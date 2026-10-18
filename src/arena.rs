@@ -145,6 +145,14 @@ impl Arena {
     /// statement arena address a stored row by logical position via
     /// `slice_at`).
     pub fn alloc(&self, len: usize) -> Result<&mut [u8], ArenaError> {
+        self.alloc_pos(len).map(|(_, s)| s)
+    }
+
+    /// Like `alloc`, but also returns the slice's logical position
+    /// (the `pos` half of an `ABytes` handle resolvable by
+    /// `slice_at`). Padding is arena-internal, so positions can
+    /// only be minted here.
+    pub fn alloc_pos(&self, len: usize) -> Result<(usize, &mut [u8]), ArenaError> {
         let inner = unsafe { &mut *self.inner.get() };
         // Try the current (last) chunk.
         if !inner.chunks.is_empty() {
@@ -155,7 +163,9 @@ impl Arena {
                 let pad = aligned - cur;
                 inner.offs[last_i] = aligned + len;
                 self.bump_used(pad + len);
-                return Ok(&mut inner.chunk_mut(last_i)[aligned..aligned + len]);
+                let base: usize = inner.offs[..last_i].iter().sum();
+                let s = &mut inner.chunk_mut(last_i)[aligned..aligned + len];
+                return Ok((base + aligned, s));
             }
         }
         // Need a new chunk. Caller-backed arenas never grow.
@@ -195,10 +205,11 @@ impl Arena {
             ptr,
             len: new_cap,
         });
+        let base: usize = inner.offs.iter().sum();
         inner.offs.push(len);
         self.bump_used(len);
         let last_i = inner.chunks.len() - 1;
-        Ok(&mut inner.chunk_mut(last_i)[0..len])
+        Ok((base, &mut inner.chunk_mut(last_i)[0..len]))
     }
 
     /// Allocate and copy `data` in; returns the stored copy.
@@ -210,6 +221,16 @@ impl Arena {
         // and the copy is complete before this reference exists.
         let ptr = out.as_ptr();
         Ok(unsafe { core::slice::from_raw_parts(ptr, data.len()) })
+    }
+
+    /// Allocate, copy `data` in, and return its `ABytes` handle.
+    pub fn alloc_copy_handle(&self, data: &[u8]) -> Result<ABytes, ArenaError> {
+        let (pos, out) = self.alloc_pos(data.len())?;
+        out.copy_from_slice(data);
+        Ok(ABytes {
+            pos: pos as u32,
+            len: data.len() as u32,
+        })
     }
 
     /// Consume `bytes` of budget without retaining a slice (used to

@@ -310,6 +310,20 @@ pub async fn assemble_payload<S: Storage>(
     first_overflow: u32,
 ) -> Result<AVec<u8>, S::Error> {
     let mut out = AVec::new();
+    assemble_payload_into(pager, local, total_len, first_overflow, &mut out).await?;
+    Ok(out)
+}
+
+/// `assemble_payload` into a caller-owned, reusable buffer (the
+/// steady-state scan path; SPEC §4.1).
+pub async fn assemble_payload_into<S: Storage>(
+    pager: &mut Pager<S>,
+    local: &[u8],
+    total_len: usize,
+    first_overflow: u32,
+    out: &mut AVec<u8>,
+) -> Result<(), S::Error> {
+    out.clear();
     for b in local {
         out.push(*b);
     }
@@ -344,7 +358,7 @@ pub async fn assemble_payload<S: Storage>(
         }
         next = following;
     }
-    Ok(out)
+    Ok(())
 }
 
 enum ScanFrame {
@@ -373,6 +387,20 @@ impl ScanCursor {
         &mut self,
         pager: &mut Pager<S>,
     ) -> Result<Option<(i64, AVec<u8>)>, S::Error> {
+        let mut buf = AVec::new();
+        match self.next_row_into(pager, &mut buf).await? {
+            Some(rowid) => Ok(Some((rowid, buf))),
+            None => Ok(None),
+        }
+    }
+
+    /// Advance to the next row, assembling its payload into the
+    /// caller's reusable buffer; returns the rowid.
+    pub async fn next_row_into<S: Storage>(
+        &mut self,
+        pager: &mut Pager<S>,
+        buf: &mut AVec<u8>,
+    ) -> Result<Option<i64>, S::Error> {
         if self.done {
             return Ok(None);
         }
@@ -425,14 +453,13 @@ impl ScanCursor {
                 // (SPEC §5.1.1): a dropped future re-produces this
                 // row rather than skipping it — the executor only
                 // advances its own copy after a completed step.
-                let payload =
-                    assemble_payload(pager, cell.local_bytes(), cell.payload_len, cell.overflow)
-                        .await?;
+                assemble_payload_into(pager, cell.local_bytes(), cell.payload_len, cell.overflow, buf)
+                    .await?;
                 if let Some(ScanFrame::Leaf { next_cell, .. }) = self.stack.as_mut_slice().last_mut()
                 {
                     *next_cell = ci + 1;
                 }
-                return Ok(Some((cell.rowid, payload)));
+                return Ok(Some(cell.rowid));
             }
             // Interior: descend into the next child.
             let ci = match self.stack.as_slice().last() {
@@ -573,6 +600,23 @@ async fn set_page_image<S: Storage>(
 ) -> Result<(), S::Error> {
     let idx = pager.load(page).await?;
     pager.frame_data_mut(idx).copy_from_slice(img);
+    Ok(())
+}
+
+/// Initialise a freshly allocated page as an empty table leaf —
+/// a new table's root (its frame from `alloc_page` is zeroed, and
+/// a zero page is not a valid leaf until the header is written).
+pub async fn create_empty_root<S: Storage>(
+    pager: &mut Pager<S>,
+    page: u32,
+) -> Result<(), S::Error> {
+    let page_size = pager.page_size() as usize;
+    let idx = pager.load(page).await?;
+    pager.mark_frame_dirty(idx);
+    let base = copy_bytes(pager.frame_data(idx));
+    let empty: &[LeafCell] = &[];
+    let img = build_leaf_image(page, page_size, empty, base.as_slice());
+    pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
     Ok(())
 }
 

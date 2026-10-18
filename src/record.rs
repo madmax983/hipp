@@ -228,6 +228,20 @@ fn varint_size(v: u64) -> usize {
 /// At most `max_cols` serial types are read; a record with fewer
 /// values than the schema is legal (caller materialises defaults).
 pub fn decode_record<'a, E>(payload: &'a [u8], max_cols: usize) -> Result<AVec<Value<'a>>, E> {
+    let mut out = AVec::new();
+    decode_record_into(payload, max_cols, &mut out)?;
+    Ok(out)
+}
+
+/// `decode_record` into a caller-owned, reusable output vector —
+/// the steady-state scan path allocates nothing once the vector has
+/// reached its working capacity (SPEC §4.1).
+pub fn decode_record_into<'a, E>(
+    payload: &'a [u8],
+    max_cols: usize,
+    out: &mut AVec<Value<'a>>,
+) -> Result<(), E> {
+    out.clear();
     let (hlen, n) = decode_varint::<E>(payload)?;
     let hlen = hlen as usize;
     if hlen < n || hlen > payload.len() {
@@ -253,7 +267,6 @@ pub fn decode_record<'a, E>(payload: &'a [u8], max_cols: usize) -> Result<AVec<V
         }
     }
     let mut body = hlen;
-    let mut out = AVec::new();
     for s in serials.iter() {
         let s = *s;
         let blen = serial_body_len::<E>(s)?;
@@ -284,7 +297,7 @@ pub fn decode_record<'a, E>(payload: &'a [u8], max_cols: usize) -> Result<AVec<V
         out.push(v);
         body = end;
     }
-    Ok(out)
+    Ok(())
 }
 
 // ---------- comparison (SQFMT §2.2) ----------

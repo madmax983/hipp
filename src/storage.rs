@@ -439,7 +439,7 @@ mod file_storage {
 }
 
 #[cfg(feature = "std")]
-pub use file_storage::{FileError, FileStorage};
+pub use file_storage::{FileError, FileSidecar, FileStorage};
 
 /// A trivial executor for tests and examples: poll with a no-op
 /// waker until Ready. For always-Ready devices this is exactly the
