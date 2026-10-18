@@ -320,6 +320,17 @@ impl<T> AVec<T> {
     pub fn new() -> AVec<T> {
         AVec { vec: Vec::new() }
     }
+    pub fn with_capacity(cap: usize) -> AVec<T> {
+        AVec {
+            vec: Vec::with_capacity(cap),
+        }
+    }
+    pub fn extend_from_slice(&mut self, b: &[T])
+    where
+        T: Clone,
+    {
+        self.vec.extend_from_slice(b);
+    }
     pub fn push(&mut self, v: T) {
         self.vec.push(v);
     }

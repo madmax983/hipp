@@ -144,10 +144,8 @@ fn parse_leaf_cell<E>(bytes: &[u8], at: usize, usable: usize, page: u32) -> Resu
         overflow = be_u32(bytes, end);
         total += 4;
     }
-    let mut img = AVec::new();
-    for b in &bytes[at..at + total] {
-        img.push(*b);
-    }
+    let mut img = AVec::with_capacity(total);
+    img.extend_from_slice(&bytes[at..at + total]);
     Ok(LeafCell {
         rowid: rowid as i64,
         bytes: img,
@@ -155,6 +153,59 @@ fn parse_leaf_cell<E>(bytes: &[u8], at: usize, usable: usize, page: u32) -> Resu
         local_len: local,
         overflow,
     })
+}
+
+/// Metadata for one leaf cell, pointing into a page snapshot the
+/// cursor owns — the scan cache parses a page with O(1)
+/// allocations instead of one image copy per cell (SPEC §4.1).
+#[derive(Clone, Copy)]
+pub struct CellMeta {
+    pub rowid: i64,
+    pub payload_len: usize,
+    pub local_off: usize,
+    pub local_len: usize,
+    pub overflow: u32,
+}
+
+/// Parse a leaf page's cell metadata (no payload copies).
+pub fn leaf_cells_meta<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec<CellMeta>, E> {
+    let h = head::<E>(bytes, page)?;
+    if h.kind == KIND_LEAF_INDEX || h.kind == KIND_INTERIOR_INDEX {
+        return Err(Error::Unsupported);
+    }
+    if h.kind != KIND_LEAF_TABLE {
+        return Err(Error::CorruptPage { page });
+    }
+    let mut out = AVec::new();
+    for i in 0..usize::from(h.ncell) {
+        let at = cell_ptr::<E>(bytes, &h, i, page)?;
+        let cell_bytes = bytes.get(at..).ok_or(Error::CorruptPage { page })?;
+        let (plen, n1) = decode_varint::<E>(cell_bytes)?;
+        let rest = cell_bytes.get(n1..).ok_or(Error::CorruptPage { page })?;
+        let (rowid, n2) = decode_varint::<E>(rest)?;
+        let plen = plen as usize;
+        let local = table_leaf_local(usable, plen);
+        let start = at + n1 + n2;
+        let end = start.checked_add(local).ok_or(Error::CorruptPage { page })?;
+        if end > bytes.len() {
+            return Err(Error::CorruptPage { page });
+        }
+        let mut overflow = 0u32;
+        if plen > local {
+            if end + 4 > bytes.len() {
+                return Err(Error::CorruptPage { page });
+            }
+            overflow = be_u32(bytes, end);
+        }
+        out.push(CellMeta {
+            rowid: rowid as i64,
+            payload_len: plen,
+            local_off: start,
+            local_len: local,
+            overflow,
+        });
+    }
+    Ok(out)
 }
 
 /// Parse all cells of a table leaf page from a page image.
@@ -277,10 +328,8 @@ fn vec_zeroed(n: usize) -> AVec<u8> {
 }
 
 fn copy_bytes(b: &[u8]) -> AVec<u8> {
-    let mut a = AVec::new();
-    for x in b {
-        a.push(*x);
-    }
+    let mut a = AVec::with_capacity(b.len());
+    a.extend_from_slice(b);
     a
 }
 
@@ -376,11 +425,12 @@ enum ScanFrame {
 pub struct ScanCursor {
     stack: AVec<ScanFrame>,
     done: bool,
-    /// Parsed-cell cache for the leaf currently being yielded from:
-    /// a page is loaded, snapshotted, and parsed once, not once per
-    /// row (SPEC §4.1's steady-state scan-loop gate).
+    /// Snapshot + cell-metadata cache for the leaf currently being
+    /// yielded from: a page is loaded and parsed once, not once
+    /// per row (SPEC §4.1's steady-state scan-loop gate).
     leaf_cache_page: u32,
-    leaf_cache: AVec<LeafCell>,
+    leaf_img: AVec<u8>,
+    leaf_meta: AVec<CellMeta>,
 }
 
 impl ScanCursor {
@@ -391,7 +441,8 @@ impl ScanCursor {
             stack,
             done: false,
             leaf_cache_page: 0,
-            leaf_cache: AVec::new(),
+            leaf_img: AVec::new(),
+            leaf_meta: AVec::new(),
         }
     }
 
@@ -429,9 +480,10 @@ impl ScanCursor {
                 }
             };
             let idx = pager.load(page).await?;
-            // Snapshot: overflow loads below may evict this frame.
-            let snap = copy_bytes(pager.frame_data(idx));
-            let h = head::<S::Error>(snap.as_slice(), page)?;
+            // Read the header straight from the frame: parsing
+            // completes before any further pager call that could
+            // evict it, and parsed cells are cursor-owned clones.
+            let h = head::<S::Error>(pager.frame_data(idx), page)?;
             if mode == 0 {
                 // Classify and replace the unresolved frame.
                 self.stack.pop();
@@ -461,28 +513,34 @@ impl ScanCursor {
                     continue;
                 }
                 if self.leaf_cache_page != page {
-                    self.leaf_cache = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                    // Snapshot for the parse: assemble calls below
+                    // may evict this frame mid-parse otherwise.
+                    self.leaf_img = copy_bytes(pager.frame_data(idx));
+                    self.leaf_meta =
+                        leaf_cells_meta::<S::Error>(self.leaf_img.as_slice(), page, usable)?;
                     self.leaf_cache_page = page;
                 }
-                let cell = self.leaf_cache.as_slice()[ci].clone();
+                let cell = self.leaf_meta.as_slice()[ci];
+                let (rowid, plen, ovf) = (cell.rowid, cell.payload_len, cell.overflow);
+                let local =
+                    &self.leaf_img.as_slice()[cell.local_off..cell.local_off + cell.local_len];
                 // Checkpoint progress BEFORE the payload awaits
                 // (SPEC §5.1.1): a dropped future re-produces this
                 // row rather than skipping it — the executor only
                 // advances its own copy after a completed step.
-                assemble_payload_into(pager, cell.local_bytes(), cell.payload_len, cell.overflow, buf)
-                    .await?;
+                assemble_payload_into(pager, local, plen, ovf, buf).await?;
                 if let Some(ScanFrame::Leaf { next_cell, .. }) = self.stack.as_mut_slice().last_mut()
                 {
                     *next_cell = ci + 1;
                 }
-                return Ok(Some(cell.rowid));
+                return Ok(Some(rowid));
             }
             // Interior: descend into the next child.
             let ci = match self.stack.as_slice().last() {
                 Some(ScanFrame::Interior { next_child, .. }) => *next_child,
                 _ => unreachable!(),
             };
-            let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
+            let (pairs, rightmost) = interior_cells::<S::Error>(pager.frame_data(idx), page)?;
             if ci > pairs.len() {
                 self.stack.pop();
                 continue;

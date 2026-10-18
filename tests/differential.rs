@@ -227,6 +227,65 @@ fn a7_rejections() {
     });
 }
 
+
+fn a1_hipp_self_check_file() {
+    block_on(async {
+        let path = common::temp_db("a1");
+        {
+            let fs = FileStorage::open(&path).expect("fs open");
+            let mut db = Connection::open(fs, Config::default()).await.expect("open");
+            hipp_exec(&mut db, A1_CREATE).await;
+            for r in A1_ROWS {
+                hipp_exec(&mut db, r).await;
+            }
+        }
+        // Reopen the file hipp created; the scan must return the
+        // identical typed values (SPEC A1).
+        let fs = FileStorage::open(&path).expect("fs open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("reopen");
+        let mut q = db.prepare("SELECT id, name, v, b FROM t").await.expect("prep");
+        let mut rows = Vec::new();
+        while q.step().await.expect("step") == Step::Row {
+            rows.push((
+                q.column_i64(0),
+                q.column_bytes(1).map(|b| b.to_vec()),
+                q.column_value(2).map(|v| match v {
+                    Value::Real(f) => format!("{f}"),
+                    Value::Null => "NULL".into(),
+                    other => format!("{other:?}"),
+                }),
+                q.column_value(3).map(|v| match v {
+                    Value::Blob(b) => b.to_vec(),
+                    Value::Null => Vec::new(),
+                    other => panic!("{other:?}"),
+                }),
+                q.column_is_null(3),
+            ));
+        }
+        assert_eq!(rows.len(), 5);
+        // Rowid order: 1, 3, 4, 5, 9007199254740993.
+        assert_eq!(rows[0].0, Some(1));
+        assert_eq!(rows[0].1.as_deref(), Some(b"one".as_slice()));
+        assert_eq!(rows[0].2.as_deref(), Some("1.5"));
+        assert_eq!(rows[0].3.as_deref(), Some([0x00u8, 0xff].as_slice()));
+        assert_eq!(rows[1].0, Some(3));
+        assert_eq!(rows[1].2.as_deref(), Some("-0.5"));
+        assert_eq!(rows[2].0, Some(4));
+        assert_eq!(rows[2].1.as_deref(), Some(b"".as_slice())); // empty text
+        assert_eq!(rows[2].2.as_deref(), Some("0")); // REAL 0.0 read back as real
+        assert!(rows[2].4, "row 4 blob is NULL");
+        assert_eq!(rows[3].0, Some(5));
+        assert_eq!(rows[4].0, Some(9007199254740993));
+        assert_eq!(rows[4].3.as_deref(), Some([].as_slice())); // empty blob, not NULL
+        assert!(!rows[4].4);
+    });
+}
+
+#[test]
+fn a1() {
+    a1_hipp_self_check_file();
+}
+
 #[test]
 fn a2() {
     a2_hipp_writes_oracle_reads();

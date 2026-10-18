@@ -359,6 +359,12 @@ impl<S: Storage> Connection<S> {
         self.pager.in_txn()
     }
 
+    /// Mutable pager access for tools/tests driving the layers
+    /// below the session API (cursor-level scans, §4.1 gates).
+    pub fn pager_mut(&mut self) -> &mut Pager<S> {
+        &mut self.pager
+    }
+
     /// The underlying storage (for tests/tools that snapshot bytes).
     pub fn storage(&self) -> &S {
         self.pager.storage()
