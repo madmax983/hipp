@@ -123,8 +123,11 @@ impl LeafCell {
 }
 
 fn parse_leaf_cell<E>(bytes: &[u8], at: usize, usable: usize, page: u32) -> Result<LeafCell, E> {
-    let (plen, n1) = decode_varint::<E>(&bytes[at..])?;
-    let (rowid, n2) = decode_varint::<E>(&bytes[at + n1..])?;
+    // `at` comes from the page's cell-pointer array — untrusted.
+    let cell_bytes = bytes.get(at..).ok_or(Error::CorruptPage { page })?;
+    let (plen, n1) = decode_varint::<E>(cell_bytes)?;
+    let rest = cell_bytes.get(n1..).ok_or(Error::CorruptPage { page })?;
+    let (rowid, n2) = decode_varint::<E>(rest)?;
     let plen = plen as usize;
     let local = table_leaf_local(usable, plen);
     let start = at + n1 + n2;
