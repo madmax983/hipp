@@ -95,7 +95,7 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         in_header_size
     } else {
         // Trust the file's actual length instead (SQFMT §1.3.7).
-        if file_len % u64::from(page_size) != 0 {
+        if !file_len.is_multiple_of(u64::from(page_size)) {
             return Err(Error::CorruptPage { page: 1 });
         }
         (file_len / u64::from(page_size)) as u32
@@ -115,7 +115,15 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
 pub fn initial_page1(page_size: u32) -> Vec<u8> {
     let mut p = alloc::vec![0u8; page_size as usize];
     p[0..16].copy_from_slice(b"SQLite format 3\0");
-    put_be_u16(&mut p, 16, if page_size == 65536 { 1 } else { page_size as u16 });
+    put_be_u16(
+        &mut p,
+        16,
+        if page_size == 65536 {
+            1
+        } else {
+            page_size as u16
+        },
+    );
     p[18] = 1; // legacy (rollback) write version
     p[19] = 1; // legacy read version
     p[20] = 0; // reserved bytes
@@ -135,7 +143,11 @@ pub fn initial_page1(page_size: u32) -> Vec<u8> {
     put_be_u16(
         &mut p,
         105,
-        if page_size == 65536 { 0 } else { page_size as u16 },
+        if page_size == 65536 {
+            0
+        } else {
+            page_size as u16
+        },
     ); // cell content start
     p
 }
@@ -230,10 +242,7 @@ impl<S: Storage> Pager<S> {
             // A crash here leaves a zero/garbage file that fails
             // validation on next open — never a torn database.
             let img = initial_page1(new_page_size);
-            storage
-                .write_at(0, &img)
-                .await
-                .map_err(Error::Storage)?;
+            storage.write_at(0, &img).await.map_err(Error::Storage)?;
             storage.sync().await.map_err(Error::Storage)?;
             is_new = true;
         }
@@ -327,7 +336,11 @@ impl<S: Storage> Pager<S> {
                 chosen = Some(i);
             } else {
                 for _ in 0..2 * self.frames.len() {
-                    let i = self.frames.iter().position(|f| !f.dirty).unwrap_or(usize::MAX);
+                    let i = self
+                        .frames
+                        .iter()
+                        .position(|f| !f.dirty)
+                        .unwrap_or(usize::MAX);
                     if i == usize::MAX {
                         break;
                     }
@@ -737,7 +750,10 @@ async fn replay_journal<S: Storage>(
             break; // incomplete tail record — the rest is stale
         }
         let mut tag = [0u8; 4];
-        sidecar.read_at(off, &mut tag).await.map_err(Error::Storage)?;
+        sidecar
+            .read_at(off, &mut tag)
+            .await
+            .map_err(Error::Storage)?;
         let page = be_u32(&tag, 0);
         let mut img = alloc::vec![0u8; page_size];
         sidecar

@@ -279,7 +279,7 @@ pub fn decode_record_into<'a, E>(
             0 => Value::Null,
             8 => Value::Integer(0),
             9 => Value::Integer(1),
-            1 | 2 | 3 | 4 | 5 | 6 => {
+            1..=6 => {
                 let mut x: i64 = if bytes[0] & 0x80 != 0 { -1 } else { 0 };
                 for b in bytes {
                     x = (x << 8) | i64::from(*b);
@@ -421,11 +421,7 @@ fn format_real(r: f64, buf: &mut [u8; 40]) -> &str {
 
 /// `f64::fract`/`abs` are not in `core`; spell the two checks we need.
 pub fn fabs(r: f64) -> f64 {
-    if r < 0.0 {
-        -r
-    } else {
-        r
-    }
+    if r < 0.0 { -r } else { r }
 }
 
 pub fn is_integral_real(r: f64) -> bool {
@@ -495,10 +491,11 @@ pub fn text_to_number(t: &[u8]) -> Option<OwnedValue> {
             _ => return None,
         }
     }
-    if has_digit && has_dot_or_exp {
-        if let Ok(r) = s.parse::<f64>() {
-            return Some(OwnedValue::Real(r));
-        }
+    if has_digit
+        && has_dot_or_exp
+        && let Ok(r) = s.parse::<f64>()
+    {
+        return Some(OwnedValue::Real(r));
     }
     None
 }

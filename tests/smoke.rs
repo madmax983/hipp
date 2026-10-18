@@ -60,13 +60,21 @@ async fn run() -> Result<(), hipp::Error<E>> {
     assert_eq!(seen[2].3, Some(Some(vec![]))); // empty blob, not NULL
     // 'auto' was inserted when max rowid was 9007199254740993, so
     // it auto-assigned ...994 (explicit rowid 4 came after).
-    let auto = seen.iter().find(|r| r.1.as_deref() == Some(b"auto".as_slice())).unwrap();
+    let auto = seen
+        .iter()
+        .find(|r| r.1.as_deref() == Some(b"auto".as_slice()))
+        .unwrap();
     assert_eq!(auto.0, Some(9007199254740994));
     // Rowid order: 1, 4, big, auto
     let ids: Vec<_> = seen.iter().map(|r| r.0).collect();
     assert_eq!(
         ids,
-        vec![Some(1), Some(4), Some(9007199254740993), Some(9007199254740994)]
+        vec![
+            Some(1),
+            Some(4),
+            Some(9007199254740993),
+            Some(9007199254740994)
+        ]
     );
     Ok(())
 }

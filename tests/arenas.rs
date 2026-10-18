@@ -75,7 +75,11 @@ fn a9_txn_arena_exhaustion_rolls_back() {
         );
         drop(st);
         drop(db);
-        assert_eq!(mem.snapshot(), before, "file byte-identical after failed insert");
+        assert_eq!(
+            mem.snapshot(),
+            before,
+            "file byte-identical after failed insert"
+        );
         assert!(mem.journal_snapshot().is_none(), "no journal left behind");
         // And the oracle agrees the file is untouched and valid.
         let path = common::temp_db("a9");

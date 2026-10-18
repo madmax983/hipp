@@ -91,11 +91,7 @@ pub fn table_leaf_local(usable: usize, payload_len: usize) -> usize {
     }
     let m = (usable - 12) * 32 / 255 - 23;
     let k = m + (payload_len - m) % (usable - 4);
-    if k <= x {
-        k
-    } else {
-        m
-    }
+    if k <= x { k } else { m }
 }
 
 #[derive(Clone)]
@@ -131,7 +127,9 @@ fn parse_leaf_cell<E>(bytes: &[u8], at: usize, usable: usize, page: u32) -> Resu
     let plen = plen as usize;
     let local = table_leaf_local(usable, plen);
     let start = at + n1 + n2;
-    let end = start.checked_add(local).ok_or(Error::CorruptPage { page })?;
+    let end = start
+        .checked_add(local)
+        .ok_or(Error::CorruptPage { page })?;
     if end > bytes.len() {
         return Err(Error::CorruptPage { page });
     }
@@ -186,7 +184,9 @@ pub fn leaf_cells_meta<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec
         let plen = plen as usize;
         let local = table_leaf_local(usable, plen);
         let start = at + n1 + n2;
-        let end = start.checked_add(local).ok_or(Error::CorruptPage { page })?;
+        let end = start
+            .checked_add(local)
+            .ok_or(Error::CorruptPage { page })?;
         if end > bytes.len() {
             return Err(Error::CorruptPage { page });
         }
@@ -312,11 +312,7 @@ fn build_interior_image(
 }
 
 fn content_code(content: usize) -> u16 {
-    if content == 65536 {
-        0
-    } else {
-        content as u16
-    }
+    if content == 65536 { 0 } else { content as u16 }
 }
 
 fn vec_zeroed(n: usize) -> AVec<u8> {
@@ -491,10 +487,7 @@ impl ScanCursor {
                     if h.kind != KIND_LEAF_TABLE {
                         return Err(Error::Unsupported);
                     }
-                    self.stack.push(ScanFrame::Leaf {
-                        page,
-                        next_cell: 0,
-                    });
+                    self.stack.push(ScanFrame::Leaf { page, next_cell: 0 });
                 } else {
                     self.stack.push(ScanFrame::Interior {
                         page,
@@ -529,7 +522,8 @@ impl ScanCursor {
                 // row rather than skipping it — the executor only
                 // advances its own copy after a completed step.
                 assemble_payload_into(pager, local, plen, ovf, buf).await?;
-                if let Some(ScanFrame::Leaf { next_cell, .. }) = self.stack.as_mut_slice().last_mut()
+                if let Some(ScanFrame::Leaf { next_cell, .. }) =
+                    self.stack.as_mut_slice().last_mut()
                 {
                     *next_cell = ci + 1;
                 }
@@ -550,7 +544,8 @@ impl ScanCursor {
             } else {
                 rightmost
             };
-            if let Some(ScanFrame::Interior { next_child, .. }) = self.stack.as_mut_slice().last_mut()
+            if let Some(ScanFrame::Interior { next_child, .. }) =
+                self.stack.as_mut_slice().last_mut()
             {
                 *next_child = ci + 1;
             }
@@ -606,7 +601,8 @@ pub async fn seek_rowid<S: Storage>(
                 if c.rowid == rowid {
                     let local = copy_bytes(c.local_bytes());
                     return Ok(Some(
-                        assemble_payload(pager, local.as_slice(), c.payload_len, c.overflow).await?,
+                        assemble_payload(pager, local.as_slice(), c.payload_len, c.overflow)
+                            .await?,
                     ));
                 }
             }
@@ -923,7 +919,13 @@ async fn propagate<S: Storage>(
         if interior_need(npairs.as_slice(), hdr_off) <= page_size {
             let idx = pager.dirty_page(parent).await?;
             let base = copy_bytes(pager.frame_data(idx));
-            let img = build_interior_image(parent, page_size, npairs.as_slice(), nrightmost, base.as_slice());
+            let img = build_interior_image(
+                parent,
+                page_size,
+                npairs.as_slice(),
+                nrightmost,
+                base.as_slice(),
+            );
             set_page_image(pager, parent, img.as_slice()).await?;
             return Ok(());
         }

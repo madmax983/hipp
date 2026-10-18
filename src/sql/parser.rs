@@ -21,16 +21,15 @@ fn perr<E>(offset: usize, kind: ParseKind) -> Error<E> {
 }
 
 /// Resolve an arena handle to bytes.
-pub fn handle_bytes<'a>(arena: &'a Arena, h: ABytes) -> &'a [u8] {
-    arena.slice_at(h.pos as usize, h.len as usize).unwrap_or(&[])
+pub fn handle_bytes(arena: &Arena, h: ABytes) -> &[u8] {
+    arena
+        .slice_at(h.pos as usize, h.len as usize)
+        .unwrap_or(&[])
 }
 
 /// ASCII case-insensitive byte equality (SQLite identifier rules).
 pub fn eq_ci(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+    a.eq_ignore_ascii_case(b)
 }
 
 struct Parser<'a> {
@@ -186,7 +185,10 @@ impl<'a> Parser<'a> {
         if pk_names.len() == 1 {
             let target = pk_names.as_slice()[0];
             for c in columns.as_mut_slice().iter_mut() {
-                if eq_ci(handle_bytes(self.arena, c.name), handle_bytes(self.arena, target)) {
+                if eq_ci(
+                    handle_bytes(self.arena, c.name),
+                    handle_bytes(self.arena, target),
+                ) {
                     c.primary_key = true;
                 }
             }
@@ -284,7 +286,10 @@ impl<'a> Parser<'a> {
         }
         // Column definition: first token is the name.
         let Some((col_name, _, _)) = self.ident_at(from) else {
-            return Err(perr(self.toks.as_slice()[from].offset, ParseKind::UnexpectedToken));
+            return Err(perr(
+                self.toks.as_slice()[from].offset,
+                ParseKind::UnexpectedToken,
+            ));
         };
         // Declared type: tokens after the name up to the first
         // depth-0 constraint keyword; the text is the SQL span.

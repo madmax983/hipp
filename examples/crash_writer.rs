@@ -4,8 +4,10 @@
 //! rollback journal behind for *real SQLite* to recover.
 //!
 //! Modes (env `MODE`):
+//!
 //! - `setup`: create the db + table + first row, committed.
 //! - `insert`: insert the second row under the kill wrapper.
+//!
 //! Env `KILL_AT` = mutating-op index at which to die (default:
 //! never). Env `COUNT=1` prints the total mutating-op count to
 //! stderr after a successful insert.

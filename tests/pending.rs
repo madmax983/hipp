@@ -8,7 +8,7 @@
 
 use hipp::storage::{MemStorage, Sidecar, SidecarFile, Storage, block_on};
 use hipp::{Config, Connection, Error, Step};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -176,7 +176,10 @@ where
         assert_eq!(st.step().await.expect("insert"), Step::Done);
         drop(st);
     }
-    let mut q = db.prepare("SELECT id, name FROM t").await.expect("prep select");
+    let mut q = db
+        .prepare("SELECT id, name FROM t")
+        .await
+        .expect("prep select");
     let mut rows = Vec::new();
     while q.step().await.expect("step") == Step::Row {
         rows.push((
@@ -195,8 +198,7 @@ fn a11_pending_outcomes_identical() {
         let mut db = Connection::open(base_mem.clone(), Config::default())
             .await
             .expect("open");
-        let rows = script(&mut db).await;
-        rows
+        script(&mut db).await
     });
     let base_bytes = base_mem.snapshot();
 
@@ -246,8 +248,8 @@ async fn drop_mid_commit() -> (MemStorage, Connection<PendStorage>) {
         polls += 1;
         assert!(polls < 100_000, "step future never reached mid-commit");
         let l = log.borrow();
-        let jsynced = l.iter().any(|e| *e == "jsync");
-        let wrote_pages = l.iter().any(|e| *e == "write");
+        let jsynced = l.contains(&"jsync");
+        let wrote_pages = l.contains(&"write");
         if jsynced && !wrote_pages {
             break;
         }
@@ -280,7 +282,10 @@ fn a11_drop_mid_commit_resume_finishes() {
         }
         drop(q);
         assert_eq!(ids, vec![1, 2]);
-        assert!(mem.journal_snapshot().is_none(), "journal deleted by commit");
+        assert!(
+            mem.journal_snapshot().is_none(),
+            "journal deleted by commit"
+        );
     });
 }
 

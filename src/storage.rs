@@ -28,7 +28,9 @@ pub enum Sidecar {
 /// empty one.
 // `async fn` in trait is deliberate (SPEC §5.1.1): RPITIT, no
 // boxing, no `async-trait` dependency; futures need not be Send.
-#[allow(async_fn_in_trait)]
+// `len` is a byte count of a file, not a collection length:
+// no `is_empty` belongs in this contract.
+#[allow(async_fn_in_trait, clippy::len_without_is_empty)]
 pub trait SidecarFile {
     type Error;
     /// Whether this sidecar already existed (with content or not)
@@ -47,7 +49,7 @@ pub trait SidecarFile {
 /// Byte-addressed async storage for one database file plus its
 /// sidecars. Page size is a pager-level runtime value; this trait
 /// knows nothing about pages.
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait, clippy::len_without_is_empty)]
 pub trait Storage {
     type Error;
     type Sidecar: SidecarFile<Error = Self::Error>;

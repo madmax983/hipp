@@ -12,8 +12,7 @@ pub fn oracle() -> PathBuf {
     if let Ok(p) = std::env::var("HIPP_ORACLE") {
         return PathBuf::from(p);
     }
-    let pinned = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../hipp-design/oracle/sqlite3");
+    let pinned = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hipp-design/oracle/sqlite3");
     if pinned.exists() {
         return pinned;
     }
@@ -50,11 +49,7 @@ pub fn cli(db: &std::path::Path, sql: &str) -> String {
 
 /// Create a fresh temp directory path for one test database.
 pub fn temp_db(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "hipp-test-{}-{}",
-        std::process::id(),
-        tag
-    ));
+    let dir = std::env::temp_dir().join(format!("hipp-test-{}-{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir.join("test.db")

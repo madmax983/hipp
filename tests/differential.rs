@@ -8,8 +8,7 @@ mod common;
 use hipp::storage::block_on;
 use hipp::{Config, Connection, Error, FileStorage, MemStorage, Step, Value};
 
-const A1_CREATE: &str =
-    "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v REAL, b BLOB)";
+const A1_CREATE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v REAL, b BLOB)";
 const A1_ROWS: [&str; 5] = [
     "INSERT INTO t VALUES (1, 'one', 1.5, x'00ff')",
     "INSERT INTO t VALUES (9007199254740993, 'big', NULL, x'')",
@@ -49,7 +48,12 @@ fn a2_hipp_writes_oracle_reads() {
         let chk = common::cli(&path, "PRAGMA integrity_check;");
         assert_eq!(chk.trim(), "ok");
         let out = common::cli(&path, "SELECT id, name, v, hex(b) FROM t;");
-        assert_eq!(out, A1_EXPECTED, "oracle version: {}", common::oracle_version());
+        assert_eq!(
+            out,
+            A1_EXPECTED,
+            "oracle version: {}",
+            common::oracle_version()
+        );
     });
 }
 
@@ -58,33 +62,45 @@ fn a3_oracle_writes_hipp_reads() {
         // Default page size, then a 512-byte page size variant.
         for (tag, pragma) in [("a3", ""), ("a3-512", "PRAGMA page_size=512;")] {
             let path = common::temp_db(tag);
-            let script = format!(
-                "{pragma} {A1_CREATE}; {}",
-                A1_ROWS.join("; ")
-            );
+            let script = format!("{pragma} {A1_CREATE}; {}", A1_ROWS.join("; "));
             let out = common::cli(&path, &script);
             assert_eq!(out, "");
             // hipp reads it back and renders the same values.
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            let mut q = db.prepare("SELECT id, name, v, b FROM t").await.expect("prep");
+            let mut q = db
+                .prepare("SELECT id, name, v, b FROM t")
+                .await
+                .expect("prep");
             let mut rendered = String::new();
             while q.step().await.expect("step") == Step::Row {
                 let id = q.column_i64(0).unwrap();
-                let name = q.column_bytes(1).map(|b| String::from_utf8_lossy(b).into_owned());
+                let name = q
+                    .column_bytes(1)
+                    .map(|b| String::from_utf8_lossy(b).into_owned());
                 let v = match q.column_value(2) {
                     Some(Value::Real(f)) => format!("{f}"),
                     Some(Value::Null) => String::new(),
                     other => panic!("v: {other:?}"),
                 };
                 // SQLite prints integral reals with .0
-                let v = if v.contains('.') || v.is_empty() { v } else { format!("{v}.0") };
+                let v = if v.contains('.') || v.is_empty() {
+                    v
+                } else {
+                    format!("{v}.0")
+                };
                 let b = match q.column_value(3) {
                     Some(Value::Blob(bytes)) => bytes.iter().map(|x| format!("{x:02X}")).collect(),
                     Some(Value::Null) => String::new(),
                     other => panic!("b: {other:?}"),
                 };
-                rendered.push_str(&format!("{}|{}|{}|{}\n", id, name.as_deref().unwrap_or(""), v, b));
+                rendered.push_str(&format!(
+                    "{}|{}|{}|{}\n",
+                    id,
+                    name.as_deref().unwrap_or(""),
+                    v,
+                    b
+                ));
             }
             assert_eq!(rendered, A1_EXPECTED, "tag {tag}");
         }
@@ -98,7 +114,11 @@ fn a4_root_split() {
         {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            hipp_exec(&mut db, "CREATE TABLE big (id INTEGER PRIMARY KEY, data TEXT)").await;
+            hipp_exec(
+                &mut db,
+                "CREATE TABLE big (id INTEGER PRIMARY KEY, data TEXT)",
+            )
+            .await;
             for i in 1..=500 {
                 hipp_exec(
                     &mut db,
@@ -116,13 +136,19 @@ fn a4_root_split() {
             assert_eq!(expect, 501);
         }
         assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
-        assert_eq!(common::cli(&path, "SELECT count(*) FROM big;").trim(), "500");
+        assert_eq!(
+            common::cli(&path, "SELECT count(*) FROM big;").trim(),
+            "500"
+        );
         // Root page of `big` must be an interior table page (0x05).
         let bytes = std::fs::read(&path).expect("read db");
-        let root = common::cli(&path, "SELECT rootpage FROM sqlite_schema WHERE name='big';")
-            .trim()
-            .parse::<usize>()
-            .expect("rootpage");
+        let root = common::cli(
+            &path,
+            "SELECT rootpage FROM sqlite_schema WHERE name='big';",
+        )
+        .trim()
+        .parse::<usize>()
+        .expect("rootpage");
         let page_size = 4096usize;
         assert_eq!(bytes[(root - 1) * page_size], 0x05, "root is interior");
     });
@@ -136,7 +162,11 @@ fn a5_overflow_both_directions() {
         {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            hipp_exec(&mut db, "CREATE TABLE o (id INTEGER PRIMARY KEY, data TEXT)").await;
+            hipp_exec(
+                &mut db,
+                "CREATE TABLE o (id INTEGER PRIMARY KEY, data TEXT)",
+            )
+            .await;
             hipp_exec(&mut db, &format!("INSERT INTO o VALUES (1, '{big}')")).await;
             let mut q = db.prepare("SELECT data FROM o").await.expect("prep");
             assert_eq!(q.step().await.expect("step"), Step::Row);
@@ -160,7 +190,9 @@ fn a5_overflow_both_directions() {
         let path2 = common::temp_db("a5b");
         common::cli(
             &path2,
-            &format!("CREATE TABLE o (id INTEGER PRIMARY KEY, data TEXT); INSERT INTO o VALUES (1, '{big}');"),
+            &format!(
+                "CREATE TABLE o (id INTEGER PRIMARY KEY, data TEXT); INSERT INTO o VALUES (1, '{big}');"
+            ),
         );
         let fs = FileStorage::open(&path2).expect("fs open");
         let mut db = Connection::open(fs, Config::default()).await.expect("open");
@@ -175,22 +207,28 @@ fn a5_overflow_both_directions() {
 fn a7_rejections() {
     block_on(async {
         // WAL fixture → WalUnsupported.
-        let wal = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wal.db");
+        let wal =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wal.db");
         let fs = FileStorage::open(&wal).expect("fs open");
         let r = Connection::open(fs, Config::default()).await;
         assert!(
             matches!(r, Err(Error::WalUnsupported)),
-            "wal: {:?}", r.err(),
+            "wal: {:?}",
+            r.err(),
         );
 
         // UTF-16 file (oracle-created) → UnsupportedEncoding.
         let path = common::temp_db("a7-utf16");
-        common::cli(&path, "PRAGMA encoding='UTF-16le'; CREATE TABLE u (a TEXT);");
+        common::cli(
+            &path,
+            "PRAGMA encoding='UTF-16le'; CREATE TABLE u (a TEXT);",
+        );
         let fs = FileStorage::open(&path).expect("fs open");
         let r = Connection::open(fs, Config::default()).await;
         assert!(
             matches!(r, Err(Error::UnsupportedEncoding)),
-            "utf16: {:?}", r.err(),
+            "utf16: {:?}",
+            r.err(),
         );
 
         // Garbage → BadMagic.
@@ -205,7 +243,8 @@ fn a7_rejections() {
         let r = Connection::open(mem, Config::default()).await;
         assert!(
             matches!(r, Err(Error::TruncatedHeader)),
-            "truncated: {:?}", r.err(),
+            "truncated: {:?}",
+            r.err(),
         );
 
         // Corrupt a data page of a valid file: errors, never panic.
@@ -220,13 +259,18 @@ fn a7_rejections() {
         bytes[4096] = 0x77; // page 2 kind byte → nonsense
         std::fs::write(&path, &bytes).expect("write");
         let fs = FileStorage::open(&path).expect("fs open");
-        let mut db = Connection::open(fs, Config::default()).await.expect("open opens");
+        let mut db = Connection::open(fs, Config::default())
+            .await
+            .expect("open opens");
         let mut q = db.prepare("SELECT x FROM c").await.expect("prep");
         let r = q.step().await;
-        assert!(matches!(r, Err(Error::CorruptPage { page: 2 })), "corrupt scan: {:?}", r.err());
+        assert!(
+            matches!(r, Err(Error::CorruptPage { page: 2 })),
+            "corrupt scan: {:?}",
+            r.err()
+        );
     });
 }
-
 
 fn a1_hipp_self_check_file() {
     block_on(async {
@@ -242,8 +286,13 @@ fn a1_hipp_self_check_file() {
         // Reopen the file hipp created; the scan must return the
         // identical typed values (SPEC A1).
         let fs = FileStorage::open(&path).expect("fs open");
-        let mut db = Connection::open(fs, Config::default()).await.expect("reopen");
-        let mut q = db.prepare("SELECT id, name, v, b FROM t").await.expect("prep");
+        let mut db = Connection::open(fs, Config::default())
+            .await
+            .expect("reopen");
+        let mut q = db
+            .prepare("SELECT id, name, v, b FROM t")
+            .await
+            .expect("prep");
         let mut rows = Vec::new();
         while q.step().await.expect("step") == Step::Row {
             rows.push((

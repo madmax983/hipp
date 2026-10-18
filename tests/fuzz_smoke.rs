@@ -36,7 +36,7 @@ fn mutate(rng: &mut Rng, buf: &mut [u8]) {
         buf[i] = rng.next() as u8;
     }
     // Occasionally truncate.
-    if rng.next() % 23 == 0 && buf.len() > 200 {
+    if rng.next().is_multiple_of(23) && buf.len() > 200 {
         let keep = 100 + (rng.next() as usize) % (buf.len() - 100);
         // Truncation is applied by the caller via resize; here we
         // emulate by zeroing the tail (same decoder surface).
@@ -121,7 +121,9 @@ fn a8_fuzz_parser() {
             b"INSERT INTO t (name, id) VALUES ('', NULL)",
         ];
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
         let mut st = db
             .prepare("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v REAL, b BLOB)")
             .await

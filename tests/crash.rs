@@ -72,11 +72,17 @@ impl Storage for CrashStorage {
         self.mem.len().await.map_err(CrashError::Inner)
     }
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), CrashError> {
-        self.mem.read_at(offset, buf).await.map_err(CrashError::Inner)
+        self.mem
+            .read_at(offset, buf)
+            .await
+            .map_err(CrashError::Inner)
     }
     async fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), CrashError> {
         self.gate()?;
-        self.mem.write_at(offset, buf).await.map_err(CrashError::Inner)
+        self.mem
+            .write_at(offset, buf)
+            .await
+            .map_err(CrashError::Inner)
     }
     async fn set_len(&mut self, len: u64) -> Result<(), CrashError> {
         self.gate()?;
@@ -100,11 +106,17 @@ impl SidecarFile for CrashSidecar {
         self.inner.len().await.map_err(CrashError::Inner)
     }
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), CrashError> {
-        self.inner.read_at(offset, buf).await.map_err(CrashError::Inner)
+        self.inner
+            .read_at(offset, buf)
+            .await
+            .map_err(CrashError::Inner)
     }
     async fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), CrashError> {
         gate_state(&self.st)?;
-        self.inner.write_at(offset, buf).await.map_err(CrashError::Inner)
+        self.inner
+            .write_at(offset, buf)
+            .await
+            .map_err(CrashError::Inner)
     }
     async fn set_len(&mut self, len: u64) -> Result<(), CrashError> {
         gate_state(&self.st)?;
@@ -131,7 +143,9 @@ fn crash_storage(mem: MemStorage) -> CrashStorage {
 }
 
 async fn setup_db(mem: MemStorage) {
-    let mut db = Connection::open(mem, Config::default()).await.expect("open");
+    let mut db = Connection::open(mem, Config::default())
+        .await
+        .expect("open");
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)",
         "INSERT INTO t VALUES (1, 'one')",
@@ -195,7 +209,10 @@ fn a6_every_commit_boundary() {
             drop(db);
             cs.ops() - before
         };
-        assert!(total_ops >= 8, "commit should have several ops, got {total_ops}");
+        assert!(
+            total_ops >= 8,
+            "commit should have several ops, got {total_ops}"
+        );
 
         for k in 0..total_ops {
             let mem = MemStorage::new();
@@ -254,7 +271,12 @@ fn crash_writer_bin() -> PathBuf {
     p
 }
 
-fn run_writer(path: &std::path::Path, mode: &str, kill: Option<usize>, count: bool) -> (i32, String) {
+fn run_writer(
+    path: &std::path::Path,
+    mode: &str,
+    kill: Option<usize>,
+    count: bool,
+) -> (i32, String) {
     let mut cmd = std::process::Command::new(crash_writer_bin());
     cmd.arg(path).env("MODE", mode);
     if let Some(k) = kill {
@@ -302,12 +324,16 @@ fn a6_cross_tool_real_sqlite_recovers_hipp_journal() {
             "ok",
             "k={k}"
         );
-        let count = common::cli(&f, "SELECT count(*) FROM t;").trim().to_string();
+        let count = common::cli(&f, "SELECT count(*) FROM t;")
+            .trim()
+            .to_string();
         assert!(count == "1" || count == "2", "k={k}: count {count}");
         // hipp agrees with the oracle's post-recovery view.
         block_on(async {
             let fs = hipp::FileStorage::open(&f).expect("fs");
-            let mut db = Connection::open(fs, Config::default()).await.expect("hipp open");
+            let mut db = Connection::open(fs, Config::default())
+                .await
+                .expect("hipp open");
             let ids = scan_ids(&mut db).await;
             assert_eq!(ids.len().to_string(), count, "k={k}");
         });

@@ -26,7 +26,7 @@ pub mod sql;
 #[allow(unsafe_code)] // no-op waker construction for block_on only
 pub mod storage;
 
-pub use error::{Error, Scope, SchemaKind};
+pub use error::{Error, SchemaKind, Scope};
 pub use record::{OwnedValue, Value};
 pub use session::{ArenaStats, Config, Connection, Statement, Step};
 pub use storage::{MemStorage, Storage};

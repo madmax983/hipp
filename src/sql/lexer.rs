@@ -182,35 +182,59 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
                 }
             }
             b'(' => {
-                toks.push(Token { tok: Tok::LParen, offset: off });
+                toks.push(Token {
+                    tok: Tok::LParen,
+                    offset: off,
+                });
                 i += 1;
             }
             b')' => {
-                toks.push(Token { tok: Tok::RParen, offset: off });
+                toks.push(Token {
+                    tok: Tok::RParen,
+                    offset: off,
+                });
                 i += 1;
             }
             b',' => {
-                toks.push(Token { tok: Tok::Comma, offset: off });
+                toks.push(Token {
+                    tok: Tok::Comma,
+                    offset: off,
+                });
                 i += 1;
             }
             b';' => {
-                toks.push(Token { tok: Tok::Semi, offset: off });
+                toks.push(Token {
+                    tok: Tok::Semi,
+                    offset: off,
+                });
                 i += 1;
             }
             b'*' => {
-                toks.push(Token { tok: Tok::Star, offset: off });
+                toks.push(Token {
+                    tok: Tok::Star,
+                    offset: off,
+                });
                 i += 1;
             }
             b'-' => {
-                toks.push(Token { tok: Tok::Minus, offset: off });
+                toks.push(Token {
+                    tok: Tok::Minus,
+                    offset: off,
+                });
                 i += 1;
             }
             b'+' => {
-                toks.push(Token { tok: Tok::Plus, offset: off });
+                toks.push(Token {
+                    tok: Tok::Plus,
+                    offset: off,
+                });
                 i += 1;
             }
             b'.' if !(i + 1 < n && sql[i + 1].is_ascii_digit()) => {
-                toks.push(Token { tok: Tok::Dot, offset: off });
+                toks.push(Token {
+                    tok: Tok::Dot,
+                    offset: off,
+                });
                 i += 1;
             }
             b'\'' => {
@@ -235,7 +259,10 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
                     }
                 }
                 let h = arena.alloc_copy_handle(buf.as_slice())?;
-                toks.push(Token { tok: Tok::Text(h), offset: off });
+                toks.push(Token {
+                    tok: Tok::Text(h),
+                    offset: off,
+                });
             }
             b'"' | b'`' => {
                 let close = b;
@@ -290,7 +317,7 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
                     return Err(perr(off, ParseKind::UnexpectedEof));
                 }
                 let hex = &sql[start..i];
-                if hex.len() % 2 != 0 {
+                if !hex.len().is_multiple_of(2) {
                     return Err(perr(off, ParseKind::InvalidLiteral));
                 }
                 let mut buf = AVec::new();
@@ -306,7 +333,10 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
                 }
                 i += 1;
                 let h = arena.alloc_copy_handle(buf.as_slice())?;
-                toks.push(Token { tok: Tok::Blob(h), offset: off });
+                toks.push(Token {
+                    tok: Tok::Blob(h),
+                    offset: off,
+                });
             }
             b'0'..=b'9' | b'.' => {
                 // Number (b'.' only reaches here before a digit).

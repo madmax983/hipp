@@ -144,6 +144,10 @@ impl Arena {
     /// chunk (contiguity is guaranteed — this is what lets the
     /// statement arena address a stored row by logical position via
     /// `slice_at`).
+    // `&self` -> `&mut [u8]` is the arena's founding pattern
+    // (UnsafeCell interior mutability; bump discipline guarantees
+    // non-overlap — see the module safety notes).
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc(&self, len: usize) -> Result<&mut [u8], ArenaError> {
         self.alloc_pos(len).map(|(_, s)| s)
     }
@@ -152,6 +156,7 @@ impl Arena {
     /// (the `pos` half of an `ABytes` handle resolvable by
     /// `slice_at`). Padding is arena-internal, so positions can
     /// only be minted here.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc_pos(&self, len: usize) -> Result<(usize, &mut [u8]), ArenaError> {
         let inner = unsafe { &mut *self.inner.get() };
         // Try the current (last) chunk.
@@ -201,10 +206,7 @@ impl Arena {
         let ptr = owned.as_mut_ptr();
         inner._owned.push(owned);
         inner.capacity += new_cap;
-        inner.chunks.push(Chunk {
-            ptr,
-            len: new_cap,
-        });
+        inner.chunks.push(Chunk { ptr, len: new_cap });
         let base: usize = inner.offs.iter().sum();
         inner.offs.push(len);
         self.bump_used(len);
@@ -213,6 +215,7 @@ impl Arena {
     }
 
     /// Allocate and copy `data` in; returns the stored copy.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc_copy(&self, data: &[u8]) -> Result<&[u8], ArenaError> {
         let out = self.alloc(data.len())?;
         out.copy_from_slice(data);

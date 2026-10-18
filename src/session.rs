@@ -319,11 +319,7 @@ impl<S: Storage> Connection<S> {
         }
     }
 
-    fn resolve_target(
-        &self,
-        t: &crate::schema::TableDef,
-        name: &[u8],
-    ) -> Result<Target, S::Error> {
+    fn resolve_target(&self, t: &crate::schema::TableDef, name: &[u8]) -> Result<Target, S::Error> {
         for (i, c) in t.columns.iter().enumerate() {
             if eq_ci(handle_bytes(&self.catalog_arena, c.name), name) {
                 return Ok(Target::Col(i));
@@ -474,7 +470,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             end -= 1;
         }
         let sql_text = copy_vec(&raw[..end]);
-        let r = self.exec_create(name_b.as_slice(), sql_text.as_slice()).await;
+        let r = self
+            .exec_create(name_b.as_slice(), sql_text.as_slice())
+            .await;
         match r {
             Ok(()) => {
                 self.phase = Phase::Done;
@@ -555,7 +553,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     _ => {
                         return Err(Error::Schema {
                             kind: SchemaKind::DatatypeMismatch,
-                        })
+                        });
                     }
                 },
                 Target::Col(i) => {
@@ -567,7 +565,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                             _ => {
                                 return Err(Error::Schema {
                                     kind: SchemaKind::DatatypeMismatch,
-                                })
+                                });
                             }
                         }
                         // The alias column's record field stays NULL.
@@ -634,11 +632,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Ok(Step::Done);
         };
         let mut dec: AVec<Value<'_>> = AVec::new();
-        crate::record::decode_record_into::<S::Error>(
-            self.row_buf.as_slice(),
-            *ncols,
-            &mut dec,
-        )?;
+        crate::record::decode_record_into::<S::Error>(self.row_buf.as_slice(), *ncols, &mut dec)?;
         self.current.clear();
         for (j, idx) in out.iter().enumerate() {
             if *idx == ROWID_COL || Some(*idx) == *rowid_alias {
@@ -652,10 +646,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             // Read-side affinity forcing (§5.5): REAL columns
             // yield reals even when the record stores an integer.
-            if aff.as_slice()[j] == crate::record::Affinity::Real {
-                if let OwnedValue::Integer(i) = v {
-                    v = OwnedValue::Real(i as f64);
-                }
+            if aff.as_slice()[j] == crate::record::Affinity::Real
+                && let OwnedValue::Integer(i) = v
+            {
+                v = OwnedValue::Real(i as f64);
             }
             self.current.push(v);
         }
@@ -678,7 +672,10 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     pub fn column_is_null(&self, i: usize) -> bool {
-        matches!(self.current.as_slice().get(i), Some(OwnedValue::Null) | None)
+        matches!(
+            self.current.as_slice().get(i),
+            Some(OwnedValue::Null) | None
+        )
     }
 
     pub fn column_i64(&self, i: usize) -> Option<i64> {
@@ -714,4 +711,3 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.arena.high_water()
     }
 }
-

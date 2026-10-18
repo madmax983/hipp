@@ -70,11 +70,22 @@ fn a10_scan_loop_zero_steady_state_allocations() {
         let mut cursor = ScanCursor::new(2);
         let mut buf = hipp::arena::AVec::new();
         for _ in 0..10 {
-            assert!(cursor.next_row_into(pager, &mut buf).await.expect("row").is_some());
+            assert!(
+                cursor
+                    .next_row_into(pager, &mut buf)
+                    .await
+                    .expect("row")
+                    .is_some()
+            );
         }
         let before = allocs();
         let mut steady = 0usize;
-        while cursor.next_row_into(pager, &mut buf).await.expect("row").is_some() {
+        while cursor
+            .next_row_into(pager, &mut buf)
+            .await
+            .expect("row")
+            .is_some()
+        {
             steady += 1;
         }
         assert_eq!(steady, 290);
@@ -111,7 +122,12 @@ fn a10_scan_loop_zero_steady_state_allocations() {
         let mut buf = hipp::arena::AVec::new();
         let before = allocs();
         let mut n = 0usize;
-        while cursor.next_row_into(pager, &mut buf).await.expect("row").is_some() {
+        while cursor
+            .next_row_into(pager, &mut buf)
+            .await
+            .expect("row")
+            .is_some()
+        {
             n += 1;
         }
         assert_eq!(n, 300);
@@ -163,8 +179,16 @@ fn a10_tiny_config_ram_budget() {
         // txn 8K = 56K of the 64K engine-RAM gate (statics are the
         // linked-binary measurement, reported in STATUS).
         assert_eq!(stats.pool_bytes, 16 * 1024);
-        assert!(stats.catalog_high_water <= 16 * 1024, "catalog hw {}", stats.catalog_high_water);
-        assert!(stats.txn_high_water <= 8 * 1024, "txn hw {}", stats.txn_high_water);
+        assert!(
+            stats.catalog_high_water <= 16 * 1024,
+            "catalog hw {}",
+            stats.catalog_high_water
+        );
+        assert!(
+            stats.txn_high_water <= 8 * 1024,
+            "txn hw {}",
+            stats.txn_high_water
+        );
         assert!(stmt_hw <= 16 * 1024, "stmt hw {stmt_hw}");
         let total = stats.pool_bytes + stats.catalog_high_water + stats.txn_high_water + stmt_hw;
         assert!(total <= 64 * 1024, "total engine RAM {total}");
