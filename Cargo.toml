@@ -1,0 +1,22 @@
+[package]
+name = "hipp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A little no_std database that reads and writes SQLite database files (v0.1 profile, pinned claim version: SQLite 3.54.1 file format)"
+
+[features]
+default = ["std"]
+# Host file storage (std::fs). The core engine is no_std with or without it.
+std = []
+
+[dependencies]
+
+[profile.tiny]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dev-dependencies]
