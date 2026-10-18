@@ -373,13 +373,23 @@ enum ScanFrame {
 pub struct ScanCursor {
     stack: AVec<ScanFrame>,
     done: bool,
+    /// Parsed-cell cache for the leaf currently being yielded from:
+    /// a page is loaded, snapshotted, and parsed once, not once per
+    /// row (SPEC §4.1's steady-state scan-loop gate).
+    leaf_cache_page: u32,
+    leaf_cache: AVec<LeafCell>,
 }
 
 impl ScanCursor {
     pub fn new(root: u32) -> ScanCursor {
         let mut stack = AVec::new();
         stack.push(ScanFrame::Unresolved { page: root });
-        ScanCursor { stack, done: false }
+        ScanCursor {
+            stack,
+            done: false,
+            leaf_cache_page: 0,
+            leaf_cache: AVec::new(),
+        }
     }
 
     /// Advance to the next row: (rowid, full payload).
@@ -447,8 +457,11 @@ impl ScanCursor {
                     self.stack.pop();
                     continue;
                 }
-                let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
-                let cell = cells.as_slice()[ci].clone();
+                if self.leaf_cache_page != page {
+                    self.leaf_cache = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                    self.leaf_cache_page = page;
+                }
+                let cell = self.leaf_cache.as_slice()[ci].clone();
                 // Checkpoint progress BEFORE the payload awaits
                 // (SPEC §5.1.1): a dropped future re-produces this
                 // row rather than skipping it — the executor only
