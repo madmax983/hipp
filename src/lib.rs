@@ -16,7 +16,9 @@ extern crate std;
 
 #[allow(unsafe_code)] // the bounded arena exception (SPEC §6)
 pub mod arena;
+pub mod btree;
 pub mod error;
+pub mod pager;
 pub mod record;
 #[allow(unsafe_code)] // no-op waker construction for block_on only
 pub mod storage;

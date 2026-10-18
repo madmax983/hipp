@@ -26,6 +26,9 @@ pub enum Sidecar {
 /// because the journal protocol ends by deleting the journal and
 /// recovery must tell a pre-existing journal from a freshly created
 /// empty one.
+// `async fn` in trait is deliberate (SPEC §5.1.1): RPITIT, no
+// boxing, no `async-trait` dependency; futures need not be Send.
+#[allow(async_fn_in_trait)]
 pub trait SidecarFile {
     type Error;
     /// Whether this sidecar already existed (with content or not)
@@ -44,6 +47,7 @@ pub trait SidecarFile {
 /// Byte-addressed async storage for one database file plus its
 /// sidecars. Page size is a pager-level runtime value; this trait
 /// knows nothing about pages.
+#[allow(async_fn_in_trait)]
 pub trait Storage {
     type Error;
     type Sidecar: SidecarFile<Error = Self::Error>;
@@ -71,6 +75,7 @@ pub enum LockLevel {
     Exclusive,
 }
 
+#[allow(async_fn_in_trait)]
 pub trait AdvisoryLock {
     type Error;
     async fn acquire(&mut self, level: LockLevel) -> Result<(), Self::Error>;
