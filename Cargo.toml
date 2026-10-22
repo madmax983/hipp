@@ -1,9 +1,13 @@
+[workspace]
+members = ["hipp-cli"]
+resolver = "2"
+
 [package]
 name = "hipp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A little no_std database that reads and writes SQLite database files (v0.1 profile, pinned claim version: SQLite 3.54.1 file format)"
+description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
 default = ["std"]
