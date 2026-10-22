@@ -151,6 +151,25 @@ impl<'a> Parser<'a> {
             self.insert::<E>()
         } else if self.cur_is_kw(b"SELECT") {
             self.select::<E>()
+        } else if self.cur_is_kw(b"BEGIN") {
+            self.pos += 1;
+            // BEGIN [TRANSACTION]; deferred/immediate/exclusive all
+            // parse — the engine has one lock level in v0.2.
+            let _ = self.eat_kw(b"DEFERRED") || self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE");
+            let _ = self.eat_kw(b"TRANSACTION");
+            Ok(Ast::Begin)
+        } else if self.cur_is_kw(b"COMMIT") || self.cur_is_kw(b"END") {
+            self.pos += 1;
+            let _ = self.eat_kw(b"TRANSACTION");
+            Ok(Ast::Commit)
+        } else if self.cur_is_kw(b"ROLLBACK") {
+            self.pos += 1;
+            let _ = self.eat_kw(b"TRANSACTION");
+            // ROLLBACK TO <savepoint> is a later phase.
+            if self.cur_is_kw(b"TO") {
+                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+            }
+            Ok(Ast::Rollback)
         } else if self.at_eof() {
             Err(perr(self.cur().offset, ParseKind::UnexpectedEof))
         } else {
@@ -432,24 +451,33 @@ impl<'a> Parser<'a> {
             columns = Some(cols);
         }
         self.expect_kw::<E>(b"VALUES")?;
-        self.expect::<E>(Tok::LParen)?;
-        let mut values = AVec::new();
+        // v0.2: one or more parenthesised rows, comma-separated.
+        let mut rows = AVec::new();
         loop {
-            let (lit, used) = self
-                .literal_at(self.pos)
-                .ok_or(perr(self.cur().offset, ParseKind::UnexpectedToken))?;
-            values.push(lit);
-            self.pos += used;
+            self.expect::<E>(Tok::LParen)?;
+            let mut row = AVec::new();
+            loop {
+                let (lit, used) = self
+                    .literal_at(self.pos)
+                    .ok_or(perr(self.cur().offset, ParseKind::UnexpectedToken))?;
+                row.push(lit);
+                self.pos += used;
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                self.expect::<E>(Tok::RParen)?;
+                break;
+            }
+            rows.push(row);
             if self.eat(Tok::Comma) {
                 continue;
             }
-            self.expect::<E>(Tok::RParen)?;
             break;
         }
         Ok(Ast::Insert {
             table,
             columns,
-            values,
+            rows,
         })
     }
 
@@ -472,7 +500,26 @@ impl<'a> Parser<'a> {
         };
         self.expect_kw::<E>(b"FROM")?;
         let table = self.name::<E>()?;
-        Ok(Ast::Select { table, list })
+        // v0.2: optional WHERE <column> = <literal>. Any other
+        // predicate shape is rejected here; whether <column> is the
+        // rowid is a plan-time decision (the executor seam).
+        let mut predicate = None;
+        if self.eat_kw(b"WHERE") {
+            let col = self.name::<E>()?;
+            if !self.eat(Tok::Eq) {
+                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+            }
+            let (lit, used) = self
+                .literal_at(self.pos)
+                .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
+            self.pos += used;
+            predicate = Some((col, lit));
+        }
+        Ok(Ast::Select {
+            table,
+            list,
+            predicate,
+        })
     }
 }
 

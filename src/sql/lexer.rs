@@ -26,6 +26,8 @@ pub enum Tok {
     Minus,
     Plus,
     Dot,
+    /// `=` (v0.2: WHERE rowid = <literal>).
+    Eq,
     Eof,
 }
 
@@ -212,6 +214,13 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
             b'*' => {
                 toks.push(Token {
                     tok: Tok::Star,
+                    offset: off,
+                });
+                i += 1;
+            }
+            b'=' => {
+                toks.push(Token {
+                    tok: Tok::Eq,
                     offset: off,
                 });
                 i += 1;

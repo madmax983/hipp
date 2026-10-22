@@ -73,6 +73,10 @@ pub enum Error<E> {
     CacheExhausted,
     /// A second driver for an in-flight transaction stage (SPEC §5.1.2).
     OperationInFlight,
+    /// Transaction-control statement in the wrong state (v0.2):
+    /// `BEGIN` while an explicit transaction is already open
+    /// (`nested: true`), or `COMMIT`/`ROLLBACK` with none open.
+    TransactionState { nested: bool },
     /// An arena hit its configured maximum (SPEC §7.5.4).
     ArenaExhausted { scope: Scope, needed: usize },
     /// The rollback journal is malformed beyond safe recovery.
@@ -109,6 +113,7 @@ impl<E> Error<E> {
             Error::Parse { offset, kind } => Error::Parse { offset, kind },
             Error::CacheExhausted => Error::CacheExhausted,
             Error::OperationInFlight => Error::OperationInFlight,
+            Error::TransactionState { nested } => Error::TransactionState { nested },
             Error::ArenaExhausted { scope, needed } => Error::ArenaExhausted { scope, needed },
             Error::CorruptJournal => Error::CorruptJournal,
             Error::Storage(e) => Error::Storage(e.into()),

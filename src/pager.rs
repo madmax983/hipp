@@ -184,6 +184,12 @@ pub struct Pager<S: Storage> {
     cache_cap: usize,
     sidecar: Option<S::Sidecar>,
     stage: CommitStage,
+    /// Header snapshot taken when the write txn opens (v0.2): a
+    /// rollback from the `Writing` stage restores schema cookie,
+    /// freelist and page count in memory too, not just via the
+    /// journal image on disk. (The commit-begun rollback path
+    /// re-reads the header from page 1 instead.)
+    txn_header: Option<DbHeader>,
     orig_page_count: u32,
     dirty: Vec<u32>,
     journaled: Vec<u32>,
@@ -296,6 +302,7 @@ impl<S: Storage> Pager<S> {
                 cache_cap,
                 sidecar: Some(sidecar),
                 stage: CommitStage::Idle,
+                txn_header: None,
                 orig_page_count: header.page_count,
                 dirty: Vec::new(),
                 journaled: Vec::new(),
@@ -427,6 +434,7 @@ impl<S: Storage> Pager<S> {
         let sidecar = self.sidecar.as_mut().expect("sidecar from open");
         sidecar.write_at(0, &hdr).await.map_err(Error::Storage)?;
         self.journal_len = u64::from(SECTOR_SIZE);
+        self.txn_header = Some(self.header);
         self.stage = CommitStage::Writing;
         Ok(())
     }
@@ -635,6 +643,7 @@ impl<S: Storage> Pager<S> {
                     self.dirty.clear();
                     self.journaled.clear();
                     self.journal_len = 0;
+                    self.txn_header = None;
                     self.stage = CommitStage::Idle;
                     self.txn_arena.reset();
                     return Ok(());
@@ -654,6 +663,12 @@ impl<S: Storage> Pager<S> {
             CommitStage::Writing => {
                 let sidecar = self.sidecar.as_mut().expect("sidecar from open");
                 sidecar.delete().await.map_err(Error::Storage)?;
+                // No data page has moved: restore the in-memory
+                // header (schema cookie / freelist / page count may
+                // have been mutated by the aborted txn).
+                if let Some(h) = self.txn_header.take() {
+                    self.header = h;
+                }
             }
             _ => {
                 // Commit had begun: replay the journal over whatever
@@ -674,6 +689,7 @@ impl<S: Storage> Pager<S> {
                     .await
                     .map_err(Error::Storage)?;
                 self.header = parse_db_header::<S::Error>(&probe, fl)?;
+                self.txn_header = None;
             }
         }
         for f in self.frames.iter_mut() {

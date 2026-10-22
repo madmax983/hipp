@@ -307,3 +307,144 @@ fn a11_drop_mid_commit_reopen_recovers() {
         assert_eq!(ids, vec![1]);
     });
 }
+
+// ---------------- v0.2: explicit transactions under drop ----------------
+
+async fn v02_exec(db: &mut Connection<PendStorage>, sql: &str) {
+    let mut st = db.prepare(sql).await.expect("prep");
+    assert_eq!(st.step().await.expect("step"), Step::Done);
+}
+
+async fn v02_ids<S: Storage>(db: &mut Connection<S>) -> Vec<i64>
+where
+    S::Error: core::fmt::Debug,
+{
+    let mut q = db.prepare("SELECT id FROM t").await.expect("prep");
+    let mut out = Vec::new();
+    while q.step().await.expect("step") == Step::Row {
+        out.push(q.column_i64(0).expect("id"));
+    }
+    out
+}
+
+/// Open a pend-injected connection with table `t` and one
+/// autocommitted row (id 1). Returns the storage handle, the op
+/// log, and the connection.
+async fn v02_setup() -> (MemStorage, Log, Connection<PendStorage>) {
+    let mem = MemStorage::new();
+    let ps = PendStorage::new(mem.clone(), 3);
+    let log = ps.log.clone();
+    let mut db = Connection::open(ps, Config::default()).await.expect("open");
+    v02_exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)").await;
+    v02_exec(&mut db, "INSERT INTO t VALUES (1, 'one')").await;
+    (mem, log, db)
+}
+
+#[test]
+fn v02_drop_mid_commit_of_explicit_txn_resumes() {
+    block_on(async {
+        let (mem, log, mut db) = v02_setup().await;
+        v02_exec(&mut db, "BEGIN").await;
+        v02_exec(&mut db, "INSERT INTO t VALUES (2, 'two'), (3, 'three')").await;
+        log.borrow_mut().clear();
+        // Drive the COMMIT future to the same unambiguous
+        // mid-commit point as the A11 helper, then drop it.
+        let mut st = db.prepare("COMMIT").await.expect("prep commit");
+        let mut fut = Box::pin(st.step());
+        let mut polls = 0usize;
+        loop {
+            let _ = poll_once(fut.as_mut());
+            polls += 1;
+            assert!(polls < 100_000, "COMMIT future never reached mid-commit");
+            let l = log.borrow();
+            if l.contains(&"jsync") && !l.contains(&"write") {
+                break;
+            }
+        }
+        drop(fut);
+        drop(st);
+        assert!(db.in_transaction(), "commit still in flight");
+        assert!(
+            db.in_explicit_transaction(),
+            "bracket open: the commit never landed"
+        );
+        let r = db.prepare("SELECT id FROM t").await;
+        assert!(
+            matches!(r, Err(Error::OperationInFlight)),
+            "second driver: {:?}",
+            r.err()
+        );
+        // resume_txn finishes the explicit transaction's commit:
+        // post-image, bracket closed.
+        assert!(db.resume_txn().await.expect("resume"));
+        assert!(!db.in_transaction());
+        assert!(!db.in_explicit_transaction());
+        assert_eq!(v02_ids(&mut db).await, vec![1, 2, 3]);
+        assert!(mem.journal_snapshot().is_none(), "journal deleted");
+    });
+}
+
+#[test]
+fn v02_drop_mid_rollback_retries() {
+    block_on(async {
+        let (mem, _log, mut db) = v02_setup().await;
+        v02_exec(&mut db, "BEGIN").await;
+        v02_exec(&mut db, "INSERT INTO t VALUES (2, 'two')").await;
+        // Poll the ROLLBACK future exactly once: with per_op=3 the
+        // journal delete cannot have completed, so the rollback is
+        // unambiguously unfinished when the future drops.
+        let mut st = db.prepare("ROLLBACK").await.expect("prep rollback");
+        let mut fut = Box::pin(st.step());
+        let _ = poll_once(fut.as_mut());
+        drop(fut);
+        drop(st);
+        assert!(
+            db.in_explicit_transaction(),
+            "bracket survives the dropped rollback"
+        );
+        // Retrying the rollback succeeds: pre-image restored.
+        v02_exec(&mut db, "ROLLBACK").await;
+        assert!(!db.in_explicit_transaction());
+        assert!(!db.in_transaction());
+        assert_eq!(v02_ids(&mut db).await, vec![1]);
+        assert!(mem.journal_snapshot().is_none(), "journal deleted");
+    });
+}
+
+#[test]
+fn v02_dropped_insert_in_txn_then_rollback() {
+    block_on(async {
+        let (mem, _log, mut db) = v02_setup().await;
+        v02_exec(&mut db, "BEGIN").await;
+        // Poll the INSERT future until a journal record has landed
+        // (journal longer than its header sector): the statement
+        // is mid-write, transaction open at the Writing stage.
+        let mut st = db
+            .prepare("INSERT INTO t VALUES (2, 'two')")
+            .await
+            .expect("prep insert");
+        let mut fut = Box::pin(st.step());
+        let mut polls = 0usize;
+        loop {
+            let _ = poll_once(fut.as_mut());
+            polls += 1;
+            assert!(polls < 100_000, "insert future made no progress");
+            let jlen = mem.journal_snapshot().map_or(0, |j| j.len());
+            if jlen > 512 {
+                break;
+            }
+        }
+        drop(fut);
+        drop(st);
+        assert!(db.in_transaction(), "write txn left open by the drop");
+        // ROLLBACK resolves it: pre-image, on this connection and
+        // after a reopen.
+        v02_exec(&mut db, "ROLLBACK").await;
+        assert_eq!(v02_ids(&mut db).await, vec![1]);
+        drop(db);
+        let mut db = Connection::open(mem.clone(), Config::default())
+            .await
+            .expect("reopen");
+        assert_eq!(v02_ids(&mut db).await, vec![1]);
+    });
+}

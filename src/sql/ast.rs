@@ -46,10 +46,22 @@ pub enum Ast {
         table: ABytes,
         /// Explicit column list, if given.
         columns: Option<AVec<ABytes>>,
-        values: AVec<Literal>,
+        /// One entry per `VALUES` row (v0.2: multi-row VALUES).
+        rows: AVec<AVec<Literal>>,
     },
     Select {
         table: ABytes,
         list: SelectList,
+        /// Optional `WHERE <column> = <literal>` (v0.2). The plan
+        /// stage resolves whether the column is the rowid (or its
+        /// alias); any other column is an executor-level rejection,
+        /// and this pair is the seam general WHERE hangs off.
+        predicate: Option<(ABytes, Literal)>,
     },
+    /// `BEGIN [TRANSACTION]` (v0.2).
+    Begin,
+    /// `COMMIT [TRANSACTION]` / `END [TRANSACTION]` (v0.2).
+    Commit,
+    /// `ROLLBACK [TRANSACTION]` (v0.2).
+    Rollback,
 }

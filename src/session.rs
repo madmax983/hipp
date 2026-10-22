@@ -112,6 +112,20 @@ pub enum Step {
     Done,
 }
 
+/// Rowid access path the planner chose for a scan (v0.2). This is
+/// the executor seam for general WHERE: richer predicates lower
+/// to these same paths in later phases.
+#[derive(Debug, Clone, Copy)]
+enum Access {
+    /// No usable predicate: full B-tree scan.
+    FullScan,
+    /// `WHERE rowid = <v>`: point lookup via `btree::seek_rowid`.
+    Rowid(i64),
+    /// A predicate that can never match (e.g. `rowid = NULL`,
+    /// `rowid = 'abc'`): the scan yields no rows.
+    Empty,
+}
+
 enum Plan {
     CreateTable,
     Insert {
@@ -119,8 +133,8 @@ enum Plan {
         rowid_alias: Option<usize>,
         /// Per-table-column plan data (affinity + default).
         cols: AVec<InsCol>,
-        /// Where each supplied value goes, parallel to the AST's
-        /// value list.
+        /// Where each supplied value goes, parallel to one AST
+        /// value row (every row of a multi-row VALUES shares it).
         targets: AVec<Target>,
     },
     Scan {
@@ -133,7 +147,14 @@ enum Plan {
         /// serial type; fetching must yield a real).
         aff: AVec<crate::record::Affinity>,
         defaults: AVec<OwnedValue>,
+        access: Access,
     },
+    /// `BEGIN` (v0.2): state is validated again at step time.
+    Begin,
+    /// `COMMIT` (v0.2).
+    Commit,
+    /// `ROLLBACK` (v0.2).
+    Rollback,
 }
 
 struct InsCol {
@@ -152,6 +173,10 @@ pub struct Connection<S: Storage> {
     catalog_arena: Arena,
     catalog: Catalog,
     cfg: Config,
+    /// An explicit `BEGIN` is open (v0.2). The pager transaction
+    /// itself opens lazily at the first write, as in SQLite; while
+    /// this flag is set, write statements do not autocommit.
+    explicit_txn: bool,
 }
 
 impl<S: Storage> Connection<S> {
@@ -173,6 +198,7 @@ impl<S: Storage> Connection<S> {
             catalog_arena,
             catalog: Catalog::empty(u32::MAX),
             cfg,
+            explicit_txn: false,
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -223,7 +249,7 @@ impl<S: Storage> Connection<S> {
             Ast::Insert {
                 table,
                 columns,
-                values,
+                rows,
             } => {
                 let tname = handle_bytes(arena, *table);
                 let t = self
@@ -239,24 +265,28 @@ impl<S: Storage> Connection<S> {
                         default: literal_owned(&self.catalog_arena, c.default),
                     });
                 }
+                // Every row of a multi-row VALUES must match the
+                // expected width (SQLite: "all VALUES must have
+                // the same number of terms").
+                let width = match columns {
+                    None => t.columns.len(),
+                    Some(names) => names.len(),
+                };
+                for r in rows.iter() {
+                    if r.len() != width {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::ColumnCountMismatch,
+                        });
+                    }
+                }
                 let mut targets = AVec::new();
                 match columns {
                     None => {
-                        if values.len() != t.columns.len() {
-                            return Err(Error::Schema {
-                                kind: SchemaKind::ColumnCountMismatch,
-                            });
-                        }
                         for i in 0..t.columns.len() {
                             targets.push(Target::Col(i));
                         }
                     }
                     Some(names) => {
-                        if names.len() != values.len() {
-                            return Err(Error::Schema {
-                                kind: SchemaKind::ColumnCountMismatch,
-                            });
-                        }
                         for n in names.iter() {
                             let nb = handle_bytes(arena, *n);
                             targets.push(self.resolve_target(t, nb)?);
@@ -270,7 +300,19 @@ impl<S: Storage> Connection<S> {
                     targets,
                 })
             }
-            Ast::Select { table, list } => {
+            Ast::Begin => {
+                if self.explicit_txn {
+                    return Err(Error::TransactionState { nested: true });
+                }
+                Ok(Plan::Begin)
+            }
+            Ast::Commit => Ok(Plan::Commit),
+            Ast::Rollback => Ok(Plan::Rollback),
+            Ast::Select {
+                table,
+                list,
+                predicate,
+            } => {
                 let tname = handle_bytes(arena, *table);
                 let t = self
                     .catalog
@@ -278,6 +320,22 @@ impl<S: Storage> Connection<S> {
                     .ok_or(Error::Schema {
                         kind: SchemaKind::UnknownTable,
                     })?;
+                // WHERE <col> = <literal> lowers to a rowid access
+                // path when <col> is the rowid or its alias; any
+                // other real column is beyond v0.2's executor.
+                let access = match predicate {
+                    None => Access::FullScan,
+                    Some((colname, lit)) => {
+                        let nb = handle_bytes(arena, *colname);
+                        match self.resolve_target(t, nb)? {
+                            Target::Rowid => literal_rowid(arena, *lit),
+                            Target::Col(i) if Some(i) == t.rowid_alias => {
+                                literal_rowid(arena, *lit)
+                            }
+                            Target::Col(_) => return Err(Error::Unsupported),
+                        }
+                    }
+                };
                 let mut out = AVec::new();
                 let mut aff = AVec::new();
                 match list {
@@ -314,6 +372,7 @@ impl<S: Storage> Connection<S> {
                     out,
                     aff,
                     defaults,
+                    access,
                 })
             }
         }
@@ -341,18 +400,44 @@ impl<S: Storage> Connection<S> {
             return Ok(false);
         }
         self.pager.drive_commit().await?;
+        // The resumed transaction is committed, which closes any
+        // explicit bracket that contained it (v0.2).
+        self.explicit_txn = false;
         Ok(true)
     }
 
     /// Roll back the connection's open transaction, if any.
     pub async fn rollback(&mut self) -> Result<(), S::Error> {
-        self.pager.rollback().await
+        self.pager.rollback().await?;
+        self.explicit_txn = false;
+        Ok(())
     }
 
     /// Whether a write transaction is currently open on this
     /// connection (including one left behind by a dropped future).
     pub fn in_transaction(&self) -> bool {
         self.pager.in_txn()
+    }
+
+    /// Whether an explicit `BEGIN` transaction is open (v0.2).
+    /// Distinct from `in_transaction`, which reports the pager's
+    /// write transaction — that one opens lazily at first write.
+    pub fn in_explicit_transaction(&self) -> bool {
+        self.explicit_txn
+    }
+
+    /// Catalog entries for tools (the CLI's `.tables` / `.schema`
+    /// / `.dump`): table name + stored CREATE SQL, in schema
+    /// (creation) order.
+    pub fn tables(&self) -> AVec<TableMeta<'_>> {
+        let mut out = AVec::new();
+        for t in self.catalog.tables.iter() {
+            out.push(TableMeta {
+                name: handle_bytes(&self.catalog_arena, t.name),
+                sql: handle_bytes(&self.catalog_arena, t.sql),
+            });
+        }
+        out
     }
 
     /// Mutable pager access for tools/tests driving the layers
@@ -375,6 +460,14 @@ impl<S: Storage> Connection<S> {
             page_count: self.pager.page_count(),
         }
     }
+}
+
+/// One catalog row for tools: a table's name and its stored
+/// `CREATE TABLE` text (SPEC §5.5 stores the statement as issued).
+#[derive(Debug, Clone, Copy)]
+pub struct TableMeta<'a> {
+    pub name: &'a [u8],
+    pub sql: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -424,6 +517,47 @@ fn copy_vec(b: &[u8]) -> AVec<u8> {
     v
 }
 
+/// Coerce a `WHERE rowid = <literal>` literal to an access path,
+/// following SQLite's comparison rules: the literal gets numeric
+/// conversion, and a value that cannot equal any rowid yields an
+/// empty scan — never an error.
+fn literal_rowid(arena: &Arena, lit: Literal) -> Access {
+    match lit {
+        Literal::Integer(i) => Access::Rowid(i),
+        Literal::Real(f) => match integral_f64(f) {
+            Some(i) => Access::Rowid(i),
+            None => Access::Empty,
+        },
+        Literal::Text(h) => {
+            let b = handle_bytes(arena, h);
+            let Ok(s) = core::str::from_utf8(b) else {
+                return Access::Empty;
+            };
+            let s = s.trim();
+            if let Ok(i) = s.parse::<i64>() {
+                return Access::Rowid(i);
+            }
+            match s.parse::<f64>() {
+                Ok(f) => match integral_f64(f) {
+                    Some(i) => Access::Rowid(i),
+                    None => Access::Empty,
+                },
+                Err(_) => Access::Empty,
+            }
+        }
+        _ => Access::Empty,
+    }
+}
+
+/// `f` as an `i64` when it is exactly integral and in range.
+fn integral_f64(f: f64) -> Option<i64> {
+    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        Some(f as i64)
+    } else {
+        None
+    }
+}
+
 impl<'c, S: Storage> Statement<'c, S> {
     /// Execute/advance the statement by one step.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
@@ -431,7 +565,58 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::CreateTable => self.step_create().await,
             Plan::Insert { .. } => self.step_insert().await,
             Plan::Scan { .. } => self.step_scan().await,
+            Plan::Begin => self.step_begin().await,
+            Plan::Commit => self.step_commit().await,
+            Plan::Rollback => self.step_rollback().await,
         }
+    }
+
+    /// `BEGIN` (v0.2): opens the explicit bracket only — the pager
+    /// transaction itself opens lazily at the first write, so a
+    /// read-only transaction never touches the journal (as SQLite).
+    async fn step_begin(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        if self.conn.explicit_txn {
+            return Err(Error::TransactionState { nested: true });
+        }
+        self.conn.explicit_txn = true;
+        self.phase = Phase::Done;
+        Ok(Step::Done)
+    }
+
+    /// `COMMIT` (v0.2): drives the pager's resumable commit machine.
+    /// A storage error leaves the bracket open and the stage
+    /// resumable (`resume_txn` / a retry finishes it) — the flag is
+    /// only cleared once the commit point has passed.
+    async fn step_commit(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        if !self.conn.explicit_txn {
+            return Err(Error::TransactionState { nested: false });
+        }
+        self.conn.pager.drive_commit().await?;
+        self.conn.explicit_txn = false;
+        self.phase = Phase::Done;
+        Ok(Step::Done)
+    }
+
+    /// `ROLLBACK` (v0.2): the pager's rollback restores the
+    /// pre-image; a read-only bracket (pager still idle) is a no-op
+    /// at the pager level.
+    async fn step_rollback(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        if !self.conn.explicit_txn {
+            return Err(Error::TransactionState { nested: false });
+        }
+        self.conn.pager.rollback().await?;
+        self.conn.explicit_txn = false;
+        self.phase = Phase::Done;
+        Ok(Step::Done)
     }
 
     async fn step_create(&mut self) -> Result<Step, S::Error> {
@@ -479,8 +664,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                // §7.5.4: a failed write leaves no trace.
+                // §7.5.4: a failed write leaves no trace. Inside
+                // an explicit transaction the rollback ends the
+                // whole bracket (v0.2 note: stricter than SQLite's
+                // statement-level abort — see STATUS).
                 let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
                 Err(e)
             }
         }
@@ -504,7 +693,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         encode_record(vals.as_slice(), &mut rec);
         btree::btree_insert(pager, 1, schema_rowid, rec.as_slice()).await?;
         pager.bump_schema_cookie();
-        pager.drive_commit().await?;
+        if !self.conn.explicit_txn {
+            pager.drive_commit().await?;
+        }
         Ok(())
     }
 
@@ -519,13 +710,29 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
+                // Same abort rule as CREATE (see step_create).
                 let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
                 Err(e)
             }
         }
     }
 
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
+        let Ast::Insert { rows, .. } = &self.ast else {
+            unreachable!()
+        };
+        let nrows = rows.len();
+        for r in 0..nrows {
+            self.exec_insert_row(r).await?;
+        }
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
+    async fn exec_insert_row(&mut self, row_idx: usize) -> Result<(), S::Error> {
         let Plan::Insert {
             root,
             rowid_alias,
@@ -535,9 +742,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         else {
             unreachable!()
         };
-        let Ast::Insert { values, .. } = &self.ast else {
+        let Ast::Insert { rows, .. } = &self.ast else {
             unreachable!()
         };
+        let values = &rows.as_slice()[row_idx];
         let ncols = cols.len();
         let mut row: AVec<OwnedValue> = AVec::new();
         for c in cols.iter() {
@@ -597,7 +805,6 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut rec = AVec::new();
         encode_record(vals.as_slice(), &mut rec);
         btree::btree_insert(pager, *root, rowid, rec.as_slice()).await?;
-        pager.drive_commit().await?;
         Ok(())
     }
 
@@ -608,28 +815,73 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Per-row checkpoint rewind (§7.5.2): the previous row's
         // arena temporaries die before the next row is decoded.
         self.arena.rewind(self.row_ckpt);
+        let Plan::Scan { root, access, .. } = &self.plan else {
+            unreachable!()
+        };
+        let (root, access) = (*root, *access);
+        match access {
+            Access::Empty => {
+                self.phase = Phase::Done;
+                self.current_rowid = None;
+                Ok(Step::Done)
+            }
+            Access::Rowid(want) => {
+                if self.phase == Phase::Running {
+                    // The single matching row was already produced.
+                    self.phase = Phase::Done;
+                    self.current_rowid = None;
+                    return Ok(Step::Done);
+                }
+                let found = btree::seek_rowid(&mut self.conn.pager, root, want).await?;
+                match found {
+                    None => {
+                        self.phase = Phase::Done;
+                        self.current_rowid = None;
+                        Ok(Step::Done)
+                    }
+                    Some(payload) => {
+                        self.row_buf = payload;
+                        self.project_current(want)?;
+                        self.phase = Phase::Running;
+                        Ok(Step::Row)
+                    }
+                }
+            }
+            Access::FullScan => {
+                if self.cursor.is_none() {
+                    self.cursor = Some(ScanCursor::new(root));
+                }
+                let cursor = self.cursor.as_mut().expect("just set");
+                let next = cursor
+                    .next_row_into(&mut self.conn.pager, &mut self.row_buf)
+                    .await?;
+                let Some(rowid) = next else {
+                    self.phase = Phase::Done;
+                    self.current_rowid = None;
+                    return Ok(Step::Done);
+                };
+                self.project_current(rowid)?;
+                self.phase = Phase::Running;
+                Ok(Step::Row)
+            }
+        }
+    }
+
+    /// Decode `row_buf` (the payload of the row at `rowid`) into
+    /// the current-row values, applying the plan's projection and
+    /// read-side affinity rules. Shared by the scan and rowid-seek
+    /// access paths.
+    fn project_current(&mut self, rowid: i64) -> Result<(), S::Error> {
         let Plan::Scan {
-            root,
             rowid_alias,
             ncols,
             out,
             aff,
             defaults,
+            ..
         } = &self.plan
         else {
             unreachable!()
-        };
-        if self.cursor.is_none() {
-            self.cursor = Some(ScanCursor::new(*root));
-        }
-        let cursor = self.cursor.as_mut().expect("just set");
-        let next = cursor
-            .next_row_into(&mut self.conn.pager, &mut self.row_buf)
-            .await?;
-        let Some(rowid) = next else {
-            self.phase = Phase::Done;
-            self.current_rowid = None;
-            return Ok(Step::Done);
         };
         let mut dec: AVec<Value<'_>> = AVec::new();
         crate::record::decode_record_into::<S::Error>(self.row_buf.as_slice(), *ncols, &mut dec)?;
@@ -654,8 +906,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.current.push(v);
         }
         self.current_rowid = Some(rowid);
-        self.phase = Phase::Running;
-        Ok(Step::Row)
+        Ok(())
     }
 
     /// Number of result columns (0 for non-SELECT statements).
