@@ -30,10 +30,7 @@ fn temp_db(tag: &str) -> PathBuf {
 }
 
 fn run(bin: &str, args: &[&str]) -> Output {
-    Command::new(bin)
-        .args(args)
-        .output()
-        .expect("binary runs")
+    Command::new(bin).args(args).output().expect("binary runs")
 }
 
 fn run_stdin(bin: &str, db: &str, script: &str) -> Output {
@@ -81,10 +78,7 @@ fn oneshot_output_byte_identical_to_oracle() {
     let hdb = temp_db("oneshot-h");
     let odb = temp_db("oneshot-o");
     let hout = run(hipp_bin(), &[hdb.to_str().unwrap(), CORPUS]);
-    let oout = run(
-        oracle().to_str().unwrap(),
-        &[odb.to_str().unwrap(), CORPUS],
-    );
+    let oout = run(oracle().to_str().unwrap(), &[odb.to_str().unwrap(), CORPUS]);
     assert!(
         hout.status.success(),
         "hipp failed: {}",
@@ -165,7 +159,10 @@ fn dot_dump_reimports_into_oracle() {
     // Feed hipp's dump to the oracle on a fresh file; the oracle's
     // rendering must equal hipp's rendering of the original.
     let odb = temp_db("dump-o");
-    let imp = run(oracle().to_str().unwrap(), &[odb.to_str().unwrap(), &dump_sql]);
+    let imp = run(
+        oracle().to_str().unwrap(),
+        &[odb.to_str().unwrap(), &dump_sql],
+    );
     assert!(
         imp.status.success(),
         "oracle rejected hipp dump: {}",
@@ -192,9 +189,15 @@ fn dot_open_switches_database() {
         String::from_utf8_lossy(&out.stderr)
     );
     let ob = oracle();
-    let ra = run(ob.to_str().unwrap(), &[a.to_str().unwrap(), "SELECT id FROM ina;"]);
+    let ra = run(
+        ob.to_str().unwrap(),
+        &[a.to_str().unwrap(), "SELECT id FROM ina;"],
+    );
     assert_eq!(String::from_utf8_lossy(&ra.stdout), "1\n");
-    let rb = run(ob.to_str().unwrap(), &[b.to_str().unwrap(), "SELECT id FROM inb;"]);
+    let rb = run(
+        ob.to_str().unwrap(),
+        &[b.to_str().unwrap(), "SELECT id FROM inb;"],
+    );
     assert_eq!(String::from_utf8_lossy(&rb.stdout), "2\n");
 }
 
@@ -222,9 +225,6 @@ fn errors_exit_nonzero_with_stderr() {
     ] {
         let out = run(hipp_bin(), &[db.to_str().unwrap(), sql]);
         assert!(!out.status.success(), "{sql} unexpectedly succeeded");
-        assert!(
-            !out.stderr.is_empty(),
-            "{sql} failed silently (no stderr)"
-        );
+        assert!(!out.stderr.is_empty(), "{sql} failed silently (no stderr)");
     }
 }

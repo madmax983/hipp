@@ -1,4 +1,6 @@
-//! AST for the v0.1 grammar (SPEC §5.6). Text/blob bytes live in
+//! AST for the SQL grammar (SPEC §5.6; v0.2 adds multi-row
+//! VALUES, `WHERE rowid =`, and transaction control). Text/blob
+//! bytes live in
 //! the statement arena and are referenced by `ABytes` handles, so
 //! the tree holds no self-referential borrows.
 

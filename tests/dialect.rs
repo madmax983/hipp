@@ -68,9 +68,12 @@ fn multi_row_values_hipp_writes_oracle_reads() {
         {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v REAL)")
-                .await
-                .unwrap();
+            exec(
+                &mut db,
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, v REAL)",
+            )
+            .await
+            .unwrap();
             // Mixed explicit + auto rowids, out of order, one row.
             exec(
                 &mut db,
@@ -78,11 +81,16 @@ fn multi_row_values_hipp_writes_oracle_reads() {
             )
             .await
             .unwrap();
-            exec(&mut db, "INSERT INTO t VALUES (10, 'ten', 0.0)").await.unwrap();
-            // Auto rowids continue from the max (11, 12).
-            exec(&mut db, "INSERT INTO t (name) VALUES ('auto-a'), ('auto-b')")
+            exec(&mut db, "INSERT INTO t VALUES (10, 'ten', 0.0)")
                 .await
                 .unwrap();
+            // Auto rowids continue from the max (11, 12).
+            exec(
+                &mut db,
+                "INSERT INTO t (name) VALUES ('auto-a'), ('auto-b')",
+            )
+            .await
+            .unwrap();
             // Explicit column list, reordered.
             exec(
                 &mut db,
@@ -133,15 +141,20 @@ fn multi_row_values_oracle_writes_hipp_reads() {
 fn multi_row_values_errors_are_atomic() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
-        exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
+        exec(
+            &mut db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .await
+        .unwrap();
+        exec(&mut db, "INSERT INTO t VALUES (1, 'one')")
             .await
             .unwrap();
-        exec(&mut db, "INSERT INTO t VALUES (1, 'one')").await.unwrap();
         // Width mismatch in the second row: prepare-time error.
-        let r = db
-            .prepare("INSERT INTO t VALUES (2, 'two'), (3)")
-            .await;
+        let r = db.prepare("INSERT INTO t VALUES (2, 'two'), (3)").await;
         assert!(
             matches!(
                 r,
@@ -175,10 +188,15 @@ fn multi_row_values_errors_are_atomic() {
 fn where_rowid_hit_and_miss() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
-        exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        let mut db = Connection::open(mem, Config::default())
             .await
-            .unwrap();
+            .expect("open");
+        exec(
+            &mut db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .await
+        .unwrap();
         exec(
             &mut db,
             "INSERT INTO t VALUES (-7, 'neg'), (1, 'one'), (2, 'two'), (3, 'three')",
@@ -242,9 +260,12 @@ fn where_rowid_deep_tree_and_oracle_agreement() {
         {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")
-                .await
-                .unwrap();
+            exec(
+                &mut db,
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)",
+            )
+            .await
+            .unwrap();
             for chunk in 0..10 {
                 let mut sql = String::from("INSERT INTO t VALUES ");
                 for i in 0..50 {
@@ -273,7 +294,10 @@ fn where_rowid_deep_tree_and_oracle_agreement() {
             common::cli(&path, "SELECT id, data FROM t WHERE rowid = 250;"),
             format!("250|{payload}250\n")
         );
-        assert_eq!(common::cli(&path, "SELECT id FROM t WHERE rowid = 501;"), "");
+        assert_eq!(
+            common::cli(&path, "SELECT id FROM t WHERE rowid = 501;"),
+            ""
+        );
         assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
     });
 }
@@ -287,9 +311,12 @@ fn txn_commit_visible_to_oracle() {
         {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-                .await
-                .unwrap();
+            exec(
+                &mut db,
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+            )
+            .await
+            .unwrap();
             exec(&mut db, "BEGIN").await.unwrap();
             assert!(db.in_explicit_transaction());
             exec(&mut db, "INSERT INTO t VALUES (1, 'one'), (2, 'two')")
@@ -301,7 +328,9 @@ fn txn_commit_visible_to_oracle() {
             exec(&mut db, "COMMIT").await.unwrap();
             assert!(!db.in_explicit_transaction());
             // Autocommit resumes after the bracket.
-            exec(&mut db, "INSERT INTO t VALUES (3, 'three')").await.unwrap();
+            exec(&mut db, "INSERT INTO t VALUES (3, 'three')")
+                .await
+                .unwrap();
         }
         assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
         assert_eq!(
@@ -318,14 +347,22 @@ fn txn_rollback_invisible_to_oracle() {
         {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            exec(&mut db, "CREATE TABLE keep (id INTEGER PRIMARY KEY, name TEXT)")
+            exec(
+                &mut db,
+                "CREATE TABLE keep (id INTEGER PRIMARY KEY, name TEXT)",
+            )
+            .await
+            .unwrap();
+            exec(&mut db, "INSERT INTO keep VALUES (1, 'kept')")
                 .await
                 .unwrap();
-            exec(&mut db, "INSERT INTO keep VALUES (1, 'kept')").await.unwrap();
             exec(&mut db, "BEGIN TRANSACTION").await.unwrap();
-            exec(&mut db, "INSERT INTO keep VALUES (2, 'gone'), (3, 'alsogone')")
-                .await
-                .unwrap();
+            exec(
+                &mut db,
+                "INSERT INTO keep VALUES (2, 'gone'), (3, 'alsogone')",
+            )
+            .await
+            .unwrap();
             exec(&mut db, "CREATE TABLE temp_t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
@@ -348,15 +385,9 @@ fn txn_rollback_invisible_to_oracle() {
         }
         // Oracle side: only pre-transaction data, file intact.
         assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
+        assert_eq!(common::cli(&path, "SELECT id, name FROM keep;"), "1|kept\n");
         assert_eq!(
-            common::cli(&path, "SELECT id, name FROM keep;"),
-            "1|kept\n"
-        );
-        assert_eq!(
-            common::cli(
-                &path,
-                "SELECT name FROM sqlite_schema WHERE name='temp_t';"
-            ),
+            common::cli(&path, "SELECT name FROM sqlite_schema WHERE name='temp_t';"),
             ""
         );
     });
@@ -370,19 +401,19 @@ fn txn_create_commit_visible_to_oracle() {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
             exec(&mut db, "BEGIN").await.unwrap();
-            exec(&mut db, "CREATE TABLE made (id INTEGER PRIMARY KEY, x TEXT)")
-                .await
-                .unwrap();
+            exec(
+                &mut db,
+                "CREATE TABLE made (id INTEGER PRIMARY KEY, x TEXT)",
+            )
+            .await
+            .unwrap();
             exec(&mut db, "INSERT INTO made VALUES (1, 'a'), (2, 'b')")
                 .await
                 .unwrap();
             exec(&mut db, "END TRANSACTION").await.unwrap();
         }
         assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
-        assert_eq!(
-            common::cli(&path, "SELECT id, x FROM made;"),
-            "1|a\n2|b\n"
-        );
+        assert_eq!(common::cli(&path, "SELECT id, x FROM made;"), "1|a\n2|b\n");
     });
 }
 
@@ -390,7 +421,9 @@ fn txn_create_commit_visible_to_oracle() {
 fn txn_state_errors() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
         exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
             .await
             .unwrap();
@@ -426,12 +459,19 @@ fn txn_statement_error_aborts_bracket() {
         {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            exec(
+                &mut db,
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+            )
+            .await
+            .unwrap();
+            exec(&mut db, "INSERT INTO t VALUES (1, 'one')")
                 .await
                 .unwrap();
-            exec(&mut db, "INSERT INTO t VALUES (1, 'one')").await.unwrap();
             exec(&mut db, "BEGIN").await.unwrap();
-            exec(&mut db, "INSERT INTO t VALUES (2, 'two')").await.unwrap();
+            exec(&mut db, "INSERT INTO t VALUES (2, 'two')")
+                .await
+                .unwrap();
             // Duplicate rowid: error aborts the whole bracket
             // (v0.2's documented, stricter-than-SQLite rule).
             let e = exec_err(&mut db, "INSERT INTO t VALUES (1, 'dup')").await;

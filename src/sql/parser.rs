@@ -155,7 +155,8 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             // BEGIN [TRANSACTION]; deferred/immediate/exclusive all
             // parse — the engine has one lock level in v0.2.
-            let _ = self.eat_kw(b"DEFERRED") || self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE");
+            let _ =
+                self.eat_kw(b"DEFERRED") || self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE");
             let _ = self.eat_kw(b"TRANSACTION");
             Ok(Ast::Begin)
         } else if self.cur_is_kw(b"COMMIT") || self.cur_is_kw(b"END") {

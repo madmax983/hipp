@@ -28,8 +28,7 @@ fn open_db(path: &str) -> Result<Db, String> {
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::Mem(conn))
         } else {
-            let fs = FileStorage::open(std::path::Path::new(path))
-                .map_err(|e| format!("{e:?}"))?;
+            let fs = FileStorage::open(std::path::Path::new(path)).map_err(|e| format!("{e:?}"))?;
             let conn = Connection::open(fs, Config::default())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
@@ -169,16 +168,11 @@ where
 {
     let mut st = db.prepare(sql).await.map_err(|e| format!("{e:?}"))?;
     if st.column_count() > 0 {
-        loop {
-            match st.step().await.map_err(|e| format!("{e:?}"))? {
-                Step::Row => {
-                    let vals: Vec<Vec<u8>> = (0..st.column_count())
-                        .map(|i| value_bytes(st.column_value(i).unwrap_or(Value::Null)))
-                        .collect();
-                    write_row(out, &vals);
-                }
-                Step::Done => break,
-            }
+        while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
+            let vals: Vec<Vec<u8>> = (0..st.column_count())
+                .map(|i| value_bytes(st.column_value(i).unwrap_or(Value::Null)))
+                .collect();
+            write_row(out, &vals);
         }
         Ok(())
     } else {
@@ -295,23 +289,18 @@ where
                     .prepare(&format!("SELECT * FROM {name}"))
                     .await
                     .map_err(|e| format!("{e:?}"))?;
-                loop {
-                    match st.step().await.map_err(|e| format!("{e:?}"))? {
-                        Step::Row => {
-                            let mut line = format!("INSERT INTO {name} VALUES(").into_bytes();
-                            for i in 0..st.column_count() {
-                                if i > 0 {
-                                    line.extend_from_slice(b",");
-                                }
-                                line.extend_from_slice(&fmt_literal(
-                                    st.column_value(i).unwrap_or(Value::Null),
-                                ));
-                            }
-                            line.extend_from_slice(b");\n");
-                            let _ = out.write_all(&line);
+                while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
+                    let mut line = format!("INSERT INTO {name} VALUES(").into_bytes();
+                    for i in 0..st.column_count() {
+                        if i > 0 {
+                            line.extend_from_slice(b",");
                         }
-                        Step::Done => break,
+                        line.extend_from_slice(&fmt_literal(
+                            st.column_value(i).unwrap_or(Value::Null),
+                        ));
                     }
+                    line.extend_from_slice(b");\n");
+                    let _ = out.write_all(&line);
                 }
             }
             let _ = out.write_all(b"COMMIT;\n");
@@ -323,11 +312,7 @@ where
 
 /// Execute one input unit (statement or dot-command) against the
 /// current database, handling `.open` by swapping `db`.
-async fn dispatch(
-    db: &mut Db,
-    input: &str,
-    out: &mut impl Write,
-) -> Result<Flow, String> {
+async fn dispatch(db: &mut Db, input: &str, out: &mut impl Write) -> Result<Flow, String> {
     let trimmed = input.trim();
     if trimmed.starts_with('.') {
         let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -345,8 +330,12 @@ async fn dispatch(
         }
     } else {
         match db {
-            Db::File(c) => run_statement(c, trimmed, out).await.map(|()| Flow::Continue),
-            Db::Mem(c) => run_statement(c, trimmed, out).await.map(|()| Flow::Continue),
+            Db::File(c) => run_statement(c, trimmed, out)
+                .await
+                .map(|()| Flow::Continue),
+            Db::Mem(c) => run_statement(c, trimmed, out)
+                .await
+                .map(|()| Flow::Continue),
         }
     }
 }

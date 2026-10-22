@@ -210,7 +210,7 @@ impl<S: Storage> Connection<S> {
         Ok(())
     }
 
-    /// Prepare one statement (v0.1 grammar, §5.6). A stale schema
+    /// Prepare one statement (§5.6 grammar). A stale schema
     /// cookie forces a catalog rebuild first (§5.5); a commit left
     /// mid-flight by a dropped future must be resumed or rolled
     /// back before anything new is prepared (§5.1.1).
@@ -550,12 +550,18 @@ fn literal_rowid(arena: &Arena, lit: Literal) -> Access {
 }
 
 /// `f` as an `i64` when it is exactly integral and in range.
+/// Cast round-trip only — no float libm helpers, so it compiles
+/// on every no_std target (2^63 itself is excluded: it has no
+/// `i64` representation).
 fn integral_f64(f: f64) -> Option<i64> {
-    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-        Some(f as i64)
-    } else {
-        None
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if (-TWO_63..TWO_63).contains(&f) {
+        let i = f as i64;
+        if i as f64 == f {
+            return Some(i);
+        }
     }
+    None
 }
 
 impl<'c, S: Storage> Statement<'c, S> {

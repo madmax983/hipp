@@ -1,93 +1,134 @@
-# hipp v0.1 — build status (code-start 2026-10-17, milestone complete 2026-10-18)
+# hipp — build status
 
-Spec: `~/workspace/hipp-design/SPEC.md` rev. 0.3 (copied to `docs/SPEC.md`).
-Pushed to GitHub 2026-10-18 — madmax983/hipp, remote main tip 6bd49a31 (8 commits via API replay; remote SHAs differ from the local history below).
+Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
+(official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
+`--version` verified). All differential results are against the pin.
 
-## Oracle
+## v0.2 — workspace, hipp-cli, first dialect growth (2026-10-22)
 
-- Pin (D1): SQLite **3.54.1**, built from the official amalgamation
-  (3540100) at `~/workspace/hipp-design/oracle/sqlite3`, `--version`
-  verified 3.54.1. **All differential results below are against the
-  pin — claim tests count.** (`/usr/bin/sqlite3` 3.45.1 exists only
-  as a fallback the harness does not use when the pin is present.)
+Pushed to GitHub (madmax983/hipp) via API replay under the
+conformance-loop mandate; remote tip + tree recorded in the loop
+status. (v0.1 was pushed 2026-10-18, remote tip 6bd49a31.)
 
-## Slices
+### Scope shipped (SPEC §9.4)
 
-- [x] S1 scaffold: Cargo, error, arena, record codec (b4f9d06)
-- [x] S2 storage: async trait, MemStorage, FileStorage (std)
-- [x] S3 pager: header, cache, journal protocol, recovery, commit machine (89d7ea5)
-- [x] S4 btree: scan cursor, insert, splits, overflow, freelist (89d7ea5)
-- [x] S5 sql + schema + session API (Connection/Statement) (072097b)
-- [x] S6 examples (mem_demo, crash_writer, hipp_thumb_demo) + thumb gates
-- [x] S7 acceptance tests A1–A11 (all passing — below)
-- [x] S8 fmt clean (write-mode + git status), clippy `-D warnings` clean
-      on all targets, README, final commits
+- **Workspace** per §10: root `hipp` core crate (unchanged layout,
+  still zero-dependency `no_std` + `alloc`) + `hipp-cli` member.
+  Core and CLI versions 0.2.0.
+- **hipp-cli** (D4): std binary `hipp` — interactive, stdin-batch
+  and one-shot modes; list-format output byte-identical to the
+  pinned oracle CLI over the shared subset; dot-commands
+  `.tables` / `.schema` / `.dump` / `.open` / `.exit` (`.quit`).
+  The CLI is a separate std crate and contributes **0 bytes** to
+  the core's thumbv7em tiny build (ratchet rule 4).
+- **Multi-row VALUES** in INSERT: per-row widths checked at plan
+  time; a failing row aborts the whole statement (atomic).
+- **`WHERE rowid = <literal>`** on SELECT: lowers to a point
+  lookup (`btree::seek_rowid`) when the column is the rowid or
+  its alias; literals coerce per SQLite's comparison rules
+  (`'3'`, `2.0`, `'1.0'` match; `2.5`, `'abc'`, `NULL`, blobs
+  match nothing, never error). The plan's `Access` enum
+  (FullScan / Rowid / Empty) is the seam general WHERE hangs off;
+  a predicate on any other column is `Error::Unsupported`.
+- **Explicit transactions** BEGIN / COMMIT / ROLLBACK
+  (`TRANSACTION` keyword optional; `END` = COMMIT): the pager
+  transaction opens lazily at first write (read-only brackets
+  never touch the journal); write statements skip autocommit
+  while a bracket is open; COMMIT drives the resumable commit
+  machine; new error `Error::TransactionState` for nested BEGIN
+  and COMMIT/ROLLBACK without a bracket.
 
-## Acceptance (§9.2) — ALL PASS
+### Root finds this milestone
 
-| # | Status | Evidence |
-|---|---|---|
-| A1 | PASS | `tests/differential.rs::a1` — hipp creates a file; A1 script incl. rowid 9007199254740993, NULLs, 1.5, x'00ff', empty text/blob; reopen + scan identical (plus `tests/smoke.rs` MemStorage round trip) |
-| A2 | PASS | `::a2` — oracle `integrity_check` = ok; oracle SELECT matches byte-for-byte |
-| A3 | PASS | `::a3` — oracle-written files scanned identically at page sizes 4096 and 512 |
-| A4 | PASS | `::a4` — 500×80B rows; root page byte 0x05; oracle-valid; ordered scan |
-| A5 | PASS | `::a5` — 10 KiB text overflow both directions (oracle verifies length + content) |
-| A6 | PASS | `tests/crash.rs` — kill at EVERY mutating-op boundary of an INSERT commit (in-process): reopened state is byte-exact pre- or post-image, never torn. Cross-tool: hipp process `exit(42)` mid-commit at every boundary → **real SQLite 3.54.1 recovers hipp's journal**, integrity ok, counts agree with hipp's view |
-| A7 | PASS | `::a7` — WalUnsupported / UnsupportedEncoding / BadMagic / TruncatedHeader / CorruptPage{2}; no panics |
-| A8 | PASS | `tests/fuzz_smoke.rs` — debug smoke: 23k fixture mutations + 20k parser mutations, no panic/hang. **Spec-scale pass: 10⁶ mutated inputs (probe.db, release build) in 81s, clean.** Found + fixed a real bug: cell-pointer bounds in `parse_leaf_cell` |
-| A9 | PASS | `tests/arenas.rs` — tiny stmt arena → SELECT prepare `ArenaExhausted{Statement}`; tiny txn arena → INSERT `ArenaExhausted{Transaction}` with file byte-identical + oracle-valid |
-| A10 | PASS | `tests/gates.rs` + thumb build (below) |
-| A11 | PASS | `tests/pending.rs` — Pending injected at every I/O point (1/2/5/13 per op): outcomes byte-identical; future dropped mid-commit → prepare refused with `OperationInFlight`, `resume_txn` finishes to post-image, drop + reopen recovers to pre-image |
+- **Pager header snapshot:** a rollback from the `Writing`
+  stage deleted the journal but did not restore in-memory header
+  fields (schema cookie, freelist, page count) mutated by the
+  aborted transaction. `begin_write` now snapshots the header and
+  the `Writing`-stage rollback restores it (the commit-begun path
+  already re-read page 1). This hardens autocommit error paths
+  too, not just explicit ROLLBACK.
+- **Oracle shell caret notation:** the sqlite3 CLI does NOT print
+  blob/text bytes raw in list mode — bytes < 0x20 (except tab and
+  newline) print as `^` + (byte+0x40), and TEXT values truncate
+  at the first NUL byte. Verified byte-by-byte against the
+  pinned oracle over the full 0x00–0x1F range; hipp-cli now
+  renders identically. (A `cat -v` smoke test masked this; the
+  byte-compare differential caught it.)
 
-## §4.1 gate measurements (A10)
+### Tests — 45, all green (v0.1: 25)
 
-- Linked binary, `cargo build --profile tiny --target
-  thumbv7em-none-eabihf --no-default-features --bin hipp_thumb_demo`:
-  **.text 60,868 + .rodata 14,836 = 75,704 B ≤ 128 KiB budget.**
-- Statics: the binary's entire .bss (98,308 B) is the demo's caller
-  heap symbol; **engine .data+.bss outside caller memory = 0 B
-  ≤ 8 KiB budget.**
-- Tiny-config RAM (`tests/gates.rs::a10_tiny_config_ram_budget`,
-  A4-shaped 500-row workload under `Config::tiny()`): pool 16 KiB +
-  catalog/txn/stmt arena high-waters all inside their 16/8/16 KiB
-  maxima; total ≤ 64 KiB.
-- Scan loop (`::a10_scan_loop_zero_steady_state_allocations`):
-  **0 global allocations** across 290 steady-state rows in a warm
-  page (counting allocator); full-scan page-refill cost bounded at
-  ≤6 allocations per page turned (snapshot + cell metadata).
+- Core: 6 unit + 32 integration — smoke 2, differential (A1–A5,
+  A7) 6, crash (A6) 2, arenas (A9) 2, gates (A10) 2, fuzz (A8) 2,
+  pending (A11) 6, **dialect 10 (new)**.
+- `tests/dialect.rs`: multi-row VALUES both directions
+  (hipp→oracle and oracle→hipp, `integrity_check` ok), atomicity
+  of width-mismatch and duplicate-rowid failures; WHERE rowid=
+  hit/miss matrix (alias, `rowid`/`oid`/`_rowid_`, negative,
+  converted literals), deep-tree seeks with oracle agreement;
+  explicit transactions — COMMIT visibility from the oracle side,
+  ROLLBACK invisibility (rows *and* a created table), CREATE in
+  a bracket, state errors, statement-error aborts the bracket.
+- A11 extended (`tests/pending.rs`): COMMIT future of an
+  explicit transaction dropped mid-commit → `OperationInFlight`
+  for a second driver, `resume_txn` finishes to post-image and
+  closes the bracket; ROLLBACK future dropped mid-flight →
+  bracket survives, retry restores pre-image; INSERT future
+  dropped mid-write inside a bracket → ROLLBACK resolves,
+  pre-image on the connection and after reopen.
+- hipp-cli: **7 differential tests** (`hipp-cli/tests/cli_diff.rs`)
+  — one-shot and stdin-batch stdout **byte-identical** to the
+  oracle over a corpus covering all of the above plus real
+  rendering (`%!.15g`) and control-byte blobs; `.tables`/`.schema`
+  exact; `.dump` re-imported into the oracle renders identically;
+  `.open` switching verified from the oracle side; `:memory:`;
+  error cases exit nonzero with stderr.
 
-## Tests
+### §4.1 gates (re-measured)
 
-25 tests, all green on stable, edition 2024: 6 unit (arena/record)
-+ 19 integration (smoke 2, differential 6, crash 2, arenas 2,
-pending 3, gates 2, fuzz 2). Doctests: none.
+- Linked binary (`--profile tiny --target thumbv7em-none-eabihf
+  --no-default-features --bin hipp_thumb_demo`):
+  **.text 65,884 + .rodata 14,900 = 80,784 B ≤ 128 KiB.**
+  **Delta vs v0.1 baseline 75,704 B: +5,080 B (+6.7%)** — over
+  the 4 KiB ratchet line; justification in the loop status
+  (rowid seek path + multi-row insert + transaction control +
+  header snapshot; CLI contributes 0 B). Headroom left: 50,288 B.
+- Statics: `.bss` 98,308 B is again entirely the demo's caller
+  heap; **engine .data+.bss outside caller memory = 0 B ≤ 8 KiB.**
+- Tiny-config RAM and zero steady-state scan allocations:
+  `tests/gates.rs` green (unchanged from v0.1).
 
-## Deviations / honest notes
+### Honest notes / divergences
 
-- `block_on` helper lives in `hipp::storage` (core crate) rather than
-  examples/hipp-std as §10 sketches — dev-tooling placement, no engine impact.
-- §10 layout: session API lives in `src/session.rs` (re-exported from
-  lib.rs) rather than inside lib.rs itself.
-- Journal observation (empirical): a real SQLite journal mid-transaction
-  has zeroed magic and nrec=0 — the header becomes hot only at SQLite's
-  commit point. hipp writes its full header at `begin_write`; format-valid
-  and strictly safer. A6's cross-tool case proves real SQLite recovers it.
-- Read-side REAL-affinity forcing implemented in the scan (a REAL column
-  may store integral values under an integer serial type; fetch yields
-  Real). Found by A3, fixed same day.
-- CREATE TABLE constraint grammar is accepted wider than v0.1 enforces:
-  `NOT NULL`/`CHECK`/`UNIQUE`/`REFERENCES` parse (foreign-file catalog
-  reparse requires it) but are NOT enforced; only `PRIMARY KEY`
-  (rowid-alias rule) has semantics in v0.1. `WITHOUT ROWID` is rejected.
-- Real-literal parsing is a simple ≤17-significant-digit parser; may
-  differ from SQLite's exact parser by 1 ulp on pathological mantissas (R5).
-- Session-layer row decode allocates one small vector per `step()`
-  (capacity = column count); the zero-allocation gate above is stated
-  at the cursor layer, where the scan loop lives.
-- `finish_root_split` in btree.rs is a defensive `Unsupported` path:
-  splits are resolved level-by-level with the root case handled inline
-  (`is_root`), so it is unreachable by construction; A4 exercises root
-  splits of both leaf and interior roots.
-- Fuzz corpus is fixture-mutation only (no structure-aware generation);
-  10⁶-input pass used the small fixture (many.db mutations run at
-  smoke scale, 3k, because deep mutated scans are slow in debug).
+- A write-statement error inside an explicit transaction aborts
+  the **whole bracket** (pager rollback + bracket closed) —
+  stricter than SQLite, which aborts only the statement. Safe
+  direction; named here until statement-level savepoints exist.
+- CLI divergences from the oracle shell (by design, D4 scope):
+  `.tables` prints one name per line (oracle uses a grid);
+  errors print hipp's remedy-named Debug form (`Error: Parse {
+  offset, kind }`, `Error: Schema { kind }`, …) and exit 1;
+  prompts only when stdin is a terminal; no `.import`/`.export`,
+  no modes beyond list, no line editing.
+- `WHERE` beyond `rowid =` is not implemented: other predicate
+  shapes are parse-rejected (`UnsupportedClause`) and a
+  non-rowid equality column is `Error::Unsupported`.
+- Real rendering in the CLI implements SQLite's `%!.15g` for the
+  corpus in the differential tests (fixed/scientific ranges,
+  integral reals, 15 significant digits); exotic values outside
+  the corpus are best-effort.
+- `literal`→rowid text coercion mirrors SQLite's well-formed
+  rule (whole string must convert); leading/trailing spaces are
+  trimmed.
+
+## v0.1 — file-format compatibility (2026-10-18) — summary
+
+CREATE TABLE + single-row INSERT + full-scan SELECT; B-tree
+splits + overflow; rollback journal byte-exact; hot-journal
+recovery; resumable commits. Acceptance A1–A11 all PASS vs the
+3.54.1 pin (evidence: `tests/differential.rs`, `tests/crash.rs`,
+`tests/arenas.rs`, `tests/gates.rs`, `tests/pending.rs`,
+`tests/fuzz_smoke.rs`; A8 included a 10⁶-input spec-scale pass).
+Tiny gates at ship: .text+.rodata **75,704 B**, engine statics
+0 B, 25 tests green. Full v0.1 record: git history (STATUS at
+8b8ebbc) — including its honest notes, which still hold unless a
+v0.2 note above supersedes them.
