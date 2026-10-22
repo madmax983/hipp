@@ -1,7 +1,7 @@
 # hipp v0.1 — build status (code-start 2026-10-17, milestone complete 2026-10-18)
 
 Spec: `~/workspace/hipp-design/SPEC.md` rev. 0.3 (copied to `docs/SPEC.md`).
-Local only — nothing pushed to GitHub.
+Pushed to GitHub 2026-10-18 — madmax983/hipp, remote main tip 6bd49a31 (8 commits via API replay; remote SHAs differ from the local history below).
 
 ## Oracle
 
