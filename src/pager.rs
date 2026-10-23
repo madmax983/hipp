@@ -485,10 +485,25 @@ impl<S: Storage> Pager<S> {
         Ok(idx)
     }
 
+    /// Maximum leaf page numbers one freelist trunk page holds
+    /// (SQFMT §1.3.8): the array starts at offset 8, 4 bytes each.
+    fn trunk_capacity(&self) -> u32 {
+        (self.usable() - 8) / 4
+    }
+
     /// Allocate a page: pop the freelist first (consuming foreign
     /// freelist pages correctly), else grow the file (SPEC §5.4).
     /// The returned frame is zeroed, dirty, and NOT journaled (a new
     /// page has no original; rollback truncates it away).
+    ///
+    /// Freelist hardening (v0.3): every value read out of a trunk
+    /// page is untrusted input (RISKS R1/R8) — the leaf count is
+    /// bounded by the trunk capacity, a leaf may not name the trunk
+    /// itself, page 1, an out-of-range page, or a duplicate of
+    /// another leaf in the same trunk (a duplicate would hand one
+    /// page out twice and silently corrupt two B-trees), and a
+    /// trunk chain link being followed is validated end to end
+    /// (range, no cycles, per-trunk counts) before it is trusted.
     pub async fn alloc_page(&mut self) -> Result<(u32, usize), S::Error> {
         self.begin_write().await?;
         if self.header.freelist_count > 0 {
@@ -501,6 +516,9 @@ impl<S: Storage> Pager<S> {
                 let d = &self.frames[ti].data;
                 (be_u32(d, 0), be_u32(d, 4))
             };
+            if leaf_count > self.trunk_capacity() {
+                return Err(Error::CorruptPage { page: trunk });
+            }
             if leaf_count > 0 {
                 let leaf_off = 8 + 4 * (leaf_count as usize - 1);
                 let leaf = {
@@ -513,6 +531,20 @@ impl<S: Storage> Pager<S> {
                 if leaf < 2 || leaf > self.header.page_count || leaf == trunk {
                     return Err(Error::CorruptPage { page: leaf });
                 }
+                // The leaf must appear exactly once in this trunk's
+                // array (see the hardening note above).
+                {
+                    let d = &self.frames[ti].data;
+                    let mut seen = 0usize;
+                    for k in 0..leaf_count as usize {
+                        if be_u32(d, 8 + 4 * k) == leaf {
+                            seen += 1;
+                        }
+                    }
+                    if seen != 1 {
+                        return Err(Error::CorruptPage { page: leaf });
+                    }
+                }
                 // Decrement the trunk's leaf count (a journaled,
                 // dirtying write to the trunk page).
                 let ti = self.dirty_page(trunk).await?;
@@ -520,7 +552,47 @@ impl<S: Storage> Pager<S> {
                 self.header.freelist_count -= 1;
                 return self.fresh_frame(leaf).await;
             }
-            // The trunk page itself becomes the allocated page.
+            // The trunk page itself becomes the allocated page. The
+            // chain link is about to become the header's trunk, so
+            // validate the whole remaining chain first (it is the
+            // only moment the chain is walked): every link in
+            // range, no repeats (a cycle hands pages out forever),
+            // every trunk's leaf count within capacity, and the
+            // walked page total must not exceed the header's
+            // freelist count.
+            if next_trunk != 0 {
+                if next_trunk < 2 || next_trunk > self.header.page_count || next_trunk == trunk {
+                    return Err(Error::CorruptPage { page: next_trunk });
+                }
+                let mut walked: Vec<u32> = alloc::vec![trunk];
+                let mut total = 1u32; // the trunk being consumed
+                let mut cur = next_trunk;
+                loop {
+                    if walked.contains(&cur) {
+                        return Err(Error::CorruptPage { page: cur });
+                    }
+                    walked.push(cur);
+                    let ci = self.load(cur).await?;
+                    let (nxt, cnt) = {
+                        let d = &self.frames[ci].data;
+                        (be_u32(d, 0), be_u32(d, 4))
+                    };
+                    if cnt > self.trunk_capacity() {
+                        return Err(Error::CorruptPage { page: cur });
+                    }
+                    total += 1 + cnt;
+                    if total > self.header.freelist_count {
+                        return Err(Error::CorruptPage { page: cur });
+                    }
+                    if nxt == 0 {
+                        break;
+                    }
+                    if nxt < 2 || nxt > self.header.page_count {
+                        return Err(Error::CorruptPage { page: nxt });
+                    }
+                    cur = nxt;
+                }
+            }
             self.header.freelist_trunk = next_trunk;
             self.header.freelist_count -= 1;
             // Journal its trunk image before overwriting.
@@ -534,6 +606,65 @@ impl<S: Storage> Pager<S> {
         let page = self.header.page_count + 1;
         self.header.page_count = page;
         self.fresh_frame(page).await
+    }
+
+    /// Return `page` to the freelist (SQFMT §1.3.8; v0.3 — the
+    /// producer is DROP INDEX). The format's rules, mirrored from
+    /// observed oracle behaviour:
+    /// - an empty freelist: the page becomes the trunk (next = 0,
+    ///   leaf count = 0);
+    /// - a trunk with room: the page is appended to its leaf array
+    ///   and its own bytes are left untouched — a freelist leaf
+    ///   carries no information, and leaving the image intact is
+    ///   what makes rollback of the freeing transaction restore
+    ///   the page for free (its linkage lives in page 1 + the
+    ///   trunk, both journaled);
+    /// - a full trunk: the page becomes the new trunk, pointing
+    ///   at the old one.
+    ///
+    /// A page turned into a trunk IS modified (its first 8
+    /// bytes), so it goes through `dirty_page` and is journaled
+    /// first.
+    #[cfg(feature = "indexes")]
+    pub async fn free_page(&mut self, page: u32) -> Result<(), S::Error> {
+        if page < 2 || page > self.header.page_count {
+            return Err(Error::PageOutOfRange { page });
+        }
+        self.begin_write().await?;
+        if self.header.freelist_count == 0 {
+            let idx = self.dirty_page(page).await?;
+            let d = &mut self.frames[idx].data;
+            put_be_u32(d, 0, 0);
+            put_be_u32(d, 4, 0);
+            self.header.freelist_trunk = page;
+            self.header.freelist_count = 1;
+            return Ok(());
+        }
+        let trunk = self.header.freelist_trunk;
+        if trunk < 2 || trunk > self.header.page_count {
+            return Err(Error::CorruptPage { page: trunk });
+        }
+        let ti = self.load(trunk).await?;
+        let leaf_count = be_u32(&self.frames[ti].data, 4);
+        if leaf_count > self.trunk_capacity() {
+            return Err(Error::CorruptPage { page: trunk });
+        }
+        if leaf_count < self.trunk_capacity() {
+            // Append as a leaf of the current trunk.
+            let ti = self.dirty_page(trunk).await?;
+            put_be_u32(&mut self.frames[ti].data, 8 + 4 * leaf_count as usize, page);
+            put_be_u32(&mut self.frames[ti].data, 4, leaf_count + 1);
+            self.header.freelist_count += 1;
+            return Ok(());
+        }
+        // Trunk is full: the freed page becomes the new trunk.
+        let idx = self.dirty_page(page).await?;
+        let d = &mut self.frames[idx].data;
+        put_be_u32(d, 0, trunk);
+        put_be_u32(d, 4, 0);
+        self.header.freelist_trunk = page;
+        self.header.freelist_count += 1;
+        Ok(())
     }
 
     /// Create/get a zeroed dirty frame for a brand-new page (already

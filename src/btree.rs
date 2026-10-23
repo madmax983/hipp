@@ -15,6 +15,9 @@ use crate::pager::{Pager, be_u16, be_u32, put_be_u16, put_be_u32};
 use crate::record::{decode_varint, encode_varint};
 use crate::storage::Storage;
 
+#[cfg(feature = "indexes")]
+use crate::record::{OwnedValue, compare_values, decode_record};
+
 pub const KIND_INTERIOR_INDEX: u8 = 0x02;
 pub const KIND_INTERIOR_TABLE: u8 = 0x05;
 pub const KIND_LEAF_INDEX: u8 = 0x0A;
@@ -999,4 +1002,1041 @@ async fn finish_root_split<S: Storage>(
     _divider: i64,
 ) -> Result<(), S::Error> {
     Err(Error::Unsupported)
+}
+
+// ----------------------------------------------------------------
+// Table B-tree row deletion (v0.3) — used only for sqlite_schema
+// row removal (DROP INDEX). No merge/redistribution: a leaf that
+// loses its last cell stays in the tree as an empty page, which
+// keeps every ancestor divider a valid separator (it was the max
+// of the leaf's keys; remaining keys are smaller, the next
+// subtree's are larger). Overflow pages of the removed row are
+// returned to the freelist.
+// ----------------------------------------------------------------
+
+/// Delete the row `rowid` from the table rooted at `root`.
+/// Returns whether a row was present.
+#[cfg(feature = "indexes")]
+pub async fn btree_delete<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    rowid: i64,
+) -> Result<bool, S::Error> {
+    let usable = pager.usable() as usize;
+    let mut page = root;
+    let (leaf_page, cells, pos) = loop {
+        let idx = pager.load(page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        if h.is_leaf() {
+            if h.kind != KIND_LEAF_TABLE {
+                return Err(Error::Unsupported);
+            }
+            let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+            let pos = cells.iter().position(|c| c.rowid == rowid);
+            break (page, cells, pos);
+        }
+        let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
+        let mut child = rightmost;
+        for (c, k) in pairs.iter() {
+            if rowid <= *k {
+                child = *c;
+                break;
+            }
+        }
+        page = child;
+    };
+    let Some(pos) = pos else {
+        return Ok(false);
+    };
+    let removed = cells.as_slice()[pos].clone();
+    let mut kept: AVec<LeafCell> = AVec::new();
+    for (i, c) in cells.iter().enumerate() {
+        if i != pos {
+            kept.push(c.clone());
+        }
+    }
+    write_leaf_page(pager, leaf_page, kept.as_slice(), false).await?;
+    // Free the removed row's overflow chain, if any.
+    if removed.overflow != 0 {
+        let per = usable - 4;
+        let mut next = removed.overflow;
+        let mut remaining = removed.payload_len - removed.local_len;
+        let mut hops = 0u32;
+        while next != 0 {
+            hops += 1;
+            if hops > pager.page_count() + 1 {
+                return Err(Error::OverflowChainCycle);
+            }
+            let idx = pager.load(next).await?;
+            let following = be_u32(pager.frame_data(idx), 0);
+            pager.free_page(next).await?;
+            next = following;
+            if remaining <= per {
+                break;
+            }
+            remaining -= per;
+        }
+    }
+    Ok(true)
+}
+
+// ----------------------------------------------------------------
+// Index B-trees (v0.3, SPEC §2/§5.4) — feature `indexes`.
+//
+// An index key is a record of the indexed columns followed by the
+// rowid (SQFMT §2.1/§2.6, verified against the pinned oracle).
+// Index B-trees are true B-trees, not B+-trees: a key stored in an
+// interior page is a real entry and appears nowhere else (also
+// oracle-verified: after splits, the promoted key is absent from
+// both leaves). Interior cell = u32 child + key payload; the child
+// holds keys strictly below the cell's key. Overflow uses the
+// index thresholds of SQFMT §1.6.
+// ----------------------------------------------------------------
+
+/// Local-payload byte count for an index cell (SQFMT §1.6):
+/// X = ((U-12)*64/255)-23; if P > X, M = ((U-12)*32/255)-23 and
+/// K = M + ((P-M) mod (U-4)); keep K if K <= X else M.
+#[cfg(feature = "indexes")]
+pub fn index_local(usable: usize, payload_len: usize) -> usize {
+    let x = (usable - 12) * 64 / 255 - 23;
+    if payload_len <= x {
+        return payload_len;
+    }
+    let m = (usable - 12) * 32 / 255 - 23;
+    let k = m + (payload_len - m) % (usable - 4);
+    if k <= x { k } else { m }
+}
+
+/// One parsed index cell (leaf or interior).
+#[cfg(feature = "indexes")]
+#[derive(Clone)]
+pub struct IndexCell {
+    /// Left child page (interior cells only; 0 in leaf cells).
+    pub child: u32,
+    /// The full on-page cell image (child prefix when interior,
+    /// then varint payload length, local payload, overflow ptr).
+    pub bytes: AVec<u8>,
+    pub payload_len: usize,
+    pub local_len: usize,
+    pub overflow: u32,
+    /// Offset of the local payload inside `bytes`.
+    pub payload_off: usize,
+}
+
+#[cfg(feature = "indexes")]
+impl IndexCell {
+    pub fn local_bytes(&self) -> &[u8] {
+        &self.bytes.as_slice()[self.payload_off..self.payload_off + self.local_len]
+    }
+}
+
+#[cfg(feature = "indexes")]
+fn parse_index_cell<E>(
+    bytes: &[u8],
+    at: usize,
+    usable: usize,
+    page: u32,
+    interior: bool,
+) -> Result<IndexCell, E> {
+    let mut off = at;
+    let mut child = 0u32;
+    if interior {
+        if at + 4 > bytes.len() {
+            return Err(Error::CorruptPage { page });
+        }
+        child = be_u32(bytes, at);
+        off += 4;
+    }
+    let cell_bytes = bytes.get(off..).ok_or(Error::CorruptPage { page })?;
+    let (plen, n1) = decode_varint::<E>(cell_bytes)?;
+    let plen = plen as usize;
+    let local = index_local(usable, plen);
+    let start = off + n1;
+    let end = start
+        .checked_add(local)
+        .ok_or(Error::CorruptPage { page })?;
+    if end > bytes.len() {
+        return Err(Error::CorruptPage { page });
+    }
+    let mut overflow = 0u32;
+    let mut total = (off - at) + n1 + local;
+    if plen > local {
+        if end + 4 > bytes.len() {
+            return Err(Error::CorruptPage { page });
+        }
+        overflow = be_u32(bytes, end);
+        total += 4;
+    }
+    let mut img = AVec::with_capacity(total);
+    img.extend_from_slice(&bytes[at..at + total]);
+    Ok(IndexCell {
+        child,
+        bytes: img,
+        payload_len: plen,
+        local_len: local,
+        overflow,
+        payload_off: (off - at) + n1,
+    })
+}
+
+/// Parse all cells of an index leaf page.
+#[cfg(feature = "indexes")]
+pub fn index_leaf_cells<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec<IndexCell>, E> {
+    let h = head::<E>(bytes, page)?;
+    if h.kind != KIND_LEAF_INDEX {
+        return Err(Error::CorruptPage { page });
+    }
+    let mut out = AVec::new();
+    for i in 0..usize::from(h.ncell) {
+        let ptr = cell_ptr::<E>(bytes, &h, i, page)?;
+        out.push(parse_index_cell::<E>(bytes, ptr, usable, page, false)?);
+    }
+    Ok(out)
+}
+
+/// Parse an index interior page: cells (each with its left child)
+/// plus the rightmost child.
+#[cfg(feature = "indexes")]
+pub fn index_interior_cells<E>(
+    bytes: &[u8],
+    page: u32,
+    usable: usize,
+) -> Result<(AVec<IndexCell>, u32), E> {
+    let h = head::<E>(bytes, page)?;
+    if h.kind != KIND_INTERIOR_INDEX {
+        return Err(Error::CorruptPage { page });
+    }
+    let mut out = AVec::new();
+    for i in 0..usize::from(h.ncell) {
+        let ptr = cell_ptr::<E>(bytes, &h, i, page)?;
+        out.push(parse_index_cell::<E>(bytes, ptr, usable, page, true)?);
+    }
+    Ok((out, h.rightmost))
+}
+
+#[cfg(feature = "indexes")]
+fn build_index_image(
+    page: u32,
+    page_size: usize,
+    cells: &[IndexCell],
+    rightmost: u32,
+    interior: bool,
+    base: &[u8],
+) -> AVec<u8> {
+    let mut img = vec_zeroed(page_size);
+    if page == 1 {
+        img.as_mut_slice()[0..100].copy_from_slice(&base[0..100]);
+    }
+    let hdr_off = if page == 1 { 100 } else { 0 };
+    let hdr_len = if interior { 12 } else { 8 };
+    let out = img.as_mut_slice();
+    let mut content = page_size;
+    let mut ptrs = AVec::new();
+    for c in cells {
+        content -= c.bytes.len();
+        out[content..content + c.bytes.len()].copy_from_slice(c.bytes.as_slice());
+        ptrs.push(content as u16);
+    }
+    out[hdr_off] = if interior {
+        KIND_INTERIOR_INDEX
+    } else {
+        KIND_LEAF_INDEX
+    };
+    put_be_u16(out, hdr_off + 1, 0);
+    put_be_u16(out, hdr_off + 3, cells.len() as u16);
+    put_be_u16(out, hdr_off + 5, content_code(content));
+    out[hdr_off + 7] = 0;
+    if interior {
+        put_be_u32(out, hdr_off + 8, rightmost);
+    }
+    for (i, p) in ptrs.iter().enumerate() {
+        put_be_u16(out, hdr_off + hdr_len + 2 * i, *p);
+    }
+    img
+}
+
+#[cfg(feature = "indexes")]
+fn index_page_need(cells: &[IndexCell], hdr_off: usize, interior: bool) -> usize {
+    let content: usize = cells.iter().map(|c| c.bytes.len()).sum();
+    hdr_off + if interior { 12 } else { 8 } + 2 * cells.len() + content
+}
+
+/// Write `cells` as the complete image of index page `page`
+/// (leaf when `interior` is false). Fresh pages (from
+/// `alloc_page`) are already dirty and unjournaled; existing
+/// pages are journaled via `dirty_page` first.
+#[cfg(feature = "indexes")]
+async fn write_index_page<S: Storage>(
+    pager: &mut Pager<S>,
+    page: u32,
+    cells: &[IndexCell],
+    rightmost: u32,
+    interior: bool,
+    fresh: bool,
+) -> Result<(), S::Error> {
+    let page_size = pager.page_size() as usize;
+    let idx = if fresh {
+        let idx = pager.load(page).await?;
+        pager.mark_frame_dirty(idx);
+        idx
+    } else {
+        pager.dirty_page(page).await?
+    };
+    let base = copy_bytes(pager.frame_data(idx));
+    let img = build_index_image(page, page_size, cells, rightmost, interior, base.as_slice());
+    pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
+    Ok(())
+}
+
+/// Initialise a freshly allocated page as an empty index leaf —
+/// a new index's root.
+#[cfg(feature = "indexes")]
+pub async fn create_empty_index_root<S: Storage>(
+    pager: &mut Pager<S>,
+    page: u32,
+) -> Result<(), S::Error> {
+    let page_size = pager.page_size() as usize;
+    let idx = pager.load(page).await?;
+    pager.mark_frame_dirty(idx);
+    let base = copy_bytes(pager.frame_data(idx));
+    let empty: &[IndexCell] = &[];
+    let img = build_index_image(page, page_size, empty, 0, false, base.as_slice());
+    pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
+    Ok(())
+}
+
+/// A decoded index entry: the key columns' values followed by the
+/// rowid (an Integer) as the last value.
+#[cfg(feature = "indexes")]
+#[derive(Clone)]
+pub struct IndexEntry {
+    pub values: AVec<OwnedValue>,
+}
+
+#[cfg(feature = "indexes")]
+impl IndexEntry {
+    pub fn rowid<E>(&self) -> Result<i64, E> {
+        match self.values.as_slice().last() {
+            Some(OwnedValue::Integer(r)) => Ok(*r),
+            _ => Err(Error::CorruptRecord),
+        }
+    }
+}
+
+/// Decode an index key payload (a record of `nfields` values).
+#[cfg(feature = "indexes")]
+pub fn decode_index_entry<E>(payload: &[u8], nfields: usize) -> Result<IndexEntry, E> {
+    let vals = decode_record::<E>(payload, nfields)?;
+    if vals.len() != nfields {
+        return Err(Error::CorruptRecord);
+    }
+    let mut out = AVec::new();
+    for v in vals.iter() {
+        out.push(OwnedValue::from_value(*v));
+    }
+    let entry = IndexEntry { values: out };
+    // The trailing field is the rowid and must be an integer.
+    let _ = entry.rowid::<E>()?;
+    Ok(entry)
+}
+
+/// Reassemble a cell's full key payload (local part + overflow).
+#[cfg(feature = "indexes")]
+async fn index_cell_payload<S: Storage>(
+    pager: &mut Pager<S>,
+    cell: &IndexCell,
+) -> Result<AVec<u8>, S::Error> {
+    let local = copy_bytes(cell.local_bytes());
+    assemble_payload(pager, local.as_slice(), cell.payload_len, cell.overflow).await
+}
+
+/// Compare two decoded keys field by field; `desc[j]` reverses
+/// column j's comparison (the rowid field, last, is never in
+/// `desc` and always compares ascending). NULL ordering follows
+/// `compare_values` (NULL smallest; reversed under DESC, which is
+/// what the oracle does).
+#[cfg(feature = "indexes")]
+pub fn compare_entries(a: &[OwnedValue], b: &[OwnedValue], desc: &[bool]) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    for j in 0..a.len().min(b.len()) {
+        let c = compare_values(&a[j].as_value(), &b[j].as_value());
+        let c = if j < desc.len() && desc[j] {
+            c.reverse()
+        } else {
+            c
+        };
+        if c != Ordering::Equal {
+            return c;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Build the on-page image for a cell carrying `source`'s key
+/// payload, reusing its overflow chain (the local length depends
+/// only on usable size and payload length, so it is identical on
+/// every page of the tree). `source_prefix` is the length of the
+/// child prefix in the source image (4 for an interior cell, 0
+/// for a leaf cell); `child` is the new cell's child (promotion
+/// into an interior page), or None to produce a leaf-form image.
+#[cfg(feature = "indexes")]
+fn recell(child: Option<u32>, source: &IndexCell, source_prefix: usize) -> IndexCell {
+    let mut bytes = AVec::new();
+    if let Some(c) = child {
+        for b in c.to_be_bytes() {
+            bytes.push(b);
+        }
+    }
+    bytes.extend_from_slice(&source.bytes.as_slice()[source_prefix..]);
+    IndexCell {
+        child: child.unwrap_or(0),
+        payload_off: source.payload_off - source_prefix + if child.is_some() { 4 } else { 0 },
+        bytes,
+        payload_len: source.payload_len,
+        local_len: source.local_len,
+        overflow: source.overflow,
+    }
+}
+
+/// Choose a split index for a sorted cell list that must divide
+/// into (left, promoted, right): returns s with cells[..s] left,
+/// cells[s] promoted, cells[s+1..] right. Prefers s that balances
+/// total bytes while keeping both sides non-empty when there are
+/// at least 3 cells.
+#[cfg(feature = "indexes")]
+fn choose_index_split(cells: &[IndexCell]) -> usize {
+    let m = cells.len();
+    if m < 3 {
+        return 0;
+    }
+    let total: usize = cells.iter().map(|c| c.bytes.len() + 2).sum();
+    let mut best = 1usize;
+    let mut best_diff = usize::MAX;
+    let mut acc = 0usize;
+    for s in 1..m - 1 {
+        acc += cells[s - 1].bytes.len() + 2;
+        let diff = total.abs_diff(2 * acc);
+        if diff < best_diff {
+            best_diff = diff;
+            best = s;
+        }
+    }
+    best
+}
+
+/// Insert the key `payload` (a full index record) into the index
+/// rooted at `root`. The root page number never changes.
+/// Duplicate full keys (same columns AND rowid) are a
+/// `DuplicateRowid` schema error — they can only arise from an
+/// engine bug, since UNIQUE conflicts are pre-checked by the
+/// session layer on the key columns alone.
+#[cfg(feature = "indexes")]
+pub async fn index_insert<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    payload: &[u8],
+    desc: &[bool],
+) -> Result<(), S::Error> {
+    use core::cmp::Ordering;
+    let usable = pager.usable() as usize;
+    let nfields = desc.len() + 1;
+    let probe = decode_index_entry::<S::Error>(payload, nfields)?;
+    // ---- descent, remembering (interior page, child index) ----
+    // The child index counts into the page's children array
+    // (cells' children in order, then the rightmost pointer).
+    let mut path: AVec<(u32, usize)> = AVec::new();
+    let mut page = root;
+    let (leaf_page, leaf_cells) = loop {
+        let idx = pager.load(page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        if h.is_leaf() {
+            if h.kind != KIND_LEAF_INDEX {
+                return Err(Error::Unsupported);
+            }
+            let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+            for c in cells.iter() {
+                let p = index_cell_payload(pager, c).await?;
+                let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+                if compare_entries(e.values.as_slice(), probe.values.as_slice(), desc)
+                    == Ordering::Equal
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::DuplicateRowid,
+                    });
+                }
+            }
+            break (page, cells);
+        }
+        if h.kind != KIND_INTERIOR_INDEX {
+            return Err(Error::Unsupported);
+        }
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+        let mut child_idx = cells.len();
+        let mut child = rightmost;
+        for (i, c) in cells.iter().enumerate() {
+            let p = index_cell_payload(pager, c).await?;
+            let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+            match compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) {
+                Ordering::Equal => {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::DuplicateRowid,
+                    });
+                }
+                Ordering::Less => {
+                    child_idx = i;
+                    child = c.child;
+                    break;
+                }
+                Ordering::Greater => {}
+            }
+        }
+        path.push((page, child_idx));
+        page = child;
+    };
+
+    // ---- build the new leaf cell (overflow first) ----
+    let local_len = index_local(usable, payload.len());
+    let overflow_head = write_overflow(pager, payload, local_len).await?;
+    let mut cell_bytes = AVec::new();
+    encode_varint(payload.len() as u64, &mut cell_bytes);
+    for b in &payload[..local_len] {
+        cell_bytes.push(*b);
+    }
+    if overflow_head != 0 {
+        for b in overflow_head.to_be_bytes() {
+            cell_bytes.push(b);
+        }
+    }
+    let new_cell = IndexCell {
+        child: 0,
+        payload_off: cell_bytes.len() - local_len - if overflow_head != 0 { 4 } else { 0 },
+        bytes: cell_bytes,
+        payload_len: payload.len(),
+        local_len,
+        overflow: overflow_head,
+    };
+
+    // ---- merge into the leaf in key order ----
+    let mut all: AVec<IndexCell> = AVec::new();
+    let mut inserted = false;
+    for c in leaf_cells.iter() {
+        if !inserted {
+            let p = index_cell_payload(pager, c).await?;
+            let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+            if compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) == Ordering::Less
+            {
+                all.push(new_cell.clone());
+                inserted = true;
+            }
+        }
+        all.push(c.clone());
+    }
+    if !inserted {
+        all.push(new_cell);
+    }
+
+    let hdr_off = 0usize; // index roots are never page 1
+    if index_page_need(all.as_slice(), hdr_off, false) <= usable {
+        write_index_page(pager, leaf_page, all.as_slice(), 0, false, false).await?;
+        return Ok(());
+    }
+
+    // ---- split the leaf: (left, promoted, right) ----
+    let s = choose_index_split(all.as_slice());
+    let promoted = all.as_slice()[s].clone();
+    let mut left: AVec<IndexCell> = AVec::new();
+    let mut right: AVec<IndexCell> = AVec::new();
+    for (i, c) in all.iter().enumerate() {
+        if i < s {
+            left.push(c.clone());
+        } else if i > s {
+            right.push(c.clone());
+        }
+    }
+    if path.is_empty() {
+        // Root split: two fresh leaves, root becomes an interior
+        // holding the promoted key.
+        let (lp, _) = pager.alloc_page().await?;
+        let (rp, _) = pager.alloc_page().await?;
+        write_index_page(pager, lp, left.as_slice(), 0, false, true).await?;
+        write_index_page(pager, rp, right.as_slice(), 0, false, true).await?;
+        let mut cells: AVec<IndexCell> = AVec::new();
+        cells.push(recell(Some(lp), &promoted, 0));
+        write_index_page(pager, root, cells.as_slice(), rp, true, false).await?;
+        return Ok(());
+    }
+    let (right_page, _) = pager.alloc_page().await?;
+    write_index_page(pager, right_page, right.as_slice(), 0, false, true).await?;
+    write_index_page(pager, leaf_page, left.as_slice(), 0, false, false).await?;
+    index_propagate(pager, path, leaf_page, right_page, promoted, 0).await
+}
+
+/// Splice a promoted key into the ancestor chain after a split of
+/// `left_page` produced `right_page`; `promoted` is the split
+/// cell (in leaf form when `promoted_prefix` is 0, interior form
+/// when it is 4). Propagates splits upward, finishing root splits
+/// in place.
+#[cfg(feature = "indexes")]
+#[allow(clippy::too_many_arguments)]
+async fn index_propagate<S: Storage>(
+    pager: &mut Pager<S>,
+    mut path: AVec<(u32, usize)>,
+    mut left_page: u32,
+    mut right_page: u32,
+    mut promoted: IndexCell,
+    mut promoted_prefix: usize,
+) -> Result<(), S::Error> {
+    let usable = pager.usable() as usize;
+    loop {
+        let Some((parent, child_idx)) = path.pop() else {
+            // Unreachable with correct descent bookkeeping (root
+            // splits are resolved where the root is the parent);
+            // defensive, never a silent corruption.
+            return Err(Error::Unsupported);
+        };
+        let is_root = path.is_empty();
+        let idx = pager.load(parent).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), parent, usable)?;
+        // Insert (left_page, promoted) at child_idx; the cell that
+        // pointed at left_page now points at right_page.
+        let mut nc: AVec<IndexCell> = AVec::new();
+        for (i, c) in cells.iter().enumerate() {
+            if i == child_idx {
+                nc.push(recell(Some(left_page), &promoted, promoted_prefix));
+                let mut shifted = c.clone();
+                shifted.child = right_page;
+                // Keep the image's child prefix in sync.
+                let nb = right_page.to_be_bytes();
+                shifted.bytes.as_mut_slice()[..4].copy_from_slice(&nb);
+                nc.push(shifted);
+            } else {
+                nc.push(c.clone());
+            }
+        }
+        let mut nright = rightmost;
+        if child_idx >= cells.len() {
+            nc.push(recell(Some(left_page), &promoted, promoted_prefix));
+            nright = right_page;
+        }
+        if index_page_need(nc.as_slice(), 0, true) <= usable {
+            write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
+            return Ok(());
+        }
+        // Split the interior page: (left cells, promoted, right).
+        let s = choose_index_split(nc.as_slice());
+        let up = nc.as_slice()[s].clone();
+        // Children array of the merged page.
+        let mut children: AVec<u32> = AVec::new();
+        for c in nc.iter() {
+            children.push(c.child);
+        }
+        children.push(nright);
+        let left_rightmost = children.as_slice()[s];
+        let mut lc: AVec<IndexCell> = AVec::new();
+        let mut rc: AVec<IndexCell> = AVec::new();
+        for (i, c) in nc.iter().enumerate() {
+            if i < s {
+                lc.push(c.clone());
+            } else if i > s {
+                rc.push(c.clone());
+            }
+        }
+        if is_root {
+            let (lp, _) = pager.alloc_page().await?;
+            let (rp, _) = pager.alloc_page().await?;
+            write_index_page(pager, lp, lc.as_slice(), left_rightmost, true, true).await?;
+            write_index_page(pager, rp, rc.as_slice(), nright, true, true).await?;
+            let mut one: AVec<IndexCell> = AVec::new();
+            one.push(recell(Some(lp), &up, 4));
+            write_index_page(pager, parent, one.as_slice(), rp, true, false).await?;
+            return Ok(());
+        }
+        let (rp, _) = pager.alloc_page().await?;
+        write_index_page(pager, rp, rc.as_slice(), nright, true, true).await?;
+        write_index_page(pager, parent, lc.as_slice(), left_rightmost, true, false).await?;
+        left_page = parent;
+        right_page = rp;
+        promoted = up;
+        promoted_prefix = 4;
+    }
+}
+
+// ----------------------------------------------------------------
+// Index traversal: ordered cursor with lower-bound seek (v0.3).
+// ----------------------------------------------------------------
+
+/// One component of a seek probe: `Min` sorts below every value
+/// (including NULL) — it pads a prefix probe to full key length.
+#[cfg(feature = "indexes")]
+#[derive(Clone)]
+pub enum KeyPart {
+    Min,
+    Val(OwnedValue),
+}
+
+#[cfg(feature = "indexes")]
+fn cmp_entry_probe(entry: &[OwnedValue], probe: &[KeyPart], desc: &[bool]) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    for j in 0..entry.len().min(probe.len()) {
+        match &probe[j] {
+            KeyPart::Min => return Ordering::Greater,
+            KeyPart::Val(v) => {
+                let c = compare_values(&entry[j].as_value(), &v.as_value());
+                let c = if j < desc.len() && desc[j] {
+                    c.reverse()
+                } else {
+                    c
+                };
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+        }
+    }
+    Ordering::Equal
+}
+
+#[cfg(feature = "indexes")]
+enum IdxFrame {
+    Unresolved {
+        page: u32,
+    },
+    Leaf {
+        entries: AVec<IndexEntry>,
+        next: usize,
+    },
+    Interior {
+        entries: AVec<IndexEntry>,
+        children: AVec<u32>,
+        /// Next action: even seq = descend children[seq/2] (the
+        /// rightmost child is at seq == 2*entries.len()), odd seq
+        /// = yield entries[(seq-1)/2]; past the end = frame done.
+        seq: usize,
+    },
+}
+
+/// An in-order cursor over an index B-tree (interior keys are
+/// real entries and are yielded between their subtrees). State
+/// lives in the cursor, never in a future (§5.1.2).
+#[cfg(feature = "indexes")]
+pub struct IndexCursor {
+    stack: AVec<IdxFrame>,
+    nfields: usize,
+}
+
+#[cfg(feature = "indexes")]
+impl IndexCursor {
+    /// A cursor over the whole index, in key order.
+    pub fn new(root: u32, desc: &[bool]) -> IndexCursor {
+        let mut stack = AVec::new();
+        stack.push(IdxFrame::Unresolved { page: root });
+        IndexCursor {
+            stack,
+            nfields: desc.len() + 1,
+        }
+    }
+
+    /// A cursor positioned at the first entry >= `probe` (a full
+    /// key-length probe; pad prefix probes with `KeyPart::Min`).
+    pub async fn seek<S: Storage>(
+        pager: &mut Pager<S>,
+        root: u32,
+        desc: &[bool],
+        probe: &[KeyPart],
+    ) -> Result<IndexCursor, S::Error> {
+        let usable = pager.usable() as usize;
+        let nfields = desc.len() + 1;
+        let mut cur = IndexCursor::new(root, desc);
+        cur.stack.clear();
+        let mut page = root;
+        loop {
+            let idx = pager.load(page).await?;
+            let snap = copy_bytes(pager.frame_data(idx));
+            let h = head::<S::Error>(snap.as_slice(), page)?;
+            if h.is_leaf() {
+                if h.kind != KIND_LEAF_INDEX {
+                    return Err(Error::Unsupported);
+                }
+                let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                let mut entries = AVec::new();
+                for c in cells.iter() {
+                    let p = index_cell_payload(pager, c).await?;
+                    entries.push(decode_index_entry::<S::Error>(p.as_slice(), nfields)?);
+                }
+                let mut pos = entries.len();
+                for (i, e) in entries.iter().enumerate() {
+                    if cmp_entry_probe(e.values.as_slice(), probe, desc)
+                        != core::cmp::Ordering::Less
+                    {
+                        pos = i;
+                        break;
+                    }
+                }
+                cur.stack.push(IdxFrame::Leaf { entries, next: pos });
+                return Ok(cur);
+            }
+            if h.kind != KIND_INTERIOR_INDEX {
+                return Err(Error::Unsupported);
+            }
+            let (cells, rightmost) =
+                index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+            let mut entries = AVec::new();
+            let mut children = AVec::new();
+            for c in cells.iter() {
+                children.push(c.child);
+                let p = index_cell_payload(pager, c).await?;
+                entries.push(decode_index_entry::<S::Error>(p.as_slice(), nfields)?);
+            }
+            children.push(rightmost);
+            // First divider >= probe (Equal only for a full-key
+            // probe: prefix probes pad with Min and can never be
+            // Equal to a real entry).
+            let mut i = entries.len();
+            let mut equal = false;
+            for (j, e) in entries.iter().enumerate() {
+                match cmp_entry_probe(e.values.as_slice(), probe, desc) {
+                    core::cmp::Ordering::Less => {}
+                    core::cmp::Ordering::Equal => {
+                        i = j;
+                        equal = true;
+                        break;
+                    }
+                    core::cmp::Ordering::Greater => {
+                        i = j;
+                        break;
+                    }
+                }
+            }
+            if equal {
+                // The divider itself is the lower bound; yield it
+                // next, then continue with its right subtree.
+                cur.stack.push(IdxFrame::Interior {
+                    entries,
+                    children,
+                    seq: 2 * i + 1,
+                });
+                return Ok(cur);
+            }
+            // Descend into child i; when it is exhausted this
+            // frame yields divider i next (or is done, when i is
+            // the rightmost child).
+            let next_page = children.as_slice()[i];
+            cur.stack.push(IdxFrame::Interior {
+                entries,
+                children,
+                seq: 2 * i + 1,
+            });
+            page = next_page;
+        }
+    }
+
+    async fn resolve<S: Storage>(
+        &mut self,
+        pager: &mut Pager<S>,
+        page: u32,
+    ) -> Result<IdxFrame, S::Error> {
+        let usable = pager.usable() as usize;
+        let idx = pager.load(page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        if h.is_leaf() {
+            if h.kind != KIND_LEAF_INDEX {
+                return Err(Error::Unsupported);
+            }
+            let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+            let mut entries = AVec::new();
+            for c in cells.iter() {
+                let p = index_cell_payload(pager, c).await?;
+                entries.push(decode_index_entry::<S::Error>(p.as_slice(), self.nfields)?);
+            }
+            return Ok(IdxFrame::Leaf { entries, next: 0 });
+        }
+        if h.kind != KIND_INTERIOR_INDEX {
+            return Err(Error::Unsupported);
+        }
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+        let mut entries = AVec::new();
+        let mut children = AVec::new();
+        for c in cells.iter() {
+            children.push(c.child);
+            let p = index_cell_payload(pager, c).await?;
+            entries.push(decode_index_entry::<S::Error>(p.as_slice(), self.nfields)?);
+        }
+        children.push(rightmost);
+        Ok(IdxFrame::Interior {
+            entries,
+            children,
+            seq: 0,
+        })
+    }
+
+    /// The next entry in key order, if any.
+    pub async fn next_entry<S: Storage>(
+        &mut self,
+        pager: &mut Pager<S>,
+    ) -> Result<Option<IndexEntry>, S::Error> {
+        loop {
+            match self.stack.as_slice().last() {
+                None => return Ok(None),
+                Some(IdxFrame::Unresolved { page }) => {
+                    let page = *page;
+                    self.stack.pop();
+                    let frame = self.resolve(pager, page).await?;
+                    self.stack.push(frame);
+                }
+                Some(IdxFrame::Leaf { .. }) => {
+                    let frame = self.stack.pop().expect("leaf frame");
+                    if let IdxFrame::Leaf { entries, next } = frame {
+                        if next >= entries.len() {
+                            continue;
+                        }
+                        let e = entries.as_slice()[next].clone();
+                        self.stack.push(IdxFrame::Leaf {
+                            entries,
+                            next: next + 1,
+                        });
+                        return Ok(Some(e));
+                    }
+                    unreachable!()
+                }
+                Some(IdxFrame::Interior { .. }) => {
+                    let frame = self.stack.pop().expect("interior frame");
+                    if let IdxFrame::Interior {
+                        entries,
+                        children,
+                        seq,
+                    } = frame
+                    {
+                        let n = entries.len();
+                        if seq > 2 * n {
+                            continue; // frame exhausted
+                        }
+                        if seq % 2 == 1 {
+                            let e = entries.as_slice()[(seq - 1) / 2].clone();
+                            self.stack.push(IdxFrame::Interior {
+                                entries,
+                                children,
+                                seq: seq + 1,
+                            });
+                            return Ok(Some(e));
+                        }
+                        let child = children.as_slice()[seq / 2];
+                        self.stack.push(IdxFrame::Interior {
+                            entries,
+                            children,
+                            seq: seq + 1,
+                        });
+                        self.stack.push(IdxFrame::Unresolved { page: child });
+                    } else {
+                        unreachable!()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether `entry`'s first `prefix.len()` key fields equal
+/// `prefix` (direction-independent field equality).
+#[cfg(feature = "indexes")]
+fn prefix_matches(entry: &IndexEntry, prefix: &[OwnedValue]) -> bool {
+    for (j, p) in prefix.iter().enumerate() {
+        if compare_values(&entry.values.as_slice()[j].as_value(), &p.as_value())
+            != core::cmp::Ordering::Equal
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// All rowids whose index key starts with `prefix` (the planner's
+/// secondary-index lookup; seek-positioned, then a bounded scan).
+#[cfg(feature = "indexes")]
+pub async fn index_prefix_rowids<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    desc: &[bool],
+    prefix: &[OwnedValue],
+) -> Result<AVec<i64>, S::Error> {
+    let mut probe: AVec<KeyPart> = AVec::new();
+    for v in prefix {
+        probe.push(KeyPart::Val(v.clone()));
+    }
+    while probe.len() < desc.len() + 1 {
+        probe.push(KeyPart::Min);
+    }
+    let mut cur = IndexCursor::seek(pager, root, desc, probe.as_slice()).await?;
+    let mut out = AVec::new();
+    while let Some(e) = cur.next_entry(pager).await? {
+        if !prefix_matches(&e, prefix) {
+            break;
+        }
+        out.push(e.rowid()?);
+    }
+    Ok(out)
+}
+
+/// The first rowid whose index key starts with `prefix`, if any
+/// (the UNIQUE pre-check).
+#[cfg(feature = "indexes")]
+pub async fn index_first_with_prefix<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    desc: &[bool],
+    prefix: &[OwnedValue],
+) -> Result<Option<i64>, S::Error> {
+    let rowids = index_prefix_rowids(pager, root, desc, prefix).await?;
+    Ok(rowids.as_slice().first().copied())
+}
+
+/// Every page of the index rooted at `root`: B-tree pages plus
+/// all overflow chains (DROP INDEX frees exactly this set).
+#[cfg(feature = "indexes")]
+pub async fn collect_index_pages<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+) -> Result<AVec<u32>, S::Error> {
+    let usable = pager.usable() as usize;
+    let mut out: AVec<u32> = AVec::new();
+    let mut stack: AVec<u32> = AVec::new();
+    stack.push(root);
+    while let Some(page) = stack.pop() {
+        out.push(page);
+        let idx = pager.load(page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        let cells: AVec<IndexCell> = match h.kind {
+            KIND_LEAF_INDEX => index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?,
+            KIND_INTERIOR_INDEX => {
+                let (cells, rightmost) =
+                    index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                for c in cells.iter() {
+                    stack.push(c.child);
+                }
+                if rightmost != 0 {
+                    stack.push(rightmost);
+                }
+                cells
+            }
+            _ => return Err(Error::CorruptPage { page }),
+        };
+        for c in cells.iter() {
+            let mut next = c.overflow;
+            let mut hops = 0u32;
+            while next != 0 {
+                hops += 1;
+                if hops > pager.page_count() + 1 {
+                    return Err(Error::OverflowChainCycle);
+                }
+                out.push(next);
+                let oi = pager.load(next).await?;
+                next = be_u32(pager.frame_data(oi), 0);
+            }
+        }
+    }
+    Ok(out)
 }
