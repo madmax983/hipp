@@ -8,8 +8,8 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.2 — workspace + CLI + first dialect growth on the
-  v0.1 file-format foundation (SPEC §2, §9.4).
+- **Phase:** v0.3 — index B-trees, UNIQUE enforcement and
+  freelist hardening on the v0.2 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
@@ -17,7 +17,7 @@ aspirations.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
 
-## What v0.2 does
+## What v0.3 does
 
 - `Connection::open` over any async `Storage` (hipp's own
   runtime-agnostic trait: `async fn`, no executor, no tokio, no
@@ -27,6 +27,14 @@ aspirations.
   `IF NOT EXISTS`), multi-row `INSERT ... VALUES (...), (...)`,
   full-scan `SELECT` in rowid order plus `WHERE rowid = <literal>`
   point lookups, streamed via `step()`.
+- Index B-trees (behind the `indexes` feature, default on):
+  `CREATE [UNIQUE] INDEX`, `DROP INDEX`, UNIQUE enforcement for
+  explicit indexes and for column/table constraints via implicit
+  `sqlite_autoindex_*` indexes, and `WHERE <first indexed
+  column> = <literal>` lookups through the planner's access
+  seam. Expression, partial and non-BINARY-collated foreign
+  indexes are read as opaque metadata; writes to their tables
+  are refused rather than allowed to desynchronise them.
 - Explicit transactions: `BEGIN` / `COMMIT` / `ROLLBACK` over the
   resumable commit machine.
 - Table B-trees with leaf/interior/root splits, overflow chains
@@ -41,9 +49,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.2) |
+| Gate | Budget | Measured (v0.3) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **80,784 B** (Δ +5,080 B vs v0.1's 75,704 B) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **84,524 B** (Δ +3,740 B vs v0.2's 80,784 B; index engine is feature-gated out of tiny) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -63,12 +71,13 @@ differential testing. It is a separate crate and contributes
 
 ## Non-goals (SPEC §3)
 
-No WAL (files in WAL mode are rejected with `WalUnsupported`), no
-indexes (v0.3), no general `WHERE` (only `rowid = <literal>`),
-no `ORDER BY`/joins/aggregates, no bound parameters, no
-`UPDATE`/`DELETE`/`DROP`, no UTF-16, no multi-process locking —
-and **no `sqlite3_*` C ABI, ever** (D3): hipp is a Rust library,
-not a drop-in replacement.
+No WAL (files in WAL mode are rejected with `WalUnsupported`),
+no general `WHERE` (only `rowid = <literal>` and equality on an
+index's first column), no expression or partial indexes, no
+`ORDER BY`/joins/aggregates, no bound parameters, no
+`UPDATE`/`DELETE`/`DROP TABLE`, no UTF-16, no multi-process
+locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
+Rust library, not a drop-in replacement.
 
 ## Layout
 

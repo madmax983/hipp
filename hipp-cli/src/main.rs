@@ -269,6 +269,18 @@ where
                 }
                 let _ = out.write_all(t.sql);
                 let _ = out.write_all(b";\n");
+                // Explicit indexes on this table print right
+                // after it (oracle .schema order); implicit
+                // (sqlite_autoindex_*) entries carry no SQL and
+                // never print, as in the oracle shell.
+                for ix in db.indexes().iter() {
+                    if ix.table.eq_ignore_ascii_case(t.name)
+                        && let Some(sql) = ix.sql
+                    {
+                        let _ = out.write_all(sql);
+                        let _ = out.write_all(b";\n");
+                    }
+                }
             }
             Ok(Flow::Continue)
         }
@@ -301,6 +313,16 @@ where
                     }
                     line.extend_from_slice(b");\n");
                     let _ = out.write_all(&line);
+                }
+                // This table's explicit CREATE INDEX statements
+                // follow its rows.
+                for ix in db.indexes().iter() {
+                    if ix.table.eq_ignore_ascii_case(name.as_bytes())
+                        && let Some(sql) = ix.sql
+                    {
+                        let _ = out.write_all(sql);
+                        let _ = out.write_all(b";\n");
+                    }
                 }
             }
             let _ = out.write_all(b"COMMIT;\n");

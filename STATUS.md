@@ -4,6 +4,128 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.3 — index B-trees + freelist reuse hardening (2026-10-22)
+
+Pushed to GitHub (madmax983/hipp) via API replay under the
+conformance-loop mandate; remote tip + tree recorded in the loop
+status.
+
+### Scope shipped (SPEC §2 v0.3)
+
+- **Index B-trees** (SQFMT §1.5/§1.6) behind the `indexes` cargo
+  feature (default on; the tiny profile excludes it per §2):
+  key = record of the indexed columns with the rowid appended;
+  true B-tree insert — interior divider keys are real entries
+  (verified against the oracle: promoted keys are findable only
+  in interior pages); index overflow with the §1.6 X/M/K
+  formulas; ASC/DESC per column.
+- **CREATE [UNIQUE] INDEX** on plain column names (expressions,
+  partial indexes and non-BINARY collations parse-reject);
+  population of pre-existing rows; index maintenance on INSERT.
+- **Secondary-index lookup** through the planner's access seam:
+  `WHERE <first indexed column> = <literal>` uses the index
+  (plan-time literal conversion with the column's affinity,
+  including `'2'`/`2.0` forms); composite indexes serve prefix
+  lookups; a UNIQUE index wins when several match.
+- **UNIQUE enforcement** via implicit (`sqlite_autoindex_*`)
+  indexes: column and table-level UNIQUE sets, TEXT/composite
+  PRIMARY KEYs, and the `INTEGER PRIMARY KEY DESC` quirk (not a
+  rowid alias — verified against the oracle, as is NULL into a
+  TEXT PRIMARY KEY being legal heritage behaviour: duplicate
+  NULLs never conflict anywhere).
+- **DROP INDEX** (autoindexes refuse with a named error) — the
+  freelist producer that makes reuse testable end to end.
+- **Freelist hardening** (SQFMT §1.3.8): `free_page` mirrors the
+  oracle's trunk/leaf behaviour; `alloc_page` now validates
+  foreign freelists before handing pages out — duplicate leaves,
+  out-of-range pointers, overflowing leaf counts and trunk
+  cycles are `Error::CorruptPage`, never a page handed out twice.
+- **Opaque foreign indexes:** an index whose SQL the grammar
+  cannot represent (expressions, partial, collations) is
+  catalogued without resolution; reads work, INSERTs into its
+  table refuse with `Error::Unsupported` rather than silently
+  desynchronising it.
+- hipp-cli: `.schema` prints explicit indexes after their table
+  (byte-identical to the oracle shell on the test corpus);
+  `.dump` replays them; implicit indexes never print.
+
+### Root finds this milestone
+
+- **Index interior keys are entries, not separators:** with
+  512-byte pages and 300 rows, the oracle's index root holds
+  divider keys (e.g. key 520) that appear in NO leaf — the
+  lookup descent must equality-check interior keys. (Found by
+  decoding oracle pages byte-by-byte after a naive B+-tree
+  assumption produced wrong divisibility counts.)
+- **Exact int/real comparison:** the record comparator cast
+  integers to f64, equating 9007199254740993 with
+  9007199254740992.0. `compare_values` now cross-compares by
+  truncation + fraction with 2^63 bounds (unit-tested).
+
+### Tests — 64, all green (v0.2: 45)
+
+- New `tests/indexes.rs` (16): CREATE INDEX both directions
+  (oracle `integrity_check` + schema-row equality + index-leaf
+  page kind), oracle-built indexes read/maintained by hipp,
+  populated-table creation, lookup matrix (types, affinity
+  conversions, misses, NULL), composite prefix, DESC, deep tree
+  at 512-byte pages (interior-resident keys both directions),
+  2000-byte overflow keys, UNIQUE from all four origins incl.
+  multi-row statement atomicity, autoindex naming/order/SQL-
+  NULL shape vs oracle, CREATE UNIQUE INDEX over duplicates
+  fails atomically, CREATE INDEX inside transactions
+  (commit/rollback), DROP INDEX + page reuse bound, autoindex
+  drop refusal, oracle multi-trunk freelist consumption, three
+  hand-mangled freelist corruptions → `CorruptPage`, opaque
+  expression index (reads ok, writes refused).
+- New `hipp-cli/tests/cli_indexes.rs` (2): `.schema` with
+  indexes byte-identical to the oracle; `.dump` replays indexes
+  into a fresh oracle database.
+- A1–A11 all still green; clippy `-D warnings` clean; the
+  `indexes`-off (tiny) configuration compiles and its lib tests
+  pass.
+
+### §4.1 gates (re-measured)
+
+- Linked binary (`--profile tiny --target thumbv7em-none-eabihf
+  --no-default-features --bin hipp_thumb_demo`):
+  **.text 69,604 + .rodata 14,920 = 84,524 B ≤ 128 KiB.**
+  **Delta vs v0.2's 80,784 B: +3,740 B** — under the 4 KiB
+  ratchet line. The index engine itself contributes 0 B to
+  tiny (feature-gated); the growth is ungated core
+  correctness: CREATE TABLE constraint parsing (the syntax
+  must be consumed in every profile), freelist-consumption
+  validation, and the exact int/real comparator. Headroom
+  left: 46,548 B.
+- Statics: `.bss` 98,308 B is again entirely the demo's caller
+  heap; **engine .data+.bss outside caller memory = 0 B ≤ 8 KiB.**
+- Tiny-config RAM and zero steady-state scan allocations:
+  `tests/gates.rs` green (unchanged).
+
+### Honest notes / divergences
+
+- Index-aware lookup is equality on the index's **first**
+  column only (plus the rowid seam from v0.2); richer
+  predicates remain `Error::Unsupported` / parse-rejected.
+  This is the §2 seam growing one step, as designed.
+- No DELETE / UPDATE / DROP TABLE yet: index maintenance is
+  insert-only, and `btree_delete` exists solely to remove a
+  dropped index's schema row (it does no merge/redistribution —
+  an emptied schema leaf stays linked, which the format allows
+  and `integrity_check` accepts).
+- NOT NULL is still parse-but-unenforced everywhere; for
+  PRIMARY KEY columns this matches the oracle's verified
+  3.54.1 behaviour (NULL into a TEXT PRIMARY KEY succeeds).
+- The tiny profile records indexes as opaque metadata only:
+  it never creates, maintains or enforces them (SPEC §2
+  exclusion), and — as before any index support existed —
+  writing an indexed table from the tiny profile would
+  desynchronise its indexes. Standard-profile connections
+  refuse such writes safely (opaque rule above).
+- All v0.2 honest notes still hold unless superseded here (in
+  particular: a statement error inside an explicit transaction
+  aborts the whole bracket — including a UNIQUE violation).
+
 ## v0.2 — workspace, hipp-cli, first dialect growth (2026-10-22)
 
 Pushed to GitHub (madmax983/hipp) via API replay under the
