@@ -19,6 +19,8 @@ pub mod arena;
 pub mod btree;
 pub mod error;
 pub mod pager;
+#[cfg(feature = "v04")]
+pub mod query;
 pub mod record;
 pub mod schema;
 pub mod session;
@@ -28,7 +30,9 @@ pub mod storage;
 
 pub use error::{Error, SchemaKind, Scope};
 pub use record::{OwnedValue, Value};
-pub use session::{ArenaStats, Config, Connection, IndexMeta, Statement, Step, TableMeta};
+pub use session::{
+    ArenaStats, Config, Connection, IndexMeta, Statement, Step, TableMeta, ViewMeta,
+};
 pub use storage::{MemStorage, Storage};
 
 #[cfg(feature = "std")]

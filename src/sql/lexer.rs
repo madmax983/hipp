@@ -28,6 +28,17 @@ pub enum Tok {
     Dot,
     /// `=` (v0.2: WHERE rowid = <literal>).
     Eq,
+    /// `<`, `>`, `<=`, `>=`, `!=`/`<>` (v0.4 expressions).
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Ne,
+    /// `/` and `%` (v0.4 expressions).
+    Slash,
+    Percent,
+    /// `||` string concatenation (v0.4 expressions).
+    Concat,
     Eof,
 }
 
@@ -224,6 +235,79 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
                     offset: off,
                 });
                 i += 1;
+            }
+            b'<' => {
+                if i + 1 < n && sql[i + 1] == b'=' {
+                    toks.push(Token {
+                        tok: Tok::Le,
+                        offset: off,
+                    });
+                    i += 2;
+                } else if i + 1 < n && sql[i + 1] == b'>' {
+                    toks.push(Token {
+                        tok: Tok::Ne,
+                        offset: off,
+                    });
+                    i += 2;
+                } else {
+                    toks.push(Token {
+                        tok: Tok::Lt,
+                        offset: off,
+                    });
+                    i += 1;
+                }
+            }
+            b'>' => {
+                if i + 1 < n && sql[i + 1] == b'=' {
+                    toks.push(Token {
+                        tok: Tok::Ge,
+                        offset: off,
+                    });
+                    i += 2;
+                } else {
+                    toks.push(Token {
+                        tok: Tok::Gt,
+                        offset: off,
+                    });
+                    i += 1;
+                }
+            }
+            b'!' if i + 1 < n && sql[i + 1] == b'=' => {
+                toks.push(Token {
+                    tok: Tok::Ne,
+                    offset: off,
+                });
+                i += 2;
+            }
+            b'/' => {
+                if i + 1 < n && sql[i + 1] == b'*' {
+                    // C-style comment (SQLite accepts these).
+                    i += 2;
+                    while i + 1 < n && !(sql[i] == b'*' && sql[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(n);
+                } else {
+                    toks.push(Token {
+                        tok: Tok::Slash,
+                        offset: off,
+                    });
+                    i += 1;
+                }
+            }
+            b'%' => {
+                toks.push(Token {
+                    tok: Tok::Percent,
+                    offset: off,
+                });
+                i += 1;
+            }
+            b'|' if i + 1 < n && sql[i + 1] == b'|' => {
+                toks.push(Token {
+                    tok: Tok::Concat,
+                    offset: off,
+                });
+                i += 2;
             }
             b'-' => {
                 toks.push(Token {

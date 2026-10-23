@@ -230,13 +230,11 @@ fn where_rowid_hit_and_miss() {
             let rows = collect(&mut db, sql).await;
             assert_eq!(rows, Vec::<String>::new(), "{sql}");
         }
-        // A non-rowid column predicate is beyond v0.2's executor.
-        let r = db.prepare("SELECT id FROM t WHERE name = 'one'").await;
-        assert!(
-            matches!(r, Err(Error::Unsupported)),
-            "non-rowid predicate: {:?}",
-            r.err()
-        );
+        // v0.4 supersedes the v0.2 note that stood here: a
+        // non-rowid column predicate is now served by the general
+        // query planner (full coverage in tests/query.rs).
+        let rows = collect(&mut db, "SELECT id FROM t WHERE name = 'one'").await;
+        assert_eq!(rows, vec!["1"]);
         // Unknown column is a schema error, as in the select list.
         let r = db.prepare("SELECT id FROM t WHERE nope = 1").await;
         assert!(

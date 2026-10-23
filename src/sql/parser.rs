@@ -11,7 +11,12 @@
 use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
 
-use super::ast::{Ast, ColumnDef, ConstraintSet, IndexColumnDef, Literal, SelectList};
+use super::ast::{
+    Ast, BinOp, ColumnDef, ConstraintSet, Expr, FromSource, IndexColumnDef, JoinKind, Literal,
+    SelectItem, SelectStmt,
+};
+use alloc::boxed::Box;
+
 use super::lexer::{self, Tok, Token};
 
 const MAX_DEPTH: usize = 32;
@@ -152,11 +157,15 @@ impl<'a> Parser<'a> {
                 self.create_index_dispatch::<E>(false)
             } else if self.is_kw(self.pos + 1, b"UNIQUE") {
                 self.create_index_dispatch::<E>(true)
+            } else if self.is_kw(self.pos + 1, b"VIEW") {
+                self.create_view_dispatch::<E>()
             } else {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
         } else if self.cur_is_kw(b"DROP") {
-            self.drop_index_dispatch::<E>()
+            self.drop_dispatch::<E>()
+        } else if self.cur_is_kw(b"ALTER") {
+            self.alter_dispatch::<E>()
         } else if self.cur_is_kw(b"INSERT") {
             self.insert::<E>()
         } else if self.cur_is_kw(b"SELECT") {
@@ -210,6 +219,51 @@ impl<'a> Parser<'a> {
 
     #[cfg(not(feature = "indexes"))]
     fn drop_index_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
+    /// DROP dispatch: VIEW (v0.4) or INDEX (v0.3).
+    fn drop_dispatch<E>(&mut self) -> Result<Ast, E> {
+        if self.is_kw(self.pos + 1, b"VIEW") {
+            self.drop_view_dispatch::<E>()
+        } else {
+            self.drop_index_dispatch::<E>()
+        }
+    }
+
+    // ---------------- v0.4 statement shims ----------------
+    // ALTER TABLE ADD COLUMN, CREATE VIEW and DROP VIEW exist
+    // only under the `v04` feature (the tiny profile's documented
+    // exclusion, SPEC §2); the parsers live at the bottom of this
+    // file behind the same cfg.
+
+    #[cfg(feature = "v04")]
+    fn create_view_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.create_view::<E>()
+    }
+
+    #[cfg(not(feature = "v04"))]
+    fn create_view_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
+    #[cfg(feature = "v04")]
+    fn drop_view_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.drop_view::<E>()
+    }
+
+    #[cfg(not(feature = "v04"))]
+    fn drop_view_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
+    #[cfg(feature = "v04")]
+    fn alter_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.alter_table::<E>()
+    }
+
+    #[cfg(not(feature = "v04"))]
+    fn alter_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
@@ -511,6 +565,9 @@ impl<'a> Parser<'a> {
         let mut pk_desc = false;
         let mut unique = false;
         let mut default: Option<Literal> = None;
+        let mut not_null = false;
+        let mut default_nonconst = false;
+        let mut generated = false;
         let mut i = from + 1;
         while i < to {
             let t = self.toks.as_slice()[i];
@@ -538,6 +595,17 @@ impl<'a> Parser<'a> {
                 if self.is_kw(i, b"DEFAULT") {
                     decl_end_tok = decl_end_tok.min(i);
                     default = self.default_literal(i + 1, to);
+                    if default.is_none() {
+                        // A DEFAULT whose value is not a plain
+                        // literal (CURRENT_TIMESTAMP, a call, ...).
+                        default_nonconst = true;
+                    }
+                }
+                if self.is_kw(i, b"NOT") && self.is_kw(i + 1, b"NULL") {
+                    not_null = true;
+                }
+                if self.is_kw(i, b"GENERATED") {
+                    generated = true;
                 }
                 if self.is_kw(i, b"NOT")
                     || self.is_kw(i, b"NULL")
@@ -573,6 +641,9 @@ impl<'a> Parser<'a> {
             pk_desc,
             unique,
             default,
+            not_null,
+            default_nonconst,
+            generated,
         });
         // Constraint sets in statement order (v0.3): an inline
         // PRIMARY KEY / UNIQUE is a one-column set at this item's
@@ -679,16 +750,14 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw::<E>(b"VALUES")?;
         // v0.2: one or more parenthesised rows, comma-separated.
+        // v0.4: each value is an expression (a plain literal under
+        // the pre-v0.4 grammar).
         let mut rows = AVec::new();
         loop {
             self.expect::<E>(Tok::LParen)?;
             let mut row = AVec::new();
             loop {
-                let (lit, used) = self
-                    .literal_at(self.pos)
-                    .ok_or(perr(self.cur().offset, ParseKind::UnexpectedToken))?;
-                row.push(lit);
-                self.pos += used;
+                row.push(self.value_expr::<E>()?);
                 if self.eat(Tok::Comma) {
                     continue;
                 }
@@ -708,29 +777,74 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// One INSERT value: a full expression under `v04`, a plain
+    /// literal otherwise.
+    #[cfg(feature = "v04")]
+    fn value_expr<E>(&mut self) -> Result<Expr, E> {
+        self.parse_expr::<E>()
+    }
+
+    #[cfg(not(feature = "v04"))]
+    fn value_expr<E>(&mut self) -> Result<Expr, E> {
+        let (lit, used) = self
+            .literal_at(self.pos)
+            .ok_or(perr(self.cur().offset, ParseKind::UnexpectedToken))?;
+        self.pos += used;
+        Ok(Expr::Literal(lit))
+    }
+
     // ---------------- SELECT ----------------
 
     fn select<E>(&mut self) -> Result<Ast, E> {
+        #[cfg(feature = "v04")]
+        {
+            Ok(Ast::Select(self.select_rich::<E>()?))
+        }
+        #[cfg(not(feature = "v04"))]
+        {
+            self.select_simple::<E>()
+        }
+    }
+
+    /// The pre-v0.4 SELECT grammar (kept for the tiny profile):
+    /// `SELECT * | col, ... FROM t [WHERE col = literal]`, in the
+    /// v0.4 AST shape.
+    #[cfg(not(feature = "v04"))]
+    fn select_simple<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"SELECT")?;
-        let list = if self.eat(Tok::Star) {
-            SelectList::All
+        let mut items = AVec::new();
+        if self.eat(Tok::Star) {
+            items.push(SelectItem::Star);
         } else {
-            let mut cols = AVec::new();
             loop {
-                cols.push(self.name::<E>()?);
+                let n = self.name::<E>()?;
+                items.push(SelectItem::Expr(
+                    Expr::Column {
+                        table: None,
+                        name: n,
+                    },
+                    None,
+                    n,
+                ));
                 if self.eat(Tok::Comma) {
                     continue;
                 }
                 break;
             }
-            SelectList::Columns(cols)
-        };
+        }
         self.expect_kw::<E>(b"FROM")?;
         let table = self.name::<E>()?;
+        let mut from = AVec::new();
+        from.push(FromSource {
+            table,
+            alias: None,
+            kind: JoinKind::Inner,
+            on: None,
+        });
         // v0.2: optional WHERE <column> = <literal>. Any other
         // predicate shape is rejected here; whether <column> is the
         // rowid is a plan-time decision (the executor seam).
-        let mut predicate = None;
+        let mut filter = None;
         if self.eat_kw(b"WHERE") {
             let col = self.name::<E>()?;
             if !self.eat(Tok::Eq) {
@@ -740,13 +854,658 @@ impl<'a> Parser<'a> {
                 .literal_at(self.pos)
                 .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
             self.pos += used;
-            predicate = Some((col, lit));
+            filter = Some(Expr::Binary(
+                BinOp::Eq,
+                Box::new(Expr::Column {
+                    table: None,
+                    name: col,
+                }),
+                Box::new(Expr::Literal(lit)),
+            ));
         }
-        Ok(Ast::Select {
-            table,
-            list,
-            predicate,
+        Ok(Ast::Select(SelectStmt {
+            distinct: false,
+            items,
+            from,
+            filter,
+            group_by: AVec::new(),
+            having: None,
+            order_by: AVec::new(),
+            limit: None,
+            offset: 0,
+        }))
+    }
+}
+
+// ================= v0.4 grammar (feature = "v04") =================
+
+#[cfg(feature = "v04")]
+impl<'a> Parser<'a> {
+    /// True when the current token is an unquoted identifier whose
+    /// text is a clause keyword that must not be eaten as a bare
+    /// alias.
+    fn at_clause_kw(&self) -> bool {
+        const KWS: &[&[u8]] = &[
+            b"FROM",
+            b"WHERE",
+            b"GROUP",
+            b"HAVING",
+            b"ORDER",
+            b"LIMIT",
+            b"OFFSET",
+            b"JOIN",
+            b"INNER",
+            b"LEFT",
+            b"CROSS",
+            b"OUTER",
+            b"ON",
+            b"UNION",
+            b"EXCEPT",
+            b"INTERSECT",
+        ];
+        match self.ident_at(self.pos) {
+            Some((h, false, _)) => {
+                let b = handle_bytes(self.arena, h);
+                KWS.iter().any(|k| eq_ci(b, k))
+            }
+            _ => false,
+        }
+    }
+
+    /// An optional `[AS] name` alias: a quoted identifier, or a
+    /// bare identifier that is not a clause keyword.
+    fn opt_alias(&mut self) -> Option<ABytes> {
+        if self.eat_kw(b"AS") {
+            return match self.cur().tok {
+                Tok::Ident(h, _) => {
+                    self.pos += 1;
+                    Some(h)
+                }
+                _ => None,
+            };
+        }
+        match self.cur().tok {
+            Tok::Ident(h, quoted) => {
+                if quoted || !self.at_clause_kw() {
+                    self.pos += 1;
+                    Some(h)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // ---------- expression parser (SQLite precedence) ----------
+    // OR < AND < NOT < comparison < +,- < *,/,% < || < unary.
+
+    pub(crate) fn parse_expr<E>(&mut self) -> Result<Expr, E> {
+        self.expr_or::<E>()
+    }
+
+    fn expr_or<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_and::<E>()?;
+        while self.eat_kw(b"OR") {
+            let r = self.expr_and::<E>()?;
+            l = Expr::Binary(BinOp::Or, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn expr_and<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_not::<E>()?;
+        while self.eat_kw(b"AND") {
+            let r = self.expr_not::<E>()?;
+            l = Expr::Binary(BinOp::And, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn expr_not<E>(&mut self) -> Result<Expr, E> {
+        if self.eat_kw(b"NOT") {
+            let e = self.expr_not::<E>()?;
+            return Ok(Expr::Not(Box::new(e)));
+        }
+        self.expr_cmp::<E>()
+    }
+
+    fn expr_cmp<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_add::<E>()?;
+        loop {
+            // Postfix ISNULL / NOTNULL.
+            if self.eat_kw(b"ISNULL") {
+                l = Expr::IsNull(Box::new(l), false);
+                continue;
+            }
+            if self.eat_kw(b"NOTNULL") {
+                l = Expr::IsNull(Box::new(l), true);
+                continue;
+            }
+            if self.cur_is_kw(b"IS") {
+                self.pos += 1;
+                let neg = self.eat_kw(b"NOT");
+                let r = self.expr_add::<E>()?;
+                l = Expr::Binary(
+                    if neg { BinOp::IsNot } else { BinOp::Is },
+                    Box::new(l),
+                    Box::new(r),
+                );
+                continue;
+            }
+            let neg = if self.cur_is_kw(b"NOT")
+                && (self.is_kw(self.pos + 1, b"IN")
+                    || self.is_kw(self.pos + 1, b"LIKE")
+                    || self.is_kw(self.pos + 1, b"BETWEEN"))
+            {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
+            if self.eat_kw(b"IN") {
+                self.expect::<E>(Tok::LParen)?;
+                if self.cur_is_kw(b"SELECT") {
+                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                }
+                let mut list = AVec::new();
+                if self.cur().tok != Tok::RParen {
+                    loop {
+                        list.push(self.parse_expr::<E>()?);
+                        if self.eat(Tok::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect::<E>(Tok::RParen)?;
+                l = Expr::InList(Box::new(l), list, neg);
+                continue;
+            }
+            if self.eat_kw(b"LIKE") {
+                let r = self.expr_add::<E>()?;
+                l = Expr::Like(Box::new(l), Box::new(r), neg);
+                continue;
+            }
+            if self.eat_kw(b"BETWEEN") {
+                let lo = self.expr_add::<E>()?;
+                self.expect_kw::<E>(b"AND")?;
+                let hi = self.expr_add::<E>()?;
+                l = Expr::Between(Box::new(l), Box::new(lo), Box::new(hi), neg);
+                continue;
+            }
+            if neg {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+            let op = match self.cur().tok {
+                Tok::Eq => Some(BinOp::Eq),
+                Tok::Ne => Some(BinOp::Ne),
+                Tok::Lt => Some(BinOp::Lt),
+                Tok::Le => Some(BinOp::Le),
+                Tok::Gt => Some(BinOp::Gt),
+                Tok::Ge => Some(BinOp::Ge),
+                _ => None,
+            };
+            let Some(op) = op else { break };
+            self.pos += 1;
+            // `==` is spelled with two Eq tokens by the lexer;
+            // accept it.
+            if op == BinOp::Eq {
+                let _ = self.eat(Tok::Eq);
+            }
+            let r = self.expr_add::<E>()?;
+            l = Expr::Binary(op, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn expr_add<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_mul::<E>()?;
+        loop {
+            let op = match self.cur().tok {
+                Tok::Plus => BinOp::Add,
+                Tok::Minus => BinOp::Sub,
+                _ => break,
+            };
+            self.pos += 1;
+            let r = self.expr_mul::<E>()?;
+            l = Expr::Binary(op, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn expr_mul<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_concat::<E>()?;
+        loop {
+            let op = match self.cur().tok {
+                Tok::Star => BinOp::Mul,
+                Tok::Slash => BinOp::Div,
+                Tok::Percent => BinOp::Mod,
+                _ => break,
+            };
+            self.pos += 1;
+            let r = self.expr_concat::<E>()?;
+            l = Expr::Binary(op, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn expr_concat<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_unary::<E>()?;
+        while self.eat(Tok::Concat) {
+            let r = self.expr_unary::<E>()?;
+            l = Expr::Binary(BinOp::Concat, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn expr_unary<E>(&mut self) -> Result<Expr, E> {
+        // Signed literals fold at this level (literal_at handles
+        // the sign itself).
+        if let Some((lit, used)) = self.literal_at(self.pos) {
+            self.pos += used;
+            return Ok(Expr::Literal(lit));
+        }
+        if self.eat(Tok::Minus) {
+            let e = self.expr_unary::<E>()?;
+            return Ok(Expr::Neg(Box::new(e)));
+        }
+        if self.eat(Tok::Plus) {
+            return self.expr_unary::<E>();
+        }
+        self.expr_primary::<E>()
+    }
+
+    fn expr_primary<E>(&mut self) -> Result<Expr, E> {
+        if self.eat(Tok::LParen) {
+            if self.cur_is_kw(b"SELECT") {
+                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+            }
+            let e = self.parse_expr::<E>()?;
+            self.expect::<E>(Tok::RParen)?;
+            return Ok(e);
+        }
+        if self.cur_is_kw(b"CASE") {
+            self.pos += 1;
+            let base = if self.cur_is_kw(b"WHEN") {
+                None
+            } else {
+                Some(Box::new(self.parse_expr::<E>()?))
+            };
+            let mut whens = AVec::new();
+            while self.eat_kw(b"WHEN") {
+                let w = self.parse_expr::<E>()?;
+                self.expect_kw::<E>(b"THEN")?;
+                let t = self.parse_expr::<E>()?;
+                whens.push((w, t));
+            }
+            if whens.is_empty() {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+            let otherwise = if self.eat_kw(b"ELSE") {
+                Some(Box::new(self.parse_expr::<E>()?))
+            } else {
+                None
+            };
+            self.expect_kw::<E>(b"END")?;
+            return Ok(Expr::Case {
+                base,
+                whens,
+                otherwise,
+            });
+        }
+        match self.cur().tok {
+            Tok::Ident(h, quoted) => {
+                let nb = handle_bytes(self.arena, h);
+                // Function call: ident followed by '('.
+                if !quoted
+                    && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::LParen)
+                {
+                    if eq_ci(nb, b"CAST") {
+                        self.pos += 2; // name + '('
+                        let e = self.parse_expr::<E>()?;
+                        self.expect_kw::<E>(b"AS")?;
+                        // Type name: raw SQL slice up to ')'.
+                        let start = self.cur().offset;
+                        let mut depth = 0usize;
+                        while !self.at_eof() {
+                            match self.cur().tok {
+                                Tok::LParen => depth += 1,
+                                Tok::RParen => {
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                    depth -= 1;
+                                }
+                                Tok::Eof => break,
+                                _ => {}
+                            }
+                            self.pos += 1;
+                        }
+                        let end = self.cur().offset;
+                        let ty = self
+                            .arena
+                            .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
+                        self.expect::<E>(Tok::RParen)?;
+                        return Ok(Expr::Cast(Box::new(e), ty));
+                    }
+                    let fname = h;
+                    self.pos += 2; // name + '('
+                    let star = self.eat(Tok::Star);
+                    let distinct = !star && self.eat_kw(b"DISTINCT");
+                    let mut args = AVec::new();
+                    if !star && self.cur().tok != Tok::RParen {
+                        loop {
+                            args.push(self.parse_expr::<E>()?);
+                            if self.eat(Tok::Comma) {
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect::<E>(Tok::RParen)?;
+                    return Ok(Expr::Func {
+                        name: fname,
+                        distinct,
+                        star,
+                        args,
+                    });
+                }
+                if let Some((lit, used)) = self.literal_at(self.pos) {
+                    self.pos += used;
+                    return Ok(Expr::Literal(lit));
+                }
+                // Column reference, possibly qualified. Parse the
+                // tokens directly (name() would eat the qualifier).
+                self.pos += 1;
+                if self.cur().tok == Tok::Dot {
+                    self.pos += 1;
+                    match self.cur().tok {
+                        Tok::Ident(h2, _) => {
+                            self.pos += 1;
+                            return Ok(Expr::Column {
+                                table: Some(h),
+                                name: h2,
+                            });
+                        }
+                        _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+                    }
+                }
+                Ok(Expr::Column {
+                    table: None,
+                    name: h,
+                })
+            }
+            _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+        }
+    }
+
+    // ---------- rich SELECT ----------
+
+    fn select_rich<E>(&mut self) -> Result<SelectStmt, E> {
+        self.expect_kw::<E>(b"SELECT")?;
+        let distinct = if self.eat_kw(b"DISTINCT") {
+            true
+        } else {
+            let _ = self.eat_kw(b"ALL");
+            false
+        };
+        let mut items = AVec::new();
+        loop {
+            if self.eat(Tok::Star) {
+                items.push(SelectItem::Star);
+            } else if let Some((h, _, _)) = self.ident_at(self.pos)
+                && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::Dot)
+                && self.toks.as_slice().get(self.pos + 2).map(|t| t.tok) == Some(Tok::Star)
+            {
+                self.pos += 3;
+                items.push(SelectItem::TableStar(h));
+            } else {
+                let start = self.cur().offset;
+                let e = self.parse_expr::<E>()?;
+                let end = self.cur().offset;
+                let text = self
+                    .arena
+                    .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
+                let alias = self.opt_alias();
+                items.push(SelectItem::Expr(e, alias, text));
+            }
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        let mut from = AVec::new();
+        if self.eat_kw(b"FROM") {
+            from.push(self.from_source::<E>(JoinKind::Inner, true)?);
+            loop {
+                if self.eat(Tok::Comma) {
+                    from.push(self.from_source::<E>(JoinKind::Cross, false)?);
+                    continue;
+                }
+                let kind = if self.eat_kw(b"JOIN") {
+                    Some(JoinKind::Inner)
+                } else if self.eat_kw(b"INNER") {
+                    self.expect_kw::<E>(b"JOIN")?;
+                    Some(JoinKind::Inner)
+                } else if self.eat_kw(b"LEFT") {
+                    let _ = self.eat_kw(b"OUTER");
+                    self.expect_kw::<E>(b"JOIN")?;
+                    Some(JoinKind::Left)
+                } else if self.eat_kw(b"CROSS") {
+                    self.expect_kw::<E>(b"JOIN")?;
+                    Some(JoinKind::Cross)
+                } else {
+                    None
+                };
+                let Some(kind) = kind else { break };
+                from.push(self.from_source::<E>(kind, false)?);
+            }
+        }
+        let filter = if self.eat_kw(b"WHERE") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        let mut group_by = AVec::new();
+        if self.eat_kw(b"GROUP") {
+            self.expect_kw::<E>(b"BY")?;
+            loop {
+                group_by.push(self.parse_expr::<E>()?);
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        let having = if self.eat_kw(b"HAVING") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        let mut order_by = AVec::new();
+        if self.eat_kw(b"ORDER") {
+            self.expect_kw::<E>(b"BY")?;
+            loop {
+                let e = self.parse_expr::<E>()?;
+                let desc = if self.eat_kw(b"DESC") {
+                    true
+                } else {
+                    let _ = self.eat_kw(b"ASC");
+                    false
+                };
+                // NULLS FIRST/LAST: SQLite's defaults (ASC: first,
+                // DESC: last) are what the executor implements;
+                // accept and ignore the explicit form when it
+                // matches, which is the common case.
+                if self.eat_kw(b"NULLS") {
+                    let _ = self.eat_kw(b"FIRST") || self.eat_kw(b"LAST");
+                }
+                order_by.push((e, desc));
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        let mut limit = None;
+        let mut offset = 0i64;
+        if self.eat_kw(b"LIMIT") {
+            let first = self.limit_int::<E>()?;
+            if self.eat(Tok::Comma) {
+                // LIMIT offset, count
+                offset = first;
+                limit = Some(self.limit_int::<E>()?);
+            } else {
+                limit = Some(first);
+                if self.eat_kw(b"OFFSET") {
+                    offset = self.limit_int::<E>()?;
+                }
+            }
+        }
+        Ok(SelectStmt {
+            distinct,
+            items,
+            from,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
         })
+    }
+
+    fn limit_int<E>(&mut self) -> Result<i64, E> {
+        match self.literal_at(self.pos) {
+            Some((Literal::Integer(v), used)) => {
+                self.pos += used;
+                Ok(v)
+            }
+            _ => Err(perr(self.cur().offset, ParseKind::UnsupportedClause)),
+        }
+    }
+
+    fn from_source<E>(&mut self, kind: JoinKind, first: bool) -> Result<FromSource, E> {
+        let table = self.name::<E>()?;
+        let alias = self.opt_alias();
+        let on = if !first && self.eat_kw(b"ON") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        Ok(FromSource {
+            table,
+            alias,
+            kind,
+            on,
+        })
+    }
+
+    // ---------- ALTER TABLE ADD COLUMN ----------
+
+    fn alter_table<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"ALTER")?;
+        self.expect_kw::<E>(b"TABLE")?;
+        let table = self.name::<E>()?;
+        if !self.eat_kw(b"ADD") {
+            return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+        }
+        let _ = self.eat_kw(b"COLUMN");
+        // The rest of the statement is one column definition.
+        let from = self.pos;
+        let mut to = from;
+        while to < self.limit {
+            match self.toks.as_slice()[to].tok {
+                Tok::Eof | Tok::Semi => break,
+                _ => to += 1,
+            }
+        }
+        if to == from {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
+        let mut columns: AVec<ColumnDef> = AVec::new();
+        let mut pk_names: AVec<ABytes> = AVec::new();
+        let mut pk_desc: AVec<ABytes> = AVec::new();
+        let mut sets: AVec<ConstraintSet> = AVec::new();
+        self.create_item::<E>(
+            from,
+            to,
+            &mut columns,
+            &mut pk_names,
+            &mut pk_desc,
+            &mut sets,
+        )?;
+        if columns.len() != 1 {
+            return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+        }
+        let column = columns.as_slice()[0].clone();
+        // Raw definition text (SQLite stores it verbatim into the
+        // rewritten CREATE TABLE).
+        let start = self.toks.as_slice()[from].offset;
+        let end = if to < self.limit {
+            self.toks.as_slice()[to].offset
+        } else {
+            self.sql.len()
+        };
+        let text = self
+            .arena
+            .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
+        self.pos = to;
+        Ok(Ast::AlterAddColumn {
+            table,
+            column,
+            text,
+        })
+    }
+
+    // ---------- CREATE / DROP VIEW ----------
+
+    fn create_view<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"CREATE")?;
+        self.expect_kw::<E>(b"VIEW")?;
+        let if_not_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"NOT")?;
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        let mut columns = None;
+        if self.eat(Tok::LParen) {
+            let mut cols = AVec::new();
+            loop {
+                cols.push(self.name::<E>()?);
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                self.expect::<E>(Tok::RParen)?;
+                break;
+            }
+            columns = Some(cols);
+        }
+        self.expect_kw::<E>(b"AS")?;
+        let select = self.select_rich::<E>()?;
+        Ok(Ast::CreateView {
+            name,
+            if_not_exists,
+            columns,
+            select,
+        })
+    }
+
+    fn drop_view<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"DROP")?;
+        self.expect_kw::<E>(b"VIEW")?;
+        let if_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        Ok(Ast::DropView { name, if_exists })
     }
 }
 

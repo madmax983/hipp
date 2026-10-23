@@ -6,6 +6,7 @@
 //! borrows.
 
 use crate::arena::{ABytes, AVec};
+use alloc::boxed::Box;
 
 /// A literal value as written in the SQL text.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,6 +37,16 @@ pub struct ColumnDef {
     /// A simple literal `DEFAULT`, when present and parseable as a
     /// literal (v0.1 materialises only literal defaults).
     pub default: Option<Literal>,
+    /// `NOT NULL` appeared in this column's constraints (v0.4:
+    /// recorded for ALTER TABLE ADD COLUMN validation; still not
+    /// enforced on INSERT, matching the v0.1 note).
+    pub not_null: bool,
+    /// A `DEFAULT` was present but is not a plain literal
+    /// (e.g. `CURRENT_TIMESTAMP`, a function call) (v0.4).
+    pub default_nonconst: bool,
+    /// `GENERATED ALWAYS AS` appeared (v0.4: recorded so ADD
+    /// COLUMN can refuse generated columns).
+    pub generated: bool,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -62,6 +73,112 @@ pub enum SelectList {
     Columns(AVec<ABytes>),
 }
 
+/// Binary operators (v0.4 expression grammar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Or,
+    And,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    /// `IS` / `IS NOT`: NULL-safe equality.
+    Is,
+    IsNot,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Concat,
+}
+
+/// A scalar SQL expression (v0.4). Column references are by
+/// (optional qualifier, name); resolution to FROM-source slots is
+/// a plan-time step (see session/query).
+#[derive(Debug, Clone)]
+pub enum Expr {
+    Literal(Literal),
+    Column {
+        table: Option<ABytes>,
+        name: ABytes,
+    },
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// Unary minus.
+    Neg(Box<Expr>),
+    /// Logical NOT.
+    Not(Box<Expr>),
+    IsNull(Box<Expr>, bool),
+    InList(Box<Expr>, AVec<Expr>, bool),
+    Between(Box<Expr>, Box<Expr>, Box<Expr>, bool),
+    Like(Box<Expr>, Box<Expr>, bool),
+    /// CASE: optional base operand, (when, then) pairs, optional
+    /// ELSE.
+    Case {
+        base: Option<Box<Expr>>,
+        whens: AVec<(Expr, Expr)>,
+        otherwise: Option<Box<Expr>>,
+    },
+    /// Scalar or aggregate function call; `star` is `count(*)`.
+    Func {
+        name: ABytes,
+        distinct: bool,
+        star: bool,
+        args: AVec<Expr>,
+    },
+    Cast(Box<Expr>, ABytes),
+}
+
+/// One SELECT result item (v0.4).
+#[derive(Debug, Clone)]
+pub enum SelectItem {
+    Star,
+    TableStar(ABytes),
+    /// (expression, alias, source text of the expression) — the
+    /// text is how SQLite names an unaliased expression column,
+    /// which view column derivation needs.
+    Expr(Expr, Option<ABytes>, ABytes),
+}
+
+/// How a FROM source joins the previous ones (v0.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Cross,
+}
+
+/// One FROM source (v0.4): a table (or view name, resolved at plan
+/// time) with an optional alias, joined per `kind` with the
+/// optional ON expression. The first source has kind Inner and no
+/// ON.
+#[derive(Debug, Clone)]
+pub struct FromSource {
+    pub table: ABytes,
+    pub alias: Option<ABytes>,
+    pub kind: JoinKind,
+    pub on: Option<Expr>,
+}
+
+/// A full SELECT statement (v0.4 shape; the pre-v0.4 grammar
+/// produces the single-source, simple-items special case).
+#[derive(Debug, Clone)]
+pub struct SelectStmt {
+    /// `SELECT DISTINCT` (v0.4): duplicate output rows removed.
+    pub distinct: bool,
+    pub items: AVec<SelectItem>,
+    pub from: AVec<FromSource>,
+    pub filter: Option<Expr>,
+    pub group_by: AVec<Expr>,
+    pub having: Option<Expr>,
+    /// (expression, descending) pairs.
+    pub order_by: AVec<(Expr, bool)>,
+    pub limit: Option<i64>,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Ast {
     CreateTable {
@@ -84,22 +201,43 @@ pub enum Ast {
         columns: AVec<IndexColumnDef>,
     },
     /// `DROP INDEX` (v0.3).
-    DropIndex { name: ABytes, if_exists: bool },
+    DropIndex {
+        name: ABytes,
+        if_exists: bool,
+    },
     Insert {
         table: ABytes,
         /// Explicit column list, if given.
         columns: Option<AVec<ABytes>>,
         /// One entry per `VALUES` row (v0.2: multi-row VALUES).
-        rows: AVec<AVec<Literal>>,
+        /// v0.4: each value is an expression (a plain literal in
+        /// the pre-v0.4 grammar), evaluated with no row context.
+        rows: AVec<AVec<Expr>>,
     },
-    Select {
+    Select(SelectStmt),
+    /// `ALTER TABLE <t> ADD [COLUMN] <coldef>` (v0.4). `text` is
+    /// the column definition exactly as written (SQL slice), used
+    /// to rewrite the stored CREATE TABLE text the way SQLite
+    /// does (`, <text>` inserted before the closing paren).
+    AlterAddColumn {
         table: ABytes,
-        list: SelectList,
-        /// Optional `WHERE <column> = <literal>` (v0.2). The plan
-        /// stage resolves whether the column is the rowid (or its
-        /// alias); any other column is an executor-level rejection,
-        /// and this pair is the seam general WHERE hangs off.
-        predicate: Option<(ABytes, Literal)>,
+        column: ColumnDef,
+        text: ABytes,
+    },
+    /// `CREATE VIEW` (v0.4): stored SQL, inert — the SELECT is
+    /// parsed and validated at plan time but never executed;
+    /// selecting FROM a view is `Error::Unsupported`.
+    CreateView {
+        name: ABytes,
+        if_not_exists: bool,
+        /// Explicit column-name list, if written.
+        columns: Option<AVec<ABytes>>,
+        select: SelectStmt,
+    },
+    /// `DROP VIEW` (v0.4).
+    DropView {
+        name: ABytes,
+        if_exists: bool,
     },
     /// `BEGIN [TRANSACTION]` (v0.2).
     Begin,

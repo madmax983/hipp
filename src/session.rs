@@ -13,11 +13,16 @@ use crate::error::{Error, Result, SchemaKind, Scope};
 use crate::pager::Pager;
 use crate::record::{OwnedValue, Value, apply_affinity, encode_record};
 use crate::schema::{Catalog, build_catalog};
-use crate::sql::{Ast, Literal, SelectList, eq_ci, handle_bytes, parse};
+use crate::sql::{Ast, BinOp, Expr, Literal, SelectItem, SelectStmt, eq_ci, handle_bytes, parse};
 use crate::storage::Storage;
 
 #[cfg(feature = "indexes")]
 use crate::schema::IndexOrigin;
+
+#[cfg(feature = "v04")]
+use crate::query::{Ctx, RExpr, RowData};
+#[cfg(feature = "v04")]
+use crate::sql::JoinKind;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -185,6 +190,10 @@ enum Plan {
         /// Where each supplied value goes, parallel to one AST
         /// value row (every row of a multi-row VALUES shares it).
         targets: AVec<Target>,
+        /// VALUES rows evaluated at plan time (v0.4: expressions
+        /// in VALUES are constant-folded here; pre-v0.4 they are
+        /// plain literals).
+        rows_v: AVec<AVec<OwnedValue>>,
         /// Indexes to maintain, in catalog order (v0.3).
         #[cfg(feature = "indexes")]
         indexes: AVec<IndexPlan>,
@@ -207,6 +216,58 @@ enum Plan {
     Commit,
     /// `ROLLBACK` (v0.2).
     Rollback,
+    /// A v0.4 query (joins / aggregates / general expressions /
+    /// ORDER BY / LIMIT): planned resolved expressions, executed
+    /// by materialisation on first step.
+    #[cfg(feature = "v04")]
+    Query(QueryPlan),
+    /// `ALTER TABLE ... ADD COLUMN` (v0.4): the rewritten stored
+    /// CREATE TABLE text is computed at plan time.
+    #[cfg(feature = "v04")]
+    AlterAdd {
+        root: u32,
+        table: AVec<u8>,
+        new_sql: AVec<u8>,
+    },
+    /// `CREATE VIEW` (v0.4).
+    #[cfg(feature = "v04")]
+    CreateView,
+    /// `DROP VIEW` (v0.4); `exists: false` is the IF EXISTS no-op.
+    #[cfg(feature = "v04")]
+    DropView {
+        exists: bool,
+    },
+}
+
+/// One FROM source in a v0.4 query plan.
+#[cfg(feature = "v04")]
+#[derive(Debug, Clone)]
+struct SourcePlan {
+    root: u32,
+    kind: JoinKind,
+    on: Option<RExpr>,
+    rowid_alias: Option<usize>,
+    ncols: usize,
+    /// Per-column read-side affinity (REAL forcing, §5.5).
+    affs: AVec<crate::record::Affinity>,
+    defaults: AVec<OwnedValue>,
+}
+
+/// A v0.4 query plan: everything resolved at prepare time.
+#[cfg(feature = "v04")]
+#[derive(Debug, Clone)]
+struct QueryPlan {
+    sources: AVec<SourcePlan>,
+    items: AVec<RExpr>,
+    filter: Option<RExpr>,
+    group_by: AVec<RExpr>,
+    having: Option<RExpr>,
+    order_by: AVec<(RExpr, bool)>,
+    distinct: bool,
+    limit: Option<i64>,
+    offset: i64,
+    has_agg: bool,
+    width: usize,
 }
 
 struct InsCol {
@@ -218,6 +279,43 @@ struct InsCol {
 enum Target {
     Col(usize),
     Rowid,
+}
+
+/// Whether a SELECT fits the pre-v0.4 fast paths: one table,
+/// `*` (alone) or plain unqualified columns, and no filter or a
+/// `WHERE <col> = <literal>` filter.
+fn select_is_simple(stmt: &SelectStmt) -> bool {
+    if stmt.distinct
+        || stmt.from.len() != 1
+        || !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+    {
+        return false;
+    }
+    if stmt.from.as_slice()[0].on.is_some() {
+        return false;
+    }
+    let mut stars = 0usize;
+    for it in stmt.items.iter() {
+        match it {
+            SelectItem::Star => stars += 1,
+            SelectItem::Expr(Expr::Column { table: None, .. }, None, _) => {}
+            _ => return false,
+        }
+    }
+    if stars > 0 && stmt.items.len() != 1 {
+        return false;
+    }
+    match &stmt.filter {
+        None => true,
+        Some(Expr::Binary(BinOp::Eq, l, r)) => {
+            matches!(l.as_ref(), Expr::Column { table: None, .. })
+                && matches!(r.as_ref(), Expr::Literal(_))
+        }
+        _ => false,
+    }
 }
 
 pub struct Connection<S: Storage> {
@@ -298,6 +396,14 @@ impl<S: Storage> Connection<S> {
             index_pos: 0,
             #[cfg(feature = "indexes")]
             index_loaded: false,
+            #[cfg(feature = "v04")]
+            query_rows: AVec::new(),
+            #[cfg(feature = "v04")]
+            query_rowids: AVec::new(),
+            #[cfg(feature = "v04")]
+            query_pos: 0,
+            #[cfg(feature = "v04")]
+            query_loaded: false,
         })
     }
 
@@ -448,11 +554,20 @@ impl<S: Storage> Connection<S> {
                     }
                     out
                 };
+                let mut rows_v = AVec::new();
+                for r in rows.iter() {
+                    let mut rv = AVec::new();
+                    for e in r.iter() {
+                        rv.push(self.eval_value_expr(arena, e)?);
+                    }
+                    rows_v.push(rv);
+                }
                 Ok(Plan::Insert {
                     root: t.root,
                     rowid_alias: t.rowid_alias,
                     cols,
                     targets,
+                    rows_v,
                     #[cfg(feature = "indexes")]
                     indexes,
                 })
@@ -465,90 +580,433 @@ impl<S: Storage> Connection<S> {
             }
             Ast::Commit => Ok(Plan::Commit),
             Ast::Rollback => Ok(Plan::Rollback),
-            Ast::Select {
+            Ast::Select(stmt) => self.plan_select(stmt, arena),
+            #[cfg(feature = "v04")]
+            Ast::AlterAddColumn {
                 table,
-                list,
-                predicate,
+                column,
+                text,
             } => {
                 let tname = handle_bytes(arena, *table);
-                let t = self
-                    .catalog
-                    .find(&self.catalog_arena, tname)
-                    .ok_or(Error::Schema {
-                        kind: SchemaKind::UnknownTable,
-                    })?;
-                // WHERE <col> = <literal> lowers to a rowid access
-                // path when <col> is the rowid or its alias; any
-                // other real column is beyond v0.2's executor.
-                let access = match predicate {
-                    None => Access::FullScan,
-                    Some((colname, lit)) => {
-                        let nb = handle_bytes(arena, *colname);
-                        match self.resolve_target(t, nb)? {
-                            Target::Rowid => literal_rowid(arena, *lit),
-                            Target::Col(i) if Some(i) == t.rowid_alias => {
-                                literal_rowid(arena, *lit)
-                            }
-                            Target::Col(i) => {
-                                // v0.3: an index on this column
-                                // turns the predicate into a
-                                // secondary-index lookup.
-                                #[cfg(feature = "indexes")]
-                                {
-                                    match self.plan_index_access(t, tname, i, arena, *lit) {
-                                        Some(a) => a,
-                                        None => return Err(Error::Unsupported),
-                                    }
-                                }
-                                #[cfg(not(feature = "indexes"))]
-                                {
-                                    let _ = i;
-                                    return Err(Error::Unsupported);
-                                }
-                            }
+                let t = match self.catalog.find(&self.catalog_arena, tname) {
+                    Some(t) => t,
+                    None => {
+                        if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
+                            return Err(Error::Unsupported);
                         }
+                        return Err(Error::Schema {
+                            kind: SchemaKind::UnknownTable,
+                        });
                     }
                 };
-                let mut out = AVec::new();
-                let mut aff = AVec::new();
-                match list {
-                    SelectList::All => {
-                        for (i, c) in t.columns.iter().enumerate() {
-                            out.push(i);
-                            aff.push(c.affinity);
+                let cname = handle_bytes(arena, column.name);
+                if t.columns
+                    .iter()
+                    .any(|c| eq_ci(handle_bytes(&self.catalog_arena, c.name), cname))
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::DuplicateColumn,
+                    });
+                }
+                if column.primary_key
+                    || column.pk_desc
+                    || column.unique
+                    || column.generated
+                    || column.default_nonconst
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::CannotAddColumn,
+                    });
+                }
+                if column.not_null && matches!(column.default, None | Some(Literal::Null)) {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::CannotAddColumn,
+                    });
+                }
+                let base = handle_bytes(&self.catalog_arena, t.sql);
+                let pos = base
+                    .iter()
+                    .rposition(|b| *b == b')')
+                    .ok_or(Error::Unsupported)?;
+                let mut new_sql = AVec::new();
+                new_sql.extend_from_slice(&base[..pos]);
+                new_sql.extend_from_slice(b", ");
+                new_sql.extend_from_slice(handle_bytes(arena, *text));
+                new_sql.extend_from_slice(&base[pos..]);
+                Ok(Plan::AlterAdd {
+                    root: t.root,
+                    table: copy_vec(tname),
+                    new_sql,
+                })
+            }
+            #[cfg(feature = "v04")]
+            Ast::CreateView {
+                columns, select, ..
+            } => {
+                let width = self.view_select_width(select, arena)?;
+                if let Some(cols) = columns
+                    && cols.len() != width
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::ColumnCountMismatch,
+                    });
+                }
+                Ok(Plan::CreateView)
+            }
+            #[cfg(feature = "v04")]
+            Ast::DropView { name, if_exists } => {
+                let nb = handle_bytes(arena, *name);
+                match self.catalog.find_view(&self.catalog_arena, nb) {
+                    None => {
+                        if *if_exists {
+                            Ok(Plan::DropView { exists: false })
+                        } else {
+                            Err(Error::Schema {
+                                kind: SchemaKind::UnknownView,
+                            })
                         }
                     }
-                    SelectList::Columns(names) => {
-                        for n in names.iter() {
-                            let nb = handle_bytes(arena, *n);
-                            match self.resolve_target(t, nb)? {
-                                Target::Col(i) => {
-                                    out.push(i);
-                                    aff.push(t.columns.as_slice()[i].affinity);
-                                }
-                                Target::Rowid => {
-                                    out.push(ROWID_COL);
-                                    aff.push(crate::record::Affinity::Integer);
-                                }
+                    Some(_) => Ok(Plan::DropView { exists: true }),
+                }
+            }
+            #[cfg(not(feature = "v04"))]
+            Ast::AlterAddColumn { .. } | Ast::CreateView { .. } | Ast::DropView { .. } => {
+                Err(Error::Unsupported)
+            }
+        }
+    }
+
+    /// Evaluate one INSERT VALUES expression at plan time
+    /// (v0.4: constant expressions; pre-v0.4: plain literals).
+    fn eval_value_expr(&self, arena: &Arena, e: &Expr) -> Result<OwnedValue, S::Error> {
+        #[cfg(feature = "v04")]
+        {
+            crate::query::eval_const::<S::Error>(e, arena)
+        }
+        #[cfg(not(feature = "v04"))]
+        {
+            match e {
+                Expr::Literal(l) => Ok(literal_owned(arena, Some(*l))),
+                _ => Err(Error::Unsupported),
+            }
+        }
+    }
+
+    /// SELECT planning (v0.4): the legacy fast paths (full scan /
+    /// rowid seek / index lookup, zero materialisation) serve the
+    /// simple single-table shape; anything richer goes to the
+    /// general query planner when the `v04` feature is on. A
+    /// simple shape whose only legacy failure is `Unsupported`
+    /// (a general WHERE predicate) also falls through to it.
+    fn plan_select(&self, stmt: &SelectStmt, arena: &Arena) -> Result<Plan, S::Error> {
+        if select_is_simple(stmt) {
+            match self.plan_legacy_select(stmt, arena) {
+                Ok(p) => return Ok(p),
+                Err(e) => {
+                    if !matches!(e, Error::Unsupported) {
+                        return Err(e);
+                    }
+                    #[cfg(not(feature = "v04"))]
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "v04")]
+        {
+            Ok(Plan::Query(self.plan_query(stmt, arena)?))
+        }
+        #[cfg(not(feature = "v04"))]
+        {
+            Err(Error::Unsupported)
+        }
+    }
+
+    /// The pre-v0.4 SELECT planner: single table, `*` or plain
+    /// columns, optional `WHERE <col> = <literal>`.
+    fn plan_legacy_select(&self, stmt: &SelectStmt, arena: &Arena) -> Result<Plan, S::Error> {
+        let tname = handle_bytes(arena, stmt.from.as_slice()[0].table);
+        let t = self
+            .catalog
+            .find(&self.catalog_arena, tname)
+            .ok_or(Error::Schema {
+                kind: SchemaKind::UnknownTable,
+            })?;
+        let predicate: Option<(crate::arena::ABytes, Literal)> = match &stmt.filter {
+            None => None,
+            Some(Expr::Binary(BinOp::Eq, l, r)) => match (l.as_ref(), r.as_ref()) {
+                (Expr::Column { name, .. }, Expr::Literal(lit)) => Some((*name, *lit)),
+                _ => None,
+            },
+            _ => None,
+        };
+        // WHERE <col> = <literal> lowers to a rowid access
+        // path when <col> is the rowid or its alias; any
+        // other real column is beyond v0.2's executor.
+        let access = match predicate {
+            None => Access::FullScan,
+            Some((colname, lit)) => {
+                let nb = handle_bytes(arena, colname);
+                match self.resolve_target(t, nb)? {
+                    Target::Rowid => literal_rowid(arena, lit),
+                    Target::Col(i) if Some(i) == t.rowid_alias => literal_rowid(arena, lit),
+                    Target::Col(i) => {
+                        // v0.3: an index on this column
+                        // turns the predicate into a
+                        // secondary-index lookup.
+                        #[cfg(feature = "indexes")]
+                        {
+                            match self.plan_index_access(t, tname, i, arena, lit) {
+                                Some(a) => a,
+                                None => return Err(Error::Unsupported),
+                            }
+                        }
+                        #[cfg(not(feature = "indexes"))]
+                        {
+                            let _ = i;
+                            return Err(Error::Unsupported);
+                        }
+                    }
+                }
+            }
+        };
+        let mut out = AVec::new();
+        let mut aff = AVec::new();
+        if stmt.items.len() == 1 && matches!(stmt.items.as_slice()[0], SelectItem::Star) {
+            for (i, c) in t.columns.iter().enumerate() {
+                out.push(i);
+                aff.push(c.affinity);
+            }
+        } else {
+            for it in stmt.items.iter() {
+                let SelectItem::Expr(Expr::Column { name, .. }, _, _) = it else {
+                    return Err(Error::Unsupported);
+                };
+                let nb = handle_bytes(arena, *name);
+                match self.resolve_target(t, nb)? {
+                    Target::Col(i) => {
+                        out.push(i);
+                        aff.push(t.columns.as_slice()[i].affinity);
+                    }
+                    Target::Rowid => {
+                        out.push(ROWID_COL);
+                        aff.push(crate::record::Affinity::Integer);
+                    }
+                }
+            }
+        }
+        let mut defaults = AVec::new();
+        for c in t.columns.iter() {
+            defaults.push(literal_owned(&self.catalog_arena, c.default));
+        }
+        Ok(Plan::Scan {
+            root: t.root,
+            rowid_alias: t.rowid_alias,
+            ncols: t.columns.len(),
+            out,
+            aff,
+            defaults,
+            access,
+        })
+    }
+
+    /// Width of a SELECT's result (for CREATE VIEW validation).
+    #[cfg(feature = "v04")]
+    fn view_select_width(&self, stmt: &SelectStmt, arena: &Arena) -> Result<usize, S::Error> {
+        match self.plan_select(stmt, arena)? {
+            Plan::Scan { out, .. } => Ok(out.len()),
+            Plan::Query(q) => Ok(q.width),
+            _ => Err(Error::Unsupported),
+        }
+    }
+
+    /// The v0.4 general query planner: resolve every expression
+    /// against the FROM sources once, at prepare time.
+    #[cfg(feature = "v04")]
+    fn plan_query(&self, stmt: &SelectStmt, arena: &Arena) -> Result<QueryPlan, S::Error> {
+        use crate::query::{SourceDesc, has_agg, resolve};
+        let mut sources: AVec<SourceDesc> = AVec::new();
+        let mut offsets: AVec<usize> = AVec::new();
+        let mut src_plans: AVec<SourcePlan> = AVec::new();
+        let mut total = 0usize;
+        for s in stmt.from.iter() {
+            let tname = handle_bytes(arena, s.table);
+            let t = match self.catalog.find(&self.catalog_arena, tname) {
+                Some(t) => t,
+                None => {
+                    if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
+                        // Views are inert in v0.4 (SPEC §2):
+                        // stored, never executed.
+                        return Err(Error::Unsupported);
+                    }
+                    return Err(Error::Schema {
+                        kind: SchemaKind::UnknownTable,
+                    });
+                }
+            };
+            offsets.push(total);
+            let mut cols = AVec::new();
+            let mut affs = AVec::new();
+            let mut defaults = AVec::new();
+            for c in t.columns.iter() {
+                let mut nm = AVec::new();
+                nm.extend_from_slice(handle_bytes(&self.catalog_arena, c.name));
+                cols.push((nm, c.affinity));
+                affs.push(c.affinity);
+                defaults.push(literal_owned(&self.catalog_arena, c.default));
+            }
+            let qual = match s.alias {
+                Some(a) => copy_vec(handle_bytes(arena, a)),
+                None => copy_vec(tname),
+            };
+            sources.push(SourceDesc {
+                qualifier: qual,
+                columns: cols,
+                rowid_alias: t.rowid_alias,
+            });
+            src_plans.push(SourcePlan {
+                root: t.root,
+                kind: s.kind,
+                on: None,
+                rowid_alias: t.rowid_alias,
+                ncols: t.columns.len(),
+                affs,
+                defaults,
+            });
+            total += t.columns.len();
+        }
+        let filter = match &stmt.filter {
+            None => None,
+            Some(e) => {
+                let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                Some(r)
+            }
+        };
+        for (i, s) in stmt.from.iter().enumerate() {
+            if let Some(on) = &s.on {
+                let r = resolve::<S::Error>(on, arena, sources.as_slice(), offsets.as_slice())?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                src_plans.as_mut_slice()[i].on = Some(r);
+            }
+        }
+        // Items, with star expansion; aliases are remembered for
+        // ORDER BY resolution.
+        let mut items: AVec<RExpr> = AVec::new();
+        let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
+        for it in stmt.items.iter() {
+            match it {
+                SelectItem::Star => {
+                    for (si, src) in sources.iter().enumerate() {
+                        for (ci, (_, aff)) in src.columns.iter().enumerate() {
+                            items.push(if Some(ci) == src.rowid_alias {
+                                RExpr::Rowid(si)
+                            } else {
+                                RExpr::Column(offsets.as_slice()[si] + ci, *aff)
+                            });
+                            item_aliases.push(None);
+                        }
+                    }
+                }
+                SelectItem::TableStar(q) => {
+                    let qb = handle_bytes(arena, *q);
+                    let mut hit = false;
+                    for (si, src) in sources.iter().enumerate() {
+                        if eq_ci(src.qualifier.as_slice(), qb) {
+                            hit = true;
+                            for (ci, (_, aff)) in src.columns.iter().enumerate() {
+                                items.push(if Some(ci) == src.rowid_alias {
+                                    RExpr::Rowid(si)
+                                } else {
+                                    RExpr::Column(offsets.as_slice()[si] + ci, *aff)
+                                });
+                                item_aliases.push(None);
                             }
                         }
                     }
+                    if !hit {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::UnknownColumn,
+                        });
+                    }
                 }
-                let mut defaults = AVec::new();
-                for c in t.columns.iter() {
-                    defaults.push(literal_owned(&self.catalog_arena, c.default));
+                SelectItem::Expr(e, alias, _) => {
+                    items.push(resolve::<S::Error>(
+                        e,
+                        arena,
+                        sources.as_slice(),
+                        offsets.as_slice(),
+                    )?);
+                    item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
                 }
-                Ok(Plan::Scan {
-                    root: t.root,
-                    rowid_alias: t.rowid_alias,
-                    ncols: t.columns.len(),
-                    out,
-                    aff,
-                    defaults,
-                    access,
-                })
             }
         }
+        let width = items.len();
+        let mut group_by = AVec::new();
+        for e in stmt.group_by.iter() {
+            group_by.push(resolve::<S::Error>(
+                e,
+                arena,
+                sources.as_slice(),
+                offsets.as_slice(),
+            )?);
+        }
+        let having = match &stmt.having {
+            None => None,
+            Some(e) => Some(resolve::<S::Error>(
+                e,
+                arena,
+                sources.as_slice(),
+                offsets.as_slice(),
+            )?),
+        };
+        // ORDER BY: an ordinal or an output alias substitutes the
+        // item expression itself (SQLite's rule), so evaluation
+        // never needs an output-row context.
+        let mut order_by: AVec<(RExpr, bool)> = AVec::new();
+        for (e, desc) in stmt.order_by.iter() {
+            let r = match e {
+                Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= width => {
+                    items.as_slice()[*n as usize - 1].clone()
+                }
+                Expr::Column { table: None, name } => {
+                    let nb = handle_bytes(arena, *name);
+                    match item_aliases
+                        .iter()
+                        .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
+                    {
+                        Some(idx) => items.as_slice()[idx].clone(),
+                        None => {
+                            resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?
+                        }
+                    }
+                }
+                _ => resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?,
+            };
+            order_by.push((r, *desc));
+        }
+        let has_agg = !group_by.is_empty()
+            || items.iter().any(|e| has_agg(e))
+            || having.as_ref().is_some_and(|h| has_agg(h))
+            || order_by.iter().any(|(e, _)| has_agg(e));
+        Ok(QueryPlan {
+            sources: src_plans,
+            items,
+            filter,
+            group_by,
+            having,
+            order_by,
+            distinct: stmt.distinct,
+            limit: stmt.limit,
+            offset: stmt.offset,
+            has_agg,
+            width,
+        })
     }
 
     /// The v0.3 planner seam for `WHERE <col> = <literal>` on a
@@ -680,6 +1138,24 @@ impl<S: Storage> Connection<S> {
         out
     }
 
+    /// View catalog entries for tools (v0.4): name, stored SQL,
+    /// and derived column names, in schema order.
+    pub fn views(&self) -> AVec<ViewMeta<'_>> {
+        let mut out = AVec::new();
+        for v in self.catalog.views.iter() {
+            let mut cols = AVec::new();
+            for c in v.columns.iter() {
+                cols.push(handle_bytes(&self.catalog_arena, *c));
+            }
+            out.push(ViewMeta {
+                name: handle_bytes(&self.catalog_arena, v.name),
+                sql: handle_bytes(&self.catalog_arena, v.sql),
+                columns: cols,
+            });
+        }
+        out
+    }
+
     /// Mutable pager access for tools/tests driving the layers
     /// below the session API (cursor-level scans, §4.1 gates).
     pub fn pager_mut(&mut self) -> &mut Pager<S> {
@@ -708,6 +1184,14 @@ impl<S: Storage> Connection<S> {
 pub struct TableMeta<'a> {
     pub name: &'a [u8],
     pub sql: &'a [u8],
+}
+
+/// One view catalog row for tools (v0.4).
+#[derive(Debug, Clone)]
+pub struct ViewMeta<'a> {
+    pub name: &'a [u8],
+    pub sql: &'a [u8],
+    pub columns: AVec<&'a [u8]>,
 }
 
 /// One index catalog row for tools (v0.3).
@@ -754,6 +1238,15 @@ pub struct Statement<'c, S: Storage> {
     index_pos: usize,
     #[cfg(feature = "indexes")]
     index_loaded: bool,
+    /// v0.4 query results, materialised on first step.
+    #[cfg(feature = "v04")]
+    query_rows: AVec<AVec<OwnedValue>>,
+    #[cfg(feature = "v04")]
+    query_rowids: AVec<Option<i64>>,
+    #[cfg(feature = "v04")]
+    query_pos: usize,
+    #[cfg(feature = "v04")]
+    query_loaded: bool,
 }
 
 fn literal_owned(arena: &Arena, lit: Option<Literal>) -> OwnedValue {
@@ -898,9 +1391,30 @@ impl<'c, S: Storage> Statement<'c, S> {
                 {
                     false
                 }
+            }
+            || {
+                #[cfg(feature = "v04")]
+                {
+                    matches!(
+                        self.plan,
+                        Plan::AlterAdd { .. } | Plan::CreateView | Plan::DropView { .. }
+                    )
+                }
+                #[cfg(not(feature = "v04"))]
+                {
+                    false
+                }
             };
         let r = match &self.plan {
             Plan::CreateTable => self.step_create().await,
+            #[cfg(feature = "v04")]
+            Plan::Query(_) => self.step_query().await,
+            #[cfg(feature = "v04")]
+            Plan::AlterAdd { .. } => self.step_alter().await,
+            #[cfg(feature = "v04")]
+            Plan::CreateView => self.step_create_view().await,
+            #[cfg(feature = "v04")]
+            Plan::DropView { .. } => self.step_drop_view().await,
             #[cfg(feature = "indexes")]
             Plan::CreateIndex { .. } => self.step_create_index().await,
             #[cfg(feature = "indexes")]
@@ -1353,10 +1867,10 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
-        let Ast::Insert { rows, .. } = &self.ast else {
+        let Plan::Insert { rows_v, .. } = &self.plan else {
             unreachable!()
         };
-        let nrows = rows.len();
+        let nrows = rows_v.len();
         for r in 0..nrows {
             self.exec_insert_row(r).await?;
         }
@@ -1372,12 +1886,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             rowid_alias,
             cols,
             targets,
+            rows_v,
             ..
         } = &self.plan
         else {
-            unreachable!()
-        };
-        let Ast::Insert { rows, .. } = &self.ast else {
             unreachable!()
         };
         #[cfg(feature = "indexes")]
@@ -1385,15 +1897,15 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Insert { indexes, .. } => indexes.clone(),
             _ => unreachable!(),
         };
-        let values = &rows.as_slice()[row_idx];
+        let values: AVec<OwnedValue> = rows_v.as_slice()[row_idx].clone();
         let ncols = cols.len();
         let mut row: AVec<OwnedValue> = AVec::new();
         for c in cols.iter() {
             row.push(c.default.clone());
         }
         let mut explicit_rowid: Option<i64> = None;
-        for (target, lit) in targets.iter().zip(values.iter()) {
-            let v = literal_owned(&self.arena, Some(*lit));
+        for (target, v) in targets.iter().zip(values.iter()) {
+            let v = v.clone();
             match target {
                 Target::Rowid => match v {
                     OwnedValue::Integer(i) => explicit_rowid = Some(i),
@@ -1659,10 +2171,339 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(())
     }
 
+    // ---------------- v0.4 query execution ----------------
+
+    #[cfg(feature = "v04")]
+    async fn step_query(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        if !self.query_loaded {
+            self.run_query().await?;
+            self.query_loaded = true;
+            self.query_pos = 0;
+        }
+        if self.query_pos >= self.query_rows.len() {
+            self.phase = Phase::Done;
+            self.current_rowid = None;
+            return Ok(Step::Done);
+        }
+        self.current = self.query_rows.as_slice()[self.query_pos].clone();
+        self.current_rowid = self.query_rowids.as_slice()[self.query_pos];
+        self.query_pos += 1;
+        self.phase = Phase::Running;
+        Ok(Step::Row)
+    }
+
+    /// Materialise a v0.4 query end to end (SPEC §5.7's
+    /// tree-walking executor, materialising flavour): scan every
+    /// source, nested-loop join, filter, group/project, distinct,
+    /// sort, limit. The plan's fast paths keep the common
+    /// single-table scans off this code entirely.
+    #[cfg(feature = "v04")]
+    async fn run_query(&mut self) -> Result<(), S::Error> {
+        let Plan::Query(qp) = &self.plan else {
+            unreachable!()
+        };
+        let qp = qp.clone();
+        // 1. Materialise each source's rows.
+        let mut src_rows: AVec<AVec<(AVec<OwnedValue>, i64)>> = AVec::new();
+        for sp in qp.sources.iter() {
+            let mut rows = AVec::new();
+            let mut cursor = ScanCursor::new(sp.root);
+            let mut buf = AVec::new();
+            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+                let mut dec: AVec<Value<'_>> = AVec::new();
+                crate::record::decode_record_into::<S::Error>(buf.as_slice(), sp.ncols, &mut dec)?;
+                let mut vals = AVec::new();
+                for i in 0..sp.ncols {
+                    let mut v = if Some(i) == sp.rowid_alias {
+                        OwnedValue::Integer(rowid)
+                    } else if i < dec.len() {
+                        OwnedValue::from_value(dec.as_slice()[i])
+                    } else {
+                        sp.defaults.as_slice()[i].clone()
+                    };
+                    // Read-side REAL forcing (§5.5).
+                    if sp.affs.as_slice()[i] == crate::record::Affinity::Real
+                        && let OwnedValue::Integer(x) = v
+                    {
+                        v = OwnedValue::Real(x as f64);
+                    }
+                    vals.push(v);
+                }
+                rows.push((vals, rowid));
+            }
+            src_rows.push(rows);
+        }
+        // 2. Nested-loop join + WHERE.
+        let mut rows: AVec<RowData> = AVec::new();
+        join_rows::<S::Error>(&qp, src_rows.as_slice(), 0, &RowData::empty(), &mut rows)?;
+        // 3. Group / project.
+        let mut produced = project_rows::<S::Error>(&qp, rows.as_slice())?;
+        // 4. DISTINCT (on output values, first occurrence wins).
+        if qp.distinct {
+            let mut kept: AVec<Produced> = AVec::new();
+            for p in produced.iter() {
+                let dup = kept.iter().any(|k: &Produced| {
+                    k.out.len() == p.out.len()
+                        && k.out
+                            .iter()
+                            .zip(p.out.iter())
+                            .all(|(a, b)| crate::query::values_equal_is(a, b))
+                });
+                if !dup {
+                    kept.push(Produced {
+                        out: p.out.clone(),
+                        keys: p.keys.clone(),
+                        rowid: p.rowid,
+                    });
+                }
+            }
+            produced = kept;
+        }
+        // 5. ORDER BY (stable).
+        produced.as_mut_slice().sort_by(|x, y| {
+            for ((av, bv), (_, desc)) in x.keys.iter().zip(y.keys.iter()).zip(qp.order_by.iter()) {
+                let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+                let o = if *desc { o.reverse() } else { o };
+                if o != core::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            core::cmp::Ordering::Equal
+        });
+        // 6. LIMIT / OFFSET.
+        let start = qp.offset.max(0) as usize;
+        let mut kept_rows: AVec<AVec<OwnedValue>> = AVec::new();
+        let mut kept_ids: AVec<Option<i64>> = AVec::new();
+        for (i, p) in produced.iter().enumerate() {
+            if i < start {
+                continue;
+            }
+            if let Some(l) = qp.limit
+                && l >= 0
+                && (kept_rows.len() as i64) >= l
+            {
+                break;
+            }
+            kept_rows.push(p.out.clone());
+            kept_ids.push(p.rowid);
+        }
+        self.query_rows = kept_rows;
+        self.query_rowids = kept_ids;
+        Ok(())
+    }
+
+    // ---------------- v0.4 DDL ----------------
+
+    #[cfg(feature = "v04")]
+    async fn step_alter(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_alter().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN` (v0.4): rewrite the table's
+    /// schema row with the plan-time-computed SQL text, keeping
+    /// the schema rowid (creation order is schema order). The
+    /// table's records are untouched — short records already
+    /// materialise the new column's default on read (§5.5).
+    #[cfg(feature = "v04")]
+    async fn exec_alter(&mut self) -> Result<(), S::Error> {
+        let Plan::AlterAdd {
+            root,
+            table,
+            new_sql,
+        } = &self.plan
+        else {
+            unreachable!()
+        };
+        let (root, table, new_sql) = (*root, table.clone(), new_sql.clone());
+        let mut cursor = ScanCursor::new(1);
+        let mut buf = AVec::new();
+        let mut found = None;
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
+            if values.len() >= 2
+                && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"table"))
+                && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, table.as_slice()))
+            {
+                found = Some(rowid);
+                break;
+            }
+        }
+        let Some(srowid) = found else {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownTable,
+            });
+        };
+        let mut vals: AVec<Value<'_>> = AVec::new();
+        vals.push(Value::Text(b"table"));
+        vals.push(Value::Text(table.as_slice()));
+        vals.push(Value::Text(table.as_slice()));
+        vals.push(Value::Integer(i64::from(root)));
+        vals.push(Value::Text(new_sql.as_slice()));
+        let mut rec = AVec::new();
+        encode_record(vals.as_slice(), &mut rec);
+        btree::btree_delete(&mut self.conn.pager, 1, srowid).await?;
+        btree::btree_insert(&mut self.conn.pager, 1, srowid, rec.as_slice()).await?;
+        self.conn.pager.bump_schema_cookie();
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "v04")]
+    async fn step_create_view(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_create_view().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// `CREATE VIEW` (v0.4): a schema row with type `view`, root
+    /// page 0, and the statement text as issued. Inert — nothing
+    /// else happens, ever (SPEC §2).
+    #[cfg(feature = "v04")]
+    async fn exec_create_view(&mut self) -> Result<(), S::Error> {
+        let Ast::CreateView {
+            name,
+            if_not_exists,
+            ..
+        } = &self.ast
+        else {
+            unreachable!()
+        };
+        let name_b = copy_vec(handle_bytes(&self.arena, *name));
+        let taken = self
+            .conn
+            .catalog
+            .find(&self.conn.catalog_arena, name_b.as_slice())
+            .is_some()
+            || self
+                .conn
+                .catalog
+                .find_index(&self.conn.catalog_arena, name_b.as_slice())
+                .is_some()
+            || self
+                .conn
+                .catalog
+                .find_view(&self.conn.catalog_arena, name_b.as_slice())
+                .is_some();
+        if taken {
+            if *if_not_exists {
+                self.phase = Phase::Done;
+                return Ok(());
+            }
+            return Err(Error::Schema {
+                kind: SchemaKind::DuplicateView,
+            });
+        }
+        let raw = handle_bytes(&self.arena, self.sql_text);
+        let sql_text = trimmed_sql_text(raw);
+        self.insert_schema_row(
+            b"view",
+            name_b.as_slice(),
+            name_b.as_slice(),
+            0,
+            Some(sql_text.as_slice()),
+        )
+        .await?;
+        self.conn.pager.bump_schema_cookie();
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "v04")]
+    async fn step_drop_view(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_drop_view().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(feature = "v04")]
+    async fn exec_drop_view(&mut self) -> Result<(), S::Error> {
+        let Plan::DropView { exists } = &self.plan else {
+            unreachable!()
+        };
+        if !*exists {
+            return Ok(());
+        }
+        let Ast::DropView { name, .. } = &self.ast else {
+            unreachable!()
+        };
+        let name_b = copy_vec(handle_bytes(&self.arena, *name));
+        let mut cursor = ScanCursor::new(1);
+        let mut buf = AVec::new();
+        let mut found = None;
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
+            if values.len() >= 2
+                && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"view"))
+                && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, name_b.as_slice()))
+            {
+                found = Some(rowid);
+                break;
+            }
+        }
+        let Some(srowid) = found else {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownView,
+            });
+        };
+        btree::btree_delete(&mut self.conn.pager, 1, srowid).await?;
+        self.conn.pager.bump_schema_cookie();
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
     /// Number of result columns (0 for non-SELECT statements).
     pub fn column_count(&self) -> usize {
         match &self.plan {
             Plan::Scan { out, .. } => out.len(),
+            #[cfg(feature = "v04")]
+            Plan::Query(q) => q.width,
             _ => 0,
         }
     }
@@ -1711,4 +2552,240 @@ impl<'c, S: Storage> Statement<'c, S> {
     pub fn arena_high_water(&self) -> usize {
         self.arena.high_water()
     }
+}
+
+/// One produced result row of a v0.4 query (output values, sort
+/// keys, representative rowid for single-source queries).
+#[cfg(feature = "v04")]
+#[derive(Debug, Clone)]
+struct Produced {
+    out: AVec<OwnedValue>,
+    keys: AVec<OwnedValue>,
+    rowid: Option<i64>,
+}
+
+/// Nested-loop join (v0.4): extend `acc` with source `idx`'s
+/// rows, recurse; a LEFT source that matched nothing extends
+/// once with NULLs. The WHERE filter applies to complete rows.
+#[cfg(feature = "v04")]
+fn join_rows<E>(
+    qp: &QueryPlan,
+    src_rows: &[AVec<(AVec<OwnedValue>, i64)>],
+    idx: usize,
+    acc: &RowData,
+    out: &mut AVec<RowData>,
+) -> Result<(), E> {
+    if idx == qp.sources.len() {
+        let keep = match &qp.filter {
+            None => true,
+            Some(f) => {
+                crate::query::truthy(&crate::query::eval::<E>(f, &Ctx::Row(acc))?) == Some(true)
+            }
+        };
+        if keep {
+            out.push(acc.clone());
+        }
+        return Ok(());
+    }
+    let sp = &qp.sources.as_slice()[idx];
+    let mut matched = false;
+    for (vals, rowid) in src_rows[idx].iter() {
+        let mut acc2 = acc.clone();
+        for v in vals.iter() {
+            acc2.vals.push(v.clone());
+        }
+        acc2.rowids.push(Some(*rowid));
+        let on_ok = match &sp.on {
+            None => true,
+            Some(on) => {
+                crate::query::truthy(&crate::query::eval::<E>(on, &Ctx::Row(&acc2))?) == Some(true)
+            }
+        };
+        if on_ok {
+            matched = true;
+            join_rows::<E>(qp, src_rows, idx + 1, &acc2, out)?;
+        }
+    }
+    if sp.kind == JoinKind::Left && !matched {
+        let mut acc2 = acc.clone();
+        for _ in 0..sp.ncols {
+            acc2.vals.push(OwnedValue::Null);
+        }
+        acc2.rowids.push(None);
+        join_rows::<E>(qp, src_rows, idx + 1, &acc2, out)?;
+    }
+    Ok(())
+}
+
+/// Group (when the plan aggregates) and project joined rows.
+#[cfg(feature = "v04")]
+fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E> {
+    let mut out = AVec::new();
+    if !qp.has_agg {
+        for r in rows {
+            let ctx = Ctx::Row(r);
+            let mut vals = AVec::new();
+            for it in qp.items.iter() {
+                vals.push(crate::query::eval::<E>(it, &ctx)?);
+            }
+            let mut keys = AVec::new();
+            for (e, _) in qp.order_by.iter() {
+                keys.push(crate::query::eval::<E>(e, &ctx)?);
+            }
+            let rowid = if qp.sources.len() == 1 {
+                r.rowids.as_slice()[0]
+            } else {
+                None
+            };
+            out.push(Produced {
+                out: vals,
+                keys,
+                rowid,
+            });
+        }
+        return Ok(out);
+    }
+    // Grouping.
+    let total_width: usize = qp.sources.iter().map(|s| s.ncols).sum();
+    let empty_rep = RowData {
+        vals: {
+            let mut v = AVec::new();
+            for _ in 0..total_width {
+                v.push(OwnedValue::Null);
+            }
+            v
+        },
+        rowids: {
+            let mut v = AVec::new();
+            for _ in qp.sources.iter() {
+                v.push(None);
+            }
+            v
+        },
+    };
+    let mut groups: AVec<(AVec<OwnedValue>, AVec<RowData>)> = AVec::new();
+    if qp.group_by.is_empty() {
+        let mut all = AVec::new();
+        for r in rows {
+            all.push(r.clone());
+        }
+        groups.push((AVec::new(), all));
+    } else {
+        for r in rows {
+            let ctx = Ctx::Row(r);
+            let mut key = AVec::new();
+            for g in qp.group_by.iter() {
+                key.push(crate::query::eval::<E>(g, &ctx)?);
+            }
+            let mut found = None;
+            for (gi, (k, _)) in groups.iter().enumerate() {
+                if k.len() == key.len()
+                    && k.iter()
+                        .zip(key.iter())
+                        .all(|(a, b)| crate::query::values_equal_is(a, b))
+                {
+                    found = Some(gi);
+                    break;
+                }
+            }
+            match found {
+                Some(gi) => groups.as_mut_slice()[gi].1.push(r.clone()),
+                None => {
+                    let mut g = AVec::new();
+                    g.push(r.clone());
+                    groups.push((key, g));
+                }
+            }
+        }
+        // SQLite's GROUP BY emits groups in key order (its sorter).
+        groups.as_mut_slice().sort_by(|a, b| {
+            for (av, bv) in a.0.iter().zip(b.0.iter()) {
+                let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+                if o != core::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            core::cmp::Ordering::Equal
+        });
+    }
+    for (_, grows) in groups.iter() {
+        let rep = pick_rep::<E>(qp, grows.as_slice(), &empty_rep)?;
+        let ctx = Ctx::Group {
+            rows: grows.as_slice(),
+            rep: &rep,
+        };
+        if let Some(h) = &qp.having
+            && crate::query::truthy(&crate::query::eval::<E>(h, &ctx)?) != Some(true)
+        {
+            continue;
+        }
+        let mut vals = AVec::new();
+        for it in qp.items.iter() {
+            vals.push(crate::query::eval::<E>(it, &ctx)?);
+        }
+        let mut keys = AVec::new();
+        for (e, _) in qp.order_by.iter() {
+            keys.push(crate::query::eval::<E>(e, &ctx)?);
+        }
+        out.push(Produced {
+            out: vals,
+            keys,
+            rowid: None,
+        });
+    }
+    Ok(out)
+}
+
+/// The representative row of a group (SQLite's bare-column rule):
+/// the first row, except that a lone min/max aggregate makes the
+/// extremum-achieving row the representative.
+#[cfg(feature = "v04")]
+fn pick_rep<E>(qp: &QueryPlan, grows: &[RowData], empty_rep: &RowData) -> Result<RowData, E> {
+    if grows.is_empty() {
+        return Ok(empty_rep.clone());
+    }
+    let mut aggs: AVec<&RExpr> = AVec::new();
+    for it in qp.items.iter() {
+        crate::query::collect_aggs(it, &mut aggs);
+    }
+    if let Some(h) = &qp.having {
+        crate::query::collect_aggs(h, &mut aggs);
+    }
+    if aggs.len() == 1
+        && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
+        && matches!(
+            kind,
+            crate::query::AggKind::Min | crate::query::AggKind::Max
+        )
+        && !args.is_empty()
+    {
+        let arg = &args.as_slice()[0];
+        let mut best: Option<&RowData> = None;
+        let mut bestv: Option<OwnedValue> = None;
+        for r in grows {
+            let v = crate::query::eval::<E>(arg, &Ctx::Row(r))?;
+            if matches!(v, OwnedValue::Null) {
+                continue;
+            }
+            let take = match &bestv {
+                None => true,
+                Some(b) => {
+                    let o = crate::record::compare_values(&v.as_value(), &b.as_value());
+                    if *kind == crate::query::AggKind::Min {
+                        o == core::cmp::Ordering::Less
+                    } else {
+                        o == core::cmp::Ordering::Greater
+                    }
+                }
+            };
+            if take {
+                best = Some(r);
+                bestv = Some(v);
+            }
+        }
+        if let Some(b) = best {
+            return Ok(b.clone());
+        }
+    }
+    Ok(grows[0].clone())
 }

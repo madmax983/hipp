@@ -31,6 +31,21 @@ pub enum SchemaKind {
     DropAutoIndex,
     /// `CREATE INDEX` named an index that already exists (v0.3).
     DuplicateIndex,
+    /// An unqualified column name matches more than one FROM
+    /// source (v0.4).
+    AmbiguousColumn,
+    /// `ALTER TABLE ... ADD COLUMN` named a column the table
+    /// already has (v0.4).
+    DuplicateColumn,
+    /// `ALTER TABLE ... ADD COLUMN` with a definition SQLite
+    /// forbids adding: PRIMARY KEY / UNIQUE, a generated column,
+    /// NOT NULL without a non-NULL constant default, or a
+    /// non-constant default (v0.4).
+    CannotAddColumn,
+    /// `DROP VIEW` named a view that does not exist (v0.4).
+    UnknownView,
+    /// `CREATE VIEW` named an object that already exists (v0.4).
+    DuplicateView,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

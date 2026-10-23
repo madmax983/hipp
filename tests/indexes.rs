@@ -294,18 +294,19 @@ fn index_lookup_types_and_conversions() {
             let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
             assert_eq!(rows, want, "{sql}");
         }
-        // A column with no index is still Unsupported.
+        // A column with no index used to be Unsupported (the
+        // v0.3 note that stood here); v0.4's general query planner
+        // serves it with a filtered scan (see tests/query.rs).
         let r = db.prepare("SELECT id FROM t WHERE rowid = 1").await;
         assert!(r.is_ok(), "rowid path still works");
         exec(&mut db, "CREATE TABLE u (id INTEGER PRIMARY KEY, z TEXT)")
             .await
             .unwrap();
-        let r = db.prepare("SELECT id FROM u WHERE z = 'a'").await;
-        assert!(
-            matches!(r, Err(Error::Unsupported)),
-            "unindexed predicate: {:?}",
-            r.err()
-        );
+        exec(&mut db, "INSERT INTO u VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap();
+        let rows = collect(&mut db, "SELECT id FROM u WHERE z = 'a'").await;
+        assert_eq!(rows, vec!["1".to_string()]);
     });
 }
 

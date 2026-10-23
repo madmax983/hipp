@@ -94,9 +94,22 @@ pub struct IndexDef {
     pub opaque: bool,
 }
 
+/// One view (v0.4): stored SQL, inert (never executed). Column
+/// names are derived at catalog build from the view's SELECT —
+/// explicit list when written, else item names (SQLite's rule);
+/// empty when the stored SQL is outside hipp's grammar (a foreign
+/// view: listed, never resolved).
+#[derive(Debug, Clone)]
+pub struct ViewDef {
+    pub name: ABytes,
+    pub sql: ABytes,
+    pub columns: AVec<ABytes>,
+}
+
 pub struct Catalog {
     pub tables: AVec<TableDef>,
     pub indexes: AVec<IndexDef>,
+    pub views: AVec<ViewDef>,
     /// Schema cookie this catalog was built from.
     pub cookie: u32,
 }
@@ -106,12 +119,19 @@ impl Catalog {
         Catalog {
             tables: AVec::new(),
             indexes: AVec::new(),
+            views: AVec::new(),
             cookie,
         }
     }
 
     pub fn find<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x TableDef> {
         self.tables
+            .iter()
+            .find(|t| eq_ci(handle_bytes(arena, t.name), name))
+    }
+
+    pub fn find_view<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x ViewDef> {
+        self.views
             .iter()
             .find(|t| eq_ci(handle_bytes(arena, t.name), name))
     }
@@ -234,7 +254,7 @@ pub async fn build_catalog<S: Storage>(
     // Pass 1: tables (+ their constraint sets).
     for row in rows.iter() {
         if !eq_ci(row.ty.as_slice(), b"table") || row.sql.is_none() {
-            continue; // indexes in pass 2; views/triggers not hipp objects
+            continue; // indexes in pass 2; views in pass 3
         }
         let sql = row.sql.as_ref().expect("checked");
         scratch.reset();
@@ -410,8 +430,129 @@ pub async fn build_catalog<S: Storage>(
             }
         }
     }
+    // Pass 3: views (v0.4) — stored SQL, inert. Column names are
+    // derived from the stored SELECT against the tables and the
+    // views already derived (views may layer on views).
+    for row in rows.iter() {
+        if !eq_ci(row.ty.as_slice(), b"view") || row.sql.is_none() {
+            continue;
+        }
+        let sql = row.sql.as_ref().expect("checked");
+        let mut columns: AVec<ABytes> = AVec::new();
+        scratch.reset();
+        if let Ok(Ast::CreateView {
+            columns: explicit,
+            select,
+            ..
+        }) = parse::<S::Error>(sql.as_slice(), &scratch)
+        {
+            columns = derive_view_columns(&catalog, catalog_arena, &scratch, &select, &explicit);
+        }
+        catalog.views.push(ViewDef {
+            name: intern(catalog_arena, row.name.as_slice())?,
+            sql: intern(catalog_arena, sql.as_slice())?,
+            columns,
+        });
+    }
+
     catalog.cookie = pager.schema_cookie();
     Ok(catalog)
+}
+
+/// Derive a view's column names (SQLite's rule): the explicit
+/// column list when one was written, else per SELECT item — a
+/// column reference contributes its column name, an alias wins,
+/// `*` expands, and any other expression is named by its source
+/// text. Any unresolvable piece yields an empty list (the view is
+/// still catalogued; only its derived names are unknown).
+fn derive_view_columns(
+    catalog: &Catalog,
+    catalog_arena: &Arena,
+    scratch: &Arena,
+    select: &crate::sql::SelectStmt,
+    explicit: &Option<AVec<ABytes>>,
+) -> AVec<ABytes> {
+    let mut out: AVec<ABytes> = AVec::new();
+    if let Some(cols) = explicit {
+        for c in cols.iter() {
+            match intern(catalog_arena, handle_bytes(scratch, *c)) {
+                Ok(h) => out.push(h),
+                Err(_) => return AVec::new(),
+            }
+        }
+        return out;
+    }
+    // Source column-name lists, in FROM order.
+    let mut sources: AVec<(AVec<u8>, AVec<AVec<u8>>)> = AVec::new();
+    for src in select.from.iter() {
+        let tname = handle_bytes(scratch, src.table);
+        let qualifier = match src.alias {
+            Some(a) => copy_avec(handle_bytes(scratch, a)),
+            None => copy_avec(tname),
+        };
+        let mut cols: AVec<AVec<u8>> = AVec::new();
+        if let Some(t) = catalog.find(catalog_arena, tname) {
+            for c in t.columns.iter() {
+                cols.push(copy_avec(handle_bytes(catalog_arena, c.name)));
+            }
+        } else if let Some(v) = catalog.find_view(catalog_arena, tname) {
+            if v.columns.is_empty() {
+                return AVec::new();
+            }
+            for c in v.columns.iter() {
+                cols.push(copy_avec(handle_bytes(catalog_arena, *c)));
+            }
+        } else {
+            return AVec::new();
+        }
+        sources.push((qualifier, cols));
+    }
+    for item in select.items.iter() {
+        match item {
+            crate::sql::SelectItem::Star => {
+                for (_, cols) in sources.iter() {
+                    for c in cols.iter() {
+                        match intern(catalog_arena, c.as_slice()) {
+                            Ok(h) => out.push(h),
+                            Err(_) => return AVec::new(),
+                        }
+                    }
+                }
+            }
+            crate::sql::SelectItem::TableStar(q) => {
+                let qb = handle_bytes(scratch, *q);
+                let mut hit = false;
+                for (qual, cols) in sources.iter() {
+                    if eq_ci(qual.as_slice(), qb) {
+                        hit = true;
+                        for c in cols.iter() {
+                            match intern(catalog_arena, c.as_slice()) {
+                                Ok(h) => out.push(h),
+                                Err(_) => return AVec::new(),
+                            }
+                        }
+                    }
+                }
+                if !hit {
+                    return AVec::new();
+                }
+            }
+            crate::sql::SelectItem::Expr(e, alias, text) => {
+                let name: &[u8] = if let Some(a) = alias {
+                    handle_bytes(scratch, *a)
+                } else if let crate::sql::Expr::Column { name, .. } = e {
+                    handle_bytes(scratch, *name)
+                } else {
+                    handle_bytes(scratch, *text)
+                };
+                match intern(catalog_arena, name) {
+                    Ok(h) => out.push(h),
+                    Err(_) => return AVec::new(),
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Constraint sets resolved to column indices (v0.3 index
