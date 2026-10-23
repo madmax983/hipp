@@ -260,6 +260,10 @@ where
                 let _ = out.write_all(t.name);
                 let _ = out.write_all(b"\n");
             }
+            for v in db.views().iter() {
+                let _ = out.write_all(v.name);
+                let _ = out.write_all(b"\n");
+            }
             Ok(Flow::Continue)
         }
         ".schema" => {
@@ -281,6 +285,25 @@ where
                         let _ = out.write_all(b";\n");
                     }
                 }
+            }
+            // Views print after the tables (the oracle shell's
+            // .schema convention), each followed by its
+            // `/* name(columns) */` comment line.
+            for v in db.views().iter() {
+                if !arg.is_empty() && !v.name.eq_ignore_ascii_case(arg.as_bytes()) {
+                    continue;
+                }
+                let _ = out.write_all(v.sql);
+                let _ = out.write_all(b";\n/* ");
+                let _ = out.write_all(v.name);
+                let _ = out.write_all(b"(");
+                for (i, c) in v.columns.iter().enumerate() {
+                    if i > 0 {
+                        let _ = out.write_all(b",");
+                    }
+                    let _ = out.write_all(c);
+                }
+                let _ = out.write_all(b") */\n");
             }
             Ok(Flow::Continue)
         }
@@ -314,16 +337,21 @@ where
                     line.extend_from_slice(b");\n");
                     let _ = out.write_all(&line);
                 }
-                // This table's explicit CREATE INDEX statements
-                // follow its rows.
-                for ix in db.indexes().iter() {
-                    if ix.table.eq_ignore_ascii_case(name.as_bytes())
-                        && let Some(sql) = ix.sql
-                    {
-                        let _ = out.write_all(sql);
-                        let _ = out.write_all(b";\n");
-                    }
+            }
+            // Non-table schema objects follow all table data
+            // (the oracle shell's .dump order): explicit indexes,
+            // then views (inert: their CREATE text replays, and
+            // re-creating them in a fresh database is a hipp
+            // CREATE VIEW like any other).
+            for ix in db.indexes().iter() {
+                if let Some(sql) = ix.sql {
+                    let _ = out.write_all(sql);
+                    let _ = out.write_all(b";\n");
                 }
+            }
+            for v in db.views().iter() {
+                let _ = out.write_all(v.sql);
+                let _ = out.write_all(b";\n");
             }
             let _ = out.write_all(b"COMMIT;\n");
             Ok(Flow::Continue)

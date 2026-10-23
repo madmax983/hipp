@@ -727,12 +727,18 @@ impl<S: Storage> Connection<S> {
     /// columns, optional `WHERE <col> = <literal>`.
     fn plan_legacy_select(&self, stmt: &SelectStmt, arena: &Arena) -> Result<Plan, S::Error> {
         let tname = handle_bytes(arena, stmt.from.as_slice()[0].table);
-        let t = self
-            .catalog
-            .find(&self.catalog_arena, tname)
-            .ok_or(Error::Schema {
-                kind: SchemaKind::UnknownTable,
-            })?;
+        let t = match self.catalog.find(&self.catalog_arena, tname) {
+            Some(t) => t,
+            None => {
+                if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
+                    // Views are inert in v0.4 (SPEC §2).
+                    return Err(Error::Unsupported);
+                }
+                return Err(Error::Schema {
+                    kind: SchemaKind::UnknownTable,
+                });
+            }
+        };
         let predicate: Option<(crate::arena::ABytes, Literal)> = match &stmt.filter {
             None => None,
             Some(Expr::Binary(BinOp::Eq, l, r)) => match (l.as_ref(), r.as_ref()) {
@@ -947,32 +953,14 @@ impl<S: Storage> Connection<S> {
             }
         }
         let width = items.len();
-        let mut group_by = AVec::new();
-        for e in stmt.group_by.iter() {
-            group_by.push(resolve::<S::Error>(
-                e,
-                arena,
-                sources.as_slice(),
-                offsets.as_slice(),
-            )?);
-        }
-        let having = match &stmt.having {
-            None => None,
-            Some(e) => Some(resolve::<S::Error>(
-                e,
-                arena,
-                sources.as_slice(),
-                offsets.as_slice(),
-            )?),
-        };
-        // ORDER BY: an ordinal or an output alias substitutes the
-        // item expression itself (SQLite's rule), so evaluation
-        // never needs an output-row context.
-        let mut order_by: AVec<(RExpr, bool)> = AVec::new();
-        for (e, desc) in stmt.order_by.iter() {
-            let r = match e {
+        // GROUP BY / HAVING / ORDER BY terms first resolve as an
+        // output ordinal or alias (SQLite's rule), substituting
+        // the item expression itself, so evaluation never needs
+        // an output-row context.
+        let resolve_term = |e: &Expr| -> Result<RExpr, S::Error> {
+            match e {
                 Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= width => {
-                    items.as_slice()[*n as usize - 1].clone()
+                    Ok(items.as_slice()[*n as usize - 1].clone())
                 }
                 Expr::Column { table: None, name } => {
                     let nb = handle_bytes(arena, *name);
@@ -980,15 +968,29 @@ impl<S: Storage> Connection<S> {
                         .iter()
                         .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
                     {
-                        Some(idx) => items.as_slice()[idx].clone(),
-                        None => {
-                            resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?
-                        }
+                        Some(idx) => Ok(items.as_slice()[idx].clone()),
+                        None => resolve::<S::Error>(
+                            e,
+                            arena,
+                            sources.as_slice(),
+                            offsets.as_slice(),
+                        ),
                     }
                 }
-                _ => resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?,
-            };
-            order_by.push((r, *desc));
+                _ => resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice()),
+            }
+        };
+        let mut group_by = AVec::new();
+        for e in stmt.group_by.iter() {
+            group_by.push(resolve_term(e)?);
+        }
+        let having = match &stmt.having {
+            None => None,
+            Some(e) => Some(resolve_term(e)?),
+        };
+        let mut order_by: AVec<(RExpr, bool)> = AVec::new();
+        for (e, desc) in stmt.order_by.iter() {
+            order_by.push((resolve_term(e)?, *desc));
         }
         let has_agg = !group_by.is_empty()
             || items.iter().any(|e| has_agg(e))
