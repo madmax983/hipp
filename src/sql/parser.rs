@@ -1277,10 +1277,10 @@ impl<'a> Parser<'a> {
         }
         let mut from = AVec::new();
         if self.eat_kw(b"FROM") {
-            from.push(self.from_source::<E>(JoinKind::Inner, true)?);
+            from.push(self.join_source::<E>(JoinKind::Inner, true)?);
             loop {
                 if self.eat(Tok::Comma) {
-                    from.push(self.from_source::<E>(JoinKind::Cross, false)?);
+                    from.push(self.join_source::<E>(JoinKind::Cross, false)?);
                     continue;
                 }
                 let kind = if self.eat_kw(b"JOIN") {
@@ -1299,7 +1299,7 @@ impl<'a> Parser<'a> {
                     None
                 };
                 let Some(kind) = kind else { break };
-                from.push(self.from_source::<E>(kind, false)?);
+                from.push(self.join_source::<E>(kind, false)?);
             }
         }
         let filter = if self.eat_kw(b"WHERE") {
@@ -1386,7 +1386,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn from_source<E>(&mut self, kind: JoinKind, first: bool) -> Result<FromSource, E> {
+    fn join_source<E>(&mut self, kind: JoinKind, first: bool) -> Result<FromSource, E> {
         let table = self.name::<E>()?;
         let alias = self.opt_alias();
         let on = if !first && self.eat_kw(b"ON") {

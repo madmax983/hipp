@@ -969,12 +969,9 @@ impl<S: Storage> Connection<S> {
                         .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
                     {
                         Some(idx) => Ok(items.as_slice()[idx].clone()),
-                        None => resolve::<S::Error>(
-                            e,
-                            arena,
-                            sources.as_slice(),
-                            offsets.as_slice(),
-                        ),
+                        None => {
+                            resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())
+                        }
                     }
                 }
                 _ => resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice()),
@@ -993,8 +990,8 @@ impl<S: Storage> Connection<S> {
             order_by.push((resolve_term(e)?, *desc));
         }
         let has_agg = !group_by.is_empty()
-            || items.iter().any(|e| has_agg(e))
-            || having.as_ref().is_some_and(|h| has_agg(h))
+            || items.iter().any(has_agg)
+            || having.as_ref().is_some_and(has_agg)
             || order_by.iter().any(|(e, _)| has_agg(e));
         Ok(QueryPlan {
             sources: src_plans,

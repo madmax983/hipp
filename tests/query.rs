@@ -58,11 +58,14 @@ async fn diff_query(path: &std::path::Path, query: &str) {
     let oracle_out = common::cli(path, query);
     let want: Vec<String> = oracle_out.lines().map(|s| s.to_string()).collect();
     let fs = FileStorage::open(path).expect("fs open");
-    let mut db = Connection::open(fs, Config::default())
-        .await
-        .expect("open");
+    let mut db = Connection::open(fs, Config::default()).await.expect("open");
     let got = collect(&mut db, query).await;
-    assert_eq!(got, want, "query: {query}\noracle: {}", common::oracle_version());
+    assert_eq!(
+        got,
+        want,
+        "query: {query}\noracle: {}",
+        common::oracle_version()
+    );
 }
 
 fn oracle_db(tag: &str, setup: &str) -> std::path::PathBuf {
@@ -257,9 +260,7 @@ fn insert_expressions_hipp_writes_oracle_reads() {
         let path = common::temp_db("v04-ins-expr");
         {
             let fs = FileStorage::open(&path).expect("fs open");
-            let mut db = Connection::open(fs, Config::default())
-                .await
-                .expect("open");
+            let mut db = Connection::open(fs, Config::default()).await.expect("open");
             exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT, c REAL)")
                 .await
                 .unwrap();
@@ -269,14 +270,14 @@ fn insert_expressions_hipp_writes_oracle_reads() {
             )
             .await
             .unwrap();
-            exec(&mut db, "INSERT INTO t (b, a) VALUES (coalesce(NULL, 'n'), -5)")
-                .await
-                .unwrap();
+            exec(
+                &mut db,
+                "INSERT INTO t (b, a) VALUES (coalesce(NULL, 'n'), -5)",
+            )
+            .await
+            .unwrap();
         }
-        assert_eq!(
-            common::cli(&path, "PRAGMA integrity_check;").trim(),
-            "ok"
-        );
+        assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
         assert_eq!(
             common::cli(&path, "SELECT a, b, c FROM t ORDER BY rowid;"),
             "3|xy|1.5\n20|AB|3.0\n-5|n|\n"
@@ -293,9 +294,7 @@ fn alter_add_column_both_directions() {
         let path = common::temp_db("v04-alter-a");
         {
             let fs = FileStorage::open(&path).expect("fs open");
-            let mut db = Connection::open(fs, Config::default())
-                .await
-                .expect("open");
+            let mut db = Connection::open(fs, Config::default()).await.expect("open");
             exec(&mut db, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
                 .await
                 .unwrap();
@@ -317,10 +316,7 @@ fn alter_add_column_both_directions() {
                 .await
                 .unwrap();
         }
-        assert_eq!(
-            common::cli(&path, "PRAGMA integrity_check;").trim(),
-            "ok"
-        );
+        assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
         assert_eq!(
             common::cli(&path, "SELECT sql FROM sqlite_schema WHERE name = 't';"),
             "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c REAL DEFAULT 1.5, d TEXT NOT NULL DEFAULT 'z')\n"
@@ -339,9 +335,7 @@ fn alter_add_column_both_directions() {
         );
         diff_query(&path2, "SELECT * FROM t ORDER BY a").await;
         let fs = FileStorage::open(&path2).expect("fs open");
-        let mut db = Connection::open(fs, Config::default())
-            .await
-            .expect("open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
         exec(&mut db, "INSERT INTO t (a, b) VALUES (3, 'three')")
             .await
             .unwrap();
@@ -355,9 +349,7 @@ fn alter_add_column_rejections() {
     block_on(async {
         let path = common::temp_db("v04-alter-err");
         let fs = FileStorage::open(&path).expect("fs open");
-        let mut db = Connection::open(fs, Config::default())
-            .await
-            .expect("open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
         exec(&mut db, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
             .await
             .unwrap();
@@ -373,7 +365,9 @@ fn alter_add_column_rejections() {
             assert!(r.is_err(), "must refuse: {sql}");
         }
         // The table is untouched and still usable.
-        exec(&mut db, "INSERT INTO t VALUES (1, 'x')").await.unwrap();
+        exec(&mut db, "INSERT INTO t VALUES (1, 'x')")
+            .await
+            .unwrap();
         let rows = collect(&mut db, "SELECT * FROM t").await;
         assert_eq!(rows, vec!["1|x"]);
     });
@@ -388,9 +382,7 @@ fn views_inert_both_directions() {
         let path = common::temp_db("v04-view-a");
         {
             let fs = FileStorage::open(&path).expect("fs open");
-            let mut db = Connection::open(fs, Config::default())
-                .await
-                .expect("open");
+            let mut db = Connection::open(fs, Config::default()).await.expect("open");
             exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT)")
                 .await
                 .unwrap();
@@ -400,9 +392,12 @@ fn views_inert_both_directions() {
             exec(&mut db, "CREATE VIEW v AS SELECT a, b FROM t WHERE a > 0")
                 .await
                 .unwrap();
-            exec(&mut db, "CREATE VIEW w(x, y) AS SELECT b, count(*) FROM t GROUP BY b")
-                .await
-                .unwrap();
+            exec(
+                &mut db,
+                "CREATE VIEW w(x, y) AS SELECT b, count(*) FROM t GROUP BY b",
+            )
+            .await
+            .unwrap();
             // Inert: selecting from a view is refused, by design.
             let r = db.prepare("SELECT * FROM v").await;
             assert!(
@@ -411,8 +406,16 @@ fn views_inert_both_directions() {
                 r.err()
             );
             // Creating over unknown objects fails at prepare.
-            assert!(db.prepare("CREATE VIEW bad AS SELECT * FROM nope").await.is_err());
-            assert!(db.prepare("CREATE VIEW bad2 AS SELECT nope FROM t").await.is_err());
+            assert!(
+                db.prepare("CREATE VIEW bad AS SELECT * FROM nope")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                db.prepare("CREATE VIEW bad2 AS SELECT nope FROM t")
+                    .await
+                    .is_err()
+            );
             // Duplicate names fail; IF NOT EXISTS is a no-op.
             assert!(db.prepare("CREATE VIEW v AS SELECT a FROM t").await.is_ok());
             let mut st = db
@@ -435,10 +438,7 @@ fn views_inert_both_directions() {
             exec(&mut db, "DROP VIEW IF EXISTS w").await.unwrap();
             assert_eq!(db.views().len(), 1);
         }
-        assert_eq!(
-            common::cli(&path, "PRAGMA integrity_check;").trim(),
-            "ok"
-        );
+        assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
         assert_eq!(
             common::cli(
                 &path,
@@ -456,9 +456,7 @@ fn views_inert_both_directions() {
              CREATE VIEW ov AS SELECT a + 1 AS c, b FROM t;",
         );
         let fs = FileStorage::open(&path2).expect("fs open");
-        let mut db = Connection::open(fs, Config::default())
-            .await
-            .expect("open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
         let views = db.views();
         assert_eq!(views.len(), 1);
         assert_eq!(views.as_slice()[0].columns.as_slice()[0], b"c");
@@ -466,7 +464,10 @@ fn views_inert_both_directions() {
         assert!(matches!(r, Err(Error::Unsupported)));
         exec(&mut db, "DROP VIEW ov").await.unwrap();
         assert_eq!(
-            common::cli(&path2, "SELECT count(*) FROM sqlite_schema WHERE type='view';"),
+            common::cli(
+                &path2,
+                "SELECT count(*) FROM sqlite_schema WHERE type='view';"
+            ),
             "0\n"
         );
     });
@@ -484,11 +485,13 @@ fn query_rejections() {
              INSERT INTO t VALUES (1, 2); INSERT INTO u VALUES (1);",
         );
         let fs = FileStorage::open(&path).expect("fs open");
-        let mut db = Connection::open(fs, Config::default())
-            .await
-            .expect("open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
         // Aggregates in WHERE are refused at prepare.
-        assert!(db.prepare("SELECT a FROM t WHERE count(*) > 1").await.is_err());
+        assert!(
+            db.prepare("SELECT a FROM t WHERE count(*) > 1")
+                .await
+                .is_err()
+        );
         // Unknown functions are refused at prepare.
         assert!(db.prepare("SELECT nosuchfn(a) FROM t").await.is_err());
         // Ambiguous unqualified column across a join.

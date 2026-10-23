@@ -4,6 +4,157 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.4 — joins, aggregates + GROUP BY, expressions, ALTER, inert views (2026-10-23)
+
+Pushed to GitHub (madmax983/hipp) via API replay under the
+conformance-loop mandate; remote tip + tree recorded in the loop
+status.
+
+### Scope shipped (SPEC §2 v0.4)
+
+- **Expression evaluator** (`src/query.rs`, behind the `v04`
+  cargo feature, default on; the tiny profile excludes it):
+  arithmetic with SQLite's coercion rules (prefix numeric parse
+  for text, integer division truncates, `/`/`%` by zero yield
+  NULL), `||`, the comparison family with comparison-affinity
+  adjustment for direct column operands, three-valued
+  AND/OR/NOT, `IS`/`IS NOT`, `IN (list)`, `BETWEEN`, `LIKE`,
+  `CASE` (both forms), `CAST` (dedicated prefix-parse rules),
+  and a scalar library: abs, length, upper, lower, coalesce,
+  ifnull, nullif, typeof, substr, round, hex, trim/ltrim/rtrim,
+  replace, instr, sign, iif, scalar min/max. INSERT VALUES now
+  takes full constant expressions (plan-time evaluated).
+- **General WHERE**: any expression over the FROM sources; the
+  legacy fast paths (full scan / rowid seek / index lookup, zero
+  materialisation) still serve the simple shapes, and a simple
+  shape that only fails as `Unsupported` falls through to the
+  general planner.
+- **Joins**: nested-loop `JOIN`/`INNER JOIN`/`LEFT [OUTER]
+  JOIN`/`CROSS JOIN`/comma joins with `ON` expressions, table
+  aliases, self-joins, qualified column resolution with
+  ambiguity detection.
+- **Aggregates + GROUP BY**: count/sum/avg/total/min/max/
+  group_concat (with DISTINCT forms), GROUP BY (keys,
+  expressions, ordinals and output aliases — as in ORDER BY),
+  HAVING, and SQLite's bare-column rule including the lone
+  min/max extremum-row representative. GROUP BY emits groups in
+  key order, like the oracle's sorter.
+- **ORDER BY / LIMIT / OFFSET / SELECT DISTINCT** through the
+  query planner (stable sort, SQLite NULL placement falls out
+  of the comparison order), including ordinals, output aliases,
+  and expression keys.
+- **ALTER TABLE ADD COLUMN**: stored CREATE TABLE text is
+  rewritten exactly as SQLite does it (`, <coldef>` before the
+  closing paren, schema rowid preserved); existing rows read
+  the new column's default via the short-record rule — no record
+  migration. Refuses (oracle-matching) PRIMARY KEY / UNIQUE /
+  generated columns, NOT NULL without a non-NULL constant
+  default, and non-constant defaults.
+- **Views as stored SQL (inert)**: CREATE VIEW validates its
+  SELECT at prepare time (tables, columns, explicit column-list
+  width) and stores the statement verbatim (root page 0);
+  DROP VIEW; the catalog derives view column names (explicit
+  list, column refs, aliases, `*` expansion, expression text).
+  Selecting FROM a view is `Error::Unsupported` — views are
+  never executed in v0.4. hipp-cli: `.tables` lists views,
+  `.schema` prints them with the oracle's `/* name(cols) */`
+  comment line, `.dump` replays them after the table data (and
+  its output now follows the oracle's dump order throughout:
+  tables+data, then indexes, then views).
+
+### Root finds this milestone
+
+- **substr's negative length counts back from the start
+  point**, and the y=0 rule only adjusts a positive length;
+  the full coordinate algorithm was pinned by probing the
+  oracle (`substr('abcdef', 2, -1)` is `'a'`). The first
+  implementation produced `''`/`'abc'` there.
+- **round(x, -1) behaves as round(x, 0)** in SQLite (its scale
+  loop never runs for a negative count) — hipp first divided
+  by ten (123.456 → 120.0 vs the oracle's 123.0).
+- **sum() of non-numeric text is real 0.0**, not integer 0
+  (`sum('abc')` = 0.0): sum/total/avg use a dedicated
+  contribution conversion distinct from arithmetic's.
+- GROUP BY terms resolve as output aliases/ordinals first
+  (SQLite's rule, shared with HAVING and ORDER BY) — found
+  when `GROUP BY parity` (an alias) failed to prepare.
+
+### Tests — 76, all green (v0.3: 64)
+
+- New `tests/query.rs` (10): joins differential (14 queries,
+  incl. LEFT/self/3-table), aggregates + GROUP BY (21 queries
+  incl. empty-table and bare-column min/max), expressions (25
+  queries incl. coercion, three-valued logic, CAST matrix),
+  ORDER BY/LIMIT/DISTINCT (14 queries), substr/round edge
+  battery, INSERT expressions verified from the oracle side,
+  ALTER both directions (stored-SQL byte equality + integrity),
+  ALTER rejections, views both directions (stored row shape,
+  inert refusal, DROP VIEW), planner rejections (aggregates in
+  WHERE, unknown functions, ambiguous columns, subqueries).
+- New `hipp-cli/tests/cli_v04.rs` (2): one-shot v0.4 corpus
+  byte-identical to the oracle; `.schema` with views
+  byte-identical incl. the column-comment line; `.dump`
+  replayed into a fresh oracle database reproduces the schema.
+- Two pre-existing assertions were updated where v0.4
+  supersedes them by design (a non-rowid predicate in
+  tests/dialect.rs and an unindexed predicate in
+  tests/indexes.rs were `Error::Unsupported` in v0.2/v0.3;
+  both are now served by the query planner, covered above).
+- A1–A11 stay green; clippy `--workspace --all-targets
+  -D warnings` clean; the `v04`-off and `indexes`-off
+  configurations compile clean.
+
+### §4.1 gates (re-measured)
+
+- Linked binary (tiny profile, thumbv7em): **.text 73,392 +
+  .rodata 14,944 = 88,336 B ≤ 128 KiB.**
+  **Delta vs v0.3's 84,524 B: +3,812 B** — under the 4 KiB
+  ratchet line. The query engine itself contributes 0 B to
+  tiny (the `v04` feature gates the evaluator, the query
+  planner/executor, and the ALTER/VIEW grammar); the growth is
+  ungated core work every profile shares: new lexer tokens,
+  CREATE TABLE constraint-fact capture (NOT NULL / generated /
+  non-constant defaults, needed to validate ADD COLUMN),
+  view cataloguing (views are recorded as metadata in every
+  profile), and the INSERT plan-time value plumbing. Headroom
+  left: 42,736 B.
+- Statics: `.bss` 98,308 B is again entirely the demo's caller
+  heap; **engine .data+.bss outside caller memory = 0 B ≤ 8 KiB.**
+- Tiny-config RAM and zero steady-state scan allocations:
+  `tests/gates.rs` green (unchanged; the legacy scan paths are
+  untouched).
+
+### Honest notes / divergences
+
+- The query planner materialises: joins/aggregates/general
+  predicates copy rows into statement-owned vectors. Fine at
+  v0.4's correctness-first stage; the §4.1 zero-allocation gate
+  binds the legacy scan hot loop, which is unchanged, and the
+  tiny profile never runs the query engine.
+- Comparison affinity is applied when an operand is a *direct*
+  column reference (SQLite's documented main case); affinity
+  does not propagate through nested expressions, and IN-list
+  affinity follows the same direct-column rule.
+- Bare columns in an aggregate query read the group's first
+  row (SQLite picks an arbitrary row; the lone min/max case
+  follows SQLite's documented extremum-row rule exactly).
+- Integer overflow in `sum()` falls back to a real
+  accumulation; SQLite raises an overflow error there. `+`/`-`
+  overflow likewise yields a real rather than SQLite's error.
+- ADD COLUMN validates defaults that are plain literals;
+  a parenthesised expression default such as `(1+2)` is read
+  as its leading literal (a pre-existing CREATE TABLE
+  approximation), where the oracle evaluates the expression.
+- View column derivation for foreign views whose SQL is
+  outside hipp's grammar yields no derived names (the view is
+  still catalogued and listed); the CLI's `/* name(cols) */`
+  comment then prints an empty list where the oracle prints
+  resolved names.
+- LIKE matching is per-character with ASCII case folding,
+  like SQLite's default; non-ASCII text is matched on chars
+  decoded as UTF-8 (invalid UTF-8 falls back to an empty
+  haystack — SQLite would match byte-wise).
+
 ## v0.3 — index B-trees + freelist reuse hardening (2026-10-22)
 
 Pushed to GitHub (madmax983/hipp) via API replay under the

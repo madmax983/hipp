@@ -32,7 +32,7 @@ fn run(bin: &str, args: &[&str]) -> Output {
     Command::new(bin).args(args).output().expect("binary runs")
 }
 
-fn oracle_run(db: &PathBuf, sql: &str) -> Output {
+fn oracle_run(db: &std::path::Path, sql: &str) -> Output {
     run(oracle().to_str().unwrap(), &[db.to_str().unwrap(), sql])
 }
 
@@ -79,8 +79,16 @@ fn v04_oneshot_byte_identical_to_oracle() {
     let odb = temp_db("v04-oneshot-o");
     let hout = run(hipp_bin(), &[hdb.to_str().unwrap(), CORPUS]);
     let oout = oracle_run(&odb, CORPUS);
-    assert!(hout.status.success(), "hipp: {}", String::from_utf8_lossy(&hout.stderr));
-    assert!(oout.status.success(), "oracle: {}", String::from_utf8_lossy(&oout.stderr));
+    assert!(
+        hout.status.success(),
+        "hipp: {}",
+        String::from_utf8_lossy(&hout.stderr)
+    );
+    assert!(
+        oout.status.success(),
+        "oracle: {}",
+        String::from_utf8_lossy(&oout.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&hout.stdout),
         String::from_utf8_lossy(&oout.stdout),
@@ -103,10 +111,18 @@ CREATE VIEW w(n) AS SELECT count(*) FROM t;
 ";
     let hdb = temp_db("v04-schema-h");
     let hout = run_stdin(hipp_bin(), hdb.to_str().unwrap(), script);
-    assert!(hout.status.success(), "hipp: {}", String::from_utf8_lossy(&hout.stderr));
+    assert!(
+        hout.status.success(),
+        "hipp: {}",
+        String::from_utf8_lossy(&hout.stderr)
+    );
     let odb = temp_db("v04-schema-o");
     let oout = run_stdin(oracle().to_str().unwrap(), odb.to_str().unwrap(), script);
-    assert!(oout.status.success(), "oracle: {}", String::from_utf8_lossy(&oout.stderr));
+    assert!(
+        oout.status.success(),
+        "oracle: {}",
+        String::from_utf8_lossy(&oout.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&hout.stdout),
         String::from_utf8_lossy(&oout.stdout),
@@ -116,10 +132,7 @@ CREATE VIEW w(n) AS SELECT count(*) FROM t;
     // .tables: hipp prints one name per line (documented v0.2
     // divergence from the oracle's grid) — compare as a set.
     let hout = run(hipp_bin(), &[hdb.to_str().unwrap(), ".tables"]);
-    let names: Vec<&str> = std::str::from_utf8(&hout.stdout)
-        .unwrap()
-        .lines()
-        .collect();
+    let names: Vec<&str> = std::str::from_utf8(&hout.stdout).unwrap().lines().collect();
     assert_eq!(names, vec!["t", "v", "w"]);
 
     // .dump from hipp, replayed into the oracle: the view comes

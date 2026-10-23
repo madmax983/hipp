@@ -8,14 +8,41 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.3 — index B-trees, UNIQUE enforcement and
-  freelist hardening on the v0.2 foundation (SPEC §2).
+- **Phase:** v0.4 — joins, aggregates + GROUP BY, a general
+  expression evaluator, `ALTER TABLE ADD COLUMN`, and inert
+  views on the v0.3 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.4 does
+
+- Everything v0.3 does (below), plus the v0.4 dialect behind the
+  `v04` feature (default on; the tiny profile excludes it):
+  nested-loop joins (`JOIN` / `LEFT JOIN` / `CROSS JOIN` /
+  comma joins, `ON` expressions, aliases, self-joins),
+  aggregates (`count`/`sum`/`avg`/`total`/`min`/`max`/
+  `group_concat`, DISTINCT forms) with `GROUP BY` and `HAVING`,
+  `ORDER BY` / `LIMIT` / `OFFSET` / `SELECT DISTINCT`, and a
+  general expression evaluator — arithmetic with SQLite's
+  coercion rules, comparisons with affinity adjustment,
+  three-valued logic, `IN`/`BETWEEN`/`LIKE`/`CASE`/`CAST`, and
+  a scalar function library (`abs`, `length`, `upper`, `lower`,
+  `coalesce`, `nullif`, `typeof`, `substr`, `round`, `hex`,
+  `trim`, `replace`, `instr`, `sign`, `iif`, …). `INSERT`
+  values are full constant expressions. Simple single-table
+  queries keep the zero-materialisation fast paths.
+- `ALTER TABLE ... ADD COLUMN`, with the oracle's rewrite of
+  the stored CREATE TABLE text and its refusal rules (no
+  PRIMARY KEY / UNIQUE / generated columns, no NOT NULL
+  without a constant default).
+- Views as stored SQL (inert): `CREATE VIEW` validates its
+  SELECT and stores it verbatim; views are catalogued, listed
+  by the CLI, and never executed — selecting from one is a
+  named error, not a silent wrong answer.
 
 ## What v0.3 does
 
@@ -49,9 +76,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.3) |
+| Gate | Budget | Measured (v0.4) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **84,524 B** (Δ +3,740 B vs v0.2's 80,784 B; index engine is feature-gated out of tiny) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **88,336 B** (Δ +3,812 B vs v0.3's 84,524 B; the whole v0.4 query engine is feature-gated out of tiny) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -72,10 +99,9 @@ differential testing. It is a separate crate and contributes
 ## Non-goals (SPEC §3)
 
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
-no general `WHERE` (only `rowid = <literal>` and equality on an
-index's first column), no expression or partial indexes, no
-`ORDER BY`/joins/aggregates, no bound parameters, no
-`UPDATE`/`DELETE`/`DROP TABLE`, no UTF-16, no multi-process
+no expression or partial indexes, no subqueries, no bound
+parameters, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
+stored but never executed, no UTF-16, no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 
@@ -86,8 +112,9 @@ A workspace: the zero-dependency core crate at the root plus
 `unsafe`), `storage` (async trait + Mem/File impls), `pager`
 (page cache, journal protocol, commit machine), `btree`,
 `record` (serial codec, affinity), `schema` (catalog), `sql/`
-(lexer, parser, AST), `session` (Connection/Statement, planner,
-tree-walking executor), `error` (remedy-named errors).
+(lexer, parser, AST), `query` (resolved-expression evaluator,
+v0.4), `session` (Connection/Statement, planner, tree-walking
+executor), `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.
 

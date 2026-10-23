@@ -1138,12 +1138,11 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 len = n - start;
             }
             let mut out = AVec::new();
-            let mut idx = 0i64;
-            for (bs, be) in ranges.iter() {
+            for (i, (bs, be)) in ranges.iter().enumerate() {
+                let idx = i as i64;
                 if idx >= start && idx < start + len {
                     out.extend_from_slice(&text.as_slice()[*bs..*be]);
                 }
-                idx += 1;
             }
             match v[0] {
                 OwnedValue::Blob(_) => OwnedValue::Blob(out),
