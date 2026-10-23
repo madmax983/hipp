@@ -192,6 +192,32 @@ fn expressions_differential() {
     });
 }
 
+/// Edge semantics found by probing the oracle mid-milestone:
+/// substr with negative lengths (counts back from the start
+/// point), substr past the end, and round() with a negative
+/// digit count (behaves as 0 digits in SQLite).
+#[test]
+fn substr_round_edge_differential() {
+    block_on(async {
+        let path = oracle_db(
+            "v04-edges",
+            "CREATE TABLE t (s TEXT, n INTEGER);
+             INSERT INTO t VALUES ('abcdef', 1), ('hello', 2), ('', 3);",
+        );
+        for q in [
+            "SELECT substr(s, 2, -1) FROM t ORDER BY n",
+            "SELECT substr(s, -2, -1) FROM t ORDER BY n",
+            "SELECT substr(s, 0, -1) FROM t ORDER BY n",
+            "SELECT substr(s, 10, 2), substr(s, 2, 100), substr(s, -100, 3) FROM t ORDER BY n",
+            "SELECT substr(s, 3), substr(s, 0, 4), substr(s, -3) FROM t ORDER BY n",
+            "SELECT round(123.456, -1), round(15, -1), round(0.125, 2) FROM t WHERE n = 1",
+            "SELECT sum(s), avg(s) FROM t",
+        ] {
+            diff_query(&path, q).await;
+        }
+    });
+}
+
 // ---------------- ORDER BY / LIMIT / DISTINCT ----------------
 
 #[test]

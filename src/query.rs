@@ -1069,15 +1069,13 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 0
             };
             let x = n.as_f64();
+            // A negative digit count behaves as 0 in SQLite (its
+            // scale factor loop simply never runs).
             let mut mult = 1.0f64;
             let mut d = digits;
             while d > 0 {
                 mult *= 10.0;
                 d -= 1;
-            }
-            while d < 0 {
-                mult /= 10.0;
-                d += 1;
             }
             let scaled = x * mult;
             let rounded = if scaled >= 0.0 {
@@ -1108,10 +1106,10 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             } else {
                 n
             };
-            // SQLite's substr coordinate rules.
-            if start > 0 {
-                start -= 1;
-            } else if start < 0 {
+            // SQLite's substr coordinate rules (verified
+            // against the oracle, incl. negative lengths: a
+            // negative length counts back from the start point).
+            if start < 0 {
                 start += n;
                 if start < 0 {
                     len += start;
@@ -1120,16 +1118,24 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                     }
                     start = 0;
                 }
-            } else if v.len() > 2 {
+            } else if start > 0 {
+                start -= 1;
+            } else if len > 0 && v.len() > 2 {
                 len -= 1;
             }
             if len < 0 {
-                // Negative length: count back from the end point.
-                len = (start + len).max(0);
-                start = 0;
-                // (start..start+len) now measured from 0 after the
-                // fold above when start was the anchor; this branch
-                // covers substr(x, y, -k) with y already adjusted.)
+                len = -len;
+                start -= len;
+                if start < 0 {
+                    len += start;
+                    if len < 0 {
+                        len = 0;
+                    }
+                    start = 0;
+                }
+            }
+            if start + len > n {
+                len = n - start;
             }
             let mut out = AVec::new();
             let mut idx = 0i64;
