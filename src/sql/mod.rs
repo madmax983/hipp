@@ -4,5 +4,5 @@ pub mod ast;
 pub mod lexer;
 pub mod parser;
 
-pub use ast::{Ast, ColumnDef, Literal, SelectList};
+pub use ast::{Ast, ColumnDef, ConstraintSet, IndexColumnDef, Literal, SelectList};
 pub use parser::{eq_ci, handle_bytes, parse};

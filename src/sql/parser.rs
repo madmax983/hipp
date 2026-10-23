@@ -11,7 +11,7 @@
 use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
 
-use super::ast::{Ast, ColumnDef, Literal, SelectList};
+use super::ast::{Ast, ColumnDef, ConstraintSet, IndexColumnDef, Literal, SelectList};
 use super::lexer::{self, Tok, Token};
 
 const MAX_DEPTH: usize = 32;
@@ -146,7 +146,17 @@ impl<'a> Parser<'a> {
 
     fn statement<E>(&mut self) -> Result<Ast, E> {
         if self.cur_is_kw(b"CREATE") {
-            self.create_table::<E>()
+            if self.is_kw(self.pos + 1, b"TABLE") {
+                self.create_table::<E>()
+            } else if self.is_kw(self.pos + 1, b"INDEX") {
+                self.create_index_dispatch::<E>(false)
+            } else if self.is_kw(self.pos + 1, b"UNIQUE") {
+                self.create_index_dispatch::<E>(true)
+            } else {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
+        } else if self.cur_is_kw(b"DROP") {
+            self.drop_index_dispatch::<E>()
         } else if self.cur_is_kw(b"INSERT") {
             self.insert::<E>()
         } else if self.cur_is_kw(b"SELECT") {
@@ -178,6 +188,108 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // ---------------- CREATE / DROP INDEX (v0.3) ----------------
+
+    /// Index DDL exists only under the `indexes` feature; without
+    /// it the statements are unsupported (the tiny profile's
+    /// documented exclusion, SPEC §2).
+    #[cfg(feature = "indexes")]
+    fn create_index_dispatch<E>(&mut self, unique: bool) -> Result<Ast, E> {
+        self.create_index::<E>(unique)
+    }
+
+    #[cfg(not(feature = "indexes"))]
+    fn create_index_dispatch<E>(&mut self, _unique: bool) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
+    #[cfg(feature = "indexes")]
+    fn drop_index_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.drop_index::<E>()
+    }
+
+    #[cfg(not(feature = "indexes"))]
+    fn drop_index_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
+    #[cfg(feature = "indexes")]
+    fn create_index<E>(&mut self, unique: bool) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"CREATE")?;
+        if unique {
+            self.expect_kw::<E>(b"UNIQUE")?;
+        }
+        self.expect_kw::<E>(b"INDEX")?;
+        let if_not_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"NOT")?;
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        self.expect_kw::<E>(b"ON")?;
+        let table = self.name::<E>()?;
+        self.expect::<E>(Tok::LParen)?;
+        let mut columns: AVec<IndexColumnDef> = AVec::new();
+        loop {
+            let col = self.name::<E>()?;
+            // An expression index column looks like `abs(a)` or
+            // `(a+1)`: a '(' right here (or as the item start,
+            // caught because name() rejects '(') is outside v0.3.
+            if self.cur().tok == Tok::LParen {
+                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+            }
+            if self.eat_kw(b"COLLATE") {
+                let coll = self.name::<E>()?;
+                if !eq_ci(handle_bytes(self.arena, coll), b"BINARY") {
+                    // Only the BINARY collation exists in hipp.
+                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                }
+            }
+            let desc = if self.eat_kw(b"DESC") {
+                true
+            } else {
+                let _ = self.eat_kw(b"ASC");
+                false
+            };
+            columns.push(IndexColumnDef { name: col, desc });
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            self.expect::<E>(Tok::RParen)?;
+            break;
+        }
+        // Partial indexes (WHERE ...) are a later phase.
+        if self.cur_is_kw(b"WHERE") {
+            return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+        }
+        Ok(Ast::CreateIndex {
+            name,
+            table,
+            unique,
+            if_not_exists,
+            columns,
+        })
+    }
+
+    #[cfg(feature = "indexes")]
+    fn drop_index<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"DROP")?;
+        if !self.eat_kw(b"INDEX") {
+            // DROP TABLE / DROP VIEW are not in any hipp phase yet.
+            return Err(perr(self.cur().offset, ParseKind::UnsupportedStatement));
+        }
+        let if_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        Ok(Ast::DropIndex { name, if_exists })
+    }
+
     // ---------------- CREATE TABLE ----------------
 
     fn create_table<E>(&mut self) -> Result<Ast, E> {
@@ -196,22 +308,53 @@ impl<'a> Parser<'a> {
         let items = self.split_items::<E>()?;
         let mut columns: AVec<ColumnDef> = AVec::new();
         let mut pk_names: AVec<ABytes> = AVec::new();
+        let mut pk_desc_names: AVec<ABytes> = AVec::new();
+        let mut sets: AVec<ConstraintSet> = AVec::new();
         for (from, to) in items.iter() {
-            self.create_item::<E>(*from, *to, &mut columns, &mut pk_names)?;
+            self.create_item::<E>(
+                *from,
+                *to,
+                &mut columns,
+                &mut pk_names,
+                &mut pk_desc_names,
+                &mut sets,
+            )?;
         }
         if columns.is_empty() {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
         }
-        if pk_names.len() == 1 {
-            let target = pk_names.as_slice()[0];
+        // Mark PK columns (candidate rowid-alias semantics: a PK
+        // column written with DESC is not marked — see ast docs).
+        for target in pk_names.iter() {
+            let desc = pk_desc_names.iter().any(|d| {
+                eq_ci(
+                    handle_bytes(self.arena, *d),
+                    handle_bytes(self.arena, *target),
+                )
+            });
             for c in columns.as_mut_slice().iter_mut() {
                 if eq_ci(
                     handle_bytes(self.arena, c.name),
-                    handle_bytes(self.arena, target),
+                    handle_bytes(self.arena, *target),
                 ) {
-                    c.primary_key = true;
+                    c.pk_desc = desc;
+                    c.primary_key = !desc;
                 }
             }
+        }
+        let mut pk_columns: AVec<ABytes> = AVec::new();
+        let mut pk_sets = 0usize;
+        for s in sets.iter() {
+            if s.primary_key {
+                pk_sets += 1;
+                for c in s.columns.iter() {
+                    pk_columns.push(c.name);
+                }
+            }
+        }
+        if pk_sets > 1 {
+            // SQLite: "table has more than one primary key".
+            return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
         // Trailing clauses: WITHOUT ROWID is outside v0.1.
         if self.cur_is_kw(b"WITHOUT") {
@@ -221,6 +364,8 @@ impl<'a> Parser<'a> {
             name,
             if_not_exists,
             columns,
+            pk_columns,
+            constraint_sets: sets,
         })
     }
 
@@ -261,12 +406,48 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a `(col [ASC|DESC], ...)` list starting at token
+    /// `from` (the '(' is consumed by the scan); returns the column
+    /// defs. Used by table-level PRIMARY KEY / UNIQUE items.
+    fn constraint_columns(&self, mut i: usize, to: usize) -> AVec<IndexColumnDef> {
+        let mut out = AVec::new();
+        if i < to && self.toks.as_slice()[i].tok == Tok::LParen {
+            i += 1;
+        }
+        while i < to {
+            let Some((h, _, _)) = self.ident_at(i) else {
+                break;
+            };
+            i += 1;
+            let mut desc = false;
+            if self.is_kw(i, b"DESC") {
+                desc = true;
+                i += 1;
+            } else if self.is_kw(i, b"ASC") {
+                i += 1;
+            }
+            // A COLLATE clause may intervene; ignore its name.
+            if self.is_kw(i, b"COLLATE") {
+                i += 2;
+            }
+            out.push(IndexColumnDef { name: h, desc });
+            if i < to && self.toks.as_slice()[i].tok == Tok::Comma {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        out
+    }
+
     fn create_item<E>(
         &mut self,
         mut from: usize,
         to: usize,
         columns: &mut AVec<ColumnDef>,
         pk_names: &mut AVec<ABytes>,
+        pk_desc_names: &mut AVec<ABytes>,
+        sets: &mut AVec<ConstraintSet>,
     ) -> Result<(), E> {
         // CONSTRAINT name … — skip the constraint's name.
         if self.is_kw(from, b"CONSTRAINT") {
@@ -281,22 +462,33 @@ impl<'a> Parser<'a> {
             if self.is_kw(i, b"KEY") {
                 i += 1;
             }
-            if i < to && self.toks.as_slice()[i].tok == Tok::LParen {
-                i += 1;
-                while i < to {
-                    if let Some((h, _, _)) = self.ident_at(i) {
-                        pk_names.push(h);
-                    }
-                    i += 1;
-                    if i < to && self.toks.as_slice()[i].tok == Tok::Comma {
-                        i += 1;
-                    }
+            let cols = self.constraint_columns(i, to);
+            for c in cols.iter() {
+                pk_names.push(c.name);
+                if c.desc {
+                    pk_desc_names.push(c.name);
                 }
             }
+            sets.push(ConstraintSet {
+                primary_key: true,
+                columns: cols,
+            });
             return Ok(());
         }
         if self.is_kw(from, b"UNIQUE")
-            || self.is_kw(from, b"CHECK")
+            && from + 1 < to
+            && self.toks.as_slice()[from + 1].tok == Tok::LParen
+        {
+            // Table-level UNIQUE (col, …) (v0.3: enforced via an
+            // implicit index, like SQLite).
+            let cols = self.constraint_columns(from + 1, to);
+            sets.push(ConstraintSet {
+                primary_key: false,
+                columns: cols,
+            });
+            return Ok(());
+        }
+        if self.is_kw(from, b"CHECK")
             || self.is_kw(from, b"FOREIGN")
             || self.is_kw(from, b"KEY")
             || self.is_kw(from, b"INDEX")
@@ -317,6 +509,7 @@ impl<'a> Parser<'a> {
         let mut decl_end_tok = to;
         let mut pk = false;
         let mut pk_desc = false;
+        let mut unique = false;
         let mut default: Option<Literal> = None;
         let mut i = from + 1;
         while i < to {
@@ -339,6 +532,9 @@ impl<'a> Parser<'a> {
                         pk_desc = true;
                     }
                 }
+                if self.is_kw(i, b"UNIQUE") {
+                    unique = true;
+                }
                 if self.is_kw(i, b"DEFAULT") {
                     decl_end_tok = decl_end_tok.min(i);
                     default = self.default_literal(i + 1, to);
@@ -357,7 +553,6 @@ impl<'a> Parser<'a> {
             }
             i += 1;
         }
-        let _ = pk_desc; // folded into primary_key handling below
         let decl = if decl_end_tok > from + 1 {
             let start_off = self.toks.as_slice()[from + 1].offset;
             let end_off = if decl_end_tok < to {
@@ -375,8 +570,39 @@ impl<'a> Parser<'a> {
             name: col_name,
             decl,
             primary_key: pk && !pk_desc,
+            pk_desc,
+            unique,
             default,
         });
+        // Constraint sets in statement order (v0.3): an inline
+        // PRIMARY KEY / UNIQUE is a one-column set at this item's
+        // position.
+        if pk {
+            pk_names.push(col_name);
+            if pk_desc {
+                pk_desc_names.push(col_name);
+            }
+            let mut cols = AVec::new();
+            cols.push(IndexColumnDef {
+                name: col_name,
+                desc: pk_desc,
+            });
+            sets.push(ConstraintSet {
+                primary_key: true,
+                columns: cols,
+            });
+        }
+        if unique {
+            let mut cols = AVec::new();
+            cols.push(IndexColumnDef {
+                name: col_name,
+                desc: false,
+            });
+            sets.push(ConstraintSet {
+                primary_key: false,
+                columns: cols,
+            });
+        }
         Ok(())
     }
 
