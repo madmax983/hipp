@@ -311,11 +311,40 @@ fn class_rank(v: &Value<'_>) -> u8 {
     }
 }
 
-fn as_f64(v: &Value<'_>) -> f64 {
-    match v {
-        Value::Integer(i) => *i as f64,
-        Value::Real(r) => *r,
-        _ => 0.0,
+/// Exact integer-vs-real comparison (the f64 cast route loses the
+/// low bits of large i64s: 9007199254740993 vs 9007199254740992.0
+/// must not compare equal). Mirrors the documented semantics:
+/// compare against the real's truncation, then its fraction.
+fn cmp_int_real(i: i64, r: f64) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if r.is_nan() {
+        // SQLite stores NaN as NULL, so a real NaN never reaches a
+        // comparison from a file; keep a total order anyway.
+        return Ordering::Greater;
+    }
+    if r >= TWO_63 {
+        return Ordering::Less; // every i64 is below 2^63 <= r
+    }
+    if r < -TWO_63 {
+        return Ordering::Greater;
+    }
+    let ri = r as i64; // truncates toward zero; in range per above
+    match i.cmp(&ri) {
+        Ordering::Equal => {
+            // Same integral part: the fraction decides. r - ri has
+            // the sign of the fraction (both are exactly
+            // representable differences here).
+            let frac = r - ri as f64;
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        other => other,
     }
 }
 
@@ -329,13 +358,12 @@ pub fn compare_values(a: &Value<'_>, b: &Value<'_>) -> core::cmp::Ordering {
     }
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Integer(x), Value::Real(y)) => cmp_int_real(*x, *y),
+        (Value::Real(x), Value::Integer(y)) => cmp_int_real(*y, *x).reverse(),
         (Value::Text(x), Value::Text(y)) | (Value::Blob(x), Value::Blob(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
-        _ => {
-            // numeric cross-type
-            let (x, y) = (as_f64(a), as_f64(b));
-            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
-        }
+        _ => Ordering::Equal,
     }
 }
 
@@ -618,6 +646,31 @@ mod tests {
                 _ => assert_eq!(a, b),
             }
         }
+    }
+
+    #[test]
+    fn int_real_compare_is_exact() {
+        use core::cmp::Ordering::*;
+        let c = |a: Value<'_>, b: Value<'_>| compare_values(&a, &b);
+        // The f64-cast trap: 2^53+1 as an integer vs 2^53 as a real.
+        assert_eq!(
+            c(
+                Value::Integer(9_007_199_254_740_993),
+                Value::Real(9_007_199_254_740_992.0)
+            ),
+            Greater
+        );
+        assert_eq!(c(Value::Integer(3), Value::Real(3.5)), Less);
+        assert_eq!(c(Value::Integer(3), Value::Real(3.0)), Equal);
+        assert_eq!(c(Value::Integer(-3), Value::Real(-3.5)), Greater);
+        assert_eq!(c(Value::Integer(-4), Value::Real(-3.5)), Less);
+        assert_eq!(
+            c(Value::Integer(i64::MAX), Value::Real(9.223372036854776e18)),
+            Less
+        );
+        assert_eq!(c(Value::Integer(0), Value::Real(-0.0)), Equal);
+        assert_eq!(c(Value::Null, Value::Integer(i64::MIN)), Less);
+        assert_eq!(c(Value::Text(b"a"), Value::Blob(b"a")), Less);
     }
 
     #[test]

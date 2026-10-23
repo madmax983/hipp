@@ -4,15 +4,19 @@ resolver = "2"
 
 [package]
 name = "hipp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
-default = ["std"]
+default = ["std", "indexes"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
+# Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
+# lookups, UNIQUE enforcement, DROP INDEX. The tiny profile
+# (--no-default-features) excludes it and pays nothing for it (SPEC §2).
+indexes = []
 
 [dependencies]
 

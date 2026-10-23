@@ -28,7 +28,7 @@ pub mod storage;
 
 pub use error::{Error, SchemaKind, Scope};
 pub use record::{OwnedValue, Value};
-pub use session::{ArenaStats, Config, Connection, Statement, Step, TableMeta};
+pub use session::{ArenaStats, Config, Connection, IndexMeta, Statement, Step, TableMeta};
 pub use storage::{MemStorage, Storage};
 
 #[cfg(feature = "std")]

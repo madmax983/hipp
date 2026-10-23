@@ -1,6 +1,6 @@
 [package]
 name = "hipp-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Command-line shell for hipp, the little no_std database that reads and writes SQLite database files. Its first job is differential testing against the pinned SQLite oracle CLI."

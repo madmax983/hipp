@@ -22,6 +22,15 @@ pub enum SchemaKind {
     ColumnCountMismatch,
     DatatypeMismatch,
     MissingRowidValue,
+    /// A `UNIQUE` index / constraint would be violated (v0.3).
+    UniqueViolation,
+    /// `DROP INDEX` named an index that does not exist (v0.3).
+    UnknownIndex,
+    /// `DROP INDEX` named an index owned by a UNIQUE / PRIMARY KEY
+    /// constraint, which SQLite refuses to drop (v0.3).
+    DropAutoIndex,
+    /// `CREATE INDEX` named an index that already exists (v0.3).
+    DuplicateIndex,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
