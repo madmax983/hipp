@@ -16,6 +16,9 @@ use crate::schema::{Catalog, build_catalog};
 use crate::sql::{Ast, Literal, SelectList, eq_ci, handle_bytes, parse};
 use crate::storage::Storage;
 
+#[cfg(feature = "indexes")]
+use crate::schema::IndexOrigin;
+
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
 const ROWID_COL: usize = usize::MAX;
@@ -112,22 +115,68 @@ pub enum Step {
     Done,
 }
 
-/// Rowid access path the planner chose for a scan (v0.2). This is
-/// the executor seam for general WHERE: richer predicates lower
-/// to these same paths in later phases.
-#[derive(Debug, Clone, Copy)]
+/// Access path the planner chose for a scan (v0.2 rowid paths;
+/// v0.3 adds the secondary-index path). This is the executor seam
+/// for general WHERE: richer predicates lower to these same paths
+/// in later phases.
+#[derive(Debug, Clone)]
 enum Access {
     /// No usable predicate: full B-tree scan.
     FullScan,
     /// `WHERE rowid = <v>`: point lookup via `btree::seek_rowid`.
     Rowid(i64),
+    /// `WHERE <indexed col> = <v>` (v0.3): secondary-index lookup
+    /// on the index's first key column; `probe` is the literal
+    /// after the column's affinity has been applied.
+    #[cfg(feature = "indexes")]
+    Index {
+        root: u32,
+        desc: AVec<bool>,
+        probe: OwnedValue,
+    },
     /// A predicate that can never match (e.g. `rowid = NULL`,
     /// `rowid = 'abc'`): the scan yields no rows.
     Empty,
 }
 
+/// One index the INSERT executor must maintain (v0.3), resolved
+/// from the catalog at plan time.
+#[cfg(feature = "indexes")]
+#[derive(Debug, Clone)]
+struct IndexPlan {
+    root: u32,
+    unique: bool,
+    /// Key columns (canonical form: None = rowid).
+    cols: AVec<IdxColPlan>,
+    /// Per-key-column DESC flags, parallel to `cols`.
+    desc: AVec<bool>,
+}
+
+#[cfg(feature = "indexes")]
+#[derive(Debug, Clone, Copy)]
+struct IdxColPlan {
+    col: Option<usize>,
+    desc: bool,
+}
+
 enum Plan {
     CreateTable,
+    /// `CREATE [UNIQUE] INDEX` (v0.3): everything population needs
+    /// is resolved at plan time.
+    #[cfg(feature = "indexes")]
+    CreateIndex {
+        table_root: u32,
+        rowid_alias: Option<usize>,
+        ncols: usize,
+        defaults: AVec<OwnedValue>,
+        cols: AVec<IdxColPlan>,
+        unique: bool,
+    },
+    /// `DROP INDEX` (v0.3); `root: None` is the IF EXISTS no-op.
+    #[cfg(feature = "indexes")]
+    DropIndex {
+        root: Option<u32>,
+    },
     Insert {
         root: u32,
         rowid_alias: Option<usize>,
@@ -136,6 +185,9 @@ enum Plan {
         /// Where each supplied value goes, parallel to one AST
         /// value row (every row of a multi-row VALUES shares it).
         targets: AVec<Target>,
+        /// Indexes to maintain, in catalog order (v0.3).
+        #[cfg(feature = "indexes")]
+        indexes: AVec<IndexPlan>,
     },
     Scan {
         root: u32,
@@ -240,12 +292,87 @@ impl<S: Storage> Connection<S> {
             current: AVec::new(),
             current_rowid: None,
             row_ckpt,
+            #[cfg(feature = "indexes")]
+            index_rowids: AVec::new(),
+            #[cfg(feature = "indexes")]
+            index_pos: 0,
+            #[cfg(feature = "indexes")]
+            index_loaded: false,
         })
     }
 
     fn plan(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
         match ast {
             Ast::CreateTable { .. } => Ok(Plan::CreateTable),
+            #[cfg(feature = "indexes")]
+            Ast::CreateIndex {
+                table,
+                columns,
+                unique,
+                ..
+            } => {
+                let tname = handle_bytes(arena, *table);
+                let t = self
+                    .catalog
+                    .find(&self.catalog_arena, tname)
+                    .ok_or(Error::Schema {
+                        kind: SchemaKind::UnknownTable,
+                    })?;
+                let mut cols = AVec::new();
+                for cd in columns.iter() {
+                    let nb = handle_bytes(arena, cd.name);
+                    let col = match self.resolve_target(t, nb)? {
+                        Target::Rowid => None,
+                        Target::Col(i) => {
+                            if Some(i) == t.rowid_alias {
+                                None
+                            } else {
+                                Some(i)
+                            }
+                        }
+                    };
+                    cols.push(IdxColPlan { col, desc: cd.desc });
+                }
+                let mut defaults = AVec::new();
+                for c in t.columns.iter() {
+                    defaults.push(literal_owned(&self.catalog_arena, c.default));
+                }
+                Ok(Plan::CreateIndex {
+                    table_root: t.root,
+                    rowid_alias: t.rowid_alias,
+                    ncols: t.columns.len(),
+                    defaults,
+                    cols,
+                    unique: *unique,
+                })
+            }
+            #[cfg(feature = "indexes")]
+            Ast::DropIndex { name, if_exists } => {
+                let nb = handle_bytes(arena, *name);
+                match self.catalog.find_index(&self.catalog_arena, nb) {
+                    None => {
+                        if *if_exists {
+                            Ok(Plan::DropIndex { root: None })
+                        } else {
+                            Err(Error::Schema {
+                                kind: SchemaKind::UnknownIndex,
+                            })
+                        }
+                    }
+                    Some(ix) => {
+                        if ix.origin == IndexOrigin::Auto {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::DropAutoIndex,
+                            });
+                        }
+                        Ok(Plan::DropIndex {
+                            root: Some(ix.root),
+                        })
+                    }
+                }
+            }
+            #[cfg(not(feature = "indexes"))]
+            Ast::CreateIndex { .. } | Ast::DropIndex { .. } => Err(Error::Unsupported),
             Ast::Insert {
                 table,
                 columns,
@@ -293,11 +420,41 @@ impl<S: Storage> Connection<S> {
                         }
                     }
                 }
+                #[cfg(feature = "indexes")]
+                let indexes = {
+                    let mut out: AVec<IndexPlan> = AVec::new();
+                    for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
+                        if ix.opaque {
+                            // An index hipp cannot maintain:
+                            // refuse the write rather than let it
+                            // silently desynchronise (schema.rs).
+                            return Err(Error::Unsupported);
+                        }
+                        let mut cols = AVec::new();
+                        let mut desc = AVec::new();
+                        for c in ix.columns.iter() {
+                            cols.push(IdxColPlan {
+                                col: c.col,
+                                desc: c.desc,
+                            });
+                            desc.push(c.desc);
+                        }
+                        out.push(IndexPlan {
+                            root: ix.root,
+                            unique: ix.unique,
+                            cols,
+                            desc,
+                        });
+                    }
+                    out
+                };
                 Ok(Plan::Insert {
                     root: t.root,
                     rowid_alias: t.rowid_alias,
                     cols,
                     targets,
+                    #[cfg(feature = "indexes")]
+                    indexes,
                 })
             }
             Ast::Begin => {
@@ -332,7 +489,23 @@ impl<S: Storage> Connection<S> {
                             Target::Col(i) if Some(i) == t.rowid_alias => {
                                 literal_rowid(arena, *lit)
                             }
-                            Target::Col(_) => return Err(Error::Unsupported),
+                            Target::Col(i) => {
+                                // v0.3: an index on this column
+                                // turns the predicate into a
+                                // secondary-index lookup.
+                                #[cfg(feature = "indexes")]
+                                {
+                                    match self.plan_index_access(t, tname, i, arena, *lit) {
+                                        Some(a) => a,
+                                        None => return Err(Error::Unsupported),
+                                    }
+                                }
+                                #[cfg(not(feature = "indexes"))]
+                                {
+                                    let _ = i;
+                                    return Err(Error::Unsupported);
+                                }
+                            }
                         }
                     }
                 };
@@ -376,6 +549,57 @@ impl<S: Storage> Connection<S> {
                 })
             }
         }
+    }
+
+    /// The v0.3 planner seam for `WHERE <col> = <literal>` on a
+    /// non-rowid column: pick an index whose first key column is
+    /// `col` (preferring a UNIQUE one), convert the literal with
+    /// the column's affinity, and lower to `Access::Index`.
+    /// Returns None when no usable index exists.
+    #[cfg(feature = "indexes")]
+    fn plan_index_access(
+        &self,
+        t: &crate::schema::TableDef,
+        tname: &[u8],
+        col: usize,
+        arena: &Arena,
+        lit: Literal,
+    ) -> Option<Access> {
+        if matches!(lit, Literal::Null) {
+            return Some(Access::Empty);
+        }
+        let mut chosen: Option<(u32, bool, AVec<bool>)> = None;
+        for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
+            if ix.opaque {
+                continue;
+            }
+            let Some(first) = ix.columns.as_slice().first() else {
+                continue;
+            };
+            if first.col != Some(col) {
+                continue;
+            }
+            let mut desc = AVec::new();
+            for c in ix.columns.iter() {
+                desc.push(c.desc);
+            }
+            match &chosen {
+                None => chosen = Some((ix.root, ix.unique, desc)),
+                Some((_, unique, _)) if ix.unique && !unique => {
+                    chosen = Some((ix.root, ix.unique, desc));
+                }
+                _ => {}
+            }
+        }
+        let (root, _, desc) = chosen?;
+        let probe = apply_affinity(
+            literal_owned(arena, Some(lit)),
+            t.columns.as_slice()[col].affinity,
+        );
+        if matches!(probe, OwnedValue::Null) {
+            return Some(Access::Empty);
+        }
+        Some(Access::Index { root, desc, probe })
     }
 
     fn resolve_target(&self, t: &crate::schema::TableDef, name: &[u8]) -> Result<Target, S::Error> {
@@ -440,6 +664,22 @@ impl<S: Storage> Connection<S> {
         out
     }
 
+    /// Index catalog entries for tools (v0.3): every index in
+    /// schema order; `sql` is None for implicit (constraint-owned)
+    /// indexes, which have no CREATE INDEX text.
+    pub fn indexes(&self) -> AVec<IndexMeta<'_>> {
+        let mut out = AVec::new();
+        for i in self.catalog.indexes.iter() {
+            out.push(IndexMeta {
+                name: handle_bytes(&self.catalog_arena, i.name),
+                table: handle_bytes(&self.catalog_arena, i.table),
+                sql: i.sql.map(|h| handle_bytes(&self.catalog_arena, h)),
+                unique: i.unique,
+            });
+        }
+        out
+    }
+
     /// Mutable pager access for tools/tests driving the layers
     /// below the session API (cursor-level scans, §4.1 gates).
     pub fn pager_mut(&mut self) -> &mut Pager<S> {
@@ -470,6 +710,15 @@ pub struct TableMeta<'a> {
     pub sql: &'a [u8],
 }
 
+/// One index catalog row for tools (v0.3).
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMeta<'a> {
+    pub name: &'a [u8],
+    pub table: &'a [u8],
+    pub sql: Option<&'a [u8]>,
+    pub unique: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ArenaStats {
     pub catalog_high_water: usize,
@@ -497,6 +746,14 @@ pub struct Statement<'c, S: Storage> {
     current: AVec<OwnedValue>,
     current_rowid: Option<i64>,
     row_ckpt: usize,
+    /// Secondary-index scan state (v0.3): the rowids an
+    /// `Access::Index` lookup produced, consumed one per step.
+    #[cfg(feature = "indexes")]
+    index_rowids: AVec<i64>,
+    #[cfg(feature = "indexes")]
+    index_pos: usize,
+    #[cfg(feature = "indexes")]
+    index_loaded: bool,
 }
 
 fn literal_owned(arena: &Arena, lit: Option<Literal>) -> OwnedValue {
@@ -515,6 +772,70 @@ fn copy_vec(b: &[u8]) -> AVec<u8> {
         v.push(*x);
     }
     v
+}
+
+/// The stored schema text for a CREATE statement: the statement
+/// as issued, minus any trailing semicolon/whitespace (SQLite's
+/// convention).
+fn trimmed_sql_text(raw: &[u8]) -> AVec<u8> {
+    let mut end = raw.len();
+    while end > 0 && (raw[end - 1] == b';' || (raw[end - 1] as char).is_whitespace()) {
+        end -= 1;
+    }
+    copy_vec(&raw[..end])
+}
+
+/// Build an index key (the key columns' values, in index order)
+/// for one table row (v0.3). `payload` is the row's table record;
+/// short records materialise column defaults, as scans do.
+#[cfg(feature = "indexes")]
+fn index_key_for_row<E>(
+    cols: &[IdxColPlan],
+    rowid_alias: Option<usize>,
+    defaults: &[OwnedValue],
+    payload: &[u8],
+    ncols: usize,
+    rowid: i64,
+) -> Result<AVec<OwnedValue>, E> {
+    let mut dec: AVec<Value<'_>> = AVec::new();
+    crate::record::decode_record_into::<E>(payload, ncols, &mut dec)?;
+    let mut key = AVec::new();
+    for c in cols {
+        key.push(match c.col {
+            None => OwnedValue::Integer(rowid),
+            Some(i) => {
+                if Some(i) == rowid_alias {
+                    OwnedValue::Integer(rowid)
+                } else if i < dec.len() {
+                    OwnedValue::from_value(dec.as_slice()[i])
+                } else {
+                    defaults[i].clone()
+                }
+            }
+        });
+    }
+    Ok(key)
+}
+
+/// Encode an index key payload: the record of key values with
+/// the rowid appended (SQFMT §2.6).
+#[cfg(feature = "indexes")]
+fn encode_index_payload(key: &[OwnedValue], rowid: i64) -> AVec<u8> {
+    let mut vals: AVec<Value<'_>> = AVec::new();
+    for v in key {
+        vals.push(v.as_value());
+    }
+    vals.push(Value::Integer(rowid));
+    let mut rec = AVec::new();
+    encode_record(vals.as_slice(), &mut rec);
+    rec
+}
+
+/// UNIQUE semantics: a key containing any NULL never conflicts
+/// (SQLite treats NULLs as distinct for uniqueness).
+#[cfg(feature = "indexes")]
+fn key_has_no_null(key: &[OwnedValue]) -> bool {
+    key.iter().all(|v| !matches!(v, OwnedValue::Null))
 }
 
 /// Coerce a `WHERE rowid = <literal>` literal to an access path,
@@ -567,14 +888,37 @@ fn integral_f64(f: f64) -> Option<i64> {
 impl<'c, S: Storage> Statement<'c, S> {
     /// Execute/advance the statement by one step.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
-        match &self.plan {
+        let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
+            || {
+                #[cfg(feature = "indexes")]
+                {
+                    matches!(self.plan, Plan::CreateIndex { .. } | Plan::DropIndex { .. })
+                }
+                #[cfg(not(feature = "indexes"))]
+                {
+                    false
+                }
+            };
+        let r = match &self.plan {
             Plan::CreateTable => self.step_create().await,
+            #[cfg(feature = "indexes")]
+            Plan::CreateIndex { .. } => self.step_create_index().await,
+            #[cfg(feature = "indexes")]
+            Plan::DropIndex { .. } => self.step_drop_index().await,
             Plan::Insert { .. } => self.step_insert().await,
             Plan::Scan { .. } => self.step_scan().await,
             Plan::Begin => self.step_begin().await,
             Plan::Commit => self.step_commit().await,
             Plan::Rollback => self.step_rollback().await,
+        };
+        // Keep the connection's catalog in step with the schema
+        // cookie after DDL / transaction boundaries, so metadata
+        // readers (tables(), indexes()) see the new state without
+        // waiting for the next prepare (§5.5).
+        if ddl_or_txn && r.is_ok() && self.conn.pager.schema_cookie() != self.conn.catalog.cookie {
+            self.conn.rebuild_catalog().await?;
         }
+        r
     }
 
     /// `BEGIN` (v0.2): opens the explicit bracket only — the pager
@@ -633,6 +977,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             name,
             if_not_exists,
             columns,
+            ..
         } = &self.ast
         else {
             unreachable!()
@@ -656,11 +1001,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Stored schema text: the statement as issued, minus any
         // trailing semicolon/whitespace (SQLite's convention).
         let raw = handle_bytes(&self.arena, self.sql_text);
-        let mut end = raw.len();
-        while end > 0 && (raw[end - 1] == b';' || (raw[end - 1] as char).is_whitespace()) {
-            end -= 1;
-        }
-        let sql_text = copy_vec(&raw[..end]);
+        let sql_text = trimmed_sql_text(raw);
         let r = self
             .exec_create(name_b.as_slice(), sql_text.as_slice())
             .await;
@@ -681,26 +1022,313 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
     }
 
-    async fn exec_create(&mut self, name: &[u8], sql_text: &[u8]) -> Result<(), S::Error> {
+    /// Append one row to `sqlite_schema` (root page 1) with the
+    /// next schema rowid.
+    async fn insert_schema_row(
+        &mut self,
+        ty: &[u8],
+        name: &[u8],
+        tbl_name: &[u8],
+        root: u32,
+        sql: Option<&[u8]>,
+    ) -> Result<(), S::Error> {
         let pager = &mut self.conn.pager;
-        let (root, _) = pager.alloc_page().await?;
-        btree::create_empty_root(pager, root).await?;
-        let schema_rowid = match btree::seek_max_rowid(pager, 1).await? {
+        let rowid = match btree::seek_max_rowid(pager, 1).await? {
             Some(m) => m + 1,
             None => 1,
         };
         let mut vals: AVec<Value<'_>> = AVec::new();
-        vals.push(Value::Text(b"table"));
+        vals.push(Value::Text(ty));
         vals.push(Value::Text(name));
-        vals.push(Value::Text(name));
+        vals.push(Value::Text(tbl_name));
         vals.push(Value::Integer(i64::from(root)));
-        vals.push(Value::Text(sql_text));
+        match sql {
+            Some(s) => vals.push(Value::Text(s)),
+            None => vals.push(Value::Null),
+        }
         let mut rec = AVec::new();
         encode_record(vals.as_slice(), &mut rec);
-        btree::btree_insert(pager, 1, schema_rowid, rec.as_slice()).await?;
-        pager.bump_schema_cookie();
+        btree::btree_insert(pager, 1, rowid, rec.as_slice()).await
+    }
+
+    async fn exec_create(&mut self, name: &[u8], sql_text: &[u8]) -> Result<(), S::Error> {
+        let (root, _) = self.conn.pager.alloc_page().await?;
+        btree::create_empty_root(&mut self.conn.pager, root).await?;
+        self.insert_schema_row(b"table", name, name, root, Some(sql_text))
+            .await?;
+        // Implicit indexes for the table's UNIQUE / PK constraint
+        // sets (v0.3), in statement order, exactly as SQLite
+        // creates them.
+        #[cfg(feature = "indexes")]
+        self.create_auto_indexes(name).await?;
+        self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            pager.drive_commit().await?;
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
+    /// Create the implicit index B-trees + schema rows for a new
+    /// table's constraint sets (v0.3). The rowid-alias PK set is
+    /// skipped — it needs no index.
+    #[cfg(feature = "indexes")]
+    async fn create_auto_indexes(&mut self, table: &[u8]) -> Result<(), S::Error> {
+        // Phase 1: compute the implicit index names from the AST
+        // (borrows only the statement; the pager work follows).
+        let names: AVec<AVec<u8>> = {
+            let Ast::CreateTable {
+                columns,
+                pk_columns,
+                constraint_sets,
+                ..
+            } = &self.ast
+            else {
+                unreachable!()
+            };
+            // Rowid alias determination, mirroring schema.rs.
+            let mut alias = false;
+            if pk_columns.len() == 1 {
+                let target = handle_bytes(&self.arena, pk_columns.as_slice()[0]);
+                for c in columns.iter() {
+                    if eq_ci(handle_bytes(&self.arena, c.name), target) {
+                        let decl = handle_bytes(&self.arena, c.decl);
+                        let mut s = 0;
+                        let mut e = decl.len();
+                        while s < e && (decl[s] as char).is_whitespace() {
+                            s += 1;
+                        }
+                        while e > s && (decl[e - 1] as char).is_whitespace() {
+                            e -= 1;
+                        }
+                        alias = !c.pk_desc && eq_ci(&decl[s..e], b"INTEGER");
+                    }
+                }
+            }
+            let mut out: AVec<AVec<u8>> = AVec::new();
+            let mut n = 0usize;
+            for set in constraint_sets.iter() {
+                if set.primary_key && alias {
+                    continue;
+                }
+                n += 1;
+                let mut auto_name = AVec::new();
+                for b in b"sqlite_autoindex_" {
+                    auto_name.push(*b);
+                }
+                for b in table {
+                    auto_name.push(*b);
+                }
+                auto_name.push(b'_');
+                crate::record::render_int(n as i64, &mut auto_name);
+                out.push(auto_name);
+            }
+            out
+        };
+        // Phase 2: one empty index B-tree + schema row per name.
+        for auto_name in names.iter() {
+            let (root, _) = self.conn.pager.alloc_page().await?;
+            btree::create_empty_index_root(&mut self.conn.pager, root).await?;
+            self.insert_schema_row(b"index", auto_name.as_slice(), table, root, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// `CREATE [UNIQUE] INDEX` (v0.3): allocate the root, write
+    /// the schema row, then populate the index from the table's
+    /// existing rows. A UNIQUE violation during population fails
+    /// the statement (and, per the engine's write-error rule,
+    /// rolls the transaction back — the half-built index and its
+    /// schema row vanish with it).
+    #[cfg(feature = "indexes")]
+    async fn step_create_index(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_create_index().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(feature = "indexes")]
+    async fn exec_create_index(&mut self) -> Result<(), S::Error> {
+        let Ast::CreateIndex {
+            name,
+            table,
+            if_not_exists,
+            ..
+        } = &self.ast
+        else {
+            unreachable!()
+        };
+        let name_b = copy_vec(handle_bytes(&self.arena, *name));
+        let table_b = copy_vec(handle_bytes(&self.arena, *table));
+        // Index names share the schema namespace with tables.
+        let taken = self
+            .conn
+            .catalog
+            .find_index(&self.conn.catalog_arena, name_b.as_slice())
+            .is_some()
+            || self
+                .conn
+                .catalog
+                .find(&self.conn.catalog_arena, name_b.as_slice())
+                .is_some();
+        if taken {
+            if *if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Schema {
+                kind: SchemaKind::DuplicateIndex,
+            });
+        }
+        let raw = handle_bytes(&self.arena, self.sql_text);
+        let sql_text = trimmed_sql_text(raw);
+        let (root, _) = self.conn.pager.alloc_page().await?;
+        btree::create_empty_index_root(&mut self.conn.pager, root).await?;
+        self.insert_schema_row(
+            b"index",
+            name_b.as_slice(),
+            table_b.as_slice(),
+            root,
+            Some(sql_text.as_slice()),
+        )
+        .await?;
+        // Populate from the table's current contents.
+        let Plan::CreateIndex {
+            table_root,
+            rowid_alias,
+            ncols,
+            defaults,
+            cols,
+            unique,
+        } = &self.plan
+        else {
+            unreachable!()
+        };
+        let (table_root, rowid_alias, ncols, unique) = (*table_root, *rowid_alias, *ncols, *unique);
+        let defaults = defaults.clone();
+        let cols = cols.clone();
+        let mut desc = AVec::new();
+        for c in cols.iter() {
+            desc.push(c.desc);
+        }
+        let mut cursor = ScanCursor::new(table_root);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let key = index_key_for_row(
+                cols.as_slice(),
+                rowid_alias,
+                defaults.as_slice(),
+                buf.as_slice(),
+                ncols,
+                rowid,
+            )?;
+            if unique && key_has_no_null(key.as_slice()) {
+                let probe: AVec<OwnedValue> = key.clone();
+                if btree::index_first_with_prefix(
+                    &mut self.conn.pager,
+                    root,
+                    desc.as_slice(),
+                    probe.as_slice(),
+                )
+                .await?
+                .is_some()
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::UniqueViolation,
+                    });
+                }
+            }
+            let payload = encode_index_payload(key.as_slice(), rowid);
+            btree::index_insert(
+                &mut self.conn.pager,
+                root,
+                payload.as_slice(),
+                desc.as_slice(),
+            )
+            .await?;
+        }
+        self.conn.pager.bump_schema_cookie();
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
+    /// `DROP INDEX` (v0.3): free every page of the index B-tree
+    /// (pages + overflow chains) to the freelist, then remove its
+    /// schema row.
+    #[cfg(feature = "indexes")]
+    async fn step_drop_index(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_drop_index().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(feature = "indexes")]
+    async fn exec_drop_index(&mut self) -> Result<(), S::Error> {
+        let Plan::DropIndex { root } = &self.plan else {
+            unreachable!()
+        };
+        let Some(root) = *root else {
+            return Ok(()); // IF EXISTS no-op
+        };
+        let Ast::DropIndex { name, .. } = &self.ast else {
+            unreachable!()
+        };
+        let name_b = copy_vec(handle_bytes(&self.arena, *name));
+        // Locate the schema row (its rowid keys the removal).
+        let mut cursor = ScanCursor::new(1);
+        let mut buf = AVec::new();
+        let mut schema_rowid = None;
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
+            if values.len() >= 2
+                && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index"))
+                && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, name_b.as_slice()))
+            {
+                schema_rowid = Some(rowid);
+                break;
+            }
+        }
+        let Some(schema_rowid) = schema_rowid else {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownIndex,
+            });
+        };
+        // Collect first, then free: freeing rewrites the freelist
+        // linkage the traversal is not using, but the traversal
+        // must see the intact tree.
+        let pages = btree::collect_index_pages(&mut self.conn.pager, root).await?;
+        for p in pages.iter() {
+            self.conn.pager.free_page(*p).await?;
+        }
+        btree::btree_delete(&mut self.conn.pager, 1, schema_rowid).await?;
+        self.conn.pager.bump_schema_cookie();
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
         }
         Ok(())
     }
@@ -744,12 +1372,18 @@ impl<'c, S: Storage> Statement<'c, S> {
             rowid_alias,
             cols,
             targets,
+            ..
         } = &self.plan
         else {
             unreachable!()
         };
         let Ast::Insert { rows, .. } = &self.ast else {
             unreachable!()
+        };
+        #[cfg(feature = "indexes")]
+        let indexes: AVec<IndexPlan> = match &self.plan {
+            Plan::Insert { indexes, .. } => indexes.clone(),
+            _ => unreachable!(),
         };
         let values = &rows.as_slice()[row_idx];
         let ncols = cols.len();
@@ -808,10 +1442,95 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
         }
         let _ = ncols;
+        // v0.3 index work, part 1: UNIQUE pre-checks against the
+        // row's keys (a key containing NULL never conflicts).
+        #[cfg(feature = "indexes")]
+        let mut pending_keys: AVec<(u32, AVec<bool>, AVec<OwnedValue>)> = AVec::new();
+        #[cfg(feature = "indexes")]
+        for ix in indexes.iter() {
+            let mut key = AVec::new();
+            for c in ix.cols.iter() {
+                key.push(match c.col {
+                    None => OwnedValue::Integer(rowid),
+                    Some(i) => row.as_slice()[i].clone(),
+                });
+            }
+            if ix.unique
+                && key_has_no_null(key.as_slice())
+                && btree::index_first_with_prefix(
+                    pager,
+                    ix.root,
+                    ix.desc.as_slice(),
+                    key.as_slice(),
+                )
+                .await?
+                .is_some()
+            {
+                return Err(Error::Schema {
+                    kind: SchemaKind::UniqueViolation,
+                });
+            }
+            pending_keys.push((ix.root, ix.desc.clone(), key));
+        }
         let mut rec = AVec::new();
         encode_record(vals.as_slice(), &mut rec);
         btree::btree_insert(pager, *root, rowid, rec.as_slice()).await?;
+        // v0.3 index work, part 2: maintain every index.
+        #[cfg(feature = "indexes")]
+        for (ix_root, desc, key) in pending_keys.iter() {
+            let payload = encode_index_payload(key.as_slice(), rowid);
+            btree::index_insert(pager, *ix_root, payload.as_slice(), desc.as_slice()).await?;
+        }
         Ok(())
+    }
+
+    /// The v0.3 secondary-index scan: resolve the lookup's
+    /// rowids once, then fetch each row by rowid.
+    #[cfg(feature = "indexes")]
+    async fn step_scan_index(&mut self) -> Result<Step, S::Error> {
+        let (table_root, idx_root, desc, probe) = {
+            let Plan::Scan { root, access, .. } = &self.plan else {
+                unreachable!()
+            };
+            match access {
+                Access::Index {
+                    root: ir,
+                    desc,
+                    probe,
+                } => (*root, *ir, desc.clone(), probe.clone()),
+                _ => unreachable!(),
+            }
+        };
+        if !self.index_loaded {
+            let probe1 = [probe];
+            self.index_rowids = btree::index_prefix_rowids(
+                &mut self.conn.pager,
+                idx_root,
+                desc.as_slice(),
+                &probe1,
+            )
+            .await?;
+            self.index_pos = 0;
+            self.index_loaded = true;
+        }
+        loop {
+            if self.index_pos >= self.index_rowids.len() {
+                self.phase = Phase::Done;
+                self.current_rowid = None;
+                return Ok(Step::Done);
+            }
+            let rowid = self.index_rowids.as_slice()[self.index_pos];
+            self.index_pos += 1;
+            let found = btree::seek_rowid(&mut self.conn.pager, table_root, rowid).await?;
+            if let Some(payload) = found {
+                self.row_buf = payload;
+                self.project_current(rowid)?;
+                self.phase = Phase::Running;
+                return Ok(Step::Row);
+            }
+            // An index entry without a table row cannot occur in a
+            // consistent file; skip it rather than tear.
+        }
     }
 
     async fn step_scan(&mut self) -> Result<Step, S::Error> {
@@ -821,17 +1540,42 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Per-row checkpoint rewind (§7.5.2): the previous row's
         // arena temporaries die before the next row is decoded.
         self.arena.rewind(self.row_ckpt);
+        #[cfg(feature = "indexes")]
+        {
+            let is_index = matches!(
+                &self.plan,
+                Plan::Scan {
+                    access: Access::Index { .. },
+                    ..
+                }
+            );
+            if is_index {
+                return self.step_scan_index().await;
+            }
+        }
         let Plan::Scan { root, access, .. } = &self.plan else {
             unreachable!()
         };
-        let (root, access) = (*root, *access);
+        let root = *root;
+        enum SimpleAccess {
+            FullScan,
+            Rowid(i64),
+            Empty,
+        }
+        let access = match access {
+            Access::FullScan => SimpleAccess::FullScan,
+            Access::Rowid(r) => SimpleAccess::Rowid(*r),
+            Access::Empty => SimpleAccess::Empty,
+            #[cfg(feature = "indexes")]
+            Access::Index { .. } => unreachable!(),
+        };
         match access {
-            Access::Empty => {
+            SimpleAccess::Empty => {
                 self.phase = Phase::Done;
                 self.current_rowid = None;
                 Ok(Step::Done)
             }
-            Access::Rowid(want) => {
+            SimpleAccess::Rowid(want) => {
                 if self.phase == Phase::Running {
                     // The single matching row was already produced.
                     self.phase = Phase::Done;
@@ -853,7 +1597,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
-            Access::FullScan => {
+            SimpleAccess::FullScan => {
                 if self.cursor.is_none() {
                     self.cursor = Some(ScanCursor::new(root));
                 }

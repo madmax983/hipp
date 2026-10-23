@@ -6,12 +6,25 @@
 //! `TableDef`s themselves are small metadata in an `AVec` (the
 //! arena.rs collections rule, §7.5.1). The catalog is rebuilt whole
 //! on a schema-cookie change — its arena's only reset (§7.5.2).
+//!
+//! v0.3: the catalog also carries index definitions. Explicit
+//! indexes re-parse their stored `CREATE INDEX` SQL; implicit
+//! indexes (`sql IS NULL`, SQLite's `sqlite_autoindex_*`) are
+//! derived from the owning table's UNIQUE / PRIMARY KEY constraint
+//! sets in statement order — the same order SQLite creates them
+//! (oracle-verified). An index whose SQL uses a feature outside
+//! the v0.3 grammar (expressions, partial indexes, non-BINARY
+//! collations) is recorded as *opaque*: reads of its table work,
+//! writes refuse with `Error::Unsupported` rather than silently
+//! desynchronising an index hipp cannot maintain.
 
 use crate::arena::{ABytes, AVec, Arena};
 use crate::btree::ScanCursor;
 use crate::error::{Error, Result};
 use crate::pager::Pager;
 use crate::record::{Affinity, Value, affinity_of, decode_record};
+#[cfg(feature = "indexes")]
+use crate::sql::ConstraintSet;
 use crate::sql::{Ast, Literal, eq_ci, handle_bytes, parse};
 use crate::storage::Storage;
 
@@ -23,6 +36,22 @@ pub struct Column {
     pub default: Option<Literal>,
 }
 
+/// One column of an index key (v0.3). `col == None` is the rowid
+/// (also the canonical form for the table's rowid-alias column).
+#[derive(Debug, Clone, Copy)]
+pub struct IndexColumn {
+    pub col: Option<usize>,
+    pub desc: bool,
+}
+
+/// One UNIQUE / PRIMARY KEY constraint set of a table, resolved
+/// to column indices (v0.3): the source of implicit indexes.
+#[derive(Debug, Clone)]
+pub struct AutoSet {
+    pub primary_key: bool,
+    pub columns: AVec<IndexColumn>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TableDef {
     pub name: ABytes,
@@ -32,10 +61,42 @@ pub struct TableDef {
     /// Index of the `INTEGER PRIMARY KEY` column (the rowid alias),
     /// when the table has exactly one.
     pub rowid_alias: Option<usize>,
+    /// UNIQUE / PK constraint sets in statement order (v0.3).
+    pub auto_sets: AVec<AutoSet>,
+}
+
+/// Where an index came from (v0.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOrigin {
+    /// `CREATE INDEX` — has stored SQL, may be dropped.
+    Explicit,
+    /// A UNIQUE / PRIMARY KEY constraint's implicit index
+    /// (`sqlite_autoindex_*`, SQL is NULL) — may not be dropped.
+    Auto,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub name: ABytes,
+    /// Owning table's name (the schema row's `tbl_name`).
+    pub table: ABytes,
+    pub root: u32,
+    /// Stored CREATE INDEX text; None for implicit indexes.
+    pub sql: Option<ABytes>,
+    pub unique: bool,
+    pub origin: IndexOrigin,
+    /// Key columns in order (the rowid is appended by the B-tree
+    /// layer, not listed here).
+    pub columns: AVec<IndexColumn>,
+    /// True when the index's definition uses features outside
+    /// v0.3 (see the module docs): it is listed but not
+    /// maintainable, and writes to its table are refused.
+    pub opaque: bool,
 }
 
 pub struct Catalog {
     pub tables: AVec<TableDef>,
+    pub indexes: AVec<IndexDef>,
     /// Schema cookie this catalog was built from.
     pub cookie: u32,
 }
@@ -44,6 +105,7 @@ impl Catalog {
     pub fn empty(cookie: u32) -> Catalog {
         Catalog {
             tables: AVec::new(),
+            indexes: AVec::new(),
             cookie,
         }
     }
@@ -52,6 +114,23 @@ impl Catalog {
         self.tables
             .iter()
             .find(|t| eq_ci(handle_bytes(arena, t.name), name))
+    }
+
+    pub fn find_index<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x IndexDef> {
+        self.indexes
+            .iter()
+            .find(|t| eq_ci(handle_bytes(arena, t.name), name))
+    }
+
+    /// All indexes (explicit and implicit) on one table.
+    pub fn indexes_for<'x>(
+        &'x self,
+        arena: &'x Arena,
+        table: &'x [u8],
+    ) -> impl Iterator<Item = &'x IndexDef> + 'x {
+        self.indexes
+            .iter()
+            .filter(move |i| eq_ci(handle_bytes(arena, i.table), table))
     }
 }
 
@@ -72,47 +151,117 @@ fn intern_literal(
     })
 }
 
+/// One raw `sqlite_schema` row, in scan (creation) order.
+struct SchemaRow {
+    ty: AVec<u8>,
+    name: AVec<u8>,
+    tbl_name: AVec<u8>,
+    root: u32,
+    sql: Option<AVec<u8>>,
+}
+
+fn copy_avec(b: &[u8]) -> AVec<u8> {
+    let mut a = AVec::new();
+    a.extend_from_slice(b);
+    a
+}
+
+/// Resolve an index column name against a table: a real column
+/// index, or None for the rowid pseudo-column (including the
+/// rowid-alias column, canonicalised). Err(()) = unknown column.
+#[cfg(feature = "indexes")]
+fn resolve_index_column(
+    arena: &Arena,
+    t: &TableDef,
+    name: &[u8],
+) -> core::result::Result<Option<usize>, ()> {
+    for (i, c) in t.columns.iter().enumerate() {
+        if eq_ci(handle_bytes(arena, c.name), name) {
+            if Some(i) == t.rowid_alias {
+                return Ok(None);
+            }
+            return Ok(Some(i));
+        }
+    }
+    if eq_ci(name, b"rowid") || eq_ci(name, b"oid") || eq_ci(name, b"_rowid_") {
+        return Ok(None);
+    }
+    Err(())
+}
+
 /// Build the catalog by scanning `sqlite_schema` (root page 1).
 pub async fn build_catalog<S: Storage>(
     pager: &mut Pager<S>,
     catalog_arena: &Arena,
 ) -> Result<Catalog, S::Error> {
+    // Pass 0: collect the raw schema rows (tables must be built
+    // before indexes can resolve their columns).
+    let mut rows: AVec<SchemaRow> = AVec::new();
+    {
+        let mut cursor = ScanCursor::new(1);
+        while let Some((_rowid, payload)) = cursor.next_row(pager).await? {
+            let values = decode_record::<S::Error>(payload.as_slice(), 5)?;
+            if values.len() < 5 {
+                continue;
+            }
+            let (Value::Text(ty), Value::Text(name), Value::Text(tbl_name), Value::Integer(root)) = (
+                &values.as_slice()[0],
+                &values.as_slice()[1],
+                &values.as_slice()[2],
+                &values.as_slice()[3],
+            ) else {
+                continue;
+            };
+            let sql = match &values.as_slice()[4] {
+                Value::Text(s) => Some(copy_avec(s)),
+                _ => None,
+            };
+            rows.push(SchemaRow {
+                ty: copy_avec(ty),
+                name: copy_avec(name),
+                tbl_name: copy_avec(tbl_name),
+                root: *root as u32,
+                sql,
+            });
+        }
+    }
+
     let mut catalog = Catalog::empty(pager.schema_cookie());
-    let mut cursor = ScanCursor::new(1);
     // Scratch arena for parse trees (names are interned out of it
     // into the catalog arena before the next row).
     let scratch = Arena::new(crate::error::Scope::Statement, 0, 1 << 20);
-    while let Some((_rowid, payload)) = cursor.next_row(pager).await? {
-        let values = decode_record::<S::Error>(payload.as_slice(), 5)?;
-        if values.len() < 5 {
-            continue;
+
+    // Pass 1: tables (+ their constraint sets).
+    for row in rows.iter() {
+        if !eq_ci(row.ty.as_slice(), b"table") || row.sql.is_none() {
+            continue; // indexes in pass 2; views/triggers not hipp objects
         }
-        let (Value::Text(ty), Value::Text(name), Value::Integer(root), Value::Text(sql)) = (
-            &values.as_slice()[0],
-            &values.as_slice()[1],
-            &values.as_slice()[3],
-            &values.as_slice()[4],
-        ) else {
-            continue;
-        };
-        if !eq_ci(ty, b"table") {
-            continue; // indexes/views/triggers: not v0.1 objects
-        }
+        let sql = row.sql.as_ref().expect("checked");
         scratch.reset();
-        let ast = parse::<S::Error>(sql, &scratch)?;
-        let Ast::CreateTable { columns, .. } = ast else {
+        let ast = parse::<S::Error>(sql.as_slice(), &scratch)?;
+        let Ast::CreateTable {
+            columns,
+            pk_columns,
+            constraint_sets,
+            ..
+        } = ast
+        else {
             return Err(Error::CorruptRecord);
         };
         let mut cols: AVec<Column> = AVec::new();
-        let mut pk_count = 0usize;
         let mut alias = None;
         for (i, c) in columns.iter().enumerate() {
             let decl_bytes = handle_bytes(&scratch, c.decl);
-            let is_alias = c.primary_key && eq_ci(trim(decl_bytes), b"INTEGER");
-            if c.primary_key {
-                pk_count += 1;
-            }
-            if is_alias {
+            // Rowid alias rule: exactly one PK column (below), of
+            // declared type exactly INTEGER, not written DESC.
+            if pk_columns.len() == 1
+                && eq_ci(
+                    handle_bytes(&scratch, c.name),
+                    handle_bytes(&scratch, pk_columns.as_slice()[0]),
+                )
+                && !c.pk_desc
+                && eq_ci(trim(decl_bytes), b"INTEGER")
+            {
                 alias = Some(i);
             }
             cols.push(Column {
@@ -125,20 +274,195 @@ pub async fn build_catalog<S: Storage>(
                 },
             });
         }
-        // Rowid alias rule: exactly one PK column, of declared type
-        // exactly INTEGER (the parser already excluded the
-        // `PRIMARY KEY DESC` quirk).
-        let rowid_alias = if pk_count == 1 { alias } else { None };
+        let rowid_alias = alias;
+        #[cfg(feature = "indexes")]
+        let auto_sets = resolve_auto_sets(
+            &scratch,
+            catalog_arena,
+            cols.as_slice(),
+            constraint_sets.as_slice(),
+            &rowid_alias,
+            &pk_columns,
+        );
+        #[cfg(not(feature = "indexes"))]
+        let auto_sets: AVec<AutoSet> = AVec::new();
+        #[cfg(not(feature = "indexes"))]
+        let _ = (constraint_sets, pk_columns);
         catalog.tables.push(TableDef {
-            name: intern(catalog_arena, name)?,
-            root: *root as u32,
-            sql: intern(catalog_arena, sql)?,
+            name: intern(catalog_arena, row.name.as_slice())?,
+            root: row.root,
+            sql: intern(catalog_arena, sql.as_slice())?,
             columns: cols,
             rowid_alias,
+            auto_sets,
         });
+    }
+
+    // Pass 2: indexes.
+    for row in rows.iter() {
+        if !eq_ci(row.ty.as_slice(), b"index") {
+            continue;
+        }
+        let Some(t) = catalog
+            .tables
+            .iter()
+            .find(|t| eq_ci(handle_bytes(catalog_arena, t.name), row.tbl_name.as_slice()))
+            .cloned()
+        else {
+            continue; // index on a table hipp did not load
+        };
+        // Without the `indexes` feature the catalog only records
+        // that an index exists (reads still work; the tiny
+        // profile never maintains or enforces indexes).
+        #[cfg(not(feature = "indexes"))]
+        {
+            let _ = &t;
+            catalog.indexes.push(IndexDef {
+                name: intern(catalog_arena, row.name.as_slice())?,
+                table: intern(catalog_arena, row.tbl_name.as_slice())?,
+                root: row.root,
+                sql: match &row.sql {
+                    Some(sql) => Some(intern(catalog_arena, sql.as_slice())?),
+                    None => None,
+                },
+                unique: false,
+                origin: if row.sql.is_some() {
+                    IndexOrigin::Explicit
+                } else {
+                    IndexOrigin::Auto
+                },
+                columns: AVec::new(),
+                opaque: true,
+            });
+            continue;
+        }
+        #[cfg(feature = "indexes")]
+        match &row.sql {
+            Some(sql) => {
+                // Explicit index: re-parse its CREATE INDEX.
+                scratch.reset();
+                let parsed = parse::<S::Error>(sql.as_slice(), &scratch);
+                let mut idx = IndexDef {
+                    name: intern(catalog_arena, row.name.as_slice())?,
+                    table: intern(catalog_arena, row.tbl_name.as_slice())?,
+                    root: row.root,
+                    sql: Some(intern(catalog_arena, sql.as_slice())?),
+                    unique: false,
+                    origin: IndexOrigin::Explicit,
+                    columns: AVec::new(),
+                    opaque: false,
+                };
+                match parsed {
+                    Ok(Ast::CreateIndex {
+                        unique, columns, ..
+                    }) => {
+                        idx.unique = unique;
+                        let mut ok = true;
+                        for cd in columns.iter() {
+                            let nb = handle_bytes(&scratch, cd.name);
+                            match resolve_index_column(catalog_arena, &t, nb) {
+                                Ok(col) => idx.columns.push(IndexColumn { col, desc: cd.desc }),
+                                Err(()) => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        idx.opaque = !ok;
+                    }
+                    _ => {
+                        // Unparseable by the v0.3 grammar
+                        // (expressions, partial, collations, ...).
+                        idx.opaque = true;
+                    }
+                }
+                catalog.indexes.push(idx);
+            }
+            None => {
+                // Implicit index: consume the next unclaimed
+                // constraint set of the owning table, in order.
+                let pos = catalog
+                    .indexes
+                    .iter()
+                    .filter(|i| {
+                        i.origin == IndexOrigin::Auto
+                            && eq_ci(
+                                handle_bytes(catalog_arena, i.table),
+                                row.tbl_name.as_slice(),
+                            )
+                    })
+                    .count();
+                let set = t.auto_sets.as_slice().get(pos).cloned();
+                let (unique, columns, opaque) = match &set {
+                    Some(s) => (true, s.columns.clone(), false),
+                    None => (true, AVec::new(), true),
+                };
+                catalog.indexes.push(IndexDef {
+                    name: intern(catalog_arena, row.name.as_slice())?,
+                    table: intern(catalog_arena, row.tbl_name.as_slice())?,
+                    root: row.root,
+                    sql: None,
+                    unique,
+                    origin: IndexOrigin::Auto,
+                    columns,
+                    opaque,
+                });
+            }
+        }
     }
     catalog.cookie = pager.schema_cookie();
     Ok(catalog)
+}
+
+/// Constraint sets resolved to column indices (v0.3 index
+/// metadata). A set whose column does not resolve (corrupt
+/// foreign SQL) is kept out — its implicit index, if any,
+/// becomes opaque in pass 2.
+#[cfg(feature = "indexes")]
+fn resolve_auto_sets(
+    scratch: &Arena,
+    catalog_arena: &Arena,
+    cols: &[Column],
+    constraint_sets: &[ConstraintSet],
+    rowid_alias: &Option<usize>,
+    pk_columns: &AVec<ABytes>,
+) -> AVec<AutoSet> {
+    let mut auto_sets: AVec<AutoSet> = AVec::new();
+    for s in constraint_sets.iter() {
+        let mut set_cols: AVec<IndexColumn> = AVec::new();
+        let mut ok = true;
+        for cd in s.columns.iter() {
+            let nb = handle_bytes(scratch, cd.name);
+            match cols
+                .iter()
+                .position(|c| eq_ci(handle_bytes(catalog_arena, c.name), nb))
+            {
+                Some(i) => set_cols.push(IndexColumn {
+                    col: if Some(i) == *rowid_alias {
+                        None
+                    } else {
+                        Some(i)
+                    },
+                    desc: cd.desc,
+                }),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // The alias PK set needs no index at all.
+        if s.primary_key && rowid_alias.is_some() && pk_columns.len() == 1 {
+            continue;
+        }
+        if ok {
+            auto_sets.push(AutoSet {
+                primary_key: s.primary_key,
+                columns: set_cols,
+            });
+        }
+    }
+    auto_sets
 }
 
 fn trim(b: &[u8]) -> &[u8] {
