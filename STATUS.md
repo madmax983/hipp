@@ -4,6 +4,184 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.5 — UPDATE, DELETE, DROP TABLE + pager spill (2026-10-24)
+
+Pushed to GitHub (madmax983/hipp) via API replay under the
+conformance-loop mandate; remote tip + tree recorded in the loop
+status.
+
+### Scope shipped (SPEC §2 v0.5)
+
+- **UPDATE / DELETE / DROP TABLE** behind the `v05` cargo
+  feature (default on, implies `v04`; the tiny profile excludes
+  it). The write side deferred since v0.2 is now covered end to
+  end, with full index maintenance (insert-only before v0.5).
+- **Grammar** (oracle-probed): `UPDATE [OR IGNORE] t [[AS]
+  alias] SET col = expr, ... [WHERE expr]` and `DELETE FROM t
+  [[AS] alias] [WHERE expr]` with the v0.4 general expression
+  evaluator on both sides; SET targets are bare column names
+  (a qualified target is a syntax error in the oracle too);
+  `DROP TABLE [IF EXISTS] name`. OR REPLACE is parse-rejected,
+  UPDATE ... FROM / ORDER BY / LIMIT / RETURNING are not
+  supported (see honest notes).
+- **Executors**: matching rows are materialised first (the
+  row set stays stable while the tree is rewritten), SET
+  expressions evaluate against the ORIGINAL row, then each row
+  is applied as index-delete → row delete → row insert →
+  index-insert. Rowid / rowid-alias assignment follows the
+  oracle: integers move the row (collision → DuplicateRowid),
+  NULL or non-integer is a datatype-mismatch error (unlike
+  INSERT's NULL auto-assign). UNIQUE pre-checks run per unique
+  index before any page is touched; OR IGNORE skips a
+  conflicting row and continues. Statement atomicity is the
+  engine's existing rule (pager rollback on error).
+- **Index delete** (was insert-only): a recursive true-B-tree
+  delete. Interior-resident entries are replaced by their
+  predecessor (greatest entry of the left subtree) with the
+  replacement fit-checked BEFORE the predecessor is touched;
+  the entry's overflow chains are freed and re-owned
+  canonically. See the first root find for the rebuild
+  fallbacks.
+- **DROP TABLE**: every page of the table and its indexes
+  (including sqlite_autoindex trees and overflow chains)
+  returns to the freelist; schema rows (table + indexes) are
+  deleted and the schema cookie bumped. Name-kind refusals are
+  oracle-exact: DROP TABLE on a view and DROP VIEW on a table
+  are errors even under IF EXISTS (new `Error::IsView` /
+  `Error::IsTable` kinds); UPDATE/DELETE on a view is refused.
+  All three statements work inside explicit transactions,
+  including full rollback of a DROP TABLE.
+- **Pager spill** (SPEC §5.2, deferred until now): a dirty
+  frame can be written to the main file mid-transaction to
+  free a cache slot. The page's original is already journaled,
+  so this is SQLite's own protocol; rollback replays the
+  journal whenever a spill happened, and commit's page-write
+  stage loads spilled pages back instead of requiring them
+  resident. Wide write statements no longer die with
+  CacheExhausted at the default 16-frame cache (wide
+  multi-row INSERTs had the same cliff).
+
+### Root finds this milestone
+
+- **A non-root B-tree page may never be empty.** The first
+  delete implementation left emptied leaves linked (dividers
+  stay valid separators, or so the reasoning went); the
+  oracle's integrity_check rejects such trees. Bisected on
+  oracle-built 512-byte-page trees: deleting exactly the 29
+  rows of the first leaf corrupted the file, `id % 3 = 0`
+  deletes (no leaf empties) were clean. SQLite rebalances;
+  hipp's no-merge design **rebuilds the B-tree from its
+  surviving entries** when a delete would empty a non-root
+  leaf — the signal is raised before any mutation on that
+  path, and the rebuild skips only the original target
+  (payloads carried verbatim for tables; the index variant
+  collects decoded entries). The same rule covers the
+  predecessor dance: if removing the predecessor would empty
+  its leaf, the top level rebuilds without the target and the
+  predecessor survives in its leaf.
+- **`create_empty_root` silently dropped its page image at
+  commit** (latent since v0.2): it used `load` +
+  `mark_frame_dirty`, which neither journals the page nor
+  registers it in the commit write set — and the set flag
+  makes a later `dirty_page` skip registration entirely.
+  Harmless for its only previous caller (freshly allocated
+  pages are registered by the allocator); the table rebuild
+  resetting a live interior root was the first existing-page
+  caller, and the symptom was a tree page simultaneously on
+  the freelist. `create_empty_root` now goes through
+  `dirty_page`.
+- **SET expressions read the original row**: `SET b = 1,
+  b = b + 100` on b=10 yields 110 in the oracle (assignments
+  do not see each other), with the last assignment winning —
+  encoded in the executor and the tests.
+- **DROP VIEW on a table under IF EXISTS silently no-opped
+  in v0.4**; the oracle errors ("use DROP TABLE to delete
+  table t"). Fixed in the v0.5 kind checks.
+
+### Tests — 93, all green (v0.4: 76)
+
+- New `tests/write_side.rs` (15): UPDATE/DELETE differentials
+  both directions (hipp writes → oracle reads; oracle writes
+  → hipp reads and writes on), general expressions in SET and
+  WHERE, rowid/alias assignment rules (move, collision,
+  datatype mismatch), index maintenance incl. point lookups
+  through updated keys, mid-statement UNIQUE failure rolling
+  the whole statement back, OR IGNORE skips, deep 512-byte
+  trees built by each engine and mutated by the other,
+  overflow pages returning to the freelist and being reused
+  without file growth, DROP TABLE page return + schema rows
+  gone + name reuse, view/table name-kind refusal matrix,
+  and explicit-transaction commit/rollback of all three
+  statements.
+- New `hipp-cli/tests/cli_v05.rs` (2): a write-side corpus
+  byte-identical through the hipp and oracle CLIs; `.dump`
+  after UPDATE/DELETE/DROP TABLE replays into a fresh oracle
+  database and reads back identically.
+- First runs, reported as they happened: the suite opened at
+  11/15 — deep-tree deletes died with CacheExhausted (→ the
+  spill above), one test used a qualified SET target the
+  oracle also rejects, and deep deletes corrupted (→ the
+  empty-page invariant and the `create_empty_root` fix
+  above). The remaining failures were test-side arithmetic
+  (`'upd-' || 7` is `'upd-7'`, not `'upd-0007'`; a freelist
+  expectation that ignored the mid-statement rebuild).
+- A1–A11 stay green; clippy `--workspace --all-targets
+  -D warnings` clean; the full feature matrix (no-default,
+  std-only, v04-only, v05-only, indexes-only, indexes+v05)
+  compiles clean; `cargo fmt` applied with a clean tree.
+
+### §4.1 gates (re-measured)
+
+- Linked binary (tiny profile, thumbv7em): **.text 73,984 +
+  .rodata 14,952 = 88,936 B ≤ 128 KiB.**
+  **Delta vs v0.4's 88,336 B: +600 B** — under the 4 KiB
+  ratchet line. The v0.5 dialect itself contributes 0 B to
+  tiny (feature-gated out, like v04); the growth is the
+  ungated core machinery every profile shares: the pager
+  spill and the delete-rebuild path (`btree_delete` was
+  already ungated; its rebuild helper and
+  `collect_table_pages` now are too). Headroom left:
+  42,136 B.
+- Statics: `.bss` 98,308 B is again entirely the demo's caller
+  heap; **engine .data+.bss outside caller memory = 0 B
+  ≤ 8 KiB.**
+- Tiny-config RAM and zero steady-state scan allocations:
+  `tests/gates.rs` green (unchanged).
+
+### Honest notes / divergences
+
+- OR REPLACE is rejected at parse time (`Error::Parse`,
+  unsupported clause). The oracle deletes the conflicting
+  row and proceeds; the machinery to support it (delete on
+  conflict, reusing the OR IGNORE path) is a named follow-up,
+  not a silent gap.
+- UPDATE ... FROM is not supported (the FROM clause is
+  rejected as trailing input); correlated updates must be
+  written as expressions over the target row.
+- Subqueries in SET/WHERE and RETURNING remain unsupported,
+  as everywhere else in hipp (pre-existing).
+- Aggregates in SET/WHERE resolve during planning and are
+  refused with `Error::Unsupported` (the oracle raises a
+  misuse-of-aggregate error; hipp's errors are typed, not
+  text-matched, everywhere).
+- No merge or redistribution on delete: underfull pages stay
+  linked (format-legal, integrity-clean). A delete that
+  empties a non-root leaf rebuilds that B-tree — O(tree) for
+  that delete, so bulk range deletes are quadratic in the
+  worst case (divided by leaf capacity). An interior index
+  replacement whose predecessor payload cannot fit the
+  interior page also rebuilds.
+- UPDATE/DELETE materialise their matching rows before
+  rewriting (statement memory grows with matched rows; the
+  tiny profile has no write statements).
+- A failed statement inside an explicit transaction aborts
+  the whole bracket (pre-existing engine rule, stricter than
+  SQLite's statement-level rollback).
+- Spill writes dirty pages to the main file before commit;
+  within hipp's single-connection model (SPEC §5.1) the
+  journal keeps crash recovery exact, but a second opener
+  mid-transaction could observe uncommitted page images.
+
 ## v0.4 — joins, aggregates + GROUP BY, expressions, ALTER, inert views (2026-10-23)
 
 Pushed to GitHub (madmax983/hipp) via API replay under the

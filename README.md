@@ -8,15 +8,31 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.4 — joins, aggregates + GROUP BY, a general
-  expression evaluator, `ALTER TABLE ADD COLUMN`, and inert
-  views on the v0.3 foundation (SPEC §2).
+- **Phase:** v0.5 — UPDATE, DELETE, and DROP TABLE with full
+  index maintenance, on the v0.4 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.5 does
+
+- Everything v0.4 does (below), plus the write side behind the
+  `v05` feature (default on; the tiny profile excludes it):
+  `UPDATE` (with `OR IGNORE`, table aliases, and general
+  expressions that read the original row), `DELETE`, and
+  `DROP TABLE`, all with full index maintenance — updated and
+  deleted rows move through every index (including UNIQUE
+  autoindexes), dropped tables return every page to the
+  freelist, and rowid reassignment follows the oracle's rules.
+  Statement atomicity is preserved; name-kind refusals
+  (DROP TABLE on a view, DROP VIEW on a table) match the
+  oracle even under `IF EXISTS`.
+- The pager now spills dirty frames to the main file
+  mid-transaction (SPEC §5.2), so wide write statements no
+  longer exhaust the page cache.
 
 ## What v0.4 does
 
@@ -76,9 +92,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.4) |
+| Gate | Budget | Measured (v0.5) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **88,336 B** (Δ +3,812 B vs v0.3's 84,524 B; the whole v0.4 query engine is feature-gated out of tiny) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **88,936 B** (Δ +600 B vs v0.4's 88,336 B; the v0.5 dialect is feature-gated out of tiny — the delta is the ungated pager spill + delete-rebuild core) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
