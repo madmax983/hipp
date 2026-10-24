@@ -184,6 +184,11 @@ pub struct Pager<S: Storage> {
     cache_cap: usize,
     sidecar: Option<S::Sidecar>,
     stage: CommitStage,
+    /// A dirty frame was spilled to the main file mid-transaction
+    /// to free a cache slot (v0.5; see `spill_one`). While set, a
+    /// rollback must replay the journal — the cheap
+    /// nothing-has-moved path no longer holds.
+    spilled: bool,
     /// Header snapshot taken when the write txn opens (v0.2): a
     /// rollback from the `Writing` stage restores schema cookie,
     /// freelist and page count in memory too, not just via the
@@ -302,6 +307,7 @@ impl<S: Storage> Pager<S> {
                 cache_cap,
                 sidecar: Some(sidecar),
                 stage: CommitStage::Idle,
+                spilled: false,
                 txn_header: None,
                 orig_page_count: header.page_count,
                 dirty: Vec::new(),
@@ -363,7 +369,10 @@ impl<S: Storage> Pager<S> {
         };
         let vi = match victim {
             Some(i) => i,
-            None => return Err(Error::CacheExhausted),
+            None => match self.spill_one().await? {
+                Some(i) => i,
+                None => return Err(Error::CacheExhausted),
+            },
         };
         let ps = self.header.page_size as usize;
         let off = u64::from(page - 1) * ps as u64;
@@ -377,6 +386,30 @@ impl<S: Storage> Pager<S> {
         self.frames[vi].dirty = false;
         self.frames[vi].clock_ref = true;
         Ok(vi)
+    }
+
+    /// Spill one dirty frame to the main file to free a cache
+    /// slot (SPEC §5.2's spill, landed in v0.5): the page's
+    /// original is already in the rollback journal, so writing
+    /// its current image early is exactly SQLite's protocol —
+    /// a crash is recovered from the journal, a rollback replays
+    /// it, and commit writes the final image regardless. The
+    /// page stays in the dirty list; only the frame is released.
+    /// Returns the freed frame index, or None when no frame is
+    /// dirty (the cache is genuinely exhausted).
+    async fn spill_one(&mut self) -> Result<Option<usize>, S::Error> {
+        let Some(i) = self.frames.iter().position(|f| f.dirty) else {
+            return Ok(None);
+        };
+        let page = self.frames[i].page;
+        let off = u64::from(page - 1) * u64::from(self.header.page_size);
+        self.storage
+            .write_at(off, &self.frames[i].data)
+            .await
+            .map_err(Error::Storage)?;
+        self.frames[i].dirty = false;
+        self.spilled = true;
+        Ok(Some(i))
     }
 
     /// Frame access after `load` (no I/O).
@@ -676,11 +709,14 @@ impl<S: Storage> Pager<S> {
         } else if let Some(i) = self.frames.iter().position(|f| f.page == 0) {
             i
         } else {
-            // Evict a clean frame (dirty frames are never evicted —
-            // spill is deferred, SPEC §5.2).
+            // Evict a clean frame; if there is none, spill a
+            // dirty one (SPEC §5.2 spill, v0.5).
             match self.frames.iter().position(|f| !f.dirty) {
                 Some(i) => i,
-                None => return Err(Error::CacheExhausted),
+                None => match self.spill_one().await? {
+                    Some(i) => i,
+                    None => return Err(Error::CacheExhausted),
+                },
             }
         };
         for b in self.frames[idx].data.iter_mut() {
@@ -744,7 +780,12 @@ impl<S: Storage> Pager<S> {
                         continue;
                     }
                     let page = self.dirty[next];
-                    let idx = self.find_frame(page).ok_or(Error::CacheExhausted)?;
+                    // The page may have been spilled out of the
+                    // cache mid-transaction; load restores it —
+                    // its on-disk image is current (the spill
+                    // wrote it, and nothing else writes the main
+                    // file during a transaction).
+                    let idx = self.load(page).await?;
                     let ps = self.header.page_size as u64;
                     let off = u64::from(page - 1) * ps;
                     // Disjoint field borrows again: the frame image
@@ -774,6 +815,7 @@ impl<S: Storage> Pager<S> {
                     self.dirty.clear();
                     self.journaled.clear();
                     self.journal_len = 0;
+                    self.spilled = false;
                     self.txn_header = None;
                     self.stage = CommitStage::Idle;
                     self.txn_arena.reset();
@@ -791,7 +833,7 @@ impl<S: Storage> Pager<S> {
     pub async fn rollback(&mut self) -> Result<(), S::Error> {
         match self.stage {
             CommitStage::Idle => return Ok(()),
-            CommitStage::Writing => {
+            CommitStage::Writing if !self.spilled => {
                 let sidecar = self.sidecar.as_mut().expect("sidecar from open");
                 sidecar.delete().await.map_err(Error::Storage)?;
                 // No data page has moved: restore the in-memory
@@ -830,6 +872,7 @@ impl<S: Storage> Pager<S> {
         self.dirty.clear();
         self.journaled.clear();
         self.journal_len = 0;
+        self.spilled = false;
         self.stage = CommitStage::Idle;
         self.txn_arena.reset();
         Ok(())
