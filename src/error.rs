@@ -46,6 +46,13 @@ pub enum SchemaKind {
     UnknownView,
     /// `CREATE VIEW` named an object that already exists (v0.4).
     DuplicateView,
+    /// A statement that needs a table named a view instead:
+    /// `DROP TABLE` / `UPDATE` / `DELETE` on a view (v0.5; the
+    /// oracle refuses these even under IF EXISTS).
+    IsView,
+    /// `DROP VIEW` named a table instead of a view (v0.5; the
+    /// oracle refuses this even under IF EXISTS).
+    IsTable,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

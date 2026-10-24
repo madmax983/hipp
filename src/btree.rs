@@ -16,7 +16,7 @@ use crate::record::{decode_varint, encode_varint};
 use crate::storage::Storage;
 
 #[cfg(feature = "indexes")]
-use crate::record::{OwnedValue, compare_values, decode_record};
+use crate::record::{OwnedValue, Value, compare_values, decode_record, encode_record};
 
 pub const KIND_INTERIOR_INDEX: u8 = 0x02;
 pub const KIND_INTERIOR_TABLE: u8 = 0x05;
@@ -1005,18 +1005,17 @@ async fn finish_root_split<S: Storage>(
 }
 
 // ----------------------------------------------------------------
-// Table B-tree row deletion (v0.3) — used only for sqlite_schema
-// row removal (DROP INDEX). No merge/redistribution: a leaf that
-// loses its last cell stays in the tree as an empty page, which
-// keeps every ancestor divider a valid separator (it was the max
-// of the leaf's keys; remaining keys are smaller, the next
-// subtree's are larger). Overflow pages of the removed row are
-// returned to the freelist.
+// Table B-tree row deletion (v0.3 for sqlite_schema rows; v0.5
+// general DELETE/UPDATE/DROP TABLE use). No merge/redistribution:
+// a leaf that loses its last cell stays in the tree as an empty
+// page, which keeps every ancestor divider a valid separator (it
+// was the max of the leaf's keys; remaining keys are smaller, the
+// next subtree's are larger). Overflow pages of the removed row
+// are returned to the freelist.
 // ----------------------------------------------------------------
 
 /// Delete the row `rowid` from the table rooted at `root`.
 /// Returns whether a row was present.
-#[cfg(feature = "indexes")]
 pub async fn btree_delete<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -1097,7 +1096,7 @@ pub async fn btree_delete<S: Storage>(
 /// Local-payload byte count for an index cell (SQFMT §1.6):
 /// X = ((U-12)*64/255)-23; if P > X, M = ((U-12)*32/255)-23 and
 /// K = M + ((P-M) mod (U-4)); keep K if K <= X else M.
-#[cfg(feature = "indexes")]
+#[cfg(any(feature = "indexes", feature = "v05"))]
 pub fn index_local(usable: usize, payload_len: usize) -> usize {
     let x = (usable - 12) * 64 / 255 - 23;
     if payload_len <= x {
@@ -1109,7 +1108,7 @@ pub fn index_local(usable: usize, payload_len: usize) -> usize {
 }
 
 /// One parsed index cell (leaf or interior).
-#[cfg(feature = "indexes")]
+#[cfg(any(feature = "indexes", feature = "v05"))]
 #[derive(Clone)]
 pub struct IndexCell {
     /// Left child page (interior cells only; 0 in leaf cells).
@@ -1124,14 +1123,14 @@ pub struct IndexCell {
     pub payload_off: usize,
 }
 
-#[cfg(feature = "indexes")]
+#[cfg(any(feature = "indexes", feature = "v05"))]
 impl IndexCell {
     pub fn local_bytes(&self) -> &[u8] {
         &self.bytes.as_slice()[self.payload_off..self.payload_off + self.local_len]
     }
 }
 
-#[cfg(feature = "indexes")]
+#[cfg(any(feature = "indexes", feature = "v05"))]
 fn parse_index_cell<E>(
     bytes: &[u8],
     at: usize,
@@ -1181,7 +1180,7 @@ fn parse_index_cell<E>(
 }
 
 /// Parse all cells of an index leaf page.
-#[cfg(feature = "indexes")]
+#[cfg(any(feature = "indexes", feature = "v05"))]
 pub fn index_leaf_cells<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec<IndexCell>, E> {
     let h = head::<E>(bytes, page)?;
     if h.kind != KIND_LEAF_INDEX {
@@ -1197,7 +1196,7 @@ pub fn index_leaf_cells<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVe
 
 /// Parse an index interior page: cells (each with its left child)
 /// plus the rightmost child.
-#[cfg(feature = "indexes")]
+#[cfg(any(feature = "indexes", feature = "v05"))]
 pub fn index_interior_cells<E>(
     bytes: &[u8],
     page: u32,
@@ -1995,7 +1994,7 @@ pub async fn index_first_with_prefix<S: Storage>(
 
 /// Every page of the index rooted at `root`: B-tree pages plus
 /// all overflow chains (DROP INDEX frees exactly this set).
-#[cfg(feature = "indexes")]
+#[cfg(any(feature = "indexes", feature = "v05"))]
 pub async fn collect_index_pages<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -2039,4 +2038,360 @@ pub async fn collect_index_pages<S: Storage>(
         }
     }
     Ok(out)
+}
+
+// ----------------------------------------------------------------
+// Table page collection (v0.5) — DROP TABLE frees exactly the set
+// collect_table_pages returns: every B-tree page of the table
+// plus every overflow chain hanging off its cells.
+// ----------------------------------------------------------------
+
+/// Every page of the table rooted at `root`: B-tree pages plus
+/// all overflow chains.
+#[cfg(feature = "v05")]
+pub async fn collect_table_pages<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+) -> Result<AVec<u32>, S::Error> {
+    let usable = pager.usable() as usize;
+    let mut out: AVec<u32> = AVec::new();
+    let mut stack: AVec<u32> = AVec::new();
+    stack.push(root);
+    while let Some(page) = stack.pop() {
+        out.push(page);
+        let idx = pager.load(page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        match h.kind {
+            KIND_LEAF_TABLE => {
+                let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                for c in cells.iter() {
+                    let mut next = c.overflow;
+                    let mut hops = 0u32;
+                    while next != 0 {
+                        hops += 1;
+                        if hops > pager.page_count() + 1 {
+                            return Err(Error::OverflowChainCycle);
+                        }
+                        out.push(next);
+                        let oi = pager.load(next).await?;
+                        next = be_u32(pager.frame_data(oi), 0);
+                    }
+                }
+            }
+            KIND_INTERIOR_TABLE => {
+                let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
+                for (child, _) in pairs.iter() {
+                    stack.push(*child);
+                }
+                if rightmost != 0 {
+                    stack.push(rightmost);
+                }
+            }
+            _ => return Err(Error::CorruptPage { page }),
+        }
+    }
+    Ok(out)
+}
+
+// ----------------------------------------------------------------
+// Index B-tree deletion (v0.5, feature `indexes`).
+//
+// Index B-trees are true B-trees: the key being deleted may live
+// in an interior page. The classic remedy is applied: replace an
+// interior key with its predecessor (the greatest entry of its
+// left subtree), then delete that predecessor below — each round
+// strictly descends, so the loop terminates at a leaf. No merge
+// or redistribution: pages left underfull stay linked, which the
+// format allows and `integrity_check` accepts (the same posture
+// as table deletion). The one structural corner — a replacement
+// key too large for its interior page — falls back to rebuilding
+// the index without the entry (correct, and vanishingly rare:
+// it needs an oversized predecessor and a full interior page).
+// ----------------------------------------------------------------
+
+/// Free one overflow chain, following next-pointers to 0.
+#[cfg(feature = "indexes")]
+async fn free_overflow_chain<S: Storage>(
+    pager: &mut Pager<S>,
+    first: u32,
+) -> Result<(), S::Error> {
+    let mut next = first;
+    let mut hops = 0u32;
+    while next != 0 {
+        hops += 1;
+        if hops > pager.page_count() + 1 {
+            return Err(Error::OverflowChainCycle);
+        }
+        let idx = pager.load(next).await?;
+        let following = be_u32(pager.frame_data(idx), 0);
+        pager.free_page(next).await?;
+        next = following;
+    }
+    Ok(())
+}
+
+/// Canonically re-encode a decoded index entry's payload (the
+/// record of its values). Byte-different from a foreign file's
+/// original encoding is fine: every comparison decodes first.
+#[cfg(feature = "indexes")]
+fn encode_entry_payload(e: &IndexEntry) -> AVec<u8> {
+    let mut vals: AVec<Value<'_>> = AVec::new();
+    for v in e.values.iter() {
+        vals.push(v.as_value());
+    }
+    let mut rec = AVec::new();
+    encode_record(vals.as_slice(), &mut rec);
+    rec
+}
+
+#[cfg(feature = "indexes")]
+enum FoundDelete {
+    Missing,
+    Leaf {
+        page: u32,
+        cells: AVec<IndexCell>,
+        pos: usize,
+    },
+    Interior {
+        page: u32,
+        cells: AVec<IndexCell>,
+        rightmost: u32,
+        pos: usize,
+    },
+}
+
+/// Rebuild the index rooted at `root` without the entry `skip`
+/// (the index_delete fallback): collect the surviving entries,
+/// free every page but the root, reset the root to an empty
+/// leaf, and re-insert. The root page number never changes.
+#[cfg(feature = "indexes")]
+async fn index_rebuild_without<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    desc: &[bool],
+    skip: &IndexEntry,
+) -> Result<(), S::Error> {
+    use core::cmp::Ordering;
+    let mut keep: AVec<AVec<u8>> = AVec::new();
+    {
+        let mut cur = IndexCursor::new(root, desc);
+        while let Some(e) = cur.next_entry(pager).await? {
+            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc)
+                == Ordering::Equal
+            {
+                continue;
+            }
+            keep.push(encode_entry_payload(&e));
+        }
+    }
+    let pages = collect_index_pages(pager, root).await?;
+    for p in pages.iter() {
+        if *p != root {
+            pager.free_page(*p).await?;
+        }
+    }
+    let empty: &[IndexCell] = &[];
+    write_index_page(pager, root, empty, 0, false, false).await?;
+    for p in keep.iter() {
+        index_insert(pager, root, p.as_slice(), desc).await?;
+    }
+    Ok(())
+}
+
+/// Delete the entry whose full key is `payload` (key columns +
+/// rowid) from the index rooted at `root`. Returns whether an
+/// entry was present.
+#[cfg(feature = "indexes")]
+pub async fn index_delete<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    payload: &[u8],
+    desc: &[bool],
+) -> Result<bool, S::Error> {
+    use core::cmp::Ordering;
+    let usable = pager.usable() as usize;
+    let nfields = desc.len() + 1;
+    let mut target = decode_index_entry::<S::Error>(payload, nfields)?;
+    let mut search_root = root;
+    let mut replaced = false;
+    loop {
+        // ---- descend from search_root looking for target ----
+        let mut page = search_root;
+        let found = loop {
+            let idx = pager.load(page).await?;
+            let snap = copy_bytes(pager.frame_data(idx));
+            let h = head::<S::Error>(snap.as_slice(), page)?;
+            if h.is_leaf() {
+                if h.kind != KIND_LEAF_INDEX {
+                    return Err(Error::Unsupported);
+                }
+                let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                let mut hit = None;
+                for (i, c) in cells.iter().enumerate() {
+                    let p = index_cell_payload(pager, c).await?;
+                    let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+                    if compare_entries(e.values.as_slice(), target.values.as_slice(), desc)
+                        == Ordering::Equal
+                    {
+                        hit = Some(i);
+                        break;
+                    }
+                }
+                break match hit {
+                    Some(pos) => FoundDelete::Leaf { page, cells, pos },
+                    None => FoundDelete::Missing,
+                };
+            }
+            if h.kind != KIND_INTERIOR_INDEX {
+                return Err(Error::Unsupported);
+            }
+            let (cells, rightmost) =
+                index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+            let mut next = None;
+            let mut hit = None;
+            for (i, c) in cells.iter().enumerate() {
+                let p = index_cell_payload(pager, c).await?;
+                let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+                match compare_entries(target.values.as_slice(), e.values.as_slice(), desc) {
+                    Ordering::Equal => {
+                        hit = Some(i);
+                        break;
+                    }
+                    Ordering::Less => {
+                        next = Some(c.child);
+                        break;
+                    }
+                    Ordering::Greater => {}
+                }
+            }
+            if let Some(pos) = hit {
+                break FoundDelete::Interior {
+                    page,
+                    cells,
+                    rightmost,
+                    pos,
+                };
+            }
+            page = next.unwrap_or(rightmost);
+        };
+        match found {
+            FoundDelete::Missing => {
+                // After a predecessor replacement the target was
+                // just read out of this subtree; missing then is
+                // an engine bug, never a silent "not found".
+                if replaced {
+                    return Err(Error::CorruptPage { page: search_root });
+                }
+                return Ok(false);
+            }
+            FoundDelete::Leaf { page, cells, pos } => {
+                let removed = cells.as_slice()[pos].clone();
+                let mut kept: AVec<IndexCell> = AVec::new();
+                for (i, c) in cells.iter().enumerate() {
+                    if i != pos {
+                        kept.push(c.clone());
+                    }
+                }
+                write_index_page(pager, page, kept.as_slice(), 0, false, false).await?;
+                if removed.overflow != 0 {
+                    free_overflow_chain(pager, removed.overflow).await?;
+                }
+                return Ok(true);
+            }
+            FoundDelete::Interior {
+                page: ipage,
+                cells,
+                rightmost,
+                pos,
+            } => {
+                let child = cells.as_slice()[pos].child;
+                // Predecessor: the greatest entry of the left
+                // subtree, via an in-order walk.
+                let pred = {
+                    let mut cur = IndexCursor::new(child, desc);
+                    let mut last: Option<IndexEntry> = None;
+                    while let Some(e) = cur.next_entry(pager).await? {
+                        last = Some(e);
+                    }
+                    last
+                };
+                let Some(pred) = pred else {
+                    // The left subtree holds no entries at all:
+                    // drop the cell and the subtree's (empty)
+                    // pages. Surviving cells keep their own left
+                    // children, which is exactly the in-order
+                    // sequence with the empty child removed.
+                    let sub = collect_index_pages(pager, child).await?;
+                    let mut kept: AVec<IndexCell> = AVec::new();
+                    for (i, c) in cells.iter().enumerate() {
+                        if i != pos {
+                            kept.push(c.clone());
+                        }
+                    }
+                    write_index_page(pager, ipage, kept.as_slice(), rightmost, true, false)
+                        .await?;
+                    for p in sub.iter() {
+                        pager.free_page(*p).await?;
+                    }
+                    return Ok(true);
+                };
+                // Replace the interior cell with the predecessor
+                // (its own fresh overflow chain), then go delete
+                // the predecessor from the left subtree.
+                let pred_payload = encode_entry_payload(&pred);
+                let local_len = index_local(usable, pred_payload.len());
+                let ovf = write_overflow(pager, pred_payload.as_slice(), local_len).await?;
+                let mut cell_bytes = AVec::new();
+                for b in child.to_be_bytes() {
+                    cell_bytes.push(b);
+                }
+                encode_varint(pred_payload.len() as u64, &mut cell_bytes);
+                for b in &pred_payload.as_slice()[..local_len] {
+                    cell_bytes.push(*b);
+                }
+                if ovf != 0 {
+                    for b in ovf.to_be_bytes() {
+                        cell_bytes.push(b);
+                    }
+                }
+                let new_cell = IndexCell {
+                    child,
+                    payload_off: cell_bytes.len()
+                        - local_len
+                        - if ovf != 0 { 4 } else { 0 },
+                    bytes: cell_bytes,
+                    payload_len: pred_payload.len(),
+                    local_len,
+                    overflow: ovf,
+                };
+                let mut ncells: AVec<IndexCell> = AVec::new();
+                for (i, c) in cells.iter().enumerate() {
+                    ncells.push(if i == pos {
+                        new_cell.clone()
+                    } else {
+                        c.clone()
+                    });
+                }
+                if index_page_need(ncells.as_slice(), 0, true) > usable {
+                    // The replacement does not fit this interior
+                    // page: free the fresh chain and rebuild.
+                    if ovf != 0 {
+                        free_overflow_chain(pager, ovf).await?;
+                    }
+                    index_rebuild_without(pager, root, desc, &target).await?;
+                    return Ok(true);
+                }
+                let old_ovf = cells.as_slice()[pos].overflow;
+                write_index_page(pager, ipage, ncells.as_slice(), rightmost, true, false)
+                    .await?;
+                if old_ovf != 0 {
+                    free_overflow_chain(pager, old_ovf).await?;
+                }
+                replaced = true;
+                target = pred;
+                search_root = child;
+            }
+        }
+    }
 }

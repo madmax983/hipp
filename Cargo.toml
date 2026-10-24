@@ -4,13 +4,13 @@ resolver = "2"
 
 [package]
 name = "hipp"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
-default = ["std", "indexes", "v04"]
+default = ["std", "indexes", "v04", "v05"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
 # Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
@@ -21,6 +21,11 @@ indexes = []
 # expression evaluator, ALTER TABLE ADD COLUMN, inert views. The
 # tiny profile (--no-default-features) excludes it per §2.
 v04 = []
+# v0.5 write-side dialect: UPDATE, DELETE, DROP TABLE with full
+# index maintenance. Builds on the v0.4 expression evaluator for
+# SET/WHERE expressions, so it implies `v04`. The tiny profile
+# excludes it per §2.
+v05 = ["v04"]
 
 [dependencies]
 

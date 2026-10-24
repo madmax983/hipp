@@ -609,8 +609,9 @@ impl<S: Storage> Pager<S> {
     }
 
     /// Return `page` to the freelist (SQFMT §1.3.8; v0.3 — the
-    /// producer is DROP INDEX). The format's rules, mirrored from
-    /// observed oracle behaviour:
+    /// first producer was DROP INDEX; v0.5 adds DELETE / DROP
+    /// TABLE). The format's rules, mirrored from observed oracle
+    /// behaviour:
     /// - an empty freelist: the page becomes the trunk (next = 0,
     ///   leaf count = 0);
     /// - a trunk with room: the page is appended to its leaf array
@@ -625,7 +626,6 @@ impl<S: Storage> Pager<S> {
     /// A page turned into a trunk IS modified (its first 8
     /// bytes), so it goes through `dirty_page` and is journaled
     /// first.
-    #[cfg(feature = "indexes")]
     pub async fn free_page(&mut self, page: u32) -> Result<(), S::Error> {
         if page < 2 || page > self.header.page_count {
             return Err(Error::PageOutOfRange { page });
