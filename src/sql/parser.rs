@@ -168,6 +168,10 @@ impl<'a> Parser<'a> {
             self.alter_dispatch::<E>()
         } else if self.cur_is_kw(b"INSERT") {
             self.insert::<E>()
+        } else if self.cur_is_kw(b"UPDATE") {
+            self.update_dispatch::<E>()
+        } else if self.cur_is_kw(b"DELETE") {
+            self.delete_dispatch::<E>()
         } else if self.cur_is_kw(b"SELECT") {
             self.select::<E>()
         } else if self.cur_is_kw(b"BEGIN") {
@@ -222,13 +226,51 @@ impl<'a> Parser<'a> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
-    /// DROP dispatch: VIEW (v0.4) or INDEX (v0.3).
+    /// DROP dispatch: VIEW (v0.4), TABLE (v0.5), or INDEX (v0.3).
     fn drop_dispatch<E>(&mut self) -> Result<Ast, E> {
         if self.is_kw(self.pos + 1, b"VIEW") {
             self.drop_view_dispatch::<E>()
+        } else if self.is_kw(self.pos + 1, b"TABLE") {
+            self.drop_table_dispatch::<E>()
         } else {
             self.drop_index_dispatch::<E>()
         }
+    }
+
+    // ---------------- v0.5 statement shims ----------------
+    // UPDATE, DELETE and DROP TABLE exist only under the `v05`
+    // feature (the tiny profile's documented exclusion, SPEC §2);
+    // the parsers live at the bottom of this file behind the
+    // same cfg.
+
+    #[cfg(feature = "v05")]
+    fn update_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.update_stmt::<E>()
+    }
+
+    #[cfg(not(feature = "v05"))]
+    fn update_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
+    #[cfg(feature = "v05")]
+    fn delete_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.delete_stmt::<E>()
+    }
+
+    #[cfg(not(feature = "v05"))]
+    fn delete_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
+    #[cfg(feature = "v05")]
+    fn drop_table_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.drop_table::<E>()
+    }
+
+    #[cfg(not(feature = "v05"))]
+    fn drop_table_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
     // ---------------- v0.4 statement shims ----------------
@@ -1519,4 +1561,105 @@ fn trim(b: &[u8]) -> &[u8] {
         e -= 1;
     }
     &b[s..e]
+}
+
+// ================= v0.5 grammar (feature = "v05") =================
+
+#[cfg(feature = "v05")]
+impl<'a> Parser<'a> {
+    /// A bare column name with no qualifier: SQLite rejects
+    /// `SET t.col = ...` as a syntax error (oracle-verified), so
+    /// unlike `name()` a following `.` is an error, not a
+    /// schema qualifier to discard.
+    fn plain_name<E>(&mut self) -> Result<ABytes, E> {
+        match self.cur().tok {
+            Tok::Ident(h, _) => {
+                self.pos += 1;
+                if self.cur().tok == Tok::Dot {
+                    return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+                }
+                Ok(h)
+            }
+            _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+        }
+    }
+
+    fn update_stmt<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"UPDATE")?;
+        let mut or_ignore = false;
+        if self.eat_kw(b"OR") {
+            if self.eat_kw(b"IGNORE") {
+                or_ignore = true;
+            } else if self.eat_kw(b"REPLACE") {
+                // OR REPLACE deletes the conflicting row; a later
+                // phase. Rejected by name rather than mis-parsed.
+                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+            } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"FAIL") || self.eat_kw(b"ROLLBACK"))
+            {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+            // OR ABORT / FAIL / ROLLBACK: the engine's default
+            // (abort the statement) — nothing to record.
+        }
+        let table = self.name::<E>()?;
+        // The alias is optional, but `SET` must not be eaten as
+        // one (it is not in the clause-keyword stop list).
+        let alias = if self.cur_is_kw(b"SET") {
+            None
+        } else {
+            self.opt_alias()
+        };
+        self.expect_kw::<E>(b"SET")?;
+        let mut assignments: AVec<(ABytes, Expr)> = AVec::new();
+        loop {
+            let col = self.plain_name::<E>()?;
+            self.expect::<E>(Tok::Eq)?;
+            let e = self.parse_expr::<E>()?;
+            assignments.push((col, e));
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        let filter = if self.eat_kw(b"WHERE") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        // UPDATE ... FROM, ORDER BY/LIMIT (the oracle build
+        // rejects those too) and RETURNING are later phases;
+        // parse()'s expect_end rejects any trailing input.
+        Ok(Ast::Update {
+            table,
+            alias,
+            or_ignore,
+            assignments,
+            filter,
+        })
+    }
+
+    fn delete_stmt<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"DELETE")?;
+        self.expect_kw::<E>(b"FROM")?;
+        let table = self.name::<E>()?;
+        let filter = if self.eat_kw(b"WHERE") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        Ok(Ast::Delete { table, filter })
+    }
+
+    fn drop_table<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"DROP")?;
+        self.expect_kw::<E>(b"TABLE")?;
+        let if_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        Ok(Ast::DropTable { name, if_exists })
+    }
 }

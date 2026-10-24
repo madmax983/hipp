@@ -214,6 +214,32 @@ pub enum Ast {
         /// the pre-v0.4 grammar), evaluated with no row context.
         rows: AVec<AVec<Expr>>,
     },
+    /// `UPDATE [OR IGNORE] <t> [[AS] <alias>] SET <col> = <expr>,
+    /// ... [WHERE <expr>]` (v0.5). SET expressions and the filter
+    /// evaluate against each row's original values (SQLite's
+    /// rule, oracle-verified); duplicate SET columns are allowed
+    /// and the last assignment wins.
+    Update {
+        table: ABytes,
+        alias: Option<ABytes>,
+        /// `OR IGNORE`: rows whose update would violate a UNIQUE
+        /// constraint are skipped instead of failing the
+        /// statement. (`OR REPLACE` is parse-rejected in v0.5;
+        /// ABORT/FAIL/ROLLBACK are the default semantics.)
+        or_ignore: bool,
+        assignments: AVec<(ABytes, Expr)>,
+        filter: Option<Expr>,
+    },
+    /// `DELETE FROM <t> [WHERE <expr>]` (v0.5).
+    Delete {
+        table: ABytes,
+        filter: Option<Expr>,
+    },
+    /// `DROP TABLE [IF EXISTS] <name>` (v0.5).
+    DropTable {
+        name: ABytes,
+        if_exists: bool,
+    },
     Select(SelectStmt),
     /// `ALTER TABLE <t> ADD [COLUMN] <coldef>` (v0.4). `text` is
     /// the column definition exactly as written (SQL slice), used
