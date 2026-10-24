@@ -2437,11 +2437,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut dec: AVec<Value<'_>> = AVec::new();
             crate::record::decode_record_into::<S::Error>(buf.as_slice(), ncols, &mut dec)?;
             let mut rec = AVec::new();
-            for i in 0..ncols {
+            for (i, d) in defaults.iter().enumerate().take(ncols) {
                 rec.push(if i < dec.len() {
                     OwnedValue::from_value(dec.as_slice()[i])
                 } else {
-                    defaults[i].clone()
+                    d.clone()
                 });
             }
             if let Some(f) = filter {
@@ -2459,30 +2459,29 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "v05")]
     async fn exec_update(&mut self) -> Result<(), S::Error> {
-        let (root, rowid_alias, ncols, defaults, affs, sets, filter, or_ignore) =
-            match &self.plan {
-                Plan::Update {
-                    root,
-                    rowid_alias,
-                    ncols,
-                    defaults,
-                    affs,
-                    sets,
-                    filter,
-                    or_ignore,
-                    ..
-                } => (
-                    *root,
-                    *rowid_alias,
-                    *ncols,
-                    defaults.clone(),
-                    affs.clone(),
-                    sets.clone(),
-                    filter.clone(),
-                    *or_ignore,
-                ),
-                _ => unreachable!(),
-            };
+        let (root, rowid_alias, ncols, defaults, affs, sets, filter, or_ignore) = match &self.plan {
+            Plan::Update {
+                root,
+                rowid_alias,
+                ncols,
+                defaults,
+                affs,
+                sets,
+                filter,
+                or_ignore,
+                ..
+            } => (
+                *root,
+                *rowid_alias,
+                *ncols,
+                defaults.clone(),
+                affs.clone(),
+                sets.clone(),
+                filter.clone(),
+                *or_ignore,
+            ),
+            _ => unreachable!(),
+        };
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
             Plan::Update { indexes, .. } => indexes.clone(),
@@ -2499,7 +2498,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             .await?;
         for wrow in rows.iter() {
-            let rd = row_data_for(rowid_alias, affs.as_slice(), wrow.rec.as_slice(), wrow.rowid);
+            let rd = row_data_for(
+                rowid_alias,
+                affs.as_slice(),
+                wrow.rec.as_slice(),
+                wrow.rowid,
+            );
             // SET expressions evaluate against the ORIGINAL row
             // (oracle-verified: `SET b=1, b=b+100` adds 100 to
             // the old b); applying them in order makes the last
@@ -2520,7 +2524,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         _ => {
                             return Err(Error::Schema {
                                 kind: SchemaKind::DatatypeMismatch,
-                            })
+                            });
                         }
                     },
                     Target::Col(i) => {
@@ -2531,7 +2535,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                                 _ => {
                                     return Err(Error::Schema {
                                         kind: SchemaKind::DatatypeMismatch,
-                                    })
+                                    });
                                 }
                             }
                             // The alias column's record field

@@ -163,7 +163,9 @@ fn update_delete_oracle_writes_hipp_reads_and_writes() {
 fn update_where_general_expressions() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
         exec(
             &mut db,
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)",
@@ -194,12 +196,9 @@ fn update_where_general_expressions() {
         // Table alias: SET targets are bare names (a qualified
         // SET target is a syntax error in the oracle too), while
         // expressions and the filter qualify through the alias.
-        exec(
-            &mut db,
-            "UPDATE t AS tt SET b = tt.b + 1 WHERE tt.id = 3",
-        )
-        .await
-        .unwrap();
+        exec(&mut db, "UPDATE t AS tt SET b = tt.b + 1 WHERE tt.id = 3")
+            .await
+            .unwrap();
         assert_eq!(
             collect(&mut db, "SELECT * FROM t ORDER BY id").await,
             vec!["1|apple!|10", "3|cherry!|131"]
@@ -220,7 +219,9 @@ fn update_where_general_expressions() {
 fn update_delete_empty_and_no_match() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
         exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
             .await
             .unwrap();
@@ -242,11 +243,10 @@ fn update_delete_empty_and_no_match() {
         // DELETE with no WHERE takes every row; the table lives.
         exec(&mut db, "DELETE FROM t").await.unwrap();
         assert_eq!(collect(&mut db, "SELECT * FROM t").await.len(), 0);
-        exec(&mut db, "INSERT INTO t VALUES (7,'seven')").await.unwrap();
-        assert_eq!(
-            collect(&mut db, "SELECT * FROM t").await,
-            vec!["7|seven"]
-        );
+        exec(&mut db, "INSERT INTO t VALUES (7,'seven')")
+            .await
+            .unwrap();
+        assert_eq!(collect(&mut db, "SELECT * FROM t").await, vec!["7|seven"]);
     });
 }
 
@@ -256,13 +256,12 @@ fn update_delete_empty_and_no_match() {
 fn update_rowid_and_alias_rules() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
-        exec(
-            &mut db,
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)",
-        )
-        .await
-        .unwrap();
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
+        exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+            .await
+            .unwrap();
         exec(&mut db, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
             .await
             .unwrap();
@@ -347,7 +346,12 @@ fn update_delete_with_indexes() {
                 collect(&mut db, "SELECT id FROM t WHERE b = 99").await,
                 vec!["2"]
             );
-            assert_eq!(collect(&mut db, "SELECT id FROM t WHERE b = 20").await.len(), 0);
+            assert_eq!(
+                collect(&mut db, "SELECT id FROM t WHERE b = 20")
+                    .await
+                    .len(),
+                0
+            );
             // Update a non-indexed column: index stays exact.
             exec(&mut db, "UPDATE t SET a = 'uno' WHERE id = 1")
                 .await
@@ -362,9 +366,16 @@ fn update_delete_with_indexes() {
                 .unwrap();
             // Delete removes the index entries too.
             exec(&mut db, "DELETE FROM t WHERE id = 3").await.unwrap();
-            assert_eq!(collect(&mut db, "SELECT id FROM t WHERE b = 30").await.len(), 0);
             assert_eq!(
-                collect(&mut db, "SELECT id FROM t WHERE a = 'three'").await.len(),
+                collect(&mut db, "SELECT id FROM t WHERE b = 30")
+                    .await
+                    .len(),
+                0
+            );
+            assert_eq!(
+                collect(&mut db, "SELECT id FROM t WHERE a = 'three'")
+                    .await
+                    .len(),
                 0
             );
         }
@@ -380,7 +391,9 @@ fn update_delete_with_indexes() {
 fn update_unique_violation_is_atomic() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
         exec(
             &mut db,
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT UNIQUE, b INTEGER)",
@@ -425,7 +438,9 @@ fn update_unique_violation_is_atomic() {
 fn update_or_ignore_skips_conflicts() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
         exec(
             &mut db,
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT UNIQUE)",
@@ -604,12 +619,9 @@ fn delete_overflow_rows_return_pages() {
             .await
             .unwrap();
             for i in 1..=6 {
-                exec(
-                    &mut db,
-                    &format!("INSERT INTO t VALUES ({i}, '{big}')"),
-                )
-                .await
-                .unwrap();
+                exec(&mut db, &format!("INSERT INTO t VALUES ({i}, '{big}')"))
+                    .await
+                    .unwrap();
             }
             exec(&mut db, "DELETE FROM t WHERE id <= 5").await.unwrap();
         }
@@ -636,12 +648,9 @@ fn delete_overflow_rows_return_pages() {
             let fs = FileStorage::open(&path).expect("fs open");
             let mut db = Connection::open(fs, Config::default()).await.expect("open");
             for i in 11..=15 {
-                exec(
-                    &mut db,
-                    &format!("INSERT INTO t VALUES ({i}, '{big}')"),
-                )
-                .await
-                .unwrap();
+                exec(&mut db, &format!("INSERT INTO t VALUES ({i}, '{big}')"))
+                    .await
+                    .unwrap();
             }
         }
         integrity(&path);
@@ -683,9 +692,7 @@ fn drop_table_hipp_writes_oracle_reads() {
             let big = "y".repeat(3000);
             exec(
                 &mut db,
-                &format!(
-                    "INSERT INTO gone VALUES (1,'one',10),(2,'two',20),(3,'{big}',30)"
-                ),
+                &format!("INSERT INTO gone VALUES (1,'one',10),(2,'two',20),(3,'{big}',30)"),
             )
             .await
             .unwrap();
@@ -697,10 +704,7 @@ fn drop_table_hipp_writes_oracle_reads() {
             exec(&mut db, "INSERT INTO gone VALUES ('back')")
                 .await
                 .unwrap();
-            assert_eq!(
-                collect(&mut db, "SELECT * FROM keep").await,
-                vec!["1|stay"]
-            );
+            assert_eq!(collect(&mut db, "SELECT * FROM keep").await, vec!["1|stay"]);
             assert_eq!(collect(&mut db, "SELECT * FROM gone").await, vec!["back"]);
         }
         integrity(&path);
@@ -755,7 +759,9 @@ fn drop_table_oracle_writes_hipp_reads() {
 fn drop_table_and_view_name_rules() {
     block_on(async {
         let mem = MemStorage::new();
-        let mut db = Connection::open(mem, Config::default()).await.expect("open");
+        let mut db = Connection::open(mem, Config::default())
+            .await
+            .expect("open");
         exec(&mut db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
             .await
             .unwrap();
@@ -889,4 +895,3 @@ fn write_side_inside_explicit_transactions() {
         );
     });
 }
-

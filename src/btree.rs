@@ -2094,8 +2094,9 @@ pub async fn collect_index_pages<S: Storage>(
 // ----------------------------------------------------------------
 
 /// Every page of the table rooted at `root`: B-tree pages plus
-/// all overflow chains.
-#[cfg(feature = "v05")]
+/// all overflow chains. Ungated like `btree_delete`: DROP TABLE
+/// (v05) is the headline caller, but the delete-rebuild path
+/// needs it in every configuration that can delete rows.
 pub async fn collect_table_pages<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -2159,10 +2160,7 @@ pub async fn collect_table_pages<S: Storage>(
 
 /// Free one overflow chain, following next-pointers to 0.
 #[cfg(feature = "indexes")]
-async fn free_overflow_chain<S: Storage>(
-    pager: &mut Pager<S>,
-    first: u32,
-) -> Result<(), S::Error> {
+async fn free_overflow_chain<S: Storage>(pager: &mut Pager<S>, first: u32) -> Result<(), S::Error> {
     let mut next = first;
     let mut hops = 0u32;
     while next != 0 {
@@ -2208,8 +2206,7 @@ async fn index_rebuild_without<S: Storage>(
     {
         let mut cur = IndexCursor::new(root, desc);
         while let Some(e) = cur.next_entry(pager).await? {
-            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc)
-                == Ordering::Equal
+            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc) == Ordering::Equal
             {
                 continue;
             }
@@ -2329,8 +2326,7 @@ async fn index_delete_rec<S: Storage>(
         if h.kind != KIND_INTERIOR_INDEX {
             return Err(Error::Unsupported);
         }
-        let (cells, rightmost) =
-            index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
         let mut descend = None;
         let mut hit = None;
         for (i, c) in cells.iter().enumerate() {
@@ -2412,7 +2408,11 @@ async fn index_delete_rec<S: Storage>(
         };
         let mut ncells: AVec<IndexCell> = AVec::new();
         for (j, c) in cells.iter().enumerate() {
-            ncells.push(if j == pos { new_cell.clone() } else { c.clone() });
+            ncells.push(if j == pos {
+                new_cell.clone()
+            } else {
+                c.clone()
+            });
         }
         if index_page_need(ncells.as_slice(), 0, true) > usable {
             // The replacement does not fit this interior

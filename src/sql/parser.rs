@@ -1594,8 +1594,7 @@ impl<'a> Parser<'a> {
                 // OR REPLACE deletes the conflicting row; a later
                 // phase. Rejected by name rather than mis-parsed.
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
-            } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"FAIL") || self.eat_kw(b"ROLLBACK"))
-            {
+            } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"FAIL") || self.eat_kw(b"ROLLBACK")) {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
             // OR ABORT / FAIL / ROLLBACK: the engine's default
