@@ -221,6 +221,46 @@ enum Plan {
     /// by materialisation on first step.
     #[cfg(feature = "v04")]
     Query(QueryPlan),
+    /// `UPDATE` (v0.5): SET expressions and the filter are
+    /// resolved at plan time against the single source; rows are
+    /// materialised at step time and each assignment evaluates
+    /// against the row's original values.
+    #[cfg(feature = "v05")]
+    Update {
+        root: u32,
+        rowid_alias: Option<usize>,
+        ncols: usize,
+        defaults: AVec<OwnedValue>,
+        affs: AVec<crate::record::Affinity>,
+        /// (target, expression) pairs in statement order.
+        sets: AVec<(Target, RExpr)>,
+        filter: Option<RExpr>,
+        or_ignore: bool,
+        /// Indexes to maintain, in catalog order.
+        #[cfg(feature = "indexes")]
+        indexes: AVec<IndexPlan>,
+    },
+    /// `DELETE` (v0.5).
+    #[cfg(feature = "v05")]
+    Delete {
+        root: u32,
+        rowid_alias: Option<usize>,
+        ncols: usize,
+        defaults: AVec<OwnedValue>,
+        affs: AVec<crate::record::Affinity>,
+        filter: Option<RExpr>,
+        /// Indexes to maintain, in catalog order.
+        #[cfg(feature = "indexes")]
+        indexes: AVec<IndexPlan>,
+    },
+    /// `DROP TABLE` (v0.5); `root: None` is the IF EXISTS no-op.
+    #[cfg(feature = "v05")]
+    DropTable {
+        root: Option<u32>,
+        /// Roots of the table's indexes (explicit + implicit),
+        /// in catalog order; their pages are freed with it.
+        index_roots: AVec<u32>,
+    },
     /// `ALTER TABLE ... ADD COLUMN` (v0.4): the rewritten stored
     /// CREATE TABLE text is computed at plan time.
     #[cfg(feature = "v04")]
@@ -658,6 +698,13 @@ impl<S: Storage> Connection<S> {
                 let nb = handle_bytes(arena, *name);
                 match self.catalog.find_view(&self.catalog_arena, nb) {
                     None => {
+                        // The oracle refuses DROP VIEW on a table
+                        // even under IF EXISTS (v0.5 probe).
+                        if self.catalog.find(&self.catalog_arena, nb).is_some() {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::IsTable,
+                            });
+                        }
                         if *if_exists {
                             Ok(Plan::DropView { exists: false })
                         } else {
@@ -673,7 +720,237 @@ impl<S: Storage> Connection<S> {
             Ast::AlterAddColumn { .. } | Ast::CreateView { .. } | Ast::DropView { .. } => {
                 Err(Error::Unsupported)
             }
+            #[cfg(feature = "v05")]
+            Ast::Update {
+                table,
+                alias,
+                or_ignore,
+                assignments,
+                filter,
+            } => self.plan_update(arena, table, alias, *or_ignore, assignments, filter),
+            #[cfg(feature = "v05")]
+            Ast::Delete { table, filter } => self.plan_delete(arena, table, filter),
+            #[cfg(feature = "v05")]
+            Ast::DropTable { name, if_exists } => {
+                let nb = handle_bytes(arena, *name);
+                match self.catalog.find(&self.catalog_arena, nb) {
+                    None => {
+                        // The oracle refuses DROP TABLE on a view
+                        // even under IF EXISTS (v0.5 probe).
+                        if self.catalog.find_view(&self.catalog_arena, nb).is_some() {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::IsView,
+                            });
+                        }
+                        if *if_exists {
+                            Ok(Plan::DropTable {
+                                root: None,
+                                index_roots: AVec::new(),
+                            })
+                        } else {
+                            Err(Error::Schema {
+                                kind: SchemaKind::UnknownTable,
+                            })
+                        }
+                    }
+                    Some(t) => {
+                        let mut index_roots = AVec::new();
+                        for ix in self.catalog.indexes_for(&self.catalog_arena, nb) {
+                            index_roots.push(ix.root);
+                        }
+                        Ok(Plan::DropTable {
+                            root: Some(t.root),
+                            index_roots,
+                        })
+                    }
+                }
+            }
+            #[cfg(not(feature = "v05"))]
+            Ast::Update { .. } | Ast::Delete { .. } | Ast::DropTable { .. } => {
+                Err(Error::Unsupported)
+            }
         }
+    }
+
+    /// The table an UPDATE/DELETE writes to: a view is refused
+    /// with `IsView` (the oracle: "cannot modify ... because it
+    /// is a view"), a missing name with `UnknownTable`.
+    #[cfg(feature = "v05")]
+    fn write_table(
+        &self,
+        arena: &Arena,
+        table: &crate::arena::ABytes,
+    ) -> Result<&crate::schema::TableDef, S::Error> {
+        let tname = handle_bytes(arena, *table);
+        match self.catalog.find(&self.catalog_arena, tname) {
+            Some(t) => Ok(t),
+            None => {
+                if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::IsView,
+                    });
+                }
+                Err(Error::Schema {
+                    kind: SchemaKind::UnknownTable,
+                })
+            }
+        }
+    }
+
+    /// One FROM source description for resolving an UPDATE/DELETE
+    /// statement's expressions (qualifier = alias if given, else
+    /// the table name — SQLite's rule, as in plan_query).
+    #[cfg(feature = "v05")]
+    fn single_source(
+        &self,
+        t: &crate::schema::TableDef,
+        qualifier: &[u8],
+    ) -> (AVec<crate::query::SourceDesc>, AVec<usize>) {
+        let mut cols = AVec::new();
+        for c in t.columns.iter() {
+            cols.push((
+                copy_vec(handle_bytes(&self.catalog_arena, c.name)),
+                c.affinity,
+            ));
+        }
+        let mut sources = AVec::new();
+        sources.push(crate::query::SourceDesc {
+            qualifier: copy_vec(qualifier),
+            columns: cols,
+            rowid_alias: t.rowid_alias,
+        });
+        let mut offsets = AVec::new();
+        offsets.push(0);
+        (sources, offsets)
+    }
+
+    /// Index plans for an UPDATE/DELETE on `tname` (v0.5): the
+    /// same resolution INSERT performs — an index hipp cannot
+    /// maintain refuses the write.
+    #[cfg(all(feature = "v05", feature = "indexes"))]
+    fn write_index_plans(&self, tname: &[u8]) -> Result<AVec<IndexPlan>, S::Error> {
+        let mut out: AVec<IndexPlan> = AVec::new();
+        for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
+            if ix.opaque {
+                return Err(Error::Unsupported);
+            }
+            let mut cols = AVec::new();
+            let mut desc = AVec::new();
+            for c in ix.columns.iter() {
+                cols.push(IdxColPlan {
+                    col: c.col,
+                    desc: c.desc,
+                });
+                desc.push(c.desc);
+            }
+            out.push(IndexPlan {
+                root: ix.root,
+                unique: ix.unique,
+                cols,
+                desc,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Plan an UPDATE (v0.5): resolve the SET expressions and the
+    /// filter once, at prepare time; aggregates are not legal in
+    /// either (SQLite agrees).
+    #[cfg(feature = "v05")]
+    fn plan_update(
+        &self,
+        arena: &Arena,
+        table: &crate::arena::ABytes,
+        alias: &Option<crate::arena::ABytes>,
+        or_ignore: bool,
+        assignments: &AVec<(crate::arena::ABytes, Expr)>,
+        filter: &Option<Expr>,
+    ) -> Result<Plan, S::Error> {
+        use crate::query::{has_agg, resolve};
+        let tname = handle_bytes(arena, *table);
+        let t = self.write_table(arena, table)?;
+        let qualifier: &[u8] = match alias {
+            Some(a) => handle_bytes(arena, *a),
+            None => tname,
+        };
+        let (sources, offsets) = self.single_source(t, qualifier);
+        let mut sets = AVec::new();
+        for (colname, e) in assignments.iter() {
+            let target = self.resolve_target(t, handle_bytes(arena, *colname))?;
+            let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+            if has_agg(&r) {
+                return Err(Error::Unsupported);
+            }
+            sets.push((target, r));
+        }
+        let filter = match filter {
+            None => None,
+            Some(e) => {
+                let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                Some(r)
+            }
+        };
+        let mut defaults = AVec::new();
+        let mut affs = AVec::new();
+        for c in t.columns.iter() {
+            defaults.push(literal_owned(&self.catalog_arena, c.default));
+            affs.push(c.affinity);
+        }
+        Ok(Plan::Update {
+            root: t.root,
+            rowid_alias: t.rowid_alias,
+            ncols: t.columns.len(),
+            defaults,
+            affs,
+            sets,
+            filter,
+            or_ignore,
+            #[cfg(feature = "indexes")]
+            indexes: self.write_index_plans(tname)?,
+        })
+    }
+
+    /// Plan a DELETE (v0.5).
+    #[cfg(feature = "v05")]
+    fn plan_delete(
+        &self,
+        arena: &Arena,
+        table: &crate::arena::ABytes,
+        filter: &Option<Expr>,
+    ) -> Result<Plan, S::Error> {
+        use crate::query::{has_agg, resolve};
+        let tname = handle_bytes(arena, *table);
+        let t = self.write_table(arena, table)?;
+        let (sources, offsets) = self.single_source(t, tname);
+        let filter = match filter {
+            None => None,
+            Some(e) => {
+                let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                Some(r)
+            }
+        };
+        let mut defaults = AVec::new();
+        let mut affs = AVec::new();
+        for c in t.columns.iter() {
+            defaults.push(literal_owned(&self.catalog_arena, c.default));
+            affs.push(c.affinity);
+        }
+        Ok(Plan::Delete {
+            root: t.root,
+            rowid_alias: t.rowid_alias,
+            ncols: t.columns.len(),
+            defaults,
+            affs,
+            filter,
+            #[cfg(feature = "indexes")]
+            indexes: self.write_index_plans(tname)?,
+        })
     }
 
     /// Evaluate one INSERT VALUES expression at plan time
@@ -1330,6 +1607,69 @@ fn key_has_no_null(key: &[OwnedValue]) -> bool {
     key.iter().all(|v| !matches!(v, OwnedValue::Null))
 }
 
+/// One row an UPDATE/DELETE will touch (v0.5), in record form:
+/// decoded values with defaults materialised; the rowid-alias
+/// column's slot holds its stored NULL — the rowid itself is in
+/// `rowid`.
+#[cfg(feature = "v05")]
+struct WriteRow {
+    rowid: i64,
+    rec: AVec<OwnedValue>,
+}
+
+/// Build the evaluation row for one write-side row (v0.5): the
+/// alias column reads as the rowid and REAL columns force reals,
+/// exactly as the query executor builds its rows (§5.5).
+#[cfg(feature = "v05")]
+fn row_data_for(
+    rowid_alias: Option<usize>,
+    affs: &[crate::record::Affinity],
+    rec: &[OwnedValue],
+    rowid: i64,
+) -> RowData {
+    let mut vals = AVec::new();
+    for i in 0..rec.len() {
+        let mut v = if Some(i) == rowid_alias {
+            OwnedValue::Integer(rowid)
+        } else {
+            rec[i].clone()
+        };
+        if affs[i] == crate::record::Affinity::Real
+            && let OwnedValue::Integer(x) = v
+        {
+            v = OwnedValue::Real(x as f64);
+        }
+        vals.push(v);
+    }
+    let mut rowids = AVec::new();
+    rowids.push(Some(rowid));
+    RowData { vals, rowids }
+}
+
+/// An index key for one write-side row in record form (v0.5).
+#[cfg(all(feature = "v05", feature = "indexes"))]
+fn key_from_rec(
+    cols: &[IdxColPlan],
+    rowid_alias: Option<usize>,
+    rec: &[OwnedValue],
+    rowid: i64,
+) -> AVec<OwnedValue> {
+    let mut key = AVec::new();
+    for c in cols {
+        key.push(match c.col {
+            None => OwnedValue::Integer(rowid),
+            Some(i) => {
+                if Some(i) == rowid_alias {
+                    OwnedValue::Integer(rowid)
+                } else {
+                    rec[i].clone()
+                }
+            }
+        });
+    }
+    key
+}
+
 /// Coerce a `WHERE rowid = <literal>` literal to an access path,
 /// following SQLite's comparison rules: the literal gets numeric
 /// conversion, and a value that cannot equal any rowid yields an
@@ -1403,6 +1743,19 @@ impl<'c, S: Storage> Statement<'c, S> {
                 {
                     false
                 }
+            }
+            || {
+                #[cfg(feature = "v05")]
+                {
+                    matches!(
+                        self.plan,
+                        Plan::Update { .. } | Plan::Delete { .. } | Plan::DropTable { .. }
+                    )
+                }
+                #[cfg(not(feature = "v05"))]
+                {
+                    false
+                }
             };
         let r = match &self.plan {
             Plan::CreateTable => self.step_create().await,
@@ -1419,6 +1772,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "indexes")]
             Plan::DropIndex { .. } => self.step_drop_index().await,
             Plan::Insert { .. } => self.step_insert().await,
+            #[cfg(feature = "v05")]
+            Plan::Update { .. } => self.step_update().await,
+            #[cfg(feature = "v05")]
+            Plan::Delete { .. } => self.step_delete().await,
+            #[cfg(feature = "v05")]
+            Plan::DropTable { .. } => self.step_drop_table().await,
             Plan::Scan { .. } => self.step_scan().await,
             Plan::Begin => self.step_begin().await,
             Plan::Commit => self.step_commit().await,
@@ -1991,6 +2350,415 @@ impl<'c, S: Storage> Statement<'c, S> {
         for (ix_root, desc, key) in pending_keys.iter() {
             let payload = encode_index_payload(key.as_slice(), rowid);
             btree::index_insert(pager, *ix_root, payload.as_slice(), desc.as_slice()).await?;
+        }
+        Ok(())
+    }
+
+    // ---------------- v0.5 write-side execution ----------------
+
+    #[cfg(feature = "v05")]
+    async fn step_update(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_update().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                // Same abort rule as INSERT (see step_insert).
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(feature = "v05")]
+    async fn step_delete(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_delete().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(feature = "v05")]
+    async fn step_drop_table(&mut self) -> Result<Step, S::Error> {
+        if self.phase == Phase::Done {
+            return Ok(Step::Done);
+        }
+        let r = self.exec_drop_table().await;
+        match r {
+            Ok(()) => {
+                self.phase = Phase::Done;
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// Materialise the rows an UPDATE/DELETE touches (v0.5):
+    /// full scan, decode each record (short records materialise
+    /// defaults), keep the rows the filter accepts. Collecting
+    /// before mutating is what keeps the statement's row set
+    /// stable while it rewrites the B-tree underneath itself —
+    /// and what makes statement atomicity a rollback away.
+    #[cfg(feature = "v05")]
+    async fn scan_write_rows(
+        &mut self,
+        root: u32,
+        rowid_alias: Option<usize>,
+        ncols: usize,
+        defaults: &[OwnedValue],
+        affs: &[crate::record::Affinity],
+        filter: &Option<RExpr>,
+    ) -> Result<AVec<WriteRow>, S::Error> {
+        let mut out = AVec::new();
+        let mut cursor = ScanCursor::new(root);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let mut dec: AVec<Value<'_>> = AVec::new();
+            crate::record::decode_record_into::<S::Error>(buf.as_slice(), ncols, &mut dec)?;
+            let mut rec = AVec::new();
+            for i in 0..ncols {
+                rec.push(if i < dec.len() {
+                    OwnedValue::from_value(dec.as_slice()[i])
+                } else {
+                    defaults[i].clone()
+                });
+            }
+            if let Some(f) = filter {
+                let rd = row_data_for(rowid_alias, affs, rec.as_slice(), rowid);
+                if crate::query::truthy(&crate::query::eval::<S::Error>(f, &Ctx::Row(&rd))?)
+                    != Some(true)
+                {
+                    continue;
+                }
+            }
+            out.push(WriteRow { rowid, rec });
+        }
+        Ok(out)
+    }
+
+    #[cfg(feature = "v05")]
+    async fn exec_update(&mut self) -> Result<(), S::Error> {
+        let (root, rowid_alias, ncols, defaults, affs, sets, filter, or_ignore) =
+            match &self.plan {
+                Plan::Update {
+                    root,
+                    rowid_alias,
+                    ncols,
+                    defaults,
+                    affs,
+                    sets,
+                    filter,
+                    or_ignore,
+                    ..
+                } => (
+                    *root,
+                    *rowid_alias,
+                    *ncols,
+                    defaults.clone(),
+                    affs.clone(),
+                    sets.clone(),
+                    filter.clone(),
+                    *or_ignore,
+                ),
+                _ => unreachable!(),
+            };
+        #[cfg(feature = "indexes")]
+        let indexes: AVec<IndexPlan> = match &self.plan {
+            Plan::Update { indexes, .. } => indexes.clone(),
+            _ => unreachable!(),
+        };
+        let rows = self
+            .scan_write_rows(
+                root,
+                rowid_alias,
+                ncols,
+                defaults.as_slice(),
+                affs.as_slice(),
+                &filter,
+            )
+            .await?;
+        for wrow in rows.iter() {
+            let rd = row_data_for(rowid_alias, affs.as_slice(), wrow.rec.as_slice(), wrow.rowid);
+            // SET expressions evaluate against the ORIGINAL row
+            // (oracle-verified: `SET b=1, b=b+100` adds 100 to
+            // the old b); applying them in order makes the last
+            // assignment to a column win.
+            let mut evaluated: AVec<(Target, OwnedValue)> = AVec::new();
+            for (target, e) in sets.iter() {
+                evaluated.push((*target, crate::query::eval::<S::Error>(e, &Ctx::Row(&rd))?));
+            }
+            let mut new_rec: AVec<OwnedValue> = wrow.rec.clone();
+            let mut new_rowid = wrow.rowid;
+            for (target, v) in evaluated.iter() {
+                match target {
+                    Target::Rowid => match v {
+                        OwnedValue::Integer(x) => new_rowid = *x,
+                        // UPDATE (unlike INSERT) refuses a NULL
+                        // or non-integer rowid: datatype mismatch
+                        // in the oracle (v0.5 probe).
+                        _ => {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::DatatypeMismatch,
+                            })
+                        }
+                    },
+                    Target::Col(i) => {
+                        let i = *i;
+                        if Some(i) == rowid_alias {
+                            match v {
+                                OwnedValue::Integer(x) => new_rowid = *x,
+                                _ => {
+                                    return Err(Error::Schema {
+                                        kind: SchemaKind::DatatypeMismatch,
+                                    })
+                                }
+                            }
+                            // The alias column's record field
+                            // stays NULL (the rowid carries it).
+                        } else {
+                            new_rec.as_mut_slice()[i] =
+                                apply_affinity(v.clone(), affs.as_slice()[i]);
+                        }
+                    }
+                }
+            }
+            if new_rowid != wrow.rowid
+                && btree::seek_rowid(&mut self.conn.pager, root, new_rowid)
+                    .await?
+                    .is_some()
+            {
+                if or_ignore {
+                    continue;
+                }
+                return Err(Error::Schema {
+                    kind: SchemaKind::DuplicateRowid,
+                });
+            }
+            #[cfg(feature = "indexes")]
+            let mut new_keys: AVec<AVec<OwnedValue>> = AVec::new();
+            #[cfg(feature = "indexes")]
+            {
+                let mut conflict = false;
+                for ix in indexes.iter() {
+                    let key = key_from_rec(
+                        ix.cols.as_slice(),
+                        rowid_alias,
+                        new_rec.as_slice(),
+                        new_rowid,
+                    );
+                    if ix.unique
+                        && key_has_no_null(key.as_slice())
+                        && let Some(other) = btree::index_first_with_prefix(
+                            &mut self.conn.pager,
+                            ix.root,
+                            ix.desc.as_slice(),
+                            key.as_slice(),
+                        )
+                        .await?
+                        && other != wrow.rowid
+                    {
+                        conflict = true;
+                    }
+                    new_keys.push(key);
+                    if conflict {
+                        break;
+                    }
+                }
+                if conflict {
+                    if or_ignore {
+                        continue;
+                    }
+                    return Err(Error::Schema {
+                        kind: SchemaKind::UniqueViolation,
+                    });
+                }
+            }
+            // Apply: old index entries out, row out, row in,
+            // new index entries in.
+            #[cfg(feature = "indexes")]
+            for ix in indexes.iter() {
+                let old_key = key_from_rec(
+                    ix.cols.as_slice(),
+                    rowid_alias,
+                    wrow.rec.as_slice(),
+                    wrow.rowid,
+                );
+                let payload = encode_index_payload(old_key.as_slice(), wrow.rowid);
+                btree::index_delete(
+                    &mut self.conn.pager,
+                    ix.root,
+                    payload.as_slice(),
+                    ix.desc.as_slice(),
+                )
+                .await?;
+            }
+            btree::btree_delete(&mut self.conn.pager, root, wrow.rowid).await?;
+            let mut vals: AVec<Value<'_>> = AVec::new();
+            for (i, v) in new_rec.iter().enumerate() {
+                if Some(i) == rowid_alias {
+                    vals.push(Value::Null);
+                } else {
+                    vals.push(v.as_value());
+                }
+            }
+            let mut rec_bytes = AVec::new();
+            encode_record(vals.as_slice(), &mut rec_bytes);
+            btree::btree_insert(&mut self.conn.pager, root, new_rowid, rec_bytes.as_slice())
+                .await?;
+            #[cfg(feature = "indexes")]
+            for (ix, key) in indexes.iter().zip(new_keys.iter()) {
+                let payload = encode_index_payload(key.as_slice(), new_rowid);
+                btree::index_insert(
+                    &mut self.conn.pager,
+                    ix.root,
+                    payload.as_slice(),
+                    ix.desc.as_slice(),
+                )
+                .await?;
+            }
+        }
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "v05")]
+    async fn exec_delete(&mut self) -> Result<(), S::Error> {
+        let (root, rowid_alias, ncols, defaults, affs, filter) = match &self.plan {
+            Plan::Delete {
+                root,
+                rowid_alias,
+                ncols,
+                defaults,
+                affs,
+                filter,
+                ..
+            } => (
+                *root,
+                *rowid_alias,
+                *ncols,
+                defaults.clone(),
+                affs.clone(),
+                filter.clone(),
+            ),
+            _ => unreachable!(),
+        };
+        #[cfg(feature = "indexes")]
+        let indexes: AVec<IndexPlan> = match &self.plan {
+            Plan::Delete { indexes, .. } => indexes.clone(),
+            _ => unreachable!(),
+        };
+        let rows = self
+            .scan_write_rows(
+                root,
+                rowid_alias,
+                ncols,
+                defaults.as_slice(),
+                affs.as_slice(),
+                &filter,
+            )
+            .await?;
+        for wrow in rows.iter() {
+            #[cfg(feature = "indexes")]
+            for ix in indexes.iter() {
+                let key = key_from_rec(
+                    ix.cols.as_slice(),
+                    rowid_alias,
+                    wrow.rec.as_slice(),
+                    wrow.rowid,
+                );
+                let payload = encode_index_payload(key.as_slice(), wrow.rowid);
+                btree::index_delete(
+                    &mut self.conn.pager,
+                    ix.root,
+                    payload.as_slice(),
+                    ix.desc.as_slice(),
+                )
+                .await?;
+            }
+            btree::btree_delete(&mut self.conn.pager, root, wrow.rowid).await?;
+        }
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(())
+    }
+
+    /// `DROP TABLE` (v0.5): free every page of the table B-tree
+    /// and of each of its indexes (B-tree pages + overflow
+    /// chains) to the freelist, then remove the schema rows.
+    /// Collection happens before any freeing, so the traversals
+    /// see intact trees.
+    #[cfg(feature = "v05")]
+    async fn exec_drop_table(&mut self) -> Result<(), S::Error> {
+        let (root, index_roots) = match &self.plan {
+            Plan::DropTable { root, index_roots } => (*root, index_roots.clone()),
+            _ => unreachable!(),
+        };
+        let Some(root) = root else {
+            return Ok(()); // IF EXISTS no-op
+        };
+        let Ast::DropTable { name, .. } = &self.ast else {
+            unreachable!()
+        };
+        let name_b = copy_vec(handle_bytes(&self.arena, *name));
+        // Schema rowids: the table's own row plus every index
+        // row it owns (explicit and implicit alike).
+        let mut schema_rowids = AVec::new();
+        {
+            let mut cursor = ScanCursor::new(1);
+            let mut buf = AVec::new();
+            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+                let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
+                if values.len() >= 3 {
+                    let is_table_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"table"))
+                        && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, name_b.as_slice()));
+                    let is_index_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index"))
+                        && matches!(&values.as_slice()[2], Value::Text(n) if eq_ci(n, name_b.as_slice()));
+                    if is_table_row || is_index_row {
+                        schema_rowids.push(rowid);
+                    }
+                }
+            }
+        }
+        let mut pages = btree::collect_table_pages(&mut self.conn.pager, root).await?;
+        for ir in index_roots.iter() {
+            let ipages = btree::collect_index_pages(&mut self.conn.pager, *ir).await?;
+            for p in ipages.iter() {
+                pages.push(*p);
+            }
+        }
+        for p in pages.iter() {
+            self.conn.pager.free_page(*p).await?;
+        }
+        for r in schema_rowids.iter() {
+            btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
+        }
+        self.conn.pager.bump_schema_cookie();
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
         }
         Ok(())
     }
