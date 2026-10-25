@@ -4,6 +4,146 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.6 — subqueries in expressions (2026-10-25)
+
+Pushed to GitHub (madmax983/hipp) via API replay under the
+conformance-loop mandate; remote tip + tree recorded in the
+loop status.
+
+### Scope shipped
+
+- **Subqueries in expressions** behind the `v06` cargo
+  feature (default on, implies `v05`; the tiny profile
+  excludes it): scalar subqueries `(SELECT ...)`,
+  `x [NOT] IN (SELECT ...)`, and `EXISTS (SELECT ...)` in
+  every expression site the engine evaluates — SELECT list,
+  WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY, UPDATE SET and
+  WHERE, DELETE WHERE. Subqueries nest, and their own SELECT
+  is the full v0.4 grammar (joins, aggregates, GROUP BY,
+  ORDER BY / LIMIT, further subqueries).
+- **Correlation is first-class.** Name resolution is scoped:
+  a subquery's own FROM sources answer first, then enclosing
+  queries' sources nearest-first (SQLite's shadowing rule),
+  with qualified references reaching any enclosing level.
+  Resolution happens once at prepare time against the
+  combined scope, producing expressions over one flat
+  combined row (outer values ++ inner values); ambiguity and
+  unknown-name errors are prepare-time, in the right scope.
+- **Execution by substitution.** The v0.4 evaluator is
+  synchronous and pager-free, so the executors compute each
+  subquery node against the pager for the outer row at hand
+  (async), then substitute the result into the expression
+  tree — a literal for scalar / EXISTS, an IN-list of
+  literals for IN — and run the unchanged evaluator. Scalar
+  semantics are oracle-probed: first row's first column,
+  NULL on no rows, EXISTS false under `LIMIT 0`, the NOT IN
+  NULL trap (a NULL anywhere in the list makes NOT IN match
+  nothing). A scalar / IN subquery yielding more or fewer
+  than one column is a prepare-time `ColumnCountMismatch`
+  (the oracle's "sub-select returns 2 columns" case).
+- Aggregate queries take the same path with the group's
+  representative row as the subqueries' outer context —
+  subqueries compose with bare columns exactly as SQLite
+  composes them.
+
+### Root finds this milestone
+
+- **The async call graph is a layout cycle.** The natural
+  implementation (evaluate → compute subqueries → execute
+  subplan → project → evaluate …) makes every future in the
+  cycle contain the next, and rustc rejects the infinite
+  layout (E0391). Two links are boxed: subplan execution
+  itself, and the recursive nested-loop joins (top-level and
+  subplan). That is the whole fix; no executor or runtime
+  crept in (D2 intact).
+- **Oracle probes before code** pinned the semantics the
+  tests then encode: scalar takes the first row (not an
+  error) on multi-row results, the width error is real,
+  `EXISTS (SELECT ... LIMIT 0)` is 0, and correlated
+  references through two scope levels resolve to the
+  outermost row.
+- One pre-existing assertion was superseded by design
+  (v0.4's `query_rejections` listed subqueries as refused);
+  it now points here.
+
+### Tests — 103, all green (v0.5: 93)
+
+- New `tests/subqueries.rs` (8): scalar differentials
+  (uncorrelated, correlated, nested, empty-set, ORDER
+  BY/LIMIT steering, in CASE/coalesce/arithmetic), IN
+  differentials incl. correlated and expression left sides,
+  the IN/NOT IN NULL-semantics suite, EXISTS incl. double
+  correlation and HAVING-bearing subqueries, shadowing
+  (unqualified names bind inner, qualified reach outer,
+  two-alias self-correlation, subqueries in ON / GROUP BY /
+  HAVING / ORDER BY), write-side differentials (UPDATE ...
+  WHERE IN, UPDATE SET = correlated scalar, DELETE ...
+  WHERE EXISTS / NOT IN — hipp-mutated file vs oracle-
+  mutated twin, integrity-checked), subqueries over a
+  hipp-built file, and the rejection matrix (width,
+  aggregate-argument, INSERT VALUES, unknown names in
+  scope, views as subquery sources).
+- New `hipp-cli/tests/cli_v06.rs` (2): a subquery corpus
+  (reads plus subquery-driven UPDATE/DELETE) byte-identical
+  through the hipp and oracle CLIs, one-shot and stdin;
+  `.dump` after the writes replays into a fresh oracle
+  database identically.
+- A1–A11 stay green; clippy `--workspace --all-targets
+  -D warnings` clean; `cargo fmt` applied with a clean
+  tree; the feature matrix (no-default, std-only, v04-only,
+  v05-only, v06-only, indexes-only, indexes+v05,
+  all-features) all compiles.
+
+### §4.1 gates (re-measured)
+
+- Linked binary (tiny profile, thumbv7em): **.text 74,032 +
+  .rodata 14,952 = 88,984 B ≤ 128 KiB.**
+  **Delta vs v0.5's 88,936 B: +48 B** — under the 4 KiB
+  ratchet line, no justification needed. The v0.6 engine
+  (scoped resolver, SubPlan planner/executor) contributes
+  0 B to tiny — it lives behind `v06`/`v04`; the +48 B is
+  the ungated AST/parser gaining the three subquery `Expr`
+  variants. Headroom left: 42,088 B.
+- Statics: `.bss` 98,308 B is again entirely the demo's
+  caller heap; **engine .data+.bss outside caller memory =
+  0 B ≤ 8 KiB.**
+- Tiny-config RAM and zero steady-state scan allocations:
+  `tests/gates.rs` green (unchanged).
+
+### Honest notes / divergences
+
+- A subquery inside an aggregate's arguments
+  (`sum((SELECT ...))`) is refused at plan time with
+  `Error::Unsupported`: it would need per-group-row
+  execution. Subqueries *around* aggregates, and aggregates
+  *inside* subqueries, both work.
+- Subqueries in INSERT VALUES are refused (VALUES are
+  constant-folded at plan time, where no executor exists);
+  `INSERT INTO ... SELECT` is not in the grammar at all.
+- No FROM-clause derived tables and no UNION anywhere —
+  both remain outside the grammar engine-wide, subqueries
+  included.
+- Subqueries execute once per outer row, correlated or
+  not: there is no uncorrelated hoisting yet, so an
+  uncorrelated subquery in a hot WHERE re-runs per row.
+  Correctness-first, like the v0.4 materialising planner.
+- UPDATE's WHERE subqueries observe the pre-statement
+  table (matches are materialised before any row moves);
+  SET subqueries run per row as the statement applies, so
+  they observe rows the same statement already updated —
+  SQLite's row-by-row behaviour.
+- A subquery in a JOIN's ON clause is evaluated against
+  the partially joined row; references to sources not yet
+  joined read as NULL (the evaluator's lenient row reads),
+  where SQLite scopes ON to the joined sources.
+- Cross-affinity column-to-column comparisons keep the
+  v0.4 simplification (affinity adjustment only for a
+  direct column operand against a non-column): probed
+  against the oracle, `int_col = text_col` applies NUMERIC
+  affinity in SQLite even between two columns. Pre-existing,
+  not a subquery gap; the correlated differentials use
+  type-consistent keys, as real schemas do.
+
 ## v0.5 — UPDATE, DELETE, DROP TABLE + pager spill (2026-10-24)
 
 Pushed to GitHub (madmax983/hipp) via API replay under the

@@ -8,14 +8,33 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.5 — UPDATE, DELETE, and DROP TABLE with full
-  index maintenance, on the v0.4 foundation (SPEC §2).
+- **Phase:** v0.6 — subqueries in expressions (scalar,
+  `IN (SELECT ...)`, `EXISTS`) across SELECT / UPDATE /
+  DELETE, on the v0.5 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.6 does
+
+- Everything v0.5 does (below), plus subqueries in
+  expressions behind the `v06` feature (default on, implies
+  `v05`; the tiny profile excludes it): scalar subqueries,
+  `x [NOT] IN (SELECT ...)`, and `EXISTS (SELECT ...)` in
+  SELECT lists, WHERE, ON, GROUP BY, HAVING, ORDER BY,
+  UPDATE SET/WHERE, and DELETE WHERE. Uncorrelated and
+  correlated forms both run: name resolution shadows outward
+  through nested scopes exactly like SQLite (inner sources
+  first, then enclosing queries nearest-first), a scalar
+  subquery yields its first row's first column (NULL on no
+  rows), and a subquery yielding the wrong column count is a
+  prepare-time error. Named boundaries: a subquery inside an
+  aggregate's arguments and subqueries in INSERT VALUES are
+  refused at prepare time; FROM-clause derived tables and
+  UNION remain outside the grammar.
 
 ## What v0.5 does
 
@@ -92,9 +111,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.5) |
+| Gate | Budget | Measured (v0.6) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **88,936 B** (Δ +600 B vs v0.4's 88,336 B; the v0.5 dialect is feature-gated out of tiny — the delta is the ungated pager spill + delete-rebuild core) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **88,984 B** (Δ +48 B vs v0.5's 88,936 B; the v0.6 engine is feature-gated out of tiny — the delta is the ungated AST gaining the three subquery `Expr` variants) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
