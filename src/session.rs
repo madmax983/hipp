@@ -2765,9 +2765,15 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             if let Some(f) = filter {
                 let rd = row_data_for(rowid_alias, affs, rec.as_slice(), rowid);
-                if crate::query::truthy(&crate::query::eval::<S::Error>(f, &Ctx::Row(&rd))?)
-                    != Some(true)
-                {
+                #[cfg(feature = "v06")]
+                let keep =
+                    crate::query::truthy(&self.eval_row_sub(f, &rd).await?) == Some(true);
+                #[cfg(not(feature = "v06"))]
+                let keep = crate::query::truthy(&crate::query::eval::<S::Error>(
+                    f,
+                    &Ctx::Row(&rd),
+                )?) == Some(true);
+                if !keep {
                     continue;
                 }
             }
@@ -2829,7 +2835,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             // assignment to a column win.
             let mut evaluated: AVec<(Target, OwnedValue)> = AVec::new();
             for (target, e) in sets.iter() {
-                evaluated.push((*target, crate::query::eval::<S::Error>(e, &Ctx::Row(&rd))?));
+                #[cfg(feature = "v06")]
+                let v = self.eval_row_sub(e, &rd).await?;
+                #[cfg(not(feature = "v06"))]
+                let v = crate::query::eval::<S::Error>(e, &Ctx::Row(&rd))?;
+                evaluated.push((*target, v));
             }
             let mut new_rec: AVec<OwnedValue> = wrow.rec.clone();
             let mut new_rowid = wrow.rowid;
@@ -3296,9 +3306,30 @@ impl<'c, S: Storage> Statement<'c, S> {
             unreachable!()
         };
         let qp = qp.clone();
-        // 1. Materialise each source's rows.
+        #[cfg(feature = "v06")]
+        if query_plan_has_sub(&qp) {
+            return self.run_query_sub(qp).await;
+        }
+        let src_rows = self.materialise_query_sources(qp.sources.as_slice()).await?;
+        // Nested-loop join + WHERE, then group / project: the
+        // synchronous v0.4 executor (no subqueries in the plan).
+        let mut rows: AVec<RowData> = AVec::new();
+        join_rows::<S::Error>(&qp, src_rows.as_slice(), 0, &RowData::empty(), &mut rows)?;
+        let produced = project_rows::<S::Error>(&qp, rows.as_slice())?;
+        self.finish_produced(&qp, produced);
+        Ok(())
+    }
+
+    /// Scan one query source's rows into memory (v0.4 executor
+    /// step 1, shared by the subquery path): decoded values with
+    /// defaults materialised and read-side REAL forcing (§5.5).
+    #[cfg(feature = "v04")]
+    async fn materialise_query_sources(
+        &mut self,
+        sources: &[SourcePlan],
+    ) -> Result<AVec<AVec<(AVec<OwnedValue>, i64)>>, S::Error> {
         let mut src_rows: AVec<AVec<(AVec<OwnedValue>, i64)>> = AVec::new();
-        for sp in qp.sources.iter() {
+        for sp in sources.iter() {
             let mut rows = AVec::new();
             let mut cursor = ScanCursor::new(sp.root);
             let mut buf = AVec::new();
@@ -3326,12 +3357,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             src_rows.push(rows);
         }
-        // 2. Nested-loop join + WHERE.
-        let mut rows: AVec<RowData> = AVec::new();
-        join_rows::<S::Error>(&qp, src_rows.as_slice(), 0, &RowData::empty(), &mut rows)?;
-        // 3. Group / project.
-        let mut produced = project_rows::<S::Error>(&qp, rows.as_slice())?;
-        // 4. DISTINCT (on output values, first occurrence wins).
+        Ok(src_rows)
+    }
+
+    /// DISTINCT, ORDER BY, LIMIT/OFFSET over produced rows
+    /// (v0.4 executor steps 4-6, shared by the subquery path).
+    #[cfg(feature = "v04")]
+    fn finish_produced(&mut self, qp: &QueryPlan, mut produced: AVec<Produced>) {
         if qp.distinct {
             let mut kept: AVec<Produced> = AVec::new();
             for p in produced.iter() {
@@ -3352,7 +3384,6 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             produced = kept;
         }
-        // 5. ORDER BY (stable).
         produced.as_mut_slice().sort_by(|x, y| {
             for ((av, bv), (_, desc)) in x.keys.iter().zip(y.keys.iter()).zip(qp.order_by.iter()) {
                 let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
@@ -3363,7 +3394,6 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             core::cmp::Ordering::Equal
         });
-        // 6. LIMIT / OFFSET.
         let start = qp.offset.max(0) as usize;
         let mut kept_rows: AVec<AVec<OwnedValue>> = AVec::new();
         let mut kept_ids: AVec<Option<i64>> = AVec::new();
@@ -3382,7 +3412,567 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.query_rows = kept_rows;
         self.query_rowids = kept_ids;
+    }
+
+    // ---------------- v0.6 subquery execution ----------------
+
+    /// The v0.6 query path: like `run_query`, but ON / WHERE /
+    /// projection evaluate through `eval_row_sub`, which
+    /// executes each subquery node against the pager for the
+    /// row at hand and substitutes its value before the
+    /// synchronous evaluator runs.
+    #[cfg(feature = "v06")]
+    async fn run_query_sub(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
+        let src_rows = self.materialise_query_sources(qp.sources.as_slice()).await?;
+        let mut rows: AVec<RowData> = AVec::new();
+        self.join_qp_async(&qp, src_rows.as_slice(), 0, RowData::empty(), &mut rows)
+            .await?;
+        let produced = self.project_qp_async(&qp, rows.as_slice()).await?;
+        self.finish_produced(&qp, produced);
         Ok(())
+    }
+
+    /// Evaluate one expression for one row, executing any
+    /// subquery nodes it contains first (v0.6). Expressions
+    /// without subqueries take the plain synchronous path.
+    #[cfg(feature = "v06")]
+    async fn eval_row_sub(&mut self, e: &RExpr, row: &RowData) -> Result<OwnedValue, S::Error> {
+        if !crate::query::has_sub(e) {
+            return crate::query::eval::<S::Error>(e, &Ctx::Row(row));
+        }
+        let values = self.compute_sub_values(e, row).await?;
+        let mut pos = 0;
+        let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
+        crate::query::eval::<S::Error>(&e2, &Ctx::Row(row))
+    }
+
+    /// Evaluate one expression for an aggregate group (v0.6):
+    /// subqueries resolve against the group's representative
+    /// row, exactly like bare columns.
+    #[cfg(feature = "v06")]
+    async fn eval_group_sub(
+        &mut self,
+        e: &RExpr,
+        rows: &[RowData],
+        rep: &RowData,
+    ) -> Result<OwnedValue, S::Error> {
+        if !crate::query::has_sub(e) {
+            return crate::query::eval::<S::Error>(e, &Ctx::Group { rows, rep });
+        }
+        let values = self.compute_sub_values(e, rep).await?;
+        let mut pos = 0;
+        let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
+        crate::query::eval::<S::Error>(&e2, &Ctx::Group { rows, rep })
+    }
+
+    /// Execute every current-scope subquery node of `e` for the
+    /// outer row `outer`, in `collect_subs` traversal order.
+    #[cfg(feature = "v06")]
+    async fn compute_sub_values(
+        &mut self,
+        e: &RExpr,
+        outer: &RowData,
+    ) -> Result<AVec<crate::query::SubValue>, S::Error> {
+        use crate::query::{SubKind, SubValue, collect_subs};
+        let mut kinds: AVec<SubKind<'_>> = AVec::new();
+        collect_subs(e, &mut kinds);
+        let mut out: AVec<SubValue> = AVec::new();
+        for k in kinds.iter() {
+            match k {
+                SubKind::Scalar(plan) => {
+                    let rows = self.exec_subplan(plan, outer).await?;
+                    out.push(SubValue::One(match rows.as_slice().first() {
+                        Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
+                        None => OwnedValue::Null,
+                    }));
+                }
+                SubKind::Exists(plan) => {
+                    let rows = self.exec_subplan(plan, outer).await?;
+                    out.push(SubValue::One(OwnedValue::Integer(if rows.is_empty() {
+                        0
+                    } else {
+                        1
+                    })));
+                }
+                SubKind::In(plan) => {
+                    let rows = self.exec_subplan(plan, outer).await?;
+                    let mut vs = AVec::new();
+                    for r in rows.iter() {
+                        vs.push(r.as_slice().first().cloned().unwrap_or(OwnedValue::Null));
+                    }
+                    out.push(SubValue::Many(vs));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Execute one planned subquery for one outer row (v0.6):
+    /// scan its sources, nested-loop join them onto the outer
+    /// row, group/project, then DISTINCT / ORDER BY / LIMIT.
+    /// Returns the result rows' output values. The future is
+    /// boxed: subquery execution is recursive (a subquery's
+    /// expressions can contain further subqueries), and boxing
+    /// this link keeps the async layout finite.
+    #[cfg(feature = "v06")]
+    fn exec_subplan<'x>(
+        &'x mut self,
+        plan: &'x crate::query::SubPlan,
+        outer: &'x RowData,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<
+            dyn core::future::Future<Output = Result<AVec<AVec<OwnedValue>>, S::Error>> + 'x,
+        >,
+    > {
+        alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer))
+    }
+
+    #[cfg(feature = "v06")]
+    async fn exec_subplan_inner(
+        &mut self,
+        plan: &crate::query::SubPlan,
+        outer: &RowData,
+    ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
+        let plan = plan.clone();
+        // Materialise the subquery's own sources.
+        let mut src_rows: AVec<AVec<(AVec<OwnedValue>, i64)>> = AVec::new();
+        for sp in plan.sources.iter() {
+            let mut rows = AVec::new();
+            let mut cursor = ScanCursor::new(sp.root);
+            let mut buf = AVec::new();
+            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+                let mut dec: AVec<Value<'_>> = AVec::new();
+                crate::record::decode_record_into::<S::Error>(buf.as_slice(), sp.ncols, &mut dec)?;
+                let mut vals = AVec::new();
+                for i in 0..sp.ncols {
+                    let mut v = if Some(i) == sp.rowid_alias {
+                        OwnedValue::Integer(rowid)
+                    } else if i < dec.len() {
+                        OwnedValue::from_value(dec.as_slice()[i])
+                    } else {
+                        sp.defaults.as_slice()[i].clone()
+                    };
+                    if sp.affs.as_slice()[i] == crate::record::Affinity::Real
+                        && let OwnedValue::Integer(x) = v
+                    {
+                        v = OwnedValue::Real(x as f64);
+                    }
+                    vals.push(v);
+                }
+                rows.push((vals, rowid));
+            }
+            src_rows.push(rows);
+        }
+        let mut joined: AVec<RowData> = AVec::new();
+        self.sub_join(&plan, src_rows.as_slice(), 0, outer.clone(), &mut joined)
+            .await?;
+        let mut produced = self.sub_project(&plan, outer, joined.as_slice()).await?;
+        if plan.distinct {
+            let mut kept: AVec<Produced> = AVec::new();
+            for p in produced.iter() {
+                let dup = kept.iter().any(|k: &Produced| {
+                    k.out.len() == p.out.len()
+                        && k.out
+                            .iter()
+                            .zip(p.out.iter())
+                            .all(|(a, b)| crate::query::values_equal_is(a, b))
+                });
+                if !dup {
+                    kept.push(Produced {
+                        out: p.out.clone(),
+                        keys: p.keys.clone(),
+                        rowid: p.rowid,
+                    });
+                }
+            }
+            produced = kept;
+        }
+        produced.as_mut_slice().sort_by(|x, y| {
+            for ((av, bv), (_, desc)) in x.keys.iter().zip(y.keys.iter()).zip(plan.order_by.iter())
+            {
+                let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+                let o = if *desc { o.reverse() } else { o };
+                if o != core::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            core::cmp::Ordering::Equal
+        });
+        let start = plan.offset.max(0) as usize;
+        let mut rows_out: AVec<AVec<OwnedValue>> = AVec::new();
+        for (i, p) in produced.iter().enumerate() {
+            if i < start {
+                continue;
+            }
+            if let Some(l) = plan.limit
+                && l >= 0
+                && (rows_out.len() as i64) >= l
+            {
+                break;
+            }
+            rows_out.push(p.out.clone());
+        }
+        Ok(rows_out)
+    }
+
+    /// Nested-loop join for a subquery (v0.6): like `join_rows`,
+    /// but the accumulator starts from the outer row and ON /
+    /// WHERE evaluate through `eval_row_sub` (a nested
+    /// subquery may itself be correlated to the combined row).
+    /// Recursive, so the future is boxed.
+    #[cfg(feature = "v06")]
+    fn sub_join<'x>(
+        &'x mut self,
+        plan: &'x crate::query::SubPlan,
+        src_rows: &'x [AVec<(AVec<OwnedValue>, i64)>],
+        idx: usize,
+        acc: RowData,
+        out: &'x mut AVec<RowData>,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<dyn core::future::Future<Output = Result<(), S::Error>> + 'x>,
+    > {
+        alloc::boxed::Box::pin(async move {
+            if idx == plan.sources.len() {
+                let keep = match &plan.filter {
+                    None => true,
+                    Some(f) => {
+                        crate::query::truthy(&self.eval_row_sub(f, &acc).await?) == Some(true)
+                    }
+                };
+                if keep {
+                    out.push(acc);
+                }
+                return Ok(());
+            }
+            let sp = &plan.sources.as_slice()[idx];
+            let mut matched = false;
+            for (vals, rowid) in src_rows[idx].iter() {
+                let mut acc2 = acc.clone();
+                for v in vals.iter() {
+                    acc2.vals.push(v.clone());
+                }
+                acc2.rowids.push(Some(*rowid));
+                let on_ok = match &sp.on {
+                    None => true,
+                    Some(on) => {
+                        crate::query::truthy(&self.eval_row_sub(on, &acc2).await?) == Some(true)
+                    }
+                };
+                if on_ok {
+                    matched = true;
+                    self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out).await?;
+                }
+            }
+            if sp.kind == JoinKind::Left && !matched {
+                let mut acc2 = acc.clone();
+                for _ in 0..sp.ncols {
+                    acc2.vals.push(OwnedValue::Null);
+                }
+                acc2.rowids.push(None);
+                self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Nested-loop join for a top-level query whose ON / WHERE
+    /// contain subqueries (v0.6): `join_rows` with per-candidate
+    /// subquery execution. Recursive, so the future is boxed.
+    #[cfg(feature = "v06")]
+    fn join_qp_async<'x>(
+        &'x mut self,
+        qp: &'x QueryPlan,
+        src_rows: &'x [AVec<(AVec<OwnedValue>, i64)>],
+        idx: usize,
+        acc: RowData,
+        out: &'x mut AVec<RowData>,
+    ) -> core::pin::Pin<
+        alloc::boxed::Box<dyn core::future::Future<Output = Result<(), S::Error>> + 'x>,
+    > {
+        alloc::boxed::Box::pin(async move {
+            if idx == qp.sources.len() {
+                let keep = match &qp.filter {
+                    None => true,
+                    Some(f) => {
+                        crate::query::truthy(&self.eval_row_sub(f, &acc).await?) == Some(true)
+                    }
+                };
+                if keep {
+                    out.push(acc);
+                }
+                return Ok(());
+            }
+            let sp = &qp.sources.as_slice()[idx];
+            let mut matched = false;
+            for (vals, rowid) in src_rows[idx].iter() {
+                let mut acc2 = acc.clone();
+                for v in vals.iter() {
+                    acc2.vals.push(v.clone());
+                }
+                acc2.rowids.push(Some(*rowid));
+                let on_ok = match &sp.on {
+                    None => true,
+                    Some(on) => {
+                        crate::query::truthy(&self.eval_row_sub(on, &acc2).await?) == Some(true)
+                    }
+                };
+                if on_ok {
+                    matched = true;
+                    self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out).await?;
+                }
+            }
+            if sp.kind == JoinKind::Left && !matched {
+                let mut acc2 = acc.clone();
+                for _ in 0..sp.ncols {
+                    acc2.vals.push(OwnedValue::Null);
+                }
+                acc2.rowids.push(None);
+                self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Group / project for a top-level query whose expressions
+    /// contain subqueries (v0.6): `project_rows` with per-row /
+    /// per-group subquery execution.
+    #[cfg(feature = "v06")]
+    async fn project_qp_async(
+        &mut self,
+        qp: &QueryPlan,
+        rows: &[RowData],
+    ) -> Result<AVec<Produced>, S::Error> {
+        let mut out = AVec::new();
+        if !qp.has_agg {
+            for r in rows {
+                let mut vals = AVec::new();
+                for it in qp.items.iter() {
+                    vals.push(self.eval_row_sub(it, r).await?);
+                }
+                let mut keys = AVec::new();
+                for (e, _) in qp.order_by.iter() {
+                    keys.push(self.eval_row_sub(e, r).await?);
+                }
+                let rowid = if qp.sources.len() == 1 {
+                    r.rowids.as_slice()[0]
+                } else {
+                    None
+                };
+                out.push(Produced {
+                    out: vals,
+                    keys,
+                    rowid,
+                });
+            }
+            return Ok(out);
+        }
+        // Grouping, mirroring project_rows but with per-row
+        // subquery execution for the keys.
+        let total_width: usize = qp.sources.iter().map(|s| s.ncols).sum();
+        let empty_rep = RowData {
+            vals: {
+                let mut v = AVec::new();
+                for _ in 0..total_width {
+                    v.push(OwnedValue::Null);
+                }
+                v
+            },
+            rowids: {
+                let mut v = AVec::new();
+                for _ in qp.sources.iter() {
+                    v.push(None);
+                }
+                v
+            },
+        };
+        let mut groups: AVec<(AVec<OwnedValue>, AVec<RowData>)> = AVec::new();
+        if qp.group_by.is_empty() {
+            let mut all = AVec::new();
+            for r in rows {
+                all.push(r.clone());
+            }
+            groups.push((AVec::new(), all));
+        } else {
+            for r in rows {
+                let mut key = AVec::new();
+                for g in qp.group_by.iter() {
+                    key.push(self.eval_row_sub(g, r).await?);
+                }
+                let mut found = None;
+                for (gi, (k, _)) in groups.iter().enumerate() {
+                    if k.len() == key.len()
+                        && k.iter()
+                            .zip(key.iter())
+                            .all(|(a, b)| crate::query::values_equal_is(a, b))
+                    {
+                        found = Some(gi);
+                        break;
+                    }
+                }
+                match found {
+                    Some(gi) => groups.as_mut_slice()[gi].1.push(r.clone()),
+                    None => {
+                        let mut g = AVec::new();
+                        g.push(r.clone());
+                        groups.push((key, g));
+                    }
+                }
+            }
+            groups.as_mut_slice().sort_by(|a, b| {
+                for (av, bv) in a.0.iter().zip(b.0.iter()) {
+                    let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+        }
+        for (_, grows) in groups.iter() {
+            let rep = pick_rep::<S::Error>(qp, grows.as_slice(), &empty_rep)?;
+            if let Some(h) = &qp.having
+                && crate::query::truthy(
+                    &self
+                        .eval_group_sub(h, grows.as_slice(), &rep)
+                        .await?,
+                ) != Some(true)
+            {
+                continue;
+            }
+            let mut vals = AVec::new();
+            for it in qp.items.iter() {
+                vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
+            }
+            let mut keys = AVec::new();
+            for (e, _) in qp.order_by.iter() {
+                keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
+            }
+            out.push(Produced {
+                out: vals,
+                keys,
+                rowid: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Group / project for a subquery (v0.6): `project_rows`
+    /// over combined (outer ++ inner) rows; the empty-group
+    /// representative keeps the outer row's values and pads the
+    /// subquery's own columns with NULLs.
+    #[cfg(feature = "v06")]
+    async fn sub_project(
+        &mut self,
+        plan: &crate::query::SubPlan,
+        outer: &RowData,
+        rows: &[RowData],
+    ) -> Result<AVec<Produced>, S::Error> {
+        let mut out = AVec::new();
+        if !plan.has_agg {
+            for r in rows {
+                let mut vals = AVec::new();
+                for it in plan.items.iter() {
+                    vals.push(self.eval_row_sub(it, r).await?);
+                }
+                let mut keys = AVec::new();
+                for (e, _) in plan.order_by.iter() {
+                    keys.push(self.eval_row_sub(e, r).await?);
+                }
+                out.push(Produced {
+                    out: vals,
+                    keys,
+                    rowid: None,
+                });
+            }
+            return Ok(out);
+        }
+        // Grouping: keys evaluate per combined row.
+        let inner_width: usize = plan.sources.iter().map(|s| s.ncols).sum();
+        let empty_rep = RowData {
+            vals: {
+                let mut v = outer.vals.clone();
+                for _ in 0..inner_width {
+                    v.push(OwnedValue::Null);
+                }
+                v
+            },
+            rowids: {
+                let mut v = outer.rowids.clone();
+                for _ in plan.sources.iter() {
+                    v.push(None);
+                }
+                v
+            },
+        };
+        let mut groups: AVec<(AVec<OwnedValue>, AVec<RowData>)> = AVec::new();
+        if plan.group_by.is_empty() {
+            let mut all = AVec::new();
+            for r in rows {
+                all.push(r.clone());
+            }
+            groups.push((AVec::new(), all));
+        } else {
+            for r in rows {
+                let mut key = AVec::new();
+                for g in plan.group_by.iter() {
+                    key.push(self.eval_row_sub(g, r).await?);
+                }
+                let mut found = None;
+                for (gi, (k, _)) in groups.iter().enumerate() {
+                    if k.len() == key.len()
+                        && k.iter()
+                            .zip(key.iter())
+                            .all(|(a, b)| crate::query::values_equal_is(a, b))
+                    {
+                        found = Some(gi);
+                        break;
+                    }
+                }
+                match found {
+                    Some(gi) => groups.as_mut_slice()[gi].1.push(r.clone()),
+                    None => {
+                        let mut g = AVec::new();
+                        g.push(r.clone());
+                        groups.push((key, g));
+                    }
+                }
+            }
+            groups.as_mut_slice().sort_by(|a, b| {
+                for (av, bv) in a.0.iter().zip(b.0.iter()) {
+                    let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+        }
+        for (_, grows) in groups.iter() {
+            let rep = pick_rep_sub::<S::Error>(plan, grows.as_slice(), &empty_rep)?;
+            if let Some(h) = &plan.having
+                && crate::query::truthy(
+                    &self
+                        .eval_group_sub(h, grows.as_slice(), &rep)
+                        .await?,
+                ) != Some(true)
+            {
+                continue;
+            }
+            let mut vals = AVec::new();
+            for it in plan.items.iter() {
+                vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
+            }
+            let mut keys = AVec::new();
+            for (e, _) in plan.order_by.iter() {
+                keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
+            }
+            out.push(Produced {
+                out: vals,
+                keys,
+                rowid: None,
+            });
+        }
+        Ok(out)
     }
 
     // ---------------- v0.4 DDL ----------------
@@ -3642,6 +4232,81 @@ impl<'c, S: Storage> Statement<'c, S> {
     pub fn arena_high_water(&self) -> usize {
         self.arena.high_water()
     }
+}
+
+/// Whether any expression of a query plan contains a
+/// current-scope subquery node (v0.6): such plans execute
+/// through the substitution path instead of the synchronous
+/// v0.4 executor.
+#[cfg(feature = "v06")]
+fn query_plan_has_sub(qp: &QueryPlan) -> bool {
+    use crate::query::has_sub;
+    qp.sources.iter().any(|s| s.on.as_ref().is_some_and(has_sub))
+        || qp.filter.as_ref().is_some_and(has_sub)
+        || qp.items.iter().any(has_sub)
+        || qp.group_by.iter().any(has_sub)
+        || qp.having.as_ref().is_some_and(has_sub)
+        || qp.order_by.iter().any(|(e, _)| has_sub(e))
+}
+
+/// The representative row of a subquery's group (v0.6): the
+/// `pick_rep` rule (first row, or the extremum row of a lone
+/// min/max aggregate) over combined rows. Aggregate arguments
+/// are subquery-free by the plan-time check, so plain
+/// synchronous evaluation suffices here.
+#[cfg(feature = "v06")]
+fn pick_rep_sub<E>(
+    plan: &crate::query::SubPlan,
+    grows: &[RowData],
+    empty_rep: &RowData,
+) -> Result<RowData, E> {
+    if grows.is_empty() {
+        return Ok(empty_rep.clone());
+    }
+    let mut aggs: AVec<&RExpr> = AVec::new();
+    for it in plan.items.iter() {
+        crate::query::collect_aggs(it, &mut aggs);
+    }
+    if let Some(h) = &plan.having {
+        crate::query::collect_aggs(h, &mut aggs);
+    }
+    if aggs.len() == 1
+        && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
+        && matches!(
+            kind,
+            crate::query::AggKind::Min | crate::query::AggKind::Max
+        )
+        && !args.is_empty()
+    {
+        let arg = &args.as_slice()[0];
+        let mut best: Option<&RowData> = None;
+        let mut bestv: Option<OwnedValue> = None;
+        for r in grows {
+            let v = crate::query::eval::<E>(arg, &Ctx::Row(r))?;
+            if matches!(v, OwnedValue::Null) {
+                continue;
+            }
+            let take = match &bestv {
+                None => true,
+                Some(b) => {
+                    let o = crate::record::compare_values(&v.as_value(), &b.as_value());
+                    if *kind == crate::query::AggKind::Min {
+                        o == core::cmp::Ordering::Less
+                    } else {
+                        o == core::cmp::Ordering::Greater
+                    }
+                }
+            };
+            if take {
+                best = Some(r);
+                bestv = Some(v);
+            }
+        }
+        if let Some(b) = best {
+            return Ok(b.clone());
+        }
+    }
+    Ok(grows[0].clone())
 }
 
 /// One produced result row of a v0.4 query (output values, sort

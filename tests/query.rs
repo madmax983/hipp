@@ -514,11 +514,7 @@ fn query_rejections() {
                 kind: hipp::SchemaKind::UnknownColumn
             })
         ));
-        // Subqueries are outside v0.4.
-        assert!(
-            db.prepare("SELECT a FROM t WHERE a IN (SELECT a FROM u)")
-                .await
-                .is_err()
-        );
+        // Subqueries were outside v0.4; since v0.6 they plan
+        // and run (covered differentially in tests/subqueries.rs).
     });
 }
