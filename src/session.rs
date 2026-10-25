@@ -885,9 +885,9 @@ impl<S: Storage> Connection<S> {
         #[cfg(not(feature = "v06"))]
         {
             let _ = arena;
-            move |_: &SelectStmt,
-                  _: &crate::query::ScopeGroup,
-                  _: &[crate::query::ScopeGroup]| { Err(Error::Unsupported) }
+            move |_: &SelectStmt, _: &crate::query::ScopeGroup, _: &[crate::query::ScopeGroup]| {
+                Err(Error::Unsupported)
+            }
         }
     }
 
@@ -918,13 +918,9 @@ impl<S: Storage> Connection<S> {
                     .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
                 {
                     Some(idx) => Ok(items[idx].clone()),
-                    None => crate::query::resolve_scoped::<S::Error>(
-                        e,
-                        arena,
-                        cur,
-                        enclosing,
-                        planner,
-                    ),
+                    None => {
+                        crate::query::resolve_scoped::<S::Error>(e, arena, cur, enclosing, planner)
+                    }
                 }
             }
             _ => crate::query::resolve_scoped::<S::Error>(e, arena, cur, enclosing, planner),
@@ -2766,13 +2762,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             if let Some(f) = filter {
                 let rd = row_data_for(rowid_alias, affs, rec.as_slice(), rowid);
                 #[cfg(feature = "v06")]
-                let keep =
-                    crate::query::truthy(&self.eval_row_sub(f, &rd).await?) == Some(true);
+                let keep = crate::query::truthy(&self.eval_row_sub(f, &rd).await?) == Some(true);
                 #[cfg(not(feature = "v06"))]
-                let keep = crate::query::truthy(&crate::query::eval::<S::Error>(
-                    f,
-                    &Ctx::Row(&rd),
-                )?) == Some(true);
+                let keep =
+                    crate::query::truthy(&crate::query::eval::<S::Error>(f, &Ctx::Row(&rd))?)
+                        == Some(true);
                 if !keep {
                     continue;
                 }
@@ -3310,7 +3304,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         if query_plan_has_sub(&qp) {
             return self.run_query_sub(qp).await;
         }
-        let src_rows = self.materialise_query_sources(qp.sources.as_slice()).await?;
+        let src_rows = self
+            .materialise_query_sources(qp.sources.as_slice())
+            .await?;
         // Nested-loop join + WHERE, then group / project: the
         // synchronous v0.4 executor (no subqueries in the plan).
         let mut rows: AVec<RowData> = AVec::new();
@@ -3423,7 +3419,9 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// synchronous evaluator runs.
     #[cfg(feature = "v06")]
     async fn run_query_sub(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
-        let src_rows = self.materialise_query_sources(qp.sources.as_slice()).await?;
+        let src_rows = self
+            .materialise_query_sources(qp.sources.as_slice())
+            .await?;
         let mut rows: AVec<RowData> = AVec::new();
         self.join_qp_async(&qp, src_rows.as_slice(), 0, RowData::empty(), &mut rows)
             .await?;
@@ -3519,11 +3517,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         &'x mut self,
         plan: &'x crate::query::SubPlan,
         outer: &'x RowData,
-    ) -> core::pin::Pin<
-        alloc::boxed::Box<
-            dyn core::future::Future<Output = Result<AVec<AVec<OwnedValue>>, S::Error>> + 'x,
-        >,
-    > {
+    ) -> SubplanFuture<'x, S::Error> {
         alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer))
     }
 
@@ -3628,9 +3622,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         idx: usize,
         acc: RowData,
         out: &'x mut AVec<RowData>,
-    ) -> core::pin::Pin<
-        alloc::boxed::Box<dyn core::future::Future<Output = Result<(), S::Error>> + 'x>,
-    > {
+    ) -> JoinFuture<'x, S::Error> {
         alloc::boxed::Box::pin(async move {
             if idx == plan.sources.len() {
                 let keep = match &plan.filter {
@@ -3660,7 +3652,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 };
                 if on_ok {
                     matched = true;
-                    self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out).await?;
+                    self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out)
+                        .await?;
                 }
             }
             if sp.kind == JoinKind::Left && !matched {
@@ -3669,7 +3662,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     acc2.vals.push(OwnedValue::Null);
                 }
                 acc2.rowids.push(None);
-                self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out).await?;
+                self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out)
+                    .await?;
             }
             Ok(())
         })
@@ -3686,9 +3680,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         idx: usize,
         acc: RowData,
         out: &'x mut AVec<RowData>,
-    ) -> core::pin::Pin<
-        alloc::boxed::Box<dyn core::future::Future<Output = Result<(), S::Error>> + 'x>,
-    > {
+    ) -> JoinFuture<'x, S::Error> {
         alloc::boxed::Box::pin(async move {
             if idx == qp.sources.len() {
                 let keep = match &qp.filter {
@@ -3718,7 +3710,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 };
                 if on_ok {
                     matched = true;
-                    self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out).await?;
+                    self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out)
+                        .await?;
                 }
             }
             if sp.kind == JoinKind::Left && !matched {
@@ -3727,7 +3720,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     acc2.vals.push(OwnedValue::Null);
                 }
                 acc2.rowids.push(None);
-                self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out).await?;
+                self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out)
+                    .await?;
             }
             Ok(())
         })
@@ -3831,11 +3825,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         for (_, grows) in groups.iter() {
             let rep = pick_rep::<S::Error>(qp, grows.as_slice(), &empty_rep)?;
             if let Some(h) = &qp.having
-                && crate::query::truthy(
-                    &self
-                        .eval_group_sub(h, grows.as_slice(), &rep)
-                        .await?,
-                ) != Some(true)
+                && crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
+                    != Some(true)
             {
                 continue;
             }
@@ -3950,11 +3941,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         for (_, grows) in groups.iter() {
             let rep = pick_rep_sub::<S::Error>(plan, grows.as_slice(), &empty_rep)?;
             if let Some(h) = &plan.having
-                && crate::query::truthy(
-                    &self
-                        .eval_group_sub(h, grows.as_slice(), &rep)
-                        .await?,
-                ) != Some(true)
+                && crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
+                    != Some(true)
             {
                 continue;
             }
@@ -4234,6 +4222,17 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 }
 
+/// A boxed subquery-execution future (v0.6).
+#[cfg(feature = "v06")]
+type SubplanFuture<'x, E> = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<AVec<AVec<OwnedValue>>, E>> + 'x>,
+>;
+
+/// A boxed recursive-join future (v0.6).
+#[cfg(feature = "v06")]
+type JoinFuture<'x, E> =
+    core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), E>> + 'x>>;
+
 /// Whether any expression of a query plan contains a
 /// current-scope subquery node (v0.6): such plans execute
 /// through the substitution path instead of the synchronous
@@ -4241,7 +4240,9 @@ impl<'c, S: Storage> Statement<'c, S> {
 #[cfg(feature = "v06")]
 fn query_plan_has_sub(qp: &QueryPlan) -> bool {
     use crate::query::has_sub;
-    qp.sources.iter().any(|s| s.on.as_ref().is_some_and(has_sub))
+    qp.sources
+        .iter()
+        .any(|s| s.on.as_ref().is_some_and(has_sub))
         || qp.filter.as_ref().is_some_and(has_sub)
         || qp.items.iter().any(has_sub)
         || qp.group_by.iter().any(has_sub)

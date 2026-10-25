@@ -401,39 +401,110 @@ pub fn resolve_scoped<E>(
             }
             RExpr::SubScalar(Box::new(plan))
         }
-        Expr::ExistsSubquery(stmt) => {
-            RExpr::SubExists(Box::new(planner(stmt, cur, enclosing)?))
-        },
+        Expr::ExistsSubquery(stmt) => RExpr::SubExists(Box::new(planner(stmt, cur, enclosing)?)),
         Expr::Binary(op, l, r) => RExpr::Binary(
             *op,
-            Box::new(resolve_scoped::<E>(l, arena, cur, enclosing, &mut *planner)?),
-            Box::new(resolve_scoped::<E>(r, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(
+                l,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
+            Box::new(resolve_scoped::<E>(
+                r,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
         ),
-        Expr::Neg(e) => RExpr::Neg(Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?)),
-        Expr::Not(e) => RExpr::Not(Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?)),
-        Expr::IsNull(e, neg) => {
-            RExpr::IsNull(Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?), *neg)
-        }
+        Expr::Neg(e) => RExpr::Neg(Box::new(resolve_scoped::<E>(
+            e,
+            arena,
+            cur,
+            enclosing,
+            &mut *planner,
+        )?)),
+        Expr::Not(e) => RExpr::Not(Box::new(resolve_scoped::<E>(
+            e,
+            arena,
+            cur,
+            enclosing,
+            &mut *planner,
+        )?)),
+        Expr::IsNull(e, neg) => RExpr::IsNull(
+            Box::new(resolve_scoped::<E>(
+                e,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
+            *neg,
+        ),
         Expr::InList(x, list, neg) => {
             let mut out = AVec::new();
             for e in list.iter() {
-                out.push(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?);
+                out.push(resolve_scoped::<E>(
+                    e,
+                    arena,
+                    cur,
+                    enclosing,
+                    &mut *planner,
+                )?);
             }
             RExpr::InList(
-                Box::new(resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?),
+                Box::new(resolve_scoped::<E>(
+                    x,
+                    arena,
+                    cur,
+                    enclosing,
+                    &mut *planner,
+                )?),
                 out,
                 *neg,
             )
         }
         Expr::Between(x, lo, hi, neg) => RExpr::Between(
-            Box::new(resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?),
-            Box::new(resolve_scoped::<E>(lo, arena, cur, enclosing, &mut *planner)?),
-            Box::new(resolve_scoped::<E>(hi, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(
+                x,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
+            Box::new(resolve_scoped::<E>(
+                lo,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
+            Box::new(resolve_scoped::<E>(
+                hi,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
             *neg,
         ),
         Expr::Like(x, p, neg) => RExpr::Like(
-            Box::new(resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?),
-            Box::new(resolve_scoped::<E>(p, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(
+                x,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
+            Box::new(resolve_scoped::<E>(
+                p,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
             *neg,
         ),
         Expr::Case {
@@ -450,18 +521,36 @@ pub fn resolve_scoped<E>(
             }
             RExpr::Case {
                 base: match base {
-                    Some(b) => Some(Box::new(resolve_scoped::<E>(b, arena, cur, enclosing, &mut *planner)?)),
+                    Some(b) => Some(Box::new(resolve_scoped::<E>(
+                        b,
+                        arena,
+                        cur,
+                        enclosing,
+                        &mut *planner,
+                    )?)),
                     None => None,
                 },
                 whens: ws,
                 otherwise: match otherwise {
-                    Some(o) => Some(Box::new(resolve_scoped::<E>(o, arena, cur, enclosing, &mut *planner)?)),
+                    Some(o) => Some(Box::new(resolve_scoped::<E>(
+                        o,
+                        arena,
+                        cur,
+                        enclosing,
+                        &mut *planner,
+                    )?)),
                     None => None,
                 },
             }
         }
         Expr::Cast(e, ty) => RExpr::Cast(
-            Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(
+                e,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
             crate::record::affinity_of(handle_bytes(arena, *ty)),
         ),
         Expr::Func {
@@ -491,7 +580,13 @@ fn resolve_args<E>(
 ) -> Result<AVec<RExpr>, E> {
     let mut out = AVec::new();
     for a in args.iter() {
-        out.push(resolve_scoped::<E>(a, arena, cur, enclosing, &mut *planner)?);
+        out.push(resolve_scoped::<E>(
+            a,
+            arena,
+            cur,
+            enclosing,
+            &mut *planner,
+        )?);
     }
     Ok(out)
 }
