@@ -1048,7 +1048,17 @@ impl<'a> Parser<'a> {
             if self.eat_kw(b"IN") {
                 self.expect::<E>(Tok::LParen)?;
                 if self.cur_is_kw(b"SELECT") {
-                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                    #[cfg(feature = "v06")]
+                    {
+                        let stmt = self.select_rich::<E>()?;
+                        self.expect::<E>(Tok::RParen)?;
+                        l = Expr::InSubquery(Box::new(l), Box::new(stmt), neg);
+                        continue;
+                    }
+                    #[cfg(not(feature = "v06"))]
+                    {
+                        return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                    }
                 }
                 let mut list = AVec::new();
                 if self.cur().tok != Tok::RParen {
@@ -1159,9 +1169,29 @@ impl<'a> Parser<'a> {
     }
 
     fn expr_primary<E>(&mut self) -> Result<Expr, E> {
+        #[cfg(feature = "v06")]
+        if self.cur_is_kw(b"EXISTS") {
+            self.pos += 1;
+            self.expect::<E>(Tok::LParen)?;
+            if !self.cur_is_kw(b"SELECT") {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+            let stmt = self.select_rich::<E>()?;
+            self.expect::<E>(Tok::RParen)?;
+            return Ok(Expr::ExistsSubquery(Box::new(stmt)));
+        }
         if self.eat(Tok::LParen) {
             if self.cur_is_kw(b"SELECT") {
-                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                #[cfg(feature = "v06")]
+                {
+                    let stmt = self.select_rich::<E>()?;
+                    self.expect::<E>(Tok::RParen)?;
+                    return Ok(Expr::ScalarSubquery(Box::new(stmt)));
+                }
+                #[cfg(not(feature = "v06"))]
+                {
+                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                }
             }
             let e = self.parse_expr::<E>()?;
             self.expect::<E>(Tok::RParen)?;

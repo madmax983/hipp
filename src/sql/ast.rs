@@ -112,6 +112,14 @@ pub enum Expr {
     Not(Box<Expr>),
     IsNull(Box<Expr>, bool),
     InList(Box<Expr>, AVec<Expr>, bool),
+    /// `x [NOT] IN (SELECT ...)` (v0.6).
+    InSubquery(Box<Expr>, Box<SelectStmt>, bool),
+    /// `(SELECT ...)` as a scalar operand (v0.6): the first
+    /// column of the first row, or NULL when the subquery
+    /// yields no rows.
+    ScalarSubquery(Box<SelectStmt>),
+    /// `EXISTS (SELECT ...)` (v0.6).
+    ExistsSubquery(Box<SelectStmt>),
     Between(Box<Expr>, Box<Expr>, Box<Expr>, bool),
     Like(Box<Expr>, Box<Expr>, bool),
     /// CASE: optional base operand, (when, then) pairs, optional

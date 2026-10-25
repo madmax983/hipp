@@ -95,6 +95,16 @@ pub enum RExpr {
     Not(Box<RExpr>),
     IsNull(Box<RExpr>, bool),
     InList(Box<RExpr>, AVec<RExpr>, bool),
+    /// A scalar subquery (v0.6): never evaluated directly — the
+    /// executor computes it per outer row and substitutes the
+    /// result as a `Literal` before `eval` runs (see
+    /// `substitute`). Evaluating one is `Error::Unsupported`.
+    SubScalar(Box<SubPlan>),
+    /// An EXISTS subquery (v0.6): substituted like `SubScalar`.
+    SubExists(Box<SubPlan>),
+    /// `x [NOT] IN (SELECT ...)` (v0.6): substituted to an
+    /// `InList` of literals before evaluation.
+    InSub(Box<RExpr>, Box<SubPlan>, bool),
     Between(Box<RExpr>, Box<RExpr>, Box<RExpr>, bool),
     Like(Box<RExpr>, Box<RExpr>, bool),
     Case {
@@ -117,45 +127,144 @@ pub enum RExpr {
 /// One FROM source for resolution: qualifier (alias if given, else
 /// the table name), column names + affinities in table order, and
 /// the rowid-alias column index if any.
+#[derive(Debug, Clone)]
 pub struct SourceDesc {
     pub qualifier: AVec<u8>,
     pub columns: AVec<(AVec<u8>, Affinity)>,
     pub rowid_alias: Option<usize>,
 }
 
+/// One level of name-resolution scope (v0.6): a query's own FROM
+/// sources, with absolute slot offsets into the (possibly
+/// combined outer ++ inner) evaluation row and the absolute
+/// index of its first source in that row's `rowids`. Subquery
+/// planning stacks these: the subquery's own group is resolved
+/// first, then enclosing groups nearest-first — SQLite's
+/// shadowing rule.
+#[derive(Debug, Clone)]
+pub struct ScopeGroup {
+    pub sources: AVec<SourceDesc>,
+    pub offsets: AVec<usize>,
+    pub first_src: usize,
+}
+
+impl ScopeGroup {
+    /// Total flat column slots across this group's sources.
+    pub fn width(&self) -> usize {
+        self.sources.iter().map(|s| s.columns.len()).sum()
+    }
+}
+
+/// One FROM source of a planned subquery (v0.6): the executor's
+/// view (root page + read rules), mirroring the session's query
+/// `SourcePlan` but self-contained so a `SubPlan` can nest.
+#[derive(Debug, Clone)]
+pub struct SubSource {
+    pub root: u32,
+    pub kind: crate::sql::JoinKind,
+    pub on: Option<RExpr>,
+    pub rowid_alias: Option<usize>,
+    pub ncols: usize,
+    pub affs: AVec<Affinity>,
+    pub defaults: AVec<OwnedValue>,
+}
+
+/// A planned subquery (v0.6): a full SELECT planned against the
+/// combined scope (enclosing sources ++ its own). Its
+/// expressions index the combined evaluation row, so executing
+/// it for one outer row is: scan its own sources, join them onto
+/// the outer row, project. Nested subqueries nest as further
+/// `RExpr` subquery nodes inside these expressions.
+#[derive(Debug, Clone)]
+pub struct SubPlan {
+    pub sources: AVec<SubSource>,
+    pub items: AVec<RExpr>,
+    pub filter: Option<RExpr>,
+    pub group_by: AVec<RExpr>,
+    pub having: Option<RExpr>,
+    pub order_by: AVec<(RExpr, bool)>,
+    pub distinct: bool,
+    pub limit: Option<i64>,
+    pub offset: i64,
+    pub has_agg: bool,
+}
+
+/// The computed value of one subquery node for one outer row
+/// (v0.6): a scalar / EXISTS result, or the first-column values
+/// of an IN subquery's rows.
+#[derive(Debug, Clone)]
+pub enum SubValue {
+    One(OwnedValue),
+    Many(AVec<OwnedValue>),
+}
+
+/// A subquery node found in an expression, in substitution
+/// traversal order (v0.6).
+#[derive(Debug, Clone, Copy)]
+pub enum SubKind<'x> {
+    Scalar(&'x SubPlan),
+    Exists(&'x SubPlan),
+    In(&'x SubPlan),
+}
+
 fn is_rowid_name(b: &[u8]) -> bool {
     eq_ci(b, b"rowid") || eq_ci(b, b"oid") || eq_ci(b, b"_rowid_")
 }
 
-/// Resolve one column reference to an `RExpr`.
-fn resolve_column<E>(
-    sources: &[SourceDesc],
-    offsets: &[usize],
+/// Try to resolve one column reference within a single scope
+/// group (v0.6). Returns None when this group cannot answer the
+/// reference at all (unqualified: no source has the column;
+/// qualified: no source carries the qualifier), so the caller
+/// may fall through to an enclosing scope. A group that *can*
+/// answer — including with an ambiguity or a missing column on
+/// a matched qualifier — answers definitively.
+fn resolve_column_in_group<E>(
+    group: &ScopeGroup,
     table: Option<&[u8]>,
     name: &[u8],
-) -> Result<RExpr, E> {
-    // Candidate: (flat slot or rowid source, is_rowid)
+) -> Option<Result<RExpr, E>> {
+    if let Some(q) = table {
+        for (si, src) in group.sources.iter().enumerate() {
+            if !eq_ci(src.qualifier.as_slice(), q) {
+                continue;
+            }
+            for (ci, (cname, aff)) in src.columns.iter().enumerate() {
+                if eq_ci(cname.as_slice(), name) {
+                    return Some(Ok(if Some(ci) == src.rowid_alias {
+                        RExpr::Rowid(group.first_src + si)
+                    } else {
+                        RExpr::Column(group.offsets[si] + ci, *aff)
+                    }));
+                }
+            }
+            if is_rowid_name(name) {
+                return Some(Ok(RExpr::Rowid(group.first_src + si)));
+            }
+            // The qualifier matched but the column does not
+            // exist: SQLite calls this "no such column" at
+            // prepare time, in this scope.
+            return Some(Err(Error::Schema {
+                kind: SchemaKind::UnknownColumn,
+            }));
+        }
+        return None;
+    }
     let mut found: Option<RExpr> = None;
     let mut ambiguous = false;
-    for (si, src) in sources.iter().enumerate() {
-        if let Some(q) = table
-            && !eq_ci(src.qualifier.as_slice(), q)
-        {
-            continue;
-        }
+    for (si, src) in group.sources.iter().enumerate() {
         let mut cand: Option<RExpr> = None;
         for (ci, (cname, aff)) in src.columns.iter().enumerate() {
             if eq_ci(cname.as_slice(), name) {
                 cand = Some(if Some(ci) == src.rowid_alias {
-                    RExpr::Rowid(si)
+                    RExpr::Rowid(group.first_src + si)
                 } else {
-                    RExpr::Column(offsets[si] + ci, *aff)
+                    RExpr::Column(group.offsets[si] + ci, *aff)
                 });
                 break;
             }
         }
         if cand.is_none() && is_rowid_name(name) {
-            cand = Some(RExpr::Rowid(si));
+            cand = Some(RExpr::Rowid(group.first_src + si));
         }
         if let Some(c) = cand {
             if found.is_some() {
@@ -164,25 +273,32 @@ fn resolve_column<E>(
                 found = Some(c);
             }
         }
-        if table.is_some() {
-            break;
-        }
     }
     if ambiguous {
-        return Err(Error::Schema {
+        return Some(Err(Error::Schema {
             kind: SchemaKind::AmbiguousColumn,
-        });
+        }));
     }
-    if let Some(f) = found {
-        return Ok(f);
+    found.map(Ok)
+}
+
+/// Resolve one column reference: the current query's sources
+/// first, then enclosing scopes nearest-first (v0.6 subquery
+/// shadowing). With no enclosing scopes this is exactly the
+/// pre-v0.6 rule.
+fn resolve_column<E>(
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    table: Option<&[u8]>,
+    name: &[u8],
+) -> Result<RExpr, E> {
+    if let Some(r) = resolve_column_in_group::<E>(cur, table, name) {
+        return r;
     }
-    if table.is_some() {
-        // Qualified reference to a source that exists but lacks the
-        // column, or to a source that does not exist: SQLite calls
-        // both "no such column" at prepare time.
-        return Err(Error::Schema {
-            kind: SchemaKind::UnknownColumn,
-        });
+    for g in enclosing {
+        if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
+            return r;
+        }
     }
     Err(Error::Schema {
         kind: SchemaKind::UnknownColumn,
@@ -207,54 +323,117 @@ fn literal_value(arena: &Arena, lit: Literal) -> OwnedValue {
     }
 }
 
-/// Resolve a parser `Expr` against the FROM sources. `offsets[i]`
-/// is source i's first flat slot. Aggregate functions resolve to
-/// `RExpr::Agg` wherever they appear; the planner decides where
-/// aggregates are legal.
+/// The subquery planner callback (v0.6): given a subquery's
+/// SELECT, the scope group of the query textually containing it,
+/// and the enclosing scope groups (nearest first), produce its
+/// plan. The session supplies the real planner; contexts that
+/// cannot execute subqueries (constant folding) supply one that
+/// fails with `Error::Unsupported`.
+pub type SubPlanner<'p, E> =
+    &'p mut dyn FnMut(&crate::sql::SelectStmt, &ScopeGroup, &[ScopeGroup]) -> Result<SubPlan, E>;
+
+/// Resolve a parser `Expr` against the FROM sources, with no
+/// enclosing scope and no subquery support (v0.6 contexts that
+/// plan subqueries call `resolve_scoped` directly). Aggregate
+/// functions resolve to `RExpr::Agg` wherever they appear; the
+/// planner decides where aggregates are legal.
 pub fn resolve<E>(
     expr: &Expr,
     arena: &Arena,
     sources: &[SourceDesc],
     offsets: &[usize],
 ) -> Result<RExpr, E> {
+    let mut srcs = AVec::new();
+    for s in sources {
+        srcs.push(s.clone());
+    }
+    let mut offs = AVec::new();
+    for o in offsets {
+        offs.push(*o);
+    }
+    let cur = ScopeGroup {
+        sources: srcs,
+        offsets: offs,
+        first_src: 0,
+    };
+    let mut planner = |_: &crate::sql::SelectStmt,
+                       _: &ScopeGroup,
+                       _: &[ScopeGroup]|
+     -> Result<SubPlan, E> { Err(Error::Unsupported) };
+    resolve_scoped::<E>(expr, arena, &cur, &[], &mut planner)
+}
+
+/// Resolve a parser `Expr` against the current scope group plus
+/// enclosing groups (nearest first), planning subqueries through
+/// `planner` (v0.6). Column resolution shadows outward: the
+/// current group answers first.
+pub fn resolve_scoped<E>(
+    expr: &Expr,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    planner: SubPlanner<'_, E>,
+) -> Result<RExpr, E> {
     Ok(match expr {
         Expr::Literal(l) => RExpr::Literal(literal_value(arena, *l)),
         Expr::Column { table, name } => resolve_column::<E>(
-            sources,
-            offsets,
+            cur,
+            enclosing,
             table.map(|h| handle_bytes(arena, h)),
             handle_bytes(arena, *name),
         )?,
+        Expr::InSubquery(x, stmt, neg) => {
+            let xr = resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let plan = planner(stmt, cur, enclosing)?;
+            if plan.items.len() != 1 {
+                return Err(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                });
+            }
+            RExpr::InSub(Box::new(xr), Box::new(plan), *neg)
+        }
+        Expr::ScalarSubquery(stmt) => {
+            let plan = planner(stmt, cur, enclosing)?;
+            if plan.items.len() != 1 {
+                return Err(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                });
+            }
+            RExpr::SubScalar(Box::new(plan))
+        }
+        Expr::ExistsSubquery(stmt) => {
+            RExpr::SubExists(Box::new(planner(stmt, cur, enclosing)?))
+        },
         Expr::Binary(op, l, r) => RExpr::Binary(
             *op,
-            Box::new(resolve::<E>(l, arena, sources, offsets)?),
-            Box::new(resolve::<E>(r, arena, sources, offsets)?),
+            Box::new(resolve_scoped::<E>(l, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(r, arena, cur, enclosing, &mut *planner)?),
         ),
-        Expr::Neg(e) => RExpr::Neg(Box::new(resolve::<E>(e, arena, sources, offsets)?)),
-        Expr::Not(e) => RExpr::Not(Box::new(resolve::<E>(e, arena, sources, offsets)?)),
+        Expr::Neg(e) => RExpr::Neg(Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?)),
+        Expr::Not(e) => RExpr::Not(Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?)),
         Expr::IsNull(e, neg) => {
-            RExpr::IsNull(Box::new(resolve::<E>(e, arena, sources, offsets)?), *neg)
+            RExpr::IsNull(Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?), *neg)
         }
         Expr::InList(x, list, neg) => {
             let mut out = AVec::new();
             for e in list.iter() {
-                out.push(resolve::<E>(e, arena, sources, offsets)?);
+                out.push(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?);
             }
             RExpr::InList(
-                Box::new(resolve::<E>(x, arena, sources, offsets)?),
+                Box::new(resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?),
                 out,
                 *neg,
             )
         }
         Expr::Between(x, lo, hi, neg) => RExpr::Between(
-            Box::new(resolve::<E>(x, arena, sources, offsets)?),
-            Box::new(resolve::<E>(lo, arena, sources, offsets)?),
-            Box::new(resolve::<E>(hi, arena, sources, offsets)?),
+            Box::new(resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(lo, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(hi, arena, cur, enclosing, &mut *planner)?),
             *neg,
         ),
         Expr::Like(x, p, neg) => RExpr::Like(
-            Box::new(resolve::<E>(x, arena, sources, offsets)?),
-            Box::new(resolve::<E>(p, arena, sources, offsets)?),
+            Box::new(resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_scoped::<E>(p, arena, cur, enclosing, &mut *planner)?),
             *neg,
         ),
         Expr::Case {
@@ -265,24 +444,24 @@ pub fn resolve<E>(
             let mut ws = AVec::new();
             for (w, t) in whens.iter() {
                 ws.push((
-                    resolve::<E>(w, arena, sources, offsets)?,
-                    resolve::<E>(t, arena, sources, offsets)?,
+                    resolve_scoped::<E>(w, arena, cur, enclosing, &mut *planner)?,
+                    resolve_scoped::<E>(t, arena, cur, enclosing, &mut *planner)?,
                 ));
             }
             RExpr::Case {
                 base: match base {
-                    Some(b) => Some(Box::new(resolve::<E>(b, arena, sources, offsets)?)),
+                    Some(b) => Some(Box::new(resolve_scoped::<E>(b, arena, cur, enclosing, &mut *planner)?)),
                     None => None,
                 },
                 whens: ws,
                 otherwise: match otherwise {
-                    Some(o) => Some(Box::new(resolve::<E>(o, arena, sources, offsets)?)),
+                    Some(o) => Some(Box::new(resolve_scoped::<E>(o, arena, cur, enclosing, &mut *planner)?)),
                     None => None,
                 },
             }
         }
         Expr::Cast(e, ty) => RExpr::Cast(
-            Box::new(resolve::<E>(e, arena, sources, offsets)?),
+            Box::new(resolve_scoped::<E>(e, arena, cur, enclosing, &mut *planner)?),
             crate::record::affinity_of(handle_bytes(arena, *ty)),
         ),
         Expr::Func {
@@ -296,8 +475,9 @@ pub fn resolve<E>(
             *star,
             args.as_slice(),
             arena,
-            sources,
-            offsets,
+            cur,
+            enclosing,
+            planner,
         )?,
     })
 }
@@ -305,12 +485,13 @@ pub fn resolve<E>(
 fn resolve_args<E>(
     args: &[Expr],
     arena: &Arena,
-    sources: &[SourceDesc],
-    offsets: &[usize],
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    planner: SubPlanner<'_, E>,
 ) -> Result<AVec<RExpr>, E> {
     let mut out = AVec::new();
     for a in args.iter() {
-        out.push(resolve::<E>(a, arena, sources, offsets)?);
+        out.push(resolve_scoped::<E>(a, arena, cur, enclosing, &mut *planner)?);
     }
     Ok(out)
 }
@@ -322,8 +503,9 @@ fn resolve_func<E>(
     star: bool,
     args: &[Expr],
     arena: &Arena,
-    sources: &[SourceDesc],
-    offsets: &[usize],
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    planner: SubPlanner<'_, E>,
 ) -> Result<RExpr, E> {
     let agg = if eq_ci(name, b"count") {
         Some(AggKind::Count)
@@ -352,7 +534,7 @@ fn resolve_func<E>(
             };
             return Ok(RExpr::Scalar(
                 f,
-                resolve_args::<E>(args, arena, sources, offsets)?,
+                resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
             ));
         }
         let want = match kind {
@@ -377,7 +559,7 @@ fn resolve_func<E>(
             kind,
             distinct,
             star: false,
-            args: resolve_args::<E>(args, arena, sources, offsets)?,
+            args: resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
         });
     }
     if star || distinct {
@@ -437,14 +619,20 @@ fn resolve_func<E>(
     }
     Ok(RExpr::Scalar(
         f,
-        resolve_args::<E>(args, arena, sources, offsets)?,
+        resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
     ))
 }
 
 /// Whether a resolved expression contains an aggregate node.
+/// Aggregates inside a subquery belong to the subquery's own
+/// grouping, never to the enclosing query, so subquery nodes
+/// are not descended into (except an IN subquery's left
+/// operand, which is an enclosing-scope expression).
 pub fn has_agg(e: &RExpr) -> bool {
     match e {
         RExpr::Agg { .. } => true,
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, _, _) => has_agg(x),
         RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => has_agg(a) || has_agg(b),
         RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => has_agg(a),
@@ -465,8 +653,12 @@ pub fn has_agg(e: &RExpr) -> bool {
 }
 
 /// Collect aggregate nodes (for the min/max bare-column rule).
+/// Subquery interiors are a separate grouping scope and are
+/// not descended into.
 pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     match e {
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => {}
+        RExpr::InSub(x, _, _) => collect_aggs(x, out),
         RExpr::Agg { args, .. } => {
             out.push(e);
             for a in args.iter() {
@@ -517,6 +709,241 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Whether a resolved expression contains a subquery node in
+/// the *current* scope (v0.6). Subquery interiors are not
+/// descended into: their nodes belong to the subquery's own
+/// execution. An IN subquery's left operand is current-scope.
+pub fn has_sub(e: &RExpr) -> bool {
+    match e {
+        RExpr::SubScalar(_) | RExpr::SubExists(_) | RExpr::InSub(..) => true,
+        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => false,
+        RExpr::Binary(_, a, b) => has_sub(a) || has_sub(b),
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => has_sub(a),
+        RExpr::InList(x, l, _) => has_sub(x) || l.iter().any(has_sub),
+        RExpr::Between(x, a, b, _) => has_sub(x) || has_sub(a) || has_sub(b),
+        RExpr::Like(a, b, _) => has_sub(a) || has_sub(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_ref().is_some_and(|b| has_sub(b))
+                || whens.iter().any(|(w, t)| has_sub(w) || has_sub(t))
+                || otherwise.as_ref().is_some_and(|o| has_sub(o))
+        }
+        RExpr::Scalar(_, args) => args.iter().any(has_sub),
+        RExpr::Agg { args, .. } => args.iter().any(has_sub),
+    }
+}
+
+/// Collect the current-scope subquery nodes of `e` in
+/// substitution traversal order (v0.6): children before the
+/// node itself where a node has current-scope children (only
+/// `InSub` does). `substitute` consumes values in exactly this
+/// order.
+pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
+    match e {
+        RExpr::SubScalar(p) => out.push(SubKind::Scalar(p)),
+        RExpr::SubExists(p) => out.push(SubKind::Exists(p)),
+        RExpr::InSub(x, p, _) => {
+            collect_subs(x, out);
+            out.push(SubKind::In(p));
+        }
+        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => {}
+        RExpr::Binary(_, a, b) => {
+            collect_subs(a, out);
+            collect_subs(b, out);
+        }
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            collect_subs(a, out)
+        }
+        RExpr::InList(x, l, _) => {
+            collect_subs(x, out);
+            for i in l.iter() {
+                collect_subs(i, out);
+            }
+        }
+        RExpr::Between(x, a, b, _) => {
+            collect_subs(x, out);
+            collect_subs(a, out);
+            collect_subs(b, out);
+        }
+        RExpr::Like(a, b, _) => {
+            collect_subs(a, out);
+            collect_subs(b, out);
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            if let Some(b) = base {
+                collect_subs(b, out);
+            }
+            for (w, t) in whens.iter() {
+                collect_subs(w, out);
+                collect_subs(t, out);
+            }
+            if let Some(o) = otherwise {
+                collect_subs(o, out);
+            }
+        }
+        RExpr::Scalar(_, args) => {
+            for a in args.iter() {
+                collect_subs(a, out);
+            }
+        }
+        RExpr::Agg { args, .. } => {
+            for a in args.iter() {
+                collect_subs(a, out);
+            }
+        }
+    }
+}
+
+/// Rebuild `e` with every current-scope subquery node replaced
+/// by its computed value (v0.6): scalar / EXISTS results become
+/// literals, an IN subquery becomes an IN list of literals.
+/// `values` is consumed in `collect_subs` order; the caller
+/// guarantees the counts match.
+pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
+    match e {
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => {
+            let v = match &values[*pos] {
+                SubValue::One(v) => v.clone(),
+                SubValue::Many(_) => OwnedValue::Null,
+            };
+            *pos += 1;
+            RExpr::Literal(v)
+        }
+        RExpr::InSub(x, _, neg) => {
+            let sx = substitute(x, values, pos);
+            let list = match &values[*pos] {
+                SubValue::Many(vs) => {
+                    let mut out = AVec::new();
+                    for v in vs.iter() {
+                        out.push(RExpr::Literal(v.clone()));
+                    }
+                    out
+                }
+                SubValue::One(v) => {
+                    let mut out = AVec::new();
+                    out.push(RExpr::Literal(v.clone()));
+                    out
+                }
+            };
+            *pos += 1;
+            RExpr::InList(Box::new(sx), list, *neg)
+        }
+        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => e.clone(),
+        RExpr::Binary(op, a, b) => RExpr::Binary(
+            *op,
+            Box::new(substitute(a, values, pos)),
+            Box::new(substitute(b, values, pos)),
+        ),
+        RExpr::Neg(a) => RExpr::Neg(Box::new(substitute(a, values, pos))),
+        RExpr::Not(a) => RExpr::Not(Box::new(substitute(a, values, pos))),
+        RExpr::IsNull(a, neg) => RExpr::IsNull(Box::new(substitute(a, values, pos)), *neg),
+        RExpr::InList(x, l, neg) => {
+            let sx = substitute(x, values, pos);
+            let mut out = AVec::new();
+            for i in l.iter() {
+                out.push(substitute(i, values, pos));
+            }
+            RExpr::InList(Box::new(sx), out, *neg)
+        }
+        RExpr::Between(x, a, b, neg) => RExpr::Between(
+            Box::new(substitute(x, values, pos)),
+            Box::new(substitute(a, values, pos)),
+            Box::new(substitute(b, values, pos)),
+            *neg,
+        ),
+        RExpr::Like(a, b, neg) => RExpr::Like(
+            Box::new(substitute(a, values, pos)),
+            Box::new(substitute(b, values, pos)),
+            *neg,
+        ),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            let sbase = base.as_ref().map(|b| Box::new(substitute(b, values, pos)));
+            let mut ws = AVec::new();
+            for (w, t) in whens.iter() {
+                ws.push((substitute(w, values, pos), substitute(t, values, pos)));
+            }
+            let sother = otherwise
+                .as_ref()
+                .map(|o| Box::new(substitute(o, values, pos)));
+            RExpr::Case {
+                base: sbase,
+                whens: ws,
+                otherwise: sother,
+            }
+        }
+        RExpr::Scalar(f, args) => {
+            let mut out = AVec::new();
+            for a in args.iter() {
+                out.push(substitute(a, values, pos));
+            }
+            RExpr::Scalar(*f, out)
+        }
+        RExpr::Cast(a, aff) => RExpr::Cast(Box::new(substitute(a, values, pos)), *aff),
+        RExpr::Agg {
+            kind,
+            distinct,
+            star,
+            args,
+        } => {
+            let mut out = AVec::new();
+            for a in args.iter() {
+                out.push(substitute(a, values, pos));
+            }
+            RExpr::Agg {
+                kind: *kind,
+                distinct: *distinct,
+                star: *star,
+                args: out,
+            }
+        }
+    }
+}
+
+/// Whether a subquery node occurs inside an aggregate's
+/// arguments (v0.6): such subqueries would need per-group-row
+/// execution, which v0.6 refuses at plan time with
+/// `Error::Unsupported` rather than mis-evaluating.
+pub fn sub_in_agg_args(e: &RExpr) -> bool {
+    match e {
+        RExpr::Agg { args, .. } => args.iter().any(has_sub),
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, _, _) => sub_in_agg_args(x),
+        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => false,
+        RExpr::Binary(_, a, b) => sub_in_agg_args(a) || sub_in_agg_args(b),
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            sub_in_agg_args(a)
+        }
+        RExpr::InList(x, l, _) => sub_in_agg_args(x) || l.iter().any(sub_in_agg_args),
+        RExpr::Between(x, a, b, _) => {
+            sub_in_agg_args(x) || sub_in_agg_args(a) || sub_in_agg_args(b)
+        }
+        RExpr::Like(a, b, _) => sub_in_agg_args(a) || sub_in_agg_args(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_ref().is_some_and(|b| sub_in_agg_args(b))
+                || whens
+                    .iter()
+                    .any(|(w, t)| sub_in_agg_args(w) || sub_in_agg_args(t))
+                || otherwise.as_ref().is_some_and(|o| sub_in_agg_args(o))
+        }
+        RExpr::Scalar(_, args) => args.iter().any(sub_in_agg_args),
     }
 }
 
@@ -1617,6 +2044,12 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
             Ctx::Row(_) => return Err(Error::Unsupported),
         },
+        // Subquery nodes are computed by the executor and
+        // substituted away before evaluation (v0.6); reaching
+        // one here means a path forgot to substitute.
+        RExpr::SubScalar(_) | RExpr::SubExists(_) | RExpr::InSub(..) => {
+            return Err(Error::Unsupported);
+        }
     })
 }
 

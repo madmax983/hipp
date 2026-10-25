@@ -853,6 +853,291 @@ impl<S: Storage> Connection<S> {
         Ok(out)
     }
 
+    /// The subquery planner handed to `resolve_scoped` (v0.6):
+    /// stacks the containing query's scope group onto the
+    /// enclosing groups and plans the subquery against the
+    /// combined scope. Without the `v06` feature the planner
+    /// always fails — the parser never produces subquery nodes
+    /// there, so it is never actually called.
+    #[cfg(feature = "v04")]
+    fn sub_planner<'a>(
+        &'a self,
+        arena: &'a Arena,
+    ) -> impl FnMut(
+        &SelectStmt,
+        &crate::query::ScopeGroup,
+        &[crate::query::ScopeGroup],
+    ) -> Result<crate::query::SubPlan, S::Error>
+    + 'a {
+        #[cfg(feature = "v06")]
+        {
+            move |stmt: &SelectStmt,
+                  cur: &crate::query::ScopeGroup,
+                  enclosing: &[crate::query::ScopeGroup]| {
+                let mut full: AVec<crate::query::ScopeGroup> = AVec::new();
+                full.push(cur.clone());
+                for g in enclosing {
+                    full.push(g.clone());
+                }
+                self.plan_subquery(stmt, arena, full.as_slice())
+            }
+        }
+        #[cfg(not(feature = "v06"))]
+        {
+            let _ = arena;
+            move |_: &SelectStmt,
+                  _: &crate::query::ScopeGroup,
+                  _: &[crate::query::ScopeGroup]| { Err(Error::Unsupported) }
+        }
+    }
+
+    /// Resolve one GROUP BY / HAVING / ORDER BY term (v0.4,
+    /// scoped in v0.6): an output ordinal or alias substitutes
+    /// the item expression itself (SQLite's rule); anything else
+    /// resolves as an ordinary expression.
+    #[cfg(feature = "v04")]
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_term(
+        &self,
+        e: &Expr,
+        arena: &Arena,
+        items: &[RExpr],
+        aliases: &[Option<AVec<u8>>],
+        cur: &crate::query::ScopeGroup,
+        enclosing: &[crate::query::ScopeGroup],
+        planner: crate::query::SubPlanner<'_, S::Error>,
+    ) -> Result<RExpr, S::Error> {
+        match e {
+            Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= items.len() => {
+                Ok(items[*n as usize - 1].clone())
+            }
+            Expr::Column { table: None, name } => {
+                let nb = handle_bytes(arena, *name);
+                match aliases
+                    .iter()
+                    .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
+                {
+                    Some(idx) => Ok(items[idx].clone()),
+                    None => crate::query::resolve_scoped::<S::Error>(
+                        e,
+                        arena,
+                        cur,
+                        enclosing,
+                        planner,
+                    ),
+                }
+            }
+            _ => crate::query::resolve_scoped::<S::Error>(e, arena, cur, enclosing, planner),
+        }
+    }
+
+    /// Plan one subquery (v0.6) against the combined scope:
+    /// `enclosing` holds the scope groups of every textually
+    /// enclosing query, nearest first, with absolute slot/source
+    /// numbering into the combined evaluation row. The
+    /// subquery's own sources are numbered after all enclosing
+    /// sources. Mirrors `plan_query`, including term resolution
+    /// and the aggregate-argument subquery refusal.
+    #[cfg(feature = "v06")]
+    fn plan_subquery(
+        &self,
+        stmt: &SelectStmt,
+        arena: &Arena,
+        enclosing: &[crate::query::ScopeGroup],
+    ) -> Result<crate::query::SubPlan, S::Error> {
+        use crate::query::{
+            ScopeGroup, SourceDesc, SubPlan, SubSource, has_agg, resolve_scoped, sub_in_agg_args,
+        };
+        let base_width: usize = enclosing.iter().map(|g| g.width()).sum();
+        let base_src: usize = enclosing.iter().map(|g| g.sources.len()).sum();
+        let mut descs: AVec<SourceDesc> = AVec::new();
+        let mut offsets: AVec<usize> = AVec::new();
+        let mut subs: AVec<SubSource> = AVec::new();
+        let mut total = base_width;
+        for s in stmt.from.iter() {
+            let tname = handle_bytes(arena, s.table);
+            let t = match self.catalog.find(&self.catalog_arena, tname) {
+                Some(t) => t,
+                None => {
+                    if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
+                        // Views are inert (SPEC §2): a subquery
+                        // cannot select from one either.
+                        return Err(Error::Unsupported);
+                    }
+                    return Err(Error::Schema {
+                        kind: SchemaKind::UnknownTable,
+                    });
+                }
+            };
+            offsets.push(total);
+            let mut cols = AVec::new();
+            let mut affs = AVec::new();
+            let mut defaults = AVec::new();
+            for c in t.columns.iter() {
+                let mut nm = AVec::new();
+                nm.extend_from_slice(handle_bytes(&self.catalog_arena, c.name));
+                cols.push((nm, c.affinity));
+                affs.push(c.affinity);
+                defaults.push(literal_owned(&self.catalog_arena, c.default));
+            }
+            let qual = match s.alias {
+                Some(a) => copy_vec(handle_bytes(arena, a)),
+                None => copy_vec(tname),
+            };
+            descs.push(SourceDesc {
+                qualifier: qual,
+                columns: cols,
+                rowid_alias: t.rowid_alias,
+            });
+            subs.push(SubSource {
+                root: t.root,
+                kind: s.kind,
+                on: None,
+                rowid_alias: t.rowid_alias,
+                ncols: t.columns.len(),
+                affs,
+                defaults,
+            });
+            total += t.columns.len();
+        }
+        let cur = ScopeGroup {
+            sources: descs,
+            offsets,
+            first_src: base_src,
+        };
+        let mut planner = self.sub_planner(arena);
+        let filter = match &stmt.filter {
+            None => None,
+            Some(e) => {
+                let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                Some(r)
+            }
+        };
+        for (i, s) in stmt.from.iter().enumerate() {
+            if let Some(on) = &s.on {
+                let r = resolve_scoped::<S::Error>(on, arena, &cur, enclosing, &mut planner)?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                subs.as_mut_slice()[i].on = Some(r);
+            }
+        }
+        let mut items: AVec<RExpr> = AVec::new();
+        let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
+        for it in stmt.items.iter() {
+            match it {
+                SelectItem::Star => {
+                    for (si, src) in cur.sources.iter().enumerate() {
+                        for (ci, (_, aff)) in src.columns.iter().enumerate() {
+                            items.push(if Some(ci) == src.rowid_alias {
+                                RExpr::Rowid(cur.first_src + si)
+                            } else {
+                                RExpr::Column(cur.offsets.as_slice()[si] + ci, *aff)
+                            });
+                            item_aliases.push(None);
+                        }
+                    }
+                }
+                SelectItem::TableStar(q) => {
+                    let qb = handle_bytes(arena, *q);
+                    let mut hit = false;
+                    for (si, src) in cur.sources.iter().enumerate() {
+                        if eq_ci(src.qualifier.as_slice(), qb) {
+                            hit = true;
+                            for (ci, (_, aff)) in src.columns.iter().enumerate() {
+                                items.push(if Some(ci) == src.rowid_alias {
+                                    RExpr::Rowid(cur.first_src + si)
+                                } else {
+                                    RExpr::Column(cur.offsets.as_slice()[si] + ci, *aff)
+                                });
+                                item_aliases.push(None);
+                            }
+                        }
+                    }
+                    if !hit {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::UnknownColumn,
+                        });
+                    }
+                }
+                SelectItem::Expr(e, alias, _) => {
+                    items.push(resolve_scoped::<S::Error>(
+                        e,
+                        arena,
+                        &cur,
+                        enclosing,
+                        &mut planner,
+                    )?);
+                    item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
+                }
+            }
+        }
+        let mut group_by = AVec::new();
+        for e in stmt.group_by.iter() {
+            group_by.push(self.resolve_term(
+                e,
+                arena,
+                items.as_slice(),
+                item_aliases.as_slice(),
+                &cur,
+                enclosing,
+                &mut planner,
+            )?);
+        }
+        let having = match &stmt.having {
+            None => None,
+            Some(e) => Some(self.resolve_term(
+                e,
+                arena,
+                items.as_slice(),
+                item_aliases.as_slice(),
+                &cur,
+                enclosing,
+                &mut planner,
+            )?),
+        };
+        let mut order_by: AVec<(RExpr, bool)> = AVec::new();
+        for (e, desc) in stmt.order_by.iter() {
+            order_by.push((
+                self.resolve_term(
+                    e,
+                    arena,
+                    items.as_slice(),
+                    item_aliases.as_slice(),
+                    &cur,
+                    enclosing,
+                    &mut planner,
+                )?,
+                *desc,
+            ));
+        }
+        if items.iter().any(sub_in_agg_args)
+            || having.as_ref().is_some_and(sub_in_agg_args)
+            || order_by.iter().any(|(e, _)| sub_in_agg_args(e))
+        {
+            return Err(Error::Unsupported);
+        }
+        let has_agg = !group_by.is_empty()
+            || items.iter().any(has_agg)
+            || having.as_ref().is_some_and(has_agg)
+            || order_by.iter().any(|(e, _)| has_agg(e));
+        Ok(SubPlan {
+            sources: subs,
+            items,
+            filter,
+            group_by,
+            having,
+            order_by,
+            distinct: stmt.distinct,
+            limit: stmt.limit,
+            offset: stmt.offset,
+            has_agg,
+        })
+    }
+
     /// Plan an UPDATE (v0.5): resolve the SET expressions and the
     /// filter once, at prepare time; aggregates are not legal in
     /// either (SQLite agrees).
@@ -866,7 +1151,7 @@ impl<S: Storage> Connection<S> {
         assignments: &AVec<(crate::arena::ABytes, Expr)>,
         filter: &Option<Expr>,
     ) -> Result<Plan, S::Error> {
-        use crate::query::{has_agg, resolve};
+        use crate::query::{has_agg, resolve_scoped};
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
         let qualifier: &[u8] = match alias {
@@ -874,10 +1159,16 @@ impl<S: Storage> Connection<S> {
             None => tname,
         };
         let (sources, offsets) = self.single_source(t, qualifier);
+        let cur = crate::query::ScopeGroup {
+            sources,
+            offsets,
+            first_src: 0,
+        };
+        let mut planner = self.sub_planner(arena);
         let mut sets = AVec::new();
         for (colname, e) in assignments.iter() {
             let target = self.resolve_target(t, handle_bytes(arena, *colname))?;
-            let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+            let r = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
             if has_agg(&r) {
                 return Err(Error::Unsupported);
             }
@@ -886,7 +1177,7 @@ impl<S: Storage> Connection<S> {
         let filter = match filter {
             None => None,
             Some(e) => {
-                let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+                let r = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
                 if has_agg(&r) {
                     return Err(Error::Unsupported);
                 }
@@ -921,14 +1212,20 @@ impl<S: Storage> Connection<S> {
         table: &crate::arena::ABytes,
         filter: &Option<Expr>,
     ) -> Result<Plan, S::Error> {
-        use crate::query::{has_agg, resolve};
+        use crate::query::{has_agg, resolve_scoped};
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
         let (sources, offsets) = self.single_source(t, tname);
+        let cur = crate::query::ScopeGroup {
+            sources,
+            offsets,
+            first_src: 0,
+        };
+        let mut planner = self.sub_planner(arena);
         let filter = match filter {
             None => None,
             Some(e) => {
-                let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+                let r = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
                 if has_agg(&r) {
                     return Err(Error::Unsupported);
                 }
@@ -1108,7 +1405,7 @@ impl<S: Storage> Connection<S> {
     /// against the FROM sources once, at prepare time.
     #[cfg(feature = "v04")]
     fn plan_query(&self, stmt: &SelectStmt, arena: &Arena) -> Result<QueryPlan, S::Error> {
-        use crate::query::{SourceDesc, has_agg, resolve};
+        use crate::query::{SourceDesc, has_agg, resolve_scoped, sub_in_agg_args};
         let mut sources: AVec<SourceDesc> = AVec::new();
         let mut offsets: AVec<usize> = AVec::new();
         let mut src_plans: AVec<SourcePlan> = AVec::new();
@@ -1159,10 +1456,16 @@ impl<S: Storage> Connection<S> {
             });
             total += t.columns.len();
         }
+        let cur = crate::query::ScopeGroup {
+            sources: sources.clone(),
+            offsets: offsets.clone(),
+            first_src: 0,
+        };
+        let mut planner = self.sub_planner(arena);
         let filter = match &stmt.filter {
             None => None,
             Some(e) => {
-                let r = resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())?;
+                let r = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
                 if has_agg(&r) {
                     return Err(Error::Unsupported);
                 }
@@ -1171,7 +1474,7 @@ impl<S: Storage> Connection<S> {
         };
         for (i, s) in stmt.from.iter().enumerate() {
             if let Some(on) = &s.on {
-                let r = resolve::<S::Error>(on, arena, sources.as_slice(), offsets.as_slice())?;
+                let r = resolve_scoped::<S::Error>(on, arena, &cur, &[], &mut planner)?;
                 if has_agg(&r) {
                     return Err(Error::Unsupported);
                 }
@@ -1219,11 +1522,12 @@ impl<S: Storage> Connection<S> {
                     }
                 }
                 SelectItem::Expr(e, alias, _) => {
-                    items.push(resolve::<S::Error>(
+                    items.push(resolve_scoped::<S::Error>(
                         e,
                         arena,
-                        sources.as_slice(),
-                        offsets.as_slice(),
+                        &cur,
+                        &[],
+                        &mut planner,
                     )?);
                     item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
                 }
@@ -1234,37 +1538,52 @@ impl<S: Storage> Connection<S> {
         // output ordinal or alias (SQLite's rule), substituting
         // the item expression itself, so evaluation never needs
         // an output-row context.
-        let resolve_term = |e: &Expr| -> Result<RExpr, S::Error> {
-            match e {
-                Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= width => {
-                    Ok(items.as_slice()[*n as usize - 1].clone())
-                }
-                Expr::Column { table: None, name } => {
-                    let nb = handle_bytes(arena, *name);
-                    match item_aliases
-                        .iter()
-                        .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
-                    {
-                        Some(idx) => Ok(items.as_slice()[idx].clone()),
-                        None => {
-                            resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice())
-                        }
-                    }
-                }
-                _ => resolve::<S::Error>(e, arena, sources.as_slice(), offsets.as_slice()),
-            }
-        };
         let mut group_by = AVec::new();
         for e in stmt.group_by.iter() {
-            group_by.push(resolve_term(e)?);
+            group_by.push(self.resolve_term(
+                e,
+                arena,
+                items.as_slice(),
+                item_aliases.as_slice(),
+                &cur,
+                &[],
+                &mut planner,
+            )?);
         }
         let having = match &stmt.having {
             None => None,
-            Some(e) => Some(resolve_term(e)?),
+            Some(e) => Some(self.resolve_term(
+                e,
+                arena,
+                items.as_slice(),
+                item_aliases.as_slice(),
+                &cur,
+                &[],
+                &mut planner,
+            )?),
         };
         let mut order_by: AVec<(RExpr, bool)> = AVec::new();
         for (e, desc) in stmt.order_by.iter() {
-            order_by.push((resolve_term(e)?, *desc));
+            order_by.push((
+                self.resolve_term(
+                    e,
+                    arena,
+                    items.as_slice(),
+                    item_aliases.as_slice(),
+                    &cur,
+                    &[],
+                    &mut planner,
+                )?,
+                *desc,
+            ));
+        }
+        // A subquery inside an aggregate's arguments would need
+        // per-group-row execution; v0.6 refuses it at plan time.
+        if items.iter().any(sub_in_agg_args)
+            || having.as_ref().is_some_and(sub_in_agg_args)
+            || order_by.iter().any(|(e, _)| sub_in_agg_args(e))
+        {
+            return Err(Error::Unsupported);
         }
         let has_agg = !group_by.is_empty()
             || items.iter().any(has_agg)

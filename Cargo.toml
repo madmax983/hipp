@@ -4,13 +4,13 @@ resolver = "2"
 
 [package]
 name = "hipp"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
-default = ["std", "indexes", "v04", "v05"]
+default = ["std", "indexes", "v04", "v05", "v06"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
 # Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
@@ -26,6 +26,12 @@ v04 = []
 # SET/WHERE expressions, so it implies `v04`. The tiny profile
 # excludes it per §2.
 v05 = ["v04"]
+# v0.6 dialect: subqueries in expressions — scalar subqueries,
+# IN (SELECT ...), EXISTS across SELECT / UPDATE / DELETE. Builds
+# on the v0.5 write side (UPDATE/DELETE filters and SET
+# expressions are subquery sites), so it implies `v05`. The tiny
+# profile excludes it per §2.
+v06 = ["v05"]
 
 [dependencies]
 
