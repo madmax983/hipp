@@ -187,6 +187,46 @@ pub struct SelectStmt {
     pub offset: i64,
 }
 
+/// A statement conflict-resolution clause (v0.7): the `OR ...`
+/// of `INSERT OR ...` / `UPDATE OR ...`, and the standalone
+/// `REPLACE` verb (which is `INSERT` with `Replace`). `Abort`
+/// covers ABORT, FAIL and ROLLBACK spellings: hipp's write-error
+/// rule already aborts (and rolls back) the whole statement on
+/// any error, which is the observable behaviour of all three in
+/// autocommit and the documented v0.5 simplification inside an
+/// explicit transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAction {
+    Abort,
+    Ignore,
+    Replace,
+}
+
+/// An `INSERT ... ON CONFLICT ...` upsert clause (v0.7).
+#[derive(Debug, Clone)]
+pub struct Upsert {
+    /// Conflict-target column names as written; empty when the
+    /// clause names no target (`ON CONFLICT DO ...` arbitrates
+    /// any uniqueness conflict).
+    pub target: AVec<ABytes>,
+    /// The target's optional index predicate (`ON CONFLICT (a)
+    /// WHERE ...`): parsed and name-resolved at plan time (an
+    /// unknown column errors, as in the oracle), but never
+    /// evaluated — hipp has no partial indexes, and the oracle
+    /// ignores the predicate for non-partial indexes too.
+    pub target_filter: Option<Expr>,
+    pub action: UpsertAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum UpsertAction {
+    Nothing,
+    Update {
+        assignments: AVec<(ABytes, Expr)>,
+        filter: Option<Expr>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum Ast {
     CreateTable {
@@ -221,27 +261,50 @@ pub enum Ast {
         /// v0.4: each value is an expression (a plain literal in
         /// the pre-v0.4 grammar), evaluated with no row context.
         rows: AVec<AVec<Expr>>,
+        /// The `OR ...` conflict clause (v0.7; `REPLACE INTO`
+        /// parses as Insert with `Replace`).
+        conflict: ConflictAction,
+        /// `ON CONFLICT ...` upsert clause (v0.7), if present.
+        upsert: Option<Box<Upsert>>,
+        /// `RETURNING ...` result items (v0.7), SELECT-item
+        /// shaped; empty when the clause is absent.
+        returning: AVec<SelectItem>,
     },
-    /// `UPDATE [OR IGNORE] <t> [[AS] <alias>] SET <col> = <expr>,
-    /// ... [WHERE <expr>]` (v0.5). SET expressions and the filter
-    /// evaluate against each row's original values (SQLite's
-    /// rule, oracle-verified); duplicate SET columns are allowed
-    /// and the last assignment wins.
+    /// `UPDATE [OR <action>] <t> [[AS] <alias>] SET <col> =
+    /// <expr>, ... [FROM <sources>] [WHERE <expr>] [RETURNING
+    /// ...]` (v0.5; FROM/RETURNING and OR REPLACE are v0.7). SET
+    /// expressions and the filter evaluate against each row's
+    /// original values (SQLite's rule, oracle-verified);
+    /// duplicate SET columns are allowed and the last assignment
+    /// wins. With FROM, a row matched by several FROM
+    /// combinations is written once per combination, each time
+    /// computed from its original values — the last combination
+    /// wins (oracle-verified in the v0.7 probes).
     Update {
         table: ABytes,
         alias: Option<ABytes>,
-        /// `OR IGNORE`: rows whose update would violate a UNIQUE
-        /// constraint are skipped instead of failing the
-        /// statement. (`OR REPLACE` is parse-rejected in v0.5;
-        /// ABORT/FAIL/ROLLBACK are the default semantics.)
-        or_ignore: bool,
+        /// The `OR ...` conflict clause (v0.7): `Ignore` skips a
+        /// row whose update would violate a UNIQUE constraint,
+        /// `Replace` deletes the conflicting row(s) instead.
+        conflict: ConflictAction,
         assignments: AVec<(ABytes, Expr)>,
+        /// `FROM` sources (v0.7), in SELECT FROM shape; the
+        /// target table is not among them (it is source 0 of the
+        /// resolution scope, as in SQLite's model).
+        from: AVec<FromSource>,
         filter: Option<Expr>,
+        /// `RETURNING ...` result items (v0.7); empty when the
+        /// clause is absent. Resolved against the target table
+        /// only — SQLite refuses FROM columns there ("no such
+        /// column", oracle-verified).
+        returning: AVec<SelectItem>,
     },
-    /// `DELETE FROM <t> [WHERE <expr>]` (v0.5).
+    /// `DELETE FROM <t> [WHERE <expr>] [RETURNING ...]` (v0.5;
+    /// RETURNING is v0.7).
     Delete {
         table: ABytes,
         filter: Option<Expr>,
+        returning: AVec<SelectItem>,
     },
     /// `DROP TABLE [IF EXISTS] <name>` (v0.5).
     DropTable {

@@ -12,8 +12,8 @@ use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
 
 use super::ast::{
-    Ast, BinOp, ColumnDef, ConstraintSet, Expr, FromSource, IndexColumnDef, JoinKind, Literal,
-    SelectItem, SelectStmt,
+    Ast, BinOp, ColumnDef, ConflictAction, ConstraintSet, Expr, FromSource, IndexColumnDef,
+    JoinKind, Literal, SelectItem, SelectStmt, Upsert, UpsertAction,
 };
 use alloc::boxed::Box;
 
@@ -167,7 +167,9 @@ impl<'a> Parser<'a> {
         } else if self.cur_is_kw(b"ALTER") {
             self.alter_dispatch::<E>()
         } else if self.cur_is_kw(b"INSERT") {
-            self.insert::<E>()
+            self.insert::<E>(false)
+        } else if self.cur_is_kw(b"REPLACE") {
+            self.replace_dispatch::<E>()
         } else if self.cur_is_kw(b"UPDATE") {
             self.update_dispatch::<E>()
         } else if self.cur_is_kw(b"DELETE") {
@@ -771,10 +773,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // ---------------- v0.7 statement shim ----------------
+    // The standalone `REPLACE` verb (== INSERT OR REPLACE) exists
+    // only under the `v07` feature.
+
+    #[cfg(feature = "v07")]
+    fn replace_dispatch<E>(&mut self) -> Result<Ast, E> {
+        self.insert::<E>(true)
+    }
+
+    #[cfg(not(feature = "v07"))]
+    fn replace_dispatch<E>(&mut self) -> Result<Ast, E> {
+        Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+    }
+
     // ---------------- INSERT ----------------
 
-    fn insert<E>(&mut self) -> Result<Ast, E> {
-        self.expect_kw::<E>(b"INSERT")?;
+    fn insert<E>(&mut self, verb_replace: bool) -> Result<Ast, E> {
+        let conflict = if verb_replace {
+            self.expect_kw::<E>(b"REPLACE")?;
+            ConflictAction::Replace
+        } else {
+            self.expect_kw::<E>(b"INSERT")?;
+            #[cfg(feature = "v07")]
+            let c = self.conflict_clause::<E>()?;
+            #[cfg(not(feature = "v07"))]
+            let c = ConflictAction::Abort;
+            c
+        };
         self.expect_kw::<E>(b"INTO")?;
         let table = self.name::<E>()?;
         let mut columns = None;
@@ -812,11 +838,152 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        let (upsert, returning) = self.insert_tail::<E>()?;
         Ok(Ast::Insert {
             table,
             columns,
             rows,
+            conflict,
+            upsert,
+            returning,
         })
+    }
+
+    /// The optional `OR <action>` after INSERT / UPDATE (v0.7):
+    /// absent is `Abort` (the engine default).
+    #[cfg(feature = "v07")]
+    fn conflict_clause<E>(&mut self) -> Result<ConflictAction, E> {
+        if !self.eat_kw(b"OR") {
+            return Ok(ConflictAction::Abort);
+        }
+        if self.eat_kw(b"IGNORE") {
+            Ok(ConflictAction::Ignore)
+        } else if self.eat_kw(b"REPLACE") {
+            Ok(ConflictAction::Replace)
+        } else if self.eat_kw(b"ABORT") || self.eat_kw(b"FAIL") || self.eat_kw(b"ROLLBACK") {
+            Ok(ConflictAction::Abort)
+        } else {
+            Err(perr(self.cur().offset, ParseKind::UnexpectedToken))
+        }
+    }
+
+    /// What may follow an INSERT's VALUES rows (v0.7): an
+    /// optional `ON CONFLICT` upsert clause, then an optional
+    /// `RETURNING` clause. Without the `v07` feature nothing may
+    /// follow (the caller's `expect_end` rejects trailing input).
+    #[cfg(feature = "v07")]
+    fn insert_tail<E>(&mut self) -> Result<(Option<Box<Upsert>>, AVec<SelectItem>), E> {
+        let upsert = if self.eat_kw(b"ON") {
+            Some(Box::new(self.upsert_clause::<E>()?))
+        } else {
+            None
+        };
+        let returning = self.returning_clause::<E>()?;
+        Ok((upsert, returning))
+    }
+
+    #[cfg(not(feature = "v07"))]
+    fn insert_tail<E>(&mut self) -> Result<(Option<Box<Upsert>>, AVec<SelectItem>), E> {
+        Ok((None, AVec::new()))
+    }
+
+    /// `CONFLICT [(col, ...)] [WHERE expr] DO NOTHING | DO
+    /// UPDATE SET ... [WHERE expr]` — the leading `ON` is eaten
+    /// by the caller (v0.7).
+    #[cfg(feature = "v07")]
+    fn upsert_clause<E>(&mut self) -> Result<Upsert, E> {
+        self.expect_kw::<E>(b"CONFLICT")?;
+        let mut target = AVec::new();
+        if self.eat(Tok::LParen) {
+            loop {
+                target.push(self.name::<E>()?);
+                // Indexed-column decorations SQLite permits in a
+                // conflict target: COLLATE <name>, ASC / DESC.
+                if self.eat_kw(b"COLLATE") {
+                    let _ = self.name::<E>()?;
+                }
+                let _ = self.eat_kw(b"ASC") || self.eat_kw(b"DESC");
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                self.expect::<E>(Tok::RParen)?;
+                break;
+            }
+        }
+        let target_filter = if self.eat_kw(b"WHERE") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        self.expect_kw::<E>(b"DO")?;
+        let action = if self.eat_kw(b"NOTHING") {
+            UpsertAction::Nothing
+        } else {
+            self.expect_kw::<E>(b"UPDATE")?;
+            self.expect_kw::<E>(b"SET")?;
+            let mut assignments: AVec<(ABytes, Expr)> = AVec::new();
+            loop {
+                let col = self.plain_name::<E>()?;
+                self.expect::<E>(Tok::Eq)?;
+                let e = self.parse_expr::<E>()?;
+                assignments.push((col, e));
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+            let filter = if self.eat_kw(b"WHERE") {
+                Some(self.parse_expr::<E>()?)
+            } else {
+                None
+            };
+            UpsertAction::Update {
+                assignments,
+                filter,
+            }
+        };
+        Ok(Upsert {
+            target,
+            target_filter,
+            action,
+        })
+    }
+
+    /// An optional `RETURNING <items>` clause (v0.7), shared by
+    /// INSERT / UPDATE / DELETE: SELECT-shaped result items
+    /// (`*`, `t.*`, or an expression with an optional alias).
+    /// Returns an empty vec when the clause is absent.
+    #[cfg(feature = "v07")]
+    fn returning_clause<E>(&mut self) -> Result<AVec<SelectItem>, E> {
+        let mut items = AVec::new();
+        if !self.eat_kw(b"RETURNING") {
+            return Ok(items);
+        }
+        loop {
+            if self.eat(Tok::Star) {
+                items.push(SelectItem::Star);
+            } else if let Some((h, _, _)) = self.ident_at(self.pos)
+                && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::Dot)
+                && self.toks.as_slice().get(self.pos + 2).map(|t| t.tok) == Some(Tok::Star)
+            {
+                self.pos += 3;
+                items.push(SelectItem::TableStar(h));
+            } else {
+                let start = self.cur().offset;
+                let e = self.parse_expr::<E>()?;
+                let end = self.cur().offset;
+                let text = self
+                    .arena
+                    .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
+                let alias = self.opt_alias();
+                items.push(SelectItem::Expr(e, alias, text));
+            }
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(items)
     }
 
     /// One INSERT value: a full expression under `v04`, a plain
@@ -1616,14 +1783,23 @@ impl<'a> Parser<'a> {
 
     fn update_stmt<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"UPDATE")?;
-        let mut or_ignore = false;
+        // OR clause: under v05 alone only IGNORE widens behaviour
+        // (ABORT/FAIL/ROLLBACK are the default); OR REPLACE is a
+        // v0.7 addition, rejected by name without the feature.
+        let mut conflict = ConflictAction::Abort;
         if self.eat_kw(b"OR") {
             if self.eat_kw(b"IGNORE") {
-                or_ignore = true;
-            } else if self.eat_kw(b"REPLACE") {
-                // OR REPLACE deletes the conflicting row; a later
-                // phase. Rejected by name rather than mis-parsed.
-                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                conflict = ConflictAction::Ignore;
+            } else if self.cur_is_kw(b"REPLACE") {
+                #[cfg(feature = "v07")]
+                {
+                    self.pos += 1;
+                    conflict = ConflictAction::Replace;
+                }
+                #[cfg(not(feature = "v07"))]
+                {
+                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                }
             } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"FAIL") || self.eat_kw(b"ROLLBACK")) {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
@@ -1650,21 +1826,69 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        // FROM (v0.7): sources in SELECT shape, after SET and
+        // before WHERE, exactly as SQLite orders the clauses.
+        #[cfg(feature = "v07")]
+        let from = self.update_from::<E>()?;
+        #[cfg(not(feature = "v07"))]
+        let from: AVec<FromSource> = AVec::new();
         let filter = if self.eat_kw(b"WHERE") {
             Some(self.parse_expr::<E>()?)
         } else {
             None
         };
-        // UPDATE ... FROM, ORDER BY/LIMIT (the oracle build
-        // rejects those too) and RETURNING are later phases;
-        // parse()'s expect_end rejects any trailing input.
+        // ORDER BY/LIMIT on UPDATE stay rejected (the pinned
+        // oracle's build rejects them too); expect_end in parse()
+        // catches any trailing input.
+        #[cfg(feature = "v07")]
+        let returning = self.returning_clause::<E>()?;
+        #[cfg(not(feature = "v07"))]
+        let returning: AVec<SelectItem> = AVec::new();
         Ok(Ast::Update {
             table,
             alias,
-            or_ignore,
+            conflict,
             assignments,
+            from,
             filter,
+            returning,
         })
+    }
+
+    /// The optional `FROM <source> [, <source> | JOIN ...]` of
+    /// an UPDATE (v0.7): the same source grammar as a SELECT's
+    /// FROM clause body.
+    #[cfg(feature = "v07")]
+    fn update_from<E>(&mut self) -> Result<AVec<FromSource>, E> {
+        let mut from = AVec::new();
+        if !self.eat_kw(b"FROM") {
+            return Ok(from);
+        }
+        from.push(self.join_source::<E>(JoinKind::Inner, true)?);
+        loop {
+            if self.eat(Tok::Comma) {
+                from.push(self.join_source::<E>(JoinKind::Cross, false)?);
+                continue;
+            }
+            let kind = if self.eat_kw(b"JOIN") {
+                Some(JoinKind::Inner)
+            } else if self.eat_kw(b"INNER") {
+                self.expect_kw::<E>(b"JOIN")?;
+                Some(JoinKind::Inner)
+            } else if self.eat_kw(b"LEFT") {
+                let _ = self.eat_kw(b"OUTER");
+                self.expect_kw::<E>(b"JOIN")?;
+                Some(JoinKind::Left)
+            } else if self.eat_kw(b"CROSS") {
+                self.expect_kw::<E>(b"JOIN")?;
+                Some(JoinKind::Cross)
+            } else {
+                None
+            };
+            let Some(kind) = kind else { break };
+            from.push(self.join_source::<E>(kind, false)?);
+        }
+        Ok(from)
     }
 
     fn delete_stmt<E>(&mut self) -> Result<Ast, E> {
@@ -1676,7 +1900,15 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Ast::Delete { table, filter })
+        #[cfg(feature = "v07")]
+        let returning = self.returning_clause::<E>()?;
+        #[cfg(not(feature = "v07"))]
+        let returning: AVec<SelectItem> = AVec::new();
+        Ok(Ast::Delete {
+            table,
+            filter,
+            returning,
+        })
     }
 
     fn drop_table<E>(&mut self) -> Result<Ast, E> {
