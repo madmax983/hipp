@@ -9,10 +9,23 @@
 //! - arithmetic converts text operands by *prefix* numeric parse
 //!   (`'12abc' + 0` is 12, `'abc' + 0` is 0); integer `/` truncates
 //!   and division/modulo by zero yield NULL, never an error;
-//! - comparisons follow `record::compare_values`, with the
-//!   documented comparison-affinity adjustment when one operand is
-//!   a direct column reference (SQLite applies the column's
-//!   affinity to the other operand);
+//! - comparisons follow `record::compare_values`, with SQLite's
+//!   comparison-affinity adjustment (§4.2 of the datatype doc):
+//!   each operand carries an affinity class derived from its
+//!   expression shape — a column reference or CAST carries its
+//!   column/cast affinity, a rowid reference is NUMERIC-class,
+//!   anything else has no affinity. If exactly one side is
+//!   NUMERIC-class, NUMERIC affinity is applied to the other
+//!   side's value (whatever its class); else if one side is
+//!   TEXT-class and the other has no affinity, TEXT affinity is
+//!   applied to the no-affinity side; otherwise neither value is
+//!   converted. (v0.8: the pre-v0.8 evaluator only adjusted when
+//!   exactly one operand was a column reference, so a NUMERIC
+//!   column compared against a TEXT column silently compared
+//!   raw storage classes — a wrong answer, probed against the
+//!   pinned oracle and fixed here. A BLOB-affinity column is
+//!   its own class, *not* "no affinity": TEXT vs BLOB converts
+//!   nothing, also oracle-probed.)
 //! - `=`/`!=`/`<`/... with a NULL operand yield NULL; `IS`/`IS NOT`
 //!   are the NULL-safe forms; AND/OR/NOT are three-valued.
 //!
@@ -88,6 +101,17 @@ pub enum ScalarFn {
 #[derive(Debug, Clone)]
 pub enum RExpr {
     Literal(OwnedValue),
+    /// A computed subquery result value carrying the result
+    /// column's affinity (v0.8): evaluation yields the value
+    /// unchanged, but comparisons treat it as an operand of
+    /// this affinity class — a scalar / IN subquery whose
+    /// single result item is a direct column reference (or
+    /// CAST, or rowid) compares with that column's affinity
+    /// in SQLite, which the plain `Literal` substitution of
+    /// v0.6 silently dropped (oracle-probed: `'002' = (SELECT
+    /// int_col ...)` is true there). Produced only by
+    /// `substitute`; never by the resolver.
+    AffLiteral(OwnedValue, Affinity),
     Column(usize, Affinity),
     Rowid(usize),
     Binary(BinOp, Box<RExpr>, Box<RExpr>),
@@ -191,11 +215,27 @@ pub struct SubPlan {
 
 /// The computed value of one subquery node for one outer row
 /// (v0.6): a scalar / EXISTS result, or the first-column values
-/// of an IN subquery's rows.
+/// of an IN subquery's rows. The `Option<Affinity>` is the
+/// result column's affinity when the subquery's single result
+/// item is a direct column reference / CAST / rowid (v0.8 —
+/// see `RExpr::AffLiteral`); EXISTS results and non-column
+/// result items carry `None`.
 #[derive(Debug, Clone)]
 pub enum SubValue {
-    One(OwnedValue),
-    Many(AVec<OwnedValue>),
+    One(OwnedValue, Option<Affinity>),
+    Many(AVec<OwnedValue>, Option<Affinity>),
+}
+
+/// The affinity a subquery's single result item carries into
+/// an enclosing comparison (v0.8): a direct column reference,
+/// a rowid reference, or a CAST keeps its affinity; every
+/// other expression shape has none.
+pub fn result_affinity(plan: &SubPlan) -> Option<Affinity> {
+    match plan.items.as_slice().first() {
+        Some(RExpr::Column(_, aff)) | Some(RExpr::Cast(_, aff)) => Some(*aff),
+        Some(RExpr::Rowid(_)) => Some(Affinity::Integer),
+        _ => None,
+    }
 }
 
 /// A subquery node found in an expression, in substitution
@@ -728,7 +768,11 @@ pub fn has_agg(e: &RExpr) -> bool {
         RExpr::Agg { .. } => true,
         RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
         RExpr::InSub(x, _, _) => has_agg(x),
-        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => false,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => has_agg(a) || has_agg(b),
         RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => has_agg(a),
         RExpr::InList(x, l, _) => has_agg(x) || l.iter().any(has_agg),
@@ -814,7 +858,11 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
 pub fn has_sub(e: &RExpr) -> bool {
     match e {
         RExpr::SubScalar(_) | RExpr::SubExists(_) | RExpr::InSub(..) => true,
-        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => false,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => has_sub(a) || has_sub(b),
         RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => has_sub(a),
         RExpr::InList(x, l, _) => has_sub(x) || l.iter().any(has_sub),
@@ -847,7 +895,11 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
             collect_subs(x, out);
             out.push(SubKind::In(p));
         }
-        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => {}
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => {}
         RExpr::Binary(_, a, b) => {
             collect_subs(a, out);
             collect_subs(b, out);
@@ -908,32 +960,43 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
     match e {
         RExpr::SubScalar(_) | RExpr::SubExists(_) => {
             let v = match &values[*pos] {
-                SubValue::One(v) => v.clone(),
-                SubValue::Many(_) => OwnedValue::Null,
+                SubValue::One(v, aff) => match aff {
+                    Some(a) => RExpr::AffLiteral(v.clone(), *a),
+                    None => RExpr::Literal(v.clone()),
+                },
+                SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
             };
             *pos += 1;
-            RExpr::Literal(v)
+            v
         }
         RExpr::InSub(x, _, neg) => {
             let sx = substitute(x, values, pos);
+            let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
+                Some(a) => RExpr::AffLiteral(v.clone(), *a),
+                None => RExpr::Literal(v.clone()),
+            };
             let list = match &values[*pos] {
-                SubValue::Many(vs) => {
+                SubValue::Many(vs, aff) => {
                     let mut out = AVec::new();
                     for v in vs.iter() {
-                        out.push(RExpr::Literal(v.clone()));
+                        out.push(wrap(v, aff));
                     }
                     out
                 }
-                SubValue::One(v) => {
+                SubValue::One(v, aff) => {
                     let mut out = AVec::new();
-                    out.push(RExpr::Literal(v.clone()));
+                    out.push(wrap(v, aff));
                     out
                 }
             };
             *pos += 1;
             RExpr::InList(Box::new(sx), list, *neg)
         }
-        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => e.clone(),
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => e.clone(),
         RExpr::Binary(op, a, b) => RExpr::Binary(
             *op,
             Box::new(substitute(a, values, pos)),
@@ -1017,7 +1080,11 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
         RExpr::Agg { args, .. } => args.iter().any(has_sub),
         RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
         RExpr::InSub(x, _, _) => sub_in_agg_args(x),
-        RExpr::Literal(_) | RExpr::Column(..) | RExpr::Rowid(_) | RExpr::OutRef(_) => false,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => sub_in_agg_args(a) || sub_in_agg_args(b),
         RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
             sub_in_agg_args(a)
@@ -1278,24 +1345,60 @@ impl<'x> Ctx<'x> {
     }
 }
 
-fn col_affinity(e: &RExpr) -> Option<Affinity> {
+/// The comparison-affinity class of one operand (v0.8; see the
+/// module docs). `Blob` is a real class of its own — a column
+/// declared without a type does *not* count as "no affinity"
+/// for the TEXT rule (oracle-probed: `text_col = blob_col`
+/// converts nothing, while `text_col = 1` converts the literal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmpClass {
+    Numeric,
+    Text,
+    Blob,
+    None,
+}
+
+fn class_of_affinity(aff: Affinity) -> CmpClass {
+    match aff {
+        Affinity::Integer | Affinity::Real | Affinity::Numeric => CmpClass::Numeric,
+        Affinity::Text => CmpClass::Text,
+        Affinity::Blob => CmpClass::Blob,
+    }
+}
+
+fn cmp_class(e: &RExpr) -> CmpClass {
     match e {
-        RExpr::Column(_, aff) => Some(*aff),
-        _ => None,
+        RExpr::Column(_, aff) | RExpr::Cast(_, aff) | RExpr::AffLiteral(_, aff) => {
+            class_of_affinity(*aff)
+        }
+        // A rowid reference behaves as an INTEGER-affinity
+        // column (oracle-probed: `rowid = '1'` matches rowid 1).
+        RExpr::Rowid(_) => CmpClass::Numeric,
+        _ => CmpClass::None,
     }
 }
 
 /// SQLite's comparison-affinity adjustment for `=`-family
-/// operators: when exactly one operand is a direct column
-/// reference, the column's affinity is applied to the other
-/// operand (numeric affinity converts text; TEXT affinity
-/// converts numbers to text).
+/// operators (v0.8, generalised from the v0.4 one-column rule):
+/// NUMERIC-class on exactly one side applies NUMERIC affinity
+/// to the other side's value; TEXT-class against no affinity
+/// applies TEXT affinity to the no-affinity side; every other
+/// pairing converts nothing.
 fn adjust_cmp(l: &RExpr, r: &RExpr, lv: OwnedValue, rv: OwnedValue) -> (OwnedValue, OwnedValue) {
-    match (col_affinity(l), col_affinity(r)) {
-        (Some(a), None) => (lv, apply_cmp_affinity(rv, a)),
-        (None, Some(a)) => (apply_cmp_affinity(lv, a), rv),
-        _ => (lv, rv),
+    let (lc, rc) = (cmp_class(l), cmp_class(r));
+    if lc == CmpClass::Numeric && rc != CmpClass::Numeric {
+        return (lv, apply_cmp_affinity(rv, Affinity::Numeric));
     }
+    if rc == CmpClass::Numeric && lc != CmpClass::Numeric {
+        return (apply_cmp_affinity(lv, Affinity::Numeric), rv);
+    }
+    if lc == CmpClass::Text && rc == CmpClass::None {
+        return (lv, apply_cmp_affinity(rv, Affinity::Text));
+    }
+    if rc == CmpClass::Text && lc == CmpClass::None {
+        return (apply_cmp_affinity(lv, Affinity::Text), rv);
+    }
+    (lv, rv)
 }
 
 fn apply_cmp_affinity(v: OwnedValue, aff: Affinity) -> OwnedValue {
@@ -1976,6 +2079,7 @@ fn eval_agg<E>(
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
+        RExpr::AffLiteral(v, _) => v.clone(),
         RExpr::Column(i, _) => ctx
             .row()
             .vals
@@ -2101,9 +2205,17 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                     let bv = eval::<E>(b, ctx)?;
                     for (w, t) in whens.iter() {
                         let wv = eval::<E>(w, ctx)?;
-                        if !matches!(bv, OwnedValue::Null)
-                            && !matches!(wv, OwnedValue::Null)
-                            && values_equal_is(&bv, &wv)
+                        // The base form compares like `=`:
+                        // comparison affinity applies between
+                        // the base and each WHEN operand (v0.8;
+                        // oracle-probed `CASE int_col WHEN
+                        // text_col`). NULLIF is the exception —
+                        // it compares binary, no affinity — and
+                        // it does not come through here.
+                        let (bv2, wv2) = adjust_cmp(b, w, bv.clone(), wv);
+                        if !matches!(bv2, OwnedValue::Null)
+                            && !matches!(wv2, OwnedValue::Null)
+                            && values_equal_is(&bv2, &wv2)
                         {
                             out = eval::<E>(t, ctx)?;
                             done = true;

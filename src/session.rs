@@ -7,6 +7,9 @@
 //! per connection (§5.1.2) and a catalog rebuild can only happen
 //! when no statement is live (§7.5.5) — both by construction.
 
+#[cfg(feature = "v08")]
+use alloc::boxed::Box;
+
 use crate::arena::{AVec, Arena};
 use crate::btree::{self, ScanCursor};
 use crate::error::{Error, Result, SchemaKind, Scope};
@@ -196,6 +199,26 @@ enum Plan {
         /// in VALUES are constant-folded here; pre-v0.4 they are
         /// plain literals).
         rows_v: AVec<AVec<OwnedValue>>,
+        /// VALUES rows that contain subqueries (v0.8), resolved
+        /// at plan time and evaluated at step time — all of them
+        /// BEFORE the first row is inserted (the oracle evaluates
+        /// a multi-row VALUES' subqueries against the
+        /// pre-statement table: `VALUES ((SELECT count(*) FROM
+        /// t)), ((SELECT count(*) FROM t))` on an empty `t`
+        /// inserts 0, 0 — probed on the pin). `rows_v` is empty
+        /// when this is `Some`.
+        #[cfg(feature = "v08")]
+        rows_r: Option<AVec<AVec<RExpr>>>,
+        /// `INSERT INTO ... SELECT` source (v0.8): a subquery
+        /// plan against the empty enclosing scope; executed and
+        /// fully materialised at step time before the first row
+        /// is inserted, so a self-insert
+        /// (`INSERT INTO t SELECT * FROM t`) terminates with the
+        /// pre-statement rows, as in the oracle. Boxed: the
+        /// plan is large and the enum's other variants are not
+        /// (clippy::large_enum_variant).
+        #[cfg(feature = "v08")]
+        select: Option<Box<crate::query::SubPlan>>,
         /// The `OR ...` conflict clause (v0.7; the parser only
         /// produces a non-default value under the feature, and
         /// the executor only consults it there).
@@ -581,6 +604,7 @@ impl<S: Storage> Connection<S> {
                 table,
                 columns,
                 rows,
+                select,
                 conflict,
                 upsert,
                 returning,
@@ -599,6 +623,8 @@ impl<S: Storage> Connection<S> {
                         default: literal_owned(&self.catalog_arena, c.default),
                     });
                 }
+                #[cfg(not(feature = "v08"))]
+                let _ = select;
                 // Every row of a multi-row VALUES must match the
                 // expected width (SQLite: "all VALUES must have
                 // the same number of terms").
@@ -655,14 +681,106 @@ impl<S: Storage> Connection<S> {
                     }
                     out
                 };
-                let mut rows_v = AVec::new();
-                for r in rows.iter() {
-                    let mut rv = AVec::new();
-                    for e in r.iter() {
-                        rv.push(self.eval_value_expr(arena, e)?);
+                // v0.8: an INSERT ... SELECT source is planned
+                // as a subquery against the empty enclosing
+                // scope. Its result width must match the target
+                // width, and an upsert clause after it is only
+                // accepted when the SELECT's FROM clause is
+                // terminated by a WHERE, ORDER BY or LIMIT (or
+                // there is no FROM at all) — the pinned oracle's
+                // parser rejects `... FROM t ON CONFLICT ...`
+                // outright (probed: the bare-FROM upsert is a
+                // syntax error there, the terminated and
+                // FROM-less forms parse), so hipp refuses the
+                // same shape rather than accepting a superset.
+                #[cfg(feature = "v08")]
+                let select_plan = match select {
+                    Some(sel) => {
+                        if upsert.is_some()
+                            && !sel.from.is_empty()
+                            && sel.filter.is_none()
+                            && sel.order_by.is_empty()
+                            && sel.limit.is_none()
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        let p = self.plan_subquery(sel, arena, &[])?;
+                        if p.items.len() != width {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::ColumnCountMismatch,
+                            });
+                        }
+                        Some(Box::new(p))
                     }
-                    rows_v.push(rv);
-                }
+                    None => None,
+                };
+                #[cfg(feature = "v08")]
+                let (rows_v, rows_r) = if select_plan.is_some() {
+                    (AVec::new(), None)
+                } else {
+                    // Resolve the VALUES expressions against the
+                    // empty scope with the real subquery planner.
+                    // Rows without subqueries fold to constants
+                    // here, exactly as `eval_value_expr` did; a
+                    // row set containing subqueries is kept
+                    // resolved for step-time evaluation (all rows
+                    // evaluated before any insert — see the
+                    // `rows_r` plan field).
+                    let cur = crate::query::ScopeGroup {
+                        sources: AVec::new(),
+                        offsets: AVec::new(),
+                        first_src: 0,
+                    };
+                    let mut planner = self.sub_planner(arena);
+                    let mut resolved: AVec<AVec<RExpr>> = AVec::new();
+                    let mut any_sub = false;
+                    for r in rows.iter() {
+                        let mut rr = AVec::new();
+                        for e in r.iter() {
+                            let re = crate::query::resolve_scoped::<S::Error>(
+                                e,
+                                arena,
+                                &cur,
+                                &[],
+                                &mut planner,
+                            )?;
+                            if crate::query::has_agg(&re) {
+                                return Err(Error::Unsupported);
+                            }
+                            if crate::query::has_sub(&re) {
+                                any_sub = true;
+                            }
+                            rr.push(re);
+                        }
+                        resolved.push(rr);
+                    }
+                    if any_sub {
+                        (AVec::new(), Some(resolved))
+                    } else {
+                        let empty = RowData::empty();
+                        let mut folded = AVec::new();
+                        for rr in resolved.iter() {
+                            let mut rv = AVec::new();
+                            for re in rr.iter() {
+                                rv.push(crate::query::eval::<S::Error>(re, &Ctx::Row(&empty))?);
+                            }
+                            folded.push(rv);
+                        }
+                        (folded, None)
+                    }
+                };
+                #[cfg(not(feature = "v08"))]
+                let rows_v = {
+                    let mut rows_v = AVec::new();
+                    for r in rows.iter() {
+                        let mut rv = AVec::new();
+                        for e in r.iter() {
+                            rv.push(self.eval_value_expr(arena, e)?);
+                        }
+                        rows_v.push(rv);
+                    }
+                    rows_v
+                };
                 #[cfg(feature = "v07")]
                 let upsert_plan = match upsert {
                     Some(u) => Some(self.plan_upsert(arena, t, tname, u)?),
@@ -676,6 +794,10 @@ impl<S: Storage> Connection<S> {
                     cols,
                     targets,
                     rows_v,
+                    #[cfg(feature = "v08")]
+                    rows_r,
+                    #[cfg(feature = "v08")]
+                    select: select_plan,
                     conflict: *conflict,
                     #[cfg(feature = "v07")]
                     upsert: upsert_plan,
@@ -1631,6 +1753,10 @@ impl<S: Storage> Connection<S> {
 
     /// Evaluate one INSERT VALUES expression at plan time
     /// (v0.4: constant expressions; pre-v0.4: plain literals).
+    /// Superseded under `v08` by the resolved-expression fold in
+    /// the INSERT planner (which needs the resolved form to
+    /// detect subqueries), so it only compiles there.
+    #[cfg(not(feature = "v08"))]
     fn eval_value_expr(&self, arena: &Arena, e: &Expr) -> Result<OwnedValue, S::Error> {
         #[cfg(feature = "v04")]
         {
@@ -3064,12 +3190,14 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
-        let Plan::Insert { rows_v, .. } = &self.plan else {
-            unreachable!()
-        };
-        let nrows = rows_v.len();
-        for r in 0..nrows {
-            self.exec_insert_row(r).await?;
+        // The full row source is materialised BEFORE the first
+        // row is inserted (v0.8): an INSERT ... SELECT reading
+        // its own target terminates on the pre-statement rows,
+        // and subqueries in VALUES observe the pre-statement
+        // table for every row — both oracle-probed.
+        let rows = self.insert_source_rows().await?;
+        for values in rows.iter() {
+            self.exec_insert_row(values.clone()).await?;
         }
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
@@ -3077,13 +3205,52 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(())
     }
 
-    async fn exec_insert_row(&mut self, row_idx: usize) -> Result<(), S::Error> {
+    /// Produce every row an INSERT will insert, as raw value
+    /// rows parallel to the plan's `targets` (v0.8). VALUES rows
+    /// were folded at plan time, except rows containing
+    /// subqueries, which evaluate here against the empty row;
+    /// an INSERT ... SELECT source executes its subquery plan
+    /// against the empty outer row.
+    async fn insert_source_rows(&mut self) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
+        #[cfg(feature = "v08")]
+        {
+            let select = match &self.plan {
+                Plan::Insert { select, .. } => select.clone(),
+                _ => unreachable!(),
+            };
+            if let Some(plan) = select {
+                let empty = RowData::empty();
+                return self.exec_subplan(&plan, &empty).await;
+            }
+            let rows_r = match &self.plan {
+                Plan::Insert { rows_r, .. } => rows_r.clone(),
+                _ => unreachable!(),
+            };
+            if let Some(rows_r) = rows_r {
+                let empty = RowData::empty();
+                let mut out = AVec::new();
+                for rr in rows_r.iter() {
+                    let mut rv = AVec::new();
+                    for e in rr.iter() {
+                        rv.push(self.eval_row_sub(e, &empty).await?);
+                    }
+                    out.push(rv);
+                }
+                return Ok(out);
+            }
+        }
+        match &self.plan {
+            Plan::Insert { rows_v, .. } => Ok(rows_v.clone()),
+            _ => unreachable!(),
+        }
+    }
+
+    async fn exec_insert_row(&mut self, values: AVec<OwnedValue>) -> Result<(), S::Error> {
         let Plan::Insert {
             root,
             rowid_alias,
             cols,
             targets,
-            rows_v,
             ..
         } = &self.plan
         else {
@@ -3094,7 +3261,6 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Insert { indexes, .. } => indexes.clone(),
             _ => unreachable!(),
         };
-        let values: AVec<OwnedValue> = rows_v.as_slice()[row_idx].clone();
         let ncols = cols.len();
         let mut row: AVec<OwnedValue> = AVec::new();
         for c in cols.iter() {
@@ -4574,18 +4740,20 @@ impl<'c, S: Storage> Statement<'c, S> {
             match k {
                 SubKind::Scalar(plan) => {
                     let rows = self.exec_subplan(plan, outer).await?;
-                    out.push(SubValue::One(match rows.as_slice().first() {
-                        Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
-                        None => OwnedValue::Null,
-                    }));
+                    out.push(SubValue::One(
+                        match rows.as_slice().first() {
+                            Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
+                            None => OwnedValue::Null,
+                        },
+                        crate::query::result_affinity(plan),
+                    ));
                 }
                 SubKind::Exists(plan) => {
                     let rows = self.exec_subplan(plan, outer).await?;
-                    out.push(SubValue::One(OwnedValue::Integer(if rows.is_empty() {
-                        0
-                    } else {
-                        1
-                    })));
+                    out.push(SubValue::One(
+                        OwnedValue::Integer(if rows.is_empty() { 0 } else { 1 }),
+                        None,
+                    ));
                 }
                 SubKind::In(plan) => {
                     let rows = self.exec_subplan(plan, outer).await?;
@@ -4593,7 +4761,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     for r in rows.iter() {
                         vs.push(r.as_slice().first().cloned().unwrap_or(OwnedValue::Null));
                     }
-                    out.push(SubValue::Many(vs));
+                    out.push(SubValue::Many(vs, crate::query::result_affinity(plan)));
                 }
             }
         }
