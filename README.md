@@ -8,15 +8,50 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.7 — write-side completion (OR REPLACE,
-  UPDATE ... FROM, RETURNING, UPSERT), on the v0.6
-  foundation (SPEC §2).
+- **Phase:** v0.8 — the correctness-and-completion pass
+  (cross-affinity comparisons; INSERT INTO ... SELECT;
+  subqueries in INSERT VALUES), on the v0.7 foundation
+  (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.8 does
+
+- Everything v0.7 does (below), plus the
+  correctness-and-completion pass behind the `v08` feature
+  (default on, implies `v07`; the tiny profile excludes it):
+  `INSERT INTO ... SELECT` — the full SELECT grammar as a row
+  source (joins, aggregates, GROUP BY, DISTINCT, ORDER BY /
+  LIMIT, no-FROM selects, column lists), composing with the
+  v0.7 machinery (`OR` conflict clauses, UPSERT, RETURNING);
+  the source is fully materialised before the first row is
+  inserted, so a self-insert doubles the table exactly once,
+  as in SQLite; and subqueries in `INSERT VALUES` (scalar,
+  `IN (SELECT ...)`, `EXISTS`), likewise all evaluated
+  against the pre-statement table before any row lands.
+  One oracle quirk is reproduced, not widened: an upsert
+  clause after an INSERT ... SELECT whose FROM clause is
+  not terminated by WHERE / ORDER BY / LIMIT is a syntax
+  error in SQLite, and hipp refuses the same shape.
+- A correctness fix in the comparison evaluator (not
+  feature-gated — it lives in the v0.4 evaluator): SQLite's
+  comparison-affinity rules now apply between any two
+  operands, not only column-vs-literal. A NUMERIC-affinity
+  column compared against a TEXT-affinity column converts
+  the text side (`int_col = text_col` with `'002'` stored is
+  true, where v0.7 silently compared raw storage classes
+  and answered false); TEXT vs BLOB affinity converts
+  nothing (a BLOB column is its own affinity class, not
+  "no affinity"); CAST operands and rowid references carry
+  their affinity class; and a scalar / IN subquery whose
+  result item is a direct column reference carries that
+  column's affinity into the enclosing comparison. CASE's
+  base form compares with affinity, like `=`; NULLIF still
+  compares binary, as SQLite does.
 
 ## What v0.7 does
 
@@ -55,9 +90,10 @@ aspirations.
   subquery yields its first row's first column (NULL on no
   rows), and a subquery yielding the wrong column count is a
   prepare-time error. Named boundaries: a subquery inside an
-  aggregate's arguments and subqueries in INSERT VALUES are
-  refused at prepare time; FROM-clause derived tables and
-  UNION remain outside the grammar.
+  aggregate's arguments are refused at prepare time;
+  FROM-clause derived tables and UNION remain outside the
+  grammar. (Subqueries in INSERT VALUES, refused in v0.6,
+  are implemented in v0.8.)
 
 ## What v0.5 does
 
@@ -136,7 +172,7 @@ aspirations.
 
 | Gate | Budget | Measured (v0.7) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,168 B** (Δ +184 B vs v0.6's 88,984 B; the v0.7 engine is feature-gated out of tiny — the delta is the ungated AST/parser gaining the conflict action, upsert and RETURNING nodes, and the REPLACE verb) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,312 B** (Δ +144 B vs v0.7's 89,168 B; the v0.8 engine is feature-gated out of tiny — the delta is the ungated AST/parser gaining the INSERT source split) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

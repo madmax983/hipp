@@ -4,6 +4,142 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.8 — correctness-and-completion pass (2026-10-26)
+
+Pushed to GitHub (madmax983/hipp) via API replay under the
+conformance-loop mandate; remote tip + tree recorded in the
+loop status.
+
+### Scope shipped
+
+- **Cross-affinity comparison correctness** in the v0.4
+  evaluator (not feature-gated — the evaluator is already
+  outside the tiny profile): every comparison operand now
+  carries an affinity *class* (NUMERIC / TEXT / BLOB / none)
+  derived from its expression shape — a column reference or
+  CAST carries its column/cast affinity, a rowid reference
+  is NUMERIC-class, anything else has none. SQLite's rules
+  then apply between *any* two operands: NUMERIC-class on
+  exactly one side applies NUMERIC affinity to the other
+  side's value; TEXT-class against no affinity applies TEXT
+  affinity to the no-affinity side; every other pairing
+  converts nothing. This closes the silent wrong-answer
+  divergence carried since v0.4 (`int_col = text_col`
+  compared raw storage classes). CASE's base form takes the
+  same adjustment (it compares like `=`); NULLIF keeps its
+  binary comparison, matching the oracle. A scalar / IN
+  subquery whose single result item is a direct column
+  reference, CAST, or rowid now carries that affinity into
+  the enclosing comparison too (`'002' = (SELECT int_col
+  ...)`) — the substitution path represents such results as
+  an affinity-carrying literal node (`RExpr::AffLiteral`)
+  whose value is untouched (a CAST would have corrupted it:
+  CAST 'abc' AS NUMERIC is 0, affinity leaves 'abc' alone).
+- **INSERT completion** behind the `v08` cargo feature
+  (default on, implies `v07`; the tiny profile excludes
+  it): `INSERT INTO ... SELECT` with the full SELECT
+  grammar as the row source (joins, aggregates + GROUP BY,
+  DISTINCT, ORDER BY / LIMIT / OFFSET, no-FROM selects,
+  explicit column lists), composing with OR conflict
+  clauses, UPSERT, and RETURNING through the existing
+  per-row insert path; and subqueries in INSERT VALUES
+  (scalar, `IN (SELECT ...)`, `EXISTS`). Both new sources
+  are **fully materialised / evaluated before the first
+  row is inserted**, which is the oracle's observable
+  semantics on both points (probed below).
+
+### Root finds this milestone
+
+- **Oracle probes before code** pinned the affinity rules
+  the tests then encode: a BLOB-affinity column is its own
+  class, *not* "no affinity" (`text_col = blob_col` over
+  `'1'` vs integer `1` is false; `text_col = 1` is true);
+  `rowid = '1'` matches (rowid is NUMERIC-class); BETWEEN
+  is pairwise comparison affinity, not the
+  apply-the-left-affinity-to-both-bounds special rule (the
+  distinguishing probe `'10' BETWEEN 2 AND 3` over TEXT /
+  INTEGER columns is true pairwise, false under the
+  special rule); and NULLIF compares binary.
+- **VALUES subqueries snapshot the pre-statement table.**
+  Probed on the pin: on an empty `t`,
+  `INSERT INTO t VALUES ((SELECT count(*) FROM t)),
+  ((SELECT count(*) FROM t))` inserts **0, 0** — every
+  row's subqueries evaluate before any row lands. The
+  executor therefore evaluates all source rows (VALUES
+  subqueries and INSERT ... SELECT alike) before the
+  first insert; a self-insert
+  (`INSERT INTO t SELECT * FROM t`) terminates on the
+  pre-statement rows for the same reason.
+- **The upsert-after-SELECT parser quirk is reproduced,
+  not widened.** On the pin, `INSERT INTO d SELECT ...
+  FROM t ON CONFLICT ...` is a syntax error unless the
+  SELECT's FROM clause is terminated by WHERE, ORDER BY,
+  or LIMIT (a FROM-less SELECT takes an upsert freely).
+  hipp refuses exactly the unterminated-FROM shape at plan
+  time rather than accepting a superset of the oracle's
+  grammar.
+- **One pre-existing test was superseded by design**
+  (v0.6's `subquery_rejections` asserted INSERT VALUES
+  subqueries are prepare-time refusals); it now asserts
+  the implemented behaviour and the landed row, the same
+  repointing pattern as v0.6/v0.7.
+
+### Tests — 191, all green (v0.7 by the same count: 181)
+
+Counted as the full `cargo test --workspace` sum across
+every suite. New: `tests/insert_select_v08.rs` (8) —
+cross-affinity column pairs and compound positions
+(CASE / BETWEEN / IN / joins / subquery-result affinity)
+as row-for-row differentials over an oracle-built file,
+cross-affinity UPDATE / DELETE filters, INSERT ... SELECT
+(copies, expressions, aggregates, self-insert, empty
+sources, no-FROM selects), INSERT ... SELECT with
+conflict clauses / UPSERT / RETURNING including the
+unterminated-FROM refusal, an oracle-writes-first
+INSERT ... SELECT, and VALUES subqueries with their
+snapshot semantics and rejections — plus
+`hipp-cli/tests/cli_v08.rs` (2): a v0.8 corpus
+byte-identical through both CLIs and a `.dump` replay
+check. A1–A11 acceptance tests stay green; clippy
+`--workspace --all-targets -- -D warnings` clean; the
+feature matrix (no-default, std-only, v04-only through
+v08-only, indexes-only, indexes+v05, all-features) all
+compiles.
+
+### Tiny gates (SPEC §4.1), re-measured
+
+- Linked binary (tiny profile, thumbv7em): **.text 74,360 +
+  .rodata 14,952 = 89,312 B** ≤ 128 KiB. Δ vs v0.7's
+  89,168 B: **+144 B** — under the 4 KiB ratchet line, no
+  justification needed. The v08 engine contributes 0 B to
+  tiny (behind `v08`); the delta is the ungated AST/parser
+  gaining the INSERT source split (VALUES vs SELECT).
+- Engine statics 0 B outside caller heap (.bss 98,308 B =
+  demo heap, unchanged); tiny RAM + zero-alloc scan gates
+  green (`tests/gates.rs`).
+
+### Honest gaps
+
+- INSERT ... SELECT sources and VALUES rows are
+  materialised in the statement arena before inserting;
+  very wide sources are bounded by the statement arena
+  (ArenaExhausted, never a panic) where SQLite streams.
+  RETURNING over an INSERT ... SELECT inherits v0.7's
+  buffered-RETURNING note (values identical, timing
+  differs).
+- A subquery result item that is not a direct column
+  reference / CAST / rowid carries no affinity into an
+  enclosing comparison; that matches the oracle for the
+  probed expression shapes, but compound result items
+  (e.g. `SELECT a FROM t UNION ...`) are outside the
+  grammar entirely (UNION is v0.9 scope).
+- Carried: no FROM-clause derived tables or UNION
+  anywhere; subqueries execute once per outer row with no
+  uncorrelated hoisting; subquery inside an aggregate's
+  arguments plan-refused. The SPEC §2 phase table's last
+  item, WAL read, remains gated on a real target demanding
+  it.
+
 ## v0.7 — write-side completion (2026-10-25)
 
 Pushed to GitHub (madmax983/hipp) via API replay under the
