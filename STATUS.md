@@ -84,10 +84,12 @@ loop status.
   the implemented behaviour and the landed row, the same
   repointing pattern as v0.6/v0.7.
 
-### Tests — 191, all green (v0.7 by the same count: 181)
+### Tests — 131, all green (v0.7: 121)
 
 Counted as the full `cargo test --workspace` sum across
-every suite. New: `tests/insert_select_v08.rs` (8) —
+every suite. (Correction, same day: the first v0.8 STATUS
+draft said 191/181 — a miscount from a garbled test-run
+listing; the log-verified sums are 131 and 121.) New: `tests/insert_select_v08.rs` (8) —
 cross-affinity column pairs and compound positions
 (CASE / BETWEEN / IN / joins / subquery-result affinity)
 as row-for-row differentials over an oracle-built file,
