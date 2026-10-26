@@ -382,12 +382,25 @@ fn subquery_rejections() {
                 .await
                 .is_err()
         );
-        // Subqueries in INSERT VALUES are refused (constant
-        // folding has no executor).
-        assert!(
-            db.prepare("INSERT INTO dept VALUES ((SELECT max(id) FROM dept), 'x', 1)")
+        // Subqueries in INSERT VALUES were refused in v0.6
+        // (constant folding has no executor); v0.8 implements
+        // them (see tests/insert_select_v08.rs), so the prepare
+        // now succeeds — execute it and check the row landed.
+        {
+            let mut st = db
+                .prepare("INSERT INTO dept VALUES ((SELECT max(id) FROM dept) + 1, 'x', 1)")
                 .await
-                .is_err()
+                .expect("v0.8: VALUES subquery prepares");
+            assert_eq!(st.step().await.expect("step"), hipp::Step::Done);
+        }
+        assert_eq!(
+            collect(&mut db, "SELECT id, name, budget FROM dept ORDER BY id").await,
+            vec![
+                "1|eng|1000".to_string(),
+                "2|ops|400".to_string(),
+                "3|empty|50".to_string(),
+                "4|x|1".to_string(),
+            ]
         );
         // Unknown names inside a subquery fail at prepare,
         // correlated or not.
