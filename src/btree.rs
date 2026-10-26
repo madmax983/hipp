@@ -1493,7 +1493,7 @@ pub async fn index_insert<S: Storage>(
     // (cells' children in order, then the rightmost pointer).
     let mut path: AVec<(u32, usize)> = AVec::new();
     let mut page = root;
-    let (leaf_page, leaf_cells) = loop {
+    let (leaf_page, leaf_cells, leaf_pos) = loop {
         let idx = pager.load(page).await?;
         let snap = copy_bytes(pager.frame_data(idx));
         let h = head::<S::Error>(snap.as_slice(), page)?;
@@ -1502,18 +1502,27 @@ pub async fn index_insert<S: Storage>(
                 return Err(Error::Unsupported);
             }
             let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
-            for c in cells.iter() {
+            // The leaf is sorted: the probe goes before the first cell
+            // above it, and a duplicate can only be the cell at that
+            // boundary (cells past it are strictly above the probe).
+            let mut pos = cells.len();
+            for (i, c) in cells.iter().enumerate() {
                 let p = index_cell_payload(pager, c).await?;
                 let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-                if compare_entries(e.values.as_slice(), probe.values.as_slice(), desc)
-                    == Ordering::Equal
-                {
-                    return Err(Error::Schema {
-                        kind: SchemaKind::DuplicateRowid,
-                    });
+                match compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) {
+                    Ordering::Equal => {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::DuplicateRowid,
+                        });
+                    }
+                    Ordering::Less => {
+                        pos = i;
+                        break;
+                    }
+                    Ordering::Greater => {}
                 }
             }
-            break (page, cells);
+            break (page, cells, pos);
         }
         if h.kind != KIND_INTERIOR_INDEX {
             return Err(Error::Unsupported);
@@ -1566,20 +1575,13 @@ pub async fn index_insert<S: Storage>(
 
     // ---- merge into the leaf in key order ----
     let mut all: AVec<IndexCell> = AVec::new();
-    let mut inserted = false;
-    for c in leaf_cells.iter() {
-        if !inserted {
-            let p = index_cell_payload(pager, c).await?;
-            let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-            if compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) == Ordering::Less
-            {
-                all.push(new_cell.clone());
-                inserted = true;
-            }
+    for (i, c) in leaf_cells.iter().enumerate() {
+        if i == leaf_pos {
+            all.push(new_cell.clone());
         }
         all.push(c.clone());
     }
-    if !inserted {
+    if leaf_pos == leaf_cells.len() {
         all.push(new_cell);
     }
 
