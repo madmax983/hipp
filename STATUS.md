@@ -4,6 +4,142 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.7 — write-side completion (2026-10-25)
+
+Pushed to GitHub (madmax983/hipp) via API replay under the
+conformance-loop mandate; remote tip + tree recorded in the
+loop status.
+
+### Scope shipped
+
+- **Conflict clauses everywhere** behind the `v07` cargo
+  feature (default on, implies `v06`; the tiny profile
+  excludes it): `INSERT` / `UPDATE` accept `OR REPLACE`,
+  `OR IGNORE`, `OR ABORT`, `OR FAIL`, `OR ROLLBACK` (the
+  last three are the same abort in hipp, as they observably
+  are in the oracle in autocommit), and the `REPLACE` verb
+  is `INSERT OR REPLACE`. REPLACE deletes **every**
+  conflicting row — a proposal can kill two different rows
+  at once, one through the rowid and one through a UNIQUE
+  index — then inserts; updated rows take the same path
+  against the rows they collide with.
+- **UPSERT**: `INSERT ... ON CONFLICT [(target)] DO
+  NOTHING | DO UPDATE SET ... [WHERE ...]`, with no-target
+  arbitration over any uniqueness conflict, target
+  arbitration over exactly the rowid or one unique index's
+  key set (canonicalised: the rowid-alias column and
+  `rowid` spellings are the same target, DESC / COLLATE
+  decorations accepted), `excluded.<col>` for the proposal
+  and bare / table-qualified names for the original row in
+  SET expressions and the DO UPDATE WHERE. A conflict the
+  clause does not arbitrate falls back to the statement's
+  own conflict action (abort by default), atomically.
+- **UPDATE ... FROM**: the target row is joined against
+  materialised FROM sources (full v0.4 source grammar,
+  JOIN / LEFT JOIN / aliases, self-FROM included); SET and
+  WHERE evaluate per (target, FROM) combination against
+  the target's ORIGINAL values, a row matched by several
+  combinations is rewritten once per combination, and the
+  last combination's result is what remains.
+- **RETURNING** on INSERT / UPDATE / DELETE: SELECT-shaped
+  items (`*`, `t.*`, expressions, aliases) including
+  correlated subqueries through the v0.6 machinery;
+  aggregates are refused. INSERT returns rows in VALUES
+  order, UPDATE returns post-update values (one row per
+  updated target row), DELETE returns pre-delete values,
+  OR IGNORE / DO NOTHING skips return nothing, and an
+  upsert DO UPDATE returns the updated row.
+
+### Root finds this milestone
+
+- **Oracle probes before code** pinned the semantics the
+  tests then encode: REPLACE's two-victim case; UPDATE
+  FROM's last-combination-wins computed from original
+  values (`v=10` over FROM values 1, 2, 4 leaves 14, not
+  17); the upsert fallback rule above; DO UPDATE's bare
+  names binding the original row; a qualified SET
+  left-hand side being a syntax error, not a resolution
+  error.
+- **The conflict-target WHERE is resolved but never
+  evaluated.** Probed on the pin: `ON CONFLICT(u) WHERE 0
+  DO NOTHING` arbitrates exactly like `WHERE 1` (the row
+  is skipped, no error), while `WHERE nosuchcol` errors
+  with "no such column". The predicate only has meaning
+  for partial indexes; hipp creates none, so the planner
+  name-resolves it for validation and drops it.
+- **One apply tail for every write.** UPDATE, OR REPLACE
+  victim deletion, and upsert DO UPDATE all funnel through
+  the same rewrite/delete helpers, so index maintenance
+  lives in exactly one place — that is what keeps
+  `integrity_check` green across every new delete path.
+- One pre-existing assertion was superseded by design
+  (v0.5's `update_or_ignore_skips_conflicts` asserted
+  UPDATE OR REPLACE is a parse refusal); it now asserts
+  the implemented behaviour.
+
+### Tests — 121, all green (v0.6: 103)
+
+- New `tests/write_side_v07.rs` (16): twin-file
+  differentials (hipp writes one file, the oracle CLI a
+  twin; final contents compared from the oracle side,
+  `integrity_check` on the hipp file) covering INSERT OR
+  REPLACE incl. the two-victim and `REPLACE INTO` cases,
+  default-abort preservation, UPDATE OR REPLACE / OR
+  IGNORE on UNIQUE and rowid conflicts, RETURNING for all
+  three verbs (order, star, aliases, rowid, subqueries,
+  aggregate refusal), upsert basics / targets / WHERE /
+  multi-row / RETURNING / syntax rejections, UPDATE FROM
+  (basic, multi-match last-wins, joins + aliases +
+  self-FROM + LEFT JOIN, RETURNING scope), and an
+  oracle-writes-first both-directions file.
+- New `hipp-cli/tests/cli_v07.rs` (2): a v0.7 corpus
+  byte-identical through both CLIs (one-shot and stdin),
+  and a `.dump` replay check.
+- The full suite re-runs on the committed tree before the
+  push (see the loop status for the recorded run).
+
+### Gates
+
+- clippy `--workspace --all-targets -D warnings` clean;
+  `cargo fmt` write-mode + clean tree; feature matrix
+  (no-default, std-only, v04-only, v05-only, v06-only,
+  v07-only, indexes-only, indexes+v05, all-features) all
+  compile; A1–A11 stay green.
+- Tiny profile (thumbv7em): `.text` 74,208 + `.rodata`
+  14,960 = **89,168 B** ≤ 128 KiB. Δ **+184 B** vs v0.6's
+  88,984 B — under the 4 KiB ratchet line, no justification
+  needed. The v07 engine contributes 0 B to tiny (behind
+  the feature); the delta is the ungated AST/parser growth
+  (conflict action on INSERT/UPDATE, upsert and RETURNING
+  AST nodes, the REPLACE verb). Engine statics 0 B outside
+  caller heap (`.bss` 98,308 B = demo heap, unchanged);
+  tiny-config RAM and zero-steady-state-scan-allocation
+  gates green (`tests/gates.rs`).
+
+### Honest gaps
+
+- RETURNING rows are buffered: in autocommit the write
+  executes and commits before the first RETURNING row is
+  served, where SQLite streams rows as the statement
+  runs. Values are identical; only the timing differs,
+  and only across connections.
+- A row deleted as an OR REPLACE victim can still be
+  visited later by the same statement's own scan snapshot
+  (writes materialise their scan first) and rewritten;
+  SQLite's cursor never sees it. Not differentially
+  covered.
+- Rowid-changing UPDATE ... FROM with several matching
+  combinations applies later combinations against the
+  moved row; the combinations' expressions still read
+  the original values.
+- Carried from v0.6: subqueries in INSERT VALUES are
+  refused and `INSERT INTO ... SELECT` is not in the
+  grammar; no FROM-clause derived tables or UNION;
+  cross-affinity column-to-column comparison keeps the
+  v0.4 simplification (probed divergence; it was v0.7's
+  named stretch item and the write-side scope plus gates
+  consumed the run — it carries forward).
+
 ## v0.6 — subqueries in expressions (2026-10-25)
 
 Pushed to GitHub (madmax983/hipp) via API replay under the

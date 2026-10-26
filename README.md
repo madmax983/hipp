@@ -8,15 +8,38 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.6 — subqueries in expressions (scalar,
-  `IN (SELECT ...)`, `EXISTS`) across SELECT / UPDATE /
-  DELETE, on the v0.5 foundation (SPEC §2).
+- **Phase:** v0.7 — write-side completion (OR REPLACE,
+  UPDATE ... FROM, RETURNING, UPSERT), on the v0.6
+  foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.7 does
+
+- Everything v0.6 does (below), plus the write-side
+  completion behind the `v07` feature (default on, implies
+  `v06`; the tiny profile excludes it): `OR REPLACE` /
+  `OR IGNORE` / `OR ABORT` conflict clauses on INSERT and
+  UPDATE (plus the `REPLACE` verb), where REPLACE deletes
+  every row the proposal or update collides with — through
+  the rowid and through UNIQUE indexes alike; UPSERT
+  (`INSERT ... ON CONFLICT [(target)] DO NOTHING | DO
+  UPDATE SET ... [WHERE ...]`) with `excluded.*` proposal
+  references and the oracle's fallback to the statement's
+  own conflict action for conflicts the clause does not
+  arbitrate; `UPDATE ... FROM` with per-combination
+  evaluation against the target's original values (last
+  matching combination wins); and `RETURNING` on INSERT /
+  UPDATE / DELETE, including subquery expressions.
+  Named boundaries: RETURNING rows are buffered until the
+  write completes (values identical, timing differs from
+  SQLite's streaming); the upsert conflict-target WHERE is
+  name-resolved but never evaluated, matching the oracle
+  for the non-partial indexes hipp creates.
 
 ## What v0.6 does
 
@@ -111,9 +134,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.6) |
+| Gate | Budget | Measured (v0.7) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **88,984 B** (Δ +48 B vs v0.5's 88,936 B; the v0.6 engine is feature-gated out of tiny — the delta is the ungated AST gaining the three subquery `Expr` variants) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,168 B** (Δ +184 B vs v0.6's 88,984 B; the v0.7 engine is feature-gated out of tiny — the delta is the ungated AST/parser gaining the conflict action, upsert and RETURNING nodes, and the REPLACE verb) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
