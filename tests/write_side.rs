@@ -466,11 +466,15 @@ fn update_or_ignore_skips_conflicts() {
             collect(&mut db, "SELECT * FROM t ORDER BY id").await,
             vec!["1|x", "2|y", "3|w"]
         );
-        // OR REPLACE is a named v0.5 refusal, not a silent ABORT.
-        assert!(matches!(
-            exec_err(&mut db, "UPDATE OR REPLACE t SET a = 'x' WHERE id = 3").await,
-            Error::Parse { .. }
-        ));
+        // v0.5 named OR REPLACE a refusal; v0.7 implements it:
+        // row 3 takes 'x' and the conflicting row 1 is deleted.
+        exec(&mut db, "UPDATE OR REPLACE t SET a = 'x' WHERE id = 3")
+            .await
+            .unwrap();
+        assert_eq!(
+            collect(&mut db, "SELECT * FROM t ORDER BY id").await,
+            vec!["2|y", "3|x"]
+        );
     });
 }
 
