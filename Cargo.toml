@@ -4,13 +4,13 @@ resolver = "2"
 
 [package]
 name = "hipp"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
-default = ["std", "indexes", "v04", "v05", "v06", "v07"]
+default = ["std", "indexes", "v04", "v05", "v06", "v07", "v08"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
 # Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
@@ -39,6 +39,14 @@ v06 = ["v05"]
 # expressions resolve subqueries against the affected row), so
 # it implies `v06`. The tiny profile excludes it per §2.
 v07 = ["v06"]
+# v0.8 dialect: INSERT completion — INSERT INTO ... SELECT and
+# subqueries in INSERT VALUES. Builds on the v0.7 write side
+# (an INSERT ... SELECT ... ON CONFLICT / RETURNING composes
+# the v0.7 plans), so it implies `v07`. The tiny profile
+# excludes it per §2. (The v0.8 cross-affinity comparison fix
+# is *not* gated: it lives in the v0.4 evaluator, which the
+# tiny profile already excludes wholesale.)
+v08 = ["v07"]
 
 [dependencies]
 

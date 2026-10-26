@@ -45,6 +45,15 @@ struct Parser<'a> {
     sql: &'a [u8],
 }
 
+/// What supplies an INSERT's rows (v0.8): VALUES rows, or a
+/// SELECT source (exactly one of the two is meaningful —
+/// `select` is `Some` iff the source was a SELECT, in which
+/// case `rows` is empty).
+struct InsertSource {
+    rows: AVec<AVec<Expr>>,
+    select: Option<Box<SelectStmt>>,
+}
+
 pub fn parse<E>(sql: &[u8], arena: &Arena) -> Result<Ast, E> {
     let toks = lexer::lex::<E>(sql, arena)?;
     let mut p = Parser {
@@ -816,10 +825,51 @@ impl<'a> Parser<'a> {
             }
             columns = Some(cols);
         }
+        let InsertSource { rows, select } = self.insert_source::<E>()?;
+        let (upsert, returning) = self.insert_tail::<E>()?;
+        Ok(Ast::Insert {
+            table,
+            columns,
+            rows,
+            select,
+            conflict,
+            upsert,
+            returning,
+        })
+    }
+
+    /// An INSERT's row source (v0.8): `VALUES (...)` rows, or —
+    /// under `v08` — a SELECT whose result rows are inserted.
+    /// Without the feature a SELECT source is not consumed here
+    /// and the statement fails at `expect_kw(VALUES)` exactly as
+    /// before.
+    #[cfg(feature = "v08")]
+    fn insert_source<E>(&mut self) -> Result<InsertSource, E> {
+        if self.cur_is_kw(b"SELECT") {
+            return Ok(InsertSource {
+                rows: AVec::new(),
+                select: Some(Box::new(self.select_rich::<E>()?)),
+            });
+        }
+        Ok(InsertSource {
+            rows: self.values_rows::<E>()?,
+            select: None,
+        })
+    }
+
+    #[cfg(not(feature = "v08"))]
+    fn insert_source<E>(&mut self) -> Result<InsertSource, E> {
+        Ok(InsertSource {
+            rows: self.values_rows::<E>()?,
+            select: None,
+        })
+    }
+
+    /// The `VALUES` row list: v0.2 one or more parenthesised
+    /// rows, comma-separated; v0.4 each value is an expression
+    /// (a plain literal under the pre-v0.4 grammar).
+    fn values_rows<E>(&mut self) -> Result<AVec<AVec<Expr>>, E> {
         self.expect_kw::<E>(b"VALUES")?;
-        // v0.2: one or more parenthesised rows, comma-separated.
-        // v0.4: each value is an expression (a plain literal under
-        // the pre-v0.4 grammar).
         let mut rows = AVec::new();
         loop {
             self.expect::<E>(Tok::LParen)?;
@@ -838,15 +888,7 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        let (upsert, returning) = self.insert_tail::<E>()?;
-        Ok(Ast::Insert {
-            table,
-            columns,
-            rows,
-            conflict,
-            upsert,
-            returning,
-        })
+        Ok(rows)
     }
 
     /// The optional `OR <action>` after INSERT / UPDATE (v0.7):

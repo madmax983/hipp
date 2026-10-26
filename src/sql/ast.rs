@@ -260,7 +260,12 @@ pub enum Ast {
         /// One entry per `VALUES` row (v0.2: multi-row VALUES).
         /// v0.4: each value is an expression (a plain literal in
         /// the pre-v0.4 grammar), evaluated with no row context.
+        /// Empty when the source is a SELECT (v0.8).
         rows: AVec<AVec<Expr>>,
+        /// `INSERT INTO ... SELECT ...` source (v0.8, feature
+        /// `v08`): the rows to insert are the SELECT's result
+        /// rows, in result order. `None` for a VALUES source.
+        select: Option<Box<SelectStmt>>,
         /// The `OR ...` conflict clause (v0.7; `REPLACE INTO`
         /// parses as Insert with `Replace`).
         conflict: ConflictAction,
