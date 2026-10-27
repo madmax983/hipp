@@ -4571,7 +4571,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Nested-loop join + WHERE, then group / project: the
         // synchronous v0.4 executor (no subqueries in the plan).
         let mut rows: AVec<RowData> = AVec::new();
-        join_rows::<S::Error>(&qp, src_rows.as_slice(), 0, &RowData::empty(), &mut rows)?;
+        join_rows::<S::Error>(
+            &qp,
+            src_rows.as_slice(),
+            0,
+            &mut RowData::empty(),
+            &mut rows,
+        )?;
         let produced = project_rows::<S::Error>(&qp, rows.as_slice())?;
         self.finish_produced(&qp, produced);
         Ok(())
@@ -5650,7 +5656,7 @@ fn join_rows<E>(
     qp: &QueryPlan,
     src_rows: &[AVec<(AVec<OwnedValue>, i64)>],
     idx: usize,
-    acc: &RowData,
+    acc: &mut RowData,
     out: &mut AVec<RowData>,
 ) -> Result<(), E> {
     if idx == qp.sources.len() {
@@ -5666,31 +5672,38 @@ fn join_rows<E>(
         return Ok(());
     }
     let sp = &qp.sources.as_slice()[idx];
+    let base = acc.vals.len();
     let mut matched = false;
     for (vals, rowid) in src_rows[idx].iter() {
-        let mut acc2 = acc.clone();
         for v in vals.iter() {
-            acc2.vals.push(v.clone());
+            acc.vals.push(v.clone());
         }
-        acc2.rowids.push(Some(*rowid));
+        acc.rowids.push(Some(*rowid));
         let on_ok = match &sp.on {
             None => true,
             Some(on) => {
-                crate::query::truthy(&crate::query::eval::<E>(on, &Ctx::Row(&acc2))?) == Some(true)
+                crate::query::truthy(&crate::query::eval::<E>(on, &Ctx::Row(acc))?) == Some(true)
             }
         };
         if on_ok {
             matched = true;
-            join_rows::<E>(qp, src_rows, idx + 1, &acc2, out)?;
+            join_rows::<E>(qp, src_rows, idx + 1, acc, out)?;
         }
+        while acc.vals.len() > base {
+            acc.vals.pop();
+        }
+        acc.rowids.pop();
     }
     if sp.kind == JoinKind::Left && !matched {
-        let mut acc2 = acc.clone();
         for _ in 0..sp.ncols {
-            acc2.vals.push(OwnedValue::Null);
+            acc.vals.push(OwnedValue::Null);
         }
-        acc2.rowids.push(None);
-        join_rows::<E>(qp, src_rows, idx + 1, &acc2, out)?;
+        acc.rowids.push(None);
+        join_rows::<E>(qp, src_rows, idx + 1, acc, out)?;
+        while acc.vals.len() > base {
+            acc.vals.pop();
+        }
+        acc.rowids.pop();
     }
     Ok(())
 }
