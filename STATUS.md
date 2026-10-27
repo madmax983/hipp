@@ -4,6 +4,166 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.9 — compound SELECTs and derived tables (2026-10-27)
+
+**Status:** implemented, differential-tested against the
+pinned oracle, and gated (below). This milestone closes the
+last grammar holes named in every milestone since v0.6:
+compound SELECTs and FROM-clause derived tables, behind the
+`v09` cargo feature (default on, implies `v08`; the tiny
+profile excludes it).
+
+### Base note (Bolt re-baseline)
+
+v0.9 stacks on `a3b80ec` — the v0.8 tree plus Mark's two
+external Bolt perf commits (`ecf225b` index_insert
+single-pass leaf probe, `a3b80ec` join_rows accumulator),
+adopted as the loop baseline on 2026-10-27 after a full
+green suite run. The tiny profile was **re-measured on the
+untouched base** before any v0.9 work: **89,312 B** (.text
+74,360 + .rodata 14,952) — identical to the v0.8 landing.
+The Bolt commits contribute **0 B** to tiny (index_insert
+sits behind `indexes`, join_rows behind `v04`), so the
+ratchet baseline for the v0.9 delta is 89,312 B.
+
+### Shipped
+
+- **Compound SELECTs** (`UNION`, `UNION ALL`, `INTERSECT`,
+  `EXCEPT`) between SELECT cores and `VALUES` cores, in
+  every position a select statement appears: standalone
+  statements, scalar / `IN` / `EXISTS` subquery bodies,
+  `INSERT INTO ... SELECT` sources, and derived tables.
+  The `SelectStmt` AST carries a flat source-order tail of
+  `(CompoundOp, core)` pairs — SQLite's operators all share
+  one precedence and associate left-to-right, so no tree is
+  needed — and each core plans independently before the
+  combination runs.
+- **Compound semantics, probed on the pin first** (see
+  below): raw storage-equality dedup with NULLs equal and
+  no affinity whatsoever; sorter-order output for the dedup
+  operators; first-occurrence survivors except that UNION's
+  right operand replaces equal left rows; compound
+  `ORDER BY` restricted to output ordinals and result-column
+  names drawn from *any* constituent core (qualified names
+  included), resolved at prepare time; per-core column-count
+  checking (`SchemaKind::ColumnCountMismatch`); cores carry
+  no `ORDER BY` / `LIMIT` of their own.
+- **Derived tables**: `(select-stmt) [[AS] alias]` in the
+  general query planner, the subquery planner (including
+  inside `EXISTS` / scalar / `IN` bodies), and
+  `UPDATE ... FROM`. The inner statement is planned against
+  enclosing scopes only (no LATERAL: sibling sources are
+  invisible, exactly like the pin) but may correlate with an
+  enclosing query. Result columns take their names from the
+  inner statement (`column1`, `column2`, ... for VALUES
+  cores); the derived source exposes **no rowid** unless a
+  result column is literally named `rowid`. Derived sources
+  work over compounds, VALUES cores, aggregates, and joins,
+  and nest.
+- **VALUES cores** as first-class select cores: standalone
+  `VALUES` statements, `VALUES` inside compounds and
+  `IN (VALUES ...)`, with column names `column1`, ... .
+- Source rows in the executor now carry `Option<i64>`
+  rowids (table rows `Some`, derived rows `None`), which is
+  what lets the rowid fallback distinguish a real table from
+  a derived source.
+
+### Oracle-probing notes (all verified on the 3.54.1 pin
+before implementation)
+
+- **Precedence surprise:** all four compound operators
+  share SQLite's single precedence and are
+  left-associative — INTERSECT does *not* bind tighter than
+  UNION on the pin (the coordinator brief's prior was
+  wrong; probing caught it). `SELECT 1 UNION SELECT 2
+  INTERSECT SELECT 2` yields `{2}`.
+- **Dedup equality is raw:** `SELECT 1 UNION SELECT '1'`
+  keeps both rows; a TEXT column unioned with integer
+  literals keeps the integers too (no affinity conversion,
+  contradicting the "compound affinity" phrasing in the
+  planning notes — the comparison is `compare_values` raw:
+  numeric cross-type equality only, text never equals blob,
+  NULL equals NULL). Dedup output order is sorter order,
+  ascending on all columns.
+- **Survivor rule:** dedup is first-occurrence-wins within
+  each operand, but a UNION right row *replaces* an equal
+  left row — `1 UNION 1.0` yields the real `1.0`, `1.0
+  UNION 1` yields the integer `1`. INTERSECT / EXCEPT keep
+  left rows.
+- **Compound ORDER BY** accepts only (a) in-range ordinals,
+  (b) bare names matching a result-column name from any
+  constituent core, (c) qualified names matching a plain
+  column item's source qualifier and name in any core.
+  Expressions, constants, unknown names, and out-of-range
+  ordinals are prepare errors. The sort comparison is raw.
+- **Derived-table rules:** alias optional; a column-name
+  list after the alias is a *syntax error* on the pin;
+  parenthesised compound operands are a syntax error
+  everywhere; `INSERT ... SELECT ... UNION ... ON CONFLICT`
+  parses (the compound terminates the SELECT, so the v0.8
+  bare-FROM upsert quirk refusal does not apply to compound
+  sources).
+- **VALUES-tail quirk:** if the *last* core of a compound
+  is a VALUES core, a trailing `ORDER BY` / `LIMIT` is a
+  syntax error on the pin (`VALUES (1) LIMIT 1` fails,
+  `VALUES (1) UNION SELECT 2 ORDER BY 1` works). Reproduced
+  in the parser.
+
+### Gates (run on the final tree)
+
+- `cargo test --workspace`: **142 passed, 0 failed** (131
+  at v0.8 + 9 new core differentials in
+  `tests/compound_v09.rs` + 2 new CLI differentials in
+  `hipp-cli/tests/cli_v09.rs`, counts summed from the test
+  log). The new suites cover operator precedence, raw
+  equality incl. NULLs and cross-class pairs, ORDER BY
+  acceptance *and* refusal shapes, width-mismatch / core
+  ORDER BY / parenthesised-operand refusals, VALUES cores
+  incl. the trailing-tail refusal, derived tables incl. the
+  rowid / sibling-correlation / alias-column-list refusals,
+  compounds as INSERT sources and subquery bodies, and
+  `UPDATE ... FROM` over derived tables. A1–A11 conformance
+  checks (in the suite) stay green; every `Twins` file
+  passes `PRAGMA integrity_check` in the oracle.
+- CLI: the v0.9 corpus (compounds, VALUES, derived tables,
+  compound INSERT, UPDATE ... FROM over a derived table)
+  is byte-identical to the oracle one-shot and over stdin,
+  and `.dump` after v0.9 writes replays into the oracle.
+- `cargo clippy --workspace --all-targets -- -D warnings`:
+  clean. `cargo fmt` (write mode): clean tree afterwards.
+  Feature matrix compiles: default, no-default, std-only,
+  v04-only ... v09-only ladders, indexes-only, indexes+v05,
+  all-features.
+- Tiny (below).
+
+### Size (ratchet)
+
+- thumbv7em-none-eabihf `tiny`: **.text 74,560 + .rodata
+  14,952 = 89,512 B of 128 KiB budget**, Δ **+200 B** vs
+  the re-measured base (89,312 B) — under the 4 KiB
+  justification line. Attribution: the `v09` engine is
+  fully feature-gated out of tiny; the +200 B is ungated
+  AST struct growth (`SelectStmt`'s compound / values
+  fields, `FromSource`'s derived field) flowing through
+  the always-compiled parser. Engine statics 0 B (.bss is
+  the demo's caller-supplied heap, unchanged).
+
+### Honest gaps (v0.9)
+
+- Compound `ORDER BY` name resolution takes the first
+  matching core scanning left to right; a name that appears
+  at *different* result positions in different cores is an
+  untested edge (the pin's behaviour there is unprobed).
+- All pre-existing gaps stand: uncorrelated-subquery
+  hoisting is still absent (a compound core re-runs per
+  outer row when correlated; results are correct,
+  performance is not); subqueries inside aggregate
+  arguments stay refused; NOT NULL constraints parse but
+  are still not enforced; real-literal parsing may differ
+  from the oracle by 1 ulp on pathological mantissas
+  (RISKS R5); WAL read stays gated on a real target
+  demanding it.
+
 ## v0.8 — correctness-and-completion pass (2026-10-26)
 
 Pushed to GitHub (madmax983/hipp) via API replay under the
