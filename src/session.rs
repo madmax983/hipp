@@ -724,7 +724,12 @@ impl<S: Storage> Connection<S> {
                 #[cfg(feature = "v08")]
                 let select_plan = match select {
                     Some(sel) => {
+                        // A compound source (v0.9) terminates
+                        // the SELECT before ON CONFLICT on the
+                        // pin too, so the quirk refusal applies
+                        // only to a bare single core.
                         if upsert.is_some()
+                            && sel.compound.is_empty()
                             && !sel.from.is_empty()
                             && sel.filter.is_none()
                             && sel.order_by.is_empty()
@@ -6382,11 +6387,22 @@ fn combine_compound(
             out
         }
         CompoundOp::Union => {
-            let mut all = left;
-            for r in right.iter() {
-                all.push(r.clone());
+            // Pin-verified survivor rule: each side first
+            // deduplicates first-occurrence-wins; then a right
+            // row REPLACES an equal left row (`SELECT 1 UNION
+            // SELECT 1.0` yields the real 1.0, `SELECT 1.0
+            // UNION SELECT 1` the integer 1), and right rows
+            // with no equal append.
+            let mut out = dedup_compound_rows(left);
+            for r in dedup_compound_rows(right).iter() {
+                match out
+                    .iter()
+                    .position(|k| compound_rows_equal(k.as_slice(), r.as_slice()))
+                {
+                    Some(i) => out.as_mut_slice()[i] = r.clone(),
+                    None => out.push(r.clone()),
+                }
             }
-            let mut out = dedup_compound_rows(all);
             compound_sort_rows(out.as_mut_slice());
             out
         }
