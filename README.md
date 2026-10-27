@@ -8,16 +8,48 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.8 — the correctness-and-completion pass
-  (cross-affinity comparisons; INSERT INTO ... SELECT;
-  subqueries in INSERT VALUES), on the v0.7 foundation
-  (SPEC §2).
+- **Phase:** v0.9 — compound SELECTs and derived tables
+  (UNION / UNION ALL / INTERSECT / EXCEPT between SELECT and
+  VALUES cores; `(SELECT ...) [[AS] alias]` in FROM), on the
+  v0.8 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.9 does
+
+- Everything v0.8 does (below), plus the last grammar holes
+  of the claimed profiles behind the `v09` feature (default
+  on, implies `v08`; the tiny profile excludes it):
+  **compound SELECTs** — `UNION`, `UNION ALL`, `INTERSECT`
+  and `EXCEPT` between SELECT cores and `VALUES` cores,
+  anywhere a select statement appears (statements, subquery
+  bodies, `INSERT INTO ... SELECT` sources, derived tables),
+  with the pinned oracle's exact rules, all probed before
+  implementation: the four operators share one precedence and
+  associate to the left; row equality for dedup is the raw
+  storage comparison with NULLs equal and **no affinity
+  applied** (`1 UNION '1'` keeps both rows); dedup operators
+  emit in the oracle's sorter order; a UNION's right side
+  replaces equal left rows (`1 UNION 1.0` yields the real);
+  and a compound's `ORDER BY` accepts only output ordinals
+  and result-column names — from any constituent core,
+  qualified names included — never general expressions.
+  **Derived tables** — `(SELECT ...) [[AS] alias]` (also
+  `(VALUES ...)`) in the general query planner, the subquery
+  planner, and `UPDATE ... FROM`: the alias is optional, no
+  column-name list may follow it (a syntax error on the pin),
+  the result exposes no rowid, and the subquery is planned
+  against enclosing scopes only — SQLite has no LATERAL, so
+  sibling sources are invisible to it, while correlation
+  with an enclosing query works. A standalone `VALUES`
+  statement and `VALUES` cores inside compounds (including
+  `IN (VALUES ...)`) complete the surface; the pin's quirk
+  that a trailing ORDER BY / LIMIT after a trailing VALUES
+  core is a syntax error is reproduced.
 
 ## What v0.8 does
 
@@ -170,9 +202,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.7) |
+| Gate | Budget | Measured (v0.9) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,312 B** (Δ +144 B vs v0.7's 89,168 B; the v0.8 engine is feature-gated out of tiny — the delta is the ungated AST/parser gaining the INSERT source split) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,512 B** (Δ +200 B vs v0.8's 89,312 B; the v0.9 engine is feature-gated out of tiny — the delta is ungated AST struct growth: `SelectStmt` compound/VALUES fields and the `FromSource` derived field. The base was re-measured on the Bolt-inclusive tree before v0.9 work: 89,312 B, identical to the v0.8 landing — the Bolt commits touch only `indexes`/`v04`-gated code and contribute 0 B to tiny) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
