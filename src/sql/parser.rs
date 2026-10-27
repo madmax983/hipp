@@ -1422,9 +1422,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 extra_parens += 1;
             }
-            if !self.cur_is_kw(b"SELECT")
-                && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
-            {
+            if !self.cur_is_kw(b"SELECT") && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES")) {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
             let stmt = self.select_rich::<E>()?;
@@ -1434,9 +1432,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::ExistsSubquery(Box::new(stmt)));
         }
         if self.eat(Tok::LParen) {
-            if self.cur_is_kw(b"SELECT")
-                || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
-            {
+            if self.cur_is_kw(b"SELECT") || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES")) {
                 #[cfg(feature = "v06")]
                 {
                     let stmt = self.select_rich::<E>()?;
@@ -1604,7 +1600,9 @@ impl<'a> Parser<'a> {
                 None => !head.values.is_empty(),
             };
             if last_is_values
-                && (self.cur_is_kw(b"ORDER") || self.cur_is_kw(b"LIMIT") || self.cur_is_kw(b"OFFSET"))
+                && (self.cur_is_kw(b"ORDER")
+                    || self.cur_is_kw(b"LIMIT")
+                    || self.cur_is_kw(b"OFFSET"))
             {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }

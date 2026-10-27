@@ -7,7 +7,7 @@
 //! per connection (§5.1.2) and a catalog rebuild can only happen
 //! when no statement is live (§7.5.5) — both by construction.
 
-#[cfg(feature = "v08")]
+#[cfg(feature = "v04")]
 use alloc::boxed::Box;
 
 use crate::arena::{AVec, Arena};
@@ -383,8 +383,7 @@ struct QueryPlan {
     /// expanded per column for star items. The compound ORDER
     /// BY resolver matches a term against these across ALL of
     /// the compound's cores (pin-verified behaviour).
-    #[cfg(feature = "v09")]
-    order_names: AVec<(Option<AVec<u8>>, AVec<u8>)>,
+    order_names: AVec<crate::query::OrderName>,
 }
 
 struct InsCol {
@@ -397,6 +396,22 @@ enum Target {
     Col(usize),
     Rowid,
 }
+
+/// A planned subquery compound tail plus its resolved
+/// compound ORDER BY (v0.9).
+#[cfg(feature = "v06")]
+type SubCompoundParts = (
+    AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)>,
+    AVec<(usize, bool)>,
+);
+
+/// A planned top-level compound tail plus its resolved
+/// compound ORDER BY (v0.9).
+#[cfg(feature = "v04")]
+type QueryCompoundParts = (
+    AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
+    AVec<(usize, bool)>,
+);
 
 /// A planned `ON CONFLICT` upsert clause (v0.7). The SET
 /// expressions and the filter are resolved against the combined
@@ -1225,7 +1240,7 @@ impl<S: Storage> Connection<S> {
             let width = width.unwrap_or(0);
             let mut result_names: AVec<AVec<u8>> = AVec::new();
             let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
-            let mut order_names: AVec<(Option<AVec<u8>>, AVec<u8>)> = AVec::new();
+            let mut order_names: AVec<crate::query::OrderName> = AVec::new();
             for i in 0..width {
                 let n = values_col_name(i);
                 result_names.push(n.clone());
@@ -1274,9 +1289,7 @@ impl<S: Storage> Connection<S> {
                     let mut cols = AVec::new();
                     let mut affs = AVec::new();
                     let mut defaults = AVec::new();
-                    for (nm, aff) in
-                        dplan.result_names.iter().zip(dplan.result_affs.iter())
-                    {
+                    for (nm, aff) in dplan.result_names.iter().zip(dplan.result_affs.iter()) {
                         cols.push((nm.clone(), aff.unwrap_or(crate::record::Affinity::Blob)));
                         affs.push(crate::record::Affinity::Blob);
                         defaults.push(OwnedValue::Null);
@@ -1381,7 +1394,7 @@ impl<S: Storage> Connection<S> {
         let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
         let mut result_names: AVec<AVec<u8>> = AVec::new();
         let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
-        let mut order_names: AVec<(Option<AVec<u8>>, AVec<u8>)> = AVec::new();
+        let mut order_names: AVec<crate::query::OrderName> = AVec::new();
         for it in stmt.items.iter() {
             match it {
                 SelectItem::Star => {
@@ -1508,10 +1521,7 @@ impl<S: Storage> Connection<S> {
             self.plan_sub_compound(stmt, arena, enclosing, order_names.as_slice(), items.len())?
         };
         #[cfg(not(feature = "v09"))]
-        let (compound, comp_order): (
-            AVec<(crate::sql::CompoundOp, Box<SubPlan>)>,
-            AVec<(usize, bool)>,
-        ) = (AVec::new(), AVec::new());
+        let (compound, comp_order): SubCompoundParts = (AVec::new(), AVec::new());
         Ok(SubPlan {
             sources: subs,
             items,
@@ -1545,15 +1555,9 @@ impl<S: Storage> Connection<S> {
         stmt: &SelectStmt,
         arena: &Arena,
         enclosing: &[crate::query::ScopeGroup],
-        head_names: &[(Option<AVec<u8>>, AVec<u8>)],
+        head_names: &[crate::query::OrderName],
         width: usize,
-    ) -> Result<
-        (
-            AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)>,
-            AVec<(usize, bool)>,
-        ),
-        S::Error,
-    > {
+    ) -> Result<SubCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)> = AVec::new();
         for (op, core) in stmt.compound.iter() {
             let p = self.plan_subquery(core, arena, enclosing)?;
@@ -1564,7 +1568,7 @@ impl<S: Storage> Connection<S> {
             }
             tails.push((*op, Box::new(p)));
         }
-        let mut all_names: AVec<&[(Option<AVec<u8>>, AVec<u8>)]> = AVec::new();
+        let mut all_names: AVec<&[crate::query::OrderName]> = AVec::new();
         all_names.push(head_names);
         for (_, p) in tails.iter() {
             all_names.push(p.order_names.as_slice());
@@ -1585,10 +1589,9 @@ impl<S: Storage> Connection<S> {
         &self,
         stmt: &SelectStmt,
         arena: &Arena,
-        head_names: &[(Option<AVec<u8>>, AVec<u8>)],
+        head_names: &[crate::query::OrderName],
         width: usize,
-    ) -> Result<(AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>, AVec<(usize, bool)>), S::Error>
-    {
+    ) -> Result<QueryCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)> = AVec::new();
         for (op, core) in stmt.compound.iter() {
             let p = self.plan_query(core, arena)?;
@@ -1599,7 +1602,7 @@ impl<S: Storage> Connection<S> {
             }
             tails.push((*op, Box::new(p)));
         }
-        let mut all_names: AVec<&[(Option<AVec<u8>>, AVec<u8>)]> = AVec::new();
+        let mut all_names: AVec<&[crate::query::OrderName]> = AVec::new();
         all_names.push(head_names);
         for (_, p) in tails.iter() {
             all_names.push(p.order_names.as_slice());
@@ -2257,7 +2260,7 @@ impl<S: Storage> Connection<S> {
                 rows_r.push(rr);
             }
             let width = width.unwrap_or(0);
-            let mut order_names: AVec<(Option<AVec<u8>>, AVec<u8>)> = AVec::new();
+            let mut order_names: AVec<crate::query::OrderName> = AVec::new();
             for i in 0..width {
                 order_names.push((None, values_col_name(i)));
             }
@@ -2406,7 +2409,7 @@ impl<S: Storage> Connection<S> {
         // ORDER BY resolution.
         let mut items: AVec<RExpr> = AVec::new();
         let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
-        let mut order_names: AVec<(Option<AVec<u8>>, AVec<u8>)> = AVec::new();
+        let mut order_names: AVec<crate::query::OrderName> = AVec::new();
         for it in stmt.items.iter() {
             match it {
                 SelectItem::Star => {
@@ -2533,10 +2536,7 @@ impl<S: Storage> Connection<S> {
             self.plan_query_compound(stmt, arena, order_names.as_slice(), width)?
         };
         #[cfg(not(feature = "v09"))]
-        let (compound, comp_order): (
-            AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
-            AVec<(usize, bool)>,
-        ) = (AVec::new(), AVec::new());
+        let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
         Ok(QueryPlan {
             sources: src_plans,
             items,
@@ -6232,7 +6232,7 @@ fn item_name_keys(
     alias: &Option<crate::arena::ABytes>,
     text: &crate::arena::ABytes,
     cur: &crate::query::ScopeGroup,
-) -> (AVec<u8>, (Option<AVec<u8>>, AVec<u8>)) {
+) -> (AVec<u8>, crate::query::OrderName) {
     if let Some(a) = alias {
         let n = copy_vec(handle_bytes(arena, *a));
         return (n.clone(), (None, n));
@@ -6282,7 +6282,7 @@ fn values_col_name(i: usize) -> AVec<u8> {
 fn resolve_compound_order<E>(
     order_by: &[(Expr, bool)],
     arena: &Arena,
-    cores_names: &[&[(Option<AVec<u8>>, AVec<u8>)]],
+    cores_names: &[&[crate::query::OrderName]],
     width: usize,
 ) -> Result<AVec<(usize, bool)>, E> {
     let mut out = AVec::new();
@@ -6345,7 +6345,10 @@ fn compound_rows_equal(a: &[OwnedValue], b: &[OwnedValue]) -> bool {
 fn dedup_compound_rows(rows: AVec<AVec<OwnedValue>>) -> AVec<AVec<OwnedValue>> {
     let mut kept: AVec<AVec<OwnedValue>> = AVec::new();
     for r in rows.iter() {
-        if !kept.iter().any(|k| compound_rows_equal(k.as_slice(), r.as_slice())) {
+        if !kept
+            .iter()
+            .any(|k| compound_rows_equal(k.as_slice(), r.as_slice()))
+        {
             kept.push(r.clone());
         }
     }
@@ -6469,9 +6472,10 @@ fn apply_limit_offset(
 fn query_plan_has_sub(qp: &QueryPlan) -> bool {
     use crate::query::has_sub;
     qp.sources.iter().any(|s| s.derived.is_some())
-        || qp.sources
-        .iter()
-        .any(|s| s.on.as_ref().is_some_and(has_sub))
+        || qp
+            .sources
+            .iter()
+            .any(|s| s.on.as_ref().is_some_and(has_sub))
         || qp.filter.as_ref().is_some_and(has_sub)
         || qp.items.iter().any(has_sub)
         || qp.group_by.iter().any(has_sub)

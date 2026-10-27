@@ -259,8 +259,13 @@ pub struct SubPlan {
     pub result_affs: AVec<Option<Affinity>>,
     /// Per-result-item ORDER BY name keys (v0.9; see the
     /// session's `QueryPlan::order_names`).
-    pub order_names: AVec<(Option<AVec<u8>>, AVec<u8>)>,
+    pub order_names: AVec<OrderName>,
 }
+
+/// One result item's compound ORDER BY name key (v0.9):
+/// `(qualifier, name)` — the qualifier is the item's source
+/// qualifier for a plain column item, else None.
+pub type OrderName = (Option<AVec<u8>>, AVec<u8>);
 
 impl SubPlan {
     /// The plan's output width: a VALUES core's row length,

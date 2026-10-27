@@ -527,10 +527,8 @@ fn update_from_derived() {
              WHERE t.a = s.c",
         )
         .await;
-        tw.write(
-            "UPDATE u SET d = 'z' FROM (SELECT a FROM t GROUP BY a) s WHERE u.c = s.a",
-        )
-        .await;
+        tw.write("UPDATE u SET d = 'z' FROM (SELECT a FROM t GROUP BY a) s WHERE u.c = s.a")
+            .await;
         tw.finish("SELECT a, b FROM t ORDER BY a");
         tw.finish("SELECT c, d FROM u ORDER BY c");
     });
