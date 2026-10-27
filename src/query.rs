@@ -156,6 +156,13 @@ pub struct SourceDesc {
     pub qualifier: AVec<u8>,
     pub columns: AVec<(AVec<u8>, Affinity)>,
     pub rowid_alias: Option<usize>,
+    /// Whether an unqualified / qualified `rowid` reference may
+    /// resolve to this source's rowid (v0.9): true for real
+    /// tables, false for derived tables — the pin answers
+    /// "no such column: rowid" for `SELECT rowid FROM
+    /// (SELECT ...) s` (a derived column literally NAMED rowid
+    /// still resolves, as an ordinary column).
+    pub has_rowid: bool,
 }
 
 /// One level of name-resolution scope (v0.6): a query's own FROM
@@ -191,6 +198,14 @@ pub struct SubSource {
     pub ncols: usize,
     pub affs: AVec<Affinity>,
     pub defaults: AVec<OwnedValue>,
+    /// A derived table (v0.9): when `Some`, the source's rows
+    /// are this subplan's result (executed against the outer
+    /// row at materialisation time; `root` is unused). The
+    /// subplan was planned against the enclosing scopes only —
+    /// SQLite has no LATERAL, so a FROM subquery cannot see its
+    /// sibling sources (pin-verified: `FROM t, (SELECT t.a) s`
+    /// is "no such column").
+    pub derived: Option<Box<SubPlan>>,
 }
 
 /// A planned subquery (v0.6): a full SELECT planned against the
@@ -211,6 +226,51 @@ pub struct SubPlan {
     pub limit: Option<i64>,
     pub offset: i64,
     pub has_agg: bool,
+    /// Compound tail (v0.9): `(op, core plan)` pairs applied
+    /// left to right after this plan's own core. Each tail plan
+    /// is a single core (its own `compound` empty). When this
+    /// is non-empty, `order_by` is empty and `comp_order`
+    /// carries the compound's ORDER BY instead; `limit` /
+    /// `offset` apply to the combined result.
+    pub compound: AVec<(crate::sql::CompoundOp, Box<SubPlan>)>,
+    /// A VALUES core (v0.9): resolved rows to produce in place
+    /// of a source scan (sources/items are empty). Each row was
+    /// resolved against the combined (enclosing ++ own) scope,
+    /// so evaluating a row for an outer row yields its values.
+    pub values: AVec<AVec<RExpr>>,
+    /// Compound ORDER BY (v0.9): `(output column, descending)`
+    /// pairs, resolved at plan time from the statement's ORDER
+    /// BY terms — on the pin a compound's ORDER BY terms may
+    /// only be an output ordinal or a result-column name (any
+    /// constituent core's), never a general expression.
+    pub comp_order: AVec<(usize, bool)>,
+    /// Result column names (v0.9), parallel to the core's
+    /// output width: alias if written, else the column name
+    /// for a direct column reference, else the expression's
+    /// source text; a VALUES core's are `column1`, `column2`,
+    /// ... (all pin-verified). Consumed by derived-table
+    /// planning and compound ORDER BY name resolution.
+    pub result_names: AVec<AVec<u8>>,
+    /// Result column comparison affinities (v0.9), parallel to
+    /// `result_names`: `Some` when the result item is a direct
+    /// column reference, CAST, or rowid (the affinity it
+    /// carries into an enclosing comparison / a derived
+    /// table's column), else `None`.
+    pub result_affs: AVec<Option<Affinity>>,
+    /// Per-result-item ORDER BY name keys (v0.9; see the
+    /// session's `QueryPlan::order_names`).
+    pub order_names: AVec<(Option<AVec<u8>>, AVec<u8>)>,
+}
+
+impl SubPlan {
+    /// The plan's output width: a VALUES core's row length,
+    /// else the item count.
+    pub fn width(&self) -> usize {
+        match self.values.as_slice().first() {
+            Some(r) => r.len(),
+            None => self.items.len(),
+        }
+    }
 }
 
 /// The computed value of one subquery node for one outer row
@@ -232,8 +292,19 @@ pub enum SubValue {
 /// other expression shape has none.
 pub fn result_affinity(plan: &SubPlan) -> Option<Affinity> {
     match plan.items.as_slice().first() {
-        Some(RExpr::Column(_, aff)) | Some(RExpr::Cast(_, aff)) => Some(*aff),
-        Some(RExpr::Rowid(_)) => Some(Affinity::Integer),
+        Some(r) => item_result_affinity(r),
+        None => None,
+    }
+}
+
+/// The comparison affinity one resolved result item carries
+/// (v0.9): the per-item form of `result_affinity`, used for
+/// derived-table column affinities and compound metadata. A
+/// VALUES core's items carry none.
+pub fn item_result_affinity(r: &RExpr) -> Option<Affinity> {
+    match r {
+        RExpr::Column(_, aff) | RExpr::Cast(_, aff) => Some(*aff),
+        RExpr::Rowid(_) => Some(Affinity::Integer),
         _ => None,
     }
 }
@@ -277,7 +348,7 @@ fn resolve_column_in_group<E>(
                     }));
                 }
             }
-            if is_rowid_name(name) {
+            if is_rowid_name(name) && src.has_rowid {
                 return Some(Ok(RExpr::Rowid(group.first_src + si)));
             }
             // The qualifier matched but the column does not
@@ -303,7 +374,7 @@ fn resolve_column_in_group<E>(
                 break;
             }
         }
-        if cand.is_none() && is_rowid_name(name) {
+        if cand.is_none() && is_rowid_name(name) && src.has_rowid {
             cand = Some(RExpr::Rowid(group.first_src + si));
         }
         if let Some(c) = cand {
@@ -425,7 +496,7 @@ pub fn resolve_scoped<E>(
         Expr::InSubquery(x, stmt, neg) => {
             let xr = resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?;
             let plan = planner(stmt, cur, enclosing)?;
-            if plan.items.len() != 1 {
+            if plan.width() != 1 {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
                 });
@@ -434,7 +505,7 @@ pub fn resolve_scoped<E>(
         }
         Expr::ScalarSubquery(stmt) => {
             let plan = planner(stmt, cur, enclosing)?;
-            if plan.items.len() != 1 {
+            if plan.width() != 1 {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
                 });

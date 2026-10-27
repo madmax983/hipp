@@ -5,7 +5,7 @@ pub mod lexer;
 pub mod parser;
 
 pub use ast::{
-    Ast, BinOp, ColumnDef, ConflictAction, ConstraintSet, Expr, FromSource, IndexColumnDef,
-    JoinKind, Literal, SelectItem, SelectList, SelectStmt, Upsert, UpsertAction,
+    Ast, BinOp, ColumnDef, CompoundOp, ConflictAction, ConstraintSet, Expr, FromSource,
+    IndexColumnDef, JoinKind, Literal, SelectItem, SelectList, SelectStmt, Upsert, UpsertAction,
 };
 pub use parser::{eq_ci, handle_bytes, parse};

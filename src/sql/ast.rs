@@ -161,13 +161,32 @@ pub enum JoinKind {
 /// One FROM source (v0.4): a table (or view name, resolved at plan
 /// time) with an optional alias, joined per `kind` with the
 /// optional ON expression. The first source has kind Inner and no
-/// ON.
+/// ON. v0.9: the source may instead be a derived table —
+/// `(SELECT ...) [[AS] alias]` — in which case `derived` holds
+/// the subquery and `table` is empty. (The pinned oracle accepts
+/// no column-name list after a derived alias: `... AS s (y)` is
+/// a syntax error there, so none is parsed here either.)
 #[derive(Debug, Clone)]
 pub struct FromSource {
     pub table: ABytes,
     pub alias: Option<ABytes>,
     pub kind: JoinKind,
     pub on: Option<Expr>,
+    /// A FROM-clause subquery (v0.9, feature `v09`).
+    pub derived: Option<Box<SelectStmt>>,
+}
+
+/// A compound SELECT operator (v0.9). All four operators have
+/// the SAME precedence in SQLite and associate to the left —
+/// verified on the pin: `SELECT 1 UNION SELECT 2 INTERSECT
+/// SELECT 2` is `{2}` (i.e. `(1 UNION 2) INTERSECT 2`), not the
+/// INTERSECT-binds-tighter reading other dialects use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOp {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
 }
 
 /// A full SELECT statement (v0.4 shape; the pre-v0.4 grammar
@@ -185,6 +204,23 @@ pub struct SelectStmt {
     pub order_by: AVec<(Expr, bool)>,
     pub limit: Option<i64>,
     pub offset: i64,
+    /// Compound tail (v0.9, feature `v09`): `(op, core)` pairs
+    /// in source order, applied left to right (all compound
+    /// operators share one precedence on the pin — see
+    /// `CompoundOp`). Each tail core is a plain SELECT or VALUES
+    /// core with no compound, ORDER BY, or LIMIT of its own (the
+    /// pin's grammar gives cores none); this statement's
+    /// `order_by` / `limit` / `offset` then apply to the whole
+    /// compound. Empty for an ordinary single-core SELECT.
+    pub compound: AVec<(CompoundOp, SelectStmt)>,
+    /// A VALUES core (v0.9, feature `v09`): when non-empty this
+    /// "core" is `VALUES (row), (row), ...` and `items` / `from`
+    /// are empty. All rows have the same width (validated at
+    /// plan time). A VALUES core may head a compound or stand
+    /// alone; when it is the LAST core of a select statement,
+    /// the pin rejects a trailing ORDER BY / LIMIT as a syntax
+    /// error, and so does the parser.
+    pub values: AVec<AVec<Expr>>,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`

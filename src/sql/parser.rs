@@ -12,8 +12,8 @@ use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
 
 use super::ast::{
-    Ast, BinOp, ColumnDef, ConflictAction, ConstraintSet, Expr, FromSource, IndexColumnDef,
-    JoinKind, Literal, SelectItem, SelectStmt, Upsert, UpsertAction,
+    Ast, BinOp, ColumnDef, CompoundOp, ConflictAction, ConstraintSet, Expr, FromSource,
+    IndexColumnDef, JoinKind, Literal, SelectItem, SelectStmt, Upsert, UpsertAction,
 };
 use alloc::boxed::Box;
 
@@ -185,6 +185,17 @@ impl<'a> Parser<'a> {
             self.delete_dispatch::<E>()
         } else if self.cur_is_kw(b"SELECT") {
             self.select::<E>()
+        } else if self.cur_is_kw(b"VALUES") {
+            // A standalone VALUES statement (v0.9): a select
+            // statement whose first core is a VALUES core.
+            #[cfg(feature = "v09")]
+            {
+                Ok(Ast::Select(self.select_rich::<E>()?))
+            }
+            #[cfg(not(feature = "v09"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
         } else if self.cur_is_kw(b"BEGIN") {
             self.pos += 1;
             // BEGIN [TRANSACTION]; deferred/immediate/exclusive all
@@ -1091,6 +1102,7 @@ impl<'a> Parser<'a> {
             alias: None,
             kind: JoinKind::Inner,
             on: None,
+            derived: None,
         });
         // v0.2: optional WHERE <column> = <literal>. Any other
         // predicate shape is rejected here; whether <column> is the
@@ -1124,6 +1136,8 @@ impl<'a> Parser<'a> {
             order_by: AVec::new(),
             limit: None,
             offset: 0,
+            compound: AVec::new(),
+            values: AVec::new(),
         }))
     }
 }
@@ -1256,11 +1270,31 @@ impl<'a> Parser<'a> {
             };
             if self.eat_kw(b"IN") {
                 self.expect::<E>(Tok::LParen)?;
-                if self.cur_is_kw(b"SELECT") {
+                // A subquery body: SELECT (or a v0.9 VALUES core),
+                // possibly under further parentheses — the pin
+                // accepts `IN ((SELECT ...))`.
+                let save = self.pos;
+                let mut extra_parens = 0usize;
+                while self.cur().tok == Tok::LParen {
+                    self.pos += 1;
+                    extra_parens += 1;
+                }
+                let is_subquery = self.cur_is_kw(b"SELECT")
+                    || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"));
+                if !is_subquery {
+                    // An expression list whose first item is
+                    // parenthesised: rewind and let the list
+                    // parser see the parens.
+                    self.pos = save;
+                    extra_parens = 0;
+                }
+                if is_subquery {
                     #[cfg(feature = "v06")]
                     {
                         let stmt = self.select_rich::<E>()?;
-                        self.expect::<E>(Tok::RParen)?;
+                        for _ in 0..=extra_parens {
+                            self.expect::<E>(Tok::RParen)?;
+                        }
                         l = Expr::InSubquery(Box::new(l), Box::new(stmt), neg);
                         continue;
                     }
@@ -1269,6 +1303,7 @@ impl<'a> Parser<'a> {
                         return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                     }
                 }
+
                 let mut list = AVec::new();
                 if self.cur().tok != Tok::RParen {
                     loop {
@@ -1382,15 +1417,26 @@ impl<'a> Parser<'a> {
         if self.cur_is_kw(b"EXISTS") {
             self.pos += 1;
             self.expect::<E>(Tok::LParen)?;
-            if !self.cur_is_kw(b"SELECT") {
+            let mut extra_parens = 0usize;
+            while self.cur().tok == Tok::LParen {
+                self.pos += 1;
+                extra_parens += 1;
+            }
+            if !self.cur_is_kw(b"SELECT")
+                && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
             let stmt = self.select_rich::<E>()?;
-            self.expect::<E>(Tok::RParen)?;
+            for _ in 0..=extra_parens {
+                self.expect::<E>(Tok::RParen)?;
+            }
             return Ok(Expr::ExistsSubquery(Box::new(stmt)));
         }
         if self.eat(Tok::LParen) {
-            if self.cur_is_kw(b"SELECT") {
+            if self.cur_is_kw(b"SELECT")
+                || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            {
                 #[cfg(feature = "v06")]
                 {
                     let stmt = self.select_rich::<E>()?;
@@ -1523,7 +1569,103 @@ impl<'a> Parser<'a> {
 
     // ---------- rich SELECT ----------
 
+    /// A full select statement (v0.9 shape): one core, an
+    /// optional compound tail, and the trailing ORDER BY /
+    /// LIMIT that belong to the whole statement. Without the
+    /// `v09` feature this is exactly the pre-v0.9 single core
+    /// plus its tail.
     fn select_rich<E>(&mut self) -> Result<SelectStmt, E> {
+        let mut head = self.select_core::<E>()?;
+        #[cfg(feature = "v09")]
+        {
+            let mut compound: AVec<(CompoundOp, SelectStmt)> = AVec::new();
+            loop {
+                let op = if self.eat_kw(b"UNION") {
+                    if self.eat_kw(b"ALL") {
+                        CompoundOp::UnionAll
+                    } else {
+                        CompoundOp::Union
+                    }
+                } else if self.eat_kw(b"EXCEPT") {
+                    CompoundOp::Except
+                } else if self.eat_kw(b"INTERSECT") {
+                    CompoundOp::Intersect
+                } else {
+                    break;
+                };
+                compound.push((op, self.select_core::<E>()?));
+            }
+            // The pin's grammar: a trailing ORDER BY / LIMIT is
+            // a syntax error when the LAST core is a VALUES core
+            // (`VALUES (1) LIMIT 1`, `... UNION VALUES (2)
+            // ORDER BY 1` both fail there) — reproduce it.
+            let last_is_values = match compound.as_slice().last() {
+                Some((_, c)) => !c.values.is_empty(),
+                None => !head.values.is_empty(),
+            };
+            if last_is_values
+                && (self.cur_is_kw(b"ORDER") || self.cur_is_kw(b"LIMIT") || self.cur_is_kw(b"OFFSET"))
+            {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+            head.compound = compound;
+        }
+        self.select_tail::<E>(&mut head)?;
+        Ok(head)
+    }
+
+    /// One compound operand: a SELECT core or — under `v09` —
+    /// a VALUES core, with no ORDER BY / LIMIT / compound of
+    /// its own (the pin gives cores none: `SELECT ... ORDER BY
+    /// ... UNION ...` fails there with "ORDER BY clause should
+    /// come after UNION").
+    fn select_core<E>(&mut self) -> Result<SelectStmt, E> {
+        #[cfg(feature = "v09")]
+        if self.cur_is_kw(b"VALUES") {
+            return self.values_core::<E>();
+        }
+        self.select_core_select::<E>()
+    }
+
+    /// A `VALUES (row), (row), ...` core (v0.9): values are
+    /// full expressions, as in the INSERT grammar.
+    #[cfg(feature = "v09")]
+    fn values_core<E>(&mut self) -> Result<SelectStmt, E> {
+        self.expect_kw::<E>(b"VALUES")?;
+        let mut values = AVec::new();
+        loop {
+            self.expect::<E>(Tok::LParen)?;
+            let mut row = AVec::new();
+            loop {
+                row.push(self.parse_expr::<E>()?);
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                self.expect::<E>(Tok::RParen)?;
+                break;
+            }
+            values.push(row);
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(SelectStmt {
+            distinct: false,
+            items: AVec::new(),
+            from: AVec::new(),
+            filter: None,
+            group_by: AVec::new(),
+            having: None,
+            order_by: AVec::new(),
+            limit: None,
+            offset: 0,
+            compound: AVec::new(),
+            values,
+        })
+    }
+
+    fn select_core_select<E>(&mut self) -> Result<SelectStmt, E> {
         self.expect_kw::<E>(b"SELECT")?;
         let distinct = if self.eat_kw(b"DISTINCT") {
             true
@@ -1604,6 +1746,25 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        Ok(SelectStmt {
+            distinct,
+            items,
+            from,
+            filter,
+            group_by,
+            having,
+            order_by: AVec::new(),
+            limit: None,
+            offset: 0,
+            compound: AVec::new(),
+            values: AVec::new(),
+        })
+    }
+
+    /// The trailing ORDER BY / LIMIT of a select statement,
+    /// parsed into `head` after its core(s) (v0.9 split: cores
+    /// carry none of their own).
+    fn select_tail<E>(&mut self, head: &mut SelectStmt) -> Result<(), E> {
         let mut order_by = AVec::new();
         if self.eat_kw(b"ORDER") {
             self.expect_kw::<E>(b"BY")?;
@@ -1644,17 +1805,10 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(SelectStmt {
-            distinct,
-            items,
-            from,
-            filter,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-        })
+        head.order_by = order_by;
+        head.limit = limit;
+        head.offset = offset;
+        Ok(())
     }
 
     fn limit_int<E>(&mut self) -> Result<i64, E> {
@@ -1668,6 +1822,41 @@ impl<'a> Parser<'a> {
     }
 
     fn join_source<E>(&mut self, kind: JoinKind, first: bool) -> Result<FromSource, E> {
+        // A derived table (v0.9): `(SELECT ...)` or `(VALUES
+        // ...)`, possibly under further parentheses (the pin
+        // accepts `FROM ((SELECT 1)) s`). The alias is optional;
+        // no column-name list may follow it (pin: syntax error).
+        #[cfg(feature = "v09")]
+        if self.cur().tok == Tok::LParen {
+            let mut depth = 0usize;
+            let mut i = self.pos;
+            while i < self.limit && self.toks.as_slice()[i].tok == Tok::LParen {
+                depth += 1;
+                i += 1;
+            }
+            if self.is_kw(i, b"SELECT") || self.is_kw(i, b"VALUES") {
+                for _ in 0..depth {
+                    self.expect::<E>(Tok::LParen)?;
+                }
+                let inner = self.select_rich::<E>()?;
+                for _ in 0..depth {
+                    self.expect::<E>(Tok::RParen)?;
+                }
+                let alias = self.opt_alias();
+                let on = if !first && self.eat_kw(b"ON") {
+                    Some(self.parse_expr::<E>()?)
+                } else {
+                    None
+                };
+                return Ok(FromSource {
+                    table: ABytes::EMPTY,
+                    alias,
+                    kind,
+                    on,
+                    derived: Some(Box::new(inner)),
+                });
+            }
+        }
         let table = self.name::<E>()?;
         let alias = self.opt_alias();
         let on = if !first && self.eat_kw(b"ON") {
@@ -1680,6 +1869,7 @@ impl<'a> Parser<'a> {
             alias,
             kind,
             on,
+            derived: None,
         })
     }
 
