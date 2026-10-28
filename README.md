@@ -8,16 +8,41 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.9 — compound SELECTs and derived tables
-  (UNION / UNION ALL / INTERSECT / EXCEPT between SELECT and
-  VALUES cores; `(SELECT ...) [[AS] alias]` in FROM), on the
-  v0.8 foundation (SPEC §2).
+- **Phase:** v0.10 — NOT NULL enforcement on every write
+  path (INSERT / UPDATE / UPSERT with the pin's per-clause
+  semantics), on the v0.9 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.10 does
+
+- Everything v0.9 does (below), plus **NOT NULL
+  enforcement** — the last parse-but-unenforced integrity
+  constraint in the claimed profiles. It is *not*
+  feature-gated: like the v0.8 affinity fix, it corrects
+  existing write paths, so the tiny profile (whose INSERT
+  claimed the same semantics) enforces it too. A NULL
+  proposed for a NOT NULL column is resolved under the
+  statement's conflict action, with the pinned oracle's
+  exact per-clause rules (all probed before
+  implementation): ABORT / FAIL / ROLLBACK error with
+  `SchemaKind::NotNullViolation`; OR IGNORE skips the row
+  (INSERT) or the combination (UPDATE ... FROM); OR
+  REPLACE substitutes the column's default — affinity
+  applied, as for any stored value — and errors when the
+  default itself is NULL. The check runs before any
+  uniqueness or rowid conflict is considered (NOT NULL
+  wins error precedence, and a substituted default can
+  itself make a REPLACE victim). An upsert proposal is
+  resolved before arbitration; the DO UPDATE result row
+  is then checked with abort semantics unconditionally.
+  The rowid-alias column is exempt; a non-alias PRIMARY
+  KEY column (TEXT PK, `INTEGER PRIMARY KEY DESC`) is
+  not.
 
 ## What v0.9 does
 
@@ -202,9 +227,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.9) |
+| Gate | Budget | Measured (v0.10) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,512 B** (Δ +200 B vs v0.8's 89,312 B; the v0.9 engine is feature-gated out of tiny — the delta is ungated AST struct growth: `SelectStmt` compound/VALUES fields and the `FromSource` derived field. The base was re-measured on the Bolt-inclusive tree before v0.9 work: 89,312 B, identical to the v0.8 landing — the Bolt commits touch only `indexes`/`v04`-gated code and contribute 0 B to tiny) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,872 B** (Δ +360 B vs v0.9's 89,512 B; NOT NULL enforcement is deliberately ungated — a correctness fix in the existing INSERT path, which the tiny profile includes — so the delta is the resolver plus the catalog `not_null` plumbing itself) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

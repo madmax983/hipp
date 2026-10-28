@@ -4,6 +4,179 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.10 — NOT NULL enforcement (2026-10-28)
+
+**Status:** implemented, differential-tested against the
+pinned oracle, and gated (below). This milestone closes
+the last parse-but-unenforced integrity constraint in the
+claimed profiles: before v0.10 hipp silently ACCEPTED rows
+the pin rejects. Enforcement is deliberately **not**
+feature-gated — it is a correctness fix in the existing
+write paths, like the v0.8 cross-affinity fix (which was
+likewise ungated): the tiny profile's INSERT claims the
+same semantics, so the tiny profile enforces them too.
+
+### Shipped
+
+- **One resolver** (`session::resolve_not_null`) runs on
+  every fully-built row the write paths produce, after
+  affinity / assignment resolution and BEFORE any
+  uniqueness or rowid conflict detection, under the
+  statement's conflict action: `Abort` (ABORT / FAIL /
+  ROLLBACK / default) fails with the new
+  `SchemaKind::NotNullViolation`; `Ignore` skips the row
+  (INSERT) or the combination (UPDATE); `Replace`
+  substitutes the column's default (affinity applied, as
+  for any stored value) and degrades to the abort error
+  when the default itself is NULL.
+- **INSERT** (VALUES rows, INSERT ... SELECT sources, the
+  REPLACE verb): the proposed row is resolved in
+  `exec_insert_row`, the single funnel for all three —
+  which is also where an upsert proposal is resolved,
+  before conflict arbitration (below).
+- **UPDATE** (including UPDATE ... FROM combinations and
+  the OR REPLACE victim path): each combination's result
+  row is resolved before its uniqueness checks, so a
+  substituted default is what conflict detection sees.
+- **UPSERT**: the proposal is resolved under the
+  statement's own action before arbitration; the
+  DO UPDATE result row is resolved with ABORT semantics
+  unconditionally in `exec_upsert_update`.
+- The catalog now carries `not_null` per column (the
+  parser recorded it since v0.1 but `schema.rs` dropped
+  it), so foreign files written by the oracle enforce
+  identically to hipp-created ones. The rowid-alias
+  column is exempt (its record field is NULL by
+  construction); non-alias PRIMARY KEY columns are not.
+
+### Oracle-probing notes (all verified on the 3.54.1 pin
+before implementation)
+
+- **Per-clause semantics:** plain / ABORT / FAIL /
+  ROLLBACK error atomically (a multi-row VALUES lands
+  nothing); IGNORE skips just the offending row; REPLACE
+  substitutes the default even with no uniqueness
+  conflict anywhere, and errors when the column has no
+  non-NULL default — a pre-existing conflicting row
+  survives that error untouched.
+- **Substitution precedes uniqueness:** under OR
+  REPLACE, a substituted default that collides with an
+  existing row deletes that row as the victim (INSERT
+  and UPDATE forms both probed). NOT NULL also wins
+  error precedence over UNIQUE and duplicate-rowid
+  errors in INSERT, UPDATE, and DO UPDATE.
+- **Upsert proposals are checked before arbitration**
+  (the brief's open question, and the naive reading is
+  wrong): a violating proposal errors even when a
+  conflict exists and DO UPDATE never reads the value.
+  Under OR IGNORE + upsert the proposal is skipped
+  wholesale — the DO UPDATE does NOT run; under OR
+  REPLACE + upsert it is substituted and arbitration
+  proceeds. The DO UPDATE result then aborts on a NULL
+  under EVERY statement action, OR REPLACE included; a
+  false DO UPDATE WHERE skips the check with the update.
+- **Final-row rule:** the check reads the row after all
+  assignments, so `SET b = NULL, b = 'x'` is legal and
+  `SET b = 'x', b = NULL` is not (UPDATE and DO UPDATE).
+- **Keys:** `INTEGER PRIMARY KEY NOT NULL` still
+  auto-assigns on NULL (alias exemption); `INTEGER
+  PRIMARY KEY DESC NOT NULL`, TEXT / INT primary keys
+  with NOT NULL, and a table-level PK over a NOT NULL
+  column all reject NULL. A TEXT PRIMARY KEY *without*
+  NOT NULL still accepts NULLs (v0.3 heritage behaviour,
+  unchanged).
+
+### Root finds this milestone
+
+- **The catalog dropped `not_null`.** The parser has
+  recorded the constraint since v0.1 and ALTER validates
+  against it since v0.4, but `schema::Column` had no
+  such field — enforcement first needed it threaded
+  through catalog construction.
+- **Omitted-column defaults were stored raw.** The
+  substitution rule forced the question of what value a
+  default materialises as: the pin applies the column's
+  affinity (`DEFAULT '7'` in an INT column stores the
+  integer 7), but hipp's INSERT row build cloned the raw
+  literal, storing the text `'7'` for an omitted column.
+  The row build now affinity-applies defaults, so the
+  omitted, supplied, and substituted forms of a value
+  agree; the new differential pins all three.
+
+### Gates (run on the final tree)
+
+- `cargo test --workspace`: **152 passed, 0 failed**
+  (142 at v0.9 + 8 new core differentials in
+  `tests/not_null_v10.rs` + 2 new CLI differentials in
+  `hipp-cli/tests/cli_v10.rs`). The new suites cover the
+  abort family incl. expression NULLs and multi-row
+  atomicity, IGNORE skips incl. RETURNING, REPLACE
+  substitution incl. victim-making defaults and the
+  no-default degradation, UPDATE actions incl.
+  last-assignment-wins and FROM combinations, upsert
+  proposal/DO UPDATE semantics under all statement
+  actions, the PK/alias matrix, error precedence, an
+  oracle-written schema enforced by hipp, and the tiny
+  configuration enforcing too. A1–A11 stay green; every
+  hipp file `integrity_check`s in the oracle.
+- CLI: the v0.10 corpus (IGNORE skips, REPLACE
+  substitution, upsert proposal resolution, alias +
+  affinity corners) is byte-identical to the oracle
+  one-shot and over stdin, and `.dump` after v0.10
+  writes replays into the oracle.
+- `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean. `cargo fmt` (write mode): clean
+  tree afterwards. Feature matrix compiles: default,
+  no-default, std-only, v04..v09 ladders, indexes-only,
+  indexes+v05, all-features; lib tests pass under
+  no-default-features.
+- Tiny (below). Pre-implementation evidence, for the
+  record: the new core suite did not compile against
+  the v0.9 tree (`SchemaKind::NotNullViolation` did not
+  exist), and the v0.9 hipp CLI accepted and stored a
+  NULL into a NOT NULL column (`1|1|`) where the pin
+  exits 1 with "NOT NULL constraint failed".
+
+### Size (ratchet)
+
+- thumbv7em-none-eabihf `tiny`: **.text 74,920 +
+  .rodata 14,952 = 89,872 B of 128 KiB budget**, Δ
+  **+360 B** vs v0.9's 89,512 B — under the 4 KiB
+  justification line. Attribution: the whole delta is
+  the ungated enforcement (the resolver, the per-plan
+  `not_null` plumbing, the new error kind) — tiny pays
+  it because tiny's INSERT is one of the corrected
+  paths. Engine statics 0 B (.bss 98,308 B = demo heap,
+  unchanged). Headroom remaining: 41,200 B.
+
+### Honest gaps (v0.10)
+
+- Non-literal defaults keep the parser's pre-existing
+  approximation (v0.4): a `DEFAULT` that is not a plain
+  literal is recorded as no default (or its leading
+  literal), so OR REPLACE substitution uses the
+  recorded default — a NOT NULL column whose real
+  default is a non-NULL expression (e.g.
+  `DEFAULT (1+2)`, `CURRENT_TIMESTAMP`) errors under OR
+  REPLACE where the pin would substitute the computed
+  value.
+- When one row carries both a bad rowid value
+  (datatype mismatch) and a NULL NOT NULL column, hipp
+  reports the datatype mismatch (targets are applied
+  before the check); the pin's precedence there is
+  unprobed.
+- FAIL vs ABORT inside an explicit transaction keeps
+  the engine's pre-existing simplification (any
+  statement error aborts the bracket); the pin's FAIL
+  keeps the statement's earlier rows inside a
+  transaction.
+- All pre-existing gaps stand: subqueries inside
+  aggregate arguments stay refused; real-literal
+  parsing may differ by 1 ulp (RISKS R5);
+  uncorrelated-subquery hoisting absent; no merge /
+  redistribution on delete; WAL read stays gated on a
+  real target demanding it.
+
 ## v0.9 — compound SELECTs and derived tables (2026-10-27)
 
 **Status:** implemented, differential-tested against the
