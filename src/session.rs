@@ -268,6 +268,9 @@ enum Plan {
         ncols: usize,
         defaults: AVec<OwnedValue>,
         affs: AVec<crate::record::Affinity>,
+        /// Per-column `NOT NULL` flags (v0.10), parallel to
+        /// `defaults` / `affs`.
+        not_null: AVec<bool>,
         /// (target, expression) pairs in statement order.
         sets: AVec<(Target, RExpr)>,
         filter: Option<RExpr>,
@@ -389,6 +392,8 @@ struct QueryPlan {
 struct InsCol {
     affinity: crate::record::Affinity,
     default: OwnedValue,
+    /// `NOT NULL` constraint on the column (v0.10).
+    not_null: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -664,6 +669,7 @@ impl<S: Storage> Connection<S> {
                     cols.push(InsCol {
                         affinity: c.affinity,
                         default: literal_owned(&self.catalog_arena, c.default),
+                        not_null: c.not_null,
                     });
                 }
                 #[cfg(not(feature = "v08"))]
@@ -1992,9 +1998,11 @@ impl<S: Storage> Connection<S> {
         };
         let mut defaults = AVec::new();
         let mut affs = AVec::new();
+        let mut not_null = AVec::new();
         for c in t.columns.iter() {
             defaults.push(literal_owned(&self.catalog_arena, c.default));
             affs.push(c.affinity);
+            not_null.push(c.not_null);
         }
         #[cfg(feature = "v07")]
         let returning_r = self.plan_returning(arena, t, qualifier, returning)?;
@@ -2004,6 +2012,7 @@ impl<S: Storage> Connection<S> {
             ncols: t.columns.len(),
             defaults,
             affs,
+            not_null,
             sets,
             filter,
             conflict,
@@ -2889,6 +2898,61 @@ fn key_has_no_null(key: &[OwnedValue]) -> bool {
     key.iter().all(|v| !matches!(v, OwnedValue::Null))
 }
 
+/// NOT NULL resolution for one fully-built row (v0.10; every
+/// rule below probed on the pinned 3.54.1 oracle before
+/// implementation). `row` holds one value per table column in
+/// record form (affinities applied, defaults materialised);
+/// the rowid-alias column is exempt — its record field is
+/// NULL by construction and its value lives in the rowid.
+/// Per statement conflict action:
+/// - `Abort` (ABORT / FAIL / ROLLBACK / the default): any
+///   NULL in a NOT NULL column is `NotNullViolation`.
+/// - `Ignore`: returns `Ok(false)` — the caller skips this
+///   row / combination and proceeds with the next.
+/// - `Replace`: each NULL is replaced by the column's
+///   default, affinity applied exactly as for a stored
+///   value; a default that is itself NULL degrades to the
+///   `Abort` error.
+///
+/// Callers run this BEFORE any uniqueness/rowid conflict
+/// detection on the row: the pin reports the NOT NULL
+/// violation when both are present, and an OR REPLACE
+/// substitution is itself visible to conflict detection (a
+/// substituted default that collides makes a victim).
+/// Returns `Ok(true)` when the (possibly substituted) row
+/// may proceed.
+fn resolve_not_null<E>(
+    row: &mut [OwnedValue],
+    not_null: &[bool],
+    defaults: &[OwnedValue],
+    affs: &[crate::record::Affinity],
+    rowid_alias: Option<usize>,
+    action: ConflictAction,
+) -> Result<bool, E> {
+    for i in 0..row.len() {
+        if !not_null[i] || Some(i) == rowid_alias || !matches!(row[i], OwnedValue::Null) {
+            continue;
+        }
+        match action {
+            ConflictAction::Abort => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::NotNullViolation,
+                });
+            }
+            ConflictAction::Ignore => return Ok(false),
+            ConflictAction::Replace => {
+                if matches!(defaults[i], OwnedValue::Null) {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::NotNullViolation,
+                    });
+                }
+                row[i] = apply_affinity(defaults[i].clone(), affs[i]);
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// One row an UPDATE/DELETE will touch (v0.5), in record form:
 /// decoded values with defaults materialised; the rowid-alias
 /// column's slot holds its stored NULL — the rowid itself is in
@@ -3711,7 +3775,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         let ncols = cols.len();
         let mut row: AVec<OwnedValue> = AVec::new();
         for c in cols.iter() {
-            row.push(c.default.clone());
+            // An omitted column's default is a stored value
+            // like any other: the column's affinity applies
+            // (v0.10; the pin stores DEFAULT '7' in an INT
+            // column as the integer 7).
+            row.push(apply_affinity(c.default.clone(), c.affinity));
         }
         let mut explicit_rowid: Option<i64> = None;
         for (target, v) in targets.iter().zip(values.iter()) {
@@ -3743,6 +3811,37 @@ impl<'c, S: Storage> Statement<'c, S> {
                         row.as_mut_slice()[i] = apply_affinity(v, cols.as_slice()[i].affinity);
                     }
                 }
+            }
+        }
+        // v0.10 NOT NULL: the proposed row is resolved under
+        // the statement's conflict action before the rowid is
+        // assigned and before any uniqueness check (the pin's
+        // order) — and, for an upsert, before arbitration: a
+        // violating proposal under OR IGNORE is skipped
+        // wholesale (its DO UPDATE never runs), under OR
+        // REPLACE it is substituted and then arbitrated.
+        {
+            let action = match &self.plan {
+                Plan::Insert { conflict, .. } => *conflict,
+                _ => unreachable!(),
+            };
+            let mut nn_flags = AVec::new();
+            let mut nn_defaults = AVec::new();
+            let mut nn_affs = AVec::new();
+            for c in cols.iter() {
+                nn_flags.push(c.not_null);
+                nn_defaults.push(c.default.clone());
+                nn_affs.push(c.affinity);
+            }
+            if !resolve_not_null::<S::Error>(
+                row.as_mut_slice(),
+                nn_flags.as_slice(),
+                nn_defaults.as_slice(),
+                nn_affs.as_slice(),
+                *rowid_alias,
+                action,
+            )? {
+                return Ok(()); // OR IGNORE: skip this row.
             }
         }
         let rowid = {
@@ -3978,32 +4077,36 @@ impl<'c, S: Storage> Statement<'c, S> {
         row: AVec<OwnedValue>,
         rowid: i64,
     ) -> Result<(), S::Error> {
-        let (root, rowid_alias, defaults, affs, conflict_action, upsert) = match &self.plan {
-            Plan::Insert {
-                root,
-                rowid_alias,
-                cols,
-                conflict,
-                upsert,
-                ..
-            } => {
-                let mut defaults = AVec::new();
-                let mut affs = AVec::new();
-                for c in cols.iter() {
-                    defaults.push(c.default.clone());
-                    affs.push(c.affinity);
+        let (root, rowid_alias, defaults, affs, not_nulls, conflict_action, upsert) =
+            match &self.plan {
+                Plan::Insert {
+                    root,
+                    rowid_alias,
+                    cols,
+                    conflict,
+                    upsert,
+                    ..
+                } => {
+                    let mut defaults = AVec::new();
+                    let mut affs = AVec::new();
+                    let mut not_nulls = AVec::new();
+                    for c in cols.iter() {
+                        defaults.push(c.default.clone());
+                        affs.push(c.affinity);
+                        not_nulls.push(c.not_null);
+                    }
+                    (
+                        *root,
+                        *rowid_alias,
+                        defaults,
+                        affs,
+                        not_nulls,
+                        *conflict,
+                        upsert.clone(),
+                    )
                 }
-                (
-                    *root,
-                    *rowid_alias,
-                    defaults,
-                    affs,
-                    *conflict,
-                    upsert.clone(),
-                )
-            }
-            _ => unreachable!(),
-        };
+                _ => unreachable!(),
+            };
         let ncols = defaults.len();
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
@@ -4078,6 +4181,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         rowid_alias,
                         defaults.as_slice(),
                         affs.as_slice(),
+                        not_nulls.as_slice(),
                     )
                     .await;
             }
@@ -4128,6 +4232,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         rowid_alias: Option<usize>,
         defaults: &[OwnedValue],
         affs: &[crate::record::Affinity],
+        not_nulls: &[bool],
     ) -> Result<(), S::Error> {
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
@@ -4204,6 +4309,21 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
         }
+        // v0.10 NOT NULL: the DO UPDATE result row is checked
+        // with ABORT semantics unconditionally (probed on the
+        // pin: no default substitution and no skip, whatever
+        // the statement's own conflict action — even OR
+        // REPLACE), and before its uniqueness checks, matching
+        // the pin's error precedence. A WHERE that skipped the
+        // update returned above, before any assignment ran.
+        resolve_not_null::<S::Error>(
+            new_rec.as_mut_slice(),
+            not_nulls,
+            defaults,
+            affs,
+            rowid_alias,
+            ConflictAction::Abort,
+        )?;
         // The update itself must not collide with a third row.
         if new_rowid != crowid
             && btree::seek_rowid(&mut self.conn.pager, root, new_rowid)
@@ -4397,7 +4517,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "v05")]
     async fn exec_update(&mut self) -> Result<(), S::Error> {
-        let (root, rowid_alias, ncols, defaults, affs, sets, filter, conflict_action) =
+        let (root, rowid_alias, ncols, defaults, affs, not_null, sets, filter, conflict_action) =
             match &self.plan {
                 Plan::Update {
                     root,
@@ -4405,6 +4525,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     ncols,
                     defaults,
                     affs,
+                    not_null,
                     sets,
                     filter,
                     conflict,
@@ -4415,6 +4536,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     *ncols,
                     defaults.clone(),
                     affs.clone(),
+                    not_null.clone(),
                     sets.clone(),
                     filter.clone(),
                     *conflict,
@@ -4557,6 +4679,24 @@ impl<'c, S: Storage> Statement<'c, S> {
                             }
                         }
                     }
+                }
+                // v0.10 NOT NULL: the combination's result row
+                // is resolved under the statement's conflict
+                // action before uniqueness is considered (the
+                // pin's order — NOT NULL wins precedence, and
+                // an OR REPLACE substitution is what the
+                // uniqueness check then sees). OR IGNORE skips
+                // this combination; later combinations of the
+                // same row still get their turn.
+                if !resolve_not_null::<S::Error>(
+                    new_rec.as_mut_slice(),
+                    not_null.as_slice(),
+                    defaults.as_slice(),
+                    affs.as_slice(),
+                    rowid_alias,
+                    conflict_action,
+                )? {
+                    continue;
                 }
                 // Conflicts of the new values against OTHER rows
                 // (the row as currently stored is `cur_rowid`):

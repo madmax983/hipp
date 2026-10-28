@@ -24,6 +24,12 @@ pub enum SchemaKind {
     MissingRowidValue,
     /// A `UNIQUE` index / constraint would be violated (v0.3).
     UniqueViolation,
+    /// A `NOT NULL` column would receive a NULL (v0.10). Raised
+    /// for the statement conflict actions that error (ABORT /
+    /// FAIL / ROLLBACK and the default), for an OR REPLACE
+    /// substitution whose column default is itself NULL, and
+    /// unconditionally for an upsert DO UPDATE result row.
+    NotNullViolation,
     /// `DROP INDEX` named an index that does not exist (v0.3).
     UnknownIndex,
     /// `DROP INDEX` named an index owned by a UNIQUE / PRIMARY KEY

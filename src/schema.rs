@@ -34,6 +34,10 @@ pub struct Column {
     pub decl: ABytes,
     pub affinity: Affinity,
     pub default: Option<Literal>,
+    /// `NOT NULL` appeared in the column's constraints (v0.10:
+    /// carried into the catalog so the write paths can enforce
+    /// it; parsed since v0.1, recorded for ALTER since v0.4).
+    pub not_null: bool,
 }
 
 /// One column of an index key (v0.3). `col == None` is the rowid
@@ -292,6 +296,7 @@ pub async fn build_catalog<S: Storage>(
                     Some(l) => Some(intern_literal(catalog_arena, l, &scratch)?),
                     None => None,
                 },
+                not_null: c.not_null,
             });
         }
         let rowid_alias = alias;

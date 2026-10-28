@@ -38,8 +38,9 @@ pub struct ColumnDef {
     /// literal (v0.1 materialises only literal defaults).
     pub default: Option<Literal>,
     /// `NOT NULL` appeared in this column's constraints (v0.4:
-    /// recorded for ALTER TABLE ADD COLUMN validation; still not
-    /// enforced on INSERT, matching the v0.1 note).
+    /// recorded for ALTER TABLE ADD COLUMN validation; v0.10:
+    /// carried into the catalog and enforced on every write
+    /// path — see `session::resolve_not_null`).
     pub not_null: bool,
     /// A `DEFAULT` was present but is not a plain literal
     /// (e.g. `CURRENT_TIMESTAMP`, a function call) (v0.4).
