@@ -363,10 +363,7 @@ fn insert_replace_substitutes_default() {
         // text '7' for the omitted form).
         tw.write("INSERT INTO t (a) VALUES (2)").await;
         let got = tw.rows("SELECT b, typeof(b) FROM t ORDER BY a").await;
-        assert_eq!(
-            got,
-            vec!["7|integer".to_string(), "7|integer".to_string()]
-        );
+        assert_eq!(got, vec!["7|integer".to_string(), "7|integer".to_string()]);
         tw.finish(DUMP);
     });
 }
