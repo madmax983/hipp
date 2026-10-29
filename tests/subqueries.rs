@@ -375,12 +375,16 @@ fn subquery_rejections() {
                 .await
                 .is_err()
         );
-        // A subquery inside an aggregate's arguments is
-        // refused at plan time (named v0.6 boundary).
-        assert!(
-            db.prepare("SELECT sum((SELECT max(salary) FROM emp)) FROM emp")
-                .await
-                .is_err()
+        // A subquery inside an aggregate's arguments was
+        // refused at plan time in v0.6; v0.11 implements it
+        // (per-group-row execution — see
+        // tests/agg_subquery_v11.rs), so the prepare now
+        // succeeds and the value is the oracle's: the
+        // uncorrelated subquery yields max(salary) = 300 for
+        // each of emp's five rows.
+        assert_eq!(
+            collect(&mut db, "SELECT sum((SELECT max(salary) FROM emp)) FROM emp").await,
+            vec!["1500".to_string()]
         );
         // Subqueries in INSERT VALUES were refused in v0.6
         // (constant folding has no executor); v0.8 implements
