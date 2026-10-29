@@ -383,7 +383,11 @@ fn subquery_rejections() {
         // uncorrelated subquery yields max(salary) = 300 for
         // each of emp's five rows.
         assert_eq!(
-            collect(&mut db, "SELECT sum((SELECT max(salary) FROM emp)) FROM emp").await,
+            collect(
+                &mut db,
+                "SELECT sum((SELECT max(salary) FROM emp)) FROM emp"
+            )
+            .await,
             vec!["1500".to_string()]
         );
         // Subqueries in INSERT VALUES were refused in v0.6

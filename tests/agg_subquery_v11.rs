@@ -282,7 +282,9 @@ fn nested_positions() {
         let twin = oracle_db("v11-nested-twin", SETUP);
         let fs = FileStorage::open(&path).expect("fs open");
         let mut db = Connection::open(fs, Config::default()).await.expect("open");
-        exec(&mut db, "CREATE TABLE dst (v INTEGER)").await.expect("hipp ddl");
+        exec(&mut db, "CREATE TABLE dst (v INTEGER)")
+            .await
+            .expect("hipp ddl");
         exec(&mut db, "INSERT INTO dst SELECT sum((SELECT b)) FROM t")
             .await
             .expect("hipp insert-select");
@@ -296,10 +298,7 @@ fn nested_positions() {
         );
         let read = "SELECT v FROM dst ORDER BY v";
         assert_eq!(common::cli(&path, read), common::cli(&twin, read));
-        assert_eq!(
-            common::cli(&path, "PRAGMA integrity_check;").trim(),
-            "ok"
-        );
+        assert_eq!(common::cli(&path, "PRAGMA integrity_check;").trim(), "ok");
     });
 }
 

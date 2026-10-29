@@ -1379,8 +1379,12 @@ pub fn substitute_group(
             Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
             Box::new(substitute_group(b, values, pos, agg_values, agg_pos)),
         ),
-        RExpr::Neg(a) => RExpr::Neg(Box::new(substitute_group(a, values, pos, agg_values, agg_pos))),
-        RExpr::Not(a) => RExpr::Not(Box::new(substitute_group(a, values, pos, agg_values, agg_pos))),
+        RExpr::Neg(a) => RExpr::Neg(Box::new(substitute_group(
+            a, values, pos, agg_values, agg_pos,
+        ))),
+        RExpr::Not(a) => RExpr::Not(Box::new(substitute_group(
+            a, values, pos, agg_values, agg_pos,
+        ))),
         RExpr::IsNull(a, neg) => RExpr::IsNull(
             Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
             *neg,

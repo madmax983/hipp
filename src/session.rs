@@ -5545,7 +5545,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         if aggs.len() == 1
             && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
-            && matches!(kind, crate::query::AggKind::Min | crate::query::AggKind::Max)
+            && matches!(
+                kind,
+                crate::query::AggKind::Min | crate::query::AggKind::Max
+            )
             && !args.is_empty()
             && crate::query::has_sub(&args.as_slice()[0])
         {
@@ -5576,7 +5579,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         if aggs.len() == 1
             && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
-            && matches!(kind, crate::query::AggKind::Min | crate::query::AggKind::Max)
+            && matches!(
+                kind,
+                crate::query::AggKind::Min | crate::query::AggKind::Max
+            )
             && !args.is_empty()
             && crate::query::has_sub(&args.as_slice()[0])
         {
