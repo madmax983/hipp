@@ -4,6 +4,153 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.11 — subqueries inside aggregate arguments (2026-10-29)
+
+**Status:** implemented, differential-tested against the
+pinned oracle, and gated (below). This milestone lifts the
+last plan-time refusal carried since v0.6: expressions like
+`sum((SELECT ...))` / `count((SELECT ...))` were refused
+with `Error::Unsupported` in every aggregate-argument
+position. The behaviour is new dialect surface, so it lands
+behind the **`v10` cargo feature** (default on, implies
+`v09`; the tiny profile excludes it). The feature ladder's
+next rung is `v10` because v0.10 itself was an ungated
+correctness fix and took no rung. Without `v10`, the
+planners refuse exactly as before (verified: the whole
+v0.11 suite fails against a `v09`-only build).
+
+### Shipped
+
+- **Per-group-row aggregate arguments.** In the async
+  group evaluator, an expression containing a subquery
+  inside an aggregate's arguments now folds each outermost
+  aggregate over argument values evaluated **per group
+  row** through the v0.6 substitution path (each subquery
+  executes against that row), then substitutes the folded
+  literal back into the expression; subqueries outside the
+  aggregate still resolve against the group's
+  representative row, and bare columns read it as before.
+  Positions covered: SELECT list, HAVING, ORDER BY — in
+  top-level queries, subquery bodies, derived tables,
+  compound cores, and `INSERT INTO ... SELECT` sources
+  (all of which share the two group projectors).
+- **One fold, two drivers.** The aggregate fold was
+  refactored to operate on precomputed per-row argument
+  values (`query::eval_agg_values`); the synchronous
+  evaluator and the new per-row path are the same code, so
+  DISTINCT handling, NULL skipping, sum's int/real
+  accumulation, and group_concat's per-row separator
+  cannot drift apart.
+- **Representative rule preserved.** A lone min/max whose
+  argument contains a subquery picks its extremum row by
+  the per-row subquery values (`pick_rep_qp_async` /
+  `pick_rep_sub_async` over an async extremum search); all
+  other groups keep the synchronous rule untouched.
+
+### Oracle-probing notes (all verified on the 3.54.1 pin
+before implementation)
+
+- `sum((SELECT b))` over `(1,10),(1,20),(2,30),(2,NULL)`
+  is 60: a no-FROM subquery reads the group row's own
+  columns, one contribution per row. Grouped by `a` it is
+  30 per group. `sum((SELECT x FROM u LIMIT 1))` lands the
+  uncorrelated value once per row (400 for `x = 100`).
+- A subquery yielding no row for a group row contributes
+  NULL: `count((SELECT 1 WHERE a = 1))` counts only the
+  matching rows (2 of 4), and an all-miss fold behaves
+  exactly like an all-NULL fold (`sum` NULL, `count` 0,
+  `total` 0.0).
+- Composition inside an argument is unrestricted on the
+  pin: arithmetic mixing columns and subqueries, CASE
+  between subqueries, `IN (SELECT ...)` and `EXISTS`
+  forms, nested aggregates *inside* the subquery
+  (`sum((SELECT sum(b) FROM t))` = 240), and compound
+  subquery bodies (first row wins). group_concat's
+  separator argument is per-row too
+  (`group_concat((SELECT b), (SELECT ';'))`).
+- A direct aggregate inside an aggregate's argument
+  remains a misuse on the pin; hipp refuses it with its
+  typed `Unsupported` (raised when the inner aggregate
+  would evaluate in a row context), consistent with its
+  typed-error discipline.
+
+### Root finds this milestone
+
+- **The representative row needed the async path too.**
+  The synchronous `pick_rep` evaluates a lone min/max
+  argument to choose the extremum row; with a subquery in
+  that argument it would have failed (or, worse, silently
+  kept the first row) even though the fold itself worked.
+  The async wrappers pre-empt exactly that one case and
+  delegate everything else to the synchronous rule.
+- **One pre-existing assertion was superseded by design**
+  (v0.6's `subquery_rejections` asserted aggregate-argument
+  subqueries are prepare-time refusals); it now asserts
+  the implemented value (1500 for the file's data), the
+  same repointing pattern as v0.6–v0.8.
+
+### Gates (run on the final tree)
+
+- `cargo test --workspace`: **162 passed, 0 failed**
+  (152 at v0.10 + 8 new core differentials in
+  `tests/agg_subquery_v11.rs` + 2 new CLI differentials in
+  `hipp-cli/tests/cli_v11.rs`). The core suite covers
+  uncorrelated and plain-mixed arguments, correlated
+  per-row evaluation incl. conditional / IN / EXISTS /
+  CASE forms, GROUP BY / HAVING / ORDER BY positions,
+  the min/max representative rule, DISTINCT folds and
+  per-row separators, empty and all-NULL groups, nested
+  positions (scalar subquery bodies, derived tables,
+  compound cores, INSERT ... SELECT sources), and the
+  nested-aggregate misuse refusal. A1–A11 stay green;
+  the hipp-written file in the INSERT ... SELECT test
+  passes `PRAGMA integrity_check` in the oracle.
+- CLI: the v0.11 corpus (the fold family, correlation,
+  grouping, representative rows, and an aggregate-argument
+  INSERT ... SELECT) is byte-identical to the oracle
+  one-shot and over stdin, and `.dump` after the writes
+  replays into the oracle.
+- `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean. `cargo fmt` (write mode): clean tree
+  afterwards. Feature matrix compiles: default,
+  no-default, std-only, v04..v10 ladders, indexes-only,
+  indexes+v05, all-features; lib tests pass under
+  no-default-features; a `v09`-only build (no `v10`)
+  keeps the pre-v0.11 refusal (the v0.11 suite fails
+  against it, as designed).
+
+### Size (ratchet)
+
+- thumbv7em-none-eabihf `tiny`: **.text 74,920 +
+  .rodata 14,952 = 89,872 B of 128 KiB budget**, Δ
+  **0 B** vs v0.10's 89,872 B — under the 4 KiB
+  justification line, no justification needed.
+  Attribution: the whole v0.11 engine (per-row fold,
+  group substitution helpers, async representative
+  search) lives in the `v04`/`v06`-gated modules behind
+  the `v10` feature; tiny compiles none of it. Engine
+  statics 0 B (.bss 98,308 B = demo heap, unchanged).
+  Headroom remaining: 41,200 B.
+
+### Honest gaps (v0.11)
+
+- Per-row execution is per group row per subquery, with
+  no uncorrelated hoisting (the standing perf gap,
+  unchanged): an uncorrelated subquery inside an
+  aggregate argument re-executes for every group row.
+  Results are the pin's; only the cost differs.
+- Bare columns beside *multiple* min/max aggregates keep
+  hipp's first-row representative rule; the pin's choice
+  among extremum rows in that case is implementation
+  behaviour, unprobed and unchanged by this milestone
+  (the lone min/max rule — the documented one — is
+  differentially pinned, plain and subquery arguments
+  alike).
+- All pre-existing gaps stand: real-literal parsing may
+  differ by 1 ulp (RISKS R5); no merge / redistribution
+  on delete; WAL read stays gated on a real target
+  demanding it.
+
 ## v0.10 — NOT NULL enforcement (2026-10-28)
 
 **Status:** implemented, differential-tested against the

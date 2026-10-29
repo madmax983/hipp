@@ -8,15 +8,38 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.10 — NOT NULL enforcement on every write
-  path (INSERT / UPDATE / UPSERT with the pin's per-clause
-  semantics), on the v0.9 foundation (SPEC §2).
+- **Phase:** v0.11 — subqueries inside aggregate arguments
+  (`sum((SELECT ...))` and friends, evaluated per group
+  row), on the v0.10 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.11 does
+
+- Everything v0.10 does (below), plus **subqueries inside
+  aggregate arguments** behind the `v10` feature (default
+  on, implies `v09`; the tiny profile excludes it — the
+  feature ladder's next rung is `v10` because v0.10 itself
+  was an ungated correctness fix and took no rung). The
+  v0.6 plan-time refusal is lifted in every aggregate-
+  argument position: SELECT list, HAVING, and ORDER BY, in
+  top-level queries, subquery bodies, derived tables,
+  compound cores, and `INSERT INTO ... SELECT` sources.
+  The pin's semantics, probed before implementation: the
+  argument is evaluated **per group row** — each subquery
+  executes against that row (correlation binds the row,
+  and a no-FROM subquery reads the row's own columns), a
+  subquery yielding no row contributes NULL for that row,
+  and the aggregate folds the per-row values, DISTINCT and
+  group_concat separators included. Subqueries outside the
+  aggregate in the same expression still resolve against
+  the group's representative row, and a lone min/max over
+  a subquery argument keeps the bare-column rule (bare
+  columns read the extremum row, by the per-row value).
 
 ## What v0.10 does
 
@@ -227,9 +250,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.10) |
+| Gate | Budget | Measured (v0.11) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,872 B** (Δ +360 B vs v0.9's 89,512 B; NOT NULL enforcement is deliberately ungated — a correctness fix in the existing INSERT path, which the tiny profile includes — so the delta is the resolver plus the catalog `not_null` plumbing itself) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,872 B** (Δ **0 B** vs v0.10's 89,872 B; the v0.11 engine lives entirely behind the `v10` feature and the v04/v06-gated modules, so the tiny profile pays nothing for it) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
