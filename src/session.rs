@@ -1198,7 +1198,7 @@ impl<S: Storage> Connection<S> {
     /// numbering into the combined evaluation row. The
     /// subquery's own sources are numbered after all enclosing
     /// sources. Mirrors `plan_query`, including term resolution
-    /// and the aggregate-argument subquery refusal.
+    /// and the aggregate-argument subquery rule.
     #[cfg(feature = "v06")]
     fn plan_subquery(
         &self,
@@ -1510,9 +1510,10 @@ impl<S: Storage> Connection<S> {
                 ));
             }
         }
-        if items.iter().any(sub_in_agg_args)
-            || having.as_ref().is_some_and(sub_in_agg_args)
-            || order_by.iter().any(|(e, _)| sub_in_agg_args(e))
+        if cfg!(not(feature = "v10"))
+            && (items.iter().any(sub_in_agg_args)
+                || having.as_ref().is_some_and(sub_in_agg_args)
+                || order_by.iter().any(|(e, _)| sub_in_agg_args(e)))
         {
             return Err(Error::Unsupported);
         }
@@ -2526,11 +2527,13 @@ impl<S: Storage> Connection<S> {
                 ));
             }
         }
-        // A subquery inside an aggregate's arguments would need
-        // per-group-row execution; v0.6 refuses it at plan time.
-        if items.iter().any(sub_in_agg_args)
-            || having.as_ref().is_some_and(sub_in_agg_args)
-            || order_by.iter().any(|(e, _)| sub_in_agg_args(e))
+        // A subquery inside an aggregate's arguments needs
+        // per-group-row execution (v0.11, the `v10` feature);
+        // without it the plan is refused, as in v0.6.
+        if cfg!(not(feature = "v10"))
+            && (items.iter().any(sub_in_agg_args)
+                || having.as_ref().is_some_and(sub_in_agg_args)
+                || order_by.iter().any(|(e, _)| sub_in_agg_args(e)))
         {
             return Err(Error::Unsupported);
         }
@@ -5437,6 +5440,14 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Evaluate one expression for an aggregate group (v0.6):
     /// subqueries resolve against the group's representative
     /// row, exactly like bare columns.
+    ///
+    /// v0.11: a subquery inside an aggregate's arguments
+    /// resolves per group row instead — the aggregate's
+    /// arguments are evaluated for every row of the group
+    /// (each subquery correlated to that row), the fold runs
+    /// over those values, and the folded literal replaces the
+    /// aggregate node before the rest of the expression
+    /// evaluates against the representative row.
     #[cfg(feature = "v06")]
     async fn eval_group_sub(
         &mut self,
@@ -5447,10 +5458,179 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !crate::query::has_sub(e) {
             return crate::query::eval::<S::Error>(e, &Ctx::Group { rows, rep });
         }
-        let values = self.compute_sub_values(e, rep).await?;
+        if !crate::query::sub_in_agg_args(e) {
+            let values = self.compute_sub_values(e, rep).await?;
+            let mut pos = 0;
+            let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
+            return crate::query::eval::<S::Error>(&e2, &Ctx::Group { rows, rep });
+        }
+        // Per-group-row aggregate path (v0.11): fold every
+        // outermost aggregate over per-row argument values,
+        // substitute the outside-aggregate subqueries against
+        // the representative row, then evaluate synchronously.
+        let mut agg_exprs: AVec<&RExpr> = AVec::new();
+        crate::query::collect_outer_aggs(e, &mut agg_exprs);
+        let mut agg_values: AVec<OwnedValue> = AVec::new();
+        for a in agg_exprs.iter() {
+            agg_values.push(self.eval_agg_async(a, rows).await?);
+        }
+        let values = self.compute_sub_values_outside_agg(e, rep).await?;
         let mut pos = 0;
-        let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
+        let mut agg_pos = 0;
+        let e2 = crate::query::substitute_group(
+            e,
+            values.as_slice(),
+            &mut pos,
+            agg_values.as_slice(),
+            &mut agg_pos,
+        );
         crate::query::eval::<S::Error>(&e2, &Ctx::Group { rows, rep })
+    }
+
+    /// Fold one aggregate node over a group's rows, evaluating
+    /// its arguments per row through `eval_row_sub` so any
+    /// subquery in an argument is executed against that row
+    /// (v0.11). The fold itself is `query::eval_agg_values`,
+    /// shared with the synchronous evaluator.
+    #[cfg(feature = "v06")]
+    async fn eval_agg_async(
+        &mut self,
+        agg: &RExpr,
+        rows: &[RowData],
+    ) -> Result<OwnedValue, S::Error> {
+        let RExpr::Agg {
+            kind,
+            distinct,
+            star,
+            args,
+        } = agg
+        else {
+            return Err(Error::Unsupported);
+        };
+        let (kind, distinct, star) = (*kind, *distinct, *star);
+        let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
+        for r in rows {
+            let mut vs: AVec<OwnedValue> = AVec::new();
+            if !star {
+                for a in args.iter() {
+                    vs.push(self.eval_row_sub(a, r).await?);
+                }
+            }
+            arg_rows.push(vs);
+        }
+        crate::query::eval_agg_values::<S::Error>(kind, distinct, star, arg_rows.as_slice())
+    }
+
+    /// The representative row for a top-level query's group
+    /// (v0.11 wrapper over `pick_rep`): when the lone min/max
+    /// aggregate's argument contains a subquery, the extremum
+    /// search must execute that subquery per row, which the
+    /// synchronous `pick_rep` cannot do.
+    #[cfg(feature = "v06")]
+    async fn pick_rep_qp_async(
+        &mut self,
+        qp: &QueryPlan,
+        grows: &[RowData],
+        empty_rep: &RowData,
+    ) -> Result<RowData, S::Error> {
+        if grows.is_empty() {
+            return Ok(empty_rep.clone());
+        }
+        let mut aggs: AVec<&RExpr> = AVec::new();
+        for it in qp.items.iter() {
+            crate::query::collect_aggs(it, &mut aggs);
+        }
+        if let Some(h) = &qp.having {
+            crate::query::collect_aggs(h, &mut aggs);
+        }
+        if aggs.len() == 1
+            && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
+            && matches!(kind, crate::query::AggKind::Min | crate::query::AggKind::Max)
+            && !args.is_empty()
+            && crate::query::has_sub(&args.as_slice()[0])
+        {
+            return self
+                .extremum_rep(*kind, &args.as_slice()[0], grows, empty_rep)
+                .await;
+        }
+        pick_rep::<S::Error>(qp, grows, empty_rep)
+    }
+
+    /// The `pick_rep_qp_async` mirror for a subquery's group.
+    #[cfg(feature = "v06")]
+    async fn pick_rep_sub_async(
+        &mut self,
+        plan: &crate::query::SubPlan,
+        grows: &[RowData],
+        empty_rep: &RowData,
+    ) -> Result<RowData, S::Error> {
+        if grows.is_empty() {
+            return Ok(empty_rep.clone());
+        }
+        let mut aggs: AVec<&RExpr> = AVec::new();
+        for it in plan.items.iter() {
+            crate::query::collect_aggs(it, &mut aggs);
+        }
+        if let Some(h) = &plan.having {
+            crate::query::collect_aggs(h, &mut aggs);
+        }
+        if aggs.len() == 1
+            && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
+            && matches!(kind, crate::query::AggKind::Min | crate::query::AggKind::Max)
+            && !args.is_empty()
+            && crate::query::has_sub(&args.as_slice()[0])
+        {
+            return self
+                .extremum_rep(*kind, &args.as_slice()[0], grows, empty_rep)
+                .await;
+        }
+        pick_rep_sub::<S::Error>(plan, grows, empty_rep)
+    }
+
+    /// The extremum row of a group under one min/max aggregate
+    /// whose argument is evaluated per row through
+    /// `eval_row_sub` (v0.11): NULL arguments never win, and a
+    /// group with no non-NULL argument keeps its first row —
+    /// the synchronous `pick_rep` rule, with per-row subquery
+    /// execution.
+    #[cfg(feature = "v06")]
+    async fn extremum_rep(
+        &mut self,
+        kind: crate::query::AggKind,
+        arg: &RExpr,
+        grows: &[RowData],
+        empty_rep: &RowData,
+    ) -> Result<RowData, S::Error> {
+        if grows.is_empty() {
+            return Ok(empty_rep.clone());
+        }
+        let mut best: Option<&RowData> = None;
+        let mut bestv: Option<OwnedValue> = None;
+        for r in grows {
+            let v = self.eval_row_sub(arg, r).await?;
+            if matches!(v, OwnedValue::Null) {
+                continue;
+            }
+            let take = match &bestv {
+                None => true,
+                Some(b) => {
+                    let o = crate::record::compare_values(&v.as_value(), &b.as_value());
+                    if kind == crate::query::AggKind::Min {
+                        o == core::cmp::Ordering::Less
+                    } else {
+                        o == core::cmp::Ordering::Greater
+                    }
+                }
+            };
+            if take {
+                best = Some(r);
+                bestv = Some(v);
+            }
+        }
+        match best {
+            Some(b) => Ok(b.clone()),
+            None => Ok(grows[0].clone()),
+        }
     }
 
     /// Execute every current-scope subquery node of `e` for the
@@ -5464,6 +5644,51 @@ impl<'c, S: Storage> Statement<'c, S> {
         use crate::query::{SubKind, SubValue, collect_subs};
         let mut kinds: AVec<SubKind<'_>> = AVec::new();
         collect_subs(e, &mut kinds);
+        let mut out: AVec<SubValue> = AVec::new();
+        for k in kinds.iter() {
+            match k {
+                SubKind::Scalar(plan) => {
+                    let rows = self.exec_subplan(plan, outer).await?;
+                    out.push(SubValue::One(
+                        match rows.as_slice().first() {
+                            Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
+                            None => OwnedValue::Null,
+                        },
+                        crate::query::result_affinity(plan),
+                    ));
+                }
+                SubKind::Exists(plan) => {
+                    let rows = self.exec_subplan(plan, outer).await?;
+                    out.push(SubValue::One(
+                        OwnedValue::Integer(if rows.is_empty() { 0 } else { 1 }),
+                        None,
+                    ));
+                }
+                SubKind::In(plan) => {
+                    let rows = self.exec_subplan(plan, outer).await?;
+                    let mut vs = AVec::new();
+                    for r in rows.iter() {
+                        vs.push(r.as_slice().first().cloned().unwrap_or(OwnedValue::Null));
+                    }
+                    out.push(SubValue::Many(vs, crate::query::result_affinity(plan)));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Execute the subquery nodes of `e` that lie OUTSIDE any
+    /// aggregate's arguments, for the outer row `outer`, in
+    /// `collect_subs_outside_agg` traversal order (v0.11).
+    #[cfg(feature = "v06")]
+    async fn compute_sub_values_outside_agg(
+        &mut self,
+        e: &RExpr,
+        outer: &RowData,
+    ) -> Result<AVec<crate::query::SubValue>, S::Error> {
+        use crate::query::{SubKind, SubValue, collect_subs_outside_agg};
+        let mut kinds: AVec<SubKind<'_>> = AVec::new();
+        collect_subs_outside_agg(e, &mut kinds);
         let mut out: AVec<SubValue> = AVec::new();
         for k in kinds.iter() {
             match k {
@@ -5940,7 +6165,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         }
         for (_, grows) in groups.iter() {
-            let rep = pick_rep::<S::Error>(qp, grows.as_slice(), &empty_rep)?;
+            let rep = self
+                .pick_rep_qp_async(qp, grows.as_slice(), &empty_rep)
+                .await?;
             if let Some(h) = &qp.having
                 && crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
                     != Some(true)
@@ -6056,7 +6283,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         }
         for (_, grows) in groups.iter() {
-            let rep = pick_rep_sub::<S::Error>(plan, grows.as_slice(), &empty_rep)?;
+            let rep = self
+                .pick_rep_sub_async(plan, grows.as_slice(), &empty_rep)
+                .await?;
             if let Some(h) = &plan.having
                 && crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
                     != Some(true)
@@ -6625,9 +6854,10 @@ fn query_plan_has_sub(qp: &QueryPlan) -> bool {
 
 /// The representative row of a subquery's group (v0.6): the
 /// `pick_rep` rule (first row, or the extremum row of a lone
-/// min/max aggregate) over combined rows. Aggregate arguments
-/// are subquery-free by the plan-time check, so plain
-/// synchronous evaluation suffices here.
+/// min/max aggregate) over combined rows. When the lone
+/// min/max argument contains a subquery (v0.11), the caller
+/// goes through `pick_rep_sub_async` instead — this
+/// synchronous form only evaluates subquery-free arguments.
 #[cfg(feature = "v06")]
 fn pick_rep_sub<E>(
     plan: &crate::query::SubPlan,

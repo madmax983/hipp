@@ -4,13 +4,13 @@ resolver = "2"
 
 [package]
 name = "hipp"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
-default = ["std", "indexes", "v04", "v05", "v06", "v07", "v08", "v09"]
+default = ["std", "indexes", "v04", "v05", "v06", "v07", "v08", "v09", "v10"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
 # Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
@@ -55,6 +55,15 @@ v08 = ["v07"]
 # INSERT ... SELECT sources through the subquery planner), so it
 # implies `v08`. The tiny profile excludes it per §2.
 v09 = ["v08"]
+# v0.11 dialect: subqueries inside aggregate arguments
+# (sum((SELECT ...)) and friends, evaluated per group row).
+# The feature ladder's next rung is v10 -- the v0.10 milestone
+# itself was an ungated correctness fix and took no rung.
+# Builds on the v0.9 compound/derived machinery (an aggregate
+# argument's subquery may itself be a compound or contain
+# aggregates over derived tables), so it implies `v09`. The
+# tiny profile excludes it per §2.
+v10 = ["v09"]
 
 [dependencies]
 

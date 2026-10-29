@@ -1148,8 +1148,9 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
 }
 
 /// Whether a subquery node occurs inside an aggregate's
-/// arguments (v0.6): such subqueries would need per-group-row
-/// execution, which v0.6 refuses at plan time with
+/// arguments: such subqueries need per-group-row execution
+/// (v0.11, behind the `v10` feature). Without that feature the
+/// planners refuse them at plan time with
 /// `Error::Unsupported` rather than mis-evaluating.
 pub fn sub_in_agg_args(e: &RExpr) -> bool {
     match e {
@@ -1182,6 +1183,262 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
                 || otherwise.as_ref().is_some_and(|o| sub_in_agg_args(o))
         }
         RExpr::Scalar(_, args) => args.iter().any(sub_in_agg_args),
+    }
+}
+
+/// Collect the *outermost* aggregate nodes of `e` (v0.11),
+/// in the traversal order `substitute_group` consumes them:
+/// like `collect_aggs`, but an aggregate's own arguments are
+/// not descended into (a nested aggregate there is a misuse
+/// the evaluator refuses, not a second fold). Subquery
+/// interiors are a separate grouping scope, as in
+/// `collect_aggs`.
+pub fn collect_outer_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+    match e {
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => {}
+        RExpr::InSub(x, _, _) => collect_outer_aggs(x, out),
+        RExpr::Agg { .. } => out.push(e),
+        RExpr::Binary(_, a, b) => {
+            collect_outer_aggs(a, out);
+            collect_outer_aggs(b, out);
+        }
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            collect_outer_aggs(a, out)
+        }
+        RExpr::InList(x, l, _) => {
+            collect_outer_aggs(x, out);
+            for i in l.iter() {
+                collect_outer_aggs(i, out);
+            }
+        }
+        RExpr::Between(x, a, b, _) => {
+            collect_outer_aggs(x, out);
+            collect_outer_aggs(a, out);
+            collect_outer_aggs(b, out);
+        }
+        RExpr::Like(a, b, _) => {
+            collect_outer_aggs(a, out);
+            collect_outer_aggs(b, out);
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            if let Some(b) = base {
+                collect_outer_aggs(b, out);
+            }
+            for (w, t) in whens.iter() {
+                collect_outer_aggs(w, out);
+                collect_outer_aggs(t, out);
+            }
+            if let Some(o) = otherwise {
+                collect_outer_aggs(o, out);
+            }
+        }
+        RExpr::Scalar(_, args) => {
+            for a in args.iter() {
+                collect_outer_aggs(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the current-scope subquery nodes of `e` that lie
+/// OUTSIDE any aggregate's arguments (v0.11), in the order
+/// `substitute_group` consumes them. Aggregate interiors are
+/// skipped entirely: their subqueries are computed per group
+/// row by the executor, never against the representative row.
+pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
+    match e {
+        RExpr::SubScalar(p) => out.push(SubKind::Scalar(p)),
+        RExpr::SubExists(p) => out.push(SubKind::Exists(p)),
+        RExpr::InSub(x, p, _) => {
+            collect_subs_outside_agg(x, out);
+            out.push(SubKind::In(p));
+        }
+        RExpr::Agg { .. }
+        | RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => {}
+        RExpr::Binary(_, a, b) => {
+            collect_subs_outside_agg(a, out);
+            collect_subs_outside_agg(b, out);
+        }
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            collect_subs_outside_agg(a, out)
+        }
+        RExpr::InList(x, l, _) => {
+            collect_subs_outside_agg(x, out);
+            for i in l.iter() {
+                collect_subs_outside_agg(i, out);
+            }
+        }
+        RExpr::Between(x, a, b, _) => {
+            collect_subs_outside_agg(x, out);
+            collect_subs_outside_agg(a, out);
+            collect_subs_outside_agg(b, out);
+        }
+        RExpr::Like(a, b, _) => {
+            collect_subs_outside_agg(a, out);
+            collect_subs_outside_agg(b, out);
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            if let Some(b) = base {
+                collect_subs_outside_agg(b, out);
+            }
+            for (w, t) in whens.iter() {
+                collect_subs_outside_agg(w, out);
+                collect_subs_outside_agg(t, out);
+            }
+            if let Some(o) = otherwise {
+                collect_subs_outside_agg(o, out);
+            }
+        }
+        RExpr::Scalar(_, args) => {
+            for a in args.iter() {
+                collect_subs_outside_agg(a, out);
+            }
+        }
+    }
+}
+
+/// Rebuild a group expression for synchronous evaluation
+/// (v0.11): every outermost aggregate node is replaced by the
+/// literal of its already-computed fold (consumed from
+/// `agg_values` in `collect_outer_aggs` order), and every
+/// subquery node outside an aggregate's arguments is replaced
+/// by its representative-row value (consumed from `values` in
+/// `collect_subs_outside_agg` order). Subqueries INSIDE an
+/// aggregate were folded into that aggregate's value per
+/// group row by the executor, so nothing of them remains.
+/// The result contains no aggregate and no subquery node, so
+/// bare columns read the representative row exactly as in a
+/// plain group evaluation.
+pub fn substitute_group(
+    e: &RExpr,
+    values: &[SubValue],
+    pos: &mut usize,
+    agg_values: &[OwnedValue],
+    agg_pos: &mut usize,
+) -> RExpr {
+    match e {
+        RExpr::Agg { .. } => {
+            let v = agg_values[*agg_pos].clone();
+            *agg_pos += 1;
+            RExpr::Literal(v)
+        }
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => {
+            let v = match &values[*pos] {
+                SubValue::One(v, aff) => match aff {
+                    Some(a) => RExpr::AffLiteral(v.clone(), *a),
+                    None => RExpr::Literal(v.clone()),
+                },
+                SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
+            };
+            *pos += 1;
+            v
+        }
+        RExpr::InSub(x, _, neg) => {
+            let sx = substitute_group(x, values, pos, agg_values, agg_pos);
+            let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
+                Some(a) => RExpr::AffLiteral(v.clone(), *a),
+                None => RExpr::Literal(v.clone()),
+            };
+            let list = match &values[*pos] {
+                SubValue::Many(vs, aff) => {
+                    let mut out = AVec::new();
+                    for v in vs.iter() {
+                        out.push(wrap(v, aff));
+                    }
+                    out
+                }
+                SubValue::One(v, aff) => {
+                    let mut out = AVec::new();
+                    out.push(wrap(v, aff));
+                    out
+                }
+            };
+            *pos += 1;
+            RExpr::InList(Box::new(sx), list, *neg)
+        }
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => e.clone(),
+        RExpr::Binary(op, a, b) => RExpr::Binary(
+            *op,
+            Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
+            Box::new(substitute_group(b, values, pos, agg_values, agg_pos)),
+        ),
+        RExpr::Neg(a) => RExpr::Neg(Box::new(substitute_group(a, values, pos, agg_values, agg_pos))),
+        RExpr::Not(a) => RExpr::Not(Box::new(substitute_group(a, values, pos, agg_values, agg_pos))),
+        RExpr::IsNull(a, neg) => RExpr::IsNull(
+            Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
+            *neg,
+        ),
+        RExpr::InList(x, l, neg) => {
+            let sx = substitute_group(x, values, pos, agg_values, agg_pos);
+            let mut out = AVec::new();
+            for i in l.iter() {
+                out.push(substitute_group(i, values, pos, agg_values, agg_pos));
+            }
+            RExpr::InList(Box::new(sx), out, *neg)
+        }
+        RExpr::Between(x, a, b, neg) => RExpr::Between(
+            Box::new(substitute_group(x, values, pos, agg_values, agg_pos)),
+            Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
+            Box::new(substitute_group(b, values, pos, agg_values, agg_pos)),
+            *neg,
+        ),
+        RExpr::Like(a, b, neg) => RExpr::Like(
+            Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
+            Box::new(substitute_group(b, values, pos, agg_values, agg_pos)),
+            *neg,
+        ),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            let sbase = base
+                .as_ref()
+                .map(|b| Box::new(substitute_group(b, values, pos, agg_values, agg_pos)));
+            let mut ws = AVec::new();
+            for (w, t) in whens.iter() {
+                ws.push((
+                    substitute_group(w, values, pos, agg_values, agg_pos),
+                    substitute_group(t, values, pos, agg_values, agg_pos),
+                ));
+            }
+            let sother = otherwise
+                .as_ref()
+                .map(|o| Box::new(substitute_group(o, values, pos, agg_values, agg_pos)));
+            RExpr::Case {
+                base: sbase,
+                whens: ws,
+                otherwise: sother,
+            }
+        }
+        RExpr::Scalar(f, args) => {
+            let mut out = AVec::new();
+            for a in args.iter() {
+                out.push(substitute_group(a, values, pos, agg_values, agg_pos));
+            }
+            RExpr::Scalar(*f, out)
+        }
+        RExpr::Cast(a, aff) => RExpr::Cast(
+            Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
+            *aff,
+        ),
     }
 }
 
@@ -1989,7 +2246,8 @@ fn sum_number(v: &OwnedValue) -> Num {
     }
 }
 
-/// Fold one aggregate over a group's rows.
+/// Fold one aggregate over a group's rows: evaluate the
+/// arguments per row (synchronously) and fold the values.
 fn eval_agg<E>(
     kind: AggKind,
     distinct: bool,
@@ -1997,23 +2255,49 @@ fn eval_agg<E>(
     args: &[RExpr],
     rows: &[RowData],
 ) -> Result<OwnedValue, E> {
+    let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
+    for r in rows {
+        let mut vs: AVec<OwnedValue> = AVec::new();
+        if !star {
+            for a in args {
+                vs.push(eval::<E>(a, &Ctx::as_row(r))?);
+            }
+        }
+        arg_rows.push(vs);
+    }
+    eval_agg_values::<E>(kind, distinct, star, arg_rows.as_slice())
+}
+
+/// Fold one aggregate over precomputed per-row argument
+/// values (v0.11): `arg_rows` holds, per group row, the values
+/// of the aggregate's arguments for that row (empty for
+/// `count(*)`). This is the single folding implementation:
+/// the synchronous evaluator reaches it through `eval_agg`,
+/// and the subquery executor reaches it with argument values
+/// whose subqueries were executed per group row.
+pub fn eval_agg_values<E>(
+    kind: AggKind,
+    distinct: bool,
+    star: bool,
+    arg_rows: &[AVec<OwnedValue>],
+) -> Result<OwnedValue, E> {
     match kind {
         AggKind::Count => {
             if star {
-                return Ok(OwnedValue::Integer(rows.len() as i64));
+                return Ok(OwnedValue::Integer(arg_rows.len() as i64));
             }
             let mut n = 0i64;
             let mut seen: AVec<OwnedValue> = AVec::new();
-            for r in rows {
-                let val = eval::<E>(&args[0], &Ctx::as_row(r))?;
+            for vs in arg_rows {
+                let val = &vs.as_slice()[0];
                 if matches!(val, OwnedValue::Null) {
                     continue;
                 }
                 if distinct {
-                    if seen.iter().any(|s| values_equal_is(s, &val)) {
+                    if seen.iter().any(|s| values_equal_is(s, val)) {
                         continue;
                     }
-                    seen.push(val);
+                    seen.push(val.clone());
                 }
                 n += 1;
             }
@@ -2025,23 +2309,23 @@ fn eval_agg<E>(
             let mut real_acc = 0.0f64;
             let mut count = 0i64;
             let mut seen: AVec<OwnedValue> = AVec::new();
-            for r in rows {
-                let val = eval::<E>(&args[0], &Ctx::as_row(r))?;
+            for vs in arg_rows {
+                let val = &vs.as_slice()[0];
                 if matches!(val, OwnedValue::Null) {
                     continue;
                 }
                 if distinct {
-                    if seen.iter().any(|s| values_equal_is(s, &val)) {
+                    if seen.iter().any(|s| values_equal_is(s, val)) {
                         continue;
                     }
                     seen.push(val.clone());
                 }
                 count += 1;
-                match Some(sum_number(&val)) {
-                    Some(Num::Int(i)) => {
+                match sum_number(val) {
+                    Num::Int(i) => {
                         if int_ok {
                             match int_acc.checked_add(i) {
-                                Some(s) => int_acc = s,
+                                Some(s2) => int_acc = s2,
                                 None => {
                                     int_ok = false;
                                     real_acc = int_acc as f64 + i as f64;
@@ -2051,7 +2335,7 @@ fn eval_agg<E>(
                             real_acc += i as f64;
                         }
                     }
-                    Some(Num::Real(x)) => {
+                    Num::Real(x) => {
                         if int_ok {
                             int_ok = false;
                             real_acc = int_acc as f64 + x;
@@ -2059,7 +2343,6 @@ fn eval_agg<E>(
                             real_acc += x;
                         }
                     }
-                    None => {}
                 }
             }
             if count == 0 {
@@ -2086,8 +2369,8 @@ fn eval_agg<E>(
         AggKind::Min | AggKind::Max => {
             let mut best: Option<OwnedValue> = None;
             let mut seen: AVec<OwnedValue> = AVec::new();
-            for r in rows {
-                let val = eval::<E>(&args[0], &Ctx::as_row(r))?;
+            for vs in arg_rows {
+                let val = vs.as_slice()[0].clone();
                 if matches!(val, OwnedValue::Null) {
                     continue;
                 }
@@ -2116,21 +2399,21 @@ fn eval_agg<E>(
             let mut out = AVec::new();
             let mut any = false;
             let mut seen: AVec<OwnedValue> = AVec::new();
-            for r in rows {
-                let val = eval::<E>(&args[0], &Ctx::as_row(r))?;
+            for vs in arg_rows {
+                let val = &vs.as_slice()[0];
                 if matches!(val, OwnedValue::Null) {
                     continue;
                 }
                 if distinct {
-                    if seen.iter().any(|s| values_equal_is(s, &val)) {
+                    if seen.iter().any(|s| values_equal_is(s, val)) {
                         continue;
                     }
                     seen.push(val.clone());
                 }
-                let sep = if args.len() > 1 {
-                    match eval::<E>(&args[1], &Ctx::as_row(r))? {
+                let sep = if vs.len() > 1 {
+                    match &vs.as_slice()[1] {
                         OwnedValue::Null => return Ok(OwnedValue::Null),
-                        s => to_text(&s).unwrap_or_default(),
+                        s => to_text(s).unwrap_or_default(),
                     }
                 } else {
                     let mut c = AVec::new();
@@ -2140,7 +2423,7 @@ fn eval_agg<E>(
                 if any {
                     out.extend_from_slice(sep.as_slice());
                 }
-                out.extend_from_slice(to_text(&val).unwrap_or_default().as_slice());
+                out.extend_from_slice(to_text(val).unwrap_or_default().as_slice());
                 any = true;
             }
             if !any {
