@@ -3058,12 +3058,12 @@ fn literal_rowid(arena: &Arena, lit: Literal) -> Access {
             if let Ok(i) = s.parse::<i64>() {
                 return Access::Rowid(i);
             }
-            match s.parse::<f64>() {
-                Ok(f) => match integral_f64(f) {
+            match crate::sql::lexer::parse_real_signed(s.as_bytes()) {
+                Some(f) => match integral_f64(f) {
                     Some(i) => Access::Rowid(i),
                     None => Access::Empty,
                 },
-                Err(_) => Access::Empty,
+                None => Access::Empty,
             }
         }
         _ => Access::Empty,

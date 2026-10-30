@@ -506,11 +506,10 @@ pub fn text_to_number(t: &[u8]) -> Option<OwnedValue> {
     // Strict real check: must look like a number, not "inf"/"nan".
     let bytes = s.as_bytes();
     let mut has_digit = false;
-    let mut has_dot_or_exp = false;
     for (i, c) in bytes.iter().enumerate() {
         match c {
             b'0'..=b'9' => has_digit = true,
-            b'.' | b'e' | b'E' => has_dot_or_exp = true,
+            b'.' | b'e' | b'E' => {}
             b'+' | b'-' => {
                 if i != 0 && !matches!(bytes[i - 1], b'e' | b'E') {
                     return None;
@@ -519,10 +518,11 @@ pub fn text_to_number(t: &[u8]) -> Option<OwnedValue> {
             _ => return None,
         }
     }
-    if has_digit
-        && has_dot_or_exp
-        && let Ok(r) = s.parse::<f64>()
-    {
+    if has_digit && let Some(r) = crate::sql::lexer::parse_real_signed(bytes) {
+        // The exact decimal conversion (v0.12) serves both the
+        // real-literal shape and the pure-integer shape: integer
+        // text reaches here only when it overflowed i64 above,
+        // and the oracle converts such text to a REAL as well.
         return Some(OwnedValue::Real(r));
     }
     None

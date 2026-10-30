@@ -1518,9 +1518,9 @@ pub fn parse_num_prefix(t: &[u8]) -> Option<Num> {
         // Integer literal too large for i64: SQLite saturates for
         // CAST, and yields a real for arithmetic. Use real here;
         // the CAST-to-integer path clamps separately.
-        return text.parse::<f64>().ok().map(Num::Real);
+        return crate::sql::lexer::parse_real_signed(text.as_bytes()).map(Num::Real);
     }
-    text.parse::<f64>().ok().map(Num::Real)
+    crate::sql::lexer::parse_real_signed(text.as_bytes()).map(Num::Real)
 }
 
 /// The number a value converts to for arithmetic: NULL stays NULL
