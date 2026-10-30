@@ -8,16 +8,42 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.12 — real-literal parsing exactness
-  (RISKS R5 closed: decimal→REAL conversion reproduces
-  the pinned oracle bit-for-bit), on the v0.11
-  foundation (SPEC §2).
+- **Phase:** v0.13 — uncorrelated-subquery hoisting
+  (an uncorrelated subquery executes once per statement,
+  not once per outer row — and the pin's per-statement
+  snapshot semantics now hold on the write side too),
+  on the v0.12 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.13 does
+
+- Everything v0.12 does (below), plus **uncorrelated-
+  subquery hoisting** — a performance milestone that
+  also fixes a wrong answer. It is *not* feature-gated:
+  it changes no dialect surface, only how often existing
+  subquery plans execute (the tiny profile has no
+  subqueries either way). At plan time the scoped
+  resolver's absolute slot numbering decides whether a
+  subquery plan references any enclosing scope; if not,
+  the executor computes it on first use in a statement,
+  caches the scalar / IN-list / EXISTS result under the
+  plan's node id, and serves every other outer row (or
+  group row, inside aggregate arguments) from the cache.
+  Probing the pin first showed why this is also
+  correctness: SQLite fixes an uncorrelated subquery's
+  value for the whole statement, so `UPDATE t SET a =
+  (SELECT sum(a) FROM t)` writes the pre-statement sum
+  to every row — the per-row engine wrote a climbing
+  6, 11, 20 instead. The win is asserted, not timed:
+  `Connection::subquery_executions()` counts subquery
+  plan executions, and the suite pins an uncorrelated
+  node over 200 rows at exactly 1 (a correlated control
+  stays at exactly 200).
 
 ## What v0.12 does
 
@@ -275,9 +301,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.12) |
+| Gate | Budget | Measured (v0.13) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **72,732 B** (Δ **−17,140 B** vs v0.11's 89,872 B; the v0.12 converter is ungated, but routing the affinity path off `core`'s f64 text parser removes its tables and code from the tiny link) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **72,704 B** (Δ **−28 B** vs v0.12's 72,732 B; the hoisting machinery is compiled out of the tiny profile with the rest of the subquery paths, and the delta is dead-code noise) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

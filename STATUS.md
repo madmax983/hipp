@@ -4,6 +4,136 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.13 — uncorrelated-subquery hoisting (2026-10-30)
+
+**Status:** implemented, differential-tested against the
+pinned oracle, and gated (below). An uncorrelated scalar /
+IN / EXISTS subquery — including inside aggregate
+arguments — is now executed **once per statement
+execution** and its result cached, instead of
+re-executing once per outer row (per group row for
+aggregate arguments). This is deliberately **not**
+feature-gated: it adds no dialect surface, only an
+execution strategy for the existing v0.6/v0.11 paths
+(the tiny profile has no subqueries either way), and —
+per the probing notes — the per-row strategy was not
+merely slow on the write side, it was *wrong*.
+
+### Shipped
+
+- **Plan-time correlation verdict** (`query.rs`): every
+  `SubPlan` is stamped by the session planner with a
+  unique node `id` and an `uncorrelated` flag. Resolved
+  expressions index the combined (enclosing ++ own)
+  evaluation row in absolute slots, so correlation is
+  decidable exactly: `plan_is_uncorrelated` walks the
+  plan — items, filter, grouping, having, ordering, ON
+  expressions, derived sources, VALUES rows, compound
+  tails, and nested subquery plans recursively, all
+  against the same absolute threshold — and reports
+  whether anything references a slot or rowid source
+  belonging to an enclosing scope.
+- **Statement-scoped result cache** (`session.rs`):
+  `compute_sub_values` / `compute_sub_values_outside_agg`
+  route through `sub_value_for`, which serves an
+  uncorrelated plan from the statement's hoist cache
+  after its first computation (keyed by node id, which
+  survives the executor's per-execution plan clones, so
+  nested uncorrelated nodes hoist too). The cache is
+  cleared when a fresh statement execution begins.
+  Correlated plans take the exact pre-v0.13 per-row path.
+- **Execution counter**: `Connection::subquery_executions()`
+  counts `exec_subplan` calls on the connection, so the
+  win is asserted in tests without timing: an
+  uncorrelated node over 200 outer rows contributes
+  exactly 1 execution; a correlated EXISTS control
+  contributes exactly 200.
+
+### Oracle-probing notes (verified on the 3.54.1 pin
+before implementation)
+
+- **The pin fixes an uncorrelated subquery's value for
+  the whole statement**, including when the statement
+  writes the subquery's own table:
+  `UPDATE t SET a = (SELECT sum(a) FROM t)` over
+  (1,2,3,4) yields 10 on every row;
+  `DELETE ... WHERE a = (SELECT min(a) FROM t)` deletes
+  only the one minimum row; a multi-row
+  `INSERT ... VALUES ((SELECT max(a) FROM t) + 1), ...`
+  inserts the same value for every row; and
+  `INSERT INTO u SELECT (SELECT max(x) FROM u) + 1 FROM t`
+  inserts the statement-start maximum for every source
+  row.
+- **The v0.12 engine diverged on the UPDATE case**
+  (probed on the pre-v0.13 tree): it produced
+  6, 11, 20 over (1,2,3) — each row's SET subquery
+  re-evaluated against the rows already written. The
+  DELETE / INSERT cases already matched, because those
+  paths collect their row sets (or value rows) before
+  mutating. Hoisting — first use computes the
+  pre-write snapshot, every later row reuses it —
+  closes the UPDATE divergence as a side effect of the
+  optimisation. No other silent divergences were found:
+  the full read/write corpora below are identical to
+  the pin.
+
+### Gates (run on the final tree)
+
+- `cargo test --workspace`: **178 passed, 0 failed**
+  (171 at v0.12 + 5 new core tests in
+  `tests/hoist_v13.rs` + 2 new CLI tests in
+  `hipp-cli/tests/cli_v13.rs`), re-run green on the
+  COMMITTED tree (clean status; see the loop status
+  for the recorded run). The core suite covers
+  read-side identity (scalar / IN / EXISTS in every
+  position, empty and multi-row scalar results,
+  deterministic expressions inside the subquery,
+  compound and derived-table cores, correlated
+  controls), aggregate-argument hoisting, the
+  write-snapshot matrix above applied to twin files,
+  and the execution-count assertions. A1–A11 stay
+  green.
+- CLI: read and write-snapshot corpora byte-identical
+  to the oracle, one-shot and over stdin; hipp-written
+  files pass the oracle's `integrity_check`.
+- `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean. `cargo fmt` (write mode): clean
+  tree afterwards. Feature matrix compiles: default,
+  no-default, std-only, v04..v10 ladders, indexes-only,
+  indexes+v05, all-features; lib tests pass under
+  no-default-features. (The tiny thumb build shows the
+  same 3 pre-existing feature-combination warnings as
+  the base; none are new.)
+
+### Size (ratchet)
+
+- thumbv7em-none-eabihf `tiny`: **.text 70,012 +
+  .rodata 2,692 = 72,704 B of 128 KiB budget**, Δ
+  **−28 B** vs v0.12's 72,732 B — a shrink (dead-code
+  noise), no justification needed. The hoisting
+  machinery lives entirely in the `v06`-gated paths
+  the tiny profile excludes. Engine statics 0 B (.bss
+  98,308 B = demo heap, unchanged). Headroom
+  remaining: 58,368 B.
+
+### Honest gaps (v0.13)
+
+- The only remaining recorded candidate is
+  performance: no merge / redistribution on delete.
+  WAL read stays gated on a real target demanding it.
+- Hoisting is all-or-nothing per plan node against
+  *every* enclosing scope: a subquery bound only to an
+  outer scope but nested inside a correlated plan is
+  re-executed per execution of that plan (its value
+  genuinely varies there), and FROM-clause derived
+  tables inside a subquery still materialise per outer
+  row even when uncorrelated — expression subqueries
+  were this milestone's scope.
+- There are no volatile scalar functions in the
+  claimed dialect (no `random()`, no clock functions),
+  so a cached result can never go stale within a
+  statement for nondeterminism reasons.
+
 ## v0.12 — real-literal parsing exactness (2026-10-29)
 
 **Status:** implemented, differential-tested against the
