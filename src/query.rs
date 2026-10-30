@@ -260,6 +260,23 @@ pub struct SubPlan {
     /// Per-result-item ORDER BY name keys (v0.9; see the
     /// session's `QueryPlan::order_names`).
     pub order_names: AVec<OrderName>,
+    /// Plan-node identity (v0.13): unique across every
+    /// `SubPlan` planned in this process, assigned by the
+    /// session planner. Clones keep the id, which is what
+    /// makes a plan node recognisable across the executor's
+    /// per-execution plan clones. `0` is never assigned.
+    pub id: usize,
+    /// Uncorrelated at plan time (v0.13): no expression in
+    /// this plan — its own cores, nested subqueries, derived
+    /// sources, VALUES rows, compound tails — references a
+    /// column slot or rowid source belonging to any enclosing
+    /// scope (see `plan_is_uncorrelated`). The executor may
+    /// execute such a plan once per statement and cache the
+    /// result; the pinned oracle fixes an uncorrelated
+    /// subquery's value for the whole statement (probed:
+    /// `UPDATE t SET a = (SELECT sum(a) FROM t)` yields the
+    /// pre-statement sum on every row).
+    pub uncorrelated: bool,
 }
 
 /// One result item's compound ORDER BY name key (v0.9):
@@ -276,6 +293,121 @@ impl SubPlan {
             None => self.items.len(),
         }
     }
+}
+
+/// Whether expression `e` references any column slot below
+/// `width` or any rowid source below `srcs` (v0.13). Slot and
+/// source indices in resolved expressions are absolute
+/// positions in the combined (enclosing ++ own) evaluation
+/// row, so a reference below the threshold is exactly a
+/// reference bound to an enclosing scope. Nested subquery
+/// plans are walked with the same absolute threshold: their
+/// interiors index the same combined row.
+pub fn expr_refs_below(e: &RExpr, width: usize, srcs: usize) -> bool {
+    match e {
+        RExpr::Column(slot, _) => *slot < width,
+        RExpr::Rowid(src) => *src < srcs,
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_below(p, width, srcs),
+        RExpr::InSub(x, p, _) => expr_refs_below(x, width, srcs) || plan_refs_below(p, width, srcs),
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => false,
+        RExpr::Binary(_, a, b) => {
+            expr_refs_below(a, width, srcs) || expr_refs_below(b, width, srcs)
+        }
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            expr_refs_below(a, width, srcs)
+        }
+        RExpr::InList(x, l, _) => {
+            expr_refs_below(x, width, srcs) || l.iter().any(|i| expr_refs_below(i, width, srcs))
+        }
+        RExpr::Between(x, a, b, _) => {
+            expr_refs_below(x, width, srcs)
+                || expr_refs_below(a, width, srcs)
+                || expr_refs_below(b, width, srcs)
+        }
+        RExpr::Like(a, b, _) => expr_refs_below(a, width, srcs) || expr_refs_below(b, width, srcs),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_ref()
+                .is_some_and(|b| expr_refs_below(b, width, srcs))
+                || whens.iter().any(|(w, t)| {
+                    expr_refs_below(w, width, srcs) || expr_refs_below(t, width, srcs)
+                })
+                || otherwise
+                    .as_ref()
+                    .is_some_and(|o| expr_refs_below(o, width, srcs))
+        }
+        RExpr::Scalar(_, args) => args.iter().any(|a| expr_refs_below(a, width, srcs)),
+        RExpr::Agg { args, .. } => args.iter().any(|a| expr_refs_below(a, width, srcs)),
+    }
+}
+
+/// Whether any part of plan `p` references a column slot
+/// below `width` or a rowid source below `srcs` (v0.13):
+/// its cores' items / filter / grouping / having / ordering,
+/// its sources' ON expressions and derived subplans, its
+/// VALUES rows, and its compound tails — recursively, with
+/// the same absolute threshold throughout.
+pub fn plan_refs_below(p: &SubPlan, width: usize, srcs: usize) -> bool {
+    for s in p.sources.iter() {
+        if let Some(on) = &s.on
+            && expr_refs_below(on, width, srcs)
+        {
+            return true;
+        }
+        if let Some(d) = &s.derived
+            && plan_refs_below(d, width, srcs)
+        {
+            return true;
+        }
+    }
+    if p.items.iter().any(|e| expr_refs_below(e, width, srcs)) {
+        return true;
+    }
+    if let Some(f) = &p.filter
+        && expr_refs_below(f, width, srcs)
+    {
+        return true;
+    }
+    if p.group_by.iter().any(|e| expr_refs_below(e, width, srcs)) {
+        return true;
+    }
+    if let Some(h) = &p.having
+        && expr_refs_below(h, width, srcs)
+    {
+        return true;
+    }
+    if p.order_by
+        .iter()
+        .any(|(e, _)| expr_refs_below(e, width, srcs))
+    {
+        return true;
+    }
+    if p.values
+        .iter()
+        .any(|r| r.iter().any(|e| expr_refs_below(e, width, srcs)))
+    {
+        return true;
+    }
+    if p.compound
+        .iter()
+        .any(|(_, t)| plan_refs_below(t, width, srcs))
+    {
+        return true;
+    }
+    false
+}
+
+/// Whether plan `p`, planned against enclosing scopes that
+/// occupy the first `outer_width` column slots and the first
+/// `outer_srcs` rowid sources of the combined evaluation row,
+/// is uncorrelated (v0.13): nothing in it is bound to an
+/// enclosing scope, so its result is fixed for the whole
+/// statement execution and may be computed once and cached.
+pub fn plan_is_uncorrelated(p: &SubPlan, outer_width: usize, outer_srcs: usize) -> bool {
+    !plan_refs_below(p, outer_width, outer_srcs)
 }
 
 /// The computed value of one subquery node for one outer row

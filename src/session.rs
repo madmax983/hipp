@@ -33,6 +33,13 @@ use crate::sql::JoinKind;
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
 const ROWID_COL: usize = usize::MAX;
 
+/// SubPlan node identity source (v0.13): every planned
+/// subquery node takes a unique id, which the executor's
+/// hoisting cache keys on. Relaxed ordering suffices — ids
+/// only need uniqueness, never synchronisation.
+#[cfg(feature = "v06")]
+static NEXT_SUBPLAN_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+
 /// Caller configuration (SPEC §5.8, §7.5.3): page-pool size and
 /// per-scope arena initial/maximum bytes.
 #[derive(Debug, Clone)]
@@ -488,6 +495,14 @@ pub struct Connection<S: Storage> {
     /// itself opens lazily at the first write, as in SQLite; while
     /// this flag is set, write statements do not autocommit.
     explicit_txn: bool,
+    /// Cumulative subquery-plan executions on this connection
+    /// (v0.13): one per `exec_subplan` call, including derived
+    /// tables and INSERT ... SELECT sources. A diagnostic /
+    /// test observable for the hoisting win — an uncorrelated
+    /// expression subquery over N outer rows contributes 1,
+    /// not N.
+    #[cfg(feature = "v06")]
+    sub_execs: usize,
 }
 
 impl<S: Storage> Connection<S> {
@@ -510,6 +525,8 @@ impl<S: Storage> Connection<S> {
             catalog: Catalog::empty(u32::MAX),
             cfg,
             explicit_txn: false,
+            #[cfg(feature = "v06")]
+            sub_execs: 0,
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -565,6 +582,8 @@ impl<S: Storage> Connection<S> {
             query_pos: 0,
             #[cfg(feature = "v04")]
             query_loaded: false,
+            #[cfg(feature = "v06")]
+            hoist: AVec::new(),
             #[cfg(feature = "v07")]
             ret_rows: AVec::new(),
             #[cfg(feature = "v07")]
@@ -1192,6 +1211,17 @@ impl<S: Storage> Connection<S> {
         }
     }
 
+    /// Stamp a freshly planned subquery with its node id and
+    /// its uncorrelated verdict (v0.13): `base_width` /
+    /// `base_src` are the enclosing scopes' combined width and
+    /// source count — the absolute threshold below which a
+    /// reference is bound to an enclosing scope.
+    #[cfg(feature = "v06")]
+    fn stamp_subplan(plan: &mut crate::query::SubPlan, base_width: usize, base_src: usize) {
+        plan.id = NEXT_SUBPLAN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        plan.uncorrelated = crate::query::plan_is_uncorrelated(plan, base_width, base_src);
+    }
+
     /// Plan one subquery (v0.6) against the combined scope:
     /// `enclosing` holds the scope groups of every textually
     /// enclosing query, nearest first, with absolute slot/source
@@ -1258,7 +1288,7 @@ impl<S: Storage> Connection<S> {
             } else {
                 self.plan_sub_compound(stmt, arena, enclosing, order_names.as_slice(), width)?
             };
-            return Ok(SubPlan {
+            let mut plan = SubPlan {
                 sources: AVec::new(),
                 items: AVec::new(),
                 filter: None,
@@ -1275,7 +1305,11 @@ impl<S: Storage> Connection<S> {
                 result_names,
                 result_affs,
                 order_names,
-            });
+                id: 0,
+                uncorrelated: false,
+            };
+            Self::stamp_subplan(&mut plan, base_width, base_src);
+            return Ok(plan);
         }
         let mut descs: AVec<SourceDesc> = AVec::new();
         let mut offsets: AVec<usize> = AVec::new();
@@ -1529,7 +1563,7 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(not(feature = "v09"))]
         let (compound, comp_order): SubCompoundParts = (AVec::new(), AVec::new());
-        Ok(SubPlan {
+        let mut plan = SubPlan {
             sources: subs,
             items,
             filter,
@@ -1546,7 +1580,11 @@ impl<S: Storage> Connection<S> {
             result_names,
             result_affs,
             order_names,
-        })
+            id: 0,
+            uncorrelated: false,
+        };
+        Self::stamp_subplan(&mut plan, base_width, base_src);
+        Ok(plan)
     }
 
     /// Plan one subquery statement's compound tail (v0.9):
@@ -2726,6 +2764,15 @@ impl<S: Storage> Connection<S> {
         self.pager.storage()
     }
 
+    /// Cumulative subquery-plan executions on this connection
+    /// (v0.13; see the `sub_execs` field). Tests assert the
+    /// hoisting win with it: an uncorrelated subquery node's
+    /// executions per statement drop from O(outer rows) to 1.
+    #[cfg(feature = "v06")]
+    pub fn subquery_executions(&self) -> usize {
+        self.sub_execs
+    }
+
     /// Arena high-water marks + pool bytes (SPEC §7.5.3 stats).
     pub fn arena_stats(&self) -> ArenaStats {
         ArenaStats {
@@ -2806,6 +2853,17 @@ pub struct Statement<'c, S: Storage> {
     query_pos: usize,
     #[cfg(feature = "v04")]
     query_loaded: bool,
+    /// Hoisted uncorrelated-subquery results for this
+    /// statement's execution (v0.13): `(plan node id, value)`
+    /// pairs, populated on first use and cleared when a fresh
+    /// execution begins (see `Statement::step`). The pinned
+    /// oracle fixes an uncorrelated subquery's value for the
+    /// whole statement, so one entry serves every outer row —
+    /// including a statement that writes the subquery's own
+    /// table, whose pre-statement snapshot the first use
+    /// captures.
+    #[cfg(feature = "v06")]
+    hoist: AVec<(usize, crate::query::SubValue)>,
     /// v0.7 RETURNING results of a write statement, materialised
     /// by the write's execution on first step and then served
     /// one row per step, like a query's.
@@ -3088,6 +3146,14 @@ fn integral_f64(f: f64) -> Option<i64> {
 impl<'c, S: Storage> Statement<'c, S> {
     /// Execute/advance the statement by one step.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
+        // A fresh execution starts with an empty hoist cache
+        // (v0.13): cached uncorrelated-subquery values belong
+        // to one statement execution, never across statements
+        // or across a re-execution after an error.
+        #[cfg(feature = "v06")]
+        if self.phase == Phase::Fresh {
+            self.hoist.clear();
+        }
         let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
             || {
                 #[cfg(feature = "indexes")]
@@ -5652,33 +5718,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         collect_subs(e, &mut kinds);
         let mut out: AVec<SubValue> = AVec::new();
         for k in kinds.iter() {
-            match k {
-                SubKind::Scalar(plan) => {
-                    let rows = self.exec_subplan(plan, outer).await?;
-                    out.push(SubValue::One(
-                        match rows.as_slice().first() {
-                            Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
-                            None => OwnedValue::Null,
-                        },
-                        crate::query::result_affinity(plan),
-                    ));
-                }
-                SubKind::Exists(plan) => {
-                    let rows = self.exec_subplan(plan, outer).await?;
-                    out.push(SubValue::One(
-                        OwnedValue::Integer(if rows.is_empty() { 0 } else { 1 }),
-                        None,
-                    ));
-                }
-                SubKind::In(plan) => {
-                    let rows = self.exec_subplan(plan, outer).await?;
-                    let mut vs = AVec::new();
-                    for r in rows.iter() {
-                        vs.push(r.as_slice().first().cloned().unwrap_or(OwnedValue::Null));
-                    }
-                    out.push(SubValue::Many(vs, crate::query::result_affinity(plan)));
-                }
-            }
+            out.push(self.sub_value_for(k, outer).await?);
         }
         Ok(out)
     }
@@ -5697,35 +5737,81 @@ impl<'c, S: Storage> Statement<'c, S> {
         collect_subs_outside_agg(e, &mut kinds);
         let mut out: AVec<SubValue> = AVec::new();
         for k in kinds.iter() {
-            match k {
-                SubKind::Scalar(plan) => {
-                    let rows = self.exec_subplan(plan, outer).await?;
-                    out.push(SubValue::One(
-                        match rows.as_slice().first() {
-                            Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
-                            None => OwnedValue::Null,
-                        },
-                        crate::query::result_affinity(plan),
-                    ));
-                }
-                SubKind::Exists(plan) => {
-                    let rows = self.exec_subplan(plan, outer).await?;
-                    out.push(SubValue::One(
-                        OwnedValue::Integer(if rows.is_empty() { 0 } else { 1 }),
-                        None,
-                    ));
-                }
-                SubKind::In(plan) => {
-                    let rows = self.exec_subplan(plan, outer).await?;
-                    let mut vs = AVec::new();
-                    for r in rows.iter() {
-                        vs.push(r.as_slice().first().cloned().unwrap_or(OwnedValue::Null));
-                    }
-                    out.push(SubValue::Many(vs, crate::query::result_affinity(plan)));
-                }
-            }
+            out.push(self.sub_value_for(k, outer).await?);
         }
         Ok(out)
+    }
+
+    /// Compute one subquery node's value for `outer` (v0.13):
+    /// an uncorrelated plan is executed once per statement
+    /// execution and the result is cached under its plan node
+    /// id — every later row (or group row, for aggregate
+    /// arguments) reuses it. The first use computes against
+    /// the live database at that moment, which for a statement
+    /// that writes the subquery's own table is its pre-write
+    /// snapshot, matching the pin's per-statement behaviour.
+    /// Correlated plans always take the per-row path.
+    #[cfg(feature = "v06")]
+    async fn sub_value_for(
+        &mut self,
+        kind: &crate::query::SubKind<'_>,
+        outer: &RowData,
+    ) -> Result<crate::query::SubValue, S::Error> {
+        use crate::query::SubKind;
+        let plan = match kind {
+            SubKind::Scalar(p) => *p,
+            SubKind::Exists(p) => *p,
+            SubKind::In(p) => *p,
+        };
+        if plan.uncorrelated && plan.id != 0 {
+            for (id, v) in self.hoist.iter() {
+                if *id == plan.id {
+                    return Ok(v.clone());
+                }
+            }
+            let v = self.exec_sub_kind(kind, outer).await?;
+            self.hoist.push((plan.id, v.clone()));
+            return Ok(v);
+        }
+        self.exec_sub_kind(kind, outer).await
+    }
+
+    /// Execute one subquery node for one outer row and shape
+    /// its `SubValue` (v0.6; factored out in v0.13).
+    #[cfg(feature = "v06")]
+    async fn exec_sub_kind(
+        &mut self,
+        kind: &crate::query::SubKind<'_>,
+        outer: &RowData,
+    ) -> Result<crate::query::SubValue, S::Error> {
+        use crate::query::{SubKind, SubValue};
+        Ok(match kind {
+            SubKind::Scalar(plan) => {
+                let rows = self.exec_subplan(plan, outer).await?;
+                SubValue::One(
+                    match rows.as_slice().first() {
+                        Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
+                        None => OwnedValue::Null,
+                    },
+                    crate::query::result_affinity(plan),
+                )
+            }
+            SubKind::Exists(plan) => {
+                let rows = self.exec_subplan(plan, outer).await?;
+                SubValue::One(
+                    OwnedValue::Integer(if rows.is_empty() { 0 } else { 1 }),
+                    None,
+                )
+            }
+            SubKind::In(plan) => {
+                let rows = self.exec_subplan(plan, outer).await?;
+                let mut vs = AVec::new();
+                for r in rows.iter() {
+                    vs.push(r.as_slice().first().cloned().unwrap_or(OwnedValue::Null));
+                }
+                SubValue::Many(vs, crate::query::result_affinity(plan))
+            }
+        })
     }
 
     /// Execute one planned subquery for one outer row (v0.6):
@@ -5741,6 +5827,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         plan: &'x crate::query::SubPlan,
         outer: &'x RowData,
     ) -> SubplanFuture<'x, S::Error> {
+        self.conn.sub_execs += 1;
         alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer))
     }
 
