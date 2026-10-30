@@ -8,15 +8,40 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.11 — subqueries inside aggregate arguments
-  (`sum((SELECT ...))` and friends, evaluated per group
-  row), on the v0.10 foundation (SPEC §2).
+- **Phase:** v0.12 — real-literal parsing exactness
+  (RISKS R5 closed: decimal→REAL conversion reproduces
+  the pinned oracle bit-for-bit), on the v0.11
+  foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.12 does
+
+- Everything v0.11 does (below), plus **real-literal
+  parsing exactness** — the last recorded
+  silent-wrong-answer divergence (RISKS R5). It is
+  *not* feature-gated: like the v0.8 / v0.10 fixes it
+  corrects claimed paths. Probing the pin first showed
+  the old parser was off by ~41 ulp at `1e308` (its
+  17-digit accumulation plus chunked power-of-ten
+  scaling), and that the pin's own conversion is not
+  textbook IEEE rounding on long inputs: significant
+  digits accumulate into a `u64`, the first digit that
+  would overflow it ends the input (later digits are
+  ignored entirely), and the truncated decimal is then
+  converted exactly, ties to even. hipp now performs
+  that same conversion — exact big-integer rational
+  arithmetic in `no_std` — for literals and, through
+  one shared converter, for `CAST` / affinity /
+  rowid-literal text conversions. Integer text past
+  `i64` under NUMERIC / REAL affinity now converts to
+  a REAL too, as the oracle's does. A side effect the
+  ratchet likes: dropping `core`'s f64 text parser from
+  the tiny link makes the tiny build 17,140 B smaller.
 
 ## What v0.11 does
 
@@ -250,9 +275,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.11) |
+| Gate | Budget | Measured (v0.12) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **89,872 B** (Δ **0 B** vs v0.10's 89,872 B; the v0.11 engine lives entirely behind the `v10` feature and the v04/v06-gated modules, so the tiny profile pays nothing for it) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **72,732 B** (Δ **−17,140 B** vs v0.11's 89,872 B; the v0.12 converter is ungated, but routing the affinity path off `core`'s f64 text parser removes its tables and code from the tiny link) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

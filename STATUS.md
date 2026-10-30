@@ -4,6 +4,186 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.12 — real-literal parsing exactness (2026-10-29)
+
+**Status:** implemented, differential-tested against the
+pinned oracle, and gated (below). This milestone closes
+RISKS R5, the last recorded silent-wrong-answer divergence:
+decimal text that becomes a REAL — SQL literals, `CAST`
+conversions, affinity conversions, rowid-literal coercion —
+now converts bit-for-bit the way the pinned SQLite 3.54.1
+oracle converts it. Like v0.8 / v0.10 it is deliberately
+**not** feature-gated: it corrects claimed paths, and the
+tiny profile's literal path is one of them (tiny ends up
+17 KiB *smaller*; see the ratchet).
+
+### Shipped
+
+- **`parse_real` rewritten** (`sql::lexer`) as a two-step
+  reproduction of the oracle's conversion (model probed
+  black-box first; see the probing notes):
+  (1) significant digits accumulate into a `u64` — the
+  first digit whose multiply-and-add would overflow `u64`
+  ends the input, and it and every later digit are dropped
+  at one decimal-exponent unit each (no rounding, no
+  sticky); (2) the truncated decimal is converted
+  *exactly* by big-integer rational arithmetic: binary
+  exponent from bit lengths, one big division for the
+  mantissa, remainder-driven round-to-nearest with true
+  ties to the even neighbour, subnormals through the fixed
+  `2^-1074` scale, overflow to infinity at/above the
+  overflow midpoint, underflow to zero.
+- **One conversion engine for every decimal→REAL path.**
+  The new `parse_real_signed` (leading `+`/`-`) serves the
+  CAST/arithmetic prefix parser
+  (`query::parse_num_prefix`), the affinity text conversion
+  (`record::text_to_number`), and the rowid-literal
+  coercion (`session::literal_rowid`), replacing
+  `str::parse::<f64>` at all three sites. Same input text
+  now yields the same bits in a literal, a `CAST`, an
+  affinity conversion, and a `WHERE rowid = '...'` probe.
+- **`text_to_number` integer-overflow fix:** text that is a
+  well-formed integer literal past `i64` used to convert to
+  nothing (the value stayed TEXT under NUMERIC / REAL
+  affinity); it now converts to a REAL, as the oracle's
+  does (e.g. `'18446744073709551616'` stored into a REAL
+  column is the real 2^64).
+
+### Oracle-probing notes (all verified on the 3.54.1 pin
+before and during implementation)
+
+- **The old parser was far worse than the recorded
+  "1 ulp on pathological mantissas":** on an 869-literal
+  adversarial corpus (long mantissas, halfway cases,
+  subnormals, exponent extremes) its bits diverged from
+  the correctly rounded value on **386** literals —
+  `1e308` off by ~41 ulp (the repeated `1e16` scaling
+  chunks), `0.9999999999999999` parsed to exactly 1.0,
+  `1.7976931348623157e308` one ulp low.
+- **The pin is not textbook IEEE rounding on long
+  inputs.** A first implementation doing exact IEEE
+  conversion of the full literal matched the pin on
+  495/500 corpus literals; the 5 holdouts were all
+  midpoint-shadow constructions, and targeted probing
+  isolated the pin's actual rule (the `u64` digit
+  horizon in "Shipped"): sig digit 20 of the 1.0
+  midpoint flips the result while sig digit 21 is
+  ignored (raising it cannot push a value over a tie —
+  there is no sticky bit); the 20-digit integer
+  `18446744073709553665` converts as `...53660` because
+  its 20th digit's accumulation overflows `u64`
+  (`...53664` behaves the same; `...560000`, whose
+  dropped digit is 0, converts exactly); short exact
+  ties go to the even neighbour (`72057594037927960`
+  → 2^56+32), while long-digit exact ties land low
+  only because their truncated form is strictly below
+  the tie (`0.9999999999999999444888487687421729788184
+  16595458984375` → the float below 1.0). The overflow
+  midpoint in full scientific digits likewise converts
+  to the largest finite float under the horizon, not
+  to infinity.
+- **Stress (run, not committed):** 6,200 literals
+  concentrated where the model could break — 17–26
+  digit mantissas at all exponents, integers straddling
+  the `u64` accumulation boundary (±2000 around
+  `u64::MAX` in steps), 19–24 fraction digits near
+  1.0, subnormal-range strings — zero divergences.
+
+### Root finds this milestone
+
+- **The horizon model was forced by the data, not
+  chosen.** Textbook exactness was implemented first
+  and the pin itself refuted it on five literals; the
+  milestone's real scope turned out to be "match the
+  pin's conversion, including its digit horizon," which
+  is what a pinned-version claim means.
+- **`core`'s f64 text parser was riding in the tiny
+  build** through the ungated `text_to_number`.
+  Routing every conversion through the new converter
+  removed its tables and code from the tiny link —
+  that removal, not the converter, is the v0.12 size
+  story (below).
+- Two test-authoring corrections during bring-up,
+  recorded for honesty: the stored-comparison
+  expectations for `2.5e-324` / `4.9e-324` (both parse
+  to the minimum subnormal, so both match both rows),
+  and the oracle's `printf('%!.25e')` rendering of a
+  stored +0.0, which is `0.0e+00`.
+
+### Gates (run on the final tree)
+
+- `cargo test --workspace`: **171 passed, 0 failed**
+  (162 at v0.11 + 7 new core differentials in
+  `tests/real_literal_v12.rs` + 2 new CLI differentials
+  in `hipp-cli/tests/cli_v12.rs`), re-run green on the
+  COMMITTED tree (clean status; see the loop status for
+  the recorded run). The core suite extracts the
+  oracle's bits losslessly (the oracle writes each
+  literal into a REAL column of a file; hipp reads the
+  file) over a ~500-literal corpus of hand-picked edges
+  plus an LCG-generated spread, checks hipp's parse of
+  every literal against them, checks the reverse file
+  direction via the oracle's `printf('%!.25e')`
+  extraction from both files, pins 29 halfway / boundary
+  cases with the pin's own bit patterns (generated from
+  the exact midpoint expansions under the probed
+  horizon rule and cross-checked against the oracle),
+  and covers CAST / affinity conversions, stored-value
+  comparisons whose row sets flip on 1 ulp, integer
+  literals past `i64` / `u64`, and the exponent
+  extremes. A1–A11 stay green.
+- CLI: the v0.12 corpus exposes the parse through
+  comparison operators (0/1 outputs that flip on
+  1 ulp) and CAST / stored-value comparisons —
+  byte-identical to the oracle one-shot and over
+  stdin; the stored-literals test compares the
+  oracle's exact extraction from a hipp-written file
+  against its own file.
+- `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean. `cargo fmt` (write mode): clean
+  tree afterwards. Feature matrix compiles: default,
+  no-default, std-only, v04..v10 ladders, indexes-only,
+  indexes+v05, all-features; lib tests pass under
+  no-default-features. (The tiny thumb build shows the
+  same 3 pre-existing feature-combination warnings as
+  the base; none are new.)
+
+### Size (ratchet)
+
+- thumbv7em-none-eabihf `tiny`: **.text 70,040 +
+  .rodata 2,692 = 72,732 B of 128 KiB budget**, Δ
+  **−17,140 B** vs v0.11's 89,872 B (base re-measured
+  with the identical command at 89,872 B before the
+  delta was taken). The milestone is an ungated
+  correctness fix, so tiny compiles the new converter —
+  but routing the affinity path away from
+  `str::parse::<f64>` drops `core`'s float-parse tables
+  (most of the old 14,952 B `.rodata`) and code from
+  the tiny link, and the exact converter is smaller
+  than what it replaced. Engine statics 0 B (.bss
+  98,308 B = demo heap, unchanged). Headroom
+  remaining: 58,340 B.
+
+### Honest gaps (v0.12)
+
+- **R5 is closed.** What remains on the recorded list
+  is performance only: no uncorrelated-subquery
+  hoisting (an uncorrelated subquery still re-executes
+  per outer row — now also inside aggregate arguments,
+  v0.11) and no merge / redistribution on delete.
+  WAL read stays gated on a real target demanding it.
+- The digit-horizon model is probed behaviourally
+  (clean-room: oracle I/O, never SQLite source) and
+  verified on the committed corpus plus the
+  6,200-literal stress above; a decimal shape outside
+  every probed family could in principle still
+  diverge, as with any black-box model.
+- Conversion cost is quadratic in mantissa digit
+  count for pathological inputs (the exact rational
+  is built over all kept digits); ordinary literals
+  are unaffected, and the kept prefix is bounded by
+  the `u64` horizon plus dropped-digit counting.
+
 ## v0.11 — subqueries inside aggregate arguments (2026-10-29)
 
 **Status:** implemented, differential-tested against the
