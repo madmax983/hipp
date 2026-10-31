@@ -4,6 +4,172 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.14 — delete merge/redistribution (2026-10-31)
+
+**Status:** implemented, differential-tested against the
+pinned oracle, and gated (below). DELETE — and the delete
+side of UPDATE / REPLACE / upsert victims — now balances
+the B-tree the way the pin does: an underflow page is
+redistributed with its siblings or merged, instead of
+being left in place. Delete-heavy files therefore reclaim
+the same pages into the freelist the pin reclaims, and
+`page_count` / `freelist_count` track the pin
+statement-for-statement on the pinned workloads. This is
+deliberately **not** feature-gated: it changes no dialect
+surface, only the file layout produced by existing delete
+paths (a pure layout-conformance fix; the recorded
+candidate list named at v0.6/v0.11/v0.12/v0.13 is now
+empty).
+
+### Shipped
+
+- **Table B-tree balance** (`btree.rs`): `btree_delete`
+  records its descent path; a delete that leaves a
+  non-root page with total free space greater than two
+  thirds of the usable size balances a window of up to
+  three consecutive siblings under the parent (centred on
+  the trigger, clamped at the edges). The window's cells
+  are redistributed over the smallest page count that
+  holds them at full capacity; excess pages return to
+  the freelist. Balances cascade up the recorded path,
+  and an interior root left with a single child
+  collapses (the child's content is copied into the
+  root page, the child freed, the height shrinks).
+- **Index B-tree balance**: the same window machinery
+  over the index entry sequence — a window's combined
+  sequence interleaves the window pages' entries with
+  the parent dividers between them, and re-splitting
+  lifts one entry per boundary back into the parent as
+  the new divider. Interior-resident deletes use
+  predecessor replacement: the predecessor is removed
+  from its leaf first, then the target cell is re-sought
+  (a balance may have moved it) and replaced.
+- **Distribution rule** (`distribute`, shared by both
+  trees): cumulative quotas fitted on a machine-collected
+  dataset of 156 oracle balance events — see the probing
+  notes.
+- **Degenerate fallback preserved**: a delete that would
+  empty a whole non-root subtree still falls back to
+  rebuilding the tree from its surviving rows (v0.5
+  design); overflow chains of removed rows return to
+  the freelist on every path.
+
+### Oracle-probing notes (verified on the 3.54.1 pin
+before implementation; clean-room — file-format docs +
+oracle I/O only)
+
+- **Trigger**: a delete balances a non-root page when
+  its post-delete total free space exceeds two thirds
+  of usable (`free > usable * 2 / 3`, integer floor).
+  A page already underfull from inserts balances on its
+  first delete; inserts themselves never balance.
+- **Window**: up to three consecutive siblings under one
+  parent, containing the trigger — first child
+  `[0..3]`, middle `[i-1..i+2]`, last `[n-3..n]`.
+- **Merge decision is capacity-driven**: the window's
+  combined cells go on the smallest number of pages
+  that holds them at full capacity (greedy in-order
+  packing by page need); excess pages are freed.
+- **Distribution**: with S the window's total cost
+  (cell bytes + 2 per cell), P one page's content
+  capacity, and n the result page count, page i's quota
+  boundary is `Q_i = i * (S + P) / (n + 1)`. A two-page
+  merge splits evenly (17/17 fitted events exact); for
+  three-page results the first boundary is
+  check-then-add at Q_1 and the second sits at the item
+  closest to Q_2 (115/139 exact, the rest within one
+  cell). Earlier hypotheses (pure quotas, sequential
+  remainder quotas, pairwise sweeps) scored strictly
+  worse and were rejected.
+- **Root collapse**: an interior root left with a
+  single child is replaced by that child's content.
+
+### Root finds
+
+- **`index_parent_after` dropped the parent's rightmost
+  child** when splicing a balanced window back into an
+  index parent (the surviving-children copy loop ran
+  over cell indices, not child indices). Found by the
+  pre-existing `deep_tree_index_delete_and_update`
+  acceptance test going corrupt after the index balance
+  landed (double-referenced page, orphaned subtree);
+  fixed and re-verified — the full deep-index trace now
+  matches the pin step-for-step.
+- **hipp's insert-side shape already diverges from the
+  pin** (pre-existing, not v0.14 scope): 100 rows at
+  page size 512 build 8 pages in hipp vs 6 in the pin —
+  the insert split distribution differs. Delete shape
+  is therefore pinned in the direction that isolates
+  it (hipp deleting on pin-built trees, per-statement);
+  the hipp-built direction is asserted on contents and
+  integrity. This divergence is the named v0.15 scope.
+
+### Gates (run on the final tree)
+
+- `cargo test --workspace`: **193 passed, 0 failed**
+  (178 at v0.13 + 12 new core tests in
+  `tests/delete_balance_v14.rs` + 3 new CLI tests in
+  `hipp-cli/tests/cli_v14.rs`), re-run green on the
+  COMMITTED tree (clean status; see the loop status for
+  the recorded run). The core suite pins, per statement,
+  identical (page_count, freelist_count) traces against
+  the oracle on tail / middle / scattered deletes,
+  delete-all collapse with freelist-reuse reinsert,
+  batch deletes, overflow-row deletes, page size 4096,
+  a depth-3 table tree (interior cascade + height
+  shrink), depth-2 and depth-3 index deletes, plus
+  contents-and-integrity assertions for UPDATE / REPLACE
+  / upsert victim churn and the hipp-built direction.
+  A1–A11 stay green.
+- CLI: delete-heavy batches through the hipp CLI on
+  oracle-built files leave contents, page_count and
+  freelist_count identical to the oracle-run twins, and
+  pass the oracle's `integrity_check`.
+- `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean. `cargo fmt` (write mode): clean
+  tree afterwards. Feature matrix compiles: default,
+  no-default, std-only, v04..v10 ladders, indexes-only,
+  indexes+v05, all-features; lib tests pass under
+  no-default-features. (The tiny thumb build shows the
+  same 3 pre-existing feature-combination warnings as
+  the base; none are new.)
+
+### Size (ratchet)
+
+- thumbv7em-none-eabihf `tiny`: **.text 70,040 +
+  .rodata 2,692 = 72,732 B of 128 KiB budget**, Δ
+  **+28 B** vs v0.13's 72,704 B — the balance machinery
+  lives on delete paths the tiny profile (INSERT /
+  SELECT only) does not reach, so the tiny binary is
+  nearly untouched; far below the 4 KiB
+  justification threshold. Engine statics 0 B (.bss
+  98,308 B = demo heap, unchanged). Headroom
+  remaining: 58,340 B.
+
+### Honest gaps (v0.14)
+
+- The within-window distribution matches the pin
+  exactly in ~83% of probed balance events and is
+  within one cell in the rest; no pinned workload's
+  page_count / freelist trace diverged because of it,
+  but a workload crafted around a boundary case could
+  show a one-page-count difference after a single
+  balance. The interior-window phantom (content
+  capacity minus the 12-byte interior header) is a
+  principled guess validated only indirectly through
+  page-count traces, and windows over a two-child
+  parent were not separately probed.
+- hipp always repacks a page it writes; the pin can
+  leave freeblocks in place on pages it did not need
+  to repack. Total free space agrees; byte-level page
+  layout can differ.
+- The insert-side split distribution divergence
+  (above) is untouched — hipp-built files can differ
+  from pin-built files in page_count after inserts.
+  Named as the v0.15 scope.
+- WAL read stays gated on a real target demanding
+  it (RISKS R3).
+
 ## v0.13 — uncorrelated-subquery hoisting (2026-10-30)
 
 **Status:** implemented, differential-tested against the
