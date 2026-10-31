@@ -1010,17 +1010,681 @@ async fn finish_root_split<S: Storage>(
 
 // ----------------------------------------------------------------
 // Table B-tree row deletion (v0.3 for sqlite_schema rows; v0.5
-// general DELETE/UPDATE/DROP TABLE use). No merge/redistribution.
+// general DELETE/UPDATE/DROP TABLE use) and, since v0.14,
+// balance-by-redistribution and merge on the delete path.
+//
 // One format invariant shapes the design (found by differential
 // testing against the oracle in v0.5): a non-root B-tree page may
 // never be empty — SQLite rebalances to maintain that, and the
-// oracle's integrity_check rejects trees that violate it. So a
-// delete that would empty a non-root leaf rebuilds the table
-// B-tree from its surviving rows instead (root page number,
-// rowids and row contents all preserved, so indexes stay
-// valid). Overflow pages of a removed row return to the
-// freelist.
+// oracle's integrity_check rejects trees that violate it.
+//
+// v0.14 balance, probed behaviourally against the pinned 3.54.1
+// oracle before implementation (clean-room: file-format docs +
+// oracle I/O only):
+// - A delete that leaves a non-root page with total free space
+//   greater than two thirds of the usable page size triggers a
+//   balance of that page with its siblings. (Probed crossings:
+//   usable 512 -> free 342 triggers, 339 does not; 1024 -> 686
+//   triggers, 680 does not; 4096 -> the crossing sits between
+//   2645 and 2756. All fit `free > usable * 2 / 3`.) An insert
+//   into an underfull page does NOT balance (also probed).
+// - The balance window is up to three consecutive sibling pages
+//   under one parent, containing the underfull page, centred
+//   where possible and clamped at the parent's edges (probed:
+//   first/middle/last leaf windows are [0..3], [i-1..i+2] and
+//   [n-3..n] respectively).
+// - The window's combined cells are redistributed over the
+//   smallest number of pages that hold them at full capacity;
+//   when that is fewer than the window size, the excess pages
+//   return to the freelist (merge). When an interior root is
+//   left with a single child, the child is copied into the root
+//   page and freed (the tree's height shrinks).
+// - The within-window distribution follows cumulative quotas
+//   fitted on a machine-collected dataset of 156 oracle balance
+//   events (exact pre-balance per-page cell costs): with S the
+//   window's total cost (cell bytes + 2 per cell), P one page's
+//   content capacity, and n the result page count, page i's
+//   quota boundary is Q_i = i * (S + P) / (n + 1). A two-page
+//   merge splits evenly (17/17 events exact); for three-page
+//   results the first boundary is check-then-add at Q_1 and the
+//   second sits at the item closest to Q_2 (115/139 events
+//   exact, the rest within one cell). Page-count and freelist
+//   traces match the pin step-for-step on every pinned
+//   workload; the residual +/-1-cell distribution misses are
+//   recorded in STATUS.md. The distribution lives in
+//   `distribute`, shared by the table and index windows.
+// - The degenerate case the v0.5 design met — a delete that
+//   would empty a whole non-root subtree — still falls back to
+//   rebuilding the tree from its surviving rows (root page
+//   number, rowids and row contents all preserved, so indexes
+//   stay valid). Overflow pages of a removed row return to the
+//   freelist.
 // ----------------------------------------------------------------
+
+/// Length of the varint encoding of `v` (the divider-key cost of
+/// a table interior cell).
+fn varint_len(v: i64) -> usize {
+    let mut t = AVec::new();
+    encode_varint(v as u64, &mut t);
+    t.len()
+}
+
+/// The pinned engine's underflow rule (v0.14, probed above): a
+/// page whose total free space exceeds two thirds of the usable
+/// size is balanced with its siblings after a delete.
+fn page_underfull(free: usize, usable: usize) -> bool {
+    free > usable * 2 / 3
+}
+
+fn table_leaf_free(usable: usize, page: u32, cells: &[LeafCell]) -> usize {
+    let hdr_off = if page == 1 { 100 } else { 0 };
+    usable.saturating_sub(leaf_need(cells, hdr_off))
+}
+
+fn table_interior_free(usable: usize, page: u32, pairs: &[(u32, i64)]) -> usize {
+    let hdr_off = if page == 1 { 100 } else { 0 };
+    usable.saturating_sub(interior_need(pairs, hdr_off))
+}
+
+/// The balance window within a parent's `nchildren` children for
+/// a triggering child at `trigger`: up to three consecutive
+/// children, centred on the trigger where possible.
+fn window_range(nchildren: usize, trigger: usize) -> (usize, usize) {
+    if nchildren <= 3 {
+        return (0, nchildren);
+    }
+    let start = if trigger == 0 {
+        0
+    } else if trigger + 1 >= nchildren {
+        nchildren - 3
+    } else {
+        trigger - 1
+    };
+    (start, start + 3)
+}
+
+/// Distribute `items` (with per-item `weights`) in order into
+/// `n` non-empty groups, evenly by weight: each group is filled
+/// to at least the ceiling of its fair share of the remaining
+/// weight before the next group starts. Requires
+/// `items.len() >= n >= 1`.
+fn distribute<T: Clone>(items: &[T], weights: &[usize], n: usize, usable: usize) -> AVec<AVec<T>> {
+    debug_assert!(n >= 1 && items.len() >= n);
+    let total: usize = weights.iter().sum();
+    let mut groups: AVec<AVec<T>> = AVec::new();
+    let mut idx = 0usize;
+    let mut cum = 0usize;
+    for g in 0..n {
+        let mut group = AVec::new();
+        if g + 1 == n {
+            while idx < items.len() {
+                group.push(items[idx].clone());
+                idx += 1;
+            }
+            groups.push(group);
+            break;
+        }
+        // Items that must remain so every later group is
+        // non-empty.
+        let reserve = n - 1 - g;
+        if n == 2 {
+            // Two-page result: split evenly by weight — fill
+            // while the running total is below half (probed:
+            // exact on every observed merge).
+            while items.len() - idx > reserve && (group.is_empty() || cum * 2 < total) {
+                cum += weights[idx];
+                group.push(items[idx].clone());
+                idx += 1;
+            }
+        } else if g == 0 {
+            // First boundary of a three-page result: cumulative
+            // quota (total + usable) / (n + 1), check-then-add —
+            // the group overshoots its quota by less than one
+            // item (probed from the 3.54.1 oracle; see the
+            // section comment).
+            while items.len() - idx > reserve
+                && (group.is_empty() || cum * (n + 1) < total + usable)
+            {
+                cum += weights[idx];
+                group.push(items[idx].clone());
+                idx += 1;
+            }
+        } else {
+            // Second boundary: place it at the item closest to
+            // the cumulative quota 2 * (total + usable) / (n + 1)
+            // — stop before an item that would carry the total
+            // strictly further past the quota than it currently
+            // falls short.
+            while items.len() - idx > reserve
+                && (group.is_empty()
+                    || (2 * cum + weights[idx]) * (n + 1) <= 2 * (total + usable) * (g + 1))
+            {
+                cum += weights[idx];
+                group.push(items[idx].clone());
+                idx += 1;
+            }
+        }
+        groups.push(group);
+    }
+    groups
+}
+
+/// Outcome of one window balance.
+enum TableBalance {
+    /// The window was redistributed (and possibly merged);
+    /// `children_removed` counts how many children the parent
+    /// lost (0 for a pure redistribution).
+    Done { children_removed: usize },
+    /// A degenerate shape was detected during the gather phase,
+    /// before any page was written: the caller falls back to
+    /// rebuilding the whole tree from its surviving rows.
+    Rebuild,
+}
+
+/// Load a table interior page's model: (divider pairs, rightmost
+/// child, full children list in order).
+async fn table_children<S: Storage>(
+    pager: &mut Pager<S>,
+    page: u32,
+) -> Result<(AVec<(u32, i64)>, u32, AVec<u32>), S::Error> {
+    let idx = pager.load(page).await?;
+    let snap = copy_bytes(pager.frame_data(idx));
+    let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
+    let mut children = AVec::new();
+    for (c, _) in pairs.iter() {
+        children.push(*c);
+    }
+    children.push(rightmost);
+    Ok((pairs, rightmost, children))
+}
+
+/// Balance the children of table interior page `parent` around
+/// child index `trigger` (the child a delete just left
+/// underfull). The children may be leaf pages (leaf level) or
+/// interior pages (a cascade level); the first window child's
+/// kind decides. `preset` carries the trigger leaf's post-delete
+/// cell list at the leaf level, where the on-disk page still
+/// holds the deleted row.
+async fn balance_table_window<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    parent: u32,
+    trigger: usize,
+    preset: Option<(u32, AVec<LeafCell>)>,
+) -> Result<TableBalance, S::Error> {
+    let (pairs, _rightmost, children) = table_children(pager, parent).await?;
+    let nchildren = children.len();
+    if nchildren == 0 {
+        return Err(Error::CorruptPage { page: parent });
+    }
+    let (start, end) = window_range(nchildren, trigger.min(nchildren - 1));
+    let window_pages: AVec<u32> = {
+        let mut w = AVec::new();
+        for j in start..end {
+            w.push(children.as_slice()[j]);
+        }
+        w
+    };
+    // Decide leaf vs interior level from the first window child.
+    let first = window_pages.as_slice()[0];
+    let first_kind = {
+        let idx = pager.load(first).await?;
+        head::<S::Error>(pager.frame_data(idx), first)?.kind
+    };
+    match first_kind {
+        KIND_LEAF_TABLE => {
+            balance_table_leaf_window(
+                pager,
+                root,
+                parent,
+                pairs.as_slice(),
+                &children,
+                start,
+                end,
+                &window_pages,
+                preset,
+            )
+            .await
+        }
+        KIND_INTERIOR_TABLE => {
+            balance_table_interior_window(
+                pager,
+                root,
+                parent,
+                pairs.as_slice(),
+                &children,
+                start,
+                end,
+                &window_pages,
+            )
+            .await
+        }
+        _ => Err(Error::CorruptPage { page: first }),
+    }
+}
+
+/// Leaf-level window balance: redistribute the window leaves'
+/// combined cells over the smallest page count that holds them.
+#[allow(clippy::too_many_arguments)]
+async fn balance_table_leaf_window<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    parent: u32,
+    pairs: &[(u32, i64)],
+    children: &AVec<u32>,
+    start: usize,
+    end: usize,
+    window_pages: &AVec<u32>,
+    preset: Option<(u32, AVec<LeafCell>)>,
+) -> Result<TableBalance, S::Error> {
+    let usable = pager.usable() as usize;
+    // Gather the window's combined cells, in key order.
+    let mut all: AVec<LeafCell> = AVec::new();
+    for p in window_pages.iter() {
+        let p = *p;
+        let cells = match &preset {
+            Some((pp, kept)) if *pp == p => kept.clone(),
+            _ => {
+                let idx = pager.load(p).await?;
+                let snap = copy_bytes(pager.frame_data(idx));
+                let h = head::<S::Error>(snap.as_slice(), p)?;
+                if h.kind != KIND_LEAF_TABLE {
+                    return Err(Error::CorruptPage { page: p });
+                }
+                leaf_cells::<S::Error>(snap.as_slice(), p, usable)?
+            }
+        };
+        for c in cells.iter() {
+            all.push(c.clone());
+        }
+    }
+    if all.is_empty() && end - start == children.len() {
+        if parent == root {
+            // The whole tree's rows are gone: the root
+            // becomes an empty leaf, the children are freed.
+            for p in window_pages.iter() {
+                pager.free_page(*p).await?;
+            }
+            create_empty_root(pager, root).await?;
+            return Ok(TableBalance::Done {
+                children_removed: children.len(),
+            });
+        }
+        return Ok(TableBalance::Rebuild);
+    }
+    // A fully empty window inside a larger parent falls
+    // through: the window pages are freed below via the
+    // n_new = 0 path.
+    // Smallest page count that holds the combined cells at full
+    // capacity (greedy in-order packing; child pages have no
+    // 100-byte header offset).
+    let n_new = if all.is_empty() {
+        0
+    } else {
+        let mut pages = 1usize;
+        let mut cur_need = 8usize;
+        for c in all.iter() {
+            let add = c.bytes.len() + 2;
+            if cur_need + add > usable && cur_need > 8 {
+                pages += 1;
+                cur_need = 8;
+            }
+            cur_need += add;
+        }
+        pages
+    };
+    let groups: AVec<AVec<LeafCell>> = if n_new == 0 {
+        AVec::new()
+    } else {
+        let weights: AVec<usize> = {
+            let mut w = AVec::new();
+            for c in all.iter() {
+                w.push(c.bytes.len() + 2);
+            }
+            w
+        };
+        let groups = distribute(all.as_slice(), weights.as_slice(), n_new, usable - 8);
+        // The quota distribution is a layout target, not a
+        // capacity proof: with chunky cells a group could
+        // exceed its page. Fall back to the greedy packing
+        // (whose page count is `n_new` by construction) if any
+        // group does not fit.
+        if groups.iter().any(|g| leaf_need(g.as_slice(), 0) > usable) {
+            let mut greedy: AVec<AVec<LeafCell>> = AVec::new();
+            let mut cur: AVec<LeafCell> = AVec::new();
+            for c in all.iter() {
+                let mut trial = cur.clone();
+                trial.push(c.clone());
+                if !cur.is_empty() && leaf_need(trial.as_slice(), 0) > usable {
+                    greedy.push(cur);
+                    cur = AVec::new();
+                }
+                cur.push(c.clone());
+            }
+            if !cur.is_empty() {
+                greedy.push(cur);
+            }
+            greedy
+        } else {
+            groups
+        }
+    };
+    let n_new = groups.len();
+    // Write the surviving pages, then free the excess.
+    for (i, g) in groups.iter().enumerate() {
+        write_leaf_page(pager, window_pages.as_slice()[i], g.as_slice(), false).await?;
+    }
+    for i in n_new..window_pages.len() {
+        pager.free_page(window_pages.as_slice()[i]).await?;
+    }
+    // Rebuild the parent's pairs over the spliced child list.
+    let mut new_children: AVec<u32> = AVec::new();
+    for j in 0..start {
+        new_children.push(children.as_slice()[j]);
+    }
+    for i in 0..n_new {
+        new_children.push(window_pages.as_slice()[i]);
+    }
+    for j in end..children.len() {
+        new_children.push(children.as_slice()[j]);
+    }
+    if new_children.is_empty() {
+        // Only reachable for a non-root parent whose whole
+        // subtree emptied — detected here, still before the
+        // parent page itself was written, but the window pages
+        // have already been freed; the caller's rebuild collects
+        // surviving rows from what remains reachable, which is
+        // exactly the rows outside this subtree... plus this
+        // parent must not be left pointing at freed pages. That
+        // shape is prevented by the gather-phase check: an empty
+        // window covering every child of a non-root parent
+        // returns Rebuild before any write (above).
+        return Err(Error::CorruptPage { page: parent });
+    }
+    let mut new_pairs: AVec<(u32, i64)> = AVec::new();
+    for i in 0..new_children.len() - 1 {
+        let child = new_children.as_slice()[i];
+        let key = if (start..start + n_new).contains(&i) {
+            let g = &groups.as_slice()[i - start];
+            g.as_slice()[g.len() - 1].rowid
+        } else {
+            // The child's old divider key, located by its old
+            // position in the parent's pair list.
+            let old_idx = if i < start {
+                i
+            } else {
+                i + (end - start) - n_new
+            };
+            pairs[old_idx].1
+        };
+        new_pairs.push((child, key));
+    }
+    let new_rightmost = *new_children.as_slice().last().expect("nonempty");
+    write_interior_page(pager, parent, new_pairs.as_slice(), new_rightmost, false).await?;
+    Ok(TableBalance::Done {
+        children_removed: (end - start) - n_new,
+    })
+}
+
+/// Interior-level window balance: redistribute the window
+/// interior pages' combined children over the smallest page
+/// count that holds them. Divider keys are recomputed from each
+/// child's subtree maximum (a table divider is exactly that).
+#[allow(clippy::too_many_arguments)]
+async fn balance_table_interior_window<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    parent: u32,
+    pairs: &[(u32, i64)],
+    children: &AVec<u32>,
+    start: usize,
+    end: usize,
+    window_pages: &AVec<u32>,
+) -> Result<TableBalance, S::Error> {
+    let usable = pager.usable() as usize;
+    // Gather the window's combined grandchildren, each with its
+    // divider key (its subtree's maximum rowid).
+    let mut all: AVec<(u32, i64)> = AVec::new();
+    for (wi, p) in window_pages.iter().enumerate() {
+        let p = *p;
+        let (wpairs, wright, wchildren) = table_children(pager, p).await?;
+        let h_kind = {
+            let idx = pager.load(p).await?;
+            head::<S::Error>(pager.frame_data(idx), p)?.kind
+        };
+        if h_kind != KIND_INTERIOR_TABLE {
+            return Err(Error::CorruptPage { page: p });
+        }
+        for (j, gc) in wchildren.iter().enumerate() {
+            let gc = *gc;
+            let key = if j < wpairs.len() {
+                wpairs.as_slice()[j].1
+            } else if start + wi < pairs.len() {
+                // This window page's rightmost child's maximum is
+                // the divider the parent stores for the page.
+                pairs[start + wi].1
+            } else {
+                // The parent's rightmost subtree: probe it.
+                match seek_max_rowid(pager, p).await? {
+                    Some(m) => m,
+                    None => return Err(Error::CorruptPage { page: p }),
+                }
+            };
+            let _ = wright;
+            all.push((gc, key));
+        }
+    }
+    if all.is_empty() && end - start == children.len() {
+        if parent == root {
+            for p in window_pages.iter() {
+                pager.free_page(*p).await?;
+            }
+            create_empty_root(pager, root).await?;
+            return Ok(TableBalance::Done {
+                children_removed: children.len(),
+            });
+        }
+        return Ok(TableBalance::Rebuild);
+    }
+    // Smallest page count at full capacity. A page holding
+    // grandchildren a..b stores dividers for a..b-1, so adding
+    // one more grandchild costs the previous last grandchild's
+    // divider (4 + varint) plus a pointer slot.
+    let n_new = if all.is_empty() {
+        0
+    } else {
+        let mut pages = 1usize;
+        let mut cur_need = 12usize;
+        let mut cur_last: Option<i64> = None;
+        for (_, key) in all.iter() {
+            if let Some(prev) = cur_last {
+                let add = 4 + varint_len(prev) + 2;
+                if cur_need + add > usable {
+                    pages += 1;
+                    cur_need = 12;
+                } else {
+                    cur_need += add;
+                }
+            }
+            cur_last = Some(*key);
+        }
+        pages
+    };
+    let mut groups: AVec<AVec<(u32, i64)>> = if n_new == 0 {
+        AVec::new()
+    } else {
+        let weights: AVec<usize> = {
+            let mut w = AVec::new();
+            for (_, key) in all.iter() {
+                w.push(4 + varint_len(*key) + 2);
+            }
+            w
+        };
+        distribute(all.as_slice(), weights.as_slice(), n_new, usable - 12)
+    };
+    // Repair pass: even-by-weight grouping can overflow a page
+    // whose last grandchild's divider was counted in its weight
+    // but is not stored on it (or vice versa); shift boundary
+    // grandchildren forward until every page fits. If the last
+    // page still overflows, fall back to a rebuild — the gather
+    // phase has not written anything yet.
+    for gi in 0..groups.len() {
+        loop {
+            let g = &groups.as_slice()[gi];
+            if g.len() <= 1 {
+                break;
+            }
+            let gpairs: AVec<(u32, i64)> = {
+                let mut v = AVec::new();
+                for t in 0..g.len() - 1 {
+                    v.push(g.as_slice()[t]);
+                }
+                v
+            };
+            if interior_need(gpairs.as_slice(), 0) <= usable {
+                break;
+            }
+            if gi + 1 >= groups.len() {
+                return Ok(TableBalance::Rebuild);
+            }
+            let moved = groups.as_mut_slice()[gi].pop().expect("len>1");
+            let next = &mut groups.as_mut_slice()[gi + 1];
+            let mut rebuilt: AVec<(u32, i64)> = AVec::new();
+            rebuilt.push(moved);
+            for t in next.iter() {
+                rebuilt.push(*t);
+            }
+            *next = rebuilt;
+        }
+    }
+    // Write the surviving interior pages, free the excess.
+    for (i, g) in groups.iter().enumerate() {
+        let gpairs: AVec<(u32, i64)> = {
+            let mut v = AVec::new();
+            for t in 0..g.len() - 1 {
+                v.push(g.as_slice()[t]);
+            }
+            v
+        };
+        let gright = g.as_slice()[g.len() - 1].0;
+        write_interior_page(
+            pager,
+            window_pages.as_slice()[i],
+            gpairs.as_slice(),
+            gright,
+            false,
+        )
+        .await?;
+    }
+    for i in n_new..window_pages.len() {
+        pager.free_page(window_pages.as_slice()[i]).await?;
+    }
+    // Rebuild the parent's pairs over the spliced child list.
+    let mut new_children: AVec<u32> = AVec::new();
+    for j in 0..start {
+        new_children.push(children.as_slice()[j]);
+    }
+    for i in 0..n_new {
+        new_children.push(window_pages.as_slice()[i]);
+    }
+    for j in end..children.len() {
+        new_children.push(children.as_slice()[j]);
+    }
+    if new_children.is_empty() {
+        return Err(Error::CorruptPage { page: parent });
+    }
+    let mut new_pairs: AVec<(u32, i64)> = AVec::new();
+    for i in 0..new_children.len() - 1 {
+        let child = new_children.as_slice()[i];
+        let key = if (start..start + n_new).contains(&i) {
+            let g = &groups.as_slice()[i - start];
+            g.as_slice()[g.len() - 1].1
+        } else {
+            let old_idx = if i < start {
+                i
+            } else {
+                i + (end - start) - n_new
+            };
+            pairs[old_idx].1
+        };
+        new_pairs.push((child, key));
+    }
+    let new_rightmost = *new_children.as_slice().last().expect("nonempty");
+    write_interior_page(pager, parent, new_pairs.as_slice(), new_rightmost, false).await?;
+    Ok(TableBalance::Done {
+        children_removed: (end - start) - n_new,
+    })
+}
+
+/// Collapse a table root that has been left with a single
+/// child: copy the child's image into the root page (whose
+/// number — and, for page 1, header — never changes) and free
+/// the child. Loops while the new root is still a one-child
+/// interior page.
+async fn collapse_table_root<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<(), S::Error> {
+    let usable = pager.usable() as usize;
+    loop {
+        let idx = pager.load(root).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), root)?;
+        if h.kind != KIND_INTERIOR_TABLE {
+            return Ok(());
+        }
+        let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), root)?;
+        if !pairs.is_empty() {
+            return Ok(());
+        }
+        let child = rightmost;
+        if child == 0 || child == root {
+            return Err(Error::CorruptPage { page: root });
+        }
+        let cidx = pager.load(child).await?;
+        let csnap = copy_bytes(pager.frame_data(cidx));
+        let ch = head::<S::Error>(csnap.as_slice(), child)?;
+        match ch.kind {
+            KIND_LEAF_TABLE => {
+                let cells = leaf_cells::<S::Error>(csnap.as_slice(), child, usable)?;
+                write_leaf_page(pager, root, cells.as_slice(), false).await?;
+            }
+            KIND_INTERIOR_TABLE => {
+                let (cpairs, cright) = interior_cells::<S::Error>(csnap.as_slice(), child)?;
+                write_interior_page(pager, root, cpairs.as_slice(), cright, false).await?;
+            }
+            _ => return Err(Error::CorruptPage { page: child }),
+        }
+        pager.free_page(child).await?;
+    }
+}
+
+/// Free a removed table leaf cell's overflow chain, if any.
+async fn free_table_overflow<S: Storage>(
+    pager: &mut Pager<S>,
+    removed: &LeafCell,
+) -> Result<(), S::Error> {
+    let usable = pager.usable() as usize;
+    if removed.overflow == 0 {
+        return Ok(());
+    }
+    let per = usable - 4;
+    let mut next = removed.overflow;
+    let mut remaining = removed.payload_len - removed.local_len;
+    let mut hops = 0u32;
+    while next != 0 {
+        hops += 1;
+        if hops > pager.page_count() + 1 {
+            return Err(Error::OverflowChainCycle);
+        }
+        let idx = pager.load(next).await?;
+        let following = be_u32(pager.frame_data(idx), 0);
+        pager.free_page(next).await?;
+        next = following;
+        if remaining <= per {
+            break;
+        }
+        remaining -= per;
+    }
+    Ok(())
+}
 
 /// Rebuild the table B-tree rooted at `root` without the row
 /// `skip`: collect the surviving rows, free every page but the
@@ -1062,6 +1726,9 @@ pub async fn btree_delete<S: Storage>(
     rowid: i64,
 ) -> Result<bool, S::Error> {
     let usable = pager.usable() as usize;
+    // Descent, remembering (interior page, child index) pairs —
+    // the balance cascade walks this path back up.
+    let mut path: AVec<(u32, usize)> = AVec::new();
     let mut page = root;
     let (leaf_page, cells, pos) = loop {
         let idx = pager.load(page).await?;
@@ -1077,24 +1744,20 @@ pub async fn btree_delete<S: Storage>(
         }
         let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
         let mut child = rightmost;
-        for (c, k) in pairs.iter() {
+        let mut ci = pairs.len();
+        for (i, (c, k)) in pairs.iter().enumerate() {
             if rowid <= *k {
                 child = *c;
+                ci = i;
                 break;
             }
         }
+        path.push((page, ci));
         page = child;
     };
     let Some(pos) = pos else {
         return Ok(false);
     };
-    if cells.len() == 1 && leaf_page != root {
-        // The leaf's last row: removing it in place would leave
-        // an empty non-root page (see the section comment).
-        // Nothing has been mutated yet; rebuild instead.
-        btree_rebuild_without(pager, root, rowid).await?;
-        return Ok(true);
-    }
     let removed = cells.as_slice()[pos].clone();
     let mut kept: AVec<LeafCell> = AVec::new();
     for (i, c) in cells.iter().enumerate() {
@@ -1102,27 +1765,81 @@ pub async fn btree_delete<S: Storage>(
             kept.push(c.clone());
         }
     }
-    write_leaf_page(pager, leaf_page, kept.as_slice(), false).await?;
-    // Free the removed row's overflow chain, if any.
-    if removed.overflow != 0 {
-        let per = usable - 4;
-        let mut next = removed.overflow;
-        let mut remaining = removed.payload_len - removed.local_len;
-        let mut hops = 0u32;
-        while next != 0 {
-            hops += 1;
-            if hops > pager.page_count() + 1 {
-                return Err(Error::OverflowChainCycle);
-            }
-            let idx = pager.load(next).await?;
-            let following = be_u32(pager.frame_data(idx), 0);
-            pager.free_page(next).await?;
-            next = following;
-            if remaining <= per {
-                break;
-            }
-            remaining -= per;
+    if leaf_page == root {
+        // A root leaf may legally empty; no siblings exist.
+        write_leaf_page(pager, leaf_page, kept.as_slice(), false).await?;
+        free_table_overflow(pager, &removed).await?;
+        return Ok(true);
+    }
+    if !page_underfull(table_leaf_free(usable, leaf_page, kept.as_slice()), usable) {
+        write_leaf_page(pager, leaf_page, kept.as_slice(), false).await?;
+        free_table_overflow(pager, &removed).await?;
+        return Ok(true);
+    }
+    // Underfull: balance the leaf's window. The leaf page itself
+    // has not been written yet — the balance gathers the kept
+    // cells from `preset`, and a Rebuild verdict therefore still
+    // sees the untouched tree (the row included) on disk.
+    let (parent, trigger) = *path.as_slice().last().expect("non-root leaf has a parent");
+    let outcome =
+        balance_table_window(pager, root, parent, trigger, Some((leaf_page, kept))).await?;
+    let mut removed_children = match outcome {
+        TableBalance::Rebuild => {
+            btree_rebuild_without(pager, root, rowid).await?;
+            return Ok(true);
         }
+        TableBalance::Done { children_removed } => children_removed,
+    };
+    free_table_overflow(pager, &removed).await?;
+    // Cascade: while the parent that just lost children is
+    // itself underfull, balance it among its own siblings; a
+    // root that ends with one child collapses.
+    let mut cur = path.len() - 1; // path index of the page whose children were just balanced
+    loop {
+        let cur_page = path.as_slice()[cur].0;
+        if cur_page == root {
+            collapse_table_root(pager, root).await?;
+            break;
+        }
+        if removed_children == 0 {
+            break;
+        }
+        // Is the current page (an interior page that lost
+        // children) itself underfull?
+        let idx = pager.load(cur_page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), cur_page)?;
+        if h.kind != KIND_INTERIOR_TABLE {
+            break;
+        }
+        let (cpairs, _) = interior_cells::<S::Error>(snap.as_slice(), cur_page)?;
+        if !page_underfull(
+            table_interior_free(usable, cur_page, cpairs.as_slice()),
+            usable,
+        ) {
+            break;
+        }
+        if cur == 0 {
+            // cur_page is the root (handled above) — unreachable,
+            // but never loop forever on a foreign shape.
+            break;
+        }
+        let (gp, gtrigger) = path.as_slice()[cur - 1];
+        let outcome = balance_table_window(pager, root, gp, gtrigger, None).await?;
+        match outcome {
+            TableBalance::Rebuild => {
+                // The lower levels are already consistently
+                // rebalanced and the row is gone; a whole-tree
+                // rebuild from the surviving rows is still a
+                // correct (if blunt) finish.
+                btree_rebuild_without(pager, root, rowid).await?;
+                return Ok(true);
+            }
+            TableBalance::Done { children_removed } => {
+                removed_children = children_removed;
+            }
+        }
+        cur -= 1;
     }
     Ok(true)
 }
@@ -2192,6 +2909,487 @@ fn encode_entry_payload(e: &IndexEntry) -> AVec<u8> {
     rec
 }
 
+// ----------------------------------------------------------------
+// Index B-tree delete balancing (v0.14): the same window
+// redistribution / merge / cascade / root-collapse machinery as
+// the table path, over the index entry sequence. An index
+// window's combined sequence interleaves the window pages' own
+// entries with the parent dividers between them (each divider
+// is an ordinary entry of the tree); re-splitting lifts one
+// entry per boundary back into the parent as the new divider.
+// Interior pages flatten the same way, each entry carrying its
+// left child pointer, plus one trailing rightmost pointer.
+// ----------------------------------------------------------------
+
+/// Outcome of one index window balance.
+#[cfg(feature = "indexes")]
+enum IndexBalance {
+    /// The window was redistributed (and possibly merged);
+    /// `children_removed` counts how many children the parent
+    /// lost.
+    Done { children_removed: usize },
+    /// Degenerate window (a whole subtree level emptied under a
+    /// non-root parent). No window page was written; the caller
+    /// falls back to a rebuild.
+    Rebuild,
+}
+
+/// The cells, rightmost pointer and ordered children of an
+/// interior index page.
+#[cfg(feature = "indexes")]
+async fn index_children<S: Storage>(
+    pager: &mut Pager<S>,
+    page: u32,
+) -> Result<(AVec<IndexCell>, u32, AVec<u32>), S::Error> {
+    let usable = pager.usable() as usize;
+    let idx = pager.load(page).await?;
+    let snap = copy_bytes(pager.frame_data(idx));
+    let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+    let mut children: AVec<u32> = AVec::new();
+    for c in cells.iter() {
+        children.push(c.child);
+    }
+    children.push(rightmost);
+    Ok((cells, rightmost, children))
+}
+
+/// Patch an interior cell's child pointer (the cell struct and
+/// the first four bytes of its image).
+#[cfg(feature = "indexes")]
+fn patch_child(cell: &mut IndexCell, child: u32) {
+    cell.child = child;
+    let nb = child.to_be_bytes();
+    cell.bytes.as_mut_slice()[..4].copy_from_slice(&nb);
+}
+
+/// Rebuild a parent's (cells, rightmost) after its children
+/// `start..end` were replaced by `new_pages` with `dividers`
+/// (entries in `divider_prefix`-byte-prefixed form; divider `i`
+/// separates new page `i` from new page `i + 1` and is stored
+/// with child = new page `i`). An empty `new_pages` drops the
+/// window's children and their preceding dividers wholesale.
+#[cfg(feature = "indexes")]
+fn index_parent_after(
+    cells: &[IndexCell],
+    children: &[u32],
+    start: usize,
+    end: usize,
+    new_pages: &[u32],
+    dividers: &[IndexCell],
+    divider_prefix: usize,
+) -> (AVec<IndexCell>, u32) {
+    let mut nc: AVec<IndexCell> = AVec::new();
+    let mut nchildren: AVec<u32> = AVec::new();
+    for j in 0..start {
+        nchildren.push(children[j]);
+        nc.push(cells[j].clone());
+    }
+    for (i, p) in new_pages.iter().enumerate() {
+        nchildren.push(*p);
+        if i + 1 < new_pages.len() {
+            nc.push(recell(Some(*p), &dividers[i], divider_prefix));
+        }
+    }
+    if !new_pages.is_empty() && end < children.len() {
+        // The divider that followed the old window now follows
+        // the last new page; only its child pointer changes.
+        let mut sep = cells[end - 1].clone();
+        patch_child(&mut sep, *new_pages.last().expect("non-empty"));
+        nc.push(sep);
+    }
+    for j in end..children.len() {
+        nchildren.push(children[j]);
+        if j < cells.len() {
+            nc.push(cells[j].clone());
+        }
+    }
+    let rightmost = nchildren.as_slice()[nchildren.len() - 1];
+    (nc, rightmost)
+}
+
+/// Partition a combined window sequence into page groups plus
+/// one lifted divider per boundary (the last item of each group
+/// but the last). Tries the pin's quota distribution first and
+/// verifies every group fits its page; falls back to greedy
+/// maximal packing, which always fits when any partition does.
+#[cfg(feature = "indexes")]
+fn partition_index(
+    items: &[IndexCell],
+    n_new: usize,
+    usable: usize,
+    interior: bool,
+) -> (AVec<AVec<IndexCell>>, AVec<IndexCell>) {
+    let weights: AVec<usize> = {
+        let mut w = AVec::new();
+        for c in items.iter() {
+            w.push(c.bytes.len() + 2);
+        }
+        w
+    };
+    let phantom = usable - if interior { 12 } else { 8 };
+    let groups = distribute(items, weights.as_slice(), n_new, phantom);
+    // Lift dividers and verify capacity.
+    let mut pages: AVec<AVec<IndexCell>> = AVec::new();
+    let mut dividers: AVec<IndexCell> = AVec::new();
+    let mut ok = true;
+    for (i, g) in groups.iter().enumerate() {
+        let mut g = g.clone();
+        if i + 1 < groups.len() {
+            match g.pop() {
+                Some(d) => dividers.push(d),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if g.is_empty() || index_page_need(g.as_slice(), 0, interior) > usable {
+            ok = false;
+            break;
+        }
+        pages.push(g);
+    }
+    if ok {
+        return (pages, dividers);
+    }
+    // Greedy maximal packing: fill each page until the next
+    // item no longer fits; the page's last item lifts as the
+    // divider and the item starts the next page. A one-item
+    // page has no item to spare, so there the incoming item
+    // lifts as the divider instead.
+    let mut pages: AVec<AVec<IndexCell>> = AVec::new();
+    let mut dividers: AVec<IndexCell> = AVec::new();
+    let mut cur: AVec<IndexCell> = AVec::new();
+    for item in items.iter() {
+        if cur.is_empty() {
+            cur.push(item.clone());
+            continue;
+        }
+        let mut trial = cur.clone();
+        trial.push(item.clone());
+        if index_page_need(trial.as_slice(), 0, interior) <= usable {
+            cur = trial;
+        } else if cur.len() >= 2 {
+            let d = cur.pop().expect("cur has a divider candidate");
+            dividers.push(d);
+            pages.push(cur);
+            cur = AVec::new();
+            cur.push(item.clone());
+        } else {
+            dividers.push(item.clone());
+            pages.push(cur);
+            cur = AVec::new();
+        }
+    }
+    if !cur.is_empty() {
+        pages.push(cur);
+    }
+    (pages, dividers)
+}
+
+/// Minimum page count for a combined sequence, by greedy
+/// maximal packing with divider lifting (mirrors
+/// `partition_index`'s fallback arithmetic).
+#[cfg(feature = "indexes")]
+fn index_min_pages(items: &[IndexCell], usable: usize, interior: bool) -> usize {
+    let mut pages = 1usize;
+    let mut cur_need = if interior { 12 } else { 8 };
+    for item in items.iter() {
+        let add = item.bytes.len() + 2;
+        if cur_need + add > usable && cur_need > if interior { 12 } else { 8 } {
+            pages += 1;
+            cur_need = if interior { 12 } else { 8 } + add;
+        } else {
+            cur_need += add;
+        }
+    }
+    pages
+}
+
+/// Balance the window of `parent`'s children around child
+/// index `trigger`. `preset` supplies the trigger leaf's kept
+/// cells when the caller holds an un-written delete (the leaf
+/// on disk still contains the removed entry).
+#[cfg(feature = "indexes")]
+async fn balance_index_window<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    parent: u32,
+    trigger: usize,
+    preset: Option<(u32, AVec<IndexCell>)>,
+) -> Result<IndexBalance, S::Error> {
+    let (cells, _rightmost, children) = index_children(pager, parent).await?;
+    let (start, end) = window_range(children.len(), trigger);
+    let window_pages: AVec<u32> = {
+        let mut w = AVec::new();
+        for j in start..end {
+            w.push(children[j]);
+        }
+        w
+    };
+    // Dispatch on the first window child's kind.
+    let idx = pager.load(window_pages.as_slice()[0]).await?;
+    let snap = copy_bytes(pager.frame_data(idx));
+    let h = head::<S::Error>(snap.as_slice(), window_pages.as_slice()[0])?;
+    match h.kind {
+        KIND_LEAF_INDEX => {
+            balance_index_leaf_window(
+                pager,
+                root,
+                parent,
+                cells.as_slice(),
+                children.as_slice(),
+                start,
+                end,
+                window_pages.as_slice(),
+                preset,
+            )
+            .await
+        }
+        KIND_INTERIOR_INDEX => {
+            balance_index_interior_window(
+                pager,
+                root,
+                parent,
+                cells.as_slice(),
+                children.as_slice(),
+                start,
+                end,
+                window_pages.as_slice(),
+            )
+            .await
+        }
+        _ => Err(Error::Unsupported),
+    }
+}
+
+#[cfg(feature = "indexes")]
+#[allow(clippy::too_many_arguments)]
+async fn balance_index_leaf_window<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    parent: u32,
+    pcells: &[IndexCell],
+    children: &[u32],
+    start: usize,
+    end: usize,
+    window_pages: &[u32],
+    preset: Option<(u32, AVec<IndexCell>)>,
+) -> Result<IndexBalance, S::Error> {
+    let usable = pager.usable() as usize;
+    // Gather: window leaves' entries in order, interleaved
+    // with the parent dividers between them (converted to leaf
+    // form).
+    let mut all: AVec<IndexCell> = AVec::new();
+    for (wi, wp) in window_pages.iter().enumerate() {
+        let preset_hit = match &preset {
+            Some((pp, kept)) if pp == wp => Some(kept),
+            _ => None,
+        };
+        match preset_hit {
+            Some(kept) => {
+                for c in kept.iter() {
+                    all.push(c.clone());
+                }
+            }
+            None => {
+                let idx = pager.load(*wp).await?;
+                let snap = copy_bytes(pager.frame_data(idx));
+                let cells = index_leaf_cells::<S::Error>(snap.as_slice(), *wp, usable)?;
+                for c in cells.iter() {
+                    all.push(c.clone());
+                }
+            }
+        }
+        if wi + 1 < window_pages.len() {
+            all.push(recell(None, &pcells[start + wi], 4));
+        }
+    }
+    if all.is_empty() {
+        if start == 0 && end == children.len() {
+            if parent == root {
+                for wp in window_pages.iter() {
+                    pager.free_page(*wp).await?;
+                }
+                let empty: &[IndexCell] = &[];
+                write_index_page(pager, root, empty, 0, false, false).await?;
+                return Ok(IndexBalance::Done {
+                    children_removed: window_pages.len(),
+                });
+            }
+            return Ok(IndexBalance::Rebuild);
+        }
+        let (nc, nright) = index_parent_after(pcells, children, start, end, &[], &[], 0);
+        for wp in window_pages.iter() {
+            pager.free_page(*wp).await?;
+        }
+        write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
+        return Ok(IndexBalance::Done {
+            children_removed: window_pages.len(),
+        });
+    }
+    let n_new = index_min_pages(all.as_slice(), usable, false).min(window_pages.len());
+    let (pages, dividers) = partition_index(all.as_slice(), n_new, usable, false);
+    let n_new = pages.len();
+    for (i, g) in pages.iter().enumerate() {
+        write_index_page(pager, window_pages[i], g.as_slice(), 0, false, false).await?;
+    }
+    for wp in window_pages.iter().skip(n_new) {
+        pager.free_page(*wp).await?;
+    }
+    let new_pages: AVec<u32> = {
+        let mut v = AVec::new();
+        for wp in window_pages.iter().take(n_new) {
+            v.push(*wp);
+        }
+        v
+    };
+    let (nc, nright) = index_parent_after(
+        pcells,
+        children,
+        start,
+        end,
+        new_pages.as_slice(),
+        dividers.as_slice(),
+        0,
+    );
+    write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
+    Ok(IndexBalance::Done {
+        children_removed: window_pages.len() - n_new,
+    })
+}
+
+#[cfg(feature = "indexes")]
+#[allow(clippy::too_many_arguments)]
+async fn balance_index_interior_window<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    parent: u32,
+    pcells: &[IndexCell],
+    children: &[u32],
+    start: usize,
+    end: usize,
+    window_pages: &[u32],
+) -> Result<IndexBalance, S::Error> {
+    let usable = pager.usable() as usize;
+    // Gather: window interior pages' entries in order, each
+    // page's rightmost pointer becoming the child of the
+    // following parent divider item; the last page's rightmost
+    // is the sequence's trailing child.
+    let mut all: AVec<IndexCell> = AVec::new();
+    let mut trailing = 0u32;
+    for (wi, wp) in window_pages.iter().enumerate() {
+        let idx = pager.load(*wp).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), *wp, usable)?;
+        for c in cells.iter() {
+            all.push(c.clone());
+        }
+        if wi + 1 < window_pages.len() {
+            let mut d = pcells[start + wi].clone();
+            patch_child(&mut d, rightmost);
+            all.push(d);
+        } else {
+            trailing = rightmost;
+        }
+    }
+    if all.is_empty() {
+        if start == 0 && end == children.len() {
+            if parent == root {
+                for wp in window_pages.iter() {
+                    pager.free_page(*wp).await?;
+                }
+                let empty: &[IndexCell] = &[];
+                write_index_page(pager, root, empty, 0, false, false).await?;
+                return Ok(IndexBalance::Done {
+                    children_removed: window_pages.len(),
+                });
+            }
+            return Ok(IndexBalance::Rebuild);
+        }
+        let (nc, nright) = index_parent_after(pcells, children, start, end, &[], &[], 4);
+        for wp in window_pages.iter() {
+            pager.free_page(*wp).await?;
+        }
+        write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
+        return Ok(IndexBalance::Done {
+            children_removed: window_pages.len(),
+        });
+    }
+    let n_new = index_min_pages(all.as_slice(), usable, true).min(window_pages.len());
+    let (pages, dividers) = partition_index(all.as_slice(), n_new, usable, true);
+    let n_new = pages.len();
+    for (i, g) in pages.iter().enumerate() {
+        let right = if i + 1 < n_new {
+            dividers.as_slice()[i].child
+        } else {
+            trailing
+        };
+        write_index_page(pager, window_pages[i], g.as_slice(), right, true, false).await?;
+    }
+    for wp in window_pages.iter().skip(n_new) {
+        pager.free_page(*wp).await?;
+    }
+    let new_pages: AVec<u32> = {
+        let mut v = AVec::new();
+        for wp in window_pages.iter().take(n_new) {
+            v.push(*wp);
+        }
+        v
+    };
+    let (nc, nright) = index_parent_after(
+        pcells,
+        children,
+        start,
+        end,
+        new_pages.as_slice(),
+        dividers.as_slice(),
+        4,
+    );
+    write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
+    Ok(IndexBalance::Done {
+        children_removed: window_pages.len() - n_new,
+    })
+}
+
+/// Collapse an index root that has been reduced to a single
+/// child: copy the child's image into the root page and free
+/// the child, repeating while the root stays a one-child
+/// interior page.
+#[cfg(feature = "indexes")]
+async fn collapse_index_root<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<(), S::Error> {
+    let usable = pager.usable() as usize;
+    loop {
+        let idx = pager.load(root).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), root)?;
+        if h.kind != KIND_INTERIOR_INDEX {
+            return Ok(());
+        }
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), root, usable)?;
+        if !cells.is_empty() {
+            return Ok(());
+        }
+        let child = rightmost;
+        let cidx = pager.load(child).await?;
+        let csnap = copy_bytes(pager.frame_data(cidx));
+        let ch = head::<S::Error>(csnap.as_slice(), child)?;
+        match ch.kind {
+            KIND_LEAF_INDEX => {
+                let ccells = index_leaf_cells::<S::Error>(csnap.as_slice(), child, usable)?;
+                write_index_page(pager, root, ccells.as_slice(), 0, false, false).await?;
+            }
+            KIND_INTERIOR_INDEX => {
+                let (ccells, cright) =
+                    index_interior_cells::<S::Error>(csnap.as_slice(), child, usable)?;
+                write_index_page(pager, root, ccells.as_slice(), cright, true, false).await?;
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        pager.free_page(child).await?;
+    }
+}
+
 /// Rebuild the index rooted at `root` without the entry `skip`
 /// (the index_delete fallback): collect the surviving entries,
 /// free every page but the root, reset the root to an empty
@@ -2229,16 +3427,34 @@ async fn index_rebuild_without<S: Storage>(
     Ok(())
 }
 
+/// How a leaf-level index removal ended, for the driver's
+/// rebuild bookkeeping.
+#[cfg(feature = "indexes")]
+enum IndexRemoval {
+    /// Removed; the tree is consistent.
+    Done,
+    /// A balance reported the degenerate window BEFORE any
+    /// page was written: the entry is still in the tree.
+    RebuildBeforeWrite,
+    /// A balance cascade reported the degenerate window AFTER
+    /// the entry was removed: the tree no longer holds it.
+    RebuildAfterRemoval,
+}
+
 /// Delete the entry whose full key is `payload` (key columns +
 /// rowid) from the index rooted at `root`. Returns whether an
 /// entry was present.
 ///
-/// The recursive worker removes entries in place wherever the
-/// format allows; when a delete would empty a non-root leaf it
-/// reports `IndexDel::Rebuild` having made NO mutation on that
-/// path, and this wrapper rebuilds the index without the entry
-/// (SQLite rebalances; hipp's no-merge design rebuilds, which
-/// is always format-legal).
+/// The descent mirrors `btree_delete`: it records the path,
+/// removes the entry from its leaf, and balances underfull
+/// windows upward (redistribution / merge / cascade / root
+/// collapse — the same rules as the table path). An entry
+/// resident in an interior page is replaced by its predecessor
+/// (the greatest entry of its left subtree); the predecessor is
+/// removed from its leaf first, and the replacement is then
+/// written wherever the entry lives by then (re-seek — a
+/// balance may have moved it). The whole-tree rebuild survives
+/// only as the degenerate-window fallback.
 #[cfg(feature = "indexes")]
 pub async fn index_delete<S: Storage>(
     pager: &mut Pager<S>,
@@ -2246,45 +3462,19 @@ pub async fn index_delete<S: Storage>(
     payload: &[u8],
     desc: &[bool],
 ) -> Result<bool, S::Error> {
-    let target = decode_index_entry::<S::Error>(payload, desc.len() + 1)?;
-    match index_delete_rec(pager, root, root, &target, desc).await? {
-        IndexDel::Absent => Ok(false),
-        IndexDel::Done => Ok(true),
-        IndexDel::Rebuild => {
-            index_rebuild_without(pager, root, desc, &target).await?;
-            Ok(true)
-        }
-    }
-}
-
-/// Outcome of the recursive index delete.
-#[cfg(feature = "indexes")]
-enum IndexDel {
-    /// The entry was not present.
-    Absent,
-    /// The entry was removed; the tree is fully consistent.
-    Done,
-    /// A non-root leaf would empty. No mutation was made on
-    /// this path; the top level rebuilds without the target.
-    Rebuild,
-}
-
-/// Recursive worker for `index_delete`: delete `target` from
-/// the subtree rooted at `page` (`root` stays the index root,
-/// for the emptiness test). Descends iteratively; the only
-/// recursion is the predecessor removal in the interior case.
-#[cfg(feature = "indexes")]
-async fn index_delete_rec<S: Storage>(
-    pager: &mut Pager<S>,
-    root: u32,
-    mut page: u32,
-    target: &IndexEntry,
-    desc: &[bool],
-) -> Result<IndexDel, S::Error> {
     use core::cmp::Ordering;
     let usable = pager.usable() as usize;
     let nfields = desc.len() + 1;
-    loop {
+    let target = decode_index_entry::<S::Error>(payload, nfields)?;
+    // ---- descent, recording (page, child index) pairs ----
+    let mut path: AVec<(u32, usize)> = AVec::new();
+    let mut page = root;
+    // An interior-resident target leaves a pending replacement:
+    // (predecessor entry, its leaf-form cell with a fresh
+    // overflow chain already written).
+    let mut pending: Option<(IndexEntry, IndexCell)> = None;
+    let mut leaf_target = target.clone();
+    let (leaf_page, leaf_cells, leaf_pos) = loop {
         let idx = pager.load(page).await?;
         let snap = copy_bytes(pager.frame_data(idx));
         let h = head::<S::Error>(snap.as_slice(), page)?;
@@ -2297,7 +3487,7 @@ async fn index_delete_rec<S: Storage>(
             for (i, c) in cells.iter().enumerate() {
                 let p = index_cell_payload(pager, c).await?;
                 let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-                if compare_entries(e.values.as_slice(), target.values.as_slice(), desc)
+                if compare_entries(e.values.as_slice(), leaf_target.values.as_slice(), desc)
                     == Ordering::Equal
                 {
                     hit = Some(i);
@@ -2305,25 +3495,286 @@ async fn index_delete_rec<S: Storage>(
                 }
             }
             let Some(pos) = hit else {
-                return Ok(IndexDel::Absent);
+                if let Some((_, cell)) = &pending
+                    && cell.overflow != 0
+                {
+                    free_overflow_chain(pager, cell.overflow).await?;
+                }
+                return Ok(false);
             };
-            if cells.len() == 1 && page != root {
-                // The leaf's last entry: an empty non-root page
-                // is format-illegal (see btree_delete).
-                return Ok(IndexDel::Rebuild);
+            break (page, cells, pos);
+        }
+        if h.kind != KIND_INTERIOR_INDEX {
+            return Err(Error::Unsupported);
+        }
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+        let mut descend = None;
+        let mut child_idx = cells.len();
+        let mut hit = None;
+        for (i, c) in cells.iter().enumerate() {
+            let p = index_cell_payload(pager, c).await?;
+            let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+            match compare_entries(leaf_target.values.as_slice(), e.values.as_slice(), desc) {
+                Ordering::Equal => {
+                    hit = Some(i);
+                    break;
+                }
+                Ordering::Less => {
+                    descend = Some(c.child);
+                    child_idx = i;
+                    break;
+                }
+                Ordering::Greater => {}
             }
-            let removed = cells.as_slice()[pos].clone();
-            let mut kept: AVec<IndexCell> = AVec::new();
-            for (i, c) in cells.iter().enumerate() {
-                if i != pos {
-                    kept.push(c.clone());
+        }
+        if let Some(pos) = hit {
+            if pending.is_some() {
+                // The leaf target (a predecessor) is itself
+                // interior-resident — impossible in a valid
+                // tree (the predecessor is the maximum of the
+                // subtree, so it lives in its rightmost leaf).
+                return Err(Error::CorruptPage { page });
+            }
+            // Interior-resident target: replace with the
+            // predecessor, then delete the predecessor from
+            // its leaf. The replacement is applied by re-seek
+            // after the leaf removal (see below).
+            let child = cells.as_slice()[pos].child;
+            let pred = {
+                let mut cur = IndexCursor::new(child, desc);
+                let mut last: Option<IndexEntry> = None;
+                while let Some(e) = cur.next_entry(pager).await? {
+                    last = Some(e);
+                }
+                last
+            };
+            let Some(pred) = pred else {
+                // The left subtree holds no entries at all
+                // (defensive; a valid tree never has one):
+                // drop the cell and free the subtree's pages.
+                let sub = collect_index_pages(pager, child).await?;
+                let mut kept: AVec<IndexCell> = AVec::new();
+                for (j, c) in cells.iter().enumerate() {
+                    if j != pos {
+                        kept.push(c.clone());
+                    }
+                }
+                write_index_page(pager, page, kept.as_slice(), rightmost, true, false).await?;
+                for p in sub.iter() {
+                    pager.free_page(*p).await?;
+                }
+                return Ok(true);
+            };
+            let pred_payload = encode_entry_payload(&pred);
+            let local_len = index_local(usable, pred_payload.len());
+            let ovf = write_overflow(pager, pred_payload.as_slice(), local_len).await?;
+            let mut cell_bytes = AVec::new();
+            encode_varint(pred_payload.len() as u64, &mut cell_bytes);
+            for b in &pred_payload.as_slice()[..local_len] {
+                cell_bytes.push(*b);
+            }
+            if ovf != 0 {
+                for b in ovf.to_be_bytes() {
+                    cell_bytes.push(b);
                 }
             }
-            write_index_page(pager, page, kept.as_slice(), 0, false, false).await?;
-            if removed.overflow != 0 {
-                free_overflow_chain(pager, removed.overflow).await?;
+            let pred_cell = IndexCell {
+                child: 0,
+                payload_off: cell_bytes.len() - local_len - if ovf != 0 { 4 } else { 0 },
+                bytes: cell_bytes,
+                payload_len: pred_payload.len(),
+                local_len,
+                overflow: ovf,
+            };
+            pending = Some((pred.clone(), pred_cell));
+            leaf_target = pred;
+            path.push((page, pos));
+            page = child;
+            continue;
+        }
+        path.push((page, child_idx));
+        page = descend.unwrap_or(rightmost);
+    };
+    // ---- remove the entry from its leaf ----
+    let removed = leaf_cells.as_slice()[leaf_pos].clone();
+    let mut kept: AVec<IndexCell> = AVec::new();
+    for (i, c) in leaf_cells.iter().enumerate() {
+        if i != leaf_pos {
+            kept.push(c.clone());
+        }
+    }
+    let removal = index_remove_from_leaf(pager, root, leaf_page, kept, path.as_slice()).await?;
+    match removal {
+        IndexRemoval::Done => {}
+        IndexRemoval::RebuildBeforeWrite | IndexRemoval::RebuildAfterRemoval => {
+            // Fall back to a whole-index rebuild. Before-write:
+            // the tree still holds both entries, rebuild without
+            // the target. After-removal: the leaf entry is gone,
+            // so the rebuild must re-add it (it survives as the
+            // pending replacement's source entry — for a plain
+            // leaf delete there is no pending entry, and the
+            // removed entry is simply the target itself, which
+            // the rebuild skips anyway; the removed entry is
+            // re-added only when a replacement is pending).
+            if let Some((_, cell)) = &pending
+                && cell.overflow != 0
+            {
+                free_overflow_chain(pager, cell.overflow).await?;
             }
-            return Ok(IndexDel::Done);
+            match (removal, &pending) {
+                (IndexRemoval::RebuildAfterRemoval, Some((pred, _))) => {
+                    index_rebuild_without_extra(pager, root, desc, &target, Some(pred)).await?;
+                }
+                _ => {
+                    index_rebuild_without(pager, root, desc, &target).await?;
+                }
+            }
+            return Ok(true);
+        }
+    }
+    if removed.overflow != 0 {
+        free_overflow_chain(pager, removed.overflow).await?;
+    }
+    // ---- apply a pending predecessor replacement by re-seek --
+    if let Some((pred_entry, pred_cell)) = pending {
+        index_apply_replacement(pager, root, &target, &pred_entry, &pred_cell, desc).await?;
+    }
+    Ok(true)
+}
+
+/// Remove `kept`'s page-mate entry: write `kept` as the new
+/// content of `leaf_page` (a non-root leaf whose previous
+/// content was `kept` plus the removed entry), balancing
+/// upward along `path` when the leaf underflows. The removed
+/// entry's overflow chain is the caller's to free, and only on
+/// `Done`.
+#[cfg(feature = "indexes")]
+async fn index_remove_from_leaf<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    leaf_page: u32,
+    kept: AVec<IndexCell>,
+    path: &[(u32, usize)],
+) -> Result<IndexRemoval, S::Error> {
+    let usable = pager.usable() as usize;
+    if leaf_page == root {
+        write_index_page(pager, leaf_page, kept.as_slice(), 0, false, false).await?;
+        return Ok(IndexRemoval::Done);
+    }
+    let free = usable - index_page_need(kept.as_slice(), 0, false);
+    if !page_underfull(free, usable) {
+        write_index_page(pager, leaf_page, kept.as_slice(), 0, false, false).await?;
+        return Ok(IndexRemoval::Done);
+    }
+    let (parent, trigger) = *path.last().expect("non-root leaf has a parent");
+    let outcome =
+        balance_index_window(pager, root, parent, trigger, Some((leaf_page, kept))).await?;
+    let mut removed_children = match outcome {
+        IndexBalance::Rebuild => return Ok(IndexRemoval::RebuildBeforeWrite),
+        IndexBalance::Done { children_removed } => children_removed,
+    };
+    // Cascade, mirroring the table delete: balance each
+    // ancestor that lost children and is itself underfull;
+    // collapse a one-child root.
+    let mut cur = path.len() - 1;
+    loop {
+        let cur_page = path[cur].0;
+        if cur_page == root {
+            collapse_index_root(pager, root).await?;
+            break;
+        }
+        if removed_children == 0 {
+            break;
+        }
+        let idx = pager.load(cur_page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), cur_page)?;
+        if h.kind != KIND_INTERIOR_INDEX {
+            break;
+        }
+        let (cells, _) = index_interior_cells::<S::Error>(snap.as_slice(), cur_page, usable)?;
+        let free = usable - index_page_need(cells.as_slice(), 0, true);
+        if !page_underfull(free, usable) {
+            break;
+        }
+        if cur == 0 {
+            break;
+        }
+        let (gp, gtrigger) = path[cur - 1];
+        let outcome = balance_index_window(pager, root, gp, gtrigger, None).await?;
+        match outcome {
+            IndexBalance::Rebuild => return Ok(IndexRemoval::RebuildAfterRemoval),
+            IndexBalance::Done { children_removed } => {
+                removed_children = children_removed;
+            }
+        }
+        cur -= 1;
+    }
+    Ok(IndexRemoval::Done)
+}
+
+/// Write the predecessor replacement: find `target` again
+/// (a balance may have moved it between pages or between an
+/// interior page and a leaf) and replace its cell with
+/// `pred_cell` (leaf form; re-celled onto the found cell's
+/// child when the found cell is interior). Falls back to a
+/// rebuild when the replacement does not fit the page it now
+/// lives on.
+#[cfg(feature = "indexes")]
+async fn index_apply_replacement<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    target: &IndexEntry,
+    pred_entry: &IndexEntry,
+    pred_cell: &IndexCell,
+    desc: &[bool],
+) -> Result<(), S::Error> {
+    use core::cmp::Ordering;
+    let usable = pager.usable() as usize;
+    let nfields = desc.len() + 1;
+    let mut page = root;
+    loop {
+        let idx = pager.load(page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        if h.is_leaf() {
+            if h.kind != KIND_LEAF_INDEX {
+                return Err(Error::Unsupported);
+            }
+            let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+            for (i, c) in cells.iter().enumerate() {
+                let p = index_cell_payload(pager, c).await?;
+                let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+                if compare_entries(e.values.as_slice(), target.values.as_slice(), desc)
+                    == Ordering::Equal
+                {
+                    let mut nc: AVec<IndexCell> = AVec::new();
+                    for (j, cc) in cells.iter().enumerate() {
+                        nc.push(if j == i {
+                            pred_cell.clone()
+                        } else {
+                            cc.clone()
+                        });
+                    }
+                    if index_page_need(nc.as_slice(), 0, false) > usable {
+                        if pred_cell.overflow != 0 {
+                            free_overflow_chain(pager, pred_cell.overflow).await?;
+                        }
+                        // The predecessor entry is already out
+                        // of its leaf; re-add it via the rebuild.
+                        index_rebuild_without_extra(pager, root, desc, target, Some(pred_entry))
+                            .await?;
+                        return Ok(());
+                    }
+                    let old_ovf = cells.as_slice()[i].overflow;
+                    write_index_page(pager, page, nc.as_slice(), 0, false, false).await?;
+                    if old_ovf != 0 {
+                        free_overflow_chain(pager, old_ovf).await?;
+                    }
+                    return Ok(());
+                }
+            }
+            return Err(Error::CorruptPage { page });
         }
         if h.kind != KIND_INTERIOR_INDEX {
             return Err(Error::Unsupported);
@@ -2350,106 +3801,69 @@ async fn index_delete_rec<S: Storage>(
             page = descend.unwrap_or(rightmost);
             continue;
         };
-        // Interior-resident target: replace it with the
-        // predecessor (the greatest entry of its left subtree,
-        // read by an in-order walk), then delete the
-        // predecessor from that subtree.
-        let child = cells.as_slice()[pos].child;
-        let pred = {
-            let mut cur = IndexCursor::new(child, desc);
-            let mut last: Option<IndexEntry> = None;
-            while let Some(e) = cur.next_entry(pager).await? {
-                last = Some(e);
-            }
-            last
-        };
-        let Some(pred) = pred else {
-            // The left subtree holds no entries at all
-            // (defensive; a valid tree never has one): drop
-            // the cell and free the subtree's pages.
-            let sub = collect_index_pages(pager, child).await?;
-            let mut kept: AVec<IndexCell> = AVec::new();
-            for (j, c) in cells.iter().enumerate() {
-                if j != pos {
-                    kept.push(c.clone());
-                }
-            }
-            write_index_page(pager, page, kept.as_slice(), rightmost, true, false).await?;
-            for p in sub.iter() {
-                pager.free_page(*p).await?;
-            }
-            return Ok(IndexDel::Done);
-        };
-        // Fit-check the replacement BEFORE touching the
-        // predecessor: on any failure path below, the rebuild
-        // at the top level (without the target) must still see
-        // the predecessor in its leaf.
-        let pred_payload = encode_entry_payload(&pred);
-        let local_len = index_local(usable, pred_payload.len());
-        let ovf = write_overflow(pager, pred_payload.as_slice(), local_len).await?;
-        let mut cell_bytes = AVec::new();
-        for b in child.to_be_bytes() {
-            cell_bytes.push(b);
-        }
-        encode_varint(pred_payload.len() as u64, &mut cell_bytes);
-        for b in &pred_payload.as_slice()[..local_len] {
-            cell_bytes.push(*b);
-        }
-        if ovf != 0 {
-            for b in ovf.to_be_bytes() {
-                cell_bytes.push(b);
-            }
-        }
-        let new_cell = IndexCell {
-            child,
-            payload_off: cell_bytes.len() - local_len - if ovf != 0 { 4 } else { 0 },
-            bytes: cell_bytes,
-            payload_len: pred_payload.len(),
-            local_len,
-            overflow: ovf,
-        };
-        let mut ncells: AVec<IndexCell> = AVec::new();
+        let found = cells.as_slice()[pos].clone();
+        let new_cell = recell(Some(found.child), pred_cell, 0);
+        let mut nc: AVec<IndexCell> = AVec::new();
         for (j, c) in cells.iter().enumerate() {
-            ncells.push(if j == pos {
+            nc.push(if j == pos {
                 new_cell.clone()
             } else {
                 c.clone()
             });
         }
-        if index_page_need(ncells.as_slice(), 0, true) > usable {
-            // The replacement does not fit this interior
-            // page: free the fresh chain and rebuild.
-            if ovf != 0 {
-                free_overflow_chain(pager, ovf).await?;
+        if index_page_need(nc.as_slice(), 0, true) > usable {
+            if pred_cell.overflow != 0 {
+                free_overflow_chain(pager, pred_cell.overflow).await?;
             }
-            return Ok(IndexDel::Rebuild);
+            index_rebuild_without_extra(pager, root, desc, target, Some(pred_entry)).await?;
+            return Ok(());
         }
-        match alloc::boxed::Box::pin(index_delete_rec(pager, root, child, &pred, desc)).await? {
-            IndexDel::Done => {}
-            IndexDel::Rebuild => {
-                // Nothing on the predecessor path was mutated;
-                // free the fresh chain and let the top level
-                // rebuild without the original target.
-                if ovf != 0 {
-                    free_overflow_chain(pager, ovf).await?;
-                }
-                return Ok(IndexDel::Rebuild);
-            }
-            IndexDel::Absent => {
-                // The predecessor was just read out of this
-                // subtree; absent is an engine bug, never a
-                // silent "not found".
-                if ovf != 0 {
-                    free_overflow_chain(pager, ovf).await?;
-                }
-                return Err(Error::CorruptPage { page: child });
-            }
+        write_index_page(pager, page, nc.as_slice(), rightmost, true, false).await?;
+        if found.overflow != 0 {
+            free_overflow_chain(pager, found.overflow).await?;
         }
-        let old_ovf = cells.as_slice()[pos].overflow;
-        write_index_page(pager, page, ncells.as_slice(), rightmost, true, false).await?;
-        if old_ovf != 0 {
-            free_overflow_chain(pager, old_ovf).await?;
-        }
-        return Ok(IndexDel::Done);
+        return Ok(());
     }
+}
+
+/// Rebuild without `skip`, re-adding `extra` (an entry the
+/// tree currently lacks because a balance removed it before
+/// the rebuild fallback fired).
+#[cfg(feature = "indexes")]
+async fn index_rebuild_without_extra<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    desc: &[bool],
+    skip: &IndexEntry,
+    extra: Option<&IndexEntry>,
+) -> Result<(), S::Error> {
+    use core::cmp::Ordering;
+    let mut keep: AVec<AVec<u8>> = AVec::new();
+    {
+        let mut cur = IndexCursor::new(root, desc);
+        while let Some(e) = cur.next_entry(pager).await? {
+            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc) == Ordering::Equal
+            {
+                continue;
+            }
+            keep.push(encode_entry_payload(&e));
+        }
+    }
+    if let Some(x) = extra
+        && compare_entries(x.values.as_slice(), skip.values.as_slice(), desc) != Ordering::Equal
+    {
+        keep.push(encode_entry_payload(x));
+    }
+    let pages = collect_index_pages(pager, root).await?;
+    for p in pages.iter() {
+        if *p != root {
+            pager.free_page(*p).await?;
+        }
+    }
+    let empty: &[IndexCell] = &[];
+    write_index_page(pager, root, empty, 0, false, false).await?;
+    for p in keep.iter() {
+        index_insert(pager, root, p.as_slice(), desc).await?;
+    }
+    Ok(())
 }
