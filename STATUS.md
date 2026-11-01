@@ -4,6 +4,151 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.15 — insert-side split distribution (2026-11-01)
+
+**Status:** implemented, differential-tested against the
+pinned oracle, and gated (below). INSERT — and the insert
+side of every other writer — now balances the table B-tree
+the way the pin does when a page overflows, instead of
+splitting the overflowing page into byte-even halves in
+isolation. hipp-built files therefore track the pin's
+`page_count` / `freelist_count` statement-for-statement on
+the pinned table workloads — the direction v0.14 could not
+pin (100 uniform rows at page size 512 built 8 pages in
+hipp vs 6 in the pin; both now build 6, identically at
+every step). This is deliberately **not** feature-gated:
+it changes no dialect surface, only the file layout
+produced by existing insert paths (a pure
+layout-conformance fix, on the same basis as v0.14).
+
+### Shipped
+
+- **Table insert balance** (`btree.rs`): the insert
+  descent records its path and whether it stayed on the
+  tree's rightmost spine. On overflow:
+  - appending to the rightmost leaf takes the pin's
+    **quick split**: the old leaf is left completely
+    untouched and the new cell goes alone onto a fresh
+    page (at the root, the old leaf's content is first
+    copied to a new left child, allocated before the
+    right page);
+  - a root leaf balances over two pages by the fitted
+    distribution (below), the root becoming interior;
+  - any other overflowing leaf balances over a window
+    of up to three consecutive siblings under its
+    parent (the same centred window the delete side
+    uses), redistributed over the smallest page count
+    that holds the window's cells at full capacity —
+    a balance can free a page as well as allocate one.
+    Interior pages balance the same way on cascade,
+    with divider keys modelled exactly (a divider's
+    cost includes its child pointer); a root interior
+    that overflows splits into two fresh pages.
+- **Distribution rule** (fitted clean-room from oracle
+  behaviour over ~4,700 reconstructed balance events):
+  page count first (greedy in-order packing at full
+  capacity, matched the pin on 1,826/1,826 table
+  events); for a balance that allocates one page more
+  than the window, the new (last) page receives a
+  suffix of the combined sequence costing closest to
+  half the content capacity and the remainder is
+  distributed over the old pages by the v0.14 quota
+  distribution; otherwise the quota distribution runs
+  over the whole window.
+- **Index insert balance**: the same window machinery
+  over the index entry sequence, plus one accounting
+  correction — a balance's minimum page count now
+  follows a divider-aware packing (an item that lifts
+  as a divider consumes no leaf space), where the
+  delete-side counter charged every item to a page.
+  This moved the ascending-index trace's first
+  divergence from step 68 to step 133 (see gaps).
+
+### Gates
+
+- `cargo test --workspace` (stable): **203 passed /
+  0 failed / 5 ignored** (v0.14: 193 passed; the +10 is
+  this milestone's new live tests; the 5 ignored are
+  the not-yet-exact differentials under Honest gaps,
+  kept runnable with `--ignored`). New suite
+  `tests/insert_balance_v15.rs`: twin files built from
+  empty by both engines, `(page_count, freelist_count)`
+  asserted after EVERY statement, final contents equal,
+  oracle `integrity_check` clean on the hipp file.
+  Live and green: the original 100-row repro at ps512,
+  appends at ps1024/ps4096, descending and
+  pseudo-random insert orders, varied cell sizes,
+  ~900-byte overflow rows, INSERT INTO ... SELECT bulk
+  loads, and deep trees (2,000 appends; 1,200 random)
+  that split interior pages and the root. A1–A11 stay
+  green; all v0.14 delete traces stay green.
+- `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean. `cargo fmt` (write mode): clean
+  tree afterwards. Feature matrix compiles: default,
+  no-default, std-only, v04..v10 ladders, indexes-only,
+  indexes+v05, all-features; lib tests pass under
+  no-default-features.
+
+### Size (ratchet)
+
+- thumbv7em-none-eabihf `tiny`: **.text 78,708 +
+  .rodata 2,692 = 81,400 B of 128 KiB budget**, Δ
+  **+8,668 B** vs v0.14's 72,732 B (A/B-verified on
+  this machine against the v0.14 tree: 70,040 + 2,692).
+  The growth is over the 4 KiB justification line and
+  is justified: unlike v0.14's delete machinery, the
+  insert balance sits on the INSERT path the tiny
+  profile claims, so the tiny binary pays for the
+  window redistribution, the quick split, the interior
+  cascade and the root-split handling that make
+  hipp-built files match the pin's shape. Engine
+  statics 0 B (.bss 98,308 B = demo heap, unchanged).
+  Headroom remaining: 49,672 B.
+
+### Honest gaps (v0.15)
+
+- **Index insert distribution is not yet pin-exact.**
+  Three differentials (`v15_index_ascending_keys`,
+  `v15_index_scrambled_keys`,
+  `v15_create_index_on_populated`, plus the indexed
+  churn trace) are `#[ignore]`d with their first
+  divergence steps recorded in the test file (steps
+  133 / 121 / 202 / 133): a grow balance at row 68
+  distributes (27,25,16) in the pin where hipp's
+  fitted rule gives (26,25,17) — page counts
+  reconverge a row later, but the per-step trace is
+  the assertion, so it honestly fails. Extensive
+  fitting (575 exactly-reconstructed index events;
+  quota families static and dynamic, check-then-add
+  and closest boundaries, suffix targets) tops out
+  near 74% event-exact, and the pin's two boundaries
+  in several events are jointly inconsistent with
+  every quota family tried — the rule has a component
+  the fitting has not isolated. Contents and
+  integrity are unaffected; only intermediate page
+  counts on index-heavy builds can differ by a page
+  for a few statements.
+- **Delete distribution on mixed-weight windows.**
+  The build-and-churn trace (inserts pin-exact, trees
+  census-identical after the insert phase) diverges
+  in the delete phase at step 247: on windows whose
+  cells straddle the rowid varint boundary, the pin
+  distributes e.g. (27,24,18) where the v0.14 fitted
+  rule gives (26,24,19), delaying a page free by two
+  steps. `v15_build_and_churn` is `#[ignore]`d with
+  the step recorded. This is the same open rule as
+  the index gap, on the delete side; v0.14's pinned
+  delete workloads (uniform weights) are unaffected.
+- The interior-window phantom (content capacity minus
+  the 12-byte interior header), inherited from
+  v0.14, is still validated only indirectly through
+  page-count traces; hipp repacks pages it writes, so
+  total free space agrees with the pin while byte
+  layout inside a page can differ (the pin may leave
+  freeblocks). WAL read stays target-gated (RISKS
+  R3); auto-vacuum / ptrmap write support has no
+  recorded demand. Neither was touched.
+
 ## v0.14 — delete merge/redistribution (2026-10-31)
 
 **Status:** implemented, differential-tested against the
