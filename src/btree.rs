@@ -2188,6 +2188,37 @@ fn choose_index_split(cells: &[IndexCell]) -> usize {
     best
 }
 
+/// Binary-search a sorted cell list for the first cell above
+/// `probe`; returns `cells.len()` when none is. An equal cell is a
+/// `DuplicateRowid` error: it is never excluded from the search
+/// range, so it is always probed before the range empties.
+#[cfg(feature = "indexes")]
+async fn index_search_pos<S: Storage>(
+    pager: &mut Pager<S>,
+    cells: &[IndexCell],
+    probe: &IndexEntry,
+    nfields: usize,
+    desc: &[bool],
+) -> Result<usize, S::Error> {
+    use core::cmp::Ordering;
+    let (mut lo, mut hi) = (0usize, cells.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let p = index_cell_payload(pager, &cells[mid]).await?;
+        let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+        match compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) {
+            Ordering::Equal => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::DuplicateRowid,
+                });
+            }
+            Ordering::Less => hi = mid,
+            Ordering::Greater => lo = mid + 1,
+        }
+    }
+    Ok(lo)
+}
+
 /// Insert the key `payload` (a full index record) into the index
 /// rooted at `root`. The root page number never changes.
 /// Duplicate full keys (same columns AND rowid) are a
@@ -2201,7 +2232,6 @@ pub async fn index_insert<S: Storage>(
     payload: &[u8],
     desc: &[bool],
 ) -> Result<(), S::Error> {
-    use core::cmp::Ordering;
     let usable = pager.usable() as usize;
     let nfields = desc.len() + 1;
     let probe = decode_index_entry::<S::Error>(payload, nfields)?;
@@ -2220,50 +2250,21 @@ pub async fn index_insert<S: Storage>(
             }
             let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
             // The leaf is sorted: the probe goes before the first cell
-            // above it, and a duplicate can only be the cell at that
-            // boundary (cells past it are strictly above the probe).
-            let mut pos = cells.len();
-            for (i, c) in cells.iter().enumerate() {
-                let p = index_cell_payload(pager, c).await?;
-                let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-                match compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) {
-                    Ordering::Equal => {
-                        return Err(Error::Schema {
-                            kind: SchemaKind::DuplicateRowid,
-                        });
-                    }
-                    Ordering::Less => {
-                        pos = i;
-                        break;
-                    }
-                    Ordering::Greater => {}
-                }
-            }
+            // above it, and a duplicate can only be a cell the binary
+            // search lands on (an equal cell is never excluded).
+            let pos = index_search_pos(pager, cells.as_slice(), &probe, nfields, desc).await?;
             break (page, cells, pos);
         }
         if h.kind != KIND_INTERIOR_INDEX {
             return Err(Error::Unsupported);
         }
         let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
-        let mut child_idx = cells.len();
-        let mut child = rightmost;
-        for (i, c) in cells.iter().enumerate() {
-            let p = index_cell_payload(pager, c).await?;
-            let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-            match compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) {
-                Ordering::Equal => {
-                    return Err(Error::Schema {
-                        kind: SchemaKind::DuplicateRowid,
-                    });
-                }
-                Ordering::Less => {
-                    child_idx = i;
-                    child = c.child;
-                    break;
-                }
-                Ordering::Greater => {}
-            }
-        }
+        let child_idx = index_search_pos(pager, cells.as_slice(), &probe, nfields, desc).await?;
+        let child = if child_idx < cells.len() {
+            cells.as_slice()[child_idx].child
+        } else {
+            rightmost
+        };
         path.push((page, child_idx));
         page = child;
     };
