@@ -91,10 +91,11 @@ layout-conformance fix, on the same basis as v0.14).
 
 ### Size (ratchet)
 
-- thumbv7em-none-eabihf `tiny`: **.text 78,708 +
-  .rodata 2,692 = 81,400 B of 128 KiB budget**, Δ
-  **+8,668 B** vs v0.14's 72,732 B (A/B-verified on
-  this machine against the v0.14 tree: 70,040 + 2,692).
+- thumbv7em-none-eabihf `tiny`: **.text 78,716 +
+  .rodata 2,692 = 81,408 B of 128 KiB budget**, Δ
+  **+8,676 B** vs v0.14's 72,732 B (A/B-verified on
+  this machine against the v0.14 tree: 70,040 + 2,692;
+  the figures here are from the committed tree).
   The growth is over the 4 KiB justification line and
   is justified: unlike v0.14's delete machinery, the
   insert balance sits on the INSERT path the tiny
@@ -103,7 +104,7 @@ layout-conformance fix, on the same basis as v0.14).
   cascade and the root-split handling that make
   hipp-built files match the pin's shape. Engine
   statics 0 B (.bss 98,308 B = demo heap, unchanged).
-  Headroom remaining: 49,672 B.
+  Headroom remaining: 49,664 B.
 
 ### Honest gaps (v0.15)
 
