@@ -174,9 +174,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: coverage
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov
       - name: Cache the pinned oracle
         uses: actions/cache@v4
         with:
@@ -184,12 +181,13 @@ jobs:
           key: sqlite-oracle-3540100-${{ runner.os }}-${{ hashFiles('ci/build-oracle.sh') }}
       - name: Build the pinned oracle
         run: ci/build-oracle.sh "${{ github.workspace }}/../hipp-design/oracle"
-      - name: Coverage (core crate, full test suite)
+      - name: Coverage (core crate src/, full workspace test suite)
+        # ci/coverage.sh drives the pinned toolchain's own llvm-tools,
+        # so the profile format always matches the compiler.
         run: |
-          cargo llvm-cov --workspace --no-fail-fast --lcov --output-path lcov.info
-          cargo llvm-cov report --summary-only | tee coverage.txt
-          { echo '### Coverage'; echo; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          ci/coverage.sh --fail-under 80
+          { echo '### Coverage (core crate)'; echo; echo '```'; cat target/coverage/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: lcov
-          path: lcov.info
+          path: target/coverage/lcov.info
