@@ -36,7 +36,9 @@
 
 use crate::arena::AVec;
 use crate::error::{Error, Result, SchemaKind};
-use crate::query::{AggKind, AggParts, args_coll, parse_num_prefix, to_text, values_equal_coll};
+use crate::query::{
+    AggKind, AggParts, args_coll, parse_num_prefix, real_value, to_text, values_equal_coll,
+};
 use crate::record::{OwnedValue, compare_coll, fabs, text_to_number};
 
 /// Fold one aggregate over the per-row input values of the rows
@@ -320,14 +322,17 @@ impl SumCtx {
     }
 
     fn finish(&self, kind: AggKind) -> core::result::Result<OwnedValue, SchemaKind> {
+        // A NaN sum (`+inf` and `-inf` both added) is NULL, as
+        // `sqlite3_result_double` stores it (v0.16 review fix:
+        // sum / total / avg answered a REAL).
         Ok(match kind {
-            AggKind::Total => OwnedValue::Real(self.real()),
+            AggKind::Total => real_value(self.real()),
             _ if self.cnt == 0 => OwnedValue::Null,
-            AggKind::Avg => OwnedValue::Real(self.real() / self.cnt as f64),
+            AggKind::Avg => real_value(self.real() / self.cnt as f64),
             _ if self.approx && self.ovrfl => {
                 return Err(SchemaKind::IntegerOverflow);
             }
-            _ if self.approx => OwnedValue::Real(self.real()),
+            _ if self.approx => real_value(self.real()),
             _ => OwnedValue::Integer(self.i),
         })
     }
@@ -410,7 +415,7 @@ fn percentile(
     let i1 = (ix as usize).min(last);
     let v1 = ys.get(i1).copied().unwrap_or(0.0);
     if disc {
-        return Ok(OwnedValue::Real(v1));
+        return Ok(real_value(v1));
     }
     let i2 = if ix == i1 as f64 || i1 == last {
         i1
@@ -418,7 +423,7 @@ fn percentile(
         i1.saturating_add(1).min(last)
     };
     let v2 = ys.get(i2).copied().unwrap_or(v1);
-    Ok(OwnedValue::Real(v1 + (v2 - v1) * (ix - i1 as f64)))
+    Ok(real_value(v1 + (v2 - v1) * (ix - i1 as f64)))
 }
 
 /// A stable bottom-up merge sort of `v` under `le` ("a sorts no

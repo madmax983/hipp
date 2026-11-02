@@ -5,7 +5,10 @@
 //! REAL results, the compensated REAL sums and text addends of
 //! sum() / total() / avg(), group_concat() separators (NULL ones,
 //! blobs, control characters), and CREATE TABLE ... AS SELECT
-//! over these clauses (the pin's column names). Each batch runs
+//! over these clauses (the pin's column names), plus the review
+//! fixes (min / max ORDER BY ownership, `count(ORDER BY ...)`, NaN
+//! results as NULL, derived-table LIMITs, HAVING terms moved into
+//! WHERE). Each batch runs
 //! one-shot and over stdin, and the hipp-written file must pass
 //! the oracle's integrity check.
 
@@ -140,6 +143,25 @@ SELECT * FROM c;
 .schema c
 ";
 
+/// Review fixes: min / max ORDER BY ownership, `count(ORDER BY
+/// ...)`, NaN sums and arithmetic rendering (and stored) as NULL,
+/// an outer LIMIT stopping a derived table's groups, HAVING terms
+/// the pin moves into WHERE.
+const REVIEW: &str = "\
+CREATE TABLE big(k, v); INSERT INTO big VALUES (1,1),(2,9223372036854775807),(2,1),(3,5);
+SELECT a, (SELECT max(t.a ORDER BY u.b) FROM t u) FROM t ORDER BY 1;
+SELECT (SELECT max(1 ORDER BY t.a) FROM t u) FROM t;
+SELECT count(ORDER BY b), count(ORDER BY nosuch) FILTER (WHERE a > 1), count(ORDER BY b DESC) FROM t;
+SELECT sum(x), total(x), avg(x), typeof(sum(x)), count(x) FROM (SELECT 9e999 x UNION ALL SELECT -9e999);
+SELECT 9e999 - 9e999, 0 * 9e999, 9e999 / -9e999, 9e999 + 9e999;
+CREATE TABLE n AS SELECT total(x) s, 9e999 - 9e999 d FROM (SELECT 9e999 x UNION ALL SELECT -9e999);
+SELECT s, d, typeof(s), typeof(d) FROM n;
+SELECT k FROM (SELECT k, sum(v) s FROM big GROUP BY k) LIMIT 1;
+SELECT * FROM (SELECT * FROM (SELECT k, sum(v) s FROM big GROUP BY k)) LIMIT 1;
+SELECT k, sum(v) FROM big GROUP BY k HAVING k = 1 AND abs(k) = 1;
+SELECT k, sum(v) FROM big GROUP BY k HAVING abs(k) = 3 AND 0;
+";
+
 fn batch(body: &str) -> String {
     format!("{SETUP}{body}")
 }
@@ -174,4 +196,9 @@ fn cli_v16_aggregates_ctas_stdin_byte_identical() {
     assert_eq!(got, run_stdin(&oracle(), &b, &input));
     assert!(!got.is_empty());
     assert_eq!(run(&oracle(), &a, "PRAGMA integrity_check;"), b"ok\n");
+}
+
+#[test]
+fn cli_v16_aggregates_review_byte_identical() {
+    byte_identical("review", &batch(REVIEW));
 }

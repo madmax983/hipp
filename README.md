@@ -233,7 +233,8 @@ aspirations.
   x)` deduplicates through the sort and keeps the last, as the
   pin's sorter does; `FILTER (WHERE ...)` on every aggregate
   (count(*), DISTINCT forms, min / max bare columns included);
-  `count()`; and the percentile family the pin builds in —
+  `count()` (and `count(ORDER BY ...)`, whose clause the pin
+  drops); and the percentile family the pin builds in —
   `median()`, `percentile(Y, P)`, `percentile_cont()`,
   `percentile_disc()` with its P validation, constant-P check,
   numeric-only Y and REAL results. ORDER BY / FILTER on a
@@ -248,8 +249,11 @@ aspirations.
   nothing (the result was NULL), `group_concat(DISTINCT x, ',')`
   is refused (`DistinctAggregateArgs`), and a group finalizes its
   aggregates as the pin does — before HAVING, never for a group a
-  WHERE-able HAVING term or a group-ordered LIMIT keeps from
-  forming. The tiny profile did not grow.
+  HAVING term the pin moves into WHERE (constant or GROUP BY
+  terms only), a group-ordered LIMIT, or an outer LIMIT reading a
+  derived table keeps from forming. A NaN result (`sum()` over
+  `+inf` and `-inf`, `inf - inf`) is NULL, as the pin stores it
+  (it was a REAL 0.0). The tiny profile did not grow.
 - **Math functions** (leaf feature `math`, in `full`; needs only
   `v04`): every function the pin builds with
   SQLITE_ENABLE_MATH_FUNCTIONS — `acos` `acosh` `asin` `asinh`

@@ -2092,26 +2092,32 @@ fn resolve_func<E>(
         let all = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
         #[cfg(feature = "v16")]
         let mut all = all;
+        // min / max take no ORDER BY on the pin, but only its code
+        // generator ignores it: the keys are resolved (so their
+        // errors stand) and every resolver walk — ownership and
+        // the nested-aggregate misuse check — still reads them
+        // (review fix: `(SELECT max(o.x ORDER BY i.y) FROM i)`
+        // became the outer query's aggregate, and `max(x ORDER BY
+        // count(*))` ran). They are held here, outside the node.
+        #[cfg(feature = "v16")]
+        let mut ignored: AVec<RExpr> = AVec::new();
         #[cfg(feature = "v16")]
         let ext = match clause {
             None => None,
             Some(c) => {
                 let nargs = all.len();
+                let minmax = matches!(kind, AggKind::Min | AggKind::Max);
                 let mut order = AVec::new();
                 for (k, o) in c.order_by.iter() {
                     let r = resolve_scoped::<E>(k, arena, cur, enclosing, &mut *planner)?;
+                    if minmax {
+                        ignored.push(r);
+                        continue;
+                    }
                     let mut o = *o;
                     o.coll = expr_coll(&r).unwrap_or_default();
                     order.push(o);
                     all.push(r);
-                }
-                // min / max take no ORDER BY on the pin: it is
-                // resolved (so its errors stand) and dropped.
-                if matches!(kind, AggKind::Min | AggKind::Max) {
-                    while all.len() > nargs {
-                        all.pop();
-                    }
-                    order.clear();
                 }
                 let unique = distinct
                     && nargs == 1
@@ -2149,15 +2155,19 @@ fn resolve_func<E>(
         // aggregate's arguments): `sum(max(a))`, and `(SELECT
         // sum(c + max(t.a)) FROM u)`, where sum belongs to u and
         // max to t (review fix: the latter returned a value).
-        if all.iter().any(has_direct_agg) {
+        #[cfg(feature = "v16")]
+        let ignored = ignored.as_slice();
+        #[cfg(not(feature = "v16"))]
+        let ignored: &[RExpr] = &[];
+        if all.iter().chain(ignored.iter()).any(has_direct_agg) {
             return Err(Error::Schema {
                 kind: SchemaKind::MisusedAggregate,
             });
         }
         // The owner reads every part: an aggregate whose FILTER or
-        // ORDER BY names an inner source belongs to the inner
-        // query, as on the pin.
-        let lvl = agg_level(all.as_slice(), cur, enclosing);
+        // ORDER BY (min / max's ignored one included) names an
+        // inner source belongs to the inner query, as on the pin.
+        let lvl = agg_level(all.as_slice(), ignored, cur, enclosing);
         return Ok(RExpr::Agg {
             kind,
             distinct,
@@ -2261,14 +2271,16 @@ pub fn same_expr(a: &RExpr, b: &RExpr) -> bool {
 }
 
 /// The owner level of an aggregate with resolved arguments
-/// `args` (v0.16, the pin's `sqlite3ReferencesSrcList` walk):
+/// `args` and `extra` (parts walked but not kept: min / max's
+/// ORDER BY keys) (v0.16, the pin's `sqlite3ReferencesSrcList`
+/// walk):
 /// 0 when they reference the current query's sources or no
 /// column at all, else 1 + the index (nearest first) of the
 /// nearest enclosing scope they reference. References past the
 /// current query's end belong to subqueries nested in the
 /// arguments and do not count, nor do references to a group
 /// that cannot own aggregates (`ScopeGroup::agg_owner`).
-fn agg_level(args: &[RExpr], cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> u8 {
+fn agg_level(args: &[RExpr], extra: &[RExpr], cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> u8 {
     let band = |g: &ScopeGroup| {
         let (we, se) = g.end();
         RefRange {
@@ -2278,7 +2290,9 @@ fn agg_level(args: &[RExpr], cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> u8 {
     };
     let refs = |g: &ScopeGroup| {
         let r = band(g);
-        args.iter().any(|a| expr_refs_range(a, &r))
+        args.iter()
+            .chain(extra.iter())
+            .any(|a| expr_refs_range(a, &r))
     };
     if refs(cur) {
         return 0;
@@ -4183,7 +4197,7 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
                 if d == 0.0 {
                     OwnedValue::Null
                 } else {
-                    OwnedValue::Real(x.as_f64() / d)
+                    real_value(x.as_f64() / d)
                 }
             }
         });
@@ -4205,12 +4219,24 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
         // recorded as a hipp divergence only for +,- overflow).
     }
     let (x, y) = (a.as_f64(), b.as_f64());
-    Ok(OwnedValue::Real(match op {
+    Ok(real_value(match op {
         BinOp::Add => x + y,
         BinOp::Sub => x - y,
         BinOp::Mul => x * y,
         _ => unreachable!(),
     }))
+}
+
+/// A REAL result as the pin stores it: a NaN (`inf - inf`,
+/// `0 * inf`, `inf / inf`) is NULL (`sqlite3VdbeMemSetDouble`;
+/// v0.16 review fix: hipp answered a NaN REAL, which rendered
+/// as 0.0 and was written to the file).
+pub fn real_value(r: f64) -> OwnedValue {
+    if r.is_nan() {
+        OwnedValue::Null
+    } else {
+        OwnedValue::Real(r)
+    }
 }
 
 /// Decode text the way the pin's `sqlite3Utf8Read` walks a

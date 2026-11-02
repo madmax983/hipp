@@ -720,6 +720,236 @@ fn aggregate_errors_and_group_finalization() {
     }
 }
 
+// ---------------- review fixes ----------------
+
+const OI: &str = "CREATE TABLE o(x); CREATE TABLE i(y);
+INSERT INTO o VALUES (1),(2),(3); INSERT INTO i VALUES (10),(20);";
+
+/// Regression: min / max drop their ORDER BY only when the pin
+/// generates code; ownership still reads the keys, so an ORDER BY
+/// naming the inner source makes the inner query the owner (hipp
+/// gave the outer query the aggregate: one row, a misuse error, or
+/// EXISTS flipping).
+#[test]
+fn minmax_order_by_still_decides_the_owner() {
+    let tw = twins("mmown", OI);
+    tw.all(&[
+        "SELECT (SELECT max(o.x ORDER BY i.y) FROM i) FROM o",
+        "SELECT x FROM o WHERE x = (SELECT max(o.x ORDER BY i.y) FROM i)",
+        "SELECT EXISTS (SELECT max(o.x ORDER BY i.y) FROM (SELECT 1 y) i WHERE 0) FROM (SELECT 1 x) o",
+        "SELECT x, (SELECT min(o.x ORDER BY i.y) + count(*) FROM i) FROM o",
+        "SELECT (SELECT min(o.x ORDER BY i.y DESC, o.x) FROM i) FROM o ORDER BY 1",
+        "SELECT (SELECT max(o.x ORDER BY i.y) FILTER (WHERE i.y > 10) FROM i) FROM o",
+        // Keys naming only the outer query: the outer's (one row).
+        "SELECT (SELECT max(1 ORDER BY o.x) FROM i) FROM o",
+        "SELECT (SELECT min(o.x ORDER BY o.x) FROM i) FROM o",
+        "SELECT (SELECT max(i.y ORDER BY o.x) FROM i) FROM o",
+        // Still resolved: an unknown column errors.
+        "SELECT max(x ORDER BY nosuch) FROM o",
+        "SELECT max(x ORDER BY (SELECT count(*))) FROM o",
+    ]);
+}
+
+/// Regression: an aggregate inside min / max's ORDER BY is the
+/// pin's "misuse of aggregate function" (hipp ran it).
+#[test]
+fn minmax_order_by_nested_aggregate_is_misuse() {
+    let tw = twins("mmmis", OI);
+    for sql in [
+        "SELECT max(x ORDER BY count(*)) FROM (SELECT 1 x)",
+        "SELECT min(x ORDER BY x, sum(x)) FROM o",
+        "SELECT (SELECT max(i.y ORDER BY sum(o.x)) FROM (SELECT 1 y UNION ALL SELECT 3) i) FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3) o",
+        "SELECT (SELECT max(i.y ORDER BY sum(o.x)) FROM i) FROM o",
+        "SELECT group_concat(x ORDER BY count(*)) FROM o",
+    ] {
+        tw.refuse(sql, SchemaKind::MisusedAggregate);
+    }
+}
+
+/// Regression: `f(ORDER BY ...)` with no arguments parses on the
+/// pin, which drops the clause unresolved (`count(ORDER BY x)` is
+/// `count(*)`); hipp refused it as a syntax error.
+#[test]
+fn order_by_without_arguments() {
+    let tw = twins("noargs", OI);
+    tw.all(&[
+        "SELECT count(ORDER BY x) FROM (SELECT 1 x)",
+        "SELECT count(ORDER BY x) FILTER (WHERE x > 1) FROM (SELECT 1 x UNION ALL SELECT 2)",
+        "SELECT count(ORDER BY nosuch) FROM o",
+        "SELECT count(ORDER BY count(*)) FROM o",
+        "SELECT count(ORDER BY x DESC NULLS LAST, 2) FROM o",
+        "SELECT count(ORDER BY x) FROM o WHERE 0",
+        "SELECT x, (SELECT count(ORDER BY o.x) FROM i) FROM o",
+        "SELECT typeof(changes(ORDER BY x)) FROM o",
+        // Syntax and argument errors stand.
+        "SELECT count(* ORDER BY x) FROM o",
+        "SELECT count(ORDER BY) FROM o",
+        "SELECT sum(ORDER BY x) FROM o",
+        "SELECT max(ORDER BY x) FROM o",
+        "SELECT group_concat(ORDER BY x) FROM o",
+        "SELECT abs(ORDER BY x) FROM o",
+        "SELECT random(ORDER BY x) FILTER (WHERE 1) FROM o",
+    ]);
+    tw.refuse(
+        "SELECT count(DISTINCT ORDER BY x) FROM o",
+        SchemaKind::DistinctAggregateArgs,
+    );
+}
+
+/// Regression: a NaN REAL (`inf + -inf`) is NULL on the pin, for
+/// sum / total / avg and for the arithmetic operators; hipp
+/// answered a REAL (0.0) and wrote it to the file.
+#[test]
+fn nan_results_are_null() {
+    let tw = twins("nan", OI);
+    tw.all(&[
+        "SELECT typeof(sum(x)), typeof(total(x)), typeof(avg(x)), sum(x) IS NULL FROM (SELECT 9e999 x UNION ALL SELECT -9e999)",
+        "SELECT sum(x) FROM (SELECT 1e308 x UNION ALL SELECT 1e308 UNION ALL SELECT -9e999)",
+        "SELECT count(s) FROM (SELECT total(x) s FROM (SELECT 9e999 x UNION ALL SELECT -9e999))",
+        "SELECT typeof(avg(x)) FROM (SELECT 9e999 x UNION ALL SELECT -9e999 UNION ALL SELECT 1)",
+        "SELECT avg(x), total(x), sum(x) FROM (SELECT 9e999 x UNION ALL SELECT 9e999)",
+        "SELECT typeof(sum(x)) FROM (SELECT 9e999 x UNION ALL SELECT 1)",
+        "SELECT group_concat(s), max(s), min(s) FROM (SELECT sum(x) s FROM (SELECT 9e999 x UNION ALL SELECT -9e999))",
+        "SELECT median(x), percentile(x, 50), percentile_cont(x, 0.25) FROM (SELECT -1.7e308 x UNION ALL SELECT 1.7e308)",
+        "SELECT typeof(9e999 + -9e999), typeof(9e999 - 9e999), typeof(0 * 9e999), typeof(9e999 / 9e999), typeof(9e999 * -9e999)",
+        "SELECT 9e999 - 9e999 IS NULL, -9e999 / -9e999, 0.0 * -9e999",
+        "SELECT x * 9e999 FROM o",
+        "SELECT sum(x * 9e999 - 9e999) FROM o",
+    ]);
+    // Through the file: the stored value is a NULL, not a NaN.
+    tw.all(&[
+        "CREATE TABLE n AS SELECT total(x) s, 9e999 - 9e999 d FROM (SELECT 9e999 x UNION ALL SELECT -9e999)",
+        "INSERT INTO n SELECT sum(x), x - x FROM (SELECT 9e999 x UNION ALL SELECT -9e999)",
+        "UPDATE n SET d = 9e999 + -9e999 WHERE rowid = 1",
+        "SELECT typeof(s), typeof(d), s IS NULL, d IS NULL FROM n",
+        "SELECT count(s), count(d) FROM n",
+    ]);
+}
+
+/// Regression: an outer LIMIT that stops reading a derived table
+/// keeps its later groups from being finalized on the pin, so a
+/// sum() overflow in such a group does not fail the statement
+/// (the ungated overflow fix made hipp refuse it).
+#[test]
+fn outer_limit_stops_derived_groups() {
+    let tw = twins(
+        "dlim",
+        "CREATE TABLE g(k, v); INSERT INTO g VALUES (1,1),(2,9223372036854775807),(2,1),(3,5);",
+    );
+    tw.all(&[
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 1",
+        "SELECT * FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 1",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 0",
+        "SELECT * FROM (SELECT * FROM (SELECT k x, sum(v) s FROM g GROUP BY k)) LIMIT 1",
+        "SELECT * FROM (SELECT * FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 5) LIMIT 1",
+        "SELECT * FROM (SELECT * FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 2) LIMIT 1",
+        "SELECT (SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 1)",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k ORDER BY k) LIMIT 1",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k ORDER BY k DESC) LIMIT 1",
+        "SELECT x, (SELECT 1) FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 1",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k HAVING sum(v) > 0) LIMIT 1",
+        "SELECT EXISTS (SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k))",
+    ]);
+    for sql in [
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 2",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 1 OFFSET 1",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k) ORDER BY x LIMIT 1",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k ORDER BY s) LIMIT 1",
+        "SELECT count(*) FROM (SELECT k x, sum(v) s FROM g GROUP BY k) LIMIT 1",
+        "SELECT x FROM (SELECT k x, sum(v) s FROM g GROUP BY k)",
+    ] {
+        tw.refuse(sql, SchemaKind::IntegerOverflow);
+    }
+}
+
+/// Regression: a HAVING term moves into WHERE on the pin (so the
+/// groups it rejects never form) only with a GROUP BY, when it is
+/// not the literal 0 / FALSE (an AND with such an operand folds to
+/// 0), and when it is constant or built from BINARY GROUP BY terms
+/// and deterministic functions. hipp moved every term without
+/// aggregates or subqueries, skipping errors the pin raises.
+#[test]
+fn having_terms_moved_to_where() {
+    let tw = twins(
+        "hmove",
+        "CREATE TABLE g(k, v); INSERT INTO g VALUES (1,1),(2,9223372036854775807),(2,1),(3,5);
+CREATE TABLE h(k TEXT COLLATE NOCASE, v); INSERT INTO h VALUES ('a',1),('b',9223372036854775807),('b',1);
+CREATE TABLE t2(k TEXT, v); INSERT INTO t2 VALUES ('a',1),('b',9223372036854775807),('b',1);",
+    );
+    // Moved: the overflowing group never forms.
+    tw.all(&[
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING abs(k) = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k + 0 = 1",
+        "SELECT k + 1, sum(v) FROM g GROUP BY k + 1 HAVING k + 1 = 2",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 OR 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k IN (1)",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k BETWEEN 1 AND 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING +k = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING coalesce(k, 0) = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k COLLATE NOCASE = 1",
+        "SELECT k, sum(v) FROM g AS x GROUP BY x.k HAVING k = 1",
+        "SELECT k, sum(v) FROM g GROUP BY 1 HAVING k = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING CASE WHEN k = 1 THEN 1 END",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING typeof(k) = 'integer' AND k < 2",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING printf('%d', k) = '1'",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING likely(k = 1)",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING iif(k = 1, 1, 0)",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING sqlite_version() = 'x'",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING NULL",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING 0.0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING '0'",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING 1 = 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING TRUE AND k = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND v = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k, v HAVING v = 1",
+        "SELECT k, sum(v) FROM t2 GROUP BY k HAVING k = 'a'",
+        "SELECT k, sum(v) FROM t2 GROUP BY k COLLATE BINARY HAVING k = 'a'",
+        "SELECT k, sum(v) FROM h GROUP BY k COLLATE BINARY HAVING k COLLATE BINARY = 'a'",
+        // An AND over 0 folds to 0 only without function calls.
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND random() = 5 AND 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING abs(k) = 1 AND 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND (0 AND abs(k))",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND sum(v) AND 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND (0 OR 0)",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND CAST(0 AS INT)",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND k LIKE 1 AND 0",
+    ]);
+    // Not moved: every group's sum() is computed and overflows.
+    for sql in [
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING random() = 5",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING changes() = 5",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING last_insert_rowid() = 99",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING (0)",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING 00",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING 0x0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING false",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING (k = 1 AND 0) AND k = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING 0 AND k = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND (SELECT 1) AND 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND 0x0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1 AND (k = 2 AND 0)",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING k COLLATE NOCASE = 1 AND 0",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING v = 1",
+        "SELECT k, sum(v) FROM g GROUP BY k HAVING (SELECT 0)",
+        "SELECT sum(v) FROM g HAVING 0",
+        "SELECT sum(v) FROM g HAVING random() = 5",
+        "SELECT k, sum(v) FROM h GROUP BY k HAVING k = 'a'",
+        "SELECT k, sum(v) FROM h GROUP BY k HAVING k COLLATE BINARY = 'a'",
+        "SELECT k, sum(v) FROM h GROUP BY k HAVING upper(k) = 'A'",
+        "SELECT k, sum(v) FROM g GROUP BY k COLLATE NOCASE HAVING k = 1",
+        "SELECT k, sum(v) FROM t2 GROUP BY k COLLATE NOCASE HAVING k COLLATE NOCASE = 'a'",
+        "SELECT k, sum(v) FROM g GROUP BY k COLLATE RTRIM HAVING k COLLATE RTRIM = 1",
+        "SELECT k, sum(v) FROM (SELECT * FROM g) GROUP BY k HAVING random() = 5",
+        "SELECT (SELECT sum(v) FROM g GROUP BY k HAVING random() = 5)",
+    ] {
+        tw.refuse(sql, SchemaKind::IntegerOverflow);
+    }
+}
+
 // ---------------- generated corpus ----------------
 
 /// Random aggregate calls — every kind, with and without DISTINCT,

@@ -1808,8 +1808,11 @@ compensated sum, the NULL separator, `group_concat(DISTINCT x,
   through its sorter index and the *last* of equal keys survives
   (`group_concat(DISTINCT c ORDER BY c)` over NOCASE 'A', 'a' is
   `a`; `typeof(sum(DISTINCT x ORDER BY x))` over 1.0, 1 is
-  integer). The pin's grammar takes ORDER BY only after one or
-  more arguments.
+  integer). The pin's grammar takes ORDER BY after a possibly
+  empty argument list (not after `*`); with no arguments it drops
+  the clause unresolved, so `count(ORDER BY nosuch)` is
+  `count(*)` and `abs(ORDER BY x)` is `abs()` (review fix: hipp
+  refused `count(ORDER BY x)`).
 - `FILTER (WHERE expr)` on every aggregate: a row whose filter is
   NULL or false is not stepped and nothing else of it is
   evaluated; FILTER is no reserved word (`count(*) filter` is an
@@ -1825,7 +1828,12 @@ compensated sum, the NULL separator, `group_concat(DISTINCT x,
   the filter in `args` behind its arguments (`AggExt`), so every
   walker — column shifts, subquery collection, ownership,
   nested-aggregate misuse — sees them; `query::agg_parts` takes
-  a node apart.
+  a node apart. min / max's ORDER BY keys are not kept in the
+  node, but the ownership walk and the misuse check read them
+  before they are dropped, as the pin's resolver does (review
+  fix: `(SELECT max(o.x ORDER BY i.y) FROM i)` was the outer
+  query's aggregate, collapsing it to one row, and `max(x ORDER
+  BY count(*))` ran).
 - `median(Y)`, `percentile(Y, P)` (P in 0 ..= 100),
   `percentile_cont(Y, P)` / `percentile_disc(Y, P)` (0 ..= 1):
   per stepped row, P is checked first (its numeric type: numeric
@@ -1870,6 +1878,42 @@ paths):**
   only the first group (`session::having_early`, `group_aggs`,
   `group_cap`; top-level queries and subqueries).
 
+**Review fixes** (2026-11-02, all reproduced on the pin first):
+
+- min / max ORDER BY ownership and nested-aggregate misuse (see
+  the ORDER BY bullets above; `v16`).
+- `f(ORDER BY ...)` with no arguments parses (`v16`).
+- A NaN REAL is NULL, as `sqlite3VdbeMemSetDouble` stores it:
+  sum / total / avg over `+inf` and `-inf` (hipp answered 0.0
+  REAL, so `count(s)` over it was 1 and INSERT ... SELECT wrote a
+  NaN into the file), and the operators `inf - inf`, `0 * inf`,
+  `inf / inf` (`query::real_value`; ungated, the operators are
+  claimed v0.4 paths).
+- An outer LIMIT bounds the groups a derived table finalizes
+  (ungated: a regression of the sum-overflow error). When a query
+  reads exactly one derived table with no WHERE, grouping,
+  aggregates, ORDER BY or DISTINCT, the pin runs the subquery as
+  a coroutine and stops after OFFSET + LIMIT rows, so `SELECT x
+  FROM (SELECT k x, sum(v) FROM g GROUP BY k) LIMIT 1` succeeds
+  although a later group overflows; hipp passes the bound into
+  the subquery's group loop, through nested derived tables
+  (`session::derived_need`, `exec_subplan_need`).
+- HAVING-to-WHERE follows the pin's `havingToWhere` (ungated):
+  only with a GROUP BY; a term moves only if it passes
+  `sqlite3ExprIsConstantOrGroupBy` — literals, operators,
+  deterministic functions (`sqlite_version()` counts; `random()`,
+  `changes()`, `total_changes()`, `last_insert_rowid()`,
+  `randomblob()` do not) and GROUP BY terms whose collation is
+  BINARY (matched as `sqlite3ExprCompare` < 2: a COLLATE on top
+  of either side is ignored); and the literal 0 / FALSE never
+  moves, nor does an AND the pin's parser folds to 0 (an operand
+  that is the literal 0 and no function call — LIKE / GLOB
+  included — on either side). So `HAVING random() = 5`, `HAVING
+  0`, `HAVING k = 1 AND 0`, `HAVING bare_col = 1`, a NOCASE group
+  column and a query without GROUP BY now finalize every group
+  and raise the overflow as the pin does (`session::having_early`,
+  `const_or_group`, `group_match`, `always_false`).
+
 **Oracle-probing notes** (all on the live 3.54.1 pin): `EXPLAIN`
 shows an ephemeral sorter with `OP_Sequence` for every aggregate
 ORDER BY but min / max, and a second ephemeral (`OP_Found`) for
@@ -1894,7 +1938,7 @@ group's first row.
 
 **Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
 end with "==> all gates passed". New suites:
-`tests/aggregates_v16.rs` (14 tests: string_agg / ORDER BY
+`tests/aggregates_v16.rs` (20 tests: string_agg / ORDER BY
 corpus and refusals, DISTINCT + ORDER BY interplay, FILTER and its
 refusals, FILTER with bare columns, clause ownership in
 subqueries, percentile values and every percentile error kind, a
@@ -1905,10 +1949,14 @@ and HAVING / ORDER BY in compound and subquery bodies, the group
 finalization rules, and a 240-statement PRNG corpus of random
 aggregates with random DISTINCT / ORDER BY / FILTER over mixed
 storage classes — `HIPP_AGG_CORPUS` / `HIPP_AGG_SEED` scale it;
-4 × 1 500 extra statements agreed while developing) and
-`hipp-cli/tests/cli_v16_aggregates.rs` (5 byte-identical batches,
-one-shot and over stdin: ORDER BY, FILTER, percentile, sums and
-separators, CREATE TABLE ... AS SELECT with its `.schema`).
+4 × 1 500 extra statements agreed while developing; the review
+fixes added six: min / max ORDER BY ownership, its misuse
+refusals, argument-less ORDER BY, NaN results through queries and
+the file, outer LIMITs over derived tables, and a
+HAVING-to-WHERE matrix of 63 statements) and `hipp-cli/tests/cli_v16_aggregates.rs`
+(6 byte-identical batches, one-shot and over stdin: ORDER BY,
+FILTER, percentile, sums and separators, CREATE TABLE ... AS
+SELECT with its `.schema`, the review fixes).
 
 **Size:** tiny **75,960 B** (Δ **0**: the evaluator is not in the
 tiny profile). Full **325,451 B** (Δ **+10,196 B** vs 315,255,
@@ -1919,6 +1967,15 @@ instantiations cost 6 KB more), FILTER and clause resolution
 (`AggExt`, `same_expr`), and the finalization rules in the three
 group loops.
 
+Review fixes: tiny **76,048 B** (Δ **0**; none of the changed
+code is in the tiny profile). Full **346,455 B** (Δ **+1,480 B**
+vs 344,975 after the math unit, ratchet raised to it): the
+HAVING-to-WHERE walkers (`const_or_group`, `has_call`), the
+derived-table LIMIT bound, the NaN-to-NULL helper and the kept
+min / max keys. Census: unchanged on the 205 earlier probes (135
+match); 6 new probes for these fixes — 4 match, 2 are errors on
+both (the misuse refusal, the HAVING `random()` overflow).
+
 **Honest gaps:**
 
 - Window functions (`OVER`) are not implemented (another leaf);
@@ -1928,15 +1985,27 @@ group loops.
   operators, casts, COLLATE and scalar calls; a CASE or
   subquery argument repeated in the ORDER BY takes the
   first-seen path, where the pin keeps the last of equal values.
-- Group finalization: a WHERE-able HAVING term is any AND term
-  without aggregates or subqueries (the pin also requires it to
-  name only GROUP BY terms, so `HAVING bare_col > 1` still
-  finalizes there and can error where hipp skips the group); a
-  DISTINCT grouped query, a compound core and a derived table
-  the pin pushes a WHERE into (`SELECT * FROM (SELECT k, sum(v)
-  ... GROUP BY k) WHERE k = 1`) finalize every group in hipp, so
-  an erroring aggregate in a group the pin never forms fails
-  there.
+- Group finalization: a DISTINCT grouped query, a compound core
+  and a derived table the pin pushes a WHERE into (`SELECT *
+  FROM (SELECT k, sum(v) ... GROUP BY k) WHERE k = 1`) finalize
+  every group in hipp, so an erroring aggregate in a group the
+  pin never forms fails there. The outer-LIMIT bound covers only
+  a reader with no WHERE, DISTINCT, ORDER BY, grouping or join:
+  the pin's coroutine also stops early under `WHERE x < 5 LIMIT
+  1`, `SELECT DISTINCT ... LIMIT 1`, a UNION ALL derived table or
+  a join whose outer loop is the derived table, where hipp
+  finalizes every group and can raise an error the pin never
+  reaches.
+- HAVING-to-WHERE: hipp's parser folds FALSE, `-0` and `+0` into
+  the literal 0, so `HAVING -0` / `+0` (movable on the pin) and
+  an AND over FALSE (which the pin's parser does not fold) keep
+  every group in hipp and can raise an error the pin skips.
+  The pin's error after partial output (rows of earlier groups
+  are printed before the overflow) is not reproduced: hipp
+  returns the error alone.
+- The argument-less ORDER BY is dropped after parsing, but hipp
+  checks collation names while parsing, so `count(ORDER BY x
+  COLLATE nosuch)` is refused where the pin runs it.
 - When several aggregates (or rows) would raise different errors,
   which one hipp reports may differ from the pin's; the tests
   compare errored-vs-succeeded and hipp's kind, never the pin's

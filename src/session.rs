@@ -6235,7 +6235,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             None
         } else {
             Some(
-                self.materialise_sources_sub(from_sources.as_slice(), &RowData::empty())
+                self.materialise_sources_sub(from_sources.as_slice(), &RowData::empty(), None)
                     .await?,
             )
         };
@@ -7017,15 +7017,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         &mut self,
         sources: &[SourcePlan],
         outer: &RowData,
+        need: Option<usize>,
     ) -> Result<AVec<AVec<(AVec<OwnedValue>, Option<i64>)>>, S::Error> {
         #[cfg(not(feature = "v09"))]
-        let _ = outer;
+        let _ = (outer, need);
         let mut src_rows: AVec<AVec<(AVec<OwnedValue>, Option<i64>)>> = AVec::new();
         for sp in sources.iter() {
             #[cfg(feature = "v09")]
             {
                 if let Some(d) = &sp.derived {
-                    let inner = self.exec_subplan(d, outer).await?;
+                    let inner = self.exec_subplan_need(d, outer, need).await?;
                     let mut rows = AVec::new();
                     for r in inner.iter() {
                         rows.push((r.clone(), None));
@@ -7145,7 +7146,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Ok(out);
         }
         let src_rows = self
-            .materialise_sources_sub(qp.sources.as_slice(), &RowData::empty())
+            .materialise_sources_sub(qp.sources.as_slice(), &RowData::empty(), None)
             .await?;
         let mut rows: AVec<RowData> = AVec::new();
         self.join_sources(
@@ -7212,8 +7213,17 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "v06")]
     async fn run_query_sub(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        #[cfg(feature = "v09")]
+        let need = derived_need(
+            qp.sources.as_slice(),
+            qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
+            !qp.order_by.is_empty() || qp.distinct,
+            window,
+        );
+        #[cfg(not(feature = "v09"))]
+        let need = None;
         let src_rows = self
-            .materialise_sources_sub(qp.sources.as_slice(), &RowData::empty())
+            .materialise_sources_sub(qp.sources.as_slice(), &RowData::empty(), need)
             .await?;
         let mut rows: AVec<RowData> = AVec::new();
         self.join_sources(
@@ -7600,8 +7610,26 @@ impl<'c, S: Storage> Statement<'c, S> {
         plan: &'x crate::query::SubPlan,
         outer: &'x RowData,
     ) -> SubplanFuture<'x, S::Error> {
+        self.exec_subplan_need(plan, outer, None)
+    }
+
+    /// `exec_subplan` for a derived table whose reader needs only
+    /// its first `need` rows (v0.16 review fix; None: all of
+    /// them). The pin runs such a FROM subquery as a coroutine
+    /// (or flattens it) and stops at the reader's LIMIT, so its
+    /// later groups are never finalized and their aggregates
+    /// cannot error: `SELECT x FROM (SELECT k x, sum(v) FROM g
+    /// GROUP BY k) LIMIT 1` answers although a later group's sum
+    /// overflows.
+    #[cfg(feature = "v06")]
+    fn exec_subplan_need<'x>(
+        &'x mut self,
+        plan: &'x crate::query::SubPlan,
+        outer: &'x RowData,
+        need: Option<usize>,
+    ) -> SubplanFuture<'x, S::Error> {
         self.conn.sub_execs += 1;
-        alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer))
+        alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer, need))
     }
 
     #[cfg(feature = "v06")]
@@ -7609,9 +7637,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         &mut self,
         plan: &crate::query::SubPlan,
         outer: &RowData,
+        need: Option<usize>,
     ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
         let plan = plan.clone();
         let window = self.limit_window(&plan.limit, &plan.offset).await?;
+        // The rows its reader takes bound the rows it must make.
+        let (skip, take) = window;
+        let streamed = (skip, need.map_or(take, |n| take.min(n)));
         // Only a lone core streams its groups up to the LIMIT.
         #[cfg(feature = "v09")]
         let lone = plan.compound.is_empty();
@@ -7622,12 +7654,27 @@ impl<'c, S: Storage> Statement<'c, S> {
                 plan.group_by.as_slice(),
                 plan.order_by.as_slice(),
                 plan.distinct,
-                window,
+                streamed,
             )
         } else {
             None
         };
-        let mut produced = self.exec_subplan_core(&plan, outer, cap).await?;
+        // A lone core reading one derived table passes the bound
+        // on (`derived_need`).
+        #[cfg(feature = "v09")]
+        let src_need = if lone {
+            derived_need(
+                plan.sources.as_slice(),
+                plan.filter.is_some() || !plan.group_by.is_empty() || plan.has_agg,
+                !plan.order_by.is_empty() || plan.distinct,
+                streamed,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(feature = "v09"))]
+        let src_need = None;
+        let mut produced = self.exec_subplan_core(&plan, outer, cap, src_need).await?;
         // Compound finish (v0.9): combine the core rows with
         // each tail core's rows, left to right, then the
         // compound ORDER BY / LIMIT.
@@ -7641,7 +7688,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut cores = AVec::new();
             cores.push(core_colls(plan.items.as_slice(), plan.values.as_slice()));
             for (op, tail) in plan.compound.iter() {
-                let tp = self.exec_subplan_core(tail, outer, None).await?;
+                let tp = self.exec_subplan_core(tail, outer, None, None).await?;
                 let mut right: AVec<AVec<OwnedValue>> = AVec::new();
                 for p in tp.iter() {
                     right.push(p.out.clone());
@@ -7692,6 +7739,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         plan: &crate::query::SubPlan,
         outer: &RowData,
         cap: Option<usize>,
+        need: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         // A VALUES core (v0.9): the rows evaluate against the
         // outer row directly.
@@ -7715,7 +7763,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // table's rows are its subplan's result for this outer
         // row; they carry no rowid).
         let src_rows = self
-            .materialise_sources_sub(plan.sources.as_slice(), outer)
+            .materialise_sources_sub(plan.sources.as_slice(), outer, need)
             .await?;
         let mut joined: AVec<RowData> = AVec::new();
         self.join_sources(
@@ -7993,7 +8041,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .await?;
             if let Some(h) = &qp.having {
                 let mut early = AVec::new();
-                having_early(h, &mut early);
+                having_early(h, qp.group_by.as_slice(), &mut early);
                 let mut pass = true;
                 for c in early.iter() {
                     pass &= crate::query::truthy(
@@ -8141,7 +8189,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .await?;
             if let Some(h) = &plan.having {
                 let mut early = AVec::new();
-                having_early(h, &mut early);
+                having_early(h, plan.group_by.as_slice(), &mut early);
                 let mut pass = true;
                 for c in early.iter() {
                     pass &= crate::query::truthy(
@@ -8931,20 +8979,156 @@ fn compound_order_cmp(
 }
 
 /// The HAVING conjuncts the pin moves into WHERE (v0.16,
-/// ungated; its `havingToWhere`): AND terms with no aggregate and
-/// no subquery. A group failing one never forms there, so none of
-/// its aggregates is finalized — `sum()` cannot raise "integer
-/// overflow" for it. hipp evaluates them first, against the
-/// group's representative row, and skips the group.
+/// ungated; its `havingToWhere`, run only for a GROUP BY query):
+/// AND terms that pass `sqlite3ExprIsConstantOrGroupBy`
+/// (`const_or_group`) and are not the literal 0 / FALSE
+/// (`ExprAlwaysFalse`). A group failing one never forms there, so
+/// none of its aggregates is finalized — `sum()` cannot raise
+/// "integer overflow" for it. hipp evaluates them first, against
+/// the group's representative row, and skips the group. Review
+/// fix: any term without aggregates or subqueries used to move,
+/// so `HAVING random() = 5`, `HAVING 0`, a bare column, a NOCASE
+/// group column and a query without GROUP BY skipped errors the
+/// pin raises.
 #[cfg(feature = "v04")]
-fn having_early<'x>(h: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+fn having_early<'x>(h: &'x RExpr, group_by: &[RExpr], out: &mut AVec<&'x RExpr>) {
+    if group_by.is_empty() || always_false(h) {
+        return;
+    }
     match h {
         RExpr::Binary(crate::sql::BinOp::And, a, b) => {
-            having_early(a, out);
-            having_early(b, out);
+            having_early(a, group_by, out);
+            having_early(b, group_by, out);
         }
-        e if !crate::query::has_agg(e) && !crate::query::has_sub(e) => out.push(e),
+        e if const_or_group(e, group_by) => out.push(e),
         _ => {}
+    }
+}
+
+/// The pin's `ExprAlwaysFalse` after its parser's AND folding
+/// (v0.16): the literal 0 (or FALSE), or an AND with such an
+/// operand and no function call on either side, which
+/// `sqlite3ExprAnd` turns into the literal 0 — so `HAVING k = 1
+/// AND 0` moves nothing while `HAVING abs(k) = 1 AND 0` moves
+/// `abs(k) = 1`. hipp's parser folds FALSE, `-0` and `+0` into
+/// the literal 0, where the pin folds no AND over FALSE and
+/// keeps a (movable) unary operator (STATUS.md gap).
+#[cfg(feature = "v04")]
+fn always_false(e: &RExpr) -> bool {
+    match e {
+        RExpr::Literal(OwnedValue::Integer(0)) => true,
+        RExpr::Binary(crate::sql::BinOp::And, a, b) => {
+            (always_false(a) || always_false(b)) && !has_call(a) && !has_call(b)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` holds a function call outside its subqueries
+/// (v0.16): the pin's `EP_HasFunc`, which LIKE / GLOB carry too.
+#[cfg(feature = "v04")]
+fn has_call(e: &RExpr) -> bool {
+    match e {
+        RExpr::Scalar(..) | RExpr::Agg { .. } | RExpr::Like(..) => true,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, ..)
+        | RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _)
+        | RExpr::Cast(x, _)
+        | RExpr::Collate(x, _) => has_call(x),
+        RExpr::Binary(_, a, b) => has_call(a) || has_call(b),
+        RExpr::InList(x, l, ..) => has_call(x) || l.iter().any(has_call),
+        RExpr::Between(x, a, b, _) => has_call(x) || has_call(a) || has_call(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(has_call)
+                || whens.iter().any(|(w, t)| has_call(w) || has_call(t))
+                || otherwise.as_deref().is_some_and(has_call)
+        }
+    }
+}
+
+/// The pin's `sqlite3ExprIsConstantOrGroupBy` (v0.16): every
+/// part of `e` is a literal, an operator or deterministic
+/// function over such parts, or a GROUP BY term with BINARY
+/// collation (`group_match`). Columns elsewhere, subqueries,
+/// aggregates and the non-constant functions (`random()`,
+/// `changes()`, ...) fail.
+#[cfg(feature = "v04")]
+fn const_or_group(e: &RExpr, group_by: &[RExpr]) -> bool {
+    if group_by.iter().any(|g| {
+        group_match(e, g)
+            && crate::query::expr_coll(g).unwrap_or_default() == crate::record::Coll::Binary
+    }) {
+        return true;
+    }
+    let f = |x: &RExpr| const_or_group(x, group_by);
+    match e {
+        RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
+        RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_)
+        | RExpr::InSub(..)
+        | RExpr::Agg { .. } => false,
+        RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _)
+        | RExpr::Cast(x, _)
+        | RExpr::Collate(x, _) => f(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) && f(b),
+        RExpr::InList(x, l, ..) => f(x) && l.iter().all(f),
+        RExpr::Between(x, a, b, _) => f(x) && f(a) && f(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_none_or(f)
+                && whens.iter().all(|(w, t)| f(w) && f(t))
+                && otherwise.as_deref().is_none_or(f)
+        }
+        RExpr::Scalar(g, args) => {
+            // sqlite_version() is a constant function there.
+            #[cfg(feature = "v16")]
+            let varies = g.nondeterministic() && *g != crate::query::ScalarFn::SqliteVersion;
+            #[cfg(not(feature = "v16"))]
+            let varies = {
+                let _ = g;
+                false
+            };
+            !varies && args.iter().all(f)
+        }
+    }
+}
+
+/// `sqlite3ExprCompare(a, b) < 2` (v0.16): the same expression,
+/// or one that differs only by a COLLATE on top of either side.
+#[cfg(feature = "v04")]
+fn group_match(a: &RExpr, b: &RExpr) -> bool {
+    if crate::query::same_expr(a, b) {
+        return true;
+    }
+    match (a, b) {
+        (RExpr::Collate(..), RExpr::Collate(..)) => false,
+        (RExpr::Collate(x, _), _) => group_match(x, b),
+        (_, RExpr::Collate(y, _)) => group_match(a, y),
+        _ => false,
     }
 }
 
@@ -8991,6 +9175,27 @@ fn group_cap(
                 .zip(group_by.iter())
                 .all(|((o, _), g)| crate::query::same_expr(o, g)));
     in_group_order.then(|| skip.saturating_add(take))
+}
+
+/// How many rows a query needs from its FROM clause when that
+/// is one derived table it reads in order (v0.16 review fix):
+/// with a LIMIT, no WHERE / grouping / aggregates (`reduced`)
+/// and no ORDER BY / DISTINCT (`reordered`), the pin stops reading the
+/// subquery after OFFSET + LIMIT rows. None: every row is
+/// needed (an outer WHERE may be pushed into the subquery on the
+/// pin, which hipp does not model; see STATUS.md).
+#[cfg(feature = "v09")]
+fn derived_need(
+    sources: &[SourcePlan],
+    reduced: bool,
+    reordered: bool,
+    (skip, take): (usize, usize),
+) -> Option<usize> {
+    let [only] = sources else {
+        return None;
+    };
+    (only.derived.is_some() && !reduced && !reordered && take != usize::MAX)
+        .then(|| skip.saturating_add(take))
 }
 
 /// The direction each GROUP BY term's groups come out in
@@ -9352,7 +9557,7 @@ fn project_rows<E>(
         let ctx = Ctx::group(grows.as_slice(), &rep).with(env);
         if let Some(h) = &qp.having {
             let mut early = AVec::new();
-            having_early(h, &mut early);
+            having_early(h, qp.group_by.as_slice(), &mut early);
             let mut pass = true;
             for c in early.iter() {
                 pass &= crate::query::truthy(&crate::query::eval::<E>(c, &ctx)?) == Some(true);

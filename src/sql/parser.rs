@@ -2002,7 +2002,11 @@ impl<'a> Parser<'a> {
                     let star = self.eat(Tok::Star);
                     let distinct = !star && self.eat_kw(b"DISTINCT");
                     let mut args = AVec::new();
-                    if !star && !matches!(self.cur().tok, Tok::RParen) {
+                    #[cfg(feature = "v16")]
+                    let no_args = self.cur_is_kw(b"ORDER");
+                    #[cfg(not(feature = "v16"))]
+                    let no_args = false;
+                    if !star && !no_args && !matches!(self.cur().tok, Tok::RParen) {
                         loop {
                             args.push(self.parse_expr::<E>()?);
                             if self.eat(Tok::Comma) {
@@ -2012,13 +2016,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                     // `f(args ORDER BY ...)` (v0.16, `v16`): the
-                    // pin's grammar takes it after one or more
-                    // arguments only (`count(* ORDER BY x)` is a
-                    // syntax error there).
+                    // pin's grammar takes it after a (possibly
+                    // empty) argument list, not after `*`
+                    // (`count(* ORDER BY x)` is a syntax error
+                    // there). With no arguments the pin's
+                    // `sqlite3ExprAddFunctionOrderBy` drops the
+                    // clause unresolved: `count(ORDER BY nosuch)`
+                    // is `count(*)` (review fix: it was refused).
                     #[cfg(feature = "v16")]
-                    let order_by = if !args.is_empty() && self.eat_kw(b"ORDER") {
+                    let order_by = if !star && self.eat_kw(b"ORDER") {
                         self.expect_kw::<E>(b"BY")?;
-                        self.order_terms::<E>()?
+                        let terms = self.order_terms::<E>()?;
+                        if args.is_empty() { AVec::new() } else { terms }
                     } else {
                         AVec::new()
                     };
