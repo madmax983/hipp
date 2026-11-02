@@ -141,6 +141,15 @@ pub enum SchemaKind {
     /// the pin's default `SQLITE_LIMIT_LIKE_PATTERN_LENGTH`,
     /// "LIKE or GLOB pattern too complex"). Shorten the pattern.
     PatternTooComplex,
+    /// A bound parameter inside a schema object's definition — a
+    /// view, a CHECK constraint, a generated column or a DEFAULT
+    /// (v0.16, `params`; the pin's "parameters are not allowed in
+    /// views" / "parameters prohibited in CHECK constraints" /
+    /// "default value ... is not constant"). The definition is
+    /// stored as text and re-read without the bindings: write the
+    /// value as a literal.
+    #[cfg(feature = "params")]
+    ParameterNotAllowed,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -169,6 +178,17 @@ pub enum ParseKind {
     /// ignoring the clause. Build with feature `v04` (or
     /// `full`), or drop the clause.
     RequiresEvaluator,
+    /// `?0`, or `?NNN` past 32766 (v0.16, `params`; the pin's
+    /// "variable number must be between ?1 and ?32766"). Number
+    /// parameters from ?1 up to ?32766.
+    #[cfg(feature = "params")]
+    VariableNumber,
+    /// A statement whose parameters need an index past 32766
+    /// (v0.16, `params`; the pin's "too many SQL variables").
+    /// Split the statement, or reuse named / numbered
+    /// parameters.
+    #[cfg(feature = "params")]
+    TooManyVariables,
 }
 
 /// The core error type. Generic over the storage error `E`.
@@ -221,6 +241,17 @@ pub enum Error<E> {
     /// has none: the core has no clock of its own. Supply one
     /// with `Config::clock`.
     NoClock,
+    /// A `bind_*` call names an index outside 1 ..=
+    /// `parameter_count()` (v0.16, `params`; the pin's
+    /// `SQLITE_RANGE`). Bind by an index the statement has, or
+    /// look one up with `parameter_index`.
+    #[cfg(feature = "params")]
+    BindIndexOutOfRange { index: usize },
+    /// A `bind_*` / `clear_bindings` call on a statement that
+    /// has been stepped and not reset (v0.16, `params`; the pin's
+    /// `SQLITE_MISUSE`). Call `Statement::reset` first.
+    #[cfg(feature = "params")]
+    ResetRequired,
     /// The caller's storage device error.
     Storage(E),
 }
@@ -257,6 +288,10 @@ impl<E> Error<E> {
             Error::ArenaExhausted { scope, needed } => Error::ArenaExhausted { scope, needed },
             Error::CorruptJournal => Error::CorruptJournal,
             Error::NoClock => Error::NoClock,
+            #[cfg(feature = "params")]
+            Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
+            #[cfg(feature = "params")]
+            Error::ResetRequired => Error::ResetRequired,
             Error::Storage(e) => Error::Storage(e.into()),
         }
     }

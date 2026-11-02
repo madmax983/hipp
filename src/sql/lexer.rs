@@ -41,7 +41,127 @@ pub enum Tok {
     Percent,
     /// `||` string concatenation (v0.4 expressions).
     Concat,
+    /// A bound-parameter token (v0.16, feature `params`): `?`,
+    /// `?NNN`, `:name`, `@name`, `$name` or `#name`, with the
+    /// 1-based index the pin's `sqlite3ExprAssignVarNumber`
+    /// gives it (see `ParamTable`) and the token's own text.
+    #[cfg(feature = "params")]
+    Param(u16, ABytes),
     Eof,
+}
+
+/// The largest parameter index (v0.16, `params`): the pin's
+/// `SQLITE_MAX_VARIABLE_NUMBER` default, 32766.
+#[cfg(feature = "params")]
+pub const MAX_PARAMS: u16 = 32766;
+
+/// A statement's parameter numbering (v0.16, `params`) — the
+/// pin's `Parse.nVar` and `pVList`, built in source order as
+/// the lexer meets each parameter token: `?` takes the next
+/// index (one past the largest so far); `?NNN` takes NNN (and
+/// names that index `?NNN` unless it already has a name); a
+/// named parameter (`:a`, `@a`, `$a`, `#a`) reuses the index of
+/// an earlier token with exactly the same text, else takes the
+/// next index.
+#[cfg(feature = "params")]
+#[derive(Debug, Clone, Default)]
+pub struct ParamTable {
+    /// The largest index assigned (`sqlite3_bind_parameter_count`).
+    pub count: u16,
+    /// `(name, index)` in registration order; the first entry
+    /// for an index is that index's name.
+    pub names: AVec<(ABytes, u16)>,
+}
+
+#[cfg(feature = "params")]
+impl ParamTable {
+    /// The index of the parameter spelled exactly `name`.
+    pub fn index_of(&self, arena: &Arena, name: &[u8]) -> Option<u16> {
+        self.names
+            .iter()
+            .find(|(h, _)| arena.slice_at(h.pos as usize, h.len as usize) == Some(name))
+            .map(|(_, i)| *i)
+    }
+
+    /// The name of index `i` (`None` for a nameless `?`).
+    pub fn name_of(&self, i: u16) -> Option<ABytes> {
+        self.names.iter().find(|(_, x)| *x == i).map(|(h, _)| *h)
+    }
+
+    /// Assign the index of one parameter token `z` (the pin's
+    /// `sqlite3ExprAssignVarNumber`).
+    fn assign<E>(&mut self, arena: &Arena, z: &[u8], h: ABytes, off: usize) -> Result<u16, E> {
+        let next = |c: u16| {
+            c.checked_add(1)
+                .filter(|n| *n <= MAX_PARAMS)
+                .ok_or(perr(off, ParseKind::TooManyVariables))
+        };
+        if z.len() == 1 {
+            self.count = next(self.count)?;
+            return Ok(self.count);
+        }
+        if z.first() == Some(&b'?') {
+            let mut v: u16 = 0;
+            for d in z.iter().skip(1) {
+                v = v
+                    .checked_mul(10)
+                    .and_then(|x| x.checked_add(u16::from(d.wrapping_sub(b'0'))))
+                    .filter(|x| *x <= MAX_PARAMS)
+                    .ok_or(perr(off, ParseKind::VariableNumber))?;
+            }
+            if v == 0 {
+                return Err(perr(off, ParseKind::VariableNumber));
+            }
+            if v > self.count {
+                self.count = v;
+                self.names.push((h, v));
+            } else if self.name_of(v).is_none() {
+                self.names.push((h, v));
+            }
+            return Ok(v);
+        }
+        if let Some(x) = self.index_of(arena, z) {
+            return Ok(x);
+        }
+        self.count = next(self.count)?;
+        self.names.push((h, self.count));
+        Ok(self.count)
+    }
+}
+
+/// The length of the parameter token at the start of `z`
+/// (v0.16, `params`; the pin's tokenizer): `?` and its digits;
+/// or `$ @ : #` and identifier characters, with the TCL forms
+/// `::` and a trailing `(...)` group. `None` is the pin's
+/// "unrecognized token" (no name characters, or an unclosed
+/// group).
+#[cfg(feature = "params")]
+fn param_len(z: &[u8]) -> Option<usize> {
+    if z.first() == Some(&b'?') {
+        return Some(1 + z.iter().skip(1).take_while(|c| c.is_ascii_digit()).count());
+    }
+    let mut i = 1usize;
+    let mut n = 0usize;
+    while let Some(&c) = z.get(i) {
+        if is_ident_char(c) {
+            n += 1;
+        } else if c == b'(' && n > 0 {
+            loop {
+                i += 1;
+                match z.get(i) {
+                    Some(b')') => return Some(i + 1),
+                    Some(c) if *c != 0 && !c.is_ascii_whitespace() && *c != 0x0b => {}
+                    _ => return None,
+                }
+            }
+        } else if c == b':' && z.get(i + 1) == Some(&b':') {
+            i += 1;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    (n > 0).then_some(i)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -532,6 +652,28 @@ fn number_token<E>(text: &[u8], offset: usize) -> core::result::Result<Tok, Erro
 }
 
 pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
+    #[cfg(feature = "params")]
+    {
+        lex_params::<E>(sql, arena, &mut ParamTable::default())
+    }
+    #[cfg(not(feature = "params"))]
+    {
+        lex_inner::<E>(sql, arena)
+    }
+}
+
+/// `lex`, numbering parameter tokens into `params` (v0.16,
+/// feature `params`).
+#[cfg(feature = "params")]
+pub fn lex_params<E>(sql: &[u8], arena: &Arena, params: &mut ParamTable) -> Result<AVec<Token>, E> {
+    lex_inner::<E>(sql, arena, params)
+}
+
+fn lex_inner<E>(
+    sql: &[u8],
+    arena: &Arena,
+    #[cfg(feature = "params")] params: &mut ParamTable,
+) -> Result<AVec<Token>, E> {
     let mut toks = AVec::new();
     let mut i = 0usize;
     let n = sql.len();
@@ -832,6 +974,24 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
                 }
                 let tok = number_token::<E>(&sql[start..i], off)?;
                 toks.push(Token { tok, offset: off });
+            }
+            #[cfg(feature = "params")]
+            b'?' | b':' | b'@' | b'$' | b'#' => {
+                let rest = sql.get(i..).unwrap_or(&[]);
+                let len = param_len(rest).ok_or(perr(off, ParseKind::UnexpectedToken))?;
+                let z = rest.get(..len).unwrap_or(&[]);
+                // `#` and a digit is the pin's register syntax,
+                // a syntax error outside its nested parses.
+                if b == b'#' && z.get(1).is_some_and(u8::is_ascii_digit) {
+                    return Err(perr(off, ParseKind::UnexpectedToken));
+                }
+                let h = arena.alloc_copy_handle(z)?;
+                let idx = params.assign::<E>(arena, z, h, off)?;
+                toks.push(Token {
+                    tok: Tok::Param(idx, h),
+                    offset: off,
+                });
+                i += len;
             }
             _ if is_ident_start(b) => {
                 let start = i;

@@ -79,6 +79,40 @@ pub fn parse<E>(sql: &[u8], arena: &Arena) -> Result<Ast, E> {
     Ok(ast)
 }
 
+/// `parse`, also returning the statement's parameter numbering
+/// (v0.16, feature `params`). A parameter inside a CREATE TABLE
+/// (other than its AS SELECT), ALTER TABLE or CREATE VIEW is
+/// refused, as on the pin: those definitions are stored as text
+/// and re-read without bindings.
+#[cfg(feature = "params")]
+pub fn parse_params<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, lexer::ParamTable), E> {
+    let mut params = lexer::ParamTable::default();
+    let toks = lexer::lex_params::<E>(sql, arena, &mut params)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    let stored = match &ast {
+        #[cfg(feature = "v16")]
+        Ast::CreateTable { as_select, .. } => as_select.is_none(),
+        #[cfg(not(feature = "v16"))]
+        Ast::CreateTable { .. } => true,
+        Ast::AlterAddColumn { .. } | Ast::CreateView { .. } => true,
+        _ => false,
+    };
+    if stored && params.count > 0 {
+        return Err(Error::Schema {
+            kind: crate::error::SchemaKind::ParameterNotAllowed,
+        });
+    }
+    Ok((ast, params))
+}
+
 /// Parse one stand-alone expression (v0.16): the stored text of
 /// a CHECK constraint, generated column or DEFAULT, re-parsed by
 /// the planner into `arena`. The whole input must be the one
@@ -837,6 +871,19 @@ impl<'a> Parser<'a> {
                 .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_')
     }
 
+    /// A parameter token at the cursor, consumed (v0.16,
+    /// `params`): the literal positions of the tiny grammar.
+    #[cfg(all(feature = "params", not(feature = "v04")))]
+    fn param_here(&mut self) -> Option<Expr> {
+        match self.cur().tok {
+            Tok::Param(i, h) => {
+                self.pos += 1;
+                Some(Expr::Param(i, h))
+            }
+            _ => None,
+        }
+    }
+
     fn literal_at(&self, i: usize) -> Option<(Literal, usize)> {
         if i >= self.limit {
             return None;
@@ -1181,6 +1228,10 @@ impl<'a> Parser<'a> {
 
     #[cfg(not(feature = "v04"))]
     fn value_expr<E>(&mut self) -> Result<Expr, E> {
+        #[cfg(feature = "params")]
+        if let Some(e) = self.param_here() {
+            return Ok(e);
+        }
         let (lit, used) = self
             .literal_at(self.pos)
             .ok_or(perr(self.cur().offset, ParseKind::UnexpectedToken))?;
@@ -1250,17 +1301,32 @@ impl<'a> Parser<'a> {
             if !self.eat(Tok::Eq) {
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
-            let (lit, used) = self
-                .literal_at(self.pos)
-                .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
-            self.pos += used;
+            #[cfg(feature = "params")]
+            let rhs = match self.param_here() {
+                Some(e) => e,
+                None => {
+                    let (lit, used) = self
+                        .literal_at(self.pos)
+                        .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
+                    self.pos += used;
+                    Expr::Literal(lit)
+                }
+            };
+            #[cfg(not(feature = "params"))]
+            let rhs = {
+                let (lit, used) = self
+                    .literal_at(self.pos)
+                    .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
+                self.pos += used;
+                Expr::Literal(lit)
+            };
             filter = Some(Expr::Binary(
                 BinOp::Eq,
                 Box::new(Expr::Column {
                     table: None,
                     name: col,
                 }),
-                Box::new(Expr::Literal(lit)),
+                Box::new(rhs),
             ));
         }
         Ok(Ast::Select(SelectStmt {
@@ -1805,6 +1871,11 @@ impl<'a> Parser<'a> {
                     table: None,
                     name: h,
                 })
+            }
+            #[cfg(feature = "params")]
+            Tok::Param(i, h) => {
+                self.pos += 1;
+                Ok(Expr::Param(i, h))
             }
             _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         }

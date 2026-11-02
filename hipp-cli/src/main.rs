@@ -4,15 +4,26 @@
 //! is byte-diffable against the pinned SQLite oracle CLI.
 //!
 //! Its first job is differential testing; demo surface second.
-//! Dot-commands: `.tables`, `.schema`, `.dump`, `.open`, `.exit`
-//! (alias `.quit`). No line editing, no `.import`/`.export`, no
-//! format/flag parity beyond diffable basics.
+//! Dot-commands: `.tables`, `.schema`, `.dump`, `.open`,
+//! `.parameter`, `.exit` (alias `.quit`). No line editing, no
+//! `.import`/`.export`, no format/flag parity beyond diffable
+//! basics.
+//!
+//! Bound parameters (v0.16) work as in the oracle shell: every
+//! parameter of a statement is bound from the `.parameter set`
+//! table by its name (a nameless `?` by `?N`), NULL when the
+//! table has no such key.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use hipp::storage::block_on;
-use hipp::{Config, Connection, FileStorage, MemStorage, Step, Value};
+use hipp::{Config, Connection, FileStorage, MemStorage, OwnedValue, Step, Value};
+
+/// The `.parameter` bindings (v0.16): the oracle shell's
+/// `temp.sqlite_parameters` table — key (the parameter's name as
+/// written, `?N` for a nameless `?`) to value, in key order.
+type Params = std::collections::BTreeMap<String, OwnedValue>;
 
 /// The open database: a file or `:memory:`.
 enum Db {
@@ -52,11 +63,9 @@ fn now_ms() -> i64 {
 /// [-4, 15) exponent range, at least one fractional digit.
 fn fmt_real(f: f64) -> String {
     if f == 0.0 {
-        return if f.is_sign_negative() {
-            "-0.0".to_string()
-        } else {
-            "0.0".to_string()
-        };
+        // The pin's printf has no negative zero: `SELECT -0.0`
+        // prints 0.0 (v0.16 fix; the value itself stays -0.0).
+        return "0.0".to_string();
     }
     if !f.is_finite() {
         // SQLite prints these as Inf / -Inf in list mode.
@@ -171,24 +180,34 @@ fn value_bytes(v: Value<'_>) -> Vec<u8> {
 async fn run_statement<S: hipp::Storage>(
     db: &mut Connection<S>,
     sql: &str,
+    params: &Params,
     out: &mut impl Write,
 ) -> Result<(), String>
 where
     S::Error: core::fmt::Debug,
 {
     let mut st = db.prepare(sql).await.map_err(|e| format!("{e:?}"))?;
-    if st.column_count() > 0 {
-        while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
-            let vals: Vec<Vec<u8>> = (0..st.column_count())
-                .map(|i| value_bytes(st.column_value(i).unwrap_or(Value::Null)))
-                .collect();
-            write_row(out, &vals);
+    // The oracle shell's `bind_prepared_stmt`: each parameter
+    // from the `.parameter` table by name, else NULL.
+    for i in 1..=st.parameter_count() {
+        let key = st
+            .parameter_name(i)
+            .map_or_else(|| format!("?{i}"), str::to_string);
+        if let Some(v) = params.get(&key) {
+            st.bind_value(i, v.as_value())
+                .map_err(|e| format!("{e:?}"))?;
         }
-        Ok(())
-    } else {
-        st.step().await.map_err(|e| format!("{e:?}"))?;
-        Ok(())
     }
+    // Step to completion, printing every row (a statement whose
+    // planning waited for its bindings knows its columns only
+    // once stepped).
+    while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
+        let vals: Vec<Vec<u8>> = (0..st.column_count())
+            .map(|i| value_bytes(st.column_value(i).unwrap_or(Value::Null)))
+            .collect();
+        write_row(out, &vals);
+    }
+    Ok(())
 }
 
 /// Split a script into statements on `;` outside of string
@@ -252,9 +271,58 @@ enum Flow {
     Exit,
 }
 
+/// Split a dot-command line into arguments the way the oracle
+/// shell does: whitespace-separated words, a word starting with
+/// `'` or `"` running to the matching quote (the quotes
+/// dropped).
+fn shell_args(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(&c) = chars.peek() else {
+            return args;
+        };
+        let mut word = String::new();
+        if c == '\'' || c == '"' {
+            chars.next();
+            for d in chars.by_ref() {
+                if d == c {
+                    break;
+                }
+                word.push(d);
+            }
+        } else {
+            while let Some(d) = chars.next_if(|d| !d.is_whitespace()) {
+                word.push(d);
+            }
+        }
+        args.push(word);
+    }
+}
+
+/// `.parameter set KEY VALUE`'s value (v0.16): VALUE as an SQL
+/// expression when it is one (`5`, `2.5`, `x'01'`, `'text'`,
+/// `1+2`), else the text itself — the oracle shell's two-try
+/// `REPLACE INTO temp.sqlite_parameters ... VALUES(%Q,%s)`.
+async fn parameter_value<S: hipp::Storage>(db: &mut Connection<S>, text: &str) -> OwnedValue
+where
+    S::Error: core::fmt::Debug,
+{
+    if let Ok(mut st) = db.prepare(&format!("SELECT {text}")).await
+        && st.column_count() == 1
+        && st.parameter_count() == 0
+        && let Ok(Step::Row) = st.step().await
+    {
+        return OwnedValue::from_value(st.column_value(0).unwrap_or(Value::Null));
+    }
+    OwnedValue::from_value(Value::Text(text.as_bytes()))
+}
+
 async fn dot_command<S: hipp::Storage>(
     db: &mut Connection<S>,
     line: &str,
+    params: &mut Params,
     out: &mut impl Write,
 ) -> Result<Flow, String>
 where
@@ -265,6 +333,36 @@ where
     let arg = parts.next().map(str::trim).unwrap_or("");
     match cmd {
         ".exit" | ".quit" => Ok(Flow::Exit),
+        ".parameter" | ".param" => {
+            let args = shell_args(arg);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match args.as_slice() {
+                ["clear"] => params.clear(),
+                ["init"] => {}
+                ["list"] => {
+                    let len = params.keys().map(|k| k.len()).max().unwrap_or(0).min(40);
+                    for (k, v) in params.iter() {
+                        let _ = out.write_all(format!("{k:<len$} ").as_bytes());
+                        let _ = out.write_all(&fmt_literal(v.as_value()));
+                        let _ = out.write_all(b"\n");
+                    }
+                }
+                ["set", key, value] => {
+                    let v = parameter_value(db, value).await;
+                    params.insert((*key).to_string(), v);
+                }
+                ["unset", key] => {
+                    params.remove(*key);
+                }
+                _ => {
+                    return Err(
+                        "usage: .parameter clear | init | list | set NAME VALUE | unset NAME"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(Flow::Continue)
+        }
         ".tables" => {
             for t in db.tables().iter() {
                 let _ = out.write_all(t.name);
@@ -391,7 +489,12 @@ where
 
 /// Execute one input unit (statement or dot-command) against the
 /// current database, handling `.open` by swapping `db`.
-async fn dispatch(db: &mut Db, input: &str, out: &mut impl Write) -> Result<Flow, String> {
+async fn dispatch(
+    db: &mut Db,
+    input: &str,
+    params: &mut Params,
+    out: &mut impl Write,
+) -> Result<Flow, String> {
     let trimmed = input.trim();
     if trimmed.starts_with('.') {
         let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -404,15 +507,15 @@ async fn dispatch(db: &mut Db, input: &str, out: &mut impl Write) -> Result<Flow
             return Ok(Flow::Continue);
         }
         match db {
-            Db::File(c) => dot_command(c, trimmed, out).await,
-            Db::Mem(c) => dot_command(c, trimmed, out).await,
+            Db::File(c) => dot_command(c, trimmed, params, out).await,
+            Db::Mem(c) => dot_command(c, trimmed, params, out).await,
         }
     } else {
         match db {
-            Db::File(c) => run_statement(c, trimmed, out)
+            Db::File(c) => run_statement(c, trimmed, params, out)
                 .await
                 .map(|()| Flow::Continue),
-            Db::Mem(c) => run_statement(c, trimmed, out)
+            Db::Mem(c) => run_statement(c, trimmed, params, out)
                 .await
                 .map(|()| Flow::Continue),
         }
@@ -438,12 +541,13 @@ fn main() -> ExitCode {
         }
     };
     let mut out = std::io::stdout().lock();
+    let mut params = Params::new();
 
     // One-shot mode: run the SQL argument (possibly several
     // statements), stop at the first error.
     if let Some(sql) = args.get(1) {
         for stmt in split_statements(sql) {
-            match block_on(dispatch(&mut db, &stmt, &mut out)) {
+            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {
@@ -460,7 +564,7 @@ fn main() -> ExitCode {
     let interactive = stdin.is_terminal();
     if interactive {
         println!("hipp — reads and writes SQLite database files (format pin: SQLite 3.54.1)");
-        println!("Enter SQL or dot-commands (.tables .schema .dump .open .exit)");
+        println!("Enter SQL or dot-commands (.tables .schema .dump .open .parameter .exit)");
     }
     let mut lines = stdin.lock().lines();
     let mut buffer = String::new();
@@ -479,7 +583,7 @@ fn main() -> ExitCode {
         };
         let line = line.trim_end();
         if buffer.is_empty() && line.trim_start().starts_with('.') {
-            match block_on(dispatch(&mut db, line.trim(), &mut out)) {
+            match block_on(dispatch(&mut db, line.trim(), &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => eprintln!("Error: {e}"),
@@ -493,7 +597,7 @@ fn main() -> ExitCode {
         if buffer.trim_end().ends_with(';') {
             let script = std::mem::take(&mut buffer);
             for stmt in split_statements(&script) {
-                match block_on(dispatch(&mut db, &stmt, &mut out)) {
+                match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit) => return ExitCode::SUCCESS,
                     Err(e) => eprintln!("Error: {e}"),
@@ -504,7 +608,7 @@ fn main() -> ExitCode {
     // A trailing unterminated statement still runs at EOF.
     if !buffer.trim().is_empty() {
         for stmt in split_statements(&buffer) {
-            match block_on(dispatch(&mut db, &stmt, &mut out)) {
+            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {

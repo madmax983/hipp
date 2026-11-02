@@ -180,6 +180,15 @@ pub enum Expr {
     /// it takes part in (the pin's `EP_Collate` rules).
     #[cfg(feature = "v16")]
     Collate(Box<Expr>, Coll),
+    /// A bound parameter (v0.16, feature `params`): its 1-based
+    /// index and its token text (`?`, `?2`, `:name`, ...). It
+    /// never reaches the planner from a prepared statement: each
+    /// execution plans a copy of the tree with every parameter
+    /// replaced by its bound value as a literal (see
+    /// `session::bind_ast`). In a stored schema text (where the
+    /// pin silently reads one as NULL) it resolves to NULL.
+    #[cfg(feature = "params")]
+    Param(u16, ABytes),
 }
 
 /// One SELECT result item (v0.4).

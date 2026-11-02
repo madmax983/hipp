@@ -17,7 +17,7 @@ use crate::pager::Pager;
 use crate::record::{OwnedValue, Value, apply_affinity, encode_record};
 use crate::schema::{Catalog, build_catalog};
 use crate::sql::{
-    Ast, BinOp, ConflictAction, Expr, Literal, SelectItem, SelectStmt, eq_ci, handle_bytes, parse,
+    Ast, BinOp, ConflictAction, Expr, Literal, SelectItem, SelectStmt, eq_ci, handle_bytes,
 };
 use crate::storage::Storage;
 
@@ -392,6 +392,12 @@ enum Plan {
     /// `CREATE VIEW` (v0.4).
     #[cfg(feature = "v04")]
     CreateView,
+    /// A statement with parameters whose plan for its current
+    /// bindings is not made yet (v0.16, `params`): its plan for
+    /// the unbound (all-NULL) state failed at prepare with an
+    /// error a binding may change. `step` plans it first.
+    #[cfg(feature = "params")]
+    Deferred,
     /// `DROP VIEW` (v0.4); `exists: false` is the IF EXISTS no-op.
     #[cfg(feature = "v04")]
     DropView {
@@ -808,6 +814,13 @@ impl<S: Storage> Connection<S> {
     /// cookie forces a catalog rebuild first (§5.5); a commit left
     /// mid-flight by a dropped future must be resumed or rolled
     /// back before anything new is prepared (§5.1.1).
+    ///
+    /// With feature `params` the SQL may hold parameters (`?`,
+    /// `?NNN`, `:name`, `@name`, `$name`), NULL until bound with
+    /// `Statement::bind_*`. Such a statement is planned for its
+    /// unbound state here; an error a binding could change (a
+    /// value error of a constant row, say) is deferred to the
+    /// first `step`, which plans with the values bound by then.
     pub async fn prepare(&mut self, sql: &str) -> Result<Statement<'_, S>, S::Error> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
@@ -819,10 +832,16 @@ impl<S: Storage> Connection<S> {
         // The original statement text, retained for CREATE TABLE:
         // it is what lands in `sqlite_schema.sql` (§5.5).
         let sql_text = arena.alloc_copy_handle(sql.as_bytes())?;
-        let ast = parse::<S::Error>(sql.as_bytes(), &arena)?;
+        #[cfg(not(feature = "params"))]
+        let ast = crate::sql::parse::<S::Error>(sql.as_bytes(), &arena)?;
+        #[cfg(not(feature = "params"))]
         let plan = self.plan(&arena, &ast)?;
+        #[cfg(feature = "params")]
+        let (ast, plan, binds) = self.prepare_params(sql.as_bytes(), &arena)?;
         let row_ckpt = arena.checkpoint();
         Ok(Statement {
+            #[cfg(feature = "params")]
+            binds,
             conn: self,
             arena,
             sql_text,
@@ -859,6 +878,47 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v07")]
             ret_loaded: false,
         })
+    }
+
+    /// Parse and plan a statement that may hold parameters (v0.16,
+    /// `params`). Without parameters this is `parse` + `plan`.
+    /// With them, the plan is made for the all-NULL bindings (the
+    /// unbound state); a failure that a binding could change (a
+    /// value error such as a NOT NULL or MustBeInt failure of a
+    /// constant row) is not reported here but deferred to the
+    /// first `step`, which plans again with the actual bindings —
+    /// as the pin reports such errors only when it runs the
+    /// statement. Name-resolution and grammar errors, which no
+    /// binding changes, are reported here.
+    #[cfg(feature = "params")]
+    fn prepare_params(&self, sql: &[u8], arena: &Arena) -> Result<(Ast, Plan, Binds), S::Error> {
+        let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena)?;
+        let plan_ckpt = arena.checkpoint();
+        let mut binds = Binds {
+            values: AVec::new(),
+            table,
+            src: None,
+            plan_ckpt,
+            stale: false,
+            started: false,
+        };
+        if binds.table.count == 0 {
+            let plan = self.plan(arena, &ast)?;
+            return Ok((ast, plan, binds));
+        }
+        for _ in 0..binds.table.count {
+            binds.values.push(OwnedValue::Null);
+        }
+        let bound = crate::sql::bind::bind_ast::<S::Error>(&ast, binds.values.as_slice(), arena)?;
+        binds.src = Some(ast);
+        match self.plan(arena, &bound) {
+            Ok(plan) => Ok((bound, plan, binds)),
+            Err(e) if binding_independent(&e) => Err(e),
+            Err(_) => {
+                binds.stale = true;
+                Ok((bound, Plan::Deferred, binds))
+            }
+        }
     }
 
     fn plan(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
@@ -1353,7 +1413,7 @@ impl<S: Storage> Connection<S> {
                     #[cfg(feature = "v16")]
                     strict,
                     ..
-                } = parse::<S::Error>(new_sql.as_slice(), arena)?
+                } = crate::sql::parse::<S::Error>(new_sql.as_slice(), arena)?
                 else {
                     return Err(Error::Unsupported);
                 };
@@ -3447,7 +3507,68 @@ enum Phase {
     Done,
 }
 
+/// A statement's parameters and re-execution state (v0.16,
+/// `params`).
+#[cfg(feature = "params")]
+struct Binds {
+    /// The numbering the lexer assigned (count, names).
+    table: crate::sql::lexer::ParamTable,
+    /// The bound values, one per index (`table.count` of them);
+    /// NULL until bound.
+    values: AVec<OwnedValue>,
+    /// The statement as parsed, its parameters unbound; `None`
+    /// when it has none (then `Statement::ast` is the source).
+    src: Option<Ast>,
+    /// The statement arena's mark before planning: re-planning
+    /// rewinds here, so a re-executed statement does not grow
+    /// its arena.
+    plan_ckpt: usize,
+    /// The plan must be made again before the next execution:
+    /// the bindings changed, or the statement was reset (a plan
+    /// holds execution-time state — the schema it resolved, the
+    /// clock read of an expression DEFAULT — so every execution
+    /// after the first plans afresh, from the parsed tree).
+    stale: bool,
+    /// `step` has run since prepare / the last `reset`.
+    started: bool,
+}
+
+/// Whether a planning error is one no parameter binding can
+/// change (v0.16, `params`): grammar and name resolution — the
+/// errors the pin reports at prepare. Everything else is deferred
+/// to `step` (see `Connection::prepare_params`).
+#[cfg(feature = "params")]
+fn binding_independent<E>(e: &Error<E>) -> bool {
+    match e {
+        Error::Parse { .. } | Error::Unsupported => true,
+        Error::Schema { kind } => matches!(
+            kind,
+            SchemaKind::UnknownTable
+                | SchemaKind::UnknownColumn
+                | SchemaKind::UnknownIndex
+                | SchemaKind::UnknownView
+                | SchemaKind::AmbiguousColumn
+                | SchemaKind::ColumnCountMismatch
+                | SchemaKind::DuplicateColumn
+                | SchemaKind::UsingColumnMissing
+                | SchemaKind::OnReferencesLaterSource
+                | SchemaKind::TermOutOfRange
+                | SchemaKind::MisusedAggregate
+                | SchemaKind::HavingWithoutAggregate
+                | SchemaKind::IsView
+                | SchemaKind::IsTable
+                | SchemaKind::UpdateTargetInFrom
+                | SchemaKind::UnknownCollation
+                | SchemaKind::GeneratedColumnWrite
+                | SchemaKind::ParameterNotAllowed
+        ),
+        _ => false,
+    }
+}
+
 pub struct Statement<'c, S: Storage> {
+    #[cfg(feature = "params")]
+    binds: Binds,
     conn: &'c mut Connection<S>,
     arena: Arena,
     sql_text: crate::arena::ABytes,
@@ -3895,7 +4016,17 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// Execute/advance the statement by one step.
+    ///
+    /// With feature `params`, the first step of an execution
+    /// after `reset` or a binding change plans the statement
+    /// again, so the plan reflects the values bound, the schema
+    /// and the clock at the time.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
+        #[cfg(feature = "params")]
+        if !self.binds.started {
+            self.replan().await?;
+            self.binds.started = true;
+        }
         // A fresh execution starts with an empty hoist cache
         // (v0.13): cached uncorrelated-subquery values belong
         // to one statement execution, never across statements
@@ -3952,6 +4083,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             };
         let r = match &self.plan {
+            #[cfg(feature = "params")]
+            Plan::Deferred => Err(Error::Unsupported),
             Plan::CreateTable => self.step_create().await,
             #[cfg(feature = "v16")]
             Plan::CreateTableAs { .. } => self.step_create_as().await,
@@ -3987,6 +4120,182 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.conn.rebuild_catalog().await?;
         }
         r
+    }
+
+    /// Re-plan before an execution when the plan is stale (v0.16,
+    /// `params`; see `Binds::stale`). The catalog is brought up
+    /// to date first (a re-executed statement may have changed
+    /// the schema itself, or rolled a change back), and the
+    /// statement arena is rewound to its pre-plan mark, so
+    /// repeated executions reuse the same arena space.
+    #[cfg(feature = "params")]
+    async fn replan(&mut self) -> Result<(), S::Error> {
+        if !self.binds.stale {
+            return Ok(());
+        }
+        if self.conn.pager.in_commit() {
+            return Err(Error::OperationInFlight);
+        }
+        if self.conn.pager.schema_cookie() != self.conn.catalog.cookie {
+            self.conn.rebuild_catalog().await?;
+        }
+        self.plan = Plan::Deferred;
+        self.arena.rewind(self.binds.plan_ckpt);
+        if let Some(src) = &self.binds.src {
+            self.ast = crate::sql::bind::bind_ast::<S::Error>(
+                src,
+                self.binds.values.as_slice(),
+                &self.arena,
+            )?;
+        }
+        self.plan = self.conn.plan(&self.arena, &self.ast)?;
+        self.binds.stale = false;
+        self.row_ckpt = self.arena.checkpoint();
+        Ok(())
+    }
+
+    /// The number of parameters (v0.16, `params`): the largest
+    /// parameter index in the statement — `SELECT ?5` has 5 —
+    /// as the pin's `sqlite3_bind_parameter_count`.
+    #[cfg(feature = "params")]
+    pub fn parameter_count(&self) -> usize {
+        usize::from(self.binds.table.count)
+    }
+
+    /// The index of the parameter spelled exactly `name`,
+    /// sigil included (`":a"`, `"$x"`, `"?3"`), as the pin's
+    /// `sqlite3_bind_parameter_index`; `None` when no parameter
+    /// has that spelling. Names are case-sensitive, and a
+    /// numbered parameter answers only to its own spelling
+    /// (`"?01"` is not `"?1"`).
+    #[cfg(feature = "params")]
+    pub fn parameter_index(&self, name: &str) -> Option<usize> {
+        self.binds
+            .table
+            .index_of(&self.arena, name.as_bytes())
+            .map(usize::from)
+    }
+
+    /// The name of parameter `i` (1-based) as written — `":a"`,
+    /// `"?2"` for an explicitly numbered one — or `None` for a
+    /// nameless `?` or an index the statement does not have (the
+    /// pin's `sqlite3_bind_parameter_name`).
+    #[cfg(feature = "params")]
+    pub fn parameter_name(&self, i: usize) -> Option<&str> {
+        let i = u16::try_from(i).ok()?;
+        let h = self.binds.table.name_of(i)?;
+        core::str::from_utf8(handle_bytes(&self.arena, h)).ok()
+    }
+
+    /// Bind parameter `i` (1-based) to `v` (v0.16, `params`).
+    /// The value takes part in affinity exactly as a literal of
+    /// the same storage class: no affinity of its own, the
+    /// column's applied on store and comparison. Allowed only
+    /// before the first `step` or after `reset`
+    /// (`Error::ResetRequired`); `i` outside 1 ..=
+    /// `parameter_count()` is `Error::BindIndexOutOfRange`.
+    #[cfg(feature = "params")]
+    pub fn bind_value(&mut self, i: usize, v: Value<'_>) -> Result<(), S::Error> {
+        if self.binds.started {
+            return Err(Error::ResetRequired);
+        }
+        let slot = i
+            .checked_sub(1)
+            .and_then(|k| self.binds.values.as_mut_slice().get_mut(k))
+            .ok_or(Error::BindIndexOutOfRange { index: i })?;
+        *slot = match v {
+            // The pin stores a NaN double as NULL.
+            Value::Real(f) if f.is_nan() => OwnedValue::Null,
+            v => OwnedValue::from_value(v),
+        };
+        self.binds.stale = true;
+        Ok(())
+    }
+
+    /// Bind parameter `i` to NULL (see `bind_value`).
+    #[cfg(feature = "params")]
+    pub fn bind_null(&mut self, i: usize) -> Result<(), S::Error> {
+        self.bind_value(i, Value::Null)
+    }
+
+    /// Bind parameter `i` to an INTEGER (see `bind_value`).
+    #[cfg(feature = "params")]
+    pub fn bind_i64(&mut self, i: usize, v: i64) -> Result<(), S::Error> {
+        self.bind_value(i, Value::Integer(v))
+    }
+
+    /// Bind parameter `i` to a REAL (see `bind_value`); a NaN
+    /// binds NULL, as on the pin.
+    #[cfg(feature = "params")]
+    pub fn bind_f64(&mut self, i: usize, v: f64) -> Result<(), S::Error> {
+        self.bind_value(i, Value::Real(v))
+    }
+
+    /// Bind parameter `i` to TEXT (see `bind_value`). The bytes
+    /// are copied; an embedded NUL is kept, as on the pin. They
+    /// count against the statement arena when the statement is
+    /// planned, as the same literal in the SQL text would.
+    #[cfg(feature = "params")]
+    pub fn bind_text(&mut self, i: usize, v: &str) -> Result<(), S::Error> {
+        self.bind_value(i, Value::Text(v.as_bytes()))
+    }
+
+    /// Bind parameter `i` to a BLOB (see `bind_text`).
+    #[cfg(feature = "params")]
+    pub fn bind_blob(&mut self, i: usize, v: &[u8]) -> Result<(), S::Error> {
+        self.bind_value(i, Value::Blob(v))
+    }
+
+    /// Reset every parameter to NULL (v0.16, `params`; the pin's
+    /// `sqlite3_clear_bindings`). Allowed at any time; a running
+    /// execution keeps the values it started with, the next one
+    /// (after `reset`) sees NULLs.
+    #[cfg(feature = "params")]
+    pub fn clear_bindings(&mut self) {
+        for v in self.binds.values.as_mut_slice() {
+            *v = OwnedValue::Null;
+        }
+        self.binds.stale = true;
+    }
+
+    /// Return the statement to its prepared state (v0.16,
+    /// `params`; the pin's `sqlite3_reset`), so the next `step`
+    /// executes it again from the start — with the bindings in
+    /// force then, which `reset` keeps. Any unread rows are
+    /// dropped; a write statement that already completed is not
+    /// undone. Bindings may change only while reset.
+    #[cfg(feature = "params")]
+    pub fn reset(&mut self) {
+        self.binds.started = false;
+        self.binds.stale = true;
+        self.phase = Phase::Fresh;
+        self.cursor = None;
+        self.row_buf.clear();
+        self.current.clear();
+        self.current_rowid = None;
+        #[cfg(feature = "indexes")]
+        {
+            self.index_rowids.clear();
+            self.index_pos = 0;
+            self.index_loaded = false;
+        }
+        #[cfg(feature = "v04")]
+        {
+            self.query_rows.clear();
+            self.query_rowids.clear();
+            self.query_pos = 0;
+            self.query_loaded = false;
+        }
+        #[cfg(feature = "v06")]
+        self.hoist.clear();
+        #[cfg(feature = "v07")]
+        {
+            self.ret_rows.clear();
+            self.ret_rowids.clear();
+            self.ret_pos = 0;
+            self.ret_loaded = false;
+        }
+        self.arena.rewind(self.row_ckpt);
     }
 
     /// `BEGIN` (v0.2): opens the explicit bracket only — the pager
@@ -7524,7 +7833,10 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// Number of result columns (0 for non-SELECT statements
-    /// without a RETURNING clause).
+    /// without a RETURNING clause). With feature `params`, a
+    /// statement whose planning was deferred to its first step
+    /// (see `Connection::prepare`) reports 0 until it is
+    /// stepped.
     pub fn column_count(&self) -> usize {
         match &self.plan {
             Plan::Scan { out, .. } => out.len(),

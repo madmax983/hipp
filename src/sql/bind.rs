@@ -1,0 +1,314 @@
+//! Parameter binding (v0.16, feature `params`): a prepared
+//! statement's tree with every `Expr::Param` replaced by its bound
+//! value, written as the literal of the same storage class.
+//!
+//! The pin gives a bound value no affinity and no collation, as it
+//! gives a literal, so everything downstream of the parser — the
+//! planner's constant folding, affinity, comparison, the tiny
+//! profile's literal-only INSERT and `WHERE rowid = ?` paths —
+//! treats the substituted literal exactly as the pin treats the
+//! parameter. The one place the pin tells them apart is an ORDER
+//! BY / GROUP BY term: an integer *literal* there is a result-column
+//! ordinal, a parameter is a constant expression (or, in a compound
+//! ORDER BY, a match for a result item that is the same parameter).
+//! `bind_ast` encodes that: such a term becomes `+literal` (a
+//! constant that is not an ordinal), or the matched item's ordinal.
+
+use alloc::boxed::Box;
+
+use super::ast::{Ast, Expr, Literal, SelectItem, SelectStmt, UpsertAction};
+use crate::arena::{ABytes, AVec, Arena};
+use crate::error::Result;
+use crate::record::OwnedValue;
+
+/// The bound tree of `src` (see the module docs). `values[i]` is
+/// parameter `i + 1`'s value; a missing entry is NULL. Bound text
+/// and blob bytes are copied into `arena`.
+pub fn bind_ast<E>(src: &Ast, values: &[OwnedValue], arena: &Arena) -> Result<Ast, E> {
+    let mut ast = src.clone();
+    let b = Binder { values, arena };
+    match &mut ast {
+        Ast::Select(s) => b.select::<E>(s)?,
+        Ast::Insert {
+            rows,
+            select,
+            upsert,
+            returning,
+            ..
+        } => {
+            for row in rows.as_mut_slice() {
+                for e in row.as_mut_slice() {
+                    b.expr::<E>(e)?;
+                }
+            }
+            if let Some(s) = select {
+                b.select::<E>(s)?;
+            }
+            if let Some(u) = upsert {
+                if let Some(f) = &mut u.target_filter {
+                    b.expr::<E>(f)?;
+                }
+                if let UpsertAction::Update {
+                    assignments,
+                    filter,
+                } = &mut u.action
+                {
+                    for (_, e) in assignments.as_mut_slice() {
+                        b.expr::<E>(e)?;
+                    }
+                    if let Some(f) = filter {
+                        b.expr::<E>(f)?;
+                    }
+                }
+            }
+            b.items::<E>(returning.as_mut_slice())?;
+        }
+        Ast::Update {
+            assignments,
+            from,
+            filter,
+            returning,
+            ..
+        } => {
+            for (_, e) in assignments.as_mut_slice() {
+                b.expr::<E>(e)?;
+            }
+            for f in from.as_mut_slice() {
+                if let Some(on) = &mut f.on {
+                    b.expr::<E>(on)?;
+                }
+                if let Some(d) = &mut f.derived {
+                    b.select::<E>(d)?;
+                }
+            }
+            if let Some(f) = filter {
+                b.expr::<E>(f)?;
+            }
+            b.items::<E>(returning.as_mut_slice())?;
+        }
+        Ast::Delete {
+            filter, returning, ..
+        } => {
+            if let Some(f) = filter {
+                b.expr::<E>(f)?;
+            }
+            b.items::<E>(returning.as_mut_slice())?;
+        }
+        #[cfg(feature = "v16")]
+        Ast::CreateTable {
+            as_select: Some(s), ..
+        } => b.select::<E>(s)?,
+        // Every other statement holds no parameters: the parser
+        // refuses them in stored definitions (CREATE TABLE / VIEW,
+        // ALTER TABLE) and the rest have no expressions.
+        _ => {}
+    }
+    Ok(ast)
+}
+
+struct Binder<'v> {
+    values: &'v [OwnedValue],
+    arena: &'v Arena,
+}
+
+impl Binder<'_> {
+    /// Parameter `idx`'s value as a literal.
+    fn literal<E>(&self, idx: u16) -> Result<Literal, E> {
+        let v = usize::from(idx)
+            .checked_sub(1)
+            .and_then(|i| self.values.get(i));
+        Ok(match v {
+            None | Some(OwnedValue::Null) => Literal::Null,
+            Some(OwnedValue::Integer(i)) => Literal::Integer(*i),
+            Some(OwnedValue::Real(f)) => Literal::Real(*f),
+            Some(OwnedValue::Text(t)) => Literal::Text(self.arena.alloc_copy_handle(t.as_slice())?),
+            Some(OwnedValue::Blob(t)) => Literal::Blob(self.arena.alloc_copy_handle(t.as_slice())?),
+        })
+    }
+
+    fn expr<E>(&self, e: &mut Expr) -> Result<(), E> {
+        match e {
+            Expr::Param(idx, _) => {
+                *e = Expr::Literal(self.literal::<E>(*idx)?);
+            }
+            Expr::Literal(_) | Expr::Column { .. } => {}
+            Expr::Binary(_, a, c) | Expr::Like(a, c, _) => {
+                self.expr::<E>(a)?;
+                self.expr::<E>(c)?;
+            }
+            Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
+                self.expr::<E>(a)?
+            }
+            #[cfg(feature = "v16")]
+            Expr::Collate(a, _) => self.expr::<E>(a)?,
+            Expr::InList(a, l, _) => {
+                self.expr::<E>(a)?;
+                for x in l.as_mut_slice() {
+                    self.expr::<E>(x)?;
+                }
+            }
+            Expr::InSubquery(a, s, _) => {
+                self.expr::<E>(a)?;
+                self.select::<E>(s)?;
+            }
+            Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) => self.select::<E>(s)?,
+            Expr::Between(a, c, d, _) => {
+                self.expr::<E>(a)?;
+                self.expr::<E>(c)?;
+                self.expr::<E>(d)?;
+            }
+            Expr::Case {
+                base,
+                whens,
+                otherwise,
+            } => {
+                if let Some(x) = base {
+                    self.expr::<E>(x)?;
+                }
+                for (w, t) in whens.as_mut_slice() {
+                    self.expr::<E>(w)?;
+                    self.expr::<E>(t)?;
+                }
+                if let Some(x) = otherwise {
+                    self.expr::<E>(x)?;
+                }
+            }
+            Expr::Func { args, .. } => {
+                for x in args.as_mut_slice() {
+                    self.expr::<E>(x)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn items<E>(&self, items: &mut [SelectItem]) -> Result<(), E> {
+        for it in items {
+            if let SelectItem::Expr(e, _, _) = it {
+                self.expr::<E>(e)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One ORDER BY / GROUP BY term: a bare parameter (under any
+    /// COLLATE) becomes `ordinal` when given, else `+value` — a
+    /// constant the term rules never read as an ordinal.
+    fn term<E>(&self, e: &mut Expr, ordinal: Option<i64>) -> Result<(), E> {
+        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        let mut core = &mut *e;
+        #[cfg(feature = "v16")]
+        while let Expr::Collate(inner, _) = core {
+            core = inner;
+        }
+        if let Expr::Param(idx, _) = core {
+            *core = match ordinal {
+                Some(k) => Expr::Literal(Literal::Integer(k)),
+                None => Expr::Pos(Box::new(Expr::Literal(self.literal::<E>(*idx)?))),
+            };
+            return Ok(());
+        }
+        self.expr::<E>(e)
+    }
+
+    fn select<E>(&self, s: &mut SelectStmt) -> Result<(), E> {
+        // Compound ORDER BY terms that are a bare parameter match
+        // the first item, scanning the cores from the rightmost,
+        // that is the same parameter (the pin's
+        // `resolveCompoundOrderBy` + `sqlite3ExprCompare`: same
+        // index, same spelling). Found before the items are bound.
+        let mut ordinals: AVec<Option<i64>> = AVec::new();
+        if !s.compound.is_empty() {
+            for (t, _) in s.order_by.iter() {
+                ordinals.push(compound_match(s, t, self.arena));
+            }
+        }
+        self.core::<E>(s)?;
+        for (_, c) in s.compound.as_mut_slice() {
+            self.core::<E>(c)?;
+        }
+        for (k, (t, _)) in s.order_by.as_mut_slice().iter_mut().enumerate() {
+            self.term::<E>(t, ordinals.as_slice().get(k).copied().flatten())?;
+        }
+        if let Some(x) = &mut s.limit {
+            self.expr::<E>(x)?;
+        }
+        if let Some(x) = &mut s.offset {
+            self.expr::<E>(x)?;
+        }
+        Ok(())
+    }
+
+    /// One core's own clauses (not the statement's ORDER BY /
+    /// LIMIT, which `select` binds).
+    fn core<E>(&self, s: &mut SelectStmt) -> Result<(), E> {
+        self.items::<E>(s.items.as_mut_slice())?;
+        for f in s.from.as_mut_slice() {
+            if let Some(on) = &mut f.on {
+                self.expr::<E>(on)?;
+            }
+            if let Some(d) = &mut f.derived {
+                self.select::<E>(d)?;
+            }
+        }
+        if let Some(f) = &mut s.filter {
+            self.expr::<E>(f)?;
+        }
+        for g in s.group_by.as_mut_slice() {
+            self.term::<E>(g, None)?;
+        }
+        if let Some(h) = &mut s.having {
+            self.expr::<E>(h)?;
+        }
+        for row in s.values.as_mut_slice() {
+            for e in row.as_mut_slice() {
+                self.expr::<E>(e)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The parameter a term is (under any COLLATE), if it is one.
+fn bare_param(e: &Expr) -> Option<(u16, ABytes)> {
+    #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+    let mut core = e;
+    #[cfg(feature = "v16")]
+    while let Expr::Collate(inner, _) = core {
+        core = inner;
+    }
+    match core {
+        Expr::Param(i, h) => Some((*i, *h)),
+        _ => None,
+    }
+}
+
+/// The 1-based result column a compound ORDER BY term matches by
+/// being the same parameter as one core's item (rightmost core
+/// first; a multi-row VALUES core is one core per row, as the pin
+/// builds it).
+fn compound_match(s: &SelectStmt, term: &Expr, arena: &Arena) -> Option<i64> {
+    let (idx, h) = bare_param(term)?;
+    let text = crate::sql::handle_bytes(arena, h);
+    let same = |e: &Expr| match e {
+        Expr::Param(j, h2) => *j == idx && crate::sql::handle_bytes(arena, *h2) == text,
+        _ => false,
+    };
+    let in_core = |c: &SelectStmt| -> Option<i64> {
+        for row in c.values.iter().rev() {
+            if let Some(k) = row.iter().position(&same) {
+                return i64::try_from(k).ok().map(|k| k + 1);
+            }
+        }
+        let k = c.items.iter().position(|it| match it {
+            SelectItem::Expr(e, _, _) => same(e),
+            _ => false,
+        })?;
+        i64::try_from(k).ok().map(|k| k + 1)
+    };
+    s.compound
+        .iter()
+        .rev()
+        .find_map(|(_, c)| in_core(c))
+        .or_else(|| in_core(s))
+}

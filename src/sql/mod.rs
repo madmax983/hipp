@@ -1,6 +1,8 @@
 //! SQL frontend (SPEC §5.6): lexer, parser, AST.
 
 pub mod ast;
+#[cfg(feature = "params")]
+pub mod bind;
 pub mod lexer;
 pub mod parser;
 
@@ -11,4 +13,6 @@ pub use ast::{
 };
 #[cfg(feature = "v04")]
 pub use parser::parse_expr_text;
+#[cfg(feature = "params")]
+pub use parser::parse_params;
 pub use parser::{eq_ci, handle_bytes, parse};

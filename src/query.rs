@@ -1002,6 +1002,11 @@ pub fn resolve_scoped<E>(
 ) -> Result<RExpr, E> {
     Ok(match expr {
         Expr::Literal(l) => RExpr::Literal(literal_value(arena, *l)),
+        // Only a stored schema text still holds a parameter here
+        // (a prepared statement's are bound away before planning,
+        // `session::bind_ast`); the pin reads one there as NULL.
+        #[cfg(feature = "params")]
+        Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
         Expr::Column { table, name } => resolve_column::<E>(
             cur,
             enclosing,
@@ -2142,6 +2147,57 @@ pub fn to_number(v: &OwnedValue) -> Option<Num> {
     }
 }
 
+/// The pin's `sqlite3Atoi64` over text (v0.16): ASCII spaces,
+/// an optional sign, then the leading digits only — a `.` or an
+/// exponent ends the number (`'1e18'` is 1) — saturating at the
+/// i64 bounds. What the pin's `sqlite3VdbeIntValue` reads from
+/// a TEXT or BLOB: CAST(x AS INTEGER) and `%` operands.
+pub fn atoi_prefix(t: &[u8]) -> i64 {
+    let mut i = 0usize;
+    while t
+        .get(i)
+        .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+    {
+        i += 1;
+    }
+    let neg = t.get(i) == Some(&b'-');
+    if matches!(t.get(i), Some(b'-' | b'+')) {
+        i += 1;
+    }
+    // Accumulate the magnitude as a negative number, which holds
+    // i64::MIN exactly; saturate on overflow.
+    let mut v: i64 = 0;
+    let mut over = false;
+    while let Some(d) = t.get(i).filter(|c| c.is_ascii_digit()) {
+        match v
+            .checked_mul(10)
+            .and_then(|x| x.checked_sub(i64::from(d - b'0')))
+        {
+            Some(x) => v = x,
+            None => over = true,
+        }
+        i += 1;
+    }
+    match (neg, over) {
+        (true, true) => i64::MIN,
+        (false, true) => i64::MAX,
+        (true, false) => v,
+        (false, false) => v.checked_neg().unwrap_or(i64::MAX),
+    }
+}
+
+/// The integer the pin's `sqlite3VdbeIntValue` reads from a
+/// value (v0.16): reals truncate and clamp, text and blobs take
+/// their integer prefix (`atoi_prefix`).
+fn int_value(v: &OwnedValue) -> i64 {
+    match v {
+        OwnedValue::Null => 0,
+        OwnedValue::Integer(i) => *i,
+        OwnedValue::Real(r) => num_to_i64(Num::Real(*r)),
+        OwnedValue::Text(t) | OwnedValue::Blob(t) => atoi_prefix(t.as_slice()),
+    }
+}
+
 /// Truncating conversion to i64 with SQLite's clamping at the
 /// i64 bounds (CAST semantics for out-of-range reals).
 pub fn num_to_i64(n: Num) -> i64 {
@@ -2225,11 +2281,10 @@ pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {
             OwnedValue::Null => OwnedValue::Null,
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             OwnedValue::Real(r) => OwnedValue::Integer(num_to_i64(Num::Real(*r))),
+            // v0.16 fix: the integer prefix only, as the pin's
+            // `sqlite3Atoi64` (CAST('1e18' AS INTEGER) is 1).
             OwnedValue::Text(t) | OwnedValue::Blob(t) => {
-                OwnedValue::Integer(match parse_num_prefix(t.as_slice()) {
-                    Some(n) => num_to_i64(n),
-                    None => 0,
-                })
+                OwnedValue::Integer(atoi_prefix(t.as_slice()))
             }
         },
         Affinity::Real => match v {
@@ -2246,11 +2301,18 @@ pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {
         Affinity::Numeric => match v {
             OwnedValue::Null => OwnedValue::Null,
             OwnedValue::Integer(_) | OwnedValue::Real(_) => v.clone(),
+            // The pin's `sqlite3VdbeMemNumerify` (v0.16 fix): an
+            // integer-shaped prefix that fits i64 is that
+            // INTEGER; any other number is an INTEGER only when it
+            // is integral and |x| < 2^51 (`sqlite3RealSameAsInt`),
+            // else a REAL — CAST('9223372036854775808' AS NUMERIC)
+            // and CAST('1e18' AS NUMERIC) are REALs.
             OwnedValue::Text(t) | OwnedValue::Blob(t) => match parse_num_prefix(t.as_slice()) {
                 Some(Num::Int(i)) => OwnedValue::Integer(i),
                 Some(Num::Real(r)) => {
+                    const TWO_51: f64 = 2_251_799_813_685_248.0;
                     let i = num_to_i64(Num::Real(r));
-                    if (i as f64) == r {
+                    if (-TWO_51..TWO_51).contains(&r) && (i as f64) == r {
                         OwnedValue::Integer(i)
                     } else {
                         OwnedValue::Real(r)
@@ -2610,11 +2672,21 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
         return Ok(OwnedValue::Null);
     };
     if matches!(op, BinOp::Mod) {
-        let (x, y) = (num_to_i64(a), num_to_i64(b));
+        // The pin's OP_Remainder (v0.16 fix): two INTEGER-classed
+        // operands give an INTEGER; otherwise each operand's
+        // integer value (`int_value`: a text operand's integer
+        // *prefix*) is taken and the result is a REAL.
+        if let (Num::Int(x), Num::Int(y)) = (a, b) {
+            if y == 0 {
+                return Ok(OwnedValue::Null);
+            }
+            return Ok(OwnedValue::Integer(x.wrapping_rem(y)));
+        }
+        let (x, y) = (int_value(&lv), int_value(&rv));
         if y == 0 {
             return Ok(OwnedValue::Null);
         }
-        return Ok(OwnedValue::Integer(x.wrapping_rem(y)));
+        return Ok(OwnedValue::Real(x.wrapping_rem(y) as f64));
     }
     if matches!(op, BinOp::Div) {
         return Ok(match (a, b) {

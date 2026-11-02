@@ -768,6 +768,191 @@ fixes).
   (3.4x–3.5x); nothing relied on is known to differ in 3.54.1,
   and CI runs the real pin.
 
+### Bound parameters (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated behind the new leaf feature `params` (in `full`;
+`params = []`, so it builds alone on top of the tiny profile —
+`ci/feature-sets.txt` has its line).
+
+**Shipped — `params`:**
+
+- **Syntax and numbering** (`sql::lexer::ParamTable`, assigned
+  in the lexer in source order, which is the pin's
+  `sqlite3ExprAssignVarNumber` order): `?` takes one past the
+  largest index so far; `?NNN` takes NNN (leading zeros
+  allowed) and names that index `?NNN` unless it has a name;
+  `:name` / `@name` / `$name` / `#name` reuse the index of an
+  identical spelling (case-sensitive) else take the next one;
+  the TCL forms `$a::b` and `$a(x)` lex as one name. Errors:
+  `?0`, `?32767`, an overflowing NNN (`ParseKind::
+  VariableNumber`), an index past 32766 (`TooManyVariables`),
+  `#1`, a bare sigil, `$a(x y)` (`UnexpectedToken`).
+- **Statement API** (doc-commented): `bind_null` / `bind_i64` /
+  `bind_f64` (NaN binds NULL, as on the pin) / `bind_text` /
+  `bind_blob` / `bind_value` by 1-based index
+  (`Error::BindIndexOutOfRange`; binding a stepped, un-reset
+  statement is `Error::ResetRequired`, the pin's
+  `SQLITE_MISUSE`), `parameter_count`, `parameter_index(name)`,
+  `parameter_name(i)` (the pin's answers, including `?1` not
+  finding `?01` and nameless `?` having no name),
+  `clear_bindings`, and `reset`, which makes any prepared
+  statement executable again (it was single-shot). Unbound is
+  NULL.
+- **Binding** (`sql::bind::bind_ast`): each execution plans a
+  copy of the parsed tree with every parameter replaced by its
+  value as the literal of the same storage class, so affinity,
+  comparison, constant folding and the tiny profile's literal
+  paths treat it exactly as the pin treats a bound value (which,
+  like a literal, has no affinity or collation). The one
+  difference the pin makes — an integer literal in ORDER BY /
+  GROUP BY is an ordinal, a parameter is not — is encoded: such a
+  term becomes `+value`, or, in a compound ORDER BY, the ordinal
+  of the first result item (rightmost core first) that is the
+  same parameter (same index and spelling: the pin's
+  `resolveCompoundOrderBy` + `sqlite3ExprCompare`); anything
+  else there is "does not match any column", as on the pin.
+- **Re-execution:** the first `step` after a `reset` or a
+  binding change plans again from the retained parse tree (a
+  plan captures the catalog and an expression DEFAULT's clock
+  read, so every execution plans afresh — `DROP TABLE`
+  re-executed is "no such table", CTAS "already exists"),
+  bringing the catalog up to date first, and rewinding the
+  statement arena to its pre-plan mark (asserted: 200 executions
+  do not grow it). A plan that fails for the unbound (all-NULL)
+  state with an error a binding could change (a constant row's
+  NOT NULL / CHECK / MustBeInt failure, say) is deferred to the
+  first `step` (`Plan::Deferred`; `column_count` is 0 until
+  then); name-resolution and grammar errors are still reported by
+  `prepare`.
+- **Where:** in the full profile every expression position —
+  WHERE, SET, VALUES, LIMIT / OFFSET, scalar / IN / EXISTS
+  subqueries, upsert targets and DO UPDATE, RETURNING, compound
+  cores and VALUES, derived tables, joins' ON, HAVING, aggregate
+  arguments, INSERT ... SELECT, UPDATE ... FROM, CREATE TABLE ...
+  AS SELECT (columns named by the parameter text: `"?"`,
+  `"? + 1"`, `":n"`, byte-identical to the pin). On top of the
+  tiny profile: INSERT VALUES and `WHERE <col> = ?` (rowid seeks).
+  Refused, as on the pin, in CREATE TABLE (other than its AS
+  SELECT), ALTER TABLE and CREATE VIEW
+  (`SchemaKind::ParameterNotAllowed`; `DEFAULT ?` stays a syntax
+  error). A parameter in a stored schema text resolves to NULL
+  (the pin's schema-parse rule).
+- **hipp-cli** binds like the oracle shell: each parameter by
+  its name (a nameless `?` as `?N`) from `.parameter set NAME
+  VALUE` (VALUE evaluated as SQL, else taken as text), NULL
+  otherwise; `.parameter unset / clear / list / init`. It now
+  steps every statement to completion (a deferred plan knows its
+  columns only once stepped).
+- **`examples/params.rs`**: prepare once, bind / step / reset
+  per row, re-run a query with new bindings.
+
+**Shipped — ungated (found by the generated corpus; claimed
+v0.4 / CLI paths, wrong with or without parameters):**
+
+- `%` with a REAL or real-looking operand is a REAL computed on
+  both operands' integer values — a text operand's integer
+  *prefix* (`'1e18' % 2` is 1.0); hipp answered an INTEGER.
+- `CAST(text AS INTEGER)` reads only the integer prefix
+  (`sqlite3Atoi64`: `CAST('1e18' AS INTEGER)` is 1, hipp gave
+  10^18).
+- `CAST(text AS NUMERIC)` is the pin's `sqlite3VdbeMemNumerify`:
+  an integer-shaped prefix that fits i64 is an INTEGER, any
+  other number only when integral with |x| < 2^51 —
+  `CAST('9223372036854775808' AS NUMERIC)` and `CAST('1e18' AS
+  NUMERIC)` are REALs (hipp gave integers).
+- hipp-cli printed a REAL -0.0 as `-0.0`; the pin's printf has
+  no negative zero (`SELECT -0.0` prints `0.0`; the value keeps
+  its sign — `atan2` shows it on the pin).
+
+**Oracle-probing notes** (numbering: the C API of the system
+libsqlite3 3.45 via ctypes — `sqlite3_bind_parameter_count /
+_name / _index` — whose rules have not changed in years, with
+the 32766 limit from the local 3.53.1 stand-in, the system build
+allowing 250000; values: the stand-in's Python binding): `SELECT
+?5, :a` has 6 parameters, `:a` = 6; `:a, ?1` shares index 1
+named `:a` (`?1` is not found by name); `?2, :a, ?1` names 1..3
+`?1 ?2 :a`; `?a` is `?` aliased `a`, `?1a` is `?1` aliased `a`;
+`:` / `@` / `$` / `#` alone are unrecognized tokens, `#1` a
+syntax error. A TEXT `'5'` bound against INTEGER / NUMERIC /
+REAL columns converts by the column's affinity exactly as the
+literal does, `? = 5` with `'5'` is 0, `LIMIT ?` takes `'2'` and
+`2.0` but errors on 2.5 / NULL / 'abc', `INSERT ... (rowid)
+VALUES (?)` takes `'100'` / 101.0 and errors on 'abc' / 102.5,
+a NaN binds NULL, `-?` over i64::MIN is the REAL 9.2e18. `ORDER
+BY ?` (1) keeps scan order and `GROUP BY ?` makes one group;
+`SELECT ?1 UNION ALL SELECT 2 ORDER BY ?1` sorts by column 1
+(also under COLLATE and DESC) but `ORDER BY +?1`, `:a ... ORDER
+BY ?1` (same index, other spelling) and `? ... ORDER BY ?`
+(other index) are "does not match". Views / CHECK / generated
+columns: "parameters prohibited"; `DEFAULT (?)`: "not constant";
+`DEFAULT ?`: syntax error; CTAS allowed. The oracle shell binds
+from `temp.sqlite_parameters` by name (`?N` for nameless) and
+NULL otherwise (shell.c's `bind_prepared_stmt`).
+
+**Gates:** `ci/local-gates.sh` (full run) green. New suites:
+`tests/params_v16.rs` (13 tests: the numbering table and errors
+against the probed C-API answers, the bind / reset API
+contract, the tiny grammar's positions and API — the three
+tiny-grammar tests also pass in a `std,params` build — a 200-row
+prepared-INSERT re-execution corpus with the arena bound, the
+affinity matrix of 15 bound values × 9 column expressions × 5
+operators plus storage into every affinity, every expression
+position (35 reads, 13 writes, CTAS schema text), ORDER / GROUP
+BY constants and compound matches with hand-written oracle SQL,
+error-vs-error agreement and deferred value errors,
+re-execution across schema changes, a 400-case generated
+expression corpus with random bindings, and the CAST / `%`
+regressions; every case compares hipp-with-bindings to the
+oracle with the values inlined, and every write is checked by
+the oracle reading both files with `quote()` and
+`integrity_check`), `hipp-cli/tests/cli_v16_params.rs` (unbound
+parameters one-shot and over stdin, and a `.parameter set`
+batch of every storage class against inlined literals,
+byte-identical, with the `-0.0` regression).
+
+**Size:** tiny **76,048 B** (Δ **0**; `params` is not in the
+tiny profile and its code compiles out); full **288,755 B**
+(Δ **+8,360 B** vs 280,395, ratchet raised: `params` +7,936 B —
+the lexer numbering, the tree-binding walker and the parse-tree
+clone it plans from, the Statement API and re-planning — and the
+CAST / `%` fixes +424 B). For information, tiny + `params`
+(`--no-default-features --features params`) is **84,672 B**
+(+8,624 B over tiny).
+
+**Honest gaps:**
+
+- Every execution after the first plans again (from the
+  retained parse tree, not the SQL): correct by construction,
+  but a re-executed statement pays planning each time.
+- A plan that fails for the all-NULL bindings with a
+  value-dependent error is deferred, so such a statement reports
+  `column_count` 0 until stepped; a deferral that is really a
+  schema problem surfaces at `step`, not `prepare`.
+- Bound text / blob bytes are copied into the statement arena
+  when planned, so a bound value counts against `stmt_max` as
+  the same literal in the SQL would.
+- hipp-cli does not implement the shell's test-only magic
+  parameter names (`$int_N`, `$text_X`, `:NAN`, `:INF`);
+  `.parameter list` follows shell.c's layout (`%-*s %s` with
+  `quote()`d values) but was not verified against the pin
+  (the stand-in has no `.parameter`).
+- In a pre-`v16` build with the evaluator (`v04`..`v10`, not in
+  `ci/feature-sets.txt`) LIMIT / OFFSET take only an integer
+  literal, so a parameter there is a syntax error.
+- Found, not fixed (pre-existing, outside this unit): the pin
+  converts a REAL to TEXT with up to 17 digits of its own
+  (inexact) decoding — `86255.9396259168 || ''` is
+  `86255.939625916799` there, hipp's exact rule gives the 15
+  digits back — so the corpora keep REALs to short decimal
+  expansions; and a -0.0 stored in a REAL column keeps its sign
+  in hipp's record where the pin's reads back +0.0. Unordered
+  results that the pin returns in index order (a `GLOB` prefix
+  over a UNIQUE column) can differ in order, as before.
+- Probed on the local 3.53.1 stand-in and the system 3.45 C API;
+  parameter numbering and binding semantics are long stable,
+  and CI runs the real 3.54.1 pin.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

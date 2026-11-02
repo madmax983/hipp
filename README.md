@@ -101,6 +101,33 @@ aspirations.
   reads operands up to a NUL and matches iteratively. Behind
   `v16`: the `expr COLLATE name` operator, GLOB / NOT GLOB,
   `LIKE ... ESCAPE`, and `like()` / `glob()`.
+- **Bound parameters** (leaf feature `params`, in `full`;
+  not in the tiny profile, but it builds on it alone): `?`,
+  `?NNN`, `:name`, `@name`, `$name` (and `#name`, the TCL
+  `$a::b` / `$a(x)` forms) numbered exactly as the pin numbers
+  them (a named parameter takes the next free index, repeated
+  names share one, `?NNN` sets it, 32766 at most). The
+  Statement API: `bind_null` / `bind_i64` / `bind_f64` /
+  `bind_text` / `bind_blob` / `bind_value` by 1-based index,
+  `parameter_count`, `parameter_index`, `parameter_name`,
+  `clear_bindings` and `reset`, so a prepared statement is
+  stepped again with new bindings (each execution plans afresh
+  from the parsed tree; the statement arena is rewound, not
+  grown). Unbound is NULL; a NaN binds NULL. A bound value
+  takes part in affinity exactly as the literal of its storage
+  class (the pin's rule), anywhere an expression goes in the full
+  profile — WHERE, SET, VALUES, LIMIT / OFFSET, subqueries,
+  upsert, RETURNING, compound cores, derived tables, CREATE TABLE
+  ... AS SELECT — and in ORDER BY / GROUP BY as a constant (not
+  an ordinal), matching a compound's identical result item as on
+  the pin; on top of the tiny profile, in INSERT VALUES and
+  `WHERE rowid = ?`. Parameters in views, CHECK, DEFAULT and
+  generated columns are refused, as on the pin. hipp-cli binds
+  them like the oracle shell, from `.parameter set` (NULL
+  otherwise). Found on the way and fixed ungated: `%` with a
+  REAL operand is a REAL, CAST(text AS INTEGER) reads only the
+  integer prefix, CAST(text AS NUMERIC) follows the pin's
+  2^51 rule, and hipp-cli prints `-0.0` as the pin does (`0.0`).
 
 ## What v0.13 does
 
@@ -400,7 +427,9 @@ and `cargo test --workspace`.
 A std binary shell (`hipp-cli/`, decision D4): interactive,
 stdin-batch and one-shot modes with list-format output
 byte-diffable against the pinned oracle CLI, plus `.tables`,
-`.schema`, `.dump`, `.open`, `.exit`. Its first job is
+`.schema`, `.dump`, `.open`, `.parameter` (v0.16: `set`,
+`unset`, `clear`, `list`, `init`, bound by name as the oracle
+shell binds them), `.exit`. Its first job is
 differential testing. It is a separate crate and contributes
 0 bytes to the core's tiny build.
 
@@ -409,8 +438,7 @@ differential testing. It is a separate crate and contributes
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
 no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
 created (refused; foreign ones load), no expression or partial
-indexes, no subqueries, no bound
-parameters, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
+indexes, no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed, no UTF-16, no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
@@ -422,7 +450,7 @@ A workspace: the zero-dependency core crate at the root plus
 `unsafe`), `storage` (async trait + Mem/File impls), `pager`
 (page cache, journal protocol, commit machine), `btree`,
 `record` (serial codec, affinity), `schema` (catalog), `sql/`
-(lexer, parser, AST), `query` (resolved-expression evaluator,
+(lexer, parser, AST, parameter binding), `query` (resolved-expression evaluator,
 v0.4), `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor),
