@@ -3267,9 +3267,13 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             let mut start = int_value(&v[1]);
             let ranges = char_ranges(text.as_slice());
             let n = ranges.len() as i64;
+            // Two-argument form: the implicit length is i64::MAX
+            // (pinned on 3.54.1 by a CI probe grid — e.g.
+            // substr(x, -9223372036854775808) keeps all but the last
+            // character, substr(x, -27) on 26 characters keeps all).
             let mut len: i64 = match v.get(2) {
                 Some(m) => int_value(m),
-                None => n,
+                None => i64::MAX,
             };
             // SQLite's substr coordinate rules (verified
             // against the oracle, incl. negative lengths: a

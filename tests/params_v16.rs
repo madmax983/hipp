@@ -296,6 +296,44 @@ fn twins(tag: &str, setup: &str) -> Twins {
     tw
 }
 
+/// Answers recorded from the real 3.54.1 pin on CI for statements the
+/// 3.53.1 stand-in answers differently (see tests/substr_pin_v16.rs:
+/// the two-argument substr's implicit length is i64::MAX on the pin).
+fn pin_golden(oracle_sql: &str) -> Option<&'static str> {
+    const GOLDEN: &[(&str, &str)] = &[
+        (
+            "SELECT substr('abcdefghijklmnopqrstuvwxyz', '-9223372036854775808'), \
+         substr('abcdefghijkl', 2, '-9223372036854775808')",
+            "abcdefghijklmnopqrstuvwxy|a",
+        ),
+        (
+            // Derived, not recorded: the text saturates to i64::MIN when
+            // read as an integer (sqlite3_value_int64), so it takes the
+            // recorded row above's path. CI re-checks it live on the pin.
+            "SELECT substr('abcdefghijklmnopqrstuvwxyz', '-9223372036854775809'), \
+         substr('abcdefghijkl', 2, '-9223372036854775809')",
+            "abcdefghijklmnopqrstuvwxy|a",
+        ),
+        // Derived from the recorded grid in tests/substr_pin_v16.rs: every
+        // start from -1000000001 down to i64::MIN + 1 keeps the whole
+        // 26-character string on the pin (3.53 returns '').
+        (
+            "SELECT substr('abcdefghijklmnopqrstuvwxyz', '-2251799813685248.0'), \
+         substr('abcdefghijkl', 2, '-2251799813685248.0')",
+            "abcdefghijklmnopqrstuvwxyz|a",
+        ),
+        (
+            "SELECT substr('abcdefghijklmnopqrstuvwxyz', '-2251799813685247.5'), \
+         substr('abcdefghijkl', 2, '-2251799813685247.5')",
+            "abcdefghijklmnopqrstuvwxyz|a",
+        ),
+    ];
+    GOLDEN
+        .iter()
+        .find(|(q, _)| *q == oracle_sql)
+        .map(|(_, a)| *a)
+}
+
 fn show(rows: &[Vec<u8>]) -> String {
     rows.iter()
         .map(|r| String::from_utf8_lossy(r).into_owned())
@@ -316,7 +354,13 @@ impl Twins {
             let mut db = open(&self.hipp).await;
             hipp_run(&mut db, sql, vals).await
         });
-        let (ok, want) = oracle_raw(&self.oracle, oracle_sql);
+        let (ok, want) = match pin_golden(oracle_sql) {
+            // A statement whose answer changed between the local
+            // stand-in (3.53.1) and the 3.54.1 pin: off the pin, the
+            // recorded pin answer stands in for the live oracle.
+            Some(g) if !common::oracle_is_pinned() => (true, vec![g.as_bytes().to_vec()]),
+            _ => oracle_raw(&self.oracle, oracle_sql),
+        };
         match got {
             Ok(rows) => {
                 assert!(ok, "oracle refused {oracle_sql} (hipp ran {sql} {vals:?})");
