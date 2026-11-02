@@ -62,16 +62,36 @@ impl Drop for Inner {
 }
 
 impl Inner {
-    fn chunk(&self, i: usize) -> &[u8] {
+    /// Shared view of `len` bytes at `start` in chunk `i` — only that
+    /// range, never the whole chunk: a whole-chunk reference would
+    /// overlap slices the arena has already handed out.
+    fn range(&self, i: usize, start: usize, len: usize) -> &[u8] {
+        let c = &self.chunks[i];
+        assert!(
+            start <= c.len && len <= c.len - start,
+            "arena range in bounds"
+        );
         // SAFETY: chunk pointers are valid for the arena's life and
         // never move (owned boxes are never reallocated after push;
-        // caller slabs are contractually kept alive by the caller).
-        unsafe { core::slice::from_raw_parts(self.chunks[i].ptr, self.chunks[i].len) }
+        // caller slabs are contractually kept alive by the caller), and
+        // the range is in bounds (checked above).
+        unsafe { core::slice::from_raw_parts(c.ptr.add(start), len) }
     }
-    fn chunk_mut(&mut self, i: usize) -> &mut [u8] {
-        // SAFETY: as above; bump discipline means two live mutable
-        // slices into one chunk never overlap in time-and-range.
-        unsafe { core::slice::from_raw_parts_mut(self.chunks[i].ptr, self.chunks[i].len) }
+    /// Mutable view of a freshly bumped range of chunk `i`. Exactly the
+    /// new range is borrowed, so it cannot alias any live slice the
+    /// arena handed out earlier — including a caller copying arena
+    /// bytes back into the same arena (`alloc_copy_handle` on an
+    /// arena-resident source, which miri flagged when this borrowed
+    /// the whole chunk).
+    fn range_mut(&mut self, i: usize, start: usize, len: usize) -> &mut [u8] {
+        let c = &self.chunks[i];
+        assert!(
+            start <= c.len && len <= c.len - start,
+            "arena range in bounds"
+        );
+        // SAFETY: as for `range`; bump discipline guarantees the range
+        // was never handed out before.
+        unsafe { core::slice::from_raw_parts_mut(c.ptr.add(start), len) }
     }
 }
 
@@ -185,7 +205,7 @@ impl Arena {
                 inner.offs[last_i] = aligned + len;
                 self.bump_used(pad + len);
                 let base: usize = inner.offs[..last_i].iter().sum();
-                let s = &mut inner.chunk_mut(last_i)[aligned..aligned + len];
+                let s = inner.range_mut(last_i, aligned, len);
                 return Ok((base + aligned, s));
             }
         }
@@ -227,7 +247,7 @@ impl Arena {
         inner.offs.push(len);
         self.bump_used(len);
         let last_i = inner.chunks.len() - 1;
-        Ok((base, &mut inner.chunk_mut(last_i)[0..len]))
+        Ok((base, inner.range_mut(last_i, 0, len)))
     }
 
     /// Allocate and copy `data` in; returns the stored copy.
@@ -307,7 +327,7 @@ impl Arena {
             let used_here = inner.offs[i];
             if pos >= base && pos + len <= base + used_here {
                 let start = pos - base;
-                return Some(&inner.chunk(i)[start..start + len]);
+                return Some(inner.range(i, start, len));
             }
             base += used_here;
         }
@@ -446,6 +466,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn copy_arena_resident_bytes_back_in() {
+        // Regression (miri, Stacked Borrows): copying bytes that live
+        // in this arena back into it must not create a mutable borrow
+        // overlapping the source slice.
+        let a = Arena::new(Scope::Statement, 0, 1 << 20);
+        let pos = a.checkpoint();
+        let _ = a.alloc_copy(b"hello arena").expect("alloc");
+        let src = a.slice_at(pos, 11).expect("slice");
+        let h = a.alloc_copy_handle(src).expect("copy back in");
+        assert_eq!(
+            a.slice_at(h.pos as usize, h.len as usize),
+            Some(&b"hello arena"[..])
+        );
+        // Force a new chunk while the source is still borrowed.
+        let big = a.alloc_copy_handle(&[7u8; 8192]).expect("grow");
+        assert_eq!(big.len, 8192);
+        assert_eq!(src, b"hello arena");
     }
 
     #[test]

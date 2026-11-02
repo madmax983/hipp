@@ -8,17 +8,139 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.13 — uncorrelated-subquery hoisting
-  (an uncorrelated subquery executes once per statement,
-  not once per outer row — and the pin's per-statement
-  snapshot semantics now hold on the write side too),
-  on the v0.12 foundation (SPEC §2).
+- **Phase:** v0.16 — the SQLite-parity push (ADR 0001:
+  silent wrong answers fixed ungated, new dialect behind the
+  `v16` rung / leaf features, the tiny profile never grows),
+  on the v0.15 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.16 does
+
+- **Joins, ordering and query-shape completion.** Ungated
+  fixes to claimed v0.4 paths: `RIGHT` / `FULL [OUTER]
+  JOIN` (they used to parse as a table alias and run as an
+  inner join) with the pin's row order; `NATURAL` and
+  `USING (...)` joins with the pin's `SELECT *` expansion
+  and USING-column resolution (left-most side, right side
+  after RIGHT, `coalesce` after FULL); ON clauses that name
+  a later source (hoisted on inner joins, refused on outer
+  ones); `ORDER BY ... NULLS FIRST / LAST` honoured
+  everywhere; the pin's ordinal / alias / HAVING term rules;
+  `NULL IN (<empty>)` = 0. Behind the new `v16` rung:
+  LIMIT / OFFSET as expressions (constant or uncorrelated
+  subquery, the pin's integer conversion), result-column
+  aliases inside WHERE / ON / GROUP BY / HAVING / ORDER BY,
+  `x IN tablename`, and string-literal aliases. Review
+  fixes: compound ORDER BY names resolve per core as on the
+  pin (a USING column after RIGHT / FULL is the joined
+  value); a derived table's and a view's duplicate column
+  names become `id:1`, ... and a view's column list shows
+  NATURAL / USING columns once; `UPDATE t ... FROM t` and any
+  schema qualifier but `main.` are refused instead of
+  silently run against `main`; scalar / EXISTS subqueries take
+  the pin's `LIMIT (X<>0)` rewrite; an alias holding a
+  subquery works inside nested subqueries (one holding an
+  aggregate is refused there).
+- **Column constraints and table definitions.** Ungated
+  wherever the v0.4 evaluator is built (they used to be
+  parsed and silently ignored): CHECK constraints on every
+  write path with the pin's NULL-passes / OR IGNORE / no-REPLACE
+  rules and NOT NULL → STRICT → CHECK → UNIQUE precedence;
+  expression DEFAULTs (`DEFAULT (1+2)` stored 1), signed and
+  identifier defaults, and CURRENT_TIME / DATE / TIMESTAMP
+  through a caller-supplied `Config::clock` (`Error::NoClock`
+  without one); VIRTUAL / STORED generated columns in the pin's
+  record layout (files interoperate both ways), indexable,
+  recomputed on UPDATE; UPDATE ... FROM applying only the last
+  matching combination (in hipp's join order); MustBeInt rowid
+  conversion. The tiny profile refuses those clauses
+  (`RequiresEvaluator`) instead of ignoring them, and still
+  shrank. Behind `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE
+  ... AS SELECT (the pin's column names, declared types and
+  schema text, byte for byte) and STRICT tables. WITHOUT ROWID
+  stays refused. Review fixes (every profile): CREATE TABLE
+  items are walked with the pin's grammar, so malformed
+  constraint lists (`CHECK(a>0) bar`, `DEFAULT abs(1)`,
+  `PRIMARY KEY (a) foo`) are syntax errors instead of schemas
+  the pin cannot load; stored CREATE texts drop `main.` / `IF
+  NOT EXISTS` as the pin's do; repeated PRIMARY KEY / UNIQUE
+  sets share one autoindex; `-9223372036854775808` is an
+  INTEGER; unary `+` keeps no affinity (`+a = '1'`, CTAS column
+  `"+a"`); `||` is always TEXT, `abs()` follows the pin (TEXT →
+  REAL, i64::MIN overflows) and REAL → TEXT uses the pin's
+  `1.0e+20` layout — computed with exact integer arithmetic, so
+  no build links `core::fmt`'s float formatting any more (the
+  tiny profile dropped 5.5 KB); ALTER TABLE ADD COLUMN takes
+  non-constant defaults, NOT NULL and STORED columns on an empty
+  table; one clock read per statement; hipp-cli supplies the
+  system clock; CREATE TABLE refuses AUTOINCREMENT (hipp keeps
+  no `sqlite_sequence`, and such a table read as malformed on
+  the pin).
+- **Collations and pattern matching.** Ungated (column
+  `COLLATE` was parsed and ignored): BINARY / NOCASE / RTRIM
+  column collations with the pin's selection rule in every
+  comparison (`=`, `<`, IS, IN, BETWEEN, CASE, joins,
+  subqueries), in ORDER BY, GROUP BY, DISTINCT, min / max /
+  nullif and DISTINCT aggregates, derived-table columns, and
+  compounds — now evaluated with the pin's merge algorithm, so
+  which of two NOCASE-equal rows survives a UNION matches too;
+  collated indexes (`CREATE INDEX ... (c COLLATE NOCASE)`,
+  UNIQUE NOCASE / RTRIM constraints and their autoindexes,
+  upsert targets) order, find and enforce keys by their
+  collation, interoperate with the pin's files both ways, and
+  their tables are writable (they used to be refused as foreign);
+  unknown collation names are refused (a file whose table names
+  an application-registered collation still opens; only that
+  table is refused). Upsert `excluded.<col>` compares with no
+  collation or affinity, as on the pin. Also fixed on the way:
+  GROUP BY takes the ORDER BY's directions for its group order,
+  bare columns follow the last min / max aggregate (an all-NULL
+  group reads its last row), scalar `min(1, 1.0)` is 1.0, LIKE
+  reads operands up to a NUL and matches iteratively, a written
+  `IN (list)` converts by its left operand's affinity only, and
+  UPDATE OR REPLACE no longer revives rows its own REPLACE
+  deleted. Behind
+  `v16`: the `expr COLLATE name` operator, GLOB / NOT GLOB,
+  `LIKE ... ESCAPE`, and `like()` / `glob()`.
+- **Bound parameters** (leaf feature `params`, in `full`;
+  not in the tiny profile, but it builds on it alone): `?`,
+  `?NNN`, `:name`, `@name`, `$name` (and `#name`, the TCL
+  `$a::b` / `$a(x)` forms) numbered exactly as the pin numbers
+  them (a named parameter takes the next free index, repeated
+  names share one, `?NNN` sets it, 32766 at most). The
+  Statement API: `bind_null` / `bind_i64` / `bind_f64` /
+  `bind_text` / `bind_blob` / `bind_value` by 1-based index,
+  `parameter_count`, `parameter_index`, `parameter_name`,
+  `clear_bindings` and `reset`, so a prepared statement is
+  stepped again with new bindings (each execution plans afresh
+  from the parsed tree; the statement arena is rewound, not
+  grown). Unbound is NULL; a NaN binds NULL. A bound value
+  takes part in affinity exactly as the literal of its storage
+  class (the pin's rule), anywhere an expression goes in the full
+  profile — WHERE, SET, VALUES, LIMIT / OFFSET, subqueries,
+  upsert, RETURNING, compound cores, derived tables, CREATE TABLE
+  ... AS SELECT — and in ORDER BY / GROUP BY as a constant (not
+  an ordinal), matching a compound's identical result item
+  (leftmost core first, a multi-row VALUES laid out as the pin
+  lays it out) as on the pin; on top of the tiny profile, in INSERT VALUES and
+  `WHERE rowid = ?`. Parameters in views, CHECK, DEFAULT and
+  generated columns are refused, as on the pin. hipp-cli binds
+  them like the oracle shell, from `.parameter set` (NULL
+  otherwise). Found on the way and fixed ungated: `%` with a
+  REAL operand is a REAL, CAST(text AS INTEGER) reads only the
+  integer prefix, CAST(text AS NUMERIC) follows the pin's
+  2^51 rule, substr() / round() read text integer arguments by
+  their integer prefix, round() clamps its digit count to 30 and
+  rounds the exact decimal expansion as the pin's printf does,
+  `CREATE TABLE IF NOT EXISTS t AS SELECT ...` over an existing
+  `t` is a no-op before its SELECT is resolved, and hipp-cli
+  prints `-0.0` as `0.0` and an exact half at the 16th digit
+  rounded up, as the pin does.
 
 ## What v0.13 does
 
@@ -284,9 +406,10 @@ aspirations.
   explicit indexes and for column/table constraints via implicit
   `sqlite_autoindex_*` indexes, and `WHERE <first indexed
   column> = <literal>` lookups through the planner's access
-  seam. Expression, partial and non-BINARY-collated foreign
-  indexes are read as opaque metadata; writes to their tables
-  are refused rather than allowed to desynchronise them.
+  seam. Expression and partial foreign indexes are read as
+  opaque metadata; writes to their tables are refused rather
+  than allowed to desynchronise them. (Since v0.16, NOCASE /
+  RTRIM-collated indexes are maintained, not opaque.)
 - Explicit transactions: `BEGIN` / `COMMIT` / `ROLLBACK` over the
   resumable commit machine.
 - Table B-trees with leaf/interior/root splits, overflow chains
@@ -317,15 +440,18 @@ and `cargo test --workspace`.
 A std binary shell (`hipp-cli/`, decision D4): interactive,
 stdin-batch and one-shot modes with list-format output
 byte-diffable against the pinned oracle CLI, plus `.tables`,
-`.schema`, `.dump`, `.open`, `.exit`. Its first job is
+`.schema`, `.dump`, `.open`, `.parameter` (v0.16: `set`,
+`unset`, `clear`, `list`, `init`, bound by name as the oracle
+shell binds them), `.exit`. Its first job is
 differential testing. It is a separate crate and contributes
 0 bytes to the core's tiny build.
 
 ## Non-goals (SPEC §3)
 
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
-no expression or partial indexes, no subqueries, no bound
-parameters, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
+no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
+created (refused; foreign ones load), no expression or partial
+indexes, no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed, no UTF-16, no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
@@ -337,9 +463,11 @@ A workspace: the zero-dependency core crate at the root plus
 `unsafe`), `storage` (async trait + Mem/File impls), `pager`
 (page cache, journal protocol, commit machine), `btree`,
 `record` (serial codec, affinity), `schema` (catalog), `sql/`
-(lexer, parser, AST), `query` (resolved-expression evaluator,
-v0.4), `session` (Connection/Statement, planner, tree-walking
-executor), `error` (remedy-named errors).
+(lexer, parser, AST, parameter binding), `query` (resolved-expression evaluator,
+v0.4), `rules` (CHECK / generated-column / STRICT / DEFAULT
+rules and the generated-column row codec, v0.16), `session`
+(Connection/Statement, planner, tree-walking executor),
+`error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.
 

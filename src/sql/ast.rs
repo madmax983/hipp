@@ -6,6 +6,8 @@
 //! borrows.
 
 use crate::arena::{ABytes, AVec};
+#[cfg(any(feature = "v04", feature = "indexes"))]
+use crate::record::Coll;
 use alloc::boxed::Box;
 
 /// A literal value as written in the SQL text.
@@ -45,9 +47,33 @@ pub struct ColumnDef {
     /// A `DEFAULT` was present but is not a plain literal
     /// (e.g. `CURRENT_TIMESTAMP`, a function call) (v0.4).
     pub default_nonconst: bool,
-    /// `GENERATED ALWAYS AS` appeared (v0.4: recorded so ADD
-    /// COLUMN can refuse generated columns).
+    /// The column is generated — `GENERATED ALWAYS AS (expr)`
+    /// or the short `AS (expr)` (v0.4: recorded so ADD COLUMN
+    /// could refuse it; v0.16: computed, see `gen_expr`).
     pub generated: bool,
+    /// The DEFAULT clause's expression text when it is not a
+    /// plain literal (v0.16): `(1+2)`, `-'3'`, `-x'01'`,
+    /// `CURRENT_TIMESTAMP`, ... — re-parsed and evaluated by
+    /// the planner when a row needs the default. `None` for a
+    /// literal default (then `default` holds it) or no DEFAULT.
+    #[cfg(feature = "v04")]
+    pub default_expr: Option<ABytes>,
+    /// The generation expression's text (the inside of `AS
+    /// (...)`) of a generated column (v0.16).
+    #[cfg(feature = "v04")]
+    pub gen_expr: Option<ABytes>,
+    /// A generated column written `STORED` (v0.16): computed on
+    /// write and kept in the record. Otherwise (`VIRTUAL`, the
+    /// default) it is computed on read and absent from the
+    /// record, exactly as in the pin's file format.
+    #[cfg(feature = "v04")]
+    pub stored: bool,
+    /// The column's `COLLATE name` (v0.16): its collating
+    /// sequence for comparisons, ORDER BY / GROUP BY / DISTINCT
+    /// and the indexes on it; `None` (no clause) is BINARY. An
+    /// unknown name is refused at parse, as on the pin.
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub coll: Option<Coll>,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -66,6 +92,10 @@ pub struct IndexColumnDef {
     pub name: ABytes,
     /// `DESC` sort order for this key column.
     pub desc: bool,
+    /// An explicit `COLLATE name` on this key column (v0.16);
+    /// `None` takes the table column's collation.
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub coll: Option<Coll>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +139,13 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// Unary minus.
     Neg(Box<Expr>),
+    /// Unary plus over a non-literal operand (v0.16): the
+    /// operand's value with *no* affinity (the pin's `TK_UPLUS`;
+    /// `+a = '1'` compares without converting, and a
+    /// CREATE TABLE ... AS SELECT column `+a` is named `"+a"`
+    /// and typed by no affinity). Its collation is the operand's.
+    /// A sign over a literal folds into the literal instead.
+    Pos(Box<Expr>),
     /// Logical NOT.
     Not(Box<Expr>),
     IsNull(Box<Expr>, bool),
@@ -138,6 +175,20 @@ pub enum Expr {
         args: AVec<Expr>,
     },
     Cast(Box<Expr>, ABytes),
+    /// `expr COLLATE name` (v0.16, `v16`): the operand with an
+    /// explicit collating sequence, which wins every comparison
+    /// it takes part in (the pin's `EP_Collate` rules).
+    #[cfg(feature = "v16")]
+    Collate(Box<Expr>, Coll),
+    /// A bound parameter (v0.16, feature `params`): its 1-based
+    /// index and its token text (`?`, `?2`, `:name`, ...). It
+    /// never reaches the planner from a prepared statement: each
+    /// execution plans a copy of the tree with every parameter
+    /// replaced by its bound value as a literal (see
+    /// `session::bind_ast`). In a stored schema text (where the
+    /// pin silently reads one as NULL) it resolves to NULL.
+    #[cfg(feature = "params")]
+    Param(u16, ABytes),
 }
 
 /// One SELECT result item (v0.4).
@@ -151,12 +202,51 @@ pub enum SelectItem {
     Expr(Expr, Option<ABytes>, ABytes),
 }
 
-/// How a FROM source joins the previous ones (v0.4).
+/// How a FROM source joins the previous ones (v0.4; `Right` /
+/// `Full` v0.16). The FROM clause is a left-deep tree: source
+/// `i` joins the result of sources `0..i`. The pin's keyword
+/// combinations map here as SQLite's `sqlite3JoinType` does —
+/// LEFT and RIGHT together (`FULL`, or even `LEFT RIGHT`) are
+/// `Full`, `OUTER` is only a modifier of LEFT / RIGHT / FULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,
     Left,
     Cross,
+    /// `RIGHT [OUTER] JOIN` (v0.16): every row of this source
+    /// appears; one that no left combination matched is emitted
+    /// NULL-padded on the left after the whole left operand has
+    /// been scanned (the pin's order).
+    Right,
+    /// `FULL [OUTER] JOIN` (v0.16): LEFT and RIGHT together.
+    Full,
+}
+
+impl JoinKind {
+    /// Unmatched left combinations are NULL-padded (LEFT, FULL).
+    pub fn pads_right(self) -> bool {
+        matches!(self, JoinKind::Left | JoinKind::Full)
+    }
+    /// Unmatched rows of this source are emitted NULL-padded on
+    /// the left (RIGHT, FULL).
+    pub fn pads_left(self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Full)
+    }
+}
+
+/// The direction of one ORDER BY term (v0.16 adds NULL
+/// placement): `nulls_first` is SQLite's default `!desc` (NULL
+/// sorts smallest) unless `NULLS FIRST` / `NULLS LAST` was
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortOrder {
+    pub desc: bool,
+    pub nulls_first: bool,
+    /// The term's collating sequence (v0.16): BINARY from the
+    /// parser; the planner sets the term's collation (an explicit
+    /// `COLLATE`, else the column's — the pin's
+    /// `sqlite3ExprCollSeq`).
+    pub coll: crate::record::Coll,
 }
 
 /// One FROM source (v0.4): a table (or view name, resolved at plan
@@ -175,6 +265,16 @@ pub struct FromSource {
     pub on: Option<Expr>,
     /// A FROM-clause subquery (v0.9, feature `v09`).
     pub derived: Option<Box<SelectStmt>>,
+    /// `NATURAL` was written on this join (v0.16): the join
+    /// columns are this source's columns that any source to its
+    /// left also has, in this source's column order. Never
+    /// combined with `on` / `using` (the parser refuses that).
+    #[cfg(feature = "v04")]
+    pub natural: bool,
+    /// `USING (col, ...)` column names as written (v0.16);
+    /// empty when the clause is absent.
+    #[cfg(feature = "v04")]
+    pub using: AVec<ABytes>,
 }
 
 /// A compound SELECT operator (v0.9). All four operators have
@@ -201,10 +301,15 @@ pub struct SelectStmt {
     pub filter: Option<Expr>,
     pub group_by: AVec<Expr>,
     pub having: Option<Expr>,
-    /// (expression, descending) pairs.
-    pub order_by: AVec<(Expr, bool)>,
-    pub limit: Option<i64>,
-    pub offset: i64,
+    /// (expression, direction) pairs (v0.16: the direction
+    /// carries the NULLS FIRST / LAST placement).
+    pub order_by: AVec<(Expr, SortOrder)>,
+    /// `LIMIT` expression (v0.16: a general expression under
+    /// the `v16` feature; an integer literal before it).
+    pub limit: Option<Box<Expr>>,
+    /// `OFFSET` expression (also the first term of the
+    /// `LIMIT offset, count` form); None when absent.
+    pub offset: Option<Box<Expr>>,
     /// Compound tail (v0.9, feature `v09`): `(op, core)` pairs
     /// in source order, applied left to right (all compound
     /// operators share one precedence on the pin — see
@@ -246,6 +351,11 @@ pub struct Upsert {
     /// clause names no target (`ON CONFLICT DO ...` arbitrates
     /// any uniqueness conflict).
     pub target: AVec<ABytes>,
+    /// Per-target-column explicit `COLLATE name` (v0.16),
+    /// parallel to `target`: a target column with one matches
+    /// only an index column of that collation (the pin's
+    /// upsert-target rule); `None` matches any.
+    pub target_colls: AVec<Option<crate::record::Coll>>,
     /// The target's optional index predicate (`ON CONFLICT (a)
     /// WHERE ...`): parsed and name-resolved at plan time (an
     /// unknown column errors, as in the oracle), but never
@@ -276,6 +386,19 @@ pub enum Ast {
         /// UNIQUE / PRIMARY KEY constraint sets in statement
         /// order (v0.3).
         constraint_sets: AVec<ConstraintSet>,
+        /// CHECK constraint expression texts, column-level and
+        /// table-level, in statement order (v0.16; the inside
+        /// of each `CHECK (...)`).
+        #[cfg(feature = "v04")]
+        checks: AVec<ABytes>,
+        /// The `STRICT` table option (v0.16, feature `v16`).
+        #[cfg(feature = "v16")]
+        strict: bool,
+        /// `CREATE TABLE ... AS SELECT ...` (v0.16, feature
+        /// `v16`): the columns are derived from the SELECT and
+        /// `columns` is empty.
+        #[cfg(feature = "v16")]
+        as_select: Option<Box<SelectStmt>>,
     },
     /// `CREATE [UNIQUE] INDEX` (v0.3).
     CreateIndex {
@@ -362,6 +485,10 @@ pub enum Ast {
         table: ABytes,
         column: ColumnDef,
         text: ABytes,
+        /// The new column's CHECK constraint texts (v0.16): the
+        /// pin verifies existing rows against them.
+        #[cfg(feature = "v04")]
+        checks: AVec<ABytes>,
     },
     /// `CREATE VIEW` (v0.4): stored SQL, inert — the SELECT is
     /// parsed and validated at plan time but never executed;

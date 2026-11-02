@@ -4,15 +4,26 @@
 //! is byte-diffable against the pinned SQLite oracle CLI.
 //!
 //! Its first job is differential testing; demo surface second.
-//! Dot-commands: `.tables`, `.schema`, `.dump`, `.open`, `.exit`
-//! (alias `.quit`). No line editing, no `.import`/`.export`, no
-//! format/flag parity beyond diffable basics.
+//! Dot-commands: `.tables`, `.schema`, `.dump`, `.open`,
+//! `.parameter`, `.exit` (alias `.quit`). No line editing, no
+//! `.import`/`.export`, no format/flag parity beyond diffable
+//! basics.
+//!
+//! Bound parameters (v0.16) work as in the oracle shell: every
+//! parameter of a statement is bound from the `.parameter set`
+//! table by its name (a nameless `?` by `?N`), NULL when the
+//! table has no such key.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use hipp::storage::block_on;
-use hipp::{Config, Connection, FileStorage, MemStorage, Step, Value};
+use hipp::{Config, Connection, FileStorage, MemStorage, OwnedValue, Step, Value};
+
+/// The `.parameter` bindings (v0.16): the oracle shell's
+/// `temp.sqlite_parameters` table — key (the parameter's name as
+/// written, `?N` for a nameless `?`) to value, in key order.
+type Params = std::collections::BTreeMap<String, OwnedValue>;
 
 /// The open database: a file or `:memory:`.
 enum Db {
@@ -23,13 +34,13 @@ enum Db {
 fn open_db(path: &str) -> Result<Db, String> {
     block_on(async {
         if path == ":memory:" {
-            let conn = Connection::open(MemStorage::new(), Config::default())
+            let conn = Connection::open(MemStorage::new(), Config::default().clock(now_ms))
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::Mem(conn))
         } else {
             let fs = FileStorage::open(std::path::Path::new(path)).map_err(|e| format!("{e:?}"))?;
-            let conn = Connection::open(fs, Config::default())
+            let conn = Connection::open(fs, Config::default().clock(now_ms))
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::File(conn))
@@ -37,50 +48,206 @@ fn open_db(path: &str) -> Result<Db, String> {
     })
 }
 
-/// Format an `f64` the way SQLite's list mode prints reals
-/// (`%!.15g`): 15 significant digits, fixed notation inside
-/// [-4, 15) exponent range, at least one fractional digit.
-fn fmt_real(f: f64) -> String {
-    if f == 0.0 {
-        return if f.is_sign_negative() {
-            "-0.0".to_string()
-        } else {
-            "0.0".to_string()
-        };
+/// The wall clock for CURRENT_TIME / CURRENT_DATE /
+/// CURRENT_TIMESTAMP defaults (v0.16): the core has none of its
+/// own; the CLI, a std program, supplies the system time in Unix
+/// milliseconds (0 if the system clock reads before 1970).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// A column name as the shell's `.schema` view comment prints it
+/// (v0.16, CI against the pin: `/* v(a,"+b",b,Q) */`): bare when
+/// it is a plain identifier (an ASCII letter or `_`, then letters,
+/// digits, `_`) that is not an SQL keyword, else double-quoted
+/// with `"` doubled. The keyword list is SQLite's documented one
+/// (147 words, sqlite.org/lang_keywords.html); the keyword case is
+/// inferred from the shell's quoting rule, not seen in CI.
+fn shell_quote_name(c: &[u8]) -> Vec<u8> {
+    let plain = c
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && c.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    if plain
+        && !SQL_KEYWORDS
+            .iter()
+            .any(|k| k.as_bytes().eq_ignore_ascii_case(c))
+    {
+        return c.to_vec();
     }
-    if !f.is_finite() {
-        // SQLite prints these as Inf / -Inf in list mode.
-        return if f > 0.0 {
-            "Inf".to_string()
-        } else {
-            "-Inf".to_string()
-        };
-    }
-    // 15 significant digits in scientific form: d.dddddddddddddd e±X
-    let sci = format!("{:.14e}", f.abs());
-    let (mant, exp) = sci.split_once('e').expect("scientific form");
-    let exp10: i32 = exp.parse().expect("exponent");
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
-    let digits = digits.trim_end_matches('0');
-    let digits = if digits.is_empty() { "0" } else { digits };
-    let sign = if f < 0.0 { "-" } else { "" };
-    if !(-4..15).contains(&exp10) {
-        // Scientific: one digit, point, rest (at least one digit
-        // after the point), e, signed two-digit exponent.
-        let frac = if digits.len() > 1 { &digits[1..] } else { "0" };
-        return format!("{sign}{}.{frac}e{exp10:+03}", &digits[0..1]);
-    }
-    if exp10 >= 0 {
-        let split = (exp10 + 1) as usize;
-        if digits.len() <= split {
-            let int = format!("{digits:0<width$}", width = split);
-            return format!("{sign}{int}.0");
+    let mut q = vec![b'"'];
+    for &b in c {
+        if b == b'"' {
+            q.push(b'"');
         }
-        format!("{sign}{}.{}", &digits[..split], &digits[split..])
-    } else {
-        let zeros = (-exp10 - 1) as usize;
-        format!("{sign}0.{}{digits}", "0".repeat(zeros))
+        q.push(b);
     }
+    q.push(b'"');
+    q
+}
+
+/// SQLite's keywords (sqlite.org/lang_keywords.html), for
+/// `shell_quote_name`.
+const SQL_KEYWORDS: [&str; 147] = [
+    "ABORT",
+    "ACTION",
+    "ADD",
+    "AFTER",
+    "ALL",
+    "ALTER",
+    "ALWAYS",
+    "ANALYZE",
+    "AND",
+    "AS",
+    "ASC",
+    "ATTACH",
+    "AUTOINCREMENT",
+    "BEFORE",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLLATE",
+    "COLUMN",
+    "COMMIT",
+    "CONFLICT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "CURRENT",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "DATABASE",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DEFERRED",
+    "DELETE",
+    "DESC",
+    "DETACH",
+    "DISTINCT",
+    "DO",
+    "DROP",
+    "EACH",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXCEPT",
+    "EXCLUDE",
+    "EXCLUSIVE",
+    "EXISTS",
+    "EXPLAIN",
+    "FAIL",
+    "FILTER",
+    "FIRST",
+    "FOLLOWING",
+    "FOR",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "GENERATED",
+    "GLOB",
+    "GROUP",
+    "GROUPS",
+    "HAVING",
+    "IF",
+    "IGNORE",
+    "IMMEDIATE",
+    "IN",
+    "INDEX",
+    "INDEXED",
+    "INITIALLY",
+    "INNER",
+    "INSERT",
+    "INSTEAD",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "KEY",
+    "LAST",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "MATCH",
+    "MATERIALIZED",
+    "NATURAL",
+    "NO",
+    "NOT",
+    "NOTHING",
+    "NOTNULL",
+    "NULL",
+    "NULLS",
+    "OF",
+    "OFFSET",
+    "ON",
+    "OR",
+    "ORDER",
+    "OTHERS",
+    "OUTER",
+    "OVER",
+    "PARTITION",
+    "PLAN",
+    "PRAGMA",
+    "PRECEDING",
+    "PRIMARY",
+    "QUERY",
+    "RAISE",
+    "RANGE",
+    "RECURSIVE",
+    "REFERENCES",
+    "REGEXP",
+    "REINDEX",
+    "RELEASE",
+    "RENAME",
+    "REPLACE",
+    "RESTRICT",
+    "RETURNING",
+    "RIGHT",
+    "ROLLBACK",
+    "ROW",
+    "ROWS",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "TABLE",
+    "TEMP",
+    "TEMPORARY",
+    "THEN",
+    "TIES",
+    "TO",
+    "TRANSACTION",
+    "TRIGGER",
+    "UNBOUNDED",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VACUUM",
+    "VALUES",
+    "VIEW",
+    "VIRTUAL",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+    "WITHOUT",
+];
+
+/// Format an `f64` the way SQLite's list mode prints reals: the
+/// pin's CLI renders a REAL exactly as its core REAL-to-text
+/// conversion (CAST AS TEXT) does — CI showed it (v0.16) — so this
+/// is the core's `render_real`, the one source of truth.
+fn fmt_real(f: f64) -> String {
+    let mut t = hipp::arena::AVec::new();
+    hipp::record::render_real(f, &mut t);
+    String::from_utf8_lossy(t.as_slice()).into_owned()
 }
 
 /// SQL literal rendering for `.dump`: text quoted with `''`
@@ -161,24 +328,34 @@ fn value_bytes(v: Value<'_>) -> Vec<u8> {
 async fn run_statement<S: hipp::Storage>(
     db: &mut Connection<S>,
     sql: &str,
+    params: &Params,
     out: &mut impl Write,
 ) -> Result<(), String>
 where
     S::Error: core::fmt::Debug,
 {
     let mut st = db.prepare(sql).await.map_err(|e| format!("{e:?}"))?;
-    if st.column_count() > 0 {
-        while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
-            let vals: Vec<Vec<u8>> = (0..st.column_count())
-                .map(|i| value_bytes(st.column_value(i).unwrap_or(Value::Null)))
-                .collect();
-            write_row(out, &vals);
+    // The oracle shell's `bind_prepared_stmt`: each parameter
+    // from the `.parameter` table by name, else NULL.
+    for i in 1..=st.parameter_count() {
+        let key = st
+            .parameter_name(i)
+            .map_or_else(|| format!("?{i}"), str::to_string);
+        if let Some(v) = params.get(&key) {
+            st.bind_value(i, v.as_value())
+                .map_err(|e| format!("{e:?}"))?;
         }
-        Ok(())
-    } else {
-        st.step().await.map_err(|e| format!("{e:?}"))?;
-        Ok(())
     }
+    // Step to completion, printing every row (a statement whose
+    // planning waited for its bindings knows its columns only
+    // once stepped).
+    while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
+        let vals: Vec<Vec<u8>> = (0..st.column_count())
+            .map(|i| value_bytes(st.column_value(i).unwrap_or(Value::Null)))
+            .collect();
+        write_row(out, &vals);
+    }
+    Ok(())
 }
 
 /// Split a script into statements on `;` outside of string
@@ -242,9 +419,58 @@ enum Flow {
     Exit,
 }
 
+/// Split a dot-command line into arguments the way the oracle
+/// shell does: whitespace-separated words, a word starting with
+/// `'` or `"` running to the matching quote (the quotes
+/// dropped).
+fn shell_args(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(&c) = chars.peek() else {
+            return args;
+        };
+        let mut word = String::new();
+        if c == '\'' || c == '"' {
+            chars.next();
+            for d in chars.by_ref() {
+                if d == c {
+                    break;
+                }
+                word.push(d);
+            }
+        } else {
+            while let Some(d) = chars.next_if(|d| !d.is_whitespace()) {
+                word.push(d);
+            }
+        }
+        args.push(word);
+    }
+}
+
+/// `.parameter set KEY VALUE`'s value (v0.16): VALUE as an SQL
+/// expression when it is one (`5`, `2.5`, `x'01'`, `'text'`,
+/// `1+2`), else the text itself — the oracle shell's two-try
+/// `REPLACE INTO temp.sqlite_parameters ... VALUES(%Q,%s)`.
+async fn parameter_value<S: hipp::Storage>(db: &mut Connection<S>, text: &str) -> OwnedValue
+where
+    S::Error: core::fmt::Debug,
+{
+    if let Ok(mut st) = db.prepare(&format!("SELECT {text}")).await
+        && st.column_count() == 1
+        && st.parameter_count() == 0
+        && let Ok(Step::Row) = st.step().await
+    {
+        return OwnedValue::from_value(st.column_value(0).unwrap_or(Value::Null));
+    }
+    OwnedValue::from_value(Value::Text(text.as_bytes()))
+}
+
 async fn dot_command<S: hipp::Storage>(
     db: &mut Connection<S>,
     line: &str,
+    params: &mut Params,
     out: &mut impl Write,
 ) -> Result<Flow, String>
 where
@@ -255,6 +481,36 @@ where
     let arg = parts.next().map(str::trim).unwrap_or("");
     match cmd {
         ".exit" | ".quit" => Ok(Flow::Exit),
+        ".parameter" | ".param" => {
+            let args = shell_args(arg);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match args.as_slice() {
+                ["clear"] => params.clear(),
+                ["init"] => {}
+                ["list"] => {
+                    let len = params.keys().map(|k| k.len()).max().unwrap_or(0).min(40);
+                    for (k, v) in params.iter() {
+                        let _ = out.write_all(format!("{k:<len$} ").as_bytes());
+                        let _ = out.write_all(&fmt_literal(v.as_value()));
+                        let _ = out.write_all(b"\n");
+                    }
+                }
+                ["set", key, value] => {
+                    let v = parameter_value(db, value).await;
+                    params.insert((*key).to_string(), v);
+                }
+                ["unset", key] => {
+                    params.remove(*key);
+                }
+                _ => {
+                    return Err(
+                        "usage: .parameter clear | init | list | set NAME VALUE | unset NAME"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(Flow::Continue)
+        }
         ".tables" => {
             for t in db.tables().iter() {
                 let _ = out.write_all(t.name);
@@ -301,7 +557,7 @@ where
                     if i > 0 {
                         let _ = out.write_all(b",");
                     }
-                    let _ = out.write_all(c);
+                    let _ = out.write_all(&shell_quote_name(c));
                 }
                 let _ = out.write_all(b") */\n");
             }
@@ -311,17 +567,36 @@ where
             let _ = out.write_all(b"BEGIN TRANSACTION;\n");
             // Snapshot the catalog first (names as bytes) so the
             // per-table SELECTs can borrow the connection freely.
-            let tables: Vec<(Vec<u8>, Vec<u8>)> = db
+            // A table with generated columns dumps only the
+            // other columns (v0.16), as the oracle shell does:
+            // its INSERT ... VALUES replays without them.
+            let tables: Vec<(Vec<u8>, Vec<u8>, String)> = db
                 .tables()
                 .iter()
-                .map(|t| (t.name.to_vec(), t.sql.to_vec()))
+                .map(|t| {
+                    let list = if t.generated.iter().any(|g| *g) {
+                        let cols: Vec<String> = t
+                            .columns
+                            .iter()
+                            .zip(t.generated.iter())
+                            .filter(|(_, g)| !**g)
+                            .map(|(c, _)| {
+                                format!("\"{}\"", String::from_utf8_lossy(c).replace('"', "\"\""))
+                            })
+                            .collect();
+                        cols.join(", ")
+                    } else {
+                        "*".to_string()
+                    };
+                    (t.name.to_vec(), t.sql.to_vec(), list)
+                })
                 .collect();
-            for (name, sql) in &tables {
+            for (name, sql, list) in &tables {
                 let _ = out.write_all(sql);
                 let _ = out.write_all(b";\n");
                 let name = String::from_utf8_lossy(name);
                 let mut st = db
-                    .prepare(&format!("SELECT * FROM {name}"))
+                    .prepare(&format!("SELECT {list} FROM {name}"))
                     .await
                     .map_err(|e| format!("{e:?}"))?;
                 while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
@@ -362,7 +637,12 @@ where
 
 /// Execute one input unit (statement or dot-command) against the
 /// current database, handling `.open` by swapping `db`.
-async fn dispatch(db: &mut Db, input: &str, out: &mut impl Write) -> Result<Flow, String> {
+async fn dispatch(
+    db: &mut Db,
+    input: &str,
+    params: &mut Params,
+    out: &mut impl Write,
+) -> Result<Flow, String> {
     let trimmed = input.trim();
     if trimmed.starts_with('.') {
         let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -375,15 +655,15 @@ async fn dispatch(db: &mut Db, input: &str, out: &mut impl Write) -> Result<Flow
             return Ok(Flow::Continue);
         }
         match db {
-            Db::File(c) => dot_command(c, trimmed, out).await,
-            Db::Mem(c) => dot_command(c, trimmed, out).await,
+            Db::File(c) => dot_command(c, trimmed, params, out).await,
+            Db::Mem(c) => dot_command(c, trimmed, params, out).await,
         }
     } else {
         match db {
-            Db::File(c) => run_statement(c, trimmed, out)
+            Db::File(c) => run_statement(c, trimmed, params, out)
                 .await
                 .map(|()| Flow::Continue),
-            Db::Mem(c) => run_statement(c, trimmed, out)
+            Db::Mem(c) => run_statement(c, trimmed, params, out)
                 .await
                 .map(|()| Flow::Continue),
         }
@@ -409,12 +689,13 @@ fn main() -> ExitCode {
         }
     };
     let mut out = std::io::stdout().lock();
+    let mut params = Params::new();
 
     // One-shot mode: run the SQL argument (possibly several
     // statements), stop at the first error.
     if let Some(sql) = args.get(1) {
         for stmt in split_statements(sql) {
-            match block_on(dispatch(&mut db, &stmt, &mut out)) {
+            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {
@@ -431,7 +712,7 @@ fn main() -> ExitCode {
     let interactive = stdin.is_terminal();
     if interactive {
         println!("hipp — reads and writes SQLite database files (format pin: SQLite 3.54.1)");
-        println!("Enter SQL or dot-commands (.tables .schema .dump .open .exit)");
+        println!("Enter SQL or dot-commands (.tables .schema .dump .open .parameter .exit)");
     }
     let mut lines = stdin.lock().lines();
     let mut buffer = String::new();
@@ -450,7 +731,7 @@ fn main() -> ExitCode {
         };
         let line = line.trim_end();
         if buffer.is_empty() && line.trim_start().starts_with('.') {
-            match block_on(dispatch(&mut db, line.trim(), &mut out)) {
+            match block_on(dispatch(&mut db, line.trim(), &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => eprintln!("Error: {e}"),
@@ -464,7 +745,7 @@ fn main() -> ExitCode {
         if buffer.trim_end().ends_with(';') {
             let script = std::mem::take(&mut buffer);
             for stmt in split_statements(&script) {
-                match block_on(dispatch(&mut db, &stmt, &mut out)) {
+                match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit) => return ExitCode::SUCCESS,
                     Err(e) => eprintln!("Error: {e}"),
@@ -475,7 +756,7 @@ fn main() -> ExitCode {
     // A trailing unterminated statement still runs at EOF.
     if !buffer.trim().is_empty() {
         for stmt in split_statements(&buffer) {
-            match block_on(dispatch(&mut db, &stmt, &mut out)) {
+            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {

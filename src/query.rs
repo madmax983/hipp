@@ -38,9 +38,10 @@ use alloc::boxed::Box;
 use crate::arena::{AVec, Arena};
 use crate::error::{Error, Result, SchemaKind};
 use crate::record::{
-    Affinity, OwnedValue, apply_affinity, compare_values, render_int, render_real,
+    Affinity, Coll, OwnedValue, apply_affinity, compare_coll, compare_values, render_int,
+    render_real,
 };
-use crate::sql::{BinOp, Expr, Literal, eq_ci, handle_bytes};
+use crate::sql::{BinOp, Expr, Literal, SortOrder, eq_ci, handle_bytes};
 
 /// One materialised row: flat column values across all FROM
 /// sources, plus each source's rowid (None for a LEFT JOIN pad).
@@ -94,6 +95,12 @@ pub enum ScalarFn {
     Iif,
     MinN,
     MaxN,
+    /// `like(pattern, subject[, escape])` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Like,
+    /// `glob(pattern, subject)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Glob,
 }
 
 /// A resolved expression: column references are flat slot indices
@@ -112,13 +119,28 @@ pub enum RExpr {
     /// int_col ...)` is true there). Produced only by
     /// `substitute`; never by the resolver.
     AffLiteral(OwnedValue, Affinity),
-    Column(usize, Affinity),
+    /// A column slot with its comparison affinity and its
+    /// collating sequence (v0.16: the column's `COLLATE`; a
+    /// derived table's column carries its subquery item's;
+    /// `None` for a register reference — an upsert's
+    /// `excluded.<col>` — which has none, so the other
+    /// operand's collation decides a comparison).
+    Column(usize, Affinity, Option<Coll>),
     Rowid(usize),
     Binary(BinOp, Box<RExpr>, Box<RExpr>),
     Neg(Box<RExpr>),
+    /// Unary plus (v0.16): the operand's value, with no
+    /// comparison affinity (the operand's collation passes).
+    Pos(Box<RExpr>),
     Not(Box<RExpr>),
     IsNull(Box<RExpr>, bool),
-    InList(Box<RExpr>, AVec<RExpr>, bool),
+    /// `x [NOT] IN (list)`: (operand, items, negated, from_sub).
+    /// `from_sub` marks the literal list an `InSub` substitutes
+    /// (v0.16): its items compare by the binary rule (the pin's
+    /// comparison affinity for `IN (SELECT ...)`), while a
+    /// written list converts by the left operand's affinity
+    /// alone.
+    InList(Box<RExpr>, AVec<RExpr>, bool, bool),
     /// A scalar subquery (v0.6): never evaluated directly — the
     /// executor computes it per outer row and substitutes the
     /// result as a `Literal` before `eval` runs (see
@@ -138,6 +160,13 @@ pub enum RExpr {
     },
     Scalar(ScalarFn, AVec<RExpr>),
     Cast(Box<RExpr>, Affinity),
+    /// `expr COLLATE name` (v0.16): evaluates to the operand;
+    /// comparisons it takes part in use this collation (the
+    /// pin's `EP_Collate`: an explicit collation anywhere in an
+    /// operand wins over column collations). Also produced by
+    /// `substitute` to carry an IN subquery's comparison
+    /// collation onto its left operand.
+    Collate(Box<RExpr>, Coll),
     Agg {
         kind: AggKind,
         distinct: bool,
@@ -163,6 +192,85 @@ pub struct SourceDesc {
     /// (SELECT ...) s` (a derived column literally NAMED rowid
     /// still resolves, as an ordinary column).
     pub has_rowid: bool,
+    /// How this source joins the sources on its left (v0.16):
+    /// unqualified references to a USING column pick a side by
+    /// it (see `resolve_column_in_group`).
+    pub kind: crate::sql::JoinKind,
+    /// This source's USING column names (v0.16; NATURAL joins
+    /// fill it with the common columns): empty without one.
+    pub using: AVec<AVec<u8>>,
+    /// Per-column collating sequences (v0.16), parallel to
+    /// `columns`; a missing entry (the default: empty) is
+    /// BINARY.
+    pub colls: AVec<Coll>,
+    /// The source's columns are register references (v0.16:
+    /// an upsert's `excluded` row): no affinity and no
+    /// collation in comparisons, as on the pin.
+    pub registers: bool,
+}
+
+impl SourceDesc {
+    /// A source joined as an inner join with no USING columns
+    /// (the planner fills `kind` / `using` for joined sources).
+    pub fn new(
+        qualifier: AVec<u8>,
+        columns: AVec<(AVec<u8>, Affinity)>,
+        rowid_alias: Option<usize>,
+        has_rowid: bool,
+    ) -> SourceDesc {
+        SourceDesc {
+            qualifier,
+            columns,
+            rowid_alias,
+            has_rowid,
+            kind: crate::sql::JoinKind::Inner,
+            using: AVec::new(),
+            colls: AVec::new(),
+            registers: false,
+        }
+    }
+
+    /// Whether `name` is one of this source's USING columns.
+    pub fn uses(&self, name: &[u8]) -> bool {
+        self.using.iter().any(|u| eq_ci(u.as_slice(), name))
+    }
+
+    /// The resolved reference to this source's column `ci`
+    /// (source `si` of `group`): the rowid for the rowid-alias
+    /// column, else the flat slot.
+    pub fn column_ref(&self, group: &ScopeGroup, si: usize, ci: usize) -> RExpr {
+        let r = if Some(ci) == self.rowid_alias {
+            RExpr::Rowid(group.first_src + si)
+        } else {
+            let aff = self
+                .columns
+                .as_slice()
+                .get(ci)
+                .map_or(Affinity::Blob, |c| c.1);
+            RExpr::Column(
+                group.offsets.as_slice().get(si).copied().unwrap_or(0) + ci,
+                aff,
+                if self.registers {
+                    None
+                } else {
+                    Some(self.colls.as_slice().get(ci).copied().unwrap_or_default())
+                },
+            )
+        };
+        // A register reads as `+value`: no comparison affinity.
+        if self.registers {
+            RExpr::Pos(Box::new(r))
+        } else {
+            r
+        }
+    }
+
+    /// The index of this source's column named `name`, if any.
+    pub fn column_index(&self, name: &[u8]) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|(c, _)| eq_ci(c.as_slice(), name))
+    }
 }
 
 /// One level of name-resolution scope (v0.6): a query's own FROM
@@ -177,9 +285,55 @@ pub struct ScopeGroup {
     pub sources: AVec<SourceDesc>,
     pub offsets: AVec<usize>,
     pub first_src: usize,
+    /// Result-column aliases visible in this scope (v0.16,
+    /// `v16`): `(alias, resolved item)`. Filled after the
+    /// result list is resolved, so WHERE / ON / GROUP BY /
+    /// HAVING / ORDER BY expressions — and subqueries inside
+    /// them — may name an alias; an unqualified name that no
+    /// source of this group has resolves to the first alias
+    /// spelled the same, before any enclosing scope (the pin's
+    /// `lookupName` order). Empty while the result list itself
+    /// resolves: there an alias is "no such column".
+    pub aliases: AVec<(AVec<u8>, RExpr)>,
 }
 
 impl ScopeGroup {
+    /// A scope group with no aliases.
+    pub fn new(sources: AVec<SourceDesc>, offsets: AVec<usize>, first_src: usize) -> ScopeGroup {
+        ScopeGroup {
+            sources,
+            offsets,
+            first_src,
+            aliases: AVec::new(),
+        }
+    }
+
+    /// One past the last absolute column slot / rowid source
+    /// this group occupies (v0.16). A subquery planned inside
+    /// these scopes numbers its own slots from the largest end
+    /// over them — the same as summing widths when the groups
+    /// tile the row from slot 0, and still right for a group
+    /// that starts later (an UPDATE ... FROM clause's own scope
+    /// sits after the target's columns).
+    pub fn end(&self) -> (usize, usize) {
+        let slots = match (
+            self.offsets.as_slice().last(),
+            self.sources.as_slice().last(),
+        ) {
+            (Some(o), Some(s)) => o + s.columns.len(),
+            _ => 0,
+        };
+        (slots, self.first_src + self.sources.len())
+    }
+
+    /// The `end` over a stack of scope groups (v0.16).
+    pub fn stack_end(groups: &[ScopeGroup]) -> (usize, usize) {
+        groups.iter().fold((0, 0), |(w, s), g| {
+            let (gw, gs) = g.end();
+            (w.max(gw), s.max(gs))
+        })
+    }
+
     /// Total flat column slots across this group's sources.
     pub fn width(&self) -> usize {
         self.sources.iter().map(|s| s.columns.len()).sum()
@@ -206,6 +360,9 @@ pub struct SubSource {
     /// sibling sources (pin-verified: `FROM t, (SELECT t.a) s`
     /// is "no such column").
     pub derived: Option<Box<SubPlan>>,
+    /// The table's generated columns (v0.16): VIRTUAL ones are
+    /// absent from the record and computed as each row is read.
+    pub gcols: Option<Box<crate::rules::GenCols>>,
 }
 
 /// A planned subquery (v0.6): a full SELECT planned against the
@@ -221,10 +378,14 @@ pub struct SubPlan {
     pub filter: Option<RExpr>,
     pub group_by: AVec<RExpr>,
     pub having: Option<RExpr>,
-    pub order_by: AVec<(RExpr, bool)>,
+    pub order_by: AVec<(RExpr, SortOrder)>,
     pub distinct: bool,
-    pub limit: Option<i64>,
-    pub offset: i64,
+    /// LIMIT / OFFSET (v0.16: resolved expressions — planned
+    /// against an empty scope, so never correlated — evaluated
+    /// once per execution with the pin's `MustBeInt` rule; see
+    /// `limit_int`).
+    pub limit: Option<RExpr>,
+    pub offset: Option<RExpr>,
     pub has_agg: bool,
     /// Compound tail (v0.9): `(op, core plan)` pairs applied
     /// left to right after this plan's own core. Each tail plan
@@ -240,16 +401,15 @@ pub struct SubPlan {
     pub values: AVec<AVec<RExpr>>,
     /// Compound ORDER BY (v0.9): `(output column, descending)`
     /// pairs, resolved at plan time from the statement's ORDER
-    /// BY terms — on the pin a compound's ORDER BY terms may
-    /// only be an output ordinal or a result-column name (any
-    /// constituent core's), never a general expression.
-    pub comp_order: AVec<(usize, bool)>,
+    /// BY terms — an output ordinal or a column name some
+    /// constituent core matches (the session's `CompKeys`).
+    pub comp_order: AVec<(usize, SortOrder)>,
     /// Result column names (v0.9), parallel to the core's
     /// output width: alias if written, else the column name
     /// for a direct column reference, else the expression's
     /// source text; a VALUES core's are `column1`, `column2`,
     /// ... (all pin-verified). Consumed by derived-table
-    /// planning and compound ORDER BY name resolution.
+    /// planning.
     pub result_names: AVec<AVec<u8>>,
     /// Result column comparison affinities (v0.9), parallel to
     /// `result_names`: `Some` when the result item is a direct
@@ -257,9 +417,11 @@ pub struct SubPlan {
     /// carries into an enclosing comparison / a derived
     /// table's column), else `None`.
     pub result_affs: AVec<Option<Affinity>>,
-    /// Per-result-item ORDER BY name keys (v0.9; see the
-    /// session's `QueryPlan::order_names`).
-    pub order_names: AVec<OrderName>,
+    /// Whether each result item was written with an `AS` alias
+    /// (v0.16), parallel to `result_names`: CREATE TABLE ... AS
+    /// SELECT names an unaliased column reference by the
+    /// table's own column name, not its spelling here.
+    pub result_named: AVec<bool>,
     /// Plan-node identity (v0.13): unique across every
     /// `SubPlan` planned in this process, assigned by the
     /// session planner. Clones keep the id, which is what
@@ -278,11 +440,6 @@ pub struct SubPlan {
     /// pre-statement sum on every row).
     pub uncorrelated: bool,
 }
-
-/// One result item's compound ORDER BY name key (v0.9):
-/// `(qualifier, name)` — the qualifier is the item's source
-/// qualifier for a plain column item, else None.
-pub type OrderName = (Option<AVec<u8>>, AVec<u8>);
 
 impl SubPlan {
     /// The plan's output width: a VALUES core's row length,
@@ -304,43 +461,67 @@ impl SubPlan {
 /// plans are walked with the same absolute threshold: their
 /// interiors index the same combined row.
 pub fn expr_refs_below(e: &RExpr, width: usize, srcs: usize) -> bool {
+    expr_refs_range(e, &RefRange::below(width, srcs))
+}
+
+/// A band of the combined evaluation row (v0.16): column slots
+/// `w.0..w.1` and rowid sources `s.0..s.1`.
+#[derive(Debug, Clone, Copy)]
+pub struct RefRange {
+    pub w: (usize, usize),
+    pub s: (usize, usize),
+}
+
+impl RefRange {
+    /// Every slot below `width` and source below `srcs`.
+    pub fn below(width: usize, srcs: usize) -> RefRange {
+        RefRange {
+            w: (0, width),
+            s: (0, srcs),
+        }
+    }
+    fn slot(&self, i: usize) -> bool {
+        self.w.0 <= i && i < self.w.1
+    }
+    fn src(&self, i: usize) -> bool {
+        self.s.0 <= i && i < self.s.1
+    }
+}
+
+/// Whether expression `e` references a column slot or rowid
+/// source inside band `r` (v0.16 generalisation of
+/// `expr_refs_below`; the ON-clause forward-reference check
+/// asks it for the band of the sources joined later). Nested
+/// subquery plans are walked with the same absolute band:
+/// their own sources lie past every band of the query that
+/// contains them.
+pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
+    let f = |x: &RExpr| expr_refs_range(x, r);
     match e {
-        RExpr::Column(slot, _) => *slot < width,
-        RExpr::Rowid(src) => *src < srcs,
-        RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_below(p, width, srcs),
-        RExpr::InSub(x, p, _) => expr_refs_below(x, width, srcs) || plan_refs_below(p, width, srcs),
+        RExpr::Column(slot, ..) => r.slot(*slot),
+        RExpr::Rowid(src) => r.src(*src),
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_range(p, r),
+        RExpr::InSub(x, p, _) => f(x) || plan_refs_range(p, r),
         RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => false,
-        RExpr::Binary(_, a, b) => {
-            expr_refs_below(a, width, srcs) || expr_refs_below(b, width, srcs)
-        }
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
-            expr_refs_below(a, width, srcs)
-        }
-        RExpr::InList(x, l, _) => {
-            expr_refs_below(x, width, srcs) || l.iter().any(|i| expr_refs_below(i, width, srcs))
-        }
-        RExpr::Between(x, a, b, _) => {
-            expr_refs_below(x, width, srcs)
-                || expr_refs_below(a, width, srcs)
-                || expr_refs_below(b, width, srcs)
-        }
-        RExpr::Like(a, b, _) => expr_refs_below(a, width, srcs) || expr_refs_below(b, width, srcs),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => f(a),
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
         RExpr::Case {
             base,
             whens,
             otherwise,
         } => {
-            base.as_ref()
-                .is_some_and(|b| expr_refs_below(b, width, srcs))
-                || whens.iter().any(|(w, t)| {
-                    expr_refs_below(w, width, srcs) || expr_refs_below(t, width, srcs)
-                })
-                || otherwise
-                    .as_ref()
-                    .is_some_and(|o| expr_refs_below(o, width, srcs))
+            base.as_ref().is_some_and(|b| f(b))
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_ref().is_some_and(|o| f(o))
         }
-        RExpr::Scalar(_, args) => args.iter().any(|a| expr_refs_below(a, width, srcs)),
-        RExpr::Agg { args, .. } => args.iter().any(|a| expr_refs_below(a, width, srcs)),
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().any(f),
     }
 }
 
@@ -349,55 +530,25 @@ pub fn expr_refs_below(e: &RExpr, width: usize, srcs: usize) -> bool {
 /// its cores' items / filter / grouping / having / ordering,
 /// its sources' ON expressions and derived subplans, its
 /// VALUES rows, and its compound tails — recursively, with
-/// the same absolute threshold throughout.
+/// the same absolute threshold throughout. (LIMIT / OFFSET
+/// are planned against an empty scope of their own and can
+/// reference nothing outside it, so they are not walked.)
 pub fn plan_refs_below(p: &SubPlan, width: usize, srcs: usize) -> bool {
-    for s in p.sources.iter() {
-        if let Some(on) = &s.on
-            && expr_refs_below(on, width, srcs)
-        {
-            return true;
-        }
-        if let Some(d) = &s.derived
-            && plan_refs_below(d, width, srcs)
-        {
-            return true;
-        }
-    }
-    if p.items.iter().any(|e| expr_refs_below(e, width, srcs)) {
-        return true;
-    }
-    if let Some(f) = &p.filter
-        && expr_refs_below(f, width, srcs)
-    {
-        return true;
-    }
-    if p.group_by.iter().any(|e| expr_refs_below(e, width, srcs)) {
-        return true;
-    }
-    if let Some(h) = &p.having
-        && expr_refs_below(h, width, srcs)
-    {
-        return true;
-    }
-    if p.order_by
-        .iter()
-        .any(|(e, _)| expr_refs_below(e, width, srcs))
-    {
-        return true;
-    }
-    if p.values
-        .iter()
-        .any(|r| r.iter().any(|e| expr_refs_below(e, width, srcs)))
-    {
-        return true;
-    }
-    if p.compound
-        .iter()
-        .any(|(_, t)| plan_refs_below(t, width, srcs))
-    {
-        return true;
-    }
-    false
+    plan_refs_range(p, &RefRange::below(width, srcs))
+}
+
+/// `plan_refs_below` over an arbitrary band (v0.16).
+pub fn plan_refs_range(p: &SubPlan, r: &RefRange) -> bool {
+    let f = |x: &RExpr| expr_refs_range(x, r);
+    p.sources.iter().any(|s| {
+        s.on.as_ref().is_some_and(f) || s.derived.as_ref().is_some_and(|d| plan_refs_range(d, r))
+    }) || p.items.iter().any(f)
+        || p.filter.as_ref().is_some_and(f)
+        || p.group_by.iter().any(f)
+        || p.having.as_ref().is_some_and(f)
+        || p.order_by.iter().any(|(e, _)| f(e))
+        || p.values.iter().any(|row| row.iter().any(f))
+        || p.compound.iter().any(|(_, t)| plan_refs_range(t, r))
 }
 
 /// Whether plan `p`, planned against enclosing scopes that
@@ -440,7 +591,8 @@ pub fn result_affinity(plan: &SubPlan) -> Option<Affinity> {
 /// VALUES core's items carry none.
 pub fn item_result_affinity(r: &RExpr) -> Option<Affinity> {
     match r {
-        RExpr::Column(_, aff) | RExpr::Cast(_, aff) => Some(*aff),
+        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) => Some(*aff),
+        RExpr::Collate(x, _) => item_result_affinity(x),
         RExpr::Rowid(_) => Some(Affinity::Integer),
         _ => None,
     }
@@ -455,7 +607,7 @@ pub enum SubKind<'x> {
     In(&'x SubPlan),
 }
 
-fn is_rowid_name(b: &[u8]) -> bool {
+pub(crate) fn is_rowid_name(b: &[u8]) -> bool {
     eq_ci(b, b"rowid") || eq_ci(b, b"oid") || eq_ci(b, b"_rowid_")
 }
 
@@ -466,7 +618,18 @@ fn is_rowid_name(b: &[u8]) -> bool {
 /// may fall through to an enclosing scope. A group that *can*
 /// answer — including with an ambiguity or a missing column on
 /// a matched qualifier — answers definitively.
-fn resolve_column_in_group<E>(
+///
+/// An unqualified name follows the pin's `lookupName` rules
+/// (v0.16): real columns are matched across the group's
+/// sources left to right; a later source that has the name
+/// only as one of its USING (or NATURAL) columns does not make
+/// it ambiguous — after an INNER / LEFT join the left-most
+/// source keeps it, after a RIGHT join the right-most source
+/// takes it, and a FULL join gathers every such side into
+/// `coalesce(...)`. Only when no source has a real column so
+/// named does `rowid` (or `oid` / `_rowid_`) bind to the one
+/// source with a rowid — two such sources are ambiguous.
+pub(crate) fn resolve_column_in_group<E>(
     group: &ScopeGroup,
     table: Option<&[u8]>,
     name: &[u8],
@@ -476,14 +639,8 @@ fn resolve_column_in_group<E>(
             if !eq_ci(src.qualifier.as_slice(), q) {
                 continue;
             }
-            for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-                if eq_ci(cname.as_slice(), name) {
-                    return Some(Ok(if Some(ci) == src.rowid_alias {
-                        RExpr::Rowid(group.first_src + si)
-                    } else {
-                        RExpr::Column(group.offsets[si] + ci, *aff)
-                    }));
-                }
+            if let Some(ci) = src.column_index(name) {
+                return Some(Ok(src.column_ref(group, si, ci)));
             }
             if is_rowid_name(name) && src.has_rowid {
                 return Some(Ok(RExpr::Rowid(group.first_src + si)));
@@ -497,60 +654,288 @@ fn resolve_column_in_group<E>(
         }
         return None;
     }
+    let mut cnt = 0usize;
     let mut found: Option<RExpr> = None;
-    let mut ambiguous = false;
+    let mut full: AVec<RExpr> = AVec::new();
     for (si, src) in group.sources.iter().enumerate() {
-        let mut cand: Option<RExpr> = None;
-        for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-            if eq_ci(cname.as_slice(), name) {
-                cand = Some(if Some(ci) == src.rowid_alias {
-                    RExpr::Rowid(group.first_src + si)
-                } else {
-                    RExpr::Column(group.offsets[si] + ci, *aff)
-                });
-                break;
+        let Some(ci) = src.column_index(name) else {
+            continue;
+        };
+        if cnt > 0 {
+            if !src.uses(name) {
+                // A second real column not joined by USING:
+                // ambiguous (cnt passes 1, the coalesce is off).
+                full.clear();
+            } else if !src.kind.pads_left() {
+                // INNER / LEFT join: the left-most side stays.
+                continue;
+            } else if !src.kind.pads_right() {
+                // RIGHT join: the right-most side takes over.
+                cnt = 0;
+                full.clear();
+            } else if let Some(prev) = found.take() {
+                // FULL join: coalesce over both sides.
+                full.push(prev);
             }
         }
-        if cand.is_none() && is_rowid_name(name) && src.has_rowid {
-            cand = Some(RExpr::Rowid(group.first_src + si));
-        }
-        if let Some(c) = cand {
-            if found.is_some() {
-                ambiguous = true;
-            } else {
-                found = Some(c);
-            }
-        }
+        cnt += 1;
+        found = Some(src.column_ref(group, si, ci));
     }
-    if ambiguous {
-        return Some(Err(Error::Schema {
+    match (cnt, found) {
+        (1, Some(e)) => Some(Ok(e)),
+        (0, _) => {
+            if !is_rowid_name(name) {
+                return None;
+            }
+            let mut rowid: Option<RExpr> = None;
+            for (si, src) in group.sources.iter().enumerate() {
+                if src.has_rowid {
+                    if rowid.is_some() {
+                        return Some(Err(Error::Schema {
+                            kind: SchemaKind::AmbiguousColumn,
+                        }));
+                    }
+                    rowid = Some(RExpr::Rowid(group.first_src + si));
+                }
+            }
+            rowid.map(Ok)
+        }
+        (n, Some(last)) if full.len() + 1 == n => {
+            full.push(last);
+            Some(Ok(RExpr::Scalar(ScalarFn::Coalesce, full)))
+        }
+        _ => Some(Err(Error::Schema {
             kind: SchemaKind::AmbiguousColumn,
-        }));
+        })),
     }
-    found.map(Ok)
 }
 
 /// Resolve one column reference: the current query's sources
 /// first, then enclosing scopes nearest-first (v0.6 subquery
 /// shadowing). With no enclosing scopes this is exactly the
-/// pre-v0.6 rule.
+/// pre-v0.6 rule. v0.16: within each scope an unqualified name
+/// no source has falls back to that scope's result-column
+/// aliases (only filled under `v16`) before the next scope out.
 fn resolve_column<E>(
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Result<RExpr, E> {
-    if let Some(r) = resolve_column_in_group::<E>(cur, table, name) {
-        return r;
-    }
-    for g in enclosing {
+    #[cfg(not(feature = "v16"))]
+    for g in core::iter::once(cur).chain(enclosing.iter()) {
         if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
             return r;
+        }
+    }
+    #[cfg(feature = "v16")]
+    for (depth, g) in core::iter::once(cur).chain(enclosing.iter()).enumerate() {
+        if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
+            return r;
+        }
+        if table.is_none()
+            && let Some((_, e)) = g.aliases.iter().find(|(a, _)| eq_ci(a.as_slice(), name))
+        {
+            if depth == 0 {
+                return Ok(e.clone());
+            }
+            return alias_from_outer(e, cur, enclosing, depth);
         }
     }
     Err(Error::Schema {
         kind: SchemaKind::UnknownColumn,
     })
+}
+
+/// An alias of an enclosing query, referenced from a subquery
+/// `depth` scopes in (v0.16, `v16`). The alias's resolved item
+/// is reused, rebased onto the current evaluation row: its
+/// column refs into its own scope (and further out) keep their
+/// slots, but any subquery inside it was planned with its own
+/// rows numbered after its home scope, while here those rows
+/// are appended after every scope of `cur` / `enclosing` — so
+/// slots and rowid sources at or past the home stack's end
+/// move by the difference (review regression: they read the
+/// nested subquery's columns, silently wrong rows).
+///
+/// An alias whose item holds an aggregate (outside any nested
+/// subquery) is refused: on the pin the aggregate still belongs
+/// to the alias's own query (one value per outer group), which
+/// hipp cannot evaluate inside a subquery — cloning it here
+/// re-aggregated the subquery's rows (review regression).
+#[cfg(feature = "v16")]
+fn alias_from_outer<E>(
+    e: &RExpr,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    depth: usize,
+) -> Result<RExpr, E> {
+    if has_agg(e) {
+        return Err(Error::Unsupported);
+    }
+    let home = ScopeGroup::stack_end(enclosing.get(depth.saturating_sub(1)..).unwrap_or(&[]));
+    let (cw, cs) = cur.end();
+    let (ew, es) = ScopeGroup::stack_end(enclosing);
+    let by = (
+        cw.max(ew).saturating_sub(home.0),
+        cs.max(es).saturating_sub(home.1),
+    );
+    let mut out = e.clone();
+    shift_expr(&mut out, home, by);
+    Ok(out)
+}
+
+/// Move every column slot at or past `at.0` by `by.0` and every
+/// rowid source at or past `at.1` by `by.1`, through nested
+/// subquery plans (v0.16, `alias_from_outer`).
+#[cfg(feature = "v16")]
+fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
+    match e {
+        RExpr::Column(slot, ..) => {
+            if *slot >= at.0 {
+                *slot = slot.saturating_add(by.0);
+            }
+        }
+        RExpr::Rowid(src) => {
+            if *src >= at.1 {
+                *src = src.saturating_add(by.1);
+            }
+        }
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => shift_plan(p, at, by),
+        RExpr::InSub(x, p, _) => {
+            shift_expr(x, at, by);
+            shift_plan(p, at, by);
+        }
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => {}
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            shift_expr(a, at, by);
+            shift_expr(b, at, by);
+        }
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => shift_expr(a, at, by),
+        RExpr::InList(x, l, ..) => {
+            shift_expr(x, at, by);
+            for i in l.as_mut_slice() {
+                shift_expr(i, at, by);
+            }
+        }
+        RExpr::Between(x, a, b, _) => {
+            shift_expr(x, at, by);
+            shift_expr(a, at, by);
+            shift_expr(b, at, by);
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            for b in base.iter_mut().chain(otherwise.iter_mut()) {
+                shift_expr(b, at, by);
+            }
+            for (w, t) in whens.as_mut_slice() {
+                shift_expr(w, at, by);
+                shift_expr(t, at, by);
+            }
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
+            for a in args.as_mut_slice() {
+                shift_expr(a, at, by);
+            }
+        }
+    }
+}
+
+/// `shift_expr` over every part of a plan that indexes the
+/// combined row (LIMIT / OFFSET run against an empty row of
+/// their own and are left alone).
+#[cfg(feature = "v16")]
+fn shift_plan(p: &mut SubPlan, at: (usize, usize), by: (usize, usize)) {
+    for s in p.sources.as_mut_slice() {
+        if let Some(on) = &mut s.on {
+            shift_expr(on, at, by);
+        }
+        if let Some(d) = &mut s.derived {
+            shift_plan(d, at, by);
+        }
+    }
+    let exprs = p
+        .items
+        .as_mut_slice()
+        .iter_mut()
+        .chain(p.filter.iter_mut())
+        .chain(p.group_by.as_mut_slice().iter_mut())
+        .chain(p.having.iter_mut())
+        .chain(p.order_by.as_mut_slice().iter_mut().map(|(e, _)| e));
+    for e in exprs {
+        shift_expr(e, at, by);
+    }
+    for row in p.values.as_mut_slice() {
+        for e in row.as_mut_slice() {
+            shift_expr(e, at, by);
+        }
+    }
+    for (_, t) in p.compound.as_mut_slice() {
+        shift_plan(t, at, by);
+    }
+}
+
+/// Expand `*` (`qual` None) or `q.*` over a scope group (v0.4;
+/// USING-aware since v0.16, the pin's `selectExpander`) into
+/// `(item, result name)` pairs; returns
+/// whether any source matched (always true for `*` with
+/// sources). For an unqualified `*`, a joined source's USING /
+/// NATURAL columns are omitted — each shows once, at the
+/// left-most source's position. Under an unqualified `*`, a
+/// column of a source left of the FROM clause's last RIGHT /
+/// FULL join that some later source names in USING expands to
+/// the *unqualified* name, so it reads the joined value (the
+/// right side after a RIGHT join, `coalesce(...)` after a FULL
+/// one). `q.*` always reads `q`'s own columns (NULL on a row
+/// another source contributed alone): CI against the 3.54.1 pin
+/// (`SELECT a.* FROM a FULL JOIN b USING (id)` shows a NULL `id`
+/// on the b-only rows); the 3.53 stand-in read the joined value
+/// there too.
+pub fn expand_star<E>(
+    cur: &ScopeGroup,
+    qual: Option<&[u8]>,
+    out: &mut AVec<(RExpr, AVec<u8>)>,
+) -> Result<bool, E> {
+    let srcs = cur.sources.as_slice();
+    let last_right = srcs.iter().rposition(|s| s.kind.pads_left());
+    let mut hit = false;
+    for (si, src) in srcs.iter().enumerate() {
+        if let Some(q) = qual
+            && !eq_ci(src.qualifier.as_slice(), q)
+        {
+            continue;
+        }
+        hit = true;
+        for (ci, (cname, _)) in src.columns.iter().enumerate() {
+            let n = cname.as_slice();
+            if qual.is_none() && si > 0 && src.uses(n) {
+                continue;
+            }
+            let joined = qual.is_none()
+                && last_right.is_some_and(|r| si < r)
+                && srcs
+                    .get(si + 1..)
+                    .is_some_and(|rest| rest.iter().any(|s| s.uses(n)));
+            let e = if joined {
+                match resolve_column_in_group::<E>(cur, None, n) {
+                    Some(r) => r?,
+                    None => src.column_ref(cur, si, ci),
+                }
+            } else {
+                src.column_ref(cur, si, ci)
+            };
+            out.push((e, cname.clone()));
+        }
+    }
+    Ok(hit)
 }
 
 fn literal_value(arena: &Arena, lit: Literal) -> OwnedValue {
@@ -580,6 +965,42 @@ fn literal_value(arena: &Arena, lit: Literal) -> OwnedValue {
 pub type SubPlanner<'p, E> =
     &'p mut dyn FnMut(&crate::sql::SelectStmt, &ScopeGroup, &[ScopeGroup]) -> Result<SubPlan, E>;
 
+/// A scalar / EXISTS subquery reads at most its first row, and
+/// the pin (`sqlite3CodeSubselect`) rewrites its `LIMIT X` to
+/// `LIMIT (X <> 0)`, the `0` carrying NUMERIC affinity (v0.16,
+/// `v16`): `LIMIT 2.5`, `LIMIT 'x'` or `LIMIT x'00'` become
+/// `LIMIT 1` there instead of a datatype mismatch, `LIMIT '0'`
+/// stays `LIMIT 0`, and a NULL limit still errors. OFFSET is
+/// left alone, as are IN subqueries and derived tables.
+///
+/// Without a LIMIT of its own the subquery gets the pin's
+/// implicit integer `LIMIT 1`, which is what lets a UNION
+/// compound take the pin's first-row shortcut
+/// (`session::union_first_row`; v0.16, CI against the pin).
+#[cfg(feature = "v16")]
+fn first_row_limit(mut plan: SubPlan) -> SubPlan {
+    plan.limit = Some(match plan.limit.take() {
+        Some(x) => RExpr::Binary(
+            BinOp::Ne,
+            Box::new(x),
+            Box::new(RExpr::AffLiteral(OwnedValue::Integer(0), Affinity::Numeric)),
+        ),
+        None => RExpr::Literal(OwnedValue::Integer(1)),
+    });
+    plan
+}
+
+/// `first_row_limit` without `v16`: a LIMIT is an integer
+/// literal there, for which the `X <> 0` rewrite changes
+/// nothing; the implicit `LIMIT 1` still applies.
+#[cfg(not(feature = "v16"))]
+fn first_row_limit(mut plan: SubPlan) -> SubPlan {
+    if plan.limit.is_none() {
+        plan.limit = Some(RExpr::Literal(OwnedValue::Integer(1)));
+    }
+    plan
+}
+
 /// Resolve a parser `Expr` against the FROM sources, with no
 /// enclosing scope and no subquery support (v0.6 contexts that
 /// plan subqueries call `resolve_scoped` directly). Aggregate
@@ -599,11 +1020,7 @@ pub fn resolve<E>(
     for o in offsets {
         offs.push(*o);
     }
-    let cur = ScopeGroup {
-        sources: srcs,
-        offsets: offs,
-        first_src: 0,
-    };
+    let cur = ScopeGroup::new(srcs, offs, 0);
     let mut planner = |_: &crate::sql::SelectStmt,
                        _: &ScopeGroup,
                        _: &[ScopeGroup]|
@@ -624,6 +1041,11 @@ pub fn resolve_scoped<E>(
 ) -> Result<RExpr, E> {
     Ok(match expr {
         Expr::Literal(l) => RExpr::Literal(literal_value(arena, *l)),
+        // Only a stored schema text still holds a parameter here
+        // (a prepared statement's are bound away before planning,
+        // `session::bind_ast`); the pin reads one there as NULL.
+        #[cfg(feature = "params")]
+        Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
         Expr::Column { table, name } => resolve_column::<E>(
             cur,
             enclosing,
@@ -647,9 +1069,11 @@ pub fn resolve_scoped<E>(
                     kind: SchemaKind::ColumnCountMismatch,
                 });
             }
-            RExpr::SubScalar(Box::new(plan))
+            RExpr::SubScalar(Box::new(first_row_limit(plan)))
         }
-        Expr::ExistsSubquery(stmt) => RExpr::SubExists(Box::new(planner(stmt, cur, enclosing)?)),
+        Expr::ExistsSubquery(stmt) => {
+            RExpr::SubExists(Box::new(first_row_limit(planner(stmt, cur, enclosing)?)))
+        }
         Expr::Binary(op, l, r) => RExpr::Binary(
             *op,
             Box::new(resolve_scoped::<E>(
@@ -668,6 +1092,13 @@ pub fn resolve_scoped<E>(
             )?),
         ),
         Expr::Neg(e) => RExpr::Neg(Box::new(resolve_scoped::<E>(
+            e,
+            arena,
+            cur,
+            enclosing,
+            &mut *planner,
+        )?)),
+        Expr::Pos(e) => RExpr::Pos(Box::new(resolve_scoped::<E>(
             e,
             arena,
             cur,
@@ -712,6 +1143,7 @@ pub fn resolve_scoped<E>(
                 )?),
                 out,
                 *neg,
+                false,
             )
         }
         Expr::Between(x, lo, hi, neg) => RExpr::Between(
@@ -800,6 +1232,17 @@ pub fn resolve_scoped<E>(
                 &mut *planner,
             )?),
             crate::record::affinity_of(handle_bytes(arena, *ty)),
+        ),
+        #[cfg(feature = "v16")]
+        Expr::Collate(e, c) => RExpr::Collate(
+            Box::new(resolve_scoped::<E>(
+                e,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?),
+            *c,
         ),
         Expr::Func {
             name,
@@ -942,6 +1385,20 @@ fn resolve_func<E>(
         ScalarFn::Sign
     } else if eq_ci(name, b"iif") {
         ScalarFn::Iif
+    } else if cfg!(feature = "v16") && eq_ci(name, b"like") {
+        #[cfg(feature = "v16")]
+        {
+            ScalarFn::Like
+        }
+        #[cfg(not(feature = "v16"))]
+        return Err(Error::Unsupported);
+    } else if cfg!(feature = "v16") && eq_ci(name, b"glob") {
+        #[cfg(feature = "v16")]
+        {
+            ScalarFn::Glob
+        }
+        #[cfg(not(feature = "v16"))]
+        return Err(Error::Unsupported);
     } else {
         return Err(Error::Unsupported);
     };
@@ -954,6 +1411,10 @@ fn resolve_func<E>(
         ScalarFn::Replace => (3, 3),
         ScalarFn::Instr => (2, 2),
         ScalarFn::Iif => (3, 3),
+        #[cfg(feature = "v16")]
+        ScalarFn::Like => (2, 3),
+        #[cfg(feature = "v16")]
+        ScalarFn::Glob => (2, 2),
         ScalarFn::MinN | ScalarFn::MaxN => (2, usize::MAX),
         _ => (1, 1),
     };
@@ -982,8 +1443,13 @@ pub fn has_agg(e: &RExpr) -> bool {
         | RExpr::Rowid(_)
         | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => has_agg(a) || has_agg(b),
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => has_agg(a),
-        RExpr::InList(x, l, _) => has_agg(x) || l.iter().any(has_agg),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => has_agg(a),
+        RExpr::InList(x, l, ..) => has_agg(x) || l.iter().any(has_agg),
         RExpr::Between(x, a, b, _) => has_agg(x) || has_agg(a) || has_agg(b),
         RExpr::Like(a, b, _) => has_agg(a) || has_agg(b),
         RExpr::Case {
@@ -1016,10 +1482,13 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
             collect_aggs(a, out);
             collect_aggs(b, out);
         }
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
-            collect_aggs(a, out)
-        }
-        RExpr::InList(x, l, _) => {
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => collect_aggs(a, out),
+        RExpr::InList(x, l, ..) => {
             collect_aggs(x, out);
             for i in l.iter() {
                 collect_aggs(i, out);
@@ -1072,8 +1541,13 @@ pub fn has_sub(e: &RExpr) -> bool {
         | RExpr::Rowid(_)
         | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => has_sub(a) || has_sub(b),
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => has_sub(a),
-        RExpr::InList(x, l, _) => has_sub(x) || l.iter().any(has_sub),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => has_sub(a),
+        RExpr::InList(x, l, ..) => has_sub(x) || l.iter().any(has_sub),
         RExpr::Between(x, a, b, _) => has_sub(x) || has_sub(a) || has_sub(b),
         RExpr::Like(a, b, _) => has_sub(a) || has_sub(b),
         RExpr::Case {
@@ -1112,10 +1586,13 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
             collect_subs(a, out);
             collect_subs(b, out);
         }
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
-            collect_subs(a, out)
-        }
-        RExpr::InList(x, l, _) => {
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => collect_subs(a, out),
+        RExpr::InList(x, l, ..) => {
             collect_subs(x, out);
             for i in l.iter() {
                 collect_subs(i, out);
@@ -1162,6 +1639,27 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
 /// Rebuild `e` with every current-scope subquery node replaced
 /// by its computed value (v0.6): scalar / EXISTS results become
 /// literals, an IN subquery becomes an IN list of literals.
+/// The left operand of an IN subquery after substitution
+/// (v0.16): `sx` carrying the membership test's collation —
+/// the binary rule between the left operand and the
+/// subquery's result item (its rightmost core's, as on the
+/// pin) — as an explicit `Collate`, since the IN list it
+/// becomes compares by its left operand's collation alone.
+fn in_sub_lhs(x: &RExpr, plan: &SubPlan, sx: RExpr) -> RExpr {
+    let core = plan.compound.as_slice().last().map_or(plan, |(_, t)| t);
+    let item = core.items.as_slice().first().or_else(|| {
+        core.values
+            .as_slice()
+            .first()
+            .and_then(|r| r.as_slice().first())
+    });
+    let coll = match item {
+        Some(i) => binary_coll(x, i),
+        None => expr_coll(x).unwrap_or_default(),
+    };
+    RExpr::Collate(Box::new(sx), coll)
+}
+
 /// `values` is consumed in `collect_subs` order; the caller
 /// guarantees the counts match.
 pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
@@ -1177,8 +1675,8 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             *pos += 1;
             v
         }
-        RExpr::InSub(x, _, neg) => {
-            let sx = substitute(x, values, pos);
+        RExpr::InSub(x, plan, neg) => {
+            let sx = in_sub_lhs(x, plan, substitute(x, values, pos));
             let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
                 Some(a) => RExpr::AffLiteral(v.clone(), *a),
                 None => RExpr::Literal(v.clone()),
@@ -1198,7 +1696,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                 }
             };
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg)
+            RExpr::InList(Box::new(sx), list, *neg, true)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
@@ -1211,15 +1709,16 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             Box::new(substitute(b, values, pos)),
         ),
         RExpr::Neg(a) => RExpr::Neg(Box::new(substitute(a, values, pos))),
+        RExpr::Pos(a) => RExpr::Pos(Box::new(substitute(a, values, pos))),
         RExpr::Not(a) => RExpr::Not(Box::new(substitute(a, values, pos))),
         RExpr::IsNull(a, neg) => RExpr::IsNull(Box::new(substitute(a, values, pos)), *neg),
-        RExpr::InList(x, l, neg) => {
+        RExpr::InList(x, l, neg, sub) => {
             let sx = substitute(x, values, pos);
             let mut out = AVec::new();
             for i in l.iter() {
                 out.push(substitute(i, values, pos));
             }
-            RExpr::InList(Box::new(sx), out, *neg)
+            RExpr::InList(Box::new(sx), out, *neg, *sub)
         }
         RExpr::Between(x, a, b, neg) => RExpr::Between(
             Box::new(substitute(x, values, pos)),
@@ -1259,6 +1758,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             RExpr::Scalar(*f, out)
         }
         RExpr::Cast(a, aff) => RExpr::Cast(Box::new(substitute(a, values, pos)), *aff),
+        RExpr::Collate(a, c) => RExpr::Collate(Box::new(substitute(a, values, pos)), *c),
         RExpr::Agg {
             kind,
             distinct,
@@ -1295,10 +1795,13 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
         | RExpr::Rowid(_)
         | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => sub_in_agg_args(a) || sub_in_agg_args(b),
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
-            sub_in_agg_args(a)
-        }
-        RExpr::InList(x, l, _) => sub_in_agg_args(x) || l.iter().any(sub_in_agg_args),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => sub_in_agg_args(a),
+        RExpr::InList(x, l, ..) => sub_in_agg_args(x) || l.iter().any(sub_in_agg_args),
         RExpr::Between(x, a, b, _) => {
             sub_in_agg_args(x) || sub_in_agg_args(a) || sub_in_agg_args(b)
         }
@@ -1334,10 +1837,13 @@ pub fn collect_outer_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
             collect_outer_aggs(a, out);
             collect_outer_aggs(b, out);
         }
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
-            collect_outer_aggs(a, out)
-        }
-        RExpr::InList(x, l, _) => {
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => collect_outer_aggs(a, out),
+        RExpr::InList(x, l, ..) => {
             collect_outer_aggs(x, out);
             for i in l.iter() {
                 collect_outer_aggs(i, out);
@@ -1400,10 +1906,13 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
             collect_subs_outside_agg(a, out);
             collect_subs_outside_agg(b, out);
         }
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
-            collect_subs_outside_agg(a, out)
-        }
-        RExpr::InList(x, l, _) => {
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => collect_subs_outside_agg(a, out),
+        RExpr::InList(x, l, ..) => {
             collect_subs_outside_agg(x, out);
             for i in l.iter() {
                 collect_subs_outside_agg(i, out);
@@ -1478,8 +1987,12 @@ pub fn substitute_group(
             *pos += 1;
             v
         }
-        RExpr::InSub(x, _, neg) => {
-            let sx = substitute_group(x, values, pos, agg_values, agg_pos);
+        RExpr::InSub(x, plan, neg) => {
+            let sx = in_sub_lhs(
+                x,
+                plan,
+                substitute_group(x, values, pos, agg_values, agg_pos),
+            );
             let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
                 Some(a) => RExpr::AffLiteral(v.clone(), *a),
                 None => RExpr::Literal(v.clone()),
@@ -1499,7 +2012,7 @@ pub fn substitute_group(
                 }
             };
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg)
+            RExpr::InList(Box::new(sx), list, *neg, true)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
@@ -1514,6 +2027,9 @@ pub fn substitute_group(
         RExpr::Neg(a) => RExpr::Neg(Box::new(substitute_group(
             a, values, pos, agg_values, agg_pos,
         ))),
+        RExpr::Pos(a) => RExpr::Pos(Box::new(substitute_group(
+            a, values, pos, agg_values, agg_pos,
+        ))),
         RExpr::Not(a) => RExpr::Not(Box::new(substitute_group(
             a, values, pos, agg_values, agg_pos,
         ))),
@@ -1521,13 +2037,13 @@ pub fn substitute_group(
             Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
             *neg,
         ),
-        RExpr::InList(x, l, neg) => {
+        RExpr::InList(x, l, neg, sub) => {
             let sx = substitute_group(x, values, pos, agg_values, agg_pos);
             let mut out = AVec::new();
             for i in l.iter() {
                 out.push(substitute_group(i, values, pos, agg_values, agg_pos));
             }
-            RExpr::InList(Box::new(sx), out, *neg)
+            RExpr::InList(Box::new(sx), out, *neg, *sub)
         }
         RExpr::Between(x, a, b, neg) => RExpr::Between(
             Box::new(substitute_group(x, values, pos, agg_values, agg_pos)),
@@ -1574,6 +2090,10 @@ pub fn substitute_group(
         RExpr::Cast(a, aff) => RExpr::Cast(
             Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
             *aff,
+        ),
+        RExpr::Collate(a, c) => RExpr::Collate(
+            Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
+            *c,
         ),
     }
 }
@@ -1667,6 +2187,159 @@ pub fn to_number(v: &OwnedValue) -> Option<Num> {
     }
 }
 
+/// The pin's `sqlite3Atoi64` over text (v0.16): ASCII spaces,
+/// an optional sign, then the leading digits only — a `.` or an
+/// exponent ends the number (`'1e18'` is 1) — saturating at the
+/// i64 bounds. What the pin's `sqlite3VdbeIntValue` reads from
+/// a TEXT or BLOB: CAST(x AS INTEGER) and `%` operands.
+pub fn atoi_prefix(t: &[u8]) -> i64 {
+    let mut i = 0usize;
+    while t
+        .get(i)
+        .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+    {
+        i += 1;
+    }
+    let neg = t.get(i) == Some(&b'-');
+    if matches!(t.get(i), Some(b'-' | b'+')) {
+        i += 1;
+    }
+    // Accumulate the magnitude as a negative number, which holds
+    // i64::MIN exactly; saturate on overflow.
+    let mut v: i64 = 0;
+    let mut over = false;
+    while let Some(d) = t.get(i).filter(|c| c.is_ascii_digit()) {
+        match v
+            .checked_mul(10)
+            .and_then(|x| x.checked_sub(i64::from(d - b'0')))
+        {
+            Some(x) => v = x,
+            None => over = true,
+        }
+        i += 1;
+    }
+    match (neg, over) {
+        (true, true) => i64::MIN,
+        (false, true) => i64::MAX,
+        (true, false) => v,
+        (false, false) => v.checked_neg().unwrap_or(i64::MAX),
+    }
+}
+
+/// The integer the pin's `sqlite3VdbeIntValue` reads from a
+/// value (v0.16): reals truncate and clamp, text and blobs take
+/// their integer prefix (`atoi_prefix`).
+fn int_value(v: &OwnedValue) -> i64 {
+    match v {
+        OwnedValue::Null => 0,
+        OwnedValue::Integer(i) => *i,
+        OwnedValue::Real(r) => num_to_i64(Num::Real(*r)),
+        OwnedValue::Text(t) | OwnedValue::Blob(t) => atoi_prefix(t.as_slice()),
+    }
+}
+
+/// `round(r, n)` as the pin computes it (v0.16), for `n` in
+/// 0..=30: a value beyond ±2^52 has no fraction and stays; with
+/// `n` 0 it is `(double)(i64)(r ± 0.5)`; otherwise the pin prints
+/// `%!.*f` (the decimal expansion rounded half away from zero at
+/// `n` places, or at its 26th significant digit when that comes
+/// first) and reads the text back. Here the expansion is exact:
+/// `|r| * 10^n` as a 192-bit integer of 32-bit limbs.
+fn round_real(r: f64, n: i64) -> f64 {
+    const LIM: f64 = 4_503_599_627_370_496.0;
+    if r.is_nan() || !(-LIM..=LIM).contains(&r) {
+        return r;
+    }
+    if n <= 0 {
+        return (if r < 0.0 { r - 0.5 } else { r + 0.5 }) as i64 as f64;
+    }
+    let bits = r.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e) = if exp == 0 {
+        (frac, -1074i64)
+    } else {
+        (frac | (1u64 << 52), exp - 1075)
+    };
+    // An integral value (e >= 0) prints and reads back unchanged.
+    let Ok(k) = u32::try_from(-e) else {
+        return r;
+    };
+    if k == 0 {
+        return r;
+    }
+    // x = m * 10^n + 2^(k-1) < 2^154: six 32-bit limbs.
+    if k >= 154 {
+        // x < 2^153 <= 2^(k-1): rounds to 0.
+        return if r < 0.0 { -0.0 } else { 0.0 };
+    }
+    let mut x = [m as u32, (m >> 32) as u32, 0, 0, 0, 0];
+    for _ in 0..n {
+        let mut carry = 0u64;
+        for limb in x.iter_mut() {
+            let t = u64::from(*limb) * 10 + carry;
+            *limb = t as u32;
+            carry = t >> 32;
+        }
+    }
+    let mut carry = 1u64 << ((k - 1) % 32);
+    for limb in x.iter_mut().skip(((k - 1) / 32) as usize) {
+        let t = u64::from(*limb) + carry;
+        *limb = t as u32;
+        carry = t >> 32;
+    }
+    // D = x >> k, the value rounded half away from zero at n places.
+    let (lo, hi) = ((k / 32) as usize, k % 32);
+    let mut d = [0u32; 6];
+    for (i, slot) in d.iter_mut().enumerate() {
+        let a = u64::from(x.get(i + lo).copied().unwrap_or(0));
+        let b = u64::from(x.get(i + lo + 1).copied().unwrap_or(0));
+        *slot = (((b << 32) | a) >> hi) as u32;
+    }
+    // D's decimal digits, least significant first; more than 26
+    // means the pin rounds at its 26th significant digit, which
+    // reads back as `r` itself.
+    let mut digits = [0u8; 27];
+    let mut nd = 0usize;
+    while d.iter().any(|l| *l != 0) || nd == 0 {
+        let mut rem = 0u64;
+        for limb in d.iter_mut().rev() {
+            let cur = (rem << 32) | u64::from(*limb);
+            *limb = (cur / 10) as u32;
+            rem = cur % 10;
+        }
+        let Some(slot) = digits.get_mut(nd) else {
+            return r;
+        };
+        *slot = b'0' + rem as u8;
+        nd += 1;
+    }
+    // "[-]<digits>e-<n>", read back as the pin's AtoF reads it.
+    let mut buf = [0u8; 32];
+    let mut len = 0usize;
+    let mut push = |c: u8| {
+        if let Some(slot) = buf.get_mut(len) {
+            *slot = c;
+            len += 1;
+        }
+    };
+    if r < 0.0 {
+        push(b'-');
+    }
+    for c in digits.iter().take(nd).rev() {
+        push(*c);
+    }
+    push(b'e');
+    push(b'-');
+    if n >= 10 {
+        push(b'0' + (n / 10) as u8);
+    }
+    push(b'0' + (n % 10) as u8);
+    buf.get(..len)
+        .and_then(crate::sql::lexer::parse_real_signed)
+        .unwrap_or(r)
+}
+
 /// Truncating conversion to i64 with SQLite's clamping at the
 /// i64 bounds (CAST semantics for out-of-range reals).
 pub fn num_to_i64(n: Num) -> i64 {
@@ -1750,11 +2423,10 @@ pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {
             OwnedValue::Null => OwnedValue::Null,
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             OwnedValue::Real(r) => OwnedValue::Integer(num_to_i64(Num::Real(*r))),
+            // v0.16 fix: the integer prefix only, as the pin's
+            // `sqlite3Atoi64` (CAST('1e18' AS INTEGER) is 1).
             OwnedValue::Text(t) | OwnedValue::Blob(t) => {
-                OwnedValue::Integer(match parse_num_prefix(t.as_slice()) {
-                    Some(n) => num_to_i64(n),
-                    None => 0,
-                })
+                OwnedValue::Integer(atoi_prefix(t.as_slice()))
             }
         },
         Affinity::Real => match v {
@@ -1771,11 +2443,18 @@ pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {
         Affinity::Numeric => match v {
             OwnedValue::Null => OwnedValue::Null,
             OwnedValue::Integer(_) | OwnedValue::Real(_) => v.clone(),
+            // The pin's `sqlite3VdbeMemNumerify` (v0.16 fix): an
+            // integer-shaped prefix that fits i64 is that
+            // INTEGER; any other number is an INTEGER only when it
+            // is integral and |x| < 2^51 (`sqlite3RealSameAsInt`),
+            // else a REAL — CAST('9223372036854775808' AS NUMERIC)
+            // and CAST('1e18' AS NUMERIC) are REALs.
             OwnedValue::Text(t) | OwnedValue::Blob(t) => match parse_num_prefix(t.as_slice()) {
                 Some(Num::Int(i)) => OwnedValue::Integer(i),
                 Some(Num::Real(r)) => {
+                    const TWO_51: f64 = 2_251_799_813_685_248.0;
                     let i = num_to_i64(Num::Real(r));
-                    if (i as f64) == r {
+                    if (-TWO_51..TWO_51).contains(&r) && (i as f64) == r {
                         OwnedValue::Integer(i)
                     } else {
                         OwnedValue::Real(r)
@@ -1837,9 +2516,11 @@ fn class_of_affinity(aff: Affinity) -> CmpClass {
 
 fn cmp_class(e: &RExpr) -> CmpClass {
     match e {
-        RExpr::Column(_, aff) | RExpr::Cast(_, aff) | RExpr::AffLiteral(_, aff) => {
+        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) | RExpr::AffLiteral(_, aff) => {
             class_of_affinity(*aff)
         }
+        // COLLATE is transparent to affinity (the pin's EP_Skip).
+        RExpr::Collate(x, _) => cmp_class(x),
         // A rowid reference behaves as an INTEGER-affinity
         // column (oracle-probed: `rowid = '1'` matches rowid 1).
         RExpr::Rowid(_) => CmpClass::Numeric,
@@ -1870,6 +2551,18 @@ fn adjust_cmp(l: &RExpr, r: &RExpr, lv: OwnedValue, rv: OwnedValue) -> (OwnedVal
     (lv, rv)
 }
 
+/// The affinity conversion of a written `IN (list)` test
+/// (v0.16): the left operand's comparison affinity applies to
+/// both values; a left operand without one converts nothing.
+fn adjust_in(x: &RExpr, xv: OwnedValue, iv: OwnedValue) -> (OwnedValue, OwnedValue) {
+    let aff = match cmp_class(x) {
+        CmpClass::Numeric => Affinity::Numeric,
+        CmpClass::Text => Affinity::Text,
+        CmpClass::Blob | CmpClass::None => return (xv, iv),
+    };
+    (apply_cmp_affinity(xv, aff), apply_cmp_affinity(iv, aff))
+}
+
 fn apply_cmp_affinity(v: OwnedValue, aff: Affinity) -> OwnedValue {
     match aff {
         Affinity::Integer | Affinity::Real | Affinity::Numeric => match &v {
@@ -1891,18 +2584,217 @@ pub fn values_equal_is(a: &OwnedValue, b: &OwnedValue) -> bool {
     compare_values(&a.as_value(), &b.as_value()) == core::cmp::Ordering::Equal
 }
 
+/// `values_equal_is` under a collating sequence (v0.16).
+pub fn values_equal_coll(a: &OwnedValue, b: &OwnedValue, c: Coll) -> bool {
+    compare_coll(&a.as_value(), &b.as_value(), c) == core::cmp::Ordering::Equal
+}
+
+// ---------------- collating sequences (v0.16) ----------------
+
+/// Whether an explicit `COLLATE` occurs in `e` outside any
+/// subquery (the pin's `EP_Collate` flag, which every parent
+/// node inherits from its operands and arguments).
+pub fn has_explicit_coll(e: &RExpr) -> bool {
+    let f = has_explicit_coll;
+    match e {
+        RExpr::Collate(..) => true,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, ..)
+        | RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _)
+        | RExpr::Cast(x, _) => f(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(f)
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_deref().is_some_and(f)
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().any(f),
+    }
+}
+
+/// The operand an explicit collation is inherited from (the
+/// pin's `sqlite3ExprCollSeq` descent): the left operand when
+/// it carries one, else the first argument / list item that
+/// does, else the right operand. LIKE is the pin's
+/// `like(pattern, subject)` call, so its pattern comes first.
+fn explicit_child(e: &RExpr) -> Option<&RExpr> {
+    let f = has_explicit_coll;
+    let first = |l: &'_ [RExpr]| -> Option<usize> { l.iter().position(f) };
+    match e {
+        RExpr::InSub(x, ..)
+        | RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _) => Some(x),
+        RExpr::Binary(_, a, b) => Some(if f(a) { a } else { b }),
+        RExpr::Like(x, p, _) => Some(if f(p) { p } else { x }),
+        RExpr::InList(x, l, ..) => {
+            if f(x) {
+                Some(x)
+            } else {
+                first(l.as_slice()).and_then(|i| l.as_slice().get(i))
+            }
+        }
+        RExpr::Between(x, a, b, _) => Some(if f(x) {
+            x
+        } else if f(a) {
+            a
+        } else {
+            b
+        }),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            if let Some(b) = base.as_deref().filter(|b| f(b)) {
+                return Some(b);
+            }
+            for (w, t) in whens.iter() {
+                if f(w) {
+                    return Some(w);
+                }
+                if f(t) {
+                    return Some(t);
+                }
+            }
+            otherwise.as_deref()
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
+            first(args.as_slice()).and_then(|i| args.as_slice().get(i))
+        }
+        _ => None,
+    }
+}
+
+/// The collating sequence an expression carries (v0.16, the
+/// pin's `sqlite3ExprCollSeq`): a column's own (BINARY when it
+/// declares none — still a collation, so it beats a literal),
+/// an explicit `COLLATE`'s, through CAST, else the one an
+/// explicit `COLLATE` inside the expression lends it; `None`
+/// for anything else (literals, functions, the rowid, scalar
+/// subqueries).
+pub fn expr_coll(e: &RExpr) -> Option<Coll> {
+    let mut p = e;
+    loop {
+        match p {
+            RExpr::Column(_, _, c) => return *c,
+            RExpr::Collate(_, c) => return Some(*c),
+            RExpr::Cast(x, _) | RExpr::Pos(x) => p = x,
+            _ if has_explicit_coll(p) => p = explicit_child(p)?,
+            _ => return None,
+        }
+    }
+}
+
+/// The collation of a binary comparison `l <op> r` (v0.16, the
+/// pin's `sqlite3BinaryCompareCollSeq`): an explicit collation
+/// on the left, else one on the right, else the left operand's
+/// column collation, else the right's, else BINARY.
+pub fn binary_coll(l: &RExpr, r: &RExpr) -> Coll {
+    if has_explicit_coll(l) {
+        expr_coll(l)
+    } else if has_explicit_coll(r) {
+        expr_coll(r)
+    } else {
+        expr_coll(l).or_else(|| expr_coll(r))
+    }
+    .unwrap_or_default()
+}
+
+/// The collation a collation-sensitive function or aggregate
+/// uses (v0.16; the pin's `SQLITE_FUNC_NEEDCOLL` rule for
+/// min / max / nullif): the first argument that has one.
+pub fn args_coll(args: &[RExpr]) -> Coll {
+    args.iter().find_map(expr_coll).unwrap_or_default()
+}
+
+/// Each expression's collation, BINARY when it has none
+/// (v0.16): the per-term collations of GROUP BY, DISTINCT and
+/// compound result columns.
+pub fn exprs_colls(es: &[RExpr]) -> AVec<Coll> {
+    let mut out = AVec::new();
+    for e in es {
+        out.push(expr_coll(e).unwrap_or_default());
+    }
+    out
+}
+
+/// Whether `e` is constant (v0.16): it reads no column, rowid,
+/// subquery or aggregate (a VALUES core of constant rows is the
+/// pin's co-routine; see `session::core_colls`).
+pub fn is_constant(e: &RExpr) -> bool {
+    match e {
+        RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
+        RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_)
+        | RExpr::InSub(..)
+        | RExpr::Agg { .. } => false,
+        RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _)
+        | RExpr::Cast(x, _)
+        | RExpr::Collate(x, _) => is_constant(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => is_constant(a) && is_constant(b),
+        RExpr::InList(x, l, ..) => is_constant(x) && l.iter().all(is_constant),
+        RExpr::Between(x, a, b, _) => is_constant(x) && is_constant(a) && is_constant(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_none_or(is_constant)
+                && whens.iter().all(|(w, t)| is_constant(w) && is_constant(t))
+                && otherwise.as_deref().is_none_or(is_constant)
+        }
+        RExpr::Scalar(_, args) => args.iter().all(is_constant),
+    }
+}
+
+/// The collation of an IN list's membership test (v0.16): the
+/// left operand's alone (explicit `COLLATE`, else its column's),
+/// never an item's. CI against the 3.54.1 pin: `'A' IN ('a'
+/// COLLATE NOCASE)` is 0 there; the 3.53 stand-in rewrote a single
+/// constant item to `x = +item` and gave 1 (the binary rule). That
+/// a single item's column collation is ignored too is inferred.
+fn in_list_coll(x: &RExpr) -> Coll {
+    expr_coll(x).unwrap_or_default()
+}
+
 fn cmp_op<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     let lv = eval::<E>(l, ctx)?;
     let rv = eval::<E>(r, ctx)?;
     let (lv, rv) = adjust_cmp(l, r, lv, rv);
+    // v0.16: the comparison's collating sequence (column
+    // COLLATE clauses used to be ignored).
+    let coll = binary_coll(l, r);
     if matches!(op, BinOp::Is | BinOp::IsNot) {
-        let eq = values_equal_is(&lv, &rv);
+        let eq = values_equal_coll(&lv, &rv, coll);
         return Ok(bool_val(if op == BinOp::Is { eq } else { !eq }));
     }
     if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
         return Ok(OwnedValue::Null);
     }
-    let ord = compare_values(&lv.as_value(), &rv.as_value());
+    let ord = compare_coll(&lv.as_value(), &rv.as_value(), coll);
     use core::cmp::Ordering::*;
     let b = match op {
         BinOp::Eq => ord == Equal,
@@ -1923,24 +2815,31 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
         if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
             return Ok(OwnedValue::Null);
         }
-        let blob = matches!(lv, OwnedValue::Blob(_)) || matches!(rv, OwnedValue::Blob(_));
+        // Always TEXT, blob operands included (the pin's
+        // OP_Concat; v0.16 — hipp answered a BLOB).
         let mut out = to_text(&lv).unwrap_or_default();
         out.extend_from_slice(to_text(&rv).unwrap_or_default().as_slice());
-        return Ok(if blob {
-            OwnedValue::Blob(out)
-        } else {
-            OwnedValue::Text(out)
-        });
+        return Ok(OwnedValue::Text(out));
     }
     let (Some(a), Some(b)) = (to_number(&lv), to_number(&rv)) else {
         return Ok(OwnedValue::Null);
     };
     if matches!(op, BinOp::Mod) {
-        let (x, y) = (num_to_i64(a), num_to_i64(b));
+        // The pin's OP_Remainder (v0.16 fix): two INTEGER-classed
+        // operands give an INTEGER; otherwise each operand's
+        // integer value (`int_value`: a text operand's integer
+        // *prefix*) is taken and the result is a REAL.
+        if let (Num::Int(x), Num::Int(y)) = (a, b) {
+            if y == 0 {
+                return Ok(OwnedValue::Null);
+            }
+            return Ok(OwnedValue::Integer(x.wrapping_rem(y)));
+        }
+        let (x, y) = (int_value(&lv), int_value(&rv));
         if y == 0 {
             return Ok(OwnedValue::Null);
         }
-        return Ok(OwnedValue::Integer(x.wrapping_rem(y)));
+        return Ok(OwnedValue::Real(x.wrapping_rem(y) as f64));
     }
     if matches!(op, BinOp::Div) {
         return Ok(match (a, b) {
@@ -1988,44 +2887,221 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
     }))
 }
 
-/// SQLite LIKE matching: `%` any run, `_` exactly one character;
-/// ASCII case-insensitive. Works on characters, not bytes, for
-/// text values.
-fn like_match(text: &[u8], pat: &[u8]) -> bool {
-    // Decode both as char vectors (lossy on invalid UTF-8, which
-    // SQLite would treat byte-wise; ASCII corpora agree).
-    let t: AVec<char> = {
-        let mut v = AVec::new();
-        for c in core::str::from_utf8(text).unwrap_or("").chars() {
-            v.push(c);
-        }
-        v
-    };
-    let p: AVec<char> = {
-        let mut v = AVec::new();
-        for c in core::str::from_utf8(pat).unwrap_or("").chars() {
-            v.push(c);
-        }
-        v
-    };
-    fn inner(t: &[char], p: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        match p[0] {
-            '%' => {
-                for k in 0..=t.len() {
-                    if inner(&t[k..], &p[1..]) {
-                        return true;
-                    }
+/// Decode text the way the pin's `sqlite3Utf8Read` walks a
+/// LIKE / GLOB operand (v0.16): the value ends at its first
+/// NUL byte (the pin reads it as a C string); a lead byte >=
+/// 0xC0 takes every following continuation byte; overlong
+/// forms, surrogates and U+FFFE / U+FFFF read as U+FFFD;
+/// stray continuation and ASCII bytes read as themselves.
+fn pattern_chars(b: &[u8]) -> AVec<u32> {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    let b = b.get(..end).unwrap_or(&[]);
+    let mut out = AVec::new();
+    let mut i = 0;
+    while let Some(&c0) = b.get(i) {
+        i += 1;
+        let mut c = u32::from(c0);
+        if c >= 0xc0 {
+            // `sqlite3Utf8Trans1`: the lead byte's payload bits.
+            c = match c0 {
+                0xc0..=0xdf => c - 0xc0,
+                0xe0..=0xef => c - 0xe0,
+                0xf0..=0xf7 => c - 0xf0,
+                0xf8..=0xfb => c - 0xf8,
+                0xfc..=0xfd => c - 0xfc,
+                _ => 0,
+            };
+            while let Some(&n) = b.get(i) {
+                if n & 0xc0 != 0x80 {
+                    break;
                 }
-                false
+                c = c.wrapping_shl(6) | u32::from(n & 0x3f);
+                i += 1;
             }
-            '_' => !t.is_empty() && inner(&t[1..], &p[1..]),
-            c => !t.is_empty() && t[0].eq_ignore_ascii_case(&c) && inner(&t[1..], &p[1..]),
+            if c < 0x80 || (c & 0xFFFF_F800) == 0xD800 || (c & 0xFFFF_FFFE) == 0xFFFE {
+                c = 0xFFFD;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The pin's `compareInfo` (v0.16): the wildcard characters
+/// (0 = disabled), the escape / class character, and whether
+/// ASCII letters match case-insensitively.
+#[derive(Clone, Copy)]
+struct PatInfo {
+    all: u32,
+    one: u32,
+    /// LIKE's ESCAPE character, GLOB's `[` (0: none).
+    other: u32,
+    /// `other` opens a character class (GLOB) rather than
+    /// escaping the next character (LIKE).
+    set: bool,
+    nocase: bool,
+}
+
+fn fold(c: u32) -> u32 {
+    if (u32::from(b'A')..=u32::from(b'Z')).contains(&c) {
+        c + 32
+    } else {
+        c
+    }
+}
+
+/// Whether the single-character pattern element at `pat[p]`
+/// matches `ch`; `Some(len)` gives the element's length in
+/// pattern characters. A lone trailing escape and an
+/// unterminated class never match (the pin's NOMATCH).
+fn element_match(pat: &[u32], p: usize, ch: Option<u32>, info: PatInfo) -> Option<usize> {
+    let c = *pat.get(p)?;
+    let ch = ch?;
+    if info.other != 0 && c == info.other {
+        if !info.set {
+            let lit = *pat.get(p + 1)?;
+            let ok = lit == ch || (info.nocase && lit < 0x80 && ch < 0x80 && fold(lit) == fold(ch));
+            return ok.then_some(2);
+        }
+        // A GLOB class `[...]`: `^` inverts, a leading `]` is a
+        // member, `a-z` is a range unless the `-` is last.
+        let at = |q: usize| pat.get(q).copied();
+        let mut q = p + 1;
+        let (mut seen, mut invert, mut prior) = (false, false, 0u32);
+        let mut c2 = at(q);
+        q += 1;
+        if c2 == Some(u32::from(b'^')) {
+            invert = true;
+            c2 = at(q);
+            q += 1;
+        }
+        if c2 == Some(u32::from(b']')) {
+            seen = ch == u32::from(b']');
+            c2 = at(q);
+            q += 1;
+        }
+        while let Some(x) = c2 {
+            if x == u32::from(b']') {
+                break;
+            }
+            if x == u32::from(b'-') && at(q).is_some_and(|n| n != u32::from(b']')) && prior > 0 {
+                let hi = at(q).unwrap_or(0);
+                q += 1;
+                if ch >= prior && ch <= hi {
+                    seen = true;
+                }
+                prior = 0;
+            } else {
+                if ch == x {
+                    seen = true;
+                }
+                prior = x;
+            }
+            c2 = at(q);
+            q += 1;
+        }
+        return (c2.is_some() && seen != invert).then_some(q - p);
+    }
+    if c == ch || (info.nocase && c < 0x80 && ch < 0x80 && fold(c) == fold(ch)) {
+        return Some(1);
+    }
+    (info.one != 0 && c == info.one).then_some(1)
+}
+
+/// The pin's `patternCompare` (v0.16; v0.4 had a recursive
+/// LIKE-only matcher that read invalid UTF-8 as empty and ran
+/// in exponential time). Every pattern element but the
+/// all-wildcard matches exactly one character, so the classic
+/// single-backtrack-point scan decides exactly what the pin's
+/// recursive search decides, iteratively and in O(n*m).
+fn pattern_match(pat: &[u32], s: &[u32], info: PatInfo) -> bool {
+    let (mut p, mut i) = (0usize, 0usize);
+    let mut back: Option<(usize, usize)> = None;
+    loop {
+        if let Some(&c) = pat.get(p) {
+            if info.all != 0 && c == info.all {
+                p += 1;
+                back = Some((p, i));
+                continue;
+            }
+            if let Some(n) = element_match(pat, p, s.get(i).copied(), info) {
+                p += n;
+                i += 1;
+                continue;
+            }
+        } else if i >= s.len() {
+            return true;
+        }
+        match back {
+            Some((bp, bi)) if bi < s.len() => {
+                back = Some((bp, bi + 1));
+                p = bp;
+                i = bi + 1;
+            }
+            _ => return false,
         }
     }
-    inner(t.as_slice(), p.as_slice())
+}
+
+/// The pin's `likeFunc` (v0.16): `like(pattern, subject[,
+/// escape])` / `glob(pattern, subject)`, and the LIKE / GLOB
+/// operators built on them. A pattern over 50,000 bytes is
+/// `PatternTooComplex`; a NULL escape gives NULL, one that is
+/// not exactly one character `EscapeNotSingleChar` (both
+/// checked before the NULL operands); a NULL pattern or subject
+/// gives NULL. LIKE folds ASCII letters only (`'ä' LIKE 'Ä'`
+/// is 0, as on the pin).
+pub fn like_glob<E>(
+    pat: &OwnedValue,
+    subject: &OwnedValue,
+    esc: Option<&OwnedValue>,
+    glob: bool,
+) -> Result<OwnedValue, E> {
+    if to_text(pat).map_or(0, |t| t.len()) > 50_000 {
+        return Err(Error::Schema {
+            kind: SchemaKind::PatternTooComplex,
+        });
+    }
+    let mut info = if glob {
+        PatInfo {
+            all: u32::from(b'*'),
+            one: u32::from(b'?'),
+            other: u32::from(b'['),
+            set: true,
+            nocase: false,
+        }
+    } else {
+        PatInfo {
+            all: u32::from(b'%'),
+            one: u32::from(b'_'),
+            other: 0,
+            set: false,
+            nocase: true,
+        }
+    };
+    if let Some(e) = esc {
+        let Some(t) = to_text(e) else {
+            return Ok(OwnedValue::Null);
+        };
+        let chars = pattern_chars(t.as_slice());
+        let [c] = chars.as_slice() else {
+            return Err(Error::Schema {
+                kind: SchemaKind::EscapeNotSingleChar,
+            });
+        };
+        info.other = *c;
+        if *c == info.all {
+            info.all = 0;
+        }
+        if *c == info.one {
+            info.one = 0;
+        }
+    }
+    let (Some(p), Some(x)) = (to_text(pat), to_text(subject)) else {
+        return Ok(OwnedValue::Null);
+    };
+    let (p, x) = (pattern_chars(p.as_slice()), pattern_chars(x.as_slice()));
+    Ok(bool_val(pattern_match(p.as_slice(), x.as_slice(), info)))
 }
 
 /// Number of Unicode characters in a text value (blob length is
@@ -2069,7 +3145,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             let (a, b) = (&v[0], &v[1]);
             if !matches!(a, OwnedValue::Null)
                 && !matches!(b, OwnedValue::Null)
-                && values_equal_is(a, b)
+                && values_equal_coll(a, b, args_coll(args))
             {
                 OwnedValue::Null
             } else {
@@ -2088,13 +3164,27 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             t.extend_from_slice(name);
             OwnedValue::Text(t)
         }
-        ScalarFn::Abs => match to_number(&v[0]) {
-            None => OwnedValue::Null,
-            Some(Num::Int(i)) => match i.checked_abs() {
+        // The pin's absFunc (v0.16): an INTEGER stays INTEGER —
+        // i64::MIN is "integer overflow" —, a REAL stays REAL, and
+        // TEXT / BLOB convert to REAL (`abs('5')` is 5.0).
+        ScalarFn::Abs => match &v[0] {
+            OwnedValue::Null => OwnedValue::Null,
+            OwnedValue::Integer(i) => match i.checked_abs() {
                 Some(a) => OwnedValue::Integer(a),
-                None => OwnedValue::Real(-(i as f64)),
+                None => {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::IntegerOverflow,
+                    });
+                }
             },
-            Some(Num::Real(r)) => OwnedValue::Real(if r < 0.0 { -r } else { r }),
+            other => {
+                let r = match to_number(other) {
+                    Some(Num::Int(i)) => i as f64,
+                    Some(Num::Real(r)) => r,
+                    None => 0.0,
+                };
+                OwnedValue::Real(if r < 0.0 { -r } else { r })
+            }
         },
         ScalarFn::Length => {
             if matches!(v[0], OwnedValue::Null) {
@@ -2154,30 +3244,15 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             let Some(n) = to_number(&v[0]) else {
                 return Ok(OwnedValue::Null);
             };
-            let digits = if v.len() > 1 {
-                match to_number(&v[1]) {
-                    Some(m) => num_to_i64(m),
-                    None => return Ok(OwnedValue::Null),
-                }
-            } else {
-                0
+            // The digit count is read as the pin's
+            // `sqlite3_value_int64` reads it (a text's integer
+            // prefix: '1e1' is 1), then clamped to 0..=30.
+            let digits = match v.get(1) {
+                None => 0,
+                Some(OwnedValue::Null) => return Ok(OwnedValue::Null),
+                Some(d) => int_value(d).clamp(0, 30),
             };
-            let x = n.as_f64();
-            // A negative digit count behaves as 0 in SQLite (its
-            // scale factor loop simply never runs).
-            let mut mult = 1.0f64;
-            let mut d = digits;
-            while d > 0 {
-                mult *= 10.0;
-                d -= 1;
-            }
-            let scaled = x * mult;
-            let rounded = if scaled >= 0.0 {
-                (scaled + 0.5) as i64 as f64
-            } else {
-                (scaled - 0.5) as i64 as f64
-            };
-            OwnedValue::Real(rounded / mult)
+            OwnedValue::Real(round_real(n.as_f64(), digits))
         }
         ScalarFn::Substr => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
@@ -2186,30 +3261,28 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             let Some(text) = to_text(&v[0]) else {
                 return Ok(OwnedValue::Null);
             };
-            let Some(start_n) = to_number(&v[1]) else {
-                return Ok(OwnedValue::Null);
-            };
-            let mut start = num_to_i64(start_n);
+            // Start and length are read as the pin's
+            // `sqlite3_value_int64` reads them: a text's integer
+            // prefix ('1e1' is 1), a real truncated.
+            let mut start = int_value(&v[1]);
             let ranges = char_ranges(text.as_slice());
             let n = ranges.len() as i64;
-            let mut len: i64 = if v.len() > 2 {
-                match to_number(&v[2]) {
-                    Some(m) => num_to_i64(m),
-                    None => return Ok(OwnedValue::Null),
-                }
-            } else {
-                n
+            // Two-argument form: the implicit length is i64::MAX
+            // (pinned on 3.54.1 by a CI probe grid — e.g.
+            // substr(x, -9223372036854775808) keeps all but the last
+            // character, substr(x, -27) on 26 characters keeps all).
+            let mut len: i64 = match v.get(2) {
+                Some(m) => int_value(m),
+                None => i64::MAX,
             };
             // SQLite's substr coordinate rules (verified
             // against the oracle, incl. negative lengths: a
-            // negative length counts back from the start point).
+            // negative length counts back from the start point),
+            // saturating at the i64 bounds.
             if start < 0 {
-                start += n;
+                start = start.saturating_add(n);
                 if start < 0 {
-                    len += start;
-                    if len < 0 {
-                        len = 0;
-                    }
+                    len = len.saturating_add(start).max(0);
                     start = 0;
                 }
             } else if start > 0 {
@@ -2218,24 +3291,22 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 len -= 1;
             }
             if len < 0 {
-                len = -len;
-                start -= len;
+                len = len.saturating_neg();
+                start = start.saturating_sub(len);
                 if start < 0 {
-                    len += start;
-                    if len < 0 {
-                        len = 0;
-                    }
+                    len = len.saturating_add(start).max(0);
                     start = 0;
                 }
             }
-            if start + len > n {
-                len = n - start;
-            }
+            let end = start.saturating_add(len).min(n);
             let mut out = AVec::new();
             for (i, (bs, be)) in ranges.iter().enumerate() {
                 let idx = i as i64;
-                if idx >= start && idx < start + len {
-                    out.extend_from_slice(&text.as_slice()[*bs..*be]);
+                if idx >= start
+                    && idx < end
+                    && let Some(piece) = text.as_slice().get(*bs..*be)
+                {
+                    out.extend_from_slice(piece);
                 }
             }
             match v[0] {
@@ -2325,6 +3396,10 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             }
             OwnedValue::Integer(found)
         }
+        #[cfg(feature = "v16")]
+        ScalarFn::Like | ScalarFn::Glob => {
+            like_glob::<E>(&v[0], &v[1], v.get(2), f == ScalarFn::Glob)?
+        }
         ScalarFn::Iif => {
             if truthy(&v[0]) == Some(true) {
                 v[1].clone()
@@ -2336,11 +3411,16 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
                 OwnedValue::Null
             } else {
+                // v0.16: the first argument's collation decides,
+                // and a tie keeps the earlier argument for max()
+                // but takes the later one for min() — the pin's
+                // `minmaxFunc` (`min(1, 1.0)` is 1.0).
+                let coll = args_coll(args);
                 let mut best = v[0].clone();
                 for x in &v[1..] {
-                    let ord = compare_values(&x.as_value(), &best.as_value());
+                    let ord = compare_coll(&x.as_value(), &best.as_value(), coll);
                     let take = if f == ScalarFn::MinN {
-                        ord == core::cmp::Ordering::Less
+                        ord != core::cmp::Ordering::Greater
                     } else {
                         ord == core::cmp::Ordering::Greater
                     };
@@ -2401,7 +3481,7 @@ fn eval_agg<E>(
         }
         arg_rows.push(vs);
     }
-    eval_agg_values::<E>(kind, distinct, star, arg_rows.as_slice())
+    eval_agg_values::<E>(kind, distinct, star, arg_rows.as_slice(), args_coll(args))
 }
 
 /// Fold one aggregate over precomputed per-row argument
@@ -2416,6 +3496,7 @@ pub fn eval_agg_values<E>(
     distinct: bool,
     star: bool,
     arg_rows: &[AVec<OwnedValue>],
+    coll: Coll,
 ) -> Result<OwnedValue, E> {
     match kind {
         AggKind::Count => {
@@ -2430,7 +3511,7 @@ pub fn eval_agg_values<E>(
                     continue;
                 }
                 if distinct {
-                    if seen.iter().any(|s| values_equal_is(s, val)) {
+                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
                         continue;
                     }
                     seen.push(val.clone());
@@ -2451,7 +3532,7 @@ pub fn eval_agg_values<E>(
                     continue;
                 }
                 if distinct {
-                    if seen.iter().any(|s| values_equal_is(s, val)) {
+                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
                         continue;
                     }
                     seen.push(val.clone());
@@ -2511,7 +3592,7 @@ pub fn eval_agg_values<E>(
                     continue;
                 }
                 if distinct {
-                    if seen.iter().any(|s| values_equal_is(s, &val)) {
+                    if seen.iter().any(|s| values_equal_coll(s, &val, coll)) {
                         continue;
                     }
                     seen.push(val.clone());
@@ -2519,7 +3600,7 @@ pub fn eval_agg_values<E>(
                 best = Some(match best {
                     None => val,
                     Some(b) => {
-                        let ord = compare_values(&val.as_value(), &b.as_value());
+                        let ord = compare_coll(&val.as_value(), &b.as_value(), coll);
                         let take = if kind == AggKind::Min {
                             ord == core::cmp::Ordering::Less
                         } else {
@@ -2541,7 +3622,7 @@ pub fn eval_agg_values<E>(
                     continue;
                 }
                 if distinct {
-                    if seen.iter().any(|s| values_equal_is(s, val)) {
+                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
                         continue;
                     }
                     seen.push(val.clone());
@@ -2575,7 +3656,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
         RExpr::AffLiteral(v, _) => v.clone(),
-        RExpr::Column(i, _) => ctx
+        RExpr::Column(i, ..) => ctx
             .row()
             .vals
             .as_slice()
@@ -2587,6 +3668,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             _ => OwnedValue::Null,
         },
         RExpr::OutRef(_) => return Err(Error::Unsupported),
+        RExpr::Pos(x) => eval::<E>(x, ctx)?,
         RExpr::Neg(x) => match to_number(&eval::<E>(x, ctx)?) {
             None => OwnedValue::Null,
             Some(Num::Int(i)) => match i.checked_neg() {
@@ -2634,19 +3716,37 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                 arith::<E>(*op, l, r, ctx)?
             }
         },
-        RExpr::InList(x, list, neg) => {
+        // An empty set is FALSE for IN (TRUE for NOT IN) even
+        // when the left operand is NULL (v0.16, pin-probed:
+        // `NULL IN (SELECT a FROM empty)` is 0, not NULL — the
+        // shape `x IN emptytable` exposed it).
+        RExpr::InList(_, list, neg, _) if list.is_empty() => bool_val(*neg),
+        RExpr::InList(x, list, neg, from_sub) => {
             let xv = eval::<E>(x, ctx)?;
             let mut any_null = matches!(xv, OwnedValue::Null);
             let mut hit = false;
+            let coll = in_list_coll(x);
             for item in list.iter() {
                 let iv = eval::<E>(item, ctx)?;
-                // Comparison-affinity adjustment mirrors `=`.
-                let (a, b) = adjust_cmp(x, item, xv.clone(), iv);
+                // An IN (SELECT ...) substitution compares like
+                // `=` (the item carries the subquery column's
+                // affinity). A written list converts both sides
+                // by the LEFT operand's affinity only, as the
+                // pin's OP_Eq / ephemeral-index path does: an
+                // operand without affinity converts nothing,
+                // whatever the items declare (v0.16, probed:
+                // with d no affinity, e INTEGER, f TEXT holding
+                // '1'/1/'1', d IN (e) and 1 IN (f) are 0).
+                let (a, b) = if *from_sub {
+                    adjust_cmp(x, item, xv.clone(), iv)
+                } else {
+                    adjust_in(x, xv.clone(), iv)
+                };
                 if matches!(a, OwnedValue::Null) || matches!(b, OwnedValue::Null) {
                     any_null = true;
                     continue;
                 }
-                if compare_values(&a.as_value(), &b.as_value()) == core::cmp::Ordering::Equal {
+                if compare_coll(&a.as_value(), &b.as_value(), coll) == core::cmp::Ordering::Equal {
                     hit = true;
                     break;
                 }
@@ -2680,12 +3780,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Like(x, p, neg) => {
             let xv = eval::<E>(x, ctx)?;
             let pv = eval::<E>(p, ctx)?;
-            if matches!(xv, OwnedValue::Null) || matches!(pv, OwnedValue::Null) {
-                OwnedValue::Null
-            } else {
-                let xt = to_text(&xv).unwrap_or_default();
-                let pt = to_text(&pv).unwrap_or_default();
-                bool_val(like_match(xt.as_slice(), pt.as_slice()) != *neg)
+            match like_glob::<E>(&pv, &xv, None, false)? {
+                OwnedValue::Integer(m) => bool_val((m != 0) != *neg),
+                other => other,
             }
         }
         RExpr::Case {
@@ -2710,7 +3807,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                         let (bv2, wv2) = adjust_cmp(b, w, bv.clone(), wv);
                         if !matches!(bv2, OwnedValue::Null)
                             && !matches!(wv2, OwnedValue::Null)
-                            && values_equal_is(&bv2, &wv2)
+                            && values_equal_coll(&bv2, &wv2, binary_coll(b, w))
                         {
                             out = eval::<E>(t, ctx)?;
                             done = true;
@@ -2735,6 +3832,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         }
         RExpr::Scalar(f, args) => eval_scalar::<E>(*f, args.as_slice(), ctx)?,
         RExpr::Cast(x, aff) => cast_value(&eval::<E>(x, ctx)?, *aff),
+        RExpr::Collate(x, _) => eval::<E>(x, ctx)?,
         RExpr::Agg {
             kind,
             distinct,
@@ -2767,4 +3865,64 @@ pub fn eval_const<E>(expr: &Expr, arena: &Arena) -> Result<OwnedValue, E> {
     }
     let empty = RowData::empty();
     eval::<E>(&r, &Ctx::Row(&empty))
+}
+
+/// Compare two ORDER BY key values under one term's direction
+/// (v0.16): NULLs go first or last as the term says (SQLite's
+/// default is NULL-smallest, i.e. first ascending and last
+/// descending); any other pair compares by the storage-class
+/// ordering, reversed for DESC.
+pub fn order_cmp(a: &OwnedValue, b: &OwnedValue, o: SortOrder) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (matches!(a, OwnedValue::Null), matches!(b, OwnedValue::Null)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if o.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if o.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let c = compare_coll(&a.as_value(), &b.as_value(), o.coll);
+            if o.desc { c.reverse() } else { c }
+        }
+    }
+}
+
+/// Lexicographic ORDER BY comparison of two key rows (v0.16):
+/// `order_cmp` per term, first difference wins.
+pub fn order_keys_cmp(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+    dirs: impl Iterator<Item = SortOrder>,
+) -> core::cmp::Ordering {
+    for ((x, y), o) in a.iter().zip(b.iter()).zip(dirs) {
+        let c = order_cmp(x, y, o);
+        if c != core::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
+/// A LIMIT / OFFSET value as the pin's `OP_MustBeInt` takes it
+/// (v0.16): NUMERIC affinity first (`'2'`, `' 2 '`, `'2.0'`,
+/// `2.0` become 2), then the value must be an integer — NULL,
+/// a blob, non-numeric text, or a real with a fractional part
+/// or outside the i64 range is a datatype mismatch.
+pub fn limit_int<E>(v: OwnedValue) -> Result<i64, E> {
+    match apply_affinity(v, Affinity::Numeric) {
+        OwnedValue::Integer(i) => Ok(i),
+        _ => Err(Error::Schema {
+            kind: SchemaKind::DatatypeMismatch,
+        }),
+    }
 }

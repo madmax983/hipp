@@ -4,6 +4,1194 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.16 — SQLite-parity push
+
+Milestone v0.16 closes as much of the gap with the pin as
+possible under ADR 0001 (silent wrong answers fixed ungated;
+new surface behind the `v16` rung or a leaf feature; the tiny
+profile never grows). Each unit of the push records itself
+below.
+
+### CI vs the real pin (2026-11-02)
+
+The local oracle was a stand-in (a CLI list-mode shim over
+Python's bundled SQLite **3.53.1**); CI's first run against the
+real **3.54.1** pin failed wave 1's new tests on five
+behaviours. What CI showed, what changed, and what is inferred:
+
+- **REAL → text** (ungated; tiny path). CI showed the pin's CLI
+  list mode prints a REAL exactly as its core REAL → TEXT
+  conversion (CAST AS TEXT) does, and 3.53's conversion gives
+  the same strings. hipp-cli's `fmt_real` and the test helper
+  in `tests/params_v16.rs` had their own `%!.15g`; both now call
+  `record::render_real`, the one source of truth. That function
+  was correctly rounded and so differed from the pin on about 9%
+  of random doubles (`574.423710258671` is `574.42371025867101`
+  there). It is now fitted **clean-room from oracle output
+  only** (no SQLite source): `lexer::pin_digits` reproduces the
+  pin's 18 or 19 internal digits (shown by `printf('%!.26g')`):
+  scale by `10^(17 - floor(log10 2^e))` with that power of ten
+  truncated to a 64-bit mantissa, round half up. Matched on
+  120 000 random doubles before any rendering was fitted. The
+  short-or-17 choice was fitted next: 13 truncated digits when
+  they read back and digits 14..16 are `000` or the scale was
+  downward; else, when digits 15..16 are `99`, the 14-digit
+  rounding when it reads back; else 17 digits, half up from the
+  18/19 (a double rounding, as on the pin:
+  `-589569.98659691867`). Corpus: 4.2 M doubles through the
+  Python model and **2 M through hipp's SQL path, 0
+  mismatches** against the stand-in core (random bit patterns,
+  subnormals, 1–17-digit decimals and their neighbours, integers
+  near 2^53 / 2^63 / 10^k, powers of ten, halfway cases).
+  `tests/real_text_v16.rs` keeps 4 000 of them (scalable with
+  `HIPP_REAL_CORPUS`) plus the CI goldens. Inferred: that the
+  3.54.1 core equals the 3.53.1 core here (CI's strings all
+  agreed; the corpus runs live against the pin in CI). `parse_real`
+  and the read-back test now share `lexer::int_pow10_to_f64`,
+  which is why tiny got smaller (−48 B).
+- **IN-list collation** (ungated). `'A' IN ('a' COLLATE NOCASE)`
+  is 0 on the pin, 1 on 3.53 (which rewrote one constant item
+  to `x = +item`). An IN list now uses only its left operand's
+  collation, explicit or column. Inferred: a single item's
+  column collation is ignored too.
+- **UNION with LIMIT 1** (ungated, v0.9 compound path). CI:
+  `SELECT a FROM t LIMIT (SELECT 2 UNION SELECT 1)` keeps 2 rows
+  on the pin (the scalar subquery is 2, not the sorted 1). The
+  3.54.0 release notes say "UNION queries with a LIMIT of exactly
+  1 are now handled faster". hipp now takes the first row in
+  left-to-right core order when every operator is UNION, there
+  is no ORDER BY and no OFFSET, and the LIMIT is the integer
+  literal 1. A scalar or EXISTS subquery with no LIMIT of its
+  own now gets that literal (`query::first_row_limit`); EXISTS
+  values do not change. Pinned by CI: the scalar-subquery case.
+  Inferred, and checked live on CI by `pin_inferred`: the
+  written `LIMIT 1`; that mixed UNION / UNION ALL / EXCEPT
+  chains, `LIMIT +1`, bound limits and a subquery's own `LIMIT X`
+  (the pin's `X <> 0` rewrite) keep the sorted answer.
+- **`q.*` over RIGHT / FULL USING** (ungated). CI:
+  `SELECT a.* FROM a FULL JOIN b USING (id)` shows a NULL `id`
+  on the b-only rows, so `a.*` reads a's own columns. 3.53 read
+  the coalesced value. Qualified `q.*` now always expands to q's
+  own columns. Unqualified `*` and an unqualified `id` coalesce
+  as before (CI agreed on those). Inferred, and checked live on
+  CI: the RIGHT JOIN and NATURAL RIGHT / FULL forms.
+- **`.schema` view comment** (hipp-cli). The pin prints
+  `/* v(a,"+b",b,Q) */`. A column name now prints bare only if
+  it is a plain identifier (ASCII letter or `_`, then letters,
+  digits or `_`) and not an SQL keyword. Otherwise it is
+  double-quoted, with `"` doubled. Inferred: keyword quoting,
+  using SQLite's documented list of 147 keywords.
+
+Tests for the three engine behaviours that changed assert the
+pin's answer. Against the live oracle when it is the pin;
+otherwise against the CI-recorded goldens (`pin`), or, for the
+inferred neighbours, against rows derived from the evidenced
+rule (`pin_inferred`, labelled so). **Size:** tiny **75,960 B**
+(Δ **−48 B**, ratchet lowered); full **291,531 B** (Δ **+264 B**,
+ratchet raised to it: the UNION first-row rule, the
+`first_row_limit` literal, the reworked digits).
+Left open: round() still reads the exact decimal expansion
+rather than `pin_digits` (see the bound-parameters gaps).
+
+### Joins, ordering and query-shape completion (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated (below). Census (158 probes): MATCH 53 → 61,
+silent-wrong DIFF 8 → 4 (the four left — CHECK, generated
+columns, expression DEFAULTs, column COLLATE — belong to
+other units).
+
+**Shipped — ungated (fixes on claimed v0.4 paths):**
+
+- **RIGHT / FULL [OUTER] JOIN.** `RIGHT`, `FULL` and
+  `NATURAL` were eaten as a table *alias*, so `a RIGHT JOIN b`
+  ran as an inner join. They are now join keywords (never a
+  bare alias, as on the pin), parsed with SQLite's
+  `sqlite3JoinType` algebra (LEFT+RIGHT = FULL, OUTER only
+  qualifies an outer join, `INNER OUTER` / `LEFT CROSS` /
+  bare `OUTER` refused — `ParseKind::UnknownJoinType`).
+  Executor: the main nested loop in FROM order, then each
+  RIGHT / FULL source — earlier first — emits its
+  never-matched rows in its own row order, NULL-padded on the
+  left and joined onward. One async join executor now serves
+  top-level queries, subqueries and UPDATE ... FROM (three
+  copies merged; `SourcePlan` is `query::SubSource`); the
+  synchronous v0.4 path got the same tail.
+- **NATURAL / USING** (`SchemaKind::UsingColumnMissing`,
+  `ParseKind::NaturalJoinConstraint`, ambiguity as on the
+  pin): `SELECT *` shows a join column once, at the left-most
+  source; unqualified references follow the pin's
+  `lookupName` (left-most side after INNER/LEFT, right side
+  after RIGHT, `coalesce(...)` after FULL); unqualified `*`
+  over a source left of a RIGHT/FULL join reads the joined value
+  (`a.*` reads a's own columns on the 3.54.1 pin — see "CI vs
+  the real pin"); qualified `t.col` still reads its own side.
+- **ON clauses naming a later source:** an inner join's ON is
+  hoisted into WHERE (hipp read a NULL slot and dropped every
+  row); on an outer join, or anywhere once a RIGHT/FULL join
+  exists, `SchemaKind::OnReferencesLaterSource`.
+- **Subquery inside a non-last source's ON** read misaligned
+  slots (wrong rows): the row is now padded to the full FROM
+  width for such an ON, and scope bases are computed from
+  each group's end slot (needed by UPDATE ... FROM, whose
+  FROM clause is now its own join scope: its ON / USING never
+  see the target, as on the pin).
+- **ORDER BY ... NULLS FIRST / LAST** was parsed and ignored
+  (and `NULLS` alone accepted): honoured at every ORDER BY
+  site — queries, compound ORDER BY, subqueries, derived
+  tables, INSERT ... SELECT.
+- **Term rules:** out-of-range ORDER BY / GROUP BY ordinals
+  error (`TermOutOfRange`; the pin's 32-bit "is integer" test
+  — `ORDER BY 2147483648` stays a constant); HAVING has no
+  ordinals (`HAVING 1` read item 1); a real column shadows an
+  alias in GROUP BY / HAVING (not ORDER BY); aggregates in
+  GROUP BY (`MisusedAggregate`); HAVING on a non-aggregate
+  query (`HavingWithoutAggregate`).
+- **IN over an empty set** is 0 (NOT IN 1) even for a NULL
+  left operand (hipp gave NULL); a real column named `rowid`
+  now beats another source's rowid instead of "ambiguous".
+
+**Shipped — `v16` (new rung, `v16 = ["v10"]`, in `full`):**
+LIMIT / OFFSET as expressions (constant or uncorrelated
+subquery, both `LIMIT x OFFSET y` and `LIMIT y, x`; resolved
+against an empty scope like the pin; value via the pin's
+`MustBeInt` — NUMERIC affinity then lossless integer, else
+`DatatypeMismatch`, raised even over no rows; negative LIMIT
+= none, negative OFFSET = 0; windows saturate instead of
+wrapping on 32-bit targets); result-column aliases inside
+WHERE / ON / GROUP BY / HAVING / ORDER BY expressions and
+their subqueries (current scope's columns, then its aliases,
+then outer scopes; never in the result list itself);
+`x [NOT] IN tablename` (one-column tables); string-literal
+aliases (`AS 'q'`, bare `'q'`).
+
+**Review fixes (second pass, same day):**
+
+- *v16 alias with a subquery, used from a nested subquery
+  with its own FROM* (silent wrong rows): the alias's item was
+  cloned with its subquery slots numbered for its home scope,
+  but evaluated after the nested sources. It is now rebased
+  onto the deeper row (`query::alias_from_outer` /
+  `shift_expr`: slots and rowid sources at or past the home
+  stack's end move by the difference).
+- *v16 aliased aggregate inside a subquery* (HAVING / ORDER
+  BY re-aggregated the subquery's rows): refused
+  (`Error::Unsupported`) — on the pin the aggregate stays
+  the outer group's value, which hipp cannot evaluate inside
+  a subquery. In WHERE both engines refuse.
+- *Compound ORDER BY* (ungated): terms now resolve per core
+  as in the pin's `resolveCompoundOrderBy` — an `AS` name,
+  else the term resolved in that core's FROM scope alone and
+  matched to the item that is the same reference
+  (`CompKeys`; replaces the `(qualifier, name)` keys). After
+  `RIGHT JOIN ... USING (id)`, `ORDER BY id` is `b.id`; after
+  FULL, `coalesce(a.id, b.id)`; `ORDER BY b.id` is accepted
+  and `a.id` refused there. Also fixes older acceptances: an
+  ambiguous bare name (`FROM a, b ... ORDER BY id`) and an
+  expression item's text used as a name now error, as on the
+  pin.
+- *Duplicate column names* (ungated): a derived table's and
+  a view's duplicates become `id`, `id:1`, ... (the pin's
+  `sqlite3ColumnsFromExprList`, shared with CTAS's
+  `rules::unique_names`), so NATURAL / USING over such a
+  derived table no longer drops the later columns from
+  `SELECT *`, and `"id:1"` resolves.
+- *View column lists* (ungated, `.schema` comment and
+  `ViewDef.columns`): NATURAL / USING columns once, `t.*`
+  unaffected, duplicates renamed.
+- *v16 scalar / EXISTS LIMIT*: the pin's `LIMIT (X<>0)`
+  rewrite (the `0` with NUMERIC affinity): `LIMIT 2.5`,
+  `'x'`, `x'00'`, `9223372036854775808` act as `LIMIT 1`,
+  `'0'` as 0, NULL still errors; OFFSET, IN subqueries and
+  derived tables keep `MustBeInt`.
+- *INSERT ... SELECT upsert quirk* (ungated): the refusal now
+  only covers an `ON` that could still start the last
+  source's join constraint; a last join with ON / USING, and
+  GROUP BY / HAVING, terminate the FROM clause and are
+  accepted, as on the pin (the ON-terminated form was found
+  while probing the USING one).
+- *UPDATE ... FROM repeating the target* (ungated): the
+  same table under the same alias (or both bare) is
+  `SchemaKind::UpdateTargetInFrom`, as on the pin; `FROM t AS
+  t`, `FROM t AS t2` and `UPDATE t AS q ... FROM t` still run.
+- *Schema qualifiers* (ungated, tiny included): `name()`
+  dropped any qualifier, so `temp.s` / `foo.s` (including the
+  new `x IN temp.s`) read `main.s` and `CREATE TABLE temp.q`
+  wrote a main table; anything but `main.` is now
+  `ParseKind::UnsupportedClause`.
+
+**Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
+not error text): the pin always runs the RIGHT/FULL join's
+left operand as the outer loop (EXPLAIN shows `RIGHT-JOIN b`
+after the main loop) and emits unmatched right rows in scan
+order — so unordered two-table RIGHT / FULL joins are
+compared row-for-row, while generated multi-way corpora are
+ORDER BY'd over every column (the planner may reorder inner
+joins). The USING / star / coalesce rules were derived from
+probes of every INNER/LEFT/RIGHT/FULL pairing in 2- and
+3-way chains (`a.* FROM a FULL JOIN b USING(id)` really
+yields `coalesce(a.id, b.id)`). LIMIT: `'2'`, `' 2 '`,
+`'2.0'`, `2.0`, `-0.0`, `true` convert; `2.5`, `NULL`,
+`'0x10'`, `1e19`, blobs do not; `LIMIT t.a` is "no such
+column" even inside a correlated subquery. Aliases: `WHERE`
+sees them, `ON` too (`ON k=u.a` substitutes `k` and then
+reports `a` ambiguous), the result list never; `GROUP BY b`
+with alias `b` and column `b` groups by the column. Review
+pass: `UPDATE t ... FROM t` and `UPDATE t AS x ... FROM t AS
+x` error, `FROM t AS t` runs (the rule compares table and
+alias); `INSERT ... SELECT ... JOIN b ON ... ON CONFLICT` and
+`... GROUP BY ... ON CONFLICT` parse; `VALUES (1),(2) UNION
+SELECT 3 ORDER BY column1` matches the VALUES head's names.
+
+**Gates:** `ci/local-gates.sh` (full run) green — fmt,
+clippy `-D warnings` (default, all-features, every
+`ci/feature-sets.txt` line incl. the new `v16`), workspace
+tests, no_std builds (thumbv7em / thumbv6m / riscv32imac /
+wasm32, both profiles), both size gates. New suites:
+`tests/query_shape_v16.rs` (27 tests: RIGHT/FULL orders and
+chains, outer joins in subqueries / derived tables / INSERT
+... SELECT / UPDATE ... FROM, NATURAL/USING rows and star
+expansion, affinity, error agreement, ON forward references,
+ON-subquery alignment, rowid precedence, NULLS at every site,
+term rules, empty IN, a PRNG-generated join corpus, and the
+`v16` LIMIT / alias / IN-table tests, plus one regression
+test per review finding — nested alias rebasing with a
+PRNG-generated alias corpus, aggregate-alias refusal,
+per-core compound ORDER BY, duplicate derived names, the
+subquery LIMIT rewrite, upsert after terminated FROM
+clauses, UPDATE ... FROM target repeats, schema qualifiers;
+each of the nine fails on 1248d47) and
+`hipp-cli/tests/cli_v16_query_shape.rs` (4 byte-identical
+batches, one-shot and stdin, REAL / blob rendering included,
+plus the views' `.schema` column lists).
+
+**Size:** tiny **81,616 B** (Δ **−64 B** vs 81,680; ratchet
+lowered — the AST change from literal LIMIT integers to
+expression handles shortened the legacy constructor paths);
+full **257,117 B** (Δ **+652 B** vs 256,465, ratchet raised:
+the RIGHT/FULL tail, USING/NATURAL planning, alias scopes and
+LIMIT evaluation, mostly paid for by merging the three
+duplicated join executors and the duplicated
+`plan_query` / `plan_subquery` bodies into `plan_core`).
+Review pass, vs 1248d47 (after the column-constraints unit):
+tiny **81,564 B** (Δ **+40 B** vs 81,524, ratchet raised —
+justified as a correctness fix on the tiny profile's own
+CREATE TABLE / INSERT / scan SELECT paths: the parser's
+`name()` silently turned `temp.t` into `main.t`; the other
+review fixes are compiled out of tiny); full **279,455 B**
+(Δ **+3,328 B** vs 276,127, ratchet raised: alias rebasing,
+per-core compound ORDER BY keys, the subquery LIMIT rewrite,
+view / derived name dedupe and the UPDATE ... FROM check).
+
+**Honest gaps:**
+
+- Output order where the pin's order is a planner accident
+  (inner joins it reorders, an index-driven RIGHT-join tail
+  scan) is not reproduced; hipp has no index-driven join
+  planning, so tests ORDER BY there.
+- An aggregate inside a subquery whose arguments name only
+  outer columns belongs to the *outer* query on the pin
+  (`SELECT (SELECT max(t.a) FROM u) FROM t` is one row; with
+  an alias, `WHERE z = (SELECT max(z) ...)` is a misuse
+  error); hipp still aggregates it in the subquery. Found
+  while probing aliases; a subquery-scoping fix outside this
+  unit. The same machinery is why an *aliased aggregate*
+  used inside a subquery (`HAVING (SELECT c) > 1`,
+  `ORDER BY (SELECT c)`) is refused rather than answered —
+  the pin runs those.
+- Compound ORDER BY terms are an ordinal or a (qualified)
+  column name; the pin also matches a general expression
+  term against an identical item (`SELECT a+0 ... UNION ...
+  ORDER BY a+0`), which hipp still refuses.
+- Out of scope, found by the review (older behaviour, still
+  open): ~~`x'01' || x'01'` is BLOB in hipp, TEXT on the pin~~
+  (fixed by the column-constraints review pass, below);
+  with min()/max() plus another aggregate the pin still takes
+  bare columns from the extremum row, hipp's `pick_rep` only
+  for a lone min/max. A three-part `main.t.col` reference is
+  refused.
+- ~~`-9223372036854775808` is an INTEGER literal on the pin and
+  a REAL in hipp~~ — fixed by the column-constraints review pass
+  (below).
+- `x IN view` (and NATURAL / USING with a view) stays refused:
+  views are inert.
+- Parenthesised join groups (`FROM (a JOIN b USING (id))`)
+  are still refused; LIMIT on UPDATE / DELETE is a
+  compile-time option the pin's CLI build lacks.
+- Probed on the local 3.53.1 stand-in; nothing relied on is
+  known to differ in 3.54.1, and CI runs the real pin.
+
+### Column constraints and table definitions (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated (below). Census (158 probes): MATCH 61 → 66,
+silent-wrong DIFF 4 → 1 (CHECK, expression DEFAULTs and
+generated columns fixed; column COLLATE belongs to another
+unit). A new module `src/rules.rs` (built with `v04`) holds
+the rule planner and the row codec; the catalog keeps each
+rule as SQL text and every write re-resolves it.
+
+**Shipped — ungated wherever the v0.4 evaluator is built
+(fixes on claimed paths):**
+
+- **CHECK constraints** (column-level, table-level,
+  `CONSTRAINT name CHECK`) — parsed and ignored before —
+  enforced on INSERT (VALUES / SELECT / REPLACE), UPDATE
+  (incl. FROM) and the upsert DO UPDATE row, with the pin's
+  rules: a NULL result passes; the expression reads
+  affinity-converted values and the final rowid (an `INTEGER
+  PRIMARY KEY` CHECK sees the auto-assigned rowid); OR IGNORE
+  skips the row, every other action errors
+  (`SchemaKind::CheckViolation`) — OR REPLACE does not resolve
+  a CHECK; the DO UPDATE row errors even under OR IGNORE, the
+  proposal is checked before arbitration (OR IGNORE skips it
+  wholesale). Order: NOT NULL, generated columns, STRICT, CHECK,
+  then uniqueness. An UPDATE (and DO UPDATE) checks NOT NULL
+  only on assigned columns and evaluates a CHECK only when it
+  reads an assigned column, a generated column computed from
+  one, or a changed rowid — the pin's optimisation, observable
+  on rows written under `ignore_check_constraints`. CREATE
+  TABLE refuses what the pin refuses: subqueries
+  (`SubqueryInConstraint`), aggregates (`MisusedAggregate`),
+  unknown columns / functions.
+- **DEFAULT values:** `DEFAULT (1+2)` used to store 1 (the
+  parser kept the first literal); `-'3'`, `-x'01'`, `DEFAULT
+  identifier`, CURRENT_TIME / DATE / TIMESTAMP used to read
+  NULL. Expression defaults are now re-parsed and evaluated:
+  constant ones are folded once at catalog build (so short
+  records, CREATE INDEX and every reader see the pin's value);
+  ones naming the clock — or failing, e.g. an unknown function
+  — are evaluated per statement only when a row needs them (an
+  unknown function errors at that INSERT, as on the pin, and
+  not at CREATE). A column reference or subquery is refused at
+  CREATE (`NotConstantDefault`). The clock is a new
+  `Config::clock(fn() -> i64)` hook (Unix ms; read at most once
+  per statement, formatted UTC with seconds truncated);
+  without one a statement that needs it fails with the new
+  `Error::NoClock`. ALTER TABLE ADD COLUMN takes only the pin's
+  `sqlite3ValueFromExpr` shape (a literal, possibly signed or
+  CAST: `-'3'` adds, `(1+2)` / CURRENT_TIMESTAMP do not), and a
+  short record now reads the default *with the column's
+  affinity* (`ADD COLUMN c INT DEFAULT '5'` reads 5, hipp
+  returned '5' — fixed in every profile).
+- **Generated columns** (`GENERATED ALWAYS AS (expr)` and `AS
+  (expr)`, VIRTUAL / STORED) — parsed as part of the declared
+  type and read as NULL before: computed in dependency order
+  with the column's affinity; VIRTUAL columns are absent from
+  the record, STORED ones stored in place — the pin's
+  `sqlite3TableColumnToStorage` layout, verified both ways
+  (hipp-written files read and pass `integrity_check` on the
+  oracle, oracle-written files read, update and index
+  correctly in hipp). INSERT without a column list supplies the
+  non-generated columns; naming a generated column in INSERT /
+  UPDATE / DO UPDATE is `GeneratedColumnWrite`; SELECT `*`,
+  RETURNING and `excluded.*` include them; indexes and UNIQUE
+  constraints on them (VIRTUAL included) are maintained;
+  UPDATE recomputes them; NOT NULL / CHECK apply to them.
+  Definition errors as on the pin: loops
+  (`GeneratedColumnLoop`), DEFAULT / PRIMARY KEY on one, a
+  qualified name, a table of only generated columns
+  (`InvalidGeneratedColumn`), `rowid` (no such column),
+  subqueries, aggregates. ALTER TABLE ADD COLUMN takes VIRTUAL
+  ones (not STORED, `CannotAddColumn`), verifying existing rows
+  against a generated NOT NULL column and the table's CHECKs
+  (the pin's post-ADD `quick_check`).
+- **UPDATE ... FROM** applies only the *last* matching FROM
+  combination per target row (found while probing CHECK): the
+  pin materialises the join keyed by target rowid, so earlier
+  combinations are never checked — hipp used to apply each in
+  turn (same final value, but NOT NULL / CHECK fired on the
+  earlier ones). "Last" is in hipp's join order (FROM order,
+  rowid scans), which is the pin's for scans; where the pin
+  builds an automatic index for an equality join it is that
+  index's order instead (a choice SQLite documents as
+  arbitrary — see the gaps). `FROM s RETURNING ...` no longer aliases `s`
+  as RETURNING.
+- **Rowid values** convert like the pin's MustBeInt in INSERT,
+  UPDATE and DO UPDATE: `'8'`, `9.0`, `' 10 '`, `'1e2'` are
+  rowids (they were a datatype mismatch) — fixed in every
+  profile.
+- **Tiny profile:** the parser refuses (new
+  `ParseKind::RequiresEvaluator`) every CHECK, generated column
+  and non-literal DEFAULT instead of ignoring it; it still
+  takes literal defaults, bare or parenthesised, signed, TRUE /
+  FALSE / NULL and `DEFAULT "quoted"`. Replacing the derived
+  `PartialEq for Tok` with discriminant / `matches!` tests (it
+  was instantiated for `Option<Tok>` comparisons) paid for it.
+
+**Shipped — `v16`:** `INSERT INTO t DEFAULT VALUES` (with
+RETURNING; no column list, no ON CONFLICT, as on the pin);
+`CREATE TABLE ... AS SELECT` with the pin's column names
+(alias, else the column's name — `rowid` or the rowid-alias
+column's name for a rowid reference — else the expression
+text; duplicates `:1`, `:2`, `:3`), declared types from
+`sqlite3ExprAffinity` (a scalar subquery's first column's;
+the pin's compound demotion / FLEXNUM) and its
+`createTableStmt` text byte for byte (keyword quoting from the
+pin's 147-keyword list, the 50-byte one-line threshold); and
+STRICT tables (`STRICT` / `STRICT, STRICT` table options;
+INT / INTEGER / REAL / TEXT / BLOB / ANY, case-insensitive,
+else `StrictColumnType`; ANY has no affinity; a value the
+type's affinity cannot convert is `StrictTypeViolation` under
+every conflict action, generated columns included; checked
+after NOT NULL and before CHECK; ALTER verifies existing rows).
+WITHOUT ROWID stays refused.
+
+**Review fixes (second pass, same day):**
+
+- *Malformed constraint lists* (corruption, every profile): the
+  column parser scanned an item for keywords, so trailing junk —
+  `CHECK(a>0) bar`, `DEFAULT abs(1)` (stored 'abs'), `DEFAULT
+  "x" y`, `DEFAULT - - 1`, `DEFAULT (1)(2)`, `PRIMARY KEY (a)
+  foo`, `VARCHAR(10) foo`, a column after a table constraint,
+  `INDEX (a)` — was accepted and stored verbatim, a schema the
+  pin then refuses to load. Every CREATE TABLE item (and ALTER's
+  column) is now walked clause by clause with the pin's grammar
+  (`typetoken`, `carglist`, `conslist` with optional commas
+  between table constraints, ON CONFLICT, REFERENCES / MATCH /
+  ON DELETE …, [NOT] DEFERRABLE, AUTOINCREMENT inside a table
+  PRIMARY KEY), with the pin's 68 non-fallback keywords refused
+  as names / type words / DEFAULT identifiers. The same walker
+  serves the tiny profile, which therefore gained it too, and
+  now takes `DEFAULT identifier` (only the clock keywords are
+  refused there). Found on the way: a column named `key` was
+  silently dropped (items starting with KEY were skipped);
+  `CHECK(a) CHECK(b)` without a comma kept only the first.
+- *Repeated PRIMARY KEY / UNIQUE sets* (corruption, `indexes`):
+  `a PRIMARY KEY UNIQUE`, `UNIQUE(a), UNIQUE(a DESC)` got two
+  autoindexes — "orphan index" on the pin. A set repeating an
+  earlier one (same columns in order, same effective collations)
+  is dropped as the pin's `sqlite3CreateIndex` does; a repeating
+  PRIMARY KEY makes the earlier UNIQUE set the key's.
+- *Stored CREATE text* (corruption, every profile): `CREATE
+  TABLE main.t` was stored verbatim ("corrupt database" on the
+  pin). The text is now rebuilt as the pin's: `CREATE TABLE ` /
+  `CREATE VIEW ` / `CREATE [UNIQUE] INDEX ` and the statement
+  from the bare name on (so `IF NOT EXISTS` and the keywords'
+  case are not kept either; `parser::schema_text_start`). `ON
+  main.t` in CREATE INDEX is a syntax error, as on the pin.
+  (`temp.` / other schemas were already refused, CTAS included.)
+- *CTAS names* (`v16`): unary `+` was dropped by the parser, so
+  `+a` named its column `a` with INT affinity. The AST and the
+  evaluator now keep it (`Expr::Pos` / `RExpr::Pos`: the
+  operand's value and collation, no affinity) — which also
+  fixes `+a = '1'` comparing with affinity (a silent wrong answer
+  on the claimed v0.4 path) and derived / view column names.
+  An unaliased column reference takes the table's spelling (`A`,
+  `S.B` → `a`, `b`, via the new `SubPlan::result_named`), as do
+  view column lists; an alias spelled `oid` is kept.
+- *`-9223372036854775808`* (every profile): the pin's
+  `codeInteger` makes `-` over that literal (through `+` and
+  parentheses) INTEGER i64::MIN; hipp folded it to a REAL and
+  stored that through DEFAULT, generated columns, CHECK, ALTER
+  and plain INSERT. `- -9223372036854775808` overflows to REAL.
+- *Evaluator values now on disk*: `||` is always TEXT (a blob
+  operand gave BLOB); `abs()` follows the pin's `absFunc` —
+  INTEGER i64::MIN is `SchemaKind::IntegerOverflow`, TEXT / BLOB
+  give REAL (`abs('5')` = 5.0); REAL → TEXT (`||`, CAST, TEXT
+  affinity — the tiny profile's INSERT too) is the pin's: 15
+  significant digits if they read back as the value (through
+  the pin's own `parse_real`), else 17, laid out as `%!.17g`
+  (`1.0e+20`, `1.0e-05`, `10000000000000000.0`); it used to print
+  every digit (`100000000000000000000`, and 5e-324 as forty
+  zeros). The digits come from exact big-integer arithmetic
+  (`lexer::real_digits`), so no build links `core::fmt`'s float
+  formatting any more.
+- *ALTER TABLE ADD COLUMN on an empty table*: the pin refuses a
+  non-constant default, NOT NULL with no / a literal NULL
+  default, and a STORED column only when the table has rows
+  (`sqlite3ErrorIfNotEmpty`); hipp refused them always. They
+  are now checked at step time (`Plan::AlterAdd::empty_only`).
+- *AUTOINCREMENT* (corruption, found while probing the grammar,
+  every profile): it was parsed and ignored, and a hipp-created
+  AUTOINCREMENT table has no `sqlite_sequence` — the pin's next
+  INSERT reports "database disk image is malformed". CREATE
+  TABLE now refuses it (`Error::Unsupported`); files the pin
+  wrote with one still load and stay writable.
+- *Clock*: `Config::clock` was read once per clock-default
+  column, so one row could mix two instants (CURRENT_DATE
+  1970-01-01 with CURRENT_TIME 00:00:00). A statement now reads
+  it at most once (`rules::Clock`). hipp-cli supplies the system
+  clock (it had none, so every CURRENT_* default failed with
+  `NoClock` there).
+
+Review-pass tests (each fails on 104c4da): in
+`tests/table_defs_v16.rs` — `malformed_definitions_are_refused_like_the_pin`
+(every review reproduction plus the same pattern across the
+column grammar; verdicts agree and every accepted schema passes
+the oracle's `integrity_check` on hipp's file),
+`prng_definition_grammar_corpus` (120 PRNG definitions from valid
+and malformed fragments), `repeated_constraint_sets_share_one_autoindex`,
+`main_qualifier_is_left_out_of_the_schema_text`,
+`unary_plus_drops_affinity`, `create_table_as_select_names_follow_resolution`,
+`minimum_integer_literal_through_rules`,
+`stored_values_match_the_pins_evaluator`,
+`alter_add_column_on_an_empty_table`,
+`clock_is_read_once_per_statement` (a ticking clock across
+midnight), `autoincrement_is_refused_at_create_and_read_from_foreign_files`;
+in `hipp-cli/tests/cli_v16_table_defs.rs` a byte-identical review
+batch (plus the oracle reading both schemas and the view's
+`.schema` column list) and the CLI clock; parser unit tests for
+the grammar (both profiles), the i64::MIN literal and the schema
+text start.
+
+**Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
+not error text): precedence NOT NULL → STRICT → CHECK → UNIQUE
+(`('q', NULL)` reports NOT NULL; `(1.5, 'x')` with a failing
+CHECK reports the type); `CHECK(a)` passes NULL, `'1abc'`,
+`0.5`, fails `'abc'`, `x'00'`, `0`; `CHECK(nofunc(a))` fails
+CREATE but `DEFAULT (nofunc())` fails only the INSERT that
+needs it; `DEFAULT 1+2` and `DEFAULT -TRUE` are syntax errors,
+`DEFAULT hello` is `'hello'`, `-x'01'` is 0, `+'abc'` stays
+text, `-0x10` is -16; `b GENERATED AS (a)` declares type
+GENERATED; `GENERATED ALWAYS AS (a) VIRTUAL STORED` is a syntax
+error; VIRTUAL values are type-checked in STRICT tables;
+`INSERT INTO t VALUES (...)` counts only non-generated columns;
+`PRAGMA table_info` hides generated columns (hipp has no
+PRAGMA); ALTER's `DEFAULT 5 CHECK(l > 10)` fails on a
+non-empty table only. The keyword list was verified by
+creating a CTAS column named after each candidate word.
+
+**Gates:** `ci/local-gates.sh` (full run) green. New suites:
+`tests/table_defs_v16.rs` (27 tests: CHECK truth rules,
+affinity, rowid, precedence, upsert / REPLACE / INSERT ...
+SELECT, the UPDATE ... FROM last-combination regression,
+UPDATE change sets over violating rows, definition errors, an
+oracle-written CHECK file; every DEFAULT form, deferred and
+definition errors, OR REPLACE substitution, the clock hook —
+fixed and pre-epoch times, a 50-point PRNG calendar against the
+oracle's `datetime(..., 'unixepoch')`, `NoClock` — and ALTER's
+default / CHECK / generated rules; generated columns both
+directions incl. indexes on VIRTUAL columns, upsert, REPLACE,
+definition errors; rowid conversion; a PRNG constraint corpus
+over 6 random schemas × 40 random statements; and the `v16`
+DEFAULT VALUES, CTAS (schema text byte-compared through the
+oracle) and STRICT tests — the 21 ungated ones also pass in a
+`v10`-without-`v16` build), `hipp-cli/tests/cli_v16_table_defs.rs`
+(4 byte-identical batches, one-shot and stdin, REAL rendering
+included, plus a `.dump` replay of a generated-column table —
+the CLI's `.dump` now writes only non-generated columns, as the
+pin's shell does, using the new `TableMeta::columns` /
+`generated`), and parser unit tests for the tiny refusals (run by
+the `--no-default-features` lib test gate).
+
+Review pass, vs 104c4da (after the collations unit): tiny
+**76,048 B** (Δ **−5,504 B** vs 81,552, ratchet lowered — the
+REAL → TEXT digits now come from the lexer's existing big-integer
+helpers, which drops `core::fmt`'s float formatting (~9.7 KB:
+Grisu / Dragon, both decimal formatters); that pays for the
+clause-by-clause CREATE TABLE walker (~3 KB), the
+`schema_text_start` re-lex with its AUTOINCREMENT refusal, the
+i64::MIN literal rule and the REAL layout); full **280,395 B**
+(Δ **−3,900 B** vs 284,295, ratchet lowered; the same saving less
+the unary-plus node, CTAS naming, autoindex dedupe and ALTER's
+empty-table path).
+
+**Size:** tiny **81,524 B** (Δ **−92 B** vs 81,616; ratchet
+lowered — the `Tok` comparison rewrite saves more than the
+tiny parser's new refusals and the rowid / default-affinity
+fixes cost); full **276,127 B** (Δ **+19,010 B** vs 257,117,
+ratchet raised; over `justify_over` (16,384 B), justified
+here: the rule planner and row codec (`plan_rules`,
+`validate_def`, `resolve`, `decode_rec` / `encode_rec`, ~5 KB),
+expression-default evaluation with the calendar (~1.2 KB),
+the parser's clause spans and stricter column grammar (~1 KB),
+CTAS naming / quoting / affinity (~1.5 KB), the lexer no longer
+inlined into `parse` now that `parse_expr_text` also calls it
+(net ~+0.4 KB), and the write / read paths' rule plumbing in
+the planner and the async step state machines (~8 KB)).
+
+**Honest gaps:**
+
+- `PRAGMA ignore_check_constraints` is not offered: hipp has no
+  PRAGMA statements yet (another unit's surface).
+- Constraint-level conflict clauses (`a UNIQUE ON CONFLICT
+  IGNORE`, `NOT NULL ON CONFLICT REPLACE`) are still parsed and
+  ignored: such a write errors where the pin would resolve it
+  (an error, never a silent wrong answer).
+- hipp's function library has no non-deterministic function,
+  so the pin's "non-deterministic functions prohibited in
+  generated columns" cannot arise; a unit adding `random()` or
+  `'now'` must refuse them there.
+- The tiny profile refuses such tables at parse, so it cannot
+  open a file holding any table with a CHECK, generated column
+  or expression DEFAULT (the WITHOUT ROWID precedent). (Its
+  refusal of the unquoted `DEFAULT identifier` form is gone: the
+  review pass's grammar walker tells the clock keywords apart.)
+  Without `indexes` it does not check COLLATE names (it has no
+  collations), where the pin refuses an unknown one.
+- A double-quoted `"current_timestamp"` inside a parenthesised
+  DEFAULT reads as the clock keyword (the AST does not keep
+  quotedness); the pin calls it a non-constant column.
+- CTAS: a fourth duplicate column name gets a random suffix on
+  the pin — hipp refuses it (`Unsupported`); compound affinity
+  demotion reads hipp's resolved
+  expression shapes, not the pin's parse tree (they agree on
+  the probed literal / column / CAST / function / CASE shapes).
+  hipp cannot query `sqlite_schema` itself (another unit), so
+  CTAS text is verified through the oracle reading hipp's file.
+- A record shorter than its table whose missing column has a
+  foldable *expression* default reads the folded value; the
+  pin's `OP_Column` would read NULL — reachable only with a
+  foreign writer (ALTER refuses such defaults).
+- Review pass gaps: the UPDATE ... FROM "last combination" is
+  hipp's join order — with an equality join on an unindexed FROM
+  table the pin builds an automatic index and takes the
+  combination last in that index's (key, columns) order instead
+  (`s = (1,1),(1,9),(1,3)`: pin 9, hipp 3; SQLite calls the
+  choice arbitrary), so tests keep one matching row per target
+  or a cross join. (REAL → TEXT digits: fixed bit-exact later
+  in v0.16, see "CI vs the real pin".)
+  `-0x8000000000000000` is "hex literal too big" on the pin and
+  a REAL in hipp. AUTOINCREMENT tables cannot be created (no
+  `sqlite_sequence` upkeep), and hipp's INSERTs into a foreign
+  one do not advance its `sqlite_sequence` row (the pin then
+  takes max(rowid) + 1, so the file stays valid, but a rowid
+  hipp wrote and someone deleted can come back). A clock default is
+  evaluated when the statement is prepared, so re-stepping a
+  prepared statement reuses that instant (the pin reads it per
+  execution). The non-fallback keyword list was probed on the
+  stand-in (`CREATE TABLE t(a K)` for each of the 147 keywords).
+- Probed on the local 3.53.1 stand-in; STRICT (3.37) and
+  generated columns (3.31) are long-stable, and nothing relied
+  on is known to differ in 3.54.1. CI runs the real pin.
+
+### Collations and pattern matching (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated (below). Census (158 probes): MATCH 66 → 72,
+silent-wrong DIFF 1 → 0 (column COLLATE was the last).
+
+**Shipped — ungated (fixes on claimed v0.4 / index paths):**
+
+- **Column `COLLATE BINARY | NOCASE | RTRIM`** — parsed and
+  ignored before (comparisons and ORDER BY ran BINARY):
+  `record::Coll` (NOCASE folds ASCII `A`-`Z` only, RTRIM drops
+  trailing U+0020), carried on catalog columns, resolved
+  column references (`RExpr::Column(slot, aff, coll)`) and
+  derived-table columns (their leftmost core's item collation,
+  BINARY when none — still a column's). The pin's
+  `sqlite3ExprCollSeq` / `sqlite3BinaryCompareCollSeq`
+  (`query::expr_coll`, `binary_coll`): an explicit COLLATE on
+  the left operand, else on the right (it propagates up through
+  operators and function arguments, the pin's `EP_Collate`),
+  else the left column's, else the right's, else BINARY; CAST
+  and unary `+` pass a column's through, functions and scalar
+  subqueries carry none, the rowid / IPK none. Applied to `=`
+  `<` IS BETWEEN, CASE, joins' ON / USING / NATURAL, CHECK and
+  generated-column expressions; an IN list compares (and, since
+  the review fixes, converts affinity) by its left operand only
+  (3.53 rewrote a single constant item to `x = +c` and so took
+  its COLLATE; the 3.54.1 pin does not — see "CI vs the real
+  pin"); `x IN (SELECT ...)`
+  by the binary rule against the subquery's item — its
+  *rightmost* core's for a compound (carried through
+  substitution as an explicit `Collate`); min / max / nullif and
+  min / max aggregates use the first argument with a collation;
+  ORDER BY terms, GROUP BY (grouping and group order), DISTINCT,
+  count / sum / group_concat(DISTINCT) use each term's.
+- **Compounds run the pin's merge** (3.5x uses
+  `multiSelectOrderBy` for every UNION / INTERSECT / EXCEPT):
+  both sides stably sorted by one merge key (the column
+  collations, leftmost core with one per column — pushed down to
+  every inner operator up to the last non-ALL one, or to all
+  of them when an ORDER BY is merged in), equal keys advance the
+  left side (a UNION keeps the *right* row of an NOCASE-equal
+  pair; INTERSECT the left), each emitted row of a non-ALL
+  operator dropped when equal to the previous one under that
+  operator's own collations; trailing UNION ALLs append; an
+  ORDER BY naming another collation sorts the finished compound
+  (the pin evaluates it as a subquery then). A multi-row
+  constant VALUES core reads as a BINARY column (the pin's
+  `sqlite3MultiValues` co-routine). `combine_compound`'s
+  set-based approximation is gone (`run_compound`,
+  `merge_compound`).
+- **Collated indexes:** `CREATE INDEX ... (c COLLATE NOCASE)`
+  (was refused), table `UNIQUE (c COLLATE RTRIM)` and the
+  autoindexes of NOCASE / RTRIM columns key by their collation:
+  `record::KeyOrder { desc, coll }` replaces the B-tree layer's
+  `desc: &[bool]`, so insertion order, prefix probes (UNIQUE
+  checks, OR IGNORE / OR REPLACE / upsert victims) and the
+  legacy `WHERE col = lit` index path all compare by it (that
+  path only takes an index whose collation is the column's).
+  Upsert targets match the pin's rule (`ON CONFLICT (a COLLATE
+  x)` only an index column of collation x; a bare column any).
+  Tables with such indexes are writable — they were refused as
+  foreign / opaque. Files interoperate both ways (hipp-written
+  indexes pass the oracle's `integrity_check`; oracle-written
+  ones are maintained by hipp).
+- **Unknown collation names** in CREATE TABLE / UNIQUE / CREATE
+  INDEX / upsert targets are refused (`SchemaKind::
+  UnknownCollation`, the pin's "no such collation sequence").
+- **Table `UNIQUE (a COLLATE x DESC, b)`** dropped `b` (the
+  parser skipped COLLATE only after ASC / DESC, the reverse of
+  the pin's grammar): uniqueness was enforced on `a` alone.
+- **GROUP BY order** (found while probing): with as many ORDER
+  BY as GROUP BY terms the pin's group sorter takes the ORDER
+  BY terms' ASC / DESC (`orderByGrp` set-up), so ties of the
+  ORDER BY keep a descending group order — `GROUP BY a ORDER BY
+  b DESC` listed equal-`b` groups ascending.
+- **Bare columns of aggregate queries** (found while probing
+  min / max ties): they come from the extremum row of the
+  *last* min() / max() aggregate (items, ORDER BY, HAVING — the
+  pin's shared `OP_CollSeq` hit flag), whatever other
+  aggregates exist, and a group whose argument is all NULL
+  reads its *last* row; hipp honoured only a lone min / max and
+  read the first row (closes the review gap recorded by the
+  query-shape unit).
+- **Scalar `min()` ties:** `min(1, 1.0)` is 1.0 (the pin's
+  `minmaxFunc` takes the later of equal arguments for min, the
+  earlier for max).
+- **LIKE matcher** (`query::like_glob`, the pin's `likeFunc` +
+  `patternCompare`): operands read up to their first NUL with
+  `sqlite3Utf8Read`'s decoding (invalid UTF-8 used to read as
+  empty), ASCII-only case folding, patterns over 50,000 bytes
+  `SchemaKind::PatternTooComplex`; iterative single-backtrack
+  matching (the old recursive matcher was exponential).
+
+**Shipped — `v16`:** the `expr COLLATE name` operator (binds
+tighter than `||`, looser than unary minus; identifier or
+string names, case-insensitive; ORDER BY / GROUP BY ordinals
+and aliases keep the collation on top, as the pin's
+`resolveAlias` does); GLOB / NOT GLOB (`*`, `?`, classes with
+`^`, leading `]`, ranges, a trailing `-` literal) and `LIKE ...
+ESCAPE` — both desugared at parse into the pin's `glob(p, x)` /
+`like(p, x, e)` calls — and the `like()` / `glob()` functions
+(escape: NULL gives NULL, not exactly one character
+`SchemaKind::EscapeNotSingleChar`, checked before NULL
+operands; an escape equal to `%` / `_` disables that wildcard).
+
+**Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
+not error text): `'a' COLLATE BINARY = 'A' COLLATE NOCASE` is
+0 (left explicit wins); `x'61' = 'a' COLLATE NOCASE` is 0 (no
+cross-class effect); `upper('a' COLLATE NOCASE) = 'a'` and
+`coalesce('A' COLLATE NOCASE, 1) = 'a'` are 1 (EP_Collate
+through function arguments), `(SELECT 'A' COLLATE NOCASE) =
+'a'` 0; `'ABC' IN (nocase_col)` 0 but `'A' IN ('a' COLLATE
+NOCASE)` 1 (the one-constant rewrite) and with three items 0;
+`'X' IN (SELECT a FROM t UNION SELECT 'q')` 0, reversed cores 1
+(rightmost core). EXPLAIN showed every non-ALL compound as
+sorter + co-routine merge (`k(1,NOCASE)`), and an ORDER BY
+`COLLATE` other than the column's as the natural compound
+plus a final sorter (`k(1,B)`); the survivor rules (`a UNION b`
+→ `A, ABC, b` over `abc, B, a` / `ABC, b, A`) were derived from
+that and checked on 150 generated compounds. Derived columns:
+`(SELECT 'X' AS c UNION ALL SELECT a ...)` is BINARY, `(SELECT a
+AS c ... UNION ALL SELECT 'X')` NOCASE (leftmost core). Ties:
+max() / min() aggregates and DISTINCT / GROUP BY keep the first
+row, ORDER BY is stable. Bare columns: `SELECT max(x), min(y),
+id` reads min(y)'s row, `min(y), max(x)` max(x)'s, all-NULL
+groups the last row. LIKE / GLOB: `'ÄBC' LIKE 'äbc'` 0, `'ab'
+GLOB 'a[b-a]'` 1 (the `b` literal), `'a' LIKE 'a' ESCAPE NULL`
+NULL, `GLOB ... ESCAPE` a wrong-argument-count error, a NUL
+ends either operand, `'x' LIKE 'X' ESCAPE x'41'` 1. CTAS does
+not copy a column's COLLATE. `SELECT 1 COLLATE bogus` runs on
+the pin (the name is looked up only when used).
+
+**Review fixes (second commit):**
+
+- **Upsert `excluded.<col>`** (a regression of the first
+  commit) took the target column's collation, and (older) its
+  affinity. On the pin it is a register reference with
+  neither: `excluded.a = 'x'` is BINARY over a NOCASE `a`,
+  `excluded.a = a` takes `a`'s NOCASE, and a TEXT column's
+  `'1'` is not `1`. `SourceDesc::registers` resolves such
+  references as `+col` with no collation
+  (`RExpr::Column(.., None)`).
+- **`UNIQUE (a DESC COLLATE NOCASE, b)`** (accepted with `b`
+  dropped, stored as SQL the pin cannot load) was already a
+  syntax error after the column-constraints review commit's
+  clause-by-clause walk; regression tests added (also for
+  PRIMARY KEY and CREATE INDEX).
+- **UPDATE OR REPLACE** (older, any collation) visited rows an
+  earlier REPLACE in the same statement had deleted, and wrote
+  them back. The pin collects rowids and re-reads each one: a
+  deleted row is skipped, and a rowid another row moved into
+  is updated from its current content (`SET id = id + 1,
+  v = v || 'x'` over ids 1, 2 leaves `3|axx`). `exec_update`
+  now re-reads each row (`reload_write_row`) once a REPLACE
+  deletion or a rowid change has happened.
+- **`x IN (list)` affinity** (older): a written list converts
+  both sides by the LEFT operand's affinity only (no affinity:
+  no conversion), as the pin's `OP_Eq` / ephemeral-index paths
+  do. hipp used the binary-comparison rule, so `d IN (e)` with
+  `d` untyped `'1'` and `e INTEGER 1` gave 1 (pin 0). `IN
+  (SELECT ...)` keeps the binary rule (`InList`'s new
+  `from_sub` flag marks the substituted list).
+- **Files naming a non-built-in collation** failed to open at
+  all (a regression for files of applications that register
+  collations). Now only that table is refused (gap below).
+- Not changed: GROUP BY over a column with a differently
+  collated index shows the pin's index-order representative
+  (plan-dependent; gap below).
+
+**Gates:** `ci/local-gates.sh` (full run) green. New suites:
+`tests/collation_v16.rs` (23 tests after the review fixes:
+COLLATE after ASC / DESC, upsert `excluded`, UPDATE OR REPLACE
+with a 12-statement PRNG corpus over NOCASE / RTRIM UNIQUE,
+IN-list affinity, and a file naming an unknown collation join
+the first 18: column-collation
+comparisons, ordering / grouping / DISTINCT / aggregates, ties,
+the GROUP BY direction and bare-column regressions, compound
+merges, subqueries / derived tables / joins, CHECK / generated /
+UPDATE / DELETE over collated columns, UNIQUE NOCASE / RTRIM
+(with the `UNIQUE (b COLLATE RTRIM DESC, a)` regression),
+CREATE INDEX COLLATE incl. `INDEXED BY` order on the oracle,
+upsert targets, an oracle-written collated file written by hipp,
+unknown names, the LIKE matcher and pattern limit, and under
+`v16` the COLLATE operator corpus, GLOB / ESCAPE / functions,
+plus two PRNG corpora — 40×18 random LIKE / ESCAPE / GLOB
+pairs and 60 random collated queries; the 15 ungated ones also
+pass in a `std,indexes,v10` build, 20 after the review),
+`hipp-cli/tests/cli_v16_collation.rs` (3 byte-identical
+batches one-shot and over stdin, REAL / NULL / blob rendering
+included, plus a `.dump` replay of a collated, indexed table),
+and parser unit tests for the clause grammar.
+
+**Size:** tiny **81,552 B** (Δ **−12 B** vs 81,564; ratchet
+lowered — the collation fields and name lookups are compiled
+out of the tiny profile, which has no comparison a collation
+could change, and the parser's constraint-column rewrite came
+out smaller); full **284,295 B** (Δ **+4,840 B** vs 279,455,
+ratchet raised: collation selection and the collated
+comparators (~1.5 KB), the merge-based compound evaluator
+(~1 KB over the removed set version), the pattern matcher and
+like / glob functions (~1.2 KB), index `KeyOrder` plumbing and
+upsert-target matching, the bare-column and GROUP BY order
+fixes). Review fixes: tiny **76,016 B** (Δ **−32 B** vs the
+76,048 ratchet the later units left; ratchet lowered; code
+layout only, as none of the fixes is in the tiny profile); full
+**289,995 B** (Δ **+1,240 B** vs 288,755, ratchet raised: the
+UPDATE row re-read, the IN-list affinity rule and its flag,
+register references, the foreign-collation table handling).
+
+**Honest gaps:**
+
+- The tiny profile still accepts (and ignores) `COLLATE
+  <unknown>` in CREATE TABLE: it has no comparisons a collation
+  could change, and validating the name did not fit its
+  ratchet.
+- An unknown name in the `COLLATE` operator is refused at
+  prepare even where the pin, which looks names up only when a
+  comparison or sort uses them, runs the statement (`SELECT 1
+  COLLATE bogus`).
+- A table whose stored SQL names a collation hipp does not
+  have (an application-registered one) is listed, but every
+  statement that reads or writes it is refused
+  (`UnknownCollation`). The pin reads it and errors only where
+  the collation is used, e.g. `SELECT * FROM t` runs there. An
+  index naming one stays opaque (its table's writes refused;
+  the pin errors there too). `.dump` stops at such a table.
+  DROP TABLE works.
+- GROUP BY / DISTINCT without ORDER BY over a column with a
+  *differently* collated index (`ON k(a COLLATE BINARY)` on a
+  NOCASE `a`): the pin scans the covering index, so a group's
+  shown value is the first row in that index's order (`B`);
+  hipp shows the first in rowid order (`b`). This is
+  plan-dependent row choice, the same class as the older
+  BINARY-index unordered-output differences; matching it means
+  modelling the pin's covering-index choice, a planner project.
+- `x IN ((SELECT ...))` (a lone parenthesised subquery item,
+  which the pin rewrites to `x IN (SELECT ...)`) is a parse
+  error in hipp (older, a refusal).
+- `PRAGMA case_sensitive_like` is not offered (hipp has no
+  PRAGMA statements yet); LIKE is always case-insensitive for
+  ASCII, the pin's default.
+- A multi-row VALUES core whose rows are not constant (or whose
+  first row has an affinity) is the pin's UNION ALL fallback;
+  hipp takes the first row with a collation then, but does not
+  re-run the merge per row-core.
+- Out of scope, found while probing (older, still open): the
+  relational operators bind tighter than `=` / LIKE on the pin
+  (`0 = 1 < 2` is 0), hipp parses them at one level, left to
+  right.
+- Probed on the local 3.53.1 stand-in. The merge-based compound
+  evaluation and the VALUES co-routine are recent pin internals
+  (3.4x–3.5x); nothing relied on is known to differ in 3.54.1,
+  and CI runs the real pin.
+
+### Bound parameters (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated behind the new leaf feature `params` (in `full`;
+`params = []`, so it builds alone on top of the tiny profile —
+`ci/feature-sets.txt` has its line).
+
+**Shipped — `params`:**
+
+- **Syntax and numbering** (`sql::lexer::ParamTable`, assigned
+  in the lexer in source order, which is the pin's
+  `sqlite3ExprAssignVarNumber` order): `?` takes one past the
+  largest index so far; `?NNN` takes NNN (leading zeros
+  allowed) and names that index `?NNN` unless it has a name;
+  `:name` / `@name` / `$name` / `#name` reuse the index of an
+  identical spelling (case-sensitive) else take the next one;
+  the TCL forms `$a::b` and `$a(x)` lex as one name. Errors:
+  `?0`, `?32767`, an overflowing NNN (`ParseKind::
+  VariableNumber`), an index past 32766 (`TooManyVariables`),
+  `#1`, a bare sigil, `$a(x y)` (`UnexpectedToken`).
+- **Statement API** (doc-commented): `bind_null` / `bind_i64` /
+  `bind_f64` (NaN binds NULL, as on the pin) / `bind_text` /
+  `bind_blob` / `bind_value` by 1-based index
+  (`Error::BindIndexOutOfRange`; binding a stepped, un-reset
+  statement is `Error::ResetRequired`, the pin's
+  `SQLITE_MISUSE`), `parameter_count`, `parameter_index(name)`,
+  `parameter_name(i)` (the pin's answers, including `?1` not
+  finding `?01` and nameless `?` having no name),
+  `clear_bindings`, and `reset`, which makes any prepared
+  statement executable again (it was single-shot). Unbound is
+  NULL.
+- **Binding** (`sql::bind::bind_ast`): each execution plans a
+  copy of the parsed tree with every parameter replaced by its
+  value as the literal of the same storage class, so affinity,
+  comparison, constant folding and the tiny profile's literal
+  paths treat it exactly as the pin treats a bound value (which,
+  like a literal, has no affinity or collation). The one
+  difference the pin makes — an integer literal in ORDER BY /
+  GROUP BY is an ordinal, a parameter is not — is encoded: such a
+  term becomes `+value`, or, in a compound ORDER BY, the ordinal
+  of the first result item (leftmost core first) that is the
+  same parameter (same index and spelling: the pin's
+  `resolveCompoundOrderBy` + `sqlite3ExprCompare`), with a
+  multi-row VALUES laid out as the pin's `sqlite3MultiValues`
+  builds it (rows sharing a co-routine never match; see the
+  review fixes); anything else there is "does not match any
+  column", as on the pin.
+- **Re-execution:** the first `step` after a `reset` or a
+  binding change plans again from the retained parse tree (a
+  plan captures the catalog and an expression DEFAULT's clock
+  read, so every execution plans afresh — `DROP TABLE`
+  re-executed is "no such table", CTAS "already exists"),
+  bringing the catalog up to date first, and rewinding the
+  statement arena to its pre-plan mark (asserted: 200 executions
+  do not grow it). A plan that fails for the unbound (all-NULL)
+  state with an error a binding could change (a constant row's
+  NOT NULL / CHECK / MustBeInt failure, say) is deferred to the
+  first `step` (`Plan::Deferred`; `column_count` is 0 until
+  then). Only such value errors are deferred (a deny-list:
+  constraint, type, rowid, overflow and ESCAPE / pattern
+  errors); every other error — grammar, name resolution, a name
+  already taken — is `prepare`'s, as on the pin.
+- **Where:** in the full profile every expression position —
+  WHERE, SET, VALUES, LIMIT / OFFSET, scalar / IN / EXISTS
+  subqueries, upsert targets and DO UPDATE, RETURNING, compound
+  cores and VALUES, derived tables, joins' ON, HAVING, aggregate
+  arguments, INSERT ... SELECT, UPDATE ... FROM, CREATE TABLE ...
+  AS SELECT (columns named by the parameter text: `"?"`,
+  `"? + 1"`, `":n"`, byte-identical to the pin). On top of the
+  tiny profile: INSERT VALUES and `WHERE <col> = ?` (rowid seeks).
+  Refused, as on the pin, in CREATE TABLE (other than its AS
+  SELECT), ALTER TABLE and CREATE VIEW
+  (`SchemaKind::ParameterNotAllowed`; `DEFAULT ?` stays a syntax
+  error). A parameter in a stored schema text resolves to NULL
+  (the pin's schema-parse rule).
+- **hipp-cli** binds like the oracle shell: each parameter by
+  its name (a nameless `?` as `?N`) from `.parameter set NAME
+  VALUE` (VALUE evaluated as SQL, else taken as text), NULL
+  otherwise; `.parameter unset / clear / list / init`. It now
+  steps every statement to completion (a deferred plan knows its
+  columns only once stepped).
+- **`examples/params.rs`**: prepare once, bind / step / reset
+  per row, re-run a query with new bindings.
+
+**Shipped — ungated (found by the generated corpus; claimed
+v0.4 / CLI paths, wrong with or without parameters):**
+
+- `%` with a REAL or real-looking operand is a REAL computed on
+  both operands' integer values — a text operand's integer
+  *prefix* (`'1e18' % 2` is 1.0); hipp answered an INTEGER.
+- `CAST(text AS INTEGER)` reads only the integer prefix
+  (`sqlite3Atoi64`: `CAST('1e18' AS INTEGER)` is 1, hipp gave
+  10^18).
+- `CAST(text AS NUMERIC)` is the pin's `sqlite3VdbeMemNumerify`:
+  an integer-shaped prefix that fits i64 is an INTEGER, any
+  other number only when integral with |x| < 2^51 —
+  `CAST('9223372036854775808' AS NUMERIC)` and `CAST('1e18' AS
+  NUMERIC)` are REALs (hipp gave integers).
+- hipp-cli printed a REAL -0.0 as `-0.0`; the pin's printf has
+  no negative zero (`SELECT -0.0` prints `0.0`; the value keeps
+  its sign — `atan2` shows it on the pin).
+
+**Review fixes (2026-11-02):**
+
+- *Compound ORDER BY parameter, leftmost core decides* (wrong
+  order, no error): hipp scanned the cores from the rightmost.
+  `SELECT ?1, 2 UNION SELECT 3, ?1 ORDER BY ?1` with 9 now sorts
+  by column 1 (`3|9`, `9|2`), as the pin does.
+- *Multi-row VALUES cores* (rows where the pin errors): rows of a
+  multi-row VALUES matched one by one. They are now laid out as
+  `sqlite3MultiValues` lays them out (probed with real bindings
+  on the 3.53.1 library; the co-routine form is 3.46+). A row
+  joins a co-routine, whose `column1..N` items never match, when
+  the row is constant (has no subquery) and the core before it
+  is that co-routine, or is a plain row that is constant with no
+  top-level CAST under any COLLATE. Otherwise the row stays a
+  core of its own and can match. A multi-row VALUES to the right
+  of an operator is a subquery, so it never matches. Every
+  built-in function, LIKE and GLOB included, counts as constant.
+- *Errors at prepare*: the deferral list is a deny-list of value
+  errors (it was an allow-list of prepare errors), and CREATE
+  TABLE ... AS SELECT checks its name when planned, before the
+  SELECT is resolved, as `sqlite3StartTable` does. So
+  `prepare("CREATE TABLE t AS SELECT ?")` over an existing `t`
+  is `DuplicateTable` at prepare. A CLI-visible wrong answer was
+  fixed too: `CREATE TABLE IF NOT EXISTS t AS SELECT nope` over
+  an existing `t` is now a no-op. hipp used to fail it with "no
+  such column".
+- *IN-list affinity of a bound value*: `? IN (int_col)` with
+  `'5'` is 0. The evaluator fix landed in 2ea68e6, and regression
+  cases for the bound form are in the affinity matrix.
+- *Ungated, integer arguments read as the pin's
+  `sqlite3_value_int64`*: substr()'s start / length and round()'s
+  digit count take a text's integer prefix (`substr(x, '1e1')`
+  starts at 1, hipp read 10). Further round() fixes:
+  - The digit count is clamped to 0..=30. `round(1.5,
+    1000000000000)` looped 10^12 times.
+  - round() follows the pin's `%!.*f` rounding: the exact decimal
+    expansion, rounded half away from zero at n places or at the
+    26th significant digit, read back. hipp scaled by 10^n, so
+    `round(2.675, 2)` gave 2.68 (the pin gives 2.67) and `round(1.5,
+    31)` gave 9.2e-13.
+  - substr()'s coordinate arithmetic saturates at the i64 bounds.
+    It used to overflow and panic, as in `substr(x, -2,
+    9223372036854775807)`.
+- *Ungated, hipp-cli*: a REAL whose 16th significant digit is an
+  exact 5 printed rounded to even (`5833858491548785.0` gave
+  `5.83385849154878e+15`). It now rounds half away from zero, as
+  the pin's printf does. 12,000 random doubles print the same as
+  the oracle.
+- *Tiny + params in CI*: `tests/params_tiny_v16.rs` (which runs
+  in the default test run, so in CI) builds `tests/params_v16.rs`
+  with `--no-default-features --features std,params` in its own
+  target directory. It requires the three tiny-grammar tests to
+  run and pass against the tiny parser, which no other test run
+  reaches. It takes about 10 s.
+- The `Error::ResetRequired` doc no longer says `clear_bindings`
+  can return it. `clear_bindings` is infallible.
+
+**Oracle-probing notes** (numbering: the C API of the system
+libsqlite3 3.45 via ctypes — `sqlite3_bind_parameter_count /
+_name / _index` — whose rules have not changed in years, with
+the 32766 limit from the local 3.53.1 stand-in, the system build
+allowing 250000; values: the stand-in's Python binding): `SELECT
+?5, :a` has 6 parameters, `:a` = 6; `:a, ?1` shares index 1
+named `:a` (`?1` is not found by name); `?2, :a, ?1` names 1..3
+`?1 ?2 :a`; `?a` is `?` aliased `a`, `?1a` is `?1` aliased `a`;
+`:` / `@` / `$` / `#` alone are unrecognized tokens, `#1` a
+syntax error. A TEXT `'5'` bound against INTEGER / NUMERIC /
+REAL columns converts by the column's affinity exactly as the
+literal does, `? = 5` with `'5'` is 0, `LIMIT ?` takes `'2'` and
+`2.0` but errors on 2.5 / NULL / 'abc', `INSERT ... (rowid)
+VALUES (?)` takes `'100'` / 101.0 and errors on 'abc' / 102.5,
+a NaN binds NULL, `-?` over i64::MIN is the REAL 9.2e18. `ORDER
+BY ?` (1) keeps scan order and `GROUP BY ?` makes one group;
+`SELECT ?1 UNION ALL SELECT 2 ORDER BY ?1` sorts by column 1
+(also under COLLATE and DESC) but `ORDER BY +?1`, `:a ... ORDER
+BY ?1` (same index, other spelling) and `? ... ORDER BY ?`
+(other index) are "does not match". Views / CHECK / generated
+columns: "parameters prohibited"; `DEFAULT (?)`: "not constant";
+`DEFAULT ?`: syntax error; CTAS allowed. The oracle shell binds
+from `temp.sqlite_parameters` by name (`?N` for nameless) and
+NULL otherwise (shell.c's `bind_prepared_stmt`).
+
+**Gates:** `ci/local-gates.sh` (full run) green. New suites:
+`tests/params_v16.rs` (13 tests: the numbering table and errors
+against the probed C-API answers, the bind / reset API
+contract, the tiny grammar's positions and API — the three
+tiny-grammar tests also pass in a `std,params` build — a 200-row
+prepared-INSERT re-execution corpus with the arena bound, the
+affinity matrix of 15 bound values × 9 column expressions × 5
+operators plus storage into every affinity, every expression
+position (35 reads, 13 writes, CTAS schema text), ORDER / GROUP
+BY constants and compound matches with hand-written oracle SQL,
+error-vs-error agreement and deferred value errors,
+re-execution across schema changes, a 400-case generated
+expression corpus with random bindings, and the CAST / `%`
+regressions; every case compares hipp-with-bindings to the
+oracle with the values inlined, and every write is checked by
+the oracle reading both files with `quote()` and
+`integrity_check`), `hipp-cli/tests/cli_v16_params.rs` (unbound
+parameters one-shot and over stdin, and a `.parameter set`
+batch of every storage class against inlined literals,
+byte-identical, with the `-0.0` regression).
+
+**Size:** tiny **76,048 B** (Δ **0**; `params` is not in the
+tiny profile and its code compiles out); full **288,755 B**
+(Δ **+8,360 B** vs 280,395, ratchet raised: `params` +7,936 B —
+the lexer numbering, the tree-binding walker and the parse-tree
+clone it plans from, the Statement API and re-planning — and the
+CAST / `%` fixes +424 B). For information, tiny + `params`
+(`--no-default-features --features params`) is **84,672 B**
+(+8,624 B over tiny).
+
+*Review fixes:* tiny **76,016 B**, Δ **0** against the current
+ratchet (the 76,048 figure above was measured before 2ea68e6).
+`params` stays out of the tiny profile, and the fixed evaluator,
+CTAS and compound-ORDER-BY paths are not in it. Full **291,267
+B**, Δ **+1,272 B** against 289,995, and the ratchet is raised to
+that figure. round()'s exact rounding is about +460 B, the
+multi-row VALUES layout and leftmost match about +560 B, and the
+CTAS name check at plan time with its re-plan about +300 B. For
+information, tiny + `params` is now **85,048 B** (+376 B, the
+VALUES layout of `sql::bind`).
+
+**Gates (review fixes):** `cargo fmt --all` and the full
+`ci/local-gates.sh` run end with "==> all gates passed".
+`tests/params_v16.rs` now has 14 tests: the compound ORDER BY
+corpus gained 24 cases (leftmost core, VALUES co-routine layout,
+match and no-match), the affinity matrix gained `? IN (col)`
+forms, and there are new round() and substr() regressions,
+including a 600-case random round() corpus and the i64 extremes.
+`tests/params_tiny_v16.rs` is new: it runs the tiny + `params`
+tests in CI. `hipp-cli/tests/cli_v16_params.rs` has 3 tests: the
+new one covers the compound ORDER BY, the text integer arguments
+and REAL ties, byte-identical.
+
+**Honest gaps:**
+
+- Every execution after the first plans again (from the
+  retained parse tree, not the SQL): correct by construction,
+  but a re-executed statement pays planning each time.
+- A plan that fails for the all-NULL bindings with a value error
+  is deferred, so such a statement reports `column_count` 0 until
+  it is stepped.
+- The compound ORDER BY rules for a multi-row VALUES follow the
+  3.53.1 library, probed with real bindings. The tests check them
+  against hand-written literal SQL, because the oracle shell
+  cannot bind. The co-routine rule depends on the version (3.46
+  and later), and the pin is 3.54.1.
+- Found, not fixed (existing, outside this unit): when a compound
+  has an ORDER BY that it merges directly, hipp breaks ties
+  between rows by all of their columns. On the pin, UNION ALL
+  ties keep input order: `SELECT 1, 2 UNION ALL SELECT 1, 0 ORDER
+  BY 1` is `1|2`, `1|0` on the pin and `1|0`, `1|2` in hipp. The
+  corpora avoid such ties.
+- round() reads its exact decimal expansion, while the pin reads
+  the digits its double-double decoder gives (about 20). They
+  could differ only for a value whose rounding is decided past
+  about the 18th significant digit. 6,000 random cases agree.
+- Bound text / blob bytes are copied into the statement arena
+  when planned, so a bound value counts against `stmt_max` as
+  the same literal in the SQL would.
+- hipp-cli does not implement the shell's test-only magic
+  parameter names (`$int_N`, `$text_X`, `:NAN`, `:INF`);
+  `.parameter list` follows shell.c's layout (`%-*s %s` with
+  `quote()`d values) but was not verified against the pin
+  (the stand-in has no `.parameter`).
+- In a pre-`v16` build with the evaluator (`v04`..`v10`, not in
+  `ci/feature-sets.txt`) LIMIT / OFFSET take only an integer
+  literal, so a parameter there is a syntax error.
+- Found here, fixed since (see "CI vs the real pin"): the pin
+  converts a REAL to TEXT with up to 17 digits of its own
+  (inexact) decoding — `86255.9396259168 || ''` is
+  `86255.939625916799` there. Still open: a -0.0 stored in a REAL column keeps its sign
+  in hipp's record where the pin's reads back +0.0. Unordered
+  results that the pin returns in index order (a `GLOB` prefix
+  over a UNIQUE column) can differ in order, as before.
+- Probed on the local 3.53.1 stand-in and the system 3.45 C API;
+  parameter numbering and binding semantics are long stable,
+  and CI runs the real 3.54.1 pin.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

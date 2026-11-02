@@ -367,6 +367,87 @@ pub fn compare_values(a: &Value<'_>, b: &Value<'_>) -> core::cmp::Ordering {
     }
 }
 
+// ---------- collating sequences (v0.16) ----------
+
+/// A collating sequence: how two TEXT values compare (v0.16).
+/// SQLite's three built-ins — `BINARY` (memcmp, then length),
+/// `NOCASE` (ASCII `A`-`Z` folded to lower case, then memcmp and
+/// length; other bytes, UTF-8 included, compare as-is) and
+/// `RTRIM` (trailing U+0020 spaces ignored, then BINARY). A
+/// collation only affects TEXT-vs-TEXT comparisons; every other
+/// pairing is `compare_values`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Coll {
+    #[default]
+    Binary,
+    NoCase,
+    Rtrim,
+}
+
+impl Coll {
+    /// The built-in collation named `name` (case-insensitive, as
+    /// the pin matches collation names), or None for an unknown
+    /// name ("no such collation sequence" on the pin).
+    pub fn named(name: &[u8]) -> Option<Coll> {
+        let is = |w: &[u8]| name.eq_ignore_ascii_case(w);
+        if is(b"BINARY") {
+            Some(Coll::Binary)
+        } else if is(b"NOCASE") {
+            Some(Coll::NoCase)
+        } else if is(b"RTRIM") {
+            Some(Coll::Rtrim)
+        } else {
+            None
+        }
+    }
+}
+
+/// Compare two TEXT byte strings under a collation (v0.16).
+pub fn compare_text(a: &[u8], b: &[u8], coll: Coll) -> core::cmp::Ordering {
+    match coll {
+        Coll::Binary => a.cmp(b),
+        Coll::NoCase => {
+            let n = a.len().min(b.len());
+            for (x, y) in a[..n].iter().zip(b[..n].iter()) {
+                let c = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+                if c != core::cmp::Ordering::Equal {
+                    return c;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+        Coll::Rtrim => {
+            let trim = |s: &[u8]| -> usize {
+                let mut e = s.len();
+                while e > 0 && s[e - 1] == b' ' {
+                    e -= 1;
+                }
+                e
+            };
+            a[..trim(a)].cmp(&b[..trim(b)])
+        }
+    }
+}
+
+/// `compare_values` under a collation (v0.16): TEXT against
+/// TEXT compares by `coll`, everything else as before.
+pub fn compare_coll(a: &Value<'_>, b: &Value<'_>, coll: Coll) -> core::cmp::Ordering {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => compare_text(x, y, coll),
+        _ => compare_values(a, b),
+    }
+}
+
+/// One index key column's ordering (v0.16): its direction and
+/// its collating sequence (an index on a NOCASE column, or
+/// `CREATE INDEX ... (c COLLATE NOCASE)`, orders and finds its
+/// keys by NOCASE — exactly the pin's file layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyOrder {
+    pub desc: bool,
+    pub coll: Coll,
+}
+
 // ---------- affinity (SPEC §5.5, SQFMT §2.3) ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,46 +486,113 @@ pub fn affinity_of(decl: &[u8]) -> Affinity {
     }
 }
 
-/// Render a real the way SQLite renders it for TEXT conversion:
-/// shortest round-trip, with `.0` kept for integral values.
+/// Render a real the way SQLite renders it for TEXT conversion
+/// (`||`, CAST AS TEXT, TEXT affinity, and the CLI's list mode,
+/// which prints a REAL exactly as this conversion does), bit for
+/// bit as the pin. Fitted clean-room to the pin's output (v0.16,
+/// STATUS.md "CI vs the real pin"): the pin's approximate 18 or
+/// 19 digits `d` (`lexer::pin_digits`), then the first of
+///
+/// 1. the first 13 digits, truncated, when they read back as `r`
+///    and digits 14..=16 are `000` or the digits needed a downward
+///    decimal scale (`r` about 1e17 or more);
+/// 2. when digits 15 and 16 are `99`, the 14-digit rounding (half
+///    up) when it reads back as `r`;
+/// 3. the 17-digit rounding (half up: double rounding from `d`).
+///
+/// Trailing zeros dropped; laid out as `%!.17g`: fixed notation
+/// for decimal exponents -4 ..= 16 with `.0` kept on integral
+/// values, else `d.ddde±XX`. `-0.0` is `0.0`, infinities `Inf` /
+/// `-Inf`.
+#[inline(never)]
 pub fn render_real(r: f64, out: &mut AVec<u8>) {
-    // Rust's Display for f64 gives shortest-round-trip without an
-    // exponent for typical magnitudes and matches SQLite's rendering
-    // for the values v0.1 handles (1.5 -> "1.5", 1.0 -> "1.0").
-    let mut buf = [0u8; 40];
-    let s = format_real(r, &mut buf);
-    for b in s.bytes() {
-        out.push(b);
+    if r < 0.0 {
+        out.push(b'-');
     }
-}
-
-struct BufWriter<'a> {
-    buf: &'a mut [u8],
-    n: usize,
-}
-impl core::fmt::Write for BufWriter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for b in s.bytes() {
-            if self.n < self.buf.len() {
-                self.buf[self.n] = b;
-                self.n += 1;
-            }
-        }
-        Ok(())
+    let r = fabs(r);
+    if r == f64::INFINITY {
+        out.extend_from_slice(b"Inf");
+        return;
     }
-}
-
-fn format_real(r: f64, buf: &mut [u8; 40]) -> &str {
-    use core::fmt::Write as _;
-    let integral = is_integral_real(r);
-    let mut w = BufWriter { buf, n: 0 };
-    if integral {
-        let _ = write!(w, "{r:.1}");
+    if r == 0.0 || r.is_nan() {
+        out.extend_from_slice(b"0.0");
+        return;
+    }
+    let (d, scale) = crate::sql::lexer::pin_digits(r);
+    let p = |k: u32| 10u64.pow(k);
+    // 18 or 19 digits.
+    let l: u32 = if d >= p(18) { 19 } else { 18 };
+    // Decimal exponent of d's first digit.
+    let e10 = l as i32 - 1 - scale;
+    let lead16 = d / p(l - 16);
+    let c13 = d / p(l - 13);
+    let c14 = (d + 5 * p(l - 15)) / p(l - 14);
+    let (c, n) = if (scale < 0 || lead16 % 1000 == 0) && reads_back(c13, e10 - 12, r) {
+        (c13, 13)
+    } else if lead16 % 100 == 99 && reads_back(c14, e10 - 13, r) {
+        (c14, 14)
     } else {
-        let _ = write!(w, "{r}");
+        ((d + 5 * p(l - 18)) / p(l - 17), 17)
+    };
+    let mut nd = 1usize;
+    while nd < 20 && c >= p(nd as u32) {
+        nd += 1;
     }
-    let n = w.n;
-    core::str::from_utf8(&w.buf[..n]).unwrap_or("0")
+    let mut dig = [0u8; 20];
+    let mut x = c;
+    for k in (0..nd).rev() {
+        if let Some(slot) = dig.get_mut(k) {
+            *slot = b'0' + (x % 10) as u8;
+        }
+        x /= 10;
+    }
+    // A rounding carry adds a digit.
+    let exp = e10 + nd as i32 - n;
+    while nd > 1 && dig.get(nd - 1) == Some(&b'0') {
+        nd -= 1;
+    }
+    let digits = dig.get(..nd).unwrap_or(&[]);
+    // Fixed: the integer part (at least `0`), `.`, the fraction
+    // (at least `0`). Exponential: one digit, `.`, the rest (at
+    // least `0`), `e`, the signed exponent (at least two digits).
+    let fixed = (-4..=16).contains(&exp);
+    let (int, lead) = if fixed {
+        (exp.max(0) as usize + 1, (-exp).max(0) as usize)
+    } else {
+        (1, 0)
+    };
+    for k in 0..int {
+        out.push(if lead > 0 {
+            b'0'
+        } else {
+            digits.get(k).copied().unwrap_or(b'0')
+        });
+    }
+    out.push(b'.');
+    for _ in 1..lead {
+        out.push(b'0');
+    }
+    let from = if lead > 0 { 0 } else { int };
+    match digits.get(from..) {
+        Some(rest) if !rest.is_empty() => out.extend_from_slice(rest),
+        _ => out.push(b'0'),
+    }
+    if !fixed {
+        out.push(b'e');
+        out.push(if exp < 0 { b'-' } else { b'+' });
+        let e = exp.unsigned_abs();
+        if e >= 100 {
+            out.push(b'0' + (e / 100) as u8);
+        }
+        out.push(b'0' + (e / 10 % 10) as u8);
+        out.push(b'0' + (e % 10) as u8);
+    }
+}
+
+/// Whether `c * 10^x` reads back (correctly rounded, like the
+/// pin's own text-to-real conversion) as `r`.
+fn reads_back(c: u64, x: i32, r: f64) -> bool {
+    crate::sql::lexer::int_pow10_to_f64(c, i64::from(x)) == r
 }
 
 /// `f64::fract`/`abs` are not in `core`; spell the two checks we need.
@@ -587,6 +735,35 @@ pub fn apply_affinity(v: OwnedValue, aff: Affinity) -> OwnedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pin's REAL -> TEXT strings (CI's 3.54.1 run and the
+    /// fitted corpus; `tests/real_text_v16.rs` checks millions
+    /// against the oracle). Here so miri walks every branch.
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn render_real_pin_strings() {
+        for (v, want) in [
+            (1e15, "1000000000000000.0"),
+            (9223372036854775808.0, "9.2233720368547758e+18"),
+            (0.000123456789012345, "0.00012345678901234499"),
+            (574.423710258671, "574.42371025867101"),
+            (-589569.9865969187, "-589569.98659691867"),
+            (-3.521289658049935e18, "-3.5212896580499349e+18"),
+            (8.5281530614695, "8.5281530614695"),
+            (9.5e21, "9.5e+21"),
+            (9.4174e-10, "9.417400000000001e-10"),
+            (1e-14, "1.0e-14"),
+            (0.1, "0.1"),
+            (5e-324, "4.9406564584124654e-324"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"),
+            (-0.0, "0.0"),
+            (f64::NEG_INFINITY, "-Inf"),
+        ] {
+            let mut out = AVec::new();
+            render_real(v, &mut out);
+            assert_eq!(out.as_slice(), want.as_bytes(), "{v:?}");
+        }
+    }
 
     #[test]
     fn varint_roundtrip() {

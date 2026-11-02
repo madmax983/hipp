@@ -59,6 +59,97 @@ pub enum SchemaKind {
     /// `DROP VIEW` named a table instead of a view (v0.5; the
     /// oracle refuses this even under IF EXISTS).
     IsTable,
+    /// A `USING (col)` / NATURAL join column that is missing from
+    /// the joined source or from every source on its left
+    /// (v0.16; the pin's "cannot join using column ... not
+    /// present in both tables"). Name a column both sides have.
+    UsingColumnMissing,
+    /// An ON clause names a source joined after it (v0.16): an
+    /// outer join's ON (LEFT / RIGHT / FULL) never may, and with
+    /// a RIGHT / FULL join anywhere in the FROM clause no ON may
+    /// — the pin's "ON clause references tables to its right".
+    /// Move the term to WHERE or to a later ON.
+    OnReferencesLaterSource,
+    /// An ORDER BY / GROUP BY ordinal outside 1..=result width
+    /// (v0.16; the pin's "term out of range"). Use a valid
+    /// column number or an expression.
+    TermOutOfRange,
+    /// An aggregate where the pin forbids one (v0.16): in a
+    /// GROUP BY term (directly, or through an ordinal / alias
+    /// naming an aggregate result column) or in LIMIT / OFFSET.
+    MisusedAggregate,
+    /// A HAVING clause on a query that is not an aggregate query
+    /// — no GROUP BY and no aggregate in the result list (v0.16;
+    /// the pin refuses it). Add a GROUP BY or use WHERE.
+    HavingWithoutAggregate,
+    /// `abs()` of the INTEGER -9223372036854775808, which has no
+    /// INTEGER result (v0.16; the pin's "integer overflow" — hipp
+    /// used to answer a REAL). Cast the argument to REAL first.
+    IntegerOverflow,
+    /// A row failed one of its table's CHECK constraints
+    /// (v0.16): the constraint evaluated to false — NULL passes.
+    /// Raised under every conflict action except OR IGNORE
+    /// (which skips the row); OR REPLACE does not resolve it.
+    CheckViolation,
+    /// A column DEFAULT that is not constant (v0.16; the pin's
+    /// "default value of column is not constant"): it names a
+    /// column or contains a subquery. Use a literal or a
+    /// constant expression in parentheses.
+    NotConstantDefault,
+    /// Generated columns that depend on each other in a cycle
+    /// (v0.16; the pin's "generated column loop").
+    GeneratedColumnLoop,
+    /// A generated column the pin refuses to define (v0.16): a
+    /// DEFAULT on it, a PRIMARY KEY on it, a qualified (`t.c`)
+    /// reference or `rowid` in its expression, or a table with
+    /// no non-generated column. Drop the offending clause.
+    InvalidGeneratedColumn,
+    /// A subquery inside a CHECK constraint or generated column
+    /// (v0.16; the pin prohibits both).
+    SubqueryInConstraint,
+    /// An INSERT column list / UPDATE SET / upsert DO UPDATE
+    /// SET names a generated column (v0.16; the pin's "cannot
+    /// INSERT/UPDATE generated column"). Write its source
+    /// columns instead.
+    GeneratedColumnWrite,
+    /// A STRICT table column received a value its declared type
+    /// cannot hold after the type's conversion (v0.16; the
+    /// pin's "cannot store TEXT value in INT column").
+    StrictTypeViolation,
+    /// A STRICT table column without a type, or with one other
+    /// than INT / INTEGER / REAL / TEXT / BLOB / ANY (v0.16;
+    /// the pin's "missing / unknown datatype"). Declare one of
+    /// the six.
+    StrictColumnType,
+    /// An UPDATE ... FROM whose FROM clause repeats the target
+    /// table under the target's alias (or, both unaliased, bare)
+    /// (v0.16; the pin's "target object/alias may not appear in
+    /// FROM clause"). Give the FROM clause's copy its own
+    /// alias: `FROM t AS t2`.
+    UpdateTargetInFrom,
+    /// A `COLLATE` clause or operator names a collating
+    /// sequence other than BINARY, NOCASE or RTRIM (v0.16; the
+    /// pin's "no such collation sequence"). Use one of the
+    /// three built-ins.
+    UnknownCollation,
+    /// A LIKE `ESCAPE` operand (or `like()`'s third argument)
+    /// that is not exactly one character (v0.16; the pin's
+    /// "ESCAPE expression must be a single character"). Pass a
+    /// one-character escape.
+    EscapeNotSingleChar,
+    /// A LIKE / GLOB pattern longer than 50,000 bytes (v0.16;
+    /// the pin's default `SQLITE_LIMIT_LIKE_PATTERN_LENGTH`,
+    /// "LIKE or GLOB pattern too complex"). Shorten the pattern.
+    PatternTooComplex,
+    /// A bound parameter inside a schema object's definition — a
+    /// view, a CHECK constraint, a generated column or a DEFAULT
+    /// (v0.16, `params`; the pin's "parameters are not allowed in
+    /// views" / "parameters prohibited in CHECK constraints" /
+    /// "default value ... is not constant"). The definition is
+    /// stored as text and re-read without the bindings: write the
+    /// value as a literal.
+    #[cfg(feature = "params")]
+    ParameterNotAllowed,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -71,6 +162,33 @@ pub enum ParseKind {
     UnsupportedClause,
     RecursionLimit,
     TrailingInput,
+    /// A join operator whose keywords do not form a join type
+    /// (v0.16): `OUTER JOIN` alone, `INNER OUTER JOIN`, `LEFT
+    /// CROSS JOIN`, more than three keywords — the pin's
+    /// "unknown join type". Write LEFT / RIGHT / FULL [OUTER],
+    /// [INNER | CROSS], optionally after NATURAL.
+    UnknownJoinType,
+    /// A NATURAL join that also has an ON or USING clause
+    /// (v0.16; the pin refuses it). Drop NATURAL or the clause.
+    NaturalJoinConstraint,
+    /// A CHECK constraint, generated column, or non-literal
+    /// DEFAULT in a build without the v0.4 expression evaluator
+    /// (the tiny profile, v0.16): hipp cannot enforce or
+    /// compute it, so it refuses the table instead of silently
+    /// ignoring the clause. Build with feature `v04` (or
+    /// `full`), or drop the clause.
+    RequiresEvaluator,
+    /// `?0`, or `?NNN` past 32766 (v0.16, `params`; the pin's
+    /// "variable number must be between ?1 and ?32766"). Number
+    /// parameters from ?1 up to ?32766.
+    #[cfg(feature = "params")]
+    VariableNumber,
+    /// A statement whose parameters need an index past 32766
+    /// (v0.16, `params`; the pin's "too many SQL variables").
+    /// Split the statement, or reuse named / numbered
+    /// parameters.
+    #[cfg(feature = "params")]
+    TooManyVariables,
 }
 
 /// The core error type. Generic over the storage error `E`.
@@ -118,6 +236,23 @@ pub enum Error<E> {
     ArenaExhausted { scope: Scope, needed: usize },
     /// The rollback journal is malformed beyond safe recovery.
     CorruptJournal,
+    /// A statement needs the wall clock (`DEFAULT
+    /// CURRENT_TIMESTAMP` and friends, v0.16) but the connection
+    /// has none: the core has no clock of its own. Supply one
+    /// with `Config::clock`.
+    NoClock,
+    /// A `bind_*` call names an index outside 1 ..=
+    /// `parameter_count()` (v0.16, `params`; the pin's
+    /// `SQLITE_RANGE`). Bind by an index the statement has, or
+    /// look one up with `parameter_index`.
+    #[cfg(feature = "params")]
+    BindIndexOutOfRange { index: usize },
+    /// A `bind_*` call on a statement that has been stepped and
+    /// not reset (v0.16, `params`; the pin's `SQLITE_MISUSE`).
+    /// Call `Statement::reset` first. (`clear_bindings` is allowed
+    /// at any time and never returns it.)
+    #[cfg(feature = "params")]
+    ResetRequired,
     /// The caller's storage device error.
     Storage(E),
 }
@@ -153,6 +288,11 @@ impl<E> Error<E> {
             Error::TransactionState { nested } => Error::TransactionState { nested },
             Error::ArenaExhausted { scope, needed } => Error::ArenaExhausted { scope, needed },
             Error::CorruptJournal => Error::CorruptJournal,
+            Error::NoClock => Error::NoClock,
+            #[cfg(feature = "params")]
+            Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
+            #[cfg(feature = "params")]
+            Error::ResetRequired => Error::ResetRequired,
             Error::Storage(e) => Error::Storage(e.into()),
         }
     }

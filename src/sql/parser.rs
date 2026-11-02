@@ -1,18 +1,25 @@
 //! Recursive-descent parser for the v0.1 grammar (SPEC §5.6).
 //!
-//! The `CREATE TABLE` path is deliberately more tolerant than the
-//! generator grammar: `sqlite_schema` rows written by real SQLite
-//! must re-parse (§5.5), so column/table constraints SQLite emits
-//! (`NOT NULL`, `CHECK`, `DEFAULT`, foreign keys, …) are accepted
-//! syntactically. v0.1 *enforces* only `PRIMARY KEY` (for the
-//! rowid-alias rule); other constraints are parsed and not enforced
-//! — a recorded v0.1 dialect limitation, widened in v0.2.
+//! The `CREATE TABLE` path accepts the pin's whole column and
+//! table constraint grammar — `sqlite_schema` rows written by real
+//! SQLite must re-parse (§5.5) — and, since v0.16, nothing more:
+//! every item is walked clause by clause, because whatever is
+//! accepted is stored verbatim and must load on the pin. Foreign
+//! keys, constraint-level ON CONFLICT and DEFERRABLE are parsed
+//! and not enforced; CHECK, DEFAULT, generated columns, COLLATE,
+//! NOT NULL, PRIMARY KEY and UNIQUE are (CHECK and generated
+//! columns only with the v0.4 evaluator — the tiny profile refuses
+//! them).
 
 use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
+#[cfg(any(feature = "v04", feature = "indexes"))]
+use crate::record::Coll;
 
 #[cfg(feature = "v09")]
 use super::ast::CompoundOp;
+#[cfg(feature = "v04")]
+use super::ast::SortOrder;
 #[cfg(feature = "v07")]
 use super::ast::UpsertAction;
 use super::ast::{
@@ -72,6 +79,117 @@ pub fn parse<E>(sql: &[u8], arena: &Arena) -> Result<Ast, E> {
     Ok(ast)
 }
 
+/// `parse`, also returning the statement's parameter numbering
+/// (v0.16, feature `params`). A parameter inside a CREATE TABLE
+/// (other than its AS SELECT), ALTER TABLE or CREATE VIEW is
+/// refused, as on the pin: those definitions are stored as text
+/// and re-read without bindings.
+#[cfg(feature = "params")]
+pub fn parse_params<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, lexer::ParamTable), E> {
+    let mut params = lexer::ParamTable::default();
+    let toks = lexer::lex_params::<E>(sql, arena, &mut params)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    let stored = match &ast {
+        #[cfg(feature = "v16")]
+        Ast::CreateTable { as_select, .. } => as_select.is_none(),
+        #[cfg(not(feature = "v16"))]
+        Ast::CreateTable { .. } => true,
+        Ast::AlterAddColumn { .. } | Ast::CreateView { .. } => true,
+        _ => false,
+    };
+    if stored && params.count > 0 {
+        return Err(Error::Schema {
+            kind: crate::error::SchemaKind::ParameterNotAllowed,
+        });
+    }
+    Ok((ast, params))
+}
+
+/// Parse one stand-alone expression (v0.16): the stored text of
+/// a CHECK constraint, generated column or DEFAULT, re-parsed by
+/// the planner into `arena`. The whole input must be the one
+/// expression.
+#[cfg(feature = "v04")]
+pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena) -> Result<Expr, E> {
+    let toks = lexer::lex::<E>(sql, arena)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let e = p.parse_expr::<E>()?;
+    if !p.at_eof() {
+        return Err(perr(p.cur().offset, ParseKind::TrailingInput));
+    }
+    Ok(e)
+}
+
+/// Where the stored schema text of a CREATE TABLE / INDEX / VIEW
+/// statement starts (v0.16): the pin rebuilds that text as
+/// `CREATE TABLE ` (`CREATE VIEW `, `CREATE [UNIQUE] INDEX `)
+/// followed by the statement from the bare created name on, so a
+/// `main.` qualifier, `IF NOT EXISTS` and the keywords' spelling
+/// are not kept. Returns that prefix and the name's byte offset;
+/// `None` for text that does not lex.
+///
+/// It also refuses AUTOINCREMENT (`Error::Unsupported`, v0.16):
+/// hipp does not maintain the companion `sqlite_sequence` table,
+/// and a file holding an AUTOINCREMENT table without it is
+/// "malformed" to the pin on its next INSERT. (Existing files that
+/// have one still load: the catalog parses, it does not create.)
+/// The word is reserved, so an unquoted occurrence is the clause.
+pub fn schema_text_start<E>(
+    sql: &[u8],
+    arena: &Arena,
+) -> Result<Option<(&'static [u8], usize)>, E> {
+    let Ok(toks) = lexer::lex::<E>(sql, arena) else {
+        return Ok(None);
+    };
+    let p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    if (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT")) {
+        return Err(Error::Unsupported);
+    }
+    // CREATE [UNIQUE] TABLE|INDEX|VIEW [IF NOT EXISTS] [main .] name
+    let unique = p.is_kw(1, b"UNIQUE");
+    let kind = 1 + usize::from(unique);
+    let prefix: &'static [u8] = if p.is_kw(kind, b"VIEW") {
+        b"CREATE VIEW "
+    } else if p.is_kw(kind, b"INDEX") {
+        if unique {
+            b"CREATE UNIQUE INDEX "
+        } else {
+            b"CREATE INDEX "
+        }
+    } else {
+        b"CREATE TABLE "
+    };
+    let mut i = kind + 1;
+    if p.is_kw(i, b"IF") {
+        i += 3;
+    }
+    let t = p.toks.as_slice();
+    if t.get(i + 1).is_some_and(|d| matches!(d.tok, Tok::Dot)) {
+        i += 2;
+    }
+    Ok(t.get(i).map(|n| (prefix, n.offset)))
+}
+
 impl<'a> Parser<'a> {
     fn cur(&self) -> Token {
         let i = self.pos.min(self.limit - 1);
@@ -121,7 +239,11 @@ impl<'a> Parser<'a> {
     }
 
     fn eat(&mut self, t: Tok) -> bool {
-        if self.cur().tok == t {
+        // Discriminant compare: `eat` / `expect` only take
+        // payload-free tokens, and it keeps the derived
+        // `PartialEq for Tok` (f64 / handle payloads) out of the
+        // tiny build.
+        if core::mem::discriminant(&self.cur().tok) == core::mem::discriminant(&t) {
             self.pos += 1;
             true
         } else {
@@ -137,13 +259,44 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The collating sequence named by token `i` (v0.16): an
+    /// identifier or string (`COLLATE nocase`, `COLLATE
+    /// "NoCase"`, `COLLATE 'rtrim'`), matched case-insensitively.
+    /// An unknown name is the pin's "no such collation
+    /// sequence". Not built for the tiny profile, which has no
+    /// comparisons a collation could change (it skips the
+    /// clause, as before v0.16).
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    fn coll_at<E>(&self, i: usize) -> Result<Coll, E> {
+        let t = self
+            .toks
+            .as_slice()
+            .get(i.min(self.limit - 1))
+            .map(|t| t.tok);
+        match t {
+            Some(Tok::Ident(h, _)) | Some(Tok::Text(h)) => Coll::named(handle_bytes(self.arena, h))
+                .ok_or(Error::Schema {
+                    kind: crate::error::SchemaKind::UnknownCollation,
+                }),
+            _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+        }
+    }
+
     /// A table/column name: any identifier token (quoted or not).
     fn name<E>(&mut self) -> Result<ABytes, E> {
         match self.cur().tok {
             Tok::Ident(h, _) => {
                 self.pos += 1;
-                // Accept (and discard) a schema qualifier: `main.t`.
-                if self.cur().tok == Tok::Dot {
+                // Accept (and discard) the schema qualifier `main.`
+                // — the only schema a hipp connection has. Any
+                // other (`temp.t`, an attached name) is refused:
+                // hipp used to drop it and use `main.t`, where the
+                // pin finds no such table (or, for CREATE TABLE
+                // temp.t, makes a temporary one outside the file).
+                if matches!(self.cur().tok, Tok::Dot) {
+                    if !eq_ci(handle_bytes(self.arena, h), b"main") {
+                        return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                    }
                     self.pos += 1;
                     return self.name::<E>();
                 }
@@ -351,6 +504,15 @@ impl<'a> Parser<'a> {
         };
         let name = self.name::<E>()?;
         self.expect_kw::<E>(b"ON")?;
+        // The indexed table is a bare name on the pin (`ON
+        // main.t` is a syntax error there — and stored, a schema
+        // it cannot load).
+        if matches!(
+            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+            Some(Tok::Dot)
+        ) {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
         let table = self.name::<E>()?;
         self.expect::<E>(Tok::LParen)?;
         let mut columns: AVec<IndexColumnDef> = AVec::new();
@@ -359,15 +521,15 @@ impl<'a> Parser<'a> {
             // An expression index column looks like `abs(a)` or
             // `(a+1)`: a '(' right here (or as the item start,
             // caught because name() rejects '(') is outside v0.3.
-            if self.cur().tok == Tok::LParen {
+            if matches!(self.cur().tok, Tok::LParen) {
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
+            // v0.16: an explicit key collation (BINARY, NOCASE
+            // or RTRIM — the index orders and finds keys by it).
+            let mut coll = None;
             if self.eat_kw(b"COLLATE") {
-                let coll = self.name::<E>()?;
-                if !eq_ci(handle_bytes(self.arena, coll), b"BINARY") {
-                    // Only the BINARY collation exists in hipp.
-                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
-                }
+                coll = Some(self.coll_at::<E>(self.pos)?);
+                self.pos += 1;
             }
             let desc = if self.eat_kw(b"DESC") {
                 true
@@ -375,7 +537,11 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_kw(b"ASC");
                 false
             };
-            columns.push(IndexColumnDef { name: col, desc });
+            columns.push(IndexColumnDef {
+                name: col,
+                desc,
+                coll,
+            });
             if self.eat(Tok::Comma) {
                 continue;
             }
@@ -425,6 +591,22 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.name::<E>()?;
+        // CREATE TABLE ... AS SELECT (v0.16, `v16`): the columns
+        // come from the SELECT at plan time.
+        #[cfg(feature = "v16")]
+        if self.eat_kw(b"AS") {
+            let select = self.select_rich::<E>()?;
+            return Ok(Ast::CreateTable {
+                name,
+                if_not_exists,
+                columns: AVec::new(),
+                pk_columns: AVec::new(),
+                constraint_sets: AVec::new(),
+                checks: AVec::new(),
+                strict: false,
+                as_select: Some(Box::new(select)),
+            });
+        }
         self.expect::<E>(Tok::LParen)?;
         // Split the parenthesised body into top-level comma items.
         let items = self.split_items::<E>()?;
@@ -432,15 +614,30 @@ impl<'a> Parser<'a> {
         let mut pk_names: AVec<ABytes> = AVec::new();
         let mut pk_desc_names: AVec<ABytes> = AVec::new();
         let mut sets: AVec<ConstraintSet> = AVec::new();
+        #[cfg(feature = "v04")]
+        let mut checks: AVec<ABytes> = AVec::new();
+        // Column definitions first, then table constraints (the
+        // pin's `columnlist conslist_opt`): a column after a table
+        // constraint is a syntax error.
+        let mut in_cons = false;
         for (from, to) in items.iter() {
-            self.create_item::<E>(
+            let ncols = columns.len();
+            in_cons |= self.create_item::<E>(
                 *from,
                 *to,
                 &mut columns,
                 &mut pk_names,
                 &mut pk_desc_names,
                 &mut sets,
+                #[cfg(feature = "v04")]
+                &mut checks,
             )?;
+            if in_cons && columns.len() != ncols {
+                return Err(perr(
+                    self.item_end_offset(*from),
+                    ParseKind::UnexpectedToken,
+                ));
+            }
         }
         if columns.is_empty() {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
@@ -478,7 +675,29 @@ impl<'a> Parser<'a> {
             // SQLite: "table has more than one primary key".
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
+        #[cfg(feature = "indexes")]
+        let sets = self.dedupe_sets(sets, &columns, &pk_columns);
+        // Table options (v0.16, `v16`): a comma-separated list of
+        // STRICT and WITHOUT ROWID, as on the pin (`STRICT,STRICT`
+        // parses; `STRICT STRICT` does not). WITHOUT ROWID stays
+        // outside every hipp phase and is refused.
+        #[cfg(feature = "v16")]
+        let mut strict = false;
+        #[cfg(feature = "v16")]
+        if self.cur_is_kw(b"STRICT") || self.cur_is_kw(b"WITHOUT") {
+            loop {
+                if self.cur_is_kw(b"WITHOUT") {
+                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                }
+                self.expect_kw::<E>(b"STRICT")?;
+                strict = true;
+                if !self.eat(Tok::Comma) {
+                    break;
+                }
+            }
+        }
         // Trailing clauses: WITHOUT ROWID is outside v0.1.
+        #[cfg(not(feature = "v16"))]
         if self.cur_is_kw(b"WITHOUT") {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
@@ -488,7 +707,99 @@ impl<'a> Parser<'a> {
             columns,
             pk_columns,
             constraint_sets: sets,
+            #[cfg(feature = "v04")]
+            checks,
+            #[cfg(feature = "v16")]
+            strict,
+            #[cfg(feature = "v16")]
+            as_select: None,
         })
+    }
+
+    /// Drop each PRIMARY KEY / UNIQUE set that repeats an earlier
+    /// one — the same columns in the same order with the same
+    /// collations, sort order aside — as the pin's
+    /// `sqlite3CreateIndex` does for automatic indexes (v0.16:
+    /// `a PRIMARY KEY UNIQUE` used to get two autoindexes, a
+    /// schema the pin rejects as "orphan index"). A repeat of a
+    /// UNIQUE set by the PRIMARY KEY makes the earlier set the
+    /// key's. The rowid-alias key (no index) never merges.
+    #[cfg(feature = "indexes")]
+    fn dedupe_sets(
+        &self,
+        sets: AVec<ConstraintSet>,
+        columns: &AVec<ColumnDef>,
+        pk_columns: &AVec<ABytes>,
+    ) -> AVec<ConstraintSet> {
+        let name = |h: ABytes| handle_bytes(self.arena, h);
+        let col = |h: ABytes| columns.iter().find(|c| eq_ci(name(c.name), name(h)));
+        let alias = pk_columns.len() == 1
+            && pk_columns
+                .as_slice()
+                .first()
+                .and_then(|h| col(*h))
+                .is_some_and(|c| {
+                    !c.pk_desc && eq_ci(trim(handle_bytes(self.arena, c.decl)), b"INTEGER")
+                });
+        let coll = |d: &IndexColumnDef| d.coll.or_else(|| col(d.name).and_then(|c| c.coll));
+        let mut out: AVec<ConstraintSet> = AVec::new();
+        for s in sets.iter() {
+            let indexed = |x: &ConstraintSet| !(x.primary_key && alias);
+            let same = |k: &ConstraintSet| {
+                k.columns.len() == s.columns.len()
+                    && k.columns.iter().zip(s.columns.iter()).all(|(a, b)| {
+                        eq_ci(name(a.name), name(b.name))
+                            && coll(a).unwrap_or_default() == coll(b).unwrap_or_default()
+                    })
+            };
+            if indexed(s)
+                && let Some(k) = out
+                    .as_mut_slice()
+                    .iter_mut()
+                    .find(|k| indexed(k) && same(k))
+            {
+                k.primary_key |= s.primary_key;
+                continue;
+            }
+            out.push(s.clone());
+        }
+        out
+    }
+
+    /// The index of the `)` matching the `(` at token `k`,
+    /// within the item ending at token `to` (v0.16).
+    fn close_paren<E>(&self, k: usize, to: usize) -> Result<usize, E> {
+        let mut depth = 0usize;
+        let mut j = k;
+        while j < to {
+            match self.toks.as_slice()[j].tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Ok(j);
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        Err(perr(self.item_end_offset(to), ParseKind::UnexpectedToken))
+    }
+
+    /// The SQL text inside the parenthesised group opening at
+    /// token `k` (v0.16: CHECK and generated-column bodies),
+    /// plus the index of its closing `)`.
+    #[cfg(feature = "v04")]
+    fn paren_text<E>(&self, k: usize, to: usize) -> Result<(usize, ABytes), E> {
+        if k >= to || !matches!(self.toks.as_slice()[k].tok, Tok::LParen) {
+            return Err(perr(self.item_end_offset(k), ParseKind::UnexpectedToken));
+        }
+        let close = self.close_paren::<E>(k, to)?;
+        let start = self.toks.as_slice()[k + 1].offset;
+        let end = self.toks.as_slice()[close].offset;
+        let text = trim(&self.sql[start.min(end)..end.min(self.sql.len())]);
+        Ok((close, self.arena.alloc_copy_handle(text)?))
     }
 
     /// Consume tokens up to the matching `)` of an already-eaten
@@ -528,223 +839,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a `(col [ASC|DESC], ...)` list starting at token
-    /// `from` (the '(' is consumed by the scan); returns the column
-    /// defs. Used by table-level PRIMARY KEY / UNIQUE items.
-    fn constraint_columns(&self, mut i: usize, to: usize) -> AVec<IndexColumnDef> {
-        let mut out = AVec::new();
-        if i < to && self.toks.as_slice()[i].tok == Tok::LParen {
-            i += 1;
-        }
-        while i < to {
-            let Some((h, _, _)) = self.ident_at(i) else {
-                break;
-            };
-            i += 1;
-            let mut desc = false;
-            if self.is_kw(i, b"DESC") {
-                desc = true;
-                i += 1;
-            } else if self.is_kw(i, b"ASC") {
-                i += 1;
-            }
-            // A COLLATE clause may intervene; ignore its name.
-            if self.is_kw(i, b"COLLATE") {
-                i += 2;
-            }
-            out.push(IndexColumnDef { name: h, desc });
-            if i < to && self.toks.as_slice()[i].tok == Tok::Comma {
-                i += 1;
-                continue;
-            }
-            break;
-        }
-        out
-    }
-
-    fn create_item<E>(
-        &mut self,
-        mut from: usize,
-        to: usize,
-        columns: &mut AVec<ColumnDef>,
-        pk_names: &mut AVec<ABytes>,
-        pk_desc_names: &mut AVec<ABytes>,
-        sets: &mut AVec<ConstraintSet>,
-    ) -> Result<(), E> {
-        // CONSTRAINT name … — skip the constraint's name.
-        if self.is_kw(from, b"CONSTRAINT") {
-            from += 2;
-        }
-        if from >= to {
-            return Ok(());
-        }
-        if self.is_kw(from, b"PRIMARY") {
-            // Table-level PRIMARY KEY (col, …)
-            let mut i = from + 1;
-            if self.is_kw(i, b"KEY") {
-                i += 1;
-            }
-            let cols = self.constraint_columns(i, to);
-            for c in cols.iter() {
-                pk_names.push(c.name);
-                if c.desc {
-                    pk_desc_names.push(c.name);
-                }
-            }
-            sets.push(ConstraintSet {
-                primary_key: true,
-                columns: cols,
-            });
-            return Ok(());
-        }
-        if self.is_kw(from, b"UNIQUE")
-            && from + 1 < to
-            && self.toks.as_slice()[from + 1].tok == Tok::LParen
-        {
-            // Table-level UNIQUE (col, …) (v0.3: enforced via an
-            // implicit index, like SQLite).
-            let cols = self.constraint_columns(from + 1, to);
-            sets.push(ConstraintSet {
-                primary_key: false,
-                columns: cols,
-            });
-            return Ok(());
-        }
-        if self.is_kw(from, b"CHECK")
-            || self.is_kw(from, b"FOREIGN")
-            || self.is_kw(from, b"KEY")
-            || self.is_kw(from, b"INDEX")
-        {
-            // Parsed, not enforced in v0.1 (see module docs).
-            return Ok(());
-        }
-        // Column definition: first token is the name.
-        let Some((col_name, _, _)) = self.ident_at(from) else {
-            return Err(perr(
-                self.toks.as_slice()[from].offset,
-                ParseKind::UnexpectedToken,
-            ));
-        };
-        // Declared type: tokens after the name up to the first
-        // depth-0 constraint keyword; the text is the SQL span.
-        let mut depth = 0usize;
-        let mut decl_end_tok = to;
-        let mut pk = false;
-        let mut pk_desc = false;
-        let mut unique = false;
-        let mut default: Option<Literal> = None;
-        let mut not_null = false;
-        let mut default_nonconst = false;
-        let mut generated = false;
-        let mut i = from + 1;
-        while i < to {
-            let t = self.toks.as_slice()[i];
-            match t.tok {
-                Tok::LParen => {
-                    depth += 1;
-                    if depth > MAX_DEPTH {
-                        return Err(perr(t.offset, ParseKind::RecursionLimit));
-                    }
-                }
-                Tok::RParen => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-            if depth == 0 {
-                if self.is_kw(i, b"PRIMARY") && self.is_kw(i + 1, b"KEY") {
-                    pk = true;
-                    decl_end_tok = decl_end_tok.min(i);
-                    if self.is_kw(i + 2, b"DESC") {
-                        pk_desc = true;
-                    }
-                }
-                if self.is_kw(i, b"UNIQUE") {
-                    unique = true;
-                }
-                if self.is_kw(i, b"DEFAULT") {
-                    decl_end_tok = decl_end_tok.min(i);
-                    default = self.default_literal(i + 1, to);
-                    if default.is_none() {
-                        // A DEFAULT whose value is not a plain
-                        // literal (CURRENT_TIMESTAMP, a call, ...).
-                        default_nonconst = true;
-                    }
-                }
-                if self.is_kw(i, b"NOT") && self.is_kw(i + 1, b"NULL") {
-                    not_null = true;
-                }
-                if self.is_kw(i, b"GENERATED") {
-                    generated = true;
-                }
-                if self.is_kw(i, b"NOT")
-                    || self.is_kw(i, b"NULL")
-                    || self.is_kw(i, b"UNIQUE")
-                    || self.is_kw(i, b"CHECK")
-                    || self.is_kw(i, b"REFERENCES")
-                    || self.is_kw(i, b"COLLATE")
-                    || self.is_kw(i, b"GENERATED")
-                    || self.is_kw(i, b"CONSTRAINT")
-                {
-                    decl_end_tok = decl_end_tok.min(i);
-                }
-            }
-            i += 1;
-        }
-        let decl = if decl_end_tok > from + 1 {
-            let start_off = self.toks.as_slice()[from + 1].offset;
-            let end_off = if decl_end_tok < to {
-                self.toks.as_slice()[decl_end_tok].offset
-            } else {
-                // End of item: use the end offset of the last token.
-                self.item_end_offset(decl_end_tok)
-            };
-            let text = trim(&self.sql[start_off..end_off.min(self.sql.len())]);
-            self.arena.alloc_copy_handle(text)?
-        } else {
-            ABytes::EMPTY
-        };
-        columns.push(ColumnDef {
-            name: col_name,
-            decl,
-            primary_key: pk && !pk_desc,
-            pk_desc,
-            unique,
-            default,
-            not_null,
-            default_nonconst,
-            generated,
-        });
-        // Constraint sets in statement order (v0.3): an inline
-        // PRIMARY KEY / UNIQUE is a one-column set at this item's
-        // position.
-        if pk {
-            pk_names.push(col_name);
-            if pk_desc {
-                pk_desc_names.push(col_name);
-            }
-            let mut cols = AVec::new();
-            cols.push(IndexColumnDef {
-                name: col_name,
-                desc: pk_desc,
-            });
-            sets.push(ConstraintSet {
-                primary_key: true,
-                columns: cols,
-            });
-        }
-        if unique {
-            let mut cols = AVec::new();
-            cols.push(IndexColumnDef {
-                name: col_name,
-                desc: false,
-            });
-            sets.push(ConstraintSet {
-                primary_key: false,
-                columns: cols,
-            });
-        }
-        Ok(())
-    }
-
     fn item_end_offset(&self, tok_idx: usize) -> usize {
         // Offset just past the last significant token before tok_idx:
         // approximate with the next token's offset (items are followed
@@ -756,13 +850,38 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a DEFAULT literal starting at token `i` (best effort:
-    /// non-literal defaults like CURRENT_TIMESTAMP yield None).
-    fn default_literal(&self, mut i: usize, to: usize) -> Option<Literal> {
-        if i < to && self.toks.as_slice()[i].tok == Tok::LParen {
-            i += 1;
+    /// Token `i` is the integer literal 9223372036854775808
+    /// (leading zeros allowed) — lexed as a REAL, the one integer
+    /// text a minus sign turns back into an INTEGER (v0.16).
+    fn min_magnitude(&self, i: usize) -> bool {
+        let Some(t) = self.toks.as_slice().get(i) else {
+            return false;
+        };
+        if !matches!(t.tok, Tok::Real(f) if f == 9_223_372_036_854_775_808.0) {
+            return false;
         }
-        self.literal_at(i).map(|(lit, _)| lit)
+        let mut z = self.sql.get(t.offset..).unwrap_or(&[]);
+        while let [b'0', rest @ ..] = z {
+            z = rest;
+        }
+        let d = b"9223372036854775808";
+        z.starts_with(d)
+            && !z
+                .get(d.len())
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_')
+    }
+
+    /// A parameter token at the cursor, consumed (v0.16,
+    /// `params`): the literal positions of the tiny grammar.
+    #[cfg(all(feature = "params", not(feature = "v04")))]
+    fn param_here(&mut self) -> Option<Expr> {
+        match self.cur().tok {
+            Tok::Param(i, h) => {
+                self.pos += 1;
+                Some(Expr::Param(i, h))
+            }
+            _ => None,
+        }
     }
 
     fn literal_at(&self, i: usize) -> Option<(Literal, usize)> {
@@ -775,11 +894,29 @@ impl<'a> Parser<'a> {
             Tok::Real(f) => Some((Literal::Real(f), 1)),
             Tok::Text(h) => Some((Literal::Text(h), 1)),
             Tok::Blob(h) => Some((Literal::Blob(h), 1)),
-            Tok::Minus => match self.literal_at(i + 1) {
-                Some((Literal::Integer(v), n)) => Some((Literal::Integer(v.wrapping_neg()), n + 1)),
-                Some((Literal::Real(f), n)) => Some((Literal::Real(-f), n + 1)),
-                _ => None,
-            },
+            Tok::Minus => {
+                // The pin's `codeInteger`: `-` over the integer
+                // literal 9223372036854775808 (unary `+` between
+                // is transparent) is INTEGER i64::MIN, not a REAL
+                // (v0.16); `-` over i64::MIN itself overflows to
+                // REAL.
+                let mut j = i + 1;
+                while matches!(self.toks.as_slice().get(j).map(|t| t.tok), Some(Tok::Plus)) {
+                    j += 1;
+                }
+                if self.min_magnitude(j) {
+                    return Some((Literal::Integer(i64::MIN), j - i + 1));
+                }
+                match self.literal_at(i + 1) {
+                    Some((Literal::Integer(v), n)) => Some((
+                        v.checked_neg()
+                            .map_or(Literal::Real(-(v as f64)), Literal::Integer),
+                        n + 1,
+                    )),
+                    Some((Literal::Real(f), n)) => Some((Literal::Real(-f), n + 1)),
+                    _ => None,
+                }
+            }
             Tok::Plus => self.literal_at(i + 1).map(|(l, n)| (l, n + 1)),
             Tok::Ident(h, false) => {
                 let b = handle_bytes(self.arena, h);
@@ -839,6 +976,33 @@ impl<'a> Parser<'a> {
                 break;
             }
             columns = Some(cols);
+        }
+        // `INSERT INTO t DEFAULT VALUES` (v0.16, `v16`): one row
+        // of defaults — an empty target list with one empty VALUES
+        // row. The pin allows no column list before it and no
+        // ON CONFLICT after it (RETURNING is fine).
+        #[cfg(feature = "v16")]
+        if self.cur_is_kw(b"DEFAULT") {
+            self.pos += 1;
+            if columns.is_some() {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+            self.expect_kw::<E>(b"VALUES")?;
+            let mut rows = AVec::new();
+            rows.push(AVec::new());
+            #[cfg(feature = "v07")]
+            let returning = self.returning_clause::<E>()?;
+            #[cfg(not(feature = "v07"))]
+            let returning = AVec::new();
+            return Ok(Ast::Insert {
+                table,
+                columns: Some(AVec::new()),
+                rows,
+                select: None,
+                conflict,
+                upsert: None,
+                returning,
+            });
         }
         let InsertSource { rows, select } = self.insert_source::<E>()?;
         let (upsert, returning) = self.insert_tail::<E>()?;
@@ -951,14 +1115,19 @@ impl<'a> Parser<'a> {
     fn upsert_clause<E>(&mut self) -> Result<Upsert, E> {
         self.expect_kw::<E>(b"CONFLICT")?;
         let mut target = AVec::new();
+        let mut target_colls = AVec::new();
         if self.eat(Tok::LParen) {
             loop {
                 target.push(self.name::<E>()?);
                 // Indexed-column decorations SQLite permits in a
-                // conflict target: COLLATE <name>, ASC / DESC.
+                // conflict target: COLLATE <name>, ASC / DESC
+                // (v0.16: the collation must match the index's).
+                let mut coll = None;
                 if self.eat_kw(b"COLLATE") {
-                    let _ = self.name::<E>()?;
+                    coll = Some(self.coll_at::<E>(self.pos)?);
+                    self.pos += 1;
                 }
+                target_colls.push(coll);
                 let _ = self.eat_kw(b"ASC") || self.eat_kw(b"DESC");
                 if self.eat(Tok::Comma) {
                     continue;
@@ -1001,6 +1170,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Upsert {
             target,
+            target_colls,
             target_filter,
             action,
         })
@@ -1020,8 +1190,14 @@ impl<'a> Parser<'a> {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
             } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::Dot)
-                && self.toks.as_slice().get(self.pos + 2).map(|t| t.tok) == Some(Tok::Star)
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                    Some(Tok::Dot)
+                )
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
+                    Some(Tok::Star)
+                )
             {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
@@ -1052,6 +1228,10 @@ impl<'a> Parser<'a> {
 
     #[cfg(not(feature = "v04"))]
     fn value_expr<E>(&mut self) -> Result<Expr, E> {
+        #[cfg(feature = "params")]
+        if let Some(e) = self.param_here() {
+            return Ok(e);
+        }
         let (lit, used) = self
             .literal_at(self.pos)
             .ok_or(perr(self.cur().offset, ParseKind::UnexpectedToken))?;
@@ -1107,6 +1287,10 @@ impl<'a> Parser<'a> {
             kind: JoinKind::Inner,
             on: None,
             derived: None,
+            #[cfg(feature = "v04")]
+            natural: false,
+            #[cfg(feature = "v04")]
+            using: AVec::new(),
         });
         // v0.2: optional WHERE <column> = <literal>. Any other
         // predicate shape is rejected here; whether <column> is the
@@ -1117,17 +1301,32 @@ impl<'a> Parser<'a> {
             if !self.eat(Tok::Eq) {
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
-            let (lit, used) = self
-                .literal_at(self.pos)
-                .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
-            self.pos += used;
+            #[cfg(feature = "params")]
+            let rhs = match self.param_here() {
+                Some(e) => e,
+                None => {
+                    let (lit, used) = self
+                        .literal_at(self.pos)
+                        .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
+                    self.pos += used;
+                    Expr::Literal(lit)
+                }
+            };
+            #[cfg(not(feature = "params"))]
+            let rhs = {
+                let (lit, used) = self
+                    .literal_at(self.pos)
+                    .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
+                self.pos += used;
+                Expr::Literal(lit)
+            };
             filter = Some(Expr::Binary(
                 BinOp::Eq,
                 Box::new(Expr::Column {
                     table: None,
                     name: col,
                 }),
-                Box::new(Expr::Literal(lit)),
+                Box::new(rhs),
             ));
         }
         Ok(Ast::Select(SelectStmt {
@@ -1139,7 +1338,7 @@ impl<'a> Parser<'a> {
             having: None,
             order_by: AVec::new(),
             limit: None,
-            offset: 0,
+            offset: None,
             compound: AVec::new(),
             values: AVec::new(),
         }))
@@ -1167,7 +1366,14 @@ impl<'a> Parser<'a> {
             b"LEFT",
             b"CROSS",
             b"OUTER",
+            // The pin's remaining join keywords (JOIN_KW tokens,
+            // never a bare alias there): eating them as an alias
+            // turned `a RIGHT JOIN b` into an inner join (v0.16).
+            b"NATURAL",
+            b"RIGHT",
+            b"FULL",
             b"ON",
+            b"USING",
             b"UNION",
             b"EXCEPT",
             b"INTERSECT",
@@ -1175,15 +1381,29 @@ impl<'a> Parser<'a> {
         match self.ident_at(self.pos) {
             Some((h, false, _)) => {
                 let b = handle_bytes(self.arena, h);
-                KWS.iter().any(|k| eq_ci(b, k))
+                // RETURNING (v0.16 fix, v07 grammar) ends an
+                // UPDATE ... FROM source list: `FROM s RETURNING v`
+                // used to alias `s` as RETURNING.
+                KWS.iter().any(|k| eq_ci(b, k)) || (cfg!(feature = "v07") && eq_ci(b, b"RETURNING"))
             }
             _ => false,
         }
     }
 
     /// An optional `[AS] name` alias: a quoted identifier, or a
-    /// bare identifier that is not a clause keyword.
+    /// bare identifier that is not a clause keyword. Under `v16`
+    /// a string literal works too, with or without AS (the pin's
+    /// `as ::= AS nm | ids`, where both admit a STRING token):
+    /// `SELECT a AS 'q'`, `FROM t 'x'`.
     fn opt_alias(&mut self) -> Option<ABytes> {
+        #[cfg(feature = "v16")]
+        {
+            let at = if self.cur_is_kw(b"AS") { 1 } else { 0 };
+            if let Some(Tok::Text(h)) = self.toks.as_slice().get(self.pos + at).map(|t| t.tok) {
+                self.pos += at + 1;
+                return Some(h);
+            }
+        }
         if self.eat_kw(b"AS") {
             return match self.cur().tok {
                 Tok::Ident(h, _) => {
@@ -1265,6 +1485,7 @@ impl<'a> Parser<'a> {
             let neg = if self.cur_is_kw(b"NOT")
                 && (self.is_kw(self.pos + 1, b"IN")
                     || self.is_kw(self.pos + 1, b"LIKE")
+                    || (cfg!(feature = "v16") && self.is_kw(self.pos + 1, b"GLOB"))
                     || self.is_kw(self.pos + 1, b"BETWEEN"))
             {
                 self.pos += 1;
@@ -1273,13 +1494,22 @@ impl<'a> Parser<'a> {
                 false
             };
             if self.eat_kw(b"IN") {
+                // `x IN tablename` (v0.16, `v16`): the pin reads
+                // it as `x IN (SELECT * FROM tablename)` — a
+                // one-column table is required at plan time.
+                #[cfg(feature = "v16")]
+                if let Tok::Ident(..) = self.cur().tok {
+                    let table = self.name::<E>()?;
+                    l = Expr::InSubquery(Box::new(l), Box::new(self.table_select(table)), neg);
+                    continue;
+                }
                 self.expect::<E>(Tok::LParen)?;
                 // A subquery body: SELECT (or a v0.9 VALUES core),
                 // possibly under further parentheses — the pin
                 // accepts `IN ((SELECT ...))`.
                 let save = self.pos;
                 let mut extra_parens = 0usize;
-                while self.cur().tok == Tok::LParen {
+                while matches!(self.cur().tok, Tok::LParen) {
                     self.pos += 1;
                     extra_parens += 1;
                 }
@@ -1311,7 +1541,7 @@ impl<'a> Parser<'a> {
                 }
 
                 let mut list = AVec::new();
-                if self.cur().tok != Tok::RParen {
+                if !matches!(self.cur().tok, Tok::RParen) {
                     loop {
                         list.push(self.parse_expr::<E>()?);
                         if self.eat(Tok::Comma) {
@@ -1326,7 +1556,23 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw(b"LIKE") {
                 let r = self.expr_add::<E>()?;
+                // `x LIKE p ESCAPE e` (v0.16, `v16`) is the pin's
+                // `like(p, x, e)` call, negated for NOT LIKE.
+                #[cfg(feature = "v16")]
+                if self.eat_kw(b"ESCAPE") {
+                    let esc = self.expr_add::<E>()?;
+                    l = self.pattern_call::<E>(b"like", r, l, Some(esc), neg)?;
+                    continue;
+                }
                 l = Expr::Like(Box::new(l), Box::new(r), neg);
+                continue;
+            }
+            // `x [NOT] GLOB p` (v0.16, `v16`): the pin's
+            // `glob(p, x)` call (no ESCAPE form).
+            #[cfg(feature = "v16")]
+            if self.eat_kw(b"GLOB") {
+                let r = self.expr_add::<E>()?;
+                l = self.pattern_call::<E>(b"glob", r, l, None, neg)?;
                 continue;
             }
             if self.eat_kw(b"BETWEEN") {
@@ -1393,12 +1639,58 @@ impl<'a> Parser<'a> {
     }
 
     fn expr_concat<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_unary::<E>()?;
+        let mut l = self.expr_collate::<E>()?;
         while self.eat(Tok::Concat) {
-            let r = self.expr_unary::<E>()?;
+            let r = self.expr_collate::<E>()?;
             l = Expr::Binary(BinOp::Concat, Box::new(l), Box::new(r));
         }
         Ok(l)
+    }
+
+    /// `expr COLLATE name` (v0.16, `v16`): binds tighter than
+    /// `||` and looser than the unary operators (the pin's
+    /// precedence: `-a COLLATE x` is `(-a) COLLATE x`).
+    #[cfg(feature = "v16")]
+    fn expr_collate<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_unary::<E>()?;
+        while self.eat_kw(b"COLLATE") {
+            let c = self.coll_at::<E>(self.pos)?;
+            self.pos += 1;
+            l = Expr::Collate(Box::new(l), c);
+        }
+        Ok(l)
+    }
+
+    #[cfg(not(feature = "v16"))]
+    fn expr_collate<E>(&mut self) -> Result<Expr, E> {
+        self.expr_unary::<E>()
+    }
+
+    /// A LIKE ... ESCAPE / GLOB operator as the pin's function
+    /// call (v0.16, `v16`): `name(pattern, subject[, escape])`,
+    /// wrapped in NOT for the negated form.
+    #[cfg(feature = "v16")]
+    fn pattern_call<E>(
+        &mut self,
+        name: &[u8],
+        pattern: Expr,
+        subject: Expr,
+        escape: Option<Expr>,
+        neg: bool,
+    ) -> Result<Expr, E> {
+        let mut args = AVec::new();
+        args.push(pattern);
+        args.push(subject);
+        if let Some(e) = escape {
+            args.push(e);
+        }
+        let call = Expr::Func {
+            name: self.arena.alloc_copy_handle(name)?,
+            distinct: false,
+            star: false,
+            args,
+        };
+        Ok(if neg { Expr::Not(Box::new(call)) } else { call })
     }
 
     fn expr_unary<E>(&mut self) -> Result<Expr, E> {
@@ -1409,11 +1701,23 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Literal(lit));
         }
         if self.eat(Tok::Minus) {
+            let start = self.pos;
             let e = self.expr_unary::<E>()?;
+            // `-(9223372036854775808)`: parentheses (and unary
+            // `+`) are invisible to the pin's integer rule.
+            let toks = self.toks.as_slice().get(start..self.pos).unwrap_or(&[]);
+            if toks.iter().enumerate().all(|(k, t)| {
+                matches!(t.tok, Tok::LParen | Tok::RParen | Tok::Plus)
+                    || self.min_magnitude(start + k)
+            }) && toks.iter().any(|t| matches!(t.tok, Tok::Real(_)))
+            {
+                return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
+            }
             return Ok(Expr::Neg(Box::new(e)));
         }
         if self.eat(Tok::Plus) {
-            return self.expr_unary::<E>();
+            let e = self.expr_unary::<E>()?;
+            return Ok(Expr::Pos(Box::new(e)));
         }
         self.expr_primary::<E>()
     }
@@ -1424,7 +1728,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             self.expect::<E>(Tok::LParen)?;
             let mut extra_parens = 0usize;
-            while self.cur().tok == Tok::LParen {
+            while matches!(self.cur().tok, Tok::LParen) {
                 self.pos += 1;
                 extra_parens += 1;
             }
@@ -1488,7 +1792,10 @@ impl<'a> Parser<'a> {
                 let nb = handle_bytes(self.arena, h);
                 // Function call: ident followed by '('.
                 if !quoted
-                    && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::LParen)
+                    && matches!(
+                        self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                        Some(Tok::LParen)
+                    )
                 {
                     if eq_ci(nb, b"CAST") {
                         self.pos += 2; // name + '('
@@ -1523,7 +1830,7 @@ impl<'a> Parser<'a> {
                     let star = self.eat(Tok::Star);
                     let distinct = !star && self.eat_kw(b"DISTINCT");
                     let mut args = AVec::new();
-                    if !star && self.cur().tok != Tok::RParen {
+                    if !star && !matches!(self.cur().tok, Tok::RParen) {
                         loop {
                             args.push(self.parse_expr::<E>()?);
                             if self.eat(Tok::Comma) {
@@ -1547,7 +1854,7 @@ impl<'a> Parser<'a> {
                 // Column reference, possibly qualified. Parse the
                 // tokens directly (name() would eat the qualifier).
                 self.pos += 1;
-                if self.cur().tok == Tok::Dot {
+                if matches!(self.cur().tok, Tok::Dot) {
                     self.pos += 1;
                     match self.cur().tok {
                         Tok::Ident(h2, _) => {
@@ -1564,6 +1871,11 @@ impl<'a> Parser<'a> {
                     table: None,
                     name: h,
                 })
+            }
+            #[cfg(feature = "params")]
+            Tok::Param(i, h) => {
+                self.pos += 1;
+                Ok(Expr::Param(i, h))
             }
             _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         }
@@ -1663,7 +1975,7 @@ impl<'a> Parser<'a> {
             having: None,
             order_by: AVec::new(),
             limit: None,
-            offset: 0,
+            offset: None,
             compound: AVec::new(),
             values,
         })
@@ -1682,8 +1994,14 @@ impl<'a> Parser<'a> {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
             } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::Dot)
-                && self.toks.as_slice().get(self.pos + 2).map(|t| t.tok) == Some(Tok::Star)
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                    Some(Tok::Dot)
+                )
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
+                    Some(Tok::Star)
+                )
             {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
@@ -1702,33 +2020,11 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        let mut from = AVec::new();
-        if self.eat_kw(b"FROM") {
-            from.push(self.join_source::<E>(JoinKind::Inner, true)?);
-            loop {
-                if self.eat(Tok::Comma) {
-                    from.push(self.join_source::<E>(JoinKind::Cross, false)?);
-                    continue;
-                }
-                let kind = if self.eat_kw(b"JOIN") {
-                    Some(JoinKind::Inner)
-                } else if self.eat_kw(b"INNER") {
-                    self.expect_kw::<E>(b"JOIN")?;
-                    Some(JoinKind::Inner)
-                } else if self.eat_kw(b"LEFT") {
-                    let _ = self.eat_kw(b"OUTER");
-                    self.expect_kw::<E>(b"JOIN")?;
-                    Some(JoinKind::Left)
-                } else if self.eat_kw(b"CROSS") {
-                    self.expect_kw::<E>(b"JOIN")?;
-                    Some(JoinKind::Cross)
-                } else {
-                    None
-                };
-                let Some(kind) = kind else { break };
-                from.push(self.join_source::<E>(kind, false)?);
-            }
-        }
+        let from = if self.eat_kw(b"FROM") {
+            self.source_list::<E>()?
+        } else {
+            AVec::new()
+        };
         let filter = if self.eat_kw(b"WHERE") {
             Some(self.parse_expr::<E>()?)
         } else {
@@ -1759,7 +2055,7 @@ impl<'a> Parser<'a> {
             having,
             order_by: AVec::new(),
             limit: None,
-            offset: 0,
+            offset: None,
             compound: AVec::new(),
             values: AVec::new(),
         })
@@ -1780,14 +2076,29 @@ impl<'a> Parser<'a> {
                     let _ = self.eat_kw(b"ASC");
                     false
                 };
-                // NULLS FIRST/LAST: SQLite's defaults (ASC: first,
-                // DESC: last) are what the executor implements;
-                // accept and ignore the explicit form when it
-                // matches, which is the common case.
-                if self.eat_kw(b"NULLS") {
-                    let _ = self.eat_kw(b"FIRST") || self.eat_kw(b"LAST");
-                }
-                order_by.push((e, desc));
+                // NULLS FIRST / LAST (v0.16: honoured, where it
+                // was parsed and ignored before — a silent wrong
+                // answer for `ASC NULLS LAST` / `DESC NULLS
+                // FIRST`). The pin's grammar needs FIRST or LAST
+                // after NULLS; the default is NULL-smallest.
+                let nulls_first = if self.eat_kw(b"NULLS") {
+                    if self.eat_kw(b"FIRST") {
+                        true
+                    } else {
+                        self.expect_kw::<E>(b"LAST")?;
+                        false
+                    }
+                } else {
+                    !desc
+                };
+                order_by.push((
+                    e,
+                    SortOrder {
+                        desc,
+                        nulls_first,
+                        coll: Coll::Binary,
+                    },
+                ));
                 if self.eat(Tok::Comma) {
                     continue;
                 }
@@ -1795,17 +2106,17 @@ impl<'a> Parser<'a> {
             }
         }
         let mut limit = None;
-        let mut offset = 0i64;
+        let mut offset = None;
         if self.eat_kw(b"LIMIT") {
-            let first = self.limit_int::<E>()?;
+            let first = self.limit_term::<E>()?;
             if self.eat(Tok::Comma) {
                 // LIMIT offset, count
-                offset = first;
-                limit = Some(self.limit_int::<E>()?);
+                offset = Some(first);
+                limit = Some(self.limit_term::<E>()?);
             } else {
                 limit = Some(first);
                 if self.eat_kw(b"OFFSET") {
-                    offset = self.limit_int::<E>()?;
+                    offset = Some(self.limit_term::<E>()?);
                 }
             }
         }
@@ -1815,26 +2126,196 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn limit_int<E>(&mut self) -> Result<i64, E> {
+    /// One LIMIT / OFFSET term: an integer literal (v0.4), or —
+    /// under `v16` — any expression; the planner resolves it
+    /// against an empty scope (the pin: a LIMIT may not name a
+    /// column) and the executor converts its value with the
+    /// pin's `MustBeInt` rule.
+    fn limit_term<E>(&mut self) -> Result<Box<Expr>, E> {
+        #[cfg(feature = "v16")]
+        {
+            Ok(Box::new(self.parse_expr::<E>()?))
+        }
+        #[cfg(not(feature = "v16"))]
         match self.literal_at(self.pos) {
-            Some((Literal::Integer(v), used)) => {
+            Some((lit @ Literal::Integer(_), used)) => {
                 self.pos += used;
-                Ok(v)
+                Ok(Box::new(Expr::Literal(lit)))
             }
             _ => Err(perr(self.cur().offset, ParseKind::UnsupportedClause)),
         }
     }
 
-    fn join_source<E>(&mut self, kind: JoinKind, first: bool) -> Result<FromSource, E> {
+    /// `SELECT * FROM <table>` as an AST (v0.16: the subquery an
+    /// `x IN table` operand stands for).
+    #[cfg(feature = "v16")]
+    fn table_select(&self, table: ABytes) -> SelectStmt {
+        let mut items = AVec::new();
+        items.push(SelectItem::Star);
+        let mut from = AVec::new();
+        from.push(FromSource {
+            table,
+            alias: None,
+            kind: JoinKind::Inner,
+            on: None,
+            derived: None,
+            natural: false,
+            using: AVec::new(),
+        });
+        SelectStmt {
+            distinct: false,
+            items,
+            from,
+            filter: None,
+            group_by: AVec::new(),
+            having: None,
+            order_by: AVec::new(),
+            limit: None,
+            offset: None,
+            compound: AVec::new(),
+            values: AVec::new(),
+        }
+    }
+
+    /// A FROM clause body (v0.4; shared by SELECT and UPDATE
+    /// ... FROM): the first source, then `,` / join-operator
+    /// separated sources, each joined to everything on its left.
+    fn source_list<E>(&mut self) -> Result<AVec<FromSource>, E> {
+        let mut from = AVec::new();
+        from.push(self.join_source::<E>(JoinKind::Inner, false, true)?);
+        loop {
+            if self.eat(Tok::Comma) {
+                from.push(self.join_source::<E>(JoinKind::Cross, false, false)?);
+                continue;
+            }
+            let Some((kind, natural)) = self.join_op::<E>()? else {
+                break;
+            };
+            from.push(self.join_source::<E>(kind, natural, false)?);
+        }
+        Ok(from)
+    }
+
+    /// A join operator (v0.16, SQLite's `sqlite3JoinType`): up
+    /// to three of NATURAL / LEFT / OUTER / RIGHT / FULL / INNER
+    /// / CROSS, then JOIN. The flags combine as on the pin —
+    /// LEFT + RIGHT is a FULL join, OUTER only qualifies LEFT /
+    /// RIGHT / FULL (`OUTER JOIN`, `NATURAL OUTER JOIN` and
+    /// `INNER OUTER JOIN` are "unknown join type" there), and
+    /// INNER / CROSS with any outer flag is refused. Returns
+    /// None when no join operator starts here.
+    fn join_op<E>(&mut self) -> Result<Option<(JoinKind, bool)>, E> {
+        const NATURAL: u8 = 1;
+        const LEFT: u8 = 2;
+        const OUTER: u8 = 4;
+        const RIGHT: u8 = 8;
+        const INNER: u8 = 16;
+        const CROSS: u8 = 32;
+        const WORDS: [(&[u8], u8); 7] = [
+            (b"NATURAL", NATURAL),
+            (b"LEFT", LEFT | OUTER),
+            (b"OUTER", OUTER),
+            (b"RIGHT", RIGHT | OUTER),
+            (b"FULL", LEFT | RIGHT | OUTER),
+            (b"INNER", INNER),
+            (b"CROSS", INNER | CROSS),
+        ];
+        let mut flags = 0u8;
+        let mut n = 0usize;
+        while !self.cur_is_kw(b"JOIN") {
+            let Some(code) = WORDS
+                .iter()
+                .find(|(w, _)| self.cur_is_kw(w))
+                .map(|(_, c)| *c)
+            else {
+                if n == 0 {
+                    return Ok(None);
+                }
+                return Err(perr(self.cur().offset, ParseKind::UnknownJoinType));
+            };
+            if n == 3 {
+                return Err(perr(self.cur().offset, ParseKind::UnknownJoinType));
+            }
+            flags |= code;
+            n += 1;
+            self.pos += 1;
+        }
+        let at = self.cur().offset;
+        self.pos += 1;
+        if flags & (INNER | OUTER) == INNER | OUTER || flags & (OUTER | LEFT | RIGHT) == OUTER {
+            return Err(perr(at, ParseKind::UnknownJoinType));
+        }
+        let kind = if flags & (LEFT | RIGHT) == LEFT | RIGHT {
+            JoinKind::Full
+        } else if flags & RIGHT != 0 {
+            JoinKind::Right
+        } else if flags & LEFT != 0 {
+            JoinKind::Left
+        } else if flags & CROSS != 0 {
+            JoinKind::Cross
+        } else {
+            JoinKind::Inner
+        };
+        Ok(Some((kind, flags & NATURAL != 0)))
+    }
+
+    /// A joined source's constraint (v0.16): `ON <expr>`, or
+    /// `USING (col, ...)`, or nothing. A NATURAL join may carry
+    /// neither (the pin refuses it at prepare time); the first
+    /// source carries none (`FROM t ON ...` is an error there
+    /// too — the caller leaves the tokens unconsumed).
+    fn join_constraint<E>(
+        &mut self,
+        natural: bool,
+        first: bool,
+    ) -> Result<(Option<Expr>, AVec<ABytes>), E> {
+        let mut using = AVec::new();
+        if first {
+            return Ok((None, using));
+        }
+        let on = if self.eat_kw(b"ON") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        if on.is_none() && self.eat_kw(b"USING") {
+            self.expect::<E>(Tok::LParen)?;
+            loop {
+                match self.cur().tok {
+                    Tok::Ident(h, _) => {
+                        self.pos += 1;
+                        using.push(h);
+                    }
+                    _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+                }
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                self.expect::<E>(Tok::RParen)?;
+                break;
+            }
+        }
+        if natural && (on.is_some() || !using.is_empty()) {
+            return Err(perr(self.cur().offset, ParseKind::NaturalJoinConstraint));
+        }
+        Ok((on, using))
+    }
+
+    fn join_source<E>(
+        &mut self,
+        kind: JoinKind,
+        natural: bool,
+        first: bool,
+    ) -> Result<FromSource, E> {
         // A derived table (v0.9): `(SELECT ...)` or `(VALUES
         // ...)`, possibly under further parentheses (the pin
         // accepts `FROM ((SELECT 1)) s`). The alias is optional;
         // no column-name list may follow it (pin: syntax error).
         #[cfg(feature = "v09")]
-        if self.cur().tok == Tok::LParen {
+        if matches!(self.cur().tok, Tok::LParen) {
             let mut depth = 0usize;
             let mut i = self.pos;
-            while i < self.limit && self.toks.as_slice()[i].tok == Tok::LParen {
+            while i < self.limit && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
                 depth += 1;
                 i += 1;
             }
@@ -1847,33 +2328,29 @@ impl<'a> Parser<'a> {
                     self.expect::<E>(Tok::RParen)?;
                 }
                 let alias = self.opt_alias();
-                let on = if !first && self.eat_kw(b"ON") {
-                    Some(self.parse_expr::<E>()?)
-                } else {
-                    None
-                };
+                let (on, using) = self.join_constraint::<E>(natural, first)?;
                 return Ok(FromSource {
                     table: ABytes::EMPTY,
                     alias,
                     kind,
                     on,
                     derived: Some(Box::new(inner)),
+                    natural,
+                    using,
                 });
             }
         }
         let table = self.name::<E>()?;
         let alias = self.opt_alias();
-        let on = if !first && self.eat_kw(b"ON") {
-            Some(self.parse_expr::<E>()?)
-        } else {
-            None
-        };
+        let (on, using) = self.join_constraint::<E>(natural, first)?;
         Ok(FromSource {
             table,
             alias,
             kind,
             on,
             derived: None,
+            natural,
+            using,
         })
     }
 
@@ -1903,6 +2380,7 @@ impl<'a> Parser<'a> {
         let mut pk_names: AVec<ABytes> = AVec::new();
         let mut pk_desc: AVec<ABytes> = AVec::new();
         let mut sets: AVec<ConstraintSet> = AVec::new();
+        let mut checks: AVec<ABytes> = AVec::new();
         self.create_item::<E>(
             from,
             to,
@@ -1910,6 +2388,7 @@ impl<'a> Parser<'a> {
             &mut pk_names,
             &mut pk_desc,
             &mut sets,
+            &mut checks,
         )?;
         if columns.len() != 1 {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
@@ -1931,6 +2410,7 @@ impl<'a> Parser<'a> {
             table,
             column,
             text,
+            checks,
         })
     }
 
@@ -1984,6 +2464,665 @@ impl<'a> Parser<'a> {
     }
 }
 
+// ===================== CREATE TABLE items =====================
+//
+// Every CREATE TABLE item (and the ALTER TABLE ADD COLUMN
+// definition) is walked clause by clause with the pin's grammar
+// (v0.16), so whatever is accepted — and later stored verbatim in
+// `sqlite_schema` — is a definition the pin can load. A build
+// without the v0.4 evaluator (the tiny profile) refuses the clauses
+// it cannot enforce — CHECK, generated columns, expression
+// DEFAULTs — with `ParseKind::RequiresEvaluator`.
+impl<'a> Parser<'a> {
+    /// The DEFAULT value starting at token `k`, with the index of
+    /// the token after it (v0.16; the pin's grammar: `DEFAULT
+    /// [+|-] term`, `DEFAULT (expr)`, `DEFAULT id`, where a term
+    /// is a number, string, blob, NULL or a wall-clock keyword).
+    /// `Ok(lit)` is a plain literal — a bare or parenthesised
+    /// (signed) literal, TRUE / FALSE / NULL, or an identifier,
+    /// which the pin stores as its text (`DEFAULT hello` is
+    /// `'hello'`). `Err((start, end))` is the SQL byte span of an
+    /// expression default: anything else in parentheses, a sign
+    /// over a non-numeric term (`-'3'`, `-x'01'`), or
+    /// CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP (which a
+    /// build without the evaluator refuses).
+    #[allow(clippy::type_complexity)]
+    fn default_clause<E>(
+        &self,
+        k: usize,
+        to: usize,
+    ) -> Result<(core::result::Result<Literal, (usize, usize)>, usize), E> {
+        let toks = self.toks.as_slice();
+        let Some(t) = toks.get(k).filter(|_| k < to).copied() else {
+            return Err(perr(self.item_end_offset(k), ParseKind::UnexpectedToken));
+        };
+        let span = |a: usize, b: usize| Err((toks[a].offset, self.item_end_offset(b)));
+        let term = |j: usize| {
+            j < to
+                && match toks[j].tok {
+                    Tok::Integer(_) | Tok::Real(_) | Tok::Text(_) | Tok::Blob(_) => true,
+                    Tok::Ident(h, false) => {
+                        let b = handle_bytes(self.arena, h);
+                        eq_ci(b, b"NULL") || is_ctime_kw(b)
+                    }
+                    _ => false,
+                }
+        };
+        match t.tok {
+            Tok::LParen => {
+                // `(expr)`: the whole parenthesised group.
+                let close = self.close_paren::<E>(k, to)?;
+                if let Some((lit, n)) = self.literal_at(k + 1)
+                    && k + 1 + n == close
+                {
+                    return Ok((Ok(lit), close + 1));
+                }
+                Ok((span(k + 1, close), close + 1))
+            }
+            // `[+|-] term`: exactly one sign (`- - 1` and `-TRUE`
+            // are syntax errors on the pin).
+            Tok::Minus | Tok::Plus if term(k + 1) => match self.literal_at(k) {
+                Some((lit, 2)) => Ok((Ok(lit), k + 2)),
+                _ => Ok((span(k, k + 2), k + 2)),
+            },
+            _ if term(k) => match self.literal_at(k) {
+                Some((lit, _)) => Ok((Ok(lit), k + 1)),
+                // A wall-clock keyword.
+                None => Ok((span(k, k + 1), k + 1)),
+            },
+            // `id`: TRUE / FALSE, else the identifier's text.
+            Tok::Ident(h, quoted)
+                if quoted || !self.reserved(k, false) || self.is_kw(k, b"INDEXED") =>
+            {
+                if let Some((lit, _)) = self.literal_at(k) {
+                    return Ok((Ok(lit), k + 1));
+                }
+                Ok((Ok(Literal::Text(h)), k + 1))
+            }
+            _ => Err(perr(t.offset, ParseKind::UnexpectedToken)),
+        }
+    }
+
+    /// Whether token `i` is one of the pin's keywords that never
+    /// fall back to an identifier (v0.16): such a word cannot be
+    /// a column or constraint name, a type name word or a DEFAULT
+    /// identifier — `CREATE TABLE t(a INT SELECT)` is a syntax
+    /// error there, and storing it would leave a schema the pin
+    /// cannot load. `nm` admits the join keywords and INDEXED
+    /// (the pin's `nm ::= id | STRING | JOIN_KW`, `nm = true`); a
+    /// type word (`ids`) takes neither, a DEFAULT `id` INDEXED
+    /// only (its caller's special case).
+    fn reserved(&self, i: usize, nm: bool) -> bool {
+        let Some((h, false, _)) = self.ident_at(i) else {
+            return false;
+        };
+        let w = handle_bytes(self.arena, h);
+        let hit = |list: &str| list.split(' ').any(|k| eq_ci(k.as_bytes(), w));
+        {
+            if hit("CROSS FULL INNER LEFT NATURAL OUTER RIGHT") {
+                return !nm;
+            }
+            if hit("INDEXED") {
+                return !nm;
+            }
+            hit(
+                "ADD ALL ALTER AND AS AUTOINCREMENT BETWEEN CASE CHECK COLLATE COMMIT \
+CONSTRAINT CREATE DEFAULT DEFERRABLE DELETE DISTINCT DROP ELSE ESCAPE EXCEPT EXISTS FOREIGN \
+FROM GROUP HAVING IN INDEX INSERT INTERSECT INTO IS ISNULL JOIN LIMIT NOT NOTHING NOTNULL NULL \
+ON OR ORDER PRIMARY REFERENCES RETURNING SELECT SET TABLE THEN TO TRANSACTION UNION UNIQUE \
+UPDATE USING VALUES WHEN WHERE",
+            )
+        }
+    }
+
+    /// Token `i` is a name (`nm`): an identifier that is not a
+    /// reserved keyword, or a string.
+    fn nm_at(&self, i: usize, to: usize) -> bool {
+        i < to
+            && match self.toks.as_slice()[i].tok {
+                Tok::Ident(..) => !self.reserved(i, true),
+                Tok::Text(_) => true,
+                _ => false,
+            }
+    }
+
+    /// Skip an optional `ON CONFLICT <action>` at token `i`,
+    /// returning the next index. Parsed, not acted on (an
+    /// honest gap: such a write errors where the pin resolves).
+    fn onconf<E>(&self, i: usize, to: usize) -> Result<usize, E> {
+        if !self.is_kw(i, b"ON") {
+            return Ok(i);
+        }
+        if i + 2 < to
+            && self.is_kw(i + 1, b"CONFLICT")
+            && [
+                b"ROLLBACK" as &[u8],
+                b"ABORT",
+                b"FAIL",
+                b"IGNORE",
+                b"REPLACE",
+            ]
+            .iter()
+            .any(|w| self.is_kw(i + 2, w))
+        {
+            return Ok(i + 3);
+        }
+        Err(perr(self.item_end_offset(i), ParseKind::UnexpectedToken))
+    }
+
+    /// Skip a `REFERENCES nm [(cols)] {MATCH nm | ON
+    /// DELETE|UPDATE|INSERT action}` clause whose REFERENCES is
+    /// token `i`, returning the next index (foreign keys are
+    /// parsed, not enforced).
+    fn references<E>(&self, mut i: usize, to: usize) -> Result<usize, E> {
+        let bad = |j: usize| Err(perr(self.item_end_offset(j), ParseKind::UnexpectedToken));
+        if !self.nm_at(i + 1, to) {
+            return bad(i + 1);
+        }
+        i += 2;
+        if i < to && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
+            i = self.constraint_columns::<E>(i, to, false)?.1;
+        }
+        loop {
+            if self.is_kw(i, b"MATCH") {
+                if !self.nm_at(i + 1, to) {
+                    return bad(i + 1);
+                }
+                i += 2;
+            } else if self.is_kw(i, b"ON")
+                && (self.is_kw(i + 1, b"DELETE")
+                    || self.is_kw(i + 1, b"UPDATE")
+                    || self.is_kw(i + 1, b"INSERT"))
+            {
+                i += 2;
+                i += if self.is_kw(i, b"SET")
+                    && (self.is_kw(i + 1, b"NULL") || self.is_kw(i + 1, b"DEFAULT"))
+                    || self.is_kw(i, b"NO") && self.is_kw(i + 1, b"ACTION")
+                {
+                    2
+                } else if self.is_kw(i, b"CASCADE") || self.is_kw(i, b"RESTRICT") {
+                    1
+                } else {
+                    return bad(i);
+                };
+            } else {
+                return Ok(i);
+            }
+        }
+    }
+
+    /// Skip an optional `[NOT] DEFERRABLE [INITIALLY DEFERRED |
+    /// IMMEDIATE]` at token `i` (parsed, not enforced).
+    fn deferrable(&self, mut i: usize) -> usize {
+        let start = i;
+        if self.is_kw(i, b"NOT") {
+            i += 1;
+        }
+        if !self.is_kw(i, b"DEFERRABLE") {
+            return start;
+        }
+        i += 1;
+        if self.is_kw(i, b"INITIALLY")
+            && (self.is_kw(i + 1, b"DEFERRED") || self.is_kw(i + 1, b"IMMEDIATE"))
+        {
+            i += 2;
+        }
+        i
+    }
+
+    /// Parse a `(col [COLLATE name] [ASC|DESC], ...)` list whose
+    /// `(` is token `i` (table-level PRIMARY KEY / UNIQUE, a
+    /// FOREIGN KEY's or REFERENCES' column list), returning the
+    /// columns and the index after the `)`. `autoinc` admits the
+    /// PRIMARY KEY's `AUTOINCREMENT` before the `)`. Anything
+    /// else — an expression, a missing `)` — is a syntax error
+    /// (v0.16: the list used to stop silently at the first
+    /// unexpected token and keep the columns before it).
+    fn constraint_columns<E>(
+        &self,
+        mut i: usize,
+        to: usize,
+        autoinc: bool,
+    ) -> Result<(AVec<IndexColumnDef>, usize), E> {
+        let mut out = AVec::new();
+        let tok = |j: usize| {
+            self.toks
+                .as_slice()
+                .get(j)
+                .filter(|_| j < to)
+                .map(|t| t.tok)
+        };
+        if !matches!(tok(i), Some(Tok::LParen)) {
+            return Err(perr(self.item_end_offset(i), ParseKind::UnexpectedToken));
+        }
+        i += 1;
+        loop {
+            let h = match self.ident_at(i) {
+                Some((h, _, _)) if i < to && !self.reserved(i, true) => h,
+                _ => return Err(perr(self.item_end_offset(i), ParseKind::UnexpectedToken)),
+            };
+            i += 1;
+            // `col [COLLATE name] [ASC | DESC]` — the pin's
+            // order (v0.16: the collation is the autoindex key's;
+            // it used to be skipped, and only after ASC / DESC,
+            // so `(a COLLATE x DESC, b)` lost `b`).
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            let mut coll = None;
+            if self.is_kw(i, b"COLLATE") {
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                {
+                    coll = Some(self.coll_at::<E>(i + 1)?);
+                }
+                i += 2;
+            }
+            let mut desc = false;
+            if self.is_kw(i, b"DESC") {
+                desc = true;
+                i += 1;
+            } else if self.is_kw(i, b"ASC") {
+                i += 1;
+            }
+            out.push(IndexColumnDef {
+                name: h,
+                desc,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll,
+            });
+            match tok(i) {
+                Some(Tok::Comma) => i += 1,
+                _ => break,
+            }
+        }
+        if autoinc && self.is_kw(i, b"AUTOINCREMENT") {
+            i += 1;
+        }
+        match tok(i) {
+            Some(Tok::RParen) => Ok((out, i + 1)),
+            _ => Err(perr(self.item_end_offset(i), ParseKind::UnexpectedToken)),
+        }
+    }
+
+    /// One comma-separated item of a CREATE TABLE body (or the
+    /// column of an ALTER TABLE ADD COLUMN), walked token by token
+    /// with the pin's grammar (v0.16: the clauses used to be found
+    /// by scanning for keywords, so trailing junk — `CHECK(a>0)
+    /// bar`, `DEFAULT abs(1)`, `PRIMARY KEY (a) foo` — was
+    /// accepted and stored verbatim in `sqlite_schema`, a schema
+    /// the pin then refuses to load). Returns whether the item is
+    /// a table constraint; after one, a column definition is a
+    /// syntax error (the caller's check). Table constraints may
+    /// follow each other without a comma, as on the pin.
+    #[allow(clippy::too_many_arguments)]
+    fn create_item<E>(
+        &mut self,
+        from: usize,
+        to: usize,
+        columns: &mut AVec<ColumnDef>,
+        pk_names: &mut AVec<ABytes>,
+        pk_desc_names: &mut AVec<ABytes>,
+        sets: &mut AVec<ConstraintSet>,
+        #[cfg(feature = "v04")] checks: &mut AVec<ABytes>,
+    ) -> Result<bool, E> {
+        let bad = |j: usize| -> Result<bool, E> {
+            Err(perr(self.item_end_offset(j), ParseKind::UnexpectedToken))
+        };
+        let tok = |j: usize| {
+            self.toks
+                .as_slice()
+                .get(j)
+                .filter(|_| j < to)
+                .map(|t| t.tok)
+        };
+        if from >= to {
+            return bad(from);
+        }
+        let tcons = ["CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"]
+            .iter()
+            .any(|w| self.is_kw(from, w.as_bytes()));
+        if tcons {
+            let mut i = from;
+            while i < to {
+                if self.is_kw(i, b"CONSTRAINT") {
+                    if !self.nm_at(i + 1, to) {
+                        return bad(i + 1);
+                    }
+                    i += 2;
+                } else if self.is_kw(i, b"PRIMARY") || self.is_kw(i, b"UNIQUE") {
+                    // Table-level PRIMARY KEY / UNIQUE (col, …)
+                    // (v0.3: UNIQUE enforced via an implicit
+                    // index, like SQLite).
+                    let pk = self.is_kw(i, b"PRIMARY");
+                    if pk {
+                        if !self.is_kw(i + 1, b"KEY") {
+                            return bad(i + 1);
+                        }
+                        i += 1;
+                    }
+                    let (cols, next) = self.constraint_columns::<E>(i + 1, to, pk)?;
+                    if pk {
+                        for c in cols.iter() {
+                            pk_names.push(c.name);
+                            if c.desc {
+                                pk_desc_names.push(c.name);
+                            }
+                        }
+                    }
+                    sets.push(ConstraintSet {
+                        primary_key: pk,
+                        columns: cols,
+                    });
+                    i = self.onconf::<E>(next, to)?;
+                } else if self.is_kw(i, b"CHECK") {
+                    // Table-level CHECK (v0.16): enforced on every
+                    // write path through the v0.4 evaluator; a
+                    // build without it refuses the table rather
+                    // than ignore the check.
+                    #[cfg(feature = "v04")]
+                    {
+                        let (close, text) = self.paren_text::<E>(i + 1, to)?;
+                        checks.push(text);
+                        i = self.onconf::<E>(close + 1, to)?;
+                    }
+                    #[cfg(not(feature = "v04"))]
+                    return Err(perr(
+                        self.toks.as_slice()[i].offset,
+                        ParseKind::RequiresEvaluator,
+                    ));
+                } else if self.is_kw(i, b"FOREIGN") && self.is_kw(i + 1, b"KEY") {
+                    // Parsed, not enforced (see module docs).
+                    let next = self.constraint_columns::<E>(i + 2, to, false)?.1;
+                    if !self.is_kw(next, b"REFERENCES") {
+                        return bad(next);
+                    }
+                    i = self.references::<E>(next, to)?;
+                    i = self.deferrable(i);
+                } else {
+                    return bad(i);
+                }
+            }
+            return Ok(true);
+        }
+        // Column definition: first token is the name.
+        let col_name = match self.ident_at(from) {
+            Some((h, _, _)) if self.nm_at(from, to) => h,
+            _ => return bad(from),
+        };
+        // Declared type (`typetoken`): name words, then an
+        // optional `(n)` / `(n, m)` of signed numbers; the text is
+        // the SQL span. `GENERATED` and `ALWAYS` are type words
+        // (`b GENERATED AS (a)` declares type GENERATED, `a
+        // GENERATED ALWAYS (1)` type `GENERATED ALWAYS (1)`) except
+        // in `GENERATED ALWAYS AS`, whose words the pin strips
+        // from the type.
+        let mut i = from + 1;
+        while i < to
+            && match self.toks.as_slice()[i].tok {
+                Tok::Text(_) => true,
+                Tok::Ident(..) => {
+                    !self.reserved(i, false)
+                        && !(self.is_kw(i, b"GENERATED")
+                            && self.is_kw(i + 1, b"ALWAYS")
+                            && self.is_kw(i + 2, b"AS"))
+                }
+                _ => false,
+            }
+        {
+            i += 1;
+        }
+        if i > from + 1 && matches!(tok(i), Some(Tok::LParen)) {
+            i += 1;
+            for n in 0..2 {
+                if matches!(tok(i), Some(Tok::Plus | Tok::Minus)) {
+                    i += 1;
+                }
+                if !matches!(tok(i), Some(Tok::Integer(_) | Tok::Real(_))) {
+                    return bad(i);
+                }
+                i += 1;
+                if n == 0 && matches!(tok(i), Some(Tok::Comma)) {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            if !matches!(tok(i), Some(Tok::RParen)) {
+                return bad(i);
+            }
+            i += 1;
+        }
+        let decl_end_tok = i;
+        let mut pk_count = 0usize;
+        let mut pk_desc = false;
+        let mut unique = false;
+        let mut default: Option<Literal> = None;
+        let mut not_null = false;
+        #[cfg(any(feature = "v04", feature = "indexes"))]
+        let mut coll = None;
+        // Without the evaluator (tiny) neither can become true:
+        // the clauses that set them are refused.
+        #[cfg(feature = "v04")]
+        let mut default_nonconst = false;
+        #[cfg(not(feature = "v04"))]
+        let default_nonconst = false;
+        #[cfg(feature = "v04")]
+        let mut generated = false;
+        #[cfg(not(feature = "v04"))]
+        let generated = false;
+        #[cfg(feature = "v04")]
+        let mut default_expr: Option<ABytes> = None;
+        #[cfg(feature = "v04")]
+        let mut gen_expr: Option<ABytes> = None;
+        #[cfg(feature = "v04")]
+        let mut stored = false;
+        // Column constraints (`carglist`), in any order.
+        while i < to {
+            if self.is_kw(i, b"CONSTRAINT") {
+                if !self.nm_at(i + 1, to) {
+                    return bad(i + 1);
+                }
+                i += 2;
+            } else if self.is_kw(i, b"DEFAULT") {
+                let (d, next) = self.default_clause::<E>(i + 1, to)?;
+                match d {
+                    Ok(lit) => {
+                        default = Some(lit);
+                        #[cfg(feature = "v04")]
+                        {
+                            default_nonconst = false;
+                            default_expr = None;
+                        }
+                    }
+                    // An expression DEFAULT (v0.16): kept as text
+                    // for the planner's evaluator; a build without
+                    // one refuses the table (it used to keep the
+                    // first literal of `DEFAULT (1+2)` and NULL for
+                    // the rest).
+                    #[cfg(feature = "v04")]
+                    Err((start, end)) => {
+                        default = None;
+                        default_nonconst = true;
+                        let text = trim(&self.sql[start.min(end)..end.min(self.sql.len())]);
+                        default_expr = Some(self.arena.alloc_copy_handle(text)?);
+                    }
+                    #[cfg(not(feature = "v04"))]
+                    Err(_) => {
+                        return Err(perr(
+                            self.toks.as_slice()[i + 1].offset,
+                            ParseKind::RequiresEvaluator,
+                        ));
+                    }
+                }
+                i = next;
+            } else if self.is_kw(i, b"NULL") {
+                i = self.onconf::<E>(i + 1, to)?;
+            } else if self.is_kw(i, b"NOT") && self.is_kw(i + 1, b"NULL") {
+                not_null = true;
+                i = self.onconf::<E>(i + 2, to)?;
+            } else if self.is_kw(i, b"NOT") || self.is_kw(i, b"DEFERRABLE") {
+                let next = self.deferrable(i);
+                if next == i {
+                    return bad(i + 1);
+                }
+                i = next;
+            } else if self.is_kw(i, b"PRIMARY") {
+                if !self.is_kw(i + 1, b"KEY") {
+                    return bad(i + 1);
+                }
+                pk_count += 1;
+                i += 2;
+                if self.is_kw(i, b"DESC") {
+                    pk_desc = true;
+                    i += 1;
+                } else if self.is_kw(i, b"ASC") {
+                    i += 1;
+                }
+                i = self.onconf::<E>(i, to)?;
+                if self.is_kw(i, b"AUTOINCREMENT") {
+                    i += 1;
+                }
+            } else if self.is_kw(i, b"UNIQUE") {
+                unique = true;
+                i = self.onconf::<E>(i + 1, to)?;
+            } else if self.is_kw(i, b"CHECK") {
+                // Column-level CHECK (v0.16): a table check like
+                // any other.
+                #[cfg(feature = "v04")]
+                {
+                    let (close, text) = self.paren_text::<E>(i + 1, to)?;
+                    checks.push(text);
+                    i = close + 1;
+                }
+                #[cfg(not(feature = "v04"))]
+                return Err(perr(
+                    self.toks.as_slice()[i].offset,
+                    ParseKind::RequiresEvaluator,
+                ));
+            } else if self.is_kw(i, b"REFERENCES") {
+                i = self.references::<E>(i, to)?;
+            } else if self.is_kw(i, b"COLLATE") {
+                // v0.16: the column's collating sequence (it used
+                // to be parsed and ignored — comparisons and
+                // ORDER BY ran BINARY).
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                {
+                    coll = Some(self.coll_at::<E>(i + 1)?);
+                }
+                if !matches!(tok(i + 1), Some(Tok::Ident(..) | Tok::Text(_))) {
+                    return bad(i + 1);
+                }
+                i += 2;
+            } else if self.is_kw(i, b"AS")
+                || (self.is_kw(i, b"GENERATED") && self.is_kw(i + 1, b"ALWAYS"))
+            {
+                let at = if self.is_kw(i, b"AS") {
+                    i
+                } else if self.is_kw(i + 2, b"AS") {
+                    i + 2
+                } else {
+                    return bad(i + 2);
+                };
+                // Every generated column has `AS (...)`; without
+                // the evaluator it cannot be computed.
+                #[cfg(not(feature = "v04"))]
+                return Err(perr(
+                    self.toks.as_slice()[at].offset,
+                    ParseKind::RequiresEvaluator,
+                ));
+                // A generated column (v0.16): `[GENERATED ALWAYS]
+                // AS (expr) [VIRTUAL | STORED]`. It used to be
+                // parsed as part of the declared type and read as
+                // NULL.
+                #[cfg(feature = "v04")]
+                {
+                    if generated {
+                        return bad(i);
+                    }
+                    generated = true;
+                    let (close, text) = self.paren_text::<E>(at + 1, to)?;
+                    gen_expr = Some(text);
+                    stored = self.is_kw(close + 1, b"STORED");
+                    i = close + 1 + usize::from(stored || self.is_kw(close + 1, b"VIRTUAL"));
+                }
+            } else {
+                return bad(i);
+            }
+        }
+        if pk_count > 1 {
+            // SQLite: "table has more than one primary key".
+            return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+        }
+        let pk = pk_count == 1;
+        let decl = if decl_end_tok > from + 1 {
+            let start_off = self.toks.as_slice()[from + 1].offset;
+            let end_off = self.item_end_offset(decl_end_tok);
+            let text = trim(&self.sql[start_off..end_off.min(self.sql.len())]);
+            self.arena.alloc_copy_handle(text)?
+        } else {
+            ABytes::EMPTY
+        };
+        columns.push(ColumnDef {
+            name: col_name,
+            decl,
+            primary_key: pk && !pk_desc,
+            pk_desc,
+            unique,
+            default,
+            not_null,
+            default_nonconst,
+            generated,
+            #[cfg(feature = "v04")]
+            default_expr,
+            #[cfg(feature = "v04")]
+            gen_expr,
+            #[cfg(feature = "v04")]
+            stored,
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            coll,
+        });
+        // Constraint sets in statement order (v0.3): an inline
+        // PRIMARY KEY / UNIQUE is a one-column set at this item's
+        // position.
+        if pk {
+            pk_names.push(col_name);
+            if pk_desc {
+                pk_desc_names.push(col_name);
+            }
+            let mut cols = AVec::new();
+            cols.push(IndexColumnDef {
+                name: col_name,
+                desc: pk_desc,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll: None,
+            });
+            sets.push(ConstraintSet {
+                primary_key: true,
+                columns: cols,
+            });
+        }
+        if unique {
+            let mut cols = AVec::new();
+            cols.push(IndexColumnDef {
+                name: col_name,
+                desc: false,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll: None,
+            });
+            sets.push(ConstraintSet {
+                primary_key: false,
+                columns: cols,
+            });
+        }
+        Ok(false)
+    }
+}
+
+/// CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP (v0.16): the
+/// pin's wall-clock keywords, an expression wherever a DEFAULT
+/// term may be.
+fn is_ctime_kw(b: &[u8]) -> bool {
+    eq_ci(b, b"CURRENT_TIME") || eq_ci(b, b"CURRENT_DATE") || eq_ci(b, b"CURRENT_TIMESTAMP")
+}
+
 fn trim(b: &[u8]) -> &[u8] {
     let mut s = 0;
     let mut e = b.len();
@@ -2008,7 +3147,7 @@ impl<'a> Parser<'a> {
         match self.cur().tok {
             Tok::Ident(h, _) => {
                 self.pos += 1;
-                if self.cur().tok == Tok::Dot {
+                if matches!(self.cur().tok, Tok::Dot) {
                     return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
                 }
                 Ok(h)
@@ -2096,35 +3235,10 @@ impl<'a> Parser<'a> {
     /// FROM clause body.
     #[cfg(feature = "v07")]
     fn update_from<E>(&mut self) -> Result<AVec<FromSource>, E> {
-        let mut from = AVec::new();
         if !self.eat_kw(b"FROM") {
-            return Ok(from);
+            return Ok(AVec::new());
         }
-        from.push(self.join_source::<E>(JoinKind::Inner, true)?);
-        loop {
-            if self.eat(Tok::Comma) {
-                from.push(self.join_source::<E>(JoinKind::Cross, false)?);
-                continue;
-            }
-            let kind = if self.eat_kw(b"JOIN") {
-                Some(JoinKind::Inner)
-            } else if self.eat_kw(b"INNER") {
-                self.expect_kw::<E>(b"JOIN")?;
-                Some(JoinKind::Inner)
-            } else if self.eat_kw(b"LEFT") {
-                let _ = self.eat_kw(b"OUTER");
-                self.expect_kw::<E>(b"JOIN")?;
-                Some(JoinKind::Left)
-            } else if self.eat_kw(b"CROSS") {
-                self.expect_kw::<E>(b"JOIN")?;
-                Some(JoinKind::Cross)
-            } else {
-                None
-            };
-            let Some(kind) = kind else { break };
-            from.push(self.join_source::<E>(kind, false)?);
-        }
-        Ok(from)
+        self.source_list::<E>()
     }
 
     fn delete_stmt<E>(&mut self) -> Result<Ast, E> {
@@ -2158,5 +3272,285 @@ impl<'a> Parser<'a> {
         };
         let name = self.name::<E>()?;
         Ok(Ast::DropTable { name, if_exists })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Scope;
+
+    fn kind(sql: &str) -> Option<ParseKind> {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        match parse::<()>(sql.as_bytes(), &arena) {
+            Ok(_) => None,
+            Err(Error::Parse { kind, .. }) => Some(kind),
+            Err(_) => Some(ParseKind::UnexpectedToken),
+        }
+    }
+
+    /// v0.16: the tiny profile (no evaluator) refuses every table
+    /// clause it cannot enforce or compute, instead of parsing and
+    /// ignoring it (they used to be silent wrong answers: CHECK
+    /// never enforced, `DEFAULT (1+2)` stored 1, generated columns
+    /// read NULL) — and still accepts the literal forms it handles.
+    #[cfg(not(feature = "v04"))]
+    #[test]
+    fn tiny_refuses_unenforceable_table_clauses() {
+        let refused = [
+            "CREATE TABLE t(a CHECK(a > 0))",
+            "CREATE TABLE t(a, CHECK(a > 0))",
+            "CREATE TABLE t(a, CONSTRAINT c CHECK(a > 0))",
+            "CREATE TABLE t(a, b AS (a * 2))",
+            "CREATE TABLE t(a, b GENERATED ALWAYS AS (a) STORED)",
+            "CREATE TABLE t(a DEFAULT (1 + 2))",
+            "CREATE TABLE t(a DEFAULT -'3')",
+            "CREATE TABLE t(a DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE t(a DEFAULT current_date)",
+            "CREATE TABLE t(a DEFAULT -current_time)",
+        ];
+        for sql in refused {
+            assert_eq!(kind(sql), Some(ParseKind::RequiresEvaluator), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE t(a DEFAULT 5, b DEFAULT -1.5, c DEFAULT 'x', d DEFAULT x'00')",
+            "CREATE TABLE t(a DEFAULT (5), b DEFAULT (-2), c DEFAULT TRUE, d DEFAULT NULL)",
+            "CREATE TABLE t(a DEFAULT +'x', b DEFAULT \"quoted\", c INTEGER NOT NULL)",
+            "CREATE TABLE t(a DEFAULT hello, b DEFAULT key)",
+        ] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+    }
+
+    /// v0.16, every build: CREATE TABLE items follow the pin's
+    /// grammar clause by clause. Trailing junk after a constraint
+    /// used to be accepted and stored verbatim, a schema the pin
+    /// then refuses to load ("malformed database schema").
+    #[test]
+    fn create_table_items_follow_the_pins_grammar() {
+        for sql in [
+            "CREATE TABLE t(a INT PRIMARY KEY foo)",
+            "CREATE TABLE t(a DEFAULT \"x\" y)",
+            "CREATE TABLE t(a DEFAULT - - 1)",
+            "CREATE TABLE t(a DEFAULT 'a' 'b')",
+            "CREATE TABLE t(a DEFAULT x.y)",
+            "CREATE TABLE t(a DEFAULT \"x\"(1))",
+            "CREATE TABLE t(a DEFAULT (1)(2))",
+            "CREATE TABLE t(a DEFAULT TRUE FALSE)",
+            "CREATE TABLE t(a DEFAULT)",
+            "CREATE TABLE t(a DEFAULT SELECT)",
+            "CREATE TABLE t(a, PRIMARY KEY (a) foo)",
+            "CREATE TABLE t(a, PRIMARY KEY a)",
+            "CREATE TABLE t(a, b, PRIMARY KEY (a, b + 1))",
+            "CREATE TABLE t(a, UNIQUE (a) (b))",
+            "CREATE TABLE t(a, UNIQUE (a AUTOINCREMENT))",
+            "CREATE TABLE t(a, FOREIGN KEY (a))",
+            "CREATE TABLE t(a, PRIMARY KEY (a), b)",
+            "CREATE TABLE t(a, CONSTRAINT c, b)",
+            "CREATE TABLE t(a, INDEX (a))",
+            "CREATE TABLE t(a VARCHAR(10) foo)",
+            "CREATE TABLE t(a VARCHAR(10, 20, 30))",
+            "CREATE TABLE t(a VARCHAR(x))",
+            "CREATE TABLE t(a (10))",
+            "CREATE TABLE t(a INT SELECT)",
+            "CREATE TABLE t(SELECT INT)",
+            "CREATE TABLE t(a PRIMARY)",
+            "CREATE TABLE t(a PRIMARY KEY KEY)",
+            "CREATE TABLE t(a NOT)",
+            "CREATE TABLE t(a ON CONFLICT IGNORE)",
+            "CREATE TABLE t(a UNIQUE ON CONFLICT)",
+            "CREATE TABLE t(a REFERENCES)",
+            "CREATE TABLE t(a REFERENCES p(x) foo)",
+            "CREATE TABLE t(a REFERENCES p MATCH)",
+            "CREATE TABLE t(a REFERENCES p ON DELETE NO)",
+            "CREATE TABLE t(a COLLATE)",
+            "CREATE TABLE t(a, )",
+            "CREATE TABLE t(, a)",
+            "CREATE TABLE t(a PRIMARY KEY PRIMARY KEY)",
+            "CREATE TABLE t(a, b, PRIMARY KEY (a) PRIMARY KEY (b))",
+        ] {
+            assert!(kind(sql).is_some(), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE t(a 'text' \"int\" [x] `y`, b VARCHAR(-10, +20.5))",
+            "CREATE TABLE t(a DOUBLE PRECISION(10), b UNSIGNED BIG INT, c KEY)",
+            "CREATE TABLE t(a, key INT, natural, indexed, left)",
+            "CREATE TABLE t(a INT PRIMARY KEY ASC ON CONFLICT IGNORE, b UNIQUE ON CONFLICT ABORT)",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL ON CONFLICT REPLACE)",
+            "CREATE TABLE t(a NULL NOT NULL DEFAULT 1 DEFAULT 2 CONSTRAINT c CONSTRAINT 'd')",
+            "CREATE TABLE t(a REFERENCES p (x) ON DELETE CASCADE ON UPDATE SET NULL \
+             MATCH FULL ON INSERT NO ACTION NOT DEFERRABLE INITIALLY IMMEDIATE, b DEFERRABLE)",
+            "CREATE TABLE t(a, b, PRIMARY KEY (a DESC, b ASC) ON CONFLICT FAIL UNIQUE (b) \
+             CONSTRAINT f FOREIGN KEY (a, b) REFERENCES p ON DELETE SET DEFAULT \
+             DEFERRABLE INITIALLY DEFERRED, CONSTRAINT lone)",
+            "CREATE TABLE t(a INTEGER, PRIMARY KEY (a AUTOINCREMENT))",
+            "CREATE TABLE t(a DEFAULT 0x10, b DEFAULT -0x10, c DEFAULT +NULL, d DEFAULT indexed)",
+            "CREATE TABLE t(a GENERATED, b GENERATED ALWAYS (1))",
+        ] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+    }
+
+    /// v0.16: `-9223372036854775808` is the INTEGER i64::MIN (the
+    /// pin's `codeInteger`), through unary `+`; `- -` over it, a
+    /// REAL spelling or a larger magnitude stay REAL.
+    #[test]
+    fn minimum_integer_literal() {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        let lit = |sql: &str| {
+            let toks = lexer::lex::<()>(sql.as_bytes(), &arena).ok()?;
+            let p = Parser {
+                limit: toks.len(),
+                toks,
+                pos: 0,
+                arena: &arena,
+                sql: sql.as_bytes(),
+            };
+            p.literal_at(0).map(|(l, _)| l)
+        };
+        for sql in [
+            "-9223372036854775808",
+            "- 09223372036854775808",
+            "-+9223372036854775808",
+        ] {
+            assert!(
+                matches!(lit(sql), Some(Literal::Integer(i64::MIN))),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "- -9223372036854775808",
+            "-9223372036854775809",
+            "-9223372036854775808.0",
+            "-9223372036854775808e0",
+            "9223372036854775808",
+        ] {
+            assert!(matches!(lit(sql), Some(Literal::Real(_))), "{sql}");
+        }
+    }
+
+    /// v0.16: the stored schema text restarts at the bare created
+    /// name, after the pin's own keyword prefix (the pin cannot load
+    /// `CREATE TABLE main.t`).
+    #[test]
+    fn schema_text_starts_at_the_bare_name() {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        for (sql, prefix, at) in [
+            (
+                &b"create table if not exists main . t(a)"[..],
+                &b"CREATE TABLE "[..],
+                34,
+            ),
+            (b"CREATE TABLE t(a)", b"CREATE TABLE ", 13),
+            (
+                b"create unique index \"main\".i on t(a)",
+                b"CREATE UNIQUE INDEX ",
+                27,
+            ),
+            (b"create  index i on t(a)", b"CREATE INDEX ", 14),
+            (b"create view v as select 1", b"CREATE VIEW ", 12),
+        ] {
+            assert_eq!(
+                schema_text_start::<()>(sql, &arena).ok(),
+                Some(Some((prefix, at)))
+            );
+        }
+        let auto = b"CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)";
+        assert!(matches!(
+            schema_text_start::<()>(auto, &arena),
+            Err(Error::Unsupported)
+        ));
+    }
+
+    /// v0.16 (evaluator builds): the clauses are kept for the
+    /// planner, and the pin's syntax errors around them hold.
+    #[cfg(feature = "v04")]
+    #[test]
+    fn table_clauses_parse_with_the_pins_grammar() {
+        for sql in [
+            "CREATE TABLE t(a CHECK(a > 0), b, CHECK(a < b))",
+            "CREATE TABLE t(a, b AS (a * 2) STORED, c GENERATED ALWAYS AS (b) VIRTUAL NOT NULL)",
+            "CREATE TABLE t(a DEFAULT (1 + 2), b DEFAULT -'3', c DEFAULT CURRENT_TIME, d DEFAULT hello)",
+        ] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE t(a DEFAULT 1 + 2)",
+            "CREATE TABLE t(a DEFAULT -TRUE)",
+            "CREATE TABLE t(a, b AS (a) VIRTUAL STORED)",
+            "CREATE TABLE t(a, b GENERATED ALWAYS (a))",
+            "CREATE TABLE t(a CHECK)",
+        ] {
+            assert!(kind(sql).is_some(), "{sql}");
+        }
+    }
+
+    /// v0.16: collation clauses — the column's, a table UNIQUE's
+    /// (before ASC / DESC; the clause used to be skipped only
+    /// after them, so `(a COLLATE x DESC, b)` dropped `b`), a
+    /// CREATE INDEX key's — and unknown names refused.
+    #[cfg(feature = "indexes")]
+    #[test]
+    fn collation_clauses_parse_and_unknown_names_are_refused() {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        let sql = "CREATE TABLE t(a TEXT COLLATE NOCASE, b COLLATE 'rtrim', \
+                   UNIQUE (a COLLATE BINARY DESC, b))";
+        let Ok(Ast::CreateTable {
+            columns,
+            constraint_sets,
+            ..
+        }) = parse::<()>(sql.as_bytes(), &arena)
+        else {
+            panic!("parses");
+        };
+        assert_eq!(columns.as_slice()[0].coll, Some(Coll::NoCase));
+        assert_eq!(columns.as_slice()[1].coll, Some(Coll::Rtrim));
+        let set = &constraint_sets.as_slice()[0];
+        assert_eq!(set.columns.len(), 2);
+        assert_eq!(set.columns.as_slice()[0].coll, Some(Coll::Binary));
+        assert!(set.columns.as_slice()[0].desc);
+        let Ok(Ast::CreateIndex { columns, .. }) =
+            parse::<()>(b"CREATE INDEX i ON t(a COLLATE \"NoCase\" DESC)", &arena)
+        else {
+            panic!("parses");
+        };
+        assert_eq!(columns.as_slice()[0].coll, Some(Coll::NoCase));
+        for sql in [
+            "CREATE TABLE t(a COLLATE foo)",
+            "CREATE TABLE t(a, UNIQUE (a COLLATE foo))",
+            "CREATE INDEX i ON t(a COLLATE foo)",
+        ] {
+            assert!(
+                matches!(
+                    parse::<()>(sql.as_bytes(), &arena),
+                    Err(Error::Schema {
+                        kind: crate::error::SchemaKind::UnknownCollation
+                    })
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    /// v0.16 (`v16`): the COLLATE operator binds tighter than
+    /// `||` and looser than unary minus; GLOB and LIKE ... ESCAPE
+    /// are the pin's `glob()` / `like()` calls.
+    #[cfg(feature = "v16")]
+    #[test]
+    fn collate_operator_and_pattern_calls() {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        let e = parse_expr_text::<()>(b"'a' || -b COLLATE nocase", &arena).expect("parses");
+        let Expr::Binary(BinOp::Concat, _, r) = e else {
+            panic!("concat on top");
+        };
+        assert!(matches!(*r, Expr::Collate(ref x, Coll::NoCase) if matches!(**x, Expr::Neg(_))));
+        let e = parse_expr_text::<()>(b"x NOT GLOB 'a*'", &arena).expect("parses");
+        let Expr::Not(call) = e else {
+            panic!("NOT GLOB negates the call");
+        };
+        assert!(matches!(*call, Expr::Func { ref args, .. } if args.len() == 2));
+        let e = parse_expr_text::<()>(b"x LIKE 'a%' ESCAPE '\\'", &arena).expect("parses");
+        assert!(matches!(e, Expr::Func { ref args, .. } if args.len() == 3));
+        assert!(parse_expr_text::<()>(b"x GLOB 'a' ESCAPE 'b'", &arena).is_err());
     }
 }

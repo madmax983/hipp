@@ -41,7 +41,127 @@ pub enum Tok {
     Percent,
     /// `||` string concatenation (v0.4 expressions).
     Concat,
+    /// A bound-parameter token (v0.16, feature `params`): `?`,
+    /// `?NNN`, `:name`, `@name`, `$name` or `#name`, with the
+    /// 1-based index the pin's `sqlite3ExprAssignVarNumber`
+    /// gives it (see `ParamTable`) and the token's own text.
+    #[cfg(feature = "params")]
+    Param(u16, ABytes),
     Eof,
+}
+
+/// The largest parameter index (v0.16, `params`): the pin's
+/// `SQLITE_MAX_VARIABLE_NUMBER` default, 32766.
+#[cfg(feature = "params")]
+pub const MAX_PARAMS: u16 = 32766;
+
+/// A statement's parameter numbering (v0.16, `params`) — the
+/// pin's `Parse.nVar` and `pVList`, built in source order as
+/// the lexer meets each parameter token: `?` takes the next
+/// index (one past the largest so far); `?NNN` takes NNN (and
+/// names that index `?NNN` unless it already has a name); a
+/// named parameter (`:a`, `@a`, `$a`, `#a`) reuses the index of
+/// an earlier token with exactly the same text, else takes the
+/// next index.
+#[cfg(feature = "params")]
+#[derive(Debug, Clone, Default)]
+pub struct ParamTable {
+    /// The largest index assigned (`sqlite3_bind_parameter_count`).
+    pub count: u16,
+    /// `(name, index)` in registration order; the first entry
+    /// for an index is that index's name.
+    pub names: AVec<(ABytes, u16)>,
+}
+
+#[cfg(feature = "params")]
+impl ParamTable {
+    /// The index of the parameter spelled exactly `name`.
+    pub fn index_of(&self, arena: &Arena, name: &[u8]) -> Option<u16> {
+        self.names
+            .iter()
+            .find(|(h, _)| arena.slice_at(h.pos as usize, h.len as usize) == Some(name))
+            .map(|(_, i)| *i)
+    }
+
+    /// The name of index `i` (`None` for a nameless `?`).
+    pub fn name_of(&self, i: u16) -> Option<ABytes> {
+        self.names.iter().find(|(_, x)| *x == i).map(|(h, _)| *h)
+    }
+
+    /// Assign the index of one parameter token `z` (the pin's
+    /// `sqlite3ExprAssignVarNumber`).
+    fn assign<E>(&mut self, arena: &Arena, z: &[u8], h: ABytes, off: usize) -> Result<u16, E> {
+        let next = |c: u16| {
+            c.checked_add(1)
+                .filter(|n| *n <= MAX_PARAMS)
+                .ok_or(perr(off, ParseKind::TooManyVariables))
+        };
+        if z.len() == 1 {
+            self.count = next(self.count)?;
+            return Ok(self.count);
+        }
+        if z.first() == Some(&b'?') {
+            let mut v: u16 = 0;
+            for d in z.iter().skip(1) {
+                v = v
+                    .checked_mul(10)
+                    .and_then(|x| x.checked_add(u16::from(d.wrapping_sub(b'0'))))
+                    .filter(|x| *x <= MAX_PARAMS)
+                    .ok_or(perr(off, ParseKind::VariableNumber))?;
+            }
+            if v == 0 {
+                return Err(perr(off, ParseKind::VariableNumber));
+            }
+            if v > self.count {
+                self.count = v;
+                self.names.push((h, v));
+            } else if self.name_of(v).is_none() {
+                self.names.push((h, v));
+            }
+            return Ok(v);
+        }
+        if let Some(x) = self.index_of(arena, z) {
+            return Ok(x);
+        }
+        self.count = next(self.count)?;
+        self.names.push((h, self.count));
+        Ok(self.count)
+    }
+}
+
+/// The length of the parameter token at the start of `z`
+/// (v0.16, `params`; the pin's tokenizer): `?` and its digits;
+/// or `$ @ : #` and identifier characters, with the TCL forms
+/// `::` and a trailing `(...)` group. `None` is the pin's
+/// "unrecognized token" (no name characters, or an unclosed
+/// group).
+#[cfg(feature = "params")]
+fn param_len(z: &[u8]) -> Option<usize> {
+    if z.first() == Some(&b'?') {
+        return Some(1 + z.iter().skip(1).take_while(|c| c.is_ascii_digit()).count());
+    }
+    let mut i = 1usize;
+    let mut n = 0usize;
+    while let Some(&c) = z.get(i) {
+        if is_ident_char(c) {
+            n += 1;
+        } else if c == b'(' && n > 0 {
+            loop {
+                i += 1;
+                match z.get(i) {
+                    Some(b')') => return Some(i + 1),
+                    Some(c) if *c != 0 && !c.is_ascii_whitespace() && *c != 0x0b => {}
+                    _ => return None,
+                }
+            }
+        } else if c == b':' && z.get(i + 1) == Some(&b':') {
+            i += 1;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    (n > 0).then_some(i)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,32 +331,93 @@ pub fn parse_real(text: &[u8]) -> Option<f64> {
     if dropped > 0 {
         exp10 += dropped as i64;
     }
-    let digits = &digits[..kept];
+    Some(int_pow10_to_f64(acc, exp10))
+}
+
+/// The f64 nearest to `c * 10^x` (`c > 0`), ties to even — the
+/// conversion `parse_real` ends in (`acc` holds the kept digits),
+/// shared with `record::render_real`'s read-back test (v0.16).
+pub fn int_pow10_to_f64(c: u64, x: i64) -> f64 {
     // Decimal magnitude: the value lies in [10^(mag-1), 10^mag).
     // Far outside the f64 range the answer needs no arithmetic:
     // >= 10^310 is past the overflow midpoint, and < 10^-324 is
     // below half of the smallest subnormal (2.47e-324).
-    let mag = exp10 + digits.len() as i64;
+    let mut mag = x;
+    let mut t = c;
+    while t > 0 {
+        mag += 1;
+        t /= 10;
+    }
     if mag > 310 {
-        return Some(f64::INFINITY);
+        return f64::INFINITY;
     }
     if mag < -323 {
-        return Some(0.0);
+        return 0.0;
     }
     // Exact rational P / Q equal to the literal.
-    let mut p: BigUint = Vec::new();
-    for &d in digits {
-        big_mul_small(&mut p, 10);
-        big_add_small(&mut p, u32::from(d));
-    }
-    let mut q: BigUint = Vec::new();
-    q.push(1);
-    if exp10 >= 0 {
-        big_mul_pow10(&mut p, exp10 as usize);
+    let mut p: BigUint = alloc::vec![c as u32, (c >> 32) as u32];
+    big_trim(&mut p);
+    let mut q: BigUint = alloc::vec![1];
+    if x >= 0 {
+        big_mul_pow10(&mut p, x as usize);
     } else {
-        big_mul_pow10(&mut q, (-exp10) as usize);
+        big_mul_pow10(&mut q, x.unsigned_abs() as usize);
     }
-    Some(big_rational_to_f64(&p, &q))
+    big_rational_to_f64(&p, &q)
+}
+
+/// The pin's internal decimal digits of the finite `r > 0`
+/// (v0.16, for `record::render_real`), as `(d, n)` with `d`, an
+/// 18- or 19-digit integer, about `r * 10^n`. Fitted clean-room
+/// to the pin's observable output (`printf('%!.26g', r)` shows
+/// `d` with its trailing zeros dropped; matched on 120 000 random
+/// doubles, then through `render_real` on millions): with
+/// `r = m * 2^e` (53-bit `m`) and `p = floor(log10 2^(e+52))`,
+/// `n = 17 - p` and `d = round_half_up(r * T)` where `T` is `10^n`
+/// truncated to a 64-bit mantissa (exact for `0 <= n <= 27`, a
+/// little low otherwise). Not correctly rounded: the truncation
+/// shows in the last digit.
+pub fn pin_digits(r: f64) -> (u64, i32) {
+    let bits = r.to_bits();
+    let be = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e) = if be == 0 {
+        // Subnormal: normalise so bit 52 is set.
+        let sh = frac.leading_zeros().saturating_sub(11);
+        (frac << sh, -1074 - sh as i32)
+    } else {
+        (frac | (1u64 << 52), be - 1075)
+    };
+    // floor(x * log10 2), exact for |x| < 2^16 (no float math).
+    let n = 17 - (((e + 52) * 78913) >> 18);
+    let (t, s) = pow10_mantissa(n);
+    // d = m * t * 2^(e + s), rounded half up. The product is
+    // below 2^117 and the shift between 54 and 61, so the low 53
+    // bits only ever fall away: shift them off first and round in
+    // 64 bits (no variable-width 128-bit shift).
+    let y = ((u128::from(m) * u128::from(t)) >> 53) as u64;
+    let sh = (-(e + s)).clamp(54, 116) as u32 - 53;
+    let d = (y >> (sh - 1).min(63)).saturating_add(1) >> 1;
+    (d, n)
+}
+
+/// `10^n` as `(t, s)`: `t` in `[2^63, 2^64)`, the largest with
+/// `t * 2^s <= 10^n` (a truncated 64-bit mantissa).
+fn pow10_mantissa(n: i32) -> (u64, i32) {
+    let mut p: BigUint = alloc::vec![1];
+    big_mul_pow10(&mut p, n.unsigned_abs() as usize);
+    let bl = big_bit_len(&p) as i32;
+    let one: BigUint = alloc::vec![1];
+    // 10^n = (a / b) * 2^s with a / b in [2^63, 2^64): for n >= 0
+    // a = 10^n * 2^64, b = 2^bl; else a = 2^(bl+63), b = 10^-n.
+    let neg = n < 0;
+    let (top, bot) = if neg { (&one, &p) } else { (&p, &one) };
+    let a = big_shl(top, if neg { bl + 63 } else { 64 } as usize);
+    let b = big_shl(bot, if neg { 0 } else { bl } as usize);
+    let s = if neg { -(bl + 63) } else { bl - 64 };
+    let (q, _) = big_div_rem(&a, &b);
+    let limb = |i: usize| u64::from(q.get(i).copied().unwrap_or(0));
+    (limb(0) | (limb(1) << 32), s)
 }
 
 /// `parse_real` for text that may carry one leading `+`/`-`
@@ -270,20 +451,6 @@ fn big_mul_small(v: &mut BigUint, m: u32) {
     while carry > 0 {
         v.push(carry as u32);
         carry >>= 32;
-    }
-}
-
-fn big_add_small(v: &mut BigUint, a: u32) {
-    let mut carry = u64::from(a);
-    let mut i = 0usize;
-    while carry > 0 {
-        if i == v.len() {
-            v.push(0);
-        }
-        let cur = u64::from(v[i]) + carry;
-        v[i] = cur as u32;
-        carry = cur >> 32;
-        i += 1;
     }
 }
 
@@ -360,7 +527,8 @@ fn big_sub(a: &mut BigUint, b: &BigUint) {
 
 /// Floor division with remainder, by binary long division.
 /// In this module the quotient is always mantissa-sized
-/// (~53 bits), so the loop runs ~54 compare/subtract rounds.
+/// (~53 to 64 bits), so the loop runs at most ~65
+/// compare/subtract rounds.
 fn big_div_rem(num: &BigUint, den: &BigUint) -> (BigUint, BigUint) {
     use core::cmp::Ordering;
     if big_cmp(num, den) == Ordering::Less {
@@ -480,6 +648,28 @@ fn number_token<E>(text: &[u8], offset: usize) -> core::result::Result<Tok, Erro
 }
 
 pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
+    #[cfg(feature = "params")]
+    {
+        lex_params::<E>(sql, arena, &mut ParamTable::default())
+    }
+    #[cfg(not(feature = "params"))]
+    {
+        lex_inner::<E>(sql, arena)
+    }
+}
+
+/// `lex`, numbering parameter tokens into `params` (v0.16,
+/// feature `params`).
+#[cfg(feature = "params")]
+pub fn lex_params<E>(sql: &[u8], arena: &Arena, params: &mut ParamTable) -> Result<AVec<Token>, E> {
+    lex_inner::<E>(sql, arena, params)
+}
+
+fn lex_inner<E>(
+    sql: &[u8],
+    arena: &Arena,
+    #[cfg(feature = "params")] params: &mut ParamTable,
+) -> Result<AVec<Token>, E> {
     let mut toks = AVec::new();
     let mut i = 0usize;
     let n = sql.len();
@@ -780,6 +970,24 @@ pub fn lex<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
                 }
                 let tok = number_token::<E>(&sql[start..i], off)?;
                 toks.push(Token { tok, offset: off });
+            }
+            #[cfg(feature = "params")]
+            b'?' | b':' | b'@' | b'$' | b'#' => {
+                let rest = sql.get(i..).unwrap_or(&[]);
+                let len = param_len(rest).ok_or(perr(off, ParseKind::UnexpectedToken))?;
+                let z = rest.get(..len).unwrap_or(&[]);
+                // `#` and a digit is the pin's register syntax,
+                // a syntax error outside its nested parses.
+                if b == b'#' && z.get(1).is_some_and(u8::is_ascii_digit) {
+                    return Err(perr(off, ParseKind::UnexpectedToken));
+                }
+                let h = arena.alloc_copy_handle(z)?;
+                let idx = params.assign::<E>(arena, z, h, off)?;
+                toks.push(Token {
+                    tok: Tok::Param(idx, h),
+                    offset: off,
+                });
+                i += len;
             }
             _ if is_ident_start(b) => {
                 let start = i;

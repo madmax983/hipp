@@ -353,6 +353,12 @@ fn alter_add_column_rejections() {
         exec(&mut db, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
             .await
             .unwrap();
+        // v0.16: NOT NULL without a default and a non-constant
+        // default are refused only on a table with rows (the pin's
+        // sqlite3ErrorIfNotEmpty), so the table gets one first.
+        exec(&mut db, "INSERT INTO t VALUES (1, 'x')")
+            .await
+            .unwrap();
         for sql in [
             "ALTER TABLE t ADD COLUMN c INTEGER PRIMARY KEY",
             "ALTER TABLE t ADD COLUMN c TEXT UNIQUE",
@@ -361,13 +367,13 @@ fn alter_add_column_rejections() {
             "ALTER TABLE t ADD COLUMN b INTEGER",
             "ALTER TABLE nope ADD COLUMN c INTEGER",
         ] {
-            let r = db.prepare(sql).await;
-            assert!(r.is_err(), "must refuse: {sql}");
+            let failed = match db.prepare(sql).await {
+                Err(_) => true,
+                Ok(mut st) => st.step().await.is_err(),
+            };
+            assert!(failed, "must refuse: {sql}");
         }
         // The table is untouched and still usable.
-        exec(&mut db, "INSERT INTO t VALUES (1, 'x')")
-            .await
-            .unwrap();
         let rows = collect(&mut db, "SELECT * FROM t").await;
         assert_eq!(rows, vec!["1|x"]);
     });

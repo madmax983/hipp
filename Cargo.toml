@@ -14,7 +14,7 @@ default = ["std", "full"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
-full = ["indexes", "v04", "v05", "v06", "v07", "v08", "v09", "v10"]
+full = ["indexes", "v04", "v05", "v06", "v07", "v08", "v09", "v10", "v16", "params"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
 # Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
@@ -68,6 +68,30 @@ v09 = ["v08"]
 # aggregates over derived tables), so it implies `v09`. The
 # tiny profile excludes it per §2.
 v10 = ["v09"]
+# v0.16 dialect (ADR 0001): the SQLite-parity rung for core-SQL
+# completion. This unit adds the query-shape surface: LIMIT /
+# OFFSET as general (constant / uncorrelated subquery)
+# expressions, result-column aliases referenced from WHERE / ON
+# / GROUP BY / HAVING / ORDER BY expressions, and `x IN table`.
+# (The RIGHT / FULL / NATURAL / USING joins and NULLS FIRST /
+# LAST fixes are *not* gated: they correct claimed v0.4 paths.)
+# The collations unit adds the `expr COLLATE name` operator,
+# GLOB / NOT GLOB, LIKE ... ESCAPE and the like() / glob()
+# functions (column COLLATE clauses, collated indexes and the
+# collation rules themselves are *not* gated: they correct
+# claimed v0.4 / index paths).
+# Builds on the v0.11 subquery machinery (a LIMIT may be a
+# scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
+# so it implies `v10`. The tiny profile excludes it per §2.
+v16 = ["v10"]
+# v0.16 leaf (ADR 0001): bound parameters -- `?`, `?NNN`, `:name`,
+# `@name`, `$name` with the pin's numbering, the Statement bind_*
+# / parameter_* / clear_bindings / reset API, and re-execution of
+# a prepared statement. Depends on nothing: on top of the tiny
+# profile a parameter stands wherever its grammar takes a literal
+# (INSERT VALUES, WHERE rowid = ?); with the evaluator it is any
+# expression. The tiny profile excludes it per §2.
+params = []
 
 [dependencies]
 
@@ -79,3 +103,7 @@ codegen-units = 1
 panic = "abort"
 
 [dev-dependencies]
+
+[[example]]
+name = "params"
+required-features = ["params"]

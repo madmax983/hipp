@@ -13,8 +13,9 @@
 //! derived from the owning table's UNIQUE / PRIMARY KEY constraint
 //! sets in statement order — the same order SQLite creates them
 //! (oracle-verified). An index whose SQL uses a feature outside
-//! the v0.3 grammar (expressions, partial indexes, non-BINARY
-//! collations) is recorded as *opaque*: reads of its table work,
+//! the v0.3 grammar (expressions, partial indexes) is recorded
+//! as *opaque* (v0.16: NOCASE / RTRIM key collations are
+//! maintained, no longer opaque): reads of its table work,
 //! writes refuse with `Error::Unsupported` rather than silently
 //! desynchronising an index hipp cannot maintain.
 
@@ -22,7 +23,7 @@ use crate::arena::{ABytes, AVec, Arena};
 use crate::btree::ScanCursor;
 use crate::error::{Error, Result};
 use crate::pager::Pager;
-use crate::record::{Affinity, Value, affinity_of, decode_record};
+use crate::record::{Affinity, Coll, Value, affinity_of, decode_record};
 #[cfg(feature = "indexes")]
 use crate::sql::ConstraintSet;
 use crate::sql::{Ast, Literal, eq_ci, handle_bytes, parse};
@@ -38,6 +39,25 @@ pub struct Column {
     /// carried into the catalog so the write paths can enforce
     /// it; parsed since v0.1, recorded for ALTER since v0.4).
     pub not_null: bool,
+    /// An expression DEFAULT that could not be folded to a
+    /// constant when the catalog was built (v0.16): it names the
+    /// clock (`CURRENT_TIMESTAMP`, ...) or fails to evaluate (an
+    /// unknown function). The text is evaluated per statement by
+    /// the INSERT that needs it. A foldable expression default
+    /// (`(1+2)`, `-'3'`) is folded into `default` instead, so
+    /// every reader sees the pin's value.
+    #[cfg(feature = "v04")]
+    pub default_expr: Option<ABytes>,
+    /// A generated column's expression text (v0.16).
+    #[cfg(feature = "v04")]
+    pub gen_expr: Option<ABytes>,
+    /// A STORED generated column (v0.16); VIRTUAL otherwise.
+    #[cfg(feature = "v04")]
+    pub stored: bool,
+    /// The column's collating sequence (v0.16; BINARY when no
+    /// `COLLATE` clause was written).
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub coll: Coll,
 }
 
 /// One column of an index key (v0.3). `col == None` is the rowid
@@ -46,6 +66,10 @@ pub struct Column {
 pub struct IndexColumn {
     pub col: Option<usize>,
     pub desc: bool,
+    /// The key column's collating sequence (v0.16): the index's
+    /// explicit `COLLATE`, else the table column's (BINARY for
+    /// the rowid).
+    pub coll: Coll,
 }
 
 /// One UNIQUE / PRIMARY KEY constraint set of a table, resolved
@@ -67,6 +91,54 @@ pub struct TableDef {
     pub rowid_alias: Option<usize>,
     /// UNIQUE / PK constraint sets in statement order (v0.3).
     pub auto_sets: AVec<AutoSet>,
+    /// CHECK constraint texts, statement order (v0.16).
+    #[cfg(feature = "v04")]
+    pub checks: AVec<ABytes>,
+    /// A STRICT table (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub strict: bool,
+    /// The stored SQL names a collating sequence hipp does not
+    /// have (an application-registered one, v0.16). The table
+    /// is listed (its name is taken, `.schema` shows it) but
+    /// has no columns here, and every statement that reads or
+    /// writes it is refused with `SchemaKind::UnknownCollation`
+    /// (see `TableDef::usable`); the rest of the file works.
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub foreign_coll: bool,
+}
+
+impl TableDef {
+    /// The table, unless it names a collating sequence hipp
+    /// does not have (v0.16): statements that read or write
+    /// such a table are refused with
+    /// `SchemaKind::UnknownCollation` — remedy: register no
+    /// custom collation, or use an engine that has it.
+    pub fn usable<E>(&self) -> Result<&TableDef, E> {
+        #[cfg(any(feature = "v04", feature = "indexes"))]
+        if self.foreign_coll {
+            return Err(Error::Schema {
+                kind: crate::error::SchemaKind::UnknownCollation,
+            });
+        }
+        Ok(self)
+    }
+
+    /// Whether any column is generated (v0.16).
+    #[cfg(feature = "v04")]
+    pub fn has_generated(&self) -> bool {
+        self.columns.iter().any(|c| c.gen_expr.is_some())
+    }
+
+    /// Whether writes must go through table rules (v0.16): a
+    /// generated column, a CHECK constraint, or STRICT typing.
+    #[cfg(feature = "v04")]
+    pub fn has_rules(&self) -> bool {
+        #[cfg(feature = "v16")]
+        if self.strict {
+            return true;
+        }
+        self.has_generated() || !self.checks.is_empty()
+    }
 }
 
 /// Where an index came from (v0.3).
@@ -175,6 +247,22 @@ fn intern_literal(
     })
 }
 
+/// A folded DEFAULT value as a catalog literal (v0.16).
+#[cfg(feature = "v04")]
+fn owned_literal(
+    arena: &Arena,
+    v: &crate::record::OwnedValue,
+) -> core::result::Result<Literal, crate::error::ArenaError> {
+    use crate::record::OwnedValue;
+    Ok(match v {
+        OwnedValue::Null => Literal::Null,
+        OwnedValue::Integer(i) => Literal::Integer(*i),
+        OwnedValue::Real(f) => Literal::Real(*f),
+        OwnedValue::Text(t) => Literal::Text(intern(arena, t.as_slice())?),
+        OwnedValue::Blob(b) => Literal::Blob(intern(arena, b.as_slice())?),
+    })
+}
+
 /// One raw `sqlite_schema` row, in scan (creation) order.
 struct SchemaRow {
     ty: AVec<u8>,
@@ -211,6 +299,15 @@ fn resolve_index_column(
         return Ok(None);
     }
     Err(())
+}
+
+/// The collating sequence of index key column `col` (v0.16):
+/// the table column's, BINARY for the rowid.
+#[cfg(feature = "indexes")]
+fn col_coll(t: &TableDef, col: Option<usize>) -> Coll {
+    col.and_then(|i| t.columns.as_slice().get(i))
+        .map(|c| c.coll)
+        .unwrap_or_default()
 }
 
 /// Build the catalog by scanning `sqlite_schema` (root page 1).
@@ -262,11 +359,42 @@ pub async fn build_catalog<S: Storage>(
         }
         let sql = row.sql.as_ref().expect("checked");
         scratch.reset();
-        let ast = parse::<S::Error>(sql.as_slice(), &scratch)?;
+        let ast = match parse::<S::Error>(sql.as_slice(), &scratch) {
+            Ok(a) => a,
+            // v0.16: a collation hipp does not have (one an
+            // application registered) — the pin opens such a
+            // file and errors only where the collation is used.
+            // Keep the table listed but unusable; the rest of
+            // the file still opens.
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            Err(Error::Schema {
+                kind: crate::error::SchemaKind::UnknownCollation,
+            }) => {
+                catalog.tables.push(TableDef {
+                    name: intern(catalog_arena, row.name.as_slice())?,
+                    root: row.root,
+                    sql: intern(catalog_arena, sql.as_slice())?,
+                    columns: AVec::new(),
+                    rowid_alias: None,
+                    auto_sets: AVec::new(),
+                    #[cfg(feature = "v04")]
+                    checks: AVec::new(),
+                    #[cfg(feature = "v16")]
+                    strict: false,
+                    foreign_coll: true,
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let Ast::CreateTable {
             columns,
             pk_columns,
             constraint_sets,
+            #[cfg(feature = "v04")]
+            checks,
+            #[cfg(feature = "v16")]
+            strict,
             ..
         } = ast
         else {
@@ -288,15 +416,55 @@ pub async fn build_catalog<S: Storage>(
             {
                 alias = Some(i);
             }
+            #[allow(unused_mut)]
+            let mut affinity = affinity_of(decl_bytes);
+            // STRICT (v0.16): an ANY column has no affinity —
+            // values are stored as given (in an ordinary table
+            // `ANY` is NUMERIC by the name rules).
+            #[cfg(feature = "v16")]
+            if strict && eq_ci(trim(decl_bytes), b"ANY") {
+                affinity = Affinity::Blob;
+            }
+            #[allow(unused_mut)]
+            let mut default = match c.default {
+                Some(l) => Some(intern_literal(catalog_arena, l, &scratch)?),
+                None => None,
+            };
+            // v0.16: fold an expression DEFAULT once, here, when
+            // it is constant; keep its text when it reads the
+            // clock or fails to evaluate (the INSERT that needs
+            // it evaluates it then — and errors, as the pin does).
+            #[cfg(feature = "v04")]
+            let mut default_expr = None;
+            #[cfg(feature = "v04")]
+            if let Some(h) = c.default_expr {
+                let text = handle_bytes(&scratch, h);
+                match crate::rules::eval_default::<S::Error>(
+                    text,
+                    &scratch,
+                    &mut crate::rules::Clock::new(None),
+                ) {
+                    Ok(v) => default = Some(owned_literal(catalog_arena, &v)?),
+                    Err(_) => default_expr = Some(intern(catalog_arena, text)?),
+                }
+            }
             cols.push(Column {
                 name: intern(catalog_arena, handle_bytes(&scratch, c.name))?,
                 decl: intern(catalog_arena, decl_bytes)?,
-                affinity: affinity_of(decl_bytes),
-                default: match c.default {
-                    Some(l) => Some(intern_literal(catalog_arena, l, &scratch)?),
+                affinity,
+                default,
+                not_null: c.not_null,
+                #[cfg(feature = "v04")]
+                default_expr,
+                #[cfg(feature = "v04")]
+                gen_expr: match c.gen_expr {
+                    Some(h) => Some(intern(catalog_arena, handle_bytes(&scratch, h))?),
                     None => None,
                 },
-                not_null: c.not_null,
+                #[cfg(feature = "v04")]
+                stored: c.stored,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll: c.coll.unwrap_or_default(),
             });
         }
         let rowid_alias = alias;
@@ -313,6 +481,12 @@ pub async fn build_catalog<S: Storage>(
         let auto_sets: AVec<AutoSet> = AVec::new();
         #[cfg(not(feature = "indexes"))]
         let _ = (constraint_sets, pk_columns);
+        #[cfg(feature = "v04")]
+        let mut check_texts = AVec::new();
+        #[cfg(feature = "v04")]
+        for h in checks.iter() {
+            check_texts.push(intern(catalog_arena, handle_bytes(&scratch, *h))?);
+        }
         catalog.tables.push(TableDef {
             name: intern(catalog_arena, row.name.as_slice())?,
             root: row.root,
@@ -320,6 +494,12 @@ pub async fn build_catalog<S: Storage>(
             columns: cols,
             rowid_alias,
             auto_sets,
+            #[cfg(feature = "v04")]
+            checks: check_texts,
+            #[cfg(feature = "v16")]
+            strict,
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            foreign_coll: false,
         });
     }
 
@@ -386,7 +566,11 @@ pub async fn build_catalog<S: Storage>(
                         for cd in columns.iter() {
                             let nb = handle_bytes(&scratch, cd.name);
                             match resolve_index_column(catalog_arena, &t, nb) {
-                                Ok(col) => idx.columns.push(IndexColumn { col, desc: cd.desc }),
+                                Ok(col) => idx.columns.push(IndexColumn {
+                                    col,
+                                    desc: cd.desc,
+                                    coll: cd.coll.unwrap_or_else(|| col_coll(&t, col)),
+                                }),
                                 Err(()) => {
                                     ok = false;
                                     break;
@@ -487,8 +671,14 @@ fn derive_view_columns(
         }
         return out;
     }
-    // Source column-name lists, in FROM order.
+    // Source column-name lists, in FROM order — and (v0.16)
+    // each source's NATURAL / USING join columns: an
+    // unqualified `*` shows those once, at the left-most source
+    // (the pin's `selectExpander`; review regression: they were
+    // listed per source).
     let mut sources: AVec<(AVec<u8>, AVec<AVec<u8>>)> = AVec::new();
+    #[cfg(feature = "v04")]
+    let mut joined: AVec<AVec<AVec<u8>>> = AVec::new();
     for src in select.from.iter() {
         let tname = handle_bytes(scratch, src.table);
         let qualifier = match src.alias {
@@ -510,13 +700,40 @@ fn derive_view_columns(
         } else {
             return AVec::new();
         }
+        #[cfg(feature = "v04")]
+        {
+            let mut j: AVec<AVec<u8>> = AVec::new();
+            if src.natural {
+                for c in cols.iter() {
+                    if sources
+                        .iter()
+                        .any(|(_, l)| l.iter().any(|x| eq_ci(x.as_slice(), c.as_slice())))
+                    {
+                        j.push(c.clone());
+                    }
+                }
+            } else {
+                for u in src.using.iter() {
+                    j.push(copy_avec(handle_bytes(scratch, *u)));
+                }
+            }
+            joined.push(j);
+        }
         sources.push((qualifier, cols));
     }
     for item in select.items.iter() {
         match item {
             crate::sql::SelectItem::Star => {
+                #[cfg(feature = "v04")]
+                let mut joined_it = joined.iter();
                 for (_, cols) in sources.iter() {
+                    #[cfg(feature = "v04")]
+                    let j = joined_it.next();
                     for c in cols.iter() {
+                        #[cfg(feature = "v04")]
+                        if j.is_some_and(|j| j.iter().any(|x| eq_ci(x.as_slice(), c.as_slice()))) {
+                            continue;
+                        }
                         match intern(catalog_arena, c.as_slice()) {
                             Ok(h) => out.push(h),
                             Err(_) => return AVec::new(),
@@ -545,13 +762,41 @@ fn derive_view_columns(
             crate::sql::SelectItem::Expr(e, alias, text) => {
                 let name: &[u8] = if let Some(a) = alias {
                     handle_bytes(scratch, *a)
-                } else if let crate::sql::Expr::Column { name, .. } = e {
-                    handle_bytes(scratch, *name)
+                } else if let crate::sql::Expr::Column { table, name } = e {
+                    // v0.16: the referenced column's own spelling
+                    // (the pin names `SELECT A FROM s` column `a`).
+                    let nb = handle_bytes(scratch, *name);
+                    let qb = table.map(|q| handle_bytes(scratch, q));
+                    sources
+                        .iter()
+                        .filter(|(q, _)| qb.is_none_or(|qb| eq_ci(q.as_slice(), qb)))
+                        .flat_map(|(_, cols)| cols.iter())
+                        .find(|c| eq_ci(c.as_slice(), nb))
+                        .map_or(nb, |c| c.as_slice())
                 } else {
                     handle_bytes(scratch, *text)
                 };
                 match intern(catalog_arena, name) {
                     Ok(h) => out.push(h),
+                    Err(_) => return AVec::new(),
+                }
+            }
+        }
+    }
+    // Duplicate names become `id:1`, ... as on the pin (v0.16).
+    #[cfg(feature = "v04")]
+    {
+        let mut names: AVec<AVec<u8>> = AVec::new();
+        for h in out.iter() {
+            names.push(copy_avec(handle_bytes(catalog_arena, *h)));
+        }
+        if crate::rules::unique_names::<()>(names.as_mut_slice()).is_err() {
+            return AVec::new();
+        }
+        for (h, n) in out.as_mut_slice().iter_mut().zip(names.iter()) {
+            if handle_bytes(catalog_arena, *h) != n.as_slice() {
+                match intern(catalog_arena, n.as_slice()) {
+                    Ok(x) => *h = x,
                     Err(_) => return AVec::new(),
                 }
             }
@@ -590,6 +835,12 @@ fn resolve_auto_sets(
                         Some(i)
                     },
                     desc: cd.desc,
+                    // v0.16: an autoindex keys by the constraint's
+                    // explicit COLLATE, else the column's.
+                    coll: cd
+                        .coll
+                        .or_else(|| cols.get(i).map(|c| c.coll))
+                        .unwrap_or_default(),
                 }),
                 None => {
                     ok = false;
