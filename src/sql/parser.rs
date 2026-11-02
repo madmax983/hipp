@@ -1156,7 +1156,9 @@ impl<'a> Parser<'a> {
             Ok(ConflictAction::Ignore)
         } else if self.eat_kw(b"REPLACE") {
             Ok(ConflictAction::Replace)
-        } else if self.eat_kw(b"ABORT") || self.eat_kw(b"FAIL") || self.eat_kw(b"ROLLBACK") {
+        } else if self.eat_kw(b"FAIL") {
+            Ok(ConflictAction::Fail)
+        } else if self.eat_kw(b"ABORT") || self.eat_kw(b"ROLLBACK") {
             Ok(ConflictAction::Abort)
         } else {
             Err(perr(self.cur().offset, ParseKind::UnexpectedToken))
@@ -3457,11 +3459,13 @@ impl<'a> Parser<'a> {
                 {
                     return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                 }
-            } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"FAIL") || self.eat_kw(b"ROLLBACK")) {
+            } else if self.eat_kw(b"FAIL") {
+                conflict = ConflictAction::Fail;
+            } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"ROLLBACK")) {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
-            // OR ABORT / FAIL / ROLLBACK: the engine's default
-            // (abort the statement) — nothing to record.
+            // OR ABORT / ROLLBACK: the engine's default (abort
+            // the statement) — nothing to record.
         }
         let table = self.name::<E>()?;
         // The alias is optional, but `SET` must not be eaten as

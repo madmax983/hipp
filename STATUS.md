@@ -1590,6 +1590,80 @@ of them (round digits, text with a NUL).
   `replace` with a NUL-led pattern keeps the subject; `upper` /
   `lower` of a BLOB are TEXT (they returned the BLOB).
 
+**Review fixes** (all reproduced first, then compared with the
+live pin; regression tests in `tests/functions_v16.rs` and the
+CLI suite's `review` batch):
+
+- **Overflow chains** (ungated; corruption on a tiny-claimed
+  INSERT path, already in the base): a record whose overflow tail
+  needed more pages than the page cache holds (≈16 with the
+  default cache, 4 in the tiny profile) wrote a truncated chain —
+  `alloc_page` spilled the fresh zeroed frames, `write_overflow`
+  re-read them *clean*, and their writes were lost on the next
+  eviction. `zeroblob(69530)` (69529 passed) gave the pin's
+  "overflow list length is 15 but should be 17" and a
+  CorruptRecord read. The reloaded frame is now marked dirty (the
+  same rule `write_leaf_page` follows). Every other fresh-page
+  writer already did.
+- **Argument counts** (ungated): `coalesce` takes 2+ arguments and
+  `ifnull` exactly 2, as on the pin (`coalesce(1)`, `ifnull(1)`,
+  `ifnull(NULL, NULL, 5)` used to answer). A sweep of every
+  function in scope with 0..4 arguments now agrees with the pin.
+  `count()` (count(*)) already worked after the aggregate unit.
+- **`f(*)` and DISTINCT on scalar functions** (`v16`): `f(*)` is
+  `f()` (`random(*)`, `printf(*)` is NULL, `abs(*)` a wrong
+  argument count) and DISTINCT is ignored (`abs(DISTINCT -1)`,
+  `printf(DISTINCT '%d', 1)`), as on the pin. They were
+  `Unsupported`.
+- **Subqueries read only when reached** (ungated, v0.6 path): the
+  executor computes subquery nodes before it evaluates an
+  expression, so an error inside one surfaced even where the pin
+  never runs it (`coalesce(1, (SELECT abs(-9223372036854775808)))`
+  is 1 there). A subquery that fails with an evaluation error
+  (`Error::Schema`) now becomes `SubValue::Fail` →
+  `RExpr::Raise`, raised only if evaluation reads it. I/O,
+  corruption and arena errors still fail at once. AND / OR skip
+  their right side when the left side decides and the right side
+  holds such a node. This matches the pin, which short-circuits
+  an AND / OR whose operand has a subquery, while `a AND abs(b)`
+  runs both sides there too.
+- **Text functions walk text in place** (ungated): `char_ranges`
+  was a list of 16-byte ranges per character (`length()` of a
+  100 MB text peaked at 1.6 GB; the pin's largest legal value,
+  `length(printf('%*.*s', 999999999, 5, 'x'))`, was OOM-killed).
+  It is now an iterator. `length` counts, and `substr` finds its
+  byte span in one walk. The same pattern in LIKE / GLOB (a
+  4-byte code point per subject character) now decodes the
+  subject on the fly; only the pattern (≤ 50,000 bytes) is
+  decoded into a list. The 999,999,999-byte case answers in 2.2 s
+  at 957 MB peak (release), like the pin.
+- **Per-row DEFAULTs** (`v16`): a DEFAULT reading connection state
+  (`random()`, `last_insert_rowid()`, `changes()`, ...) was
+  evaluated once at prepare. Now `InsCol::per_row` keeps its
+  resolved expression and evaluates it for each row:
+  `b DEFAULT (last_insert_rowid())` over `VALUES (11), (12),
+  (13)` is 0, 11, 12 (was 0, 0, 0). OR REPLACE, INSERT ...
+  SELECT and upsert rows behave the same way, and each row draws
+  its own `random()`.
+- **OR FAIL** (ungated; claimed v0.5 / v0.7 paths). hipp parsed
+  FAIL as ABORT, so a constraint violation rolled back the rows
+  the statement had already changed. STATUS v0.7 called the two
+  "observably" the same in autocommit, which is false for
+  multi-row statements. `ConflictAction::Fail` now keeps them. On
+  a UNIQUE / PRIMARY KEY, NOT NULL or CHECK violation, the earlier
+  rows stay: committed in autocommit, or left in the open
+  transaction. `changes()` counts them (the pin's 1|2, was 0|1).
+  Other errors (overflow, datatype mismatch, STRICT) still undo
+  the statement, as on the pin. Conflicts are found before a row
+  is written, so no partial row is kept.
+- **A VALUES row that fails to evaluate** (`v16`): constant rows
+  are folded at prepare, so `VALUES (30, 'x'), (31,
+  abs(-9223372036854775808))` failed before any row was
+  inserted. On the pin, row 30 goes in first, so a failed
+  statement leaves `last_insert_rowid()` at 30. Now a row that
+  fails to fold makes the statement evaluate its VALUES row by row
+  at step time.
+
 **Oracle-probing notes** (all on the live 3.54.1 pin; the REAL
 digit rules fitted clean-room from output: 16 000 cases through a
 Python model, then 4 × 3 000 through hipp's SQL path, all
@@ -1637,7 +1711,22 @@ per-seed determinism, non-deterministic functions in definitions).
 `hipp-cli/tests/cli_v16_functions.rs` (3 tests, byte-identical
 one-shot and over stdin).
 
-**Size:** tiny **75,960 B** (Δ **0**: the function library is
+**Size after the review fixes:** tiny **75,968 B** (Δ **+8 B**
+vs 75,960, ratchet raised to it). This is the overflow-chain
+correctness fix on the tiny profile's INSERT path: one
+`mark_frame_dirty` call in `write_overflow`. The FAIL variant
+and its keep logic are gated on `v05`, where OR FAIL parses, so
+the tiny insert error path is unchanged. Full **327,667 B**
+(Δ **+2,216 B** vs 325,451, ratchet raised to it): deferred
+subquery errors, the OR FAIL path, per-row defaults, and the
+in-place text walkers. The full `ci/local-gates.sh` run ends
+with "==> all gates passed". Census (now 195 probes): the 186
+earlier probes are unchanged (MATCH 120, HIPP_ERR 52, BOTH_ERR
+14). Of the 9 new review probes, 6 match and 3 are refused by
+both engines: `coalesce(1)`, `ifnull(…3 args)`, and the OR FAIL
+script, whose one-shot stops at the error on both sides.
+
+**Size (unit as first shipped):** tiny **75,960 B** (Δ **0**: the function library is
 `v16`; the counters' hooks and the round() / text fixes live in
 `v16` / evaluator code the tiny profile does not build). Full
 **312,051 B** (Δ **+10,672 B** vs 301,379, ratchet raised to it):
@@ -1653,7 +1742,27 @@ and the function-name table.
 - `last_insert_rowid()` inside an INSERT ... SELECT source reads
   the pre-statement value for every row (hipp materialises the
   source first; the pin streams it and later rows see earlier
-  inserts' rowids, unless the source reads the target).
+  inserts' rowids, unless the source reads the target). A
+  DEFAULT reading it is per row (review fix), so only the SELECT
+  list itself is affected. A VALUES list with a subquery is
+  still materialised before the first insert. If one of its rows
+  fails to evaluate, `last_insert_rowid()` keeps the
+  pre-statement value, where the pin has the rows before it.
+- An UPDATE OR REPLACE that substitutes a NOT NULL column's
+  connection-state DEFAULT evaluates that default once per
+  statement, not per row.
+- The deferred subquery errors are evaluation errors only: an
+  AND / OR short-circuits its right side only when that side
+  holds a failed subquery. The pin short-circuits whenever an
+  operand has a subquery, which can differ when the same side
+  also raises an error of its own. The pin also folds `X AND 0`
+  to 0 at prepare (`abs(-9223372036854775808) AND 0` is 0 there;
+  hipp raises), an expression-folding gap outside this unit.
+- OR ABORT inside an explicit transaction still rolls back the
+  whole transaction (the documented v0.5 simplification); OR
+  FAIL and OR ROLLBACK match the pin there. Column-level conflict
+  clauses (`NOT NULL ON CONFLICT FAIL`) are still parsed and
+  ignored (see "Column constraints and table definitions").
 - `random()` / `randomblob()` are not the pin's ChaCha20 stream —
   types, lengths and ranges match, values do not (and the seed is
   `Config::nonce_seed`, shared with the journal nonces).

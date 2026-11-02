@@ -133,6 +133,30 @@ INSERT INTO r VALUES (7) RETURNING last_insert_rowid(), changes(), total_changes
 SELECT changes(), total_changes(), last_insert_rowid();
 ";
 
+/// Review fixes: overflow chains of large records, per-row
+/// connection-state DEFAULTs, subqueries read only when reached,
+/// `f(*)` / DISTINCT on scalar functions.
+const REVIEW: &str = "\
+CREATE TABLE big(b);
+INSERT INTO big VALUES(zeroblob(69530)), (printf('%70000d', 1)), (randomblob(300000));
+UPDATE big SET b = b || b WHERE rowid = 2;
+SELECT rowid, length(b), typeof(b) FROM big;
+CREATE TABLE d(a INTEGER PRIMARY KEY, b DEFAULT (last_insert_rowid()), c DEFAULT (random()));
+INSERT INTO d(a) VALUES(11), (12), (13);
+INSERT INTO d(a) SELECT a + 100 FROM d;
+SELECT a, b, typeof(c) FROM d;
+SELECT count(DISTINCT c) FROM d;
+SELECT coalesce(1, (SELECT abs(-9223372036854775808))), iif(1, 2, (SELECT abs(-9223372036854775808)));
+SELECT 0 AND (SELECT abs(-9223372036854775808)), 1 OR (SELECT abs(-9223372036854775808)), coalesce(1, 5 IN (SELECT abs(-9223372036854775808)));
+SELECT typeof(random(*)), printf(*), abs(DISTINCT -1), upper(DISTINCT 'a'), printf(DISTINCT '%d-%d', 1, 2), changes(*), char(*);
+SELECT length(printf('%*.*s', 3000000, 5, 'x')), length(substr(hex(zeroblob(400000)), 7, 500000)), hex(zeroblob(100000)) LIKE '%01';
+";
+
+#[test]
+fn cli_v16_functions_review_byte_identical() {
+    byte_identical("review", REVIEW);
+}
+
 #[test]
 fn cli_v16_functions_core_byte_identical() {
     byte_identical("core", CORE);

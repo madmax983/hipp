@@ -389,14 +389,22 @@ pub struct SelectStmt {
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
 /// of `INSERT OR ...` / `UPDATE OR ...`, and the standalone
 /// `REPLACE` verb (which is `INSERT` with `Replace`). `Abort`
-/// covers ABORT, FAIL and ROLLBACK spellings: hipp's write-error
-/// rule already aborts (and rolls back) the whole statement on
-/// any error, which is the observable behaviour of all three in
-/// autocommit and the documented v0.5 simplification inside an
+/// covers the ABORT and ROLLBACK spellings: hipp's write-error
+/// rule aborts (and rolls back) the whole transaction on any
+/// error, which is ROLLBACK's behaviour, ABORT's in autocommit,
+/// and the documented v0.5 simplification for ABORT inside an
 /// explicit transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
     Abort,
+    /// `OR FAIL` (v0.16 review fix, ungated): a constraint
+    /// violation (UNIQUE / PRIMARY KEY, NOT NULL, CHECK) errors
+    /// like `Abort`, but the rows the statement changed before it
+    /// stay changed (committed in autocommit; an explicit
+    /// transaction stays open). Other errors still roll back.
+    /// Parsed only with UPDATE (v0.5) / INSERT OR (v0.7).
+    #[cfg(feature = "v05")]
+    Fail,
     Ignore,
     Replace,
 }

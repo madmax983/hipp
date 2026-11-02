@@ -756,6 +756,18 @@ pub fn eval_default<E>(
     clock: &mut Clock,
     env: Option<&crate::query::Env>,
 ) -> Result<OwnedValue, E> {
+    let (r, row) = prepare_default::<E>(text, arena, clock)?;
+    eval_prepared_default::<E>(&r, &row, env)
+}
+
+/// The resolved expression of a DEFAULT and the clock row it reads
+/// (`eval_default`'s first half, v0.16): the clock is read here
+/// when the expression names it, once per statement.
+pub fn prepare_default<E>(
+    text: &[u8],
+    arena: &Arena,
+    clock: &mut Clock,
+) -> Result<(RExpr, RowData), E> {
     let e = parse_rule::<E>(text, arena)?;
     let mut cols = AVec::new();
     for c in CTIME.iter() {
@@ -791,11 +803,23 @@ pub fn eval_default<E>(
             row.vals.push(OwnedValue::Null);
         }
     }
+    Ok((r, row))
+}
+
+/// Evaluate a `prepare_default` result (v0.16): once per statement,
+/// or once per row for a default that reads connection state
+/// (`random()`, `last_insert_rowid()`, ... — the pin computes a
+/// DEFAULT for each row it inserts).
+pub fn eval_prepared_default<E>(
+    r: &RExpr,
+    row: &RowData,
+    env: Option<&crate::query::Env>,
+) -> Result<OwnedValue, E> {
     let ctx = match env {
-        Some(env) => Ctx::of(&row).with(env),
-        None => Ctx::of(&row),
+        Some(env) => Ctx::of(row).with(env),
+        None => Ctx::of(row),
     };
-    eval::<E>(&r, &ctx)
+    eval::<E>(r, &ctx)
 }
 
 /// One statement's view of the wall clock (v0.16): the

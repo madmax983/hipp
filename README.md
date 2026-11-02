@@ -209,8 +209,22 @@ aspirations.
   `ifnull` / `iif` evaluate lazily, and `length` / `substr` /
   `trim` / `instr` / `replace` / `upper` / `lower` read text up
   to a NUL and blobs as bytes, as the pin's C functions do.
+  Review fixes (ungated unless noted): a record with more than
+  about 16 overflow pages no longer writes a truncated chain
+  (`zeroblob(69530)` corrupted the file — a page-cache spill
+  dropped chain writes); `coalesce` needs 2+ arguments and
+  `ifnull` exactly 2; a subquery's error surfaces only if
+  evaluation reaches it (`coalesce(1, (SELECT ...))`, an AND /
+  OR the other side decides); `length` / `substr` / `trim` /
+  LIKE walk text in place (no per-character list, so the pin's
+  largest legal text no longer runs out of memory); `INSERT` /
+  `UPDATE OR FAIL` keep the rows changed before the violation
+  (it was treated as ABORT); behind `v16`, a DEFAULT reading
+  `last_insert_rowid()` / `random()` is evaluated per row,
+  `f(*)` is `f()` and DISTINCT is ignored on scalar functions.
   `sqlite_source_id()` stays undefined (hipp is not the pin's
-  source check-in). The tiny profile did not grow.
+  source check-in). The tiny profile grew by 8 bytes (the
+  overflow-chain fix on its INSERT path).
 - **Aggregate completion.** Behind `v16`: `string_agg(X, SEP)`;
   the aggregate ORDER BY (`group_concat(b, ',' ORDER BY a DESC,
   b)`) on every aggregate that takes it — a stable sort of the

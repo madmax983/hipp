@@ -651,7 +651,14 @@ async fn write_overflow<S: Storage>(
     }
     for (i, p) in pages.iter().enumerate() {
         let p = *p;
+        // The page is fresh (dirty, unjournaled), but a long chain
+        // can outgrow the page cache: `alloc_page` then spilled
+        // its zeroed frame and `load` reads it back *clean*, so it
+        // must be re-marked dirty or the chain write is lost on
+        // the next eviction (v0.16 review fix: a record with more
+        // than ~16 overflow pages wrote a truncated chain).
         let idx = pager.load(p).await?;
+        pager.mark_frame_dirty(idx);
         let next = if i + 1 < pages.len() {
             pages.as_slice()[i + 1]
         } else {

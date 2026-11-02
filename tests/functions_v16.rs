@@ -868,3 +868,229 @@ fn nondeterministic_functions_in_definitions() {
         "SELECT * FROM c",
     ]);
 }
+
+// ---------------- review fixes ----------------
+
+/// A record whose overflow tail outgrows the page cache wrote a
+/// truncated chain (pages spilled while the chain was being
+/// built were re-read clean and their writes lost): the pin's
+/// integrity check reported "overflow list length is 15 but
+/// should be 17" for `zeroblob(69530)`, and hipp read the row
+/// back as CorruptRecord. The cut-off moved with the cache size,
+/// so the tiny profile's 4-page cache is exercised too, with a
+/// plain blob literal (no v16 function needed).
+#[test]
+fn large_records_write_whole_overflow_chains() {
+    let tw = twins("ovf", "CREATE TABLE t(b)");
+    tw.all(&[
+        "INSERT INTO t VALUES (zeroblob(69529)), (zeroblob(69530)), (zeroblob(250000))",
+        "INSERT INTO t VALUES (printf('%70000d', 1)), (randomblob(140000))",
+        "INSERT INTO t SELECT concat(b, b) FROM t WHERE rowid = 4",
+        "UPDATE t SET b = b || b || b WHERE rowid = 2",
+        "SELECT rowid, length(b), typeof(b), hex(substr(b, length(b) - 2)) FROM t WHERE rowid <> 5",
+        "SELECT length(b) FROM t WHERE rowid = 5",
+        "DELETE FROM t WHERE rowid IN (1, 3)",
+        "SELECT rowid, length(b) FROM t",
+    ]);
+    assert_eq!(oracle_raw(&tw.hipp, "PRAGMA integrity_check;").1, ["ok"]);
+    // The tiny profile's cache size, a 30 KB literal.
+    let path = common::temp_db("v16fn-ovf-tiny");
+    let lit: String = (0..30_000).map(|i| format!("{:02x}", i % 251)).collect();
+    block_on(async {
+        let cfg = Config::default()
+            .cache_pages(4)
+            .statement_arena(1 << 16, 1 << 20);
+        let mut db = Connection::open(FileStorage::open(&path).expect("fs open"), cfg)
+            .await
+            .expect("open");
+        try_collect(&mut db, "CREATE TABLE t(b)")
+            .await
+            .expect("create");
+        let r = try_collect(&mut db, &format!("INSERT INTO t VALUES (x'{lit}')")).await;
+        assert!(r.is_ok(), "insert: {r:?}");
+        let rows = try_collect(&mut db, "SELECT length(b) FROM t")
+            .await
+            .expect("read");
+        assert_eq!(rows, ["30000"]);
+    });
+    assert_eq!(oracle_raw(&path, "PRAGMA integrity_check;").1, ["ok"]);
+    assert_eq!(
+        oracle_raw(&path, "SELECT length(b), hex(substr(b, 29999)) FROM t;").1,
+        [format!("30000|{}", &lit[59996..])]
+    );
+}
+
+/// The pin's argument counts for coalesce (2+) and ifnull (2),
+/// `f(*)` as `f()` and DISTINCT ignored on scalar functions, and
+/// `count()` as `count(*)`.
+#[test]
+fn argument_count_review_fixes() {
+    let tw = twins(
+        "argc2",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1), (NULL)",
+    );
+    for sql in [
+        "SELECT coalesce(1)",
+        "SELECT coalesce()",
+        "SELECT coalesce(*)",
+        "SELECT coalesce(DISTINCT 1)",
+        "SELECT ifnull(1)",
+        "SELECT ifnull(NULL, NULL, 5)",
+        "SELECT ifnull(*)",
+        "SELECT abs(*)",
+        "SELECT abs(DISTINCT)",
+        "SELECT concat(*)",
+        "SELECT a FROM t WHERE ifnull(a)",
+    ] {
+        tw.refuse(sql, SchemaKind::WrongArgumentCount);
+    }
+    tw.refuse("SELECT nosuch(*)", SchemaKind::UnknownFunction);
+    tw.refuse("SELECT nosuch(DISTINCT 1)", SchemaKind::UnknownFunction);
+    tw.all(&[
+        "SELECT coalesce(NULL, 2), ifnull(NULL, 5), coalesce(NULL, NULL, 5)",
+        "SELECT typeof(random(*)), printf(*), char(*), changes(*), sqlite_version(*)",
+        "SELECT typeof(last_insert_rowid(*)), total_changes(*), typeof(random(DISTINCT))",
+        "SELECT abs(DISTINCT -1), upper(DISTINCT 'a'), coalesce(DISTINCT NULL, 2)",
+        "SELECT ifnull(DISTINCT NULL, 2), iif(DISTINCT 1, 2), likelihood(DISTINCT 1, 0.5)",
+        "SELECT likely(DISTINCT 3), min(DISTINCT 3, 1), max(DISTINCT 3, 1), nullif(DISTINCT 1, 2)",
+        "SELECT printf(DISTINCT '%d-%d', 1, 1), char(DISTINCT 65, 65)",
+        "SELECT abs(DISTINCT a) FROM t",
+        "SELECT count(), count(*), count(a) FROM t",
+        "SELECT count()",
+    ]);
+}
+
+/// A subquery's evaluation error surfaces only if evaluation
+/// reads it (the pin runs a subquery when it is reached): inside
+/// coalesce / ifnull / iif / CASE, and on the undecided side of
+/// an AND / OR (which the pin short-circuits when an operand has
+/// a subquery; without one both sides run).
+#[test]
+fn subqueries_are_read_lazily() {
+    let tw = twins(
+        "lazysub",
+        "CREATE TABLE z(a, b); INSERT INTO z VALUES (0, -9223372036854775808), (1, -9223372036854775808), (NULL, 2)",
+    );
+    let boom = "(SELECT abs(-9223372036854775808))";
+    tw.all(&[
+        &format!("SELECT coalesce(1, {boom}), ifnull(2, {boom}), iif(1, 3, {boom}), iif(0, {boom}, 4)"),
+        &format!("SELECT CASE WHEN 1 THEN 1 ELSE {boom} END, CASE 2 WHEN 2 THEN 'x' ELSE {boom} END"),
+        &format!("SELECT 0 AND {boom}, 1 OR {boom}, 1 IN (1, {boom})"),
+        &format!("SELECT 1 WHERE 0 AND {boom}"),
+        "SELECT coalesce(1, EXISTS (SELECT abs(-9223372036854775808))), coalesce(1, 5 IN (SELECT abs(-9223372036854775808)))",
+        "SELECT coalesce(a, (SELECT abs(b))) FROM z WHERE a IS NOT NULL",
+        "SELECT a AND (SELECT abs(b)) FROM z WHERE a = 0",
+        "SELECT a OR (SELECT abs(b)) FROM z WHERE a = 1",
+        &format!("SELECT coalesce(a, {boom}) FROM z WHERE a IS NOT NULL"),
+        &format!("SELECT count(*) FROM z WHERE a = 0 OR (a = 1 AND {boom} IS NULL)"),
+    ]);
+    for sql in [
+        "SELECT abs(-9223372036854775808)".to_string(),
+        format!("SELECT {boom}"),
+        format!("SELECT NULL AND {boom}"),
+        format!("SELECT coalesce(NULL, {boom})"),
+        "SELECT 5 IN (SELECT abs(-9223372036854775808))".to_string(),
+        format!("SELECT EXISTS (SELECT 1) AND {boom}"),
+        "SELECT coalesce(NULL, (SELECT abs(b))) FROM z WHERE a = 0".to_string(),
+        "SELECT a = 1 OR (SELECT abs(b)) FROM z WHERE a = 0".to_string(),
+        "SELECT a AND abs(b) FROM z WHERE a = 0".to_string(),
+    ] {
+        tw.refuse(&sql, SchemaKind::IntegerOverflow);
+    }
+}
+
+/// length() / substr() / trim() / LIKE over large texts: walked
+/// in place, not as a per-character list (which took 16 bytes per
+/// character and was OOM-killed on the pin's largest legal
+/// value); answers checked against the pin.
+#[test]
+fn text_functions_on_large_values() {
+    let tw = twins("bigtext", "");
+    tw.all(&[
+        "SELECT length(printf('%*.*s', 20000000, 5, 'x')), length(hex(zeroblob(5000000)))",
+        "SELECT length(substr(hex(zeroblob(3000000)), 5, 4000000)), substr(printf('%.*c', 2000000, 'é'), 1999999)",
+        "SELECT length(substr(printf('%.*c', 2000000, 'é'), -3)), hex(substr(zeroblob(3000000), 2999999))",
+        "SELECT length(trim(printf('%2000000s', 'y'))), hex(zeroblob(2000000)) LIKE '%01', printf('%.*c', 1000000, 'é') GLOB '*é'",
+        "SELECT printf('%.*c', 1000000, 'é') LIKE '%é_é', instr(printf('%1000000s', 'q'), 'q')",
+    ]);
+}
+
+/// A DEFAULT reading connection state is evaluated for each row
+/// inserted: `last_insert_rowid()` sees the previous row's rowid
+/// (VALUES, INSERT ... SELECT, OR REPLACE, upsert), `random()`
+/// draws per row. hipp evaluated it once at prepare.
+#[test]
+fn connection_state_defaults_per_row() {
+    script_same(
+        "defrow",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b DEFAULT (last_insert_rowid()), c DEFAULT (random()));
+         INSERT INTO t(a) VALUES(11),(12),(13);
+         SELECT a, b, typeof(c) FROM t;
+         SELECT count(DISTINCT c) FROM t;
+         INSERT OR REPLACE INTO t(a) VALUES(12),(20);
+         SELECT a, b FROM t;
+         CREATE TABLE s(x);
+         INSERT INTO s VALUES(100),(101);
+         INSERT INTO t(a) SELECT x FROM s;
+         SELECT a, b FROM t;
+         INSERT INTO t(a) VALUES(30) RETURNING b;
+         INSERT INTO t(a, b) VALUES(40, last_insert_rowid()),(41, last_insert_rowid());
+         INSERT INTO t(a) VALUES(50),(51) ON CONFLICT(a) DO NOTHING;
+         SELECT a, b FROM t WHERE a >= 40;
+         SELECT count(DISTINCT c) = count(*) FROM t;
+         CREATE TABLE u(k INTEGER PRIMARY KEY, d DEFAULT (changes()), e DEFAULT (total_changes() + 1));
+         INSERT INTO u(k) VALUES(1),(2);
+         SELECT * FROM u;
+         CREATE TABLE w(a INTEGER PRIMARY KEY, n NOT NULL DEFAULT (last_insert_rowid()));
+         INSERT OR REPLACE INTO w VALUES(5, NULL),(6, NULL);
+         SELECT * FROM w",
+    );
+}
+
+/// OR FAIL: a constraint violation (UNIQUE / PRIMARY KEY, NOT
+/// NULL, CHECK) keeps the rows the statement changed before it —
+/// in autocommit and in an explicit transaction, for INSERT
+/// (VALUES, SELECT, upsert) and UPDATE — and `changes()` counts
+/// them; other errors (overflow, datatype, STRICT) still undo the
+/// statement. hipp used to treat FAIL as ABORT.
+#[test]
+fn or_fail_keeps_earlier_rows() {
+    script_same(
+        "orfail",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c NOT NULL DEFAULT 5, d CHECK(d > 0));
+         INSERT INTO t VALUES(1,'a',1,1);
+         INSERT OR FAIL INTO t VALUES(2,'b',1,1),(3,'a',1,1),(4,'d',1,1);
+         INSERT OR FAIL INTO t VALUES(5,'e',1,1),(6,'f',NULL,1),(7,'g',1,1);
+         INSERT OR FAIL INTO t VALUES(8,'h',1,1),(9,'i',1,-1),(10,'j',1,1);
+         INSERT OR FAIL INTO t VALUES(11,'k',1,1),(1,'z',1,1);
+         UPDATE OR FAIL t SET b = 'q' WHERE a >= 2;
+         SELECT * FROM t;
+         BEGIN;
+         INSERT OR FAIL INTO t VALUES(20,'t',1,1),(21,'a',1,1);
+         SELECT * FROM t WHERE a >= 20;
+         COMMIT;
+         SELECT * FROM t WHERE a >= 20;
+         UPDATE OR FAIL t SET c = NULL WHERE a >= 11;
+         INSERT OR FAIL INTO t SELECT a + 100, b, c, d FROM t ORDER BY a;
+         INSERT OR FAIL INTO t VALUES(30,'x',1,1),(31, abs(-9223372036854775808),1,1);
+         INSERT OR FAIL INTO t VALUES(32,'x2',1,1),('abc','y',1,1);
+         INSERT OR ROLLBACK INTO t VALUES(33,'x3',1,1),(34,'a',1,1);
+         INSERT OR ABORT INTO t VALUES(35,'x4',1,1),(36,'a',1,1);
+         INSERT OR FAIL INTO t VALUES(37,'x5',1,1),(38,'x5',1,1) RETURNING a;
+         SELECT count(*) FROM t;
+         CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE);
+         INSERT INTO u VALUES(1,'a'),(2,'b'),(3,'c');
+         UPDATE OR FAIL u SET b = 'z' WHERE a >= 1;
+         UPDATE OR FAIL u SET b = b || 'q';
+         INSERT OR FAIL INTO u VALUES(9,'n'),(10,'a'),(1,'w') ON CONFLICT(a) DO UPDATE SET b = 'zq';
+         INSERT OR FAIL INTO u VALUES(4,'d'),(5,'c') ON CONFLICT(b) DO NOTHING;
+         INSERT OR FAIL INTO u VALUES(6,'e'),(7,'zq') ON CONFLICT(a) DO NOTHING;
+         SELECT * FROM u;
+         CREATE TABLE s(a INT) STRICT;
+         INSERT OR FAIL INTO s VALUES(1),('x');
+         SELECT count(*) FROM s;
+         CREATE TABLE g(a, b AS (a * 2) CHECK(b < 10));
+         INSERT OR FAIL INTO g(a) VALUES(1),(7),(2);
+         SELECT * FROM g",
+    );
+}

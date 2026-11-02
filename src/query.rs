@@ -319,6 +319,7 @@ pub fn any_scalar(e: &RExpr, f: &dyn Fn(ScalarFn) -> bool) -> bool {
         | RExpr::Column(..)
         | RExpr::Rowid(_)
         | RExpr::OutRef(_)
+        | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_) => false,
         RExpr::InSub(x, ..) => any(x),
@@ -449,6 +450,16 @@ pub enum RExpr {
     },
     /// ORDER BY reference to an output column (0-based).
     OutRef(usize),
+    /// A subquery whose execution failed with an evaluation error
+    /// (v0.16 review fix): `substitute` puts it where the
+    /// subquery's value would go, and evaluating it raises
+    /// `Error::Schema { kind }`. The pin only runs a subquery when
+    /// evaluation reaches it, so `coalesce(1, (SELECT
+    /// abs(-9223372036854775808)))` is 1 there; the executor
+    /// computes subqueries before evaluating, and this keeps
+    /// their errors for the moment (if any) they are read.
+    /// Produced only by `substitute`; never by the resolver.
+    Raise(SchemaKind),
 }
 
 /// One FROM source for resolution: qualifier (alias if given, else
@@ -790,7 +801,7 @@ pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
         RExpr::Rowid(src) => r.src(*src),
         RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_range(p, r),
         RExpr::InSub(x, p, _) => f(x) || plan_refs_range(p, r),
-        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => false,
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -860,6 +871,10 @@ pub fn plan_is_uncorrelated(p: &SubPlan, outer_width: usize, outer_srcs: usize) 
 pub enum SubValue {
     One(OwnedValue, Option<Affinity>),
     Many(AVec<OwnedValue>, Option<Affinity>),
+    /// The subquery failed with this evaluation error (v0.16
+    /// review fix): raised only if evaluation reads it
+    /// (`RExpr::Raise`).
+    Fail(SchemaKind),
 }
 
 /// The affinity a subquery's single result item carries into
@@ -1132,7 +1147,7 @@ fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
             shift_expr(x, at, by);
             shift_plan(p, at, by);
         }
-        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => {}
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
             shift_expr(a, at, by);
             shift_expr(b, at, by);
@@ -1929,7 +1944,11 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
 /// The argument counts a scalar function takes, as on the pin.
 fn arity(f: ScalarFn) -> (usize, usize) {
     match f {
-        ScalarFn::Coalesce => (1, usize::MAX),
+        // The pin's coalesce() takes two or more arguments (the
+        // name-dependent `ifnull` form is exactly two; see
+        // `resolve_func`). v0.16 review fix, ungated: one argument
+        // used to run.
+        ScalarFn::Coalesce => (2, usize::MAX),
         ScalarFn::Nullif | ScalarFn::Instr => (2, 2),
         ScalarFn::Substr => (2, 3),
         ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
@@ -2153,13 +2172,26 @@ fn resolve_func<E>(
     };
     #[cfg(not(feature = "v16"))]
     let want = arity(f);
+    // `ifnull` is coalesce with exactly two arguments on the pin
+    // (v0.16 review fix: `ifnull(1)` / `ifnull(NULL, NULL, 5)`
+    // used to run).
+    let want = if f == ScalarFn::Coalesce && eq_ci(name, b"ifnull") {
+        (2, 2)
+    } else {
+        want
+    };
+    // `f(*)` is `f()` for a scalar function and DISTINCT is
+    // ignored, as on the pin (v0.16, `v16`): `random(*)`,
+    // `printf(*)` (NULL), `abs(DISTINCT -1)` (1). The argument
+    // count is checked as for the plain call (`abs(*)` errors).
+    #[cfg(not(feature = "v16"))]
+    if star || distinct {
+        return Err(Error::Unsupported);
+    }
     if args.len() < want.0 || args.len() > want.1 {
         return Err(Error::Schema {
             kind: SchemaKind::WrongArgumentCount,
         });
-    }
-    if star || distinct {
-        return Err(Error::Unsupported);
     }
     // likelihood(X, P): P must be a REAL literal in 0.0 ..= 1.0
     // (the pin's `TK_FLOAT` test; `-0.0` and integers fail).
@@ -2296,7 +2328,8 @@ fn visit_all_aggs<'x>(e: &'x RExpr, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => {}
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
             visit_aggs(a, d, f);
             visit_aggs(b, d, f);
@@ -2479,7 +2512,8 @@ fn direct_agg(e: &RExpr, p: &dyn Fn(&RExpr) -> bool) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => false,
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -2584,7 +2618,8 @@ fn walk_aggs_mut<E>(
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => Ok(()),
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => Ok(()),
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
             walk_aggs_mut(a, d, fold)?;
             walk_aggs_mut(b, d, fold)
@@ -2684,7 +2719,8 @@ pub fn has_sub(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => false,
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) => has_sub(a) || has_sub(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -2726,7 +2762,8 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => {}
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) => {
             collect_subs(a, out);
             collect_subs(b, out);
@@ -2813,6 +2850,9 @@ fn in_sub_lhs(x: &RExpr, plan: &SubPlan, sx: RExpr) -> RExpr {
 /// values regrouped into rows of its size, each element
 /// carrying its result column's affinity.
 fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool) -> RExpr {
+    if let SubValue::Fail(k) = value {
+        return RExpr::Raise(*k);
+    }
     let wrap = |v: &OwnedValue, aff: Option<Affinity>| match aff {
         Some(a) => RExpr::AffLiteral(v.clone(), a),
         None => RExpr::Literal(v.clone()),
@@ -2839,7 +2879,7 @@ fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool
         }
         let vals: &[OwnedValue] = match value {
             SubValue::Many(vs, _) => vs.as_slice(),
-            SubValue::One(..) => &[],
+            SubValue::One(..) | SubValue::Fail(_) => &[],
         };
         let mut rows = AVec::new();
         for chunk in vals.chunks(n) {
@@ -2865,6 +2905,7 @@ fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool
             }
         }
         SubValue::One(v, aff) => list.push(wrap(v, *aff)),
+        SubValue::Fail(_) => {}
     }
     RExpr::InList(Box::new(sx), list, neg, true)
 }
@@ -2880,6 +2921,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                     None => RExpr::Literal(v.clone()),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
+                SubValue::Fail(k) => RExpr::Raise(*k),
             };
             *pos += 1;
             v
@@ -2894,7 +2936,8 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => e.clone(),
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => e.clone(),
         RExpr::Binary(op, a, b) => RExpr::Binary(
             *op,
             Box::new(substitute(a, values, pos)),
@@ -2995,7 +3038,8 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => false,
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) => sub_in_agg_args(a) || sub_in_agg_args(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -3103,7 +3147,8 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => {}
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) => {
             collect_subs_outside_agg(a, out);
             collect_subs_outside_agg(b, out);
@@ -3185,6 +3230,7 @@ pub fn substitute_group(
                     None => RExpr::Literal(v.clone()),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
+                SubValue::Fail(k) => RExpr::Raise(*k),
             };
             *pos += 1;
             v
@@ -3199,7 +3245,8 @@ pub fn substitute_group(
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => e.clone(),
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => e.clone(),
         RExpr::Binary(op, a, b) => RExpr::Binary(
             *op,
             Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
@@ -3827,6 +3874,7 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
         | RExpr::Column(..)
         | RExpr::Rowid(_)
         | RExpr::OutRef(_)
+        | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_) => false,
         RExpr::InSub(x, ..)
@@ -3971,6 +4019,7 @@ pub fn is_constant(e: &RExpr) -> bool {
         RExpr::Column(..)
         | RExpr::Rowid(_)
         | RExpr::OutRef(_)
+        | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_)
         | RExpr::InSub(..)
@@ -3994,6 +4043,44 @@ pub fn is_constant(e: &RExpr) -> bool {
                 && otherwise.as_deref().is_none_or(is_constant)
         }
         RExpr::Scalar(_, args) => args.iter().all(is_constant),
+    }
+}
+
+/// Whether `e` holds a failed subquery's deferred error
+/// (`RExpr::Raise`, v0.16 review fix). The pin codes an AND /
+/// OR whose operand has a subquery as a short-circuit jump, so
+/// `0 AND (SELECT abs(-9223372036854775808))` is 0 there; without
+/// a subquery both operands run (`0 AND abs(b)` raises).
+fn has_raise(e: &RExpr) -> bool {
+    match e {
+        RExpr::Raise(_) => true,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_)
+        | RExpr::InSub(..) => false,
+        RExpr::Agg { args, .. } | RExpr::Scalar(_, args) => args.iter().any(has_raise),
+        RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _)
+        | RExpr::Cast(x, _)
+        | RExpr::Collate(x, _) => has_raise(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => has_raise(a) || has_raise(b),
+        RExpr::InList(x, l, ..) => has_raise(x) || l.iter().any(has_raise),
+        RExpr::Between(x, a, b, _) => has_raise(x) || has_raise(a) || has_raise(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(has_raise)
+                || whens.iter().any(|(w, t)| has_raise(w) || has_raise(t))
+                || otherwise.as_deref().is_some_and(has_raise)
+        }
     }
 }
 
@@ -4121,37 +4208,50 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
 /// forms, surrogates and U+FFFE / U+FFFF read as U+FFFD;
 /// stray continuation and ASCII bytes read as themselves.
 fn pattern_chars(b: &[u8]) -> AVec<u32> {
-    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-    let b = b.get(..end).unwrap_or(&[]);
     let mut out = AVec::new();
     let mut i = 0;
-    while let Some(&c0) = b.get(i) {
-        i += 1;
-        let mut c = u32::from(c0);
-        if c >= 0xc0 {
-            // `sqlite3Utf8Trans1`: the lead byte's payload bits.
-            c = match c0 {
-                0xc0..=0xdf => c - 0xc0,
-                0xe0..=0xef => c - 0xe0,
-                0xf0..=0xf7 => c - 0xf0,
-                0xf8..=0xfb => c - 0xf8,
-                0xfc..=0xfd => c - 0xfc,
-                _ => 0,
-            };
-            while let Some(&n) = b.get(i) {
-                if n & 0xc0 != 0x80 {
-                    break;
-                }
-                c = c.wrapping_shl(6) | u32::from(n & 0x3f);
-                i += 1;
-            }
-            if c < 0x80 || (c & 0xFFFF_F800) == 0xD800 || (c & 0xFFFF_FFFE) == 0xFFFE {
-                c = 0xFFFD;
-            }
-        }
+    while let Some((c, n)) = pattern_char_at(b, i) {
         out.push(c);
+        i = n;
     }
     out
+}
+
+/// One character of `pattern_chars` at byte `i`: the code point
+/// and the next character's byte offset; None at the end (or
+/// the first NUL). The LIKE / GLOB subject is walked with this
+/// directly rather than decoded into a list (v0.16 review fix:
+/// four bytes per character of a subject up to the 1e9-byte
+/// limit).
+fn pattern_char_at(b: &[u8], i: usize) -> Option<(u32, usize)> {
+    let c0 = *b.get(i)?;
+    if c0 == 0 {
+        return None;
+    }
+    let mut i = i + 1;
+    let mut c = u32::from(c0);
+    if c >= 0xc0 {
+        // `sqlite3Utf8Trans1`: the lead byte's payload bits.
+        c = match c0 {
+            0xc0..=0xdf => c - 0xc0,
+            0xe0..=0xef => c - 0xe0,
+            0xf0..=0xf7 => c - 0xf0,
+            0xf8..=0xfb => c - 0xf8,
+            0xfc..=0xfd => c - 0xfc,
+            _ => 0,
+        };
+        while let Some(&n) = b.get(i) {
+            if n & 0xc0 != 0x80 {
+                break;
+            }
+            c = c.wrapping_shl(6) | u32::from(n & 0x3f);
+            i += 1;
+        }
+        if c < 0x80 || (c & 0xFFFF_F800) == 0xD800 || (c & 0xFFFF_FFFE) == 0xFFFE {
+            c = 0xFFFD;
+        }
+    }
+    Some((c, i))
 }
 
 /// The pin's `compareInfo` (v0.16): the wildcard characters
@@ -4241,31 +4341,34 @@ fn element_match(pat: &[u32], p: usize, ch: Option<u32>, info: PatInfo) -> Optio
 /// all-wildcard matches exactly one character, so the classic
 /// single-backtrack-point scan decides exactly what the pin's
 /// recursive search decides, iteratively and in O(n*m).
-fn pattern_match(pat: &[u32], s: &[u32], info: PatInfo) -> bool {
+fn pattern_match(pat: &[u32], s: &[u8], info: PatInfo) -> bool {
+    // `i` is a byte offset into the subject, which is decoded one
+    // character at a time (`pattern_char_at`).
     let (mut p, mut i) = (0usize, 0usize);
     let mut back: Option<(usize, usize)> = None;
     loop {
+        let cur = pattern_char_at(s, i);
         if let Some(&c) = pat.get(p) {
             if info.all != 0 && c == info.all {
                 p += 1;
                 back = Some((p, i));
                 continue;
             }
-            if let Some(n) = element_match(pat, p, s.get(i).copied(), info) {
+            if let Some(n) = element_match(pat, p, cur.map(|(c, _)| c), info) {
                 p += n;
-                i += 1;
+                i = cur.map_or(i, |(_, next)| next);
                 continue;
             }
-        } else if i >= s.len() {
+        } else if cur.is_none() {
             return true;
         }
-        match back {
-            Some((bp, bi)) if bi < s.len() => {
-                back = Some((bp, bi + 1));
+        match back.and_then(|(bp, bi)| pattern_char_at(s, bi).map(|(_, next)| (bp, next))) {
+            Some((bp, bn)) => {
+                back = Some((bp, bn));
                 p = bp;
-                i = bi + 1;
+                i = bn;
             }
-            _ => return false,
+            None => return false,
         }
     }
 }
@@ -4327,7 +4430,7 @@ pub fn like_glob<E>(
     let (Some(p), Some(x)) = (to_text(pat), to_text(subject)) else {
         return Ok(OwnedValue::Null);
     };
-    let (p, x) = (pattern_chars(p.as_slice()), pattern_chars(x.as_slice()));
+    let p = pattern_chars(p.as_slice());
     Ok(bool_val(pattern_match(p.as_slice(), x.as_slice(), info)))
 }
 
@@ -4337,23 +4440,39 @@ pub fn like_glob<E>(
 /// any other byte one character on its own — invalid UTF-8
 /// included (v0.15 read invalid UTF-8 as no characters, or as
 /// bytes, and counted past a NUL).
-fn char_ranges(t: &[u8]) -> AVec<(usize, usize)> {
-    let mut out = AVec::new();
-    let mut i = 0usize;
-    while let Some(&c) = t.get(i) {
+///
+/// An iterator, not a list: `length()` / `substr()` of a large
+/// text walk it once without allocating (v0.16 review fix — a
+/// collected list took 16 bytes per character, so
+/// `length(printf('%*.*s', 999999999, 5, 'x'))` was killed for
+/// memory where the pin answers).
+fn char_ranges(t: &[u8]) -> CharRanges<'_> {
+    CharRanges { t, i: 0 }
+}
+
+/// The byte ranges `char_ranges` yields.
+struct CharRanges<'a> {
+    t: &'a [u8],
+    i: usize,
+}
+
+impl Iterator for CharRanges<'_> {
+    type Item = (usize, usize);
+    fn next(&mut self) -> Option<(usize, usize)> {
+        let i = self.i;
+        let c = *self.t.get(i)?;
         if c == 0 {
-            break;
+            return None;
         }
         let mut j = i + 1;
         if c >= 0xc0 {
-            while t.get(j).is_some_and(|b| (*b & 0xc0) == 0x80) {
+            while self.t.get(j).is_some_and(|b| (*b & 0xc0) == 0x80) {
                 j += 1;
             }
         }
-        out.push((i, j));
-        i = j;
+        self.i = j;
+        Some((i, j))
     }
-    out
 }
 
 /// `length(X)` (v0.16 fix): a BLOB's bytes; a TEXT's characters
@@ -4361,7 +4480,7 @@ fn char_ranges(t: &[u8]) -> AVec<(usize, usize)> {
 /// bytes.
 fn char_len(v: &OwnedValue) -> i64 {
     match v {
-        OwnedValue::Text(t) => char_ranges(t.as_slice()).len() as i64,
+        OwnedValue::Text(t) => char_ranges(t.as_slice()).count() as i64,
         OwnedValue::Blob(t) => t.len() as i64,
         OwnedValue::Integer(_) | OwnedValue::Real(_) => {
             to_text(v).map(|t| t.len()).unwrap_or(0) as i64
@@ -4431,11 +4550,10 @@ fn trim_value(f: ScalarFn, v: &[OwnedValue]) -> OwnedValue {
         }
     };
     let set = c_text(set.as_slice());
-    let chars = char_ranges(set);
     let mut z = text.as_slice();
     let hit = |z: &[u8], front: bool| -> Option<usize> {
-        chars.iter().find_map(|(a, b)| {
-            let ch = set.get(*a..*b)?;
+        char_ranges(set).find_map(|(a, b)| {
+            let ch = set.get(a..b)?;
             let ok = if front {
                 z.starts_with(ch)
             } else {
@@ -4444,7 +4562,7 @@ fn trim_value(f: ScalarFn, v: &[OwnedValue]) -> OwnedValue {
             ok.then_some(ch.len())
         })
     };
-    if !chars.is_empty() {
+    if !set.is_empty() {
         if f != ScalarFn::Rtrim {
             while let Some(k) = hit(z, true).filter(|_| !z.is_empty()) {
                 z = z.get(k..).unwrap_or(&[]);
@@ -4697,17 +4815,15 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             // prefix ('1e1' is 1), a real truncated.
             let mut start = v1.map_or(0, int_value);
             // A BLOB's units are bytes; a text's are its
-            // characters up to the first NUL (v0.16 fix).
-            let ranges = if blob {
-                let mut r = AVec::new();
-                for i in 0..text.len() {
-                    r.push((i, i + 1));
-                }
-                r
+            // characters up to the first NUL (v0.16 fix). Counted
+            // and walked without a per-unit list (v0.16 review
+            // fix: memory stays the size of the text).
+            let tb = text.as_slice();
+            let n = if blob {
+                tb.len() as i64
             } else {
-                char_ranges(text.as_slice())
+                char_ranges(tb).count() as i64
             };
-            let n = ranges.len() as i64;
             // Two-argument form: the implicit length is i64::MAX
             // (pinned on 3.54.1 by a CI probe grid — e.g.
             // substr(x, -9223372036854775808) keeps all but the last
@@ -4740,15 +4856,29 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 }
             }
             let end = start.saturating_add(len).min(n);
-            let mut out = AVec::new();
-            for (i, (bs, be)) in ranges.iter().enumerate() {
-                let idx = i as i64;
-                if idx >= start
-                    && idx < end
-                    && let Some(piece) = text.as_slice().get(*bs..*be)
-                {
-                    out.extend_from_slice(piece);
+            // The byte span of units start..end (0 <= start).
+            let span = if start >= end {
+                None
+            } else if blob {
+                Some((start as usize, end as usize))
+            } else {
+                let mut first = None;
+                let mut last = 0usize;
+                for (idx, (bs, be)) in char_ranges(tb).enumerate() {
+                    let idx = idx as i64;
+                    if idx >= end {
+                        break;
+                    }
+                    if idx >= start {
+                        first.get_or_insert(bs);
+                        last = be;
+                    }
                 }
+                first.map(|f| (f, last))
+            };
+            let mut out = AVec::new();
+            if let Some(piece) = span.and_then(|(a, b)| tb.get(a..b)) {
+                out.extend_from_slice(piece);
             }
             if blob {
                 OwnedValue::Blob(out)
@@ -4949,6 +5079,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             _ => OwnedValue::Null,
         },
         RExpr::OutRef(_) => return Err(Error::Unsupported),
+        RExpr::Raise(kind) => return Err(Error::Schema { kind: *kind }),
         RExpr::Pos(x) => eval::<E>(x, ctx)?,
         RExpr::Neg(x) => match to_number(&eval::<E>(x, ctx)?) {
             None => OwnedValue::Null,
@@ -4969,6 +5100,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Binary(op, l, r) => match op {
             BinOp::And => {
                 let a = truthy(&eval::<E>(l, ctx)?);
+                if a == Some(false) && has_raise(r) {
+                    return Ok(bool_val(false));
+                }
                 let b = truthy(&eval::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(false), _) | (_, Some(false)) => bool_val(false),
@@ -4978,6 +5112,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
             BinOp::Or => {
                 let a = truthy(&eval::<E>(l, ctx)?);
+                if a == Some(true) && has_raise(r) {
+                    return Ok(bool_val(true));
+                }
                 let b = truthy(&eval::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(true), _) | (_, Some(true)) => bool_val(true),

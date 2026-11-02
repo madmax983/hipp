@@ -660,6 +660,15 @@ struct InsCol {
     default: OwnedValue,
     /// `NOT NULL` constraint on the column (v0.10).
     not_null: bool,
+    /// A DEFAULT that reads connection state (`random()`,
+    /// `last_insert_rowid()`, ...; v0.16 review fix, `v16`): its
+    /// resolved expression and clock row, evaluated again for
+    /// every row inserted — on the pin each row's DEFAULT sees the
+    /// rowid the row before it inserted, and draws its own random
+    /// value. `default` keeps the prepare-time value (which is
+    /// where such a default's errors surface).
+    #[cfg(feature = "v16")]
+    per_row: Option<(RExpr, RowData)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1168,11 +1177,20 @@ impl<S: Storage> Connection<S> {
                     // in a NOT NULL column — so its clock read or
                     // unknown function errors exactly when the
                     // pin's would.
+                    #[cfg(feature = "v16")]
+                    let mut per_row = None;
                     #[cfg(feature = "v04")]
                     let default = if c.default_expr.is_some()
                         && (!targets.iter().any(|tg| *tg == Target::Col(i))
                             || (c.not_null && *conflict == ConflictAction::Replace))
                     {
+                        #[cfg(feature = "v16")]
+                        {
+                            let (v, pr) = self.column_default_per_row(arena, c, &mut clock)?;
+                            per_row = pr;
+                            v
+                        }
+                        #[cfg(not(feature = "v16"))]
                         self.column_default(arena, c, &mut clock)?
                     } else {
                         literal_owned(&self.catalog_arena, c.default)
@@ -1186,6 +1204,8 @@ impl<S: Storage> Connection<S> {
                         affinity: c.affinity,
                         default,
                         not_null: c.not_null,
+                        #[cfg(feature = "v16")]
+                        per_row,
                     });
                 }
                 #[cfg(feature = "indexes")]
@@ -1316,17 +1336,36 @@ impl<S: Storage> Connection<S> {
                     } else {
                         let empty = RowData::empty();
                         let mut folded = AVec::new();
-                        for rr in resolved.iter() {
+                        let mut fold_err = None;
+                        'rows: for rr in resolved.iter() {
                             let mut rv = AVec::new();
                             for re in rr.iter() {
-                                rv.push(crate::query::eval::<S::Error>(
+                                match crate::query::eval::<S::Error>(
                                     re,
                                     &Ctx::of(&empty).with(&self.env),
-                                )?);
+                                ) {
+                                    Ok(v) => rv.push(v),
+                                    Err(e) => {
+                                        fold_err = Some(e);
+                                        break 'rows;
+                                    }
+                                }
                             }
                             folded.push(rv);
                         }
-                        (folded, None)
+                        match fold_err {
+                            None => (folded, None),
+                            // v0.16 review fix: a row that fails to
+                            // evaluate is evaluated again at step
+                            // time, one row at a time (`exec_insert`'s
+                            // per-row path): the rows before it are
+                            // inserted first, as on the pin, so a
+                            // failed statement leaves
+                            // last_insert_rowid() at the last of them.
+                            #[cfg(feature = "v16")]
+                            Some(Error::Schema { .. }) => (AVec::new(), Some(resolved)),
+                            Some(e) => return Err(e),
+                        }
                     }
                 };
                 #[cfg(not(feature = "v08"))]
@@ -1849,6 +1888,31 @@ impl<S: Storage> Connection<S> {
             ),
             None => Ok(literal_owned(&self.catalog_arena, c.default)),
         }
+    }
+
+    /// `column_default` for an INSERT (v0.16 review fix, `v16`):
+    /// also the prepared expression when the default reads
+    /// connection state, for `InsCol::per_row`.
+    #[cfg(feature = "v16")]
+    #[allow(clippy::type_complexity)]
+    fn column_default_per_row(
+        &self,
+        arena: &Arena,
+        c: &crate::schema::Column,
+        clock: &mut crate::rules::Clock,
+    ) -> Result<(OwnedValue, Option<(RExpr, RowData)>), S::Error> {
+        let Some(h) = c.default_expr else {
+            return Ok((literal_owned(&self.catalog_arena, c.default), None));
+        };
+        let (r, row) = crate::rules::prepare_default::<S::Error>(
+            handle_bytes(&self.catalog_arena, h),
+            arena,
+            clock,
+        )?;
+        let v = crate::rules::eval_prepared_default::<S::Error>(&r, &row, Some(&self.env))?;
+        let per_row = crate::query::any_scalar(&r, &crate::query::ScalarFn::nondeterministic)
+            .then_some((r, row));
+        Ok((v, per_row))
     }
 
     /// One FROM source description for resolving an UPDATE/DELETE
@@ -3949,6 +4013,12 @@ pub(crate) fn resolve_not_null<E>(
                     kind: SchemaKind::NotNullViolation,
                 });
             }
+            #[cfg(feature = "v05")]
+            ConflictAction::Fail => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::NotNullViolation,
+                });
+            }
             ConflictAction::Ignore => return Ok(false),
             ConflictAction::Replace => {
                 if matches!(defaults[i], OwnedValue::Null) {
@@ -5064,13 +5134,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     self.ret_loaded = true;
                     self.ret_pos = 0;
                 }
-                Err(e) => {
-                    #[cfg(feature = "v16")]
-                    self.conn.env.finish(false);
-                    let _ = self.conn.pager.rollback().await;
-                    self.conn.explicit_txn = false;
-                    return Err(e);
-                }
+                Err(e) => return Err(self.write_failed(e).await),
             }
         }
         #[cfg(feature = "v07")]
@@ -5083,15 +5147,91 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.phase = Phase::Done;
                 Ok(Step::Done)
             }
+            // Same abort rule as CREATE (see step_create), but for
+            // OR FAIL (`write_failed`).
+            #[cfg(feature = "v05")]
+            Err(e) => Err(self.write_failed(e).await),
+            // No OR FAIL without v0.5 / v0.7: the abort rule alone
+            // (inline, as the tiny profile has always built it).
+            #[cfg(not(feature = "v05"))]
             Err(e) => {
-                #[cfg(feature = "v16")]
-                self.conn.env.finish(false);
-                // Same abort rule as CREATE (see step_create).
                 let _ = self.conn.pager.rollback().await;
                 self.conn.explicit_txn = false;
                 Err(e)
             }
         }
+    }
+
+    /// The end of an INSERT / UPDATE that failed with `e`: the
+    /// transaction is rolled back (the abort rule of
+    /// `step_create`) — except that under OR FAIL a constraint
+    /// violation keeps the rows the statement already changed, as
+    /// on the pin (v0.16 review fix, ungated: hipp treated FAIL as
+    /// ABORT, so `INSERT OR FAIL INTO t VALUES (2,'b'), (3,'a')`
+    /// over a UNIQUE 'a' lost row 2). Conflicts are found before a
+    /// row is written, so no partial row is kept. In autocommit the
+    /// kept rows are committed; an explicit transaction stays open.
+    /// `changes()` counts the kept rows.
+    /// (OR FAIL parses only with UPDATE (v0.5) / INSERT OR (v0.7).)
+    #[cfg(feature = "v05")]
+    async fn write_failed(&mut self, e: Error<S::Error>) -> Error<S::Error> {
+        let conflict = match &self.plan {
+            Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
+            _ => ConflictAction::Abort,
+        };
+        match self.fail_in_place(conflict, &e).await {
+            Ok(true) => return e,
+            Ok(false) => {}
+            Err(ce) => return ce,
+        }
+        #[cfg(feature = "v16")]
+        self.conn.env.finish(false);
+        let _ = self.conn.pager.rollback().await;
+        self.conn.explicit_txn = false;
+        e
+    }
+
+    /// The OR FAIL half of `write_failed` (v0.5+): whether the
+    /// statement's changes were kept (committed in autocommit), or
+    /// the commit's own error (the transaction then rolled back).
+    #[cfg(feature = "v05")]
+    async fn fail_in_place(
+        &mut self,
+        conflict: ConflictAction,
+        e: &Error<S::Error>,
+    ) -> core::result::Result<bool, Error<S::Error>> {
+        let keep = conflict == ConflictAction::Fail
+            && matches!(
+                e,
+                Error::Schema {
+                    kind: SchemaKind::UniqueViolation
+                        | SchemaKind::DuplicateRowid
+                        | SchemaKind::NotNullViolation
+                        | SchemaKind::CheckViolation
+                }
+            );
+        if keep {
+            let committed = if self.conn.explicit_txn {
+                Ok(())
+            } else {
+                self.conn.pager.drive_commit().await
+            };
+            return match committed {
+                Ok(()) => {
+                    #[cfg(feature = "v16")]
+                    self.conn.env.finish(true);
+                    Ok(true)
+                }
+                Err(ce) => {
+                    #[cfg(feature = "v16")]
+                    self.conn.env.finish(false);
+                    let _ = self.conn.pager.rollback().await;
+                    self.conn.explicit_txn = false;
+                    Err(ce)
+                }
+            };
+        }
+        Ok(false)
     }
 
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
@@ -5106,7 +5246,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                 rows_r: Some(rows_r),
                 select: None,
                 ..
-            } if rows_r.iter().any(|r| r.iter().any(reads_last_rowid)) => Some(rows_r.clone()),
+            } if rows_r.iter().any(|r| r.iter().any(reads_last_rowid))
+                || !rows_r.iter().any(|r| r.iter().any(crate::query::has_sub)) =>
+            {
+                Some(rows_r.clone())
+            }
             _ => None,
         };
         #[cfg(feature = "v16")]
@@ -5199,12 +5343,33 @@ impl<'c, S: Storage> Statement<'c, S> {
             _ => unreachable!(),
         };
         let ncols = cols.len();
+        // This row's defaults: a connection-state DEFAULT is
+        // evaluated now, for this row (v0.16 review fix, `v16`).
+        #[cfg(feature = "v16")]
+        let row_defaults: AVec<OwnedValue> = {
+            let mut out = AVec::new();
+            for c in cols.iter() {
+                out.push(match &c.per_row {
+                    Some((r, crow)) => crate::rules::eval_prepared_default::<S::Error>(
+                        r,
+                        crow,
+                        Some(&self.conn.env),
+                    )?,
+                    None => c.default.clone(),
+                });
+            }
+            out
+        };
         let mut row: AVec<OwnedValue> = AVec::new();
+        // An omitted column's default is a stored value like any
+        // other: the column's affinity applies (v0.10; the pin
+        // stores DEFAULT '7' in an INT column as the integer 7).
+        #[cfg(feature = "v16")]
+        for (c, d) in cols.iter().zip(row_defaults.iter()) {
+            row.push(apply_affinity(d.clone(), c.affinity));
+        }
+        #[cfg(not(feature = "v16"))]
         for c in cols.iter() {
-            // An omitted column's default is a stored value
-            // like any other: the column's affinity applies
-            // (v0.10; the pin stores DEFAULT '7' in an INT
-            // column as the integer 7).
             row.push(apply_affinity(c.default.clone(), c.affinity));
         }
         let mut explicit_rowid: Option<i64> = None;
@@ -5263,6 +5428,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut nn_flags = AVec::new();
             let mut nn_defaults = AVec::new();
             let mut nn_affs = AVec::new();
+            #[cfg(feature = "v16")]
+            for (c, d) in cols.iter().zip(row_defaults.iter()) {
+                nn_flags.push(c.not_null);
+                nn_defaults.push(d.clone());
+                nn_affs.push(c.affinity);
+            }
+            #[cfg(not(feature = "v16"))]
             for c in cols.iter() {
                 nn_flags.push(c.not_null);
                 nn_defaults.push(c.default.clone());
@@ -5665,7 +5837,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.push_insert_returning(row.as_slice(), rowid).await?;
                 Ok(())
             }
-            ConflictAction::Abort => Err(Error::Schema {
+            ConflictAction::Abort | ConflictAction::Fail => Err(Error::Schema {
                 kind: if conflicts.as_slice()[0].1 {
                     SchemaKind::DuplicateRowid
                 } else {
@@ -5856,13 +6028,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         self.ret_loaded = true;
                         self.ret_pos = 0;
                     }
-                    Err(e) => {
-                        #[cfg(feature = "v16")]
-                        self.conn.env.finish(false);
-                        let _ = self.conn.pager.rollback().await;
-                        self.conn.explicit_txn = false;
-                        return Err(e);
-                    }
+                    Err(e) => return Err(self.write_failed(e).await),
                 }
             }
             return Ok(self.serve_returning());
@@ -5873,14 +6039,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.phase = Phase::Done;
                 Ok(Step::Done)
             }
-            Err(e) => {
-                #[cfg(feature = "v16")]
-                self.conn.env.finish(false);
-                // Same abort rule as INSERT (see step_insert).
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
-                Err(e)
-            }
+            // Same abort rule as INSERT (see `write_failed`).
+            Err(e) => Err(self.write_failed(e).await),
         }
     }
 
@@ -6291,7 +6451,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !conflict_rows.is_empty() {
                     match conflict_action {
                         ConflictAction::Ignore => continue,
-                        ConflictAction::Abort => {
+                        ConflictAction::Abort | ConflictAction::Fail => {
                             return Err(Error::Schema {
                                 kind: first_err.unwrap_or(SchemaKind::UniqueViolation),
                             });
@@ -7355,11 +7515,29 @@ impl<'c, S: Storage> Statement<'c, S> {
                     return Ok(v.clone());
                 }
             }
-            let v = self.exec_sub_kind(kind, outer).await?;
+            let v = self.exec_sub_kind_deferred(kind, outer).await?;
             self.hoist.push((key, v.clone()));
             return Ok(v);
         }
-        self.exec_sub_kind(kind, outer).await
+        self.exec_sub_kind_deferred(kind, outer).await
+    }
+
+    /// `exec_sub_kind` with an evaluation error (`Error::Schema`)
+    /// kept as the node's value (`SubValue::Fail`, v0.16 review
+    /// fix): it is raised only if evaluation reaches the node, as
+    /// on the pin, which runs a subquery only when it is read
+    /// (`coalesce(1, (SELECT abs(-9223372036854775808)))` is 1).
+    /// I/O, corruption and resource errors still fail at once.
+    #[cfg(feature = "v06")]
+    async fn exec_sub_kind_deferred(
+        &mut self,
+        kind: &crate::query::SubKind<'_>,
+        outer: &RowData,
+    ) -> Result<crate::query::SubValue, S::Error> {
+        match self.exec_sub_kind(kind, outer).await {
+            Err(Error::Schema { kind }) => Ok(crate::query::SubValue::Fail(kind)),
+            r => r,
+        }
     }
 
     /// Execute one subquery node for one outer row and shape
