@@ -82,6 +82,10 @@ pub enum SchemaKind {
     /// — no GROUP BY and no aggregate in the result list (v0.16;
     /// the pin refuses it). Add a GROUP BY or use WHERE.
     HavingWithoutAggregate,
+    /// `abs()` of the INTEGER -9223372036854775808, which has no
+    /// INTEGER result (v0.16; the pin's "integer overflow" — hipp
+    /// used to answer a REAL). Cast the argument to REAL first.
+    IntegerOverflow,
     /// A row failed one of its table's CHECK constraints
     /// (v0.16): the constraint evaluated to false — NULL passes.
     /// Raised under every conflict action except OR IGNORE

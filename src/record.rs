@@ -486,46 +486,113 @@ pub fn affinity_of(decl: &[u8]) -> Affinity {
     }
 }
 
-/// Render a real the way SQLite renders it for TEXT conversion:
-/// shortest round-trip, with `.0` kept for integral values.
+/// Render a real the way SQLite renders it for TEXT conversion
+/// (`||`, CAST AS TEXT, TEXT affinity), as the pin does: 15
+/// significant digits when they read back (through the pin's own
+/// text-to-real conversion, `lexer::parse_real`) as the same
+/// value, else 17; trailing zeros dropped; laid out as `%!.17g` —
+/// fixed notation for decimal exponents -4 ..= 16 with `.0` kept
+/// on integral values, else `d.ddde±XX` (v0.16: 1e20 used to
+/// render as `100000000000000000000`, 1e-5 as `0.00001` and
+/// 5e-324 as forty zeros). `-0.0` is `0.0`, infinities `Inf` /
+/// `-Inf`. The 17th digit is correctly rounded here; the pin's
+/// digit generator can differ in it (an honest gap).
+#[inline(never)]
 pub fn render_real(r: f64, out: &mut AVec<u8>) {
-    // Rust's Display for f64 gives shortest-round-trip without an
-    // exponent for typical magnitudes and matches SQLite's rendering
-    // for the values v0.1 handles (1.5 -> "1.5", 1.0 -> "1.0").
-    let mut buf = [0u8; 40];
-    let s = format_real(r, &mut buf);
-    for b in s.bytes() {
-        out.push(b);
+    if r < 0.0 {
+        out.push(b'-');
     }
-}
-
-struct BufWriter<'a> {
-    buf: &'a mut [u8],
-    n: usize,
-}
-impl core::fmt::Write for BufWriter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for b in s.bytes() {
-            if self.n < self.buf.len() {
-                self.buf[self.n] = b;
-                self.n += 1;
+    let r = fabs(r);
+    if r == f64::INFINITY {
+        out.extend_from_slice(b"Inf");
+        return;
+    }
+    if r == 0.0 || r.is_nan() {
+        out.extend_from_slice(b"0.0");
+        return;
+    }
+    // 15 digits when they read back as `r`, else 17.
+    let mut digits = [b'0'; 17];
+    let mut nd = 0usize;
+    let mut exp = 0i32;
+    for n in [15u32, 17] {
+        let (mut d, e) = crate::sql::lexer::real_digits(r, n);
+        exp = e;
+        nd = n as usize;
+        for k in (0..nd).rev() {
+            if let Some(c) = digits.get_mut(k) {
+                *c = b'0' + (d % 10) as u8;
+            }
+            d /= 10;
+        }
+        // `ddd...de<exp - n + 1>` for the round-trip check.
+        let mut t = [0u8; 24];
+        let (head, tail) = t.split_at_mut(nd);
+        head.copy_from_slice(digits.get(..nd).unwrap_or(&[]));
+        let mut x = (e - n as i32 + 1).unsigned_abs();
+        let mut len = nd;
+        if let [ec, sc, ..] = tail {
+            *ec = b'e';
+            *sc = if e - (n as i32) + 1 < 0 { b'-' } else { b'+' };
+            len += 2;
+        }
+        let mut j = t.len();
+        loop {
+            j -= 1;
+            if let Some(c) = t.get_mut(j) {
+                *c = b'0' + (x % 10) as u8;
+            }
+            x /= 10;
+            if x == 0 {
+                break;
             }
         }
-        Ok(())
+        let mut txt = AVec::new();
+        txt.extend_from_slice(t.get(..len).unwrap_or(&[]));
+        txt.extend_from_slice(t.get(j..).unwrap_or(&[]));
+        if n == 17 || crate::sql::lexer::parse_real(txt.as_slice()) == Some(r) {
+            break;
+        }
     }
-}
-
-fn format_real(r: f64, buf: &mut [u8; 40]) -> &str {
-    use core::fmt::Write as _;
-    let integral = is_integral_real(r);
-    let mut w = BufWriter { buf, n: 0 };
-    if integral {
-        let _ = write!(w, "{r:.1}");
+    while nd > 1 && digits.get(nd - 1) == Some(&b'0') {
+        nd -= 1;
+    }
+    let digits = digits.get(..nd).unwrap_or(&[]);
+    // Fixed: the integer part (at least `0`), `.`, the fraction
+    // (at least `0`). Exponential: one digit, `.`, the rest (at
+    // least `0`), `e`, the signed exponent (at least two digits).
+    let fixed = (-4..=16).contains(&exp);
+    let (int, lead) = if fixed {
+        (exp.max(0) as usize + 1, (-exp).max(0) as usize)
     } else {
-        let _ = write!(w, "{r}");
+        (1, 0)
+    };
+    for k in 0..int {
+        out.push(if lead > 0 {
+            b'0'
+        } else {
+            digits.get(k).copied().unwrap_or(b'0')
+        });
     }
-    let n = w.n;
-    core::str::from_utf8(&w.buf[..n]).unwrap_or("0")
+    out.push(b'.');
+    for _ in 1..lead {
+        out.push(b'0');
+    }
+    let from = if lead > 0 { 0 } else { int };
+    match digits.get(from..) {
+        Some(rest) if !rest.is_empty() => out.extend_from_slice(rest),
+        _ => out.push(b'0'),
+    }
+    if !fixed {
+        out.push(b'e');
+        out.push(if exp < 0 { b'-' } else { b'+' });
+        let e = exp.unsigned_abs();
+        if e >= 100 {
+            out.push(b'0' + (e / 100) as u8);
+        }
+        out.push(b'0' + (e / 10 % 10) as u8);
+        out.push(b'0' + (e % 10) as u8);
+    }
 }
 
 /// `f64::fract`/`abs` are not in `core`; spell the two checks we need.

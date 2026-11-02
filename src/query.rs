@@ -126,6 +126,9 @@ pub enum RExpr {
     Rowid(usize),
     Binary(BinOp, Box<RExpr>, Box<RExpr>),
     Neg(Box<RExpr>),
+    /// Unary plus (v0.16): the operand's value, with no
+    /// comparison affinity (the operand's collation passes).
+    Pos(Box<RExpr>),
     Not(Box<RExpr>),
     IsNull(Box<RExpr>, bool),
     InList(Box<RExpr>, AVec<RExpr>, bool),
@@ -390,6 +393,11 @@ pub struct SubPlan {
     /// carries into an enclosing comparison / a derived
     /// table's column), else `None`.
     pub result_affs: AVec<Option<Affinity>>,
+    /// Whether each result item was written with an `AS` alias
+    /// (v0.16), parallel to `result_names`: CREATE TABLE ... AS
+    /// SELECT names an unaliased column reference by the
+    /// table's own column name, not its spelling here.
+    pub result_named: AVec<bool>,
     /// Plan-node identity (v0.13): unique across every
     /// `SubPlan` planned in this process, assigned by the
     /// session planner. Clones keep the id, which is what
@@ -473,6 +481,7 @@ pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
         RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -779,6 +788,7 @@ fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
             shift_expr(b, at, by);
         }
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1038,6 +1048,13 @@ pub fn resolve_scoped<E>(
             )?),
         ),
         Expr::Neg(e) => RExpr::Neg(Box::new(resolve_scoped::<E>(
+            e,
+            arena,
+            cur,
+            enclosing,
+            &mut *planner,
+        )?)),
+        Expr::Pos(e) => RExpr::Pos(Box::new(resolve_scoped::<E>(
             e,
             arena,
             cur,
@@ -1382,6 +1399,7 @@ pub fn has_agg(e: &RExpr) -> bool {
         | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => has_agg(a) || has_agg(b),
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1420,6 +1438,7 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
             collect_aggs(b, out);
         }
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1478,6 +1497,7 @@ pub fn has_sub(e: &RExpr) -> bool {
         | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => has_sub(a) || has_sub(b),
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1522,6 +1542,7 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
             collect_subs(b, out);
         }
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1643,6 +1664,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             Box::new(substitute(b, values, pos)),
         ),
         RExpr::Neg(a) => RExpr::Neg(Box::new(substitute(a, values, pos))),
+        RExpr::Pos(a) => RExpr::Pos(Box::new(substitute(a, values, pos))),
         RExpr::Not(a) => RExpr::Not(Box::new(substitute(a, values, pos))),
         RExpr::IsNull(a, neg) => RExpr::IsNull(Box::new(substitute(a, values, pos)), *neg),
         RExpr::InList(x, l, neg) => {
@@ -1729,6 +1751,7 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
         | RExpr::OutRef(_) => false,
         RExpr::Binary(_, a, b) => sub_in_agg_args(a) || sub_in_agg_args(b),
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1770,6 +1793,7 @@ pub fn collect_outer_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
             collect_outer_aggs(b, out);
         }
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1838,6 +1862,7 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
             collect_subs_outside_agg(b, out);
         }
         RExpr::Neg(a)
+        | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
@@ -1955,6 +1980,9 @@ pub fn substitute_group(
             Box::new(substitute_group(b, values, pos, agg_values, agg_pos)),
         ),
         RExpr::Neg(a) => RExpr::Neg(Box::new(substitute_group(
+            a, values, pos, agg_values, agg_pos,
+        ))),
+        RExpr::Pos(a) => RExpr::Pos(Box::new(substitute_group(
             a, values, pos, agg_values, agg_pos,
         ))),
         RExpr::Not(a) => RExpr::Not(Box::new(substitute_group(
@@ -2363,6 +2391,7 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
         | RExpr::SubExists(_) => false,
         RExpr::InSub(x, ..)
         | RExpr::Neg(x)
+        | RExpr::Pos(x)
         | RExpr::Not(x)
         | RExpr::IsNull(x, _)
         | RExpr::Cast(x, _) => f(x),
@@ -2391,7 +2420,11 @@ fn explicit_child(e: &RExpr) -> Option<&RExpr> {
     let f = has_explicit_coll;
     let first = |l: &'_ [RExpr]| -> Option<usize> { l.iter().position(f) };
     match e {
-        RExpr::InSub(x, ..) | RExpr::Neg(x) | RExpr::Not(x) | RExpr::IsNull(x, _) => Some(x),
+        RExpr::InSub(x, ..)
+        | RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _) => Some(x),
         RExpr::Binary(_, a, b) => Some(if f(a) { a } else { b }),
         RExpr::Like(x, p, _) => Some(if f(p) { p } else { x }),
         RExpr::InList(x, l, _) => {
@@ -2445,7 +2478,7 @@ pub fn expr_coll(e: &RExpr) -> Option<Coll> {
     loop {
         match p {
             RExpr::Column(_, _, c) | RExpr::Collate(_, c) => return Some(*c),
-            RExpr::Cast(x, _) => p = x,
+            RExpr::Cast(x, _) | RExpr::Pos(x) => p = x,
             _ if has_explicit_coll(p) => p = explicit_child(p)?,
             _ => return None,
         }
@@ -2500,6 +2533,7 @@ pub fn is_constant(e: &RExpr) -> bool {
         | RExpr::InSub(..)
         | RExpr::Agg { .. } => false,
         RExpr::Neg(x)
+        | RExpr::Pos(x)
         | RExpr::Not(x)
         | RExpr::IsNull(x, _)
         | RExpr::Cast(x, _)
@@ -2566,14 +2600,11 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
         if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
             return Ok(OwnedValue::Null);
         }
-        let blob = matches!(lv, OwnedValue::Blob(_)) || matches!(rv, OwnedValue::Blob(_));
+        // Always TEXT, blob operands included (the pin's
+        // OP_Concat; v0.16 — hipp answered a BLOB).
         let mut out = to_text(&lv).unwrap_or_default();
         out.extend_from_slice(to_text(&rv).unwrap_or_default().as_slice());
-        return Ok(if blob {
-            OwnedValue::Blob(out)
-        } else {
-            OwnedValue::Text(out)
-        });
+        return Ok(OwnedValue::Text(out));
     }
     let (Some(a), Some(b)) = (to_number(&lv), to_number(&rv)) else {
         return Ok(OwnedValue::Null);
@@ -2908,13 +2939,27 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             t.extend_from_slice(name);
             OwnedValue::Text(t)
         }
-        ScalarFn::Abs => match to_number(&v[0]) {
-            None => OwnedValue::Null,
-            Some(Num::Int(i)) => match i.checked_abs() {
+        // The pin's absFunc (v0.16): an INTEGER stays INTEGER —
+        // i64::MIN is "integer overflow" —, a REAL stays REAL, and
+        // TEXT / BLOB convert to REAL (`abs('5')` is 5.0).
+        ScalarFn::Abs => match &v[0] {
+            OwnedValue::Null => OwnedValue::Null,
+            OwnedValue::Integer(i) => match i.checked_abs() {
                 Some(a) => OwnedValue::Integer(a),
-                None => OwnedValue::Real(-(i as f64)),
+                None => {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::IntegerOverflow,
+                    });
+                }
             },
-            Some(Num::Real(r)) => OwnedValue::Real(if r < 0.0 { -r } else { r }),
+            other => {
+                let r = match to_number(other) {
+                    Some(Num::Int(i)) => i as f64,
+                    Some(Num::Real(r)) => r,
+                    None => 0.0,
+                };
+                OwnedValue::Real(if r < 0.0 { -r } else { r })
+            }
         },
         ScalarFn::Length => {
             if matches!(v[0], OwnedValue::Null) {
@@ -3417,6 +3462,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             _ => OwnedValue::Null,
         },
         RExpr::OutRef(_) => return Err(Error::Unsupported),
+        RExpr::Pos(x) => eval::<E>(x, ctx)?,
         RExpr::Neg(x) => match to_number(&eval::<E>(x, ctx)?) {
             None => OwnedValue::Null,
             Some(Num::Int(i)) => match i.checked_neg() {

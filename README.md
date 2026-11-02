@@ -57,12 +57,30 @@ aspirations.
   without one); VIRTUAL / STORED generated columns in the pin's
   record layout (files interoperate both ways), indexable,
   recomputed on UPDATE; UPDATE ... FROM applying only the last
-  matching combination; MustBeInt rowid conversion. The tiny
-  profile refuses those clauses (`RequiresEvaluator`) instead
-  of ignoring them, and still shrank. Behind `v16`: INSERT ...
-  DEFAULT VALUES, CREATE TABLE ... AS SELECT (the pin's column
-  names, declared types and schema text, byte for byte) and
-  STRICT tables. WITHOUT ROWID stays refused.
+  matching combination (in hipp's join order); MustBeInt rowid
+  conversion. The tiny profile refuses those clauses
+  (`RequiresEvaluator`) instead of ignoring them, and still
+  shrank. Behind `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE
+  ... AS SELECT (the pin's column names, declared types and
+  schema text, byte for byte) and STRICT tables. WITHOUT ROWID
+  stays refused. Review fixes (every profile): CREATE TABLE
+  items are walked with the pin's grammar, so malformed
+  constraint lists (`CHECK(a>0) bar`, `DEFAULT abs(1)`,
+  `PRIMARY KEY (a) foo`) are syntax errors instead of schemas
+  the pin cannot load; stored CREATE texts drop `main.` / `IF
+  NOT EXISTS` as the pin's do; repeated PRIMARY KEY / UNIQUE
+  sets share one autoindex; `-9223372036854775808` is an
+  INTEGER; unary `+` keeps no affinity (`+a = '1'`, CTAS column
+  `"+a"`); `||` is always TEXT, `abs()` follows the pin (TEXT →
+  REAL, i64::MIN overflows) and REAL → TEXT uses the pin's
+  `1.0e+20` layout — computed with exact integer arithmetic, so
+  no build links `core::fmt`'s float formatting any more (the
+  tiny profile dropped 5.5 KB); ALTER TABLE ADD COLUMN takes
+  non-constant defaults, NOT NULL and STORED columns on an empty
+  table; one clock read per statement; hipp-cli supplies the
+  system clock; CREATE TABLE refuses AUTOINCREMENT (hipp keeps
+  no `sqlite_sequence`, and such a table read as malformed on
+  the pin).
 - **Collations and pattern matching.** Ungated (column
   `COLLATE` was parsed and ignored): BINARY / NOCASE / RTRIM
   column collations with the pin's selection rule in every
@@ -389,7 +407,8 @@ differential testing. It is a separate crate and contributes
 ## Non-goals (SPEC §3)
 
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
-no WITHOUT ROWID tables (refused), no expression or partial
+no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
+created (refused; foreign ones load), no expression or partial
 indexes, no subqueries, no bound
 parameters, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed, no UTF-16, no multi-process

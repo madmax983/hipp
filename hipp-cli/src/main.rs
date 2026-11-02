@@ -23,18 +23,28 @@ enum Db {
 fn open_db(path: &str) -> Result<Db, String> {
     block_on(async {
         if path == ":memory:" {
-            let conn = Connection::open(MemStorage::new(), Config::default())
+            let conn = Connection::open(MemStorage::new(), Config::default().clock(now_ms))
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::Mem(conn))
         } else {
             let fs = FileStorage::open(std::path::Path::new(path)).map_err(|e| format!("{e:?}"))?;
-            let conn = Connection::open(fs, Config::default())
+            let conn = Connection::open(fs, Config::default().clock(now_ms))
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::File(conn))
         }
     })
+}
+
+/// The wall clock for CURRENT_TIME / CURRENT_DATE /
+/// CURRENT_TIMESTAMP defaults (v0.16): the core has none of its
+/// own; the CLI, a std program, supplies the system time in Unix
+/// milliseconds (0 if the system clock reads before 1970).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Format an `f64` the way SQLite's list mode prints reals

@@ -239,6 +239,58 @@ pub fn parse_real(text: &[u8]) -> Option<f64> {
     Some(big_rational_to_f64(&p, &q))
 }
 
+/// The `n` (1 ..= 17) significant decimal digits of the finite
+/// `r > 0`, correctly rounded (ties to even, as C's `printf`
+/// rounds), as an integer in `[10^(n-1), 10^n)`, with the decimal
+/// exponent of its first digit (v0.16, for `record::render_real`:
+/// exact big-integer arithmetic, so the build needs none of
+/// `core::fmt`'s float formatting).
+pub fn real_digits(r: f64, n: u32) -> (u64, i32) {
+    let bits = r.to_bits();
+    let be = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e2) = if be == 0 {
+        (frac, -1074i64)
+    } else {
+        (frac | (1u64 << 52), be - 1075)
+    };
+    let n = n.clamp(1, 17);
+    let lo = 10u64.pow(n - 1);
+    let hi = lo.saturating_mul(10);
+    // floor(log10 r) to within one: log2 r is about e2 + bits(m) - 1.
+    let bl = i64::from(64 - m.leading_zeros());
+    // (x * 78913) >> 18 is floor(x * log10(2)) for |x| < 2^16,
+    // in integer arithmetic (no soft-float multiply on FPU-less
+    // targets).
+    let mut exp10 = ((e2 + bl - 1) * 78913) >> 18;
+    let mut d = 0u64;
+    for _ in 0..4 {
+        let k = i64::from(n) - 1 - exp10;
+        let mut num: BigUint = alloc::vec![m as u32, (m >> 32) as u32];
+        big_trim(&mut num);
+        let mut den: BigUint = alloc::vec![1];
+        if k >= 0 {
+            big_mul_pow10(&mut num, k as usize);
+        } else {
+            big_mul_pow10(&mut den, k.unsigned_abs() as usize);
+        }
+        if e2 >= 0 {
+            num = big_shl(&num, e2 as usize);
+        } else {
+            den = big_shl(&den, e2.unsigned_abs() as usize);
+        }
+        d = big_rounded_div(&num, &den);
+        if d >= hi {
+            exp10 += 1;
+        } else if d < lo {
+            exp10 -= 1;
+        } else {
+            break;
+        }
+    }
+    (d, exp10 as i32)
+}
+
 /// `parse_real` for text that may carry one leading `+`/`-`
 /// (CAST and affinity text-to-number conversions, where the
 /// sign is part of the text rather than a unary operator).

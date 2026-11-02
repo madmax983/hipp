@@ -383,6 +383,11 @@ enum Plan {
         /// Existing rows to verify against the new definition
         /// (v0.16; see the planner).
         verify: Option<Box<AlterVerify>>,
+        /// The column may be added only while the table has no
+        /// rows (v0.16, the pin's `sqlite3ErrorIfNotEmpty`): a
+        /// non-constant default, NOT NULL without a default, a
+        /// STORED generated column.
+        empty_only: bool,
     },
     /// `CREATE VIEW` (v0.4).
     #[cfg(feature = "v04")]
@@ -512,6 +517,8 @@ struct CorePlan {
     result_names: AVec<AVec<u8>>,
     #[cfg_attr(not(feature = "v06"), allow(dead_code))]
     result_affs: AVec<Option<crate::record::Affinity>>,
+    #[cfg_attr(not(feature = "v06"), allow(dead_code))]
+    result_named: AVec<bool>,
     /// Compound ORDER BY matching data for this core.
     keys: CompKeys,
 }
@@ -1041,6 +1048,9 @@ impl<S: Storage> Connection<S> {
                     }
                 }
                 let mut cols = AVec::new();
+                // One clock read for the whole statement.
+                #[cfg(feature = "v04")]
+                let mut clock = crate::rules::Clock::new(self.cfg.clock);
                 for (i, c) in t.columns.iter().enumerate() {
                     // v0.16: an expression DEFAULT the catalog
                     // could not fold is evaluated only when a row
@@ -1054,7 +1064,7 @@ impl<S: Storage> Connection<S> {
                         && (!targets.iter().any(|tg| *tg == Target::Col(i))
                             || (c.not_null && *conflict == ConflictAction::Replace))
                     {
-                        self.column_default(arena, c)?
+                        self.column_default(arena, c, &mut clock)?
                     } else {
                         literal_owned(&self.catalog_arena, c.default)
                     };
@@ -1280,36 +1290,43 @@ impl<S: Storage> Connection<S> {
                 // v0.16: a VIRTUAL generated column may be added
                 // (it occupies no record field); a STORED one may
                 // not ("cannot add a STORED column").
-                if column.primary_key
-                    || column.pk_desc
-                    || column.unique
-                    || (column.generated && column.stored)
-                {
+                if column.primary_key || column.pk_desc || column.unique {
                     return Err(Error::Schema {
                         kind: SchemaKind::CannotAddColumn,
                     });
                 }
+                // The pin's other refusals fire only when the table
+                // has rows (`sqlite3ErrorIfNotEmpty`, checked at
+                // step time): a STORED generated column, a DEFAULT
+                // outside the `sqlite3ValueFromExpr` shape — a
+                // (signed / CAST) literal: `-'3'` and `-x'01'` add
+                // anywhere, `(1+2)` and CURRENT_TIMESTAMP only to an
+                // empty table (v0.16: they were always refused) —
+                // and NOT NULL with no default or a literal NULL.
+                let mut empty_only = column.generated && column.stored;
                 // The new column's value in every existing row.
-                // An expression DEFAULT is allowed only in the
-                // pin's `sqlite3ValueFromExpr` shape — a (signed /
-                // CAST) literal: `-'3'` and `-x'01'` add, `(1+2)`
-                // and CURRENT_TIMESTAMP do not.
                 let new_default = match column.default_expr {
-                    Some(h) => {
+                    Some(h) if !column.generated => {
                         let dt = handle_bytes(arena, h);
-                        if !crate::rules::alter_default_ok::<S::Error>(dt, arena)? {
-                            return Err(Error::Schema {
-                                kind: SchemaKind::CannotAddColumn,
-                            });
+                        if crate::rules::alter_default_ok::<S::Error>(dt, arena)? {
+                            crate::rules::eval_default::<S::Error>(
+                                dt,
+                                arena,
+                                &mut crate::rules::Clock::new(None),
+                            )?
+                        } else {
+                            empty_only = true;
+                            OwnedValue::Null
                         }
-                        crate::rules::eval_default::<S::Error>(dt, arena, None)?
                     }
-                    None => literal_owned(arena, column.default),
+                    _ => literal_owned(arena, column.default),
                 };
-                if column.not_null && !column.generated && matches!(new_default, OwnedValue::Null) {
-                    return Err(Error::Schema {
-                        kind: SchemaKind::CannotAddColumn,
-                    });
+                if column.not_null
+                    && !column.generated
+                    && column.default_expr.is_none()
+                    && matches!(new_default, OwnedValue::Null)
+                {
+                    empty_only = true;
                 }
                 let base = handle_bytes(&self.catalog_arena, t.sql);
                 let pos = base
@@ -1391,6 +1408,7 @@ impl<S: Storage> Connection<S> {
                     table: copy_vec(tname),
                     new_sql,
                     verify,
+                    empty_only,
                 })
             }
             #[cfg(feature = "v04")]
@@ -1556,16 +1574,40 @@ impl<S: Storage> Connection<S> {
                 .cloned()
                 .unwrap_or_default();
             let item = plan.items.as_slice().get(i);
-            if let Some(RExpr::Rowid(src)) = item
-                && crate::query::is_rowid_name(name.as_slice())
-            {
-                name = copy_vec(b"rowid");
-                if let Some(sp) = plan.sources.as_slice().get(*src)
-                    && let Some(a) = sp.rowid_alias
-                    && let Some(t) = self.catalog.tables.iter().find(|t| t.root == sp.root)
-                    && let Some(c) = t.columns.as_slice().get(a)
-                {
-                    name = copy_vec(handle_bytes(&self.catalog_arena, c.name));
+            // The pin's `sqlite3ColumnsFromExprList` over the
+            // resolved list: an unaliased column reference (COLLATE
+            // skipped; parentheses are no node, unary `+` is) takes
+            // its table's own column name — `A` and `s.A` name the
+            // column `a` —, a rowid reference `rowid` or the
+            // rowid-alias column's name.
+            let mut bare = item;
+            while let Some(RExpr::Collate(x, _)) = bare {
+                bare = Some(&**x);
+            }
+            if !plan.result_named.as_slice().get(i).copied().unwrap_or(true) {
+                match bare {
+                    Some(RExpr::Rowid(src)) => {
+                        name = copy_vec(b"rowid");
+                        if let Some(sp) = plan.sources.as_slice().get(*src)
+                            && let Some(a) = sp.rowid_alias
+                            && let Some(n) = self.source_col_name(sp, a)?
+                        {
+                            name = n;
+                        }
+                    }
+                    Some(RExpr::Column(slot, ..)) => {
+                        let mut base = 0usize;
+                        for sp in plan.sources.iter() {
+                            if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
+                                if let Some(n) = self.source_col_name(sp, k)? {
+                                    name = n;
+                                }
+                                break;
+                            }
+                            base = base.saturating_add(sp.ncols);
+                        }
+                    }
+                    _ => {}
                 }
             }
             names.push(name);
@@ -1600,6 +1642,29 @@ impl<S: Storage> Connection<S> {
             sql: crate::rules::ctas_sql(tname, cols.as_slice()),
             affs,
         })
+    }
+
+    /// The name of column `k` of one planned FROM source (v0.16,
+    /// CREATE TABLE ... AS SELECT naming): the table's column, or
+    /// a derived table's (deduplicated) result column.
+    #[cfg(feature = "v16")]
+    fn source_col_name(
+        &self,
+        sp: &crate::query::SubSource,
+        k: usize,
+    ) -> Result<Option<AVec<u8>>, S::Error> {
+        if let Some(d) = &sp.derived {
+            let mut names = d.result_names.clone();
+            crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
+            return Ok(names.as_slice().get(k).cloned());
+        }
+        Ok(self
+            .catalog
+            .tables
+            .iter()
+            .find(|t| t.root == sp.root)
+            .and_then(|t| t.columns.as_slice().get(k))
+            .map(|c| copy_vec(handle_bytes(&self.catalog_arena, c.name))))
     }
 
     /// A table's CHECK / generated / STRICT rules resolved for
@@ -1653,12 +1718,13 @@ impl<S: Storage> Connection<S> {
         &self,
         arena: &Arena,
         c: &crate::schema::Column,
+        clock: &mut crate::rules::Clock,
     ) -> Result<OwnedValue, S::Error> {
         match c.default_expr {
             Some(h) => crate::rules::eval_default::<S::Error>(
                 handle_bytes(&self.catalog_arena, h),
                 arena,
-                self.cfg.clock,
+                clock,
             ),
             None => Ok(literal_owned(&self.catalog_arena, c.default)),
         }
@@ -1885,9 +1951,11 @@ impl<S: Storage> Connection<S> {
             };
             let mut result_names: AVec<AVec<u8>> = AVec::new();
             let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
+            let mut result_named = AVec::new();
             for n in keys.names.iter() {
                 result_names.push(n.clone().unwrap_or_default());
                 result_affs.push(None);
+                result_named.push(false);
             }
             let mut plan = SubPlan {
                 sources: AVec::new(),
@@ -1905,6 +1973,7 @@ impl<S: Storage> Connection<S> {
                 comp_order,
                 result_names,
                 result_affs,
+                result_named,
                 id: 0,
                 uncorrelated: false,
             };
@@ -1936,6 +2005,7 @@ impl<S: Storage> Connection<S> {
             comp_order,
             result_names: core.result_names,
             result_affs: core.result_affs,
+            result_named: core.result_named,
             id: 0,
             uncorrelated: false,
         };
@@ -2385,12 +2455,13 @@ impl<S: Storage> Connection<S> {
         let mut defaults = AVec::new();
         let mut affs = AVec::new();
         let mut not_null = AVec::new();
+        let mut clock = crate::rules::Clock::new(self.cfg.clock);
         for c in t.columns.iter() {
             // v0.16: an unfolded expression DEFAULT matters to an
             // UPDATE only as OR REPLACE's NOT NULL substitute.
             defaults.push(
                 if c.default_expr.is_some() && c.not_null && conflict == ConflictAction::Replace {
-                    self.column_default(arena, c)?
+                    self.column_default(arena, c, &mut clock)?
                 } else {
                     read_default(&self.catalog_arena, c)
                 },
@@ -2746,12 +2817,14 @@ impl<S: Storage> Connection<S> {
         let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
         let mut result_names: AVec<AVec<u8>> = AVec::new();
         let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
+        let mut result_named: AVec<bool> = AVec::new();
         for it in stmt.items.iter() {
             let qual = match it {
                 SelectItem::Expr(e, alias, text) => {
                     let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
                     result_names.push(item_name(arena, e, alias, text));
                     result_affs.push(item_result_affinity(&r));
+                    result_named.push(alias.is_some());
                     items.push(r);
                     item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
                     continue;
@@ -2768,6 +2841,7 @@ impl<S: Storage> Connection<S> {
             }
             for (r, nm) in expanded.iter() {
                 result_affs.push(item_result_affinity(r));
+                result_named.push(false);
                 items.push(r.clone());
                 item_aliases.push(None);
                 result_names.push(nm.clone());
@@ -2907,6 +2981,7 @@ impl<S: Storage> Connection<S> {
             has_agg,
             result_names,
             result_affs,
+            result_named,
             keys,
         })
     }
@@ -3465,13 +3540,29 @@ fn copy_vec(b: &[u8]) -> AVec<u8> {
 
 /// The stored schema text for a CREATE statement: the statement
 /// as issued, minus any trailing semicolon/whitespace (SQLite's
-/// convention).
-fn trimmed_sql_text(raw: &[u8]) -> AVec<u8> {
+/// convention), rebuilt from the bare created name on after the
+/// pin's own `CREATE TABLE ` / `CREATE VIEW ` / `CREATE [UNIQUE]
+/// INDEX ` prefix (v0.16: a stored `CREATE TABLE main.t(...)` is a
+/// schema the pin reports as corrupt, and `IF NOT EXISTS` or the
+/// keywords' spelling are not kept by the pin either). `arena`
+/// holds the re-lexed tokens. AUTOINCREMENT is refused
+/// (`Error::Unsupported`: hipp keeps no `sqlite_sequence`).
+fn trimmed_sql_text<E>(raw: &[u8], arena: &Arena) -> Result<AVec<u8>, E> {
     let mut end = raw.len();
     while end > 0 && (raw[end - 1] == b';' || (raw[end - 1] as char).is_whitespace()) {
         end -= 1;
     }
-    copy_vec(&raw[..end])
+    let raw = &raw[..end];
+    Ok(
+        match crate::sql::parser::schema_text_start::<E>(raw, arena)? {
+            Some((prefix, at)) if at <= raw.len() => {
+                let mut v = copy_vec(prefix);
+                v.extend_from_slice(&raw[at..]);
+                v
+            }
+            _ => copy_vec(raw),
+        },
+    )
 }
 
 /// Build an index key (the key columns' values, in index order)
@@ -3976,9 +4067,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let _ = columns;
         // Stored schema text: the statement as issued, minus any
-        // trailing semicolon/whitespace (SQLite's convention).
+        // trailing semicolon/whitespace (SQLite's convention);
+        // AUTOINCREMENT is refused there (v0.16).
         let raw = handle_bytes(&self.arena, self.sql_text);
-        let sql_text = trimmed_sql_text(raw);
+        let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
         let r = self
             .exec_create(name_b.as_slice(), sql_text.as_slice())
             .await;
@@ -4250,7 +4342,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         }
         let raw = handle_bytes(&self.arena, self.sql_text);
-        let sql_text = trimmed_sql_text(raw);
+        let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
         let (root, _) = self.conn.pager.alloc_page().await?;
         btree::create_empty_index_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(
@@ -7212,12 +7304,31 @@ impl<'c, S: Storage> Statement<'c, S> {
             table,
             new_sql,
             verify,
+            empty_only,
         } = &self.plan
         else {
             unreachable!()
         };
-        let (root, table, new_sql, verify) =
-            (*root, table.clone(), new_sql.clone(), verify.clone());
+        let (root, table, new_sql, verify, empty_only) = (
+            *root,
+            table.clone(),
+            new_sql.clone(),
+            verify.clone(),
+            *empty_only,
+        );
+        if empty_only {
+            let mut cursor = ScanCursor::new(root);
+            let mut buf = AVec::new();
+            if cursor
+                .next_row_into(&mut self.conn.pager, &mut buf)
+                .await?
+                .is_some()
+            {
+                return Err(Error::Schema {
+                    kind: SchemaKind::CannotAddColumn,
+                });
+            }
+        }
         let mut cursor = ScanCursor::new(1);
         let mut buf = AVec::new();
         let mut found = None;
@@ -7339,7 +7450,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         }
         let raw = handle_bytes(&self.arena, self.sql_text);
-        let sql_text = trimmed_sql_text(raw);
+        let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
         self.insert_schema_row(
             b"view",
             name_b.as_slice(),

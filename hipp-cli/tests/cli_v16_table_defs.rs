@@ -195,3 +195,80 @@ fn cli_v16_dump_skips_generated_columns() {
     assert_eq!(run(&oracle(), &o, q), run(&hipp_bin(), &h, q));
     assert_eq!(run(&oracle(), &o, "PRAGMA integrity_check;"), b"ok\n");
 }
+
+// ---------------- review fixes (second pass) ----------------
+
+/// Second-pass regressions, byte-compared: unary `+` drops
+/// affinity (`+a = '1'`) and names a CTAS column `"+a"`; an
+/// unaliased column reference takes the table's spelling in CTAS
+/// and view column lists; `||` over blobs is TEXT; REAL-to-TEXT
+/// conversions use the pin's `%!.17g` layout; abs() of TEXT is
+/// REAL; `-9223372036854775808` is an INTEGER through DEFAULT,
+/// generated columns and ALTER; `main.` qualifiers stay out of the
+/// stored schema text; a repeated PRIMARY KEY / UNIQUE set gets no
+/// second autoindex; ALTER TABLE ADD COLUMN takes non-constant
+/// defaults and STORED columns on an empty table.
+const REVIEW: &str = "\
+CREATE TABLE main.s(a INT, b TEXT, c TEXT COLLATE NOCASE, id INTEGER PRIMARY KEY);
+INSERT INTO s VALUES (1, '1', 'X', 7), (2, '2.0', 'y', 8);
+SELECT count(*) FROM s WHERE +a = '1';
+SELECT count(*) FROM s WHERE a = '1';
+SELECT +b = 1, b = 1, +c = 'x', '2' = +a FROM s;
+CREATE TABLE ct AS SELECT +a, +b, (a), ((b)), A, S.B, ID, rowid, a AS A, c COLLATE BINARY FROM s;
+SELECT typeof(\"+a\"), typeof(a) FROM ct;
+CREATE VIEW v AS SELECT A, +b, S.B, a AS Q FROM s;
+CREATE TABLE r(a, c, d AS (c || a) STORED, e DEFAULT (x'41' || x'42'), f TEXT, g AS (a || '') STORED);
+INSERT INTO r(a, c, f) VALUES (3.5, x'01', 1e20), (1e-5, x'02', 1e16), (1e17, 'z', 0.0001);
+SELECT typeof(d), hex(d), typeof(e), e, f, g FROM r;
+SELECT 1e20 || '', 1e15 || '', 1.5e-7 || '', CAST(-2.5e30 AS TEXT), 1e100 || '';
+SELECT abs('5'), typeof(abs('-2.5')), abs(x'35'), abs(-3), abs(-9223372036854775807);
+CREATE TABLE m(a, b DEFAULT -9223372036854775808, c AS (-9223372036854775808),
+  d CHECK(d IS NULL OR d = -9223372036854775808));
+INSERT INTO m(a, d) VALUES (1, -9223372036854775808);
+ALTER TABLE m ADD COLUMN e DEFAULT -9223372036854775808;
+SELECT b, typeof(b), c, typeof(c), d, typeof(d), e, typeof(e), -(9223372036854775808) FROM m;
+CREATE TABLE u(a PRIMARY KEY UNIQUE, b UNIQUE, UNIQUE(b), UNIQUE(a, b), UNIQUE(a) );
+CREATE TABLE w(a, b, UNIQUE(a) UNIQUE(b));
+CREATE UNIQUE INDEX main.wi ON w(a, b);
+CREATE TABLE e(a);
+ALTER TABLE e ADD COLUMN b DEFAULT (1 + 2);
+ALTER TABLE e ADD COLUMN c NOT NULL;
+ALTER TABLE e ADD COLUMN d AS (a * 2) STORED;
+INSERT INTO e(a, c) VALUES (5, 'c');
+SELECT * FROM e;
+";
+
+#[test]
+fn cli_v16_review_fixes_byte_identical() {
+    byte_identical("review", REVIEW);
+    // The schema each engine wrote, read back by the oracle: the
+    // CTAS text, the qualifier-free CREATE texts, the deduplicated
+    // autoindexes; and the view's column list in `.schema`.
+    let a = temp_db("review2-hipp");
+    let b = temp_db("review2-ora");
+    run(&hipp_bin(), &a, REVIEW);
+    run(&oracle(), &b, REVIEW);
+    let q = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name;";
+    assert_eq!(run(&oracle(), &a, q), run(&oracle(), &b, q));
+    assert_eq!(
+        run(&hipp_bin(), &a, ".schema v"),
+        run(&oracle(), &b, ".schema v")
+    );
+}
+
+/// The CLI supplies the system clock: a CURRENT_* default no
+/// longer fails with `NoClock`, and one statement's defaults
+/// share one instant.
+#[test]
+fn cli_v16_clock_defaults_use_the_system_time() {
+    let batch = "CREATE TABLE t(a, b DEFAULT CURRENT_TIMESTAMP, c DEFAULT CURRENT_DATE, \
+                 d DEFAULT CURRENT_TIME); INSERT INTO t(a) VALUES (1), (2); \
+                 SELECT length(b), substr(b, 1, 10) = c, substr(b, 12) = d, \
+                 count(DISTINCT b) FROM t;";
+    let a = temp_db("clock-hipp");
+    let b = temp_db("clock-ora");
+    let got = run(&hipp_bin(), &a, batch);
+    assert_eq!(got, b"19|1|1|1\n");
+    assert_eq!(got, run(&oracle(), &b, batch));
+    assert_eq!(run(&oracle(), &a, "PRAGMA integrity_check;"), b"ok\n");
+}

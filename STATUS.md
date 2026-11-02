@@ -222,14 +222,15 @@ view / derived name dedupe and the UPDATE ... FROM check).
   term against an identical item (`SELECT a+0 ... UNION ...
   ORDER BY a+0`), which hipp still refuses.
 - Out of scope, found by the review (older behaviour, still
-  open): `x'01' || x'01'` is BLOB in hipp, TEXT on the pin;
+  open): ~~`x'01' || x'01'` is BLOB in hipp, TEXT on the pin~~
+  (fixed by the column-constraints review pass, below);
   with min()/max() plus another aggregate the pin still takes
   bare columns from the extremum row, hipp's `pick_rep` only
   for a lone min/max. A three-part `main.t.col` reference is
   refused.
-- `-9223372036854775808` is an INTEGER literal on the pin and
-  a REAL in hipp (so `LIMIT -9223372036854775808` errors) —
-  a literal-parsing gap outside this unit.
+- ~~`-9223372036854775808` is an INTEGER literal on the pin and
+  a REAL in hipp~~ — fixed by the column-constraints review pass
+  (below).
 - `x IN view` (and NATURAL / USING with a view) stays refused:
   views are inert.
 - Parenthesised join groups (`FROM (a JOIN b USING (id))`)
@@ -318,7 +319,11 @@ rule as SQL text and every write re-resolves it.
   pin materialises the join keyed by target rowid, so earlier
   combinations are never checked — hipp used to apply each in
   turn (same final value, but NOT NULL / CHECK fired on the
-  earlier ones). `FROM s RETURNING ...` no longer aliases `s`
+  earlier ones). "Last" is in hipp's join order (FROM order,
+  rowid scans), which is the pin's for scans; where the pin
+  builds an automatic index for an equality join it is that
+  index's order instead (a choice SQLite documents as
+  arbitrary — see the gaps). `FROM s RETURNING ...` no longer aliases `s`
   as RETURNING.
 - **Rowid values** convert like the pin's MustBeInt in INSERT,
   UPDATE and DO UPDATE: `'8'`, `9.0`, `' 10 '`, `'1e2'` are
@@ -349,6 +354,104 @@ type's affinity cannot convert is `StrictTypeViolation` under
 every conflict action, generated columns included; checked
 after NOT NULL and before CHECK; ALTER verifies existing rows).
 WITHOUT ROWID stays refused.
+
+**Review fixes (second pass, same day):**
+
+- *Malformed constraint lists* (corruption, every profile): the
+  column parser scanned an item for keywords, so trailing junk —
+  `CHECK(a>0) bar`, `DEFAULT abs(1)` (stored 'abs'), `DEFAULT
+  "x" y`, `DEFAULT - - 1`, `DEFAULT (1)(2)`, `PRIMARY KEY (a)
+  foo`, `VARCHAR(10) foo`, a column after a table constraint,
+  `INDEX (a)` — was accepted and stored verbatim, a schema the
+  pin then refuses to load. Every CREATE TABLE item (and ALTER's
+  column) is now walked clause by clause with the pin's grammar
+  (`typetoken`, `carglist`, `conslist` with optional commas
+  between table constraints, ON CONFLICT, REFERENCES / MATCH /
+  ON DELETE …, [NOT] DEFERRABLE, AUTOINCREMENT inside a table
+  PRIMARY KEY), with the pin's 68 non-fallback keywords refused
+  as names / type words / DEFAULT identifiers. The same walker
+  serves the tiny profile, which therefore gained it too, and
+  now takes `DEFAULT identifier` (only the clock keywords are
+  refused there). Found on the way: a column named `key` was
+  silently dropped (items starting with KEY were skipped);
+  `CHECK(a) CHECK(b)` without a comma kept only the first.
+- *Repeated PRIMARY KEY / UNIQUE sets* (corruption, `indexes`):
+  `a PRIMARY KEY UNIQUE`, `UNIQUE(a), UNIQUE(a DESC)` got two
+  autoindexes — "orphan index" on the pin. A set repeating an
+  earlier one (same columns in order, same effective collations)
+  is dropped as the pin's `sqlite3CreateIndex` does; a repeating
+  PRIMARY KEY makes the earlier UNIQUE set the key's.
+- *Stored CREATE text* (corruption, every profile): `CREATE
+  TABLE main.t` was stored verbatim ("corrupt database" on the
+  pin). The text is now rebuilt as the pin's: `CREATE TABLE ` /
+  `CREATE VIEW ` / `CREATE [UNIQUE] INDEX ` and the statement
+  from the bare name on (so `IF NOT EXISTS` and the keywords'
+  case are not kept either; `parser::schema_text_start`). `ON
+  main.t` in CREATE INDEX is a syntax error, as on the pin.
+  (`temp.` / other schemas were already refused, CTAS included.)
+- *CTAS names* (`v16`): unary `+` was dropped by the parser, so
+  `+a` named its column `a` with INT affinity. The AST and the
+  evaluator now keep it (`Expr::Pos` / `RExpr::Pos`: the
+  operand's value and collation, no affinity) — which also
+  fixes `+a = '1'` comparing with affinity (a silent wrong answer
+  on the claimed v0.4 path) and derived / view column names.
+  An unaliased column reference takes the table's spelling (`A`,
+  `S.B` → `a`, `b`, via the new `SubPlan::result_named`), as do
+  view column lists; an alias spelled `oid` is kept.
+- *`-9223372036854775808`* (every profile): the pin's
+  `codeInteger` makes `-` over that literal (through `+` and
+  parentheses) INTEGER i64::MIN; hipp folded it to a REAL and
+  stored that through DEFAULT, generated columns, CHECK, ALTER
+  and plain INSERT. `- -9223372036854775808` overflows to REAL.
+- *Evaluator values now on disk*: `||` is always TEXT (a blob
+  operand gave BLOB); `abs()` follows the pin's `absFunc` —
+  INTEGER i64::MIN is `SchemaKind::IntegerOverflow`, TEXT / BLOB
+  give REAL (`abs('5')` = 5.0); REAL → TEXT (`||`, CAST, TEXT
+  affinity — the tiny profile's INSERT too) is the pin's: 15
+  significant digits if they read back as the value (through
+  the pin's own `parse_real`), else 17, laid out as `%!.17g`
+  (`1.0e+20`, `1.0e-05`, `10000000000000000.0`); it used to print
+  every digit (`100000000000000000000`, and 5e-324 as forty
+  zeros). The digits come from exact big-integer arithmetic
+  (`lexer::real_digits`), so no build links `core::fmt`'s float
+  formatting any more.
+- *ALTER TABLE ADD COLUMN on an empty table*: the pin refuses a
+  non-constant default, NOT NULL with no / a literal NULL
+  default, and a STORED column only when the table has rows
+  (`sqlite3ErrorIfNotEmpty`); hipp refused them always. They
+  are now checked at step time (`Plan::AlterAdd::empty_only`).
+- *AUTOINCREMENT* (corruption, found while probing the grammar,
+  every profile): it was parsed and ignored, and a hipp-created
+  AUTOINCREMENT table has no `sqlite_sequence` — the pin's next
+  INSERT reports "database disk image is malformed". CREATE
+  TABLE now refuses it (`Error::Unsupported`); files the pin
+  wrote with one still load and stay writable.
+- *Clock*: `Config::clock` was read once per clock-default
+  column, so one row could mix two instants (CURRENT_DATE
+  1970-01-01 with CURRENT_TIME 00:00:00). A statement now reads
+  it at most once (`rules::Clock`). hipp-cli supplies the system
+  clock (it had none, so every CURRENT_* default failed with
+  `NoClock` there).
+
+Review-pass tests (each fails on 104c4da): in
+`tests/table_defs_v16.rs` — `malformed_definitions_are_refused_like_the_pin`
+(every review reproduction plus the same pattern across the
+column grammar; verdicts agree and every accepted schema passes
+the oracle's `integrity_check` on hipp's file),
+`prng_definition_grammar_corpus` (120 PRNG definitions from valid
+and malformed fragments), `repeated_constraint_sets_share_one_autoindex`,
+`main_qualifier_is_left_out_of_the_schema_text`,
+`unary_plus_drops_affinity`, `create_table_as_select_names_follow_resolution`,
+`minimum_integer_literal_through_rules`,
+`stored_values_match_the_pins_evaluator`,
+`alter_add_column_on_an_empty_table`,
+`clock_is_read_once_per_statement` (a ticking clock across
+midnight), `autoincrement_is_refused_at_create_and_read_from_foreign_files`;
+in `hipp-cli/tests/cli_v16_table_defs.rs` a byte-identical review
+batch (plus the oracle reading both schemas and the view's
+`.schema` column list) and the CLI clock; parser unit tests for
+the grammar (both profiles), the i64::MIN literal and the schema
+text start.
 
 **Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
 not error text): precedence NOT NULL → STRICT → CHECK → UNIQUE
@@ -390,6 +493,18 @@ pin's shell does, using the new `TableMeta::columns` /
 `generated`), and parser unit tests for the tiny refusals (run by
 the `--no-default-features` lib test gate).
 
+Review pass, vs 104c4da (after the collations unit): tiny
+**76,048 B** (Δ **−5,504 B** vs 81,552, ratchet lowered — the
+REAL → TEXT digits now come from the lexer's existing big-integer
+helpers, which drops `core::fmt`'s float formatting (~9.7 KB:
+Grisu / Dragon, both decimal formatters); that pays for the
+clause-by-clause CREATE TABLE walker (~3 KB), the
+`schema_text_start` re-lex with its AUTOINCREMENT refusal, the
+i64::MIN literal rule and the REAL layout); full **280,395 B**
+(Δ **−3,900 B** vs 284,295, ratchet lowered; the same saving less
+the unary-plus node, CTAS naming, autoindex dedupe and ALTER's
+empty-table path).
+
 **Size:** tiny **81,524 B** (Δ **−92 B** vs 81,616; ratchet
 lowered — the `Tok` comparison rewrite saves more than the
 tiny parser's new refusals and the rowid / default-affinity
@@ -418,17 +533,17 @@ the planner and the async step state machines (~8 KB)).
   `'now'` must refuse them there.
 - The tiny profile refuses such tables at parse, so it cannot
   open a file holding any table with a CHECK, generated column
-  or expression DEFAULT (the WITHOUT ROWID precedent); it also
-  refuses the unquoted `DEFAULT identifier` form that `v04`
-  builds accept (distinguishing it from the clock keywords did
-  not fit the ratchet).
+  or expression DEFAULT (the WITHOUT ROWID precedent). (Its
+  refusal of the unquoted `DEFAULT identifier` form is gone: the
+  review pass's grammar walker tells the clock keywords apart.)
+  Without `indexes` it does not check COLLATE names (it has no
+  collations), where the pin refuses an unknown one.
 - A double-quoted `"current_timestamp"` inside a parenthesised
   DEFAULT reads as the clock keyword (the AST does not keep
   quotedness); the pin calls it a non-constant column.
 - CTAS: a fourth duplicate column name gets a random suffix on
-  the pin — hipp refuses it (`Unsupported`); an explicit alias
-  spelled `oid` / `_rowid_` on a rowid reference is renamed
-  `rowid`; compound affinity demotion reads hipp's resolved
+  the pin — hipp refuses it (`Unsupported`); compound affinity
+  demotion reads hipp's resolved
   expression shapes, not the pin's parse tree (they agree on
   the probed literal / column / CAST / function / CASE shapes).
   hipp cannot query `sqlite_schema` itself (another unit), so
@@ -437,6 +552,29 @@ the planner and the async step state machines (~8 KB)).
   foldable *expression* default reads the folded value; the
   pin's `OP_Column` would read NULL — reachable only with a
   foreign writer (ALTER refuses such defaults).
+- Review pass gaps: the UPDATE ... FROM "last combination" is
+  hipp's join order — with an equality join on an unindexed FROM
+  table the pin builds an automatic index and takes the
+  combination last in that index's (key, columns) order instead
+  (`s = (1,1),(1,9),(1,3)`: pin 9, hipp 3; SQLite calls the
+  choice arbitrary), so tests keep one matching row per target
+  or a cross join. REAL → TEXT digits are correctly rounded
+  where the pin's `sqlite3FpDecode` can differ in the 17th digit,
+  and the 15-or-17 choice uses hipp's model of the pin's text →
+  real conversion; on the 3.53.1 stand-in (whose conversion is
+  not the pin's, see `literal_bits_match_oracle_on_corpus`)
+  "random" doubles such as 664489.808985587 and 5e-324 render
+  differently, so the corpora use decimal-shaped values.
+  `-0x8000000000000000` is "hex literal too big" on the pin and
+  a REAL in hipp. AUTOINCREMENT tables cannot be created (no
+  `sqlite_sequence` upkeep), and hipp's INSERTs into a foreign
+  one do not advance its `sqlite_sequence` row (the pin then
+  takes max(rowid) + 1, so the file stays valid, but a rowid
+  hipp wrote and someone deleted can come back). A clock default is
+  evaluated when the statement is prepared, so re-stepping a
+  prepared statement reuses that instant (the pin reads it per
+  execution). The non-fallback keyword list was probed on the
+  stand-in (`CREATE TABLE t(a K)` for each of the 147 keywords).
 - Probed on the local 3.53.1 stand-in; STRICT (3.37) and
   generated columns (3.31) are long-stable, and nothing relied
   on is known to differ in 3.54.1. CI runs the real pin.

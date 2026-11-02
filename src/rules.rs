@@ -633,7 +633,9 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_) => false,
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => expr_any(a, f) || expr_any(b, f),
-        Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => expr_any(a, f),
+        Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
+            expr_any(a, f)
+        }
         #[cfg(feature = "v16")]
         Expr::Collate(a, _) => expr_any(a, f),
         Expr::InSubquery(a, _, _) => expr_any(a, f),
@@ -692,7 +694,7 @@ pub fn alter_default_ok<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
     fn ok(e: &Expr) -> bool {
         match e {
             Expr::Literal(_) => true,
-            Expr::Neg(a) | Expr::Cast(a, _) => ok(a),
+            Expr::Neg(a) | Expr::Pos(a) | Expr::Cast(a, _) => ok(a),
             _ => false,
         }
     }
@@ -705,11 +707,7 @@ pub fn alter_default_ok<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
 /// is `Error::NoClock` without a `Config::clock`. An unknown
 /// function or an aggregate errors here, when the default is
 /// needed — as on the pin.
-pub fn eval_default<E>(
-    text: &[u8],
-    arena: &Arena,
-    clock: Option<fn() -> i64>,
-) -> Result<OwnedValue, E> {
+pub fn eval_default<E>(text: &[u8], arena: &Arena, clock: &mut Clock) -> Result<OwnedValue, E> {
     let e = parse_rule::<E>(text, arena)?;
     let mut cols = AVec::new();
     for c in CTIME.iter() {
@@ -736,7 +734,7 @@ pub fn eval_default<E>(
     }
     let mut row = RowData::empty();
     if expr_refs_range(&r, &RefRange::below(CTIME.len(), 0)) {
-        let ms = clock.ok_or(Error::NoClock)?();
+        let ms = clock.read::<E>()?;
         for v in clock_values(ms) {
             row.vals.push(v);
         }
@@ -746,6 +744,34 @@ pub fn eval_default<E>(
         }
     }
     eval::<E>(&r, &Ctx::Row(&row))
+}
+
+/// One statement's view of the wall clock (v0.16): the
+/// `Config::clock` hook is called at most once, on first need, and
+/// every clock default the statement evaluates reads that same
+/// instant (the pin's one `sqlite3StmtCurrentTime` per statement —
+/// a row's CURRENT_DATE and CURRENT_TIME never straddle midnight).
+pub struct Clock {
+    now: Option<fn() -> i64>,
+    ms: Option<i64>,
+}
+
+impl Clock {
+    /// A clock that has not been read yet; `None` has no hook
+    /// (reading it is `Error::NoClock`).
+    pub fn new(now: Option<fn() -> i64>) -> Clock {
+        Clock { now, ms: None }
+    }
+
+    /// The statement's instant, Unix milliseconds.
+    pub fn read<E>(&mut self) -> Result<i64, E> {
+        if let Some(ms) = self.ms {
+            return Ok(ms);
+        }
+        let ms = self.now.ok_or(Error::NoClock)?();
+        self.ms = Some(ms);
+        Ok(ms)
+    }
 }
 
 /// CURRENT_TIME, CURRENT_DATE and CURRENT_TIMESTAMP for a Unix

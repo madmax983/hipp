@@ -1327,3 +1327,435 @@ fn update_checks_only_what_it_assigns() {
         assert_eq!(oracle_raw(&tw.hipp, q), oracle_raw(&tw.oracle, q), "{q}");
     }
 }
+
+// ---------------- review fixes (second pass) ----------------
+
+/// hipp and the oracle agree on whether a batch runs on a fresh
+/// database; whenever hipp runs it, the oracle loads hipp's file
+/// and passes `PRAGMA integrity_check` (before the fix hipp
+/// accepted, and stored verbatim, definitions the pin rejects —
+/// a schema the pin then refuses as "malformed").
+fn same_verdict(tag: &str, batch: &str) {
+    let h = common::temp_db(&format!("v16td-{tag}-h"));
+    let o = common::temp_db(&format!("v16td-{tag}-o"));
+    let got = block_on(async {
+        let mut db = open(&h).await;
+        for stmt in batch.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            try_collect(&mut db, stmt).await?;
+        }
+        Ok::<(), Error<FsError>>(())
+    });
+    let (ok, _) = oracle_raw(&o, batch);
+    assert_eq!(got.is_ok(), ok, "verdicts differ on {batch}\nhipp: {got:?}");
+    if ok {
+        assert_eq!(
+            oracle_raw(&h, "PRAGMA integrity_check;").1,
+            ["ok"],
+            "hipp file unreadable after {batch}"
+        );
+    }
+}
+
+#[test]
+fn malformed_definitions_are_refused_like_the_pin() {
+    let corpus = [
+        // The review's reproductions.
+        "CREATE TABLE t(a CHECK(a > 0) bar)",
+        "CREATE TABLE t(a, CHECK(a > 0) foo)",
+        "CREATE TABLE t(a, c DEFAULT abs(1))",
+        "CREATE TABLE t(a DEFAULT cast('5' AS integer))",
+        "CREATE TABLE t(a DEFAULT foo bar)",
+        "CREATE TABLE t(a DEFAULT \"x\" y)",
+        "CREATE TABLE t(a DEFAULT - - 1)",
+        "CREATE TABLE t(a DEFAULT (1)(2))",
+        "CREATE TABLE t(b DEFAULT current_timestamp foo)",
+        "CREATE TABLE t(b DEFAULT current_timestamp(1))",
+        "CREATE TABLE t(b DEFAULT \"x\"(1))",
+        "CREATE TABLE t(b DEFAULT 1 COLLATE)",
+        "CREATE TABLE t(b DEFAULT x.y)",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1); ALTER TABLE t ADD COLUMN b DEFAULT abs(-1)",
+        // The same pattern elsewhere in the column grammar.
+        "CREATE TABLE t(a INT PRIMARY KEY foo)",
+        "CREATE TABLE t(a VARCHAR(10) foo)",
+        "CREATE TABLE t(a VARCHAR(10, 20, 30))",
+        "CREATE TABLE t(a INT SELECT)",
+        "CREATE TABLE t(a DEFAULT SELECT)",
+        "CREATE TABLE t(a REFERENCES p(x) foo)",
+        "CREATE TABLE t(a REFERENCES p ON DELETE NO)",
+        "CREATE TABLE t(a ON CONFLICT IGNORE)",
+        "CREATE TABLE t(a UNIQUE ON CONFLICT)",
+        "CREATE TABLE t(a CHECK(a) ON CONFLICT IGNORE)",
+        "CREATE TABLE t(a, PRIMARY KEY (a) foo)",
+        "CREATE TABLE t(a, UNIQUE (a AUTOINCREMENT))",
+        "CREATE TABLE t(a, FOREIGN KEY (a))",
+        "CREATE TABLE t(a, CHECK(a > 0), b)",
+        "CREATE TABLE t(a, CONSTRAINT c, b)",
+        "CREATE TABLE t(a, INDEX (a))",
+        "CREATE TABLE t(a, key INT); INSERT INTO t VALUES (1, 2)",
+        "CREATE TABLE t(a PRIMARY KEY PRIMARY KEY)",
+        "CREATE TABLE t(a, b, UNIQUE (a) PRIMARY KEY (b) CHECK (a < b))",
+        // Accepted forms stay accepted, and load on the pin.
+        "CREATE TABLE t(a CHECK(a > 0) CHECK(a < 9), b, CHECK(b > 0) CHECK(b < 9))",
+        "CREATE TABLE t(a DEFAULT 1 DEFAULT 2, b NULL NOT NULL DEFAULT 0, c DEFAULT key)",
+        "CREATE TABLE t(a 'text' \"int\" [x] `y`, b VARCHAR(-10, +20.5), c DOUBLE PRECISION(10))",
+        "CREATE TABLE t(a GENERATED ALWAYS (1), b GENERATED AS (a))",
+        "CREATE TABLE p(id); CREATE TABLE t(a REFERENCES p (id) ON DELETE CASCADE \
+         ON UPDATE SET NULL MATCH FULL NOT DEFERRABLE INITIALLY IMMEDIATE, b DEFERRABLE, \
+         CONSTRAINT f FOREIGN KEY (a, b) REFERENCES p ON DELETE SET DEFAULT \
+         DEFERRABLE INITIALLY DEFERRED, CONSTRAINT lone)",
+        "CREATE TABLE t(a, b, PRIMARY KEY (a DESC, b) ON CONFLICT FAIL UNIQUE (b), \
+         CHECK (a > b) ON CONFLICT ROLLBACK)",
+        "CREATE TABLE t(a DEFAULT 0x10, b DEFAULT -0x10, c DEFAULT +NULL, d DEFAULT indexed, \
+         e DEFAULT -current_time, f DEFAULT -'3')",
+    ];
+    for (i, sql) in corpus.iter().enumerate() {
+        same_verdict(&format!("gram-{i}"), sql);
+    }
+}
+
+#[test]
+fn prng_definition_grammar_corpus() {
+    // Random column definitions from valid and malformed clause
+    // fragments: the verdicts agree, and every accepted schema
+    // loads on the pin.
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut rnd = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let types = [
+        "",
+        "INT",
+        "INTEGER",
+        "TEXT",
+        "VARCHAR(10)",
+        "DECIMAL(10, 2)",
+        "\"odd type\"",
+        "KEY",
+    ];
+    let frags = [
+        "NOT NULL",
+        "NULL",
+        "UNIQUE",
+        "PRIMARY KEY",
+        "PRIMARY KEY DESC",
+        "DEFAULT 1",
+        "DEFAULT -1.5",
+        "DEFAULT (1+2)",
+        "DEFAULT abs(1)",
+        "DEFAULT 'x'",
+        "DEFAULT hello",
+        "DEFAULT - - 1",
+        "CHECK(# > 0)",
+        "CHECK(# > 0) x",
+        "COLLATE NOCASE",
+        "COLLATE",
+        "REFERENCES p",
+        "REFERENCES p(id) ON DELETE CASCADE",
+        "REFERENCES p MATCH",
+        "ON CONFLICT IGNORE",
+        "UNIQUE ON CONFLICT REPLACE",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "NOT DEFERRABLE",
+        "AS (1)",
+        "GENERATED ALWAYS AS (2) STORED",
+        "CONSTRAINT c",
+        "CONSTRAINT",
+        "foo",
+        "(1)",
+        "DEFAULT",
+        "DEFAULT CURRENT_TIME",
+        "DEFAULT x.y",
+        "NOT",
+    ];
+    let tcons = [
+        "PRIMARY KEY (a)",
+        "UNIQUE (a, b)",
+        "UNIQUE (a) UNIQUE (b)",
+        "CHECK (b < 5)",
+        "CHECK (b < 5) ON CONFLICT FAIL",
+        "FOREIGN KEY (a) REFERENCES p",
+        "CONSTRAINT k UNIQUE (b)",
+        "PRIMARY KEY (a) foo",
+        "UNIQUE a",
+        "FOREIGN KEY (a)",
+        "CONSTRAINT z",
+    ];
+    let pick = |r: u64, xs: &[&'static str]| xs[(r % xs.len() as u64) as usize];
+    for case in 0..120 {
+        let mut items = Vec::new();
+        for name in ["a", "b"] {
+            let mut d = name.to_string();
+            if rnd() % 3 != 0 {
+                d.push(' ');
+                d.push_str(pick(rnd(), &types));
+            }
+            for _ in 0..rnd() % 3 {
+                d.push(' ');
+                d.push_str(&pick(rnd(), &frags).replace('#', name));
+            }
+            items.push(d);
+        }
+        if rnd() % 2 == 0 {
+            items.push(pick(rnd(), &tcons).to_string());
+        }
+        if rnd() % 4 == 0 {
+            items.push("c".to_string());
+        }
+        let sql = format!("CREATE TABLE p(id); CREATE TABLE t({})", items.join(", "));
+        same_verdict(&format!("gram-prng-{case}"), &sql);
+    }
+}
+
+#[test]
+fn repeated_constraint_sets_share_one_autoindex() {
+    // A UNIQUE / PRIMARY KEY set repeating an earlier one (sort
+    // order aside) gets no index of its own — hipp used to write a
+    // second autoindex, which the pin reports as an orphan index.
+    let setup = "CREATE TABLE t(a PRIMARY KEY UNIQUE, b UNIQUE, UNIQUE (b DESC), \
+                 UNIQUE (b COLLATE NOCASE), UNIQUE (a, b), UNIQUE (b, a), UNIQUE (a));\
+                 CREATE TABLE u(a UNIQUE, b, PRIMARY KEY (a));\
+                 CREATE TABLE w(a INTEGER PRIMARY KEY UNIQUE)";
+    let tw = twins("autoidx", setup);
+    tw.all(&[
+        "INSERT INTO t VALUES (1, 'x'), (2, 'y')",
+        "INSERT INTO u VALUES (1, 1)",
+        "INSERT INTO w VALUES (5)",
+    ]);
+    tw.refuse("INSERT INTO t VALUES (1, 'z')", SchemaKind::UniqueViolation);
+    tw.refuse("INSERT INTO t VALUES (3, 'X')", SchemaKind::UniqueViolation);
+    tw.refuse("INSERT INTO u VALUES (1, 2)", SchemaKind::UniqueViolation);
+    tw.refuse("INSERT INTO w VALUES (5)", SchemaKind::UniqueViolation);
+    tw.finish("SELECT * FROM t ORDER BY a");
+    let q = "SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name";
+    assert_eq!(oracle_raw(&tw.hipp, q), oracle_raw(&tw.oracle, q));
+}
+
+#[test]
+fn main_qualifier_is_left_out_of_the_schema_text() {
+    let tw = twins(
+        "mainq",
+        "CREATE TABLE main.t(a INT);\
+         CREATE TABLE IF NOT EXISTS \"main\" . u(b);\
+         CREATE UNIQUE INDEX main.i ON t(a);\
+         CREATE VIEW MAIN.v AS SELECT a FROM t",
+    );
+    tw.all(&["INSERT INTO main.t VALUES (1)", "SELECT * FROM t"]);
+    tw.refuse_any("CREATE INDEX j ON main.t(a)");
+    tw.refuse_any("CREATE TABLE foo.x(a)");
+    tw.finish("SELECT * FROM t");
+    let q = "SELECT type, name, sql FROM sqlite_schema ORDER BY name";
+    assert_eq!(oracle_raw(&tw.hipp, q), oracle_raw(&tw.oracle, q));
+}
+
+#[test]
+fn unary_plus_drops_affinity() {
+    // `+x` has no affinity on the pin (hipp's parser used to drop
+    // the `+`, so `+a = '1'` converted '1' and matched).
+    let tw = twins(
+        "uplus",
+        "CREATE TABLE s(a INT, b TEXT, c TEXT COLLATE NOCASE, d);\
+         INSERT INTO s VALUES (1, '1', 'X', 2), (2, '2.0', 'y', '2')",
+    );
+    tw.all(&[
+        "SELECT count(*) FROM s WHERE +a = '1'",
+        "SELECT count(*) FROM s WHERE a = '1'",
+        "SELECT a, +b = 1, b = 1, +c = 'x', '2' = +d, +a IN ('1', 2) FROM s ORDER BY a",
+        "SELECT a FROM s WHERE +b = 2.0",
+        "SELECT +a, -+a, +-a, +(a), +'x', typeof(+b) FROM s ORDER BY 1",
+        "SELECT a FROM s ORDER BY +1",
+        "SELECT +a FROM s GROUP BY +a HAVING +a > 1",
+        "SELECT \"+a\" FROM (SELECT +a FROM s) WHERE \"+a\" = '1'",
+        "SELECT x FROM (SELECT +a AS x FROM s) WHERE x = '1'",
+    ]);
+}
+
+#[cfg(feature = "v16")]
+#[test]
+fn create_table_as_select_names_follow_resolution() {
+    // The pin names CTAS columns over the resolved list: `+a` is
+    // an expression (`"+a"`, no affinity), `(a)` is the column,
+    // and a column reference takes the table's spelling (`A` and
+    // `S.B` are `a` and `b`); an explicit alias is kept as written.
+    ctas(
+        "names2",
+        "CREATE TABLE s(a INT, b TEXT, id INTEGER PRIMARY KEY);\
+         INSERT INTO s VALUES (1, 'x', 5)",
+        &[
+            "CREATE TABLE t1 AS SELECT +a, +b, (a), ((b)) FROM s",
+            "CREATE TABLE t2 AS SELECT a, A FROM s",
+            "CREATE TABLE t3 AS SELECT A, S.B, ID, Rowid, oid AS OID, a AS A, b COLLATE NOCASE FROM s",
+            "CREATE TABLE t4 AS SELECT X, Y FROM (SELECT a AS x, b y FROM s)",
+            "SELECT typeof(\"+a\"), typeof(a), \"+b\" FROM t1",
+            "SELECT * FROM t3",
+        ],
+        "SELECT * FROM t1",
+    );
+}
+
+#[test]
+fn minimum_integer_literal_through_rules() {
+    // `-9223372036854775808` is the INTEGER i64::MIN on the pin;
+    // hipp evaluated it as a REAL and stored that through
+    // DEFAULT, generated columns, CHECK and ALTER.
+    let tw = twins(
+        "i64min",
+        "CREATE TABLE t(a, b DEFAULT -9223372036854775808, c DEFAULT (-9223372036854775808), \
+         d AS (-9223372036854775808), e CHECK(e = -9223372036854775808), \
+         f AS (-(9223372036854775808)) STORED)",
+    );
+    tw.all(&[
+        "INSERT INTO t(a, e) VALUES (1, -9223372036854775808)",
+        "ALTER TABLE t ADD COLUMN g DEFAULT -9223372036854775808",
+        "SELECT b, typeof(b), c, typeof(c), d, typeof(d), e, typeof(e), f, typeof(f), g, typeof(g) FROM t",
+        "SELECT -9223372036854775808, - 9223372036854775808, -(9223372036854775808), \
+         -+9223372036854775808, typeof(- -9223372036854775808), typeof(-9223372036854775809), \
+         typeof(-9223372036854775808.0)",
+    ]);
+    tw.refuse(
+        "INSERT INTO t(a, e) VALUES (2, -9223372036854775807)",
+        SchemaKind::CheckViolation,
+    );
+    tw.finish("SELECT rowid, a, b, c, e, g FROM t");
+}
+
+#[test]
+fn stored_values_match_the_pins_evaluator() {
+    // Values the evaluator computes now land on disk (STORED
+    // generated columns, expression DEFAULTs, TEXT affinity), so
+    // its divergences became file divergences: `||` over a blob is
+    // TEXT, abs(i64::MIN) is "integer overflow", abs() of TEXT is
+    // REAL, and REAL-to-TEXT uses the pin's `%!.17g` layout.
+    let tw = twins(
+        "evalstore",
+        "CREATE TABLE t(a, c, d AS (c || a) STORED, e DEFAULT (x'41' || x'42'), \
+         f TEXT, g AS (a || '') STORED, h AS (abs(c)) STORED)",
+    );
+    tw.all(&[
+        "INSERT INTO t(a, c, f) VALUES (3.5, x'01', 1e20), (1e-5, '-2', 1e16), \
+         (1e17, 'z', 0.0001), (-2.5e-300, 4, 123456.75), (100.0, -3.5, -0.0)",
+        "SELECT typeof(d), hex(d), typeof(e), e, f, typeof(f), g, h, typeof(h) FROM t",
+        "SELECT x'41' || x'42', typeof(x'01' || 1), typeof('' || x'')",
+        "SELECT 1e20 || '', 1e15 || '', 1e16 || '', 1e17 || '', 1.5e-7 || '', 0.0001 || '', \
+         CAST(-2.5e30 AS TEXT), 1e100 || '', 1.7976931348623157e308 || '', (0.1 + 0.2) || ''",
+        "SELECT abs('5'), typeof(abs('-2.5')), abs(x'35'), abs('abc'), abs(-3), \
+         abs(-9223372036854775807)",
+    ]);
+    tw.refuse(
+        "SELECT abs(-9223372036854775808)",
+        SchemaKind::IntegerOverflow,
+    );
+    tw.refuse(
+        "INSERT INTO t(a, c) VALUES (1, -9223372036854775808)",
+        SchemaKind::IntegerOverflow,
+    );
+    tw.finish("SELECT rowid, typeof(d), hex(d), hex(e), hex(f), hex(g), h FROM t");
+}
+
+#[test]
+fn alter_add_column_on_an_empty_table() {
+    // The pin refuses these only when the table has rows
+    // (`sqlite3ErrorIfNotEmpty`); hipp refused them always.
+    let tw = twins("alter-empty", "CREATE TABLE t(a); CREATE TABLE f(a)");
+    tw.all(&[
+        "ALTER TABLE t ADD COLUMN b DEFAULT (1 + 2)",
+        "ALTER TABLE t ADD COLUMN c DEFAULT (abs(-3))",
+        "ALTER TABLE t ADD COLUMN d NOT NULL",
+        "ALTER TABLE t ADD COLUMN e NOT NULL DEFAULT NULL",
+        "ALTER TABLE t ADD COLUMN g AS (a * 2) STORED",
+        "INSERT INTO t(a, d, e) VALUES (5, 'd', 'e')",
+        "SELECT * FROM t",
+        "INSERT INTO f VALUES (1)",
+    ]);
+    for sql in [
+        "ALTER TABLE f ADD COLUMN b DEFAULT (1 + 2)",
+        "ALTER TABLE f ADD COLUMN d NOT NULL",
+        "ALTER TABLE f ADD COLUMN g AS (a * 2) STORED",
+        "ALTER TABLE t ADD COLUMN h DEFAULT (2 * 2)",
+    ] {
+        tw.refuse(sql, SchemaKind::CannotAddColumn);
+    }
+    tw.finish("SELECT rowid, * FROM t");
+    let q = "SELECT sql FROM sqlite_schema ORDER BY name";
+    assert_eq!(oracle_raw(&tw.hipp, q), oracle_raw(&tw.oracle, q));
+}
+
+std::thread_local! {
+    static TICKS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn clock_is_read_once_per_statement() {
+    // A clock advancing one second per call, starting one second
+    // before midnight: one statement's CURRENT_DATE, CURRENT_TIME
+    // and CURRENT_TIMESTAMP — over every row — share one instant
+    // (the clock used to be read per column, so a row could say
+    // 1970-01-01 and 00:00:00 at once).
+    let path = common::temp_db("v16td-clock-once");
+    let rows = block_on(async {
+        TICKS.with(|c| c.set(0));
+        let clock: fn() -> i64 = || {
+            TICKS.with(|c| {
+                let n = c.get();
+                c.set(n + 1);
+                86_399_000 + n * 1000
+            })
+        };
+        let mut db = open_with(&path, Config::default().clock(clock)).await;
+        exec(
+            &mut db,
+            "CREATE TABLE t(a, d DEFAULT CURRENT_DATE, t DEFAULT CURRENT_TIME, \
+             s DEFAULT CURRENT_TIMESTAMP)",
+        )
+        .await;
+        exec(&mut db, "INSERT INTO t(a) VALUES (1), (2)").await;
+        exec(&mut db, "INSERT INTO t(a) VALUES (3)").await;
+        try_collect(&mut db, "SELECT a, d, t, s FROM t")
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        rows,
+        [
+            "1|1970-01-01|23:59:59|1970-01-01 23:59:59",
+            "2|1970-01-01|23:59:59|1970-01-01 23:59:59",
+            "3|1970-01-02|00:00:00|1970-01-02 00:00:00",
+        ]
+    );
+    assert_eq!(TICKS.with(|c| c.get()), 2, "one clock read per statement");
+}
+
+#[test]
+fn autoincrement_is_refused_at_create_and_read_from_foreign_files() {
+    // hipp keeps no `sqlite_sequence`; a table it created with
+    // AUTOINCREMENT made the pin's next INSERT report "database
+    // disk image is malformed". CREATE refuses the clause; a file
+    // the pin wrote (sqlite_sequence included) still loads, and
+    // hipp's writes keep it valid.
+    let h = common::temp_db("v16td-autoinc-h");
+    for sql in [
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b)",
+        "CREATE TABLE t(a INTEGER, b, PRIMARY KEY (a AUTOINCREMENT))",
+    ] {
+        let r = block_on(async {
+            let mut db = open(&h).await;
+            try_collect(&mut db, sql).await
+        });
+        assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
+    }
+    let o = common::temp_db("v16td-autoinc-o");
+    common::cli(
+        &o,
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b); INSERT INTO t(b) VALUES ('x');",
+    );
+    let rows = block_on(async {
+        let mut db = open(&o).await;
+        exec(&mut db, "INSERT INTO t(b) VALUES ('y')").await;
+        try_collect(&mut db, "SELECT a, b FROM t").await.unwrap()
+    });
+    assert_eq!(rows, ["1|x", "2|y"]);
+    assert_eq!(oracle_raw(&o, "PRAGMA integrity_check;").1, ["ok"]);
+    assert!(oracle_raw(&o, "INSERT INTO t(b) VALUES ('z');").0);
+}

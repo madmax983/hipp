@@ -389,7 +389,11 @@ pub async fn build_catalog<S: Storage>(
             #[cfg(feature = "v04")]
             if let Some(h) = c.default_expr {
                 let text = handle_bytes(&scratch, h);
-                match crate::rules::eval_default::<S::Error>(text, &scratch, None) {
+                match crate::rules::eval_default::<S::Error>(
+                    text,
+                    &scratch,
+                    &mut crate::rules::Clock::new(None),
+                ) {
                     Ok(v) => default = Some(owned_literal(catalog_arena, &v)?),
                     Err(_) => default_expr = Some(intern(catalog_arena, text)?),
                 }
@@ -706,8 +710,17 @@ fn derive_view_columns(
             crate::sql::SelectItem::Expr(e, alias, text) => {
                 let name: &[u8] = if let Some(a) = alias {
                     handle_bytes(scratch, *a)
-                } else if let crate::sql::Expr::Column { name, .. } = e {
-                    handle_bytes(scratch, *name)
+                } else if let crate::sql::Expr::Column { table, name } = e {
+                    // v0.16: the referenced column's own spelling
+                    // (the pin names `SELECT A FROM s` column `a`).
+                    let nb = handle_bytes(scratch, *name);
+                    let qb = table.map(|q| handle_bytes(scratch, q));
+                    sources
+                        .iter()
+                        .filter(|(q, _)| qb.is_none_or(|qb| eq_ci(q.as_slice(), qb)))
+                        .flat_map(|(_, cols)| cols.iter())
+                        .find(|c| eq_ci(c.as_slice(), nb))
+                        .map_or(nb, |c| c.as_slice())
                 } else {
                     handle_bytes(scratch, *text)
                 };

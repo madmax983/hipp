@@ -139,6 +139,13 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// Unary minus.
     Neg(Box<Expr>),
+    /// Unary plus over a non-literal operand (v0.16): the
+    /// operand's value with *no* affinity (the pin's `TK_UPLUS`;
+    /// `+a = '1'` compares without converting, and a
+    /// CREATE TABLE ... AS SELECT column `+a` is named `"+a"`
+    /// and typed by no affinity). Its collation is the operand's.
+    /// A sign over a literal folds into the literal instead.
+    Pos(Box<Expr>),
     /// Logical NOT.
     Not(Box<Expr>),
     IsNull(Box<Expr>, bool),
