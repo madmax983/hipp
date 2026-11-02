@@ -47,6 +47,18 @@ pub enum Tok {
     /// gives it (see `ParamTable`) and the token's own text.
     #[cfg(feature = "params")]
     Param(u16, ABytes),
+    /// The bitwise operators `&`, `|`, `<<`, `>>` and `~`
+    /// (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    BitAnd,
+    #[cfg(feature = "v16")]
+    BitOr,
+    #[cfg(feature = "v16")]
+    Shl,
+    #[cfg(feature = "v16")]
+    Shr,
+    #[cfg(feature = "v16")]
+    BitNot,
     Eof,
 }
 
@@ -620,6 +632,119 @@ fn big_rational_to_f64(p: &BigUint, q: &BigUint) -> f64 {
     }
 }
 
+/// Lex one numeric literal at the start of `z` (the pin's
+/// tokenizer, `CC_DIGIT`): returns the token and its length.
+///
+/// - `0x` / `0X` followed by a hex digit is a hexadecimal
+///   integer: leading zeros are skipped and up to 16
+///   significant digits are read as a 64-bit two's-complement
+///   value (`0xffffffffffffffff` is -1); more is the pin's
+///   "hex literal too big" (v0.16 fix: hipp refused anything
+///   past `0x7fffffffffffffff`).
+/// - Otherwise digits, an optional `.` fraction and an
+///   optional exponent (`e` / `E`, optional sign, at least one
+///   digit) — `1e` is not an exponent.
+/// - With the evaluator (v0.16 fix; `v04`): a `_` digit
+///   separator is allowed between two digits (hex digits in a
+///   hex literal), as in SQLite 3.46+, and a literal followed
+///   directly by an identifier character is the pin's
+///   "unrecognized token" (`1_000` used to lex as `1` aliased
+///   `_000`; `1a` as `1` aliased `a`). The tiny profile has
+///   no position where either reading is accepted, so it keeps
+///   the shorter scan.
+#[cfg(feature = "v04")]
+fn number_at<E>(z: &[u8], off: usize) -> core::result::Result<(Tok, usize), Error<E>> {
+    let at = |k: usize| z.get(k).copied().unwrap_or(0);
+    let sep = |c: u8| cfg!(feature = "v04") && c == b'_';
+    let mut i;
+    let hex = at(0) == b'0' && matches!(at(1), b'x' | b'X') && hex_val(at(2)).is_some();
+    if hex {
+        i = 2;
+        while hex_val(at(i)).is_some() || sep(at(i)) {
+            i += 1;
+        }
+    } else {
+        i = 0;
+        while at(i).is_ascii_digit() || sep(at(i)) {
+            i += 1;
+        }
+        if at(i) == b'.' {
+            i += 1;
+            while at(i).is_ascii_digit() || sep(at(i)) {
+                i += 1;
+            }
+        }
+        if matches!(at(i), b'e' | b'E')
+            && (at(i + 1).is_ascii_digit()
+                || (matches!(at(i + 1), b'+' | b'-') && at(i + 2).is_ascii_digit()))
+        {
+            i += 2;
+            while at(i).is_ascii_digit() || sep(at(i)) {
+                i += 1;
+            }
+        }
+    }
+    let text = z.get(..i).unwrap_or(&[]);
+    #[cfg(feature = "v04")]
+    {
+        if is_ident_char(at(i)) {
+            return Err(perr(off, ParseKind::InvalidLiteral));
+        }
+        if text.contains(&b'_') {
+            // Every separator sits between two digits (hex
+            // digits in a hex literal); the digits are then read
+            // without them.
+            let mut buf: AVec<u8> = AVec::new();
+            for (k, &c) in text.iter().enumerate() {
+                if c != b'_' {
+                    buf.push(c);
+                    continue;
+                }
+                let ok = |d: u8| {
+                    if hex {
+                        hex_val(d).is_some()
+                    } else {
+                        d.is_ascii_digit()
+                    }
+                };
+                let prev = k.checked_sub(1).map_or(0, at);
+                if !ok(prev) || !ok(at(k + 1)) {
+                    return Err(perr(off, ParseKind::InvalidLiteral));
+                }
+            }
+            let tok = if hex {
+                hex_token::<E>(buf.as_slice(), off)?
+            } else {
+                number_token::<E>(buf.as_slice(), off)?
+            };
+            return Ok((tok, i));
+        }
+    }
+    let tok = if hex {
+        hex_token::<E>(text, off)?
+    } else {
+        number_token::<E>(text, off)?
+    };
+    Ok((tok, i))
+}
+
+/// The value of a hexadecimal literal `0x<digits>` (v0.16): the
+/// pin's `sqlite3DecOrHexToI64` — leading zeros skipped, at most
+/// 16 significant digits, read as two's complement.
+#[cfg(feature = "v04")]
+fn hex_token<E>(text: &[u8], off: usize) -> core::result::Result<Tok, Error<E>> {
+    let mut v: u64 = 0;
+    for &c in text.get(2..).unwrap_or(&[]) {
+        // A 17th significant digit overflows: "hex literal too
+        // big" (leading zeros never do).
+        if v >> 60 != 0 {
+            return Err(perr(off, ParseKind::HexLiteralTooBig));
+        }
+        v = (v << 4) | u64::from(hex_val(c).unwrap_or(0));
+    }
+    Ok(Tok::Integer(v as i64))
+}
+
 /// An integer literal that overflowed i64 becomes a real (SQLite's
 /// rule). Returns Integer when it fits.
 fn number_token<E>(text: &[u8], offset: usize) -> core::result::Result<Tok, Error<E>> {
@@ -723,6 +848,26 @@ fn lex_inner<E>(
             b'=' => {
                 toks.push(Token {
                     tok: Tok::Eq,
+                    offset: off,
+                });
+                i += 1;
+            }
+            #[cfg(feature = "v16")]
+            b'<' | b'>' if sql.get(i + 1) == Some(&b) => {
+                toks.push(Token {
+                    tok: if b == b'<' { Tok::Shl } else { Tok::Shr },
+                    offset: off,
+                });
+                i += 2;
+            }
+            #[cfg(feature = "v16")]
+            b'&' | b'~' | b'|' if !(b == b'|' && sql.get(i + 1) == Some(&b'|')) => {
+                toks.push(Token {
+                    tok: match b {
+                        b'&' => Tok::BitAnd,
+                        b'|' => Tok::BitOr,
+                        _ => Tok::BitNot,
+                    },
                     offset: off,
                 });
                 i += 1;
@@ -922,6 +1067,11 @@ fn lex_inner<E>(
                     offset: off,
                 });
             }
+            // The tiny profile's number scan: hex up to
+            // 0x7fffffffffffffff, refused beyond (the evaluator's
+            // `number_at` reads all 16 digits, digit separators
+            // and the pin's trailing-character rule).
+            #[cfg(not(feature = "v04"))]
             b'0'..=b'9' | b'.' => {
                 // Number (b'.' only reaches here before a digit).
                 if b == b'0' && i + 1 < n && (sql[i + 1] == b'x' || sql[i + 1] == b'X') {
@@ -930,7 +1080,7 @@ fn lex_inner<E>(
                     let mut any = false;
                     while i < n && hex_val(sql[i]).is_some() {
                         any = true;
-                        let d = i64::from(hex_val(sql[i]).expect("checked"));
+                        let d = i64::from(hex_val(sql[i]).unwrap_or(0));
                         v = v
                             .checked_mul(16)
                             .and_then(|x| x.checked_add(d))
@@ -970,6 +1120,13 @@ fn lex_inner<E>(
                 }
                 let tok = number_token::<E>(&sql[start..i], off)?;
                 toks.push(Token { tok, offset: off });
+            }
+            #[cfg(feature = "v04")]
+            b'0'..=b'9' | b'.' => {
+                // Number (b'.' only reaches here before a digit).
+                let (tok, len) = number_at::<E>(sql.get(i..).unwrap_or(&[]), off)?;
+                toks.push(Token { tok, offset: off });
+                i += len;
             }
             #[cfg(feature = "params")]
             b'?' | b':' | b'@' | b'$' | b'#' => {

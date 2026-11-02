@@ -141,6 +141,32 @@ aspirations.
   `t` is a no-op before its SELECT is resolved, and hipp-cli
   prints `-0.0` as `0.0` and an exact half at the 16th digit
   rounded up, as the pin does.
+- **Expression operators, literals and row values.** Ungated
+  fixes to claimed v0.4 / v0.6 paths: the pin's precedence
+  (`<` `<=` `>` `>=` bind tighter than `=` / IS / IN / LIKE /
+  BETWEEN — `3 = 2 < 3` was 1 — and a postfix ISNULL / IN (...)
+  result takes tighter operators, `x ISNULL + 1`); `x IS [NOT]
+  TRUE / FALSE` as the pin's truth test (`2 IS TRUE` was 0); hex
+  literals read as 16-digit two's complement
+  (`0xffffffffffffffff` = -1) with the pin's "hex literal too
+  big" (also for `-0x8000000000000000`); `1_000` digit
+  separators and a literal glued to an identifier (`1a`,
+  refused) — `1_000` used to read as `1` aliased `_000`; an
+  aggregate inside a subquery whose arguments name only an
+  enclosing query's columns belongs to that query (`SELECT
+  (SELECT max(t.a) FROM u) FROM t` is one row, as on the pin;
+  in that query's WHERE it is "misuse of aggregate"); an
+  aggregate in ORDER BY alone no longer aggregates the query;
+  a qualifier naming an inner source that lacks the column
+  falls through to the outer scopes. Behind `v16`: `&` `|`
+  `<<` `>>` `~` with the pin's integer coercion and shift
+  rules, `IS [NOT] DISTINCT FROM`, postfix `NOT NULL`, and row
+  values — `(a, b) = / <> / < / <= / > / >= / IS (c, d)`,
+  BETWEEN, `IN ((..), (..))` (the pin's VALUES rewrite),
+  `IN (SELECT a, b ...)`, CASE, multi-column scalar subqueries,
+  `UPDATE ... SET (a, b) = (..)` / `= (SELECT ..)` (also in
+  upsert), with the pin's errors for size mismatches and row
+  values anywhere else. The tiny profile did not grow.
 
 ## What v0.13 does
 

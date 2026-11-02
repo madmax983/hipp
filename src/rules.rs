@@ -639,7 +639,9 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
             expr_any(a, f)
         }
         #[cfg(feature = "v16")]
-        Expr::Collate(a, _) => expr_any(a, f),
+        Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => expr_any(a, f),
+        #[cfg(feature = "v16")]
+        Expr::Vector(l) => l.iter().any(|x| expr_any(x, f)),
         Expr::InSubquery(a, _, _) => expr_any(a, f),
         Expr::InList(a, l, _) => expr_any(a, f) || l.iter().any(|x| expr_any(x, f)),
         Expr::Between(a, b, c, _) => expr_any(a, f) || expr_any(b, f) || expr_any(c, f),

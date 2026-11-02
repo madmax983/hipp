@@ -101,6 +101,16 @@ pub enum ScalarFn {
     /// `glob(pattern, subject)` (v0.16, `v16`).
     #[cfg(feature = "v16")]
     Glob,
+    /// `~x` (v0.16, `v16`): bitwise NOT of the operand's
+    /// integer value.
+    #[cfg(feature = "v16")]
+    BitNot,
+    /// A row value's elements (v0.16, `v16`): only ever the left
+    /// operand or an item of an `InList` (a row-value IN test),
+    /// which evaluates it element by element; on its own it is
+    /// `SchemaKind::RowValueMisused`.
+    #[cfg(feature = "v16")]
+    Vector,
 }
 
 /// A resolved expression: column references are flat slot indices
@@ -172,6 +182,17 @@ pub enum RExpr {
         distinct: bool,
         star: bool,
         args: AVec<RExpr>,
+        /// Which query the aggregate belongs to (v0.16 fix,
+        /// ungated): 0 is the query whose expression holds it;
+        /// `n` is the query `n` subquery levels out. The pin
+        /// gives an aggregate to the innermost query whose FROM
+        /// sources its arguments reference (`SELECT (SELECT
+        /// max(t.a) FROM u) FROM t` aggregates over t, one row);
+        /// arguments referencing no column keep it local. The
+        /// owner folds it per group and substitutes the value
+        /// into the subquery before executing it (see
+        /// `visit_aggs`, `session::eval_group_sub`).
+        lvl: u8,
     },
     /// ORDER BY reference to an output column (0-based).
     OutRef(usize),
@@ -439,6 +460,12 @@ pub struct SubPlan {
     /// `UPDATE t SET a = (SELECT sum(a) FROM t)` yields the
     /// pre-statement sum on every row).
     pub uncorrelated: bool,
+    /// The result column a scalar subquery yields (v0.16): 0,
+    /// except for the parts of a multi-column scalar subquery
+    /// used as a row value (`(SELECT a, b) = (1, 2)`, `SET (a,
+    /// b) = (SELECT ...)`), where part `i` is a copy of the plan
+    /// yielding column `i` of the first row.
+    pub scalar_col: usize,
 }
 
 impl SubPlan {
@@ -579,7 +606,7 @@ pub enum SubValue {
 /// a rowid reference, or a CAST keeps its affinity; every
 /// other expression shape has none.
 pub fn result_affinity(plan: &SubPlan) -> Option<Affinity> {
-    match plan.items.as_slice().first() {
+    match plan.items.as_slice().get(plan.scalar_col) {
         Some(r) => item_result_affinity(r),
         None => None,
     }
@@ -646,11 +673,10 @@ pub(crate) fn resolve_column_in_group<E>(
                 return Some(Ok(RExpr::Rowid(group.first_src + si)));
             }
             // The qualifier matched but the column does not
-            // exist: SQLite calls this "no such column" at
-            // prepare time, in this scope.
-            return Some(Err(Error::Schema {
-                kind: SchemaKind::UnknownColumn,
-            }));
+            // exist here: the pin's `lookupName` goes on to the
+            // enclosing scopes (v0.16 fix: `SELECT (SELECT
+            // max(t.a) FROM u AS t) FROM t` reads the outer t.a;
+            // hipp answered "no such column").
         }
         return None;
     }
@@ -1052,6 +1078,21 @@ pub fn resolve_scoped<E>(
             table.map(|h| handle_bytes(arena, h)),
             handle_bytes(arena, *name),
         )?,
+        #[cfg(feature = "v16")]
+        Expr::InSubquery(x, stmt, neg) if is_row(x) => {
+            let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let plan = planner(stmt, cur, enclosing)?;
+            if plan.width() != xp.len() {
+                return Err(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                });
+            }
+            RExpr::InSub(
+                Box::new(RExpr::Scalar(ScalarFn::Vector, xp)),
+                Box::new(plan),
+                *neg,
+            )
+        }
         Expr::InSubquery(x, stmt, neg) => {
             let xr = resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?;
             let plan = planner(stmt, cur, enclosing)?;
@@ -1070,6 +1111,111 @@ pub fn resolve_scoped<E>(
                 });
             }
             RExpr::SubScalar(Box::new(first_row_limit(plan)))
+        }
+        #[cfg(feature = "v16")]
+        Expr::BitNot(e) => {
+            let mut args = AVec::new();
+            args.push(resolve_scoped::<E>(
+                e,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?);
+            RExpr::Scalar(ScalarFn::BitNot, args)
+        }
+        // A row value anywhere but a comparison operand.
+        #[cfg(feature = "v16")]
+        Expr::Vector(_) => return Err(row_misused()),
+        #[cfg(feature = "v16")]
+        Expr::RowItem(e, i, n) => {
+            let parts = resolve_row::<E>(e, arena, cur, enclosing, &mut *planner)?;
+            if parts.len() != usize::from(*n) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                });
+            }
+            parts
+                .as_slice()
+                .get(usize::from(*i))
+                .cloned()
+                .ok_or(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                })?
+        }
+        #[cfg(feature = "v16")]
+        Expr::Binary(op, l, r) if is_cmp_op(*op) && (is_row(l) || is_row(r)) => {
+            let lp = resolve_row::<E>(l, arena, cur, enclosing, &mut *planner)?;
+            let rp = resolve_row::<E>(r, arena, cur, enclosing, &mut *planner)?;
+            row_cmp::<E>(*op, lp.as_slice(), rp.as_slice())?
+        }
+        #[cfg(feature = "v16")]
+        Expr::Between(x, lo, hi, neg) if is_row(x) || is_row(lo) || is_row(hi) => {
+            let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let lp = resolve_row::<E>(lo, arena, cur, enclosing, &mut *planner)?;
+            let hp = resolve_row::<E>(hi, arena, cur, enclosing, &mut *planner)?;
+            let b = RExpr::Binary(
+                BinOp::And,
+                Box::new(row_cmp::<E>(BinOp::Ge, xp.as_slice(), lp.as_slice())?),
+                Box::new(row_cmp::<E>(BinOp::Le, xp.as_slice(), hp.as_slice())?),
+            );
+            if *neg { RExpr::Not(Box::new(b)) } else { b }
+        }
+        #[cfg(feature = "v16")]
+        Expr::InList(x, list, neg) if matches!(**x, Expr::Vector(_)) => {
+            let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let mut items = AVec::new();
+            for e in list.iter() {
+                // Each item must itself be a row value of the
+                // same size (the pin's VALUES rewrite: "IN(...)
+                // element has N terms - expected M").
+                let Expr::Vector(_) = e else {
+                    return Err(row_misused());
+                };
+                let ip = resolve_row::<E>(e, arena, cur, enclosing, &mut *planner)?;
+                if ip.len() != xp.len() {
+                    return Err(row_misused());
+                }
+                items.push(RExpr::Scalar(ScalarFn::Vector, ip));
+            }
+            RExpr::InList(
+                Box::new(RExpr::Scalar(ScalarFn::Vector, xp)),
+                items,
+                *neg,
+                false,
+            )
+        }
+        #[cfg(feature = "v16")]
+        Expr::Case {
+            base: Some(b),
+            whens,
+            otherwise,
+        } if is_row(b) || whens.iter().any(|(w, _)| is_row(w)) => {
+            // `CASE (a, b) WHEN (x, y) ...` compares like `=`:
+            // the searched CASE of the row comparisons.
+            let bp = resolve_row::<E>(b, arena, cur, enclosing, &mut *planner)?;
+            let mut ws = AVec::new();
+            for (w, t) in whens.iter() {
+                let wp = resolve_row::<E>(w, arena, cur, enclosing, &mut *planner)?;
+                ws.push((
+                    row_cmp::<E>(BinOp::Eq, bp.as_slice(), wp.as_slice())?,
+                    resolve_scoped::<E>(t, arena, cur, enclosing, &mut *planner)?,
+                ));
+            }
+            RExpr::Case {
+                base: None,
+                whens: ws,
+                otherwise: match otherwise {
+                    Some(o) => Some(Box::new(resolve_scoped::<E>(
+                        o,
+                        arena,
+                        cur,
+                        enclosing,
+                        &mut *planner,
+                    )?)),
+                    None => None,
+                },
+            }
         }
         Expr::ExistsSubquery(stmt) => {
             RExpr::SubExists(Box::new(first_row_limit(planner(stmt, cur, enclosing)?)))
@@ -1262,6 +1408,135 @@ pub fn resolve_scoped<E>(
     })
 }
 
+/// The pin's "row value misused" (v0.16).
+#[cfg(feature = "v16")]
+fn row_misused<E>() -> Error<E> {
+    Error::Schema {
+        kind: SchemaKind::RowValueMisused,
+    }
+}
+
+/// `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`: the operators
+/// that compare row values (v0.16).
+#[cfg(feature = "v16")]
+fn is_cmp_op(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::Is
+            | BinOp::IsNot
+    )
+}
+
+/// Whether `e` may be a row value (v0.16): a written `(a, b,
+/// ...)` or a scalar subquery (whose width only planning
+/// tells).
+#[cfg(feature = "v16")]
+fn is_row(e: &Expr) -> bool {
+    matches!(e, Expr::Vector(_) | Expr::ScalarSubquery(_))
+}
+
+/// Resolve an operand that may be a row value (v0.16): its
+/// elements — one for a scalar. A written row value's elements
+/// must be scalars; a scalar subquery of n > 1 columns gives n
+/// copies of its plan, part `i` yielding column `i` of the
+/// first row.
+#[cfg(feature = "v16")]
+fn resolve_row<E>(
+    e: &Expr,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    planner: SubPlanner<'_, E>,
+) -> Result<AVec<RExpr>, E> {
+    let mut out = AVec::new();
+    match e {
+        Expr::Vector(items) => {
+            for x in items.iter() {
+                out.push(resolve_scoped::<E>(
+                    x,
+                    arena,
+                    cur,
+                    enclosing,
+                    &mut *planner,
+                )?);
+            }
+        }
+        Expr::ScalarSubquery(stmt) => {
+            let plan = first_row_limit(planner(stmt, cur, enclosing)?);
+            for i in 0..plan.width() {
+                let mut p = plan.clone();
+                p.scalar_col = i;
+                out.push(RExpr::SubScalar(Box::new(p)));
+            }
+        }
+        _ => out.push(resolve_scoped::<E>(
+            e,
+            arena,
+            cur,
+            enclosing,
+            &mut *planner,
+        )?),
+    }
+    Ok(out)
+}
+
+/// A comparison of two resolved operands as the pin's vector
+/// comparison (v0.16, `codeVectorCompare`), written with scalar
+/// operators so affinity and collation stay per element: `=` /
+/// `IS` are the AND of the element tests, `<>` / `IS NOT` their
+/// OR, and `<` (`<=`, `>`, `>=`) is lexicographic — `a1 < b1 OR
+/// (a1 = b1 AND (rest))`, the last element taking the operator
+/// itself. Three-valued logic gives the pin's NULL answers. Two
+/// scalars compare directly; operands of different sizes are
+/// "row value misused".
+#[cfg(feature = "v16")]
+fn row_cmp<E>(op: BinOp, l: &[RExpr], r: &[RExpr]) -> Result<RExpr, E> {
+    if l.len() != r.len() {
+        return Err(row_misused());
+    }
+    let bin = |op: BinOp, a: RExpr, b: RExpr| RExpr::Binary(op, Box::new(a), Box::new(b));
+    let pair = |i: usize, op: BinOp| match (l.get(i), r.get(i)) {
+        (Some(a), Some(b)) => Ok(bin(op, a.clone(), b.clone())),
+        _ => Err(row_misused()),
+    };
+    let n = l.len();
+    let Some(last) = n.checked_sub(1) else {
+        return Err(row_misused());
+    };
+    let (join, elem) = match op {
+        BinOp::Eq | BinOp::Is => (BinOp::And, op),
+        BinOp::Ne => (BinOp::Or, BinOp::Ne),
+        BinOp::IsNot => (BinOp::Or, BinOp::IsNot),
+        _ => {
+            let strict = if matches!(op, BinOp::Lt | BinOp::Le) {
+                BinOp::Lt
+            } else {
+                BinOp::Gt
+            };
+            let mut acc = pair(last, op)?;
+            for i in (0..last).rev() {
+                acc = bin(
+                    BinOp::Or,
+                    pair(i, strict)?,
+                    bin(BinOp::And, pair(i, BinOp::Eq)?, acc),
+                );
+            }
+            return Ok(acc);
+        }
+    };
+    let mut acc = pair(0, elem)?;
+    for i in 1..n {
+        acc = bin(join, acc, pair(i, elem)?);
+    }
+    Ok(acc)
+}
+
 fn resolve_args<E>(
     args: &[Expr],
     arena: &Arena,
@@ -1336,16 +1611,20 @@ fn resolve_func<E>(
                 distinct: false,
                 star: true,
                 args: AVec::new(),
+                lvl: 0,
             });
         }
         if args.len() < want.0 || args.len() > want.1 {
             return Err(Error::Unsupported);
         }
+        let args = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
+        let lvl = agg_level(args.as_slice(), cur, enclosing);
         return Ok(RExpr::Agg {
             kind,
             distinct,
             star: false,
-            args: resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
+            args,
+            lvl,
         });
     }
     if star || distinct {
@@ -1427,81 +1706,83 @@ fn resolve_func<E>(
     ))
 }
 
-/// Whether a resolved expression contains an aggregate node.
-/// Aggregates inside a subquery belong to the subquery's own
-/// grouping, never to the enclosing query, so subquery nodes
-/// are not descended into (except an IN subquery's left
-/// operand, which is an enclosing-scope expression).
-pub fn has_agg(e: &RExpr) -> bool {
+/// The owner level of an aggregate with resolved arguments
+/// `args` (v0.16, the pin's `sqlite3ReferencesSrcList` walk):
+/// 0 when they reference the current query's sources or no
+/// column at all, else 1 + the index (nearest first) of the
+/// nearest enclosing scope they reference. References past the
+/// current query's end belong to subqueries nested in the
+/// arguments and do not count.
+fn agg_level(args: &[RExpr], cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> u8 {
+    let band = |g: &ScopeGroup| {
+        let (we, se) = g.end();
+        RefRange {
+            w: (g.offsets.as_slice().first().copied().unwrap_or(we), we),
+            s: (g.first_src, se),
+        }
+    };
+    let refs = |g: &ScopeGroup| {
+        let r = band(g);
+        args.iter().any(|a| expr_refs_range(a, &r))
+    };
+    if refs(cur) {
+        return 0;
+    }
+    for (k, g) in enclosing.iter().enumerate() {
+        if refs(g) {
+            return u8::try_from(k.saturating_add(1)).unwrap_or(u8::MAX);
+        }
+    }
+    0
+}
+
+/// Visit, in pre-order, every aggregate node in `e` that
+/// belongs to the query `d` subquery levels out from `e`'s own
+/// (v0.16): at depth 0 the expression's own aggregates, and
+/// inside nested subquery plans (depth + 1 per level; derived
+/// tables and compound cores share their plan's depth) those
+/// whose `lvl` reaches back to it. `f` gets the node and the
+/// depth it was found at.
+pub fn visit_aggs<'x>(e: &'x RExpr, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
     match e {
-        RExpr::Agg { .. } => true,
-        RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
-        RExpr::InSub(x, _, _) => has_agg(x),
+        RExpr::Agg { lvl, args, .. } => {
+            if *lvl == d {
+                f(e, d);
+            }
+            for a in args.iter() {
+                visit_aggs(a, d, f);
+            }
+        }
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => visit_plan_aggs(p, d.saturating_add(1), f),
+        RExpr::InSub(x, p, _) => {
+            visit_aggs(x, d, f);
+            visit_plan_aggs(p, d.saturating_add(1), f);
+        }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => false,
-        RExpr::Binary(_, a, b) => has_agg(a) || has_agg(b),
-        RExpr::Neg(a)
-        | RExpr::Pos(a)
-        | RExpr::Not(a)
-        | RExpr::IsNull(a, _)
-        | RExpr::Cast(a, _)
-        | RExpr::Collate(a, _) => has_agg(a),
-        RExpr::InList(x, l, ..) => has_agg(x) || l.iter().any(has_agg),
-        RExpr::Between(x, a, b, _) => has_agg(x) || has_agg(a) || has_agg(b),
-        RExpr::Like(a, b, _) => has_agg(a) || has_agg(b),
-        RExpr::Case {
-            base,
-            whens,
-            otherwise,
-        } => {
-            base.as_ref().is_some_and(|b| has_agg(b))
-                || whens.iter().any(|(w, t)| has_agg(w) || has_agg(t))
-                || otherwise.as_ref().is_some_and(|o| has_agg(o))
-        }
-        RExpr::Scalar(_, args) => args.iter().any(has_agg),
-    }
-}
-
-/// Collect aggregate nodes (for the min/max bare-column rule).
-/// Subquery interiors are a separate grouping scope and are
-/// not descended into.
-pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
-    match e {
-        RExpr::SubScalar(_) | RExpr::SubExists(_) => {}
-        RExpr::InSub(x, _, _) => collect_aggs(x, out),
-        RExpr::Agg { args, .. } => {
-            out.push(e);
-            for a in args.iter() {
-                collect_aggs(a, out);
-            }
-        }
-        RExpr::Binary(_, a, b) => {
-            collect_aggs(a, out);
-            collect_aggs(b, out);
+        | RExpr::OutRef(_) => {}
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            visit_aggs(a, d, f);
+            visit_aggs(b, d, f);
         }
         RExpr::Neg(a)
         | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
-        | RExpr::Collate(a, _) => collect_aggs(a, out),
+        | RExpr::Collate(a, _) => visit_aggs(a, d, f),
         RExpr::InList(x, l, ..) => {
-            collect_aggs(x, out);
+            visit_aggs(x, d, f);
             for i in l.iter() {
-                collect_aggs(i, out);
+                visit_aggs(i, d, f);
             }
         }
         RExpr::Between(x, a, b, _) => {
-            collect_aggs(x, out);
-            collect_aggs(a, out);
-            collect_aggs(b, out);
-        }
-        RExpr::Like(a, b, _) => {
-            collect_aggs(a, out);
-            collect_aggs(b, out);
+            visit_aggs(x, d, f);
+            visit_aggs(a, d, f);
+            visit_aggs(b, d, f);
         }
         RExpr::Case {
             base,
@@ -1509,23 +1790,263 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
             otherwise,
         } => {
             if let Some(b) = base {
-                collect_aggs(b, out);
+                visit_aggs(b, d, f);
             }
             for (w, t) in whens.iter() {
-                collect_aggs(w, out);
-                collect_aggs(t, out);
+                visit_aggs(w, d, f);
+                visit_aggs(t, d, f);
             }
             if let Some(o) = otherwise {
-                collect_aggs(o, out);
+                visit_aggs(o, d, f);
             }
         }
         RExpr::Scalar(_, args) => {
             for a in args.iter() {
-                collect_aggs(a, out);
+                visit_aggs(a, d, f);
             }
         }
-        _ => {}
     }
+}
+
+/// `visit_aggs` over every expression of a plan (v0.16).
+fn visit_plan_aggs<'x>(p: &'x SubPlan, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
+    for s in p.sources.iter() {
+        if let Some(on) = &s.on {
+            visit_aggs(on, d, f);
+        }
+        if let Some(dp) = &s.derived {
+            visit_plan_aggs(dp, d, f);
+        }
+    }
+    for e in p.items.iter() {
+        visit_aggs(e, d, f);
+    }
+    if let Some(e) = &p.filter {
+        visit_aggs(e, d, f);
+    }
+    for e in p.group_by.iter() {
+        visit_aggs(e, d, f);
+    }
+    if let Some(e) = &p.having {
+        visit_aggs(e, d, f);
+    }
+    for (e, _) in p.order_by.iter() {
+        visit_aggs(e, d, f);
+    }
+    for row in p.values.iter() {
+        for e in row.iter() {
+            visit_aggs(e, d, f);
+        }
+    }
+    for (_, t) in p.compound.iter() {
+        visit_plan_aggs(t, d, f);
+    }
+}
+
+/// Whether a resolved expression holds an aggregate of its own
+/// query: one directly in it, or (v0.16) one inside a nested
+/// subquery whose arguments reference only this query's columns
+/// (`visit_aggs`). Aggregates a subquery owns are not this
+/// query's.
+pub fn has_agg(e: &RExpr) -> bool {
+    let mut any = false;
+    visit_aggs(e, 0, &mut |_, _| any = true);
+    any
+}
+
+/// Whether a WHERE expression `e` holds an aggregate the pin
+/// refuses there (v0.16): any of this query's own (directly or
+/// inside a subquery), and — when this query is not an
+/// aggregate query (`allow_foreign` false) — any enclosing
+/// query's directly in it ("misuse of aggregate function": a
+/// non-aggregate query's WHERE resolves with aggregates
+/// disallowed).
+pub fn where_agg(e: &RExpr, allow_foreign: bool) -> bool {
+    has_agg(e) || (!allow_foreign && has_direct_agg(e))
+}
+
+/// Whether `e` holds an aggregate node of any query outside a
+/// nested subquery (v0.16).
+fn has_direct_agg(e: &RExpr) -> bool {
+    match e {
+        RExpr::Agg { .. } => true,
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, _, _) => has_direct_agg(x),
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => false,
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => has_direct_agg(a) || has_direct_agg(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => has_direct_agg(a),
+        RExpr::InList(x, l, ..) => has_direct_agg(x) || l.iter().any(has_direct_agg),
+        RExpr::Between(x, a, b, _) => has_direct_agg(x) || has_direct_agg(a) || has_direct_agg(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_ref().is_some_and(|b| has_direct_agg(b))
+                || whens
+                    .iter()
+                    .any(|(w, t)| has_direct_agg(w) || has_direct_agg(t))
+                || otherwise.as_ref().is_some_and(|o| has_direct_agg(o))
+        }
+        RExpr::Scalar(_, args) => args.iter().any(has_direct_agg),
+    }
+}
+
+/// Whether `e` holds an aggregate of an enclosing query inside a
+/// nested subquery that this query owns (v0.16): its group
+/// evaluation must substitute it before executing the subquery.
+pub fn has_owned_sub_agg(e: &RExpr) -> bool {
+    let mut any = false;
+    visit_aggs(e, 0, &mut |_, d| any |= d > 0);
+    any
+}
+
+/// Whether an aggregate's arguments hold another aggregate of
+/// the same query (v0.16; the pin's "misuse of aggregate
+/// function": `sum(max(a))`, `sum((SELECT max(t.a) FROM u))`).
+pub fn has_nested_agg(e: &RExpr) -> bool {
+    let mut bad = false;
+    visit_aggs(e, 0, &mut |a, d| {
+        if d == 0
+            && let RExpr::Agg { args, .. } = a
+        {
+            bad |= args.iter().any(has_agg);
+        }
+    });
+    bad
+}
+
+/// Collect this query's aggregate nodes (for the min/max
+/// bare-column rule), in `visit_aggs` order: its own, and
+/// (v0.16) its aggregates inside nested subqueries — the pin
+/// sets its min/max flag on the owning query.
+pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+    visit_aggs(e, 0, &mut |a, _| out.push(a));
+}
+
+/// Replace every aggregate of the current query inside nested
+/// subquery plans of `e` (depth >= 1, `visit_aggs`) by the
+/// value `fold` gives it (v0.16): the owner's group evaluation,
+/// before it executes those subqueries.
+pub fn subst_owned_aggs<E>(
+    e: &mut RExpr,
+    d: u8,
+    fold: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
+) -> Result<(), E> {
+    if let RExpr::Agg { lvl, .. } = e
+        && *lvl == d
+        && d > 0
+    {
+        let v = fold(e)?;
+        *e = RExpr::Literal(v);
+        return Ok(());
+    }
+    match e {
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => subst_plan_aggs(p, d.saturating_add(1), fold),
+        RExpr::InSub(x, p, _) => {
+            subst_owned_aggs(x, d, fold)?;
+            subst_plan_aggs(p, d.saturating_add(1), fold)
+        }
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_) => Ok(()),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            subst_owned_aggs(a, d, fold)?;
+            subst_owned_aggs(b, d, fold)
+        }
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => subst_owned_aggs(a, d, fold),
+        RExpr::InList(x, l, ..) => {
+            subst_owned_aggs(x, d, fold)?;
+            for i in l.as_mut_slice() {
+                subst_owned_aggs(i, d, fold)?;
+            }
+            Ok(())
+        }
+        RExpr::Between(x, a, b, _) => {
+            subst_owned_aggs(x, d, fold)?;
+            subst_owned_aggs(a, d, fold)?;
+            subst_owned_aggs(b, d, fold)
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            if let Some(b) = base {
+                subst_owned_aggs(b, d, fold)?;
+            }
+            for (w, t) in whens.as_mut_slice() {
+                subst_owned_aggs(w, d, fold)?;
+                subst_owned_aggs(t, d, fold)?;
+            }
+            if let Some(o) = otherwise {
+                subst_owned_aggs(o, d, fold)?;
+            }
+            Ok(())
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
+            for a in args.as_mut_slice() {
+                subst_owned_aggs(a, d, fold)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `subst_owned_aggs` over every expression of a plan (v0.16).
+fn subst_plan_aggs<E>(
+    p: &mut SubPlan,
+    d: u8,
+    fold: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
+) -> Result<(), E> {
+    for s in p.sources.as_mut_slice() {
+        if let Some(on) = &mut s.on {
+            subst_owned_aggs(on, d, fold)?;
+        }
+        if let Some(dp) = &mut s.derived {
+            subst_plan_aggs(dp, d, fold)?;
+        }
+    }
+    for e in p.items.as_mut_slice() {
+        subst_owned_aggs(e, d, fold)?;
+    }
+    if let Some(e) = &mut p.filter {
+        subst_owned_aggs(e, d, fold)?;
+    }
+    for e in p.group_by.as_mut_slice() {
+        subst_owned_aggs(e, d, fold)?;
+    }
+    if let Some(e) = &mut p.having {
+        subst_owned_aggs(e, d, fold)?;
+    }
+    for (e, _) in p.order_by.as_mut_slice() {
+        subst_owned_aggs(e, d, fold)?;
+    }
+    for row in p.values.as_mut_slice() {
+        for e in row.as_mut_slice() {
+            subst_owned_aggs(e, d, fold)?;
+        }
+    }
+    for (_, t) in p.compound.as_mut_slice() {
+        subst_plan_aggs(t, d, fold)?;
+    }
+    Ok(())
 }
 
 /// Whether a resolved expression contains a subquery node in
@@ -1660,6 +2181,70 @@ fn in_sub_lhs(x: &RExpr, plan: &SubPlan, sx: RExpr) -> RExpr {
     RExpr::Collate(Box::new(sx), coll)
 }
 
+/// An IN subquery node after substitution: an `InList` (marked
+/// as substituted) of the subquery's values, with the left
+/// operand `sx` (the substituted `x`) carrying the membership
+/// collation (`in_sub_lhs`). A row-value left operand (v0.16,
+/// `v16`) gets one collation per element and the row-major
+/// values regrouped into rows of its size, each element
+/// carrying its result column's affinity.
+fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool) -> RExpr {
+    let wrap = |v: &OwnedValue, aff: Option<Affinity>| match aff {
+        Some(a) => RExpr::AffLiteral(v.clone(), a),
+        None => RExpr::Literal(v.clone()),
+    };
+    #[cfg(feature = "v16")]
+    if let (RExpr::Scalar(ScalarFn::Vector, xs), RExpr::Scalar(ScalarFn::Vector, sxs)) = (x, &sx) {
+        let core = plan.compound.as_slice().last().map_or(plan, |(_, t)| t);
+        let n = xs.len().max(1);
+        let mut lhs = AVec::new();
+        let mut affs = AVec::new();
+        for (j, (xe, se)) in xs.iter().zip(sxs.iter()).enumerate() {
+            let item = core.items.as_slice().get(j).or_else(|| {
+                core.values
+                    .as_slice()
+                    .first()
+                    .and_then(|r| r.as_slice().get(j))
+            });
+            let coll = match item {
+                Some(i) => binary_coll(xe, i),
+                None => expr_coll(xe).unwrap_or_default(),
+            };
+            lhs.push(RExpr::Collate(Box::new(se.clone()), coll));
+            affs.push(plan.items.as_slice().get(j).and_then(item_result_affinity));
+        }
+        let vals: &[OwnedValue] = match value {
+            SubValue::Many(vs, _) => vs.as_slice(),
+            SubValue::One(..) => &[],
+        };
+        let mut rows = AVec::new();
+        for chunk in vals.chunks(n) {
+            let mut row = AVec::new();
+            for (j, v) in chunk.iter().enumerate() {
+                row.push(wrap(v, affs.as_slice().get(j).copied().flatten()));
+            }
+            rows.push(RExpr::Scalar(ScalarFn::Vector, row));
+        }
+        return RExpr::InList(
+            Box::new(RExpr::Scalar(ScalarFn::Vector, lhs)),
+            rows,
+            neg,
+            true,
+        );
+    }
+    let sx = in_sub_lhs(x, plan, sx);
+    let mut list = AVec::new();
+    match value {
+        SubValue::Many(vs, aff) => {
+            for v in vs.iter() {
+                list.push(wrap(v, *aff));
+            }
+        }
+        SubValue::One(v, aff) => list.push(wrap(v, *aff)),
+    }
+    RExpr::InList(Box::new(sx), list, neg, true)
+}
+
 /// `values` is consumed in `collect_subs` order; the caller
 /// guarantees the counts match.
 pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
@@ -1676,27 +2261,10 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             v
         }
         RExpr::InSub(x, plan, neg) => {
-            let sx = in_sub_lhs(x, plan, substitute(x, values, pos));
-            let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
-                Some(a) => RExpr::AffLiteral(v.clone(), *a),
-                None => RExpr::Literal(v.clone()),
-            };
-            let list = match &values[*pos] {
-                SubValue::Many(vs, aff) => {
-                    let mut out = AVec::new();
-                    for v in vs.iter() {
-                        out.push(wrap(v, aff));
-                    }
-                    out
-                }
-                SubValue::One(v, aff) => {
-                    let mut out = AVec::new();
-                    out.push(wrap(v, aff));
-                    out
-                }
-            };
+            let sx = substitute(x, values, pos);
+            let v = &values[*pos];
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg, true)
+            in_sub_list(x, plan, sx, v, *neg)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
@@ -1764,6 +2332,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             distinct,
             star,
             args,
+            lvl,
         } => {
             let mut out = AVec::new();
             for a in args.iter() {
@@ -1774,6 +2343,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                 distinct: *distinct,
                 star: *star,
                 args: out,
+                lvl: *lvl,
             }
         }
     }
@@ -1988,31 +2558,10 @@ pub fn substitute_group(
             v
         }
         RExpr::InSub(x, plan, neg) => {
-            let sx = in_sub_lhs(
-                x,
-                plan,
-                substitute_group(x, values, pos, agg_values, agg_pos),
-            );
-            let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
-                Some(a) => RExpr::AffLiteral(v.clone(), *a),
-                None => RExpr::Literal(v.clone()),
-            };
-            let list = match &values[*pos] {
-                SubValue::Many(vs, aff) => {
-                    let mut out = AVec::new();
-                    for v in vs.iter() {
-                        out.push(wrap(v, aff));
-                    }
-                    out
-                }
-                SubValue::One(v, aff) => {
-                    let mut out = AVec::new();
-                    out.push(wrap(v, aff));
-                    out
-                }
-            };
+            let sx = substitute_group(x, values, pos, agg_values, agg_pos);
+            let v = &values[*pos];
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg, true)
+            in_sub_list(x, plan, sx, v, *neg)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
@@ -3136,6 +3685,13 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
     }
     let v = vs.as_slice();
     Ok(match f {
+        #[cfg(feature = "v16")]
+        ScalarFn::BitNot => match v.first() {
+            None | Some(OwnedValue::Null) => OwnedValue::Null,
+            Some(x) => OwnedValue::Integer(!int_value(x)),
+        },
+        #[cfg(feature = "v16")]
+        ScalarFn::Vector => return Err(row_misused()),
         ScalarFn::Coalesce => v
             .iter()
             .find(|x| !matches!(x, OwnedValue::Null))
@@ -3652,6 +4208,97 @@ pub fn eval_agg_values<E>(
 }
 
 /// Evaluate a resolved expression.
+/// `&`, `|`, `<<`, `>>` on two integers (v0.16): the pin's
+/// `OP_BitAnd` / `OP_BitOr` / `OP_ShiftLeft` / `OP_ShiftRight`.
+/// A negative count shifts the other way; a count of 64 or more
+/// leaves 0, or -1 for a negative value shifted right.
+#[cfg(feature = "v16")]
+fn bit_op(op: BinOp, a: i64, b: i64) -> i64 {
+    let mut left = match op {
+        BinOp::BitAnd => return a & b,
+        BinOp::BitOr => return a | b,
+        BinOp::Shl => true,
+        _ => false,
+    };
+    if b == 0 {
+        return a;
+    }
+    let mut n = b;
+    if n < 0 {
+        left = !left;
+        n = if n > -64 { -n } else { 64 };
+    }
+    if n >= 64 {
+        return if a >= 0 || left { 0 } else { -1 };
+    }
+    // 0 < n < 64 here.
+    let n = n as u32;
+    if left {
+        ((a as u64) << n) as i64
+    } else {
+        a >> n
+    }
+}
+
+/// A row-value IN test (v0.16): `x` and every item are
+/// `Vector`s of the same size (checked at plan time). An item
+/// matches when every element compares equal, each element
+/// pair under the comparison affinity of `x`'s element and the
+/// LAST item's element — the pin rewrites a row-value IN list
+/// as `IN (VALUES ...)`, whose column affinity is its rightmost
+/// row's, and an `IN (SELECT ...)` substitutes items that all
+/// carry the subquery column's affinity — and the collation of
+/// `x`'s element against that same element. The result is 1 on
+/// a match, else NULL if some item had a NULL element test and
+/// no unequal one, else 0 (negated for NOT IN).
+#[cfg(feature = "v16")]
+fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    fn parts(e: &RExpr) -> &[RExpr] {
+        match e {
+            RExpr::Scalar(ScalarFn::Vector, p) => p.as_slice(),
+            _ => &[],
+        }
+    }
+    let xs = parts(x);
+    let last = list.last().map(parts).unwrap_or(&[]);
+    let mut xv = AVec::new();
+    for e in xs {
+        xv.push(eval::<E>(e, ctx)?);
+    }
+    let mut any_null = false;
+    for item in list {
+        let mut row_null = false;
+        let mut row_false = false;
+        for (j, ie) in parts(item).iter().enumerate() {
+            let (Some(xe), Some(src), Some(v)) = (xs.get(j), last.get(j), xv.as_slice().get(j))
+            else {
+                return Err(row_misused());
+            };
+            let iv = eval::<E>(ie, ctx)?;
+            let (a, b) = adjust_cmp(xe, src, v.clone(), iv);
+            if matches!(a, OwnedValue::Null) || matches!(b, OwnedValue::Null) {
+                row_null = true;
+            } else if compare_coll(&a.as_value(), &b.as_value(), binary_coll(xe, src))
+                != core::cmp::Ordering::Equal
+            {
+                row_false = true;
+                break;
+            }
+        }
+        if !row_false {
+            if !row_null {
+                return Ok(bool_val(!neg));
+            }
+            any_null = true;
+        }
+    }
+    Ok(if any_null {
+        OwnedValue::Null
+    } else {
+        bool_val(neg)
+    })
+}
+
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
@@ -3715,12 +4362,26 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
                 arith::<E>(*op, l, r, ctx)?
             }
+            #[cfg(feature = "v16")]
+            BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => {
+                let lv = eval::<E>(l, ctx)?;
+                let rv = eval::<E>(r, ctx)?;
+                if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
+                    OwnedValue::Null
+                } else {
+                    OwnedValue::Integer(bit_op(*op, int_value(&lv), int_value(&rv)))
+                }
+            }
         },
         // An empty set is FALSE for IN (TRUE for NOT IN) even
         // when the left operand is NULL (v0.16, pin-probed:
         // `NULL IN (SELECT a FROM empty)` is 0, not NULL — the
         // shape `x IN emptytable` exposed it).
         RExpr::InList(_, list, neg, _) if list.is_empty() => bool_val(*neg),
+        #[cfg(feature = "v16")]
+        RExpr::InList(x, list, neg, _) if matches!(**x, RExpr::Scalar(ScalarFn::Vector, _)) => {
+            in_rows::<E>(x, list.as_slice(), *neg, ctx)?
+        }
         RExpr::InList(x, list, neg, from_sub) => {
             let xv = eval::<E>(x, ctx)?;
             let mut any_null = matches!(xv, OwnedValue::Null);
@@ -3833,11 +4494,19 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Scalar(f, args) => eval_scalar::<E>(*f, args.as_slice(), ctx)?,
         RExpr::Cast(x, aff) => cast_value(&eval::<E>(x, ctx)?, *aff),
         RExpr::Collate(x, _) => eval::<E>(x, ctx)?,
+        // An aggregate of an enclosing query that its owner did
+        // not substitute: one in a clause that cannot aggregate.
+        RExpr::Agg { lvl: 1.., .. } => {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedAggregate,
+            });
+        }
         RExpr::Agg {
             kind,
             distinct,
             star,
             args,
+            ..
         } => match ctx {
             Ctx::Group { rows, .. } => {
                 eval_agg::<E>(*kind, *distinct, *star, args.as_slice(), rows)?

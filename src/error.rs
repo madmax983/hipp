@@ -150,6 +150,16 @@ pub enum SchemaKind {
     /// value as a literal.
     #[cfg(feature = "params")]
     ParameterNotAllowed,
+    /// A row value `(a, b, ...)` (or a multi-column scalar
+    /// subquery) where only a single value is allowed, or two
+    /// row values of different sizes compared (v0.16, `v16`;
+    /// the pin's "row value misused" and "IN(...) element has N
+    /// terms - expected M"). Compare row values of equal size
+    /// with `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT]`,
+    /// `BETWEEN`, `IN`, or assign them with `UPDATE ... SET
+    /// (a, b) = ...`.
+    #[cfg(feature = "v16")]
+    RowValueMisused,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -189,6 +199,11 @@ pub enum ParseKind {
     /// parameters.
     #[cfg(feature = "params")]
     TooManyVariables,
+    /// A hexadecimal literal with more than 16 significant
+    /// digits, or `-` applied to `0x8000000000000000` (v0.16;
+    /// the pin's "hex literal too big"). Write a shorter
+    /// literal, or a decimal one.
+    HexLiteralTooBig,
 }
 
 /// The core error type. Generic over the storage error `E`.

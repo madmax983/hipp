@@ -2064,6 +2064,7 @@ impl<S: Storage> Connection<S> {
                 result_named,
                 id: 0,
                 uncorrelated: false,
+                scalar_col: 0,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
@@ -2096,6 +2097,7 @@ impl<S: Storage> Connection<S> {
             result_named: core.result_named,
             id: 0,
             uncorrelated: false,
+            scalar_col: 0,
         };
         self.stamp_subplan(&mut plan, base_width, base_src);
         Ok((plan, core.keys))
@@ -2971,8 +2973,14 @@ impl<S: Storage> Connection<S> {
             None => hoisted,
             Some(e) => {
                 let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
-                if has_agg(&r) {
-                    return Err(Error::Unsupported);
+                // None of this query's aggregates, and none of an
+                // enclosing query's unless this query aggregates
+                // (v0.16: the pin's "misuse of aggregate").
+                let aggregates = !stmt.group_by.is_empty() || items.iter().any(has_agg);
+                if crate::query::where_agg(&r, aggregates) {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::MisusedAggregate,
+                    });
                 }
                 Some(and_expr(hoisted, r))
             }
@@ -3050,10 +3058,29 @@ impl<S: Storage> Connection<S> {
         {
             return Err(Error::Unsupported);
         }
-        let has_agg = !group_by.is_empty()
-            || items.iter().any(has_agg)
-            || having.as_ref().is_some_and(has_agg)
-            || order_by.iter().any(|(e, _)| has_agg(e));
+        // Only GROUP BY or an aggregate in the result list makes
+        // the query an aggregate one (v0.16 fix, ungated: an
+        // aggregate in ORDER BY alone is the pin's "misuse of
+        // aggregate" — hipp aggregated the query to one row).
+        // HAVING needs one of them already (checked above).
+        let has_agg = !group_by.is_empty() || items.iter().any(has_agg);
+        if !has_agg && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedAggregate,
+            });
+        }
+        // An aggregate inside another's arguments (`sum(max(a))`,
+        // or one of this query's inside a subquery argument).
+        if items.iter().any(crate::query::has_nested_agg)
+            || having.as_ref().is_some_and(crate::query::has_nested_agg)
+            || order_by
+                .iter()
+                .any(|(e, _)| crate::query::has_nested_agg(e))
+        {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedAggregate,
+            });
+        }
         cur.aliases.clear();
         let keys = CompKeys {
             names: item_aliases,
@@ -3633,7 +3660,7 @@ pub struct Statement<'c, S: Storage> {
     /// table, whose pre-statement snapshot the first use
     /// captures.
     #[cfg(feature = "v06")]
-    hoist: AVec<(usize, crate::query::SubValue)>,
+    hoist: AVec<((usize, usize), crate::query::SubValue)>,
     /// v0.7 RETURNING results of a write statement, materialised
     /// by the write's execution on first step and then served
     /// one row per step, like a query's.
@@ -6899,6 +6926,46 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !crate::query::has_sub(e) {
             return crate::query::eval::<S::Error>(e, &Ctx::Group { rows, rep });
         }
+        // This query's aggregates inside its subqueries (v0.16
+        // fix: `(SELECT max(t.a) FROM u)` over t): fold each over
+        // the group and substitute the value into the subquery
+        // plan before anything executes it.
+        if crate::query::has_owned_sub_agg(e) {
+            let mut e2 = e.clone();
+            crate::query::subst_owned_aggs::<S::Error>(&mut e2, 0, &mut |a| {
+                let RExpr::Agg {
+                    kind,
+                    distinct,
+                    star,
+                    args,
+                    ..
+                } = a
+                else {
+                    return Err(Error::Unsupported);
+                };
+                if args.iter().any(crate::query::has_sub) {
+                    return Err(Error::Unsupported);
+                }
+                let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
+                for r in rows {
+                    let mut vs: AVec<OwnedValue> = AVec::new();
+                    if !*star {
+                        for x in args.iter() {
+                            vs.push(crate::query::eval::<S::Error>(x, &Ctx::Row(r))?);
+                        }
+                    }
+                    arg_rows.push(vs);
+                }
+                crate::query::eval_agg_values::<S::Error>(
+                    *kind,
+                    *distinct,
+                    *star,
+                    arg_rows.as_slice(),
+                    crate::query::args_coll(args.as_slice()),
+                )
+            })?;
+            return Box::pin(self.eval_group_sub(&e2, rows, rep)).await;
+        }
         if !crate::query::sub_in_agg_args(e) {
             let values = self.compute_sub_values(e, rep).await?;
             let mut pos = 0;
@@ -6944,6 +7011,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             distinct,
             star,
             args,
+            ..
         } = agg
         else {
             return Err(Error::Unsupported);
@@ -7103,13 +7171,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             SubKind::In(p) => *p,
         };
         if plan.uncorrelated && plan.id != 0 {
-            for (id, v) in self.hoist.iter() {
-                if *id == plan.id {
+            // Keyed by node id and result column: the parts of a
+            // multi-column scalar subquery share their node id.
+            let key = (plan.id, plan.scalar_col);
+            for (k, v) in self.hoist.iter() {
+                if *k == key {
                     return Ok(v.clone());
                 }
             }
             let v = self.exec_sub_kind(kind, outer).await?;
-            self.hoist.push((plan.id, v.clone()));
+            self.hoist.push((key, v.clone()));
             return Ok(v);
         }
         self.exec_sub_kind(kind, outer).await
@@ -7129,7 +7200,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let rows = self.exec_subplan(plan, outer).await?;
                 SubValue::One(
                     match rows.as_slice().first() {
-                        Some(r) => r.as_slice().first().cloned().unwrap_or(OwnedValue::Null),
+                        Some(r) => r
+                            .as_slice()
+                            .get(plan.scalar_col)
+                            .cloned()
+                            .unwrap_or(OwnedValue::Null),
                         None => OwnedValue::Null,
                     },
                     crate::query::result_affinity(plan),
@@ -7144,9 +7219,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             SubKind::In(plan) => {
                 let rows = self.exec_subplan(plan, outer).await?;
+                // Row-major: every column of every row for a
+                // row-value IN (v0.16), else the one column.
+                let w = plan.width().max(1);
                 let mut vs = AVec::new();
                 for r in rows.iter() {
-                    vs.push(r.as_slice().first().cloned().unwrap_or(OwnedValue::Null));
+                    for c in 0..w {
+                        vs.push(r.as_slice().get(c).cloned().unwrap_or(OwnedValue::Null));
+                    }
                 }
                 SubValue::Many(vs, crate::query::result_affinity(plan))
             }

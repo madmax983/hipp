@@ -80,6 +80,13 @@ v10 = ["v09"]
 # functions (column COLLATE clauses, collated indexes and the
 # collation rules themselves are *not* gated: they correct
 # claimed v0.4 / index paths).
+# The expressions unit adds the bitwise operators `& | << >> ~`,
+# IS [NOT] DISTINCT FROM, postfix NOT NULL and row values
+# (comparisons, BETWEEN, IN, CASE, multi-column scalar
+# subqueries, UPDATE ... SET (a, b) = ...). (The precedence,
+# IS TRUE / FALSE, hex / digit-separator literal and aggregate
+# scoping fixes are *not* gated: they correct claimed v0.4 /
+# v0.6 paths.)
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.

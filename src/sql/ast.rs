@@ -124,6 +124,18 @@ pub enum BinOp {
     Div,
     Mod,
     Concat,
+    /// `&`, `|`, `<<`, `>>` (v0.16, `v16`): both operands taken
+    /// as 64-bit integers (the pin's `sqlite3VdbeIntValue`), NULL
+    /// if either is NULL; a negative shift count shifts the other
+    /// way and a count of 64 or more shifts every bit out.
+    #[cfg(feature = "v16")]
+    BitAnd,
+    #[cfg(feature = "v16")]
+    BitOr,
+    #[cfg(feature = "v16")]
+    Shl,
+    #[cfg(feature = "v16")]
+    Shr,
 }
 
 /// A scalar SQL expression (v0.4). Column references are by
@@ -189,6 +201,25 @@ pub enum Expr {
     /// pin silently reads one as NULL) it resolves to NULL.
     #[cfg(feature = "params")]
     Param(u16, ABytes),
+    /// `~x`, bitwise NOT (v0.16, `v16`): the operand as a 64-bit
+    /// integer, complemented; NULL stays NULL.
+    #[cfg(feature = "v16")]
+    BitNot(Box<Expr>),
+    /// A row value `(a, b, ...)` of two or more expressions
+    /// (v0.16, `v16`). Legal only as an operand of a comparison
+    /// (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT]`), `BETWEEN`,
+    /// `IN`, or a CASE base / WHEN operand, against a row value
+    /// of the same size; anywhere else the planner refuses it
+    /// (`SchemaKind::RowValueMisused`), as the pin does.
+    #[cfg(feature = "v16")]
+    Vector(AVec<Expr>),
+    /// Element `i` (0-based) of a row value of `n` elements
+    /// (v0.16, `v16`): the parser's split of `UPDATE ... SET
+    /// (c1, ..., cn) = <row>` into one assignment per column. The
+    /// row is a scalar subquery (column `i` of its first row) or
+    /// any expression when `n` is 1; the planner checks the size.
+    #[cfg(feature = "v16")]
+    RowItem(Box<Expr>, u16, u16),
 }
 
 /// One SELECT result item (v0.4).

@@ -140,7 +140,13 @@ impl Binder<'_> {
                 self.expr::<E>(a)?
             }
             #[cfg(feature = "v16")]
-            Expr::Collate(a, _) => self.expr::<E>(a)?,
+            Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => self.expr::<E>(a)?,
+            #[cfg(feature = "v16")]
+            Expr::Vector(l) => {
+                for x in l.as_mut_slice() {
+                    self.expr::<E>(x)?;
+                }
+            }
             Expr::InList(a, l, _) => {
                 self.expr::<E>(a)?;
                 for x in l.as_mut_slice() {
@@ -358,7 +364,9 @@ fn constant(e: &Expr) -> bool {
             constant(a)
         }
         #[cfg(feature = "v16")]
-        Expr::Collate(a, _) => constant(a),
+        Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => constant(a),
+        #[cfg(feature = "v16")]
+        Expr::Vector(l) => l.iter().all(constant),
         Expr::InList(a, l, _) => constant(a) && l.iter().all(constant),
         Expr::Between(a, b, c, _) => constant(a) && constant(b) && constant(c),
         Expr::Case {

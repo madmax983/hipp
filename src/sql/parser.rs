@@ -32,6 +32,29 @@ use super::lexer::{self, Tok, Token};
 
 const MAX_DEPTH: usize = 32;
 
+// Expression binding powers (v0.16: the pin's precedence levels,
+// loosest first; see `Parser::expr_bp`).
+#[cfg(feature = "v04")]
+const BP_OR: u8 = 1;
+#[cfg(feature = "v04")]
+const BP_AND: u8 = 2;
+#[cfg(feature = "v04")]
+const BP_NOT: u8 = 3;
+#[cfg(feature = "v04")]
+const BP_EQ: u8 = 4;
+#[cfg(feature = "v04")]
+const BP_REL: u8 = 5;
+#[cfg(feature = "v16")]
+const BP_BIT: u8 = 7;
+#[cfg(feature = "v04")]
+const BP_ADD: u8 = 8;
+#[cfg(feature = "v04")]
+const BP_MUL: u8 = 9;
+#[cfg(feature = "v04")]
+const BP_CONCAT: u8 = 10;
+#[cfg(feature = "v04")]
+const BP_COLLATE: u8 = 11;
+
 fn perr<E>(offset: usize, kind: ParseKind) -> Error<E> {
     Error::Parse { offset, kind }
 }
@@ -860,15 +883,59 @@ impl<'a> Parser<'a> {
         if !matches!(t.tok, Tok::Real(f) if f == 9_223_372_036_854_775_808.0) {
             return false;
         }
-        let mut z = self.sql.get(t.offset..).unwrap_or(&[]);
-        while let [b'0', rest @ ..] = z {
-            z = rest;
+        let z = self.sql.get(t.offset..).unwrap_or(&[]);
+        // Without the evaluator there are no `_` separators.
+        #[cfg(not(feature = "v04"))]
+        {
+            let mut z = z;
+            while let [b'0', rest @ ..] = z {
+                z = rest;
+            }
+            let d = b"9223372036854775808";
+            z.starts_with(d)
+                && !z
+                    .get(d.len())
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_')
         }
-        let d = b"9223372036854775808";
-        z.starts_with(d)
-            && !z
-                .get(d.len())
-                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_')
+        // The token's digits, without leading zeros and `_`
+        // separators (v0.16: `-9_223_372_036_854_775_808` is
+        // the INTEGER too).
+        #[cfg(feature = "v04")]
+        {
+            let end = z
+                .iter()
+                .position(|b| !(b.is_ascii_digit() || *b == b'_'))
+                .unwrap_or(z.len());
+            if z.get(end)
+                .is_some_and(|b| *b == b'.' || *b == b'e' || *b == b'E')
+            {
+                return false;
+            }
+            let mut digits = z
+                .get(..end)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|b| **b != b'_')
+                .skip_while(|b| **b == b'0');
+            let d = b"9223372036854775808";
+            d.iter().all(|c| digits.next() == Some(c)) && digits.next().is_none()
+        }
+    }
+
+    /// Token `i` is a hexadecimal literal whose value is i64::MIN
+    /// (`0x8000000000000000`, leading zeros allowed) — the one
+    /// hex literal a minus sign cannot negate (v0.16).
+    #[cfg(feature = "v04")]
+    fn hex_min(&self, i: usize) -> bool {
+        match self.toks.as_slice().get(i) {
+            Some(t) if matches!(t.tok, Tok::Integer(i64::MIN)) => {
+                matches!(
+                    self.sql.get(t.offset..t.offset.saturating_add(2)),
+                    Some(b"0x" | b"0X")
+                )
+            }
+            _ => false,
+        }
     }
 
     /// A parameter token at the cursor, consumed (v0.16,
@@ -906,6 +973,14 @@ impl<'a> Parser<'a> {
                 }
                 if self.min_magnitude(j) {
                     return Some((Literal::Integer(i64::MIN), j - i + 1));
+                }
+                // `-0x8000000000000000` is the pin's "hex literal
+                // too big", not a REAL (v0.16 fix): no literal
+                // here, so the evaluator's unary minus reports
+                // it. (The tiny lexer refuses the literal itself.)
+                #[cfg(feature = "v04")]
+                if self.hex_min(j) {
+                    return None;
                 }
                 match self.literal_at(i + 1) {
                     Some((Literal::Integer(v), n)) => Some((
@@ -1147,17 +1222,7 @@ impl<'a> Parser<'a> {
         } else {
             self.expect_kw::<E>(b"UPDATE")?;
             self.expect_kw::<E>(b"SET")?;
-            let mut assignments: AVec<(ABytes, Expr)> = AVec::new();
-            loop {
-                let col = self.plain_name::<E>()?;
-                self.expect::<E>(Tok::Eq)?;
-                let e = self.parse_expr::<E>()?;
-                assignments.push((col, e));
-                if self.eat(Tok::Comma) {
-                    continue;
-                }
-                break;
-            }
+            let assignments = self.set_list::<E>()?;
             let filter = if self.eat_kw(b"WHERE") {
                 Some(self.parse_expr::<E>()?)
             } else {
@@ -1427,242 +1492,295 @@ impl<'a> Parser<'a> {
     }
 
     // ---------- expression parser (SQLite precedence) ----------
-    // OR < AND < NOT < comparison < +,- < *,/,% < || < unary.
+    // The pin's `parse.y` precedence, loosest first:
+    //   OR < AND < NOT < (= == != <> IS IN LIKE GLOB BETWEEN
+    //   ISNULL NOTNULL NOT NULL) < (< <= > >=) < (& | << >>)
+    //   < (+ -) < (* / %) < || < COLLATE < unary (- + ~).
+    // A precedence-climbing loop reproduces the LALR parse:
+    // binary operators associate to the left, and a postfix
+    // operator (ISNULL, IN (...), COLLATE, ...) yields an
+    // operand that tighter operators may still extend — `x
+    // ISNULL + 1` is `(x ISNULL) + 1` on the pin. (v0.16 fix,
+    // ungated: before it `<` and `=` shared one level, so `3 =
+    // 2 < 3` read `(3 = 2) < 3`.)
 
     pub(crate) fn parse_expr<E>(&mut self) -> Result<Expr, E> {
-        self.expr_or::<E>()
+        self.expr_bp::<E>(BP_OR)
     }
 
-    fn expr_or<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_and::<E>()?;
-        while self.eat_kw(b"OR") {
-            let r = self.expr_and::<E>()?;
-            l = Expr::Binary(BinOp::Or, Box::new(l), Box::new(r));
+    /// An expression whose operators all bind at least as
+    /// tightly as `min`.
+    fn expr_bp<E>(&mut self, min: u8) -> Result<Expr, E> {
+        let mut l = self.expr_prefix::<E>()?;
+        while let Some(bp) = self.infix_bp() {
+            if bp < min {
+                break;
+            }
+            l = self.expr_infix::<E>(l, bp)?;
         }
         Ok(l)
     }
 
-    fn expr_and<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_not::<E>()?;
-        while self.eat_kw(b"AND") {
-            let r = self.expr_not::<E>()?;
-            l = Expr::Binary(BinOp::And, Box::new(l), Box::new(r));
-        }
-        Ok(l)
-    }
-
-    fn expr_not<E>(&mut self) -> Result<Expr, E> {
-        if self.eat_kw(b"NOT") {
-            let e = self.expr_not::<E>()?;
-            return Ok(Expr::Not(Box::new(e)));
-        }
-        self.expr_cmp::<E>()
-    }
-
-    fn expr_cmp<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_add::<E>()?;
-        loop {
-            // Postfix ISNULL / NOTNULL.
-            if self.eat_kw(b"ISNULL") {
-                l = Expr::IsNull(Box::new(l), false);
-                continue;
-            }
-            if self.eat_kw(b"NOTNULL") {
-                l = Expr::IsNull(Box::new(l), true);
-                continue;
-            }
-            if self.cur_is_kw(b"IS") {
-                self.pos += 1;
-                let neg = self.eat_kw(b"NOT");
-                let r = self.expr_add::<E>()?;
-                l = Expr::Binary(
-                    if neg { BinOp::IsNot } else { BinOp::Is },
-                    Box::new(l),
-                    Box::new(r),
-                );
-                continue;
-            }
-            let neg = if self.cur_is_kw(b"NOT")
-                && (self.is_kw(self.pos + 1, b"IN")
-                    || self.is_kw(self.pos + 1, b"LIKE")
-                    || (cfg!(feature = "v16") && self.is_kw(self.pos + 1, b"GLOB"))
-                    || self.is_kw(self.pos + 1, b"BETWEEN"))
-            {
-                self.pos += 1;
-                true
-            } else {
-                false
-            };
-            if self.eat_kw(b"IN") {
-                // `x IN tablename` (v0.16, `v16`): the pin reads
-                // it as `x IN (SELECT * FROM tablename)` — a
-                // one-column table is required at plan time.
-                #[cfg(feature = "v16")]
-                if let Tok::Ident(..) = self.cur().tok {
-                    let table = self.name::<E>()?;
-                    l = Expr::InSubquery(Box::new(l), Box::new(self.table_select(table)), neg);
-                    continue;
-                }
-                self.expect::<E>(Tok::LParen)?;
-                // A subquery body: SELECT (or a v0.9 VALUES core),
-                // possibly under further parentheses — the pin
-                // accepts `IN ((SELECT ...))`.
-                let save = self.pos;
-                let mut extra_parens = 0usize;
-                while matches!(self.cur().tok, Tok::LParen) {
-                    self.pos += 1;
-                    extra_parens += 1;
-                }
-                let is_subquery = self.cur_is_kw(b"SELECT")
-                    || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"));
-                if !is_subquery {
-                    // An expression list whose first item is
-                    // parenthesised: rewind and let the list
-                    // parser see the parens.
-                    self.pos = save;
-                    extra_parens = 0;
-                }
-                #[cfg(not(feature = "v06"))]
-                let _ = extra_parens;
-                if is_subquery {
-                    #[cfg(feature = "v06")]
-                    {
-                        let stmt = self.select_rich::<E>()?;
-                        for _ in 0..=extra_parens {
-                            self.expect::<E>(Tok::RParen)?;
-                        }
-                        l = Expr::InSubquery(Box::new(l), Box::new(stmt), neg);
-                        continue;
-                    }
-                    #[cfg(not(feature = "v06"))]
-                    {
-                        return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
-                    }
-                }
-
-                let mut list = AVec::new();
-                if !matches!(self.cur().tok, Tok::RParen) {
-                    loop {
-                        list.push(self.parse_expr::<E>()?);
-                        if self.eat(Tok::Comma) {
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                self.expect::<E>(Tok::RParen)?;
-                l = Expr::InList(Box::new(l), list, neg);
-                continue;
-            }
-            if self.eat_kw(b"LIKE") {
-                let r = self.expr_add::<E>()?;
-                // `x LIKE p ESCAPE e` (v0.16, `v16`) is the pin's
-                // `like(p, x, e)` call, negated for NOT LIKE.
-                #[cfg(feature = "v16")]
-                if self.eat_kw(b"ESCAPE") {
-                    let esc = self.expr_add::<E>()?;
-                    l = self.pattern_call::<E>(b"like", r, l, Some(esc), neg)?;
-                    continue;
-                }
-                l = Expr::Like(Box::new(l), Box::new(r), neg);
-                continue;
-            }
-            // `x [NOT] GLOB p` (v0.16, `v16`): the pin's
-            // `glob(p, x)` call (no ESCAPE form).
+    /// The binding power of the operator at the cursor, if it
+    /// is one that continues an expression.
+    fn infix_bp(&self) -> Option<u8> {
+        Some(match self.cur().tok {
+            Tok::Eq | Tok::Ne => BP_EQ,
+            Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge => BP_REL,
             #[cfg(feature = "v16")]
-            if self.eat_kw(b"GLOB") {
-                let r = self.expr_add::<E>()?;
-                l = self.pattern_call::<E>(b"glob", r, l, None, neg)?;
-                continue;
+            Tok::BitAnd | Tok::BitOr | Tok::Shl | Tok::Shr => BP_BIT,
+            Tok::Plus | Tok::Minus => BP_ADD,
+            Tok::Star | Tok::Slash | Tok::Percent => BP_MUL,
+            Tok::Concat => BP_CONCAT,
+            Tok::Ident(h, false) => {
+                let b = handle_bytes(self.arena, h);
+                if eq_ci(b, b"OR") {
+                    BP_OR
+                } else if eq_ci(b, b"AND") {
+                    BP_AND
+                } else if eq_ci(b, b"NOT") {
+                    // Only as the head of a negated operator: an
+                    // expression followed by any other NOT ends.
+                    let n = self.pos + 1;
+                    if self.is_kw(n, b"IN")
+                        || self.is_kw(n, b"LIKE")
+                        || self.is_kw(n, b"BETWEEN")
+                        || (cfg!(feature = "v16")
+                            && (self.is_kw(n, b"GLOB") || self.is_kw(n, b"NULL")))
+                    {
+                        BP_EQ
+                    } else {
+                        return None;
+                    }
+                } else if [
+                    &b"IS"[..],
+                    b"ISNULL",
+                    b"NOTNULL",
+                    b"IN",
+                    b"LIKE",
+                    b"BETWEEN",
+                ]
+                .iter()
+                .any(|k| eq_ci(b, k))
+                    || (cfg!(feature = "v16") && eq_ci(b, b"GLOB"))
+                {
+                    BP_EQ
+                } else if cfg!(feature = "v16") && eq_ci(b, b"COLLATE") {
+                    BP_COLLATE
+                } else {
+                    return None;
+                }
             }
-            if self.eat_kw(b"BETWEEN") {
-                let lo = self.expr_add::<E>()?;
-                self.expect_kw::<E>(b"AND")?;
-                let hi = self.expr_add::<E>()?;
-                l = Expr::Between(Box::new(l), Box::new(lo), Box::new(hi), neg);
-                continue;
-            }
-            if neg {
-                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
-            }
-            let op = match self.cur().tok {
-                Tok::Eq => Some(BinOp::Eq),
-                Tok::Ne => Some(BinOp::Ne),
-                Tok::Lt => Some(BinOp::Lt),
-                Tok::Le => Some(BinOp::Le),
-                Tok::Gt => Some(BinOp::Gt),
-                Tok::Ge => Some(BinOp::Ge),
-                _ => None,
-            };
-            let Some(op) = op else { break };
+            _ => return None,
+        })
+    }
+
+    /// Apply the operator at the cursor (of binding power `bp`)
+    /// to the left operand `l`.
+    fn expr_infix<E>(&mut self, l: Expr, bp: u8) -> Result<Expr, E> {
+        let bin = |op: BinOp, l: Expr, r: Expr| Expr::Binary(op, Box::new(l), Box::new(r));
+        if bp == BP_OR || bp == BP_AND {
             self.pos += 1;
-            // `==` is spelled with two Eq tokens by the lexer;
-            // accept it.
-            if op == BinOp::Eq {
-                let _ = self.eat(Tok::Eq);
-            }
-            let r = self.expr_add::<E>()?;
-            l = Expr::Binary(op, Box::new(l), Box::new(r));
+            let r = self.expr_bp::<E>(bp + 1)?;
+            return Ok(bin(if bp == BP_OR { BinOp::Or } else { BinOp::And }, l, r));
         }
-        Ok(l)
-    }
-
-    fn expr_add<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_mul::<E>()?;
-        loop {
-            let op = match self.cur().tok {
-                Tok::Plus => BinOp::Add,
-                Tok::Minus => BinOp::Sub,
-                _ => break,
-            };
+        if bp == BP_EQ && matches!(self.cur().tok, Tok::Ident(..)) {
+            return self.expr_eq_kw::<E>(l);
+        }
+        #[cfg(feature = "v16")]
+        if bp == BP_COLLATE {
             self.pos += 1;
-            let r = self.expr_mul::<E>()?;
-            l = Expr::Binary(op, Box::new(l), Box::new(r));
-        }
-        Ok(l)
-    }
-
-    fn expr_mul<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_concat::<E>()?;
-        loop {
-            let op = match self.cur().tok {
-                Tok::Star => BinOp::Mul,
-                Tok::Slash => BinOp::Div,
-                Tok::Percent => BinOp::Mod,
-                _ => break,
-            };
-            self.pos += 1;
-            let r = self.expr_concat::<E>()?;
-            l = Expr::Binary(op, Box::new(l), Box::new(r));
-        }
-        Ok(l)
-    }
-
-    fn expr_concat<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_collate::<E>()?;
-        while self.eat(Tok::Concat) {
-            let r = self.expr_collate::<E>()?;
-            l = Expr::Binary(BinOp::Concat, Box::new(l), Box::new(r));
-        }
-        Ok(l)
-    }
-
-    /// `expr COLLATE name` (v0.16, `v16`): binds tighter than
-    /// `||` and looser than the unary operators (the pin's
-    /// precedence: `-a COLLATE x` is `(-a) COLLATE x`).
-    #[cfg(feature = "v16")]
-    fn expr_collate<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_unary::<E>()?;
-        while self.eat_kw(b"COLLATE") {
             let c = self.coll_at::<E>(self.pos)?;
             self.pos += 1;
-            l = Expr::Collate(Box::new(l), c);
+            return Ok(Expr::Collate(Box::new(l), c));
         }
-        Ok(l)
+        let op = match self.cur().tok {
+            Tok::Eq => BinOp::Eq,
+            Tok::Ne => BinOp::Ne,
+            Tok::Lt => BinOp::Lt,
+            Tok::Le => BinOp::Le,
+            Tok::Gt => BinOp::Gt,
+            Tok::Ge => BinOp::Ge,
+            #[cfg(feature = "v16")]
+            Tok::BitAnd => BinOp::BitAnd,
+            #[cfg(feature = "v16")]
+            Tok::BitOr => BinOp::BitOr,
+            #[cfg(feature = "v16")]
+            Tok::Shl => BinOp::Shl,
+            #[cfg(feature = "v16")]
+            Tok::Shr => BinOp::Shr,
+            Tok::Plus => BinOp::Add,
+            Tok::Minus => BinOp::Sub,
+            Tok::Star => BinOp::Mul,
+            Tok::Slash => BinOp::Div,
+            Tok::Percent => BinOp::Mod,
+            _ => BinOp::Concat,
+        };
+        self.pos += 1;
+        // `==` is spelled with two Eq tokens by the lexer.
+        if op == BinOp::Eq {
+            let _ = self.eat(Tok::Eq);
+        }
+        let r = self.expr_bp::<E>(bp + 1)?;
+        Ok(bin(op, l, r))
     }
 
-    #[cfg(not(feature = "v16"))]
-    fn expr_collate<E>(&mut self) -> Result<Expr, E> {
+    /// The keyword operators of the `=` level: IS [NOT]
+    /// [DISTINCT FROM], ISNULL, NOTNULL, NOT NULL, [NOT] IN /
+    /// LIKE / GLOB / BETWEEN.
+    fn expr_eq_kw<E>(&mut self, l: Expr) -> Result<Expr, E> {
+        // Postfix ISNULL / NOTNULL.
+        if self.eat_kw(b"ISNULL") {
+            return Ok(Expr::IsNull(Box::new(l), false));
+        }
+        if self.eat_kw(b"NOTNULL") {
+            return Ok(Expr::IsNull(Box::new(l), true));
+        }
+        if self.eat_kw(b"IS") {
+            let neg = self.eat_kw(b"NOT");
+            // `IS [NOT] DISTINCT FROM` (v0.16, `v16`): `IS NOT
+            // DISTINCT FROM` is IS, `IS DISTINCT FROM` is IS NOT.
+            #[cfg(feature = "v16")]
+            let neg = if self.eat_kw(b"DISTINCT") {
+                self.expect_kw::<E>(b"FROM")?;
+                !neg
+            } else {
+                neg
+            };
+            let start = self.pos;
+            let r = self.expr_bp::<E>(BP_REL)?;
+            // `x IS [NOT] TRUE / FALSE` with the bare keyword as
+            // the whole right operand is the pin's truth test
+            // (`TK_TRUTH`): any true value IS TRUE, NULL is
+            // neither (v0.16 fix, ungated: `2 IS TRUE` was 0).
+            // Written as the CASE it equals.
+            if self.pos == start + 1
+                && let Expr::Literal(Literal::Integer(v @ (0 | 1))) = r
+                && (self.is_kw(start, b"TRUE") || self.is_kw(start, b"FALSE"))
+            {
+                let test = if v == 1 { l } else { Expr::Not(Box::new(l)) };
+                let (yes, no) = if neg { (0, 1) } else { (1, 0) };
+                let mut whens = AVec::new();
+                whens.push((test, Expr::Literal(Literal::Integer(yes))));
+                return Ok(Expr::Case {
+                    base: None,
+                    whens,
+                    otherwise: Some(Box::new(Expr::Literal(Literal::Integer(no)))),
+                });
+            }
+            let op = if neg { BinOp::IsNot } else { BinOp::Is };
+            return Ok(Expr::Binary(op, Box::new(l), Box::new(r)));
+        }
+        let neg = self.eat_kw(b"NOT");
+        // Postfix `NOT NULL` (v0.16, `v16`): NOTNULL.
+        #[cfg(feature = "v16")]
+        if neg && self.cur_is_kw(b"NULL") {
+            self.pos += 1;
+            return Ok(Expr::IsNull(Box::new(l), true));
+        }
+        if self.eat_kw(b"IN") {
+            return self.expr_in::<E>(l, neg);
+        }
+        if self.eat_kw(b"LIKE") {
+            let r = self.expr_bp::<E>(BP_REL)?;
+            // `x LIKE p ESCAPE e` (v0.16, `v16`) is the pin's
+            // `like(p, x, e)` call, negated for NOT LIKE.
+            #[cfg(feature = "v16")]
+            if self.eat_kw(b"ESCAPE") {
+                let esc = self.expr_bp::<E>(BP_REL)?;
+                return self.pattern_call::<E>(b"like", r, l, Some(esc), neg);
+            }
+            return Ok(Expr::Like(Box::new(l), Box::new(r), neg));
+        }
+        // `x [NOT] GLOB p` (v0.16, `v16`): the pin's
+        // `glob(p, x)` call (no ESCAPE form).
+        #[cfg(feature = "v16")]
+        if self.eat_kw(b"GLOB") {
+            let r = self.expr_bp::<E>(BP_REL)?;
+            return self.pattern_call::<E>(b"glob", r, l, None, neg);
+        }
+        if self.eat_kw(b"BETWEEN") {
+            // The lower bound runs to the BETWEEN's own AND; the
+            // upper bound takes only operators tighter than `=`.
+            let lo = self.expr_bp::<E>(BP_NOT)?;
+            self.expect_kw::<E>(b"AND")?;
+            let hi = self.expr_bp::<E>(BP_REL)?;
+            return Ok(Expr::Between(Box::new(l), Box::new(lo), Box::new(hi), neg));
+        }
+        Err(perr(self.cur().offset, ParseKind::UnexpectedToken))
+    }
+
+    /// The right side of `x [NOT] IN`: a table name (`v16`), a
+    /// parenthesised subquery, or an expression list.
+    fn expr_in<E>(&mut self, l: Expr, neg: bool) -> Result<Expr, E> {
+        // `x IN tablename` (v0.16, `v16`): the pin reads it as
+        // `x IN (SELECT * FROM tablename)` — a one-column table
+        // is required at plan time.
+        #[cfg(feature = "v16")]
+        if let Tok::Ident(..) = self.cur().tok {
+            let table = self.name::<E>()?;
+            return Ok(Expr::InSubquery(
+                Box::new(l),
+                Box::new(self.table_select(table)),
+                neg,
+            ));
+        }
+        self.expect::<E>(Tok::LParen)?;
+        // A subquery body: SELECT (or a v0.9 VALUES core),
+        // possibly under further parentheses — the pin accepts
+        // `IN ((SELECT ...))`.
+        let save = self.pos;
+        let mut extra_parens = 0usize;
+        while matches!(self.cur().tok, Tok::LParen) {
+            self.pos += 1;
+            extra_parens += 1;
+        }
+        let is_subquery =
+            self.cur_is_kw(b"SELECT") || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"));
+        if !is_subquery {
+            // An expression list whose first item is
+            // parenthesised: rewind and let the list parser see
+            // the parens.
+            self.pos = save;
+            extra_parens = 0;
+        }
+        #[cfg(not(feature = "v06"))]
+        let _ = extra_parens;
+        if is_subquery {
+            #[cfg(feature = "v06")]
+            {
+                let stmt = self.select_rich::<E>()?;
+                for _ in 0..=extra_parens {
+                    self.expect::<E>(Tok::RParen)?;
+                }
+                return Ok(Expr::InSubquery(Box::new(l), Box::new(stmt), neg));
+            }
+            #[cfg(not(feature = "v06"))]
+            {
+                return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+            }
+        }
+        let mut list = AVec::new();
+        if !matches!(self.cur().tok, Tok::RParen) {
+            loop {
+                list.push(self.parse_expr::<E>()?);
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect::<E>(Tok::RParen)?;
+        Ok(Expr::InList(Box::new(l), list, neg))
+    }
+
+    /// A prefix position: `NOT`, the unary operators, or a
+    /// primary.
+    fn expr_prefix<E>(&mut self) -> Result<Expr, E> {
+        if self.eat_kw(b"NOT") {
+            let e = self.expr_bp::<E>(BP_EQ)?;
+            return Ok(Expr::Not(Box::new(e)));
+        }
         self.expr_unary::<E>()
     }
 
@@ -1702,22 +1820,35 @@ impl<'a> Parser<'a> {
         }
         if self.eat(Tok::Minus) {
             let start = self.pos;
-            let e = self.expr_unary::<E>()?;
+            let e = self.expr_prefix::<E>()?;
             // `-(9223372036854775808)`: parentheses (and unary
-            // `+`) are invisible to the pin's integer rule.
+            // `+`) are invisible to the pin's integer rule — and
+            // to its "hex literal too big" for `-` over
+            // `0x8000000000000000` (v0.16).
             let toks = self.toks.as_slice().get(start..self.pos).unwrap_or(&[]);
-            if toks.iter().enumerate().all(|(k, t)| {
-                matches!(t.tok, Tok::LParen | Tok::RParen | Tok::Plus)
-                    || self.min_magnitude(start + k)
-            }) && toks.iter().any(|t| matches!(t.tok, Tok::Real(_)))
+            let only = |f: &dyn Fn(usize) -> bool| {
+                toks.iter().enumerate().all(|(k, t)| {
+                    matches!(t.tok, Tok::LParen | Tok::RParen | Tok::Plus) || f(start + k)
+                })
+            };
+            if only(&|k| self.min_magnitude(k))
+                && toks.iter().any(|t| matches!(t.tok, Tok::Real(_)))
             {
                 return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
+            }
+            if only(&|k| self.hex_min(k)) && toks.iter().any(|t| matches!(t.tok, Tok::Integer(_))) {
+                return Err(perr(self.cur().offset, ParseKind::HexLiteralTooBig));
             }
             return Ok(Expr::Neg(Box::new(e)));
         }
         if self.eat(Tok::Plus) {
-            let e = self.expr_unary::<E>()?;
+            let e = self.expr_prefix::<E>()?;
             return Ok(Expr::Pos(Box::new(e)));
+        }
+        #[cfg(feature = "v16")]
+        if self.eat(Tok::BitNot) {
+            let e = self.expr_prefix::<E>()?;
+            return Ok(Expr::BitNot(Box::new(e)));
         }
         self.expr_primary::<E>()
     }
@@ -1755,6 +1886,20 @@ impl<'a> Parser<'a> {
                 }
             }
             let e = self.parse_expr::<E>()?;
+            // A row value `(a, b, ...)` (v0.16, `v16`).
+            #[cfg(feature = "v16")]
+            if self.eat(Tok::Comma) {
+                let mut items = AVec::new();
+                items.push(e);
+                loop {
+                    items.push(self.parse_expr::<E>()?);
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect::<E>(Tok::RParen)?;
+                return Ok(Expr::Vector(items));
+            }
             self.expect::<E>(Tok::RParen)?;
             return Ok(e);
         }
@@ -3156,6 +3301,72 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An UPDATE / upsert `SET` list: `col = expr, ...`. Under
+    /// `v16` an item may be `(c1, ..., cn) = <row>` (v0.16),
+    /// split here into one assignment per column: a row value of
+    /// size n gives each column its element, any other
+    /// right-hand side gives column i `RowItem(rhs, i, n)` (the
+    /// planner requires a scalar subquery of n columns). A size
+    /// mismatch is the pin's "N columns assigned M values".
+    fn set_list<E>(&mut self) -> Result<AVec<(ABytes, Expr)>, E> {
+        let mut assignments: AVec<(ABytes, Expr)> = AVec::new();
+        loop {
+            #[cfg(feature = "v16")]
+            if self.eat(Tok::LParen) {
+                let mut cols: AVec<ABytes> = AVec::new();
+                loop {
+                    cols.push(self.plain_name::<E>()?);
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect::<E>(Tok::RParen)?;
+                self.expect::<E>(Tok::Eq)?;
+                let e = self.parse_expr::<E>()?;
+                let n = u16::try_from(cols.len()).map_err(|_| Error::Schema {
+                    kind: crate::error::SchemaKind::ColumnCountMismatch,
+                })?;
+                match e {
+                    Expr::Vector(items) => {
+                        if items.len() != cols.len() {
+                            return Err(Error::Schema {
+                                kind: crate::error::SchemaKind::ColumnCountMismatch,
+                            });
+                        }
+                        for (c, x) in cols.iter().zip(items.iter()) {
+                            assignments.push((*c, x.clone()));
+                        }
+                    }
+                    e if n == 1 => {
+                        if let Some(c) = cols.as_slice().first() {
+                            assignments.push((*c, e));
+                        }
+                    }
+                    e => {
+                        let rhs = Box::new(e);
+                        for (i, c) in cols.iter().enumerate() {
+                            let i = u16::try_from(i).unwrap_or(u16::MAX);
+                            assignments.push((*c, Expr::RowItem(rhs.clone(), i, n)));
+                        }
+                    }
+                }
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+            let col = self.plain_name::<E>()?;
+            self.expect::<E>(Tok::Eq)?;
+            let e = self.parse_expr::<E>()?;
+            assignments.push((col, e));
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(assignments)
+    }
+
     fn update_stmt<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"UPDATE")?;
         // OR clause: under v05 alone only IGNORE widens behaviour
@@ -3190,17 +3401,7 @@ impl<'a> Parser<'a> {
             self.opt_alias()
         };
         self.expect_kw::<E>(b"SET")?;
-        let mut assignments: AVec<(ABytes, Expr)> = AVec::new();
-        loop {
-            let col = self.plain_name::<E>()?;
-            self.expect::<E>(Tok::Eq)?;
-            let e = self.parse_expr::<E>()?;
-            assignments.push((col, e));
-            if self.eat(Tok::Comma) {
-                continue;
-            }
-            break;
-        }
+        let assignments = self.set_list::<E>()?;
         // FROM (v0.7): sources in SELECT shape, after SET and
         // before WHERE, exactly as SQLite orders the clauses.
         #[cfg(feature = "v07")]

@@ -1192,6 +1192,196 @@ and REAL ties, byte-identical.
   parameter numbering and binding semantics are long stable,
   and CI runs the real 3.54.1 pin.
 
+### Expression operators, literals and row values (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1), gated as below. New surface is behind `v16`; the fixes
+to claimed paths are ungated.
+
+**Shipped — ungated (silent wrong answers on claimed v0.4 / v0.6
+paths):**
+
+- *Precedence.* The expression parser is now a
+  precedence-climbing loop over the pin's `parse.y` levels: OR <
+  AND < NOT < `= == != <> IS IN LIKE GLOB BETWEEN ISNULL NOTNULL`
+  < `< <= > >=` < `& | << >>` < `+ -` < `* / %` < `||` <
+  COLLATE < unary `- + ~`. `<` and `=` used to share a level
+  (`3 = 2 < 3` was 1, `0 = 1 > 2` was 0). A postfix operator's
+  result takes tighter operators after it (`x ISNULL + 1` is
+  `(x ISNULL) + 1`, `1 IN (1) + 1` is 2), BETWEEN's lower bound
+  runs to its own AND and its upper bound takes only operators
+  tighter than `=`, and a unary operand may start with NOT
+  (`- NOT 0 = 1`).
+- *`x IS [NOT] TRUE / FALSE`* is the pin's truth test
+  (`TK_TRUTH`) when the bare keyword is the whole right operand:
+  any true value IS TRUE, NULL is neither (`2 IS TRUE`, `0.5 IS
+  TRUE`, `'a' IS FALSE` were 0). Written as the CASE it equals.
+- *Hex literals* (evaluator builds): 16 significant digits as
+  two's complement (`0xffffffffffffffff` = -1,
+  `0x8000000000000000` = i64::MIN; hipp refused anything past
+  `0x7fff...`), leading zeros free, more digits the pin's "hex
+  literal too big" (`ParseKind::HexLiteralTooBig`), as is `-`
+  over `0x8000000000000000` through parentheses / unary `+`
+  (`-(+0x8000000000000000)`, `- - 0x8...`; `0 - 0x8...` is the
+  REAL). `'0x10'` text is never hex (CAST, affinity, `+0`).
+- *Digit separators and glued identifiers* (evaluator builds):
+  the pin's tokenizer — `_` between two digits (hex digits in a
+  hex literal) in every part, `1_000` = 1000 (hipp read `1`
+  aliased `_000`, a silent wrong value), and any number followed
+  directly by an identifier character (`1a`, `1_`, `1e_5`,
+  `0x1g`, `1$`) is "unrecognized token" (hipp read `1a` as `1`
+  aliased `a`). `-9_223_372_036_854_775_808` is the INTEGER.
+  The tiny profile keeps its old scan (it has no position where
+  either reading was accepted, and refuses hex past
+  `0x7fff...`, as before).
+- *Aggregate scoping* (`RExpr::Agg::lvl`): an aggregate whose
+  arguments reference no column of its own query but some
+  enclosing query's belongs to the innermost such query (the
+  pin's `sqlite3ReferencesSrcList` walk); no column at all keeps
+  it local. The owner counts it as its own (`has_agg` /
+  `collect_aggs` walk subquery plans by depth, so `SELECT
+  (SELECT max(t.a) FROM u) FROM t` is one row and the min/max
+  bare-column rule sees it), folds it per group and substitutes
+  the value into the subquery plan before executing it
+  (`subst_owned_aggs`, in `eval_group_sub`); the subquery does
+  not aggregate over it (`(SELECT max(t.a) + b FROM u)` keeps
+  u's rows, `GROUP BY max(t.a)` there is legal). "misuse of
+  aggregate" where the owner cannot aggregate: its WHERE (also
+  through an alias), GROUP BY, an aggregate's arguments, UPDATE
+  / DELETE; an enclosing query's aggregate directly in a WHERE
+  is refused unless that WHERE's own query aggregates (the
+  pin's NC_AllowAgg rule).
+- *ORDER BY aggregate:* an aggregate in ORDER BY alone no longer
+  makes the query an aggregate one (`SELECT a FROM t ORDER BY
+  max(a)` returned one row; the pin: "misuse of aggregate").
+  Nested aggregates (`sum(max(a))`) are refused at prepare.
+- *Qualified names fall through:* `t.a` where an inner source
+  is aliased `t` but has no column `a` resolves in the enclosing
+  scopes, as the pin's `lookupName` does (hipp: "no such
+  column").
+
+**Shipped — `v16`:**
+
+- `&`, `|`, `<<`, `>>` (one level, left-associative) and unary
+  `~`: operands as 64-bit integers (`sqlite3VdbeIntValue`: a
+  text / blob's integer prefix, a REAL truncated and saturated),
+  NULL in -> NULL out, always INTEGER; a negative shift count
+  shifts the other way, a count >= 64 gives 0 (-1 for a negative
+  value shifted right) — `OP_ShiftLeft` / `OP_ShiftRight`.
+- `IS [NOT] DISTINCT FROM` (IS NOT / IS; `x IS NOT DISTINCT FROM
+  TRUE` is the truth test, as on the pin) and postfix `NOT
+  NULL`.
+- Row values (`Expr::Vector`, `SchemaKind::RowValueMisused`):
+  `(a, b) op (c, d)` for `= == <> != < <= > >= IS [NOT]` is
+  written as scalar comparisons — AND of the element tests for
+  `=` / IS, OR for `<>` / IS NOT, lexicographic `a1 < b1 OR (a1
+  = b1 AND ...)` otherwise — so affinity and collation stay per
+  element and three-valued logic gives the pin's NULLs; BETWEEN
+  and CASE (base and WHEN rows) build on it. `(a, b) IN ((..),
+  (..))` and `IN (SELECT a, b ...)` evaluate natively
+  (`ScalarFn::Vector` in an `InList`): each element compares
+  under the affinity of the RIGHTMOST row's element — the pin
+  rewrites a row-value IN list as `IN (VALUES ...)`, whose
+  column affinity is its last row's (probed: `(c,b) IN
+  ((a,'q'),(2,'y'))` finds nothing where `((2,'y'),(a,'q'))`
+  finds row 2). A multi-column scalar subquery is a row value
+  (`SubPlan::scalar_col`: one plan copy per column; the hoist
+  cache keys on (node, column)); row-major subquery values for
+  row-value IN. `UPDATE ... SET (a, b) = (x, y)` / `= (SELECT
+  ...)` (also in upsert DO UPDATE) splits into per-column
+  assignments (`Expr::RowItem`). Errors as on the pin: sizes
+  that differ, a row value nested in one, or anywhere but those
+  operands (arithmetic, NOT, IS NULL, functions, CAST, COLLATE,
+  ORDER / GROUP BY, LIMIT, result columns, INSERT values) are
+  `RowValueMisused`; wrong subquery widths and "N columns
+  assigned M values" are `ColumnCountMismatch`.
+
+**Oracle-probing notes** (all on the live 3.54.1 pin):
+`1<<63` = i64::MIN, `1<<64` = 0, `1<<-1` = 0, `8>>-1` = 16,
+`-1>>64` = -1, `1<<-64` = 0, `-1<<-100` = -1; `~5.7` = -6,
+`~-5.7` = 4, `~'abc'` = -1; `'1e3'|0` = 1, `'12abc'|1` = 13, `'
+12 '|0` = 12, `1e19|0` = i64::MAX, `-1e19|0` = i64::MIN,
+`'9223372036854775808'|0` = i64::MAX; `1|2&3` = 3, `6&3|8` =
+10, `1&3<<2` = 4 (one level, left to right); `1 + 1 << 1 + 1` =
+8, `1 || 2 << 1` = 24, `1 << 1 || 2` = 4096. `0x1_0` = 16,
+`0x1ffffffffffffffff`, `-0x8000000000000000`,
+`-(0x8000000000000000)`, `- - 0x8...` are "hex literal too big";
+`0x`, `0x1g`, `0x_1`, `1__0`, `1_`, `1_e5`, `1e_5`, `1a`, `1$`
+"unrecognized token"; `.5_1` = 0.51, `1e1_0` = 1e10. `1 ISNULL
++ 1` = 1, `2 = 1 ISNULL + 1` = 1, `1 NOT NULL + 1` = 2, `NOT 1
+NOT NULL` = 0, `2 BETWEEN 1 = 1 AND 3` = 1, `'a' LIKE 'b' = 0`
+= 1, `0 = 'a' LIKE 'b'` = 0, `1 BETWEEN 1 OR 0 AND 3` is
+"incomplete input". `(1,NULL)<(1,2)` NULL, `(1,NULL)<(2,0)` 1,
+`(2,NULL)<(1,0)` 0, `(1,NULL)<=(1,NULL)` NULL; `(1,2) IN ((1,2),
+(NULL,1))` 1, `(1,2) IN (VALUES (1,NULL))` NULL, `(1,2) IN
+(VALUES (2,NULL))` 0; `(1,2) IN ()` 0; `(1,2) IN ((SELECT
+1,2))` 1 but `IN ((SELECT 1,2),(3,4))` an error; `(SELECT 1,2)
+IN ((1,2))` misused but `IN (SELECT 1,2)` fine; `CASE (1,2) WHEN
+(1,2)` works; `(SELECT 1,2 UNION SELECT 0,0) = (0,0)` is 0 (the
+UNION first-row rule); `SET (a,a) = (5,6)` keeps 6, `SET (rowid,
+a)` works, `SET (a,b) = (SELECT 7,8 WHERE 0)` writes NULLs.
+Aggregates: `SELECT a, (SELECT count(t.a) FROM u) FROM t` is
+`1|3`; `(SELECT count(t.a) FROM e)` over an empty e is one NULL
+row; `(SELECT (SELECT max(u.b) FROM e) FROM u)` makes the u
+level aggregate (three NULL rows); `(SELECT 1 FROM u WHERE b =
+max(t.a))` is "misuse of aggregate function" but `(SELECT
+count(*) FROM u WHERE b < min(t.a))` runs; derived tables
+inside the subquery count at the subquery's level (`(SELECT x
+FROM (SELECT max(t.a) AS x))` is 3).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh`
+run end with "==> all gates passed". New suites:
+`tests/expr_v16.rs` (23 tests: precedence fixed cases and a
+480-expression generated corpus over every level; truth tests
+over a table; DISTINCT FROM / NOT NULL; bitwise fixed cases, a
+720-expression generated corpus over every storage class and
+the shift counts around 0 / 64, columns of every affinity,
+generated columns and UPDATE; hex literals, their errors and
+affinity contexts (typed columns, DEFAULTs); digit separators
+and glued identifiers; the smallest integer literal; row-value
+comparisons, a 420-expression generated corpus, IN lists /
+VALUES / subqueries with the rightmost-row affinity rule, scalar
+subquery rows, 43 error-vs-error cases, UPDATE / upsert SET
+rows, CHECK and DELETE; aggregate scoping — 58 statements, the
+misuse cases, the alias cases, the qualifier fall-through and a
+generated corpus over random tables). Every write is checked by
+the oracle reading both files and `integrity_check`.
+`hipp-cli/tests/cli_v16_expr.rs` (2 tests, byte-identical
+one-shot and over stdin, REAL results included). Updated:
+`tests/agg_subquery_v11.rs` accepts `sum(sum(b))` refused at
+prepare (the pin's behaviour) as well as at step.
+
+**Size:** tiny **75,960 B** (Δ **0**: the bitwise / row-value
+code is `v16`, the precedence / scoping code is in the
+evaluator, and the tiny lexer keeps its number scan — it also
+dropped an `expect`). Full **301,379 B** (Δ **+9,848 B** vs
+291,531, ratchet raised to it): the precedence-climbing parser,
+row values (resolution, IN evaluation, the per-column subquery
+parts, UPDATE SET rows), the bitwise operators, the evaluator's
+number lexer and the aggregate-scope walkers.
+
+**Honest gaps:**
+
+- A column named `true` / `false` does not shadow the keyword
+  (pre-existing for every TRUE / FALSE; now also for `x IS
+  TRUE`, which the pin then reads as `x IS <column>`).
+- An enclosing query's aggregate whose arguments hold a
+  subquery is refused (`Unsupported`); the pin folds it. An
+  aggregate of an enclosing query nested inside another query's
+  aggregate arguments (`(SELECT sum((SELECT max(t.a) FROM e))
+  FROM u)`) is refused at execution rather than at prepare.
+- The written row-value IN list takes each element's collation
+  from the rightmost row as for affinity; collations on other
+  rows were probed only in the cases tested.
+- A multi-column scalar subquery used as a row value runs once
+  per element it supplies (correlated ones per row and element);
+  results are the same, the cost is not the pin's.
+- `MATCH`, `REGEXP` and the JSON `->` / `->>` operators remain
+  unparsed (their functions do not exist in hipp).
+- UPDATE / DELETE refuse an enclosing query's aggregate with
+  `Unsupported`, not `MisusedAggregate` (pre-existing kind).
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the
