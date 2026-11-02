@@ -169,8 +169,16 @@ impl<'a> Parser<'a> {
         match self.cur().tok {
             Tok::Ident(h, _) => {
                 self.pos += 1;
-                // Accept (and discard) a schema qualifier: `main.t`.
+                // Accept (and discard) the schema qualifier `main.`
+                // — the only schema a hipp connection has. Any
+                // other (`temp.t`, an attached name) is refused:
+                // hipp used to drop it and use `main.t`, where the
+                // pin finds no such table (or, for CREATE TABLE
+                // temp.t, makes a temporary one outside the file).
                 if matches!(self.cur().tok, Tok::Dot) {
+                    if !eq_ci(handle_bytes(self.arena, h), b"main") {
+                        return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                    }
                     self.pos += 1;
                     return self.name::<E>();
                 }

@@ -83,6 +83,61 @@ then outer scopes; never in the result list itself);
 `x [NOT] IN tablename` (one-column tables); string-literal
 aliases (`AS 'q'`, bare `'q'`).
 
+**Review fixes (second pass, same day):**
+
+- *v16 alias with a subquery, used from a nested subquery
+  with its own FROM* (silent wrong rows): the alias's item was
+  cloned with its subquery slots numbered for its home scope,
+  but evaluated after the nested sources. It is now rebased
+  onto the deeper row (`query::alias_from_outer` /
+  `shift_expr`: slots and rowid sources at or past the home
+  stack's end move by the difference).
+- *v16 aliased aggregate inside a subquery* (HAVING / ORDER
+  BY re-aggregated the subquery's rows): refused
+  (`Error::Unsupported`) — on the pin the aggregate stays
+  the outer group's value, which hipp cannot evaluate inside
+  a subquery. In WHERE both engines refuse.
+- *Compound ORDER BY* (ungated): terms now resolve per core
+  as in the pin's `resolveCompoundOrderBy` — an `AS` name,
+  else the term resolved in that core's FROM scope alone and
+  matched to the item that is the same reference
+  (`CompKeys`; replaces the `(qualifier, name)` keys). After
+  `RIGHT JOIN ... USING (id)`, `ORDER BY id` is `b.id`; after
+  FULL, `coalesce(a.id, b.id)`; `ORDER BY b.id` is accepted
+  and `a.id` refused there. Also fixes older acceptances: an
+  ambiguous bare name (`FROM a, b ... ORDER BY id`) and an
+  expression item's text used as a name now error, as on the
+  pin.
+- *Duplicate column names* (ungated): a derived table's and
+  a view's duplicates become `id`, `id:1`, ... (the pin's
+  `sqlite3ColumnsFromExprList`, shared with CTAS's
+  `rules::unique_names`), so NATURAL / USING over such a
+  derived table no longer drops the later columns from
+  `SELECT *`, and `"id:1"` resolves.
+- *View column lists* (ungated, `.schema` comment and
+  `ViewDef.columns`): NATURAL / USING columns once, `t.*`
+  unaffected, duplicates renamed.
+- *v16 scalar / EXISTS LIMIT*: the pin's `LIMIT (X<>0)`
+  rewrite (the `0` with NUMERIC affinity): `LIMIT 2.5`,
+  `'x'`, `x'00'`, `9223372036854775808` act as `LIMIT 1`,
+  `'0'` as 0, NULL still errors; OFFSET, IN subqueries and
+  derived tables keep `MustBeInt`.
+- *INSERT ... SELECT upsert quirk* (ungated): the refusal now
+  only covers an `ON` that could still start the last
+  source's join constraint; a last join with ON / USING, and
+  GROUP BY / HAVING, terminate the FROM clause and are
+  accepted, as on the pin (the ON-terminated form was found
+  while probing the USING one).
+- *UPDATE ... FROM repeating the target* (ungated): the
+  same table under the same alias (or both bare) is
+  `SchemaKind::UpdateTargetInFrom`, as on the pin; `FROM t AS
+  t`, `FROM t AS t2` and `UPDATE t AS q ... FROM t` still run.
+- *Schema qualifiers* (ungated, tiny included): `name()`
+  dropped any qualifier, so `temp.s` / `foo.s` (including the
+  new `x IN temp.s`) read `main.s` and `CREATE TABLE temp.q`
+  wrote a main table; anything but `main.` is now
+  `ParseKind::UnsupportedClause`.
+
 **Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
 not error text): the pin always runs the RIGHT/FULL join's
 left operand as the outer loop (EXPLAIN shows `RIGHT-JOIN b`
@@ -99,23 +154,34 @@ yields `coalesce(a.id, b.id)`). LIMIT: `'2'`, `' 2 '`,
 column" even inside a correlated subquery. Aliases: `WHERE`
 sees them, `ON` too (`ON k=u.a` substitutes `k` and then
 reports `a` ambiguous), the result list never; `GROUP BY b`
-with alias `b` and column `b` groups by the column.
+with alias `b` and column `b` groups by the column. Review
+pass: `UPDATE t ... FROM t` and `UPDATE t AS x ... FROM t AS
+x` error, `FROM t AS t` runs (the rule compares table and
+alias); `INSERT ... SELECT ... JOIN b ON ... ON CONFLICT` and
+`... GROUP BY ... ON CONFLICT` parse; `VALUES (1),(2) UNION
+SELECT 3 ORDER BY column1` matches the VALUES head's names.
 
 **Gates:** `ci/local-gates.sh` (full run) green — fmt,
 clippy `-D warnings` (default, all-features, every
 `ci/feature-sets.txt` line incl. the new `v16`), workspace
 tests, no_std builds (thumbv7em / thumbv6m / riscv32imac /
 wasm32, both profiles), both size gates. New suites:
-`tests/query_shape_v16.rs` (18 tests: RIGHT/FULL orders and
+`tests/query_shape_v16.rs` (27 tests: RIGHT/FULL orders and
 chains, outer joins in subqueries / derived tables / INSERT
 ... SELECT / UPDATE ... FROM, NATURAL/USING rows and star
 expansion, affinity, error agreement, ON forward references,
 ON-subquery alignment, rowid precedence, NULLS at every site,
 term rules, empty IN, a PRNG-generated join corpus, and the
-`v16` LIMIT / alias / IN-table tests — the ungated tests also
-pass in a `v10`-without-`v16` build) and
-`hipp-cli/tests/cli_v16_query_shape.rs` (3 byte-identical
-batches, one-shot and stdin, REAL / blob rendering included).
+`v16` LIMIT / alias / IN-table tests, plus one regression
+test per review finding — nested alias rebasing with a
+PRNG-generated alias corpus, aggregate-alias refusal,
+per-core compound ORDER BY, duplicate derived names, the
+subquery LIMIT rewrite, upsert after terminated FROM
+clauses, UPDATE ... FROM target repeats, schema qualifiers;
+each of the nine fails on 1248d47) and
+`hipp-cli/tests/cli_v16_query_shape.rs` (4 byte-identical
+batches, one-shot and stdin, REAL / blob rendering included,
+plus the views' `.schema` column lists).
 
 **Size:** tiny **81,616 B** (Δ **−64 B** vs 81,680; ratchet
 lowered — the AST change from literal LIMIT integers to
@@ -125,6 +191,15 @@ the RIGHT/FULL tail, USING/NATURAL planning, alias scopes and
 LIMIT evaluation, mostly paid for by merging the three
 duplicated join executors and the duplicated
 `plan_query` / `plan_subquery` bodies into `plan_core`).
+Review pass, vs 1248d47 (after the column-constraints unit):
+tiny **81,564 B** (Δ **+40 B** vs 81,524, ratchet raised —
+justified as a correctness fix on the tiny profile's own
+CREATE TABLE / INSERT / scan SELECT paths: the parser's
+`name()` silently turned `temp.t` into `main.t`; the other
+review fixes are compiled out of tiny); full **279,455 B**
+(Δ **+3,328 B** vs 276,127, ratchet raised: alias rebasing,
+per-core compound ORDER BY keys, the subquery LIMIT rewrite,
+view / derived name dedupe and the UPDATE ... FROM check).
 
 **Honest gaps:**
 
@@ -138,7 +213,20 @@ duplicated join executors and the duplicated
   an alias, `WHERE z = (SELECT max(z) ...)` is a misuse
   error); hipp still aggregates it in the subquery. Found
   while probing aliases; a subquery-scoping fix outside this
-  unit.
+  unit. The same machinery is why an *aliased aggregate*
+  used inside a subquery (`HAVING (SELECT c) > 1`,
+  `ORDER BY (SELECT c)`) is refused rather than answered —
+  the pin runs those.
+- Compound ORDER BY terms are an ordinal or a (qualified)
+  column name; the pin also matches a general expression
+  term against an identical item (`SELECT a+0 ... UNION ...
+  ORDER BY a+0`), which hipp still refuses.
+- Out of scope, found by the review (older behaviour, still
+  open): `x'01' || x'01'` is BLOB in hipp, TEXT on the pin;
+  with min()/max() plus another aggregate the pin still takes
+  bare columns from the extremum row, hipp's `pick_rep` only
+  for a lone min/max. A three-part `main.t.col` reference is
+  refused.
 - `-9223372036854775808` is an INTEGER literal on the pin and
   a REAL in hipp (so `LIMIT -9223372036854775808` errors) —
   a literal-parsing gap outside this unit.

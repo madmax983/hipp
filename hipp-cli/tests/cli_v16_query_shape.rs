@@ -138,6 +138,44 @@ SELECT w, w IN k, w NOT IN k, w IN e, w NOT IN e FROM s;
 SELECT w FROM s WHERE w IN main.k ORDER BY w;
 ";
 
+/// Review regressions: a view's `.schema` column list over
+/// NATURAL / USING joins and duplicate names, compound ORDER BY
+/// on a RIGHT / FULL join's USING column, a derived table's
+/// duplicate names under USING, and (v16) an alias with a
+/// subquery used inside a nested subquery plus the scalar /
+/// EXISTS LIMIT rewrite.
+const REVIEW: &str = "\
+CREATE TABLE a(id INTEGER, x);
+CREATE TABLE b(id TEXT, y);
+INSERT INTO a VALUES(1, 'a1'), (5, 'a5');
+INSERT INTO b VALUES('5', 'b5'), (3, 'b3'), (0.5, 'b0');
+CREATE VIEW v1 AS SELECT * FROM a NATURAL JOIN b;
+CREATE VIEW v2 AS SELECT * FROM a JOIN b USING (id);
+CREATE VIEW v3 AS SELECT a.id, b.id FROM a, b;
+CREATE VIEW v4 AS SELECT a.*, b.* FROM a NATURAL JOIN b;
+CREATE VIEW v5 AS SELECT * FROM a NATURAL JOIN b NATURAL JOIN a;
+CREATE VIEW v6 AS SELECT x AS y, y, y FROM a, b;
+SELECT a.id, b.id FROM a RIGHT JOIN b USING (id) UNION ALL SELECT 8, 9.5 ORDER BY id;
+SELECT a.id, b.id, id FROM a FULL JOIN b USING (id) UNION ALL SELECT 8, 9, 7.25 ORDER BY id DESC;
+SELECT * FROM a JOIN (SELECT b.id, a.id FROM a, b) s USING (id);
+SELECT * FROM a NATURAL JOIN (SELECT 5 AS id, 0.5 AS id) s;
+SELECT a.id, (SELECT y FROM b WHERE b.id = a.id) AS r FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = r);
+SELECT (SELECT y FROM b ORDER BY y LIMIT 2.5), EXISTS (SELECT 1 FROM b LIMIT 'x');
+";
+
+#[test]
+fn cli_v16_review_regressions_byte_identical() {
+    byte_identical("review", REVIEW);
+    // The views' derived column lists, as `.schema` prints them
+    // (each NATURAL / USING column once, duplicates `id:1`).
+    let a = temp_db("review-schema-hipp");
+    let b = temp_db("review-schema-ora");
+    let input = format!("{REVIEW}.schema\n");
+    let got = run_stdin(&hipp_bin(), &a, &input);
+    assert_eq!(got, run_stdin(&oracle(), &b, &input));
+    assert!(String::from_utf8_lossy(&got).contains("/* v4(id,x,id:1,y) */"));
+}
+
 #[test]
 fn cli_v16_joins_byte_identical() {
     byte_identical("joins", JOINS);

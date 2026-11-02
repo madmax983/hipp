@@ -117,6 +117,12 @@ pub enum SchemaKind {
     /// the pin's "missing / unknown datatype"). Declare one of
     /// the six.
     StrictColumnType,
+    /// An UPDATE ... FROM whose FROM clause repeats the target
+    /// table under the target's alias (or, both unaliased, bare)
+    /// (v0.16; the pin's "target object/alias may not appear in
+    /// FROM clause"). Give the FROM clause's copy its own
+    /// alias: `FROM t AS t2`.
+    UpdateTargetInFrom,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

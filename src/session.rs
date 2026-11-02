@@ -420,14 +420,59 @@ struct QueryPlan {
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
     #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     comp_order: AVec<(usize, crate::sql::SortOrder)>,
-    /// Per-result-item ORDER BY name keys (v0.9): `(qualifier,
-    /// name)` for a plain column item (qualifier = its source's
-    /// qualifier), `(None, alias-or-text)` for other items,
-    /// expanded per column for star items. The compound ORDER
-    /// BY resolver matches a term against these across ALL of
-    /// the compound's cores (pin-verified behaviour).
-    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
-    order_names: AVec<crate::query::OrderName>,
+}
+
+/// One compound member core's ORDER BY matching data (v0.16;
+/// replaces v0.9's per-item `(qualifier, name)` keys): each
+/// item's `AS` name (a VALUES core's `column1`, ...), its
+/// resolved expression, and the core's own FROM scope. The
+/// pin's `resolveCompoundOrderBy` tries each core left to
+/// right: a bare name equal to an `AS` name matches that item;
+/// otherwise the term resolves in the core's FROM scope alone
+/// (no enclosing scopes, failures skip the core) and matches
+/// the first item that is the same reference — so after
+/// `a RIGHT JOIN b USING (id)` the term `id` is `b.id`, after a
+/// FULL join `coalesce(a.id, b.id)`.
+#[cfg(feature = "v04")]
+#[cfg_attr(not(feature = "v09"), allow(dead_code))]
+struct CompKeys {
+    names: AVec<Option<AVec<u8>>>,
+    items: AVec<RExpr>,
+    scope: crate::query::ScopeGroup,
+}
+
+#[cfg(feature = "v09")]
+impl CompKeys {
+    /// The item term `table.name` (or bare `name`) matches in
+    /// this core, if any.
+    fn hit(&self, table: Option<&[u8]>, name: &[u8]) -> Option<usize> {
+        if table.is_none()
+            && let Some(i) = self
+                .names
+                .iter()
+                .position(|n| n.as_ref().is_some_and(|n| eq_ci(n.as_slice(), name)))
+        {
+            return Some(i);
+        }
+        let r = crate::query::resolve_column_in_group::<()>(&self.scope, table, name)?.ok()?;
+        self.items.iter().position(|it| same_ref(it, &r))
+    }
+}
+
+/// Whether two resolved column references name the same thing
+/// (v0.16, compound ORDER BY): the same slot, the same rowid
+/// source, or the same function over such references (a FULL
+/// join's USING `coalesce`).
+#[cfg(feature = "v09")]
+fn same_ref(a: &RExpr, b: &RExpr) -> bool {
+    match (a, b) {
+        (RExpr::Column(x, _), RExpr::Column(y, _)) => x == y,
+        (RExpr::Rowid(x), RExpr::Rowid(y)) => x == y,
+        (RExpr::Scalar(f, xs), RExpr::Scalar(g, ys)) => {
+            f == g && xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_ref(x, y))
+        }
+        _ => false,
+    }
 }
 
 /// The common planned body of one SELECT core (v0.16; see
@@ -450,7 +495,8 @@ struct CorePlan {
     result_names: AVec<AVec<u8>>,
     #[cfg_attr(not(feature = "v06"), allow(dead_code))]
     result_affs: AVec<Option<crate::record::Affinity>>,
-    order_names: AVec<crate::query::OrderName>,
+    /// Compound ORDER BY matching data for this core.
+    keys: CompKeys,
 }
 
 /// Which clause a GROUP BY / HAVING / ORDER BY term belongs to
@@ -1037,11 +1083,23 @@ impl<S: Storage> Connection<S> {
                         // A compound source (v0.9) terminates
                         // the SELECT before ON CONFLICT on the
                         // pin too, so the quirk refusal applies
-                        // only to a bare single core.
+                        // only to a bare single core. v0.16: so
+                        // do GROUP BY / HAVING and a last join's
+                        // ON / USING constraint — only an `ON`
+                        // that could still start the last
+                        // source's join constraint is the quirk
+                        // (review regression: those shapes were
+                        // refused; the pin accepts them).
                         if upsert.is_some()
                             && sel.compound.is_empty()
-                            && !sel.from.is_empty()
+                            && sel
+                                .from
+                                .as_slice()
+                                .last()
+                                .is_some_and(|s| s.using.is_empty() && s.on.is_none())
                             && sel.filter.is_none()
+                            && sel.group_by.is_empty()
+                            && sel.having.is_none()
                             && sel.order_by.is_empty()
                             && sel.limit.is_none()
                         {
@@ -1752,52 +1810,39 @@ impl<S: Storage> Connection<S> {
         arena: &Arena,
         enclosing: &[crate::query::ScopeGroup],
     ) -> Result<crate::query::SubPlan, S::Error> {
+        self.plan_subquery_keyed(stmt, arena, enclosing)
+            .map(|(p, _)| p)
+    }
+
+    /// `plan_subquery`, also returning the head core's compound
+    /// ORDER BY matching data (v0.16; a compound tail core is
+    /// planned through this to supply its own).
+    #[cfg(feature = "v06")]
+    fn plan_subquery_keyed(
+        &self,
+        stmt: &SelectStmt,
+        arena: &Arena,
+        enclosing: &[crate::query::ScopeGroup],
+    ) -> Result<(crate::query::SubPlan, CompKeys), S::Error> {
         use crate::query::SubPlan;
         let (base_width, base_src) = crate::query::ScopeGroup::stack_end(enclosing);
         // A VALUES core (v0.9): no sources of its own; the rows
         // resolve against the enclosing scopes alone.
         #[cfg(feature = "v09")]
         if !stmt.values.is_empty() {
-            use crate::query::{ScopeGroup, has_agg, resolve_scoped};
-            let cur = ScopeGroup::new(AVec::new(), AVec::new(), base_src);
-            let mut planner = self.sub_planner(arena);
-            let mut rows_r: AVec<AVec<RExpr>> = AVec::new();
-            let mut width: Option<usize> = None;
-            for r in stmt.values.iter() {
-                match width {
-                    None => width = Some(r.len()),
-                    Some(w) if w != r.len() => {
-                        return Err(Error::Schema {
-                            kind: SchemaKind::ColumnCountMismatch,
-                        });
-                    }
-                    _ => {}
-                }
-                let mut rr = AVec::new();
-                for e in r.iter() {
-                    let re = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
-                    if has_agg(&re) {
-                        return Err(Error::Unsupported);
-                    }
-                    rr.push(re);
-                }
-                rows_r.push(rr);
-            }
-            let width = width.unwrap_or(0);
-            let mut result_names: AVec<AVec<u8>> = AVec::new();
-            let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
-            let mut order_names: AVec<crate::query::OrderName> = AVec::new();
-            for i in 0..width {
-                let n = values_col_name(i);
-                result_names.push(n.clone());
-                order_names.push((None, n));
-                result_affs.push(None);
-            }
+            let (values, keys) = self.plan_values(stmt, arena, base_src, enclosing)?;
+            let width = keys.names.len();
             let (compound, comp_order) = if stmt.compound.is_empty() {
                 (AVec::new(), AVec::new())
             } else {
-                self.plan_sub_compound(stmt, arena, enclosing, order_names.as_slice(), width)?
+                self.plan_sub_compound(stmt, arena, enclosing, &keys, width)?
             };
+            let mut result_names: AVec<AVec<u8>> = AVec::new();
+            let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
+            for n in keys.names.iter() {
+                result_names.push(n.clone().unwrap_or_default());
+                result_affs.push(None);
+            }
             let mut plan = SubPlan {
                 sources: AVec::new(),
                 items: AVec::new(),
@@ -1810,29 +1855,22 @@ impl<S: Storage> Connection<S> {
                 offset: self.plan_limit(stmt.offset.as_deref(), arena)?,
                 has_agg: false,
                 compound,
-                values: rows_r,
+                values,
                 comp_order,
                 result_names,
                 result_affs,
-                order_names,
                 id: 0,
                 uncorrelated: false,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
-            return Ok(plan);
+            return Ok((plan, keys));
         }
         let core = self.plan_core(stmt, arena, enclosing)?;
         #[cfg(feature = "v09")]
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
-            self.plan_sub_compound(
-                stmt,
-                arena,
-                enclosing,
-                core.order_names.as_slice(),
-                core.items.len(),
-            )?
+            self.plan_sub_compound(stmt, arena, enclosing, &core.keys, core.items.len())?
         };
         #[cfg(not(feature = "v09"))]
         let (compound, comp_order): SubCompoundParts = (AVec::new(), AVec::new());
@@ -1852,12 +1890,62 @@ impl<S: Storage> Connection<S> {
             comp_order,
             result_names: core.result_names,
             result_affs: core.result_affs,
-            order_names: core.order_names,
             id: 0,
             uncorrelated: false,
         };
         self.stamp_subplan(&mut plan, base_width, base_src);
-        Ok(plan)
+        Ok((plan, core.keys))
+    }
+
+    /// Resolve a VALUES core's rows (v0.9; shared by top-level
+    /// and subquery planning since v0.16) against `enclosing`,
+    /// with its compound ORDER BY keys: the `column1`, ...
+    /// names, no FROM scope.
+    #[cfg(feature = "v09")]
+    fn plan_values(
+        &self,
+        stmt: &SelectStmt,
+        arena: &Arena,
+        base_src: usize,
+        enclosing: &[crate::query::ScopeGroup],
+    ) -> Result<(AVec<AVec<RExpr>>, CompKeys), S::Error> {
+        use crate::query::{ScopeGroup, has_agg, resolve_scoped};
+        let cur = ScopeGroup::new(AVec::new(), AVec::new(), base_src);
+        let mut planner = self.sub_planner(arena);
+        let mut rows_r: AVec<AVec<RExpr>> = AVec::new();
+        let mut width: Option<usize> = None;
+        for r in stmt.values.iter() {
+            match width {
+                None => width = Some(r.len()),
+                Some(w) if w != r.len() => {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::ColumnCountMismatch,
+                    });
+                }
+                _ => {}
+            }
+            let mut rr = AVec::new();
+            for e in r.iter() {
+                let re = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
+                if has_agg(&re) {
+                    return Err(Error::Unsupported);
+                }
+                rr.push(re);
+            }
+            rows_r.push(rr);
+        }
+        let mut names = AVec::new();
+        for i in 0..width.unwrap_or(0) {
+            names.push(Some(values_col_name(i)));
+        }
+        Ok((
+            rows_r,
+            CompKeys {
+                names,
+                items: AVec::new(),
+                scope: cur,
+            },
+        ))
     }
 
     /// Plan one subquery statement's compound tail (v0.9):
@@ -1865,36 +1953,34 @@ impl<S: Storage> Connection<S> {
     /// all cores must match the head's width (the pin: "SELECTs
     /// to the left and right of UNION do not have the same
     /// number of result columns"). The statement's ORDER BY
-    /// resolves to output-column indices over the union of all
-    /// cores' result names.
+    /// resolves to output-column indices over every core's
+    /// `CompKeys`, head first.
     #[cfg(feature = "v09")]
     fn plan_sub_compound(
         &self,
         stmt: &SelectStmt,
         arena: &Arena,
         enclosing: &[crate::query::ScopeGroup],
-        head_names: &[crate::query::OrderName],
+        head: &CompKeys,
         width: usize,
     ) -> Result<SubCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)> = AVec::new();
+        let mut keys: AVec<CompKeys> = AVec::new();
         for (op, core) in stmt.compound.iter() {
-            let p = self.plan_subquery(core, arena, enclosing)?;
+            let (p, k) = self.plan_subquery_keyed(core, arena, enclosing)?;
             if p.width() != width {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
                 });
             }
             tails.push((*op, Box::new(p)));
-        }
-        let mut all_names: AVec<&[crate::query::OrderName]> = AVec::new();
-        all_names.push(head_names);
-        for (_, p) in tails.iter() {
-            all_names.push(p.order_names.as_slice());
+            keys.push(k);
         }
         let comp_order = resolve_compound_order::<S::Error>(
             stmt.order_by.as_slice(),
             arena,
-            all_names.as_slice(),
+            head,
+            keys.as_slice(),
             width,
         )?;
         Ok((tails, comp_order))
@@ -1907,28 +1993,26 @@ impl<S: Storage> Connection<S> {
         &self,
         stmt: &SelectStmt,
         arena: &Arena,
-        head_names: &[crate::query::OrderName],
+        head: &CompKeys,
         width: usize,
     ) -> Result<QueryCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)> = AVec::new();
+        let mut keys: AVec<CompKeys> = AVec::new();
         for (op, core) in stmt.compound.iter() {
-            let p = self.plan_query(core, arena)?;
+            let (p, k) = self.plan_query_keyed(core, arena)?;
             if p.width != width {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
                 });
             }
             tails.push((*op, Box::new(p)));
-        }
-        let mut all_names: AVec<&[crate::query::OrderName]> = AVec::new();
-        all_names.push(head_names);
-        for (_, p) in tails.iter() {
-            all_names.push(p.order_names.as_slice());
+            keys.push(k);
         }
         let comp_order = resolve_compound_order::<S::Error>(
             stmt.order_by.as_slice(),
             arena,
-            all_names.as_slice(),
+            head,
+            keys.as_slice(),
             width,
         )?;
         Ok((tails, comp_order))
@@ -2194,6 +2278,25 @@ impl<S: Storage> Connection<S> {
             &mut foffsets,
             &mut from_plans,
         )?;
+        // The pin refuses a FROM item that repeats the target
+        // item: the same table under the same alias, or both
+        // unaliased (`UPDATE t ... FROM t`, `UPDATE t AS x ...
+        // FROM t AS x`; `FROM t AS t` and `FROM t AS t2` are
+        // accepted). Review finding: hipp ran it as a self-join.
+        let alias_b = alias.map(|a| handle_bytes(arena, a));
+        if from.iter().any(|s| {
+            s.derived.is_none()
+                && eq_ci(handle_bytes(arena, s.table), tname)
+                && match (s.alias.map(|a| handle_bytes(arena, a)), alias_b) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => eq_ci(x, y),
+                    _ => false,
+                }
+        }) {
+            return Err(Error::Schema {
+                kind: SchemaKind::UpdateTargetInFrom,
+            });
+        }
         let mut fscope = crate::query::ScopeGroup::new(fdescs, foffsets, 1);
         let using = plan_using::<S::Error>(from.as_slice(), arena, &mut fscope)?;
         let mut planner = self.sub_planner(arena);
@@ -2493,51 +2596,29 @@ impl<S: Storage> Connection<S> {
     /// against the FROM sources once, at prepare time.
     #[cfg(feature = "v04")]
     fn plan_query(&self, stmt: &SelectStmt, arena: &Arena) -> Result<QueryPlan, S::Error> {
+        self.plan_query_keyed(stmt, arena).map(|(p, _)| p)
+    }
+
+    /// `plan_query`, also returning the head core's compound
+    /// ORDER BY matching data (v0.16; see `plan_subquery_keyed`).
+    #[cfg(feature = "v04")]
+    fn plan_query_keyed(
+        &self,
+        stmt: &SelectStmt,
+        arena: &Arena,
+    ) -> Result<(QueryPlan, CompKeys), S::Error> {
         // A VALUES core (v0.9): no sources; rows resolve
         // against the empty scope.
         #[cfg(feature = "v09")]
         if !stmt.values.is_empty() {
-            let cur = crate::query::ScopeGroup::new(AVec::new(), AVec::new(), 0);
-            let mut planner = self.sub_planner(arena);
-            let mut rows_r: AVec<AVec<RExpr>> = AVec::new();
-            let mut width: Option<usize> = None;
-            for r in stmt.values.iter() {
-                match width {
-                    None => width = Some(r.len()),
-                    Some(w) if w != r.len() => {
-                        return Err(Error::Schema {
-                            kind: SchemaKind::ColumnCountMismatch,
-                        });
-                    }
-                    _ => {}
-                }
-                let mut rr = AVec::new();
-                for e in r.iter() {
-                    let re = crate::query::resolve_scoped::<S::Error>(
-                        e,
-                        arena,
-                        &cur,
-                        &[],
-                        &mut planner,
-                    )?;
-                    if crate::query::has_agg(&re) {
-                        return Err(Error::Unsupported);
-                    }
-                    rr.push(re);
-                }
-                rows_r.push(rr);
-            }
-            let width = width.unwrap_or(0);
-            let mut order_names: AVec<crate::query::OrderName> = AVec::new();
-            for i in 0..width {
-                order_names.push((None, values_col_name(i)));
-            }
+            let (values, keys) = self.plan_values(stmt, arena, 0, &[])?;
+            let width = keys.names.len();
             let (compound, comp_order) = if stmt.compound.is_empty() {
                 (AVec::new(), AVec::new())
             } else {
-                self.plan_query_compound(stmt, arena, order_names.as_slice(), width)?
+                self.plan_query_compound(stmt, arena, &keys, width)?
             };
-            return Ok(QueryPlan {
+            let qp = QueryPlan {
                 sources: AVec::new(),
                 items: AVec::new(),
                 filter: None,
@@ -2550,10 +2631,10 @@ impl<S: Storage> Connection<S> {
                 has_agg: false,
                 width,
                 compound,
-                values: rows_r,
+                values,
                 comp_order,
-                order_names,
-            });
+            };
+            return Ok((qp, keys));
         }
         let core = self.plan_core(stmt, arena, &[])?;
         let width = core.items.len();
@@ -2561,11 +2642,11 @@ impl<S: Storage> Connection<S> {
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
-            self.plan_query_compound(stmt, arena, core.order_names.as_slice(), width)?
+            self.plan_query_compound(stmt, arena, &core.keys, width)?
         };
         #[cfg(not(feature = "v09"))]
         let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
-        Ok(QueryPlan {
+        let qp = QueryPlan {
             sources: core.sources,
             items: core.items,
             filter: core.filter,
@@ -2580,8 +2661,8 @@ impl<S: Storage> Connection<S> {
             compound,
             values: AVec::new(),
             comp_order,
-            order_names: core.order_names,
-        })
+        };
+        Ok((qp, core.keys))
     }
 
     /// The shared core planner (v0.16: the common body of
@@ -2622,14 +2703,11 @@ impl<S: Storage> Connection<S> {
         let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
         let mut result_names: AVec<AVec<u8>> = AVec::new();
         let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
-        let mut order_names: AVec<crate::query::OrderName> = AVec::new();
         for it in stmt.items.iter() {
             let qual = match it {
                 SelectItem::Expr(e, alias, text) => {
                     let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
-                    let (nm, okey) = item_name_keys(arena, e, alias, text, &cur);
-                    result_names.push(nm);
-                    order_names.push(okey);
+                    result_names.push(item_name(arena, e, alias, text));
                     result_affs.push(item_result_affinity(&r));
                     items.push(r);
                     item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
@@ -2645,12 +2723,11 @@ impl<S: Storage> Connection<S> {
                     kind: SchemaKind::UnknownColumn,
                 });
             }
-            for (r, nm, okey) in expanded.iter() {
+            for (r, nm) in expanded.iter() {
                 result_affs.push(item_result_affinity(r));
                 items.push(r.clone());
                 item_aliases.push(None);
                 result_names.push(nm.clone());
-                order_names.push(okey.clone());
             }
         }
         // The pin's "HAVING clause on a non-aggregate query":
@@ -2767,6 +2844,12 @@ impl<S: Storage> Connection<S> {
             || items.iter().any(has_agg)
             || having.as_ref().is_some_and(has_agg)
             || order_by.iter().any(|(e, _)| has_agg(e));
+        cur.aliases.clear();
+        let keys = CompKeys {
+            names: item_aliases,
+            items: items.clone(),
+            scope: cur,
+        };
         Ok(CorePlan {
             sources,
             items,
@@ -2779,7 +2862,7 @@ impl<S: Storage> Connection<S> {
             has_agg,
             result_names,
             result_affs,
-            order_names,
+            keys,
         })
     }
 
@@ -2816,7 +2899,14 @@ impl<S: Storage> Connection<S> {
                 let mut cols = AVec::new();
                 let mut affs = AVec::new();
                 let mut defaults = AVec::new();
-                for (nm, aff) in dplan.result_names.iter().zip(dplan.result_affs.iter()) {
+                // The pin names a derived table's duplicate
+                // columns `id`, `id:1`, ... — so only the first
+                // is `id` to `s.id`, NATURAL and USING (review
+                // regression: every duplicate stayed `id`, and
+                // `SELECT *` over a USING join dropped them all).
+                let mut names = dplan.result_names.clone();
+                crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
+                for (nm, aff) in names.iter().zip(dplan.result_affs.iter()) {
                     cols.push((nm.clone(), aff.unwrap_or(crate::record::Affinity::Blob)));
                     affs.push(crate::record::Affinity::Blob);
                     defaults.push(OwnedValue::Null);
@@ -7279,48 +7369,23 @@ type SubplanFuture<'x, E> = core::pin::Pin<
 type JoinFuture<'x, E> =
     core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), E>> + 'x>>;
 
-/// The result-column name of one SELECT item (v0.9), and its
-/// compound ORDER BY match key: the name is the alias when
-/// written, else the column name for a direct column
-/// reference, else the expression's source text (the pin's
-/// naming rules, header-verified). The match key's qualifier
-/// is the written qualifier, else the qualifier of the source
-/// that supplies the column, else None (expressions/aliases
-/// match unqualified terms only).
+/// The result-column name of one SELECT item (v0.9): the
+/// alias when written, else the column name for a direct
+/// column reference, else the expression's source text (the
+/// pin's naming rules, header-verified).
 #[cfg(feature = "v04")]
-fn item_name_keys(
+fn item_name(
     arena: &Arena,
     e: &Expr,
     alias: &Option<crate::arena::ABytes>,
     text: &crate::arena::ABytes,
-    cur: &crate::query::ScopeGroup,
-) -> (AVec<u8>, crate::query::OrderName) {
-    if let Some(a) = alias {
-        let n = copy_vec(handle_bytes(arena, *a));
-        return (n.clone(), (None, n));
-    }
-    match e {
-        Expr::Column { table, name } => {
-            let nb = copy_vec(handle_bytes(arena, *name));
-            let qual = match table {
-                Some(q) => Some(copy_vec(handle_bytes(arena, *q))),
-                None => cur
-                    .sources
-                    .iter()
-                    .find(|s| {
-                        s.columns
-                            .iter()
-                            .any(|(c, _)| eq_ci(c.as_slice(), nb.as_slice()))
-                    })
-                    .map(|s| s.qualifier.clone()),
-            };
-            (nb.clone(), (qual, nb))
-        }
-        _ => {
-            let t = copy_vec(handle_bytes(arena, *text));
-            (t.clone(), (None, t))
-        }
-    }
+) -> AVec<u8> {
+    let h = match (alias, e) {
+        (Some(a), _) => *a,
+        (None, Expr::Column { name, .. }) => *name,
+        _ => *text,
+    };
+    copy_vec(handle_bytes(arena, h))
 }
 
 /// A VALUES core's result column name (v0.9): `column1`,
@@ -7335,58 +7400,45 @@ fn values_col_name(i: usize) -> AVec<u8> {
 }
 
 /// Resolve a compound SELECT's ORDER BY terms (v0.9) to
-/// output-column indices. The pin's rule: a term is an output
-/// ordinal, or a (possibly qualified) name matching a result
-/// column of ANY constituent core — anything else ("ORDER BY
-/// a+0", a constant, an unknown name) fails prepare with
+/// output-column indices. The pin's rule
+/// (`resolveCompoundOrderBy`): a term is an output ordinal, or
+/// a (possibly qualified) column name that some constituent
+/// core matches — the head first, then each tail (see
+/// `CompKeys::hit`); anything else ("ORDER BY a+0", a
+/// constant, a name no core matches) fails prepare with
 /// "ORDER BY term does not match any column in the result
 /// set", mirrored here as `SchemaKind::UnknownColumn`.
 #[cfg(feature = "v09")]
 fn resolve_compound_order<E>(
     order_by: &[(Expr, crate::sql::SortOrder)],
     arena: &Arena,
-    cores_names: &[&[crate::query::OrderName]],
+    head: &CompKeys,
+    tails: &[CompKeys],
     width: usize,
 ) -> Result<AVec<(usize, crate::sql::SortOrder)>, E> {
     let mut out = AVec::new();
     for (e, desc) in order_by.iter() {
         let idx = match e {
             Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= width => {
-                *n as usize - 1
+                Some(*n as usize - 1)
             }
             Expr::Column { table, name } => {
                 let nb = handle_bytes(arena, *name);
                 let qb = table.map(|h| handle_bytes(arena, h));
-                let mut found = None;
-                'cores: for names in cores_names.iter() {
-                    for (i, (q, n)) in names.iter().enumerate() {
-                        let qual_ok = match (&qb, q) {
-                            (None, _) => true,
-                            (Some(want), Some(have)) => eq_ci(have.as_slice(), want),
-                            (Some(_), None) => false,
-                        };
-                        if qual_ok && eq_ci(n.as_slice(), nb) {
-                            found = Some(i);
-                            break 'cores;
-                        }
-                    }
-                }
-                match found {
-                    Some(i) => i,
-                    None => {
-                        return Err(Error::Schema {
-                            kind: SchemaKind::UnknownColumn,
-                        });
-                    }
-                }
+                core::iter::once(head)
+                    .chain(tails.iter())
+                    .find_map(|k| k.hit(qb, nb))
             }
-            _ => {
+            _ => None,
+        };
+        match idx {
+            Some(i) => out.push((i, *desc)),
+            None => {
                 return Err(Error::Schema {
                     kind: SchemaKind::UnknownColumn,
                 });
             }
-        };
-        out.push((idx, *desc));
+        }
     }
     Ok(out)
 }

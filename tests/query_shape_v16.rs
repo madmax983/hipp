@@ -982,3 +982,339 @@ fn in_table_operand() {
     }
     tw.finish("SELECT rowid, v FROM s ORDER BY rowid");
 }
+
+// ---------------- review regressions ----------------
+
+/// hipp's own verdict on one statement (no oracle): for shapes
+/// the pin runs but hipp refuses, so a silent wrong answer
+/// cannot hide behind `same`.
+fn hipp_only(
+    tw: &Twins,
+    sql: &str,
+) -> Result<Vec<String>, Error<<FileStorage as hipp::Storage>::Error>> {
+    block_on(async {
+        let mut db = open(&tw.hipp).await;
+        try_collect(&mut db, sql).await
+    })
+}
+
+/// An alias whose item holds a subquery, referenced from a
+/// subquery with FROM sources of its own: the alias's
+/// subquery reads the right columns (review regression: its
+/// slots were not rebased onto the deeper row — no rows, or
+/// the nested source's columns).
+#[cfg(feature = "v16")]
+#[test]
+fn alias_with_subquery_used_in_a_nested_scope() {
+    let tw = twins(
+        "alias-nest",
+        "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2),(3);
+         CREATE TABLE u(b, d); INSERT INTO u VALUES(1,'p'),(2,'q'),(3,'r');
+         CREATE TABLE w(k); INSERT INTO w VALUES('p'),('r')",
+    );
+    tw.all(&[
+        "SELECT a, (SELECT d FROM u WHERE u.b=t.a) AS r FROM t
+         WHERE (SELECT count(*) FROM w WHERE w.k = r) = 1",
+        "SELECT a, (SELECT d FROM u WHERE u.b=t.a) AS r FROM t
+         WHERE EXISTS (SELECT 1 FROM w WHERE w.k = r)",
+        "SELECT a, (SELECT max(d) FROM u) AS m FROM t
+         WHERE EXISTS (SELECT 1 FROM w WHERE w.k = m)",
+        // Two scopes deep, and next to the nested source's own
+        // correlated reference.
+        "SELECT a, (SELECT d FROM u WHERE u.b=t.a) AS r FROM t
+         WHERE EXISTS (SELECT 1 FROM w WHERE w.k = r
+                       AND EXISTS (SELECT 1 FROM u WHERE u.d = r AND u.b = a))",
+        "SELECT a, (SELECT d FROM u WHERE u.b=t.a) AS r FROM t
+         ORDER BY (SELECT count(*) FROM w, u WHERE w.k = r AND u.d = w.k) DESC, a",
+        "SELECT a, (SELECT d FROM u WHERE u.b=t.a) AS r FROM t
+         WHERE a IN (SELECT b FROM u WHERE d = r AND EXISTS (SELECT 1 FROM w WHERE k = r))",
+        "SELECT a, (SELECT d FROM u WHERE u.b = t.a) AS r FROM t
+         WHERE r IN (SELECT k FROM w JOIN u ON u.d = w.k)",
+        // The alias's subquery reads a rowid and has a derived
+        // table of its own.
+        "SELECT a, (SELECT u.rowid FROM u WHERE u.b = t.a) AS r FROM t
+         WHERE EXISTS (SELECT 1 FROM u WHERE u.b = r + 1)",
+        "SELECT a, (SELECT max(z) FROM (SELECT b AS z FROM u WHERE b < t.a + 1)) AS r FROM t
+         WHERE (SELECT d FROM u WHERE u.b = r) > 'p'",
+        // Through GROUP BY / HAVING and an ON clause.
+        "SELECT (SELECT d FROM u WHERE u.b = t.a) AS r, count(*) FROM t
+         GROUP BY r HAVING EXISTS (SELECT 1 FROM w WHERE w.k = r)",
+        "SELECT t.a, (SELECT d FROM u WHERE u.b = t.a) AS r FROM t JOIN u AS v
+         ON v.b = (SELECT u.b FROM u, w WHERE u.d = r AND w.k = u.d)",
+    ]);
+}
+
+/// The same, generated: alias definitions with correlated and
+/// uncorrelated subqueries, referenced from nested subqueries
+/// of various shapes, vs the oracle.
+#[cfg(feature = "v16")]
+#[test]
+fn generated_alias_nesting_corpus() {
+    let tw = twins(
+        "alias-gen",
+        "CREATE TABLE t(a, c); INSERT INTO t VALUES(1,'x'),(2,'y'),(3,'x'),(4,NULL);
+         CREATE TABLE u(b, d); INSERT INTO u VALUES(1,'p'),(2,'q'),(3,'r'),(4,'p');
+         CREATE TABLE w(k, n); INSERT INTO w VALUES('p',1),('r',2),('q',NULL),('p',3)",
+    );
+    let defs = [
+        "(SELECT d FROM u WHERE u.b = t.a)",
+        "(SELECT max(d) FROM u)",
+        "(SELECT count(*) FROM u WHERE u.b <= t.a)",
+        "(SELECT d FROM u WHERE u.b = (SELECT max(b) FROM u WHERE b < t.a))",
+        "a + (SELECT min(b) FROM u)",
+    ];
+    let uses = [
+        "EXISTS (SELECT 1 FROM w WHERE w.k = z)",
+        "(SELECT count(*) FROM w WHERE w.k = z OR w.n = z) > 0",
+        "z IN (SELECT k FROM w)",
+        "z IN (SELECT n FROM w JOIN u ON u.b = w.n)",
+        "(SELECT max(n) FROM w, u WHERE u.d = w.k AND (u.b = z OR u.d = z)) IS NOT NULL",
+        "EXISTS (SELECT 1 FROM (SELECT k FROM w) s WHERE s.k = z)",
+    ];
+    let mut rng = Rng(0x0a11_a5ed_0016_7e57);
+    for _ in 0..30 {
+        let d = defs[rng.below(defs.len() as u64) as usize];
+        let u = uses[rng.below(uses.len() as u64) as usize];
+        tw.same(&format!("SELECT a, {d} AS z FROM t WHERE {u} ORDER BY a"));
+        tw.same(&format!("SELECT a, {d} AS z FROM t ORDER BY ({u}) DESC, a"));
+    }
+}
+
+/// An aliased aggregate referenced inside a subquery belongs
+/// to the outer query on the pin; hipp re-aggregated the
+/// subquery's rows (silent wrong answers). It now refuses.
+#[cfg(feature = "v16")]
+#[test]
+fn aggregate_alias_inside_a_subquery_is_refused() {
+    let tw = twins(
+        "alias-agg",
+        "CREATE TABLE t(a); INSERT INTO t VALUES(1),(1),(2),(3),(3),(3);
+         CREATE TABLE u(b); INSERT INTO u VALUES(1),(2)",
+    );
+    for sql in [
+        "SELECT a, count(*) AS c FROM t GROUP BY a HAVING (SELECT c) > 1",
+        "SELECT a, count(*) AS c FROM t GROUP BY a HAVING (SELECT c FROM u LIMIT 1) > 1",
+        "SELECT a, count(*) AS c FROM t GROUP BY a ORDER BY (SELECT c) DESC",
+        "SELECT a, count(*) AS c FROM t GROUP BY a HAVING EXISTS (SELECT 1 FROM u WHERE u.b = c)",
+        "SELECT a, count(*) + 1 AS c FROM t GROUP BY a HAVING 3 IN (SELECT c + b FROM u)",
+    ] {
+        assert!(
+            matches!(hipp_only(&tw, sql), Err(Error::Unsupported)),
+            "{sql}"
+        );
+        // The pin runs it (its answer is not reproduced).
+        assert!(oracle_raw(&tw.oracle, sql).0, "{sql}");
+    }
+    // In WHERE both refuse; at the alias's own level it works.
+    assert!(
+        tw.same("SELECT count(*) AS c FROM t WHERE (SELECT c) > 0")
+            .is_some()
+    );
+    tw.all(&[
+        "SELECT a, count(*) AS c FROM t GROUP BY a HAVING c > 1",
+        "SELECT a, count(*) AS c FROM t GROUP BY a ORDER BY c DESC, a",
+        "SELECT a, count(*) + 1 AS c FROM t GROUP BY a HAVING c IN (SELECT b + 2 FROM u)",
+    ]);
+}
+
+/// Compound ORDER BY names resolve per core like the pin's
+/// `resolveCompoundOrderBy`: an AS name, else the term
+/// resolved in the core's FROM scope and matched to the item
+/// that is the same reference (review regression: a USING
+/// column of a RIGHT / FULL join sorted by the wrong column).
+#[test]
+fn compound_order_by_resolves_terms_per_core() {
+    let tw = twins(
+        "comp-ord",
+        "CREATE TABLE a(id, x); CREATE TABLE b(id, y);
+         INSERT INTO a VALUES(1,'a1'),(5,'a5'); INSERT INTO b VALUES(5,'b5'),(3,'b3'),(0,'b0')",
+    );
+    tw.all(&[
+        "SELECT a.id, b.id FROM a RIGHT JOIN b USING (id) UNION ALL SELECT 8, 9 ORDER BY id",
+        "SELECT a.id, b.id, id FROM a FULL JOIN b USING (id) UNION ALL SELECT 8, 9, 7 ORDER BY id",
+        "SELECT id FROM a RIGHT JOIN b USING (id) UNION SELECT 9 ORDER BY b.id",
+        "SELECT id FROM a LEFT JOIN b USING (id) UNION SELECT 9 ORDER BY a.id",
+        "SELECT a.id FROM a LEFT JOIN b USING (id) UNION SELECT 9 ORDER BY id",
+        "SELECT b.id, a.id FROM a LEFT JOIN b USING (id) UNION SELECT 9, 9 ORDER BY id",
+        "SELECT * FROM (SELECT a.id, b.id, id FROM a FULL JOIN b USING (id)
+                       UNION ALL SELECT 8, 9, 7 ORDER BY id DESC)",
+        "SELECT x AS q FROM a UNION SELECT y FROM b ORDER BY q",
+        "SELECT y FROM b UNION SELECT x AS q FROM a ORDER BY q",
+        "SELECT y FROM b UNION SELECT x AS y FROM a ORDER BY y",
+        "SELECT x AS id, id AS x FROM a UNION SELECT 7, 8 ORDER BY x",
+        "SELECT a.rowid, x FROM a UNION SELECT 1, 2 ORDER BY rowid",
+        "SELECT * FROM a UNION SELECT * FROM b ORDER BY b.y",
+        "VALUES (1), (2) UNION SELECT 3 ORDER BY column1",
+    ]);
+    for sql in [
+        "SELECT id FROM a RIGHT JOIN b USING (id) UNION SELECT 9 ORDER BY a.id",
+        "SELECT id FROM a LEFT JOIN b USING (id) UNION SELECT 9 ORDER BY b.id",
+        "SELECT b.id FROM a LEFT JOIN b USING (id) UNION SELECT 9 ORDER BY id",
+        "SELECT x, y FROM a FULL JOIN b USING (id) UNION SELECT 9, 9 ORDER BY id",
+        "SELECT id + 0 FROM a FULL JOIN b USING (id) UNION SELECT 9 ORDER BY id",
+        // Ambiguous in the core's FROM: no match (older bug).
+        "SELECT a.id FROM a, b UNION SELECT 9 ORDER BY id",
+        // An expression item's text is not a name.
+        "SELECT x || '' FROM a UNION SELECT 3 ORDER BY \"x || ''\"",
+    ] {
+        tw.refuse(sql, SchemaKind::UnknownColumn);
+    }
+}
+
+/// A derived table's duplicate column names become `id`,
+/// `id:1`, ... (review regression: every duplicate stayed `id`,
+/// so NATURAL / USING `SELECT *` dropped them all).
+#[test]
+fn derived_table_duplicate_names_are_renamed() {
+    let tw = twins(
+        "dup-derived",
+        "CREATE TABLE a(id); CREATE TABLE b(id); CREATE TABLE c(id, z);
+         INSERT INTO a VALUES(1); INSERT INTO b VALUES(7); INSERT INTO c VALUES(1,'z'),(7,'y')",
+    );
+    tw.all(&[
+        "SELECT * FROM c JOIN (SELECT a.id, b.id FROM a, b) s USING (id)",
+        "SELECT * FROM c NATURAL JOIN (SELECT 1 AS id, 7 AS id) s",
+        "SELECT * FROM c NATURAL FULL JOIN (SELECT 7 AS id, 1 AS ID) s",
+        "SELECT \"id:1\" FROM (SELECT 1 AS id, 7 AS id)",
+        "SELECT s.id, s.\"ID:2\" FROM (SELECT 1 AS id, 7 AS id, 8 AS ID) s",
+        "SELECT * FROM (SELECT 1 AS id, 7 AS id, 8 AS ID, 9 AS \"id:1\")",
+        "SELECT * FROM (SELECT 1 AS \"id:1\", 2 AS id, 3 AS id)",
+        "SELECT * FROM (SELECT * FROM a, b) WHERE \"id:1\" = 7",
+    ]);
+}
+
+/// Scalar and EXISTS subqueries take the pin's `LIMIT (X<>0)`
+/// rewrite (review regression: hipp raised a datatype
+/// mismatch for a non-integer X there).
+#[cfg(feature = "v16")]
+#[test]
+fn scalar_and_exists_subquery_limit_rewrite() {
+    let tw = twins(
+        "sub-limit",
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES(5,2),(1,4),(3,NULL)",
+    );
+    tw.all(&[
+        "SELECT (SELECT a FROM t ORDER BY a LIMIT 2.5)",
+        "SELECT (SELECT a FROM t ORDER BY a LIMIT 2.5 OFFSET 1)",
+        "SELECT (SELECT a FROM t ORDER BY a LIMIT -1 OFFSET 2)",
+        "SELECT (SELECT a FROM t ORDER BY a LIMIT 9223372036854775808)",
+        "SELECT (SELECT a FROM t ORDER BY a LIMIT '1e0')",
+        "SELECT (SELECT a FROM t UNION SELECT 9 ORDER BY 1 LIMIT 1.5 OFFSET 1)",
+        "SELECT EXISTS (SELECT a FROM t LIMIT 'x')",
+        "SELECT EXISTS (SELECT a FROM t LIMIT '0')",
+        "SELECT EXISTS (SELECT a FROM t LIMIT ' 0 ')",
+        "SELECT EXISTS (SELECT a FROM t LIMIT x'00')",
+        "SELECT EXISTS (SELECT a FROM t LIMIT 0.0)",
+        "SELECT a FROM t WHERE a = (SELECT a FROM t ORDER BY a DESC LIMIT 0.5)",
+    ]);
+    // A NULL limit, a non-integer OFFSET, and IN subqueries /
+    // derived tables keep MustBeInt on both engines.
+    for sql in [
+        "SELECT (SELECT a FROM t LIMIT NULL)",
+        "SELECT (SELECT a FROM t LIMIT 1 OFFSET 2.5)",
+        "SELECT a FROM t WHERE a IN (SELECT a FROM t LIMIT 2.5)",
+        "SELECT * FROM (SELECT a FROM t LIMIT 2.5)",
+    ] {
+        tw.refuse(sql, SchemaKind::DatatypeMismatch);
+    }
+    let tw = twins(
+        "sub-limit-w",
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES(5,2),(1,4),(3,NULL)",
+    );
+    assert!(
+        tw.same("UPDATE t SET b = (SELECT count(*) FROM t LIMIT 1.5)")
+            .is_none()
+    );
+    tw.finish("SELECT rowid, a, b FROM t ORDER BY rowid");
+}
+
+/// The INSERT ... SELECT upsert parse quirk only covers an
+/// `ON` that could still start the last source's join
+/// constraint (review regression: USING / ON-terminated joins
+/// and GROUP BY / HAVING were refused; the pin accepts them).
+#[test]
+fn upsert_after_terminated_from_clauses() {
+    let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES(2,'old');
+         CREATE TABLE a(id, x); CREATE TABLE b(id, y);
+         INSERT INTO a VALUES(1,'a1'),(2,'a2'); INSERT INTO b VALUES(2,'b2'),(3,'b3')";
+    let tw = twins("upsert-from", setup);
+    for sql in [
+        "INSERT INTO t SELECT id, y FROM a JOIN b USING (id) ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+        "INSERT INTO t SELECT id, max(x) FROM a GROUP BY id ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+        "INSERT INTO t SELECT id, x FROM a GROUP BY id HAVING 1 ON CONFLICT(id) DO UPDATE SET v = excluded.v || 'h'",
+        "INSERT INTO t SELECT a.id, y FROM a LEFT JOIN b ON a.id = b.id ON CONFLICT(id) DO UPDATE SET v = 'L' || excluded.v",
+        "INSERT INTO t SELECT a.id, y FROM a CROSS JOIN b USING (id) ON CONFLICT(id) DO UPDATE SET v = 'c'",
+    ] {
+        assert!(tw.same(sql).is_none(), "{sql}");
+    }
+    // Still the quirk (both refuse): a bare table, a comma join
+    // and an unconstrained JOIN before ON CONFLICT.
+    for sql in [
+        "INSERT INTO t SELECT a.id, x FROM a ON CONFLICT(id) DO UPDATE SET v = 'c'",
+        "INSERT INTO t SELECT a.id, y FROM a, b ON CONFLICT(id) DO UPDATE SET v = 'c'",
+        "INSERT INTO t SELECT a.id, x FROM a JOIN b ON CONFLICT(id) DO UPDATE SET v = 'c'",
+    ] {
+        assert!(tw.same(sql).is_some(), "{sql}");
+    }
+    tw.finish("SELECT id, v FROM t ORDER BY id");
+}
+
+/// UPDATE ... FROM refuses a FROM item that repeats the target
+/// (same table, same alias or both bare), as the pin does
+/// (review finding: hipp ran it as a self-join).
+#[test]
+fn update_from_repeating_the_target_is_refused() {
+    let setup = "CREATE TABLE t(a, b); INSERT INTO t VALUES(1,2);
+         CREATE TABLE u(a); INSERT INTO u VALUES(1); CREATE TABLE x(a)";
+    let tw = twins("upd-self", setup);
+    for sql in [
+        "UPDATE t SET b = 5 FROM t",
+        "UPDATE t SET b = 5 FROM T",
+        "UPDATE t SET b = 5 FROM main.t",
+        "UPDATE t SET b = 5 FROM u, t",
+        "UPDATE t SET b = 5 FROM u NATURAL JOIN t",
+        "UPDATE t AS x SET b = 5 FROM t AS X",
+    ] {
+        tw.refuse(sql, SchemaKind::UpdateTargetInFrom);
+    }
+    for sql in [
+        "UPDATE t SET b = 6 FROM t AS t2 WHERE t2.a = t.a",
+        "UPDATE t AS q SET b = 7 FROM t",
+        "UPDATE t SET b = 8 FROM t AS t",
+        "UPDATE t SET b = 9 FROM (SELECT 1) AS t",
+        "UPDATE t SET b = 10 FROM u AS t",
+        "UPDATE t AS u SET b = 11 FROM u",
+        "UPDATE t AS x SET b = 12 FROM x",
+    ] {
+        assert!(tw.same(sql).is_none(), "{sql}");
+    }
+    tw.finish("SELECT rowid, a, b FROM t ORDER BY rowid");
+}
+
+/// A schema qualifier other than `main` is refused (review
+/// finding: hipp dropped it and used the main table, e.g. for
+/// the new `x IN temp.s`, where the pin has no such table).
+#[test]
+fn schema_qualifier_other_than_main_is_refused() {
+    let tw = twins("schema-q", "CREATE TABLE s(a); INSERT INTO s VALUES(1)");
+    tw.all(&["SELECT * FROM main.s", "SELECT * FROM MAIN.s"]);
+    for sql in [
+        "SELECT * FROM temp.s",
+        "SELECT * FROM foo.s",
+        "INSERT INTO temp.s VALUES(2)",
+        "DELETE FROM temp.s",
+    ] {
+        tw.refuse_parse(sql);
+    }
+    #[cfg(feature = "v16")]
+    {
+        tw.same("SELECT 1 IN main.s");
+        tw.refuse_parse("SELECT 1 IN temp.s");
+    }
+    // The pin would make a temporary table outside the file.
+    assert!(matches!(
+        hipp_only(&tw, "CREATE TABLE temp.q(a)"),
+        Err(Error::Parse { .. })
+    ));
+    tw.finish("SELECT a FROM s");
+}

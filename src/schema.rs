@@ -591,8 +591,14 @@ fn derive_view_columns(
         }
         return out;
     }
-    // Source column-name lists, in FROM order.
+    // Source column-name lists, in FROM order — and (v0.16)
+    // each source's NATURAL / USING join columns: an
+    // unqualified `*` shows those once, at the left-most source
+    // (the pin's `selectExpander`; review regression: they were
+    // listed per source).
     let mut sources: AVec<(AVec<u8>, AVec<AVec<u8>>)> = AVec::new();
+    #[cfg(feature = "v04")]
+    let mut joined: AVec<AVec<AVec<u8>>> = AVec::new();
     for src in select.from.iter() {
         let tname = handle_bytes(scratch, src.table);
         let qualifier = match src.alias {
@@ -614,13 +620,40 @@ fn derive_view_columns(
         } else {
             return AVec::new();
         }
+        #[cfg(feature = "v04")]
+        {
+            let mut j: AVec<AVec<u8>> = AVec::new();
+            if src.natural {
+                for c in cols.iter() {
+                    if sources
+                        .iter()
+                        .any(|(_, l)| l.iter().any(|x| eq_ci(x.as_slice(), c.as_slice())))
+                    {
+                        j.push(c.clone());
+                    }
+                }
+            } else {
+                for u in src.using.iter() {
+                    j.push(copy_avec(handle_bytes(scratch, *u)));
+                }
+            }
+            joined.push(j);
+        }
         sources.push((qualifier, cols));
     }
     for item in select.items.iter() {
         match item {
             crate::sql::SelectItem::Star => {
+                #[cfg(feature = "v04")]
+                let mut joined_it = joined.iter();
                 for (_, cols) in sources.iter() {
+                    #[cfg(feature = "v04")]
+                    let j = joined_it.next();
                     for c in cols.iter() {
+                        #[cfg(feature = "v04")]
+                        if j.is_some_and(|j| j.iter().any(|x| eq_ci(x.as_slice(), c.as_slice()))) {
+                            continue;
+                        }
                         match intern(catalog_arena, c.as_slice()) {
                             Ok(h) => out.push(h),
                             Err(_) => return AVec::new(),
@@ -656,6 +689,25 @@ fn derive_view_columns(
                 };
                 match intern(catalog_arena, name) {
                     Ok(h) => out.push(h),
+                    Err(_) => return AVec::new(),
+                }
+            }
+        }
+    }
+    // Duplicate names become `id:1`, ... as on the pin (v0.16).
+    #[cfg(feature = "v04")]
+    {
+        let mut names: AVec<AVec<u8>> = AVec::new();
+        for h in out.iter() {
+            names.push(copy_avec(handle_bytes(catalog_arena, *h)));
+        }
+        if crate::rules::unique_names::<()>(names.as_mut_slice()).is_err() {
+            return AVec::new();
+        }
+        for (h, n) in out.as_mut_slice().iter_mut().zip(names.iter()) {
+            if handle_bytes(catalog_arena, *h) != n.as_slice() {
+                match intern(catalog_arena, n.as_slice()) {
+                    Ok(x) => *h = x,
                     Err(_) => return AVec::new(),
                 }
             }

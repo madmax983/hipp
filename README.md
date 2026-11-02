@@ -35,7 +35,17 @@ aspirations.
   LIMIT / OFFSET as expressions (constant or uncorrelated
   subquery, the pin's integer conversion), result-column
   aliases inside WHERE / ON / GROUP BY / HAVING / ORDER BY,
-  `x IN tablename`, and string-literal aliases.
+  `x IN tablename`, and string-literal aliases. Review
+  fixes: compound ORDER BY names resolve per core as on the
+  pin (a USING column after RIGHT / FULL is the joined
+  value); a derived table's and a view's duplicate column
+  names become `id:1`, ... and a view's column list shows
+  NATURAL / USING columns once; `UPDATE t ... FROM t` and any
+  schema qualifier but `main.` are refused instead of
+  silently run against `main`; scalar / EXISTS subqueries take
+  the pin's `LIMIT (X<>0)` rewrite; an alias holding a
+  subquery works inside nested subqueries (one holding an
+  aggregate is refused there).
 - **Column constraints and table definitions.** Ungated
   wherever the v0.4 evaluator is built (they used to be
   parsed and silently ignored): CHECK constraints on every

@@ -351,16 +351,15 @@ pub struct SubPlan {
     pub values: AVec<AVec<RExpr>>,
     /// Compound ORDER BY (v0.9): `(output column, descending)`
     /// pairs, resolved at plan time from the statement's ORDER
-    /// BY terms — on the pin a compound's ORDER BY terms may
-    /// only be an output ordinal or a result-column name (any
-    /// constituent core's), never a general expression.
+    /// BY terms — an output ordinal or a column name some
+    /// constituent core matches (the session's `CompKeys`).
     pub comp_order: AVec<(usize, SortOrder)>,
     /// Result column names (v0.9), parallel to the core's
     /// output width: alias if written, else the column name
     /// for a direct column reference, else the expression's
     /// source text; a VALUES core's are `column1`, `column2`,
     /// ... (all pin-verified). Consumed by derived-table
-    /// planning and compound ORDER BY name resolution.
+    /// planning.
     pub result_names: AVec<AVec<u8>>,
     /// Result column comparison affinities (v0.9), parallel to
     /// `result_names`: `Some` when the result item is a direct
@@ -368,9 +367,6 @@ pub struct SubPlan {
     /// carries into an enclosing comparison / a derived
     /// table's column), else `None`.
     pub result_affs: AVec<Option<Affinity>>,
-    /// Per-result-item ORDER BY name keys (v0.9; see the
-    /// session's `QueryPlan::order_names`).
-    pub order_names: AVec<OrderName>,
     /// Plan-node identity (v0.13): unique across every
     /// `SubPlan` planned in this process, assigned by the
     /// session planner. Clones keep the id, which is what
@@ -389,11 +385,6 @@ pub struct SubPlan {
     /// pre-statement sum on every row).
     pub uncorrelated: bool,
 }
-
-/// One result item's compound ORDER BY name key (v0.9):
-/// `(qualifier, name)` — the qualifier is the item's source
-/// qualifier for a plain column item, else None.
-pub type OrderName = (Option<AVec<u8>>, AVec<u8>);
 
 impl SubPlan {
     /// The plan's output width: a VALUES core's row length,
@@ -670,14 +661,24 @@ fn resolve_column<E>(
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Result<RExpr, E> {
+    #[cfg(not(feature = "v16"))]
     for g in core::iter::once(cur).chain(enclosing.iter()) {
+        if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
+            return r;
+        }
+    }
+    #[cfg(feature = "v16")]
+    for (depth, g) in core::iter::once(cur).chain(enclosing.iter()).enumerate() {
         if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
             return r;
         }
         if table.is_none()
             && let Some((_, e)) = g.aliases.iter().find(|(a, _)| eq_ci(a.as_slice(), name))
         {
-            return Ok(e.clone());
+            if depth == 0 {
+                return Ok(e.clone());
+            }
+            return alias_from_outer(e, cur, enclosing, depth);
         }
     }
     Err(Error::Schema {
@@ -685,9 +686,142 @@ fn resolve_column<E>(
     })
 }
 
+/// An alias of an enclosing query, referenced from a subquery
+/// `depth` scopes in (v0.16, `v16`). The alias's resolved item
+/// is reused, rebased onto the current evaluation row: its
+/// column refs into its own scope (and further out) keep their
+/// slots, but any subquery inside it was planned with its own
+/// rows numbered after its home scope, while here those rows
+/// are appended after every scope of `cur` / `enclosing` — so
+/// slots and rowid sources at or past the home stack's end
+/// move by the difference (review regression: they read the
+/// nested subquery's columns, silently wrong rows).
+///
+/// An alias whose item holds an aggregate (outside any nested
+/// subquery) is refused: on the pin the aggregate still belongs
+/// to the alias's own query (one value per outer group), which
+/// hipp cannot evaluate inside a subquery — cloning it here
+/// re-aggregated the subquery's rows (review regression).
+#[cfg(feature = "v16")]
+fn alias_from_outer<E>(
+    e: &RExpr,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    depth: usize,
+) -> Result<RExpr, E> {
+    if has_agg(e) {
+        return Err(Error::Unsupported);
+    }
+    let home = ScopeGroup::stack_end(enclosing.get(depth.saturating_sub(1)..).unwrap_or(&[]));
+    let (cw, cs) = cur.end();
+    let (ew, es) = ScopeGroup::stack_end(enclosing);
+    let by = (
+        cw.max(ew).saturating_sub(home.0),
+        cs.max(es).saturating_sub(home.1),
+    );
+    let mut out = e.clone();
+    shift_expr(&mut out, home, by);
+    Ok(out)
+}
+
+/// Move every column slot at or past `at.0` by `by.0` and every
+/// rowid source at or past `at.1` by `by.1`, through nested
+/// subquery plans (v0.16, `alias_from_outer`).
+#[cfg(feature = "v16")]
+fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
+    match e {
+        RExpr::Column(slot, _) => {
+            if *slot >= at.0 {
+                *slot = slot.saturating_add(by.0);
+            }
+        }
+        RExpr::Rowid(src) => {
+            if *src >= at.1 {
+                *src = src.saturating_add(by.1);
+            }
+        }
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => shift_plan(p, at, by),
+        RExpr::InSub(x, p, _) => {
+            shift_expr(x, at, by);
+            shift_plan(p, at, by);
+        }
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => {}
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            shift_expr(a, at, by);
+            shift_expr(b, at, by);
+        }
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            shift_expr(a, at, by)
+        }
+        RExpr::InList(x, l, _) => {
+            shift_expr(x, at, by);
+            for i in l.as_mut_slice() {
+                shift_expr(i, at, by);
+            }
+        }
+        RExpr::Between(x, a, b, _) => {
+            shift_expr(x, at, by);
+            shift_expr(a, at, by);
+            shift_expr(b, at, by);
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            for b in base.iter_mut().chain(otherwise.iter_mut()) {
+                shift_expr(b, at, by);
+            }
+            for (w, t) in whens.as_mut_slice() {
+                shift_expr(w, at, by);
+                shift_expr(t, at, by);
+            }
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
+            for a in args.as_mut_slice() {
+                shift_expr(a, at, by);
+            }
+        }
+    }
+}
+
+/// `shift_expr` over every part of a plan that indexes the
+/// combined row (LIMIT / OFFSET run against an empty row of
+/// their own and are left alone).
+#[cfg(feature = "v16")]
+fn shift_plan(p: &mut SubPlan, at: (usize, usize), by: (usize, usize)) {
+    for s in p.sources.as_mut_slice() {
+        if let Some(on) = &mut s.on {
+            shift_expr(on, at, by);
+        }
+        if let Some(d) = &mut s.derived {
+            shift_plan(d, at, by);
+        }
+    }
+    let exprs = p
+        .items
+        .as_mut_slice()
+        .iter_mut()
+        .chain(p.filter.iter_mut())
+        .chain(p.group_by.as_mut_slice().iter_mut())
+        .chain(p.having.iter_mut())
+        .chain(p.order_by.as_mut_slice().iter_mut().map(|(e, _)| e));
+    for e in exprs {
+        shift_expr(e, at, by);
+    }
+    for row in p.values.as_mut_slice() {
+        for e in row.as_mut_slice() {
+            shift_expr(e, at, by);
+        }
+    }
+    for (_, t) in p.compound.as_mut_slice() {
+        shift_plan(t, at, by);
+    }
+}
+
 /// Expand `*` (`qual` None) or `q.*` over a scope group (v0.4;
 /// USING-aware since v0.16, the pin's `selectExpander`) into
-/// `(item, result name, ORDER BY name key)` triples; returns
+/// `(item, result name)` pairs; returns
 /// whether any source matched (always true for `*` with
 /// sources). For an unqualified `*`, a joined source's USING /
 /// NATURAL columns are omitted — each shows once, at the
@@ -700,7 +834,7 @@ fn resolve_column<E>(
 pub fn expand_star<E>(
     cur: &ScopeGroup,
     qual: Option<&[u8]>,
-    out: &mut AVec<(RExpr, AVec<u8>, OrderName)>,
+    out: &mut AVec<(RExpr, AVec<u8>)>,
 ) -> Result<bool, E> {
     let srcs = cur.sources.as_slice();
     let last_right = srcs.iter().rposition(|s| s.kind.pads_left());
@@ -729,11 +863,7 @@ pub fn expand_star<E>(
             } else {
                 src.column_ref(cur, si, ci)
             };
-            out.push((
-                e,
-                cname.clone(),
-                (Some(src.qualifier.clone()), cname.clone()),
-            ));
+            out.push((e, cname.clone()));
         }
     }
     Ok(hit)
@@ -765,6 +895,32 @@ fn literal_value(arena: &Arena, lit: Literal) -> OwnedValue {
 /// fails with `Error::Unsupported`.
 pub type SubPlanner<'p, E> =
     &'p mut dyn FnMut(&crate::sql::SelectStmt, &ScopeGroup, &[ScopeGroup]) -> Result<SubPlan, E>;
+
+/// A scalar / EXISTS subquery reads at most its first row, and
+/// the pin (`sqlite3CodeSubselect`) rewrites its `LIMIT X` to
+/// `LIMIT (X <> 0)`, the `0` carrying NUMERIC affinity (v0.16,
+/// `v16`): `LIMIT 2.5`, `LIMIT 'x'` or `LIMIT x'00'` become
+/// `LIMIT 1` there instead of a datatype mismatch, `LIMIT '0'`
+/// stays `LIMIT 0`, and a NULL limit still errors. OFFSET is
+/// left alone, as are IN subqueries and derived tables.
+#[cfg(feature = "v16")]
+fn first_row_limit(mut plan: SubPlan) -> SubPlan {
+    if let Some(x) = plan.limit.take() {
+        plan.limit = Some(RExpr::Binary(
+            BinOp::Ne,
+            Box::new(x),
+            Box::new(RExpr::AffLiteral(OwnedValue::Integer(0), Affinity::Numeric)),
+        ));
+    }
+    plan
+}
+
+/// `first_row_limit` without `v16`: a LIMIT is an integer
+/// literal there, for which the rewrite changes nothing.
+#[cfg(not(feature = "v16"))]
+fn first_row_limit(plan: SubPlan) -> SubPlan {
+    plan
+}
 
 /// Resolve a parser `Expr` against the FROM sources, with no
 /// enclosing scope and no subquery support (v0.6 contexts that
@@ -829,9 +985,11 @@ pub fn resolve_scoped<E>(
                     kind: SchemaKind::ColumnCountMismatch,
                 });
             }
-            RExpr::SubScalar(Box::new(plan))
+            RExpr::SubScalar(Box::new(first_row_limit(plan)))
         }
-        Expr::ExistsSubquery(stmt) => RExpr::SubExists(Box::new(planner(stmt, cur, enclosing)?)),
+        Expr::ExistsSubquery(stmt) => {
+            RExpr::SubExists(Box::new(first_row_limit(planner(stmt, cur, enclosing)?)))
+        }
         Expr::Binary(op, l, r) => RExpr::Binary(
             *op,
             Box::new(resolve_scoped::<E>(
