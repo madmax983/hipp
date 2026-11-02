@@ -6,6 +6,8 @@
 //! borrows.
 
 use crate::arena::{ABytes, AVec};
+#[cfg(any(feature = "v04", feature = "indexes"))]
+use crate::record::Coll;
 use alloc::boxed::Box;
 
 /// A literal value as written in the SQL text.
@@ -66,6 +68,12 @@ pub struct ColumnDef {
     /// record, exactly as in the pin's file format.
     #[cfg(feature = "v04")]
     pub stored: bool,
+    /// The column's `COLLATE name` (v0.16): its collating
+    /// sequence for comparisons, ORDER BY / GROUP BY / DISTINCT
+    /// and the indexes on it; `None` (no clause) is BINARY. An
+    /// unknown name is refused at parse, as on the pin.
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub coll: Option<Coll>,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -84,6 +92,10 @@ pub struct IndexColumnDef {
     pub name: ABytes,
     /// `DESC` sort order for this key column.
     pub desc: bool,
+    /// An explicit `COLLATE name` on this key column (v0.16);
+    /// `None` takes the table column's collation.
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub coll: Option<Coll>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +168,11 @@ pub enum Expr {
         args: AVec<Expr>,
     },
     Cast(Box<Expr>, ABytes),
+    /// `expr COLLATE name` (v0.16, `v16`): the operand with an
+    /// explicit collating sequence, which wins every comparison
+    /// it takes part in (the pin's `EP_Collate` rules).
+    #[cfg(feature = "v16")]
+    Collate(Box<Expr>, Coll),
 }
 
 /// One SELECT result item (v0.4).
@@ -209,6 +226,11 @@ impl JoinKind {
 pub struct SortOrder {
     pub desc: bool,
     pub nulls_first: bool,
+    /// The term's collating sequence (v0.16): BINARY from the
+    /// parser; the planner sets the term's collation (an explicit
+    /// `COLLATE`, else the column's — the pin's
+    /// `sqlite3ExprCollSeq`).
+    pub coll: crate::record::Coll,
 }
 
 /// One FROM source (v0.4): a table (or view name, resolved at plan
@@ -313,6 +335,11 @@ pub struct Upsert {
     /// clause names no target (`ON CONFLICT DO ...` arbitrates
     /// any uniqueness conflict).
     pub target: AVec<ABytes>,
+    /// Per-target-column explicit `COLLATE name` (v0.16),
+    /// parallel to `target`: a target column with one matches
+    /// only an index column of that collation (the pin's
+    /// upsert-target rule); `None` matches any.
+    pub target_colls: AVec<Option<crate::record::Coll>>,
     /// The target's optional index predicate (`ON CONFLICT (a)
     /// WHERE ...`): parsed and name-resolved at plan time (an
     /// unknown column errors, as in the oracle), but never

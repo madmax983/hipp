@@ -158,7 +158,7 @@ enum Access {
     #[cfg(feature = "indexes")]
     Index {
         root: u32,
-        desc: AVec<bool>,
+        desc: AVec<crate::record::KeyOrder>,
         probe: OwnedValue,
     },
     /// A predicate that can never match (e.g. `rowid = NULL`,
@@ -175,8 +175,9 @@ struct IndexPlan {
     unique: bool,
     /// Key columns (canonical form: None = rowid).
     cols: AVec<IdxColPlan>,
-    /// Per-key-column DESC flags, parallel to `cols`.
-    desc: AVec<bool>,
+    /// Per-key-column direction and collation (v0.16), parallel
+    /// to `cols`.
+    desc: AVec<crate::record::KeyOrder>,
 }
 
 #[cfg(feature = "indexes")]
@@ -184,6 +185,18 @@ struct IndexPlan {
 struct IdxColPlan {
     col: Option<usize>,
     desc: bool,
+    /// The key column's collating sequence (v0.16).
+    coll: crate::record::Coll,
+}
+
+#[cfg(feature = "indexes")]
+impl IdxColPlan {
+    fn order(&self) -> crate::record::KeyOrder {
+        crate::record::KeyOrder {
+            desc: self.desc,
+            coll: self.coll,
+        }
+    }
 }
 
 // Plans are built once per statement and never stored in bulk;
@@ -439,6 +452,10 @@ struct CompKeys {
     names: AVec<Option<AVec<u8>>>,
     items: AVec<RExpr>,
     scope: crate::query::ScopeGroup,
+    /// Each result column's collation, if it has one (v0.16;
+    /// a VALUES core's first row): the compound's column
+    /// collation is the leftmost core's that has one.
+    colls: AVec<Option<crate::record::Coll>>,
 }
 
 #[cfg(feature = "v09")]
@@ -466,7 +483,7 @@ impl CompKeys {
 #[cfg(feature = "v09")]
 fn same_ref(a: &RExpr, b: &RExpr) -> bool {
     match (a, b) {
-        (RExpr::Column(x, _), RExpr::Column(y, _)) => x == y,
+        (RExpr::Column(x, ..), RExpr::Column(y, ..)) => x == y,
         (RExpr::Rowid(x), RExpr::Rowid(y)) => x == y,
         (RExpr::Scalar(f, xs), RExpr::Scalar(g, ys)) => {
             f == g && xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| same_ref(x, y))
@@ -665,6 +682,10 @@ struct UpsertPlan {
     /// conflict on the rowid (cols == [Rowid]) or on a unique
     /// index whose key columns are exactly this set.
     target: Option<AVec<Target>>,
+    /// Per-target-column explicit collations (v0.16), parallel
+    /// to `target`: such a column arbitrates only an index key
+    /// column of that collation.
+    target_colls: AVec<Option<crate::record::Coll>>,
     /// `DO UPDATE` when true; `DO NOTHING` when false (then
     /// `sets`/`filter` are empty / None).
     do_update: bool,
@@ -898,7 +919,18 @@ impl<S: Storage> Connection<S> {
                             }
                         }
                     };
-                    cols.push(IdxColPlan { col, desc: cd.desc });
+                    // v0.16: the key collation — explicit, else
+                    // the column's (BINARY for the rowid).
+                    let coll = cd.coll.unwrap_or_else(|| {
+                        col.and_then(|i| t.columns.as_slice().get(i))
+                            .map(|c| c.coll)
+                            .unwrap_or_default()
+                    });
+                    cols.push(IdxColPlan {
+                        col,
+                        desc: cd.desc,
+                        coll,
+                    });
                 }
                 let mut defaults = AVec::new();
                 for c in t.columns.iter() {
@@ -1050,11 +1082,13 @@ impl<S: Storage> Connection<S> {
                         let mut cols = AVec::new();
                         let mut desc = AVec::new();
                         for c in ix.columns.iter() {
-                            cols.push(IdxColPlan {
+                            let p = IdxColPlan {
                                 col: c.col,
                                 desc: c.desc,
-                            });
-                            desc.push(c.desc);
+                                coll: c.coll,
+                            };
+                            desc.push(p.order());
+                            cols.push(p);
                         }
                         out.push(IndexPlan {
                             root: ix.root,
@@ -1588,6 +1622,7 @@ impl<S: Storage> Connection<S> {
                 decl: handle_bytes(ca, c.decl),
                 gen_text: c.gen_expr.map(|h| handle_bytes(ca, h)),
                 stored: c.stored,
+                coll: c.coll,
             });
         }
         let mut checks: AVec<&[u8]> = AVec::new();
@@ -1646,12 +1681,9 @@ impl<S: Storage> Connection<S> {
             ));
         }
         let mut sources = AVec::new();
-        sources.push(crate::query::SourceDesc::new(
-            copy_vec(qualifier),
-            cols,
-            t.rowid_alias,
-            true,
-        ));
+        let mut src = crate::query::SourceDesc::new(copy_vec(qualifier), cols, t.rowid_alias, true);
+        src.colls = table_colls(t);
+        sources.push(src);
         let mut offsets = AVec::new();
         offsets.push(0);
         (sources, offsets)
@@ -1670,11 +1702,13 @@ impl<S: Storage> Connection<S> {
             let mut cols = AVec::new();
             let mut desc = AVec::new();
             for c in ix.columns.iter() {
-                cols.push(IdxColPlan {
+                let p = IdxColPlan {
                     col: c.col,
                     desc: c.desc,
-                });
-                desc.push(c.desc);
+                    coll: c.coll,
+                };
+                desc.push(p.order());
+                cols.push(p);
             }
             out.push(IndexPlan {
                 root: ix.root,
@@ -1753,6 +1787,18 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
         planner: crate::query::SubPlanner<'_, S::Error>,
     ) -> Result<RExpr, S::Error> {
+        // `<term> COLLATE name` (v0.16, `v16`): the term's own
+        // ordinal / alias rules apply to the operand and the
+        // collation stays on top (the pin's `resolveAlias`
+        // keeps it), so `ORDER BY 1 COLLATE NOCASE` sorts item 1
+        // by NOCASE.
+        #[cfg(feature = "v16")]
+        if let Expr::Collate(inner, c) = e {
+            let r = self.resolve_term(
+                inner, clause, arena, items, aliases, cur, enclosing, planner,
+            )?;
+            return Ok(RExpr::Collate(Box::new(r), *c));
+        }
         if clause != TermClause::Having
             && let Expr::Literal(Literal::Integer(n)) = e
             && (-0x7fff_ffff..=0x7fff_ffff).contains(n)
@@ -1938,12 +1984,14 @@ impl<S: Storage> Connection<S> {
         for i in 0..width.unwrap_or(0) {
             names.push(Some(values_col_name(i)));
         }
+        let colls = core_colls(&[], rows_r.as_slice());
         Ok((
             rows_r,
             CompKeys {
                 names,
                 items: AVec::new(),
                 scope: cur,
+                colls,
             },
         ))
     }
@@ -2040,12 +2088,8 @@ impl<S: Storage> Connection<S> {
             match it {
                 SelectItem::Star => {
                     let src = &cur.sources.as_slice()[0];
-                    for (ci, (_, aff)) in src.columns.iter().enumerate() {
-                        out.push(if Some(ci) == src.rowid_alias {
-                            RExpr::Rowid(0)
-                        } else {
-                            RExpr::Column(ci, *aff)
-                        });
+                    for ci in 0..src.columns.len() {
+                        out.push(src.column_ref(&cur, 0, ci));
                     }
                 }
                 SelectItem::TableStar(q) => {
@@ -2056,12 +2100,8 @@ impl<S: Storage> Connection<S> {
                             kind: SchemaKind::UnknownColumn,
                         });
                     }
-                    for (ci, (_, aff)) in src.columns.iter().enumerate() {
-                        out.push(if Some(ci) == src.rowid_alias {
-                            RExpr::Rowid(0)
-                        } else {
-                            RExpr::Column(ci, *aff)
-                        });
+                    for ci in 0..src.columns.len() {
+                        out.push(src.column_ref(&cur, 0, ci));
                     }
                 }
                 SelectItem::Expr(e, _, _) => {
@@ -2132,15 +2172,20 @@ impl<S: Storage> Connection<S> {
                     }
                     let mut keyset = AVec::new();
                     for c in ix.columns.iter() {
-                        keyset.push(match c.col {
-                            None => Target::Rowid,
-                            Some(i) if Some(i) == t.rowid_alias => Target::Rowid,
-                            Some(i) => Target::Col(i),
-                        });
+                        keyset.push((
+                            match c.col {
+                                None => Target::Rowid,
+                                Some(i) if Some(i) == t.rowid_alias => Target::Rowid,
+                                Some(i) => Target::Col(i),
+                            },
+                            c.coll,
+                        ));
                     }
-                    if keyset.len() == cols.len()
-                        && keyset.iter().all(|k| cols.iter().any(|c| c == k))
-                    {
+                    if keyset_matches(
+                        cols.as_slice(),
+                        upsert.target_colls.as_slice(),
+                        keyset.as_slice(),
+                    ) {
                         matches_index = true;
                         break;
                     }
@@ -2171,12 +2216,9 @@ impl<S: Storage> Connection<S> {
                     ));
                 }
                 let mut ex_sources = AVec::new();
-                ex_sources.push(SourceDesc::new(
-                    copy_vec(b"excluded"),
-                    ex_cols,
-                    t.rowid_alias,
-                    true,
-                ));
+                let mut ex = SourceDesc::new(copy_vec(b"excluded"), ex_cols, t.rowid_alias, true);
+                ex.colls = table_colls(t);
+                ex_sources.push(ex);
                 let mut ex_offsets = AVec::new();
                 ex_offsets.push(t.columns.len());
                 let enclosing = [ScopeGroup::new(ex_sources, ex_offsets, 1)];
@@ -2223,6 +2265,7 @@ impl<S: Storage> Connection<S> {
         };
         Ok(UpsertPlan {
             target,
+            target_colls: upsert.target_colls.clone(),
             do_update,
             sets,
             filter,
@@ -2813,19 +2856,20 @@ impl<S: Storage> Connection<S> {
         let mut order_by: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
         if stmt.compound.is_empty() {
             for (e, dir) in stmt.order_by.iter() {
-                order_by.push((
-                    self.resolve_term(
-                        e,
-                        TermClause::Order,
-                        arena,
-                        items.as_slice(),
-                        item_aliases.as_slice(),
-                        &cur,
-                        enclosing,
-                        &mut planner,
-                    )?,
-                    *dir,
-                ));
+                let r = self.resolve_term(
+                    e,
+                    TermClause::Order,
+                    arena,
+                    items.as_slice(),
+                    item_aliases.as_slice(),
+                    &cur,
+                    enclosing,
+                    &mut planner,
+                )?;
+                // v0.16: the term sorts by its collation.
+                let mut dir = *dir;
+                dir.coll = crate::query::expr_coll(&r).unwrap_or_default();
+                order_by.push((r, dir));
             }
         }
         // A subquery inside an aggregate's arguments needs
@@ -2847,6 +2891,7 @@ impl<S: Storage> Connection<S> {
         cur.aliases.clear();
         let keys = CompKeys {
             names: item_aliases,
+            colls: core_colls(items.as_slice(), &[]),
             items: items.clone(),
             scope: cur,
         };
@@ -2917,6 +2962,23 @@ impl<S: Storage> Connection<S> {
                 };
                 let mut desc = SourceDesc::new(qual, cols, None, false);
                 desc.kind = s.kind;
+                // v0.16: a derived column compares by its
+                // leftmost core's item collation (BINARY when
+                // the item has none — still a column's).
+                for it in dplan.items.iter() {
+                    desc.colls
+                        .push(crate::query::expr_coll(it).unwrap_or_default());
+                }
+                for v in dplan
+                    .values
+                    .as_slice()
+                    .first()
+                    .iter()
+                    .flat_map(|r| r.iter())
+                {
+                    desc.colls
+                        .push(crate::query::expr_coll(v).unwrap_or_default());
+                }
                 descs.push(desc);
                 plans.push(SourcePlan {
                     root: 0,
@@ -2963,6 +3025,7 @@ impl<S: Storage> Connection<S> {
             };
             let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, true);
             desc.kind = s.kind;
+            desc.colls = table_colls(t);
             descs.push(desc);
             let gcols = if t.has_generated() {
                 self.table_rules(arena, t)?
@@ -3084,7 +3147,8 @@ impl<S: Storage> Connection<S> {
         if matches!(lit, Literal::Null) {
             return Some(Access::Empty);
         }
-        let mut chosen: Option<(u32, bool, AVec<bool>)> = None;
+        let mut chosen: Option<(u32, bool, AVec<crate::record::KeyOrder>)> = None;
+        let col_coll = t.columns.as_slice().get(col).map(|c| c.coll);
         for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
             if ix.opaque {
                 continue;
@@ -3092,12 +3156,18 @@ impl<S: Storage> Connection<S> {
             let Some(first) = ix.columns.as_slice().first() else {
                 continue;
             };
-            if first.col != Some(col) {
+            // v0.16: `col = lit` compares by the column's
+            // collation; only an index keyed by that same
+            // collation can answer it.
+            if first.col != Some(col) || Some(first.coll) != col_coll {
                 continue;
             }
             let mut desc = AVec::new();
             for c in ix.columns.iter() {
-                desc.push(c.desc);
+                desc.push(crate::record::KeyOrder {
+                    desc: c.desc,
+                    coll: c.coll,
+                });
             }
             match &chosen {
                 None => chosen = Some((ix.root, ix.unique, desc)),
@@ -3374,6 +3444,17 @@ fn literal_owned(arena: &Arena, lit: Option<Literal>) -> OwnedValue {
     }
 }
 
+/// A table's per-column collating sequences (v0.16), for its
+/// resolution `SourceDesc`.
+#[cfg(feature = "v04")]
+fn table_colls(t: &crate::schema::TableDef) -> AVec<crate::record::Coll> {
+    let mut out = AVec::new();
+    for c in t.columns.iter() {
+        out.push(c.coll);
+    }
+    out
+}
+
 fn copy_vec(b: &[u8]) -> AVec<u8> {
     let mut v = AVec::new();
     for x in b {
@@ -3618,13 +3699,18 @@ fn update_rowid<E>(v: &OwnedValue) -> Result<i64, E> {
     }
 }
 
+/// A unique index's canonical key columns with their
+/// collations (v0.16), for upsert-target matching.
+#[cfg(feature = "v07")]
+type KeySet = AVec<(Target, crate::record::Coll)>;
+
 /// Whether an upsert clause arbitrates one found conflict
 /// (v0.7): no target arbitrates everything; a target arbitrates
 /// a rowid conflict only when it is exactly `[Rowid]`, and an
 /// index conflict only when the index's canonical key set is
 /// exactly the target set.
 #[cfg(feature = "v07")]
-fn upsert_arbitrates(up: &UpsertPlan, by_rowid: bool, keyset: &Option<AVec<Target>>) -> bool {
+fn upsert_arbitrates(up: &UpsertPlan, by_rowid: bool, keyset: &Option<KeySet>) -> bool {
     let Some(target) = &up.target else {
         return true;
     };
@@ -3632,9 +3718,28 @@ fn upsert_arbitrates(up: &UpsertPlan, by_rowid: bool, keyset: &Option<AVec<Targe
         return target.len() == 1 && target.as_slice()[0] == Target::Rowid;
     }
     match keyset {
-        Some(ks) => ks.len() == target.len() && ks.iter().all(|k| target.iter().any(|t| t == k)),
+        Some(ks) => keyset_matches(target.as_slice(), up.target_colls.as_slice(), ks.as_slice()),
         None => false,
     }
+}
+
+/// Whether an upsert target names exactly an index's key
+/// columns (v0.7), each target column written with a `COLLATE`
+/// matching that key column's collation (v0.16; the pin's
+/// `sqlite3UpsertAnalyzeTarget` — a bare column matches any).
+#[cfg(feature = "v07")]
+fn keyset_matches(
+    target: &[Target],
+    colls: &[Option<crate::record::Coll>],
+    keyset: &[(Target, crate::record::Coll)],
+) -> bool {
+    keyset.len() == target.len()
+        && keyset.iter().all(|(k, kc)| {
+            target
+                .iter()
+                .zip(colls.iter().chain(core::iter::repeat(&None)))
+                .any(|(t, c)| t == k && c.is_none_or(|c| c == *kc))
+        })
 }
 
 /// Coerce a `WHERE rowid = <literal>` literal to an access path,
@@ -4179,7 +4284,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         let mut desc = AVec::new();
         for c in cols.iter() {
-            desc.push(c.desc);
+            desc.push(c.order());
         }
         let mut cursor = ScanCursor::new(table_root);
         let mut buf = AVec::new();
@@ -4648,7 +4753,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         // v0.3 index work, part 1: UNIQUE pre-checks against the
         // row's keys (a key containing NULL never conflicts).
         #[cfg(feature = "indexes")]
-        let mut pending_keys: AVec<(u32, AVec<bool>, AVec<OwnedValue>)> = AVec::new();
+        let mut pending_keys: AVec<(u32, AVec<crate::record::KeyOrder>, AVec<OwnedValue>)> =
+            AVec::new();
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
             let mut key = AVec::new();
@@ -4866,7 +4972,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Find every conflict: (conflicting rowid, conflict is on
         // the rowid itself, the index's canonical key-target set
         // when the conflict is index-borne).
-        let mut conflicts: AVec<(i64, bool, Option<AVec<Target>>)> = AVec::new();
+        let mut conflicts: AVec<(i64, bool, Option<KeySet>)> = AVec::new();
         if btree::seek_rowid(&mut self.conn.pager, root, rowid)
             .await?
             .is_some()
@@ -4896,11 +5002,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             {
                 let mut keyset = AVec::new();
                 for c in ix.cols.iter() {
-                    keyset.push(match c.col {
-                        None => Target::Rowid,
-                        Some(i) if Some(i) == rowid_alias => Target::Rowid,
-                        Some(i) => Target::Col(i),
-                    });
+                    keyset.push((
+                        match c.col {
+                            None => Target::Rowid,
+                            Some(i) if Some(i) == rowid_alias => Target::Rowid,
+                            Some(i) => Target::Col(i),
+                        },
+                        c.coll,
+                    ));
                 }
                 conflicts.push((other, false, Some(keyset)));
             }
@@ -6125,13 +6234,20 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "v09")]
     async fn run_query_compound(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
-        let mut rows = self.exec_qp_core_values(&qp).await?;
+        let head = self.exec_qp_core_values(&qp).await?;
+        let mut tails = AVec::new();
+        let mut cores = AVec::new();
+        cores.push(core_colls(qp.items.as_slice(), qp.values.as_slice()));
         for (op, tail) in qp.compound.iter() {
-            let right = self.exec_qp_core_values(tail).await?;
-            rows = combine_compound(*op, rows, right);
+            tails.push((*op, self.exec_qp_core_values(tail).await?));
+            cores.push(core_colls(tail.items.as_slice(), tail.values.as_slice()));
         }
-        rows.as_mut_slice()
-            .sort_by(|a, b| compound_order_cmp(a, b, qp.comp_order.as_slice()));
+        let rows = run_compound(
+            head,
+            tails.as_slice(),
+            cores.as_slice(),
+            qp.comp_order.as_slice(),
+        );
         let rows = apply_window(rows, window);
         let mut ids: AVec<Option<i64>> = AVec::new();
         for _ in rows.iter() {
@@ -6182,7 +6298,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             out.push(p.out.clone());
         }
         if qp.distinct {
-            out = dedup_compound_rows(out);
+            let colls = crate::query::exprs_colls(qp.items.as_slice());
+            out = dedup_compound_rows(out, colls.as_slice());
         }
         Ok(out)
     }
@@ -6199,7 +6316,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         (skip, take): (usize, usize),
     ) {
         if qp.distinct {
-            produced = dedup_produced(produced);
+            produced = dedup_produced(
+                produced,
+                crate::query::exprs_colls(qp.items.as_slice()).as_slice(),
+            );
         }
         produced.as_mut_slice().sort_by(|x, y| {
             crate::query::order_keys_cmp(
@@ -6340,7 +6460,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             arg_rows.push(vs);
         }
-        crate::query::eval_agg_values::<S::Error>(kind, distinct, star, arg_rows.as_slice())
+        crate::query::eval_agg_values::<S::Error>(
+            kind,
+            distinct,
+            star,
+            arg_rows.as_slice(),
+            crate::query::args_coll(args.as_slice()),
+        )
     }
 
     /// The representative row for a top-level query's group
@@ -6358,25 +6484,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         if grows.is_empty() {
             return Ok(empty_rep.clone());
         }
-        let mut aggs: AVec<&RExpr> = AVec::new();
-        for it in qp.items.iter() {
-            crate::query::collect_aggs(it, &mut aggs);
-        }
-        if let Some(h) = &qp.having {
-            crate::query::collect_aggs(h, &mut aggs);
-        }
-        if aggs.len() == 1
-            && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
-            && matches!(
-                kind,
-                crate::query::AggKind::Min | crate::query::AggKind::Max
-            )
-            && !args.is_empty()
-            && crate::query::has_sub(&args.as_slice()[0])
+        if let Some((kind, arg)) = rep_minmax(
+            qp.items.as_slice(),
+            qp.having.as_ref(),
+            qp.order_by.as_slice(),
+        ) && crate::query::has_sub(arg)
         {
-            return self
-                .extremum_rep(*kind, &args.as_slice()[0], grows, empty_rep)
-                .await;
+            return self.extremum_rep(kind, arg, grows, empty_rep).await;
         }
         pick_rep::<S::Error>(qp, grows, empty_rep)
     }
@@ -6392,35 +6506,22 @@ impl<'c, S: Storage> Statement<'c, S> {
         if grows.is_empty() {
             return Ok(empty_rep.clone());
         }
-        let mut aggs: AVec<&RExpr> = AVec::new();
-        for it in plan.items.iter() {
-            crate::query::collect_aggs(it, &mut aggs);
-        }
-        if let Some(h) = &plan.having {
-            crate::query::collect_aggs(h, &mut aggs);
-        }
-        if aggs.len() == 1
-            && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
-            && matches!(
-                kind,
-                crate::query::AggKind::Min | crate::query::AggKind::Max
-            )
-            && !args.is_empty()
-            && crate::query::has_sub(&args.as_slice()[0])
+        if let Some((kind, arg)) = rep_minmax(
+            plan.items.as_slice(),
+            plan.having.as_ref(),
+            plan.order_by.as_slice(),
+        ) && crate::query::has_sub(arg)
         {
-            return self
-                .extremum_rep(*kind, &args.as_slice()[0], grows, empty_rep)
-                .await;
+            return self.extremum_rep(kind, arg, grows, empty_rep).await;
         }
         pick_rep_sub::<S::Error>(plan, grows, empty_rep)
     }
 
-    /// The extremum row of a group under one min/max aggregate
-    /// whose argument is evaluated per row through
-    /// `eval_row_sub` (v0.11): NULL arguments never win, and a
-    /// group with no non-NULL argument keeps its first row —
-    /// the synchronous `pick_rep` rule, with per-row subquery
-    /// execution.
+    /// The extremum row of a group under the min/max aggregate
+    /// `rep_minmax` chose, whose argument is evaluated per row
+    /// through `eval_row_sub` (v0.11): the synchronous
+    /// `pick_rep_from` rule (`extremum_step`), with per-row
+    /// subquery execution.
     #[cfg(feature = "v06")]
     async fn extremum_rep(
         &mut self,
@@ -6432,33 +6533,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         if grows.is_empty() {
             return Ok(empty_rep.clone());
         }
-        let mut best: Option<&RowData> = None;
-        let mut bestv: Option<OwnedValue> = None;
+        let coll = crate::query::expr_coll(arg).unwrap_or_default();
+        let mut best: Option<OwnedValue> = None;
+        let mut rep: Option<&RowData> = None;
         for r in grows {
             let v = self.eval_row_sub(arg, r).await?;
-            if matches!(v, OwnedValue::Null) {
-                continue;
-            }
-            let take = match &bestv {
-                None => true,
-                Some(b) => {
-                    let o = crate::record::compare_values(&v.as_value(), &b.as_value());
-                    if kind == crate::query::AggKind::Min {
-                        o == core::cmp::Ordering::Less
-                    } else {
-                        o == core::cmp::Ordering::Greater
-                    }
-                }
-            };
-            if take {
-                best = Some(r);
-                bestv = Some(v);
+            if extremum_step(kind, coll, &mut best, v) {
+                rep = Some(r);
             }
         }
-        match best {
-            Some(b) => Ok(b.clone()),
-            None => Ok(grows[0].clone()),
-        }
+        Ok(rep.unwrap_or(empty_rep).clone())
     }
 
     /// Execute every current-scope subquery node of `e` for the
@@ -6601,20 +6685,28 @@ impl<'c, S: Storage> Statement<'c, S> {
         // compound ORDER BY / LIMIT.
         #[cfg(feature = "v09")]
         if !plan.compound.is_empty() {
-            let mut rows: AVec<AVec<OwnedValue>> = AVec::new();
+            let mut head: AVec<AVec<OwnedValue>> = AVec::new();
             for p in produced.iter() {
-                rows.push(p.out.clone());
+                head.push(p.out.clone());
             }
+            let mut tails = AVec::new();
+            let mut cores = AVec::new();
+            cores.push(core_colls(plan.items.as_slice(), plan.values.as_slice()));
             for (op, tail) in plan.compound.iter() {
                 let tp = self.exec_subplan_core(tail, outer).await?;
                 let mut right: AVec<AVec<OwnedValue>> = AVec::new();
                 for p in tp.iter() {
                     right.push(p.out.clone());
                 }
-                rows = combine_compound(*op, rows, right);
+                tails.push((*op, right));
+                cores.push(core_colls(tail.items.as_slice(), tail.values.as_slice()));
             }
-            rows.as_mut_slice()
-                .sort_by(|a, b| compound_order_cmp(a, b, plan.comp_order.as_slice()));
+            let rows = run_compound(
+                head,
+                tails.as_slice(),
+                cores.as_slice(),
+                plan.comp_order.as_slice(),
+            );
             return Ok(apply_window(rows, window));
         }
         produced.as_mut_slice().sort_by(|x, y| {
@@ -6678,7 +6770,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         .await?;
         let mut produced = self.sub_project(plan, outer, joined.as_slice()).await?;
         if plan.distinct {
-            produced = dedup_produced(produced);
+            produced = dedup_produced(
+                produced,
+                crate::query::exprs_colls(plan.items.as_slice()).as_slice(),
+            );
         }
         Ok(produced)
     }
@@ -6882,6 +6977,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             groups.push((AVec::new(), all));
         } else {
+            // v0.16: groups form and sort under each term's
+            // collation (a NOCASE column groups 'a' with 'A').
+            let gcolls = crate::query::exprs_colls(qp.group_by.as_slice());
+            let gdesc = group_desc(qp.group_by.as_slice(), qp.order_by.as_slice());
             for r in rows {
                 let mut key = AVec::new();
                 for g in qp.group_by.iter() {
@@ -6892,7 +6991,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     if k.len() == key.len()
                         && k.iter()
                             .zip(key.iter())
-                            .all(|(a, b)| crate::query::values_equal_is(a, b))
+                            .zip(gcolls.iter())
+                            .all(|((a, b), c)| crate::query::values_equal_coll(a, b, *c))
                     {
                         found = Some(gi);
                         break;
@@ -6908,8 +7008,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             groups.as_mut_slice().sort_by(|a, b| {
-                for (av, bv) in a.0.iter().zip(b.0.iter()) {
-                    let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+                for (((av, bv), c), d) in
+                    a.0.iter()
+                        .zip(b.0.iter())
+                        .zip(gcolls.iter())
+                        .zip(gdesc.iter())
+                {
+                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                    let o = if *d { o.reverse() } else { o };
                     if o != core::cmp::Ordering::Equal {
                         return o;
                     }
@@ -7000,6 +7106,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             groups.push((AVec::new(), all));
         } else {
+            // v0.16: groups form and sort under each term's
+            // collation (a NOCASE column groups 'a' with 'A').
+            let gcolls = crate::query::exprs_colls(plan.group_by.as_slice());
+            let gdesc = group_desc(plan.group_by.as_slice(), plan.order_by.as_slice());
             for r in rows {
                 let mut key = AVec::new();
                 for g in plan.group_by.iter() {
@@ -7010,7 +7120,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     if k.len() == key.len()
                         && k.iter()
                             .zip(key.iter())
-                            .all(|(a, b)| crate::query::values_equal_is(a, b))
+                            .zip(gcolls.iter())
+                            .all(|((a, b), c)| crate::query::values_equal_coll(a, b, *c))
                     {
                         found = Some(gi);
                         break;
@@ -7026,8 +7137,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             groups.as_mut_slice().sort_by(|a, b| {
-                for (av, bv) in a.0.iter().zip(b.0.iter()) {
-                    let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+                for (((av, bv), c), d) in
+                    a.0.iter()
+                        .zip(b.0.iter())
+                        .zip(gcolls.iter())
+                        .zip(gdesc.iter())
+                {
+                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                    let o = if *d { o.reverse() } else { o };
                     if o != core::cmp::Ordering::Equal {
                         return o;
                     }
@@ -7418,6 +7535,18 @@ fn resolve_compound_order<E>(
 ) -> Result<AVec<(usize, crate::sql::SortOrder)>, E> {
     let mut out = AVec::new();
     for (e, desc) in order_by.iter() {
+        // v0.16: `<term> COLLATE name` sorts the matched column
+        // by that collation; any other term by the compound
+        // column's own (the leftmost core's that has one).
+        #[allow(unused_mut)]
+        let (mut e, mut explicit) = (e, None);
+        #[cfg(feature = "v16")]
+        while let Expr::Collate(inner, c) = e {
+            if explicit.is_none() {
+                explicit = Some(*c);
+            }
+            e = inner;
+        }
         let idx = match e {
             Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= width => {
                 Some(*n as usize - 1)
@@ -7432,7 +7561,16 @@ fn resolve_compound_order<E>(
             _ => None,
         };
         match idx {
-            Some(i) => out.push((i, *desc)),
+            Some(i) => {
+                let mut o = *desc;
+                o.coll = explicit.unwrap_or_else(|| {
+                    compound_col_coll(
+                        core::iter::once(head).chain(tails.iter()).map(|k| &k.colls),
+                        i,
+                    )
+                });
+                out.push((i, o));
+            }
             None => {
                 return Err(Error::Schema {
                     kind: SchemaKind::UnknownColumn,
@@ -7443,26 +7581,80 @@ fn resolve_compound_order<E>(
     Ok(out)
 }
 
-/// Compound row equality (v0.9): raw storage-class comparison
-/// per column, NULLs equal — the pin applies NO affinity in
-/// compound operations (`SELECT 1 UNION SELECT '1'` keeps both
-/// rows; a TEXT column does not convert the other side either).
-#[cfg(feature = "v09")]
-fn compound_rows_equal(a: &[OwnedValue], b: &[OwnedValue]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| crate::query::values_equal_is(x, y))
+/// A core's per-column collations (v0.16): each result item's
+/// (`query::expr_coll`). A VALUES core follows the pin's
+/// `sqlite3MultiValues`: several constant rows whose first row
+/// has no affinity become a co-routine read through a FROM
+/// subquery, whose columns are columns (the first row's
+/// collation, else BINARY — so `VALUES ('X'), ('x') UNION
+/// SELECT nocase_col` deduplicates by BINARY); otherwise the
+/// rows are a UNION ALL chain of one-row cores, and the first
+/// row with a collation lends it.
+#[cfg(feature = "v04")]
+fn core_colls(items: &[RExpr], values: &[AVec<RExpr>]) -> AVec<Option<crate::record::Coll>> {
+    use crate::query::{expr_coll, is_constant, item_result_affinity};
+    let mut out = AVec::new();
+    let Some(first) = values.first() else {
+        for e in items {
+            out.push(expr_coll(e));
+        }
+        return out;
+    };
+    let coroutine = values.len() > 1
+        && values.iter().all(|r| r.iter().all(is_constant))
+        && first.iter().all(|e| item_result_affinity(e).is_none());
+    for (i, e) in first.iter().enumerate() {
+        out.push(if coroutine {
+            Some(expr_coll(e).unwrap_or_default())
+        } else {
+            values
+                .iter()
+                .find_map(|r| r.as_slice().get(i).and_then(expr_coll))
+        });
+    }
+    out
 }
 
-/// Remove duplicate rows, keeping first occurrences (v0.9).
+/// A compound result column's collation (v0.16, the pin's
+/// `multiSelectCollSeq`): the leftmost core whose item `i` has
+/// one decides; BINARY when none does.
 #[cfg(feature = "v09")]
-fn dedup_compound_rows(rows: AVec<AVec<OwnedValue>>) -> AVec<AVec<OwnedValue>> {
+fn compound_col_coll<'x>(
+    cores: impl Iterator<Item = &'x AVec<Option<crate::record::Coll>>>,
+    i: usize,
+) -> crate::record::Coll {
+    for c in cores {
+        if let Some(Some(x)) = c.as_slice().get(i) {
+            return *x;
+        }
+    }
+    crate::record::Coll::Binary
+}
+
+/// Row equality under per-column collations, NULLs equal
+/// (v0.16; v0.9 compared raw): the pin applies NO affinity in
+/// compound operations or DISTINCT (`SELECT 1 UNION SELECT
+/// '1'` keeps both rows).
+#[cfg(feature = "v04")]
+fn compound_rows_equal(a: &[OwnedValue], b: &[OwnedValue], colls: &[crate::record::Coll]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).enumerate().all(|(i, (x, y))| {
+            crate::query::values_equal_coll(x, y, colls.get(i).copied().unwrap_or_default())
+        })
+}
+
+/// Remove duplicate rows, keeping first occurrences (v0.9;
+/// under the columns' collations since v0.16).
+#[cfg(feature = "v09")]
+fn dedup_compound_rows(
+    rows: AVec<AVec<OwnedValue>>,
+    colls: &[crate::record::Coll],
+) -> AVec<AVec<OwnedValue>> {
     let mut kept: AVec<AVec<OwnedValue>> = AVec::new();
     for r in rows.iter() {
         if !kept
             .iter()
-            .any(|k| compound_rows_equal(k.as_slice(), r.as_slice()))
+            .any(|k| compound_rows_equal(k.as_slice(), r.as_slice(), colls))
         {
             kept.push(r.clone());
         }
@@ -7470,87 +7662,171 @@ fn dedup_compound_rows(rows: AVec<AVec<OwnedValue>>) -> AVec<AVec<OwnedValue>> {
     kept
 }
 
-/// Sort rows the way the pin's compound sorter emits them
-/// (v0.9): ascending by every column, raw comparison.
+/// Compare two compound rows ascending by every column under
+/// the merge key's collations (v0.16).
 #[cfg(feature = "v09")]
-fn compound_sort_rows(rows: &mut [AVec<OwnedValue>]) {
-    rows.sort_by(|a, b| {
-        for (x, y) in a.iter().zip(b.iter()) {
-            let o = crate::record::compare_values(&x.as_value(), &y.as_value());
-            if o != core::cmp::Ordering::Equal {
-                return o;
-            }
-        }
-        core::cmp::Ordering::Equal
-    });
-}
-
-/// Combine two cores' rows under one compound operator
-/// (v0.9). UNION / INTERSECT / EXCEPT deduplicate and emit in
-/// sorter order, like the pin; UNION ALL concatenates in
-/// operand order.
-#[cfg(feature = "v09")]
-fn combine_compound(
-    op: crate::sql::CompoundOp,
-    left: AVec<AVec<OwnedValue>>,
-    right: AVec<AVec<OwnedValue>>,
-) -> AVec<AVec<OwnedValue>> {
-    use crate::sql::CompoundOp;
-    match op {
-        CompoundOp::UnionAll => {
-            let mut out = left;
-            for r in right.iter() {
-                out.push(r.clone());
-            }
-            out
-        }
-        CompoundOp::Union => {
-            // Pin-verified survivor rule: each side first
-            // deduplicates first-occurrence-wins; then a right
-            // row REPLACES an equal left row (`SELECT 1 UNION
-            // SELECT 1.0` yields the real 1.0, `SELECT 1.0
-            // UNION SELECT 1` the integer 1), and right rows
-            // with no equal append.
-            let mut out = dedup_compound_rows(left);
-            for r in dedup_compound_rows(right).iter() {
-                match out
-                    .iter()
-                    .position(|k| compound_rows_equal(k.as_slice(), r.as_slice()))
-                {
-                    Some(i) => out.as_mut_slice()[i] = r.clone(),
-                    None => out.push(r.clone()),
-                }
-            }
-            compound_sort_rows(out.as_mut_slice());
-            out
-        }
-        CompoundOp::Intersect => {
-            let mut out: AVec<AVec<OwnedValue>> = AVec::new();
-            for r in dedup_compound_rows(left).iter() {
-                if right
-                    .iter()
-                    .any(|x| compound_rows_equal(x.as_slice(), r.as_slice()))
-                {
-                    out.push(r.clone());
-                }
-            }
-            compound_sort_rows(out.as_mut_slice());
-            out
-        }
-        CompoundOp::Except => {
-            let mut out: AVec<AVec<OwnedValue>> = AVec::new();
-            for r in dedup_compound_rows(left).iter() {
-                if !right
-                    .iter()
-                    .any(|x| compound_rows_equal(x.as_slice(), r.as_slice()))
-                {
-                    out.push(r.clone());
-                }
-            }
-            compound_sort_rows(out.as_mut_slice());
-            out
+fn compound_key_cmp(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+    colls: &[crate::record::Coll],
+) -> core::cmp::Ordering {
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let c = crate::record::compare_coll(
+            &x.as_value(),
+            &y.as_value(),
+            colls.get(i).copied().unwrap_or_default(),
+        );
+        if c != core::cmp::Ordering::Equal {
+            return c;
         }
     }
+    core::cmp::Ordering::Equal
+}
+
+/// One compound operator as the pin's merge (v0.16, its
+/// `multiSelectOrderBy`, which 3.5x uses for every UNION /
+/// INTERSECT / EXCEPT): both sides stably sorted by the merge
+/// key `key`, then merged — on equal keys UNION and EXCEPT
+/// advance the left side silently (so the RIGHT row survives a
+/// UNION: `SELECT 1 UNION SELECT 1.0` is 1.0), INTERSECT emits
+/// the left row, UNION ALL emits left before right. Every
+/// emitted row of a non-ALL operator is dropped when it equals
+/// the previous emitted row under `dup` (the operator's own
+/// column collations, which can differ from a key pushed down
+/// from an enclosing operator).
+#[cfg(feature = "v09")]
+fn merge_compound(
+    op: crate::sql::CompoundOp,
+    mut left: AVec<AVec<OwnedValue>>,
+    mut right: AVec<AVec<OwnedValue>>,
+    key: &[crate::record::Coll],
+    dup: &[crate::record::Coll],
+) -> AVec<AVec<OwnedValue>> {
+    use crate::sql::CompoundOp::{Except, Intersect, Union, UnionAll};
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    left.as_mut_slice()
+        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key));
+    right
+        .as_mut_slice()
+        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key));
+    let (l, r) = (left.as_slice(), right.as_slice());
+    let mut out: AVec<AVec<OwnedValue>> = AVec::new();
+    let emit = |out: &mut AVec<AVec<OwnedValue>>, row: &AVec<OwnedValue>| {
+        if op != UnionAll
+            && out
+                .as_slice()
+                .last()
+                .is_some_and(|p| compound_rows_equal(p.as_slice(), row.as_slice(), dup))
+        {
+            return;
+        }
+        out.push(row.clone());
+    };
+    let (mut i, mut j) = (0usize, 0usize);
+    loop {
+        match (l.get(i), r.get(j)) {
+            (Some(a), Some(b)) => match compound_key_cmp(a.as_slice(), b.as_slice(), key) {
+                Less => {
+                    if op != Intersect {
+                        emit(&mut out, a);
+                    }
+                    i += 1;
+                }
+                Equal => {
+                    if matches!(op, UnionAll | Intersect) {
+                        emit(&mut out, a);
+                    }
+                    i += 1;
+                }
+                Greater => {
+                    if matches!(op, Union | UnionAll) {
+                        emit(&mut out, b);
+                    }
+                    j += 1;
+                }
+            },
+            (Some(a), None) => {
+                if op == Intersect {
+                    break;
+                }
+                emit(&mut out, a);
+                i += 1;
+            }
+            (None, Some(b)) => {
+                if matches!(op, Intersect | Except) {
+                    break;
+                }
+                emit(&mut out, b);
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    out
+}
+
+/// Evaluate a compound SELECT over its cores' rows (v0.16; the
+/// pin's algorithm, which collations make observable). `cores`
+/// holds each core's per-column collations (head first, see
+/// `core_colls`); `order` is the compound ORDER BY with each
+/// term's collation resolved.
+///
+/// Operators up to the last non-ALL one — or every operator,
+/// when an ORDER BY whose collations agree with the columns'
+/// is merged straight in — run as `merge_compound` with one
+/// merge key: the column collations over the cores up to that
+/// point (the key the pin pushes down). Trailing UNION ALLs
+/// past it append in order. An ORDER BY naming a collation
+/// other than its column's makes the pin evaluate the compound
+/// without it and sort the result afterwards; the final stable
+/// sort by `order` below covers both shapes.
+#[cfg(feature = "v09")]
+fn run_compound(
+    head: AVec<AVec<OwnedValue>>,
+    tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
+    cores: &[AVec<Option<crate::record::Coll>>],
+    order: &[(usize, crate::sql::SortOrder)],
+) -> AVec<AVec<OwnedValue>> {
+    use crate::sql::CompoundOp::UnionAll;
+    let width = cores.first().map_or(0, |c| c.len());
+    let prefix = |k: usize| -> AVec<crate::record::Coll> {
+        let mut v = AVec::new();
+        for i in 0..width {
+            v.push(compound_col_coll(cores.iter().take(k + 1), i));
+        }
+        v
+    };
+    let full = prefix(tails.len());
+    let direct = !order.is_empty()
+        && order
+            .iter()
+            .all(|(i, o)| full.as_slice().get(*i).is_some_and(|c| *c == o.coll));
+    // The last operator that merges (index into `tails`).
+    let last = if direct {
+        tails.len().checked_sub(1)
+    } else {
+        tails.iter().rposition(|(op, _)| *op != UnionAll)
+    };
+    let key = last.map(|h| prefix(h + 1)).unwrap_or_default();
+    let mut rows = head;
+    for (k, (op, right)) in tails.iter().enumerate() {
+        if last.is_some_and(|h| k <= h) {
+            rows = merge_compound(
+                *op,
+                rows,
+                right.clone(),
+                key.as_slice(),
+                prefix(k + 1).as_slice(),
+            );
+        } else {
+            for r in right.iter() {
+                rows.push(r.clone());
+            }
+        }
+    }
+    rows.as_mut_slice()
+        .sort_by(|a, b| compound_order_cmp(a, b, order));
+    rows
 }
 
 /// A row window `(skip, take)` from `limit_window` over
@@ -7587,18 +7863,33 @@ fn compound_order_cmp(
     core::cmp::Ordering::Equal
 }
 
-/// DISTINCT over produced rows (v0.4): first occurrences
-/// kept, values compared NULL-safely.
+/// The direction each GROUP BY term's groups come out in
+/// (v0.16): when the ORDER BY has exactly as many terms as the
+/// GROUP BY, the pin's group sorter takes each ORDER BY term's
+/// ASC / DESC for the GROUP BY term in the same position
+/// (`sqlite3Select`'s orderByGrp set-up), whatever the terms
+/// are — so ties under the ORDER BY keep that group order
+/// (`GROUP BY a ORDER BY b DESC` lists equal-`b` groups by `a`
+/// descending). Otherwise every group term is ascending.
 #[cfg(feature = "v04")]
-fn dedup_produced(produced: AVec<Produced>) -> AVec<Produced> {
+fn group_desc(group_by: &[RExpr], order_by: &[(RExpr, crate::sql::SortOrder)]) -> AVec<bool> {
+    let mut out = AVec::new();
+    for i in 0..group_by.len() {
+        out.push(group_by.len() == order_by.len() && order_by.get(i).is_some_and(|(_, o)| o.desc));
+    }
+    out
+}
+
+/// DISTINCT over produced rows (v0.4): first occurrences
+/// kept, values compared NULL-safely under each result
+/// column's collation (v0.16).
+#[cfg(feature = "v04")]
+fn dedup_produced(produced: AVec<Produced>, colls: &[crate::record::Coll]) -> AVec<Produced> {
     let mut kept: AVec<Produced> = AVec::new();
     for p in produced.iter() {
         let dup = kept.iter().any(|k: &Produced| {
             k.out.len() == p.out.len()
-                && k.out
-                    .iter()
-                    .zip(p.out.iter())
-                    .all(|(a, b)| crate::query::values_equal_is(a, b))
+                && compound_rows_equal(k.out.as_slice(), p.out.as_slice(), colls)
         });
         if !dup {
             kept.push(p.clone());
@@ -7701,67 +7992,6 @@ fn query_plan_has_sub(qp: &QueryPlan) -> bool {
         || qp.group_by.iter().any(has_sub)
         || qp.having.as_ref().is_some_and(has_sub)
         || qp.order_by.iter().any(|(e, _)| has_sub(e))
-}
-
-/// The representative row of a subquery's group (v0.6): the
-/// `pick_rep` rule (first row, or the extremum row of a lone
-/// min/max aggregate) over combined rows. When the lone
-/// min/max argument contains a subquery (v0.11), the caller
-/// goes through `pick_rep_sub_async` instead — this
-/// synchronous form only evaluates subquery-free arguments.
-#[cfg(feature = "v06")]
-fn pick_rep_sub<E>(
-    plan: &crate::query::SubPlan,
-    grows: &[RowData],
-    empty_rep: &RowData,
-) -> Result<RowData, E> {
-    if grows.is_empty() {
-        return Ok(empty_rep.clone());
-    }
-    let mut aggs: AVec<&RExpr> = AVec::new();
-    for it in plan.items.iter() {
-        crate::query::collect_aggs(it, &mut aggs);
-    }
-    if let Some(h) = &plan.having {
-        crate::query::collect_aggs(h, &mut aggs);
-    }
-    if aggs.len() == 1
-        && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
-        && matches!(
-            kind,
-            crate::query::AggKind::Min | crate::query::AggKind::Max
-        )
-        && !args.is_empty()
-    {
-        let arg = &args.as_slice()[0];
-        let mut best: Option<&RowData> = None;
-        let mut bestv: Option<OwnedValue> = None;
-        for r in grows {
-            let v = crate::query::eval::<E>(arg, &Ctx::Row(r))?;
-            if matches!(v, OwnedValue::Null) {
-                continue;
-            }
-            let take = match &bestv {
-                None => true,
-                Some(b) => {
-                    let o = crate::record::compare_values(&v.as_value(), &b.as_value());
-                    if *kind == crate::query::AggKind::Min {
-                        o == core::cmp::Ordering::Less
-                    } else {
-                        o == core::cmp::Ordering::Greater
-                    }
-                }
-            };
-            if take {
-                best = Some(r);
-                bestv = Some(v);
-            }
-        }
-        if let Some(b) = best {
-            return Ok(b.clone());
-        }
-    }
-    Ok(grows[0].clone())
 }
 
 /// One produced result row of a v0.4 query (output values, sort
@@ -7920,6 +8150,9 @@ fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E
         }
         groups.push((AVec::new(), all));
     } else {
+        // v0.16: groups form and sort under each term's collation.
+        let gcolls = crate::query::exprs_colls(qp.group_by.as_slice());
+        let gdesc = group_desc(qp.group_by.as_slice(), qp.order_by.as_slice());
         for r in rows {
             let ctx = Ctx::Row(r);
             let mut key = AVec::new();
@@ -7931,7 +8164,8 @@ fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E
                 if k.len() == key.len()
                     && k.iter()
                         .zip(key.iter())
-                        .all(|(a, b)| crate::query::values_equal_is(a, b))
+                        .zip(gcolls.iter())
+                        .all(|((a, b), c)| crate::query::values_equal_coll(a, b, *c))
                 {
                     found = Some(gi);
                     break;
@@ -7948,8 +8182,14 @@ fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E
         }
         // SQLite's GROUP BY emits groups in key order (its sorter).
         groups.as_mut_slice().sort_by(|a, b| {
-            for (av, bv) in a.0.iter().zip(b.0.iter()) {
-                let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
+            for (((av, bv), c), d) in
+                a.0.iter()
+                    .zip(b.0.iter())
+                    .zip(gcolls.iter())
+                    .zip(gdesc.iter())
+            {
+                let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                let o = if *d { o.reverse() } else { o };
                 if o != core::cmp::Ordering::Equal {
                     return o;
                 }
@@ -7985,56 +8225,126 @@ fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E
     Ok(out)
 }
 
-/// The representative row of a group (SQLite's bare-column rule):
-/// the first row, except that a lone min/max aggregate makes the
-/// extremum-achieving row the representative.
+/// The min/max aggregate whose extremum row supplies a group's
+/// bare columns (v0.16 rule, pin-probed): the LAST min() / max()
+/// aggregate among the result items, ORDER BY terms and HAVING
+/// (the pin's aggregate order — each one's `OP_CollSeq` resets
+/// the shared "hit" flag, so only the last decides), whatever
+/// other aggregates the query has. None: bare columns read the
+/// group's first row. (v0.4 – v0.15 honoured only a lone
+/// min/max aggregate.)
+#[cfg(feature = "v04")]
+fn rep_minmax<'x>(
+    items: &'x [RExpr],
+    having: Option<&'x RExpr>,
+    order_by: &'x [(RExpr, crate::sql::SortOrder)],
+) -> Option<(crate::query::AggKind, &'x RExpr)> {
+    use crate::query::{AggKind, collect_aggs};
+    let mut aggs: AVec<&RExpr> = AVec::new();
+    for it in items.iter() {
+        collect_aggs(it, &mut aggs);
+    }
+    for (e, _) in order_by.iter() {
+        collect_aggs(e, &mut aggs);
+    }
+    if let Some(h) = having {
+        collect_aggs(h, &mut aggs);
+    }
+    aggs.iter().rev().find_map(|a| match a {
+        RExpr::Agg {
+            kind: k @ (AggKind::Min | AggKind::Max),
+            args,
+            ..
+        } => args.as_slice().first().map(|x| (*k, x)),
+        _ => None,
+    })
+}
+
+/// One row of the pin's min/max bare-column rule (v0.16):
+/// whether the row's argument value `v` loads the bare columns.
+/// A NULL loads them only while no value has been seen (so a
+/// group of NULLs reads its LAST row); a value loads them when
+/// it is the first or strictly beyond the best so far under the
+/// argument's collation (ties keep the earlier row).
+#[cfg(feature = "v04")]
+fn extremum_step(
+    kind: crate::query::AggKind,
+    coll: crate::record::Coll,
+    best: &mut Option<OwnedValue>,
+    v: OwnedValue,
+) -> bool {
+    if matches!(v, OwnedValue::Null) {
+        return best.is_none();
+    }
+    let take = match best {
+        None => true,
+        Some(b) => {
+            let o = crate::record::compare_coll(&v.as_value(), &b.as_value(), coll);
+            if kind == crate::query::AggKind::Min {
+                o == core::cmp::Ordering::Less
+            } else {
+                o == core::cmp::Ordering::Greater
+            }
+        }
+    };
+    if take {
+        *best = Some(v);
+    }
+    take
+}
+
+/// The representative row of a group (SQLite's bare-column
+/// rule): the first row, or the extremum row of the min/max
+/// aggregate `rep_minmax` picks (see `extremum_step`).
+#[cfg(feature = "v04")]
+fn pick_rep_from<E>(
+    items: &[RExpr],
+    having: Option<&RExpr>,
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    grows: &[RowData],
+    empty_rep: &RowData,
+) -> Result<RowData, E> {
+    let Some(first) = grows.first() else {
+        return Ok(empty_rep.clone());
+    };
+    let Some((kind, arg)) = rep_minmax(items, having, order_by) else {
+        return Ok(first.clone());
+    };
+    let coll = crate::query::expr_coll(arg).unwrap_or_default();
+    let mut best: Option<OwnedValue> = None;
+    let mut rep = first;
+    for r in grows {
+        let v = crate::query::eval::<E>(arg, &Ctx::Row(r))?;
+        if extremum_step(kind, coll, &mut best, v) {
+            rep = r;
+        }
+    }
+    Ok(rep.clone())
+}
+
 #[cfg(feature = "v04")]
 fn pick_rep<E>(qp: &QueryPlan, grows: &[RowData], empty_rep: &RowData) -> Result<RowData, E> {
-    if grows.is_empty() {
-        return Ok(empty_rep.clone());
-    }
-    let mut aggs: AVec<&RExpr> = AVec::new();
-    for it in qp.items.iter() {
-        crate::query::collect_aggs(it, &mut aggs);
-    }
-    if let Some(h) = &qp.having {
-        crate::query::collect_aggs(h, &mut aggs);
-    }
-    if aggs.len() == 1
-        && let RExpr::Agg { kind, args, .. } = aggs.as_slice()[0]
-        && matches!(
-            kind,
-            crate::query::AggKind::Min | crate::query::AggKind::Max
-        )
-        && !args.is_empty()
-    {
-        let arg = &args.as_slice()[0];
-        let mut best: Option<&RowData> = None;
-        let mut bestv: Option<OwnedValue> = None;
-        for r in grows {
-            let v = crate::query::eval::<E>(arg, &Ctx::Row(r))?;
-            if matches!(v, OwnedValue::Null) {
-                continue;
-            }
-            let take = match &bestv {
-                None => true,
-                Some(b) => {
-                    let o = crate::record::compare_values(&v.as_value(), &b.as_value());
-                    if *kind == crate::query::AggKind::Min {
-                        o == core::cmp::Ordering::Less
-                    } else {
-                        o == core::cmp::Ordering::Greater
-                    }
-                }
-            };
-            if take {
-                best = Some(r);
-                bestv = Some(v);
-            }
-        }
-        if let Some(b) = best {
-            return Ok(b.clone());
-        }
-    }
-    Ok(grows[0].clone())
+    pick_rep_from::<E>(
+        qp.items.as_slice(),
+        qp.having.as_ref(),
+        qp.order_by.as_slice(),
+        grows,
+        empty_rep,
+    )
+}
+
+/// The `pick_rep` rule for a subquery's group.
+#[cfg(feature = "v06")]
+fn pick_rep_sub<E>(
+    plan: &crate::query::SubPlan,
+    grows: &[RowData],
+    empty_rep: &RowData,
+) -> Result<RowData, E> {
+    pick_rep_from::<E>(
+        plan.items.as_slice(),
+        plan.having.as_ref(),
+        plan.order_by.as_slice(),
+        grows,
+        empty_rep,
+    )
 }

@@ -75,6 +75,11 @@ v10 = ["v09"]
 # / GROUP BY / HAVING / ORDER BY expressions, and `x IN table`.
 # (The RIGHT / FULL / NATURAL / USING joins and NULLS FIRST /
 # LAST fixes are *not* gated: they correct claimed v0.4 paths.)
+# The collations unit adds the `expr COLLATE name` operator,
+# GLOB / NOT GLOB, LIKE ... ESCAPE and the like() / glob()
+# functions (column COLLATE clauses, collated indexes and the
+# collation rules themselves are *not* gated: they correct
+# claimed v0.4 / index paths).
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.

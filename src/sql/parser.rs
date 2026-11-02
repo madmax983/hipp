@@ -10,6 +10,8 @@
 
 use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
+#[cfg(any(feature = "v04", feature = "indexes"))]
+use crate::record::Coll;
 
 #[cfg(feature = "v09")]
 use super::ast::CompoundOp;
@@ -161,6 +163,29 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             Err(perr(self.cur().offset, ParseKind::UnexpectedToken))
+        }
+    }
+
+    /// The collating sequence named by token `i` (v0.16): an
+    /// identifier or string (`COLLATE nocase`, `COLLATE
+    /// "NoCase"`, `COLLATE 'rtrim'`), matched case-insensitively.
+    /// An unknown name is the pin's "no such collation
+    /// sequence". Not built for the tiny profile, which has no
+    /// comparisons a collation could change (it skips the
+    /// clause, as before v0.16).
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    fn coll_at<E>(&self, i: usize) -> Result<Coll, E> {
+        let t = self
+            .toks
+            .as_slice()
+            .get(i.min(self.limit - 1))
+            .map(|t| t.tok);
+        match t {
+            Some(Tok::Ident(h, _)) | Some(Tok::Text(h)) => Coll::named(handle_bytes(self.arena, h))
+                .ok_or(Error::Schema {
+                    kind: crate::error::SchemaKind::UnknownCollation,
+                }),
+            _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         }
     }
 
@@ -397,12 +422,12 @@ impl<'a> Parser<'a> {
             if matches!(self.cur().tok, Tok::LParen) {
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
+            // v0.16: an explicit key collation (BINARY, NOCASE
+            // or RTRIM — the index orders and finds keys by it).
+            let mut coll = None;
             if self.eat_kw(b"COLLATE") {
-                let coll = self.name::<E>()?;
-                if !eq_ci(handle_bytes(self.arena, coll), b"BINARY") {
-                    // Only the BINARY collation exists in hipp.
-                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
-                }
+                coll = Some(self.coll_at::<E>(self.pos)?);
+                self.pos += 1;
             }
             let desc = if self.eat_kw(b"DESC") {
                 true
@@ -410,7 +435,11 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_kw(b"ASC");
                 false
             };
-            columns.push(IndexColumnDef { name: col, desc });
+            columns.push(IndexColumnDef {
+                name: col,
+                desc,
+                coll,
+            });
             if self.eat(Tok::Comma) {
                 continue;
             }
@@ -771,7 +800,7 @@ impl<'a> Parser<'a> {
     /// Parse a `(col [ASC|DESC], ...)` list starting at token
     /// `from` (the '(' is consumed by the scan); returns the column
     /// defs. Used by table-level PRIMARY KEY / UNIQUE items.
-    fn constraint_columns(&self, mut i: usize, to: usize) -> AVec<IndexColumnDef> {
+    fn constraint_columns<E>(&self, mut i: usize, to: usize) -> Result<AVec<IndexColumnDef>, E> {
         let mut out = AVec::new();
         if i < to && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
             i += 1;
@@ -781,6 +810,19 @@ impl<'a> Parser<'a> {
                 break;
             };
             i += 1;
+            // `col [COLLATE name] [ASC | DESC]` — the pin's
+            // order (v0.16: the collation is the autoindex key's;
+            // it used to be skipped, and only after ASC / DESC,
+            // so `(a COLLATE x DESC, b)` lost `b`).
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            let mut coll = None;
+            if self.is_kw(i, b"COLLATE") {
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                {
+                    coll = Some(self.coll_at::<E>(i + 1)?);
+                }
+                i += 2;
+            }
             let mut desc = false;
             if self.is_kw(i, b"DESC") {
                 desc = true;
@@ -788,18 +830,19 @@ impl<'a> Parser<'a> {
             } else if self.is_kw(i, b"ASC") {
                 i += 1;
             }
-            // A COLLATE clause may intervene; ignore its name.
-            if self.is_kw(i, b"COLLATE") {
-                i += 2;
-            }
-            out.push(IndexColumnDef { name: h, desc });
+            out.push(IndexColumnDef {
+                name: h,
+                desc,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll,
+            });
             if i < to && matches!(self.toks.as_slice()[i].tok, Tok::Comma) {
                 i += 1;
                 continue;
             }
             break;
         }
-        out
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -826,7 +869,7 @@ impl<'a> Parser<'a> {
             if self.is_kw(i, b"KEY") {
                 i += 1;
             }
-            let cols = self.constraint_columns(i, to);
+            let cols = self.constraint_columns::<E>(i, to)?;
             for c in cols.iter() {
                 pk_names.push(c.name);
                 if c.desc {
@@ -845,7 +888,7 @@ impl<'a> Parser<'a> {
         {
             // Table-level UNIQUE (col, …) (v0.3: enforced via an
             // implicit index, like SQLite).
-            let cols = self.constraint_columns(from + 1, to);
+            let cols = self.constraint_columns::<E>(from + 1, to)?;
             sets.push(ConstraintSet {
                 primary_key: false,
                 columns: cols,
@@ -888,6 +931,8 @@ impl<'a> Parser<'a> {
         let mut unique = false;
         let mut default: Option<Literal> = None;
         let mut not_null = false;
+        #[cfg(any(feature = "v04", feature = "indexes"))]
+        let mut coll = None;
         // Without the evaluator (tiny) neither can become true:
         // the clauses that set them are refused.
         #[cfg(feature = "v04")]
@@ -952,6 +997,13 @@ impl<'a> Parser<'a> {
                 }
                 if self.is_kw(i, b"NOT") && self.is_kw(i + 1, b"NULL") {
                     not_null = true;
+                }
+                // v0.16: the column's collating sequence (it used
+                // to be parsed and ignored — comparisons and
+                // ORDER BY ran BINARY).
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                if self.is_kw(i, b"COLLATE") {
+                    coll = Some(self.coll_at::<E>(i + 1)?);
                 }
                 if self.is_kw(i, b"CHECK") {
                     // Column-level CHECK (v0.16): a table check
@@ -1038,6 +1090,8 @@ impl<'a> Parser<'a> {
             gen_expr,
             #[cfg(feature = "v04")]
             stored,
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            coll,
         });
         // Constraint sets in statement order (v0.3): an inline
         // PRIMARY KEY / UNIQUE is a one-column set at this item's
@@ -1051,6 +1105,8 @@ impl<'a> Parser<'a> {
             cols.push(IndexColumnDef {
                 name: col_name,
                 desc: pk_desc,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll: None,
             });
             sets.push(ConstraintSet {
                 primary_key: true,
@@ -1062,6 +1118,8 @@ impl<'a> Parser<'a> {
             cols.push(IndexColumnDef {
                 name: col_name,
                 desc: false,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll: None,
             });
             sets.push(ConstraintSet {
                 primary_key: false,
@@ -1295,14 +1353,19 @@ impl<'a> Parser<'a> {
     fn upsert_clause<E>(&mut self) -> Result<Upsert, E> {
         self.expect_kw::<E>(b"CONFLICT")?;
         let mut target = AVec::new();
+        let mut target_colls = AVec::new();
         if self.eat(Tok::LParen) {
             loop {
                 target.push(self.name::<E>()?);
                 // Indexed-column decorations SQLite permits in a
-                // conflict target: COLLATE <name>, ASC / DESC.
+                // conflict target: COLLATE <name>, ASC / DESC
+                // (v0.16: the collation must match the index's).
+                let mut coll = None;
                 if self.eat_kw(b"COLLATE") {
-                    let _ = self.name::<E>()?;
+                    coll = Some(self.coll_at::<E>(self.pos)?);
+                    self.pos += 1;
                 }
+                target_colls.push(coll);
                 let _ = self.eat_kw(b"ASC") || self.eat_kw(b"DESC");
                 if self.eat(Tok::Comma) {
                     continue;
@@ -1345,6 +1408,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Upsert {
             target,
+            target_colls,
             target_filter,
             action,
         })
@@ -1640,6 +1704,7 @@ impl<'a> Parser<'a> {
             let neg = if self.cur_is_kw(b"NOT")
                 && (self.is_kw(self.pos + 1, b"IN")
                     || self.is_kw(self.pos + 1, b"LIKE")
+                    || (cfg!(feature = "v16") && self.is_kw(self.pos + 1, b"GLOB"))
                     || self.is_kw(self.pos + 1, b"BETWEEN"))
             {
                 self.pos += 1;
@@ -1710,7 +1775,23 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw(b"LIKE") {
                 let r = self.expr_add::<E>()?;
+                // `x LIKE p ESCAPE e` (v0.16, `v16`) is the pin's
+                // `like(p, x, e)` call, negated for NOT LIKE.
+                #[cfg(feature = "v16")]
+                if self.eat_kw(b"ESCAPE") {
+                    let esc = self.expr_add::<E>()?;
+                    l = self.pattern_call::<E>(b"like", r, l, Some(esc), neg)?;
+                    continue;
+                }
                 l = Expr::Like(Box::new(l), Box::new(r), neg);
+                continue;
+            }
+            // `x [NOT] GLOB p` (v0.16, `v16`): the pin's
+            // `glob(p, x)` call (no ESCAPE form).
+            #[cfg(feature = "v16")]
+            if self.eat_kw(b"GLOB") {
+                let r = self.expr_add::<E>()?;
+                l = self.pattern_call::<E>(b"glob", r, l, None, neg)?;
                 continue;
             }
             if self.eat_kw(b"BETWEEN") {
@@ -1777,12 +1858,58 @@ impl<'a> Parser<'a> {
     }
 
     fn expr_concat<E>(&mut self) -> Result<Expr, E> {
-        let mut l = self.expr_unary::<E>()?;
+        let mut l = self.expr_collate::<E>()?;
         while self.eat(Tok::Concat) {
-            let r = self.expr_unary::<E>()?;
+            let r = self.expr_collate::<E>()?;
             l = Expr::Binary(BinOp::Concat, Box::new(l), Box::new(r));
         }
         Ok(l)
+    }
+
+    /// `expr COLLATE name` (v0.16, `v16`): binds tighter than
+    /// `||` and looser than the unary operators (the pin's
+    /// precedence: `-a COLLATE x` is `(-a) COLLATE x`).
+    #[cfg(feature = "v16")]
+    fn expr_collate<E>(&mut self) -> Result<Expr, E> {
+        let mut l = self.expr_unary::<E>()?;
+        while self.eat_kw(b"COLLATE") {
+            let c = self.coll_at::<E>(self.pos)?;
+            self.pos += 1;
+            l = Expr::Collate(Box::new(l), c);
+        }
+        Ok(l)
+    }
+
+    #[cfg(not(feature = "v16"))]
+    fn expr_collate<E>(&mut self) -> Result<Expr, E> {
+        self.expr_unary::<E>()
+    }
+
+    /// A LIKE ... ESCAPE / GLOB operator as the pin's function
+    /// call (v0.16, `v16`): `name(pattern, subject[, escape])`,
+    /// wrapped in NOT for the negated form.
+    #[cfg(feature = "v16")]
+    fn pattern_call<E>(
+        &mut self,
+        name: &[u8],
+        pattern: Expr,
+        subject: Expr,
+        escape: Option<Expr>,
+        neg: bool,
+    ) -> Result<Expr, E> {
+        let mut args = AVec::new();
+        args.push(pattern);
+        args.push(subject);
+        if let Some(e) = escape {
+            args.push(e);
+        }
+        let call = Expr::Func {
+            name: self.arena.alloc_copy_handle(name)?,
+            distinct: false,
+            star: false,
+            args,
+        };
+        Ok(if neg { Expr::Not(Box::new(call)) } else { call })
     }
 
     fn expr_unary<E>(&mut self) -> Result<Expr, E> {
@@ -2166,7 +2293,14 @@ impl<'a> Parser<'a> {
                 } else {
                     !desc
                 };
-                order_by.push((e, SortOrder { desc, nulls_first }));
+                order_by.push((
+                    e,
+                    SortOrder {
+                        desc,
+                        nulls_first,
+                        coll: Coll::Binary,
+                    },
+                ));
                 if self.eat(Tok::Comma) {
                     continue;
                 }
@@ -2759,5 +2893,74 @@ mod tests {
         ] {
             assert!(kind(sql).is_some(), "{sql}");
         }
+    }
+
+    /// v0.16: collation clauses — the column's, a table UNIQUE's
+    /// (before ASC / DESC; the clause used to be skipped only
+    /// after them, so `(a COLLATE x DESC, b)` dropped `b`), a
+    /// CREATE INDEX key's — and unknown names refused.
+    #[cfg(feature = "indexes")]
+    #[test]
+    fn collation_clauses_parse_and_unknown_names_are_refused() {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        let sql = "CREATE TABLE t(a TEXT COLLATE NOCASE, b COLLATE 'rtrim', \
+                   UNIQUE (a COLLATE BINARY DESC, b))";
+        let Ok(Ast::CreateTable {
+            columns,
+            constraint_sets,
+            ..
+        }) = parse::<()>(sql.as_bytes(), &arena)
+        else {
+            panic!("parses");
+        };
+        assert_eq!(columns.as_slice()[0].coll, Some(Coll::NoCase));
+        assert_eq!(columns.as_slice()[1].coll, Some(Coll::Rtrim));
+        let set = &constraint_sets.as_slice()[0];
+        assert_eq!(set.columns.len(), 2);
+        assert_eq!(set.columns.as_slice()[0].coll, Some(Coll::Binary));
+        assert!(set.columns.as_slice()[0].desc);
+        let Ok(Ast::CreateIndex { columns, .. }) =
+            parse::<()>(b"CREATE INDEX i ON t(a COLLATE \"NoCase\" DESC)", &arena)
+        else {
+            panic!("parses");
+        };
+        assert_eq!(columns.as_slice()[0].coll, Some(Coll::NoCase));
+        for sql in [
+            "CREATE TABLE t(a COLLATE foo)",
+            "CREATE TABLE t(a, UNIQUE (a COLLATE foo))",
+            "CREATE INDEX i ON t(a COLLATE foo)",
+        ] {
+            assert!(
+                matches!(
+                    parse::<()>(sql.as_bytes(), &arena),
+                    Err(Error::Schema {
+                        kind: crate::error::SchemaKind::UnknownCollation
+                    })
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    /// v0.16 (`v16`): the COLLATE operator binds tighter than
+    /// `||` and looser than unary minus; GLOB and LIKE ... ESCAPE
+    /// are the pin's `glob()` / `like()` calls.
+    #[cfg(feature = "v16")]
+    #[test]
+    fn collate_operator_and_pattern_calls() {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        let e = parse_expr_text::<()>(b"'a' || -b COLLATE nocase", &arena).expect("parses");
+        let Expr::Binary(BinOp::Concat, _, r) = e else {
+            panic!("concat on top");
+        };
+        assert!(matches!(*r, Expr::Collate(ref x, Coll::NoCase) if matches!(**x, Expr::Neg(_))));
+        let e = parse_expr_text::<()>(b"x NOT GLOB 'a*'", &arena).expect("parses");
+        let Expr::Not(call) = e else {
+            panic!("NOT GLOB negates the call");
+        };
+        assert!(matches!(*call, Expr::Func { ref args, .. } if args.len() == 2));
+        let e = parse_expr_text::<()>(b"x LIKE 'a%' ESCAPE '\\'", &arena).expect("parses");
+        assert!(matches!(e, Expr::Func { ref args, .. } if args.len() == 3));
+        assert!(parse_expr_text::<()>(b"x GLOB 'a' ESCAPE 'b'", &arena).is_err());
     }
 }

@@ -123,6 +123,20 @@ pub enum SchemaKind {
     /// FROM clause"). Give the FROM clause's copy its own
     /// alias: `FROM t AS t2`.
     UpdateTargetInFrom,
+    /// A `COLLATE` clause or operator names a collating
+    /// sequence other than BINARY, NOCASE or RTRIM (v0.16; the
+    /// pin's "no such collation sequence"). Use one of the
+    /// three built-ins.
+    UnknownCollation,
+    /// A LIKE `ESCAPE` operand (or `like()`'s third argument)
+    /// that is not exactly one character (v0.16; the pin's
+    /// "ESCAPE expression must be a single character"). Pass a
+    /// one-character escape.
+    EscapeNotSingleChar,
+    /// A LIKE / GLOB pattern longer than 50,000 bytes (v0.16;
+    /// the pin's default `SQLITE_LIMIT_LIKE_PATTERN_LENGTH`,
+    /// "LIKE or GLOB pattern too complex"). Shorten the pattern.
+    PatternTooComplex,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

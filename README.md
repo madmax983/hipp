@@ -63,6 +63,26 @@ aspirations.
   DEFAULT VALUES, CREATE TABLE ... AS SELECT (the pin's column
   names, declared types and schema text, byte for byte) and
   STRICT tables. WITHOUT ROWID stays refused.
+- **Collations and pattern matching.** Ungated (column
+  `COLLATE` was parsed and ignored): BINARY / NOCASE / RTRIM
+  column collations with the pin's selection rule in every
+  comparison (`=`, `<`, IS, IN, BETWEEN, CASE, joins,
+  subqueries), in ORDER BY, GROUP BY, DISTINCT, min / max /
+  nullif and DISTINCT aggregates, derived-table columns, and
+  compounds — now evaluated with the pin's merge algorithm, so
+  which of two NOCASE-equal rows survives a UNION matches too;
+  collated indexes (`CREATE INDEX ... (c COLLATE NOCASE)`,
+  UNIQUE NOCASE / RTRIM constraints and their autoindexes,
+  upsert targets) order, find and enforce keys by their
+  collation, interoperate with the pin's files both ways, and
+  their tables are writable (they used to be refused as foreign);
+  unknown collation names are refused. Also fixed on the way:
+  GROUP BY takes the ORDER BY's directions for its group order,
+  bare columns follow the last min / max aggregate (an all-NULL
+  group reads its last row), scalar `min(1, 1.0)` is 1.0, LIKE
+  reads operands up to a NUL and matches iteratively. Behind
+  `v16`: the `expr COLLATE name` operator, GLOB / NOT GLOB,
+  `LIKE ... ESCAPE`, and `like()` / `glob()`.
 
 ## What v0.13 does
 
@@ -328,9 +348,10 @@ aspirations.
   explicit indexes and for column/table constraints via implicit
   `sqlite_autoindex_*` indexes, and `WHERE <first indexed
   column> = <literal>` lookups through the planner's access
-  seam. Expression, partial and non-BINARY-collated foreign
-  indexes are read as opaque metadata; writes to their tables
-  are refused rather than allowed to desynchronise them.
+  seam. Expression and partial foreign indexes are read as
+  opaque metadata; writes to their tables are refused rather
+  than allowed to desynchronise them. (Since v0.16, NOCASE /
+  RTRIM-collated indexes are maintained, not opaque.)
 - Explicit transactions: `BEGIN` / `COMMIT` / `ROLLBACK` over the
   resumable commit machine.
 - Table B-trees with leaf/interior/root splits, overflow chains

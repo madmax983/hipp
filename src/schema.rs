@@ -13,8 +13,9 @@
 //! derived from the owning table's UNIQUE / PRIMARY KEY constraint
 //! sets in statement order — the same order SQLite creates them
 //! (oracle-verified). An index whose SQL uses a feature outside
-//! the v0.3 grammar (expressions, partial indexes, non-BINARY
-//! collations) is recorded as *opaque*: reads of its table work,
+//! the v0.3 grammar (expressions, partial indexes) is recorded
+//! as *opaque* (v0.16: NOCASE / RTRIM key collations are
+//! maintained, no longer opaque): reads of its table work,
 //! writes refuse with `Error::Unsupported` rather than silently
 //! desynchronising an index hipp cannot maintain.
 
@@ -22,7 +23,7 @@ use crate::arena::{ABytes, AVec, Arena};
 use crate::btree::ScanCursor;
 use crate::error::{Error, Result};
 use crate::pager::Pager;
-use crate::record::{Affinity, Value, affinity_of, decode_record};
+use crate::record::{Affinity, Coll, Value, affinity_of, decode_record};
 #[cfg(feature = "indexes")]
 use crate::sql::ConstraintSet;
 use crate::sql::{Ast, Literal, eq_ci, handle_bytes, parse};
@@ -53,6 +54,10 @@ pub struct Column {
     /// A STORED generated column (v0.16); VIRTUAL otherwise.
     #[cfg(feature = "v04")]
     pub stored: bool,
+    /// The column's collating sequence (v0.16; BINARY when no
+    /// `COLLATE` clause was written).
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub coll: Coll,
 }
 
 /// One column of an index key (v0.3). `col == None` is the rowid
@@ -61,6 +66,10 @@ pub struct Column {
 pub struct IndexColumn {
     pub col: Option<usize>,
     pub desc: bool,
+    /// The key column's collating sequence (v0.16): the index's
+    /// explicit `COLLATE`, else the table column's (BINARY for
+    /// the rowid).
+    pub coll: Coll,
 }
 
 /// One UNIQUE / PRIMARY KEY constraint set of a table, resolved
@@ -269,6 +278,15 @@ fn resolve_index_column(
     Err(())
 }
 
+/// The collating sequence of index key column `col` (v0.16):
+/// the table column's, BINARY for the rowid.
+#[cfg(feature = "indexes")]
+fn col_coll(t: &TableDef, col: Option<usize>) -> Coll {
+    col.and_then(|i| t.columns.as_slice().get(i))
+        .map(|c| c.coll)
+        .unwrap_or_default()
+}
+
 /// Build the catalog by scanning `sqlite_schema` (root page 1).
 pub async fn build_catalog<S: Storage>(
     pager: &mut Pager<S>,
@@ -391,6 +409,8 @@ pub async fn build_catalog<S: Storage>(
                 },
                 #[cfg(feature = "v04")]
                 stored: c.stored,
+                #[cfg(any(feature = "v04", feature = "indexes"))]
+                coll: c.coll.unwrap_or_default(),
             });
         }
         let rowid_alias = alias;
@@ -490,7 +510,11 @@ pub async fn build_catalog<S: Storage>(
                         for cd in columns.iter() {
                             let nb = handle_bytes(&scratch, cd.name);
                             match resolve_index_column(catalog_arena, &t, nb) {
-                                Ok(col) => idx.columns.push(IndexColumn { col, desc: cd.desc }),
+                                Ok(col) => idx.columns.push(IndexColumn {
+                                    col,
+                                    desc: cd.desc,
+                                    coll: cd.coll.unwrap_or_else(|| col_coll(&t, col)),
+                                }),
                                 Err(()) => {
                                     ok = false;
                                     break;
@@ -746,6 +770,12 @@ fn resolve_auto_sets(
                         Some(i)
                     },
                     desc: cd.desc,
+                    // v0.16: an autoindex keys by the constraint's
+                    // explicit COLLATE, else the column's.
+                    coll: cd
+                        .coll
+                        .or_else(|| cols.get(i).map(|c| c.coll))
+                        .unwrap_or_default(),
                 }),
                 None => {
                     ok = false;

@@ -367,6 +367,87 @@ pub fn compare_values(a: &Value<'_>, b: &Value<'_>) -> core::cmp::Ordering {
     }
 }
 
+// ---------- collating sequences (v0.16) ----------
+
+/// A collating sequence: how two TEXT values compare (v0.16).
+/// SQLite's three built-ins — `BINARY` (memcmp, then length),
+/// `NOCASE` (ASCII `A`-`Z` folded to lower case, then memcmp and
+/// length; other bytes, UTF-8 included, compare as-is) and
+/// `RTRIM` (trailing U+0020 spaces ignored, then BINARY). A
+/// collation only affects TEXT-vs-TEXT comparisons; every other
+/// pairing is `compare_values`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Coll {
+    #[default]
+    Binary,
+    NoCase,
+    Rtrim,
+}
+
+impl Coll {
+    /// The built-in collation named `name` (case-insensitive, as
+    /// the pin matches collation names), or None for an unknown
+    /// name ("no such collation sequence" on the pin).
+    pub fn named(name: &[u8]) -> Option<Coll> {
+        let is = |w: &[u8]| name.eq_ignore_ascii_case(w);
+        if is(b"BINARY") {
+            Some(Coll::Binary)
+        } else if is(b"NOCASE") {
+            Some(Coll::NoCase)
+        } else if is(b"RTRIM") {
+            Some(Coll::Rtrim)
+        } else {
+            None
+        }
+    }
+}
+
+/// Compare two TEXT byte strings under a collation (v0.16).
+pub fn compare_text(a: &[u8], b: &[u8], coll: Coll) -> core::cmp::Ordering {
+    match coll {
+        Coll::Binary => a.cmp(b),
+        Coll::NoCase => {
+            let n = a.len().min(b.len());
+            for (x, y) in a[..n].iter().zip(b[..n].iter()) {
+                let c = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+                if c != core::cmp::Ordering::Equal {
+                    return c;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+        Coll::Rtrim => {
+            let trim = |s: &[u8]| -> usize {
+                let mut e = s.len();
+                while e > 0 && s[e - 1] == b' ' {
+                    e -= 1;
+                }
+                e
+            };
+            a[..trim(a)].cmp(&b[..trim(b)])
+        }
+    }
+}
+
+/// `compare_values` under a collation (v0.16): TEXT against
+/// TEXT compares by `coll`, everything else as before.
+pub fn compare_coll(a: &Value<'_>, b: &Value<'_>, coll: Coll) -> core::cmp::Ordering {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => compare_text(x, y, coll),
+        _ => compare_values(a, b),
+    }
+}
+
+/// One index key column's ordering (v0.16): its direction and
+/// its collating sequence (an index on a NOCASE column, or
+/// `CREATE INDEX ... (c COLLATE NOCASE)`, orders and finds its
+/// keys by NOCASE — exactly the pin's file layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyOrder {
+    pub desc: bool,
+    pub coll: Coll,
+}
+
 // ---------- affinity (SPEC §5.5, SQFMT §2.3) ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

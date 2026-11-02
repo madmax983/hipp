@@ -441,6 +441,195 @@ the planner and the async step state machines (~8 KB)).
   generated columns (3.31) are long-stable, and nothing relied
   on is known to differ in 3.54.1. CI runs the real pin.
 
+### Collations and pattern matching (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated (below). Census (158 probes): MATCH 66 → 72,
+silent-wrong DIFF 1 → 0 (column COLLATE was the last).
+
+**Shipped — ungated (fixes on claimed v0.4 / index paths):**
+
+- **Column `COLLATE BINARY | NOCASE | RTRIM`** — parsed and
+  ignored before (comparisons and ORDER BY ran BINARY):
+  `record::Coll` (NOCASE folds ASCII `A`-`Z` only, RTRIM drops
+  trailing U+0020), carried on catalog columns, resolved
+  column references (`RExpr::Column(slot, aff, coll)`) and
+  derived-table columns (their leftmost core's item collation,
+  BINARY when none — still a column's). The pin's
+  `sqlite3ExprCollSeq` / `sqlite3BinaryCompareCollSeq`
+  (`query::expr_coll`, `binary_coll`): an explicit COLLATE on
+  the left operand, else on the right (it propagates up through
+  operators and function arguments, the pin's `EP_Collate`),
+  else the left column's, else the right's, else BINARY; CAST
+  and unary `+` pass a column's through, functions and scalar
+  subqueries carry none, the rowid / IPK none. Applied to `=`
+  `<` IS BETWEEN, CASE, joins' ON / USING / NATURAL, CHECK and
+  generated-column expressions; an IN list compares by its left
+  operand only (a single constant item follows the binary rule:
+  the pin rewrites `x IN (c)` to `x = +c`); `x IN (SELECT ...)`
+  by the binary rule against the subquery's item — its
+  *rightmost* core's for a compound (carried through
+  substitution as an explicit `Collate`); min / max / nullif and
+  min / max aggregates use the first argument with a collation;
+  ORDER BY terms, GROUP BY (grouping and group order), DISTINCT,
+  count / sum / group_concat(DISTINCT) use each term's.
+- **Compounds run the pin's merge** (3.5x uses
+  `multiSelectOrderBy` for every UNION / INTERSECT / EXCEPT):
+  both sides stably sorted by one merge key (the column
+  collations, leftmost core with one per column — pushed down to
+  every inner operator up to the last non-ALL one, or to all
+  of them when an ORDER BY is merged in), equal keys advance the
+  left side (a UNION keeps the *right* row of an NOCASE-equal
+  pair; INTERSECT the left), each emitted row of a non-ALL
+  operator dropped when equal to the previous one under that
+  operator's own collations; trailing UNION ALLs append; an
+  ORDER BY naming another collation sorts the finished compound
+  (the pin evaluates it as a subquery then). A multi-row
+  constant VALUES core reads as a BINARY column (the pin's
+  `sqlite3MultiValues` co-routine). `combine_compound`'s
+  set-based approximation is gone (`run_compound`,
+  `merge_compound`).
+- **Collated indexes:** `CREATE INDEX ... (c COLLATE NOCASE)`
+  (was refused), table `UNIQUE (c COLLATE RTRIM)` and the
+  autoindexes of NOCASE / RTRIM columns key by their collation:
+  `record::KeyOrder { desc, coll }` replaces the B-tree layer's
+  `desc: &[bool]`, so insertion order, prefix probes (UNIQUE
+  checks, OR IGNORE / OR REPLACE / upsert victims) and the
+  legacy `WHERE col = lit` index path all compare by it (that
+  path only takes an index whose collation is the column's).
+  Upsert targets match the pin's rule (`ON CONFLICT (a COLLATE
+  x)` only an index column of collation x; a bare column any).
+  Tables with such indexes are writable — they were refused as
+  foreign / opaque. Files interoperate both ways (hipp-written
+  indexes pass the oracle's `integrity_check`; oracle-written
+  ones are maintained by hipp).
+- **Unknown collation names** in CREATE TABLE / UNIQUE / CREATE
+  INDEX / upsert targets are refused (`SchemaKind::
+  UnknownCollation`, the pin's "no such collation sequence").
+- **Table `UNIQUE (a COLLATE x DESC, b)`** dropped `b` (the
+  parser skipped COLLATE only after ASC / DESC, the reverse of
+  the pin's grammar): uniqueness was enforced on `a` alone.
+- **GROUP BY order** (found while probing): with as many ORDER
+  BY as GROUP BY terms the pin's group sorter takes the ORDER
+  BY terms' ASC / DESC (`orderByGrp` set-up), so ties of the
+  ORDER BY keep a descending group order — `GROUP BY a ORDER BY
+  b DESC` listed equal-`b` groups ascending.
+- **Bare columns of aggregate queries** (found while probing
+  min / max ties): they come from the extremum row of the
+  *last* min() / max() aggregate (items, ORDER BY, HAVING — the
+  pin's shared `OP_CollSeq` hit flag), whatever other
+  aggregates exist, and a group whose argument is all NULL
+  reads its *last* row; hipp honoured only a lone min / max and
+  read the first row (closes the review gap recorded by the
+  query-shape unit).
+- **Scalar `min()` ties:** `min(1, 1.0)` is 1.0 (the pin's
+  `minmaxFunc` takes the later of equal arguments for min, the
+  earlier for max).
+- **LIKE matcher** (`query::like_glob`, the pin's `likeFunc` +
+  `patternCompare`): operands read up to their first NUL with
+  `sqlite3Utf8Read`'s decoding (invalid UTF-8 used to read as
+  empty), ASCII-only case folding, patterns over 50,000 bytes
+  `SchemaKind::PatternTooComplex`; iterative single-backtrack
+  matching (the old recursive matcher was exponential).
+
+**Shipped — `v16`:** the `expr COLLATE name` operator (binds
+tighter than `||`, looser than unary minus; identifier or
+string names, case-insensitive; ORDER BY / GROUP BY ordinals
+and aliases keep the collation on top, as the pin's
+`resolveAlias` does); GLOB / NOT GLOB (`*`, `?`, classes with
+`^`, leading `]`, ranges, a trailing `-` literal) and `LIKE ...
+ESCAPE` — both desugared at parse into the pin's `glob(p, x)` /
+`like(p, x, e)` calls — and the `like()` / `glob()` functions
+(escape: NULL gives NULL, not exactly one character
+`SchemaKind::EscapeNotSingleChar`, checked before NULL
+operands; an escape equal to `%` / `_` disables that wildcard).
+
+**Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
+not error text): `'a' COLLATE BINARY = 'A' COLLATE NOCASE` is
+0 (left explicit wins); `x'61' = 'a' COLLATE NOCASE` is 0 (no
+cross-class effect); `upper('a' COLLATE NOCASE) = 'a'` and
+`coalesce('A' COLLATE NOCASE, 1) = 'a'` are 1 (EP_Collate
+through function arguments), `(SELECT 'A' COLLATE NOCASE) =
+'a'` 0; `'ABC' IN (nocase_col)` 0 but `'A' IN ('a' COLLATE
+NOCASE)` 1 (the one-constant rewrite) and with three items 0;
+`'X' IN (SELECT a FROM t UNION SELECT 'q')` 0, reversed cores 1
+(rightmost core). EXPLAIN showed every non-ALL compound as
+sorter + co-routine merge (`k(1,NOCASE)`), and an ORDER BY
+`COLLATE` other than the column's as the natural compound
+plus a final sorter (`k(1,B)`); the survivor rules (`a UNION b`
+→ `A, ABC, b` over `abc, B, a` / `ABC, b, A`) were derived from
+that and checked on 150 generated compounds. Derived columns:
+`(SELECT 'X' AS c UNION ALL SELECT a ...)` is BINARY, `(SELECT a
+AS c ... UNION ALL SELECT 'X')` NOCASE (leftmost core). Ties:
+max() / min() aggregates and DISTINCT / GROUP BY keep the first
+row, ORDER BY is stable. Bare columns: `SELECT max(x), min(y),
+id` reads min(y)'s row, `min(y), max(x)` max(x)'s, all-NULL
+groups the last row. LIKE / GLOB: `'ÄBC' LIKE 'äbc'` 0, `'ab'
+GLOB 'a[b-a]'` 1 (the `b` literal), `'a' LIKE 'a' ESCAPE NULL`
+NULL, `GLOB ... ESCAPE` a wrong-argument-count error, a NUL
+ends either operand, `'x' LIKE 'X' ESCAPE x'41'` 1. CTAS does
+not copy a column's COLLATE. `SELECT 1 COLLATE bogus` runs on
+the pin (the name is looked up only when used).
+
+**Gates:** `ci/local-gates.sh` (full run) green. New suites:
+`tests/collation_v16.rs` (18 tests: column-collation
+comparisons, ordering / grouping / DISTINCT / aggregates, ties,
+the GROUP BY direction and bare-column regressions, compound
+merges, subqueries / derived tables / joins, CHECK / generated /
+UPDATE / DELETE over collated columns, UNIQUE NOCASE / RTRIM
+(with the `UNIQUE (b COLLATE RTRIM DESC, a)` regression),
+CREATE INDEX COLLATE incl. `INDEXED BY` order on the oracle,
+upsert targets, an oracle-written collated file written by hipp,
+unknown names, the LIKE matcher and pattern limit, and under
+`v16` the COLLATE operator corpus, GLOB / ESCAPE / functions,
+plus two PRNG corpora — 40×18 random LIKE / ESCAPE / GLOB
+pairs and 60 random collated queries; the 15 ungated ones also
+pass in a `std,indexes,v10` build),
+`hipp-cli/tests/cli_v16_collation.rs` (3 byte-identical
+batches one-shot and over stdin, REAL / NULL / blob rendering
+included, plus a `.dump` replay of a collated, indexed table),
+and parser unit tests for the clause grammar.
+
+**Size:** tiny **81,552 B** (Δ **−12 B** vs 81,564; ratchet
+lowered — the collation fields and name lookups are compiled
+out of the tiny profile, which has no comparison a collation
+could change, and the parser's constraint-column rewrite came
+out smaller); full **284,295 B** (Δ **+4,840 B** vs 279,455,
+ratchet raised: collation selection and the collated
+comparators (~1.5 KB), the merge-based compound evaluator
+(~1 KB over the removed set version), the pattern matcher and
+like / glob functions (~1.2 KB), index `KeyOrder` plumbing and
+upsert-target matching, the bare-column and GROUP BY order
+fixes).
+
+**Honest gaps:**
+
+- The tiny profile still accepts (and ignores) `COLLATE
+  <unknown>` in CREATE TABLE: it has no comparisons a collation
+  could change, and validating the name did not fit its
+  ratchet.
+- An unknown name in the `COLLATE` operator is refused at
+  prepare even where the pin, which looks names up only when a
+  comparison or sort uses them, runs the statement (`SELECT 1
+  COLLATE bogus`). A file whose schema names a collation other
+  than the three built-ins fails to open (`UnknownCollation`),
+  as files with WITHOUT ROWID tables do.
+- `PRAGMA case_sensitive_like` is not offered (hipp has no
+  PRAGMA statements yet); LIKE is always case-insensitive for
+  ASCII, the pin's default.
+- A multi-row VALUES core whose rows are not constant (or whose
+  first row has an affinity) is the pin's UNION ALL fallback;
+  hipp takes the first row with a collation then, but does not
+  re-run the merge per row-core.
+- Out of scope, found while probing (older, still open): the
+  relational operators bind tighter than `=` / LIKE on the pin
+  (`0 = 1 < 2` is 0), hipp parses them at one level, left to
+  right.
+- Probed on the local 3.53.1 stand-in. The merge-based compound
+  evaluation and the VALUES co-routine are recent pin internals
+  (3.4x–3.5x); nothing relied on is known to differ in 3.54.1,
+  and CI runs the real pin.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

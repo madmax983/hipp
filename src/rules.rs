@@ -390,6 +390,9 @@ pub struct ColSpec<'a> {
     pub gen_text: Option<&'a [u8]>,
     /// A STORED generated column.
     pub stored: bool,
+    /// The column's collating sequence (v0.16): CHECK and
+    /// generation expressions compare by it.
+    pub coll: crate::record::Coll,
 }
 
 fn subquery_refused<E>(
@@ -438,9 +441,11 @@ pub fn plan_rules<E>(
     }
     let mut descs: AVec<(AVec<u8>, Affinity)> = AVec::new();
     let mut affs = AVec::new();
+    let mut colls = AVec::new();
     for c in cols.iter() {
         descs.push((copy(c.name), c.affinity));
         affs.push(c.affinity);
+        colls.push(c.coll);
     }
     let mut offsets = AVec::new();
     offsets.push(0);
@@ -456,12 +461,9 @@ pub fn plan_rules<E>(
         // operator prohibited"), so the source carries an empty
         // qualifier no written reference can match.
         let mut srcs = AVec::new();
-        srcs.push(SourceDesc::new(
-            AVec::new(),
-            descs.clone(),
-            rowid_alias,
-            false,
-        ));
+        let mut src = SourceDesc::new(AVec::new(), descs.clone(), rowid_alias, false);
+        src.colls = colls.clone();
+        srcs.push(src);
         let cur = ScopeGroup::new(srcs, offsets.clone(), 0);
         let mut pending: AVec<(usize, RExpr)> = AVec::new();
         let mut virt = AVec::new();
@@ -534,7 +536,9 @@ pub fn plan_rules<E>(
     }
     if !checks.is_empty() {
         let mut srcs = AVec::new();
-        srcs.push(SourceDesc::new(copy(tname), descs, rowid_alias, true));
+        let mut src = SourceDesc::new(copy(tname), descs, rowid_alias, true);
+        src.colls = colls;
+        srcs.push(src);
         let cur = ScopeGroup::new(srcs, offsets, 0);
         for text in checks.iter() {
             let e = parse_rule::<E>(text, arena)?;
@@ -598,6 +602,7 @@ pub fn validate_def<E>(
             decl,
             gen_text: c.gen_expr.map(|h| handle_bytes(arena, h)),
             stored: c.stored,
+            coll: c.coll.unwrap_or_default(),
         });
     }
     let mut texts: AVec<&[u8]> = AVec::new();
@@ -629,6 +634,8 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | Expr::ExistsSubquery(_) => false,
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => expr_any(a, f) || expr_any(b, f),
         Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => expr_any(a, f),
+        #[cfg(feature = "v16")]
+        Expr::Collate(a, _) => expr_any(a, f),
         Expr::InSubquery(a, _, _) => expr_any(a, f),
         Expr::InList(a, l, _) => expr_any(a, f) || l.iter().any(|x| expr_any(x, f)),
         Expr::Between(a, b, c, _) => expr_any(a, f) || expr_any(b, f) || expr_any(c, f),
@@ -947,7 +954,8 @@ pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
 #[cfg(feature = "v16")]
 pub fn item_affinity(e: &RExpr) -> Affinity {
     match e {
-        RExpr::Column(_, a) | RExpr::Cast(_, a) => *a,
+        RExpr::Column(_, a, _) | RExpr::Cast(_, a) => *a,
+        RExpr::Collate(x, _) => item_affinity(x),
         RExpr::Rowid(_) => Affinity::Integer,
         RExpr::SubScalar(p) => p
             .items

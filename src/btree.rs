@@ -16,7 +16,9 @@ use crate::record::{decode_varint, encode_varint};
 use crate::storage::Storage;
 
 #[cfg(feature = "indexes")]
-use crate::record::{OwnedValue, Value, compare_values, decode_record, encode_record};
+use crate::record::{KeyOrder, compare_coll};
+#[cfg(feature = "indexes")]
+use crate::record::{OwnedValue, Value, decode_record, encode_record};
 
 pub const KIND_INTERIOR_INDEX: u8 = 0x02;
 pub const KIND_INTERIOR_TABLE: u8 = 0x05;
@@ -2607,21 +2609,23 @@ async fn index_cell_payload<S: Storage>(
     assemble_payload(pager, local.as_slice(), cell.payload_len, cell.overflow).await
 }
 
-/// Compare two decoded keys field by field; `desc[j]` reverses
+/// Compare two decoded keys field by field under each key
+/// column's collation (v0.16); `desc[j].desc` reverses
 /// column j's comparison (the rowid field, last, is never in
 /// `desc` and always compares ascending). NULL ordering follows
 /// `compare_values` (NULL smallest; reversed under DESC, which is
 /// what the oracle does).
 #[cfg(feature = "indexes")]
-pub fn compare_entries(a: &[OwnedValue], b: &[OwnedValue], desc: &[bool]) -> core::cmp::Ordering {
+pub fn compare_entries(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+    desc: &[KeyOrder],
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for j in 0..a.len().min(b.len()) {
-        let c = compare_values(&a[j].as_value(), &b[j].as_value());
-        let c = if j < desc.len() && desc[j] {
-            c.reverse()
-        } else {
-            c
-        };
+        let o = desc.get(j).copied().unwrap_or_default();
+        let c = compare_coll(&a[j].as_value(), &b[j].as_value(), o.coll);
+        let c = if o.desc { c.reverse() } else { c };
         if c != Ordering::Equal {
             return c;
         }
@@ -3056,7 +3060,7 @@ async fn index_search_pos<S: Storage>(
     cells: &[IndexCell],
     probe: &IndexEntry,
     nfields: usize,
-    desc: &[bool],
+    desc: &[KeyOrder],
 ) -> Result<usize, S::Error> {
     use core::cmp::Ordering;
     let (mut lo, mut hi) = (0usize, cells.len());
@@ -3088,7 +3092,7 @@ pub async fn index_insert<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
     payload: &[u8],
-    desc: &[bool],
+    desc: &[KeyOrder],
 ) -> Result<(), S::Error> {
     let usable = pager.usable() as usize;
     let nfields = desc.len() + 1;
@@ -3205,18 +3209,19 @@ pub enum KeyPart {
 }
 
 #[cfg(feature = "indexes")]
-fn cmp_entry_probe(entry: &[OwnedValue], probe: &[KeyPart], desc: &[bool]) -> core::cmp::Ordering {
+fn cmp_entry_probe(
+    entry: &[OwnedValue],
+    probe: &[KeyPart],
+    desc: &[KeyOrder],
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for j in 0..entry.len().min(probe.len()) {
         match &probe[j] {
             KeyPart::Min => return Ordering::Greater,
             KeyPart::Val(v) => {
-                let c = compare_values(&entry[j].as_value(), &v.as_value());
-                let c = if j < desc.len() && desc[j] {
-                    c.reverse()
-                } else {
-                    c
-                };
+                let o = desc.get(j).copied().unwrap_or_default();
+                let c = compare_coll(&entry[j].as_value(), &v.as_value(), o.coll);
+                let c = if o.desc { c.reverse() } else { c };
                 if c != Ordering::Equal {
                     return c;
                 }
@@ -3257,7 +3262,7 @@ pub struct IndexCursor {
 #[cfg(feature = "indexes")]
 impl IndexCursor {
     /// A cursor over the whole index, in key order.
-    pub fn new(root: u32, desc: &[bool]) -> IndexCursor {
+    pub fn new(root: u32, desc: &[KeyOrder]) -> IndexCursor {
         let mut stack = AVec::new();
         stack.push(IdxFrame::Unresolved { page: root });
         IndexCursor {
@@ -3271,7 +3276,7 @@ impl IndexCursor {
     pub async fn seek<S: Storage>(
         pager: &mut Pager<S>,
         root: u32,
-        desc: &[bool],
+        desc: &[KeyOrder],
         probe: &[KeyPart],
     ) -> Result<IndexCursor, S::Error> {
         let usable = pager.usable() as usize;
@@ -3467,13 +3472,16 @@ impl IndexCursor {
 }
 
 /// Whether `entry`'s first `prefix.len()` key fields equal
-/// `prefix` (direction-independent field equality).
+/// `prefix` (direction-independent field equality, under each
+/// key column's collation — v0.16).
 #[cfg(feature = "indexes")]
-fn prefix_matches(entry: &IndexEntry, prefix: &[OwnedValue]) -> bool {
+fn prefix_matches(entry: &IndexEntry, prefix: &[OwnedValue], desc: &[KeyOrder]) -> bool {
     for (j, p) in prefix.iter().enumerate() {
-        if compare_values(&entry.values.as_slice()[j].as_value(), &p.as_value())
-            != core::cmp::Ordering::Equal
-        {
+        let Some(v) = entry.values.as_slice().get(j) else {
+            return false;
+        };
+        let coll = desc.get(j).map(|o| o.coll).unwrap_or_default();
+        if compare_coll(&v.as_value(), &p.as_value(), coll) != core::cmp::Ordering::Equal {
             return false;
         }
     }
@@ -3486,7 +3494,7 @@ fn prefix_matches(entry: &IndexEntry, prefix: &[OwnedValue]) -> bool {
 pub async fn index_prefix_rowids<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
-    desc: &[bool],
+    desc: &[KeyOrder],
     prefix: &[OwnedValue],
 ) -> Result<AVec<i64>, S::Error> {
     let mut probe: AVec<KeyPart> = AVec::new();
@@ -3499,7 +3507,7 @@ pub async fn index_prefix_rowids<S: Storage>(
     let mut cur = IndexCursor::seek(pager, root, desc, probe.as_slice()).await?;
     let mut out = AVec::new();
     while let Some(e) = cur.next_entry(pager).await? {
-        if !prefix_matches(&e, prefix) {
+        if !prefix_matches(&e, prefix, desc) {
             break;
         }
         out.push(e.rowid()?);
@@ -3513,7 +3521,7 @@ pub async fn index_prefix_rowids<S: Storage>(
 pub async fn index_first_with_prefix<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
-    desc: &[bool],
+    desc: &[KeyOrder],
     prefix: &[OwnedValue],
 ) -> Result<Option<i64>, S::Error> {
     let rowids = index_prefix_rowids(pager, root, desc, prefix).await?;
@@ -4160,7 +4168,7 @@ async fn collapse_index_root<S: Storage>(pager: &mut Pager<S>, root: u32) -> Res
 async fn index_rebuild_without<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
-    desc: &[bool],
+    desc: &[KeyOrder],
     skip: &IndexEntry,
 ) -> Result<(), S::Error> {
     use core::cmp::Ordering;
@@ -4222,7 +4230,7 @@ pub async fn index_delete<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
     payload: &[u8],
-    desc: &[bool],
+    desc: &[KeyOrder],
 ) -> Result<bool, S::Error> {
     use core::cmp::Ordering;
     let usable = pager.usable() as usize;
@@ -4489,7 +4497,7 @@ async fn index_apply_replacement<S: Storage>(
     target: &IndexEntry,
     pred_entry: &IndexEntry,
     pred_cell: &IndexCell,
-    desc: &[bool],
+    desc: &[KeyOrder],
 ) -> Result<(), S::Error> {
     use core::cmp::Ordering;
     let usable = pager.usable() as usize;
@@ -4595,7 +4603,7 @@ async fn index_apply_replacement<S: Storage>(
 async fn index_rebuild_without_extra<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
-    desc: &[bool],
+    desc: &[KeyOrder],
     skip: &IndexEntry,
     extra: Option<&IndexEntry>,
 ) -> Result<(), S::Error> {
