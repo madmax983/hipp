@@ -40,7 +40,7 @@ use crate::error::{Error, Result, SchemaKind};
 use crate::record::{
     Affinity, OwnedValue, apply_affinity, compare_values, render_int, render_real,
 };
-use crate::sql::{BinOp, Expr, Literal, eq_ci, handle_bytes};
+use crate::sql::{BinOp, Expr, Literal, SortOrder, eq_ci, handle_bytes};
 
 /// One materialised row: flat column values across all FROM
 /// sources, plus each source's rowid (None for a LEFT JOIN pad).
@@ -163,6 +163,64 @@ pub struct SourceDesc {
     /// (SELECT ...) s` (a derived column literally NAMED rowid
     /// still resolves, as an ordinary column).
     pub has_rowid: bool,
+    /// How this source joins the sources on its left (v0.16):
+    /// unqualified references to a USING column pick a side by
+    /// it (see `resolve_column_in_group`).
+    pub kind: crate::sql::JoinKind,
+    /// This source's USING column names (v0.16; NATURAL joins
+    /// fill it with the common columns): empty without one.
+    pub using: AVec<AVec<u8>>,
+}
+
+impl SourceDesc {
+    /// A source joined as an inner join with no USING columns
+    /// (the planner fills `kind` / `using` for joined sources).
+    pub fn new(
+        qualifier: AVec<u8>,
+        columns: AVec<(AVec<u8>, Affinity)>,
+        rowid_alias: Option<usize>,
+        has_rowid: bool,
+    ) -> SourceDesc {
+        SourceDesc {
+            qualifier,
+            columns,
+            rowid_alias,
+            has_rowid,
+            kind: crate::sql::JoinKind::Inner,
+            using: AVec::new(),
+        }
+    }
+
+    /// Whether `name` is one of this source's USING columns.
+    pub fn uses(&self, name: &[u8]) -> bool {
+        self.using.iter().any(|u| eq_ci(u.as_slice(), name))
+    }
+
+    /// The resolved reference to this source's column `ci`
+    /// (source `si` of `group`): the rowid for the rowid-alias
+    /// column, else the flat slot.
+    pub fn column_ref(&self, group: &ScopeGroup, si: usize, ci: usize) -> RExpr {
+        if Some(ci) == self.rowid_alias {
+            RExpr::Rowid(group.first_src + si)
+        } else {
+            let aff = self
+                .columns
+                .as_slice()
+                .get(ci)
+                .map_or(Affinity::Blob, |c| c.1);
+            RExpr::Column(
+                group.offsets.as_slice().get(si).copied().unwrap_or(0) + ci,
+                aff,
+            )
+        }
+    }
+
+    /// The index of this source's column named `name`, if any.
+    pub fn column_index(&self, name: &[u8]) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|(c, _)| eq_ci(c.as_slice(), name))
+    }
 }
 
 /// One level of name-resolution scope (v0.6): a query's own FROM
@@ -177,9 +235,55 @@ pub struct ScopeGroup {
     pub sources: AVec<SourceDesc>,
     pub offsets: AVec<usize>,
     pub first_src: usize,
+    /// Result-column aliases visible in this scope (v0.16,
+    /// `v16`): `(alias, resolved item)`. Filled after the
+    /// result list is resolved, so WHERE / ON / GROUP BY /
+    /// HAVING / ORDER BY expressions — and subqueries inside
+    /// them — may name an alias; an unqualified name that no
+    /// source of this group has resolves to the first alias
+    /// spelled the same, before any enclosing scope (the pin's
+    /// `lookupName` order). Empty while the result list itself
+    /// resolves: there an alias is "no such column".
+    pub aliases: AVec<(AVec<u8>, RExpr)>,
 }
 
 impl ScopeGroup {
+    /// A scope group with no aliases.
+    pub fn new(sources: AVec<SourceDesc>, offsets: AVec<usize>, first_src: usize) -> ScopeGroup {
+        ScopeGroup {
+            sources,
+            offsets,
+            first_src,
+            aliases: AVec::new(),
+        }
+    }
+
+    /// One past the last absolute column slot / rowid source
+    /// this group occupies (v0.16). A subquery planned inside
+    /// these scopes numbers its own slots from the largest end
+    /// over them — the same as summing widths when the groups
+    /// tile the row from slot 0, and still right for a group
+    /// that starts later (an UPDATE ... FROM clause's own scope
+    /// sits after the target's columns).
+    pub fn end(&self) -> (usize, usize) {
+        let slots = match (
+            self.offsets.as_slice().last(),
+            self.sources.as_slice().last(),
+        ) {
+            (Some(o), Some(s)) => o + s.columns.len(),
+            _ => 0,
+        };
+        (slots, self.first_src + self.sources.len())
+    }
+
+    /// The `end` over a stack of scope groups (v0.16).
+    pub fn stack_end(groups: &[ScopeGroup]) -> (usize, usize) {
+        groups.iter().fold((0, 0), |(w, s), g| {
+            let (gw, gs) = g.end();
+            (w.max(gw), s.max(gs))
+        })
+    }
+
     /// Total flat column slots across this group's sources.
     pub fn width(&self) -> usize {
         self.sources.iter().map(|s| s.columns.len()).sum()
@@ -221,10 +325,14 @@ pub struct SubPlan {
     pub filter: Option<RExpr>,
     pub group_by: AVec<RExpr>,
     pub having: Option<RExpr>,
-    pub order_by: AVec<(RExpr, bool)>,
+    pub order_by: AVec<(RExpr, SortOrder)>,
     pub distinct: bool,
-    pub limit: Option<i64>,
-    pub offset: i64,
+    /// LIMIT / OFFSET (v0.16: resolved expressions — planned
+    /// against an empty scope, so never correlated — evaluated
+    /// once per execution with the pin's `MustBeInt` rule; see
+    /// `limit_int`).
+    pub limit: Option<RExpr>,
+    pub offset: Option<RExpr>,
     pub has_agg: bool,
     /// Compound tail (v0.9): `(op, core plan)` pairs applied
     /// left to right after this plan's own core. Each tail plan
@@ -243,7 +351,7 @@ pub struct SubPlan {
     /// BY terms — on the pin a compound's ORDER BY terms may
     /// only be an output ordinal or a result-column name (any
     /// constituent core's), never a general expression.
-    pub comp_order: AVec<(usize, bool)>,
+    pub comp_order: AVec<(usize, SortOrder)>,
     /// Result column names (v0.9), parallel to the core's
     /// output width: alias if written, else the column name
     /// for a direct column reference, else the expression's
@@ -304,43 +412,62 @@ impl SubPlan {
 /// plans are walked with the same absolute threshold: their
 /// interiors index the same combined row.
 pub fn expr_refs_below(e: &RExpr, width: usize, srcs: usize) -> bool {
+    expr_refs_range(e, &RefRange::below(width, srcs))
+}
+
+/// A band of the combined evaluation row (v0.16): column slots
+/// `w.0..w.1` and rowid sources `s.0..s.1`.
+#[derive(Debug, Clone, Copy)]
+pub struct RefRange {
+    pub w: (usize, usize),
+    pub s: (usize, usize),
+}
+
+impl RefRange {
+    /// Every slot below `width` and source below `srcs`.
+    pub fn below(width: usize, srcs: usize) -> RefRange {
+        RefRange {
+            w: (0, width),
+            s: (0, srcs),
+        }
+    }
+    fn slot(&self, i: usize) -> bool {
+        self.w.0 <= i && i < self.w.1
+    }
+    fn src(&self, i: usize) -> bool {
+        self.s.0 <= i && i < self.s.1
+    }
+}
+
+/// Whether expression `e` references a column slot or rowid
+/// source inside band `r` (v0.16 generalisation of
+/// `expr_refs_below`; the ON-clause forward-reference check
+/// asks it for the band of the sources joined later). Nested
+/// subquery plans are walked with the same absolute band:
+/// their own sources lie past every band of the query that
+/// contains them.
+pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
+    let f = |x: &RExpr| expr_refs_range(x, r);
     match e {
-        RExpr::Column(slot, _) => *slot < width,
-        RExpr::Rowid(src) => *src < srcs,
-        RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_below(p, width, srcs),
-        RExpr::InSub(x, p, _) => expr_refs_below(x, width, srcs) || plan_refs_below(p, width, srcs),
+        RExpr::Column(slot, _) => r.slot(*slot),
+        RExpr::Rowid(src) => r.src(*src),
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_range(p, r),
+        RExpr::InSub(x, p, _) => f(x) || plan_refs_range(p, r),
         RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => false,
-        RExpr::Binary(_, a, b) => {
-            expr_refs_below(a, width, srcs) || expr_refs_below(b, width, srcs)
-        }
-        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
-            expr_refs_below(a, width, srcs)
-        }
-        RExpr::InList(x, l, _) => {
-            expr_refs_below(x, width, srcs) || l.iter().any(|i| expr_refs_below(i, width, srcs))
-        }
-        RExpr::Between(x, a, b, _) => {
-            expr_refs_below(x, width, srcs)
-                || expr_refs_below(a, width, srcs)
-                || expr_refs_below(b, width, srcs)
-        }
-        RExpr::Like(a, b, _) => expr_refs_below(a, width, srcs) || expr_refs_below(b, width, srcs),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => f(a),
+        RExpr::InList(x, l, _) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
         RExpr::Case {
             base,
             whens,
             otherwise,
         } => {
-            base.as_ref()
-                .is_some_and(|b| expr_refs_below(b, width, srcs))
-                || whens.iter().any(|(w, t)| {
-                    expr_refs_below(w, width, srcs) || expr_refs_below(t, width, srcs)
-                })
-                || otherwise
-                    .as_ref()
-                    .is_some_and(|o| expr_refs_below(o, width, srcs))
+            base.as_ref().is_some_and(|b| f(b))
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_ref().is_some_and(|o| f(o))
         }
-        RExpr::Scalar(_, args) => args.iter().any(|a| expr_refs_below(a, width, srcs)),
-        RExpr::Agg { args, .. } => args.iter().any(|a| expr_refs_below(a, width, srcs)),
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().any(f),
     }
 }
 
@@ -349,55 +476,25 @@ pub fn expr_refs_below(e: &RExpr, width: usize, srcs: usize) -> bool {
 /// its cores' items / filter / grouping / having / ordering,
 /// its sources' ON expressions and derived subplans, its
 /// VALUES rows, and its compound tails — recursively, with
-/// the same absolute threshold throughout.
+/// the same absolute threshold throughout. (LIMIT / OFFSET
+/// are planned against an empty scope of their own and can
+/// reference nothing outside it, so they are not walked.)
 pub fn plan_refs_below(p: &SubPlan, width: usize, srcs: usize) -> bool {
-    for s in p.sources.iter() {
-        if let Some(on) = &s.on
-            && expr_refs_below(on, width, srcs)
-        {
-            return true;
-        }
-        if let Some(d) = &s.derived
-            && plan_refs_below(d, width, srcs)
-        {
-            return true;
-        }
-    }
-    if p.items.iter().any(|e| expr_refs_below(e, width, srcs)) {
-        return true;
-    }
-    if let Some(f) = &p.filter
-        && expr_refs_below(f, width, srcs)
-    {
-        return true;
-    }
-    if p.group_by.iter().any(|e| expr_refs_below(e, width, srcs)) {
-        return true;
-    }
-    if let Some(h) = &p.having
-        && expr_refs_below(h, width, srcs)
-    {
-        return true;
-    }
-    if p.order_by
-        .iter()
-        .any(|(e, _)| expr_refs_below(e, width, srcs))
-    {
-        return true;
-    }
-    if p.values
-        .iter()
-        .any(|r| r.iter().any(|e| expr_refs_below(e, width, srcs)))
-    {
-        return true;
-    }
-    if p.compound
-        .iter()
-        .any(|(_, t)| plan_refs_below(t, width, srcs))
-    {
-        return true;
-    }
-    false
+    plan_refs_range(p, &RefRange::below(width, srcs))
+}
+
+/// `plan_refs_below` over an arbitrary band (v0.16).
+pub fn plan_refs_range(p: &SubPlan, r: &RefRange) -> bool {
+    let f = |x: &RExpr| expr_refs_range(x, r);
+    p.sources.iter().any(|s| {
+        s.on.as_ref().is_some_and(f) || s.derived.as_ref().is_some_and(|d| plan_refs_range(d, r))
+    }) || p.items.iter().any(f)
+        || p.filter.as_ref().is_some_and(f)
+        || p.group_by.iter().any(f)
+        || p.having.as_ref().is_some_and(f)
+        || p.order_by.iter().any(|(e, _)| f(e))
+        || p.values.iter().any(|row| row.iter().any(f))
+        || p.compound.iter().any(|(_, t)| plan_refs_range(t, r))
 }
 
 /// Whether plan `p`, planned against enclosing scopes that
@@ -466,7 +563,18 @@ fn is_rowid_name(b: &[u8]) -> bool {
 /// may fall through to an enclosing scope. A group that *can*
 /// answer — including with an ambiguity or a missing column on
 /// a matched qualifier — answers definitively.
-fn resolve_column_in_group<E>(
+///
+/// An unqualified name follows the pin's `lookupName` rules
+/// (v0.16): real columns are matched across the group's
+/// sources left to right; a later source that has the name
+/// only as one of its USING (or NATURAL) columns does not make
+/// it ambiguous — after an INNER / LEFT join the left-most
+/// source keeps it, after a RIGHT join the right-most source
+/// takes it, and a FULL join gathers every such side into
+/// `coalesce(...)`. Only when no source has a real column so
+/// named does `rowid` (or `oid` / `_rowid_`) bind to the one
+/// source with a rowid — two such sources are ambiguous.
+pub(crate) fn resolve_column_in_group<E>(
     group: &ScopeGroup,
     table: Option<&[u8]>,
     name: &[u8],
@@ -476,14 +584,8 @@ fn resolve_column_in_group<E>(
             if !eq_ci(src.qualifier.as_slice(), q) {
                 continue;
             }
-            for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-                if eq_ci(cname.as_slice(), name) {
-                    return Some(Ok(if Some(ci) == src.rowid_alias {
-                        RExpr::Rowid(group.first_src + si)
-                    } else {
-                        RExpr::Column(group.offsets[si] + ci, *aff)
-                    }));
-                }
+            if let Some(ci) = src.column_index(name) {
+                return Some(Ok(src.column_ref(group, si, ci)));
             }
             if is_rowid_name(name) && src.has_rowid {
                 return Some(Ok(RExpr::Rowid(group.first_src + si)));
@@ -497,60 +599,141 @@ fn resolve_column_in_group<E>(
         }
         return None;
     }
+    let mut cnt = 0usize;
     let mut found: Option<RExpr> = None;
-    let mut ambiguous = false;
+    let mut full: AVec<RExpr> = AVec::new();
     for (si, src) in group.sources.iter().enumerate() {
-        let mut cand: Option<RExpr> = None;
-        for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-            if eq_ci(cname.as_slice(), name) {
-                cand = Some(if Some(ci) == src.rowid_alias {
-                    RExpr::Rowid(group.first_src + si)
-                } else {
-                    RExpr::Column(group.offsets[si] + ci, *aff)
-                });
-                break;
+        let Some(ci) = src.column_index(name) else {
+            continue;
+        };
+        if cnt > 0 {
+            if !src.uses(name) {
+                // A second real column not joined by USING:
+                // ambiguous (cnt passes 1, the coalesce is off).
+                full.clear();
+            } else if !src.kind.pads_left() {
+                // INNER / LEFT join: the left-most side stays.
+                continue;
+            } else if !src.kind.pads_right() {
+                // RIGHT join: the right-most side takes over.
+                cnt = 0;
+                full.clear();
+            } else if let Some(prev) = found.take() {
+                // FULL join: coalesce over both sides.
+                full.push(prev);
             }
         }
-        if cand.is_none() && is_rowid_name(name) && src.has_rowid {
-            cand = Some(RExpr::Rowid(group.first_src + si));
-        }
-        if let Some(c) = cand {
-            if found.is_some() {
-                ambiguous = true;
-            } else {
-                found = Some(c);
-            }
-        }
+        cnt += 1;
+        found = Some(src.column_ref(group, si, ci));
     }
-    if ambiguous {
-        return Some(Err(Error::Schema {
+    match (cnt, found) {
+        (1, Some(e)) => Some(Ok(e)),
+        (0, _) => {
+            if !is_rowid_name(name) {
+                return None;
+            }
+            let mut rowid: Option<RExpr> = None;
+            for (si, src) in group.sources.iter().enumerate() {
+                if src.has_rowid {
+                    if rowid.is_some() {
+                        return Some(Err(Error::Schema {
+                            kind: SchemaKind::AmbiguousColumn,
+                        }));
+                    }
+                    rowid = Some(RExpr::Rowid(group.first_src + si));
+                }
+            }
+            rowid.map(Ok)
+        }
+        (n, Some(last)) if full.len() + 1 == n => {
+            full.push(last);
+            Some(Ok(RExpr::Scalar(ScalarFn::Coalesce, full)))
+        }
+        _ => Some(Err(Error::Schema {
             kind: SchemaKind::AmbiguousColumn,
-        }));
+        })),
     }
-    found.map(Ok)
 }
 
 /// Resolve one column reference: the current query's sources
 /// first, then enclosing scopes nearest-first (v0.6 subquery
 /// shadowing). With no enclosing scopes this is exactly the
-/// pre-v0.6 rule.
+/// pre-v0.6 rule. v0.16: within each scope an unqualified name
+/// no source has falls back to that scope's result-column
+/// aliases (only filled under `v16`) before the next scope out.
 fn resolve_column<E>(
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Result<RExpr, E> {
-    if let Some(r) = resolve_column_in_group::<E>(cur, table, name) {
-        return r;
-    }
-    for g in enclosing {
+    for g in core::iter::once(cur).chain(enclosing.iter()) {
         if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
             return r;
+        }
+        if table.is_none()
+            && let Some((_, e)) = g.aliases.iter().find(|(a, _)| eq_ci(a.as_slice(), name))
+        {
+            return Ok(e.clone());
         }
     }
     Err(Error::Schema {
         kind: SchemaKind::UnknownColumn,
     })
+}
+
+/// Expand `*` (`qual` None) or `q.*` over a scope group (v0.4;
+/// USING-aware since v0.16, the pin's `selectExpander`) into
+/// `(item, result name, ORDER BY name key)` triples; returns
+/// whether any source matched (always true for `*` with
+/// sources). For an unqualified `*`, a joined source's USING /
+/// NATURAL columns are omitted — each shows once, at the
+/// left-most source's position. A column of a source left of
+/// the FROM clause's last RIGHT / FULL join that some later
+/// source names in USING expands to the *unqualified* name, so
+/// it reads the joined value (the right side after a RIGHT
+/// join, `coalesce(...)` after a FULL one); that applies to
+/// `q.*` as well, as on the pin.
+pub fn expand_star<E>(
+    cur: &ScopeGroup,
+    qual: Option<&[u8]>,
+    out: &mut AVec<(RExpr, AVec<u8>, OrderName)>,
+) -> Result<bool, E> {
+    let srcs = cur.sources.as_slice();
+    let last_right = srcs.iter().rposition(|s| s.kind.pads_left());
+    let mut hit = false;
+    for (si, src) in srcs.iter().enumerate() {
+        if let Some(q) = qual
+            && !eq_ci(src.qualifier.as_slice(), q)
+        {
+            continue;
+        }
+        hit = true;
+        for (ci, (cname, _)) in src.columns.iter().enumerate() {
+            let n = cname.as_slice();
+            if qual.is_none() && si > 0 && src.uses(n) {
+                continue;
+            }
+            let joined = last_right.is_some_and(|r| si < r)
+                && srcs
+                    .get(si + 1..)
+                    .is_some_and(|rest| rest.iter().any(|s| s.uses(n)));
+            let e = if joined {
+                match resolve_column_in_group::<E>(cur, None, n) {
+                    Some(r) => r?,
+                    None => src.column_ref(cur, si, ci),
+                }
+            } else {
+                src.column_ref(cur, si, ci)
+            };
+            out.push((
+                e,
+                cname.clone(),
+                (Some(src.qualifier.clone()), cname.clone()),
+            ));
+        }
+    }
+    Ok(hit)
 }
 
 fn literal_value(arena: &Arena, lit: Literal) -> OwnedValue {
@@ -599,11 +782,7 @@ pub fn resolve<E>(
     for o in offsets {
         offs.push(*o);
     }
-    let cur = ScopeGroup {
-        sources: srcs,
-        offsets: offs,
-        first_src: 0,
-    };
+    let cur = ScopeGroup::new(srcs, offs, 0);
     let mut planner = |_: &crate::sql::SelectStmt,
                        _: &ScopeGroup,
                        _: &[ScopeGroup]|
@@ -2634,6 +2813,11 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                 arith::<E>(*op, l, r, ctx)?
             }
         },
+        // An empty set is FALSE for IN (TRUE for NOT IN) even
+        // when the left operand is NULL (v0.16, pin-probed:
+        // `NULL IN (SELECT a FROM empty)` is 0, not NULL — the
+        // shape `x IN emptytable` exposed it).
+        RExpr::InList(_, list, neg) if list.is_empty() => bool_val(*neg),
         RExpr::InList(x, list, neg) => {
             let xv = eval::<E>(x, ctx)?;
             let mut any_null = matches!(xv, OwnedValue::Null);
@@ -2767,4 +2951,64 @@ pub fn eval_const<E>(expr: &Expr, arena: &Arena) -> Result<OwnedValue, E> {
     }
     let empty = RowData::empty();
     eval::<E>(&r, &Ctx::Row(&empty))
+}
+
+/// Compare two ORDER BY key values under one term's direction
+/// (v0.16): NULLs go first or last as the term says (SQLite's
+/// default is NULL-smallest, i.e. first ascending and last
+/// descending); any other pair compares by the storage-class
+/// ordering, reversed for DESC.
+pub fn order_cmp(a: &OwnedValue, b: &OwnedValue, o: SortOrder) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (matches!(a, OwnedValue::Null), matches!(b, OwnedValue::Null)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if o.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if o.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let c = compare_values(&a.as_value(), &b.as_value());
+            if o.desc { c.reverse() } else { c }
+        }
+    }
+}
+
+/// Lexicographic ORDER BY comparison of two key rows (v0.16):
+/// `order_cmp` per term, first difference wins.
+pub fn order_keys_cmp(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+    dirs: impl Iterator<Item = SortOrder>,
+) -> core::cmp::Ordering {
+    for ((x, y), o) in a.iter().zip(b.iter()).zip(dirs) {
+        let c = order_cmp(x, y, o);
+        if c != core::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
+/// A LIMIT / OFFSET value as the pin's `OP_MustBeInt` takes it
+/// (v0.16): NUMERIC affinity first (`'2'`, `' 2 '`, `'2.0'`,
+/// `2.0` become 2), then the value must be an integer — NULL,
+/// a blob, non-numeric text, or a real with a fractional part
+/// or outside the i64 range is a datatype mismatch.
+pub fn limit_int<E>(v: OwnedValue) -> Result<i64, E> {
+    match apply_affinity(v, Affinity::Numeric) {
+        OwnedValue::Integer(i) => Ok(i),
+        _ => Err(Error::Schema {
+            kind: SchemaKind::DatatypeMismatch,
+        }),
+    }
 }

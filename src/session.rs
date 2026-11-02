@@ -26,8 +26,6 @@ use crate::schema::IndexOrigin;
 
 #[cfg(feature = "v04")]
 use crate::query::{Ctx, RExpr, RowData};
-#[cfg(feature = "v04")]
-use crate::sql::JoinKind;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -338,26 +336,14 @@ enum Plan {
     },
 }
 
-/// One FROM source in a v0.4 query plan.
+/// One FROM source in a v0.4 query plan: the subquery
+/// planner's `SubSource` (v0.16 merged the two identical
+/// structs, so every join executor serves both plan kinds). A
+/// derived source (v0.9) carries its subplan in `derived`,
+/// executed once against the empty outer row at
+/// materialisation time (`root` unused).
 #[cfg(feature = "v04")]
-#[derive(Debug, Clone)]
-struct SourcePlan {
-    root: u32,
-    kind: JoinKind,
-    on: Option<RExpr>,
-    rowid_alias: Option<usize>,
-    ncols: usize,
-    /// Per-column read-side affinity (REAL forcing, §5.5).
-    affs: AVec<crate::record::Affinity>,
-    defaults: AVec<OwnedValue>,
-    /// A derived table (v0.9): when `Some`, the source's rows
-    /// are this subplan's result rows (executed once against
-    /// the empty outer row at materialisation time; `root` is
-    /// unused). Planned against no enclosing scope — a FROM
-    /// subquery sees neither sibling sources nor (at statement
-    /// level) any outer query. Only filled under `v09`.
-    derived: Option<Box<crate::query::SubPlan>>,
-}
+type SourcePlan = crate::query::SubSource;
 
 /// A v0.4 query plan: everything resolved at prepare time.
 #[cfg(feature = "v04")]
@@ -368,10 +354,12 @@ struct QueryPlan {
     filter: Option<RExpr>,
     group_by: AVec<RExpr>,
     having: Option<RExpr>,
-    order_by: AVec<(RExpr, bool)>,
+    order_by: AVec<(RExpr, crate::sql::SortOrder)>,
     distinct: bool,
-    limit: Option<i64>,
-    offset: i64,
+    /// LIMIT / OFFSET (v0.16: resolved expressions; see
+    /// `SubPlan::limit`).
+    limit: Option<RExpr>,
+    offset: Option<RExpr>,
     has_agg: bool,
     width: usize,
     /// Compound tail (v0.9; see `SubPlan::compound`). When
@@ -386,7 +374,7 @@ struct QueryPlan {
     values: AVec<AVec<RExpr>>,
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
     #[cfg_attr(not(feature = "v09"), allow(dead_code))]
-    comp_order: AVec<(usize, bool)>,
+    comp_order: AVec<(usize, crate::sql::SortOrder)>,
     /// Per-result-item ORDER BY name keys (v0.9): `(qualifier,
     /// name)` for a plain column item (qualifier = its source's
     /// qualifier), `(None, alias-or-text)` for other items,
@@ -395,6 +383,140 @@ struct QueryPlan {
     /// the compound's cores (pin-verified behaviour).
     #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     order_names: AVec<crate::query::OrderName>,
+}
+
+/// The common planned body of one SELECT core (v0.16; see
+/// `Connection::plan_core`): what `QueryPlan` and `SubPlan`
+/// both carry.
+#[cfg(feature = "v04")]
+struct CorePlan {
+    sources: AVec<SourcePlan>,
+    items: AVec<RExpr>,
+    filter: Option<RExpr>,
+    group_by: AVec<RExpr>,
+    having: Option<RExpr>,
+    order_by: AVec<(RExpr, crate::sql::SortOrder)>,
+    limit: Option<RExpr>,
+    offset: Option<RExpr>,
+    has_agg: bool,
+    /// Result names / affinities: what a subquery plan records
+    /// (top-level queries do not keep them).
+    #[cfg_attr(not(feature = "v06"), allow(dead_code))]
+    result_names: AVec<AVec<u8>>,
+    #[cfg_attr(not(feature = "v06"), allow(dead_code))]
+    result_affs: AVec<Option<crate::record::Affinity>>,
+    order_names: AVec<crate::query::OrderName>,
+}
+
+/// Which clause a GROUP BY / HAVING / ORDER BY term belongs to
+/// (v0.16): the pin's ordinal and alias rules differ per
+/// clause (see `Connection::resolve_term`).
+#[cfg(feature = "v04")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TermClause {
+    Order,
+    Group,
+    Having,
+}
+
+/// `a AND b`, or `b` alone when there is no `a` (v0.16: join
+/// constraint and hoisted ON-term conjunctions).
+#[cfg(feature = "v04")]
+fn and_expr(a: Option<RExpr>, b: RExpr) -> RExpr {
+    match a {
+        None => b,
+        Some(a) => RExpr::Binary(BinOp::And, Box::new(a), Box::new(b)),
+    }
+}
+
+/// Resolve every joined source's USING / NATURAL columns
+/// (v0.16, the pin's `sqlite3ProcessJoin`). For source `i`:
+/// a NATURAL join's columns are its own columns (in its column
+/// order) that some source on its left also has; a USING
+/// column must exist in source `i` and in some source on its
+/// left ("cannot join using column ... not present in both
+/// tables" otherwise). Each column contributes `left = right`
+/// to the source's join condition, where `left` is the
+/// left-most source having the column — or, once the FROM
+/// clause has a RIGHT / FULL join, `coalesce(...)` over every
+/// left source having it, each of which (after the first) must
+/// itself have it as a USING column ("ambiguous reference ...
+/// in USING()" otherwise). Records the columns in the scope
+/// (`SourceDesc::using`) for star expansion and unqualified
+/// name resolution, and returns the per-source conditions.
+#[cfg(feature = "v04")]
+fn plan_using<E>(
+    from: &[crate::sql::FromSource],
+    arena: &Arena,
+    cur: &mut crate::query::ScopeGroup,
+) -> Result<AVec<Option<RExpr>>, E> {
+    let any_right = from.iter().any(|s| s.kind.pads_left());
+    let mut conds = AVec::new();
+    for (i, s) in from.iter().enumerate() {
+        let mut names: AVec<AVec<u8>> = AVec::new();
+        let mut cond: Option<RExpr> = None;
+        {
+            let (left, right) = cur.sources.as_slice().split_at(i.min(cur.sources.len()));
+            let Some(src) = right.first() else {
+                break;
+            };
+            if s.natural {
+                for (c, _) in src.columns.iter() {
+                    if left.iter().any(|l| l.column_index(c.as_slice()).is_some()) {
+                        names.push(c.clone());
+                    }
+                }
+            } else {
+                for u in s.using.iter() {
+                    names.push(copy_vec(handle_bytes(arena, *u)));
+                }
+            }
+            let missing = Error::Schema {
+                kind: SchemaKind::UsingColumnMissing,
+            };
+            for n in names.iter() {
+                let n = n.as_slice();
+                let Some(rc) = src.column_index(n) else {
+                    return Err(missing);
+                };
+                let rhs = src.column_ref(cur, i, rc);
+                let mut sides = left
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(li, l)| l.column_index(n).map(|ci| (li, l, ci)));
+                let Some((li, l, ci)) = sides.next() else {
+                    return Err(missing);
+                };
+                let mut lhs = l.column_ref(cur, li, ci);
+                if any_right {
+                    let mut all: AVec<RExpr> = AVec::new();
+                    for (li, l, ci) in sides {
+                        if !l.uses(n) {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::AmbiguousColumn,
+                            });
+                        }
+                        if all.is_empty() {
+                            all.push(lhs.clone());
+                        }
+                        all.push(l.column_ref(cur, li, ci));
+                    }
+                    if !all.is_empty() {
+                        lhs = RExpr::Scalar(crate::query::ScalarFn::Coalesce, all);
+                    }
+                }
+                cond = Some(and_expr(
+                    cond,
+                    RExpr::Binary(BinOp::Eq, Box::new(lhs), Box::new(rhs)),
+                ));
+            }
+        }
+        if let Some(src) = cur.sources.as_mut_slice().get_mut(i) {
+            src.using = names;
+        }
+        conds.push(cond);
+    }
+    Ok(conds)
 }
 
 struct InsCol {
@@ -415,7 +537,7 @@ enum Target {
 #[cfg(feature = "v06")]
 type SubCompoundParts = (
     AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)>,
-    AVec<(usize, bool)>,
+    AVec<(usize, crate::sql::SortOrder)>,
 );
 
 /// A planned top-level compound tail plus its resolved
@@ -423,7 +545,7 @@ type SubCompoundParts = (
 #[cfg(feature = "v04")]
 type QueryCompoundParts = (
     AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
-    AVec<(usize, bool)>,
+    AVec<(usize, crate::sql::SortOrder)>,
 );
 
 /// A planned `ON CONFLICT` upsert clause (v0.7). The SET
@@ -814,11 +936,7 @@ impl<S: Storage> Connection<S> {
                     // resolved for step-time evaluation (all rows
                     // evaluated before any insert — see the
                     // `rows_r` plan field).
-                    let cur = crate::query::ScopeGroup {
-                        sources: AVec::new(),
-                        offsets: AVec::new(),
-                        first_src: 0,
-                    };
+                    let cur = crate::query::ScopeGroup::new(AVec::new(), AVec::new(), 0);
                     let mut planner = self.sub_planner(arena);
                     let mut resolved: AVec<AVec<RExpr>> = AVec::new();
                     let mut any_sub = false;
@@ -1112,12 +1230,12 @@ impl<S: Storage> Connection<S> {
             ));
         }
         let mut sources = AVec::new();
-        sources.push(crate::query::SourceDesc {
-            qualifier: copy_vec(qualifier),
-            columns: cols,
-            rowid_alias: t.rowid_alias,
-            has_rowid: true,
-        });
+        sources.push(crate::query::SourceDesc::new(
+            copy_vec(qualifier),
+            cols,
+            t.rowid_alias,
+            true,
+        ));
         let mut offsets = AVec::new();
         offsets.push(0);
         (sources, offsets)
@@ -1191,14 +1309,27 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Resolve one GROUP BY / HAVING / ORDER BY term (v0.4,
-    /// scoped in v0.6): an output ordinal or alias substitutes
-    /// the item expression itself (SQLite's rule); anything else
-    /// resolves as an ordinary expression.
+    /// scoped in v0.6, per-clause rules v0.16 — the pin's
+    /// `resolveOrderGroupBy`):
+    ///
+    /// - ORDER BY / GROUP BY: an integer literal that fits the
+    ///   pin's 32-bit "is integer" test is an output ordinal —
+    ///   outside 1..=items it is an error (it used to sort by a
+    ///   constant silently). HAVING has no ordinals: `HAVING 1`
+    ///   is the constant 1 (it used to read item 1).
+    /// - A bare name equal to an item alias: ORDER BY takes the
+    ///   alias first; GROUP BY and HAVING only when no source
+    ///   of the current scope has a column so named (a real
+    ///   column shadows the alias there — the pin groups
+    ///   `SELECT a+1 AS b ... GROUP BY b` by the column `b`).
+    /// - Anything else resolves as an ordinary expression
+    ///   (under `v16` the scope's aliases are visible inside it).
     #[cfg(feature = "v04")]
     #[allow(clippy::too_many_arguments)]
     fn resolve_term(
         &self,
         e: &Expr,
+        clause: TermClause,
         arena: &Arena,
         items: &[RExpr],
         aliases: &[Option<AVec<u8>>],
@@ -1206,24 +1337,32 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
         planner: crate::query::SubPlanner<'_, S::Error>,
     ) -> Result<RExpr, S::Error> {
-        match e {
-            Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= items.len() => {
-                Ok(items[*n as usize - 1].clone())
-            }
-            Expr::Column { table: None, name } => {
-                let nb = handle_bytes(arena, *name);
-                match aliases
-                    .iter()
-                    .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
-                {
-                    Some(idx) => Ok(items[idx].clone()),
-                    None => {
-                        crate::query::resolve_scoped::<S::Error>(e, arena, cur, enclosing, planner)
-                    }
-                }
-            }
-            _ => crate::query::resolve_scoped::<S::Error>(e, arena, cur, enclosing, planner),
+        if clause != TermClause::Having
+            && let Expr::Literal(Literal::Integer(n)) = e
+            && (-0x7fff_ffff..=0x7fff_ffff).contains(n)
+        {
+            return usize::try_from(*n)
+                .ok()
+                .and_then(|k| k.checked_sub(1))
+                .and_then(|k| items.get(k))
+                .cloned()
+                .ok_or(Error::Schema {
+                    kind: SchemaKind::TermOutOfRange,
+                });
         }
+        if let Expr::Column { table: None, name } = e {
+            let nb = handle_bytes(arena, *name);
+            if let Some(item) = aliases
+                .iter()
+                .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
+                .and_then(|idx| items.get(idx))
+                && (clause == TermClause::Order
+                    || crate::query::resolve_column_in_group::<S::Error>(cur, None, nb).is_none())
+            {
+                return Ok(item.clone());
+            }
+        }
+        crate::query::resolve_scoped::<S::Error>(e, arena, cur, enclosing, planner)
     }
 
     /// Stamp a freshly planned subquery with its node id and
@@ -1255,20 +1394,14 @@ impl<S: Storage> Connection<S> {
         arena: &Arena,
         enclosing: &[crate::query::ScopeGroup],
     ) -> Result<crate::query::SubPlan, S::Error> {
-        use crate::query::{
-            ScopeGroup, SourceDesc, SubPlan, SubSource, has_agg, resolve_scoped, sub_in_agg_args,
-        };
-        let base_width: usize = enclosing.iter().map(|g| g.width()).sum();
-        let base_src: usize = enclosing.iter().map(|g| g.sources.len()).sum();
+        use crate::query::SubPlan;
+        let (base_width, base_src) = crate::query::ScopeGroup::stack_end(enclosing);
         // A VALUES core (v0.9): no sources of its own; the rows
         // resolve against the enclosing scopes alone.
         #[cfg(feature = "v09")]
         if !stmt.values.is_empty() {
-            let cur = ScopeGroup {
-                sources: AVec::new(),
-                offsets: AVec::new(),
-                first_src: base_src,
-            };
+            use crate::query::{ScopeGroup, has_agg, resolve_scoped};
+            let cur = ScopeGroup::new(AVec::new(), AVec::new(), base_src);
             let mut planner = self.sub_planner(arena);
             let mut rows_r: AVec<AVec<RExpr>> = AVec::new();
             let mut width: Option<usize> = None;
@@ -1315,8 +1448,8 @@ impl<S: Storage> Connection<S> {
                 having: None,
                 order_by: AVec::new(),
                 distinct: false,
-                limit: stmt.limit,
-                offset: stmt.offset,
+                limit: self.plan_limit(stmt.limit.as_deref(), arena)?,
+                offset: self.plan_limit(stmt.offset.as_deref(), arena)?,
                 has_agg: false,
                 compound,
                 values: rows_r,
@@ -1330,275 +1463,38 @@ impl<S: Storage> Connection<S> {
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok(plan);
         }
-        let mut descs: AVec<SourceDesc> = AVec::new();
-        let mut offsets: AVec<usize> = AVec::new();
-        let mut subs: AVec<SubSource> = AVec::new();
-        let mut total = base_width;
-        for s in stmt.from.iter() {
-            // A derived table (v0.9): planned against the
-            // enclosing scopes ONLY — the pin has no LATERAL, so
-            // the subquery cannot see its sibling sources, but
-            // correlation with enclosing queries works.
-            #[cfg(feature = "v09")]
-            {
-                if let Some(d) = &s.derived {
-                    let dplan = self.plan_subquery(d, arena, enclosing)?;
-                    let w = dplan.width();
-                    offsets.push(total);
-                    let mut cols = AVec::new();
-                    let mut affs = AVec::new();
-                    let mut defaults = AVec::new();
-                    for (nm, aff) in dplan.result_names.iter().zip(dplan.result_affs.iter()) {
-                        cols.push((nm.clone(), aff.unwrap_or(crate::record::Affinity::Blob)));
-                        affs.push(crate::record::Affinity::Blob);
-                        defaults.push(OwnedValue::Null);
-                    }
-                    let qual = match s.alias {
-                        Some(a) => copy_vec(handle_bytes(arena, a)),
-                        None => AVec::new(),
-                    };
-                    descs.push(SourceDesc {
-                        qualifier: qual,
-                        columns: cols,
-                        rowid_alias: None,
-                        has_rowid: false,
-                    });
-                    subs.push(SubSource {
-                        root: 0,
-                        kind: s.kind,
-                        on: None,
-                        rowid_alias: None,
-                        ncols: w,
-                        affs,
-                        defaults,
-                        derived: Some(Box::new(dplan)),
-                    });
-                    total += w;
-                    continue;
-                }
-            }
-            let tname = handle_bytes(arena, s.table);
-            let t = match self.catalog.find(&self.catalog_arena, tname) {
-                Some(t) => t,
-                None => {
-                    if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
-                        // Views are inert (SPEC §2): a subquery
-                        // cannot select from one either.
-                        return Err(Error::Unsupported);
-                    }
-                    return Err(Error::Schema {
-                        kind: SchemaKind::UnknownTable,
-                    });
-                }
-            };
-            offsets.push(total);
-            let mut cols = AVec::new();
-            let mut affs = AVec::new();
-            let mut defaults = AVec::new();
-            for c in t.columns.iter() {
-                let mut nm = AVec::new();
-                nm.extend_from_slice(handle_bytes(&self.catalog_arena, c.name));
-                cols.push((nm, c.affinity));
-                affs.push(c.affinity);
-                defaults.push(literal_owned(&self.catalog_arena, c.default));
-            }
-            let qual = match s.alias {
-                Some(a) => copy_vec(handle_bytes(arena, a)),
-                None => copy_vec(tname),
-            };
-            descs.push(SourceDesc {
-                qualifier: qual,
-                columns: cols,
-                rowid_alias: t.rowid_alias,
-                has_rowid: true,
-            });
-            subs.push(SubSource {
-                root: t.root,
-                kind: s.kind,
-                on: None,
-                rowid_alias: t.rowid_alias,
-                ncols: t.columns.len(),
-                affs,
-                defaults,
-                derived: None,
-            });
-            total += t.columns.len();
-        }
-        let cur = ScopeGroup {
-            sources: descs,
-            offsets,
-            first_src: base_src,
-        };
-        let mut planner = self.sub_planner(arena);
-        let filter = match &stmt.filter {
-            None => None,
-            Some(e) => {
-                let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
-                if has_agg(&r) {
-                    return Err(Error::Unsupported);
-                }
-                Some(r)
-            }
-        };
-        for (i, s) in stmt.from.iter().enumerate() {
-            if let Some(on) = &s.on {
-                let r = resolve_scoped::<S::Error>(on, arena, &cur, enclosing, &mut planner)?;
-                if has_agg(&r) {
-                    return Err(Error::Unsupported);
-                }
-                subs.as_mut_slice()[i].on = Some(r);
-            }
-        }
-        let mut items: AVec<RExpr> = AVec::new();
-        let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
-        let mut result_names: AVec<AVec<u8>> = AVec::new();
-        let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
-        let mut order_names: AVec<crate::query::OrderName> = AVec::new();
-        for it in stmt.items.iter() {
-            match it {
-                SelectItem::Star => {
-                    for (si, src) in cur.sources.iter().enumerate() {
-                        for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-                            items.push(if Some(ci) == src.rowid_alias {
-                                RExpr::Rowid(cur.first_src + si)
-                            } else {
-                                RExpr::Column(cur.offsets.as_slice()[si] + ci, *aff)
-                            });
-                            item_aliases.push(None);
-                            result_names.push(cname.clone());
-                            result_affs.push(Some(if Some(ci) == src.rowid_alias {
-                                crate::record::Affinity::Integer
-                            } else {
-                                *aff
-                            }));
-                            order_names.push((Some(src.qualifier.clone()), cname.clone()));
-                        }
-                    }
-                }
-                SelectItem::TableStar(q) => {
-                    let qb = handle_bytes(arena, *q);
-                    let mut hit = false;
-                    for (si, src) in cur.sources.iter().enumerate() {
-                        if eq_ci(src.qualifier.as_slice(), qb) {
-                            hit = true;
-                            for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-                                items.push(if Some(ci) == src.rowid_alias {
-                                    RExpr::Rowid(cur.first_src + si)
-                                } else {
-                                    RExpr::Column(cur.offsets.as_slice()[si] + ci, *aff)
-                                });
-                                item_aliases.push(None);
-                                result_names.push(cname.clone());
-                                result_affs.push(Some(if Some(ci) == src.rowid_alias {
-                                    crate::record::Affinity::Integer
-                                } else {
-                                    *aff
-                                }));
-                                order_names.push((Some(src.qualifier.clone()), cname.clone()));
-                            }
-                        }
-                    }
-                    if !hit {
-                        return Err(Error::Schema {
-                            kind: SchemaKind::UnknownColumn,
-                        });
-                    }
-                }
-                SelectItem::Expr(e, alias, text) => {
-                    let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
-                    let (nm, okey) = item_name_keys(arena, e, alias, text, &cur);
-                    result_names.push(nm);
-                    order_names.push(okey);
-                    result_affs.push(crate::query::item_result_affinity(&r));
-                    items.push(r);
-                    item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
-                }
-            }
-        }
-        let mut group_by = AVec::new();
-        for e in stmt.group_by.iter() {
-            group_by.push(self.resolve_term(
-                e,
-                arena,
-                items.as_slice(),
-                item_aliases.as_slice(),
-                &cur,
-                enclosing,
-                &mut planner,
-            )?);
-        }
-        let having = match &stmt.having {
-            None => None,
-            Some(e) => Some(self.resolve_term(
-                e,
-                arena,
-                items.as_slice(),
-                item_aliases.as_slice(),
-                &cur,
-                enclosing,
-                &mut planner,
-            )?),
-        };
-        // A compound head's ORDER BY resolves against the
-        // combined result (comp_order, below), not this core's
-        // rows, so the term loop is skipped for it.
-        #[cfg(feature = "v09")]
-        let compound_head = !stmt.compound.is_empty();
-        #[cfg(not(feature = "v09"))]
-        let compound_head = false;
-        let mut order_by: AVec<(RExpr, bool)> = AVec::new();
-        if !compound_head {
-            for (e, desc) in stmt.order_by.iter() {
-                order_by.push((
-                    self.resolve_term(
-                        e,
-                        arena,
-                        items.as_slice(),
-                        item_aliases.as_slice(),
-                        &cur,
-                        enclosing,
-                        &mut planner,
-                    )?,
-                    *desc,
-                ));
-            }
-        }
-        if cfg!(not(feature = "v10"))
-            && (items.iter().any(sub_in_agg_args)
-                || having.as_ref().is_some_and(sub_in_agg_args)
-                || order_by.iter().any(|(e, _)| sub_in_agg_args(e)))
-        {
-            return Err(Error::Unsupported);
-        }
-        let has_agg = !group_by.is_empty()
-            || items.iter().any(has_agg)
-            || having.as_ref().is_some_and(has_agg)
-            || order_by.iter().any(|(e, _)| has_agg(e));
+        let core = self.plan_core(stmt, arena, enclosing)?;
         #[cfg(feature = "v09")]
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
-            self.plan_sub_compound(stmt, arena, enclosing, order_names.as_slice(), items.len())?
+            self.plan_sub_compound(
+                stmt,
+                arena,
+                enclosing,
+                core.order_names.as_slice(),
+                core.items.len(),
+            )?
         };
         #[cfg(not(feature = "v09"))]
         let (compound, comp_order): SubCompoundParts = (AVec::new(), AVec::new());
         let mut plan = SubPlan {
-            sources: subs,
-            items,
-            filter,
-            group_by,
-            having,
-            order_by,
+            sources: core.sources,
+            items: core.items,
+            filter: core.filter,
+            group_by: core.group_by,
+            having: core.having,
+            order_by: core.order_by,
             distinct: stmt.distinct,
-            limit: stmt.limit,
-            offset: stmt.offset,
-            has_agg,
+            limit: core.limit,
+            offset: core.offset,
+            has_agg: core.has_agg,
             compound,
             values: AVec::new(),
             comp_order,
-            result_names,
-            result_affs,
-            order_names,
+            result_names: core.result_names,
+            result_affs: core.result_affs,
+            order_names: core.order_names,
             id: 0,
             uncorrelated: false,
         };
@@ -1695,11 +1591,7 @@ impl<S: Storage> Connection<S> {
     ) -> Result<AVec<RExpr>, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
         let (sources, offsets) = self.single_source(t, qualifier);
-        let cur = crate::query::ScopeGroup {
-            sources,
-            offsets,
-            first_src: 0,
-        };
+        let cur = crate::query::ScopeGroup::new(sources, offsets, 0);
         let mut planner = self.sub_planner(arena);
         let mut out = AVec::new();
         for it in items.iter() {
@@ -1763,11 +1655,7 @@ impl<S: Storage> Connection<S> {
             // INDEX ... WHERE is refused), so resolve for
             // validation and then drop the predicate.
             let (sources, offsets) = self.single_source(t, tname);
-            let cur = ScopeGroup {
-                sources,
-                offsets,
-                first_src: 0,
-            };
+            let cur = ScopeGroup::new(sources, offsets, 0);
             let mut planner = self.sub_planner(arena);
             let r = resolve_scoped::<S::Error>(tf, arena, &cur, &[], &mut planner)?;
             if has_agg(&r) {
@@ -1832,11 +1720,7 @@ impl<S: Storage> Connection<S> {
                 // enclosing group under the qualifier `excluded`,
                 // reached by qualified references only.
                 let (sources, offsets) = self.single_source(t, tname);
-                let cur = ScopeGroup {
-                    sources,
-                    offsets,
-                    first_src: 0,
-                };
+                let cur = ScopeGroup::new(sources, offsets, 0);
                 let mut ex_cols = AVec::new();
                 for c in t.columns.iter() {
                     ex_cols.push((
@@ -1845,19 +1729,15 @@ impl<S: Storage> Connection<S> {
                     ));
                 }
                 let mut ex_sources = AVec::new();
-                ex_sources.push(SourceDesc {
-                    qualifier: copy_vec(b"excluded"),
-                    columns: ex_cols,
-                    rowid_alias: t.rowid_alias,
-                    has_rowid: true,
-                });
+                ex_sources.push(SourceDesc::new(
+                    copy_vec(b"excluded"),
+                    ex_cols,
+                    t.rowid_alias,
+                    true,
+                ));
                 let mut ex_offsets = AVec::new();
                 ex_offsets.push(t.columns.len());
-                let enclosing = [ScopeGroup {
-                    sources: ex_sources,
-                    offsets: ex_offsets,
-                    first_src: 1,
-                }];
+                let enclosing = [ScopeGroup::new(ex_sources, ex_offsets, 1)];
                 let mut planner = self.sub_planner(arena);
                 let mut sets = AVec::new();
                 for (colname, e) in assignments.iter() {
@@ -1930,113 +1810,43 @@ impl<S: Storage> Connection<S> {
         };
         // Combined scope: target first, then the FROM sources
         // (empty without the v07 parser, which never fills
-        // `from`); SourcePlans are kept for the executor.
+        // `from`); SourcePlans are kept for the executor. The
+        // FROM clause is its own join (v0.16, as on the pin,
+        // which plans it like a subquery): its USING / NATURAL
+        // columns and ON clauses see only the FROM sources —
+        // `... FROM a JOIN b ON t.id = b.y` is "no such column"
+        // there — and a RIGHT / FULL join's unmatched rows
+        // NULL-pad the FROM sources only, never the target.
         let (mut sources, mut offsets) = self.single_source(t, qualifier);
         let mut from_plans: AVec<SourcePlan> = AVec::new();
-        let mut total = t.columns.len();
-        for s in from.iter() {
-            // A derived table in UPDATE ... FROM (v0.9):
-            // planned as a subquery against no enclosing scope
-            // (it cannot see the target table — no LATERAL).
-            #[cfg(feature = "v09")]
-            {
-                if let Some(d) = &s.derived {
-                    let dplan = self.plan_subquery(d, arena, &[])?;
-                    let w = dplan.width();
-                    offsets.push(total);
-                    let mut cols = AVec::new();
-                    let mut affs = AVec::new();
-                    let mut defaults = AVec::new();
-                    for (nm, aff) in dplan.result_names.iter().zip(dplan.result_affs.iter()) {
-                        cols.push((nm.clone(), aff.unwrap_or(crate::record::Affinity::Blob)));
-                        affs.push(crate::record::Affinity::Blob);
-                        defaults.push(OwnedValue::Null);
-                    }
-                    let qual = match s.alias {
-                        Some(a) => copy_vec(handle_bytes(arena, a)),
-                        None => AVec::new(),
-                    };
-                    sources.push(crate::query::SourceDesc {
-                        qualifier: qual,
-                        columns: cols,
-                        rowid_alias: None,
-                        has_rowid: false,
-                    });
-                    from_plans.push(SourcePlan {
-                        root: 0,
-                        kind: s.kind,
-                        on: None,
-                        rowid_alias: None,
-                        ncols: w,
-                        affs,
-                        defaults,
-                        derived: Some(Box::new(dplan)),
-                    });
-                    total += w;
-                    continue;
-                }
-            }
-            let fname = handle_bytes(arena, s.table);
-            let ft = match self.catalog.find(&self.catalog_arena, fname) {
-                Some(ft) => ft,
-                None => {
-                    if self.catalog.find_view(&self.catalog_arena, fname).is_some() {
-                        return Err(Error::Unsupported);
-                    }
-                    return Err(Error::Schema {
-                        kind: SchemaKind::UnknownTable,
-                    });
-                }
-            };
-            offsets.push(total);
-            let mut cols = AVec::new();
-            let mut affs = AVec::new();
-            let mut defaults = AVec::new();
-            for c in ft.columns.iter() {
-                cols.push((
-                    copy_vec(handle_bytes(&self.catalog_arena, c.name)),
-                    c.affinity,
-                ));
-                affs.push(c.affinity);
-                defaults.push(literal_owned(&self.catalog_arena, c.default));
-            }
-            let qual = match s.alias {
-                Some(a) => copy_vec(handle_bytes(arena, a)),
-                None => copy_vec(fname),
-            };
-            sources.push(crate::query::SourceDesc {
-                qualifier: qual,
-                columns: cols,
-                rowid_alias: ft.rowid_alias,
-                has_rowid: true,
-            });
-            from_plans.push(SourcePlan {
-                root: ft.root,
-                kind: s.kind,
-                on: None,
-                rowid_alias: ft.rowid_alias,
-                ncols: ft.columns.len(),
-                affs,
-                defaults,
-                derived: None,
-            });
-            total += ft.columns.len();
-        }
-        let cur = crate::query::ScopeGroup {
-            sources,
-            offsets,
-            first_src: 0,
-        };
+        let mut fdescs = AVec::new();
+        let mut foffsets = AVec::new();
+        self.plan_from(
+            from.as_slice(),
+            arena,
+            &[],
+            t.columns.len(),
+            &mut fdescs,
+            &mut foffsets,
+            &mut from_plans,
+        )?;
+        let mut fscope = crate::query::ScopeGroup::new(fdescs, foffsets, 1);
+        let using = plan_using::<S::Error>(from.as_slice(), arena, &mut fscope)?;
         let mut planner = self.sub_planner(arena);
-        for (i, s) in from.iter().enumerate() {
-            if let Some(on) = &s.on {
-                let r = resolve_scoped::<S::Error>(on, arena, &cur, &[], &mut planner)?;
-                if has_agg(&r) {
-                    return Err(Error::Unsupported);
-                }
-                from_plans.as_mut_slice()[i].on = Some(r);
-            }
+        let hoisted = self.plan_on(
+            from.as_slice(),
+            arena,
+            &fscope,
+            &[],
+            from_plans.as_mut_slice(),
+            using,
+            &mut planner,
+        )?;
+        for (d, o) in fscope.sources.iter().zip(fscope.offsets.iter()) {
+            sources.push(d.clone());
+            offsets.push(*o);
         }
+        let cur = crate::query::ScopeGroup::new(sources, offsets, 0);
         let mut sets = AVec::new();
         for (colname, e) in assignments.iter() {
             let target = self.resolve_target(t, handle_bytes(arena, *colname))?;
@@ -2047,13 +1857,13 @@ impl<S: Storage> Connection<S> {
             sets.push((target, r));
         }
         let filter = match filter {
-            None => None,
+            None => hoisted,
             Some(e) => {
                 let r = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
                 if has_agg(&r) {
                     return Err(Error::Unsupported);
                 }
-                Some(r)
+                Some(and_expr(hoisted, r))
             }
         };
         let mut defaults = AVec::new();
@@ -2100,11 +1910,7 @@ impl<S: Storage> Connection<S> {
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
         let (sources, offsets) = self.single_source(t, tname);
-        let cur = crate::query::ScopeGroup {
-            sources,
-            offsets,
-            first_src: 0,
-        };
+        let cur = crate::query::ScopeGroup::new(sources, offsets, 0);
         let mut planner = self.sub_planner(arena);
         let filter = match filter {
             None => None,
@@ -2297,16 +2103,11 @@ impl<S: Storage> Connection<S> {
     /// against the FROM sources once, at prepare time.
     #[cfg(feature = "v04")]
     fn plan_query(&self, stmt: &SelectStmt, arena: &Arena) -> Result<QueryPlan, S::Error> {
-        use crate::query::{SourceDesc, has_agg, resolve_scoped, sub_in_agg_args};
         // A VALUES core (v0.9): no sources; rows resolve
         // against the empty scope.
         #[cfg(feature = "v09")]
         if !stmt.values.is_empty() {
-            let cur = crate::query::ScopeGroup {
-                sources: AVec::new(),
-                offsets: AVec::new(),
-                first_src: 0,
-            };
+            let cur = crate::query::ScopeGroup::new(AVec::new(), AVec::new(), 0);
             let mut planner = self.sub_planner(arena);
             let mut rows_r: AVec<AVec<RExpr>> = AVec::new();
             let mut width: Option<usize> = None;
@@ -2322,8 +2123,14 @@ impl<S: Storage> Connection<S> {
                 }
                 let mut rr = AVec::new();
                 for e in r.iter() {
-                    let re = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
-                    if has_agg(&re) {
+                    let re = crate::query::resolve_scoped::<S::Error>(
+                        e,
+                        arena,
+                        &cur,
+                        &[],
+                        &mut planner,
+                    )?;
+                    if crate::query::has_agg(&re) {
                         return Err(Error::Unsupported);
                     }
                     rr.push(re);
@@ -2348,8 +2155,8 @@ impl<S: Storage> Connection<S> {
                 having: None,
                 order_by: AVec::new(),
                 distinct: false,
-                limit: stmt.limit,
-                offset: stmt.offset,
+                limit: self.plan_limit(stmt.limit.as_deref(), arena)?,
+                offset: self.plan_limit(stmt.offset.as_deref(), arena)?,
                 has_agg: false,
                 width,
                 compound,
@@ -2358,59 +2165,299 @@ impl<S: Storage> Connection<S> {
                 order_names,
             });
         }
-        let mut sources: AVec<SourceDesc> = AVec::new();
-        let mut offsets: AVec<usize> = AVec::new();
-        let mut src_plans: AVec<SourcePlan> = AVec::new();
-        let mut total = 0usize;
-        for s in stmt.from.iter() {
-            // A derived table (v0.9): planned as a subquery
-            // against no enclosing scope (a statement-level
-            // FROM subquery sees no siblings — no LATERAL).
-            #[cfg(feature = "v09")]
-            {
-                if let Some(d) = &s.derived {
-                    let dplan = self.plan_subquery(d, arena, &[])?;
-                    let w = dplan.width();
-                    offsets.push(total);
-                    let mut cols = AVec::new();
-                    let mut affs = AVec::new();
-                    let mut defaults = AVec::new();
-                    for (nm, aff) in dplan.result_names.iter().zip(dplan.result_affs.iter()) {
-                        cols.push((nm.clone(), aff.unwrap_or(crate::record::Affinity::Blob)));
-                        affs.push(crate::record::Affinity::Blob);
-                        defaults.push(OwnedValue::Null);
-                    }
-                    let qual = match s.alias {
-                        Some(a) => copy_vec(handle_bytes(arena, a)),
-                        None => AVec::new(),
-                    };
-                    sources.push(SourceDesc {
-                        qualifier: qual,
-                        columns: cols,
-                        rowid_alias: None,
-                        has_rowid: false,
-                    });
-                    src_plans.push(SourcePlan {
-                        root: 0,
-                        kind: s.kind,
-                        on: None,
-                        rowid_alias: None,
-                        ncols: w,
-                        affs,
-                        defaults,
-                        derived: Some(Box::new(dplan)),
-                    });
-                    total += w;
+        let core = self.plan_core(stmt, arena, &[])?;
+        let width = core.items.len();
+        #[cfg(feature = "v09")]
+        let (compound, comp_order) = if stmt.compound.is_empty() {
+            (AVec::new(), AVec::new())
+        } else {
+            self.plan_query_compound(stmt, arena, core.order_names.as_slice(), width)?
+        };
+        #[cfg(not(feature = "v09"))]
+        let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
+        Ok(QueryPlan {
+            sources: core.sources,
+            items: core.items,
+            filter: core.filter,
+            group_by: core.group_by,
+            having: core.having,
+            order_by: core.order_by,
+            distinct: stmt.distinct,
+            limit: core.limit,
+            offset: core.offset,
+            has_agg: core.has_agg,
+            width,
+            compound,
+            values: AVec::new(),
+            comp_order,
+            order_names: core.order_names,
+        })
+    }
+
+    /// The shared core planner (v0.16: the common body of
+    /// `plan_query` and `plan_subquery`, formerly duplicated):
+    /// FROM sources and their join constraints, result items,
+    /// WHERE, GROUP BY, HAVING, ORDER BY and LIMIT / OFFSET of
+    /// one SELECT core. The core's sources are numbered after
+    /// every slot / source of `enclosing` (nearest first);
+    /// derived tables plan against `enclosing` only — SQLite has
+    /// no LATERAL, so a FROM subquery never sees its siblings.
+    #[cfg(feature = "v04")]
+    fn plan_core(
+        &self,
+        stmt: &SelectStmt,
+        arena: &Arena,
+        enclosing: &[crate::query::ScopeGroup],
+    ) -> Result<CorePlan, S::Error> {
+        use crate::query::{ScopeGroup, has_agg, item_result_affinity, resolve_scoped};
+        let (base_width, base_src) = ScopeGroup::stack_end(enclosing);
+        let mut descs = AVec::new();
+        let mut offsets = AVec::new();
+        let mut sources: AVec<SourcePlan> = AVec::new();
+        self.plan_from(
+            stmt.from.as_slice(),
+            arena,
+            enclosing,
+            base_width,
+            &mut descs,
+            &mut offsets,
+            &mut sources,
+        )?;
+        let mut cur = ScopeGroup::new(descs, offsets, base_src);
+        let using = plan_using::<S::Error>(stmt.from.as_slice(), arena, &mut cur)?;
+        let mut planner = self.sub_planner(arena);
+        // Items, with star expansion (USING-aware, v0.16);
+        // aliases are remembered for term resolution.
+        let mut items: AVec<RExpr> = AVec::new();
+        let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
+        let mut result_names: AVec<AVec<u8>> = AVec::new();
+        let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
+        let mut order_names: AVec<crate::query::OrderName> = AVec::new();
+        for it in stmt.items.iter() {
+            let qual = match it {
+                SelectItem::Expr(e, alias, text) => {
+                    let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
+                    let (nm, okey) = item_name_keys(arena, e, alias, text, &cur);
+                    result_names.push(nm);
+                    order_names.push(okey);
+                    result_affs.push(item_result_affinity(&r));
+                    items.push(r);
+                    item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
                     continue;
                 }
+                SelectItem::Star => None,
+                SelectItem::TableStar(q) => Some(handle_bytes(arena, *q)),
+            };
+            let mut expanded = AVec::new();
+            let hit = crate::query::expand_star::<S::Error>(&cur, qual, &mut expanded)?;
+            if !hit && qual.is_some() {
+                return Err(Error::Schema {
+                    kind: SchemaKind::UnknownColumn,
+                });
+            }
+            for (r, nm, okey) in expanded.iter() {
+                result_affs.push(item_result_affinity(r));
+                items.push(r.clone());
+                item_aliases.push(None);
+                result_names.push(nm.clone());
+                order_names.push(okey.clone());
+            }
+        }
+        // The pin's "HAVING clause on a non-aggregate query":
+        // HAVING needs a GROUP BY or an aggregate in the result
+        // list (aggregates elsewhere do not count).
+        if stmt.having.is_some() && stmt.group_by.is_empty() && !items.iter().any(has_agg) {
+            return Err(Error::Schema {
+                kind: SchemaKind::HavingWithoutAggregate,
+            });
+        }
+        // v16: result-column aliases become visible to every
+        // clause resolved below (and to subqueries inside them),
+        // after the current scope's own columns (the pin's
+        // `lookupName` order). The result list above never sees
+        // them — there an alias is "no such column" on the pin.
+        #[cfg(feature = "v16")]
+        for (a, r) in item_aliases.iter().zip(items.iter()) {
+            if let Some(a) = a {
+                cur.aliases.push((a.clone(), r.clone()));
+            }
+        }
+        let hoisted = self.plan_on(
+            stmt.from.as_slice(),
+            arena,
+            &cur,
+            enclosing,
+            sources.as_mut_slice(),
+            using,
+            &mut planner,
+        )?;
+        let filter = match &stmt.filter {
+            None => hoisted,
+            Some(e) => {
+                let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                Some(and_expr(hoisted, r))
+            }
+        };
+        // GROUP BY / HAVING / ORDER BY terms: an output ordinal
+        // or alias substitutes the item expression itself
+        // (SQLite's rule, per clause — see `resolve_term`), so
+        // evaluation never needs an output-row context.
+        let mut group_by = AVec::new();
+        for e in stmt.group_by.iter() {
+            let r = self.resolve_term(
+                e,
+                TermClause::Group,
+                arena,
+                items.as_slice(),
+                item_aliases.as_slice(),
+                &cur,
+                enclosing,
+                &mut planner,
+            )?;
+            // The pin: "aggregate functions are not allowed in
+            // the GROUP BY clause" (directly, or through an
+            // ordinal / alias naming an aggregate item).
+            if has_agg(&r) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::MisusedAggregate,
+                });
+            }
+            group_by.push(r);
+        }
+        let having = match &stmt.having {
+            None => None,
+            Some(e) => Some(self.resolve_term(
+                e,
+                TermClause::Having,
+                arena,
+                items.as_slice(),
+                item_aliases.as_slice(),
+                &cur,
+                enclosing,
+                &mut planner,
+            )?),
+        };
+        // A compound head's ORDER BY resolves against the
+        // combined result (comp_order), not this core's rows,
+        // so the term loop is skipped for it.
+        let mut order_by: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+        if stmt.compound.is_empty() {
+            for (e, dir) in stmt.order_by.iter() {
+                order_by.push((
+                    self.resolve_term(
+                        e,
+                        TermClause::Order,
+                        arena,
+                        items.as_slice(),
+                        item_aliases.as_slice(),
+                        &cur,
+                        enclosing,
+                        &mut planner,
+                    )?,
+                    *dir,
+                ));
+            }
+        }
+        // A subquery inside an aggregate's arguments needs
+        // per-group-row execution (v0.11, the `v10` feature);
+        // without it the plan is refused, as in v0.6.
+        if cfg!(not(feature = "v10"))
+            && (items.iter().any(crate::query::sub_in_agg_args)
+                || having.as_ref().is_some_and(crate::query::sub_in_agg_args)
+                || order_by
+                    .iter()
+                    .any(|(e, _)| crate::query::sub_in_agg_args(e)))
+        {
+            return Err(Error::Unsupported);
+        }
+        let has_agg = !group_by.is_empty()
+            || items.iter().any(has_agg)
+            || having.as_ref().is_some_and(has_agg)
+            || order_by.iter().any(|(e, _)| has_agg(e));
+        Ok(CorePlan {
+            sources,
+            items,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit: self.plan_limit(stmt.limit.as_deref(), arena)?,
+            offset: self.plan_limit(stmt.offset.as_deref(), arena)?,
+            has_agg,
+            result_names,
+            result_affs,
+            order_names,
+        })
+    }
+
+    /// Plan a FROM clause's sources (v0.4; one helper for
+    /// SELECT cores, subqueries and UPDATE ... FROM since
+    /// v0.16): each table or derived table gets its resolution
+    /// description (qualifier, columns, join kind), its absolute
+    /// first slot (counting from `total`), and its executor
+    /// plan. Join constraints are resolved later
+    /// (`plan_using`, `plan_on`) once the whole scope exists.
+    #[cfg(feature = "v04")]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_from(
+        &self,
+        from: &[crate::sql::FromSource],
+        arena: &Arena,
+        derived_scope: &[crate::query::ScopeGroup],
+        mut total: usize,
+        descs: &mut AVec<crate::query::SourceDesc>,
+        offsets: &mut AVec<usize>,
+        plans: &mut AVec<SourcePlan>,
+    ) -> Result<(), S::Error> {
+        use crate::query::SourceDesc;
+        #[cfg(not(feature = "v09"))]
+        let _ = derived_scope;
+        for s in from.iter() {
+            offsets.push(total);
+            // A derived table (v0.9): planned as a subquery
+            // against `derived_scope` only (no LATERAL).
+            #[cfg(feature = "v09")]
+            if let Some(d) = &s.derived {
+                let dplan = self.plan_subquery(d, arena, derived_scope)?;
+                let w = dplan.width();
+                let mut cols = AVec::new();
+                let mut affs = AVec::new();
+                let mut defaults = AVec::new();
+                for (nm, aff) in dplan.result_names.iter().zip(dplan.result_affs.iter()) {
+                    cols.push((nm.clone(), aff.unwrap_or(crate::record::Affinity::Blob)));
+                    affs.push(crate::record::Affinity::Blob);
+                    defaults.push(OwnedValue::Null);
+                }
+                let qual = match s.alias {
+                    Some(a) => copy_vec(handle_bytes(arena, a)),
+                    None => AVec::new(),
+                };
+                let mut desc = SourceDesc::new(qual, cols, None, false);
+                desc.kind = s.kind;
+                descs.push(desc);
+                plans.push(SourcePlan {
+                    root: 0,
+                    kind: s.kind,
+                    on: None,
+                    rowid_alias: None,
+                    ncols: w,
+                    affs,
+                    defaults,
+                    derived: Some(Box::new(dplan)),
+                });
+                total += w;
+                continue;
             }
             let tname = handle_bytes(arena, s.table);
             let t = match self.catalog.find(&self.catalog_arena, tname) {
                 Some(t) => t,
                 None => {
                     if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
-                        // Views are inert in v0.4 (SPEC §2):
-                        // stored, never executed.
+                        // Views are inert (SPEC §2): stored,
+                        // never executed.
                         return Err(Error::Unsupported);
                     }
                     return Err(Error::Schema {
@@ -2418,14 +2465,14 @@ impl<S: Storage> Connection<S> {
                     });
                 }
             };
-            offsets.push(total);
             let mut cols = AVec::new();
             let mut affs = AVec::new();
             let mut defaults = AVec::new();
             for c in t.columns.iter() {
-                let mut nm = AVec::new();
-                nm.extend_from_slice(handle_bytes(&self.catalog_arena, c.name));
-                cols.push((nm, c.affinity));
+                cols.push((
+                    copy_vec(handle_bytes(&self.catalog_arena, c.name)),
+                    c.affinity,
+                ));
                 affs.push(c.affinity);
                 defaults.push(literal_owned(&self.catalog_arena, c.default));
             }
@@ -2433,13 +2480,10 @@ impl<S: Storage> Connection<S> {
                 Some(a) => copy_vec(handle_bytes(arena, a)),
                 None => copy_vec(tname),
             };
-            sources.push(SourceDesc {
-                qualifier: qual,
-                columns: cols,
-                rowid_alias: t.rowid_alias,
-                has_rowid: true,
-            });
-            src_plans.push(SourcePlan {
+            let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, true);
+            desc.kind = s.kind;
+            descs.push(desc);
+            plans.push(SourcePlan {
                 root: t.root,
                 kind: s.kind,
                 on: None,
@@ -2451,182 +2495,87 @@ impl<S: Storage> Connection<S> {
             });
             total += t.columns.len();
         }
-        let cur = crate::query::ScopeGroup {
-            sources: sources.clone(),
-            offsets: offsets.clone(),
-            first_src: 0,
-        };
-        let mut planner = self.sub_planner(arena);
-        let filter = match &stmt.filter {
-            None => None,
-            Some(e) => {
-                let r = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
-                if has_agg(&r) {
-                    return Err(Error::Unsupported);
-                }
-                Some(r)
-            }
-        };
-        for (i, s) in stmt.from.iter().enumerate() {
+        Ok(())
+    }
+
+    /// Resolve each joined source's ON clause (v0.16) and fold
+    /// it — or the USING / NATURAL equalities `plan_using`
+    /// built — into the source's executor `on`. An ON term that
+    /// references a source joined LATER follows the pin: on an
+    /// outer join (LEFT / RIGHT / FULL), or anywhere once the
+    /// FROM clause has a RIGHT / FULL join, it is an error;
+    /// otherwise (an inner join's ON) it is hoisted into WHERE —
+    /// the returned conjunction — exactly as SQLite moves it,
+    /// which for an inner join changes no result.
+    #[cfg(feature = "v04")]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_on(
+        &self,
+        from: &[crate::sql::FromSource],
+        arena: &Arena,
+        cur: &crate::query::ScopeGroup,
+        enclosing: &[crate::query::ScopeGroup],
+        plans: &mut [SourcePlan],
+        using: AVec<Option<RExpr>>,
+        planner: crate::query::SubPlanner<'_, S::Error>,
+    ) -> Result<Option<RExpr>, S::Error> {
+        use crate::query::{RefRange, expr_refs_range, has_agg, resolve_scoped};
+        let any_right = from.iter().any(|s| s.kind.pads_left());
+        let n = cur.sources.len();
+        let end = cur.offsets.as_slice().last().copied().unwrap_or(0)
+            + cur.sources.as_slice().last().map_or(0, |s| s.columns.len());
+        let mut hoisted = None;
+        let mut using = using.as_slice().iter();
+        for (i, (s, plan)) in from.iter().zip(plans.iter_mut()).enumerate() {
+            let mut cond = using.next().cloned().flatten();
             if let Some(on) = &s.on {
-                let r = resolve_scoped::<S::Error>(on, arena, &cur, &[], &mut planner)?;
+                let r = resolve_scoped::<S::Error>(on, arena, cur, enclosing, &mut *planner)?;
                 if has_agg(&r) {
                     return Err(Error::Unsupported);
                 }
-                src_plans.as_mut_slice()[i].on = Some(r);
-            }
-        }
-        // Items, with star expansion; aliases are remembered for
-        // ORDER BY resolution.
-        let mut items: AVec<RExpr> = AVec::new();
-        let mut item_aliases: AVec<Option<AVec<u8>>> = AVec::new();
-        let mut order_names: AVec<crate::query::OrderName> = AVec::new();
-        for it in stmt.items.iter() {
-            match it {
-                SelectItem::Star => {
-                    for (si, src) in sources.iter().enumerate() {
-                        for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-                            items.push(if Some(ci) == src.rowid_alias {
-                                RExpr::Rowid(si)
-                            } else {
-                                RExpr::Column(offsets.as_slice()[si] + ci, *aff)
-                            });
-                            item_aliases.push(None);
-                            order_names.push((Some(src.qualifier.clone()), cname.clone()));
-                            let _ = aff;
-                        }
-                    }
-                }
-                SelectItem::TableStar(q) => {
-                    let qb = handle_bytes(arena, *q);
-                    let mut hit = false;
-                    for (si, src) in sources.iter().enumerate() {
-                        if eq_ci(src.qualifier.as_slice(), qb) {
-                            hit = true;
-                            for (ci, (cname, aff)) in src.columns.iter().enumerate() {
-                                items.push(if Some(ci) == src.rowid_alias {
-                                    RExpr::Rowid(si)
-                                } else {
-                                    RExpr::Column(offsets.as_slice()[si] + ci, *aff)
-                                });
-                                item_aliases.push(None);
-                                order_names.push((Some(src.qualifier.clone()), cname.clone()));
-                                let _ = aff;
-                            }
-                        }
-                    }
-                    if !hit {
+                let later = RefRange {
+                    w: (
+                        cur.offsets.as_slice().get(i + 1).copied().unwrap_or(end),
+                        end,
+                    ),
+                    s: (cur.first_src + i + 1, cur.first_src + n),
+                };
+                if expr_refs_range(&r, &later) {
+                    if any_right || s.kind.pads_left() || s.kind.pads_right() {
                         return Err(Error::Schema {
-                            kind: SchemaKind::UnknownColumn,
+                            kind: SchemaKind::OnReferencesLaterSource,
                         });
                     }
-                }
-                SelectItem::Expr(e, alias, text) => {
-                    items.push(resolve_scoped::<S::Error>(
-                        e,
-                        arena,
-                        &cur,
-                        &[],
-                        &mut planner,
-                    )?);
-                    let (_, okey) = item_name_keys(arena, e, alias, text, &cur);
-                    order_names.push(okey);
-                    item_aliases.push(alias.map(|a| copy_vec(handle_bytes(arena, a))));
+                    hoisted = Some(and_expr(hoisted, r));
+                } else {
+                    cond = Some(and_expr(cond, r));
                 }
             }
+            plan.on = cond;
         }
-        let width = items.len();
-        // GROUP BY / HAVING / ORDER BY terms first resolve as an
-        // output ordinal or alias (SQLite's rule), substituting
-        // the item expression itself, so evaluation never needs
-        // an output-row context.
-        let mut group_by = AVec::new();
-        for e in stmt.group_by.iter() {
-            group_by.push(self.resolve_term(
-                e,
-                arena,
-                items.as_slice(),
-                item_aliases.as_slice(),
-                &cur,
-                &[],
-                &mut planner,
-            )?);
-        }
-        let having = match &stmt.having {
-            None => None,
-            Some(e) => Some(self.resolve_term(
-                e,
-                arena,
-                items.as_slice(),
-                item_aliases.as_slice(),
-                &cur,
-                &[],
-                &mut planner,
-            )?),
+        Ok(hoisted)
+    }
+
+    /// Plan a LIMIT / OFFSET expression (v0.16): resolved
+    /// against an empty scope with no enclosing scopes — the
+    /// pin resolves LIMIT with an empty name context, so a
+    /// column reference (even an outer one) is "no such
+    /// column" and any subquery in it is uncorrelated — and
+    /// aggregate-free ("misuse of aggregate").
+    #[cfg(feature = "v04")]
+    fn plan_limit(&self, e: Option<&Expr>, arena: &Arena) -> Result<Option<RExpr>, S::Error> {
+        let Some(e) = e else {
+            return Ok(None);
         };
-        // A compound head's ORDER BY resolves against the
-        // combined result (comp_order, below), not this core's
-        // rows, so the term loop is skipped for it.
-        #[cfg(feature = "v09")]
-        let compound_head = !stmt.compound.is_empty();
-        #[cfg(not(feature = "v09"))]
-        let compound_head = false;
-        let mut order_by: AVec<(RExpr, bool)> = AVec::new();
-        if !compound_head {
-            for (e, desc) in stmt.order_by.iter() {
-                order_by.push((
-                    self.resolve_term(
-                        e,
-                        arena,
-                        items.as_slice(),
-                        item_aliases.as_slice(),
-                        &cur,
-                        &[],
-                        &mut planner,
-                    )?,
-                    *desc,
-                ));
-            }
+        let empty = crate::query::ScopeGroup::new(AVec::new(), AVec::new(), 0);
+        let mut planner = self.sub_planner(arena);
+        let r = crate::query::resolve_scoped::<S::Error>(e, arena, &empty, &[], &mut planner)?;
+        if crate::query::has_agg(&r) {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedAggregate,
+            });
         }
-        // A subquery inside an aggregate's arguments needs
-        // per-group-row execution (v0.11, the `v10` feature);
-        // without it the plan is refused, as in v0.6.
-        if cfg!(not(feature = "v10"))
-            && (items.iter().any(sub_in_agg_args)
-                || having.as_ref().is_some_and(sub_in_agg_args)
-                || order_by.iter().any(|(e, _)| sub_in_agg_args(e)))
-        {
-            return Err(Error::Unsupported);
-        }
-        let has_agg = !group_by.is_empty()
-            || items.iter().any(has_agg)
-            || having.as_ref().is_some_and(has_agg)
-            || order_by.iter().any(|(e, _)| has_agg(e));
-        #[cfg(feature = "v09")]
-        let (compound, comp_order) = if stmt.compound.is_empty() {
-            (AVec::new(), AVec::new())
-        } else {
-            self.plan_query_compound(stmt, arena, order_names.as_slice(), width)?
-        };
-        #[cfg(not(feature = "v09"))]
-        let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
-        Ok(QueryPlan {
-            sources: src_plans,
-            items,
-            filter,
-            group_by,
-            having,
-            order_by,
-            distinct: stmt.distinct,
-            limit: stmt.limit,
-            offset: stmt.offset,
-            has_agg,
-            width,
-            compound,
-            values: AVec::new(),
-            comp_order,
-            order_names,
-        })
+        Ok(Some(r))
     }
 
     /// The v0.3 planner seam for `WHERE <col> = <literal>` on a
@@ -4692,11 +4641,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "v07")]
             if let Some(fr) = &from_rows {
                 let mut joined: AVec<RowData> = AVec::new();
-                self.join_from(
+                self.join_sources(
                     from_sources.as_slice(),
+                    None,
                     fr.as_slice(),
-                    0,
-                    base_rd.clone(),
+                    &base_rd,
                     &mut joined,
                 )
                 .await?;
@@ -5250,22 +5199,53 @@ impl<'c, S: Storage> Statement<'c, S> {
         if query_plan_has_sub(&qp) {
             return self.run_query_sub(qp).await;
         }
+        // LIMIT / OFFSET first: the pin computes them before
+        // the scan, so a bad one errors even over no rows.
+        let window = self.limit_window(&qp.limit, &qp.offset).await?;
         let src_rows = self
             .materialise_query_sources(qp.sources.as_slice())
             .await?;
         // Nested-loop join + WHERE, then group / project: the
         // synchronous v0.4 executor (no subqueries in the plan).
         let mut rows: AVec<RowData> = AVec::new();
-        join_rows::<S::Error>(
-            &qp,
-            src_rows.as_slice(),
-            0,
-            &mut RowData::empty(),
-            &mut rows,
-        )?;
+        join_all::<S::Error>(&qp, src_rows.as_slice(), &mut rows)?;
         let produced = project_rows::<S::Error>(&qp, rows.as_slice())?;
-        self.finish_produced(&qp, produced);
+        self.finish_produced(&qp, produced, window);
         Ok(())
+    }
+
+    /// Evaluate a plan's LIMIT / OFFSET (v0.16) into the row
+    /// window `(skip, take)`: each expression evaluates once,
+    /// against the empty row (it was planned against an empty
+    /// scope), and must pass the pin's `MustBeInt` conversion
+    /// (`query::limit_int`). A negative LIMIT means no limit and
+    /// a negative OFFSET means none; counts beyond the address
+    /// space saturate rather than wrap on 32-bit targets.
+    #[cfg(feature = "v04")]
+    async fn limit_window(
+        &mut self,
+        limit: &Option<RExpr>,
+        offset: &Option<RExpr>,
+    ) -> Result<(usize, usize), S::Error> {
+        let mut vals = [None, None];
+        for (slot, e) in vals.iter_mut().zip([limit, offset]) {
+            let Some(e) = e else { continue };
+            #[cfg(feature = "v06")]
+            let v = self.eval_row_sub(e, &RowData::empty()).await?;
+            #[cfg(not(feature = "v06"))]
+            let v = crate::query::eval::<S::Error>(e, &Ctx::Row(&RowData::empty()))?;
+            *slot = Some(crate::query::limit_int::<S::Error>(v)?);
+        }
+        let [lim, off] = vals;
+        let take = match lim {
+            Some(l) if l >= 0 => usize::try_from(l).unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        };
+        let skip = match off {
+            Some(o) if o > 0 => usize::try_from(o).unwrap_or(usize::MAX),
+            _ => 0,
+        };
+        Ok((skip, take))
     }
 
     /// Scan one query source's rows into memory (v0.4 executor
@@ -5374,26 +5354,15 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// left to right, then the compound ORDER BY / LIMIT.
     #[cfg(feature = "v09")]
     async fn run_query_compound(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
+        let window = self.limit_window(&qp.limit, &qp.offset).await?;
         let mut rows = self.exec_qp_core_values(&qp).await?;
         for (op, tail) in qp.compound.iter() {
             let right = self.exec_qp_core_values(tail).await?;
             rows = combine_compound(*op, rows, right);
         }
-        let comp_order = qp.comp_order.clone();
-        rows.as_mut_slice().sort_by(|a, b| {
-            for (idx, desc) in comp_order.iter() {
-                let o = crate::record::compare_values(
-                    &a.as_slice()[*idx].as_value(),
-                    &b.as_slice()[*idx].as_value(),
-                );
-                let o = if *desc { o.reverse() } else { o };
-                if o != core::cmp::Ordering::Equal {
-                    return o;
-                }
-            }
-            core::cmp::Ordering::Equal
-        });
-        let rows = apply_limit_offset(rows, qp.offset, qp.limit);
+        rows.as_mut_slice()
+            .sort_by(|a, b| compound_order_cmp(a, b, qp.comp_order.as_slice()));
+        let rows = apply_window(rows, window);
         let mut ids: AVec<Option<i64>> = AVec::new();
         for _ in rows.iter() {
             ids.push(None);
@@ -5429,8 +5398,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             .materialise_sources_sub(qp.sources.as_slice(), &RowData::empty())
             .await?;
         let mut rows: AVec<RowData> = AVec::new();
-        self.join_qp_async(qp, src_rows.as_slice(), 0, RowData::empty(), &mut rows)
-            .await?;
+        self.join_sources(
+            qp.sources.as_slice(),
+            qp.filter.as_ref(),
+            src_rows.as_slice(),
+            &RowData::empty(),
+            &mut rows,
+        )
+        .await?;
         let produced = self.project_qp_async(qp, rows.as_slice()).await?;
         let mut out: AVec<AVec<OwnedValue>> = AVec::new();
         for p in produced.iter() {
@@ -5443,52 +5418,29 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// DISTINCT, ORDER BY, LIMIT/OFFSET over produced rows
-    /// (v0.4 executor steps 4-6, shared by the subquery path).
+    /// (v0.4 executor steps 4-6, shared by the subquery path;
+    /// v0.16: NULLS FIRST / LAST honoured, and the row window
+    /// comes evaluated from `limit_window`).
     #[cfg(feature = "v04")]
-    fn finish_produced(&mut self, qp: &QueryPlan, mut produced: AVec<Produced>) {
+    fn finish_produced(
+        &mut self,
+        qp: &QueryPlan,
+        mut produced: AVec<Produced>,
+        (skip, take): (usize, usize),
+    ) {
         if qp.distinct {
-            let mut kept: AVec<Produced> = AVec::new();
-            for p in produced.iter() {
-                let dup = kept.iter().any(|k: &Produced| {
-                    k.out.len() == p.out.len()
-                        && k.out
-                            .iter()
-                            .zip(p.out.iter())
-                            .all(|(a, b)| crate::query::values_equal_is(a, b))
-                });
-                if !dup {
-                    kept.push(Produced {
-                        out: p.out.clone(),
-                        keys: p.keys.clone(),
-                        rowid: p.rowid,
-                    });
-                }
-            }
-            produced = kept;
+            produced = dedup_produced(produced);
         }
         produced.as_mut_slice().sort_by(|x, y| {
-            for ((av, bv), (_, desc)) in x.keys.iter().zip(y.keys.iter()).zip(qp.order_by.iter()) {
-                let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
-                let o = if *desc { o.reverse() } else { o };
-                if o != core::cmp::Ordering::Equal {
-                    return o;
-                }
-            }
-            core::cmp::Ordering::Equal
+            crate::query::order_keys_cmp(
+                x.keys.as_slice(),
+                y.keys.as_slice(),
+                qp.order_by.iter().map(|(_, o)| *o),
+            )
         });
-        let start = qp.offset.max(0) as usize;
         let mut kept_rows: AVec<AVec<OwnedValue>> = AVec::new();
         let mut kept_ids: AVec<Option<i64>> = AVec::new();
-        for (i, p) in produced.iter().enumerate() {
-            if i < start {
-                continue;
-            }
-            if let Some(l) = qp.limit
-                && l >= 0
-                && (kept_rows.len() as i64) >= l
-            {
-                break;
-            }
+        for p in produced.iter().skip(skip).take(take) {
             kept_rows.push(p.out.clone());
             kept_ids.push(p.rowid);
         }
@@ -5505,14 +5457,21 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// synchronous evaluator runs.
     #[cfg(feature = "v06")]
     async fn run_query_sub(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
+        let window = self.limit_window(&qp.limit, &qp.offset).await?;
         let src_rows = self
             .materialise_sources_sub(qp.sources.as_slice(), &RowData::empty())
             .await?;
         let mut rows: AVec<RowData> = AVec::new();
-        self.join_qp_async(&qp, src_rows.as_slice(), 0, RowData::empty(), &mut rows)
-            .await?;
+        self.join_sources(
+            qp.sources.as_slice(),
+            qp.filter.as_ref(),
+            src_rows.as_slice(),
+            &RowData::empty(),
+            &mut rows,
+        )
+        .await?;
         let produced = self.project_qp_async(&qp, rows.as_slice()).await?;
-        self.finish_produced(&qp, produced);
+        self.finish_produced(&qp, produced, window);
         Ok(())
     }
 
@@ -5865,7 +5824,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &RowData,
     ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
         let plan = plan.clone();
-        let produced = self.exec_subplan_core(&plan, outer).await?;
+        let window = self.limit_window(&plan.limit, &plan.offset).await?;
+        let mut produced = self.exec_subplan_core(&plan, outer).await?;
         // Compound finish (v0.9): combine the core rows with
         // each tail core's rows, left to right, then the
         // compound ORDER BY / LIMIT.
@@ -5883,39 +5843,22 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
                 rows = combine_compound(*op, rows, right);
             }
-            let comp_order = plan.comp_order.clone();
-            rows.as_mut_slice().sort_by(|a, b| {
-                for (idx, desc) in comp_order.iter() {
-                    let o = crate::record::compare_values(
-                        &a.as_slice()[*idx].as_value(),
-                        &b.as_slice()[*idx].as_value(),
-                    );
-                    let o = if *desc { o.reverse() } else { o };
-                    if o != core::cmp::Ordering::Equal {
-                        return o;
-                    }
-                }
-                core::cmp::Ordering::Equal
-            });
-            return Ok(apply_limit_offset(rows, plan.offset, plan.limit));
+            rows.as_mut_slice()
+                .sort_by(|a, b| compound_order_cmp(a, b, plan.comp_order.as_slice()));
+            return Ok(apply_window(rows, window));
         }
-        let mut produced = produced;
         produced.as_mut_slice().sort_by(|x, y| {
-            for ((av, bv), (_, desc)) in x.keys.iter().zip(y.keys.iter()).zip(plan.order_by.iter())
-            {
-                let o = crate::record::compare_values(&av.as_value(), &bv.as_value());
-                let o = if *desc { o.reverse() } else { o };
-                if o != core::cmp::Ordering::Equal {
-                    return o;
-                }
-            }
-            core::cmp::Ordering::Equal
+            crate::query::order_keys_cmp(
+                x.keys.as_slice(),
+                y.keys.as_slice(),
+                plan.order_by.iter().map(|(_, o)| *o),
+            )
         });
         let mut rows: AVec<AVec<OwnedValue>> = AVec::new();
-        for p in produced.iter() {
+        for p in produced.iter().skip(window.0).take(window.1) {
             rows.push(p.out.clone());
         }
-        Ok(apply_limit_offset(rows, plan.offset, plan.limit))
+        Ok(rows)
     }
 
     /// Execute one subquery CORE (v0.6; v0.9 split): materialise
@@ -5948,217 +5891,109 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             return Ok(out);
         }
-        // Materialise the subquery's own sources.
-        let mut src_rows: AVec<AVec<(AVec<OwnedValue>, Option<i64>)>> = AVec::new();
-        for sp in plan.sources.iter() {
-            // A derived table (v0.9): its rows are the inner
-            // subplan's result for this outer row; they carry
-            // no rowid.
-            #[cfg(feature = "v09")]
-            {
-                if let Some(d) = &sp.derived {
-                    let inner = self.exec_subplan(d, outer).await?;
-                    let mut rows = AVec::new();
-                    for r in inner.iter() {
-                        rows.push((r.clone(), None));
-                    }
-                    src_rows.push(rows);
-                    continue;
-                }
-            }
-            let mut rows = AVec::new();
-            let mut cursor = ScanCursor::new(sp.root);
-            let mut buf = AVec::new();
-            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-                let mut dec: AVec<Value<'_>> = AVec::new();
-                crate::record::decode_record_into::<S::Error>(buf.as_slice(), sp.ncols, &mut dec)?;
-                let mut vals = AVec::new();
-                for i in 0..sp.ncols {
-                    let mut v = if Some(i) == sp.rowid_alias {
-                        OwnedValue::Integer(rowid)
-                    } else if i < dec.len() {
-                        OwnedValue::from_value(dec.as_slice()[i])
-                    } else {
-                        sp.defaults.as_slice()[i].clone()
-                    };
-                    if sp.affs.as_slice()[i] == crate::record::Affinity::Real
-                        && let OwnedValue::Integer(x) = v
-                    {
-                        v = OwnedValue::Real(x as f64);
-                    }
-                    vals.push(v);
-                }
-                rows.push((vals, Some(rowid)));
-            }
-            src_rows.push(rows);
-        }
-        let mut joined: AVec<RowData> = AVec::new();
-        self.sub_join(plan, src_rows.as_slice(), 0, outer.clone(), &mut joined)
+        // Materialise the subquery's own sources (a derived
+        // table's rows are its subplan's result for this outer
+        // row; they carry no rowid).
+        let src_rows = self
+            .materialise_sources_sub(plan.sources.as_slice(), outer)
             .await?;
+        let mut joined: AVec<RowData> = AVec::new();
+        self.join_sources(
+            plan.sources.as_slice(),
+            plan.filter.as_ref(),
+            src_rows.as_slice(),
+            outer,
+            &mut joined,
+        )
+        .await?;
         let mut produced = self.sub_project(plan, outer, joined.as_slice()).await?;
         if plan.distinct {
-            let mut kept: AVec<Produced> = AVec::new();
-            for p in produced.iter() {
-                let dup = kept.iter().any(|k: &Produced| {
-                    k.out.len() == p.out.len()
-                        && k.out
-                            .iter()
-                            .zip(p.out.iter())
-                            .all(|(a, b)| crate::query::values_equal_is(a, b))
-                });
-                if !dup {
-                    kept.push(Produced {
-                        out: p.out.clone(),
-                        keys: p.keys.clone(),
-                        rowid: p.rowid,
-                    });
-                }
-            }
-            produced = kept;
+            produced = dedup_produced(produced);
         }
         Ok(produced)
     }
 
-    /// Nested-loop join for a subquery (v0.6): like `join_rows`,
-    /// but the accumulator starts from the outer row and ON /
-    /// WHERE evaluate through `eval_row_sub` (a nested
-    /// subquery may itself be correlated to the combined row).
-    /// Recursive, so the future is boxed.
+    /// The nested-loop join of `sources` onto `outer` (v0.6
+    /// subquery joins, v0.7 UPDATE ... FROM, top-level queries
+    /// with subqueries; one executor since v0.16): ON and the
+    /// optional `filter` evaluate through `eval_row_sub`, so a
+    /// nested subquery may be correlated to the combined row.
+    /// LEFT / FULL sources NULL-pad an unmatched left
+    /// combination in place. RIGHT / FULL sources (v0.16) then
+    /// emit, after the whole main loop, each of their rows that
+    /// no combination matched, NULL-padded on the left and
+    /// joined onward through the later sources — earlier
+    /// sources first, each in its own row order, exactly the
+    /// pin's output order (its right-join loop runs once the
+    /// left operand is exhausted).
     #[cfg(feature = "v06")]
-    fn sub_join<'x>(
-        &'x mut self,
-        plan: &'x crate::query::SubPlan,
-        src_rows: &'x [AVec<(AVec<OwnedValue>, Option<i64>)>],
-        idx: usize,
-        acc: RowData,
-        out: &'x mut AVec<RowData>,
-    ) -> JoinFuture<'x, S::Error> {
-        alloc::boxed::Box::pin(async move {
-            if idx == plan.sources.len() {
-                let keep = match &plan.filter {
-                    None => true,
-                    Some(f) => {
-                        crate::query::truthy(&self.eval_row_sub(f, &acc).await?) == Some(true)
-                    }
-                };
-                if keep {
-                    out.push(acc);
-                }
-                return Ok(());
+    async fn join_sources(
+        &mut self,
+        sources: &[SourcePlan],
+        filter: Option<&RExpr>,
+        src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
+        outer: &RowData,
+        out: &mut AVec<RowData>,
+    ) -> Result<(), S::Error> {
+        let mut matched = right_match_flags(sources, src_rows);
+        self.join_step(
+            sources,
+            filter,
+            src_rows,
+            0,
+            outer.clone(),
+            &mut matched,
+            out,
+        )
+        .await?;
+        for (i, (sp, rows)) in sources.iter().zip(src_rows.iter()).enumerate() {
+            if !sp.kind.pads_left() {
+                continue;
             }
-            let sp = &plan.sources.as_slice()[idx];
-            let mut matched = false;
-            for (vals, rowid) in src_rows[idx].iter() {
-                let mut acc2 = acc.clone();
-                for v in vals.iter() {
-                    acc2.vals.push(v.clone());
+            for (ri, (vals, rowid)) in rows.iter().enumerate() {
+                if row_matched(&matched, i, ri) {
+                    continue;
                 }
-                acc2.rowids.push(*rowid);
-                let on_ok = match &sp.on {
-                    None => true,
-                    Some(on) => {
-                        crate::query::truthy(&self.eval_row_sub(on, &acc2).await?) == Some(true)
-                    }
-                };
-                if on_ok {
-                    matched = true;
-                    self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out)
-                        .await?;
-                }
-            }
-            if sp.kind == JoinKind::Left && !matched {
-                let mut acc2 = acc.clone();
-                for _ in 0..sp.ncols {
-                    acc2.vals.push(OwnedValue::Null);
-                }
-                acc2.rowids.push(None);
-                self.sub_join(plan, src_rows, idx + 1, acc2, &mut *out)
+                let acc = left_padded(outer, sources, i, vals, *rowid);
+                self.join_step(sources, filter, src_rows, i + 1, acc, &mut matched, out)
                     .await?;
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
-    /// Nested-loop join for a top-level query whose ON / WHERE
-    /// contain subqueries (v0.6): `join_rows` with per-candidate
-    /// subquery execution. Recursive, so the future is boxed.
+    /// One level of `join_sources`' main loop: extend `acc`
+    /// with source `idx`'s rows that pass its ON, recording the
+    /// RIGHT / FULL matches in `matched`, and recurse; a
+    /// complete row passes `filter` into `out`. Recursive, so
+    /// the future is boxed.
     #[cfg(feature = "v06")]
-    fn join_qp_async<'x>(
-        &'x mut self,
-        qp: &'x QueryPlan,
-        src_rows: &'x [AVec<(AVec<OwnedValue>, Option<i64>)>],
-        idx: usize,
-        acc: RowData,
-        out: &'x mut AVec<RowData>,
-    ) -> JoinFuture<'x, S::Error> {
-        alloc::boxed::Box::pin(async move {
-            if idx == qp.sources.len() {
-                let keep = match &qp.filter {
-                    None => true,
-                    Some(f) => {
-                        crate::query::truthy(&self.eval_row_sub(f, &acc).await?) == Some(true)
-                    }
-                };
-                if keep {
-                    out.push(acc);
-                }
-                return Ok(());
-            }
-            let sp = &qp.sources.as_slice()[idx];
-            let mut matched = false;
-            for (vals, rowid) in src_rows[idx].iter() {
-                let mut acc2 = acc.clone();
-                for v in vals.iter() {
-                    acc2.vals.push(v.clone());
-                }
-                acc2.rowids.push(*rowid);
-                let on_ok = match &sp.on {
-                    None => true,
-                    Some(on) => {
-                        crate::query::truthy(&self.eval_row_sub(on, &acc2).await?) == Some(true)
-                    }
-                };
-                if on_ok {
-                    matched = true;
-                    self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out)
-                        .await?;
-                }
-            }
-            if sp.kind == JoinKind::Left && !matched {
-                let mut acc2 = acc.clone();
-                for _ in 0..sp.ncols {
-                    acc2.vals.push(OwnedValue::Null);
-                }
-                acc2.rowids.push(None);
-                self.join_qp_async(qp, src_rows, idx + 1, acc2, &mut *out)
-                    .await?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Nested-loop join of an UPDATE's FROM sources onto one
-    /// target row (v0.7): like `sub_join`, but the accumulator
-    /// starts from the target row and no filter is applied here
-    /// (the caller filters each complete combination). Boxed
-    /// for the same layout reason as the other recursive joins.
-    #[cfg(feature = "v07")]
-    fn join_from<'x>(
+    #[allow(clippy::too_many_arguments)]
+    fn join_step<'x>(
         &'x mut self,
         sources: &'x [SourcePlan],
+        filter: Option<&'x RExpr>,
         src_rows: &'x [AVec<(AVec<OwnedValue>, Option<i64>)>],
         idx: usize,
         acc: RowData,
+        matched: &'x mut AVec<AVec<bool>>,
         out: &'x mut AVec<RowData>,
     ) -> JoinFuture<'x, S::Error> {
         alloc::boxed::Box::pin(async move {
-            if idx == sources.len() {
-                out.push(acc);
+            let (Some(sp), Some(rows)) = (sources.get(idx), src_rows.get(idx)) else {
+                let keep = match filter {
+                    None => true,
+                    Some(f) => {
+                        crate::query::truthy(&self.eval_row_sub(f, &acc).await?) == Some(true)
+                    }
+                };
+                if keep {
+                    out.push(acc);
+                }
                 return Ok(());
-            }
-            let sp = &sources[idx];
-            let mut matched = false;
-            for (vals, rowid) in src_rows[idx].iter() {
+            };
+            let mut any = false;
+            for (ri, (vals, rowid)) in rows.iter().enumerate() {
                 let mut acc2 = acc.clone();
                 for v in vals.iter() {
                     acc2.vals.push(v.clone());
@@ -6166,24 +6001,52 @@ impl<'c, S: Storage> Statement<'c, S> {
                 acc2.rowids.push(*rowid);
                 let on_ok = match &sp.on {
                     None => true,
+                    // A subquery in this ON was planned with its
+                    // own slots after EVERY source of the FROM
+                    // clause, but the row holds only sources
+                    // 0..=idx here: evaluate it on a copy padded
+                    // with the later sources as NULLs (an ON may
+                    // not read them — see `plan_on`), so the
+                    // subquery's rows land where it reads them.
+                    // v0.16 regression: hipp read misaligned
+                    // slots (wrong rows) for such an ON.
+                    Some(on) if crate::query::has_sub(on) => {
+                        let mut padded = acc2.clone();
+                        pad_sources(&mut padded, sources.get(idx + 1..).unwrap_or(&[]));
+                        crate::query::truthy(&self.eval_row_sub(on, &padded).await?) == Some(true)
+                    }
                     Some(on) => {
                         crate::query::truthy(&self.eval_row_sub(on, &acc2).await?) == Some(true)
                     }
                 };
                 if on_ok {
-                    matched = true;
-                    self.join_from(sources, src_rows, idx + 1, acc2, &mut *out)
-                        .await?;
+                    any = true;
+                    mark_matched(matched, idx, ri);
+                    self.join_step(
+                        sources,
+                        filter,
+                        src_rows,
+                        idx + 1,
+                        acc2,
+                        &mut *matched,
+                        &mut *out,
+                    )
+                    .await?;
                 }
             }
-            if sp.kind == JoinKind::Left && !matched {
-                let mut acc2 = acc.clone();
-                for _ in 0..sp.ncols {
-                    acc2.vals.push(OwnedValue::Null);
-                }
-                acc2.rowids.push(None);
-                self.join_from(sources, src_rows, idx + 1, acc2, &mut *out)
-                    .await?;
+            if sp.kind.pads_right() && !any {
+                let mut acc2 = acc;
+                pad_sources(&mut acc2, core::slice::from_ref(sp));
+                self.join_step(
+                    sources,
+                    filter,
+                    src_rows,
+                    idx + 1,
+                    acc2,
+                    &mut *matched,
+                    &mut *out,
+                )
+                .await?;
             }
             Ok(())
         })
@@ -6770,11 +6633,11 @@ fn values_col_name(i: usize) -> AVec<u8> {
 /// set", mirrored here as `SchemaKind::UnknownColumn`.
 #[cfg(feature = "v09")]
 fn resolve_compound_order<E>(
-    order_by: &[(Expr, bool)],
+    order_by: &[(Expr, crate::sql::SortOrder)],
     arena: &Arena,
     cores_names: &[&[crate::query::OrderName]],
     width: usize,
-) -> Result<AVec<(usize, bool)>, E> {
+) -> Result<AVec<(usize, crate::sql::SortOrder)>, E> {
     let mut out = AVec::new();
     for (e, desc) in order_by.iter() {
         let idx = match e {
@@ -6928,30 +6791,135 @@ fn combine_compound(
     }
 }
 
-/// OFFSET / LIMIT over finished rows (v0.9 extraction of the
-/// tail of the subquery finisher): a negative LIMIT means no
-/// limit, as in SQLite.
-#[cfg(feature = "v06")]
-fn apply_limit_offset(
+/// A row window `(skip, take)` from `limit_window` over
+/// finished rows (v0.9 extraction of the subquery finisher's
+/// tail; v0.16 takes the evaluated window).
+#[cfg(feature = "v09")]
+fn apply_window(
     rows: AVec<AVec<OwnedValue>>,
-    offset: i64,
-    limit: Option<i64>,
+    (skip, take): (usize, usize),
 ) -> AVec<AVec<OwnedValue>> {
-    let start = offset.max(0) as usize;
     let mut out: AVec<AVec<OwnedValue>> = AVec::new();
-    for (i, r) in rows.iter().enumerate() {
-        if i < start {
-            continue;
-        }
-        if let Some(l) = limit
-            && l >= 0
-            && (out.len() as i64) >= l
-        {
-            break;
-        }
+    for r in rows.iter().skip(skip).take(take) {
         out.push(r.clone());
     }
     out
+}
+
+/// Compare two compound result rows under the compound ORDER
+/// BY (v0.9; NULLS FIRST / LAST since v0.16).
+#[cfg(feature = "v09")]
+fn compound_order_cmp(
+    a: &AVec<OwnedValue>,
+    b: &AVec<OwnedValue>,
+    order: &[(usize, crate::sql::SortOrder)],
+) -> core::cmp::Ordering {
+    for (idx, o) in order.iter() {
+        if let (Some(x), Some(y)) = (a.as_slice().get(*idx), b.as_slice().get(*idx)) {
+            let c = crate::query::order_cmp(x, y, *o);
+            if c != core::cmp::Ordering::Equal {
+                return c;
+            }
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
+/// DISTINCT over produced rows (v0.4): first occurrences
+/// kept, values compared NULL-safely.
+#[cfg(feature = "v04")]
+fn dedup_produced(produced: AVec<Produced>) -> AVec<Produced> {
+    let mut kept: AVec<Produced> = AVec::new();
+    for p in produced.iter() {
+        let dup = kept.iter().any(|k: &Produced| {
+            k.out.len() == p.out.len()
+                && k.out
+                    .iter()
+                    .zip(p.out.iter())
+                    .all(|(a, b)| crate::query::values_equal_is(a, b))
+        });
+        if !dup {
+            kept.push(p.clone());
+        }
+    }
+    kept
+}
+
+/// Per-source "matched" flags for a join's RIGHT / FULL
+/// sources (v0.16): one flag per materialised row of each such
+/// source, empty for every other source.
+#[cfg(feature = "v04")]
+fn right_match_flags(
+    sources: &[SourcePlan],
+    src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
+) -> AVec<AVec<bool>> {
+    let mut m = AVec::new();
+    for (sp, rows) in sources.iter().zip(src_rows.iter()) {
+        let mut f = AVec::new();
+        if sp.kind.pads_left() {
+            for _ in rows.iter() {
+                f.push(false);
+            }
+        }
+        m.push(f);
+    }
+    m
+}
+
+/// Record that row `ri` of source `idx` was matched (v0.16; a
+/// no-op for sources that keep no flags).
+#[cfg(feature = "v04")]
+fn mark_matched(matched: &mut AVec<AVec<bool>>, idx: usize, ri: usize) {
+    if let Some(f) = matched
+        .as_mut_slice()
+        .get_mut(idx)
+        .and_then(|m| m.as_mut_slice().get_mut(ri))
+    {
+        *f = true;
+    }
+}
+
+/// Whether row `ri` of source `idx` was matched (v0.16).
+#[cfg(feature = "v04")]
+fn row_matched(matched: &AVec<AVec<bool>>, idx: usize, ri: usize) -> bool {
+    matched
+        .as_slice()
+        .get(idx)
+        .and_then(|m| m.as_slice().get(ri))
+        .copied()
+        .unwrap_or(true)
+}
+
+/// Append a NULL row (all columns, no rowid) for each of
+/// `sources` to `acc` (v0.16).
+#[cfg(feature = "v04")]
+fn pad_sources(acc: &mut RowData, sources: &[SourcePlan]) {
+    for sp in sources.iter() {
+        for _ in 0..sp.ncols {
+            acc.vals.push(OwnedValue::Null);
+        }
+        acc.rowids.push(None);
+    }
+}
+
+/// The accumulator for an unmatched row of RIGHT / FULL source
+/// `i` (v0.16): the outer row, NULLs for every source before
+/// `i`, then the row itself.
+#[cfg(feature = "v04")]
+fn left_padded(
+    outer: &RowData,
+    sources: &[SourcePlan],
+    i: usize,
+    vals: &AVec<OwnedValue>,
+    rowid: Option<i64>,
+) -> RowData {
+    let mut acc = outer.clone();
+    pad_sources(&mut acc, sources.get(..i).unwrap_or(&[]));
+    for v in vals.iter() {
+        acc.vals.push(v.clone());
+    }
+    acc.rowids.push(rowid);
+    acc
 }
 
 /// Whether any expression of a query plan contains a
@@ -7044,18 +7012,50 @@ struct Produced {
     rowid: Option<i64>,
 }
 
+/// The synchronous nested-loop join of a query plan's sources
+/// (v0.4; RIGHT / FULL since v0.16): the main loop, then each
+/// RIGHT / FULL source's unmatched rows NULL-padded on the left
+/// and joined onward — the `join_sources` order, without
+/// subquery execution.
+#[cfg(feature = "v04")]
+fn join_all<E>(
+    qp: &QueryPlan,
+    src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
+    out: &mut AVec<RowData>,
+) -> Result<(), E> {
+    let mut matched = right_match_flags(qp.sources.as_slice(), src_rows);
+    join_rows::<E>(qp, src_rows, 0, &mut RowData::empty(), &mut matched, out)?;
+    let empty = RowData::empty();
+    for (i, (sp, rows)) in qp.sources.iter().zip(src_rows.iter()).enumerate() {
+        if !sp.kind.pads_left() {
+            continue;
+        }
+        for (ri, (vals, rowid)) in rows.iter().enumerate() {
+            if row_matched(&matched, i, ri) {
+                continue;
+            }
+            let mut acc = left_padded(&empty, qp.sources.as_slice(), i, vals, *rowid);
+            join_rows::<E>(qp, src_rows, i + 1, &mut acc, &mut matched, out)?;
+        }
+    }
+    Ok(())
+}
+
 /// Nested-loop join (v0.4): extend `acc` with source `idx`'s
-/// rows, recurse; a LEFT source that matched nothing extends
-/// once with NULLs. The WHERE filter applies to complete rows.
+/// rows, recurse; a LEFT / FULL source that matched nothing
+/// extends once with NULLs, and RIGHT / FULL matches are
+/// recorded in `matched` for `join_all`'s tail. The WHERE
+/// filter applies to complete rows.
 #[cfg(feature = "v04")]
 fn join_rows<E>(
     qp: &QueryPlan,
     src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
     idx: usize,
     acc: &mut RowData,
+    matched: &mut AVec<AVec<bool>>,
     out: &mut AVec<RowData>,
 ) -> Result<(), E> {
-    if idx == qp.sources.len() {
+    let (Some(sp), Some(rows)) = (qp.sources.as_slice().get(idx), src_rows.get(idx)) else {
         let keep = match &qp.filter {
             None => true,
             Some(f) => {
@@ -7066,11 +7066,10 @@ fn join_rows<E>(
             out.push(acc.clone());
         }
         return Ok(());
-    }
-    let sp = &qp.sources.as_slice()[idx];
+    };
     let base = acc.vals.len();
-    let mut matched = false;
-    for (vals, rowid) in src_rows[idx].iter() {
+    let mut any = false;
+    for (ri, (vals, rowid)) in rows.iter().enumerate() {
         for v in vals.iter() {
             acc.vals.push(v.clone());
         }
@@ -7082,20 +7081,21 @@ fn join_rows<E>(
             }
         };
         if on_ok {
-            matched = true;
-            join_rows::<E>(qp, src_rows, idx + 1, acc, out)?;
+            any = true;
+            mark_matched(matched, idx, ri);
+            join_rows::<E>(qp, src_rows, idx + 1, acc, matched, out)?;
         }
         while acc.vals.len() > base {
             acc.vals.pop();
         }
         acc.rowids.pop();
     }
-    if sp.kind == JoinKind::Left && !matched {
+    if sp.kind.pads_right() && !any {
         for _ in 0..sp.ncols {
             acc.vals.push(OwnedValue::Null);
         }
         acc.rowids.push(None);
-        join_rows::<E>(qp, src_rows, idx + 1, acc, out)?;
+        join_rows::<E>(qp, src_rows, idx + 1, acc, matched, out)?;
         while acc.vals.len() > base {
             acc.vals.pop();
         }

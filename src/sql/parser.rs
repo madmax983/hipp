@@ -13,6 +13,8 @@ use crate::error::{Error, ParseKind, Result};
 
 #[cfg(feature = "v09")]
 use super::ast::CompoundOp;
+#[cfg(feature = "v04")]
+use super::ast::SortOrder;
 #[cfg(feature = "v07")]
 use super::ast::UpsertAction;
 use super::ast::{
@@ -1107,6 +1109,10 @@ impl<'a> Parser<'a> {
             kind: JoinKind::Inner,
             on: None,
             derived: None,
+            #[cfg(feature = "v04")]
+            natural: false,
+            #[cfg(feature = "v04")]
+            using: AVec::new(),
         });
         // v0.2: optional WHERE <column> = <literal>. Any other
         // predicate shape is rejected here; whether <column> is the
@@ -1139,7 +1145,7 @@ impl<'a> Parser<'a> {
             having: None,
             order_by: AVec::new(),
             limit: None,
-            offset: 0,
+            offset: None,
             compound: AVec::new(),
             values: AVec::new(),
         }))
@@ -1167,7 +1173,14 @@ impl<'a> Parser<'a> {
             b"LEFT",
             b"CROSS",
             b"OUTER",
+            // The pin's remaining join keywords (JOIN_KW tokens,
+            // never a bare alias there): eating them as an alias
+            // turned `a RIGHT JOIN b` into an inner join (v0.16).
+            b"NATURAL",
+            b"RIGHT",
+            b"FULL",
             b"ON",
+            b"USING",
             b"UNION",
             b"EXCEPT",
             b"INTERSECT",
@@ -1182,8 +1195,19 @@ impl<'a> Parser<'a> {
     }
 
     /// An optional `[AS] name` alias: a quoted identifier, or a
-    /// bare identifier that is not a clause keyword.
+    /// bare identifier that is not a clause keyword. Under `v16`
+    /// a string literal works too, with or without AS (the pin's
+    /// `as ::= AS nm | ids`, where both admit a STRING token):
+    /// `SELECT a AS 'q'`, `FROM t 'x'`.
     fn opt_alias(&mut self) -> Option<ABytes> {
+        #[cfg(feature = "v16")]
+        {
+            let at = if self.cur_is_kw(b"AS") { 1 } else { 0 };
+            if let Some(Tok::Text(h)) = self.toks.as_slice().get(self.pos + at).map(|t| t.tok) {
+                self.pos += at + 1;
+                return Some(h);
+            }
+        }
         if self.eat_kw(b"AS") {
             return match self.cur().tok {
                 Tok::Ident(h, _) => {
@@ -1273,6 +1297,15 @@ impl<'a> Parser<'a> {
                 false
             };
             if self.eat_kw(b"IN") {
+                // `x IN tablename` (v0.16, `v16`): the pin reads
+                // it as `x IN (SELECT * FROM tablename)` — a
+                // one-column table is required at plan time.
+                #[cfg(feature = "v16")]
+                if let Tok::Ident(..) = self.cur().tok {
+                    let table = self.name::<E>()?;
+                    l = Expr::InSubquery(Box::new(l), Box::new(self.table_select(table)), neg);
+                    continue;
+                }
                 self.expect::<E>(Tok::LParen)?;
                 // A subquery body: SELECT (or a v0.9 VALUES core),
                 // possibly under further parentheses — the pin
@@ -1663,7 +1696,7 @@ impl<'a> Parser<'a> {
             having: None,
             order_by: AVec::new(),
             limit: None,
-            offset: 0,
+            offset: None,
             compound: AVec::new(),
             values,
         })
@@ -1702,33 +1735,11 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        let mut from = AVec::new();
-        if self.eat_kw(b"FROM") {
-            from.push(self.join_source::<E>(JoinKind::Inner, true)?);
-            loop {
-                if self.eat(Tok::Comma) {
-                    from.push(self.join_source::<E>(JoinKind::Cross, false)?);
-                    continue;
-                }
-                let kind = if self.eat_kw(b"JOIN") {
-                    Some(JoinKind::Inner)
-                } else if self.eat_kw(b"INNER") {
-                    self.expect_kw::<E>(b"JOIN")?;
-                    Some(JoinKind::Inner)
-                } else if self.eat_kw(b"LEFT") {
-                    let _ = self.eat_kw(b"OUTER");
-                    self.expect_kw::<E>(b"JOIN")?;
-                    Some(JoinKind::Left)
-                } else if self.eat_kw(b"CROSS") {
-                    self.expect_kw::<E>(b"JOIN")?;
-                    Some(JoinKind::Cross)
-                } else {
-                    None
-                };
-                let Some(kind) = kind else { break };
-                from.push(self.join_source::<E>(kind, false)?);
-            }
-        }
+        let from = if self.eat_kw(b"FROM") {
+            self.source_list::<E>()?
+        } else {
+            AVec::new()
+        };
         let filter = if self.eat_kw(b"WHERE") {
             Some(self.parse_expr::<E>()?)
         } else {
@@ -1759,7 +1770,7 @@ impl<'a> Parser<'a> {
             having,
             order_by: AVec::new(),
             limit: None,
-            offset: 0,
+            offset: None,
             compound: AVec::new(),
             values: AVec::new(),
         })
@@ -1780,14 +1791,22 @@ impl<'a> Parser<'a> {
                     let _ = self.eat_kw(b"ASC");
                     false
                 };
-                // NULLS FIRST/LAST: SQLite's defaults (ASC: first,
-                // DESC: last) are what the executor implements;
-                // accept and ignore the explicit form when it
-                // matches, which is the common case.
-                if self.eat_kw(b"NULLS") {
-                    let _ = self.eat_kw(b"FIRST") || self.eat_kw(b"LAST");
-                }
-                order_by.push((e, desc));
+                // NULLS FIRST / LAST (v0.16: honoured, where it
+                // was parsed and ignored before — a silent wrong
+                // answer for `ASC NULLS LAST` / `DESC NULLS
+                // FIRST`). The pin's grammar needs FIRST or LAST
+                // after NULLS; the default is NULL-smallest.
+                let nulls_first = if self.eat_kw(b"NULLS") {
+                    if self.eat_kw(b"FIRST") {
+                        true
+                    } else {
+                        self.expect_kw::<E>(b"LAST")?;
+                        false
+                    }
+                } else {
+                    !desc
+                };
+                order_by.push((e, SortOrder { desc, nulls_first }));
                 if self.eat(Tok::Comma) {
                     continue;
                 }
@@ -1795,17 +1814,17 @@ impl<'a> Parser<'a> {
             }
         }
         let mut limit = None;
-        let mut offset = 0i64;
+        let mut offset = None;
         if self.eat_kw(b"LIMIT") {
-            let first = self.limit_int::<E>()?;
+            let first = self.limit_term::<E>()?;
             if self.eat(Tok::Comma) {
                 // LIMIT offset, count
-                offset = first;
-                limit = Some(self.limit_int::<E>()?);
+                offset = Some(first);
+                limit = Some(self.limit_term::<E>()?);
             } else {
                 limit = Some(first);
                 if self.eat_kw(b"OFFSET") {
-                    offset = self.limit_int::<E>()?;
+                    offset = Some(self.limit_term::<E>()?);
                 }
             }
         }
@@ -1815,17 +1834,187 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn limit_int<E>(&mut self) -> Result<i64, E> {
+    /// One LIMIT / OFFSET term: an integer literal (v0.4), or —
+    /// under `v16` — any expression; the planner resolves it
+    /// against an empty scope (the pin: a LIMIT may not name a
+    /// column) and the executor converts its value with the
+    /// pin's `MustBeInt` rule.
+    fn limit_term<E>(&mut self) -> Result<Box<Expr>, E> {
+        #[cfg(feature = "v16")]
+        {
+            Ok(Box::new(self.parse_expr::<E>()?))
+        }
+        #[cfg(not(feature = "v16"))]
         match self.literal_at(self.pos) {
-            Some((Literal::Integer(v), used)) => {
+            Some((lit @ Literal::Integer(_), used)) => {
                 self.pos += used;
-                Ok(v)
+                Ok(Box::new(Expr::Literal(lit)))
             }
             _ => Err(perr(self.cur().offset, ParseKind::UnsupportedClause)),
         }
     }
 
-    fn join_source<E>(&mut self, kind: JoinKind, first: bool) -> Result<FromSource, E> {
+    /// `SELECT * FROM <table>` as an AST (v0.16: the subquery an
+    /// `x IN table` operand stands for).
+    #[cfg(feature = "v16")]
+    fn table_select(&self, table: ABytes) -> SelectStmt {
+        let mut items = AVec::new();
+        items.push(SelectItem::Star);
+        let mut from = AVec::new();
+        from.push(FromSource {
+            table,
+            alias: None,
+            kind: JoinKind::Inner,
+            on: None,
+            derived: None,
+            natural: false,
+            using: AVec::new(),
+        });
+        SelectStmt {
+            distinct: false,
+            items,
+            from,
+            filter: None,
+            group_by: AVec::new(),
+            having: None,
+            order_by: AVec::new(),
+            limit: None,
+            offset: None,
+            compound: AVec::new(),
+            values: AVec::new(),
+        }
+    }
+
+    /// A FROM clause body (v0.4; shared by SELECT and UPDATE
+    /// ... FROM): the first source, then `,` / join-operator
+    /// separated sources, each joined to everything on its left.
+    fn source_list<E>(&mut self) -> Result<AVec<FromSource>, E> {
+        let mut from = AVec::new();
+        from.push(self.join_source::<E>(JoinKind::Inner, false, true)?);
+        loop {
+            if self.eat(Tok::Comma) {
+                from.push(self.join_source::<E>(JoinKind::Cross, false, false)?);
+                continue;
+            }
+            let Some((kind, natural)) = self.join_op::<E>()? else {
+                break;
+            };
+            from.push(self.join_source::<E>(kind, natural, false)?);
+        }
+        Ok(from)
+    }
+
+    /// A join operator (v0.16, SQLite's `sqlite3JoinType`): up
+    /// to three of NATURAL / LEFT / OUTER / RIGHT / FULL / INNER
+    /// / CROSS, then JOIN. The flags combine as on the pin —
+    /// LEFT + RIGHT is a FULL join, OUTER only qualifies LEFT /
+    /// RIGHT / FULL (`OUTER JOIN`, `NATURAL OUTER JOIN` and
+    /// `INNER OUTER JOIN` are "unknown join type" there), and
+    /// INNER / CROSS with any outer flag is refused. Returns
+    /// None when no join operator starts here.
+    fn join_op<E>(&mut self) -> Result<Option<(JoinKind, bool)>, E> {
+        const NATURAL: u8 = 1;
+        const LEFT: u8 = 2;
+        const OUTER: u8 = 4;
+        const RIGHT: u8 = 8;
+        const INNER: u8 = 16;
+        const CROSS: u8 = 32;
+        const WORDS: [(&[u8], u8); 7] = [
+            (b"NATURAL", NATURAL),
+            (b"LEFT", LEFT | OUTER),
+            (b"OUTER", OUTER),
+            (b"RIGHT", RIGHT | OUTER),
+            (b"FULL", LEFT | RIGHT | OUTER),
+            (b"INNER", INNER),
+            (b"CROSS", INNER | CROSS),
+        ];
+        let mut flags = 0u8;
+        let mut n = 0usize;
+        while !self.cur_is_kw(b"JOIN") {
+            let Some(code) = WORDS
+                .iter()
+                .find(|(w, _)| self.cur_is_kw(w))
+                .map(|(_, c)| *c)
+            else {
+                if n == 0 {
+                    return Ok(None);
+                }
+                return Err(perr(self.cur().offset, ParseKind::UnknownJoinType));
+            };
+            if n == 3 {
+                return Err(perr(self.cur().offset, ParseKind::UnknownJoinType));
+            }
+            flags |= code;
+            n += 1;
+            self.pos += 1;
+        }
+        let at = self.cur().offset;
+        self.pos += 1;
+        if flags & (INNER | OUTER) == INNER | OUTER || flags & (OUTER | LEFT | RIGHT) == OUTER {
+            return Err(perr(at, ParseKind::UnknownJoinType));
+        }
+        let kind = if flags & (LEFT | RIGHT) == LEFT | RIGHT {
+            JoinKind::Full
+        } else if flags & RIGHT != 0 {
+            JoinKind::Right
+        } else if flags & LEFT != 0 {
+            JoinKind::Left
+        } else if flags & CROSS != 0 {
+            JoinKind::Cross
+        } else {
+            JoinKind::Inner
+        };
+        Ok(Some((kind, flags & NATURAL != 0)))
+    }
+
+    /// A joined source's constraint (v0.16): `ON <expr>`, or
+    /// `USING (col, ...)`, or nothing. A NATURAL join may carry
+    /// neither (the pin refuses it at prepare time); the first
+    /// source carries none (`FROM t ON ...` is an error there
+    /// too — the caller leaves the tokens unconsumed).
+    fn join_constraint<E>(
+        &mut self,
+        natural: bool,
+        first: bool,
+    ) -> Result<(Option<Expr>, AVec<ABytes>), E> {
+        let mut using = AVec::new();
+        if first {
+            return Ok((None, using));
+        }
+        let on = if self.eat_kw(b"ON") {
+            Some(self.parse_expr::<E>()?)
+        } else {
+            None
+        };
+        if on.is_none() && self.eat_kw(b"USING") {
+            self.expect::<E>(Tok::LParen)?;
+            loop {
+                match self.cur().tok {
+                    Tok::Ident(h, _) => {
+                        self.pos += 1;
+                        using.push(h);
+                    }
+                    _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+                }
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                self.expect::<E>(Tok::RParen)?;
+                break;
+            }
+        }
+        if natural && (on.is_some() || !using.is_empty()) {
+            return Err(perr(self.cur().offset, ParseKind::NaturalJoinConstraint));
+        }
+        Ok((on, using))
+    }
+
+    fn join_source<E>(
+        &mut self,
+        kind: JoinKind,
+        natural: bool,
+        first: bool,
+    ) -> Result<FromSource, E> {
         // A derived table (v0.9): `(SELECT ...)` or `(VALUES
         // ...)`, possibly under further parentheses (the pin
         // accepts `FROM ((SELECT 1)) s`). The alias is optional;
@@ -1847,33 +2036,29 @@ impl<'a> Parser<'a> {
                     self.expect::<E>(Tok::RParen)?;
                 }
                 let alias = self.opt_alias();
-                let on = if !first && self.eat_kw(b"ON") {
-                    Some(self.parse_expr::<E>()?)
-                } else {
-                    None
-                };
+                let (on, using) = self.join_constraint::<E>(natural, first)?;
                 return Ok(FromSource {
                     table: ABytes::EMPTY,
                     alias,
                     kind,
                     on,
                     derived: Some(Box::new(inner)),
+                    natural,
+                    using,
                 });
             }
         }
         let table = self.name::<E>()?;
         let alias = self.opt_alias();
-        let on = if !first && self.eat_kw(b"ON") {
-            Some(self.parse_expr::<E>()?)
-        } else {
-            None
-        };
+        let (on, using) = self.join_constraint::<E>(natural, first)?;
         Ok(FromSource {
             table,
             alias,
             kind,
             on,
             derived: None,
+            natural,
+            using,
         })
     }
 
@@ -2096,35 +2281,10 @@ impl<'a> Parser<'a> {
     /// FROM clause body.
     #[cfg(feature = "v07")]
     fn update_from<E>(&mut self) -> Result<AVec<FromSource>, E> {
-        let mut from = AVec::new();
         if !self.eat_kw(b"FROM") {
-            return Ok(from);
+            return Ok(AVec::new());
         }
-        from.push(self.join_source::<E>(JoinKind::Inner, true)?);
-        loop {
-            if self.eat(Tok::Comma) {
-                from.push(self.join_source::<E>(JoinKind::Cross, false)?);
-                continue;
-            }
-            let kind = if self.eat_kw(b"JOIN") {
-                Some(JoinKind::Inner)
-            } else if self.eat_kw(b"INNER") {
-                self.expect_kw::<E>(b"JOIN")?;
-                Some(JoinKind::Inner)
-            } else if self.eat_kw(b"LEFT") {
-                let _ = self.eat_kw(b"OUTER");
-                self.expect_kw::<E>(b"JOIN")?;
-                Some(JoinKind::Left)
-            } else if self.eat_kw(b"CROSS") {
-                self.expect_kw::<E>(b"JOIN")?;
-                Some(JoinKind::Cross)
-            } else {
-                None
-            };
-            let Some(kind) = kind else { break };
-            from.push(self.join_source::<E>(kind, false)?);
-        }
-        Ok(from)
+        self.source_list::<E>()
     }
 
     fn delete_stmt<E>(&mut self) -> Result<Ast, E> {

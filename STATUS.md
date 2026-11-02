@@ -4,6 +4,152 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.16 — SQLite-parity push
+
+Milestone v0.16 closes as much of the gap with the pin as
+possible under ADR 0001 (silent wrong answers fixed ungated;
+new surface behind the `v16` rung or a leaf feature; the tiny
+profile never grows). Each unit of the push records itself
+below.
+
+### Joins, ordering and query-shape completion (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated (below). Census (158 probes): MATCH 53 → 61,
+silent-wrong DIFF 8 → 4 (the four left — CHECK, generated
+columns, expression DEFAULTs, column COLLATE — belong to
+other units).
+
+**Shipped — ungated (fixes on claimed v0.4 paths):**
+
+- **RIGHT / FULL [OUTER] JOIN.** `RIGHT`, `FULL` and
+  `NATURAL` were eaten as a table *alias*, so `a RIGHT JOIN b`
+  ran as an inner join. They are now join keywords (never a
+  bare alias, as on the pin), parsed with SQLite's
+  `sqlite3JoinType` algebra (LEFT+RIGHT = FULL, OUTER only
+  qualifies an outer join, `INNER OUTER` / `LEFT CROSS` /
+  bare `OUTER` refused — `ParseKind::UnknownJoinType`).
+  Executor: the main nested loop in FROM order, then each
+  RIGHT / FULL source — earlier first — emits its
+  never-matched rows in its own row order, NULL-padded on the
+  left and joined onward. One async join executor now serves
+  top-level queries, subqueries and UPDATE ... FROM (three
+  copies merged; `SourcePlan` is `query::SubSource`); the
+  synchronous v0.4 path got the same tail.
+- **NATURAL / USING** (`SchemaKind::UsingColumnMissing`,
+  `ParseKind::NaturalJoinConstraint`, ambiguity as on the
+  pin): `SELECT *` shows a join column once, at the left-most
+  source; unqualified references follow the pin's
+  `lookupName` (left-most side after INNER/LEFT, right side
+  after RIGHT, `coalesce(...)` after FULL); star expansion of
+  a source left of a RIGHT/FULL join reads the joined value
+  (even `a.*`); qualified `t.col` still reads its own side.
+- **ON clauses naming a later source:** an inner join's ON is
+  hoisted into WHERE (hipp read a NULL slot and dropped every
+  row); on an outer join, or anywhere once a RIGHT/FULL join
+  exists, `SchemaKind::OnReferencesLaterSource`.
+- **Subquery inside a non-last source's ON** read misaligned
+  slots (wrong rows): the row is now padded to the full FROM
+  width for such an ON, and scope bases are computed from
+  each group's end slot (needed by UPDATE ... FROM, whose
+  FROM clause is now its own join scope: its ON / USING never
+  see the target, as on the pin).
+- **ORDER BY ... NULLS FIRST / LAST** was parsed and ignored
+  (and `NULLS` alone accepted): honoured at every ORDER BY
+  site — queries, compound ORDER BY, subqueries, derived
+  tables, INSERT ... SELECT.
+- **Term rules:** out-of-range ORDER BY / GROUP BY ordinals
+  error (`TermOutOfRange`; the pin's 32-bit "is integer" test
+  — `ORDER BY 2147483648` stays a constant); HAVING has no
+  ordinals (`HAVING 1` read item 1); a real column shadows an
+  alias in GROUP BY / HAVING (not ORDER BY); aggregates in
+  GROUP BY (`MisusedAggregate`); HAVING on a non-aggregate
+  query (`HavingWithoutAggregate`).
+- **IN over an empty set** is 0 (NOT IN 1) even for a NULL
+  left operand (hipp gave NULL); a real column named `rowid`
+  now beats another source's rowid instead of "ambiguous".
+
+**Shipped — `v16` (new rung, `v16 = ["v10"]`, in `full`):**
+LIMIT / OFFSET as expressions (constant or uncorrelated
+subquery, both `LIMIT x OFFSET y` and `LIMIT y, x`; resolved
+against an empty scope like the pin; value via the pin's
+`MustBeInt` — NUMERIC affinity then lossless integer, else
+`DatatypeMismatch`, raised even over no rows; negative LIMIT
+= none, negative OFFSET = 0; windows saturate instead of
+wrapping on 32-bit targets); result-column aliases inside
+WHERE / ON / GROUP BY / HAVING / ORDER BY expressions and
+their subqueries (current scope's columns, then its aliases,
+then outer scopes; never in the result list itself);
+`x [NOT] IN tablename` (one-column tables); string-literal
+aliases (`AS 'q'`, bare `'q'`).
+
+**Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
+not error text): the pin always runs the RIGHT/FULL join's
+left operand as the outer loop (EXPLAIN shows `RIGHT-JOIN b`
+after the main loop) and emits unmatched right rows in scan
+order — so unordered two-table RIGHT / FULL joins are
+compared row-for-row, while generated multi-way corpora are
+ORDER BY'd over every column (the planner may reorder inner
+joins). The USING / star / coalesce rules were derived from
+probes of every INNER/LEFT/RIGHT/FULL pairing in 2- and
+3-way chains (`a.* FROM a FULL JOIN b USING(id)` really
+yields `coalesce(a.id, b.id)`). LIMIT: `'2'`, `' 2 '`,
+`'2.0'`, `2.0`, `-0.0`, `true` convert; `2.5`, `NULL`,
+`'0x10'`, `1e19`, blobs do not; `LIMIT t.a` is "no such
+column" even inside a correlated subquery. Aliases: `WHERE`
+sees them, `ON` too (`ON k=u.a` substitutes `k` and then
+reports `a` ambiguous), the result list never; `GROUP BY b`
+with alias `b` and column `b` groups by the column.
+
+**Gates:** `ci/local-gates.sh` (full run) green — fmt,
+clippy `-D warnings` (default, all-features, every
+`ci/feature-sets.txt` line incl. the new `v16`), workspace
+tests, no_std builds (thumbv7em / thumbv6m / riscv32imac /
+wasm32, both profiles), both size gates. New suites:
+`tests/query_shape_v16.rs` (18 tests: RIGHT/FULL orders and
+chains, outer joins in subqueries / derived tables / INSERT
+... SELECT / UPDATE ... FROM, NATURAL/USING rows and star
+expansion, affinity, error agreement, ON forward references,
+ON-subquery alignment, rowid precedence, NULLS at every site,
+term rules, empty IN, a PRNG-generated join corpus, and the
+`v16` LIMIT / alias / IN-table tests — the ungated tests also
+pass in a `v10`-without-`v16` build) and
+`hipp-cli/tests/cli_v16_query_shape.rs` (3 byte-identical
+batches, one-shot and stdin, REAL / blob rendering included).
+
+**Size:** tiny **81,616 B** (Δ **−64 B** vs 81,680; ratchet
+lowered — the AST change from literal LIMIT integers to
+expression handles shortened the legacy constructor paths);
+full **257,117 B** (Δ **+652 B** vs 256,465, ratchet raised:
+the RIGHT/FULL tail, USING/NATURAL planning, alias scopes and
+LIMIT evaluation, mostly paid for by merging the three
+duplicated join executors and the duplicated
+`plan_query` / `plan_subquery` bodies into `plan_core`).
+
+**Honest gaps:**
+
+- Output order where the pin's order is a planner accident
+  (inner joins it reorders, an index-driven RIGHT-join tail
+  scan) is not reproduced; hipp has no index-driven join
+  planning, so tests ORDER BY there.
+- An aggregate inside a subquery whose arguments name only
+  outer columns belongs to the *outer* query on the pin
+  (`SELECT (SELECT max(t.a) FROM u) FROM t` is one row; with
+  an alias, `WHERE z = (SELECT max(z) ...)` is a misuse
+  error); hipp still aggregates it in the subquery. Found
+  while probing aliases; a subquery-scoping fix outside this
+  unit.
+- `-9223372036854775808` is an INTEGER literal on the pin and
+  a REAL in hipp (so `LIMIT -9223372036854775808` errors) —
+  a literal-parsing gap outside this unit.
+- `x IN view` (and NATURAL / USING with a view) stays refused:
+  views are inert.
+- Parenthesised join groups (`FROM (a JOIN b USING (id))`)
+  are still refused; LIMIT on UPDATE / DELETE is a
+  compile-time option the pin's CLI build lacks.
+- Probed on the local 3.53.1 stand-in; nothing relied on is
+  known to differ in 3.54.1, and CI runs the real pin.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

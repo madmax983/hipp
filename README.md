@@ -8,17 +8,34 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.13 — uncorrelated-subquery hoisting
-  (an uncorrelated subquery executes once per statement,
-  not once per outer row — and the pin's per-statement
-  snapshot semantics now hold on the write side too),
-  on the v0.12 foundation (SPEC §2).
+- **Phase:** v0.16 — the SQLite-parity push (ADR 0001:
+  silent wrong answers fixed ungated, new dialect behind the
+  `v16` rung / leaf features, the tiny profile never grows),
+  on the v0.15 foundation (SPEC §2).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
   files, and real SQLite recovers hipp's rollback journals.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## What v0.16 does
+
+- **Joins, ordering and query-shape completion.** Ungated
+  fixes to claimed v0.4 paths: `RIGHT` / `FULL [OUTER]
+  JOIN` (they used to parse as a table alias and run as an
+  inner join) with the pin's row order; `NATURAL` and
+  `USING (...)` joins with the pin's `SELECT *` expansion
+  and USING-column resolution (left-most side, right side
+  after RIGHT, `coalesce` after FULL); ON clauses that name
+  a later source (hoisted on inner joins, refused on outer
+  ones); `ORDER BY ... NULLS FIRST / LAST` honoured
+  everywhere; the pin's ordinal / alias / HAVING term rules;
+  `NULL IN (<empty>)` = 0. Behind the new `v16` rung:
+  LIMIT / OFFSET as expressions (constant or uncorrelated
+  subquery, the pin's integer conversion), result-column
+  aliases inside WHERE / ON / GROUP BY / HAVING / ORDER BY,
+  `x IN tablename`, and string-literal aliases.
 
 ## What v0.13 does
 

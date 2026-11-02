@@ -59,6 +59,29 @@ pub enum SchemaKind {
     /// `DROP VIEW` named a table instead of a view (v0.5; the
     /// oracle refuses this even under IF EXISTS).
     IsTable,
+    /// A `USING (col)` / NATURAL join column that is missing from
+    /// the joined source or from every source on its left
+    /// (v0.16; the pin's "cannot join using column ... not
+    /// present in both tables"). Name a column both sides have.
+    UsingColumnMissing,
+    /// An ON clause names a source joined after it (v0.16): an
+    /// outer join's ON (LEFT / RIGHT / FULL) never may, and with
+    /// a RIGHT / FULL join anywhere in the FROM clause no ON may
+    /// — the pin's "ON clause references tables to its right".
+    /// Move the term to WHERE or to a later ON.
+    OnReferencesLaterSource,
+    /// An ORDER BY / GROUP BY ordinal outside 1..=result width
+    /// (v0.16; the pin's "term out of range"). Use a valid
+    /// column number or an expression.
+    TermOutOfRange,
+    /// An aggregate where the pin forbids one (v0.16): in a
+    /// GROUP BY term (directly, or through an ordinal / alias
+    /// naming an aggregate result column) or in LIMIT / OFFSET.
+    MisusedAggregate,
+    /// A HAVING clause on a query that is not an aggregate query
+    /// — no GROUP BY and no aggregate in the result list (v0.16;
+    /// the pin refuses it). Add a GROUP BY or use WHERE.
+    HavingWithoutAggregate,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -71,6 +94,15 @@ pub enum ParseKind {
     UnsupportedClause,
     RecursionLimit,
     TrailingInput,
+    /// A join operator whose keywords do not form a join type
+    /// (v0.16): `OUTER JOIN` alone, `INNER OUTER JOIN`, `LEFT
+    /// CROSS JOIN`, more than three keywords — the pin's
+    /// "unknown join type". Write LEFT / RIGHT / FULL [OUTER],
+    /// [INNER | CROSS], optionally after NATURAL.
+    UnknownJoinType,
+    /// A NATURAL join that also has an ON or USING clause
+    /// (v0.16; the pin refuses it). Drop NATURAL or the clause.
+    NaturalJoinConstraint,
 }
 
 /// The core error type. Generic over the storage error `E`.

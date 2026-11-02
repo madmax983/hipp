@@ -151,12 +151,46 @@ pub enum SelectItem {
     Expr(Expr, Option<ABytes>, ABytes),
 }
 
-/// How a FROM source joins the previous ones (v0.4).
+/// How a FROM source joins the previous ones (v0.4; `Right` /
+/// `Full` v0.16). The FROM clause is a left-deep tree: source
+/// `i` joins the result of sources `0..i`. The pin's keyword
+/// combinations map here as SQLite's `sqlite3JoinType` does —
+/// LEFT and RIGHT together (`FULL`, or even `LEFT RIGHT`) are
+/// `Full`, `OUTER` is only a modifier of LEFT / RIGHT / FULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,
     Left,
     Cross,
+    /// `RIGHT [OUTER] JOIN` (v0.16): every row of this source
+    /// appears; one that no left combination matched is emitted
+    /// NULL-padded on the left after the whole left operand has
+    /// been scanned (the pin's order).
+    Right,
+    /// `FULL [OUTER] JOIN` (v0.16): LEFT and RIGHT together.
+    Full,
+}
+
+impl JoinKind {
+    /// Unmatched left combinations are NULL-padded (LEFT, FULL).
+    pub fn pads_right(self) -> bool {
+        matches!(self, JoinKind::Left | JoinKind::Full)
+    }
+    /// Unmatched rows of this source are emitted NULL-padded on
+    /// the left (RIGHT, FULL).
+    pub fn pads_left(self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Full)
+    }
+}
+
+/// The direction of one ORDER BY term (v0.16 adds NULL
+/// placement): `nulls_first` is SQLite's default `!desc` (NULL
+/// sorts smallest) unless `NULLS FIRST` / `NULLS LAST` was
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortOrder {
+    pub desc: bool,
+    pub nulls_first: bool,
 }
 
 /// One FROM source (v0.4): a table (or view name, resolved at plan
@@ -175,6 +209,16 @@ pub struct FromSource {
     pub on: Option<Expr>,
     /// A FROM-clause subquery (v0.9, feature `v09`).
     pub derived: Option<Box<SelectStmt>>,
+    /// `NATURAL` was written on this join (v0.16): the join
+    /// columns are this source's columns that any source to its
+    /// left also has, in this source's column order. Never
+    /// combined with `on` / `using` (the parser refuses that).
+    #[cfg(feature = "v04")]
+    pub natural: bool,
+    /// `USING (col, ...)` column names as written (v0.16);
+    /// empty when the clause is absent.
+    #[cfg(feature = "v04")]
+    pub using: AVec<ABytes>,
 }
 
 /// A compound SELECT operator (v0.9). All four operators have
@@ -201,10 +245,15 @@ pub struct SelectStmt {
     pub filter: Option<Expr>,
     pub group_by: AVec<Expr>,
     pub having: Option<Expr>,
-    /// (expression, descending) pairs.
-    pub order_by: AVec<(Expr, bool)>,
-    pub limit: Option<i64>,
-    pub offset: i64,
+    /// (expression, direction) pairs (v0.16: the direction
+    /// carries the NULLS FIRST / LAST placement).
+    pub order_by: AVec<(Expr, SortOrder)>,
+    /// `LIMIT` expression (v0.16: a general expression under
+    /// the `v16` feature; an integer literal before it).
+    pub limit: Option<Box<Expr>>,
+    /// `OFFSET` expression (also the first term of the
+    /// `LIMIT offset, count` form); None when absent.
+    pub offset: Option<Box<Expr>>,
     /// Compound tail (v0.9, feature `v09`): `(op, core)` pairs
     /// in source order, applied left to right (all compound
     /// operators share one precedence on the pin — see
