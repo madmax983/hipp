@@ -22,6 +22,8 @@ pub mod pager;
 #[cfg(feature = "v04")]
 pub mod query;
 pub mod record;
+#[cfg(feature = "v04")]
+pub mod rules;
 pub mod schema;
 pub mod session;
 pub mod sql;

@@ -36,6 +36,23 @@ aspirations.
   subquery, the pin's integer conversion), result-column
   aliases inside WHERE / ON / GROUP BY / HAVING / ORDER BY,
   `x IN tablename`, and string-literal aliases.
+- **Column constraints and table definitions.** Ungated
+  wherever the v0.4 evaluator is built (they used to be
+  parsed and silently ignored): CHECK constraints on every
+  write path with the pin's NULL-passes / OR IGNORE / no-REPLACE
+  rules and NOT NULL → STRICT → CHECK → UNIQUE precedence;
+  expression DEFAULTs (`DEFAULT (1+2)` stored 1), signed and
+  identifier defaults, and CURRENT_TIME / DATE / TIMESTAMP
+  through a caller-supplied `Config::clock` (`Error::NoClock`
+  without one); VIRTUAL / STORED generated columns in the pin's
+  record layout (files interoperate both ways), indexable,
+  recomputed on UPDATE; UPDATE ... FROM applying only the last
+  matching combination; MustBeInt rowid conversion. The tiny
+  profile refuses those clauses (`RequiresEvaluator`) instead
+  of ignoring them, and still shrank. Behind `v16`: INSERT ...
+  DEFAULT VALUES, CREATE TABLE ... AS SELECT (the pin's column
+  names, declared types and schema text, byte for byte) and
+  STRICT tables. WITHOUT ROWID stays refused.
 
 ## What v0.13 does
 
@@ -341,7 +358,8 @@ differential testing. It is a separate crate and contributes
 ## Non-goals (SPEC §3)
 
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
-no expression or partial indexes, no subqueries, no bound
+no WITHOUT ROWID tables (refused), no expression or partial
+indexes, no subqueries, no bound
 parameters, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed, no UTF-16, no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
@@ -355,8 +373,10 @@ A workspace: the zero-dependency core crate at the root plus
 (page cache, journal protocol, commit machine), `btree`,
 `record` (serial codec, affinity), `schema` (catalog), `sql/`
 (lexer, parser, AST), `query` (resolved-expression evaluator,
-v0.4), `session` (Connection/Statement, planner, tree-walking
-executor), `error` (remedy-named errors).
+v0.4), `rules` (CHECK / generated-column / STRICT / DEFAULT
+rules and the generated-column row codec, v0.16), `session`
+(Connection/Statement, planner, tree-walking executor),
+`error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.
 

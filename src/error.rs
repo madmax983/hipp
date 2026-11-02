@@ -82,6 +82,41 @@ pub enum SchemaKind {
     /// — no GROUP BY and no aggregate in the result list (v0.16;
     /// the pin refuses it). Add a GROUP BY or use WHERE.
     HavingWithoutAggregate,
+    /// A row failed one of its table's CHECK constraints
+    /// (v0.16): the constraint evaluated to false — NULL passes.
+    /// Raised under every conflict action except OR IGNORE
+    /// (which skips the row); OR REPLACE does not resolve it.
+    CheckViolation,
+    /// A column DEFAULT that is not constant (v0.16; the pin's
+    /// "default value of column is not constant"): it names a
+    /// column or contains a subquery. Use a literal or a
+    /// constant expression in parentheses.
+    NotConstantDefault,
+    /// Generated columns that depend on each other in a cycle
+    /// (v0.16; the pin's "generated column loop").
+    GeneratedColumnLoop,
+    /// A generated column the pin refuses to define (v0.16): a
+    /// DEFAULT on it, a PRIMARY KEY on it, a qualified (`t.c`)
+    /// reference or `rowid` in its expression, or a table with
+    /// no non-generated column. Drop the offending clause.
+    InvalidGeneratedColumn,
+    /// A subquery inside a CHECK constraint or generated column
+    /// (v0.16; the pin prohibits both).
+    SubqueryInConstraint,
+    /// An INSERT column list / UPDATE SET / upsert DO UPDATE
+    /// SET names a generated column (v0.16; the pin's "cannot
+    /// INSERT/UPDATE generated column"). Write its source
+    /// columns instead.
+    GeneratedColumnWrite,
+    /// A STRICT table column received a value its declared type
+    /// cannot hold after the type's conversion (v0.16; the
+    /// pin's "cannot store TEXT value in INT column").
+    StrictTypeViolation,
+    /// A STRICT table column without a type, or with one other
+    /// than INT / INTEGER / REAL / TEXT / BLOB / ANY (v0.16;
+    /// the pin's "missing / unknown datatype"). Declare one of
+    /// the six.
+    StrictColumnType,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -103,6 +138,13 @@ pub enum ParseKind {
     /// A NATURAL join that also has an ON or USING clause
     /// (v0.16; the pin refuses it). Drop NATURAL or the clause.
     NaturalJoinConstraint,
+    /// A CHECK constraint, generated column, or non-literal
+    /// DEFAULT in a build without the v0.4 expression evaluator
+    /// (the tiny profile, v0.16): hipp cannot enforce or
+    /// compute it, so it refuses the table instead of silently
+    /// ignoring the clause. Build with feature `v04` (or
+    /// `full`), or drop the clause.
+    RequiresEvaluator,
 }
 
 /// The core error type. Generic over the storage error `E`.
@@ -150,6 +192,11 @@ pub enum Error<E> {
     ArenaExhausted { scope: Scope, needed: usize },
     /// The rollback journal is malformed beyond safe recovery.
     CorruptJournal,
+    /// A statement needs the wall clock (`DEFAULT
+    /// CURRENT_TIMESTAMP` and friends, v0.16) but the connection
+    /// has none: the core has no clock of its own. Supply one
+    /// with `Config::clock`.
+    NoClock,
     /// The caller's storage device error.
     Storage(E),
 }
@@ -185,6 +232,7 @@ impl<E> Error<E> {
             Error::TransactionState { nested } => Error::TransactionState { nested },
             Error::ArenaExhausted { scope, needed } => Error::ArenaExhausted { scope, needed },
             Error::CorruptJournal => Error::CorruptJournal,
+            Error::NoClock => Error::NoClock,
             Error::Storage(e) => Error::Storage(e.into()),
         }
     }

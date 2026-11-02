@@ -45,9 +45,27 @@ pub struct ColumnDef {
     /// A `DEFAULT` was present but is not a plain literal
     /// (e.g. `CURRENT_TIMESTAMP`, a function call) (v0.4).
     pub default_nonconst: bool,
-    /// `GENERATED ALWAYS AS` appeared (v0.4: recorded so ADD
-    /// COLUMN can refuse generated columns).
+    /// The column is generated — `GENERATED ALWAYS AS (expr)`
+    /// or the short `AS (expr)` (v0.4: recorded so ADD COLUMN
+    /// could refuse it; v0.16: computed, see `gen_expr`).
     pub generated: bool,
+    /// The DEFAULT clause's expression text when it is not a
+    /// plain literal (v0.16): `(1+2)`, `-'3'`, `-x'01'`,
+    /// `CURRENT_TIMESTAMP`, ... — re-parsed and evaluated by
+    /// the planner when a row needs the default. `None` for a
+    /// literal default (then `default` holds it) or no DEFAULT.
+    #[cfg(feature = "v04")]
+    pub default_expr: Option<ABytes>,
+    /// The generation expression's text (the inside of `AS
+    /// (...)`) of a generated column (v0.16).
+    #[cfg(feature = "v04")]
+    pub gen_expr: Option<ABytes>,
+    /// A generated column written `STORED` (v0.16): computed on
+    /// write and kept in the record. Otherwise (`VIRTUAL`, the
+    /// default) it is computed on read and absent from the
+    /// record, exactly as in the pin's file format.
+    #[cfg(feature = "v04")]
+    pub stored: bool,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -325,6 +343,19 @@ pub enum Ast {
         /// UNIQUE / PRIMARY KEY constraint sets in statement
         /// order (v0.3).
         constraint_sets: AVec<ConstraintSet>,
+        /// CHECK constraint expression texts, column-level and
+        /// table-level, in statement order (v0.16; the inside
+        /// of each `CHECK (...)`).
+        #[cfg(feature = "v04")]
+        checks: AVec<ABytes>,
+        /// The `STRICT` table option (v0.16, feature `v16`).
+        #[cfg(feature = "v16")]
+        strict: bool,
+        /// `CREATE TABLE ... AS SELECT ...` (v0.16, feature
+        /// `v16`): the columns are derived from the SELECT and
+        /// `columns` is empty.
+        #[cfg(feature = "v16")]
+        as_select: Option<Box<SelectStmt>>,
     },
     /// `CREATE [UNIQUE] INDEX` (v0.3).
     CreateIndex {
@@ -411,6 +442,10 @@ pub enum Ast {
         table: ABytes,
         column: ColumnDef,
         text: ABytes,
+        /// The new column's CHECK constraint texts (v0.16): the
+        /// pin verifies existing rows against them.
+        #[cfg(feature = "v04")]
+        checks: AVec<ABytes>,
     },
     /// `CREATE VIEW` (v0.4): stored SQL, inert — the SELECT is
     /// parsed and validated at plan time but never executed;

@@ -150,6 +150,209 @@ duplicated join executors and the duplicated
 - Probed on the local 3.53.1 stand-in; nothing relied on is
   known to differ in 3.54.1, and CI runs the real pin.
 
+### Column constraints and table definitions (2026-11-02)
+
+**Status:** implemented, differential-tested against the
+oracle, gated (below). Census (158 probes): MATCH 61 → 66,
+silent-wrong DIFF 4 → 1 (CHECK, expression DEFAULTs and
+generated columns fixed; column COLLATE belongs to another
+unit). A new module `src/rules.rs` (built with `v04`) holds
+the rule planner and the row codec; the catalog keeps each
+rule as SQL text and every write re-resolves it.
+
+**Shipped — ungated wherever the v0.4 evaluator is built
+(fixes on claimed paths):**
+
+- **CHECK constraints** (column-level, table-level,
+  `CONSTRAINT name CHECK`) — parsed and ignored before —
+  enforced on INSERT (VALUES / SELECT / REPLACE), UPDATE
+  (incl. FROM) and the upsert DO UPDATE row, with the pin's
+  rules: a NULL result passes; the expression reads
+  affinity-converted values and the final rowid (an `INTEGER
+  PRIMARY KEY` CHECK sees the auto-assigned rowid); OR IGNORE
+  skips the row, every other action errors
+  (`SchemaKind::CheckViolation`) — OR REPLACE does not resolve
+  a CHECK; the DO UPDATE row errors even under OR IGNORE, the
+  proposal is checked before arbitration (OR IGNORE skips it
+  wholesale). Order: NOT NULL, generated columns, STRICT, CHECK,
+  then uniqueness. An UPDATE (and DO UPDATE) checks NOT NULL
+  only on assigned columns and evaluates a CHECK only when it
+  reads an assigned column, a generated column computed from
+  one, or a changed rowid — the pin's optimisation, observable
+  on rows written under `ignore_check_constraints`. CREATE
+  TABLE refuses what the pin refuses: subqueries
+  (`SubqueryInConstraint`), aggregates (`MisusedAggregate`),
+  unknown columns / functions.
+- **DEFAULT values:** `DEFAULT (1+2)` used to store 1 (the
+  parser kept the first literal); `-'3'`, `-x'01'`, `DEFAULT
+  identifier`, CURRENT_TIME / DATE / TIMESTAMP used to read
+  NULL. Expression defaults are now re-parsed and evaluated:
+  constant ones are folded once at catalog build (so short
+  records, CREATE INDEX and every reader see the pin's value);
+  ones naming the clock — or failing, e.g. an unknown function
+  — are evaluated per statement only when a row needs them (an
+  unknown function errors at that INSERT, as on the pin, and
+  not at CREATE). A column reference or subquery is refused at
+  CREATE (`NotConstantDefault`). The clock is a new
+  `Config::clock(fn() -> i64)` hook (Unix ms; read at most once
+  per statement, formatted UTC with seconds truncated);
+  without one a statement that needs it fails with the new
+  `Error::NoClock`. ALTER TABLE ADD COLUMN takes only the pin's
+  `sqlite3ValueFromExpr` shape (a literal, possibly signed or
+  CAST: `-'3'` adds, `(1+2)` / CURRENT_TIMESTAMP do not), and a
+  short record now reads the default *with the column's
+  affinity* (`ADD COLUMN c INT DEFAULT '5'` reads 5, hipp
+  returned '5' — fixed in every profile).
+- **Generated columns** (`GENERATED ALWAYS AS (expr)` and `AS
+  (expr)`, VIRTUAL / STORED) — parsed as part of the declared
+  type and read as NULL before: computed in dependency order
+  with the column's affinity; VIRTUAL columns are absent from
+  the record, STORED ones stored in place — the pin's
+  `sqlite3TableColumnToStorage` layout, verified both ways
+  (hipp-written files read and pass `integrity_check` on the
+  oracle, oracle-written files read, update and index
+  correctly in hipp). INSERT without a column list supplies the
+  non-generated columns; naming a generated column in INSERT /
+  UPDATE / DO UPDATE is `GeneratedColumnWrite`; SELECT `*`,
+  RETURNING and `excluded.*` include them; indexes and UNIQUE
+  constraints on them (VIRTUAL included) are maintained;
+  UPDATE recomputes them; NOT NULL / CHECK apply to them.
+  Definition errors as on the pin: loops
+  (`GeneratedColumnLoop`), DEFAULT / PRIMARY KEY on one, a
+  qualified name, a table of only generated columns
+  (`InvalidGeneratedColumn`), `rowid` (no such column),
+  subqueries, aggregates. ALTER TABLE ADD COLUMN takes VIRTUAL
+  ones (not STORED, `CannotAddColumn`), verifying existing rows
+  against a generated NOT NULL column and the table's CHECKs
+  (the pin's post-ADD `quick_check`).
+- **UPDATE ... FROM** applies only the *last* matching FROM
+  combination per target row (found while probing CHECK): the
+  pin materialises the join keyed by target rowid, so earlier
+  combinations are never checked — hipp used to apply each in
+  turn (same final value, but NOT NULL / CHECK fired on the
+  earlier ones). `FROM s RETURNING ...` no longer aliases `s`
+  as RETURNING.
+- **Rowid values** convert like the pin's MustBeInt in INSERT,
+  UPDATE and DO UPDATE: `'8'`, `9.0`, `' 10 '`, `'1e2'` are
+  rowids (they were a datatype mismatch) — fixed in every
+  profile.
+- **Tiny profile:** the parser refuses (new
+  `ParseKind::RequiresEvaluator`) every CHECK, generated column
+  and non-literal DEFAULT instead of ignoring it; it still
+  takes literal defaults, bare or parenthesised, signed, TRUE /
+  FALSE / NULL and `DEFAULT "quoted"`. Replacing the derived
+  `PartialEq for Tok` with discriminant / `matches!` tests (it
+  was instantiated for `Option<Tok>` comparisons) paid for it.
+
+**Shipped — `v16`:** `INSERT INTO t DEFAULT VALUES` (with
+RETURNING; no column list, no ON CONFLICT, as on the pin);
+`CREATE TABLE ... AS SELECT` with the pin's column names
+(alias, else the column's name — `rowid` or the rowid-alias
+column's name for a rowid reference — else the expression
+text; duplicates `:1`, `:2`, `:3`), declared types from
+`sqlite3ExprAffinity` (a scalar subquery's first column's;
+the pin's compound demotion / FLEXNUM) and its
+`createTableStmt` text byte for byte (keyword quoting from the
+pin's 147-keyword list, the 50-byte one-line threshold); and
+STRICT tables (`STRICT` / `STRICT, STRICT` table options;
+INT / INTEGER / REAL / TEXT / BLOB / ANY, case-insensitive,
+else `StrictColumnType`; ANY has no affinity; a value the
+type's affinity cannot convert is `StrictTypeViolation` under
+every conflict action, generated columns included; checked
+after NOT NULL and before CHECK; ALTER verifies existing rows).
+WITHOUT ROWID stays refused.
+
+**Oracle-probing notes** (stand-in 3.53.1 locally; semantics,
+not error text): precedence NOT NULL → STRICT → CHECK → UNIQUE
+(`('q', NULL)` reports NOT NULL; `(1.5, 'x')` with a failing
+CHECK reports the type); `CHECK(a)` passes NULL, `'1abc'`,
+`0.5`, fails `'abc'`, `x'00'`, `0`; `CHECK(nofunc(a))` fails
+CREATE but `DEFAULT (nofunc())` fails only the INSERT that
+needs it; `DEFAULT 1+2` and `DEFAULT -TRUE` are syntax errors,
+`DEFAULT hello` is `'hello'`, `-x'01'` is 0, `+'abc'` stays
+text, `-0x10` is -16; `b GENERATED AS (a)` declares type
+GENERATED; `GENERATED ALWAYS AS (a) VIRTUAL STORED` is a syntax
+error; VIRTUAL values are type-checked in STRICT tables;
+`INSERT INTO t VALUES (...)` counts only non-generated columns;
+`PRAGMA table_info` hides generated columns (hipp has no
+PRAGMA); ALTER's `DEFAULT 5 CHECK(l > 10)` fails on a
+non-empty table only. The keyword list was verified by
+creating a CTAS column named after each candidate word.
+
+**Gates:** `ci/local-gates.sh` (full run) green. New suites:
+`tests/table_defs_v16.rs` (27 tests: CHECK truth rules,
+affinity, rowid, precedence, upsert / REPLACE / INSERT ...
+SELECT, the UPDATE ... FROM last-combination regression,
+UPDATE change sets over violating rows, definition errors, an
+oracle-written CHECK file; every DEFAULT form, deferred and
+definition errors, OR REPLACE substitution, the clock hook —
+fixed and pre-epoch times, a 50-point PRNG calendar against the
+oracle's `datetime(..., 'unixepoch')`, `NoClock` — and ALTER's
+default / CHECK / generated rules; generated columns both
+directions incl. indexes on VIRTUAL columns, upsert, REPLACE,
+definition errors; rowid conversion; a PRNG constraint corpus
+over 6 random schemas × 40 random statements; and the `v16`
+DEFAULT VALUES, CTAS (schema text byte-compared through the
+oracle) and STRICT tests — the 21 ungated ones also pass in a
+`v10`-without-`v16` build), `hipp-cli/tests/cli_v16_table_defs.rs`
+(4 byte-identical batches, one-shot and stdin, REAL rendering
+included, plus a `.dump` replay of a generated-column table —
+the CLI's `.dump` now writes only non-generated columns, as the
+pin's shell does, using the new `TableMeta::columns` /
+`generated`), and parser unit tests for the tiny refusals (run by
+the `--no-default-features` lib test gate).
+
+**Size:** tiny **81,524 B** (Δ **−92 B** vs 81,616; ratchet
+lowered — the `Tok` comparison rewrite saves more than the
+tiny parser's new refusals and the rowid / default-affinity
+fixes cost); full **276,127 B** (Δ **+19,010 B** vs 257,117,
+ratchet raised; over `justify_over` (16,384 B), justified
+here: the rule planner and row codec (`plan_rules`,
+`validate_def`, `resolve`, `decode_rec` / `encode_rec`, ~5 KB),
+expression-default evaluation with the calendar (~1.2 KB),
+the parser's clause spans and stricter column grammar (~1 KB),
+CTAS naming / quoting / affinity (~1.5 KB), the lexer no longer
+inlined into `parse` now that `parse_expr_text` also calls it
+(net ~+0.4 KB), and the write / read paths' rule plumbing in
+the planner and the async step state machines (~8 KB)).
+
+**Honest gaps:**
+
+- `PRAGMA ignore_check_constraints` is not offered: hipp has no
+  PRAGMA statements yet (another unit's surface).
+- Constraint-level conflict clauses (`a UNIQUE ON CONFLICT
+  IGNORE`, `NOT NULL ON CONFLICT REPLACE`) are still parsed and
+  ignored: such a write errors where the pin would resolve it
+  (an error, never a silent wrong answer).
+- hipp's function library has no non-deterministic function,
+  so the pin's "non-deterministic functions prohibited in
+  generated columns" cannot arise; a unit adding `random()` or
+  `'now'` must refuse them there.
+- The tiny profile refuses such tables at parse, so it cannot
+  open a file holding any table with a CHECK, generated column
+  or expression DEFAULT (the WITHOUT ROWID precedent); it also
+  refuses the unquoted `DEFAULT identifier` form that `v04`
+  builds accept (distinguishing it from the clock keywords did
+  not fit the ratchet).
+- A double-quoted `"current_timestamp"` inside a parenthesised
+  DEFAULT reads as the clock keyword (the AST does not keep
+  quotedness); the pin calls it a non-constant column.
+- CTAS: a fourth duplicate column name gets a random suffix on
+  the pin — hipp refuses it (`Unsupported`); an explicit alias
+  spelled `oid` / `_rowid_` on a rowid reference is renamed
+  `rowid`; compound affinity demotion reads hipp's resolved
+  expression shapes, not the pin's parse tree (they agree on
+  the probed literal / column / CAST / function / CASE shapes).
+  hipp cannot query `sqlite_schema` itself (another unit), so
+  CTAS text is verified through the oracle reading hipp's file.
+- A record shorter than its table whose missing column has a
+  foldable *expression* default reads the folded value; the
+  pin's `OP_Column` would read NULL — reachable only with a
+  foreign writer (ALTER refuses such defaults).
+- Probed on the local 3.53.1 stand-in; STRICT (3.37) and
+  generated columns (3.31) are long-stable, and nothing relied
+  on is known to differ in 3.54.1. CI runs the real pin.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

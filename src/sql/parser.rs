@@ -74,6 +74,27 @@ pub fn parse<E>(sql: &[u8], arena: &Arena) -> Result<Ast, E> {
     Ok(ast)
 }
 
+/// Parse one stand-alone expression (v0.16): the stored text of
+/// a CHECK constraint, generated column or DEFAULT, re-parsed by
+/// the planner into `arena`. The whole input must be the one
+/// expression.
+#[cfg(feature = "v04")]
+pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena) -> Result<Expr, E> {
+    let toks = lexer::lex::<E>(sql, arena)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let e = p.parse_expr::<E>()?;
+    if !p.at_eof() {
+        return Err(perr(p.cur().offset, ParseKind::TrailingInput));
+    }
+    Ok(e)
+}
+
 impl<'a> Parser<'a> {
     fn cur(&self) -> Token {
         let i = self.pos.min(self.limit - 1);
@@ -123,7 +144,11 @@ impl<'a> Parser<'a> {
     }
 
     fn eat(&mut self, t: Tok) -> bool {
-        if self.cur().tok == t {
+        // Discriminant compare: `eat` / `expect` only take
+        // payload-free tokens, and it keeps the derived
+        // `PartialEq for Tok` (f64 / handle payloads) out of the
+        // tiny build.
+        if core::mem::discriminant(&self.cur().tok) == core::mem::discriminant(&t) {
             self.pos += 1;
             true
         } else {
@@ -145,7 +170,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(h, _) => {
                 self.pos += 1;
                 // Accept (and discard) a schema qualifier: `main.t`.
-                if self.cur().tok == Tok::Dot {
+                if matches!(self.cur().tok, Tok::Dot) {
                     self.pos += 1;
                     return self.name::<E>();
                 }
@@ -361,7 +386,7 @@ impl<'a> Parser<'a> {
             // An expression index column looks like `abs(a)` or
             // `(a+1)`: a '(' right here (or as the item start,
             // caught because name() rejects '(') is outside v0.3.
-            if self.cur().tok == Tok::LParen {
+            if matches!(self.cur().tok, Tok::LParen) {
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
             if self.eat_kw(b"COLLATE") {
@@ -427,6 +452,22 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.name::<E>()?;
+        // CREATE TABLE ... AS SELECT (v0.16, `v16`): the columns
+        // come from the SELECT at plan time.
+        #[cfg(feature = "v16")]
+        if self.eat_kw(b"AS") {
+            let select = self.select_rich::<E>()?;
+            return Ok(Ast::CreateTable {
+                name,
+                if_not_exists,
+                columns: AVec::new(),
+                pk_columns: AVec::new(),
+                constraint_sets: AVec::new(),
+                checks: AVec::new(),
+                strict: false,
+                as_select: Some(Box::new(select)),
+            });
+        }
         self.expect::<E>(Tok::LParen)?;
         // Split the parenthesised body into top-level comma items.
         let items = self.split_items::<E>()?;
@@ -434,6 +475,8 @@ impl<'a> Parser<'a> {
         let mut pk_names: AVec<ABytes> = AVec::new();
         let mut pk_desc_names: AVec<ABytes> = AVec::new();
         let mut sets: AVec<ConstraintSet> = AVec::new();
+        #[cfg(feature = "v04")]
+        let mut checks: AVec<ABytes> = AVec::new();
         for (from, to) in items.iter() {
             self.create_item::<E>(
                 *from,
@@ -442,6 +485,8 @@ impl<'a> Parser<'a> {
                 &mut pk_names,
                 &mut pk_desc_names,
                 &mut sets,
+                #[cfg(feature = "v04")]
+                &mut checks,
             )?;
         }
         if columns.is_empty() {
@@ -480,7 +525,27 @@ impl<'a> Parser<'a> {
             // SQLite: "table has more than one primary key".
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
+        // Table options (v0.16, `v16`): a comma-separated list of
+        // STRICT and WITHOUT ROWID, as on the pin (`STRICT,STRICT`
+        // parses; `STRICT STRICT` does not). WITHOUT ROWID stays
+        // outside every hipp phase and is refused.
+        #[cfg(feature = "v16")]
+        let mut strict = false;
+        #[cfg(feature = "v16")]
+        if self.cur_is_kw(b"STRICT") || self.cur_is_kw(b"WITHOUT") {
+            loop {
+                if self.cur_is_kw(b"WITHOUT") {
+                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                }
+                self.expect_kw::<E>(b"STRICT")?;
+                strict = true;
+                if !self.eat(Tok::Comma) {
+                    break;
+                }
+            }
+        }
         // Trailing clauses: WITHOUT ROWID is outside v0.1.
+        #[cfg(not(feature = "v16"))]
         if self.cur_is_kw(b"WITHOUT") {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
@@ -490,7 +555,172 @@ impl<'a> Parser<'a> {
             columns,
             pk_columns,
             constraint_sets: sets,
+            #[cfg(feature = "v04")]
+            checks,
+            #[cfg(feature = "v16")]
+            strict,
+            #[cfg(feature = "v16")]
+            as_select: None,
         })
+    }
+
+    /// The index of the `)` matching the `(` at token `k`,
+    /// within the item ending at token `to` (v0.16).
+    #[cfg(feature = "v04")]
+    fn close_paren<E>(&self, k: usize, to: usize) -> Result<usize, E> {
+        let mut depth = 0usize;
+        let mut j = k;
+        while j < to {
+            match self.toks.as_slice()[j].tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Ok(j);
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        Err(perr(self.item_end_offset(to), ParseKind::UnexpectedToken))
+    }
+
+    /// The SQL text inside the parenthesised group opening at
+    /// token `k` (v0.16: CHECK and generated-column bodies),
+    /// plus the index of its closing `)`.
+    #[cfg(feature = "v04")]
+    fn paren_text<E>(&self, k: usize, to: usize) -> Result<(usize, ABytes), E> {
+        if k >= to || !matches!(self.toks.as_slice()[k].tok, Tok::LParen) {
+            return Err(perr(self.item_end_offset(k), ParseKind::UnexpectedToken));
+        }
+        let close = self.close_paren::<E>(k, to)?;
+        let start = self.toks.as_slice()[k + 1].offset;
+        let end = self.toks.as_slice()[close].offset;
+        let text = trim(&self.sql[start.min(end)..end.min(self.sql.len())]);
+        Ok((close, self.arena.alloc_copy_handle(text)?))
+    }
+
+    /// Classify a DEFAULT value starting at token `k` (v0.16;
+    /// the pin's grammar: `DEFAULT [+|-] term`, `DEFAULT
+    /// (expr)`, `DEFAULT id`). `Ok(lit)` is a plain literal —
+    /// a bare or parenthesised (signed) literal, TRUE / FALSE /
+    /// NULL, or an identifier, which the pin stores as its text
+    /// (`DEFAULT hello` is `'hello'`). `Err((start, end))` is
+    /// the SQL byte span of an expression default: anything in
+    /// parentheses, a sign over a non-numeric term (`-'3'`,
+    /// `-x'01'`), or CURRENT_TIME / CURRENT_DATE /
+    /// CURRENT_TIMESTAMP.
+    #[cfg(feature = "v04")]
+    #[allow(clippy::type_complexity)]
+    fn default_clause<E>(
+        &self,
+        k: usize,
+        to: usize,
+    ) -> Result<core::result::Result<Literal, (usize, usize)>, E> {
+        if k >= to {
+            return Err(perr(self.item_end_offset(k), ParseKind::UnexpectedToken));
+        }
+        let t = self.toks.as_slice()[k];
+        if matches!(t.tok, Tok::LParen) {
+            let close = self.close_paren::<E>(k, to)?;
+            if let Some((lit, n)) = self.literal_at(k + 1)
+                && k + 1 + n == close
+            {
+                return Ok(Ok(lit));
+            }
+            return Ok(Err((
+                self.toks.as_slice()[k + 1].offset,
+                self.toks.as_slice()[close].offset,
+            )));
+        }
+        if let Some((lit, n)) = self.literal_at(k) {
+            // `DEFAULT -TRUE` is no term on the pin; `DEFAULT 1+2`
+            // leaves an operator behind: both syntax errors there.
+            if matches!(t.tok, Tok::Minus | Tok::Plus)
+                && matches!(
+                    self.toks.as_slice().get(k + 1).map(|x| x.tok),
+                    Some(Tok::Ident(..))
+                )
+            {
+                return Err(perr(t.offset, ParseKind::UnexpectedToken));
+            }
+            self.constraint_follows::<E>(k + n, to)?;
+            return Ok(Ok(lit));
+        }
+        match t.tok {
+            Tok::Ident(h, quoted) => {
+                if !quoted && is_ctime_kw(handle_bytes(self.arena, h)) {
+                    return Ok(Err((t.offset, self.item_end_offset(k + 1))));
+                }
+                if !quoted && self.is_constraint_kw(k) {
+                    return Err(perr(t.offset, ParseKind::UnexpectedToken));
+                }
+                Ok(Ok(Literal::Text(h)))
+            }
+            Tok::Minus | Tok::Plus if k + 1 < to => {
+                Ok(Err((t.offset, self.item_end_offset(k + 2))))
+            }
+            _ => Err(perr(t.offset, ParseKind::UnexpectedToken)),
+        }
+    }
+
+    /// The tiny profile's DEFAULT (v0.16): only a plain
+    /// (signed) literal, bare or parenthesised, TRUE / FALSE /
+    /// NULL, or a quoted identifier (the pin stores
+    /// `DEFAULT "x"` as the text `'x'`). Anything else — an
+    /// expression, the clock keywords, an unquoted identifier
+    /// (which the pin also reads as text, but which may be a
+    /// clock keyword) — is refused (`RequiresEvaluator`): before
+    /// v0.16 those read as NULL or as a wrong literal.
+    #[cfg(not(feature = "v04"))]
+    fn default_clause<E>(&self, k: usize) -> Result<Literal, E> {
+        let tok = |j: usize| self.toks.as_slice().get(j).map(|t| t.tok);
+        let paren = matches!(tok(k), Some(Tok::LParen));
+        let at = k + usize::from(paren);
+        if let Some((lit, n)) = self.literal_at(at) {
+            if !paren || matches!(tok(at + n), Some(Tok::RParen)) {
+                return Ok(lit);
+            }
+        } else if let (false, Some(Tok::Ident(h, true))) = (paren, tok(k)) {
+            // `DEFAULT "text"`: a quoted identifier is the pin's
+            // `DEFAULT id` text form.
+            return Ok(Literal::Text(h));
+        }
+        Err(perr(self.item_end_offset(k), ParseKind::RequiresEvaluator))
+    }
+
+    /// After a DEFAULT term or a generated column's `AS (...)
+    /// [STORED | VIRTUAL]` (v0.16): the column definition ends or
+    /// another constraint starts — anything else is a syntax
+    /// error on the pin (`DEFAULT 1+2`, `VIRTUAL STORED`).
+    #[cfg(feature = "v04")]
+    fn constraint_follows<E>(&self, j: usize, to: usize) -> Result<(), E> {
+        if j >= to || self.is_constraint_kw(j) || self.is_kw(j, b"REFERENCES") {
+            return Ok(());
+        }
+        Err(perr(self.item_end_offset(j), ParseKind::UnexpectedToken))
+    }
+
+    /// Whether token `i` is a keyword that starts a column
+    /// constraint (an identifier DEFAULT may not be one).
+    #[cfg(feature = "v04")]
+    fn is_constraint_kw(&self, i: usize) -> bool {
+        [
+            b"NOT" as &[u8],
+            b"NULL",
+            b"UNIQUE",
+            b"CHECK",
+            b"REFERENCES",
+            b"COLLATE",
+            b"GENERATED",
+            b"CONSTRAINT",
+            b"AS",
+            b"DEFAULT",
+            b"PRIMARY",
+        ]
+        .iter()
+        .any(|w| self.is_kw(i, w))
     }
 
     /// Consume tokens up to the matching `)` of an already-eaten
@@ -535,7 +765,7 @@ impl<'a> Parser<'a> {
     /// defs. Used by table-level PRIMARY KEY / UNIQUE items.
     fn constraint_columns(&self, mut i: usize, to: usize) -> AVec<IndexColumnDef> {
         let mut out = AVec::new();
-        if i < to && self.toks.as_slice()[i].tok == Tok::LParen {
+        if i < to && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
             i += 1;
         }
         while i < to {
@@ -555,7 +785,7 @@ impl<'a> Parser<'a> {
                 i += 2;
             }
             out.push(IndexColumnDef { name: h, desc });
-            if i < to && self.toks.as_slice()[i].tok == Tok::Comma {
+            if i < to && matches!(self.toks.as_slice()[i].tok, Tok::Comma) {
                 i += 1;
                 continue;
             }
@@ -564,6 +794,7 @@ impl<'a> Parser<'a> {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_item<E>(
         &mut self,
         mut from: usize,
@@ -572,6 +803,7 @@ impl<'a> Parser<'a> {
         pk_names: &mut AVec<ABytes>,
         pk_desc_names: &mut AVec<ABytes>,
         sets: &mut AVec<ConstraintSet>,
+        #[cfg(feature = "v04")] checks: &mut AVec<ABytes>,
     ) -> Result<(), E> {
         // CONSTRAINT name … — skip the constraint's name.
         if self.is_kw(from, b"CONSTRAINT") {
@@ -601,7 +833,7 @@ impl<'a> Parser<'a> {
         }
         if self.is_kw(from, b"UNIQUE")
             && from + 1 < to
-            && self.toks.as_slice()[from + 1].tok == Tok::LParen
+            && matches!(self.toks.as_slice()[from + 1].tok, Tok::LParen)
         {
             // Table-level UNIQUE (col, …) (v0.3: enforced via an
             // implicit index, like SQLite).
@@ -612,11 +844,23 @@ impl<'a> Parser<'a> {
             });
             return Ok(());
         }
-        if self.is_kw(from, b"CHECK")
-            || self.is_kw(from, b"FOREIGN")
-            || self.is_kw(from, b"KEY")
-            || self.is_kw(from, b"INDEX")
-        {
+        if self.is_kw(from, b"CHECK") {
+            // Table-level CHECK (v0.16): enforced on every write
+            // path through the v0.4 evaluator; a build without it
+            // refuses the table rather than ignore the check.
+            #[cfg(feature = "v04")]
+            {
+                let (_, text) = self.paren_text::<E>(from + 1, to)?;
+                checks.push(text);
+                return Ok(());
+            }
+            #[cfg(not(feature = "v04"))]
+            return Err(perr(
+                self.toks.as_slice()[from].offset,
+                ParseKind::RequiresEvaluator,
+            ));
+        }
+        if self.is_kw(from, b"FOREIGN") || self.is_kw(from, b"KEY") || self.is_kw(from, b"INDEX") {
             // Parsed, not enforced in v0.1 (see module docs).
             return Ok(());
         }
@@ -636,8 +880,22 @@ impl<'a> Parser<'a> {
         let mut unique = false;
         let mut default: Option<Literal> = None;
         let mut not_null = false;
+        // Without the evaluator (tiny) neither can become true:
+        // the clauses that set them are refused.
+        #[cfg(feature = "v04")]
         let mut default_nonconst = false;
+        #[cfg(not(feature = "v04"))]
+        let default_nonconst = false;
+        #[cfg(feature = "v04")]
         let mut generated = false;
+        #[cfg(not(feature = "v04"))]
+        let generated = false;
+        #[cfg(feature = "v04")]
+        let mut default_expr: Option<ABytes> = None;
+        #[cfg(feature = "v04")]
+        let mut gen_expr: Option<ABytes> = None;
+        #[cfg(feature = "v04")]
+        let mut stored = false;
         let mut i = from + 1;
         while i < to {
             let t = self.toks.as_slice()[i];
@@ -662,20 +920,66 @@ impl<'a> Parser<'a> {
                 if self.is_kw(i, b"UNIQUE") {
                     unique = true;
                 }
+                #[cfg(not(feature = "v04"))]
                 if self.is_kw(i, b"DEFAULT") {
-                    decl_end_tok = decl_end_tok.min(i);
-                    default = self.default_literal(i + 1, to);
-                    if default.is_none() {
-                        // A DEFAULT whose value is not a plain
-                        // literal (CURRENT_TIMESTAMP, a call, ...).
-                        default_nonconst = true;
+                    default = Some(self.default_clause::<E>(i + 1)?);
+                }
+                #[cfg(feature = "v04")]
+                if self.is_kw(i, b"DEFAULT") {
+                    match self.default_clause::<E>(i + 1, to)? {
+                        Ok(lit) => default = Some(lit),
+                        // An expression DEFAULT (v0.16): kept as
+                        // text for the planner's evaluator; a
+                        // build without one refuses the table
+                        // (it used to keep the first literal of
+                        // `DEFAULT (1+2)` and NULL for the rest).
+                        #[cfg(feature = "v04")]
+                        Err((start, end)) => {
+                            default = None;
+                            default_nonconst = true;
+                            let text = trim(&self.sql[start.min(end)..end.min(self.sql.len())]);
+                            default_expr = Some(self.arena.alloc_copy_handle(text)?);
+                        }
                     }
                 }
                 if self.is_kw(i, b"NOT") && self.is_kw(i + 1, b"NULL") {
                     not_null = true;
                 }
-                if self.is_kw(i, b"GENERATED") {
+                if self.is_kw(i, b"CHECK") {
+                    // Column-level CHECK (v0.16): a table check
+                    // like any other.
+                    #[cfg(feature = "v04")]
+                    {
+                        let (_, text) = self.paren_text::<E>(i + 1, to)?;
+                        checks.push(text);
+                    }
+                    #[cfg(not(feature = "v04"))]
+                    return Err(perr(t.offset, ParseKind::RequiresEvaluator));
+                }
+                #[cfg(feature = "v04")]
+                if self.is_kw(i, b"GENERATED")
+                    && self.is_kw(i + 1, b"ALWAYS")
+                    && !self.is_kw(i + 2, b"AS")
+                {
+                    return Err(perr(t.offset, ParseKind::UnexpectedToken));
+                }
+                // Every generated column has `AS (...)`.
+                #[cfg(not(feature = "v04"))]
+                if self.is_kw(i, b"AS") {
+                    return Err(perr(t.offset, ParseKind::RequiresEvaluator));
+                }
+                #[cfg(feature = "v04")]
+                if self.is_kw(i, b"AS") {
+                    // A generated column (v0.16): `[GENERATED
+                    // ALWAYS] AS (expr) [VIRTUAL | STORED]`. It
+                    // used to be parsed as part of the declared
+                    // type and read as NULL.
                     generated = true;
+                    let (close, text) = self.paren_text::<E>(i + 1, to)?;
+                    gen_expr = Some(text);
+                    stored = self.is_kw(close + 1, b"STORED");
+                    let kind = usize::from(stored || self.is_kw(close + 1, b"VIRTUAL"));
+                    self.constraint_follows::<E>(close + 1 + kind, to)?;
                 }
                 if self.is_kw(i, b"NOT")
                     || self.is_kw(i, b"NULL")
@@ -683,8 +987,14 @@ impl<'a> Parser<'a> {
                     || self.is_kw(i, b"CHECK")
                     || self.is_kw(i, b"REFERENCES")
                     || self.is_kw(i, b"COLLATE")
-                    || self.is_kw(i, b"GENERATED")
+                    // `GENERATED` alone is a type name on the pin
+                    // (`b GENERATED AS (a)` declares type
+                    // GENERATED); only `GENERATED ALWAYS` starts
+                    // the constraint.
+                    || (self.is_kw(i, b"GENERATED") && self.is_kw(i + 1, b"ALWAYS"))
                     || self.is_kw(i, b"CONSTRAINT")
+                    || self.is_kw(i, b"AS")
+                    || self.is_kw(i, b"DEFAULT")
                 {
                     decl_end_tok = decl_end_tok.min(i);
                 }
@@ -714,6 +1024,12 @@ impl<'a> Parser<'a> {
             not_null,
             default_nonconst,
             generated,
+            #[cfg(feature = "v04")]
+            default_expr,
+            #[cfg(feature = "v04")]
+            gen_expr,
+            #[cfg(feature = "v04")]
+            stored,
         });
         // Constraint sets in statement order (v0.3): an inline
         // PRIMARY KEY / UNIQUE is a one-column set at this item's
@@ -756,15 +1072,6 @@ impl<'a> Parser<'a> {
         } else {
             self.sql.len()
         }
-    }
-
-    /// Parse a DEFAULT literal starting at token `i` (best effort:
-    /// non-literal defaults like CURRENT_TIMESTAMP yield None).
-    fn default_literal(&self, mut i: usize, to: usize) -> Option<Literal> {
-        if i < to && self.toks.as_slice()[i].tok == Tok::LParen {
-            i += 1;
-        }
-        self.literal_at(i).map(|(lit, _)| lit)
     }
 
     fn literal_at(&self, i: usize) -> Option<(Literal, usize)> {
@@ -841,6 +1148,33 @@ impl<'a> Parser<'a> {
                 break;
             }
             columns = Some(cols);
+        }
+        // `INSERT INTO t DEFAULT VALUES` (v0.16, `v16`): one row
+        // of defaults — an empty target list with one empty VALUES
+        // row. The pin allows no column list before it and no
+        // ON CONFLICT after it (RETURNING is fine).
+        #[cfg(feature = "v16")]
+        if self.cur_is_kw(b"DEFAULT") {
+            self.pos += 1;
+            if columns.is_some() {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+            self.expect_kw::<E>(b"VALUES")?;
+            let mut rows = AVec::new();
+            rows.push(AVec::new());
+            #[cfg(feature = "v07")]
+            let returning = self.returning_clause::<E>()?;
+            #[cfg(not(feature = "v07"))]
+            let returning = AVec::new();
+            return Ok(Ast::Insert {
+                table,
+                columns: Some(AVec::new()),
+                rows,
+                select: None,
+                conflict,
+                upsert: None,
+                returning,
+            });
         }
         let InsertSource { rows, select } = self.insert_source::<E>()?;
         let (upsert, returning) = self.insert_tail::<E>()?;
@@ -1022,8 +1356,14 @@ impl<'a> Parser<'a> {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
             } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::Dot)
-                && self.toks.as_slice().get(self.pos + 2).map(|t| t.tok) == Some(Tok::Star)
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                    Some(Tok::Dot)
+                )
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
+                    Some(Tok::Star)
+                )
             {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
@@ -1188,7 +1528,10 @@ impl<'a> Parser<'a> {
         match self.ident_at(self.pos) {
             Some((h, false, _)) => {
                 let b = handle_bytes(self.arena, h);
-                KWS.iter().any(|k| eq_ci(b, k))
+                // RETURNING (v0.16 fix, v07 grammar) ends an
+                // UPDATE ... FROM source list: `FROM s RETURNING v`
+                // used to alias `s` as RETURNING.
+                KWS.iter().any(|k| eq_ci(b, k)) || (cfg!(feature = "v07") && eq_ci(b, b"RETURNING"))
             }
             _ => false,
         }
@@ -1312,7 +1655,7 @@ impl<'a> Parser<'a> {
                 // accepts `IN ((SELECT ...))`.
                 let save = self.pos;
                 let mut extra_parens = 0usize;
-                while self.cur().tok == Tok::LParen {
+                while matches!(self.cur().tok, Tok::LParen) {
                     self.pos += 1;
                     extra_parens += 1;
                 }
@@ -1344,7 +1687,7 @@ impl<'a> Parser<'a> {
                 }
 
                 let mut list = AVec::new();
-                if self.cur().tok != Tok::RParen {
+                if !matches!(self.cur().tok, Tok::RParen) {
                     loop {
                         list.push(self.parse_expr::<E>()?);
                         if self.eat(Tok::Comma) {
@@ -1457,7 +1800,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             self.expect::<E>(Tok::LParen)?;
             let mut extra_parens = 0usize;
-            while self.cur().tok == Tok::LParen {
+            while matches!(self.cur().tok, Tok::LParen) {
                 self.pos += 1;
                 extra_parens += 1;
             }
@@ -1521,7 +1864,10 @@ impl<'a> Parser<'a> {
                 let nb = handle_bytes(self.arena, h);
                 // Function call: ident followed by '('.
                 if !quoted
-                    && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::LParen)
+                    && matches!(
+                        self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                        Some(Tok::LParen)
+                    )
                 {
                     if eq_ci(nb, b"CAST") {
                         self.pos += 2; // name + '('
@@ -1556,7 +1902,7 @@ impl<'a> Parser<'a> {
                     let star = self.eat(Tok::Star);
                     let distinct = !star && self.eat_kw(b"DISTINCT");
                     let mut args = AVec::new();
-                    if !star && self.cur().tok != Tok::RParen {
+                    if !star && !matches!(self.cur().tok, Tok::RParen) {
                         loop {
                             args.push(self.parse_expr::<E>()?);
                             if self.eat(Tok::Comma) {
@@ -1580,7 +1926,7 @@ impl<'a> Parser<'a> {
                 // Column reference, possibly qualified. Parse the
                 // tokens directly (name() would eat the qualifier).
                 self.pos += 1;
-                if self.cur().tok == Tok::Dot {
+                if matches!(self.cur().tok, Tok::Dot) {
                     self.pos += 1;
                     match self.cur().tok {
                         Tok::Ident(h2, _) => {
@@ -1715,8 +2061,14 @@ impl<'a> Parser<'a> {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
             } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) == Some(Tok::Dot)
-                && self.toks.as_slice().get(self.pos + 2).map(|t| t.tok) == Some(Tok::Star)
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                    Some(Tok::Dot)
+                )
+                && matches!(
+                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
+                    Some(Tok::Star)
+                )
             {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
@@ -2020,10 +2372,10 @@ impl<'a> Parser<'a> {
         // accepts `FROM ((SELECT 1)) s`). The alias is optional;
         // no column-name list may follow it (pin: syntax error).
         #[cfg(feature = "v09")]
-        if self.cur().tok == Tok::LParen {
+        if matches!(self.cur().tok, Tok::LParen) {
             let mut depth = 0usize;
             let mut i = self.pos;
-            while i < self.limit && self.toks.as_slice()[i].tok == Tok::LParen {
+            while i < self.limit && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
                 depth += 1;
                 i += 1;
             }
@@ -2088,6 +2440,7 @@ impl<'a> Parser<'a> {
         let mut pk_names: AVec<ABytes> = AVec::new();
         let mut pk_desc: AVec<ABytes> = AVec::new();
         let mut sets: AVec<ConstraintSet> = AVec::new();
+        let mut checks: AVec<ABytes> = AVec::new();
         self.create_item::<E>(
             from,
             to,
@@ -2095,6 +2448,7 @@ impl<'a> Parser<'a> {
             &mut pk_names,
             &mut pk_desc,
             &mut sets,
+            &mut checks,
         )?;
         if columns.len() != 1 {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
@@ -2116,6 +2470,7 @@ impl<'a> Parser<'a> {
             table,
             column,
             text,
+            checks,
         })
     }
 
@@ -2169,6 +2524,14 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP (v0.16): the
+/// pin's wall-clock keywords, an expression wherever a DEFAULT
+/// term may be.
+#[cfg(feature = "v04")]
+fn is_ctime_kw(b: &[u8]) -> bool {
+    eq_ci(b, b"CURRENT_TIME") || eq_ci(b, b"CURRENT_DATE") || eq_ci(b, b"CURRENT_TIMESTAMP")
+}
+
 fn trim(b: &[u8]) -> &[u8] {
     let mut s = 0;
     let mut e = b.len();
@@ -2193,7 +2556,7 @@ impl<'a> Parser<'a> {
         match self.cur().tok {
             Tok::Ident(h, _) => {
                 self.pos += 1;
-                if self.cur().tok == Tok::Dot {
+                if matches!(self.cur().tok, Tok::Dot) {
                     return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
                 }
                 Ok(h)
@@ -2318,5 +2681,75 @@ impl<'a> Parser<'a> {
         };
         let name = self.name::<E>()?;
         Ok(Ast::DropTable { name, if_exists })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Scope;
+
+    fn kind(sql: &str) -> Option<ParseKind> {
+        let arena = Arena::new(Scope::Statement, 0, 1 << 16);
+        match parse::<()>(sql.as_bytes(), &arena) {
+            Ok(_) => None,
+            Err(Error::Parse { kind, .. }) => Some(kind),
+            Err(_) => Some(ParseKind::UnexpectedToken),
+        }
+    }
+
+    /// v0.16: the tiny profile (no evaluator) refuses every table
+    /// clause it cannot enforce or compute, instead of parsing and
+    /// ignoring it (they used to be silent wrong answers: CHECK
+    /// never enforced, `DEFAULT (1+2)` stored 1, generated columns
+    /// read NULL) — and still accepts the literal forms it handles.
+    #[cfg(not(feature = "v04"))]
+    #[test]
+    fn tiny_refuses_unenforceable_table_clauses() {
+        let refused = [
+            "CREATE TABLE t(a CHECK(a > 0))",
+            "CREATE TABLE t(a, CHECK(a > 0))",
+            "CREATE TABLE t(a, CONSTRAINT c CHECK(a > 0))",
+            "CREATE TABLE t(a, b AS (a * 2))",
+            "CREATE TABLE t(a, b GENERATED ALWAYS AS (a) STORED)",
+            "CREATE TABLE t(a DEFAULT (1 + 2))",
+            "CREATE TABLE t(a DEFAULT -'3')",
+            "CREATE TABLE t(a DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE t(a DEFAULT current_date)",
+            "CREATE TABLE t(a DEFAULT hello)",
+        ];
+        for sql in refused {
+            assert_eq!(kind(sql), Some(ParseKind::RequiresEvaluator), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE t(a DEFAULT 5, b DEFAULT -1.5, c DEFAULT 'x', d DEFAULT x'00')",
+            "CREATE TABLE t(a DEFAULT (5), b DEFAULT (-2), c DEFAULT TRUE, d DEFAULT NULL)",
+            "CREATE TABLE t(a DEFAULT +'x', b DEFAULT \"quoted\", c INTEGER NOT NULL)",
+        ] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+    }
+
+    /// v0.16 (evaluator builds): the clauses are kept for the
+    /// planner, and the pin's syntax errors around them hold.
+    #[cfg(feature = "v04")]
+    #[test]
+    fn table_clauses_parse_with_the_pins_grammar() {
+        for sql in [
+            "CREATE TABLE t(a CHECK(a > 0), b, CHECK(a < b))",
+            "CREATE TABLE t(a, b AS (a * 2) STORED, c GENERATED ALWAYS AS (b) VIRTUAL NOT NULL)",
+            "CREATE TABLE t(a DEFAULT (1 + 2), b DEFAULT -'3', c DEFAULT CURRENT_TIME, d DEFAULT hello)",
+        ] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE t(a DEFAULT 1 + 2)",
+            "CREATE TABLE t(a DEFAULT -TRUE)",
+            "CREATE TABLE t(a, b AS (a) VIRTUAL STORED)",
+            "CREATE TABLE t(a, b GENERATED ALWAYS (a))",
+            "CREATE TABLE t(a CHECK)",
+        ] {
+            assert!(kind(sql).is_some(), "{sql}");
+        }
     }
 }

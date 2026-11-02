@@ -38,6 +38,21 @@ pub struct Column {
     /// carried into the catalog so the write paths can enforce
     /// it; parsed since v0.1, recorded for ALTER since v0.4).
     pub not_null: bool,
+    /// An expression DEFAULT that could not be folded to a
+    /// constant when the catalog was built (v0.16): it names the
+    /// clock (`CURRENT_TIMESTAMP`, ...) or fails to evaluate (an
+    /// unknown function). The text is evaluated per statement by
+    /// the INSERT that needs it. A foldable expression default
+    /// (`(1+2)`, `-'3'`) is folded into `default` instead, so
+    /// every reader sees the pin's value.
+    #[cfg(feature = "v04")]
+    pub default_expr: Option<ABytes>,
+    /// A generated column's expression text (v0.16).
+    #[cfg(feature = "v04")]
+    pub gen_expr: Option<ABytes>,
+    /// A STORED generated column (v0.16); VIRTUAL otherwise.
+    #[cfg(feature = "v04")]
+    pub stored: bool,
 }
 
 /// One column of an index key (v0.3). `col == None` is the rowid
@@ -67,6 +82,31 @@ pub struct TableDef {
     pub rowid_alias: Option<usize>,
     /// UNIQUE / PK constraint sets in statement order (v0.3).
     pub auto_sets: AVec<AutoSet>,
+    /// CHECK constraint texts, statement order (v0.16).
+    #[cfg(feature = "v04")]
+    pub checks: AVec<ABytes>,
+    /// A STRICT table (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub strict: bool,
+}
+
+impl TableDef {
+    /// Whether any column is generated (v0.16).
+    #[cfg(feature = "v04")]
+    pub fn has_generated(&self) -> bool {
+        self.columns.iter().any(|c| c.gen_expr.is_some())
+    }
+
+    /// Whether writes must go through table rules (v0.16): a
+    /// generated column, a CHECK constraint, or STRICT typing.
+    #[cfg(feature = "v04")]
+    pub fn has_rules(&self) -> bool {
+        #[cfg(feature = "v16")]
+        if self.strict {
+            return true;
+        }
+        self.has_generated() || !self.checks.is_empty()
+    }
 }
 
 /// Where an index came from (v0.3).
@@ -175,6 +215,22 @@ fn intern_literal(
     })
 }
 
+/// A folded DEFAULT value as a catalog literal (v0.16).
+#[cfg(feature = "v04")]
+fn owned_literal(
+    arena: &Arena,
+    v: &crate::record::OwnedValue,
+) -> core::result::Result<Literal, crate::error::ArenaError> {
+    use crate::record::OwnedValue;
+    Ok(match v {
+        OwnedValue::Null => Literal::Null,
+        OwnedValue::Integer(i) => Literal::Integer(*i),
+        OwnedValue::Real(f) => Literal::Real(*f),
+        OwnedValue::Text(t) => Literal::Text(intern(arena, t.as_slice())?),
+        OwnedValue::Blob(b) => Literal::Blob(intern(arena, b.as_slice())?),
+    })
+}
+
 /// One raw `sqlite_schema` row, in scan (creation) order.
 struct SchemaRow {
     ty: AVec<u8>,
@@ -267,6 +323,10 @@ pub async fn build_catalog<S: Storage>(
             columns,
             pk_columns,
             constraint_sets,
+            #[cfg(feature = "v04")]
+            checks,
+            #[cfg(feature = "v16")]
+            strict,
             ..
         } = ast
         else {
@@ -288,15 +348,49 @@ pub async fn build_catalog<S: Storage>(
             {
                 alias = Some(i);
             }
+            #[allow(unused_mut)]
+            let mut affinity = affinity_of(decl_bytes);
+            // STRICT (v0.16): an ANY column has no affinity —
+            // values are stored as given (in an ordinary table
+            // `ANY` is NUMERIC by the name rules).
+            #[cfg(feature = "v16")]
+            if strict && eq_ci(trim(decl_bytes), b"ANY") {
+                affinity = Affinity::Blob;
+            }
+            #[allow(unused_mut)]
+            let mut default = match c.default {
+                Some(l) => Some(intern_literal(catalog_arena, l, &scratch)?),
+                None => None,
+            };
+            // v0.16: fold an expression DEFAULT once, here, when
+            // it is constant; keep its text when it reads the
+            // clock or fails to evaluate (the INSERT that needs
+            // it evaluates it then — and errors, as the pin does).
+            #[cfg(feature = "v04")]
+            let mut default_expr = None;
+            #[cfg(feature = "v04")]
+            if let Some(h) = c.default_expr {
+                let text = handle_bytes(&scratch, h);
+                match crate::rules::eval_default::<S::Error>(text, &scratch, None) {
+                    Ok(v) => default = Some(owned_literal(catalog_arena, &v)?),
+                    Err(_) => default_expr = Some(intern(catalog_arena, text)?),
+                }
+            }
             cols.push(Column {
                 name: intern(catalog_arena, handle_bytes(&scratch, c.name))?,
                 decl: intern(catalog_arena, decl_bytes)?,
-                affinity: affinity_of(decl_bytes),
-                default: match c.default {
-                    Some(l) => Some(intern_literal(catalog_arena, l, &scratch)?),
+                affinity,
+                default,
+                not_null: c.not_null,
+                #[cfg(feature = "v04")]
+                default_expr,
+                #[cfg(feature = "v04")]
+                gen_expr: match c.gen_expr {
+                    Some(h) => Some(intern(catalog_arena, handle_bytes(&scratch, h))?),
                     None => None,
                 },
-                not_null: c.not_null,
+                #[cfg(feature = "v04")]
+                stored: c.stored,
             });
         }
         let rowid_alias = alias;
@@ -313,6 +407,12 @@ pub async fn build_catalog<S: Storage>(
         let auto_sets: AVec<AutoSet> = AVec::new();
         #[cfg(not(feature = "indexes"))]
         let _ = (constraint_sets, pk_columns);
+        #[cfg(feature = "v04")]
+        let mut check_texts = AVec::new();
+        #[cfg(feature = "v04")]
+        for h in checks.iter() {
+            check_texts.push(intern(catalog_arena, handle_bytes(&scratch, *h))?);
+        }
         catalog.tables.push(TableDef {
             name: intern(catalog_arena, row.name.as_slice())?,
             root: row.root,
@@ -320,6 +420,10 @@ pub async fn build_catalog<S: Storage>(
             columns: cols,
             rowid_alias,
             auto_sets,
+            #[cfg(feature = "v04")]
+            checks: check_texts,
+            #[cfg(feature = "v16")]
+            strict,
         });
     }
 

@@ -311,17 +311,36 @@ where
             let _ = out.write_all(b"BEGIN TRANSACTION;\n");
             // Snapshot the catalog first (names as bytes) so the
             // per-table SELECTs can borrow the connection freely.
-            let tables: Vec<(Vec<u8>, Vec<u8>)> = db
+            // A table with generated columns dumps only the
+            // other columns (v0.16), as the oracle shell does:
+            // its INSERT ... VALUES replays without them.
+            let tables: Vec<(Vec<u8>, Vec<u8>, String)> = db
                 .tables()
                 .iter()
-                .map(|t| (t.name.to_vec(), t.sql.to_vec()))
+                .map(|t| {
+                    let list = if t.generated.iter().any(|g| *g) {
+                        let cols: Vec<String> = t
+                            .columns
+                            .iter()
+                            .zip(t.generated.iter())
+                            .filter(|(_, g)| !**g)
+                            .map(|(c, _)| {
+                                format!("\"{}\"", String::from_utf8_lossy(c).replace('"', "\"\""))
+                            })
+                            .collect();
+                        cols.join(", ")
+                    } else {
+                        "*".to_string()
+                    };
+                    (t.name.to_vec(), t.sql.to_vec(), list)
+                })
                 .collect();
-            for (name, sql) in &tables {
+            for (name, sql, list) in &tables {
                 let _ = out.write_all(sql);
                 let _ = out.write_all(b";\n");
                 let name = String::from_utf8_lossy(name);
                 let mut st = db
-                    .prepare(&format!("SELECT * FROM {name}"))
+                    .prepare(&format!("SELECT {list} FROM {name}"))
                     .await
                     .map_err(|e| format!("{e:?}"))?;
                 while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {

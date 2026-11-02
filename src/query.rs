@@ -310,6 +310,9 @@ pub struct SubSource {
     /// sibling sources (pin-verified: `FROM t, (SELECT t.a) s`
     /// is "no such column").
     pub derived: Option<Box<SubPlan>>,
+    /// The table's generated columns (v0.16): VIRTUAL ones are
+    /// absent from the record and computed as each row is read.
+    pub gcols: Option<Box<crate::rules::GenCols>>,
 }
 
 /// A planned subquery (v0.6): a full SELECT planned against the
@@ -552,7 +555,7 @@ pub enum SubKind<'x> {
     In(&'x SubPlan),
 }
 
-fn is_rowid_name(b: &[u8]) -> bool {
+pub(crate) fn is_rowid_name(b: &[u8]) -> bool {
     eq_ci(b, b"rowid") || eq_ci(b, b"oid") || eq_ci(b, b"_rowid_")
 }
 
