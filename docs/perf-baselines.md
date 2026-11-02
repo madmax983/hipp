@@ -48,10 +48,12 @@ cell, although the parsed leaf cells are never used afterwards.
 |------|---------------|---------------------------|
 | 1000 | 2,745,910,617 | 826,540,662 (30.1%)       |
 
-### After: move parsed leaf cells into the merged vector
+### After: reuse the parsed leaf cells vector (insert in place)
 
-| n    | total before  | total after   | Δ total | index_insert (n=1000) |
-|------|---------------|---------------|---------|-----------------------|
-| 500  | 931,842,438   | 828,743,502   | -11.1%  |                       |
-| 1000 | 2,745,910,617 | 2,489,560,156 | -9.3%   | 826.5M → 571.1M (-30.9%) |
-| 2000 | 8,674,819,320 | 8,071,584,310 | -7.0%   |                       |
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 931,842,438   | 818,053,256   | -12.2%  |
+| 1000 | 2,745,910,617 | 2,470,276,502 | -10.0%  |
+| 2000 | 8,674,819,320 | 8,022,700,508 | -7.5%   |
+
+Full no_std size gate: 256,353 B (ratchet 256,465 B); tiny unchanged at 81,680 B.
