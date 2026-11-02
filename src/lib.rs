@@ -14,10 +14,16 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "v04")]
+pub mod agg;
 #[allow(unsafe_code)] // the bounded arena exception (SPEC §6)
 pub mod arena;
 pub mod btree;
 pub mod error;
+#[cfg(feature = "v16")]
+pub mod func;
+#[cfg(feature = "math")]
+pub mod math;
 pub mod pager;
 #[cfg(feature = "v04")]
 pub mod query;

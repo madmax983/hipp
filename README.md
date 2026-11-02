@@ -45,7 +45,8 @@ aspirations.
   silently run against `main`; scalar / EXISTS subqueries take
   the pin's `LIMIT (X<>0)` rewrite; an alias holding a
   subquery works inside nested subqueries (one holding an
-  aggregate is refused there).
+  aggregate names the alias's own query's aggregate there, as
+  on the pin).
 - **Column constraints and table definitions.** Ungated
   wherever the v0.4 evaluator is built (they used to be
   parsed and silently ignored): CHECK constraints on every
@@ -135,12 +136,158 @@ aspirations.
   REAL operand is a REAL, CAST(text AS INTEGER) reads only the
   integer prefix, CAST(text AS NUMERIC) follows the pin's
   2^51 rule, substr() / round() read text integer arguments by
-  their integer prefix, round() clamps its digit count to 30 and
-  rounds the exact decimal expansion as the pin's printf does,
+  their integer prefix, round() clamps its digit count to 30
+  (its digits now follow the pin's printf; see the function
+  library below),
   `CREATE TABLE IF NOT EXISTS t AS SELECT ...` over an existing
   `t` is a no-op before its SELECT is resolved, and hipp-cli
   prints `-0.0` as `0.0` and an exact half at the 16th digit
   rounded up, as the pin does.
+- **Expression operators, literals and row values.** Ungated
+  fixes to claimed v0.4 / v0.6 paths: the pin's precedence
+  (`<` `<=` `>` `>=` bind tighter than `=` / IS / IN / LIKE /
+  BETWEEN — `3 = 2 < 3` was 1 — and a postfix ISNULL / IN (...)
+  result takes tighter operators, `x ISNULL + 1`); `x IS [NOT]
+  TRUE / FALSE` as the pin's truth test (`2 IS TRUE` was 0); hex
+  literals read as 16-digit two's complement
+  (`0xffffffffffffffff` = -1) with the pin's "hex literal too
+  big" (also for `-0x8000000000000000`); `1_000` digit
+  separators and a literal glued to an identifier (`1a`,
+  refused) — `1_000` used to read as `1` aliased `_000`; an
+  aggregate inside a subquery whose arguments name only an
+  enclosing query's columns belongs to that query (`SELECT
+  (SELECT max(t.a) FROM u) FROM t` is one row, as on the pin;
+  in that query's WHERE it is "misuse of aggregate"); an
+  aggregate in ORDER BY alone no longer aggregates the query;
+  a qualifier naming an inner source that lacks the column
+  falls through to the outer scopes. Behind `v16`: `&` `|`
+  `<<` `>>` `~` with the pin's integer coercion and shift
+  rules, `IS [NOT] DISTINCT FROM`, postfix `NOT NULL`, and row
+  values — `(a, b) = / <> / < / <= / > / >= / IS (c, d)`,
+  BETWEEN, `IN ((..), (..))` (the pin's VALUES rewrite),
+  `IN (SELECT a, b ...)`, CASE, multi-column scalar subqueries,
+  `UPDATE ... SET (a, b) = (..)` / `= (SELECT ..)` (also in
+  upsert), with the pin's errors for size mismatches and row
+  values anywhere else. Review fixes: a written row-value IN
+  list converts both sides under the set's affinity (`(1, 1)
+  IN ((x, y), (a, b))` was 0); an enclosing query's aggregate
+  inside another aggregate's arguments is "misuse of
+  aggregate" (it returned a value); an enclosing query's
+  aggregate in an EXISTS subquery's result list is inert, as
+  on the pin (WHERE / ON / DELETE / UPDATE ran again); RETURNING
+  and `excluded` never own a subquery's aggregate; an aggregate
+  alias works inside HAVING / ORDER BY subqueries; a too-big hex
+  literal errors only where it is evaluated (a pin file with
+  one in a DEFAULT / CHECK is readable); a subquery used as an
+  expression takes its comparison affinity from its rightmost
+  core, as on the pin, and comparisons convert both operands
+  (`'1' IN (SELECT 1 UNION SELECT i FROM c)` was 0); `x IN
+  ((SELECT ...), 2)` parses; a bare reserved word is no alias
+  (`SELECT 1 NOT`, `SELECT 1 AS` are syntax errors). The tiny
+  profile did not grow.
+- **Scalar function library.** Behind `v16`: `printf()` /
+  `format()` with the pin's whole conversion set (`%d %i %u %x
+  %X %o %p %r %c %s %z %q %Q %w %j %J %f %e %E %g %G %% %n`, the
+  flags `- + space 0 # , !`, width / precision / `*`, the `#`
+  unistr form of `%q` / `%Q`, the new 3.54 JSON forms) and its
+  REAL digits byte for byte — fitted clean-room to pin output:
+  the 18 / 19 internal digits, the 17-digit `!` shortening, and
+  the truncated-scale rounding that makes `printf('%.0e', 450.0)`
+  `4e+02`; `quote()`, `char()`, `unicode()`, `zeroblob()`,
+  `randomblob()` / `random()` (an in-crate generator seeded from
+  `Config::nonce_seed`), `concat()`, `concat_ws()`,
+  `octet_length()`, `unhex()`, `likely()` / `unlikely()` /
+  `likelihood()` (its constant-probability error), `if()` and the
+  n-ary `iif()`, `sqlite_version()` (`'3.54.1'`), and
+  `last_insert_rowid()` / `changes()` / `total_changes()` with the
+  pin's counting rules — also as `Connection::last_insert_rowid`
+  / `changes` / `total_changes`. Non-deterministic functions are
+  refused in generated columns; unknown functions and wrong
+  argument counts are prepare-time errors (`UnknownFunction`,
+  `WrongArgumentCount`). Ungated fixes: `round()` rounds the
+  pin's digits (`round(166162.7745, 3)` was .774), `coalesce` /
+  `ifnull` / `iif` evaluate lazily, and `length` / `substr` /
+  `trim` / `instr` / `replace` / `upper` / `lower` read text up
+  to a NUL and blobs as bytes, as the pin's C functions do.
+  Review fixes (ungated unless noted): a record with more than
+  about 16 overflow pages no longer writes a truncated chain
+  (`zeroblob(69530)` corrupted the file — a page-cache spill
+  dropped chain writes); `coalesce` needs 2+ arguments and
+  `ifnull` exactly 2; a subquery's error surfaces only if
+  evaluation reaches it (`coalesce(1, (SELECT ...))`, an AND /
+  OR the other side decides); `length` / `substr` / `trim` /
+  LIKE walk text in place (no per-character list, so the pin's
+  largest legal text no longer runs out of memory); `INSERT` /
+  `UPDATE OR FAIL` keep the rows changed before the violation
+  (it was treated as ABORT); behind `v16`, a DEFAULT reading
+  `last_insert_rowid()` / `random()` is evaluated per row,
+  `f(*)` is `f()` and DISTINCT is ignored on scalar functions.
+  `sqlite_source_id()` stays undefined (hipp is not the pin's
+  source check-in). The tiny profile grew by 8 bytes (the
+  overflow-chain fix on its INSERT path).
+- **Aggregate completion.** Behind `v16`: `string_agg(X, SEP)`;
+  the aggregate ORDER BY (`group_concat(b, ',' ORDER BY a DESC,
+  b)`) on every aggregate that takes it — a stable sort of the
+  stepped rows, dropped by min / max as on the pin; DISTINCT
+  keeps the first value seen, except that `f(DISTINCT x ORDER BY
+  x)` deduplicates through the sort and keeps the last, as the
+  pin's sorter does; `FILTER (WHERE ...)` on every aggregate
+  (count(*), DISTINCT forms, min / max bare columns included);
+  `count()` (and `count(ORDER BY ...)`, whose clause the pin
+  drops); and the percentile family the pin builds in —
+  `median()`, `percentile(Y, P)`, `percentile_cont()`,
+  `percentile_disc()` with its P validation, constant-P check,
+  numeric-only Y and REAL results. ORDER BY / FILTER on a
+  non-aggregate are refused (`OrderByNonAggregate`,
+  `FilterNonAggregate`), and they decide which query owns an
+  aggregate in a subquery. Ungated fixes: `sum()` integer
+  overflow is the pin's error (it returned a REAL; `total()` /
+  `avg()` still go REAL), REAL sums are compensated
+  (Kahan–Babuška–Neumaier: `0.1 + 0.2 + 0.3` sums to `0.6`), a
+  text addend counts as REAL unless it is wholly an integer
+  (`sum('12abc')` is `12.0`), a NULL group_concat separator adds
+  nothing (the result was NULL), `group_concat(DISTINCT x, ',')`
+  is refused (`DistinctAggregateArgs`), and a group finalizes its
+  aggregates as the pin does — before HAVING, never for a group a
+  HAVING term the pin moves into WHERE (constant or GROUP BY
+  terms only), a group-ordered LIMIT, or an outer LIMIT reading a
+  derived table keeps from forming. A NaN result (`sum()` over
+  `+inf` and `-inf`, `inf - inf`) is NULL, as the pin stores it
+  (it was a REAL 0.0). The tiny profile did not grow.
+- **Math functions** (leaf feature `math`, in `full`; needs only
+  `v04`): every function the pin builds with
+  SQLITE_ENABLE_MATH_FUNCTIONS — `acos` `acosh` `asin` `asinh`
+  `atan` `atan2` `atanh` `ceil` / `ceiling` `cos` `cosh`
+  `degrees` `exp` `floor` `ln` `log(X)` `log(B, X)` `log10`
+  `log2` `mod` `pi` `pow` / `power` `radians` `sin` `sinh`
+  `sqrt` `tan` `tanh` `trunc` — with the pin's argument rules
+  (only INTEGER, REAL and wholly numeric TEXT count; NULL, BLOB
+  and other text give NULL; `log(B, X)` reads X as any value's
+  numeric prefix), NULL for every NaN result (`sqrt(-1)`,
+  `acos(2)`, `mod(1, 0)`, `sin(1e400)`), INTEGER results from
+  `ceil` / `floor` / `trunc` of an integer, and the pin's REAL
+  rendering (`Inf`, `-Inf`). There is no libm in `no_std`, so
+  `hipp::math` is an in-crate floating-point library: exact
+  integer `sqrt`, `fmod`, `ceil` / `floor` / `trunc`; Payne–Hanek
+  reduction and double-double series for the rest, correctly
+  rounded; `log10` and the hyperbolic functions follow the
+  pin's own formulas (fitted to its output) over those. The pin
+  uses glibc, which is not correctly rounded everywhere, so
+  0.01–0.3% of `exp` / `ln` / trig results (up to 2.4% of `acosh`
+  near 1, up to 11% of `sinh` / `tanh` / `asinh` / `atanh`,
+  through glibc's `expm1` / `log1p`) differ, mostly by 1–3 ulp
+  (14 ulp for `tan` at the classic hard reduction argument).
+  Exact `pow` results round half to even in hipp, while glibc
+  misses many such ties (89 of 145 in the test corpus), so small integer powers are a
+  hot spot visible in CLI output (`pow(9, 17)` is
+  16677181699666568.0 in hipp, 16677181699666570.0 on the pin);
+  STATUS.md lists the measured rates. Ungated fixes on the way:
+  text → number conversion (column affinity, comparisons, `WHERE
+  rowid = '<text>'`) trims only ASCII spaces and reads text to its
+  first NUL, as the pin does (`char(160) || '5'` was stored as 5,
+  `'5' || char(0) || 'x'` as text); the numeric prefix behind
+  arithmetic and CAST reads bytes, so a non-UTF-8 tail no longer
+  zeroes it (`x'38ff' + 0` is 8).
 
 ## What v0.13 does
 
@@ -464,7 +611,10 @@ A workspace: the zero-dependency core crate at the root plus
 (page cache, journal protocol, commit machine), `btree`,
 `record` (serial codec, affinity), `schema` (catalog), `sql/`
 (lexer, parser, AST, parameter binding), `query` (resolved-expression evaluator,
-v0.4), `rules` (CHECK / generated-column / STRICT / DEFAULT
+v0.4), `agg` (aggregate folding: the pin's sum / percentile
+rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
+the v0.16 scalar function library),
+`rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor),
 `error` (remedy-named errors).

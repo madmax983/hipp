@@ -312,11 +312,10 @@ fn nested_aggregate_misuse_still_refused() {
         // is a misuse on the pin ("misuse of aggregate
         // function"); hipp refuses it with its typed
         // Unsupported error rather than evaluating it.
-        let mut st = db
-            .prepare("SELECT sum(sum(b)) FROM t")
-            .await
-            .expect("prepare");
-        assert!(st.step().await.is_err(), "nested aggregate must fail");
+        // (Since v0.16 it is refused at prepare, as on the pin.)
+        if let Ok(mut st) = db.prepare("SELECT sum(sum(b)) FROM t").await {
+            assert!(st.step().await.is_err(), "nested aggregate must fail");
+        }
         // The same shape one subquery down is legal (the
         // inner aggregate belongs to the subquery's grouping).
         assert_eq!(

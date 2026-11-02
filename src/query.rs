@@ -69,7 +69,132 @@ pub enum AggKind {
     Total,
     Min,
     Max,
+    /// `group_concat(X[, SEP])`, and (v0.16, `v16`)
+    /// `string_agg(X, SEP)`.
     GroupConcat,
+    /// `median(Y)` (v0.16, `v16`): `percentile(Y, 50)`.
+    #[cfg(feature = "v16")]
+    Median,
+    /// `percentile(Y, P)`, P in 0 ..= 100 (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Percentile,
+    /// `percentile_cont(Y, P)`, P in 0 ..= 1 (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    PercentileCont,
+    /// `percentile_disc(Y, P)`, P in 0 ..= 1 (v0.16, `v16`): the
+    /// value at or below the interpolation point, no blending.
+    #[cfg(feature = "v16")]
+    PercentileDisc,
+}
+
+/// How an aggregate's `args` divide when it was written with an
+/// aggregate ORDER BY and / or FILTER clause (v0.16, `v16`): the
+/// first `nargs` are its arguments, the next `order.len()` its
+/// ORDER BY keys (`order` holds their directions and
+/// collations), and with `filter` the last one is its FILTER
+/// expression. Keeping them in `args` lets every walker (column
+/// shifts, subquery collection and substitution, aggregate
+/// ownership, nested-aggregate misuse) see them unchanged.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct AggExt {
+    pub nargs: usize,
+    pub order: AVec<SortOrder>,
+    pub filter: bool,
+    /// The pin's "ORDER BY is the argument" form of a DISTINCT
+    /// aggregate (`group_concat(DISTINCT x ORDER BY x)`): the
+    /// values are deduplicated by the sort itself, the *last* of
+    /// equal keys surviving, instead of by the first-seen DISTINCT
+    /// test.
+    pub unique: bool,
+}
+
+/// One aggregate node, taken apart (`agg_parts`): its kind and
+/// flags, its own arguments, and (v0.16, `v16`) its ORDER BY
+/// keys with their directions and its FILTER expression. Each
+/// group row contributes the values of `inputs()` (arguments,
+/// then keys) when the filter passes.
+#[derive(Debug, Clone, Copy)]
+pub struct AggParts<'a> {
+    pub kind: AggKind,
+    pub distinct: bool,
+    pub star: bool,
+    pub args: &'a [RExpr],
+    inputs: &'a [RExpr],
+    pub filter: Option<&'a RExpr>,
+    pub order: &'a [SortOrder],
+    pub unique: bool,
+}
+
+impl<'a> AggParts<'a> {
+    /// The expressions each stepped row evaluates: the arguments,
+    /// then the ORDER BY keys.
+    pub fn inputs(&self) -> &'a [RExpr] {
+        self.inputs
+    }
+}
+
+/// Take an aggregate node apart (None for any other node).
+pub fn agg_parts(e: &RExpr) -> Option<AggParts<'_>> {
+    let RExpr::Agg {
+        kind,
+        distinct,
+        star,
+        args,
+        #[cfg(feature = "v16")]
+        ext,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    let all = args.as_slice();
+    #[cfg(feature = "v16")]
+    if let Some(x) = ext {
+        let n = x.nargs.min(all.len());
+        let k = n.saturating_add(x.order.len()).min(all.len());
+        return Some(AggParts {
+            kind: *kind,
+            distinct: *distinct,
+            star: *star,
+            args: all.get(..n).unwrap_or(&[]),
+            inputs: all.get(..k).unwrap_or(&[]),
+            filter: if x.filter { all.get(k) } else { None },
+            order: x.order.as_slice(),
+            unique: x.unique,
+        });
+    }
+    Some(AggParts {
+        kind: *kind,
+        distinct: *distinct,
+        star: *star,
+        args: all,
+        inputs: all,
+        filter: None,
+        order: &[],
+        unique: false,
+    })
+}
+
+/// One group row's contribution to an aggregate (`agg_parts`):
+/// None when its FILTER does not pass (NULL or false: the row is
+/// not stepped, and nothing else of it is evaluated), else the
+/// values of `inputs()`. `ev` evaluates an expression against
+/// the row.
+pub fn agg_row<E>(
+    p: &AggParts<'_>,
+    ev: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
+) -> Result<Option<AVec<OwnedValue>>, E> {
+    if let Some(f) = p.filter
+        && truthy(&ev(f)?) != Some(true)
+    {
+        return Ok(None);
+    }
+    let mut vs = AVec::new();
+    for a in p.inputs() {
+        vs.push(ev(a)?);
+    }
+    Ok(Some(vs))
 }
 
 /// Scalar function kinds (v0.4). `MinN`/`MaxN` are the multi-arg
@@ -101,6 +226,127 @@ pub enum ScalarFn {
     /// `glob(pattern, subject)` (v0.16, `v16`).
     #[cfg(feature = "v16")]
     Glob,
+    /// `~x` (v0.16, `v16`): bitwise NOT of the operand's
+    /// integer value.
+    #[cfg(feature = "v16")]
+    BitNot,
+    /// A row value's elements (v0.16, `v16`): only ever the left
+    /// operand or an item of an `InList` (a row-value IN test),
+    /// which evaluates it element by element; on its own it is
+    /// `SchemaKind::RowValueMisused`.
+    #[cfg(feature = "v16")]
+    Vector,
+    /// `printf()` / `format()` (v0.16, `v16`): `func::printf`.
+    #[cfg(feature = "v16")]
+    Printf,
+    /// `quote(X)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Quote,
+    /// `char(X, ...)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Char,
+    /// `unicode(X)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Unicode,
+    /// `zeroblob(N)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Zeroblob,
+    /// `randomblob(N)` (v0.16, `v16`): reads the connection's
+    /// random stream (`Env::prng`).
+    #[cfg(feature = "v16")]
+    Randomblob,
+    /// `random()` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Random,
+    /// `last_insert_rowid()` (v0.16, `v16`): `Env::last_rowid`.
+    #[cfg(feature = "v16")]
+    LastInsertRowid,
+    /// `changes()` (v0.16, `v16`): `Env::changes`.
+    #[cfg(feature = "v16")]
+    Changes,
+    /// `total_changes()` (v0.16, `v16`): `Env::total_changes`.
+    #[cfg(feature = "v16")]
+    TotalChanges,
+    /// `likely(X)` / `unlikely(X)` / `likelihood(X, P)` (v0.16,
+    /// `v16`): X itself (P is a planner hint, checked at
+    /// resolution).
+    #[cfg(feature = "v16")]
+    Likely,
+    /// `concat(X, ...)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Concat,
+    /// `concat_ws(SEP, X, ...)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    ConcatWs,
+    /// `octet_length(X)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    OctetLength,
+    /// `unhex(X[, Y])` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Unhex,
+    /// `sqlite_version()` (v0.16, `v16`): the claim version,
+    /// `'3.54.1'`.
+    #[cfg(feature = "v16")]
+    SqliteVersion,
+    /// The math functions (v0.16, leaf feature `math`):
+    /// `crate::math::eval`.
+    #[cfg(feature = "math")]
+    Math(crate::math::MathFn),
+}
+
+impl ScalarFn {
+    /// Whether the pin counts the function non-deterministic
+    /// (v0.16): refused in generated columns.
+    #[cfg(feature = "v16")]
+    pub fn nondeterministic(self) -> bool {
+        matches!(
+            self,
+            ScalarFn::Random
+                | ScalarFn::Randomblob
+                | ScalarFn::LastInsertRowid
+                | ScalarFn::Changes
+                | ScalarFn::TotalChanges
+                | ScalarFn::SqliteVersion
+        )
+    }
+}
+
+/// Whether any function call in `e` (outside subquery plans)
+/// satisfies `f` (v0.16).
+#[cfg(feature = "v16")]
+pub fn any_scalar(e: &RExpr, f: &dyn Fn(ScalarFn) -> bool) -> bool {
+    let any = |x: &RExpr| any_scalar(x, f);
+    match e {
+        RExpr::Scalar(g, args) => f(*g) || args.iter().any(any),
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, ..) => any(x),
+        RExpr::Agg { args, .. } => args.iter().any(any),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => any(a) || any(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => any(a),
+        RExpr::InList(x, l, ..) => any(x) || l.iter().any(any),
+        RExpr::Between(x, a, b, _) => any(x) || any(a) || any(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(any)
+                || whens.iter().any(|(w, t)| any(w) || any(t))
+                || otherwise.as_deref().is_some_and(any)
+        }
+    }
 }
 
 /// A resolved expression: column references are flat slot indices
@@ -172,9 +418,52 @@ pub enum RExpr {
         distinct: bool,
         star: bool,
         args: AVec<RExpr>,
+        /// Which query the aggregate belongs to (v0.16 fix,
+        /// ungated): 0 is the query whose expression holds it;
+        /// `n` is the query `n` subquery levels out. The pin
+        /// gives an aggregate to the innermost query whose FROM
+        /// sources its arguments reference (`SELECT (SELECT
+        /// max(t.a) FROM u) FROM t` aggregates over t, one row);
+        /// arguments referencing no column keep it local. The
+        /// owner folds it per group and substitutes the value
+        /// into the subquery before executing it (see
+        /// `visit_aggs`, `session::eval_group_sub`).
+        lvl: u8,
+        /// An enclosing query's aggregate in the result list or
+        /// ORDER BY of an EXISTS subquery (v0.16 review fix,
+        /// `mark_exists_inert`): the pin never evaluates those
+        /// terms, so the aggregate is no misuse where its owner
+        /// cannot aggregate (`WHERE EXISTS (SELECT max(t.a) FROM
+        /// u)`) and does not make the EXISTS subquery an
+        /// aggregate one. It still makes its owner an aggregate
+        /// query from the owner's result list (`SELECT
+        /// EXISTS(SELECT max(t.a) FROM u) FROM t` is one row) —
+        /// see `has_result_agg`. Evaluates as NULL.
+        inert: bool,
+        /// Copied in from an enclosing query's result-column
+        /// alias (v0.16 review fix, `alias_from_outer`): the pin
+        /// substitutes an alias without re-resolving it, so such
+        /// an aggregate is no misuse in a subquery's WHERE
+        /// (`HAVING EXISTS (SELECT 1 FROM t x WHERE x.b = s)`
+        /// over `sum(b) AS s`), where a written one is.
+        alias: bool,
+        /// The ORDER BY / FILTER layout of `args` (v0.16, `v16`);
+        /// None when the call had neither clause.
+        #[cfg(feature = "v16")]
+        ext: Option<Box<AggExt>>,
     },
     /// ORDER BY reference to an output column (0-based).
     OutRef(usize),
+    /// A subquery whose execution failed with an evaluation error
+    /// (v0.16 review fix): `substitute` puts it where the
+    /// subquery's value would go, and evaluating it raises
+    /// `Error::Schema { kind }`. The pin only runs a subquery when
+    /// evaluation reaches it, so `coalesce(1, (SELECT
+    /// abs(-9223372036854775808)))` is 1 there; the executor
+    /// computes subqueries before evaluating, and this keeps
+    /// their errors for the moment (if any) they are read.
+    /// Produced only by `substitute`; never by the resolver.
+    Raise(SchemaKind),
 }
 
 /// One FROM source for resolution: qualifier (alias if given, else
@@ -295,6 +584,13 @@ pub struct ScopeGroup {
     /// `lookupName` order). Empty while the result list itself
     /// resolves: there an alias is "no such column".
     pub aliases: AVec<(AVec<u8>, RExpr)>,
+    /// Whether an aggregate in a subquery that references this
+    /// group's columns may belong to it (v0.16 review fix). False
+    /// for a RETURNING list's row and an upsert's `excluded`
+    /// row: the pin's owner search never stops at those, so
+    /// `RETURNING (SELECT max(t.a) FROM u)` aggregates inside
+    /// the subquery (9 for a one-row insert of a = 9).
+    pub agg_owner: bool,
 }
 
 impl ScopeGroup {
@@ -305,6 +601,7 @@ impl ScopeGroup {
             offsets,
             first_src,
             aliases: AVec::new(),
+            agg_owner: true,
         }
     }
 
@@ -439,6 +736,12 @@ pub struct SubPlan {
     /// `UPDATE t SET a = (SELECT sum(a) FROM t)` yields the
     /// pre-statement sum on every row).
     pub uncorrelated: bool,
+    /// The result column a scalar subquery yields (v0.16): 0,
+    /// except for the parts of a multi-column scalar subquery
+    /// used as a row value (`(SELECT a, b) = (1, 2)`, `SET (a,
+    /// b) = (SELECT ...)`), where part `i` is a copy of the plan
+    /// yielding column `i` of the first row.
+    pub scalar_col: usize,
 }
 
 impl SubPlan {
@@ -502,7 +805,7 @@ pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
         RExpr::Rowid(src) => r.src(*src),
         RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_range(p, r),
         RExpr::InSub(x, p, _) => f(x) || plan_refs_range(p, r),
-        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => false,
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -558,7 +861,7 @@ pub fn plan_refs_range(p: &SubPlan, r: &RefRange) -> bool {
 /// enclosing scope, so its result is fixed for the whole
 /// statement execution and may be computed once and cached.
 pub fn plan_is_uncorrelated(p: &SubPlan, outer_width: usize, outer_srcs: usize) -> bool {
-    !plan_refs_below(p, outer_width, outer_srcs)
+    !plan_refs_below(p, outer_width, outer_srcs) && !plan_has_foreign_agg(p)
 }
 
 /// The computed value of one subquery node for one outer row
@@ -572,6 +875,10 @@ pub fn plan_is_uncorrelated(p: &SubPlan, outer_width: usize, outer_srcs: usize) 
 pub enum SubValue {
     One(OwnedValue, Option<Affinity>),
     Many(AVec<OwnedValue>, Option<Affinity>),
+    /// The subquery failed with this evaluation error (v0.16
+    /// review fix): raised only if evaluation reads it
+    /// (`RExpr::Raise`).
+    Fail(SchemaKind),
 }
 
 /// The affinity a subquery's single result item carries into
@@ -579,10 +886,33 @@ pub enum SubValue {
 /// a rowid reference, or a CAST keeps its affinity; every
 /// other expression shape has none.
 pub fn result_affinity(plan: &SubPlan) -> Option<Affinity> {
-    match plan.items.as_slice().first() {
-        Some(r) => item_result_affinity(r),
-        None => None,
+    sub_col_affinity(plan, plan.scalar_col)
+}
+
+/// The comparison affinity column `j` of a subquery used as an
+/// expression carries (a scalar subquery's value, an IN set):
+/// the pin's `sqlite3ExprAffinity` of `pSelect->pEList`, i.e.
+/// of the RIGHTMOST compound core (v0.16 review fix: hipp read
+/// the leftmost, so `'1' IN (SELECT 1 UNION SELECT i FROM c)`
+/// over INTEGER i was 0). A one-row VALUES core is its row; a
+/// longer one is the pin's `sqlite3MultiValues` — a co-routine
+/// with no affinity when every row is constant and the first
+/// has none, else the UNION ALL chain, whose rightmost core is
+/// the last row (the rule `core_colls` follows for collations).
+pub fn sub_col_affinity(plan: &SubPlan, j: usize) -> Option<Affinity> {
+    let core: &SubPlan = plan.compound.as_slice().last().map_or(plan, |(_, t)| t);
+    let rows = core.values.as_slice();
+    let Some(last) = rows.last() else {
+        return core.items.as_slice().get(j).and_then(item_result_affinity);
+    };
+    let first = rows.first().map_or(&[][..], |r| r.as_slice());
+    let coroutine = rows.len() > 1
+        && rows.iter().all(|r| r.iter().all(is_constant))
+        && first.iter().all(|e| item_result_affinity(e).is_none());
+    if coroutine {
+        return None;
     }
+    last.as_slice().get(j).and_then(item_result_affinity)
 }
 
 /// The comparison affinity one resolved result item carries
@@ -594,6 +924,10 @@ pub fn item_result_affinity(r: &RExpr) -> Option<Affinity> {
         RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) => Some(*aff),
         RExpr::Collate(x, _) => item_result_affinity(x),
         RExpr::Rowid(_) => Some(Affinity::Integer),
+        // A scalar subquery carries its own result's affinity
+        // (v0.16 review fix: `(SELECT (SELECT i FROM c)) = '1'`
+        // over INTEGER i was 0).
+        RExpr::SubScalar(p) => result_affinity(p),
         _ => None,
     }
 }
@@ -646,11 +980,10 @@ pub(crate) fn resolve_column_in_group<E>(
                 return Some(Ok(RExpr::Rowid(group.first_src + si)));
             }
             // The qualifier matched but the column does not
-            // exist: SQLite calls this "no such column" at
-            // prepare time, in this scope.
-            return Some(Err(Error::Schema {
-                kind: SchemaKind::UnknownColumn,
-            }));
+            // exist here: the pin's `lookupName` goes on to the
+            // enclosing scopes (v0.16 fix: `SELECT (SELECT
+            // max(t.a) FROM u AS t) FROM t` reads the outer t.a;
+            // hipp answered "no such column").
         }
         return None;
     }
@@ -758,11 +1091,16 @@ fn resolve_column<E>(
 /// move by the difference (review regression: they read the
 /// nested subquery's columns, silently wrong rows).
 ///
-/// An alias whose item holds an aggregate (outside any nested
-/// subquery) is refused: on the pin the aggregate still belongs
-/// to the alias's own query (one value per outer group), which
-/// hipp cannot evaluate inside a subquery — cloning it here
-/// re-aggregated the subquery's rows (review regression).
+/// An alias whose item holds an aggregate still names the
+/// alias's own query's aggregate (one value per outer group):
+/// every aggregate the item's query (or a query further out)
+/// owns has its owner level raised by `depth`, so the owner
+/// folds it per group and substitutes the value into this
+/// subquery (`subst_owned_aggs`) — `HAVING (SELECT s) > 0`
+/// over `sum(a) AS s` (v0.16 review fix: refused, and before
+/// that the subquery re-aggregated its own rows). Where the
+/// owner cannot aggregate (WHERE, GROUP BY) the planner then
+/// reports the pin's misuse.
 #[cfg(feature = "v16")]
 fn alias_from_outer<E>(
     e: &RExpr,
@@ -770,9 +1108,6 @@ fn alias_from_outer<E>(
     enclosing: &[ScopeGroup],
     depth: usize,
 ) -> Result<RExpr, E> {
-    if has_agg(e) {
-        return Err(Error::Unsupported);
-    }
     let home = ScopeGroup::stack_end(enclosing.get(depth.saturating_sub(1)..).unwrap_or(&[]));
     let (cw, cs) = cur.end();
     let (ew, es) = ScopeGroup::stack_end(enclosing);
@@ -782,6 +1117,16 @@ fn alias_from_outer<E>(
     );
     let mut out = e.clone();
     shift_expr(&mut out, home, by);
+    let up = u8::try_from(depth).map_err(|_| Error::Unsupported)?;
+    walk_aggs_mut::<E>(&mut out, 0, &mut |a, dd| {
+        if let RExpr::Agg { lvl, alias, .. } = a
+            && *lvl >= dd
+        {
+            *lvl = lvl.checked_add(up).ok_or(Error::Unsupported)?;
+            *alias = true;
+        }
+        Ok(false)
+    })?;
     Ok(out)
 }
 
@@ -806,7 +1151,7 @@ fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
             shift_expr(x, at, by);
             shift_plan(p, at, by);
         }
-        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) => {}
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
             shift_expr(a, at, by);
             shift_expr(b, at, by);
@@ -1041,6 +1386,12 @@ pub fn resolve_scoped<E>(
 ) -> Result<RExpr, E> {
     Ok(match expr {
         Expr::Literal(l) => RExpr::Literal(literal_value(arena, *l)),
+        Expr::HexTooBig(offset) => {
+            return Err(Error::Parse {
+                offset: *offset,
+                kind: crate::error::ParseKind::HexLiteralTooBig,
+            });
+        }
         // Only a stored schema text still holds a parameter here
         // (a prepared statement's are bound away before planning,
         // `session::bind_ast`); the pin reads one there as NULL.
@@ -1052,6 +1403,21 @@ pub fn resolve_scoped<E>(
             table.map(|h| handle_bytes(arena, h)),
             handle_bytes(arena, *name),
         )?,
+        #[cfg(feature = "v16")]
+        Expr::InSubquery(x, stmt, neg) if is_row(x) => {
+            let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let plan = planner(stmt, cur, enclosing)?;
+            if plan.width() != xp.len() {
+                return Err(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                });
+            }
+            RExpr::InSub(
+                Box::new(RExpr::Scalar(ScalarFn::Vector, xp)),
+                Box::new(plan),
+                *neg,
+            )
+        }
         Expr::InSubquery(x, stmt, neg) => {
             let xr = resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?;
             let plan = planner(stmt, cur, enclosing)?;
@@ -1071,8 +1437,115 @@ pub fn resolve_scoped<E>(
             }
             RExpr::SubScalar(Box::new(first_row_limit(plan)))
         }
+        #[cfg(feature = "v16")]
+        Expr::BitNot(e) => {
+            let mut args = AVec::new();
+            args.push(resolve_scoped::<E>(
+                e,
+                arena,
+                cur,
+                enclosing,
+                &mut *planner,
+            )?);
+            RExpr::Scalar(ScalarFn::BitNot, args)
+        }
+        // A row value anywhere but a comparison operand.
+        #[cfg(feature = "v16")]
+        Expr::Vector(_) => return Err(row_misused()),
+        #[cfg(feature = "v16")]
+        Expr::RowItem(e, i, n) => {
+            let parts = resolve_row::<E>(e, arena, cur, enclosing, &mut *planner)?;
+            if parts.len() != usize::from(*n) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                });
+            }
+            parts
+                .as_slice()
+                .get(usize::from(*i))
+                .cloned()
+                .ok_or(Error::Schema {
+                    kind: SchemaKind::ColumnCountMismatch,
+                })?
+        }
+        #[cfg(feature = "v16")]
+        Expr::Binary(op, l, r) if is_cmp_op(*op) && (is_row(l) || is_row(r)) => {
+            let lp = resolve_row::<E>(l, arena, cur, enclosing, &mut *planner)?;
+            let rp = resolve_row::<E>(r, arena, cur, enclosing, &mut *planner)?;
+            row_cmp::<E>(*op, lp.as_slice(), rp.as_slice())?
+        }
+        #[cfg(feature = "v16")]
+        Expr::Between(x, lo, hi, neg) if is_row(x) || is_row(lo) || is_row(hi) => {
+            let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let lp = resolve_row::<E>(lo, arena, cur, enclosing, &mut *planner)?;
+            let hp = resolve_row::<E>(hi, arena, cur, enclosing, &mut *planner)?;
+            let b = RExpr::Binary(
+                BinOp::And,
+                Box::new(row_cmp::<E>(BinOp::Ge, xp.as_slice(), lp.as_slice())?),
+                Box::new(row_cmp::<E>(BinOp::Le, xp.as_slice(), hp.as_slice())?),
+            );
+            if *neg { RExpr::Not(Box::new(b)) } else { b }
+        }
+        #[cfg(feature = "v16")]
+        Expr::InList(x, list, neg) if matches!(**x, Expr::Vector(_)) => {
+            let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let mut items = AVec::new();
+            for e in list.iter() {
+                // Each item must itself be a row value of the
+                // same size (the pin's VALUES rewrite: "IN(...)
+                // element has N terms - expected M").
+                let Expr::Vector(_) = e else {
+                    return Err(row_misused());
+                };
+                let ip = resolve_row::<E>(e, arena, cur, enclosing, &mut *planner)?;
+                if ip.len() != xp.len() {
+                    return Err(row_misused());
+                }
+                items.push(RExpr::Scalar(ScalarFn::Vector, ip));
+            }
+            RExpr::InList(
+                Box::new(RExpr::Scalar(ScalarFn::Vector, xp)),
+                items,
+                *neg,
+                false,
+            )
+        }
+        #[cfg(feature = "v16")]
+        Expr::Case {
+            base: Some(b),
+            whens,
+            otherwise,
+        } if is_row(b) || whens.iter().any(|(w, _)| is_row(w)) => {
+            // `CASE (a, b) WHEN (x, y) ...` compares like `=`:
+            // the searched CASE of the row comparisons.
+            let bp = resolve_row::<E>(b, arena, cur, enclosing, &mut *planner)?;
+            let mut ws = AVec::new();
+            for (w, t) in whens.iter() {
+                let wp = resolve_row::<E>(w, arena, cur, enclosing, &mut *planner)?;
+                ws.push((
+                    row_cmp::<E>(BinOp::Eq, bp.as_slice(), wp.as_slice())?,
+                    resolve_scoped::<E>(t, arena, cur, enclosing, &mut *planner)?,
+                ));
+            }
+            RExpr::Case {
+                base: None,
+                whens: ws,
+                otherwise: match otherwise {
+                    Some(o) => Some(Box::new(resolve_scoped::<E>(
+                        o,
+                        arena,
+                        cur,
+                        enclosing,
+                        &mut *planner,
+                    )?)),
+                    None => None,
+                },
+            }
+        }
         Expr::ExistsSubquery(stmt) => {
-            RExpr::SubExists(Box::new(first_row_limit(planner(stmt, cur, enclosing)?)))
+            let mut plan = planner(stmt, cur, enclosing)?;
+            mark_exists_inert(&mut plan);
+            RExpr::SubExists(Box::new(first_row_limit(plan)))
         }
         Expr::Binary(op, l, r) => RExpr::Binary(
             *op,
@@ -1249,17 +1722,150 @@ pub fn resolve_scoped<E>(
             distinct,
             star,
             args,
+            #[cfg(feature = "v16")]
+            clause,
         } => resolve_func::<E>(
             handle_bytes(arena, *name),
             *distinct,
             *star,
             args.as_slice(),
+            #[cfg(feature = "v16")]
+            clause.as_deref(),
             arena,
             cur,
             enclosing,
             planner,
         )?,
     })
+}
+
+/// The pin's "row value misused" (v0.16).
+#[cfg(feature = "v16")]
+fn row_misused<E>() -> Error<E> {
+    Error::Schema {
+        kind: SchemaKind::RowValueMisused,
+    }
+}
+
+/// `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`: the operators
+/// that compare row values (v0.16).
+#[cfg(feature = "v16")]
+fn is_cmp_op(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::Is
+            | BinOp::IsNot
+    )
+}
+
+/// Whether `e` may be a row value (v0.16): a written `(a, b,
+/// ...)` or a scalar subquery (whose width only planning
+/// tells).
+#[cfg(feature = "v16")]
+fn is_row(e: &Expr) -> bool {
+    matches!(e, Expr::Vector(_) | Expr::ScalarSubquery(_))
+}
+
+/// Resolve an operand that may be a row value (v0.16): its
+/// elements — one for a scalar. A written row value's elements
+/// must be scalars; a scalar subquery of n > 1 columns gives n
+/// copies of its plan, part `i` yielding column `i` of the
+/// first row.
+#[cfg(feature = "v16")]
+fn resolve_row<E>(
+    e: &Expr,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    planner: SubPlanner<'_, E>,
+) -> Result<AVec<RExpr>, E> {
+    let mut out = AVec::new();
+    match e {
+        Expr::Vector(items) => {
+            for x in items.iter() {
+                out.push(resolve_scoped::<E>(
+                    x,
+                    arena,
+                    cur,
+                    enclosing,
+                    &mut *planner,
+                )?);
+            }
+        }
+        Expr::ScalarSubquery(stmt) => {
+            let plan = first_row_limit(planner(stmt, cur, enclosing)?);
+            for i in 0..plan.width() {
+                let mut p = plan.clone();
+                p.scalar_col = i;
+                out.push(RExpr::SubScalar(Box::new(p)));
+            }
+        }
+        _ => out.push(resolve_scoped::<E>(
+            e,
+            arena,
+            cur,
+            enclosing,
+            &mut *planner,
+        )?),
+    }
+    Ok(out)
+}
+
+/// A comparison of two resolved operands as the pin's vector
+/// comparison (v0.16, `codeVectorCompare`), written with scalar
+/// operators so affinity and collation stay per element: `=` /
+/// `IS` are the AND of the element tests, `<>` / `IS NOT` their
+/// OR, and `<` (`<=`, `>`, `>=`) is lexicographic — `a1 < b1 OR
+/// (a1 = b1 AND (rest))`, the last element taking the operator
+/// itself. Three-valued logic gives the pin's NULL answers. Two
+/// scalars compare directly; operands of different sizes are
+/// "row value misused".
+#[cfg(feature = "v16")]
+fn row_cmp<E>(op: BinOp, l: &[RExpr], r: &[RExpr]) -> Result<RExpr, E> {
+    if l.len() != r.len() {
+        return Err(row_misused());
+    }
+    let bin = |op: BinOp, a: RExpr, b: RExpr| RExpr::Binary(op, Box::new(a), Box::new(b));
+    let pair = |i: usize, op: BinOp| match (l.get(i), r.get(i)) {
+        (Some(a), Some(b)) => Ok(bin(op, a.clone(), b.clone())),
+        _ => Err(row_misused()),
+    };
+    let n = l.len();
+    let Some(last) = n.checked_sub(1) else {
+        return Err(row_misused());
+    };
+    let (join, elem) = match op {
+        BinOp::Eq | BinOp::Is => (BinOp::And, op),
+        BinOp::Ne => (BinOp::Or, BinOp::Ne),
+        BinOp::IsNot => (BinOp::Or, BinOp::IsNot),
+        _ => {
+            let strict = if matches!(op, BinOp::Lt | BinOp::Le) {
+                BinOp::Lt
+            } else {
+                BinOp::Gt
+            };
+            let mut acc = pair(last, op)?;
+            for i in (0..last).rev() {
+                acc = bin(
+                    BinOp::Or,
+                    pair(i, strict)?,
+                    bin(BinOp::And, pair(i, BinOp::Eq)?, acc),
+                );
+            }
+            return Ok(acc);
+        }
+    };
+    let mut acc = pair(0, elem)?;
+    for i in 1..n {
+        acc = bin(join, acc, pair(i, elem)?);
+    }
+    Ok(acc)
 }
 
 fn resolve_args<E>(
@@ -1282,34 +1888,159 @@ fn resolve_args<E>(
     Ok(out)
 }
 
+/// The scalar function a name calls (case-insensitive), or None
+/// for a name the pin does not define (or this build leaves out).
+fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
+    const BASE: &[(&[u8], ScalarFn)] = &[
+        (b"abs", ScalarFn::Abs),
+        (b"length", ScalarFn::Length),
+        (b"upper", ScalarFn::Upper),
+        (b"lower", ScalarFn::Lower),
+        (b"coalesce", ScalarFn::Coalesce),
+        (b"ifnull", ScalarFn::Coalesce),
+        (b"nullif", ScalarFn::Nullif),
+        (b"typeof", ScalarFn::Typeof),
+        (b"substr", ScalarFn::Substr),
+        (b"substring", ScalarFn::Substr),
+        (b"round", ScalarFn::Round),
+        (b"hex", ScalarFn::Hex),
+        (b"trim", ScalarFn::Trim),
+        (b"ltrim", ScalarFn::Ltrim),
+        (b"rtrim", ScalarFn::Rtrim),
+        (b"replace", ScalarFn::Replace),
+        (b"instr", ScalarFn::Instr),
+        (b"sign", ScalarFn::Sign),
+        (b"iif", ScalarFn::Iif),
+    ];
+    #[cfg(feature = "v16")]
+    const V16: &[(&[u8], ScalarFn)] = &[
+        (b"if", ScalarFn::Iif),
+        (b"like", ScalarFn::Like),
+        (b"glob", ScalarFn::Glob),
+        (b"printf", ScalarFn::Printf),
+        (b"format", ScalarFn::Printf),
+        (b"quote", ScalarFn::Quote),
+        (b"char", ScalarFn::Char),
+        (b"unicode", ScalarFn::Unicode),
+        (b"zeroblob", ScalarFn::Zeroblob),
+        (b"randomblob", ScalarFn::Randomblob),
+        (b"random", ScalarFn::Random),
+        (b"last_insert_rowid", ScalarFn::LastInsertRowid),
+        (b"changes", ScalarFn::Changes),
+        (b"total_changes", ScalarFn::TotalChanges),
+        (b"likely", ScalarFn::Likely),
+        (b"unlikely", ScalarFn::Likely),
+        (b"likelihood", ScalarFn::Likely),
+        (b"concat", ScalarFn::Concat),
+        (b"concat_ws", ScalarFn::ConcatWs),
+        (b"octet_length", ScalarFn::OctetLength),
+        (b"unhex", ScalarFn::Unhex),
+        (b"sqlite_version", ScalarFn::SqliteVersion),
+    ];
+    #[cfg(not(feature = "v16"))]
+    const V16: &[(&[u8], ScalarFn)] = &[];
+    let f = BASE
+        .iter()
+        .chain(V16.iter())
+        .find(|(n, _)| eq_ci(name, n))
+        .map(|(_, f)| *f);
+    #[cfg(feature = "math")]
+    if f.is_none() {
+        return crate::math::MathFn::lookup(name).map(ScalarFn::Math);
+    }
+    f
+}
+
+/// The argument counts a scalar function takes, as on the pin.
+fn arity(f: ScalarFn) -> (usize, usize) {
+    match f {
+        // The pin's coalesce() takes two or more arguments (the
+        // name-dependent `ifnull` form is exactly two; see
+        // `resolve_func`). v0.16 review fix, ungated: one argument
+        // used to run.
+        ScalarFn::Coalesce => (2, usize::MAX),
+        ScalarFn::Nullif | ScalarFn::Instr => (2, 2),
+        ScalarFn::Substr => (2, 3),
+        ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
+        ScalarFn::Replace => (3, 3),
+        // The pin's iif() is a CASE of (condition, value) pairs
+        // with an optional ELSE (3.48+): two or more arguments.
+        #[cfg(feature = "v16")]
+        ScalarFn::Iif => (2, usize::MAX),
+        #[cfg(not(feature = "v16"))]
+        ScalarFn::Iif => (3, 3),
+        #[cfg(feature = "v16")]
+        ScalarFn::Like => (2, 3),
+        #[cfg(feature = "v16")]
+        ScalarFn::Glob => (2, 2),
+        ScalarFn::MinN | ScalarFn::MaxN => (2, usize::MAX),
+        #[cfg(feature = "v16")]
+        ScalarFn::Printf | ScalarFn::Char => (0, usize::MAX),
+        #[cfg(feature = "v16")]
+        ScalarFn::Random
+        | ScalarFn::LastInsertRowid
+        | ScalarFn::Changes
+        | ScalarFn::TotalChanges
+        | ScalarFn::SqliteVersion => (0, 0),
+        #[cfg(feature = "v16")]
+        ScalarFn::Likely | ScalarFn::Unhex => (1, 2),
+        #[cfg(feature = "v16")]
+        ScalarFn::Concat => (1, usize::MAX),
+        #[cfg(feature = "v16")]
+        ScalarFn::ConcatWs => (2, usize::MAX),
+        #[cfg(feature = "math")]
+        ScalarFn::Math(m) => m.arity(),
+        _ => (1, 1),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_func<E>(
     name: &[u8],
     distinct: bool,
     star: bool,
     args: &[Expr],
+    #[cfg(feature = "v16")] clause: Option<&crate::sql::ast::FuncClause>,
     arena: &Arena,
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
     planner: SubPlanner<'_, E>,
 ) -> Result<RExpr, E> {
-    let agg = if eq_ci(name, b"count") {
-        Some(AggKind::Count)
-    } else if eq_ci(name, b"sum") {
-        Some(AggKind::Sum)
-    } else if eq_ci(name, b"avg") {
-        Some(AggKind::Avg)
-    } else if eq_ci(name, b"total") {
-        Some(AggKind::Total)
-    } else if eq_ci(name, b"min") {
-        Some(AggKind::Min)
-    } else if eq_ci(name, b"max") {
-        Some(AggKind::Max)
-    } else if eq_ci(name, b"group_concat") {
-        Some(AggKind::GroupConcat)
-    } else {
-        None
-    };
+    const AGGS: &[(&[u8], AggKind)] = &[
+        (b"count", AggKind::Count),
+        (b"sum", AggKind::Sum),
+        (b"avg", AggKind::Avg),
+        (b"total", AggKind::Total),
+        (b"min", AggKind::Min),
+        (b"max", AggKind::Max),
+        (b"group_concat", AggKind::GroupConcat),
+        #[cfg(feature = "v16")]
+        (b"string_agg", AggKind::GroupConcat),
+        #[cfg(feature = "v16")]
+        (b"median", AggKind::Median),
+        #[cfg(feature = "v16")]
+        (b"percentile", AggKind::Percentile),
+        #[cfg(feature = "v16")]
+        (b"percentile_cont", AggKind::PercentileCont),
+        #[cfg(feature = "v16")]
+        (b"percentile_disc", AggKind::PercentileDisc),
+    ];
+    let agg = AGGS.iter().find(|(n, _)| eq_ci(name, n)).map(|(_, k)| *k);
+    // The aggregate clauses on anything but an aggregate (v0.16,
+    // `v16`): the pin refuses them at prepare. min / max with
+    // several arguments are the scalar forms.
+    #[cfg(feature = "v16")]
+    if let Some(c) = clause
+        && (agg.is_none() || (matches!(agg, Some(AggKind::Min | AggKind::Max)) && args.len() > 1))
+    {
+        return Err(Error::Schema {
+            kind: if c.order_by.is_empty() {
+                SchemaKind::FilterNonAggregate
+            } else {
+                SchemaKind::OrderByNonAggregate
+            },
+        });
+    }
     if let Some(kind) = agg {
         // min/max with several arguments are the scalar forms.
         if matches!(kind, AggKind::Min | AggKind::Max) && args.len() > 1 {
@@ -1324,102 +2055,177 @@ fn resolve_func<E>(
             ));
         }
         let want = match kind {
-            AggKind::GroupConcat => (1, 2),
+            AggKind::GroupConcat => {
+                #[cfg(feature = "v16")]
+                if eq_ci(name, b"string_agg") {
+                    (2, 2)
+                } else {
+                    (1, 2)
+                }
+                #[cfg(not(feature = "v16"))]
+                (1, 2)
+            }
+            // `count()` is `count(*)` on the pin (v0.16, `v16`).
+            #[cfg(feature = "v16")]
+            AggKind::Count => (0, 1),
+            #[cfg(feature = "v16")]
+            AggKind::Percentile | AggKind::PercentileCont | AggKind::PercentileDisc => (2, 2),
             _ => (1, 1),
         };
-        if star {
-            if kind != AggKind::Count {
-                return Err(Error::Unsupported);
-            }
-            return Ok(RExpr::Agg {
-                kind,
-                distinct: false,
-                star: true,
-                args: AVec::new(),
-            });
-        }
-        if args.len() < want.0 || args.len() > want.1 {
+        if star && kind != AggKind::Count {
             return Err(Error::Unsupported);
         }
+        if !star && (args.len() < want.0 || args.len() > want.1) {
+            return Err(Error::Schema {
+                kind: SchemaKind::WrongArgumentCount,
+            });
+        }
+        // The pin's "DISTINCT aggregates must have exactly one
+        // argument" (v0.16, ungated: `group_concat(DISTINCT x,
+        // ',')` used to run), checked after the argument count.
+        if distinct && args.len() != 1 {
+            return Err(Error::Schema {
+                kind: SchemaKind::DistinctAggregateArgs,
+            });
+        }
+        let star = star || args.is_empty();
+        let all = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
+        #[cfg(feature = "v16")]
+        let mut all = all;
+        // min / max take no ORDER BY on the pin, but only its code
+        // generator ignores it: the keys are resolved (so their
+        // errors stand) and every resolver walk — ownership and
+        // the nested-aggregate misuse check — still reads them
+        // (review fix: `(SELECT max(o.x ORDER BY i.y) FROM i)`
+        // became the outer query's aggregate, and `max(x ORDER BY
+        // count(*))` ran). They are held here, outside the node.
+        #[cfg(feature = "v16")]
+        let mut ignored: AVec<RExpr> = AVec::new();
+        #[cfg(feature = "v16")]
+        let ext = match clause {
+            None => None,
+            Some(c) => {
+                let nargs = all.len();
+                let minmax = matches!(kind, AggKind::Min | AggKind::Max);
+                let mut order = AVec::new();
+                for (k, o) in c.order_by.iter() {
+                    let r = resolve_scoped::<E>(k, arena, cur, enclosing, &mut *planner)?;
+                    if minmax {
+                        ignored.push(r);
+                        continue;
+                    }
+                    let mut o = *o;
+                    o.coll = expr_coll(&r).unwrap_or_default();
+                    order.push(o);
+                    all.push(r);
+                }
+                let unique = distinct
+                    && nargs == 1
+                    && order.len() == 1
+                    && matches!((all.as_slice().first(), all.as_slice().get(1)), (Some(a), Some(b)) if same_expr(a, b));
+                let filter = match &c.filter {
+                    Some(f) => {
+                        all.push(resolve_scoped::<E>(
+                            f,
+                            arena,
+                            cur,
+                            enclosing,
+                            &mut *planner,
+                        )?);
+                        true
+                    }
+                    None => false,
+                };
+                if order.is_empty() && !filter {
+                    None
+                } else {
+                    Some(Box::new(AggExt {
+                        nargs,
+                        order,
+                        filter,
+                        unique,
+                    }))
+                }
+            }
+        };
+        // An aggregate directly inside another's arguments (and,
+        // v0.16, its ORDER BY or FILTER) is the pin's "misuse of
+        // aggregate function" whichever query owns either (its
+        // resolver clears NC_AllowAgg while it walks an
+        // aggregate's arguments): `sum(max(a))`, and `(SELECT
+        // sum(c + max(t.a)) FROM u)`, where sum belongs to u and
+        // max to t (review fix: the latter returned a value).
+        #[cfg(feature = "v16")]
+        let ignored = ignored.as_slice();
+        #[cfg(not(feature = "v16"))]
+        let ignored: &[RExpr] = &[];
+        if all.iter().chain(ignored.iter()).any(has_direct_agg) {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedAggregate,
+            });
+        }
+        // The owner reads every part: an aggregate whose FILTER or
+        // ORDER BY (min / max's ignored one included) names an
+        // inner source belongs to the inner query, as on the pin.
+        let lvl = agg_level(all.as_slice(), ignored, cur, enclosing);
         return Ok(RExpr::Agg {
             kind,
             distinct,
-            star: false,
-            args: resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
+            star,
+            args: all,
+            lvl,
+            inert: false,
+            alias: false,
+            #[cfg(feature = "v16")]
+            ext,
         });
     }
+    let Some(f) = scalar_fn(name) else {
+        return Err(Error::Schema {
+            kind: SchemaKind::UnknownFunction,
+        });
+    };
+    #[cfg(feature = "v16")]
+    let want = if f == ScalarFn::Likely {
+        let n = if eq_ci(name, b"likelihood") { 2 } else { 1 };
+        (n, n)
+    } else {
+        arity(f)
+    };
+    #[cfg(not(feature = "v16"))]
+    let want = arity(f);
+    // `ifnull` is coalesce with exactly two arguments on the pin
+    // (v0.16 review fix: `ifnull(1)` / `ifnull(NULL, NULL, 5)`
+    // used to run).
+    let want = if f == ScalarFn::Coalesce && eq_ci(name, b"ifnull") {
+        (2, 2)
+    } else {
+        want
+    };
+    // `f(*)` is `f()` for a scalar function and DISTINCT is
+    // ignored, as on the pin (v0.16, `v16`): `random(*)`,
+    // `printf(*)` (NULL), `abs(DISTINCT -1)` (1). The argument
+    // count is checked as for the plain call (`abs(*)` errors).
+    #[cfg(not(feature = "v16"))]
     if star || distinct {
         return Err(Error::Unsupported);
     }
-    let f = if eq_ci(name, b"abs") {
-        ScalarFn::Abs
-    } else if eq_ci(name, b"length") {
-        ScalarFn::Length
-    } else if eq_ci(name, b"upper") {
-        ScalarFn::Upper
-    } else if eq_ci(name, b"lower") {
-        ScalarFn::Lower
-    } else if eq_ci(name, b"coalesce") || eq_ci(name, b"ifnull") {
-        ScalarFn::Coalesce
-    } else if eq_ci(name, b"nullif") {
-        ScalarFn::Nullif
-    } else if eq_ci(name, b"typeof") {
-        ScalarFn::Typeof
-    } else if eq_ci(name, b"substr") || eq_ci(name, b"substring") {
-        ScalarFn::Substr
-    } else if eq_ci(name, b"round") {
-        ScalarFn::Round
-    } else if eq_ci(name, b"hex") {
-        ScalarFn::Hex
-    } else if eq_ci(name, b"trim") {
-        ScalarFn::Trim
-    } else if eq_ci(name, b"ltrim") {
-        ScalarFn::Ltrim
-    } else if eq_ci(name, b"rtrim") {
-        ScalarFn::Rtrim
-    } else if eq_ci(name, b"replace") {
-        ScalarFn::Replace
-    } else if eq_ci(name, b"instr") {
-        ScalarFn::Instr
-    } else if eq_ci(name, b"sign") {
-        ScalarFn::Sign
-    } else if eq_ci(name, b"iif") {
-        ScalarFn::Iif
-    } else if cfg!(feature = "v16") && eq_ci(name, b"like") {
-        #[cfg(feature = "v16")]
-        {
-            ScalarFn::Like
-        }
-        #[cfg(not(feature = "v16"))]
-        return Err(Error::Unsupported);
-    } else if cfg!(feature = "v16") && eq_ci(name, b"glob") {
-        #[cfg(feature = "v16")]
-        {
-            ScalarFn::Glob
-        }
-        #[cfg(not(feature = "v16"))]
-        return Err(Error::Unsupported);
-    } else {
-        return Err(Error::Unsupported);
-    };
-    let want = match f {
-        ScalarFn::Coalesce => (1, usize::MAX),
-        ScalarFn::Nullif => (2, 2),
-        ScalarFn::Substr => (2, 3),
-        ScalarFn::Round => (1, 2),
-        ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
-        ScalarFn::Replace => (3, 3),
-        ScalarFn::Instr => (2, 2),
-        ScalarFn::Iif => (3, 3),
-        #[cfg(feature = "v16")]
-        ScalarFn::Like => (2, 3),
-        #[cfg(feature = "v16")]
-        ScalarFn::Glob => (2, 2),
-        ScalarFn::MinN | ScalarFn::MaxN => (2, usize::MAX),
-        _ => (1, 1),
-    };
     if args.len() < want.0 || args.len() > want.1 {
-        return Err(Error::Unsupported);
+        return Err(Error::Schema {
+            kind: SchemaKind::WrongArgumentCount,
+        });
+    }
+    // likelihood(X, P): P must be a REAL literal in 0.0 ..= 1.0
+    // (the pin's `TK_FLOAT` test; `-0.0` and integers fail).
+    #[cfg(feature = "v16")]
+    if f == ScalarFn::Likely
+        && args.len() == 2
+        && !matches!(args.get(1), Some(Expr::Literal(Literal::Real(r)))
+            if (0.0..=1.0).contains(r) && !r.is_sign_negative())
+    {
+        return Err(Error::Schema {
+            kind: SchemaKind::LikelihoodNotConstant,
+        });
     }
     Ok(RExpr::Scalar(
         f,
@@ -1427,81 +2233,149 @@ fn resolve_func<E>(
     ))
 }
 
-/// Whether a resolved expression contains an aggregate node.
-/// Aggregates inside a subquery belong to the subquery's own
-/// grouping, never to the enclosing query, so subquery nodes
-/// are not descended into (except an IN subquery's left
-/// operand, which is an enclosing-scope expression).
-pub fn has_agg(e: &RExpr) -> bool {
+/// Whether two resolved expressions are the same expression in
+/// the pin's `sqlite3ExprCompare` sense (v0.16, `v16`; used for
+/// the DISTINCT aggregate whose ORDER BY is its argument): the
+/// same column (whatever qualifier named it), literal, operator,
+/// function or COLLATE, recursively. Anything else — CASE,
+/// subqueries, lists — compares unequal (the general form).
+/// Also decides whether an ORDER BY names the GROUP BY terms
+/// (`session::group_cap`).
+pub fn same_expr(a: &RExpr, b: &RExpr) -> bool {
+    let all = |x: &[RExpr], y: &[RExpr]| {
+        x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same_expr(p, q))
+    };
+    match (a, b) {
+        (RExpr::Literal(x), RExpr::Literal(y)) => match (x, y) {
+            (OwnedValue::Null, OwnedValue::Null) => true,
+            (OwnedValue::Integer(p), OwnedValue::Integer(q)) => p == q,
+            (OwnedValue::Real(p), OwnedValue::Real(q)) => p.to_bits() == q.to_bits(),
+            (OwnedValue::Text(p), OwnedValue::Text(q))
+            | (OwnedValue::Blob(p), OwnedValue::Blob(q)) => p.as_slice() == q.as_slice(),
+            _ => false,
+        },
+        (RExpr::Column(i, _, c), RExpr::Column(j, _, d)) => i == j && c == d,
+        (RExpr::Rowid(i), RExpr::Rowid(j)) => i == j,
+        (RExpr::Binary(o, x1, y1), RExpr::Binary(p, x2, y2)) => {
+            o == p && same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        (RExpr::Neg(x), RExpr::Neg(y))
+        | (RExpr::Pos(x), RExpr::Pos(y))
+        | (RExpr::Not(x), RExpr::Not(y)) => same_expr(x, y),
+        (RExpr::IsNull(x, n), RExpr::IsNull(y, m)) => n == m && same_expr(x, y),
+        (RExpr::Cast(x, f), RExpr::Cast(y, g)) => f == g && same_expr(x, y),
+        (RExpr::Collate(x, c), RExpr::Collate(y, d)) => c == d && same_expr(x, y),
+        (RExpr::Scalar(f, x), RExpr::Scalar(g, y)) => f == g && all(x.as_slice(), y.as_slice()),
+        _ => false,
+    }
+}
+
+/// The owner level of an aggregate with resolved arguments
+/// `args` and `extra` (parts walked but not kept: min / max's
+/// ORDER BY keys) (v0.16, the pin's `sqlite3ReferencesSrcList`
+/// walk):
+/// 0 when they reference the current query's sources or no
+/// column at all, else 1 + the index (nearest first) of the
+/// nearest enclosing scope they reference. References past the
+/// current query's end belong to subqueries nested in the
+/// arguments and do not count, nor do references to a group
+/// that cannot own aggregates (`ScopeGroup::agg_owner`).
+fn agg_level(args: &[RExpr], extra: &[RExpr], cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> u8 {
+    let band = |g: &ScopeGroup| {
+        let (we, se) = g.end();
+        RefRange {
+            w: (g.offsets.as_slice().first().copied().unwrap_or(we), we),
+            s: (g.first_src, se),
+        }
+    };
+    let refs = |g: &ScopeGroup| {
+        let r = band(g);
+        args.iter()
+            .chain(extra.iter())
+            .any(|a| expr_refs_range(a, &r))
+    };
+    if refs(cur) {
+        return 0;
+    }
+    for (k, g) in enclosing.iter().enumerate() {
+        if g.agg_owner && refs(g) {
+            return u8::try_from(k.saturating_add(1)).unwrap_or(u8::MAX);
+        }
+    }
+    0
+}
+
+/// Visit, in pre-order, every aggregate node in `e` that
+/// belongs to the query `d` subquery levels out from `e`'s own
+/// (v0.16): at depth 0 the expression's own aggregates, and
+/// inside nested subquery plans (depth + 1 per level; derived
+/// tables and compound cores share their plan's depth) those
+/// whose `lvl` reaches back to it. `f` gets the node and the
+/// depth it was found at.
+pub fn visit_aggs<'x>(e: &'x RExpr, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
+    visit_all_aggs(e, d, &mut |a, dd| {
+        if matches!(a, RExpr::Agg { lvl, .. } if *lvl == dd) {
+            f(a, dd);
+        }
+    });
+}
+
+/// Whether plan `p` holds an aggregate that an enclosing query
+/// owns, other than an inert one (v0.16 review fix): its value
+/// changes per owner group, so the plan is correlated even with
+/// no column reference (`HAVING (SELECT s) > 1` over `count(*)
+/// AS s` was cached as uncorrelated, one count for every group).
+pub fn plan_has_foreign_agg(p: &SubPlan) -> bool {
+    let mut any = false;
+    visit_plan_all_aggs(p, 0, &mut |a, d| {
+        any |= matches!(a, RExpr::Agg { lvl, inert: false, .. } if *lvl > d);
+    });
+    any
+}
+
+/// `visit_aggs` without the owner filter: every aggregate node,
+/// with the subquery depth it was found at (v0.16).
+fn visit_all_aggs<'x>(e: &'x RExpr, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
+    let visit_aggs = visit_all_aggs;
+    let visit_plan_aggs = visit_plan_all_aggs;
     match e {
-        RExpr::Agg { .. } => true,
-        RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
-        RExpr::InSub(x, _, _) => has_agg(x),
+        RExpr::Agg { args, .. } => {
+            f(e, d);
+            for a in args.iter() {
+                visit_aggs(a, d, f);
+            }
+        }
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => visit_plan_aggs(p, d.saturating_add(1), f),
+        RExpr::InSub(x, p, _) => {
+            visit_aggs(x, d, f);
+            visit_plan_aggs(p, d.saturating_add(1), f);
+        }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => false,
-        RExpr::Binary(_, a, b) => has_agg(a) || has_agg(b),
-        RExpr::Neg(a)
-        | RExpr::Pos(a)
-        | RExpr::Not(a)
-        | RExpr::IsNull(a, _)
-        | RExpr::Cast(a, _)
-        | RExpr::Collate(a, _) => has_agg(a),
-        RExpr::InList(x, l, ..) => has_agg(x) || l.iter().any(has_agg),
-        RExpr::Between(x, a, b, _) => has_agg(x) || has_agg(a) || has_agg(b),
-        RExpr::Like(a, b, _) => has_agg(a) || has_agg(b),
-        RExpr::Case {
-            base,
-            whens,
-            otherwise,
-        } => {
-            base.as_ref().is_some_and(|b| has_agg(b))
-                || whens.iter().any(|(w, t)| has_agg(w) || has_agg(t))
-                || otherwise.as_ref().is_some_and(|o| has_agg(o))
-        }
-        RExpr::Scalar(_, args) => args.iter().any(has_agg),
-    }
-}
-
-/// Collect aggregate nodes (for the min/max bare-column rule).
-/// Subquery interiors are a separate grouping scope and are
-/// not descended into.
-pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
-    match e {
-        RExpr::SubScalar(_) | RExpr::SubExists(_) => {}
-        RExpr::InSub(x, _, _) => collect_aggs(x, out),
-        RExpr::Agg { args, .. } => {
-            out.push(e);
-            for a in args.iter() {
-                collect_aggs(a, out);
-            }
-        }
-        RExpr::Binary(_, a, b) => {
-            collect_aggs(a, out);
-            collect_aggs(b, out);
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => {}
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            visit_aggs(a, d, f);
+            visit_aggs(b, d, f);
         }
         RExpr::Neg(a)
         | RExpr::Pos(a)
         | RExpr::Not(a)
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
-        | RExpr::Collate(a, _) => collect_aggs(a, out),
+        | RExpr::Collate(a, _) => visit_aggs(a, d, f),
         RExpr::InList(x, l, ..) => {
-            collect_aggs(x, out);
+            visit_aggs(x, d, f);
             for i in l.iter() {
-                collect_aggs(i, out);
+                visit_aggs(i, d, f);
             }
         }
         RExpr::Between(x, a, b, _) => {
-            collect_aggs(x, out);
-            collect_aggs(a, out);
-            collect_aggs(b, out);
-        }
-        RExpr::Like(a, b, _) => {
-            collect_aggs(a, out);
-            collect_aggs(b, out);
+            visit_aggs(x, d, f);
+            visit_aggs(a, d, f);
+            visit_aggs(b, d, f);
         }
         RExpr::Case {
             base,
@@ -1509,23 +2383,355 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
             otherwise,
         } => {
             if let Some(b) = base {
-                collect_aggs(b, out);
+                visit_aggs(b, d, f);
             }
             for (w, t) in whens.iter() {
-                collect_aggs(w, out);
-                collect_aggs(t, out);
+                visit_aggs(w, d, f);
+                visit_aggs(t, d, f);
             }
             if let Some(o) = otherwise {
-                collect_aggs(o, out);
+                visit_aggs(o, d, f);
             }
         }
         RExpr::Scalar(_, args) => {
             for a in args.iter() {
-                collect_aggs(a, out);
+                visit_aggs(a, d, f);
             }
         }
-        _ => {}
     }
+}
+
+/// `visit_all_aggs` over every expression of a plan (v0.16).
+fn visit_plan_all_aggs<'x>(p: &'x SubPlan, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
+    let visit_aggs = visit_all_aggs;
+    let visit_plan_aggs = visit_plan_all_aggs;
+    for s in p.sources.iter() {
+        if let Some(on) = &s.on {
+            visit_aggs(on, d, f);
+        }
+        if let Some(dp) = &s.derived {
+            visit_plan_aggs(dp, d, f);
+        }
+    }
+    for e in p.items.iter() {
+        visit_aggs(e, d, f);
+    }
+    if let Some(e) = &p.filter {
+        visit_aggs(e, d, f);
+    }
+    for e in p.group_by.iter() {
+        visit_aggs(e, d, f);
+    }
+    if let Some(e) = &p.having {
+        visit_aggs(e, d, f);
+    }
+    for (e, _) in p.order_by.iter() {
+        visit_aggs(e, d, f);
+    }
+    for row in p.values.iter() {
+        for e in row.iter() {
+            visit_aggs(e, d, f);
+        }
+    }
+    for (_, t) in p.compound.iter() {
+        visit_plan_aggs(t, d, f);
+    }
+}
+
+/// Whether a resolved expression holds an aggregate of its own
+/// query: one directly in it, or (v0.16) one inside a nested
+/// subquery whose arguments reference only this query's columns
+/// (`visit_aggs`). Aggregates a subquery owns are not this
+/// query's, and neither are the inert ones of an EXISTS
+/// subquery's result list (see `RExpr::Agg::inert`).
+pub fn has_agg(e: &RExpr) -> bool {
+    let mut any = false;
+    visit_aggs(e, 0, &mut |a, _| any |= !is_inert(a));
+    any
+}
+
+/// `has_agg` counting inert aggregates too (v0.16 review fix):
+/// whether a result-list term makes its query an aggregate
+/// query. On the pin `SELECT EXISTS(SELECT max(t.a) FROM u)
+/// FROM t` aggregates t to one row, though the EXISTS never
+/// evaluates max(t.a).
+pub fn has_result_agg(e: &RExpr) -> bool {
+    let mut any = false;
+    visit_aggs(e, 0, &mut |_, _| any = true);
+    any
+}
+
+/// Whether `e` is an inert aggregate node (`RExpr::Agg::inert`).
+fn is_inert(e: &RExpr) -> bool {
+    matches!(e, RExpr::Agg { inert: true, .. })
+}
+
+/// Mark the enclosing queries' aggregates in an EXISTS
+/// subquery's result list and ORDER BY inert (v0.16 review
+/// fix; the pin never evaluates those terms of an EXISTS, so
+/// `WHERE EXISTS (SELECT max(t.a) FROM u)` runs, and is true
+/// when u has rows — the EXISTS is not an aggregate query of
+/// its own). Only a plan whose compound operators are all
+/// UNION / UNION ALL qualifies (every core of it, which keeps
+/// its emptiness): under INTERSECT / EXCEPT the values decide
+/// the result and the pin reports the misuse.
+pub fn mark_exists_inert(p: &mut SubPlan) {
+    if !p.compound.iter().all(|(op, _)| {
+        matches!(
+            op,
+            crate::sql::CompoundOp::Union | crate::sql::CompoundOp::UnionAll
+        )
+    }) {
+        return;
+    }
+    fn mark(e: &mut RExpr, d: u8) {
+        let _ = walk_aggs_mut::<()>(e, d, &mut |a, dd| {
+            if let RExpr::Agg { lvl, inert, .. } = a
+                && *lvl > dd
+            {
+                *inert = true;
+            }
+            Ok(false)
+        });
+    }
+    fn core(p: &mut SubPlan) {
+        for e in p.items.as_mut_slice() {
+            mark(e, 0);
+        }
+        for (e, _) in p.order_by.as_mut_slice() {
+            mark(e, 0);
+        }
+    }
+    core(p);
+    for (_, t) in p.compound.as_mut_slice() {
+        core(t);
+    }
+}
+
+/// Whether a WHERE expression `e` holds an aggregate the pin
+/// refuses there (v0.16): any of this query's own (directly or
+/// inside a subquery), and — when this query is not an
+/// aggregate query (`allow_foreign` false) — any enclosing
+/// query's directly in it ("misuse of aggregate function": a
+/// non-aggregate query's WHERE resolves with aggregates
+/// disallowed).
+pub fn where_agg(e: &RExpr, allow_foreign: bool) -> bool {
+    has_agg(e)
+        || (!allow_foreign && direct_agg(e, &|a| !matches!(a, RExpr::Agg { alias: true, .. })))
+}
+
+/// Whether `e` holds an aggregate node of any query outside a
+/// nested subquery (v0.16).
+fn has_direct_agg(e: &RExpr) -> bool {
+    direct_agg(e, &|_| true)
+}
+
+/// Whether `e` holds an aggregate node satisfying `p` outside
+/// any nested subquery (v0.16).
+fn direct_agg(e: &RExpr, p: &dyn Fn(&RExpr) -> bool) -> bool {
+    let f = |x: &RExpr| direct_agg(x, p);
+    match e {
+        RExpr::Agg { args, .. } => p(e) || args.iter().any(f),
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, _, _) => f(x),
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => false,
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => f(a),
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_ref().is_some_and(|b| f(b))
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_ref().is_some_and(|o| f(o))
+        }
+        RExpr::Scalar(_, args) => args.iter().any(f),
+    }
+}
+
+/// Whether `e` holds an aggregate of an enclosing query inside a
+/// nested subquery that this query owns (v0.16): its group
+/// evaluation must substitute it before executing the subquery.
+pub fn has_owned_sub_agg(e: &RExpr) -> bool {
+    let mut any = false;
+    visit_aggs(e, 0, &mut |a, d| any |= d > 0 && !is_inert(a));
+    any
+}
+
+/// Whether an aggregate's arguments hold another aggregate of
+/// the same query (v0.16; the pin's "misuse of aggregate
+/// function": `sum(max(a))`, `sum((SELECT max(t.a) FROM u))`).
+pub fn has_nested_agg(e: &RExpr) -> bool {
+    let mut bad = false;
+    visit_aggs(e, 0, &mut |a, d| {
+        if d == 0
+            && let RExpr::Agg { args, .. } = a
+        {
+            bad |= args.iter().any(has_agg);
+        }
+    });
+    bad
+}
+
+/// Collect this query's aggregate nodes (for the min/max
+/// bare-column rule), in `visit_aggs` order: its own, and
+/// (v0.16) its aggregates inside nested subqueries — the pin
+/// sets its min/max flag on the owning query.
+pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+    visit_aggs(e, 0, &mut |a, _| out.push(a));
+}
+
+/// Replace every aggregate of the current query inside nested
+/// subquery plans of `e` (depth >= 1, `visit_aggs`) by the
+/// value `fold` gives it (v0.16): the owner's group evaluation,
+/// before it executes those subqueries. Inert aggregates stay
+/// (they evaluate as NULL, and nothing reads them).
+pub fn subst_owned_aggs<E>(
+    e: &mut RExpr,
+    d: u8,
+    fold: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
+) -> Result<(), E> {
+    walk_aggs_mut::<E>(e, d, &mut |a, dd| {
+        if let RExpr::Agg {
+            lvl, inert: false, ..
+        } = a
+            && *lvl == dd
+            && dd > 0
+        {
+            let v = fold(a)?;
+            *a = RExpr::Literal(v);
+            return Ok(true);
+        }
+        Ok(false)
+    })
+}
+
+/// Walk every node of `e` (at subquery depth `d`, + 1 per
+/// nested plan as in `visit_aggs`), calling `f` on each
+/// aggregate node first; `f` returning true means it replaced
+/// the node, which is then not descended into (v0.16).
+fn walk_aggs_mut<E>(
+    e: &mut RExpr,
+    d: u8,
+    f: &mut dyn FnMut(&mut RExpr, u8) -> Result<bool, E>,
+) -> Result<(), E> {
+    let fold = f;
+    if matches!(e, RExpr::Agg { .. }) && fold(e, d)? {
+        return Ok(());
+    }
+    match e {
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => {
+            walk_plan_aggs_mut(p, d.saturating_add(1), fold)
+        }
+        RExpr::InSub(x, p, _) => {
+            walk_aggs_mut(x, d, fold)?;
+            walk_plan_aggs_mut(p, d.saturating_add(1), fold)
+        }
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => Ok(()),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            walk_aggs_mut(a, d, fold)?;
+            walk_aggs_mut(b, d, fold)
+        }
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => walk_aggs_mut(a, d, fold),
+        RExpr::InList(x, l, ..) => {
+            walk_aggs_mut(x, d, fold)?;
+            for i in l.as_mut_slice() {
+                walk_aggs_mut(i, d, fold)?;
+            }
+            Ok(())
+        }
+        RExpr::Between(x, a, b, _) => {
+            walk_aggs_mut(x, d, fold)?;
+            walk_aggs_mut(a, d, fold)?;
+            walk_aggs_mut(b, d, fold)
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            if let Some(b) = base {
+                walk_aggs_mut(b, d, fold)?;
+            }
+            for (w, t) in whens.as_mut_slice() {
+                walk_aggs_mut(w, d, fold)?;
+                walk_aggs_mut(t, d, fold)?;
+            }
+            if let Some(o) = otherwise {
+                walk_aggs_mut(o, d, fold)?;
+            }
+            Ok(())
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
+            for a in args.as_mut_slice() {
+                walk_aggs_mut(a, d, fold)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `walk_aggs_mut` over every expression of a plan (v0.16).
+fn walk_plan_aggs_mut<E>(
+    p: &mut SubPlan,
+    d: u8,
+    fold: &mut dyn FnMut(&mut RExpr, u8) -> Result<bool, E>,
+) -> Result<(), E> {
+    for s in p.sources.as_mut_slice() {
+        if let Some(on) = &mut s.on {
+            walk_aggs_mut(on, d, fold)?;
+        }
+        if let Some(dp) = &mut s.derived {
+            walk_plan_aggs_mut(dp, d, fold)?;
+        }
+    }
+    for e in p.items.as_mut_slice() {
+        walk_aggs_mut(e, d, fold)?;
+    }
+    if let Some(e) = &mut p.filter {
+        walk_aggs_mut(e, d, fold)?;
+    }
+    for e in p.group_by.as_mut_slice() {
+        walk_aggs_mut(e, d, fold)?;
+    }
+    if let Some(e) = &mut p.having {
+        walk_aggs_mut(e, d, fold)?;
+    }
+    for (e, _) in p.order_by.as_mut_slice() {
+        walk_aggs_mut(e, d, fold)?;
+    }
+    for row in p.values.as_mut_slice() {
+        for e in row.as_mut_slice() {
+            walk_aggs_mut(e, d, fold)?;
+        }
+    }
+    for (_, t) in p.compound.as_mut_slice() {
+        walk_plan_aggs_mut(t, d, fold)?;
+    }
+    Ok(())
 }
 
 /// Whether a resolved expression contains a subquery node in
@@ -1539,7 +2745,8 @@ pub fn has_sub(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => false,
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) => has_sub(a) || has_sub(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -1581,7 +2788,8 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => {}
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) => {
             collect_subs(a, out);
             collect_subs(b, out);
@@ -1660,6 +2868,74 @@ fn in_sub_lhs(x: &RExpr, plan: &SubPlan, sx: RExpr) -> RExpr {
     RExpr::Collate(Box::new(sx), coll)
 }
 
+/// An IN subquery node after substitution: an `InList` (marked
+/// as substituted) of the subquery's values, with the left
+/// operand `sx` (the substituted `x`) carrying the membership
+/// collation (`in_sub_lhs`). A row-value left operand (v0.16,
+/// `v16`) gets one collation per element and the row-major
+/// values regrouped into rows of its size, each element
+/// carrying its result column's affinity.
+fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool) -> RExpr {
+    if let SubValue::Fail(k) = value {
+        return RExpr::Raise(*k);
+    }
+    let wrap = |v: &OwnedValue, aff: Option<Affinity>| match aff {
+        Some(a) => RExpr::AffLiteral(v.clone(), a),
+        None => RExpr::Literal(v.clone()),
+    };
+    #[cfg(feature = "v16")]
+    if let (RExpr::Scalar(ScalarFn::Vector, xs), RExpr::Scalar(ScalarFn::Vector, sxs)) = (x, &sx) {
+        let core = plan.compound.as_slice().last().map_or(plan, |(_, t)| t);
+        let n = xs.len().max(1);
+        let mut lhs = AVec::new();
+        let mut affs = AVec::new();
+        for (j, (xe, se)) in xs.iter().zip(sxs.iter()).enumerate() {
+            let item = core.items.as_slice().get(j).or_else(|| {
+                core.values
+                    .as_slice()
+                    .first()
+                    .and_then(|r| r.as_slice().get(j))
+            });
+            let coll = match item {
+                Some(i) => binary_coll(xe, i),
+                None => expr_coll(xe).unwrap_or_default(),
+            };
+            lhs.push(RExpr::Collate(Box::new(se.clone()), coll));
+            affs.push(sub_col_affinity(plan, j));
+        }
+        let vals: &[OwnedValue] = match value {
+            SubValue::Many(vs, _) => vs.as_slice(),
+            SubValue::One(..) | SubValue::Fail(_) => &[],
+        };
+        let mut rows = AVec::new();
+        for chunk in vals.chunks(n) {
+            let mut row = AVec::new();
+            for (j, v) in chunk.iter().enumerate() {
+                row.push(wrap(v, affs.as_slice().get(j).copied().flatten()));
+            }
+            rows.push(RExpr::Scalar(ScalarFn::Vector, row));
+        }
+        return RExpr::InList(
+            Box::new(RExpr::Scalar(ScalarFn::Vector, lhs)),
+            rows,
+            neg,
+            true,
+        );
+    }
+    let sx = in_sub_lhs(x, plan, sx);
+    let mut list = AVec::new();
+    match value {
+        SubValue::Many(vs, aff) => {
+            for v in vs.iter() {
+                list.push(wrap(v, *aff));
+            }
+        }
+        SubValue::One(v, aff) => list.push(wrap(v, *aff)),
+        SubValue::Fail(_) => {}
+    }
+    RExpr::InList(Box::new(sx), list, neg, true)
+}
+
 /// `values` is consumed in `collect_subs` order; the caller
 /// guarantees the counts match.
 pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
@@ -1671,38 +2947,23 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                     None => RExpr::Literal(v.clone()),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
+                SubValue::Fail(k) => RExpr::Raise(*k),
             };
             *pos += 1;
             v
         }
         RExpr::InSub(x, plan, neg) => {
-            let sx = in_sub_lhs(x, plan, substitute(x, values, pos));
-            let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
-                Some(a) => RExpr::AffLiteral(v.clone(), *a),
-                None => RExpr::Literal(v.clone()),
-            };
-            let list = match &values[*pos] {
-                SubValue::Many(vs, aff) => {
-                    let mut out = AVec::new();
-                    for v in vs.iter() {
-                        out.push(wrap(v, aff));
-                    }
-                    out
-                }
-                SubValue::One(v, aff) => {
-                    let mut out = AVec::new();
-                    out.push(wrap(v, aff));
-                    out
-                }
-            };
+            let sx = substitute(x, values, pos);
+            let v = &values[*pos];
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg, true)
+            in_sub_list(x, plan, sx, v, *neg)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => e.clone(),
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => e.clone(),
         RExpr::Binary(op, a, b) => RExpr::Binary(
             *op,
             Box::new(substitute(a, values, pos)),
@@ -1764,6 +3025,11 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             distinct,
             star,
             args,
+            lvl,
+            inert,
+            alias,
+            #[cfg(feature = "v16")]
+            ext,
         } => {
             let mut out = AVec::new();
             for a in args.iter() {
@@ -1774,6 +3040,11 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                 distinct: *distinct,
                 star: *star,
                 args: out,
+                lvl: *lvl,
+                inert: *inert,
+                alias: *alias,
+                #[cfg(feature = "v16")]
+                ext: ext.clone(),
             }
         }
     }
@@ -1793,7 +3064,8 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => false,
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) => sub_in_agg_args(a) || sub_in_agg_args(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -1901,7 +3173,8 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => {}
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) => {
             collect_subs_outside_agg(a, out);
             collect_subs_outside_agg(b, out);
@@ -1983,42 +3256,23 @@ pub fn substitute_group(
                     None => RExpr::Literal(v.clone()),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
+                SubValue::Fail(k) => RExpr::Raise(*k),
             };
             *pos += 1;
             v
         }
         RExpr::InSub(x, plan, neg) => {
-            let sx = in_sub_lhs(
-                x,
-                plan,
-                substitute_group(x, values, pos, agg_values, agg_pos),
-            );
-            let wrap = |v: &OwnedValue, aff: &Option<Affinity>| match aff {
-                Some(a) => RExpr::AffLiteral(v.clone(), *a),
-                None => RExpr::Literal(v.clone()),
-            };
-            let list = match &values[*pos] {
-                SubValue::Many(vs, aff) => {
-                    let mut out = AVec::new();
-                    for v in vs.iter() {
-                        out.push(wrap(v, aff));
-                    }
-                    out
-                }
-                SubValue::One(v, aff) => {
-                    let mut out = AVec::new();
-                    out.push(wrap(v, aff));
-                    out
-                }
-            };
+            let sx = substitute_group(x, values, pos, agg_values, agg_pos);
+            let v = &values[*pos];
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg, true)
+            in_sub_list(x, plan, sx, v, *neg)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_) => e.clone(),
+        | RExpr::OutRef(_)
+        | RExpr::Raise(_) => e.clone(),
         RExpr::Binary(op, a, b) => RExpr::Binary(
             *op,
             Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
@@ -2120,11 +3374,14 @@ impl Num {
 /// conversion for CAST and arithmetic): leading spaces skipped,
 /// optional sign, digits with optional fraction/exponent. Returns
 /// None when the prefix has no digits at all.
-pub fn parse_num_prefix(t: &[u8]) -> Option<Num> {
-    let s = core::str::from_utf8(t).ok()?;
-    let b = s.as_bytes();
+///
+/// Like the pin's `sqlite3AtoF`, this reads bytes: what follows the
+/// prefix is never looked at (`x'38ff' + 0` is 8 — it used to be 0
+/// because the whole buffer had to be UTF-8), and only the ASCII
+/// spaces `sqlite3Isspace` knows are skipped (v0.16 fix, ungated).
+pub fn parse_num_prefix(b: &[u8]) -> Option<Num> {
     let mut i = 0usize;
-    while i < b.len() && (b[i] as char).is_whitespace() {
+    while i < b.len() && matches!(b[i], b' ' | b'\t'..=b'\r') {
         i += 1;
     }
     let start = i;
@@ -2162,7 +3419,8 @@ pub fn parse_num_prefix(t: &[u8]) -> Option<Num> {
             i = j;
         }
     }
-    let text = &s[start..i];
+    // Sign, digits, '.' and exponent only: always ASCII.
+    let text = core::str::from_utf8(b.get(start..i)?).ok()?;
     if !is_real {
         if let Ok(v) = text.parse::<i64>() {
             return Some(Num::Int(v));
@@ -2241,10 +3499,8 @@ fn int_value(v: &OwnedValue) -> i64 {
 /// `round(r, n)` as the pin computes it (v0.16), for `n` in
 /// 0..=30: a value beyond ±2^52 has no fraction and stays; with
 /// `n` 0 it is `(double)(i64)(r ± 0.5)`; otherwise the pin prints
-/// `%!.*f` (the decimal expansion rounded half away from zero at
-/// `n` places, or at its 26th significant digit when that comes
-/// first) and reads the text back. Here the expansion is exact:
-/// `|r| * 10^n` as a 192-bit integer of 32-bit limbs.
+/// `%!.*f` from its own digits and reads the text back
+/// (`record::round_digits`).
 fn round_real(r: f64, n: i64) -> f64 {
     const LIM: f64 = 4_503_599_627_370_496.0;
     if r.is_nan() || !(-LIM..=LIM).contains(&r) {
@@ -2253,91 +3509,7 @@ fn round_real(r: f64, n: i64) -> f64 {
     if n <= 0 {
         return (if r < 0.0 { r - 0.5 } else { r + 0.5 }) as i64 as f64;
     }
-    let bits = r.to_bits();
-    let exp = ((bits >> 52) & 0x7ff) as i64;
-    let frac = bits & ((1u64 << 52) - 1);
-    let (m, e) = if exp == 0 {
-        (frac, -1074i64)
-    } else {
-        (frac | (1u64 << 52), exp - 1075)
-    };
-    // An integral value (e >= 0) prints and reads back unchanged.
-    let Ok(k) = u32::try_from(-e) else {
-        return r;
-    };
-    if k == 0 {
-        return r;
-    }
-    // x = m * 10^n + 2^(k-1) < 2^154: six 32-bit limbs.
-    if k >= 154 {
-        // x < 2^153 <= 2^(k-1): rounds to 0.
-        return if r < 0.0 { -0.0 } else { 0.0 };
-    }
-    let mut x = [m as u32, (m >> 32) as u32, 0, 0, 0, 0];
-    for _ in 0..n {
-        let mut carry = 0u64;
-        for limb in x.iter_mut() {
-            let t = u64::from(*limb) * 10 + carry;
-            *limb = t as u32;
-            carry = t >> 32;
-        }
-    }
-    let mut carry = 1u64 << ((k - 1) % 32);
-    for limb in x.iter_mut().skip(((k - 1) / 32) as usize) {
-        let t = u64::from(*limb) + carry;
-        *limb = t as u32;
-        carry = t >> 32;
-    }
-    // D = x >> k, the value rounded half away from zero at n places.
-    let (lo, hi) = ((k / 32) as usize, k % 32);
-    let mut d = [0u32; 6];
-    for (i, slot) in d.iter_mut().enumerate() {
-        let a = u64::from(x.get(i + lo).copied().unwrap_or(0));
-        let b = u64::from(x.get(i + lo + 1).copied().unwrap_or(0));
-        *slot = (((b << 32) | a) >> hi) as u32;
-    }
-    // D's decimal digits, least significant first; more than 26
-    // means the pin rounds at its 26th significant digit, which
-    // reads back as `r` itself.
-    let mut digits = [0u8; 27];
-    let mut nd = 0usize;
-    while d.iter().any(|l| *l != 0) || nd == 0 {
-        let mut rem = 0u64;
-        for limb in d.iter_mut().rev() {
-            let cur = (rem << 32) | u64::from(*limb);
-            *limb = (cur / 10) as u32;
-            rem = cur % 10;
-        }
-        let Some(slot) = digits.get_mut(nd) else {
-            return r;
-        };
-        *slot = b'0' + rem as u8;
-        nd += 1;
-    }
-    // "[-]<digits>e-<n>", read back as the pin's AtoF reads it.
-    let mut buf = [0u8; 32];
-    let mut len = 0usize;
-    let mut push = |c: u8| {
-        if let Some(slot) = buf.get_mut(len) {
-            *slot = c;
-            len += 1;
-        }
-    };
-    if r < 0.0 {
-        push(b'-');
-    }
-    for c in digits.iter().take(nd).rev() {
-        push(*c);
-    }
-    push(b'e');
-    push(b'-');
-    if n >= 10 {
-        push(b'0' + (n / 10) as u8);
-    }
-    push(b'0' + (n % 10) as u8);
-    buf.get(..len)
-        .and_then(crate::sql::lexer::parse_real_signed)
-        .unwrap_or(r)
+    crate::record::round_digits(r, n)
 }
 
 /// Truncating conversion to i64 with SQLite's clamping at the
@@ -2468,28 +3640,124 @@ pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {
 
 // ---------------- evaluation ----------------
 
+/// Connection state the evaluator reads (v0.16, `v16`): the
+/// pin's `last_insert_rowid()`, `changes()`, `total_changes()`
+/// and the random stream behind `random()` / `randomblob()`. One
+/// per connection; the cells are updated from `&self` paths (a
+/// statement's writes, the random draws), never through global
+/// state. Without `v16` it is empty.
+#[derive(Debug)]
+pub struct Env {
+    #[cfg(feature = "v16")]
+    pub last_rowid: core::cell::Cell<i64>,
+    #[cfg(feature = "v16")]
+    pub changes: core::cell::Cell<i64>,
+    #[cfg(feature = "v16")]
+    pub total_changes: core::cell::Cell<i64>,
+    #[cfg(feature = "v16")]
+    pub prng: crate::func::Prng,
+    /// Rows the running INSERT / UPDATE / DELETE has changed so
+    /// far (moved to `changes` when it succeeds).
+    #[cfg(feature = "v16")]
+    pub pending: core::cell::Cell<i64>,
+}
+
+impl Env {
+    /// A fresh connection's state: no rows inserted or changed,
+    /// the random stream seeded from `seed` (`Config::nonce_seed`).
+    pub fn new(seed: u64) -> Env {
+        let _ = seed;
+        Env {
+            #[cfg(feature = "v16")]
+            last_rowid: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            changes: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            total_changes: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            prng: crate::func::Prng::new(seed),
+            #[cfg(feature = "v16")]
+            pending: core::cell::Cell::new(0),
+        }
+    }
+
+    /// One row inserted with `rowid` (an INSERT, the REPLACE
+    /// verb, an upsert's insert): counted, and the new
+    /// `last_insert_rowid()`.
+    #[cfg(feature = "v16")]
+    pub fn note_insert(&self, rowid: i64) {
+        self.last_rowid.set(rowid);
+        self.note_change();
+    }
+
+    /// One row updated (UPDATE, upsert DO UPDATE) or deleted
+    /// (DELETE). A REPLACE conflict's deletions are not counted,
+    /// as on the pin.
+    #[cfg(feature = "v16")]
+    pub fn note_change(&self) {
+        self.pending.set(self.pending.get().saturating_add(1));
+    }
+
+    /// The end of an INSERT / UPDATE / DELETE: on success its
+    /// count becomes `changes()` and joins `total_changes()`; a
+    /// failed statement leaves `changes()` 0.
+    #[cfg(feature = "v16")]
+    pub fn finish(&self, ok: bool) {
+        let n = if ok { self.pending.get() } else { 0 };
+        self.changes.set(n);
+        self.total_changes
+            .set(self.total_changes.get().saturating_add(n));
+        self.pending.set(0);
+    }
+}
+
 /// Evaluation context: a single row, or an aggregate group (bare
 /// columns read the representative row; `Agg` nodes fold the
-/// group's rows).
-pub enum Ctx<'x> {
-    Row(&'x RowData),
-    Group {
-        rows: &'x [RowData],
-        rep: &'x RowData,
-    },
+/// group's rows), plus the connection state (`Env`) the
+/// connection-state functions read — absent where an expression
+/// is evaluated outside any connection (they then refuse with
+/// `Unsupported`).
+#[derive(Clone, Copy)]
+pub struct Ctx<'x> {
+    rows: Option<&'x [RowData]>,
+    rep: &'x RowData,
+    env: Option<&'x Env>,
 }
 
 impl<'x> Ctx<'x> {
-    fn row(&self) -> &'x RowData {
-        match self {
-            Ctx::Row(r) => r,
-            Ctx::Group { rep, .. } => rep,
+    /// A single-row context.
+    pub fn of(r: &'x RowData) -> Ctx<'x> {
+        Ctx {
+            rows: None,
+            rep: r,
+            env: None,
         }
     }
-    /// A row context over the same representative/current row, for
-    /// evaluating aggregate arguments per group row.
-    fn as_row(r: &'x RowData) -> Ctx<'x> {
-        Ctx::Row(r)
+    /// An aggregate group's context: `rows` folds, `rep` supplies
+    /// the bare columns.
+    pub fn group(rows: &'x [RowData], rep: &'x RowData) -> Ctx<'x> {
+        Ctx {
+            rows: Some(rows),
+            rep,
+            env: None,
+        }
+    }
+    /// The same context reading the connection state `env`.
+    pub fn with(mut self, env: &'x Env) -> Ctx<'x> {
+        self.env = Some(env);
+        self
+    }
+    fn row(&self) -> &'x RowData {
+        self.rep
+    }
+    /// A row context over one of the group's rows, for evaluating
+    /// aggregate arguments per group row (same connection state).
+    fn as_row(&self, r: &'x RowData) -> Ctx<'x> {
+        Ctx {
+            rows: None,
+            rep: r,
+            env: self.env,
+        }
     }
 }
 
@@ -2534,21 +3802,54 @@ fn cmp_class(e: &RExpr) -> CmpClass {
 /// to the other side's value; TEXT-class against no affinity
 /// applies TEXT affinity to the no-affinity side; every other
 /// pairing converts nothing.
+///
+/// The pin's `OP_Eq` family applies the chosen affinity to BOTH
+/// operands (NUMERIC to a string, TEXT to a number when either
+/// operand is a string), which for a value read from a column
+/// of that affinity changes nothing — but a compound subquery's
+/// value may come from a core whose column has another affinity
+/// (v0.16 review fix: `(SELECT 1 UNION SELECT t FROM c) = 1`
+/// over TEXT t is 1 on the pin, hipp gave 0).
 fn adjust_cmp(l: &RExpr, r: &RExpr, lv: OwnedValue, rv: OwnedValue) -> (OwnedValue, OwnedValue) {
     let (lc, rc) = (cmp_class(l), cmp_class(r));
-    if lc == CmpClass::Numeric && rc != CmpClass::Numeric {
-        return (lv, apply_cmp_affinity(rv, Affinity::Numeric));
-    }
-    if rc == CmpClass::Numeric && lc != CmpClass::Numeric {
-        return (apply_cmp_affinity(lv, Affinity::Numeric), rv);
-    }
-    if lc == CmpClass::Text && rc == CmpClass::None {
-        return (lv, apply_cmp_affinity(rv, Affinity::Text));
-    }
-    if rc == CmpClass::Text && lc == CmpClass::None {
-        return (apply_cmp_affinity(lv, Affinity::Text), rv);
-    }
-    (lv, rv)
+    let aff = if lc == CmpClass::Numeric || rc == CmpClass::Numeric {
+        Affinity::Numeric
+    } else if (lc == CmpClass::Text && rc == CmpClass::None)
+        || (rc == CmpClass::Text && lc == CmpClass::None)
+    {
+        if !matches!(lv, OwnedValue::Text(_)) && !matches!(rv, OwnedValue::Text(_)) {
+            return (lv, rv);
+        }
+        Affinity::Text
+    } else {
+        return (lv, rv);
+    };
+    (apply_cmp_affinity(lv, aff), apply_cmp_affinity(rv, aff))
+}
+
+/// The affinity conversion of an IN over a subquery's set
+/// (v0.16 review fix): the set takes each column's comparison
+/// affinity from the left operand and the subquery's
+/// (`exprINAffinity`) and applies it to BOTH sides, as column
+/// affinity does — the left operand when it probes, every
+/// set value as it is stored — so TEXT stringifies a number
+/// even against a number (`1 IN (VALUES (1.0), (t))` over TEXT
+/// t is 0 on the pin). A row-value IN list is such a set too:
+/// the pin rewrites `(a, b) IN ((x, y), ...)` as an IN over
+/// `VALUES`, so `(1, 1) IN ((x, y), (a, b))` with INTEGER x, y
+/// and TEXT a, b converts the literals and x, y to TEXT, and
+/// the first row matches (only the left operand was converted,
+/// a silent 0).
+fn adjust_set(l: &RExpr, r: &RExpr, lv: OwnedValue, rv: OwnedValue) -> (OwnedValue, OwnedValue) {
+    let aff = match (cmp_class(l), cmp_class(r)) {
+        (CmpClass::None, CmpClass::None) => return (lv, rv),
+        (CmpClass::Numeric, _) | (_, CmpClass::Numeric) => Affinity::Numeric,
+        (CmpClass::None, CmpClass::Text) | (CmpClass::Text, CmpClass::None) => Affinity::Text,
+        // Two affinities, neither numeric — or BLOB against
+        // none: the pin compares as stored.
+        _ => return (lv, rv),
+    };
+    (apply_cmp_affinity(lv, aff), apply_cmp_affinity(rv, aff))
 }
 
 /// The affinity conversion of a written `IN (list)` test
@@ -2603,6 +3904,7 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
         | RExpr::Column(..)
         | RExpr::Rowid(_)
         | RExpr::OutRef(_)
+        | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_) => false,
         RExpr::InSub(x, ..)
@@ -2623,7 +3925,8 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
                 || whens.iter().any(|(w, t)| f(w) || f(t))
                 || otherwise.as_deref().is_some_and(f)
         }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().any(f),
+        RExpr::Scalar(_, args) => args.iter().any(f),
+        RExpr::Agg { .. } => agg_parts(e).is_some_and(|p| p.args.iter().any(f)),
     }
 }
 
@@ -2675,8 +3978,10 @@ fn explicit_child(e: &RExpr) -> Option<&RExpr> {
             }
             otherwise.as_deref()
         }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
-            first(args.as_slice()).and_then(|i| args.as_slice().get(i))
+        RExpr::Scalar(_, args) => first(args.as_slice()).and_then(|i| args.as_slice().get(i)),
+        RExpr::Agg { .. } => {
+            let args = agg_parts(e).map(|p| p.args).unwrap_or(&[]);
+            first(args).and_then(|i| args.get(i))
         }
         _ => None,
     }
@@ -2744,6 +4049,7 @@ pub fn is_constant(e: &RExpr) -> bool {
         RExpr::Column(..)
         | RExpr::Rowid(_)
         | RExpr::OutRef(_)
+        | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_)
         | RExpr::InSub(..)
@@ -2767,6 +4073,44 @@ pub fn is_constant(e: &RExpr) -> bool {
                 && otherwise.as_deref().is_none_or(is_constant)
         }
         RExpr::Scalar(_, args) => args.iter().all(is_constant),
+    }
+}
+
+/// Whether `e` holds a failed subquery's deferred error
+/// (`RExpr::Raise`, v0.16 review fix). The pin codes an AND /
+/// OR whose operand has a subquery as a short-circuit jump, so
+/// `0 AND (SELECT abs(-9223372036854775808))` is 0 there; without
+/// a subquery both operands run (`0 AND abs(b)` raises).
+fn has_raise(e: &RExpr) -> bool {
+    match e {
+        RExpr::Raise(_) => true,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_)
+        | RExpr::InSub(..) => false,
+        RExpr::Agg { args, .. } | RExpr::Scalar(_, args) => args.iter().any(has_raise),
+        RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _)
+        | RExpr::Cast(x, _)
+        | RExpr::Collate(x, _) => has_raise(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => has_raise(a) || has_raise(b),
+        RExpr::InList(x, l, ..) => has_raise(x) || l.iter().any(has_raise),
+        RExpr::Between(x, a, b, _) => has_raise(x) || has_raise(a) || has_raise(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(has_raise)
+                || whens.iter().any(|(w, t)| has_raise(w) || has_raise(t))
+                || otherwise.as_deref().is_some_and(has_raise)
+        }
     }
 }
 
@@ -2857,7 +4201,7 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
                 if d == 0.0 {
                     OwnedValue::Null
                 } else {
-                    OwnedValue::Real(x.as_f64() / d)
+                    real_value(x.as_f64() / d)
                 }
             }
         });
@@ -2879,12 +4223,24 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
         // recorded as a hipp divergence only for +,- overflow).
     }
     let (x, y) = (a.as_f64(), b.as_f64());
-    Ok(OwnedValue::Real(match op {
+    Ok(real_value(match op {
         BinOp::Add => x + y,
         BinOp::Sub => x - y,
         BinOp::Mul => x * y,
         _ => unreachable!(),
     }))
+}
+
+/// A REAL result as the pin stores it: a NaN (`inf - inf`,
+/// `0 * inf`, `inf / inf`) is NULL (`sqlite3VdbeMemSetDouble`;
+/// v0.16 review fix: hipp answered a NaN REAL, which rendered
+/// as 0.0 and was written to the file).
+pub fn real_value(r: f64) -> OwnedValue {
+    if r.is_nan() {
+        OwnedValue::Null
+    } else {
+        OwnedValue::Real(r)
+    }
 }
 
 /// Decode text the way the pin's `sqlite3Utf8Read` walks a
@@ -2894,37 +4250,50 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
 /// forms, surrogates and U+FFFE / U+FFFF read as U+FFFD;
 /// stray continuation and ASCII bytes read as themselves.
 fn pattern_chars(b: &[u8]) -> AVec<u32> {
-    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-    let b = b.get(..end).unwrap_or(&[]);
     let mut out = AVec::new();
     let mut i = 0;
-    while let Some(&c0) = b.get(i) {
-        i += 1;
-        let mut c = u32::from(c0);
-        if c >= 0xc0 {
-            // `sqlite3Utf8Trans1`: the lead byte's payload bits.
-            c = match c0 {
-                0xc0..=0xdf => c - 0xc0,
-                0xe0..=0xef => c - 0xe0,
-                0xf0..=0xf7 => c - 0xf0,
-                0xf8..=0xfb => c - 0xf8,
-                0xfc..=0xfd => c - 0xfc,
-                _ => 0,
-            };
-            while let Some(&n) = b.get(i) {
-                if n & 0xc0 != 0x80 {
-                    break;
-                }
-                c = c.wrapping_shl(6) | u32::from(n & 0x3f);
-                i += 1;
-            }
-            if c < 0x80 || (c & 0xFFFF_F800) == 0xD800 || (c & 0xFFFF_FFFE) == 0xFFFE {
-                c = 0xFFFD;
-            }
-        }
+    while let Some((c, n)) = pattern_char_at(b, i) {
         out.push(c);
+        i = n;
     }
     out
+}
+
+/// One character of `pattern_chars` at byte `i`: the code point
+/// and the next character's byte offset; None at the end (or
+/// the first NUL). The LIKE / GLOB subject is walked with this
+/// directly rather than decoded into a list (v0.16 review fix:
+/// four bytes per character of a subject up to the 1e9-byte
+/// limit).
+fn pattern_char_at(b: &[u8], i: usize) -> Option<(u32, usize)> {
+    let c0 = *b.get(i)?;
+    if c0 == 0 {
+        return None;
+    }
+    let mut i = i + 1;
+    let mut c = u32::from(c0);
+    if c >= 0xc0 {
+        // `sqlite3Utf8Trans1`: the lead byte's payload bits.
+        c = match c0 {
+            0xc0..=0xdf => c - 0xc0,
+            0xe0..=0xef => c - 0xe0,
+            0xf0..=0xf7 => c - 0xf0,
+            0xf8..=0xfb => c - 0xf8,
+            0xfc..=0xfd => c - 0xfc,
+            _ => 0,
+        };
+        while let Some(&n) = b.get(i) {
+            if n & 0xc0 != 0x80 {
+                break;
+            }
+            c = c.wrapping_shl(6) | u32::from(n & 0x3f);
+            i += 1;
+        }
+        if c < 0x80 || (c & 0xFFFF_F800) == 0xD800 || (c & 0xFFFF_FFFE) == 0xFFFE {
+            c = 0xFFFD;
+        }
+    }
+    Some((c, i))
 }
 
 /// The pin's `compareInfo` (v0.16): the wildcard characters
@@ -3014,31 +4383,34 @@ fn element_match(pat: &[u32], p: usize, ch: Option<u32>, info: PatInfo) -> Optio
 /// all-wildcard matches exactly one character, so the classic
 /// single-backtrack-point scan decides exactly what the pin's
 /// recursive search decides, iteratively and in O(n*m).
-fn pattern_match(pat: &[u32], s: &[u32], info: PatInfo) -> bool {
+fn pattern_match(pat: &[u32], s: &[u8], info: PatInfo) -> bool {
+    // `i` is a byte offset into the subject, which is decoded one
+    // character at a time (`pattern_char_at`).
     let (mut p, mut i) = (0usize, 0usize);
     let mut back: Option<(usize, usize)> = None;
     loop {
+        let cur = pattern_char_at(s, i);
         if let Some(&c) = pat.get(p) {
             if info.all != 0 && c == info.all {
                 p += 1;
                 back = Some((p, i));
                 continue;
             }
-            if let Some(n) = element_match(pat, p, s.get(i).copied(), info) {
+            if let Some(n) = element_match(pat, p, cur.map(|(c, _)| c), info) {
                 p += n;
-                i += 1;
+                i = cur.map_or(i, |(_, next)| next);
                 continue;
             }
-        } else if i >= s.len() {
+        } else if cur.is_none() {
             return true;
         }
-        match back {
-            Some((bp, bi)) if bi < s.len() => {
-                back = Some((bp, bi + 1));
+        match back.and_then(|(bp, bi)| pattern_char_at(s, bi).map(|(_, next)| (bp, next))) {
+            Some((bp, bn)) => {
+                back = Some((bp, bn));
                 p = bp;
-                i = bi + 1;
+                i = bn;
             }
-            _ => return false,
+            None => return false,
         }
     }
 }
@@ -3100,17 +4472,57 @@ pub fn like_glob<E>(
     let (Some(p), Some(x)) = (to_text(pat), to_text(subject)) else {
         return Ok(OwnedValue::Null);
     };
-    let (p, x) = (pattern_chars(p.as_slice()), pattern_chars(x.as_slice()));
+    let p = pattern_chars(p.as_slice());
     Ok(bool_val(pattern_match(p.as_slice(), x.as_slice(), info)))
 }
 
-/// Number of Unicode characters in a text value (blob length is
-/// the byte length; SQLite's length() rule).
+/// The characters of a text as the pin's C functions walk it
+/// (v0.16 fix): up to the first NUL, a lead byte of 0xc0 or more
+/// taking the continuation bytes after it (`SQLITE_SKIP_UTF8`),
+/// any other byte one character on its own — invalid UTF-8
+/// included (v0.15 read invalid UTF-8 as no characters, or as
+/// bytes, and counted past a NUL).
+///
+/// An iterator, not a list: `length()` / `substr()` of a large
+/// text walk it once without allocating (v0.16 review fix — a
+/// collected list took 16 bytes per character, so
+/// `length(printf('%*.*s', 999999999, 5, 'x'))` was killed for
+/// memory where the pin answers).
+fn char_ranges(t: &[u8]) -> CharRanges<'_> {
+    CharRanges { t, i: 0 }
+}
+
+/// The byte ranges `char_ranges` yields.
+struct CharRanges<'a> {
+    t: &'a [u8],
+    i: usize,
+}
+
+impl Iterator for CharRanges<'_> {
+    type Item = (usize, usize);
+    fn next(&mut self) -> Option<(usize, usize)> {
+        let i = self.i;
+        let c = *self.t.get(i)?;
+        if c == 0 {
+            return None;
+        }
+        let mut j = i + 1;
+        if c >= 0xc0 {
+            while self.t.get(j).is_some_and(|b| (*b & 0xc0) == 0x80) {
+                j += 1;
+            }
+        }
+        self.i = j;
+        Some((i, j))
+    }
+}
+
+/// `length(X)` (v0.16 fix): a BLOB's bytes; a TEXT's characters
+/// up to its first NUL (`char_ranges`); a number's text form's
+/// bytes.
 fn char_len(v: &OwnedValue) -> i64 {
     match v {
-        OwnedValue::Text(t) => core::str::from_utf8(t.as_slice())
-            .map(|s| s.chars().count())
-            .unwrap_or(t.len()) as i64,
+        OwnedValue::Text(t) => char_ranges(t.as_slice()).count() as i64,
         OwnedValue::Blob(t) => t.len() as i64,
         OwnedValue::Integer(_) | OwnedValue::Real(_) => {
             to_text(v).map(|t| t.len()).unwrap_or(0) as i64
@@ -3119,41 +4531,226 @@ fn char_len(v: &OwnedValue) -> i64 {
     }
 }
 
-/// Split text into (byte_range per char) for substr/instr.
-fn char_ranges(t: &[u8]) -> AVec<(usize, usize)> {
-    let mut out = AVec::new();
-    let s = core::str::from_utf8(t).unwrap_or("");
-    for (i, c) in s.char_indices() {
-        out.push((i, i + c.len_utf8()));
+/// The text a C function sees for a value (`sqlite3_value_text`):
+/// its bytes up to the first NUL.
+fn c_text(t: &[u8]) -> &[u8] {
+    match t.iter().position(|b| *b == 0) {
+        Some(i) => t.get(..i).unwrap_or(t),
+        None => t,
     }
-    out
+}
+
+/// The pin's `instrFunc` (v0.16 fix): two BLOBs search bytes;
+/// otherwise both sides as text, counting characters (a lead
+/// byte's continuation bytes are skipped). An empty needle is at
+/// 1; not found is 0.
+fn instr_value(x: &OwnedValue, y: &OwnedValue) -> OwnedValue {
+    if matches!(x, OwnedValue::Null) || matches!(y, OwnedValue::Null) {
+        return OwnedValue::Null;
+    }
+    let is_text = !(matches!(x, OwnedValue::Blob(_)) && matches!(y, OwnedValue::Blob(_)));
+    let (Some(h), Some(n)) = (to_text(x), to_text(y)) else {
+        return OwnedValue::Null;
+    };
+    let (h, n) = (h.as_slice(), n.as_slice());
+    if n.is_empty() {
+        return OwnedValue::Integer(1);
+    }
+    let mut pos = 1i64;
+    let mut i = 0usize;
+    while n.len() <= h.len().saturating_sub(i) {
+        if h.get(i..i + n.len()) == Some(n) {
+            return OwnedValue::Integer(pos);
+        }
+        pos += 1;
+        i += 1;
+        while is_text && h.get(i).is_some_and(|b| (*b & 0xc0) == 0x80) {
+            i += 1;
+        }
+    }
+    OwnedValue::Integer(0)
+}
+
+/// The pin's `trimFunc` (v0.16 fix): the trim set is the second
+/// argument's characters up to its first NUL (one space when
+/// absent; nothing to trim when empty), each matched as its whole
+/// byte sequence against either end of the first argument's
+/// bytes. Always TEXT.
+fn trim_value(f: ScalarFn, v: &[OwnedValue]) -> OwnedValue {
+    if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
+        return OwnedValue::Null;
+    }
+    let Some(text) = v.first().and_then(to_text) else {
+        return OwnedValue::Null;
+    };
+    let set: AVec<u8> = match v.get(1) {
+        Some(c) => to_text(c).unwrap_or_default(),
+        None => {
+            let mut c = AVec::new();
+            c.push(b' ');
+            c
+        }
+    };
+    let set = c_text(set.as_slice());
+    let mut z = text.as_slice();
+    let hit = |z: &[u8], front: bool| -> Option<usize> {
+        char_ranges(set).find_map(|(a, b)| {
+            let ch = set.get(a..b)?;
+            let ok = if front {
+                z.starts_with(ch)
+            } else {
+                z.ends_with(ch)
+            };
+            ok.then_some(ch.len())
+        })
+    };
+    if !set.is_empty() {
+        if f != ScalarFn::Rtrim {
+            while let Some(k) = hit(z, true).filter(|_| !z.is_empty()) {
+                z = z.get(k..).unwrap_or(&[]);
+            }
+        }
+        if f != ScalarFn::Ltrim {
+            while let Some(k) = hit(z, false).filter(|_| !z.is_empty()) {
+                z = z.get(..z.len() - k).unwrap_or(&[]);
+            }
+        }
+    }
+    let mut out = AVec::new();
+    out.extend_from_slice(z);
+    OwnedValue::Text(out)
+}
+
+/// Evaluate the arguments a function call needs only lazily
+/// (v0.16 fix): `coalesce` / `ifnull` stop at the first non-NULL,
+/// `iif` / `if` evaluate only the chosen branch, `likely` & co.
+/// are their first argument — the pin compiles them inline and
+/// never evaluates the rest (`coalesce(1, abs(<i64 min>))` is 1
+/// there; hipp raised "integer overflow").
+fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<OwnedValue, E>> {
+    match f {
+        ScalarFn::Coalesce => {
+            for a in args {
+                match eval::<E>(a, ctx) {
+                    Ok(OwnedValue::Null) => {}
+                    other => return Some(other),
+                }
+            }
+            Some(Ok(OwnedValue::Null))
+        }
+        ScalarFn::Iif => {
+            let mut i = 0usize;
+            while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
+                match eval::<E>(c, ctx) {
+                    Err(e) => return Some(Err(e)),
+                    Ok(cv) => {
+                        if truthy(&cv) == Some(true) {
+                            return Some(eval::<E>(t, ctx));
+                        }
+                    }
+                }
+                i += 2;
+            }
+            Some(match args.get(i) {
+                Some(o) => eval::<E>(o, ctx),
+                None => Ok(OwnedValue::Null),
+            })
+        }
+        #[cfg(feature = "v16")]
+        ScalarFn::Likely => args.first().map(|a| eval::<E>(a, ctx)),
+        #[cfg(feature = "v16")]
+        ScalarFn::Random
+        | ScalarFn::Randomblob
+        | ScalarFn::LastInsertRowid
+        | ScalarFn::Changes
+        | ScalarFn::TotalChanges => {
+            let Some(env) = ctx.env else {
+                return Some(Err(Error::Unsupported));
+            };
+            Some(match f {
+                ScalarFn::Random => Ok(OwnedValue::Integer(env.prng.random())),
+                ScalarFn::Randomblob => match args.first().map(|a| eval::<E>(a, ctx)) {
+                    Some(Ok(n)) => env.prng.blob::<E>(&n),
+                    Some(Err(e)) => Err(e),
+                    None => Ok(OwnedValue::Null),
+                },
+                ScalarFn::LastInsertRowid => Ok(OwnedValue::Integer(env.last_rowid.get())),
+                ScalarFn::Changes => Ok(OwnedValue::Integer(env.changes.get())),
+                _ => Ok(OwnedValue::Integer(env.total_changes.get())),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    if let Some(r) = eval_lazy::<E>(f, args, ctx) {
+        return r;
+    }
     let mut vs: AVec<OwnedValue> = AVec::new();
     for a in args {
         vs.push(eval::<E>(a, ctx)?);
     }
     let v = vs.as_slice();
+    #[cfg(feature = "math")]
+    if let ScalarFn::Math(m) = f {
+        return Ok(crate::math::eval(m, v));
+    }
+    let Some(v0) = v.first() else {
+        // The argument-free calls.
+        #[cfg(feature = "v16")]
+        match f {
+            ScalarFn::Printf => return Ok(OwnedValue::Null),
+            ScalarFn::Char => return Ok(OwnedValue::Text(AVec::new())),
+            ScalarFn::SqliteVersion => {
+                let mut t = AVec::new();
+                t.extend_from_slice(b"3.54.1");
+                return Ok(OwnedValue::Text(t));
+            }
+            _ => {}
+        }
+        return Err(Error::Unsupported);
+    };
+    let v1 = v.get(1);
     Ok(match f {
-        ScalarFn::Coalesce => v
-            .iter()
-            .find(|x| !matches!(x, OwnedValue::Null))
-            .cloned()
-            .unwrap_or(OwnedValue::Null),
+        #[cfg(feature = "v16")]
+        ScalarFn::BitNot => match v0 {
+            OwnedValue::Null => OwnedValue::Null,
+            x => OwnedValue::Integer(!int_value(x)),
+        },
+        #[cfg(feature = "v16")]
+        ScalarFn::Vector => return Err(row_misused()),
+        #[cfg(feature = "v16")]
+        ScalarFn::Printf => crate::func::printf::<E>(v)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Quote => crate::func::quote::<E>(v0)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Char => crate::func::char_fn::<E>(v)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Unicode => crate::func::unicode(v0),
+        #[cfg(feature = "v16")]
+        ScalarFn::Zeroblob => crate::func::zeroblob::<E>(v0)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Concat => crate::func::concat::<E>(None, v)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::ConcatWs => crate::func::concat::<E>(Some(v0), v.get(1..).unwrap_or(&[]))?,
+        #[cfg(feature = "v16")]
+        ScalarFn::OctetLength => crate::func::octet_length(v0),
+        #[cfg(feature = "v16")]
+        ScalarFn::Unhex => crate::func::unhex(v0, v1),
         ScalarFn::Nullif => {
-            let (a, b) = (&v[0], &v[1]);
-            if !matches!(a, OwnedValue::Null)
+            let b = v1.unwrap_or(&OwnedValue::Null);
+            if !matches!(v0, OwnedValue::Null)
                 && !matches!(b, OwnedValue::Null)
-                && values_equal_coll(a, b, args_coll(args))
+                && values_equal_coll(v0, b, args_coll(args))
             {
                 OwnedValue::Null
             } else {
-                a.clone()
+                v0.clone()
             }
         }
         ScalarFn::Typeof => {
-            let name: &[u8] = match &v[0] {
+            let name: &[u8] = match v0 {
                 OwnedValue::Null => b"null",
                 OwnedValue::Integer(_) => b"integer",
                 OwnedValue::Real(_) => b"real",
@@ -3167,7 +4764,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
         // The pin's absFunc (v0.16): an INTEGER stays INTEGER —
         // i64::MIN is "integer overflow" —, a REAL stays REAL, and
         // TEXT / BLOB convert to REAL (`abs('5')` is 5.0).
-        ScalarFn::Abs => match &v[0] {
+        ScalarFn::Abs => match v0 {
             OwnedValue::Null => OwnedValue::Null,
             OwnedValue::Integer(i) => match i.checked_abs() {
                 Some(a) => OwnedValue::Integer(a),
@@ -3187,37 +4784,34 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             }
         },
         ScalarFn::Length => {
-            if matches!(v[0], OwnedValue::Null) {
+            if matches!(v0, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
-                OwnedValue::Integer(char_len(&v[0]))
+                OwnedValue::Integer(char_len(v0))
             }
         }
+        // ASCII case folding over the value's text bytes (all of
+        // them); a BLOB comes back as TEXT, as on the pin (v0.16
+        // fix: hipp returned the BLOB unchanged).
         ScalarFn::Upper | ScalarFn::Lower => {
             let up = f == ScalarFn::Upper;
-            match &v[0] {
-                OwnedValue::Null => OwnedValue::Null,
-                OwnedValue::Blob(b) => OwnedValue::Blob(b.clone()),
-                _ => {
-                    let Some(mut t) = to_text(&v[0]) else {
-                        return Ok(OwnedValue::Null);
-                    };
-                    for b in t.as_mut_slice() {
-                        if up {
-                            b.make_ascii_uppercase();
-                        } else {
-                            b.make_ascii_lowercase();
-                        }
-                    }
-                    OwnedValue::Text(t)
+            let Some(mut t) = to_text(v0) else {
+                return Ok(OwnedValue::Null);
+            };
+            for b in t.as_mut_slice() {
+                if up {
+                    b.make_ascii_uppercase();
+                } else {
+                    b.make_ascii_lowercase();
                 }
             }
+            OwnedValue::Text(t)
         }
         ScalarFn::Hex => {
-            if matches!(v[0], OwnedValue::Null) {
+            if matches!(v0, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
-                let bytes = to_text(&v[0]).unwrap_or_default();
+                let bytes = to_text(v0).unwrap_or_default();
                 let mut out = AVec::new();
                 for b in bytes.as_slice() {
                     let (hi, lo) = (b >> 4, b & 0xf);
@@ -3227,7 +4821,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 OwnedValue::Text(out)
             }
         }
-        ScalarFn::Sign => match to_number(&v[0]) {
+        ScalarFn::Sign => match to_number(v0) {
             None => OwnedValue::Null,
             Some(n) => {
                 let x = n.as_f64();
@@ -3241,13 +4835,13 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             }
         },
         ScalarFn::Round => {
-            let Some(n) = to_number(&v[0]) else {
+            let Some(n) = to_number(v0) else {
                 return Ok(OwnedValue::Null);
             };
             // The digit count is read as the pin's
             // `sqlite3_value_int64` reads it (a text's integer
             // prefix: '1e1' is 1), then clamped to 0..=30.
-            let digits = match v.get(1) {
+            let digits = match v1 {
                 None => 0,
                 Some(OwnedValue::Null) => return Ok(OwnedValue::Null),
                 Some(d) => int_value(d).clamp(0, 30),
@@ -3258,15 +4852,24 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
                 return Ok(OwnedValue::Null);
             }
-            let Some(text) = to_text(&v[0]) else {
+            let Some(text) = to_text(v0) else {
                 return Ok(OwnedValue::Null);
             };
+            let blob = matches!(v0, OwnedValue::Blob(_));
             // Start and length are read as the pin's
             // `sqlite3_value_int64` reads them: a text's integer
             // prefix ('1e1' is 1), a real truncated.
-            let mut start = int_value(&v[1]);
-            let ranges = char_ranges(text.as_slice());
-            let n = ranges.len() as i64;
+            let mut start = v1.map_or(0, int_value);
+            // A BLOB's units are bytes; a text's are its
+            // characters up to the first NUL (v0.16 fix). Counted
+            // and walked without a per-unit list (v0.16 review
+            // fix: memory stays the size of the text).
+            let tb = text.as_slice();
+            let n = if blob {
+                tb.len() as i64
+            } else {
+                char_ranges(tb).count() as i64
+            };
             // Two-argument form: the implicit length is i64::MAX
             // (pinned on 3.54.1 by a CI probe grid — e.g.
             // substr(x, -9223372036854775808) keeps all but the last
@@ -3299,114 +4902,75 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 }
             }
             let end = start.saturating_add(len).min(n);
-            let mut out = AVec::new();
-            for (i, (bs, be)) in ranges.iter().enumerate() {
-                let idx = i as i64;
-                if idx >= start
-                    && idx < end
-                    && let Some(piece) = text.as_slice().get(*bs..*be)
-                {
-                    out.extend_from_slice(piece);
-                }
-            }
-            match v[0] {
-                OwnedValue::Blob(_) => OwnedValue::Blob(out),
-                _ => OwnedValue::Text(out),
-            }
-        }
-        ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => {
-            if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
-                return Ok(OwnedValue::Null);
-            }
-            let Some(text) = to_text(&v[0]) else {
-                return Ok(OwnedValue::Null);
-            };
-            let chars: AVec<u8> = if v.len() > 1 {
-                to_text(&v[1]).unwrap_or_default()
+            // The byte span of units start..end (0 <= start).
+            let span = if start >= end {
+                None
+            } else if blob {
+                Some((start as usize, end as usize))
             } else {
-                let mut c = AVec::new();
-                c.push(b' ');
-                c
+                let mut first = None;
+                let mut last = 0usize;
+                for (idx, (bs, be)) in char_ranges(tb).enumerate() {
+                    let idx = idx as i64;
+                    if idx >= end {
+                        break;
+                    }
+                    if idx >= start {
+                        first.get_or_insert(bs);
+                        last = be;
+                    }
+                }
+                first.map(|f| (f, last))
             };
-            let in_set = |b: u8| chars.as_slice().contains(&b);
-            let bytes = text.as_slice();
-            let (mut s, mut e) = (0usize, bytes.len());
-            if f != ScalarFn::Rtrim {
-                while s < e && in_set(bytes[s]) {
-                    s += 1;
-                }
-            }
-            if f != ScalarFn::Ltrim {
-                while e > s && in_set(bytes[e - 1]) {
-                    e -= 1;
-                }
-            }
             let mut out = AVec::new();
-            out.extend_from_slice(&bytes[s..e]);
-            OwnedValue::Text(out)
+            if let Some(piece) = span.and_then(|(a, b)| tb.get(a..b)) {
+                out.extend_from_slice(piece);
+            }
+            if blob {
+                OwnedValue::Blob(out)
+            } else {
+                OwnedValue::Text(out)
+            }
         }
+        ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => trim_value(f, v),
         ScalarFn::Replace => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
                 return Ok(OwnedValue::Null);
             }
-            let (Some(x), Some(y), Some(z)) = (to_text(&v[0]), to_text(&v[1]), to_text(&v[2]))
-            else {
+            let (Some(x), Some(y), Some(z)) = (
+                to_text(v0),
+                v1.and_then(to_text),
+                v.get(2).and_then(to_text),
+            ) else {
                 return Ok(OwnedValue::Null);
             };
-            if y.is_empty() {
+            // The pin tests the pattern's first byte for NUL: an
+            // empty or NUL-led pattern leaves X as it is (TEXT).
+            if matches!(y.as_slice().first(), None | Some(0)) {
                 return Ok(OwnedValue::Text(x));
             }
             let mut out = AVec::new();
             let (xb, yb) = (x.as_slice(), y.as_slice());
             let mut i = 0usize;
-            while i < xb.len() {
-                if i + yb.len() <= xb.len() && &xb[i..i + yb.len()] == yb {
+            while let Some(&c) = xb.get(i) {
+                if xb.get(i..i + yb.len()) == Some(yb) {
                     out.extend_from_slice(z.as_slice());
                     i += yb.len();
                 } else {
-                    out.push(xb[i]);
+                    out.push(c);
                     i += 1;
                 }
             }
             OwnedValue::Text(out)
         }
-        ScalarFn::Instr => {
-            if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
-                return Ok(OwnedValue::Null);
-            }
-            let (Some(x), Some(y)) = (to_text(&v[0]), to_text(&v[1])) else {
-                return Ok(OwnedValue::Null);
-            };
-            if y.is_empty() {
-                return Ok(OwnedValue::Integer(1));
-            }
-            let (xb, yb) = (x.as_slice(), y.as_slice());
-            let mut pos = 0i64;
-            let mut i = 0usize;
-            let mut found = 0i64;
-            while i < xb.len() {
-                if i + yb.len() <= xb.len() && &xb[i..i + yb.len()] == yb {
-                    found = pos + 1;
-                    break;
-                }
-                // Advance by one character.
-                let step = utf8_len(xb[i]);
-                i += step;
-                pos += 1;
-            }
-            OwnedValue::Integer(found)
-        }
+        ScalarFn::Instr => instr_value(v0, v1.unwrap_or(&OwnedValue::Null)),
         #[cfg(feature = "v16")]
-        ScalarFn::Like | ScalarFn::Glob => {
-            like_glob::<E>(&v[0], &v[1], v.get(2), f == ScalarFn::Glob)?
-        }
-        ScalarFn::Iif => {
-            if truthy(&v[0]) == Some(true) {
-                v[1].clone()
-            } else {
-                v[2].clone()
-            }
-        }
+        ScalarFn::Like | ScalarFn::Glob => like_glob::<E>(
+            v0,
+            v1.unwrap_or(&OwnedValue::Null),
+            v.get(2),
+            f == ScalarFn::Glob,
+        )?,
         ScalarFn::MinN | ScalarFn::MaxN => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
                 OwnedValue::Null
@@ -3416,8 +4980,8 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 // but takes the later one for min() — the pin's
                 // `minmaxFunc` (`min(1, 1.0)` is 1.0).
                 let coll = args_coll(args);
-                let mut best = v[0].clone();
-                for x in &v[1..] {
+                let mut best = v0.clone();
+                for x in v.get(1..).unwrap_or(&[]) {
                     let ord = compare_coll(&x.as_value(), &best.as_value(), coll);
                     let take = if f == ScalarFn::MinN {
                         ord != core::cmp::Ordering::Greater
@@ -3431,227 +4995,120 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 best
             }
         }
+        // Handled lazily (`eval_lazy`) or argument-free above.
+        _ => return Err(Error::Unsupported),
     })
 }
 
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b >> 5 == 0b110 {
-        2
-    } else if b >> 4 == 0b1110 {
-        3
-    } else if b >> 3 == 0b11110 {
-        4
-    } else {
-        1
-    }
-}
-
-/// The number a value contributes to sum/total/avg: like
-/// `to_number`, except non-numeric text contributes a *real* 0.0
-/// (SQLite: `sum('abc')` is 0.0, not integer 0).
-fn sum_number(v: &OwnedValue) -> Num {
-    match v {
-        OwnedValue::Integer(i) => Num::Int(*i),
-        OwnedValue::Real(r) => Num::Real(*r),
-        OwnedValue::Text(t) | OwnedValue::Blob(t) => {
-            parse_num_prefix(t.as_slice()).unwrap_or(Num::Real(0.0))
-        }
-        OwnedValue::Null => Num::Int(0),
-    }
-}
-
-/// Fold one aggregate over a group's rows: evaluate the
-/// arguments per row (synchronously) and fold the values.
-fn eval_agg<E>(
-    kind: AggKind,
-    distinct: bool,
-    star: bool,
-    args: &[RExpr],
-    rows: &[RowData],
-) -> Result<OwnedValue, E> {
+/// Fold one aggregate over a group's rows: evaluate its inputs
+/// per row (synchronously; `agg_row` applies its FILTER) and fold
+/// the values (`agg::fold`).
+fn eval_agg<E>(e: &RExpr, rows: &[RowData], ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    let Some(p) = agg_parts(e) else {
+        return Err(Error::Unsupported);
+    };
     let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
     for r in rows {
-        let mut vs: AVec<OwnedValue> = AVec::new();
-        if !star {
-            for a in args {
-                vs.push(eval::<E>(a, &Ctx::as_row(r))?);
-            }
-        }
-        arg_rows.push(vs);
-    }
-    eval_agg_values::<E>(kind, distinct, star, arg_rows.as_slice(), args_coll(args))
-}
-
-/// Fold one aggregate over precomputed per-row argument
-/// values (v0.11): `arg_rows` holds, per group row, the values
-/// of the aggregate's arguments for that row (empty for
-/// `count(*)`). This is the single folding implementation:
-/// the synchronous evaluator reaches it through `eval_agg`,
-/// and the subquery executor reaches it with argument values
-/// whose subqueries were executed per group row.
-pub fn eval_agg_values<E>(
-    kind: AggKind,
-    distinct: bool,
-    star: bool,
-    arg_rows: &[AVec<OwnedValue>],
-    coll: Coll,
-) -> Result<OwnedValue, E> {
-    match kind {
-        AggKind::Count => {
-            if star {
-                return Ok(OwnedValue::Integer(arg_rows.len() as i64));
-            }
-            let mut n = 0i64;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = &vs.as_slice()[0];
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                n += 1;
-            }
-            Ok(OwnedValue::Integer(n))
-        }
-        AggKind::Sum | AggKind::Total | AggKind::Avg => {
-            let mut int_acc: i64 = 0;
-            let mut int_ok = true;
-            let mut real_acc = 0.0f64;
-            let mut count = 0i64;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = &vs.as_slice()[0];
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                count += 1;
-                match sum_number(val) {
-                    Num::Int(i) => {
-                        if int_ok {
-                            match int_acc.checked_add(i) {
-                                Some(s2) => int_acc = s2,
-                                None => {
-                                    int_ok = false;
-                                    real_acc = int_acc as f64 + i as f64;
-                                }
-                            }
-                        } else {
-                            real_acc += i as f64;
-                        }
-                    }
-                    Num::Real(x) => {
-                        if int_ok {
-                            int_ok = false;
-                            real_acc = int_acc as f64 + x;
-                        } else {
-                            real_acc += x;
-                        }
-                    }
-                }
-            }
-            if count == 0 {
-                return Ok(match kind {
-                    AggKind::Total => OwnedValue::Real(0.0),
-                    _ => OwnedValue::Null,
-                });
-            }
-            Ok(match kind {
-                AggKind::Sum => {
-                    if int_ok {
-                        OwnedValue::Integer(int_acc)
-                    } else {
-                        OwnedValue::Real(real_acc)
-                    }
-                }
-                AggKind::Total => OwnedValue::Real(if int_ok { int_acc as f64 } else { real_acc }),
-                AggKind::Avg => OwnedValue::Real(
-                    (if int_ok { int_acc as f64 } else { real_acc }) / count as f64,
-                ),
-                _ => unreachable!(),
-            })
-        }
-        AggKind::Min | AggKind::Max => {
-            let mut best: Option<OwnedValue> = None;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = vs.as_slice()[0].clone();
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, &val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                best = Some(match best {
-                    None => val,
-                    Some(b) => {
-                        let ord = compare_coll(&val.as_value(), &b.as_value(), coll);
-                        let take = if kind == AggKind::Min {
-                            ord == core::cmp::Ordering::Less
-                        } else {
-                            ord == core::cmp::Ordering::Greater
-                        };
-                        if take { val } else { b }
-                    }
-                });
-            }
-            Ok(best.unwrap_or(OwnedValue::Null))
-        }
-        AggKind::GroupConcat => {
-            let mut out = AVec::new();
-            let mut any = false;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = &vs.as_slice()[0];
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                let sep = if vs.len() > 1 {
-                    match &vs.as_slice()[1] {
-                        OwnedValue::Null => return Ok(OwnedValue::Null),
-                        s => to_text(s).unwrap_or_default(),
-                    }
-                } else {
-                    let mut c = AVec::new();
-                    c.push(b',');
-                    c
-                };
-                if any {
-                    out.extend_from_slice(sep.as_slice());
-                }
-                out.extend_from_slice(to_text(val).unwrap_or_default().as_slice());
-                any = true;
-            }
-            if !any {
-                return Ok(OwnedValue::Null);
-            }
-            Ok(OwnedValue::Text(out))
+        let rc = ctx.as_row(r);
+        if let Some(vs) = agg_row::<E>(&p, &mut |x| eval::<E>(x, &rc))? {
+            arg_rows.push(vs);
         }
     }
+    crate::agg::fold::<E>(&p, arg_rows)
 }
 
 /// Evaluate a resolved expression.
+/// `&`, `|`, `<<`, `>>` on two integers (v0.16): the pin's
+/// `OP_BitAnd` / `OP_BitOr` / `OP_ShiftLeft` / `OP_ShiftRight`.
+/// A negative count shifts the other way; a count of 64 or more
+/// leaves 0, or -1 for a negative value shifted right.
+#[cfg(feature = "v16")]
+fn bit_op(op: BinOp, a: i64, b: i64) -> i64 {
+    let mut left = match op {
+        BinOp::BitAnd => return a & b,
+        BinOp::BitOr => return a | b,
+        BinOp::Shl => true,
+        _ => false,
+    };
+    if b == 0 {
+        return a;
+    }
+    let mut n = b;
+    if n < 0 {
+        left = !left;
+        n = if n > -64 { -n } else { 64 };
+    }
+    if n >= 64 {
+        return if a >= 0 || left { 0 } else { -1 };
+    }
+    // 0 < n < 64 here.
+    let n = n as u32;
+    if left {
+        ((a as u64) << n) as i64
+    } else {
+        a >> n
+    }
+}
+
+/// A row-value IN test (v0.16): `x` and every item are
+/// `Vector`s of the same size (checked at plan time). An item
+/// matches when every element compares equal, each element
+/// pair under the comparison affinity of `x`'s element and the
+/// LAST item's element — the pin rewrites a row-value IN list
+/// as `IN (VALUES ...)`, whose column affinity is its rightmost
+/// row's, and an `IN (SELECT ...)` substitutes items that all
+/// carry the subquery column's affinity — and the collation of
+/// `x`'s element against that same element. The result is 1 on
+/// a match, else NULL if some item had a NULL element test and
+/// no unequal one, else 0 (negated for NOT IN).
+#[cfg(feature = "v16")]
+fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    fn parts(e: &RExpr) -> &[RExpr] {
+        match e {
+            RExpr::Scalar(ScalarFn::Vector, p) => p.as_slice(),
+            _ => &[],
+        }
+    }
+    let xs = parts(x);
+    let last = list.last().map(parts).unwrap_or(&[]);
+    let mut xv = AVec::new();
+    for e in xs {
+        xv.push(eval::<E>(e, ctx)?);
+    }
+    let mut any_null = false;
+    for item in list {
+        let mut row_null = false;
+        let mut row_false = false;
+        for (j, ie) in parts(item).iter().enumerate() {
+            let (Some(xe), Some(src), Some(v)) = (xs.get(j), last.get(j), xv.as_slice().get(j))
+            else {
+                return Err(row_misused());
+            };
+            let iv = eval::<E>(ie, ctx)?;
+            let (a, b) = adjust_set(xe, src, v.clone(), iv);
+            if matches!(a, OwnedValue::Null) || matches!(b, OwnedValue::Null) {
+                row_null = true;
+            } else if compare_coll(&a.as_value(), &b.as_value(), binary_coll(xe, src))
+                != core::cmp::Ordering::Equal
+            {
+                row_false = true;
+                break;
+            }
+        }
+        if !row_false {
+            if !row_null {
+                return Ok(bool_val(!neg));
+            }
+            any_null = true;
+        }
+    }
+    Ok(if any_null {
+        OwnedValue::Null
+    } else {
+        bool_val(neg)
+    })
+}
+
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
@@ -3668,6 +5125,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             _ => OwnedValue::Null,
         },
         RExpr::OutRef(_) => return Err(Error::Unsupported),
+        RExpr::Raise(kind) => return Err(Error::Schema { kind: *kind }),
         RExpr::Pos(x) => eval::<E>(x, ctx)?,
         RExpr::Neg(x) => match to_number(&eval::<E>(x, ctx)?) {
             None => OwnedValue::Null,
@@ -3688,6 +5146,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Binary(op, l, r) => match op {
             BinOp::And => {
                 let a = truthy(&eval::<E>(l, ctx)?);
+                if a == Some(false) && has_raise(r) {
+                    return Ok(bool_val(false));
+                }
                 let b = truthy(&eval::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(false), _) | (_, Some(false)) => bool_val(false),
@@ -3697,6 +5158,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
             BinOp::Or => {
                 let a = truthy(&eval::<E>(l, ctx)?);
+                if a == Some(true) && has_raise(r) {
+                    return Ok(bool_val(true));
+                }
                 let b = truthy(&eval::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(true), _) | (_, Some(true)) => bool_val(true),
@@ -3715,12 +5179,26 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
                 arith::<E>(*op, l, r, ctx)?
             }
+            #[cfg(feature = "v16")]
+            BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => {
+                let lv = eval::<E>(l, ctx)?;
+                let rv = eval::<E>(r, ctx)?;
+                if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
+                    OwnedValue::Null
+                } else {
+                    OwnedValue::Integer(bit_op(*op, int_value(&lv), int_value(&rv)))
+                }
+            }
         },
         // An empty set is FALSE for IN (TRUE for NOT IN) even
         // when the left operand is NULL (v0.16, pin-probed:
         // `NULL IN (SELECT a FROM empty)` is 0, not NULL — the
         // shape `x IN emptytable` exposed it).
         RExpr::InList(_, list, neg, _) if list.is_empty() => bool_val(*neg),
+        #[cfg(feature = "v16")]
+        RExpr::InList(x, list, neg, _) if matches!(**x, RExpr::Scalar(ScalarFn::Vector, _)) => {
+            in_rows::<E>(x, list.as_slice(), *neg, ctx)?
+        }
         RExpr::InList(x, list, neg, from_sub) => {
             let xv = eval::<E>(x, ctx)?;
             let mut any_null = matches!(xv, OwnedValue::Null);
@@ -3728,9 +5206,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             let coll = in_list_coll(x);
             for item in list.iter() {
                 let iv = eval::<E>(item, ctx)?;
-                // An IN (SELECT ...) substitution compares like
-                // `=` (the item carries the subquery column's
-                // affinity). A written list converts both sides
+                // An IN (SELECT ...) substitution converts both
+                // sides by the set's affinity (the item carries
+                // the subquery column's; `adjust_set`). A written list converts both sides
                 // by the LEFT operand's affinity only, as the
                 // pin's OP_Eq / ephemeral-index path does: an
                 // operand without affinity converts nothing,
@@ -3738,7 +5216,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                 // with d no affinity, e INTEGER, f TEXT holding
                 // '1'/1/'1', d IN (e) and 1 IN (f) are 0).
                 let (a, b) = if *from_sub {
-                    adjust_cmp(x, item, xv.clone(), iv)
+                    adjust_set(x, item, xv.clone(), iv)
                 } else {
                     adjust_in(x, xv.clone(), iv)
                 };
@@ -3833,16 +5311,18 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Scalar(f, args) => eval_scalar::<E>(*f, args.as_slice(), ctx)?,
         RExpr::Cast(x, aff) => cast_value(&eval::<E>(x, ctx)?, *aff),
         RExpr::Collate(x, _) => eval::<E>(x, ctx)?,
-        RExpr::Agg {
-            kind,
-            distinct,
-            star,
-            args,
-        } => match ctx {
-            Ctx::Group { rows, .. } => {
-                eval_agg::<E>(*kind, *distinct, *star, args.as_slice(), rows)?
-            }
-            Ctx::Row(_) => return Err(Error::Unsupported),
+        // An EXISTS result-list term nobody reads.
+        RExpr::Agg { inert: true, .. } => OwnedValue::Null,
+        // An aggregate of an enclosing query that its owner did
+        // not substitute: one in a clause that cannot aggregate.
+        RExpr::Agg { lvl: 1.., .. } => {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedAggregate,
+            });
+        }
+        RExpr::Agg { .. } => match ctx.rows {
+            Some(rows) => eval_agg::<E>(e, rows, ctx)?,
+            None => return Err(Error::Unsupported),
         },
         // Subquery nodes are computed by the executor and
         // substituted away before evaluation (v0.6); reaching
@@ -3864,7 +5344,7 @@ pub fn eval_const<E>(expr: &Expr, arena: &Arena) -> Result<OwnedValue, E> {
         return Err(Error::Unsupported);
     }
     let empty = RowData::empty();
-    eval::<E>(&r, &Ctx::Row(&empty))
+    eval::<E>(&r, &Ctx::of(&empty))
 }
 
 /// Compare two ORDER BY key values under one term's direction

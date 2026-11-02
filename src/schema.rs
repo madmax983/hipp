@@ -443,6 +443,7 @@ pub async fn build_catalog<S: Storage>(
                     text,
                     &scratch,
                     &mut crate::rules::Clock::new(None),
+                    None,
                 ) {
                     Ok(v) => default = Some(owned_literal(catalog_arena, &v)?),
                     Err(_) => default_expr = Some(intern(catalog_arena, text)?),

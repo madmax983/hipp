@@ -132,7 +132,7 @@ impl GenCols {
                 continue;
             }
             let rd = eval_row(self.rowid_alias, self.affs.as_slice(), rec, rowid);
-            let v = eval::<E>(e, &Ctx::Row(&rd))?;
+            let v = eval::<E>(e, &Ctx::of(&rd))?;
             let aff = self
                 .affs
                 .as_slice()
@@ -196,6 +196,7 @@ impl TableRules {
         rowid_alias: Option<usize>,
         action: ConflictAction,
         changed: Option<(&[bool], bool)>,
+        env: Option<&crate::query::Env>,
     ) -> Result<bool, E> {
         let gcols = self.gcols.as_ref();
         let assigned = |i: usize| changed.is_none_or(|(m, _)| m.get(i).copied().unwrap_or(false));
@@ -260,7 +261,11 @@ impl TableRules {
                 if changed.is_some() && !reads_any(c, eff.as_slice(), rowid_changed) {
                     continue;
                 }
-                if truthy(&eval::<E>(c, &Ctx::Row(&rd))?) == Some(false) {
+                let ctx = match env {
+                    Some(env) => Ctx::of(&rd).with(env),
+                    None => Ctx::of(&rd),
+                };
+                if truthy(&eval::<E>(c, &ctx)?) == Some(false) {
                     if action == ConflictAction::Ignore {
                         return Ok(false);
                     }
@@ -485,6 +490,12 @@ pub fn plan_rules<E>(
                     kind: SchemaKind::MisusedAggregate,
                 });
             }
+            #[cfg(feature = "v16")]
+            if crate::query::any_scalar(&r, &crate::query::ScalarFn::nondeterministic) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::NonDeterministic,
+                });
+            }
             pending.push((i, r));
         }
         // Dependency order (iterative, so no recursion depth on
@@ -629,6 +640,7 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
     }
     match e {
         Expr::Literal(_)
+        | Expr::HexTooBig(_)
         | Expr::Column { .. }
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_) => false,
@@ -639,7 +651,9 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
             expr_any(a, f)
         }
         #[cfg(feature = "v16")]
-        Expr::Collate(a, _) => expr_any(a, f),
+        Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => expr_any(a, f),
+        #[cfg(feature = "v16")]
+        Expr::Vector(l) => l.iter().any(|x| expr_any(x, f)),
         Expr::InSubquery(a, _, _) => expr_any(a, f),
         Expr::InList(a, l, _) => expr_any(a, f) || l.iter().any(|x| expr_any(x, f)),
         Expr::Between(a, b, c, _) => expr_any(a, f) || expr_any(b, f) || expr_any(c, f),
@@ -652,8 +666,30 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
                 || whens.iter().any(|(w, t)| expr_any(w, f) || expr_any(t, f))
                 || otherwise.as_ref().is_some_and(|o| expr_any(o, f))
         }
-        Expr::Func { args, .. } => args.iter().any(|x| expr_any(x, f)),
+        Expr::Func {
+            args,
+            #[cfg(feature = "v16")]
+            clause,
+            ..
+        } => {
+            #[cfg(feature = "v16")]
+            if let Some(c) = clause
+                && (c.order_by.iter().any(|(x, _)| expr_any(x, f))
+                    || c.filter.as_ref().is_some_and(|x| expr_any(x, f)))
+            {
+                return true;
+            }
+            args.iter().any(|x| expr_any(x, f))
+        }
     }
+}
+
+/// Whether a stored rule text holds a too-big hex literal
+/// (`Expr::HexTooBig`, v0.16 review fix): CREATE TABLE leaves
+/// such a CHECK to the statements that evaluate it.
+pub fn has_big_hex<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
+    let e = parse_rule::<E>(text, arena)?;
+    Ok(expr_any(&e, &mut |x| matches!(x, Expr::HexTooBig(_))))
 }
 
 /// The wall-clock keyword names, the pseudo-columns a DEFAULT
@@ -709,7 +745,29 @@ pub fn alter_default_ok<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
 /// is `Error::NoClock` without a `Config::clock`. An unknown
 /// function or an aggregate errors here, when the default is
 /// needed — as on the pin.
-pub fn eval_default<E>(text: &[u8], arena: &Arena, clock: &mut Clock) -> Result<OwnedValue, E> {
+///
+/// `env` is the connection state a connection-state function
+/// reads (`random()`, `last_insert_rowid()`, ...); without one
+/// such a default does not evaluate (`Unsupported`) — which is
+/// how the catalog keeps it unfolded, for evaluation per row.
+pub fn eval_default<E>(
+    text: &[u8],
+    arena: &Arena,
+    clock: &mut Clock,
+    env: Option<&crate::query::Env>,
+) -> Result<OwnedValue, E> {
+    let (r, row) = prepare_default::<E>(text, arena, clock)?;
+    eval_prepared_default::<E>(&r, &row, env)
+}
+
+/// The resolved expression of a DEFAULT and the clock row it reads
+/// (`eval_default`'s first half, v0.16): the clock is read here
+/// when the expression names it, once per statement.
+pub fn prepare_default<E>(
+    text: &[u8],
+    arena: &Arena,
+    clock: &mut Clock,
+) -> Result<(RExpr, RowData), E> {
     let e = parse_rule::<E>(text, arena)?;
     let mut cols = AVec::new();
     for c in CTIME.iter() {
@@ -745,7 +803,23 @@ pub fn eval_default<E>(text: &[u8], arena: &Arena, clock: &mut Clock) -> Result<
             row.vals.push(OwnedValue::Null);
         }
     }
-    eval::<E>(&r, &Ctx::Row(&row))
+    Ok((r, row))
+}
+
+/// Evaluate a `prepare_default` result (v0.16): once per statement,
+/// or once per row for a default that reads connection state
+/// (`random()`, `last_insert_rowid()`, ... — the pin computes a
+/// DEFAULT for each row it inserts).
+pub fn eval_prepared_default<E>(
+    r: &RExpr,
+    row: &RowData,
+    env: Option<&crate::query::Env>,
+) -> Result<OwnedValue, E> {
+    let ctx = match env {
+        Some(env) => Ctx::of(row).with(env),
+        None => Ctx::of(row),
+    };
+    eval::<E>(r, &ctx)
 }
 
 /// One statement's view of the wall clock (v0.16): the

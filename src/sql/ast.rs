@@ -124,6 +124,18 @@ pub enum BinOp {
     Div,
     Mod,
     Concat,
+    /// `&`, `|`, `<<`, `>>` (v0.16, `v16`): both operands taken
+    /// as 64-bit integers (the pin's `sqlite3VdbeIntValue`), NULL
+    /// if either is NULL; a negative shift count shifts the other
+    /// way and a count of 64 or more shifts every bit out.
+    #[cfg(feature = "v16")]
+    BitAnd,
+    #[cfg(feature = "v16")]
+    BitOr,
+    #[cfg(feature = "v16")]
+    Shl,
+    #[cfg(feature = "v16")]
+    Shr,
 }
 
 /// A scalar SQL expression (v0.4). Column references are by
@@ -173,8 +185,23 @@ pub enum Expr {
         distinct: bool,
         star: bool,
         args: AVec<Expr>,
+        /// The aggregate clauses written with the call (v0.16,
+        /// `v16`): `f(args ORDER BY ...)` and `f(...) FILTER
+        /// (WHERE ...)`. `None` when neither was written.
+        #[cfg(feature = "v16")]
+        clause: Option<Box<FuncClause>>,
     },
     Cast(Box<Expr>, ABytes),
+    /// A hexadecimal literal too big for 64 bits (more than 16
+    /// significant digits, or `-` over `0x8000000000000000`) at
+    /// this byte offset (v0.16 review fix, evaluator builds):
+    /// parsed, and refused with `ParseKind::HexLiteralTooBig`
+    /// when it resolves — the pin's "hex literal too big"
+    /// comes from code generation, so a CREATE TABLE holding one
+    /// in a DEFAULT / CHECK / generated column is accepted and
+    /// only the statement that evaluates it fails.
+    #[cfg(feature = "v04")]
+    HexTooBig(usize),
     /// `expr COLLATE name` (v0.16, `v16`): the operand with an
     /// explicit collating sequence, which wins every comparison
     /// it takes part in (the pin's `EP_Collate` rules).
@@ -189,6 +216,25 @@ pub enum Expr {
     /// pin silently reads one as NULL) it resolves to NULL.
     #[cfg(feature = "params")]
     Param(u16, ABytes),
+    /// `~x`, bitwise NOT (v0.16, `v16`): the operand as a 64-bit
+    /// integer, complemented; NULL stays NULL.
+    #[cfg(feature = "v16")]
+    BitNot(Box<Expr>),
+    /// A row value `(a, b, ...)` of two or more expressions
+    /// (v0.16, `v16`). Legal only as an operand of a comparison
+    /// (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT]`), `BETWEEN`,
+    /// `IN`, or a CASE base / WHEN operand, against a row value
+    /// of the same size; anywhere else the planner refuses it
+    /// (`SchemaKind::RowValueMisused`), as the pin does.
+    #[cfg(feature = "v16")]
+    Vector(AVec<Expr>),
+    /// Element `i` (0-based) of a row value of `n` elements
+    /// (v0.16, `v16`): the parser's split of `UPDATE ... SET
+    /// (c1, ..., cn) = <row>` into one assignment per column. The
+    /// row is a scalar subquery (column `i` of its first row) or
+    /// any expression when `n` is 1; the planner checks the size.
+    #[cfg(feature = "v16")]
+    RowItem(Box<Expr>, u16, u16),
 }
 
 /// One SELECT result item (v0.4).
@@ -232,6 +278,17 @@ impl JoinKind {
     pub fn pads_left(self) -> bool {
         matches!(self, JoinKind::Right | JoinKind::Full)
     }
+}
+
+/// The aggregate clauses of a function call (v0.16, `v16`): the
+/// ORDER BY written inside its parentheses (empty when none) and
+/// its `FILTER (WHERE ...)` expression. The planner refuses both
+/// on a function that is not an aggregate, as the pin does.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct FuncClause {
+    pub order_by: AVec<(Expr, SortOrder)>,
+    pub filter: Option<Expr>,
 }
 
 /// The direction of one ORDER BY term (v0.16 adds NULL
@@ -332,14 +389,22 @@ pub struct SelectStmt {
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
 /// of `INSERT OR ...` / `UPDATE OR ...`, and the standalone
 /// `REPLACE` verb (which is `INSERT` with `Replace`). `Abort`
-/// covers ABORT, FAIL and ROLLBACK spellings: hipp's write-error
-/// rule already aborts (and rolls back) the whole statement on
-/// any error, which is the observable behaviour of all three in
-/// autocommit and the documented v0.5 simplification inside an
+/// covers the ABORT and ROLLBACK spellings: hipp's write-error
+/// rule aborts (and rolls back) the whole transaction on any
+/// error, which is ROLLBACK's behaviour, ABORT's in autocommit,
+/// and the documented v0.5 simplification for ABORT inside an
 /// explicit transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
     Abort,
+    /// `OR FAIL` (v0.16 review fix, ungated): a constraint
+    /// violation (UNIQUE / PRIMARY KEY, NOT NULL, CHECK) errors
+    /// like `Abort`, but the rows the statement changed before it
+    /// stay changed (committed in autocommit; an explicit
+    /// transaction stays open). Other errors still roll back.
+    /// Parsed only with UPDATE (v0.5) / INSERT OR (v0.7).
+    #[cfg(feature = "v05")]
+    Fail,
     Ignore,
     Replace,
 }

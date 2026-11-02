@@ -150,6 +150,84 @@ pub enum SchemaKind {
     /// value as a literal.
     #[cfg(feature = "params")]
     ParameterNotAllowed,
+    /// A row value `(a, b, ...)` (or a multi-column scalar
+    /// subquery) where only a single value is allowed, or two
+    /// row values of different sizes compared (v0.16, `v16`;
+    /// the pin's "row value misused" and "IN(...) element has N
+    /// terms - expected M"). Compare row values of equal size
+    /// with `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT]`,
+    /// `BETWEEN`, `IN`, or assign them with `UPDATE ... SET
+    /// (a, b) = ...`.
+    #[cfg(feature = "v16")]
+    RowValueMisused,
+    /// A function name the pin does not define, or one this build
+    /// leaves out (v0.16; the pin's "no such function"). Raised
+    /// at prepare.
+    UnknownFunction,
+    /// A known function called with an argument count it does not
+    /// take (v0.16; the pin's "wrong number of arguments to
+    /// function"). Raised at prepare.
+    WrongArgumentCount,
+    /// `likelihood(X, P)` whose P is not a REAL literal between
+    /// 0.0 and 1.0 (v0.16, `v16`; the pin's "second argument to
+    /// likelihood() must be a constant between 0.0 and 1.0").
+    /// Write P as a literal such as `0.5`.
+    #[cfg(feature = "v16")]
+    LikelihoodNotConstant,
+    /// A non-deterministic function — `random()`, `randomblob()`,
+    /// `changes()`, `total_changes()`, `last_insert_rowid()`,
+    /// `sqlite_version()` — in a generated column (v0.16, `v16`;
+    /// the pin's "non-deterministic functions prohibited in
+    /// generated columns"). Compute the value on INSERT instead.
+    #[cfg(feature = "v16")]
+    NonDeterministic,
+    /// A string or blob result of 1,000,000,000 bytes or more
+    /// (v0.16, `v16`; the pin's default `SQLITE_LIMIT_LENGTH`,
+    /// "string or blob too big"): `zeroblob` / `randomblob` past
+    /// the limit, or a `printf` result reaching it.
+    #[cfg(feature = "v16")]
+    TooBig,
+    /// A DISTINCT aggregate called with other than exactly one
+    /// argument (v0.16, ungated; the pin's "DISTINCT aggregates
+    /// must have exactly one argument" — `group_concat(DISTINCT
+    /// x, ',')` used to run). Drop DISTINCT, or the separator.
+    DistinctAggregateArgs,
+    /// `ORDER BY` inside the parentheses of a function that is
+    /// not an aggregate (v0.16, `v16`; the pin's "ORDER BY may
+    /// not be used with non-aggregate"). Order the query instead.
+    #[cfg(feature = "v16")]
+    OrderByNonAggregate,
+    /// `FILTER (WHERE ...)` after a function that is not an
+    /// aggregate (v0.16, `v16`; the pin's "FILTER may not be used
+    /// with non-aggregate"). Use a CASE expression instead.
+    #[cfg(feature = "v16")]
+    FilterNonAggregate,
+    /// The P argument of `percentile(Y, P)` (0 ..= 100) or
+    /// `percentile_cont` / `percentile_disc` (0 ..= 1) is not a
+    /// number in range — NULL, non-numeric text, a blob, or out
+    /// of bounds (v0.16, `v16`; the pin's "the fraction argument
+    /// to ...() is not between 0.0 and ..."). Raised for each row
+    /// the aggregate steps, NULL Y included. Pass a constant in
+    /// range.
+    #[cfg(feature = "v16")]
+    PercentileFraction,
+    /// The P argument of a percentile aggregate differs (by more
+    /// than 0.001 of the fraction) between rows of one group
+    /// (v0.16, `v16`; the pin's "the fraction argument to ...() is
+    /// not the same for all input rows"). Pass a constant P.
+    #[cfg(feature = "v16")]
+    PercentileFractionVaries,
+    /// A non-NULL Y of `median()` / `percentile*()` that is not an
+    /// INTEGER or REAL — TEXT (even numeric text) or a BLOB
+    /// (v0.16, `v16`; the pin's "input to ...() is not numeric").
+    /// CAST the column to REAL.
+    #[cfg(feature = "v16")]
+    PercentileNotNumeric,
+    /// An infinite Y of `median()` / `percentile*()` (v0.16,
+    /// `v16`; the pin's "Inf input to ...()"). Filter infinities
+    /// out first.
+    #[cfg(feature = "v16")]
+    PercentileInfinite,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -189,6 +267,11 @@ pub enum ParseKind {
     /// parameters.
     #[cfg(feature = "params")]
     TooManyVariables,
+    /// A hexadecimal literal with more than 16 significant
+    /// digits, or `-` applied to `0x8000000000000000` (v0.16;
+    /// the pin's "hex literal too big"). Write a shorter
+    /// literal, or a decimal one.
+    HexLiteralTooBig,
 }
 
 /// The core error type. Generic over the storage error `E`.

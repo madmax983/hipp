@@ -1192,6 +1192,1079 @@ and REAL ties, byte-identical.
   parameter numbering and binding semantics are long stable,
   and CI runs the real 3.54.1 pin.
 
+### Expression operators, literals and row values (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1), gated as below. New surface is behind `v16`; the fixes
+to claimed paths are ungated.
+
+**Shipped — ungated (silent wrong answers on claimed v0.4 / v0.6
+paths):**
+
+- *Precedence.* The expression parser is now a
+  precedence-climbing loop over the pin's `parse.y` levels: OR <
+  AND < NOT < `= == != <> IS IN LIKE GLOB BETWEEN ISNULL NOTNULL`
+  < `< <= > >=` < `& | << >>` < `+ -` < `* / %` < `||` <
+  COLLATE < unary `- + ~`. `<` and `=` used to share a level
+  (`3 = 2 < 3` was 1, `0 = 1 > 2` was 0). A postfix operator's
+  result takes tighter operators after it (`x ISNULL + 1` is
+  `(x ISNULL) + 1`, `1 IN (1) + 1` is 2), BETWEEN's lower bound
+  runs to its own AND and its upper bound takes only operators
+  tighter than `=`, and a unary operand may start with NOT
+  (`- NOT 0 = 1`).
+- *`x IS [NOT] TRUE / FALSE`* is the pin's truth test
+  (`TK_TRUTH`) when the bare keyword is the whole right operand:
+  any true value IS TRUE, NULL is neither (`2 IS TRUE`, `0.5 IS
+  TRUE`, `'a' IS FALSE` were 0). Written as the CASE it equals.
+- *Hex literals* (evaluator builds): 16 significant digits as
+  two's complement (`0xffffffffffffffff` = -1,
+  `0x8000000000000000` = i64::MIN; hipp refused anything past
+  `0x7fff...`), leading zeros free, more digits the pin's "hex
+  literal too big" (`ParseKind::HexLiteralTooBig`), as is `-`
+  over `0x8000000000000000` through parentheses / unary `+`
+  (`-(+0x8000000000000000)`, `- - 0x8...`; `0 - 0x8...` is the
+  REAL). `'0x10'` text is never hex (CAST, affinity, `+0`).
+- *Digit separators and glued identifiers* (evaluator builds):
+  the pin's tokenizer — `_` between two digits (hex digits in a
+  hex literal) in every part, `1_000` = 1000 (hipp read `1`
+  aliased `_000`, a silent wrong value), and any number followed
+  directly by an identifier character (`1a`, `1_`, `1e_5`,
+  `0x1g`, `1$`) is "unrecognized token" (hipp read `1a` as `1`
+  aliased `a`). `-9_223_372_036_854_775_808` is the INTEGER.
+  The tiny profile keeps its old scan (it has no position where
+  either reading was accepted, and refuses hex past
+  `0x7fff...`, as before).
+- *Aggregate scoping* (`RExpr::Agg::lvl`): an aggregate whose
+  arguments reference no column of its own query but some
+  enclosing query's belongs to the innermost such query (the
+  pin's `sqlite3ReferencesSrcList` walk); no column at all keeps
+  it local. The owner counts it as its own (`has_agg` /
+  `collect_aggs` walk subquery plans by depth, so `SELECT
+  (SELECT max(t.a) FROM u) FROM t` is one row and the min/max
+  bare-column rule sees it), folds it per group and substitutes
+  the value into the subquery plan before executing it
+  (`subst_owned_aggs`, in `eval_group_sub`); the subquery does
+  not aggregate over it (`(SELECT max(t.a) + b FROM u)` keeps
+  u's rows, `GROUP BY max(t.a)` there is legal). "misuse of
+  aggregate" where the owner cannot aggregate: its WHERE (also
+  through an alias), GROUP BY, an aggregate's arguments, UPDATE
+  / DELETE; an enclosing query's aggregate directly in a WHERE
+  is refused unless that WHERE's own query aggregates (the
+  pin's NC_AllowAgg rule).
+- *ORDER BY aggregate:* an aggregate in ORDER BY alone no longer
+  makes the query an aggregate one (`SELECT a FROM t ORDER BY
+  max(a)` returned one row; the pin: "misuse of aggregate").
+  An aggregate directly inside another's arguments is refused
+  when it resolves, whichever queries own the two
+  (`sum(max(a))`, and `(SELECT sum(c + max(t.a)) FROM u)` —
+  see the review fixes below).
+- *Qualified names fall through:* `t.a` where an inner source
+  is aliased `t` but has no column `a` resolves in the enclosing
+  scopes, as the pin's `lookupName` does (hipp: "no such
+  column").
+
+**Shipped — `v16`:**
+
+- `&`, `|`, `<<`, `>>` (one level, left-associative) and unary
+  `~`: operands as 64-bit integers (`sqlite3VdbeIntValue`: a
+  text / blob's integer prefix, a REAL truncated and saturated),
+  NULL in -> NULL out, always INTEGER; a negative shift count
+  shifts the other way, a count >= 64 gives 0 (-1 for a negative
+  value shifted right) — `OP_ShiftLeft` / `OP_ShiftRight`.
+- `IS [NOT] DISTINCT FROM` (IS NOT / IS; `x IS NOT DISTINCT FROM
+  TRUE` is the truth test, as on the pin) and postfix `NOT
+  NULL`.
+- Row values (`Expr::Vector`, `SchemaKind::RowValueMisused`):
+  `(a, b) op (c, d)` for `= == <> != < <= > >= IS [NOT]` is
+  written as scalar comparisons — AND of the element tests for
+  `=` / IS, OR for `<>` / IS NOT, lexicographic `a1 < b1 OR (a1
+  = b1 AND ...)` otherwise — so affinity and collation stay per
+  element and three-valued logic gives the pin's NULLs; BETWEEN
+  and CASE (base and WHEN rows) build on it. `(a, b) IN ((..),
+  (..))` and `IN (SELECT a, b ...)` evaluate natively
+  (`ScalarFn::Vector` in an `InList`): the pin rewrites a
+  row-value IN list as `IN (VALUES ...)`, whose set takes each
+  column's comparison affinity from the left element and the
+  RIGHTMOST row's element (`exprINAffinity`) and applies it to
+  both sides — the probe and every row's stored values
+  (`adjust_set`; probed: `(c,b) IN ((a,'q'),(2,'y'))` finds
+  nothing where `((2,'y'),(a,'q'))` finds row 2, and `(1, 1)
+  IN ((x, y), (a, b))` with INTEGER x, y and TEXT a, b is 1). A multi-column scalar subquery is a row value
+  (`SubPlan::scalar_col`: one plan copy per column; the hoist
+  cache keys on (node, column)); row-major subquery values for
+  row-value IN. `UPDATE ... SET (a, b) = (x, y)` / `= (SELECT
+  ...)` (also in upsert DO UPDATE) splits into per-column
+  assignments (`Expr::RowItem`). Errors as on the pin: sizes
+  that differ, a row value nested in one, or anywhere but those
+  operands (arithmetic, NOT, IS NULL, functions, CAST, COLLATE,
+  ORDER / GROUP BY, LIMIT, result columns, INSERT values) are
+  `RowValueMisused`; wrong subquery widths and "N columns
+  assigned M values" are `ColumnCountMismatch`.
+
+**Oracle-probing notes** (all on the live 3.54.1 pin):
+`1<<63` = i64::MIN, `1<<64` = 0, `1<<-1` = 0, `8>>-1` = 16,
+`-1>>64` = -1, `1<<-64` = 0, `-1<<-100` = -1; `~5.7` = -6,
+`~-5.7` = 4, `~'abc'` = -1; `'1e3'|0` = 1, `'12abc'|1` = 13, `'
+12 '|0` = 12, `1e19|0` = i64::MAX, `-1e19|0` = i64::MIN,
+`'9223372036854775808'|0` = i64::MAX; `1|2&3` = 3, `6&3|8` =
+10, `1&3<<2` = 4 (one level, left to right); `1 + 1 << 1 + 1` =
+8, `1 || 2 << 1` = 24, `1 << 1 || 2` = 4096. `0x1_0` = 16,
+`0x1ffffffffffffffff`, `-0x8000000000000000`,
+`-(0x8000000000000000)`, `- - 0x8...` are "hex literal too big";
+`0x`, `0x1g`, `0x_1`, `1__0`, `1_`, `1_e5`, `1e_5`, `1a`, `1$`
+"unrecognized token"; `.5_1` = 0.51, `1e1_0` = 1e10. `1 ISNULL
++ 1` = 1, `2 = 1 ISNULL + 1` = 1, `1 NOT NULL + 1` = 2, `NOT 1
+NOT NULL` = 0, `2 BETWEEN 1 = 1 AND 3` = 1, `'a' LIKE 'b' = 0`
+= 1, `0 = 'a' LIKE 'b'` = 0, `1 BETWEEN 1 OR 0 AND 3` is
+"incomplete input". `(1,NULL)<(1,2)` NULL, `(1,NULL)<(2,0)` 1,
+`(2,NULL)<(1,0)` 0, `(1,NULL)<=(1,NULL)` NULL; `(1,2) IN ((1,2),
+(NULL,1))` 1, `(1,2) IN (VALUES (1,NULL))` NULL, `(1,2) IN
+(VALUES (2,NULL))` 0; `(1,2) IN ()` 0; `(1,2) IN ((SELECT
+1,2))` 1 but `IN ((SELECT 1,2),(3,4))` an error; `(SELECT 1,2)
+IN ((1,2))` misused but `IN (SELECT 1,2)` fine; `CASE (1,2) WHEN
+(1,2)` works; `(SELECT 1,2 UNION SELECT 0,0) = (0,0)` is 0 (the
+UNION first-row rule); `SET (a,a) = (5,6)` keeps 6, `SET (rowid,
+a)` works, `SET (a,b) = (SELECT 7,8 WHERE 0)` writes NULLs.
+Aggregates: `SELECT a, (SELECT count(t.a) FROM u) FROM t` is
+`1|3`; `(SELECT count(t.a) FROM e)` over an empty e is one NULL
+row; `(SELECT (SELECT max(u.b) FROM e) FROM u)` makes the u
+level aggregate (three NULL rows); `(SELECT 1 FROM u WHERE b =
+max(t.a))` is "misuse of aggregate function" but `(SELECT
+count(*) FROM u WHERE b < min(t.a))` runs; derived tables
+inside the subquery count at the subquery's level (`(SELECT x
+FROM (SELECT max(t.a) AS x))` is 3).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh`
+run end with "==> all gates passed". New suites:
+`tests/expr_v16.rs` (23 tests: precedence fixed cases and a
+480-expression generated corpus over every level; truth tests
+over a table; DISTINCT FROM / NOT NULL; bitwise fixed cases, a
+720-expression generated corpus over every storage class and
+the shift counts around 0 / 64, columns of every affinity,
+generated columns and UPDATE; hex literals, their errors and
+affinity contexts (typed columns, DEFAULTs); digit separators
+and glued identifiers; the smallest integer literal; row-value
+comparisons, a 420-expression generated corpus, IN lists /
+VALUES / subqueries with the rightmost-row affinity rule, scalar
+subquery rows, 43 error-vs-error cases, UPDATE / upsert SET
+rows, CHECK and DELETE; aggregate scoping — 58 statements, the
+misuse cases, the alias cases, the qualifier fall-through and a
+generated corpus over random tables). Every write is checked by
+the oracle reading both files and `integrity_check`.
+`hipp-cli/tests/cli_v16_expr.rs` (2 tests, byte-identical
+one-shot and over stdin, REAL results included). Updated:
+`tests/agg_subquery_v11.rs` accepts `sum(sum(b))` refused at
+prepare (the pin's behaviour) as well as at step.
+
+**Size:** tiny **75,960 B** (Δ **0**: the bitwise / row-value
+code is `v16`, the precedence / scoping code is in the
+evaluator, and the tiny lexer keeps its number scan — it also
+dropped an `expect`). Full **301,379 B** (Δ **+9,848 B** vs
+291,531, ratchet raised to it): the precedence-climbing parser,
+row values (resolution, IN evaluation, the per-column subquery
+parts, UPDATE SET rows), the bitwise operators, the evaluator's
+number lexer and the aggregate-scope walkers.
+
+**Review fixes (2026-11-02, all re-probed on the live pin;
+regression tests in `tests/expr_v16.rs`, CLI lines in
+`hipp-cli/tests/cli_v16_expr.rs`):**
+
+- *Row-value IN list affinity* (`v16`): the set affinity was
+  applied to the left operand only, so `(1, 1) IN ((x, y), (a,
+  b))` with INTEGER x, y and TEXT a, b was 0 (the pin: 1, its
+  VALUES set stores x, y as TEXT too). `adjust_set` now converts
+  both sides; a 300-expression generated corpus over every
+  affinity and literal kind guards it.
+- *Mixed-owner nested aggregates* (ungated): `(SELECT sum(c +
+  max(t.a)) FROM u)` (sum owned by u, max by t) passed prepare
+  and returned 25; the pin's resolver clears NC_AllowAgg while
+  it walks an aggregate's arguments, so any aggregate directly
+  inside another's is "misuse of aggregate function". The check
+  now runs as the aggregate resolves (`direct_agg`).
+- *EXISTS result lists* (ungated): an enclosing query's
+  aggregate in an EXISTS subquery's result list or ORDER BY was
+  counted as that query's, refusing `WHERE EXISTS (SELECT
+  max(t.a) FROM u)` (MisusedAggregate) and the same in ON /
+  DELETE / UPDATE (Unsupported). The pin never evaluates those
+  terms: such aggregates are now marked inert
+  (`RExpr::Agg::inert`, `mark_exists_inert`, for plans whose
+  compound operators are all UNION / UNION ALL — under INTERSECT
+  / EXCEPT the pin reports the misuse, and so does hipp), are no
+  misuse in any clause, do not make the EXISTS an aggregate
+  query (`EXISTS (SELECT max(t.a) FROM u WHERE c > 100)` is
+  false), evaluate as NULL, and still make the owner an
+  aggregate query from its result list (`SELECT EXISTS (SELECT
+  max(t.a) FROM u) FROM t` is one row — `has_result_agg`).
+- *RETURNING / excluded* (ungated): `RETURNING (SELECT
+  max(t.a))` and `DO UPDATE SET b = (SELECT max(excluded.b))`
+  were refused; the pin's owner search never stops at a
+  RETURNING row or the `excluded` row, so the subquery owns
+  the aggregate (`ScopeGroup::agg_owner`). `RETURNING max(t.a)`
+  and `(SELECT count(*) FROM u WHERE c > max(t.a))` stay errors.
+- *Aggregate aliases in subqueries* (`v16`, item (f)'s alias
+  case): `HAVING (SELECT s) > 0` / `ORDER BY (SELECT s)` over
+  `sum(a) AS s` were refused; the copied alias's aggregates now
+  have their owner level raised by the subquery depth (and are
+  marked `alias`, which the pin never re-checks, so they are no
+  misuse in the subquery's WHERE). A plan holding an aggregate
+  an enclosing query owns is now correlated
+  (`plan_has_foreign_agg`), else `(SELECT s)` over `count(*)`
+  was hoisted and gave one count for every group. In WHERE /
+  GROUP BY (`(SELECT s)` there), or nested (`(SELECT max(s))`),
+  it is the pin's misuse.
+- *Too-big hex literals* (evaluator builds): the lexer refused
+  them, so a pin-written file with `DEFAULT 0x10000000000000000`
+  could not be read at all, and CREATE TABLE refused them in a
+  DEFAULT or CHECK. The pin raises "hex literal too big" only
+  while coding the expression: the lexer now emits
+  `Tok::HexTooBig`, the parser keeps `Expr::HexTooBig`, and
+  resolution refuses it — so DEFAULT and CHECK texts are
+  accepted (CREATE TABLE leaves such a CHECK to the writes,
+  `rules::has_big_hex`) and only the INSERT / UPDATE that
+  evaluates them fails; a generated column with one is still
+  refused at CREATE, as on the pin.
+- *Subquery comparison affinity* (ungated, the same pattern
+  found elsewhere): a subquery used as an expression took its
+  affinity from the LEFTMOST compound core and VALUES rows and
+  nested scalar subqueries carried none; the pin reads the
+  RIGHTMOST core (`'1' IN (SELECT 1 UNION SELECT i FROM c)` and
+  `(SELECT 1 UNION SELECT i FROM c) = '1'` over INTEGER i were
+  0), a one-row VALUES's row, the `sqlite3MultiValues` rule for
+  longer VALUES (as `core_colls` already did for collations),
+  and a nested scalar subquery's own result
+  (`sub_col_affinity`, `item_result_affinity`). The pin's
+  comparison applies its affinity to BOTH operands (TEXT only
+  when either is a string), which matters once a compound's
+  value comes from a core of another affinity (`(SELECT 1 UNION
+  SELECT t FROM c) = 1` over TEXT t was 0) — `adjust_cmp` now
+  does; an IN over a subquery converts both sides
+  unconditionally, as the pin stores its set (`adjust_set`).
+- *`x IN ((SELECT ...), 2)`* (ungated parser): a list led by a
+  parenthesised scalar subquery was a syntax error; it is the
+  pin's list.
+- *Bare aliases* (ungated parser): a bare alias may no longer
+  be a reserved keyword and `AS` needs a name — `SELECT 1 NOT`,
+  `SELECT a NOT, a FROM t`, `SELECT 1 AS` returned values, the
+  pin gives syntax errors. A census of 70 keywords in four alias
+  positions agrees with the pin (except OFFSET, below).
+
+Review-fix gates: `cargo fmt --all` and the full
+`ci/local-gates.sh` end with "==> all gates passed";
+`tests/expr_v16.rs` has 35 tests (12 new: the regressions
+above, with generated corpora of 300 row-value IN lists, 120
+compound / VALUES sets and 600 comparisons over every affinity),
+and
+`tests/query_shape_v16.rs`'s alias-aggregate test now compares
+with the pin instead of expecting a refusal. Size: tiny
+**75,960 B** (Δ **0**); full **315,255 B** (Δ **+3,204 B** vs
+the 312,051 B ratchet the scalar-function unit left; ratchet
+raised): the inert / alias aggregate flags and walkers, the
+owner-scope flag, `HexTooBig` plumbing, the set / comparison
+affinity rules and the rightmost-core affinity.
+
+**Honest gaps:**
+
+- The pin folds constants before coding, so `SELECT 1 WHERE 0
+  AND 0x10000000000000000` runs there; hipp refuses every
+  too-big hex literal it resolves. CREATE VIEW with one is
+  refused (hipp plans a view's SELECT for its width; the pin
+  stores it), and ALTER TABLE ADD COLUMN ... DEFAULT with one on
+  a non-empty table is refused (the pin stores the literal's
+  text as the value). A CHECK holding a too-big hex literal is
+  not resolved at CREATE at all, so its unknown columns are
+  reported only by the first write (the pin: at CREATE).
+- `OFFSET` is still refused as a bare alias (the pin's keyword
+  fallback allows it; pre-existing).
+- A multi-row VALUES whose co-routine starts after a
+  non-constant row (the pin's `sqlite3MultiValues` switching
+  form mid-list) takes the last row's affinity in hipp; the
+  probed shapes (all constant, or any non-constant row) agree.
+  `typeof((SELECT t FROM c UNION SELECT 1 LIMIT 1))` over TEXT t
+  holding '1' is `text` on the pin, `integer` on hipp (a scalar
+  subquery's UNION row order; derived tables agree) — so
+  comparisons against such a subquery can differ.
+- A column named `true` / `false` does not shadow the keyword
+  (pre-existing for every TRUE / FALSE; now also for `x IS
+  TRUE`, which the pin then reads as `x IS <column>`).
+- An enclosing query's aggregate whose arguments hold a
+  subquery is refused (`Unsupported`); the pin folds it. An
+  aggregate of an enclosing query inside a subquery that is
+  itself another query's aggregate argument (`(SELECT
+  sum((SELECT max(t.a) FROM e)) FROM u)`) is refused with
+  `Unsupported` (the pin: misuse) — error vs error.
+- The written row-value IN list takes each element's collation
+  from the rightmost row; collations on other rows were probed
+  only in the cases tested.
+- A multi-column scalar subquery used as a row value runs once
+  per element it supplies (correlated ones per row and element);
+  results are the same, the cost is not the pin's.
+- `MATCH`, `REGEXP` and the JSON `->` / `->>` operators remain
+  unparsed (their functions do not exist in hipp).
+- UPDATE / DELETE refuse an enclosing query's aggregate with
+  `Unsupported`, not `MisusedAggregate` (pre-existing kind).
+
+### Scalar function library (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1), gated as below. Census (now 177 probes): on the 158
+earlier probes MATCH 80 → 95 (HIPP_ERR 70 → 55); 19 new probes
+for this unit — 14 match, 4 refused by both, `sqlite_source_id()`
+left HIPP_ERR on purpose; the old binary was silently wrong on 2
+of them (round digits, text with a NUL).
+
+**Shipped — `v16`** (new `src/func.rs`, `ScalarFn` variants,
+`query::Env`):
+
+- `printf()` / `format()`: the pin's conversion loop — flags `-
+  + space 0 # , !` in any order (last sign flag wins), width and
+  precision digits accumulated in 32 bits and masked to 31, `*`
+  read as a C int (negative width left-justifies, i32::MIN is 0),
+  `l` / `ll` skipped; `%d %i %u %x %X %o %p %r` (ordinal) with
+  `,` grouping where the pin allows it and `#` prefixes; `%c`
+  (one UTF-8 character, precision = repeat count, NUL for an
+  empty / NULL argument); `%s %z` (`!` counts characters);
+  `%q %Q %w` and the `#` form (backslashes doubled and control
+  characters `\u00xx` — always for %q, for %Q only when one is
+  present, then wrapped in `unistr(...)`); `%j` / `%J` (3.54's
+  JSON string escapes: `\" \\ \b \f \n \r \t`, other C0 as
+  `\u00xx`, NULL as nothing / `null`); `%f %e %E %g %G` from the
+  pin's digits; `%%` (width applies), `%n` (nothing). An unknown
+  conversion, or `%T` / `%S`, ends the output; missing arguments
+  are NULL (0 / 0.0 / no text); the format and text arguments end
+  at a NUL; a result of 1,000,000,000 bytes or more is
+  `SchemaKind::TooBig` (checked before allocating; large buffers
+  are reserved with `AVec::try_reserve`, so allocation failure is
+  `ArenaExhausted`, not an abort).
+- `quote()` (REAL as REAL -> TEXT, infinities `±9.0e+999`, TEXT up
+  to a NUL), `char()`, `unicode()` (the pin's UTF-8 reader:
+  overlong / surrogate / U+FFFE-F are U+FFFD, a stray continuation
+  byte is itself), `zeroblob()`, `randomblob()` / `random()`
+  (splitmix64 over a per-connection `Cell`, seeded from
+  `Config::nonce_seed`; negative draws folded as the pin folds
+  them, so never i64::MIN), `concat()`, `concat_ws()`,
+  `octet_length()`, `unhex(X[, Y])`, `likely()` / `unlikely()` /
+  `likelihood()` (P must be a REAL literal in 0.0 ..= 1.0:
+  `SchemaKind::LikelihoodNotConstant`), `if()` and iif() with two
+  or more arguments (a CASE of pairs with an optional ELSE),
+  `sqlite_version()` = `'3.54.1'`.
+- `last_insert_rowid()` / `changes()` / `total_changes()` and
+  `Connection::last_insert_rowid` / `changes` / `total_changes`:
+  every inserted row (INSERT, REPLACE, an upsert's insert) counts
+  and moves the last rowid at once — later VALUES rows, DEFAULTs,
+  CHECKs and RETURNING see it (a VALUES row reading it is
+  evaluated just before its own insert); upsert DO UPDATE and
+  UPDATE count once per row (also UPDATE ... FROM with several
+  matches), DELETE per row, REPLACE's victims not at all;
+  `changes()` / `total_changes()` move at the statement's end
+  (inside it they read the previous statement), a failed write
+  sets `changes()` to 0 and keeps the rowids it inserted; SELECT,
+  DDL, CREATE TABLE ... AS SELECT and transaction control leave
+  all three alone; a rolled-back write still counts.
+- Generated columns refuse the non-deterministic functions
+  (`SchemaKind::NonDeterministic`); CHECK and DEFAULT accept them.
+- Unknown functions are `SchemaKind::UnknownFunction` and wrong
+  argument counts (scalar and aggregate) `WrongArgumentCount`,
+  both at prepare (they were `Unsupported`, ungated).
+
+**Shipped — ungated (silent wrong answers on claimed v0.4 paths):**
+
+- `round(X, N)` printed the exact binary expansion; it now rounds
+  the pin's own digits as its `%!.*f` does (`record::round_digits`
+  over `record::fp_decode`): `round(166162.7745, 3)` is .775 and
+  `round(188.30472979193155, 13)` ...161 on the pin (hipp gave
+  .774 / ...149). The STATUS gap from "CI vs the real pin" is
+  closed.
+- `coalesce` / `ifnull` / `iif` evaluated every argument
+  (`coalesce(1, abs(-9223372036854775808))` raised "integer
+  overflow"; the pin returns 1); they are lazy now, as the pin
+  compiles them.
+- The text functions read text as the pin's C functions do: up to
+  the first NUL, a lead byte of 0xc0+ taking its continuation
+  bytes (invalid UTF-8 included) — `length(CAST(x'610062' AS
+  TEXT))` is 1 (was 3), `substr` likewise; a BLOB's `substr`
+  counts bytes (`substr(x'c3a9', 1, 1)` was the whole é); `instr`
+  of two BLOBs counts bytes; `trim`'s set ends at a NUL and
+  matches whole characters (`trim(x'c3a9c3', 'é')` is x'c3');
+  `replace` with a NUL-led pattern keeps the subject; `upper` /
+  `lower` of a BLOB are TEXT (they returned the BLOB).
+
+**Review fixes** (all reproduced first, then compared with the
+live pin; regression tests in `tests/functions_v16.rs` and the
+CLI suite's `review` batch):
+
+- **Overflow chains** (ungated; corruption on a tiny-claimed
+  INSERT path, already in the base): a record whose overflow tail
+  needed more pages than the page cache holds (≈16 with the
+  default cache, 4 in the tiny profile) wrote a truncated chain —
+  `alloc_page` spilled the fresh zeroed frames, `write_overflow`
+  re-read them *clean*, and their writes were lost on the next
+  eviction. `zeroblob(69530)` (69529 passed) gave the pin's
+  "overflow list length is 15 but should be 17" and a
+  CorruptRecord read. The reloaded frame is now marked dirty (the
+  same rule `write_leaf_page` follows). Every other fresh-page
+  writer already did.
+- **Argument counts** (ungated): `coalesce` takes 2+ arguments and
+  `ifnull` exactly 2, as on the pin (`coalesce(1)`, `ifnull(1)`,
+  `ifnull(NULL, NULL, 5)` used to answer). A sweep of every
+  function in scope with 0..4 arguments now agrees with the pin.
+  `count()` (count(*)) already worked after the aggregate unit.
+- **`f(*)` and DISTINCT on scalar functions** (`v16`): `f(*)` is
+  `f()` (`random(*)`, `printf(*)` is NULL, `abs(*)` a wrong
+  argument count) and DISTINCT is ignored (`abs(DISTINCT -1)`,
+  `printf(DISTINCT '%d', 1)`), as on the pin. They were
+  `Unsupported`.
+- **Subqueries read only when reached** (ungated, v0.6 path): the
+  executor computes subquery nodes before it evaluates an
+  expression, so an error inside one surfaced even where the pin
+  never runs it (`coalesce(1, (SELECT abs(-9223372036854775808)))`
+  is 1 there). A subquery that fails with an evaluation error
+  (`Error::Schema`) now becomes `SubValue::Fail` →
+  `RExpr::Raise`, raised only if evaluation reads it. I/O,
+  corruption and arena errors still fail at once. AND / OR skip
+  their right side when the left side decides and the right side
+  holds such a node. This matches the pin, which short-circuits
+  an AND / OR whose operand has a subquery, while `a AND abs(b)`
+  runs both sides there too.
+- **Text functions walk text in place** (ungated): `char_ranges`
+  was a list of 16-byte ranges per character (`length()` of a
+  100 MB text peaked at 1.6 GB; the pin's largest legal value,
+  `length(printf('%*.*s', 999999999, 5, 'x'))`, was OOM-killed).
+  It is now an iterator. `length` counts, and `substr` finds its
+  byte span in one walk. The same pattern in LIKE / GLOB (a
+  4-byte code point per subject character) now decodes the
+  subject on the fly; only the pattern (≤ 50,000 bytes) is
+  decoded into a list. The 999,999,999-byte case answers in 2.2 s
+  at 957 MB peak (release), like the pin.
+- **Per-row DEFAULTs** (`v16`): a DEFAULT reading connection state
+  (`random()`, `last_insert_rowid()`, `changes()`, ...) was
+  evaluated once at prepare. Now `InsCol::per_row` keeps its
+  resolved expression and evaluates it for each row:
+  `b DEFAULT (last_insert_rowid())` over `VALUES (11), (12),
+  (13)` is 0, 11, 12 (was 0, 0, 0). OR REPLACE, INSERT ...
+  SELECT and upsert rows behave the same way, and each row draws
+  its own `random()`.
+- **OR FAIL** (ungated; claimed v0.5 / v0.7 paths). hipp parsed
+  FAIL as ABORT, so a constraint violation rolled back the rows
+  the statement had already changed. STATUS v0.7 called the two
+  "observably" the same in autocommit, which is false for
+  multi-row statements. `ConflictAction::Fail` now keeps them. On
+  a UNIQUE / PRIMARY KEY, NOT NULL or CHECK violation, the earlier
+  rows stay: committed in autocommit, or left in the open
+  transaction. `changes()` counts them (the pin's 1|2, was 0|1).
+  Other errors (overflow, datatype mismatch, STRICT) still undo
+  the statement, as on the pin. Conflicts are found before a row
+  is written, so no partial row is kept.
+- **A VALUES row that fails to evaluate** (`v16`): constant rows
+  are folded at prepare, so `VALUES (30, 'x'), (31,
+  abs(-9223372036854775808))` failed before any row was
+  inserted. On the pin, row 30 goes in first, so a failed
+  statement leaves `last_insert_rowid()` at 30. Now a row that
+  fails to fold makes the statement evaluate its VALUES row by row
+  at step time.
+
+**Oracle-probing notes** (all on the live 3.54.1 pin; the REAL
+digit rules fitted clean-room from output: 16 000 cases through a
+Python model, then 4 × 3 000 through hipp's SQL path, all
+random cases with no mismatch): %e / %g rounding to fewer than 17
+significant digits reads `floor(r * T)` at scale `10^(iRound - p)`
+(`T` the truncated 64-bit power of ten of `lexer::pin_digits`, `p`
+its binary estimate of the decimal exponent) and rounds half up at
+the next digit — so an exact tie with trailing zeros rounds *down*
+(`%.0e` of 450.0 is `4e+02`, of 45.0 `5e+01`; 12350.0 at three
+digits rounds up, being one decade past its estimate); %f rounds
+the 18 / 19 digits instead (`printf('%.3f', 166162.7745)` .775
+while `%.8e` shows ...774); any `!` conversion rounding to exactly
+17 digits takes REAL -> TEXT's shortening (`%!.17g` of 0.1 is
+0.1, `%!.16e` too, `%!.18g` is not); `#` drops the sign of a
+negative value printing as zero unless `+` / space asks
+(`%#.0f` of -0.4 is `0.`, `%.0f` is `-0`); precision is capped at
+100,000,000 (`%.*f` of 10^9); infinity with `0` prints `9` and
+999 zeros; `printf()` / `printf(NULL)` are NULL; `printf('%c',
+'')` is a NUL; `%.2q` of NULL is `(N`, `%.0J` of NULL `null`;
+`%#q` doubles backslashes even without a control character;
+`quote(1e16)` is `10000000000000000.0`; `char(NULL)` is a NUL,
+out-of-range code points U+FFFD; `unhex('4 142', ' ')` is NULL
+(separators only between pairs); `iif(0,1,0,2)` is NULL;
+`likelihood(1, (0.5))` and `5e-1` pass, `+0.5`, `-0.0`, `1`,
+`?` fail; `sqlite_version()` is non-deterministic for generated
+columns; `INSERT INTO t SELECT last_insert_rowid() FROM s` sees
+each earlier row's rowid (3, 1, 2) unless the source is the
+target; changes counts per the rules above (probed one by one).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed". New suites:
+`tests/functions_v16.rs` (16 tests: printf fixed cases, the JSON
+/ unistr forms, REAL conversions with every rounding rule above,
+a 900-format generated corpus over every storage class compared
+as hex, a 700-double generated corpus through the REAL
+conversions, round() and quote(), round() regressions — one
+value panicked in an early fit —, TooBig, the value functions,
+argument-count / unknown-function / likelihood errors at prepare,
+a generated value-function corpus over a table of every storage
+class, the text-function and laziness fixes, the change counters
+and last-insert rowid across two scripts compared line by line
+with a pin stdin session and with the `Connection` methods after
+every statement, the random stream's types / ranges /
+per-seed determinism, non-deterministic functions in definitions).
+`hipp-cli/tests/cli_v16_functions.rs` (3 tests, byte-identical
+one-shot and over stdin).
+
+**Size after the review fixes:** tiny **75,968 B** (Δ **+8 B**
+vs 75,960, ratchet raised to it). This is the overflow-chain
+correctness fix on the tiny profile's INSERT path: one
+`mark_frame_dirty` call in `write_overflow`. The FAIL variant
+and its keep logic are gated on `v05`, where OR FAIL parses, so
+the tiny insert error path is unchanged. Full **327,667 B**
+(Δ **+2,216 B** vs 325,451, ratchet raised to it): deferred
+subquery errors, the OR FAIL path, per-row defaults, and the
+in-place text walkers. The full `ci/local-gates.sh` run ends
+with "==> all gates passed". Census (now 195 probes): the 186
+earlier probes are unchanged (MATCH 120, HIPP_ERR 52, BOTH_ERR
+14). Of the 9 new review probes, 6 match and 3 are refused by
+both engines: `coalesce(1)`, `ifnull(…3 args)`, and the OR FAIL
+script, whose one-shot stops at the error on both sides.
+
+**Size (unit as first shipped):** tiny **75,960 B** (Δ **0**: the function library is
+`v16`; the counters' hooks and the round() / text fixes live in
+`v16` / evaluator code the tiny profile does not build). Full
+**312,051 B** (Δ **+10,672 B** vs 301,379, ratchet raised to it):
+the printf engine and its digit paths, the value functions, the
+connection state threaded through every evaluation context
+(`Ctx` became a struct carrying `&Env`), the change-counter hooks
+and the function-name table.
+
+**Honest gaps:**
+
+- `sqlite_source_id()` is undefined (`UnknownFunction`): it names
+  the pin's source check-in, which hipp is not.
+- `last_insert_rowid()` inside an INSERT ... SELECT source reads
+  the pre-statement value for every row (hipp materialises the
+  source first; the pin streams it and later rows see earlier
+  inserts' rowids, unless the source reads the target). A
+  DEFAULT reading it is per row (review fix), so only the SELECT
+  list itself is affected. A VALUES list with a subquery is
+  still materialised before the first insert. If one of its rows
+  fails to evaluate, `last_insert_rowid()` keeps the
+  pre-statement value, where the pin has the rows before it.
+- An UPDATE OR REPLACE that substitutes a NOT NULL column's
+  connection-state DEFAULT evaluates that default once per
+  statement, not per row.
+- The deferred subquery errors are evaluation errors only: an
+  AND / OR short-circuits its right side only when that side
+  holds a failed subquery. The pin short-circuits whenever an
+  operand has a subquery, which can differ when the same side
+  also raises an error of its own. The pin also folds `X AND 0`
+  to 0 at prepare (`abs(-9223372036854775808) AND 0` is 0 there;
+  hipp raises), an expression-folding gap outside this unit.
+- OR ABORT inside an explicit transaction still rolls back the
+  whole transaction (the documented v0.5 simplification); OR
+  FAIL and OR ROLLBACK match the pin there. Column-level conflict
+  clauses (`NOT NULL ON CONFLICT FAIL`) are still parsed and
+  ignored (see "Column constraints and table definitions").
+- `random()` / `randomblob()` are not the pin's ChaCha20 stream —
+  types, lengths and ranges match, values do not (and the seed is
+  `Config::nonce_seed`, shared with the journal nonces).
+- `likelihood(X, +0.5)` is accepted: the parser folds a unary `+`
+  into the literal, which the pin keeps as an operator and
+  refuses.
+- `unhex()`'s separator set is matched by bytes per UTF-8
+  character, not by decoded code point (they differ only for
+  invalid UTF-8 in Y).
+- The printf result limit is the pin's default
+  SQLITE_LIMIT_LENGTH; hipp has no runtime limit setting.
+
+### Aggregate completion (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1; its build has `SQLITE_ENABLE_PERCENTILE`), gated as below.
+Census (186 probes): on the 177 earlier probes MATCH 109 → 113
+(`f_group_concat_order`, `f_string_agg`, `f_filter`, `f_median`;
+HIPP_ERR 56 → 52); 9 new probes for this unit — 7 match, 2 are
+errors on both (sum overflow, DISTINCT argument count). The old
+binary was silently wrong on 4 of them (sum overflow, the
+compensated sum, the NULL separator, `group_concat(DISTINCT x,
+',')`). Folding moved to a new `src/agg.rs` (built with `v04`).
+
+**Shipped — `v16`:**
+
+- `string_agg(X, SEP)` (exactly two arguments; group_concat's
+  fold) and `count()` (= `count(*)`).
+- The aggregate ORDER BY, `f(args ORDER BY term, ...)` with ASC /
+  DESC / NULLS FIRST / LAST and collations, on every aggregate:
+  the stepped rows are sorted stably (ties keep input order —
+  the pin's sorter carries a sequence number), so it orders
+  group_concat / string_agg, and the steps of sum / total / avg
+  (REAL sums are order-sensitive: `sum(x ORDER BY k)` over
+  1e308, 1e308, -1e308 is Inf, descending 1e308) and of the
+  percentile checks. min / max drop it (EXPLAIN shows no sorter
+  on the pin). An integer term is a constant, not an ordinal.
+  DISTINCT keeps the first equal value in input order, then
+  sorts; when the only ORDER BY term is the argument itself
+  (`query::same_expr`, the pin's `sqlite3ExprCompare`: COLLATE
+  makes it differ, parentheses do not), the pin deduplicates
+  through its sorter index and the *last* of equal keys survives
+  (`group_concat(DISTINCT c ORDER BY c)` over NOCASE 'A', 'a' is
+  `a`; `typeof(sum(DISTINCT x ORDER BY x))` over 1.0, 1 is
+  integer). The pin's grammar takes ORDER BY after a possibly
+  empty argument list (not after `*`); with no arguments it drops
+  the clause unresolved, so `count(ORDER BY nosuch)` is
+  `count(*)` and `abs(ORDER BY x)` is `abs()` (review fix: hipp
+  refused `count(ORDER BY x)`).
+- `FILTER (WHERE expr)` on every aggregate: a row whose filter is
+  NULL or false is not stepped and nothing else of it is
+  evaluated; FILTER is no reserved word (`count(*) filter` is an
+  alias). A rejected row never loads min / max bare columns
+  (none passing: the group's first row, as on the pin).
+- FILTER and ORDER BY count for aggregate ownership in
+  subqueries: `(SELECT count(*) FILTER (WHERE t.a > 1) FROM u)`
+  is the outer query's (one row), `(SELECT sum(t.a) FILTER
+  (WHERE u.k > 1) FROM u)` the subquery's. Aggregates inside
+  them are misuse; on a non-aggregate (scalar min / max
+  included) they are `SchemaKind::OrderByNonAggregate` /
+  `FilterNonAggregate`. Layout: `RExpr::Agg` keeps the keys and
+  the filter in `args` behind its arguments (`AggExt`), so every
+  walker — column shifts, subquery collection, ownership,
+  nested-aggregate misuse — sees them; `query::agg_parts` takes
+  a node apart. min / max's ORDER BY keys are not kept in the
+  node, but the ownership walk and the misuse check read them
+  before they are dropped, as the pin's resolver does (review
+  fix: `(SELECT max(o.x ORDER BY i.y) FROM i)` was the outer
+  query's aggregate, collapsing it to one row, and `max(x ORDER
+  BY count(*))` ran).
+- `median(Y)`, `percentile(Y, P)` (P in 0 ..= 100),
+  `percentile_cont(Y, P)` / `percentile_disc(Y, P)` (0 ..= 1):
+  per stepped row, P is checked first (its numeric type: numeric
+  text counts, a blob or NULL does not —
+  `PercentileFraction`), then compared with the first row's
+  fraction within 0.001 (`PercentileFractionVaries`), then a
+  NULL Y is skipped, a TEXT / BLOB Y is `PercentileNotNumeric`
+  (no conversion: `'3'` is refused), an infinite one
+  `PercentileInfinite`; the result is the REAL at `P * (n - 1)`
+  of the sorted values, linearly interpolated except for
+  `percentile_disc`; no stepped value is NULL. The errors depend
+  on bound values, so with `params` they are deferred to step.
+
+**Shipped — ungated (silent wrong answers on claimed v0.4
+paths):**
+
+- `sum()` follows the pin's `sumStep`: an exact integer sum while
+  every addend is INTEGER, else a Kahan–Babuška–Neumaier REAL sum
+  (integers at or past 2^52 split as the pin splits them); an
+  integer overflow is `SchemaKind::IntegerOverflow` unless a later
+  REAL addend absorbs it (hipp returned a REAL); `total()` / `avg()`
+  read the compensated REAL. `sum(0.1, 0.2, 0.3)` was
+  `0.60000000000000009`, `sum(1e18, 1, -1e18)` was 0.0.
+- A text addend is INTEGER only when it is wholly an integer
+  (`' 5 '`, `'+7'`); any other text or blob adds its numeric
+  prefix as a REAL (`sum('  12abc')` is `12.0`, hipp said 12).
+- group_concat's separator is each value's own; a NULL one adds
+  nothing (the whole result was NULL).
+- DISTINCT with other than one argument is
+  `SchemaKind::DistinctAggregateArgs` (`group_concat(DISTINCT b,
+  ',')` ran), checked after the argument count as on the pin.
+- Group finalization (found while probing the overflow error):
+  the pin finalizes every aggregate of a group before HAVING
+  decides, so an erroring one fails the statement even for a
+  group HAVING drops (hipp skipped them); HAVING's AND terms
+  without aggregates or subqueries are moved into WHERE there, so
+  a group failing one never forms (`GROUP BY k HAVING k = 1`
+  ignores the overflowing group); and a grouped query with a
+  LIMIT, no DISTINCT and output in group order (no ORDER BY, or
+  one naming exactly the GROUP BY terms) stops finalizing at
+  OFFSET + LIMIT — so `(SELECT sum(v) FROM g GROUP BY k)` reads
+  only the first group (`session::having_early`, `group_aggs`,
+  `group_cap`; top-level queries and subqueries).
+
+**Review fixes** (2026-11-02, all reproduced on the pin first):
+
+- min / max ORDER BY ownership and nested-aggregate misuse (see
+  the ORDER BY bullets above; `v16`).
+- `f(ORDER BY ...)` with no arguments parses (`v16`).
+- A NaN REAL is NULL, as `sqlite3VdbeMemSetDouble` stores it:
+  sum / total / avg over `+inf` and `-inf` (hipp answered 0.0
+  REAL, so `count(s)` over it was 1 and INSERT ... SELECT wrote a
+  NaN into the file), and the operators `inf - inf`, `0 * inf`,
+  `inf / inf` (`query::real_value`; ungated, the operators are
+  claimed v0.4 paths).
+- An outer LIMIT bounds the groups a derived table finalizes
+  (ungated: a regression of the sum-overflow error). When a query
+  reads exactly one derived table with no WHERE, grouping,
+  aggregates, ORDER BY or DISTINCT, the pin runs the subquery as
+  a coroutine and stops after OFFSET + LIMIT rows, so `SELECT x
+  FROM (SELECT k x, sum(v) FROM g GROUP BY k) LIMIT 1` succeeds
+  although a later group overflows; hipp passes the bound into
+  the subquery's group loop, through nested derived tables
+  (`session::derived_need`, `exec_subplan_need`).
+- HAVING-to-WHERE follows the pin's `havingToWhere` (ungated):
+  only with a GROUP BY; a term moves only if it passes
+  `sqlite3ExprIsConstantOrGroupBy` — literals, operators,
+  deterministic functions (`sqlite_version()` counts; `random()`,
+  `changes()`, `total_changes()`, `last_insert_rowid()`,
+  `randomblob()` do not) and GROUP BY terms whose collation is
+  BINARY (matched as `sqlite3ExprCompare` < 2: a COLLATE on top
+  of either side is ignored); and the literal 0 / FALSE never
+  moves, nor does an AND the pin's parser folds to 0 (an operand
+  that is the literal 0 and no function call — LIKE / GLOB
+  included — on either side). So `HAVING random() = 5`, `HAVING
+  0`, `HAVING k = 1 AND 0`, `HAVING bare_col = 1`, a NOCASE group
+  column and a query without GROUP BY now finalize every group
+  and raise the overflow as the pin does (`session::having_early`,
+  `const_or_group`, `group_match`, `always_false`).
+
+**Oracle-probing notes** (all on the live 3.54.1 pin): `EXPLAIN`
+shows an ephemeral sorter with `OP_Sequence` for every aggregate
+ORDER BY but min / max, and a second ephemeral (`OP_Found`) for
+the first-seen DISTINCT test unless the ORDER BY is the argument
+(then the sorter alone, no sequence column); `group_concat(DISTINCT
+a ORDER BY b)` over 1, 2, 3, NULL, 2, '7' gives `7,1,2,3` (the v
+row's 2 dropped in input order); `group_concat(x, s)` uses the
+current row's separator (`ab3c` with a NULL second separator,
+`b3c` when the first value is NULL); `group_concat('')` is `''`;
+`percentile(a, '50')` works, `'50x'` / `x'01'` / NULL fail even
+over NULL Y rows, a varying P fails at the first row past 0.001
+(`50` vs `50.05` passes), `percentile(a, true)` is 1.04;
+`median(-0.0)` renders `0.0`; `sum()` after an overflow: a later
+1.0 or text / blob (REAL addends) absorbs it, a later INTEGER,
+`'1'` or NULL does not; `sum('5e0')` is REAL, `sum(CAST(x'3500' AS
+TEXT))` INTEGER 5; `select k, sum(v) ... group by k limit 1`,
+`having k = 1`, `(select sum(v) ... group by k)` and `EXISTS (...)`
+succeed while `having count(*) < 2`, `limit 1 offset 1`, `order by
+sum(v) limit 1` and `1 IN (...)` raise the overflow; FILTER on a
+min / max with no passing row leaves the bare column at the
+group's first row.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed". New suites:
+`tests/aggregates_v16.rs` (20 tests: string_agg / ORDER BY
+corpus and refusals, DISTINCT + ORDER BY interplay, FILTER and its
+refusals, FILTER with bare columns, clause ownership in
+subqueries, percentile values and every percentile error kind, a
+bound-P test through the Statement API, the sum overflow / KBN /
+text-addend regressions, the separator and DISTINCT-argument
+regressions, mixed storage classes and collations, empty input
+and HAVING / ORDER BY in compound and subquery bodies, the group
+finalization rules, and a 240-statement PRNG corpus of random
+aggregates with random DISTINCT / ORDER BY / FILTER over mixed
+storage classes — `HIPP_AGG_CORPUS` / `HIPP_AGG_SEED` scale it;
+4 × 1 500 extra statements agreed while developing; the review
+fixes added six: min / max ORDER BY ownership, its misuse
+refusals, argument-less ORDER BY, NaN results through queries and
+the file, outer LIMITs over derived tables, and a
+HAVING-to-WHERE matrix of 63 statements) and `hipp-cli/tests/cli_v16_aggregates.rs`
+(6 byte-identical batches, one-shot and over stdin: ORDER BY,
+FILTER, percentile, sums and separators, CREATE TABLE ... AS
+SELECT with its `.schema`, the review fixes).
+
+**Size:** tiny **75,960 B** (Δ **0**: the evaluator is not in the
+tiny profile). Full **325,451 B** (Δ **+10,196 B** vs 315,255,
+ratchet raised to it): the percentile family, the KBN sum
+context, the ORDER BY / DISTINCT sort (one hand-written stable
+merge sort over row indices — two `slice::sort_by`
+instantiations cost 6 KB more), FILTER and clause resolution
+(`AggExt`, `same_expr`), and the finalization rules in the three
+group loops.
+
+Review fixes: tiny **76,048 B** (Δ **0**; none of the changed
+code is in the tiny profile). Full **346,455 B** (Δ **+1,480 B**
+vs 344,975 after the math unit, ratchet raised to it): the
+HAVING-to-WHERE walkers (`const_or_group`, `has_call`), the
+derived-table LIMIT bound, the NaN-to-NULL helper and the kept
+min / max keys. Census: unchanged on the 205 earlier probes (135
+match); 6 new probes for these fixes — 4 match, 2 are errors on
+both (the misuse refusal, the HAVING `random()` overflow).
+
+**Honest gaps:**
+
+- Window functions (`OVER`) are not implemented (another leaf);
+  `sum(a) OVER ()` and an aggregate with FILTER / ORDER BY plus
+  OVER stay refused.
+- The DISTINCT-equals-ORDER-BY test compares columns, literals,
+  operators, casts, COLLATE and scalar calls; a CASE or
+  subquery argument repeated in the ORDER BY takes the
+  first-seen path, where the pin keeps the last of equal values.
+- Group finalization: a DISTINCT grouped query, a compound core
+  and a derived table the pin pushes a WHERE into (`SELECT *
+  FROM (SELECT k, sum(v) ... GROUP BY k) WHERE k = 1`) finalize
+  every group in hipp, so an erroring aggregate in a group the
+  pin never forms fails there. The outer-LIMIT bound covers only
+  a reader with no WHERE, DISTINCT, ORDER BY, grouping or join:
+  the pin's coroutine also stops early under `WHERE x < 5 LIMIT
+  1`, `SELECT DISTINCT ... LIMIT 1`, a UNION ALL derived table or
+  a join whose outer loop is the derived table, where hipp
+  finalizes every group and can raise an error the pin never
+  reaches.
+- HAVING-to-WHERE: hipp's parser folds FALSE, `-0` and `+0` into
+  the literal 0, so `HAVING -0` / `+0` (movable on the pin) and
+  an AND over FALSE (which the pin's parser does not fold) keep
+  every group in hipp and can raise an error the pin skips.
+  The pin's error after partial output (rows of earlier groups
+  are printed before the overflow) is not reproduced: hipp
+  returns the error alone.
+- The argument-less ORDER BY is dropped after parsing, but hipp
+  checks collation names while parsing, so `count(ORDER BY x
+  COLLATE nosuch)` is refused where the pin runs it.
+- When several aggregates (or rows) would raise different errors,
+  which one hipp reports may differ from the pin's; the tests
+  compare errored-vs-succeeded and hipp's kind, never the pin's
+  text.
+- Aggregate folding is still materialise-then-fold (each group's
+  rows held in memory) and DISTINCT is quadratic, as before.
+
+### Math functions (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1, built with SQLITE_ENABLE_MATH_FUNCTIONS over glibc 2.39's
+libm), gated as below. Census (now 205 probes): on the 195
+earlier probes `f_math` moved HIPP_ERR → MATCH (MATCH 126 → 127,
+HIPP_ERR 52 → 51); of 10 new probes 8 match, `m_arity` is
+refused by both, and `m_hyper` differs by one ulp in
+`atanh(0.25)` (glibc's `log1p`, see the gaps).
+
+**Shipped — leaf feature `math`** (new `src/math.rs`, Cargo
+feature `math = ["v04"]`, in `full`, `v04,math` in
+`ci/feature-sets.txt`; `ScalarFn::Math(MathFn)`):
+
+- The SQL functions `acos acosh asin asinh atan atan2 atanh ceil
+  ceiling cos cosh degrees exp floor ln log(X) log(B, X) log10
+  log2 mod pi pow power radians sin sinh sqrt tan tanh trunc`,
+  case-insensitive, deterministic (generated columns, CHECK,
+  DEFAULT, WHERE / ORDER BY and write paths all accept them), with
+  the pin's argument counts (`WrongArgumentCount` at prepare;
+  `pi(*)` is `pi()`, `sin(*)` a wrong count, DISTINCT ignored,
+  FILTER refused — the shared scalar-function rules).
+- Argument rules (`math::eval`): an argument counts only as
+  `sqlite3_value_numeric_type` makes it a number — INTEGER, REAL,
+  or TEXT that is wholly a number (`record::text_to_number`:
+  ASCII spaces around it, read to its first NUL; `'1e400'` is
+  Inf, `'0x10'` / `'1_000'` / `'inf'` / `''` are not numbers);
+  NULL, BLOB and other text give NULL. `ceil` / `floor` / `trunc`
+  return an INTEGER argument unchanged (also integer text: `ceil('5')`
+  is 5, `ceil('5.0')` 5.0). Every NaN result is NULL. The
+  logarithms are NULL at or below zero; `log(B, X)` is NULL for B
+  at or below 1 (its `ln(B) <= 0`) and reads X as
+  `sqlite3_value_double` — any value's numeric prefix
+  (`log(2, x'38')` and `log(2, '8abc')` are 3.0, `log(2, x'')`
+  NULL) — then `ln(X) / ln(B)` in double (`log(10, 1000)` is
+  2.9999999999999996, as on the pin). `degrees(x)` is
+  `x * (180 / M_PI)`, `radians(x)` `x * (M_PI / 180)`.
+- `hipp::math`, a public in-crate floating-point library (no
+  libm exists in `no_std`; no std float math; zero dependencies):
+  `sqrt` (exact: integer square root of the 108-bit scaled
+  mantissa, round half even), `fmod` (exact: mantissa remainder
+  ten bits at a time), `ceil` / `floor` / `trunc` (bit masks);
+  `exp`, `expm1`, `ln`, `log1p`, `log2`, `pow`, `sin`, `cos`,
+  `tan`, `asin`, `acos`, `atan`, `atan2` correctly rounded by
+  clean-room methods: double-double arithmetic (Dekker products,
+  no FMA), `exp` by `k ln 2` reduction, a 9-term Taylor series of
+  `expm1(r/1024)` and ten exact squarings, `ln` by exponent
+  reduction and the `2 atanh(f/(2+f))` series, trig by
+  Payne–Hanek reduction against 1,472 bits of 2/π (computed
+  offline with integer Machin arithmetic; the `0xa2f9836e4e44152`
+  prefix checks it) then Taylor series on |r| <= π/4, `atan` by
+  three angle halvings and its series; `pow` follows C99 Annex F
+  and computes every exact power exactly (powers of two with
+  integral `e * y`; otherwise, for `x = a * 2^e` with `a` odd and
+  `y = n / 2^k` with `n` odd, `k <= 5`: `a = t^(2^k)`, `2^k | e n`
+  and `t^n` within 106 bits — the only way `x^y` can be a dyadic
+  rational short enough to be a halfway case — so ties round to
+  even, fractional exponents included); one shared `scale_round` rounds into the
+  subnormal range and to infinity. 55,000 random arguments
+  checked against a 400-digit Python `Decimal` reference: 0
+  misrounded.
+- Fitted to the pin's output (clean room, by testing
+  hypotheses against glibc results through Python's `math`,
+  which links the same libm — 27,000 random calls first showed
+  Python's `math` and the pin agree bit for bit): `log10` is
+  `(k * lo + ln(m) / ln 10) + k * hi` with `x = m * 2^k`, `m` in
+  [1, 2) (in [1/2, 1) with `k + 1` below 1) and log10(2) split
+  with its low mantissa bits clear (0 mismatches over 145,000
+  doubles); the hyperbolic functions are the textbook identities
+  over `expm1` / `exp` / `log1p` / `ln` / `sqrt` in double
+  (`sinh = ±(t + t/(t+1))/2` with `t = expm1|x|`, `2t - t²/(t+1)`
+  below 1, `e^|x|/2` from 22; `cosh`, `tanh`, `asinh`, `acosh`,
+  `atanh` likewise; 0–6 mismatches in 60,000 through the pin's
+  own building blocks). hipp evaluates them over its correctly
+  rounded building blocks. Their branch points are fitted too
+  (see the gaps).
+
+**Shipped — ungated** (silent wrong answers on the tiny-claimed
+INSERT path and every comparison): `record::text_to_number` (NUMERIC
+/ INTEGER / REAL column affinity, comparison affinity, the
+aggregates' numeric text) trimmed Unicode whitespace and refused a
+number followed by a NUL. The pin trims only `sqlite3Isspace`'s
+ASCII set and reads text to its first NUL: `char(160) || '5'` and
+`'5' || char(133)` stay TEXT (hipp stored 5), `'5' || char(0) ||
+'x'` is 5 (hipp kept the text).
+
+**Review fixes (second commit, same day):**
+
+- `pow` misrounded exact halfway results with a fractional
+  exponent (`pow(68661293089, 1.5)` = 262033^3, a 54-bit odd
+  integer, came out ...938 for ...936; `pow(590211519630.0625,
+  1.25)` and `pow(50360764242731682758656, 3.5)` likewise —
+  about half of such ties). Only integer exponents were computed
+  exactly; `math::pow_exact` now covers every exact case (above).
+  Regressions: `pow_exact_halfway_cases_round_to_even` (1,500
+  generated `pow(t^(2^k) * 2^(2^k j), n / 2^k)` cases, k = 0..5,
+  each checked against an exact big-integer rounding in the test,
+  and the review's three cases against the pin),
+  `pow_integer_grid_is_exactly_rounded` (all 9,680 `pow(a, b)`,
+  a in -60..60, b in 0..79, against the exact rounding), unit test
+  `pow_exact_ties`, and CLI lines.
+- Ungated (silent wrong answers on claimed paths): the numeric
+  prefix reading behind arithmetic, CAST, `sum` / `total` / `avg`
+  and `log(B, X)`'s X (`query::parse_num_prefix`) required the
+  whole buffer to be UTF-8 and skipped Latin-1 spaces as raw
+  bytes would: `log(2, x'38ff')` and `log(10, cast(x'313030ff' AS
+  TEXT))` were NULL, `x'38ff' + 0` was 0 (pin: 3.0, 2.0, 8). It now
+  reads bytes like the pin's `sqlite3AtoF`, skipping only the
+  `sqlite3Isspace` set. The same Unicode-trim pattern sat in
+  `WHERE rowid = '<text literal>'` (`'\u{a0}5'` found rowid 5; the
+  pin finds none): it now goes through `record::text_to_number`.
+  Regression: `numeric_prefix_reads_bytes`.
+- Documentation: the mismatch figures below were understated for
+  some argument families; they now list the hot spots (exact `pow`
+  ties, small integer powers, `acosh` near 1, the hard trig
+  reduction argument).
+
+**Oracle-probing notes** (all on the live pin; the CLI's
+`ieee754_to_blob()` gives the exact bits): `ceil(-0.5)`,
+`trunc(-0.0)`, `sin(-0.0)` and `sqrt(-0.0)` are -0.0 (the CLI and
+printf render it `0.0`); `sqrt('-0')` is +0 (integer text);
+`ceil('abc')`, `ceil(x'31')` NULL (not 0.0); `log(0)`, `ln(0)`
+NULL (C gives -inf); `pow(0, -1)` Inf, `pow(-1, 1e300)` 1.0,
+`pow(2, -1075)` 0.0 (the tie rounds to even), `pow(-8, 1.0/3)` NULL;
+`mod(7, 3)` is REAL 1.0, `mod(7, 0)` NULL; `atan2(-0.0, -1)` -π;
+`atanh(1)` Inf, `acosh(0.5)` NULL; `exp(709.79)` and `sinh(-711)`
+±Inf, `cosh(710)` finite; `sin(1e400)` NULL; `ceil(9223372036854775807)`
+and `trunc('-9223372036854775808')` stay INTEGER; `ceil('9223372036854775808')`
+is REAL. glibc 2.39's own accuracy (measured against hipp's
+correctly rounded results, which a `Decimal` check confirmed on
+every sampled disagreement): `exp`, `ln`, `log2`, `pow`, `sin`,
+`cos`, `tan`, `asin`, `acos`, `atan`, `atan2` misround 0.01–0.16%
+of random arguments by one ulp (`pow(x, -1)` for `x` one ulp
+below a power of two among them); `expm1` 7.2% and `log1p` 2.0%
+(fdlibm-style); the pin's `atan2(y, x)` for a tiny ratio is
+`y / x` rounded once (a subnormal tie rounds to even, where
+`atan` lies just below it — hipp now does the same).
+
+**Mismatch rates vs the pin** (bitwise, 10^6 random arguments
+per function over five distributions — random bit patterns,
+[-1, 1], [-30, 30], log-uniform magnitudes, 1 ± 10^-6 — through
+the same libm via a scratch harness; max difference in ulps):
+`sqrt` `ceil` `floor` `trunc` `mod` (8 × 10^5) `degrees` `radians`
+`pi`: **0**. `log10` 0.008% (2), `ln` 0.010% (1), `acos` 0.015%
+(1), `log2` 0.026% (1), `asin` 0.034% (1), `acosh` 0.036% (1),
+`atan2` 0.041% (1), `cosh` 0.045% (1), `exp` 0.048% (1), `pow`
+0.066% (1), `cos` 0.072% (1), `atan` 0.076% (1), `sin` 0.10%
+(1), `tan` 0.16% (1), `atanh` 1.5% (1), `tanh` 3.8% (3), `asinh`
+4.5% (1), `sinh` 5.1% (2). These rates depend on the argument
+distribution (the mixture above includes out-of-domain arguments,
+NULL on both sides, and wide ranges); the hot spots, measured
+against the live pin over 20,000 arguments each unless noted:
+`acosh` 2.4% on uniform [1, 5], 1.1% on 1 + log-uniform, 0.44% on
+[1, 30]; `atanh` 7.4%, `asinh` 7.9%, `sinh` 7.5% (2 ulp) and `tanh`
+11.6% (3 ulp) on [-1, 1]; `ln` 0.15% and `log10` 0.10% (2 ulp) on
+[0.5, 2]; `pow` 0.27% on integer a < 1000, b < 40, 0.48% (46 of
+9,680) on the grid a in -60..60, b in 0..79 — mostly exact ties,
+where glibc does not round half to even (`pow(9, 17)` =
+16677181699666569 is 16677181699666570.0 on the pin,
+16677181699666568.0 in hipp; `pow(-17, 13)` likewise; the CLI
+shows these digits) — and on exact ties with fractional
+exponents glibc is wrong in 89 of 145 (61%; e.g. `pow(18^16 *
+2^-48, 1.0625)`). The largest difference found: `cos` and `tan`
+of 6381956970095103 * 2^797 (5.319372648326541e+255, the classic
+hard reduction argument) are 8 and 14 ulp from the pin — hipp's
+are the correctly rounded values (a 1,300-digit `Decimal`
+reduction; unit test `hard_reduction_argument`), glibc's lose bits
+there; random bit patterns otherwise stay within 1 ulp (0.06–0.12%
+for `sin` / `cos` / `tan`). In the test corpus against the live
+pin (1,500 per function, `tests/math_v16.rs`): 0 for the exact
+functions and `exp`, `ln`, `log`, `log10`, `log2`, `log(B, X)`,
+`pow`; 1–4 for trig and inverse trig; `cosh` 5, `acosh` 6,
+`asinh` 12, `tanh` 59, `atanh` 108, `sinh` 109 (the [-30, 30] /
+[-1, 1] / [-3, 3] ranges where glibc's `expm1` / `log1p` sit).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed" (`v04,math` compiles warning-free
+alone). New suites: `tests/math_v16.rs` (6 tests, 10 after the
+review fixes — the two exact-`pow` suites, the byte-wise numeric
+prefix and the hard trig argument vs the pin: the generated
+bitwise corpus per function with its mismatch bound and ulp cap,
+structural edge cases — ±0, subnormals, the largest doubles,
+infinities, NaN-producing arguments, overflow / underflow
+thresholds, the C99 pow / atan2 / fmod tables — bit for bit but
+two one-ulp cases (`atanh(±0.5)`, glibc's `log1p(2)`), argument
+coercion over every storage class for every function, arity
+errors, math in generated / CHECK / DEFAULT columns and writes,
+and the text → number regression); `src/math.rs` unit tests (exact
+and special values, the SQL argument rules; after the review,
+also `pow_exact_ties` and `hard_reduction_argument`);
+`hipp-cli/tests/cli_v16_math.rs` (2 tests, byte-identical
+one-shot and over stdin: special-value rendering and a generated
+corpus of the exact functions).
+
+**Size:** tiny **76,048 B** (Δ **+80 B** vs 75,968, ratchet raised
+to it): the text → number correctness fix on the tiny profile's
+INSERT affinity path — the NUL cut and the ASCII-only trim check
+(three variants were measured; this one is the smallest; the math
+library itself is not in the tiny build). Full **344,975 B** (Δ
+**+17,308 B** vs 327,667, ratchet raised to it; over the 16 KiB
+`justify_over`, justified here): the soft-float double-double
+library on thumbv7em (9.4 KB of `math::` symbols: Payne–Hanek with
+its 184-byte table, the series, `scale_round`, the integer `sqrt`),
+5.8 KB inlined into `eval_scalar` (the per-function entry points)
+and the u128 builtins it pulls in.
+
+*Review fixes:* tiny **76,044 B** (Δ **−4 B** vs 76,048, ratchet
+lowered: the byte-wise `parse_num_prefix` drops the whole-buffer
+UTF-8 check; `literal_rowid` reuses `text_to_number`). Full
+**346,207 B** (Δ **−248 B** vs the current 346,455 ratchet,
+lowered: the general `pow_exact` replaces the integer-only exact
+branch and the UTF-8 check goes). Gates: `cargo fmt --all` and
+the full `ci/local-gates.sh` run end with "==> all gates passed".
+
+**Honest gaps:**
+
+- Not bit-identical everywhere: where glibc is not correctly
+  rounded, hipp (which is) differs, mostly by one ulp — rates and
+  hot spots above (up to 14 ulp at the hard trig argument; exact
+  `pow` ties, where glibc does not round half to even, cannot be
+  matched without reproducing glibc's internals);
+  `sinh` / `tanh` / `asinh` / `atanh` inherit glibc's `expm1` /
+  `log1p` errors (`atanh(0.5)` is ...478 on the pin, ...489 in
+  hipp, the true value). Matching those would mean reproducing
+  glibc's polynomial coefficients, which output fitting cannot
+  recover; `tanh` can differ by up to 3 ulp through `1 - 2/(t+2)`.
+- The hyperbolic branch points were fitted by sweeping the
+  arguments around each (every 997th to 2^26th double over
+  ±2^21 .. ±2^40 ulps): `asinh`'s 2^28 and 2, `cosh`'s ln(2)/2 and
+  the `sinh` / `cosh` exp split sit at their values rounded up to
+  the high 32 bits (0 mismatches after, 1,052 / 176 / 204 / 28
+  before); `acosh`'s 2 and the round values 22, 1, 0.5, 2^-28,
+  2^-55 compare exactly. A ±3-ulp sweep of every threshold now
+  differs only where a building block (`expm1`, `log1p`, `exp`)
+  does. Thresholds were not swept beyond these.
+- `log10` is the fitted formula, not correctly rounded (up to
+  2 ulp from the true value; it equals the pin's wherever its
+  `ln` does).
+- hipp's correct rounding is by double-double evaluation (about
+  2^-95 relative before the final rounding), not a proof: a
+  hard case within 2^-95 of a midpoint could misround; none was
+  found in 55,000 `Decimal`-checked or 2.2 × 10^7 glibc-compared
+  arguments (nor in the 11,180 exact `pow` cases the review fix
+  checks against big-integer rounding).
+- Arithmetic over text / a blob whose number is followed by
+  spaces and a NUL (`x'3500' + 0`, `('5' || char(0)) * 1`): the
+  pin makes the result REAL (5.0), hipp INTEGER (5). The value
+  agrees; only the type differs. A pre-existing arithmetic
+  quirk outside this unit, found while probing the review fix;
+  not changed here.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

@@ -132,6 +132,8 @@ impl Binder<'_> {
                 *e = Expr::Literal(self.literal::<E>(*idx)?);
             }
             Expr::Literal(_) | Expr::Column { .. } => {}
+            #[cfg(feature = "v04")]
+            Expr::HexTooBig(_) => {}
             Expr::Binary(_, a, c) | Expr::Like(a, c, _) => {
                 self.expr::<E>(a)?;
                 self.expr::<E>(c)?;
@@ -140,7 +142,13 @@ impl Binder<'_> {
                 self.expr::<E>(a)?
             }
             #[cfg(feature = "v16")]
-            Expr::Collate(a, _) => self.expr::<E>(a)?,
+            Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => self.expr::<E>(a)?,
+            #[cfg(feature = "v16")]
+            Expr::Vector(l) => {
+                for x in l.as_mut_slice() {
+                    self.expr::<E>(x)?;
+                }
+            }
             Expr::InList(a, l, _) => {
                 self.expr::<E>(a)?;
                 for x in l.as_mut_slice() {
@@ -173,9 +181,23 @@ impl Binder<'_> {
                     self.expr::<E>(x)?;
                 }
             }
-            Expr::Func { args, .. } => {
+            Expr::Func {
+                args,
+                #[cfg(feature = "v16")]
+                clause,
+                ..
+            } => {
                 for x in args.as_mut_slice() {
                     self.expr::<E>(x)?;
+                }
+                #[cfg(feature = "v16")]
+                if let Some(c) = clause {
+                    for (x, _) in c.order_by.as_mut_slice() {
+                        self.expr::<E>(x)?;
+                    }
+                    if let Some(x) = &mut c.filter {
+                        self.expr::<E>(x)?;
+                    }
                 }
             }
         }
@@ -353,12 +375,16 @@ fn constant(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) | Expr::ExistsSubquery(_) | Expr::InSubquery(..) => false,
         Expr::Literal(_) | Expr::Column { .. } | Expr::Param(..) => true,
+        #[cfg(feature = "v04")]
+        Expr::HexTooBig(_) => true,
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => constant(a) && constant(b),
         Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             constant(a)
         }
         #[cfg(feature = "v16")]
-        Expr::Collate(a, _) => constant(a),
+        Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => constant(a),
+        #[cfg(feature = "v16")]
+        Expr::Vector(l) => l.iter().all(constant),
         Expr::InList(a, l, _) => constant(a) && l.iter().all(constant),
         Expr::Between(a, b, c, _) => constant(a) && constant(b) && constant(c),
         Expr::Case {
@@ -370,6 +396,12 @@ fn constant(e: &Expr) -> bool {
                 && whens.iter().all(|(w, t)| constant(w) && constant(t))
                 && otherwise.as_deref().is_none_or(constant)
         }
+        // An aggregate clause makes no call constant (it only
+        // goes with aggregates, which are not).
+        #[cfg(feature = "v16")]
+        Expr::Func {
+            clause: Some(_), ..
+        } => false,
         Expr::Func { args, .. } => args.iter().all(constant),
     }
 }
