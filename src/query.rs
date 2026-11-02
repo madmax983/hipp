@@ -889,12 +889,16 @@ fn shift_plan(p: &mut SubPlan, at: (usize, usize), by: (usize, usize)) {
 /// whether any source matched (always true for `*` with
 /// sources). For an unqualified `*`, a joined source's USING /
 /// NATURAL columns are omitted — each shows once, at the
-/// left-most source's position. A column of a source left of
-/// the FROM clause's last RIGHT / FULL join that some later
-/// source names in USING expands to the *unqualified* name, so
-/// it reads the joined value (the right side after a RIGHT
-/// join, `coalesce(...)` after a FULL one); that applies to
-/// `q.*` as well, as on the pin.
+/// left-most source's position. Under an unqualified `*`, a
+/// column of a source left of the FROM clause's last RIGHT /
+/// FULL join that some later source names in USING expands to
+/// the *unqualified* name, so it reads the joined value (the
+/// right side after a RIGHT join, `coalesce(...)` after a FULL
+/// one). `q.*` always reads `q`'s own columns (NULL on a row
+/// another source contributed alone): CI against the 3.54.1 pin
+/// (`SELECT a.* FROM a FULL JOIN b USING (id)` shows a NULL `id`
+/// on the b-only rows); the 3.53 stand-in read the joined value
+/// there too.
 pub fn expand_star<E>(
     cur: &ScopeGroup,
     qual: Option<&[u8]>,
@@ -915,7 +919,8 @@ pub fn expand_star<E>(
             if qual.is_none() && si > 0 && src.uses(n) {
                 continue;
             }
-            let joined = last_right.is_some_and(|r| si < r)
+            let joined = qual.is_none()
+                && last_right.is_some_and(|r| si < r)
                 && srcs
                     .get(si + 1..)
                     .is_some_and(|rest| rest.iter().any(|s| s.uses(n)));
@@ -967,22 +972,32 @@ pub type SubPlanner<'p, E> =
 /// `LIMIT 1` there instead of a datatype mismatch, `LIMIT '0'`
 /// stays `LIMIT 0`, and a NULL limit still errors. OFFSET is
 /// left alone, as are IN subqueries and derived tables.
+///
+/// Without a LIMIT of its own the subquery gets the pin's
+/// implicit integer `LIMIT 1`, which is what lets a UNION
+/// compound take the pin's first-row shortcut
+/// (`session::union_first_row`; v0.16, CI against the pin).
 #[cfg(feature = "v16")]
 fn first_row_limit(mut plan: SubPlan) -> SubPlan {
-    if let Some(x) = plan.limit.take() {
-        plan.limit = Some(RExpr::Binary(
+    plan.limit = Some(match plan.limit.take() {
+        Some(x) => RExpr::Binary(
             BinOp::Ne,
             Box::new(x),
             Box::new(RExpr::AffLiteral(OwnedValue::Integer(0), Affinity::Numeric)),
-        ));
-    }
+        ),
+        None => RExpr::Literal(OwnedValue::Integer(1)),
+    });
     plan
 }
 
 /// `first_row_limit` without `v16`: a LIMIT is an integer
-/// literal there, for which the rewrite changes nothing.
+/// literal there, for which the `X <> 0` rewrite changes
+/// nothing; the implicit `LIMIT 1` still applies.
 #[cfg(not(feature = "v16"))]
-fn first_row_limit(plan: SubPlan) -> SubPlan {
+fn first_row_limit(mut plan: SubPlan) -> SubPlan {
+    if plan.limit.is_none() {
+        plan.limit = Some(RExpr::Literal(OwnedValue::Integer(1)));
+    }
     plan
 }
 
@@ -2721,9 +2736,8 @@ pub fn exprs_colls(es: &[RExpr]) -> AVec<Coll> {
 }
 
 /// Whether `e` is constant (v0.16): it reads no column, rowid,
-/// subquery or aggregate. The pin rewrites `x IN (<one
-/// constant>)` into `x = +<constant>`, whose collation follows
-/// the binary rule instead of the IN list's left-only one.
+/// subquery or aggregate (a VALUES core of constant rows is the
+/// pin's co-routine; see `session::core_colls`).
 pub fn is_constant(e: &RExpr) -> bool {
     match e {
         RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
@@ -2757,14 +2771,13 @@ pub fn is_constant(e: &RExpr) -> bool {
 }
 
 /// The collation of an IN list's membership test (v0.16): the
-/// left operand's (the pin compares list items by it alone),
-/// except that a single constant item follows the binary rule
-/// (see `is_constant`).
-fn in_list_coll(x: &RExpr, list: &[RExpr]) -> Coll {
-    match list {
-        [one] if is_constant(one) => binary_coll(x, one),
-        _ => expr_coll(x).unwrap_or_default(),
-    }
+/// left operand's alone (explicit `COLLATE`, else its column's),
+/// never an item's. CI against the 3.54.1 pin: `'A' IN ('a'
+/// COLLATE NOCASE)` is 0 there; the 3.53 stand-in rewrote a single
+/// constant item to `x = +item` and gave 1 (the binary rule). That
+/// a single item's column collation is ignored too is inferred.
+fn in_list_coll(x: &RExpr) -> Coll {
+    expr_coll(x).unwrap_or_default()
 }
 
 fn cmp_op<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
@@ -3708,7 +3721,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             let xv = eval::<E>(x, ctx)?;
             let mut any_null = matches!(xv, OwnedValue::Null);
             let mut hit = false;
-            let coll = in_list_coll(x, list.as_slice());
+            let coll = in_list_coll(x);
             for item in list.iter() {
                 let iv = eval::<E>(item, ctx)?;
                 // An IN (SELECT ...) substitution compares like
@@ -3719,9 +3732,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                 // operand without affinity converts nothing,
                 // whatever the items declare (v0.16, probed:
                 // with d no affinity, e INTEGER, f TEXT holding
-                // '1'/1/'1', d IN (e) and 1 IN (f) are 0). A
-                // single constant item is the pin's `x = +item`
-                // rewrite, which the same rule matches.
+                // '1'/1/'1', d IN (e) and 1 IN (f) are 0).
                 let (a, b) = if *from_sub {
                     adjust_cmp(x, item, xv.clone(), iv)
                 } else {

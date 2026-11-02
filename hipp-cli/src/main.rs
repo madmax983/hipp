@@ -58,72 +58,196 @@ fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// Format an `f64` the way SQLite's list mode prints reals
-/// (`%!.15g`): 15 significant digits, fixed notation inside
-/// [-4, 15) exponent range, at least one fractional digit.
+/// A column name as the shell's `.schema` view comment prints it
+/// (v0.16, CI against the pin: `/* v(a,"+b",b,Q) */`): bare when
+/// it is a plain identifier (an ASCII letter or `_`, then letters,
+/// digits, `_`) that is not an SQL keyword, else double-quoted
+/// with `"` doubled. The keyword list is SQLite's documented one
+/// (147 words, sqlite.org/lang_keywords.html); the keyword case is
+/// inferred from the shell's quoting rule, not seen in CI.
+fn shell_quote_name(c: &[u8]) -> Vec<u8> {
+    let plain = c
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && c.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    if plain
+        && !SQL_KEYWORDS
+            .iter()
+            .any(|k| k.as_bytes().eq_ignore_ascii_case(c))
+    {
+        return c.to_vec();
+    }
+    let mut q = vec![b'"'];
+    for &b in c {
+        if b == b'"' {
+            q.push(b'"');
+        }
+        q.push(b);
+    }
+    q.push(b'"');
+    q
+}
+
+/// SQLite's keywords (sqlite.org/lang_keywords.html), for
+/// `shell_quote_name`.
+const SQL_KEYWORDS: [&str; 147] = [
+    "ABORT",
+    "ACTION",
+    "ADD",
+    "AFTER",
+    "ALL",
+    "ALTER",
+    "ALWAYS",
+    "ANALYZE",
+    "AND",
+    "AS",
+    "ASC",
+    "ATTACH",
+    "AUTOINCREMENT",
+    "BEFORE",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLLATE",
+    "COLUMN",
+    "COMMIT",
+    "CONFLICT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "CURRENT",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "DATABASE",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DEFERRED",
+    "DELETE",
+    "DESC",
+    "DETACH",
+    "DISTINCT",
+    "DO",
+    "DROP",
+    "EACH",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXCEPT",
+    "EXCLUDE",
+    "EXCLUSIVE",
+    "EXISTS",
+    "EXPLAIN",
+    "FAIL",
+    "FILTER",
+    "FIRST",
+    "FOLLOWING",
+    "FOR",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "GENERATED",
+    "GLOB",
+    "GROUP",
+    "GROUPS",
+    "HAVING",
+    "IF",
+    "IGNORE",
+    "IMMEDIATE",
+    "IN",
+    "INDEX",
+    "INDEXED",
+    "INITIALLY",
+    "INNER",
+    "INSERT",
+    "INSTEAD",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "KEY",
+    "LAST",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "MATCH",
+    "MATERIALIZED",
+    "NATURAL",
+    "NO",
+    "NOT",
+    "NOTHING",
+    "NOTNULL",
+    "NULL",
+    "NULLS",
+    "OF",
+    "OFFSET",
+    "ON",
+    "OR",
+    "ORDER",
+    "OTHERS",
+    "OUTER",
+    "OVER",
+    "PARTITION",
+    "PLAN",
+    "PRAGMA",
+    "PRECEDING",
+    "PRIMARY",
+    "QUERY",
+    "RAISE",
+    "RANGE",
+    "RECURSIVE",
+    "REFERENCES",
+    "REGEXP",
+    "REINDEX",
+    "RELEASE",
+    "RENAME",
+    "REPLACE",
+    "RESTRICT",
+    "RETURNING",
+    "RIGHT",
+    "ROLLBACK",
+    "ROW",
+    "ROWS",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "TABLE",
+    "TEMP",
+    "TEMPORARY",
+    "THEN",
+    "TIES",
+    "TO",
+    "TRANSACTION",
+    "TRIGGER",
+    "UNBOUNDED",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VACUUM",
+    "VALUES",
+    "VIEW",
+    "VIRTUAL",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+    "WITHOUT",
+];
+
+/// Format an `f64` the way SQLite's list mode prints reals: the
+/// pin's CLI renders a REAL exactly as its core REAL-to-text
+/// conversion (CAST AS TEXT) does — CI showed it (v0.16) — so this
+/// is the core's `render_real`, the one source of truth.
 fn fmt_real(f: f64) -> String {
-    if f == 0.0 {
-        // The pin's printf has no negative zero: `SELECT -0.0`
-        // prints 0.0 (v0.16 fix; the value itself stays -0.0).
-        return "0.0".to_string();
-    }
-    if !f.is_finite() {
-        // SQLite prints these as Inf / -Inf in list mode.
-        return if f > 0.0 {
-            "Inf".to_string()
-        } else {
-            "-Inf".to_string()
-        };
-    }
-    // 15 significant digits, rounded as the pin's printf rounds
-    // its decoded digit string: half away from zero (an exact tie
-    // such as 5833858491548785.0 goes up, where Rust's `{:.14e}`
-    // goes to even). The decoding is taken to 20 digits, about
-    // what the pin's double-double decoder yields.
-    let sci = format!("{:.19e}", f.abs());
-    let (mant, exp) = sci.split_once('e').expect("scientific form");
-    let mut exp10: i32 = exp.parse().expect("exponent");
-    let mut d: Vec<u8> = mant.bytes().filter(|c| *c != b'.').collect();
-    let up = d.get(15).is_some_and(|c| *c >= b'5');
-    d.truncate(15);
-    if up {
-        let mut carry = true;
-        for c in d.iter_mut().rev() {
-            if *c == b'9' {
-                *c = b'0';
-            } else {
-                *c += 1;
-                carry = false;
-                break;
-            }
-        }
-        if carry {
-            d.insert(0, b'1');
-            d.truncate(15);
-            exp10 += 1;
-        }
-    }
-    let digits = String::from_utf8(d).expect("ascii digits");
-    let digits = digits.trim_end_matches('0');
-    let digits = if digits.is_empty() { "0" } else { digits };
-    let sign = if f < 0.0 { "-" } else { "" };
-    if !(-4..15).contains(&exp10) {
-        // Scientific: one digit, point, rest (at least one digit
-        // after the point), e, signed two-digit exponent.
-        let frac = if digits.len() > 1 { &digits[1..] } else { "0" };
-        return format!("{sign}{}.{frac}e{exp10:+03}", &digits[0..1]);
-    }
-    if exp10 >= 0 {
-        let split = (exp10 + 1) as usize;
-        if digits.len() <= split {
-            let int = format!("{digits:0<width$}", width = split);
-            return format!("{sign}{int}.0");
-        }
-        format!("{sign}{}.{}", &digits[..split], &digits[split..])
-    } else {
-        let zeros = (-exp10 - 1) as usize;
-        format!("{sign}0.{}{digits}", "0".repeat(zeros))
-    }
+    let mut t = hipp::arena::AVec::new();
+    hipp::record::render_real(f, &mut t);
+    String::from_utf8_lossy(t.as_slice()).into_owned()
 }
 
 /// SQL literal rendering for `.dump`: text quoted with `''`
@@ -433,7 +557,7 @@ where
                     if i > 0 {
                         let _ = out.write_all(b",");
                     }
-                    let _ = out.write_all(c);
+                    let _ = out.write_all(&shell_quote_name(c));
                 }
                 let _ = out.write_all(b") */\n");
             }

@@ -105,7 +105,6 @@ SELECT * FROM a JOIN b USING (id);
 SELECT * FROM a RIGHT JOIN b USING (id);
 SELECT * FROM a FULL JOIN b USING (id);
 SELECT id, a.id, b.id, x FROM a FULL JOIN b USING (id);
-SELECT a.*, '|', b.* FROM a FULL JOIN b USING (id);
 SELECT * FROM a FULL JOIN b USING (id) FULL JOIN c USING (id);
 SELECT * FROM a LEFT JOIN b USING (id) RIGHT JOIN c USING (id);
 SELECT id, typeof(id), count(*), total(x) FROM a NATURAL FULL JOIN b GROUP BY id ORDER BY id;
@@ -167,18 +166,68 @@ SELECT (SELECT y FROM b ORDER BY y LIMIT 2.5), EXISTS (SELECT 1 FROM b LIMIT 'x'
 fn cli_v16_review_regressions_byte_identical() {
     byte_identical("review", REVIEW);
     // The views' derived column lists, as `.schema` prints them
-    // (each NATURAL / USING column once, duplicates `id:1`).
+    // (each NATURAL / USING column once, duplicates `id:1` —
+    // quoted, as the pin quotes a non-identifier name).
     let a = temp_db("review-schema-hipp");
     let b = temp_db("review-schema-ora");
     let input = format!("{REVIEW}.schema\n");
     let got = run_stdin(&hipp_bin(), &a, &input);
     assert_eq!(got, run_stdin(&oracle(), &b, &input));
-    assert!(String::from_utf8_lossy(&got).contains("/* v4(id,x,id:1,y) */"));
+    assert!(String::from_utf8_lossy(&got).contains("/* v4(id,x,\"id:1\",y) */"));
 }
 
 #[test]
 fn cli_v16_joins_byte_identical() {
     byte_identical("joins", JOINS);
+}
+
+fn oracle_is_pinned() -> bool {
+    Command::new(oracle())
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.stdout.starts_with(b"3.54.1 "))
+}
+
+/// `q.*` reads `q`'s own columns, also left of a RIGHT / FULL join
+/// (CI against the 3.54.1 pin, `tests/query_shape_v16.rs`; the
+/// 3.53 stand-in read the joined USING value). Byte-identical to
+/// the live oracle when it is the pin; otherwise against output
+/// DERIVED from that rule (not recorded from CI — CI's live run
+/// confirms it).
+#[test]
+fn cli_v16_qualified_star_reads_own_columns() {
+    let batch = "\
+CREATE TABLE a(id, x REAL, k);
+CREATE TABLE b(k, id, y TEXT);
+INSERT INTO a VALUES(1, 1.5, 10), (2, 2.0, 20), (3, -0.25, 30), (NULL, 1e100, 40), ('2', 7, 50);
+INSERT INTO b VALUES(10, 1, 'b1'), (20, 2.0, 'b2'), (99, 4, 'b4'), (40, NULL, 'bn'), (50, '2', 'bs');
+SELECT a.*, '|', b.* FROM a FULL JOIN b USING (id);
+SELECT b.*, '|', a.* FROM b RIGHT JOIN a USING (id);
+";
+    if oracle_is_pinned() {
+        byte_identical("qstar", batch);
+        return;
+    }
+    let expected = "\
+1|1.5|10|||10|1|b1
+2|2.0|20|||20|2.0|b2
+3|-0.25|30|||||
+|1.0e+100|40|||||
+2|7.0|50|||50|2|bs
+|||||99|4|b4
+|||||40||bn
+10|1|b1|||1|1.5|10
+20|2.0|b2|||2|2.0|20
+50|2|bs|||2|7.0|50
+|||||3|-0.25|30
+||||||1.0e+100|40
+";
+    let a = temp_db("qstar-hipp");
+    assert_eq!(
+        String::from_utf8_lossy(&run(&hipp_bin(), &a, batch)),
+        expected
+    );
+    assert_eq!(run(&oracle(), &a, "PRAGMA integrity_check;"), b"ok\n");
 }
 
 #[test]

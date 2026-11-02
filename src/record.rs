@@ -487,16 +487,23 @@ pub fn affinity_of(decl: &[u8]) -> Affinity {
 }
 
 /// Render a real the way SQLite renders it for TEXT conversion
-/// (`||`, CAST AS TEXT, TEXT affinity), as the pin does: 15
-/// significant digits when they read back (through the pin's own
-/// text-to-real conversion, `lexer::parse_real`) as the same
-/// value, else 17; trailing zeros dropped; laid out as `%!.17g` —
-/// fixed notation for decimal exponents -4 ..= 16 with `.0` kept
-/// on integral values, else `d.ddde±XX` (v0.16: 1e20 used to
-/// render as `100000000000000000000`, 1e-5 as `0.00001` and
-/// 5e-324 as forty zeros). `-0.0` is `0.0`, infinities `Inf` /
-/// `-Inf`. The 17th digit is correctly rounded here; the pin's
-/// digit generator can differ in it (an honest gap).
+/// (`||`, CAST AS TEXT, TEXT affinity, and the CLI's list mode,
+/// which prints a REAL exactly as this conversion does), bit for
+/// bit as the pin. Fitted clean-room to the pin's output (v0.16,
+/// STATUS.md "CI vs the real pin"): the pin's approximate 18 or
+/// 19 digits `d` (`lexer::pin_digits`), then the first of
+///
+/// 1. the first 13 digits, truncated, when they read back as `r`
+///    and digits 14..=16 are `000` or the digits needed a downward
+///    decimal scale (`r` about 1e17 or more);
+/// 2. when digits 15 and 16 are `99`, the 14-digit rounding (half
+///    up) when it reads back as `r`;
+/// 3. the 17-digit rounding (half up: double rounding from `d`).
+///
+/// Trailing zeros dropped; laid out as `%!.17g`: fixed notation
+/// for decimal exponents -4 ..= 16 with `.0` kept on integral
+/// values, else `d.ddde±XX`. `-0.0` is `0.0`, infinities `Inf` /
+/// `-Inf`.
 #[inline(never)]
 pub fn render_real(r: f64, out: &mut AVec<u8>) {
     if r < 0.0 {
@@ -511,53 +518,40 @@ pub fn render_real(r: f64, out: &mut AVec<u8>) {
         out.extend_from_slice(b"0.0");
         return;
     }
-    // 15 digits when they read back as `r`, else 17.
-    let mut digits = [b'0'; 17];
-    let mut nd = 0usize;
-    let mut exp = 0i32;
-    for n in [15u32, 17] {
-        let (mut d, e) = crate::sql::lexer::real_digits(r, n);
-        exp = e;
-        nd = n as usize;
-        for k in (0..nd).rev() {
-            if let Some(c) = digits.get_mut(k) {
-                *c = b'0' + (d % 10) as u8;
-            }
-            d /= 10;
-        }
-        // `ddd...de<exp - n + 1>` for the round-trip check.
-        let mut t = [0u8; 24];
-        let (head, tail) = t.split_at_mut(nd);
-        head.copy_from_slice(digits.get(..nd).unwrap_or(&[]));
-        let mut x = (e - n as i32 + 1).unsigned_abs();
-        let mut len = nd;
-        if let [ec, sc, ..] = tail {
-            *ec = b'e';
-            *sc = if e - (n as i32) + 1 < 0 { b'-' } else { b'+' };
-            len += 2;
-        }
-        let mut j = t.len();
-        loop {
-            j -= 1;
-            if let Some(c) = t.get_mut(j) {
-                *c = b'0' + (x % 10) as u8;
-            }
-            x /= 10;
-            if x == 0 {
-                break;
-            }
-        }
-        let mut txt = AVec::new();
-        txt.extend_from_slice(t.get(..len).unwrap_or(&[]));
-        txt.extend_from_slice(t.get(j..).unwrap_or(&[]));
-        if n == 17 || crate::sql::lexer::parse_real(txt.as_slice()) == Some(r) {
-            break;
-        }
+    let (d, scale) = crate::sql::lexer::pin_digits(r);
+    let p = |k: u32| 10u64.pow(k);
+    // 18 or 19 digits.
+    let l: u32 = if d >= p(18) { 19 } else { 18 };
+    // Decimal exponent of d's first digit.
+    let e10 = l as i32 - 1 - scale;
+    let lead16 = d / p(l - 16);
+    let c13 = d / p(l - 13);
+    let c14 = (d + 5 * p(l - 15)) / p(l - 14);
+    let (c, n) = if (scale < 0 || lead16 % 1000 == 0) && reads_back(c13, e10 - 12, r) {
+        (c13, 13)
+    } else if lead16 % 100 == 99 && reads_back(c14, e10 - 13, r) {
+        (c14, 14)
+    } else {
+        ((d + 5 * p(l - 18)) / p(l - 17), 17)
+    };
+    let mut nd = 1usize;
+    while nd < 20 && c >= p(nd as u32) {
+        nd += 1;
     }
-    while nd > 1 && digits.get(nd - 1) == Some(&b'0') {
+    let mut dig = [0u8; 20];
+    let mut x = c;
+    for k in (0..nd).rev() {
+        if let Some(slot) = dig.get_mut(k) {
+            *slot = b'0' + (x % 10) as u8;
+        }
+        x /= 10;
+    }
+    // A rounding carry adds a digit.
+    let exp = e10 + nd as i32 - n;
+    while nd > 1 && dig.get(nd - 1) == Some(&b'0') {
         nd -= 1;
     }
-    let digits = digits.get(..nd).unwrap_or(&[]);
+    let digits = dig.get(..nd).unwrap_or(&[]);
     // Fixed: the integer part (at least `0`), `.`, the fraction
     // (at least `0`). Exponential: one digit, `.`, the rest (at
     // least `0`), `e`, the signed exponent (at least two digits).
@@ -593,6 +587,12 @@ pub fn render_real(r: f64, out: &mut AVec<u8>) {
         out.push(b'0' + (e / 10 % 10) as u8);
         out.push(b'0' + (e % 10) as u8);
     }
+}
+
+/// Whether `c * 10^x` reads back (correctly rounded, like the
+/// pin's own text-to-real conversion) as `r`.
+fn reads_back(c: u64, x: i32, r: f64) -> bool {
+    crate::sql::lexer::int_pow10_to_f64(c, i64::from(x)) == r
 }
 
 /// `f64::fract`/`abs` are not in `core`; spell the two checks we need.
@@ -735,6 +735,35 @@ pub fn apply_affinity(v: OwnedValue, aff: Affinity) -> OwnedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pin's REAL -> TEXT strings (CI's 3.54.1 run and the
+    /// fitted corpus; `tests/real_text_v16.rs` checks millions
+    /// against the oracle). Here so miri walks every branch.
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn render_real_pin_strings() {
+        for (v, want) in [
+            (1e15, "1000000000000000.0"),
+            (9223372036854775808.0, "9.2233720368547758e+18"),
+            (0.000123456789012345, "0.00012345678901234499"),
+            (574.423710258671, "574.42371025867101"),
+            (-589569.9865969187, "-589569.98659691867"),
+            (-3.521289658049935e18, "-3.5212896580499349e+18"),
+            (8.5281530614695, "8.5281530614695"),
+            (9.5e21, "9.5e+21"),
+            (9.4174e-10, "9.417400000000001e-10"),
+            (1e-14, "1.0e-14"),
+            (0.1, "0.1"),
+            (5e-324, "4.9406564584124654e-324"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"),
+            (-0.0, "0.0"),
+            (f64::NEG_INFINITY, "-Inf"),
+        ] {
+            let mut out = AVec::new();
+            render_real(v, &mut out);
+            assert_eq!(out.as_slice(), want.as_bytes(), "{v:?}");
+        }
+    }
 
     #[test]
     fn varint_roundtrip() {

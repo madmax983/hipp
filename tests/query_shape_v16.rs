@@ -162,6 +162,44 @@ impl Twins {
         }
     }
 
+    /// hipp's rows for `sql` (it must run).
+    fn hipp_rows(&self, sql: &str) -> Vec<String> {
+        block_on(async {
+            let mut db = open(&self.hipp).await;
+            try_collect(&mut db, sql).await
+        })
+        .unwrap_or_else(|e| panic!("hipp refused {sql}: {e:?}"))
+    }
+
+    /// A statement whose answer changed between the 3.53 stand-in
+    /// and the 3.54.1 pin: against the live oracle when it is the
+    /// pin, else against `golden` — the rows CI's real 3.54.1 pin
+    /// printed (recorded from the CI run, not derived).
+    fn pin(&self, sql: &str, golden: &[&str]) {
+        if common::oracle_is_pinned() {
+            self.same(sql);
+        } else {
+            assert_eq!(self.hipp_rows(sql), golden, "vs the CI pin golden: {sql}");
+        }
+    }
+
+    /// Like `pin`, for a neighbour of a CI-evidenced change that CI
+    /// has not shown yet: against the live oracle when it is the
+    /// pin, else against `expected` — rows DERIVED from the
+    /// evidenced rule (STATUS.md, v0.16 "CI vs the real pin"), not
+    /// recorded; CI's live run is what confirms them.
+    fn pin_inferred(&self, sql: &str, expected: &[&str]) {
+        if common::oracle_is_pinned() {
+            self.same(sql);
+        } else {
+            assert_eq!(
+                self.hipp_rows(sql),
+                expected,
+                "vs the inferred pin rows: {sql}"
+            );
+        }
+    }
+
     /// Both engines refuse `sql`; hipp with `kind`.
     fn refuse(&self, sql: &str, kind: SchemaKind) {
         match self.same(sql) {
@@ -369,11 +407,8 @@ fn natural_and_using_rows_and_star_expansion() {
         "SELECT id, a.id, b.id FROM a LEFT JOIN b USING (id)",
         "SELECT id, a.id, b.id FROM a RIGHT JOIN b USING (id)",
         "SELECT id, a.id, b.id FROM a FULL JOIN b USING (id)",
-        // q.* of a source left of a FULL join reads the joined
-        // value; the right side's q.* is plain.
-        "SELECT a.* FROM a FULL JOIN b USING (id)",
+        // The right side's q.* is plain (3.53 and 3.54 agree).
         "SELECT b.* FROM a FULL JOIN b USING (id)",
-        "SELECT a.*, b.* FROM a NATURAL RIGHT JOIN b",
         // Multi-way chains.
         "SELECT * FROM a JOIN b USING (id) JOIN c USING (id)",
         "SELECT * FROM a NATURAL JOIN c NATURAL JOIN b",
@@ -398,6 +433,38 @@ fn natural_and_using_rows_and_star_expansion() {
         "SELECT (SELECT count(*) FROM a JOIN b USING (id)), (SELECT group_concat(id) FROM a FULL JOIN b USING (id))",
         "SELECT count(*), count(a.id), count(b.id), count(id) FROM a FULL JOIN b USING (id)",
     ]);
+    // q.* reads q's own columns, also left of a RIGHT / FULL join
+    // (3.54.1; the 3.53 stand-in read the joined value). Recorded
+    // from CI's pin run:
+    tw.pin(
+        "SELECT a.* FROM a FULL JOIN b USING (id)",
+        &["1|a1|10", "2|a2|20", "3|a3|30", "|an|40", "||", "||"],
+    );
+    // Derived from that rule (CI's live run confirms):
+    tw.pin_inferred(
+        "SELECT a.* FROM a RIGHT JOIN b USING (id)",
+        &["1|a1|10", "2|a2|20", "||", "||"],
+    );
+    tw.pin_inferred(
+        "SELECT a.*, b.* FROM a NATURAL RIGHT JOIN b",
+        &[
+            "1|a1|10|10|1|b1",
+            "2|a2|20|20|2|b2",
+            "|||99|4|b4",
+            "|||40||bn",
+        ],
+    );
+    tw.pin_inferred(
+        "SELECT a.*, '|', b.* FROM a NATURAL FULL JOIN b",
+        &[
+            "1|a1|10|||10|1|b1",
+            "2|a2|20|||20|2|b2",
+            "3|a3|30|||||",
+            "|an|40|||||",
+            "|||||99|4|b4",
+            "|||||40||bn",
+        ],
+    );
 }
 
 #[test]
@@ -773,7 +840,6 @@ fn limit_offset_expressions() {
         "CASE WHEN 1 THEN 2 END",
         "(SELECT 2)",
         "(VALUES(2))",
-        "(SELECT 2 UNION SELECT 1)",
         "(SELECT a FROM t)",
         "(SELECT max(a) FROM t)",
         "(SELECT count(*) FROM t) - 3",
@@ -795,6 +861,32 @@ fn limit_offset_expressions() {
     ] {
         tw.same(&format!("SELECT a FROM t LIMIT {l}"));
     }
+    // A UNION with a LIMIT of exactly 1 and no ORDER BY / OFFSET
+    // takes its first row in core order on the pin (3.54.0's
+    // "UNION queries with a LIMIT of exactly 1"); the scalar
+    // subquery's implicit LIMIT 1 counts. Recorded from CI's pin
+    // run (the 3.53 stand-in gives 1 row):
+    tw.pin(
+        "SELECT a FROM t LIMIT (SELECT 2 UNION SELECT 1)",
+        &["1", "2"],
+    );
+    // Derived from that rule (CI's live run confirms): a written
+    // LIMIT 1, a three-core chain, an empty first core, EXISTS
+    // (unchanged value), and the shapes that keep the sorted
+    // first row (ORDER BY, OFFSET, a mixed chain, LIMIT 2).
+    tw.pin_inferred("SELECT 2 UNION SELECT 1 LIMIT 1", &["2"]);
+    tw.pin_inferred("SELECT 3 UNION SELECT 2 UNION SELECT 1 LIMIT 1", &["3"]);
+    tw.pin_inferred(
+        "SELECT (SELECT a FROM t WHERE a > 9 UNION SELECT 7 UNION SELECT 5)",
+        &["7"],
+    );
+    tw.pin_inferred("SELECT EXISTS (SELECT 2 UNION SELECT 1)", &["1"]);
+    tw.all(&[
+        "SELECT 2 UNION SELECT 1 ORDER BY 1 LIMIT 1",
+        "SELECT 3 UNION SELECT 2 UNION SELECT 1 LIMIT 1 OFFSET 1",
+        "SELECT 2 UNION SELECT 1 LIMIT 2",
+        "SELECT a FROM t UNION SELECT 0 LIMIT 3",
+    ]);
     // Not losslessly an integer: the pin's datatype mismatch,
     // raised even when no row is produced.
     for l in [

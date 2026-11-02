@@ -6732,12 +6732,21 @@ impl<'c, S: Storage> Statement<'c, S> {
             tails.push((*op, self.exec_qp_core_values(tail).await?));
             cores.push(core_colls(tail.items.as_slice(), tail.values.as_slice()));
         }
-        let rows = run_compound(
-            head,
-            tails.as_slice(),
-            cores.as_slice(),
+        let rows = if union_first_row(
+            &qp.limit,
+            &qp.offset,
             qp.comp_order.as_slice(),
-        );
+            tails.as_slice(),
+        ) {
+            first_core_row(head, tails.as_slice())
+        } else {
+            run_compound(
+                head,
+                tails.as_slice(),
+                cores.as_slice(),
+                qp.comp_order.as_slice(),
+            )
+        };
         let rows = apply_window(rows, window);
         let mut ids: AVec<Option<i64>> = AVec::new();
         for _ in rows.iter() {
@@ -7191,12 +7200,21 @@ impl<'c, S: Storage> Statement<'c, S> {
                 tails.push((*op, right));
                 cores.push(core_colls(tail.items.as_slice(), tail.values.as_slice()));
             }
-            let rows = run_compound(
-                head,
-                tails.as_slice(),
-                cores.as_slice(),
+            let rows = if union_first_row(
+                &plan.limit,
+                &plan.offset,
                 plan.comp_order.as_slice(),
-            );
+                tails.as_slice(),
+            ) {
+                first_core_row(head, tails.as_slice())
+            } else {
+                run_compound(
+                    head,
+                    tails.as_slice(),
+                    cores.as_slice(),
+                    plan.comp_order.as_slice(),
+                )
+            };
             return Ok(apply_window(rows, window));
         }
         produced.as_mut_slice().sort_by(|x, y| {
@@ -8339,6 +8357,52 @@ fn run_compound(
     rows.as_mut_slice()
         .sort_by(|a, b| compound_order_cmp(a, b, order));
     rows
+}
+
+/// The pin's UNION-with-LIMIT-1 shortcut (3.54.0: "UNION queries
+/// with a LIMIT of exactly 1 are now handled faster"; ungated, a
+/// silent wrong answer on the claimed v0.9 compound path): a
+/// compound whose every operator is UNION, with no ORDER BY, no
+/// OFFSET and a LIMIT that is the integer literal 1 — written, or
+/// the implicit one of a scalar / EXISTS subquery without its own
+/// LIMIT (`query::first_row_limit`) — yields its first row in
+/// left-to-right core order, not the first of the sorted,
+/// deduplicated result. CI evidence: `LIMIT (SELECT 2 UNION SELECT
+/// 1)` is 2 on the pin. Inferred (no CI evidence yet): the written
+/// `LIMIT 1` case, and that mixed operator chains, `LIMIT +1`,
+/// bound limits and a subquery's own `LIMIT X` (rewritten to
+/// `X <> 0`) keep the sorted answer.
+#[cfg(feature = "v09")]
+fn union_first_row(
+    limit: &Option<RExpr>,
+    offset: &Option<RExpr>,
+    order: &[(usize, crate::sql::SortOrder)],
+    tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
+) -> bool {
+    matches!(limit, Some(RExpr::Literal(OwnedValue::Integer(1))))
+        && offset.is_none()
+        && order.is_empty()
+        && tails
+            .iter()
+            .all(|(op, _)| *op == crate::sql::CompoundOp::Union)
+}
+
+/// The first row of the first core that has one (see
+/// `union_first_row`).
+#[cfg(feature = "v09")]
+fn first_core_row(
+    head: AVec<AVec<OwnedValue>>,
+    tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
+) -> AVec<AVec<OwnedValue>> {
+    let mut out = AVec::new();
+    let first = head
+        .as_slice()
+        .first()
+        .or_else(|| tails.iter().find_map(|(_, rows)| rows.as_slice().first()));
+    if let Some(r) = first {
+        out.push(r.clone());
+    }
+    out
 }
 
 /// A row window `(skip, take)` from `limit_window` over

@@ -331,84 +331,93 @@ pub fn parse_real(text: &[u8]) -> Option<f64> {
     if dropped > 0 {
         exp10 += dropped as i64;
     }
-    let digits = &digits[..kept];
+    Some(int_pow10_to_f64(acc, exp10))
+}
+
+/// The f64 nearest to `c * 10^x` (`c > 0`), ties to even — the
+/// conversion `parse_real` ends in (`acc` holds the kept digits),
+/// shared with `record::render_real`'s read-back test (v0.16).
+pub fn int_pow10_to_f64(c: u64, x: i64) -> f64 {
     // Decimal magnitude: the value lies in [10^(mag-1), 10^mag).
     // Far outside the f64 range the answer needs no arithmetic:
     // >= 10^310 is past the overflow midpoint, and < 10^-324 is
     // below half of the smallest subnormal (2.47e-324).
-    let mag = exp10 + digits.len() as i64;
+    let mut mag = x;
+    let mut t = c;
+    while t > 0 {
+        mag += 1;
+        t /= 10;
+    }
     if mag > 310 {
-        return Some(f64::INFINITY);
+        return f64::INFINITY;
     }
     if mag < -323 {
-        return Some(0.0);
+        return 0.0;
     }
     // Exact rational P / Q equal to the literal.
-    let mut p: BigUint = Vec::new();
-    for &d in digits {
-        big_mul_small(&mut p, 10);
-        big_add_small(&mut p, u32::from(d));
-    }
-    let mut q: BigUint = Vec::new();
-    q.push(1);
-    if exp10 >= 0 {
-        big_mul_pow10(&mut p, exp10 as usize);
+    let mut p: BigUint = alloc::vec![c as u32, (c >> 32) as u32];
+    big_trim(&mut p);
+    let mut q: BigUint = alloc::vec![1];
+    if x >= 0 {
+        big_mul_pow10(&mut p, x as usize);
     } else {
-        big_mul_pow10(&mut q, (-exp10) as usize);
+        big_mul_pow10(&mut q, x.unsigned_abs() as usize);
     }
-    Some(big_rational_to_f64(&p, &q))
+    big_rational_to_f64(&p, &q)
 }
 
-/// The `n` (1 ..= 17) significant decimal digits of the finite
-/// `r > 0`, correctly rounded (ties to even, as C's `printf`
-/// rounds), as an integer in `[10^(n-1), 10^n)`, with the decimal
-/// exponent of its first digit (v0.16, for `record::render_real`:
-/// exact big-integer arithmetic, so the build needs none of
-/// `core::fmt`'s float formatting).
-pub fn real_digits(r: f64, n: u32) -> (u64, i32) {
+/// The pin's internal decimal digits of the finite `r > 0`
+/// (v0.16, for `record::render_real`), as `(d, n)` with `d`, an
+/// 18- or 19-digit integer, about `r * 10^n`. Fitted clean-room
+/// to the pin's observable output (`printf('%!.26g', r)` shows
+/// `d` with its trailing zeros dropped; matched on 120 000 random
+/// doubles, then through `render_real` on millions): with
+/// `r = m * 2^e` (53-bit `m`) and `p = floor(log10 2^(e+52))`,
+/// `n = 17 - p` and `d = round_half_up(r * T)` where `T` is `10^n`
+/// truncated to a 64-bit mantissa (exact for `0 <= n <= 27`, a
+/// little low otherwise). Not correctly rounded: the truncation
+/// shows in the last digit.
+pub fn pin_digits(r: f64) -> (u64, i32) {
     let bits = r.to_bits();
-    let be = ((bits >> 52) & 0x7ff) as i64;
+    let be = ((bits >> 52) & 0x7ff) as i32;
     let frac = bits & ((1u64 << 52) - 1);
-    let (m, e2) = if be == 0 {
-        (frac, -1074i64)
+    let (m, e) = if be == 0 {
+        // Subnormal: normalise so bit 52 is set.
+        let sh = frac.leading_zeros().saturating_sub(11);
+        (frac << sh, -1074 - sh as i32)
     } else {
         (frac | (1u64 << 52), be - 1075)
     };
-    let n = n.clamp(1, 17);
-    let lo = 10u64.pow(n - 1);
-    let hi = lo.saturating_mul(10);
-    // floor(log10 r) to within one: log2 r is about e2 + bits(m) - 1.
-    let bl = i64::from(64 - m.leading_zeros());
-    // (x * 78913) >> 18 is floor(x * log10(2)) for |x| < 2^16,
-    // in integer arithmetic (no soft-float multiply on FPU-less
-    // targets).
-    let mut exp10 = ((e2 + bl - 1) * 78913) >> 18;
-    let mut d = 0u64;
-    for _ in 0..4 {
-        let k = i64::from(n) - 1 - exp10;
-        let mut num: BigUint = alloc::vec![m as u32, (m >> 32) as u32];
-        big_trim(&mut num);
-        let mut den: BigUint = alloc::vec![1];
-        if k >= 0 {
-            big_mul_pow10(&mut num, k as usize);
-        } else {
-            big_mul_pow10(&mut den, k.unsigned_abs() as usize);
-        }
-        if e2 >= 0 {
-            num = big_shl(&num, e2 as usize);
-        } else {
-            den = big_shl(&den, e2.unsigned_abs() as usize);
-        }
-        d = big_rounded_div(&num, &den);
-        if d >= hi {
-            exp10 += 1;
-        } else if d < lo {
-            exp10 -= 1;
-        } else {
-            break;
-        }
-    }
-    (d, exp10 as i32)
+    // floor(x * log10 2), exact for |x| < 2^16 (no float math).
+    let n = 17 - (((e + 52) * 78913) >> 18);
+    let (t, s) = pow10_mantissa(n);
+    // d = m * t * 2^(e + s), rounded half up. The product is
+    // below 2^117 and the shift between 54 and 61, so the low 53
+    // bits only ever fall away: shift them off first and round in
+    // 64 bits (no variable-width 128-bit shift).
+    let y = ((u128::from(m) * u128::from(t)) >> 53) as u64;
+    let sh = (-(e + s)).clamp(54, 116) as u32 - 53;
+    let d = (y >> (sh - 1).min(63)).saturating_add(1) >> 1;
+    (d, n)
+}
+
+/// `10^n` as `(t, s)`: `t` in `[2^63, 2^64)`, the largest with
+/// `t * 2^s <= 10^n` (a truncated 64-bit mantissa).
+fn pow10_mantissa(n: i32) -> (u64, i32) {
+    let mut p: BigUint = alloc::vec![1];
+    big_mul_pow10(&mut p, n.unsigned_abs() as usize);
+    let bl = big_bit_len(&p) as i32;
+    let one: BigUint = alloc::vec![1];
+    // 10^n = (a / b) * 2^s with a / b in [2^63, 2^64): for n >= 0
+    // a = 10^n * 2^64, b = 2^bl; else a = 2^(bl+63), b = 10^-n.
+    let neg = n < 0;
+    let (top, bot) = if neg { (&one, &p) } else { (&p, &one) };
+    let a = big_shl(top, if neg { bl + 63 } else { 64 } as usize);
+    let b = big_shl(bot, if neg { 0 } else { bl } as usize);
+    let s = if neg { -(bl + 63) } else { bl - 64 };
+    let (q, _) = big_div_rem(&a, &b);
+    let limb = |i: usize| u64::from(q.get(i).copied().unwrap_or(0));
+    (limb(0) | (limb(1) << 32), s)
 }
 
 /// `parse_real` for text that may carry one leading `+`/`-`
@@ -442,20 +451,6 @@ fn big_mul_small(v: &mut BigUint, m: u32) {
     while carry > 0 {
         v.push(carry as u32);
         carry >>= 32;
-    }
-}
-
-fn big_add_small(v: &mut BigUint, a: u32) {
-    let mut carry = u64::from(a);
-    let mut i = 0usize;
-    while carry > 0 {
-        if i == v.len() {
-            v.push(0);
-        }
-        let cur = u64::from(v[i]) + carry;
-        v[i] = cur as u32;
-        carry = cur >> 32;
-        i += 1;
     }
 }
 
@@ -532,7 +527,8 @@ fn big_sub(a: &mut BigUint, b: &BigUint) {
 
 /// Floor division with remainder, by binary long division.
 /// In this module the quotient is always mantissa-sized
-/// (~53 bits), so the loop runs ~54 compare/subtract rounds.
+/// (~53 to 64 bits), so the loop runs at most ~65
+/// compare/subtract rounds.
 fn big_div_rem(num: &BigUint, den: &BigUint) -> (BigUint, BigUint) {
     use core::cmp::Ordering;
     if big_cmp(num, den) == Ordering::Less {

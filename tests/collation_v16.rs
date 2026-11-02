@@ -10,8 +10,9 @@
 //!   operand's column collation, else the right's, else BINARY
 //!   (`=`, `<`, IS, BETWEEN, CASE, joins' ON / USING, correlated
 //!   subqueries). An IN list compares by its left operand's
-//!   collation only (a single constant item follows the binary
-//!   rule: the pin rewrites it to `=`); `x IN (SELECT ...)` by
+//!   collation only, a single item with its own COLLATE included
+//!   (CI against the real 3.54.1 pin; the 3.53 stand-in rewrites
+//!   one constant item to `=` and follows the binary rule); `x IN (SELECT ...)` by
 //!   the binary rule against the subquery's — rightmost core's —
 //!   item. min / max / nullif use their first argument with a
 //!   collation; ORDER BY, GROUP BY, DISTINCT, count(DISTINCT),
@@ -155,6 +156,23 @@ impl Twins {
         for sql in sqls {
             self.same(sql);
         }
+    }
+
+    /// A statement whose answer changed between the 3.53 stand-in
+    /// and the 3.54.1 pin: against the live oracle when it is the
+    /// pin, else against `golden` — the rows CI's real 3.54.1 pin
+    /// printed (recorded from the CI run, not derived).
+    fn pin(&self, sql: &str, golden: &[&str]) {
+        if common::oracle_is_pinned() {
+            self.same(sql);
+            return;
+        }
+        let got = block_on(async {
+            let mut db = open(&self.hipp).await;
+            try_collect(&mut db, sql).await
+        })
+        .unwrap_or_else(|e| panic!("hipp refused {sql}: {e:?}"));
+        assert_eq!(got, golden, "statement (vs the CI pin golden): {sql}");
     }
 
     /// Both engines refuse `sql`; hipp with schema error `kind`.
@@ -854,12 +872,6 @@ fn collate_operator_wins_comparisons() {
         // An explicit collation inside an operand lends it.
         "SELECT ('a' COLLATE NOCASE) || 'x' = 'AX', upper('a' COLLATE NOCASE) = 'a', \
          ('a' COLLATE RTRIM) COLLATE NOCASE = 'A ', 'a' COLLATE RTRIM = ('A ' COLLATE NOCASE)",
-        "SELECT 'A' IN ('a' COLLATE NOCASE), 'A' COLLATE NOCASE IN ('a'), \
-         'A' IN ('a' COLLATE NOCASE, 'b', 'c'), CASE 'A' WHEN 'a' COLLATE NOCASE THEN 1 ELSE 0 END, \
-         'A' BETWEEN 'a' COLLATE NOCASE AND 'a', nullif('A', 'a' COLLATE NOCASE), \
-         coalesce('A' COLLATE NOCASE, 1) = 'a', ('A' COLLATE NOCASE) IS 'a', \
-         iif(1, 'A' COLLATE NOCASE, 'b') = 'a', (SELECT 'A' COLLATE NOCASE) = 'a', \
-         -('1' COLLATE NOCASE), typeof('a' COLLATE BINARY)",
         "SELECT 'a' COLLATE nOcAsE = 'A', 'a' COLLATE \"rtrim\" = 'a ', 'a' COLLATE 'BINARY' = 'A'",
         // Over columns: the explicit side beats a column's.
         "SELECT id FROM t WHERE n COLLATE BINARY = 'ABC' ORDER BY id",
@@ -887,6 +899,18 @@ fn collate_operator_wins_comparisons() {
         "SELECT n FROM t UNION SELECT b FROM t UNION ALL SELECT 'q' ORDER BY 1 COLLATE BINARY",
         "SELECT b COLLATE NOCASE FROM t UNION SELECT n FROM t",
     ]);
+    // An IN list compares by its left operand's collation only,
+    // even for one item with an explicit COLLATE (3.54.1: 0; the
+    // 3.53 stand-in rewrote it to `=` and gave 1).
+    tw.pin(
+        "SELECT 'A' IN ('a' COLLATE NOCASE), 'A' COLLATE NOCASE IN ('a'), \
+         'A' IN ('a' COLLATE NOCASE, 'b', 'c'), CASE 'A' WHEN 'a' COLLATE NOCASE THEN 1 ELSE 0 END, \
+         'A' BETWEEN 'a' COLLATE NOCASE AND 'a', nullif('A', 'a' COLLATE NOCASE), \
+         coalesce('A' COLLATE NOCASE, 1) = 'a', ('A' COLLATE NOCASE) IS 'a', \
+         iif(1, 'A' COLLATE NOCASE, 'b') = 'a', (SELECT 'A' COLLATE NOCASE) = 'a', \
+         -('1' COLLATE NOCASE), typeof('a' COLLATE BINARY)",
+        &["0|1|0|1|1||1|1|1|0|-1|text"],
+    );
     tw.refuse(
         "SELECT n FROM t ORDER BY n COLLATE bogus",
         SchemaKind::UnknownCollation,

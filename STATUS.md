@@ -12,6 +12,87 @@ new surface behind the `v16` rung or a leaf feature; the tiny
 profile never grows). Each unit of the push records itself
 below.
 
+### CI vs the real pin (2026-11-02)
+
+The local oracle was a stand-in (a CLI list-mode shim over
+Python's bundled SQLite **3.53.1**); CI's first run against the
+real **3.54.1** pin failed wave 1's new tests on five
+behaviours. What CI showed, what changed, and what is inferred:
+
+- **REAL → text** (ungated; tiny path). CI showed the pin's CLI
+  list mode prints a REAL exactly as its core REAL → TEXT
+  conversion (CAST AS TEXT) does, and 3.53's conversion gives
+  the same strings. hipp-cli's `fmt_real` and the test helper
+  in `tests/params_v16.rs` had their own `%!.15g`; both now call
+  `record::render_real`, the one source of truth. That function
+  was correctly rounded and so differed from the pin on about 9%
+  of random doubles (`574.423710258671` is `574.42371025867101`
+  there). It is now fitted **clean-room from oracle output
+  only** (no SQLite source): `lexer::pin_digits` reproduces the
+  pin's 18 or 19 internal digits (shown by `printf('%!.26g')`):
+  scale by `10^(17 - floor(log10 2^e))` with that power of ten
+  truncated to a 64-bit mantissa, round half up. Matched on
+  120 000 random doubles before any rendering was fitted. The
+  short-or-17 choice was fitted next: 13 truncated digits when
+  they read back and digits 14..16 are `000` or the scale was
+  downward; else, when digits 15..16 are `99`, the 14-digit
+  rounding when it reads back; else 17 digits, half up from the
+  18/19 (a double rounding, as on the pin:
+  `-589569.98659691867`). Corpus: 4.2 M doubles through the
+  Python model and **2 M through hipp's SQL path, 0
+  mismatches** against the stand-in core (random bit patterns,
+  subnormals, 1–17-digit decimals and their neighbours, integers
+  near 2^53 / 2^63 / 10^k, powers of ten, halfway cases).
+  `tests/real_text_v16.rs` keeps 4 000 of them (scalable with
+  `HIPP_REAL_CORPUS`) plus the CI goldens. Inferred: that the
+  3.54.1 core equals the 3.53.1 core here (CI's strings all
+  agreed; the corpus runs live against the pin in CI). `parse_real`
+  and the read-back test now share `lexer::int_pow10_to_f64`,
+  which is why tiny got smaller (−48 B).
+- **IN-list collation** (ungated). `'A' IN ('a' COLLATE NOCASE)`
+  is 0 on the pin, 1 on 3.53 (which rewrote one constant item
+  to `x = +item`). An IN list now uses only its left operand's
+  collation, explicit or column. Inferred: a single item's
+  column collation is ignored too.
+- **UNION with LIMIT 1** (ungated, v0.9 compound path). CI:
+  `SELECT a FROM t LIMIT (SELECT 2 UNION SELECT 1)` keeps 2 rows
+  on the pin (the scalar subquery is 2, not the sorted 1). The
+  3.54.0 release notes say "UNION queries with a LIMIT of exactly
+  1 are now handled faster". hipp now takes the first row in
+  left-to-right core order when every operator is UNION, there
+  is no ORDER BY and no OFFSET, and the LIMIT is the integer
+  literal 1. A scalar or EXISTS subquery with no LIMIT of its
+  own now gets that literal (`query::first_row_limit`); EXISTS
+  values do not change. Pinned by CI: the scalar-subquery case.
+  Inferred, and checked live on CI by `pin_inferred`: the
+  written `LIMIT 1`; that mixed UNION / UNION ALL / EXCEPT
+  chains, `LIMIT +1`, bound limits and a subquery's own `LIMIT X`
+  (the pin's `X <> 0` rewrite) keep the sorted answer.
+- **`q.*` over RIGHT / FULL USING** (ungated). CI:
+  `SELECT a.* FROM a FULL JOIN b USING (id)` shows a NULL `id`
+  on the b-only rows, so `a.*` reads a's own columns. 3.53 read
+  the coalesced value. Qualified `q.*` now always expands to q's
+  own columns. Unqualified `*` and an unqualified `id` coalesce
+  as before (CI agreed on those). Inferred, and checked live on
+  CI: the RIGHT JOIN and NATURAL RIGHT / FULL forms.
+- **`.schema` view comment** (hipp-cli). The pin prints
+  `/* v(a,"+b",b,Q) */`. A column name now prints bare only if
+  it is a plain identifier (ASCII letter or `_`, then letters,
+  digits or `_`) and not an SQL keyword. Otherwise it is
+  double-quoted, with `"` doubled. Inferred: keyword quoting,
+  using SQLite's documented list of 147 keywords.
+
+Tests for the three engine behaviours that changed assert the
+pin's answer. Against the live oracle when it is the pin;
+otherwise against the CI-recorded goldens (`pin`), or, for the
+inferred neighbours, against rows derived from the evidenced
+rule (`pin_inferred`, labelled so). **Size:** tiny **75,960 B**
+(Δ **−48 B**, ratchet lowered); full **291,531 B** (Δ **+264 B**,
+ratchet raised to it: the UNION first-row rule, the
+`first_row_limit` literal, the reworked digits).
+Left open: round() still reads the exact decimal expansion
+rather than `pin_digits` (see the bound-parameters gaps).
+
 ### Joins, ordering and query-shape completion (2026-11-02)
 
 **Status:** implemented, differential-tested against the
@@ -41,9 +122,10 @@ other units).
   pin): `SELECT *` shows a join column once, at the left-most
   source; unqualified references follow the pin's
   `lookupName` (left-most side after INNER/LEFT, right side
-  after RIGHT, `coalesce(...)` after FULL); star expansion of
-  a source left of a RIGHT/FULL join reads the joined value
-  (even `a.*`); qualified `t.col` still reads its own side.
+  after RIGHT, `coalesce(...)` after FULL); unqualified `*`
+  over a source left of a RIGHT/FULL join reads the joined value
+  (`a.*` reads a's own columns on the 3.54.1 pin — see "CI vs
+  the real pin"); qualified `t.col` still reads its own side.
 - **ON clauses naming a later source:** an inner join's ON is
   hoisted into WHERE (hipp read a NULL slot and dropped every
   row); on an outer join, or anywhere once a RIGHT/FULL join
@@ -558,13 +640,8 @@ the planner and the async step state machines (~8 KB)).
   combination last in that index's (key, columns) order instead
   (`s = (1,1),(1,9),(1,3)`: pin 9, hipp 3; SQLite calls the
   choice arbitrary), so tests keep one matching row per target
-  or a cross join. REAL → TEXT digits are correctly rounded
-  where the pin's `sqlite3FpDecode` can differ in the 17th digit,
-  and the 15-or-17 choice uses hipp's model of the pin's text →
-  real conversion; on the 3.53.1 stand-in (whose conversion is
-  not the pin's, see `literal_bits_match_oracle_on_corpus`)
-  "random" doubles such as 664489.808985587 and 5e-324 render
-  differently, so the corpora use decimal-shaped values.
+  or a cross join. (REAL → TEXT digits: fixed bit-exact later
+  in v0.16, see "CI vs the real pin".)
   `-0x8000000000000000` is "hex literal too big" on the pin and
   a REAL in hipp. AUTOINCREMENT tables cannot be created (no
   `sqlite_sequence` upkeep), and hipp's INSERTs into a foreign
@@ -603,8 +680,10 @@ silent-wrong DIFF 1 → 0 (column COLLATE was the last).
   subqueries carry none, the rowid / IPK none. Applied to `=`
   `<` IS BETWEEN, CASE, joins' ON / USING / NATURAL, CHECK and
   generated-column expressions; an IN list compares (and, since
-  the review fixes, converts affinity) by its left operand only (a single constant item follows the binary rule:
-  the pin rewrites `x IN (c)` to `x = +c`); `x IN (SELECT ...)`
+  the review fixes, converts affinity) by its left operand only
+  (3.53 rewrote a single constant item to `x = +c` and so took
+  its COLLATE; the 3.54.1 pin does not — see "CI vs the real
+  pin"); `x IN (SELECT ...)`
   by the binary rule against the subquery's item — its
   *rightmost* core's for a compound (carried through
   substitution as an explicit `Collate`); min / max / nullif and
@@ -1102,12 +1181,10 @@ and REAL ties, byte-identical.
 - In a pre-`v16` build with the evaluator (`v04`..`v10`, not in
   `ci/feature-sets.txt`) LIMIT / OFFSET take only an integer
   literal, so a parameter there is a syntax error.
-- Found, not fixed (pre-existing, outside this unit): the pin
+- Found here, fixed since (see "CI vs the real pin"): the pin
   converts a REAL to TEXT with up to 17 digits of its own
   (inexact) decoding — `86255.9396259168 || ''` is
-  `86255.939625916799` there, hipp's exact rule gives the 15
-  digits back — so the corpora keep REALs to short decimal
-  expansions; and a -0.0 stored in a REAL column keeps its sign
+  `86255.939625916799` there. Still open: a -0.0 stored in a REAL column keeps its sign
   in hipp's record where the pin's reads back +0.0. Unordered
   results that the pin returns in index order (a `GLOB` prefix
   over a UNIQUE column) can differ in order, as before.

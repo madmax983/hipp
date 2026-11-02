@@ -178,34 +178,13 @@ fn inline(sql: &str, vals: &[B]) -> String {
     out
 }
 
-/// The CLI's list rendering of a REAL (`%!.15g`).
+/// The CLI's list rendering of a REAL: the core's REAL-to-text
+/// conversion (the pin's CLI prints exactly what CAST AS TEXT
+/// gives; one source of truth, `record::render_real`).
 fn fmt_real(f: f64) -> String {
-    if f == 0.0 {
-        // The pin's printf has no negative zero.
-        return "0.0".into();
-    }
-    if !f.is_finite() {
-        return if f > 0.0 { "Inf" } else { "-Inf" }.into();
-    }
-    let sci = format!("{:.14e}", f.abs());
-    let (mant, exp) = sci.split_once('e').expect("sci");
-    let exp10: i32 = exp.parse().expect("exp");
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
-    let digits = digits.trim_end_matches('0');
-    let digits = if digits.is_empty() { "0" } else { digits };
-    let sign = if f < 0.0 { "-" } else { "" };
-    if !(-4..15).contains(&exp10) {
-        let frac = if digits.len() > 1 { &digits[1..] } else { "0" };
-        return format!("{sign}{}.{frac}e{exp10:+03}", &digits[0..1]);
-    }
-    if exp10 >= 0 {
-        let split = (exp10 + 1) as usize;
-        if digits.len() <= split {
-            return format!("{sign}{digits:0<split$}.0");
-        }
-        return format!("{sign}{}.{}", &digits[..split], &digits[split..]);
-    }
-    format!("{sign}0.{}{digits}", "0".repeat((-exp10 - 1) as usize))
+    let mut t = hipp::arena::AVec::new();
+    hipp::record::render_real(f, &mut t);
+    String::from_utf8_lossy(t.as_slice()).into_owned()
 }
 
 /// The CLI's list rendering of one value (bytes: a blob need not
