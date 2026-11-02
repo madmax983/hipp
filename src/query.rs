@@ -111,6 +111,112 @@ pub enum ScalarFn {
     /// `SchemaKind::RowValueMisused`.
     #[cfg(feature = "v16")]
     Vector,
+    /// `printf()` / `format()` (v0.16, `v16`): `func::printf`.
+    #[cfg(feature = "v16")]
+    Printf,
+    /// `quote(X)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Quote,
+    /// `char(X, ...)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Char,
+    /// `unicode(X)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Unicode,
+    /// `zeroblob(N)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Zeroblob,
+    /// `randomblob(N)` (v0.16, `v16`): reads the connection's
+    /// random stream (`Env::prng`).
+    #[cfg(feature = "v16")]
+    Randomblob,
+    /// `random()` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Random,
+    /// `last_insert_rowid()` (v0.16, `v16`): `Env::last_rowid`.
+    #[cfg(feature = "v16")]
+    LastInsertRowid,
+    /// `changes()` (v0.16, `v16`): `Env::changes`.
+    #[cfg(feature = "v16")]
+    Changes,
+    /// `total_changes()` (v0.16, `v16`): `Env::total_changes`.
+    #[cfg(feature = "v16")]
+    TotalChanges,
+    /// `likely(X)` / `unlikely(X)` / `likelihood(X, P)` (v0.16,
+    /// `v16`): X itself (P is a planner hint, checked at
+    /// resolution).
+    #[cfg(feature = "v16")]
+    Likely,
+    /// `concat(X, ...)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Concat,
+    /// `concat_ws(SEP, X, ...)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    ConcatWs,
+    /// `octet_length(X)` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    OctetLength,
+    /// `unhex(X[, Y])` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Unhex,
+    /// `sqlite_version()` (v0.16, `v16`): the claim version,
+    /// `'3.54.1'`.
+    #[cfg(feature = "v16")]
+    SqliteVersion,
+}
+
+impl ScalarFn {
+    /// Whether the pin counts the function non-deterministic
+    /// (v0.16): refused in generated columns.
+    #[cfg(feature = "v16")]
+    pub fn nondeterministic(self) -> bool {
+        matches!(
+            self,
+            ScalarFn::Random
+                | ScalarFn::Randomblob
+                | ScalarFn::LastInsertRowid
+                | ScalarFn::Changes
+                | ScalarFn::TotalChanges
+                | ScalarFn::SqliteVersion
+        )
+    }
+}
+
+/// Whether any function call in `e` (outside subquery plans)
+/// satisfies `f` (v0.16).
+#[cfg(feature = "v16")]
+pub fn any_scalar(e: &RExpr, f: &dyn Fn(ScalarFn) -> bool) -> bool {
+    let any = |x: &RExpr| any_scalar(x, f);
+    match e {
+        RExpr::Scalar(g, args) => f(*g) || args.iter().any(any),
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::OutRef(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, ..) => any(x),
+        RExpr::Agg { args, .. } => args.iter().any(any),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => any(a) || any(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => any(a),
+        RExpr::InList(x, l, ..) => any(x) || l.iter().any(any),
+        RExpr::Between(x, a, b, _) => any(x) || any(a) || any(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(any)
+                || whens.iter().any(|(w, t)| any(w) || any(t))
+                || otherwise.as_deref().is_some_and(any)
+        }
+    }
 }
 
 /// A resolved expression: column references are flat slot indices
@@ -1557,6 +1663,100 @@ fn resolve_args<E>(
     Ok(out)
 }
 
+/// The scalar function a name calls (case-insensitive), or None
+/// for a name the pin does not define (or this build leaves out).
+fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
+    const BASE: &[(&[u8], ScalarFn)] = &[
+        (b"abs", ScalarFn::Abs),
+        (b"length", ScalarFn::Length),
+        (b"upper", ScalarFn::Upper),
+        (b"lower", ScalarFn::Lower),
+        (b"coalesce", ScalarFn::Coalesce),
+        (b"ifnull", ScalarFn::Coalesce),
+        (b"nullif", ScalarFn::Nullif),
+        (b"typeof", ScalarFn::Typeof),
+        (b"substr", ScalarFn::Substr),
+        (b"substring", ScalarFn::Substr),
+        (b"round", ScalarFn::Round),
+        (b"hex", ScalarFn::Hex),
+        (b"trim", ScalarFn::Trim),
+        (b"ltrim", ScalarFn::Ltrim),
+        (b"rtrim", ScalarFn::Rtrim),
+        (b"replace", ScalarFn::Replace),
+        (b"instr", ScalarFn::Instr),
+        (b"sign", ScalarFn::Sign),
+        (b"iif", ScalarFn::Iif),
+    ];
+    #[cfg(feature = "v16")]
+    const V16: &[(&[u8], ScalarFn)] = &[
+        (b"if", ScalarFn::Iif),
+        (b"like", ScalarFn::Like),
+        (b"glob", ScalarFn::Glob),
+        (b"printf", ScalarFn::Printf),
+        (b"format", ScalarFn::Printf),
+        (b"quote", ScalarFn::Quote),
+        (b"char", ScalarFn::Char),
+        (b"unicode", ScalarFn::Unicode),
+        (b"zeroblob", ScalarFn::Zeroblob),
+        (b"randomblob", ScalarFn::Randomblob),
+        (b"random", ScalarFn::Random),
+        (b"last_insert_rowid", ScalarFn::LastInsertRowid),
+        (b"changes", ScalarFn::Changes),
+        (b"total_changes", ScalarFn::TotalChanges),
+        (b"likely", ScalarFn::Likely),
+        (b"unlikely", ScalarFn::Likely),
+        (b"likelihood", ScalarFn::Likely),
+        (b"concat", ScalarFn::Concat),
+        (b"concat_ws", ScalarFn::ConcatWs),
+        (b"octet_length", ScalarFn::OctetLength),
+        (b"unhex", ScalarFn::Unhex),
+        (b"sqlite_version", ScalarFn::SqliteVersion),
+    ];
+    #[cfg(not(feature = "v16"))]
+    const V16: &[(&[u8], ScalarFn)] = &[];
+    BASE.iter()
+        .chain(V16.iter())
+        .find(|(n, _)| eq_ci(name, n))
+        .map(|(_, f)| *f)
+}
+
+/// The argument counts a scalar function takes, as on the pin.
+fn arity(f: ScalarFn) -> (usize, usize) {
+    match f {
+        ScalarFn::Coalesce => (1, usize::MAX),
+        ScalarFn::Nullif | ScalarFn::Instr => (2, 2),
+        ScalarFn::Substr => (2, 3),
+        ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
+        ScalarFn::Replace => (3, 3),
+        // The pin's iif() is a CASE of (condition, value) pairs
+        // with an optional ELSE (3.48+): two or more arguments.
+        #[cfg(feature = "v16")]
+        ScalarFn::Iif => (2, usize::MAX),
+        #[cfg(not(feature = "v16"))]
+        ScalarFn::Iif => (3, 3),
+        #[cfg(feature = "v16")]
+        ScalarFn::Like => (2, 3),
+        #[cfg(feature = "v16")]
+        ScalarFn::Glob => (2, 2),
+        ScalarFn::MinN | ScalarFn::MaxN => (2, usize::MAX),
+        #[cfg(feature = "v16")]
+        ScalarFn::Printf | ScalarFn::Char => (0, usize::MAX),
+        #[cfg(feature = "v16")]
+        ScalarFn::Random
+        | ScalarFn::LastInsertRowid
+        | ScalarFn::Changes
+        | ScalarFn::TotalChanges
+        | ScalarFn::SqliteVersion => (0, 0),
+        #[cfg(feature = "v16")]
+        ScalarFn::Likely | ScalarFn::Unhex => (1, 2),
+        #[cfg(feature = "v16")]
+        ScalarFn::Concat => (1, usize::MAX),
+        #[cfg(feature = "v16")]
+        ScalarFn::ConcatWs => (2, usize::MAX),
+        _ => (1, 1),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_func<E>(
     name: &[u8],
@@ -1615,7 +1815,9 @@ fn resolve_func<E>(
             });
         }
         if args.len() < want.0 || args.len() > want.1 {
-            return Err(Error::Unsupported);
+            return Err(Error::Schema {
+                kind: SchemaKind::WrongArgumentCount,
+            });
         }
         let args = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
         let lvl = agg_level(args.as_slice(), cur, enclosing);
@@ -1627,78 +1829,39 @@ fn resolve_func<E>(
             lvl,
         });
     }
+    let Some(f) = scalar_fn(name) else {
+        return Err(Error::Schema {
+            kind: SchemaKind::UnknownFunction,
+        });
+    };
+    #[cfg(feature = "v16")]
+    let want = if f == ScalarFn::Likely {
+        let n = if eq_ci(name, b"likelihood") { 2 } else { 1 };
+        (n, n)
+    } else {
+        arity(f)
+    };
+    #[cfg(not(feature = "v16"))]
+    let want = arity(f);
+    if args.len() < want.0 || args.len() > want.1 {
+        return Err(Error::Schema {
+            kind: SchemaKind::WrongArgumentCount,
+        });
+    }
     if star || distinct {
         return Err(Error::Unsupported);
     }
-    let f = if eq_ci(name, b"abs") {
-        ScalarFn::Abs
-    } else if eq_ci(name, b"length") {
-        ScalarFn::Length
-    } else if eq_ci(name, b"upper") {
-        ScalarFn::Upper
-    } else if eq_ci(name, b"lower") {
-        ScalarFn::Lower
-    } else if eq_ci(name, b"coalesce") || eq_ci(name, b"ifnull") {
-        ScalarFn::Coalesce
-    } else if eq_ci(name, b"nullif") {
-        ScalarFn::Nullif
-    } else if eq_ci(name, b"typeof") {
-        ScalarFn::Typeof
-    } else if eq_ci(name, b"substr") || eq_ci(name, b"substring") {
-        ScalarFn::Substr
-    } else if eq_ci(name, b"round") {
-        ScalarFn::Round
-    } else if eq_ci(name, b"hex") {
-        ScalarFn::Hex
-    } else if eq_ci(name, b"trim") {
-        ScalarFn::Trim
-    } else if eq_ci(name, b"ltrim") {
-        ScalarFn::Ltrim
-    } else if eq_ci(name, b"rtrim") {
-        ScalarFn::Rtrim
-    } else if eq_ci(name, b"replace") {
-        ScalarFn::Replace
-    } else if eq_ci(name, b"instr") {
-        ScalarFn::Instr
-    } else if eq_ci(name, b"sign") {
-        ScalarFn::Sign
-    } else if eq_ci(name, b"iif") {
-        ScalarFn::Iif
-    } else if cfg!(feature = "v16") && eq_ci(name, b"like") {
-        #[cfg(feature = "v16")]
-        {
-            ScalarFn::Like
-        }
-        #[cfg(not(feature = "v16"))]
-        return Err(Error::Unsupported);
-    } else if cfg!(feature = "v16") && eq_ci(name, b"glob") {
-        #[cfg(feature = "v16")]
-        {
-            ScalarFn::Glob
-        }
-        #[cfg(not(feature = "v16"))]
-        return Err(Error::Unsupported);
-    } else {
-        return Err(Error::Unsupported);
-    };
-    let want = match f {
-        ScalarFn::Coalesce => (1, usize::MAX),
-        ScalarFn::Nullif => (2, 2),
-        ScalarFn::Substr => (2, 3),
-        ScalarFn::Round => (1, 2),
-        ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
-        ScalarFn::Replace => (3, 3),
-        ScalarFn::Instr => (2, 2),
-        ScalarFn::Iif => (3, 3),
-        #[cfg(feature = "v16")]
-        ScalarFn::Like => (2, 3),
-        #[cfg(feature = "v16")]
-        ScalarFn::Glob => (2, 2),
-        ScalarFn::MinN | ScalarFn::MaxN => (2, usize::MAX),
-        _ => (1, 1),
-    };
-    if args.len() < want.0 || args.len() > want.1 {
-        return Err(Error::Unsupported);
+    // likelihood(X, P): P must be a REAL literal in 0.0 ..= 1.0
+    // (the pin's `TK_FLOAT` test; `-0.0` and integers fail).
+    #[cfg(feature = "v16")]
+    if f == ScalarFn::Likely
+        && args.len() == 2
+        && !matches!(args.get(1), Some(Expr::Literal(Literal::Real(r)))
+            if (0.0..=1.0).contains(r) && !r.is_sign_negative())
+    {
+        return Err(Error::Schema {
+            kind: SchemaKind::LikelihoodNotConstant,
+        });
     }
     Ok(RExpr::Scalar(
         f,
@@ -2790,10 +2953,8 @@ fn int_value(v: &OwnedValue) -> i64 {
 /// `round(r, n)` as the pin computes it (v0.16), for `n` in
 /// 0..=30: a value beyond ±2^52 has no fraction and stays; with
 /// `n` 0 it is `(double)(i64)(r ± 0.5)`; otherwise the pin prints
-/// `%!.*f` (the decimal expansion rounded half away from zero at
-/// `n` places, or at its 26th significant digit when that comes
-/// first) and reads the text back. Here the expansion is exact:
-/// `|r| * 10^n` as a 192-bit integer of 32-bit limbs.
+/// `%!.*f` from its own digits and reads the text back
+/// (`record::round_digits`).
 fn round_real(r: f64, n: i64) -> f64 {
     const LIM: f64 = 4_503_599_627_370_496.0;
     if r.is_nan() || !(-LIM..=LIM).contains(&r) {
@@ -2802,91 +2963,7 @@ fn round_real(r: f64, n: i64) -> f64 {
     if n <= 0 {
         return (if r < 0.0 { r - 0.5 } else { r + 0.5 }) as i64 as f64;
     }
-    let bits = r.to_bits();
-    let exp = ((bits >> 52) & 0x7ff) as i64;
-    let frac = bits & ((1u64 << 52) - 1);
-    let (m, e) = if exp == 0 {
-        (frac, -1074i64)
-    } else {
-        (frac | (1u64 << 52), exp - 1075)
-    };
-    // An integral value (e >= 0) prints and reads back unchanged.
-    let Ok(k) = u32::try_from(-e) else {
-        return r;
-    };
-    if k == 0 {
-        return r;
-    }
-    // x = m * 10^n + 2^(k-1) < 2^154: six 32-bit limbs.
-    if k >= 154 {
-        // x < 2^153 <= 2^(k-1): rounds to 0.
-        return if r < 0.0 { -0.0 } else { 0.0 };
-    }
-    let mut x = [m as u32, (m >> 32) as u32, 0, 0, 0, 0];
-    for _ in 0..n {
-        let mut carry = 0u64;
-        for limb in x.iter_mut() {
-            let t = u64::from(*limb) * 10 + carry;
-            *limb = t as u32;
-            carry = t >> 32;
-        }
-    }
-    let mut carry = 1u64 << ((k - 1) % 32);
-    for limb in x.iter_mut().skip(((k - 1) / 32) as usize) {
-        let t = u64::from(*limb) + carry;
-        *limb = t as u32;
-        carry = t >> 32;
-    }
-    // D = x >> k, the value rounded half away from zero at n places.
-    let (lo, hi) = ((k / 32) as usize, k % 32);
-    let mut d = [0u32; 6];
-    for (i, slot) in d.iter_mut().enumerate() {
-        let a = u64::from(x.get(i + lo).copied().unwrap_or(0));
-        let b = u64::from(x.get(i + lo + 1).copied().unwrap_or(0));
-        *slot = (((b << 32) | a) >> hi) as u32;
-    }
-    // D's decimal digits, least significant first; more than 26
-    // means the pin rounds at its 26th significant digit, which
-    // reads back as `r` itself.
-    let mut digits = [0u8; 27];
-    let mut nd = 0usize;
-    while d.iter().any(|l| *l != 0) || nd == 0 {
-        let mut rem = 0u64;
-        for limb in d.iter_mut().rev() {
-            let cur = (rem << 32) | u64::from(*limb);
-            *limb = (cur / 10) as u32;
-            rem = cur % 10;
-        }
-        let Some(slot) = digits.get_mut(nd) else {
-            return r;
-        };
-        *slot = b'0' + rem as u8;
-        nd += 1;
-    }
-    // "[-]<digits>e-<n>", read back as the pin's AtoF reads it.
-    let mut buf = [0u8; 32];
-    let mut len = 0usize;
-    let mut push = |c: u8| {
-        if let Some(slot) = buf.get_mut(len) {
-            *slot = c;
-            len += 1;
-        }
-    };
-    if r < 0.0 {
-        push(b'-');
-    }
-    for c in digits.iter().take(nd).rev() {
-        push(*c);
-    }
-    push(b'e');
-    push(b'-');
-    if n >= 10 {
-        push(b'0' + (n / 10) as u8);
-    }
-    push(b'0' + (n % 10) as u8);
-    buf.get(..len)
-        .and_then(crate::sql::lexer::parse_real_signed)
-        .unwrap_or(r)
+    crate::record::round_digits(r, n)
 }
 
 /// Truncating conversion to i64 with SQLite's clamping at the
@@ -3017,28 +3094,124 @@ pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {
 
 // ---------------- evaluation ----------------
 
+/// Connection state the evaluator reads (v0.16, `v16`): the
+/// pin's `last_insert_rowid()`, `changes()`, `total_changes()`
+/// and the random stream behind `random()` / `randomblob()`. One
+/// per connection; the cells are updated from `&self` paths (a
+/// statement's writes, the random draws), never through global
+/// state. Without `v16` it is empty.
+#[derive(Debug)]
+pub struct Env {
+    #[cfg(feature = "v16")]
+    pub last_rowid: core::cell::Cell<i64>,
+    #[cfg(feature = "v16")]
+    pub changes: core::cell::Cell<i64>,
+    #[cfg(feature = "v16")]
+    pub total_changes: core::cell::Cell<i64>,
+    #[cfg(feature = "v16")]
+    pub prng: crate::func::Prng,
+    /// Rows the running INSERT / UPDATE / DELETE has changed so
+    /// far (moved to `changes` when it succeeds).
+    #[cfg(feature = "v16")]
+    pub pending: core::cell::Cell<i64>,
+}
+
+impl Env {
+    /// A fresh connection's state: no rows inserted or changed,
+    /// the random stream seeded from `seed` (`Config::nonce_seed`).
+    pub fn new(seed: u64) -> Env {
+        let _ = seed;
+        Env {
+            #[cfg(feature = "v16")]
+            last_rowid: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            changes: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            total_changes: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            prng: crate::func::Prng::new(seed),
+            #[cfg(feature = "v16")]
+            pending: core::cell::Cell::new(0),
+        }
+    }
+
+    /// One row inserted with `rowid` (an INSERT, the REPLACE
+    /// verb, an upsert's insert): counted, and the new
+    /// `last_insert_rowid()`.
+    #[cfg(feature = "v16")]
+    pub fn note_insert(&self, rowid: i64) {
+        self.last_rowid.set(rowid);
+        self.note_change();
+    }
+
+    /// One row updated (UPDATE, upsert DO UPDATE) or deleted
+    /// (DELETE). A REPLACE conflict's deletions are not counted,
+    /// as on the pin.
+    #[cfg(feature = "v16")]
+    pub fn note_change(&self) {
+        self.pending.set(self.pending.get().saturating_add(1));
+    }
+
+    /// The end of an INSERT / UPDATE / DELETE: on success its
+    /// count becomes `changes()` and joins `total_changes()`; a
+    /// failed statement leaves `changes()` 0.
+    #[cfg(feature = "v16")]
+    pub fn finish(&self, ok: bool) {
+        let n = if ok { self.pending.get() } else { 0 };
+        self.changes.set(n);
+        self.total_changes
+            .set(self.total_changes.get().saturating_add(n));
+        self.pending.set(0);
+    }
+}
+
 /// Evaluation context: a single row, or an aggregate group (bare
 /// columns read the representative row; `Agg` nodes fold the
-/// group's rows).
-pub enum Ctx<'x> {
-    Row(&'x RowData),
-    Group {
-        rows: &'x [RowData],
-        rep: &'x RowData,
-    },
+/// group's rows), plus the connection state (`Env`) the
+/// connection-state functions read — absent where an expression
+/// is evaluated outside any connection (they then refuse with
+/// `Unsupported`).
+#[derive(Clone, Copy)]
+pub struct Ctx<'x> {
+    rows: Option<&'x [RowData]>,
+    rep: &'x RowData,
+    env: Option<&'x Env>,
 }
 
 impl<'x> Ctx<'x> {
-    fn row(&self) -> &'x RowData {
-        match self {
-            Ctx::Row(r) => r,
-            Ctx::Group { rep, .. } => rep,
+    /// A single-row context.
+    pub fn of(r: &'x RowData) -> Ctx<'x> {
+        Ctx {
+            rows: None,
+            rep: r,
+            env: None,
         }
     }
-    /// A row context over the same representative/current row, for
-    /// evaluating aggregate arguments per group row.
-    fn as_row(r: &'x RowData) -> Ctx<'x> {
-        Ctx::Row(r)
+    /// An aggregate group's context: `rows` folds, `rep` supplies
+    /// the bare columns.
+    pub fn group(rows: &'x [RowData], rep: &'x RowData) -> Ctx<'x> {
+        Ctx {
+            rows: Some(rows),
+            rep,
+            env: None,
+        }
+    }
+    /// The same context reading the connection state `env`.
+    pub fn with(mut self, env: &'x Env) -> Ctx<'x> {
+        self.env = Some(env);
+        self
+    }
+    fn row(&self) -> &'x RowData {
+        self.rep
+    }
+    /// A row context over one of the group's rows, for evaluating
+    /// aggregate arguments per group row (same connection state).
+    fn as_row(&self, r: &'x RowData) -> Ctx<'x> {
+        Ctx {
+            rows: None,
+            rep: r,
+            env: self.env,
+        }
     }
 }
 
@@ -3653,13 +3826,37 @@ pub fn like_glob<E>(
     Ok(bool_val(pattern_match(p.as_slice(), x.as_slice(), info)))
 }
 
-/// Number of Unicode characters in a text value (blob length is
-/// the byte length; SQLite's length() rule).
+/// The characters of a text as the pin's C functions walk it
+/// (v0.16 fix): up to the first NUL, a lead byte of 0xc0 or more
+/// taking the continuation bytes after it (`SQLITE_SKIP_UTF8`),
+/// any other byte one character on its own — invalid UTF-8
+/// included (v0.15 read invalid UTF-8 as no characters, or as
+/// bytes, and counted past a NUL).
+fn char_ranges(t: &[u8]) -> AVec<(usize, usize)> {
+    let mut out = AVec::new();
+    let mut i = 0usize;
+    while let Some(&c) = t.get(i) {
+        if c == 0 {
+            break;
+        }
+        let mut j = i + 1;
+        if c >= 0xc0 {
+            while t.get(j).is_some_and(|b| (*b & 0xc0) == 0x80) {
+                j += 1;
+            }
+        }
+        out.push((i, j));
+        i = j;
+    }
+    out
+}
+
+/// `length(X)` (v0.16 fix): a BLOB's bytes; a TEXT's characters
+/// up to its first NUL (`char_ranges`); a number's text form's
+/// bytes.
 fn char_len(v: &OwnedValue) -> i64 {
     match v {
-        OwnedValue::Text(t) => core::str::from_utf8(t.as_slice())
-            .map(|s| s.chars().count())
-            .unwrap_or(t.len()) as i64,
+        OwnedValue::Text(t) => char_ranges(t.as_slice()).len() as i64,
         OwnedValue::Blob(t) => t.len() as i64,
         OwnedValue::Integer(_) | OwnedValue::Real(_) => {
             to_text(v).map(|t| t.len()).unwrap_or(0) as i64
@@ -3668,48 +3865,223 @@ fn char_len(v: &OwnedValue) -> i64 {
     }
 }
 
-/// Split text into (byte_range per char) for substr/instr.
-fn char_ranges(t: &[u8]) -> AVec<(usize, usize)> {
-    let mut out = AVec::new();
-    let s = core::str::from_utf8(t).unwrap_or("");
-    for (i, c) in s.char_indices() {
-        out.push((i, i + c.len_utf8()));
+/// The text a C function sees for a value (`sqlite3_value_text`):
+/// its bytes up to the first NUL.
+fn c_text(t: &[u8]) -> &[u8] {
+    match t.iter().position(|b| *b == 0) {
+        Some(i) => t.get(..i).unwrap_or(t),
+        None => t,
     }
-    out
+}
+
+/// The pin's `instrFunc` (v0.16 fix): two BLOBs search bytes;
+/// otherwise both sides as text, counting characters (a lead
+/// byte's continuation bytes are skipped). An empty needle is at
+/// 1; not found is 0.
+fn instr_value(x: &OwnedValue, y: &OwnedValue) -> OwnedValue {
+    if matches!(x, OwnedValue::Null) || matches!(y, OwnedValue::Null) {
+        return OwnedValue::Null;
+    }
+    let is_text = !(matches!(x, OwnedValue::Blob(_)) && matches!(y, OwnedValue::Blob(_)));
+    let (Some(h), Some(n)) = (to_text(x), to_text(y)) else {
+        return OwnedValue::Null;
+    };
+    let (h, n) = (h.as_slice(), n.as_slice());
+    if n.is_empty() {
+        return OwnedValue::Integer(1);
+    }
+    let mut pos = 1i64;
+    let mut i = 0usize;
+    while n.len() <= h.len().saturating_sub(i) {
+        if h.get(i..i + n.len()) == Some(n) {
+            return OwnedValue::Integer(pos);
+        }
+        pos += 1;
+        i += 1;
+        while is_text && h.get(i).is_some_and(|b| (*b & 0xc0) == 0x80) {
+            i += 1;
+        }
+    }
+    OwnedValue::Integer(0)
+}
+
+/// The pin's `trimFunc` (v0.16 fix): the trim set is the second
+/// argument's characters up to its first NUL (one space when
+/// absent; nothing to trim when empty), each matched as its whole
+/// byte sequence against either end of the first argument's
+/// bytes. Always TEXT.
+fn trim_value(f: ScalarFn, v: &[OwnedValue]) -> OwnedValue {
+    if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
+        return OwnedValue::Null;
+    }
+    let Some(text) = v.first().and_then(to_text) else {
+        return OwnedValue::Null;
+    };
+    let set: AVec<u8> = match v.get(1) {
+        Some(c) => to_text(c).unwrap_or_default(),
+        None => {
+            let mut c = AVec::new();
+            c.push(b' ');
+            c
+        }
+    };
+    let set = c_text(set.as_slice());
+    let chars = char_ranges(set);
+    let mut z = text.as_slice();
+    let hit = |z: &[u8], front: bool| -> Option<usize> {
+        chars.iter().find_map(|(a, b)| {
+            let ch = set.get(*a..*b)?;
+            let ok = if front {
+                z.starts_with(ch)
+            } else {
+                z.ends_with(ch)
+            };
+            ok.then_some(ch.len())
+        })
+    };
+    if !chars.is_empty() {
+        if f != ScalarFn::Rtrim {
+            while let Some(k) = hit(z, true).filter(|_| !z.is_empty()) {
+                z = z.get(k..).unwrap_or(&[]);
+            }
+        }
+        if f != ScalarFn::Ltrim {
+            while let Some(k) = hit(z, false).filter(|_| !z.is_empty()) {
+                z = z.get(..z.len() - k).unwrap_or(&[]);
+            }
+        }
+    }
+    let mut out = AVec::new();
+    out.extend_from_slice(z);
+    OwnedValue::Text(out)
+}
+
+/// Evaluate the arguments a function call needs only lazily
+/// (v0.16 fix): `coalesce` / `ifnull` stop at the first non-NULL,
+/// `iif` / `if` evaluate only the chosen branch, `likely` & co.
+/// are their first argument — the pin compiles them inline and
+/// never evaluates the rest (`coalesce(1, abs(<i64 min>))` is 1
+/// there; hipp raised "integer overflow").
+fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<OwnedValue, E>> {
+    match f {
+        ScalarFn::Coalesce => {
+            for a in args {
+                match eval::<E>(a, ctx) {
+                    Ok(OwnedValue::Null) => {}
+                    other => return Some(other),
+                }
+            }
+            Some(Ok(OwnedValue::Null))
+        }
+        ScalarFn::Iif => {
+            let mut i = 0usize;
+            while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
+                match eval::<E>(c, ctx) {
+                    Err(e) => return Some(Err(e)),
+                    Ok(cv) => {
+                        if truthy(&cv) == Some(true) {
+                            return Some(eval::<E>(t, ctx));
+                        }
+                    }
+                }
+                i += 2;
+            }
+            Some(match args.get(i) {
+                Some(o) => eval::<E>(o, ctx),
+                None => Ok(OwnedValue::Null),
+            })
+        }
+        #[cfg(feature = "v16")]
+        ScalarFn::Likely => args.first().map(|a| eval::<E>(a, ctx)),
+        #[cfg(feature = "v16")]
+        ScalarFn::Random
+        | ScalarFn::Randomblob
+        | ScalarFn::LastInsertRowid
+        | ScalarFn::Changes
+        | ScalarFn::TotalChanges => {
+            let Some(env) = ctx.env else {
+                return Some(Err(Error::Unsupported));
+            };
+            Some(match f {
+                ScalarFn::Random => Ok(OwnedValue::Integer(env.prng.random())),
+                ScalarFn::Randomblob => match args.first().map(|a| eval::<E>(a, ctx)) {
+                    Some(Ok(n)) => env.prng.blob::<E>(&n),
+                    Some(Err(e)) => Err(e),
+                    None => Ok(OwnedValue::Null),
+                },
+                ScalarFn::LastInsertRowid => Ok(OwnedValue::Integer(env.last_rowid.get())),
+                ScalarFn::Changes => Ok(OwnedValue::Integer(env.changes.get())),
+                _ => Ok(OwnedValue::Integer(env.total_changes.get())),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    if let Some(r) = eval_lazy::<E>(f, args, ctx) {
+        return r;
+    }
     let mut vs: AVec<OwnedValue> = AVec::new();
     for a in args {
         vs.push(eval::<E>(a, ctx)?);
     }
     let v = vs.as_slice();
+    let Some(v0) = v.first() else {
+        // The argument-free calls.
+        #[cfg(feature = "v16")]
+        match f {
+            ScalarFn::Printf => return Ok(OwnedValue::Null),
+            ScalarFn::Char => return Ok(OwnedValue::Text(AVec::new())),
+            ScalarFn::SqliteVersion => {
+                let mut t = AVec::new();
+                t.extend_from_slice(b"3.54.1");
+                return Ok(OwnedValue::Text(t));
+            }
+            _ => {}
+        }
+        return Err(Error::Unsupported);
+    };
+    let v1 = v.get(1);
     Ok(match f {
         #[cfg(feature = "v16")]
-        ScalarFn::BitNot => match v.first() {
-            None | Some(OwnedValue::Null) => OwnedValue::Null,
-            Some(x) => OwnedValue::Integer(!int_value(x)),
+        ScalarFn::BitNot => match v0 {
+            OwnedValue::Null => OwnedValue::Null,
+            x => OwnedValue::Integer(!int_value(x)),
         },
         #[cfg(feature = "v16")]
         ScalarFn::Vector => return Err(row_misused()),
-        ScalarFn::Coalesce => v
-            .iter()
-            .find(|x| !matches!(x, OwnedValue::Null))
-            .cloned()
-            .unwrap_or(OwnedValue::Null),
+        #[cfg(feature = "v16")]
+        ScalarFn::Printf => crate::func::printf::<E>(v)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Quote => crate::func::quote::<E>(v0)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Char => crate::func::char_fn::<E>(v)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Unicode => crate::func::unicode(v0),
+        #[cfg(feature = "v16")]
+        ScalarFn::Zeroblob => crate::func::zeroblob::<E>(v0)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::Concat => crate::func::concat::<E>(None, v)?,
+        #[cfg(feature = "v16")]
+        ScalarFn::ConcatWs => crate::func::concat::<E>(Some(v0), v.get(1..).unwrap_or(&[]))?,
+        #[cfg(feature = "v16")]
+        ScalarFn::OctetLength => crate::func::octet_length(v0),
+        #[cfg(feature = "v16")]
+        ScalarFn::Unhex => crate::func::unhex(v0, v1),
         ScalarFn::Nullif => {
-            let (a, b) = (&v[0], &v[1]);
-            if !matches!(a, OwnedValue::Null)
+            let b = v1.unwrap_or(&OwnedValue::Null);
+            if !matches!(v0, OwnedValue::Null)
                 && !matches!(b, OwnedValue::Null)
-                && values_equal_coll(a, b, args_coll(args))
+                && values_equal_coll(v0, b, args_coll(args))
             {
                 OwnedValue::Null
             } else {
-                a.clone()
+                v0.clone()
             }
         }
         ScalarFn::Typeof => {
-            let name: &[u8] = match &v[0] {
+            let name: &[u8] = match v0 {
                 OwnedValue::Null => b"null",
                 OwnedValue::Integer(_) => b"integer",
                 OwnedValue::Real(_) => b"real",
@@ -3723,7 +4095,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
         // The pin's absFunc (v0.16): an INTEGER stays INTEGER —
         // i64::MIN is "integer overflow" —, a REAL stays REAL, and
         // TEXT / BLOB convert to REAL (`abs('5')` is 5.0).
-        ScalarFn::Abs => match &v[0] {
+        ScalarFn::Abs => match v0 {
             OwnedValue::Null => OwnedValue::Null,
             OwnedValue::Integer(i) => match i.checked_abs() {
                 Some(a) => OwnedValue::Integer(a),
@@ -3743,37 +4115,34 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             }
         },
         ScalarFn::Length => {
-            if matches!(v[0], OwnedValue::Null) {
+            if matches!(v0, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
-                OwnedValue::Integer(char_len(&v[0]))
+                OwnedValue::Integer(char_len(v0))
             }
         }
+        // ASCII case folding over the value's text bytes (all of
+        // them); a BLOB comes back as TEXT, as on the pin (v0.16
+        // fix: hipp returned the BLOB unchanged).
         ScalarFn::Upper | ScalarFn::Lower => {
             let up = f == ScalarFn::Upper;
-            match &v[0] {
-                OwnedValue::Null => OwnedValue::Null,
-                OwnedValue::Blob(b) => OwnedValue::Blob(b.clone()),
-                _ => {
-                    let Some(mut t) = to_text(&v[0]) else {
-                        return Ok(OwnedValue::Null);
-                    };
-                    for b in t.as_mut_slice() {
-                        if up {
-                            b.make_ascii_uppercase();
-                        } else {
-                            b.make_ascii_lowercase();
-                        }
-                    }
-                    OwnedValue::Text(t)
+            let Some(mut t) = to_text(v0) else {
+                return Ok(OwnedValue::Null);
+            };
+            for b in t.as_mut_slice() {
+                if up {
+                    b.make_ascii_uppercase();
+                } else {
+                    b.make_ascii_lowercase();
                 }
             }
+            OwnedValue::Text(t)
         }
         ScalarFn::Hex => {
-            if matches!(v[0], OwnedValue::Null) {
+            if matches!(v0, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
-                let bytes = to_text(&v[0]).unwrap_or_default();
+                let bytes = to_text(v0).unwrap_or_default();
                 let mut out = AVec::new();
                 for b in bytes.as_slice() {
                     let (hi, lo) = (b >> 4, b & 0xf);
@@ -3783,7 +4152,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 OwnedValue::Text(out)
             }
         }
-        ScalarFn::Sign => match to_number(&v[0]) {
+        ScalarFn::Sign => match to_number(v0) {
             None => OwnedValue::Null,
             Some(n) => {
                 let x = n.as_f64();
@@ -3797,13 +4166,13 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             }
         },
         ScalarFn::Round => {
-            let Some(n) = to_number(&v[0]) else {
+            let Some(n) = to_number(v0) else {
                 return Ok(OwnedValue::Null);
             };
             // The digit count is read as the pin's
             // `sqlite3_value_int64` reads it (a text's integer
             // prefix: '1e1' is 1), then clamped to 0..=30.
-            let digits = match v.get(1) {
+            let digits = match v1 {
                 None => 0,
                 Some(OwnedValue::Null) => return Ok(OwnedValue::Null),
                 Some(d) => int_value(d).clamp(0, 30),
@@ -3814,14 +4183,25 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
                 return Ok(OwnedValue::Null);
             }
-            let Some(text) = to_text(&v[0]) else {
+            let Some(text) = to_text(v0) else {
                 return Ok(OwnedValue::Null);
             };
+            let blob = matches!(v0, OwnedValue::Blob(_));
             // Start and length are read as the pin's
             // `sqlite3_value_int64` reads them: a text's integer
             // prefix ('1e1' is 1), a real truncated.
-            let mut start = int_value(&v[1]);
-            let ranges = char_ranges(text.as_slice());
+            let mut start = v1.map_or(0, int_value);
+            // A BLOB's units are bytes; a text's are its
+            // characters up to the first NUL (v0.16 fix).
+            let ranges = if blob {
+                let mut r = AVec::new();
+                for i in 0..text.len() {
+                    r.push((i, i + 1));
+                }
+                r
+            } else {
+                char_ranges(text.as_slice())
+            };
             let n = ranges.len() as i64;
             // Two-argument form: the implicit length is i64::MAX
             // (pinned on 3.54.1 by a CI probe grid — e.g.
@@ -3865,104 +4245,51 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                     out.extend_from_slice(piece);
                 }
             }
-            match v[0] {
-                OwnedValue::Blob(_) => OwnedValue::Blob(out),
-                _ => OwnedValue::Text(out),
-            }
-        }
-        ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => {
-            if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
-                return Ok(OwnedValue::Null);
-            }
-            let Some(text) = to_text(&v[0]) else {
-                return Ok(OwnedValue::Null);
-            };
-            let chars: AVec<u8> = if v.len() > 1 {
-                to_text(&v[1]).unwrap_or_default()
+            if blob {
+                OwnedValue::Blob(out)
             } else {
-                let mut c = AVec::new();
-                c.push(b' ');
-                c
-            };
-            let in_set = |b: u8| chars.as_slice().contains(&b);
-            let bytes = text.as_slice();
-            let (mut s, mut e) = (0usize, bytes.len());
-            if f != ScalarFn::Rtrim {
-                while s < e && in_set(bytes[s]) {
-                    s += 1;
-                }
+                OwnedValue::Text(out)
             }
-            if f != ScalarFn::Ltrim {
-                while e > s && in_set(bytes[e - 1]) {
-                    e -= 1;
-                }
-            }
-            let mut out = AVec::new();
-            out.extend_from_slice(&bytes[s..e]);
-            OwnedValue::Text(out)
         }
+        ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => trim_value(f, v),
         ScalarFn::Replace => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
                 return Ok(OwnedValue::Null);
             }
-            let (Some(x), Some(y), Some(z)) = (to_text(&v[0]), to_text(&v[1]), to_text(&v[2]))
-            else {
+            let (Some(x), Some(y), Some(z)) = (
+                to_text(v0),
+                v1.and_then(to_text),
+                v.get(2).and_then(to_text),
+            ) else {
                 return Ok(OwnedValue::Null);
             };
-            if y.is_empty() {
+            // The pin tests the pattern's first byte for NUL: an
+            // empty or NUL-led pattern leaves X as it is (TEXT).
+            if matches!(y.as_slice().first(), None | Some(0)) {
                 return Ok(OwnedValue::Text(x));
             }
             let mut out = AVec::new();
             let (xb, yb) = (x.as_slice(), y.as_slice());
             let mut i = 0usize;
-            while i < xb.len() {
-                if i + yb.len() <= xb.len() && &xb[i..i + yb.len()] == yb {
+            while let Some(&c) = xb.get(i) {
+                if xb.get(i..i + yb.len()) == Some(yb) {
                     out.extend_from_slice(z.as_slice());
                     i += yb.len();
                 } else {
-                    out.push(xb[i]);
+                    out.push(c);
                     i += 1;
                 }
             }
             OwnedValue::Text(out)
         }
-        ScalarFn::Instr => {
-            if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
-                return Ok(OwnedValue::Null);
-            }
-            let (Some(x), Some(y)) = (to_text(&v[0]), to_text(&v[1])) else {
-                return Ok(OwnedValue::Null);
-            };
-            if y.is_empty() {
-                return Ok(OwnedValue::Integer(1));
-            }
-            let (xb, yb) = (x.as_slice(), y.as_slice());
-            let mut pos = 0i64;
-            let mut i = 0usize;
-            let mut found = 0i64;
-            while i < xb.len() {
-                if i + yb.len() <= xb.len() && &xb[i..i + yb.len()] == yb {
-                    found = pos + 1;
-                    break;
-                }
-                // Advance by one character.
-                let step = utf8_len(xb[i]);
-                i += step;
-                pos += 1;
-            }
-            OwnedValue::Integer(found)
-        }
+        ScalarFn::Instr => instr_value(v0, v1.unwrap_or(&OwnedValue::Null)),
         #[cfg(feature = "v16")]
-        ScalarFn::Like | ScalarFn::Glob => {
-            like_glob::<E>(&v[0], &v[1], v.get(2), f == ScalarFn::Glob)?
-        }
-        ScalarFn::Iif => {
-            if truthy(&v[0]) == Some(true) {
-                v[1].clone()
-            } else {
-                v[2].clone()
-            }
-        }
+        ScalarFn::Like | ScalarFn::Glob => like_glob::<E>(
+            v0,
+            v1.unwrap_or(&OwnedValue::Null),
+            v.get(2),
+            f == ScalarFn::Glob,
+        )?,
         ScalarFn::MinN | ScalarFn::MaxN => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
                 OwnedValue::Null
@@ -3972,8 +4299,8 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 // but takes the later one for min() — the pin's
                 // `minmaxFunc` (`min(1, 1.0)` is 1.0).
                 let coll = args_coll(args);
-                let mut best = v[0].clone();
-                for x in &v[1..] {
+                let mut best = v0.clone();
+                for x in v.get(1..).unwrap_or(&[]) {
                     let ord = compare_coll(&x.as_value(), &best.as_value(), coll);
                     let take = if f == ScalarFn::MinN {
                         ord != core::cmp::Ordering::Greater
@@ -3987,21 +4314,9 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 best
             }
         }
+        // Handled lazily (`eval_lazy`) or argument-free above.
+        _ => return Err(Error::Unsupported),
     })
-}
-
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b >> 5 == 0b110 {
-        2
-    } else if b >> 4 == 0b1110 {
-        3
-    } else if b >> 3 == 0b11110 {
-        4
-    } else {
-        1
-    }
 }
 
 /// The number a value contributes to sum/total/avg: like
@@ -4026,13 +4341,14 @@ fn eval_agg<E>(
     star: bool,
     args: &[RExpr],
     rows: &[RowData],
+    ctx: &Ctx<'_>,
 ) -> Result<OwnedValue, E> {
     let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
     for r in rows {
         let mut vs: AVec<OwnedValue> = AVec::new();
         if !star {
             for a in args {
-                vs.push(eval::<E>(a, &Ctx::as_row(r))?);
+                vs.push(eval::<E>(a, &ctx.as_row(r))?);
             }
         }
         arg_rows.push(vs);
@@ -4507,11 +4823,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             star,
             args,
             ..
-        } => match ctx {
-            Ctx::Group { rows, .. } => {
-                eval_agg::<E>(*kind, *distinct, *star, args.as_slice(), rows)?
-            }
-            Ctx::Row(_) => return Err(Error::Unsupported),
+        } => match ctx.rows {
+            Some(rows) => eval_agg::<E>(*kind, *distinct, *star, args.as_slice(), rows, ctx)?,
+            None => return Err(Error::Unsupported),
         },
         // Subquery nodes are computed by the executor and
         // substituted away before evaluation (v0.6); reaching
@@ -4533,7 +4847,7 @@ pub fn eval_const<E>(expr: &Expr, arena: &Arena) -> Result<OwnedValue, E> {
         return Err(Error::Unsupported);
     }
     let empty = RowData::empty();
-    eval::<E>(&r, &Ctx::Row(&empty))
+    eval::<E>(&r, &Ctx::of(&empty))
 }
 
 /// Compare two ORDER BY key values under one term's direction

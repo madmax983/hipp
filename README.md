@@ -135,8 +135,9 @@ aspirations.
   REAL operand is a REAL, CAST(text AS INTEGER) reads only the
   integer prefix, CAST(text AS NUMERIC) follows the pin's
   2^51 rule, substr() / round() read text integer arguments by
-  their integer prefix, round() clamps its digit count to 30 and
-  rounds the exact decimal expansion as the pin's printf does,
+  their integer prefix, round() clamps its digit count to 30
+  (its digits now follow the pin's printf; see the function
+  library below),
   `CREATE TABLE IF NOT EXISTS t AS SELECT ...` over an existing
   `t` is a no-op before its SELECT is resolved, and hipp-cli
   prints `-0.0` as `0.0` and an exact half at the 16th digit
@@ -167,6 +168,32 @@ aspirations.
   `UPDATE ... SET (a, b) = (..)` / `= (SELECT ..)` (also in
   upsert), with the pin's errors for size mismatches and row
   values anywhere else. The tiny profile did not grow.
+- **Scalar function library.** Behind `v16`: `printf()` /
+  `format()` with the pin's whole conversion set (`%d %i %u %x
+  %X %o %p %r %c %s %z %q %Q %w %j %J %f %e %E %g %G %% %n`, the
+  flags `- + space 0 # , !`, width / precision / `*`, the `#`
+  unistr form of `%q` / `%Q`, the new 3.54 JSON forms) and its
+  REAL digits byte for byte — fitted clean-room to pin output:
+  the 18 / 19 internal digits, the 17-digit `!` shortening, and
+  the truncated-scale rounding that makes `printf('%.0e', 450.0)`
+  `4e+02`; `quote()`, `char()`, `unicode()`, `zeroblob()`,
+  `randomblob()` / `random()` (an in-crate generator seeded from
+  `Config::nonce_seed`), `concat()`, `concat_ws()`,
+  `octet_length()`, `unhex()`, `likely()` / `unlikely()` /
+  `likelihood()` (its constant-probability error), `if()` and the
+  n-ary `iif()`, `sqlite_version()` (`'3.54.1'`), and
+  `last_insert_rowid()` / `changes()` / `total_changes()` with the
+  pin's counting rules — also as `Connection::last_insert_rowid`
+  / `changes` / `total_changes`. Non-deterministic functions are
+  refused in generated columns; unknown functions and wrong
+  argument counts are prepare-time errors (`UnknownFunction`,
+  `WrongArgumentCount`). Ungated fixes: `round()` rounds the
+  pin's digits (`round(166162.7745, 3)` was .774), `coalesce` /
+  `ifnull` / `iif` evaluate lazily, and `length` / `substr` /
+  `trim` / `instr` / `replace` / `upper` / `lower` read text up
+  to a NUL and blobs as bytes, as the pin's C functions do.
+  `sqlite_source_id()` stays undefined (hipp is not the pin's
+  source check-in). The tiny profile did not grow.
 
 ## What v0.13 does
 
@@ -490,7 +517,8 @@ A workspace: the zero-dependency core crate at the root plus
 (page cache, journal protocol, commit machine), `btree`,
 `record` (serial codec, affinity), `schema` (catalog), `sql/`
 (lexer, parser, AST, parameter binding), `query` (resolved-expression evaluator,
-v0.4), `rules` (CHECK / generated-column / STRICT / DEFAULT
+v0.4), `func` (printf and the v0.16 scalar function library),
+`rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor),
 `error` (remedy-named errors).

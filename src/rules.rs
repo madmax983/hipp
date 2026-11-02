@@ -132,7 +132,7 @@ impl GenCols {
                 continue;
             }
             let rd = eval_row(self.rowid_alias, self.affs.as_slice(), rec, rowid);
-            let v = eval::<E>(e, &Ctx::Row(&rd))?;
+            let v = eval::<E>(e, &Ctx::of(&rd))?;
             let aff = self
                 .affs
                 .as_slice()
@@ -196,6 +196,7 @@ impl TableRules {
         rowid_alias: Option<usize>,
         action: ConflictAction,
         changed: Option<(&[bool], bool)>,
+        env: Option<&crate::query::Env>,
     ) -> Result<bool, E> {
         let gcols = self.gcols.as_ref();
         let assigned = |i: usize| changed.is_none_or(|(m, _)| m.get(i).copied().unwrap_or(false));
@@ -260,7 +261,11 @@ impl TableRules {
                 if changed.is_some() && !reads_any(c, eff.as_slice(), rowid_changed) {
                     continue;
                 }
-                if truthy(&eval::<E>(c, &Ctx::Row(&rd))?) == Some(false) {
+                let ctx = match env {
+                    Some(env) => Ctx::of(&rd).with(env),
+                    None => Ctx::of(&rd),
+                };
+                if truthy(&eval::<E>(c, &ctx)?) == Some(false) {
                     if action == ConflictAction::Ignore {
                         return Ok(false);
                     }
@@ -483,6 +488,12 @@ pub fn plan_rules<E>(
             if has_agg(&r) {
                 return Err(Error::Schema {
                     kind: SchemaKind::MisusedAggregate,
+                });
+            }
+            #[cfg(feature = "v16")]
+            if crate::query::any_scalar(&r, &crate::query::ScalarFn::nondeterministic) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::NonDeterministic,
                 });
             }
             pending.push((i, r));
@@ -711,7 +722,17 @@ pub fn alter_default_ok<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
 /// is `Error::NoClock` without a `Config::clock`. An unknown
 /// function or an aggregate errors here, when the default is
 /// needed — as on the pin.
-pub fn eval_default<E>(text: &[u8], arena: &Arena, clock: &mut Clock) -> Result<OwnedValue, E> {
+///
+/// `env` is the connection state a connection-state function
+/// reads (`random()`, `last_insert_rowid()`, ...); without one
+/// such a default does not evaluate (`Unsupported`) — which is
+/// how the catalog keeps it unfolded, for evaluation per row.
+pub fn eval_default<E>(
+    text: &[u8],
+    arena: &Arena,
+    clock: &mut Clock,
+    env: Option<&crate::query::Env>,
+) -> Result<OwnedValue, E> {
     let e = parse_rule::<E>(text, arena)?;
     let mut cols = AVec::new();
     for c in CTIME.iter() {
@@ -747,7 +768,11 @@ pub fn eval_default<E>(text: &[u8], arena: &Arena, clock: &mut Clock) -> Result<
             row.vals.push(OwnedValue::Null);
         }
     }
-    eval::<E>(&r, &Ctx::Row(&row))
+    let ctx = match env {
+        Some(env) => Ctx::of(&row).with(env),
+        None => Ctx::of(&row),
+    };
+    eval::<E>(&r, &ctx)
 }
 
 /// One statement's view of the wall clock (v0.16): the

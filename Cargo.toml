@@ -87,6 +87,14 @@ v10 = ["v09"]
 # IS TRUE / FALSE, hex / digit-separator literal and aggregate
 # scoping fixes are *not* gated: they correct claimed v0.4 /
 # v0.6 paths.)
+# The function-library unit adds printf() / format(), quote(),
+# char(), unicode(), zeroblob(), randomblob(), random(),
+# last_insert_rowid() / changes() / total_changes() (and the
+# Connection methods), likely() / unlikely() / likelihood(),
+# concat(), concat_ws(), octet_length(), unhex(), if() and the
+# n-ary iif(), sqlite_version(). (round()'s fitted digits, lazy
+# coalesce / iif and the text-function fixes are *not* gated:
+# they correct claimed v0.4 paths.)
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.

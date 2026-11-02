@@ -160,6 +160,33 @@ pub enum SchemaKind {
     /// (a, b) = ...`.
     #[cfg(feature = "v16")]
     RowValueMisused,
+    /// A function name the pin does not define, or one this build
+    /// leaves out (v0.16; the pin's "no such function"). Raised
+    /// at prepare.
+    UnknownFunction,
+    /// A known function called with an argument count it does not
+    /// take (v0.16; the pin's "wrong number of arguments to
+    /// function"). Raised at prepare.
+    WrongArgumentCount,
+    /// `likelihood(X, P)` whose P is not a REAL literal between
+    /// 0.0 and 1.0 (v0.16, `v16`; the pin's "second argument to
+    /// likelihood() must be a constant between 0.0 and 1.0").
+    /// Write P as a literal such as `0.5`.
+    #[cfg(feature = "v16")]
+    LikelihoodNotConstant,
+    /// A non-deterministic function — `random()`, `randomblob()`,
+    /// `changes()`, `total_changes()`, `last_insert_rowid()`,
+    /// `sqlite_version()` — in a generated column (v0.16, `v16`;
+    /// the pin's "non-deterministic functions prohibited in
+    /// generated columns"). Compute the value on INSERT instead.
+    #[cfg(feature = "v16")]
+    NonDeterministic,
+    /// A string or blob result of 1,000,000,000 bytes or more
+    /// (v0.16, `v16`; the pin's default `SQLITE_LIMIT_LENGTH`,
+    /// "string or blob too big"): `zeroblob` / `randomblob` past
+    /// the limit, or a `printf` result reaching it.
+    #[cfg(feature = "v16")]
+    TooBig,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

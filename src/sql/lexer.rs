@@ -413,6 +413,34 @@ pub fn pin_digits(r: f64) -> (u64, i32) {
     (d, n)
 }
 
+/// The pin's digits of the finite `r > 0` at a requested
+/// precision of `iround` (1 ..= 16) significant digits (v0.16,
+/// printf): `(v, n)` with `v = floor(r * T)` — `T` the same
+/// truncated `10^n` as in `pin_digits`, `n = iround - p` — an
+/// integer of `iround + 1` or `iround + 2` digits that the caller
+/// rounds half up at digit `iround`. The truncated scale is why a
+/// written tie such as 450 rounds *down* at one digit on the pin
+/// (`printf('%.0e', 450.0)` is `4e+02`, `45.0` gives `5e+01`):
+/// fitted to 14 000 pin outputs with no mismatch.
+pub fn pin_digits_floor(r: f64, iround: i32) -> (u64, i32) {
+    let bits = r.to_bits();
+    let be = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e) = if be == 0 {
+        let sh = frac.leading_zeros().saturating_sub(11);
+        (frac << sh, -1074 - sh as i32)
+    } else {
+        (frac | (1u64 << 52), be - 1075)
+    };
+    let n = iround - (((e + 52) * 78913) >> 18);
+    let (t, s) = pow10_mantissa(n);
+    // r * T = m * t * 2^(e + s), below 10^18 by the choice of n,
+    // so the shift is at least 53.
+    let k = (-(e + s)).clamp(0, 127) as u32;
+    let v = (u128::from(m) * u128::from(t)).checked_shr(k).unwrap_or(0);
+    (u64::try_from(v).unwrap_or(u64::MAX), n)
+}
+
 /// `10^n` as `(t, s)`: `t` in `[2^63, 2^64)`, the largest with
 /// `t * 2^s <= 10^n` (a truncated 64-bit mantissa).
 fn pow10_mantissa(n: i32) -> (u64, i32) {

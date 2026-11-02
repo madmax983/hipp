@@ -1382,6 +1382,168 @@ number lexer and the aggregate-scope walkers.
 - UPDATE / DELETE refuse an enclosing query's aggregate with
   `Unsupported`, not `MisusedAggregate` (pre-existing kind).
 
+### Scalar function library (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1), gated as below. Census (now 177 probes): on the 158
+earlier probes MATCH 80 → 95 (HIPP_ERR 70 → 55); 19 new probes
+for this unit — 14 match, 4 refused by both, `sqlite_source_id()`
+left HIPP_ERR on purpose; the old binary was silently wrong on 2
+of them (round digits, text with a NUL).
+
+**Shipped — `v16`** (new `src/func.rs`, `ScalarFn` variants,
+`query::Env`):
+
+- `printf()` / `format()`: the pin's conversion loop — flags `-
+  + space 0 # , !` in any order (last sign flag wins), width and
+  precision digits accumulated in 32 bits and masked to 31, `*`
+  read as a C int (negative width left-justifies, i32::MIN is 0),
+  `l` / `ll` skipped; `%d %i %u %x %X %o %p %r` (ordinal) with
+  `,` grouping where the pin allows it and `#` prefixes; `%c`
+  (one UTF-8 character, precision = repeat count, NUL for an
+  empty / NULL argument); `%s %z` (`!` counts characters);
+  `%q %Q %w` and the `#` form (backslashes doubled and control
+  characters `\u00xx` — always for %q, for %Q only when one is
+  present, then wrapped in `unistr(...)`); `%j` / `%J` (3.54's
+  JSON string escapes: `\" \\ \b \f \n \r \t`, other C0 as
+  `\u00xx`, NULL as nothing / `null`); `%f %e %E %g %G` from the
+  pin's digits; `%%` (width applies), `%n` (nothing). An unknown
+  conversion, or `%T` / `%S`, ends the output; missing arguments
+  are NULL (0 / 0.0 / no text); the format and text arguments end
+  at a NUL; a result of 1,000,000,000 bytes or more is
+  `SchemaKind::TooBig` (checked before allocating; large buffers
+  are reserved with `AVec::try_reserve`, so allocation failure is
+  `ArenaExhausted`, not an abort).
+- `quote()` (REAL as REAL -> TEXT, infinities `±9.0e+999`, TEXT up
+  to a NUL), `char()`, `unicode()` (the pin's UTF-8 reader:
+  overlong / surrogate / U+FFFE-F are U+FFFD, a stray continuation
+  byte is itself), `zeroblob()`, `randomblob()` / `random()`
+  (splitmix64 over a per-connection `Cell`, seeded from
+  `Config::nonce_seed`; negative draws folded as the pin folds
+  them, so never i64::MIN), `concat()`, `concat_ws()`,
+  `octet_length()`, `unhex(X[, Y])`, `likely()` / `unlikely()` /
+  `likelihood()` (P must be a REAL literal in 0.0 ..= 1.0:
+  `SchemaKind::LikelihoodNotConstant`), `if()` and iif() with two
+  or more arguments (a CASE of pairs with an optional ELSE),
+  `sqlite_version()` = `'3.54.1'`.
+- `last_insert_rowid()` / `changes()` / `total_changes()` and
+  `Connection::last_insert_rowid` / `changes` / `total_changes`:
+  every inserted row (INSERT, REPLACE, an upsert's insert) counts
+  and moves the last rowid at once — later VALUES rows, DEFAULTs,
+  CHECKs and RETURNING see it (a VALUES row reading it is
+  evaluated just before its own insert); upsert DO UPDATE and
+  UPDATE count once per row (also UPDATE ... FROM with several
+  matches), DELETE per row, REPLACE's victims not at all;
+  `changes()` / `total_changes()` move at the statement's end
+  (inside it they read the previous statement), a failed write
+  sets `changes()` to 0 and keeps the rowids it inserted; SELECT,
+  DDL, CREATE TABLE ... AS SELECT and transaction control leave
+  all three alone; a rolled-back write still counts.
+- Generated columns refuse the non-deterministic functions
+  (`SchemaKind::NonDeterministic`); CHECK and DEFAULT accept them.
+- Unknown functions are `SchemaKind::UnknownFunction` and wrong
+  argument counts (scalar and aggregate) `WrongArgumentCount`,
+  both at prepare (they were `Unsupported`, ungated).
+
+**Shipped — ungated (silent wrong answers on claimed v0.4 paths):**
+
+- `round(X, N)` printed the exact binary expansion; it now rounds
+  the pin's own digits as its `%!.*f` does (`record::round_digits`
+  over `record::fp_decode`): `round(166162.7745, 3)` is .775 and
+  `round(188.30472979193155, 13)` ...161 on the pin (hipp gave
+  .774 / ...149). The STATUS gap from "CI vs the real pin" is
+  closed.
+- `coalesce` / `ifnull` / `iif` evaluated every argument
+  (`coalesce(1, abs(-9223372036854775808))` raised "integer
+  overflow"; the pin returns 1); they are lazy now, as the pin
+  compiles them.
+- The text functions read text as the pin's C functions do: up to
+  the first NUL, a lead byte of 0xc0+ taking its continuation
+  bytes (invalid UTF-8 included) — `length(CAST(x'610062' AS
+  TEXT))` is 1 (was 3), `substr` likewise; a BLOB's `substr`
+  counts bytes (`substr(x'c3a9', 1, 1)` was the whole é); `instr`
+  of two BLOBs counts bytes; `trim`'s set ends at a NUL and
+  matches whole characters (`trim(x'c3a9c3', 'é')` is x'c3');
+  `replace` with a NUL-led pattern keeps the subject; `upper` /
+  `lower` of a BLOB are TEXT (they returned the BLOB).
+
+**Oracle-probing notes** (all on the live 3.54.1 pin; the REAL
+digit rules fitted clean-room from output: 16 000 cases through a
+Python model, then 4 × 3 000 through hipp's SQL path, all
+random cases with no mismatch): %e / %g rounding to fewer than 17
+significant digits reads `floor(r * T)` at scale `10^(iRound - p)`
+(`T` the truncated 64-bit power of ten of `lexer::pin_digits`, `p`
+its binary estimate of the decimal exponent) and rounds half up at
+the next digit — so an exact tie with trailing zeros rounds *down*
+(`%.0e` of 450.0 is `4e+02`, of 45.0 `5e+01`; 12350.0 at three
+digits rounds up, being one decade past its estimate); %f rounds
+the 18 / 19 digits instead (`printf('%.3f', 166162.7745)` .775
+while `%.8e` shows ...774); any `!` conversion rounding to exactly
+17 digits takes REAL -> TEXT's shortening (`%!.17g` of 0.1 is
+0.1, `%!.16e` too, `%!.18g` is not); `#` drops the sign of a
+negative value printing as zero unless `+` / space asks
+(`%#.0f` of -0.4 is `0.`, `%.0f` is `-0`); precision is capped at
+100,000,000 (`%.*f` of 10^9); infinity with `0` prints `9` and
+999 zeros; `printf()` / `printf(NULL)` are NULL; `printf('%c',
+'')` is a NUL; `%.2q` of NULL is `(N`, `%.0J` of NULL `null`;
+`%#q` doubles backslashes even without a control character;
+`quote(1e16)` is `10000000000000000.0`; `char(NULL)` is a NUL,
+out-of-range code points U+FFFD; `unhex('4 142', ' ')` is NULL
+(separators only between pairs); `iif(0,1,0,2)` is NULL;
+`likelihood(1, (0.5))` and `5e-1` pass, `+0.5`, `-0.0`, `1`,
+`?` fail; `sqlite_version()` is non-deterministic for generated
+columns; `INSERT INTO t SELECT last_insert_rowid() FROM s` sees
+each earlier row's rowid (3, 1, 2) unless the source is the
+target; changes counts per the rules above (probed one by one).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed". New suites:
+`tests/functions_v16.rs` (16 tests: printf fixed cases, the JSON
+/ unistr forms, REAL conversions with every rounding rule above,
+a 900-format generated corpus over every storage class compared
+as hex, a 700-double generated corpus through the REAL
+conversions, round() and quote(), round() regressions — one
+value panicked in an early fit —, TooBig, the value functions,
+argument-count / unknown-function / likelihood errors at prepare,
+a generated value-function corpus over a table of every storage
+class, the text-function and laziness fixes, the change counters
+and last-insert rowid across two scripts compared line by line
+with a pin stdin session and with the `Connection` methods after
+every statement, the random stream's types / ranges /
+per-seed determinism, non-deterministic functions in definitions).
+`hipp-cli/tests/cli_v16_functions.rs` (3 tests, byte-identical
+one-shot and over stdin).
+
+**Size:** tiny **75,960 B** (Δ **0**: the function library is
+`v16`; the counters' hooks and the round() / text fixes live in
+`v16` / evaluator code the tiny profile does not build). Full
+**312,051 B** (Δ **+10,672 B** vs 301,379, ratchet raised to it):
+the printf engine and its digit paths, the value functions, the
+connection state threaded through every evaluation context
+(`Ctx` became a struct carrying `&Env`), the change-counter hooks
+and the function-name table.
+
+**Honest gaps:**
+
+- `sqlite_source_id()` is undefined (`UnknownFunction`): it names
+  the pin's source check-in, which hipp is not.
+- `last_insert_rowid()` inside an INSERT ... SELECT source reads
+  the pre-statement value for every row (hipp materialises the
+  source first; the pin streams it and later rows see earlier
+  inserts' rowids, unless the source reads the target).
+- `random()` / `randomblob()` are not the pin's ChaCha20 stream —
+  types, lengths and ranges match, values do not (and the seed is
+  `Config::nonce_seed`, shared with the journal nonces).
+- `likelihood(X, +0.5)` is accepted: the parser folds a unary `+`
+  into the literal, which the pin keeps as an operator and
+  refuses.
+- `unhex()`'s separator set is matched by bytes per UTF-8
+  character, not by decoded code point (they differ only for
+  invalid UTF-8 in Y).
+- The printf result limit is the pin's default
+  SQLITE_LIMIT_LENGTH; hipp has no runtime limit setting.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

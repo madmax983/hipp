@@ -504,6 +504,32 @@ pub fn affinity_of(decl: &[u8]) -> Affinity {
 /// for decimal exponents -4 ..= 16 with `.0` kept on integral
 /// values, else `d.ddde±XX`. `-0.0` is `0.0`, infinities `Inf` /
 /// `-Inf`.
+/// The pin's 17-significant-digit rounding of the finite `r > 0`
+/// whose pin digits are `(d, scale)` (`lexer::pin_digits`), with
+/// its shortening: `(c, n, e10)` — the coefficient `c` of `n`
+/// digits (one more after a rounding carry) and the decimal
+/// exponent `e10` of the first of the `n`. Used by REAL → TEXT
+/// and by printf's `%!.17g` (any `!` conversion rounding to
+/// exactly 17 digits), which the pin computes the same way.
+pub fn short17(r: f64, d: u64, scale: i32) -> (u64, i32, i32) {
+    let p = |k: u32| 10u64.pow(k);
+    // 18 or 19 digits.
+    let l: u32 = if d >= p(18) { 19 } else { 18 };
+    // Decimal exponent of d's first digit.
+    let e10 = l as i32 - 1 - scale;
+    let lead16 = d / p(l - 16);
+    let c13 = d / p(l - 13);
+    let c14 = (d + 5 * p(l - 15)) / p(l - 14);
+    let (c, n) = if (scale < 0 || lead16.is_multiple_of(1000)) && reads_back(c13, e10 - 12, r) {
+        (c13, 13)
+    } else if lead16 % 100 == 99 && reads_back(c14, e10 - 13, r) {
+        (c14, 14)
+    } else {
+        ((d + 5 * p(l - 18)) / p(l - 17), 17)
+    };
+    (c, n, e10)
+}
+
 #[inline(never)]
 pub fn render_real(r: f64, out: &mut AVec<u8>) {
     if r < 0.0 {
@@ -519,21 +545,8 @@ pub fn render_real(r: f64, out: &mut AVec<u8>) {
         return;
     }
     let (d, scale) = crate::sql::lexer::pin_digits(r);
+    let (c, n, e10) = short17(r, d, scale);
     let p = |k: u32| 10u64.pow(k);
-    // 18 or 19 digits.
-    let l: u32 = if d >= p(18) { 19 } else { 18 };
-    // Decimal exponent of d's first digit.
-    let e10 = l as i32 - 1 - scale;
-    let lead16 = d / p(l - 16);
-    let c13 = d / p(l - 13);
-    let c14 = (d + 5 * p(l - 15)) / p(l - 14);
-    let (c, n) = if (scale < 0 || lead16 % 1000 == 0) && reads_back(c13, e10 - 12, r) {
-        (c13, 13)
-    } else if lead16 % 100 == 99 && reads_back(c14, e10 - 13, r) {
-        (c14, 14)
-    } else {
-        ((d + 5 * p(l - 18)) / p(l - 17), 17)
-    };
     let mut nd = 1usize;
     while nd < 20 && c >= p(nd as u32) {
         nd += 1;
@@ -587,6 +600,207 @@ pub fn render_real(r: f64, out: &mut AVec<u8>) {
         out.push(b'0' + (e / 10 % 10) as u8);
         out.push(b'0' + (e % 10) as u8);
     }
+}
+
+#[cfg(feature = "v04")]
+/// A decoded REAL: `n` significant digits `z[s..s + n]` with the
+/// decimal point after digit `idp` (`0.d1d2... * 10^idp`).
+pub struct Fp {
+    pub neg: bool,
+    /// 0 finite, 1 infinite, 2 NaN.
+    pub special: u8,
+    pub z: [u8; 26],
+    pub s: usize,
+    pub n: usize,
+    pub idp: i32,
+}
+
+#[cfg(feature = "v04")]
+impl Fp {
+    pub fn digit(&self, j: usize) -> u8 {
+        if j < self.n {
+            self.z.get(self.s + j).copied().unwrap_or(b'0')
+        } else {
+            b'0'
+        }
+    }
+}
+
+#[cfg(feature = "v04")]
+/// Decode `r` into the pin's digits, rounded half up to `iround`
+/// significant digits (or, for `iround <= 0`, to `-iround` digits
+/// after the point) and to at most `mx` digits (16, or 26 with the
+/// `!` flag) — the pin's `sqlite3FpDecode`.
+pub fn fp_decode(r: f64, mut iround: i32, mx: i32) -> Fp {
+    let mut f = Fp {
+        neg: false,
+        special: 0,
+        z: [b'0'; 26],
+        s: 3,
+        n: 1,
+        idp: 1,
+    };
+    if r.is_nan() {
+        f.special = 2;
+        return f;
+    }
+    if r == 0.0 {
+        return f;
+    }
+    f.neg = r < 0.0;
+    let a = fabs(r);
+    if a == f64::INFINITY {
+        f.special = 1;
+        return f;
+    }
+    let (mut d, scale) = crate::sql::lexer::pin_digits(a);
+    let d0 = d;
+    // %e / %g pass a significant-digit count; %f passes `-precision`.
+    let short = iround > 0 && iround < 17;
+    let mut nd = 0usize;
+    let mut tmp = [b'0'; 20];
+    while d > 0 && nd < tmp.len() {
+        if let Some(slot) = tmp.get_mut(nd) {
+            *slot = b'0' + (d % 10) as u8;
+        }
+        d /= 10;
+        nd += 1;
+    }
+    for k in 0..nd {
+        if let (Some(dst), Some(src)) = (f.z.get_mut(f.s + k), tmp.get(nd - 1 - k)) {
+            *dst = *src;
+        }
+    }
+    f.n = nd;
+    f.idp = nd as i32 - scale;
+    if iround <= 0 {
+        iround = f.idp.saturating_sub(iround);
+        if iround == 0 && f.digit(0) >= b'5' {
+            iround = 1;
+            f.s = f.s.saturating_sub(1);
+            if let Some(z) = f.z.get_mut(f.s) {
+                *z = b'0';
+            }
+            f.n += 1;
+            f.idp += 1;
+        }
+    }
+    // A short significant-digit rounding (%e / %g to fewer than 17
+    // digits) reads the digits from the pin's floor at that
+    // precision instead (`lexer::pin_digits_floor`); %f rounds the
+    // 18 / 19 digits (`printf('%.3f', 166162.7745)` is .775 there
+    // while `%.8e` shows ...774).
+    if short {
+        let (mut v, n2) = crate::sql::lexer::pin_digits_floor(a, iround);
+        let mut nd = 0usize;
+        let mut tmp = [b'0'; 20];
+        while v > 0 && nd < tmp.len() {
+            if let Some(slot) = tmp.get_mut(nd) {
+                *slot = b'0' + (v % 10) as u8;
+            }
+            v /= 10;
+            nd += 1;
+        }
+        for k in 0..nd {
+            if let (Some(dst), Some(src)) = (f.z.get_mut(f.s + k), tmp.get(nd - 1 - k)) {
+                *dst = *src;
+            }
+        }
+        f.n = nd;
+        f.idp = nd as i32 - n2;
+    }
+    if iround > 0 && ((iround as usize) < f.n || f.n as i32 > mx) {
+        if iround > mx {
+            iround = mx;
+        }
+        // Exactly 17 digits (only reachable with `!`): the pin's
+        // shortened 17-digit form, as REAL -> TEXT has it
+        // (`printf('%!.17g', 0.1)` is 0.1).
+        if iround == 17 && f.s == 3 {
+            let (c, n, e10) = short17(a, d0, scale);
+            let mut nd = 0usize;
+            let mut x = c;
+            let mut tmp = [b'0'; 20];
+            while x > 0 && nd < tmp.len() {
+                if let Some(slot) = tmp.get_mut(nd) {
+                    *slot = b'0' + (x % 10) as u8;
+                }
+                x /= 10;
+                nd += 1;
+            }
+            for k in 0..nd {
+                if let (Some(dst), Some(src)) = (f.z.get_mut(f.s + k), tmp.get(nd - 1 - k)) {
+                    *dst = *src;
+                }
+            }
+            f.n = nd;
+            f.idp = e10 + 1 + (nd as i32 - n);
+            while f.n > 0 && f.digit(f.n - 1) == b'0' {
+                f.n -= 1;
+            }
+            return f;
+        }
+        let ir = iround as usize;
+        let round_up = f.digit(ir) >= b'5';
+        f.n = ir;
+        if round_up {
+            let mut j = ir;
+            loop {
+                if j == 0 {
+                    f.s = f.s.saturating_sub(1);
+                    if let Some(z) = f.z.get_mut(f.s) {
+                        *z = b'1';
+                    }
+                    f.n += 1;
+                    f.idp += 1;
+                    break;
+                }
+                j -= 1;
+                let Some(z) = f.z.get_mut(f.s + j) else {
+                    break;
+                };
+                if *z < b'9' {
+                    *z += 1;
+                    break;
+                }
+                *z = b'0';
+            }
+        }
+    }
+    while f.n > 0 && f.digit(f.n - 1) == b'0' {
+        f.n -= 1;
+    }
+    f
+}
+
+/// `round(r, n)` for `n` in 1..=30 as the pin computes it (v0.16
+/// fit): its `roundFunc` prints `%!.*f` — the pin's own digits
+/// (`fp_decode`, at most 26 of them) rounded half up at `n`
+/// places, a value too small to reach the `n`th place printing as
+/// zero — and reads the text back. (v0.15 rounded the exact
+/// binary expansion instead, which differs where the pin's
+/// approximate digits do.)
+#[cfg(feature = "v04")]
+pub fn round_digits(r: f64, n: i64) -> f64 {
+    let n = n.clamp(0, 30) as i32;
+    let f = fp_decode(r, -n, 26);
+    if f.special != 0 {
+        return r;
+    }
+    let kept = if f.idp.saturating_add(n) <= 0 { 0 } else { f.n };
+    let mut c: u64 = 0;
+    for j in 0..kept {
+        c = c
+            .saturating_mul(10)
+            .saturating_add(u64::from(f.digit(j).saturating_sub(b'0')));
+    }
+    // (int_pow10_to_f64 takes a positive coefficient.)
+    let x = if c == 0 {
+        0.0
+    } else {
+        crate::sql::lexer::int_pow10_to_f64(c, i64::from(f.idp) - kept as i64)
+    };
+    if f.neg { -x } else { x }
 }
 
 /// Whether `c * 10^x` reads back (correctly rounded, like the

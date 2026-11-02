@@ -376,6 +376,17 @@ impl<T> AVec<T> {
     pub fn pop(&mut self) -> Option<T> {
         self.vec.pop()
     }
+    /// Reserve room for `n` more elements, reporting an allocation
+    /// the global allocator refuses (or a size overflow) as
+    /// statement-arena exhaustion instead of aborting (v0.16: the
+    /// function library's large results — `zeroblob(N)`,
+    /// `printf('%*d', N, ...)` — size their buffers through this).
+    pub fn try_reserve(&mut self, n: usize) -> Result<(), ArenaError> {
+        self.vec.try_reserve(n).map_err(|_| ArenaError {
+            scope: Scope::Statement,
+            needed: n,
+        })
+    }
     pub fn len(&self) -> usize {
         self.vec.len()
     }

@@ -776,6 +776,11 @@ pub struct Connection<S: Storage> {
     /// (`thumbv6m`) do not have.
     #[cfg(feature = "v06")]
     next_subplan_id: core::cell::Cell<usize>,
+    /// The connection state the evaluator reads (v0.16): the
+    /// pin's last-insert rowid, change counters and random
+    /// stream (`query::Env`; empty without `v16`).
+    #[cfg(feature = "v04")]
+    env: crate::query::Env,
 }
 
 impl<S: Storage> Connection<S> {
@@ -792,6 +797,8 @@ impl<S: Storage> Connection<S> {
         )
         .await?;
         let catalog_arena = Arena::new(Scope::Catalog, cfg.catalog_init, cfg.catalog_max);
+        #[cfg(feature = "v04")]
+        let seed = cfg.nonce_seed;
         let mut conn = Connection {
             pager,
             catalog_arena,
@@ -802,6 +809,8 @@ impl<S: Storage> Connection<S> {
             sub_execs: 0,
             #[cfg(feature = "v06")]
             next_subplan_id: core::cell::Cell::new(1),
+            #[cfg(feature = "v04")]
+            env: crate::query::Env::new(seed),
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -1279,6 +1288,13 @@ impl<S: Storage> Connection<S> {
                             if crate::query::has_sub(&re) {
                                 any_sub = true;
                             }
+                            // v0.16: a row reading last_insert_rowid()
+                            // evaluates at step time, just before its
+                            // own insert (see `exec_insert`).
+                            #[cfg(feature = "v16")]
+                            if reads_last_rowid(&re) {
+                                any_sub = true;
+                            }
                             rr.push(re);
                         }
                         resolved.push(rr);
@@ -1291,7 +1307,10 @@ impl<S: Storage> Connection<S> {
                         for rr in resolved.iter() {
                             let mut rv = AVec::new();
                             for re in rr.iter() {
-                                rv.push(crate::query::eval::<S::Error>(re, &Ctx::Row(&empty))?);
+                                rv.push(crate::query::eval::<S::Error>(
+                                    re,
+                                    &Ctx::of(&empty).with(&self.env),
+                                )?);
                             }
                             folded.push(rv);
                         }
@@ -1401,6 +1420,7 @@ impl<S: Storage> Connection<S> {
                                 dt,
                                 arena,
                                 &mut crate::rules::Clock::new(None),
+                                Some(&self.env),
                             )?
                         } else {
                             empty_only = true;
@@ -1813,6 +1833,7 @@ impl<S: Storage> Connection<S> {
                 handle_bytes(&self.catalog_arena, h),
                 arena,
                 clock,
+                Some(&self.env),
             ),
             None => Ok(literal_owned(&self.catalog_arena, c.default)),
         }
@@ -3417,6 +3438,39 @@ impl<S: Storage> Connection<S> {
         Ok(())
     }
 
+    /// The rowid of the most recent row an INSERT (or REPLACE, or
+    /// an upsert's insert branch) put into a table on this
+    /// connection, 0 before any (v0.16, `v16`; the pin's
+    /// `sqlite3_last_insert_rowid`, also read by the SQL function
+    /// `last_insert_rowid()`). An upsert's DO UPDATE, UPDATE and
+    /// CREATE TABLE ... AS SELECT leave it alone; a failed
+    /// statement keeps the rowids it inserted before failing.
+    #[cfg(feature = "v16")]
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.env.last_rowid.get()
+    }
+
+    /// The rows the most recent successful INSERT, UPDATE or DELETE
+    /// changed (v0.16, `v16`; the pin's `sqlite3_changes64`, also
+    /// `changes()`): inserted rows (REPLACE's deletions not
+    /// counted), rows updated (once per row, also by an upsert's
+    /// DO UPDATE) and rows deleted. A failed write sets it to 0;
+    /// other statements (SELECT, DDL, CREATE TABLE ... AS SELECT,
+    /// transaction control) leave it alone.
+    #[cfg(feature = "v16")]
+    pub fn changes(&self) -> i64 {
+        self.env.changes.get()
+    }
+
+    /// The sum of `changes()` over every successful INSERT, UPDATE
+    /// and DELETE since the connection opened (v0.16, `v16`; the
+    /// pin's `sqlite3_total_changes64`, also `total_changes()`) —
+    /// a write later rolled back still counts.
+    #[cfg(feature = "v16")]
+    pub fn total_changes(&self) -> i64 {
+        self.env.total_changes.get()
+    }
+
     /// Whether a write transaction is currently open on this
     /// connection (including one left behind by a dropped future).
     pub fn in_transaction(&self) -> bool {
@@ -3681,6 +3735,13 @@ pub struct Statement<'c, S: Storage> {
 /// integer 5 on the pin, where hipp used to return the text.
 fn read_default(arena: &Arena, c: &crate::schema::Column) -> OwnedValue {
     apply_affinity(literal_owned(arena, c.default), c.affinity)
+}
+
+/// Whether `e` calls `last_insert_rowid()` (v0.16), whose value
+/// moves with every row an INSERT inserts.
+#[cfg(feature = "v16")]
+fn reads_last_rowid(e: &RExpr) -> bool {
+    crate::query::any_scalar(e, &|f| f == crate::query::ScalarFn::LastInsertRowid)
 }
 
 fn literal_owned(arena: &Arena, lit: Option<Literal>) -> OwnedValue {
@@ -4968,6 +5029,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     self.ret_pos = 0;
                 }
                 Err(e) => {
+                    #[cfg(feature = "v16")]
+                    self.conn.env.finish(false);
                     let _ = self.conn.pager.rollback().await;
                     self.conn.explicit_txn = false;
                     return Err(e);
@@ -4985,6 +5048,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
+                #[cfg(feature = "v16")]
+                self.conn.env.finish(false);
                 // Same abort rule as CREATE (see step_create).
                 let _ = self.conn.pager.rollback().await;
                 self.conn.explicit_txn = false;
@@ -4994,6 +5059,36 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "v16")]
+        self.conn.env.pending.set(0);
+        // v0.16: VALUES rows that read last_insert_rowid() evaluate
+        // one at a time, each just before its own insert — on the
+        // pin each row sees the rowid the row before it inserted.
+        #[cfg(feature = "v16")]
+        let lazy = match &self.plan {
+            Plan::Insert {
+                rows_r: Some(rows_r),
+                select: None,
+                ..
+            } if rows_r.iter().any(|r| r.iter().any(reads_last_rowid)) => Some(rows_r.clone()),
+            _ => None,
+        };
+        #[cfg(feature = "v16")]
+        if let Some(rows_r) = lazy {
+            let empty = RowData::empty();
+            for rr in rows_r.iter() {
+                let mut rv = AVec::new();
+                for e in rr.iter() {
+                    rv.push(self.eval_row_sub(e, &empty).await?);
+                }
+                self.exec_insert_row(rv).await?;
+            }
+            if !self.conn.explicit_txn {
+                self.conn.pager.drive_commit().await?;
+            }
+            self.conn.env.finish(true);
+            return Ok(());
+        }
         // The full row source is materialised BEFORE the first
         // row is inserted (v0.8): an INSERT ... SELECT reading
         // its own target terminates on the pre-statement rows,
@@ -5006,6 +5101,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
+        #[cfg(feature = "v16")]
+        self.conn.env.finish(true);
         Ok(())
     }
 
@@ -5146,6 +5243,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     *rowid_alias,
                     action,
                     None,
+                    Some(&self.conn.env),
                 )?,
                 _ => resolve_not_null::<S::Error>(
                     row.as_mut_slice(),
@@ -5252,6 +5350,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             let payload = encode_index_payload(key.as_slice(), rowid);
             btree::index_insert(pager, *ix_root, payload.as_slice(), desc.as_slice()).await?;
         }
+        #[cfg(feature = "v16")]
+        self.conn.env.note_insert(rowid);
         #[cfg(feature = "v07")]
         self.push_insert_returning(row.as_slice(), rowid).await?;
         Ok(())
@@ -5328,6 +5428,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             .await?;
         }
+        #[cfg(feature = "v16")]
+        self.conn.env.note_insert(rowid);
         Ok(())
     }
 
@@ -5633,6 +5735,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     rowid_alias,
                     ConflictAction::Abort,
                     Some((assigned.as_slice(), rowid_set)),
+                    Some(&self.conn.env),
                 )?;
             }
             None => {
@@ -5695,6 +5798,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             new_rowid,
         )
         .await?;
+        #[cfg(feature = "v16")]
+        self.conn.env.note_change();
         self.push_insert_returning(new_rec.as_slice(), new_rowid)
             .await?;
         Ok(())
@@ -5716,6 +5821,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                         self.ret_pos = 0;
                     }
                     Err(e) => {
+                        #[cfg(feature = "v16")]
+                        self.conn.env.finish(false);
                         let _ = self.conn.pager.rollback().await;
                         self.conn.explicit_txn = false;
                         return Err(e);
@@ -5731,6 +5838,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
+                #[cfg(feature = "v16")]
+                self.conn.env.finish(false);
                 // Same abort rule as INSERT (see step_insert).
                 let _ = self.conn.pager.rollback().await;
                 self.conn.explicit_txn = false;
@@ -5753,6 +5862,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                         self.ret_pos = 0;
                     }
                     Err(e) => {
+                        #[cfg(feature = "v16")]
+                        self.conn.env.finish(false);
                         let _ = self.conn.pager.rollback().await;
                         self.conn.explicit_txn = false;
                         return Err(e);
@@ -5768,6 +5879,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
+                #[cfg(feature = "v16")]
+                self.conn.env.finish(false);
                 let _ = self.conn.pager.rollback().await;
                 self.conn.explicit_txn = false;
                 Err(e)
@@ -5831,9 +5944,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 #[cfg(feature = "v06")]
                 let keep = crate::query::truthy(&self.eval_row_sub(f, &rd).await?) == Some(true);
                 #[cfg(not(feature = "v06"))]
-                let keep =
-                    crate::query::truthy(&crate::query::eval::<S::Error>(f, &Ctx::Row(&rd))?)
-                        == Some(true);
+                let keep = crate::query::truthy(&crate::query::eval::<S::Error>(
+                    f,
+                    &Ctx::of(&rd).with(&self.conn.env),
+                )?) == Some(true);
                 if !keep {
                     continue;
                 }
@@ -5874,6 +5988,8 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "v05")]
     async fn exec_update(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "v16")]
+        self.conn.env.pending.set(0);
         let (root, rowid_alias, ncols, defaults, affs, not_null, sets, filter, conflict_action) =
             match &self.plan {
                 Plan::Update {
@@ -6045,7 +6161,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     #[cfg(feature = "v06")]
                     let v = self.eval_row_sub(e, rd).await?;
                     #[cfg(not(feature = "v06"))]
-                    let v = crate::query::eval::<S::Error>(e, &Ctx::Row(rd))?;
+                    let v = crate::query::eval::<S::Error>(e, &Ctx::of(rd).with(&self.conn.env))?;
                     evaluated.push((*target, v));
                 }
                 let mut new_rec: AVec<OwnedValue> = wrow.rec.clone();
@@ -6082,6 +6198,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         rowid_alias,
                         conflict_action,
                         Some((assigned.as_slice(), rowid_set)),
+                        Some(&self.conn.env),
                     )?,
                     None => resolve_not_null::<S::Error>(
                         new_rec.as_mut_slice(),
@@ -6189,16 +6306,24 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.ret_rows.push(vals);
                 self.ret_rowids.push(Some(cur_rowid));
             }
+            #[cfg(feature = "v16")]
+            if applied {
+                self.conn.env.note_change();
+            }
             let _ = applied;
         }
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
+        #[cfg(feature = "v16")]
+        self.conn.env.finish(true);
         Ok(())
     }
 
     #[cfg(feature = "v05")]
     async fn exec_delete(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "v16")]
+        self.conn.env.pending.set(0);
         let (root, rowid_alias, ncols, defaults, affs, filter) = match &self.plan {
             Plan::Delete {
                 root,
@@ -6273,10 +6398,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .await?;
             }
             btree::btree_delete(&mut self.conn.pager, root, wrow.rowid).await?;
+            #[cfg(feature = "v16")]
+            self.conn.env.note_change();
         }
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
+        #[cfg(feature = "v16")]
+        self.conn.env.finish(true);
         Ok(())
     }
 
@@ -6564,8 +6693,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Nested-loop join + WHERE, then group / project: the
         // synchronous v0.4 executor (no subqueries in the plan).
         let mut rows: AVec<RowData> = AVec::new();
-        join_all::<S::Error>(&qp, src_rows.as_slice(), &mut rows)?;
-        let produced = project_rows::<S::Error>(&qp, rows.as_slice())?;
+        join_all::<S::Error>(&self.conn.env, &qp, src_rows.as_slice(), &mut rows)?;
+        let produced = project_rows::<S::Error>(&self.conn.env, &qp, rows.as_slice())?;
         self.finish_produced(&qp, produced, window);
         Ok(())
     }
@@ -6589,7 +6718,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "v06")]
             let v = self.eval_row_sub(e, &RowData::empty()).await?;
             #[cfg(not(feature = "v06"))]
-            let v = crate::query::eval::<S::Error>(e, &Ctx::Row(&RowData::empty()))?;
+            let v = crate::query::eval::<S::Error>(
+                e,
+                &Ctx::of(&RowData::empty()).with(&self.conn.env),
+            )?;
             *slot = Some(crate::query::limit_int::<S::Error>(v)?);
         }
         let [lim, off] = vals;
@@ -6897,12 +7029,12 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "v06")]
     async fn eval_row_sub(&mut self, e: &RExpr, row: &RowData) -> Result<OwnedValue, S::Error> {
         if !crate::query::has_sub(e) {
-            return crate::query::eval::<S::Error>(e, &Ctx::Row(row));
+            return crate::query::eval::<S::Error>(e, &Ctx::of(row).with(&self.conn.env));
         }
         let values = self.compute_sub_values(e, row).await?;
         let mut pos = 0;
         let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
-        crate::query::eval::<S::Error>(&e2, &Ctx::Row(row))
+        crate::query::eval::<S::Error>(&e2, &Ctx::of(row).with(&self.conn.env))
     }
 
     /// Evaluate one expression for an aggregate group (v0.6):
@@ -6924,7 +7056,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         rep: &RowData,
     ) -> Result<OwnedValue, S::Error> {
         if !crate::query::has_sub(e) {
-            return crate::query::eval::<S::Error>(e, &Ctx::Group { rows, rep });
+            return crate::query::eval::<S::Error>(e, &Ctx::group(rows, rep).with(&self.conn.env));
         }
         // This query's aggregates inside its subqueries (v0.16
         // fix: `(SELECT max(t.a) FROM u)` over t): fold each over
@@ -6951,7 +7083,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                     let mut vs: AVec<OwnedValue> = AVec::new();
                     if !*star {
                         for x in args.iter() {
-                            vs.push(crate::query::eval::<S::Error>(x, &Ctx::Row(r))?);
+                            vs.push(crate::query::eval::<S::Error>(
+                                x,
+                                &Ctx::of(r).with(&self.conn.env),
+                            )?);
                         }
                     }
                     arg_rows.push(vs);
@@ -6970,7 +7105,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             let values = self.compute_sub_values(e, rep).await?;
             let mut pos = 0;
             let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
-            return crate::query::eval::<S::Error>(&e2, &Ctx::Group { rows, rep });
+            return crate::query::eval::<S::Error>(
+                &e2,
+                &Ctx::group(rows, rep).with(&self.conn.env),
+            );
         }
         // Per-group-row aggregate path (v0.11): fold every
         // outermost aggregate over per-row argument values,
@@ -6992,7 +7130,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             agg_values.as_slice(),
             &mut agg_pos,
         );
-        crate::query::eval::<S::Error>(&e2, &Ctx::Group { rows, rep })
+        crate::query::eval::<S::Error>(&e2, &Ctx::group(rows, rep).with(&self.conn.env))
     }
 
     /// Fold one aggregate node over a group's rows, evaluating
@@ -7059,7 +7197,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         {
             return self.extremum_rep(kind, arg, grows, empty_rep).await;
         }
-        pick_rep::<S::Error>(qp, grows, empty_rep)
+        pick_rep::<S::Error>(&self.conn.env, qp, grows, empty_rep)
     }
 
     /// The `pick_rep_qp_async` mirror for a subquery's group.
@@ -7081,7 +7219,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         {
             return self.extremum_rep(kind, arg, grows, empty_rep).await;
         }
-        pick_rep_sub::<S::Error>(plan, grows, empty_rep)
+        pick_rep_sub::<S::Error>(&self.conn.env, plan, grows, empty_rep)
     }
 
     /// The extremum row of a group under the min/max aggregate
@@ -7878,6 +8016,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     v.rowid_alias,
                     ConflictAction::Abort,
                     None,
+                    Some(&self.conn.env),
                 )?;
             }
         }
@@ -8667,12 +8806,21 @@ struct Produced {
 /// subquery execution.
 #[cfg(feature = "v04")]
 fn join_all<E>(
+    env: &crate::query::Env,
     qp: &QueryPlan,
     src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
     out: &mut AVec<RowData>,
 ) -> Result<(), E> {
     let mut matched = right_match_flags(qp.sources.as_slice(), src_rows);
-    join_rows::<E>(qp, src_rows, 0, &mut RowData::empty(), &mut matched, out)?;
+    join_rows::<E>(
+        env,
+        qp,
+        src_rows,
+        0,
+        &mut RowData::empty(),
+        &mut matched,
+        out,
+    )?;
     let empty = RowData::empty();
     for (i, (sp, rows)) in qp.sources.iter().zip(src_rows.iter()).enumerate() {
         if !sp.kind.pads_left() {
@@ -8683,7 +8831,7 @@ fn join_all<E>(
                 continue;
             }
             let mut acc = left_padded(&empty, qp.sources.as_slice(), i, vals, *rowid);
-            join_rows::<E>(qp, src_rows, i + 1, &mut acc, &mut matched, out)?;
+            join_rows::<E>(env, qp, src_rows, i + 1, &mut acc, &mut matched, out)?;
         }
     }
     Ok(())
@@ -8696,6 +8844,7 @@ fn join_all<E>(
 /// filter applies to complete rows.
 #[cfg(feature = "v04")]
 fn join_rows<E>(
+    env: &crate::query::Env,
     qp: &QueryPlan,
     src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
     idx: usize,
@@ -8707,7 +8856,8 @@ fn join_rows<E>(
         let keep = match &qp.filter {
             None => true,
             Some(f) => {
-                crate::query::truthy(&crate::query::eval::<E>(f, &Ctx::Row(acc))?) == Some(true)
+                crate::query::truthy(&crate::query::eval::<E>(f, &Ctx::of(acc).with(env))?)
+                    == Some(true)
             }
         };
         if keep {
@@ -8725,13 +8875,14 @@ fn join_rows<E>(
         let on_ok = match &sp.on {
             None => true,
             Some(on) => {
-                crate::query::truthy(&crate::query::eval::<E>(on, &Ctx::Row(acc))?) == Some(true)
+                crate::query::truthy(&crate::query::eval::<E>(on, &Ctx::of(acc).with(env))?)
+                    == Some(true)
             }
         };
         if on_ok {
             any = true;
             mark_matched(matched, idx, ri);
-            join_rows::<E>(qp, src_rows, idx + 1, acc, matched, out)?;
+            join_rows::<E>(env, qp, src_rows, idx + 1, acc, matched, out)?;
         }
         while acc.vals.len() > base {
             acc.vals.pop();
@@ -8743,7 +8894,7 @@ fn join_rows<E>(
             acc.vals.push(OwnedValue::Null);
         }
         acc.rowids.push(None);
-        join_rows::<E>(qp, src_rows, idx + 1, acc, matched, out)?;
+        join_rows::<E>(env, qp, src_rows, idx + 1, acc, matched, out)?;
         while acc.vals.len() > base {
             acc.vals.pop();
         }
@@ -8754,11 +8905,15 @@ fn join_rows<E>(
 
 /// Group (when the plan aggregates) and project joined rows.
 #[cfg(feature = "v04")]
-fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E> {
+fn project_rows<E>(
+    env: &crate::query::Env,
+    qp: &QueryPlan,
+    rows: &[RowData],
+) -> Result<AVec<Produced>, E> {
     let mut out = AVec::new();
     if !qp.has_agg {
         for r in rows {
-            let ctx = Ctx::Row(r);
+            let ctx = Ctx::of(r).with(env);
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -8810,7 +8965,7 @@ fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E
         let gcolls = crate::query::exprs_colls(qp.group_by.as_slice());
         let gdesc = group_desc(qp.group_by.as_slice(), qp.order_by.as_slice());
         for r in rows {
-            let ctx = Ctx::Row(r);
+            let ctx = Ctx::of(r).with(env);
             let mut key = AVec::new();
             for g in qp.group_by.iter() {
                 key.push(crate::query::eval::<E>(g, &ctx)?);
@@ -8854,11 +9009,8 @@ fn project_rows<E>(qp: &QueryPlan, rows: &[RowData]) -> Result<AVec<Produced>, E
         });
     }
     for (_, grows) in groups.iter() {
-        let rep = pick_rep::<E>(qp, grows.as_slice(), &empty_rep)?;
-        let ctx = Ctx::Group {
-            rows: grows.as_slice(),
-            rep: &rep,
-        };
+        let rep = pick_rep::<E>(env, qp, grows.as_slice(), &empty_rep)?;
+        let ctx = Ctx::group(grows.as_slice(), &rep).with(env);
         if let Some(h) = &qp.having
             && crate::query::truthy(&crate::query::eval::<E>(h, &ctx)?) != Some(true)
         {
@@ -8954,6 +9106,7 @@ fn extremum_step(
 /// aggregate `rep_minmax` picks (see `extremum_step`).
 #[cfg(feature = "v04")]
 fn pick_rep_from<E>(
+    env: &crate::query::Env,
     items: &[RExpr],
     having: Option<&RExpr>,
     order_by: &[(RExpr, crate::sql::SortOrder)],
@@ -8970,7 +9123,7 @@ fn pick_rep_from<E>(
     let mut best: Option<OwnedValue> = None;
     let mut rep = first;
     for r in grows {
-        let v = crate::query::eval::<E>(arg, &Ctx::Row(r))?;
+        let v = crate::query::eval::<E>(arg, &Ctx::of(r).with(env))?;
         if extremum_step(kind, coll, &mut best, v) {
             rep = r;
         }
@@ -8979,8 +9132,14 @@ fn pick_rep_from<E>(
 }
 
 #[cfg(feature = "v04")]
-fn pick_rep<E>(qp: &QueryPlan, grows: &[RowData], empty_rep: &RowData) -> Result<RowData, E> {
+fn pick_rep<E>(
+    env: &crate::query::Env,
+    qp: &QueryPlan,
+    grows: &[RowData],
+    empty_rep: &RowData,
+) -> Result<RowData, E> {
     pick_rep_from::<E>(
+        env,
         qp.items.as_slice(),
         qp.having.as_ref(),
         qp.order_by.as_slice(),
@@ -8992,11 +9151,13 @@ fn pick_rep<E>(qp: &QueryPlan, grows: &[RowData], empty_rep: &RowData) -> Result
 /// The `pick_rep` rule for a subquery's group.
 #[cfg(feature = "v06")]
 fn pick_rep_sub<E>(
+    env: &crate::query::Env,
     plan: &crate::query::SubPlan,
     grows: &[RowData],
     empty_rep: &RowData,
 ) -> Result<RowData, E> {
     pick_rep_from::<E>(
+        env,
         plan.items.as_slice(),
         plan.having.as_ref(),
         plan.order_by.as_slice(),

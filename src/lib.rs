@@ -18,6 +18,8 @@ extern crate std;
 pub mod arena;
 pub mod btree;
 pub mod error;
+#[cfg(feature = "v16")]
+pub mod func;
 pub mod pager;
 #[cfg(feature = "v04")]
 pub mod query;
