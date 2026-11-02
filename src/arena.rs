@@ -394,6 +394,9 @@ impl<T> AVec<T> {
     pub fn iter(&self) -> core::slice::Iter<'_, T> {
         self.vec.iter()
     }
+    pub fn insert(&mut self, at: usize, v: T) {
+        self.vec.insert(at, v);
+    }
 }
 
 impl<T> Default for AVec<T> {
