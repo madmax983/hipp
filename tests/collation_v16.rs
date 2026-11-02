@@ -589,6 +589,255 @@ fn unknown_collations_are_refused() {
     ]);
 }
 
+/// Review regression: COLLATE after ASC / DESC in a table
+/// UNIQUE / PRIMARY KEY or an index column is the pin's syntax
+/// error. hipp once accepted `UNIQUE (a DESC COLLATE NOCASE, b)`,
+/// dropped `b`, and stored SQL the pin could not load.
+#[test]
+fn collate_after_sort_order_is_a_syntax_error() {
+    let tw = twins("descoll", "CREATE TABLE t(a)");
+    for sql in [
+        "CREATE TABLE k(a, b, UNIQUE (a DESC COLLATE NOCASE, b))",
+        "CREATE TABLE k(a, b, PRIMARY KEY (a ASC COLLATE NOCASE))",
+        "CREATE INDEX i ON t(a DESC COLLATE NOCASE)",
+    ] {
+        assert!(tw.same(sql).is_some(), "both refuse: {sql}");
+    }
+    // Nothing was created: k is unknown to both engines.
+    assert!(tw.same("SELECT * FROM k").is_some());
+    tw.all(&[
+        "CREATE TABLE k(a, b, UNIQUE (a COLLATE NOCASE DESC, b))",
+        "INSERT INTO k VALUES ('x', 1)",
+        "INSERT INTO k VALUES ('X', 2)",
+        "SELECT * FROM k ORDER BY rowid",
+    ]);
+    tw.refuse("INSERT INTO k VALUES ('X', 1)", SchemaKind::UniqueViolation);
+    tw.finish("SELECT * FROM k ORDER BY rowid");
+}
+
+/// Review regression: `excluded.<col>` is a register reference
+/// on the pin — BINARY, no affinity — whatever the target
+/// column declares (hipp gave it the column's NOCASE collation,
+/// and its affinity).
+#[test]
+fn upsert_excluded_compares_binary_without_affinity() {
+    let tw = twins(
+        "excl",
+        "CREATE TABLE k(a TEXT COLLATE NOCASE UNIQUE, n); INSERT INTO k VALUES ('x', 1); \
+         CREATE TABLE m(a TEXT UNIQUE, n); INSERT INTO m VALUES ('1', 1)",
+    );
+    tw.all(&[
+        "INSERT INTO k VALUES ('X', 2) ON CONFLICT (a) DO UPDATE SET n = excluded.n \
+         WHERE excluded.a = 'x'",
+        "SELECT * FROM k",
+        "INSERT INTO k VALUES ('X', 5) ON CONFLICT (a) DO UPDATE SET n = (excluded.a = 'x')",
+        "SELECT * FROM k",
+        // The other operand's collation still applies.
+        "INSERT INTO k VALUES ('X', 5) ON CONFLICT (a) DO UPDATE SET n = (excluded.a = a)",
+        "SELECT * FROM k",
+        "INSERT INTO k VALUES ('X', 5) ON CONFLICT (a) DO UPDATE SET n = (a = excluded.a) + 10",
+        "SELECT * FROM k",
+        "INSERT INTO k VALUES ('X', 5) ON CONFLICT (a) DO UPDATE \
+         SET n = (excluded.a IN ('x', 'y')) + 20",
+        "SELECT * FROM k",
+        // No affinity: the TEXT column's '1' is not 1.
+        "INSERT INTO m VALUES ('1', 2) ON CONFLICT (a) DO UPDATE SET n = (excluded.a = 1)",
+        "SELECT * FROM m",
+        "INSERT INTO m VALUES ('1', 2) ON CONFLICT (a) DO UPDATE SET n = (1 = excluded.a) + 10",
+        "SELECT * FROM m",
+        "INSERT INTO m VALUES ('1', 2) ON CONFLICT (a) DO UPDATE SET n = excluded.n \
+         WHERE excluded.a = 1",
+        "SELECT * FROM m",
+        // No affinity either way round: TEXT against it converts
+        // it; a written IN list by its (absent) affinity does not.
+        "CREATE TABLE q(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE UNIQUE, n INTEGER, \
+         s TEXT, b BLOB)",
+        "INSERT INTO q VALUES (1, 'x', 1, '1', 1)",
+        "INSERT INTO q VALUES (1, 'X', 1, 'z', 1) ON CONFLICT (a) DO UPDATE SET s = \
+         (excluded.n = s) || (s = excluded.n) || (excluded.n IN (s, 'q')) || \
+         (excluded.b = '1') || (excluded.n = b) || (b = excluded.n) || (excluded.id = '1') || \
+         (excluded.a < 'Y') || max(excluded.a, a) || (excluded.a IN (a))",
+        "SELECT * FROM q",
+    ]);
+    #[cfg(feature = "v16")]
+    tw.all(&[
+        "INSERT INTO q VALUES (1, 'X', 1, 'z', 1) ON CONFLICT (a) DO UPDATE SET s = \
+         (excluded.a COLLATE NOCASE = 'x') || ('x' = excluded.a COLLATE NOCASE)",
+        "SELECT * FROM q",
+    ]);
+    tw.finish("SELECT * FROM k UNION ALL SELECT * FROM m");
+}
+
+/// Review regression (older than collations, hit often by
+/// NOCASE / RTRIM UNIQUE corpora): UPDATE OR REPLACE visits the
+/// rowids it collected, re-reading each — a row an earlier
+/// REPLACE deleted is skipped, and a rowid another row moved
+/// into is updated from its current content.
+#[test]
+fn update_or_replace_skips_rows_it_deleted() {
+    let tw = twins(
+        "updrep",
+        "CREATE TABLE k(a TEXT UNIQUE, n); INSERT INTO k VALUES ('x', 1), ('x ', 2); \
+         CREATE TABLE r(a TEXT COLLATE RTRIM UNIQUE, n); \
+         INSERT INTO r VALUES ('x', 1), ('y', 2), ('z', 3); \
+         CREATE TABLE c(a TEXT COLLATE NOCASE UNIQUE, n); \
+         INSERT INTO c VALUES ('a', 1), ('B', 2), ('b', 3), ('C', 4); \
+         CREATE TABLE w(v, x UNIQUE); INSERT INTO w VALUES ('a', 1), ('b', 2), ('c', 3); \
+         CREATE TABLE p(id INTEGER PRIMARY KEY, v); \
+         INSERT INTO p VALUES (1, 'a'), (2, 'b'), (5, 'c')",
+    );
+    tw.all(&[
+        "UPDATE OR REPLACE k SET a = a || ' '",
+        "SELECT n, a FROM k ORDER BY n",
+        "UPDATE OR REPLACE r SET a = 'x ' WHERE n < 3",
+        "SELECT n, a FROM r ORDER BY n",
+        "UPDATE OR REPLACE c SET a = upper(a), n = n * 10",
+        "SELECT n, a FROM c ORDER BY n",
+        "UPDATE OR REPLACE w SET x = x + 1, v = v || 'x' RETURNING *",
+        "SELECT * FROM w ORDER BY rowid",
+        "UPDATE OR REPLACE p SET id = id + 1, v = v || 'x'",
+        "SELECT * FROM p ORDER BY id",
+    ]);
+    tw.finish(
+        "SELECT 'k', * FROM k UNION ALL SELECT 'r', * FROM r UNION ALL SELECT 'c', * FROM c \
+         UNION ALL SELECT 'w', * FROM w UNION ALL SELECT 'p', * FROM p",
+    );
+    // A random NOCASE / RTRIM UNIQUE corpus under UPDATE OR
+    // REPLACE (where the old row-revival showed up).
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let words = ["a", "A", "a ", "b", "B", "b  ", "ab", "AB", "c"];
+    let mut rows = Vec::new();
+    for id in 1..=40 {
+        rows.push(format!("({id}, {}, {})", lit(rng.pick(&words)), id % 7));
+    }
+    let tw = twins(
+        "updrep-gen",
+        &format!(
+            "CREATE TABLE g(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE, n, \
+             b TEXT COLLATE RTRIM UNIQUE); CREATE UNIQUE INDEX ga ON g(a, n); \
+             INSERT OR IGNORE INTO g(id, a, n) VALUES {}",
+            rows.join(", ")
+        ),
+    );
+    let sets = [
+        "a = upper(a)",
+        "a = lower(a) || ' '",
+        "n = n % 3",
+        "b = a",
+        "b = a || ' ', n = 0",
+        "a = 'a', n = id % 2",
+    ];
+    for _ in 0..12 {
+        let set = rng.pick(&sets);
+        let cut = rng.below(40);
+        tw.same(&format!("UPDATE OR REPLACE g SET {set} WHERE id > {cut}"));
+        tw.same("SELECT count(*) FROM g");
+    }
+    tw.finish("SELECT * FROM g ORDER BY id");
+}
+
+/// Review regression (older than collations): a written
+/// `x IN (list)` converts by the LEFT operand's affinity alone;
+/// `x IN (SELECT ...)` compares like `=` against the subquery's
+/// column.
+#[test]
+fn in_list_converts_by_the_left_operands_affinity() {
+    let tw = twins(
+        "inaff",
+        "CREATE TABLE t(d, e INTEGER, f TEXT, b BLOB, r REAL, n NUMERIC); \
+         INSERT INTO t VALUES ('1', 1, '1', 1, 1.0, '1')",
+    );
+    tw.all(&[
+        "SELECT d IN (e), 1 IN (f), d IN (e, 5), d IN (SELECT e FROM t) FROM t",
+        "SELECT f IN (b, 5), f IN (d, 5), e IN ('1', 5), e IN (f, 7), f IN (e, 7) FROM t",
+        "SELECT e IN (SELECT f FROM t), f IN (SELECT e FROM t), d IN (SELECT f FROM t), \
+         f IN (SELECT d FROM t) FROM t",
+        "SELECT '1' IN (e, 7), CAST(1 AS TEXT) IN (e, 7), '1' IN (CAST(1 AS INTEGER)), \
+         1 IN (CAST('1' AS TEXT)) FROM t",
+        "SELECT r IN ('1', 'x'), r IN ('1.0'), n IN (f, 'z'), e NOT IN (f, 9), NULL IN (f), \
+         f IN (NULL, 1), f IN (NULL, '1'), rowid IN ('1', 2), rowid IN (f, 2) FROM t",
+        "SELECT d FROM t WHERE d IN (e, f)",
+        "SELECT e FROM t WHERE e IN (d, 9)",
+        "SELECT d NOT IN (e, 2), b IN (f, 2), b IN (1) FROM t",
+    ]);
+}
+
+/// Review regression: a file whose schema names a collation
+/// hipp does not have (one an application registered) opens;
+/// that table is listed but refused, the rest of the file works.
+/// (The file is the oracle's, with `nocase` patched in place to
+/// a same-length unknown name — no engine here can register
+/// one.)
+#[test]
+fn files_naming_unknown_collations_still_open() {
+    let path = common::temp_db("v16co-ucoll");
+    assert!(
+        oracle_raw(
+            &path,
+            "CREATE TABLE other(x); INSERT INTO other VALUES (1), (2); \
+             CREATE TABLE t(a TEXT COLLATE nocase UNIQUE, b); CREATE INDEX tb ON t(b); \
+             INSERT INTO t VALUES ('q', 1);"
+        )
+        .0
+    );
+    let mut bytes = std::fs::read(&path).expect("read");
+    let from = b"COLLATE nocase";
+    let at = bytes
+        .windows(from.len())
+        .position(|w| w == from)
+        .expect("schema text");
+    bytes[at..at + from.len()].copy_from_slice(b"COLLATE mycoll");
+    std::fs::write(&path, &bytes).expect("write");
+    // The oracle reads the other table of such a file.
+    assert_eq!(
+        oracle_raw(&path, "SELECT x FROM other;"),
+        (true, vec!["1".into(), "2".into()])
+    );
+    block_on(async {
+        let mut db = open(&path).await;
+        assert_eq!(
+            try_collect(&mut db, "SELECT x FROM other ORDER BY x DESC")
+                .await
+                .expect("other"),
+            ["2", "1"]
+        );
+        try_collect(&mut db, "INSERT INTO other VALUES (3)")
+            .await
+            .expect("insert other");
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT (SELECT count(*) FROM t)",
+            "SELECT * FROM other, t",
+            "INSERT INTO t VALUES ('z', 2)",
+            "UPDATE t SET b = 3",
+            "DELETE FROM t",
+            "CREATE INDEX t2 ON t(b)",
+            "ALTER TABLE t ADD COLUMN c",
+        ] {
+            match try_collect(&mut db, sql).await {
+                Err(Error::Schema {
+                    kind: SchemaKind::UnknownCollation,
+                }) => {}
+                other => panic!("{sql}: expected UnknownCollation, got {other:?}"),
+            }
+        }
+        // Its name stays taken.
+        match try_collect(&mut db, "CREATE TABLE t(x)").await {
+            Err(Error::Schema {
+                kind: SchemaKind::DuplicateTable,
+            }) => {}
+            other => panic!("expected DuplicateTable, got {other:?}"),
+        }
+        let names: Vec<&[u8]> = db.tables().iter().map(|t| t.name).collect();
+        assert_eq!(names, [&b"other"[..], &b"t"[..]]);
+        // DROP TABLE needs no comparisons: it works, as on the pin.
+        try_collect(&mut db, "DROP TABLE t").await.expect("drop");
+    });
+    assert_eq!(oracle_raw(&path, "PRAGMA integrity_check;").1, ["ok"]);
+    assert_eq!(oracle_raw(&path, "SELECT x FROM other;").1, ["1", "2", "3"]);
+    assert_eq!(oracle_raw(&path, ".tables").1, ["other"]);
+}
+
 // ---------------- the COLLATE operator (v16) ----------------
 
 #[cfg(feature = "v16")]

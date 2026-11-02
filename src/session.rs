@@ -972,7 +972,8 @@ impl<S: Storage> Connection<S> {
                     .find(&self.catalog_arena, tname)
                     .ok_or(Error::Schema {
                         kind: SchemaKind::UnknownTable,
-                    })?;
+                    })?
+                    .usable()?;
                 let mut cols = AVec::new();
                 for cd in columns.iter() {
                     let nb = handle_bytes(arena, cd.name);
@@ -1062,7 +1063,8 @@ impl<S: Storage> Connection<S> {
                     .find(&self.catalog_arena, tname)
                     .ok_or(Error::Schema {
                         kind: SchemaKind::UnknownTable,
-                    })?;
+                    })?
+                    .usable()?;
                 #[cfg(not(feature = "v08"))]
                 let _ = select;
                 #[cfg(not(feature = "v07"))]
@@ -1328,7 +1330,7 @@ impl<S: Storage> Connection<S> {
             } => {
                 let tname = handle_bytes(arena, *table);
                 let t = match self.catalog.find(&self.catalog_arena, tname) {
-                    Some(t) => t,
+                    Some(t) => t.usable()?,
                     None => {
                         if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
                             return Err(Error::Unsupported);
@@ -1590,7 +1592,7 @@ impl<S: Storage> Connection<S> {
     ) -> Result<&crate::schema::TableDef, S::Error> {
         let tname = handle_bytes(arena, *table);
         match self.catalog.find(&self.catalog_arena, tname) {
-            Some(t) => Ok(t),
+            Some(t) => t.usable(),
             None => {
                 if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
                     return Err(Error::Schema {
@@ -2338,16 +2340,20 @@ impl<S: Storage> Connection<S> {
                 // reached by qualified references only.
                 let (sources, offsets) = self.single_source(t, tname);
                 let cur = ScopeGroup::new(sources, offsets, 0);
+                // The pin reads `excluded.<col>` as a register
+                // reference: no column affinity and no column
+                // collation (BINARY) in comparisons, whatever the
+                // target column declares.
                 let mut ex_cols = AVec::new();
                 for c in t.columns.iter() {
                     ex_cols.push((
                         copy_vec(handle_bytes(&self.catalog_arena, c.name)),
-                        c.affinity,
+                        crate::record::Affinity::Blob,
                     ));
                 }
                 let mut ex_sources = AVec::new();
                 let mut ex = SourceDesc::new(copy_vec(b"excluded"), ex_cols, t.rowid_alias, true);
-                ex.colls = table_colls(t);
+                ex.registers = true;
                 ex_sources.push(ex);
                 let mut ex_offsets = AVec::new();
                 ex_offsets.push(t.columns.len());
@@ -2661,7 +2667,7 @@ impl<S: Storage> Connection<S> {
     fn plan_legacy_select(&self, stmt: &SelectStmt, arena: &Arena) -> Result<Plan, S::Error> {
         let tname = handle_bytes(arena, stmt.from.as_slice()[0].table);
         let t = match self.catalog.find(&self.catalog_arena, tname) {
-            Some(t) => t,
+            Some(t) => t.usable()?,
             None => {
                 if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
                     // Views are inert in v0.4 (SPEC §2).
@@ -3131,7 +3137,7 @@ impl<S: Storage> Connection<S> {
             }
             let tname = handle_bytes(arena, s.table);
             let t = match self.catalog.find(&self.catalog_arena, tname) {
-                Some(t) => t,
+                Some(t) => t.usable()?,
                 None => {
                     if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
                         // Views are inert (SPEC §2): stored,
@@ -5782,6 +5788,35 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(out)
     }
 
+    /// Re-read one row of an UPDATE's target by rowid (v0.16),
+    /// decoded as `scan_write_rows` decodes it; `None` when the
+    /// row is gone (an OR REPLACE earlier in the statement
+    /// deleted it).
+    #[cfg(feature = "v05")]
+    async fn reload_write_row(
+        &mut self,
+        root: u32,
+        ncols: usize,
+        defaults: &[OwnedValue],
+        rowid: i64,
+    ) -> Result<Option<WriteRow>, S::Error> {
+        let Some(payload) = btree::seek_rowid(&mut self.conn.pager, root, rowid).await? else {
+            return Ok(None);
+        };
+        let rules = self.plan_rules();
+        let gcols = rules.as_ref().and_then(|r| r.gcols.as_ref());
+        let mut rec = crate::rules::decode_rec::<S::Error>(
+            payload.as_slice(),
+            ncols,
+            defaults,
+            gcols.map(|g| g.virt.as_slice()),
+        )?;
+        if let Some(g) = gcols {
+            g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
+        }
+        Ok(Some(WriteRow { rowid, rec }))
+    }
+
     #[cfg(feature = "v05")]
     async fn exec_update(&mut self) -> Result<(), S::Error> {
         let (root, rowid_alias, ncols, defaults, affs, not_null, sets, filter, conflict_action) =
@@ -5859,7 +5894,31 @@ impl<'c, S: Storage> Statement<'c, S> {
         for (i, f) in not_null.iter().enumerate() {
             nn_assigned.push(*f && assigned.as_slice().get(i).copied().unwrap_or(false));
         }
-        for wrow in rows.iter() {
+        // Set once an OR REPLACE deletion or a rowid change has
+        // rewritten rows other than the one being updated: from
+        // then on each collected rowid is re-read before it is
+        // updated. The pin collects rowids first and re-reads
+        // each one, so a row an earlier REPLACE deleted is never
+        // visited, and a rowid another row moved into is updated
+        // from its current content (probed: UPDATE OR REPLACE t
+        // SET id=id+1, v=v||'x' over ids 1,2 leaves 3|axx).
+        let mut stale = false;
+        for snap_row in rows.iter() {
+            let reloaded;
+            let wrow = if stale {
+                match self
+                    .reload_write_row(root, ncols, defaults.as_slice(), snap_row.rowid)
+                    .await?
+                {
+                    Some(r) => {
+                        reloaded = r;
+                        &reloaded
+                    }
+                    None => continue,
+                }
+            } else {
+                snap_row
+            };
             let base_rd = row_data_for(
                 rowid_alias,
                 affs.as_slice(),
@@ -6032,6 +6091,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         ConflictAction::Replace => {
                             #[cfg(feature = "v07")]
                             {
+                                stale = true;
                                 for v in conflict_rows.iter() {
                                     self.delete_row_completely(
                                         root,
@@ -6062,6 +6122,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     new_rowid,
                 )
                 .await?;
+                stale |= new_rowid != cur_rowid;
                 cur_rec = new_rec;
                 cur_rowid = new_rowid;
                 applied = true;

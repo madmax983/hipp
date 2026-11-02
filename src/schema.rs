@@ -97,9 +97,32 @@ pub struct TableDef {
     /// A STRICT table (v0.16, `v16`).
     #[cfg(feature = "v16")]
     pub strict: bool,
+    /// The stored SQL names a collating sequence hipp does not
+    /// have (an application-registered one, v0.16). The table
+    /// is listed (its name is taken, `.schema` shows it) but
+    /// has no columns here, and every statement that reads or
+    /// writes it is refused with `SchemaKind::UnknownCollation`
+    /// (see `TableDef::usable`); the rest of the file works.
+    #[cfg(any(feature = "v04", feature = "indexes"))]
+    pub foreign_coll: bool,
 }
 
 impl TableDef {
+    /// The table, unless it names a collating sequence hipp
+    /// does not have (v0.16): statements that read or write
+    /// such a table are refused with
+    /// `SchemaKind::UnknownCollation` — remedy: register no
+    /// custom collation, or use an engine that has it.
+    pub fn usable<E>(&self) -> Result<&TableDef, E> {
+        #[cfg(any(feature = "v04", feature = "indexes"))]
+        if self.foreign_coll {
+            return Err(Error::Schema {
+                kind: crate::error::SchemaKind::UnknownCollation,
+            });
+        }
+        Ok(self)
+    }
+
     /// Whether any column is generated (v0.16).
     #[cfg(feature = "v04")]
     pub fn has_generated(&self) -> bool {
@@ -336,7 +359,34 @@ pub async fn build_catalog<S: Storage>(
         }
         let sql = row.sql.as_ref().expect("checked");
         scratch.reset();
-        let ast = parse::<S::Error>(sql.as_slice(), &scratch)?;
+        let ast = match parse::<S::Error>(sql.as_slice(), &scratch) {
+            Ok(a) => a,
+            // v0.16: a collation hipp does not have (one an
+            // application registered) — the pin opens such a
+            // file and errors only where the collation is used.
+            // Keep the table listed but unusable; the rest of
+            // the file still opens.
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            Err(Error::Schema {
+                kind: crate::error::SchemaKind::UnknownCollation,
+            }) => {
+                catalog.tables.push(TableDef {
+                    name: intern(catalog_arena, row.name.as_slice())?,
+                    root: row.root,
+                    sql: intern(catalog_arena, sql.as_slice())?,
+                    columns: AVec::new(),
+                    rowid_alias: None,
+                    auto_sets: AVec::new(),
+                    #[cfg(feature = "v04")]
+                    checks: AVec::new(),
+                    #[cfg(feature = "v16")]
+                    strict: false,
+                    foreign_coll: true,
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let Ast::CreateTable {
             columns,
             pk_columns,
@@ -448,6 +498,8 @@ pub async fn build_catalog<S: Storage>(
             checks: check_texts,
             #[cfg(feature = "v16")]
             strict,
+            #[cfg(any(feature = "v04", feature = "indexes"))]
+            foreign_coll: false,
         });
     }
 

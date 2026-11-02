@@ -602,8 +602,8 @@ silent-wrong DIFF 1 → 0 (column COLLATE was the last).
   and unary `+` pass a column's through, functions and scalar
   subqueries carry none, the rowid / IPK none. Applied to `=`
   `<` IS BETWEEN, CASE, joins' ON / USING / NATURAL, CHECK and
-  generated-column expressions; an IN list compares by its left
-  operand only (a single constant item follows the binary rule:
+  generated-column expressions; an IN list compares (and, since
+  the review fixes, converts affinity) by its left operand only (a single constant item follows the binary rule:
   the pin rewrites `x IN (c)` to `x = +c`); `x IN (SELECT ...)`
   by the binary rule against the subquery's item — its
   *rightmost* core's for a compound (carried through
@@ -709,8 +709,49 @@ ends either operand, `'x' LIKE 'X' ESCAPE x'41'` 1. CTAS does
 not copy a column's COLLATE. `SELECT 1 COLLATE bogus` runs on
 the pin (the name is looked up only when used).
 
+**Review fixes (second commit):**
+
+- **Upsert `excluded.<col>`** (a regression of the first
+  commit) took the target column's collation, and (older) its
+  affinity. On the pin it is a register reference with
+  neither: `excluded.a = 'x'` is BINARY over a NOCASE `a`,
+  `excluded.a = a` takes `a`'s NOCASE, and a TEXT column's
+  `'1'` is not `1`. `SourceDesc::registers` resolves such
+  references as `+col` with no collation
+  (`RExpr::Column(.., None)`).
+- **`UNIQUE (a DESC COLLATE NOCASE, b)`** (accepted with `b`
+  dropped, stored as SQL the pin cannot load) was already a
+  syntax error after the column-constraints review commit's
+  clause-by-clause walk; regression tests added (also for
+  PRIMARY KEY and CREATE INDEX).
+- **UPDATE OR REPLACE** (older, any collation) visited rows an
+  earlier REPLACE in the same statement had deleted, and wrote
+  them back. The pin collects rowids and re-reads each one: a
+  deleted row is skipped, and a rowid another row moved into
+  is updated from its current content (`SET id = id + 1,
+  v = v || 'x'` over ids 1, 2 leaves `3|axx`). `exec_update`
+  now re-reads each row (`reload_write_row`) once a REPLACE
+  deletion or a rowid change has happened.
+- **`x IN (list)` affinity** (older): a written list converts
+  both sides by the LEFT operand's affinity only (no affinity:
+  no conversion), as the pin's `OP_Eq` / ephemeral-index paths
+  do. hipp used the binary-comparison rule, so `d IN (e)` with
+  `d` untyped `'1'` and `e INTEGER 1` gave 1 (pin 0). `IN
+  (SELECT ...)` keeps the binary rule (`InList`'s new
+  `from_sub` flag marks the substituted list).
+- **Files naming a non-built-in collation** failed to open at
+  all (a regression for files of applications that register
+  collations). Now only that table is refused (gap below).
+- Not changed: GROUP BY over a column with a differently
+  collated index shows the pin's index-order representative
+  (plan-dependent; gap below).
+
 **Gates:** `ci/local-gates.sh` (full run) green. New suites:
-`tests/collation_v16.rs` (18 tests: column-collation
+`tests/collation_v16.rs` (23 tests after the review fixes:
+COLLATE after ASC / DESC, upsert `excluded`, UPDATE OR REPLACE
+with a 12-statement PRNG corpus over NOCASE / RTRIM UNIQUE,
+IN-list affinity, and a file naming an unknown collation join
+the first 18: column-collation
 comparisons, ordering / grouping / DISTINCT / aggregates, ties,
 the GROUP BY direction and bare-column regressions, compound
 merges, subqueries / derived tables / joins, CHECK / generated /
@@ -722,7 +763,7 @@ unknown names, the LIKE matcher and pattern limit, and under
 `v16` the COLLATE operator corpus, GLOB / ESCAPE / functions,
 plus two PRNG corpora — 40×18 random LIKE / ESCAPE / GLOB
 pairs and 60 random collated queries; the 15 ungated ones also
-pass in a `std,indexes,v10` build),
+pass in a `std,indexes,v10` build, 20 after the review),
 `hipp-cli/tests/cli_v16_collation.rs` (3 byte-identical
 batches one-shot and over stdin, REAL / NULL / blob rendering
 included, plus a `.dump` replay of a collated, indexed table),
@@ -738,7 +779,12 @@ comparators (~1.5 KB), the merge-based compound evaluator
 (~1 KB over the removed set version), the pattern matcher and
 like / glob functions (~1.2 KB), index `KeyOrder` plumbing and
 upsert-target matching, the bare-column and GROUP BY order
-fixes).
+fixes). Review fixes: tiny **76,016 B** (Δ **−32 B** vs the
+76,048 ratchet the later units left; ratchet lowered; code
+layout only, as none of the fixes is in the tiny profile); full
+**289,995 B** (Δ **+1,240 B** vs 288,755, ratchet raised: the
+UPDATE row re-read, the IN-list affinity rule and its flag,
+register references, the foreign-collation table handling).
 
 **Honest gaps:**
 
@@ -749,9 +795,26 @@ fixes).
 - An unknown name in the `COLLATE` operator is refused at
   prepare even where the pin, which looks names up only when a
   comparison or sort uses them, runs the statement (`SELECT 1
-  COLLATE bogus`). A file whose schema names a collation other
-  than the three built-ins fails to open (`UnknownCollation`),
-  as files with WITHOUT ROWID tables do.
+  COLLATE bogus`).
+- A table whose stored SQL names a collation hipp does not
+  have (an application-registered one) is listed, but every
+  statement that reads or writes it is refused
+  (`UnknownCollation`). The pin reads it and errors only where
+  the collation is used, e.g. `SELECT * FROM t` runs there. An
+  index naming one stays opaque (its table's writes refused;
+  the pin errors there too). `.dump` stops at such a table.
+  DROP TABLE works.
+- GROUP BY / DISTINCT without ORDER BY over a column with a
+  *differently* collated index (`ON k(a COLLATE BINARY)` on a
+  NOCASE `a`): the pin scans the covering index, so a group's
+  shown value is the first row in that index's order (`B`);
+  hipp shows the first in rowid order (`b`). This is
+  plan-dependent row choice, the same class as the older
+  BINARY-index unordered-output differences; matching it means
+  modelling the pin's covering-index choice, a planner project.
+- `x IN ((SELECT ...))` (a lone parenthesised subquery item,
+  which the pin rewrites to `x IN (SELECT ...)`) is a parse
+  error in hipp (older, a refusal).
 - `PRAGMA case_sensitive_like` is not offered (hipp has no
   PRAGMA statements yet); LIKE is always case-insensitive for
   ASCII, the pin's default.

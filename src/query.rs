@@ -121,8 +121,11 @@ pub enum RExpr {
     AffLiteral(OwnedValue, Affinity),
     /// A column slot with its comparison affinity and its
     /// collating sequence (v0.16: the column's `COLLATE`; a
-    /// derived table's column carries its subquery item's).
-    Column(usize, Affinity, Coll),
+    /// derived table's column carries its subquery item's;
+    /// `None` for a register reference — an upsert's
+    /// `excluded.<col>` — which has none, so the other
+    /// operand's collation decides a comparison).
+    Column(usize, Affinity, Option<Coll>),
     Rowid(usize),
     Binary(BinOp, Box<RExpr>, Box<RExpr>),
     Neg(Box<RExpr>),
@@ -131,7 +134,13 @@ pub enum RExpr {
     Pos(Box<RExpr>),
     Not(Box<RExpr>),
     IsNull(Box<RExpr>, bool),
-    InList(Box<RExpr>, AVec<RExpr>, bool),
+    /// `x [NOT] IN (list)`: (operand, items, negated, from_sub).
+    /// `from_sub` marks the literal list an `InSub` substitutes
+    /// (v0.16): its items compare by the binary rule (the pin's
+    /// comparison affinity for `IN (SELECT ...)`), while a
+    /// written list converts by the left operand's affinity
+    /// alone.
+    InList(Box<RExpr>, AVec<RExpr>, bool, bool),
     /// A scalar subquery (v0.6): never evaluated directly — the
     /// executor computes it per outer row and substitutes the
     /// result as a `Literal` before `eval` runs (see
@@ -194,6 +203,10 @@ pub struct SourceDesc {
     /// `columns`; a missing entry (the default: empty) is
     /// BINARY.
     pub colls: AVec<Coll>,
+    /// The source's columns are register references (v0.16:
+    /// an upsert's `excluded` row): no affinity and no
+    /// collation in comparisons, as on the pin.
+    pub registers: bool,
 }
 
 impl SourceDesc {
@@ -213,6 +226,7 @@ impl SourceDesc {
             kind: crate::sql::JoinKind::Inner,
             using: AVec::new(),
             colls: AVec::new(),
+            registers: false,
         }
     }
 
@@ -225,7 +239,7 @@ impl SourceDesc {
     /// (source `si` of `group`): the rowid for the rowid-alias
     /// column, else the flat slot.
     pub fn column_ref(&self, group: &ScopeGroup, si: usize, ci: usize) -> RExpr {
-        if Some(ci) == self.rowid_alias {
+        let r = if Some(ci) == self.rowid_alias {
             RExpr::Rowid(group.first_src + si)
         } else {
             let aff = self
@@ -236,8 +250,18 @@ impl SourceDesc {
             RExpr::Column(
                 group.offsets.as_slice().get(si).copied().unwrap_or(0) + ci,
                 aff,
-                self.colls.as_slice().get(ci).copied().unwrap_or_default(),
+                if self.registers {
+                    None
+                } else {
+                    Some(self.colls.as_slice().get(ci).copied().unwrap_or_default())
+                },
             )
+        };
+        // A register reads as `+value`: no comparison affinity.
+        if self.registers {
+            RExpr::Pos(Box::new(r))
+        } else {
+            r
         }
     }
 
@@ -486,7 +510,7 @@ pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => f(a),
-        RExpr::InList(x, l, _) => f(x) || l.iter().any(f),
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
         RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
         RExpr::Case {
             base,
@@ -793,7 +817,7 @@ fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => shift_expr(a, at, by),
-        RExpr::InList(x, l, _) => {
+        RExpr::InList(x, l, ..) => {
             shift_expr(x, at, by);
             for i in l.as_mut_slice() {
                 shift_expr(i, at, by);
@@ -1104,6 +1128,7 @@ pub fn resolve_scoped<E>(
                 )?),
                 out,
                 *neg,
+                false,
             )
         }
         Expr::Between(x, lo, hi, neg) => RExpr::Between(
@@ -1409,7 +1434,7 @@ pub fn has_agg(e: &RExpr) -> bool {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => has_agg(a),
-        RExpr::InList(x, l, _) => has_agg(x) || l.iter().any(has_agg),
+        RExpr::InList(x, l, ..) => has_agg(x) || l.iter().any(has_agg),
         RExpr::Between(x, a, b, _) => has_agg(x) || has_agg(a) || has_agg(b),
         RExpr::Like(a, b, _) => has_agg(a) || has_agg(b),
         RExpr::Case {
@@ -1448,7 +1473,7 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => collect_aggs(a, out),
-        RExpr::InList(x, l, _) => {
+        RExpr::InList(x, l, ..) => {
             collect_aggs(x, out);
             for i in l.iter() {
                 collect_aggs(i, out);
@@ -1507,7 +1532,7 @@ pub fn has_sub(e: &RExpr) -> bool {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => has_sub(a),
-        RExpr::InList(x, l, _) => has_sub(x) || l.iter().any(has_sub),
+        RExpr::InList(x, l, ..) => has_sub(x) || l.iter().any(has_sub),
         RExpr::Between(x, a, b, _) => has_sub(x) || has_sub(a) || has_sub(b),
         RExpr::Like(a, b, _) => has_sub(a) || has_sub(b),
         RExpr::Case {
@@ -1552,7 +1577,7 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => collect_subs(a, out),
-        RExpr::InList(x, l, _) => {
+        RExpr::InList(x, l, ..) => {
             collect_subs(x, out);
             for i in l.iter() {
                 collect_subs(i, out);
@@ -1656,7 +1681,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                 }
             };
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg)
+            RExpr::InList(Box::new(sx), list, *neg, true)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
@@ -1672,13 +1697,13 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
         RExpr::Pos(a) => RExpr::Pos(Box::new(substitute(a, values, pos))),
         RExpr::Not(a) => RExpr::Not(Box::new(substitute(a, values, pos))),
         RExpr::IsNull(a, neg) => RExpr::IsNull(Box::new(substitute(a, values, pos)), *neg),
-        RExpr::InList(x, l, neg) => {
+        RExpr::InList(x, l, neg, sub) => {
             let sx = substitute(x, values, pos);
             let mut out = AVec::new();
             for i in l.iter() {
                 out.push(substitute(i, values, pos));
             }
-            RExpr::InList(Box::new(sx), out, *neg)
+            RExpr::InList(Box::new(sx), out, *neg, *sub)
         }
         RExpr::Between(x, a, b, neg) => RExpr::Between(
             Box::new(substitute(x, values, pos)),
@@ -1761,7 +1786,7 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => sub_in_agg_args(a),
-        RExpr::InList(x, l, _) => sub_in_agg_args(x) || l.iter().any(sub_in_agg_args),
+        RExpr::InList(x, l, ..) => sub_in_agg_args(x) || l.iter().any(sub_in_agg_args),
         RExpr::Between(x, a, b, _) => {
             sub_in_agg_args(x) || sub_in_agg_args(a) || sub_in_agg_args(b)
         }
@@ -1803,7 +1828,7 @@ pub fn collect_outer_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => collect_outer_aggs(a, out),
-        RExpr::InList(x, l, _) => {
+        RExpr::InList(x, l, ..) => {
             collect_outer_aggs(x, out);
             for i in l.iter() {
                 collect_outer_aggs(i, out);
@@ -1872,7 +1897,7 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::IsNull(a, _)
         | RExpr::Cast(a, _)
         | RExpr::Collate(a, _) => collect_subs_outside_agg(a, out),
-        RExpr::InList(x, l, _) => {
+        RExpr::InList(x, l, ..) => {
             collect_subs_outside_agg(x, out);
             for i in l.iter() {
                 collect_subs_outside_agg(i, out);
@@ -1972,7 +1997,7 @@ pub fn substitute_group(
                 }
             };
             *pos += 1;
-            RExpr::InList(Box::new(sx), list, *neg)
+            RExpr::InList(Box::new(sx), list, *neg, true)
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
@@ -1997,13 +2022,13 @@ pub fn substitute_group(
             Box::new(substitute_group(a, values, pos, agg_values, agg_pos)),
             *neg,
         ),
-        RExpr::InList(x, l, neg) => {
+        RExpr::InList(x, l, neg, sub) => {
             let sx = substitute_group(x, values, pos, agg_values, agg_pos);
             let mut out = AVec::new();
             for i in l.iter() {
                 out.push(substitute_group(i, values, pos, agg_values, agg_pos));
             }
-            RExpr::InList(Box::new(sx), out, *neg)
+            RExpr::InList(Box::new(sx), out, *neg, *sub)
         }
         RExpr::Between(x, a, b, neg) => RExpr::Between(
             Box::new(substitute_group(x, values, pos, agg_values, agg_pos)),
@@ -2409,6 +2434,18 @@ fn adjust_cmp(l: &RExpr, r: &RExpr, lv: OwnedValue, rv: OwnedValue) -> (OwnedVal
     (lv, rv)
 }
 
+/// The affinity conversion of a written `IN (list)` test
+/// (v0.16): the left operand's comparison affinity applies to
+/// both values; a left operand without one converts nothing.
+fn adjust_in(x: &RExpr, xv: OwnedValue, iv: OwnedValue) -> (OwnedValue, OwnedValue) {
+    let aff = match cmp_class(x) {
+        CmpClass::Numeric => Affinity::Numeric,
+        CmpClass::Text => Affinity::Text,
+        CmpClass::Blob | CmpClass::None => return (xv, iv),
+    };
+    (apply_cmp_affinity(xv, aff), apply_cmp_affinity(iv, aff))
+}
+
 fn apply_cmp_affinity(v: OwnedValue, aff: Affinity) -> OwnedValue {
     match aff {
         Affinity::Integer | Affinity::Real | Affinity::Numeric => match &v {
@@ -2458,7 +2495,7 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
         | RExpr::IsNull(x, _)
         | RExpr::Cast(x, _) => f(x),
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
-        RExpr::InList(x, l, _) => f(x) || l.iter().any(f),
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
         RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
         RExpr::Case {
             base,
@@ -2489,7 +2526,7 @@ fn explicit_child(e: &RExpr) -> Option<&RExpr> {
         | RExpr::IsNull(x, _) => Some(x),
         RExpr::Binary(_, a, b) => Some(if f(a) { a } else { b }),
         RExpr::Like(x, p, _) => Some(if f(p) { p } else { x }),
-        RExpr::InList(x, l, _) => {
+        RExpr::InList(x, l, ..) => {
             if f(x) {
                 Some(x)
             } else {
@@ -2539,7 +2576,8 @@ pub fn expr_coll(e: &RExpr) -> Option<Coll> {
     let mut p = e;
     loop {
         match p {
-            RExpr::Column(_, _, c) | RExpr::Collate(_, c) => return Some(*c),
+            RExpr::Column(_, _, c) => return *c,
+            RExpr::Collate(_, c) => return Some(*c),
             RExpr::Cast(x, _) | RExpr::Pos(x) => p = x,
             _ if has_explicit_coll(p) => p = explicit_child(p)?,
             _ => return None,
@@ -2601,7 +2639,7 @@ pub fn is_constant(e: &RExpr) -> bool {
         | RExpr::Cast(x, _)
         | RExpr::Collate(x, _) => is_constant(x),
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => is_constant(a) && is_constant(b),
-        RExpr::InList(x, l, _) => is_constant(x) && l.iter().all(is_constant),
+        RExpr::InList(x, l, ..) => is_constant(x) && l.iter().all(is_constant),
         RExpr::Between(x, a, b, _) => is_constant(x) && is_constant(a) && is_constant(b),
         RExpr::Case {
             base,
@@ -3586,16 +3624,30 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         // when the left operand is NULL (v0.16, pin-probed:
         // `NULL IN (SELECT a FROM empty)` is 0, not NULL — the
         // shape `x IN emptytable` exposed it).
-        RExpr::InList(_, list, neg) if list.is_empty() => bool_val(*neg),
-        RExpr::InList(x, list, neg) => {
+        RExpr::InList(_, list, neg, _) if list.is_empty() => bool_val(*neg),
+        RExpr::InList(x, list, neg, from_sub) => {
             let xv = eval::<E>(x, ctx)?;
             let mut any_null = matches!(xv, OwnedValue::Null);
             let mut hit = false;
             let coll = in_list_coll(x, list.as_slice());
             for item in list.iter() {
                 let iv = eval::<E>(item, ctx)?;
-                // Comparison-affinity adjustment mirrors `=`.
-                let (a, b) = adjust_cmp(x, item, xv.clone(), iv);
+                // An IN (SELECT ...) substitution compares like
+                // `=` (the item carries the subquery column's
+                // affinity). A written list converts both sides
+                // by the LEFT operand's affinity only, as the
+                // pin's OP_Eq / ephemeral-index path does: an
+                // operand without affinity converts nothing,
+                // whatever the items declare (v0.16, probed:
+                // with d no affinity, e INTEGER, f TEXT holding
+                // '1'/1/'1', d IN (e) and 1 IN (f) are 0). A
+                // single constant item is the pin's `x = +item`
+                // rewrite, which the same rule matches.
+                let (a, b) = if *from_sub {
+                    adjust_cmp(x, item, xv.clone(), iv)
+                } else {
+                    adjust_in(x, xv.clone(), iv)
+                };
                 if matches!(a, OwnedValue::Null) || matches!(b, OwnedValue::Null) {
                     any_null = true;
                     continue;

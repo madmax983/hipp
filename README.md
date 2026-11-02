@@ -94,11 +94,17 @@ aspirations.
   upsert targets) order, find and enforce keys by their
   collation, interoperate with the pin's files both ways, and
   their tables are writable (they used to be refused as foreign);
-  unknown collation names are refused. Also fixed on the way:
+  unknown collation names are refused (a file whose table names
+  an application-registered collation still opens; only that
+  table is refused). Upsert `excluded.<col>` compares with no
+  collation or affinity, as on the pin. Also fixed on the way:
   GROUP BY takes the ORDER BY's directions for its group order,
   bare columns follow the last min / max aggregate (an all-NULL
   group reads its last row), scalar `min(1, 1.0)` is 1.0, LIKE
-  reads operands up to a NUL and matches iteratively. Behind
+  reads operands up to a NUL and matches iteratively, a written
+  `IN (list)` converts by its left operand's affinity only, and
+  UPDATE OR REPLACE no longer revives rows its own REPLACE
+  deleted. Behind
   `v16`: the `expr COLLATE name` operator, GLOB / NOT GLOB,
   `LIKE ... ESCAPE`, and `like()` / `glob()`.
 - **Bound parameters** (leaf feature `params`, in `full`;
