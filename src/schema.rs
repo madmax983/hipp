@@ -501,7 +501,7 @@ pub async fn build_catalog<S: Storage>(
                     handle_bytes(&scratch, pk_columns.as_slice()[0]),
                 )
                 && !c.pk_desc
-                && eq_ci(trim(decl_bytes), b"INTEGER")
+                && eq_ci(crate::record::decl_token(decl_bytes), b"INTEGER")
             {
                 alias = Some(i);
             }
@@ -511,7 +511,7 @@ pub async fn build_catalog<S: Storage>(
             // values are stored as given (in an ordinary table
             // `ANY` is NUMERIC by the name rules).
             #[cfg(feature = "v16")]
-            if strict && eq_ci(trim(decl_bytes), b"ANY") {
+            if strict && eq_ci(crate::record::decl_token(decl_bytes), b"ANY") {
                 affinity = Affinity::Blob;
             }
             #[allow(unused_mut)]
@@ -998,16 +998,4 @@ fn resolve_auto_sets(
         }
     }
     auto_sets
-}
-
-fn trim(b: &[u8]) -> &[u8] {
-    let mut s = 0;
-    let mut e = b.len();
-    while s < e && (b[s] as char).is_whitespace() {
-        s += 1;
-    }
-    while e > s && (b[e - 1] as char).is_whitespace() {
-        e -= 1;
-    }
-    &b[s..e]
 }

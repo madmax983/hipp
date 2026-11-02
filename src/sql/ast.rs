@@ -30,9 +30,10 @@ pub struct ColumnDef {
     /// `PRIMARY KEY` appeared in this column's constraints (or the
     /// column was named by a table-level `PRIMARY KEY (col)`).
     pub primary_key: bool,
-    /// The column's PRIMARY KEY was written with `DESC` (the
-    /// SQLite quirk: such a key is NOT the rowid alias even when
-    /// the declared type is exactly INTEGER).
+    /// The column's own PRIMARY KEY constraint was written with
+    /// `DESC` (the SQLite quirk: such a key is NOT the rowid alias
+    /// even when the declared type is exactly INTEGER; a
+    /// table-level `PRIMARY KEY (a DESC)` is, as on the pin).
     pub pk_desc: bool,
     /// `UNIQUE` appeared in this column's constraints (v0.3).
     pub unique: bool,
@@ -680,6 +681,11 @@ pub enum Ast {
     },
     /// `BEGIN [TRANSACTION]` (v0.2).
     Begin,
+    /// `BEGIN IMMEDIATE | EXCLUSIVE [TRANSACTION]` (v0.16, `v16`):
+    /// a BEGIN that, like the pin's write lock taken at once, fixes
+    /// an empty database's page size (`Pager::fix_layout`).
+    #[cfg(feature = "v16")]
+    BeginImmediate,
     /// `COMMIT [TRANSACTION]` / `END [TRANSACTION]` (v0.2).
     Commit,
     /// `ROLLBACK [TRANSACTION]` (v0.2).

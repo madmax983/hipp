@@ -65,6 +65,7 @@ impl StrictType {
     /// The STRICT type a declared type names, if any of the six
     /// (case-insensitive, the whole declaration).
     pub fn of(decl: &[u8]) -> Option<StrictType> {
+        let decl = crate::record::decl_token(decl);
         Some(if eq_ci(decl, b"INT") || eq_ci(decl, b"INTEGER") {
             StrictType::Int
         } else if eq_ci(decl, b"REAL") {
@@ -114,6 +115,10 @@ pub struct GenCols {
     /// affinity, as on the pin).
     pub affs: AVec<Affinity>,
     pub rowid_alias: Option<usize>,
+    /// `PRAGMA case_sensitive_like` for this statement (v0.16 fix:
+    /// a generated column's LIKE ignored it). Set by the planner.
+    #[cfg(feature = "v16")]
+    pub case_like: bool,
 }
 
 impl GenCols {
@@ -132,7 +137,10 @@ impl GenCols {
                 continue;
             }
             let rd = eval_row(self.rowid_alias, self.affs.as_slice(), rec, rowid);
-            let v = eval::<E>(e, &Ctx::of(&rd))?;
+            let ctx = Ctx::of(&rd);
+            #[cfg(feature = "v16")]
+            let ctx = ctx.case_like(self.case_like);
+            let v = eval::<E>(e, &ctx)?;
             let aff = self
                 .affs
                 .as_slice()
@@ -543,6 +551,8 @@ pub fn plan_rules<E>(
             order,
             affs: affs.clone(),
             rowid_alias,
+            #[cfg(feature = "v16")]
+            case_like: false,
         });
     }
     if !checks.is_empty() {
@@ -599,12 +609,12 @@ pub fn validate_def<E>(
         if pk_columns.len() == 1
             && eq_ci(name, handle_bytes(arena, pk_columns[0]))
             && !c.pk_desc
-            && eq_ci(decl, b"INTEGER")
+            && eq_ci(crate::record::decl_token(decl), b"INTEGER")
         {
             alias = Some(i);
         }
         let mut affinity = crate::record::affinity_of(decl);
-        if strict && eq_ci(decl, b"ANY") {
+        if strict && eq_ci(crate::record::decl_token(decl), b"ANY") {
             affinity = Affinity::Blob;
         }
         specs.push(ColSpec {
@@ -628,6 +638,29 @@ pub fn validate_def<E>(
         texts.as_slice(),
         strict,
     )
+}
+
+/// Whether a generated column of `columns` calls LIKE — the
+/// operator or `like()` (v0.16): once `PRAGMA case_sensitive_like`
+/// has been set on a connection, the pin re-registers `like()` as
+/// non-deterministic, so CREATE TABLE / ALTER TABLE ADD COLUMN
+/// refuse such a column ("non-deterministic functions prohibited
+/// in generated columns").
+#[cfg(feature = "v16")]
+pub fn gen_uses_like<E>(arena: &Arena, columns: &[crate::sql::ColumnDef]) -> Result<bool, E> {
+    use crate::sql::handle_bytes;
+    for c in columns.iter() {
+        let Some(h) = c.gen_expr else { continue };
+        let e = parse_rule::<E>(handle_bytes(arena, h), arena)?;
+        if expr_any(&e, &mut |x| match x {
+            Expr::Like(..) => true,
+            Expr::Func { name, .. } => eq_ci(handle_bytes(arena, *name), b"like"),
+            _ => false,
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `f` holds for any node of `e` (pre-order; subquery

@@ -307,6 +307,10 @@ enum Plan {
     },
     /// `BEGIN` (v0.2): state is validated again at step time.
     Begin,
+    /// `BEGIN IMMEDIATE | EXCLUSIVE` (v0.16, `v16`): a `Begin`
+    /// that also fixes an empty database's layout.
+    #[cfg(feature = "v16")]
+    BeginImmediate,
     /// `COMMIT` (v0.2).
     Commit,
     /// `ROLLBACK` (v0.2).
@@ -745,6 +749,12 @@ fn select_is_simple(stmt: &SelectStmt) -> bool {
     if stmt.from.as_slice()[0].on.is_some() {
         return false;
     }
+    // v0.16: `name(args)` is a table-valued function (or the
+    // pin's "not a function"), for the general planner.
+    #[cfg(feature = "v16")]
+    if stmt.from.as_slice()[0].args.is_some() {
+        return false;
+    }
     let mut stars = 0usize;
     for it in stmt.items.iter() {
         match it {
@@ -1096,6 +1106,14 @@ impl<S: Storage> Connection<S> {
                     kept.as_slice(),
                     strict,
                 )?;
+                #[cfg(feature = "v16")]
+                if self.prag.like_redefined
+                    && crate::rules::gen_uses_like::<S::Error>(arena, columns.as_slice())?
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::NonDeterministic,
+                    });
+                }
                 Ok(Plan::CreateTable)
             }
             #[cfg(feature = "indexes")]
@@ -1497,6 +1515,13 @@ impl<S: Storage> Connection<S> {
                 }
                 Ok(Plan::Begin)
             }
+            #[cfg(feature = "v16")]
+            Ast::BeginImmediate => {
+                if self.explicit_txn {
+                    return Err(Error::TransactionState { nested: true });
+                }
+                Ok(Plan::BeginImmediate)
+            }
             Ast::Commit => Ok(Plan::Commit),
             Ast::Rollback => Ok(Plan::Rollback),
             Ast::Select(stmt) => self.plan_select(stmt, arena),
@@ -1612,6 +1637,15 @@ impl<S: Storage> Connection<S> {
                     checks.as_slice(),
                     strict_def,
                 )?;
+                // The pin re-checks the whole rewritten definition.
+                #[cfg(feature = "v16")]
+                if self.prag.like_redefined
+                    && crate::rules::gen_uses_like::<S::Error>(arena, ncols_def.as_slice())?
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::NonDeterministic,
+                    });
+                }
                 // `PRAGMA ignore_check_constraints` (v0.16).
                 #[cfg(feature = "v16")]
                 if self.prag.ignore_checks {
@@ -1631,11 +1665,13 @@ impl<S: Storage> Connection<S> {
                     let mut affs = AVec::new();
                     for c in ncols_def.iter() {
                         let d = handle_bytes(arena, c.decl);
-                        affs.push(if strict_def && eq_ci(d, b"ANY") {
-                            crate::record::Affinity::Blob
-                        } else {
-                            crate::record::affinity_of(d)
-                        });
+                        affs.push(
+                            if strict_def && eq_ci(crate::record::decl_token(d), b"ANY") {
+                                crate::record::Affinity::Blob
+                            } else {
+                                crate::record::affinity_of(d)
+                            },
+                        );
                     }
                     let aff = affs
                         .as_slice()
@@ -1971,14 +2007,20 @@ impl<S: Storage> Connection<S> {
         let strict = t.strict;
         #[cfg(not(feature = "v16"))]
         let strict = false;
-        Ok(Some(Box::new(crate::rules::plan_rules::<S::Error>(
+        #[allow(unused_mut)]
+        let mut rules = crate::rules::plan_rules::<S::Error>(
             arena,
             handle_bytes(ca, t.name),
             specs.as_slice(),
             t.rowid_alias,
             checks.as_slice(),
             strict,
-        )?)))
+        )?;
+        #[cfg(feature = "v16")]
+        if let Some(g) = rules.gcols.as_mut() {
+            g.case_like = self.env.case_like.get();
+        }
+        Ok(Some(Box::new(rules)))
     }
 
     /// One column's DEFAULT value for a statement (v0.16): the
@@ -2471,7 +2513,7 @@ impl<S: Storage> Connection<S> {
                 SelectItem::TableStar(q) => {
                     let qb = handle_bytes(arena, *q);
                     let src = &cur.sources.as_slice()[0];
-                    if !eq_ci(src.qualifier.as_slice(), qb) {
+                    if !src.named(qb) {
                         return Err(Error::Schema {
                             kind: SchemaKind::UnknownColumn,
                         });
@@ -3372,11 +3414,23 @@ impl<S: Storage> Connection<S> {
             }
             // v0.16: a table-valued pragma function, or the empty
             // temp schema, as the derived table of its rows.
+            // A table or view of the name shadows the function; given
+            // arguments it is the pin's "'t' is not a function" (v0.16
+            // fix: the arguments were ignored).
             #[cfg(feature = "v16")]
             let synth = if s.derived.is_none() {
                 let n = handle_bytes(arena, s.table);
-                if s.args.is_some() || self.catalog.find_readable(&self.catalog_arena, n).is_none()
-                {
+                let ca = &self.catalog_arena;
+                let exists = self.catalog.find_readable(ca, n).is_some()
+                    || self.catalog.find_view(ca, n).is_some();
+                if exists && s.args.is_some() {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::UnknownFunction,
+                    });
+                }
+                if exists {
+                    None
+                } else {
                     match self.pragma_source(arena, n, s.args.as_ref())? {
                         Some(sel) => Some(Box::new(sel)),
                         None if s.args.is_some() => {
@@ -3386,8 +3440,6 @@ impl<S: Storage> Connection<S> {
                         }
                         None => None,
                     }
-                } else {
-                    None
                 }
             } else {
                 None
@@ -3526,6 +3578,7 @@ impl<S: Storage> Connection<S> {
             let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, true);
             desc.kind = s.kind;
             desc.colls = table_colls(t);
+            desc.schema_table = t.root == 1 && s.alias.is_none();
             descs.push(desc);
             let gcols = if t.has_generated() {
                 self.table_rules(arena, t)?
@@ -4548,6 +4601,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::DropTable { .. } => self.step_drop_table().await,
             Plan::Scan { .. } => self.step_scan().await,
             Plan::Begin => self.step_begin().await,
+            #[cfg(feature = "v16")]
+            Plan::BeginImmediate => {
+                let s = self.step_begin().await?;
+                self.conn.pager.fix_layout();
+                Ok(s)
+            }
             Plan::Commit => self.step_commit().await,
             Plan::Rollback => self.step_rollback().await,
         };
@@ -5014,15 +5073,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for c in columns.iter() {
                     if eq_ci(handle_bytes(&self.arena, c.name), target) {
                         let decl = handle_bytes(&self.arena, c.decl);
-                        let mut s = 0;
-                        let mut e = decl.len();
-                        while s < e && (decl[s] as char).is_whitespace() {
-                            s += 1;
-                        }
-                        while e > s && (decl[e - 1] as char).is_whitespace() {
-                            e -= 1;
-                        }
-                        alias = !c.pk_desc && eq_ci(&decl[s..e], b"INTEGER");
+                        alias = !c.pk_desc && eq_ci(crate::record::decl_token(decl), b"INTEGER");
                     }
                 }
             }

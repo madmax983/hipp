@@ -496,6 +496,10 @@ pub struct SourceDesc {
     /// an upsert's `excluded` row): no affinity and no
     /// collation in comparisons, as on the pin.
     pub registers: bool,
+    /// The source is the main schema table read without an alias
+    /// (v0.16): `sqlite_master` and `sqlite_schema` both qualify
+    /// its columns, as on the pin.
+    pub schema_table: bool,
 }
 
 impl SourceDesc {
@@ -516,7 +520,14 @@ impl SourceDesc {
             using: AVec::new(),
             colls: AVec::new(),
             registers: false,
+            schema_table: false,
         }
+    }
+
+    /// Whether qualifier `q` names this source.
+    pub fn named(&self, q: &[u8]) -> bool {
+        eq_ci(self.qualifier.as_slice(), q)
+            || (self.schema_table && (eq_ci(q, b"sqlite_master") || eq_ci(q, b"sqlite_schema")))
     }
 
     /// Whether `name` is one of this source's USING columns.
@@ -1000,7 +1011,7 @@ pub(crate) fn resolve_column_in_group<E>(
     let mut full: AVec<RExpr> = AVec::new();
     for (si, src) in group.sources.iter().enumerate() {
         if let Some(q) = table
-            && !eq_ci(src.qualifier.as_slice(), q)
+            && !src.named(q)
         {
             continue;
         }
@@ -1036,7 +1047,7 @@ pub(crate) fn resolve_column_in_group<E>(
         // reads the outer t.a; hipp answered "no such column").
         if is_rowid_name(name) {
             for (si, src) in group.sources.iter().enumerate() {
-                if eq_ci(src.qualifier.as_slice(), q) && src.has_rowid {
+                if src.named(q) && src.has_rowid {
                     return Some(Ok(RExpr::Rowid(group.first_src + si)));
                 }
             }
@@ -1283,7 +1294,7 @@ pub fn expand_star<E>(
     let mut hit = false;
     for (si, src) in srcs.iter().enumerate() {
         if let Some(q) = qual
-            && !eq_ci(src.qualifier.as_slice(), q)
+            && !src.named(q)
         {
             continue;
         }
@@ -1744,7 +1755,7 @@ pub fn resolve_scoped<E>(
                 enclosing,
                 &mut *planner,
             )?),
-            crate::record::affinity_of(handle_bytes(arena, *ty)),
+            crate::record::cast_affinity(handle_bytes(arena, *ty)),
         ),
         #[cfg(feature = "v16")]
         Expr::Collate(e, c) => RExpr::Collate(
@@ -3768,6 +3779,10 @@ pub struct Ctx<'x> {
     rows: Option<&'x [RowData]>,
     rep: &'x RowData,
     env: Option<&'x Env>,
+    /// LIKE compares case-sensitively without the connection
+    /// state at hand (v0.16: a generated column's computation).
+    #[cfg(feature = "v16")]
+    like_cs: bool,
 }
 
 impl<'x> Ctx<'x> {
@@ -3777,7 +3792,16 @@ impl<'x> Ctx<'x> {
             rows: None,
             rep: r,
             env: None,
+            #[cfg(feature = "v16")]
+            like_cs: false,
         }
+    }
+    /// The same context with `PRAGMA case_sensitive_like` set to
+    /// `on` (v0.16).
+    #[cfg(feature = "v16")]
+    pub fn case_like(mut self, on: bool) -> Ctx<'x> {
+        self.like_cs = on;
+        self
     }
     /// An aggregate group's context: `rows` folds, `rep` supplies
     /// the bare columns.
@@ -3786,6 +3810,8 @@ impl<'x> Ctx<'x> {
             rows: Some(rows),
             rep,
             env: None,
+            #[cfg(feature = "v16")]
+            like_cs: false,
         }
     }
     /// The same context reading the connection state `env`.
@@ -3803,6 +3829,8 @@ impl<'x> Ctx<'x> {
             rows: None,
             rep: r,
             env: self.env,
+            #[cfg(feature = "v16")]
+            like_cs: self.like_cs,
         }
     }
 }
@@ -4466,7 +4494,7 @@ fn pattern_match(pat: &[u32], s: &[u8], info: PatInfo) -> bool {
 fn case_like(ctx: &Ctx<'_>) -> bool {
     #[cfg(feature = "v16")]
     {
-        ctx.env.is_some_and(|e| e.case_like.get())
+        ctx.like_cs || ctx.env.is_some_and(|e| e.case_like.get())
     }
     #[cfg(not(feature = "v16"))]
     {

@@ -231,3 +231,94 @@ fn cli_v16_pragma_integrity_messages_byte_identical() {
         },
     );
 }
+
+// ---------------- review fixes (v0.16) ----------------
+
+const REVIEW: &str = "\
+CREATE TABLE t(a int, b varchar(10), c Integer, d \"text\", e [my type], f `x`, g any, h Text, i \"a\" \"b\", j [x] TEXT, k 'it''s');
+PRAGMA table_info(t);
+INSERT INTO t VALUES ('1', '1', '1', '1', '1', '1', '1', '1', '1', '1', '1');
+SELECT typeof(a), typeof(d), typeof(e), typeof(j), typeof(k) FROM t;
+CREATE VIEW v AS SELECT a, a COLLATE NOCASE, d, j FROM t;
+PRAGMA table_info(v);
+CREATE VIEW w AS SELECT * FROM (SELECT a FROM t);
+CREATE VIEW x AS WITH c AS (SELECT a, b FROM t) SELECT * FROM c;
+PRAGMA table_list(w); PRAGMA table_list(x);
+CREATE TABLE r(a INTEGER, b, PRIMARY KEY(a DESC)); INSERT INTO r VALUES (5, 1);
+SELECT rowid, * FROM r; PRAGMA index_list(r);
+CREATE TABLE q(a \"INTEGER\" PRIMARY KEY, b); INSERT INTO q VALUES (6, 1); SELECT rowid, a FROM q;
+SELECT sqlite_master.name FROM sqlite_schema WHERE sqlite_schema.type = 'view' ORDER BY 1;
+SELECT count(*) FROM pragma_index_list('t', 'main');
+SELECT * FROM pragma_page_size('main');
+CREATE TABLE u(a, b AS (a LIKE 'A%'));
+PRAGMA case_sensitive_like = 1; INSERT INTO u(a) VALUES ('abc'), ('Abc'); SELECT * FROM u;
+PRAGMA integrity_check; PRAGMA quick_check(u);
+";
+
+#[test]
+fn cli_v16_pragma_review_fixes_byte_identical() {
+    byte_identical("review", REVIEW);
+    // Each failing statement stops the batch the same way.
+    for (i, b) in [
+        "CREATE TABLE t(a); SELECT 1; PRAGMA integrity_check(2147483648); SELECT 2;",
+        "SELECT * FROM pragma_user_version(5); PRAGMA user_version;",
+        "CREATE TABLE t(a); SELECT 1; SELECT * FROM t(1);",
+        "CREATE TABLE c(x REFERENCES p(a, b)); SELECT 1;",
+        "SELECT 1; CREATE TABLE c(x, FOREIGN KEY (nosuch) REFERENCES p);",
+        "PRAGMA case_sensitive_like = 0; SELECT 1; CREATE TABLE u(a, b AS (a LIKE 'x'));",
+        "BEGIN; CREATE TABLE t(a); ROLLBACK; PRAGMA page_size = 1024; CREATE TABLE u(a); PRAGMA page_size;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let a = temp_db(&format!("rev{i}-hipp"));
+        let b2 = temp_db(&format!("rev{i}-ora"));
+        let (hok, got) = run(&hipp_bin(), &a, b);
+        let (ook, want) = run(&oracle(), &b2, b);
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            String::from_utf8_lossy(&want),
+            "{b}"
+        );
+        assert_eq!(hok, ook, "{b}");
+    }
+}
+
+#[test]
+fn cli_v16_pragma_review_integrity_messages_byte_identical() {
+    const PS: usize = 4096;
+    // A record header the pin's row check cannot read: one row,
+    // "database disk image is malformed", after the page check's.
+    corrupt_check(
+        "malformed",
+        "CREATE TABLE t(a, b NOT NULL); CREATE INDEX i ON t(b); INSERT INTO t VALUES (2, 'x'), (1, 'helloworld');",
+        |d| {
+            let k = d
+                .windows(11)
+                .position(|w| &w[1..] == b"helloworld")
+                .expect("row")
+                - 2;
+            d[k] = 0x7f;
+            d.extend(std::iter::repeat_n(0u8, PS));
+            let n = (d.len() / PS) as u32;
+            d[28..32].copy_from_slice(&n.to_be_bytes());
+        },
+    );
+    // The incremental-vacuum flag without auto-vacuum.
+    corrupt_check(
+        "incrvac",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1);",
+        |d| d[67] = 1,
+    );
+    // An auto-vacuum file's header root page and pointer map.
+    corrupt_check(
+        "ptrmap",
+        "PRAGMA page_size = 1024; PRAGMA auto_vacuum = 1; CREATE TABLE t(a, b); CREATE INDEX i ON t(b); \
+         WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 60) \
+         INSERT INTO t SELECT x, printf('%.*c', 300, char(65 + x % 26)) FROM c;",
+        |d| {
+            d[55] = 3;
+            d[1024 + 5] = 5;
+        },
+    );
+}

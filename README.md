@@ -302,21 +302,34 @@ aspirations.
   in a foreign key are refused: hipp does not enforce them),
   `recursive_triggers`, `ignore_check_constraints` (really skips
   CHECK) and `case_sensitive_like` (really changes LIKE);
-  `table_info`, `table_xinfo` (hidden generated columns, view
-  column types), `index_list`, `index_info`, `index_xinfo`,
-  `foreign_key_list`, `table_list`, `database_list`,
-  `collation_list`, byte for byte; `integrity_check` /
-  `quick_check` with the pin's page checks, message shapes,
-  order and limit; the table-valued `pragma_table_info('t')` and
-  friends in FROM; `sqlite_schema` / `sqlite_master` readable as
-  ordinary tables (writes refused). Unknown pragma names are
+  `table_info`, `table_xinfo` (the pin's dequoted declared
+  types, hidden generated columns, view column types),
+  `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`,
+  `table_list`, `database_list` byte for byte, and
+  `collation_list` (the pin's library's three; its shell adds
+  two); `integrity_check` / `quick_check` with the pin's page
+  checks — auto-vacuum pointer maps and header fields included
+  — its record-header test ("database disk image is malformed")
+  and its index seek, message shapes, order and limit (a full
+  check of a table with an expression or partial index is
+  refused); the table-valued `pragma_table_info('t')` and
+  friends in FROM with the pin's hidden-column arities;
+  `sqlite_schema` / `sqlite_master` readable as ordinary tables
+  under either name (writes refused). Unknown pragma names are
   ignored as on the pin; the pin's other known pragmas
-  (`function_list`, `locking_mode`, ...) are refused. Ungated:
-  CREATE of a `sqlite_*` name is refused as on the pin (hipp
-  created such tables). The tiny profile grew 24 B for that fix
-  only. Gaps: the pin's schema hash order (`table_list` with more
-  than three objects), the shell's extra collations, correlated
-  table-valued arguments, no temp database (STATUS.md).
+  (`function_list`, `locking_mode`, ...) are refused. Ungated
+  (review fixes included): CREATE of a `sqlite_*` name is
+  refused; declared types are dequoted as the pin keeps them
+  (affinity, the rowid alias and STRICT read that form: `"INTEGER"
+  PRIMARY KEY` is the alias, `[x] TEXT` is NUMERIC);
+  `PRIMARY KEY (a DESC)` as a table constraint is the rowid
+  alias; FOREIGN KEY and PRIMARY KEY / UNIQUE column lists are
+  validated (hipp wrote schemas the pin could not read); a table
+  named with arguments is "not a function". The tiny profile grew
+  232 B for these (STATUS.md). Gaps: the pin's schema hash order
+  (`table_list` with more than three objects), correlated
+  table-valued arguments, no temp database, cells off their page
+  in a damaged file (STATUS.md).
 
 - **Executed views and common table expressions** (behind
   `v16`): views are read wherever a table is — FROM, joins

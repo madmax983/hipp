@@ -179,6 +179,10 @@ pub(super) struct PragState {
     pub recursive_triggers: bool,
     pub ignore_checks: bool,
     pub busy_timeout: i32,
+    /// `case_sensitive_like` has been set (to any value) on this
+    /// connection: LIKE is then non-deterministic, as on the pin
+    /// (`rules::gen_uses_like`).
+    pub like_redefined: bool,
 }
 
 /// A planned PRAGMA: `prag: None` is an ignored name.
@@ -202,7 +206,9 @@ type Rows = AVec<AVec<OwnedValue>>;
 
 /// A table the integrity check visits: name, root, and its
 /// indexes' (name, root) in the pin's order.
-type CheckedTable = (AVec<u8>, u32, AVec<(AVec<u8>, u32)>);
+/// A table under `integrity_check`: name, root page, and its
+/// indexes (name, root page, whether partial).
+type CheckedTable = (AVec<u8>, u32, AVec<(AVec<u8>, u32, bool)>);
 
 fn text(b: &[u8]) -> OwnedValue {
     OwnedValue::Text(copy_vec(b))
@@ -351,8 +357,10 @@ fn boolean(z: &[u8]) -> bool {
     safety_level(z, true, 0) != 0
 }
 
-/// A STRICT column's standard type name for its declaration.
+/// A STRICT column's standard type name for its declaration (the
+/// pin's dequoted token, `record::decl_token`).
 fn std_type(decl: &[u8]) -> &'static [u8] {
+    let decl = crate::record::decl_token(decl);
     for t in [
         b"INT" as &[u8],
         b"INTEGER",
@@ -361,21 +369,35 @@ fn std_type(decl: &[u8]) -> &'static [u8] {
         b"BLOB",
         b"ANY",
     ] {
-        if eq_ci(decl.trim_ascii(), t) {
+        if eq_ci(decl, t) {
             return t;
         }
     }
     b""
 }
 
-/// A declared type as the pin shows it (v0.16 fix): one of its
-/// standard type names (`sqlite3StdType`: INT, INTEGER, REAL,
-/// TEXT, BLOB, ANY — any case) in its own spelling, anything else
-/// as written.
-fn shown_type(decl: &[u8]) -> &[u8] {
+/// A declared type as the pin shows it (v0.16 fix): dequoted as
+/// `sqlite3AddColumn` keeps it (`record::decl_type_q`, doubled
+/// closing quotes collapsed), and one of its standard type names
+/// (`sqlite3StdType`: INT, INTEGER, REAL, TEXT, BLOB, ANY — any
+/// case) in its own spelling.
+fn shown_type(decl: &[u8]) -> AVec<u8> {
     match std_type(decl) {
-        b"" => decl,
-        t => t,
+        b"" => {
+            let (d, close) = crate::record::decl_type_q(decl);
+            let mut out = AVec::new();
+            let mut prev_close = false;
+            for c in d.iter() {
+                if close != 0 && *c == close && prev_close {
+                    prev_close = false;
+                    continue;
+                }
+                prev_close = close != 0 && *c == close;
+                out.push(*c);
+            }
+            out
+        }
+        t => copy_vec(t),
     }
 }
 
@@ -441,8 +463,11 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         }
         let arg = value.map(|h| copy_vec(handle_bytes(arena, h)));
-        if let (Some(Prag::IntegrityCheck | Prag::QuickCheck), Some(a), false) =
-            (prag, &arg, numeric)
+        // A table name — or a number outside 32 bits, which the pin
+        // also reads as one (v0.16 fix) — must name a table.
+        if let (Some(Prag::IntegrityCheck | Prag::QuickCheck), Some(a)) = (prag, &arg)
+            && (!numeric
+                || get_int32(a.as_slice().strip_prefix(b"-").unwrap_or(a.as_slice())).is_none())
             && self
                 .catalog
                 .find_readable(&self.catalog_arena, a.as_slice())
@@ -558,8 +583,14 @@ impl<S: Storage> Connection<S> {
                                 (n, n, b"table", t.columns.len(), t.strict)
                             }
                             Obj::View(v) => {
+                                // The planned columns (v0.16 fix: the
+                                // catalog's list is empty for a view
+                                // hipp did not derive at load); none
+                                // for one that cannot be planned, as
+                                // on the pin.
                                 let n = handle_bytes(ca, v.name);
-                                (n, n, b"view", v.columns.len(), false)
+                                let ncol = self.view_columns(n).map_or(0, |c| c.len());
+                                (n, n, b"view", ncol, false)
                             }
                             Obj::Schema => (b"sqlite_master", b"sqlite_schema", b"table", 5, false),
                         };
@@ -664,7 +695,7 @@ impl<S: Storage> Connection<S> {
                 let mut r = AVec::new();
                 r.push(int(if x { i as i64 } else { cid }));
                 r.push(text(cname));
-                r.push(text(shown_type(handle_bytes(&sc, c.decl))));
+                r.push(text(shown_type(handle_bytes(&sc, c.decl)).as_slice()));
                 r.push(int(i64::from(c.not_null)));
                 r.push(dflt);
                 r.push(int(pk));
@@ -738,7 +769,9 @@ impl<S: Storage> Connection<S> {
                 });
                 let z = item.and_then(|e| self.ztype(&plan, e));
                 let ty: AVec<u8> = match (z, aff) {
-                    (Some(z), Some(a)) if crate::record::affinity_of(z.as_slice()) == a => z,
+                    (Some(z), Some(a)) if crate::record::affinity_of(z.as_slice()) == a => {
+                        shown_type(z.as_slice())
+                    }
                     (_, Some(Affinity::Numeric)) => copy_vec(b"NUM"),
                     (_, Some(Affinity::Blob)) => copy_vec(b"BLOB"),
                     (_, Some(Affinity::Integer)) => copy_vec(b"INT"),
@@ -784,7 +817,7 @@ impl<S: Storage> Connection<S> {
                         return if decl.is_empty() {
                             None
                         } else {
-                            Some(copy_vec(shown_type(decl)))
+                            Some(copy_vec(decl))
                         };
                     }
                     base = base.saturating_add(sp.ncols);
@@ -1037,25 +1070,57 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
                 OwnedValue::Real(_) => return Err(Error::Unsupported),
             });
         }
-        let max = if prag.takes_name() { 2 } else { 1 };
-        if vals.len() > max {
+        // The pin's hidden columns (v0.16 fix): `arg` for a pragma
+        // that takes a name, `schema` for one that reads a database
+        // (not table_list); more arguments are its "too many
+        // arguments on pragma_x() - max N".
+        let has_arg = prag.takes_name();
+        let has_schema = prag != Prag::TableList
+            && (has_arg
+                || matches!(
+                    prag,
+                    Prag::AutoVacuum
+                        | Prag::CacheSize
+                        | Prag::JournalMode
+                        | Prag::PageCount
+                        | Prag::PageSize
+                        | Prag::Synchronous
+                ));
+        if vals.len() > usize::from(has_arg) + usize::from(has_schema) {
             return Err(Error::Schema {
                 kind: SchemaKind::WrongArgumentCount,
             });
         }
-        let (arg, schema) = if prag.takes_name() {
-            (
-                vals.as_slice().first().cloned().flatten(),
-                vals.as_slice().get(1).cloned().flatten(),
-            )
-        } else {
-            (None, vals.as_slice().first().cloned().flatten())
-        };
-        let rows = if schema
+        let arg = vals
+            .as_slice()
+            .first()
+            .filter(|_| has_arg)
+            .cloned()
+            .flatten();
+        let schema = vals
+            .as_slice()
+            .get(usize::from(has_arg))
+            .filter(|_| has_schema)
+            .cloned()
+            .flatten();
+        // A schema other than main: the temp database holds no
+        // objects in hipp (`sqlite_temp_schema` is empty), but its
+        // header values are not hipp's to report (as for `PRAGMA
+        // temp.x`); any other name is unknown.
+        let temp = schema
             .as_ref()
-            .is_some_and(|s| !eq_ci(s.as_slice(), b"main"))
-            || (prag.takes_name() && prag != Prag::TableList && arg.is_none())
-        {
+            .is_some_and(|s| eq_ci(s.as_slice(), b"temp"));
+        if let Some(s) = &schema {
+            if temp && !has_arg {
+                return Err(Error::Unsupported);
+            }
+            if !temp && !eq_ci(s.as_slice(), b"main") {
+                return Err(Error::Schema {
+                    kind: SchemaKind::UnknownDatabase,
+                });
+            }
+        }
+        let rows = if temp || (has_arg && prag != Prag::TableList && arg.is_none()) {
             AVec::new()
         } else {
             self.pragma_rows(
@@ -1262,7 +1327,7 @@ impl<S: Storage> Statement<'_, S> {
             return self.conn.pragma_rows(&self.arena, &p);
         };
         let arg = arg.as_slice();
-        let pristine = self.conn.pager.pristine()
+        let pristine = self.conn.pager.layout_open()
             && self.conn.catalog.tables.is_empty()
             && self.conn.catalog.views.is_empty();
         match prag {
@@ -1385,6 +1450,7 @@ impl<S: Storage> Statement<'_, S> {
             }
             Prag::CaseSensitiveLike => {
                 self.conn.env.case_like.set(boolean(arg));
+                self.conn.prag.like_redefined = true;
                 Ok(AVec::new())
             }
             _ => self.conn.pragma_rows(&self.arena, &p),
@@ -1394,20 +1460,17 @@ impl<S: Storage> Statement<'_, S> {
     /// `integrity_check` / `quick_check` (see the module docs):
     /// the pin's result rows, limit and order.
     async fn integrity(&mut self, p: &PragmaPlan, quick: bool) -> Result<Rows, S::Error> {
-        // The limit: a number argument (the pin reads the token
-        // without its sign), else 100; a name argument checks one
-        // table.
+        // The limit: a number argument that is a 32-bit integer
+        // (the pin reads the token without its sign), else 100; a
+        // name argument — or a number outside 32 bits, sign
+        // included (v0.16 fix) — checks one table.
         let mut mx: i64 = 100;
         let mut only: Option<AVec<u8>> = None;
         if let Some(a) = &p.arg {
-            if p.numeric {
-                let s = a.as_slice();
-                let s = s.strip_prefix(b"-").unwrap_or(s);
-                if let Some(n) = get_int32(s) {
-                    mx = if n <= 0 { 100 } else { i64::from(n) };
-                }
-            } else {
-                only = Some(a.clone());
+            let s = a.as_slice();
+            match get_int32(s.strip_prefix(b"-").unwrap_or(s)) {
+                Some(n) if p.numeric => mx = if n <= 0 { 100 } else { i64::from(n) },
+                _ => only = Some(a.clone()),
             }
         }
         let mut out = Out {
@@ -1433,7 +1496,18 @@ impl<S: Storage> Statement<'_, S> {
                 }
                 let mut ixs = AVec::new();
                 for ix in self.conn.table_indexes(name).iter() {
-                    ixs.push((copy_vec(handle_bytes(ca, ix.name)), ix.root));
+                    // The full check computes each row's key in
+                    // every index; hipp cannot for an expression or
+                    // partial index, so it refuses before reporting
+                    // anything (v0.16 fix: it printed a false
+                    // "wrong # of entries" or "ok", then failed).
+                    if ix.opaque && !quick {
+                        return Err(Error::Unsupported);
+                    }
+                    let partial = ix
+                        .sql
+                        .is_some_and(|h| sql_has_where::<S::Error>(handle_bytes(ca, h)));
+                    ixs.push((copy_vec(handle_bytes(ca, ix.name)), ix.root, partial));
                 }
                 tables.push((copy_vec(name), root, ixs));
             }
@@ -1441,7 +1515,7 @@ impl<S: Storage> Statement<'_, S> {
         let mut roots: AVec<u32> = AVec::new();
         for (_, r, ixs) in tables.iter() {
             roots.push(*r);
-            for (_, ir) in ixs.iter() {
+            for (_, ir, _) in ixs.iter() {
                 roots.push(*ir);
             }
         }
@@ -1471,17 +1545,18 @@ impl<S: Storage> Statement<'_, S> {
         out.budget -= ck.nerr as i64;
         out.stop = out.budget <= 0;
         if self.deferred.is_some() || out.stop {
-            return Ok(out.finish());
+            return Ok(out.finish(self.deferred.is_some()));
         }
-        // 2. Index entry counts against the table's.
+        // 2. Index entry counts against the table's (a partial
+        // index holds only some rows: the pin skips it here).
         let mut k = 0usize;
         for (_, _, ixs) in tables.iter() {
             let tc = counts.as_slice().get(k).copied();
             k += 1;
-            for (iname, _) in ixs.iter() {
+            for (iname, _, partial) in ixs.iter() {
                 let ic = counts.as_slice().get(k).copied();
                 k += 1;
-                if tc != ic && !out.stop {
+                if tc != ic && !*partial && !out.stop {
                     let mut m = copy_vec(b"wrong # of entries in index ");
                     m.extend_from_slice(iname.as_slice());
                     out.emit(m);
@@ -1498,7 +1573,7 @@ impl<S: Storage> Statement<'_, S> {
                 break;
             }
         }
-        Ok(out.finish())
+        Ok(out.finish(self.deferred.is_some()))
     }
 
     /// Check one table's rows: NOT NULL, STRICT types, CHECK
@@ -1573,20 +1648,36 @@ impl<S: Storage> Statement<'_, S> {
         #[cfg(not(feature = "indexes"))]
         let _ = quick;
         // Nothing to check row by row: the pin then reads only
-        // each record's header, so hipp reads no rows (a damaged
-        // overflow chain is the page check's finding alone).
+        // each record's header, so hipp reads only the cells' local
+        // bytes (a damaged overflow chain is the page check's
+        // finding alone).
         #[cfg(feature = "indexes")]
         let no_index = indexes.is_empty();
         #[cfg(not(feature = "indexes"))]
         let no_index = true;
+        let virt = rules.as_ref().and_then(|r| r.virt().map(copy_bools));
+        // The pin reads each row's right-most stored column (not
+        // the rowid alias, not a VIRTUAL one) first, which parses
+        // and checks the record header up to it: `p2` is its index
+        // in the record.
+        let is_virt = |j: usize| {
+            virt.as_ref()
+                .is_some_and(|v| v.as_slice().get(j).copied().unwrap_or(false))
+        };
+        let p2 = (0..ncols)
+            .rev()
+            .find(|j| Some(*j) != alias && !is_virt(*j))
+            .map(|m| (0..m).filter(|j| !is_virt(*j)).count());
         if no_index
             && !nn.iter().any(|b| *b)
             && strict.iter().all(|s| s.is_none())
             && rules.as_ref().is_none_or(|r| r.checks.is_empty())
         {
-            return walk_pages(&mut self.conn.pager, root).await;
+            if walk_pages(&mut self.conn.pager, root, p2).await? {
+                out.malformed();
+            }
+            return Ok(());
         }
-        let virt = rules.as_ref().and_then(|r| r.virt().map(copy_bools));
         let mut cursor = ScanCursor::new(root);
         let mut buf = AVec::new();
         // The pin's messages name a row by its scan ordinal.
@@ -1596,6 +1687,10 @@ impl<S: Storage> Statement<'_, S> {
                 return Ok(());
             }
             nrow += 1;
+            if p2.is_some_and(|p| record_header_corrupt(buf.as_slice(), buf.len() as u64, p)) {
+                out.malformed();
+                return Ok(());
+            }
             // A record whose header does not decode reads as one
             // with no fields (the pin's page check reports it).
             let mut rec = match crate::rules::decode_rec::<S::Error>(
@@ -1678,14 +1773,17 @@ impl<S: Storage> Statement<'_, S> {
                         _ => OwnedValue::Integer(rowid),
                     });
                 }
-                let rowids = btree::index_prefix_rowids(
+                let unique = ix.unique && key_has_no_null(key.as_slice());
+                let (found, dup) = btree::index_check_entry(
                     &mut self.conn.pager,
                     ix.root,
                     ix.desc.as_slice(),
                     key.as_slice(),
+                    rowid,
+                    unique,
                 )
                 .await?;
-                if !rowids.iter().any(|r| *r == rowid) {
+                if !found {
                     let mut s = copy_vec(b"row ");
                     dec(nrow, &mut s);
                     s.extend_from_slice(b" missing from index ");
@@ -1693,10 +1791,7 @@ impl<S: Storage> Statement<'_, S> {
                     if !out.emit(s) {
                         return Ok(());
                     }
-                } else if ix.unique
-                    && key_has_no_null(key.as_slice())
-                    && rowids.iter().any(|r| *r > rowid)
-                {
+                } else if dup {
                     let mut s = copy_vec(b"non-unique entry in index ");
                     s.extend_from_slice(iname.as_slice());
                     if !out.emit(s) {
@@ -1710,14 +1805,25 @@ impl<S: Storage> Statement<'_, S> {
     }
 }
 
-/// Visit a table tree's pages without reading its cells' payloads
-/// (the pin's header-only pass over a table with nothing to check
-/// per row): a page that is not a B-tree page, or a child outside
-/// the file, is the corruption error the pin's scan meets.
-async fn walk_pages<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<(), S::Error> {
+/// Visit a table tree's pages without reading its cells' overflow
+/// chains (the pin's header-only pass over a table with nothing to
+/// check per row): a page that is not a B-tree page, or a child
+/// outside the file, is the corruption error the pin's scan meets.
+/// True when a leaf cell's record header fails the pin's check for
+/// record column `p2` (`record_header_corrupt`, on the local bytes;
+/// a header that runs into an overflow page is not checked).
+async fn walk_pages<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    p2: Option<usize>,
+) -> Result<bool, S::Error> {
     let mut stack: AVec<u32> = AVec::new();
     stack.push(root);
     let mut budget = pager.page_count();
+    let usable = pager.usable() as usize;
+    // Leaves are visited in reverse order here; the pin reports the
+    // first bad row in scan order — but the message is the same
+    // whichever row it is, and the check stops at it.
     while let Some(page) = stack.pop() {
         if budget == 0 {
             return Err(Error::CorruptPage { page });
@@ -1726,6 +1832,30 @@ async fn walk_pages<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<(), S
         let d = page_copy(pager, page).await?;
         let h = btree::head::<S::Error>(d.as_slice(), page)?;
         if h.is_leaf() {
+            let Some(p2) = p2 else { continue };
+            let d = d.as_slice();
+            for i in 0..usize::from(h.ncell) {
+                let at = h.cell_ptrs_off() + 2 * i;
+                let Some(pc) = d.get(at..at + 2).map(|_| usize::from(be_u16(d, at))) else {
+                    continue;
+                };
+                let Some(cell) = d.get(pc..) else { continue };
+                let Ok((plen, n1)) = decode_varint::<()>(cell) else {
+                    continue;
+                };
+                let Some(Ok((_, n2))) = cell.get(n1..).map(decode_varint::<()>) else {
+                    continue;
+                };
+                let local =
+                    usize::try_from(plen).map_or(usable, |p| btree::table_leaf_local(usable, p));
+                let Some(body) = cell.get(n1 + n2..) else {
+                    continue;
+                };
+                let body = body.get(..local).unwrap_or(body);
+                if record_header_corrupt(body, plen, p2) {
+                    return Ok(true);
+                }
+            }
             continue;
         }
         for i in 0..usize::from(h.ncell) {
@@ -1744,7 +1874,62 @@ async fn walk_pages<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<(), S
         }
         stack.push(h.rightmost);
     }
-    Ok(())
+    Ok(false)
+}
+
+/// The pin's `OP_Column` record-header test (v0.16 fix): reading
+/// record column `p2` of a table row whose record bytes start
+/// `rec` (all of them, or the cell's local part) and whose payload
+/// is `payload` bytes. The integrity check reads each row's
+/// right-most stored column, and the pin answers a failure with the
+/// result row "database disk image is malformed" and stops. A
+/// header size of 0 is accepted (all columns NULL), as on the pin;
+/// a header whose bytes are not all at hand passes.
+fn record_header_corrupt(rec: &[u8], payload: u64, p2: usize) -> bool {
+    let Some((hdr, mut z)) = varint32(rec) else {
+        return false;
+    };
+    if hdr > 98_307 || u64::from(hdr) > payload {
+        return true;
+    }
+    let end = hdr as usize;
+    let mut off = u64::from(hdr);
+    let mut i = 0usize;
+    loop {
+        let Some((t, n)) = rec.get(z..).and_then(varint32) else {
+            return false;
+        };
+        z += n;
+        off = off.saturating_add(u64::from(serial_len(t)));
+        i += 1;
+        if i > p2 || z >= end {
+            break;
+        }
+    }
+    let bad = (z >= end && (z > end || off != payload)) || off > payload;
+    bad && hdr != 0
+}
+
+/// The pin's `getVarint32`: a varint, saturated to 32 bits.
+fn varint32(b: &[u8]) -> Option<(u32, usize)> {
+    match b.first() {
+        Some(c) if *c < 0x80 => Some((u32::from(*c), 1)),
+        Some(_) => decode_varint::<()>(b)
+            .ok()
+            .map(|(v, n)| (u32::try_from(v).unwrap_or(u32::MAX), n)),
+        None => None,
+    }
+}
+
+/// A serial type's content length (`sqlite3VdbeSerialTypeLen`).
+fn serial_len(t: u32) -> u32 {
+    match t {
+        0..=4 => t,
+        5 => 6,
+        6 | 7 => 8,
+        8..=11 => 0,
+        _ => (t - 12) / 2,
+    }
 }
 
 fn copy_bools(b: &[bool]) -> AVec<bool> {
@@ -1776,8 +1961,22 @@ impl Out {
         !self.stop
     }
 
-    fn finish(mut self) -> Rows {
-        if self.rows.is_empty() {
+    /// The pin's answer to a record it cannot read: one more row,
+    /// "database disk image is malformed", and the check stops.
+    fn malformed(&mut self) {
+        if !self.stop {
+            let mut r = AVec::new();
+            r.push(text(b"database disk image is malformed"));
+            self.rows.push(r);
+        }
+        self.stop = true;
+    }
+
+    /// The result rows: `ok` when nothing was reported, unless
+    /// the check stops on an error (`deferred`), which follows the
+    /// rows reported so far — none, then, as on the pin.
+    fn finish(mut self, deferred: bool) -> Rows {
+        if self.rows.is_empty() && !deferred {
             self.rows = row1(text(b"ok"));
         }
         self.rows
@@ -1794,8 +1993,21 @@ impl Out {
 enum Pfx {
     None,
     Freelist,
-    Page { root: u32, page: u32 },
-    Cell { root: u32, page: u32, cell: u32 },
+    Page {
+        root: u32,
+        page: u32,
+    },
+    Cell {
+        root: u32,
+        page: u32,
+        cell: u32,
+    },
+    /// "Tree R page P right child: " (an auto-vacuum file's
+    /// right-child pointer-map check, and that child's own check).
+    Right {
+        root: u32,
+        page: u32,
+    },
 }
 
 struct Ck {
@@ -1807,6 +2019,9 @@ struct Ck {
     mx: i64,
     nerr: usize,
     msgs: AVec<u8>,
+    /// The file is auto-vacuum (header offset 52 nonzero): its
+    /// pointer map is checked (v0.16 fix).
+    autovac: bool,
 }
 
 impl Ck {
@@ -1828,6 +2043,7 @@ impl Ck {
             mx,
             nerr: 0,
             msgs: AVec::new(),
+            autovac: pager.header().auto_vacuum != 0,
         };
         // The lock-byte page is never part of the database.
         let pending = 1_073_741_824 / pager.page_size() + 1;
@@ -1870,6 +2086,13 @@ impl Ck {
                 dec(i64::from(page), m);
                 m.extend_from_slice(b": ");
             }
+            Pfx::Right { root, page } => {
+                m.extend_from_slice(b"Tree ");
+                dec(i64::from(root), m);
+                m.extend_from_slice(b" page ");
+                dec(i64::from(page), m);
+                m.extend_from_slice(b" right child: ");
+            }
             Pfx::Cell { root, page, cell } => {
                 m.extend_from_slice(b"Tree ");
                 dec(i64::from(root), m);
@@ -1910,6 +2133,68 @@ async fn page_copy<S: Storage>(pager: &mut Pager<S>, page: u32) -> Result<AVec<u
     Ok(copy_vec(pager.frame_data(idx)))
 }
 
+/// The pin's `ptrmapPageno`: the pointer-map page holding `page`'s
+/// entry (0 below page 2; the lock-byte page is skipped).
+fn ptrmap_page(ck: &Ck, page: u32) -> u32 {
+    if page < 2 {
+        return 0;
+    }
+    let per = (ck.usable / 5 + 1) as u32;
+    let p = ((page - 2) / per) * per + 2;
+    let pending = 1_073_741_824 / (ck.page_size as u32).max(1) + 1;
+    if p == pending { p + 1 } else { p }
+}
+
+/// The pin's `checkPtrmap` (v0.16 fix: auto-vacuum pointer maps
+/// were not checked): `child`'s entry must read `(kind, parent)`.
+async fn check_ptrmap<S: Storage>(
+    ck: &mut Ck,
+    pager: &mut Pager<S>,
+    child: u32,
+    kind: u8,
+    parent: u32,
+    pfx: Pfx,
+) -> Result<(), S::Error> {
+    let pm = ptrmap_page(ck, child);
+    let off = (child as usize).checked_sub(pm as usize + 1).map(|k| 5 * k);
+    let got = match off {
+        Some(off) if pm != 0 && pm <= ck.npage => {
+            let d = page_copy(pager, pm).await?;
+            d.as_slice()
+                .get(off..off + 5)
+                .map(|e| (e[0], be_u32(e, 1)))
+                .filter(|(t, _)| (1..=5).contains(t))
+        }
+        _ => None,
+    };
+    match got {
+        None => ck.msg_n(pfx, b"Failed to read ptrmap key=", i64::from(child), b""),
+        Some((t, p)) if t != kind || p != parent => {
+            let mut s = copy_vec(b"Bad ptr map entry key=");
+            dec(i64::from(child), &mut s);
+            s.extend_from_slice(b" expected=(");
+            dec(i64::from(kind), &mut s);
+            s.push(b',');
+            dec(i64::from(parent), &mut s);
+            s.extend_from_slice(b") got=(");
+            dec(i64::from(t), &mut s);
+            s.push(b',');
+            dec(i64::from(p), &mut s);
+            s.push(b')');
+            ck.msg(pfx, s.as_slice());
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// The pin's pointer-map entry kinds.
+const PTRMAP_ROOTPAGE: u8 = 1;
+const PTRMAP_FREEPAGE: u8 = 2;
+const PTRMAP_OVERFLOW1: u8 = 3;
+const PTRMAP_OVERFLOW2: u8 = 4;
+const PTRMAP_BTREE: u8 = 5;
+
 /// The pin's `checkList`: a freelist trunk chain or an overflow
 /// chain of `expected` pages from `first`.
 async fn check_list<S: Storage>(
@@ -1934,6 +2219,9 @@ async fn check_list<S: Storage>(
                 .as_slice()
                 .get(4..8)
                 .map_or(0, |_| be_u32(d.as_slice(), 4));
+            if ck.autovac {
+                check_ptrmap(ck, pager, page, PTRMAP_FREEPAGE, 0, pfx).await?;
+            }
             if leaves as usize > ck.usable / 4 - 2 {
                 ck.msg_n(
                     pfx,
@@ -1947,11 +2235,18 @@ async fn check_list<S: Storage>(
                     let off = 8 + i * 4;
                     if off + 4 <= d.len() {
                         let leaf = be_u32(d.as_slice(), off);
+                        if ck.autovac {
+                            check_ptrmap(ck, pager, leaf, PTRMAP_FREEPAGE, 0, pfx).await?;
+                        }
                         ck.check_ref(leaf, pfx);
                     }
                 }
                 n = n.wrapping_sub(leaves);
             }
+        } else if ck.autovac && n > 0 {
+            // The next overflow page names this one as its parent.
+            let next = d.as_slice().get(..4).map_or(0, |_| be_u32(d.as_slice(), 0));
+            check_ptrmap(ck, pager, next, PTRMAP_OVERFLOW2, page, pfx).await?;
         }
         page = if d.len() >= 4 {
             be_u32(d.as_slice(), 0)
@@ -2139,32 +2434,35 @@ fn check_tree<'a, S: Storage>(
         }
         if !leaf {
             let right = be_u32(d, hdr + 8);
-            let (dp, mk, c) = check_tree(
-                ck,
-                pager,
+            let mut rpfx = Pfx::Cell {
                 root,
-                right,
-                v2,
-                Pfx::Cell {
-                    root,
-                    page,
-                    cell: v2,
-                },
-                max_key,
-            )
-            .await?;
+                page,
+                cell: v2,
+            };
+            if ck.autovac {
+                rpfx = Pfx::Right { root, page };
+                check_ptrmap(ck, pager, right, PTRMAP_BTREE, page, rpfx).await?;
+            }
+            let (dp, mk, c) = check_tree(ck, pager, root, right, v2, rpfx, max_key).await?;
             depth = dp;
             max_key = mk;
             count += c;
             key_eq = false;
         }
+        // In an auto-vacuum file the pin's prefix stays at the
+        // right child's for the rest of an interior page.
+        let right_pfx = ck.autovac && !leaf;
         let mut i = ncell;
         while i > 0 && ck.mx > 0 {
             i -= 1;
-            let cpfx = Pfx::Cell {
-                root,
-                page,
-                cell: i as u32,
+            let cpfx = if right_pfx {
+                Pfx::Right { root, page }
+            } else {
+                Pfx::Cell {
+                    root,
+                    page,
+                    cell: i as u32,
+                }
             };
             let at = cell_start + 2 * i;
             let pc = if at + 2 <= d.len() {
@@ -2191,14 +2489,15 @@ fn check_tree<'a, S: Storage>(
                     continue;
                 }
             };
-            // A table row's record header must fit its payload.
+            // A table row's record header size must cover at least
+            // its own byte (the pin flags a first byte of 0 or 1,
+            // nothing larger: an oversized header is the row
+            // check's "malformed" — v0.16 fix).
             if kind == btree::KIND_LEAF_TABLE && info.payload > 0 {
                 let rec = pc + info.body;
-                let hsz = d
-                    .get(rec..)
-                    .and_then(|r| decode_varint::<()>(r).ok())
-                    .map(|(h, _)| h);
-                if hsz.is_none_or(|h| h == 0 || h > info.payload) {
+                // (The pin tests the record's first byte: a two-byte
+                // varint 0x80 0x00 passes.)
+                if d.get(rec).is_none_or(|h| *h < 2) {
                     ck.msg(cpfx, b"Bad cell header size");
                     cover = false;
                     continue;
@@ -2224,9 +2523,15 @@ fn check_tree<'a, S: Storage>(
                 let ovfl = d
                     .get(pc + info.size - 4..pc + info.size)
                     .map_or(0, |_| be_u32(d, pc + info.size - 4));
+                if ck.autovac {
+                    check_ptrmap(ck, pager, ovfl, PTRMAP_OVERFLOW1, page, cpfx).await?;
+                }
                 check_list(ck, pager, false, ovfl, npage as u32, cpfx).await?;
             }
             if !leaf {
+                if ck.autovac {
+                    check_ptrmap(ck, pager, info.child, PTRMAP_BTREE, page, cpfx).await?;
+                }
                 let (d2, mk, c) =
                     check_tree(ck, pager, root, info.child, i as u32, cpfx, max_key).await?;
                 max_key = mk;
@@ -2263,6 +2568,9 @@ fn check_tree<'a, S: Storage>(
             heap.as_mut_slice().sort_unstable_by_key(|(a, b)| (*a, *b));
             let mut nfrag: i64 = 0;
             let mut prev_end = content as i64 - 1;
+            // The pin pulls the heap in order and stops at an
+            // overlap; the fragmentation test still runs when that
+            // overlap was the last entry (v0.16 fix: it was skipped).
             let mut emptied = true;
             let n = heap.len();
             for (k, (a, b)) in heap.iter().enumerate() {
@@ -2273,16 +2581,13 @@ fn check_tree<'a, S: Storage>(
                     dec(i64::from(page), &mut s);
                     ck.msg(Pfx::None, s.as_slice());
                     emptied = k + 1 == n;
-                    prev_end = -2;
                     break;
                 }
                 nfrag += *a as i64 - prev_end - 1;
                 prev_end = *b as i64;
             }
-            if prev_end != -2 {
-                nfrag += usable as i64 - prev_end - 1;
-            }
-            if emptied && prev_end != -2 && nfrag != frag as i64 {
+            nfrag += usable as i64 - prev_end - 1;
+            if emptied && nfrag != frag as i64 {
                 let mut s = copy_vec(b"Fragmentation of ");
                 dec(nfrag, &mut s);
                 s.extend_from_slice(b" bytes reported as ");
@@ -2309,25 +2614,58 @@ async fn bt_check<S: Storage>(
     if !partial {
         let (trunk, n) = (pager.header().freelist_trunk, pager.header().freelist_count);
         check_list(ck, pager, true, trunk, n, Pfx::Freelist).await?;
+        // The header's auto-vacuum fields (v0.16 fix: unchecked).
+        let p1 = page_copy(pager, 1).await?;
+        let field = |o: usize| {
+            p1.as_slice()
+                .get(o..o + 4)
+                .map_or(0, |_| be_u32(p1.as_slice(), o))
+        };
+        if ck.autovac {
+            let mx = roots.iter().copied().max().unwrap_or(0);
+            let hdr = field(52);
+            if mx != hdr {
+                let mut s = copy_vec(b"max rootpage (");
+                dec(i64::from(mx), &mut s);
+                s.extend_from_slice(b") disagrees with header (");
+                dec(i64::from(hdr), &mut s);
+                s.push(b')');
+                ck.msg(Pfx::None, s.as_slice());
+            }
+        } else if field(64) != 0 {
+            ck.msg(
+                Pfx::None,
+                b"incremental_vacuum enabled with a max rootpage of zero",
+            );
+        }
     }
     for r in roots {
         if ck.mx <= 0 {
             counts.push(0);
             continue;
         }
+        if ck.autovac && *r > 1 && !partial {
+            check_ptrmap(ck, pager, *r, PTRMAP_ROOTPAGE, 0, Pfx::None).await?;
+        }
         let (_, _, c) = check_tree(ck, pager, *r, *r, 0, Pfx::None, i64::MAX).await?;
         counts.push(c);
     }
     if !partial {
-        let autovac = pager.header().auto_vacuum != 0;
-        let per = (ck.usable / 5 + 1) as u32;
         for i in 1..=ck.npage {
             if ck.mx <= 0 {
                 break;
             }
-            let ptrmap = autovac && i >= 2 && ((i - 2) / per) * per + 2 == i;
+            let ptrmap = ck.autovac && ptrmap_page(ck, i) == i;
             if !ck.is_seen(i) && !ptrmap {
                 ck.msg_n(Pfx::None, b"Page ", i64::from(i), b": never used");
+            }
+            if ck.is_seen(i) && ptrmap {
+                ck.msg_n(
+                    Pfx::None,
+                    b"Page ",
+                    i64::from(i),
+                    b": pointer map referenced",
+                );
             }
         }
     }

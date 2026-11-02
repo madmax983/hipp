@@ -3238,6 +3238,26 @@ fn cmp_entry_probe(
     Ordering::Equal
 }
 
+/// The pin's per-page binary search (`sqlite3BtreeIndexMoveto`):
+/// probe the middle cell, halve, stop on an equal entry. Returns
+/// the equal entry's index and `true`, or the lower bound the
+/// search ended at (`lwr`: on an ordered page, the first entry
+/// greater than `probe`) and `false`.
+#[cfg(feature = "indexes")]
+fn bin_search(entries: &[IndexEntry], probe: &[KeyPart], desc: &[KeyOrder]) -> (usize, bool) {
+    let (mut lo, mut hi) = (0usize, entries.len());
+    while lo < hi {
+        let mid = lo + (hi - 1 - lo) / 2;
+        let Some(e) = entries.get(mid) else { break };
+        match cmp_entry_probe(e.values.as_slice(), probe, desc) {
+            core::cmp::Ordering::Less => lo = mid + 1,
+            core::cmp::Ordering::Greater => hi = mid,
+            core::cmp::Ordering::Equal => return (mid, true),
+        }
+    }
+    (lo, false)
+}
+
 #[cfg(feature = "indexes")]
 enum IdxFrame {
     Unresolved {
@@ -3286,6 +3306,21 @@ impl IndexCursor {
         desc: &[KeyOrder],
         probe: &[KeyPart],
     ) -> Result<IndexCursor, S::Error> {
+        Ok(Self::seek_found(pager, root, desc, probe).await?.0)
+    }
+
+    /// `seek`, plus whether the descent met an entry equal to
+    /// `probe` — the pin's `sqlite3BtreeIndexMoveto` result (v0.16:
+    /// each page is searched by the pin's binary search,
+    /// `bin_search`, so a page whose keys are out of order, in a
+    /// damaged file, is searched as the pin searches it). When
+    /// found, the cursor yields that entry next.
+    pub async fn seek_found<S: Storage>(
+        pager: &mut Pager<S>,
+        root: u32,
+        desc: &[KeyOrder],
+        probe: &[KeyPart],
+    ) -> Result<(IndexCursor, bool), S::Error> {
         let usable = pager.usable() as usize;
         let nfields = desc.len() + 1;
         let mut cur = IndexCursor::new(root, desc);
@@ -3305,17 +3340,9 @@ impl IndexCursor {
                     let p = index_cell_payload(pager, c).await?;
                     entries.push(decode_index_entry::<S::Error>(p.as_slice(), nfields)?);
                 }
-                let mut pos = entries.len();
-                for (i, e) in entries.iter().enumerate() {
-                    if cmp_entry_probe(e.values.as_slice(), probe, desc)
-                        != core::cmp::Ordering::Less
-                    {
-                        pos = i;
-                        break;
-                    }
-                }
+                let (pos, found) = bin_search(entries.as_slice(), probe, desc);
                 cur.stack.push(IdxFrame::Leaf { entries, next: pos });
-                return Ok(cur);
+                return Ok((cur, found));
             }
             if h.kind != KIND_INTERIOR_INDEX {
                 return Err(Error::Unsupported);
@@ -3333,22 +3360,7 @@ impl IndexCursor {
             // First divider >= probe (Equal only for a full-key
             // probe: prefix probes pad with Min and can never be
             // Equal to a real entry).
-            let mut i = entries.len();
-            let mut equal = false;
-            for (j, e) in entries.iter().enumerate() {
-                match cmp_entry_probe(e.values.as_slice(), probe, desc) {
-                    core::cmp::Ordering::Less => {}
-                    core::cmp::Ordering::Equal => {
-                        i = j;
-                        equal = true;
-                        break;
-                    }
-                    core::cmp::Ordering::Greater => {
-                        i = j;
-                        break;
-                    }
-                }
-            }
+            let (i, equal) = bin_search(entries.as_slice(), probe, desc);
             if equal {
                 // The divider itself is the lower bound; yield it
                 // next, then continue with its right subtree.
@@ -3357,12 +3369,16 @@ impl IndexCursor {
                     children,
                     seq: 2 * i + 1,
                 });
-                return Ok(cur);
+                return Ok((cur, true));
             }
             // Descend into child i; when it is exhausted this
             // frame yields divider i next (or is done, when i is
             // the rightmost child).
-            let next_page = children.as_slice()[i];
+            let next_page = children
+                .as_slice()
+                .get(i)
+                .copied()
+                .ok_or(Error::CorruptPage { page })?;
             cur.stack.push(IdxFrame::Interior {
                 entries,
                 children,
@@ -3520,6 +3536,373 @@ pub async fn index_prefix_rowids<S: Storage>(
         out.push(e.rowid()?);
     }
     Ok(out)
+}
+
+/// `PRAGMA integrity_check`'s index probe for one row (v0.16,
+/// `v16`): whether the entry `key` + `rowid` is found by the pin's
+/// seek (`sqlite3BtreeIndexMoveto`: each page binary-searched, see
+/// `bin_search`), and — for a `unique` index — whether the entry
+/// after it does not sort above `key` (the pin's `OP_Next` +
+/// `OP_IdxGT`: "non-unique entry"). Only the cells the search
+/// visits are decoded, as on the pin, so damage elsewhere on a
+/// page does not stop the check.
+#[cfg(all(feature = "indexes", feature = "v16"))]
+pub async fn index_check_entry<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    desc: &[KeyOrder],
+    key: &[OwnedValue],
+    rowid: i64,
+    unique: bool,
+) -> Result<(bool, bool), S::Error> {
+    let mut full: AVec<OwnedValue> = AVec::new();
+    full.extend_from_slice(key);
+    full.push(OwnedValue::Integer(rowid));
+    // The in-order successor so far: the divider after the child
+    // the descent last went left of.
+    let mut succ: Option<(u32, usize)> = None;
+    let mut page = root;
+    let mut budget = pager.page_count();
+    loop {
+        budget = budget.checked_sub(1).ok_or(Error::CorruptPage { page })?;
+        let snap = page_snap(pager, page).await?;
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        let interior = match h.kind {
+            KIND_INTERIOR_INDEX => true,
+            KIND_LEAF_INDEX => false,
+            _ => return Err(Error::CorruptPage { page }),
+        };
+        let n = usize::from(h.ncell);
+        let (mut lo, mut hi) = (0usize, n);
+        let mut hit = None;
+        while lo < hi {
+            let mid = lo + (hi - 1 - lo) / 2;
+            let rec = index_payload_at(pager, snap.as_slice(), &h, mid, page).await?;
+            match pin_rec_cmp(rec.as_slice(), full.as_slice(), desc) {
+                Some(c) if c < 0 => lo = mid + 1,
+                Some(c) if c > 0 => hi = mid,
+                Some(_) => {
+                    hit = Some(mid);
+                    break;
+                }
+                // Corrupt and so "equal": the pin's seek fails.
+                None => return Err(Error::CorruptRecord),
+            }
+        }
+        if let Some(i) = hit {
+            if !unique {
+                return Ok((true, false));
+            }
+            let next = if interior {
+                // The leftmost entry of the subtree right of it.
+                let mut p = child_at(pager, snap.as_slice(), &h, i + 1, page).await?;
+                loop {
+                    budget = budget
+                        .checked_sub(1)
+                        .ok_or(Error::CorruptPage { page: p })?;
+                    let d = page_snap(pager, p).await?;
+                    let hh = head::<S::Error>(d.as_slice(), p)?;
+                    if hh.kind == KIND_LEAF_INDEX {
+                        break if hh.ncell == 0 {
+                            None
+                        } else {
+                            Some(index_payload_at(pager, d.as_slice(), &hh, 0, p).await?)
+                        };
+                    }
+                    if hh.kind != KIND_INTERIOR_INDEX {
+                        return Err(Error::CorruptPage { page: p });
+                    }
+                    p = child_at(pager, d.as_slice(), &hh, 0, p).await?;
+                }
+            } else if i + 1 < n {
+                Some(index_payload_at(pager, snap.as_slice(), &h, i + 1, page).await?)
+            } else if let Some((sp, si)) = succ {
+                let d = page_snap(pager, sp).await?;
+                let hh = head::<S::Error>(d.as_slice(), sp)?;
+                Some(index_payload_at(pager, d.as_slice(), &hh, si, sp).await?)
+            } else {
+                None
+            };
+            // `OP_IdxGT` over the key columns: a key-prefix tie (the
+            // pin's `default_rc` -1) or less is a duplicate.
+            let dup = match next {
+                Some(rec) => match pin_rec_cmp_from(rec.as_slice(), key, desc, false) {
+                    Some(c) => c <= 0,
+                    None => return Err(Error::CorruptRecord),
+                },
+                None => false,
+            };
+            return Ok((true, dup));
+        }
+        if !interior {
+            return Ok((false, false));
+        }
+        if lo < n {
+            succ = Some((page, lo));
+        }
+        page = child_at(pager, snap.as_slice(), &h, lo, page).await?;
+    }
+}
+
+/// The pin's index-record comparison (`xRecordCompare`, v0.16,
+/// `v16`): index cell payload `rec` against the full key `probe`
+/// (key values + rowid) under `desc`, field by field from the raw
+/// record — a field's body is read only when its type needs it, so
+/// a damaged record compares as the pin's does (its fast paths for
+/// an integer or BINARY text first field included). `None` is the
+/// pin's corruption verdict (`errCode`), which it reports only if
+/// the comparison then reads as equal.
+#[cfg(all(feature = "indexes", feature = "v16"))]
+fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i32> {
+    let b = |i: usize| rec.get(i).copied().unwrap_or(0);
+    let o0 = desc.first().copied().unwrap_or_default();
+    let (r1, r2) = if o0.desc { (1, -1) } else { (-1, 1) };
+    if probe.len() <= 13 {
+        match probe.first() {
+            Some(OwnedValue::Integer(v)) => {
+                let st = u32::from(b(1));
+                let at = usize::from(b(0) & 0x3f);
+                if matches!(st, 1..=6 | 8 | 9) {
+                    let lhs = rec_int(rec, at, st);
+                    return Some(if *v > lhs {
+                        r1
+                    } else if *v < lhs {
+                        r2
+                    } else if probe.len() > 1 {
+                        return pin_rec_cmp_from(rec, probe, desc, true);
+                    } else {
+                        0
+                    });
+                }
+            }
+            Some(OwnedValue::Text(z)) if o0.coll == crate::record::Coll::Binary => {
+                let (st, _) = rec_varint32(rec, 1);
+                if st < 12 {
+                    return Some(r1);
+                }
+                if st & 1 == 0 {
+                    return Some(r2);
+                }
+                let hdr = usize::from(b(0));
+                let n = ((st - 12) / 2) as usize;
+                if hdr + n > rec.len() {
+                    return None;
+                }
+                let body = rec.get(hdr..hdr + n).unwrap_or_default();
+                let k = n.min(z.len());
+                return Some(match body.get(..k).cmp(&z.as_slice().get(..k)) {
+                    core::cmp::Ordering::Greater => r2,
+                    core::cmp::Ordering::Less => r1,
+                    core::cmp::Ordering::Equal => match n.cmp(&z.len()) {
+                        core::cmp::Ordering::Equal if probe.len() > 1 => {
+                            return pin_rec_cmp_from(rec, probe, desc, true);
+                        }
+                        core::cmp::Ordering::Equal => 0,
+                        core::cmp::Ordering::Greater => r2,
+                        core::cmp::Ordering::Less => r1,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+    pin_rec_cmp_from(rec, probe, desc, false)
+}
+
+/// `sqlite3VdbeRecordCompareWithSkip` (see `pin_rec_cmp`); `skip`
+/// starts at the second field, the first known equal.
+#[cfg(all(feature = "indexes", feature = "v16"))]
+fn pin_rec_cmp_from(
+    rec: &[u8],
+    probe: &[OwnedValue],
+    desc: &[KeyOrder],
+    skip: bool,
+) -> Option<i32> {
+    use crate::record::{Coll, Value, compare_coll};
+    let b = |i: usize| rec.get(i).copied().unwrap_or(0);
+    let nkey = rec.len() as u64;
+    let (mut idx1, hdr, mut d1, mut i) = if skip {
+        let (s1, n) = rec_varint32(rec, 1);
+        let hdr = u64::from(b(0));
+        (1 + n, hdr, hdr + u64::from(rec_serial_len(s1)), 1usize)
+    } else {
+        let (hdr, n) = rec_varint32(rec, 0);
+        (n, u64::from(hdr), u64::from(hdr), 0usize)
+    };
+    if d1 > nkey {
+        return None;
+    }
+    let ord = |o: core::cmp::Ordering| o as i32;
+    loop {
+        let rhs = probe.get(i)?;
+        let at = d1 as usize;
+        let mut st = u32::from(b(idx1));
+        let rc = match rhs {
+            OwnedValue::Integer(_) | OwnedValue::Real(_) => {
+                if st >= 10 {
+                    if st == 10 { -1 } else { 1 }
+                } else if st == 0 {
+                    -1
+                } else {
+                    let lhs = if st == 7 {
+                        Value::Real(f64::from_bits(rec_int(rec, at, 6) as u64))
+                    } else {
+                        Value::Integer(rec_int(rec, at, st))
+                    };
+                    ord(compare_coll(&lhs, &rhs.as_value(), Coll::Binary))
+                }
+            }
+            OwnedValue::Text(z) => {
+                st = rec_varint32(rec, idx1).0;
+                if st < 12 {
+                    -1
+                } else if st & 1 == 0 {
+                    1
+                } else {
+                    let n = u64::from((st - 12) / 2);
+                    if d1 + n > nkey {
+                        return None;
+                    }
+                    let body = rec.get(at..at + n as usize).unwrap_or_default();
+                    let coll = desc.get(i).map(|o| o.coll).unwrap_or_default();
+                    ord(compare_coll(
+                        &Value::Text(body),
+                        &Value::Text(z.as_slice()),
+                        coll,
+                    ))
+                }
+            }
+            OwnedValue::Blob(z) => {
+                st = rec_varint32(rec, idx1).0;
+                if st < 12 || st & 1 == 1 {
+                    -1
+                } else {
+                    let n = u64::from((st - 12) / 2);
+                    if d1 + n > nkey {
+                        return None;
+                    }
+                    let body = rec.get(at..at + n as usize).unwrap_or_default();
+                    ord(body.cmp(z.as_slice()))
+                }
+            }
+            OwnedValue::Null => {
+                let nan = st == 7 && f64::from_bits(rec_int(rec, at, 6) as u64).is_nan();
+                if st == 0 || st == 10 || nan { 0 } else { 1 }
+            }
+        };
+        if rc != 0 {
+            let flip = desc.get(i).is_some_and(|o| o.desc);
+            return Some(if flip { -rc } else { rc });
+        }
+        i += 1;
+        if i == probe.len() {
+            return Some(0);
+        }
+        d1 += u64::from(rec_serial_len(st));
+        if d1 > nkey {
+            return Some(0);
+        }
+        idx1 += if st < 0x80 { 1 } else { rec_varint_len(st) };
+        if idx1 as u64 >= hdr {
+            return None;
+        }
+    }
+}
+
+/// A big-endian integer of serial type `st` (1..=6, 8, 9) at `at`;
+/// bytes past the record read as 0 (the pin reads into its page
+/// buffer's slack).
+#[cfg(all(feature = "indexes", feature = "v16"))]
+fn rec_int(rec: &[u8], at: usize, st: u32) -> i64 {
+    let n = match st {
+        1..=4 => st as usize,
+        5 => 6,
+        6 => 8,
+        8 => return 0,
+        9 => return 1,
+        _ => return 0,
+    };
+    let mut v: i64 = if rec.get(at).is_some_and(|c| *c & 0x80 != 0) {
+        -1
+    } else {
+        0
+    };
+    for k in 0..n {
+        v = (v << 8) | i64::from(rec.get(at + k).copied().unwrap_or(0));
+    }
+    v
+}
+
+/// `getVarint32` at `at` (missing bytes read as 0).
+#[cfg(all(feature = "indexes", feature = "v16"))]
+fn rec_varint32(rec: &[u8], at: usize) -> (u32, usize) {
+    match rec.get(at..).map(decode_varint::<()>) {
+        Some(Ok((v, n))) => (u32::try_from(v).unwrap_or(u32::MAX), n),
+        _ => (0, 1),
+    }
+}
+
+#[cfg(all(feature = "indexes", feature = "v16"))]
+fn rec_serial_len(t: u32) -> u32 {
+    match t {
+        0..=4 => t,
+        5 => 6,
+        6 | 7 => 8,
+        8..=11 => 0,
+        _ => (t - 12) / 2,
+    }
+}
+
+#[cfg(all(feature = "indexes", feature = "v16"))]
+fn rec_varint_len(v: u32) -> usize {
+    match v {
+        0..=0x7f => 1,
+        0x80..=0x3fff => 2,
+        0x4000..=0x1f_ffff => 3,
+        0x20_0000..=0xfff_ffff => 4,
+        _ => 5,
+    }
+}
+
+/// A copy of page `page`'s image.
+#[cfg(all(feature = "indexes", feature = "v16"))]
+async fn page_snap<S: Storage>(pager: &mut Pager<S>, page: u32) -> Result<AVec<u8>, S::Error> {
+    let idx = pager.load(page).await?;
+    Ok(copy_bytes(pager.frame_data(idx)))
+}
+
+/// Index page cell `i`'s full payload.
+#[cfg(all(feature = "indexes", feature = "v16"))]
+async fn index_payload_at<S: Storage>(
+    pager: &mut Pager<S>,
+    snap: &[u8],
+    h: &PageHead,
+    i: usize,
+    page: u32,
+) -> Result<AVec<u8>, S::Error> {
+    let usable = pager.usable() as usize;
+    let at = cell_ptr::<S::Error>(snap, h, i, page)?;
+    let c = parse_index_cell::<S::Error>(snap, at, usable, page, h.kind == KIND_INTERIOR_INDEX)?;
+    index_cell_payload(pager, &c).await
+}
+
+/// Interior index page child `i` (`ncell` is the rightmost).
+#[cfg(all(feature = "indexes", feature = "v16"))]
+async fn child_at<S: Storage>(
+    pager: &mut Pager<S>,
+    snap: &[u8],
+    h: &PageHead,
+    i: usize,
+    page: u32,
+) -> Result<u32, S::Error> {
+    if i >= usize::from(h.ncell) {
+        return Ok(h.rightmost);
+    }
+    let at = cell_ptr::<S::Error>(snap, h, i, page)?;
+    let _ = pager;
+    snap.get(at..at + 4)
+        .map(|_| be_u32(snap, at))
+        .ok_or(Error::CorruptPage { page })
 }
 
 /// The first rowid whose index key starts with `prefix`, if any

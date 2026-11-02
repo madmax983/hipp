@@ -2444,6 +2444,127 @@ walk and row checks (inlined into `Statement::step`), view type
 derivation, the FOREIGN KEY / DEFAULT-text capture in the
 parser, and the table-valued-function planning.
 
+**Review fixes (2026-11-02).** All fifteen findings reproduced
+on the live pin and fixed but the out-of-reach parts noted in the
+gaps; each has a regression test (`tests/pragma_v16.rs`
+`regression_*`, `hipp-cli/tests/cli_v16_pragma.rs`
+`cli_v16_pragma_review_*`).
+
+- Ungated (claimed CREATE TABLE / INSERT paths):
+  - Declared types are kept as the pin's `sqlite3AddColumn`
+    keeps them (`record::decl_token`: `sqlite3DequoteToken`;
+    `record::decl_type_q`: then `sqlite3Dequote`). table_info /
+    table_xinfo / view types show `INT`, `TEXT`, `my type`,
+    `x] TEX`, `te"xt`, `a` (for `"a" "b"`), `int` (for
+    `"int"(3)`); affinity reads the dequoted form (`[x] TEXT` is
+    NUMERIC, `""` NUMERIC); the rowid-alias rule and STRICT read
+    the token form (`"INTEGER" PRIMARY KEY` and `[integer]` are
+    the alias — hipp wrote an autoindex the pin calls orphan);
+    CAST reads `sqlite3Dequote` alone (`CAST(x AS [a] CHARX)` is
+    NUMERIC).
+  - A table-level `PRIMARY KEY (a DESC)` on an INTEGER column is
+    the rowid alias (the pin passes no sort order there; only
+    the column constraint's DESC is the quirk) — hipp wrote an
+    orphan autoindex.
+  - FOREIGN KEY column lists are validated as the pin's
+    `sqlite3CreateForeignKey` does (`SchemaKind::ForeignKeyColumns`,
+    new: a column's REFERENCES names at most one parent column,
+    a table key as many as it lists; an unknown child column,
+    `rowid` included, is `UnknownColumn`), and so are PRIMARY
+    KEY / UNIQUE lists (`no such column`; with the `indexes`
+    feature, where constraint sets live — the tiny profile keeps
+    none) — hipp wrote schemas the pin could not open.
+  - `name(args)` in FROM naming a table or view is
+    `UnknownFunction` (the pin's "'t' is not a function"); the
+    arguments were ignored.
+- `v16`:
+  - `PRAGMA page_size` (and `encoding`, `auto_vacuum`) on an
+    empty file is fixed once a write transaction has begun, even
+    rolled back (the pin's `BTS_PAGESIZE_FIXED`;
+    `Pager::layout_open`); `BEGIN IMMEDIATE` / `EXCLUSIVE` (a
+    new `Ast::BeginImmediate`) count, as they take the write lock.
+  - The integrity check: no `ok` before a deferred error; partial
+    indexes are left out of `wrong # of entries` (as on the pin);
+    the full check of a table with an expression or partial index
+    (hipp keeps such indexes opaque) is refused before any output,
+    the quick check answers. The row phase makes the pin's
+    `OP_Column` record-header test on each row's right-most
+    stored column and answers a failure with one row, `database
+    disk image is malformed`, stopping (as the pin's
+    `op_column_corrupt` handler does; probed over every
+    header-size class); `Bad cell header size` is the pin's
+    first-byte test (0 or 1). The index probe for `row N missing
+    from index` / `non-unique entry` follows the pin's seek: its
+    binary search per page (also used by `IndexCursor::seek`
+    now), its raw-record comparison (`xRecordCompare` with the
+    integer / BINARY-text fast paths, a field's body read only
+    when its type needs it, corruption reported only when the
+    comparison then reads as equal), and only the cells it
+    visits decoded. Auto-vacuum files get the pin's header test
+    (`max rootpage (X) disagrees with header (Y)`, or `incremental
+    _vacuum enabled with a max rootpage of zero` without
+    auto-vacuum) and pointer-map checks (`Bad ptr map entry key=K
+    expected=(T,P) got=(T,P)`, `Failed to read ptrmap key=K`,
+    `Page N: pointer map referenced`, with the pin's prefixes —
+    `Tree R page P right child:` for the rest of an interior
+    page). After `Multiple uses for byte`, the fragmentation test
+    still runs when the overlap was the heap's last entry.
+    `integrity_check(N)` with N outside 32 bits names a table.
+    On deterministic corpora of single-byte edits of oracle files
+    (1,500 of the review's index-heavy 512-byte-page file, 900 of
+    an auto-vacuum one), hipp's answer differs from the pin's in
+    12 and 2, every one a hipp error where the pin reads a cell
+    lying off its page (11) or reads only the columns it checks
+    past a broken overflow pointer (3) — see the gaps; the
+    review's sample went from about 20 in 200 to 1 in 200.
+  - A header claiming more pages than the file holds fails to
+    open, as on the pin (it was read as empty pages); the
+    encoding field's low two bits are read (0, unset, is UTF-8:
+    the pin's file after only `PRAGMA user_version = N` opens),
+    and the first schema change on such a file sets its schema
+    format (4) and encoding (1), as the pin's CREATE TABLE does.
+  - `case_sensitive_like` reaches generated columns
+    (`GenCols::case_like`, captured at planning); once set at all,
+    LIKE / `like()` in a generated column is `NonDeterministic`
+    on CREATE TABLE and ALTER TABLE ADD COLUMN (which re-checks the
+    whole table), as the pin re-registers `like()`.
+  - `table_list` counts a view's planned columns (0 only when it
+    cannot be planned, as on the pin).
+  - Table-valued pragmas take the pin's hidden columns only:
+    `arg` for a name pragma, `schema` for table_info & co. and
+    `auto_vacuum` / `cache_size` / `journal_mode` / `page_count` /
+    `page_size` / `synchronous`; more arguments are
+    `WrongArgumentCount` ("max N"), a schema other than main /
+    temp `UnknownDatabase`; temp gives no objects, and its header
+    values are refused. A user table or view of the name shadows
+    the function (with arguments: not a function).
+  - `sqlite_master` and `sqlite_schema` both qualify the
+    unaliased main schema table (`SourceDesc::named`).
+- Not a hipp bug any more at HEAD: the view named
+  `pragma_user_version` (finding 2) — views execute since the
+  views unit, which reads the view first; regression-tested.
+
+**Gates (review):** `cargo fmt --all`, then the full
+`ci/local-gates.sh` ends with "==> all gates passed".
+`tests/pragma_v16.rs` now holds 35 tests (16 review regressions:
+generated declared-type and damaged-file corpora among them),
+`hipp-cli/tests/cli_v16_pragma.rs` 6. Census unchanged (211
+probes: MATCH 160, HIPP_ERR 29, DIFF 2, BOTH_ERR 20).
+
+**Size after the review:** tiny **76,324 B** (Δ **+208 B** vs
+76,116, ratchet raised to it; the unit's total is +232 B, within
+ADR 0001's +256 B for correctness fixes on claimed paths): the
+FOREIGN KEY column-list checks (+~160 B: the shared
+`known_columns` loop and the arity test) and the declared-type
+dequoting behind affinity and the rowid alias (+~50 B). Moved
+behind `v16` to stay inside the allowance: the open-path header
+fixes (empty-file encoding, page count beyond the file, schema
+format on first DDL) and the PRIMARY KEY / UNIQUE column check
+(with `indexes`). Full **404,128 B** (Δ **+8,459 B** vs 395,669,
+ratchet raised): the pointer-map and record-header checks, the
+pin-faithful index probe and record comparison, the
+table-valued arity rules, and the generated-column LIKE plumbing.
+
 **Honest gaps:**
 
 - Schema hash order (`table_list`, the integrity check's table
@@ -2459,23 +2580,37 @@ parser, and the table-valued-function planning.
   expose no hidden `arg` / `schema` columns (`WHERE arg = 't'`
   is unsupported), and `pragma_integrity_check` /
   `pragma_quick_check` are refused in FROM.
-- No temp database: `temp.` pragmas are refused.
+- No temp database: `temp.` pragmas, and header values of temp
+  through the table-valued forms, are refused.
 - Foreign keys are refused under `foreign_keys = ON`, not
   enforced (ADR 0001's `foreign_keys` leaf is the place for
   that); `recursive_triggers` is stored with no triggers to
-  apply it to; `case_sensitive_like` does not reach generated
-  column expressions (evaluated without the connection state).
-- The integrity check does not check auto-vacuum pointer maps
-  (it skips their pages), and a row whose record does not decode
-  is read as one with no fields (exact for the header-size-0
-  case probed, a guess for other garbage); a file whose schema
-  names an out-of-range root page opens in hipp (the pin refuses
-  it as malformed at open).
-- View column types: a view whose FROM holds a derived table has
-  no catalogued columns in hipp (pre-existing), so its
-  table_info is refused; views over views cannot be created
-  (pre-existing); a scalar subquery item's declared type is not
-  carried (its affinity is).
+  apply it to.
+- `case_sensitive_like` and schema loading: the pin loads the
+  schema lazily, so after `PRAGMA case_sensitive_like` as a new
+  connection's first statement it refuses a file that already
+  holds a LIKE generated column ("malformed database schema");
+  hipp loads the schema at open and reads such a table. The flag
+  is captured when a statement is planned (a statement prepared
+  before the PRAGMA keeps the old setting).
+- The integrity check on damaged files: a cell whose offset or
+  size lies off its page makes hipp stop with a corruption error
+  where the pin reads past the page into its buffer and carries
+  on (its answer depends on that memory); a row whose overflow
+  chain is broken stops hipp, which assembles whole rows, where
+  the pin reads only the columns it checks; the expression /
+  partial index full check is refused (above); index records are
+  compared as the pin compares them, but their headers are not
+  run through `OP_Column`'s test. A file whose schema names an
+  out-of-range root page opens in hipp (the pin refuses it as
+  malformed at open); a schema format above 4 opens in hipp too
+  (the pin's "unsupported file format").
+- PRIMARY KEY / UNIQUE column lists are not validated in the
+  tiny profile (it keeps no constraint indexes; such a table
+  already lacks the pin's autoindex there).
+- View column types: a scalar subquery item's declared type is
+  not carried (its affinity is). Three-part column names
+  (`main.sqlite_schema.name`) do not parse (hipp-wide).
 - `CREATE TABLE x AS SELECT * FROM sqlite_schema`: the pin's
   SELECT also sees its own all-NULL placeholder schema row; hipp's
   does not.

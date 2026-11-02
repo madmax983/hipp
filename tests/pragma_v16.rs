@@ -1303,3 +1303,749 @@ fn regression_view_rowid_column_is_named_by_its_alias() {
         .is_none()
     );
 }
+
+// ---------------- review fixes (v0.16) ----------------
+
+/// hipp writes `script` on a fresh file; the oracle must then read
+/// the file cleanly and see the same `check` rows as hipp.
+fn pin_reads_hipp_file(tag: &str, script: &str, check: &str) {
+    let h = common::temp_db(&format!("v16pr-rt-{tag}"));
+    let (hok, _, he) = hipp_script(&h, script);
+    assert!(hok, "{script}: {he:?}");
+    let (ook, ol) = oracle_script(&h, "PRAGMA integrity_check");
+    assert!(ook && ol == ["ok"], "{tag}: the pin reads {ol:?}");
+    let (_, hl, _) = hipp_script(&h, check);
+    let (ook, ol) = oracle_script(&h, check);
+    assert!(ook, "{tag}: {check}");
+    assert_eq!(hl, ol, "{tag}: {check}");
+}
+
+/// A generated corpus of declared types, quoted every way the pin
+/// tokenizes: `table_info` shows the pin's dequoted form (standard
+/// names in upper case), affinity reads the dequoted form, a view
+/// carries it, and a quoted `INTEGER PRIMARY KEY` is the rowid
+/// alias (it used to get an autoindex the pin calls orphan).
+#[test]
+fn regression_declared_types_are_dequoted() {
+    let bases = [
+        "int",
+        "INTEGER",
+        "Text",
+        "text ",
+        "real",
+        "blob",
+        "any",
+        "varchar(10)",
+        "my type",
+        "x] TEXT",
+        "a b",
+        "",
+        "CHAR",
+        "doub",
+        "floating",
+        "Integer",
+    ];
+    let quotes = [("", ""), ("\"", "\""), ("[", "]"), ("`", "`"), ("'", "'")];
+    let mut rng = Rng(0x0016_dec1_7e5e);
+    for round in 0..6 {
+        let mut cols = Vec::new();
+        for i in 0..10 {
+            let b = rng.pick(&bases);
+            let (l, r) = quotes[rng.below(quotes.len())];
+            // Keep each type a span the pin can lex (the harness
+            // splits statements on `;` outside ' " [ quotes, so the
+            // fixed cases below hold the quote-in-quote spellings).
+            let ty = match (l, b) {
+                ("", b) | ("[", b) if b.contains(']') => format!("\"{b}\""),
+                (l, b) => format!("{l}{b}{r}"),
+            };
+            cols.push(format!("c{i} {ty}"));
+        }
+        let vals = ["'1'", "'1.5'", "'x'", "1", "2.0"];
+        let mut ins = Vec::new();
+        for _ in 0..3 {
+            let row: Vec<&str> = (0..10).map(|_| rng.pick(&vals)).collect();
+            ins.push(format!("({})", row.join(", ")));
+        }
+        let types: Vec<String> = (0..10).map(|i| format!("typeof(c{i})")).collect();
+        let s = format!(
+            "CREATE TABLE t({}); INSERT INTO t VALUES {}; PRAGMA table_info(t); PRAGMA table_xinfo(t); \
+             SELECT {} FROM t; CREATE VIEW v AS SELECT * FROM t; PRAGMA table_info(v)",
+            cols.join(", "),
+            ins.join(", "),
+            types.join(", ")
+        );
+        assert!(same(&format!("dq{round}"), &s).is_none(), "{s}");
+    }
+    for (i, s) in [
+        "CREATE TABLE t(a \"te\"\"xt\", b [a] b, c \"a\" \"b\", d 'text', e `int`, f \"\", g [x]y, \
+         h 'my' type, i \"int\"(3), k \"INTEGER\", l [Real], m 'blob ', n \"a'b\", p [a], q 'it''s', \
+         r `a``b`, s [x] TEXT); PRAGMA table_info(t)",
+        "SELECT typeof(CAST('1' AS [x] TEXT)), typeof(CAST('1' AS [a] CHARX)), typeof(CAST('1' AS \"text\")), \
+         typeof(CAST('1' AS \"int\"(3))), typeof(CAST('1' AS \"\"))",
+        "CREATE TABLE t(a \"ANY\", b [int], c 'TEXT') STRICT; INSERT INTO t VALUES ('1', '2', 3); \
+         SELECT typeof(a), typeof(b), typeof(c) FROM t; PRAGMA table_info(t)",
+        "CREATE TABLE t(a INT, b varchar(5)); CREATE VIEW v AS SELECT a, a COLLATE NOCASE, b FROM t; \
+         PRAGMA table_info(v)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(same(&format!("dqf{i}"), s).is_none(), "{s}");
+    }
+    // A quoted type the pin's STRICT check reads as unknown.
+    assert!(same("dqs", "CREATE TABLE u(a [x] TEXT) STRICT").is_some());
+    for (i, s) in [
+        "CREATE TABLE t(a \"INTEGER\" PRIMARY KEY, b); INSERT INTO t VALUES (5, 1)",
+        "CREATE TABLE t(a [integer], b, PRIMARY KEY (a)); INSERT INTO t VALUES (6, 1)",
+        "CREATE TABLE t(a 'Integer' PRIMARY KEY); INSERT INTO t VALUES (7)",
+        "CREATE TABLE t(a \"INTEGER\"(3) PRIMARY KEY); INSERT INTO t VALUES (8)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        pin_reads_hipp_file(
+            &format!("dqa{i}"),
+            s,
+            "SELECT rowid, * FROM t; SELECT name FROM sqlite_schema",
+        );
+    }
+}
+
+/// A table-level `PRIMARY KEY (a DESC)` on an INTEGER column is the
+/// rowid alias on the pin (only the column constraint's DESC is
+/// the quirk); hipp wrote an autoindex the pin calls orphan.
+#[test]
+fn regression_table_level_pk_desc_is_the_rowid_alias() {
+    for (i, s) in [
+        "CREATE TABLE t(a INTEGER, b, PRIMARY KEY(a DESC)); INSERT INTO t VALUES (5, 1)",
+        "CREATE TABLE t(a INTEGER, b, PRIMARY KEY(a COLLATE nocase DESC)); INSERT INTO t VALUES (5, 1)",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY DESC, b); INSERT INTO t VALUES (5, 1)",
+        "CREATE TABLE t(a INTEGER, b, PRIMARY KEY(a DESC, b)); INSERT INTO t VALUES (5, 1)",
+        "CREATE TABLE t(a TEXT, b, PRIMARY KEY(a DESC)); INSERT INTO t VALUES ('5', 1)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        pin_reads_hipp_file(
+            &format!("pkd{i}"),
+            s,
+            "SELECT rowid, * FROM t; SELECT name FROM sqlite_schema; PRAGMA index_list(t); PRAGMA table_info(t)",
+        );
+    }
+}
+
+/// A user view or table named like a table-valued pragma function
+/// shadows it; given arguments, any table or view is "not a
+/// function" (hipp ignored the arguments).
+#[test]
+fn regression_schema_objects_shadow_pragma_functions() {
+    for (i, s) in [
+        "CREATE TABLE t(a); INSERT INTO t VALUES (7); CREATE VIEW pragma_user_version AS SELECT a FROM t; \
+         SELECT * FROM pragma_user_version",
+        "CREATE TABLE pragma_table_info(x); INSERT INTO pragma_table_info VALUES (9); \
+         SELECT * FROM pragma_table_info",
+        "CREATE TABLE t(a); CREATE VIEW pragma_table_list AS SELECT 1 AS n; SELECT * FROM pragma_table_list",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(same(&format!("sh{i}"), s).is_none(), "{s}");
+    }
+    for (i, s) in [
+        "CREATE TABLE pragma_table_info(x); SELECT * FROM pragma_table_info('pragma_table_info')",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (3); SELECT * FROM t(1)",
+        "CREATE TABLE t(a); SELECT * FROM main.t(1)",
+        "CREATE TABLE t(a); SELECT * FROM t()",
+        "CREATE VIEW v AS SELECT 1; SELECT * FROM v(1)",
+        "WITH c AS (SELECT 1) SELECT * FROM c(1)",
+        "CREATE VIEW pragma_user_version AS SELECT 5; SELECT * FROM pragma_user_version()",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(&format!("shf{i}"), s, SchemaKind::UnknownFunction);
+    }
+}
+
+/// Each table-valued pragma takes the pin's hidden columns only
+/// (`arg` for a name, `schema` for a database), checks the schema
+/// name, and ignores nothing (pragma_user_version(5) wrote
+/// nothing and answered).
+#[test]
+fn regression_table_valued_pragma_arities() {
+    let setup = "CREATE TABLE t(a); CREATE INDEX i ON t(a); ";
+    let prags = [
+        "application_id",
+        "auto_vacuum",
+        "busy_timeout",
+        "cache_size",
+        "database_list",
+        "encoding",
+        "foreign_key_list",
+        "foreign_keys",
+        "freelist_count",
+        "ignore_check_constraints",
+        "index_info",
+        "index_list",
+        "index_xinfo",
+        "journal_mode",
+        "page_count",
+        "page_size",
+        "recursive_triggers",
+        "schema_version",
+        "synchronous",
+        "table_info",
+        "table_list",
+        "table_xinfo",
+        "user_version",
+    ];
+    let args = [
+        "('t', 'main', 'x')",
+        "('nosuch')",
+        "('t', 'nosuch')",
+        "",
+        "(NULL)",
+        "('t')",
+        "('main')",
+        "('i', 'main')",
+        "('t', NULL)",
+        "(5)",
+        "('i', 'MAIN')",
+    ];
+    for (i, p) in prags.iter().enumerate() {
+        for (j, a) in args.iter().enumerate() {
+            let s = format!("{setup}SELECT count(*) FROM pragma_{p}{a}");
+            let _ = same(&format!("ar{i}-{j}"), &s);
+        }
+    }
+    refuse(
+        "ar-uv",
+        "SELECT * FROM pragma_user_version(5)",
+        SchemaKind::WrongArgumentCount,
+    );
+    refuse(
+        "ar-ps",
+        "SELECT * FROM pragma_page_size(1024)",
+        SchemaKind::UnknownDatabase,
+    );
+    assert!(
+        same(
+            "ar-uv2",
+            "PRAGMA user_version = 3; SELECT * FROM pragma_user_version"
+        )
+        .is_none()
+    );
+    // The temp database's header values are not hipp's to report.
+    hipp_refuses("ar-temp", "SELECT * FROM pragma_page_size('temp')");
+}
+
+/// The first write transaction fixes an empty database's page
+/// size, encoding and auto-vacuum mode, even when rolled back
+/// (the pin's BTS_PAGESIZE_FIXED); BEGIN IMMEDIATE / EXCLUSIVE
+/// start one at once.
+#[test]
+fn regression_page_size_is_fixed_by_a_rolled_back_write() {
+    for (i, s) in [
+        "BEGIN; CREATE TABLE t(a); ROLLBACK; PRAGMA page_size = 1024; CREATE TABLE u(a); PRAGMA page_size",
+        "BEGIN; PRAGMA user_version = 1; ROLLBACK; PRAGMA page_size = 1024; CREATE TABLE u(a); PRAGMA page_size",
+        "BEGIN IMMEDIATE; ROLLBACK; PRAGMA page_size = 1024; CREATE TABLE u(a); PRAGMA page_size",
+        "BEGIN EXCLUSIVE TRANSACTION; PRAGMA page_size = 1024; CREATE TABLE u(a); COMMIT; PRAGMA page_size",
+        "BEGIN DEFERRED; PRAGMA page_size = 1024; CREATE TABLE u(a); COMMIT; PRAGMA page_size",
+        "BEGIN; ROLLBACK; PRAGMA page_size = 2048; CREATE TABLE u(a); PRAGMA page_size",
+        "BEGIN; SELECT 1; ROLLBACK; PRAGMA page_size = 2048; CREATE TABLE u(a); PRAGMA page_size",
+        "BEGIN; CREATE TABLE t(a); ROLLBACK; PRAGMA page_count; PRAGMA freelist_count; \
+         PRAGMA encoding = 'UTF-16le'; PRAGMA encoding; PRAGMA auto_vacuum = 1; PRAGMA auto_vacuum",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let h = common::temp_db(&format!("v16pr-psf{i}-h"));
+        let o = common::temp_db(&format!("v16pr-psf{i}-o"));
+        assert!(same_on(&h, &o, s).is_none(), "{s}");
+        // (hipp writes page 1 at create; the pin's empty file has
+        // no pages, so only files with a table compare.)
+        if s.contains("CREATE TABLE u") {
+            assert_eq!(
+                std::fs::metadata(&h).expect("hipp file").len(),
+                std::fs::metadata(&o).expect("pin file").len(),
+                "{s}"
+            );
+        }
+    }
+    assert!(matches!(
+        same("psf-syn", "BEGIN DEFERRED IMMEDIATE"),
+        Some(Error::Parse { .. })
+    ));
+}
+
+/// FOREIGN KEY definitions the pin refuses (hipp wrote them, and
+/// the pin then could not read the file); PRIMARY KEY / UNIQUE
+/// lists must name columns too.
+#[test]
+fn regression_foreign_key_definitions_are_validated() {
+    for (i, s) in [
+        "CREATE TABLE c(x REFERENCES p(a, b))",
+        "CREATE TABLE c(x REFERENCES c(x, x))",
+        "CREATE TABLE c(x, FOREIGN KEY (x, x) REFERENCES p(a))",
+        "CREATE TABLE c(x, FOREIGN KEY (x) REFERENCES p(a, b))",
+        "CREATE TABLE c(x, FOREIGN KEY (nosuch) REFERENCES p(a, b))",
+        "CREATE TABLE c(x); ALTER TABLE c ADD COLUMN y REFERENCES p(a, b)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(&format!("fk{i}"), s, SchemaKind::ForeignKeyColumns);
+    }
+    for (i, s) in [
+        "CREATE TABLE c(x, FOREIGN KEY (nosuch) REFERENCES p)",
+        "CREATE TABLE c(x, FOREIGN KEY (rowid) REFERENCES p(a))",
+        "CREATE TABLE c(x, FOREIGN KEY (x, y) REFERENCES p)",
+        "CREATE TABLE t(a, PRIMARY KEY (nosuch))",
+        "CREATE TABLE t(a, UNIQUE (a), PRIMARY KEY (rowid))",
+        "CREATE TABLE t(a, b, UNIQUE (b, zz))",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(&format!("fku{i}"), s, SchemaKind::UnknownColumn);
+    }
+    for (i, s) in [
+        "CREATE TABLE c(x, y, FOREIGN KEY (x, y) REFERENCES p)",
+        "CREATE TABLE c(x, FOREIGN KEY (X) REFERENCES p)",
+        "CREATE TABLE c(x, FOREIGN KEY (\"x\") REFERENCES p(a))",
+        "CREATE TABLE c(x, FOREIGN KEY (x, x) REFERENCES p(a, b))",
+        "CREATE TABLE c(x REFERENCES p(a) ON DELETE CASCADE, y REFERENCES p)",
+        "CREATE TABLE c(a, UNIQUE (\"A\"))",
+    ]
+    .iter()
+    .enumerate()
+    {
+        pin_reads_hipp_file(
+            &format!("fkok{i}"),
+            s,
+            "PRAGMA foreign_key_list(c); PRAGMA table_list(c)",
+        );
+    }
+}
+
+/// `case_sensitive_like` reaches generated columns, and once it has
+/// been set at all the pin counts LIKE non-deterministic: a
+/// generated column may not use it (CREATE TABLE, and ALTER TABLE,
+/// which re-checks the whole table).
+#[test]
+fn regression_case_sensitive_like_and_generated_columns() {
+    assert!(
+        same(
+            "csg",
+            "CREATE TABLE t(a, b AS (a LIKE 'A%'), c AS (like('A%', a)) STORED, d AS (a LIKE 'A%' ESCAPE 'x')); \
+             PRAGMA case_sensitive_like = 1; INSERT INTO t(a) VALUES ('abc'), ('Abc'); SELECT * FROM t; \
+             PRAGMA case_sensitive_like = 0; SELECT * FROM t; SELECT a FROM t WHERE b"
+        )
+        .is_none()
+    );
+    for (i, s) in [
+        "PRAGMA case_sensitive_like = 1; PRAGMA case_sensitive_like = 0; CREATE TABLE u(a, b AS (a LIKE 'A%'))",
+        "PRAGMA case_sensitive_like = 0; CREATE TABLE u(a, b AS (like('A%', a)))",
+        "PRAGMA case_sensitive_like = 1; CREATE TABLE u(a, d AS (a LIKE 'x' ESCAPE 'y'))",
+        "CREATE TABLE u(a, b AS (a LIKE 'A%')); PRAGMA case_sensitive_like = 1; ALTER TABLE u ADD COLUMN c AS (a LIKE 'x')",
+        "CREATE TABLE u(a, b AS (a LIKE 'A%')); PRAGMA case_sensitive_like = 1; ALTER TABLE u ADD COLUMN c",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(&format!("csn{i}"), s, SchemaKind::NonDeterministic);
+    }
+    for (i, s) in [
+        "PRAGMA case_sensitive_like; CREATE TABLE u(a, b AS (like('A%', a))); INSERT INTO u(a) VALUES ('a'); SELECT * FROM u",
+        "PRAGMA case_sensitive_like = 1; CREATE TABLE u(a, b AS (a GLOB 'x'), c CHECK (c LIKE 'a')); \
+         INSERT INTO u(a, c) VALUES ('x', 'a'); SELECT * FROM u",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(same(&format!("csok{i}"), s).is_none(), "{s}");
+    }
+}
+
+/// `table_list` counts a view's planned columns (it reported 0 for
+/// a view over a derived table or CTE); one that cannot be planned
+/// has none, as on the pin.
+#[test]
+fn regression_table_list_counts_view_columns() {
+    assert!(
+        same(
+            "tlv",
+            "CREATE TABLE t(a, b); CREATE VIEW v AS SELECT * FROM (SELECT a FROM t); \
+             CREATE VIEW w AS WITH c AS (SELECT a, b FROM t) SELECT * FROM c; CREATE VIEW x AS SELECT * FROM nosuch; \
+             CREATE VIEW y(p, q, r) AS SELECT 1; CREATE VIEW z(p) AS SELECT 1, 2; CREATE VIEW vv AS SELECT * FROM v, w; \
+             PRAGMA table_list(v); PRAGMA table_list(w); PRAGMA table_list(x); PRAGMA table_list(y); \
+             PRAGMA table_list(z); PRAGMA table_list(vv); \
+             SELECT * FROM pragma_table_list WHERE type = 'view' ORDER BY name"
+        )
+        .is_none()
+    );
+}
+
+/// A file whose only change is a header pragma (the pin leaves the
+/// encoding and schema format unset) opens; a later CREATE TABLE
+/// sets them, as the pin's does.
+#[test]
+fn regression_pin_file_with_only_a_header_write() {
+    let p = common::temp_db("v16pr-hdronly");
+    let (ok, _) = oracle_script(&p, "PRAGMA user_version = 77; PRAGMA application_id = 5");
+    assert!(ok);
+    let q = "PRAGMA user_version; PRAGMA application_id; PRAGMA encoding; PRAGMA schema_version; \
+             SELECT count(*) FROM sqlite_schema";
+    let (hok, hl, he) = hipp_script(&p, q);
+    assert!(hok, "{he:?}");
+    assert_eq!(hl, oracle_script(&p, q).1);
+    let (hok, _, he) = hipp_script(
+        &p,
+        "CREATE TABLE t(a); CREATE INDEX i ON t(a DESC); INSERT INTO t VALUES (2), (1)",
+    );
+    assert!(hok, "{he:?}");
+    let d = std::fs::read(&p).expect("read");
+    assert_eq!(&d[44..48], &4u32.to_be_bytes(), "schema format");
+    assert_eq!(&d[56..60], &1u32.to_be_bytes(), "encoding");
+    let q = "PRAGMA integrity_check; PRAGMA user_version; PRAGMA index_xinfo(i); SELECT a FROM t ORDER BY a DESC";
+    let (_, hl, _) = hipp_script(&p, q);
+    assert_eq!(hl, oracle_script(&p, q).1);
+}
+
+/// `integrity_check(N)` with N outside 32 bits checks a table of
+/// that name (the pin's `sqlite3GetInt32` failing).
+#[test]
+fn regression_integrity_check_limit_outside_32_bits() {
+    for (i, a) in ["2147483648", "-2147483648", "99999999999"]
+        .iter()
+        .enumerate()
+    {
+        refuse(
+            &format!("ic32-{i}"),
+            &format!("CREATE TABLE t(a); PRAGMA integrity_check({a})"),
+            SchemaKind::UnknownTable,
+        );
+    }
+    for (i, a) in ["2147483647", "-2147483647", "1e3", "0x10", "+5", "1.5"]
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            same(
+                &format!("ic32ok{i}"),
+                &format!("CREATE TABLE t(a); PRAGMA integrity_check({a})")
+            )
+            .is_none()
+        );
+    }
+}
+
+/// The main schema table answers to both of its names as a
+/// qualifier.
+#[test]
+fn regression_sqlite_master_qualifies_sqlite_schema() {
+    for (i, q) in [
+        "SELECT sqlite_master.name FROM sqlite_schema",
+        "SELECT SQLITE_SCHEMA.name FROM sqlite_master",
+        "SELECT sqlite_master.* FROM sqlite_schema",
+        "SELECT sqlite_schema.rowid FROM main.sqlite_master",
+        "SELECT name FROM sqlite_schema WHERE sqlite_master.type = 'table'",
+        "SELECT sqlite_master.a FROM t AS sqlite_master",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            same(&format!("smq{i}"), &format!("CREATE TABLE t(a); {q}")).is_none(),
+            "{q}"
+        );
+    }
+    for (i, q) in [
+        "SELECT sqlite_temp_master.name FROM sqlite_schema",
+        "SELECT sqlite_schema.a FROM t AS sqlite_master",
+        "SELECT sqlite_schema.name FROM sqlite_master s",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(
+            &format!("smqe{i}"),
+            &format!("CREATE TABLE t(a); {q}"),
+            SchemaKind::UnknownColumn,
+        );
+    }
+    for (i, q) in [
+        "SELECT sqlite_master.name FROM sqlite_master, sqlite_schema",
+        "SELECT * FROM sqlite_master JOIN sqlite_schema USING (name)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(
+            &format!("smqa{i}"),
+            &format!("CREATE TABLE t(a); {q}"),
+            SchemaKind::AmbiguousColumn,
+        );
+    }
+}
+
+/// The full check of a table with an expression or partial index
+/// is refused before anything is reported (it printed a false
+/// "wrong # of entries", or "ok", then failed); the quick check,
+/// which reads no index keys, answers as the pin does.
+#[test]
+fn regression_integrity_check_expression_and_partial_indexes() {
+    for (i, ix) in [
+        "CREATE INDEX ip ON t(a) WHERE b > 0",
+        "CREATE INDEX ie ON t(a + b)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let p = common::temp_db(&format!("v16pr-opq{i}"));
+        let setup = format!("CREATE TABLE t(a, b); {ix}; INSERT INTO t VALUES (1, 2), (2, -1)");
+        assert!(oracle_script(&p, &setup).0);
+        for q in ["PRAGMA quick_check", "PRAGMA quick_check(t)"] {
+            let (hok, hl, _) = hipp_script(&p, q);
+            assert!(hok);
+            assert_eq!(hl, oracle_script(&p, q).1, "{ix}: {q}");
+        }
+        for q in ["PRAGMA integrity_check", "PRAGMA integrity_check(t)"] {
+            let (hok, hl, he) = hipp_script(&p, q);
+            assert!(!hok && hl.is_empty(), "{ix}: {q}: {hl:?}");
+            assert!(matches!(he, Some(Error::Unsupported)), "{he:?}");
+        }
+    }
+}
+
+/// Copies of the oracle file `base` with byte edits: both engines'
+/// checks; true when hipp's matched (hipp failing outright is
+/// returned as false).
+fn edited_check(base: &[u8], edits: &[(usize, u8)], q: &str, tag: &str) -> bool {
+    let mut d = base.to_vec();
+    for (o, v) in edits {
+        d[*o] = *v;
+    }
+    let h = common::temp_db(&format!("v16pr-ed-{tag}-h"));
+    let o = common::temp_db(&format!("v16pr-ed-{tag}-o"));
+    std::fs::write(&h, &d).expect("write");
+    std::fs::write(&o, &d).expect("write");
+    let hres = block_on(async {
+        let Ok(mut db) =
+            Connection::open(FileStorage::open(&h).expect("fs"), Config::default()).await
+        else {
+            return None;
+        };
+        let mut lines = Vec::new();
+        let Ok(mut st) = db.prepare(q).await else {
+            return None;
+        };
+        loop {
+            match st.step().await {
+                Ok(Step::Row) => {
+                    let mut l = String::new();
+                    render(&st, &mut l);
+                    lines.extend(l.split('\n').map(str::to_string));
+                }
+                Ok(Step::Done) => return Some(lines),
+                Err(_) => return None,
+            }
+        }
+    });
+    let (ook, ol) = oracle_script(&o, q);
+    match hres {
+        Some(hl) => {
+            assert!(ook, "{tag}: hipp answered {hl:?} where the pin failed");
+            assert_eq!(hl, ol, "{tag}: {q}");
+            true
+        }
+        None => false,
+    }
+}
+
+/// The record-header test the pin's integrity check makes on each
+/// row ("database disk image is malformed", one row, and the check
+/// stops), over every header-size byte class, with and without
+/// indexes and row constraints, under limits.
+#[test]
+fn regression_integrity_check_reads_record_headers() {
+    for (k, setup) in [
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES (2, NULL), (1, 'helloworld'), (3, NULL)",
+        "CREATE TABLE t(a, b); CREATE INDEX i ON t(b); INSERT INTO t VALUES (2, NULL), (1, 'helloworld'), (3, NULL)",
+        "CREATE TABLE t(a, b CHECK (b <> 'q')); INSERT INTO t VALUES (2, NULL), (1, 'helloworld'), (3, NULL)",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b); INSERT INTO t VALUES (2, NULL), (1, 'helloworld'), (3, NULL)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let p = common::temp_db(&format!("v16pr-rh{k}"));
+        assert!(oracle_script(&p, setup).0);
+        let base = std::fs::read(&p).expect("read");
+        let at = base
+            .windows(11)
+            .position(|w| &w[1..] == b"helloworld")
+            .expect("record")
+            - 2;
+        for (j, v) in [0x00u8, 0x01, 0x02, 0x03, 0x05, 0x0d, 0x0e, 0x7f, 0x80, 0xff]
+            .iter()
+            .enumerate()
+        {
+            for q in ["PRAGMA integrity_check", "PRAGMA quick_check", "PRAGMA integrity_check(1)"] {
+                assert!(
+                    edited_check(&base, &[(at, *v)], q, &format!("rh{k}-{j}")),
+                    "{setup}: header byte {v:#x}: {q}"
+                );
+            }
+        }
+    }
+}
+
+/// The index probe of the full check searches each page as the
+/// pin's seek does (binary search, raw-record comparison, cells
+/// decoded only when visited), so damaged index keys report the
+/// pin's rows; a deterministic corpus of single-byte edits.
+#[test]
+fn regression_integrity_check_damaged_index_keys() {
+    let p = common::temp_db("v16pr-dik");
+    let setup = "PRAGMA page_size = 512; CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c); CREATE INDEX i ON t(b); \
+                 CREATE TABLE u(x UNIQUE, y); \
+                 WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 199) \
+                 INSERT INTO t SELECT i, substr('ssssssssssssssssssssssssssssssssssssssssssssssssss', 1, i % 50), \
+                 printf('%.*c', (i * 37) % 900, 'q') FROM c; \
+                 WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 59) \
+                 INSERT INTO u SELECT i, zeroblob(i * 3) FROM c; DELETE FROM t WHERE a % 7 = 0";
+    assert!(oracle_script(&p, setup).0);
+    let base = std::fs::read(&p).expect("read");
+    // The review's case: one byte of an index key.
+    assert!(edited_check(
+        &base,
+        &[(113_040, 0xf4)],
+        "PRAGMA integrity_check",
+        "dik0"
+    ));
+    let mut rng = Rng(0x0016_1d3e_5eed);
+    let (mut ran, mut answered) = (0, 0);
+    for k in 0..150 {
+        let off = 512 + rng.below(base.len() - 512);
+        let v = rng.below(256) as u8;
+        ran += 1;
+        if edited_check(
+            &base,
+            &[(off, v)],
+            "PRAGMA integrity_check",
+            &format!("dik{}", k + 1),
+        ) {
+            answered += 1;
+        }
+    }
+    // hipp stops with an error only where the pin reads a cell
+    // that lies off its page (see the gaps); everything it answers
+    // is the pin's answer.
+    assert!(answered * 100 >= ran * 95, "{answered} of {ran}");
+}
+
+/// Auto-vacuum files: the header's max-root-page field and the
+/// pointer map are checked (messages, prefixes and order as the
+/// pin's); a non-auto-vacuum file with the incremental-vacuum flag
+/// set is reported.
+#[test]
+fn regression_integrity_check_pointer_maps() {
+    let p = common::temp_db("v16pr-av");
+    let setup = "PRAGMA page_size = 1024; PRAGMA auto_vacuum = 1; CREATE TABLE t(a, b); CREATE INDEX i ON t(b); \
+                 WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 60) \
+                 INSERT INTO t SELECT x, printf('%.*c', 300, char(65 + x % 26)) FROM c; CREATE TABLE big(x); \
+                 INSERT INTO big VALUES (printf('%.*c', 3000, 'z')); DELETE FROM t WHERE a % 3 = 0";
+    assert!(oracle_script(&p, setup).0);
+    let base = std::fs::read(&p).expect("read");
+    for (k, e) in [
+        vec![(67, 1)],
+        vec![(55, 3)],
+        vec![(55, 7)],
+        vec![(55, 0)],
+        vec![(1029, 5)],
+        vec![(1030, 9)],
+        vec![(1029, 0)],
+        vec![(1029, 9)],
+        vec![(1034, 5)],
+        vec![(1040, 2)],
+        vec![(1044, 4)],
+        vec![(1049, 1)],
+    ]
+    .iter()
+    .enumerate()
+    {
+        for q in [
+            "PRAGMA integrity_check",
+            "PRAGMA quick_check",
+            "PRAGMA integrity_check(2)",
+            "PRAGMA integrity_check(t)",
+        ] {
+            assert!(edited_check(&base, e, q, &format!("av{k}")), "{e:?}: {q}");
+        }
+    }
+    let mut rng = Rng(0x0016_a0a0_a0a0);
+    let (mut ran, mut answered) = (0, 0);
+    for k in 0..120 {
+        let off = 1024 + rng.below(base.len() - 1024);
+        ran += 1;
+        if edited_check(
+            &base,
+            &[(off, rng.below(256) as u8)],
+            "PRAGMA integrity_check",
+            &format!("avf{k}"),
+        ) {
+            answered += 1;
+        }
+    }
+    assert!(answered * 100 >= ran * 95, "{answered} of {ran}");
+    let p = common::temp_db("v16pr-nav");
+    assert!(oracle_script(&p, "CREATE TABLE t(a); INSERT INTO t VALUES (1)").0);
+    let base = std::fs::read(&p).expect("read");
+    for (k, e) in [vec![(67, 1)], vec![(55, 2)], vec![(55, 1)]]
+        .iter()
+        .enumerate()
+    {
+        for q in [
+            "PRAGMA integrity_check",
+            "PRAGMA integrity_check(t)",
+            "PRAGMA quick_check",
+        ] {
+            assert!(edited_check(&base, e, q, &format!("nav{k}")), "{e:?}: {q}");
+        }
+    }
+    // Header fields the pin reads at open: a page count beyond the
+    // file is malformed there (hipp read past the end as empty
+    // pages); an encoding's high bits are ignored.
+    for (k, e) in [
+        vec![(30, 0x20)],
+        vec![(31, 0x80)],
+        vec![(58, 0x42)],
+        vec![(57, 0x4d)],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut d = base.clone();
+        for (o, v) in e {
+            d[*o] = *v;
+        }
+        let h = common::temp_db(&format!("v16pr-hdr{k}"));
+        std::fs::write(&h, &d).expect("write");
+        let opened = block_on(async {
+            Connection::open(FileStorage::open(&h).expect("fs"), Config::default())
+                .await
+                .is_ok()
+        });
+        let (ook, _) = oracle_script(&h, "PRAGMA integrity_check");
+        assert_eq!(opened, ook, "{e:?}");
+        if opened {
+            assert!(edited_check(
+                &base,
+                e,
+                "PRAGMA integrity_check",
+                &format!("hdrc{k}")
+            ));
+        }
+    }
+}

@@ -490,9 +490,17 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             // BEGIN [TRANSACTION]; deferred/immediate/exclusive all
             // parse — the engine has one lock level in v0.2.
+            #[cfg(feature = "v16")]
+            let immediate = !self.eat_kw(b"DEFERRED")
+                && (self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE"));
+            #[cfg(not(feature = "v16"))]
             let _ =
                 self.eat_kw(b"DEFERRED") || self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE");
             let _ = self.eat_kw(b"TRANSACTION");
+            #[cfg(feature = "v16")]
+            if immediate {
+                return Ok(Ast::BeginImmediate);
+            }
             Ok(Ast::Begin)
         } else if self.cur_is_kw(b"COMMIT") || self.cur_is_kw(b"END") {
             self.pos += 1;
@@ -890,6 +898,15 @@ impl<'a> Parser<'a> {
         if columns.is_empty() {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
         }
+        // A PRIMARY KEY / UNIQUE list names the table's columns
+        // (v0.16 fix: `PRIMARY KEY (nosuch)` was written, and the
+        // pin then could not read the schema). The tiny profile
+        // keeps no constraint indexes at all (SPEC §2), so the
+        // check lives with them.
+        #[cfg(feature = "indexes")]
+        for s in sets.iter() {
+            self.known_columns::<E>(columns.as_slice(), s.columns.as_slice())?;
+        }
         // Mark PK columns (candidate rowid-alias semantics: a PK
         // column written with DESC is not marked — see ast docs).
         for target in pk_names.iter() {
@@ -989,7 +1006,11 @@ impl<'a> Parser<'a> {
                 .first()
                 .and_then(|h| col(*h))
                 .is_some_and(|c| {
-                    !c.pk_desc && eq_ci(trim(handle_bytes(self.arena, c.decl)), b"INTEGER")
+                    !c.pk_desc
+                        && eq_ci(
+                            crate::record::decl_token(handle_bytes(self.arena, c.decl)),
+                            b"INTEGER",
+                        )
                 });
         let coll = |d: &IndexColumnDef| d.coll.or_else(|| col(d.name).and_then(|c| c.coll));
         let mut out: AVec<ConstraintSet> = AVec::new();
@@ -3130,15 +3151,24 @@ UPDATE USING VALUES WHEN WHERE",
     /// Skip a `REFERENCES nm [(cols)] {MATCH nm | ON
     /// DELETE|UPDATE|INSERT action}` clause whose REFERENCES is
     /// token `i`, returning the next index (foreign keys are
-    /// parsed, not enforced).
-    fn references<E>(&self, mut i: usize, to: usize) -> Result<usize, E> {
+    /// parsed, not enforced). `from` is the child column count
+    /// (one for a column constraint): a parent column list of
+    /// another length is the pin's error (v0.16 fix — such a
+    /// schema made the file unreadable to the pin).
+    fn references<E>(&self, mut i: usize, to: usize, from: usize) -> Result<usize, E> {
         let bad = |j: usize| Err(perr(self.item_end_offset(j), ParseKind::UnexpectedToken));
         if !self.nm_at(i + 1, to) {
             return bad(i + 1);
         }
         i += 2;
         if i < to && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
-            i = self.constraint_columns::<E>(i, to, false)?.1;
+            let (cols, next) = self.constraint_columns::<E>(i, to, false)?;
+            if cols.len() != from {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::ForeignKeyColumns,
+                });
+            }
+            i = next;
         }
         loop {
             if self.is_kw(i, b"MATCH") {
@@ -3228,6 +3258,24 @@ UPDATE USING VALUES WHEN WHERE",
             on_update,
             on_delete,
         })
+    }
+
+    /// Every name of a constraint column list is one of the
+    /// table's columns (the pin's "no such column" / "unknown
+    /// column ... in foreign key definition"; `rowid` is not one).
+    fn known_columns<E>(&self, columns: &[ColumnDef], cols: &[IndexColumnDef]) -> Result<(), E> {
+        for c in cols {
+            let n = handle_bytes(self.arena, c.name);
+            if !columns
+                .iter()
+                .any(|d| eq_ci(handle_bytes(self.arena, d.name), n))
+            {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::UnknownColumn,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Skip an optional `[NOT] DEFERRABLE [INITIALLY DEFERRED |
@@ -3380,11 +3428,12 @@ UPDATE USING VALUES WHEN WHERE",
                     }
                     let (cols, next) = self.constraint_columns::<E>(i + 1, to, pk)?;
                     if pk {
+                        // A table-level key's DESC does not stop the
+                        // rowid alias (the pin passes no sort order
+                        // for `PRIMARY KEY (a DESC)`; v0.16 fix: hipp
+                        // wrote an autoindex the pin calls orphan).
                         for c in cols.iter() {
                             pk_names.push(c.name);
-                            if c.desc {
-                                pk_desc_names.push(c.name);
-                            }
                         }
                     }
                     sets.push(ConstraintSet {
@@ -3410,15 +3459,19 @@ UPDATE USING VALUES WHEN WHERE",
                     ));
                 } else if self.is_kw(i, b"FOREIGN") && self.is_kw(i + 1, b"KEY") {
                     // Parsed, not enforced (see module docs).
-                    let (_cols, next) = self.constraint_columns::<E>(i + 2, to, false)?;
+                    let (cols, next) = self.constraint_columns::<E>(i + 2, to, false)?;
                     if !self.is_kw(next, b"REFERENCES") {
                         return bad(next);
                     }
-                    i = self.references::<E>(next, to)?;
+                    i = self.references::<E>(next, to, cols.len())?;
+                    // Each child column must be one of the table's
+                    // (v0.16 fix; all columns precede the table
+                    // constraints).
+                    self.known_columns::<E>(columns.as_slice(), cols.as_slice())?;
                     #[cfg(feature = "v16")]
                     {
                         let mut from = AVec::new();
-                        for c in _cols.iter() {
+                        for c in cols.iter() {
                             from.push(c.name);
                         }
                         fkeys.push(self.fk_clause::<E>(from, next, to)?);
@@ -3607,7 +3660,7 @@ UPDATE USING VALUES WHEN WHERE",
                     from.push(col_name);
                     fkeys.push(self.fk_clause::<E>(from, i, to)?);
                 }
-                i = self.references::<E>(i, to)?;
+                i = self.references::<E>(i, to, 1)?;
             } else if self.is_kw(i, b"COLLATE") {
                 // v0.16: the column's collating sequence (it used
                 // to be parsed and ignored — comparisons and

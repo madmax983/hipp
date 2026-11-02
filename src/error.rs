@@ -228,6 +228,13 @@ pub enum SchemaKind {
     /// out first.
     #[cfg(feature = "v16")]
     PercentileInfinite,
+    /// A FOREIGN KEY whose column lists disagree (v0.16 fix, the
+    /// pin's "foreign key on x should reference only one column of
+    /// table p" / "number of columns in foreign key does not match
+    /// the number of columns in the referenced table"): a column's
+    /// REFERENCES names at most one parent column, a table-level
+    /// key as many as it lists. Make the lists the same length.
+    ForeignKeyColumns,
     /// CREATE TABLE / INDEX / VIEW of a name starting with
     /// `sqlite_` (any case; the pin's "object name reserved for
     /// internal use"). Choose another name.

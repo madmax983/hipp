@@ -10,7 +10,7 @@
 
 [tiny]
 # .text + .rodata, bytes.
-ratchet = 76116
+ratchet = 76324
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
@@ -21,7 +21,7 @@ justify_over = 4096
 # The full no_std profile (`--no-default-features --features full`),
 # same target, profile and binary. Tracked so dialect growth is a
 # visible, reviewed number; the tiny profile is the one SPEC §4.1 binds.
-ratchet = 395669
+ratchet = 404128
 budget = 524288
 statics_budget = 8192
 justify_over = 16384

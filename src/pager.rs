@@ -93,6 +93,14 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         return Err(Error::CorruptPage { page: 1 });
     }
     let encoding = be_u32(probe, 56);
+    // v0.16 (`v16`): the pin reads the encoding's low two bits: 0 —
+    // not set yet, as in its file after only a header write
+    // (`PRAGMA user_version = N` on a new file) — and 1 are UTF-8.
+    #[cfg(feature = "v16")]
+    let encoding = match encoding & 3 {
+        0 => 1,
+        e => e,
+    };
     if encoding == 2 || encoding == 3 {
         return Err(Error::UnsupportedEncoding);
     }
@@ -231,6 +239,12 @@ pub struct Pager<S: Storage> {
     /// `PRAGMA page_size` may still change.
     #[cfg(feature = "v16")]
     created: bool,
+    /// A write transaction has begun since the open (v0.16, `v16`):
+    /// the pin's `BTS_PAGESIZE_FIXED`, which a ROLLBACK does not
+    /// clear — the page size, encoding and auto-vacuum mode of an
+    /// empty database are fixed from then on.
+    #[cfg(feature = "v16")]
+    layout_fixed: bool,
 }
 
 impl<S: Storage> Pager<S> {
@@ -317,6 +331,15 @@ impl<S: Storage> Pager<S> {
                 header = parse_db_header::<S::Error>(&probe, fl)?;
             }
         }
+        // A header that claims more pages than the file holds is
+        // the pin's "malformed" (v0.16, `v16`: hipp read past the
+        // end as empty pages, which integrity_check reported).
+        #[cfg(feature = "v16")]
+        let fl = storage.len().await.map_err(Error::Storage)?;
+        #[cfg(feature = "v16")]
+        if u64::from(header.page_count) > fl.div_ceil(u64::from(header.page_size)) {
+            return Err(Error::CorruptPage { page: 1 });
+        }
 
         let frames = (0..cache_cap)
             .map(|_| Frame {
@@ -347,6 +370,8 @@ impl<S: Storage> Pager<S> {
                 txn_arena,
                 #[cfg(feature = "v16")]
                 created: is_new,
+                #[cfg(feature = "v16")]
+                layout_fixed: false,
             },
             is_new,
         ))
@@ -476,6 +501,10 @@ impl<S: Storage> Pager<S> {
         // A9 enforcement point for the transaction scope (SPEC
         // §7.5.4): it fails before anything is written anywhere.
         self.txn_arena.charge(self.cache_cap * 4 + 64)?;
+        #[cfg(feature = "v16")]
+        {
+            self.layout_fixed = true;
+        }
         // Fresh nonce per transaction (SPEC §5.3; R2's entropy note:
         // the seed is Config-supplied; targets with real entropy
         // should seed it — a counter mix is the documented floor).
@@ -777,6 +806,19 @@ impl<S: Storage> Pager<S> {
         put_be_u32(d, 40, self.header.schema_cookie);
         put_be_u32(d, 92, new_counter);
         put_be_u32(d, 96, PIN_VERSION_NUMBER);
+        // The first schema change on a file whose schema format and
+        // encoding are still unset (0) sets them, as the pin's
+        // CREATE TABLE / VIEW does (v0.16, `v16`: such a file opens
+        // only there).
+        #[cfg(feature = "v16")]
+        if self
+            .txn_header
+            .is_some_and(|h| h.schema_cookie != self.header.schema_cookie)
+            && be_u32(d, 44) == 0
+        {
+            put_be_u32(d, 44, 4);
+            put_be_u32(d, 56, 1);
+        }
         Ok(())
     }
 
@@ -796,6 +838,23 @@ impl<S: Storage> Pager<S> {
             && self.header.change_counter == 1
             && self.header.page_count == 1
             && self.stage == CommitStage::Idle
+    }
+
+    /// The empty database's layout (page size, encoding,
+    /// auto-vacuum mode) may still change (v0.16, `v16`): it is
+    /// `pristine` and no write transaction has begun since the open
+    /// (`BEGIN IMMEDIATE` counts; see `fix_layout`).
+    #[cfg(feature = "v16")]
+    pub fn layout_open(&self) -> bool {
+        self.pristine() && !self.layout_fixed
+    }
+
+    /// Fix the layout as a write transaction's start does (v0.16,
+    /// `v16`: `BEGIN IMMEDIATE` / `EXCLUSIVE`, which take the
+    /// pin's write lock at once).
+    #[cfg(feature = "v16")]
+    pub fn fix_layout(&mut self) {
+        self.layout_fixed = true;
     }
 
     /// Write a 32-bit header field of page 1 inside the current
@@ -823,7 +882,7 @@ impl<S: Storage> Pager<S> {
     /// caller checks `pristine` and the size.
     #[cfg(feature = "v16")]
     pub async fn reformat(&mut self, page_size: u32) -> Result<(), S::Error> {
-        if !self.pristine() {
+        if !self.layout_open() {
             return Err(Error::Unsupported);
         }
         let img = initial_page1(page_size);

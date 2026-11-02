@@ -459,8 +459,76 @@ pub enum Affinity {
     Numeric,
 }
 
-/// Column affinity from the declared type string, SQLite's rules.
+/// A column's declared type token span with the pin's
+/// `sqlite3DequoteToken` applied (v0.16 fix): a span of at least
+/// three bytes that starts with a quote character and has no other
+/// quote character before its last byte loses its first and last
+/// bytes (`"INTEGER"` is `INTEGER`, `[x] TEXT` is `x] TEX`). The
+/// pin matches its standard type names against this form, so the
+/// rowid-alias rule and STRICT types read it.
+pub fn decl_token(decl: &[u8]) -> &[u8] {
+    let d = decl.trim_ascii();
+    match d {
+        [f, mid @ .., _] if d.len() >= 3 && is_quote(*f) && !mid.iter().any(|c| is_quote(*c)) => {
+            mid
+        }
+        _ => d,
+    }
+}
+
+fn is_quote(c: u8) -> bool {
+    matches!(c, b'"' | b'\'' | b'`' | b'[')
+}
+
+/// A column's declared type as the pin keeps it (v0.16 fix):
+/// `decl_token`, then `dequote_q`. Affinity reads this form.
+pub fn decl_type_q(decl: &[u8]) -> (&[u8], u8) {
+    dequote_q(decl_token(decl))
+}
+
+/// The pin's `sqlite3Dequote` of a (trimmed) type: one that starts with a
+/// quote is cut at its closing quote (`"a" "b"` is `a`, `"int"(3)`
+/// is `int`). Returns the bytes and the closing quote whose
+/// doubled occurrences the pin collapses for display (`0` when
+/// none: the bytes are final).
+pub fn dequote_q(d: &[u8]) -> (&[u8], u8) {
+    match d {
+        [f, rest @ ..] if is_quote(*f) => {
+            let close = if *f == b'[' { b']' } else { *f };
+            let mut i = 0;
+            while let Some(c) = rest.get(i) {
+                if *c == close {
+                    if rest.get(i + 1) != Some(&close) {
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            (rest.get(..i).unwrap_or(rest), close)
+        }
+        _ => (d, 0),
+    }
+}
+
+/// Column affinity from the declared type string, SQLite's rules
+/// (read from the pin's dequoted form, `decl_type_q`; a
+/// declaration that dequotes to nothing, such as `""`, still has a
+/// type and so NUMERIC affinity, as on the pin).
 pub fn affinity_of(decl: &[u8]) -> Affinity {
+    type_affinity(decl_type_q(decl).0, decl.trim_ascii().is_empty())
+}
+
+/// A CAST's affinity (v0.16 fix): the pin dequotes a CAST's type
+/// with `sqlite3Dequote` alone (`CAST(x AS [a] CHARX)` reads `a`).
+pub fn cast_affinity(ty: &[u8]) -> Affinity {
+    let ty = ty.trim_ascii();
+    type_affinity(dequote_q(ty).0, ty.is_empty())
+}
+
+/// `sqlite3AffinityType` over a dequoted type; `none` for a column
+/// declared without one (BLOB).
+fn type_affinity(decl: &[u8], none: bool) -> Affinity {
     // ASCII uppercase the declaration for substring checks.
     let upper_contains = |needle: &str| -> bool {
         let n = needle.as_bytes();
@@ -477,7 +545,7 @@ pub fn affinity_of(decl: &[u8]) -> Affinity {
         Affinity::Integer
     } else if upper_contains("CHAR") || upper_contains("CLOB") || upper_contains("TEXT") {
         Affinity::Text
-    } else if upper_contains("BLOB") || decl.is_empty() {
+    } else if upper_contains("BLOB") || none {
         Affinity::Blob
     } else if upper_contains("REAL") || upper_contains("FLOA") || upper_contains("DOUB") {
         Affinity::Real
