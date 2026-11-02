@@ -1666,6 +1666,175 @@ and the function-name table.
 - The printf result limit is the pin's default
   SQLITE_LIMIT_LENGTH; hipp has no runtime limit setting.
 
+### Aggregate completion (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1; its build has `SQLITE_ENABLE_PERCENTILE`), gated as below.
+Census (186 probes): on the 177 earlier probes MATCH 109 → 113
+(`f_group_concat_order`, `f_string_agg`, `f_filter`, `f_median`;
+HIPP_ERR 56 → 52); 9 new probes for this unit — 7 match, 2 are
+errors on both (sum overflow, DISTINCT argument count). The old
+binary was silently wrong on 4 of them (sum overflow, the
+compensated sum, the NULL separator, `group_concat(DISTINCT x,
+',')`). Folding moved to a new `src/agg.rs` (built with `v04`).
+
+**Shipped — `v16`:**
+
+- `string_agg(X, SEP)` (exactly two arguments; group_concat's
+  fold) and `count()` (= `count(*)`).
+- The aggregate ORDER BY, `f(args ORDER BY term, ...)` with ASC /
+  DESC / NULLS FIRST / LAST and collations, on every aggregate:
+  the stepped rows are sorted stably (ties keep input order —
+  the pin's sorter carries a sequence number), so it orders
+  group_concat / string_agg, and the steps of sum / total / avg
+  (REAL sums are order-sensitive: `sum(x ORDER BY k)` over
+  1e308, 1e308, -1e308 is Inf, descending 1e308) and of the
+  percentile checks. min / max drop it (EXPLAIN shows no sorter
+  on the pin). An integer term is a constant, not an ordinal.
+  DISTINCT keeps the first equal value in input order, then
+  sorts; when the only ORDER BY term is the argument itself
+  (`query::same_expr`, the pin's `sqlite3ExprCompare`: COLLATE
+  makes it differ, parentheses do not), the pin deduplicates
+  through its sorter index and the *last* of equal keys survives
+  (`group_concat(DISTINCT c ORDER BY c)` over NOCASE 'A', 'a' is
+  `a`; `typeof(sum(DISTINCT x ORDER BY x))` over 1.0, 1 is
+  integer). The pin's grammar takes ORDER BY only after one or
+  more arguments.
+- `FILTER (WHERE expr)` on every aggregate: a row whose filter is
+  NULL or false is not stepped and nothing else of it is
+  evaluated; FILTER is no reserved word (`count(*) filter` is an
+  alias). A rejected row never loads min / max bare columns
+  (none passing: the group's first row, as on the pin).
+- FILTER and ORDER BY count for aggregate ownership in
+  subqueries: `(SELECT count(*) FILTER (WHERE t.a > 1) FROM u)`
+  is the outer query's (one row), `(SELECT sum(t.a) FILTER
+  (WHERE u.k > 1) FROM u)` the subquery's. Aggregates inside
+  them are misuse; on a non-aggregate (scalar min / max
+  included) they are `SchemaKind::OrderByNonAggregate` /
+  `FilterNonAggregate`. Layout: `RExpr::Agg` keeps the keys and
+  the filter in `args` behind its arguments (`AggExt`), so every
+  walker — column shifts, subquery collection, ownership,
+  nested-aggregate misuse — sees them; `query::agg_parts` takes
+  a node apart.
+- `median(Y)`, `percentile(Y, P)` (P in 0 ..= 100),
+  `percentile_cont(Y, P)` / `percentile_disc(Y, P)` (0 ..= 1):
+  per stepped row, P is checked first (its numeric type: numeric
+  text counts, a blob or NULL does not —
+  `PercentileFraction`), then compared with the first row's
+  fraction within 0.001 (`PercentileFractionVaries`), then a
+  NULL Y is skipped, a TEXT / BLOB Y is `PercentileNotNumeric`
+  (no conversion: `'3'` is refused), an infinite one
+  `PercentileInfinite`; the result is the REAL at `P * (n - 1)`
+  of the sorted values, linearly interpolated except for
+  `percentile_disc`; no stepped value is NULL. The errors depend
+  on bound values, so with `params` they are deferred to step.
+
+**Shipped — ungated (silent wrong answers on claimed v0.4
+paths):**
+
+- `sum()` follows the pin's `sumStep`: an exact integer sum while
+  every addend is INTEGER, else a Kahan–Babuška–Neumaier REAL sum
+  (integers at or past 2^52 split as the pin splits them); an
+  integer overflow is `SchemaKind::IntegerOverflow` unless a later
+  REAL addend absorbs it (hipp returned a REAL); `total()` / `avg()`
+  read the compensated REAL. `sum(0.1, 0.2, 0.3)` was
+  `0.60000000000000009`, `sum(1e18, 1, -1e18)` was 0.0.
+- A text addend is INTEGER only when it is wholly an integer
+  (`' 5 '`, `'+7'`); any other text or blob adds its numeric
+  prefix as a REAL (`sum('  12abc')` is `12.0`, hipp said 12).
+- group_concat's separator is each value's own; a NULL one adds
+  nothing (the whole result was NULL).
+- DISTINCT with other than one argument is
+  `SchemaKind::DistinctAggregateArgs` (`group_concat(DISTINCT b,
+  ',')` ran), checked after the argument count as on the pin.
+- Group finalization (found while probing the overflow error):
+  the pin finalizes every aggregate of a group before HAVING
+  decides, so an erroring one fails the statement even for a
+  group HAVING drops (hipp skipped them); HAVING's AND terms
+  without aggregates or subqueries are moved into WHERE there, so
+  a group failing one never forms (`GROUP BY k HAVING k = 1`
+  ignores the overflowing group); and a grouped query with a
+  LIMIT, no DISTINCT and output in group order (no ORDER BY, or
+  one naming exactly the GROUP BY terms) stops finalizing at
+  OFFSET + LIMIT — so `(SELECT sum(v) FROM g GROUP BY k)` reads
+  only the first group (`session::having_early`, `group_aggs`,
+  `group_cap`; top-level queries and subqueries).
+
+**Oracle-probing notes** (all on the live 3.54.1 pin): `EXPLAIN`
+shows an ephemeral sorter with `OP_Sequence` for every aggregate
+ORDER BY but min / max, and a second ephemeral (`OP_Found`) for
+the first-seen DISTINCT test unless the ORDER BY is the argument
+(then the sorter alone, no sequence column); `group_concat(DISTINCT
+a ORDER BY b)` over 1, 2, 3, NULL, 2, '7' gives `7,1,2,3` (the v
+row's 2 dropped in input order); `group_concat(x, s)` uses the
+current row's separator (`ab3c` with a NULL second separator,
+`b3c` when the first value is NULL); `group_concat('')` is `''`;
+`percentile(a, '50')` works, `'50x'` / `x'01'` / NULL fail even
+over NULL Y rows, a varying P fails at the first row past 0.001
+(`50` vs `50.05` passes), `percentile(a, true)` is 1.04;
+`median(-0.0)` renders `0.0`; `sum()` after an overflow: a later
+1.0 or text / blob (REAL addends) absorbs it, a later INTEGER,
+`'1'` or NULL does not; `sum('5e0')` is REAL, `sum(CAST(x'3500' AS
+TEXT))` INTEGER 5; `select k, sum(v) ... group by k limit 1`,
+`having k = 1`, `(select sum(v) ... group by k)` and `EXISTS (...)`
+succeed while `having count(*) < 2`, `limit 1 offset 1`, `order by
+sum(v) limit 1` and `1 IN (...)` raise the overflow; FILTER on a
+min / max with no passing row leaves the bare column at the
+group's first row.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed". New suites:
+`tests/aggregates_v16.rs` (14 tests: string_agg / ORDER BY
+corpus and refusals, DISTINCT + ORDER BY interplay, FILTER and its
+refusals, FILTER with bare columns, clause ownership in
+subqueries, percentile values and every percentile error kind, a
+bound-P test through the Statement API, the sum overflow / KBN /
+text-addend regressions, the separator and DISTINCT-argument
+regressions, mixed storage classes and collations, empty input
+and HAVING / ORDER BY in compound and subquery bodies, the group
+finalization rules, and a 240-statement PRNG corpus of random
+aggregates with random DISTINCT / ORDER BY / FILTER over mixed
+storage classes — `HIPP_AGG_CORPUS` / `HIPP_AGG_SEED` scale it;
+4 × 1 500 extra statements agreed while developing) and
+`hipp-cli/tests/cli_v16_aggregates.rs` (5 byte-identical batches,
+one-shot and over stdin: ORDER BY, FILTER, percentile, sums and
+separators, CREATE TABLE ... AS SELECT with its `.schema`).
+
+**Size:** tiny **75,960 B** (Δ **0**: the evaluator is not in the
+tiny profile). Full **325,451 B** (Δ **+10,196 B** vs 315,255,
+ratchet raised to it): the percentile family, the KBN sum
+context, the ORDER BY / DISTINCT sort (one hand-written stable
+merge sort over row indices — two `slice::sort_by`
+instantiations cost 6 KB more), FILTER and clause resolution
+(`AggExt`, `same_expr`), and the finalization rules in the three
+group loops.
+
+**Honest gaps:**
+
+- Window functions (`OVER`) are not implemented (another leaf);
+  `sum(a) OVER ()` and an aggregate with FILTER / ORDER BY plus
+  OVER stay refused.
+- The DISTINCT-equals-ORDER-BY test compares columns, literals,
+  operators, casts, COLLATE and scalar calls; a CASE or
+  subquery argument repeated in the ORDER BY takes the
+  first-seen path, where the pin keeps the last of equal values.
+- Group finalization: a WHERE-able HAVING term is any AND term
+  without aggregates or subqueries (the pin also requires it to
+  name only GROUP BY terms, so `HAVING bare_col > 1` still
+  finalizes there and can error where hipp skips the group); a
+  DISTINCT grouped query, a compound core and a derived table
+  the pin pushes a WHERE into (`SELECT * FROM (SELECT k, sum(v)
+  ... GROUP BY k) WHERE k = 1`) finalize every group in hipp, so
+  an erroring aggregate in a group the pin never forms fails
+  there.
+- When several aggregates (or rows) would raise different errors,
+  which one hipp reports may differ from the pin's; the tests
+  compare errored-vs-succeeded and hipp's kind, never the pin's
+  text.
+- Aggregate folding is still materialise-then-fold (each group's
+  rows held in memory) and DISTINCT is quadratic, as before.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

@@ -185,6 +185,11 @@ pub enum Expr {
         distinct: bool,
         star: bool,
         args: AVec<Expr>,
+        /// The aggregate clauses written with the call (v0.16,
+        /// `v16`): `f(args ORDER BY ...)` and `f(...) FILTER
+        /// (WHERE ...)`. `None` when neither was written.
+        #[cfg(feature = "v16")]
+        clause: Option<Box<FuncClause>>,
     },
     Cast(Box<Expr>, ABytes),
     /// A hexadecimal literal too big for 64 bits (more than 16
@@ -273,6 +278,17 @@ impl JoinKind {
     pub fn pads_left(self) -> bool {
         matches!(self, JoinKind::Right | JoinKind::Full)
     }
+}
+
+/// The aggregate clauses of a function call (v0.16, `v16`): the
+/// ORDER BY written inside its parentheses (empty when none) and
+/// its `FILTER (WHERE ...)` expression. The planner refuses both
+/// on a function that is not an aggregate, as the pin does.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct FuncClause {
+    pub order_by: AVec<(Expr, SortOrder)>,
+    pub filter: Option<Expr>,
 }
 
 /// The direction of one ORDER BY term (v0.16 adds NULL

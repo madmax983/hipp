@@ -666,7 +666,21 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
                 || whens.iter().any(|(w, t)| expr_any(w, f) || expr_any(t, f))
                 || otherwise.as_ref().is_some_and(|o| expr_any(o, f))
         }
-        Expr::Func { args, .. } => args.iter().any(|x| expr_any(x, f)),
+        Expr::Func {
+            args,
+            #[cfg(feature = "v16")]
+            clause,
+            ..
+        } => {
+            #[cfg(feature = "v16")]
+            if let Some(c) = clause
+                && (c.order_by.iter().any(|(x, _)| expr_any(x, f))
+                    || c.filter.as_ref().is_some_and(|x| expr_any(x, f)))
+            {
+                return true;
+            }
+            args.iter().any(|x| expr_any(x, f))
+        }
     }
 }
 

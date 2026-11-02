@@ -14,6 +14,8 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "v04")]
+pub mod agg;
 #[allow(unsafe_code)] // the bounded arena exception (SPEC §6)
 pub mod arena;
 pub mod btree;

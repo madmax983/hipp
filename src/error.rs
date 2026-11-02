@@ -187,6 +187,47 @@ pub enum SchemaKind {
     /// the limit, or a `printf` result reaching it.
     #[cfg(feature = "v16")]
     TooBig,
+    /// A DISTINCT aggregate called with other than exactly one
+    /// argument (v0.16, ungated; the pin's "DISTINCT aggregates
+    /// must have exactly one argument" — `group_concat(DISTINCT
+    /// x, ',')` used to run). Drop DISTINCT, or the separator.
+    DistinctAggregateArgs,
+    /// `ORDER BY` inside the parentheses of a function that is
+    /// not an aggregate (v0.16, `v16`; the pin's "ORDER BY may
+    /// not be used with non-aggregate"). Order the query instead.
+    #[cfg(feature = "v16")]
+    OrderByNonAggregate,
+    /// `FILTER (WHERE ...)` after a function that is not an
+    /// aggregate (v0.16, `v16`; the pin's "FILTER may not be used
+    /// with non-aggregate"). Use a CASE expression instead.
+    #[cfg(feature = "v16")]
+    FilterNonAggregate,
+    /// The P argument of `percentile(Y, P)` (0 ..= 100) or
+    /// `percentile_cont` / `percentile_disc` (0 ..= 1) is not a
+    /// number in range — NULL, non-numeric text, a blob, or out
+    /// of bounds (v0.16, `v16`; the pin's "the fraction argument
+    /// to ...() is not between 0.0 and ..."). Raised for each row
+    /// the aggregate steps, NULL Y included. Pass a constant in
+    /// range.
+    #[cfg(feature = "v16")]
+    PercentileFraction,
+    /// The P argument of a percentile aggregate differs (by more
+    /// than 0.001 of the fraction) between rows of one group
+    /// (v0.16, `v16`; the pin's "the fraction argument to ...() is
+    /// not the same for all input rows"). Pass a constant P.
+    #[cfg(feature = "v16")]
+    PercentileFractionVaries,
+    /// A non-NULL Y of `median()` / `percentile*()` that is not an
+    /// INTEGER or REAL — TEXT (even numeric text) or a BLOB
+    /// (v0.16, `v16`; the pin's "input to ...() is not numeric").
+    /// CAST the column to REAL.
+    #[cfg(feature = "v16")]
+    PercentileNotNumeric,
+    /// An infinite Y of `median()` / `percentile*()` (v0.16,
+    /// `v16`; the pin's "Inf input to ...()"). Filter infinities
+    /// out first.
+    #[cfg(feature = "v16")]
+    PercentileInfinite,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

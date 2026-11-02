@@ -181,9 +181,23 @@ impl Binder<'_> {
                     self.expr::<E>(x)?;
                 }
             }
-            Expr::Func { args, .. } => {
+            Expr::Func {
+                args,
+                #[cfg(feature = "v16")]
+                clause,
+                ..
+            } => {
                 for x in args.as_mut_slice() {
                     self.expr::<E>(x)?;
+                }
+                #[cfg(feature = "v16")]
+                if let Some(c) = clause {
+                    for (x, _) in c.order_by.as_mut_slice() {
+                        self.expr::<E>(x)?;
+                    }
+                    if let Some(x) = &mut c.filter {
+                        self.expr::<E>(x)?;
+                    }
                 }
             }
         }
@@ -382,6 +396,12 @@ fn constant(e: &Expr) -> bool {
                 && whens.iter().all(|(w, t)| constant(w) && constant(t))
                 && otherwise.as_deref().is_none_or(constant)
         }
+        // An aggregate clause makes no call constant (it only
+        // goes with aggregates, which are not).
+        #[cfg(feature = "v16")]
+        Expr::Func {
+            clause: Some(_), ..
+        } => false,
         Expr::Func { args, .. } => args.iter().all(constant),
     }
 }

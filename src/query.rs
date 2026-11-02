@@ -69,7 +69,132 @@ pub enum AggKind {
     Total,
     Min,
     Max,
+    /// `group_concat(X[, SEP])`, and (v0.16, `v16`)
+    /// `string_agg(X, SEP)`.
     GroupConcat,
+    /// `median(Y)` (v0.16, `v16`): `percentile(Y, 50)`.
+    #[cfg(feature = "v16")]
+    Median,
+    /// `percentile(Y, P)`, P in 0 ..= 100 (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Percentile,
+    /// `percentile_cont(Y, P)`, P in 0 ..= 1 (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    PercentileCont,
+    /// `percentile_disc(Y, P)`, P in 0 ..= 1 (v0.16, `v16`): the
+    /// value at or below the interpolation point, no blending.
+    #[cfg(feature = "v16")]
+    PercentileDisc,
+}
+
+/// How an aggregate's `args` divide when it was written with an
+/// aggregate ORDER BY and / or FILTER clause (v0.16, `v16`): the
+/// first `nargs` are its arguments, the next `order.len()` its
+/// ORDER BY keys (`order` holds their directions and
+/// collations), and with `filter` the last one is its FILTER
+/// expression. Keeping them in `args` lets every walker (column
+/// shifts, subquery collection and substitution, aggregate
+/// ownership, nested-aggregate misuse) see them unchanged.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct AggExt {
+    pub nargs: usize,
+    pub order: AVec<SortOrder>,
+    pub filter: bool,
+    /// The pin's "ORDER BY is the argument" form of a DISTINCT
+    /// aggregate (`group_concat(DISTINCT x ORDER BY x)`): the
+    /// values are deduplicated by the sort itself, the *last* of
+    /// equal keys surviving, instead of by the first-seen DISTINCT
+    /// test.
+    pub unique: bool,
+}
+
+/// One aggregate node, taken apart (`agg_parts`): its kind and
+/// flags, its own arguments, and (v0.16, `v16`) its ORDER BY
+/// keys with their directions and its FILTER expression. Each
+/// group row contributes the values of `inputs()` (arguments,
+/// then keys) when the filter passes.
+#[derive(Debug, Clone, Copy)]
+pub struct AggParts<'a> {
+    pub kind: AggKind,
+    pub distinct: bool,
+    pub star: bool,
+    pub args: &'a [RExpr],
+    inputs: &'a [RExpr],
+    pub filter: Option<&'a RExpr>,
+    pub order: &'a [SortOrder],
+    pub unique: bool,
+}
+
+impl<'a> AggParts<'a> {
+    /// The expressions each stepped row evaluates: the arguments,
+    /// then the ORDER BY keys.
+    pub fn inputs(&self) -> &'a [RExpr] {
+        self.inputs
+    }
+}
+
+/// Take an aggregate node apart (None for any other node).
+pub fn agg_parts(e: &RExpr) -> Option<AggParts<'_>> {
+    let RExpr::Agg {
+        kind,
+        distinct,
+        star,
+        args,
+        #[cfg(feature = "v16")]
+        ext,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    let all = args.as_slice();
+    #[cfg(feature = "v16")]
+    if let Some(x) = ext {
+        let n = x.nargs.min(all.len());
+        let k = n.saturating_add(x.order.len()).min(all.len());
+        return Some(AggParts {
+            kind: *kind,
+            distinct: *distinct,
+            star: *star,
+            args: all.get(..n).unwrap_or(&[]),
+            inputs: all.get(..k).unwrap_or(&[]),
+            filter: if x.filter { all.get(k) } else { None },
+            order: x.order.as_slice(),
+            unique: x.unique,
+        });
+    }
+    Some(AggParts {
+        kind: *kind,
+        distinct: *distinct,
+        star: *star,
+        args: all,
+        inputs: all,
+        filter: None,
+        order: &[],
+        unique: false,
+    })
+}
+
+/// One group row's contribution to an aggregate (`agg_parts`):
+/// None when its FILTER does not pass (NULL or false: the row is
+/// not stepped, and nothing else of it is evaluated), else the
+/// values of `inputs()`. `ev` evaluates an expression against
+/// the row.
+pub fn agg_row<E>(
+    p: &AggParts<'_>,
+    ev: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
+) -> Result<Option<AVec<OwnedValue>>, E> {
+    if let Some(f) = p.filter
+        && truthy(&ev(f)?) != Some(true)
+    {
+        return Ok(None);
+    }
+    let mut vs = AVec::new();
+    for a in p.inputs() {
+        vs.push(ev(a)?);
+    }
+    Ok(Some(vs))
 }
 
 /// Scalar function kinds (v0.4). `MinN`/`MaxN` are the multi-arg
@@ -317,6 +442,10 @@ pub enum RExpr {
         /// (`HAVING EXISTS (SELECT 1 FROM t x WHERE x.b = s)`
         /// over `sum(b) AS s`), where a written one is.
         alias: bool,
+        /// The ORDER BY / FILTER layout of `args` (v0.16, `v16`);
+        /// None when the call had neither clause.
+        #[cfg(feature = "v16")]
+        ext: Option<Box<AggExt>>,
     },
     /// ORDER BY reference to an output column (0-based).
     OutRef(usize),
@@ -1574,11 +1703,15 @@ pub fn resolve_scoped<E>(
             distinct,
             star,
             args,
+            #[cfg(feature = "v16")]
+            clause,
         } => resolve_func::<E>(
             handle_bytes(arena, *name),
             *distinct,
             *star,
             args.as_slice(),
+            #[cfg(feature = "v16")]
+            clause.as_deref(),
             arena,
             cur,
             enclosing,
@@ -1836,28 +1969,47 @@ fn resolve_func<E>(
     distinct: bool,
     star: bool,
     args: &[Expr],
+    #[cfg(feature = "v16")] clause: Option<&crate::sql::ast::FuncClause>,
     arena: &Arena,
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
     planner: SubPlanner<'_, E>,
 ) -> Result<RExpr, E> {
-    let agg = if eq_ci(name, b"count") {
-        Some(AggKind::Count)
-    } else if eq_ci(name, b"sum") {
-        Some(AggKind::Sum)
-    } else if eq_ci(name, b"avg") {
-        Some(AggKind::Avg)
-    } else if eq_ci(name, b"total") {
-        Some(AggKind::Total)
-    } else if eq_ci(name, b"min") {
-        Some(AggKind::Min)
-    } else if eq_ci(name, b"max") {
-        Some(AggKind::Max)
-    } else if eq_ci(name, b"group_concat") {
-        Some(AggKind::GroupConcat)
-    } else {
-        None
-    };
+    const AGGS: &[(&[u8], AggKind)] = &[
+        (b"count", AggKind::Count),
+        (b"sum", AggKind::Sum),
+        (b"avg", AggKind::Avg),
+        (b"total", AggKind::Total),
+        (b"min", AggKind::Min),
+        (b"max", AggKind::Max),
+        (b"group_concat", AggKind::GroupConcat),
+        #[cfg(feature = "v16")]
+        (b"string_agg", AggKind::GroupConcat),
+        #[cfg(feature = "v16")]
+        (b"median", AggKind::Median),
+        #[cfg(feature = "v16")]
+        (b"percentile", AggKind::Percentile),
+        #[cfg(feature = "v16")]
+        (b"percentile_cont", AggKind::PercentileCont),
+        #[cfg(feature = "v16")]
+        (b"percentile_disc", AggKind::PercentileDisc),
+    ];
+    let agg = AGGS.iter().find(|(n, _)| eq_ci(name, n)).map(|(_, k)| *k);
+    // The aggregate clauses on anything but an aggregate (v0.16,
+    // `v16`): the pin refuses them at prepare. min / max with
+    // several arguments are the scalar forms.
+    #[cfg(feature = "v16")]
+    if let Some(c) = clause
+        && (agg.is_none() || (matches!(agg, Some(AggKind::Min | AggKind::Max)) && args.len() > 1))
+    {
+        return Err(Error::Schema {
+            kind: if c.order_by.is_empty() {
+                SchemaKind::FilterNonAggregate
+            } else {
+                SchemaKind::OrderByNonAggregate
+            },
+        });
+    }
     if let Some(kind) = agg {
         // min/max with several arguments are the scalar forms.
         if matches!(kind, AggKind::Min | AggKind::Max) && args.len() > 1 {
@@ -1872,50 +2024,119 @@ fn resolve_func<E>(
             ));
         }
         let want = match kind {
-            AggKind::GroupConcat => (1, 2),
+            AggKind::GroupConcat => {
+                #[cfg(feature = "v16")]
+                if eq_ci(name, b"string_agg") {
+                    (2, 2)
+                } else {
+                    (1, 2)
+                }
+                #[cfg(not(feature = "v16"))]
+                (1, 2)
+            }
+            // `count()` is `count(*)` on the pin (v0.16, `v16`).
+            #[cfg(feature = "v16")]
+            AggKind::Count => (0, 1),
+            #[cfg(feature = "v16")]
+            AggKind::Percentile | AggKind::PercentileCont | AggKind::PercentileDisc => (2, 2),
             _ => (1, 1),
         };
-        if star {
-            if kind != AggKind::Count {
-                return Err(Error::Unsupported);
-            }
-            return Ok(RExpr::Agg {
-                kind,
-                distinct: false,
-                star: true,
-                args: AVec::new(),
-                lvl: 0,
-                inert: false,
-                alias: false,
-            });
+        if star && kind != AggKind::Count {
+            return Err(Error::Unsupported);
         }
-        if args.len() < want.0 || args.len() > want.1 {
+        if !star && (args.len() < want.0 || args.len() > want.1) {
             return Err(Error::Schema {
                 kind: SchemaKind::WrongArgumentCount,
             });
         }
-        let args = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
-        // An aggregate directly inside another's arguments is the
-        // pin's "misuse of aggregate function" whichever query
-        // owns either (its resolver clears NC_AllowAgg while it
-        // walks an aggregate's arguments): `sum(max(a))`, and
-        // `(SELECT sum(c + max(t.a)) FROM u)`, where sum belongs
-        // to u and max to t (review fix: the latter returned a
-        // value).
-        if args.iter().any(has_direct_agg) {
+        // The pin's "DISTINCT aggregates must have exactly one
+        // argument" (v0.16, ungated: `group_concat(DISTINCT x,
+        // ',')` used to run), checked after the argument count.
+        if distinct && args.len() != 1 {
+            return Err(Error::Schema {
+                kind: SchemaKind::DistinctAggregateArgs,
+            });
+        }
+        let star = star || args.is_empty();
+        let all = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
+        #[cfg(feature = "v16")]
+        let mut all = all;
+        #[cfg(feature = "v16")]
+        let ext = match clause {
+            None => None,
+            Some(c) => {
+                let nargs = all.len();
+                let mut order = AVec::new();
+                for (k, o) in c.order_by.iter() {
+                    let r = resolve_scoped::<E>(k, arena, cur, enclosing, &mut *planner)?;
+                    let mut o = *o;
+                    o.coll = expr_coll(&r).unwrap_or_default();
+                    order.push(o);
+                    all.push(r);
+                }
+                // min / max take no ORDER BY on the pin: it is
+                // resolved (so its errors stand) and dropped.
+                if matches!(kind, AggKind::Min | AggKind::Max) {
+                    while all.len() > nargs {
+                        all.pop();
+                    }
+                    order.clear();
+                }
+                let unique = distinct
+                    && nargs == 1
+                    && order.len() == 1
+                    && matches!((all.as_slice().first(), all.as_slice().get(1)), (Some(a), Some(b)) if same_expr(a, b));
+                let filter = match &c.filter {
+                    Some(f) => {
+                        all.push(resolve_scoped::<E>(
+                            f,
+                            arena,
+                            cur,
+                            enclosing,
+                            &mut *planner,
+                        )?);
+                        true
+                    }
+                    None => false,
+                };
+                if order.is_empty() && !filter {
+                    None
+                } else {
+                    Some(Box::new(AggExt {
+                        nargs,
+                        order,
+                        filter,
+                        unique,
+                    }))
+                }
+            }
+        };
+        // An aggregate directly inside another's arguments (and,
+        // v0.16, its ORDER BY or FILTER) is the pin's "misuse of
+        // aggregate function" whichever query owns either (its
+        // resolver clears NC_AllowAgg while it walks an
+        // aggregate's arguments): `sum(max(a))`, and `(SELECT
+        // sum(c + max(t.a)) FROM u)`, where sum belongs to u and
+        // max to t (review fix: the latter returned a value).
+        if all.iter().any(has_direct_agg) {
             return Err(Error::Schema {
                 kind: SchemaKind::MisusedAggregate,
             });
         }
-        let lvl = agg_level(args.as_slice(), cur, enclosing);
+        // The owner reads every part: an aggregate whose FILTER or
+        // ORDER BY names an inner source belongs to the inner
+        // query, as on the pin.
+        let lvl = agg_level(all.as_slice(), cur, enclosing);
         return Ok(RExpr::Agg {
             kind,
             distinct,
-            star: false,
-            args,
+            star,
+            args: all,
             lvl,
             inert: false,
             alias: false,
+            #[cfg(feature = "v16")]
+            ext,
         });
     }
     let Some(f) = scalar_fn(name) else {
@@ -1956,6 +2177,43 @@ fn resolve_func<E>(
         f,
         resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
     ))
+}
+
+/// Whether two resolved expressions are the same expression in
+/// the pin's `sqlite3ExprCompare` sense (v0.16, `v16`; used for
+/// the DISTINCT aggregate whose ORDER BY is its argument): the
+/// same column (whatever qualifier named it), literal, operator,
+/// function or COLLATE, recursively. Anything else — CASE,
+/// subqueries, lists — compares unequal (the general form).
+/// Also decides whether an ORDER BY names the GROUP BY terms
+/// (`session::group_cap`).
+pub fn same_expr(a: &RExpr, b: &RExpr) -> bool {
+    let all = |x: &[RExpr], y: &[RExpr]| {
+        x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same_expr(p, q))
+    };
+    match (a, b) {
+        (RExpr::Literal(x), RExpr::Literal(y)) => match (x, y) {
+            (OwnedValue::Null, OwnedValue::Null) => true,
+            (OwnedValue::Integer(p), OwnedValue::Integer(q)) => p == q,
+            (OwnedValue::Real(p), OwnedValue::Real(q)) => p.to_bits() == q.to_bits(),
+            (OwnedValue::Text(p), OwnedValue::Text(q))
+            | (OwnedValue::Blob(p), OwnedValue::Blob(q)) => p.as_slice() == q.as_slice(),
+            _ => false,
+        },
+        (RExpr::Column(i, _, c), RExpr::Column(j, _, d)) => i == j && c == d,
+        (RExpr::Rowid(i), RExpr::Rowid(j)) => i == j,
+        (RExpr::Binary(o, x1, y1), RExpr::Binary(p, x2, y2)) => {
+            o == p && same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        (RExpr::Neg(x), RExpr::Neg(y))
+        | (RExpr::Pos(x), RExpr::Pos(y))
+        | (RExpr::Not(x), RExpr::Not(y)) => same_expr(x, y),
+        (RExpr::IsNull(x, n), RExpr::IsNull(y, m)) => n == m && same_expr(x, y),
+        (RExpr::Cast(x, f), RExpr::Cast(y, g)) => f == g && same_expr(x, y),
+        (RExpr::Collate(x, c), RExpr::Collate(y, d)) => c == d && same_expr(x, y),
+        (RExpr::Scalar(f, x), RExpr::Scalar(g, y)) => f == g && all(x.as_slice(), y.as_slice()),
+        _ => false,
+    }
 }
 
 /// The owner level of an aggregate with resolved arguments
@@ -2701,6 +2959,8 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             lvl,
             inert,
             alias,
+            #[cfg(feature = "v16")]
+            ext,
         } => {
             let mut out = AVec::new();
             for a in args.iter() {
@@ -2714,6 +2974,8 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                 lvl: *lvl,
                 inert: *inert,
                 alias: *alias,
+                #[cfg(feature = "v16")]
+                ext: ext.clone(),
             }
         }
     }
@@ -3585,7 +3847,8 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
                 || whens.iter().any(|(w, t)| f(w) || f(t))
                 || otherwise.as_deref().is_some_and(f)
         }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().any(f),
+        RExpr::Scalar(_, args) => args.iter().any(f),
+        RExpr::Agg { .. } => agg_parts(e).is_some_and(|p| p.args.iter().any(f)),
     }
 }
 
@@ -3637,8 +3900,10 @@ fn explicit_child(e: &RExpr) -> Option<&RExpr> {
             }
             otherwise.as_deref()
         }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
-            first(args.as_slice()).and_then(|i| args.as_slice().get(i))
+        RExpr::Scalar(_, args) => first(args.as_slice()).and_then(|i| args.as_slice().get(i)),
+        RExpr::Agg { .. } => {
+            let args = agg_parts(e).map(|p| p.args).unwrap_or(&[]);
+            first(args).and_then(|i| args.get(i))
         }
         _ => None,
     }
@@ -4559,208 +4824,21 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
     })
 }
 
-/// The number a value contributes to sum/total/avg: like
-/// `to_number`, except non-numeric text contributes a *real* 0.0
-/// (SQLite: `sum('abc')` is 0.0, not integer 0).
-fn sum_number(v: &OwnedValue) -> Num {
-    match v {
-        OwnedValue::Integer(i) => Num::Int(*i),
-        OwnedValue::Real(r) => Num::Real(*r),
-        OwnedValue::Text(t) | OwnedValue::Blob(t) => {
-            parse_num_prefix(t.as_slice()).unwrap_or(Num::Real(0.0))
-        }
-        OwnedValue::Null => Num::Int(0),
-    }
-}
-
-/// Fold one aggregate over a group's rows: evaluate the
-/// arguments per row (synchronously) and fold the values.
-fn eval_agg<E>(
-    kind: AggKind,
-    distinct: bool,
-    star: bool,
-    args: &[RExpr],
-    rows: &[RowData],
-    ctx: &Ctx<'_>,
-) -> Result<OwnedValue, E> {
+/// Fold one aggregate over a group's rows: evaluate its inputs
+/// per row (synchronously; `agg_row` applies its FILTER) and fold
+/// the values (`agg::fold`).
+fn eval_agg<E>(e: &RExpr, rows: &[RowData], ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    let Some(p) = agg_parts(e) else {
+        return Err(Error::Unsupported);
+    };
     let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
     for r in rows {
-        let mut vs: AVec<OwnedValue> = AVec::new();
-        if !star {
-            for a in args {
-                vs.push(eval::<E>(a, &ctx.as_row(r))?);
-            }
-        }
-        arg_rows.push(vs);
-    }
-    eval_agg_values::<E>(kind, distinct, star, arg_rows.as_slice(), args_coll(args))
-}
-
-/// Fold one aggregate over precomputed per-row argument
-/// values (v0.11): `arg_rows` holds, per group row, the values
-/// of the aggregate's arguments for that row (empty for
-/// `count(*)`). This is the single folding implementation:
-/// the synchronous evaluator reaches it through `eval_agg`,
-/// and the subquery executor reaches it with argument values
-/// whose subqueries were executed per group row.
-pub fn eval_agg_values<E>(
-    kind: AggKind,
-    distinct: bool,
-    star: bool,
-    arg_rows: &[AVec<OwnedValue>],
-    coll: Coll,
-) -> Result<OwnedValue, E> {
-    match kind {
-        AggKind::Count => {
-            if star {
-                return Ok(OwnedValue::Integer(arg_rows.len() as i64));
-            }
-            let mut n = 0i64;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = &vs.as_slice()[0];
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                n += 1;
-            }
-            Ok(OwnedValue::Integer(n))
-        }
-        AggKind::Sum | AggKind::Total | AggKind::Avg => {
-            let mut int_acc: i64 = 0;
-            let mut int_ok = true;
-            let mut real_acc = 0.0f64;
-            let mut count = 0i64;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = &vs.as_slice()[0];
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                count += 1;
-                match sum_number(val) {
-                    Num::Int(i) => {
-                        if int_ok {
-                            match int_acc.checked_add(i) {
-                                Some(s2) => int_acc = s2,
-                                None => {
-                                    int_ok = false;
-                                    real_acc = int_acc as f64 + i as f64;
-                                }
-                            }
-                        } else {
-                            real_acc += i as f64;
-                        }
-                    }
-                    Num::Real(x) => {
-                        if int_ok {
-                            int_ok = false;
-                            real_acc = int_acc as f64 + x;
-                        } else {
-                            real_acc += x;
-                        }
-                    }
-                }
-            }
-            if count == 0 {
-                return Ok(match kind {
-                    AggKind::Total => OwnedValue::Real(0.0),
-                    _ => OwnedValue::Null,
-                });
-            }
-            Ok(match kind {
-                AggKind::Sum => {
-                    if int_ok {
-                        OwnedValue::Integer(int_acc)
-                    } else {
-                        OwnedValue::Real(real_acc)
-                    }
-                }
-                AggKind::Total => OwnedValue::Real(if int_ok { int_acc as f64 } else { real_acc }),
-                AggKind::Avg => OwnedValue::Real(
-                    (if int_ok { int_acc as f64 } else { real_acc }) / count as f64,
-                ),
-                _ => unreachable!(),
-            })
-        }
-        AggKind::Min | AggKind::Max => {
-            let mut best: Option<OwnedValue> = None;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = vs.as_slice()[0].clone();
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, &val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                best = Some(match best {
-                    None => val,
-                    Some(b) => {
-                        let ord = compare_coll(&val.as_value(), &b.as_value(), coll);
-                        let take = if kind == AggKind::Min {
-                            ord == core::cmp::Ordering::Less
-                        } else {
-                            ord == core::cmp::Ordering::Greater
-                        };
-                        if take { val } else { b }
-                    }
-                });
-            }
-            Ok(best.unwrap_or(OwnedValue::Null))
-        }
-        AggKind::GroupConcat => {
-            let mut out = AVec::new();
-            let mut any = false;
-            let mut seen: AVec<OwnedValue> = AVec::new();
-            for vs in arg_rows {
-                let val = &vs.as_slice()[0];
-                if matches!(val, OwnedValue::Null) {
-                    continue;
-                }
-                if distinct {
-                    if seen.iter().any(|s| values_equal_coll(s, val, coll)) {
-                        continue;
-                    }
-                    seen.push(val.clone());
-                }
-                let sep = if vs.len() > 1 {
-                    match &vs.as_slice()[1] {
-                        OwnedValue::Null => return Ok(OwnedValue::Null),
-                        s => to_text(s).unwrap_or_default(),
-                    }
-                } else {
-                    let mut c = AVec::new();
-                    c.push(b',');
-                    c
-                };
-                if any {
-                    out.extend_from_slice(sep.as_slice());
-                }
-                out.extend_from_slice(to_text(val).unwrap_or_default().as_slice());
-                any = true;
-            }
-            if !any {
-                return Ok(OwnedValue::Null);
-            }
-            Ok(OwnedValue::Text(out))
+        let rc = ctx.as_row(r);
+        if let Some(vs) = agg_row::<E>(&p, &mut |x| eval::<E>(x, &rc))? {
+            arg_rows.push(vs);
         }
     }
+    crate::agg::fold::<E>(&p, arg_rows)
 }
 
 /// Evaluate a resolved expression.
@@ -5059,14 +5137,8 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                 kind: SchemaKind::MisusedAggregate,
             });
         }
-        RExpr::Agg {
-            kind,
-            distinct,
-            star,
-            args,
-            ..
-        } => match ctx.rows {
-            Some(rows) => eval_agg::<E>(*kind, *distinct, *star, args.as_slice(), rows, ctx)?,
+        RExpr::Agg { .. } => match ctx.rows {
+            Some(rows) => eval_agg::<E>(e, rows, ctx)?,
             None => return Err(Error::Unsupported),
         },
         // Subquery nodes are computed by the executor and

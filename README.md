@@ -211,6 +211,31 @@ aspirations.
   to a NUL and blobs as bytes, as the pin's C functions do.
   `sqlite_source_id()` stays undefined (hipp is not the pin's
   source check-in). The tiny profile did not grow.
+- **Aggregate completion.** Behind `v16`: `string_agg(X, SEP)`;
+  the aggregate ORDER BY (`group_concat(b, ',' ORDER BY a DESC,
+  b)`) on every aggregate that takes it — a stable sort of the
+  stepped rows, dropped by min / max as on the pin; DISTINCT
+  keeps the first value seen, except that `f(DISTINCT x ORDER BY
+  x)` deduplicates through the sort and keeps the last, as the
+  pin's sorter does; `FILTER (WHERE ...)` on every aggregate
+  (count(*), DISTINCT forms, min / max bare columns included);
+  `count()`; and the percentile family the pin builds in —
+  `median()`, `percentile(Y, P)`, `percentile_cont()`,
+  `percentile_disc()` with its P validation, constant-P check,
+  numeric-only Y and REAL results. ORDER BY / FILTER on a
+  non-aggregate are refused (`OrderByNonAggregate`,
+  `FilterNonAggregate`), and they decide which query owns an
+  aggregate in a subquery. Ungated fixes: `sum()` integer
+  overflow is the pin's error (it returned a REAL; `total()` /
+  `avg()` still go REAL), REAL sums are compensated
+  (Kahan–Babuška–Neumaier: `0.1 + 0.2 + 0.3` sums to `0.6`), a
+  text addend counts as REAL unless it is wholly an integer
+  (`sum('12abc')` is `12.0`), a NULL group_concat separator adds
+  nothing (the result was NULL), `group_concat(DISTINCT x, ',')`
+  is refused (`DistinctAggregateArgs`), and a group finalizes its
+  aggregates as the pin does — before HAVING, never for a group a
+  WHERE-able HAVING term or a group-ordered LIMIT keeps from
+  forming. The tiny profile did not grow.
 
 ## What v0.13 does
 
@@ -534,7 +559,9 @@ A workspace: the zero-dependency core crate at the root plus
 (page cache, journal protocol, commit machine), `btree`,
 `record` (serial codec, affinity), `schema` (catalog), `sql/`
 (lexer, parser, AST, parameter binding), `query` (resolved-expression evaluator,
-v0.4), `func` (printf and the v0.16 scalar function library),
+v0.4), `agg` (aggregate folding: the pin's sum / percentile
+rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
+the v0.16 scalar function library),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor),

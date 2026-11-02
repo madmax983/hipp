@@ -3678,6 +3678,20 @@ struct Binds {
 /// pin's `sqlite3_prepare` reports, so prepare reports it.
 #[cfg(feature = "params")]
 fn binding_dependent<E>(e: &Error<E>) -> bool {
+    // The percentile family's runtime checks read the bound
+    // values too (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    if matches!(
+        e,
+        Error::Schema {
+            kind: SchemaKind::PercentileFraction
+                | SchemaKind::PercentileFractionVaries
+                | SchemaKind::PercentileNotNumeric
+                | SchemaKind::PercentileInfinite
+        }
+    ) {
+        return true;
+    }
     matches!(
         e,
         Error::Schema {
@@ -6716,7 +6730,17 @@ impl<'c, S: Storage> Statement<'c, S> {
         // synchronous v0.4 executor (no subqueries in the plan).
         let mut rows: AVec<RowData> = AVec::new();
         join_all::<S::Error>(&self.conn.env, &qp, src_rows.as_slice(), &mut rows)?;
-        let produced = project_rows::<S::Error>(&self.conn.env, &qp, rows.as_slice())?;
+        let produced = project_rows::<S::Error>(
+            &self.conn.env,
+            &qp,
+            rows.as_slice(),
+            group_cap(
+                qp.group_by.as_slice(),
+                qp.order_by.as_slice(),
+                qp.distinct,
+                window,
+            ),
+        )?;
         self.finish_produced(&qp, produced, window);
         Ok(())
     }
@@ -6972,7 +6996,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             &mut rows,
         )
         .await?;
-        let produced = self.project_qp_async(qp, rows.as_slice()).await?;
+        let produced = self.project_qp_async(qp, rows.as_slice(), None).await?;
         let mut out: AVec<AVec<OwnedValue>> = AVec::new();
         for p in produced.iter() {
             out.push(p.out.clone());
@@ -7040,7 +7064,18 @@ impl<'c, S: Storage> Statement<'c, S> {
             &mut rows,
         )
         .await?;
-        let produced = self.project_qp_async(&qp, rows.as_slice()).await?;
+        let produced = self
+            .project_qp_async(
+                &qp,
+                rows.as_slice(),
+                group_cap(
+                    qp.group_by.as_slice(),
+                    qp.order_by.as_slice(),
+                    qp.distinct,
+                    window,
+                ),
+            )
+            .await?;
         self.finish_produced(&qp, produced, window);
         Ok(())
     }
@@ -7087,39 +7122,25 @@ impl<'c, S: Storage> Statement<'c, S> {
         if crate::query::has_owned_sub_agg(e) {
             let mut e2 = e.clone();
             crate::query::subst_owned_aggs::<S::Error>(&mut e2, 0, &mut |a| {
-                let RExpr::Agg {
-                    kind,
-                    distinct,
-                    star,
-                    args,
-                    ..
-                } = a
-                else {
+                let RExpr::Agg { args, .. } = a else {
                     return Err(Error::Unsupported);
                 };
                 if args.iter().any(crate::query::has_sub) {
                     return Err(Error::Unsupported);
                 }
+                let Some(p) = crate::query::agg_parts(a) else {
+                    return Err(Error::Unsupported);
+                };
                 let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
                 for r in rows {
-                    let mut vs: AVec<OwnedValue> = AVec::new();
-                    if !*star {
-                        for x in args.iter() {
-                            vs.push(crate::query::eval::<S::Error>(
-                                x,
-                                &Ctx::of(r).with(&self.conn.env),
-                            )?);
-                        }
+                    let ctx = Ctx::of(r).with(&self.conn.env);
+                    if let Some(vs) = crate::query::agg_row::<S::Error>(&p, &mut |x| {
+                        crate::query::eval::<S::Error>(x, &ctx)
+                    })? {
+                        arg_rows.push(vs);
                     }
-                    arg_rows.push(vs);
                 }
-                crate::query::eval_agg_values::<S::Error>(
-                    *kind,
-                    *distinct,
-                    *star,
-                    arg_rows.as_slice(),
-                    crate::query::args_coll(args.as_slice()),
-                )
+                crate::agg::fold::<S::Error>(&p, arg_rows)
             })?;
             return Box::pin(self.eval_group_sub(&e2, rows, rep)).await;
         }
@@ -7166,34 +7187,25 @@ impl<'c, S: Storage> Statement<'c, S> {
         agg: &RExpr,
         rows: &[RowData],
     ) -> Result<OwnedValue, S::Error> {
-        let RExpr::Agg {
-            kind,
-            distinct,
-            star,
-            args,
-            ..
-        } = agg
-        else {
+        let Some(p) = crate::query::agg_parts(agg) else {
             return Err(Error::Unsupported);
         };
-        let (kind, distinct, star) = (*kind, *distinct, *star);
         let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
         for r in rows {
+            // The FILTER first: a row it rejects is not stepped,
+            // and nothing else of it is evaluated.
+            if let Some(f) = p.filter
+                && crate::query::truthy(&self.eval_row_sub(f, r).await?) != Some(true)
+            {
+                continue;
+            }
             let mut vs: AVec<OwnedValue> = AVec::new();
-            if !star {
-                for a in args.iter() {
-                    vs.push(self.eval_row_sub(a, r).await?);
-                }
+            for a in p.inputs() {
+                vs.push(self.eval_row_sub(a, r).await?);
             }
             arg_rows.push(vs);
         }
-        crate::query::eval_agg_values::<S::Error>(
-            kind,
-            distinct,
-            star,
-            arg_rows.as_slice(),
-            crate::query::args_coll(args.as_slice()),
-        )
+        crate::agg::fold::<S::Error>(&p, arg_rows)
     }
 
     /// The representative row for a top-level query's group
@@ -7211,13 +7223,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         if grows.is_empty() {
             return Ok(empty_rep.clone());
         }
-        if let Some((kind, arg)) = rep_minmax(
+        if let Some(m) = rep_minmax(
             qp.items.as_slice(),
             qp.having.as_ref(),
             qp.order_by.as_slice(),
-        ) && crate::query::has_sub(arg)
+        ) && m.has_sub()
         {
-            return self.extremum_rep(kind, arg, grows, empty_rep).await;
+            return self.extremum_rep(m, grows, empty_rep).await;
         }
         pick_rep::<S::Error>(&self.conn.env, qp, grows, empty_rep)
     }
@@ -7233,13 +7245,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         if grows.is_empty() {
             return Ok(empty_rep.clone());
         }
-        if let Some((kind, arg)) = rep_minmax(
+        if let Some(m) = rep_minmax(
             plan.items.as_slice(),
             plan.having.as_ref(),
             plan.order_by.as_slice(),
-        ) && crate::query::has_sub(arg)
+        ) && m.has_sub()
         {
-            return self.extremum_rep(kind, arg, grows, empty_rep).await;
+            return self.extremum_rep(m, grows, empty_rep).await;
         }
         pick_rep_sub::<S::Error>(&self.conn.env, plan, grows, empty_rep)
     }
@@ -7252,24 +7264,28 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "v06")]
     async fn extremum_rep(
         &mut self,
-        kind: crate::query::AggKind,
-        arg: &RExpr,
+        m: MinMaxRep<'_>,
         grows: &[RowData],
         empty_rep: &RowData,
     ) -> Result<RowData, S::Error> {
-        if grows.is_empty() {
+        let Some(first) = grows.first() else {
             return Ok(empty_rep.clone());
-        }
-        let coll = crate::query::expr_coll(arg).unwrap_or_default();
+        };
+        let coll = crate::query::expr_coll(m.arg).unwrap_or_default();
         let mut best: Option<OwnedValue> = None;
-        let mut rep: Option<&RowData> = None;
+        let mut rep = first;
         for r in grows {
-            let v = self.eval_row_sub(arg, r).await?;
-            if extremum_step(kind, coll, &mut best, v) {
-                rep = Some(r);
+            if let Some(f) = m.filter
+                && crate::query::truthy(&self.eval_row_sub(f, r).await?) != Some(true)
+            {
+                continue;
+            }
+            let v = self.eval_row_sub(m.arg, r).await?;
+            if extremum_step(m.kind, coll, &mut best, v) {
+                rep = r;
             }
         }
-        Ok(rep.unwrap_or(empty_rep).clone())
+        Ok(rep.clone())
     }
 
     /// Execute every current-scope subquery node of `e` for the
@@ -7418,7 +7434,22 @@ impl<'c, S: Storage> Statement<'c, S> {
     ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
         let plan = plan.clone();
         let window = self.limit_window(&plan.limit, &plan.offset).await?;
-        let mut produced = self.exec_subplan_core(&plan, outer).await?;
+        // Only a lone core streams its groups up to the LIMIT.
+        #[cfg(feature = "v09")]
+        let lone = plan.compound.is_empty();
+        #[cfg(not(feature = "v09"))]
+        let lone = true;
+        let cap = if lone {
+            group_cap(
+                plan.group_by.as_slice(),
+                plan.order_by.as_slice(),
+                plan.distinct,
+                window,
+            )
+        } else {
+            None
+        };
+        let mut produced = self.exec_subplan_core(&plan, outer, cap).await?;
         // Compound finish (v0.9): combine the core rows with
         // each tail core's rows, left to right, then the
         // compound ORDER BY / LIMIT.
@@ -7432,7 +7463,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut cores = AVec::new();
             cores.push(core_colls(plan.items.as_slice(), plan.values.as_slice()));
             for (op, tail) in plan.compound.iter() {
-                let tp = self.exec_subplan_core(tail, outer).await?;
+                let tp = self.exec_subplan_core(tail, outer, None).await?;
                 let mut right: AVec<AVec<OwnedValue>> = AVec::new();
                 for p in tp.iter() {
                     right.push(p.out.clone());
@@ -7482,6 +7513,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         &mut self,
         plan: &crate::query::SubPlan,
         outer: &RowData,
+        cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         // A VALUES core (v0.9): the rows evaluate against the
         // outer row directly.
@@ -7516,7 +7548,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             &mut joined,
         )
         .await?;
-        let mut produced = self.sub_project(plan, outer, joined.as_slice()).await?;
+        let mut produced = self
+            .sub_project(plan, outer, joined.as_slice(), cap)
+            .await?;
         if plan.distinct {
             produced = dedup_produced(
                 produced,
@@ -7673,6 +7707,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         &mut self,
         qp: &QueryPlan,
         rows: &[RowData],
+        cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
         if !qp.has_agg {
@@ -7772,14 +7807,32 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         }
         for (_, grows) in groups.iter() {
+            if cap.is_some_and(|c| out.len() >= c) {
+                break;
+            }
             let rep = self
                 .pick_rep_qp_async(qp, grows.as_slice(), &empty_rep)
                 .await?;
-            if let Some(h) = &qp.having
-                && crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
+            if let Some(h) = &qp.having {
+                let mut early = AVec::new();
+                having_early(h, &mut early);
+                let mut pass = true;
+                for c in early.iter() {
+                    pass &= crate::query::truthy(
+                        &self.eval_group_sub(c, grows.as_slice(), &rep).await?,
+                    ) == Some(true);
+                }
+                if !pass {
+                    continue;
+                }
+                for a in group_aggs(qp.items.as_slice(), qp.order_by.as_slice()).iter() {
+                    self.eval_group_sub(a, grows.as_slice(), &rep).await?;
+                }
+                if crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
                     != Some(true)
-            {
-                continue;
+                {
+                    continue;
+                }
             }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
@@ -7808,6 +7861,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         plan: &crate::query::SubPlan,
         outer: &RowData,
         rows: &[RowData],
+        cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
         if !plan.has_agg {
@@ -7901,14 +7955,32 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         }
         for (_, grows) in groups.iter() {
+            if cap.is_some_and(|c| out.len() >= c) {
+                break;
+            }
             let rep = self
                 .pick_rep_sub_async(plan, grows.as_slice(), &empty_rep)
                 .await?;
-            if let Some(h) = &plan.having
-                && crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
+            if let Some(h) = &plan.having {
+                let mut early = AVec::new();
+                having_early(h, &mut early);
+                let mut pass = true;
+                for c in early.iter() {
+                    pass &= crate::query::truthy(
+                        &self.eval_group_sub(c, grows.as_slice(), &rep).await?,
+                    ) == Some(true);
+                }
+                if !pass {
+                    continue;
+                }
+                for a in group_aggs(plan.items.as_slice(), plan.order_by.as_slice()).iter() {
+                    self.eval_group_sub(a, grows.as_slice(), &rep).await?;
+                }
+                if crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
                     != Some(true)
-            {
-                continue;
+                {
+                    continue;
+                }
             }
             let mut vals = AVec::new();
             for it in plan.items.iter() {
@@ -8680,6 +8752,69 @@ fn compound_order_cmp(
     core::cmp::Ordering::Equal
 }
 
+/// The HAVING conjuncts the pin moves into WHERE (v0.16,
+/// ungated; its `havingToWhere`): AND terms with no aggregate and
+/// no subquery. A group failing one never forms there, so none of
+/// its aggregates is finalized — `sum()` cannot raise "integer
+/// overflow" for it. hipp evaluates them first, against the
+/// group's representative row, and skips the group.
+#[cfg(feature = "v04")]
+fn having_early<'x>(h: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+    match h {
+        RExpr::Binary(crate::sql::BinOp::And, a, b) => {
+            having_early(a, out);
+            having_early(b, out);
+        }
+        e if !crate::query::has_agg(e) && !crate::query::has_sub(e) => out.push(e),
+        _ => {}
+    }
+}
+
+/// The aggregates a group finalizes before its HAVING decides
+/// (v0.16, ungated): every aggregate of the result list and the
+/// ORDER BY. The pin computes them all before testing HAVING, so
+/// one that errors (`sum()` overflow, the percentile checks) fails
+/// the statement even for a group HAVING drops.
+#[cfg(feature = "v04")]
+fn group_aggs<'x>(
+    items: &'x [RExpr],
+    order_by: &'x [(RExpr, crate::sql::SortOrder)],
+) -> AVec<&'x RExpr> {
+    let mut aggs = AVec::new();
+    for it in items.iter() {
+        crate::query::collect_outer_aggs(it, &mut aggs);
+    }
+    for (e, _) in order_by.iter() {
+        crate::query::collect_outer_aggs(e, &mut aggs);
+    }
+    aggs
+}
+
+/// How many groups a grouped query needs before it can stop
+/// (v0.16, ungated): with a LIMIT and output in group order (no
+/// ORDER BY, or one naming exactly the GROUP BY terms), and no
+/// DISTINCT, the pin emits groups as it finalizes them and stops
+/// at OFFSET + LIMIT — later groups are never finalized, so their
+/// aggregates cannot error. None: every group is needed.
+#[cfg(feature = "v04")]
+fn group_cap(
+    group_by: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    distinct: bool,
+    (skip, take): (usize, usize),
+) -> Option<usize> {
+    if group_by.is_empty() || distinct || take == usize::MAX {
+        return None;
+    }
+    let in_group_order = order_by.is_empty()
+        || (order_by.len() == group_by.len()
+            && order_by
+                .iter()
+                .zip(group_by.iter())
+                .all(|((o, _), g)| crate::query::same_expr(o, g)));
+    in_group_order.then(|| skip.saturating_add(take))
+}
+
 /// The direction each GROUP BY term's groups come out in
 /// (v0.16): when the ORDER BY has exactly as many terms as the
 /// GROUP BY, the pin's group sorter takes each ORDER BY term's
@@ -8931,6 +9066,7 @@ fn project_rows<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
     rows: &[RowData],
+    cap: Option<usize>,
 ) -> Result<AVec<Produced>, E> {
     let mut out = AVec::new();
     if !qp.has_agg {
@@ -9031,12 +9167,27 @@ fn project_rows<E>(
         });
     }
     for (_, grows) in groups.iter() {
+        if cap.is_some_and(|c| out.len() >= c) {
+            break;
+        }
         let rep = pick_rep::<E>(env, qp, grows.as_slice(), &empty_rep)?;
         let ctx = Ctx::group(grows.as_slice(), &rep).with(env);
-        if let Some(h) = &qp.having
-            && crate::query::truthy(&crate::query::eval::<E>(h, &ctx)?) != Some(true)
-        {
-            continue;
+        if let Some(h) = &qp.having {
+            let mut early = AVec::new();
+            having_early(h, &mut early);
+            let mut pass = true;
+            for c in early.iter() {
+                pass &= crate::query::truthy(&crate::query::eval::<E>(c, &ctx)?) == Some(true);
+            }
+            if !pass {
+                continue;
+            }
+            for a in group_aggs(qp.items.as_slice(), qp.order_by.as_slice()).iter() {
+                crate::query::eval::<E>(a, &ctx)?;
+            }
+            if crate::query::truthy(&crate::query::eval::<E>(h, &ctx)?) != Some(true) {
+                continue;
+            }
         }
         let mut vals = AVec::new();
         for it in qp.items.iter() {
@@ -9068,7 +9219,7 @@ fn rep_minmax<'x>(
     items: &'x [RExpr],
     having: Option<&'x RExpr>,
     order_by: &'x [(RExpr, crate::sql::SortOrder)],
-) -> Option<(crate::query::AggKind, &'x RExpr)> {
+) -> Option<MinMaxRep<'x>> {
     use crate::query::{AggKind, collect_aggs};
     let mut aggs: AVec<&RExpr> = AVec::new();
     for it in items.iter() {
@@ -9080,14 +9231,36 @@ fn rep_minmax<'x>(
     if let Some(h) = having {
         collect_aggs(h, &mut aggs);
     }
-    aggs.iter().rev().find_map(|a| match a {
-        RExpr::Agg {
-            kind: k @ (AggKind::Min | AggKind::Max),
-            args,
-            ..
-        } => args.as_slice().first().map(|x| (*k, x)),
-        _ => None,
+    aggs.iter().rev().find_map(|a| {
+        let p = crate::query::agg_parts(a)?;
+        if !matches!(p.kind, AggKind::Min | AggKind::Max) {
+            return None;
+        }
+        Some(MinMaxRep {
+            kind: p.kind,
+            arg: p.args.first()?,
+            filter: p.filter,
+        })
     })
+}
+
+/// The min / max aggregate that decides a group's bare columns
+/// (`rep_minmax`): its kind, its argument and (v0.16, `v16`) its
+/// FILTER — a row the filter rejects is not stepped, so it never
+/// loads the bare columns (none passing: the group's first row).
+#[cfg(feature = "v04")]
+#[derive(Clone, Copy)]
+struct MinMaxRep<'x> {
+    kind: crate::query::AggKind,
+    arg: &'x RExpr,
+    filter: Option<&'x RExpr>,
+}
+
+#[cfg(feature = "v06")]
+impl MinMaxRep<'_> {
+    fn has_sub(&self) -> bool {
+        crate::query::has_sub(self.arg) || self.filter.is_some_and(crate::query::has_sub)
+    }
 }
 
 /// One row of the pin's min/max bare-column rule (v0.16):
@@ -9138,15 +9311,21 @@ fn pick_rep_from<E>(
     let Some(first) = grows.first() else {
         return Ok(empty_rep.clone());
     };
-    let Some((kind, arg)) = rep_minmax(items, having, order_by) else {
+    let Some(m) = rep_minmax(items, having, order_by) else {
         return Ok(first.clone());
     };
-    let coll = crate::query::expr_coll(arg).unwrap_or_default();
+    let coll = crate::query::expr_coll(m.arg).unwrap_or_default();
     let mut best: Option<OwnedValue> = None;
     let mut rep = first;
     for r in grows {
-        let v = crate::query::eval::<E>(arg, &Ctx::of(r).with(env))?;
-        if extremum_step(kind, coll, &mut best, v) {
+        let ctx = Ctx::of(r).with(env);
+        if let Some(f) = m.filter
+            && crate::query::truthy(&crate::query::eval::<E>(f, &ctx)?) != Some(true)
+        {
+            continue;
+        }
+        let v = crate::query::eval::<E>(m.arg, &ctx)?;
+        if extremum_step(m.kind, coll, &mut best, v) {
             rep = r;
         }
     }

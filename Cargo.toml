@@ -95,6 +95,14 @@ v10 = ["v09"]
 # n-ary iif(), sqlite_version(). (round()'s fitted digits, lazy
 # coalesce / iif and the text-function fixes are *not* gated:
 # they correct claimed v0.4 paths.)
+# The aggregate unit adds string_agg(), the aggregate ORDER BY
+# (`f(args ORDER BY ...)`, DISTINCT interplay as on the pin),
+# FILTER (WHERE ...) on every aggregate, count() and the
+# percentile family -- median(), percentile(), percentile_cont(),
+# percentile_disc(). (The sum() overflow error, compensated REAL
+# sums, group_concat()'s NULL separator, the DISTINCT argument
+# count and the group-finalization rules are *not* gated: they
+# correct claimed v0.4 paths.)
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.

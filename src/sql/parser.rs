@@ -1825,6 +1825,7 @@ impl<'a> Parser<'a> {
             distinct: false,
             star: false,
             args,
+            clause: None,
         };
         Ok(if neg { Expr::Not(Box::new(call)) } else { call })
     }
@@ -2008,12 +2009,47 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
+                    // `f(args ORDER BY ...)` (v0.16, `v16`): the
+                    // pin's grammar takes it after one or more
+                    // arguments only (`count(* ORDER BY x)` is a
+                    // syntax error there).
+                    #[cfg(feature = "v16")]
+                    let order_by = if !args.is_empty() && self.eat_kw(b"ORDER") {
+                        self.expect_kw::<E>(b"BY")?;
+                        self.order_terms::<E>()?
+                    } else {
+                        AVec::new()
+                    };
                     self.expect::<E>(Tok::RParen)?;
+                    // `FILTER (WHERE expr)` (v0.16, `v16`).
+                    // FILTER is no reserved word: only a FILTER
+                    // followed by `(` starts the clause, so
+                    // `count(*) filter` stays an alias.
+                    #[cfg(feature = "v16")]
+                    let filter = if self.cur_is_kw(b"FILTER")
+                        && matches!(
+                            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                            Some(Tok::LParen)
+                        ) {
+                        self.pos += 2;
+                        self.expect_kw::<E>(b"WHERE")?;
+                        let f = self.parse_expr::<E>()?;
+                        self.expect::<E>(Tok::RParen)?;
+                        Some(f)
+                    } else {
+                        None
+                    };
                     return Ok(Expr::Func {
                         name: fname,
                         distinct,
                         star,
                         args,
+                        #[cfg(feature = "v16")]
+                        clause: if order_by.is_empty() && filter.is_none() {
+                            None
+                        } else {
+                            Some(Box::new(crate::sql::ast::FuncClause { order_by, filter }))
+                        },
                     });
                 }
                 if let Some((lit, used)) = self.literal_at(self.pos) {
@@ -2230,6 +2266,50 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// A comma-separated ORDER BY term list after `ORDER BY`:
+    /// the statement's (v0.4) and, under `v16`, an aggregate's
+    /// own `f(args ORDER BY ...)` (the same grammar on the pin).
+    fn order_terms<E>(&mut self) -> Result<AVec<(Expr, SortOrder)>, E> {
+        let mut order_by = AVec::new();
+        loop {
+            let e = self.parse_expr::<E>()?;
+            let desc = if self.eat_kw(b"DESC") {
+                true
+            } else {
+                let _ = self.eat_kw(b"ASC");
+                false
+            };
+            // NULLS FIRST / LAST (v0.16: honoured, where it
+            // was parsed and ignored before — a silent wrong
+            // answer for `ASC NULLS LAST` / `DESC NULLS
+            // FIRST`). The pin's grammar needs FIRST or LAST
+            // after NULLS; the default is NULL-smallest.
+            let nulls_first = if self.eat_kw(b"NULLS") {
+                if self.eat_kw(b"FIRST") {
+                    true
+                } else {
+                    self.expect_kw::<E>(b"LAST")?;
+                    false
+                }
+            } else {
+                !desc
+            };
+            order_by.push((
+                e,
+                SortOrder {
+                    desc,
+                    nulls_first,
+                    coll: Coll::Binary,
+                },
+            ));
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(order_by)
+    }
+
     /// The trailing ORDER BY / LIMIT of a select statement,
     /// parsed into `head` after its core(s) (v0.9 split: cores
     /// carry none of their own).
@@ -2237,42 +2317,7 @@ impl<'a> Parser<'a> {
         let mut order_by = AVec::new();
         if self.eat_kw(b"ORDER") {
             self.expect_kw::<E>(b"BY")?;
-            loop {
-                let e = self.parse_expr::<E>()?;
-                let desc = if self.eat_kw(b"DESC") {
-                    true
-                } else {
-                    let _ = self.eat_kw(b"ASC");
-                    false
-                };
-                // NULLS FIRST / LAST (v0.16: honoured, where it
-                // was parsed and ignored before — a silent wrong
-                // answer for `ASC NULLS LAST` / `DESC NULLS
-                // FIRST`). The pin's grammar needs FIRST or LAST
-                // after NULLS; the default is NULL-smallest.
-                let nulls_first = if self.eat_kw(b"NULLS") {
-                    if self.eat_kw(b"FIRST") {
-                        true
-                    } else {
-                        self.expect_kw::<E>(b"LAST")?;
-                        false
-                    }
-                } else {
-                    !desc
-                };
-                order_by.push((
-                    e,
-                    SortOrder {
-                        desc,
-                        nulls_first,
-                        coll: Coll::Binary,
-                    },
-                ));
-                if self.eat(Tok::Comma) {
-                    continue;
-                }
-                break;
-            }
+            order_by = self.order_terms::<E>()?;
         }
         let mut limit = None;
         let mut offset = None;
