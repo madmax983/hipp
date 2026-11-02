@@ -18,6 +18,11 @@ env:
   CARGO_INCREMENTAL: "0"
   # Keep in sync with rust-toolchain.toml (the size ratchet depends on it).
   RUST_TOOLCHAIN: "1.97.0"
+  # Force every rustup proxy onto the pinned toolchain: runner images
+  # ship a newer default stable, and anything built with it breaks the
+  # ratchet (different codegen) and coverage (newer profraw format).
+  # `cargo +nightly` in the miri job still takes precedence.
+  RUSTUP_TOOLCHAIN: "1.97.0"
   # NOTE: never set RUSTFLAGS globally — it would replace the
   # thumbv7em linker-script flags from .cargo/config.toml.
 
@@ -138,7 +143,7 @@ jobs:
         run: python3 ci/size_gate.py --section full target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
 
   miri:
-    name: miri (arena, the only unsafe)
+    name: miri (arena unsafe + engine end-to-end)
     needs: fmt
     runs-on: ubuntu-24.04
     steps:
@@ -147,8 +152,14 @@ jobs:
         run: |
           rustup toolchain install nightly --profile minimal --component miri,rust-src
           cargo +nightly miri setup
-      - name: miri arena + record unit tests
-        run: cargo +nightly miri test --lib --no-default-features -- arena record
+      - name: miri — lib unit tests (arena, record), full profile
+        run: cargo +nightly miri test --lib --no-default-features --features full
+      - name: miri — engine end-to-end over MemStorage (no oracle processes)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo +nightly miri test --no-default-features --features std,full --test smoke
+          cargo +nightly miri test --no-default-features --features std,full --test arenas -- a9_statement_arena_exhaustion
 
   coverage:
     name: coverage
