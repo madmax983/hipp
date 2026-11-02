@@ -47,3 +47,11 @@ cell, although the parsed leaf cells are never used afterwards.
 | n    | total Ir      | index_insert inclusive Ir |
 |------|---------------|---------------------------|
 | 1000 | 2,745,910,617 | 826,540,662 (30.1%)       |
+
+### After: move parsed leaf cells into the merged vector
+
+| n    | total before  | total after   | Δ total | index_insert (n=1000) |
+|------|---------------|---------------|---------|-----------------------|
+| 500  | 931,842,438   | 828,743,502   | -11.1%  |                       |
+| 1000 | 2,745,910,617 | 2,489,560,156 | -9.3%   | 826.5M → 571.1M (-30.9%) |
+| 2000 | 8,674,819,320 | 8,071,584,310 | -7.0%   |                       |

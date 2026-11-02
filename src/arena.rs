@@ -374,6 +374,9 @@ impl<T> AVec<T> {
     pub fn iter(&self) -> core::slice::Iter<'_, T> {
         self.vec.iter()
     }
+    pub fn into_vec(self) -> Vec<T> {
+        self.vec
+    }
 }
 
 impl<T> Default for AVec<T> {
