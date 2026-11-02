@@ -1944,6 +1944,183 @@ group loops.
 - Aggregate folding is still materialise-then-fold (each group's
   rows held in memory) and DISTINCT is quadratic, as before.
 
+### Math functions (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin (`/home/user/hipp-design/oracle/sqlite3`, `--version`
+3.54.1, built with SQLITE_ENABLE_MATH_FUNCTIONS over glibc 2.39's
+libm), gated as below. Census (now 205 probes): on the 195
+earlier probes `f_math` moved HIPP_ERR → MATCH (MATCH 126 → 127,
+HIPP_ERR 52 → 51); of 10 new probes 8 match, `m_arity` is
+refused by both, and `m_hyper` differs by one ulp in
+`atanh(0.25)` (glibc's `log1p`, see the gaps).
+
+**Shipped — leaf feature `math`** (new `src/math.rs`, Cargo
+feature `math = ["v04"]`, in `full`, `v04,math` in
+`ci/feature-sets.txt`; `ScalarFn::Math(MathFn)`):
+
+- The SQL functions `acos acosh asin asinh atan atan2 atanh ceil
+  ceiling cos cosh degrees exp floor ln log(X) log(B, X) log10
+  log2 mod pi pow power radians sin sinh sqrt tan tanh trunc`,
+  case-insensitive, deterministic (generated columns, CHECK,
+  DEFAULT, WHERE / ORDER BY and write paths all accept them), with
+  the pin's argument counts (`WrongArgumentCount` at prepare;
+  `pi(*)` is `pi()`, `sin(*)` a wrong count, DISTINCT ignored,
+  FILTER refused — the shared scalar-function rules).
+- Argument rules (`math::eval`): an argument counts only as
+  `sqlite3_value_numeric_type` makes it a number — INTEGER, REAL,
+  or TEXT that is wholly a number (`record::text_to_number`:
+  ASCII spaces around it, read to its first NUL; `'1e400'` is
+  Inf, `'0x10'` / `'1_000'` / `'inf'` / `''` are not numbers);
+  NULL, BLOB and other text give NULL. `ceil` / `floor` / `trunc`
+  return an INTEGER argument unchanged (also integer text: `ceil('5')`
+  is 5, `ceil('5.0')` 5.0). Every NaN result is NULL. The
+  logarithms are NULL at or below zero; `log(B, X)` is NULL for B
+  at or below 1 (its `ln(B) <= 0`) and reads X as
+  `sqlite3_value_double` — any value's numeric prefix
+  (`log(2, x'38')` and `log(2, '8abc')` are 3.0, `log(2, x'')`
+  NULL) — then `ln(X) / ln(B)` in double (`log(10, 1000)` is
+  2.9999999999999996, as on the pin). `degrees(x)` is
+  `x * (180 / M_PI)`, `radians(x)` `x * (M_PI / 180)`.
+- `hipp::math`, a public in-crate floating-point library (no
+  libm exists in `no_std`; no std float math; zero dependencies):
+  `sqrt` (exact: integer square root of the 108-bit scaled
+  mantissa, round half even), `fmod` (exact: mantissa remainder
+  ten bits at a time), `ceil` / `floor` / `trunc` (bit masks);
+  `exp`, `expm1`, `ln`, `log1p`, `log2`, `pow`, `sin`, `cos`,
+  `tan`, `asin`, `acos`, `atan`, `atan2` correctly rounded by
+  clean-room methods: double-double arithmetic (Dekker products,
+  no FMA), `exp` by `k ln 2` reduction, a 9-term Taylor series of
+  `expm1(r/1024)` and ten exact squarings, `ln` by exponent
+  reduction and the `2 atanh(f/(2+f))` series, trig by
+  Payne–Hanek reduction against 1,472 bits of 2/π (computed
+  offline with integer Machin arithmetic; the `0xa2f9836e4e44152`
+  prefix checks it) then Taylor series on |r| <= π/4, `atan` by
+  three angle halvings and its series; `pow` follows C99 Annex F
+  and computes exact powers exactly (powers of two with integral
+  `e * y`, small integer powers that fit 106 bits — so halfway
+  cases round to even); one shared `scale_round` rounds into the
+  subnormal range and to infinity. 55,000 random arguments
+  checked against a 400-digit Python `Decimal` reference: 0
+  misrounded.
+- Fitted to the pin's output (clean room, by testing
+  hypotheses against glibc results through Python's `math`,
+  which links the same libm — 27,000 random calls first showed
+  Python's `math` and the pin agree bit for bit): `log10` is
+  `(k * lo + ln(m) / ln 10) + k * hi` with `x = m * 2^k`, `m` in
+  [1, 2) (in [1/2, 1) with `k + 1` below 1) and log10(2) split
+  with its low mantissa bits clear (0 mismatches over 145,000
+  doubles); the hyperbolic functions are the textbook identities
+  over `expm1` / `exp` / `log1p` / `ln` / `sqrt` in double
+  (`sinh = ±(t + t/(t+1))/2` with `t = expm1|x|`, `2t - t²/(t+1)`
+  below 1, `e^|x|/2` from 22; `cosh`, `tanh`, `asinh`, `acosh`,
+  `atanh` likewise; 0–6 mismatches in 60,000 through the pin's
+  own building blocks). hipp evaluates them over its correctly
+  rounded building blocks. Their branch points are fitted too
+  (see the gaps).
+
+**Shipped — ungated** (silent wrong answers on the tiny-claimed
+INSERT path and every comparison): `record::text_to_number` (NUMERIC
+/ INTEGER / REAL column affinity, comparison affinity, the
+aggregates' numeric text) trimmed Unicode whitespace and refused a
+number followed by a NUL. The pin trims only `sqlite3Isspace`'s
+ASCII set and reads text to its first NUL: `char(160) || '5'` and
+`'5' || char(133)` stay TEXT (hipp stored 5), `'5' || char(0) ||
+'x'` is 5 (hipp kept the text).
+
+**Oracle-probing notes** (all on the live pin; the CLI's
+`ieee754_to_blob()` gives the exact bits): `ceil(-0.5)`,
+`trunc(-0.0)`, `sin(-0.0)` and `sqrt(-0.0)` are -0.0 (the CLI and
+printf render it `0.0`); `sqrt('-0')` is +0 (integer text);
+`ceil('abc')`, `ceil(x'31')` NULL (not 0.0); `log(0)`, `ln(0)`
+NULL (C gives -inf); `pow(0, -1)` Inf, `pow(-1, 1e300)` 1.0,
+`pow(2, -1075)` 0.0 (the tie rounds to even), `pow(-8, 1.0/3)` NULL;
+`mod(7, 3)` is REAL 1.0, `mod(7, 0)` NULL; `atan2(-0.0, -1)` -π;
+`atanh(1)` Inf, `acosh(0.5)` NULL; `exp(709.79)` and `sinh(-711)`
+±Inf, `cosh(710)` finite; `sin(1e400)` NULL; `ceil(9223372036854775807)`
+and `trunc('-9223372036854775808')` stay INTEGER; `ceil('9223372036854775808')`
+is REAL. glibc 2.39's own accuracy (measured against hipp's
+correctly rounded results, which a `Decimal` check confirmed on
+every sampled disagreement): `exp`, `ln`, `log2`, `pow`, `sin`,
+`cos`, `tan`, `asin`, `acos`, `atan`, `atan2` misround 0.01–0.16%
+of random arguments by one ulp (`pow(x, -1)` for `x` one ulp
+below a power of two among them); `expm1` 7.2% and `log1p` 2.0%
+(fdlibm-style); the pin's `atan2(y, x)` for a tiny ratio is
+`y / x` rounded once (a subnormal tie rounds to even, where
+`atan` lies just below it — hipp now does the same).
+
+**Mismatch rates vs the pin** (bitwise, 10^6 random arguments
+per function over five distributions — random bit patterns,
+[-1, 1], [-30, 30], log-uniform magnitudes, 1 ± 10^-6 — through
+the same libm via a scratch harness; max difference in ulps):
+`sqrt` `ceil` `floor` `trunc` `mod` (8 × 10^5) `degrees` `radians`
+`pi`: **0**. `log10` 0.008% (2), `ln` 0.010% (1), `acos` 0.015%
+(1), `log2` 0.026% (1), `asin` 0.034% (1), `acosh` 0.036% (1),
+`atan2` 0.041% (1), `cosh` 0.045% (1), `exp` 0.048% (1), `pow`
+0.066% (1), `cos` 0.072% (1), `atan` 0.076% (1), `sin` 0.10%
+(1), `tan` 0.16% (1), `atanh` 1.5% (1), `tanh` 3.8% (3), `asinh`
+4.5% (1), `sinh` 5.1% (2). In the test corpus against the live
+pin (1,500 per function, `tests/math_v16.rs`): 0 for the exact
+functions and `exp`, `ln`, `log`, `log10`, `log2`, `log(B, X)`,
+`pow`; 1–4 for trig and inverse trig; `cosh` 5, `acosh` 6,
+`asinh` 12, `tanh` 59, `atanh` 108, `sinh` 109 (the [-30, 30] /
+[-1, 1] / [-3, 3] ranges where glibc's `expm1` / `log1p` sit).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed" (`v04,math` compiles warning-free
+alone). New suites: `tests/math_v16.rs` (6 tests: the generated
+bitwise corpus per function with its mismatch bound and ulp cap,
+structural edge cases — ±0, subnormals, the largest doubles,
+infinities, NaN-producing arguments, overflow / underflow
+thresholds, the C99 pow / atan2 / fmod tables — bit for bit but
+two one-ulp cases (`atanh(±0.5)`, glibc's `log1p(2)`), argument
+coercion over every storage class for every function, arity
+errors, math in generated / CHECK / DEFAULT columns and writes,
+and the text → number regression); `src/math.rs` unit tests (exact
+and special values, the SQL argument rules);
+`hipp-cli/tests/cli_v16_math.rs` (2 tests, byte-identical
+one-shot and over stdin: special-value rendering and a generated
+corpus of the exact functions).
+
+**Size:** tiny **76,048 B** (Δ **+80 B** vs 75,968, ratchet raised
+to it): the text → number correctness fix on the tiny profile's
+INSERT affinity path — the NUL cut and the ASCII-only trim check
+(three variants were measured; this one is the smallest; the math
+library itself is not in the tiny build). Full **344,975 B** (Δ
+**+17,308 B** vs 327,667, ratchet raised to it; over the 16 KiB
+`justify_over`, justified here): the soft-float double-double
+library on thumbv7em (9.4 KB of `math::` symbols: Payne–Hanek with
+its 184-byte table, the series, `scale_round`, the integer `sqrt`),
+5.8 KB inlined into `eval_scalar` (the per-function entry points)
+and the u128 builtins it pulls in.
+
+**Honest gaps:**
+
+- Not bit-identical everywhere: where glibc is not correctly
+  rounded, hipp (which is) differs by one ulp — rates above;
+  `sinh` / `tanh` / `asinh` / `atanh` inherit glibc's `expm1` /
+  `log1p` errors (`atanh(0.5)` is ...478 on the pin, ...489 in
+  hipp, the true value). Matching those would mean reproducing
+  glibc's polynomial coefficients, which output fitting cannot
+  recover; `tanh` can differ by up to 3 ulp through `1 - 2/(t+2)`.
+- The hyperbolic branch points were fitted by sweeping the
+  arguments around each (every 997th to 2^26th double over
+  ±2^21 .. ±2^40 ulps): `asinh`'s 2^28 and 2, `cosh`'s ln(2)/2 and
+  the `sinh` / `cosh` exp split sit at their values rounded up to
+  the high 32 bits (0 mismatches after, 1,052 / 176 / 204 / 28
+  before); `acosh`'s 2 and the round values 22, 1, 0.5, 2^-28,
+  2^-55 compare exactly. A ±3-ulp sweep of every threshold now
+  differs only where a building block (`expm1`, `log1p`, `exp`)
+  does. Thresholds were not swept beyond these.
+- `log10` is the fitted formula, not correctly rounded (up to
+  2 ulp from the true value; it equals the pin's wherever its
+  `ln` does).
+- hipp's correct rounding is by double-double evaluation (about
+  2^-95 relative before the final rounding), not a proof: a
+  hard case within 2^-95 of a midpoint could misround; none was
+  found in 55,000 `Decimal`-checked or 2.2 × 10^7 glibc-compared
+  arguments.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

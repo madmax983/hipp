@@ -855,10 +855,24 @@ pub fn render_int(i: i64, out: &mut AVec<u8>) {
 /// Returns Integer if the text is a well-formed integer literal,
 /// Real if a well-formed real literal, else None. SQLite requires
 /// the whole string (modulo surrounding spaces) to be numeric.
+///
+/// The text is read as the pin reads it: up to its first NUL
+/// (`'5' || char(0) || 'x'` is 5), with only the ASCII spaces
+/// `sqlite3Isspace` knows (space, `\t` `\n` `\v` `\f` `\r`)
+/// trimmed — `char(160) || '5'` stays text (v0.16 fix, ungated:
+/// Unicode whitespace used to be trimmed and a NUL refused the
+/// number).
 pub fn text_to_number(t: &[u8]) -> Option<OwnedValue> {
-    let s = core::str::from_utf8(t).ok()?;
-    let s = s.trim();
-    if s.is_empty() {
+    let t = t.split(|c| *c == 0).next()?;
+    let u = core::str::from_utf8(t).ok()?;
+    let s = u.trim();
+    // Only the ASCII spaces may go: `trim` takes Unicode ones too,
+    // and a number holds no space inside.
+    let ascii = u
+        .bytes()
+        .filter(|c| matches!(c, b' ' | b'\t'..=b'\r'))
+        .count();
+    if s.is_empty() || u.len().saturating_sub(s.len()) != ascii {
         return None;
     }
     if let Ok(i) = s.parse::<i64>() {

@@ -288,6 +288,10 @@ pub enum ScalarFn {
     /// `'3.54.1'`.
     #[cfg(feature = "v16")]
     SqliteVersion,
+    /// The math functions (v0.16, leaf feature `math`):
+    /// `crate::math::eval`.
+    #[cfg(feature = "math")]
+    Math(crate::math::MathFn),
 }
 
 impl ScalarFn {
@@ -1935,10 +1939,16 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
     ];
     #[cfg(not(feature = "v16"))]
     const V16: &[(&[u8], ScalarFn)] = &[];
-    BASE.iter()
+    let f = BASE
+        .iter()
         .chain(V16.iter())
         .find(|(n, _)| eq_ci(name, n))
-        .map(|(_, f)| *f)
+        .map(|(_, f)| *f);
+    #[cfg(feature = "math")]
+    if f.is_none() {
+        return crate::math::MathFn::lookup(name).map(ScalarFn::Math);
+    }
+    f
 }
 
 /// The argument counts a scalar function takes, as on the pin.
@@ -1978,6 +1988,8 @@ fn arity(f: ScalarFn) -> (usize, usize) {
         ScalarFn::Concat => (1, usize::MAX),
         #[cfg(feature = "v16")]
         ScalarFn::ConcatWs => (2, usize::MAX),
+        #[cfg(feature = "math")]
+        ScalarFn::Math(m) => m.arity(),
         _ => (1, 1),
     }
 }
@@ -4650,6 +4662,10 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
         vs.push(eval::<E>(a, ctx)?);
     }
     let v = vs.as_slice();
+    #[cfg(feature = "math")]
+    if let ScalarFn::Math(m) = f {
+        return Ok(crate::math::eval(m, v));
+    }
     let Some(v0) = v.first() else {
         // The argument-free calls.
         #[cfg(feature = "v16")]

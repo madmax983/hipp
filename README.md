@@ -250,6 +250,32 @@ aspirations.
   aggregates as the pin does — before HAVING, never for a group a
   WHERE-able HAVING term or a group-ordered LIMIT keeps from
   forming. The tiny profile did not grow.
+- **Math functions** (leaf feature `math`, in `full`; needs only
+  `v04`): every function the pin builds with
+  SQLITE_ENABLE_MATH_FUNCTIONS — `acos` `acosh` `asin` `asinh`
+  `atan` `atan2` `atanh` `ceil` / `ceiling` `cos` `cosh`
+  `degrees` `exp` `floor` `ln` `log(X)` `log(B, X)` `log10`
+  `log2` `mod` `pi` `pow` / `power` `radians` `sin` `sinh`
+  `sqrt` `tan` `tanh` `trunc` — with the pin's argument rules
+  (only INTEGER, REAL and wholly numeric TEXT count; NULL, BLOB
+  and other text give NULL; `log(B, X)` reads X as any value's
+  numeric prefix), NULL for every NaN result (`sqrt(-1)`,
+  `acos(2)`, `mod(1, 0)`, `sin(1e400)`), INTEGER results from
+  `ceil` / `floor` / `trunc` of an integer, and the pin's REAL
+  rendering (`Inf`, `-Inf`). There is no libm in `no_std`, so
+  `hipp::math` is an in-crate floating-point library: exact
+  integer `sqrt`, `fmod`, `ceil` / `floor` / `trunc`; Payne–Hanek
+  reduction and double-double series for the rest, correctly
+  rounded; `log10` and the hyperbolic functions follow the
+  pin's own formulas (fitted to its output) over those. The pin
+  uses glibc, which is not correctly rounded everywhere, so
+  0.01–0.3% of `exp` / `ln` / trig results (up to 11% of
+  `sinh` / `tanh` / `asinh` / `atanh`, through glibc's `expm1` /
+  `log1p`) differ by 1–3 ulp; STATUS.md lists the measured rates.
+  Ungated fix on the way: text → number conversion (column
+  affinity, comparisons) trims only ASCII spaces and reads text
+  to its first NUL, as the pin does (`char(160) || '5'` was
+  stored as 5, `'5' || char(0) || 'x'` as text).
 
 ## What v0.13 does
 

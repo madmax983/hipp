@@ -14,7 +14,7 @@ default = ["std", "full"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
-full = ["indexes", "v04", "v05", "v06", "v07", "v08", "v09", "v10", "v16", "params"]
+full = ["indexes", "v04", "v05", "v06", "v07", "v08", "v09", "v10", "v16", "params", "math"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
 # Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
@@ -115,6 +115,13 @@ v16 = ["v10"]
 # (INSERT VALUES, WHERE rowid = ?); with the evaluator it is any
 # expression. The tiny profile excludes it per §2.
 params = []
+# v0.16 leaf (ADR 0001): the SQL math functions SQLite builds with
+# SQLITE_ENABLE_MATH_FUNCTIONS -- acos ... trunc, log(B, X), mod,
+# pi, pow -- over an in-crate floating-point library (no libm in
+# no_std: argument reduction plus double-double series, correctly
+# rounded). Needs only the v0.4 expression evaluator. The tiny
+# profile excludes it per §2.
+math = ["v04"]
 
 [dependencies]
 
