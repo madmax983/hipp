@@ -208,9 +208,12 @@ enum Plan {
     /// `CREATE TABLE ... AS SELECT` (v0.16, `v16`): the source
     /// plan, the derived `sqlite_schema` text (the pin's
     /// `createTableStmt` form) and the new columns' affinities.
+    /// `select: None` is the IF NOT EXISTS no-op: the name was
+    /// taken when the statement was planned, so (as the pin's
+    /// `sqlite3StartTable`) the SELECT was never resolved.
     #[cfg(feature = "v16")]
     CreateTableAs {
-        select: Box<crate::query::SubPlan>,
+        select: Option<Box<crate::query::SubPlan>>,
         sql: AVec<u8>,
         affs: AVec<crate::record::Affinity>,
     },
@@ -888,8 +891,9 @@ impl<S: Storage> Connection<S> {
     /// constant row) is not reported here but deferred to the
     /// first `step`, which plans again with the actual bindings —
     /// as the pin reports such errors only when it runs the
-    /// statement. Name-resolution and grammar errors, which no
-    /// binding changes, are reported here.
+    /// statement. Every other error (grammar, name resolution, a
+    /// table that already exists, storage) is reported here, as
+    /// the pin's prepare reports it (`binding_dependent`).
     #[cfg(feature = "params")]
     fn prepare_params(&self, sql: &[u8], arena: &Arena) -> Result<(Ast, Plan, Binds), S::Error> {
         let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena)?;
@@ -913,7 +917,7 @@ impl<S: Storage> Connection<S> {
         binds.src = Some(ast);
         match self.plan(arena, &bound) {
             Ok(plan) => Ok((bound, plan, binds)),
-            Err(e) if binding_independent(&e) => Err(e),
+            Err(e) if !binding_dependent(&e) => Err(e),
             Err(_) => {
                 binds.stale = true;
                 Ok((bound, Plan::Deferred, binds))
@@ -935,11 +939,33 @@ impl<S: Storage> Connection<S> {
                 strict,
                 #[cfg(feature = "v16")]
                 as_select,
+                #[cfg(feature = "v16")]
+                if_not_exists,
                 ..
             } => {
                 #[cfg(feature = "v16")]
                 if let Some(sel) = as_select {
-                    return self.plan_create_as(arena, handle_bytes(arena, *name), sel);
+                    // The pin's `sqlite3StartTable` refuses a taken
+                    // name (or makes IF NOT EXISTS a no-op) before
+                    // the SELECT is resolved, at prepare.
+                    let tname = handle_bytes(arena, *name);
+                    let (ca, cat) = (&self.catalog_arena, &self.catalog);
+                    if cat.find(ca, tname).is_some()
+                        || cat.find_view(ca, tname).is_some()
+                        || cat.find_index(ca, tname).is_some()
+                    {
+                        if *if_not_exists {
+                            return Ok(Plan::CreateTableAs {
+                                select: None,
+                                sql: AVec::new(),
+                                affs: AVec::new(),
+                            });
+                        }
+                        return Err(Error::Schema {
+                            kind: SchemaKind::DuplicateTable,
+                        });
+                    }
+                    return self.plan_create_as(arena, tname, sel);
                 }
                 #[cfg(feature = "v16")]
                 let strict = *strict;
@@ -1700,7 +1726,7 @@ impl<S: Storage> Connection<S> {
             cols.push((n.clone(), *a));
         }
         Ok(Plan::CreateTableAs {
-            select: Box::new(plan),
+            select: Some(Box::new(plan)),
             sql: crate::rules::ctas_sql(tname, cols.as_slice()),
             affs,
         })
@@ -3539,37 +3565,31 @@ struct Binds {
     started: bool,
 }
 
-/// Whether a planning error is one no parameter binding can
-/// change (v0.16, `params`): grammar and name resolution — the
-/// errors the pin reports at prepare. Everything else is deferred
-/// to `step` (see `Connection::prepare_params`).
+/// Whether a planning error of the all-NULL bindings is a value
+/// error that another binding could avoid (v0.16, `params`): a
+/// constraint, type or range failure of a constant row or operand
+/// — errors the pin reports only when it runs the statement.
+/// Only these are deferred to `step` (see
+/// `Connection::prepare_params`); every other error (grammar, name
+/// resolution, an existing table, storage, corruption) is what the
+/// pin's `sqlite3_prepare` reports, so prepare reports it.
 #[cfg(feature = "params")]
-fn binding_independent<E>(e: &Error<E>) -> bool {
-    match e {
-        Error::Parse { .. } | Error::Unsupported => true,
-        Error::Schema { kind } => matches!(
-            kind,
-            SchemaKind::UnknownTable
-                | SchemaKind::UnknownColumn
-                | SchemaKind::UnknownIndex
-                | SchemaKind::UnknownView
-                | SchemaKind::AmbiguousColumn
-                | SchemaKind::ColumnCountMismatch
-                | SchemaKind::DuplicateColumn
-                | SchemaKind::UsingColumnMissing
-                | SchemaKind::OnReferencesLaterSource
-                | SchemaKind::TermOutOfRange
-                | SchemaKind::MisusedAggregate
-                | SchemaKind::HavingWithoutAggregate
-                | SchemaKind::IsView
-                | SchemaKind::IsTable
-                | SchemaKind::UpdateTargetInFrom
-                | SchemaKind::UnknownCollation
-                | SchemaKind::GeneratedColumnWrite
-                | SchemaKind::ParameterNotAllowed
-        ),
-        _ => false,
-    }
+fn binding_dependent<E>(e: &Error<E>) -> bool {
+    matches!(
+        e,
+        Error::Schema {
+            kind: SchemaKind::DuplicateRowid
+                | SchemaKind::DatatypeMismatch
+                | SchemaKind::MissingRowidValue
+                | SchemaKind::UniqueViolation
+                | SchemaKind::NotNullViolation
+                | SchemaKind::IntegerOverflow
+                | SchemaKind::CheckViolation
+                | SchemaKind::StrictTypeViolation
+                | SchemaKind::EscapeNotSingleChar
+                | SchemaKind::PatternTooComplex
+        }
+    )
 }
 
 pub struct Statement<'c, S: Storage> {
@@ -4457,11 +4477,19 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "v16")]
     async fn exec_create_as(&mut self, name: &[u8]) -> Result<(), S::Error> {
+        if matches!(&self.plan, Plan::CreateTableAs { select: None, .. }) {
+            // The name was taken at plan time and is free now
+            // (another connection's schema change): plan again,
+            // as the pin re-prepares on a schema change.
+            self.plan = self.conn.plan(&self.arena, &self.ast)?;
+        }
         let (select, sql, affs) = match &self.plan {
-            Plan::CreateTableAs { select, sql, affs } => {
-                (select.clone(), sql.clone(), affs.clone())
-            }
-            _ => unreachable!(),
+            Plan::CreateTableAs {
+                select: Some(select),
+                sql,
+                affs,
+            } => (select.clone(), sql.clone(), affs.clone()),
+            _ => return Err(Error::Unsupported),
         };
         let rows = self.exec_subplan(&select, &RowData::empty()).await?;
         let (root, _) = self.conn.pager.alloc_page().await?;

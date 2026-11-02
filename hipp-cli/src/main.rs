@@ -75,11 +75,35 @@ fn fmt_real(f: f64) -> String {
             "-Inf".to_string()
         };
     }
-    // 15 significant digits in scientific form: d.dddddddddddddd e±X
-    let sci = format!("{:.14e}", f.abs());
+    // 15 significant digits, rounded as the pin's printf rounds
+    // its decoded digit string: half away from zero (an exact tie
+    // such as 5833858491548785.0 goes up, where Rust's `{:.14e}`
+    // goes to even). The decoding is taken to 20 digits, about
+    // what the pin's double-double decoder yields.
+    let sci = format!("{:.19e}", f.abs());
     let (mant, exp) = sci.split_once('e').expect("scientific form");
-    let exp10: i32 = exp.parse().expect("exponent");
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let mut exp10: i32 = exp.parse().expect("exponent");
+    let mut d: Vec<u8> = mant.bytes().filter(|c| *c != b'.').collect();
+    let up = d.get(15).is_some_and(|c| *c >= b'5');
+    d.truncate(15);
+    if up {
+        let mut carry = true;
+        for c in d.iter_mut().rev() {
+            if *c == b'9' {
+                *c = b'0';
+            } else {
+                *c += 1;
+                carry = false;
+                break;
+            }
+        }
+        if carry {
+            d.insert(0, b'1');
+            d.truncate(15);
+            exp10 += 1;
+        }
+    }
+    let digits = String::from_utf8(d).expect("ascii digits");
     let digits = digits.trim_end_matches('0');
     let digits = if digits.is_empty() { "0" } else { digits };
     let sign = if f < 0.0 { "-" } else { "" };

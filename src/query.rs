@@ -2223,6 +2223,108 @@ fn int_value(v: &OwnedValue) -> i64 {
     }
 }
 
+/// `round(r, n)` as the pin computes it (v0.16), for `n` in
+/// 0..=30: a value beyond ±2^52 has no fraction and stays; with
+/// `n` 0 it is `(double)(i64)(r ± 0.5)`; otherwise the pin prints
+/// `%!.*f` (the decimal expansion rounded half away from zero at
+/// `n` places, or at its 26th significant digit when that comes
+/// first) and reads the text back. Here the expansion is exact:
+/// `|r| * 10^n` as a 192-bit integer of 32-bit limbs.
+fn round_real(r: f64, n: i64) -> f64 {
+    const LIM: f64 = 4_503_599_627_370_496.0;
+    if r.is_nan() || !(-LIM..=LIM).contains(&r) {
+        return r;
+    }
+    if n <= 0 {
+        return (if r < 0.0 { r - 0.5 } else { r + 0.5 }) as i64 as f64;
+    }
+    let bits = r.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e) = if exp == 0 {
+        (frac, -1074i64)
+    } else {
+        (frac | (1u64 << 52), exp - 1075)
+    };
+    // An integral value (e >= 0) prints and reads back unchanged.
+    let Ok(k) = u32::try_from(-e) else {
+        return r;
+    };
+    if k == 0 {
+        return r;
+    }
+    // x = m * 10^n + 2^(k-1) < 2^154: six 32-bit limbs.
+    if k >= 154 {
+        // x < 2^153 <= 2^(k-1): rounds to 0.
+        return if r < 0.0 { -0.0 } else { 0.0 };
+    }
+    let mut x = [m as u32, (m >> 32) as u32, 0, 0, 0, 0];
+    for _ in 0..n {
+        let mut carry = 0u64;
+        for limb in x.iter_mut() {
+            let t = u64::from(*limb) * 10 + carry;
+            *limb = t as u32;
+            carry = t >> 32;
+        }
+    }
+    let mut carry = 1u64 << ((k - 1) % 32);
+    for limb in x.iter_mut().skip(((k - 1) / 32) as usize) {
+        let t = u64::from(*limb) + carry;
+        *limb = t as u32;
+        carry = t >> 32;
+    }
+    // D = x >> k, the value rounded half away from zero at n places.
+    let (lo, hi) = ((k / 32) as usize, k % 32);
+    let mut d = [0u32; 6];
+    for (i, slot) in d.iter_mut().enumerate() {
+        let a = u64::from(x.get(i + lo).copied().unwrap_or(0));
+        let b = u64::from(x.get(i + lo + 1).copied().unwrap_or(0));
+        *slot = (((b << 32) | a) >> hi) as u32;
+    }
+    // D's decimal digits, least significant first; more than 26
+    // means the pin rounds at its 26th significant digit, which
+    // reads back as `r` itself.
+    let mut digits = [0u8; 27];
+    let mut nd = 0usize;
+    while d.iter().any(|l| *l != 0) || nd == 0 {
+        let mut rem = 0u64;
+        for limb in d.iter_mut().rev() {
+            let cur = (rem << 32) | u64::from(*limb);
+            *limb = (cur / 10) as u32;
+            rem = cur % 10;
+        }
+        let Some(slot) = digits.get_mut(nd) else {
+            return r;
+        };
+        *slot = b'0' + rem as u8;
+        nd += 1;
+    }
+    // "[-]<digits>e-<n>", read back as the pin's AtoF reads it.
+    let mut buf = [0u8; 32];
+    let mut len = 0usize;
+    let mut push = |c: u8| {
+        if let Some(slot) = buf.get_mut(len) {
+            *slot = c;
+            len += 1;
+        }
+    };
+    if r < 0.0 {
+        push(b'-');
+    }
+    for c in digits.iter().take(nd).rev() {
+        push(*c);
+    }
+    push(b'e');
+    push(b'-');
+    if n >= 10 {
+        push(b'0' + (n / 10) as u8);
+    }
+    push(b'0' + (n % 10) as u8);
+    buf.get(..len)
+        .and_then(crate::sql::lexer::parse_real_signed)
+        .unwrap_or(r)
+}
+
 /// Truncating conversion to i64 with SQLite's clamping at the
 /// i64 bounds (CAST semantics for out-of-range reals).
 pub fn num_to_i64(n: Num) -> i64 {
@@ -3129,30 +3231,15 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             let Some(n) = to_number(&v[0]) else {
                 return Ok(OwnedValue::Null);
             };
-            let digits = if v.len() > 1 {
-                match to_number(&v[1]) {
-                    Some(m) => num_to_i64(m),
-                    None => return Ok(OwnedValue::Null),
-                }
-            } else {
-                0
+            // The digit count is read as the pin's
+            // `sqlite3_value_int64` reads it (a text's integer
+            // prefix: '1e1' is 1), then clamped to 0..=30.
+            let digits = match v.get(1) {
+                None => 0,
+                Some(OwnedValue::Null) => return Ok(OwnedValue::Null),
+                Some(d) => int_value(d).clamp(0, 30),
             };
-            let x = n.as_f64();
-            // A negative digit count behaves as 0 in SQLite (its
-            // scale factor loop simply never runs).
-            let mut mult = 1.0f64;
-            let mut d = digits;
-            while d > 0 {
-                mult *= 10.0;
-                d -= 1;
-            }
-            let scaled = x * mult;
-            let rounded = if scaled >= 0.0 {
-                (scaled + 0.5) as i64 as f64
-            } else {
-                (scaled - 0.5) as i64 as f64
-            };
-            OwnedValue::Real(rounded / mult)
+            OwnedValue::Real(round_real(n.as_f64(), digits))
         }
         ScalarFn::Substr => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
@@ -3161,30 +3248,24 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             let Some(text) = to_text(&v[0]) else {
                 return Ok(OwnedValue::Null);
             };
-            let Some(start_n) = to_number(&v[1]) else {
-                return Ok(OwnedValue::Null);
-            };
-            let mut start = num_to_i64(start_n);
+            // Start and length are read as the pin's
+            // `sqlite3_value_int64` reads them: a text's integer
+            // prefix ('1e1' is 1), a real truncated.
+            let mut start = int_value(&v[1]);
             let ranges = char_ranges(text.as_slice());
             let n = ranges.len() as i64;
-            let mut len: i64 = if v.len() > 2 {
-                match to_number(&v[2]) {
-                    Some(m) => num_to_i64(m),
-                    None => return Ok(OwnedValue::Null),
-                }
-            } else {
-                n
+            let mut len: i64 = match v.get(2) {
+                Some(m) => int_value(m),
+                None => n,
             };
             // SQLite's substr coordinate rules (verified
             // against the oracle, incl. negative lengths: a
-            // negative length counts back from the start point).
+            // negative length counts back from the start point),
+            // saturating at the i64 bounds.
             if start < 0 {
-                start += n;
+                start = start.saturating_add(n);
                 if start < 0 {
-                    len += start;
-                    if len < 0 {
-                        len = 0;
-                    }
+                    len = len.saturating_add(start).max(0);
                     start = 0;
                 }
             } else if start > 0 {
@@ -3193,24 +3274,22 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 len -= 1;
             }
             if len < 0 {
-                len = -len;
-                start -= len;
+                len = len.saturating_neg();
+                start = start.saturating_sub(len);
                 if start < 0 {
-                    len += start;
-                    if len < 0 {
-                        len = 0;
-                    }
+                    len = len.saturating_add(start).max(0);
                     start = 0;
                 }
             }
-            if start + len > n {
-                len = n - start;
-            }
+            let end = start.saturating_add(len).min(n);
             let mut out = AVec::new();
             for (i, (bs, be)) in ranges.iter().enumerate() {
                 let idx = i as i64;
-                if idx >= start && idx < start + len {
-                    out.extend_from_slice(&text.as_slice()[*bs..*be]);
+                if idx >= start
+                    && idx < end
+                    && let Some(piece) = text.as_slice().get(*bs..*be)
+                {
+                    out.extend_from_slice(piece);
                 }
             }
             match v[0] {

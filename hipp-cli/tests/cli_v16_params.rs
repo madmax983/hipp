@@ -171,3 +171,54 @@ SELECT NULL, NULL, NULL;
 ";
     same("set", hipp, ora);
 }
+
+/// Regressions from review: a compound ORDER BY parameter takes
+/// the column of the leftmost core that holds it, rows sharing a
+/// multi-row VALUES co-routine never match it, substr() / round()
+/// read text integer arguments by their integer prefix, and a
+/// REAL whose 16th significant digit is an exact 5 prints rounded
+/// up (half away from zero, as the pin's printf), not to even.
+#[test]
+fn cli_v16_compound_order_and_integer_arguments() {
+    let hipp = "\
+.parameter set ?1 9
+.parameter set :t \"'1e1'\"
+SELECT ?1, 2 UNION SELECT 3, ?1 ORDER BY ?1;
+SELECT 5, ?1 UNION ALL SELECT ?1, 2 ORDER BY ?1 DESC;
+VALUES (CAST(1 AS INT), ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1;
+SELECT substr('abcdefghijkl', :t), substr('abcdefghijkl', 2, :t), round(1.23456, :t);
+SELECT round(2.675, 2), round(1.5, 1000000000000), round(1e300, 2), round(0.1, 30);
+SELECT 5833858491548785.0, -6776496294506.125, 0.000123456789012345, 999999999999999.5;
+";
+    let ora = "\
+SELECT 9, 2 UNION SELECT 3, 9 ORDER BY 1;
+SELECT 5, 9 UNION ALL SELECT 9, 2 ORDER BY 2 DESC;
+VALUES (CAST(1 AS INT), 9), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 2;
+SELECT substr('abcdefghijkl', '1e1'), substr('abcdefghijkl', 2, '1e1'), round(1.23456, '1e1');
+SELECT round(2.675, 2), round(1.5, 1000000000000), round(1e300, 2), round(0.1, 30);
+SELECT 5833858491548785.0, -6776496294506.125, 0.000123456789012345, 999999999999999.5;
+";
+    let a = temp_db("ordint-hipp");
+    let b = temp_db("ordint-ora");
+    assert_eq!(
+        String::from_utf8_lossy(&run_stdin(&hipp_bin(), &a, hipp)),
+        String::from_utf8_lossy(&run_stdin(&oracle(), &b, ora))
+    );
+    // Rows that share a co-routine: the pin's "does not match any
+    // column" error, in both.
+    let q = "VALUES (1, ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1;";
+    let qo = "VALUES (1, 9), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 'nomatch';";
+    for (bin, sql) in [(hipp_bin(), q), (oracle(), qo)] {
+        let out = Command::new(&bin)
+            .arg(&a)
+            .arg(sql)
+            .output()
+            .expect("cli runs");
+        assert!(
+            !out.status.success() || !out.stderr.is_empty(),
+            "{}",
+            bin.display()
+        );
+        assert!(out.stdout.is_empty(), "{}", bin.display());
+    }
+}

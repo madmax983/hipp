@@ -213,10 +213,9 @@ impl Binder<'_> {
 
     fn select<E>(&self, s: &mut SelectStmt) -> Result<(), E> {
         // Compound ORDER BY terms that are a bare parameter match
-        // the first item, scanning the cores from the rightmost,
-        // that is the same parameter (the pin's
-        // `resolveCompoundOrderBy` + `sqlite3ExprCompare`: same
-        // index, same spelling). Found before the items are bound.
+        // the first item, scanning the cores from the leftmost,
+        // that is the same parameter (`compound_match`). Found
+        // before the items are bound.
         let mut ordinals: AVec<Option<i64>> = AVec::new();
         if !s.compound.is_empty() {
             for (t, _) in s.order_by.iter() {
@@ -284,9 +283,19 @@ fn bare_param(e: &Expr) -> Option<(u16, ABytes)> {
 }
 
 /// The 1-based result column a compound ORDER BY term matches by
-/// being the same parameter as one core's item (rightmost core
-/// first; a multi-row VALUES core is one core per row, as the pin
-/// builds it).
+/// being the same parameter as one core's item (the pin's
+/// `resolveCompoundOrderBy`: it walks back to the leftmost core and
+/// resolves the terms moving rightwards, so the leftmost core that
+/// holds the parameter decides; `sqlite3ExprCompare` asks for the
+/// same index and the same spelling).
+///
+/// A multi-row VALUES core is laid out as the pin's
+/// `sqlite3MultiValues` builds it: rows that may share a co-routine
+/// become one `SELECT * FROM (co-routine)` core, whose items are
+/// `column1..N` and never match a parameter; a row that may not
+/// (see `starts_coroutine`) stays a core of its own. A multi-row
+/// VALUES right of a compound operator is wrapped as a subquery by
+/// the pin's grammar, so none of its rows match.
 fn compound_match(s: &SelectStmt, term: &Expr, arena: &Arena) -> Option<i64> {
     let (idx, h) = bare_param(term)?;
     let text = crate::sql::handle_bytes(arena, h);
@@ -294,21 +303,91 @@ fn compound_match(s: &SelectStmt, term: &Expr, arena: &Arena) -> Option<i64> {
         Expr::Param(j, h2) => *j == idx && crate::sql::handle_bytes(arena, *h2) == text,
         _ => false,
     };
-    let in_core = |c: &SelectStmt| -> Option<i64> {
-        for row in c.values.iter().rev() {
-            if let Some(k) = row.iter().position(&same) {
-                return i64::try_from(k).ok().map(|k| k + 1);
-            }
-        }
-        let k = c.items.iter().position(|it| match it {
-            SelectItem::Expr(e, _, _) => same(e),
-            _ => false,
-        })?;
+    let pos = |row: &[Expr]| -> Option<i64> {
+        let k = row.iter().position(&same)?;
         i64::try_from(k).ok().map(|k| k + 1)
     };
-    s.compound
-        .iter()
-        .rev()
-        .find_map(|(_, c)| in_core(c))
-        .or_else(|| in_core(s))
+    let in_core = |c: &SelectStmt, leftmost: bool| -> Option<i64> {
+        let rows = c.values.as_slice();
+        match rows {
+            [] => {
+                let k = c.items.iter().position(|it| match it {
+                    SelectItem::Expr(e, _, _) => same(e),
+                    _ => false,
+                })?;
+                i64::try_from(k).ok().map(|k| k + 1)
+            }
+            [row] => pos(row.as_slice()),
+            _ if !leftmost => None,
+            [first, rest @ ..] => {
+                // The last core so far, when it is a plain row
+                // (None: the co-routine).
+                let mut plain: Option<&[Expr]> = Some(first.as_slice());
+                for r in rest {
+                    let joins = constant_row(r.as_slice()) && plain.is_none_or(starts_coroutine);
+                    if joins {
+                        plain = None;
+                    } else {
+                        if let Some(k) = plain.and_then(pos) {
+                            return Some(k);
+                        }
+                        plain = Some(r.as_slice());
+                    }
+                }
+                plain.and_then(pos)
+            }
+        }
+    };
+    in_core(s, true).or_else(|| s.compound.iter().find_map(|(_, c)| in_core(c, false)))
+}
+
+/// Whether a VALUES row is constant for the pin's
+/// `sqlite3MultiValues` (oracle-probed): no subquery anywhere in
+/// it. Every built-in function hipp has (LIKE and GLOB too) is
+/// constant there.
+fn constant_row(row: &[Expr]) -> bool {
+    row.iter().all(constant)
+}
+
+fn constant(e: &Expr) -> bool {
+    match e {
+        Expr::ScalarSubquery(_) | Expr::ExistsSubquery(_) | Expr::InSubquery(..) => false,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Param(..) => true,
+        Expr::Binary(_, a, b) | Expr::Like(a, b, _) => constant(a) && constant(b),
+        Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
+            constant(a)
+        }
+        #[cfg(feature = "v16")]
+        Expr::Collate(a, _) => constant(a),
+        Expr::InList(a, l, _) => constant(a) && l.iter().all(constant),
+        Expr::Between(a, b, c, _) => constant(a) && constant(b) && constant(c),
+        Expr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_none_or(constant)
+                && whens.iter().all(|(w, t)| constant(w) && constant(t))
+                && otherwise.as_deref().is_none_or(constant)
+        }
+        Expr::Func { args, .. } => args.iter().all(constant),
+    }
+}
+
+/// Whether a plain VALUES row may become the first row of a
+/// co-routine when a constant row follows it (the pin's
+/// `sqlite3MultiValues`, oracle-probed): it is constant and none
+/// of its items has an affinity — a CAST, under any COLLATE, has
+/// one; `+CAST(..)`, `CAST(..) + 0` and a COLLATE'd literal do not.
+fn starts_coroutine(row: &[Expr]) -> bool {
+    constant_row(row)
+        && row.iter().all(|e| {
+            #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+            let mut core = e;
+            #[cfg(feature = "v16")]
+            while let Expr::Collate(inner, _) = core {
+                core = inner;
+            }
+            !matches!(core, Expr::Cast(..))
+        })
 }

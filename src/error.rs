@@ -247,9 +247,10 @@ pub enum Error<E> {
     /// look one up with `parameter_index`.
     #[cfg(feature = "params")]
     BindIndexOutOfRange { index: usize },
-    /// A `bind_*` / `clear_bindings` call on a statement that
-    /// has been stepped and not reset (v0.16, `params`; the pin's
-    /// `SQLITE_MISUSE`). Call `Statement::reset` first.
+    /// A `bind_*` call on a statement that has been stepped and
+    /// not reset (v0.16, `params`; the pin's `SQLITE_MISUSE`).
+    /// Call `Statement::reset` first. (`clear_bindings` is allowed
+    /// at any time and never returns it.)
     #[cfg(feature = "params")]
     ResetRequired,
     /// The caller's storage device error.

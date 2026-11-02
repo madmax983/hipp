@@ -871,10 +871,13 @@ oracle, gated behind the new leaf feature `params` (in `full`;
   difference the pin makes — an integer literal in ORDER BY /
   GROUP BY is an ordinal, a parameter is not — is encoded: such a
   term becomes `+value`, or, in a compound ORDER BY, the ordinal
-  of the first result item (rightmost core first) that is the
+  of the first result item (leftmost core first) that is the
   same parameter (same index and spelling: the pin's
-  `resolveCompoundOrderBy` + `sqlite3ExprCompare`); anything
-  else there is "does not match any column", as on the pin.
+  `resolveCompoundOrderBy` + `sqlite3ExprCompare`), with a
+  multi-row VALUES laid out as the pin's `sqlite3MultiValues`
+  builds it (rows sharing a co-routine never match; see the
+  review fixes); anything else there is "does not match any
+  column", as on the pin.
 - **Re-execution:** the first `step` after a `reset` or a
   binding change plans again from the retained parse tree (a
   plan captures the catalog and an expression DEFAULT's clock
@@ -886,8 +889,10 @@ oracle, gated behind the new leaf feature `params` (in `full`;
   state with an error a binding could change (a constant row's
   NOT NULL / CHECK / MustBeInt failure, say) is deferred to the
   first `step` (`Plan::Deferred`; `column_count` is 0 until
-  then); name-resolution and grammar errors are still reported by
-  `prepare`.
+  then). Only such value errors are deferred (a deny-list:
+  constraint, type, rowid, overflow and ESCAPE / pattern
+  errors); every other error — grammar, name resolution, a name
+  already taken — is `prepare`'s, as on the pin.
 - **Where:** in the full profile every expression position —
   WHERE, SET, VALUES, LIMIT / OFFSET, scalar / IN / EXISTS
   subqueries, upsert targets and DO UPDATE, RETURNING, compound
@@ -927,6 +932,63 @@ v0.4 / CLI paths, wrong with or without parameters):**
 - hipp-cli printed a REAL -0.0 as `-0.0`; the pin's printf has
   no negative zero (`SELECT -0.0` prints `0.0`; the value keeps
   its sign — `atan2` shows it on the pin).
+
+**Review fixes (2026-11-02):**
+
+- *Compound ORDER BY parameter, leftmost core decides* (wrong
+  order, no error): hipp scanned the cores from the rightmost.
+  `SELECT ?1, 2 UNION SELECT 3, ?1 ORDER BY ?1` with 9 now sorts
+  by column 1 (`3|9`, `9|2`), as the pin does.
+- *Multi-row VALUES cores* (rows where the pin errors): rows of a
+  multi-row VALUES matched one by one. They are now laid out as
+  `sqlite3MultiValues` lays them out (probed with real bindings
+  on the 3.53.1 library; the co-routine form is 3.46+). A row
+  joins a co-routine, whose `column1..N` items never match, when
+  the row is constant (has no subquery) and the core before it
+  is that co-routine, or is a plain row that is constant with no
+  top-level CAST under any COLLATE. Otherwise the row stays a
+  core of its own and can match. A multi-row VALUES to the right
+  of an operator is a subquery, so it never matches. Every
+  built-in function, LIKE and GLOB included, counts as constant.
+- *Errors at prepare*: the deferral list is a deny-list of value
+  errors (it was an allow-list of prepare errors), and CREATE
+  TABLE ... AS SELECT checks its name when planned, before the
+  SELECT is resolved, as `sqlite3StartTable` does. So
+  `prepare("CREATE TABLE t AS SELECT ?")` over an existing `t`
+  is `DuplicateTable` at prepare. A CLI-visible wrong answer was
+  fixed too: `CREATE TABLE IF NOT EXISTS t AS SELECT nope` over
+  an existing `t` is now a no-op. hipp used to fail it with "no
+  such column".
+- *IN-list affinity of a bound value*: `? IN (int_col)` with
+  `'5'` is 0. The evaluator fix landed in 2ea68e6, and regression
+  cases for the bound form are in the affinity matrix.
+- *Ungated, integer arguments read as the pin's
+  `sqlite3_value_int64`*: substr()'s start / length and round()'s
+  digit count take a text's integer prefix (`substr(x, '1e1')`
+  starts at 1, hipp read 10). Further round() fixes:
+  - The digit count is clamped to 0..=30. `round(1.5,
+    1000000000000)` looped 10^12 times.
+  - round() follows the pin's `%!.*f` rounding: the exact decimal
+    expansion, rounded half away from zero at n places or at the
+    26th significant digit, read back. hipp scaled by 10^n, so
+    `round(2.675, 2)` gave 2.68 (the pin gives 2.67) and `round(1.5,
+    31)` gave 9.2e-13.
+  - substr()'s coordinate arithmetic saturates at the i64 bounds.
+    It used to overflow and panic, as in `substr(x, -2,
+    9223372036854775807)`.
+- *Ungated, hipp-cli*: a REAL whose 16th significant digit is an
+  exact 5 printed rounded to even (`5833858491548785.0` gave
+  `5.83385849154878e+15`). It now rounds half away from zero, as
+  the pin's printf does. 12,000 random doubles print the same as
+  the oracle.
+- *Tiny + params in CI*: `tests/params_tiny_v16.rs` (which runs
+  in the default test run, so in CI) builds `tests/params_v16.rs`
+  with `--no-default-features --features std,params` in its own
+  target directory. It requires the three tiny-grammar tests to
+  run and pass against the tiny parser, which no other test run
+  reaches. It takes about 10 s.
+- The `Error::ResetRequired` doc no longer says `clear_bindings`
+  can return it. `clear_bindings` is infallible.
 
 **Oracle-probing notes** (numbering: the C API of the system
 libsqlite3 3.45 via ctypes — `sqlite3_bind_parameter_count /
@@ -983,15 +1045,52 @@ CAST / `%` fixes +424 B). For information, tiny + `params`
 (`--no-default-features --features params`) is **84,672 B**
 (+8,624 B over tiny).
 
+*Review fixes:* tiny **76,016 B**, Δ **0** against the current
+ratchet (the 76,048 figure above was measured before 2ea68e6).
+`params` stays out of the tiny profile, and the fixed evaluator,
+CTAS and compound-ORDER-BY paths are not in it. Full **291,267
+B**, Δ **+1,272 B** against 289,995, and the ratchet is raised to
+that figure. round()'s exact rounding is about +460 B, the
+multi-row VALUES layout and leftmost match about +560 B, and the
+CTAS name check at plan time with its re-plan about +300 B. For
+information, tiny + `params` is now **85,048 B** (+376 B, the
+VALUES layout of `sql::bind`).
+
+**Gates (review fixes):** `cargo fmt --all` and the full
+`ci/local-gates.sh` run end with "==> all gates passed".
+`tests/params_v16.rs` now has 14 tests: the compound ORDER BY
+corpus gained 24 cases (leftmost core, VALUES co-routine layout,
+match and no-match), the affinity matrix gained `? IN (col)`
+forms, and there are new round() and substr() regressions,
+including a 600-case random round() corpus and the i64 extremes.
+`tests/params_tiny_v16.rs` is new: it runs the tiny + `params`
+tests in CI. `hipp-cli/tests/cli_v16_params.rs` has 3 tests: the
+new one covers the compound ORDER BY, the text integer arguments
+and REAL ties, byte-identical.
+
 **Honest gaps:**
 
 - Every execution after the first plans again (from the
   retained parse tree, not the SQL): correct by construction,
   but a re-executed statement pays planning each time.
-- A plan that fails for the all-NULL bindings with a
-  value-dependent error is deferred, so such a statement reports
-  `column_count` 0 until stepped; a deferral that is really a
-  schema problem surfaces at `step`, not `prepare`.
+- A plan that fails for the all-NULL bindings with a value error
+  is deferred, so such a statement reports `column_count` 0 until
+  it is stepped.
+- The compound ORDER BY rules for a multi-row VALUES follow the
+  3.53.1 library, probed with real bindings. The tests check them
+  against hand-written literal SQL, because the oracle shell
+  cannot bind. The co-routine rule depends on the version (3.46
+  and later), and the pin is 3.54.1.
+- Found, not fixed (existing, outside this unit): when a compound
+  has an ORDER BY that it merges directly, hipp breaks ties
+  between rows by all of their columns. On the pin, UNION ALL
+  ties keep input order: `SELECT 1, 2 UNION ALL SELECT 1, 0 ORDER
+  BY 1` is `1|2`, `1|0` on the pin and `1|0`, `1|2` in hipp. The
+  corpora avoid such ties.
+- round() reads its exact decimal expansion, while the pin reads
+  the digits its double-double decoder gives (about 20). They
+  could differ only for a value whose rounding is decided past
+  about the 18th significant digit. 6,000 random cases agree.
 - Bound text / blob bytes are copied into the statement arena
   when planned, so a bound value counts against `stmt_max` as
   the same literal in the SQL would.

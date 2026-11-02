@@ -940,6 +940,11 @@ fn affinity_of_bound_values_matches_literals() {
             }
             let sql = format!("SELECT {col} IN (?, 7), {col} BETWEEN ? AND 6 FROM t");
             assert!(tw.case(&sql, &[v.clone(), v.clone()]).is_none());
+            // A bound value has no affinity, so `? IN (col, ...)`
+            // compares without converting (the pin takes an IN
+            // list's affinity from its left operand only).
+            let sql = format!("SELECT ?1 IN ({col}), ?1 IN ({col}, 7), ?1 NOT IN ({col}) FROM t");
+            assert!(tw.case(&sql, std::slice::from_ref(v)).is_none());
         }
         for sql in [
             "SELECT ?1 = 5, ?1 = '5', ?1 IS NULL, typeof(?1), ?1 + 0, ?1 || 'z'",
@@ -1207,7 +1212,10 @@ fn order_and_group_by_parameters_are_constants() {
             "SELECT i FROM t ORDER BY 5+0",
         ),
         // A compound ORDER BY parameter matches a result item
-        // that is the same parameter (any core, rightmost first).
+        // that is the same parameter (any core, the leftmost
+        // first: the pin's resolveCompoundOrderBy resolves from
+        // the first SELECT rightwards; probed with real bindings
+        // on the 3.53.1 library).
         (
             "SELECT ?1 AS c UNION ALL SELECT 2 ORDER BY ?1",
             vec![B::Int(5)],
@@ -1233,13 +1241,121 @@ fn order_and_group_by_parameters_are_constants() {
             vec![B::Int(5)],
             "SELECT 5 UNION ALL SELECT 2 ORDER BY 1 COLLATE NOCASE",
         ),
+        // Regression: the leftmost core decides when the parameter
+        // sits in different columns of different cores (hipp took
+        // the rightmost).
         (
-            "VALUES (1, ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            "SELECT ?1, 2 UNION SELECT 3, ?1 ORDER BY ?1",
+            vec![B::Int(9)],
+            "SELECT 9, 2 UNION SELECT 3, 9 ORDER BY 1",
+        ),
+        (
+            "SELECT 5, ?1 UNION ALL SELECT ?1, 2 ORDER BY ?1 DESC",
+            vec![B::Int(0)],
+            "SELECT 5, 0 UNION ALL SELECT 0, 2 ORDER BY 2 DESC",
+        ),
+        (
+            "SELECT 5, 6 UNION ALL SELECT ?1, 2 UNION ALL SELECT 7, ?1 ORDER BY ?1",
             vec![B::Int(1)],
-            "VALUES (1, 1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 2",
+            "SELECT 5, 6 UNION ALL SELECT 1, 2 UNION ALL SELECT 7, 1 ORDER BY 1",
+        ),
+        (
+            "VALUES (0, ?1) UNION ALL SELECT ?1, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (0, 1) UNION ALL SELECT 1, 3 ORDER BY 2",
+        ),
+        // A multi-row VALUES is laid out as the pin's
+        // sqlite3MultiValues builds it. A row stays a core of its
+        // own (and matches) when the row after it holds a subquery,
+        // or when it has a subquery or a top-level CAST itself;
+        // rows that share a co-routine never match.
+        (
+            "VALUES (CAST(1 AS INT), ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (CAST(1 AS INT), 1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 2",
+        ),
+        (
+            "VALUES (CAST(1 AS INT) COLLATE NOCASE, ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (CAST(1 AS INT), 1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 2",
+        ),
+        (
+            "VALUES (1 + (SELECT 1), ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (2, 1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 2",
+        ),
+        (
+            "VALUES (1, 0), ((SELECT 2), ?1) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "SELECT 1, 0 UNION ALL SELECT 2, 1 UNION ALL SELECT 3, 3 ORDER BY 2",
+        ),
+        (
+            "VALUES (CAST(1 AS INT), 0), (2, ?1), ((SELECT 3), 4) UNION ALL SELECT 5, 5 ORDER BY ?1",
+            vec![B::Int(1)],
+            "SELECT 1, 0 UNION ALL SELECT 2, 1 UNION ALL SELECT 3, 4 UNION ALL SELECT 5, 5 ORDER BY 2",
+        ),
+        (
+            "VALUES (1, 0), (2, ?1), ((SELECT 3), 4), (5, ?1) UNION ALL SELECT 6, 6 ORDER BY ?1",
+            vec![B::Int(2)],
+            "SELECT 1, 0 UNION ALL SELECT 2, 2 UNION ALL SELECT 3, 4 UNION ALL SELECT 5, 2 \
+             UNION ALL SELECT 6, 6 ORDER BY 2",
+        ),
+        (
+            "VALUES (1, 0), ((SELECT 3), 4), (?1, 5) UNION ALL SELECT 7, 7 ORDER BY ?1",
+            vec![B::Int(2)],
+            "SELECT 1, 0 UNION ALL SELECT 3, 4 UNION ALL SELECT 2, 5 UNION ALL SELECT 7, 7 ORDER BY 1",
+        ),
+        (
+            "SELECT 1, 2 UNION ALL VALUES (?1, 0) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(0)],
+            "SELECT 1, 2 UNION ALL VALUES (0, 0) UNION ALL SELECT 3, 3 ORDER BY 1",
         ),
         // ... and nothing else does: these are the pin's "does not
         // match any column" errors.
+        // Regression: rows sharing a co-routine (hipp matched each
+        // row of a multi-row VALUES).
+        (
+            "VALUES (1, ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (1, 1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 'nomatch'",
+        ),
+        (
+            "VALUES (2, 0), (1, ?1) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (2, 0), (1, 1) UNION ALL SELECT 3, 3 ORDER BY 'nomatch'",
+        ),
+        (
+            "VALUES (+CAST(1 AS INT), ?1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (1, 1), (2, 0) UNION ALL SELECT 3, 3 ORDER BY 'nomatch'",
+        ),
+        (
+            "VALUES (1, 0), ('a' LIKE 'b', ?1) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (1, 0), (0, 1) UNION ALL SELECT 3, 3 ORDER BY 'nomatch'",
+        ),
+        (
+            "VALUES (CAST(1 AS INT), 0), (2, ?1), (3, 4) UNION ALL SELECT 5, 5 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (1, 0), (2, 1), (3, 4) UNION ALL SELECT 5, 5 ORDER BY 'nomatch'",
+        ),
+        (
+            "VALUES (1, 0), ((SELECT 3), 4), (?1, 5), (6, 6) UNION ALL SELECT 7, 7 ORDER BY ?1",
+            vec![B::Int(1)],
+            "VALUES (1, 0), (3, 4), (1, 5), (6, 6) UNION ALL SELECT 7, 7 ORDER BY 'nomatch'",
+        ),
+        // A multi-row VALUES right of an operator is a subquery.
+        (
+            "SELECT 1, 2 UNION ALL VALUES (?1, 0), (4, 4) UNION ALL SELECT 3, 3 ORDER BY ?1",
+            vec![B::Int(1)],
+            "SELECT 1, 2 UNION ALL VALUES (1, 0), (4, 4) UNION ALL SELECT 3, 3 ORDER BY 'nomatch'",
+        ),
+        (
+            "SELECT 1, 2 UNION ALL VALUES (CAST(4 AS INT), 4), (?1, 0) UNION ALL SELECT 3, 3 \
+             ORDER BY ?1",
+            vec![B::Int(1)],
+            "SELECT 1, 2 UNION ALL VALUES (4, 4), (1, 0) UNION ALL SELECT 3, 3 ORDER BY 'nomatch'",
+        ),
         (
             "SELECT :a UNION ALL SELECT 2 ORDER BY ?1",
             vec![B::Int(5)],
@@ -1326,6 +1442,39 @@ fn errors_and_deferred_value_errors() {
         // Name errors are not deferred.
         assert!(db.prepare("SELECT nope FROM nn WHERE a = ?").await.is_err());
         assert!(db.prepare("SELECT * FROM nope WHERE a = ?").await.is_err());
+        // Regression: only value errors are deferred; any other
+        // planning error is prepare's, as the pin's sqlite3_prepare
+        // reports it (CREATE TABLE ... AS SELECT onto an existing
+        // table used to fail only at step).
+        for (sql, want) in [
+            (
+                "CREATE TABLE nn AS SELECT ?",
+                hipp::SchemaKind::DuplicateTable,
+            ),
+            (
+                "SELECT ? UNION SELECT 1, 2",
+                hipp::SchemaKind::ColumnCountMismatch,
+            ),
+            (
+                "CREATE TABLE nn AS SELECT nope",
+                hipp::SchemaKind::DuplicateTable,
+            ),
+        ] {
+            let got = db.prepare(sql).await.err();
+            assert!(
+                matches!(got, Some(Error::Schema { kind }) if kind == want),
+                "{sql}: {got:?}"
+            );
+        }
+        // Under IF NOT EXISTS a taken name makes the statement a
+        // no-op before its SELECT is resolved (the pin's
+        // sqlite3StartTable; hipp used to refuse the SELECT).
+        let mut st = db
+            .prepare("CREATE TABLE IF NOT EXISTS nn AS SELECT nope, ?")
+            .await
+            .expect("a no-op");
+        assert_eq!(st.step().await.expect("no-op"), Step::Done);
+        drop(st);
         // Parameters in stored definitions are refused (probed:
         // the pin's views / CHECK / DEFAULT / generated errors).
         for sql in [
@@ -1483,6 +1632,11 @@ fn cast_and_remainder_follow_the_pin() {
             "SELECT typeof(CAST(?1 AS NUMERIC)), CAST(?1 AS NUMERIC)",
             "SELECT typeof(CAST(?1 AS REAL)), CAST(?1 AS REAL)",
             "SELECT typeof(?1 % 2), ?1 % 2, ?1 % 2.0, 7 % ?1, 7.5 % ?1",
+            // Regression: substr() and round() read their integer
+            // arguments as the pin's sqlite3_value_int64 does (the
+            // integer prefix: '1e1' is 1), not as a full number.
+            "SELECT substr('abcdefghijklmnopqrstuvwxyz', ?1), substr('abcdefghijkl', 2, ?1)",
+            "SELECT substr('abcdefghijkl', -2, ?1), round(1.23456789, ?1), round(?1), round(?1, 1)",
         ] {
             assert!(tw.case(sql, &v).is_none());
         }
@@ -1498,7 +1652,69 @@ fn cast_and_remainder_follow_the_pin() {
     for sql in [
         "SELECT 5.5 % 2, 5 % 2.0, -7.5 % 2, 7 % -2.5, 9e999 % 7, -9e999 % 7, 5 % 0.5, 5.0 % 0",
         "SELECT typeof(5 % 2.0), typeof(5 % 2), 'abc' % 2.0, -9223372036854775808 % -1.0",
+        // Regression: substr() coordinates saturate at the i64
+        // bounds (hipp's arithmetic overflowed and panicked).
+        "SELECT substr('abcdefghijkl', -2, 9223372036854775807), \
+         substr('abcdefghijkl', 2, -9223372036854775808), \
+         substr('abcdefghijkl', -9223372036854775808, 9223372036854775807), \
+         substr('abcdefghijkl', 9223372036854775807, -9223372036854775807), \
+         substr('abcdef', -1, -9223372036854775807)",
     ] {
         assert!(tw.case(sql, &[]).is_none());
+    }
+}
+
+/// Regression: round() clamps its digit count to 0..=30 (a huge
+/// count used to loop for as many iterations) and rounds the exact
+/// decimal expansion as the pin's `%!.*f` does (hipp scaled by a
+/// power of ten, which overflowed past 18 digits and misrounded
+/// values such as 2.675 at 2 places).
+#[cfg(feature = "v16")]
+#[test]
+fn round_follows_the_pin() {
+    let tw = twins("round", "CREATE TABLE z(a)");
+    for (x, n) in [
+        (B::Real(2.675), B::Int(2)),
+        (B::Real(1.5), B::Int(100)),
+        (B::Real(1.5), B::Int(1_000_000_000_000)),
+        (B::Real(1.5), B::Int(i64::MAX)),
+        (B::Real(1.23456), B::Int(4_294_967_298)),
+        (B::Real(1.23456), B::Int(-4_294_967_294)),
+        (B::Real(1e300), B::Int(2)),
+        (B::Real(5e-301), B::Int(300)),
+        (B::Real(0.1), B::Int(30)),
+        (B::Real(123.456), B::Int(20)),
+        (B::Real(-0.001), B::Int(2)),
+        (B::Real(-2.5), B::Int(0)),
+        (B::Real(4503599627370497.0), B::Int(0)),
+        (B::Real(0.49999999999999994), B::Int(0)),
+        (B::Int(7), B::Int(3)),
+        (B::Text("1e1".into()), B::Text("1e1".into())),
+        (B::Real(1.23456), B::Real(2.9)),
+        (B::Null, B::Int(1)),
+        (B::Real(1.0), B::Null),
+    ] {
+        assert!(tw.case("SELECT round(?1, ?2)", &[x.clone(), n]).is_none());
+        assert!(tw.case("SELECT round(?1)", &[x]).is_none());
+    }
+    // Random short decimals and random magnitudes at every count.
+    let mut rng = Rng(0x0dd5_eed5);
+    for _ in 0..300 {
+        let digits = (rng.next() % 7) as i32;
+        let mag = (rng.next() % 2_000_000) as f64 / 1000.0 - 1000.0;
+        let x = format!("{mag:.*}", digits as usize)
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        let n = (rng.next() % 32) as i64;
+        assert!(
+            tw.case("SELECT round(?1, ?2)", &[B::Real(x), B::Int(n)])
+                .is_none()
+        );
+        let scale = 10f64.powi((rng.next() % 30) as i32 - 15);
+        let y = (rng.next() % 1_000_000) as f64 / 7.0 * scale;
+        assert!(
+            tw.case("SELECT round(?1, ?2)", &[B::Real(y), B::Int(n)])
+                .is_none()
+        );
     }
 }

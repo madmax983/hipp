@@ -125,15 +125,22 @@ aspirations.
   profile — WHERE, SET, VALUES, LIMIT / OFFSET, subqueries,
   upsert, RETURNING, compound cores, derived tables, CREATE TABLE
   ... AS SELECT — and in ORDER BY / GROUP BY as a constant (not
-  an ordinal), matching a compound's identical result item as on
-  the pin; on top of the tiny profile, in INSERT VALUES and
+  an ordinal), matching a compound's identical result item
+  (leftmost core first, a multi-row VALUES laid out as the pin
+  lays it out) as on the pin; on top of the tiny profile, in INSERT VALUES and
   `WHERE rowid = ?`. Parameters in views, CHECK, DEFAULT and
   generated columns are refused, as on the pin. hipp-cli binds
   them like the oracle shell, from `.parameter set` (NULL
   otherwise). Found on the way and fixed ungated: `%` with a
   REAL operand is a REAL, CAST(text AS INTEGER) reads only the
   integer prefix, CAST(text AS NUMERIC) follows the pin's
-  2^51 rule, and hipp-cli prints `-0.0` as the pin does (`0.0`).
+  2^51 rule, substr() / round() read text integer arguments by
+  their integer prefix, round() clamps its digit count to 30 and
+  rounds the exact decimal expansion as the pin's printf does,
+  `CREATE TABLE IF NOT EXISTS t AS SELECT ...` over an existing
+  `t` is a no-op before its SELECT is resolved, and hipp-cli
+  prints `-0.0` as `0.0` and an exact half at the 16th digit
+  rounded up, as the pin does.
 
 ## What v0.13 does
 
