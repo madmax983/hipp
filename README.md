@@ -45,7 +45,8 @@ aspirations.
   silently run against `main`; scalar / EXISTS subqueries take
   the pin's `LIMIT (X<>0)` rewrite; an alias holding a
   subquery works inside nested subqueries (one holding an
-  aggregate is refused there).
+  aggregate names the alias's own query's aggregate there, as
+  on the pin).
 - **Column constraints and table definitions.** Ungated
   wherever the v0.4 evaluator is built (they used to be
   parsed and silently ignored): CHECK constraints on every
@@ -167,7 +168,23 @@ aspirations.
   `IN (SELECT a, b ...)`, CASE, multi-column scalar subqueries,
   `UPDATE ... SET (a, b) = (..)` / `= (SELECT ..)` (also in
   upsert), with the pin's errors for size mismatches and row
-  values anywhere else. The tiny profile did not grow.
+  values anywhere else. Review fixes: a written row-value IN
+  list converts both sides under the set's affinity (`(1, 1)
+  IN ((x, y), (a, b))` was 0); an enclosing query's aggregate
+  inside another aggregate's arguments is "misuse of
+  aggregate" (it returned a value); an enclosing query's
+  aggregate in an EXISTS subquery's result list is inert, as
+  on the pin (WHERE / ON / DELETE / UPDATE ran again); RETURNING
+  and `excluded` never own a subquery's aggregate; an aggregate
+  alias works inside HAVING / ORDER BY subqueries; a too-big hex
+  literal errors only where it is evaluated (a pin file with
+  one in a DEFAULT / CHECK is readable); a subquery used as an
+  expression takes its comparison affinity from its rightmost
+  core, as on the pin, and comparisons convert both operands
+  (`'1' IN (SELECT 1 UNION SELECT i FROM c)` was 0); `x IN
+  ((SELECT ...), 2)` parses; a bare reserved word is no alias
+  (`SELECT 1 NOT`, `SELECT 1 AS` are syntax errors). The tiny
+  profile did not grow.
 - **Scalar function library.** Behind `v16`: `printf()` /
   `format()` with the pin's whole conversion set (`%d %i %u %x
   %X %o %p %r %c %s %z %q %Q %w %j %J %f %e %E %g %G %% %n`, the

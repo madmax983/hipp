@@ -59,6 +59,15 @@ pub enum Tok {
     Shr,
     #[cfg(feature = "v16")]
     BitNot,
+    /// A hexadecimal literal of more than 16 significant digits
+    /// (v0.16 review fix, evaluator builds). The pin reports
+    /// "hex literal too big" only when it codes the expression,
+    /// not when it parses it, so a CREATE TABLE whose DEFAULT /
+    /// CHECK / generated expression holds one is accepted (and a
+    /// file with one stays readable); the parser keeps it as
+    /// `Expr::HexTooBig` and resolution refuses it.
+    #[cfg(feature = "v04")]
+    HexTooBig,
     Eof,
 }
 
@@ -668,7 +677,8 @@ fn big_rational_to_f64(p: &BigUint, q: &BigUint) -> f64 {
 ///   significant digits are read as a 64-bit two's-complement
 ///   value (`0xffffffffffffffff` is -1); more is the pin's
 ///   "hex literal too big" (v0.16 fix: hipp refused anything
-///   past `0x7fffffffffffffff`).
+///   past `0x7fffffffffffffff`), as a `Tok::HexTooBig` token
+///   that resolution reports.
 /// - Otherwise digits, an optional `.` fraction and an
 ///   optional exponent (`e` / `E`, optional sign, at least one
 ///   digit) — `1e` is not an exponent.
@@ -741,7 +751,7 @@ fn number_at<E>(z: &[u8], off: usize) -> core::result::Result<(Tok, usize), Erro
                 }
             }
             let tok = if hex {
-                hex_token::<E>(buf.as_slice(), off)?
+                hex_token(buf.as_slice())
             } else {
                 number_token::<E>(buf.as_slice(), off)?
             };
@@ -749,7 +759,7 @@ fn number_at<E>(z: &[u8], off: usize) -> core::result::Result<(Tok, usize), Erro
         }
     }
     let tok = if hex {
-        hex_token::<E>(text, off)?
+        hex_token(text)
     } else {
         number_token::<E>(text, off)?
     };
@@ -760,17 +770,18 @@ fn number_at<E>(z: &[u8], off: usize) -> core::result::Result<(Tok, usize), Erro
 /// pin's `sqlite3DecOrHexToI64` — leading zeros skipped, at most
 /// 16 significant digits, read as two's complement.
 #[cfg(feature = "v04")]
-fn hex_token<E>(text: &[u8], off: usize) -> core::result::Result<Tok, Error<E>> {
+fn hex_token(text: &[u8]) -> Tok {
     let mut v: u64 = 0;
     for &c in text.get(2..).unwrap_or(&[]) {
         // A 17th significant digit overflows: "hex literal too
-        // big" (leading zeros never do).
+        // big" (leading zeros never do), reported when the
+        // expression resolves.
         if v >> 60 != 0 {
-            return Err(perr(off, ParseKind::HexLiteralTooBig));
+            return Tok::HexTooBig;
         }
         v = (v << 4) | u64::from(hex_val(c).unwrap_or(0));
     }
-    Ok(Tok::Integer(v as i64))
+    Tok::Integer(v as i64)
 }
 
 /// An integer literal that overflowed i64 becomes a real (SQLite's

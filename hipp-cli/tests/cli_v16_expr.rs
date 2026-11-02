@@ -106,6 +106,10 @@ SELECT (SELECT max(t.a) + b FROM u), (SELECT avg(t.z) FROM u), (SELECT total(t.z
 SELECT a, (SELECT max(t.a) FROM u) FROM t GROUP BY a;
 SELECT a, (SELECT count(t.a) FROM u), count(*) FROM t;
 SELECT (SELECT count(*) FROM u WHERE b < max(t.a)) FROM t;
+SELECT a, z FROM t WHERE EXISTS (SELECT max(t.z) FROM u) ORDER BY a;
+SELECT a, EXISTS (SELECT max(t.z) FROM u WHERE b > 5.5) FROM t;
+SELECT a, total(z) AS s FROM t GROUP BY a HAVING (SELECT s) > 1.6 ORDER BY (SELECT s * 0.5);
+INSERT INTO t VALUES (7, 0.5) RETURNING (SELECT max(t.z) + count(*) FROM u);
 ";
 
 /// `v16`: bitwise operators, DISTINCT FROM, NOT NULL, row values.
@@ -122,6 +126,8 @@ SELECT a, (a, c) IN (SELECT a, c FROM r WHERE b NOT NULL) FROM r;
 UPDATE r SET (b, c) = (c, b) WHERE a = 1;
 UPDATE r SET (a, b) = (SELECT max(a) * 10, 0.125 FROM r) WHERE a = 2;
 SELECT a, b, c, a << 1, ~a FROM r ORDER BY a;
+CREATE TABLE s(x INT, y TEXT); INSERT INTO s VALUES (1, '2.5');
+SELECT (1, 2.5) IN ((x, y), (c, b)), (1, 2.5) IN ((c, b), (x, y)), (x, y) IN ((1, 2.5), (c, b)) FROM r, s;
 ";
 
 #[test]

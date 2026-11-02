@@ -1255,7 +1255,10 @@ paths):**
 - *ORDER BY aggregate:* an aggregate in ORDER BY alone no longer
   makes the query an aggregate one (`SELECT a FROM t ORDER BY
   max(a)` returned one row; the pin: "misuse of aggregate").
-  Nested aggregates (`sum(max(a))`) are refused at prepare.
+  An aggregate directly inside another's arguments is refused
+  when it resolves, whichever queries own the two
+  (`sum(max(a))`, and `(SELECT sum(c + max(t.a)) FROM u)` —
+  see the review fixes below).
 - *Qualified names fall through:* `t.a` where an inner source
   is aliased `t` but has no column `a` resolves in the enclosing
   scopes, as the pin's `lookupName` does (hipp: "no such
@@ -1280,12 +1283,14 @@ paths):**
   element and three-valued logic gives the pin's NULLs; BETWEEN
   and CASE (base and WHEN rows) build on it. `(a, b) IN ((..),
   (..))` and `IN (SELECT a, b ...)` evaluate natively
-  (`ScalarFn::Vector` in an `InList`): each element compares
-  under the affinity of the RIGHTMOST row's element — the pin
-  rewrites a row-value IN list as `IN (VALUES ...)`, whose
-  column affinity is its last row's (probed: `(c,b) IN
-  ((a,'q'),(2,'y'))` finds nothing where `((2,'y'),(a,'q'))`
-  finds row 2). A multi-column scalar subquery is a row value
+  (`ScalarFn::Vector` in an `InList`): the pin rewrites a
+  row-value IN list as `IN (VALUES ...)`, whose set takes each
+  column's comparison affinity from the left element and the
+  RIGHTMOST row's element (`exprINAffinity`) and applies it to
+  both sides — the probe and every row's stored values
+  (`adjust_set`; probed: `(c,b) IN ((a,'q'),(2,'y'))` finds
+  nothing where `((2,'y'),(a,'q'))` finds row 2, and `(1, 1)
+  IN ((x, y), (a, b))` with INTEGER x, y and TEXT a, b is 1). A multi-column scalar subquery is a row value
   (`SubPlan::scalar_col`: one plan copy per column; the hoist
   cache keys on (node, column)); row-major subquery values for
   row-value IN. `UPDATE ... SET (a, b) = (x, y)` / `= (SELECT
@@ -1361,19 +1366,136 @@ row values (resolution, IN evaluation, the per-column subquery
 parts, UPDATE SET rows), the bitwise operators, the evaluator's
 number lexer and the aggregate-scope walkers.
 
+**Review fixes (2026-11-02, all re-probed on the live pin;
+regression tests in `tests/expr_v16.rs`, CLI lines in
+`hipp-cli/tests/cli_v16_expr.rs`):**
+
+- *Row-value IN list affinity* (`v16`): the set affinity was
+  applied to the left operand only, so `(1, 1) IN ((x, y), (a,
+  b))` with INTEGER x, y and TEXT a, b was 0 (the pin: 1, its
+  VALUES set stores x, y as TEXT too). `adjust_set` now converts
+  both sides; a 300-expression generated corpus over every
+  affinity and literal kind guards it.
+- *Mixed-owner nested aggregates* (ungated): `(SELECT sum(c +
+  max(t.a)) FROM u)` (sum owned by u, max by t) passed prepare
+  and returned 25; the pin's resolver clears NC_AllowAgg while
+  it walks an aggregate's arguments, so any aggregate directly
+  inside another's is "misuse of aggregate function". The check
+  now runs as the aggregate resolves (`direct_agg`).
+- *EXISTS result lists* (ungated): an enclosing query's
+  aggregate in an EXISTS subquery's result list or ORDER BY was
+  counted as that query's, refusing `WHERE EXISTS (SELECT
+  max(t.a) FROM u)` (MisusedAggregate) and the same in ON /
+  DELETE / UPDATE (Unsupported). The pin never evaluates those
+  terms: such aggregates are now marked inert
+  (`RExpr::Agg::inert`, `mark_exists_inert`, for plans whose
+  compound operators are all UNION / UNION ALL — under INTERSECT
+  / EXCEPT the pin reports the misuse, and so does hipp), are no
+  misuse in any clause, do not make the EXISTS an aggregate
+  query (`EXISTS (SELECT max(t.a) FROM u WHERE c > 100)` is
+  false), evaluate as NULL, and still make the owner an
+  aggregate query from its result list (`SELECT EXISTS (SELECT
+  max(t.a) FROM u) FROM t` is one row — `has_result_agg`).
+- *RETURNING / excluded* (ungated): `RETURNING (SELECT
+  max(t.a))` and `DO UPDATE SET b = (SELECT max(excluded.b))`
+  were refused; the pin's owner search never stops at a
+  RETURNING row or the `excluded` row, so the subquery owns
+  the aggregate (`ScopeGroup::agg_owner`). `RETURNING max(t.a)`
+  and `(SELECT count(*) FROM u WHERE c > max(t.a))` stay errors.
+- *Aggregate aliases in subqueries* (`v16`, item (f)'s alias
+  case): `HAVING (SELECT s) > 0` / `ORDER BY (SELECT s)` over
+  `sum(a) AS s` were refused; the copied alias's aggregates now
+  have their owner level raised by the subquery depth (and are
+  marked `alias`, which the pin never re-checks, so they are no
+  misuse in the subquery's WHERE). A plan holding an aggregate
+  an enclosing query owns is now correlated
+  (`plan_has_foreign_agg`), else `(SELECT s)` over `count(*)`
+  was hoisted and gave one count for every group. In WHERE /
+  GROUP BY (`(SELECT s)` there), or nested (`(SELECT max(s))`),
+  it is the pin's misuse.
+- *Too-big hex literals* (evaluator builds): the lexer refused
+  them, so a pin-written file with `DEFAULT 0x10000000000000000`
+  could not be read at all, and CREATE TABLE refused them in a
+  DEFAULT or CHECK. The pin raises "hex literal too big" only
+  while coding the expression: the lexer now emits
+  `Tok::HexTooBig`, the parser keeps `Expr::HexTooBig`, and
+  resolution refuses it — so DEFAULT and CHECK texts are
+  accepted (CREATE TABLE leaves such a CHECK to the writes,
+  `rules::has_big_hex`) and only the INSERT / UPDATE that
+  evaluates them fails; a generated column with one is still
+  refused at CREATE, as on the pin.
+- *Subquery comparison affinity* (ungated, the same pattern
+  found elsewhere): a subquery used as an expression took its
+  affinity from the LEFTMOST compound core and VALUES rows and
+  nested scalar subqueries carried none; the pin reads the
+  RIGHTMOST core (`'1' IN (SELECT 1 UNION SELECT i FROM c)` and
+  `(SELECT 1 UNION SELECT i FROM c) = '1'` over INTEGER i were
+  0), a one-row VALUES's row, the `sqlite3MultiValues` rule for
+  longer VALUES (as `core_colls` already did for collations),
+  and a nested scalar subquery's own result
+  (`sub_col_affinity`, `item_result_affinity`). The pin's
+  comparison applies its affinity to BOTH operands (TEXT only
+  when either is a string), which matters once a compound's
+  value comes from a core of another affinity (`(SELECT 1 UNION
+  SELECT t FROM c) = 1` over TEXT t was 0) — `adjust_cmp` now
+  does; an IN over a subquery converts both sides
+  unconditionally, as the pin stores its set (`adjust_set`).
+- *`x IN ((SELECT ...), 2)`* (ungated parser): a list led by a
+  parenthesised scalar subquery was a syntax error; it is the
+  pin's list.
+- *Bare aliases* (ungated parser): a bare alias may no longer
+  be a reserved keyword and `AS` needs a name — `SELECT 1 NOT`,
+  `SELECT a NOT, a FROM t`, `SELECT 1 AS` returned values, the
+  pin gives syntax errors. A census of 70 keywords in four alias
+  positions agrees with the pin (except OFFSET, below).
+
+Review-fix gates: `cargo fmt --all` and the full
+`ci/local-gates.sh` end with "==> all gates passed";
+`tests/expr_v16.rs` has 35 tests (12 new: the regressions
+above, with generated corpora of 300 row-value IN lists, 120
+compound / VALUES sets and 600 comparisons over every affinity),
+and
+`tests/query_shape_v16.rs`'s alias-aggregate test now compares
+with the pin instead of expecting a refusal. Size: tiny
+**75,960 B** (Δ **0**); full **315,255 B** (Δ **+3,204 B** vs
+the 312,051 B ratchet the scalar-function unit left; ratchet
+raised): the inert / alias aggregate flags and walkers, the
+owner-scope flag, `HexTooBig` plumbing, the set / comparison
+affinity rules and the rightmost-core affinity.
+
 **Honest gaps:**
 
+- The pin folds constants before coding, so `SELECT 1 WHERE 0
+  AND 0x10000000000000000` runs there; hipp refuses every
+  too-big hex literal it resolves. CREATE VIEW with one is
+  refused (hipp plans a view's SELECT for its width; the pin
+  stores it), and ALTER TABLE ADD COLUMN ... DEFAULT with one on
+  a non-empty table is refused (the pin stores the literal's
+  text as the value). A CHECK holding a too-big hex literal is
+  not resolved at CREATE at all, so its unknown columns are
+  reported only by the first write (the pin: at CREATE).
+- `OFFSET` is still refused as a bare alias (the pin's keyword
+  fallback allows it; pre-existing).
+- A multi-row VALUES whose co-routine starts after a
+  non-constant row (the pin's `sqlite3MultiValues` switching
+  form mid-list) takes the last row's affinity in hipp; the
+  probed shapes (all constant, or any non-constant row) agree.
+  `typeof((SELECT t FROM c UNION SELECT 1 LIMIT 1))` over TEXT t
+  holding '1' is `text` on the pin, `integer` on hipp (a scalar
+  subquery's UNION row order; derived tables agree) — so
+  comparisons against such a subquery can differ.
 - A column named `true` / `false` does not shadow the keyword
   (pre-existing for every TRUE / FALSE; now also for `x IS
   TRUE`, which the pin then reads as `x IS <column>`).
 - An enclosing query's aggregate whose arguments hold a
   subquery is refused (`Unsupported`); the pin folds it. An
-  aggregate of an enclosing query nested inside another query's
-  aggregate arguments (`(SELECT sum((SELECT max(t.a) FROM e))
-  FROM u)`) is refused at execution rather than at prepare.
+  aggregate of an enclosing query inside a subquery that is
+  itself another query's aggregate argument (`(SELECT
+  sum((SELECT max(t.a) FROM e)) FROM u)`) is refused with
+  `Unsupported` (the pin: misuse) — error vs error.
 - The written row-value IN list takes each element's collation
-  from the rightmost row as for affinity; collations on other
-  rows were probed only in the cases tested.
+  from the rightmost row; collations on other rows were probed
+  only in the cases tested.
 - A multi-column scalar subquery used as a row value runs once
   per element it supplies (correlated ones per row and element);
   results are the same, the cost is not the pin's.

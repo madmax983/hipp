@@ -187,6 +187,16 @@ pub enum Expr {
         args: AVec<Expr>,
     },
     Cast(Box<Expr>, ABytes),
+    /// A hexadecimal literal too big for 64 bits (more than 16
+    /// significant digits, or `-` over `0x8000000000000000`) at
+    /// this byte offset (v0.16 review fix, evaluator builds):
+    /// parsed, and refused with `ParseKind::HexLiteralTooBig`
+    /// when it resolves — the pin's "hex literal too big"
+    /// comes from code generation, so a CREATE TABLE holding one
+    /// in a DEFAULT / CHECK / generated column is accepted and
+    /// only the statement that evaluates it fails.
+    #[cfg(feature = "v04")]
+    HexTooBig(usize),
     /// `expr COLLATE name` (v0.16, `v16`): the operand with an
     /// explicit collating sequence, which wins every comparison
     /// it takes part in (the pin's `EP_Collate` rules).

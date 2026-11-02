@@ -1471,16 +1471,25 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(b"AS") {
             return match self.cur().tok {
-                Tok::Ident(h, _) => {
+                Tok::Ident(h, quoted) if quoted || !self.reserved(self.pos, true) => {
                     self.pos += 1;
                     Some(h)
                 }
-                _ => None,
+                // `AS` with no name after it is the pin's syntax
+                // error: leave it for the caller to refuse (v0.16
+                // review fix; `SELECT 1 AS` returned 1).
+                _ => {
+                    self.pos = self.pos.saturating_sub(1);
+                    None
+                }
             };
         }
         match self.cur().tok {
+            // A bare alias is the pin's `ids`: never a reserved
+            // keyword (v0.16 review fix: `SELECT 1 NOT` read NOT
+            // as an alias where the pin gives a syntax error).
             Tok::Ident(h, quoted) => {
-                if quoted || !self.at_clause_kw() {
+                if quoted || !(self.at_clause_kw() || self.reserved(self.pos, false)) {
                     self.pos += 1;
                     Some(h)
                 } else {
@@ -1750,10 +1759,19 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "v06")]
             {
                 let stmt = self.select_rich::<E>()?;
-                for _ in 0..=extra_parens {
+                for _ in 0..extra_parens {
                     self.expect::<E>(Tok::RParen)?;
                 }
-                return Ok(Expr::InSubquery(Box::new(l), Box::new(stmt), neg));
+                if self.eat(Tok::RParen) {
+                    return Ok(Expr::InSubquery(Box::new(l), Box::new(stmt), neg));
+                }
+                // `IN ((SELECT ...), 2)` / `IN ((SELECT ...) + 1)`:
+                // a list whose first item is a scalar subquery
+                // (v0.16 review fix: a syntax error on hipp).
+                if extra_parens == 0 {
+                    return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+                }
+                self.pos = save;
             }
             #[cfg(not(feature = "v06"))]
             {
@@ -1837,7 +1855,7 @@ impl<'a> Parser<'a> {
                 return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
             }
             if only(&|k| self.hex_min(k)) && toks.iter().any(|t| matches!(t.tok, Tok::Integer(_))) {
-                return Err(perr(self.cur().offset, ParseKind::HexLiteralTooBig));
+                return Ok(Expr::HexTooBig(self.cur().offset));
             }
             return Ok(Expr::Neg(Box::new(e)));
         }
@@ -1854,6 +1872,12 @@ impl<'a> Parser<'a> {
     }
 
     fn expr_primary<E>(&mut self) -> Result<Expr, E> {
+        #[cfg(feature = "v04")]
+        if matches!(self.cur().tok, Tok::HexTooBig) {
+            let off = self.cur().offset;
+            self.pos += 1;
+            return Ok(Expr::HexTooBig(off));
+        }
         #[cfg(feature = "v06")]
         if self.cur_is_kw(b"EXISTS") {
             self.pos += 1;
@@ -2646,6 +2670,8 @@ impl<'a> Parser<'a> {
             j < to
                 && match toks[j].tok {
                     Tok::Integer(_) | Tok::Real(_) | Tok::Text(_) | Tok::Blob(_) => true,
+                    #[cfg(feature = "v04")]
+                    Tok::HexTooBig => true,
                     Tok::Ident(h, false) => {
                         let b = handle_bytes(self.arena, h);
                         eq_ci(b, b"NULL") || is_ctime_kw(b)

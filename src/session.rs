@@ -984,12 +984,24 @@ impl<S: Storage> Connection<S> {
                 // time (DEFAULT / PK on a generated column, a
                 // non-constant DEFAULT, a generated-column loop,
                 // an unresolvable CHECK, a STRICT column type).
+                // A too-big hex literal in a CHECK is the pin's
+                // error only once a statement codes the check
+                // (v0.16 review fix): the INSERT / UPDATE that
+                // plans the rules reports it, so such a CHECK is
+                // left out here. (One in a generated column the
+                // pin refuses at once.)
+                let mut kept = AVec::new();
+                for h in checks.iter() {
+                    if !crate::rules::has_big_hex::<S::Error>(handle_bytes(arena, *h), arena)? {
+                        kept.push(*h);
+                    }
+                }
                 crate::rules::validate_def::<S::Error>(
                     arena,
                     handle_bytes(arena, *name),
                     columns.as_slice(),
                     pk_columns.as_slice(),
-                    checks.as_slice(),
+                    kept.as_slice(),
                     strict,
                 )?;
                 Ok(Plan::CreateTable)
@@ -2262,7 +2274,8 @@ impl<S: Storage> Connection<S> {
     ) -> Result<AVec<RExpr>, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
         let (sources, offsets) = self.single_source(t, qualifier);
-        let cur = crate::query::ScopeGroup::new(sources, offsets, 0);
+        let mut cur = crate::query::ScopeGroup::new(sources, offsets, 0);
+        cur.agg_owner = false;
         let mut planner = self.sub_planner(arena);
         let mut out = AVec::new();
         for it in items.iter() {
@@ -2406,7 +2419,9 @@ impl<S: Storage> Connection<S> {
                 ex_sources.push(ex);
                 let mut ex_offsets = AVec::new();
                 ex_offsets.push(t.columns.len());
-                let enclosing = [ScopeGroup::new(ex_sources, ex_offsets, 1)];
+                let mut ex_group = ScopeGroup::new(ex_sources, ex_offsets, 1);
+                ex_group.agg_owner = false;
+                let enclosing = [ex_group];
                 let mut planner = self.sub_planner(arena);
                 let mut sets = AVec::new();
                 for (colname, e) in assignments.iter() {
@@ -2965,7 +2980,10 @@ impl<S: Storage> Connection<S> {
         // The pin's "HAVING clause on a non-aggregate query":
         // HAVING needs a GROUP BY or an aggregate in the result
         // list (aggregates elsewhere do not count).
-        if stmt.having.is_some() && stmt.group_by.is_empty() && !items.iter().any(has_agg) {
+        if stmt.having.is_some()
+            && stmt.group_by.is_empty()
+            && !items.iter().any(crate::query::has_result_agg)
+        {
             return Err(Error::Schema {
                 kind: SchemaKind::HavingWithoutAggregate,
             });
@@ -2997,7 +3015,8 @@ impl<S: Storage> Connection<S> {
                 // None of this query's aggregates, and none of an
                 // enclosing query's unless this query aggregates
                 // (v0.16: the pin's "misuse of aggregate").
-                let aggregates = !stmt.group_by.is_empty() || items.iter().any(has_agg);
+                let aggregates =
+                    !stmt.group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
                 if crate::query::where_agg(&r, aggregates) {
                     return Err(Error::Schema {
                         kind: SchemaKind::MisusedAggregate,
@@ -3084,7 +3103,10 @@ impl<S: Storage> Connection<S> {
         // aggregate in ORDER BY alone is the pin's "misuse of
         // aggregate" — hipp aggregated the query to one row).
         // HAVING needs one of them already (checked above).
-        let has_agg = !group_by.is_empty() || items.iter().any(has_agg);
+        // (An EXISTS's inert aggregate counts here: the pin
+        // aggregates `SELECT EXISTS(SELECT max(t.a) FROM u) FROM
+        // t` to one row.)
+        let has_agg = !group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
         if !has_agg && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
             return Err(Error::Schema {
                 kind: SchemaKind::MisusedAggregate,

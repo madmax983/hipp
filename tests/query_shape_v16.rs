@@ -1174,29 +1174,24 @@ fn generated_alias_nesting_corpus() {
 
 /// An aliased aggregate referenced inside a subquery belongs
 /// to the outer query on the pin; hipp re-aggregated the
-/// subquery's rows (silent wrong answers). It now refuses.
+/// subquery's rows (silent wrong answers), then refused. Since
+/// the v0.16 aggregate-scoping review fix the owner folds it per
+/// group and substitutes the value, as on the pin.
 #[cfg(feature = "v16")]
 #[test]
-fn aggregate_alias_inside_a_subquery_is_refused() {
+fn aggregate_alias_inside_a_subquery_matches_the_pin() {
     let tw = twins(
         "alias-agg",
         "CREATE TABLE t(a); INSERT INTO t VALUES(1),(1),(2),(3),(3),(3);
          CREATE TABLE u(b); INSERT INTO u VALUES(1),(2)",
     );
-    for sql in [
+    tw.all(&[
         "SELECT a, count(*) AS c FROM t GROUP BY a HAVING (SELECT c) > 1",
         "SELECT a, count(*) AS c FROM t GROUP BY a HAVING (SELECT c FROM u LIMIT 1) > 1",
-        "SELECT a, count(*) AS c FROM t GROUP BY a ORDER BY (SELECT c) DESC",
+        "SELECT a, count(*) AS c FROM t GROUP BY a ORDER BY (SELECT c) DESC, a",
         "SELECT a, count(*) AS c FROM t GROUP BY a HAVING EXISTS (SELECT 1 FROM u WHERE u.b = c)",
         "SELECT a, count(*) + 1 AS c FROM t GROUP BY a HAVING 3 IN (SELECT c + b FROM u)",
-    ] {
-        assert!(
-            matches!(hipp_only(&tw, sql), Err(Error::Unsupported)),
-            "{sql}"
-        );
-        // The pin runs it (its answer is not reproduced).
-        assert!(oracle_raw(&tw.oracle, sql).0, "{sql}");
-    }
+    ]);
     // In WHERE both refuse; at the alias's own level it works.
     assert!(
         tw.same("SELECT count(*) AS c FROM t WHERE (SELECT c) > 0")

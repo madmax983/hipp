@@ -640,6 +640,7 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
     }
     match e {
         Expr::Literal(_)
+        | Expr::HexTooBig(_)
         | Expr::Column { .. }
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_) => false,
@@ -667,6 +668,14 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         }
         Expr::Func { args, .. } => args.iter().any(|x| expr_any(x, f)),
     }
+}
+
+/// Whether a stored rule text holds a too-big hex literal
+/// (`Expr::HexTooBig`, v0.16 review fix): CREATE TABLE leaves
+/// such a CHECK to the statements that evaluate it.
+pub fn has_big_hex<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
+    let e = parse_rule::<E>(text, arena)?;
+    Ok(expr_any(&e, &mut |x| matches!(x, Expr::HexTooBig(_))))
 }
 
 /// The wall-clock keyword names, the pseudo-columns a DEFAULT

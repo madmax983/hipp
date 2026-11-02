@@ -932,3 +932,540 @@ fn generated_aggregate_scope_corpus() {
         }
     }
 }
+
+// ---------------- review fixes ----------------
+
+/// A written row-value IN list applies the set's comparison
+/// affinity (left operand + rightmost row) to both sides, the
+/// rows' values included, as the pin's VALUES rewrite stores
+/// them (regression: only the left operand was converted, so
+/// `(1, 1) IN ((x, y), (a, b))` with INTEGER x, y and TEXT a, b
+/// was 0 on hipp, 1 on the pin).
+#[cfg(feature = "v16")]
+#[test]
+fn row_value_in_list_affinity_applies_to_both_sides() {
+    let tw = twins(
+        "rowinaff",
+        "CREATE TABLE t(a TEXT, b TEXT); INSERT INTO t VALUES ('z','z');
+         CREATE TABLE s(x INT, y INT); INSERT INTO s VALUES (1,1)",
+    );
+    tw.all(&[
+        "SELECT (1, 1) IN ((x, y), (a, b)), (1, 1) IN ((x, y)), (1, 1) IN ((a, b), (x, y)) FROM t, s",
+        "SELECT ('1', '1') IN ((x, y), (a, b)), ('1', 1) IN ((a, b), (x, y)) FROM t, s",
+        "SELECT (1, 1) IN ((a, b), (x, y), (a, b)), (x, y) IN (('1', '1'), (a, b)) FROM t, s",
+        "SELECT (a, b) IN ((x, y), ('z', 'z')), (x, 1) IN (('1', 1), (a, y)) FROM t, s",
+    ]);
+}
+
+/// Generated tables with every affinity, written row-value IN
+/// lists of mixed column and literal rows.
+#[cfg(feature = "v16")]
+#[test]
+fn generated_row_value_in_list_affinity_corpus() {
+    let mut rng = Rng(0x0016_1a1f_5e75_0b07);
+    let vals = [
+        "1", "'1'", "1.0", "'1.0'", "'a'", "NULL", "x'31'", "2", "' 1'",
+    ];
+    let mut setup =
+        String::from("CREATE TABLE c(i INTEGER, t TEXT, r REAL, n NUMERIC, b BLOB, e);");
+    for _ in 0..4 {
+        let row: Vec<&str> = (0..6).map(|_| rng.pick(&vals)).collect();
+        setup.push_str(&format!("INSERT INTO c VALUES ({});", row.join(", ")));
+    }
+    let tw = twins("rowinaffgen", &setup);
+    let terms = [
+        "i", "t", "r", "n", "b", "e", "1", "'1'", "1.0", "'a'", "NULL", "x'31'", "+i", "t || ''",
+    ];
+    let mut exprs = Vec::new();
+    for _ in 0..300 {
+        let lhs = format!("({}, {})", rng.pick(&terms), rng.pick(&terms));
+        let rows: Vec<String> = (0..1 + rng.below(3))
+            .map(|_| format!("({}, {})", rng.pick(&terms), rng.pick(&terms)))
+            .collect();
+        let not = if rng.below(4) == 0 { "NOT " } else { "" };
+        exprs.push(format!("{lhs} {not}IN ({})", rows.join(", ")));
+    }
+    for chunk in exprs.chunks(10) {
+        tw.same(&format!("SELECT {} FROM c", chunk.join(", ")));
+    }
+}
+
+/// An aggregate directly inside another's arguments is misuse
+/// whichever queries own them (regression: `(SELECT sum(c +
+/// max(t.a)) FROM u)` returned a value; the pin refuses it at
+/// prepare).
+#[test]
+fn outer_aggregate_inside_an_inner_aggregate_is_misuse() {
+    let tw = twins(
+        "aggnest",
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES (1,2),(3,4);
+         CREATE TABLE u(c); INSERT INTO u VALUES (9),(10)",
+    );
+    for sql in [
+        "SELECT (SELECT sum(c + max(t.a)) FROM u) FROM t",
+        "SELECT (SELECT sum(c * max(t.a)) FROM u) FROM t",
+        "SELECT (SELECT total(c) + sum(c + min(t.b)) FROM u) FROM t",
+        "SELECT a, (SELECT sum(c + max(t.a)) FROM u) FROM t GROUP BY a",
+        "SELECT (SELECT count(max(t.a)) FROM u) FROM t",
+        "SELECT (SELECT max(max(t.a)) FROM u) FROM t",
+        "SELECT a FROM t WHERE EXISTS (SELECT sum(c + max(t.a)) FROM u)",
+        "SELECT sum(max(a)) FROM t",
+    ] {
+        tw.refuse(sql, SchemaKind::MisusedAggregate);
+    }
+    tw.refuse_any("SELECT (SELECT sum((SELECT max(t.a))) FROM u) FROM t");
+    tw.all(&[
+        "SELECT (SELECT max(c) + max(t.a) FROM u) FROM t",
+        "SELECT (SELECT sum(c) FROM u) + max(a) FROM t",
+    ]);
+}
+
+/// The pin never evaluates an EXISTS subquery's result list or
+/// ORDER BY (UNION / UNION ALL compounds included), so an
+/// enclosing query's aggregate there is no misuse in WHERE / ON
+/// / DELETE / UPDATE, and the EXISTS is not an aggregate query
+/// (regression: hipp refused all of these; the base commit ran
+/// them).
+#[test]
+fn exists_result_list_aggregates_are_inert() {
+    let setup = "CREATE TABLE t(a, b); INSERT INTO t VALUES (1,2),(3,4);
+         CREATE TABLE u(c); INSERT INTO u VALUES (9),(10); CREATE TABLE e(c)";
+    let tw = twins("aggexists", setup);
+    tw.all(&[
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u)",
+        "SELECT a FROM t WHERE NOT EXISTS (SELECT max(t.a) FROM u)",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u WHERE c > 9)",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u WHERE c > 100)",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM e)",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u GROUP BY c)",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) + 1 FROM u)",
+        "SELECT a FROM t WHERE EXISTS (SELECT (SELECT max(t.a)) FROM u)",
+        "SELECT a FROM t WHERE EXISTS (SELECT c FROM u ORDER BY max(t.a)) AND a > 1",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u) OR a > 5",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u LIMIT 0)",
+        "SELECT a FROM t WHERE EXISTS (SELECT count(*), max(t.a) FROM u WHERE c > 100)",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u UNION SELECT 5)",
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM e UNION ALL SELECT 5 FROM e)",
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE EXISTS (SELECT max(t.a) FROM u))",
+        "SELECT sum(a) FROM t WHERE EXISTS (SELECT max(t.a) FROM u)",
+        "SELECT count(*) FROM t WHERE EXISTS (SELECT max(t.a) FROM u WHERE c > 100)",
+        "SELECT a FROM t ORDER BY EXISTS (SELECT max(t.a) FROM u), a",
+        "SELECT a FROM t GROUP BY a HAVING EXISTS (SELECT max(t.a) FROM u WHERE c > 100)",
+        "SELECT a FROM t GROUP BY a HAVING EXISTS (SELECT max(t.a) FROM u)",
+        "SELECT t.a FROM t JOIN u ON EXISTS (SELECT max(t.a) FROM e)",
+        "SELECT t.a FROM t JOIN u ON EXISTS (SELECT max(t.a) FROM u) ORDER BY 1",
+        "SELECT t.a FROM t LEFT JOIN u ON EXISTS (SELECT max(t.a) FROM e)",
+        // In the result list it still makes t an aggregate query.
+        "SELECT EXISTS (SELECT max(t.a) FROM u) FROM t",
+        "SELECT a, EXISTS (SELECT max(t.a) FROM u) FROM t",
+        "SELECT EXISTS (SELECT max(t.a) FROM u WHERE c > 100) FROM t",
+        "SELECT a, EXISTS (SELECT max(t.a) FROM u INTERSECT SELECT 3) FROM t",
+    ]);
+    // Under INTERSECT / EXCEPT the values count: misuse.
+    for sql in [
+        "SELECT a FROM t WHERE EXISTS (SELECT max(t.a) FROM u EXCEPT SELECT 1)",
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 INTERSECT SELECT max(t.a) FROM u)",
+        "SELECT a FROM t WHERE EXISTS (SELECT c FROM u WHERE c > max(t.a))",
+        "SELECT a FROM t WHERE EXISTS (SELECT c FROM u GROUP BY c HAVING max(t.a) > 0)",
+    ] {
+        tw.refuse_any(sql);
+    }
+    tw.same("UPDATE t SET b = 7 WHERE EXISTS (SELECT max(t.a) FROM u)");
+    tw.same("UPDATE t SET b = EXISTS (SELECT max(t.a) FROM e) WHERE a = 1");
+    tw.same("DELETE FROM t WHERE EXISTS (SELECT max(t.a) FROM e)");
+    tw.finish("SELECT * FROM t ORDER BY a;");
+    tw.same("DELETE FROM t WHERE EXISTS (SELECT max(t.a) FROM u)");
+    tw.finish("SELECT count(*) FROM t;");
+}
+
+/// Aggregates in a RETURNING list's subqueries, and over an
+/// upsert's `excluded` row, belong to the subquery: the pin's
+/// owner search never stops at those rows (regression: hipp
+/// refused them; the base commit ran them).
+#[cfg(feature = "v07")]
+#[test]
+fn returning_and_excluded_never_own_an_aggregate() {
+    let setup = "CREATE TABLE t(a, b); INSERT INTO t VALUES (1,10);
+         CREATE TABLE u(c); INSERT INTO u VALUES (9),(10); CREATE TABLE e(c);
+         CREATE UNIQUE INDEX ta ON t(a)";
+    let tw = twins("aggret", setup);
+    tw.all(&[
+        "INSERT INTO t VALUES (9,9) RETURNING (SELECT max(t.a))",
+        "INSERT INTO t VALUES (8,8) RETURNING (SELECT max(t.a) FROM u)",
+        "INSERT INTO t VALUES (7,7) RETURNING (SELECT max(t.a) FROM e)",
+        "INSERT INTO t VALUES (6,6) RETURNING (SELECT max(t.a) + count(*) FROM u)",
+        "INSERT INTO t VALUES (5,5) RETURNING (SELECT (SELECT max(t.a) + max(c)) FROM u)",
+        "INSERT INTO t VALUES (4,4) RETURNING (SELECT max(c) FROM u WHERE c > (SELECT max(t.a)))",
+        "INSERT INTO t VALUES (3,3) RETURNING EXISTS (SELECT max(t.a) FROM e)",
+        "UPDATE t SET b = 0 WHERE a < 3 RETURNING (SELECT max(t.a))",
+        "DELETE FROM t WHERE a = 9 RETURNING (SELECT max(t.a) FROM u)",
+        "INSERT INTO t VALUES (1,5) ON CONFLICT(a) DO UPDATE SET b = (SELECT max(excluded.b)) RETURNING b",
+        "INSERT INTO t VALUES (1,6) ON CONFLICT(a) DO UPDATE SET b = (SELECT max(excluded.b) + count(*) FROM u) RETURNING b",
+        "INSERT INTO t VALUES (1,7) ON CONFLICT(a) DO UPDATE SET b = 3 WHERE (SELECT max(excluded.a) FROM u) = 1 RETURNING b",
+    ]);
+    for sql in [
+        "INSERT INTO t VALUES (20,20) RETURNING max(t.a)",
+        "INSERT INTO t VALUES (21,21) RETURNING (SELECT count(*) FROM u WHERE c > max(t.a))",
+        "INSERT INTO t VALUES (1,5) ON CONFLICT(a) DO UPDATE SET b = (SELECT max(t.b) + count(*) FROM u)",
+    ] {
+        tw.refuse_any(sql);
+    }
+    tw.finish("SELECT * FROM t ORDER BY a;");
+}
+
+/// A result-column alias naming an aggregate, used inside a
+/// HAVING / ORDER BY subquery, is the alias's own query's
+/// aggregate, folded per group (regression: refused; earlier
+/// still, re-aggregated over the subquery's rows).
+#[cfg(feature = "v16")]
+#[test]
+fn aggregate_alias_in_having_and_order_by_subqueries() {
+    let tw = twins(
+        "aggalias2",
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES (1,10),(5,50),(3,30),(5,7)",
+    );
+    tw.all(&[
+        "SELECT sum(a) AS s FROM t HAVING (SELECT s) > 0",
+        "SELECT b, sum(a) AS s FROM t GROUP BY a HAVING (SELECT s) > 3 ORDER BY 1",
+        "SELECT a, sum(b) AS s FROM t GROUP BY a HAVING (SELECT s + 1 FROM t WHERE b > 20) > 10",
+        "SELECT a, sum(b) AS s FROM t GROUP BY a HAVING EXISTS (SELECT 1 FROM t AS x WHERE x.b = s)",
+        "SELECT a, sum(b) AS s FROM t GROUP BY a ORDER BY (SELECT s) DESC",
+        "SELECT a, sum(b) AS s FROM t GROUP BY a HAVING (SELECT sum(x.b) FROM t x WHERE x.b < s) > 5",
+        "SELECT a, count(*) AS s FROM t GROUP BY a HAVING (SELECT (SELECT s)) > 1",
+        "SELECT a, count(*) AS s FROM t GROUP BY a HAVING (SELECT s FROM t x) > 1",
+        "SELECT a, max(b) AS s, b FROM t GROUP BY a HAVING (SELECT s) > 10",
+        "SELECT a, max(b) AS s, b FROM t GROUP BY a ORDER BY (SELECT s)",
+        "SELECT a, sum(b) + a AS s FROM t GROUP BY a HAVING (SELECT s) > 11",
+        "SELECT a, sum(b) AS s FROM t GROUP BY a HAVING a IN (SELECT s - 9 FROM t)",
+        "SELECT a, sum(b) AS s FROM t GROUP BY a HAVING (SELECT s WHERE s > 20) IS NOT NULL",
+        "SELECT a, total(b) AS s FROM t GROUP BY a HAVING (SELECT s) BETWEEN 10 AND 40",
+        "SELECT a, group_concat(b) AS g FROM t GROUP BY a HAVING (SELECT length(g)) > 2",
+        "SELECT count(*) FROM (SELECT a, sum(b) AS s FROM t GROUP BY a HAVING (SELECT s) > 20)",
+        "SELECT a AS s FROM t WHERE (SELECT s) > 2",
+    ]);
+    for sql in [
+        "SELECT sum(a) AS s FROM t WHERE (SELECT s) > 0",
+        "SELECT sum(a) AS s FROM t GROUP BY (SELECT s)",
+        "SELECT a, sum(b) AS s FROM t GROUP BY a HAVING (SELECT max(s))",
+    ] {
+        tw.refuse_any(sql);
+    }
+}
+
+/// A hex literal too big for 64 bits is the pin's error only
+/// where a statement evaluates it: CREATE TABLE accepts one in
+/// a DEFAULT or a CHECK, the file stays readable, and the INSERT
+/// that needs the default / check fails (regression: the schema
+/// parse refused it, so hipp could read nothing in such a file).
+#[test]
+fn too_big_hex_literal_waits_for_evaluation() {
+    let path = common::temp_db("v16ex-bighex-pin");
+    common::cli(
+        &path,
+        "CREATE TABLE t1(x); INSERT INTO t1 VALUES (1);
+         CREATE TABLE t2(a DEFAULT 0x10000000000000000, b);
+         CREATE TABLE t3(a CHECK (a <> 0x10000000000000000));
+         CREATE TABLE t4(a DEFAULT -0x8000000000000000, b);",
+    );
+    block_on(async {
+        let mut db = open(&path).await;
+        assert_eq!(
+            try_collect(&mut db, "SELECT * FROM t1").await.unwrap(),
+            ["1"]
+        );
+        assert!(
+            try_collect(&mut db, "SELECT * FROM t2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            try_collect(&mut db, "INSERT INTO t2(b) VALUES (1)").await,
+            Err(Error::Parse { .. })
+        ));
+        assert!(matches!(
+            try_collect(&mut db, "INSERT INTO t3 VALUES (1)").await,
+            Err(Error::Parse { .. })
+        ));
+        exec(&mut db, "INSERT INTO t2 VALUES (1, 2)").await;
+        exec(&mut db, "INSERT INTO t4 VALUES (3, 4)").await;
+    });
+    // (The pin's integrity_check codes t3's CHECK, so it reports
+    // the literal too; the rows read back.)
+    assert_eq!(oracle_raw(&path, "SELECT * FROM t2, t4;").1, ["1|2|3|4"]);
+
+    let tw = twins("bighex", "");
+    tw.all(&[
+        "CREATE TABLE d1(a DEFAULT 0x10000000000000000, b)",
+        "CREATE TABLE d2(a DEFAULT (-0x8000000000000000), b)",
+        "CREATE TABLE d3(a DEFAULT (0x10000000000000000 + 1), b)",
+        "CREATE TABLE c1(a CHECK (a <> 0x10000000000000000))",
+        "INSERT INTO d1 VALUES (1, 2)",
+        "INSERT INTO d2 VALUES (1, 2)",
+        "SELECT * FROM d1, d2, c1",
+    ]);
+    for sql in [
+        "INSERT INTO d1(b) VALUES (1)",
+        "INSERT INTO d2(b) VALUES (1)",
+        "INSERT INTO d3(b) VALUES (1)",
+        "INSERT INTO c1 VALUES (1)",
+        "CREATE TABLE g1(a, b AS (0x10000000000000000))",
+        "SELECT 0x10000000000000000 FROM d1 WHERE 0",
+        "SELECT CASE WHEN 0 THEN 0x10000000000000000 END",
+        "INSERT INTO d1 VALUES (0x10000000000000000, 1)",
+        "UPDATE d1 SET a = -0x8000000000000000",
+    ] {
+        tw.refuse_any(sql);
+    }
+    // (The pin's integrity_check codes CHECKs, c1's literal too.)
+    tw.same("DROP TABLE c1");
+    tw.finish("SELECT * FROM d1, d2;");
+}
+
+/// A bare alias is never a reserved keyword, and `AS` needs a
+/// name (regression: `SELECT 1 NOT` and `SELECT 1 AS` returned
+/// 1; the pin gives a syntax error).
+#[test]
+fn reserved_words_are_no_bare_alias() {
+    let tw = twins("alias-kw", "CREATE TABLE t(a); INSERT INTO t VALUES (1)");
+    for sql in [
+        "SELECT 1 NOT",
+        "SELECT a NOT FROM t",
+        "SELECT 1 NOT, 2",
+        "SELECT a NOT, a FROM t",
+        "SELECT 1 AS",
+        "SELECT a AS, 2 FROM t",
+        "SELECT a AS FROM t",
+        "SELECT 1 AND",
+        "SELECT 1 NULL",
+        "SELECT a SELECT FROM t",
+        "SELECT x.a FROM t x NOT",
+        "SELECT x.a FROM t AS NOT",
+    ] {
+        tw.refuse_parse(sql);
+    }
+    // Words the pin's grammar lets fall back to an identifier
+    // stay aliases.
+    let words = [
+        "ADD",
+        "ALL",
+        "ALTER",
+        "AND",
+        "AS",
+        "AUTOINCREMENT",
+        "BETWEEN",
+        "CASE",
+        "CHECK",
+        "COLLATE",
+        "COMMIT",
+        "CONSTRAINT",
+        "CREATE",
+        "DEFAULT",
+        "DEFERRABLE",
+        "DELETE",
+        "DISTINCT",
+        "DROP",
+        "ELSE",
+        "ESCAPE",
+        "EXISTS",
+        "FOREIGN",
+        "IN",
+        "INDEX",
+        "INSERT",
+        "INTO",
+        "IS",
+        "ISNULL",
+        "NOT",
+        "NOTHING",
+        "NOTNULL",
+        "NULL",
+        "OR",
+        "PRIMARY",
+        "REFERENCES",
+        "SELECT",
+        "SET",
+        "TABLE",
+        "THEN",
+        "TO",
+        "TRANSACTION",
+        "UNIQUE",
+        "UPDATE",
+        "VALUES",
+        "WHEN",
+        "CROSS",
+        "FULL",
+        "INNER",
+        "LEFT",
+        "NATURAL",
+        "OUTER",
+        "RIGHT",
+        "INDEXED",
+        "KEY",
+        "ROW",
+        "ROWS",
+        "NO",
+        "DO",
+        "END",
+        "BY",
+        "TEMP",
+        "VIEW",
+        "FIRST",
+        "LAST",
+        "REPLACE",
+        "IF",
+    ];
+    for w in words {
+        for sql in [
+            format!("SELECT 1 {w}"),
+            format!("SELECT a {w} FROM t"),
+            format!("SELECT a {w}, 2 FROM t"),
+            format!("SELECT x.a FROM t x {w}"),
+        ] {
+            tw.same(&sql);
+        }
+    }
+}
+
+/// A subquery used as an expression (scalar value or IN set)
+/// takes its comparison affinity from the RIGHTMOST compound
+/// core, a one-row VALUES from its row, a longer one from the
+/// pin's co-routine / UNION ALL rule, and a nested scalar
+/// subquery from its own result (regression: hipp read the
+/// leftmost core and gave scalar subqueries and VALUES rows no
+/// affinity, so `'1' IN (SELECT 1 UNION SELECT i FROM c)` over
+/// INTEGER i was 0, the pin 1).
+#[cfg(feature = "v09")]
+#[test]
+fn subquery_affinity_comes_from_the_rightmost_core() {
+    let tw = twins(
+        "subaff",
+        "CREATE TABLE c(i INTEGER, t TEXT); INSERT INTO c VALUES (1, '1')",
+    );
+    tw.all(&[
+        "SELECT '1' IN (SELECT i FROM c UNION SELECT 1), '1' IN (SELECT 1 UNION SELECT i FROM c)",
+        "SELECT '1' IN (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT i FROM c)",
+        "SELECT '1' IN (SELECT i FROM c UNION ALL SELECT 2 UNION ALL SELECT 1)",
+        "SELECT 1 IN (SELECT t FROM c UNION SELECT 2), 1 IN (SELECT 2 UNION SELECT t FROM c)",
+        "SELECT '1' IN (VALUES (1), ((SELECT i FROM c))), '1' IN (VALUES ((SELECT i FROM c)), (1))",
+        "SELECT '1' IN (VALUES (CAST(1 AS INTEGER))), '1' IN (VALUES (CAST(1 AS INTEGER)), (2))",
+        "SELECT '1' IN (VALUES (2), (CAST(1 AS INTEGER))), 1 IN (VALUES (1), ('1'))",
+        "SELECT '1' IN (VALUES (i)), '1' IN (VALUES (i), (2)), '1' IN (VALUES (2), (i)) FROM c",
+        "SELECT (SELECT i FROM c UNION SELECT 1) = '1', (SELECT 1 UNION SELECT i FROM c) = '1'",
+        "SELECT (SELECT (SELECT i FROM c)) = '1', '1' IN (SELECT (SELECT i FROM c))",
+        "SELECT x = '1' FROM (SELECT (SELECT i FROM c) AS x)",
+        "SELECT (SELECT x FROM (SELECT (SELECT i FROM c) AS x)) = '1'",
+        "SELECT x = '1' FROM (SELECT (SELECT i FROM c) AS x UNION SELECT 2)",
+        "SELECT '1' IN (SELECT 1 INTERSECT SELECT i FROM c), '1' IN (SELECT i FROM c INTERSECT SELECT 1)",
+        "SELECT '1' = (SELECT 2 EXCEPT SELECT i FROM c), (SELECT 1 UNION SELECT i FROM c) IN ('1')",
+    ]);
+    // Generated: every affinity and literal kind in compound
+    // and VALUES sets.
+    let tw = twins(
+        "subaffgen",
+        "CREATE TABLE c(i INTEGER, t TEXT, r REAL, n NUMERIC, b BLOB, e);
+         INSERT INTO c VALUES (1,'1',1,'1',1,'1'),('1',1,'1.0',1.0,'1',1),('a',2,'x',NULL,x'31','a')",
+    );
+    let terms = [
+        "i", "t", "r", "n", "b", "e", "1", "'1'", "1.0", "'a'", "NULL", "+i",
+    ];
+    let mut rng = Rng(0x0016_5ab0_aff1_7e57);
+    for _ in 0..120 {
+        let l = rng.pick(&terms);
+        let op = [" UNION ", " UNION ALL "][rng.below(2)];
+        let cores: Vec<String> = (0..1 + rng.below(3))
+            .map(|_| format!("SELECT {} FROM c", rng.pick(&terms)))
+            .collect();
+        let (v1, v2) = (rng.pick(&terms), rng.pick(&terms));
+        tw.same(&format!(
+            "SELECT {l} IN ({}), {l} IN (VALUES ({v1}), ({v2})), (SELECT {v1} UNION SELECT {v2}) = {l} FROM c",
+            cores.join(op)
+        ));
+    }
+}
+
+/// The row-value forms of the rightmost-core rule.
+#[cfg(feature = "v16")]
+#[test]
+fn row_value_subquery_affinity_comes_from_the_rightmost_core() {
+    let tw = twins(
+        "rowsubaff",
+        "CREATE TABLE c(i INTEGER, t TEXT); INSERT INTO c VALUES (1, '1')",
+    );
+    tw.all(&[
+        "SELECT ('1',1) IN (VALUES (i,1),(i,1)), ('1',1) IN (VALUES (i,1)), ('1',1) IN ((i,1),(i,1)) FROM c",
+        "SELECT ('1',1) IN (SELECT 1,1 UNION SELECT i,1 FROM c), ('1',1) IN (SELECT i,1 FROM c UNION SELECT 1,1) FROM c",
+        "SELECT (SELECT 1, 1 UNION SELECT i, t FROM c) = ('1', 1), (t, i) IN (SELECT 1, '1' UNION SELECT t, i FROM c) FROM c",
+    ]);
+}
+
+/// `x IN ((SELECT ...), ...)` is a list whose first item is a
+/// scalar subquery (regression: a syntax error on hipp).
+#[cfg(feature = "v09")]
+#[test]
+fn in_list_led_by_a_scalar_subquery() {
+    let tw = twins("inlistsub", "");
+    tw.all(&[
+        "SELECT 1 IN ((SELECT 1), 2), 1 IN ((SELECT 2) + -1), 1 IN ((SELECT 1)), 1 IN (((SELECT 1)))",
+        "SELECT 1 IN (((SELECT 1)), 3), 1 IN ((SELECT 1 UNION SELECT 2)), 2 IN ((VALUES (2)), 5)",
+        "SELECT 3 NOT IN ((SELECT 1), (SELECT 2)), NULL IN ((SELECT 1), 1)",
+    ]);
+    for sql in [
+        "SELECT 1 IN ((SELECT 1) UNION SELECT 2)",
+        "SELECT 1 IN ((SELECT 1)",
+        "SELECT 1 IN ((SELECT 1),)",
+    ] {
+        tw.refuse_any(sql);
+    }
+}
+
+/// Comparison affinity over every affinity and literal kind,
+/// scalar subqueries included: the pin applies the chosen
+/// affinity to both operands (`adjust_cmp`).
+#[test]
+fn generated_comparison_affinity_corpus() {
+    let tw = twins(
+        "cmpaffgen",
+        "CREATE TABLE c(i INTEGER, t TEXT, r REAL, n NUMERIC, b BLOB, e);
+         INSERT INTO c VALUES (1,'1',1,'1',1,'1'),('1',1,'1.0',1.0,'1',1),('a',2,'x',NULL,x'31','a'),
+           (2.5,'2.5',2.5,'2.5','2.5',2.5)",
+    );
+    let terms = [
+        "i",
+        "t",
+        "r",
+        "n",
+        "b",
+        "e",
+        "1",
+        "'1'",
+        "1.0",
+        "'1.0'",
+        "'a'",
+        "NULL",
+        "+i",
+        "t || ''",
+        "CAST(t AS INTEGER)",
+        "CAST(i AS TEXT)",
+        "(SELECT t FROM c LIMIT 1)",
+        "(SELECT i FROM c LIMIT 1)",
+        "(SELECT n FROM c WHERE n > 1)",
+        "(SELECT (SELECT t FROM c LIMIT 1))",
+        "'2.5'",
+        "2.5",
+        "x'31'",
+    ];
+    let ops = ["=", "<", ">=", "<>", "IS"];
+    let mut rng = Rng(0x0016_c0a1_5ce0_0001);
+    for _ in 0..100 {
+        let mut xs = Vec::new();
+        for _ in 0..6 {
+            let (a, b) = (rng.pick(&terms), rng.pick(&terms));
+            if rng.below(6) == 0 {
+                xs.push(format!("{a} IN ({b}, {})", rng.pick(&terms)));
+            } else {
+                xs.push(format!("{a} {} {b}", rng.pick(&ops)));
+            }
+        }
+        tw.same(&format!("SELECT {} FROM c", xs.join(", ")));
+    }
+}

@@ -132,6 +132,8 @@ impl Binder<'_> {
                 *e = Expr::Literal(self.literal::<E>(*idx)?);
             }
             Expr::Literal(_) | Expr::Column { .. } => {}
+            #[cfg(feature = "v04")]
+            Expr::HexTooBig(_) => {}
             Expr::Binary(_, a, c) | Expr::Like(a, c, _) => {
                 self.expr::<E>(a)?;
                 self.expr::<E>(c)?;
@@ -359,6 +361,8 @@ fn constant(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) | Expr::ExistsSubquery(_) | Expr::InSubquery(..) => false,
         Expr::Literal(_) | Expr::Column { .. } | Expr::Param(..) => true,
+        #[cfg(feature = "v04")]
+        Expr::HexTooBig(_) => true,
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => constant(a) && constant(b),
         Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             constant(a)
