@@ -102,6 +102,8 @@ SELECT mod(7, 3), mod(-7, 3), mod(7.5, 2), mod(7, 0), mod(1e308, 3), mod(-0.0, 1
 SELECT atan2(0, -1), atan2(-0.0, -1), atan2(1, 0), atan(1e400), acos(-1), asin(1), acosh(1), atanh(1), atanh(-1), tanh(30), cosh(710), sinh(-711);
 SELECT sin(1e400), cos(-1e400), tan(1e300), sqrt(1e400), ln(1e400), exp(-1e400), exp(-746), sqrt(5e-324), sqrt(1e-310), ceil(-4.0e-320);
 SELECT log(10, 1000), log(3, 81), log(8, 2), ln(1), exp(0), cos(0), sin(-0.0), sqrt(2), sqrt(1e300), power(0, 0), pow(0, -1);
+SELECT pow(590211519630.0625, 1.25), pow(50360764242731682758656, 3.5), pow(68661293089, 1.5), pow(4, 0.5), pow(27, 1.0 / 3);
+SELECT log(2, x'38ff'), log(10, cast(x'313030ff' AS TEXT)), log(2, x'3800ff'), x'38ff' + 0, cast(x'38ff' AS REAL), x'a03500' + 1;
 CREATE TABLE g(a, b AS (sqrt(a)), c AS (ceil(a)) STORED);
 INSERT INTO g(a) VALUES (4), (2.25), (-1), ('9'), (NULL);
 SELECT a, b, c, typeof(c) FROM g;

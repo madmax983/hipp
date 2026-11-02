@@ -273,13 +273,21 @@ aspirations.
   rounded; `log10` and the hyperbolic functions follow the
   pin's own formulas (fitted to its output) over those. The pin
   uses glibc, which is not correctly rounded everywhere, so
-  0.01–0.3% of `exp` / `ln` / trig results (up to 11% of
-  `sinh` / `tanh` / `asinh` / `atanh`, through glibc's `expm1` /
-  `log1p`) differ by 1–3 ulp; STATUS.md lists the measured rates.
-  Ungated fix on the way: text → number conversion (column
-  affinity, comparisons) trims only ASCII spaces and reads text
-  to its first NUL, as the pin does (`char(160) || '5'` was
-  stored as 5, `'5' || char(0) || 'x'` as text).
+  0.01–0.3% of `exp` / `ln` / trig results (up to 2.4% of `acosh`
+  near 1, up to 11% of `sinh` / `tanh` / `asinh` / `atanh`,
+  through glibc's `expm1` / `log1p`) differ, mostly by 1–3 ulp
+  (14 ulp for `tan` at the classic hard reduction argument).
+  Exact `pow` results round half to even in hipp, while glibc
+  misses many such ties (89 of 145 in the test corpus), so small integer powers are a
+  hot spot visible in CLI output (`pow(9, 17)` is
+  16677181699666568.0 in hipp, 16677181699666570.0 on the pin);
+  STATUS.md lists the measured rates. Ungated fixes on the way:
+  text → number conversion (column affinity, comparisons, `WHERE
+  rowid = '<text>'`) trims only ASCII spaces and reads text to its
+  first NUL, as the pin does (`char(160) || '5'` was stored as 5,
+  `'5' || char(0) || 'x'` as text); the numeric prefix behind
+  arithmetic and CAST reads bytes, so a non-UTF-8 tail no longer
+  zeroes it (`x'38ff' + 0` is 8).
 
 ## What v0.13 does
 

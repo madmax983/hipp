@@ -4186,20 +4186,16 @@ fn literal_rowid(arena: &Arena, lit: Literal) -> Access {
             None => Access::Empty,
         },
         Literal::Text(h) => {
-            let b = handle_bytes(arena, h);
-            let Ok(s) = core::str::from_utf8(b) else {
-                return Access::Empty;
-            };
-            let s = s.trim();
-            if let Ok(i) = s.parse::<i64>() {
-                return Access::Rowid(i);
-            }
-            match crate::sql::lexer::parse_real_signed(s.as_bytes()) {
-                Some(f) => match integral_f64(f) {
+            // The rowid's INTEGER affinity, as on the INSERT path:
+            // only ASCII spaces trimmed (`'\u{a0}5'` is no rowid;
+            // v0.16 fix, ungated — `trim` used to take Unicode ones).
+            match crate::record::text_to_number(handle_bytes(arena, h)) {
+                Some(crate::record::OwnedValue::Integer(i)) => Access::Rowid(i),
+                Some(crate::record::OwnedValue::Real(f)) => match integral_f64(f) {
                     Some(i) => Access::Rowid(i),
                     None => Access::Empty,
                 },
-                None => Access::Empty,
+                _ => Access::Empty,
             }
         }
         _ => Access::Empty,

@@ -755,3 +755,228 @@ fn text_to_number_whitespace_and_nul() {
         "SELECT sin(a), sqrt(b), ceil(c) FROM t ORDER BY rowid",
     ]);
 }
+
+/// Regression (ungated): the numeric-prefix reading behind
+/// arithmetic, CAST and `log(B, X)`'s X required the whole buffer
+/// to be UTF-8 (`log(2, x'38ff')` was NULL, `x'38ff' + 0` was 0)
+/// and skipped Latin-1 spaces; the pin's `sqlite3AtoF` reads the
+/// prefix byte by byte. A `WHERE rowid = '<text>'` literal trimmed
+/// Unicode spaces (`char(160) || '5'` found rowid 5). Arithmetic
+/// over a number followed by a NUL is left out: the pin makes that
+/// REAL (`x'3500' + 0` is 5.0), hipp INTEGER (STATUS.md gap).
+#[test]
+fn numeric_prefix_reads_bytes() {
+    let tw = twins(
+        "prefix",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1), (2), (3), (4), (5); \
+         CREATE TABLE b(v); INSERT INTO b VALUES (x'38ff'), (x'2035ff'), (x'352e35ff'), \
+         (x'2d3365ff32'), (x'ff35'), (x'a035'), (x'8535'), (x'0b35'), (x'3565ff'), (x'35c2a0')",
+    );
+    tw.all(&[
+        "SELECT log(2, x'38ff'), log(10, cast(x'313030ff' AS TEXT)), log(2, x'3800ff')",
+        "SELECT log(2, x'a03800'), log(2, x'853800'), log(2, x'0c3800ff'), log(3, x'3965ff')",
+        "SELECT v + 0, typeof(v + 0), cast(v AS REAL), cast(v AS INTEGER), cast(v AS NUMERIC), \
+         -v, v * 2, abs(v), log(2, v) FROM b ORDER BY rowid",
+        "SELECT sum(v), total(v), avg(v), max(v + 0) FROM b",
+        "SELECT x'38ff' + 0, cast(x'38ff' AS REAL), x'853500' + 1, x'a03500' + 1",
+    ]);
+    let rowid = format!(
+        "SELECT a FROM t WHERE rowid = '{}5' UNION ALL SELECT a FROM t WHERE rowid = ' 4 ' \
+         UNION ALL SELECT a FROM t WHERE rowid = '3.0' UNION ALL SELECT a FROM t WHERE rowid = '+2' \
+         UNION ALL SELECT a FROM t WHERE rowid = '1x'",
+        '\u{a0}'
+    );
+    tw.same(&rowid);
+    tw.same(&format!(
+        "SELECT count(*) FROM t WHERE rowid = '{}1'",
+        '\u{85}'
+    ));
+}
+
+/// An arbitrary-precision unsigned integer (little-endian u32
+/// limbs) for exact powers in the tests below.
+fn big_pow(base: u64, n: u32) -> Vec<u32> {
+    let mut v = vec![1u32];
+    for _ in 0..n {
+        let mut carry = 0u64;
+        for limb in v.iter_mut() {
+            let t = u64::from(*limb) * base + carry;
+            *limb = t as u32;
+            carry = t >> 32;
+        }
+        while carry > 0 {
+            v.push(carry as u32);
+            carry >>= 32;
+        }
+    }
+    v
+}
+
+/// `v * 2^e` correctly rounded (ties to even) to a normal double.
+fn big_round(v: &[u32], e: i32) -> f64 {
+    let bit = |i: usize| (v[i / 32] >> (i % 32)) & 1 == 1;
+    let len = v
+        .iter()
+        .rposition(|l| *l != 0)
+        .map_or(0, |i| 32 * i + 32 - v[i].leading_zeros() as usize);
+    if len <= 53 {
+        let m = (0..len).fold(0u64, |a, i| a | (u64::from(bit(i)) << i));
+        return m as f64 * 2f64.powi(e);
+    }
+    let sh = len - 53;
+    let mut m = (0..53).fold(0u64, |a, i| a | (u64::from(bit(sh + i)) << i));
+    let half = bit(sh - 1);
+    let rest = (0..sh - 1).any(bit);
+    if half && (rest || m & 1 == 1) {
+        m += 1;
+    }
+    m as f64 * 2f64.powi(sh as i32) * 2f64.powi(e)
+}
+
+/// Exact powers whose value lies exactly halfway between two
+/// doubles must round half to even, also for fractional exponents
+/// (`pow(t^(2^k), n / 2^k) = t^n`). Regression: only integer
+/// exponents were computed exactly, so `pow(68661293089, 1.5)`
+/// (= 262033^3, 54 bits) rounded the wrong way about half the
+/// time. hipp must equal the exact rounding in every case; glibc
+/// (the pin) is not exact at ties either, so the count that differ
+/// from the pin is reported and bounded (STATUS.md).
+#[test]
+fn pow_exact_halfway_cases_round_to_even() {
+    let mut rng = Rng(0x7a11_e5c0_ffee);
+    let mut rows = Vec::new();
+    let mut want = Vec::new();
+    // The review's cases first.
+    for (x, y) in [
+        (590211519630.0625, 1.25),
+        (50360764242731682758656.0, 3.5),
+        (68661293089.0, 1.5),
+    ] {
+        rows.push((x, y));
+        want.push(None);
+    }
+    while rows.len() < 1500 {
+        let k = (rng.next() % 6) as u32;
+        let root = 1u64 << k;
+        // t odd, t^(2^k) < 2^53.
+        let tmax = (2f64.powf(53.0 / root as f64)) as u64;
+        if tmax < 3 {
+            continue;
+        }
+        let t = (3 + rng.next() % (tmax - 2)) | 1;
+        if t.checked_pow(root as u32).is_none_or(|a| a >= 1 << 53) {
+            continue;
+        }
+        // n odd (for k > 0) with t^n of 50..=60 bits: mostly ties
+        // and near-ties.
+        let lt = (t as f64).log2();
+        let n0 = ((50.0 + (rng.next() % 11) as f64) / lt).round().max(1.0) as u32;
+        let n = if k > 0 { n0 | 1 } else { n0 };
+        let j = (rng.next() % 7) as i32 - 3;
+        let x = (t as f64).powi(root as i32) * 2f64.powi(j * root as i32);
+        let y = f64::from(n) / root as f64;
+        let p = big_pow(t, n);
+        let bits = p
+            .iter()
+            .rposition(|l| *l != 0)
+            .map_or(0, |i| 32 * i + 32 - p[i].leading_zeros() as usize);
+        rows.push((x, y));
+        want.push(Some((big_round(&p, j * n as i32), bits == 54)));
+    }
+    let (got, pin) = bits_both("pow(x, y)", &rows);
+    let (mut ties, mut off_pin, mut off_pin_ties) = (0, 0, 0);
+    for (i, ((g, p), w)) in got.iter().zip(&pin).zip(&want).enumerate() {
+        let (x, y) = rows[i];
+        let tie = match w {
+            Some((w, tie)) => {
+                assert_eq!(
+                    g,
+                    &format!("{:016X}", w.to_bits()),
+                    "pow({x:e}, {y:e}): hipp is not the exact rounding"
+                );
+                *tie
+            }
+            // The review's cases (ties): the pin is right there.
+            None => {
+                assert_eq!(g, p, "pow({x:e}, {y:e}) vs the pin");
+                true
+            }
+        };
+        ties += usize::from(tie);
+        if g != p {
+            off_pin += 1;
+            off_pin_ties += usize::from(tie);
+            assert_eq!(ulps(g, p), Some(1), "pow({x:e}, {y:e}): hipp {g} pin {p}");
+        }
+    }
+    eprintln!(
+        "pow exact family: {off_pin}/{} differ from the pin ({off_pin_ties} of {ties} ties); \
+         hipp is the exact rounding in all",
+        rows.len()
+    );
+    assert!(
+        off_pin <= 130,
+        "{off_pin} exact pow cases differ from the pin"
+    );
+}
+
+/// Every `pow(a, b)` over the integer grid a in -60..=60, b in
+/// 0..=79: hipp equals the exact rounding of a^b (computed here
+/// in big integers) everywhere. The pin (glibc) is not correctly
+/// rounded at exact ties (`pow(9, 17)` = 16677181699666569, a tie,
+/// is 16677181699666570.0 on the pin), so integer bases are a hot
+/// spot for differences; their count is bounded by the rate
+/// STATUS.md documents.
+#[test]
+fn pow_integer_grid_is_exactly_rounded() {
+    let mut rows = Vec::new();
+    for a in -60i32..=60 {
+        for b in 0u32..=79 {
+            rows.push((f64::from(a), f64::from(b)));
+        }
+    }
+    let (got, pin) = bits_both("pow(x, y)", &rows);
+    let mut off_pin = 0;
+    for ((g, p), (x, y)) in got.iter().zip(&pin).zip(&rows) {
+        let (a, b) = (*x as i64, *y as u32);
+        let mag = if a == 0 {
+            if b == 0 { 1.0 } else { 0.0 }
+        } else {
+            big_round(&big_pow(a.unsigned_abs(), b), 0)
+        };
+        let w = if a < 0 && b % 2 == 1 { -mag } else { mag };
+        assert_eq!(g, &format!("{:016X}", w.to_bits()), "pow({a}, {b})");
+        if g != p {
+            off_pin += 1;
+            assert_eq!(ulps(g, p), Some(1), "pow({a}, {b}): hipp {g} pin {p}");
+        }
+    }
+    eprintln!(
+        "pow integer grid: {off_pin}/{} differ from the pin",
+        rows.len()
+    );
+    assert!(
+        off_pin <= 60,
+        "{off_pin} integer pow cases differ from the pin"
+    );
+}
+
+/// The classic hard argument for trigonometric reduction,
+/// 6381956970095103 * 2^797: hipp is correctly rounded there
+/// (checked against a 1,300-digit Decimal reduction), glibc's cos
+/// and tan are 8 and 14 ulp off — the largest differences from
+/// the pin STATUS.md documents for the trig functions.
+#[test]
+fn hard_reduction_argument_vs_pin() {
+    let x = 6381956970095103.0 * 2f64.powi(797);
+    let rows = [(x, 0.0)];
+    for (sql, exact, pin_ulps) in [
+        ("cos(x)", "BC214AE72E6BA22F", 8),
+        ("tan(x)", "C3BD9BA9A7975636", 14),
+        ("sin(x)", "3FF0000000000000", 0),
+    ] {
+        let (got, want) = bits_both(sql, &rows);
+        assert_eq!(got[0], exact, "{sql}: hipp");
+        assert_eq!(ulps(&got[0], &want[0]), Some(pin_ulps), "{sql}: vs the pin");
+    }
+}

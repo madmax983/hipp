@@ -3374,11 +3374,14 @@ impl Num {
 /// conversion for CAST and arithmetic): leading spaces skipped,
 /// optional sign, digits with optional fraction/exponent. Returns
 /// None when the prefix has no digits at all.
-pub fn parse_num_prefix(t: &[u8]) -> Option<Num> {
-    let s = core::str::from_utf8(t).ok()?;
-    let b = s.as_bytes();
+///
+/// Like the pin's `sqlite3AtoF`, this reads bytes: what follows the
+/// prefix is never looked at (`x'38ff' + 0` is 8 — it used to be 0
+/// because the whole buffer had to be UTF-8), and only the ASCII
+/// spaces `sqlite3Isspace` knows are skipped (v0.16 fix, ungated).
+pub fn parse_num_prefix(b: &[u8]) -> Option<Num> {
     let mut i = 0usize;
-    while i < b.len() && (b[i] as char).is_whitespace() {
+    while i < b.len() && matches!(b[i], b' ' | b'\t'..=b'\r') {
         i += 1;
     }
     let start = i;
@@ -3416,7 +3419,8 @@ pub fn parse_num_prefix(t: &[u8]) -> Option<Num> {
             i = j;
         }
     }
-    let text = &s[start..i];
+    // Sign, digits, '.' and exponent only: always ASCII.
+    let text = core::str::from_utf8(b.get(start..i)?).ok()?;
     if !is_real {
         if let Ok(v) = text.parse::<i64>() {
             return Some(Num::Int(v));

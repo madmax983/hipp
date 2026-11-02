@@ -2066,9 +2066,12 @@ feature `math = ["v04"]`, in `full`, `v04,math` in
   offline with integer Machin arithmetic; the `0xa2f9836e4e44152`
   prefix checks it) then Taylor series on |r| <= π/4, `atan` by
   three angle halvings and its series; `pow` follows C99 Annex F
-  and computes exact powers exactly (powers of two with integral
-  `e * y`, small integer powers that fit 106 bits — so halfway
-  cases round to even); one shared `scale_round` rounds into the
+  and computes every exact power exactly (powers of two with
+  integral `e * y`; otherwise, for `x = a * 2^e` with `a` odd and
+  `y = n / 2^k` with `n` odd, `k <= 5`: `a = t^(2^k)`, `2^k | e n`
+  and `t^n` within 106 bits — the only way `x^y` can be a dyadic
+  rational short enough to be a halfway case — so ties round to
+  even, fractional exponents included); one shared `scale_round` rounds into the
   subnormal range and to infinity. 55,000 random arguments
   checked against a 400-digit Python `Decimal` reference: 0
   misrounded.
@@ -2096,6 +2099,37 @@ number followed by a NUL. The pin trims only `sqlite3Isspace`'s
 ASCII set and reads text to its first NUL: `char(160) || '5'` and
 `'5' || char(133)` stay TEXT (hipp stored 5), `'5' || char(0) ||
 'x'` is 5 (hipp kept the text).
+
+**Review fixes (second commit, same day):**
+
+- `pow` misrounded exact halfway results with a fractional
+  exponent (`pow(68661293089, 1.5)` = 262033^3, a 54-bit odd
+  integer, came out ...938 for ...936; `pow(590211519630.0625,
+  1.25)` and `pow(50360764242731682758656, 3.5)` likewise —
+  about half of such ties). Only integer exponents were computed
+  exactly; `math::pow_exact` now covers every exact case (above).
+  Regressions: `pow_exact_halfway_cases_round_to_even` (1,500
+  generated `pow(t^(2^k) * 2^(2^k j), n / 2^k)` cases, k = 0..5,
+  each checked against an exact big-integer rounding in the test,
+  and the review's three cases against the pin),
+  `pow_integer_grid_is_exactly_rounded` (all 9,680 `pow(a, b)`,
+  a in -60..60, b in 0..79, against the exact rounding), unit test
+  `pow_exact_ties`, and CLI lines.
+- Ungated (silent wrong answers on claimed paths): the numeric
+  prefix reading behind arithmetic, CAST, `sum` / `total` / `avg`
+  and `log(B, X)`'s X (`query::parse_num_prefix`) required the
+  whole buffer to be UTF-8 and skipped Latin-1 spaces as raw
+  bytes would: `log(2, x'38ff')` and `log(10, cast(x'313030ff' AS
+  TEXT))` were NULL, `x'38ff' + 0` was 0 (pin: 3.0, 2.0, 8). It now
+  reads bytes like the pin's `sqlite3AtoF`, skipping only the
+  `sqlite3Isspace` set. The same Unicode-trim pattern sat in
+  `WHERE rowid = '<text literal>'` (`'\u{a0}5'` found rowid 5; the
+  pin finds none): it now goes through `record::text_to_number`.
+  Regression: `numeric_prefix_reads_bytes`.
+- Documentation: the mismatch figures below were understated for
+  some argument families; they now list the hot spots (exact `pow`
+  ties, small integer powers, `acosh` near 1, the hard trig
+  reduction argument).
 
 **Oracle-probing notes** (all on the live pin; the CLI's
 `ieee754_to_blob()` gives the exact bits): `ceil(-0.5)`,
@@ -2128,7 +2162,27 @@ the same libm via a scratch harness; max difference in ulps):
 `atan2` 0.041% (1), `cosh` 0.045% (1), `exp` 0.048% (1), `pow`
 0.066% (1), `cos` 0.072% (1), `atan` 0.076% (1), `sin` 0.10%
 (1), `tan` 0.16% (1), `atanh` 1.5% (1), `tanh` 3.8% (3), `asinh`
-4.5% (1), `sinh` 5.1% (2). In the test corpus against the live
+4.5% (1), `sinh` 5.1% (2). These rates depend on the argument
+distribution (the mixture above includes out-of-domain arguments,
+NULL on both sides, and wide ranges); the hot spots, measured
+against the live pin over 20,000 arguments each unless noted:
+`acosh` 2.4% on uniform [1, 5], 1.1% on 1 + log-uniform, 0.44% on
+[1, 30]; `atanh` 7.4%, `asinh` 7.9%, `sinh` 7.5% (2 ulp) and `tanh`
+11.6% (3 ulp) on [-1, 1]; `ln` 0.15% and `log10` 0.10% (2 ulp) on
+[0.5, 2]; `pow` 0.27% on integer a < 1000, b < 40, 0.48% (46 of
+9,680) on the grid a in -60..60, b in 0..79 — mostly exact ties,
+where glibc does not round half to even (`pow(9, 17)` =
+16677181699666569 is 16677181699666570.0 on the pin,
+16677181699666568.0 in hipp; `pow(-17, 13)` likewise; the CLI
+shows these digits) — and on exact ties with fractional
+exponents glibc is wrong in 89 of 145 (61%; e.g. `pow(18^16 *
+2^-48, 1.0625)`). The largest difference found: `cos` and `tan`
+of 6381956970095103 * 2^797 (5.319372648326541e+255, the classic
+hard reduction argument) are 8 and 14 ulp from the pin — hipp's
+are the correctly rounded values (a 1,300-digit `Decimal`
+reduction; unit test `hard_reduction_argument`), glibc's lose bits
+there; random bit patterns otherwise stay within 1 ulp (0.06–0.12%
+for `sin` / `cos` / `tan`). In the test corpus against the live
 pin (1,500 per function, `tests/math_v16.rs`): 0 for the exact
 functions and `exp`, `ln`, `log`, `log10`, `log2`, `log(B, X)`,
 `pow`; 1–4 for trig and inverse trig; `cosh` 5, `acosh` 6,
@@ -2137,7 +2191,9 @@ functions and `exp`, `ln`, `log`, `log10`, `log2`, `log(B, X)`,
 
 **Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
 end with "==> all gates passed" (`v04,math` compiles warning-free
-alone). New suites: `tests/math_v16.rs` (6 tests: the generated
+alone). New suites: `tests/math_v16.rs` (6 tests, 10 after the
+review fixes — the two exact-`pow` suites, the byte-wise numeric
+prefix and the hard trig argument vs the pin: the generated
 bitwise corpus per function with its mismatch bound and ulp cap,
 structural edge cases — ±0, subnormals, the largest doubles,
 infinities, NaN-producing arguments, overflow / underflow
@@ -2146,7 +2202,8 @@ two one-ulp cases (`atanh(±0.5)`, glibc's `log1p(2)`), argument
 coercion over every storage class for every function, arity
 errors, math in generated / CHECK / DEFAULT columns and writes,
 and the text → number regression); `src/math.rs` unit tests (exact
-and special values, the SQL argument rules);
+and special values, the SQL argument rules; after the review,
+also `pow_exact_ties` and `hard_reduction_argument`);
 `hipp-cli/tests/cli_v16_math.rs` (2 tests, byte-identical
 one-shot and over stdin: special-value rendering and a generated
 corpus of the exact functions).
@@ -2163,10 +2220,21 @@ its 184-byte table, the series, `scale_round`, the integer `sqrt`),
 5.8 KB inlined into `eval_scalar` (the per-function entry points)
 and the u128 builtins it pulls in.
 
+*Review fixes:* tiny **76,044 B** (Δ **−4 B** vs 76,048, ratchet
+lowered: the byte-wise `parse_num_prefix` drops the whole-buffer
+UTF-8 check; `literal_rowid` reuses `text_to_number`). Full
+**346,207 B** (Δ **−248 B** vs the current 346,455 ratchet,
+lowered: the general `pow_exact` replaces the integer-only exact
+branch and the UTF-8 check goes). Gates: `cargo fmt --all` and
+the full `ci/local-gates.sh` run end with "==> all gates passed".
+
 **Honest gaps:**
 
 - Not bit-identical everywhere: where glibc is not correctly
-  rounded, hipp (which is) differs by one ulp — rates above;
+  rounded, hipp (which is) differs, mostly by one ulp — rates and
+  hot spots above (up to 14 ulp at the hard trig argument; exact
+  `pow` ties, where glibc does not round half to even, cannot be
+  matched without reproducing glibc's internals);
   `sinh` / `tanh` / `asinh` / `atanh` inherit glibc's `expm1` /
   `log1p` errors (`atanh(0.5)` is ...478 on the pin, ...489 in
   hipp, the true value). Matching those would mean reproducing
@@ -2188,7 +2256,14 @@ and the u128 builtins it pulls in.
   2^-95 relative before the final rounding), not a proof: a
   hard case within 2^-95 of a midpoint could misround; none was
   found in 55,000 `Decimal`-checked or 2.2 × 10^7 glibc-compared
-  arguments.
+  arguments (nor in the 11,180 exact `pow` cases the review fix
+  checks against big-integer rounding).
+- Arithmetic over text / a blob whose number is followed by
+  spaces and a NUL (`x'3500' + 0`, `('5' || char(0)) * 1`): the
+  pin makes the result REAL (5.0), hipp INTEGER (5). The value
+  agrees; only the type differs. A pre-existing arithmetic
+  quirk outside this unit, found while probing the review fix;
+  not changed here.
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

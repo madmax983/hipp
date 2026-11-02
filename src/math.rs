@@ -655,6 +655,65 @@ pub fn pow(x: f64, y: f64) -> f64 {
     if x < 0.0 && odd { -r } else { r }
 }
 
+/// `(a * 2^e)^y` for odd `a > 1` when the result is a dyadic
+/// rational of at most 106 significant bits, computed exactly
+/// and rounded once (so halfway results round to even); `None`
+/// when it is not, so the result is irrational or needs more
+/// bits and cannot be a halfway case. Writing `y = n / 2^k` with
+/// `n` odd, the power is rational only for `n > 0`, `a = t^(2^k)`
+/// and `2^k | e n`; `t >= 3` and `t^(2^k) < 2^53` bound `k <= 5`,
+/// and `t^n < 2^106` bounds `n <= 66`.
+fn pow_exact(a: u64, e: i32, y: f64) -> Option<f64> {
+    if y <= 0.0 || y > 106.0 {
+        return None;
+    }
+    let mut k = 0u32;
+    let mut yk = y;
+    while !is_int(yk) {
+        if k == 5 {
+            return None;
+        }
+        yk *= 2.0;
+        k += 1;
+    }
+    // 1 <= yk <= 106 * 32: an exact small integer.
+    let n = yk as u32;
+    // t = the exact 2^k-th root of a.
+    let mut t = u128::from(a);
+    for _ in 0..k {
+        let (r, rem) = isqrt(t);
+        if rem != 0 {
+            return None;
+        }
+        t = r;
+    }
+    let en = e.checked_mul(i32::try_from(n).ok()?)?;
+    let d = 1i32 << k;
+    if en.rem_euclid(d) != 0 {
+        return None;
+    }
+    let ey = en.div_euclid(d);
+    let mut p: u128 = 1;
+    for _ in 0..n {
+        p = p.checked_mul(t).filter(|v| *v < (1u128 << 106))?;
+    }
+    let bits = 128 - p.leading_zeros() as i32;
+    let sh = (bits - 53).max(0) as u32;
+    // Both halves fit 53 bits: exact u64 -> f64 conversions.
+    let hi = ((p >> sh) as u64) as f64 * pow2(sh as i32);
+    let lo = ((p & ((1u128 << sh) - 1)) as u64) as f64;
+    // p * 2^ey, with p scaled to [1, 2).
+    let v = scale(quick_two_sum(hi, lo), 1 - bits);
+    let ex = ey.checked_add(bits - 1)?;
+    if ex > 2000 {
+        return Some(INF);
+    }
+    if ex < -2000 {
+        return Some(0.0);
+    }
+    Some(scale_round(v, ex))
+}
+
 /// `ax^y` for finite `ax > 0`, finite nonzero `y`.
 fn pow_pos(ax: f64, y: f64) -> f64 {
     let (m, e) = decompose(ax);
@@ -678,38 +737,8 @@ fn pow_pos(ax: f64, y: f64) -> f64 {
             }
             return scale_round(ONE, p.hi as i32);
         }
-    } else if is_int(y) && (2.0..=106.0).contains(&y) {
-        // A small integer power: exact if a^y fits 106 bits.
-        let mut n: u128 = 1;
-        let mut ok = true;
-        let mut i = 0.0;
-        while i < y {
-            match n.checked_mul(u128::from(a)) {
-                Some(v) if v < (1u128 << 106) => n = v,
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-            i += 1.0;
-        }
-        if ok {
-            let bits = 128 - n.leading_zeros() as i32;
-            let sh = (bits - 53).max(0) as u32;
-            // Both halves fit 53 bits: exact u64 -> f64 conversions.
-            let hi = ((n >> sh) as u64) as f64 * pow2(sh as i32);
-            let lo = ((n & ((1u128 << sh) - 1)) as u64) as f64;
-            // n * 2^(e*y), with n scaled to [1, 2).
-            let v = scale(quick_two_sum(hi, lo), 1 - bits);
-            let ey = f64::from(e) * y + f64::from(bits - 1);
-            if ey > 2000.0 {
-                return INF;
-            }
-            if ey < -2000.0 {
-                return 0.0;
-            }
-            return scale_round(v, ey as i32);
-        }
+    } else if let Some(r) = pow_exact(a, e, y) {
+        return r;
     }
     let l = ln_dd(dd(ax));
     let z0 = l.hi * y;
@@ -1427,6 +1456,32 @@ pub fn eval(f: MathFn, args: &[OwnedValue]) -> OwnedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 6381956970095103 * 2^797, the classic worst case for
+    /// argument reduction: cos(x) ~ -4.687e-19. Bits checked
+    /// against a 1,300-digit Decimal reduction (glibc, the pin, is
+    /// 8 and 14 ulp off for cos and tan here).
+    #[test]
+    fn hard_reduction_argument() {
+        let x = 6381956970095103.0 * pow2(797);
+        assert_eq!(cos(x).to_bits(), 0xbc21_4ae7_2e6b_a22f);
+        assert_eq!(tan(x).to_bits(), 0xc3bd_9ba9_a797_5636);
+        assert_eq!(sin(x).to_bits(), 0x3ff0_0000_0000_0000);
+    }
+
+    /// Exact powers with fractional exponents round half to even
+    /// (`68661293089^1.5 = 262033^3`, a 54-bit odd integer).
+    #[test]
+    fn pow_exact_ties() {
+        assert_eq!(pow(68661293089.0, 1.5), 17991524611989936.0);
+        assert_eq!(pow(590211519630.0625, 1.25), 517320396955749.75);
+        assert_eq!(pow(9.0, 17.0), 16677181699666568.0);
+        assert_eq!(pow(-17.0, 13.0), -9904578032905936.0);
+        // Not exact (1/3 is not a double): the general path.
+        assert_eq!(pow(8.0, 1.0 / 3.0), 2.0);
+        assert_eq!(pow(3.0, 0.5), sqrt(3.0));
+        assert_eq!(pow(1e-200, 1.5), 1e-300);
+    }
 
     /// Exact and special results (C99 Annex F) every build must
     /// reproduce bit for bit; the differential suite
