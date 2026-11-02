@@ -376,6 +376,32 @@ mod file_storage {
         }
     }
 
+    /// The hosted `VACUUM INTO` writer (v0.16, `v16`; the default
+    /// `Config::vacuum_into` with `std`): writes `image` to the
+    /// file named `name` (UTF-8, relative to the working
+    /// directory) and syncs it. An existing non-empty file is
+    /// left alone and reported as `false`, as the pin refuses
+    /// one; so is a name that is not UTF-8 or a failed write.
+    #[cfg(feature = "v16")]
+    pub fn write_new_file(name: &[u8], image: &[u8]) -> bool {
+        let Ok(path) = core::str::from_utf8(name) else {
+            return false;
+        };
+        let Ok(mut f) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+        else {
+            return false;
+        };
+        if f.metadata().map(|m| m.len() != 0).unwrap_or(true) {
+            return false;
+        }
+        f.write_all(image).is_ok() && f.sync_all().is_ok()
+    }
+
     /// Hosted storage over a real file. The journal sidecar is the
     /// sibling path `<db>-journal`, exactly as SQLite names it.
     pub struct FileStorage {
@@ -457,6 +483,8 @@ mod file_storage {
     }
 }
 
+#[cfg(all(feature = "std", feature = "v16"))]
+pub use file_storage::write_new_file;
 #[cfg(feature = "std")]
 pub use file_storage::{FileError, FileSidecar, FileStorage};
 

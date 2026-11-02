@@ -293,7 +293,8 @@ aspirations.
   `PRAGMA [main.]name [= value | (value)]` with the pin's value
   grammar and conversions; header values (`user_version`,
   `application_id` read and write inside transactions;
-  `page_size` before the first write; `page_count`,
+  `page_size` before the first write, or for the next VACUUM;
+  `page_count`,
   `freelist_count`, `schema_version`, `encoding`,
   `auto_vacuum`); what hipp actually does (`journal_mode` is
   `delete`, `synchronous` FULL, `cache_size` its page pool,
@@ -359,6 +360,37 @@ aspirations.
   mixed-affinity compound views compare by the demoted affinity
   where the pin pushes some WHERE terms into each core
   (STATUS.md).
+
+- **Savepoints and maintenance statements** (behind `v16`):
+  `SAVEPOINT` / `RELEASE [SAVEPOINT]` / `ROLLBACK [TRANSACTION]
+  TO [SAVEPOINT]` with the pin's nesting (a SAVEPOINT outside a
+  transaction starts one and releasing it commits; ROLLBACK TO
+  keeps the savepoint open; names ignore ASCII case; "no such
+  savepoint"), and **statement-level rollback**: a statement that
+  fails inside a transaction now undoes only itself — also half
+  way through a multi-row write — and the transaction stays open,
+  as on the pin (the tiny profile keeps the old whole-bracket
+  abort). The undo images live in the journal file past the
+  largest rollback journal the transaction can write, so no page
+  image is held in RAM and a crash still restores the
+  transaction's start (real SQLite recovers those journals too).
+  `VACUUM [main] [INTO 'file']` rebuilds the file compactly with
+  the pin's schema order, rowid rules and header values, a
+  pending `PRAGMA page_size` applied, as one journaled
+  transaction (`Config::vacuum_into` writes VACUUM INTO's image;
+  the `std` default creates the file). `REINDEX [collation | table
+  | index]`, and `ANALYZE` writing `sqlite_stat1` exactly as the
+  pin computes it (hipp's planner does not read it; the pin then
+  plans the same over hipp's file). Ungated fixes found on the
+  way: two crash-recovery holes in the rollback journal (a page
+  the transaction allocated, spilled and changed again was
+  journaled, and replay stopped at that record; a freelist page
+  freed and reused in one transaction was not journaled), a
+  failed journal replay losing the sidecar (a panic next), and
+  `CREATE INDEX ... (rowid)` (the pin's "no such column"); the
+  tiny profile shrank 124 B. Gaps: whole-database ANALYZE row
+  order (the pin's schema hash), VACUUM of a file with an
+  expression or partial index, `ANALYZE temp` (STATUS.md).
 
 ## What v0.13 does
 
@@ -691,7 +723,8 @@ the v0.16 scalar function library),
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor;
 `session/pragma` the PRAGMA statements and integrity check,
-`session/cte` view / CTE expansion and the recursive queue, v0.16),
+`session/cte` view / CTE expansion and the recursive queue,
+`session/maint` savepoints, VACUUM, REINDEX and ANALYZE, v0.16),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

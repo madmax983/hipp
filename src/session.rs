@@ -27,8 +27,36 @@ use crate::schema::IndexOrigin;
 #[cfg(feature = "v04")]
 use crate::query::{Ctx, RExpr, RowData};
 
+/// Undo a write statement that failed with error `$e` (§7.5.4: a
+/// failed write leaves no trace). Inside a transaction with `v16`,
+/// only the statement's own savepoint is rolled back and the
+/// transaction stays open, as on the pin — unless the error is a
+/// storage, memory or cache failure, after which (as the pin's
+/// I/O and out-of-memory errors do) the whole transaction rolls
+/// back (`Statement::stmt_rollback`). Otherwise (autocommit, or a
+/// build without `v16`, where a failed statement still ends the
+/// whole bracket) the transaction is rolled back. A macro, so the
+/// tiny profile's abort stays the inline two statements it was.
+macro_rules! abort_write {
+    ($s:ident, $e:expr) => {{
+        #[cfg(feature = "v16")]
+        let undone = $s.stmt_rollback($e).await;
+        #[cfg(not(feature = "v16"))]
+        let undone = {
+            let _ = $e;
+            false
+        };
+        if !undone {
+            let _ = $s.conn.pager.rollback().await;
+            $s.conn.explicit_txn = false;
+        }
+    }};
+}
+
 #[cfg(feature = "v16")]
 mod cte;
+#[cfg(feature = "v16")]
+mod maint;
 #[cfg(feature = "v16")]
 mod pragma;
 
@@ -61,7 +89,22 @@ pub struct Config {
     /// that needs one fails with `Error::NoClock`.
     #[cfg(feature = "v04")]
     pub clock: Option<fn() -> i64>,
+    /// The `VACUUM INTO 'file'` writer (v0.16, `v16`): called with
+    /// the file name as written and the finished database image,
+    /// it creates the file and returns `true`, or returns `false`
+    /// (the statement then fails with `SchemaKind::VacuumTarget`)
+    /// when the file already holds data or cannot be written. The
+    /// core opens no files itself; with `None`, VACUUM INTO is
+    /// `Error::Unsupported`. With feature `std` the default is
+    /// `storage::write_new_file`.
+    #[cfg(feature = "v16")]
+    pub vacuum_into: Option<VacuumWriter>,
 }
+
+/// The `VACUUM INTO` writer's type (v0.16, `v16`; see
+/// `Config::vacuum_into`): file name, image → written.
+#[cfg(feature = "v16")]
+pub type VacuumWriter = fn(&[u8], &[u8]) -> bool;
 
 impl Default for Config {
     /// Hosted defaults (§5.8's example values).
@@ -78,6 +121,10 @@ impl Default for Config {
             nonce_seed: 0x6869_7070_5eed_0001,
             #[cfg(feature = "v04")]
             clock: None,
+            #[cfg(all(feature = "v16", feature = "std"))]
+            vacuum_into: Some(crate::storage::write_new_file),
+            #[cfg(all(feature = "v16", not(feature = "std")))]
+            vacuum_into: None,
         }
     }
 }
@@ -99,6 +146,8 @@ impl Config {
             nonce_seed: 0x6869_7070_5eed_0001,
             #[cfg(feature = "v04")]
             clock: None,
+            #[cfg(feature = "v16")]
+            vacuum_into: None,
         }
     }
 
@@ -134,6 +183,13 @@ impl Config {
     #[cfg(feature = "v04")]
     pub fn clock(mut self, now: fn() -> i64) -> Config {
         self.clock = Some(now);
+        self
+    }
+    /// Supply the `VACUUM INTO` writer (v0.16, `v16`; see the
+    /// `vacuum_into` field).
+    #[cfg(feature = "v16")]
+    pub fn vacuum_into(mut self, write: VacuumWriter) -> Config {
+        self.vacuum_into = Some(write);
         self
     }
 }
@@ -418,6 +474,9 @@ enum Plan {
     /// `PRAGMA` (v0.16, `v16`).
     #[cfg(feature = "v16")]
     Pragma(Box<pragma::PragmaPlan>),
+    /// The savepoint and maintenance statements (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Maint(maint::Maint),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -934,6 +993,8 @@ impl<S: Storage> Connection<S> {
             deferred: None,
             #[cfg(feature = "v16")]
             rec_rows: AVec::new(),
+            #[cfg(feature = "v16")]
+            stmt_sp: None,
         })
     }
 
@@ -1038,6 +1099,13 @@ impl<S: Storage> Connection<S> {
                 value,
                 numeric,
             } => self.plan_pragma(arena, *schema, *name, *value, *numeric),
+            #[cfg(feature = "v16")]
+            Ast::Savepoint { .. }
+            | Ast::Release { .. }
+            | Ast::RollbackTo { .. }
+            | Ast::Vacuum { .. }
+            | Ast::Reindex { .. }
+            | Ast::Analyze { .. } => self.plan_maint(arena, ast),
             #[cfg(not(feature = "v04"))]
             Ast::CreateTable { .. } => Ok(Plan::CreateTable),
             #[cfg(feature = "v04")]
@@ -1135,7 +1203,16 @@ impl<S: Storage> Connection<S> {
                 for cd in columns.iter() {
                     let nb = handle_bytes(arena, cd.name);
                     let col = match self.resolve_target(t, nb)? {
-                        Target::Rowid => None,
+                        // `rowid` / `oid` / `_rowid_` name no column
+                        // an index can hold (v0.16 fix, ungated: hipp
+                        // built the index the pin refuses with "no
+                        // such column"); an INTEGER PRIMARY KEY
+                        // column by its own name is the rowid.
+                        Target::Rowid => {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::UnknownColumn,
+                            });
+                        }
                         Target::Col(i) => {
                             if Some(i) == t.rowid_alias {
                                 None
@@ -4089,6 +4166,11 @@ pub struct Statement<'c, S: Storage> {
     /// reads the last entry with its id.
     #[cfg(feature = "v16")]
     rec_rows: AVec<(u32, AVec<OwnedValue>)>,
+    /// The savepoint level of the statement savepoint this write
+    /// runs under inside a transaction (v0.16, `v16`; see
+    /// `abort_write`), while it is open.
+    #[cfg(feature = "v16")]
+    stmt_sp: Option<usize>,
 }
 
 /// Refuse a new object name the pin reserves (`sqlite_` prefix,
@@ -4529,7 +4611,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             || {
                 #[cfg(feature = "v16")]
                 {
-                    matches!(self.plan, Plan::CreateTableAs { .. })
+                    matches!(self.plan, Plan::CreateTableAs { .. } | Plan::Maint(_))
                 }
                 #[cfg(not(feature = "v16"))]
                 {
@@ -4572,9 +4654,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                     false
                 }
             };
+        #[cfg(feature = "v16")]
+        self.open_stmt();
         let r = match &self.plan {
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
+            #[cfg(feature = "v16")]
+            Plan::Maint(_) => self.step_maint().await,
             Plan::CreateTable => self.step_create().await,
             #[cfg(feature = "v16")]
             Plan::CreateTableAs { .. } => self.step_create_as().await,
@@ -4610,6 +4696,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Commit => self.step_commit().await,
             Plan::Rollback => self.step_rollback().await,
         };
+        #[cfg(feature = "v16")]
+        self.close_stmt(r.is_err()).await;
         // Keep the connection's catalog in step with the schema
         // cookie after DDL / transaction boundaries, so metadata
         // readers (tables(), indexes()) see the new state without
@@ -4827,6 +4915,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Err(Error::TransactionState { nested: false });
         }
         self.conn.pager.drive_commit().await?;
+        // Every savepoint ends with the transaction (v0.16, `v16`).
+        #[cfg(feature = "v16")]
+        self.conn.pager.sp_clear();
         self.conn.explicit_txn = false;
         self.phase = Phase::Done;
         Ok(Step::Done)
@@ -4899,12 +4990,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                // §7.5.4: a failed write leaves no trace. Inside
-                // an explicit transaction the rollback ends the
-                // whole bracket (v0.2 note: stricter than SQLite's
-                // statement-level abort — see STATUS).
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                // §7.5.4: a failed write leaves no trace (see
+                // `abort_write`).
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -4956,8 +5044,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -5125,8 +5212,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -5263,8 +5349,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -5443,8 +5528,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             // (inline, as the tiny profile has always built it).
             #[cfg(not(feature = "v05"))]
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -5474,8 +5558,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(false);
-        let _ = self.conn.pager.rollback().await;
-        self.conn.explicit_txn = false;
+        abort_write!(self, &e);
         e
     }
 
@@ -5508,13 +5591,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(()) => {
                     #[cfg(feature = "v16")]
                     self.conn.env.finish(true);
+                    #[cfg(feature = "v16")]
+                    self.keep_stmt();
                     Ok(true)
                 }
                 Err(ce) => {
                     #[cfg(feature = "v16")]
                     self.conn.env.finish(false);
-                    let _ = self.conn.pager.rollback().await;
-                    self.conn.explicit_txn = false;
+                    abort_write!(self, &ce);
                     Err(ce)
                 }
             };
@@ -6348,8 +6432,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     Err(e) => {
                         #[cfg(feature = "v16")]
                         self.conn.env.finish(false);
-                        let _ = self.conn.pager.rollback().await;
-                        self.conn.explicit_txn = false;
+                        abort_write!(self, &e);
                         return Err(e);
                     }
                 }
@@ -6365,8 +6448,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             Err(e) => {
                 #[cfg(feature = "v16")]
                 self.conn.env.finish(false);
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -6384,8 +6466,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -8545,8 +8626,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -8665,8 +8745,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }
@@ -8739,8 +8818,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
-                let _ = self.conn.pager.rollback().await;
-                self.conn.explicit_txn = false;
+                abort_write!(self, &e);
                 Err(e)
             }
         }

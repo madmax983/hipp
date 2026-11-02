@@ -283,6 +283,27 @@ pub enum SchemaKind {
     /// pin's "duplicate WITH table name"). Rename one.
     #[cfg(feature = "v16")]
     DuplicateCteName,
+    /// `RELEASE` / `ROLLBACK TO` a name no open savepoint has
+    /// (v0.16, `v16`; the pin's "no such savepoint"). Open it with
+    /// `SAVEPOINT name` first; savepoints end with the transaction.
+    #[cfg(feature = "v16")]
+    NoSuchSavepoint,
+    /// `VACUUM` inside a transaction (v0.16, `v16`; the pin's
+    /// "cannot VACUUM from within a transaction"). COMMIT or
+    /// ROLLBACK first.
+    #[cfg(feature = "v16")]
+    VacuumInTransaction,
+    /// `VACUUM INTO` a file that already holds a database, or that
+    /// the connection's `Config::vacuum_into` hook could not write
+    /// (v0.16, `v16`; the pin's "output file already exists").
+    /// Name a new or empty file.
+    #[cfg(feature = "v16")]
+    VacuumTarget,
+    /// `REINDEX x` where `x` names no collation, table or index
+    /// (v0.16, `v16`; the pin's "unable to identify the object to
+    /// be reindexed"). Name an existing one.
+    #[cfg(feature = "v16")]
+    ReindexTarget,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -432,6 +453,44 @@ impl<E> Error<E> {
             #[cfg(feature = "params")]
             Error::ResetRequired => Error::ResetRequired,
             Error::Storage(e) => Error::Storage(e.into()),
+        }
+    }
+}
+
+impl<E> Error<E> {
+    /// Re-wrap this error for another storage error type, mapping
+    /// a `Storage` error through `f` (v0.16, `v16`: VACUUM builds
+    /// its image on an in-memory pager, whose errors surface under
+    /// the connection's storage type).
+    #[cfg(feature = "v16")]
+    pub fn map_storage<F>(self, f: impl FnOnce(E) -> Error<F>) -> Error<F> {
+        match self {
+            Error::Storage(e) => f(e),
+            Error::BadMagic => Error::BadMagic,
+            Error::TruncatedHeader => Error::TruncatedHeader,
+            Error::UnsupportedPageSize => Error::UnsupportedPageSize,
+            Error::UnsupportedEncoding => Error::UnsupportedEncoding,
+            Error::WalUnsupported => Error::WalUnsupported,
+            Error::ReservedBytesUnsupported => Error::ReservedBytesUnsupported,
+            Error::CorruptPage { page } => Error::CorruptPage { page },
+            Error::CorruptRecord => Error::CorruptRecord,
+            Error::BadVarint => Error::BadVarint,
+            Error::BadSerialType => Error::BadSerialType,
+            Error::OverflowChainCycle => Error::OverflowChainCycle,
+            Error::PageOutOfRange { page } => Error::PageOutOfRange { page },
+            Error::Unsupported => Error::Unsupported,
+            Error::Schema { kind } => Error::Schema { kind },
+            Error::Parse { offset, kind } => Error::Parse { offset, kind },
+            Error::CacheExhausted => Error::CacheExhausted,
+            Error::OperationInFlight => Error::OperationInFlight,
+            Error::TransactionState { nested } => Error::TransactionState { nested },
+            Error::ArenaExhausted { scope, needed } => Error::ArenaExhausted { scope, needed },
+            Error::CorruptJournal => Error::CorruptJournal,
+            Error::NoClock => Error::NoClock,
+            #[cfg(feature = "params")]
+            Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
+            #[cfg(feature = "params")]
+            Error::ResetRequired => Error::ResetRequired,
         }
     }
 }

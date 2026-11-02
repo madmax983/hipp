@@ -2809,6 +2809,255 @@ affinity fixes and the view column naming.
   bare names in a CREATE VIEW column list (`v(select)`), which
   the pin rejects.
 
+### Savepoints and maintenance statements (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated as below. Census (225 probes, 14 new):
+`savepoint`, `vacuum`, `reindex`, `analyze` went HIPP_ERR →
+MATCH; totals MATCH 171, HIPP_ERR 25, DIFF 2, BOTH_ERR 27 (the
+new BOTH_ERR probes are error-vs-error agreements). `BEGIN
+DEFERRED / IMMEDIATE / EXCLUSIVE [TRANSACTION]` and `END
+[TRANSACTION]` were already accepted.
+
+**Shipped — `v16`** (new `src/session/maint.rs`; `Ast::{Savepoint,
+Release, RollbackTo, Vacuum, Reindex, Analyze}`, `Plan::Maint`,
+`Pager::{sp_*, replace_image}`, `btree::index_payloads`,
+`Config::vacuum_into`, `storage::write_new_file`):
+
+- *Savepoints.* `SAVEPOINT nm`, `RELEASE [SAVEPOINT] nm`,
+  `ROLLBACK [TRANSACTION] TO [SAVEPOINT] nm` (`nm` as in PRAGMA:
+  identifiers, keywords such as `begin` / `end` / `main`, strings,
+  `""`). The pager keeps a stack of savepoint marks (name,
+  whether it opened the transaction, header snapshot,
+  sub-journal position); a savepoint outside a transaction sets
+  the explicit bracket and is the transaction savepoint, whose
+  release commits; RELEASE pops the newest mark of that name
+  (ASCII case ignored) and everything newer; ROLLBACK TO restores
+  and keeps it; COMMIT / END / ROLLBACK / a resumed commit clear
+  the stack; BEGIN inside one is `TransactionState`; unknown names
+  `SchemaKind::NoSuchSavepoint`. All of it is per-connection
+  pager state.
+- *The sub-journal.* Before a page first changes after the
+  newest mark, `Pager::sp_note` records where its mark-time image
+  is: for a page the transaction has not touched, its rollback-
+  journal record (written next, holding that very image); for
+  any other, a copy written into the journal file's *savepoint
+  area*, which starts past the largest rollback journal the
+  transaction can write (every original page once) plus one
+  record of zeros. Recovery — hipp's and the pin's — stops at that
+  zero record (page 0, bad checksum), so a crash anywhere still
+  rolls back to the transaction's start; each copy is followed by
+  four zero bytes so the file never ends in the journal magic
+  (the pin would read a super-journal name there). No page image
+  is held in RAM, so the transaction arena bounds nothing new.
+  `sp_rollback` replays each recorded page once (earliest record
+  wins), drops pages past the mark's size, restores the header
+  (schema cookie, freelist, page count, user_version /
+  application_id) and rebuilds the catalog.
+- *Statement savepoints.* Every write statement inside a
+  transaction (`Statement::open_stmt`) runs under an anonymous
+  mark: the `abort_write!` macro, replacing the thirteen inline
+  "roll back and close the bracket" sites, rolls back only that
+  mark and keeps the transaction open; OR FAIL releases it
+  (`keep_stmt`); `close_stmt` rolls back any other failed step
+  and releases a successful one. Storage, arena, cache and
+  journal errors still roll back the whole transaction, as the
+  pin's I/O / out-of-memory errors do. This replaces the v0.2
+  rule ("a failed statement aborts the whole bracket") wherever
+  `v16` is built; `tests/dialect.rs` asserts both rules by
+  feature.
+- *VACUUM [main | temp] [INTO 'file'].* The schema rows are read
+  raw and re-emitted in the pin's order — each table (rootpage >
+  0, `sqlite_sequence` excepted) followed by its automatic
+  indexes and, after the first AUTOINCREMENT table, by
+  `sqlite_sequence`; then the explicit indexes; then views,
+  triggers and virtual tables (rows copied unchanged) — into a
+  fresh in-memory pager (`Pager<MemStorage>`) at the new page
+  size; table records are copied byte for byte, keeping rowids
+  unless the table has neither an INTEGER PRIMARY KEY nor any
+  index (renumbered 1..n, as the pin's non-xfer copy does; VACUUM
+  INTO keeps them all), and index keys are copied raw in key
+  order (`btree::index_payloads`). Page 1's header is then
+  patched as the pin leaves it: change counter + 1 (1 for INTO),
+  schema cookie + 1, freelist 0, format 4, the default cache size,
+  user_version and application_id kept, auto-vacuum off.
+  In place, `Pager::replace_image` journals every original page,
+  syncs the journal, writes pages 2.. then page 1, sets the
+  length and syncs, then deletes the journal (the commit point;
+  any failure before it replays the journal) and rebuilds the
+  cache — the page size may change. `PRAGMA page_size` on a
+  non-empty file and an `auto_vacuum` change are now kept for the
+  next VACUUM (INTO included), as on the pin; a VACUUM that would
+  produce an auto-vacuum file is refused (`Unsupported`: hipp
+  keeps no pointer maps), so `PRAGMA auto_vacuum = 0; VACUUM`
+  converts one. VACUUM INTO hands the image to
+  `Config::vacuum_into` (std default: create the file, refusing
+  one that holds data — `SchemaKind::VacuumTarget`; `None` on
+  no_std: `Unsupported`). Inside a transaction:
+  `VacuumInTransaction`; an unknown schema: `UnknownDatabase`;
+  `VACUUM temp` does nothing (hipp has no temp schema).
+- *REINDEX* `[collation | [main.] table-or-view | [main.]
+  index]`, looked up as the pin does (a collation name first,
+  unqualified only; then a table, view or `sqlite_schema`; then an
+  index; else `SchemaKind::ReindexTarget`): each index is
+  emptied (its pages freed, its root kept) and refilled from its
+  table, unique checks included; an index hipp cannot compute
+  (expression / partial: `opaque`) is left as it is — hipp never
+  writes its table, so it is still exact.
+- *ANALYZE* `[main | [main.] index | [main.] table-or-view]`: the
+  pin's `sqlite_stat1` (created as `CREATE TABLE
+  sqlite_stat1(tbl,idx,stat)` on first use, in the same
+  transaction): per index `"N d1 .. dk"` with `dj = (N + D - 1) /
+  D` over `D` distinct `j`-column prefixes (NULLs equal, each key
+  column's collation deciding), 2 lowered to 1 when `10 N <= 11
+  D`; a table with no index gets `"N"` (idx NULL); empty tables
+  and empty indexes get no row; tables named `sqlite_*` are
+  skipped; a view or system table only creates the table. Old
+  rows go first exactly as the pin deletes them (`tbl = name`,
+  `idx = name`, or all); new rows take rowid max + 1. Indexes are
+  emitted in reverse creation order, tables in reverse schema
+  order (see the gap). hipp's planner does not read the
+  statistics: they are written so the files interoperate, and the
+  pin plans the same over hipp's file as over its own
+  (`EXPLAIN QUERY PLAN` compared in the tests).
+
+**Shipped — ungated** (found while testing this unit):
+
+- *Rollback journal* (tiny path, crash safety): a page the
+  transaction allocated past the original size, spilled from the
+  cache and then changed again got a journal record; replay
+  stops at such a record (page past the original size), so every
+  record after it was lost to a crash — torn file. Pages past the
+  original size are never journaled now (recovery truncates
+  them). +8 B.
+- *Freelist reuse* (`v05` / `indexes`, crash safety): a page freed
+  and reallocated in one transaction was zeroed without being
+  journaled; a crash after its new image landed restored B-trees
+  that still pointed at it. A popped freelist leaf within the
+  original size is journaled (and noted for savepoints) first.
+- *Failed replay* (tiny path): `Pager::rollback` took the journal
+  sidecar out of the pager and lost it when the replay failed, so
+  the next transaction panicked (`expect`). It is borrowed in
+  place now — which also shrank the tiny profile.
+- *CREATE INDEX on `rowid` / `oid` / `_rowid_`* (`indexes`): hipp
+  built an index on the pseudo-column; the pin refuses it ("no
+  such column"). `UnknownColumn` now (an INTEGER PRIMARY KEY
+  column by its own name is still the rowid).
+
+**Oracle-probing notes** (live pin, before implementation):
+`SAVEPOINT` outside a transaction starts one; `RELEASE` of it
+commits, so a following `ROLLBACK` is "no transaction is active";
+inside `BEGIN`, releasing the outermost savepoint commits nothing.
+`savepoint a; savepoint b; savepoint a; release a; release a`
+releases the inner `a`, then the outer one with `b`. ROLLBACK TO
+keeps the savepoint (it can be rolled back to again, then
+released). Unknown names: "no such savepoint: x"; `SAVEPOINT a;
+BEGIN`: "cannot start a transaction within a transaction";
+`savepoint 123`, `release savepoint;`, `savepoint main.x` are
+syntax errors; `savepoint savepoint`, `"" ` and keywords are
+names. changes() / total_changes() / last_insert_rowid() are not
+rolled back. A UNIQUE failure inside a transaction keeps the
+transaction and the earlier rows; `INSERT ... VALUES (41), (40)`
+failing on its second row leaves no 41. `PRAGMA user_version`
+and CREATE TABLE are undone by ROLLBACK TO. VACUUM: "cannot
+VACUUM from within a transaction" (INTO too); `vacuum nosuch` is
+"unknown database"; schema cookie + 1, change counter + 1;
+`user_version`, `application_id`, `default_cache_size` kept;
+schema order tables-with-autoindexes, `sqlite_sequence` after
+the AUTOINCREMENT table's autoindexes, other indexes, views and
+triggers; a table without INTEGER PRIMARY KEY or index gets
+rowids 1..n, every other keeps them, VACUUM INTO keeps all; INTO
+an existing database: "output file already exists", an empty
+file is fine, a non-database file "file is not a database"; INTO
+writes change counter 1 and applies the pending page size without
+changing the source's. `PRAGMA page_size = N` on a non-empty file
+still reads the old size until VACUUM; 1000 is ignored. REINDEX:
+`main.nocase`, `temp.ia` and unknown names are "unable to identify
+the object to be reindexed"; views and `sqlite_schema` are
+accepted; it works inside transactions. ANALYZE: the counts above
+(`"4 2"` for (1, 2, NULL, NULL): NULLs equal; `"11 1"` for 10
+distinct among 11 rows; `"12 2"` for 12); partial indexes always
+get a row, with the table's own `"N"` row when only partial
+indexes exist; `ANALYZE nosuch` is "no such table"; `ANALYZE
+temp` creates `temp.sqlite_stat1`, which then hides the main one
+for unqualified reads. A whole-database ANALYZE orders tables by
+the pin's in-memory schema hash: reverse creation order while it
+holds fewer than five entries (`sqlite_schema` and `sqlite_stat1`
+count), a scrambled order beyond that (`a b c d` → `a d b c`);
+probed and modelled against the hash shapes that fit SQLite's
+documented design — none matched, so hipp does not reproduce it.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed". New suites:
+`tests/savepoint_v16.rs` (9 tests: nesting, names, statement-level
+rollback in BEGIN and in savepoints — UNIQUE / NOT NULL / CHECK /
+STRICT failures, multi-row and INSERT ... SELECT failures half
+way, OR FAIL / OR IGNORE, a failing CREATE UNIQUE INDEX —, schema
+and header rollback, connection counters, large savepoints across
+splits, overflow pages, the freelist and cache spills, a
+generated corpus of 24 random interleavings of writes and
+transaction statements, and the Connection API; every script runs
+on both engines continuing past errors, comparing rows, failing
+statements and the oracle's integrity check and `.dump` of both
+files); `tests/maintenance_v16.rs` (12 tests: VACUUM against the
+pin's own VACUUM of the same file, pending page sizes, errors,
+VACUUM INTO, pin-made files with AUTOINCREMENT / triggers /
+default_cache_size, the expression-index refusal, a generated
+VACUUM + ANALYZE corpus with collations, NULLs and overflow
+records, REINDEX forms, ANALYZE rows / rowids / deletions /
+transactions, the pin's plans over hipp's statistics, `ANALYZE
+temp`, and the CREATE INDEX regression); `tests/crash.rs` (+5
+tests: every crash point of a savepoint transaction, of one inside
+BEGIN with a half-failed statement, of a spilling transaction
+under a 4-page cache with ROLLBACK TO across the spills, of
+freelist reuse, and of VACUUM at 4096 → 4096 / 1024 / 16384-byte
+pages recovers byte-exactly to the pre- or post-image; real
+SQLite recovers hipp's savepoint journals at every kill point —
+both journal fixes were confirmed by reverting them: the spill
+and freelist tests then tear the file);
+`hipp-cli/tests/cli_v16_savepoint.rs` (3 tests, byte-identical
+one-shot and over stdin).
+
+**Size:** tiny **76,200 B** (Δ **−124 B** vs 76,324, ratchet
+lowered to it): the borrowed-sidecar rollback shrank it, the
+journal fix costs 8 B, and the abort sites stayed inline in the
+tiny profile (`abort_write!` is a macro; an `async fn` helper cost
+96 B). Full **424,672 B** (Δ **+20,544 B** vs 404,128, ratchet
+raised to it; over the 16 KiB `justify_over`, justified here):
+savepoint marks and the journal-file sub-journal, statement
+savepoints, the VACUUM rebuild and image replacement, REINDEX,
+the ANALYZE statistics, their grammar and plans.
+
+**Honest gaps:**
+
+- A whole-database ANALYZE writes its rows in reverse schema
+  order; the pin's order (its schema hash) agrees only while the
+  schema hash is small (≤ 3 tables with `sqlite_stat1` absent,
+  ≤ 2 with it present). The rows themselves are the pin's; the
+  pin's planner does not depend on their order. hipp's planner
+  ignores `sqlite_stat1`.
+- VACUUM and ANALYZE refuse (`Unsupported`) a file with an
+  expression or partial index (hipp cannot order or count one);
+  REINDEX leaves such an index as it is. `ANALYZE temp` is
+  refused (no temp schema); `VACUUM temp INTO` is refused.
+- VACUUM builds the whole new image in memory (a `MemStorage`
+  pager) before writing it: RAM proportional to the database.
+  Its page layout can differ from the pin's (hipp's appends vs
+  the pin's xfer copy and balance: 148 vs 147 pages for one test
+  file at 512-byte pages); data, schema, rowids and header
+  values agree.
+- The savepoint area's offset grows with the database (the
+  largest possible rollback journal): sparse on a file system,
+  but a `MemStorage` journal allocates the gap.
+- VACUUM INTO takes a string literal only (no bound parameter or
+  expression); `Config::vacuum_into` reports success as a bool.
+- Statement-level rollback is `v16` only: without it a failed
+  statement still ends the whole bracket (the v0.2 rule).
+- Found outside this unit: after the same statements hipp's file
+  can have one more freelist page than the pin's (B-tree merge
+  differences on DELETE), and the change counter can differ by
+  one before any VACUUM.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

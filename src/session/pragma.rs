@@ -183,6 +183,13 @@ pub(super) struct PragState {
     /// connection: LIKE is then non-deterministic, as on the pin
     /// (`rules::gen_uses_like`).
     pub like_redefined: bool,
+    /// A `PRAGMA page_size` that could not apply to the existing
+    /// file: the pin keeps it for the next VACUUM (VACUUM INTO
+    /// too), which builds the file with it.
+    pub vacuum_page_size: Option<u32>,
+    /// A `PRAGMA auto_vacuum` change waiting for the next VACUUM,
+    /// as on the pin.
+    pub vacuum_autovac: Option<u8>,
 }
 
 /// A planned PRAGMA: `prag: None` is an ignored name.
@@ -1352,9 +1359,11 @@ impl<S: Storage> Statement<'_, S> {
                 let ok = (512..=65536).contains(&n) && (n as u32).is_power_of_two();
                 if ok && pristine && n as u32 != self.conn.pager.page_size() {
                     self.conn.pager.reformat(n as u32).await?;
+                } else if ok && !pristine {
+                    // Otherwise the pin records it for the next
+                    // VACUUM (a bad size is ignored).
+                    self.conn.prag.vacuum_page_size = Some(n as u32);
                 }
-                // Otherwise the pin, too, only records it for a
-                // VACUUM (hipp has none) or ignores a bad size.
                 Ok(AVec::new())
             }
             Prag::Encoding => {
@@ -1396,7 +1405,10 @@ impl<S: Storage> Statement<'_, S> {
                 let cur = self.conn.pager.header().auto_vacuum;
                 if want == cur || (!pristine && (want == 0 || cur == 0)) {
                     // Unchanged, or (as on the pin) a change that
-                    // would need a VACUUM: nothing happens.
+                    // waits for the next VACUUM.
+                    if !pristine {
+                        self.conn.prag.vacuum_autovac = Some(want);
+                    }
                     Ok(AVec::new())
                 } else {
                     // hipp keeps no pointer maps.

@@ -2606,6 +2606,69 @@ pub fn decode_index_entry<E>(payload: &[u8], nfields: usize) -> Result<IndexEntr
     Ok(entry)
 }
 
+/// Every key payload of the index rooted at `root`, raw, in key
+/// order (v0.16, `v16`: VACUUM copies indexes byte for byte).
+#[cfg(all(feature = "v16", feature = "indexes"))]
+pub async fn index_payloads<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+) -> Result<AVec<AVec<u8>>, S::Error> {
+    let usable = pager.usable() as usize;
+    let mut out: AVec<AVec<u8>> = AVec::new();
+    // (page, next action): an interior page's actions alternate
+    // descend-child / emit-divider, as `IndexCursor` walks them.
+    let mut stack: AVec<(u32, usize)> = AVec::new();
+    stack.push((root, 0));
+    let mut steps = 0u64;
+    while let Some((page, seq)) = stack.pop() {
+        steps = steps.saturating_add(1);
+        if steps
+            > u64::from(pager.page_count())
+                .saturating_mul(1024)
+                .saturating_add(64)
+        {
+            return Err(Error::CorruptPage { page });
+        }
+        let idx = pager.load(page).await?;
+        let snap = copy_bytes(pager.frame_data(idx));
+        let h = head::<S::Error>(snap.as_slice(), page)?;
+        if h.is_leaf() {
+            if h.kind != KIND_LEAF_INDEX {
+                return Err(Error::CorruptPage { page });
+            }
+            for c in index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?.iter() {
+                out.push(index_cell_payload(pager, c).await?);
+            }
+            continue;
+        }
+        if h.kind != KIND_INTERIOR_INDEX {
+            return Err(Error::CorruptPage { page });
+        }
+        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
+        let n = cells.len();
+        if seq > 2 * n {
+            continue;
+        }
+        stack.push((page, seq + 1));
+        if seq % 2 == 1 {
+            let Some(c) = cells.as_slice().get((seq - 1) / 2) else {
+                return Err(Error::CorruptPage { page });
+            };
+            out.push(index_cell_payload(pager, c).await?);
+        } else {
+            let child = match cells.as_slice().get(seq / 2) {
+                Some(c) => c.child,
+                None => rightmost,
+            };
+            if child == 0 || child == page {
+                return Err(Error::CorruptPage { page });
+            }
+            stack.push((child, 0));
+        }
+    }
+    Ok(out)
+}
+
 /// Reassemble a cell's full key payload (local part + overflow).
 #[cfg(feature = "indexes")]
 async fn index_cell_payload<S: Storage>(

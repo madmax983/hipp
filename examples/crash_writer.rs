@@ -7,6 +7,9 @@
 //!
 //! - `setup`: create the db + table + first row, committed.
 //! - `insert`: insert the second row under the kill wrapper.
+//! - `savepoint` (v0.16): a SAVEPOINT transaction under the kill
+//!   wrapper whose ROLLBACK TO reads page images back from the
+//!   journal file's savepoint area; it commits rows 2 and 4.
 //!
 //! Env `KILL_AT` = mutating-op index at which to die (default:
 //! never). Env `COUNT=1` prints the total mutating-op count to
@@ -116,7 +119,7 @@ fn main() {
                     assert_eq!(st.step().await.expect("step"), Step::Done);
                 }
             }
-            "insert" => {
+            "insert" | "savepoint" => {
                 let n = Rc::new(Cell::new(0));
                 let fs = KillStorage {
                     inner: FileStorage::open(&path).expect("fs"),
@@ -124,12 +127,24 @@ fn main() {
                     kill,
                 };
                 let mut db = Connection::open(fs, Config::default()).await.expect("open");
-                let mut st = db
-                    .prepare("INSERT INTO t VALUES (2, 'two')")
-                    .await
-                    .expect("prep");
-                assert_eq!(st.step().await.expect("step"), Step::Done);
-                drop(st);
+                let script: &[&str] = if mode == "insert" {
+                    &["INSERT INTO t VALUES (2, 'two')"]
+                } else {
+                    &[
+                        "SAVEPOINT a",
+                        "INSERT INTO t VALUES (2, 'two')",
+                        "SAVEPOINT b",
+                        "UPDATE t SET x = x || '!'",
+                        "INSERT INTO t VALUES (3, 'three')",
+                        "ROLLBACK TO b",
+                        "INSERT INTO t VALUES (4, 'four')",
+                        "RELEASE a",
+                    ]
+                };
+                for sql in script {
+                    let mut st = db.prepare(sql).await.expect("prep");
+                    assert_eq!(st.step().await.expect("step"), Step::Done);
+                }
                 drop(db);
                 if std::env::var("COUNT").is_ok() {
                     eprintln!("OPS={}", n.get());

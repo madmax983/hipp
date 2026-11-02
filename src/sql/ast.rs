@@ -690,6 +690,40 @@ pub enum Ast {
     Commit,
     /// `ROLLBACK [TRANSACTION]` (v0.2).
     Rollback,
+    /// `SAVEPOINT name` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Savepoint {
+        name: ABytes,
+    },
+    /// `RELEASE [SAVEPOINT] name` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Release {
+        name: ABytes,
+    },
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    RollbackTo {
+        name: ABytes,
+    },
+    /// `VACUUM [schema] [INTO 'file']` (v0.16, `v16`): `into` is
+    /// the target file name (a string literal).
+    #[cfg(feature = "v16")]
+    Vacuum {
+        schema: Option<ABytes>,
+        into: Option<ABytes>,
+    },
+    /// `REINDEX [[schema .] name]` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Reindex {
+        schema: Option<ABytes>,
+        name: Option<ABytes>,
+    },
+    /// `ANALYZE [[schema .] name]` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Analyze {
+        schema: Option<ABytes>,
+        name: Option<ABytes>,
+    },
     /// `WITH ... INSERT / REPLACE / UPDATE / DELETE` (v0.16,
     /// `v16`): the clause's CTEs are visible throughout the
     /// statement (its SELECT, FROM, expressions and subqueries,

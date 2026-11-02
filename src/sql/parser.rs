@@ -509,11 +509,34 @@ impl<'a> Parser<'a> {
         } else if self.cur_is_kw(b"ROLLBACK") {
             self.pos += 1;
             let _ = self.eat_kw(b"TRANSACTION");
-            // ROLLBACK TO <savepoint> is a later phase.
+            // ROLLBACK TO [SAVEPOINT] <name> (v0.16, `v16`).
             if self.cur_is_kw(b"TO") {
+                #[cfg(feature = "v16")]
+                {
+                    self.pos += 1;
+                    let _ = self.eat_kw(b"SAVEPOINT");
+                    let name = self.pragma_nm::<E>()?;
+                    return Ok(Ast::RollbackTo { name });
+                }
+                #[cfg(not(feature = "v16"))]
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
             Ok(Ast::Rollback)
+        } else if cfg!(feature = "v16")
+            && (self.cur_is_kw(b"SAVEPOINT")
+                || self.cur_is_kw(b"RELEASE")
+                || self.cur_is_kw(b"VACUUM")
+                || self.cur_is_kw(b"REINDEX")
+                || self.cur_is_kw(b"ANALYZE"))
+        {
+            #[cfg(feature = "v16")]
+            {
+                self.maint_stmt::<E>()
+            }
+            #[cfg(not(feature = "v16"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
         } else if cfg!(feature = "v16") && self.cur_is_kw(b"PRAGMA") {
             #[cfg(feature = "v16")]
             {
@@ -528,6 +551,60 @@ impl<'a> Parser<'a> {
         } else {
             Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
         }
+    }
+
+    /// The savepoint and maintenance statements (v0.16, `v16`):
+    /// `SAVEPOINT nm`, `RELEASE [SAVEPOINT] nm`, `VACUUM [nm]
+    /// [INTO 'file']`, `REINDEX [nm [. nm]]`, `ANALYZE [nm [.
+    /// nm]]`, with the current token on the keyword.
+    #[cfg(feature = "v16")]
+    fn maint_stmt<E>(&mut self) -> Result<Ast, E> {
+        if self.eat_kw(b"SAVEPOINT") {
+            let name = self.pragma_nm::<E>()?;
+            return Ok(Ast::Savepoint { name });
+        }
+        if self.eat_kw(b"RELEASE") {
+            let _ = self.eat_kw(b"SAVEPOINT");
+            let name = self.pragma_nm::<E>()?;
+            return Ok(Ast::Release { name });
+        }
+        let vacuum = self.eat_kw(b"VACUUM");
+        let reindex = !vacuum && self.eat_kw(b"REINDEX");
+        if !vacuum && !reindex {
+            self.pos += 1; // ANALYZE
+        }
+        let mut first = None;
+        if !self.at_eof() && !matches!(self.cur().tok, Tok::Semi) && !self.cur_is_kw(b"INTO") {
+            first = Some(self.pragma_nm::<E>()?);
+        }
+        if vacuum {
+            let into = if self.eat_kw(b"INTO") {
+                match self.cur().tok {
+                    Tok::Text(h) => {
+                        self.pos += 1;
+                        Some(h)
+                    }
+                    Tok::Eof => return Err(perr(self.cur().offset, ParseKind::UnexpectedEof)),
+                    _ => return Err(perr(self.cur().offset, ParseKind::UnsupportedClause)),
+                }
+            } else {
+                None
+            };
+            return Ok(Ast::Vacuum {
+                schema: first,
+                into,
+            });
+        }
+        let (schema, name) = if first.is_some() && self.eat(Tok::Dot) {
+            (first, Some(self.pragma_nm::<E>()?))
+        } else {
+            (None, first)
+        };
+        Ok(if reindex {
+            Ast::Reindex { schema, name }
+        } else {
+            Ast::Analyze { schema, name }
+        })
     }
 
     /// `PRAGMA [nm .] nm [= nmnum | ( nmnum )]` (v0.16, `v16`;
