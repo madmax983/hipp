@@ -33,13 +33,6 @@ use crate::sql::JoinKind;
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
 const ROWID_COL: usize = usize::MAX;
 
-/// SubPlan node identity source (v0.13): every planned
-/// subquery node takes a unique id, which the executor's
-/// hoisting cache keys on. Relaxed ordering suffices — ids
-/// only need uniqueness, never synchronisation.
-#[cfg(feature = "v06")]
-static NEXT_SUBPLAN_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
-
 /// Caller configuration (SPEC §5.8, §7.5.3): page-pool size and
 /// per-scope arena initial/maximum bytes.
 #[derive(Debug, Clone)]
@@ -176,6 +169,10 @@ struct IdxColPlan {
     desc: bool,
 }
 
+// Plans are built once per statement and never stored in bulk;
+// the variant-size spread depends on the feature rung (v04 alone
+// has the widest gap), so boxing would only add an indirection.
+#[allow(clippy::large_enum_variant)]
 enum Plan {
     CreateTable,
     /// `CREATE [UNIQUE] INDEX` (v0.3): everything population needs
@@ -381,11 +378,14 @@ struct QueryPlan {
     /// non-empty, `order_by` is empty, `comp_order` carries
     /// the compound ORDER BY, and `limit` / `offset` apply to
     /// the combined result. Only filled under `v09`.
+    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     compound: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
     /// A VALUES core's resolved rows (v0.9; see
     /// `SubPlan::values`).
+    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     values: AVec<AVec<RExpr>>,
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
+    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     comp_order: AVec<(usize, bool)>,
     /// Per-result-item ORDER BY name keys (v0.9): `(qualifier,
     /// name)` for a plain column item (qualifier = its source's
@@ -393,6 +393,7 @@ struct QueryPlan {
     /// expanded per column for star items. The compound ORDER
     /// BY resolver matches a term against these across ALL of
     /// the compound's cores (pin-verified behaviour).
+    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     order_names: AVec<crate::query::OrderName>,
 }
 
@@ -503,6 +504,16 @@ pub struct Connection<S: Storage> {
     /// not N.
     #[cfg(feature = "v06")]
     sub_execs: usize,
+    /// SubPlan node identity source (v0.13): every planned
+    /// subquery node takes a unique id, which the executor's
+    /// hoisting cache keys on. Ids only need uniqueness within
+    /// one connection's statements, so this is a per-connection
+    /// counter (a `Cell`, bumped from `&self` planning) rather
+    /// than a global atomic: no engine statics, and no atomic
+    /// read-modify-write, which targets such as Cortex-M0
+    /// (`thumbv6m`) do not have.
+    #[cfg(feature = "v06")]
+    next_subplan_id: core::cell::Cell<usize>,
 }
 
 impl<S: Storage> Connection<S> {
@@ -527,6 +538,8 @@ impl<S: Storage> Connection<S> {
             explicit_txn: false,
             #[cfg(feature = "v06")]
             sub_execs: 0,
+            #[cfg(feature = "v06")]
+            next_subplan_id: core::cell::Cell::new(1),
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -693,6 +706,8 @@ impl<S: Storage> Connection<S> {
                 }
                 #[cfg(not(feature = "v08"))]
                 let _ = select;
+                #[cfg(not(feature = "v07"))]
+                let _ = (upsert, returning);
                 // Every row of a multi-row VALUES must match the
                 // expected width (SQLite: "all VALUES must have
                 // the same number of terms").
@@ -1217,8 +1232,12 @@ impl<S: Storage> Connection<S> {
     /// source count — the absolute threshold below which a
     /// reference is bound to an enclosing scope.
     #[cfg(feature = "v06")]
-    fn stamp_subplan(plan: &mut crate::query::SubPlan, base_width: usize, base_src: usize) {
-        plan.id = NEXT_SUBPLAN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    fn stamp_subplan(&self, plan: &mut crate::query::SubPlan, base_width: usize, base_src: usize) {
+        let id = self.next_subplan_id.get();
+        // Wrapping past usize::MAX would take 2^64 plans; skip 0,
+        // which marks an unstamped plan.
+        self.next_subplan_id.set(id.wrapping_add(1).max(1));
+        plan.id = id;
         plan.uncorrelated = crate::query::plan_is_uncorrelated(plan, base_width, base_src);
     }
 
@@ -1308,7 +1327,7 @@ impl<S: Storage> Connection<S> {
                 id: 0,
                 uncorrelated: false,
             };
-            Self::stamp_subplan(&mut plan, base_width, base_src);
+            self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok(plan);
         }
         let mut descs: AVec<SourceDesc> = AVec::new();
@@ -1583,7 +1602,7 @@ impl<S: Storage> Connection<S> {
             id: 0,
             uncorrelated: false,
         };
-        Self::stamp_subplan(&mut plan, base_width, base_src);
+        self.stamp_subplan(&mut plan, base_width, base_src);
         Ok(plan)
     }
 
@@ -1901,6 +1920,8 @@ impl<S: Storage> Connection<S> {
         returning: &AVec<SelectItem>,
     ) -> Result<Plan, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
+        #[cfg(not(feature = "v07"))]
+        let _ = returning;
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
         let qualifier: &[u8] = match alias {
@@ -2074,6 +2095,8 @@ impl<S: Storage> Connection<S> {
         returning: &AVec<SelectItem>,
     ) -> Result<Plan, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
+        #[cfg(not(feature = "v07"))]
+        let _ = returning;
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
         let (sources, offsets) = self.single_source(t, tname);
@@ -4090,6 +4113,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         new_rec: &[OwnedValue],
         new_rowid: i64,
     ) -> Result<(), S::Error> {
+        #[cfg(not(feature = "indexes"))]
+        let _ = old_rec;
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
             Plan::Insert { indexes, .. } => indexes.clone(),
@@ -5299,6 +5324,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         sources: &[SourcePlan],
         outer: &RowData,
     ) -> Result<AVec<AVec<(AVec<OwnedValue>, Option<i64>)>>, S::Error> {
+        #[cfg(not(feature = "v09"))]
+        let _ = outer;
         let mut src_rows: AVec<AVec<(AVec<OwnedValue>, Option<i64>)>> = AVec::new();
         for sp in sources.iter() {
             #[cfg(feature = "v09")]
@@ -6726,6 +6753,7 @@ fn item_name_keys(
 /// A VALUES core's result column name (v0.9): `column1`,
 /// `column2`, ... (pin-verified via the CLI header).
 #[cfg(feature = "v04")]
+#[cfg_attr(not(feature = "v09"), allow(dead_code))]
 fn values_col_name(i: usize) -> AVec<u8> {
     let mut v = AVec::new();
     v.extend_from_slice(b"column");

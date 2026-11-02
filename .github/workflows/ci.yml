@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Keep in sync with rust-toolchain.toml (the size ratchet depends on it).
+  RUST_TOOLCHAIN: "1.97.0"
+  # NOTE: never set RUSTFLAGS globally — it would replace the
+  # thumbv7em linker-script flags from .cargo/config.toml.
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    needs: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (default features, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy (all features, all targets)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  features:
+    name: feature matrix
+    needs: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Every feature set compiles warning-free (RISKS R14; ci/feature-sets.txt)
+        run: |
+          set -euo pipefail
+          while IFS= read -r line; do
+            [[ -z "${line}" || "${line}" == \#* ]] && continue
+            f="${line}"; [[ "${f}" == "-" ]] && f=""
+            echo "::group::--no-default-features --features '${f}'"
+            cargo clippy --lib --no-default-features --features "${f}" -- -D warnings
+            echo "::endgroup::"
+          done < ci/feature-sets.txt
+      - name: Library unit tests, tiny profile
+        run: cargo test --lib --no-default-features
+      - name: Library unit tests, full no_std profile
+        run: cargo test --lib --no-default-features --features full
+
+  test:
+    name: test (vs pinned SQLite 3.54.1 oracle)
+    needs: fmt
+    runs-on: ubuntu-24.04
+    env:
+      HIPP_ORACLE: ${{ github.workspace }}/../hipp-design/oracle/sqlite3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache the pinned oracle
+        id: oracle-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../hipp-design/oracle
+          key: sqlite-oracle-3540100-${{ runner.os }}-${{ hashFiles('ci/build-oracle.sh') }}
+      - name: Build the pinned oracle (SQLite 3.54.1, SHA3-verified)
+        run: ci/build-oracle.sh "${{ github.workspace }}/../hipp-design/oracle"
+      - name: Oracle version
+        run: '"$HIPP_ORACLE" --version'
+      - name: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
+
+  no_std:
+    name: no_std build (${{ matrix.target }})
+    needs: fmt
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - thumbv7em-none-eabihf
+          - thumbv6m-none-eabi
+          - riscv32imac-unknown-none-elf
+          - wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Core, tiny profile
+        run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features
+      - name: Core, full no_std profile
+        run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features --features full
+
+  size:
+    name: size gate (thumbv7em tiny + full)
+    needs: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: size
+      - name: Build tiny profile demo
+        run: cargo build --profile tiny --target thumbv7em-none-eabihf --no-default-features --bin hipp_thumb_demo
+      - name: Tiny gate + ratchet (SPEC §4.1)
+        run: python3 ci/size_gate.py --section tiny target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
+      - name: Build full no_std profile demo
+        run: cargo build --profile tiny --target thumbv7em-none-eabihf --no-default-features --features full --bin hipp_thumb_demo
+      - name: Full-profile gate + ratchet
+        run: python3 ci/size_gate.py --section full target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
+
+  miri:
+    name: miri (arena, the only unsafe)
+    needs: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri,rust-src
+          cargo +nightly miri setup
+      - name: miri arena + record unit tests
+        run: cargo +nightly miri test --lib --no-default-features -- arena record
+
+  coverage:
+    name: coverage
+    needs: fmt
+    runs-on: ubuntu-24.04
+    env:
+      HIPP_ORACLE: ${{ github.workspace }}/../hipp-design/oracle/sqlite3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Cache the pinned oracle
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../hipp-design/oracle
+          key: sqlite-oracle-3540100-${{ runner.os }}-${{ hashFiles('ci/build-oracle.sh') }}
+      - name: Build the pinned oracle
+        run: ci/build-oracle.sh "${{ github.workspace }}/../hipp-design/oracle"
+      - name: Coverage (core crate, full test suite)
+        run: |
+          cargo llvm-cov --workspace --no-fail-fast --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee coverage.txt
+          { echo '### Coverage'; echo; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info

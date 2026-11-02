@@ -11,9 +11,13 @@
 use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
 
+#[cfg(feature = "v09")]
+use super::ast::CompoundOp;
+#[cfg(feature = "v07")]
+use super::ast::UpsertAction;
 use super::ast::{
-    Ast, BinOp, ColumnDef, CompoundOp, ConflictAction, ConstraintSet, Expr, FromSource,
-    IndexColumnDef, JoinKind, Literal, SelectItem, SelectStmt, Upsert, UpsertAction,
+    Ast, BinOp, ColumnDef, ConflictAction, ConstraintSet, Expr, FromSource, IndexColumnDef,
+    JoinKind, Literal, SelectItem, SelectStmt, Upsert,
 };
 use alloc::boxed::Box;
 
@@ -1288,6 +1292,8 @@ impl<'a> Parser<'a> {
                     self.pos = save;
                     extra_parens = 0;
                 }
+                #[cfg(not(feature = "v06"))]
+                let _ = extra_parens;
                 if is_subquery {
                     #[cfg(feature = "v06")]
                     {
