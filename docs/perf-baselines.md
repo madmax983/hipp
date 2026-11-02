@@ -18,3 +18,22 @@ debuginfo) from `examples/bolt_workload`. Reproduce:
 At n=1000 malloc/free/realloc account for ~40% of all instructions; 18.6%
 of the total is Vec allocation/growth inside `join_rows` (it clones the
 accumulator row for every outer x inner pair).
+
+## index_insert descent/leaf scan (baseline at 2d6f730)
+
+Linear scan decodes every cell on the descent path (copy + assemble +
+decode into owned values: several allocations per cell).
+
+| n    | total Ir      | index_insert inclusive Ir |
+|------|---------------|---------------------------|
+| 500  | 1,197,934,791 | 553,198,487 (46.2%)       |
+| 1000 | 3,371,808,347 | 1,334,609,167 (39.6%)     |
+| 2000 | 9,811,562,547 | 2,846,547,273 (29.0%)     |
+
+### After: binary search over sorted cells in index_insert
+
+| n    | total Ir      | Δ total | index_insert Ir | Δ index_insert |
+|------|---------------|---------|-----------------|----------------|
+| 500  | 975,531,342   | -18.6%  | 330,646,286     | -40.2%         |
+| 1000 | 2,822,970,068 | -16.3%  | 785,336,396     | -41.2%         |
+| 2000 | 8,629,951,563 | -12.0%  | 1,665,455,821   | -41.5%         |
