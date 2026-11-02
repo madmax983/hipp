@@ -329,6 +329,107 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether token `i` starts a `WITH` clause (v0.16, `v16`;
+    /// always false without it, so the clause stays a syntax
+    /// error there).
+    fn with_at(&self, i: usize) -> bool {
+        cfg!(feature = "v16") && self.is_kw(i, b"WITH")
+    }
+
+    /// `WITH [RECURSIVE] cte [, cte ...]` (v0.16, `v16`; the pin's
+    /// grammar): each CTE is `name [(col, ...)] AS [[NOT]
+    /// MATERIALIZED] (select-stmt)`.
+    #[cfg(feature = "v16")]
+    fn with_clause<E>(&mut self) -> Result<crate::sql::ast::With, E> {
+        self.expect_kw::<E>(b"WITH")?;
+        let _ = self.eat_kw(b"RECURSIVE");
+        let mut ctes = AVec::new();
+        loop {
+            let name = match self.cur().tok {
+                Tok::Ident(h, _) => {
+                    self.pos += 1;
+                    h
+                }
+                _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+            };
+            let mut columns = AVec::new();
+            if self.eat(Tok::LParen) {
+                loop {
+                    match self.cur().tok {
+                        Tok::Ident(h, _) => {
+                            self.pos += 1;
+                            columns.push(h);
+                        }
+                        _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+                    }
+                    if self.eat(Tok::Comma) {
+                        continue;
+                    }
+                    self.expect::<E>(Tok::RParen)?;
+                    break;
+                }
+            }
+            self.expect_kw::<E>(b"AS")?;
+            if self.eat_kw(b"NOT") {
+                self.expect_kw::<E>(b"MATERIALIZED")?;
+            } else {
+                let _ = self.eat_kw(b"MATERIALIZED");
+            }
+            self.expect::<E>(Tok::LParen)?;
+            let select = self.select_rich::<E>()?;
+            self.expect::<E>(Tok::RParen)?;
+            ctes.push(crate::sql::ast::Cte {
+                name,
+                columns,
+                select,
+            });
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        Ok(crate::sql::ast::With { ctes })
+    }
+
+    /// A statement led by a WITH clause (v0.16, `v16`): a select
+    /// statement keeps the clause itself; INSERT / REPLACE /
+    /// UPDATE / DELETE are wrapped in `Ast::With`.
+    #[cfg(feature = "v16")]
+    fn with_statement<E>(&mut self) -> Result<Ast, E> {
+        let save = self.pos;
+        let with = self.with_clause::<E>()?;
+        if self.cur_is_kw(b"SELECT") || self.cur_is_kw(b"VALUES") {
+            self.pos = save;
+            return Ok(Ast::Select(self.select_rich::<E>()?));
+        }
+        let body = if self.cur_is_kw(b"INSERT") {
+            self.insert::<E>(false)?
+        } else if self.cur_is_kw(b"REPLACE") {
+            self.replace_dispatch::<E>()?
+        } else if self.cur_is_kw(b"UPDATE") {
+            self.update_dispatch::<E>()?
+        } else if self.cur_is_kw(b"DELETE") {
+            self.delete_dispatch::<E>()?
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        Ok(Ast::With {
+            with: Box::new(with),
+            body: Box::new(body),
+        })
+    }
+
+    /// `name`, also saying whether the `main.` qualifier was
+    /// written (v0.16, `v16`: a qualified name never denotes a
+    /// CTE).
+    #[cfg(feature = "v16")]
+    fn name_q<E>(&mut self) -> Result<(ABytes, bool), E> {
+        let qualified = matches!(
+            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+            Some(Tok::Dot)
+        );
+        Ok((self.name::<E>()?, qualified))
+    }
+
     fn expect_end<E>(&mut self) -> Result<(), E> {
         self.eat(Tok::Semi);
         if self.at_eof() {
@@ -365,6 +466,15 @@ impl<'a> Parser<'a> {
             self.delete_dispatch::<E>()
         } else if self.cur_is_kw(b"SELECT") {
             self.select::<E>()
+        } else if self.with_at(self.pos) {
+            #[cfg(feature = "v16")]
+            {
+                self.with_statement::<E>()
+            }
+            #[cfg(not(feature = "v16"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
         } else if self.cur_is_kw(b"VALUES") {
             // A standalone VALUES statement (v0.9): a select
             // statement whose first core is a VALUES core.
@@ -1216,7 +1326,7 @@ impl<'a> Parser<'a> {
     /// before.
     #[cfg(feature = "v08")]
     fn insert_source<E>(&mut self) -> Result<InsertSource, E> {
-        if self.cur_is_kw(b"SELECT") {
+        if self.cur_is_kw(b"SELECT") || self.with_at(self.pos) {
             return Ok(InsertSource {
                 rows: AVec::new(),
                 select: Some(Box::new(self.select_rich::<E>()?)),
@@ -1848,10 +1958,10 @@ impl<'a> Parser<'a> {
         // is required at plan time.
         #[cfg(feature = "v16")]
         if let Tok::Ident(..) = self.cur().tok {
-            let table = self.name::<E>()?;
+            let (table, qualified) = self.name_q::<E>()?;
             return Ok(Expr::InSubquery(
                 Box::new(l),
-                Box::new(self.table_select(table)),
+                Box::new(self.table_select(table, qualified)),
                 neg,
             ));
         }
@@ -1865,8 +1975,9 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             extra_parens += 1;
         }
-        let is_subquery =
-            self.cur_is_kw(b"SELECT") || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"));
+        let is_subquery = self.cur_is_kw(b"SELECT")
+            || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            || self.with_at(self.pos);
         if !is_subquery {
             // An expression list whose first item is
             // parenthesised: rewind and let the list parser see
@@ -2009,7 +2120,10 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 extra_parens += 1;
             }
-            if !self.cur_is_kw(b"SELECT") && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES")) {
+            if !self.cur_is_kw(b"SELECT")
+                && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+                && !self.with_at(self.pos)
+            {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
             let stmt = self.select_rich::<E>()?;
@@ -2019,7 +2133,10 @@ impl<'a> Parser<'a> {
             return Ok(Expr::ExistsSubquery(Box::new(stmt)));
         }
         if self.eat(Tok::LParen) {
-            if self.cur_is_kw(b"SELECT") || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES")) {
+            if self.cur_is_kw(b"SELECT")
+                || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+                || self.with_at(self.pos)
+            {
                 #[cfg(feature = "v06")]
                 {
                     let stmt = self.select_rich::<E>()?;
@@ -2224,7 +2341,17 @@ impl<'a> Parser<'a> {
     /// `v09` feature this is exactly the pre-v0.9 single core
     /// plus its tail.
     fn select_rich<E>(&mut self) -> Result<SelectStmt, E> {
+        #[cfg(feature = "v16")]
+        let with = if self.with_at(self.pos) {
+            Some(Box::new(self.with_clause::<E>()?))
+        } else {
+            None
+        };
         let mut head = self.select_core::<E>()?;
+        #[cfg(feature = "v16")]
+        {
+            head.with = with;
+        }
         #[cfg(feature = "v09")]
         {
             let mut compound: AVec<(CompoundOp, SelectStmt)> = AVec::new();
@@ -2313,6 +2440,8 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values,
+            #[cfg(feature = "v16")]
+            with: None,
         })
     }
 
@@ -2393,6 +2522,8 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values: AVec::new(),
+            #[cfg(feature = "v16")]
+            with: None,
         })
     }
 
@@ -2493,7 +2624,7 @@ impl<'a> Parser<'a> {
     /// `SELECT * FROM <table>` as an AST (v0.16: the subquery an
     /// `x IN table` operand stands for).
     #[cfg(feature = "v16")]
-    fn table_select(&self, table: ABytes) -> SelectStmt {
+    fn table_select(&self, table: ABytes, qualified: bool) -> SelectStmt {
         let mut items = AVec::new();
         items.push(SelectItem::Star);
         let mut from = AVec::new();
@@ -2506,6 +2637,8 @@ impl<'a> Parser<'a> {
             natural: false,
             using: AVec::new(),
             args: None,
+            qualified,
+            cte: None,
         });
         SelectStmt {
             distinct: false,
@@ -2519,6 +2652,7 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values: AVec::new(),
+            with: None,
         }
     }
 
@@ -2664,7 +2798,7 @@ impl<'a> Parser<'a> {
                 depth += 1;
                 i += 1;
             }
-            if self.is_kw(i, b"SELECT") || self.is_kw(i, b"VALUES") {
+            if self.is_kw(i, b"SELECT") || self.is_kw(i, b"VALUES") || self.with_at(i) {
                 for _ in 0..depth {
                     self.expect::<E>(Tok::LParen)?;
                 }
@@ -2684,9 +2818,16 @@ impl<'a> Parser<'a> {
                     using,
                     #[cfg(feature = "v16")]
                     args: None,
+                    #[cfg(feature = "v16")]
+                    qualified: false,
+                    #[cfg(feature = "v16")]
+                    cte: None,
                 });
             }
         }
+        #[cfg(feature = "v16")]
+        let (table, qualified) = self.name_q::<E>()?;
+        #[cfg(not(feature = "v16"))]
         let table = self.name::<E>()?;
         // A table-valued function (v0.16): `name(arg, ...)`.
         #[cfg(feature = "v16")]
@@ -2717,6 +2858,10 @@ impl<'a> Parser<'a> {
             using,
             #[cfg(feature = "v16")]
             args,
+            #[cfg(feature = "v16")]
+            qualified,
+            #[cfg(feature = "v16")]
+            cte: None,
         })
     }
 

@@ -360,6 +360,77 @@ pub struct FromSource {
     /// ordinary table name.
     #[cfg(feature = "v16")]
     pub args: Option<AVec<Expr>>,
+    /// The name was written with its schema qualifier (`main.t`;
+    /// v0.16, `v16`): such a name never denotes a common table
+    /// expression, as on the pin.
+    #[cfg(feature = "v16")]
+    pub qualified: bool,
+    /// What the planner's view / CTE expansion made of this
+    /// source (v0.16, `v16`; `None` from the parser): see
+    /// `CteUse`.
+    #[cfg(feature = "v16")]
+    pub cte: Option<Box<CteUse>>,
+}
+
+/// A FROM source that the view / common-table-expression
+/// expansion rewrote (v0.16, `v16`; `session::cte`). The parser
+/// never builds one: the expansion turns a source naming a view
+/// or a CTE into a derived table holding a copy of its SELECT and
+/// records here what the derived table alone cannot say.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct CteUse {
+    /// The view's or CTE's column-name list, empty when none was
+    /// written. The planner checks its length against the SELECT's
+    /// width when the source is used (the pin's "expected N
+    /// columns" / "table x has N values for M columns").
+    pub columns: AVec<ABytes>,
+    /// The recursion role of the source.
+    pub rec: RecMark,
+    /// The source is a view (not a CTE): its unaliased column
+    /// references are named by their tables' own column names (the
+    /// pin resolves a view's SELECT before naming its columns, a
+    /// CTE's or FROM subquery's after: `SELECT rowid FROM t` names
+    /// its column after t's INTEGER PRIMARY KEY only in a view).
+    pub view: bool,
+}
+
+/// A source's part in a recursive CTE (v0.16, `v16`).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecMark {
+    /// An ordinary view / CTE use.
+    None,
+    /// The derived table is a recursive CTE: compound cores
+    /// `split..` (counting the head core as 0) are the recursive
+    /// SELECTs, the ones before them the setup; `id` names the
+    /// CTE's recursive references inside them.
+    Body { split: usize, id: u32 },
+    /// The one recursive reference (by `id`) in a recursive
+    /// SELECT's FROM clause: it reads the row the queue just gave
+    /// up.
+    Ref { id: u32 },
+}
+
+/// A `WITH [RECURSIVE] cte, ...` clause (v0.16, `v16`). The
+/// planner expands every reference before planning (the parser
+/// keeps the clause where it was written).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct With {
+    pub ctes: AVec<Cte>,
+}
+
+/// One common table expression, `name [(col, ...)] AS [[NOT]
+/// MATERIALIZED] (select)` (v0.16, `v16`). The MATERIALIZED hints
+/// are accepted and ignored: they change no result.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct Cte {
+    pub name: ABytes,
+    /// The column-name list, empty when none was written.
+    pub columns: AVec<ABytes>,
+    pub select: SelectStmt,
 }
 
 /// A compound SELECT operator (v0.9). All four operators have
@@ -412,6 +483,11 @@ pub struct SelectStmt {
     /// the pin rejects a trailing ORDER BY / LIMIT as a syntax
     /// error, and so does the parser.
     pub values: AVec<AVec<Expr>>,
+    /// The statement's `WITH` clause (v0.16, `v16`): its CTEs are
+    /// visible to every core, every nested subquery and each
+    /// other.
+    #[cfg(feature = "v16")]
+    pub with: Option<Box<With>>,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
@@ -608,6 +684,16 @@ pub enum Ast {
     Commit,
     /// `ROLLBACK [TRANSACTION]` (v0.2).
     Rollback,
+    /// `WITH ... INSERT / REPLACE / UPDATE / DELETE` (v0.16,
+    /// `v16`): the clause's CTEs are visible throughout the
+    /// statement (its SELECT, FROM, expressions and subqueries,
+    /// never as its target table). A `WITH ... SELECT` keeps its
+    /// clause in `SelectStmt::with` instead.
+    #[cfg(feature = "v16")]
+    With {
+        with: Box<With>,
+        body: Box<Ast>,
+    },
     /// `PRAGMA [schema .] name [= value | (value)]` (v0.16,
     /// `v16`). `value` is the argument's text as the pin hands it
     /// to its pragma code: a name or string dequoted, a number as

@@ -28,6 +28,8 @@ use crate::schema::IndexOrigin;
 use crate::query::{Ctx, RExpr, RowData};
 
 #[cfg(feature = "v16")]
+mod cte;
+#[cfg(feature = "v16")]
 mod pragma;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
@@ -791,6 +793,13 @@ pub struct Connection<S: Storage> {
     /// (`thumbv6m`) do not have.
     #[cfg(feature = "v06")]
     next_subplan_id: core::cell::Cell<usize>,
+    /// The recursive CTEs whose recursive SELECTs are being
+    /// planned (v0.16, `v16`): each one's id and column shape,
+    /// which its recursive reference takes (`plan_rec_ref`). A
+    /// `Cell` taken and put back around each use, for `&self`
+    /// planning.
+    #[cfg(feature = "v16")]
+    rec_scope: core::cell::Cell<AVec<cte::RecShape>>,
     /// The connection state the evaluator reads (v0.16): the
     /// pin's last-insert rowid, change counters and random
     /// stream (`query::Env`; empty without `v16`).
@@ -827,6 +836,8 @@ impl<S: Storage> Connection<S> {
             sub_execs: 0,
             #[cfg(feature = "v06")]
             next_subplan_id: core::cell::Cell::new(1),
+            #[cfg(feature = "v16")]
+            rec_scope: core::cell::Cell::new(AVec::new()),
             #[cfg(feature = "v04")]
             env: crate::query::Env::new(seed),
             #[cfg(feature = "v16")]
@@ -911,6 +922,8 @@ impl<S: Storage> Connection<S> {
             ret_loaded: false,
             #[cfg(feature = "v16")]
             deferred: None,
+            #[cfg(feature = "v16")]
+            rec_rows: AVec::new(),
         })
     }
 
@@ -957,6 +970,12 @@ impl<S: Storage> Connection<S> {
     }
 
     fn plan(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
+        // v0.16: views and CTEs are read as derived tables — every
+        // reference is expanded before anything else is planned.
+        #[cfg(feature = "v16")]
+        let expanded = self.expand_ast(arena, ast)?;
+        #[cfg(feature = "v16")]
+        let ast = expanded.as_ref().unwrap_or(ast);
         // The pin reserves every `sqlite_*` name (any case) for
         // itself (v0.16 fix, ungated: hipp created such tables,
         // indexes and views). Files that already hold one still
@@ -999,6 +1018,9 @@ impl<S: Storage> Connection<S> {
             }
         }
         match ast {
+            // Unwrapped by `expand_ast` above.
+            #[cfg(feature = "v16")]
+            Ast::With { .. } => Err(Error::Unsupported),
             #[cfg(feature = "v16")]
             Ast::Pragma {
                 schema,
@@ -1639,7 +1661,12 @@ impl<S: Storage> Connection<S> {
                     empty_only,
                 })
             }
-            #[cfg(feature = "v04")]
+            // v0.16: the pin stores a view without resolving it; a
+            // missing table, a column-count mismatch or a cycle is
+            // reported when the view is read.
+            #[cfg(feature = "v16")]
+            Ast::CreateView { .. } => Ok(Plan::CreateView),
+            #[cfg(all(feature = "v04", not(feature = "v16")))]
             Ast::CreateView {
                 columns, select, ..
             } => {
@@ -1789,12 +1816,52 @@ impl<S: Storage> Connection<S> {
         sel: &SelectStmt,
     ) -> Result<Plan, S::Error> {
         use crate::record::Affinity;
-        use crate::rules::{item_affinity, item_datatype};
+        use crate::rules::item_affinity;
         let plan = self.plan_subquery(sel, arena, &[])?;
         let w = plan.width();
-        let mut names: AVec<AVec<u8>> = AVec::new();
+        let mut names = self.result_col_names(&plan, (0, 0))?;
         let mut affs: AVec<Affinity> = AVec::new();
         for i in 0..w {
+            let item = plan.items.as_slice().get(i);
+            // Demoted across compound cores; a numeric CAST is the
+            // pin's FLEXNUM, declared ` NUM`.
+            let aff = crate::rules::compound_affinity(
+                item.map_or(Affinity::Blob, item_affinity),
+                item,
+                plan.compound.iter().map(|(_, t)| &**t),
+                i,
+            );
+            affs.push(aff);
+        }
+        crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
+        let mut cols = AVec::new();
+        for (n, a) in names.iter().zip(affs.iter()) {
+            cols.push((n.clone(), *a));
+        }
+        Ok(Plan::CreateTableAs {
+            select: Some(Box::new(plan)),
+            sql: crate::rules::ctas_sql(tname, cols.as_slice()),
+            affs,
+        })
+    }
+
+    /// A planned SELECT's result column names the pin's way
+    /// (`sqlite3ColumnsFromExprList`; v0.16): an alias, else for an
+    /// unaliased column reference (COLLATE skipped) its source's own
+    /// column name — `A` and `s.A` name the column `a` —, for a
+    /// rowid reference `rowid` or the rowid-alias column's name, else
+    /// the result name (the expression's text). CREATE TABLE ... AS,
+    /// derived tables, views and CTEs name their columns by it.
+    /// Not made unique. `base` is the plan's enclosing scopes'
+    /// `(width, source count)`, where its own slots begin.
+    #[cfg(feature = "v16")]
+    fn result_col_names(
+        &self,
+        plan: &crate::query::SubPlan,
+        base: (usize, usize),
+    ) -> Result<AVec<AVec<u8>>, S::Error> {
+        let mut names: AVec<AVec<u8>> = AVec::new();
+        for i in 0..plan.width() {
             let mut name = plan
                 .result_names
                 .as_slice()
@@ -1816,7 +1883,9 @@ impl<S: Storage> Connection<S> {
                 match bare {
                     Some(RExpr::Rowid(src)) => {
                         name = copy_vec(b"rowid");
-                        if let Some(sp) = plan.sources.as_slice().get(*src)
+                        if let Some(sp) = src
+                            .checked_sub(base.1)
+                            .and_then(|k| plan.sources.as_slice().get(k))
                             && let Some(a) = sp.rowid_alias
                             && let Some(n) = self.source_col_name(sp, a)?
                         {
@@ -1824,52 +1893,23 @@ impl<S: Storage> Connection<S> {
                         }
                     }
                     Some(RExpr::Column(slot, ..)) => {
-                        let mut base = 0usize;
+                        let mut at = base.0;
                         for sp in plan.sources.iter() {
-                            if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
+                            if let Some(k) = slot.checked_sub(at).filter(|k| *k < sp.ncols) {
                                 if let Some(n) = self.source_col_name(sp, k)? {
                                     name = n;
                                 }
                                 break;
                             }
-                            base = base.saturating_add(sp.ncols);
+                            at = at.saturating_add(sp.ncols);
                         }
                     }
                     _ => {}
                 }
             }
             names.push(name);
-            let mut aff = item.map_or(Affinity::Blob, item_affinity);
-            if aff != Affinity::Blob && !plan.compound.is_empty() {
-                let mut m = 0u8;
-                for (_, tail) in plan.compound.iter() {
-                    if tail.values.is_empty() {
-                        m |= tail.items.as_slice().get(i).map_or(0, item_datatype);
-                    }
-                    for row in tail.values.iter() {
-                        m |= row.as_slice().get(i).map_or(0, item_datatype);
-                    }
-                }
-                let numeric = matches!(aff, Affinity::Numeric | Affinity::Integer | Affinity::Real);
-                if (aff == Affinity::Text && m & 0x01 != 0) || (numeric && m & 0x02 != 0) {
-                    aff = Affinity::Blob;
-                } else if numeric && matches!(item, Some(RExpr::Cast(..))) {
-                    // The pin's FLEXNUM: declared ` NUM`.
-                    aff = Affinity::Numeric;
-                }
-            }
-            affs.push(aff);
         }
-        crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
-        let mut cols = AVec::new();
-        for (n, a) in names.iter().zip(affs.iter()) {
-            cols.push((n.clone(), *a));
-        }
-        Ok(Plan::CreateTableAs {
-            select: Some(Box::new(plan)),
-            sql: crate::rules::ctas_sql(tname, cols.as_slice()),
-            affs,
-        })
+        Ok(names)
     }
 
     /// The name of column `k` of one planned FROM source (v0.16,
@@ -2236,6 +2276,8 @@ impl<S: Storage> Connection<S> {
                 id: 0,
                 uncorrelated: false,
                 scalar_col: 0,
+                #[cfg(feature = "v16")]
+                rec: None,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
@@ -2269,6 +2311,8 @@ impl<S: Storage> Connection<S> {
             id: 0,
             uncorrelated: false,
             scalar_col: 0,
+            #[cfg(feature = "v16")]
+            rec: None,
         };
         self.stamp_subplan(&mut plan, base_width, base_src);
         Ok((plan, core.keys))
@@ -2974,7 +3018,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Width of a SELECT's result (for CREATE VIEW validation).
-    #[cfg(feature = "v04")]
+    #[cfg(all(feature = "v04", not(feature = "v16")))]
     fn view_select_width(&self, stmt: &SelectStmt, arena: &Arena) -> Result<usize, S::Error> {
         match self.plan_select(stmt, arena)? {
             Plan::Scan { out, .. } => Ok(out.len()),
@@ -3319,6 +3363,13 @@ impl<S: Storage> Connection<S> {
         let _ = derived_scope;
         for s in from.iter() {
             offsets.push(total);
+            // v0.16: a recursive CTE's recursive reference reads
+            // the row its queue gave up.
+            #[cfg(feature = "v16")]
+            if let Some(crate::sql::RecMark::Ref { id }) = s.cte.as_ref().map(|c| c.rec) {
+                total += self.plan_rec_ref(s, id, arena, descs, plans)?;
+                continue;
+            }
             // v0.16: a table-valued pragma function, or the empty
             // temp schema, as the derived table of its rows.
             #[cfg(feature = "v16")]
@@ -3349,6 +3400,15 @@ impl<S: Storage> Connection<S> {
             // against `derived_scope` only (no LATERAL).
             #[cfg(feature = "v09")]
             if let Some(d) = derived {
+                // v0.16: an expanded view or CTE, possibly recursive.
+                #[cfg(feature = "v16")]
+                let mut dplan = match s.cte.as_ref().map(|c| c.rec) {
+                    Some(crate::sql::RecMark::Body { split, id }) => {
+                        self.plan_recursive(d, split, id, s.cte.as_deref(), arena, derived_scope)?
+                    }
+                    _ => self.plan_subquery(d, arena, derived_scope)?,
+                };
+                #[cfg(not(feature = "v16"))]
                 let dplan = self.plan_subquery(d, arena, derived_scope)?;
                 let w = dplan.width();
                 let mut cols = AVec::new();
@@ -3359,10 +3419,31 @@ impl<S: Storage> Connection<S> {
                 // is `id` to `s.id`, NATURAL and USING (review
                 // regression: every duplicate stayed `id`, and
                 // `SELECT *` over a USING join dropped them all).
+                #[cfg(feature = "v16")]
+                if s.cte.as_ref().is_some_and(|c| c.view) {
+                    dplan.result_names = self.result_col_names(
+                        &dplan,
+                        crate::query::ScopeGroup::stack_end(derived_scope),
+                    )?;
+                }
+                #[cfg(feature = "v16")]
+                let mut names = Self::cte_names(arena, s.cte.as_deref(), &dplan)?;
+                // A column list renames the result for every reader
+                // (CREATE TABLE ... AS names its columns by it).
+                #[cfg(feature = "v16")]
+                {
+                    dplan.result_names = names.clone();
+                }
+                #[cfg(not(feature = "v16"))]
                 let mut names = dplan.result_names.clone();
                 crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
-                for (nm, aff) in names.iter().zip(dplan.result_affs.iter()) {
-                    cols.push((nm.clone(), aff.unwrap_or(crate::record::Affinity::Blob)));
+                for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
+                    // A compound's column affinity is demoted across
+                    // its cores, as on the pin (ungated fix: `(SELECT
+                    // text_col ... UNION ALL SELECT 5)` compared as
+                    // TEXT).
+                    let aff = derived_col_affinity(&dplan, i, *aff);
+                    cols.push((nm.clone(), aff));
                     affs.push(crate::record::Affinity::Blob);
                     defaults.push(OwnedValue::Null);
                 }
@@ -3403,6 +3484,8 @@ impl<S: Storage> Connection<S> {
                     defaults,
                     derived: Some(Box::new(dplan)),
                     gcols: None,
+                    #[cfg(feature = "v16")]
+                    rec: 0,
                 });
                 total += w;
                 continue;
@@ -3461,6 +3544,8 @@ impl<S: Storage> Connection<S> {
                 defaults,
                 derived: None,
                 gcols,
+                #[cfg(feature = "v16")]
+                rec: 0,
             });
             total += t.columns.len();
         }
@@ -3946,6 +4031,11 @@ pub struct Statement<'c, S: Storage> {
     /// `v16`: an integrity check that met a corrupt page).
     #[cfg(feature = "v16")]
     deferred: Option<Error<S::Error>>,
+    /// The rows recursive CTEs' queues gave up, innermost last
+    /// (v0.16, `v16`): a recursive reference (`SubSource::rec`)
+    /// reads the last entry with its id.
+    #[cfg(feature = "v16")]
+    rec_rows: AVec<(u32, AVec<OwnedValue>)>,
 }
 
 /// Refuse a new object name the pin reserves (`sqlite_` prefix,
@@ -4713,12 +4803,20 @@ impl<'c, S: Storage> Statement<'c, S> {
             unreachable!()
         };
         let name_b = copy_vec(handle_bytes(&self.arena, *name));
-        if self
+        // One namespace for tables, views and indexes (v0.16 fix,
+        // ungated: hipp created a table over a view or an index of
+        // its name). An index of the name errors even under IF NOT
+        // EXISTS, as on the pin.
+        let taken = self
             .conn
             .catalog
-            .find(&self.conn.catalog_arena, name_b.as_slice())
-            .is_some()
-        {
+            .taken(&self.conn.catalog_arena, name_b.as_slice());
+        if taken == Some(true) {
+            return Err(Error::Schema {
+                kind: SchemaKind::DuplicateIndex,
+            });
+        }
+        if taken.is_some() {
             if *if_not_exists {
                 self.phase = Phase::Done;
                 return Ok(Step::Done);
@@ -4774,12 +4872,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             unreachable!()
         };
         let name_b = copy_vec(handle_bytes(&self.arena, *name));
-        let ca = &self.conn.catalog_arena;
-        let cat = &self.conn.catalog;
-        if cat.find(ca, name_b.as_slice()).is_some()
-            || cat.find_view(ca, name_b.as_slice()).is_some()
-            || cat.find_index(ca, name_b.as_slice()).is_some()
-        {
+        let taken = self
+            .conn
+            .catalog
+            .taken(&self.conn.catalog_arena, name_b.as_slice());
+        if taken == Some(true) {
+            return Err(Error::Schema {
+                kind: SchemaKind::DuplicateIndex,
+            });
+        }
+        if taken.is_some() {
             if *if_not_exists {
                 self.phase = Phase::Done;
                 return Ok(Step::Done);
@@ -4992,18 +5094,20 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         let name_b = copy_vec(handle_bytes(&self.arena, *name));
         let table_b = copy_vec(handle_bytes(&self.arena, *table));
-        // Index names share the schema namespace with tables.
+        // Index names share the schema namespace with tables and
+        // views: a table or view of the name errors even under IF
+        // NOT EXISTS, as on the pin (v0.16 fix, ungated: a view's
+        // name was free, a table's a silent no-op).
         let taken = self
             .conn
             .catalog
-            .find_index(&self.conn.catalog_arena, name_b.as_slice())
-            .is_some()
-            || self
-                .conn
-                .catalog
-                .find(&self.conn.catalog_arena, name_b.as_slice())
-                .is_some();
-        if taken {
+            .taken(&self.conn.catalog_arena, name_b.as_slice());
+        if taken == Some(false) {
+            return Err(Error::Schema {
+                kind: SchemaKind::DuplicateTable,
+            });
+        }
+        if taken == Some(true) {
             if *if_not_exists {
                 return Ok(());
             }
@@ -7091,6 +7195,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             if sp.derived.is_some() {
                 return Err(Error::Unsupported);
             }
+            #[cfg(feature = "v16")]
+            if sp.rec != 0 {
+                return Err(Error::Unsupported);
+            }
             let mut rows = AVec::new();
             let mut cursor = ScanCursor::new(sp.root);
             let mut buf = AVec::new();
@@ -7156,6 +7264,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         let _ = (outer, need);
         let mut src_rows: AVec<AVec<(AVec<OwnedValue>, Option<i64>)>> = AVec::new();
         for sp in sources.iter() {
+            // v0.16: a recursive reference's one row.
+            #[cfg(feature = "v16")]
+            if sp.rec != 0 {
+                let mut rows = AVec::new();
+                if let Some((_, r)) = self.rec_rows.iter().rev().find(|(id, _)| *id == sp.rec) {
+                    rows.push((r.clone(), None));
+                }
+                src_rows.push(rows);
+                continue;
+            }
             #[cfg(feature = "v09")]
             {
                 if let Some(d) = &sp.derived {
@@ -7772,6 +7890,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &RowData,
         need: Option<usize>,
     ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
+        #[cfg(feature = "v16")]
+        if let Some(rec) = plan.rec {
+            return self.exec_recursive(plan, rec, outer, need).await;
+        }
         let plan = plan.clone();
         let window = self.limit_window(&plan.limit, &plan.offset).await?;
         // The rows its reader takes bound the rows it must make.
@@ -9882,5 +10004,24 @@ fn pick_rep_sub<E>(
         plan.order_by.as_slice(),
         grows,
         empty_rep,
+    )
+}
+
+/// A derived table's column `i` comparison affinity (v0.9; the
+/// compound demotion since v0.16): the result item's, demoted
+/// across a compound's cores (`rules::compound_affinity`); BLOB for
+/// none.
+#[cfg(feature = "v09")]
+fn derived_col_affinity(
+    plan: &crate::query::SubPlan,
+    i: usize,
+    aff: Option<crate::record::Affinity>,
+) -> crate::record::Affinity {
+    let a = aff.unwrap_or(crate::record::Affinity::Blob);
+    crate::rules::compound_affinity(
+        a,
+        plan.items.as_slice().get(i),
+        plan.compound.iter().map(|(_, t)| &**t),
+        i,
     )
 }

@@ -545,19 +545,27 @@ where
             // Views print after the tables (the oracle shell's
             // .schema convention), each followed by its
             // `/* name(columns) */` comment line.
+            // The column names are the view's planned ones (v0.16:
+            // views execute); a view that cannot be planned — a
+            // missing table, a column list of the wrong length, a
+            // cycle — gets no comment, as in the oracle shell.
             for v in db.views().iter() {
                 if !arg.is_empty() && !v.name.eq_ignore_ascii_case(arg.as_bytes()) {
                     continue;
                 }
                 let _ = out.write_all(v.sql);
-                let _ = out.write_all(b";\n/* ");
-                let _ = out.write_all(v.name);
+                let _ = out.write_all(b";\n");
+                let Some(cols) = db.view_columns(v.name) else {
+                    continue;
+                };
+                let _ = out.write_all(b"/* ");
+                let _ = out.write_all(&shell_quote_name(v.name));
                 let _ = out.write_all(b"(");
-                for (i, c) in v.columns.iter().enumerate() {
+                for (i, c) in cols.iter().enumerate() {
                     if i > 0 {
                         let _ = out.write_all(b",");
                     }
-                    let _ = out.write_all(&shell_quote_name(c));
+                    let _ = out.write_all(&shell_quote_name(c.as_slice()));
                 }
                 let _ = out.write_all(b") */\n");
             }

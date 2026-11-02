@@ -660,6 +660,26 @@ pub struct SubSource {
     /// The table's generated columns (v0.16): VIRTUAL ones are
     /// absent from the record and computed as each row is read.
     pub gcols: Option<Box<crate::rules::GenCols>>,
+    /// A recursive CTE's recursive reference (v0.16, `v16`): when
+    /// non-zero, the source's one row is the row the CTE's queue
+    /// last gave up (`RecInfo::id`); `root` is unused.
+    #[cfg(feature = "v16")]
+    pub rec: u32,
+}
+
+/// A recursive common table expression's shape (v0.16, `v16`),
+/// carried by its `SubPlan`: compound tails from index `split - 1`
+/// on are the recursive SELECTs, the plan's head and the tails
+/// before them the setup. `comp_order` / `limit` / `offset` are
+/// the CTE's own ORDER BY (the queue order) and row window.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy)]
+pub struct RecInfo {
+    pub split: usize,
+    /// UNION (rows seen before are dropped) rather than UNION ALL.
+    pub union: bool,
+    /// The id the recursive references read (`SubSource::rec`).
+    pub id: u32,
 }
 
 /// A planned subquery (v0.6): a full SELECT planned against the
@@ -742,6 +762,9 @@ pub struct SubPlan {
     /// b) = (SELECT ...)`), where part `i` is a copy of the plan
     /// yielding column `i` of the first row.
     pub scalar_col: usize,
+    /// A recursive CTE (v0.16, `v16`; see `RecInfo`).
+    #[cfg(feature = "v16")]
+    pub rec: Option<RecInfo>,
 }
 
 impl SubPlan {
@@ -968,29 +991,19 @@ pub(crate) fn resolve_column_in_group<E>(
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Option<Result<RExpr, E>> {
-    if let Some(q) = table {
-        for (si, src) in group.sources.iter().enumerate() {
-            if !eq_ci(src.qualifier.as_slice(), q) {
-                continue;
-            }
-            if let Some(ci) = src.column_index(name) {
-                return Some(Ok(src.column_ref(group, si, ci)));
-            }
-            if is_rowid_name(name) && src.has_rowid {
-                return Some(Ok(RExpr::Rowid(group.first_src + si)));
-            }
-            // The qualifier matched but the column does not
-            // exist here: the pin's `lookupName` goes on to the
-            // enclosing scopes (v0.16 fix: `SELECT (SELECT
-            // max(t.a) FROM u AS t) FROM t` reads the outer t.a;
-            // hipp answered "no such column").
-        }
-        return None;
-    }
+    // A qualified reference counts only the sources of that name
+    // (v0.16 fix, ungated: `SELECT t.a FROM t, t` read the first t
+    // where the pin reports "ambiguous column name"); a USING
+    // column shared by two of them resolves as unqualified.
     let mut cnt = 0usize;
     let mut found: Option<RExpr> = None;
     let mut full: AVec<RExpr> = AVec::new();
     for (si, src) in group.sources.iter().enumerate() {
+        if let Some(q) = table
+            && !eq_ci(src.qualifier.as_slice(), q)
+        {
+            continue;
+        }
         let Some(ci) = src.column_index(name) else {
             continue;
         };
@@ -1013,6 +1026,22 @@ pub(crate) fn resolve_column_in_group<E>(
         }
         cnt += 1;
         found = Some(src.column_ref(group, si, ci));
+    }
+    if let Some(q) = table
+        && cnt == 0
+    {
+        // The qualifier matched no column: its rowid, or the
+        // enclosing scopes — the pin's `lookupName` goes on there
+        // (v0.16 fix: `SELECT (SELECT max(t.a) FROM u AS t) FROM t`
+        // reads the outer t.a; hipp answered "no such column").
+        if is_rowid_name(name) {
+            for (si, src) in group.sources.iter().enumerate() {
+                if eq_ci(src.qualifier.as_slice(), q) && src.has_rowid {
+                    return Some(Ok(RExpr::Rowid(group.first_src + si)));
+                }
+            }
+        }
+        return None;
     }
     match (cnt, found) {
         (1, Some(e)) => Some(Ok(e)),
@@ -1275,6 +1304,17 @@ pub fn expand_star<E>(
                     None => src.column_ref(cur, si, ci),
                 }
             } else {
+                // With several sources the pin expands `*` to
+                // `q.col` references, so two sources of one name
+                // sharing a column make it ambiguous (v0.16 fix,
+                // ungated: `SELECT * FROM t, t` answered).
+                if srcs.len() > 1
+                    && !src.qualifier.is_empty()
+                    && let Some(Err(e)) =
+                        resolve_column_in_group::<E>(cur, Some(src.qualifier.as_slice()), n)
+                {
+                    return Err(e);
+                }
                 src.column_ref(cur, si, ci)
             };
             out.push((e, cname.clone()));

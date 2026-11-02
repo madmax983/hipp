@@ -251,6 +251,21 @@ impl Catalog {
             .find(|t| eq_ci(handle_bytes(arena, t.name), name))
     }
 
+    /// What a schema name is taken by (v0.16): `Some(true)` for an
+    /// index, `Some(false)` for a table or view, `None` when free —
+    /// tables, views and indexes share one namespace.
+    pub fn taken(&self, arena: &Arena, name: &[u8]) -> Option<bool> {
+        let hit = |h: ABytes| eq_ci(handle_bytes(arena, h), name);
+        if self.indexes.iter().any(|i| hit(i.name)) {
+            Some(true)
+        } else if self.tables.iter().any(|t| hit(t.name)) || self.views.iter().any(|v| hit(v.name))
+        {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// All indexes (explicit and implicit) on one table.
     pub fn indexes_for<'x>(
         &'x self,

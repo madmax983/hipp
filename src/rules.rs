@@ -1053,7 +1053,7 @@ pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
 /// The pin's `sqlite3ExprAffinity` of one resolved result item:
 /// a column's affinity, a CAST's, INTEGER for a rowid, a scalar
 /// subquery's first result item's; none (BLOB) for anything else.
-#[cfg(feature = "v16")]
+#[cfg(feature = "v09")]
 pub fn item_affinity(e: &RExpr) -> Affinity {
     match e {
         RExpr::Column(_, a, _) | RExpr::Cast(_, a) => *a,
@@ -1071,7 +1071,7 @@ pub fn item_affinity(e: &RExpr) -> Affinity {
 /// The pin's `sqlite3ExprDataType` bits of one later compound
 /// core's result item (0x01 numeric-ish, 0x02 text, 0x04 blob),
 /// which can demote the leftmost core's affinity.
-#[cfg(feature = "v16")]
+#[cfg(feature = "v09")]
 pub fn item_datatype(e: &RExpr) -> u8 {
     match e {
         RExpr::Literal(OwnedValue::Null) => 0x00,
@@ -1096,5 +1096,44 @@ pub fn item_datatype(e: &RExpr) -> u8 {
             m
         }
         _ => 0x01,
+    }
+}
+
+/// Column `i`'s affinity as a compound SELECT's result column (the
+/// pin's `sqlite3SubqueryColumnTypes`; v0.16, ungated on the v0.9
+/// derived-table path): the leftmost core's `aff`, demoted to none
+/// (BLOB) when a later core's item can be of the other class — a
+/// TEXT column with a numeric item elsewhere, a numeric one with a
+/// text item — and a numeric CAST becoming NUMERIC (the pin's
+/// FLEXNUM). `head` is the leftmost core's item, `tails` the later
+/// cores.
+#[cfg(feature = "v09")]
+pub fn compound_affinity<'p>(
+    aff: Affinity,
+    head: Option<&RExpr>,
+    tails: impl Iterator<Item = &'p crate::query::SubPlan>,
+    i: usize,
+) -> Affinity {
+    let mut any = false;
+    let mut m = 0u8;
+    for tail in tails {
+        any = true;
+        if tail.values.is_empty() {
+            m |= tail.items.as_slice().get(i).map_or(0, item_datatype);
+        }
+        for row in tail.values.iter() {
+            m |= row.as_slice().get(i).map_or(0, item_datatype);
+        }
+    }
+    if !any || aff == Affinity::Blob {
+        return aff;
+    }
+    let numeric = matches!(aff, Affinity::Numeric | Affinity::Integer | Affinity::Real);
+    if (aff == Affinity::Text && m & 0x01 != 0) || (numeric && m & 0x02 != 0) {
+        Affinity::Blob
+    } else if numeric && matches!(head, Some(RExpr::Cast(..))) {
+        Affinity::Numeric
+    } else {
+        aff
     }
 }

@@ -108,6 +108,13 @@ v10 = ["v09"]
 # `sqlite_schema` / `sqlite_master` as a readable table and the
 # table-valued `pragma_*` functions. (Refusing `sqlite_*` names
 # in CREATE is *not* gated: it corrects claimed paths.)
+# The views / CTE unit executes views (CREATE VIEW then resolves
+# nothing, as on the pin) and adds WITH [RECURSIVE] before SELECT,
+# VALUES, INSERT, REPLACE, UPDATE and DELETE and inside
+# subqueries, with the pin's recursive queue. (The shared
+# table / view / index namespace, ambiguous `q.col` over two
+# sources named `q`, and compound column-affinity demotion in
+# derived tables are *not* gated: they correct claimed paths.)
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.

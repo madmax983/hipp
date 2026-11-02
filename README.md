@@ -318,6 +318,35 @@ aspirations.
   than three objects), the shell's extra collations, correlated
   table-valued arguments, no temp database (STATUS.md).
 
+- **Executed views and common table expressions** (behind
+  `v16`): views are read wherever a table is — FROM, joins
+  (NATURAL / USING / RIGHT / FULL), subqueries, `x IN view`,
+  compound members, view-on-view, UPDATE ... FROM, INSERT ...
+  SELECT, CREATE TABLE ... AS — with `CREATE VIEW v(a, b)`
+  column lists, the pin's lazy CREATE VIEW (a missing table,
+  a wrong-length column list or a cycle is the reader's error)
+  and its refusals of writes to a view. `WITH [RECURSIVE]`
+  before SELECT / VALUES / INSERT / REPLACE / UPDATE / DELETE
+  and inside any subquery: several CTEs, forward references,
+  column lists, MATERIALIZED hints, the pin's scoping (a CTE
+  shadows a table, never a DML target or a `main.` name; a view
+  never sees the reader's CTEs). Recursive CTEs run the pin's
+  queue — FIFO, or a priority queue (ties in arrival order)
+  under the CTE's ORDER BY; UNION drops rows seen before;
+  LIMIT / OFFSET count dequeued rows; several recursive SELECTs;
+  an outer `LIMIT` stops an endless one — with its circular /
+  multiple-reference / recursive-aggregate errors. PRAGMA
+  `table_info` and the CLI's `.schema` comment use a view's
+  planned columns. Ungated fixes: tables, views and indexes
+  share one namespace (CREATE TABLE over a view's name worked;
+  tiny +48 B), `t.a` / `*` over two sources named `t` is
+  ambiguous, a derived compound's column affinity is demoted
+  across its cores, standard type names print as the pin's.
+  Gaps: an endless recursive CTE behind a WHERE never ends;
+  mixed-affinity compound views compare by the demoted affinity
+  where the pin pushes some WHERE terms into each core
+  (STATUS.md).
+
 ## What v0.13 does
 
 - Everything v0.12 does (below), plus **uncorrelated-
@@ -628,7 +657,9 @@ No WAL (files in WAL mode are rejected with `WalUnsupported`),
 no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
 created (refused; foreign ones load), no expression or partial
 indexes, no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
-stored but never executed, no UTF-16, no multi-process
+stored but never executed (all of these in the tiny profile: the
+`v04` ... `v16` rungs add them — views execute with `v16`), no
+UTF-16, no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 
@@ -646,7 +677,8 @@ the v0.16 scalar function library),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor;
-`session/pragma` the PRAGMA statements and integrity check, v0.16),
+`session/pragma` the PRAGMA statements and integrity check,
+`session/cte` view / CTE expansion and the recursive queue, v0.16),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

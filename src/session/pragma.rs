@@ -368,6 +368,17 @@ fn std_type(decl: &[u8]) -> &'static [u8] {
     b""
 }
 
+/// A declared type as the pin shows it (v0.16 fix): one of its
+/// standard type names (`sqlite3StdType`: INT, INTEGER, REAL,
+/// TEXT, BLOB, ANY — any case) in its own spelling, anything else
+/// as written.
+fn shown_type(decl: &[u8]) -> &[u8] {
+    match std_type(decl) {
+        b"" => decl,
+        t => t,
+    }
+}
+
 fn coll_name(c: crate::record::Coll) -> &'static [u8] {
     match c {
         crate::record::Coll::Binary => b"BINARY",
@@ -653,7 +664,7 @@ impl<S: Storage> Connection<S> {
                 let mut r = AVec::new();
                 r.push(int(if x { i as i64 } else { cid }));
                 r.push(text(cname));
-                r.push(text(handle_bytes(&sc, c.decl)));
+                r.push(text(shown_type(handle_bytes(&sc, c.decl))));
                 r.push(int(i64::from(c.not_null)));
                 r.push(dflt);
                 r.push(int(pk));
@@ -666,16 +677,21 @@ impl<S: Storage> Connection<S> {
             return Ok(rows);
         }
         if let Some(v) = self.catalog.find_view(ca, name) {
-            if v.columns.is_empty() {
-                // A view whose columns hipp could not derive.
-                return Err(Error::Unsupported);
+            // The view's columns as planned (v0.16: views execute);
+            // one that cannot be planned is the planner's error, as
+            // on the pin ("no such table: ...").
+            let names = self.view_names(arena, v)?;
+            let mut types = self.view_types(arena, v);
+            if types.len() != names.len() {
+                // A column list of another length than the SELECT
+                // (planned anyway, as on the pin): no types.
+                types = AVec::new();
             }
-            let types = self.view_types(arena, v);
-            for (i, c) in v.columns.iter().enumerate() {
+            for (i, c) in names.iter().enumerate() {
                 let ty = types.as_slice().get(i).cloned().unwrap_or_default();
                 let mut r = AVec::new();
                 r.push(int(i as i64));
-                r.push(text(handle_bytes(ca, *c)));
+                r.push(text(c.as_slice()));
                 r.push(OwnedValue::Text(ty));
                 r.push(int(0));
                 r.push(OwnedValue::Null);
@@ -694,20 +710,14 @@ impl<S: Storage> Connection<S> {
     /// column's declared type when the expression's affinity
     /// agrees; otherwise the affinity's standard name (`NUM` for
     /// NUMERIC), or none for an expression without affinity. The
-    /// view's SELECT is planned with the views it reads inlined
-    /// as derived tables; a SELECT hipp cannot plan gives no
-    /// types (an honest gap).
+    /// view's SELECT is planned with the views and CTEs it reads
+    /// expanded as derived tables (`Connection::expand_view`); a
+    /// SELECT hipp cannot plan gives no types.
     fn view_types(&self, arena: &Arena, v: &crate::schema::ViewDef) -> AVec<AVec<u8>> {
         let mut out = AVec::new();
-        let ca = &self.catalog_arena;
         let ckpt = arena.checkpoint();
         let r = (|| -> Result<AVec<AVec<u8>>, S::Error> {
-            let Ast::CreateView { mut select, .. } =
-                crate::sql::parse::<S::Error>(handle_bytes(ca, v.sql), arena)?
-            else {
-                return Err(Error::Unsupported);
-            };
-            self.inline_views(arena, &mut select, 0)?;
+            let (select, _) = self.expand_view(arena, v)?;
             let plan = self.plan_subquery(&select, arena, &[])?;
             let mut types = AVec::new();
             let w = plan.width();
@@ -718,32 +728,14 @@ impl<S: Storage> Connection<S> {
                         .first()
                         .and_then(|r| r.as_slice().get(i))
                 });
-                let mut aff = item.and_then(view_aff);
-                if aff.is_some() && !plan.compound.is_empty() {
-                    let mut m = 0u8;
-                    for (_, tail) in plan.compound.iter() {
-                        if tail.values.is_empty() {
-                            m |= tail
-                                .items
-                                .as_slice()
-                                .get(i)
-                                .map_or(0, crate::rules::item_datatype);
-                        }
-                        for row in tail.values.iter() {
-                            m |= row.as_slice().get(i).map_or(0, crate::rules::item_datatype);
-                        }
-                    }
-                    let numeric = matches!(
-                        aff,
-                        Some(Affinity::Numeric | Affinity::Integer | Affinity::Real)
-                    );
-                    if (aff == Some(Affinity::Text) && m & 0x01 != 0) || (numeric && m & 0x02 != 0)
-                    {
-                        aff = Some(Affinity::Blob);
-                    } else if numeric && matches!(item, Some(RExpr::Cast(..))) {
-                        aff = Some(Affinity::Numeric);
-                    }
-                }
+                let aff = item.and_then(|e| item_aff(&plan, e)).map(|a| {
+                    crate::rules::compound_affinity(
+                        a,
+                        item,
+                        plan.compound.iter().map(|(_, t)| &**t),
+                        i,
+                    )
+                });
                 let z = item.and_then(|e| self.ztype(&plan, e));
                 let ty: AVec<u8> = match (z, aff) {
                     (Some(z), Some(a)) if crate::record::affinity_of(z.as_slice()) == a => z,
@@ -792,7 +784,7 @@ impl<S: Storage> Connection<S> {
                         return if decl.is_empty() {
                             None
                         } else {
-                            Some(copy_vec(decl))
+                            Some(copy_vec(shown_type(decl)))
                         };
                     }
                     base = base.saturating_add(sp.ncols);
@@ -801,46 +793,6 @@ impl<S: Storage> Connection<S> {
             }
             _ => None,
         }
-    }
-
-    /// Replace each view named in a FROM clause (recursively) by
-    /// its SELECT as a derived table, for type derivation only.
-    fn inline_views(
-        &self,
-        arena: &Arena,
-        stmt: &mut SelectStmt,
-        depth: usize,
-    ) -> Result<(), S::Error> {
-        if depth > 32 {
-            return Err(Error::Unsupported);
-        }
-        let ca = &self.catalog_arena;
-        for s in stmt.from.as_mut_slice().iter_mut() {
-            if let Some(d) = s.derived.as_mut() {
-                self.inline_views(arena, d, depth + 1)?;
-                continue;
-            }
-            let n = handle_bytes(arena, s.table);
-            if self.catalog.find(ca, n).is_some() {
-                continue;
-            }
-            if let Some(v) = self.catalog.find_view(ca, n) {
-                let Ast::CreateView { mut select, .. } =
-                    crate::sql::parse::<S::Error>(handle_bytes(ca, v.sql), arena)?
-                else {
-                    return Err(Error::Unsupported);
-                };
-                self.inline_views(arena, &mut select, depth + 1)?;
-                if s.alias.is_none() {
-                    s.alias = Some(s.table);
-                }
-                s.derived = Some(Box::new(select));
-            }
-        }
-        for (_, c) in stmt.compound.as_mut_slice().iter_mut() {
-            self.inline_views(arena, c, depth + 1)?;
-        }
-        Ok(())
     }
 
     /// The indexes of table `t` in the pin's `pIndex` list order
@@ -1216,6 +1168,36 @@ fn sql_has_where<E>(sql: &[u8]) -> bool {
 
 /// The affinity a view column's expression has (the pin's
 /// `sqlite3ExprAffinity`, `None` for an expression with none).
+/// `view_aff` looking through a derived table's (an expanded
+/// view's or CTE's) column to the item it reads (v0.16): such a
+/// column has its item's affinity, none for a literal — where the
+/// derived source's comparison affinity says BLOB.
+fn item_aff(plan: &crate::query::SubPlan, e: &RExpr) -> Option<Affinity> {
+    match e {
+        RExpr::Collate(x, _) => item_aff(plan, x),
+        RExpr::Column(slot, ..) => {
+            let mut base = 0usize;
+            for sp in plan.sources.iter() {
+                if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
+                    if let Some(d) = &sp.derived {
+                        let it = d.items.as_slice().get(k).or_else(|| {
+                            d.values
+                                .as_slice()
+                                .first()
+                                .and_then(|r| r.as_slice().get(k))
+                        })?;
+                        return item_aff(d, it);
+                    }
+                    break;
+                }
+                base = base.saturating_add(sp.ncols);
+            }
+            view_aff(e)
+        }
+        _ => view_aff(e),
+    }
+}
+
 fn view_aff(e: &RExpr) -> Option<Affinity> {
     match e {
         RExpr::Column(_, a, _) | RExpr::Cast(_, a) => Some(*a),

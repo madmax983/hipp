@@ -27,83 +27,107 @@ use crate::record::OwnedValue;
 pub fn bind_ast<E>(src: &Ast, values: &[OwnedValue], arena: &Arena) -> Result<Ast, E> {
     let mut ast = src.clone();
     let b = Binder { values, arena };
-    match &mut ast {
-        Ast::Select(s) => b.select::<E>(s)?,
-        Ast::Insert {
-            rows,
-            select,
-            upsert,
-            returning,
-            ..
-        } => {
-            for row in rows.as_mut_slice() {
-                for e in row.as_mut_slice() {
-                    b.expr::<E>(e)?;
-                }
-            }
-            if let Some(s) = select {
-                b.select::<E>(s)?;
-            }
-            if let Some(u) = upsert {
-                if let Some(f) = &mut u.target_filter {
-                    b.expr::<E>(f)?;
-                }
-                if let UpsertAction::Update {
-                    assignments,
-                    filter,
-                } = &mut u.action
-                {
-                    for (_, e) in assignments.as_mut_slice() {
+    b.ast::<E>(&mut ast)?;
+    Ok(ast)
+}
+
+impl Binder<'_> {
+    fn ast<E>(&self, ast: &mut Ast) -> Result<(), E> {
+        let b = self;
+        match ast {
+            Ast::Select(s) => b.select::<E>(s)?,
+            Ast::Insert {
+                rows,
+                select,
+                upsert,
+                returning,
+                ..
+            } => {
+                for row in rows.as_mut_slice() {
+                    for e in row.as_mut_slice() {
                         b.expr::<E>(e)?;
                     }
-                    if let Some(f) = filter {
+                }
+                if let Some(s) = select {
+                    b.select::<E>(s)?;
+                }
+                if let Some(u) = upsert {
+                    if let Some(f) = &mut u.target_filter {
                         b.expr::<E>(f)?;
                     }
+                    if let UpsertAction::Update {
+                        assignments,
+                        filter,
+                    } = &mut u.action
+                    {
+                        for (_, e) in assignments.as_mut_slice() {
+                            b.expr::<E>(e)?;
+                        }
+                        if let Some(f) = filter {
+                            b.expr::<E>(f)?;
+                        }
+                    }
                 }
+                b.items::<E>(returning.as_mut_slice())?;
             }
-            b.items::<E>(returning.as_mut_slice())?;
-        }
-        Ast::Update {
-            assignments,
-            from,
-            filter,
-            returning,
-            ..
-        } => {
-            for (_, e) in assignments.as_mut_slice() {
-                b.expr::<E>(e)?;
-            }
-            for f in from.as_mut_slice() {
-                if let Some(on) = &mut f.on {
-                    b.expr::<E>(on)?;
+            Ast::Update {
+                assignments,
+                from,
+                filter,
+                returning,
+                ..
+            } => {
+                for (_, e) in assignments.as_mut_slice() {
+                    b.expr::<E>(e)?;
                 }
-                if let Some(d) = &mut f.derived {
-                    b.select::<E>(d)?;
+                for f in from.as_mut_slice() {
+                    if let Some(on) = &mut f.on {
+                        b.expr::<E>(on)?;
+                    }
+                    if let Some(d) = &mut f.derived {
+                        b.select::<E>(d)?;
+                    }
                 }
+                if let Some(f) = filter {
+                    b.expr::<E>(f)?;
+                }
+                b.items::<E>(returning.as_mut_slice())?;
             }
-            if let Some(f) = filter {
-                b.expr::<E>(f)?;
+            Ast::Delete {
+                filter, returning, ..
+            } => {
+                if let Some(f) = filter {
+                    b.expr::<E>(f)?;
+                }
+                b.items::<E>(returning.as_mut_slice())?;
             }
-            b.items::<E>(returning.as_mut_slice())?;
+            #[cfg(feature = "v16")]
+            Ast::CreateTable {
+                as_select: Some(s), ..
+            } => b.select::<E>(s)?,
+            // `WITH ... INSERT / UPDATE / DELETE` (v0.16): the CTE
+            // bodies, then the statement.
+            #[cfg(feature = "v16")]
+            Ast::With { with, body } => {
+                b.with::<E>(with)?;
+                b.ast::<E>(body)?;
+            }
+            // Every other statement holds no parameters: the parser
+            // refuses them in stored definitions (CREATE TABLE / VIEW,
+            // ALTER TABLE) and the rest have no expressions.
+            _ => {}
         }
-        Ast::Delete {
-            filter, returning, ..
-        } => {
-            if let Some(f) = filter {
-                b.expr::<E>(f)?;
-            }
-            b.items::<E>(returning.as_mut_slice())?;
-        }
-        #[cfg(feature = "v16")]
-        Ast::CreateTable {
-            as_select: Some(s), ..
-        } => b.select::<E>(s)?,
-        // Every other statement holds no parameters: the parser
-        // refuses them in stored definitions (CREATE TABLE / VIEW,
-        // ALTER TABLE) and the rest have no expressions.
-        _ => {}
+        Ok(())
     }
-    Ok(ast)
+
+    /// A WITH clause's CTE bodies (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    fn with<E>(&self, w: &mut super::ast::With) -> Result<(), E> {
+        for c in w.ctes.as_mut_slice() {
+            self.select::<E>(&mut c.select)?;
+        }
+        Ok(())
+    }
 }
 
 struct Binder<'v> {
@@ -234,6 +258,10 @@ impl Binder<'_> {
     }
 
     fn select<E>(&self, s: &mut SelectStmt) -> Result<(), E> {
+        #[cfg(feature = "v16")]
+        if let Some(w) = &mut s.with {
+            self.with::<E>(w)?;
+        }
         // Compound ORDER BY terms that are a bare parameter match
         // the first item, scanning the cores from the leftmost,
         // that is the same parameter (`compound_match`). Found

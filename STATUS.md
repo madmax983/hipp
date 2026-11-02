@@ -2483,6 +2483,197 @@ parser, and the table-valued-function planning.
   expression grammar reads `notnull` as a column name where the
   pin's treats it as the postfix NOTNULL operator.
 
+### Executed views and common table expressions (2026-11-02)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated as below. Census (211 probes): `view_exec`,
+`cte`, `cte_rec`, `cte_multi` went HIPP_ERR → MATCH; totals MATCH
+160, HIPP_ERR 29, DIFF 2, BOTH_ERR 20.
+
+**Shipped — `v16`** (new `src/session/cte.rs`; `Ast::With`,
+`SelectStmt::with`, `FromSource::{qualified, cte}`,
+`SubPlan::rec`, `SubSource::rec`):
+
+- *Expansion before planning* (`Connection::expand_ast`): every
+  FROM source naming a view or an in-scope CTE becomes a derived
+  table holding a copy of its SELECT, so views and CTEs are read
+  wherever a FROM subquery is — joins (NATURAL / USING / RIGHT /
+  FULL), subqueries, `x IN name`, compound members, view-on-view,
+  UPDATE ... FROM, INSERT ... SELECT, CREATE TABLE ... AS,
+  RETURNING and upsert expressions. Name lookup follows the pin's
+  `selectExpander` / `withExpand`: unqualified names search the
+  visible WITH clauses innermost first (every CTE of one clause
+  sees the others, forward references included; a CTE body sees
+  only its own clause and those around it), then tables, then
+  views; `main.x` is never a CTE; a view body sees none of the
+  reader's CTEs; a DML target is never a CTE. A view or CTE
+  without an alias is qualified by its name.
+- *Views:* `CREATE VIEW v(a, b)` names the columns (the length is
+  checked when the view is read: `ColumnCountMismatch`); CREATE
+  VIEW resolves nothing (a missing table or column is the reading
+  statement's error, as on the pin); a cycle is
+  `SchemaKind::CircularView`; INSERT into a view is `IsView`
+  (UPDATE / DELETE / DROP TABLE already were). A view's
+  unaliased column references are named by their tables' own
+  columns (`SELECT rowid FROM t` names the INTEGER PRIMARY KEY);
+  a CTE's and a FROM subquery's keep the spelling — the pin
+  resolves only a view's SELECT before naming its columns.
+  `Connection::view_columns` gives the planned names (a column
+  list of any length as written); PRAGMA `table_info` of a view
+  and the CLI's `.schema` comment use them (no comment for a view
+  that cannot be read, the view name quoted when needed), and the
+  view type derivation now expands views and CTEs through
+  `expand_view` (the PRAGMA unit's `inline_views` is gone), looks
+  through derived columns to their items' affinities, and works
+  for views over derived tables.
+- *WITH:* `WITH [RECURSIVE] name [(cols)] AS [[NOT] MATERIALIZED]
+  (select), ...` before SELECT / VALUES (any select statement,
+  so also inside subqueries, derived tables, INSERT ... SELECT,
+  CREATE TABLE / VIEW ... AS) and before INSERT / REPLACE /
+  UPDATE / DELETE (`Ast::With`, unwrapped by the expansion);
+  `DuplicateCteName` (checked used or not), column lists
+  (`ColumnCountMismatch` on use), hints accepted and ignored.
+  Bound parameters inside CTE bodies bind (`sql::bind`).
+- *WITH RECURSIVE* (the pin's `withExpand` +
+  `generateWithRecursiveQuery`): a CTE that is a UNION / UNION
+  ALL compound whose rightmost cores (those joined by the
+  rightmost operator) name it in their own FROM clause is
+  recursive; those cores are the steps, the cores before them
+  the setup (itself any compound). `CircularReference` for any
+  other self-reference (setup, non-UNION compound, subquery-only
+  reference, mutual CTE cycles), `RecursiveReferences` for two
+  references in one step or one inside a step's subquery /
+  the CTE's LIMIT, `RecursiveAggregate` for an aggregate or
+  GROUP BY step. Execution (`Statement::exec_recursive`):
+  LIMIT / OFFSET evaluated first (`LIMIT 0` runs nothing); setup
+  rows enter the queue; each row taken from the queue is output
+  unless OFFSET skips it, the run stops once LIMIT (or the
+  reader's `need`, so `SELECT ... FROM c LIMIT 3` over an endless
+  CTE terminates) is reached, else the row becomes the one row of
+  the recursive reference (`SubSource::rec`, read from
+  `Statement::rec_rows`) for every step, whose rows join the
+  queue. FIFO without ORDER BY; with one, a binary heap on (the
+  ORDER BY key resolved by the compound rules, arrival sequence).
+  UNION drops every row equal (under the compound's column
+  collations) to one that entered before — setup rows included.
+  The recursive table's column affinities are the CTE's compound
+  ones (`rules::compound_affinity`): the steps are planned with
+  the setup's and re-planned once if that demotes a column.
+  Steps are never hoisted as uncorrelated; a recursive CTE inside
+  a correlated subquery runs per outer row.
+
+**Shipped — ungated** (silent wrong answers on claimed paths):
+
+- *One schema namespace* (tiny path): CREATE TABLE over a view
+  of its name succeeded (DuplicateTable now; IF NOT EXISTS a
+  no-op), over an index of its name too (`DuplicateIndex`, even
+  under IF NOT EXISTS); CREATE INDEX over a view's name
+  succeeded and over a table's name was a silent no-op under IF
+  NOT EXISTS (`DuplicateTable` now, as on the pin). One
+  `Catalog::taken` scan.
+- *Same-named sources* (v0.4): `SELECT t.a FROM t, t`, `t.*` /
+  `*` over two sources named `t` (or two derived tables aliased
+  alike, or a view twice) read the first source; the pin reports
+  "ambiguous column name". A qualified name now counts every
+  source of that name like an unqualified one (a shared USING
+  column stays resolvable), and `*` over several sources checks
+  each `q.col` it expands to.
+- *Derived compound affinity* (v0.9): a FROM subquery that is a
+  compound took its leftmost core's column affinity; the pin
+  demotes it (`sqlite3SubqueryColumnTypes`): TEXT with a numeric
+  item in another core, or numeric with a text one, become none;
+  a numeric CAST becomes NUMERIC. Shared with CTAS and the PRAGMA
+  type derivation (`rules::compound_affinity`).
+- *Declared types in PRAGMA table_info* (v16, PRAGMA unit): a
+  type that is one of the pin's standard names (INT, INTEGER,
+  REAL, TEXT, BLOB, ANY, any case) prints in its spelling
+  (`integer` → `INTEGER`), for tables and views.
+
+**Oracle-probing notes** (live pin): CREATE VIEW over a missing
+table / column, with a column list of the wrong length, or
+reading itself all succeed; the reading statement fails
+("expected 2 columns for 'v' but got 1", "view v is circularly
+defined", "no such table: main.t"). A view's PRAGMA table_info
+and `.schema` comment use its column list whatever its length
+(types then empty); an unreadable view has no comment.
+`table_list` reports a view's column count from the connection's
+cached state (0 for a view not yet read in a fresh connection,
+the list's length after CREATE VIEW in the same one) — hipp keeps
+the catalog's count. CTEs: forward references work (`WITH x AS
+(SELECT * FROM y), y AS (...)`), unused CTEs are never checked
+(`WITH x(a) AS (SELECT 1, 2) SELECT 5` is 5) except for duplicate
+names; `WITH t AS (...) INSERT INTO t ...` writes the real t,
+`main.t` reads it; RECURSIVE is optional. Recursive queue:
+`(1,0) ∪ children 2n, 2n+1 ORDER BY 1 DESC` gives 1 3 7 6 2 5 4
+(a max-heap); `SELECT 5 UNION ALL SELECT 3 ... ORDER BY 1` gives
+3 2 1 0 5 4 3 2 1 0; ties leave in arrival order; `LIMIT 4 OFFSET
+2` gives 3 4 5 6 (skipped rows still recurse); `LIMIT 0` gives
+nothing; the CTE's ORDER BY names the leftmost core's result
+columns, not the CTE's column list (`ORDER BY n` over `c(n) AS
+(SELECT 1 ...)` is "does not match any column"). Several
+recursive steps run per row in order; a step reference on the
+right of a LEFT JOIN is accepted. A text setup column with a
+numeric step (`SELECT a FROM t UNION ALL SELECT x + 1 ...`) has
+no affinity: `x < 3` is false for `'1'`. Derived compounds of
+mixed affinity: a WHERE term over them is planner-dependent on
+the pin — `WHERE x > 1` and `x <> 2` evaluate per core (each
+core's own affinity) while `x = 2`, `x < 3`, `IS`, BETWEEN and
+the result list use the demoted (none) affinity; hipp always
+uses the demoted affinity (gap below). `SELECT rowid FROM t` in a
+FROM subquery or CTE is a column named `rowid`, in a view the
+INTEGER PRIMARY KEY's name.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh`
+run end with "==> all gates passed". New suites:
+`tests/views_cte_v16.rs` (16 tests: views read everywhere and in
+writes, view errors, both-way interoperability with oracle-written
+views — CTE and compound bodies included —, view table_info,
+CTEs before SELECT and writes with the files checked by the pin,
+the CTE error matrix, the recursive queue semantics corpus,
+recursive self-joins compared as multisets, a generated recursive
+corpus of 120 CTEs — `HIPP_CTE_CORPUS` scales it; 3 000 ran clean
+—, a generated view / CTE corpus over a random table, bound
+parameters in CTEs, and one regression test per ungated fix);
+`hipp-cli/tests/cli_v16_views_cte.rs` (4 tests: views, CTEs and a
+generated recursive batch byte-identical one-shot and over stdin,
+and the `.schema` view comments over stdin). `tests/query.rs` and
+`tests/subqueries.rs` assert the executed view where they
+asserted the inert one (under `v16`; unchanged without it).
+
+**Size:** tiny **76,116 B** (Δ **+48 B** vs 76,068, ratchet
+raised to it; justified: the shared-namespace check on the tiny
+profile's CREATE TABLE path — one `Catalog::taken` scan over
+indexes, tables and views — a correctness fix). Full **395,669 B**
+(Δ **+15,678 B** vs 379,991, ratchet raised to it; under the
+16 KiB `justify_over`): the expander, the recursive planner and
+queue executor, the WITH grammar, the namespace / ambiguity /
+affinity fixes and the view column naming.
+
+**Honest gaps:**
+
+- An endless recursive CTE stops only at its own LIMIT or a
+  reader that takes a bounded prefix with nothing else in
+  between (`SELECT ... FROM c LIMIT n`); `SELECT x FROM c WHERE
+  x > 5 LIMIT 2` over an endless CTE never ends in hipp, where
+  the pin's coroutine stops. A view or CTE is materialised per
+  reference (and per outer row when correlated); no index helps a
+  WHERE over one.
+- A WHERE comparison over a view / CTE / FROM subquery that is a
+  compound of mixed column affinity: hipp uses the demoted
+  affinity everywhere; the pin pushes some operators (`>`, `>=`,
+  `<>`, ...) into each core and compares with that core's
+  affinity (planner-dependent; the generated corpus avoids it).
+- The CTE's ORDER BY matches result columns by name or ordinal
+  only, not by expression (`ORDER BY x + 1` matching a step's
+  `x + 1` item is "no such column" in hipp; the pin accepts it) —
+  a pre-existing limit of hipp's compound ORDER BY.
+- `PRAGMA table_list`'s view column count is the catalog's
+  (the pin's depends on whether the connection has read the
+  view). Triggers (INSTEAD OF on views) are not supported.
+- Found outside this unit: hipp's parser accepts keywords as
+  bare names in a CREATE VIEW column list (`v(select)`), which
+  the pin rejects.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

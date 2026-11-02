@@ -246,6 +246,36 @@ pub enum SchemaKind {
     /// with CREATE / DROP statements instead.
     #[cfg(feature = "v16")]
     SchemaTableReadOnly,
+    /// A view whose definition reads itself, directly or through
+    /// other views (v0.16, `v16`; the pin's "view v is circularly
+    /// defined", raised when the view is used). Redefine one of
+    /// the views without the cycle.
+    #[cfg(feature = "v16")]
+    CircularView,
+    /// A common table expression that reads itself where it may
+    /// not (v0.16, `v16`; the pin's "circular reference"): a CTE
+    /// that is not a UNION / UNION ALL compound whose last SELECTs
+    /// name it in their FROM clause, a reference from its setup
+    /// SELECTs, or a cycle between CTEs. Make the CTE recursive
+    /// in that shape, or break the cycle.
+    #[cfg(feature = "v16")]
+    CircularReference,
+    /// A recursive SELECT that reads its recursive table more than
+    /// once — twice in its FROM clause, or again inside a
+    /// subquery (v0.16, `v16`; the pin's "multiple references to
+    /// recursive table" / "multiple recursive references"). Read
+    /// the recursive table once per recursive SELECT.
+    #[cfg(feature = "v16")]
+    RecursiveReferences,
+    /// A recursive SELECT with an aggregate or GROUP BY (v0.16,
+    /// `v16`; the pin's "recursive aggregate queries not
+    /// supported"). Aggregate over the CTE's result instead.
+    #[cfg(feature = "v16")]
+    RecursiveAggregate,
+    /// One WITH clause names two CTEs alike (v0.16, `v16`; the
+    /// pin's "duplicate WITH table name"). Rename one.
+    #[cfg(feature = "v16")]
+    DuplicateCteName,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
