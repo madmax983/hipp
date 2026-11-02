@@ -10,7 +10,7 @@
 
 [tiny]
 # .text + .rodata, bytes.
-ratchet = 76016
+ratchet = 76008
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
