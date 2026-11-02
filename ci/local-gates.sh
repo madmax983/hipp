@@ -34,7 +34,15 @@ cargo test -q --lib --no-default-features --features full
 
 if [[ "${quick}" == 0 ]]; then
   step "tests (workspace)"
-  cargo test --workspace --no-fail-fast
+  oracle="${HIPP_ORACLE:-../hipp-design/oracle/sqlite3}"
+  skip=()
+  if ! "${oracle}" --version 2>/dev/null | grep -q '^3\.54\.1 '; then
+    # Local convenience only: CI always runs against the real pin.
+    echo "  WARNING: oracle at ${oracle} is not the 3.54.1 pin;"
+    echo "  skipping the pin-only test literal_bits_match_oracle_on_corpus."
+    skip=(-- --skip literal_bits_match_oracle_on_corpus)
+  fi
+  cargo test --workspace --no-fail-fast "${skip[@]}"
 fi
 
 step "no_std targets"
