@@ -103,6 +103,11 @@ v10 = ["v09"]
 # sums, group_concat()'s NULL separator, the DISTINCT argument
 # count and the group-finalization rules are *not* gated: they
 # correct claimed v0.4 paths.)
+# The PRAGMA unit adds the PRAGMA statement (header values,
+# flags, schema introspection, integrity_check / quick_check),
+# `sqlite_schema` / `sqlite_master` as a readable table and the
+# table-valued `pragma_*` functions. (Refusing `sqlite_*` names
+# in CREATE is *not* gated: it corrects claimed paths.)
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.

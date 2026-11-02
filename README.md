@@ -289,6 +289,35 @@ aspirations.
   arithmetic and CAST reads bytes, so a non-UTF-8 tail no longer
   zeroes it (`x'38ff' + 0` is 8).
 
+- **PRAGMA statements and `sqlite_schema`** (behind `v16`):
+  `PRAGMA [main.]name [= value | (value)]` with the pin's value
+  grammar and conversions; header values (`user_version`,
+  `application_id` read and write inside transactions;
+  `page_size` before the first write; `page_count`,
+  `freelist_count`, `schema_version`, `encoding`,
+  `auto_vacuum`); what hipp actually does (`journal_mode` is
+  `delete`, `synchronous` FULL, `cache_size` its page pool,
+  `busy_timeout`) — any write hipp cannot honour is refused, never
+  pretended; the flags `foreign_keys` (while on, writes to tables
+  in a foreign key are refused: hipp does not enforce them),
+  `recursive_triggers`, `ignore_check_constraints` (really skips
+  CHECK) and `case_sensitive_like` (really changes LIKE);
+  `table_info`, `table_xinfo` (hidden generated columns, view
+  column types), `index_list`, `index_info`, `index_xinfo`,
+  `foreign_key_list`, `table_list`, `database_list`,
+  `collation_list`, byte for byte; `integrity_check` /
+  `quick_check` with the pin's page checks, message shapes,
+  order and limit; the table-valued `pragma_table_info('t')` and
+  friends in FROM; `sqlite_schema` / `sqlite_master` readable as
+  ordinary tables (writes refused). Unknown pragma names are
+  ignored as on the pin; the pin's other known pragmas
+  (`function_list`, `locking_mode`, ...) are refused. Ungated:
+  CREATE of a `sqlite_*` name is refused as on the pin (hipp
+  created such tables). The tiny profile grew 24 B for that fix
+  only. Gaps: the pin's schema hash order (`table_list` with more
+  than three objects), the shell's extra collations, correlated
+  table-valued arguments, no temp database (STATUS.md).
+
 ## What v0.13 does
 
 - Everything v0.12 does (below), plus **uncorrelated-
@@ -616,7 +645,8 @@ rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
 the v0.16 scalar function library),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
-(Connection/Statement, planner, tree-walking executor),
+(Connection/Statement, planner, tree-walking executor;
+`session/pragma` the PRAGMA statements and integrity check, v0.16),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

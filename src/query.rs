@@ -3660,6 +3660,10 @@ pub struct Env {
     /// far (moved to `changes` when it succeeds).
     #[cfg(feature = "v16")]
     pub pending: core::cell::Cell<i64>,
+    /// `PRAGMA case_sensitive_like` (v0.16): LIKE and `like()`
+    /// compare ASCII letters case-sensitively while set.
+    #[cfg(feature = "v16")]
+    pub case_like: core::cell::Cell<bool>,
 }
 
 impl Env {
@@ -3678,6 +3682,8 @@ impl Env {
             prng: crate::func::Prng::new(seed),
             #[cfg(feature = "v16")]
             pending: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            case_like: core::cell::Cell::new(false),
         }
     }
 
@@ -4415,6 +4421,20 @@ fn pattern_match(pat: &[u32], s: &[u8], info: PatInfo) -> bool {
     }
 }
 
+/// Whether `PRAGMA case_sensitive_like` is on for this
+/// evaluation (v0.16; off without the connection state).
+fn case_like(ctx: &Ctx<'_>) -> bool {
+    #[cfg(feature = "v16")]
+    {
+        ctx.env.is_some_and(|e| e.case_like.get())
+    }
+    #[cfg(not(feature = "v16"))]
+    {
+        let _ = ctx;
+        false
+    }
+}
+
 /// The pin's `likeFunc` (v0.16): `like(pattern, subject[,
 /// escape])` / `glob(pattern, subject)`, and the LIKE / GLOB
 /// operators built on them. A pattern over 50,000 bytes is
@@ -4428,6 +4448,7 @@ pub fn like_glob<E>(
     subject: &OwnedValue,
     esc: Option<&OwnedValue>,
     glob: bool,
+    case_sensitive: bool,
 ) -> Result<OwnedValue, E> {
     if to_text(pat).map_or(0, |t| t.len()) > 50_000 {
         return Err(Error::Schema {
@@ -4448,7 +4469,7 @@ pub fn like_glob<E>(
             one: u32::from(b'_'),
             other: 0,
             set: false,
-            nocase: true,
+            nocase: !case_sensitive,
         }
     };
     if let Some(e) = esc {
@@ -4970,6 +4991,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             v1.unwrap_or(&OwnedValue::Null),
             v.get(2),
             f == ScalarFn::Glob,
+            case_like(ctx),
         )?,
         ScalarFn::MinN | ScalarFn::MaxN => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
@@ -5258,7 +5280,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Like(x, p, neg) => {
             let xv = eval::<E>(x, ctx)?;
             let pv = eval::<E>(p, ctx)?;
-            match like_glob::<E>(&pv, &xv, None, false)? {
+            match like_glob::<E>(&pv, &xv, None, false, case_like(ctx))? {
                 OwnedValue::Integer(m) => bool_val((m != 0) != *neg),
                 other => other,
             }

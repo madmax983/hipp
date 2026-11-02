@@ -27,6 +27,9 @@ use crate::schema::IndexOrigin;
 #[cfg(feature = "v04")]
 use crate::query::{Ctx, RExpr, RowData};
 
+#[cfg(feature = "v16")]
+mod pragma;
+
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
 const ROWID_COL: usize = usize::MAX;
@@ -406,6 +409,9 @@ enum Plan {
     DropView {
         exists: bool,
     },
+    /// `PRAGMA` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Pragma(Box<pragma::PragmaPlan>),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -790,6 +796,9 @@ pub struct Connection<S: Storage> {
     /// stream (`query::Env`; empty without `v16`).
     #[cfg(feature = "v04")]
     env: crate::query::Env,
+    /// The PRAGMA flags (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    prag: pragma::PragState,
 }
 
 impl<S: Storage> Connection<S> {
@@ -820,6 +829,8 @@ impl<S: Storage> Connection<S> {
             next_subplan_id: core::cell::Cell::new(1),
             #[cfg(feature = "v04")]
             env: crate::query::Env::new(seed),
+            #[cfg(feature = "v16")]
+            prag: pragma::PragState::default(),
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -898,6 +909,8 @@ impl<S: Storage> Connection<S> {
             ret_pos: 0,
             #[cfg(feature = "v07")]
             ret_loaded: false,
+            #[cfg(feature = "v16")]
+            deferred: None,
         })
     }
 
@@ -944,7 +957,55 @@ impl<S: Storage> Connection<S> {
     }
 
     fn plan(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
+        // The pin reserves every `sqlite_*` name (any case) for
+        // itself (v0.16 fix, ungated: hipp created such tables,
+        // indexes and views). Files that already hold one still
+        // load: the catalog parses stored SQL without planning.
+        let created = match ast {
+            Ast::CreateTable { name, .. } => Some(*name),
+            #[cfg(feature = "indexes")]
+            Ast::CreateIndex { name, .. } => Some(*name),
+            #[cfg(feature = "v04")]
+            Ast::CreateView { name, .. } => Some(*name),
+            _ => None,
+        };
+        if let Some(n) = created {
+            reserved_name::<S::Error>(handle_bytes(arena, n))?;
+        }
+        // v0.16: `sqlite_schema` is readable, never writable; and
+        // with `PRAGMA foreign_keys = ON` a table in a foreign key
+        // is not writable either (hipp does not enforce them).
+        #[cfg(feature = "v16")]
+        {
+            let target = match ast {
+                Ast::Insert { table, .. } | Ast::CreateIndex { table, .. } => Some(*table),
+                Ast::AlterAddColumn { table, .. } => Some(*table),
+                #[cfg(feature = "v05")]
+                Ast::Update { table, .. } | Ast::Delete { table, .. } => Some(*table),
+                #[cfg(feature = "v05")]
+                Ast::DropTable { name, .. } => Some(*name),
+                _ => None,
+            };
+            if let Some(h) = target {
+                let n = handle_bytes(arena, h);
+                if crate::schema::Catalog::is_schema_name(n) {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::SchemaTableReadOnly,
+                    });
+                }
+                if !matches!(ast, Ast::CreateIndex { .. }) {
+                    self.fk_guard(n)?;
+                }
+            }
+        }
         match ast {
+            #[cfg(feature = "v16")]
+            Ast::Pragma {
+                schema,
+                name,
+                value,
+                numeric,
+            } => self.plan_pragma(arena, *schema, *name, *value, *numeric),
             #[cfg(not(feature = "v04"))]
             Ast::CreateTable { .. } => Ok(Plan::CreateTable),
             #[cfg(feature = "v04")]
@@ -1520,7 +1581,8 @@ impl<S: Storage> Connection<S> {
                 let strict_def = strict;
                 #[cfg(not(feature = "v16"))]
                 let strict_def = false;
-                let rules = crate::rules::validate_def::<S::Error>(
+                #[allow(unused_mut)]
+                let mut rules = crate::rules::validate_def::<S::Error>(
                     arena,
                     tname,
                     ncols_def.as_slice(),
@@ -1528,40 +1590,47 @@ impl<S: Storage> Connection<S> {
                     checks.as_slice(),
                     strict_def,
                 )?;
-                let verify =
-                    if !checks.is_empty() || (column.generated && column.not_null) || strict_def {
-                        let mut defaults = AVec::new();
-                        let mut not_null = AVec::new();
-                        for c in t.columns.iter() {
-                            defaults.push(read_default(&self.catalog_arena, c));
-                            not_null.push(c.not_null);
-                        }
-                        not_null.push(column.not_null);
-                        let mut affs = AVec::new();
-                        for c in ncols_def.iter() {
-                            let d = handle_bytes(arena, c.decl);
-                            affs.push(if strict_def && eq_ci(d, b"ANY") {
-                                crate::record::Affinity::Blob
-                            } else {
-                                crate::record::affinity_of(d)
-                            });
-                        }
-                        let aff = affs
-                            .as_slice()
-                            .last()
-                            .copied()
-                            .unwrap_or(crate::record::Affinity::Blob);
-                        defaults.push(apply_affinity(new_default, aff));
-                        Some(Box::new(AlterVerify {
-                            rules,
-                            defaults,
-                            affs,
-                            not_null,
-                            rowid_alias: t.rowid_alias,
-                        }))
-                    } else {
-                        None
-                    };
+                // `PRAGMA ignore_check_constraints` (v0.16).
+                #[cfg(feature = "v16")]
+                if self.prag.ignore_checks {
+                    rules.checks = AVec::new();
+                }
+                let verify = if !rules.checks.is_empty()
+                    || (column.generated && column.not_null)
+                    || strict_def
+                {
+                    let mut defaults = AVec::new();
+                    let mut not_null = AVec::new();
+                    for c in t.columns.iter() {
+                        defaults.push(read_default(&self.catalog_arena, c));
+                        not_null.push(c.not_null);
+                    }
+                    not_null.push(column.not_null);
+                    let mut affs = AVec::new();
+                    for c in ncols_def.iter() {
+                        let d = handle_bytes(arena, c.decl);
+                        affs.push(if strict_def && eq_ci(d, b"ANY") {
+                            crate::record::Affinity::Blob
+                        } else {
+                            crate::record::affinity_of(d)
+                        });
+                    }
+                    let aff = affs
+                        .as_slice()
+                        .last()
+                        .copied()
+                        .unwrap_or(crate::record::Affinity::Blob);
+                    defaults.push(apply_affinity(new_default, aff));
+                    Some(Box::new(AlterVerify {
+                        rules,
+                        defaults,
+                        affs,
+                        not_null,
+                        rowid_alias: t.rowid_alias,
+                    }))
+                } else {
+                    None
+                };
                 Ok(Plan::AlterAdd {
                     root: t.root,
                     table: copy_vec(tname),
@@ -1852,6 +1921,11 @@ impl<S: Storage> Connection<S> {
         let mut checks: AVec<&[u8]> = AVec::new();
         for h in t.checks.iter() {
             checks.push(handle_bytes(ca, *h));
+        }
+        // `PRAGMA ignore_check_constraints` (v0.16).
+        #[cfg(feature = "v16")]
+        if self.prag.ignore_checks {
+            checks.clear();
         }
         #[cfg(feature = "v16")]
         let strict = t.strict;
@@ -2796,6 +2870,15 @@ impl<S: Storage> Connection<S> {
         let tname = handle_bytes(arena, stmt.from.as_slice()[0].table);
         let t = match self.catalog.find(&self.catalog_arena, tname) {
             Some(t) => t.usable()?,
+            // v0.16: `sqlite_schema` and the table-valued pragma
+            // functions read through the general planner.
+            #[cfg(feature = "v16")]
+            None if crate::schema::Catalog::is_schema_name(tname)
+                || tname.get(..7).is_some_and(|p| eq_ci(p, b"pragma_"))
+                || tname.get(..11).is_some_and(|p| eq_ci(p, b"sqlite_temp")) =>
+            {
+                return Err(Error::Unsupported);
+            }
             None => {
                 if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
                     // Views are inert in v0.4 (SPEC §2).
@@ -3236,10 +3319,36 @@ impl<S: Storage> Connection<S> {
         let _ = derived_scope;
         for s in from.iter() {
             offsets.push(total);
+            // v0.16: a table-valued pragma function, or the empty
+            // temp schema, as the derived table of its rows.
+            #[cfg(feature = "v16")]
+            let synth = if s.derived.is_none() {
+                let n = handle_bytes(arena, s.table);
+                if s.args.is_some() || self.catalog.find_readable(&self.catalog_arena, n).is_none()
+                {
+                    match self.pragma_source(arena, n, s.args.as_ref())? {
+                        Some(sel) => Some(Box::new(sel)),
+                        None if s.args.is_some() => {
+                            return Err(Error::Schema {
+                                kind: SchemaKind::UnknownFunction,
+                            });
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            #[cfg(feature = "v16")]
+            let derived = synth.as_ref().or(s.derived.as_ref());
+            #[cfg(all(feature = "v09", not(feature = "v16")))]
+            let derived = s.derived.as_ref();
             // A derived table (v0.9): planned as a subquery
             // against `derived_scope` only (no LATERAL).
             #[cfg(feature = "v09")]
-            if let Some(d) = &s.derived {
+            if let Some(d) = derived {
                 let dplan = self.plan_subquery(d, arena, derived_scope)?;
                 let w = dplan.width();
                 let mut cols = AVec::new();
@@ -3259,6 +3368,9 @@ impl<S: Storage> Connection<S> {
                 }
                 let qual = match s.alias {
                     Some(a) => copy_vec(handle_bytes(arena, a)),
+                    // A table-valued function is named by its
+                    // name (v0.16).
+                    None if s.derived.is_none() => copy_vec(handle_bytes(arena, s.table)),
                     None => AVec::new(),
                 };
                 let mut desc = SourceDesc::new(qual, cols, None, false);
@@ -3296,7 +3408,11 @@ impl<S: Storage> Connection<S> {
                 continue;
             }
             let tname = handle_bytes(arena, s.table);
-            let t = match self.catalog.find(&self.catalog_arena, tname) {
+            #[cfg(feature = "v16")]
+            let found = self.catalog.find_readable(&self.catalog_arena, tname);
+            #[cfg(not(feature = "v16"))]
+            let found = self.catalog.find(&self.catalog_arena, tname);
+            let t = match found {
                 Some(t) => t.usable()?,
                 None => {
                     if self.catalog.find_view(&self.catalog_arena, tname).is_some() {
@@ -3826,6 +3942,21 @@ pub struct Statement<'c, S: Storage> {
     ret_pos: usize,
     #[cfg(feature = "v07")]
     ret_loaded: bool,
+    /// An error to report after the rows already produced (v0.16,
+    /// `v16`: an integrity check that met a corrupt page).
+    #[cfg(feature = "v16")]
+    deferred: Option<Error<S::Error>>,
+}
+
+/// Refuse a new object name the pin reserves (`sqlite_` prefix,
+/// ASCII case-insensitive): `SchemaKind::ReservedName`.
+fn reserved_name<E>(name: &[u8]) -> Result<(), E> {
+    match name.get(..7) {
+        Some(p) if eq_ci(p, b"sqlite_") => Err(Error::Schema {
+            kind: SchemaKind::ReservedName,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// A column's default as a stored value: the literal with the
@@ -4312,6 +4443,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::CreateView => self.step_create_view().await,
             #[cfg(feature = "v04")]
             Plan::DropView { .. } => self.step_drop_view().await,
+            #[cfg(feature = "v16")]
+            Plan::Pragma(_) => self.step_pragma().await,
             #[cfg(feature = "indexes")]
             Plan::CreateIndex { .. } => self.step_create_index().await,
             #[cfg(feature = "indexes")]
@@ -4504,6 +4637,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v06")]
         self.hoist.clear();
+        #[cfg(feature = "v16")]
+        {
+            self.deferred = None;
+        }
         #[cfg(feature = "v07")]
         {
             self.ret_rows.clear();
@@ -8484,6 +8621,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Scan { out, .. } => out.len(),
             #[cfg(feature = "v04")]
             Plan::Query(q) => q.width,
+            #[cfg(feature = "v16")]
+            Plan::Pragma(p) => p.width(),
             #[cfg(feature = "v07")]
             Plan::Insert { returning, .. } => returning.len(),
             #[cfg(all(feature = "v05", feature = "v07"))]

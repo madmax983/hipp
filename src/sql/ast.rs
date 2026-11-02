@@ -74,6 +74,29 @@ pub struct ColumnDef {
     /// unknown name is refused at parse, as on the pin.
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub coll: Option<Coll>,
+    /// The DEFAULT clause's text as `PRAGMA table_info` shows it
+    /// (v0.16, `v16`): the expression as written, the outer
+    /// parentheses of `DEFAULT (expr)` removed.
+    #[cfg(feature = "v16")]
+    pub dflt_text: Option<ABytes>,
+}
+
+/// One FOREIGN KEY / REFERENCES clause of a `CREATE TABLE`
+/// (v0.16, `v16`): parsed, never enforced; `PRAGMA
+/// foreign_key_list` reports it. Actions are the pin's codes:
+/// 0 NO ACTION, 1 RESTRICT, 2 SET NULL, 3 SET DEFAULT, 4 CASCADE.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    /// The child columns (one for a column-level REFERENCES).
+    pub from: AVec<ABytes>,
+    /// The parent table as written.
+    pub table: ABytes,
+    /// The parent columns; empty when none were written (the
+    /// parent's PRIMARY KEY).
+    pub to: AVec<ABytes>,
+    pub on_update: u8,
+    pub on_delete: u8,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -332,6 +355,11 @@ pub struct FromSource {
     /// empty when the clause is absent.
     #[cfg(feature = "v04")]
     pub using: AVec<ABytes>,
+    /// A table-valued function's arguments (v0.16, `v16`):
+    /// `pragma_table_info('t')` and friends. `None` for an
+    /// ordinary table name.
+    #[cfg(feature = "v16")]
+    pub args: Option<AVec<Expr>>,
 }
 
 /// A compound SELECT operator (v0.9). All four operators have
@@ -464,6 +492,10 @@ pub enum Ast {
         /// `columns` is empty.
         #[cfg(feature = "v16")]
         as_select: Option<Box<SelectStmt>>,
+        /// FOREIGN KEY / REFERENCES clauses in statement order
+        /// (v0.16, `v16`).
+        #[cfg(feature = "v16")]
+        fkeys: AVec<ForeignKey>,
     },
     /// `CREATE [UNIQUE] INDEX` (v0.3).
     CreateIndex {
@@ -576,4 +608,18 @@ pub enum Ast {
     Commit,
     /// `ROLLBACK [TRANSACTION]` (v0.2).
     Rollback,
+    /// `PRAGMA [schema .] name [= value | (value)]` (v0.16,
+    /// `v16`). `value` is the argument's text as the pin hands it
+    /// to its pragma code: a name or string dequoted, a number as
+    /// written (with a leading `-` for a negative one, `+`
+    /// dropped).
+    #[cfg(feature = "v16")]
+    Pragma {
+        schema: Option<ABytes>,
+        name: ABytes,
+        value: Option<ABytes>,
+        /// The argument was a number token (the pin treats
+        /// `integrity_check(5)` as a limit, `('5')` as a name).
+        numeric: bool,
+    },
 }

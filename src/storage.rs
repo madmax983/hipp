@@ -65,6 +65,12 @@ pub trait Storage {
     async fn sync(&mut self) -> Result<(), Self::Error>;
     /// Open (creating if absent) one of this database's sidecars.
     async fn sidecar(&mut self, kind: Sidecar) -> Result<Self::Sidecar, Self::Error>;
+    /// The database's file name as `PRAGMA database_list` shows it
+    /// (v0.16): the absolute path of a file, empty (the default)
+    /// for storage without one.
+    fn file_name(&self) -> &[u8] {
+        &[]
+    }
 }
 
 /// Optional advisory locking surface (SPEC §5.1): defined now so the
@@ -375,6 +381,9 @@ mod file_storage {
     pub struct FileStorage {
         file: File,
         path: PathBuf,
+        /// The absolute path, as text (v0.16: `PRAGMA
+        /// database_list`).
+        full: std::vec::Vec<u8>,
     }
 
     impl FileStorage {
@@ -386,7 +395,12 @@ mod file_storage {
                 .create(true)
                 .truncate(false)
                 .open(&path)?;
-            Ok(FileStorage { file, path })
+            let full = std::fs::canonicalize(&path)
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes();
+            Ok(FileStorage { file, path, full })
         }
 
         fn journal_path(&self) -> PathBuf {
@@ -416,6 +430,9 @@ mod file_storage {
         async fn sync(&mut self) -> Result<(), FileError> {
             self.file.sync_all()?;
             Ok(())
+        }
+        fn file_name(&self) -> &[u8] {
+            &self.full
         }
         async fn sidecar(&mut self, _kind: Sidecar) -> Result<FileSidecar, FileError> {
             let path = self.journal_path();

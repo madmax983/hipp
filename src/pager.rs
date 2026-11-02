@@ -51,6 +51,17 @@ pub struct DbHeader {
     pub freelist_trunk: u32,
     pub freelist_count: u32,
     pub schema_cookie: u32,
+    /// The user version (offset 60, v0.16 `v16`: `PRAGMA
+    /// user_version`).
+    #[cfg(feature = "v16")]
+    pub user_version: u32,
+    /// The application id (offset 68, v0.16 `v16`).
+    #[cfg(feature = "v16")]
+    pub application_id: u32,
+    /// The auto-vacuum mode (v0.16 `v16`): 0 none, 1 full, 2
+    /// incremental (offsets 52 and 64).
+    #[cfg(feature = "v16")]
+    pub auto_vacuum: u8,
 }
 
 fn parse_page_size_field<E>(raw: u16) -> Result<u32, E> {
@@ -107,6 +118,18 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         freelist_trunk: be_u32(probe, 32),
         freelist_count: be_u32(probe, 36),
         schema_cookie: be_u32(probe, 40),
+        #[cfg(feature = "v16")]
+        user_version: be_u32(probe, 60),
+        #[cfg(feature = "v16")]
+        application_id: be_u32(probe, 68),
+        #[cfg(feature = "v16")]
+        auto_vacuum: if be_u32(probe, 52) == 0 {
+            0
+        } else if be_u32(probe, 64) != 0 {
+            2
+        } else {
+            1
+        },
     })
 }
 
@@ -203,6 +226,11 @@ pub struct Pager<S: Storage> {
     nonce_counter: u64,
     nonce_seed: u64,
     pub txn_arena: Arena,
+    /// This open created the file (v0.16, `v16`): until its first
+    /// commit the database is "empty" in the pin's sense, so
+    /// `PRAGMA page_size` may still change.
+    #[cfg(feature = "v16")]
+    created: bool,
 }
 
 impl<S: Storage> Pager<S> {
@@ -317,6 +345,8 @@ impl<S: Storage> Pager<S> {
                 nonce_counter: 0,
                 nonce_seed,
                 txn_arena,
+                #[cfg(feature = "v16")]
+                created: is_new,
             },
             is_new,
         ))
@@ -747,6 +777,72 @@ impl<S: Storage> Pager<S> {
         put_be_u32(d, 40, self.header.schema_cookie);
         put_be_u32(d, 92, new_counter);
         put_be_u32(d, 96, PIN_VERSION_NUMBER);
+        Ok(())
+    }
+
+    /// The parsed database header (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn header(&self) -> &DbHeader {
+        &self.header
+    }
+
+    /// The file is as this open created it (v0.16, `v16`): no
+    /// transaction has committed and none is open — the pin's
+    /// empty database, whose page size, encoding and auto-vacuum
+    /// mode are not fixed yet.
+    #[cfg(feature = "v16")]
+    pub fn pristine(&self) -> bool {
+        self.created
+            && self.header.change_counter == 1
+            && self.header.page_count == 1
+            && self.stage == CommitStage::Idle
+    }
+
+    /// Write a 32-bit header field of page 1 inside the current
+    /// write transaction (v0.16, `v16`: `PRAGMA user_version` /
+    /// `application_id`), opening one if needed. Offsets 60 and
+    /// 68 also update the parsed header.
+    #[cfg(feature = "v16")]
+    pub async fn set_header_u32(&mut self, off: usize, v: u32) -> Result<(), S::Error> {
+        let idx = self.dirty_page(1).await?;
+        let d = &mut self.frames[idx].data;
+        if d.len() < off + 4 {
+            return Err(Error::CorruptPage { page: 1 });
+        }
+        put_be_u32(d, off, v);
+        match off {
+            60 => self.header.user_version = v,
+            68 => self.header.application_id = v,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Re-create a pristine file with another page size (v0.16,
+    /// `v16`: `PRAGMA page_size` before the first write). The
+    /// caller checks `pristine` and the size.
+    #[cfg(feature = "v16")]
+    pub async fn reformat(&mut self, page_size: u32) -> Result<(), S::Error> {
+        if !self.pristine() {
+            return Err(Error::Unsupported);
+        }
+        let img = initial_page1(page_size);
+        self.storage
+            .set_len(u64::from(page_size))
+            .await
+            .map_err(Error::Storage)?;
+        self.storage
+            .write_at(0, &img)
+            .await
+            .map_err(Error::Storage)?;
+        self.storage.sync().await.map_err(Error::Storage)?;
+        self.header = parse_db_header::<S::Error>(&img, u64::from(page_size))?;
+        self.orig_page_count = self.header.page_count;
+        for f in self.frames.iter_mut() {
+            f.page = 0;
+            f.dirty = false;
+            f.data = alloc::vec![0u8; page_size as usize];
+        }
         Ok(())
     }
 

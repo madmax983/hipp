@@ -228,6 +228,24 @@ pub enum SchemaKind {
     /// out first.
     #[cfg(feature = "v16")]
     PercentileInfinite,
+    /// CREATE TABLE / INDEX / VIEW of a name starting with
+    /// `sqlite_` (any case; the pin's "object name reserved for
+    /// internal use"). Choose another name.
+    ReservedName,
+    /// A schema qualifier that names no database (v0.16, `v16`;
+    /// the pin's "unknown database"). hipp has `main` only.
+    #[cfg(feature = "v16")]
+    UnknownDatabase,
+    /// `PRAGMA encoding` named no encoding the pin knows (v0.16,
+    /// `v16`; "unsupported encoding"). Use `UTF-8`.
+    #[cfg(feature = "v16")]
+    UnknownEncoding,
+    /// INSERT / UPDATE / DELETE / DROP / ALTER / CREATE INDEX
+    /// against `sqlite_schema` (v0.16, `v16`; the pin's "table
+    /// sqlite_master may not be modified"). Change the schema
+    /// with CREATE / DROP statements instead.
+    #[cfg(feature = "v16")]
+    SchemaTableReadOnly,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
