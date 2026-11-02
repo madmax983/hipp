@@ -1,0 +1,8 @@
+# Pinned so the size ratchet (ci/size-ratchet.toml) measures the
+# same codegen locally and in CI. Bump deliberately: a toolchain
+# bump re-baselines the ratchet in the same commit.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+targets = ["thumbv7em-none-eabihf"]
+profile = "minimal"

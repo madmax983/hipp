@@ -251,14 +251,37 @@ fn a6_every_commit_boundary() {
 }
 
 fn crash_writer_bin() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/examples/crash_writer");
+    // This test runs from target/<profile>/deps/crash-<hash>; the
+    // example lands in target/<profile>/examples/. Deriving the path
+    // from the running executable honours CARGO_TARGET_DIR and the
+    // build profile instead of assuming ./target/debug.
+    let exe = std::env::current_exe().expect("test executable path");
+    let profile_dir = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("target/<profile> directory")
+        .to_path_buf();
+    let p = profile_dir
+        .join("examples")
+        .join(format!("crash_writer{}", std::env::consts::EXE_SUFFIX));
     if !p.exists() {
         // `cargo test --test crash` alone does not build examples;
-        // build the harness binary on first use.
+        // build the harness binary on first use. `CARGO` is the cargo
+        // that is running this test, and the environment (toolchain,
+        // RUSTFLAGS, e.g. coverage instrumentation) is inherited, so
+        // the helper is built exactly like the test itself.
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let out = std::process::Command::new(cargo)
-            .args(["build", "-j2", "--example", "crash_writer"])
-            .env("RUSTUP_TOOLCHAIN", "stable")
+        let target_dir = profile_dir.parent().expect("target directory");
+        let mut cmd = std::process::Command::new(cargo);
+        cmd.args(["build", "-j2", "--example", "crash_writer", "--target-dir"])
+            .arg(target_dir);
+        match profile_dir.file_name().and_then(|n| n.to_str()) {
+            Some("debug") | None => {}
+            Some(profile) => {
+                cmd.args(["--profile", profile]);
+            }
+        }
+        let out = cmd
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
             .expect("cargo build example");

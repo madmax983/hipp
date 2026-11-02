@@ -1,0 +1,27 @@
+# Tiny-profile size ratchet (SPEC §4.1). Measured by ci/size_gate.py on
+#   cargo build --profile tiny --target thumbv7em-none-eabihf \
+#     --no-default-features --bin hipp_thumb_demo
+# with the toolchain pinned in rust-toolchain.toml.
+#
+# Ratchet rule: CI fails if the measured size exceeds `ratchet`. When a
+# change shrinks the build, lower `ratchet` in the same commit (CI prints
+# the new figure). Raising it is a reviewed, justified diff — growth past
+# `justify_over` bytes in one change needs a STATUS.md justification.
+
+[tiny]
+# .text + .rodata, bytes.
+ratchet = 81680
+# Hard gate (SPEC §4.1): 128 KiB.
+budget = 131072
+# Engine statics (.data + .bss, minus the demo's caller-supplied heap).
+statics_budget = 8192
+justify_over = 4096
+
+[full]
+# The full no_std profile (`--no-default-features --features full`),
+# same target, profile and binary. Tracked so dialect growth is a
+# visible, reviewed number; the tiny profile is the one SPEC §4.1 binds.
+ratchet = 256465
+budget = 524288
+statics_budget = 8192
+justify_over = 16384

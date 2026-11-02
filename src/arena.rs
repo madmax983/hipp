@@ -36,13 +36,29 @@ struct Chunk {
 
 struct Inner {
     chunks: Vec<Chunk>,
-    /// Keeps owned chunk allocations alive (parallel bookkeeping only;
-    /// borrowed caller slabs are chunks without an entry here).
-    _owned: Vec<Box<[u8]>>,
+    /// Owned chunk allocations, held as raw pointers from
+    /// `Box::into_raw` and freed in `Drop` (borrowed caller slabs are
+    /// chunks without an entry here). Raw ownership, not `Box`, is
+    /// what keeps the chunk pointers valid: moving a `Box` asserts
+    /// unique access and would invalidate every pointer previously
+    /// derived from it (a Stacked Borrows violation miri reported
+    /// when the box was pushed after its pointer was taken).
+    owned: Vec<*mut [u8]>,
     /// Bytes consumed in each chunk (parallel to `chunks`).
     offs: Vec<usize>,
     /// Total retained capacity (sum of chunk capacities).
     capacity: usize,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for &raw in self.owned.iter() {
+            // SAFETY: every entry came from `Box::into_raw` in
+            // `alloc_pos`, is dropped exactly once (here), and no
+            // slice handed out by the arena outlives the arena.
+            drop(unsafe { Box::from_raw(raw) });
+        }
+    }
 }
 
 impl Inner {
@@ -82,7 +98,7 @@ impl Arena {
         Arena {
             inner: UnsafeCell::new(Inner {
                 chunks: Vec::new(),
-                _owned: Vec::new(),
+                owned: Vec::new(),
                 offs: Vec::new(),
                 capacity: 0,
             }),
@@ -202,9 +218,9 @@ impl Arena {
             }
             new_cap = exact;
         }
-        let mut owned = alloc::vec![0u8; new_cap].into_boxed_slice();
-        let ptr = owned.as_mut_ptr();
-        inner._owned.push(owned);
+        let raw: *mut [u8] = Box::into_raw(alloc::vec![0u8; new_cap].into_boxed_slice());
+        let ptr = raw.cast::<u8>();
+        inner.owned.push(raw);
         inner.capacity += new_cap;
         inner.chunks.push(Chunk { ptr, len: new_cap });
         let base: usize = inner.offs.iter().sum();
