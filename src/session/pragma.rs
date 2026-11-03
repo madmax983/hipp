@@ -562,6 +562,9 @@ impl<S: Storage> Connection<S> {
                         text(self.pager.storage().file_name()),
                     ],
                 );
+                if self.temp.is_some() {
+                    push_row(&mut rows, &[int(1), text(b"temp"), text(b"")]);
+                }
                 rows
             }
             Prag::TableInfo | Prag::TableXinfo => match arg {
@@ -615,6 +618,29 @@ impl<S: Storage> Connection<S> {
                             int(i64::from(strict)),
                         ],
                     );
+                }
+                // The TEMP database's objects (v0.16), as `temp`.
+                if !p.main_only
+                    && let Some(tc) = &self.temp
+                {
+                    let tp = PragmaPlan {
+                        prag: Some(Prag::TableList),
+                        arg: p.arg.clone(),
+                        numeric: false,
+                        main_only: true,
+                    };
+                    let trows = tc.pragma_rows(arena, &tp).map_err(temp::mem_err)?;
+                    for r in trows.iter() {
+                        if matches!(r.as_slice().get(1), Some(OwnedValue::Text(n)) if n.as_slice() == b"sqlite_schema")
+                        {
+                            continue;
+                        }
+                        let mut r = r.clone();
+                        if let Some(v) = r.as_mut_slice().first_mut() {
+                            *v = text(b"temp");
+                        }
+                        rows.push(r);
+                    }
                 }
                 if !p.main_only && arg.is_none_or(|a| eq_ci(a, b"sqlite_temp_master")) {
                     push_row(

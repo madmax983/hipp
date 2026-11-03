@@ -213,6 +213,22 @@ impl<S: Storage> Connection<S> {
         }
     }
 
+    /// A view's SELECT, parsed by the caller (with its tokens),
+    /// expanded as `expand_view` expands it (v0.16, ALTER TABLE).
+    pub(super) fn expand_parsed_view(
+        &self,
+        arena: &Arena,
+        name: &[u8],
+        mut select: SelectStmt,
+    ) -> Result<SelectStmt, S::Error> {
+        let mut x = self.expander(arena);
+        x.views.push(copy_vec(name));
+        x.select::<S::Error>(&mut select)?;
+        x.fixing = true;
+        x.select::<S::Error>(&mut select)?;
+        Ok(select)
+    }
+
     /// The column names of view `name` as the pin's shell lists
     /// them in a `.schema` comment and PRAGMA table_info (v0.16,
     /// `v16`): the view's SELECT is expanded and planned; its

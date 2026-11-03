@@ -671,15 +671,27 @@ fn analyze_statistics_interoperate() {
     }
 }
 
-/// `ANALYZE temp` makes the pin a temp-schema statistics table that
-/// hides the main one; hipp has no temp schema and refuses it.
+/// `ANALYZE temp` makes a temp-schema statistics table that hides
+/// the main one for unqualified reads (refused until the TEMP
+/// database landed, tests/temp_v16.rs; now as on the pin).
 #[test]
-fn analyze_temp_is_refused() {
-    let h = common::temp_db("v16mt-antemp");
-    assert!(matches!(
-        hipp_exec(&h, &["CREATE TABLE t(a)", "ANALYZE temp"]),
-        Some(hipp::Error::Unsupported)
-    ));
+fn analyze_temp_makes_temp_statistics() {
+    same(
+        "antemp",
+        &lines(
+            "CREATE TABLE t(a)
+            CREATE INDEX ti ON t(a)
+            INSERT INTO t VALUES (1), (1), (2)
+            ANALYZE
+            CREATE TEMP TABLE x(b)
+            CREATE INDEX xi ON x(b)
+            INSERT INTO x VALUES (3)
+            ANALYZE temp
+            SELECT * FROM sqlite_stat1
+            SELECT * FROM main.sqlite_stat1
+            SELECT name FROM sqlite_temp_schema",
+        ),
+    );
 }
 
 /// Found while probing ANALYZE (ungated fix): an index on the rowid

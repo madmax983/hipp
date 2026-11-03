@@ -224,7 +224,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// The pin's ANALYZE lookup: an unqualified `main` is the whole
-    /// database (`temp` is refused: see below); otherwise an index
+    /// database (`temp` is routed away: see below); otherwise an index
     /// first, then a table or view; else "no such table".
     fn analyze_target(
         &self,
@@ -238,8 +238,9 @@ impl<S: Storage> Connection<S> {
         let n = handle_bytes(arena, name);
         match schema {
             None if eq_ci(n, b"main") => return Ok(Analyze::All),
-            // The pin makes a `temp.sqlite_stat1` that then hides
-            // the main one; hipp has no temp schema to put it in.
+            // `ANALYZE temp` and `temp.x` are routed to the TEMP
+            // database before planning (`session::temp`); reaching
+            // here, they are the TEMP database's own statements.
             None if eq_ci(n, b"temp") => return Err(Error::Unsupported),
             None => {}
             Some(s) if self.schema_is_temp(handle_bytes(arena, s))? => {

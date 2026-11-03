@@ -79,9 +79,9 @@ aspirations.
   tiny profile dropped 5.5 KB); ALTER TABLE ADD COLUMN takes
   non-constant defaults, NOT NULL and STORED columns on an empty
   table; one clock read per statement; hipp-cli supplies the
-  system clock; CREATE TABLE refuses AUTOINCREMENT (hipp keeps
-  no `sqlite_sequence`, and such a table read as malformed on
-  the pin).
+  system clock; below `v16` CREATE TABLE refuses AUTOINCREMENT
+  (those builds keep no `sqlite_sequence`, and such a table read
+  as malformed on the pin; `v16` maintains it, see below).
 - **Collations and pattern matching.** Ungated (column
   `COLLATE` was parsed and ignored): BINARY / NOCASE / RTRIM
   column collations with the pin's selection rule in every
@@ -403,7 +403,34 @@ aspirations.
   `CREATE INDEX ... (rowid)` (the pin's "no such column"); the
   tiny profile shrank 124 B. Gaps: whole-database ANALYZE row
   order (the pin's schema hash), VACUUM of a file with an
-  expression or partial index, `ANALYZE temp` (STATUS.md).
+  expression or partial index (STATUS.md).
+- **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
+  `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
+  [COLUMN] a` edit the stored schema texts token by token exactly
+  as the pin does — byte-identical `sqlite_schema` rows for the
+  table, its indexes (automatic index names too), `REFERENCES`
+  elsewhere, CHECK / generated expressions and every view (the
+  planner traces which names resolve to the table) — with the
+  pin's refusals, and DROP COLUMN rewrites every row the way the
+  pin's rewrite stores it. `AUTOINCREMENT` keeps the pin's
+  `sqlite_sequence` (its CREATE text and root page order, the
+  max-ever rowid rule, "database or disk is full" at i64::MAX,
+  REPLACE / upsert / hand-edited rows), so files interoperate both
+  ways. `CREATE TEMP | TEMPORARY TABLE / VIEW / INDEX`, `temp.`
+  names and `sqlite_temp_schema` use a per-connection in-memory
+  temp database (temp names first, transactions and savepoints
+  applied to both, never written to the file, gone on close);
+  hipp-cli's `.schema` / `.tables` / `.dump` follow. Ungated
+  fixes: a pin-made AUTOINCREMENT table is read-only below `v16`
+  (an INSERT left the counter behind), DROP TABLE removes its
+  `sqlite_sequence` row, `sqlite_*` tables can no longer be
+  indexed, altered or dropped, and ADD COLUMN on a table with
+  table constraints no longer writes unparsable text (tiny +28 B).
+  Gaps: a statement naming objects of both databases (a TEMP view
+  over a main table, `INSERT INTO temp_t SELECT ... FROM main_t`)
+  is refused; files with triggers cannot be altered; re-created
+  tables can get other root page numbers than on the pin
+  (STATUS.md).
 
 ## What v0.13 does
 
@@ -713,7 +740,8 @@ differential testing. It is a separate crate and contributes
 
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
 no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
-created (refused; foreign ones load), no expression or partial
+created (refused below `v16`, foreign ones load read-only there;
+`v16` maintains `sqlite_sequence`), no expression or partial
 indexes, no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed (all of these in the tiny profile: the
 `v04` ... `v16` rungs add them — views execute with `v16`), no

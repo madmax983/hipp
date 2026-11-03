@@ -500,6 +500,104 @@ pub struct SourceDesc {
     /// (v0.16): `sqlite_master` and `sqlite_schema` both qualify
     /// its columns, as on the pin.
     pub schema_table: bool,
+    /// The table an ALTER TABLE is renaming (v0.16, `v16`): every
+    /// reference resolved to this source is recorded in the shared
+    /// trace, with whether the source was read under an alias.
+    #[cfg(feature = "v16")]
+    pub trace: Option<(alloc::rc::Rc<core::cell::RefCell<AlterTrace>>, bool)>,
+}
+
+/// What an ALTER TABLE learns from planning a view (v0.16, `v16`):
+/// the name tokens that resolved to the table being altered. Each
+/// position is an `ABytes::pos` of the view's parsed text — a token
+/// handle — so the rename can edit exactly those tokens, as the
+/// pin's `renameColumnFunc` / `renameTableFunc` edit theirs.
+#[cfg(feature = "v16")]
+#[derive(Debug, Default)]
+pub struct AlterTrace {
+    /// The altered table's name.
+    pub table: AVec<u8>,
+    /// FROM-clause name tokens that read the table.
+    pub from: AVec<u32>,
+    /// Column references resolved to the table.
+    pub hits: AVec<TraceHit>,
+}
+
+/// One reference to the altered table's column (v0.16, `v16`).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy)]
+pub struct TraceHit {
+    /// The column-name token (`None` for `t.rowid` and `t.*`).
+    pub name: Option<u32>,
+    /// The column's index in the table (`usize::MAX` without one).
+    pub col: usize,
+    /// The qualifier token, when the source was read under the
+    /// table's own name (an alias is never the table's token).
+    pub qual: Option<u32>,
+}
+
+/// Record a resolved column reference in the trace of the source it
+/// resolved to (v0.16, `v16`; see `AlterTrace`): the first scope, in
+/// resolution order, holding a source that matches is the one the
+/// reference read; a scope whose result alias answered is not.
+#[cfg(feature = "v16")]
+fn trace_column(
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    table: Option<crate::arena::ABytes>,
+    name: crate::arena::ABytes,
+    arena: &Arena,
+) {
+    let q = table.map(|h| handle_bytes(arena, h));
+    let n = handle_bytes(arena, name);
+    for g in core::iter::once(cur).chain(enclosing.iter()) {
+        let mut any = false;
+        for src in g.sources.iter() {
+            if let Some(q) = q
+                && !src.named(q)
+            {
+                continue;
+            }
+            // `rowid` names the INTEGER PRIMARY KEY column when
+            // there is one (the pin renames it with that column).
+            let mut ci = src.column_index(n);
+            let rowid = ci.is_none() && is_rowid_name(n) && src.has_rowid;
+            if rowid {
+                ci = src.rowid_alias;
+            }
+            if ci.is_none() && !(rowid && q.is_some()) {
+                continue;
+            }
+            any = true;
+            if let Some((tr, aliased)) = &src.trace {
+                tr.borrow_mut().hits.push(TraceHit {
+                    name: ci.map(|_| name.pos),
+                    col: ci.unwrap_or(usize::MAX),
+                    qual: table.filter(|_| !*aliased).map(|h| h.pos),
+                });
+            }
+        }
+        if any || (q.is_none() && g.aliases.iter().any(|(a, _)| eq_ci(a.as_slice(), n))) {
+            return;
+        }
+    }
+}
+
+/// Record `q.*` over the altered table (v0.16, `v16`).
+#[cfg(feature = "v16")]
+pub fn trace_star(cur: &ScopeGroup, q: crate::arena::ABytes, arena: &Arena) {
+    let qn = handle_bytes(arena, q);
+    for src in cur.sources.iter() {
+        if src.named(qn)
+            && let Some((tr, false)) = &src.trace
+        {
+            tr.borrow_mut().hits.push(TraceHit {
+                name: None,
+                col: usize::MAX,
+                qual: Some(q.pos),
+            });
+        }
+    }
 }
 
 impl SourceDesc {
@@ -521,6 +619,8 @@ impl SourceDesc {
             colls: AVec::new(),
             registers: false,
             schema_table: false,
+            #[cfg(feature = "v16")]
+            trace: None,
         }
     }
 
@@ -1466,12 +1566,22 @@ pub fn resolve_scoped<E>(
         // `session::bind_ast`); the pin reads one there as NULL.
         #[cfg(feature = "params")]
         Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
-        Expr::Column { table, name } => resolve_column::<E>(
-            cur,
-            enclosing,
-            table.map(|h| handle_bytes(arena, h)),
-            handle_bytes(arena, *name),
-        )?,
+        Expr::Column { table, name } => {
+            let r = resolve_column::<E>(
+                cur,
+                enclosing,
+                table.map(|h| handle_bytes(arena, h)),
+                handle_bytes(arena, *name),
+            )?;
+            #[cfg(feature = "v16")]
+            if core::iter::once(cur)
+                .chain(enclosing.iter())
+                .any(|g| g.sources.iter().any(|s| s.trace.is_some()))
+            {
+                trace_column(cur, enclosing, *table, *name, arena);
+            }
+            r
+        }
         #[cfg(feature = "v16")]
         Expr::InSubquery(x, stmt, neg) if is_row(x) => {
             let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;

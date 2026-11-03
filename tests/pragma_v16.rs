@@ -265,9 +265,17 @@ fn known_but_unimplemented_pragmas_are_refused() {
     {
         hipp_refuses(&format!("ref{i}"), &format!("PRAGMA {name}"));
     }
-    // No temp database: a known pragma against it is refused.
-    hipp_refuses("reftemp", "PRAGMA temp.user_version");
-    hipp_refuses("reftemp2", "PRAGMA temp.table_info(t)");
+    // The TEMP database (v0.16, tests/temp_v16.rs): a known pragma
+    // against it runs there, as on the pin (refused before it).
+    assert!(same("reftemp", "PRAGMA temp.user_version").is_none());
+    assert!(same("reftemp2", "CREATE TABLE t(a); PRAGMA temp.table_info(t)").is_none());
+    assert!(
+        same(
+            "reftemp3",
+            "PRAGMA temp.user_version = 5; PRAGMA temp.user_version; PRAGMA user_version"
+        )
+        .is_none()
+    );
 }
 
 // ---------------- header values ----------------

@@ -315,6 +315,38 @@ pub enum SchemaKind {
     /// be reindexed"). Name an existing one.
     #[cfg(feature = "v16")]
     ReindexTarget,
+    /// A schema change the pin refuses on one of its own tables
+    /// (v0.16): `sqlite_*` tables may not be indexed or altered,
+    /// and only `sqlite_stat*` may be dropped ("table sqlite_sequence
+    /// may not be dropped"). Leave the system tables to the engine.
+    #[cfg(any(feature = "indexes", feature = "v04"))]
+    SystemTable,
+    /// `AUTOINCREMENT` on a column that is not the table's INTEGER
+    /// PRIMARY KEY (v0.16, `v16`; "AUTOINCREMENT is only allowed on
+    /// an INTEGER PRIMARY KEY"). Declare the column `INTEGER
+    /// PRIMARY KEY` (not DESC), or drop the keyword.
+    #[cfg(feature = "v16")]
+    AutoincrementNotIntegerPk,
+    /// `ALTER TABLE ... RENAME COLUMN` to `rowid`, `oid` or
+    /// `_rowid_` (v0.16, `v16`; the pin's "cannot rename to rowid
+    /// alias"). Pick another name.
+    #[cfg(feature = "v16")]
+    RowidAliasName,
+    /// `ALTER TABLE ... DROP COLUMN` of a PRIMARY KEY or UNIQUE
+    /// column, or of a table's only column (v0.16, `v16`; the
+    /// pin's "cannot drop PRIMARY KEY column", "cannot drop UNIQUE
+    /// column", "no other columns exist"). Rebuild the table
+    /// instead (CREATE TABLE ... AS / INSERT ... SELECT).
+    #[cfg(feature = "v16")]
+    CannotDropColumn,
+    /// An AUTOINCREMENT table has handed out rowid
+    /// 9223372036854775807, or its largest rowid is that value
+    /// (v0.16, `v16`; the pin's "database or disk is full"): no
+    /// larger rowid exists and AUTOINCREMENT never reuses one.
+    /// Insert with an explicit smaller rowid, or reset the table's
+    /// `sqlite_sequence` row.
+    #[cfg(feature = "v16")]
+    DatabaseFull,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

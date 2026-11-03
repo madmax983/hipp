@@ -136,6 +136,52 @@ pub fn parse_params<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, lexer::ParamTa
     Ok((ast, params))
 }
 
+/// `parse`, also returning the statement's tokens (v0.16, `v16`):
+/// every name in the tree is the handle of the token it was read
+/// from, so ALTER TABLE can map a resolved name back to its bytes
+/// in `sql` (`Token::offset`).
+#[cfg(feature = "v16")]
+pub fn parse_with_tokens<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, AVec<Token>), E> {
+    let toks = lexer::lex::<E>(sql, arena)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    Ok((ast, p.toks))
+}
+
+/// `parse_expr_text`, also returning the expression's tokens
+/// (v0.16, `v16`; see `parse_with_tokens`).
+#[cfg(feature = "v16")]
+pub fn parse_expr_with_tokens<E>(sql: &[u8], arena: &Arena) -> Result<(Expr, AVec<Token>), E> {
+    let toks = lexer::lex::<E>(sql, arena)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let e = p.parse_expr::<E>()?;
+    if !p.at_eof() {
+        return Err(perr(p.cur().offset, ParseKind::TrailingInput));
+    }
+    Ok((e, p.toks))
+}
+
+/// The tokens of `sql` (v0.16, `v16`): ALTER TABLE walks a stored
+/// CREATE INDEX text by tokens (an expression or partial index is
+/// outside hipp's CREATE INDEX grammar).
+#[cfg(feature = "v16")]
+pub fn tokens<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
+    lexer::lex::<E>(sql, arena)
+}
+
 /// Parse one stand-alone expression (v0.16): the stored text of
 /// a CHECK constraint, generated column or DEFAULT, re-parsed by
 /// the planner into `arena`. The whole input must be the one
@@ -165,12 +211,15 @@ pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena) -> Result<Expr, E> {
 /// are not kept. Returns that prefix and the name's byte offset;
 /// `None` for text that does not lex.
 ///
-/// It also refuses AUTOINCREMENT (`Error::Unsupported`, v0.16):
-/// hipp does not maintain the companion `sqlite_sequence` table,
-/// and a file holding an AUTOINCREMENT table without it is
-/// "malformed" to the pin on its next INSERT. (Existing files that
-/// have one still load: the catalog parses, it does not create.)
-/// The word is reserved, so an unquoted occurrence is the clause.
+/// Without `v16` it also refuses AUTOINCREMENT
+/// (`Error::Unsupported`): those builds do not maintain the
+/// companion `sqlite_sequence` table, and a file holding an
+/// AUTOINCREMENT table without it is "malformed" to the pin on its
+/// next INSERT. The INSERT planner calls it on the target table's
+/// stored text for the same reason (an existing AUTOINCREMENT
+/// table is read-only there). With `v16` AUTOINCREMENT is
+/// maintained (`has_autoincrement`). The word is reserved, so an
+/// unquoted occurrence is the clause.
 pub fn schema_text_start<E>(
     sql: &[u8],
     arena: &Arena,
@@ -185,6 +234,7 @@ pub fn schema_text_start<E>(
         arena,
         sql,
     };
+    #[cfg(not(feature = "v16"))]
     if (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT")) {
         return Err(Error::Unsupported);
     }
@@ -211,6 +261,25 @@ pub fn schema_text_start<E>(
         i += 2;
     }
     Ok(t.get(i).map(|n| (prefix, n.offset)))
+}
+
+/// Whether a stored CREATE TABLE text declares AUTOINCREMENT
+/// (v0.16, `v16`): the word is reserved, so an unquoted
+/// occurrence can only be the PRIMARY KEY's clause. Text that
+/// does not lex has none.
+#[cfg(feature = "v16")]
+pub fn has_autoincrement<E>(sql: &[u8], arena: &Arena) -> bool {
+    let Ok(toks) = lexer::lex::<E>(sql, arena) else {
+        return false;
+    };
+    let p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT"))
 }
 
 impl<'a> Parser<'a> {
@@ -316,8 +385,13 @@ impl<'a> Parser<'a> {
                 // hipp used to drop it and use `main.t`, where the
                 // pin finds no such table (or, for CREATE TABLE
                 // temp.t, makes a temporary one outside the file).
+                // v0.16 (`v16`): `temp.` too — the connection routes a
+                // statement naming the temp schema to its temp
+                // database (`session::temp`) before it plans it, so
+                // the planner never reads `temp.t` as `main.t`.
                 if matches!(self.cur().tok, Tok::Dot) {
-                    if !eq_ci(handle_bytes(self.arena, h), b"main") {
+                    let s = handle_bytes(self.arena, h);
+                    if !eq_ci(s, b"main") && !(cfg!(feature = "v16") && eq_ci(s, b"temp")) {
                         return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                     }
                     self.pos += 1;
@@ -2061,6 +2135,12 @@ impl<'a> Parser<'a> {
         #[cfg(feature = "v16")]
         if let Tok::Ident(..) = self.cur().tok {
             let (table, qualified) = self.name_q::<E>()?;
+            // A copy, not the token's handle: the pin's ALTER TABLE
+            // RENAME leaves this name unedited (its "after rename"
+            // check then fails), and ALTER maps token handles only.
+            let table = self
+                .arena
+                .alloc_copy_handle(handle_bytes(self.arena, table))?;
             return Ok(Expr::InSubquery(
                 Box::new(l),
                 Box::new(self.table_select(table, qualified)),
@@ -2973,6 +3053,34 @@ impl<'a> Parser<'a> {
         self.expect_kw::<E>(b"ALTER")?;
         self.expect_kw::<E>(b"TABLE")?;
         let table = self.name::<E>()?;
+        // RENAME TO / RENAME [COLUMN] / DROP [COLUMN] (v0.16,
+        // `v16`): every name is the pin's `nm` (an identifier, a
+        // keyword that is not reserved, or a string).
+        #[cfg(feature = "v16")]
+        if self.eat_kw(b"RENAME") {
+            if self.eat_kw(b"TO") {
+                let (to, _) = self.nm_tok::<E>()?;
+                return Ok(Ast::AlterRename { table, to });
+            }
+            // `COLUMN` is always the keyword here, as in the pin's
+            // grammar (`RENAME column TO x` is a syntax error there).
+            let _ = self.eat_kw(b"COLUMN");
+            let (from, _) = self.nm_tok::<E>()?;
+            self.expect_kw::<E>(b"TO")?;
+            let (to, quoted) = self.nm_tok::<E>()?;
+            return Ok(Ast::AlterRenameColumn {
+                table,
+                from,
+                to,
+                quoted,
+            });
+        }
+        #[cfg(feature = "v16")]
+        if self.eat_kw(b"DROP") {
+            let _ = self.eat_kw(b"COLUMN");
+            let (column, _) = self.nm_tok::<E>()?;
+            return Ok(Ast::AlterDropColumn { table, column });
+        }
         if !self.eat_kw(b"ADD") {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
@@ -3191,6 +3299,22 @@ FROM GROUP HAVING IN INDEX INSERT INTERSECT INTO IS ISNULL JOIN LIMIT NOT NOTHIN
 ON OR ORDER PRIMARY REFERENCES RETURNING SELECT SET TABLE THEN TO TRANSACTION UNION UNIQUE \
 UPDATE USING VALUES WHEN WHERE",
             )
+        }
+    }
+
+    /// Consume one `nm` (v0.16, `v16`): its handle and whether it
+    /// was quoted (a quoted identifier or a string).
+    #[cfg(feature = "v16")]
+    fn nm_tok<E>(&mut self) -> Result<(ABytes, bool), E> {
+        if !self.nm_at(self.pos, self.limit) {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
+        let t = self.cur();
+        self.pos += 1;
+        match t.tok {
+            Tok::Ident(h, q) => Ok((h, q)),
+            Tok::Text(h) => Ok((h, true)),
+            _ => Err(perr(t.offset, ParseKind::UnexpectedToken)),
         }
     }
 
@@ -4259,10 +4383,20 @@ mod tests {
             );
         }
         let auto = b"CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)";
+        #[cfg(not(feature = "v16"))]
         assert!(matches!(
             schema_text_start::<()>(auto, &arena),
             Err(Error::Unsupported)
         ));
+        #[cfg(feature = "v16")]
+        {
+            assert!(schema_text_start::<()>(auto, &arena).is_ok());
+            assert!(has_autoincrement::<()>(auto, &arena));
+            assert!(!has_autoincrement::<()>(
+                b"CREATE TABLE t(\"AUTOINCREMENT\" INTEGER PRIMARY KEY, b DEFAULT 'autoincrement')",
+                &arena
+            ));
+        }
     }
 
     /// v0.16 (evaluator builds): the clauses are kept for the

@@ -3184,6 +3184,203 @@ the ANALYZE statistics, their grammar and plans.
   differences on DELETE), and the change counter can differ by
   one before any VACUUM.
 
+### ALTER TABLE, AUTOINCREMENT and TEMP tables (2026-11-03)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated as below. Every script in the new suites runs
+on both engines continuing past errors, comparing rows (stored
+schema texts included), failing statements, and the oracle's
+`PRAGMA integrity_check` and `.dump` of both files.
+
+**Shipped — `v16`** (new `src/session/alter.rs`,
+`src/session/temp.rs`; `Ast::{AlterRename, AlterRenameColumn,
+AlterDropColumn}`, `Plan::{Alter16, Temp}`, `TableDef::autoinc`,
+`query::AlterTrace`, `record::encode_record_plain`,
+`Connection::temp_db`, `SchemaKind::{AutoincrementNotIntegerPk,
+RowidAliasName, CannotDropColumn, DatabaseFull}`):
+
+- *AUTOINCREMENT.* `INTEGER PRIMARY KEY AUTOINCREMENT` and
+  `PRIMARY KEY (a [DESC] AUTOINCREMENT)` on the rowid alias
+  (anything else: `AutoincrementNotIntegerPk`). The first such
+  table creates `sqlite_sequence` with the pin's text `CREATE
+  TABLE sqlite_sequence(name,seq)`, its schema row and root page
+  right after that table's automatic indexes. An INSERT reads the
+  table's row once (the first whose `name` equals the table's
+  name byte for byte; `seq` as CAST AS INTEGER, NULL / no row
+  reading 0); a generated rowid is one past both the largest rowid
+  and that counter; every rowid the statement inserts or
+  generates raises it (ignored rows, upsert DO UPDATE and REPLACE
+  included); the row is written back when the statement completes
+  (a new row at max rowid + 1 when there was none — even for an
+  INSERT of no rows — else rewritten in place when it grew); an
+  INSERT that fails part way (OR FAIL) writes nothing; i64::MAX
+  handed out or present is `DatabaseFull` ("database or disk is
+  full"). DROP TABLE deletes the table's sequence rows; RENAME TO
+  renames them; hand edits (`UPDATE / DELETE / INSERT INTO
+  sqlite_sequence`) are read as the pin reads them. `.dump`
+  (hipp-cli) writes `DELETE FROM sqlite_sequence;` + INSERTs last,
+  as the oracle shell does, and `.tables` leaves `sqlite_*` out.
+- *ALTER TABLE t RENAME TO u / RENAME [COLUMN] a TO b / DROP
+  [COLUMN] a.* The stored texts are edited token by token, every
+  other byte kept, exactly as the pin's `renameEditSql` writes
+  them (RENAME TO always `"u"`; RENAME COLUMN bare where the old
+  token was bare and the new name was written bare, else `"b"`,
+  with a space before a following `"`). The table's own text (its
+  name, columns, PRIMARY KEY / UNIQUE / FOREIGN KEY lists, `t.`
+  qualifiers and column references in CHECK and generated
+  expressions), every `REFERENCES t (cols)`, its indexes (`ON t`,
+  key and WHERE column references, `sqlite_autoindex_t_N` names,
+  `tbl_name`) and every view: a view is expanded and planned with
+  an `AlterTrace` on the table, so the planner itself records
+  which FROM names, qualifiers and column tokens resolved to it
+  (aliases, CTEs, subqueries, USING, `x IN t` decided exactly as
+  in a query). The pin's checks: no `sqlite_*` table, no view,
+  name not taken, not a rowid alias, no duplicate column, every
+  view must plan after the change. DROP COLUMN removes the
+  definition text (the last one from the comma before it to the
+  table constraints / `)`), refuses PRIMARY KEY / UNIQUE / the
+  only column and one an index, CHECK, generated column, foreign
+  key or view uses, and rewrites every row without it
+  (`drop_rewrite`: short rows' defaults materialised, 0 / 1
+  stored as one-byte integers like the pin's rewrite — serial 1,
+  not 8 / 9 — so the files are byte-compatible). A file with
+  triggers is refused (`Unsupported`).
+- *TEMP tables, views and indexes.* A per-connection temp
+  database: a second, private `Connection<MemStorage>`
+  (`Connection::temp`), created on first use and dropped with the
+  connection, never written to the file. Statements are routed
+  before planning (`Connection::route`) by the pin's name
+  resolution: `CREATE TEMP | TEMPORARY TABLE / VIEW`, `CREATE
+  TABLE temp.t`, `temp.`-qualified names, `sqlite_temp_schema` /
+  `sqlite_temp_master` / `temp.sqlite_schema`, and unqualified
+  names of temp objects (temp before main) run there with `TEMP`
+  and the `temp.` qualifiers cut out of the text; CREATE INDEX
+  follows its table; DROP TABLE drops the temp one first;
+  `REINDEX` / `ANALYZE` of temp objects and `ANALYZE temp` (which
+  makes `temp.sqlite_stat1`, then hiding main's) run there; a name
+  in neither database binds to neither (so `CREATE TEMP VIEW v AS
+  SELECT * FROM later` is stored, as on the pin).
+  BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / ROLLBACK TO
+  apply to both databases (a temp database created inside a
+  transaction first replays it), `last_insert_rowid()` /
+  `changes()` / `total_changes()` follow both, bound parameters
+  reach routed statements, `PRAGMA temp.x`, `table_info` of a
+  temp table, `table_list` and `database_list` (`1|temp|` once it
+  exists) show it; its schema has the pin's texts and root pages.
+  AUTOINCREMENT and ALTER TABLE work there too, including the
+  pin's double edit of TEMP views on RENAME COLUMN (below).
+  hipp-cli `.schema` prints temp objects as `CREATE TABLE
+  temp.x` / `/* temp.v(...) */` and `.tables` as `temp.x`.
+
+**Shipped — ungated** (found while probing this unit):
+
+- *AUTOINCREMENT without `v16`* (tiny path, INSERT): hipp inserted
+  into a pin-made AUTOINCREMENT table and left `sqlite_sequence`
+  behind, so after a DELETE the pin handed out a rowid
+  AUTOINCREMENT had already used. Such a table is read-only there
+  now (`Unsupported`), as CREATE already refused the clause.
+  +24 B (of the +28 B below).
+- *DROP TABLE of an AUTOINCREMENT table* (`v05`): its
+  `sqlite_sequence` row stayed behind (the pin deletes it).
+- *System tables* (`indexes` / `v04` / `v05`): hipp indexed,
+  ALTER ... ADD COLUMN'd and dropped `sqlite_sequence` (and other
+  `sqlite_*` tables); the pin refuses all three (only
+  `sqlite_stat*` may be dropped) — `SchemaKind::SystemTable`.
+- *ALTER TABLE ADD COLUMN on a table with table constraints*
+  (`v04`): the column was appended after the constraints, a text
+  that no longer parses (the next open failed). It is spliced in
+  after the last column definition, the pin's `addColOffset`.
+
+**Oracle-probing notes** (live pin): `sqlite_sequence`'s root page
+follows the first AUTOINCREMENT table's autoindexes; the counter
+rules above, including `UPDATE sqlite_sequence SET seq = 'abc'` /
+`7.7` (read as 0 / 7: the next rowid is 2 / 8), two rows of one
+name (the first wins and is the one rewritten), `name = 'T'` (not
+the table's row: byte comparison), a negative explicit rowid (the
+row is written with 0), and a ROLLBACK undoing the counter. RENAME: `"u"` always for RENAME TO; `'u'`, `[u]` and `"u"`
+as new column names all produce `"u"`; comments and spacing kept;
+"there is already another table or index with this name", "object
+name reserved for internal use", "cannot rename to rowid alias",
+"error in table t after rename: duplicate column name", "error in
+view v after rename: ambiguous column name" are errors here too.
+DROP COLUMN: "cannot drop PRIMARY KEY column", "cannot drop UNIQUE
+column", "no other columns exist", "error in index i / table t /
+view v after drop column: no such column"; the pin's rewritten
+rows store integers 0 / 1 as one-byte values (serial type 1). TEMP:
+a view without TEMP is a main view even over temp tables (and then
+reads main only: "no such table: main.x"); `CREATE TEMP TABLE
+main.t` and `CREATE INDEX temp.i ON main_table` are errors;
+`main.sqlite_temp_schema` is "no such table"; plain `ANALYZE` leaves
+the temp database alone; temp root pages start at 2; `REINDEX temp`
+names an object called `temp` ("unable to identify"). The pin's
+RENAME COLUMN of a TEMP table edits its TEMP views twice (the
+main-schema UPDATE and the temp-trigger/view UPDATE both run on the
+temp schema): the second pass plans the already-edited view
+against the old columns and fails ("error in view v: no such
+column: z") whenever the view names the column — unless every
+edited name is a bare `"z"`, which the second pass reads as a
+string (DQS). hipp reproduces this rule (`plan_view_text`) without
+having the DQS fallback in general.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed". New suites: `tests/alter_v16.rs`
+(8 tests: RENAME TO / RENAME COLUMN / DROP COLUMN matrices, views
+following the rename through aliases, CTEs, subqueries and
+compound ORDER BY, pin-made files altered by hipp and hipp-made
+files read and altered by the pin, a generated corpus);
+`tests/autoinc_v16.rs` (8 tests: creation and schema order, the
+counter rules, hand-edited sequence rows, i64::MAX, transactions
+and savepoints, interoperating files, a generated corpus of random
+INSERT / REPLACE / upsert / DELETE / sequence edits);
+`tests/temp_v16.rs` (7 tests: 47 temp-schema cases, the pin's
+corner cases above, file untouched and temp gone on close, the
+mixed-database refusal, parameters, and a generated corpus of
+random main / temp / shadowing / transaction interleavings — 10
+cases by default, `HIPP_TEMP_CORPUS=200` ran clean);
+`hipp-cli/tests/cli_v16_alter.rs` (6 tests: byte-identical ALTER /
+AUTOINCREMENT / TEMP batches one-shot and over stdin, `.schema`
+with temp objects, `.tables`, `.dump` replaying the counter).
+`tests/table_defs_v16.rs` and `tests/query_shape_v16.rs` now assert
+the AUTOINCREMENT and `temp.` behaviour per feature;
+`tests/maintenance_v16.rs` (`ANALYZE temp`) and
+`tests/pragma_v16.rs` (`PRAGMA temp.x`) compare what they used to
+expect refused with the pin.
+
+**Size:** tiny **76,228 B** (Δ **+28 B** vs 76,200, ratchet raised
+to it): a correctness fix on the INSERT path the tiny profile
+claims — the read-only refusal of a pin-made AUTOINCREMENT table
+(24 B; see above), within the +256 B allowance. Full **468,048 B**
+(Δ **+38,032 B** vs 430,016, ratchet raised to it; over the
+16 KiB `justify_over`, justified here): the ALTER TABLE text
+editor and view tracing, DROP COLUMN's row rewrite, AUTOINCREMENT
+bookkeeping, and the TEMP database (a second monomorphised
+`Connection<MemStorage>` — most of the growth — plus routing).
+
+**Honest gaps:**
+
+- A statement that names objects of both databases (`SELECT ...
+  FROM main_t, temp_t`, `CREATE TEMP TABLE x AS SELECT * FROM
+  main_t`, a TEMP view over a main table, `INSERT INTO temp_t
+  SELECT ... FROM main_t`) is refused (`Unsupported`): hipp's two
+  databases never meet inside one statement. Three-part names
+  (`temp.x.a`) do not parse; `pragma_table_info('x', 'temp')` is
+  refused; `VACUUM temp INTO` is refused (plain `VACUUM temp` does
+  nothing, as on the pin for an in-memory temp database). The
+  earlier "`ANALYZE temp` is refused" gap is closed.
+- ALTER TABLE refuses a file holding triggers (hipp has none and
+  cannot parse them); the TEMP view double-edit is modelled for
+  RENAME COLUMN as probed, and the DQS fallback only there.
+- Root pages after DROP TABLE: hipp reuses freed pages from the
+  freelist in another order than the pin (the pin takes the
+  smallest free leaf for a new root first; hipp the trunk's last
+  leaf), so a table re-created after a DROP can get different
+  `rootpage` numbers (main and temp alike; the files are valid
+  and read identically). Pre-existing pager behaviour, found
+  here; left for a pager unit (it is on the tiny path).
+- hipp-cli `.tables` prints one name per line (the oracle shell
+  columnates); `.dump` still differs from the shell's around
+  `PRAGMA foreign_keys` / `writable_schema` and `sqlite_stat1`.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

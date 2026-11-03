@@ -105,6 +105,10 @@ pub struct TableDef {
     /// (see `TableDef::usable`); the rest of the file works.
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub foreign_coll: bool,
+    /// The table's INTEGER PRIMARY KEY is AUTOINCREMENT (v0.16,
+    /// `v16`): every INSERT keeps its `sqlite_sequence` row.
+    #[cfg(feature = "v16")]
+    pub autoinc: bool,
 }
 
 impl TableDef {
@@ -435,6 +439,7 @@ pub async fn build_catalog<S: Storage>(
             checks: AVec::new(),
             strict: false,
             foreign_coll: false,
+            autoinc: false,
         });
     }
     // Scratch arena for parse trees (names are interned out of it
@@ -471,6 +476,8 @@ pub async fn build_catalog<S: Storage>(
                     #[cfg(feature = "v16")]
                     strict: false,
                     foreign_coll: true,
+                    #[cfg(feature = "v16")]
+                    autoinc: false,
                 });
                 continue;
             }
@@ -590,6 +597,9 @@ pub async fn build_catalog<S: Storage>(
             strict,
             #[cfg(any(feature = "v04", feature = "indexes"))]
             foreign_coll: false,
+            #[cfg(feature = "v16")]
+            autoinc: rowid_alias.is_some()
+                && crate::sql::parser::has_autoincrement::<S::Error>(sql.as_slice(), &scratch),
         });
     }
 

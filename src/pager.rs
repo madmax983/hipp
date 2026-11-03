@@ -1227,6 +1227,18 @@ impl<S: Storage> Pager<S> {
         })
     }
 
+    /// The open savepoints, oldest first (v0.16, `v16`): each one's
+    /// name (`None` for a statement savepoint) and whether it
+    /// opened the transaction. The TEMP database replays them.
+    #[cfg(feature = "v16")]
+    pub fn sp_marks(&self) -> AVec<(Option<AVec<u8>>, bool)> {
+        let mut out = AVec::new();
+        for m in self.sp.iter() {
+            out.push((m.name.clone(), m.starts_txn));
+        }
+        out
+    }
+
     /// Whether the savepoint at `level` opened the transaction
     /// (v0.16, `v16`).
     #[cfg(feature = "v16")]

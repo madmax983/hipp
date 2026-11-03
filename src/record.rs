@@ -155,6 +155,23 @@ fn int_serial(v: i64) -> u64 {
 /// Encode a record: header (varint header-length incl. itself, then
 /// one varint serial type per column) followed by the body.
 pub fn encode_record(values: &[Value<'_>], out: &mut AVec<u8>) {
+    encode_with(values, out, int_serial);
+}
+
+/// Encode a record the way the pin's ALTER TABLE ... DROP COLUMN
+/// rewrites one (v0.16, `v16`): as `encode_record`, except that
+/// the integers 0 and 1 take the one-byte serial type 1 rather than
+/// the constant types 8 / 9 (observed on the pin's rewritten rows).
+#[cfg(feature = "v16")]
+pub fn encode_record_plain(values: &[Value<'_>], out: &mut AVec<u8>) {
+    encode_with(values, out, |v| match v {
+        0 | 1 => 1,
+        v => int_serial(v),
+    });
+}
+
+#[inline(always)]
+fn encode_with<F: Fn(i64) -> u64>(values: &[Value<'_>], out: &mut AVec<u8>, int_serial: F) {
     let mut serials = AVec::new();
     for v in values {
         serials.push(match v {

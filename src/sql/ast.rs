@@ -686,6 +686,29 @@ pub enum Ast {
         #[cfg(feature = "v04")]
         checks: AVec<ABytes>,
     },
+    /// `ALTER TABLE <t> RENAME TO <new>` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    AlterRename {
+        table: ABytes,
+        to: ABytes,
+    },
+    /// `ALTER TABLE <t> RENAME [COLUMN] <old> TO <new>` (v0.16,
+    /// `v16`). `quoted`: the new name was written quoted (or as a
+    /// string), so every edited token takes the quoted form, as on
+    /// the pin.
+    #[cfg(feature = "v16")]
+    AlterRenameColumn {
+        table: ABytes,
+        from: ABytes,
+        to: ABytes,
+        quoted: bool,
+    },
+    /// `ALTER TABLE <t> DROP [COLUMN] <c>` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    AlterDropColumn {
+        table: ABytes,
+        column: ABytes,
+    },
     /// `CREATE VIEW` (v0.4): stored SQL, inert — the SELECT is
     /// parsed and validated at plan time but never executed;
     /// selecting FROM a view is `Error::Unsupported`.

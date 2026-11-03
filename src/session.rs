@@ -54,11 +54,15 @@ macro_rules! abort_write {
 }
 
 #[cfg(feature = "v16")]
+mod alter;
+#[cfg(feature = "v16")]
 mod cte;
 #[cfg(feature = "v16")]
 mod maint;
 #[cfg(feature = "v16")]
 mod pragma;
+#[cfg(feature = "v16")]
+mod temp;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -368,6 +372,10 @@ enum Plan {
         /// `None` when it has none.
         #[cfg(feature = "v04")]
         rules: Option<Box<crate::rules::TableRules>>,
+        /// The table's name when it is AUTOINCREMENT (v0.16,
+        /// `v16`): the `sqlite_sequence` row to keep.
+        #[cfg(feature = "v16")]
+        autoinc: Option<AVec<u8>>,
     },
     Scan {
         root: u32,
@@ -460,6 +468,25 @@ enum Plan {
         /// Roots of the table's indexes (explicit + implicit),
         /// in catalog order; their pages are freed with it.
         index_roots: AVec<u32>,
+        /// An AUTOINCREMENT table's `sqlite_sequence` (root, the
+        /// table's name): its rows of that name go with it (v0.16
+        /// fix, as the pin's `DELETE FROM sqlite_sequence WHERE
+        /// name = ...`).
+        seq: Option<(u32, AVec<u8>)>,
+    },
+    /// A statement routed to the TEMP database (v0.16, `v16`;
+    /// `session::temp`): its text there and its result width.
+    #[cfg(feature = "v16")]
+    Temp {
+        sql: AVec<u8>,
+        width: usize,
+    },
+    /// `ALTER TABLE ... RENAME TO / RENAME COLUMN / DROP COLUMN`
+    /// (v0.16, `v16`; `session::alter`).
+    #[cfg(feature = "v16")]
+    Alter16 {
+        table: AVec<u8>,
+        op: alter::AlterOp,
     },
     /// `ALTER TABLE ... ADD COLUMN` (v0.4): the rewritten stored
     /// CREATE TABLE text is computed at plan time.
@@ -897,6 +924,17 @@ pub struct Connection<S: Storage> {
     /// The PRAGMA flags (v0.16, `v16`).
     #[cfg(feature = "v16")]
     prag: pragma::PragState,
+    /// The reference trace of a running ALTER TABLE (v0.16, `v16`;
+    /// `query::AlterTrace`): set while it plans the schema's views.
+    #[cfg(feature = "v16")]
+    alter_trace: Option<alloc::rc::Rc<core::cell::RefCell<crate::query::AlterTrace>>>,
+    /// The connection's TEMP database (v0.16, `v16`; `session::temp`),
+    /// created on first use, never written to the file.
+    #[cfg(feature = "v16")]
+    temp: Option<Box<Connection<crate::storage::MemStorage>>>,
+    /// This connection is another's TEMP database (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    is_temp: bool,
 }
 
 impl<S: Storage> Connection<S> {
@@ -931,6 +969,12 @@ impl<S: Storage> Connection<S> {
             env: crate::query::Env::new(seed),
             #[cfg(feature = "v16")]
             prag: pragma::PragState::default(),
+            #[cfg(feature = "v16")]
+            alter_trace: None,
+            #[cfg(feature = "v16")]
+            temp: None,
+            #[cfg(feature = "v16")]
+            is_temp: false,
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -964,12 +1008,48 @@ impl<S: Storage> Connection<S> {
         // The original statement text, retained for CREATE TABLE:
         // it is what lands in `sqlite_schema.sql` (§5.5).
         let sql_text = arena.alloc_copy_handle(sql.as_bytes())?;
+        // v0.16: a statement on the TEMP database runs there.
+        #[cfg(feature = "v16")]
+        let routed = match self.route(sql.as_bytes(), &arena)? {
+            temp::Route::Main => None,
+            temp::Route::Temp(text) => Some(self.prepare_temp(text, &arena).await?),
+        };
+        #[cfg(not(feature = "v16"))]
+        let routed: Option<()> = None;
         #[cfg(not(feature = "params"))]
-        let ast = crate::sql::parse::<S::Error>(sql.as_bytes(), &arena)?;
-        #[cfg(not(feature = "params"))]
-        let plan = self.plan(&arena, &ast)?;
+        let (ast, plan) = match routed {
+            #[cfg(feature = "v16")]
+            Some(p) => (Ast::Begin, p),
+            _ => {
+                let ast = crate::sql::parse::<S::Error>(sql.as_bytes(), &arena)?;
+                let plan = self.plan(&arena, &ast)?;
+                (ast, plan)
+            }
+        };
         #[cfg(feature = "params")]
-        let (ast, plan, binds) = self.prepare_params(sql.as_bytes(), &arena)?;
+        let (ast, plan, binds) = match routed {
+            #[cfg(feature = "v16")]
+            Some(p) => {
+                let Plan::Temp { sql: t, .. } = &p else {
+                    return Err(Error::Unsupported);
+                };
+                let (_, table) = crate::sql::parse_params::<S::Error>(t.as_slice(), &arena)?;
+                let mut values = AVec::new();
+                for _ in 0..table.count {
+                    values.push(OwnedValue::Null);
+                }
+                let binds = Binds {
+                    values,
+                    table,
+                    src: None,
+                    plan_ckpt: arena.checkpoint(),
+                    stale: false,
+                    started: false,
+                };
+                (Ast::Begin, p, binds)
+            }
+            _ => self.prepare_params(sql.as_bytes(), &arena)?,
+        };
         let row_ckpt = arena.checkpoint();
         Ok(Statement {
             #[cfg(feature = "params")]
@@ -1017,7 +1097,32 @@ impl<S: Storage> Connection<S> {
             mats: AVec::new(),
             #[cfg(feature = "v16")]
             stmt_sp: None,
+            #[cfg(feature = "v16")]
+            autoinc: None,
         })
+    }
+
+    /// Prepare a statement routed to the TEMP database (v0.16,
+    /// `v16`): prepared there once now, so its errors are prepare
+    /// errors as on the pin, and again when it runs.
+    #[cfg(feature = "v16")]
+    async fn prepare_temp(&mut self, text: AVec<u8>, _arena: &Arena) -> Result<Plan, S::Error> {
+        let Ok(t) = core::str::from_utf8(text.as_slice()) else {
+            return Err(Error::Unsupported);
+        };
+        let c = self.temp_conn().await?;
+        let prep: core::pin::Pin<
+            Box<
+                dyn core::future::Future<
+                        Output = Result<
+                            Statement<'_, crate::storage::MemStorage>,
+                            crate::storage::MemError,
+                        >,
+                    > + '_,
+            >,
+        > = Box::pin(c.prepare(t));
+        let width = prep.await.map_err(temp::mem_err)?.column_count();
+        Ok(Plan::Temp { sql: text, width })
     }
 
     /// Parse and plan a statement that may hold parameters (v0.16,
@@ -1084,6 +1189,38 @@ impl<S: Storage> Connection<S> {
         if let Some(n) = created {
             reserved_name::<S::Error>(handle_bytes(arena, n))?;
         }
+        // The pin's system tables (`sqlite_*`, v0.16 fix, ungated):
+        // none may be indexed or altered, and only `sqlite_stat*`
+        // (and `sqlite_parameters`) may be dropped — hipp indexed,
+        // altered and dropped `sqlite_sequence`, breaking
+        // AUTOINCREMENT for the pin.
+        #[cfg(any(feature = "indexes", feature = "v04"))]
+        {
+            let sys = |h: crate::arena::ABytes| {
+                let n = handle_bytes(arena, h);
+                n.get(..7).is_some_and(|p| eq_ci(p, b"sqlite_"))
+                    && self.catalog.find(&self.catalog_arena, n).is_some()
+            };
+            let refused = match ast {
+                #[cfg(feature = "indexes")]
+                Ast::CreateIndex { table, .. } => sys(*table),
+                #[cfg(feature = "v04")]
+                Ast::AlterAddColumn { table, .. } => sys(*table),
+                #[cfg(feature = "v05")]
+                Ast::DropTable { name, .. } => {
+                    let n = handle_bytes(arena, *name);
+                    sys(*name)
+                        && !n.get(7..11).is_some_and(|p| eq_ci(p, b"stat"))
+                        && !n.get(7..).is_some_and(|p| eq_ci(p, b"parameters"))
+                }
+                _ => false,
+            };
+            if refused {
+                return Err(Error::Schema {
+                    kind: SchemaKind::SystemTable,
+                });
+            }
+        }
         // v0.16: `sqlite_schema` is readable, never writable; and
         // with `PRAGMA foreign_keys = ON` a table in a foreign key
         // is not writable either (hipp does not enforce them).
@@ -1121,6 +1258,10 @@ impl<S: Storage> Connection<S> {
                 value,
                 numeric,
             } => self.plan_pragma(arena, *schema, *name, *value, *numeric),
+            #[cfg(feature = "v16")]
+            Ast::AlterRename { .. }
+            | Ast::AlterRenameColumn { .. }
+            | Ast::AlterDropColumn { .. } => self.plan_alter16(arena, ast),
             #[cfg(feature = "v16")]
             Ast::Savepoint { .. }
             | Ast::Release { .. }
@@ -1321,6 +1462,16 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::UnknownTable,
                     })?
                     .usable()?;
+                // An AUTOINCREMENT table (in a file the pin made) is
+                // read-only without `v16`: those builds keep no
+                // `sqlite_sequence` (v0.16 fix: hipp inserted rows
+                // and left the sequence behind, so the pin's next
+                // INSERT reused a rowid AUTOINCREMENT had handed out).
+                #[cfg(not(feature = "v16"))]
+                crate::sql::parser::schema_text_start::<S::Error>(
+                    handle_bytes(&self.catalog_arena, t.sql),
+                    arena,
+                )?;
                 #[cfg(not(feature = "v08"))]
                 let _ = select;
                 #[cfg(not(feature = "v07"))]
@@ -1606,6 +1757,12 @@ impl<S: Storage> Connection<S> {
                     indexes,
                     #[cfg(feature = "v04")]
                     rules: self.table_rules(arena, t)?,
+                    #[cfg(feature = "v16")]
+                    autoinc: if t.autoinc {
+                        Some(copy_vec(handle_bytes(&self.catalog_arena, t.name)))
+                    } else {
+                        None
+                    },
                 })
             }
             Ast::Begin => {
@@ -1695,10 +1852,7 @@ impl<S: Storage> Connection<S> {
                     empty_only = true;
                 }
                 let base = handle_bytes(&self.catalog_arena, t.sql);
-                let pos = base
-                    .iter()
-                    .rposition(|b| *b == b')')
-                    .ok_or(Error::Unsupported)?;
+                let pos = add_column_offset::<S::Error>(base, arena)?;
                 let mut new_sql = AVec::new();
                 new_sql.extend_from_slice(&base[..pos]);
                 new_sql.extend_from_slice(b", ");
@@ -1883,6 +2037,7 @@ impl<S: Storage> Connection<S> {
                             Ok(Plan::DropTable {
                                 root: None,
                                 index_roots: AVec::new(),
+                                seq: None,
                             })
                         } else {
                             Err(Error::Schema {
@@ -1895,9 +2050,18 @@ impl<S: Storage> Connection<S> {
                         for ix in self.catalog.indexes_for(&self.catalog_arena, nb) {
                             index_roots.push(ix.root);
                         }
+                        let seq = match self.catalog.find(&self.catalog_arena, b"sqlite_sequence") {
+                            Some(sq)
+                                if table_autoinc::<S::Error>(t, &self.catalog_arena, arena) =>
+                            {
+                                Some((sq.root, copy_vec(handle_bytes(&self.catalog_arena, t.name))))
+                            }
+                            _ => None,
+                        };
                         Ok(Plan::DropTable {
                             root: Some(t.root),
                             index_roots,
+                            seq,
                         })
                     }
                 }
@@ -3305,6 +3469,10 @@ impl<S: Storage> Connection<S> {
                     kind: SchemaKind::NoTablesSpecified,
                 });
             }
+            #[cfg(feature = "v16")]
+            if let SelectItem::TableStar(q) = it {
+                crate::query::trace_star(&cur, *q, arena);
+            }
             let mut expanded = AVec::new();
             let hit = crate::query::expand_star::<S::Error>(&cur, qual, &mut expanded)?;
             if !hit && qual.is_some() {
@@ -3698,6 +3866,14 @@ impl<S: Storage> Connection<S> {
             desc.kind = s.kind;
             desc.colls = table_colls(t);
             desc.schema_table = t.root == 1 && s.alias.is_none();
+            // An ALTER TABLE tracing references to its table (v0.16).
+            #[cfg(feature = "v16")]
+            if let Some(tr) = &self.alter_trace
+                && eq_ci(tr.borrow().table.as_slice(), tname)
+            {
+                tr.borrow_mut().from.push(s.table.pos);
+                desc.trace = Some((tr.clone(), s.alias.is_some()));
+            }
             descs.push(desc);
             let gcols = if t.has_generated() {
                 self.table_rules(arena, t)?
@@ -4002,6 +4178,15 @@ impl<S: Storage> Connection<S> {
         out
     }
 
+    /// The connection's TEMP database (v0.16, `v16`), once a
+    /// statement has used it: a private in-memory connection whose
+    /// `tables()` / `indexes()` / `views()` are the temp schema's
+    /// (tools print them as `temp.name`). `None` before first use.
+    #[cfg(feature = "v16")]
+    pub fn temp_db(&self) -> Option<&Connection<crate::storage::MemStorage>> {
+        self.temp.as_deref()
+    }
+
     /// Mutable pager access for tools/tests driving the layers
     /// below the session API (cursor-level scans, §4.1 gates).
     pub fn pager_mut(&mut self) -> &mut Pager<S> {
@@ -4219,6 +4404,26 @@ pub struct Statement<'c, S: Storage> {
     /// `abort_write`), while it is open.
     #[cfg(feature = "v16")]
     stmt_sp: Option<usize>,
+    /// The running INSERT's AUTOINCREMENT state (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    autoinc: Option<Autoinc>,
+}
+
+/// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
+/// row (v0.16, `v16`), as the pin keeps it: read when the statement
+/// starts (the first row whose `name` is the table's name, byte for
+/// byte; `seq` converted as CAST AS INTEGER, NULL or no row reading
+/// 0), raised by every rowid the statement inserts or generates,
+/// and written back when it completes — only when there was no row
+/// or the counter grew past what was read. A statement that fails
+/// part way (OR FAIL keeps its earlier rows) writes nothing.
+#[cfg(feature = "v16")]
+struct Autoinc {
+    name: AVec<u8>,
+    seq_root: u32,
+    seq_rowid: Option<i64>,
+    counter: i64,
+    orig: Option<i64>,
 }
 
 /// Refuse a new object name the pin reserves (`sqlite_` prefix,
@@ -4302,6 +4507,90 @@ fn trimmed_sql_text<E>(raw: &[u8], arena: &Arena) -> Result<AVec<u8>, E> {
             _ => copy_vec(raw),
         },
     )
+}
+
+/// Where ALTER TABLE ADD COLUMN splices `, <column>` into a stored
+/// CREATE TABLE text: after the last column definition — at the
+/// comma that opens the table constraints, or the closing `)` — as
+/// the pin's `addColOffset` (v0.16 fix, ungated: hipp appended the
+/// column after the table constraints, a text that no longer parses,
+/// so ADD COLUMN failed on any table with one).
+#[cfg(feature = "v04")]
+fn add_column_offset<E>(sql: &[u8], arena: &Arena) -> Result<usize, E> {
+    use crate::sql::lexer::Tok;
+    let toks = crate::sql::lexer::lex::<E>(sql, arena)?;
+    let t = toks.as_slice();
+    let kw = |i: usize| match t.get(i).map(|x| x.tok) {
+        Some(Tok::Ident(h, false)) => {
+            let w = handle_bytes(arena, h);
+            [
+                &b"CONSTRAINT"[..],
+                b"PRIMARY",
+                b"UNIQUE",
+                b"CHECK",
+                b"FOREIGN",
+            ]
+            .iter()
+            .any(|k| eq_ci(w, k))
+        }
+        _ => false,
+    };
+    let mut depth = 0usize;
+    for (i, x) in t.iter().enumerate() {
+        match x.tok {
+            Tok::LParen => depth += 1,
+            Tok::RParen => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok(x.offset);
+                }
+            }
+            Tok::Comma if depth == 1 && kw(i + 1) => return Ok(x.offset),
+            _ => {}
+        }
+    }
+    Err(Error::Unsupported)
+}
+
+/// Whether a table is AUTOINCREMENT (v0.16): the catalog's flag
+/// with `v16`; without it, whether its stored text carries the
+/// clause (`schema_text_start` refuses that text there).
+#[cfg(feature = "v05")]
+#[cfg_attr(feature = "v16", allow(clippy::extra_unused_type_parameters))]
+fn table_autoinc<E>(t: &crate::schema::TableDef, cat: &Arena, arena: &Arena) -> bool {
+    #[cfg(feature = "v16")]
+    let _ = (cat, arena);
+    #[cfg(feature = "v16")]
+    return t.autoinc;
+    #[cfg(not(feature = "v16"))]
+    crate::sql::parser::schema_text_start::<E>(handle_bytes(cat, t.sql), arena).is_err()
+}
+
+/// Whether a parsed CREATE TABLE has a rowid alias (v0.16, `v16`):
+/// exactly one PRIMARY KEY column, declared exactly INTEGER and not
+/// written `INTEGER PRIMARY KEY DESC` — the rule `schema.rs` applies
+/// when it loads the table. AUTOINCREMENT needs one.
+#[cfg(feature = "v16")]
+fn create_has_rowid_alias(ast: &Ast, arena: &Arena) -> bool {
+    let Ast::CreateTable {
+        columns,
+        pk_columns,
+        ..
+    } = ast
+    else {
+        return false;
+    };
+    pk_columns.len() == 1
+        && columns.iter().any(|c| {
+            eq_ci(
+                handle_bytes(arena, c.name),
+                handle_bytes(arena, pk_columns.as_slice()[0]),
+            ) && !c.pk_desc
+                && eq_ci(
+                    crate::record::decl_token(handle_bytes(arena, c.decl)),
+                    b"INTEGER",
+                )
+        })
 }
 
 /// Build an index key (the key columns' values, in index order)
@@ -4661,7 +4950,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             || {
                 #[cfg(feature = "v16")]
                 {
-                    matches!(self.plan, Plan::CreateTableAs { .. } | Plan::Maint(_))
+                    matches!(
+                        self.plan,
+                        Plan::CreateTableAs { .. } | Plan::Maint(_) | Plan::Alter16 { .. }
+                    )
                 }
                 #[cfg(not(feature = "v16"))]
                 {
@@ -4711,6 +5003,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Deferred => Err(Error::Unsupported),
             #[cfg(feature = "v16")]
             Plan::Maint(_) => self.step_maint().await,
+            #[cfg(feature = "v16")]
+            Plan::Alter16 { .. } => self.step_alter16().await,
+            #[cfg(feature = "v16")]
+            Plan::Temp { .. } => self.step_temp().await,
             Plan::CreateTable => self.step_create().await,
             #[cfg(feature = "v16")]
             Plan::CreateTableAs { .. } => self.step_create_as().await,
@@ -4748,6 +5044,23 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
+        // A transaction statement applies to the TEMP database too.
+        #[cfg(feature = "v16")]
+        if r.is_ok()
+            && matches!(
+                self.plan,
+                Plan::Begin
+                    | Plan::BeginImmediate
+                    | Plan::Commit
+                    | Plan::Rollback
+                    | Plan::Maint(maint::Maint::Savepoint(_))
+                    | Plan::Maint(maint::Maint::Release(_))
+                    | Plan::Maint(maint::Maint::RollbackTo(_))
+            )
+        {
+            let sql = copy_vec(handle_bytes(&self.arena, self.sql_text));
+            self.conn.mirror_temp(sql.as_slice()).await;
+        }
         // Keep the connection's catalog in step with the schema
         // cookie after DDL / transaction boundaries, so metadata
         // readers (tables(), indexes()) see the new state without
@@ -4767,6 +5080,12 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "params")]
     async fn replan(&mut self) -> Result<(), S::Error> {
         if !self.binds.stale {
+            return Ok(());
+        }
+        // The TEMP database plans its own statements.
+        #[cfg(feature = "v16")]
+        if matches!(self.plan, Plan::Temp { .. }) {
+            self.binds.stale = false;
             return Ok(());
         }
         if self.conn.pager.in_commit() {
@@ -5032,6 +5351,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         // AUTOINCREMENT is refused there (v0.16).
         let raw = handle_bytes(&self.arena, self.sql_text);
         let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
+        // AUTOINCREMENT (v0.16, `v16`): only on the rowid alias.
+        #[cfg(feature = "v16")]
+        let autoinc =
+            crate::sql::parser::has_autoincrement::<S::Error>(sql_text.as_slice(), &self.arena);
+        #[cfg(feature = "v16")]
+        if autoinc && !create_has_rowid_alias(&self.ast, &self.arena) {
+            return Err(Error::Schema {
+                kind: SchemaKind::AutoincrementNotIntegerPk,
+            });
+        }
+        #[cfg(feature = "v16")]
+        let r = self
+            .exec_create(name_b.as_slice(), sql_text.as_slice(), autoinc)
+            .await;
+        #[cfg(not(feature = "v16"))]
         let r = self
             .exec_create(name_b.as_slice(), sql_text.as_slice())
             .await;
@@ -5170,7 +5504,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         btree::btree_insert(pager, 1, rowid, rec.as_slice()).await
     }
 
-    async fn exec_create(&mut self, name: &[u8], sql_text: &[u8]) -> Result<(), S::Error> {
+    async fn exec_create(
+        &mut self,
+        name: &[u8],
+        sql_text: &[u8],
+        #[cfg(feature = "v16")] autoinc: bool,
+    ) -> Result<(), S::Error> {
         let (root, _) = self.conn.pager.alloc_page().await?;
         btree::create_empty_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(b"table", name, name, root, Some(sql_text))
@@ -5180,6 +5519,28 @@ impl<'c, S: Storage> Statement<'c, S> {
         // creates them.
         #[cfg(feature = "indexes")]
         self.create_auto_indexes(name).await?;
+        // The first AUTOINCREMENT table brings `sqlite_sequence`
+        // (v0.16, `v16`): its schema row follows the table's
+        // automatic indexes, with the pin's text, as on the pin.
+        #[cfg(feature = "v16")]
+        if autoinc
+            && self
+                .conn
+                .catalog
+                .find(&self.conn.catalog_arena, b"sqlite_sequence")
+                .is_none()
+        {
+            let (sroot, _) = self.conn.pager.alloc_page().await?;
+            btree::create_empty_root(&mut self.conn.pager, sroot).await?;
+            self.insert_schema_row(
+                b"table",
+                b"sqlite_sequence",
+                b"sqlite_sequence",
+                sroot,
+                Some(b"CREATE TABLE sqlite_sequence(name,seq)"),
+            )
+            .await?;
+        }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
@@ -5677,6 +6038,8 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
         #[cfg(feature = "v16")]
         self.conn.env.pending.set(0);
+        #[cfg(feature = "v16")]
+        self.autoinc_begin().await?;
         // v0.16: VALUES rows that read last_insert_rowid() evaluate
         // one at a time, each just before its own insert — on the
         // pin each row sees the rowid the row before it inserted.
@@ -5703,6 +6066,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
                 self.exec_insert_row(rv).await?;
             }
+            self.autoinc_end().await?;
             if !self.conn.explicit_txn {
                 self.conn.pager.drive_commit().await?;
             }
@@ -5718,12 +6082,98 @@ impl<'c, S: Storage> Statement<'c, S> {
         for values in rows.iter() {
             self.exec_insert_row(values.clone()).await?;
         }
+        #[cfg(feature = "v16")]
+        self.autoinc_end().await?;
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(true);
         Ok(())
+    }
+
+    /// Read the target's `sqlite_sequence` row when the INSERT's
+    /// table is AUTOINCREMENT (v0.16, `v16`; see `Autoinc`).
+    #[cfg(feature = "v16")]
+    async fn autoinc_begin(&mut self) -> Result<(), S::Error> {
+        self.autoinc = None;
+        let name = match &self.plan {
+            Plan::Insert {
+                autoinc: Some(n), ..
+            } => n.clone(),
+            _ => return Ok(()),
+        };
+        let seq_root = self
+            .conn
+            .catalog
+            .find(&self.conn.catalog_arena, b"sqlite_sequence")
+            .ok_or(Error::Schema {
+                kind: SchemaKind::UnknownTable,
+            })?
+            .root;
+        let mut ai = Autoinc {
+            name,
+            seq_root,
+            seq_rowid: None,
+            counter: 0,
+            orig: None,
+        };
+        let mut cursor = ScanCursor::new(seq_root);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 2)?;
+            if !matches!(values.as_slice().first(), Some(Value::Text(n)) if *n == ai.name.as_slice())
+            {
+                continue;
+            }
+            let seq = values
+                .as_slice()
+                .get(1)
+                .map(|v| OwnedValue::from_value(*v))
+                .unwrap_or(OwnedValue::Null);
+            ai.counter = match crate::query::cast_value(&seq, crate::record::Affinity::Integer) {
+                OwnedValue::Integer(i) => i,
+                _ => 0,
+            };
+            ai.seq_rowid = Some(rowid);
+            ai.orig = Some(ai.counter);
+            break;
+        }
+        self.autoinc = Some(ai);
+        Ok(())
+    }
+
+    /// Write the AUTOINCREMENT counter back to `sqlite_sequence`
+    /// at the end of a successful INSERT (v0.16, `v16`): a new row
+    /// (next rowid) when the table had none, else its row rewritten
+    /// in place when the counter grew.
+    #[cfg(feature = "v16")]
+    async fn autoinc_end(&mut self) -> Result<(), S::Error> {
+        let Some(ai) = self.autoinc.take() else {
+            return Ok(());
+        };
+        if ai.orig.is_some_and(|o| ai.counter <= o) {
+            return Ok(());
+        }
+        let pager = &mut self.conn.pager;
+        let rowid = match ai.seq_rowid {
+            Some(r) => {
+                btree::btree_delete(pager, ai.seq_root, r).await?;
+                r
+            }
+            None => match btree::seek_max_rowid(pager, ai.seq_root).await? {
+                Some(m) => m.checked_add(1).ok_or(Error::Schema {
+                    kind: SchemaKind::DatabaseFull,
+                })?,
+                None => 1,
+            },
+        };
+        let mut vals: AVec<Value<'_>> = AVec::new();
+        vals.push(Value::Text(ai.name.as_slice()));
+        vals.push(Value::Integer(ai.counter));
+        let mut rec = AVec::new();
+        encode_record(vals.as_slice(), &mut rec);
+        btree::btree_insert(pager, ai.seq_root, rowid, rec.as_slice()).await
     }
 
     /// Produce every row an INSERT will insert, as raw value
@@ -5842,6 +6292,24 @@ impl<'c, S: Storage> Statement<'c, S> {
             let pager = &mut self.conn.pager;
             match explicit_rowid {
                 Some(r) => r,
+                #[cfg(feature = "v16")]
+                None if self.autoinc.is_some() => {
+                    // AUTOINCREMENT: one past both the largest rowid
+                    // and the largest ever handed out; nothing past
+                    // i64::MAX ("database or disk is full").
+                    let max = btree::seek_max_rowid(pager, *root).await?;
+                    let counter = self.autoinc.as_ref().map_or(0, |a| a.counter);
+                    let full = Error::Schema {
+                        kind: SchemaKind::DatabaseFull,
+                    };
+                    let next = match max {
+                        Some(m) => m.checked_add(1).ok_or(full)?,
+                        None => 1,
+                    };
+                    next.max(counter.checked_add(1).ok_or(Error::Schema {
+                        kind: SchemaKind::DatabaseFull,
+                    })?)
+                }
                 None => match btree::seek_max_rowid(pager, *root).await? {
                     Some(m) => m.checked_add(1).ok_or(Error::Schema {
                         kind: SchemaKind::DatatypeMismatch,
@@ -5850,6 +6318,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 },
             }
         };
+        #[cfg(feature = "v16")]
+        if let Some(ai) = self.autoinc.as_mut() {
+            ai.counter = ai.counter.max(rowid);
+        }
         // v0.10 NOT NULL: the proposed row is resolved under
         // the statement's conflict action before any uniqueness
         // check (the pin's order) — and, for an upsert, before
@@ -7049,8 +7521,12 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// see intact trees.
     #[cfg(feature = "v05")]
     async fn exec_drop_table(&mut self) -> Result<(), S::Error> {
-        let (root, index_roots) = match &self.plan {
-            Plan::DropTable { root, index_roots } => (*root, index_roots.clone()),
+        let (root, index_roots, seq) = match &self.plan {
+            Plan::DropTable {
+                root,
+                index_roots,
+                seq,
+            } => (*root, index_roots.clone(), seq.clone()),
             _ => unreachable!(),
         };
         let Some(root) = root else {
@@ -7091,6 +7567,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         for r in schema_rowids.iter() {
             btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
+        }
+        if let Some((sroot, tname)) = seq {
+            let mut gone = AVec::new();
+            let mut cursor = ScanCursor::new(sroot);
+            let mut buf = AVec::new();
+            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+                let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 1)?;
+                if matches!(values.as_slice().first(), Some(Value::Text(n)) if *n == tname.as_slice())
+                {
+                    gone.push(rowid);
+                }
+            }
+            for r in gone.iter() {
+                btree::btree_delete(&mut self.conn.pager, sroot, *r).await?;
+            }
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
@@ -9024,6 +9515,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Query(q) => q.width,
             #[cfg(feature = "v16")]
             Plan::Pragma(p) => p.width(),
+            #[cfg(feature = "v16")]
+            Plan::Temp { width, .. } => *width,
             #[cfg(feature = "v07")]
             Plan::Insert { returning, .. } => returning.len(),
             #[cfg(all(feature = "v05", feature = "v07"))]
