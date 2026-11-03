@@ -3548,6 +3548,198 @@ COLUMN cut and the catalog guard.
   columnates); `.dump` still differs from the shell's around
   `PRAGMA foreign_keys` / `writable_schema` and `sqlite_stat1`.
 
+### Parser and evaluator depth limits (2026-11-03)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, **ungated** (a crash fix on claimed paths, and the
+limits are where the pin refuses). Before it, the parser, the
+resolver, the planner, the evaluator and the tree's Clone / Drop
+recursed once per nesting level with no bound: 100 000 nested
+parentheses, signs, NOTs, calls, CASEs or subqueries in one
+statement (or in a stored CHECK / view text) overflowed the stack,
+and so did a long run of signs in the tiny profile's `INSERT ...
+VALUES (- - ... 1)` (`literal_at` recursed per sign).
+
+**Oracle-probing notes** (the pin's build: `MAX_EXPR_DEPTH=1000`,
+`MAX_FUNCTION_ARG=1000`, `MAX_COLUMN=2000`,
+`MAX_COMPOUND_SELECT=500`, `MAX_VARIABLE_NUMBER=32766`,
+`MAX_LIKE_PATTERN_LENGTH=50000`, `MAX_SQL_LENGTH=1000000000`;
+every boundary below was found by bisection on the pin):
+
+- *Expression height* ("Expression tree is too large (maximum
+  depth 1000)") is the pin's `Expr.nHeight`, checked as each node
+  is made: a leaf is 1 (`t.a` is 2, a DOT node); a node is one more
+  than its tallest operand; parentheses add nothing; `+` over a `+`
+  node re-uses it and `-` over one turns it into a `-` node (so
+  2494 `+` signs parse, 999 `-` do); a row value is a node of height
+  1 whatever its elements; `x ISNULL` / NOTNULL / `IS [NOT] NULL` /
+  `NOT NULL` over a numeric, string or blob literal (under any
+  signs) folds to the integer 0 / 1 (`1 ISNULL ISNULL ...` never
+  grows); `x IN ()` folds to a literal; `x IN (c)` with one
+  constant item and no COLLATE is `x = +c` (one node more), with
+  one scalar-subquery item it is `x IN (SELECT ...)`; NOT LIKE /
+  BETWEEN / IN / GLOB add a NOT node; a call is one more than its
+  tallest argument (FILTER, aggregate ORDER BY and OVER count
+  nothing); a subquery node is one more than its select's tallest
+  result column, WHERE, HAVING, GROUP BY, ORDER BY or LIMIT node
+  (LIMIT and OFFSET are one node) over all compound members.
+- *Resolution adds heights*: the pin's `sqlite3ResolveExprNames`
+  adds each resolved expression's height to `Parse.nHeight`, so a
+  subquery's expressions count with the heights of every
+  expression enclosing it: 43 nested scalar subqueries (sum of
+  heights 990) read, 44 do not; 41 nested `x IN (SELECT ...)`. FROM
+  subqueries and CTE bodies are resolved in their select's context,
+  not inside its expressions (`(SELECT 1 FROM (SELECT - - - - 1))`
+  counts 2 + 5). ON / USING terms are ANDed into the WHERE before
+  resolution (`sqlite3ProcessJoin`; `ON <5> WHERE 1` resolves a
+  height-6 tree). ORDER BY / GROUP BY ordinals are not resolved.
+  A CREATE VIEW body is not resolved until the view is read (the pin
+  creates a view no query can read).
+- *Compound sorter*: a member of UNION / EXCEPT / INTERSECT, or of
+  any compound with an ORDER BY, gets one node over each result
+  column (a COLLATE the pin adds), so its columns stop at 999;
+  UNION ALL alone adds none.
+- *Parser stack* ("Recursion limit"): the pin's LALR stack holds
+  2500 symbols, counted from the bottom entry: `SELECT (((1)))`
+  holds `SELECT distinct sclp scanpt` then one `(` per level (2493
+  levels), a call `idj LP distinct` per level (831), CASE `CASE
+  case_operand WHEN expr THEN` (498), a FROM subquery `SELECT
+  distinct selcollist FROM stl_prefix LP` (414), a core's end
+  `SELECT distinct selcollist from where_opt groupby_opt having_opt
+  orderby_opt limit_opt`. The bases of about 90 contexts were probed
+  and modelled (`INSERT VALUES` 8 / 10 / 9 / 11 by position, `UPDATE SET`
+  9, `WHERE` of UPDATE 10, of DELETE 7, `CREATE VIEW` 9 + the
+  select's, `ON` 10, `LIMIT` 10, `OFFSET` 12, CTE bodies 6 / 8 (+1
+  RECURSIVE), compound members 2 up, RETURNING, upsert, ...).
+- *Counts*: "too many terms in compound SELECT" past 500 SELECTs
+  (multi-row VALUES is one), "too many arguments on function f" past
+  1000, "too many columns on t" / "in index" / "in result set"
+  (after `*`) / "in set list" past 2000 (ALTER TABLE ADD COLUMN
+  too), "too many terms in ORDER BY clause" / "GROUP BY" past 2000,
+  "at most 64 tables in a join". The existing bound-parameter and
+  LIKE / GLOB pattern limits were confirmed.
+- *Found while probing* (ungated fix): `ORDER BY 2 NOTNULL` is the
+  ordinal 1 on the pin, `ORDER BY 1 ISNULL` / `GROUP BY 1 ISNULL`
+  the out-of-range ordinal 0 — the null-test fold makes an integer
+  literal; hipp sorted and grouped by a constant.
+
+**Shipped (ungated):** `sql::parser::Limits` (`Config::limits`,
+`Config::max_expr_depth`, `Config::max_parser_depth`,
+`Config::depth_limits`, `Config::stack_budget`;
+`ParseKind::{ExprTooDeep, StatementTooLong, TooManyColumns,
+TooManyTerms, TooManyArguments, TooManyCompoundTerms}`,
+`SchemaKind::{TooManyColumns, TooManyTables}`). The parser carries
+the pin's two counts as it reads: `held` (the LALR symbols below
+the construct, checked on the way down so no recursion outruns it)
+and `eh` / `ek` (the height and kind of the expression just
+parsed), with the resolution sum carried up per select (`rsub`,
+`sel_r`) and the ON chain folded (`OnChain`). Every parse site
+takes the connection's limits: statements, stored schema texts at
+catalog load, view bodies at expansion (`parse_view`: the body's
+resolution depth is checked when it is read, not at CREATE VIEW),
+CHECK / DEFAULT / generated re-parses, ALTER's text walks.
+`literal_at` walks sign runs without recursion (tiny profile
+included, with the pin's limits on the run in `INSERT VALUES` and
+`WHERE rowid =`). The null-test fold (above). CREATE TABLE items
+nest parentheses up to the parser limit (they stopped at 32). The
+count limits above. The parser's `sql[a..b]` slices became checked
+`span`s; `cmp_op` / `arith`'s `unreachable!()` arms an error.
+
+*Stack.* With the tree height and the parser stack bounded, every
+recursive walk is too; to make the bound affordable the hot
+recursive functions were split so one nesting level puts a small
+frame on the stack: the parser's primary / unary / parenthesis /
+call / CASE / CAST / column paths, `resolve_scoped` (common nodes
+inline, the rest in `resolve_other` and one function per node
+kind), `eval` (likewise; `arith` / `cmp_op` evaluate operands then
+call out), the FROM planner (`plan_derived_source`,
+`synth_source`), the FROM-source parser. Measured on x86_64
+(release / debug, bytes per level): 911 / 3.7 K per nested
+parenthesis (was 2.1 K / 12 K), 640 / 3.3 K per height of a `+`
+chain (2.9 K / 24 K), 1.3 K / 9.5 K per nested call (3.1 K /
+26 K), 1.5 K / 8.2 K per nested CASE (2.9 K / 24 K), 8.9 K / 25 K
+per nested FROM subquery (parse, plan and execution). Worst
+statement at the pin's limits: 4.3 MiB release, 13 MiB debug; at
+the defaults (expressions 1000 deep, a 500-symbol parser stack):
+1.4 MiB / 5.3 MiB (a 2 MiB release thread, an 8 MiB debug one).
+`Config::stack_budget(bytes)` uses `STACK_BASE + parser_depth *
+STACK_PER_SYMBOL + expr_depth * STACK_PER_HEIGHT` (64 K + 1.5 K +
+704 B release, 320 K + 4 K + 3.4 K debug; a debug build needs 270
+KiB for `SELECT 1` — the step future alone is 100 KiB).
+`Config::tiny()` takes 64 / 64. The CLI sets the pin's limits on
+its 512 MiB thread.
+
+**Tests:** `tests/depth_v16.rs` (8 tests): 36 nesting shapes at the
+pin's limits on both sides of every boundary vs the live pin
+(answers and error classes), the same shapes under
+`stack_budget(512 KiB)` (256 KiB in release) and under the
+defaults on an 8 MiB thread — each accepted up to hipp's boundary
+with the pin's answer, refused past it, and refused 50 times
+deeper, never an overflow; 18 count limits on both sides; a
+generated corpus (xorshift, `HIPP_DEPTH_CORPUS`, default 24 cases,
+300 ran clean) of random wrappers around random operands in random
+statement contexts, the boundary bisected on the pin; the
+regressions (null-test ordinals, CHECK past 32 parentheses, the
+CREATE VIEW deferral, IN-list rewrites, the ON chain, LIMIT /
+OFFSET, the compound sorter); 100 000-deep hostile statements on a
+default thread. `tests/depth_tiny_v16.rs` (3 tests, also built and
+run without the v0.4 grammar by `tiny_build_runs_these`): sign runs
+in every literal position of the tiny grammar at the pin's
+boundaries (searched live) on a small thread, 100 000-sign runs,
+2000 / 2001 columns (and the pin reading hipp's 2000-column file).
+Parser unit tests: the statement length limit, the ON fold.
+`hipp-cli/tests/cli_v16_depth.rs` (2 tests): a byte-identical
+batch of 15 shapes at and past their boundaries, the ordinal fold
+and the count limits. `tests/views_cte_v16.rs`'s pin-limit
+configuration now sets the pin's depth limits too.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size:** tiny **76,476 B** (Δ **+252 B** vs 76,224, ratchet raised
+to it): correctness fixes on the tiny profile's INSERT / SELECT /
+CREATE TABLE paths, within the +256 B allowance — the sign-run
+walk without recursion and its pin limits (the crash), the 2000-
+column checks of CREATE TABLE and the result list. Full **482,328 B**
+(Δ **+7,432 B** vs 474,896, ratchet raised to it) and max **482,312 B**
+(Δ **+7,408 B** vs 474,904): the parser's two counts in every
+construct, the resolution-depth fold, the count limits and the
+split walkers.
+
+**Honest gaps:**
+
+- A flattened FROM subquery, view or CTE column that the outer
+  query reads becomes, on the pin, a copy of the column's expression
+  under a COLLATE node; the copy's height (+1, plus the reading
+  expression's) is checked there and not in hipp, so hipp accepts
+  `SELECT * FROM (SELECT <height 1000> FROM t)` where the pin refuses
+  it (the pin refuses at 999 + 1).
+- A view's or CTE's resolution depth is checked at the select that
+  owns it (a view: on its own, when read; a CTE: the select with the
+  WITH clause); the pin resolves either where it is read, inside
+  any enclosing expressions. NATURAL join terms are not counted in
+  the WHERE tree (USING ones are), nor is the pin's shortcut of `ON
+  0`. CHECK / DEFAULT / generated expressions are re-parsed alone
+  and counted at the first column's base (a later column's sits two
+  symbols higher on the pin); likewise ALTER TABLE ADD COLUMN's.
+  RETURNING after a several-clause upsert and CAST type arguments
+  use approximate bases. PRAGMA `table_info` of a view and ALTER's
+  view re-plans read the view body without the resolution check.
+- The join limit is counted per FROM clause (the pin counts after
+  flattening, so a join of flattened subqueries can pass 64 there).
+- The stack costs are x86_64 measurements; other targets' frames
+  differ (32-bit ones are usually smaller), so `stack_budget` is an
+  estimate there — leave headroom. The debug build's 270 KiB base
+  (the step future) is untouched.
+- `SELECT * FROM (SELECT 1,1,1,1,1)` is still `Unsupported`
+  (pre-existing: past three duplicate names the pin switches to a
+  random column-name suffix).
+- The audit for other panics reachable from SQL covered the parser
+  and the evaluator; the `unreachable!()` / `expect` left in
+  `session.rs` and `btree.rs` guard structural invariants (plan
+  kinds, a B-tree descent's parent), not data, and were not
+  rewritten.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

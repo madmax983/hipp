@@ -716,7 +716,7 @@ impl<S: Storage> Connection<S> {
                 columns,
                 pk_columns,
                 ..
-            } = crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc)?
+            } = crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc, self.cfg.limits())?
             else {
                 return Err(Error::CorruptRecord);
             };
@@ -999,7 +999,7 @@ impl<S: Storage> Connection<S> {
         let t = t.usable::<S::Error>()?;
         let sc = scratch();
         let Ast::CreateTable { fkeys, .. } =
-            crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc)?
+            crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc, self.cfg.limits())?
         else {
             return Err(Error::CorruptRecord);
         };
@@ -1046,7 +1046,7 @@ impl<S: Storage> Connection<S> {
         for t in self.catalog.tables.iter() {
             sc.reset();
             let Ok(Ast::CreateTable { fkeys, .. }) =
-                crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc)
+                crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc, self.cfg.limits())
             else {
                 continue;
             };
@@ -1231,7 +1231,7 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
     }
 
     fn select_of(&self, arena: &Arena, sql: &[u8]) -> Result<SelectStmt, S::Error> {
-        match crate::sql::parse::<S::Error>(sql, arena)? {
+        match crate::sql::parse::<S::Error>(sql, arena, self.cfg.limits())? {
             Ast::Select(s) => Ok(s),
             _ => Err(Error::Unsupported),
         }

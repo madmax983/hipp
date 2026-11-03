@@ -445,6 +445,31 @@ aspirations.
   is refused, as is ALTER TABLE of a main table a TEMP view reads;
   files with triggers cannot be altered; re-created tables can get
   other root page numbers than on the pin (STATUS.md).
+- **Parser and evaluator depth limits (crash hardening).**
+  Ungated: no statement or stored schema text can overflow the
+  stack any more (100 000 nested parentheses, signs, calls or
+  subqueries used to; in the tiny profile a long run of signs in
+  `INSERT ... VALUES` did). hipp counts what the pin counts — the
+  expression tree's height (`SQLITE_LIMIT_EXPR_DEPTH` 1000, with
+  the heights of the expressions a subquery sits in added during
+  resolution: 43 nested scalar subqueries read, 44 do not) and
+  its LALR parser stack (2500 symbols: 2493 nested parentheses,
+  831 nested calls, 414 nested FROM subqueries) — and refuses past
+  them as the pin does ("Expression tree is too large",
+  "Recursion limit"), at the pin's exact boundary in every probed
+  context. `Config::max_expr_depth` / `max_parser_depth` bound the
+  stack a statement needs (`Config::stack_budget(bytes)` derives
+  them from a thread's stack; the defaults, 1000 and 500, fit a 2
+  MiB thread in a release build); the CLI runs the pin's. The
+  hot recursive walkers (parser, resolver, evaluator, FROM
+  planner) were split so each nesting level costs a few hundred
+  bytes in release. Also matched: 500 compound SELECTs, 1000 call
+  arguments, 2000 columns in a table, index, result set (after
+  `*`), VALUES row or SET list, 2000 ORDER BY / GROUP BY terms, 64
+  joined tables, the statement length; and `ORDER BY 2 NOTNULL`
+  is the ordinal 1 as on the pin (a null test over a literal folds
+  to an integer; hipp sorted by a constant). Tiny +252 B
+  (STATUS.md).
 
 ## What v0.13 does
 

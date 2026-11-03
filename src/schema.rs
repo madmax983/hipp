@@ -366,6 +366,7 @@ fn col_coll(t: &TableDef, col: Option<usize>) -> Coll {
 pub async fn build_catalog<S: Storage>(
     pager: &mut Pager<S>,
     catalog_arena: &Arena,
+    lim: crate::sql::parser::Limits,
 ) -> Result<Catalog, S::Error> {
     // Pass 0: collect the raw schema rows (tables must be built
     // before indexes can resolve their columns).
@@ -453,7 +454,7 @@ pub async fn build_catalog<S: Storage>(
         }
         let sql = row.sql.as_ref().expect("checked");
         scratch.reset();
-        let ast = match parse::<S::Error>(sql.as_slice(), &scratch) {
+        let ast = match parse::<S::Error>(sql.as_slice(), &scratch, lim) {
             Ok(a) => a,
             // v0.16: a collation hipp does not have (one an
             // application registered) — the pin opens such a
@@ -538,6 +539,7 @@ pub async fn build_catalog<S: Storage>(
                 match crate::rules::eval_default::<S::Error>(
                     text,
                     &scratch,
+                    lim,
                     &mut crate::rules::Clock::new(None),
                     None,
                 ) {
@@ -646,7 +648,7 @@ pub async fn build_catalog<S: Storage>(
             Some(sql) => {
                 // Explicit index: re-parse its CREATE INDEX.
                 scratch.reset();
-                let parsed = parse::<S::Error>(sql.as_slice(), &scratch);
+                let parsed = parse::<S::Error>(sql.as_slice(), &scratch, lim);
                 let mut idx = IndexDef {
                     name: intern(catalog_arena, row.name.as_slice())?,
                     table: intern(catalog_arena, row.tbl_name.as_slice())?,
@@ -733,7 +735,7 @@ pub async fn build_catalog<S: Storage>(
             columns: explicit,
             select,
             ..
-        }) = parse::<S::Error>(sql.as_slice(), &scratch)
+        }) = parse::<S::Error>(sql.as_slice(), &scratch, lim)
         {
             columns = derive_view_columns(&catalog, catalog_arena, &scratch, &select, &explicit);
         }

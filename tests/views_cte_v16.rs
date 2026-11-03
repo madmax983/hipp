@@ -1203,9 +1203,15 @@ fn cte_chain(n: usize, sub: bool) -> String {
 /// `Config::max_nesting` (default 250, for an 8 MiB stack).
 #[test]
 fn nesting_limits() {
+    // The pin's nesting limit and (v0.16 depth unit) its
+    // expression and parser depth limits.
     let pin = || {
         Config::default()
             .max_nesting(1000)
+            .depth_limits(
+                hipp::sql::parser::PIN_EXPR_DEPTH,
+                hipp::sql::parser::PIN_PARSER_DEPTH,
+            )
             .statement_arena(16 * 1024, 8 * 1024 * 1024)
     };
     for n in [63, 70, 300, 999] {

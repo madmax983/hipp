@@ -38,6 +38,7 @@ use super::*;
 use crate::arena::ABytes;
 use crate::query::AlterTrace;
 use crate::sql::lexer::{Tok, Token};
+use crate::sql::parser::Limits;
 use alloc::rc::Rc;
 use core::cell::RefCell;
 
@@ -287,9 +288,15 @@ fn walk_cols(e: &Expr, out: &mut AVec<(Option<ABytes>, ABytes)>) {
 }
 
 /// The column references of the expression text `sql[at..end]`.
-fn expr_refs<E>(sql: &[u8], at: usize, end: usize, arena: &Arena) -> Result<AVec<ColRef>, E> {
+fn expr_refs<E>(
+    sql: &[u8],
+    at: usize,
+    end: usize,
+    arena: &Arena,
+    lim: Limits,
+) -> Result<AVec<ColRef>, E> {
     let sub = sql.get(at..end).unwrap_or(&[]);
-    let (e, toks) = crate::sql::parser::parse_expr_with_tokens::<E>(sub, arena)?;
+    let (e, toks) = crate::sql::parser::parse_expr_with_tokens::<E>(sub, arena, lim)?;
     let mut cols = AVec::new();
     walk_cols(&e, &mut cols);
     let mut out = AVec::new();
@@ -357,7 +364,7 @@ fn name_list(toks: &[Token], i: usize, arena: &Arena) -> (AVec<(usize, AVec<u8>)
     (out, close)
 }
 
-fn walk_table<E>(sql: &[u8], arena: &Arena) -> Result<TableText, E> {
+fn walk_table<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<TableText, E> {
     let toks = crate::sql::parser::tokens::<E>(sql, arena)?;
     let t = toks.as_slice();
     let mut w = TableText::default();
@@ -403,7 +410,7 @@ fn walk_table<E>(sql: &[u8], arena: &Arena) -> Result<TableText, E> {
                 let close = close_paren(t, j + 1);
                 let at = t.get(j + 2).map_or(0, |x| x.offset);
                 let end = t.get(close).map_or(sql.len(), |x| x.offset);
-                for r in expr_refs::<E>(sql, at, end, arena)?.iter() {
+                for r in expr_refs::<E>(sql, at, end, arena, lim)?.iter() {
                     w.exprs.push((k, r.clone()));
                 }
                 j = close + 1;
@@ -469,7 +476,7 @@ fn walk_table<E>(sql: &[u8], arena: &Arena) -> Result<TableText, E> {
 
 /// A CREATE INDEX text, walked by tokens: the table name's offset
 /// and name, and the column references of its key items and WHERE.
-fn walk_index<E>(sql: &[u8], arena: &Arena) -> Result<(Named, AVec<ColRef>), E> {
+fn walk_index<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<(Named, AVec<ColRef>), E> {
     let toks = crate::sql::parser::tokens::<E>(sql, arena)?;
     let t = toks.as_slice();
     let Some(on) = (0..t.len()).find(|&i| is_kw(t, i, arena, b"ON")) else {
@@ -499,7 +506,7 @@ fn walk_index<E>(sql: &[u8], arena: &Arena) -> Result<(Named, AVec<ColRef>), E> 
             if last > from {
                 let at = t[from].offset;
                 let end = t.get(last).map_or(sql.len(), |x| x.offset);
-                for r in expr_refs::<E>(sql, at, end, arena)?.iter() {
+                for r in expr_refs::<E>(sql, at, end, arena, lim)?.iter() {
                     refs.push(r.clone());
                 }
             }
@@ -516,7 +523,7 @@ fn walk_index<E>(sql: &[u8], arena: &Arena) -> Result<(Named, AVec<ColRef>), E> 
         while end > at && (sql[end - 1] == b';' || sql[end - 1].is_ascii_whitespace()) {
             end -= 1;
         }
-        for r in expr_refs::<E>(sql, at, end, arena)?.iter() {
+        for r in expr_refs::<E>(sql, at, end, arena, lim)?.iter() {
             refs.push(r.clone());
         }
     }
@@ -612,7 +619,9 @@ impl<S: Storage> Connection<S> {
     /// Plan a view's stored text `sql` against the current schema
     /// (the TEMP database's second RENAME COLUMN pass, above).
     fn plan_view_text(&self, arena: &Arena, name: &[u8], sql: &[u8]) -> Result<(), S::Error> {
-        let Ast::CreateView { select, .. } = crate::sql::parse::<S::Error>(sql, arena)? else {
+        let Ast::CreateView { select, .. } =
+            crate::sql::parse::<S::Error>(sql, arena, self.cfg.limits())?
+        else {
             return Err(Error::Unsupported);
         };
         let expanded = self.expand_parsed_view(arena, name, select)?;
@@ -631,7 +640,8 @@ impl<S: Storage> Connection<S> {
         sql: &[u8],
         table: &[u8],
     ) -> Result<ViewTrace, S::Error> {
-        let (ast, toks) = crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena)?;
+        let (ast, toks) =
+            crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena, self.cfg.limits())?;
         let Ast::CreateView { select, .. } = ast else {
             return Err(Error::Unsupported);
         };
@@ -820,7 +830,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let own = eq_ci(row.name.as_slice(), tn);
                 Some(self.edit_table(sql, own, tn, &op, &arena)?)
             } else if eq_ci(row.ty.as_slice(), b"index") && eq_ci(row.tbl.as_slice(), tn) {
-                Some(edit_index::<S::Error>(sql, tn, &op, &arena)?)
+                Some(edit_index::<S::Error>(
+                    sql,
+                    tn,
+                    &op,
+                    &arena,
+                    self.conn.cfg.limits(),
+                )?)
             } else if eq_ci(row.ty.as_slice(), b"view") {
                 let (from, hits) = self.conn.trace_view(&arena, row.name.as_slice(), sql, tn)?;
                 let mut eds = AVec::new();
@@ -991,7 +1007,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         op: &AlterOp,
         arena: &Arena,
     ) -> Result<AVec<u8>, S::Error> {
-        let w = walk_table::<S::Error>(sql, arena)?;
+        let w = walk_table::<S::Error>(sql, arena, self.conn.cfg.limits())?;
         let mut eds = AVec::new();
         match op {
             AlterOp::Rename { new } => {
@@ -1082,7 +1098,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 out.extend_from_slice(&sql[..at]);
                 out.extend_from_slice(&sql[end.min(sql.len())..]);
                 // What remains must not use the column.
-                let nw = walk_table::<S::Error>(out.as_slice(), arena)?;
+                let nw = walk_table::<S::Error>(out.as_slice(), arena, self.conn.cfg.limits())?;
                 let uses = nw.exprs.iter().any(|(_, r)| names_col(r, tn, name))
                     || nw.fk_local.iter().any(|(_, n)| eq_ci(n.as_slice(), name));
                 if uses {
@@ -1192,8 +1208,14 @@ fn auto_index_name(name: &[u8], old: &[u8], new: &[u8]) -> AVec<u8> {
 }
 
 /// An index's text edited for `op` on its table `tn`.
-fn edit_index<E>(sql: &[u8], tn: &[u8], op: &AlterOp, arena: &Arena) -> Result<AVec<u8>, E> {
-    let ((to, _), refs) = walk_index::<E>(sql, arena)?;
+fn edit_index<E>(
+    sql: &[u8],
+    tn: &[u8],
+    op: &AlterOp,
+    arena: &Arena,
+    lim: Limits,
+) -> Result<AVec<u8>, E> {
+    let ((to, _), refs) = walk_index::<E>(sql, arena, lim)?;
     let mut eds = AVec::new();
     match op {
         AlterOp::Rename { new } => {

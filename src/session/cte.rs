@@ -112,6 +112,9 @@ struct Expander<'c> {
     nest: usize,
     /// `Config::max_nesting`.
     max_nest: usize,
+    /// The connection's parser limits (`Config::limits`), for view
+    /// bodies re-parsed here.
+    lim: crate::sql::parser::Limits,
     /// SELECTs copied out of view and CTE bodies so far.
     copies: usize,
     /// The second walk: every expanded source's materialization
@@ -147,6 +150,7 @@ impl<S: Storage> Connection<S> {
             mats: AVec::new(),
             nest: 0,
             max_nest: self.cfg.max_nesting,
+            lim: self.cfg.limits(),
             copies: 0,
             fixing: false,
             sub_limit: false,
@@ -719,7 +723,8 @@ impl Expander<'_> {
             return Err(schema_err(SchemaKind::CircularView));
         }
         self.enter::<E>()?;
-        let parsed = crate::sql::parse::<E>(handle_bytes(self.ca, v.sql), self.arena);
+        let parsed =
+            crate::sql::parser::parse_view::<E>(handle_bytes(self.ca, v.sql), self.arena, self.lim);
         let Ok(Ast::CreateView {
             columns,
             mut select,

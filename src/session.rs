@@ -113,6 +113,31 @@ pub struct Config {
     /// on a thread with the stack for it (the CLI does).
     #[cfg(feature = "v16")]
     pub max_nesting: usize,
+    /// The deepest expression a statement may hold (v0.16), counted
+    /// as the pin counts `SQLITE_LIMIT_EXPR_DEPTH` (whose default,
+    /// 1000, is `sql::parser::PIN_EXPR_DEPTH`); deeper is
+    /// `ParseKind::ExprTooDeep`. Every recursive walk of a statement
+    /// — the parser, the resolver and planner, the evaluator, the
+    /// tree's Clone and Drop — is bounded by it and by
+    /// `max_parser_depth`, so together they bound the stack a
+    /// statement needs: about `STACK_BASE + max_parser_depth *
+    /// STACK_PER_SYMBOL + max_expr_depth * STACK_PER_HEIGHT` bytes
+    /// (measured on x86_64; see `Config::stack_budget`). The
+    /// defaults (1000, the pin's, and 500 symbols) need about
+    /// 1.4 MiB in a release build and 5.3 MiB in a debug one; the
+    /// pin's limits about 4.3 MiB and 13 MiB — set them on a thread
+    /// with that stack (the CLI does), or derive limits from the
+    /// stack you have with `stack_budget`.
+    #[cfg(feature = "v04")]
+    pub max_expr_depth: usize,
+    /// The deepest nesting the parser takes (v0.16), counted in the
+    /// pin's LALR parser-stack symbols (the pin: 2500,
+    /// `sql::parser::PIN_PARSER_DEPTH` — about 2490 nested
+    /// parentheses, 830 nested function calls, 410 nested FROM
+    /// subqueries); deeper is `ParseKind::RecursionLimit` ("Recursion
+    /// limit").
+    #[cfg(feature = "v04")]
+    pub max_parser_depth: usize,
 }
 
 /// The `VACUUM INTO` writer's type (v0.16, `v16`; see
@@ -141,9 +166,45 @@ impl Default for Config {
             vacuum_into: None,
             #[cfg(feature = "v16")]
             max_nesting: 250,
+            #[cfg(feature = "v04")]
+            max_expr_depth: DEFAULT_EXPR_DEPTH,
+            #[cfg(feature = "v04")]
+            max_parser_depth: DEFAULT_PARSER_DEPTH,
         }
     }
 }
+
+/// `Config::default()`'s expression depth limit (v0.16): the pin's.
+#[cfg(feature = "v04")]
+pub const DEFAULT_EXPR_DEPTH: usize = crate::sql::parser::PIN_EXPR_DEPTH;
+/// `Config::default()`'s parser depth limit (v0.16): a fifth of the
+/// pin's 2500, so that the default limits fit a 2 MiB thread in a
+/// release build (about 490 nested parentheses, 160 nested calls, 80
+/// nested FROM subqueries).
+#[cfg(feature = "v04")]
+pub const DEFAULT_PARSER_DEPTH: usize = 500;
+
+/// The stack hipp needs for any statement, before nesting (v0.16;
+/// measured on x86_64 — the step future and the call path to the
+/// parser and executor).
+#[cfg(all(feature = "v04", debug_assertions))]
+pub const STACK_BASE: usize = 320 * 1024;
+#[cfg(all(feature = "v04", not(debug_assertions)))]
+pub const STACK_BASE: usize = 64 * 1024;
+/// The most stack one symbol of `Config::max_parser_depth` costs
+/// (v0.16; measured on x86_64, the worst construct being a nested
+/// FROM subquery: its parse, plan and execution).
+#[cfg(all(feature = "v04", debug_assertions))]
+pub const STACK_PER_SYMBOL: usize = 4096;
+#[cfg(all(feature = "v04", not(debug_assertions)))]
+pub const STACK_PER_SYMBOL: usize = 1536;
+/// The most stack one level of `Config::max_expr_depth` costs
+/// (v0.16; measured on x86_64: the resolver, the evaluator and the
+/// tree's Clone / Drop, each recursing once per level).
+#[cfg(all(feature = "v04", debug_assertions))]
+pub const STACK_PER_HEIGHT: usize = 3456;
+#[cfg(all(feature = "v04", not(debug_assertions)))]
+pub const STACK_PER_HEIGHT: usize = 704;
 
 impl Config {
     /// The §4.1 tiny reference configuration: 16 KiB page pool,
@@ -166,6 +227,10 @@ impl Config {
             vacuum_into: None,
             #[cfg(feature = "v16")]
             max_nesting: 16,
+            #[cfg(feature = "v04")]
+            max_expr_depth: 64,
+            #[cfg(feature = "v04")]
+            max_parser_depth: 64,
         }
     }
 
@@ -197,6 +262,40 @@ impl Config {
     pub fn max_nesting(mut self, levels: usize) -> Config {
         self.max_nesting = levels;
         self
+    }
+    /// Set `max_expr_depth` and `max_parser_depth` (v0.16).
+    #[cfg(feature = "v04")]
+    pub fn depth_limits(mut self, expr: usize, parser: usize) -> Config {
+        self.max_expr_depth = expr;
+        self.max_parser_depth = parser;
+        self
+    }
+    /// Set `max_expr_depth` and `max_parser_depth` for a thread of
+    /// `bytes` of stack (v0.16): the largest limits, at most the
+    /// pin's, whose worst case — `STACK_BASE + max_parser_depth *
+    /// STACK_PER_SYMBOL + max_expr_depth * STACK_PER_HEIGHT`, the
+    /// costs measured for this build profile — fits. Up to half the
+    /// room past the base goes to the expression depth, the rest to
+    /// the parser's. A stack below the base leaves both 0: nothing
+    /// but the statements without expressions parses then.
+    #[cfg(feature = "v04")]
+    pub fn stack_budget(self, bytes: usize) -> Config {
+        let room = bytes.saturating_sub(STACK_BASE);
+        let expr = (room / 2 / STACK_PER_HEIGHT).min(crate::sql::parser::PIN_EXPR_DEPTH);
+        let parser = (room.saturating_sub(expr * STACK_PER_HEIGHT) / STACK_PER_SYMBOL)
+            .min(crate::sql::parser::PIN_PARSER_DEPTH);
+        self.depth_limits(expr, parser)
+    }
+    /// The parser's nesting limits under this configuration
+    /// (v0.16; the pin's constants without the v0.4 grammar, which
+    /// does not nest).
+    pub fn limits(&self) -> crate::sql::parser::Limits {
+        crate::sql::parser::Limits {
+            #[cfg(feature = "v04")]
+            expr_depth: self.max_expr_depth,
+            #[cfg(feature = "v04")]
+            parser_depth: self.max_parser_depth,
+        }
     }
     pub fn page_size(mut self, n: u32) -> Config {
         self.create_page_size = n;
@@ -991,7 +1090,8 @@ impl<S: Storage> Connection<S> {
         {
             self.catalog = Catalog::empty(self.pager.schema_cookie().wrapping_add(1));
         }
-        self.catalog = build_catalog(&mut self.pager, &self.catalog_arena).await?;
+        self.catalog =
+            build_catalog(&mut self.pager, &self.catalog_arena, self.cfg.limits()).await?;
         Ok(())
     }
 
@@ -1043,7 +1143,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v16")]
             Some(p) => (Ast::Begin, p),
             _ => {
-                let ast = crate::sql::parse::<S::Error>(main_text, &arena)?;
+                let ast = crate::sql::parse::<S::Error>(main_text, &arena, self.cfg.limits())?;
                 let plan = self.plan(&arena, &ast)?;
                 (ast, plan)
             }
@@ -1055,7 +1155,8 @@ impl<S: Storage> Connection<S> {
                 let Plan::Temp { sql: t, .. } = &p else {
                     return Err(Error::Unsupported);
                 };
-                let (_, table) = crate::sql::parse_params::<S::Error>(t.as_slice(), &arena)?;
+                let (_, table) =
+                    crate::sql::parse_params::<S::Error>(t.as_slice(), &arena, self.cfg.limits())?;
                 let mut values = AVec::new();
                 for _ in 0..table.count {
                     values.push(OwnedValue::Null);
@@ -1162,7 +1263,7 @@ impl<S: Storage> Connection<S> {
     /// the pin's prepare reports it (`binding_dependent`).
     #[cfg(feature = "params")]
     fn prepare_params(&self, sql: &[u8], arena: &Arena) -> Result<(Ast, Plan, Binds), S::Error> {
-        let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena)?;
+        let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena, self.cfg.limits())?;
         let plan_ckpt = arena.checkpoint();
         let mut binds = Binds {
             values: AVec::new(),
@@ -1349,12 +1450,17 @@ impl<S: Storage> Connection<S> {
                 // pin refuses at once.)
                 let mut kept = AVec::new();
                 for h in checks.iter() {
-                    if !crate::rules::has_big_hex::<S::Error>(handle_bytes(arena, *h), arena)? {
+                    if !crate::rules::has_big_hex::<S::Error>(
+                        handle_bytes(arena, *h),
+                        arena,
+                        self.cfg.limits(),
+                    )? {
                         kept.push(*h);
                     }
                 }
                 crate::rules::validate_def::<S::Error>(
                     arena,
+                    self.cfg.limits(),
                     handle_bytes(arena, *name),
                     columns.as_slice(),
                     pk_columns.as_slice(),
@@ -1363,7 +1469,11 @@ impl<S: Storage> Connection<S> {
                 )?;
                 #[cfg(feature = "v16")]
                 if self.prag.like_redefined
-                    && crate::rules::gen_uses_like::<S::Error>(arena, columns.as_slice())?
+                    && crate::rules::gen_uses_like::<S::Error>(
+                        arena,
+                        self.cfg.limits(),
+                        columns.as_slice(),
+                    )?
                 {
                     return Err(Error::Schema {
                         kind: SchemaKind::NonDeterministic,
@@ -1824,6 +1934,14 @@ impl<S: Storage> Connection<S> {
                         });
                     }
                 };
+                // The pin's "too many columns on t" (v0.16 fix,
+                // ungated: the 2001st column made a schema it
+                // cannot load).
+                if t.columns.len() >= crate::sql::parser::MAX_COLUMN {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::TooManyColumns,
+                    });
+                }
                 let cname = handle_bytes(arena, column.name);
                 if t.columns
                     .iter()
@@ -1854,10 +1972,12 @@ impl<S: Storage> Connection<S> {
                 let new_default = match column.default_expr {
                     Some(h) if !column.generated => {
                         let dt = handle_bytes(arena, h);
-                        if crate::rules::alter_default_ok::<S::Error>(dt, arena)? {
+                        if crate::rules::alter_default_ok::<S::Error>(dt, arena, self.cfg.limits())?
+                        {
                             crate::rules::eval_default::<S::Error>(
                                 dt,
                                 arena,
+                                self.cfg.limits(),
                                 &mut crate::rules::Clock::new(None),
                                 Some(&self.env),
                             )?
@@ -1897,7 +2017,7 @@ impl<S: Storage> Connection<S> {
                     #[cfg(feature = "v16")]
                     strict,
                     ..
-                } = crate::sql::parse::<S::Error>(new_sql.as_slice(), arena)?
+                } = crate::sql::parse::<S::Error>(new_sql.as_slice(), arena, self.cfg.limits())?
                 else {
                     return Err(Error::Unsupported);
                 };
@@ -1908,6 +2028,7 @@ impl<S: Storage> Connection<S> {
                 #[allow(unused_mut)]
                 let mut rules = crate::rules::validate_def::<S::Error>(
                     arena,
+                    self.cfg.limits(),
                     tname,
                     ncols_def.as_slice(),
                     pk_columns.as_slice(),
@@ -1917,7 +2038,11 @@ impl<S: Storage> Connection<S> {
                 // The pin re-checks the whole rewritten definition.
                 #[cfg(feature = "v16")]
                 if self.prag.like_redefined
-                    && crate::rules::gen_uses_like::<S::Error>(arena, ncols_def.as_slice())?
+                    && crate::rules::gen_uses_like::<S::Error>(
+                        arena,
+                        self.cfg.limits(),
+                        ncols_def.as_slice(),
+                    )?
                 {
                     return Err(Error::Schema {
                         kind: SchemaKind::NonDeterministic,
@@ -2297,6 +2422,7 @@ impl<S: Storage> Connection<S> {
         #[allow(unused_mut)]
         let mut rules = crate::rules::plan_rules::<S::Error>(
             arena,
+            self.cfg.limits(),
             handle_bytes(ca, t.name),
             specs.as_slice(),
             t.rowid_alias,
@@ -2326,6 +2452,7 @@ impl<S: Storage> Connection<S> {
             Some(h) => crate::rules::eval_default::<S::Error>(
                 handle_bytes(&self.catalog_arena, h),
                 arena,
+                self.cfg.limits(),
                 clock,
                 Some(&self.env),
             ),
@@ -2350,6 +2477,7 @@ impl<S: Storage> Connection<S> {
         let (r, row) = crate::rules::prepare_default::<S::Error>(
             handle_bytes(&self.catalog_arena, h),
             arena,
+            self.cfg.limits(),
             clock,
         )?;
         let v = crate::rules::eval_prepared_default::<S::Error>(&r, &row, Some(&self.env))?;
@@ -3512,6 +3640,14 @@ impl<S: Storage> Connection<S> {
                 result_names.push(nm.clone());
             }
         }
+        // The pin's "too many columns in result set" once `*` is
+        // expanded (v0.16 fix, ungated; the parser counts the
+        // written items).
+        if items.len() > crate::sql::parser::MAX_COLUMN {
+            return Err(Error::Schema {
+                kind: SchemaKind::TooManyColumns,
+            });
+        }
         // The pin's "HAVING clause on a non-aggregate query":
         // HAVING needs a GROUP BY or an aggregate in the result
         // list (aggregates elsewhere do not count).
@@ -3683,6 +3819,152 @@ impl<S: Storage> Connection<S> {
         })
     }
 
+    /// A FROM source that names no table or view: a table-valued
+    /// pragma function or the empty temp schema, as the derived
+    /// table of its rows (v0.16, `v16`). Out of line: `plan_from` is
+    /// on the stack once per level of nested FROM subqueries.
+    #[cfg(feature = "v16")]
+    #[inline(never)]
+    fn synth_source(
+        &self,
+        s: &crate::sql::FromSource,
+        arena: &Arena,
+    ) -> Result<Option<Box<crate::sql::SelectStmt>>, S::Error> {
+        let n = handle_bytes(arena, s.table);
+        let ca = &self.catalog_arena;
+        let exists =
+            self.catalog.find_readable(ca, n).is_some() || self.catalog.find_view(ca, n).is_some();
+        if exists && s.args.is_some() {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownFunction,
+            });
+        }
+        if exists {
+            return Ok(None);
+        }
+        match self.pragma_source(arena, n, s.args.as_ref())? {
+            Some(sel) => Ok(Some(Box::new(sel))),
+            None if s.args.is_some() => Err(Error::Schema {
+                kind: SchemaKind::UnknownFunction,
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// One derived table of a FROM clause (v0.9; a view's or CTE's
+    /// expansion under `v16`): planned as a subquery against
+    /// `derived_scope` only (no LATERAL), its description and plan
+    /// pushed; returns its width. Out of line: `plan_from` is on
+    /// the stack once per level of nested FROM subqueries.
+    #[cfg(feature = "v09")]
+    #[inline(never)]
+    fn plan_derived_source(
+        &self,
+        s: &crate::sql::FromSource,
+        d: &crate::sql::SelectStmt,
+        arena: &Arena,
+        derived_scope: &[crate::query::ScopeGroup],
+        descs: &mut AVec<crate::query::SourceDesc>,
+        plans: &mut AVec<SourcePlan>,
+    ) -> Result<usize, S::Error> {
+        use crate::query::SourceDesc;
+        // v0.16: an expanded view or CTE, possibly recursive.
+        #[cfg(feature = "v16")]
+        let mut dplan = match s.cte.as_ref().map(|c| c.rec) {
+            Some(crate::sql::RecMark::Body { split, id }) => {
+                self.plan_recursive(d, split, id, s.cte.as_deref(), arena, derived_scope)?
+            }
+            _ => self.plan_subquery(d, arena, derived_scope)?,
+        };
+        #[cfg(not(feature = "v16"))]
+        let dplan = self.plan_subquery(d, arena, derived_scope)?;
+        let w = dplan.width();
+        let mut cols = AVec::new();
+        let mut affs = AVec::new();
+        let mut defaults = AVec::new();
+        // The pin names a derived table's duplicate
+        // columns `id`, `id:1`, ... — so only the first
+        // is `id` to `s.id`, NATURAL and USING (review
+        // regression: every duplicate stayed `id`, and
+        // `SELECT *` over a USING join dropped them all).
+        // A shared materialization (`CteUse::mat`) is read
+        // only by a plan that needs nothing of its reader.
+        #[cfg(feature = "v16")]
+        {
+            dplan.mat = match s.cte.as_ref() {
+                Some(c) if dplan.uncorrelated => c.mat,
+                _ => 0,
+            };
+        }
+        #[cfg(feature = "v16")]
+        if s.cte.as_ref().is_some_and(|c| c.view) {
+            dplan.result_names =
+                self.result_col_names(&dplan, crate::query::ScopeGroup::stack_end(derived_scope))?;
+        }
+        #[cfg(feature = "v16")]
+        let mut names = Self::cte_names(arena, s.cte.as_deref(), &dplan)?;
+        // A column list renames the result for every reader
+        // (CREATE TABLE ... AS names its columns by it).
+        #[cfg(feature = "v16")]
+        {
+            dplan.result_names = names.clone();
+        }
+        #[cfg(not(feature = "v16"))]
+        let mut names = dplan.result_names.clone();
+        crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
+        for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
+            // A compound's column affinity is demoted across
+            // its cores, as on the pin (ungated fix: `(SELECT
+            // text_col ... UNION ALL SELECT 5)` compared as
+            // TEXT).
+            let aff = derived_col_affinity(&dplan, i, *aff);
+            cols.push((nm.clone(), aff));
+            affs.push(crate::record::Affinity::Blob);
+            defaults.push(OwnedValue::Null);
+        }
+        let qual = match s.alias {
+            Some(a) => copy_vec(handle_bytes(arena, a)),
+            // A table-valued function is named by its
+            // name (v0.16).
+            None if s.derived.is_none() => copy_vec(handle_bytes(arena, s.table)),
+            None => AVec::new(),
+        };
+        let mut desc = SourceDesc::new(qual, cols, None, false);
+        desc.kind = s.kind;
+        // v0.16: a derived column compares by its
+        // leftmost core's item collation (BINARY when
+        // the item has none — still a column's).
+        for it in dplan.items.iter() {
+            desc.colls
+                .push(crate::query::expr_coll(it).unwrap_or_default());
+        }
+        for v in dplan
+            .values
+            .as_slice()
+            .first()
+            .iter()
+            .flat_map(|r| r.iter())
+        {
+            desc.colls
+                .push(crate::query::expr_coll(v).unwrap_or_default());
+        }
+        descs.push(desc);
+        plans.push(SourcePlan {
+            root: 0,
+            kind: s.kind,
+            on: None,
+            rowid_alias: None,
+            ncols: w,
+            affs,
+            defaults,
+            derived: Some(Box::new(dplan)),
+            gcols: None,
+            #[cfg(feature = "v16")]
+            rec: 0,
+        });
+        Ok(w)
+    }
+
     /// Plan a FROM clause's sources (v0.4; one helper for
     /// SELECT cores, subqueries and UPDATE ... FROM since
     /// v0.16): each table or derived table gets its resolution
@@ -3721,28 +4003,7 @@ impl<S: Storage> Connection<S> {
             // fix: the arguments were ignored).
             #[cfg(feature = "v16")]
             let synth = if s.derived.is_none() {
-                let n = handle_bytes(arena, s.table);
-                let ca = &self.catalog_arena;
-                let exists = self.catalog.find_readable(ca, n).is_some()
-                    || self.catalog.find_view(ca, n).is_some();
-                if exists && s.args.is_some() {
-                    return Err(Error::Schema {
-                        kind: SchemaKind::UnknownFunction,
-                    });
-                }
-                if exists {
-                    None
-                } else {
-                    match self.pragma_source(arena, n, s.args.as_ref())? {
-                        Some(sel) => Some(Box::new(sel)),
-                        None if s.args.is_some() => {
-                            return Err(Error::Schema {
-                                kind: SchemaKind::UnknownFunction,
-                            });
-                        }
-                        None => None,
-                    }
-                }
+                self.synth_source(s, arena)?
             } else {
                 None
             };
@@ -3754,103 +4015,7 @@ impl<S: Storage> Connection<S> {
             // against `derived_scope` only (no LATERAL).
             #[cfg(feature = "v09")]
             if let Some(d) = derived {
-                // v0.16: an expanded view or CTE, possibly recursive.
-                #[cfg(feature = "v16")]
-                let mut dplan = match s.cte.as_ref().map(|c| c.rec) {
-                    Some(crate::sql::RecMark::Body { split, id }) => {
-                        self.plan_recursive(d, split, id, s.cte.as_deref(), arena, derived_scope)?
-                    }
-                    _ => self.plan_subquery(d, arena, derived_scope)?,
-                };
-                #[cfg(not(feature = "v16"))]
-                let dplan = self.plan_subquery(d, arena, derived_scope)?;
-                let w = dplan.width();
-                let mut cols = AVec::new();
-                let mut affs = AVec::new();
-                let mut defaults = AVec::new();
-                // The pin names a derived table's duplicate
-                // columns `id`, `id:1`, ... — so only the first
-                // is `id` to `s.id`, NATURAL and USING (review
-                // regression: every duplicate stayed `id`, and
-                // `SELECT *` over a USING join dropped them all).
-                // A shared materialization (`CteUse::mat`) is read
-                // only by a plan that needs nothing of its reader.
-                #[cfg(feature = "v16")]
-                {
-                    dplan.mat = match s.cte.as_ref() {
-                        Some(c) if dplan.uncorrelated => c.mat,
-                        _ => 0,
-                    };
-                }
-                #[cfg(feature = "v16")]
-                if s.cte.as_ref().is_some_and(|c| c.view) {
-                    dplan.result_names = self.result_col_names(
-                        &dplan,
-                        crate::query::ScopeGroup::stack_end(derived_scope),
-                    )?;
-                }
-                #[cfg(feature = "v16")]
-                let mut names = Self::cte_names(arena, s.cte.as_deref(), &dplan)?;
-                // A column list renames the result for every reader
-                // (CREATE TABLE ... AS names its columns by it).
-                #[cfg(feature = "v16")]
-                {
-                    dplan.result_names = names.clone();
-                }
-                #[cfg(not(feature = "v16"))]
-                let mut names = dplan.result_names.clone();
-                crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
-                for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
-                    // A compound's column affinity is demoted across
-                    // its cores, as on the pin (ungated fix: `(SELECT
-                    // text_col ... UNION ALL SELECT 5)` compared as
-                    // TEXT).
-                    let aff = derived_col_affinity(&dplan, i, *aff);
-                    cols.push((nm.clone(), aff));
-                    affs.push(crate::record::Affinity::Blob);
-                    defaults.push(OwnedValue::Null);
-                }
-                let qual = match s.alias {
-                    Some(a) => copy_vec(handle_bytes(arena, a)),
-                    // A table-valued function is named by its
-                    // name (v0.16).
-                    None if s.derived.is_none() => copy_vec(handle_bytes(arena, s.table)),
-                    None => AVec::new(),
-                };
-                let mut desc = SourceDesc::new(qual, cols, None, false);
-                desc.kind = s.kind;
-                // v0.16: a derived column compares by its
-                // leftmost core's item collation (BINARY when
-                // the item has none — still a column's).
-                for it in dplan.items.iter() {
-                    desc.colls
-                        .push(crate::query::expr_coll(it).unwrap_or_default());
-                }
-                for v in dplan
-                    .values
-                    .as_slice()
-                    .first()
-                    .iter()
-                    .flat_map(|r| r.iter())
-                {
-                    desc.colls
-                        .push(crate::query::expr_coll(v).unwrap_or_default());
-                }
-                descs.push(desc);
-                plans.push(SourcePlan {
-                    root: 0,
-                    kind: s.kind,
-                    on: None,
-                    rowid_alias: None,
-                    ncols: w,
-                    affs,
-                    defaults,
-                    derived: Some(Box::new(dplan)),
-                    gcols: None,
-                    #[cfg(feature = "v16")]
-                    rec: 0,
-                });
-                total += w;
+                total += self.plan_derived_source(s, d, arena, derived_scope, descs, plans)?;
                 continue;
             }
             let tname = handle_bytes(arena, s.table);

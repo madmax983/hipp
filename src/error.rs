@@ -43,6 +43,14 @@ pub enum SchemaKind {
     /// `SELECT *` with no FROM clause (v0.16 review fix; the pin's
     /// "no tables specified"). Name a table, or list the columns.
     NoTablesSpecified,
+    /// A result set of more than 2000 columns once `*` is expanded
+    /// (v0.16; the pin's "too many columns in result set"), or an
+    /// ALTER TABLE ADD COLUMN past 2000 ("too many columns on t").
+    /// Name fewer columns.
+    TooManyColumns,
+    /// A FROM clause joining more than 64 tables (v0.16; the pin's
+    /// "at most 64 tables in a join"). Split the query.
+    TooManyTables,
     /// `ALTER TABLE ... ADD COLUMN` named a column the table
     /// already has (v0.4).
     DuplicateColumn,
@@ -359,8 +367,40 @@ pub enum ParseKind {
     InvalidLiteral,
     UnsupportedStatement,
     UnsupportedClause,
+    /// The statement nests deeper than the parser's stack limit
+    /// (the pin's "Recursion limit": 2500 grammar symbols, about
+    /// 2490 nested parentheses; `Config::max_parser_depth`), or a
+    /// CREATE TABLE item nests parentheses past it. Flatten the
+    /// nesting, or raise the limit with the thread's stack.
     RecursionLimit,
     TrailingInput,
+    /// An expression tree deeper than the expression depth limit
+    /// (v0.16; the pin's "Expression tree is too large (maximum
+    /// depth 1000)", `SQLITE_LIMIT_EXPR_DEPTH`;
+    /// `Config::max_expr_depth`), counted as the pin counts it —
+    /// including the sum of the heights of the expressions a
+    /// nested subquery sits in. Split the expression, or raise the
+    /// limit with the thread's stack.
+    ExprTooDeep,
+    /// A statement longer than 1,000,000,000 bytes (v0.16; the
+    /// pin's `SQLITE_LIMIT_SQL_LENGTH`, "statement too long").
+    StatementTooLong,
+    /// More columns than the pin's `SQLITE_MAX_COLUMN` (2000) in a
+    /// CREATE TABLE ("too many columns on t"), an index ("too many
+    /// columns in index"), a result list or VALUES row ("too many
+    /// columns in result set") or an UPDATE SET list ("too many
+    /// columns in set list") (v0.16). Split the table or the
+    /// statement.
+    TooManyColumns,
+    /// An ORDER BY or GROUP BY of more than 2000 terms (v0.16; the
+    /// pin's "too many terms in ORDER BY clause").
+    TooManyTerms,
+    /// A function call with more than 1000 arguments (v0.16; the
+    /// pin's "too many arguments on function f").
+    TooManyArguments,
+    /// A compound SELECT of more than 500 SELECTs (v0.16; the pin's
+    /// "too many terms in compound SELECT").
+    TooManyCompoundTerms,
     /// A join operator whose keywords do not form a join type
     /// (v0.16): `OUTER JOIN` alone, `INNER OUTER JOIN`, `LEFT
     /// CROSS JOIN`, more than three keywords — the pin's

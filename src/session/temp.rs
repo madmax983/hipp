@@ -468,7 +468,11 @@ impl<S: Storage> Connection<S> {
             }
             _ => text.extend_from_slice(sql),
         }
-        let parsed = crate::sql::parser::parse_with_tokens::<S::Error>(text.as_slice(), arena);
+        let parsed = crate::sql::parser::parse_with_tokens::<S::Error>(
+            text.as_slice(),
+            arena,
+            self.cfg.limits(),
+        );
         let (ast, toks) = match parsed {
             Ok(a) => a,
             // The main database's parse reports the error (or the
@@ -792,7 +796,7 @@ impl<S: Storage> Connection<S> {
                 name: vh, select, ..
             },
             toks,
-        ) = crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena)?
+        ) = crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena, self.cfg.limits())?
         else {
             return Err(Error::Unsupported);
         };

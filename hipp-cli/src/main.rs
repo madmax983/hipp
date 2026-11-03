@@ -49,19 +49,27 @@ fn open_db(path: &str) -> Result<Db, String> {
 }
 
 /// The CLI's engine configuration: the defaults, the system clock,
-/// and the pin's nesting limit for views and CTEs (999 levels read,
-/// 1000 are "nested too deep"), which `main`'s thread has the
-/// stack for, with a statement arena big enough to expand them
-/// (the default 64 KiB holds about 800 nested views).
+/// the pin's nesting limit for views and CTEs (999 levels read,
+/// 1000 are "nested too deep") and its expression and parser depth
+/// limits (1000, 2500), which `main`'s thread has the stack for,
+/// with a statement arena big enough to expand them (the default
+/// 64 KiB holds about 800 nested views, or 2500 tokens).
 fn cli_config() -> Config {
     let d = Config::default();
     let (init, max) = (d.stmt_init, d.stmt_max.max(4 * 1024 * 1024));
-    d.clock(now_ms).max_nesting(1000).statement_arena(init, max)
+    d.clock(now_ms)
+        .max_nesting(1000)
+        .depth_limits(
+            hipp::sql::parser::PIN_EXPR_DEPTH,
+            hipp::sql::parser::PIN_PARSER_DEPTH,
+        )
+        .statement_arena(init, max)
 }
 
 /// The stack of the thread the CLI runs on: room for
 /// `cli_config`'s 1000 nested view / CTE levels in a debug build
-/// (each costs the planner and executor tens of KiB). Only the
+/// (each costs the planner and executor tens of KiB) and for the
+/// pin's depth limits (about 13 MiB in a debug build). Only the
 /// pages a statement touches are ever committed.
 const STACK_BYTES: usize = 512 * 1024 * 1024;
 
