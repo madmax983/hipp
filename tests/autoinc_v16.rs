@@ -327,6 +327,43 @@ fn full_at_the_largest_rowid() {
     );
 }
 
+/// "database or disk is full" inside a transaction rolls the whole
+/// transaction back on the pin (review fix: hipp failed only the
+/// statement, so a later COMMIT kept the writes before it) —
+/// single and multi-row VALUES, INSERT ... SELECT, OR IGNORE / OR
+/// FAIL, RETURNING, a SAVEPOINT-opened transaction, a TEMP table.
+#[test]
+fn full_ends_the_transaction() {
+    let prep = "CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, b)
+        CREATE TABLE m(x)
+        INSERT INTO a VALUES (9223372036854775806, 0)";
+    for (i, body) in [
+        "BEGIN; INSERT INTO m VALUES (1); INSERT INTO a(b) VALUES (1); INSERT INTO a(b) VALUES (2); COMMIT",
+        "BEGIN; INSERT INTO m VALUES (1); INSERT INTO a(b) VALUES (1), (2); COMMIT",
+        "BEGIN; INSERT INTO m VALUES (1); INSERT INTO a(b) SELECT 5 UNION ALL SELECT 6; COMMIT",
+        "SAVEPOINT s; INSERT INTO m VALUES (1); INSERT INTO a(b) VALUES (1), (2); RELEASE s",
+        "BEGIN; INSERT INTO m VALUES (1); SAVEPOINT q; INSERT INTO m VALUES (2); INSERT INTO a(b) VALUES (1), (2); ROLLBACK TO q; COMMIT",
+        "BEGIN; INSERT INTO m VALUES (1); INSERT OR IGNORE INTO a(b) VALUES (1), (2); COMMIT",
+        "BEGIN; INSERT INTO m VALUES (1); INSERT OR FAIL INTO a(b) VALUES (1), (2); COMMIT",
+        "BEGIN; INSERT INTO m VALUES (1); INSERT INTO a(b) VALUES (1), (2) RETURNING id; COMMIT",
+        "BEGIN; INSERT INTO m VALUES (1); INSERT INTO a VALUES (9223372036854775807, 1); INSERT INTO a(b) VALUES (3); COMMIT",
+        "INSERT INTO a(b) VALUES (1), (2)",
+        "CREATE TEMP TABLE ta(id INTEGER PRIMARY KEY AUTOINCREMENT, b); BEGIN; INSERT INTO m VALUES (1); INSERT INTO ta VALUES (9223372036854775807, 1); INSERT INTO ta(b) VALUES (3); COMMIT; SELECT * FROM ta",
+        "BEGIN; INSERT INTO m VALUES (1); CREATE TEMP TABLE ta(id INTEGER PRIMARY KEY AUTOINCREMENT, b); INSERT INTO ta VALUES (9223372036854775807, 1); INSERT INTO ta(b) VALUES (3); COMMIT; SELECT * FROM ta",
+        "CREATE TEMP TABLE ta(a); BEGIN; INSERT INTO ta VALUES (5); INSERT INTO a(b) VALUES (3), (4); COMMIT; SELECT * FROM ta",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut stmts = lines(prep);
+        stmts.extend(body.split("; ").map(str::to_string));
+        stmts.push("SELECT * FROM m".to_string());
+        stmts.push("SELECT * FROM a".to_string());
+        stmts.push("SELECT * FROM sqlite_sequence".to_string());
+        same(&format!("full-txn{i}"), &stmts);
+    }
+}
+
 #[test]
 fn transactions_and_savepoints() {
     same(

@@ -146,6 +146,49 @@ SELECT * FROM m;
 SELECT name FROM sqlite_temp_schema;
 ";
 
+/// The review fixes: DROP COLUMN past commas in comments, a quoted
+/// `sqlite_temp_schema`, `temp.a` as a column of a table called
+/// `temp`, connection-wide pragmas on TEMP tables, and "database or
+/// disk is full" ending the transaction.
+const REVIEW: &str = "\
+CREATE TABLE d(a, b, /* x,y */ c, -- ,
+ e, /* , */ UNIQUE(a));
+INSERT INTO d VALUES (1, 2, 3, 4);
+ALTER TABLE d DROP COLUMN e;
+ALTER TABLE d DROP COLUMN c;
+SELECT * FROM d;
+SELECT sql FROM sqlite_schema WHERE name = 'd';
+CREATE TABLE temp(a);
+INSERT INTO temp VALUES (5);
+SELECT temp.a FROM temp;
+CREATE TEMP TABLE tt(a);
+INSERT INTO tt VALUES ('ABC');
+SELECT name FROM \"sqlite_temp_schema\";
+SELECT count(*) FROM [sqlite_temp_master];
+PRAGMA case_sensitive_like = ON;
+SELECT count(*) FROM tt WHERE a LIKE 'abc';
+PRAGMA temp.case_sensitive_like = OFF;
+SELECT count(*) FROM tt WHERE a LIKE 'abc';
+CREATE TABLE f(id INTEGER PRIMARY KEY AUTOINCREMENT, b);
+INSERT INTO f VALUES (9223372036854775807, 0);
+BEGIN;
+INSERT INTO d VALUES (8, 9);
+INSERT INTO f(b) VALUES (1);
+COMMIT;
+SELECT * FROM d;
+CREATE TEMP VIEW tv AS SELECT a, b FROM d -- a comment
+;
+SELECT * FROM tv;
+SELECT sql FROM sqlite_temp_schema WHERE name = 'tv';
+CREATE TEMP INDEX ti ON tt(a);
+SELECT name FROM sqlite_temp_schema;
+";
+
+#[test]
+fn review_fixes_byte_identical() {
+    byte_identical("review", REVIEW);
+}
+
 #[test]
 fn alter_table_byte_identical() {
     byte_identical("alter", ALTER);

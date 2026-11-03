@@ -424,21 +424,27 @@ aspirations.
   `sqlite_sequence` (its CREATE text and root page order, the
   max-ever rowid rule, "database or disk is full" at i64::MAX,
   REPLACE / upsert / hand-edited rows), so files interoperate both
-  ways. `CREATE TEMP | TEMPORARY TABLE / VIEW / INDEX`, `temp.`
-  names and `sqlite_temp_schema` use a per-connection in-memory
-  temp database (temp names first, transactions and savepoints
-  applied to both, never written to the file, gone on close);
-  hipp-cli's `.schema` / `.tables` / `.dump` follow. Ungated
+  ways. `CREATE TEMP | TEMPORARY TABLE / VIEW`, indexes on temp
+  tables, `temp.` names and `sqlite_temp_schema` (bare or quoted)
+  use a per-connection in-memory temp database (temp names first,
+  transactions and savepoints applied to both, the connection's
+  pragmas such as `foreign_keys` / `case_sensitive_like` holding
+  there too, never written to the file, gone on close); a TEMP
+  view may read main tables. `CREATE TEMP INDEX` is a syntax
+  error, as on the pin. A failed ALTER leaves the session's
+  catalog as the file is, and "database or disk is full" rolls the
+  transaction back as the pin does. hipp-cli's `.schema` /
+  `.tables` / `.dump` follow. Ungated
   fixes: a pin-made AUTOINCREMENT table is read-only below `v16`
   (an INSERT left the counter behind), DROP TABLE removes its
   `sqlite_sequence` row, `sqlite_*` tables can no longer be
   indexed, altered or dropped, and ADD COLUMN on a table with
   table constraints no longer writes unparsable text (tiny +28 B).
-  Gaps: a statement naming objects of both databases (a TEMP view
-  over a main table, `INSERT INTO temp_t SELECT ... FROM main_t`)
-  is refused; files with triggers cannot be altered; re-created
-  tables can get other root page numbers than on the pin
-  (STATUS.md).
+  Gaps: a statement naming a temp table and a main object
+  (`INSERT INTO temp_t SELECT ... FROM main_t`, a join of both)
+  is refused, as is ALTER TABLE of a main table a TEMP view reads;
+  files with triggers cannot be altered; re-created tables can get
+  other root page numbers than on the pin (STATUS.md).
 
 ## What v0.13 does
 

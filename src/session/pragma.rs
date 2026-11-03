@@ -105,6 +105,20 @@ pub(super) fn lookup<E>(name: &[u8]) -> Result<Option<Prag>, E> {
 }
 
 impl Prag {
+    /// A setting of the connection, not of one database: a
+    /// `temp.` (or `main.`) qualifier is ignored, as on the pin.
+    pub(super) fn connection_wide(self) -> bool {
+        matches!(
+            self,
+            Prag::ForeignKeys
+                | Prag::RecursiveTriggers
+                | Prag::IgnoreCheckConstraints
+                | Prag::BusyTimeout
+                | Prag::CaseSensitiveLike
+                | Prag::CollationList
+        )
+    }
+
     /// Result columns (the pin's column names, which the
     /// table-valued forms expose).
     fn columns(self) -> &'static [&'static str] {
@@ -466,7 +480,7 @@ impl<S: Storage> Connection<S> {
         let prag = lookup::<S::Error>(handle_bytes(arena, name))?;
         // hipp has no temp database: a known pragma against it
         // is refused (an unknown one is still ignored).
-        if temp && prag.is_some() {
+        if temp && prag.is_some_and(|p| !p.connection_wide()) {
             return Err(Error::Unsupported);
         }
         let arg = value.map(|h| copy_vec(handle_bytes(arena, h)));
@@ -1058,12 +1072,17 @@ impl<S: Storage> Connection<S> {
         name: &[u8],
         args: Option<&AVec<Expr>>,
     ) -> Result<Option<SelectStmt>, S::Error> {
-        // The empty temp schema.
+        // The empty temp schema — or, on the temp database itself
+        // (a TEMP view's stored text), its own schema table.
         if eq_ci(name, b"sqlite_temp_schema") || eq_ci(name, b"sqlite_temp_master") {
             if args.is_some() {
                 return Err(Error::Schema {
                     kind: SchemaKind::UnknownTable,
                 });
+            }
+            if self.is_temp {
+                let sql = b"SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema";
+                return self.select_of(arena, sql).map(Some);
             }
             let sql = b"SELECT CAST(NULL AS TEXT) AS type, CAST(NULL AS TEXT) AS name, \
 CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT) AS sql LIMIT 0";

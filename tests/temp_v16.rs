@@ -308,7 +308,6 @@ fn refused_when_both_databases_meet() {
             "INSERT INTO m SELECT * FROM x",
             "SELECT (SELECT count(*) FROM x) FROM m",
             "CREATE TEMP TABLE y AS SELECT * FROM m",
-            "CREATE TEMP VIEW tv AS SELECT * FROM m",
             "CREATE INDEX temp.mi ON m(a)",
             "SELECT * FROM main.m JOIN temp.x",
         ] {
@@ -316,6 +315,54 @@ fn refused_when_both_databases_meet() {
             assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
         }
     });
+}
+
+/// The pin's ALTER TABLE of a main table also rewrites the TEMP
+/// views that read it; hipp refuses such an ALTER (so a view never
+/// silently reads a different table later), and runs it once no
+/// TEMP view reads the table.
+#[test]
+fn main_alter_under_temp_views_refused() {
+    let p = common::temp_db("v16tm-alter-views");
+    common::cli(
+        &p,
+        "CREATE TABLE m(q); CREATE TABLE n(r); INSERT INTO m VALUES (1);",
+    );
+    block_on(async {
+        let mut db = open(&p).await;
+        for sql in [
+            "CREATE TEMP VIEW mv AS SELECT q FROM main.m",
+            "CREATE TEMP VIEW mv2 AS SELECT * FROM mv",
+        ] {
+            let mut q = db.prepare(sql).await.expect(sql);
+            q.step().await.expect(sql);
+        }
+        for sql in [
+            "ALTER TABLE m RENAME TO m2",
+            "ALTER TABLE m RENAME COLUMN q TO z",
+            "ALTER TABLE m ADD COLUMN y",
+        ] {
+            let r = match db.prepare(sql).await {
+                Ok(mut q) => q.step().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            if sql.contains("ADD") {
+                r.expect("ADD COLUMN rewrites no view");
+            } else {
+                assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
+            }
+        }
+        for sql in [
+            "ALTER TABLE n RENAME TO n2",
+            "DROP VIEW mv2",
+            "DROP VIEW mv",
+            "ALTER TABLE m RENAME TO m2",
+        ] {
+            let mut q = db.prepare(sql).await.expect(sql);
+            q.step().await.expect(sql);
+        }
+    });
+    assert_eq!(common::cli(&p, "SELECT * FROM m2;"), "1|\n");
 }
 
 /// Bound parameters reach a statement on the temp database.
@@ -437,6 +484,199 @@ fn pin_corner_cases() {
         let mut stmts = lines(script);
         stmts.push("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema".to_string());
         same(&format!("q{i}"), &stmts);
+    }
+}
+
+/// Review fixes, each compared with the pin: the connection-wide
+/// pragmas (foreign_keys, case_sensitive_like,
+/// ignore_check_constraints, recursive_triggers, busy_timeout) hold
+/// on TEMP tables too and `PRAGMA temp.x` of one sets the
+/// connection's; a quoted `sqlite_temp_schema` is the temp schema
+/// table; `CREATE TEMP [UNIQUE] INDEX` is a syntax error; `temp.a`
+/// naming a column of a table or alias called `temp` is no schema
+/// qualifier.
+#[test]
+fn review_fixes() {
+    for (i, script) in [
+        "PRAGMA foreign_keys = ON;
+         CREATE TEMP TABLE p(id INTEGER PRIMARY KEY);
+         CREATE TEMP TABLE c(x REFERENCES p(id));
+         INSERT INTO c VALUES (5);
+         SELECT * FROM c",
+        "CREATE TEMP TABLE p(id INTEGER PRIMARY KEY);
+         CREATE TEMP TABLE c(x REFERENCES p(id));
+         PRAGMA foreign_keys = ON;
+         INSERT INTO c VALUES (5);
+         PRAGMA foreign_keys = OFF;
+         INSERT INTO c VALUES (6);
+         SELECT * FROM c",
+        "CREATE TEMP TABLE p(id INTEGER PRIMARY KEY);
+         CREATE TEMP TABLE c(x REFERENCES p(id));
+         PRAGMA temp.foreign_keys = ON;
+         PRAGMA foreign_keys;
+         PRAGMA main.foreign_keys;
+         PRAGMA temp.foreign_keys;
+         INSERT INTO c VALUES (5);
+         SELECT * FROM c",
+        "PRAGMA case_sensitive_like = ON;
+         CREATE TEMP TABLE t(a);
+         INSERT INTO t VALUES ('ABC');
+         SELECT count(*) FROM t WHERE a LIKE 'abc';
+         PRAGMA case_sensitive_like = OFF;
+         SELECT count(*) FROM t WHERE a LIKE 'abc';
+         PRAGMA temp.case_sensitive_like = 1;
+         SELECT count(*) FROM t WHERE a LIKE 'abc';
+         SELECT 'a' LIKE 'A'",
+        "CREATE TEMP TABLE k(v CHECK (v > 0));
+         PRAGMA ignore_check_constraints = ON;
+         INSERT INTO k VALUES (-1);
+         PRAGMA ignore_check_constraints = OFF;
+         INSERT INTO k VALUES (-2);
+         PRAGMA temp.ignore_check_constraints = 1;
+         PRAGMA ignore_check_constraints;
+         INSERT INTO k VALUES (-3);
+         SELECT * FROM k",
+        "PRAGMA temp.recursive_triggers = 1;
+         PRAGMA recursive_triggers;
+         PRAGMA temp.busy_timeout = 5;
+         PRAGMA busy_timeout;
+         PRAGMA temp.busy_timeout",
+        "CREATE TEMP TABLE t(a);
+         SELECT count(*) FROM \"sqlite_temp_schema\";
+         SELECT count(*) FROM [sqlite_temp_master];
+         SELECT count(*) FROM `sqlite_temp_schema`;
+         SELECT count(*) FROM \"SQLITE_TEMP_SCHEMA\";
+         SELECT count(*) FROM temp.\"sqlite_temp_master\";
+         SELECT name FROM \"sqlite_temp_schema\" AS s WHERE s.type = 'table';
+         SELECT * FROM t WHERE a IN (SELECT 3 FROM \"sqlite_temp_master\");
+         SELECT count(*) FROM main.\"sqlite_temp_schema\"",
+        "CREATE TEMP TABLE t(a);
+         CREATE TEMP INDEX i ON t(a);
+         CREATE TEMP UNIQUE INDEX j ON t(a);
+         CREATE TEMPORARY INDEX k ON t(a);
+         SELECT name FROM sqlite_temp_schema;
+         DROP INDEX i",
+        "CREATE TABLE t(a);
+         INSERT INTO t VALUES (7);
+         SELECT temp.a FROM t AS temp;
+         SELECT temp.a FROM t temp WHERE temp.a > 0;
+         CREATE TABLE temp(a);
+         INSERT INTO temp VALUES (1);
+         SELECT temp.a FROM temp;
+         SELECT temp.a FROM temp WHERE temp.a = 1 ORDER BY temp.a",
+        "CREATE TEMP TABLE tt(a);
+         INSERT INTO tt VALUES (3);
+         SELECT temp.a FROM temp.tt;
+         SELECT temp.a FROM tt AS temp;
+         SELECT temp.a FROM temp.tt AS temp;
+         UPDATE tt SET a = 4 WHERE a = 3;
+         SELECT temp.a FROM temp.tt temp",
+        "CREATE TABLE t(a);
+         INSERT INTO t VALUES (7);
+         SELECT temp.* FROM t AS temp;
+         CREATE TABLE x(a);
+         INSERT INTO x VALUES (5);
+         CREATE TEMP TABLE x(b);
+         INSERT INTO x VALUES (1);
+         SELECT temp.* FROM x AS temp;
+         SELECT 1 IN temp.x;
+         SELECT 5 IN main.x;
+         SELECT 5 IN x;
+         SELECT 1 IN x;
+         SELECT x FROM (SELECT 1 AS x) WHERE 1 IN temp.x",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut stmts = lines(script);
+        stmts.push("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema".to_string());
+        same(&format!("r{i}"), &stmts);
+    }
+}
+
+/// A TEMP view may read main tables (review fix: refused). hipp
+/// runs a statement reading such views on main, the views written
+/// in as common table expressions; one that also reads a temp table
+/// stays refused.
+#[test]
+fn temp_views_over_main_tables() {
+    for (i, script) in [
+        "CREATE TEMP TABLE t(a);
+         INSERT INTO t VALUES (1);
+         CREATE VIEW temp.v AS SELECT * FROM temp.t WHERE t.a > 0;
+         CREATE TEMP VIEW v4 AS SELECT name FROM \"sqlite_temp_master\" WHERE type = 'table';
+         CREATE TEMP VIEW v5 AS SELECT name FROM sqlite_temp_schema WHERE type = 'view';
+         SELECT * FROM v;
+         SELECT * FROM temp.v;
+         SELECT * FROM v4;
+         SELECT * FROM v5;
+         ALTER TABLE t RENAME TO u;
+         SELECT sql FROM sqlite_temp_schema",
+        "CREATE TABLE m(a, b);
+         INSERT INTO m VALUES (1, 2), (3, 4);
+         CREATE TEMP VIEW tv AS SELECT * FROM m;
+         SELECT * FROM tv;
+         SELECT * FROM temp.tv;
+         SELECT a FROM tv WHERE a > 1;
+         SELECT tv.a FROM tv;
+         SELECT sql FROM sqlite_temp_schema",
+        "CREATE TABLE m(a, b);
+         INSERT INTO m VALUES (1, 2), (3, 4);
+         CREATE TEMP VIEW tv AS SELECT * FROM m;
+         CREATE TEMP VIEW tv2 AS SELECT a * 10 AS x FROM tv;
+         CREATE TEMP VIEW tv3(p, q) AS SELECT b, a FROM main.m;
+         SELECT * FROM tv2;
+         SELECT * FROM tv3 ORDER BY p DESC;
+         SELECT (SELECT count(*) FROM tv), (SELECT max(x) FROM tv2);
+         SELECT * FROM m JOIN tv ON m.a = tv.a;
+         SELECT * FROM tv2, tv3 WHERE x = q * 10;
+         SELECT sql FROM sqlite_temp_schema",
+        "CREATE TABLE m(a, b);
+         INSERT INTO m VALUES (1, 2), (3, 4);
+         CREATE TEMP VIEW tv AS SELECT * FROM m;
+         CREATE TEMP VIEW tv2 AS SELECT a * 10 AS x FROM tv;
+         INSERT INTO m SELECT a + 10, b FROM tv;
+         SELECT count(*) FROM m;
+         UPDATE m SET b = b + 1 WHERE a IN (SELECT a FROM tv WHERE a < 3);
+         DELETE FROM m WHERE a IN (SELECT a FROM tv2 WHERE x > 100);
+         SELECT * FROM m;
+         WITH c AS (SELECT 1 AS k) SELECT * FROM c, tv WHERE k = 1;
+         WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2) SELECT * FROM r, tv ORDER BY 1, 2",
+        "CREATE TABLE m(a);
+         INSERT INTO m VALUES (1);
+         CREATE TEMP VIEW tv AS SELECT * FROM m;
+         DROP TABLE m;
+         SELECT * FROM tv;
+         CREATE TABLE m(a, b);
+         INSERT INTO m VALUES (5, 6);
+         SELECT * FROM tv;
+         DROP VIEW tv;
+         SELECT * FROM tv;
+         SELECT name FROM sqlite_temp_schema",
+        "CREATE TABLE m(a);
+         CREATE TEMP VIEW tv AS SELECT * FROM nosuch;
+         SELECT * FROM tv;
+         CREATE TEMP VIEW tv4 AS SELECT * FROM m WHERE a > 0 /* trailing */;
+         INSERT INTO m VALUES (1), (2);
+         SELECT * FROM tv4;
+         INSERT INTO tv4 VALUES (3);
+         DELETE FROM tv4;
+         SELECT count(*) FROM m",
+        "CREATE TABLE tv(z);
+         INSERT INTO tv VALUES ('main');
+         CREATE TABLE m(a);
+         INSERT INTO m VALUES (1);
+         CREATE TEMP VIEW tv AS SELECT a AS z FROM m;
+         SELECT * FROM tv;
+         SELECT * FROM main.tv;
+         SELECT * FROM temp.tv",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut stmts = lines(script);
+        stmts.push("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema".to_string());
+        same(&format!("tvm{i}"), &stmts);
     }
 }
 

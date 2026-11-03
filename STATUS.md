@@ -3425,6 +3425,53 @@ edited name is a bare `"z"`, which the second pass reads as a
 string (DQS). hipp reproduces this rule (`plan_view_text`) without
 having the DQS fallback in general.
 
+**Review fixes** (each reproduced on the pin, each with a
+regression test):
+
+- *DROP COLUMN past a comma in a comment* (`t(a, b, /* x,y */ c)`,
+  `c, -- ,\n d`): the cut scanned bytes back to a `,`, so a comma
+  inside a comment (or quoted name) cut the text there; the edited
+  text no longer parsed, the error came after the catalog rebuild
+  had begun, and the session's catalog kept entries whose arena was
+  gone — `no such table: t` for the rest of the session, and a
+  second `CREATE TABLE t` wrote a duplicate schema row the pin
+  rejects as malformed. The comma is now the top-level `,` token
+  before the column (and before the constraints that follow), as
+  on the pin; a failed ALTER rebuilds the catalog from the restored
+  file, and (with `v16`) a failed catalog build leaves an empty
+  catalog the next prepare rebuilds, never a stale one.
+- *Connection-wide pragmas on TEMP tables*: `foreign_keys`,
+  `case_sensitive_like`, `ignore_check_constraints`,
+  `recursive_triggers`, `busy_timeout` are copied to the temp
+  database before each statement there (a CHECK was enforced under
+  `ignore_check_constraints`, LIKE ignored `case_sensitive_like`,
+  and foreign-key writes ran unchecked where main refuses them);
+  `PRAGMA temp.foreign_keys = ON` (any of these, and
+  `collation_list`) sets the connection's, as on the pin.
+- *"database or disk is full"* (AUTOINCREMENT past i64::MAX, no
+  rowid left) now rolls back the whole transaction, as the pin's
+  SQLITE_FULL does (the next COMMIT is "no transaction is active");
+  hipp failed only the statement, so COMMIT kept earlier writes.
+- *Quoted `"sqlite_temp_schema"` / `[sqlite_temp_master]` / ...*
+  returned the temp database's own (empty) temp schema; any quoting
+  is renamed now — and only where it names the table (an alias
+  `AS sqlite_temp_master` is left alone).
+- *`CREATE TEMP [UNIQUE] INDEX`* ran; it is a syntax error on the
+  pin and now in hipp.
+- *`temp.a` as a column of a table or alias called `temp`* was
+  refused (a regression of this unit): a `temp` that qualifies a
+  column in the AST is no schema qualifier now; `x IN temp.t` is
+  routed by the name's text (it was refused).
+- *A TEMP view over main tables* (declared gap, closed in part):
+  `CREATE TEMP VIEW v AS SELECT * FROM main_t` is stored, and a
+  statement reading such views (directly or through other TEMP
+  views) and no temp table runs on main with the views written in
+  as common table expressions (`inline_temp_views`; a statement
+  CTE of a clashing name is refused). A TEMP view's text is now
+  stored as written (`temp.t`, `"sqlite_temp_master"` kept, as on
+  the pin; hipp used to cut them), and the temp database reads its
+  own `sqlite_temp_schema` as its schema table.
+
 **Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
 end with "==> all gates passed". New suites: `tests/alter_v16.rs`
 (8 tests: RENAME TO / RENAME COLUMN / DROP COLUMN matrices, views
@@ -3443,6 +3490,12 @@ cases by default, `HIPP_TEMP_CORPUS=200` ran clean);
 `hipp-cli/tests/cli_v16_alter.rs` (6 tests: byte-identical ALTER /
 AUTOINCREMENT / TEMP batches one-shot and over stdin, `.schema`
 with temp objects, `.tables`, `.dump` replaying the counter).
+Review fixes added `alter_v16::{drop_column_skips_commas_in_comments,
+failed_alter_keeps_the_catalog}`, `autoinc_v16::full_ends_the_transaction`
+(13 transaction shapes), `temp_v16::{review_fixes,
+temp_views_over_main_tables, main_alter_under_temp_views_refused}`
+and `cli_v16_alter::review_fixes_byte_identical`;
+`HIPP_TEMP_CORPUS=200` still runs clean.
 `tests/table_defs_v16.rs` and `tests/query_shape_v16.rs` now assert
 the AUTOINCREMENT and `temp.` behaviour per feature;
 `tests/maintenance_v16.rs` (`ANALYZE temp`) and
@@ -3459,17 +3512,28 @@ editor and view tracing, DROP COLUMN's row rewrite, AUTOINCREMENT
 bookkeeping, and the TEMP database (a second monomorphised
 `Connection<MemStorage>` — most of the growth — plus routing).
 
+Review fixes: tiny **76,224 B** (Δ **0**: every change is behind
+`v16`, the catalog guard included). Full **475,016 B** (Δ
+**+4,000 B** vs 471,016, ratchet raised to it): TEMP-view
+inlining, the connection-wide pragma copy, the token-aware DROP
+COLUMN cut and the catalog guard.
+
 **Honest gaps:**
 
-- A statement that names objects of both databases (`SELECT ...
-  FROM main_t, temp_t`, `CREATE TEMP TABLE x AS SELECT * FROM
-  main_t`, a TEMP view over a main table, `INSERT INTO temp_t
-  SELECT ... FROM main_t`) is refused (`Unsupported`): hipp's two
-  databases never meet inside one statement. Three-part names
-  (`temp.x.a`) do not parse; `pragma_table_info('x', 'temp')` is
-  refused; `VACUUM temp INTO` is refused (plain `VACUUM temp` does
-  nothing, as on the pin for an in-memory temp database). The
-  earlier "`ANALYZE temp` is refused" gap is closed.
+- A statement that names a temp table (or a TEMP view reading
+  one) and a main object (`SELECT ... FROM main_t, temp_t`,
+  `CREATE TEMP TABLE x AS SELECT * FROM main_t`, `INSERT INTO
+  temp_t SELECT ... FROM main_t`, a TEMP view over both) is refused
+  (`Unsupported`): hipp's two databases never meet inside one
+  statement. TEMP views over main tables are read (review fix,
+  below), but `PRAGMA table_info` of one fails (the temp database
+  plans it without main), and an ALTER TABLE of a main table such
+  a view reads is refused where the pin rewrites the view.
+  Three-part names (`temp.x.a`) do not parse;
+  `pragma_table_info('x', 'temp')` is refused; `VACUUM temp INTO`
+  is refused (plain `VACUUM temp` does nothing, as on the pin for
+  an in-memory temp database). The earlier "`ANALYZE temp` is
+  refused" gap is closed.
 - ALTER TABLE refuses a file holding triggers (hipp has none and
   cannot parse them); the TEMP view double-edit is modelled for
   RENAME COLUMN as probed, and the DQS fallback only there.

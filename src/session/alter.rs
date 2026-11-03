@@ -315,6 +315,9 @@ struct TableText {
     cols: AVec<(usize, AVec<u8>, bool)>,
     /// Token index of each item's first token, and of the `)`.
     items: AVec<usize>,
+    /// Byte offset of the top-level `,` token before each item
+    /// (the first item's is the `(`).
+    commas: AVec<usize>,
     col_items: AVec<usize>,
     close: usize,
     /// PRIMARY KEY / UNIQUE lists (table constraints): offsets and
@@ -456,6 +459,8 @@ fn walk_table<E>(sql: &[u8], arena: &Arena) -> Result<TableText, E> {
     let mut item_offs = AVec::new();
     for &i in w.items.iter() {
         item_offs.push(t.get(i).map_or(0, |x| x.offset));
+        w.commas
+            .push(t.get(i.wrapping_sub(1)).map_or(0, |x| x.offset));
     }
     w.items = item_offs;
     w.close = t.get(w.close).map_or(sql.len(), |x| x.offset);
@@ -719,6 +724,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             Err(e) => {
                 abort_write!(self, &e);
+                // The catalog may have been rebuilt (or half-built)
+                // from the edited schema: read it back from the
+                // restored file.
+                let _ = self.conn.rebuild_catalog().await;
                 Err(e)
             }
         }
@@ -767,6 +776,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.conn.cfg.stmt_init,
             self.conn.cfg.stmt_max,
         );
+        // TEMP views reading this main table (`temp_views_read`).
+        if self.conn.temp_views_read(tn, &arena) {
+            return Err(Error::Unsupported);
+        }
         // The dropped column's record layout, read before the schema
         // changes: (stored, default) per column, and its position.
         let mut layout: AVec<(bool, OwnedValue)> = AVec::new();
@@ -1052,17 +1065,17 @@ impl<'c, S: Storage> Statement<'c, S> {
                     .copied()
                     .unwrap_or(usize::MAX);
                 let last = *col + 1 == w.cols.len();
-                let (at, end) = match (w.items.as_slice().get(k), w.items.as_slice().get(k + 1)) {
+                // The comma is a token: one inside a comment or a
+                // quoted name is not it, as on the pin.
+                let items = w.items.as_slice();
+                let commas = w.commas.as_slice();
+                let (at, end) = match (items.get(k), items.get(k + 1)) {
                     (Some(&a), Some(&b)) if !last => (a, b),
-                    (Some(&a), next) => {
-                        let back = |mut c: usize| {
-                            while c > 0 && sql[c - 1] != b',' {
-                                c -= 1;
-                            }
-                            c.saturating_sub(1)
-                        };
-                        (back(a), next.map_or(w.close, |&b| back(b)))
-                    }
+                    (Some(_), next) => match (commas.get(k), next.map(|_| commas.get(k + 1))) {
+                        (Some(&a), None) => (a, w.close),
+                        (Some(&a), Some(Some(&b))) => (a, b),
+                        _ => return Err(err(SchemaKind::UnknownColumn)),
+                    },
                     _ => return Err(err(SchemaKind::UnknownColumn)),
                 };
                 let mut out = AVec::new();

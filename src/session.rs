@@ -982,6 +982,15 @@ impl<S: Storage> Connection<S> {
 
     async fn rebuild_catalog(&mut self) -> Result<(), S::Error> {
         self.catalog_arena.reset();
+        // With `v16` a statement may rebuild mid-way and then roll
+        // the file back to the cookie the old catalog was built
+        // from: a failed build must not leave that catalog (its
+        // arena is gone) looking current, so it is replaced by an
+        // empty one the next prepare rebuilds.
+        #[cfg(feature = "v16")]
+        {
+            self.catalog = Catalog::empty(self.pager.schema_cookie().wrapping_add(1));
+        }
         self.catalog = build_catalog(&mut self.pager, &self.catalog_arena).await?;
         Ok(())
     }
@@ -1010,10 +1019,23 @@ impl<S: Storage> Connection<S> {
         let sql_text = arena.alloc_copy_handle(sql.as_bytes())?;
         // v0.16: a statement on the TEMP database runs there.
         #[cfg(feature = "v16")]
+        // (A statement reading TEMP views over main tables runs on
+        // main as the text `MainAs` gives.)
+        #[cfg(feature = "v16")]
+        let mut main_as = None;
+        #[cfg(feature = "v16")]
         let routed = match self.route(sql.as_bytes(), &arena)? {
             temp::Route::Main => None,
+            temp::Route::MainAs(text) => {
+                main_as = Some(text);
+                None
+            }
             temp::Route::Temp(text) => Some(self.prepare_temp(text, &arena).await?),
         };
+        #[cfg(feature = "v16")]
+        let main_text = main_as.as_ref().map_or(sql.as_bytes(), |t| t.as_slice());
+        #[cfg(not(feature = "v16"))]
+        let main_text = sql.as_bytes();
         #[cfg(not(feature = "v16"))]
         let routed: Option<()> = None;
         #[cfg(not(feature = "params"))]
@@ -1021,7 +1043,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v16")]
             Some(p) => (Ast::Begin, p),
             _ => {
-                let ast = crate::sql::parse::<S::Error>(sql.as_bytes(), &arena)?;
+                let ast = crate::sql::parse::<S::Error>(main_text, &arena)?;
                 let plan = self.plan(&arena, &ast)?;
                 (ast, plan)
             }
@@ -1048,7 +1070,7 @@ impl<S: Storage> Connection<S> {
                 };
                 (Ast::Begin, p, binds)
             }
-            _ => self.prepare_params(sql.as_bytes(), &arena)?,
+            _ => self.prepare_params(main_text, &arena)?,
         };
         let row_ckpt = arena.checkpoint();
         Ok(Statement {

@@ -94,6 +94,11 @@ fn ends_transaction<E>(e: &Error<E>) -> bool {
             | Error::CacheExhausted
             | Error::OperationInFlight
             | Error::CorruptJournal
+            // SQLITE_FULL (AUTOINCREMENT past i64::MAX, no rowid
+            // left): the pin rolls the whole transaction back.
+            | Error::Schema {
+                kind: SchemaKind::DatabaseFull
+            }
     )
 }
 

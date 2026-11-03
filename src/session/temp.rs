@@ -15,10 +15,24 @@
 //! - CREATE INDEX goes where its table is; a CREATE VIEW over temp
 //!   objects only is a temp view, as on the pin;
 //! - a statement whose names all resolve to the temp database runs
-//!   there, with `TEMP` and every `temp.` qualifier removed from its
-//!   text (the temp database is the private connection's main);
-//!   one that names both databases is refused (`Unsupported`): the
-//!   two never meet inside one statement in hipp.
+//!   there, with `TEMP` and the `temp.` qualifiers of its names
+//!   removed from its text (the temp database is the private
+//!   connection's main) — a TEMP view's text is stored as written,
+//!   as on the pin; a `temp.a` naming a column of a table or alias
+//!   called `temp` is left alone;
+//! - a TEMP view may read main tables: a statement reading such
+//!   views (and no temp table) runs on main with the views written
+//!   in as common table expressions (`inline_temp_views`); an ALTER
+//!   TABLE of a main table such a view reads is refused (the pin
+//!   rewrites the view);
+//! - a statement that names a temp table and a main object is
+//!   refused (`Unsupported`): the two databases never meet inside
+//!   one statement in hipp.
+//!
+//! The connection-wide pragmas (`foreign_keys`, `case_sensitive_like`,
+//! `ignore_check_constraints`, ...) are the main connection's, copied
+//! to the temp database before each statement there (`sync_temp`);
+//! `PRAGMA temp.foreign_keys` sets the connection's, as on the pin.
 //!
 //! BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / ROLLBACK TO are
 //! applied to both databases (a temp database created inside a
@@ -37,6 +51,10 @@ pub(super) enum Route {
     Main,
     /// On the temp database, as this text.
     Temp(AVec<u8>),
+    /// On the main database, as this text: a statement reading TEMP
+    /// views over main tables, with those views written in as
+    /// common table expressions (`Connection::inline_temp_views`).
+    MainAs(AVec<u8>),
 }
 
 /// The temp database's errors under the connection's storage type
@@ -56,6 +74,9 @@ enum Kind {
     Object,
     /// An index named by DROP INDEX.
     Index,
+    /// The table qualifier of a column (`q.col`, `q.*`): no
+    /// object; a `temp` here is a table or alias called so.
+    Qual,
 }
 
 /// Every table / view name a SELECT reads (handles), and its CTE
@@ -85,8 +106,10 @@ fn select_names(s: &SelectStmt, out: &mut AVec<(ABytes, Kind)>, ctes: &mut AVec<
 fn core_names(s: &SelectStmt, out: &mut AVec<(ABytes, Kind)>, ctes: &mut AVec<ABytes>) {
     from_names(s.from.as_slice(), out, ctes);
     for it in s.items.iter() {
-        if let SelectItem::Expr(e, _, _) = it {
-            expr_names(e, out, ctes);
+        match it {
+            SelectItem::Expr(e, _, _) => expr_names(e, out, ctes),
+            SelectItem::TableStar(h) => out.push((*h, Kind::Qual)),
+            SelectItem::Star => {}
         }
     }
     for e in s
@@ -129,6 +152,7 @@ fn from_names(
 fn expr_names(e: &Expr, out: &mut AVec<(ABytes, Kind)>, ctes: &mut AVec<ABytes>) {
     use crate::sql::Expr as X;
     match e {
+        X::Column { table: Some(h), .. } => out.push((*h, Kind::Qual)),
         X::InSubquery(a, s, _) => {
             expr_names(a, out, ctes);
             select_names(s, out, ctes);
@@ -193,8 +217,10 @@ fn expr_names(e: &Expr, out: &mut AVec<(ABytes, Kind)>, ctes: &mut AVec<ABytes>)
 
 fn returning_names(items: &[SelectItem], out: &mut AVec<(ABytes, Kind)>, ctes: &mut AVec<ABytes>) {
     for it in items {
-        if let SelectItem::Expr(e, _, _) = it {
-            expr_names(e, out, ctes);
+        match it {
+            SelectItem::Expr(e, _, _) => expr_names(e, out, ctes),
+            SelectItem::TableStar(h) => out.push((*h, Kind::Qual)),
+            SelectItem::Star => {}
         }
     }
 }
@@ -336,6 +362,65 @@ fn qual_cut(toks: &[Token], i: usize) -> Option<(usize, usize)> {
     Some((toks.get(i.checked_sub(2)?)?.offset, toks.get(i)?.offset))
 }
 
+/// `src` with `cuts` applied: a `(a, b)` cut removes bytes `a..b`
+/// (a `temp.` qualifier); an empty `(a, a)` one renames the
+/// `sqlite_temp_schema` / `sqlite_temp_master` token at `a`, bare
+/// or quoted, to `sqlite_schema`.
+fn apply_cuts(src: &[u8], cuts: &mut AVec<(usize, usize)>) -> AVec<u8> {
+    cuts.as_mut_slice().sort_by_key(|c| c.0);
+    let mut out = AVec::new();
+    let mut pos = 0usize;
+    for &(a, b) in cuts.iter() {
+        if a < pos || b > src.len() {
+            continue;
+        }
+        out.extend_from_slice(src.get(pos..a).unwrap_or_default());
+        if a == b {
+            out.extend_from_slice(b"sqlite_schema");
+            pos = token_end(src, a);
+        } else {
+            pos = b;
+        }
+    }
+    out.extend_from_slice(src.get(pos.min(src.len())..).unwrap_or_default());
+    out
+}
+
+/// The end of the name token starting at byte `a` of `src`: a
+/// quoted name (`"x"`, `` `x` ``, `[x]`, `'x'`) through its closing
+/// quote, a bare one through its last name byte.
+fn token_end(src: &[u8], a: usize) -> usize {
+    let close = match src.get(a) {
+        Some(b'"') => b'"',
+        Some(b'`') => b'`',
+        Some(b'\'') => b'\'',
+        Some(b'[') => b']',
+        _ => {
+            let mut e = a;
+            while src
+                .get(e)
+                .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80)
+            {
+                e += 1;
+            }
+            return e;
+        }
+    };
+    let mut e = a + 1;
+    while let Some(&b) = src.get(e) {
+        e += 1;
+        if b == close {
+            // A doubled quote is one quote character.
+            if close != b']' && src.get(e) == Some(&close) {
+                e += 1;
+                continue;
+            }
+            return e;
+        }
+    }
+    e
+}
+
 fn is_temp_schema_name(n: &[u8]) -> bool {
     eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master")
 }
@@ -352,6 +437,14 @@ impl<S: Storage> Connection<S> {
         let t = toks.as_slice();
         let word = |i: usize, w: &[u8]| matches!(t.get(i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
         let temp_kw = word(0, b"CREATE") && (word(1, b"TEMP") || word(1, b"TEMPORARY"));
+        // The pin's grammar has no TEMP INDEX: a syntax error at
+        // INDEX / UNIQUE (hipp's parse would take it without TEMP).
+        if temp_kw && (word(2, b"INDEX") || word(2, b"UNIQUE")) {
+            return Err(Error::Parse {
+                offset: t.get(2).map_or(0, |x| x.offset),
+                kind: crate::error::ParseKind::UnexpectedToken,
+            });
+        }
         let mentions_temp = t.iter().any(|x| match x.tok {
             Tok::Ident(h, _) => {
                 let n = handle_bytes(arena, h);
@@ -399,7 +492,22 @@ impl<S: Storage> Connection<S> {
         }
         // PRAGMA temp.x runs there; an unqualified table pragma
         // follows its table.
-        if let Ast::Pragma { schema, value, .. } = &ast {
+        if let Ast::Pragma {
+            schema,
+            name,
+            value,
+            ..
+        } = &ast
+        {
+            // A connection-wide setting is the main connection's
+            // (the temp database runs with a copy, `sync_temp`).
+            if super::pragma::lookup::<S::Error>(handle_bytes(arena, *name))
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.connection_wide())
+            {
+                return Ok(Route::Main);
+            }
             let mut out = AVec::new();
             match schema {
                 Some(h) if eq_ci(handle_bytes(arena, *h), b"temp") => {
@@ -459,13 +567,40 @@ impl<S: Storage> Connection<S> {
         let mut temp = 0usize;
         let mut main = 0usize;
         let mut cuts: AVec<(usize, usize)> = AVec::new();
-        let mut quals = 0usize;
+        // Tokens of the routed names (their `temp.` is cut), and the
+        // temp schema table's names, however quoted (renamed).
+        let mut routed: AVec<usize> = AVec::new();
+        let mut renames: AVec<usize> = AVec::new();
+        // The names that are TEMP views.
+        let mut views: AVec<AVec<u8>> = AVec::new();
+        // The `temp` tokens that qualify a column, not a name.
+        let mut col_quals: AVec<usize> = AVec::new();
         for (h, kind) in names.iter() {
             let n = handle_bytes(arena, *h);
-            let i = tok_index(t, *h);
+            // A name the parser copied (`x IN [schema.]t`) is found
+            // by its text among the qualified names not yet placed.
+            let i = tok_index(t, *h).or_else(|| {
+                (0..t.len()).find(|&k| {
+                    matches!(t[k].tok, Tok::Ident(y, _) if eq_ci(handle_bytes(arena, y), n))
+                        && qualifier(t, k, arena).is_some()
+                        && !routed.as_slice().contains(&k)
+                })
+            });
+            if *kind == Kind::Qual {
+                if let Some(i) = i {
+                    col_quals.push(i);
+                }
+                continue;
+            }
             let q = i.and_then(|i| qualifier(t, i, arena));
             if q.is_none() && ctes.iter().any(|c| eq_ci(handle_bytes(arena, *c), n)) {
                 continue;
+            }
+            if let Some(i) = i {
+                routed.push(i);
+                if q != Some(false) && is_temp_schema_name(n) {
+                    renames.push(i);
+                }
             }
             // The temp schema table is never main's.
             if q == Some(false) && is_temp_schema_name(n) {
@@ -480,7 +615,9 @@ impl<S: Storage> Connection<S> {
             };
             if let (Some(true), Some(c)) = (q, i.and_then(|i| qual_cut(t, i))) {
                 cuts.push(c);
-                quals += 1;
+            }
+            if in_temp && *kind == Kind::Object && self.temp_view(n).is_some() {
+                views.push(copy_vec(n));
             }
             if in_temp {
                 temp += 1;
@@ -493,16 +630,20 @@ impl<S: Storage> Connection<S> {
         }
         // The created object: TEMP, `temp.`, or where it reads.
         let mut create_temp = false;
+        let mut created_cut = None;
         if let Some((h, is_index)) = created {
             let q = tok_index(t, h).and_then(|i| qualifier(t, i, arena));
             // `CREATE INDEX main.i ON t` looks `t` up in main only.
             if is_index && q == Some(false) {
                 return Ok(Route::Main);
             }
+            if let Some(i) = tok_index(t, h) {
+                routed.push(i);
+            }
             if q == Some(true) {
                 if let Some(c) = tok_index(t, h).and_then(|i| qual_cut(t, i)) {
                     cuts.push(c);
-                    quals += 1;
+                    created_cut = Some(c);
                 }
                 create_temp = true;
             } else if temp_kw {
@@ -527,52 +668,291 @@ impl<S: Storage> Connection<S> {
                 return Err(Error::Unsupported);
             }
         }
-        // Every `temp.` the statement holds must be one of these.
-        let written = (0..t.len())
-            .filter(|&i| qualifier(t, i, arena) == Some(true))
-            .count();
+        // A `temp.` the routing did not place (`temp.x.y`, a
+        // three-part name; `temp.f(...)`; `x IN temp.t`), which hipp
+        // does not resolve. A `temp.a` whose `temp` qualifies a
+        // column (a table or alias called `temp`) is no schema and
+        // stays as written.
+        let unplaced = (0..t.len()).any(|i| {
+            qualifier(t, i, arena) == Some(true)
+                && !routed.as_slice().contains(&i)
+                && !(col_quals.as_slice().contains(&(i.wrapping_sub(2)))
+                    && !matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot | Tok::LParen)))
+        });
+        // TEMP views over main tables (and no temp table): the
+        // statement runs on main with the views written in.
+        if created.is_none() && !unplaced && !views.is_empty() {
+            let target = match &ast {
+                Ast::Insert { table, .. }
+                | Ast::Update { table, .. }
+                | Ast::Delete { table, .. } => Some(handle_bytes(arena, *table)),
+                Ast::Select(_) | Ast::With { .. } => None,
+                _ => Some(&b""[..]),
+            };
+            let dml_on_view = target.is_some_and(|n| n.is_empty() || self.temp_view(n).is_some());
+            if !dml_on_view
+                && let Some(out) = self.inline_temp_views(
+                    &text,
+                    t,
+                    views.as_slice(),
+                    ctes.as_slice(),
+                    cuts.as_slice(),
+                    (temp > views.len(), main > 0),
+                    arena,
+                )?
+            {
+                return Ok(Route::MainAs(out));
+            }
+        }
         let to_temp = create_temp || (temp > 0 && main == 0 && created.is_none());
         if !to_temp {
-            if temp > 0 || written > 0 {
+            if temp > 0 || unplaced {
                 return Err(Error::Unsupported);
             }
             return Ok(Route::Main);
         }
-        if main > 0 || written != quals {
+        // A TEMP view may read main tables (stored; read through
+        // `inline_temp_views`).
+        let temp_view = create_temp && matches!(ast, Ast::CreateView { .. });
+        if (main > 0 && !temp_view) || unplaced {
             return Err(Error::Unsupported);
+        }
+        // A view's text is stored as written but for its name's
+        // `temp.`, as on the pin (the temp database reads `temp.x`
+        // and `sqlite_temp_schema` as its own).
+        if temp_view {
+            cuts.clear();
+            if let Some(c) = created_cut {
+                cuts.push(c);
+            }
+            renames.clear();
         }
         // The text the temp database runs: no `temp.`, and its
         // schema table under its own name.
-        for x in t.iter() {
-            if let Tok::Ident(h, false) = x.tok
-                && is_temp_schema_name(handle_bytes(arena, h))
-            {
+        for &i in renames.iter() {
+            if let Some(x) = t.get(i) {
                 cuts.push((x.offset, x.offset));
             }
         }
-        cuts.as_mut_slice().sort_by_key(|c| c.0);
-        let src = text.as_slice();
-        let mut out = AVec::new();
-        let mut pos = 0usize;
-        for &(a, b) in cuts.iter() {
-            if a < pos || b > src.len() {
+        Ok(Route::Temp(apply_cuts(text.as_slice(), &mut cuts)))
+    }
+
+    /// Some TEMP view reads the main table `table` (directly or
+    /// through other TEMP views). The pin's ALTER TABLE of a main
+    /// table rewrites those views too; hipp's refuses instead
+    /// (`Unsupported`), so the view never reads a table the ALTER
+    /// renamed away.
+    pub(super) fn temp_views_read(&self, table: &[u8], arena: &Arena) -> bool {
+        let Some(c) = self.temp.as_deref() else {
+            return false;
+        };
+        c.catalog.views.iter().any(|v| {
+            let name = copy_vec(handle_bytes(&c.catalog_arena, v.name));
+            let ckpt = arena.checkpoint();
+            let mut order = AVec::new();
+            let mut refs = AVec::new();
+            let r = self.temp_view_closure(name.as_slice(), &mut order, &mut refs, 0, arena);
+            arena.rewind(ckpt);
+            // A view hipp cannot read through counts as reading it.
+            r.is_err() || refs.iter().any(|n| eq_ci(n.as_slice(), table))
+        })
+    }
+
+    /// The temp database's view named so.
+    fn temp_view(&self, name: &[u8]) -> Option<&crate::schema::ViewDef> {
+        let c = self.temp.as_deref()?;
+        c.catalog.find_view(&c.catalog_arena, name)
+    }
+
+    /// Add the TEMP view `name` and the TEMP views it reads to
+    /// `order` (each after the ones it reads), with its text as a
+    /// common table expression, and the names they read to `refs`.
+    /// Whether they read (a temp table, main objects).
+    fn temp_view_closure(
+        &self,
+        name: &[u8],
+        order: &mut AVec<(AVec<u8>, AVec<u8>)>,
+        refs: &mut AVec<AVec<u8>>,
+        depth: usize,
+        arena: &Arena,
+    ) -> Result<(bool, bool), S::Error> {
+        if order.iter().any(|(n, _)| eq_ci(n.as_slice(), name)) {
+            return Ok((false, false));
+        }
+        let (Some(v), Some(c)) = (self.temp_view(name), self.temp.as_deref()) else {
+            return Err(Error::Unsupported);
+        };
+        if depth >= 32 {
+            return Err(Error::Unsupported);
+        }
+        let sql = copy_vec(handle_bytes(&c.catalog_arena, v.sql));
+        let sql = sql.as_slice();
+        let (
+            Ast::CreateView {
+                name: vh, select, ..
+            },
+            toks,
+        ) = crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena)?
+        else {
+            return Err(Error::Unsupported);
+        };
+        let t = toks.as_slice();
+        // `name [(columns)] AS body`.
+        let Some(ni) = tok_index(t, vh) else {
+            return Err(Error::Unsupported);
+        };
+        let mut j = ni + 1;
+        let mut depth_p = 0usize;
+        let as_at = loop {
+            match t.get(j).map(|x| x.tok) {
+                None => return Err(Error::Unsupported),
+                Some(Tok::LParen) => depth_p += 1,
+                Some(Tok::RParen) => depth_p = depth_p.saturating_sub(1),
+                Some(Tok::Ident(h, false))
+                    if depth_p == 0 && eq_ci(handle_bytes(arena, h), b"AS") =>
+                {
+                    break j;
+                }
+                _ => {}
+            }
+            j += 1;
+        };
+        let (Some(cols_from), Some(cols_to), Some(body)) = (
+            t.get(ni + 1).map(|x| x.offset),
+            t.get(as_at).map(|x| x.offset),
+            t.get(as_at + 1).map(|x| x.offset),
+        ) else {
+            return Err(Error::Unsupported);
+        };
+        let mut names = AVec::new();
+        let mut ctes = AVec::new();
+        select_names(&select, &mut names, &mut ctes);
+        let (mut reads_temp, mut reads_main) = (false, false);
+        for (h, kind) in names.iter() {
+            if *kind == Kind::Qual {
                 continue;
             }
-            out.extend_from_slice(src.get(pos..a).unwrap_or_default());
-            if a == b {
-                // `sqlite_temp_schema` / `sqlite_temp_master`.
-                out.extend_from_slice(b"sqlite_schema");
-                let mut e = a;
-                while e < src.len() && (src[e].is_ascii_alphanumeric() || src[e] == b'_') {
-                    e += 1;
+            let n = handle_bytes(arena, *h);
+            let q = tok_index(t, *h).and_then(|i| qualifier(t, i, arena));
+            if q.is_none() && ctes.iter().any(|c| eq_ci(handle_bytes(arena, *c), n)) {
+                continue;
+            }
+            refs.push(copy_vec(n));
+            match q {
+                Some(false) => reads_main = true,
+                _ if is_temp_schema_name(n) => reads_temp = true,
+                _ if self.temp_view(n).is_some() => {
+                    let (a, b) = self.temp_view_closure(n, order, refs, depth + 1, arena)?;
+                    reads_temp |= a;
+                    reads_main |= b;
                 }
-                pos = e;
-            } else {
-                pos = b;
+                Some(true) => reads_temp = true,
+                None if self.temp_has(n, false) => reads_temp = true,
+                None => reads_main = true,
             }
         }
-        out.extend_from_slice(&src[pos.min(src.len())..]);
-        Ok(Route::Temp(out))
+        // `"name"(columns) AS (body)`; the body may end in a `--`
+        // comment.
+        let mut cte = AVec::new();
+        cte.push(b'"');
+        for &b in name {
+            cte.push(b);
+            if b == b'"' {
+                cte.push(b'"');
+            }
+        }
+        cte.push(b'"');
+        cte.extend_from_slice(sql.get(cols_from..cols_to).unwrap_or_default());
+        cte.extend_from_slice(b"AS (");
+        cte.extend_from_slice(sql.get(body..).unwrap_or_default());
+        cte.extend_from_slice(b"\n)");
+        order.push((copy_vec(name), cte));
+        Ok((reads_temp, reads_main))
+    }
+
+    /// A statement reading TEMP `views` (and other temp objects,
+    /// `temp`, and main objects, `main`)
+    /// as main's text, the views (and those they read) written in
+    /// as common table expressions before its own — when something
+    /// reads main and none of them reads a temp table (refused when
+    /// both). `None` when nothing reads main (the temp database
+    /// runs it). `cuts` are its `temp.` qualifiers.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_temp_views(
+        &self,
+        text: &AVec<u8>,
+        t: &[Token],
+        views: &[AVec<u8>],
+        ctes: &[ABytes],
+        cuts: &[(usize, usize)],
+        (temp, main): (bool, bool),
+        arena: &Arena,
+    ) -> Result<Option<AVec<u8>>, S::Error> {
+        let mut order = AVec::new();
+        let mut refs = AVec::new();
+        let (mut reads_temp, mut reads_main) = (temp, main);
+        for v in views {
+            let (a, b) = self.temp_view_closure(v.as_slice(), &mut order, &mut refs, 0, arena)?;
+            reads_temp |= a;
+            reads_main |= b;
+        }
+        // Both databases in one statement: refused (see the module
+        // docs); temp objects only: the temp database runs it.
+        if reads_temp && reads_main {
+            return Err(Error::Unsupported);
+        }
+        if !reads_main {
+            return Ok(None);
+        }
+        // A CTE of the statement's own named like a view or a name
+        // a view reads would take its place there.
+        let clash = ctes.iter().any(|c| {
+            let c = handle_bytes(arena, *c);
+            order.iter().any(|(n, _)| eq_ci(n.as_slice(), c))
+                || refs.iter().any(|r| eq_ci(r.as_slice(), c))
+        });
+        if clash {
+            return Err(Error::Unsupported);
+        }
+        let mut cuts_v: AVec<(usize, usize)> = AVec::new();
+        for &c in cuts {
+            cuts_v.push(c);
+        }
+        let body = apply_cuts(text.as_slice(), &mut cuts_v);
+        let word = |i: usize, w: &[u8]| matches!(t.get(i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
+        let mut out = copy_vec(b"WITH ");
+        // The statement's own WITH [RECURSIVE] continues the list.
+        let rest = if word(0, b"WITH") {
+            let k = if word(1, b"RECURSIVE") {
+                out.extend_from_slice(b"RECURSIVE ");
+                2
+            } else {
+                1
+            };
+            let Some(at) = t.get(k).map(|x| x.offset) else {
+                return Err(Error::Unsupported);
+            };
+            Some(at)
+        } else {
+            None
+        };
+        for (i, (_, cte)) in order.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b", ");
+            }
+            out.extend_from_slice(cte.as_slice());
+        }
+        match rest {
+            Some(at) => {
+                out.extend_from_slice(b", ");
+                out.extend_from_slice(body.as_slice().get(at..).unwrap_or_default());
+            }
+            None => {
+                out.push(b' ');
+                out.extend_from_slice(body.as_slice());
+            }
+        }
+        Ok(Some(out))
     }
 
     /// The main database may have an object (`index`: an index)
@@ -603,7 +983,8 @@ impl<S: Storage> Connection<S> {
     }
 
     /// The temp database, created (and brought into the open
-    /// transaction and savepoints) on first use.
+    /// transaction and savepoints) on first use, with the
+    /// connection's settings (`sync_temp`).
     pub(super) async fn temp_conn(&mut self) -> Result<&mut Connection<MemStorage>, S::Error> {
         if self.temp.is_none() {
             let mut cfg = self.cfg.clone();
@@ -638,9 +1019,25 @@ impl<S: Storage> Connection<S> {
             }
             self.temp = Some(Box::new(c));
         }
+        self.sync_temp();
         match self.temp.as_deref_mut() {
             Some(c) => Ok(c),
             None => Err(Error::Unsupported),
+        }
+    }
+
+    /// Give the temp database the connection's settings: the
+    /// connection-wide pragmas (`Prag::connection_wide`) hold for
+    /// both databases on the pin, wherever they were set.
+    pub(super) fn sync_temp(&mut self) {
+        let (p, like) = (&self.prag, self.env.case_like.get());
+        if let Some(c) = self.temp.as_deref_mut() {
+            c.prag.foreign_keys = p.foreign_keys;
+            c.prag.recursive_triggers = p.recursive_triggers;
+            c.prag.ignore_checks = p.ignore_checks;
+            c.prag.busy_timeout = p.busy_timeout;
+            c.prag.like_redefined = p.like_redefined;
+            c.env.case_like.set(like);
         }
     }
 

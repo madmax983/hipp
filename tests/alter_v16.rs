@@ -334,6 +334,69 @@ fn drop_column() {
     }
 }
 
+/// DROP COLUMN finds the comma before the column as a token: one
+/// inside a comment or a quoted name is not it (review fix: a raw
+/// byte scan cut there, the text no longer parsed, and the failed
+/// ALTER left the table out of the session's catalog, so a second
+/// CREATE TABLE of the name wrote a duplicate schema row).
+#[test]
+fn drop_column_skips_commas_in_comments() {
+    for (i, c) in [
+        "CREATE TABLE t(a, b, /* x,y */ c); INSERT INTO t VALUES(1,2,3); ALTER TABLE t DROP COLUMN c; SELECT * FROM t",
+        "CREATE TABLE t(a, b /* q */ , c); ALTER TABLE t DROP COLUMN c",
+        "CREATE TABLE t(a, b, /* x */ c /* y, */); ALTER TABLE t DROP COLUMN c; ALTER TABLE t DROP COLUMN b",
+        "CREATE TABLE t(a, b, c /* , */ , UNIQUE(a)); INSERT INTO t VALUES(1,2,3); ALTER TABLE t DROP COLUMN c; SELECT * FROM t",
+        "CREATE TABLE t(a, b, c, /* x,y */ UNIQUE(a)); ALTER TABLE t DROP COLUMN c",
+        "CREATE TABLE t(a, b, c /* , */ , /* , */ UNIQUE(a)); ALTER TABLE t DROP COLUMN c; ALTER TABLE t DROP COLUMN b",
+        "CREATE TABLE t(a, b, c, \"x,\" TEXT); ALTER TABLE t DROP COLUMN \"x,\"; ALTER TABLE t DROP COLUMN c",
+        "CREATE TABLE t(a, b, [x,y] c); ALTER TABLE t DROP COLUMN [x,y]",
+        "CREATE TABLE t(a, b, /* x,y */ c); INSERT INTO t VALUES(1,2,3); ALTER TABLE t DROP COLUMN c; SELECT * FROM t; CREATE TABLE t(q); SELECT count(*) FROM sqlite_schema",
+    ]
+    .iter()
+    .enumerate()
+    {
+        same(&format!("drop_comma{i}"), &split(c));
+    }
+    // A `--` comment runs to the end of its line.
+    for (i, (create, col)) in [
+        ("CREATE TABLE t(a, b, c, -- ,\n d)", "d"),
+        ("CREATE TABLE t(a, b, c, -- ,\n d)", "c"),
+        ("CREATE TABLE t(a, b -- x,\n, c)", "c"),
+        ("CREATE TABLE t(a, b, c, -- ,\n d -- ,\n)", "d"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let h = common::temp_db(&format!("v16al-dash{i}-h"));
+        let o = common::temp_db(&format!("v16al-dash{i}-o"));
+        let stmts = [
+            create.to_string(),
+            "INSERT INTO t(a, b) VALUES (1, 2)".to_string(),
+            format!("ALTER TABLE t DROP COLUMN {col}"),
+        ];
+        let (_, errs) = hipp_run(&h, &stmts);
+        assert!(errs.is_empty(), "{create}: {errs:?}");
+        common::cli(&o, &stmts.join(";\n"));
+        let q = "SELECT sql FROM sqlite_schema; SELECT * FROM t; PRAGMA integrity_check;";
+        assert_eq!(common::cli(&h, q), common::cli(&o, q), "{create}");
+    }
+}
+
+/// A failed ALTER leaves the session's catalog as the file is: the
+/// table is still there, and its name is still taken.
+#[test]
+fn failed_alter_keeps_the_catalog() {
+    for (i, c) in [
+        "CREATE TABLE t(a, b, c); INSERT INTO t VALUES(1,2,3); CREATE VIEW v AS SELECT * FROM nosuch; ALTER TABLE t RENAME TO u; SELECT * FROM t; ALTER TABLE t DROP COLUMN c; SELECT * FROM t; ALTER TABLE t RENAME COLUMN a TO z; CREATE TABLE t(q); INSERT INTO t VALUES(4,5,6); SELECT * FROM t",
+        "CREATE TABLE t(a, b); CREATE VIEW v AS SELECT * FROM nosuch; BEGIN; INSERT INTO t VALUES(1,2); ALTER TABLE t RENAME TO u; SELECT * FROM t; COMMIT; SELECT * FROM t; CREATE TABLE t(q)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        same(&format!("failed_alter{i}"), &split(c));
+    }
+}
+
 #[test]
 fn views_follow_the_rename() {
     // Views and CTEs: scoping decides which tokens are edited (aliases, subqueries, compound ORDER BY, rowid of the INTEGER PRIMARY KEY, unused CTEs).
