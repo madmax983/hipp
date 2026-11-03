@@ -428,6 +428,83 @@ pub enum SchemaKind {
     /// rowid, with no rowid left for a new row.
     #[cfg(feature = "v16")]
     DatabaseFull,
+    /// A write to a table (or view) that has triggers, in a build
+    /// without the `triggers` feature (v0.16, every profile): the
+    /// triggers would not fire, so the write is refused rather
+    /// than silently skipping them. Build with feature `triggers`,
+    /// or drop the triggers with an engine that has them. Also a
+    /// trigger whose stored text hipp cannot parse (with
+    /// `triggers`).
+    TableHasTriggers,
+    /// `CREATE TRIGGER` of a name the schema already has (v0.16,
+    /// `triggers`; the pin's "trigger t already exists"). Pick
+    /// another name, or write `IF NOT EXISTS`.
+    #[cfg(feature = "triggers")]
+    DuplicateTrigger,
+    /// `DROP TRIGGER` of a name no trigger has (v0.16, `triggers`;
+    /// "no such trigger"). Write `IF EXISTS` to accept that.
+    #[cfg(feature = "triggers")]
+    UnknownTrigger,
+    /// A BEFORE / AFTER trigger on a view (v0.16, `triggers`;
+    /// "cannot create BEFORE trigger on view"). Use INSTEAD OF.
+    #[cfg(feature = "triggers")]
+    TriggerOnView,
+    /// An INSTEAD OF trigger on a table (v0.16, `triggers`;
+    /// "cannot create INSTEAD OF trigger on table"). Use BEFORE or
+    /// AFTER.
+    #[cfg(feature = "triggers")]
+    InsteadOfTable,
+    /// A schema-qualified table name on an INSERT / UPDATE /
+    /// DELETE inside a trigger body (v0.16, `triggers`; "qualified
+    /// table names are not allowed on INSERT, UPDATE, and DELETE
+    /// statements within triggers"). Write the bare name.
+    #[cfg(feature = "triggers")]
+    TriggerQualifiedTarget,
+    /// RETURNING inside a trigger body (v0.16, `triggers`;
+    /// "cannot use RETURNING in a trigger"). Drop the clause.
+    #[cfg(feature = "triggers")]
+    TriggerReturning,
+    /// A trigger of the main schema that names a TEMP object, or a
+    /// TEMP trigger with a qualified name (v0.16, `triggers`; the
+    /// pin's "trigger ... cannot reference objects in database
+    /// temp" / "temporary trigger may not have qualified name").
+    /// Create a TEMP trigger, or drop the qualifier.
+    #[cfg(feature = "triggers")]
+    TriggerTempReference,
+    /// `RAISE()` outside a trigger program (v0.16, `triggers`;
+    /// "RAISE() may only be used within a trigger-program").
+    #[cfg(feature = "triggers")]
+    RaiseOutsideTrigger,
+    /// A trigger program ran `RAISE(ROLLBACK, msg)` (v0.16,
+    /// `triggers`): the statement failed and the transaction was
+    /// rolled back. The message is `Connection::raise_message`.
+    #[cfg(feature = "triggers")]
+    RaiseRollback,
+    /// A trigger program ran `RAISE(ABORT, msg)` (v0.16,
+    /// `triggers`): the statement failed and was rolled back.
+    #[cfg(feature = "triggers")]
+    RaiseAbort,
+    /// A trigger program ran `RAISE(FAIL, msg)` (v0.16,
+    /// `triggers`): the statement failed, keeping its changes so
+    /// far.
+    #[cfg(feature = "triggers")]
+    RaiseFail,
+    /// `RAISE(IGNORE)` reached the statement that fired the
+    /// trigger (v0.16, `triggers`). Never returned to a caller: the
+    /// statement skips the row and goes on.
+    #[cfg(feature = "triggers")]
+    RaiseIgnore,
+    /// Trigger programs nested deeper than
+    /// `Config::max_trigger_depth` (v0.16, `triggers`; the pin's
+    /// "triggers nested too deep" past 1000 levels).
+    /// Bound the recursion with a WHEN clause, or raise the limit
+    /// on a thread with the stack for it.
+    #[cfg(feature = "triggers")]
+    TriggerDepth,
+    /// An upsert into a view (v0.16, `triggers`; "cannot UPSERT a
+    /// view"). Drop the ON CONFLICT clause.
+    #[cfg(feature = "triggers")]
+    UpsertView,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

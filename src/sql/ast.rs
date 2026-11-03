@@ -259,6 +259,90 @@ pub enum Expr {
     /// any expression when `n` is 1; the planner checks the size.
     #[cfg(feature = "v16")]
     RowItem(Box<Expr>, u16, u16),
+    /// `RAISE(IGNORE)` / `RAISE(ROLLBACK | ABORT | FAIL, msg)`
+    /// (v0.16, `triggers`), and whether it was parsed inside a
+    /// trigger program: elsewhere it parses (a CHECK constraint may
+    /// hold one, as on the pin) but does not resolve — the pin's
+    /// "RAISE() may only be used within a trigger-program".
+    /// Evaluating it ends the trigger program; the message is any
+    /// expression, read as text.
+    #[cfg(feature = "triggers")]
+    Raise(RaiseKind, Option<Box<Expr>>, bool),
+    /// A `NEW.col` / `OLD.col` reference of a trigger program,
+    /// replaced by the firing row's value (v0.16, `triggers`; see
+    /// `sql::trig`): the value, the comparison affinity it carries
+    /// (the pin's: none for a column, INTEGER for the rowid) and its
+    /// collating sequence (the column's; none for the rowid). Never
+    /// produced by the parser.
+    #[cfg(feature = "triggers")]
+    TrigValue(Literal, Option<crate::record::Affinity>, Option<Coll>),
+}
+
+/// What `RAISE(...)` does (v0.16, `triggers`), as on the pin:
+/// `Ignore` abandons the trigger program and the row change that
+/// fired it (the statement goes on with its next row); `Rollback`
+/// fails the statement and rolls back the transaction; `Abort`
+/// fails and rolls back the statement; `Fail` fails the statement
+/// keeping what it changed so far.
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseKind {
+    Ignore,
+    Rollback,
+    Abort,
+    Fail,
+}
+
+/// When a trigger fires (v0.16, `triggers`).
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrigTime {
+    Before,
+    After,
+    /// `INSTEAD OF` (views only).
+    Instead,
+}
+
+/// The row change a trigger fires on (v0.16, `triggers`).
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrigEvent {
+    Insert,
+    Delete,
+    Update,
+}
+
+/// A parsed `CREATE TRIGGER` (v0.16, `triggers`). The WHEN clause
+/// and the body statements are kept as byte spans of the statement
+/// text: a trigger program is parsed again (and planned) each time
+/// it fires, with its `NEW.` / `OLD.` references bound to the row.
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone)]
+pub struct CreateTrigger {
+    /// The trigger's name (a `main.` / `temp.` qualifier dropped).
+    pub name: ABytes,
+    pub if_not_exists: bool,
+    /// The name was written with a schema qualifier.
+    pub qualified: bool,
+    pub time: TrigTime,
+    pub event: TrigEvent,
+    /// `UPDATE OF col, ...`: empty for any UPDATE.
+    pub of_cols: AVec<ABytes>,
+    /// The table (or view) after `ON`, as written.
+    pub table: ABytes,
+    /// Whether the table was written `temp.` qualified (and,
+    /// with `table_main`, `main.` qualified).
+    pub table_temp: bool,
+    pub table_main: bool,
+    /// The WHEN expression's text span (start, end).
+    pub when: Option<(usize, usize)>,
+    /// Each body statement's text span, without its `;`.
+    pub steps: AVec<(usize, usize)>,
+    /// Byte offset of the trigger's name token: the stored text is
+    /// `CREATE TRIGGER ` followed by the statement from here.
+    pub name_at: usize,
+    /// One past the closing `END`.
+    pub end: usize,
 }
 
 /// One SELECT result item (v0.4).
@@ -992,5 +1076,15 @@ pub enum Ast {
         /// The argument was a number token (the pin treats
         /// `integrity_check(5)` as a limit, `('5')` as a name).
         numeric: bool,
+    },
+    /// `CREATE TRIGGER` (v0.16, `triggers`).
+    #[cfg(feature = "triggers")]
+    CreateTrigger(Box<CreateTrigger>),
+    /// `DROP TRIGGER [IF EXISTS] [schema .] name` (v0.16,
+    /// `triggers`).
+    #[cfg(feature = "triggers")]
+    DropTrigger {
+        name: ABytes,
+        if_exists: bool,
     },
 }

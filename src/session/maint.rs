@@ -297,6 +297,12 @@ impl<S: Storage> Statement<'_, S> {
         if !self.conn.explicit_txn || self.stmt_sp.is_some() {
             return;
         }
+        // A statement of a trigger program undoes nothing itself (the
+        // statement that fired the trigger does, `session::trigger`).
+        #[cfg(feature = "triggers")]
+        if self.conn.in_trigger() {
+            return;
+        }
         let writes = match &self.plan {
             Plan::Query(_)
             | Plan::Scan { .. }
@@ -370,7 +376,7 @@ impl<S: Storage> Statement<'_, S> {
     /// action, the table's constraint-level `ON CONFLICT ROLLBACK`
     /// on a constraint of the violated kind (NOT NULL; UNIQUE /
     /// PRIMARY KEY). CHECK constraints take no conflict clause.
-    fn resolves_rollback(&self, e: &Error<S::Error>) -> bool {
+    pub(super) fn resolves_rollback(&self, e: &Error<S::Error>) -> bool {
         let (conflict, root) = match &self.plan {
             Plan::Insert { conflict, root, .. } | Plan::Update { conflict, root, .. } => {
                 (*conflict, *root)

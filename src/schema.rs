@@ -109,6 +109,11 @@ pub struct TableDef {
     /// `v16`): every INSERT keeps its `sqlite_sequence` row.
     #[cfg(feature = "v16")]
     pub autoinc: bool,
+    /// The file has a trigger on this table, which a build without
+    /// `triggers` cannot run (v0.16): writes are refused
+    /// (`SchemaKind::TableHasTriggers`).
+    #[cfg(not(feature = "triggers"))]
+    pub triggered: bool,
 }
 
 impl TableDef {
@@ -186,10 +191,38 @@ pub struct ViewDef {
     pub columns: AVec<ABytes>,
 }
 
+/// One trigger (v0.16, `triggers`): its `sqlite_schema` row and
+/// what its stored text says. The WHEN clause and the body
+/// statements are spans of `sql`, parsed again each time the
+/// trigger fires. A text hipp cannot parse makes the trigger
+/// `opaque`: writes to its table are refused
+/// (`SchemaKind::TableHasTriggers`), never run without it.
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone)]
+pub struct TriggerDef {
+    pub name: ABytes,
+    /// The schema row's `tbl_name`: the table (or view) as written
+    /// after `ON`.
+    pub table: ABytes,
+    pub sql: ABytes,
+    pub opaque: bool,
+    pub time: crate::sql::ast::TrigTime,
+    pub event: crate::sql::ast::TrigEvent,
+    /// `UPDATE OF` columns; empty for any UPDATE.
+    pub of_cols: AVec<ABytes>,
+    pub when: Option<(usize, usize)>,
+    pub steps: AVec<(usize, usize)>,
+}
+
 pub struct Catalog {
     pub tables: AVec<TableDef>,
     pub indexes: AVec<IndexDef>,
     pub views: AVec<ViewDef>,
+    /// The triggers in `sqlite_schema` rowid (creation) order
+    /// (v0.16, `triggers`).
+    #[cfg(feature = "triggers")]
+    pub triggers: AVec<TriggerDef>,
+
     /// Schema cookie this catalog was built from.
     pub cookie: u32,
     /// Table and view names in `sqlite_schema` rowid (creation)
@@ -209,6 +242,9 @@ impl Catalog {
             tables: AVec::new(),
             indexes: AVec::new(),
             views: AVec::new(),
+            #[cfg(feature = "triggers")]
+            triggers: AVec::new(),
+
             cookie,
             #[cfg(feature = "v16")]
             objects: AVec::new(),
@@ -235,6 +271,40 @@ impl Catalog {
                 None
             }
         })
+    }
+
+    /// Whether writes to `table` must be refused for its triggers
+    /// (v0.16, every profile): without `triggers`, any trigger on
+    /// it; with it, one whose text hipp cannot parse.
+    /// `SchemaKind::TableHasTriggers`.
+    pub fn trigger_blocked(&self, arena: &Arena, table: &[u8]) -> bool {
+        #[cfg(not(feature = "triggers"))]
+        return self.find(arena, table).is_some_and(|t| t.triggered);
+        #[cfg(feature = "triggers")]
+        self.triggers
+            .iter()
+            .any(|t| t.opaque && eq_ci(handle_bytes(arena, t.table), table))
+    }
+
+    /// The triggers on `table` (v0.16, `triggers`), in creation
+    /// order.
+    #[cfg(feature = "triggers")]
+    pub fn triggers_on<'x>(
+        &'x self,
+        arena: &'x Arena,
+        table: &'x [u8],
+    ) -> impl Iterator<Item = &'x TriggerDef> + 'x {
+        self.triggers
+            .iter()
+            .filter(move |t| !t.opaque && eq_ci(handle_bytes(arena, t.table), table))
+    }
+
+    /// The trigger named `name` (v0.16, `triggers`).
+    #[cfg(feature = "triggers")]
+    pub fn find_trigger<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x TriggerDef> {
+        self.triggers
+            .iter()
+            .find(|t| eq_ci(handle_bytes(arena, t.name), name))
     }
 
     pub fn find<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x TableDef> {
@@ -441,6 +511,8 @@ pub async fn build_catalog<S: Storage>(
             strict: false,
             foreign_coll: false,
             autoinc: false,
+            #[cfg(not(feature = "triggers"))]
+            triggered: false,
         });
     }
     // Scratch arena for parse trees (names are interned out of it
@@ -479,6 +551,8 @@ pub async fn build_catalog<S: Storage>(
                     foreign_coll: true,
                     #[cfg(feature = "v16")]
                     autoinc: false,
+                    #[cfg(not(feature = "triggers"))]
+                    triggered: false,
                 });
                 continue;
             }
@@ -602,6 +676,11 @@ pub async fn build_catalog<S: Storage>(
             #[cfg(feature = "v16")]
             autoinc: rowid_alias.is_some()
                 && crate::sql::parser::has_autoincrement::<S::Error>(sql.as_slice(), &scratch),
+            #[cfg(not(feature = "triggers"))]
+            triggered: rows.iter().any(|r| {
+                eq_ci(r.ty.as_slice(), b"trigger")
+                    && eq_ci(r.tbl_name.as_slice(), row.name.as_slice())
+            }),
         });
     }
 
@@ -744,6 +823,46 @@ pub async fn build_catalog<S: Storage>(
             sql: intern(catalog_arena, sql.as_slice())?,
             columns,
         });
+    }
+
+    // Pass 4: triggers (v0.16, `triggers`). Without the feature
+    // pass 1 notes the tables they are on (`TableDef::triggered`):
+    // writes to those are refused (never silently skipping a
+    // trigger the file defines).
+    #[cfg(feature = "triggers")]
+    for row in rows.iter() {
+        if !eq_ci(row.ty.as_slice(), b"trigger") {
+            continue;
+        }
+        {
+            scratch.reset();
+            let sql = row.sql.as_ref().map_or(&[][..], |s| s.as_slice());
+            let parsed = match parse::<S::Error>(sql, &scratch, lim) {
+                Ok(Ast::CreateTrigger(t)) => Some(t),
+                _ => None,
+            };
+            let mut of_cols = AVec::new();
+            if let Some(t) = &parsed {
+                for c in t.of_cols.iter() {
+                    of_cols.push(intern(catalog_arena, handle_bytes(&scratch, *c))?);
+                }
+            }
+            catalog.triggers.push(TriggerDef {
+                name: intern(catalog_arena, row.name.as_slice())?,
+                table: intern(catalog_arena, row.tbl_name.as_slice())?,
+                sql: intern(catalog_arena, sql)?,
+                opaque: parsed.is_none(),
+                time: parsed
+                    .as_ref()
+                    .map_or(crate::sql::ast::TrigTime::Before, |t| t.time),
+                event: parsed
+                    .as_ref()
+                    .map_or(crate::sql::ast::TrigEvent::Insert, |t| t.event),
+                of_cols,
+                when: parsed.as_ref().and_then(|t| t.when),
+                steps: parsed.map(|t| t.steps).unwrap_or_default(),
+            });
+        }
     }
 
     catalog.cookie = pager.schema_cookie();

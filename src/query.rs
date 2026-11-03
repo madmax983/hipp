@@ -292,6 +292,12 @@ pub enum ScalarFn {
     /// `crate::math::eval`.
     #[cfg(feature = "math")]
     Math(crate::math::MathFn),
+    /// `RAISE(kind[, message])` (v0.16, `triggers`): evaluating it
+    /// records the message (`Env::raise_msg`) and fails with the
+    /// kind's error (`SchemaKind::RaiseIgnore`, ...), which the
+    /// trigger engine acts on.
+    #[cfg(feature = "triggers")]
+    Raise(crate::sql::ast::RaiseKind),
 }
 
 impl ScalarFn {
@@ -373,7 +379,15 @@ pub enum RExpr {
     /// v0.6 silently dropped (oracle-probed: `'002' = (SELECT
     /// int_col ...)` is true there). Produced only by
     /// `substitute`; never by the resolver.
-    AffLiteral(OwnedValue, Affinity),
+    ///
+    /// v0.16 (`triggers`): a trigger program's `NEW.col` /
+    /// `OLD.col` is one too — no affinity (`None`, the pin's
+    /// `TK_TRIGGER` carries none for a column) and the column's
+    /// collating sequence, which a comparison takes as it takes a
+    /// column's; the rowid carries INTEGER affinity and no
+    /// collation. Every other producer gives an affinity and no
+    /// collation.
+    AffLiteral(OwnedValue, Option<Affinity>, Option<Coll>),
     /// A column slot with its comparison affinity and its
     /// collating sequence (v0.16: the column's `COLLATE`; a
     /// derived table's column carries its subquery item's;
@@ -1546,7 +1560,11 @@ fn first_row_limit(mut plan: SubPlan) -> SubPlan {
         Some(x) => RExpr::Binary(
             BinOp::Ne,
             Box::new(x),
-            Box::new(RExpr::AffLiteral(OwnedValue::Integer(0), Affinity::Numeric)),
+            Box::new(RExpr::AffLiteral(
+                OwnedValue::Integer(0),
+                Some(Affinity::Numeric),
+                None,
+            )),
         ),
         None => RExpr::Literal(OwnedValue::Integer(1)),
     });
@@ -1616,6 +1634,10 @@ pub fn resolve_scoped<E>(
         #[cfg(feature = "params")]
         Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
         Expr::Column { table, name } => resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?,
+        #[cfg(feature = "triggers")]
+        Expr::TrigValue(lit, aff, coll) => {
+            RExpr::AffLiteral(literal_value(arena, *lit), *aff, *coll)
+        }
         // Row-value comparisons (resolved out of line).
         #[cfg(feature = "v16")]
         Expr::Binary(op, l, r) if is_cmp_op(*op) && (is_row(l) || is_row(r)) => {
@@ -1793,6 +1815,21 @@ fn resolve_other<E>(
             enclosing,
             p,
         )?,
+        // `RAISE(...)` (v0.16, `triggers`): a call whose evaluation
+        // fails the trigger program (`eval_lazy`).
+        #[cfg(feature = "triggers")]
+        Expr::Raise(kind, msg, in_trigger) => {
+            if !*in_trigger {
+                return Err(Error::Schema {
+                    kind: SchemaKind::RaiseOutsideTrigger,
+                });
+            }
+            let mut args = AVec::new();
+            if let Some(m) = msg {
+                args.push(resolve_scoped::<E>(m, arena, cur, enclosing, p)?);
+            }
+            RExpr::Scalar(ScalarFn::Raise(*kind), args)
+        }
         // Handled by `resolve_scoped` itself.
         _ => return Err(Error::Unsupported),
     })
@@ -3464,7 +3501,7 @@ fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool
         return RExpr::Raise(*k);
     }
     let wrap = |v: &OwnedValue, aff: Option<Affinity>| match aff {
-        Some(a) => RExpr::AffLiteral(v.clone(), a),
+        Some(a) => RExpr::AffLiteral(v.clone(), Some(a), None),
         None => RExpr::Literal(v.clone()),
     };
     #[cfg(feature = "v16")]
@@ -3527,7 +3564,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
         RExpr::SubScalar(_) | RExpr::SubExists(_) => {
             let v = match &values[*pos] {
                 SubValue::One(v, aff) => match aff {
-                    Some(a) => RExpr::AffLiteral(v.clone(), *a),
+                    Some(a) => RExpr::AffLiteral(v.clone(), Some(*a), None),
                     None => RExpr::Literal(v.clone()),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
@@ -3843,7 +3880,7 @@ pub fn substitute_group(
         RExpr::SubScalar(_) | RExpr::SubExists(_) => {
             let v = match &values[*pos] {
                 SubValue::One(v, aff) => match aff {
-                    Some(a) => RExpr::AffLiteral(v.clone(), *a),
+                    Some(a) => RExpr::AffLiteral(v.clone(), Some(*a), None),
                     None => RExpr::Literal(v.clone()),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
@@ -4264,6 +4301,10 @@ pub struct Env {
     /// compare ASCII letters case-sensitively while set.
     #[cfg(feature = "v16")]
     pub case_like: core::cell::Cell<bool>,
+    /// The message of the last `RAISE(...)` evaluated (v0.16,
+    /// `triggers`; `Connection::raise_message`).
+    #[cfg(feature = "triggers")]
+    pub raise_msg: core::cell::RefCell<AVec<u8>>,
 }
 
 impl Env {
@@ -4284,6 +4325,8 @@ impl Env {
             pending: core::cell::Cell::new(0),
             #[cfg(feature = "v16")]
             case_like: core::cell::Cell::new(false),
+            #[cfg(feature = "triggers")]
+            raise_msg: core::cell::RefCell::new(AVec::new()),
         }
     }
 
@@ -4407,7 +4450,7 @@ fn class_of_affinity(aff: Affinity) -> CmpClass {
 
 fn cmp_class(e: &RExpr) -> CmpClass {
     match e {
-        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) | RExpr::AffLiteral(_, aff) => {
+        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) | RExpr::AffLiteral(_, Some(aff), _) => {
             class_of_affinity(*aff)
         }
         // COLLATE is transparent to affinity (the pin's EP_Skip).
@@ -4622,6 +4665,8 @@ pub fn expr_coll(e: &RExpr) -> Option<Coll> {
     loop {
         match p {
             RExpr::Column(_, _, c) => return *c,
+            #[cfg(feature = "triggers")]
+            RExpr::AffLiteral(_, _, Some(c)) => return Some(*c),
             RExpr::Collate(_, c) => return Some(*c),
             RExpr::Cast(x, _) | RExpr::Pos(x) => p = x,
             _ if has_explicit_coll(p) => p = explicit_child(p)?,
@@ -4694,8 +4739,30 @@ pub fn is_constant(e: &RExpr) -> bool {
                 && whens.iter().all(|(w, t)| is_constant(w) && is_constant(t))
                 && otherwise.as_deref().is_none_or(is_constant)
         }
+        // RAISE() is never folded (v0.16, `triggers`): it fails only
+        // where evaluation reaches it.
+        #[cfg(feature = "triggers")]
+        RExpr::Scalar(ScalarFn::Raise(_), _) => false,
         RExpr::Scalar(_, args) => args.iter().all(is_constant),
         RExpr::Win(..) => false,
+    }
+}
+
+/// An integer literal's truth (`None` for any other expression).
+/// An AND over a false one is false too, an OR over a true one true
+/// (the pin's simplified operator is such a literal again).
+fn int_lit(e: &RExpr) -> Option<bool> {
+    match e {
+        RExpr::Literal(OwnedValue::Integer(i)) => Some(*i != 0),
+        RExpr::Binary(BinOp::And, a, b)
+            if int_lit(a) == Some(false) || int_lit(b) == Some(false) =>
+        {
+            Some(false)
+        }
+        RExpr::Binary(BinOp::Or, a, b) if int_lit(a) == Some(true) || int_lit(b) == Some(true) => {
+            Some(true)
+        }
+        _ => None,
     }
 }
 
@@ -5288,6 +5355,8 @@ fn trim_value(f: ScalarFn, v: &[OwnedValue]) -> OwnedValue {
 /// there; hipp raised "integer overflow").
 fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<OwnedValue, E>> {
     match f {
+        #[cfg(feature = "triggers")]
+        ScalarFn::Raise(k) => Some(eval_raise::<E>(k, args, ctx)),
         ScalarFn::Coalesce => {
             for a in args {
                 match eval::<E>(a, ctx) {
@@ -5769,10 +5838,44 @@ fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<Own
     })
 }
 
+/// `RAISE(kind[, message])` (v0.16, `triggers`): the message as
+/// text (NULL is empty) is kept in the connection's `Env`, and the
+/// kind's error ends the trigger program.
+#[cfg(feature = "triggers")]
+fn eval_raise<E>(
+    k: crate::sql::ast::RaiseKind,
+    args: &[RExpr],
+    ctx: &Ctx<'_>,
+) -> Result<OwnedValue, E> {
+    use crate::sql::ast::RaiseKind;
+    let mut msg = AVec::new();
+    if let Some(a) = args.first() {
+        match eval::<E>(a, ctx)? {
+            OwnedValue::Null => {}
+            v => {
+                if let OwnedValue::Text(t) = cast_value(&v, Affinity::Text) {
+                    msg = t;
+                }
+            }
+        }
+    }
+    if let Some(env) = ctx.env {
+        *env.raise_msg.borrow_mut() = msg;
+    }
+    Err(Error::Schema {
+        kind: match k {
+            RaiseKind::Ignore => SchemaKind::RaiseIgnore,
+            RaiseKind::Rollback => SchemaKind::RaiseRollback,
+            RaiseKind::Abort => SchemaKind::RaiseAbort,
+            RaiseKind::Fail => SchemaKind::RaiseFail,
+        },
+    })
+}
+
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
-        RExpr::AffLiteral(v, _) => v.clone(),
+        RExpr::AffLiteral(v, ..) => v.clone(),
         RExpr::Column(i, ..) => ctx
             .row()
             .vals
@@ -5804,6 +5907,12 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             bool_val(is != *neg)
         }
         RExpr::Binary(op, l, r) => match op {
+            // An integer literal operand decides AND / OR without the
+            // other (v0.16 fix, ungated: the pin simplifies `x AND 0`
+            // to 0 and `x OR 1` to 1, so `0 AND abs(-9223372036854775808)`
+            // is 0 there, not "integer overflow").
+            BinOp::And if int_lit(l) == Some(false) || int_lit(r) == Some(false) => bool_val(false),
+            BinOp::Or if int_lit(l) == Some(true) || int_lit(r) == Some(true) => bool_val(true),
             BinOp::And => {
                 let a = truthy(&eval::<E>(l, ctx)?);
                 if a == Some(false) && has_raise(r) {

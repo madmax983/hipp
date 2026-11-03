@@ -631,6 +631,15 @@ pub fn validate_def<E>(
     }
     let mut texts: AVec<&[u8]> = AVec::new();
     for h in checks.iter() {
+        // A CHECK holding RAISE() is accepted when the table is
+        // created (v0.16, `triggers`): the pin refuses it only where
+        // it is resolved, when a row is written.
+        #[cfg(feature = "triggers")]
+        if parse_rule::<E>(handle_bytes(arena, *h), arena, lim)
+            .is_ok_and(|e| expr_any(&e, &mut |x| matches!(x, Expr::Raise(..))))
+        {
+            continue;
+        }
         texts.push(handle_bytes(arena, *h));
     }
     plan_rules::<E>(
@@ -687,6 +696,10 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | Expr::ExistsSubquery(_) => false,
         #[cfg(feature = "params")]
         Expr::Param(..) => false,
+        #[cfg(feature = "triggers")]
+        Expr::TrigValue(..) | Expr::Raise(_, None, _) => false,
+        #[cfg(feature = "triggers")]
+        Expr::Raise(_, Some(a), _) => expr_any(a, f),
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => expr_any(a, f) || expr_any(b, f),
         Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             expr_any(a, f)

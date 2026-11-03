@@ -301,7 +301,8 @@ aspirations.
   `busy_timeout`) — any write hipp cannot honour is refused, never
   pretended; the flags `foreign_keys` (while on, writes to tables
   in a foreign key are refused: hipp does not enforce them),
-  `recursive_triggers`, `ignore_check_constraints` (really skips
+  `recursive_triggers` (honoured with `triggers`),
+  `ignore_check_constraints` (really skips
   CHECK) and `case_sensitive_like` (really changes LIKE);
   `table_info`, `table_xinfo` (the pin's dequoted declared
   types, hidden generated columns, view column types),
@@ -443,7 +444,9 @@ aspirations.
   Gaps: a statement naming a temp table and a main object
   (`INSERT INTO temp_t SELECT ... FROM main_t`, a join of both)
   is refused, as is ALTER TABLE of a main table a TEMP view reads;
-  files with triggers cannot be altered; re-created tables can get
+  files with triggers cannot be altered without the `triggers`
+  feature (with it, their texts are rewritten as the pin's);
+  re-created tables can get
   other root page numbers than on the pin (STATUS.md).
 - **Parser and evaluator depth limits (crash hardening).**
   Ungated: within its limits no statement or stored schema text
@@ -494,6 +497,23 @@ aspirations.
   sorting stably). Window calls in WHERE / GROUP BY / HAVING,
   inside aggregates and in write statements are the pin's misuse.
   Max +41.9 KB; tiny and full unchanged (STATUS.md).
+
+- **Triggers** (new leaf feature `triggers`, in `max` — ADR
+  0002 — not `full`). CREATE [TEMP] TRIGGER (BEFORE / AFTER /
+  INSTEAD OF, INSERT / DELETE / UPDATE [OF], WHEN) stored with the
+  pin's text, DROP TRIGGER; bodies of INSERT / UPDATE / DELETE /
+  SELECT with NEW. / OLD. (the pin's affinity and collation rules),
+  RAISE(IGNORE / ROLLBACK / ABORT / FAIL) with the pin's
+  resolution, conflict-clause override, recursive_triggers, the
+  1000-program depth limit, changes() / last_insert_rowid() frames,
+  REPLACE and upsert interplay, and INSTEAD OF triggers that make
+  views writable. ALTER TABLE rewrites trigger texts as the pin
+  does (its `excluded.` quirk included). Pin-made files with
+  triggers are read and written with their triggers firing; a
+  build without the feature refuses writes to a triggered table
+  (ungated, every profile — they used to skip the trigger
+  silently). TEMP triggers on main tables are refused. Tiny +196 B,
+  full +528 B (the ungated refusals), max +33.9 KB (STATUS.md).
 
 ## What v0.13 does
 
@@ -829,7 +849,9 @@ rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor;
 `session/pragma` the PRAGMA statements and integrity check,
 `session/cte` view / CTE expansion and the recursive queue,
-`session/maint` savepoints, VACUUM, REINDEX and ANALYZE, v0.16),
+`session/maint` savepoints, VACUUM, REINDEX and ANALYZE,
+`session/trigger` trigger programs, v0.16; `sql/trig` the NEW. /
+OLD. binder),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

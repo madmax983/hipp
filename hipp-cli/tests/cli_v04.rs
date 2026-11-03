@@ -151,8 +151,14 @@ CREATE VIEW w(n) AS SELECT count(*) FROM t;
         &rdb,
         "SELECT type, name, sql FROM sqlite_schema ORDER BY rowid;",
     );
+    // The oracle's own dump of its database, replayed: the same
+    // schema (v0.16: hipp's dump writes views, triggers and indexes
+    // in the oracle shell's order, `ORDER BY type DESC`).
+    let odump = oracle_run(&odb, ".dump");
+    let rdb2 = temp_db("v04-dump-replay-o");
+    oracle_run(&rdb2, &String::from_utf8_lossy(&odump.stdout));
     let orig = oracle_run(
-        &odb,
+        &rdb2,
         "SELECT type, name, sql FROM sqlite_schema ORDER BY rowid;",
     );
     assert_eq!(

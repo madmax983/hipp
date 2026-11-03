@@ -136,6 +136,10 @@ struct Parser<'a> {
     /// The tallest result column of the select core just parsed.
     #[cfg(feature = "v04")]
     core_h: usize,
+    /// Parsing a trigger program (v0.16, `triggers`): `RAISE()` is
+    /// legal only here.
+    #[cfg(feature = "triggers")]
+    in_trig: bool,
 }
 
 /// The ON / USING terms of one select core (v0.16): the pin's
@@ -297,6 +301,10 @@ fn mark_ctx(e: &mut Expr, h: usize) {
             Expr::Literal(_) | Expr::Column { .. } | Expr::HexTooBig(_) => {}
             #[cfg(feature = "params")]
             Expr::Param(..) => {}
+            #[cfg(feature = "triggers")]
+            Expr::TrigValue(..) | Expr::Raise(_, None, _) => {}
+            #[cfg(feature = "triggers")]
+            Expr::Raise(_, Some(a), _) => todo.push(a),
             Expr::Binary(_, a, b) | Expr::Like(a, b, _) => {
                 todo.push(a);
                 todo.push(b);
@@ -469,6 +477,9 @@ pub fn parse_params<E>(
         #[cfg(not(feature = "v16"))]
         Ast::CreateTable { .. } => true,
         Ast::AlterAddColumn { .. } | Ast::CreateView { .. } => true,
+        // "trigger cannot use variables" (v0.16, `triggers`).
+        #[cfg(feature = "triggers")]
+        Ast::CreateTrigger(_) => true,
         _ => false,
     };
     if stored && params.count > 0 {
@@ -735,6 +746,8 @@ impl<'a> Parser<'a> {
             reduced: false,
             #[cfg(feature = "v04")]
             core_h: 0,
+            #[cfg(feature = "triggers")]
+            in_trig: false,
         }
     }
 
@@ -1005,6 +1018,15 @@ impl<'a> Parser<'a> {
                 self.create_index_dispatch::<E>(true)
             } else if self.is_kw(self.pos + 1, b"VIEW") {
                 self.create_view_dispatch::<E>()
+            } else if cfg!(feature = "triggers") && self.is_kw(self.pos + 1, b"TRIGGER") {
+                #[cfg(feature = "triggers")]
+                {
+                    self.create_trigger::<E>()
+                }
+                #[cfg(not(feature = "triggers"))]
+                {
+                    Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+                }
             } else {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
@@ -1285,6 +1307,10 @@ impl<'a> Parser<'a> {
 
     /// DROP dispatch: VIEW (v0.4), TABLE (v0.5), or INDEX (v0.3).
     fn drop_dispatch<E>(&mut self) -> Result<Ast, E> {
+        #[cfg(feature = "triggers")]
+        if self.is_kw(self.pos + 1, b"TRIGGER") {
+            return self.drop_trigger::<E>();
+        }
         if self.is_kw(self.pos + 1, b"VIEW") {
             self.drop_view_dispatch::<E>()
         } else if self.is_kw(self.pos + 1, b"TABLE") {
@@ -3307,6 +3333,10 @@ impl<'a> Parser<'a> {
                 {
                     if eq_ci(handle_bytes(self.arena, h), b"CAST") {
                         return self.expr_cast::<E>();
+                    }
+                    #[cfg(feature = "triggers")]
+                    if eq_ci(handle_bytes(self.arena, h), b"RAISE") {
+                        return self.expr_raise::<E>();
                     }
                     return self.expr_call::<E>(h);
                 }
@@ -5973,6 +6003,391 @@ fn offset_is_constant(e: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+// ===================== CREATE / DROP TRIGGER =====================
+//
+// v0.16, `triggers`: `CREATE TRIGGER [IF NOT EXISTS] [schema .] name
+// [BEFORE | AFTER | INSTEAD OF] DELETE | INSERT | UPDATE [OF col, ...]
+// ON table [FOR EACH ROW] [WHEN expr] BEGIN stmt; ... END`, with the
+// pin's restrictions on the body: INSERT / REPLACE / UPDATE / DELETE /
+// SELECT (a WITH clause only before a SELECT), no schema-qualified
+// target, no RETURNING, no DEFAULT VALUES, no parameters (the
+// `parse_params` refusal). `RAISE()` is legal only in a trigger.
+#[cfg(feature = "triggers")]
+impl<'a> Parser<'a> {
+    fn create_trigger<E>(&mut self) -> Result<Ast, E> {
+        use super::ast::{CreateTrigger, TrigEvent, TrigTime};
+        self.expect_kw::<E>(b"CREATE")?;
+        self.expect_kw::<E>(b"TRIGGER")?;
+        let if_not_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"NOT")?;
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        // [schema .] name
+        let (mut name, mut name_at) = match self.cur().tok {
+            Tok::Ident(h, _) => (h, self.cur().offset),
+            _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+        };
+        self.pos += 1;
+        let mut qualified = false;
+        if self.eat(Tok::Dot) {
+            let s = handle_bytes(self.arena, name);
+            if !eq_ci(s, b"main") && !eq_ci(s, b"temp") {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::UnknownDatabase,
+                });
+            }
+            qualified = true;
+            match self.cur().tok {
+                Tok::Ident(h, _) => {
+                    name = h;
+                    name_at = self.cur().offset;
+                    self.pos += 1;
+                }
+                _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+            }
+        }
+        let time = if self.eat_kw(b"BEFORE") {
+            TrigTime::Before
+        } else if self.eat_kw(b"AFTER") {
+            TrigTime::After
+        } else if self.eat_kw(b"INSTEAD") {
+            self.expect_kw::<E>(b"OF")?;
+            TrigTime::Instead
+        } else {
+            TrigTime::Before
+        };
+        let mut of_cols = AVec::new();
+        let event = if self.eat_kw(b"DELETE") {
+            TrigEvent::Delete
+        } else if self.eat_kw(b"INSERT") {
+            TrigEvent::Insert
+        } else if self.eat_kw(b"UPDATE") {
+            if self.eat_kw(b"OF") {
+                loop {
+                    match self.cur().tok {
+                        Tok::Ident(h, _) => {
+                            self.pos += 1;
+                            of_cols.push(h);
+                        }
+                        _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+                    }
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            TrigEvent::Update
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        self.expect_kw::<E>(b"ON")?;
+        // ON [schema .] table
+        let (mut table_temp, mut table_main) = (false, false);
+        if matches!(
+            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+            Some(Tok::Dot)
+        ) && let Tok::Ident(h, _) = self.cur().tok
+        {
+            let s = handle_bytes(self.arena, h);
+            if eq_ci(s, b"temp") {
+                table_temp = true;
+            } else if eq_ci(s, b"main") {
+                table_main = true;
+            }
+        }
+        let table = self.name::<E>()?;
+        if self.eat_kw(b"FOR") {
+            self.expect_kw::<E>(b"EACH")?;
+            self.expect_kw::<E>(b"ROW")?;
+        }
+        let in0 = self.in_trig;
+        self.in_trig = true;
+        let r = self.trigger_rest::<E>();
+        self.in_trig = in0;
+        let (when, steps, end) = r?;
+        Ok(Ast::CreateTrigger(Box::new(CreateTrigger {
+            name,
+            if_not_exists,
+            qualified,
+            time,
+            event,
+            of_cols,
+            table,
+            table_temp,
+            table_main,
+            when,
+            steps,
+            name_at,
+            end,
+        })))
+    }
+
+    /// One past the last byte of the token before the cursor.
+    fn prev_end(&self) -> usize {
+        let Some(t) = self
+            .pos
+            .checked_sub(1)
+            .and_then(|i| self.toks.as_slice().get(i))
+        else {
+            return 0;
+        };
+        token_end(self.sql, t.offset)
+    }
+
+    /// `[WHEN expr] BEGIN stmt; ... END` (the WHEN span, the body
+    /// spans, one past END).
+    #[allow(clippy::type_complexity)]
+    fn trigger_rest<E>(
+        &mut self,
+    ) -> Result<(Option<(usize, usize)>, AVec<(usize, usize)>, usize), E> {
+        let when = if self.eat_kw(b"WHEN") {
+            let a = self.cur().offset;
+            self.item::<E>(10)?;
+            Some((a, self.prev_end()))
+        } else {
+            None
+        };
+        self.expect_kw::<E>(b"BEGIN")?;
+        let mut steps = AVec::new();
+        loop {
+            let a = self.cur().offset;
+            self.trigger_step::<E>()?;
+            let b = self.prev_end();
+            self.expect::<E>(Tok::Semi)?;
+            steps.push((a, b));
+            if self.cur_is_kw(b"END") {
+                let end = token_end(self.sql, self.cur().offset);
+                self.pos += 1;
+                return Ok((when, steps, end));
+            }
+        }
+    }
+
+    /// One body statement, with the pin's restrictions.
+    fn trigger_step<E>(&mut self) -> Result<(), E> {
+        let qualified_target = |p: &Self, mut i: usize| -> bool {
+            // INSERT / REPLACE: the name after INTO; UPDATE [OR x]:
+            // the next name; DELETE FROM: the next.
+            if p.is_kw(i, b"OR") {
+                i += 2;
+            }
+            if p.is_kw(i, b"INTO") || p.is_kw(i, b"FROM") {
+                i += 1;
+            }
+            matches!(p.toks.as_slice().get(i + 1).map(|t| t.tok), Some(Tok::Dot))
+        };
+        let ast = if self.cur_is_kw(b"INSERT")
+            || self.cur_is_kw(b"REPLACE")
+            || self.cur_is_kw(b"UPDATE")
+            || self.cur_is_kw(b"DELETE")
+        {
+            if qualified_target(self, self.pos + 1) {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::TriggerQualifiedTarget,
+                });
+            }
+            if self.cur_is_kw(b"INSERT") {
+                self.insert::<E>(false)?
+            } else if self.cur_is_kw(b"REPLACE") {
+                self.replace_dispatch::<E>()?
+            } else if self.cur_is_kw(b"UPDATE") {
+                self.update_dispatch::<E>()?
+            } else {
+                self.delete_dispatch::<E>()?
+            }
+        } else if self.cur_is_kw(b"SELECT") || self.cur_is_kw(b"VALUES") || self.with_at(self.pos) {
+            Ast::Select(self.select_rich::<E>()?)
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        let returning = match &ast {
+            Ast::Insert {
+                returning, columns, ..
+            } => {
+                // `INSERT ... DEFAULT VALUES` (an empty target list):
+                // not in the pin's trigger grammar.
+                if columns.as_ref().is_some_and(|c| c.is_empty()) {
+                    return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+                }
+                !returning.is_empty()
+            }
+            Ast::Update { returning, .. } | Ast::Delete { returning, .. } => !returning.is_empty(),
+            _ => false,
+        };
+        if returning {
+            return Err(Error::Schema {
+                kind: crate::error::SchemaKind::TriggerReturning,
+            });
+        }
+        Ok(())
+    }
+
+    /// `RAISE(IGNORE)` / `RAISE(ROLLBACK | ABORT | FAIL, expr)`.
+    #[inline(never)]
+    fn expr_raise<E>(&mut self) -> Result<Expr, E> {
+        use super::ast::RaiseKind;
+        self.pos += 2; // RAISE (
+        let kind = if self.eat_kw(b"IGNORE") {
+            RaiseKind::Ignore
+        } else if self.eat_kw(b"ROLLBACK") {
+            RaiseKind::Rollback
+        } else if self.eat_kw(b"ABORT") {
+            RaiseKind::Abort
+        } else if self.eat_kw(b"FAIL") {
+            RaiseKind::Fail
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        let (mut h, mut k) = (0usize, EK_CONST);
+        let msg = if kind == RaiseKind::Ignore {
+            None
+        } else {
+            self.expect::<E>(Tok::Comma)?;
+            let m = self.operand_expr::<E>(5)?;
+            (h, k) = (self.eh, self.ek);
+            Some(Box::new(m))
+        };
+        self.expect::<E>(Tok::RParen)?;
+        self.need::<E>(4)?;
+        self.set_h::<E>(h + 1, k & EK_CONST)?;
+        Ok(Expr::Raise(kind, msg, self.in_trig))
+    }
+
+    fn drop_trigger<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"DROP")?;
+        self.expect_kw::<E>(b"TRIGGER")?;
+        let if_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        Ok(Ast::DropTrigger { name, if_exists })
+    }
+}
+
+/// One past the last byte of the token starting at `off` of `sql`
+/// (v0.16, `triggers`): an identifier / number / keyword run, a
+/// quoted string or name, or a one- / two-byte operator.
+#[cfg(feature = "triggers")]
+pub fn token_end(sql: &[u8], off: usize) -> usize {
+    let n = sql.len();
+    let Some(&c) = sql.get(off) else {
+        return off;
+    };
+    let close = match c {
+        b'"' => b'"',
+        b'`' => b'`',
+        b'\'' => b'\'',
+        b'[' => b']',
+        _ => 0,
+    };
+    let mut i = off;
+    if close != 0 {
+        i += 1;
+        while i < n {
+            if sql[i] == close {
+                if close != b']' && sql.get(i + 1) == Some(&close) {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i += 1;
+        }
+        return n;
+    }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+    if word(c) {
+        // A blob literal x'..' / X'..'.
+        if (c == b'x' || c == b'X') && sql.get(off + 1) == Some(&b'\'') {
+            return token_end(sql, off + 1);
+        }
+        while i < n && (word(sql[i]) || (sql[i] == b'.' && c.is_ascii_digit())) {
+            // A number's exponent sign: 1e+5.
+            if (sql[i] == b'e' || sql[i] == b'E')
+                && c.is_ascii_digit()
+                && matches!(sql.get(i + 1), Some(b'+') | Some(b'-'))
+            {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        return i;
+    }
+    // Operators: two-byte forms first.
+    let two = sql.get(off..off + 2).unwrap_or(&[]);
+    if matches!(
+        two,
+        b"<=" | b">=" | b"<>" | b"!=" | b"==" | b"||" | b"<<" | b">>" | b"->"
+    ) {
+        if sql.get(off..off + 3) == Some(b"->>") {
+            return off + 3;
+        }
+        return off + 2;
+    }
+    off + 1
+}
+
+/// Parse one statement of a trigger program (v0.16, `triggers`):
+/// a stored trigger's body statement, or `SELECT <when>`, with
+/// `RAISE()` allowed.
+#[cfg(feature = "triggers")]
+pub fn parse_trigger_step<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Ast, E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    p.in_trig = true;
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    Ok(ast)
+}
+
+/// `parse_trigger_step`, also returning the statement's tokens
+/// (v0.16, `triggers`; ALTER TABLE edits trigger texts by them).
+#[cfg(feature = "triggers")]
+pub fn parse_trigger_step_tokens<E>(
+    sql: &[u8],
+    arena: &Arena,
+    lim: Limits,
+) -> Result<(Ast, AVec<Token>), E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    p.in_trig = true;
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    Ok((ast, p.toks))
+}
+
+/// `SELECT *[, extra ...] FROM table [AS alias] [WHERE filter]` as an
+/// AST (v0.16, `triggers`): the rows an UPDATE / DELETE of a view
+/// hands its INSTEAD OF triggers.
+#[cfg(feature = "triggers")]
+pub fn star_select(
+    table: ABytes,
+    alias: Option<ABytes>,
+    filter: Option<Expr>,
+    extra: AVec<Expr>,
+    arena: &Arena,
+) -> SelectStmt {
+    let toks = AVec::new();
+    let p = Parser::new(toks, arena, &[], Limits::PIN);
+    let mut s = p.table_select(table, false);
+    if let Some(f) = s.from.as_mut_slice().first_mut() {
+        f.alias = alias;
+    }
+    s.filter = filter;
+    for e in extra.iter() {
+        s.items
+            .push(SelectItem::Expr(e.clone(), None, ABytes::EMPTY));
+    }
+    s
 }
 
 #[cfg(test)]

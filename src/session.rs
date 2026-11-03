@@ -39,7 +39,12 @@ use crate::query::{Ctx, RExpr, RowData};
 /// tiny profile's abort stays the inline two statements it was.
 macro_rules! abort_write {
     ($s:ident, $e:expr) => {{
-        #[cfg(feature = "v16")]
+        // A statement of a trigger program (v0.16, `triggers`) undoes
+        // nothing itself: the statement that fired the trigger does,
+        // as the failure's resolution says (`session::trigger`).
+        #[cfg(feature = "triggers")]
+        let undone = $s.conn.in_trigger() || $s.stmt_rollback($e).await;
+        #[cfg(all(feature = "v16", not(feature = "triggers")))]
         let undone = $s.stmt_rollback($e).await;
         #[cfg(not(feature = "v16"))]
         let undone = {
@@ -63,6 +68,8 @@ mod maint;
 mod pragma;
 #[cfg(feature = "v16")]
 mod temp;
+#[cfg(feature = "triggers")]
+mod trigger;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -147,6 +154,21 @@ pub struct Config {
     /// limit").
     #[cfg(feature = "v04")]
     pub max_parser_depth: usize,
+    /// How deep trigger programs may nest (v0.16, `triggers`): a
+    /// trigger that would run as program number
+    /// `max_trigger_depth + 1` of a nest fails its statement with
+    /// `SchemaKind::TriggerDepth` (the pin's limit is 1000; a program
+    /// counts before its WHEN clause is read). Each
+    /// level costs hipp's planner and executor stack — measured on
+    /// x86_64 at about 20 KiB in a release build and 255 KiB in a
+    /// debug one (a recursive AFTER INSERT trigger) — so the default
+    /// (100, about 2 MiB) suits an 8 MiB thread in a release build
+    /// (about 26 MiB in a debug one); raise it to 1000 for the pin's
+    /// limit on a thread with the stack for it (the CLI does). Only
+    /// recursive triggers (`PRAGMA recursive_triggers`) nest deeper
+    /// than the schema's number of triggers.
+    #[cfg(feature = "triggers")]
+    pub max_trigger_depth: usize,
 }
 
 /// The `VACUUM INTO` writer's type (v0.16, `v16`; see
@@ -179,6 +201,8 @@ impl Default for Config {
             max_expr_depth: DEFAULT_EXPR_DEPTH,
             #[cfg(feature = "v04")]
             max_parser_depth: DEFAULT_PARSER_DEPTH,
+            #[cfg(feature = "triggers")]
+            max_trigger_depth: 100,
         }
     }
 }
@@ -240,6 +264,8 @@ impl Config {
             max_expr_depth: 64,
             #[cfg(feature = "v04")]
             max_parser_depth: 64,
+            #[cfg(feature = "triggers")]
+            max_trigger_depth: 8,
         }
     }
 
@@ -270,6 +296,12 @@ impl Config {
     #[cfg(feature = "v16")]
     pub fn max_nesting(mut self, levels: usize) -> Config {
         self.max_nesting = levels;
+        self
+    }
+    /// Set `max_trigger_depth` (v0.16, `triggers`).
+    #[cfg(feature = "triggers")]
+    pub fn max_trigger_depth(mut self, levels: usize) -> Config {
+        self.max_trigger_depth = levels;
         self
     }
     /// Set `max_expr_depth` and `max_parser_depth` (v0.16).
@@ -634,6 +666,27 @@ enum Plan {
     /// The savepoint and maintenance statements (v0.16, `v16`).
     #[cfg(feature = "v16")]
     Maint(maint::Maint),
+    /// `CREATE TRIGGER` (v0.16, `triggers`): the span of the
+    /// statement text the stored text keeps (from the bare name to
+    /// END), the name and the table; `skip` is the IF NOT EXISTS
+    /// no-op.
+    #[cfg(feature = "triggers")]
+    CreateTrigger {
+        span: (usize, usize),
+        name: AVec<u8>,
+        table: AVec<u8>,
+        skip: bool,
+    },
+    /// `DROP TRIGGER` (v0.16, `triggers`); `None` is the IF EXISTS
+    /// no-op.
+    #[cfg(feature = "triggers")]
+    DropTrigger {
+        name: Option<AVec<u8>>,
+    },
+    /// A write of a view through its INSTEAD OF triggers (v0.16,
+    /// `triggers`).
+    #[cfg(feature = "triggers")]
+    Instead(Box<trigger::InsteadPlan>),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -1045,6 +1098,9 @@ pub struct Connection<S: Storage> {
     /// This connection is another's TEMP database (v0.16, `v16`).
     #[cfg(feature = "v16")]
     is_temp: bool,
+    /// The running trigger programs (v0.16, `triggers`).
+    #[cfg(feature = "triggers")]
+    trig: trigger::TrigState,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1085,6 +1141,8 @@ impl<S: Storage> Connection<S> {
             temp: None,
             #[cfg(feature = "v16")]
             is_temp: false,
+            #[cfg(feature = "triggers")]
+            trig: trigger::TrigState::default(),
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -1235,6 +1293,8 @@ impl<S: Storage> Connection<S> {
             upsert_failed: false,
             #[cfg(feature = "v16")]
             autoinc: None,
+            #[cfg(feature = "triggers")]
+            trig: None,
         })
     }
 
@@ -1303,7 +1363,59 @@ impl<S: Storage> Connection<S> {
         }
     }
 
+    #[cfg_attr(not(feature = "triggers"), inline(always))]
     fn plan(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
+        // v0.16 (`triggers`): the triggers a write may fire resolve
+        // when it is prepared, as on the pin.
+        #[cfg(feature = "triggers")]
+        {
+            use crate::sql::ast::TrigEvent;
+            let body = match ast {
+                Ast::With { body, .. } => body.as_ref(),
+                a => a,
+            };
+            let names = |a: &AVec<(crate::arena::ABytes, Expr)>| {
+                let mut out = AVec::new();
+                for (n, _) in a.iter() {
+                    out.push(copy_vec(handle_bytes(arena, *n)));
+                }
+                out
+            };
+            match body {
+                Ast::Insert { table, upsert, .. } => {
+                    let t = handle_bytes(arena, *table);
+                    self.validate_triggers(t, TrigEvent::Insert, None, arena)?;
+                    if let Some(u) = upsert
+                        && let crate::sql::UpsertAction::Update { assignments, .. } = &u.action
+                    {
+                        let n = names(assignments);
+                        self.validate_triggers(t, TrigEvent::Update, Some(n.as_slice()), arena)?;
+                    }
+                }
+                Ast::Update {
+                    table, assignments, ..
+                } => {
+                    let n = names(assignments);
+                    let t = handle_bytes(arena, *table);
+                    self.validate_triggers(t, TrigEvent::Update, Some(n.as_slice()), arena)?;
+                }
+                Ast::Delete { table, .. } => {
+                    let t = handle_bytes(arena, *table);
+                    self.validate_triggers(t, TrigEvent::Delete, None, arena)?;
+                }
+                _ => {}
+            }
+        }
+        self.plan_inner(arena, ast)
+    }
+
+    fn plan_inner(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
+        // v0.16 (`triggers`): a write of a view with INSTEAD OF
+        // triggers for it (its sources are expanded there).
+        #[cfg(feature = "triggers")]
+        if let Some(p) = self.plan_instead(arena, ast)? {
+            return Ok(p);
+        }
         // v0.16: views and CTEs are read as derived tables — every
         // reference is expanded before anything else is planned.
         #[cfg(feature = "v16")]
@@ -1387,6 +1499,12 @@ impl<S: Storage> Connection<S> {
             // Unwrapped by `expand_ast` above.
             #[cfg(feature = "v16")]
             Ast::With { .. } => Err(Error::Unsupported),
+            #[cfg(feature = "triggers")]
+            Ast::CreateTrigger(t) => self.plan_create_trigger(arena, t),
+            #[cfg(feature = "triggers")]
+            Ast::DropTrigger { name, if_exists } => {
+                self.plan_drop_trigger(arena, *name, *if_exists)
+            }
             #[cfg(feature = "v16")]
             Ast::Pragma {
                 schema,
@@ -1607,6 +1725,18 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::UnknownTable,
                     })?
                     .usable()?;
+                // v0.16, every profile: a table whose triggers this
+                // build cannot run is not written (never skipping
+                // them silently).
+                #[cfg(not(feature = "triggers"))]
+                let blocked = t.triggered;
+                #[cfg(feature = "triggers")]
+                let blocked = self.catalog.trigger_blocked(&self.catalog_arena, tname);
+                if blocked {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::TableHasTriggers,
+                    });
+                }
                 // An AUTOINCREMENT table (in a file the pin made) is
                 // read-only without `v16`: those builds keep no
                 // `sqlite_sequence` (v0.16 fix: hipp inserted rows
@@ -2243,6 +2373,12 @@ impl<S: Storage> Connection<S> {
         table: &crate::arena::ABytes,
     ) -> Result<&crate::schema::TableDef, S::Error> {
         let tname = handle_bytes(arena, *table);
+        // v0.16, every profile: as for INSERT.
+        if self.catalog.trigger_blocked(&self.catalog_arena, tname) {
+            return Err(Error::Schema {
+                kind: SchemaKind::TableHasTriggers,
+            });
+        }
         match self.catalog.find(&self.catalog_arena, tname) {
             Some(t) => t.usable(),
             None => {
@@ -4665,6 +4801,10 @@ pub struct Statement<'c, S: Storage> {
     /// The running INSERT's AUTOINCREMENT state (v0.16, `v16`).
     #[cfg(feature = "v16")]
     autoinc: Option<Autoinc>,
+    /// The triggers this write may fire (v0.16, `triggers`), loaded
+    /// when its execution starts; `None` when it fires none.
+    #[cfg(feature = "triggers")]
+    trig: Option<alloc::rc::Rc<trigger::Target>>,
 }
 
 /// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
@@ -5165,6 +5305,77 @@ fn integral_f64(f: f64) -> Option<i64> {
 }
 
 impl<'c, S: Storage> Statement<'c, S> {
+    /// A statement over its parts (v0.16, `triggers`: the statements
+    /// of a trigger program, `session::trigger`; the same fields as
+    /// `Connection::prepare` sets, which builds its statement in
+    /// place — a call here costs the tiny profile the struct's move).
+    #[cfg(feature = "triggers")]
+    fn assemble(
+        conn: &'c mut Connection<S>,
+        arena: Arena,
+        sql_text: crate::arena::ABytes,
+        ast: Ast,
+        plan: Plan,
+        #[cfg(feature = "params")] binds: Binds,
+    ) -> Statement<'c, S> {
+        let row_ckpt = arena.checkpoint();
+        Statement {
+            #[cfg(feature = "params")]
+            binds,
+            conn,
+            arena,
+            sql_text,
+            ast,
+            plan,
+            phase: Phase::Fresh,
+            cursor: None,
+            row_buf: AVec::new(),
+            current: AVec::new(),
+            current_rowid: None,
+            row_ckpt,
+            #[cfg(feature = "indexes")]
+            index_rowids: AVec::new(),
+            #[cfg(feature = "indexes")]
+            index_pos: 0,
+            #[cfg(feature = "indexes")]
+            index_loaded: false,
+            #[cfg(feature = "v04")]
+            query_rows: AVec::new(),
+            #[cfg(feature = "v04")]
+            query_rowids: AVec::new(),
+            #[cfg(feature = "v04")]
+            query_pos: 0,
+            #[cfg(feature = "v04")]
+            query_loaded: false,
+            #[cfg(feature = "v06")]
+            hoist: AVec::new(),
+            #[cfg(feature = "v07")]
+            ret_rows: AVec::new(),
+            #[cfg(feature = "v07")]
+            ret_rowids: AVec::new(),
+            #[cfg(feature = "v07")]
+            ret_pos: 0,
+            #[cfg(feature = "v07")]
+            ret_loaded: false,
+            #[cfg(feature = "v16")]
+            deferred: None,
+            #[cfg(feature = "v16")]
+            rec_rows: AVec::new(),
+            #[cfg(feature = "v16")]
+            mats: AVec::new(),
+            #[cfg(feature = "v16")]
+            stmt_sp: None,
+            #[cfg(feature = "v16")]
+            upsert_failed: false,
+            #[cfg(feature = "v16")]
+            autoinc: None,
+            #[cfg(feature = "triggers")]
+            trig: None,
+        }
+    }
+}
+
+impl<'c, S: Storage> Statement<'c, S> {
     /// The write plan's table rules (v0.16), cloned out of the
     /// plan; `None` for a table with none (or a plan without).
     #[cfg(feature = "v04")]
@@ -5209,7 +5420,19 @@ impl<'c, S: Storage> Statement<'c, S> {
                     matches!(
                         self.plan,
                         Plan::CreateTableAs { .. } | Plan::Maint(_) | Plan::Alter16 { .. }
-                    )
+                    ) || {
+                        #[cfg(feature = "triggers")]
+                        {
+                            matches!(
+                                self.plan,
+                                Plan::CreateTrigger { .. } | Plan::DropTrigger { .. }
+                            )
+                        }
+                        #[cfg(not(feature = "triggers"))]
+                        {
+                            false
+                        }
+                    }
                 }
                 #[cfg(not(feature = "v16"))]
                 {
@@ -5296,6 +5519,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(s)
             }
             Plan::Commit => self.step_commit().await,
+            #[cfg(feature = "triggers")]
+            Plan::CreateTrigger { .. } => self.step_create_trigger().await,
+            #[cfg(feature = "triggers")]
+            Plan::DropTrigger { .. } => self.step_drop_trigger().await,
+            #[cfg(feature = "triggers")]
+            Plan::Instead(_) => self.step_instead().await,
             Plan::Rollback => self.step_rollback().await,
         };
         #[cfg(feature = "v16")]
@@ -6250,6 +6479,10 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// (OR FAIL parses only with UPDATE (v0.5) / INSERT OR (v0.7).)
     #[cfg(feature = "v05")]
     async fn write_failed(&mut self, e: Error<S::Error>) -> Error<S::Error> {
+        #[cfg(feature = "triggers")]
+        if self.trigger_failed(&e).await {
+            return e;
+        }
         let conflict = match &self.plan {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
             _ => ConflictAction::Abort,
@@ -6292,8 +6525,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             return match committed {
                 Ok(()) => {
+                    // A failed statement of a trigger program counts
+                    // nothing (the pin's count is taken when a
+                    // program's statement completes).
+                    #[cfg(feature = "triggers")]
+                    let kept = !self.conn.in_trigger();
+                    #[cfg(not(feature = "triggers"))]
+                    let kept = true;
                     #[cfg(feature = "v16")]
-                    self.conn.env.finish(true);
+                    self.conn.env.finish(kept);
+                    let _ = kept;
                     #[cfg(feature = "v16")]
                     self.keep_stmt();
                     Ok(true)
@@ -6312,6 +6553,8 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
         #[cfg(feature = "v16")]
         self.conn.env.pending.set(0);
+        #[cfg(feature = "triggers")]
+        self.load_triggers()?;
         #[cfg(feature = "v16")]
         self.autoinc_begin().await?;
         // v0.16: VALUES rows that read last_insert_rowid() evaluate
@@ -6487,7 +6730,6 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     async fn exec_insert_row(&mut self, values: AVec<OwnedValue>) -> Result<(), S::Error> {
         let Plan::Insert {
-            root,
             rowid_alias,
             cols,
             targets,
@@ -6557,6 +6799,41 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Some(i) => row.as_mut_slice()[i] = apply_affinity(v, cols.as_slice()[i].affinity),
             }
         }
+        // BEFORE INSERT triggers see the row with its generated
+        // columns, and rowid -1 while it is still to be chosen; the
+        // rowid is chosen (and the constraints checked) after them.
+        #[cfg(feature = "triggers")]
+        if self.fires(
+            crate::sql::ast::TrigTime::Before,
+            crate::sql::ast::TrigEvent::Insert,
+        ) {
+            let mut nrow = row.clone();
+            let nrowid = explicit_rowid.unwrap_or(-1);
+            if let Some(g) = self.plan_rules().and_then(|r| r.gcols) {
+                g.fill::<S::Error>(nrow.as_mut_slice(), nrowid, false)?;
+            }
+            if !self
+                .fire(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Insert,
+                    None,
+                    None,
+                    Some((nrow.as_slice(), nrowid)),
+                )
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        let Plan::Insert {
+            root,
+            rowid_alias,
+            cols,
+            ..
+        } = &self.plan
+        else {
+            unreachable!()
+        };
         let rowid = {
             let pager = &mut self.conn.pager;
             match explicit_rowid {
@@ -6746,6 +7023,33 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.conn.env.note_insert(rowid);
         #[cfg(feature = "v07")]
         self.push_insert_returning(row.as_slice(), rowid).await?;
+        #[cfg(feature = "triggers")]
+        self.after_insert(row.as_slice(), rowid).await?;
+        Ok(())
+    }
+
+    /// AFTER INSERT triggers of one inserted row (v0.16,
+    /// `triggers`): they see the row as stored, generated columns
+    /// computed.
+    #[cfg(feature = "triggers")]
+    async fn after_insert(&mut self, row: &[OwnedValue], rowid: i64) -> Result<(), S::Error> {
+        use crate::sql::ast::{TrigEvent, TrigTime};
+        if !self.fires(TrigTime::After, TrigEvent::Insert) {
+            return Ok(());
+        }
+        let mut nrow = AVec::new();
+        nrow.extend_from_slice(row);
+        if let Some(g) = self.plan_rules().and_then(|r| r.gcols) {
+            g.fill::<S::Error>(nrow.as_mut_slice(), rowid, true)?;
+        }
+        self.fire(
+            TrigTime::After,
+            TrigEvent::Insert,
+            None,
+            None,
+            Some((nrow.as_slice(), rowid)),
+        )
+        .await?;
         Ok(())
     }
 
@@ -6973,6 +7277,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         if conflicts.is_empty() {
             self.insert_row_raw(row.as_slice(), rowid).await?;
             self.push_insert_returning(row.as_slice(), rowid).await?;
+            #[cfg(feature = "triggers")]
+            self.after_insert(row.as_slice(), rowid).await?;
             return Ok(());
         }
         // Upsert arbitration: the first conflict the clause
@@ -7018,12 +7324,38 @@ impl<'c, S: Storage> Statement<'c, S> {
                         victims.push(c.0);
                     }
                 }
+                #[cfg(feature = "triggers")]
+                let mut triggered = false;
                 for v in victims.iter() {
+                    #[cfg(feature = "triggers")]
+                    {
+                        let kind = if conflicts.iter().any(|c| c.0 == *v && c.1) {
+                            SchemaKind::DuplicateRowid
+                        } else {
+                            SchemaKind::UniqueViolation
+                        };
+                        if self.replace_victim(*v, kind).await? {
+                            triggered = true;
+                            continue;
+                        }
+                    }
                     self.delete_row_completely(root, rowid_alias, ncols, defaults.as_slice(), *v)
                         .await?;
                 }
+                // DELETE triggers may have written the table: the pin
+                // checks the row again, under ABORT.
+                #[cfg(feature = "triggers")]
+                if triggered
+                    && let Some(kind) = self
+                        .insert_conflict(root, row.as_slice(), rowid, None)
+                        .await?
+                {
+                    return Err(Error::Schema { kind });
+                }
                 self.insert_row_raw(row.as_slice(), rowid).await?;
                 self.push_insert_returning(row.as_slice(), rowid).await?;
+                #[cfg(feature = "triggers")]
+                self.after_insert(row.as_slice(), rowid).await?;
                 Ok(())
             }
             // ABORT, FAIL, ROLLBACK: the statement fails.
@@ -7035,6 +7367,61 @@ impl<'c, S: Storage> Statement<'c, S> {
                 },
             }),
         }
+    }
+
+    /// Whether inserting `row` at `rowid` would conflict (v0.16,
+    /// `triggers`): the kind of the first conflict (the rowid, then
+    /// each UNIQUE index in order).
+    /// `own`: the rowid the row is stored at now (an UPDATE's), which
+    /// is no conflict.
+    #[cfg(feature = "triggers")]
+    async fn insert_conflict(
+        &mut self,
+        root: u32,
+        row: &[OwnedValue],
+        rowid: i64,
+        own: Option<i64>,
+    ) -> Result<Option<SchemaKind>, S::Error> {
+        if own != Some(rowid)
+            && btree::seek_rowid(&mut self.conn.pager, root, rowid)
+                .await?
+                .is_some()
+        {
+            return Ok(Some(SchemaKind::DuplicateRowid));
+        }
+        #[cfg(not(feature = "indexes"))]
+        let _ = row;
+        #[cfg(feature = "indexes")]
+        let indexes: AVec<IndexPlan> = match &self.plan {
+            Plan::Insert { indexes, .. } | Plan::Update { indexes, .. } => indexes.clone(),
+            _ => AVec::new(),
+        };
+        #[cfg(feature = "indexes")]
+        for ix in indexes.iter() {
+            if !ix.unique {
+                continue;
+            }
+            let mut key = AVec::new();
+            for c in ix.cols.iter() {
+                key.push(match c.col {
+                    None => OwnedValue::Integer(rowid),
+                    Some(i) => row.get(i).cloned().unwrap_or(OwnedValue::Null),
+                });
+            }
+            if key_has_no_null(key.as_slice())
+                && let Some(other) = btree::index_first_with_prefix(
+                    &mut self.conn.pager,
+                    ix.root,
+                    ix.desc.as_slice(),
+                    key.as_slice(),
+                )
+                .await?
+                && own != Some(other)
+            {
+                return Ok(Some(SchemaKind::UniqueViolation));
+            }
+        }
+        Ok(None)
     }
 
     /// The DO UPDATE half of an upsert (v0.7): transform the
@@ -7106,6 +7493,37 @@ impl<'c, S: Storage> Statement<'c, S> {
                     new_rec.as_mut_slice()[*i] = apply_affinity(v.clone(), affs[*i]);
                 }
                 _ => new_rowid = update_rowid::<S::Error>(v)?,
+            }
+        }
+        // v0.16 (`triggers`): DO UPDATE fires the UPDATE triggers.
+        #[cfg(feature = "triggers")]
+        let (up_assigned, up_rowid_set) =
+            assigned_columns(up.sets.as_slice(), defaults.len(), rowid_alias);
+        #[cfg(feature = "triggers")]
+        if self.fires(
+            crate::sql::ast::TrigTime::Before,
+            crate::sql::ast::TrigEvent::Update,
+        ) {
+            let mut nrec = new_rec.clone();
+            if let Some(g) = gcols {
+                for (i, v) in nrec.as_mut_slice().iter_mut().enumerate() {
+                    if g.is_gen(i) {
+                        *v = OwnedValue::Null;
+                    }
+                }
+            }
+            if !self
+                .fire_as(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Update,
+                    Some((up_assigned.as_slice(), up_rowid_set)),
+                    Some((orec.as_slice(), crowid)),
+                    Some((nrec.as_slice(), new_rowid)),
+                    Some(ConflictAction::Abort),
+                )
+                .await?
+            {
+                return Ok(());
             }
         }
         // v0.10 NOT NULL: the DO UPDATE result row is checked
@@ -7200,6 +7618,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.conn.env.note_change();
         self.push_insert_returning(new_rec.as_slice(), new_rowid)
             .await?;
+        #[cfg(feature = "triggers")]
+        if self.fires(
+            crate::sql::ast::TrigTime::After,
+            crate::sql::ast::TrigEvent::Update,
+        ) {
+            self.fire_as(
+                crate::sql::ast::TrigTime::After,
+                crate::sql::ast::TrigEvent::Update,
+                Some((up_assigned.as_slice(), up_rowid_set)),
+                Some((orec.as_slice(), crowid)),
+                Some((new_rec.as_slice(), new_rowid)),
+                Some(ConflictAction::Abort),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -7248,6 +7681,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                         self.ret_pos = 0;
                     }
                     Err(e) => {
+                        #[cfg(feature = "triggers")]
+                        if self.trigger_failed(&e).await {
+                            return Err(e);
+                        }
                         #[cfg(feature = "v16")]
                         self.conn.env.finish(false);
                         abort_write!(self, &e);
@@ -7264,6 +7701,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
+                #[cfg(feature = "triggers")]
+                if self.trigger_failed(&e).await {
+                    return Err(e);
+                }
                 #[cfg(feature = "v16")]
                 self.conn.env.finish(false);
                 abort_write!(self, &e);
@@ -7373,6 +7814,8 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_update(&mut self) -> Result<(), S::Error> {
         #[cfg(feature = "v16")]
         self.conn.env.pending.set(0);
+        #[cfg(feature = "triggers")]
+        self.load_triggers()?;
         let (root, rowid_alias, ncols, defaults, affs, not_null, sets, filter, conflict_action) =
             match &self.plan {
                 Plan::Update {
@@ -7457,9 +7900,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         // from its current content (probed: UPDATE OR REPLACE t
         // SET id=id+1, v=v||'x' over ids 1,2 leaves 3|axx).
         let mut stale = false;
+        // v0.16 (`triggers`): with triggers each row is read again
+        // when its turn comes, as on the pin (a trigger may have
+        // changed or deleted it).
+        #[cfg(feature = "triggers")]
+        let triggered = self.trig.is_some();
+        #[cfg(not(feature = "triggers"))]
+        let triggered = false;
         for snap_row in rows.iter() {
             let reloaded;
-            let wrow = if stale {
+            let wrow = if stale || triggered {
                 match self
                     .reload_write_row(root, ncols, defaults.as_slice(), snap_row.rowid)
                     .await?
@@ -7560,6 +8010,53 @@ impl<'c, S: Storage> Statement<'c, S> {
                         _ => new_rowid = update_rowid::<S::Error>(v)?,
                     }
                 }
+                // v0.16 (`triggers`): BEFORE UPDATE triggers (NEW's
+                // generated columns NULL, as on the pin); then the row
+                // is read again — gone, it is skipped; the columns the
+                // statement does not assign take their current values.
+                #[cfg(feature = "triggers")]
+                if self.fires(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Update,
+                ) {
+                    let mut nrec = new_rec.clone();
+                    if let Some(g) = rules.as_ref().and_then(|r| r.gcols.as_ref()) {
+                        for (i, v) in nrec.as_mut_slice().iter_mut().enumerate() {
+                            if g.is_gen(i) {
+                                *v = OwnedValue::Null;
+                            }
+                        }
+                    }
+                    if !self
+                        .fire(
+                            crate::sql::ast::TrigTime::Before,
+                            crate::sql::ast::TrigEvent::Update,
+                            Some((assigned.as_slice(), rowid_set)),
+                            Some((wrow.rec.as_slice(), wrow.rowid)),
+                            Some((nrec.as_slice(), new_rowid)),
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    let Some(now) = self
+                        .reload_write_row(root, ncols, defaults.as_slice(), cur_rowid)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    for (i, v) in new_rec.as_mut_slice().iter_mut().enumerate() {
+                        if !assigned.as_slice().get(i).copied().unwrap_or(false) {
+                            *v = now
+                                .rec
+                                .as_slice()
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(OwnedValue::Null);
+                        }
+                    }
+                    cur_rec = now.rec;
+                }
                 // v0.10 NOT NULL: the combination's result row
                 // is resolved under the statement's conflict
                 // action before uniqueness is considered (the
@@ -7642,7 +8139,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                             #[cfg(feature = "v07")]
                             {
                                 stale = true;
+                                #[cfg(feature = "triggers")]
+                                let mut triggered = false;
                                 for v in conflict_rows.iter() {
+                                    #[cfg(feature = "triggers")]
+                                    if self
+                                        .replace_victim(
+                                            *v,
+                                            first_err.unwrap_or(SchemaKind::UniqueViolation),
+                                        )
+                                        .await?
+                                    {
+                                        triggered = true;
+                                        continue;
+                                    }
                                     self.delete_row_completely(
                                         root,
                                         rowid_alias,
@@ -7651,6 +8161,21 @@ impl<'c, S: Storage> Statement<'c, S> {
                                         *v,
                                     )
                                     .await?;
+                                }
+                                // DELETE triggers may have written the
+                                // table: checked again, under ABORT.
+                                #[cfg(feature = "triggers")]
+                                if triggered
+                                    && let Some(kind) = self
+                                        .insert_conflict(
+                                            root,
+                                            new_rec.as_slice(),
+                                            new_rowid,
+                                            Some(cur_rowid),
+                                        )
+                                        .await?
+                                {
+                                    return Err(Error::Schema { kind });
                                 }
                             }
                             #[cfg(not(feature = "v07"))]
@@ -7679,6 +8204,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                 )
                 .await?;
                 stale |= new_rowid != cur_rowid;
+                #[cfg(feature = "triggers")]
+                if self.fires(
+                    crate::sql::ast::TrigTime::After,
+                    crate::sql::ast::TrigEvent::Update,
+                ) {
+                    self.fire(
+                        crate::sql::ast::TrigTime::After,
+                        crate::sql::ast::TrigEvent::Update,
+                        Some((assigned.as_slice(), rowid_set)),
+                        Some((wrow.rec.as_slice(), wrow.rowid)),
+                        Some((new_rec.as_slice(), new_rowid)),
+                    )
+                    .await?;
+                }
                 cur_rec = new_rec;
                 cur_rowid = new_rowid;
                 applied = true;
@@ -7708,6 +8247,8 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_delete(&mut self) -> Result<(), S::Error> {
         #[cfg(feature = "v16")]
         self.conn.env.pending.set(0);
+        #[cfg(feature = "triggers")]
+        self.load_triggers()?;
         let (root, rowid_alias, ncols, defaults, affs, filter) = match &self.plan {
             Plan::Delete {
                 root,
@@ -7747,7 +8288,58 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Delete { returning, .. } => returning.clone(),
             _ => unreachable!(),
         };
-        for wrow in rows.iter() {
+        for snap_row in rows.iter() {
+            // v0.16 (`triggers`): with triggers each row is read again
+            // when its turn comes (gone: skipped), BEFORE DELETE
+            // triggers see it, and it is read once more after them;
+            // AFTER DELETE triggers see the row as first read.
+            #[cfg(feature = "triggers")]
+            let (old_row, cur_row);
+            #[cfg(feature = "triggers")]
+            let wrow = if self.trig.is_some() {
+                let Some(r) = self
+                    .reload_write_row(root, ncols, defaults.as_slice(), snap_row.rowid)
+                    .await?
+                else {
+                    continue;
+                };
+                old_row = Some(r);
+                let Some(old_row) = &old_row else {
+                    continue;
+                };
+                if self.fires(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Delete,
+                ) {
+                    if !self
+                        .fire(
+                            crate::sql::ast::TrigTime::Before,
+                            crate::sql::ast::TrigEvent::Delete,
+                            None,
+                            Some((old_row.rec.as_slice(), old_row.rowid)),
+                            None,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    let Some(r) = self
+                        .reload_write_row(root, ncols, defaults.as_slice(), snap_row.rowid)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    cur_row = r;
+                    &cur_row
+                } else {
+                    old_row
+                }
+            } else {
+                old_row = None;
+                snap_row
+            };
+            #[cfg(not(feature = "triggers"))]
+            let wrow = snap_row;
             #[cfg(feature = "indexes")]
             for ix in indexes.iter() {
                 let key = key_from_rec(
@@ -7783,6 +8375,22 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let vals = self.eval_returning(returning.as_slice(), &rd).await?;
                 self.ret_rows.push(vals);
                 self.ret_rowids.push(Some(wrow.rowid));
+            }
+            #[cfg(feature = "triggers")]
+            if let Some(o) = &old_row
+                && self.fires(
+                    crate::sql::ast::TrigTime::After,
+                    crate::sql::ast::TrigEvent::Delete,
+                )
+            {
+                self.fire(
+                    crate::sql::ast::TrigTime::After,
+                    crate::sql::ast::TrigEvent::Delete,
+                    None,
+                    Some((o.rec.as_slice(), o.rowid)),
+                    None,
+                )
+                .await?;
             }
         }
         if !self.conn.explicit_txn {
@@ -7865,7 +8473,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     if is_table_row && let Value::Text(n) = &values.as_slice()[1] {
                         stored = Some(copy_vec(n));
                     }
-                    let is_index_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index"))
+                    // Its indexes and (v0.16, every profile) its
+                    // triggers go with it, as on the pin.
+                    let is_index_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index") || eq_ci(t, b"trigger"))
                         && matches!(&values.as_slice()[2], Value::Text(n) if eq_ci(n, name_b.as_slice()));
                     if is_table_row || is_index_row {
                         schema_rowids.push(rowid);
@@ -10082,14 +10692,22 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut cursor = ScanCursor::new(1);
         let mut buf = AVec::new();
         let mut found = None;
+        // Its triggers go with it (v0.16, every profile).
+        let mut trigs = AVec::new();
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
             let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
+            if values.len() >= 3
+                && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"trigger"))
+                && matches!(&values.as_slice()[2], Value::Text(n) if eq_ci(n, name_b.as_slice()))
+            {
+                trigs.push(rowid);
+            }
             if values.len() >= 2
+                && found.is_none()
                 && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"view"))
                 && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, name_b.as_slice()))
             {
                 found = Some(rowid);
-                break;
             }
         }
         let Some(srowid) = found else {
@@ -10098,6 +10716,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         };
         btree::btree_delete(&mut self.conn.pager, 1, srowid).await?;
+        for r in trigs.iter() {
+            btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
+        }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;

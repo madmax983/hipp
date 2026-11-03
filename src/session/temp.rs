@@ -489,6 +489,63 @@ impl<S: Storage> Connection<S> {
             Err(_) => return Ok(Route::Main),
         };
         let t = toks.as_slice();
+        // Triggers (v0.16, `triggers`): one on a TEMP table (TEMP or
+        // not, as on the pin) lives in the temp database; a TEMP
+        // trigger on a main table is refused (hipp runs a statement
+        // in one database only); a main trigger may not name a
+        // `temp.` object ("cannot reference objects in database
+        // temp").
+        #[cfg(feature = "triggers")]
+        match &ast {
+            Ast::CreateTrigger(ct) => {
+                let tn = handle_bytes(arena, ct.table);
+                let tq = tok_index(t, ct.table).and_then(|i| qualifier(t, i, arena));
+                let on_temp = tq == Some(true) || (tq.is_none() && self.temp_has(tn, false));
+                let named_temp = tok_index(t, ct.name)
+                    .and_then(|i| qualifier(t, i, arena))
+                    .is_some();
+                if temp_kw && named_temp {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::TriggerTempReference,
+                    });
+                }
+                if !on_temp {
+                    if temp_kw {
+                        return Err(Error::Unsupported);
+                    }
+                    if (0..t.len()).any(|i| qualifier(t, i, arena) == Some(true)) {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::TriggerTempReference,
+                        });
+                    }
+                    return Ok(Route::Main);
+                }
+                // Stored as written (the temp database reads its own
+                // `temp.` names).
+                return Ok(Route::Temp(text));
+            }
+            Ast::DropTrigger { name, .. } => {
+                let n = handle_bytes(arena, *name);
+                let q = tok_index(t, *name).and_then(|i| qualifier(t, i, arena));
+                let in_temp = self
+                    .temp
+                    .as_ref()
+                    .is_some_and(|c| c.catalog.find_trigger(&c.catalog_arena, n).is_some());
+                let in_main = self.catalog.find_trigger(&self.catalog_arena, n).is_some();
+                let to_temp = q == Some(true) || (q.is_none() && in_temp && !in_main);
+                if !to_temp {
+                    return Ok(Route::Main);
+                }
+                let mut cuts = AVec::new();
+                if let Some(c) = tok_index(t, *name).and_then(|i| qual_cut(t, i))
+                    && q == Some(true)
+                {
+                    cuts.push(c);
+                }
+                return Ok(Route::Temp(apply_cuts(text.as_slice(), &mut cuts)));
+            }
+            _ => {}
+        }
         // Transaction statements run on both (`mirror_temp`).
         if matches!(
             ast,
