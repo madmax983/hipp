@@ -35,6 +35,8 @@ pub mod session;
 pub mod sql;
 #[allow(unsafe_code)] // no-op waker construction for block_on only
 pub mod storage;
+#[cfg(feature = "window")]
+pub mod window;
 
 pub use error::{Error, SchemaKind, Scope};
 pub use record::{OwnedValue, Value};

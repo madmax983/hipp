@@ -254,7 +254,12 @@ fn known_but_unimplemented_pragmas_are_refused() {
         "function_list",
         "compile_options",
         "pragma_list",
-        "foreign_key_check",
+        // Implemented by the `foreign_keys` leaf.
+        if cfg!(feature = "foreign_keys") {
+            "optimize"
+        } else {
+            "foreign_key_check"
+        },
         "wal_checkpoint",
         "query_only",
         "writable_schema",
@@ -521,6 +526,9 @@ fn ignore_check_constraints_skips_check() {
     }
 }
 
+/// Without the `foreign_keys` leaf (`tests/foreign_keys_v16.rs`
+/// covers the enforcement with it).
+#[cfg(not(feature = "foreign_keys"))]
 #[test]
 fn foreign_keys_on_refuses_writes_hipp_cannot_check() {
     // The pin enforces foreign keys once the flag is on; hipp

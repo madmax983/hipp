@@ -49,19 +49,30 @@ fn open_db(path: &str) -> Result<Db, String> {
 }
 
 /// The CLI's engine configuration: the defaults, the system clock,
-/// and the pin's nesting limit for views and CTEs (999 levels read,
-/// 1000 are "nested too deep"), which `main`'s thread has the
-/// stack for, with a statement arena big enough to expand them
-/// (the default 64 KiB holds about 800 nested views).
+/// the pin's nesting limit for views and CTEs (999 levels read,
+/// 1000 are "nested too deep") and its expression and parser depth
+/// limits (1000, 2500), which `main`'s thread has the stack for,
+/// with a statement arena big enough to expand them (the default
+/// 64 KiB holds about 800 nested views, or 2500 tokens).
 fn cli_config() -> Config {
     let d = Config::default();
     let (init, max) = (d.stmt_init, d.stmt_max.max(4 * 1024 * 1024));
-    d.clock(now_ms).max_nesting(1000).statement_arena(init, max)
+    d.clock(now_ms)
+        .max_nesting(1000)
+        .max_trigger_depth(1000)
+        .depth_limits(
+            hipp::sql::parser::PIN_EXPR_DEPTH,
+            hipp::sql::parser::PIN_PARSER_DEPTH,
+        )
+        .statement_arena(init, max)
 }
 
 /// The stack of the thread the CLI runs on: room for
 /// `cli_config`'s 1000 nested view / CTE levels in a debug build
-/// (each costs the planner and executor tens of KiB). Only the
+/// (each costs the planner and executor tens of KiB), for the
+/// pin's depth limits (about 13 MiB in a debug build) and for its
+/// 999 nested trigger programs (about 250 MiB in a debug build,
+/// 20 MiB in a release one). Only the
 /// pages a statement touches are ever committed.
 const STACK_BYTES: usize = 512 * 1024 * 1024;
 
@@ -91,6 +102,7 @@ fn temp_text(sql: &[u8]) -> Vec<u8> {
         b"CREATE UNIQUE INDEX ",
         b"CREATE INDEX ",
         b"CREATE VIEW ",
+        b"CREATE TRIGGER ",
     ] {
         if sql.starts_with(p) {
             let mut v = p.to_vec();
@@ -460,58 +472,133 @@ where
 }
 
 /// Split a script into statements on `;` outside of string
-/// literals, quoted identifiers and `--` comments.
+/// literals, quoted identifiers and comments. A `CREATE [TEMP]
+/// TRIGGER` statement runs to a `;` that follows `; END` (blanks and
+/// comments between), exactly as the oracle shell's
+/// `sqlite3_complete` state machine reads it.
 fn split_statements(script: &str) -> Vec<String> {
+    split_script(script).0
+}
+
+/// `split_statements`, also returning whether the script ends on a
+/// complete statement (nothing but blanks after the last one).
+fn split_script(script: &str) -> (Vec<String>, bool) {
+    // The states of the pin's `sqlite3_complete`.
+    const START: u8 = 1;
+    const NORMAL: u8 = 2;
+    const EXPLAIN: u8 = 3;
+    const CREATE: u8 = 4;
+    const TRIGGER: u8 = 5;
+    const SEMI: u8 = 6;
+    const END: u8 = 7;
+    // Tokens: 0 `;`, 1 blank / comment, 2 other, 3 EXPLAIN, 4
+    // CREATE, 5 TEMP / TEMPORARY, 6 TRIGGER, 7 END.
+    const TRANS: [[u8; 8]; 8] = [
+        [START, 0, NORMAL, EXPLAIN, CREATE, NORMAL, NORMAL, NORMAL],
+        [
+            START, START, NORMAL, EXPLAIN, CREATE, NORMAL, NORMAL, NORMAL,
+        ],
+        [
+            START, NORMAL, NORMAL, NORMAL, NORMAL, NORMAL, NORMAL, NORMAL,
+        ],
+        [
+            START, EXPLAIN, EXPLAIN, NORMAL, CREATE, NORMAL, NORMAL, NORMAL,
+        ],
+        [
+            START, CREATE, NORMAL, NORMAL, NORMAL, CREATE, TRIGGER, NORMAL,
+        ],
+        [
+            SEMI, TRIGGER, TRIGGER, TRIGGER, TRIGGER, TRIGGER, TRIGGER, TRIGGER,
+        ],
+        [SEMI, SEMI, TRIGGER, TRIGGER, TRIGGER, TRIGGER, TRIGGER, END],
+        [
+            START, END, TRIGGER, TRIGGER, TRIGGER, TRIGGER, TRIGGER, TRIGGER,
+        ],
+    ];
     let b = script.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
+    let mut state = START;
     while i < b.len() {
-        match b[i] {
-            b'\'' => {
+        let tok: usize = match b[i] {
+            b';' => {
                 i += 1;
-                while i < b.len() {
-                    if b[i] == b'\'' {
-                        if i + 1 < b.len() && b[i + 1] == b'\'' {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
+                0
             }
-            b'"' | b'`' => {
-                let close = b[i];
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+                1
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                1
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                1
+            }
+            q @ (b'\'' | b'"' | b'`' | b'[') => {
+                let close = if q == b'[' { b']' } else { q };
                 i += 1;
                 while i < b.len() && b[i] != close {
                     i += 1;
                 }
                 i = (i + 1).min(b.len());
+                2
             }
-            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                while i < b.len() && b[i] != b'\n' {
+            c if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 => {
+                let a = i;
+                while i < b.len()
+                    && (b[i].is_ascii_alphanumeric()
+                        || b[i] == b'_'
+                        || b[i] == b'$'
+                        || b[i] >= 0x80)
+                {
                     i += 1;
                 }
-            }
-            b';' => {
-                let s = script[start..=i].trim();
-                if !s.is_empty() {
-                    out.push(s.to_string());
+                let w = &b[a..i];
+                let is = |k: &str| w.eq_ignore_ascii_case(k.as_bytes());
+                if is("EXPLAIN") {
+                    3
+                } else if is("CREATE") {
+                    4
+                } else if is("TEMP") || is("TEMPORARY") {
+                    5
+                } else if is("TRIGGER") {
+                    6
+                } else if is("END") {
+                    7
+                } else {
+                    2
                 }
-                i += 1;
-                start = i;
             }
-            _ => i += 1,
+            _ => {
+                i += 1;
+                2
+            }
+        };
+        state = TRANS[usize::from(state)][tok];
+        if tok == 0 && state == START {
+            let s = script[start..i].trim();
+            if !s.is_empty() {
+                out.push(s.to_string());
+            }
+            start = i;
         }
     }
     let tail = script[start..].trim();
-    if !tail.is_empty() {
+    let complete = tail.is_empty();
+    if !complete {
         out.push(tail.to_string());
     }
-    out
+    (out, complete)
 }
 
 /// What a dot-command wants the shell loop to do next.
@@ -714,20 +801,32 @@ where
                     let _ = out.write_all(&line);
                 }
             }
-            // Non-table schema objects follow all table data
-            // (the oracle shell's .dump order): explicit indexes,
-            // then views (inert: their CREATE text replays, and
-            // re-creating them in a fresh database is a hipp
-            // CREATE VIEW like any other).
-            for ix in db.indexes().iter() {
-                if let Some(sql) = ix.sql {
-                    let _ = out.write_all(sql);
-                    let _ = out.write_all(b";\n");
+            // Non-table schema objects follow all table data, in
+            // the oracle shell's .dump order (`ORDER BY type COLLATE
+            // NOCASE DESC`): views, then triggers (v0.16: after the
+            // data, so replaying it fires none), then explicit
+            // indexes, each in schema order. A text holding `--`
+            // ends with its `;` on a line of its own, as there.
+            let mut objs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            if let Ok(mut st) = db
+                .prepare("SELECT type, sql FROM main.sqlite_schema WHERE sql NOT NULL")
+                .await
+            {
+                while let Ok(Step::Row) = st.step().await {
+                    if let (Some(t), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
+                        objs.push((t.to_vec(), q.to_vec()));
+                    }
                 }
             }
-            for v in db.views().iter() {
-                let _ = out.write_all(v.sql);
-                let _ = out.write_all(b";\n");
+            for ty in [&b"view"[..], b"trigger", b"index"] {
+                for (t, sql) in objs.iter() {
+                    if !t.eq_ignore_ascii_case(ty) {
+                        continue;
+                    }
+                    let _ = out.write_all(sql);
+                    let comment = sql.windows(2).any(|w| w == b"--");
+                    let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
+                }
             }
             let _ = out.write_all(b"COMMIT;\n");
             Ok(Flow::Continue)
@@ -855,7 +954,7 @@ fn run() -> ExitCode {
             buffer.push('\n');
         }
         buffer.push_str(line);
-        if buffer.trim_end().ends_with(';') {
+        if buffer.trim_end().ends_with(';') && split_script(&buffer).1 {
             let script = std::mem::take(&mut buffer);
             for stmt in split_statements(&script) {
                 match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {

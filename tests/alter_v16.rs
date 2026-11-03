@@ -482,16 +482,30 @@ fn files_the_pin_made() {
     {
         same_on(&format!("pin{i}"), prep, &split(c));
     }
-    let p = common::temp_db("v16al-trigger");
-    common::cli(
-        &p,
-        "CREATE TABLE t(a, b); CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;",
-    );
-    let (_, errs) = hipp_run(&p, &split("ALTER TABLE t RENAME TO u"));
-    assert_eq!(errs, [1], "a file with triggers is refused");
-    assert_eq!(
-        common::cli(&p, "SELECT name FROM sqlite_schema WHERE type = 'table';"),
-        "t\n"
+    // A file with triggers: refused without the `triggers` feature;
+    // with it, its trigger texts are edited as the pin edits them
+    // (tests/triggers_v16.rs has the corpus).
+    #[cfg(not(feature = "triggers"))]
+    {
+        let p = common::temp_db("v16al-trigger");
+        common::cli(
+            &p,
+            "CREATE TABLE t(a, b); CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;",
+        );
+        let (_, errs) = hipp_run(&p, &split("ALTER TABLE t RENAME TO u"));
+        assert_eq!(errs, [1], "a file with triggers is refused");
+        assert_eq!(
+            common::cli(&p, "SELECT name FROM sqlite_schema WHERE type = 'table';"),
+            "t\n"
+        );
+    }
+    #[cfg(feature = "triggers")]
+    same_on(
+        "pin-trigger",
+        "CREATE TABLE t(a, b); CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT new.a, t.b FROM t; END;",
+        &split(
+            "ALTER TABLE t RENAME TO u; ALTER TABLE u RENAME a TO x; SELECT sql FROM sqlite_schema",
+        ),
     );
 }
 

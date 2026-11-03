@@ -31,6 +31,12 @@ pub(super) enum Prag {
     CollationList,
     DatabaseList,
     Encoding,
+    /// `defer_foreign_keys` (v0.16, `foreign_keys`).
+    #[cfg(feature = "foreign_keys")]
+    DeferForeignKeys,
+    /// `foreign_key_check [table]` (v0.16, `foreign_keys`).
+    #[cfg(feature = "foreign_keys")]
+    ForeignKeyCheck,
     ForeignKeyList,
     ForeignKeys,
     FreelistCount,
@@ -82,6 +88,14 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("user_version", Prag::UserVersion),
 ];
 
+/// The foreign-key pragmas (v0.16, `foreign_keys`; refused without
+/// the leaf).
+#[cfg(feature = "foreign_keys")]
+const FK_PRAGMAS: &[(&str, Prag)] = &[
+    ("defer_foreign_keys", Prag::DeferForeignKeys),
+    ("foreign_key_check", Prag::ForeignKeyCheck),
+];
+
 /// The pin's other pragmas (its `PRAGMA pragma_list`): known
 /// there, not implemented here, so refused rather than ignored.
 const REFUSED: &str = "analysis_limit automatic_index cache_spill cell_size_check \
@@ -98,6 +112,12 @@ pub(super) fn lookup<E>(name: &[u8]) -> Result<Option<Prag>, E> {
     if let Some((_, p)) = PRAGMAS.iter().find(|(n, _)| eq_ci(n.as_bytes(), name)) {
         return Ok(Some(*p));
     }
+    #[cfg(feature = "foreign_keys")]
+    for (n, p) in FK_PRAGMAS.iter() {
+        if eq_ci(n.as_bytes(), name) {
+            return Ok(Some(*p));
+        }
+    }
     if REFUSED.split(' ').any(|n| eq_ci(n.as_bytes(), name)) {
         return Err(Error::Unsupported);
     }
@@ -108,6 +128,10 @@ impl Prag {
     /// A setting of the connection, not of one database: a
     /// `temp.` (or `main.`) qualifier is ignored, as on the pin.
     pub(super) fn connection_wide(self) -> bool {
+        #[cfg(feature = "foreign_keys")]
+        if self == Prag::DeferForeignKeys {
+            return true;
+        }
         matches!(
             self,
             Prag::ForeignKeys
@@ -147,6 +171,8 @@ impl Prag {
                 "match",
             ],
             Prag::TableList => &["schema", "name", "type", "ncol", "wr", "strict"],
+            #[cfg(feature = "foreign_keys")]
+            Prag::ForeignKeyCheck => &["table", "rowid", "parent", "fkid"],
             Prag::DatabaseList => &["seq", "name", "file"],
             Prag::CollationList => &["seq", "name"],
             _ => &[],
@@ -155,6 +181,10 @@ impl Prag {
 
     /// The single result column's name of a value pragma.
     fn value_name(self) -> &'static str {
+        #[cfg(feature = "foreign_keys")]
+        if self == Prag::DeferForeignKeys {
+            return "defer_foreign_keys";
+        }
         PRAGMAS
             .iter()
             .find(|(_, p)| *p == self)
@@ -498,6 +528,19 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::UnknownTable,
             });
         }
+        // `foreign_key_check(t)` must name a table (the pin's "no such
+        // table").
+        #[cfg(feature = "foreign_keys")]
+        if let (Some(Prag::ForeignKeyCheck), Some(a)) = (prag, &arg)
+            && self
+                .catalog
+                .find(&self.catalog_arena, a.as_slice())
+                .is_none()
+        {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownTable,
+            });
+        }
         Ok(Plan::Pragma(Box::new(PragmaPlan {
             prag,
             arg,
@@ -556,6 +599,12 @@ impl<S: Storage> Connection<S> {
             Prag::CacheSize => row1(int(self.cfg.cache_pages as i64)),
             Prag::BusyTimeout => row1(int(i64::from(self.prag.busy_timeout))),
             Prag::ForeignKeys => row1(int(i64::from(self.prag.foreign_keys))),
+            #[cfg(feature = "foreign_keys")]
+            Prag::DeferForeignKeys => row1(int(i64::from(self.fk.defer))),
+            // Reads the file (`Statement::fk_check`): not as a
+            // table-valued function.
+            #[cfg(feature = "foreign_keys")]
+            Prag::ForeignKeyCheck => return Err(Error::Unsupported),
             Prag::RecursiveTriggers => row1(int(i64::from(self.prag.recursive_triggers))),
             Prag::IgnoreCheckConstraints => row1(int(i64::from(self.prag.ignore_checks))),
             Prag::CaseSensitiveLike => AVec::new(),
@@ -716,7 +765,7 @@ impl<S: Storage> Connection<S> {
                 columns,
                 pk_columns,
                 ..
-            } = crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc)?
+            } = crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc, self.cfg.limits())?
             else {
                 return Err(Error::CorruptRecord);
             };
@@ -999,7 +1048,7 @@ impl<S: Storage> Connection<S> {
         let t = t.usable::<S::Error>()?;
         let sc = scratch();
         let Ast::CreateTable { fkeys, .. } =
-            crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc)?
+            crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc, self.cfg.limits())?
         else {
             return Err(Error::CorruptRecord);
         };
@@ -1036,7 +1085,9 @@ impl<S: Storage> Connection<S> {
 
     /// Whether table `name` takes part in a foreign key, as child
     /// or parent (v0.16): with `PRAGMA foreign_keys = ON` a write
-    /// to it is refused, since hipp does not enforce them.
+    /// to it is refused in a build without `foreign_keys`, which
+    /// does not enforce them.
+    #[cfg(not(feature = "foreign_keys"))]
     pub(super) fn fk_guard(&self, name: &[u8]) -> Result<(), S::Error> {
         if !self.prag.foreign_keys {
             return Ok(());
@@ -1046,7 +1097,7 @@ impl<S: Storage> Connection<S> {
         for t in self.catalog.tables.iter() {
             sc.reset();
             let Ok(Ast::CreateTable { fkeys, .. }) =
-                crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc)
+                crate::sql::parse::<S::Error>(handle_bytes(ca, t.sql), &sc, self.cfg.limits())
             else {
                 continue;
             };
@@ -1231,7 +1282,7 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
     }
 
     fn select_of(&self, arena: &Arena, sql: &[u8]) -> Result<SelectStmt, S::Error> {
-        match crate::sql::parse::<S::Error>(sql, arena)? {
+        match crate::sql::parse::<S::Error>(sql, arena, self.cfg.limits())? {
             Ast::Select(s) => Ok(s),
             _ => Err(Error::Unsupported),
         }
@@ -1375,6 +1426,10 @@ impl<S: Storage> Statement<'_, S> {
         if matches!(prag, Prag::IntegrityCheck | Prag::QuickCheck) {
             return self.integrity(&p, prag == Prag::QuickCheck).await;
         }
+        #[cfg(feature = "foreign_keys")]
+        if prag == Prag::ForeignKeyCheck {
+            return self.fk_check(&p).await;
+        }
         let Some(arg) = p.arg.as_ref().map(|a| copy_vec(a.as_slice())) else {
             return self.conn.pragma_rows(&self.arena, &p);
         };
@@ -1501,6 +1556,11 @@ impl<S: Storage> Statement<'_, S> {
                 self.conn.prag.recursive_triggers = boolean(arg);
                 Ok(AVec::new())
             }
+            #[cfg(feature = "foreign_keys")]
+            Prag::DeferForeignKeys => {
+                self.conn.fk.defer = boolean(arg);
+                Ok(AVec::new())
+            }
             Prag::IgnoreCheckConstraints => {
                 self.conn.prag.ignore_checks = boolean(arg);
                 Ok(AVec::new())
@@ -1512,6 +1572,53 @@ impl<S: Storage> Statement<'_, S> {
             }
             _ => self.conn.pragma_rows(&self.arena, &p),
         }
+    }
+
+    /// `foreign_key_check [table]` (v0.16, `foreign_keys`): every
+    /// child row whose parent key is missing — `table, rowid,
+    /// parent, fkid` — table by table (the pin's hash order, see
+    /// `hash_order`), rows in rowid order, keys in list order. Every
+    /// key is resolved first: a mismatch fails the pragma.
+    #[cfg(feature = "foreign_keys")]
+    async fn fk_check(&mut self, p: &PragmaPlan) -> Result<Rows, S::Error> {
+        let mut names: AVec<AVec<u8>> = AVec::new();
+        {
+            let ca = &self.conn.catalog_arena;
+            match &p.arg {
+                Some(a) => {
+                    let t = self
+                        .conn
+                        .catalog
+                        .find(ca, a.as_slice())
+                        .ok_or(Error::Schema {
+                            kind: SchemaKind::UnknownTable,
+                        })?;
+                    names.push(copy_vec(handle_bytes(ca, t.name)));
+                }
+                None => {
+                    for o in self.conn.hash_order().iter() {
+                        if let Obj::Table(t) = o {
+                            names.push(copy_vec(handle_bytes(ca, t.name)));
+                        }
+                    }
+                }
+            }
+        }
+        let plan = self.conn.fk_check_plan(names.as_slice(), &self.arena)?;
+        let found = super::fkey::fk_check_rows(&mut self.conn.pager, plan.as_slice()).await?;
+        let mut rows = AVec::new();
+        for (t, rowid, parent, id) in found.iter() {
+            push_row(
+                &mut rows,
+                &[
+                    text(t.as_slice()),
+                    int(*rowid),
+                    text(parent.as_slice()),
+                    int(*id as i64),
+                ],
+            );
+        }
+        Ok(rows)
     }
 
     /// `integrity_check` / `quick_check` (see the module docs):

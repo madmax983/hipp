@@ -30,7 +30,11 @@ use alloc::boxed::Box;
 
 use super::lexer::{self, Tok, Token};
 
-const MAX_DEPTH: usize = 32;
+/// How deep parentheses may nest inside one CREATE TABLE item
+/// (v0.16: the pin's parser stack; it was 32, refusing CHECK and
+/// DEFAULT expressions the pin takes — the expression itself is
+/// then held to `Limits`).
+const MAX_DEPTH: usize = PIN_PARSER_DEPTH;
 
 // Expression binding powers (v0.16: the pin's precedence levels,
 // loosest first; see `Parser::expr_bp`).
@@ -77,6 +81,345 @@ struct Parser<'a> {
     limit: usize,
     arena: &'a Arena,
     sql: &'a [u8],
+    /// The nesting limits (v0.16; a zero-sized pin constant
+    /// without the evaluator, whose grammar does not nest).
+    lim: Limits,
+    /// The pin's LALR parser stack while the current construct is
+    /// parsed: how many grammar symbols sit below it (v0.16; see
+    /// `Parser::need`).
+    #[cfg(feature = "v04")]
+    held: usize,
+    /// The pin's tree height (`Expr.nHeight`) of the expression
+    /// just parsed, and what kind of node it is (`EK_*`).
+    #[cfg(feature = "v04")]
+    eh: usize,
+    #[cfg(feature = "v04")]
+    ek: u8,
+    /// The largest resolution depth (`Parser::sel_r`) of the
+    /// subqueries met so far in the current resolved expression.
+    #[cfg(feature = "v04")]
+    rsub: usize,
+    /// The select just parsed: its height as a subquery operand
+    /// (`heightOfSelect`) and its resolution depth — the deepest
+    /// sum of nested expression heights the pin's name resolution
+    /// reaches inside it (`Parse.nHeight`).
+    #[cfg(feature = "v04")]
+    sel_h: usize,
+    #[cfg(feature = "v04")]
+    sel_r: usize,
+    /// The select being parsed: its height and resolution depth so
+    /// far (`sel_h` / `sel_r` once it is complete).
+    #[cfg(feature = "v04")]
+    acc_h: usize,
+    #[cfg(feature = "v04")]
+    acc_r: usize,
+    /// The current core's ON / USING terms, which the pin ANDs
+    /// into its WHERE before resolving it (`sqlite3ProcessJoin`).
+    #[cfg(feature = "v04")]
+    on: OnChain,
+    /// Resolution depths are computed but not checked: a CREATE
+    /// VIEW's body, which the pin resolves only when the view is
+    /// read (`parse_view` reads one that way).
+    #[cfg(feature = "v04")]
+    defer: bool,
+    /// Parsing a view's text to read it (`parse_view`).
+    #[cfg(feature = "v04")]
+    view_use: bool,
+    /// Parsing a CREATE VIEW body (v0.16 review fix): the pin keeps
+    /// a view's tree in its reduced form, whose leaves lose their
+    /// height, so a leaf the pin resolves on its own (`SELECT a`,
+    /// `(SELECT 1)`'s `1`) adds 0 to the resolution depth there, 1
+    /// elsewhere (probed: `SELECT <998 signs>(SELECT 1)` reads as a
+    /// view, as a CTE only up to 997).
+    #[cfg(feature = "v04")]
+    reduced: bool,
+    /// The tallest result column of the select core just parsed.
+    #[cfg(feature = "v04")]
+    core_h: usize,
+    /// Parsing a trigger program (v0.16, `triggers`): `RAISE()` is
+    /// legal only here.
+    #[cfg(feature = "triggers")]
+    in_trig: bool,
+}
+
+/// The ON / USING terms of one select core (v0.16): the pin's
+/// `sqlite3ProcessJoin` makes the WHERE clause `((WHERE AND on1)
+/// AND on2) ...` before name resolution, so the tree it resolves
+/// is taller than any one term. Kept as a fold, not a list: the
+/// terms' count, the first one's height, the best `height + 1 -
+/// position` of the others, and their deepest subquery
+/// resolution.
+#[cfg(feature = "v04")]
+#[derive(Debug, Clone, Copy, Default)]
+struct OnChain {
+    n: usize,
+    first: usize,
+    rest: isize,
+    rsub: usize,
+}
+
+#[cfg(feature = "v04")]
+impl OnChain {
+    fn push(&mut self, h: usize, rsub: usize) {
+        self.n += 1;
+        if self.n == 1 {
+            self.first = h;
+            self.rest = isize::MIN;
+        } else {
+            let v = isize::try_from(h)
+                .unwrap_or(isize::MAX)
+                .saturating_add(1)
+                .saturating_sub(isize::try_from(self.n).unwrap_or(isize::MAX));
+            self.rest = self.rest.max(v);
+        }
+        self.rsub = self.rsub.max(rsub);
+    }
+
+    /// The height of the WHERE tree the pin resolves, given the
+    /// written WHERE's height (if any).
+    fn height(&self, w: Option<usize>) -> usize {
+        let rest = |off: isize| usize::try_from(self.rest.saturating_add(off)).unwrap_or(0);
+        match (w, self.n) {
+            (Some(hw), 0) => hw,
+            (None, 0) => 0,
+            (Some(hw), n) => n.saturating_add(hw.max(self.first).max(rest(0))),
+            (None, n) => (n - 1).saturating_add(self.first.max(rest(1))),
+        }
+    }
+}
+
+/// The parser's nesting limits (v0.16), the pin's
+/// `SQLITE_LIMIT_EXPR_DEPTH` and its parser stack depth. Deeper
+/// statements are refused (`ParseKind::ExprTooDeep`,
+/// `ParseKind::RecursionLimit`), never a stack overflow: every
+/// recursive walk of a statement is bounded by them. Only the v0.4
+/// grammar nests (parentheses, operators, subqueries, ...); without
+/// it the limits are the pin's constants and the type is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The deepest expression tree, counted as the pin counts
+    /// `Expr.nHeight` (the pin: 1000; `Config::max_expr_depth`).
+    #[cfg(feature = "v04")]
+    pub expr_depth: usize,
+    /// The deepest parser stack, counted in the pin's LALR
+    /// grammar symbols (the pin: 2500; `Config::max_parser_depth`).
+    #[cfg(feature = "v04")]
+    pub parser_depth: usize,
+}
+
+impl Limits {
+    /// The pin's limits: an expression tree 1000 deep, a parser
+    /// stack of 2500 symbols.
+    pub const PIN: Limits = Limits {
+        #[cfg(feature = "v04")]
+        expr_depth: PIN_EXPR_DEPTH,
+        #[cfg(feature = "v04")]
+        parser_depth: PIN_PARSER_DEPTH,
+    };
+
+    /// The expression-height limit (the pin's without the v0.4
+    /// grammar).
+    fn expr(&self) -> usize {
+        #[cfg(feature = "v04")]
+        {
+            self.expr_depth
+        }
+        #[cfg(not(feature = "v04"))]
+        {
+            PIN_EXPR_DEPTH
+        }
+    }
+
+    /// The parser-stack limit (likewise).
+    fn stack(&self) -> usize {
+        #[cfg(feature = "v04")]
+        {
+            self.parser_depth
+        }
+        #[cfg(not(feature = "v04"))]
+        {
+            PIN_PARSER_DEPTH
+        }
+    }
+}
+
+/// The pin's `SQLITE_MAX_EXPR_DEPTH` ("Expression tree is too large
+/// (maximum depth 1000)").
+pub const PIN_EXPR_DEPTH: usize = 1000;
+/// The pin's parser stack ("Recursion limit"): 2500 LALR symbols,
+/// probed (2493 nested parentheses in a result column parse, 2494
+/// do not).
+pub const PIN_PARSER_DEPTH: usize = 2500;
+/// The pin's `SQLITE_MAX_COLUMN`: columns of a table, an index or
+/// a result set, terms of an ORDER BY / GROUP BY, items of a SET.
+pub const MAX_COLUMN: usize = 2000;
+/// The pin's `SQLITE_MAX_FUNCTION_ARG` (this build: 1000).
+#[cfg(feature = "v04")]
+pub const MAX_FUNCTION_ARG: usize = 1000;
+/// The pin's `SQLITE_MAX_COMPOUND_SELECT`.
+#[cfg(feature = "v09")]
+pub const MAX_COMPOUND_SELECT: usize = 500;
+/// The pin's join limit ("at most 64 tables in a join", the
+/// planner's bitmask width).
+#[cfg(feature = "v04")]
+pub const MAX_JOIN_TABLES: usize = 64;
+/// The pin's `SQLITE_MAX_SQL_LENGTH` ("statement too long").
+pub const MAX_SQL_LENGTH: usize = 1_000_000_000;
+
+// Expression kinds (`Parser::ek`), as the pin's parse actions see
+// them.
+/// No column reference and no subquery: the pin's
+/// `sqlite3ExprIsConstant` at parse time.
+#[cfg(feature = "v04")]
+const EK_CONST: u8 = 1;
+/// A numeric, string or blob literal, possibly under unary `+` /
+/// `-`: `x ISNULL` over it folds to a literal.
+#[cfg(feature = "v04")]
+const EK_LIT: u8 = 2;
+/// A unary `+` node (the pin re-uses it for a `+` / `-` above).
+#[cfg(feature = "v04")]
+const EK_UPLUS: u8 = 4;
+/// A COLLATE node (an IN list item the pin does not rewrite).
+#[cfg(feature = "v04")]
+const EK_COLLATE: u8 = 8;
+
+/// Record `h`, the height of a whole expression the pin resolves on
+/// its own (a result column, a WHERE tree, ...), on every subquery
+/// directly inside `e` (`SelectStmt::rctx`; v0.16 depth limits,
+/// `v16`): resolving that subquery's expressions starts that much
+/// deeper. Subqueries' own expressions were marked when they were
+/// parsed; the walk does not enter them, so each node is visited
+/// once per statement. Iterative: `e` may be as deep as the parser
+/// stack allows.
+#[cfg(feature = "v16")]
+fn mark_ctx(e: &mut Expr, h: usize) {
+    let h32 = u32::try_from(h).unwrap_or(u32::MAX);
+    let mut todo: AVec<&mut Expr> = AVec::new();
+    todo.push(e);
+    while let Some(x) = todo.pop() {
+        match x {
+            Expr::Literal(_) | Expr::Column { .. } | Expr::HexTooBig(_) => {}
+            #[cfg(feature = "params")]
+            Expr::Param(..) => {}
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            Expr::TrigValue(..) => {}
+            #[cfg(feature = "triggers")]
+            Expr::Raise(_, None, _) => {}
+            #[cfg(feature = "triggers")]
+            Expr::Raise(_, Some(a), _) => todo.push(a),
+            Expr::Binary(_, a, b) | Expr::Like(a, b, _) => {
+                todo.push(a);
+                todo.push(b);
+            }
+            Expr::Neg(a)
+            | Expr::Pos(a)
+            | Expr::Not(a)
+            | Expr::IsNull(a, _)
+            | Expr::Cast(a, _)
+            | Expr::Collate(a, _)
+            | Expr::BitNot(a)
+            | Expr::RowItem(a, ..) => todo.push(a),
+            Expr::Vector(l) => {
+                for y in l.as_mut_slice() {
+                    todo.push(y);
+                }
+            }
+            Expr::InList(a, l, _) => {
+                todo.push(a);
+                for y in l.as_mut_slice() {
+                    todo.push(y);
+                }
+            }
+            Expr::InSubquery(a, q, _) => {
+                q.rctx = h32;
+                todo.push(a);
+            }
+            Expr::ScalarSubquery(q) | Expr::ExistsSubquery(q) => q.rctx = h32,
+            Expr::Between(a, b, c, _) => {
+                todo.push(a);
+                todo.push(b);
+                todo.push(c);
+            }
+            Expr::Case {
+                base,
+                whens,
+                otherwise,
+            } => {
+                if let Some(y) = base {
+                    todo.push(y);
+                }
+                for (w, t) in whens.as_mut_slice() {
+                    todo.push(w);
+                    todo.push(t);
+                }
+                if let Some(y) = otherwise {
+                    todo.push(y);
+                }
+            }
+            Expr::Func { args, clause, .. } => {
+                for y in args.as_mut_slice() {
+                    todo.push(y);
+                }
+                if let Some(c) = clause {
+                    #[cfg(feature = "window")]
+                    if let Some(crate::sql::ast::Over::Spec(w)) = &mut c.over {
+                        // Window terms are shallow (each was checked
+                        // as it was parsed): a nested walk is bounded.
+                        w.exprs_mut(&mut |y| mark_ctx(y, h));
+                    }
+                    for (y, _) in c.order_by.as_mut_slice() {
+                        todo.push(y);
+                    }
+                    if let Some(y) = &mut c.filter {
+                        todo.push(y);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Make an ORDER BY / GROUP BY term that the pin's
+/// `sqlite3ExprIsInteger` reads as an integer the integer literal
+/// the planner takes for an ordinal (see `Parser::sort_item`).
+/// `word`: the term spells TRUE or FALSE, whose literal the pin
+/// never reads as an integer; a bare one is wrapped in a unary `+`
+/// so that it stays a constant.
+#[cfg(feature = "v04")]
+fn ordinal_term(e: &mut Expr, word: bool) {
+    #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+    let mut t = e;
+    #[cfg(feature = "v16")]
+    while let Expr::Collate(inner, _) = t {
+        t = inner;
+    }
+    let mut neg = false;
+    let mut x: &Expr = t;
+    loop {
+        match x {
+            Expr::Pos(a) => x = a,
+            Expr::Neg(a) => {
+                neg = !neg;
+                x = a;
+            }
+            _ => break,
+        }
+    }
+    let Expr::Literal(Literal::Integer(v)) = x else {
+        return;
+    };
+    let v = *v;
+    if word {
+        if matches!(t, Expr::Literal(_)) {
+            let lit = core::mem::replace(t, Expr::Literal(Literal::Null));
+            *t = Expr::Pos(Box::new(lit));
+        }
+        return;
+    }
+    // The pin's integer literals are 32-bit there (`EP_IntValue`).
+    if (-0x7fff_ffff..=0x7fff_ffff).contains(&v) {
+        *t = Expr::Literal(Literal::Integer(if neg { -v } else { v }));
+    }
 }
 
 /// What supplies an INSERT's rows (v0.8): VALUES rows, or a
@@ -88,15 +431,26 @@ struct InsertSource {
     select: Option<Box<SelectStmt>>,
 }
 
-pub fn parse<E>(sql: &[u8], arena: &Arena) -> Result<Ast, E> {
-    let toks = lexer::lex::<E>(sql, arena)?;
-    let mut p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+/// Parse one statement under the nesting limits `lim` (v0.16; see
+/// `Limits`).
+pub fn parse<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Ast, E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    Ok(ast)
+}
+
+/// `parse` of a stored CREATE VIEW text that is about to be read
+/// (v0.16): the body's resolution depth is checked, as the pin
+/// checks it when it resolves the view; `parse` of a CREATE VIEW
+/// does not (the pin creates such a view and refuses only its
+/// readers).
+#[cfg(feature = "v04")]
+pub fn parse_view<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Ast, E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    p.view_use = true;
     let ast = p.statement::<E>()?;
     p.expect_end::<E>()?;
     Ok(ast)
@@ -108,16 +462,15 @@ pub fn parse<E>(sql: &[u8], arena: &Arena) -> Result<Ast, E> {
 /// refused, as on the pin: those definitions are stored as text
 /// and re-read without bindings.
 #[cfg(feature = "params")]
-pub fn parse_params<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, lexer::ParamTable), E> {
+pub fn parse_params<E>(
+    sql: &[u8],
+    arena: &Arena,
+    lim: Limits,
+) -> Result<(Ast, lexer::ParamTable), E> {
     let mut params = lexer::ParamTable::default();
+    too_long::<E>(sql.len())?;
     let toks = lexer::lex_params::<E>(sql, arena, &mut params)?;
-    let mut p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+    let mut p = Parser::new(toks, arena, sql, lim);
     let ast = p.statement::<E>()?;
     p.expect_end::<E>()?;
     let stored = match &ast {
@@ -126,6 +479,9 @@ pub fn parse_params<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, lexer::ParamTa
         #[cfg(not(feature = "v16"))]
         Ast::CreateTable { .. } => true,
         Ast::AlterAddColumn { .. } | Ast::CreateView { .. } => true,
+        // "trigger cannot use variables" (v0.16, `triggers`).
+        #[cfg(feature = "triggers")]
+        Ast::CreateTrigger(_) => true,
         _ => false,
     };
     if stored && params.count > 0 {
@@ -141,15 +497,13 @@ pub fn parse_params<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, lexer::ParamTa
 /// from, so ALTER TABLE can map a resolved name back to its bytes
 /// in `sql` (`Token::offset`).
 #[cfg(feature = "v16")]
-pub fn parse_with_tokens<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, AVec<Token>), E> {
-    let toks = lexer::lex::<E>(sql, arena)?;
-    let mut p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+pub fn parse_with_tokens<E>(
+    sql: &[u8],
+    arena: &Arena,
+    lim: Limits,
+) -> Result<(Ast, AVec<Token>), E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
     let ast = p.statement::<E>()?;
     p.expect_end::<E>()?;
     Ok((ast, p.toks))
@@ -158,16 +512,16 @@ pub fn parse_with_tokens<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, AVec<Toke
 /// `parse_expr_text`, also returning the expression's tokens
 /// (v0.16, `v16`; see `parse_with_tokens`).
 #[cfg(feature = "v16")]
-pub fn parse_expr_with_tokens<E>(sql: &[u8], arena: &Arena) -> Result<(Expr, AVec<Token>), E> {
-    let toks = lexer::lex::<E>(sql, arena)?;
-    let mut p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+pub fn parse_expr_with_tokens<E>(
+    sql: &[u8],
+    arena: &Arena,
+    lim: Limits,
+) -> Result<(Expr, AVec<Token>), E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    p.held = RULE_HELD;
     let e = p.parse_expr::<E>()?;
+    p.resolved::<E>()?;
     if !p.at_eof() {
         return Err(perr(p.cur().offset, ParseKind::TrailingInput));
     }
@@ -187,16 +541,12 @@ pub fn tokens<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
 /// the planner into `arena`. The whole input must be the one
 /// expression.
 #[cfg(feature = "v04")]
-pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena) -> Result<Expr, E> {
-    let toks = lexer::lex::<E>(sql, arena)?;
-    let mut p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Expr, E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    p.held = RULE_HELD;
     let e = p.parse_expr::<E>()?;
+    p.resolved::<E>()?;
     if !p.at_eof() {
         return Err(perr(p.cur().offset, ParseKind::TrailingInput));
     }
@@ -227,13 +577,7 @@ pub fn schema_text_start<E>(
     let Ok(toks) = lexer::lex::<E>(sql, arena) else {
         return Ok(None);
     };
-    let p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+    let p = Parser::new(toks, arena, sql, Limits::PIN);
     #[cfg(not(feature = "v16"))]
     if (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT")) {
         return Err(Error::Unsupported);
@@ -272,13 +616,7 @@ pub fn has_autoincrement<E>(sql: &[u8], arena: &Arena) -> bool {
     let Ok(toks) = lexer::lex::<E>(sql, arena) else {
         return false;
     };
-    let p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+    let p = Parser::new(toks, arena, sql, Limits::PIN);
     (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT"))
 }
 
@@ -293,13 +631,7 @@ pub fn rollback_constraints<E>(sql: &[u8], arena: &Arena) -> (bool, bool) {
     let Ok(toks) = lexer::lex::<E>(sql, arena) else {
         return (false, false);
     };
-    let p = Parser {
-        limit: toks.len(),
-        toks,
-        pos: 0,
-        arena,
-        sql,
-    };
+    let p = Parser::new(toks, arena, sql, Limits::PIN);
     let tok = |i: usize| p.toks.as_slice().get(i).map(|t| t.tok);
     let (mut nn, mut uq) = (false, false);
     for i in 1..p.limit {
@@ -336,7 +668,96 @@ pub fn rollback_constraints<E>(sql: &[u8], arena: &Arena) -> (bool, bool) {
     (nn, uq)
 }
 
+/// The pin's `SQLITE_LIMIT_SQL_LENGTH` check (v0.16): a statement
+/// of more than 1,000,000,000 bytes is "statement too long". Only
+/// with the v0.4 grammar: the tiny profile's targets cannot hold
+/// such a statement (and its size ratchet pays for none).
+fn too_long<E>(len: usize) -> Result<(), E> {
+    #[cfg(feature = "v04")]
+    if len > MAX_SQL_LENGTH {
+        return Err(perr(0, ParseKind::StatementTooLong));
+    }
+    #[cfg(not(feature = "v04"))]
+    let _ = len;
+    Ok(())
+}
+
+/// `lexer::lex` after the length check.
+fn lex_checked<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
+    too_long::<E>(sql.len())?;
+    lexer::lex::<E>(sql, arena)
+}
+
+/// The pin's parser stack below a CHECK / DEFAULT / generated
+/// expression of a table's first column (or first table
+/// constraint): the bottom entry, `create_table`, `(`,
+/// `columnname`, `carglist`, `CHECK`, `(` — probed: 2491 nested
+/// parentheses parse there. A later column's sits two symbols
+/// higher on the pin (`columnlist ,`); hipp re-parses the stored
+/// text alone and counts the first column's.
+#[cfg(feature = "v04")]
+const RULE_HELD: usize = 7;
+
+/// The pin's parser stack below an INSERT's row source: the
+/// bottom entry, `with`, `insert_cmd`, `INTO`, `xfullname`,
+/// `idlist_opt`.
+const INS_BASE: usize = 6;
+/// ... and below a RETURNING item of an INSERT without an upsert
+/// clause (`select RETURNING sclp scanpt`).
+#[cfg(feature = "v07")]
+const INS_RETURNING: usize = 10;
+
 impl<'a> Parser<'a> {
+    fn new(toks: AVec<Token>, arena: &'a Arena, sql: &'a [u8], lim: Limits) -> Parser<'a> {
+        Parser {
+            limit: toks.len(),
+            toks,
+            pos: 0,
+            arena,
+            sql,
+            lim,
+            // The pin's bottom stack entry (state 0).
+            #[cfg(feature = "v04")]
+            held: 1,
+            #[cfg(feature = "v04")]
+            eh: 0,
+            #[cfg(feature = "v04")]
+            ek: 0,
+            #[cfg(feature = "v04")]
+            rsub: 0,
+            #[cfg(feature = "v04")]
+            sel_h: 0,
+            #[cfg(feature = "v04")]
+            sel_r: 0,
+            #[cfg(feature = "v04")]
+            acc_h: 0,
+            #[cfg(feature = "v04")]
+            acc_r: 0,
+            #[cfg(feature = "v04")]
+            on: OnChain {
+                n: 0,
+                first: 0,
+                rest: 0,
+                rsub: 0,
+            },
+            #[cfg(feature = "v04")]
+            defer: false,
+            #[cfg(feature = "v04")]
+            view_use: false,
+            #[cfg(feature = "v04")]
+            reduced: false,
+            #[cfg(feature = "v04")]
+            core_h: 0,
+            #[cfg(feature = "triggers")]
+            in_trig: false,
+        }
+    }
+
+    /// `sql[a..b]`, or nothing when the range is not inside it.
+    fn span(&self, a: usize, b: usize) -> &'a [u8] {
+        self.sql.get(a..b.min(self.sql.len())).unwrap_or(&[])
+    }
+
     fn cur(&self) -> Token {
         let i = self.pos.min(self.limit - 1);
         self.toks.as_slice()[i]
@@ -468,9 +889,14 @@ impl<'a> Parser<'a> {
     /// grammar): each CTE is `name [(col, ...)] AS [[NOT]
     /// MATERIALIZED] (select-stmt)`.
     #[cfg(feature = "v16")]
-    fn with_clause<E>(&mut self) -> Result<crate::sql::ast::With, E> {
+    ///
+    /// `hs` symbols sit below the WITH on the pin's stack; a body's
+    /// resolution depth is checked where the body is read (see
+    /// `SelectStmt::rdepth`).
+    #[inline(never)]
+    fn with_clause<E>(&mut self, hs: usize) -> Result<crate::sql::ast::With, E> {
         self.expect_kw::<E>(b"WITH")?;
-        let _ = self.eat_kw(b"RECURSIVE");
+        let rec = usize::from(self.eat_kw(b"RECURSIVE"));
         let mut ctes = AVec::new();
         loop {
             let name = match self.cur().tok {
@@ -507,7 +933,20 @@ impl<'a> Parser<'a> {
                 crate::sql::ast::M10d::Any
             };
             self.expect::<E>(Tok::LParen)?;
-            let select = self.select_rich::<E>()?;
+            // `WITH [RECURSIVE] [wqlist COMMA] withnm eidlist_opt
+            // wqas LP select`.
+            // The pin resolves a CTE body only where it is read
+            // (`defer`; an unused one never), inside the reader's
+            // expressions: the expansion checks its resolution
+            // depth (`rdepth`) there, and its width.
+            let (h0, d0) = (self.held, self.defer);
+            self.held = hs + rec + if ctes.is_empty() { 5 } else { 7 };
+            self.defer = true;
+            let r = self
+                .peak::<E>(self.held)
+                .and_then(|()| self.select_rich::<E>());
+            (self.held, self.defer) = (h0, d0);
+            let select = r?;
             self.expect::<E>(Tok::RParen)?;
             ctes.push(crate::sql::ast::Cte {
                 name,
@@ -528,7 +967,7 @@ impl<'a> Parser<'a> {
     #[cfg(feature = "v16")]
     fn with_statement<E>(&mut self) -> Result<Ast, E> {
         let save = self.pos;
-        let with = self.with_clause::<E>()?;
+        let with = self.with_clause::<E>(self.held)?;
         if self.cur_is_kw(b"SELECT") || self.cur_is_kw(b"VALUES") {
             self.pos = save;
             return Ok(Ast::Select(self.select_rich::<E>()?));
@@ -581,6 +1020,15 @@ impl<'a> Parser<'a> {
                 self.create_index_dispatch::<E>(true)
             } else if self.is_kw(self.pos + 1, b"VIEW") {
                 self.create_view_dispatch::<E>()
+            } else if cfg!(feature = "triggers") && self.is_kw(self.pos + 1, b"TRIGGER") {
+                #[cfg(feature = "triggers")]
+                {
+                    self.create_trigger::<E>()
+                }
+                #[cfg(not(feature = "triggers"))]
+                {
+                    Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+                }
             } else {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
@@ -710,8 +1158,9 @@ impl<'a> Parser<'a> {
             first = Some(self.pragma_nm::<E>()?);
         }
         if vacuum {
+            // `VACUUM [nm] INTO expr`.
             let into = if self.eat_kw(b"INTO") {
-                Some(self.parse_expr::<E>()?)
+                Some(self.item::<E>(3 + usize::from(first.is_some()))?)
             } else {
                 None
             };
@@ -860,6 +1309,10 @@ impl<'a> Parser<'a> {
 
     /// DROP dispatch: VIEW (v0.4), TABLE (v0.5), or INDEX (v0.3).
     fn drop_dispatch<E>(&mut self) -> Result<Ast, E> {
+        #[cfg(feature = "triggers")]
+        if self.is_kw(self.pos + 1, b"TRIGGER") {
+            return self.drop_trigger::<E>();
+        }
         if self.is_kw(self.pos + 1, b"VIEW") {
             self.drop_view_dispatch::<E>()
         } else if self.is_kw(self.pos + 1, b"TABLE") {
@@ -1001,6 +1454,10 @@ impl<'a> Parser<'a> {
             self.expect::<E>(Tok::RParen)?;
             break;
         }
+        // The pin's "too many columns in index" (v0.16).
+        if columns.len() > MAX_COLUMN {
+            return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
+        }
         // Partial indexes (WHERE ...) are a later phase.
         if self.cur_is_kw(b"WHERE") {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
@@ -1048,7 +1505,8 @@ impl<'a> Parser<'a> {
         // come from the SELECT at plan time.
         #[cfg(feature = "v16")]
         if self.eat_kw(b"AS") {
-            let select = self.select_rich::<E>()?;
+            // `create_table AS select`.
+            let select = self.select_at::<E>(3)?;
             return Ok(Ast::CreateTable {
                 name,
                 if_not_exists,
@@ -1099,6 +1557,12 @@ impl<'a> Parser<'a> {
         }
         if columns.is_empty() {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
+        // The pin's "too many columns on t" (v0.16 fix, ungated: a
+        // table of more than 2000 columns made a file the pin
+        // cannot open).
+        if columns.len() > MAX_COLUMN {
+            return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
         }
         // A PRIMARY KEY / UNIQUE list names the table's columns
         // (v0.16 fix: `PRIMARY KEY (nosuch)` was written, and the
@@ -1271,7 +1735,7 @@ impl<'a> Parser<'a> {
         let close = self.close_paren::<E>(k, to)?;
         let start = self.toks.as_slice()[k + 1].offset;
         let end = self.toks.as_slice()[close].offset;
-        let text = trim(&self.sql[start.min(end)..end.min(self.sql.len())]);
+        let text = trim(self.span(start.min(end), end));
         Ok((close, self.arena.alloc_copy_handle(text)?))
     }
 
@@ -1401,62 +1865,104 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A literal at token `i` under any run of unary signs:
+    /// the literal and the tokens it spans. Walked without
+    /// recursion (v0.16 fix, ungated: a recursive walk per sign
+    /// overflowed the stack on `INSERT ... VALUES (- - - ... 1)`,
+    /// the tiny profile's grammar included).
     fn literal_at(&self, i: usize) -> Option<(Literal, usize)> {
-        if i >= self.limit {
-            return None;
+        let toks = self.toks.as_slice().get(..self.limit)?;
+        // The signs, then the literal they apply to.
+        let mut j = i;
+        while matches!(toks.get(j).map(|t| t.tok), Some(Tok::Minus | Tok::Plus)) {
+            j += 1;
         }
-        let t = self.toks.as_slice()[i];
-        match t.tok {
-            Tok::Integer(v) => Some((Literal::Integer(v), 1)),
-            Tok::Real(f) => Some((Literal::Real(f), 1)),
-            Tok::Text(h) => Some((Literal::Text(h), 1)),
-            Tok::Blob(h) => Some((Literal::Blob(h), 1)),
-            Tok::Minus => {
-                // The pin's `codeInteger`: `-` over the integer
-                // literal 9223372036854775808 (unary `+` between
-                // is transparent) is INTEGER i64::MIN, not a REAL
-                // (v0.16); `-` over i64::MIN itself overflows to
-                // REAL.
-                let mut j = i + 1;
-                while matches!(self.toks.as_slice().get(j).map(|t| t.tok), Some(Tok::Plus)) {
-                    j += 1;
-                }
-                if self.min_magnitude(j) {
-                    return Some((Literal::Integer(i64::MIN), j - i + 1));
-                }
-                // `-0x8000000000000000` is the pin's "hex literal
-                // too big", not a REAL (v0.16 fix): no literal
-                // here, so the evaluator's unary minus reports
-                // it. (The tiny lexer refuses the literal itself.)
-                #[cfg(feature = "v04")]
-                if self.hex_min(j) {
-                    return None;
-                }
-                match self.literal_at(i + 1) {
-                    Some((Literal::Integer(v), n)) => Some((
-                        v.checked_neg()
-                            .map_or(Literal::Real(-(v as f64)), Literal::Integer),
-                        n + 1,
-                    )),
-                    Some((Literal::Real(f), n)) => Some((Literal::Real(-f), n + 1)),
-                    _ => None,
-                }
-            }
-            Tok::Plus => self.literal_at(i + 1).map(|(l, n)| (l, n + 1)),
+        let t = toks.get(j)?;
+        let mut lit = match t.tok {
+            Tok::Integer(v) => Literal::Integer(v),
+            Tok::Real(f) => Literal::Real(f),
+            Tok::Text(h) => Literal::Text(h),
+            Tok::Blob(h) => Literal::Blob(h),
             Tok::Ident(h, false) => {
                 let b = handle_bytes(self.arena, h);
                 if eq_ci(b, b"NULL") {
-                    Some((Literal::Null, 1))
+                    Literal::Null
                 } else if eq_ci(b, b"TRUE") {
-                    Some((Literal::Integer(1), 1))
+                    Literal::Integer(1)
                 } else if eq_ci(b, b"FALSE") {
-                    Some((Literal::Integer(0), 1))
+                    Literal::Integer(0)
                 } else {
-                    None
+                    return None;
                 }
             }
-            _ => None,
+            _ => return None,
+        };
+        // Apply the signs from the innermost out. The innermost
+        // `-` (only `+` between it and the literal) follows the
+        // pin's `codeInteger`: over the integer literal
+        // 9223372036854775808 it is INTEGER i64::MIN, not a REAL
+        // (v0.16); over i64::MIN itself it overflows to REAL; and
+        // `-0x8000000000000000` is the pin's "hex literal too big",
+        // not a REAL (v0.16 fix): no literal here, so the
+        // evaluator's unary minus reports it. (The tiny lexer
+        // refuses the literal itself.) A `+` leaves the value.
+        let mut innermost = true;
+        let mut k = j;
+        while k > i {
+            k -= 1;
+            if !matches!(toks.get(k).map(|t| t.tok), Some(Tok::Minus)) {
+                continue;
+            }
+            if innermost && self.min_magnitude(j) {
+                lit = Literal::Integer(i64::MIN);
+            } else {
+                #[cfg(feature = "v04")]
+                if innermost && self.hex_min(j) {
+                    return None;
+                }
+                lit = match lit {
+                    Literal::Integer(v) => v
+                        .checked_neg()
+                        .map_or(Literal::Real(-(v as f64)), Literal::Integer),
+                    Literal::Real(f) => Literal::Real(-f),
+                    _ => return None,
+                };
+            }
+            innermost = false;
         }
+        Some((lit, j - i + 1))
+    }
+
+    /// The pin's limits on a literal under a run of unary signs at
+    /// token `i`, spanning `used` tokens (`literal_at`), when the
+    /// grammar folds it without parsing it as an expression (v0.16:
+    /// the tiny grammar's literals, a parenthesised DEFAULT, a
+    /// LIMIT without `v16`): one parser-stack symbol per token over
+    /// `held` ("Recursion limit"), and the tree height of its `+` /
+    /// `-` nodes, `nodes` more sitting above them — a `+` over a `+`
+    /// node re-uses it, a `-` over one turns it into a `-` node
+    /// ("Expression tree is too large").
+    fn sign_run<E>(&self, i: usize, used: usize, held: usize, nodes: usize) -> Result<(), E> {
+        let run = self
+            .toks
+            .as_slice()
+            .get(i..i.saturating_add(used))
+            .unwrap_or(&[]);
+        // A sign makes a node unless the one inside it is a `+`.
+        let h = run
+            .windows(2)
+            .filter(|w| !matches!(w.last().map(|t| t.tok), Some(Tok::Plus)))
+            .count()
+            .saturating_add(nodes)
+            .saturating_add(1);
+        let kind = if held.saturating_add(used) > self.lim.stack() {
+            ParseKind::RecursionLimit
+        } else if h > self.lim.expr() {
+            ParseKind::ExprTooDeep
+        } else {
+            return Ok(());
+        };
+        Err(perr(run.first().map_or(0, |t| t.offset), kind))
     }
 
     // ---------------- v0.7 statement shim ----------------
@@ -1516,7 +2022,7 @@ impl<'a> Parser<'a> {
             let mut rows = AVec::new();
             rows.push(AVec::new());
             #[cfg(feature = "v07")]
-            let returning = self.returning_clause::<E>()?;
+            let returning = self.returning_clause::<E>(INS_RETURNING)?;
             #[cfg(not(feature = "v07"))]
             let returning = AVec::new();
             return Ok(Ast::Insert {
@@ -1552,11 +2058,11 @@ impl<'a> Parser<'a> {
         if self.cur_is_kw(b"SELECT") || self.with_at(self.pos) {
             return Ok(InsertSource {
                 rows: AVec::new(),
-                select: Some(Box::new(self.select_rich::<E>()?)),
+                select: Some(Box::new(self.select_at::<E>(INS_BASE)?)),
             });
         }
         Ok(InsertSource {
-            rows: self.values_rows::<E>()?,
+            rows: self.values_rows::<E>(INS_BASE, true)?,
             select: None,
         })
     }
@@ -1564,34 +2070,64 @@ impl<'a> Parser<'a> {
     #[cfg(not(feature = "v08"))]
     fn insert_source<E>(&mut self) -> Result<InsertSource, E> {
         Ok(InsertSource {
-            rows: self.values_rows::<E>()?,
+            rows: self.values_rows::<E>(INS_BASE, true)?,
             select: None,
         })
     }
 
     /// The `VALUES` row list: v0.2 one or more parenthesised
     /// rows, comma-separated; v0.4 each value is an expression
-    /// (a plain literal under the pre-v0.4 grammar).
-    fn values_rows<E>(&mut self) -> Result<AVec<AVec<Expr>>, E> {
+    /// (a plain literal under the pre-v0.4 grammar). `base`
+    /// symbols sit below it on the pin's parser stack.
+    ///
+    /// A row of more than 2000 values is the pin's "too many columns
+    /// in result set" where it reads the rows as a select: a VALUES
+    /// core it resolves (not in a CREATE VIEW or CTE body, `defer`),
+    /// and an INSERT's rows when there are several (`insert`; one
+    /// row is not a select there — `INSERT INTO t(a, a, ...)` takes
+    /// any number).
+    fn values_rows<E>(&mut self, base: usize, insert: bool) -> Result<AVec<AVec<Expr>>, E> {
         self.expect_kw::<E>(b"VALUES")?;
         let mut rows = AVec::new();
+        #[cfg(feature = "v04")]
+        let mut core_h = 1usize;
         loop {
             self.expect::<E>(Tok::LParen)?;
+            // `VALUES LP` / `values COMMA LP`, then `nexprlist
+            // COMMA` before a later value.
+            let lp = if rows.is_empty() { 2 } else { 3 };
             let mut row = AVec::new();
             loop {
-                row.push(self.value_expr::<E>()?);
+                let at = base + lp + if row.is_empty() { 0 } else { 2 };
+                row.push(self.value_expr::<E>(at)?);
+                #[cfg(feature = "v04")]
+                {
+                    core_h = core_h.max(self.eh);
+                }
                 if self.eat(Tok::Comma) {
                     continue;
                 }
                 self.expect::<E>(Tok::RParen)?;
                 break;
             }
+            #[cfg(feature = "v04")]
+            self.peak::<E>(base + lp + 2)?;
             rows.push(row);
             if self.eat(Tok::Comma) {
                 continue;
             }
             break;
         }
+        #[cfg(feature = "v04")]
+        {
+            self.core_h = core_h;
+            let wide = rows.iter().any(|r| r.len() > MAX_COLUMN);
+            if wide && if insert { rows.len() > 1 } else { !self.defer } {
+                return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
+            }
+        }
+        #[cfg(not(feature = "v04"))]
+        let _ = insert;
         Ok(rows)
     }
 
@@ -1631,7 +2167,19 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let returning = self.returning_clause::<E>()?;
+        // `... select [upsert] RETURNING`: the pin's RETURNING is
+        // the tail of its upsert rule, above that clause's symbols
+        // (`ON CONFLICT [LP sortlist RP where_opt] DO NOTHING |
+        // UPDATE SET setlist where_opt`).
+        let held = match &upsert {
+            None => INS_RETURNING,
+            Some(u) => {
+                let target = !u.target.is_empty();
+                let nothing = matches!(u.action, UpsertAction::Nothing);
+                INS_RETURNING + 3 + if target { 4 } else { 0 } + if nothing { 1 } else { 4 }
+            }
+        };
+        let returning = self.returning_clause::<E>(held)?;
         Ok((upsert, returning))
     }
 
@@ -1668,8 +2216,10 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // `with insert_cmd INTO xfullname idlist_opt select ON
+        // CONFLICT LP sortlist RP WHERE expr`.
         let target_filter = if self.eat_kw(b"WHERE") {
-            Some(self.parse_expr::<E>()?)
+            Some(self.item::<E>(INS_BASE + 7)?)
         } else {
             None
         };
@@ -1679,9 +2229,12 @@ impl<'a> Parser<'a> {
         } else {
             self.expect_kw::<E>(b"UPDATE")?;
             self.expect_kw::<E>(b"SET")?;
-            let assignments = self.set_list::<E>()?;
+            // `... ON CONFLICT [LP sortlist RP where_opt] DO UPDATE
+            // SET nm EQ expr ... [WHERE expr]`.
+            let at = INS_BASE + if target.is_empty() { 8 } else { 12 };
+            let assignments = self.set_list::<E>(at)?;
             let filter = if self.eat_kw(b"WHERE") {
-                Some(self.parse_expr::<E>()?)
+                Some(self.item::<E>(at)?)
             } else {
                 None
             };
@@ -1702,8 +2255,11 @@ impl<'a> Parser<'a> {
     /// INSERT / UPDATE / DELETE: SELECT-shaped result items
     /// (`*`, `t.*`, or an expression with an optional alias).
     /// Returns an empty vec when the clause is absent.
+    ///
+    /// `held` symbols sit below an item on the pin's parser stack
+    /// (`RETURNING sclp scanpt`).
     #[cfg(feature = "v07")]
-    fn returning_clause<E>(&mut self) -> Result<AVec<SelectItem>, E> {
+    fn returning_clause<E>(&mut self, held: usize) -> Result<AVec<SelectItem>, E> {
         let mut items = AVec::new();
         if !self.eat_kw(b"RETURNING") {
             return Ok(items);
@@ -1725,11 +2281,9 @@ impl<'a> Parser<'a> {
                 items.push(SelectItem::TableStar(h));
             } else {
                 let start = self.cur().offset;
-                let e = self.parse_expr::<E>()?;
+                let e = self.item::<E>(held)?;
                 let end = self.cur().offset;
-                let text = self
-                    .arena
-                    .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
+                let text = self.arena.alloc_copy_handle(trim(self.span(start, end)))?;
                 let alias = self.opt_alias();
                 items.push(SelectItem::Expr(e, alias, text));
             }
@@ -1743,22 +2297,43 @@ impl<'a> Parser<'a> {
 
     /// One INSERT value: a full expression under `v04`, a plain
     /// literal otherwise.
+    /// `held` symbols sit below it on the pin's parser stack.
     #[cfg(feature = "v04")]
-    fn value_expr<E>(&mut self) -> Result<Expr, E> {
-        self.parse_expr::<E>()
+    fn value_expr<E>(&mut self, held: usize) -> Result<Expr, E> {
+        self.item::<E>(held)
     }
 
     #[cfg(not(feature = "v04"))]
-    fn value_expr<E>(&mut self) -> Result<Expr, E> {
+    fn value_expr<E>(&mut self, held: usize) -> Result<Expr, E> {
         #[cfg(feature = "params")]
         if let Some(e) = self.param_here() {
             return Ok(e);
         }
-        let (lit, used) = self
-            .literal_at(self.pos)
+        let lit = self
+            .signed_literal::<E>(held, 0)?
             .ok_or(perr(self.cur().offset, ParseKind::UnexpectedToken))?;
-        self.pos += used;
         Ok(Expr::Literal(lit))
+    }
+
+    /// A literal under any run of unary signs, consumed, with the
+    /// pin's limits on the run (v0.16, the tiny grammar; the v0.4
+    /// grammar counts them in `expr_unary`): one parser-stack
+    /// symbol per sign over `held` ("Recursion limit"), and the
+    /// tree height of its `+` / `-` nodes — a `+` over a `+` node
+    /// re-uses it, a `-` over one turns it into a `-` node
+    /// ("Expression tree is too large"). `None` (nothing consumed)
+    /// when no literal starts here.
+    #[cfg(not(feature = "v04"))]
+    ///
+    /// `nodes` more nodes sit above the run in the pin's tree (the
+    /// `=` of `WHERE col = literal`).
+    fn signed_literal<E>(&mut self, held: usize, nodes: usize) -> Result<Option<Literal>, E> {
+        let Some((lit, used)) = self.literal_at(self.pos) else {
+            return Ok(None);
+        };
+        self.sign_run::<E>(self.pos, used, held, nodes)?;
+        self.pos += used;
+        Ok(Some(lit))
     }
 
     // ---------------- SELECT ----------------
@@ -1800,6 +2375,10 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // The pin's "too many columns in result set" (v0.16 fix).
+        if items.len() > MAX_COLUMN {
+            return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
+        }
         self.expect_kw::<E>(b"FROM")?;
         let table = self.name::<E>()?;
         let mut from = AVec::new();
@@ -1825,25 +2404,20 @@ impl<'a> Parser<'a> {
             if !self.eat(Tok::Eq) {
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
+            // `SELECT distinct selcollist from WHERE expr EQ`.
             #[cfg(feature = "params")]
             let rhs = match self.param_here() {
                 Some(e) => e,
-                None => {
-                    let (lit, used) = self
-                        .literal_at(self.pos)
-                        .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
-                    self.pos += used;
-                    Expr::Literal(lit)
-                }
+                None => Expr::Literal(
+                    self.signed_literal::<E>(8, 1)?
+                        .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?,
+                ),
             };
             #[cfg(not(feature = "params"))]
-            let rhs = {
-                let (lit, used) = self
-                    .literal_at(self.pos)
-                    .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?;
-                self.pos += used;
-                Expr::Literal(lit)
-            };
+            let rhs = Expr::Literal(
+                self.signed_literal::<E>(8, 1)?
+                    .ok_or(perr(self.cur().offset, ParseKind::UnsupportedClause))?,
+            );
             filter = Some(Expr::Binary(
                 BinOp::Eq,
                 Box::new(Expr::Column {
@@ -1908,10 +2482,27 @@ impl<'a> Parser<'a> {
                 // RETURNING (v0.16 fix, v07 grammar) ends an
                 // UPDATE ... FROM source list: `FROM s RETURNING v`
                 // used to alias `s` as RETURNING.
-                KWS.iter().any(|k| eq_ci(b, k)) || (cfg!(feature = "v07") && eq_ci(b, b"RETURNING"))
+                KWS.iter().any(|k| eq_ci(b, k))
+                    || (cfg!(feature = "v07") && eq_ci(b, b"RETURNING"))
+                    || (cfg!(feature = "window") && self.window_clause_at(self.pos))
             }
             _ => false,
         }
+    }
+
+    /// Whether token `i` starts a `WINDOW name AS` clause (v0.16,
+    /// `window`): the pin's tokenizer reads WINDOW as a keyword
+    /// only when an identifier (or string) and AS follow it
+    /// (`analyzeWindowKeyword`), so `SELECT 1 window` stays an
+    /// alias.
+    fn window_clause_at(&self, i: usize) -> bool {
+        cfg!(feature = "window")
+            && self.is_kw(i, b"WINDOW")
+            && matches!(
+                self.toks.as_slice().get(i + 1).map(|t| t.tok),
+                Some(Tok::Ident(..) | Tok::Text(_))
+            )
+            && self.is_kw(i + 2, b"AS")
     }
 
     /// An optional `[AS] name` alias: a quoted identifier, or a
@@ -1976,17 +2567,244 @@ impl<'a> Parser<'a> {
         self.expr_bp::<E>(BP_OR)
     }
 
+    // ---------- the pin's nesting limits (v0.16) ----------
+    // Two counts follow the pin's parser as it reads the statement,
+    // so hipp refuses exactly what it refuses — and every recursive
+    // walk of an accepted statement (this parser, the resolver, the
+    // evaluator, the derived Clone / Drop) is bounded by them:
+    //
+    // - `held`: the symbols on the pin's LALR stack below the
+    //   construct being parsed. Each construct adds the symbols its
+    //   grammar rule holds while a nested part is read (`expr +` is
+    //   two, `CASE case_operand WHEN` three, ...) and `need` checks
+    //   the peak a construct reaches against `Limits::parser_depth`
+    //   ("Recursion limit").
+    // - `eh` / `ek`: the height the pin gives the expression just
+    //   parsed (`Expr.nHeight`: a leaf is 1, a node one more than
+    //   its tallest operand; parentheses and a row value's
+    //   elements add nothing, `+` over a `+` node re-uses it, `x
+    //   ISNULL` over a literal folds to one), checked against
+    //   `Limits::expr_depth` as each node is made ("Expression tree
+    //   is too large"). Name resolution adds the heights of the
+    //   expressions a subquery sits in (`Parse.nHeight`): `rsub`
+    //   and `sel_r` carry that sum up (`resolved`).
+
+    /// The pin's stack would hold `k` more symbols here.
+    fn need<E>(&self, k: usize) -> Result<(), E> {
+        self.peak::<E>(self.held.saturating_add(k))
+    }
+
+    /// The pin's stack would hold `abs` symbols in all here.
+    fn peak<E>(&self, abs: usize) -> Result<(), E> {
+        if abs > self.lim.parser_depth {
+            return Err(perr(self.cur().offset, ParseKind::RecursionLimit));
+        }
+        Ok(())
+    }
+
+    /// Record the height and kind of the expression just made.
+    fn set_h<E>(&mut self, h: usize, k: u8) -> Result<(), E> {
+        if h > self.lim.expr_depth {
+            return Err(perr(self.cur().offset, ParseKind::ExprTooDeep));
+        }
+        self.eh = h;
+        self.ek = k;
+        Ok(())
+    }
+
+    /// A node over the expression just parsed (and over operands
+    /// of heights up to `other`, kinds `ok`): one taller.
+    fn node<E>(&mut self, other: usize, ok: u8) -> Result<(), E> {
+        let h = self.eh.max(other).saturating_add(1);
+        let k = self.ek & ok & EK_CONST;
+        self.set_h::<E>(h, k)
+    }
+
+    /// An operand parsed with `k` more symbols on the pin's stack,
+    /// at binding power `min`.
+    fn operand<E>(&mut self, k: usize, min: u8) -> Result<Expr, E> {
+        let h0 = self.held;
+        self.held = h0.saturating_add(k);
+        self.peak::<E>(self.held)?;
+        let r = self.expr_bp::<E>(min);
+        self.held = h0;
+        r
+    }
+
+    /// A whole expression parsed with `k` more symbols on the
+    /// pin's stack.
+    fn operand_expr<E>(&mut self, k: usize) -> Result<Expr, E> {
+        self.operand::<E>(k, BP_OR)
+    }
+
+    /// The resolution depth of the expression just parsed: its
+    /// height plus the deepest resolution depth of a subquery in
+    /// it — checked, as the pin's `sqlite3ResolveExprNames`
+    /// checks `Parse.nHeight`.
+    fn resolved<E>(&self) -> Result<usize, E> {
+        let h = if self.reduced && self.eh == 1 {
+            0
+        } else {
+            self.eh
+        };
+        let r = h.saturating_add(self.rsub);
+        if r > self.lim.expr_depth && !self.defer {
+            return Err(perr(self.cur().offset, ParseKind::ExprTooDeep));
+        }
+        Ok(r)
+    }
+
+    /// One expression the pin resolves on its own (a result
+    /// column, WHERE, a SET value, ...), with `held` symbols below
+    /// it: parsed, its resolution depth checked and folded into
+    /// the current select's (`sel_*` accumulators `acc_h` /
+    /// `acc_r`). Returns the expression; `eh` / `rsub` stay set
+    /// for the caller.
+    fn item<E>(&mut self, held: usize) -> Result<Expr, E> {
+        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        let mut e = self.raw::<E>(held)?;
+        self.fold_item::<E>(true)?;
+        #[cfg(feature = "v16")]
+        mark_ctx(&mut e, self.eh);
+        Ok(e)
+    }
+
+    /// Fold the expression just parsed (`raw`) into the current
+    /// select: its height always (`heightOfSelect`), its
+    /// resolution depth when the pin resolves it (`resolve`).
+    fn fold_item<E>(&mut self, resolve: bool) -> Result<(), E> {
+        self.acc_h = self.acc_h.max(self.eh);
+        if resolve {
+            let depth = self.resolved::<E>()?;
+            self.acc_r = self.acc_r.max(depth);
+        }
+        Ok(())
+    }
+
+    /// An ORDER BY / GROUP BY term with `held` symbols below it:
+    /// an item, except that an integer term is a column ordinal the
+    /// pin never resolves.
+    ///
+    /// The term is an ordinal when the pin's `sqlite3ExprIsInteger`
+    /// says so (v0.16 review fix, ungated): under any COLLATE, any
+    /// run of unary `+` / `-` and parentheses over a 32-bit integer
+    /// literal (or a null test folded to one), so `-(-2)` and `+(2)`
+    /// are the ordinal 2 and `-(2)` the out-of-range -2; the term is
+    /// then made that integer literal. TRUE / FALSE are not integers
+    /// there (`ORDER BY TRUE` sorts by a constant): such a term is
+    /// kept from reading as an ordinal.
+    fn sort_item<E>(&mut self, held: usize) -> Result<Expr, E> {
+        let p0 = self.pos;
+        let mut e = self.raw::<E>(held)?;
+        let word = self
+            .toks
+            .as_slice()
+            .get(p0..self.pos)
+            .unwrap_or(&[])
+            .iter()
+            .any(|t| match t.tok {
+                Tok::Ident(h, false) => {
+                    let b = handle_bytes(self.arena, h);
+                    eq_ci(b, b"TRUE") || eq_ci(b, b"FALSE")
+                }
+                _ => false,
+            });
+        ordinal_term(&mut e, word);
+        self.fold_item::<E>(!matches!(e, Expr::Literal(Literal::Integer(_))))?;
+        #[cfg(feature = "v16")]
+        mark_ctx(&mut e, self.eh);
+        Ok(e)
+    }
+
+    /// An expression with `held` symbols below it, its subqueries'
+    /// resolution depths collected afresh in `rsub` (left set for
+    /// the caller, as is `eh`).
+    fn raw<E>(&mut self, held: usize) -> Result<Expr, E> {
+        let h0 = self.held;
+        self.held = held;
+        self.peak::<E>(self.held)?;
+        self.rsub = 0;
+        let r = self.parse_expr::<E>();
+        self.held = h0;
+        r
+    }
+
+    /// A subquery's select statement with `k` more symbols below
+    /// it; afterwards `sel_h` / `sel_r` describe it and `rsub`
+    /// includes its resolution depth.
+    #[cfg(feature = "v06")]
+    fn subquery<E>(&mut self, k: usize) -> Result<SelectStmt, E> {
+        let h0 = self.held;
+        self.held = h0.saturating_add(k);
+        self.peak::<E>(self.held)?;
+        let r = self.select_rich::<E>();
+        self.held = h0;
+        let s = r?;
+        self.rsub = self.rsub.max(self.sel_r);
+        Ok(s)
+    }
+
     /// An expression whose operators all bind at least as
     /// tightly as `min`.
     fn expr_bp<E>(&mut self, min: u8) -> Result<Expr, E> {
+        let p0 = self.pos;
         let mut l = self.expr_prefix::<E>()?;
         while let Some(bp) = self.infix_bp() {
             if bp < min {
                 break;
             }
+            if bp == BP_OR || bp == BP_AND {
+                self.mark_and_or_operand(&mut l, p0);
+            }
             l = self.expr_infix::<E>(l, bp)?;
         }
         Ok(l)
+    }
+
+    /// An integer-literal operand of AND / OR (tokens `p0` to the
+    /// cursor) that the pin does not treat as a constant truth
+    /// value is wrapped in a unary `+` (v0.16 review fix, ungated):
+    /// the pin simplifies `0 AND x` / `x OR 1` only over a single
+    /// integer token holding a 32-bit value (or TRUE / FALSE), so
+    /// `-1 OR x`, `+0 AND x`, `1_0 OR x` and `2147483648 OR x` still
+    /// evaluate `x` there (the evaluator's short-circuit, `int_lit`,
+    /// sees only a bare literal).
+    fn mark_and_or_operand(&self, e: &mut Expr, p0: usize) {
+        if !matches!(e, Expr::Literal(Literal::Integer(_))) {
+            return;
+        }
+        let toks = self.toks.as_slice().get(p0..self.pos).unwrap_or(&[]);
+        let mut a = 0;
+        let mut b = toks.len();
+        while b > a + 1
+            && matches!(toks.get(a).map(|t| t.tok), Some(Tok::LParen))
+            && matches!(toks.get(b - 1).map(|t| t.tok), Some(Tok::RParen))
+        {
+            a += 1;
+            b -= 1;
+        }
+        let simple = b == a + 1
+            && toks.get(a).is_some_and(|t| match t.tok {
+                Tok::Integer(v) => {
+                    (0..=i64::from(i32::MAX)).contains(&v)
+                        && !self
+                            .sql
+                            .get(t.offset..)
+                            .unwrap_or(&[])
+                            .iter()
+                            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+                            .any(|c| *c == b'_')
+                }
+                Tok::Ident(h, false) => {
+                    let w = handle_bytes(self.arena, h);
+                    eq_ci(w, b"TRUE") || eq_ci(w, b"FALSE")
+                }
+                _ => false,
+            });
+        if !simple {
+            let inner = core::mem::replace(e, Expr::Literal(Literal::Null));
+            *e = Expr::Pos(Box::new(inner));
+        }
     }
 
     /// The binding power of the operator at the cursor, if it
@@ -2047,9 +2865,14 @@ impl<'a> Parser<'a> {
     /// to the left operand `l`.
     fn expr_infix<E>(&mut self, l: Expr, bp: u8) -> Result<Expr, E> {
         let bin = |op: BinOp, l: Expr, r: Expr| Expr::Binary(op, Box::new(l), Box::new(r));
+        let (lh, lk) = (self.eh, self.ek);
         if bp == BP_OR || bp == BP_AND {
             self.pos += 1;
-            let r = self.expr_bp::<E>(bp + 1)?;
+            let r0 = self.pos;
+            // `expr AND expr`: two symbols below the right operand.
+            let mut r = self.operand::<E>(2, bp + 1)?;
+            self.mark_and_or_operand(&mut r, r0);
+            self.node::<E>(lh, lk)?;
             return Ok(bin(if bp == BP_OR { BinOp::Or } else { BinOp::And }, l, r));
         }
         if bp == BP_EQ && matches!(self.cur().tok, Tok::Ident(..)) {
@@ -2060,6 +2883,10 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let c = self.coll_at::<E>(self.pos)?;
             self.pos += 1;
+            // `expr COLLATE ids`.
+            self.need::<E>(3)?;
+            self.node::<E>(0, EK_CONST)?;
+            self.ek |= EK_COLLATE;
             return Ok(Expr::Collate(Box::new(l), c));
         }
         let op = match self.cur().tok {
@@ -2085,46 +2912,80 @@ impl<'a> Parser<'a> {
             _ => BinOp::Concat,
         };
         self.pos += 1;
-        // `==` is spelled with two Eq tokens by the lexer.
+        // `==` is spelled with two Eq tokens by the lexer (one
+        // token, one symbol, on the pin).
         if op == BinOp::Eq {
             let _ = self.eat(Tok::Eq);
         }
-        let r = self.expr_bp::<E>(bp + 1)?;
+        let r = self.operand::<E>(2, bp + 1)?;
+        self.node::<E>(lh, lk)?;
         Ok(bin(op, l, r))
+    }
+
+    /// `x ISNULL` / `NOTNULL` / `NOT NULL` / `IS [NOT] NULL` over
+    /// the expression just parsed: the pin folds it to a literal
+    /// when the operand is a numeric, string or blob literal
+    /// (under any unary `+` / `-`), else a node.
+    ///
+    /// The fold is the pin's `sqlite3PExprIsNull`: the test becomes
+    /// the integer literal `notnull` (v0.16 fix, ungated: so `ORDER
+    /// BY 2 NOTNULL` is the ordinal 1 and `GROUP BY 1 ISNULL` the
+    /// out-of-range ordinal 0, as on the pin — hipp sorted and
+    /// grouped by a constant). Returns the expression made.
+    fn null_test<E>(&mut self, operand: Expr, notnull: bool) -> Result<Expr, E> {
+        if self.ek & EK_LIT != 0 {
+            self.set_h::<E>(1, EK_LIT | EK_CONST)?;
+            return Ok(Expr::Literal(Literal::Integer(i64::from(notnull))));
+        }
+        self.node::<E>(0, EK_CONST)?;
+        Ok(Expr::IsNull(Box::new(operand), notnull))
     }
 
     /// The keyword operators of the `=` level: IS [NOT]
     /// [DISTINCT FROM], ISNULL, NOTNULL, NOT NULL, [NOT] IN /
     /// LIKE / GLOB / BETWEEN.
     fn expr_eq_kw<E>(&mut self, l: Expr) -> Result<Expr, E> {
-        // Postfix ISNULL / NOTNULL.
-        if self.eat_kw(b"ISNULL") {
-            return Ok(Expr::IsNull(Box::new(l), false));
-        }
-        if self.eat_kw(b"NOTNULL") {
-            return Ok(Expr::IsNull(Box::new(l), true));
+        let (lh, lk) = (self.eh, self.ek);
+        // Postfix ISNULL / NOTNULL (`expr ISNULL`).
+        if self.cur_is_kw(b"ISNULL") || self.cur_is_kw(b"NOTNULL") {
+            let neg = self.cur_is_kw(b"NOTNULL");
+            self.pos += 1;
+            self.need::<E>(2)?;
+            return self.null_test::<E>(l, neg);
         }
         if self.eat_kw(b"IS") {
             let neg = self.eat_kw(b"NOT");
             // `IS [NOT] DISTINCT FROM` (v0.16, `v16`): `IS NOT
             // DISTINCT FROM` is IS, `IS DISTINCT FROM` is IS NOT.
             #[cfg(feature = "v16")]
-            let neg = if self.eat_kw(b"DISTINCT") {
+            let (neg, distinct) = if self.eat_kw(b"DISTINCT") {
                 self.expect_kw::<E>(b"FROM")?;
-                !neg
+                (!neg, true)
             } else {
-                neg
+                (neg, false)
             };
+            #[cfg(not(feature = "v16"))]
+            let distinct = false;
+            // `expr IS [NOT] [DISTINCT FROM] expr`.
+            let k = 2 + usize::from(neg != distinct) + 2 * usize::from(distinct);
             let start = self.pos;
-            let r = self.expr_bp::<E>(BP_REL)?;
+            let r = self.operand::<E>(k, BP_REL)?;
+            let bare = |p: &Self, w: &[u8]| p.pos == start + 1 && p.is_kw(start, w);
+            // `x IS [NOT] NULL` is the pin's null test (folded
+            // over a literal).
+            if !distinct && bare(self, b"NULL") {
+                self.eh = lh;
+                self.ek = lk;
+                return self.null_test::<E>(l, neg);
+            }
+            self.node::<E>(lh, lk)?;
             // `x IS [NOT] TRUE / FALSE` with the bare keyword as
             // the whole right operand is the pin's truth test
             // (`TK_TRUTH`): any true value IS TRUE, NULL is
             // neither (v0.16 fix, ungated: `2 IS TRUE` was 0).
             // Written as the CASE it equals.
-            if self.pos == start + 1
-                && let Expr::Literal(Literal::Integer(v @ (0 | 1))) = r
-                && (self.is_kw(start, b"TRUE") || self.is_kw(start, b"FALSE"))
+            if let Expr::Literal(Literal::Integer(v @ (0 | 1))) = r
+                && (bare(self, b"TRUE") || bare(self, b"FALSE"))
             {
                 let test = if v == 1 { l } else { Expr::Not(Box::new(l)) };
                 let (yes, no) = if neg { (0, 1) } else { (1, 0) };
@@ -2144,49 +3005,80 @@ impl<'a> Parser<'a> {
         #[cfg(feature = "v16")]
         if neg && self.cur_is_kw(b"NULL") {
             self.pos += 1;
-            return Ok(Expr::IsNull(Box::new(l), true));
+            // `expr NOT NULL`.
+            self.need::<E>(3)?;
+            return self.null_test::<E>(l, true);
         }
         if self.eat_kw(b"IN") {
             return self.expr_in::<E>(l, neg);
         }
         if self.eat_kw(b"LIKE") {
-            let r = self.expr_bp::<E>(BP_REL)?;
+            // `expr likeop expr [ESCAPE expr]`: the pin's
+            // `like(pattern, x[, escape])` function node.
+            let r = self.operand::<E>(2, BP_REL)?;
             // `x LIKE p ESCAPE e` (v0.16, `v16`) is the pin's
             // `like(p, x, e)` call, negated for NOT LIKE.
             #[cfg(feature = "v16")]
             if self.eat_kw(b"ESCAPE") {
-                let esc = self.expr_bp::<E>(BP_REL)?;
+                let (rh, rk) = (self.eh, self.ek);
+                let esc = self.operand::<E>(4, BP_REL)?;
+                self.node::<E>(lh.max(rh), lk & rk)?;
+                self.negated::<E>(neg)?;
                 return self.pattern_call::<E>(b"like", r, l, Some(esc), neg);
             }
+            self.node::<E>(lh, lk)?;
+            self.negated::<E>(neg)?;
             return Ok(Expr::Like(Box::new(l), Box::new(r), neg));
         }
         // `x [NOT] GLOB p` (v0.16, `v16`): the pin's
         // `glob(p, x)` call (no ESCAPE form).
         #[cfg(feature = "v16")]
         if self.eat_kw(b"GLOB") {
-            let r = self.expr_bp::<E>(BP_REL)?;
+            let r = self.operand::<E>(2, BP_REL)?;
+            self.node::<E>(lh, lk)?;
+            self.negated::<E>(neg)?;
             return self.pattern_call::<E>(b"glob", r, l, None, neg);
         }
         if self.eat_kw(b"BETWEEN") {
             // The lower bound runs to the BETWEEN's own AND; the
-            // upper bound takes only operators tighter than `=`.
-            let lo = self.expr_bp::<E>(BP_NOT)?;
+            // upper bound takes only operators tighter than `=`
+            // (`expr between_op expr AND expr`).
+            let lo = self.operand::<E>(2, BP_NOT)?;
+            let (loh, lok) = (self.eh, self.ek);
             self.expect_kw::<E>(b"AND")?;
-            let hi = self.expr_bp::<E>(BP_REL)?;
+            let hi = self.operand::<E>(4, BP_REL)?;
+            self.node::<E>(lh.max(loh), lk & lok)?;
+            self.negated::<E>(neg)?;
             return Ok(Expr::Between(Box::new(l), Box::new(lo), Box::new(hi), neg));
         }
         Err(perr(self.cur().offset, ParseKind::UnexpectedToken))
     }
 
+    /// The pin's NOT node over a negated operator (`NOT LIKE`,
+    /// `NOT BETWEEN`, `NOT IN`, ...).
+    fn negated<E>(&mut self, neg: bool) -> Result<(), E> {
+        if neg {
+            self.node::<E>(0, EK_CONST)?;
+        }
+        Ok(())
+    }
+
     /// The right side of `x [NOT] IN`: a table name (`v16`), a
     /// parenthesised subquery, or an expression list.
     fn expr_in<E>(&mut self, l: Expr, neg: bool) -> Result<Expr, E> {
+        let (lh, lk) = (self.eh, self.ek);
         // `x IN tablename` (v0.16, `v16`): the pin reads it as
         // `x IN (SELECT * FROM tablename)` — a one-column table
         // is required at plan time.
         #[cfg(feature = "v16")]
         if let Tok::Ident(..) = self.cur().tok {
             let (table, qualified) = self.name_q::<E>()?;
+            // `expr in_op nm dbnm paren_exprlist`; the subquery's
+            // one result column (`*`) is a leaf.
+            self.need::<E>(5)?;
+            self.rsub = self.rsub.max(1);
+            self.set_h::<E>(lh.max(1) + 1, 0)?;
+            self.negated::<E>(neg)?;
             // A copy, not the token's handle: the pin's ALTER TABLE
             // RENAME leaves this name unedited (its "after rename"
             // check then fails), and ALTER maps token handles only.
@@ -2224,11 +3116,18 @@ impl<'a> Parser<'a> {
         if is_subquery {
             #[cfg(feature = "v06")]
             {
-                let stmt = self.select_rich::<E>()?;
+                // `expr in_op LP select RP` (each further `(` one
+                // more symbol: a scalar-subquery list item the pin
+                // turns into this form).
+                let rsub0 = self.rsub;
+                let stmt = self.subquery::<E>(3 + extra_parens)?;
                 for _ in 0..extra_parens {
                     self.expect::<E>(Tok::RParen)?;
                 }
                 if self.eat(Tok::RParen) {
+                    self.need::<E>(5)?;
+                    self.set_h::<E>(lh.max(self.sel_h) + 1, 0)?;
+                    self.negated::<E>(neg)?;
                     return Ok(Expr::InSubquery(Box::new(l), Box::new(stmt), neg));
                 }
                 // `IN ((SELECT ...), 2)` / `IN ((SELECT ...) + 1)`:
@@ -2238,6 +3137,7 @@ impl<'a> Parser<'a> {
                     return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
                 }
                 self.pos = save;
+                self.rsub = rsub0;
             }
             #[cfg(not(feature = "v06"))]
             {
@@ -2245,9 +3145,19 @@ impl<'a> Parser<'a> {
             }
         }
         let mut list = AVec::new();
+        // The tallest item, whether all are constant, and the
+        // first item's height and kind.
+        let (mut ih, mut ik, mut first) = (0usize, EK_CONST, (0usize, 0u8));
         if !matches!(self.cur().tok, Tok::RParen) {
             loop {
-                list.push(self.parse_expr::<E>()?);
+                // `expr in_op LP [nexprlist COMMA] expr`.
+                let k = if list.is_empty() { 3 } else { 5 };
+                list.push(self.operand_expr::<E>(k)?);
+                if list.len() == 1 {
+                    first = (self.eh, self.ek);
+                }
+                ih = ih.max(self.eh);
+                ik &= self.ek;
                 if self.eat(Tok::Comma) {
                     continue;
                 }
@@ -2255,6 +3165,22 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect::<E>(Tok::RParen)?;
+        self.need::<E>(5)?;
+        if list.is_empty() {
+            // The pin folds `x IN ()` to the integer 0 (1 for NOT
+            // IN), dropping x.
+            self.set_h::<E>(1, EK_LIT | EK_CONST)?;
+            return Ok(Expr::InList(Box::new(l), list, neg));
+        }
+        if list.len() == 1 && first.1 & EK_CONST != 0 && first.1 & EK_COLLATE == 0 && !is_vector(&l)
+        {
+            // One constant item (no COLLATE): the pin rewrites it
+            // to `x = +item`.
+            self.set_h::<E>(lh.max(first.0 + 1) + 1, lk & first.1 & EK_CONST)?;
+        } else {
+            self.set_h::<E>(lh.max(ih) + 1, lk & ik & EK_CONST)?;
+        }
+        self.negated::<E>(neg)?;
         Ok(Expr::InList(Box::new(l), list, neg))
     }
 
@@ -2262,7 +3188,9 @@ impl<'a> Parser<'a> {
     /// primary.
     fn expr_prefix<E>(&mut self) -> Result<Expr, E> {
         if self.eat_kw(b"NOT") {
-            let e = self.expr_bp::<E>(BP_EQ)?;
+            // `NOT expr`.
+            let e = self.operand::<E>(1, BP_EQ)?;
+            self.node::<E>(0, EK_CONST)?;
             return Ok(Expr::Not(Box::new(e)));
         }
         self.expr_unary::<E>()
@@ -2296,142 +3224,160 @@ impl<'a> Parser<'a> {
         Ok(if neg { Expr::Not(Box::new(call)) } else { call })
     }
 
+    /// Apply the pin's unary `+` / `-` rule to the expression just
+    /// parsed: over a `+` node, `+` keeps it and `-` turns it into
+    /// a `-` node (no new node either way); otherwise a new node,
+    /// a `+` one for `plus`.
+    fn sign_node<E>(&mut self, plus: bool) -> Result<(), E> {
+        if self.ek & EK_UPLUS != 0 {
+            if !plus {
+                self.ek &= !EK_UPLUS;
+            }
+            return Ok(());
+        }
+        let k = self.ek & (EK_CONST | EK_LIT);
+        self.set_h::<E>(
+            self.eh.saturating_add(1),
+            k | if plus { EK_UPLUS } else { 0 },
+        )
+    }
+
     fn expr_unary<E>(&mut self) -> Result<Expr, E> {
         // Signed literals fold at this level (literal_at handles
         // the sign itself).
-        if let Some((lit, used)) = self.literal_at(self.pos) {
-            self.pos += used;
-            return Ok(Expr::Literal(lit));
-        }
-        if self.eat(Tok::Minus) {
-            let start = self.pos;
-            let e = self.expr_prefix::<E>()?;
-            // `-(9223372036854775808)`: parentheses (and unary
-            // `+`) are invisible to the pin's integer rule — and
-            // to its "hex literal too big" for `-` over
-            // `0x8000000000000000` (v0.16).
-            let toks = self.toks.as_slice().get(start..self.pos).unwrap_or(&[]);
-            let only = |f: &dyn Fn(usize) -> bool| {
-                toks.iter().enumerate().all(|(k, t)| {
-                    matches!(t.tok, Tok::LParen | Tok::RParen | Tok::Plus) || f(start + k)
-                })
-            };
-            if only(&|k| self.min_magnitude(k))
-                && toks.iter().any(|t| matches!(t.tok, Tok::Real(_)))
-            {
-                return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
-            }
-            if only(&|k| self.hex_min(k)) && toks.iter().any(|t| matches!(t.tok, Tok::Integer(_))) {
-                return Ok(Expr::HexTooBig(self.cur().offset));
-            }
-            return Ok(Expr::Neg(Box::new(e)));
-        }
-        if self.eat(Tok::Plus) {
-            let e = self.expr_prefix::<E>()?;
-            return Ok(Expr::Pos(Box::new(e)));
-        }
-        #[cfg(feature = "v16")]
-        if self.eat(Tok::BitNot) {
-            let e = self.expr_prefix::<E>()?;
-            return Ok(Expr::BitNot(Box::new(e)));
-        }
-        self.expr_primary::<E>()
-    }
-
-    fn expr_primary<E>(&mut self) -> Result<Expr, E> {
-        #[cfg(feature = "v04")]
-        if matches!(self.cur().tok, Tok::HexTooBig) {
-            let off = self.cur().offset;
-            self.pos += 1;
-            return Ok(Expr::HexTooBig(off));
-        }
-        #[cfg(feature = "v06")]
-        if self.cur_is_kw(b"EXISTS") {
-            self.pos += 1;
-            self.expect::<E>(Tok::LParen)?;
-            let mut extra_parens = 0usize;
-            while matches!(self.cur().tok, Tok::LParen) {
-                self.pos += 1;
-                extra_parens += 1;
-            }
-            if !self.cur_is_kw(b"SELECT")
-                && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
-                && !self.with_at(self.pos)
-            {
-                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
-            }
-            let stmt = self.select_rich::<E>()?;
-            for _ in 0..=extra_parens {
-                self.expect::<E>(Tok::RParen)?;
-            }
-            return Ok(Expr::ExistsSubquery(Box::new(stmt)));
-        }
-        if self.eat(Tok::LParen) {
-            if self.cur_is_kw(b"SELECT")
-                || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
-                || self.with_at(self.pos)
-            {
-                #[cfg(feature = "v06")]
-                {
-                    let stmt = self.select_rich::<E>()?;
-                    self.expect::<E>(Tok::RParen)?;
-                    return Ok(Expr::ScalarSubquery(Box::new(stmt)));
-                }
-                #[cfg(not(feature = "v06"))]
-                {
-                    return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
-                }
-            }
-            let e = self.parse_expr::<E>()?;
-            // A row value `(a, b, ...)` (v0.16, `v16`).
-            #[cfg(feature = "v16")]
-            if self.eat(Tok::Comma) {
-                let mut items = AVec::new();
-                items.push(e);
-                loop {
-                    items.push(self.parse_expr::<E>()?);
-                    if !self.eat(Tok::Comma) {
-                        break;
-                    }
-                }
-                self.expect::<E>(Tok::RParen)?;
-                return Ok(Expr::Vector(items));
-            }
-            self.expect::<E>(Tok::RParen)?;
+        if let Some(e) = self.signed_literal_expr::<E>()? {
             return Ok(e);
         }
-        if self.cur_is_kw(b"CASE") {
-            self.pos += 1;
-            let base = if self.cur_is_kw(b"WHEN") {
-                None
-            } else {
-                Some(Box::new(self.parse_expr::<E>()?))
-            };
-            let mut whens = AVec::new();
-            while self.eat_kw(b"WHEN") {
-                let w = self.parse_expr::<E>()?;
-                self.expect_kw::<E>(b"THEN")?;
-                let t = self.parse_expr::<E>()?;
-                whens.push((w, t));
-            }
-            if whens.is_empty() {
-                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
-            }
-            let otherwise = if self.eat_kw(b"ELSE") {
-                Some(Box::new(self.parse_expr::<E>()?))
-            } else {
-                None
-            };
-            self.expect_kw::<E>(b"END")?;
-            return Ok(Expr::Case {
-                base,
-                whens,
-                otherwise,
-            });
-        }
         match self.cur().tok {
+            Tok::Minus => self.expr_neg::<E>(),
+            Tok::Plus => {
+                self.pos += 1;
+                let e = self.unary_operand::<E>()?;
+                self.sign_node::<E>(true)?;
+                Ok(Expr::Pos(Box::new(e)))
+            }
+            #[cfg(feature = "v16")]
+            Tok::BitNot => {
+                self.pos += 1;
+                let e = self.unary_operand::<E>()?;
+                self.node::<E>(0, EK_CONST)?;
+                Ok(Expr::BitNot(Box::new(e)))
+            }
+            _ => self.expr_primary::<E>(),
+        }
+    }
+
+    /// A literal under any run of unary signs, consumed: one stack
+    /// symbol per sign and the literal's own, and the pin's height
+    /// for the sign nodes. `None` when no literal starts here.
+    #[inline(never)]
+    fn signed_literal_expr<E>(&mut self) -> Result<Option<Expr>, E> {
+        let Some((lit, used)) = self.literal_at(self.pos) else {
+            return Ok(None);
+        };
+        self.need::<E>(used)?;
+        let last = self.pos + used - 1;
+        let leaf = match lit {
+            Literal::Null => EK_CONST,
+            Literal::Integer(_) if self.literal_word(last) => EK_CONST,
+            _ => EK_CONST | EK_LIT,
+        };
+        self.set_h::<E>(1, leaf)?;
+        let mut i = last;
+        while i > self.pos {
+            i -= 1;
+            let plus = matches!(self.toks.as_slice().get(i).map(|t| t.tok), Some(Tok::Plus));
+            self.sign_node::<E>(plus)?;
+        }
+        self.pos += used;
+        Ok(Some(Expr::Literal(lit)))
+    }
+
+    /// Unary `-` over a non-literal operand.
+    #[inline(never)]
+    fn expr_neg<E>(&mut self) -> Result<Expr, E> {
+        self.pos += 1;
+        let start = self.pos;
+        let e = self.unary_operand::<E>()?;
+        self.sign_node::<E>(false)?;
+        if let Some(x) = self.neg_special(start) {
+            return Ok(x);
+        }
+        Ok(Expr::Neg(Box::new(e)))
+    }
+
+    /// `-(9223372036854775808)`: parentheses (and unary `+`) are
+    /// invisible to the pin's integer rule — and to its "hex
+    /// literal too big" for `-` over `0x8000000000000000` (v0.16).
+    /// The operand spans tokens `start..pos`.
+    #[inline(never)]
+    fn neg_special(&self, start: usize) -> Option<Expr> {
+        let toks = self.toks.as_slice().get(start..self.pos).unwrap_or(&[]);
+        let only = |f: &dyn Fn(usize) -> bool| {
+            toks.iter().enumerate().all(|(k, t)| {
+                matches!(t.tok, Tok::LParen | Tok::RParen | Tok::Plus) || f(start + k)
+            })
+        };
+        if only(&|k| self.min_magnitude(k)) && toks.iter().any(|t| matches!(t.tok, Tok::Real(_))) {
+            return Some(Expr::Literal(Literal::Integer(i64::MIN)));
+        }
+        if only(&|k| self.hex_min(k)) && toks.iter().any(|t| matches!(t.tok, Tok::Integer(_))) {
+            return Some(Expr::HexTooBig(self.cur().offset));
+        }
+        None
+    }
+
+    /// The operand of a unary `-` / `+` / `~`: one symbol (the
+    /// operator) below it.
+    fn unary_operand<E>(&mut self) -> Result<Expr, E> {
+        let h0 = self.held;
+        self.held = h0.saturating_add(1);
+        self.peak::<E>(self.held)?;
+        let r = self.expr_prefix::<E>();
+        self.held = h0;
+        r
+    }
+
+    /// Token `i` is the keyword TRUE or FALSE (a literal the pin
+    /// does not fold under ISNULL).
+    fn literal_word(&self, i: usize) -> bool {
+        matches!(
+            self.toks.as_slice().get(i).map(|t| t.tok),
+            Some(Tok::Ident(..))
+        )
+    }
+
+    /// A primary: a literal, a column, a parameter, a function
+    /// call, CASE, CAST, a parenthesised expression, a row value or
+    /// a subquery. The nesting forms live in functions of their
+    /// own, so that the frame each nesting level puts on the stack
+    /// stays small.
+    fn expr_primary<E>(&mut self) -> Result<Expr, E> {
+        match self.cur().tok {
+            #[cfg(feature = "v04")]
+            Tok::HexTooBig => {
+                let off = self.cur().offset;
+                self.pos += 1;
+                self.need::<E>(1)?;
+                self.set_h::<E>(1, EK_CONST | EK_LIT)?;
+                Ok(Expr::HexTooBig(off))
+            }
+            Tok::LParen => self.expr_paren::<E>(),
+            #[cfg(feature = "params")]
+            Tok::Param(i, h) => {
+                self.pos += 1;
+                self.need::<E>(1)?;
+                self.set_h::<E>(1, EK_CONST)?;
+                Ok(Expr::Param(i, h))
+            }
             Tok::Ident(h, quoted) => {
-                let nb = handle_bytes(self.arena, h);
+                #[cfg(feature = "v06")]
+                if self.cur_is_kw(b"EXISTS") {
+                    return self.expr_exists::<E>();
+                }
+                if self.cur_is_kw(b"CASE") {
+                    return self.expr_case::<E>();
+                }
                 // Function call: ident followed by '('.
                 if !quoted
                     && matches!(
@@ -2439,153 +3385,692 @@ impl<'a> Parser<'a> {
                         Some(Tok::LParen)
                     )
                 {
-                    if eq_ci(nb, b"CAST") {
-                        self.pos += 2; // name + '('
-                        let e = self.parse_expr::<E>()?;
-                        self.expect_kw::<E>(b"AS")?;
-                        // Type name: raw SQL slice up to ')'.
-                        let start = self.cur().offset;
-                        let mut depth = 0usize;
-                        while !self.at_eof() {
-                            match self.cur().tok {
-                                Tok::LParen => depth += 1,
-                                Tok::RParen => {
-                                    if depth == 0 {
-                                        break;
-                                    }
-                                    depth -= 1;
-                                }
-                                Tok::Eof => break,
-                                _ => {}
-                            }
-                            self.pos += 1;
-                        }
-                        let end = self.cur().offset;
-                        let ty = self
-                            .arena
-                            .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
-                        self.expect::<E>(Tok::RParen)?;
-                        return Ok(Expr::Cast(Box::new(e), ty));
+                    if eq_ci(handle_bytes(self.arena, h), b"CAST") {
+                        return self.expr_cast::<E>();
                     }
-                    let fname = h;
-                    self.pos += 2; // name + '('
-                    let star = self.eat(Tok::Star);
-                    let distinct = !star && self.eat_kw(b"DISTINCT");
-                    let mut args = AVec::new();
-                    #[cfg(feature = "v16")]
-                    let no_args = self.cur_is_kw(b"ORDER");
-                    #[cfg(not(feature = "v16"))]
-                    let no_args = false;
-                    if !star && !no_args && !matches!(self.cur().tok, Tok::RParen) {
-                        loop {
-                            args.push(self.parse_expr::<E>()?);
-                            if self.eat(Tok::Comma) {
-                                continue;
-                            }
-                            break;
-                        }
+                    #[cfg(feature = "triggers")]
+                    if eq_ci(handle_bytes(self.arena, h), b"RAISE") {
+                        return self.expr_raise::<E>();
                     }
-                    // `f(args ORDER BY ...)` (v0.16, `v16`): the
-                    // pin's grammar takes it after a (possibly
-                    // empty) argument list, not after `*`
-                    // (`count(* ORDER BY x)` is a syntax error
-                    // there). With no arguments the pin's
-                    // `sqlite3ExprAddFunctionOrderBy` drops the
-                    // clause unresolved: `count(ORDER BY nosuch)`
-                    // is `count(*)` (review fix: it was refused).
-                    #[cfg(feature = "v16")]
-                    let order_by = if !star && self.eat_kw(b"ORDER") {
-                        self.expect_kw::<E>(b"BY")?;
-                        let terms = self.order_terms::<E>()?;
-                        if args.is_empty() { AVec::new() } else { terms }
-                    } else {
-                        AVec::new()
-                    };
-                    self.expect::<E>(Tok::RParen)?;
-                    // `FILTER (WHERE expr)` (v0.16, `v16`).
-                    // FILTER is no reserved word: only a FILTER
-                    // followed by `(` starts the clause, so
-                    // `count(*) filter` stays an alias.
-                    #[cfg(feature = "v16")]
-                    let filter = if self.cur_is_kw(b"FILTER")
-                        && matches!(
-                            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
-                            Some(Tok::LParen)
-                        ) {
-                        self.pos += 2;
-                        self.expect_kw::<E>(b"WHERE")?;
-                        let f = self.parse_expr::<E>()?;
-                        self.expect::<E>(Tok::RParen)?;
-                        Some(f)
-                    } else {
-                        None
-                    };
-                    return Ok(Expr::Func {
-                        name: fname,
-                        distinct,
-                        star,
-                        args,
-                        #[cfg(feature = "v16")]
-                        clause: if order_by.is_empty() && filter.is_none() {
-                            None
-                        } else {
-                            Some(Box::new(crate::sql::ast::FuncClause { order_by, filter }))
-                        },
-                    });
+                    return self.expr_call::<E>(h);
                 }
-                if let Some((lit, used)) = self.literal_at(self.pos) {
-                    self.pos += used;
-                    return Ok(Expr::Literal(lit));
-                }
-                // Column reference, possibly qualified. Parse the
-                // tokens directly (name() would eat the qualifier).
-                self.pos += 1;
-                if matches!(self.cur().tok, Tok::Dot) {
-                    self.pos += 1;
-                    match self.cur().tok {
-                        Tok::Ident(h2, _) => {
-                            self.pos += 1;
-                            return Ok(Expr::Column {
-                                table: Some(h),
-                                name: h2,
-                            });
-                        }
-                        _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
-                    }
-                }
-                Ok(Expr::Column {
-                    table: None,
-                    name: h,
-                })
-            }
-            #[cfg(feature = "params")]
-            Tok::Param(i, h) => {
-                self.pos += 1;
-                Ok(Expr::Param(i, h))
+                self.expr_column::<E>(h)
             }
             _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         }
     }
 
+    /// A column reference `name` or `table.name` (or a NULL /
+    /// TRUE / FALSE literal) at the cursor.
+    #[inline(never)]
+    fn expr_column<E>(&mut self, h: ABytes) -> Result<Expr, E> {
+        if let Some((lit, used)) = self.literal_at(self.pos) {
+            self.pos += used;
+            self.need::<E>(1)?;
+            self.set_h::<E>(1, EK_CONST)?;
+            return Ok(Expr::Literal(lit));
+        }
+        // Column reference, possibly qualified. Parse the
+        // tokens directly (name() would eat the qualifier).
+        self.pos += 1;
+        if matches!(self.cur().tok, Tok::Dot) {
+            self.pos += 1;
+            match self.cur().tok {
+                Tok::Ident(h2, _) => {
+                    self.pos += 1;
+                    // `nm DOT nm`: the pin's DOT node over
+                    // two leaves.
+                    self.need::<E>(3)?;
+                    self.set_h::<E>(2, 0)?;
+                    return Ok(Expr::Column {
+                        table: Some(h),
+                        name: h2,
+                    });
+                }
+                _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+            }
+        }
+        self.need::<E>(1)?;
+        let k = if is_ctime_kw(handle_bytes(self.arena, h)) {
+            EK_CONST
+        } else {
+            0
+        };
+        self.set_h::<E>(1, k)?;
+        Ok(Expr::Column {
+            table: None,
+            name: h,
+        })
+    }
+
+    /// `EXISTS (select)` (v0.6).
+    #[cfg(feature = "v06")]
+    #[inline(never)]
+    fn expr_exists<E>(&mut self) -> Result<Expr, E> {
+        self.pos += 1;
+        self.expect::<E>(Tok::LParen)?;
+        let mut extra_parens = 0usize;
+        while matches!(self.cur().tok, Tok::LParen) {
+            self.pos += 1;
+            extra_parens += 1;
+        }
+        if !self.cur_is_kw(b"SELECT")
+            && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            && !self.with_at(self.pos)
+        {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
+        // `EXISTS LP select RP`.
+        let stmt = self.subquery::<E>(2 + extra_parens)?;
+        for _ in 0..=extra_parens {
+            self.expect::<E>(Tok::RParen)?;
+        }
+        self.need::<E>(4)?;
+        self.set_h::<E>(self.sel_h + 1, 0)?;
+        Ok(Expr::ExistsSubquery(Box::new(stmt)))
+    }
+
+    /// `( ... )`: a scalar subquery, a parenthesised expression or
+    /// (`v16`) a row value.
+    #[inline(never)]
+    fn expr_paren<E>(&mut self) -> Result<Expr, E> {
+        self.pos += 1;
+        if self.cur_is_kw(b"SELECT")
+            || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            || self.with_at(self.pos)
+        {
+            return self.paren_subquery::<E>();
+        }
+        // `LP expr RP` (no node of its own).
+        let e = self.operand_expr::<E>(1)?;
+        #[cfg(feature = "v16")]
+        if matches!(self.cur().tok, Tok::Comma) {
+            return self.paren_vector::<E>(e);
+        }
+        self.expect::<E>(Tok::RParen)?;
+        self.need::<E>(3)?;
+        Ok(e)
+    }
+
+    /// `LP select RP`: a scalar subquery.
+    #[inline(never)]
+    fn paren_subquery<E>(&mut self) -> Result<Expr, E> {
+        #[cfg(feature = "v06")]
+        {
+            let stmt = self.subquery::<E>(1)?;
+            self.expect::<E>(Tok::RParen)?;
+            self.need::<E>(3)?;
+            self.set_h::<E>(self.sel_h + 1, 0)?;
+            Ok(Expr::ScalarSubquery(Box::new(stmt)))
+        }
+        #[cfg(not(feature = "v06"))]
+        {
+            Err(perr(self.cur().offset, ParseKind::UnsupportedClause))
+        }
+    }
+
+    /// The rest of a row value `(a, b, ...)` after its first
+    /// element (v0.16, `v16`): `LP nexprlist COMMA expr RP`, a node
+    /// of height 1 on the pin whatever its elements.
+    #[cfg(feature = "v16")]
+    #[inline(never)]
+    fn paren_vector<E>(&mut self, first: Expr) -> Result<Expr, E> {
+        let mut k = self.ek;
+        let mut items = AVec::new();
+        items.push(first);
+        while self.eat(Tok::Comma) {
+            items.push(self.operand_expr::<E>(3)?);
+            k &= self.ek;
+        }
+        self.expect::<E>(Tok::RParen)?;
+        self.need::<E>(5)?;
+        self.set_h::<E>(1, k & EK_CONST)?;
+        Ok(Expr::Vector(items))
+    }
+
+    /// `CASE [base] WHEN ... THEN ... [ELSE ...] END`.
+    #[inline(never)]
+    fn expr_case<E>(&mut self) -> Result<Expr, E> {
+        self.pos += 1;
+        // `CASE case_operand case_exprlist case_else END`: the
+        // operand one symbol up; the first WHEN three (`CASE
+        // case_operand WHEN`), later ones four; THEN two more.
+        let (mut h, mut k) = (0usize, EK_CONST);
+        let base = if self.cur_is_kw(b"WHEN") {
+            None
+        } else {
+            let b = self.operand_expr::<E>(1)?;
+            (h, k) = (self.eh, self.ek);
+            Some(Box::new(b))
+        };
+        let mut whens = AVec::new();
+        while self.eat_kw(b"WHEN") {
+            let at = if whens.is_empty() { 3 } else { 4 };
+            let w = self.operand_expr::<E>(at)?;
+            (h, k) = (h.max(self.eh), k & self.ek);
+            self.expect_kw::<E>(b"THEN")?;
+            let t = self.operand_expr::<E>(at + 2)?;
+            (h, k) = (h.max(self.eh), k & self.ek);
+            whens.push((w, t));
+        }
+        if whens.is_empty() {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
+        let otherwise = if self.eat_kw(b"ELSE") {
+            let o = self.operand_expr::<E>(4)?;
+            (h, k) = (h.max(self.eh), k & self.ek);
+            Some(Box::new(o))
+        } else {
+            None
+        };
+        self.expect_kw::<E>(b"END")?;
+        self.need::<E>(5)?;
+        self.set_h::<E>(h + 1, k & EK_CONST)?;
+        Ok(Expr::Case {
+            base,
+            whens,
+            otherwise,
+        })
+    }
+
+    /// `CAST(expr AS type)`.
+    #[inline(never)]
+    fn expr_cast<E>(&mut self) -> Result<Expr, E> {
+        self.pos += 2; // name + '('
+        // `CAST LP expr AS typetoken RP`.
+        let e = self.operand_expr::<E>(2)?;
+        let (h, k) = (self.eh, self.ek);
+        self.expect_kw::<E>(b"AS")?;
+        // Type name: raw SQL slice up to ')'.
+        let start = self.cur().offset;
+        let mut depth = 0usize;
+        let mut args = 0usize;
+        while !self.at_eof() {
+            match self.cur().tok {
+                Tok::LParen => {
+                    depth += 1;
+                    args = args.max(1);
+                }
+                Tok::Comma if depth == 1 => args = 2,
+                Tok::RParen => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::Eof => break,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        let end = self.cur().offset;
+        let ty = self.arena.alloc_copy_handle(trim(self.span(start, end)))?;
+        self.expect::<E>(Tok::RParen)?;
+        // `typename [LP signed [COMMA signed] RP]` peaks above
+        // `CAST LP expr AS`.
+        self.need::<E>(6 + 2 * args)?;
+        self.eh = h;
+        self.ek = k;
+        self.node::<E>(0, EK_CONST)?;
+        Ok(Expr::Cast(Box::new(e), ty))
+    }
+
+    /// A function call `name(...)`: `*`, `DISTINCT`, the
+    /// arguments, the aggregate ORDER BY and FILTER (`v16`).
+    #[inline(never)]
+    fn expr_call<E>(&mut self, fname: ABytes) -> Result<Expr, E> {
+        self.pos += 2; // name + '('
+        let star = self.eat(Tok::Star);
+        let distinct = !star && self.eat_kw(b"DISTINCT");
+        let mut args = AVec::new();
+        #[cfg(feature = "v16")]
+        let no_args = self.cur_is_kw(b"ORDER");
+        #[cfg(not(feature = "v16"))]
+        let no_args = false;
+        // `idj LP distinct [nexprlist COMMA] expr`: the first
+        // argument three symbols up, later ones five.
+        let (mut h, mut k) = (0usize, EK_CONST);
+        if !star && !no_args && !matches!(self.cur().tok, Tok::RParen) {
+            loop {
+                let at = if args.is_empty() { 3 } else { 5 };
+                args.push(self.operand_expr::<E>(at)?);
+                (h, k) = (h.max(self.eh), k & self.ek);
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        if args.len() > MAX_FUNCTION_ARG {
+            return Err(perr(self.cur().offset, ParseKind::TooManyArguments));
+        }
+        // `f(args ORDER BY ...)` (v0.16, `v16`): the pin's
+        // grammar takes it after a (possibly empty) argument
+        // list, not after `*` (`count(* ORDER BY x)` is a
+        // syntax error there). With no arguments the pin's
+        // `sqlite3ExprAddFunctionOrderBy` drops the clause
+        // unresolved: `count(ORDER BY nosuch)` is `count(*)`
+        // (review fix: it was refused). Its terms (`idj LP
+        // distinct exprlist ORDER BY sortlist`) add nothing to
+        // the call's height.
+        #[cfg(feature = "v16")]
+        let clause = self.call_clauses::<E>(star, args.is_empty())?;
+        #[cfg(not(feature = "v16"))]
+        {
+            self.expect::<E>(Tok::RParen)?;
+            self.need::<E>(if star { 4 } else { 5 })?;
+        }
+        self.set_h::<E>(h + 1, k & EK_CONST)?;
+        Ok(Expr::Func {
+            name: fname,
+            distinct,
+            star,
+            args,
+            #[cfg(feature = "v16")]
+            clause,
+        })
+    }
+
+    /// A call's tail after its arguments (v0.16, `v16`): the
+    /// aggregate ORDER BY, the `)` and FILTER. Neither clause adds
+    /// to the call's height.
+    #[cfg(feature = "v16")]
+    #[inline(never)]
+    fn call_clauses<E>(
+        &mut self,
+        star: bool,
+        no_args: bool,
+    ) -> Result<Option<Box<crate::sql::ast::FuncClause>>, E> {
+        // `idj LP distinct exprlist ORDER BY sortlist`.
+        let order_by = if !star && self.eat_kw(b"ORDER") {
+            self.expect_kw::<E>(b"BY")?;
+            let terms = self.order_terms::<E>(self.held + 6, false)?;
+            if no_args { AVec::new() } else { terms }
+        } else {
+            AVec::new()
+        };
+        self.expect::<E>(Tok::RParen)?;
+        // `idj LP distinct exprlist RP` (`idj LP STAR RP`).
+        self.need::<E>(if star { 4 } else { 5 })?;
+        // `FILTER (WHERE expr)`: FILTER is no reserved word, so
+        // only a FILTER followed by `(` starts the clause and
+        // `count(*) filter` stays an alias (`... RP FILTER LP
+        // WHERE expr`).
+        let filter = if self.cur_is_kw(b"FILTER")
+            && matches!(
+                self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+                Some(Tok::LParen)
+            ) {
+            self.pos += 2;
+            self.expect_kw::<E>(b"WHERE")?;
+            let f = self.operand_expr::<E>(if star { 7 } else { 8 })?;
+            self.expect::<E>(Tok::RParen)?;
+            Some(f)
+        } else {
+            None
+        };
+        // `OVER (...)` / `OVER name` (v0.16, `window`): after the
+        // FILTER, as in the pin's `filter_over` (`OVER () FILTER`
+        // is a syntax error there).
+        #[cfg(feature = "window")]
+        let over = self.over_clause::<E>()?;
+        #[cfg(feature = "window")]
+        let none = over.is_none();
+        #[cfg(not(feature = "window"))]
+        let none = true;
+        Ok(if order_by.is_empty() && filter.is_none() && none {
+            None
+        } else {
+            Some(Box::new(crate::sql::ast::FuncClause {
+                order_by,
+                filter,
+                #[cfg(feature = "window")]
+                over,
+            }))
+        })
+    }
+
+    /// A call's `OVER` clause (v0.16, `window`). OVER is a keyword
+    /// only right after the call's `)` with `(` or a name after it
+    /// (the pin's `analyzeOverKeyword`), so `sum(x) over` is still
+    /// an alias. A "name" there is the pin's `getToken` ID: a
+    /// string, a quoted or fallback identifier, a join keyword —
+    /// never a keyword like FROM, WHERE, UNION or LIMIT (v0.16
+    /// review fix: `count(*) over FROM t` is an alias).
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn over_clause<E>(&mut self) -> Result<Option<crate::sql::ast::Over>, E> {
+        use crate::sql::ast::Over;
+        if !self.cur_is_kw(b"OVER") {
+            return Ok(None);
+        }
+        let i = self.pos + 1;
+        match self.toks.as_slice().get(i).map(|t| t.tok) {
+            Some(Tok::Ident(_, false)) if self.reserved(i, true) || self.is_kw(i, b"INDEXED") => {
+                Ok(None)
+            }
+            Some(Tok::LParen) => {
+                self.pos += 2;
+                // `... RP OVER LP`.
+                let w = self.window_def::<E>(self.held + 8)?;
+                self.expect::<E>(Tok::RParen)?;
+                Ok(Some(Over::Spec(Box::new(w))))
+            }
+            Some(Tok::Ident(..)) | Some(Tok::Text(_)) => {
+                let h = self.window_name::<E>(self.pos + 1)?;
+                self.pos += 2;
+                Ok(Some(Over::Named(h)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A window name token `i` as the pin keeps one: its raw text
+    /// with any quotes (`OVER [w]` names no window `w`), compared
+    /// case-insensitively (v0.16, `window`).
+    #[cfg(feature = "window")]
+    fn window_name<E>(&self, i: usize) -> Result<ABytes, E> {
+        let t = self.toks.as_slice().get(i.min(self.limit - 1)).copied();
+        let Some(t) = t else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        let quoted = match t.tok {
+            Tok::Ident(h, false) => return Ok(h),
+            Tok::Ident(_, true) | Tok::Text(_) => true,
+            _ => false,
+        };
+        if !quoted {
+            return Err(perr(t.offset, ParseKind::UnexpectedToken));
+        }
+        let b = self.sql;
+        let q = b.get(t.offset).copied().unwrap_or(b'"');
+        let close = if q == b'[' { b']' } else { q };
+        let mut j = t.offset + 1;
+        while j < b.len() {
+            if b.get(j) == Some(&close) {
+                if close != b']' && b.get(j + 1) == Some(&close) {
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+                break;
+            }
+            j += 1;
+        }
+        Ok(self.arena.alloc_copy_handle(self.span(t.offset, j))?)
+    }
+
+    /// A window definition inside its parentheses (v0.16,
+    /// `window`; the pin's `window` rule): `[base] [PARTITION BY
+    /// expr, ...] [ORDER BY term, ...] [frame]`. `held`
+    /// approximates the pin's stack below its expressions.
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn window_def<E>(&mut self, held: usize) -> Result<crate::sql::ast::WindowDef, E> {
+        const KWS: &[&[u8]] = &[b"PARTITION", b"ORDER", b"RANGE", b"ROWS", b"GROUPS"];
+        let base = match self.cur().tok {
+            Tok::Ident(_, q) if q || !KWS.iter().any(|k| self.cur_is_kw(k)) => {
+                let h = self.window_name::<E>(self.pos)?;
+                self.pos += 1;
+                Some(h)
+            }
+            Tok::Text(_) => {
+                let h = self.window_name::<E>(self.pos)?;
+                self.pos += 1;
+                Some(h)
+            }
+            _ => None,
+        };
+        let mut partition = AVec::new();
+        if self.eat_kw(b"PARTITION") {
+            self.expect_kw::<E>(b"BY")?;
+            loop {
+                let at = if partition.is_empty() { held } else { held + 2 };
+                let mut e = self.window_expr::<E>(at)?;
+                mark_ctx(&mut e, self.eh);
+                partition.push(e);
+                if !self.eat(Tok::Comma) {
+                    break;
+                }
+            }
+            if partition.len() > MAX_COLUMN {
+                return Err(perr(self.cur().offset, ParseKind::TooManyTerms));
+            }
+        }
+        let order_by = if self.eat_kw(b"ORDER") {
+            self.expect_kw::<E>(b"BY")?;
+            self.order_terms::<E>(held + 3, false)?
+        } else {
+            AVec::new()
+        };
+        let frame = self.frame_opt::<E>(held + 4)?;
+        Ok(crate::sql::ast::WindowDef {
+            base,
+            partition,
+            order_by,
+            frame,
+        })
+    }
+
+    /// One expression of a window definition, `held` symbols up.
+    #[cfg(feature = "window")]
+    fn window_expr<E>(&mut self, held: usize) -> Result<Expr, E> {
+        let h0 = self.held;
+        self.held = held;
+        self.peak::<E>(self.held)?;
+        let r = self.parse_expr::<E>();
+        self.held = h0;
+        r
+    }
+
+    /// A window's optional frame (v0.16, `window`; the pin's
+    /// `frame_opt`): `ROWS | RANGE | GROUPS` then one start bound
+    /// (the end is CURRENT ROW) or `BETWEEN start AND end`, then
+    /// an optional `EXCLUDE`. A start that comes after the end in
+    /// the pin's bound order is its "unsupported frame
+    /// specification".
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn frame_opt<E>(&mut self, held: usize) -> Result<Option<crate::sql::ast::Frame>, E> {
+        use crate::sql::ast::{Frame, FrameBound, FrameExclude, FrameUnit};
+        let unit = if self.eat_kw(b"ROWS") {
+            FrameUnit::Rows
+        } else if self.eat_kw(b"RANGE") {
+            FrameUnit::Range
+        } else if self.eat_kw(b"GROUPS") {
+            FrameUnit::Groups
+        } else {
+            return Ok(None);
+        };
+        let at = self.cur().offset;
+        let (start, end) = if self.eat_kw(b"BETWEEN") {
+            let s = self.frame_bound::<E>(held + 2, true)?;
+            self.expect_kw::<E>(b"AND")?;
+            let e = self.frame_bound::<E>(held + 4, false)?;
+            (s, e)
+        } else {
+            (
+                self.frame_bound::<E>(held + 1, true)?,
+                FrameBound::CurrentRow,
+            )
+        };
+        if matches!(
+            (&start, &end),
+            (FrameBound::CurrentRow, FrameBound::Preceding(_))
+                | (
+                    FrameBound::Following(_),
+                    FrameBound::Preceding(_) | FrameBound::CurrentRow
+                )
+        ) {
+            return Err(perr(at, ParseKind::UnsupportedFrame));
+        }
+        let exclude = if self.eat_kw(b"EXCLUDE") {
+            if self.eat_kw(b"NO") {
+                self.expect_kw::<E>(b"OTHERS")?;
+                FrameExclude::NoOthers
+            } else if self.eat_kw(b"CURRENT") {
+                self.expect_kw::<E>(b"ROW")?;
+                FrameExclude::CurrentRow
+            } else if self.eat_kw(b"GROUP") {
+                FrameExclude::Group
+            } else {
+                self.expect_kw::<E>(b"TIES")?;
+                FrameExclude::Ties
+            }
+        } else {
+            FrameExclude::None
+        };
+        Ok(Some(Frame {
+            unit,
+            start,
+            end,
+            exclude,
+        }))
+    }
+
+    /// One frame boundary (v0.16, `window`): `UNBOUNDED PRECEDING`
+    /// (a start only), `UNBOUNDED FOLLOWING` (an end only),
+    /// `CURRENT ROW`, or `expr PRECEDING | FOLLOWING` — an offset
+    /// that is not a constant expression becomes NULL, as the
+    /// pin's `sqlite3WindowOffsetExpr` makes it.
+    #[cfg(feature = "window")]
+    fn frame_bound<E>(
+        &mut self,
+        held: usize,
+        start: bool,
+    ) -> Result<crate::sql::ast::FrameBound, E> {
+        use crate::sql::ast::FrameBound;
+        if self.eat_kw(b"UNBOUNDED") {
+            return Ok(if start {
+                self.expect_kw::<E>(b"PRECEDING")?;
+                FrameBound::UnboundedPreceding
+            } else {
+                self.expect_kw::<E>(b"FOLLOWING")?;
+                FrameBound::UnboundedFollowing
+            });
+        }
+        if self.eat_kw(b"CURRENT") {
+            self.expect_kw::<E>(b"ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let e = self.window_expr::<E>(held)?;
+        let e = if offset_is_constant(&e) {
+            e
+        } else {
+            Expr::Literal(Literal::Null)
+        };
+        if self.eat_kw(b"PRECEDING") {
+            Ok(FrameBound::Preceding(Box::new(e)))
+        } else {
+            self.expect_kw::<E>(b"FOLLOWING")?;
+            Ok(FrameBound::Following(Box::new(e)))
+        }
+    }
+
+    /// A core's `WINDOW name AS (...), ...` clause (v0.16,
+    /// `window`), after HAVING. Each definition after the first
+    /// takes its base window's PARTITION BY / ORDER BY from the
+    /// definitions before it (the pin's `sqlite3WindowChain`;
+    /// the first definition's base is never looked up, as on the
+    /// pin).
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn window_clause<E>(
+        &mut self,
+        held: usize,
+    ) -> Result<AVec<(ABytes, crate::sql::ast::WindowDef)>, E> {
+        let mut out: AVec<(ABytes, crate::sql::ast::WindowDef)> = AVec::new();
+        if !self.window_clause_at(self.pos) {
+            return Ok(out);
+        }
+        self.pos += 1;
+        loop {
+            let name = self.window_name::<E>(self.pos)?;
+            self.pos += 1;
+            self.expect_kw::<E>(b"AS")?;
+            self.expect::<E>(Tok::LParen)?;
+            let mut w = self.window_def::<E>(held + 4)?;
+            self.expect::<E>(Tok::RParen)?;
+            if !out.is_empty() {
+                crate::sql::ast::chain_window(&mut w, out.as_slice(), self.arena)
+                    .map_err(|kind| Error::Schema { kind })?;
+            }
+            out.push((name, w));
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     // ---------- rich SELECT ----------
+
+    /// `select_rich` with `held` symbols below it on the pin's
+    /// parser stack.
+    fn select_at<E>(&mut self, held: usize) -> Result<SelectStmt, E> {
+        let h0 = self.held;
+        self.held = held;
+        self.peak::<E>(self.held)?;
+        let r = self.select_rich::<E>();
+        self.held = h0;
+        r
+    }
 
     /// A full select statement (v0.9 shape): one core, an
     /// optional compound tail, and the trailing ORDER BY /
     /// LIMIT that belong to the whole statement. Without the
     /// `v09` feature this is exactly the pre-v0.9 single core
     /// plus its tail.
+    ///
+    /// `held` is the pin's parser stack below it; afterwards
+    /// `sel_h` / `sel_r` are its height and resolution depth (the
+    /// enclosing select's accumulators are kept).
     fn select_rich<E>(&mut self) -> Result<SelectStmt, E> {
+        let saved = (self.acc_h, self.acc_r, self.rsub, self.on);
+        self.acc_h = 0;
+        self.acc_r = 0;
+        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        let mut r = self.select_body::<E>();
+        (self.sel_h, self.sel_r) = (self.acc_h, self.acc_r);
+        (self.acc_h, self.acc_r, self.rsub, self.on) = saved;
         #[cfg(feature = "v16")]
-        let with = if self.with_at(self.pos) {
-            Some(Box::new(self.with_clause::<E>()?))
+        if let Ok(s) = &mut r {
+            s.rdepth = u32::try_from(self.sel_r).unwrap_or(u32::MAX);
+        }
+        r
+    }
+
+    fn select_body<E>(&mut self) -> Result<SelectStmt, E> {
+        let hs = self.held;
+        // `select ::= WITH [RECURSIVE] wqlist selectnowith`: the
+        // cores sit two symbols up (three after RECURSIVE).
+        #[cfg(feature = "v16")]
+        let (with, base) = if self.with_at(self.pos) {
+            let recursive = self.is_kw(self.pos + 1, b"RECURSIVE");
+            let w = self.with_clause::<E>(hs)?;
+            (Some(Box::new(w)), hs + 2 + usize::from(recursive))
         } else {
-            None
+            (None, hs)
         };
-        let mut head = self.select_core::<E>()?;
+        #[cfg(not(feature = "v16"))]
+        let base = hs;
+        let mut head = self.select_core::<E>(base)?;
         #[cfg(feature = "v16")]
         {
             head.with = with;
         }
+        // The pin gives every result column of a compound member a
+        // node more (a COLLATE it adds for the sorter) when the
+        // member is an operand of UNION / EXCEPT / INTERSECT, or the
+        // compound has an ORDER BY (UNION ALL alone adds none):
+        // `pending` is the tallest result column of the members not
+        // known yet to be such operands.
+        #[cfg(feature = "v09")]
+        let mut pending = self.core_h;
+        // The base of the last core: `selectnowith
+        // multiselect_op oneselect` puts a later one two up.
+        #[cfg_attr(not(feature = "v09"), allow(unused_mut))]
+        let mut last = base;
         #[cfg(feature = "v09")]
         {
             let mut compound: AVec<(CompoundOp, SelectStmt)> = AVec::new();
@@ -2603,7 +4088,15 @@ impl<'a> Parser<'a> {
                 } else {
                     break;
                 };
-                compound.push((op, self.select_core::<E>()?));
+                last = base + 2;
+                let core = self.select_core::<E>(last)?;
+                if op == CompoundOp::UnionAll {
+                    pending = pending.max(self.core_h);
+                } else {
+                    self.sorted_members::<E>(pending.max(self.core_h))?;
+                    pending = 0;
+                }
+                compound.push((op, core));
             }
             // The pin's grammar: a trailing ORDER BY / LIMIT is
             // a syntax error when the LAST core is a VALUES core
@@ -2622,46 +4115,59 @@ impl<'a> Parser<'a> {
             }
             head.compound = compound;
         }
-        self.select_tail::<E>(&mut head)?;
+        self.select_tail::<E>(&mut head, last)?;
+        #[cfg(feature = "v09")]
+        if !head.compound.is_empty() && !head.order_by.is_empty() {
+            self.sorted_members::<E>(pending)?;
+        }
+        // The pin's `parserDoubleLinkSelect`: "too many terms in
+        // compound SELECT" past 500 SELECTs (multi-row VALUES is
+        // one), unless the last member is a one-row VALUES (its
+        // `SF_Values` exemption; v0.16 review fix — probed: 600
+        // SELECTs then `VALUES(1)` read, then `VALUES(1),(2)` do
+        // not).
+        #[cfg(feature = "v09")]
+        if head.compound.len() >= MAX_COMPOUND_SELECT
+            && head
+                .compound
+                .as_slice()
+                .last()
+                .is_none_or(|(_, c)| c.values.len() != 1)
+        {
+            return Err(perr(self.cur().offset, ParseKind::TooManyCompoundTerms));
+        }
         Ok(head)
+    }
+
+    /// Compound members whose result columns reach height `h` go
+    /// through the pin's sorter, which puts a node over each.
+    #[cfg(feature = "v09")]
+    fn sorted_members<E>(&self, h: usize) -> Result<(), E> {
+        if h.saturating_add(1) > self.lim.expr_depth && h > 0 {
+            return Err(perr(self.cur().offset, ParseKind::ExprTooDeep));
+        }
+        Ok(())
     }
 
     /// One compound operand: a SELECT core or — under `v09` —
     /// a VALUES core, with no ORDER BY / LIMIT / compound of
     /// its own (the pin gives cores none: `SELECT ... ORDER BY
     /// ... UNION ...` fails there with "ORDER BY clause should
-    /// come after UNION").
-    fn select_core<E>(&mut self) -> Result<SelectStmt, E> {
+    /// come after UNION"). `base` symbols sit below it on the
+    /// pin's stack.
+    fn select_core<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
         #[cfg(feature = "v09")]
         if self.cur_is_kw(b"VALUES") {
-            return self.values_core::<E>();
+            return self.values_core::<E>(base);
         }
-        self.select_core_select::<E>()
+        self.select_core_select::<E>(base)
     }
 
     /// A `VALUES (row), (row), ...` core (v0.9): values are
     /// full expressions, as in the INSERT grammar.
     #[cfg(feature = "v09")]
-    fn values_core<E>(&mut self) -> Result<SelectStmt, E> {
-        self.expect_kw::<E>(b"VALUES")?;
-        let mut values = AVec::new();
-        loop {
-            self.expect::<E>(Tok::LParen)?;
-            let mut row = AVec::new();
-            loop {
-                row.push(self.parse_expr::<E>()?);
-                if self.eat(Tok::Comma) {
-                    continue;
-                }
-                self.expect::<E>(Tok::RParen)?;
-                break;
-            }
-            values.push(row);
-            if self.eat(Tok::Comma) {
-                continue;
-            }
-            break;
-        }
+    fn values_core<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
+        let values = self.values_rows::<E>(base, false)?;
         Ok(SelectStmt {
             distinct: false,
             items: AVec::new(),
@@ -2676,11 +4182,18 @@ impl<'a> Parser<'a> {
             values,
             #[cfg(feature = "v16")]
             with: None,
+            #[cfg(feature = "v16")]
+            rctx: 0,
+            #[cfg(feature = "v16")]
+            rdepth: 0,
+            #[cfg(feature = "window")]
+            windows: AVec::new(),
         })
     }
 
-    fn select_core_select<E>(&mut self) -> Result<SelectStmt, E> {
+    fn select_core_select<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
         self.expect_kw::<E>(b"SELECT")?;
+        self.on = OnChain::default();
         let distinct = if self.eat_kw(b"DISTINCT") {
             true
         } else {
@@ -2688,6 +4201,7 @@ impl<'a> Parser<'a> {
             false
         };
         let mut items = AVec::new();
+        let mut core_h = 1usize;
         loop {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
@@ -2705,11 +4219,11 @@ impl<'a> Parser<'a> {
                 items.push(SelectItem::TableStar(h));
             } else {
                 let start = self.cur().offset;
-                let e = self.parse_expr::<E>()?;
+                // `SELECT distinct sclp scanpt expr`.
+                let e = self.item::<E>(base + 4)?;
+                core_h = core_h.max(self.eh);
                 let end = self.cur().offset;
-                let text = self
-                    .arena
-                    .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
+                let text = self.arena.alloc_copy_handle(trim(self.span(start, end)))?;
                 let alias = self.opt_alias();
                 items.push(SelectItem::Expr(e, alias, text));
             }
@@ -2718,32 +4232,75 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        let from = if self.eat_kw(b"FROM") {
-            self.source_list::<E>()?
+        // "too many columns in result set": checked when the pin
+        // resolves the select, so not in a CREATE VIEW or CTE body
+        // (`defer`; the expansion checks a body it copies).
+        if items.len() > MAX_COLUMN && !self.defer {
+            return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
+        }
+        // `SELECT distinct selcollist FROM`.
+        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        let mut from = if self.eat_kw(b"FROM") {
+            self.source_list::<E>(base + 4)?
         } else {
             AVec::new()
         };
-        let filter = if self.eat_kw(b"WHERE") {
-            Some(self.parse_expr::<E>()?)
+        if from.len() > MAX_JOIN_TABLES {
+            return Err(Error::Schema {
+                kind: crate::error::SchemaKind::TooManyTables,
+            });
+        }
+        // `SELECT distinct selcollist from WHERE expr`: the pin
+        // resolves the WHERE with the ON / USING terms ANDed in.
+        let (filter, wh) = if self.eat_kw(b"WHERE") {
+            #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+            let mut w = self.raw::<E>(base + 5)?;
+            self.fold_item::<E>(false)?;
+            let wh = self.where_depth::<E>(Some(self.eh))?;
+            #[cfg(feature = "v16")]
+            mark_ctx(&mut w, wh);
+            (Some(w), wh)
         } else {
-            None
+            (None, self.where_depth::<E>(None)?)
         };
+        // The ON / USING terms are resolved inside that WHERE tree.
+        #[cfg(feature = "v16")]
+        for f in from.as_mut_slice() {
+            if let Some(on) = &mut f.on {
+                mark_ctx(on, wh);
+            }
+        }
+        #[cfg(not(feature = "v16"))]
+        let _ = wh;
         let mut group_by = AVec::new();
         if self.eat_kw(b"GROUP") {
             self.expect_kw::<E>(b"BY")?;
             loop {
-                group_by.push(self.parse_expr::<E>()?);
+                // `... where_opt GROUP BY [nexprlist COMMA] expr`.
+                let at = if group_by.is_empty() { 7 } else { 9 };
+                group_by.push(self.sort_item::<E>(base + at)?);
                 if self.eat(Tok::Comma) {
                     continue;
                 }
                 break;
             }
+            if group_by.len() > MAX_COLUMN && !self.defer {
+                return Err(perr(self.cur().offset, ParseKind::TooManyTerms));
+            }
         }
+        // `... where_opt groupby_opt HAVING expr`.
         let having = if self.eat_kw(b"HAVING") {
-            Some(self.parse_expr::<E>()?)
+            Some(self.item::<E>(base + 7)?)
         } else {
             None
         };
+        // `... having_opt WINDOW windowdefn_list` (v0.16, `window`).
+        #[cfg(feature = "window")]
+        let windows = self.window_clause::<E>(base + 8)?;
+        // The core's end: `SELECT distinct selcollist from
+        // where_opt groupby_opt having_opt orderby_opt limit_opt`.
+        self.peak::<E>(base + 9)?;
+        self.core_h = core_h;
         Ok(SelectStmt {
             distinct,
             items,
@@ -2758,16 +4315,62 @@ impl<'a> Parser<'a> {
             values: AVec::new(),
             #[cfg(feature = "v16")]
             with: None,
+            #[cfg(feature = "v16")]
+            rctx: 0,
+            #[cfg(feature = "v16")]
+            rdepth: 0,
+            #[cfg(feature = "window")]
+            windows,
         })
+    }
+
+    /// Fold the WHERE clause the pin resolves — the written one
+    /// (of height `w`, its subqueries' depth in `rsub`) with the
+    /// core's ON / USING terms ANDed in — into the select.
+    /// Returns that tree's height (0 when there is none).
+    fn where_depth<E>(&mut self, w: Option<usize>) -> Result<usize, E> {
+        if w.is_none() && self.on.n == 0 {
+            return Ok(0);
+        }
+        let rsub = if w.is_some() { self.rsub } else { 0 };
+        // A lone leaf WHERE in a view body (see `reduced`).
+        let w = w.map(|h| usize::from(!(self.reduced && h == 1 && self.on.n == 0)) * h);
+        let h = self.on.height(w);
+        let depth = h.saturating_add(rsub.max(self.on.rsub));
+        if depth > self.lim.expr_depth && !self.defer {
+            return Err(perr(self.cur().offset, ParseKind::ExprTooDeep));
+        }
+        self.acc_r = self.acc_r.max(depth);
+        Ok(h)
     }
 
     /// A comma-separated ORDER BY term list after `ORDER BY`:
     /// the statement's (v0.4) and, under `v16`, an aggregate's
     /// own `f(args ORDER BY ...)` (the same grammar on the pin).
-    fn order_terms<E>(&mut self) -> Result<AVec<(Expr, SortOrder)>, E> {
+    /// `held` symbols sit below the first term on the pin's stack
+    /// (`sortlist COMMA` two more below the others); a statement's
+    /// terms are resolved on their own (`resolve`), an aggregate's
+    /// are part of its call.
+    fn order_terms<E>(&mut self, held: usize, resolve: bool) -> Result<AVec<(Expr, SortOrder)>, E> {
         let mut order_by = AVec::new();
         loop {
-            let e = self.parse_expr::<E>()?;
+            let at = if order_by.is_empty() { held } else { held + 2 };
+            let e = if resolve {
+                self.sort_item::<E>(at)?
+            } else {
+                let h0 = self.held;
+                self.held = at;
+                self.peak::<E>(self.held)?;
+                let r = self.parse_expr::<E>();
+                self.held = h0;
+                #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+                let mut e = r?;
+                // An aggregate's or window's term: inside a call, the
+                // whole item's height is marked over this later.
+                #[cfg(feature = "v16")]
+                mark_ctx(&mut e, self.eh);
+                e
+            };
             let desc = if self.eat_kw(b"DESC") {
                 true
             } else {
@@ -2802,31 +4405,62 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        if order_by.len() > MAX_COLUMN && !(resolve && self.defer) {
+            return Err(perr(self.cur().offset, ParseKind::TooManyTerms));
+        }
         Ok(order_by)
     }
 
     /// The trailing ORDER BY / LIMIT of a select statement,
     /// parsed into `head` after its core(s) (v0.9 split: cores
-    /// carry none of their own).
-    fn select_tail<E>(&mut self, head: &mut SelectStmt) -> Result<(), E> {
+    /// carry none of their own). `base` is the last core's.
+    #[inline(never)]
+    fn select_tail<E>(&mut self, head: &mut SelectStmt, base: usize) -> Result<(), E> {
         let mut order_by = AVec::new();
         if self.eat_kw(b"ORDER") {
             self.expect_kw::<E>(b"BY")?;
-            order_by = self.order_terms::<E>()?;
+            // `... having_opt ORDER BY sortlist`.
+            order_by = self.order_terms::<E>(base + 9, true)?;
         }
         let mut limit = None;
         let mut offset = None;
         if self.eat_kw(b"LIMIT") {
-            let first = self.limit_term::<E>()?;
-            if self.eat(Tok::Comma) {
-                // LIMIT offset, count
-                offset = Some(first);
-                limit = Some(self.limit_term::<E>()?);
+            // `... orderby_opt LIMIT expr [OFFSET | COMMA expr]`:
+            // one TK_LIMIT node over both on the pin.
+            let first = self.limit_term::<E>(base + 9)?;
+            let (mut h, mut rsub) = (self.eh, self.rsub);
+            let comma = self.eat(Tok::Comma);
+            let second = if comma || self.eat_kw(b"OFFSET") {
+                let s = self.limit_term::<E>(base + 11)?;
+                h = h.max(self.eh);
+                rsub = rsub.max(self.rsub);
+                Some(s)
             } else {
-                limit = Some(first);
-                if self.eat_kw(b"OFFSET") {
-                    offset = Some(self.limit_term::<E>()?);
+                None
+            };
+            self.set_h::<E>(h + 1, 0)?;
+            self.rsub = rsub;
+            self.fold_item::<E>(true)?;
+            #[cfg(feature = "v16")]
+            let (mut first, mut second) = (first, second);
+            #[cfg(feature = "v16")]
+            {
+                mark_ctx(&mut first, h + 1);
+                if let Some(x) = &mut second {
+                    mark_ctx(x, h + 1);
                 }
+            }
+            match second {
+                // `LIMIT offset, count`.
+                Some(s) if comma => {
+                    offset = Some(first);
+                    limit = Some(s);
+                }
+                Some(s) => {
+                    limit = Some(first);
+                    offset = Some(s);
+                }
+                None => limit = Some(first),
             }
         }
         head.order_by = order_by;
@@ -2839,16 +4473,20 @@ impl<'a> Parser<'a> {
     /// under `v16` — any expression; the planner resolves it
     /// against an empty scope (the pin: a LIMIT may not name a
     /// column) and the executor converts its value with the
-    /// pin's `MustBeInt` rule.
-    fn limit_term<E>(&mut self) -> Result<Box<Expr>, E> {
+    /// pin's `MustBeInt` rule. `held` symbols sit below it.
+    fn limit_term<E>(&mut self, held: usize) -> Result<Box<Expr>, E> {
         #[cfg(feature = "v16")]
         {
-            Ok(Box::new(self.parse_expr::<E>()?))
+            Ok(Box::new(self.raw::<E>(held)?))
         }
         #[cfg(not(feature = "v16"))]
         match self.literal_at(self.pos) {
             Some((lit @ Literal::Integer(_), used)) => {
+                // The LIMIT node sits above the run.
+                self.sign_run::<E>(self.pos, used, held, 1)?;
                 self.pos += used;
+                self.eh = 1;
+                self.rsub = 0;
                 Ok(Box::new(Expr::Literal(lit)))
             }
             _ => Err(perr(self.cur().offset, ParseKind::UnsupportedClause)),
@@ -2887,24 +4525,30 @@ impl<'a> Parser<'a> {
             compound: AVec::new(),
             values: AVec::new(),
             with: None,
+            rctx: 0,
+            rdepth: 0,
+            #[cfg(feature = "window")]
+            windows: AVec::new(),
         }
     }
 
     /// A FROM clause body (v0.4; shared by SELECT and UPDATE
     /// ... FROM): the first source, then `,` / join-operator
     /// separated sources, each joined to everything on its left.
-    fn source_list<E>(&mut self) -> Result<AVec<FromSource>, E> {
+    /// A FROM clause's sources, `fb` symbols (up to its `FROM`)
+    /// below them on the pin's stack.
+    fn source_list<E>(&mut self, fb: usize) -> Result<AVec<FromSource>, E> {
         let mut from = AVec::new();
-        from.push(self.join_source::<E>(JoinKind::Inner, false, true)?);
+        from.push(self.join_source::<E>(JoinKind::Inner, false, true, fb)?);
         loop {
             if self.eat(Tok::Comma) {
-                from.push(self.join_source::<E>(JoinKind::Cross, false, false)?);
+                from.push(self.join_source::<E>(JoinKind::Cross, false, false, fb)?);
                 continue;
             }
             let Some((kind, natural)) = self.join_op::<E>()? else {
                 break;
             };
-            from.push(self.join_source::<E>(kind, natural, false)?);
+            from.push(self.join_source::<E>(kind, natural, false, fb)?);
         }
         Ok(from)
     }
@@ -2977,17 +4621,23 @@ impl<'a> Parser<'a> {
     /// neither (the pin refuses it at prepare time); the first
     /// source carries none (`FROM t ON ...` is an error there
     /// too — the caller leaves the tokens unconsumed).
+    ///
+    /// `on_at` symbols sit below an ON expression on the pin's
+    /// stack; ON and USING terms join the core's `OnChain`.
     fn join_constraint<E>(
         &mut self,
         natural: bool,
         first: bool,
+        on_at: usize,
     ) -> Result<(Option<Expr>, AVec<ABytes>), E> {
         let mut using = AVec::new();
         if first {
             return Ok((None, using));
         }
         let on = if self.eat_kw(b"ON") {
-            Some(self.parse_expr::<E>()?)
+            let e = self.raw::<E>(on_at)?;
+            self.on.push(self.eh, self.rsub);
+            Some(e)
         } else {
             None
         };
@@ -2998,6 +4648,9 @@ impl<'a> Parser<'a> {
                     Tok::Ident(h, _) => {
                         self.pos += 1;
                         using.push(h);
+                        // The pin's `a.x = b.x` term: an EQ node
+                        // over two column leaves.
+                        self.on.push(2, 0);
                     }
                     _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
                 }
@@ -3014,17 +4667,38 @@ impl<'a> Parser<'a> {
         Ok((on, using))
     }
 
+    /// One FROM source (`fb` as in `source_list`): a derived
+    /// table or a named one, each parsed out of line (the frame of
+    /// each nested FROM subquery level stays small).
     fn join_source<E>(
         &mut self,
         kind: JoinKind,
         natural: bool,
         first: bool,
+        fb: usize,
     ) -> Result<FromSource, E> {
+        #[cfg(feature = "v09")]
+        if let Some(src) = self.derived_source::<E>(kind, natural, first, fb)? {
+            return Ok(src);
+        }
+        self.table_source::<E>(kind, natural, first, fb)
+    }
+
+    /// A derived table source, or `None` (nothing consumed) when no
+    /// subquery starts here.
+    #[cfg(feature = "v09")]
+    #[inline(never)]
+    fn derived_source<E>(
+        &mut self,
+        kind: JoinKind,
+        natural: bool,
+        first: bool,
+        fb: usize,
+    ) -> Result<Option<FromSource>, E> {
         // A derived table (v0.9): `(SELECT ...)` or `(VALUES
         // ...)`, possibly under further parentheses (the pin
         // accepts `FROM ((SELECT 1)) s`). The alias is optional;
         // no column-name list may follow it (pin: syntax error).
-        #[cfg(feature = "v09")]
         if matches!(self.cur().tok, Tok::LParen) {
             let mut depth = 0usize;
             let mut i = self.pos;
@@ -3036,13 +4710,24 @@ impl<'a> Parser<'a> {
                 for _ in 0..depth {
                     self.expect::<E>(Tok::LParen)?;
                 }
-                let inner = self.select_rich::<E>()?;
+                // `stl_prefix LP` per parenthesis (the inner ones
+                // the pin's `stl_prefix LP seltablist RP`); the
+                // derived table's resolution does not sit in any
+                // expression of this select.
+                let h0 = self.held;
+                self.held = fb.saturating_add(depth.saturating_mul(2));
+                self.peak::<E>(self.held)?;
+                let r = self.select_rich::<E>();
+                self.held = h0;
+                let inner = r?;
+                self.acc_r = self.acc_r.max(self.sel_r);
                 for _ in 0..depth {
                     self.expect::<E>(Tok::RParen)?;
                 }
                 let alias = self.opt_alias();
-                let (on, using) = self.join_constraint::<E>(natural, first)?;
-                return Ok(FromSource {
+                // `stl_prefix LP select RP as ON expr`.
+                let (on, using) = self.join_constraint::<E>(natural, first, fb + 6)?;
+                return Ok(Some(FromSource {
                     table: ABytes::EMPTY,
                     alias,
                     kind,
@@ -3056,9 +4741,22 @@ impl<'a> Parser<'a> {
                     qualified: false,
                     #[cfg(feature = "v16")]
                     cte: None,
-                });
+                }));
             }
         }
+        Ok(None)
+    }
+
+    /// A named FROM source: a table, view or CTE name, or (`v16`) a
+    /// table-valued function call.
+    #[inline(never)]
+    fn table_source<E>(
+        &mut self,
+        kind: JoinKind,
+        natural: bool,
+        first: bool,
+        fb: usize,
+    ) -> Result<FromSource, E> {
         #[cfg(feature = "v16")]
         let (table, qualified) = self.name_q::<E>()?;
         #[cfg(not(feature = "v16"))]
@@ -3069,7 +4767,9 @@ impl<'a> Parser<'a> {
             let mut v = AVec::new();
             if !self.eat(Tok::RParen) {
                 loop {
-                    v.push(self.parse_expr::<E>()?);
+                    // `stl_prefix nm dbnm LP [nexprlist COMMA] expr`.
+                    let at = if v.is_empty() { 4 } else { 6 };
+                    v.push(self.item::<E>(fb + at)?);
                     if !self.eat(Tok::Comma) {
                         break;
                     }
@@ -3081,7 +4781,8 @@ impl<'a> Parser<'a> {
             None
         };
         let alias = self.opt_alias();
-        let (on, using) = self.join_constraint::<E>(natural, first)?;
+        // `stl_prefix nm dbnm as ON expr`.
+        let (on, using) = self.join_constraint::<E>(natural, first, fb + 5)?;
         Ok(FromSource {
             table,
             alias,
@@ -3179,9 +4880,7 @@ impl<'a> Parser<'a> {
         } else {
             self.sql.len()
         };
-        let text = self
-            .arena
-            .alloc_copy_handle(trim(&self.sql[start..end.min(self.sql.len())]))?;
+        let text = self.arena.alloc_copy_handle(trim(self.span(start, end)))?;
         self.pos = to;
         Ok(Ast::AlterAddColumn {
             table,
@@ -3218,7 +4917,14 @@ impl<'a> Parser<'a> {
             columns = Some(cols);
         }
         self.expect_kw::<E>(b"AS")?;
-        let select = self.select_rich::<E>()?;
+        // `createkw temp VIEW ifnotexists nm dbnm eidlist_opt AS
+        // select`. The pin resolves the body only when the view is
+        // read: its resolution depth is checked then (`parse_view`).
+        self.defer = !self.view_use;
+        self.reduced = true;
+        let select = self.select_at::<E>(9);
+        (self.defer, self.reduced) = (false, false);
+        let select = select?;
         Ok(Ast::CreateView {
             name,
             if_not_exists,
@@ -3264,10 +4970,16 @@ impl<'a> Parser<'a> {
     /// CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP (which a
     /// build without the evaluator refuses).
     #[allow(clippy::type_complexity)]
+    ///
+    /// `held`: the pin's parser stack below the DEFAULT's operand
+    /// (the parenthesised literal's sign run is held to the pin's
+    /// limits there, v0.16 review fix: `DEFAULT (- - ... 1)` was
+    /// stored past them, a schema the pin cannot load).
     fn default_clause<E>(
         &self,
         k: usize,
         to: usize,
+        held: usize,
     ) -> Result<(core::result::Result<Literal, (usize, usize)>, usize), E> {
         let toks = self.toks.as_slice();
         let Some(t) = toks.get(k).filter(|_| k < to).copied() else {
@@ -3294,6 +5006,7 @@ impl<'a> Parser<'a> {
                 if let Some((lit, n)) = self.literal_at(k + 1)
                     && k + 1 + n == close
                 {
+                    self.sign_run::<E>(k + 1, n, held, 0)?;
                     return Ok((Ok(lit), close + 1));
                 }
                 Ok((span(k + 1, close), close + 1))
@@ -3514,6 +5227,7 @@ UPDATE USING VALUES WHEN WHERE",
             to: cols,
             on_update,
             on_delete,
+            deferred: false,
         })
     }
 
@@ -3537,6 +5251,17 @@ UPDATE USING VALUES WHEN WHERE",
 
     /// Skip an optional `[NOT] DEFERRABLE [INITIALLY DEFERRED |
     /// IMMEDIATE]` at token `i` (parsed, not enforced).
+    /// Whether the deferrable clause at token `i` (`deferrable`'s
+    /// grammar) makes its foreign key deferred: `DEFERRABLE
+    /// INITIALLY DEFERRED` only (`NOT DEFERRABLE INITIALLY
+    /// DEFERRED` is immediate, as on the pin).
+    #[cfg(feature = "v16")]
+    fn defers(&self, i: usize) -> bool {
+        self.is_kw(i, b"DEFERRABLE")
+            && self.is_kw(i + 1, b"INITIALLY")
+            && self.is_kw(i + 2, b"DEFERRED")
+    }
+
     fn deferrable(&self, mut i: usize) -> usize {
         let start = i;
         if self.is_kw(i, b"NOT") {
@@ -3732,6 +5457,9 @@ UPDATE USING VALUES WHEN WHERE",
                             from.push(c.name);
                         }
                         fkeys.push(self.fk_clause::<E>(from, next, to)?);
+                        if let Some(f) = fkeys.as_mut_slice().last_mut() {
+                            f.deferred = self.defers(i);
+                        }
                     }
                     i = self.deferrable(i);
                 } else {
@@ -3822,7 +5550,23 @@ UPDATE USING VALUES WHEN WHERE",
                 }
                 i += 2;
             } else if self.is_kw(i, b"DEFAULT") {
-                let (d, next) = self.default_clause::<E>(i + 1, to)?;
+                // The pin's stack below the operand: the bottom
+                // entry, `create_table ( columnname carglist DEFAULT
+                // (` for the first column (7, probed), two more
+                // (`columnlist ,`) for a later one and for ALTER
+                // TABLE ADD COLUMN's.
+                // (ALTER TABLE exists with `v16`: its item follows
+                // ADD [COLUMN], not `(`.)
+                #[cfg(feature = "v16")]
+                let first = columns.is_empty()
+                    && from
+                        .checked_sub(1)
+                        .and_then(|j| self.toks.as_slice().get(j))
+                        .is_some_and(|t| matches!(t.tok, Tok::LParen));
+                #[cfg(not(feature = "v16"))]
+                let first = columns.is_empty();
+                let held = if first { 7 } else { 9 };
+                let (d, next) = self.default_clause::<E>(i + 1, to, held)?;
                 #[cfg(feature = "v16")]
                 {
                     let paren = matches!(tok(i + 1), Some(Tok::LParen));
@@ -3854,7 +5598,7 @@ UPDATE USING VALUES WHEN WHERE",
                     Err((start, end)) => {
                         default = None;
                         default_nonconst = true;
-                        let text = trim(&self.sql[start.min(end)..end.min(self.sql.len())]);
+                        let text = trim(self.span(start.min(end), end));
                         default_expr = Some(self.arena.alloc_copy_handle(text)?);
                     }
                     #[cfg(not(feature = "v04"))]
@@ -3875,6 +5619,12 @@ UPDATE USING VALUES WHEN WHERE",
                 let next = self.deferrable(i);
                 if next == i {
                     return bad(i + 1);
+                }
+                // The pin's `sqlite3DeferForeignKey`: the table's most
+                // recent foreign key, whichever column declared it.
+                #[cfg(feature = "v16")]
+                if let Some(f) = fkeys.as_mut_slice().last_mut() {
+                    f.deferred = self.defers(i);
                 }
                 i = next;
             } else if self.is_kw(i, b"PRIMARY") {
@@ -3974,7 +5724,7 @@ UPDATE USING VALUES WHEN WHERE",
         let decl = if decl_end_tok > from + 1 {
             let start_off = self.toks.as_slice()[from + 1].offset;
             let end_off = self.item_end_offset(decl_end_tok);
-            let text = trim(&self.sql[start_off..end_off.min(self.sql.len())]);
+            let text = trim(self.span(start_off, end_off));
             self.arena.alloc_copy_handle(text)?
         } else {
             ABytes::EMPTY
@@ -4040,6 +5790,20 @@ UPDATE USING VALUES WHEN WHERE",
 /// CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP (v0.16): the
 /// pin's wall-clock keywords, an expression wherever a DEFAULT
 /// term may be.
+/// A row value (v0.16, `v16`; there are none without it).
+#[cfg(feature = "v04")]
+fn is_vector(e: &Expr) -> bool {
+    #[cfg(feature = "v16")]
+    {
+        matches!(e, Expr::Vector(_))
+    }
+    #[cfg(not(feature = "v16"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 fn is_ctime_kw(b: &[u8]) -> bool {
     eq_ci(b, b"CURRENT_TIME") || eq_ci(b, b"CURRENT_DATE") || eq_ci(b, b"CURRENT_TIMESTAMP")
 }
@@ -4084,9 +5848,14 @@ impl<'a> Parser<'a> {
     /// right-hand side gives column i `RowItem(rhs, i, n)` (the
     /// planner requires a scalar subquery of n columns). A size
     /// mismatch is the pin's "N columns assigned M values".
-    fn set_list<E>(&mut self) -> Result<AVec<(ABytes, Expr)>, E> {
+    ///
+    /// `held` symbols sit below the first `nm EQ expr` value on the
+    /// pin's parser stack; a `LP idlist RP EQ` value two more, and
+    /// any later item two more again (`setlist COMMA`).
+    fn set_list<E>(&mut self, held: usize) -> Result<AVec<(ABytes, Expr)>, E> {
         let mut assignments: AVec<(ABytes, Expr)> = AVec::new();
         loop {
+            let at = held + if assignments.is_empty() { 0 } else { 2 };
             #[cfg(feature = "v16")]
             if self.eat(Tok::LParen) {
                 let mut cols: AVec<ABytes> = AVec::new();
@@ -4098,7 +5867,7 @@ impl<'a> Parser<'a> {
                 }
                 self.expect::<E>(Tok::RParen)?;
                 self.expect::<E>(Tok::Eq)?;
-                let e = self.parse_expr::<E>()?;
+                let e = self.item::<E>(at + 2)?;
                 let n = u16::try_from(cols.len()).map_err(|_| Error::Schema {
                     kind: crate::error::SchemaKind::ColumnCountMismatch,
                 })?;
@@ -4133,7 +5902,7 @@ impl<'a> Parser<'a> {
             }
             let col = self.plain_name::<E>()?;
             self.expect::<E>(Tok::Eq)?;
-            let e = self.parse_expr::<E>()?;
+            let e = self.item::<E>(at)?;
             assignments.push((col, e));
             if self.eat(Tok::Comma) {
                 continue;
@@ -4186,15 +5955,29 @@ impl<'a> Parser<'a> {
             self.opt_alias()
         };
         self.expect_kw::<E>(b"SET")?;
-        let assignments = self.set_list::<E>()?;
+        // `with UPDATE orconf xfullname indexed_opt SET nm EQ expr`.
+        let assignments = self.set_list::<E>(9)?;
+        // "too many columns in set list" (UPDATE's only: the pin's
+        // upsert SET takes any number).
+        if assignments.len() > MAX_COLUMN {
+            return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
+        }
         // FROM (v0.7): sources in SELECT shape, after SET and
-        // before WHERE, exactly as SQLite orders the clauses.
+        // before WHERE, exactly as SQLite orders the clauses
+        // (`... SET setlist FROM`). The target is a table of the
+        // join too.
         #[cfg(feature = "v07")]
         let from = self.update_from::<E>()?;
         #[cfg(not(feature = "v07"))]
         let from: AVec<FromSource> = AVec::new();
+        if from.len() >= MAX_JOIN_TABLES {
+            return Err(Error::Schema {
+                kind: crate::error::SchemaKind::TooManyTables,
+            });
+        }
+        // `... SET setlist from WHERE expr`.
         let filter = if self.eat_kw(b"WHERE") {
-            Some(self.parse_expr::<E>()?)
+            Some(self.item::<E>(10)?)
         } else {
             None
         };
@@ -4202,7 +5985,7 @@ impl<'a> Parser<'a> {
         // oracle's build rejects them too); expect_end in parse()
         // catches any trailing input.
         #[cfg(feature = "v07")]
-        let returning = self.returning_clause::<E>()?;
+        let returning = self.returning_clause::<E>(if filter.is_some() { 14 } else { 12 })?;
         #[cfg(not(feature = "v07"))]
         let returning: AVec<SelectItem> = AVec::new();
         Ok(Ast::Update {
@@ -4224,20 +6007,21 @@ impl<'a> Parser<'a> {
         if !self.eat_kw(b"FROM") {
             return Ok(AVec::new());
         }
-        self.source_list::<E>()
+        self.source_list::<E>(9)
     }
 
     fn delete_stmt<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"DELETE")?;
         self.expect_kw::<E>(b"FROM")?;
         let table = self.name::<E>()?;
+        // `with DELETE FROM xfullname indexed_opt WHERE expr`.
         let filter = if self.eat_kw(b"WHERE") {
-            Some(self.parse_expr::<E>()?)
+            Some(self.item::<E>(7)?)
         } else {
             None
         };
         #[cfg(feature = "v07")]
-        let returning = self.returning_clause::<E>()?;
+        let returning = self.returning_clause::<E>(if filter.is_some() { 11 } else { 9 })?;
         #[cfg(not(feature = "v07"))]
         let returning: AVec<SelectItem> = AVec::new();
         Ok(Ast::Delete {
@@ -4261,14 +6045,486 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Whether a frame offset is a constant expression as the pin's
+/// parser sees one (v0.16, `window`; `sqlite3ExprIsConstant` before
+/// name resolution): literals, bound parameters and operators over
+/// them. Columns, calls (no function is known constant before
+/// resolution) and subqueries are not.
+#[cfg(feature = "window")]
+fn offset_is_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::HexTooBig(_) => true,
+        // A bound parameter counts as a constant there.
+        #[cfg(feature = "params")]
+        Expr::Param(..) => true,
+        Expr::Neg(x)
+        | Expr::Pos(x)
+        | Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull(x, _)
+        | Expr::Cast(x, _)
+        | Expr::Collate(x, _) => offset_is_constant(x),
+        Expr::Binary(_, a, b) | Expr::Like(a, b, _) => {
+            offset_is_constant(a) && offset_is_constant(b)
+        }
+        Expr::Between(x, a, b, _) => {
+            offset_is_constant(x) && offset_is_constant(a) && offset_is_constant(b)
+        }
+        Expr::InList(x, l, _) => offset_is_constant(x) && l.iter().all(offset_is_constant),
+        Expr::Vector(l) => l.iter().all(offset_is_constant),
+        Expr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_none_or(offset_is_constant)
+                && otherwise.as_deref().is_none_or(offset_is_constant)
+                && whens
+                    .iter()
+                    .all(|(w, t)| offset_is_constant(w) && offset_is_constant(t))
+        }
+        _ => false,
+    }
+}
+
+// ===================== CREATE / DROP TRIGGER =====================
+//
+// v0.16, `triggers`: `CREATE TRIGGER [IF NOT EXISTS] [schema .] name
+// [BEFORE | AFTER | INSTEAD OF] DELETE | INSERT | UPDATE [OF col, ...]
+// ON table [FOR EACH ROW] [WHEN expr] BEGIN stmt; ... END`, with the
+// pin's restrictions on the body: INSERT / REPLACE / UPDATE / DELETE /
+// SELECT (a WITH clause only before a SELECT), no schema-qualified
+// target, no RETURNING, no DEFAULT VALUES, no parameters (the
+// `parse_params` refusal). `RAISE()` is legal only in a trigger.
+#[cfg(feature = "triggers")]
+impl<'a> Parser<'a> {
+    fn create_trigger<E>(&mut self) -> Result<Ast, E> {
+        use super::ast::{CreateTrigger, TrigEvent, TrigTime};
+        self.expect_kw::<E>(b"CREATE")?;
+        self.expect_kw::<E>(b"TRIGGER")?;
+        let if_not_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"NOT")?;
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        // [schema .] name
+        let (mut name, mut name_at) = match self.cur().tok {
+            Tok::Ident(h, _) => (h, self.cur().offset),
+            _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+        };
+        self.pos += 1;
+        let mut qualified = false;
+        if self.eat(Tok::Dot) {
+            let s = handle_bytes(self.arena, name);
+            if !eq_ci(s, b"main") && !eq_ci(s, b"temp") {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::UnknownDatabase,
+                });
+            }
+            qualified = true;
+            match self.cur().tok {
+                Tok::Ident(h, _) => {
+                    name = h;
+                    name_at = self.cur().offset;
+                    self.pos += 1;
+                }
+                _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+            }
+        }
+        let time = if self.eat_kw(b"BEFORE") {
+            TrigTime::Before
+        } else if self.eat_kw(b"AFTER") {
+            TrigTime::After
+        } else if self.eat_kw(b"INSTEAD") {
+            self.expect_kw::<E>(b"OF")?;
+            TrigTime::Instead
+        } else {
+            TrigTime::Before
+        };
+        let mut of_cols = AVec::new();
+        let event = if self.eat_kw(b"DELETE") {
+            TrigEvent::Delete
+        } else if self.eat_kw(b"INSERT") {
+            TrigEvent::Insert
+        } else if self.eat_kw(b"UPDATE") {
+            if self.eat_kw(b"OF") {
+                loop {
+                    match self.cur().tok {
+                        Tok::Ident(h, _) => {
+                            self.pos += 1;
+                            of_cols.push(h);
+                        }
+                        _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+                    }
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            TrigEvent::Update
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        self.expect_kw::<E>(b"ON")?;
+        // ON [schema .] table
+        let (mut table_temp, mut table_main) = (false, false);
+        if matches!(
+            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+            Some(Tok::Dot)
+        ) && let Tok::Ident(h, _) = self.cur().tok
+        {
+            let s = handle_bytes(self.arena, h);
+            if eq_ci(s, b"temp") {
+                table_temp = true;
+            } else if eq_ci(s, b"main") {
+                table_main = true;
+            }
+        }
+        let table = self.name::<E>()?;
+        if self.eat_kw(b"FOR") {
+            self.expect_kw::<E>(b"EACH")?;
+            self.expect_kw::<E>(b"ROW")?;
+        }
+        let in0 = self.in_trig;
+        self.in_trig = true;
+        let r = self.trigger_rest::<E>();
+        self.in_trig = in0;
+        let (when, steps, end) = r?;
+        Ok(Ast::CreateTrigger(Box::new(CreateTrigger {
+            name,
+            if_not_exists,
+            qualified,
+            time,
+            event,
+            of_cols,
+            table,
+            table_temp,
+            table_main,
+            when,
+            steps,
+            name_at,
+            end,
+        })))
+    }
+
+    /// One past the last byte of the token before the cursor.
+    fn prev_end(&self) -> usize {
+        let Some(t) = self
+            .pos
+            .checked_sub(1)
+            .and_then(|i| self.toks.as_slice().get(i))
+        else {
+            return 0;
+        };
+        token_end(self.sql, t.offset)
+    }
+
+    /// `[WHEN expr] BEGIN stmt; ... END` (the WHEN span, the body
+    /// spans, one past END).
+    #[allow(clippy::type_complexity)]
+    fn trigger_rest<E>(
+        &mut self,
+    ) -> Result<(Option<(usize, usize)>, AVec<(usize, usize)>, usize), E> {
+        let when = if self.eat_kw(b"WHEN") {
+            let a = self.cur().offset;
+            self.item::<E>(10)?;
+            Some((a, self.prev_end()))
+        } else {
+            None
+        };
+        self.expect_kw::<E>(b"BEGIN")?;
+        let mut steps = AVec::new();
+        loop {
+            let a = self.cur().offset;
+            self.trigger_step::<E>()?;
+            let b = self.prev_end();
+            self.expect::<E>(Tok::Semi)?;
+            steps.push((a, b));
+            if self.cur_is_kw(b"END") {
+                let end = token_end(self.sql, self.cur().offset);
+                self.pos += 1;
+                return Ok((when, steps, end));
+            }
+        }
+    }
+
+    /// One body statement, with the pin's restrictions.
+    fn trigger_step<E>(&mut self) -> Result<(), E> {
+        let qualified_target = |p: &Self, mut i: usize| -> bool {
+            // INSERT / REPLACE: the name after INTO; UPDATE [OR x]:
+            // the next name; DELETE FROM: the next.
+            if p.is_kw(i, b"OR") {
+                i += 2;
+            }
+            if p.is_kw(i, b"INTO") || p.is_kw(i, b"FROM") {
+                i += 1;
+            }
+            matches!(p.toks.as_slice().get(i + 1).map(|t| t.tok), Some(Tok::Dot))
+        };
+        let ast = if self.cur_is_kw(b"INSERT")
+            || self.cur_is_kw(b"REPLACE")
+            || self.cur_is_kw(b"UPDATE")
+            || self.cur_is_kw(b"DELETE")
+        {
+            if qualified_target(self, self.pos + 1) {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::TriggerQualifiedTarget,
+                });
+            }
+            if self.cur_is_kw(b"INSERT") {
+                self.insert::<E>(false)?
+            } else if self.cur_is_kw(b"REPLACE") {
+                self.replace_dispatch::<E>()?
+            } else if self.cur_is_kw(b"UPDATE") {
+                self.update_dispatch::<E>()?
+            } else {
+                self.delete_dispatch::<E>()?
+            }
+        } else if self.cur_is_kw(b"SELECT") || self.cur_is_kw(b"VALUES") || self.with_at(self.pos) {
+            Ast::Select(self.select_rich::<E>()?)
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        let returning = match &ast {
+            Ast::Insert {
+                returning, columns, ..
+            } => {
+                // `INSERT ... DEFAULT VALUES` (an empty target list):
+                // not in the pin's trigger grammar.
+                if columns.as_ref().is_some_and(|c| c.is_empty()) {
+                    return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+                }
+                !returning.is_empty()
+            }
+            Ast::Update { returning, .. } | Ast::Delete { returning, .. } => !returning.is_empty(),
+            _ => false,
+        };
+        if returning {
+            return Err(Error::Schema {
+                kind: crate::error::SchemaKind::TriggerReturning,
+            });
+        }
+        Ok(())
+    }
+
+    /// `RAISE(IGNORE)` / `RAISE(ROLLBACK | ABORT | FAIL, expr)`.
+    #[inline(never)]
+    fn expr_raise<E>(&mut self) -> Result<Expr, E> {
+        use super::ast::RaiseKind;
+        self.pos += 2; // RAISE (
+        let kind = if self.eat_kw(b"IGNORE") {
+            RaiseKind::Ignore
+        } else if self.eat_kw(b"ROLLBACK") {
+            RaiseKind::Rollback
+        } else if self.eat_kw(b"ABORT") {
+            RaiseKind::Abort
+        } else if self.eat_kw(b"FAIL") {
+            RaiseKind::Fail
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        let (mut h, mut k) = (0usize, EK_CONST);
+        let msg = if kind == RaiseKind::Ignore {
+            None
+        } else {
+            self.expect::<E>(Tok::Comma)?;
+            let m = self.operand_expr::<E>(5)?;
+            (h, k) = (self.eh, self.ek);
+            Some(Box::new(m))
+        };
+        self.expect::<E>(Tok::RParen)?;
+        self.need::<E>(4)?;
+        self.set_h::<E>(h + 1, k & EK_CONST)?;
+        Ok(Expr::Raise(kind, msg, self.in_trig))
+    }
+
+    fn drop_trigger<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"DROP")?;
+        self.expect_kw::<E>(b"TRIGGER")?;
+        let if_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        Ok(Ast::DropTrigger { name, if_exists })
+    }
+}
+
+/// One past the last byte of the token starting at `off` of `sql`
+/// (v0.16, `triggers`): an identifier / number / keyword run, a
+/// quoted string or name, or a one- / two-byte operator.
+#[cfg(feature = "triggers")]
+pub fn token_end(sql: &[u8], off: usize) -> usize {
+    let n = sql.len();
+    let Some(&c) = sql.get(off) else {
+        return off;
+    };
+    let close = match c {
+        b'"' => b'"',
+        b'`' => b'`',
+        b'\'' => b'\'',
+        b'[' => b']',
+        _ => 0,
+    };
+    let mut i = off;
+    if close != 0 {
+        i += 1;
+        while i < n {
+            if sql[i] == close {
+                if close != b']' && sql.get(i + 1) == Some(&close) {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i += 1;
+        }
+        return n;
+    }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+    if word(c) {
+        // A blob literal x'..' / X'..'.
+        if (c == b'x' || c == b'X') && sql.get(off + 1) == Some(&b'\'') {
+            return token_end(sql, off + 1);
+        }
+        while i < n && (word(sql[i]) || (sql[i] == b'.' && c.is_ascii_digit())) {
+            // A number's exponent sign: 1e+5.
+            if (sql[i] == b'e' || sql[i] == b'E')
+                && c.is_ascii_digit()
+                && matches!(sql.get(i + 1), Some(b'+') | Some(b'-'))
+            {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        return i;
+    }
+    // Operators: two-byte forms first.
+    let two = sql.get(off..off + 2).unwrap_or(&[]);
+    if matches!(
+        two,
+        b"<=" | b">=" | b"<>" | b"!=" | b"==" | b"||" | b"<<" | b">>" | b"->"
+    ) {
+        if sql.get(off..off + 3) == Some(b"->>") {
+            return off + 3;
+        }
+        return off + 2;
+    }
+    off + 1
+}
+
+/// Parse one statement of a trigger program (v0.16, `triggers`):
+/// a stored trigger's body statement, or `SELECT <when>`, with
+/// `RAISE()` allowed.
+#[cfg(feature = "triggers")]
+pub fn parse_trigger_step<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Ast, E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    p.in_trig = true;
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    Ok(ast)
+}
+
+/// `parse_trigger_step`, also returning the statement's tokens
+/// (v0.16, `triggers`; ALTER TABLE edits trigger texts by them).
+#[cfg(feature = "triggers")]
+pub fn parse_trigger_step_tokens<E>(
+    sql: &[u8],
+    arena: &Arena,
+    lim: Limits,
+) -> Result<(Ast, AVec<Token>), E> {
+    let toks = lex_checked::<E>(sql, arena)?;
+    let mut p = Parser::new(toks, arena, sql, lim);
+    p.in_trig = true;
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    Ok((ast, p.toks))
+}
+
+/// `SELECT *[, extra ...] FROM table [AS alias] [WHERE filter]` as an
+/// AST (v0.16, `triggers`): the rows an UPDATE / DELETE of a view
+/// hands its INSTEAD OF triggers.
+#[cfg(feature = "triggers")]
+pub fn star_select(
+    table: ABytes,
+    alias: Option<ABytes>,
+    filter: Option<Expr>,
+    extra: AVec<Expr>,
+    arena: &Arena,
+) -> SelectStmt {
+    let toks = AVec::new();
+    let p = Parser::new(toks, arena, &[], Limits::PIN);
+    let mut s = p.table_select(table, false);
+    if let Some(f) = s.from.as_mut_slice().first_mut() {
+        f.alias = alias;
+    }
+    s.filter = filter;
+    for e in extra.iter() {
+        s.items
+            .push(SelectItem::Expr(e.clone(), None, ABytes::EMPTY));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The pin's statement length limit (v0.16): a length is all
+    /// the check reads, so the boundary is testable without a
+    /// gigabyte of SQL.
+    #[cfg(feature = "v04")]
+    #[test]
+    fn statement_length_limit() {
+        assert!(too_long::<()>(MAX_SQL_LENGTH).is_ok());
+        assert!(matches!(
+            too_long::<()>(MAX_SQL_LENGTH + 1),
+            Err(Error::Parse {
+                kind: ParseKind::StatementTooLong,
+                ..
+            })
+        ));
+    }
+
+    /// The ON / USING fold equals the left-deep AND tree the pin
+    /// builds (v0.16), with and without a written WHERE.
+    #[cfg(feature = "v04")]
+    #[test]
+    fn on_chain_heights() {
+        // A reference: heights of ((w AND t1) AND t2) ... built
+        // one node at a time.
+        let tree = |w: Option<usize>, terms: &[usize]| {
+            let mut h = w;
+            for t in terms {
+                h = Some(match h {
+                    None => *t,
+                    Some(x) => x.max(*t) + 1,
+                });
+            }
+            h.unwrap_or(0)
+        };
+        let cases: [&[usize]; 6] = [&[], &[1], &[5, 1], &[1, 5], &[3, 9, 2, 2], &[7, 1, 1, 1, 6]];
+        for terms in cases {
+            let mut c = OnChain::default();
+            for t in terms {
+                c.push(*t, 0);
+            }
+            for w in [None, Some(1), Some(4), Some(12)] {
+                assert_eq!(c.height(w), tree(w, terms), "{w:?} {terms:?}");
+            }
+        }
+    }
     use super::*;
     use crate::error::Scope;
 
     fn kind(sql: &str) -> Option<ParseKind> {
         let arena = Arena::new(Scope::Statement, 0, 1 << 16);
-        match parse::<()>(sql.as_bytes(), &arena) {
+        match parse::<()>(sql.as_bytes(), &arena, Limits::PIN) {
             Ok(_) => None,
             Err(Error::Parse { kind, .. }) => Some(kind),
             Err(_) => Some(ParseKind::UnexpectedToken),
@@ -4385,13 +6641,7 @@ mod tests {
         let arena = Arena::new(Scope::Statement, 0, 1 << 16);
         let lit = |sql: &str| {
             let toks = lexer::lex::<()>(sql.as_bytes(), &arena).ok()?;
-            let p = Parser {
-                limit: toks.len(),
-                toks,
-                pos: 0,
-                arena: &arena,
-                sql: sql.as_bytes(),
-            };
+            let p = Parser::new(toks, &arena, sql.as_bytes(), Limits::PIN);
             p.literal_at(0).map(|(l, _)| l)
         };
         for sql in [
@@ -4495,7 +6745,7 @@ mod tests {
             columns,
             constraint_sets,
             ..
-        }) = parse::<()>(sql.as_bytes(), &arena)
+        }) = parse::<()>(sql.as_bytes(), &arena, Limits::PIN)
         else {
             panic!("parses");
         };
@@ -4505,9 +6755,11 @@ mod tests {
         assert_eq!(set.columns.len(), 2);
         assert_eq!(set.columns.as_slice()[0].coll, Some(Coll::Binary));
         assert!(set.columns.as_slice()[0].desc);
-        let Ok(Ast::CreateIndex { columns, .. }) =
-            parse::<()>(b"CREATE INDEX i ON t(a COLLATE \"NoCase\" DESC)", &arena)
-        else {
+        let Ok(Ast::CreateIndex { columns, .. }) = parse::<()>(
+            b"CREATE INDEX i ON t(a COLLATE \"NoCase\" DESC)",
+            &arena,
+            Limits::PIN,
+        ) else {
             panic!("parses");
         };
         assert_eq!(columns.as_slice()[0].coll, Some(Coll::NoCase));
@@ -4518,7 +6770,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse::<()>(sql.as_bytes(), &arena),
+                    parse::<()>(sql.as_bytes(), &arena, Limits::PIN),
                     Err(Error::Schema {
                         kind: crate::error::SchemaKind::UnknownCollation
                     })
@@ -4535,18 +6787,20 @@ mod tests {
     #[test]
     fn collate_operator_and_pattern_calls() {
         let arena = Arena::new(Scope::Statement, 0, 1 << 16);
-        let e = parse_expr_text::<()>(b"'a' || -b COLLATE nocase", &arena).expect("parses");
+        let e = parse_expr_text::<()>(b"'a' || -b COLLATE nocase", &arena, Limits::PIN)
+            .expect("parses");
         let Expr::Binary(BinOp::Concat, _, r) = e else {
             panic!("concat on top");
         };
         assert!(matches!(*r, Expr::Collate(ref x, Coll::NoCase) if matches!(**x, Expr::Neg(_))));
-        let e = parse_expr_text::<()>(b"x NOT GLOB 'a*'", &arena).expect("parses");
+        let e = parse_expr_text::<()>(b"x NOT GLOB 'a*'", &arena, Limits::PIN).expect("parses");
         let Expr::Not(call) = e else {
             panic!("NOT GLOB negates the call");
         };
         assert!(matches!(*call, Expr::Func { ref args, .. } if args.len() == 2));
-        let e = parse_expr_text::<()>(b"x LIKE 'a%' ESCAPE '\\'", &arena).expect("parses");
+        let e =
+            parse_expr_text::<()>(b"x LIKE 'a%' ESCAPE '\\'", &arena, Limits::PIN).expect("parses");
         assert!(matches!(e, Expr::Func { ref args, .. } if args.len() == 3));
-        assert!(parse_expr_text::<()>(b"x GLOB 'a' ESCAPE 'b'", &arena).is_err());
+        assert!(parse_expr_text::<()>(b"x GLOB 'a' ESCAPE 'b'", &arena, Limits::PIN).is_err());
     }
 }

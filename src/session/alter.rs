@@ -31,13 +31,24 @@
 //! view still uses. DROP COLUMN rewrites every row without the
 //! column (unless it was VIRTUAL), materialising the defaults of a
 //! short row and storing 0 / 1 in one byte, as the pin's rewrite
-//! does. A file holding triggers is refused (`Unsupported`): hipp
-//! cannot parse them, and the pin rewrites them too.
+//! does.
+//!
+//! Triggers (v0.16, `triggers`): a trigger's text is edited as the
+//! pin edits it — its `ON` table and `UPDATE OF` columns, the
+//! `NEW.` / `OLD.` columns of a trigger on the altered table, the
+//! targets of its INSERT / UPDATE / DELETE statements with their
+//! column lists, SET targets, upsert targets and `excluded.`
+//! references (RENAME TO renames the `excluded` qualifier too, as
+//! the pin does), and every reference its statements resolve to
+//! the table (planned as SELECTs with the trace). Every trigger must
+//! plan before and after the change ("error in trigger t"). Without
+//! `triggers` a file holding triggers is refused (`Unsupported`).
 
 use super::*;
 use crate::arena::ABytes;
 use crate::query::AlterTrace;
 use crate::sql::lexer::{Tok, Token};
+use crate::sql::parser::Limits;
 use alloc::rc::Rc;
 use core::cell::RefCell;
 
@@ -287,9 +298,15 @@ fn walk_cols(e: &Expr, out: &mut AVec<(Option<ABytes>, ABytes)>) {
 }
 
 /// The column references of the expression text `sql[at..end]`.
-fn expr_refs<E>(sql: &[u8], at: usize, end: usize, arena: &Arena) -> Result<AVec<ColRef>, E> {
+fn expr_refs<E>(
+    sql: &[u8],
+    at: usize,
+    end: usize,
+    arena: &Arena,
+    lim: Limits,
+) -> Result<AVec<ColRef>, E> {
     let sub = sql.get(at..end).unwrap_or(&[]);
-    let (e, toks) = crate::sql::parser::parse_expr_with_tokens::<E>(sub, arena)?;
+    let (e, toks) = crate::sql::parser::parse_expr_with_tokens::<E>(sub, arena, lim)?;
     let mut cols = AVec::new();
     walk_cols(&e, &mut cols);
     let mut out = AVec::new();
@@ -357,7 +374,7 @@ fn name_list(toks: &[Token], i: usize, arena: &Arena) -> (AVec<(usize, AVec<u8>)
     (out, close)
 }
 
-fn walk_table<E>(sql: &[u8], arena: &Arena) -> Result<TableText, E> {
+fn walk_table<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<TableText, E> {
     let toks = crate::sql::parser::tokens::<E>(sql, arena)?;
     let t = toks.as_slice();
     let mut w = TableText::default();
@@ -403,7 +420,7 @@ fn walk_table<E>(sql: &[u8], arena: &Arena) -> Result<TableText, E> {
                 let close = close_paren(t, j + 1);
                 let at = t.get(j + 2).map_or(0, |x| x.offset);
                 let end = t.get(close).map_or(sql.len(), |x| x.offset);
-                for r in expr_refs::<E>(sql, at, end, arena)?.iter() {
+                for r in expr_refs::<E>(sql, at, end, arena, lim)?.iter() {
                     w.exprs.push((k, r.clone()));
                 }
                 j = close + 1;
@@ -469,7 +486,7 @@ fn walk_table<E>(sql: &[u8], arena: &Arena) -> Result<TableText, E> {
 
 /// A CREATE INDEX text, walked by tokens: the table name's offset
 /// and name, and the column references of its key items and WHERE.
-fn walk_index<E>(sql: &[u8], arena: &Arena) -> Result<(Named, AVec<ColRef>), E> {
+fn walk_index<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<(Named, AVec<ColRef>), E> {
     let toks = crate::sql::parser::tokens::<E>(sql, arena)?;
     let t = toks.as_slice();
     let Some(on) = (0..t.len()).find(|&i| is_kw(t, i, arena, b"ON")) else {
@@ -499,7 +516,7 @@ fn walk_index<E>(sql: &[u8], arena: &Arena) -> Result<(Named, AVec<ColRef>), E> 
             if last > from {
                 let at = t[from].offset;
                 let end = t.get(last).map_or(sql.len(), |x| x.offset);
-                for r in expr_refs::<E>(sql, at, end, arena)?.iter() {
+                for r in expr_refs::<E>(sql, at, end, arena, lim)?.iter() {
                     refs.push(r.clone());
                 }
             }
@@ -516,7 +533,7 @@ fn walk_index<E>(sql: &[u8], arena: &Arena) -> Result<(Named, AVec<ColRef>), E> 
         while end > at && (sql[end - 1] == b';' || sql[end - 1].is_ascii_whitespace()) {
             end -= 1;
         }
-        for r in expr_refs::<E>(sql, at, end, arena)?.iter() {
+        for r in expr_refs::<E>(sql, at, end, arena, lim)?.iter() {
             refs.push(r.clone());
         }
     }
@@ -612,7 +629,9 @@ impl<S: Storage> Connection<S> {
     /// Plan a view's stored text `sql` against the current schema
     /// (the TEMP database's second RENAME COLUMN pass, above).
     fn plan_view_text(&self, arena: &Arena, name: &[u8], sql: &[u8]) -> Result<(), S::Error> {
-        let Ast::CreateView { select, .. } = crate::sql::parse::<S::Error>(sql, arena)? else {
+        let Ast::CreateView { select, .. } =
+            crate::sql::parse::<S::Error>(sql, arena, self.cfg.limits())?
+        else {
             return Err(Error::Unsupported);
         };
         let expanded = self.expand_parsed_view(arena, name, select)?;
@@ -631,7 +650,8 @@ impl<S: Storage> Connection<S> {
         sql: &[u8],
         table: &[u8],
     ) -> Result<ViewTrace, S::Error> {
-        let (ast, toks) = crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena)?;
+        let (ast, toks) =
+            crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena, self.cfg.limits())?;
         let Ast::CreateView { select, .. } = ast else {
             return Err(Error::Unsupported);
         };
@@ -711,6 +731,399 @@ impl<S: Storage> Connection<S> {
     }
 }
 
+#[cfg(feature = "triggers")]
+impl<S: Storage> Connection<S> {
+    /// Every trigger must still read as the pin reads it after an
+    /// ALTER TABLE (`trace_trigger` with no table to edit).
+    fn check_triggers(&mut self, arena: &Arena) -> Result<(), S::Error> {
+        let ca = &self.catalog_arena;
+        let mut texts: AVec<AVec<u8>> = AVec::new();
+        for t in self.catalog.triggers.iter() {
+            texts.push(copy_vec(handle_bytes(ca, t.sql)));
+        }
+        for t in texts.iter() {
+            let ckpt = arena.checkpoint();
+            let r = self.trace_trigger(
+                arena,
+                t.as_slice(),
+                &[],
+                &AlterOp::Drop {
+                    col: usize::MAX,
+                    name: AVec::new(),
+                },
+            );
+            arena.rewind(ckpt);
+            r?;
+        }
+        Ok(())
+    }
+
+    /// The edits of one trigger's text for `op` on `table` (see the
+    /// module docs).
+    fn trace_trigger(
+        &mut self,
+        arena: &Arena,
+        sql: &[u8],
+        table: &[u8],
+        op: &AlterOp,
+    ) -> Result<AVec<Ed>, S::Error> {
+        let lim = self.cfg.limits();
+        let (ast, toks) = crate::sql::parser::parse_with_tokens::<S::Error>(sql, arena, lim)?;
+        let Ast::CreateTrigger(ct) = ast else {
+            return Err(Error::Unsupported);
+        };
+        let mut eds = AVec::new();
+        let on = handle_bytes(arena, ct.table);
+        let on_it = eq_ci(on, table);
+        let tk = toks.as_slice();
+        if on_it {
+            match op {
+                AlterOp::Rename { new } => {
+                    if let Some(o) = tok_offset(tk, ct.table) {
+                        eds.push(edit_for(sql, o, new.as_slice(), true));
+                    }
+                }
+                AlterOp::RenameCol {
+                    old, new, quoted, ..
+                } => {
+                    for c in ct.of_cols.iter() {
+                        if eq_ci(handle_bytes(arena, *c), old.as_slice())
+                            && let Some(o) = tok_offset(tk, *c)
+                        {
+                            eds.push(edit_for(sql, o, new.as_slice(), *quoted));
+                        }
+                    }
+                }
+                AlterOp::Drop { .. } => {}
+            }
+        }
+        // The NEW / OLD rows bind to NULLs for planning.
+        let Ok((names, colls, alias, view)) = self.trigger_columns_of(on, arena) else {
+            return Ok(eds);
+        };
+        let mut nulls = AVec::new();
+        for _ in names.iter() {
+            nulls.push(OwnedValue::Null);
+        }
+        let row = crate::sql::trig::RowRef {
+            vals: nulls.as_slice(),
+            rowid: 0,
+        };
+        let bind = crate::sql::trig::Binding {
+            names: names.as_slice(),
+            colls: colls.as_slice(),
+            alias,
+            view,
+            new: (ct.event != crate::sql::ast::TrigEvent::Delete).then_some(row),
+            old: (ct.event != crate::sql::ast::TrigEvent::Insert).then_some(row),
+        };
+        let mut pieces: AVec<(usize, usize, usize)> = AVec::new();
+        if let Some((a, b)) = ct.when {
+            pieces.push((a, b, 7));
+        }
+        for (a, b) in ct.steps.iter() {
+            pieces.push((*a, *b, 0));
+        }
+        for (a, b, pre) in pieces.iter().copied() {
+            let mut text = AVec::new();
+            if pre > 0 {
+                text.extend_from_slice(b"SELECT ");
+            }
+            text.extend_from_slice(sql.get(a..b).unwrap_or(&[]));
+            let (step, stoks) = crate::sql::parser::parse_trigger_step_tokens::<S::Error>(
+                text.as_slice(),
+                arena,
+                lim,
+            )?;
+            let st = stoks.as_slice();
+            let off = |h: ABytes| -> Option<usize> {
+                tok_offset(st, h)
+                    .and_then(|o| o.checked_sub(pre))
+                    .and_then(|o| o.checked_add(a))
+            };
+            // NEW. / OLD. columns of a trigger on the table.
+            if on_it
+                && let AlterOp::RenameCol {
+                    col, new, quoted, ..
+                } = op
+            {
+                for (_, n) in crate::sql::trig::trigger_refs::<S::Error>(&step, arena)?.iter() {
+                    let nb = handle_bytes(arena, *n);
+                    let hit = names.iter().position(|c| eq_ci(c.as_slice(), nb)) == Some(*col);
+                    if hit && let Some(o) = off(*n) {
+                        eds.push(edit_for(sql, o, new.as_slice(), *quoted));
+                    }
+                }
+            }
+            target_edits(&step, arena, table, op, &off, sql, &mut eds);
+            // An INSERT's target must exist (the pin resolves it).
+            if let Ast::Insert { table: t, .. } = &step {
+                let n = handle_bytes(arena, *t);
+                if self.catalog.find(&self.catalog_arena, n).is_none()
+                    && self.catalog.find_view(&self.catalog_arena, n).is_none()
+                {
+                    return Err(err(SchemaKind::UnknownTable));
+                }
+            }
+            // Every reference the statement resolves to the table.
+            let mut bound = step.clone();
+            crate::sql::trig::bind_trigger::<S::Error>(&mut bound, &bind, arena)?;
+            let Some(sel) = as_select(&bound, arena) else {
+                continue;
+            };
+            let tr = Rc::new(RefCell::new(AlterTrace {
+                table: copy_vec(table),
+                ..AlterTrace::default()
+            }));
+            self.alter_trace = Some(tr.clone());
+            let r = (|| -> Result<(), S::Error> {
+                let wrapped = Ast::Select(sel);
+                let expanded = self.expand_ast(arena, &wrapped)?;
+                if let Some(Ast::Select(s)) = expanded.as_ref().or(Some(&wrapped)) {
+                    self.plan_subquery(s, arena, &[])?;
+                }
+                Ok(())
+            })();
+            self.alter_trace = None;
+            r?;
+            let tr = tr.borrow();
+            let at = |pos: u32| {
+                st.iter()
+                    .find(|x| matches!(x.tok, Tok::Ident(h, _) | Tok::Text(h) if h.pos == pos && h.len > 0))
+                    .and_then(|x| x.offset.checked_sub(pre))
+                    .and_then(|o| o.checked_add(a))
+            };
+            match op {
+                AlterOp::Rename { new } => {
+                    for &p in tr.from.iter() {
+                        if let Some(o) = at(p) {
+                            eds.push(edit_for(sql, o, new.as_slice(), true));
+                        }
+                    }
+                    for h in tr.hits.iter() {
+                        if let Some(o) = h.qual.and_then(at) {
+                            eds.push(edit_for(sql, o, new.as_slice(), true));
+                        }
+                    }
+                }
+                AlterOp::RenameCol {
+                    col, new, quoted, ..
+                } => {
+                    for h in tr.hits.iter() {
+                        if h.col == *col
+                            && let Some(o) = h.name.and_then(at)
+                        {
+                            eds.push(edit_for(sql, o, new.as_slice(), *quoted));
+                        }
+                    }
+                }
+                AlterOp::Drop { .. } => {}
+            }
+        }
+        Ok(eds)
+    }
+
+    /// `trigger_columns` for a trigger's table or view.
+    #[allow(clippy::type_complexity)]
+    fn trigger_columns_of(
+        &self,
+        table: &[u8],
+        arena: &Arena,
+    ) -> Result<
+        (
+            AVec<AVec<u8>>,
+            AVec<Option<crate::record::Coll>>,
+            Option<usize>,
+            bool,
+        ),
+        S::Error,
+    > {
+        let ca = &self.catalog_arena;
+        let mut names = AVec::new();
+        let mut colls = AVec::new();
+        if let Some(t) = self.catalog.find(ca, table) {
+            for c in t.columns.iter() {
+                names.push(copy_vec(handle_bytes(ca, c.name)));
+                colls.push(Some(c.coll));
+            }
+            return Ok((names, colls, t.rowid_alias, false));
+        }
+        let Some(v) = self.catalog.find_view(ca, table) else {
+            return Err(err(SchemaKind::UnknownTable));
+        };
+        for n in self.view_names(arena, v)?.iter() {
+            names.push(n.clone());
+            colls.push(None);
+        }
+        Ok((names, colls, None, true))
+    }
+}
+
+/// A trigger statement as the SELECT that reads what it reads: an
+/// UPDATE's SET values over its target and FROM sources, a DELETE's
+/// target, an INSERT's rows (`None`: nothing to plan).
+#[cfg(feature = "triggers")]
+fn as_select(step: &Ast, arena: &Arena) -> Option<SelectStmt> {
+    match step {
+        Ast::Select(s) => Some(s.clone()),
+        Ast::Insert {
+            select: Some(s), ..
+        } => Some(s.as_ref().clone()),
+        Ast::Insert { table, rows, .. } => {
+            let mut s = crate::sql::parser::star_select(*table, None, None, AVec::new(), arena);
+            s.items.clear();
+            s.from.clear();
+            s.values = rows.clone();
+            Some(s)
+        }
+        Ast::Update {
+            table,
+            alias,
+            assignments,
+            from,
+            filter,
+            ..
+        } => {
+            let mut extra = AVec::new();
+            for (_, e) in assignments.iter() {
+                extra.push(e.clone());
+            }
+            let mut s =
+                crate::sql::parser::star_select(*table, *alias, filter.clone(), extra, arena);
+            let mut items = AVec::new();
+            for it in s.items.iter().skip(1) {
+                items.push(it.clone());
+            }
+            s.items = items;
+            for f in from.iter() {
+                s.from.push(f.clone());
+            }
+            Some(s)
+        }
+        Ast::Delete { table, filter, .. } => Some(crate::sql::parser::star_select(
+            *table,
+            None,
+            filter.clone(),
+            AVec::new(),
+            arena,
+        )),
+        _ => None,
+    }
+}
+
+/// A trigger statement's edits that name resolution does not find:
+/// its INSERT target, the column lists and SET targets of a write of
+/// the table, and an upsert's references.
+#[cfg(feature = "triggers")]
+fn target_edits(
+    step: &Ast,
+    arena: &Arena,
+    table: &[u8],
+    op: &AlterOp,
+    off: &dyn Fn(ABytes) -> Option<usize>,
+    sql: &[u8],
+    eds: &mut AVec<Ed>,
+) {
+    let is_t = |h: ABytes| eq_ci(handle_bytes(arena, h), table);
+    let mut push = |h: ABytes, new: &[u8], q: bool| {
+        if let Some(o) = off(h) {
+            eds.push(edit_for(sql, o, new, q));
+        }
+    };
+    let (target, cols, sets, upsert) = match step {
+        Ast::Insert {
+            table: t,
+            columns,
+            upsert,
+            ..
+        } => (*t, columns.as_ref(), None, upsert.as_deref()),
+        Ast::Update {
+            table: t,
+            assignments,
+            ..
+        } => (*t, None, Some(assignments), None),
+        _ => return,
+    };
+    if !is_t(target) {
+        return;
+    }
+    match op {
+        AlterOp::Rename { new } => {
+            if matches!(step, Ast::Insert { .. }) {
+                push(target, new.as_slice(), true);
+            }
+            if let Some(u) = upsert {
+                // The pin renames the `excluded` qualifier too.
+                let mut refs = AVec::new();
+                upsert_refs(u, &mut refs);
+                for (q, _) in refs.iter() {
+                    if let Some(q) = q
+                        && (is_t(*q) || eq_ci(handle_bytes(arena, *q), b"excluded"))
+                    {
+                        push(*q, new.as_slice(), true);
+                    }
+                }
+            }
+        }
+        AlterOp::RenameCol {
+            old, new, quoted, ..
+        } => {
+            let is_old = |h: ABytes| eq_ci(handle_bytes(arena, h), old.as_slice());
+            for c in cols.into_iter().flat_map(|c| c.iter()) {
+                if is_old(*c) {
+                    push(*c, new.as_slice(), *quoted);
+                }
+            }
+            for (c, _) in sets.into_iter().flat_map(|s| s.iter()) {
+                if is_old(*c) {
+                    push(*c, new.as_slice(), *quoted);
+                }
+            }
+            if let Some(u) = upsert {
+                for c in u.target.iter() {
+                    if is_old(*c) {
+                        push(*c, new.as_slice(), *quoted);
+                    }
+                }
+                if let crate::sql::UpsertAction::Update { assignments, .. } = &u.action {
+                    for (c, _) in assignments.iter() {
+                        if is_old(*c) {
+                            push(*c, new.as_slice(), *quoted);
+                        }
+                    }
+                }
+                let mut refs = AVec::new();
+                upsert_refs(u, &mut refs);
+                for (q, n) in refs.iter() {
+                    let own =
+                        q.is_none_or(|q| is_t(q) || eq_ci(handle_bytes(arena, q), b"excluded"));
+                    if own && is_old(*n) {
+                        push(*n, new.as_slice(), *quoted);
+                    }
+                }
+            }
+        }
+        AlterOp::Drop { .. } => {}
+    }
+}
+
+/// The column references of an upsert's DO UPDATE clause.
+#[cfg(feature = "triggers")]
+fn upsert_refs(u: &crate::sql::Upsert, out: &mut AVec<(Option<ABytes>, ABytes)>) {
+    if let crate::sql::UpsertAction::Update {
+        assignments,
+        filter,
+    } = &u.action
+    {
+        for (_, e) in assignments.iter() {
+            walk_cols(e, out);
+        }
+        if let Some(f) = filter {
+            walk_cols(f, out);
+        }
+    }
+}
+
 impl<'c, S: Storage> Statement<'c, S> {
     pub(super) async fn step_alter16(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
@@ -768,6 +1181,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let (table, op) = (table.clone(), op.clone());
         let tn = table.as_slice();
         let rows = self.alter_schema_rows().await?;
+        #[cfg(not(feature = "triggers"))]
         if rows.iter().any(|r| eq_ci(r.ty.as_slice(), b"trigger")) {
             return Err(Error::Unsupported);
         }
@@ -820,7 +1234,25 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let own = eq_ci(row.name.as_slice(), tn);
                 Some(self.edit_table(sql, own, tn, &op, &arena)?)
             } else if eq_ci(row.ty.as_slice(), b"index") && eq_ci(row.tbl.as_slice(), tn) {
-                Some(edit_index::<S::Error>(sql, tn, &op, &arena)?)
+                Some(edit_index::<S::Error>(
+                    sql,
+                    tn,
+                    &op,
+                    &arena,
+                    self.conn.cfg.limits(),
+                )?)
+            } else if cfg!(feature = "triggers") && eq_ci(row.ty.as_slice(), b"trigger") {
+                #[cfg(feature = "triggers")]
+                {
+                    let eds = self.conn.trace_trigger(&arena, sql, tn, &op)?;
+                    if eds.is_empty() {
+                        None
+                    } else {
+                        Some(apply(sql, eds))
+                    }
+                }
+                #[cfg(not(feature = "triggers"))]
+                None
             } else if eq_ci(row.ty.as_slice(), b"view") {
                 let (from, hits) = self.conn.trace_view(&arena, row.name.as_slice(), sql, tn)?;
                 let mut eds = AVec::new();
@@ -881,6 +1313,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 AlterOp::Rename { new } if eq_ci(row.tbl.as_slice(), tn) => {
                     let name = if eq_ci(row.ty.as_slice(), b"table") {
                         new.clone()
+                    } else if eq_ci(row.ty.as_slice(), b"trigger") {
+                        row.name.clone()
                     } else {
                         auto_index_name(row.name.as_slice(), tn, new.as_slice())
                     };
@@ -969,6 +1403,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             arena.rewind(ckpt);
         }
+        // Every trigger must still plan ("error in trigger t after
+        // rename", v0.16, `triggers`).
+        #[cfg(feature = "triggers")]
+        self.conn.check_triggers(&arena)?;
         // Phase 4: DROP COLUMN rewrites every row without it.
         if let AlterOp::Drop { col, .. } = &op
             && layout.as_slice().get(*col).is_some_and(|l| l.0)
@@ -991,7 +1429,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         op: &AlterOp,
         arena: &Arena,
     ) -> Result<AVec<u8>, S::Error> {
-        let w = walk_table::<S::Error>(sql, arena)?;
+        let w = walk_table::<S::Error>(sql, arena, self.conn.cfg.limits())?;
         let mut eds = AVec::new();
         match op {
             AlterOp::Rename { new } => {
@@ -1082,7 +1520,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 out.extend_from_slice(&sql[..at]);
                 out.extend_from_slice(&sql[end.min(sql.len())..]);
                 // What remains must not use the column.
-                let nw = walk_table::<S::Error>(out.as_slice(), arena)?;
+                let nw = walk_table::<S::Error>(out.as_slice(), arena, self.conn.cfg.limits())?;
                 let uses = nw.exprs.iter().any(|(_, r)| names_col(r, tn, name))
                     || nw.fk_local.iter().any(|(_, n)| eq_ci(n.as_slice(), name));
                 if uses {
@@ -1192,8 +1630,14 @@ fn auto_index_name(name: &[u8], old: &[u8], new: &[u8]) -> AVec<u8> {
 }
 
 /// An index's text edited for `op` on its table `tn`.
-fn edit_index<E>(sql: &[u8], tn: &[u8], op: &AlterOp, arena: &Arena) -> Result<AVec<u8>, E> {
-    let ((to, _), refs) = walk_index::<E>(sql, arena)?;
+fn edit_index<E>(
+    sql: &[u8],
+    tn: &[u8],
+    op: &AlterOp,
+    arena: &Arena,
+    lim: Limits,
+) -> Result<AVec<u8>, E> {
+    let ((to, _), refs) = walk_index::<E>(sql, arena, lim)?;
     let mut eds = AVec::new();
     match op {
         AlterOp::Rename { new } => {

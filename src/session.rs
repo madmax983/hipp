@@ -39,7 +39,16 @@ use crate::query::{Ctx, RExpr, RowData};
 /// tiny profile's abort stays the inline two statements it was.
 macro_rules! abort_write {
     ($s:ident, $e:expr) => {{
-        #[cfg(feature = "v16")]
+        // A statement of a trigger program (v0.16, `triggers`) undoes
+        // nothing itself: the statement that fired the trigger does,
+        // as the failure's resolution says (`session::trigger`).
+        // (A foreign-key action program's statements likewise.)
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        let undone = $s.conn.in_program() || $s.stmt_rollback($e).await;
+        #[cfg(all(
+            feature = "v16",
+            not(any(feature = "triggers", feature = "foreign_keys"))
+        ))]
         let undone = $s.stmt_rollback($e).await;
         #[cfg(not(feature = "v16"))]
         let undone = {
@@ -57,12 +66,16 @@ macro_rules! abort_write {
 mod alter;
 #[cfg(feature = "v16")]
 mod cte;
+#[cfg(feature = "foreign_keys")]
+mod fkey;
 #[cfg(feature = "v16")]
 mod maint;
 #[cfg(feature = "v16")]
 mod pragma;
 #[cfg(feature = "v16")]
 mod temp;
+#[cfg(feature = "triggers")]
+mod trigger;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -107,12 +120,68 @@ pub struct Config {
     /// (v0.16, `v16`): a statement reaching this many levels fails
     /// with `SchemaKind::NestedTooDeep`. The pin allows 999 nested
     /// views (1000 is its "nested too deep"). Each level costs
-    /// hipp's planner and executor stack — about 10 KiB in a
-    /// release build, 30 KiB in a debug one — so the default (250)
-    /// suits an 8 MiB thread; raise it to 1000 for the pin's limit
-    /// on a thread with the stack for it (the CLI does).
+    /// hipp's planner and executor stack — measured on x86_64 up to
+    /// about 24 KiB in a release build (a view reading the last one
+    /// in an `IN` subquery) and 130 KiB in a debug one — on top of
+    /// what `max_expr_depth` / `max_parser_depth` bound, so the
+    /// default (250) suits an 8 MiB thread in release (about 32 MiB
+    /// in debug); `Config::stack_budget` does not lower it. Raise it
+    /// to 1000 for the pin's limit on a thread with the stack for it
+    /// (the CLI does).
     #[cfg(feature = "v16")]
     pub max_nesting: usize,
+    /// The deepest expression a statement may hold (v0.16), counted
+    /// as the pin counts `SQLITE_LIMIT_EXPR_DEPTH` (whose default,
+    /// 1000, is `sql::parser::PIN_EXPR_DEPTH`); deeper is
+    /// `ParseKind::ExprTooDeep`. Every recursive walk of a statement
+    /// — the parser, the resolver and planner, the evaluator, the
+    /// tree's Clone and Drop — is bounded by it and by
+    /// `max_parser_depth`. A view or CTE body counts where it is
+    /// read, as on the pin: the depths of a chain of bodies read
+    /// inside one another add up to this limit, and the chain is at
+    /// most `max_nesting` long. Together they bound the stack a
+    /// statement's own text needs: about `STACK_BASE + max_parser_depth *
+    /// STACK_PER_SYMBOL + max_expr_depth * STACK_PER_HEIGHT` bytes
+    /// (measured on x86_64; see `Config::stack_budget`). The
+    /// defaults (1000, the pin's, and 500 symbols) need about
+    /// 1.4 MiB in a release build and 5.3 MiB in a debug one; the
+    /// pin's limits about 4.3 MiB and 13 MiB — set them on a thread
+    /// with that stack (the CLI does), or derive limits from the
+    /// stack you have with `stack_budget`. The views and CTEs a
+    /// statement reads cost their nesting levels on top (see
+    /// `max_nesting`).
+    #[cfg(feature = "v04")]
+    pub max_expr_depth: usize,
+    /// The deepest nesting the parser takes (v0.16), counted in the
+    /// pin's LALR parser-stack symbols (the pin: 2500,
+    /// `sql::parser::PIN_PARSER_DEPTH` — about 2490 nested
+    /// parentheses, 830 nested function calls, 410 nested FROM
+    /// subqueries); deeper is `ParseKind::RecursionLimit` ("Recursion
+    /// limit").
+    #[cfg(feature = "v04")]
+    pub max_parser_depth: usize,
+    /// How deep trigger programs may nest (v0.16, `triggers`): a
+    /// trigger that would run as program number
+    /// `max_trigger_depth + 1` of a nest fails its statement with
+    /// `SchemaKind::TriggerDepth` (the pin's limit is 1000; a program
+    /// counts before its WHEN clause is read). Each level costs
+    /// hipp's planner and executor stack — up to `STACK_PER_TRIGGER`
+    /// (measured on x86_64 at about 15 KiB in a release build and
+    /// 262 KiB in a debug one, a recursive trigger with a simple
+    /// body), on top of what each level's statement needs by
+    /// `max_expr_depth` / `max_parser_depth`. The default (24, v0.16
+    /// review fix: 100 overflowed a 2 MiB thread) leaves a 2 MiB
+    /// release thread room for the default statement limits, and
+    /// fits an 8 MiB thread in a debug build; `Config::stack_budget`
+    /// lowers it to the levels its stack holds. Raise it to 1000 for
+    /// the pin's limit on a thread with the stack for it (about 15
+    /// MiB in release, 260 MiB in debug; the CLI does). Only
+    /// recursive triggers (`PRAGMA recursive_triggers`) nest deeper
+    /// than the schema's number of triggers. Foreign-key action
+    /// programs (`foreign_keys`: a cascade through a chain of rows)
+    /// count as trigger programs, as on the pin.
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+    pub max_trigger_depth: usize,
 }
 
 /// The `VACUUM INTO` writer's type (v0.16, `v16`; see
@@ -141,9 +210,62 @@ impl Default for Config {
             vacuum_into: None,
             #[cfg(feature = "v16")]
             max_nesting: 250,
+            #[cfg(feature = "v04")]
+            max_expr_depth: DEFAULT_EXPR_DEPTH,
+            #[cfg(feature = "v04")]
+            max_parser_depth: DEFAULT_PARSER_DEPTH,
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            max_trigger_depth: DEFAULT_TRIGGER_DEPTH,
         }
     }
 }
+
+/// `Config::default()`'s expression depth limit (v0.16): the pin's.
+#[cfg(feature = "v04")]
+pub const DEFAULT_EXPR_DEPTH: usize = crate::sql::parser::PIN_EXPR_DEPTH;
+/// `Config::default()`'s parser depth limit (v0.16): a fifth of the
+/// pin's 2500, so that the default limits fit a 2 MiB thread in a
+/// release build (about 490 nested parentheses, 160 nested calls, 80
+/// nested FROM subqueries).
+#[cfg(feature = "v04")]
+pub const DEFAULT_PARSER_DEPTH: usize = 500;
+
+/// `Config::default()`'s trigger nesting limit (v0.16, `triggers` /
+/// `foreign_keys`; see `Config::max_trigger_depth`).
+#[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+pub const DEFAULT_TRIGGER_DEPTH: usize = 24;
+/// The most stack one level of trigger (or foreign-key action)
+/// program nesting costs (v0.16; measured on x86_64 over recursive
+/// AFTER INSERT triggers with simple bodies, `FileStorage`).
+#[cfg(all(any(feature = "triggers", feature = "foreign_keys"), debug_assertions))]
+pub const STACK_PER_TRIGGER: usize = 272 * 1024;
+#[cfg(all(
+    any(feature = "triggers", feature = "foreign_keys"),
+    not(debug_assertions)
+))]
+pub const STACK_PER_TRIGGER: usize = 16 * 1024;
+
+/// The stack hipp needs for any statement, before nesting (v0.16;
+/// measured on x86_64 — the step future and the call path to the
+/// parser and executor).
+#[cfg(all(feature = "v04", debug_assertions))]
+pub const STACK_BASE: usize = 320 * 1024;
+#[cfg(all(feature = "v04", not(debug_assertions)))]
+pub const STACK_BASE: usize = 64 * 1024;
+/// The most stack one symbol of `Config::max_parser_depth` costs
+/// (v0.16; measured on x86_64, the worst construct being a nested
+/// FROM subquery: its parse, plan and execution).
+#[cfg(all(feature = "v04", debug_assertions))]
+pub const STACK_PER_SYMBOL: usize = 4096;
+#[cfg(all(feature = "v04", not(debug_assertions)))]
+pub const STACK_PER_SYMBOL: usize = 1536;
+/// The most stack one level of `Config::max_expr_depth` costs
+/// (v0.16; measured on x86_64: the resolver, the evaluator and the
+/// tree's Clone / Drop, each recursing once per level).
+#[cfg(all(feature = "v04", debug_assertions))]
+pub const STACK_PER_HEIGHT: usize = 3456;
+#[cfg(all(feature = "v04", not(debug_assertions)))]
+pub const STACK_PER_HEIGHT: usize = 704;
 
 impl Config {
     /// The §4.1 tiny reference configuration: 16 KiB page pool,
@@ -166,6 +288,12 @@ impl Config {
             vacuum_into: None,
             #[cfg(feature = "v16")]
             max_nesting: 16,
+            #[cfg(feature = "v04")]
+            max_expr_depth: 64,
+            #[cfg(feature = "v04")]
+            max_parser_depth: 64,
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            max_trigger_depth: 8,
         }
     }
 
@@ -197,6 +325,59 @@ impl Config {
     pub fn max_nesting(mut self, levels: usize) -> Config {
         self.max_nesting = levels;
         self
+    }
+    /// Set `max_trigger_depth` (v0.16, `triggers` / `foreign_keys`).
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+    pub fn max_trigger_depth(mut self, levels: usize) -> Config {
+        self.max_trigger_depth = levels;
+        self
+    }
+    /// Set `max_expr_depth` and `max_parser_depth` (v0.16).
+    #[cfg(feature = "v04")]
+    pub fn depth_limits(mut self, expr: usize, parser: usize) -> Config {
+        self.max_expr_depth = expr;
+        self.max_parser_depth = parser;
+        self
+    }
+    /// Set `max_expr_depth` and `max_parser_depth` for a thread of
+    /// `bytes` of stack (v0.16): the largest limits, at most the
+    /// pin's, whose worst case — `STACK_BASE + max_parser_depth *
+    /// STACK_PER_SYMBOL + max_expr_depth * STACK_PER_HEIGHT`, the
+    /// costs measured for this build profile — fits. Up to half the
+    /// room past the base goes to the expression depth, the rest to
+    /// the parser's. A stack below the base leaves both 0: nothing
+    /// but the statements without expressions parses then. It
+    /// budgets a statement's own text: lower `max_nesting` too when
+    /// statements read views or CTEs on a small stack. With
+    /// triggers or foreign keys it also lowers `max_trigger_depth`
+    /// to the trigger levels a quarter of the room holds
+    /// (`STACK_PER_TRIGGER` each; v0.16 review fix), never raising it.
+    #[cfg(feature = "v04")]
+    pub fn stack_budget(self, bytes: usize) -> Config {
+        let room = bytes.saturating_sub(STACK_BASE);
+        let expr = (room / 2 / STACK_PER_HEIGHT).min(crate::sql::parser::PIN_EXPR_DEPTH);
+        let parser = (room.saturating_sub(expr * STACK_PER_HEIGHT) / STACK_PER_SYMBOL)
+            .min(crate::sql::parser::PIN_PARSER_DEPTH);
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        let c = {
+            let levels = room / 4 / STACK_PER_TRIGGER;
+            let d = self.max_trigger_depth.min(levels);
+            self.max_trigger_depth(d)
+        };
+        #[cfg(not(any(feature = "triggers", feature = "foreign_keys")))]
+        let c = self;
+        c.depth_limits(expr, parser)
+    }
+    /// The parser's nesting limits under this configuration
+    /// (v0.16; the pin's constants without the v0.4 grammar, which
+    /// does not nest).
+    pub fn limits(&self) -> crate::sql::parser::Limits {
+        crate::sql::parser::Limits {
+            #[cfg(feature = "v04")]
+            expr_depth: self.max_expr_depth,
+            #[cfg(feature = "v04")]
+            parser_depth: self.max_parser_depth,
+        }
     }
     pub fn page_size(mut self, n: u32) -> Config {
         self.create_page_size = n;
@@ -501,8 +682,11 @@ enum Plan {
         /// The column may be added only while the table has no
         /// rows (v0.16, the pin's `sqlite3ErrorIfNotEmpty`): a
         /// non-constant default, NOT NULL without a default, a
-        /// STORED generated column.
-        empty_only: bool,
+        /// STORED generated column; with `PRAGMA foreign_keys` ON a
+        /// REFERENCES column with a non-NULL default. The error the
+        /// step raises when the table has rows (the first refusal
+        /// the pin emits).
+        empty_only: Option<SchemaKind>,
     },
     /// `CREATE VIEW` (v0.4).
     #[cfg(feature = "v04")]
@@ -524,6 +708,27 @@ enum Plan {
     /// The savepoint and maintenance statements (v0.16, `v16`).
     #[cfg(feature = "v16")]
     Maint(maint::Maint),
+    /// `CREATE TRIGGER` (v0.16, `triggers`): the span of the
+    /// statement text the stored text keeps (from the bare name to
+    /// END), the name and the table; `skip` is the IF NOT EXISTS
+    /// no-op.
+    #[cfg(feature = "triggers")]
+    CreateTrigger {
+        span: (usize, usize),
+        name: AVec<u8>,
+        table: AVec<u8>,
+        skip: bool,
+    },
+    /// `DROP TRIGGER` (v0.16, `triggers`); `None` is the IF EXISTS
+    /// no-op.
+    #[cfg(feature = "triggers")]
+    DropTrigger {
+        name: Option<AVec<u8>>,
+    },
+    /// A write of a view through its INSTEAD OF triggers (v0.16,
+    /// `triggers`).
+    #[cfg(feature = "triggers")]
+    Instead(Box<trigger::InsteadPlan>),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -935,6 +1140,13 @@ pub struct Connection<S: Storage> {
     /// This connection is another's TEMP database (v0.16, `v16`).
     #[cfg(feature = "v16")]
     is_temp: bool,
+    /// The running trigger programs (v0.16, `triggers`).
+    #[cfg(feature = "triggers")]
+    trig: trigger::TrigState,
+    /// The foreign-key violation counters and action programs
+    /// (v0.16, `foreign_keys`).
+    #[cfg(feature = "foreign_keys")]
+    fk: fkey::FkState,
 }
 
 impl<S: Storage> Connection<S> {
@@ -975,6 +1187,10 @@ impl<S: Storage> Connection<S> {
             temp: None,
             #[cfg(feature = "v16")]
             is_temp: false,
+            #[cfg(feature = "triggers")]
+            trig: trigger::TrigState::default(),
+            #[cfg(feature = "foreign_keys")]
+            fk: fkey::FkState::default(),
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -991,7 +1207,8 @@ impl<S: Storage> Connection<S> {
         {
             self.catalog = Catalog::empty(self.pager.schema_cookie().wrapping_add(1));
         }
-        self.catalog = build_catalog(&mut self.pager, &self.catalog_arena).await?;
+        self.catalog =
+            build_catalog(&mut self.pager, &self.catalog_arena, self.cfg.limits()).await?;
         Ok(())
     }
 
@@ -1043,7 +1260,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v16")]
             Some(p) => (Ast::Begin, p),
             _ => {
-                let ast = crate::sql::parse::<S::Error>(main_text, &arena)?;
+                let ast = crate::sql::parse::<S::Error>(main_text, &arena, self.cfg.limits())?;
                 let plan = self.plan(&arena, &ast)?;
                 (ast, plan)
             }
@@ -1055,7 +1272,8 @@ impl<S: Storage> Connection<S> {
                 let Plan::Temp { sql: t, .. } = &p else {
                     return Err(Error::Unsupported);
                 };
-                let (_, table) = crate::sql::parse_params::<S::Error>(t.as_slice(), &arena)?;
+                let (_, table) =
+                    crate::sql::parse_params::<S::Error>(t.as_slice(), &arena, self.cfg.limits())?;
                 let mut values = AVec::new();
                 for _ in 0..table.count {
                     values.push(OwnedValue::Null);
@@ -1103,6 +1321,8 @@ impl<S: Storage> Connection<S> {
             query_loaded: false,
             #[cfg(feature = "v06")]
             hoist: AVec::new(),
+            #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+            ret_hoist: AVec::new(),
             #[cfg(feature = "v07")]
             ret_rows: AVec::new(),
             #[cfg(feature = "v07")]
@@ -1123,6 +1343,14 @@ impl<S: Storage> Connection<S> {
             upsert_failed: false,
             #[cfg(feature = "v16")]
             autoinc: None,
+            #[cfg(feature = "triggers")]
+            trig: None,
+            #[cfg(feature = "foreign_keys")]
+            fk: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_del: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_skip: [None; 2],
         })
     }
 
@@ -1162,7 +1390,7 @@ impl<S: Storage> Connection<S> {
     /// the pin's prepare reports it (`binding_dependent`).
     #[cfg(feature = "params")]
     fn prepare_params(&self, sql: &[u8], arena: &Arena) -> Result<(Ast, Plan, Binds), S::Error> {
-        let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena)?;
+        let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena, self.cfg.limits())?;
         let plan_ckpt = arena.checkpoint();
         let mut binds = Binds {
             values: AVec::new(),
@@ -1191,7 +1419,84 @@ impl<S: Storage> Connection<S> {
         }
     }
 
+    #[cfg_attr(not(feature = "triggers"), inline(always))]
     fn plan(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
+        // v0.16 (`triggers`): the triggers a write may fire resolve
+        // when it is prepared, as on the pin.
+        #[cfg(feature = "triggers")]
+        {
+            use crate::sql::ast::TrigEvent;
+            let body = match ast {
+                Ast::With { body, .. } => body.as_ref(),
+                a => a,
+            };
+            let names = |a: &AVec<(crate::arena::ABytes, Expr)>| {
+                let mut out = AVec::new();
+                for (n, _) in a.iter() {
+                    out.push(copy_vec(handle_bytes(arena, *n)));
+                }
+                out
+            };
+            // A REPLACE's deletions fire the DELETE triggers under
+            // `recursive_triggers`: the pin compiles them too.
+            let replace =
+                |c: &ConflictAction| *c == ConflictAction::Replace && self.prag.recursive_triggers;
+            match body {
+                Ast::Insert { conflict, .. } | Ast::Update { conflict, .. }
+                    if replace(conflict) =>
+                {
+                    let (Ast::Insert { table, .. } | Ast::Update { table, .. }) = body else {
+                        return Err(Error::Unsupported);
+                    };
+                    self.validate_triggers(
+                        handle_bytes(arena, *table),
+                        TrigEvent::Delete,
+                        None,
+                        arena,
+                    )?;
+                }
+                _ => {}
+            }
+            match body {
+                Ast::Insert { table, upsert, .. } => {
+                    let t = handle_bytes(arena, *table);
+                    self.validate_triggers(t, TrigEvent::Insert, None, arena)?;
+                    if let Some(u) = upsert
+                        && let crate::sql::UpsertAction::Update { assignments, .. } = &u.action
+                    {
+                        let n = names(assignments);
+                        self.validate_triggers(t, TrigEvent::Update, Some(n.as_slice()), arena)?;
+                    }
+                }
+                Ast::Update {
+                    table, assignments, ..
+                } => {
+                    let n = names(assignments);
+                    let t = handle_bytes(arena, *table);
+                    self.validate_triggers(t, TrigEvent::Update, Some(n.as_slice()), arena)?;
+                }
+                Ast::Delete { table, .. } => {
+                    let t = handle_bytes(arena, *table);
+                    self.validate_triggers(t, TrigEvent::Delete, None, arena)?;
+                }
+                _ => {}
+            }
+        }
+        let plan = self.plan_inner(arena, ast)?;
+        // v0.16 (`foreign_keys`): the keys a write uses resolve when
+        // it is prepared, as on the pin.
+        #[cfg(feature = "foreign_keys")]
+        self.fk_validate(ast, &plan, arena)?;
+        Ok(plan)
+    }
+
+    fn plan_inner(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
+        // v0.16 (`triggers`): a write of a view with INSTEAD OF
+        // triggers for it (its sources are expanded there).
+        #[cfg(feature = "triggers")]
+        if let Some(p) = self.plan_instead(arena, ast)? {
+            return Ok(p);
+        }
         // v0.16: views and CTEs are read as derived tables — every
         // reference is expanded before anything else is planned.
         #[cfg(feature = "v16")]
@@ -1247,7 +1552,8 @@ impl<S: Storage> Connection<S> {
         }
         // v0.16: `sqlite_schema` is readable, never writable; and
         // with `PRAGMA foreign_keys = ON` a table in a foreign key
-        // is not writable either (hipp does not enforce them).
+        // is not writable either unless `foreign_keys` enforces
+        // them.
         #[cfg(feature = "v16")]
         {
             let target = match ast {
@@ -1266,6 +1572,10 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::SchemaTableReadOnly,
                     });
                 }
+                // Without `foreign_keys` a table in a foreign key is
+                // not writable while the pragma is ON (never skipped
+                // silently); with it the keys are enforced.
+                #[cfg(not(feature = "foreign_keys"))]
                 if !matches!(ast, Ast::CreateIndex { .. }) {
                     self.fk_guard(n)?;
                 }
@@ -1275,6 +1585,12 @@ impl<S: Storage> Connection<S> {
             // Unwrapped by `expand_ast` above.
             #[cfg(feature = "v16")]
             Ast::With { .. } => Err(Error::Unsupported),
+            #[cfg(feature = "triggers")]
+            Ast::CreateTrigger(t) => self.plan_create_trigger(arena, t),
+            #[cfg(feature = "triggers")]
+            Ast::DropTrigger { name, if_exists } => {
+                self.plan_drop_trigger(arena, *name, *if_exists)
+            }
             #[cfg(feature = "v16")]
             Ast::Pragma {
                 schema,
@@ -1349,12 +1665,17 @@ impl<S: Storage> Connection<S> {
                 // pin refuses at once.)
                 let mut kept = AVec::new();
                 for h in checks.iter() {
-                    if !crate::rules::has_big_hex::<S::Error>(handle_bytes(arena, *h), arena)? {
+                    if !crate::rules::has_big_hex::<S::Error>(
+                        handle_bytes(arena, *h),
+                        arena,
+                        self.cfg.limits(),
+                    )? {
                         kept.push(*h);
                     }
                 }
                 crate::rules::validate_def::<S::Error>(
                     arena,
+                    self.cfg.limits(),
                     handle_bytes(arena, *name),
                     columns.as_slice(),
                     pk_columns.as_slice(),
@@ -1363,7 +1684,11 @@ impl<S: Storage> Connection<S> {
                 )?;
                 #[cfg(feature = "v16")]
                 if self.prag.like_redefined
-                    && crate::rules::gen_uses_like::<S::Error>(arena, columns.as_slice())?
+                    && crate::rules::gen_uses_like::<S::Error>(
+                        arena,
+                        self.cfg.limits(),
+                        columns.as_slice(),
+                    )?
                 {
                     return Err(Error::Schema {
                         kind: SchemaKind::NonDeterministic,
@@ -1486,6 +1811,18 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::UnknownTable,
                     })?
                     .usable()?;
+                // v0.16, every profile: a table whose triggers this
+                // build cannot run is not written (never skipping
+                // them silently).
+                #[cfg(not(feature = "triggers"))]
+                let blocked = t.triggered;
+                #[cfg(feature = "triggers")]
+                let blocked = self.catalog.trigger_blocked(&self.catalog_arena, tname);
+                if blocked {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::TableHasTriggers,
+                    });
+                }
                 // An AUTOINCREMENT table (in a file the pin made) is
                 // read-only without `v16`: those builds keep no
                 // `sqlite_sequence` (v0.16 fix: hipp inserted rows
@@ -1611,6 +1948,11 @@ impl<S: Storage> Connection<S> {
                             desc,
                         });
                     }
+                    // Checked most recently created first, as the pin
+                    // walks its (prepended) index list (v0.16 review
+                    // fix: which REPLACE victim goes first shows in
+                    // its DELETE triggers).
+                    out.as_mut_slice().reverse();
                     out
                 };
                 // v0.8: an INSERT ... SELECT source is planned
@@ -1824,6 +2166,14 @@ impl<S: Storage> Connection<S> {
                         });
                     }
                 };
+                // The pin's "too many columns on t" (v0.16 fix,
+                // ungated: the 2001st column made a schema it
+                // cannot load).
+                if t.columns.len() >= crate::sql::parser::MAX_COLUMN {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::TooManyColumns,
+                    });
+                }
                 let cname = handle_bytes(arena, column.name);
                 if t.columns
                     .iter()
@@ -1841,6 +2191,22 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::CannotAddColumn,
                     });
                 }
+                let mut empty_only = None;
+                // v0.16 fix (ungated): with `PRAGMA foreign_keys` ON a
+                // REFERENCES column takes no non-NULL default while
+                // the table has rows (the pin's "Cannot add a
+                // REFERENCES column with non-NULL default value",
+                // through `sqlite3ErrorIfNotEmpty` and emitted before
+                // its other such refusals; v0.16 review fix: an empty
+                // table takes the column).
+                #[cfg(feature = "v16")]
+                if self.prag.foreign_keys
+                    && (column.default_expr.is_some()
+                        || !matches!(literal_owned(arena, column.default), OwnedValue::Null))
+                    && def_references::<S::Error>(handle_bytes(arena, *text), arena)
+                {
+                    empty_only = Some(SchemaKind::ReferencesDefault);
+                }
                 // The pin's other refusals fire only when the table
                 // has rows (`sqlite3ErrorIfNotEmpty`, checked at
                 // step time): a STORED generated column, a DEFAULT
@@ -1849,20 +2215,22 @@ impl<S: Storage> Connection<S> {
                 // anywhere, `(1+2)` and CURRENT_TIMESTAMP only to an
                 // empty table (v0.16: they were always refused) —
                 // and NOT NULL with no default or a literal NULL.
-                let mut empty_only = column.generated && column.stored;
+                let mut refuse = column.generated && column.stored;
                 // The new column's value in every existing row.
                 let new_default = match column.default_expr {
                     Some(h) if !column.generated => {
                         let dt = handle_bytes(arena, h);
-                        if crate::rules::alter_default_ok::<S::Error>(dt, arena)? {
+                        if crate::rules::alter_default_ok::<S::Error>(dt, arena, self.cfg.limits())?
+                        {
                             crate::rules::eval_default::<S::Error>(
                                 dt,
                                 arena,
+                                self.cfg.limits(),
                                 &mut crate::rules::Clock::new(None),
                                 Some(&self.env),
                             )?
                         } else {
-                            empty_only = true;
+                            refuse = true;
                             OwnedValue::Null
                         }
                     }
@@ -1873,7 +2241,10 @@ impl<S: Storage> Connection<S> {
                     && column.default_expr.is_none()
                     && matches!(new_default, OwnedValue::Null)
                 {
-                    empty_only = true;
+                    refuse = true;
+                }
+                if refuse && empty_only.is_none() {
+                    empty_only = Some(SchemaKind::CannotAddColumn);
                 }
                 let base = handle_bytes(&self.catalog_arena, t.sql);
                 let pos = add_column_offset::<S::Error>(base, arena)?;
@@ -1897,7 +2268,7 @@ impl<S: Storage> Connection<S> {
                     #[cfg(feature = "v16")]
                     strict,
                     ..
-                } = crate::sql::parse::<S::Error>(new_sql.as_slice(), arena)?
+                } = crate::sql::parse::<S::Error>(new_sql.as_slice(), arena, self.cfg.limits())?
                 else {
                     return Err(Error::Unsupported);
                 };
@@ -1908,6 +2279,7 @@ impl<S: Storage> Connection<S> {
                 #[allow(unused_mut)]
                 let mut rules = crate::rules::validate_def::<S::Error>(
                     arena,
+                    self.cfg.limits(),
                     tname,
                     ncols_def.as_slice(),
                     pk_columns.as_slice(),
@@ -1917,7 +2289,11 @@ impl<S: Storage> Connection<S> {
                 // The pin re-checks the whole rewritten definition.
                 #[cfg(feature = "v16")]
                 if self.prag.like_redefined
-                    && crate::rules::gen_uses_like::<S::Error>(arena, ncols_def.as_slice())?
+                    && crate::rules::gen_uses_like::<S::Error>(
+                        arena,
+                        self.cfg.limits(),
+                        ncols_def.as_slice(),
+                    )?
                 {
                     return Err(Error::Schema {
                         kind: SchemaKind::NonDeterministic,
@@ -2107,6 +2483,12 @@ impl<S: Storage> Connection<S> {
         table: &crate::arena::ABytes,
     ) -> Result<&crate::schema::TableDef, S::Error> {
         let tname = handle_bytes(arena, *table);
+        // v0.16, every profile: as for INSERT.
+        if self.catalog.trigger_blocked(&self.catalog_arena, tname) {
+            return Err(Error::Schema {
+                kind: SchemaKind::TableHasTriggers,
+            });
+        }
         match self.catalog.find(&self.catalog_arena, tname) {
             Some(t) => t.usable(),
             None => {
@@ -2297,6 +2679,7 @@ impl<S: Storage> Connection<S> {
         #[allow(unused_mut)]
         let mut rules = crate::rules::plan_rules::<S::Error>(
             arena,
+            self.cfg.limits(),
             handle_bytes(ca, t.name),
             specs.as_slice(),
             t.rowid_alias,
@@ -2326,6 +2709,7 @@ impl<S: Storage> Connection<S> {
             Some(h) => crate::rules::eval_default::<S::Error>(
                 handle_bytes(&self.catalog_arena, h),
                 arena,
+                self.cfg.limits(),
                 clock,
                 Some(&self.env),
             ),
@@ -2350,6 +2734,7 @@ impl<S: Storage> Connection<S> {
         let (r, row) = crate::rules::prepare_default::<S::Error>(
             handle_bytes(&self.catalog_arena, h),
             arena,
+            self.cfg.limits(),
             clock,
         )?;
         let v = crate::rules::eval_prepared_default::<S::Error>(&r, &row, Some(&self.env))?;
@@ -2411,6 +2796,8 @@ impl<S: Storage> Connection<S> {
                 desc,
             });
         }
+        // Most recently created first, as INSERT's (the pin's order).
+        out.as_mut_slice().reverse();
         Ok(out)
     }
 
@@ -2647,6 +3034,40 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v16")]
             mat: 0,
         };
+        // A compound's cores sort by its ORDER BY (and, under
+        // UNION / INTERSECT / EXCEPT, every column) on the pin,
+        // which copies their window columns (v0.16 review fix,
+        // `window`; see `window::compound_sorts`).
+        #[cfg(feature = "window")]
+        if !plan.compound.is_empty() {
+            let mut ops = AVec::new();
+            for (op, _) in plan.compound.iter() {
+                ops.push(*op);
+            }
+            let mut cols = AVec::new();
+            for (j, _) in plan.comp_order.iter() {
+                cols.push(*j);
+            }
+            let sorts =
+                crate::window::compound_sorts(ops.as_slice(), cols.as_slice(), plan.items.len());
+            let mut it = sorts.iter();
+            if let Some(c) = it.next() {
+                crate::window::compound_copies(
+                    plan.items.as_mut_slice(),
+                    &mut plan.order_by,
+                    c.as_slice(),
+                    plan.distinct,
+                );
+            }
+            for ((_, t), c) in plan.compound.as_mut_slice().iter_mut().zip(it) {
+                crate::window::compound_copies(
+                    t.items.as_mut_slice(),
+                    &mut t.order_by,
+                    c.as_slice(),
+                    t.distinct,
+                );
+            }
+        }
         self.stamp_subplan(&mut plan, base_width, base_src);
         Ok((plan, core.keys))
     }
@@ -2679,12 +3100,25 @@ impl<S: Storage> Connection<S> {
                 _ => {}
             }
             let mut rr = AVec::new();
+            // Each VALUES row is a SELECT core of its own on the pin:
+            // its window calls (v0.16, `window`) run over that one
+            // row.
+            #[cfg(feature = "window")]
+            {
+                cur.win.ok.set(true);
+                cur.win.next.set(0);
+            }
             for e in r.iter() {
                 let re = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
                 if has_agg(&re) {
                     return Err(Error::Unsupported);
                 }
                 rr.push(re);
+            }
+            #[cfg(feature = "window")]
+            {
+                cur.win.ok.set(false);
+                crate::window::classify(rr.as_mut_slice(), &mut []);
             }
             rows_r.push(rr);
         }
@@ -2787,8 +3221,21 @@ impl<S: Storage> Connection<S> {
         qualifier: &[u8],
         items: &AVec<SelectItem>,
     ) -> Result<AVec<RExpr>, S::Error> {
-        use crate::query::{has_agg, resolve_scoped};
         let (sources, offsets) = self.single_source(t, qualifier);
+        self.plan_returning_in(arena, sources, offsets, items)
+    }
+
+    /// `plan_returning` over the given source (v0.16: also a view's
+    /// columns, for a write through INSTEAD OF triggers).
+    #[cfg(feature = "v07")]
+    pub(super) fn plan_returning_in(
+        &self,
+        arena: &Arena,
+        sources: AVec<crate::query::SourceDesc>,
+        offsets: AVec<usize>,
+        items: &AVec<SelectItem>,
+    ) -> Result<AVec<RExpr>, S::Error> {
+        use crate::query::{has_agg, resolve_scoped};
         let mut cur = crate::query::ScopeGroup::new(sources, offsets, 0);
         cur.agg_owner = false;
         let mut planner = self.sub_planner(arena);
@@ -2801,17 +3248,12 @@ impl<S: Storage> Connection<S> {
                         out.push(src.column_ref(&cur, 0, ci));
                     }
                 }
-                SelectItem::TableStar(q) => {
-                    let qb = handle_bytes(arena, *q);
-                    let src = &cur.sources.as_slice()[0];
-                    if !src.named(qb) {
-                        return Err(Error::Schema {
-                            kind: SchemaKind::UnknownColumn,
-                        });
-                    }
-                    for ci in 0..src.columns.len() {
-                        out.push(src.column_ref(&cur, 0, ci));
-                    }
+                // The pin refuses `t.*` in RETURNING (v0.16 review
+                // fix: hipp used to expand it).
+                SelectItem::TableStar(_) => {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::ReturningTableStar,
+                    });
                 }
                 SelectItem::Expr(e, _, _) => {
                     let r = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
@@ -2821,6 +3263,14 @@ impl<S: Storage> Connection<S> {
                     out.push(r);
                 }
             }
+        }
+        // The pin's "too many columns in result set" (v0.16 review
+        // fix, ungated): a RETURNING list is a result set, counted
+        // once `*` is expanded and checked before any row changes.
+        if out.len() > crate::sql::parser::MAX_COLUMN {
+            return Err(Error::Schema {
+                kind: SchemaKind::TooManyColumns,
+            });
         }
         Ok(out)
     }
@@ -3414,7 +3864,8 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(not(feature = "v09"))]
         let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
-        let qp = QueryPlan {
+        #[cfg_attr(not(feature = "window"), allow(unused_mut))]
+        let mut plan = QueryPlan {
             sources: core.sources,
             items: core.items,
             filter: core.filter,
@@ -3430,7 +3881,41 @@ impl<S: Storage> Connection<S> {
             values: AVec::new(),
             comp_order,
         };
-        Ok((qp, core.keys))
+        // A compound's cores sort by its ORDER BY (and, under
+        // UNION / INTERSECT / EXCEPT, every column) on the pin,
+        // which copies their window columns (v0.16 review fix,
+        // `window`; see `window::compound_sorts`).
+        #[cfg(feature = "window")]
+        if !plan.compound.is_empty() {
+            let mut ops = AVec::new();
+            for (op, _) in plan.compound.iter() {
+                ops.push(*op);
+            }
+            let mut cols = AVec::new();
+            for (j, _) in plan.comp_order.iter() {
+                cols.push(*j);
+            }
+            let sorts =
+                crate::window::compound_sorts(ops.as_slice(), cols.as_slice(), plan.items.len());
+            let mut it = sorts.iter();
+            if let Some(c) = it.next() {
+                crate::window::compound_copies(
+                    plan.items.as_mut_slice(),
+                    &mut plan.order_by,
+                    c.as_slice(),
+                    plan.distinct,
+                );
+            }
+            for ((_, t), c) in plan.compound.as_mut_slice().iter_mut().zip(it) {
+                crate::window::compound_copies(
+                    t.items.as_mut_slice(),
+                    &mut t.order_by,
+                    c.as_slice(),
+                    t.distinct,
+                );
+            }
+        }
+        Ok((plan, core.keys))
     }
 
     /// The shared core planner (v0.16: the common body of
@@ -3463,6 +3948,13 @@ impl<S: Storage> Connection<S> {
             &mut sources,
         )?;
         let mut cur = ScopeGroup::new(descs, offsets, base_src);
+        // v0.16 (`window`): the core's WINDOW clause, and window
+        // calls allowed in its result list.
+        #[cfg(feature = "window")]
+        {
+            cur.win.defs = stmt.windows.clone();
+            cur.win.ok.set(true);
+        }
         let using = plan_using::<S::Error>(stmt.from.as_slice(), arena, &mut cur)?;
         let mut planner = self.sub_planner(arena);
         // Items, with star expansion (USING-aware, v0.16);
@@ -3511,6 +4003,16 @@ impl<S: Storage> Connection<S> {
                 item_aliases.push(None);
                 result_names.push(nm.clone());
             }
+        }
+        #[cfg(feature = "window")]
+        cur.win.ok.set(false);
+        // The pin's "too many columns in result set" once `*` is
+        // expanded (v0.16 fix, ungated; the parser counts the
+        // written items).
+        if items.len() > crate::sql::parser::MAX_COLUMN {
+            return Err(Error::Schema {
+                kind: SchemaKind::TooManyColumns,
+            });
         }
         // The pin's "HAVING clause on a non-aggregate query":
         // HAVING needs a GROUP BY or an aggregate in the result
@@ -3576,6 +4078,15 @@ impl<S: Storage> Connection<S> {
                 enclosing,
                 &mut planner,
             )?;
+            // A window call there (through an ordinal or alias):
+            // the pin's "misuse of window function" (v0.16,
+            // `window`).
+            #[cfg(feature = "window")]
+            if crate::window::has_win(&r) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::MisusedWindow,
+                });
+            }
             // The pin: "aggregate functions are not allowed in
             // the GROUP BY clause" (directly, or through an
             // ordinal / alias naming an aggregate item).
@@ -3599,11 +4110,24 @@ impl<S: Storage> Connection<S> {
                 &mut planner,
             )?),
         };
+        #[cfg(feature = "window")]
+        if having.as_ref().is_some_and(crate::window::has_win) {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedWindow,
+            });
+        }
         // A compound head's ORDER BY resolves against the
         // combined result (comp_order), not this core's rows,
         // so the term loop is skipped for it.
         let mut order_by: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+        // Which result column each ORDER BY term names, if any
+        // (v0.16 review fix, `window`; see `window::order_copies`).
+        #[cfg(feature = "window")]
+        let mut order_refs: AVec<Option<usize>> = AVec::new();
         if stmt.compound.is_empty() {
+            // Window calls are allowed in ORDER BY terms too.
+            #[cfg(feature = "window")]
+            cur.win.ok.set(true);
             for (e, dir) in stmt.order_by.iter() {
                 let r = self.resolve_term(
                     e,
@@ -3615,11 +4139,32 @@ impl<S: Storage> Connection<S> {
                     enclosing,
                     &mut planner,
                 )?;
+                #[cfg(feature = "window")]
+                order_refs.push(order_ref(
+                    e,
+                    &r,
+                    arena,
+                    items.as_slice(),
+                    item_aliases.as_slice(),
+                ));
                 // v0.16: the term sorts by its collation.
                 let mut dir = *dir;
                 dir.coll = crate::query::expr_coll(&r).unwrap_or_default();
                 order_by.push((r, dir));
             }
+            #[cfg(feature = "window")]
+            cur.win.ok.set(false);
+        }
+        // The window classes (v0.16, `window`).
+        #[cfg(feature = "window")]
+        {
+            crate::window::order_copies(
+                items.as_mut_slice(),
+                order_by.as_mut_slice(),
+                order_refs.as_slice(),
+                stmt.distinct,
+            );
+            crate::window::classify(items.as_mut_slice(), order_by.as_mut_slice());
         }
         // A subquery inside an aggregate's arguments needs
         // per-group-row execution (v0.11, the `v10` feature);
@@ -3683,6 +4228,152 @@ impl<S: Storage> Connection<S> {
         })
     }
 
+    /// A FROM source that names no table or view: a table-valued
+    /// pragma function or the empty temp schema, as the derived
+    /// table of its rows (v0.16, `v16`). Out of line: `plan_from` is
+    /// on the stack once per level of nested FROM subqueries.
+    #[cfg(feature = "v16")]
+    #[inline(never)]
+    fn synth_source(
+        &self,
+        s: &crate::sql::FromSource,
+        arena: &Arena,
+    ) -> Result<Option<Box<crate::sql::SelectStmt>>, S::Error> {
+        let n = handle_bytes(arena, s.table);
+        let ca = &self.catalog_arena;
+        let exists =
+            self.catalog.find_readable(ca, n).is_some() || self.catalog.find_view(ca, n).is_some();
+        if exists && s.args.is_some() {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownFunction,
+            });
+        }
+        if exists {
+            return Ok(None);
+        }
+        match self.pragma_source(arena, n, s.args.as_ref())? {
+            Some(sel) => Ok(Some(Box::new(sel))),
+            None if s.args.is_some() => Err(Error::Schema {
+                kind: SchemaKind::UnknownFunction,
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// One derived table of a FROM clause (v0.9; a view's or CTE's
+    /// expansion under `v16`): planned as a subquery against
+    /// `derived_scope` only (no LATERAL), its description and plan
+    /// pushed; returns its width. Out of line: `plan_from` is on
+    /// the stack once per level of nested FROM subqueries.
+    #[cfg(feature = "v09")]
+    #[inline(never)]
+    fn plan_derived_source(
+        &self,
+        s: &crate::sql::FromSource,
+        d: &crate::sql::SelectStmt,
+        arena: &Arena,
+        derived_scope: &[crate::query::ScopeGroup],
+        descs: &mut AVec<crate::query::SourceDesc>,
+        plans: &mut AVec<SourcePlan>,
+    ) -> Result<usize, S::Error> {
+        use crate::query::SourceDesc;
+        // v0.16: an expanded view or CTE, possibly recursive.
+        #[cfg(feature = "v16")]
+        let mut dplan = match s.cte.as_ref().map(|c| c.rec) {
+            Some(crate::sql::RecMark::Body { split, id }) => {
+                self.plan_recursive(d, split, id, s.cte.as_deref(), arena, derived_scope)?
+            }
+            _ => self.plan_subquery(d, arena, derived_scope)?,
+        };
+        #[cfg(not(feature = "v16"))]
+        let dplan = self.plan_subquery(d, arena, derived_scope)?;
+        let w = dplan.width();
+        let mut cols = AVec::new();
+        let mut affs = AVec::new();
+        let mut defaults = AVec::new();
+        // The pin names a derived table's duplicate
+        // columns `id`, `id:1`, ... — so only the first
+        // is `id` to `s.id`, NATURAL and USING (review
+        // regression: every duplicate stayed `id`, and
+        // `SELECT *` over a USING join dropped them all).
+        // A shared materialization (`CteUse::mat`) is read
+        // only by a plan that needs nothing of its reader.
+        #[cfg(feature = "v16")]
+        {
+            dplan.mat = match s.cte.as_ref() {
+                Some(c) if dplan.uncorrelated => c.mat,
+                _ => 0,
+            };
+        }
+        #[cfg(feature = "v16")]
+        if s.cte.as_ref().is_some_and(|c| c.view) {
+            dplan.result_names =
+                self.result_col_names(&dplan, crate::query::ScopeGroup::stack_end(derived_scope))?;
+        }
+        #[cfg(feature = "v16")]
+        let mut names = Self::cte_names(arena, s.cte.as_deref(), &dplan)?;
+        // A column list renames the result for every reader
+        // (CREATE TABLE ... AS names its columns by it).
+        #[cfg(feature = "v16")]
+        {
+            dplan.result_names = names.clone();
+        }
+        #[cfg(not(feature = "v16"))]
+        let mut names = dplan.result_names.clone();
+        crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
+        for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
+            // A compound's column affinity is demoted across
+            // its cores, as on the pin (ungated fix: `(SELECT
+            // text_col ... UNION ALL SELECT 5)` compared as
+            // TEXT).
+            let aff = derived_col_affinity(&dplan, i, *aff);
+            cols.push((nm.clone(), aff));
+            affs.push(crate::record::Affinity::Blob);
+            defaults.push(OwnedValue::Null);
+        }
+        let qual = match s.alias {
+            Some(a) => copy_vec(handle_bytes(arena, a)),
+            // A table-valued function is named by its
+            // name (v0.16).
+            None if s.derived.is_none() => copy_vec(handle_bytes(arena, s.table)),
+            None => AVec::new(),
+        };
+        let mut desc = SourceDesc::new(qual, cols, None, false);
+        desc.kind = s.kind;
+        // v0.16: a derived column compares by its
+        // leftmost core's item collation (BINARY when
+        // the item has none — still a column's).
+        for it in dplan.items.iter() {
+            desc.colls
+                .push(crate::query::expr_coll(it).unwrap_or_default());
+        }
+        for v in dplan
+            .values
+            .as_slice()
+            .first()
+            .iter()
+            .flat_map(|r| r.iter())
+        {
+            desc.colls
+                .push(crate::query::expr_coll(v).unwrap_or_default());
+        }
+        descs.push(desc);
+        plans.push(SourcePlan {
+            root: 0,
+            kind: s.kind,
+            on: None,
+            rowid_alias: None,
+            ncols: w,
+            affs,
+            defaults,
+            derived: Some(Box::new(dplan)),
+            gcols: None,
+            #[cfg(feature = "v16")]
+            rec: 0,
+        });
+        Ok(w)
+    }
+
     /// Plan a FROM clause's sources (v0.4; one helper for
     /// SELECT cores, subqueries and UPDATE ... FROM since
     /// v0.16): each table or derived table gets its resolution
@@ -3721,28 +4412,7 @@ impl<S: Storage> Connection<S> {
             // fix: the arguments were ignored).
             #[cfg(feature = "v16")]
             let synth = if s.derived.is_none() {
-                let n = handle_bytes(arena, s.table);
-                let ca = &self.catalog_arena;
-                let exists = self.catalog.find_readable(ca, n).is_some()
-                    || self.catalog.find_view(ca, n).is_some();
-                if exists && s.args.is_some() {
-                    return Err(Error::Schema {
-                        kind: SchemaKind::UnknownFunction,
-                    });
-                }
-                if exists {
-                    None
-                } else {
-                    match self.pragma_source(arena, n, s.args.as_ref())? {
-                        Some(sel) => Some(Box::new(sel)),
-                        None if s.args.is_some() => {
-                            return Err(Error::Schema {
-                                kind: SchemaKind::UnknownFunction,
-                            });
-                        }
-                        None => None,
-                    }
-                }
+                self.synth_source(s, arena)?
             } else {
                 None
             };
@@ -3754,103 +4424,7 @@ impl<S: Storage> Connection<S> {
             // against `derived_scope` only (no LATERAL).
             #[cfg(feature = "v09")]
             if let Some(d) = derived {
-                // v0.16: an expanded view or CTE, possibly recursive.
-                #[cfg(feature = "v16")]
-                let mut dplan = match s.cte.as_ref().map(|c| c.rec) {
-                    Some(crate::sql::RecMark::Body { split, id }) => {
-                        self.plan_recursive(d, split, id, s.cte.as_deref(), arena, derived_scope)?
-                    }
-                    _ => self.plan_subquery(d, arena, derived_scope)?,
-                };
-                #[cfg(not(feature = "v16"))]
-                let dplan = self.plan_subquery(d, arena, derived_scope)?;
-                let w = dplan.width();
-                let mut cols = AVec::new();
-                let mut affs = AVec::new();
-                let mut defaults = AVec::new();
-                // The pin names a derived table's duplicate
-                // columns `id`, `id:1`, ... — so only the first
-                // is `id` to `s.id`, NATURAL and USING (review
-                // regression: every duplicate stayed `id`, and
-                // `SELECT *` over a USING join dropped them all).
-                // A shared materialization (`CteUse::mat`) is read
-                // only by a plan that needs nothing of its reader.
-                #[cfg(feature = "v16")]
-                {
-                    dplan.mat = match s.cte.as_ref() {
-                        Some(c) if dplan.uncorrelated => c.mat,
-                        _ => 0,
-                    };
-                }
-                #[cfg(feature = "v16")]
-                if s.cte.as_ref().is_some_and(|c| c.view) {
-                    dplan.result_names = self.result_col_names(
-                        &dplan,
-                        crate::query::ScopeGroup::stack_end(derived_scope),
-                    )?;
-                }
-                #[cfg(feature = "v16")]
-                let mut names = Self::cte_names(arena, s.cte.as_deref(), &dplan)?;
-                // A column list renames the result for every reader
-                // (CREATE TABLE ... AS names its columns by it).
-                #[cfg(feature = "v16")]
-                {
-                    dplan.result_names = names.clone();
-                }
-                #[cfg(not(feature = "v16"))]
-                let mut names = dplan.result_names.clone();
-                crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
-                for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
-                    // A compound's column affinity is demoted across
-                    // its cores, as on the pin (ungated fix: `(SELECT
-                    // text_col ... UNION ALL SELECT 5)` compared as
-                    // TEXT).
-                    let aff = derived_col_affinity(&dplan, i, *aff);
-                    cols.push((nm.clone(), aff));
-                    affs.push(crate::record::Affinity::Blob);
-                    defaults.push(OwnedValue::Null);
-                }
-                let qual = match s.alias {
-                    Some(a) => copy_vec(handle_bytes(arena, a)),
-                    // A table-valued function is named by its
-                    // name (v0.16).
-                    None if s.derived.is_none() => copy_vec(handle_bytes(arena, s.table)),
-                    None => AVec::new(),
-                };
-                let mut desc = SourceDesc::new(qual, cols, None, false);
-                desc.kind = s.kind;
-                // v0.16: a derived column compares by its
-                // leftmost core's item collation (BINARY when
-                // the item has none — still a column's).
-                for it in dplan.items.iter() {
-                    desc.colls
-                        .push(crate::query::expr_coll(it).unwrap_or_default());
-                }
-                for v in dplan
-                    .values
-                    .as_slice()
-                    .first()
-                    .iter()
-                    .flat_map(|r| r.iter())
-                {
-                    desc.colls
-                        .push(crate::query::expr_coll(v).unwrap_or_default());
-                }
-                descs.push(desc);
-                plans.push(SourcePlan {
-                    root: 0,
-                    kind: s.kind,
-                    on: None,
-                    rowid_alias: None,
-                    ncols: w,
-                    affs,
-                    defaults,
-                    derived: Some(Box::new(dplan)),
-                    gcols: None,
-                    #[cfg(feature = "v16")]
-                    rec: 0,
-                });
-                total += w;
+                total += self.plan_derived_source(s, d, arena, derived_scope, descs, plans)?;
                 continue;
             }
             let tname = handle_bytes(arena, s.table);
@@ -4397,6 +4971,11 @@ pub struct Statement<'c, S: Storage> {
     /// captures.
     #[cfg(feature = "v06")]
     hoist: AVec<((usize, usize), crate::query::SubValue)>,
+    /// The uncorrelated subqueries of a RETURNING list that do not
+    /// read the written table, cached for the statement (v0.16
+    /// review fix; see `eval_returning`).
+    #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+    ret_hoist: AVec<((usize, usize), crate::query::SubValue)>,
     /// v0.7 RETURNING results of a write statement, materialised
     /// by the write's execution on first step and then served
     /// one row per step, like a query's.
@@ -4436,6 +5015,24 @@ pub struct Statement<'c, S: Storage> {
     /// The running INSERT's AUTOINCREMENT state (v0.16, `v16`).
     #[cfg(feature = "v16")]
     autoinc: Option<Autoinc>,
+    /// The triggers this write may fire (v0.16, `triggers`), loaded
+    /// when its execution starts; `None` when it fires none.
+    #[cfg(feature = "triggers")]
+    trig: Option<alloc::rc::Rc<trigger::Target>>,
+    /// The foreign keys this write checks and acts on (v0.16,
+    /// `foreign_keys`), loaded when its execution starts; `None`
+    /// when `PRAGMA foreign_keys` is off or the table takes part in
+    /// none.
+    #[cfg(feature = "foreign_keys")]
+    fk: Option<alloc::rc::Rc<fkey::FkTarget>>,
+    /// An UPDATE OR REPLACE's keys for the rows its conflicts delete
+    /// (all of the table's, as a DELETE's).
+    #[cfg(feature = "foreign_keys")]
+    fk_del: Option<alloc::rc::Rc<fkey::FkTarget>>,
+    /// The keys whose new rows this write does not look up (the
+    /// pin's `isSetNullAction`; see `fkey::Sim`), loaded with `fk`.
+    #[cfg(feature = "foreign_keys")]
+    fk_skip: fkey::Skip,
 }
 
 /// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
@@ -4473,6 +5070,51 @@ fn reserved_name<E>(name: &[u8]) -> Result<(), E> {
 /// integer 5 on the pin, where hipp used to return the text.
 fn read_default(arena: &Arena, c: &crate::schema::Column) -> OwnedValue {
     apply_affinity(literal_owned(arena, c.default), c.affinity)
+}
+
+/// Whether a column definition's text declares a REFERENCES
+/// clause (v0.16).
+#[cfg(feature = "v16")]
+fn def_references<E>(text: &[u8], arena: &Arena) -> bool {
+    use crate::sql::lexer::Tok;
+    let Ok(toks) = crate::sql::lexer::lex::<E>(text, arena) else {
+        return false;
+    };
+    toks.iter().any(
+        |t| matches!(t.tok, Tok::Ident(h, false) if eq_ci(handle_bytes(arena, h), b"REFERENCES")),
+    )
+}
+
+#[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+impl<S: Storage> Connection<S> {
+    /// Whether a trigger or foreign-key action program (or DROP
+    /// TABLE's inline DELETE) is running: its statements commit,
+    /// roll back and check nothing themselves.
+    pub(super) fn in_program(&self) -> bool {
+        #[cfg(feature = "triggers")]
+        if self.in_trigger() {
+            return true;
+        }
+        #[cfg(all(feature = "foreign_keys", not(feature = "triggers")))]
+        if self.fk.depth > 0 {
+            return true;
+        }
+        #[cfg(feature = "foreign_keys")]
+        if self.fk.nest > 0 {
+            return true;
+        }
+        false
+    }
+}
+
+/// An INSERT plan's column affinities (v0.16, `foreign_keys`).
+#[cfg(feature = "foreign_keys")]
+fn ins_affs(cols: &[InsCol]) -> AVec<crate::record::Affinity> {
+    let mut out = AVec::new();
+    for c in cols {
+        out.push(c.affinity);
+    }
+    out
 }
 
 /// Whether `e` calls `last_insert_rowid()` (v0.16), whose value
@@ -4935,6 +5577,145 @@ fn integral_f64(f: f64) -> Option<i64> {
     None
 }
 
+/// One row's deletion with its index entries (v0.7; see
+/// `Statement::delete_row_completely`), written once for its two
+/// names.
+macro_rules! row_delete_fn {
+    (#[$m:meta] $name:ident) => {
+        /// Delete one row and every index entry it owns (v0.7): the
+        /// shared tail of OR REPLACE and upsert conflict handling. A
+        /// rowid that is already gone is a no-op.
+        #[$m]
+        async fn $name(
+            &mut self,
+            root: u32,
+            rowid_alias: Option<usize>,
+            ncols: usize,
+            defaults: &[OwnedValue],
+            rowid: i64,
+        ) -> Result<(), S::Error> {
+            #[cfg(feature = "indexes")]
+            {
+                let indexes: AVec<IndexPlan> = match &self.plan {
+                    Plan::Insert { indexes, .. } => indexes.clone(),
+                    Plan::Update { indexes, .. } => indexes.clone(),
+                    Plan::Delete { indexes, .. } => indexes.clone(),
+                    _ => AVec::new(),
+                };
+                let Some(payload) = btree::seek_rowid(&mut self.conn.pager, root, rowid).await?
+                else {
+                    return Ok(());
+                };
+                let gcols = self.plan_rules().and_then(|r| r.gcols);
+                for ix in indexes.iter() {
+                    let key = index_key_for_row(
+                        ix.cols.as_slice(),
+                        rowid_alias,
+                        defaults,
+                        payload.as_slice(),
+                        ncols,
+                        rowid,
+                        gcols.as_ref(),
+                    )?;
+                    let enc = encode_index_payload(key.as_slice(), rowid);
+                    btree::index_delete(
+                        &mut self.conn.pager,
+                        ix.root,
+                        enc.as_slice(),
+                        ix.desc.as_slice(),
+                    )
+                    .await?;
+                }
+            }
+            #[cfg(not(feature = "indexes"))]
+            {
+                let _ = (rowid_alias, ncols, defaults);
+            }
+            btree::btree_delete(&mut self.conn.pager, root, rowid).await?;
+            Ok(())
+        }
+    };
+}
+
+impl<'c, S: Storage> Statement<'c, S> {
+    /// A statement over its parts (v0.16, `triggers`: the statements
+    /// of a trigger program, `session::trigger`; the same fields as
+    /// `Connection::prepare` sets, which builds its statement in
+    /// place — a call here costs the tiny profile the struct's move).
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+    fn assemble(
+        conn: &'c mut Connection<S>,
+        arena: Arena,
+        sql_text: crate::arena::ABytes,
+        ast: Ast,
+        plan: Plan,
+        #[cfg(feature = "params")] binds: Binds,
+    ) -> Statement<'c, S> {
+        let row_ckpt = arena.checkpoint();
+        Statement {
+            #[cfg(feature = "params")]
+            binds,
+            conn,
+            arena,
+            sql_text,
+            ast,
+            plan,
+            phase: Phase::Fresh,
+            cursor: None,
+            row_buf: AVec::new(),
+            current: AVec::new(),
+            current_rowid: None,
+            row_ckpt,
+            #[cfg(feature = "indexes")]
+            index_rowids: AVec::new(),
+            #[cfg(feature = "indexes")]
+            index_pos: 0,
+            #[cfg(feature = "indexes")]
+            index_loaded: false,
+            #[cfg(feature = "v04")]
+            query_rows: AVec::new(),
+            #[cfg(feature = "v04")]
+            query_rowids: AVec::new(),
+            #[cfg(feature = "v04")]
+            query_pos: 0,
+            #[cfg(feature = "v04")]
+            query_loaded: false,
+            #[cfg(feature = "v06")]
+            hoist: AVec::new(),
+            #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+            ret_hoist: AVec::new(),
+            #[cfg(feature = "v07")]
+            ret_rows: AVec::new(),
+            #[cfg(feature = "v07")]
+            ret_rowids: AVec::new(),
+            #[cfg(feature = "v07")]
+            ret_pos: 0,
+            #[cfg(feature = "v07")]
+            ret_loaded: false,
+            #[cfg(feature = "v16")]
+            deferred: None,
+            #[cfg(feature = "v16")]
+            rec_rows: AVec::new(),
+            #[cfg(feature = "v16")]
+            mats: AVec::new(),
+            #[cfg(feature = "v16")]
+            stmt_sp: None,
+            #[cfg(feature = "v16")]
+            upsert_failed: false,
+            #[cfg(feature = "v16")]
+            autoinc: None,
+            #[cfg(feature = "triggers")]
+            trig: None,
+            #[cfg(feature = "foreign_keys")]
+            fk: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_del: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_skip: [None; 2],
+        }
+    }
+}
+
 impl<'c, S: Storage> Statement<'c, S> {
     /// The write plan's table rules (v0.16), cloned out of the
     /// plan; `None` for a table with none (or a plan without).
@@ -4968,6 +5749,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v06")]
         if self.phase == Phase::Fresh {
             self.hoist.clear();
+            #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+            self.ret_hoist.clear();
             #[cfg(feature = "v16")]
             self.mats.clear();
         }
@@ -4980,7 +5763,19 @@ impl<'c, S: Storage> Statement<'c, S> {
                     matches!(
                         self.plan,
                         Plan::CreateTableAs { .. } | Plan::Maint(_) | Plan::Alter16 { .. }
-                    )
+                    ) || {
+                        #[cfg(feature = "triggers")]
+                        {
+                            matches!(
+                                self.plan,
+                                Plan::CreateTrigger { .. } | Plan::DropTrigger { .. }
+                            )
+                        }
+                        #[cfg(not(feature = "triggers"))]
+                        {
+                            false
+                        }
+                    }
                 }
                 #[cfg(not(feature = "v16"))]
                 {
@@ -5025,6 +5820,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
         #[cfg(feature = "v16")]
         self.open_stmt();
+        #[cfg(feature = "foreign_keys")]
+        self.fk_stmt_begin();
         let r = match &self.plan {
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
@@ -5067,10 +5864,18 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(s)
             }
             Plan::Commit => self.step_commit().await,
+            #[cfg(feature = "triggers")]
+            Plan::CreateTrigger { .. } => self.step_create_trigger().await,
+            #[cfg(feature = "triggers")]
+            Plan::DropTrigger { .. } => self.step_drop_trigger().await,
+            #[cfg(feature = "triggers")]
+            Plan::Instead(_) => self.step_instead().await,
             Plan::Rollback => self.step_rollback().await,
         };
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
+        #[cfg(feature = "foreign_keys")]
+        self.fk_stmt_end(r.is_err(), was_txn);
         // A failure that ended the transaction (OR ROLLBACK, an
         // I/O-class error) ends the TEMP database's too.
         #[cfg(feature = "v16")]
@@ -5280,6 +6085,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v06")]
         self.hoist.clear();
+        #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+        self.ret_hoist.clear();
         #[cfg(feature = "v16")]
         {
             self.deferred = None;
@@ -5321,6 +6128,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !self.conn.explicit_txn {
             return Err(Error::TransactionState { nested: false });
         }
+        // Outstanding deferred foreign-key violations fail COMMIT,
+        // the transaction staying open (v0.16, `foreign_keys`).
+        #[cfg(feature = "foreign_keys")]
+        self.conn.fk_commit_check()?;
         self.conn.pager.drive_commit().await?;
         // Every savepoint ends with the transaction (v0.16, `v16`).
         #[cfg(feature = "v16")]
@@ -5866,8 +6677,29 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Insert { returning, .. } => !returning.is_empty(),
             Plan::Update { returning, .. } => !returning.is_empty(),
             Plan::Delete { returning, .. } => !returning.is_empty(),
+            #[cfg(feature = "triggers")]
+            Plan::Instead(ip) => ip.has_returning(),
             _ => false,
         }
+    }
+
+    /// `serve_returning`, and after the last row an autocommit
+    /// write's deferred foreign-key violations (v0.16,
+    /// `foreign_keys`): the pin checks them when the statement
+    /// halts, after its RETURNING rows (its immediate ones before).
+    #[cfg(feature = "v07")]
+    async fn serve_returning_fk(&mut self) -> Result<Step, S::Error> {
+        let step = self.serve_returning();
+        #[cfg(feature = "foreign_keys")]
+        if step == Step::Done && core::mem::take(&mut self.conn.fk.late) {
+            self.conn.env.finish(false);
+            let _ = self.conn.pager.rollback().await;
+            self.conn.explicit_txn = false;
+            return Err(Error::Schema {
+                kind: SchemaKind::ForeignKeyViolation,
+            });
+        }
+        Ok(step)
     }
 
     /// Serve one buffered RETURNING row (v0.7), query-style.
@@ -5895,7 +6727,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// each row evaluates them afresh (`hoist` is set aside
     /// meanwhile). A shared CTE materialization is still computed
     /// once per statement, as on the pin (its `OP_Once` holds
-    /// across the rows).
+    /// across the rows). So is an uncorrelated subquery that does
+    /// not read the written table (v0.16 review fix, `triggers` /
+    /// `foreign_keys`: the pin computes it once, when a row first
+    /// reaches it, so the later writes of triggers or foreign-key
+    /// actions to its tables do not show — `ret_hoist`).
     #[cfg(feature = "v07")]
     async fn eval_returning(
         &mut self,
@@ -5903,6 +6739,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         rd: &RowData,
     ) -> Result<AVec<OwnedValue>, S::Error> {
         let hoist = core::mem::take(&mut self.hoist);
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        {
+            self.hoist = core::mem::take(&mut self.ret_hoist);
+        }
         let mut out = AVec::new();
         let mut r = Ok(());
         for e in exprs {
@@ -5914,6 +6754,31 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
         }
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        {
+            let root = match &self.plan {
+                Plan::Insert { root, .. }
+                | Plan::Update { root, .. }
+                | Plan::Delete { root, .. } => Some(*root),
+                _ => None,
+            };
+            let mut per_row = AVec::new();
+            if let Some(root) = root {
+                for e in exprs {
+                    crate::query::subs_reading(e, root, &mut per_row);
+                }
+            }
+            // (A view written through INSTEAD OF triggers has no
+            // root: its RETURNING subqueries are all cached.)
+            let cached = core::mem::take(&mut self.hoist);
+            let mut kept = AVec::new();
+            for (k, v) in cached.iter() {
+                if !per_row.iter().any(|p| *p == k.0) {
+                    kept.push((*k, v.clone()));
+                }
+            }
+            self.ret_hoist = kept;
+        }
         self.hoist = hoist;
         r.map(|()| out)
     }
@@ -5921,7 +6786,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Delete one row and every index entry it owns (v0.7):
     /// the shared tail of OR REPLACE and upsert conflict
     /// handling. A rowid that is already gone is a no-op.
-    #[cfg(feature = "v07")]
+    #[cfg(all(feature = "v07", feature = "foreign_keys"))]
     async fn delete_row_completely(
         &mut self,
         root: u32,
@@ -5930,45 +6795,59 @@ impl<'c, S: Storage> Statement<'c, S> {
         defaults: &[OwnedValue],
         rowid: i64,
     ) -> Result<(), S::Error> {
-        #[cfg(feature = "indexes")]
-        {
-            let indexes: AVec<IndexPlan> = match &self.plan {
-                Plan::Insert { indexes, .. } => indexes.clone(),
-                Plan::Update { indexes, .. } => indexes.clone(),
-                Plan::Delete { indexes, .. } => indexes.clone(),
-                _ => AVec::new(),
-            };
-            let Some(payload) = btree::seek_rowid(&mut self.conn.pager, root, rowid).await? else {
+        // v0.16 (`foreign_keys`): a REPLACE victim's keys, as a
+        // DELETE's (the pin deletes it through `GenerateRowDelete`).
+        let fk_main = match self.fk_del.clone() {
+            Some(d) => self.fk.replace(d),
+            None => self.fk.clone(),
+        };
+        let r = self
+            .delete_victim(root, rowid_alias, ncols, defaults, rowid)
+            .await;
+        self.fk = fk_main;
+        r
+    }
+
+    /// `delete_row_completely` with the victim's foreign keys
+    /// (v0.16, `foreign_keys`).
+    #[cfg(feature = "foreign_keys")]
+    async fn delete_victim(
+        &mut self,
+        root: u32,
+        rowid_alias: Option<usize>,
+        ncols: usize,
+        defaults: &[OwnedValue],
+        rowid: i64,
+    ) -> Result<(), S::Error> {
+        let fk_old = if self.fk_active() {
+            let Some(r) = self.reload_write_row(root, ncols, defaults, rowid).await? else {
                 return Ok(());
             };
-            let gcols = self.plan_rules().and_then(|r| r.gcols);
-            for ix in indexes.iter() {
-                let key = index_key_for_row(
-                    ix.cols.as_slice(),
-                    rowid_alias,
-                    defaults,
-                    payload.as_slice(),
-                    ncols,
-                    rowid,
-                    gcols.as_ref(),
-                )?;
-                let enc = encode_index_payload(key.as_slice(), rowid);
-                btree::index_delete(
-                    &mut self.conn.pager,
-                    ix.root,
-                    enc.as_slice(),
-                    ix.desc.as_slice(),
-                )
-                .await?;
-            }
+            let affs = self.plan_affs();
+            let lrow = self.fk_row(r.rec.as_slice(), rowid, affs.as_slice());
+            self.fk_old_row(lrow.as_slice(), rowid, None).await?;
+            Some(lrow)
+        } else {
+            None
+        };
+        self.delete_row_raw(root, rowid_alias, ncols, defaults, rowid)
+            .await?;
+        if let Some(lrow) = &fk_old {
+            self.fk_actions(lrow.as_slice(), None, None).await?;
         }
-        #[cfg(not(feature = "indexes"))]
-        {
-            let _ = (rowid_alias, ncols, defaults);
-        }
-        btree::btree_delete(&mut self.conn.pager, root, rowid).await?;
         Ok(())
     }
+
+    // The row deletion itself: `delete_row_completely` without
+    // `foreign_keys` (as it always was), its `delete_row_raw` with.
+    row_delete_fn!(
+        #[cfg(all(feature = "v07", feature = "foreign_keys"))]
+        delete_row_raw
+    );
+    row_delete_fn!(
+        #[cfg(all(feature = "v07", not(feature = "foreign_keys")))]
+        delete_row_completely
+    );
 
     async fn step_insert(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
@@ -5986,7 +6865,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v07")]
         if self.has_returning() {
-            return Ok(self.serve_returning());
+            return self.serve_returning_fk().await;
         }
         let r = self.exec_insert().await;
         match r {
@@ -6020,7 +6899,14 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// `changes()` counts the kept rows.
     /// (OR FAIL parses only with UPDATE (v0.5) / INSERT OR (v0.7).)
     #[cfg(feature = "v05")]
-    async fn write_failed(&mut self, e: Error<S::Error>) -> Error<S::Error> {
+    async fn write_failed(
+        &mut self,
+        #[allow(unused_mut)] mut e: Error<S::Error>,
+    ) -> Error<S::Error> {
+        #[cfg(feature = "triggers")]
+        if self.trigger_failed(&mut e).await {
+            return e;
+        }
         let conflict = match &self.plan {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
             _ => ConflictAction::Abort,
@@ -6056,6 +6942,22 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             );
         if keep {
+            // v0.16 (`foreign_keys`): an action program's failure
+            // aborts the statement whatever its clause says; and the
+            // pin's OR FAIL halt still checks the statement's
+            // foreign-key violations (in autocommit the
+            // transaction's too), undoing it when there are any.
+            #[cfg(feature = "foreign_keys")]
+            {
+                if self.conn.fk.abort {
+                    return Ok(false);
+                }
+                if let Err(fe) = self.fk_end() {
+                    self.conn.env.finish(false);
+                    abort_write!(self, &fe);
+                    return Err(fe);
+                }
+            }
             let committed = if self.conn.explicit_txn {
                 Ok(())
             } else {
@@ -6063,8 +6965,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             return match committed {
                 Ok(()) => {
+                    // A failed statement of a trigger program counts
+                    // nothing (the pin's count is taken when a
+                    // program's statement completes).
+                    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+                    let kept = !self.conn.in_program();
+                    #[cfg(not(any(feature = "triggers", feature = "foreign_keys")))]
+                    let kept = true;
                     #[cfg(feature = "v16")]
-                    self.conn.env.finish(true);
+                    self.conn.env.finish(kept);
+                    let _ = kept;
                     #[cfg(feature = "v16")]
                     self.keep_stmt();
                     Ok(true)
@@ -6083,19 +6993,41 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
         #[cfg(feature = "v16")]
         self.conn.env.pending.set(0);
+        #[cfg(feature = "triggers")]
+        self.load_triggers()?;
+        #[cfg(feature = "foreign_keys")]
+        {
+            let multi = self.insert_multi();
+            self.fk_load(fkey::Event::Insert, multi)?;
+        }
         #[cfg(feature = "v16")]
         self.autoinc_begin().await?;
         // v0.16: VALUES rows that read last_insert_rowid() evaluate
         // one at a time, each just before its own insert — on the
         // pin each row sees the rowid the row before it inserted.
+        // (v0.16 review fix, `triggers`: not when the target has
+        // INSERT triggers — the pin then computes every VALUES row
+        // into a temporary table first, so a RAISE(FAIL) in a later
+        // row of a trigger program's INSERT keeps none.)
+        #[cfg(feature = "triggers")]
+        let staged = self.fires(
+            crate::sql::ast::TrigTime::Before,
+            crate::sql::ast::TrigEvent::Insert,
+        ) || self.fires(
+            crate::sql::ast::TrigTime::After,
+            crate::sql::ast::TrigEvent::Insert,
+        );
+        #[cfg(all(feature = "v16", not(feature = "triggers")))]
+        let staged = false;
         #[cfg(feature = "v16")]
         let lazy = match &self.plan {
             Plan::Insert {
                 rows_r: Some(rows_r),
                 select: None,
                 ..
-            } if rows_r.iter().any(|r| r.iter().any(reads_last_rowid))
-                || !rows_r.iter().any(|r| r.iter().any(crate::query::has_sub)) =>
+            } if !staged
+                && (rows_r.iter().any(|r| r.iter().any(reads_last_rowid))
+                    || !rows_r.iter().any(|r| r.iter().any(crate::query::has_sub))) =>
             {
                 Some(rows_r.clone())
             }
@@ -6112,6 +7044,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.exec_insert_row(rv).await?;
             }
             self.autoinc_end().await?;
+            #[cfg(feature = "foreign_keys")]
+            self.fk_end_commit().await?;
+            #[cfg(not(feature = "foreign_keys"))]
             if !self.conn.explicit_txn {
                 self.conn.pager.drive_commit().await?;
             }
@@ -6123,12 +7058,31 @@ impl<'c, S: Storage> Statement<'c, S> {
         // its own target terminates on the pre-statement rows,
         // and subqueries in VALUES observe the pre-statement
         // table for every row — both oracle-probed.
+        #[cfg(feature = "triggers")]
+        let (rows, failed) = match self.insert_source_rows().await {
+            Ok(r) => (r, None),
+            Err(e) => match self.insert_prefix().await? {
+                Some((p, true)) => (p, Some(e)),
+                Some((p, false)) => (p, None),
+                None => return Err(e),
+            },
+        };
+        #[cfg(not(feature = "triggers"))]
         let rows = self.insert_source_rows().await?;
         for values in rows.iter() {
             self.exec_insert_row(values.clone()).await?;
         }
         #[cfg(feature = "v16")]
         self.autoinc_end().await?;
+        // The rows a trigger program's INSERT ... SELECT streamed
+        // before its SELECT failed stay (`insert_prefix`).
+        #[cfg(feature = "triggers")]
+        if let Some(e) = failed {
+            return Err(self.failed_part_way(e));
+        }
+        #[cfg(feature = "foreign_keys")]
+        self.fk_end_commit().await?;
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
@@ -6258,7 +7212,6 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     async fn exec_insert_row(&mut self, values: AVec<OwnedValue>) -> Result<(), S::Error> {
         let Plan::Insert {
-            root,
             rowid_alias,
             cols,
             targets,
@@ -6328,6 +7281,41 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Some(i) => row.as_mut_slice()[i] = apply_affinity(v, cols.as_slice()[i].affinity),
             }
         }
+        // BEFORE INSERT triggers see the row with its generated
+        // columns, and rowid -1 while it is still to be chosen; the
+        // rowid is chosen (and the constraints checked) after them.
+        #[cfg(feature = "triggers")]
+        if self.fires(
+            crate::sql::ast::TrigTime::Before,
+            crate::sql::ast::TrigEvent::Insert,
+        ) {
+            let mut nrow = row.clone();
+            let nrowid = explicit_rowid.unwrap_or(-1);
+            if let Some(g) = self.plan_rules().and_then(|r| r.gcols) {
+                g.fill::<S::Error>(nrow.as_mut_slice(), nrowid, false)?;
+            }
+            if !self
+                .fire(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Insert,
+                    None,
+                    None,
+                    Some((nrow.as_slice(), nrowid)),
+                )
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        let Plan::Insert {
+            root,
+            rowid_alias,
+            cols,
+            ..
+        } = &self.plan
+        else {
+            unreachable!()
+        };
         let rowid = {
             let pager = &mut self.conn.pager;
             match explicit_rowid {
@@ -6455,6 +7443,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             }),
             _ => None,
         };
+        #[cfg(feature = "foreign_keys")]
+        let fk_affs = ins_affs(cols.as_slice());
         let pager = &mut self.conn.pager;
         let mut vals: AVec<Value<'_>> = AVec::new();
         for (i, v) in row.iter().enumerate() {
@@ -6506,6 +7496,34 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let mut rec = AVec::new();
         encode_record(vals.as_slice(), &mut rec);
+        // v0.16 (`foreign_keys`): the row's keys, after its other
+        // constraints and before it is stored (the pin's order).
+        #[cfg(feature = "foreign_keys")]
+        let (pager, root) = {
+            let root = *root;
+            drop(vals);
+            if self.fk_active() {
+                // The pin finds a rowid conflict among the row's
+                // constraints, before its keys: a single-row INSERT
+                // halts on a violated key at once, so the conflict
+                // must win (v0.16 review fix — OR ROLLBACK then ends
+                // the transaction).
+                if btree::seek_rowid(&mut self.conn.pager, root, rowid)
+                    .await?
+                    .is_some()
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::DuplicateRowid,
+                    });
+                }
+                let lrow = self.fk_row(row.as_slice(), rowid, fk_affs.as_slice());
+                self.fk_new_row(lrow.as_slice(), rowid, None, None).await?;
+            }
+            (&mut self.conn.pager, root)
+        };
+        #[cfg(feature = "foreign_keys")]
+        btree::btree_insert(pager, root, rowid, rec.as_slice()).await?;
+        #[cfg(not(feature = "foreign_keys"))]
         btree::btree_insert(pager, *root, rowid, rec.as_slice()).await?;
         // v0.3 index work, part 2: maintain every index.
         #[cfg(feature = "indexes")]
@@ -6517,6 +7535,33 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.conn.env.note_insert(rowid);
         #[cfg(feature = "v07")]
         self.push_insert_returning(row.as_slice(), rowid).await?;
+        #[cfg(feature = "triggers")]
+        self.after_insert(row.as_slice(), rowid).await?;
+        Ok(())
+    }
+
+    /// AFTER INSERT triggers of one inserted row (v0.16,
+    /// `triggers`): they see the row as stored, generated columns
+    /// computed.
+    #[cfg(feature = "triggers")]
+    async fn after_insert(&mut self, row: &[OwnedValue], rowid: i64) -> Result<(), S::Error> {
+        use crate::sql::ast::{TrigEvent, TrigTime};
+        if !self.fires(TrigTime::After, TrigEvent::Insert) {
+            return Ok(());
+        }
+        let mut nrow = AVec::new();
+        nrow.extend_from_slice(row);
+        if let Some(g) = self.plan_rules().and_then(|r| r.gcols) {
+            g.fill::<S::Error>(nrow.as_mut_slice(), rowid, true)?;
+        }
+        self.fire(
+            TrigTime::After,
+            TrigEvent::Insert,
+            None,
+            None,
+            Some((nrow.as_slice(), rowid)),
+        )
+        .await?;
         Ok(())
     }
 
@@ -6742,8 +7787,15 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
         }
         if conflicts.is_empty() {
+            #[cfg(feature = "foreign_keys")]
+            if self.fk_active() {
+                let lrow = self.fk_row(row.as_slice(), rowid, affs.as_slice());
+                self.fk_new_row(lrow.as_slice(), rowid, None, None).await?;
+            }
             self.insert_row_raw(row.as_slice(), rowid).await?;
             self.push_insert_returning(row.as_slice(), rowid).await?;
+            #[cfg(feature = "triggers")]
+            self.after_insert(row.as_slice(), rowid).await?;
             return Ok(());
         }
         // Upsert arbitration: the first conflict the clause
@@ -6789,12 +7841,43 @@ impl<'c, S: Storage> Statement<'c, S> {
                         victims.push(c.0);
                     }
                 }
+                #[cfg(feature = "triggers")]
+                let mut triggered = false;
                 for v in victims.iter() {
+                    #[cfg(feature = "triggers")]
+                    {
+                        let kind = if conflicts.iter().any(|c| c.0 == *v && c.1) {
+                            SchemaKind::DuplicateRowid
+                        } else {
+                            SchemaKind::UniqueViolation
+                        };
+                        if self.replace_victim(*v, kind).await? {
+                            triggered = true;
+                            continue;
+                        }
+                    }
                     self.delete_row_completely(root, rowid_alias, ncols, defaults.as_slice(), *v)
                         .await?;
                 }
+                // DELETE triggers may have written the table: the pin
+                // checks the row again, under ABORT.
+                #[cfg(feature = "triggers")]
+                if triggered
+                    && let Some(kind) = self
+                        .insert_conflict(root, row.as_slice(), rowid, None)
+                        .await?
+                {
+                    return Err(Error::Schema { kind });
+                }
+                #[cfg(feature = "foreign_keys")]
+                if self.fk_active() {
+                    let lrow = self.fk_row(row.as_slice(), rowid, affs.as_slice());
+                    self.fk_new_row(lrow.as_slice(), rowid, None, None).await?;
+                }
                 self.insert_row_raw(row.as_slice(), rowid).await?;
                 self.push_insert_returning(row.as_slice(), rowid).await?;
+                #[cfg(feature = "triggers")]
+                self.after_insert(row.as_slice(), rowid).await?;
                 Ok(())
             }
             // ABORT, FAIL, ROLLBACK: the statement fails.
@@ -6806,6 +7889,61 @@ impl<'c, S: Storage> Statement<'c, S> {
                 },
             }),
         }
+    }
+
+    /// Whether inserting `row` at `rowid` would conflict (v0.16,
+    /// `triggers`): the kind of the first conflict (the rowid, then
+    /// each UNIQUE index in order).
+    /// `own`: the rowid the row is stored at now (an UPDATE's), which
+    /// is no conflict.
+    #[cfg(feature = "triggers")]
+    async fn insert_conflict(
+        &mut self,
+        root: u32,
+        row: &[OwnedValue],
+        rowid: i64,
+        own: Option<i64>,
+    ) -> Result<Option<SchemaKind>, S::Error> {
+        if own != Some(rowid)
+            && btree::seek_rowid(&mut self.conn.pager, root, rowid)
+                .await?
+                .is_some()
+        {
+            return Ok(Some(SchemaKind::DuplicateRowid));
+        }
+        #[cfg(not(feature = "indexes"))]
+        let _ = row;
+        #[cfg(feature = "indexes")]
+        let indexes: AVec<IndexPlan> = match &self.plan {
+            Plan::Insert { indexes, .. } | Plan::Update { indexes, .. } => indexes.clone(),
+            _ => AVec::new(),
+        };
+        #[cfg(feature = "indexes")]
+        for ix in indexes.iter() {
+            if !ix.unique {
+                continue;
+            }
+            let mut key = AVec::new();
+            for c in ix.cols.iter() {
+                key.push(match c.col {
+                    None => OwnedValue::Integer(rowid),
+                    Some(i) => row.get(i).cloned().unwrap_or(OwnedValue::Null),
+                });
+            }
+            if key_has_no_null(key.as_slice())
+                && let Some(other) = btree::index_first_with_prefix(
+                    &mut self.conn.pager,
+                    ix.root,
+                    ix.desc.as_slice(),
+                    key.as_slice(),
+                )
+                .await?
+                && own != Some(other)
+            {
+                return Ok(Some(SchemaKind::UniqueViolation));
+            }
+        }
+        Ok(None)
     }
 
     /// The DO UPDATE half of an upsert (v0.7): transform the
@@ -6849,6 +7987,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         if let Some(g) = gcols {
             g.fill::<S::Error>(orec.as_mut_slice(), crowid, true)?;
         }
+        // The row as stored when it is rewritten (read again after
+        // BEFORE UPDATE triggers); `orec` stays the OLD row.
+        #[allow(unused_mut)]
+        let mut stored = orec.clone();
         // Combined evaluation row: original ++ excluded.
         let orig_rd = row_data_for(rowid_alias, affs, orec.as_slice(), crowid);
         let prop_rd = row_data_for(rowid_alias, affs, row, rowid);
@@ -6878,6 +8020,59 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
                 _ => new_rowid = update_rowid::<S::Error>(v)?,
             }
+        }
+        // v0.16 (`triggers`): DO UPDATE fires the UPDATE triggers.
+        #[cfg(feature = "triggers")]
+        let (up_assigned, up_rowid_set) =
+            assigned_columns(up.sets.as_slice(), defaults.len(), rowid_alias);
+        #[cfg(feature = "triggers")]
+        if self.fires(
+            crate::sql::ast::TrigTime::Before,
+            crate::sql::ast::TrigEvent::Update,
+        ) {
+            let mut nrec = new_rec.clone();
+            if let Some(g) = gcols {
+                for (i, v) in nrec.as_mut_slice().iter_mut().enumerate() {
+                    if g.is_gen(i) {
+                        *v = OwnedValue::Null;
+                    }
+                }
+            }
+            if !self
+                .fire_as(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Update,
+                    Some((up_assigned.as_slice(), up_rowid_set)),
+                    Some((orec.as_slice(), crowid)),
+                    Some((nrec.as_slice(), new_rowid)),
+                    Some(ConflictAction::Abort),
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            // Then the row is read again, as an UPDATE's (v0.16 review
+            // fix: the upsert used the row from before its triggers):
+            // gone — deleted by a trigger, or by a foreign-key cascade
+            // one ran — it is skipped; the columns DO UPDATE does not
+            // assign take their current values.
+            let Some(now) = self
+                .reload_write_row(root, defaults.len(), defaults, crowid)
+                .await?
+            else {
+                return Ok(());
+            };
+            for (i, v) in new_rec.as_mut_slice().iter_mut().enumerate() {
+                if !up_assigned.as_slice().get(i).copied().unwrap_or(false) {
+                    *v = now
+                        .rec
+                        .as_slice()
+                        .get(i)
+                        .cloned()
+                        .unwrap_or(OwnedValue::Null);
+                }
+            }
+            stored = now.rec;
         }
         // v0.10 NOT NULL: the DO UPDATE result row is checked
         // with ABORT semantics unconditionally (probed on the
@@ -6958,19 +8153,56 @@ impl<'c, S: Storage> Statement<'c, S> {
                 });
             }
         }
+        // v0.16 (`foreign_keys`): the update's keys, as an UPDATE's.
+        #[cfg(feature = "foreign_keys")]
+        let fk_rows = if self.fk_active() {
+            let lold = self.fk_row(orec.as_slice(), crowid, affs);
+            let lnew = self.fk_row(new_rec.as_slice(), new_rowid, affs);
+            let ch = Some((assigned.as_slice(), rowid_set));
+            self.fk_old_row(lold.as_slice(), crowid, ch).await?;
+            self.fk_new_row(lnew.as_slice(), new_rowid, Some(crowid), ch)
+                .await?;
+            Some((lold, lnew))
+        } else {
+            None
+        };
         self.rewrite_stored_row(
             root,
             rowid_alias,
-            orec.as_slice(),
+            stored.as_slice(),
             crowid,
             new_rec.as_slice(),
             new_rowid,
         )
         .await?;
+        #[cfg(feature = "foreign_keys")]
+        if let Some((lold, lnew)) = &fk_rows {
+            self.fk_actions(
+                lold.as_slice(),
+                Some(lnew.as_slice()),
+                Some((assigned.as_slice(), rowid_set)),
+            )
+            .await?;
+        }
         #[cfg(feature = "v16")]
         self.conn.env.note_change();
         self.push_insert_returning(new_rec.as_slice(), new_rowid)
             .await?;
+        #[cfg(feature = "triggers")]
+        if self.fires(
+            crate::sql::ast::TrigTime::After,
+            crate::sql::ast::TrigEvent::Update,
+        ) {
+            self.fire_as(
+                crate::sql::ast::TrigTime::After,
+                crate::sql::ast::TrigEvent::Update,
+                Some((up_assigned.as_slice(), up_rowid_set)),
+                Some((orec.as_slice(), crowid)),
+                Some((new_rec.as_slice(), new_rowid)),
+                Some(ConflictAction::Abort),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -6992,7 +8224,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     Err(e) => return Err(self.write_failed(e).await),
                 }
             }
-            return Ok(self.serve_returning());
+            return self.serve_returning_fk().await;
         }
         let r = self.exec_update().await;
         match r {
@@ -7018,7 +8250,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                         self.ret_loaded = true;
                         self.ret_pos = 0;
                     }
-                    Err(e) => {
+                    #[allow(unused_mut)]
+                    Err(mut e) => {
+                        #[cfg(feature = "triggers")]
+                        if self.trigger_failed(&mut e).await {
+                            return Err(e);
+                        }
                         #[cfg(feature = "v16")]
                         self.conn.env.finish(false);
                         abort_write!(self, &e);
@@ -7026,7 +8263,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
-            return Ok(self.serve_returning());
+            return self.serve_returning_fk().await;
         }
         let r = self.exec_delete().await;
         match r {
@@ -7034,7 +8271,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.phase = Phase::Done;
                 Ok(Step::Done)
             }
-            Err(e) => {
+            #[allow(unused_mut)]
+            Err(mut e) => {
+                #[cfg(feature = "triggers")]
+                if self.trigger_failed(&mut e).await {
+                    return Err(e);
+                }
                 #[cfg(feature = "v16")]
                 self.conn.env.finish(false);
                 abort_write!(self, &e);
@@ -7055,6 +8297,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
+                #[cfg(feature = "foreign_keys")]
+                if core::mem::take(&mut self.conn.fk.drop_counted) {
+                    self.conn.env.finish(false);
+                }
                 abort_write!(self, &e);
                 Err(e)
             }
@@ -7066,9 +8312,13 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// defaults), keep the rows the filter accepts. Collecting
     /// before mutating is what keeps the statement's row set
     /// stable while it rewrites the B-tree underneath itself —
-    /// and what makes statement atomicity a rollback away.
+    /// and what makes statement atomicity a rollback away. On a
+    /// failure, the rows the scan passed before it are in `out`
+    /// (v0.16 review fix, `triggers`: a trigger program's one-pass
+    /// write keeps them — `one_pass`).
     #[cfg(feature = "v05")]
-    async fn scan_write_rows(
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_write_rows_into(
         &mut self,
         root: u32,
         rowid_alias: Option<usize>,
@@ -7076,8 +8326,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         defaults: &[OwnedValue],
         affs: &[crate::record::Affinity],
         filter: &Option<RExpr>,
-    ) -> Result<AVec<WriteRow>, S::Error> {
-        let mut out = AVec::new();
+        out: &mut AVec<WriteRow>,
+    ) -> Result<(), S::Error> {
         let mut cursor = ScanCursor::new(root);
         let mut buf = AVec::new();
         // v0.16: VIRTUAL generated columns are computed per row.
@@ -7108,11 +8358,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             out.push(WriteRow { rowid, rec });
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Re-read one row of an UPDATE's target by rowid (v0.16),
-    /// decoded as `scan_write_rows` decodes it; `None` when the
+    /// decoded as `scan_write_rows_into` decodes it; `None` when the
     /// row is gone (an OR REPLACE earlier in the statement
     /// deleted it).
     #[cfg(feature = "v05")]
@@ -7144,6 +8394,8 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_update(&mut self) -> Result<(), S::Error> {
         #[cfg(feature = "v16")]
         self.conn.env.pending.set(0);
+        #[cfg(feature = "triggers")]
+        self.load_triggers()?;
         let (root, rowid_alias, ncols, defaults, affs, not_null, sets, filter, conflict_action) =
             match &self.plan {
                 Plan::Update {
@@ -7201,20 +8453,54 @@ impl<'c, S: Storage> Statement<'c, S> {
         let scan_filter = if from_rows.is_some() { &None } else { &filter };
         #[cfg(not(feature = "v07"))]
         let scan_filter = &filter;
-        let rows = self
-            .scan_write_rows(
+        let mut rows = AVec::new();
+        let scanned = self
+            .scan_write_rows_into(
                 root,
                 rowid_alias,
                 ncols,
                 defaults.as_slice(),
                 affs.as_slice(),
                 scan_filter,
+                &mut rows,
             )
-            .await?;
+            .await;
+        #[cfg(not(feature = "triggers"))]
+        scanned?;
         let rules = self.plan_rules();
         // v0.16: the statement's change set — NOT NULL and CHECK
         // apply to assigned columns only, as on the pin.
         let (assigned, rowid_set) = assigned_columns(sets.as_slice(), ncols, rowid_alias);
+        #[cfg(feature = "foreign_keys")]
+        self.fk_load(fkey::Event::Update(assigned.as_slice(), rowid_set), true)?;
+        // A trigger program's one-pass UPDATE keeps the rows its
+        // WHERE passed before failing (`one_pass`).
+        #[cfg(feature = "triggers")]
+        let failed = match scanned {
+            Ok(()) => None,
+            Err(e)
+                if from_rows.is_none()
+                    && self.one_pass(
+                        crate::sql::ast::TrigEvent::Update,
+                        Some((assigned.as_slice(), rowid_set)),
+                        filter.as_ref(),
+                        conflict_action == ConflictAction::Replace,
+                    ) =>
+            {
+                Some(e)
+            }
+            Err(e) => return Err(e),
+        };
+        // (The pin deletes REPLACE victims only where the update can
+        // conflict: a new rowid, or a UNIQUE index it changes.)
+        #[cfg(feature = "foreign_keys")]
+        {
+            let replace = conflict_action == ConflictAction::Replace
+                && self.fk_update_replace(assigned.as_slice(), rowid_set);
+            if replace {
+                self.fk_load_victims()?;
+            }
+        }
         let mut nn_assigned = AVec::new();
         for (i, f) in not_null.iter().enumerate() {
             nn_assigned.push(*f && assigned.as_slice().get(i).copied().unwrap_or(false));
@@ -7228,9 +8514,19 @@ impl<'c, S: Storage> Statement<'c, S> {
         // from its current content (probed: UPDATE OR REPLACE t
         // SET id=id+1, v=v||'x' over ids 1,2 leaves 3|axx).
         let mut stale = false;
+        // v0.16 (`triggers`): with triggers each row is read again
+        // when its turn comes, as on the pin (a trigger may have
+        // changed or deleted it).
+        #[cfg(feature = "triggers")]
+        let triggered = self.trig.is_some();
+        #[cfg(not(feature = "triggers"))]
+        let triggered = false;
+        // v0.16 (`foreign_keys`): an action may change rows too.
+        #[cfg(feature = "foreign_keys")]
+        let triggered = triggered || self.fk_active();
         for snap_row in rows.iter() {
             let reloaded;
-            let wrow = if stale {
+            let wrow = if stale || triggered {
                 match self
                     .reload_write_row(root, ncols, defaults.as_slice(), snap_row.rowid)
                     .await?
@@ -7331,6 +8627,70 @@ impl<'c, S: Storage> Statement<'c, S> {
                         _ => new_rowid = update_rowid::<S::Error>(v)?,
                     }
                 }
+                // v0.16 (`triggers`): BEFORE UPDATE triggers (NEW's
+                // generated columns computed as on the pin); then the row
+                // is read again — gone, it is skipped; the columns the
+                // statement does not assign take their current values.
+                #[cfg(feature = "triggers")]
+                if self.fires(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Update,
+                ) {
+                    let mut nrec = new_rec.clone();
+                    if let Some(g) = rules.as_ref().and_then(|r| r.gcols.as_ref()) {
+                        // v0.16 review fix: the pin computes them from
+                        // the assigned columns and those a trigger
+                        // reads as NEW.x; the rest count as NULL.
+                        let loaded = self.before_update_loaded(assigned.as_slice(), rowid_set);
+                        for (i, v) in nrec.as_mut_slice().iter_mut().enumerate() {
+                            if Some(i) != rowid_alias
+                                && !g.is_gen(i)
+                                && !loaded.as_slice().get(i).copied().unwrap_or(true)
+                            {
+                                *v = OwnedValue::Null;
+                            }
+                        }
+                        g.fill::<S::Error>(nrec.as_mut_slice(), new_rowid, false)?;
+                        for (i, v) in nrec.as_mut_slice().iter_mut().enumerate() {
+                            if !g.is_gen(i) {
+                                *v = new_rec
+                                    .as_slice()
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(OwnedValue::Null);
+                            }
+                        }
+                    }
+                    if !self
+                        .fire(
+                            crate::sql::ast::TrigTime::Before,
+                            crate::sql::ast::TrigEvent::Update,
+                            Some((assigned.as_slice(), rowid_set)),
+                            Some((wrow.rec.as_slice(), wrow.rowid)),
+                            Some((nrec.as_slice(), new_rowid)),
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    let Some(now) = self
+                        .reload_write_row(root, ncols, defaults.as_slice(), cur_rowid)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    for (i, v) in new_rec.as_mut_slice().iter_mut().enumerate() {
+                        if !assigned.as_slice().get(i).copied().unwrap_or(false) {
+                            *v = now
+                                .rec
+                                .as_slice()
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(OwnedValue::Null);
+                        }
+                    }
+                    cur_rec = now.rec;
+                }
                 // v0.10 NOT NULL: the combination's result row
                 // is resolved under the statement's conflict
                 // action before uniqueness is considered (the
@@ -7413,7 +8773,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                             #[cfg(feature = "v07")]
                             {
                                 stale = true;
+                                #[cfg(feature = "triggers")]
+                                let mut triggered = false;
                                 for v in conflict_rows.iter() {
+                                    #[cfg(feature = "triggers")]
+                                    if self
+                                        .replace_victim(
+                                            *v,
+                                            first_err.unwrap_or(SchemaKind::UniqueViolation),
+                                        )
+                                        .await?
+                                    {
+                                        triggered = true;
+                                        continue;
+                                    }
                                     self.delete_row_completely(
                                         root,
                                         rowid_alias,
@@ -7422,6 +8795,21 @@ impl<'c, S: Storage> Statement<'c, S> {
                                         *v,
                                     )
                                     .await?;
+                                }
+                                // DELETE triggers may have written the
+                                // table: checked again, under ABORT.
+                                #[cfg(feature = "triggers")]
+                                if triggered
+                                    && let Some(kind) = self
+                                        .insert_conflict(
+                                            root,
+                                            new_rec.as_slice(),
+                                            new_rowid,
+                                            Some(cur_rowid),
+                                        )
+                                        .await?
+                                {
+                                    return Err(Error::Schema { kind });
                                 }
                             }
                             #[cfg(not(feature = "v07"))]
@@ -7439,6 +8827,21 @@ impl<'c, S: Storage> Statement<'c, S> {
                         }
                     }
                 }
+                // v0.16 (`foreign_keys`): the old row's keys while it is
+                // stored, the new row's as if it were gone (the pin
+                // deletes it in between).
+                #[cfg(feature = "foreign_keys")]
+                let fk_rows = if self.fk_active() {
+                    let lold = self.fk_row(wrow.rec.as_slice(), wrow.rowid, affs.as_slice());
+                    let lnew = self.fk_row(new_rec.as_slice(), new_rowid, affs.as_slice());
+                    let ch = Some((assigned.as_slice(), rowid_set));
+                    self.fk_old_row(lold.as_slice(), wrow.rowid, ch).await?;
+                    self.fk_new_row(lnew.as_slice(), new_rowid, Some(cur_rowid), ch)
+                        .await?;
+                    Some((lold, lnew))
+                } else {
+                    None
+                };
                 // Apply against the row as currently stored.
                 self.rewrite_stored_row(
                     root,
@@ -7450,16 +8853,44 @@ impl<'c, S: Storage> Statement<'c, S> {
                 )
                 .await?;
                 stale |= new_rowid != cur_rowid;
+                #[cfg(feature = "foreign_keys")]
+                if let Some((lold, lnew)) = &fk_rows {
+                    self.fk_actions(
+                        lold.as_slice(),
+                        Some(lnew.as_slice()),
+                        Some((assigned.as_slice(), rowid_set)),
+                    )
+                    .await?;
+                    stale = true;
+                }
+                // RETURNING reads the row before its AFTER triggers
+                // run (v0.16 review fix: the pin's RETURNING program
+                // is the first of them, as for INSERT and DELETE).
+                #[cfg(feature = "v07")]
+                if !returning.is_empty() {
+                    let rd =
+                        row_data_for(rowid_alias, affs.as_slice(), new_rec.as_slice(), new_rowid);
+                    let vals = self.eval_returning(returning.as_slice(), &rd).await?;
+                    self.ret_rows.push(vals);
+                    self.ret_rowids.push(Some(new_rowid));
+                }
+                #[cfg(feature = "triggers")]
+                if self.fires(
+                    crate::sql::ast::TrigTime::After,
+                    crate::sql::ast::TrigEvent::Update,
+                ) {
+                    self.fire(
+                        crate::sql::ast::TrigTime::After,
+                        crate::sql::ast::TrigEvent::Update,
+                        Some((assigned.as_slice(), rowid_set)),
+                        Some((wrow.rec.as_slice(), wrow.rowid)),
+                        Some((new_rec.as_slice(), new_rowid)),
+                    )
+                    .await?;
+                }
                 cur_rec = new_rec;
                 cur_rowid = new_rowid;
                 applied = true;
-            }
-            #[cfg(feature = "v07")]
-            if applied && !returning.is_empty() {
-                let rd = row_data_for(rowid_alias, affs.as_slice(), cur_rec.as_slice(), cur_rowid);
-                let vals = self.eval_returning(returning.as_slice(), &rd).await?;
-                self.ret_rows.push(vals);
-                self.ret_rowids.push(Some(cur_rowid));
             }
             #[cfg(feature = "v16")]
             if applied {
@@ -7467,6 +8898,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             let _ = applied;
         }
+        #[cfg(feature = "triggers")]
+        if let Some(e) = failed {
+            return Err(self.failed_part_way(e));
+        }
+        #[cfg(feature = "foreign_keys")]
+        self.fk_end_commit().await?;
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
@@ -7479,6 +8917,8 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_delete(&mut self) -> Result<(), S::Error> {
         #[cfg(feature = "v16")]
         self.conn.env.pending.set(0);
+        #[cfg(feature = "triggers")]
+        self.load_triggers()?;
         let (root, rowid_alias, ncols, defaults, affs, filter) = match &self.plan {
             Plan::Delete {
                 root,
@@ -7503,22 +8943,116 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Delete { indexes, .. } => indexes.clone(),
             _ => unreachable!(),
         };
-        let rows = self
-            .scan_write_rows(
+        let mut rows = AVec::new();
+        let scanned = self
+            .scan_write_rows_into(
                 root,
                 rowid_alias,
                 ncols,
                 defaults.as_slice(),
                 affs.as_slice(),
                 &filter,
+                &mut rows,
             )
-            .await?;
+            .await;
+        #[cfg(not(feature = "triggers"))]
+        scanned?;
         #[cfg(feature = "v07")]
         let returning = match &self.plan {
             Plan::Delete { returning, .. } => returning.clone(),
             _ => unreachable!(),
         };
-        for wrow in rows.iter() {
+        #[cfg(feature = "foreign_keys")]
+        self.fk_load(fkey::Event::Delete, true)?;
+        // A trigger program's one-pass DELETE keeps the rows its
+        // WHERE passed before failing (`one_pass`).
+        #[cfg(feature = "triggers")]
+        let failed = match scanned {
+            Ok(()) => None,
+            Err(e)
+                if self.one_pass(
+                    crate::sql::ast::TrigEvent::Delete,
+                    None,
+                    filter.as_ref(),
+                    false,
+                ) =>
+            {
+                Some(e)
+            }
+            Err(e) => return Err(e),
+        };
+        for snap_row in rows.iter() {
+            // v0.16 (`triggers`): with triggers each row is read again
+            // when its turn comes (gone: skipped), BEFORE DELETE
+            // triggers see it, and it is read once more after them;
+            // AFTER DELETE triggers see the row as first read.
+            #[cfg(feature = "triggers")]
+            let (old_row, cur_row);
+            #[cfg(feature = "triggers")]
+            let wrow = if self.trig.is_some() {
+                let Some(r) = self
+                    .reload_write_row(root, ncols, defaults.as_slice(), snap_row.rowid)
+                    .await?
+                else {
+                    continue;
+                };
+                old_row = Some(r);
+                let Some(old_row) = &old_row else {
+                    continue;
+                };
+                if self.fires(
+                    crate::sql::ast::TrigTime::Before,
+                    crate::sql::ast::TrigEvent::Delete,
+                ) {
+                    if !self
+                        .fire(
+                            crate::sql::ast::TrigTime::Before,
+                            crate::sql::ast::TrigEvent::Delete,
+                            None,
+                            Some((old_row.rec.as_slice(), old_row.rowid)),
+                            None,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    let Some(r) = self
+                        .reload_write_row(root, ncols, defaults.as_slice(), snap_row.rowid)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    cur_row = r;
+                    &cur_row
+                } else {
+                    old_row
+                }
+            } else {
+                old_row = None;
+                snap_row
+            };
+            #[cfg(not(feature = "triggers"))]
+            let wrow = snap_row;
+            // v0.16 (`foreign_keys`): an earlier row's actions may have
+            // deleted or changed this one; its keys are checked while
+            // it is stored, its actions run once it is gone.
+            #[cfg(feature = "foreign_keys")]
+            let fk_now;
+            #[cfg(feature = "foreign_keys")]
+            let (wrow, fk_old) = if self.fk_active() {
+                let Some(r) = self
+                    .reload_write_row(root, ncols, defaults.as_slice(), wrow.rowid)
+                    .await?
+                else {
+                    continue;
+                };
+                fk_now = r;
+                let lrow = self.fk_row(fk_now.rec.as_slice(), fk_now.rowid, affs.as_slice());
+                self.fk_old_row(lrow.as_slice(), fk_now.rowid, None).await?;
+                (&fk_now, Some(lrow))
+            } else {
+                (wrow, None)
+            };
             #[cfg(feature = "indexes")]
             for ix in indexes.iter() {
                 let key = key_from_rec(
@@ -7539,6 +9073,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             btree::btree_delete(&mut self.conn.pager, root, wrow.rowid).await?;
             #[cfg(feature = "v16")]
             self.conn.env.note_change();
+            #[cfg(feature = "foreign_keys")]
+            if let Some(lrow) = &fk_old {
+                self.fk_actions(lrow.as_slice(), None, None).await?;
+            }
             // RETURNING reads the row's pre-delete values, its
             // subqueries the table with this row (and every
             // earlier one) gone — the pin evaluates it after the
@@ -7555,7 +9093,30 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.ret_rows.push(vals);
                 self.ret_rowids.push(Some(wrow.rowid));
             }
+            #[cfg(feature = "triggers")]
+            if let Some(o) = &old_row
+                && self.fires(
+                    crate::sql::ast::TrigTime::After,
+                    crate::sql::ast::TrigEvent::Delete,
+                )
+            {
+                self.fire(
+                    crate::sql::ast::TrigTime::After,
+                    crate::sql::ast::TrigEvent::Delete,
+                    None,
+                    Some((o.rec.as_slice(), o.rowid)),
+                    None,
+                )
+                .await?;
+            }
         }
+        #[cfg(feature = "triggers")]
+        if let Some(e) = failed {
+            return Err(self.failed_part_way(e));
+        }
+        #[cfg(feature = "foreign_keys")]
+        self.fk_end_commit().await?;
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
@@ -7621,6 +9182,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             unreachable!()
         };
         let name_b = copy_vec(handle_bytes(&self.arena, *name));
+        // v0.16 (`foreign_keys`): the pin's implicit DELETE first.
+        #[cfg(feature = "foreign_keys")]
+        self.fk_drop(name_b.as_slice()).await?;
         // Schema rowids: the table's own row plus every index
         // row it owns (explicit and implicit alike).
         let mut schema_rowids = AVec::new();
@@ -7636,7 +9200,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     if is_table_row && let Value::Text(n) = &values.as_slice()[1] {
                         stored = Some(copy_vec(n));
                     }
-                    let is_index_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index"))
+                    // Its indexes and (v0.16, every profile) its
+                    // triggers go with it, as on the pin.
+                    let is_index_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index") || eq_ci(t, b"trigger"))
                         && matches!(&values.as_slice()[2], Value::Text(n) if eq_ci(n, name_b.as_slice()));
                     if is_table_row || is_index_row {
                         schema_rowids.push(rowid);
@@ -7678,6 +9244,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
         }
         self.conn.pager.bump_schema_cookie();
+        #[cfg(feature = "foreign_keys")]
+        {
+            self.fk_end_commit().await?;
+            if core::mem::take(&mut self.conn.fk.drop_counted) {
+                self.conn.env.finish(true);
+            }
+        }
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
@@ -8183,10 +9757,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             let empty = RowData::empty();
             let mut out = AVec::new();
             for r in qp.values.iter() {
-                let mut rv = AVec::new();
-                for e in r.iter() {
-                    rv.push(self.eval_row_sub(e, &empty).await?);
-                }
+                #[cfg(feature = "window")]
+                let rv = self.eval_values_row(r.as_slice(), &empty).await?;
+                #[cfg(not(feature = "window"))]
+                let rv = {
+                    let mut rv = AVec::new();
+                    for e in r.iter() {
+                        rv.push(self.eval_row_sub(e, &empty).await?);
+                    }
+                    rv
+                };
                 out.push(rv);
             }
             return Ok(out);
@@ -8259,10 +9839,17 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "v06")]
     async fn run_query_sub(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        // Window calls (v0.16, `window`) read every input row: no
+        // bound passes into the sources.
+        #[cfg(feature = "window")]
+        let wins = !crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice()).is_empty();
+        #[cfg(not(feature = "window"))]
+        #[cfg_attr(not(feature = "v09"), allow(unused_variables))]
+        let wins = false;
         #[cfg(feature = "v09")]
         let need = derived_need(
             qp.sources.as_slice(),
-            qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
+            wins || qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
             !qp.order_by.is_empty() || qp.distinct,
             window,
         );
@@ -8272,10 +9859,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         // outer loop through a WHERE or a join stops at the
         // reader's LIMIT, as the pin's co-routine does.
         #[cfg(feature = "v16")]
-        let grow = streams_first(
-            qp.sources.as_slice(),
-            qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct,
-        ) && (qp.filter.is_some() || qp.sources.len() > 1)
+        let grow = !wins
+            && streams_first(
+                qp.sources.as_slice(),
+                qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct,
+            )
+            && (qp.filter.is_some() || qp.sources.len() > 1)
             && window.1 != usize::MAX;
         #[cfg(not(feature = "v16"))]
         let grow = false;
@@ -8319,6 +9908,47 @@ impl<'c, S: Storage> Statement<'c, S> {
             .await?;
         self.finish_produced(&qp, produced, window);
         Ok(())
+    }
+
+    /// One VALUES row against `outer` (v0.16, `window`): its window
+    /// calls run over the row alone, as the pin's one-row SELECT
+    /// core it is.
+    #[cfg(feature = "window")]
+    async fn eval_values_row(
+        &mut self,
+        r: &[RExpr],
+        outer: &RowData,
+    ) -> Result<AVec<OwnedValue>, S::Error> {
+        let mut rv = AVec::new();
+        {
+            let wins = crate::window::calls(r, &[]);
+            if !wins.is_empty() {
+                let mut ins = AVec::new();
+                for w in wins.iter() {
+                    let mut v = AVec::new();
+                    for k in crate::window::children(w) {
+                        v.push(self.eval_row_sub(k, outer).await?);
+                    }
+                    ins.push(v);
+                }
+                let mut units = AVec::new();
+                units.push(ins);
+                let (_, vals) = crate::window::compute(wins.as_slice(), units.as_slice())
+                    .map_err(|kind| Error::Schema { kind })?;
+                let empty = AVec::new();
+                let v = vals.as_slice().first().unwrap_or(&empty);
+                for e in r {
+                    let mut t = crate::window::strip(e);
+                    crate::window::fill(&mut t, v.as_slice());
+                    rv.push(self.eval_row_sub(&t, outer).await?);
+                }
+                return Ok(rv);
+            }
+        }
+        for e in r {
+            rv.push(self.eval_row_sub(e, outer).await?);
+        }
+        Ok(rv)
     }
 
     /// Evaluate one expression for one row, executing any
@@ -8722,11 +10352,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         // The rows its reader takes bound the rows it must make.
         let (skip, take) = window;
         let streamed = (skip, need.map_or(take, |n| take.min(n)));
-        // Only a lone core streams its groups up to the LIMIT.
+        // Only a lone core streams its groups up to the LIMIT —
+        // and not over window calls (v0.16, `window`), which read
+        // every input row.
         #[cfg(feature = "v09")]
         let lone = plan.compound.is_empty();
         #[cfg(not(feature = "v09"))]
         let lone = true;
+        #[cfg(feature = "window")]
+        let lone = lone
+            && crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice()).is_empty();
         let cap = if lone {
             group_cap(
                 plan.group_by.as_slice(),
@@ -8866,10 +10501,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !plan.values.is_empty() {
             let mut out = AVec::new();
             for r in plan.values.iter() {
-                let mut rv = AVec::new();
-                for e in r.iter() {
-                    rv.push(self.eval_row_sub(e, outer).await?);
-                }
+                #[cfg(feature = "window")]
+                let rv = self.eval_values_row(r.as_slice(), outer).await?;
+                #[cfg(not(feature = "window"))]
+                let rv = {
+                    let mut rv = AVec::new();
+                    for e in r.iter() {
+                        rv.push(self.eval_row_sub(e, outer).await?);
+                    }
+                    rv
+                };
                 out.push(Produced {
                     out: rv,
                     keys: AVec::new(),
@@ -9057,8 +10698,35 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        // Window calls (v0.16, `window`; see `project_rows`).
+        #[cfg(feature = "window")]
+        let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
+        #[cfg(feature = "window")]
+        let cap = if wins.is_empty() { cap } else { None };
+        #[cfg(feature = "window")]
+        let mut pend: AVec<WinUnit> = AVec::new();
         if !qp.has_agg {
+            #[cfg(feature = "window")]
+            let mut row_at = 0usize;
             for r in rows {
+                #[cfg(feature = "window")]
+                if !wins.is_empty() {
+                    let mut ins = AVec::new();
+                    for w in wins.iter() {
+                        let mut v = AVec::new();
+                        for k in crate::window::children(w) {
+                            v.push(self.eval_row_sub(k, r).await?);
+                        }
+                        ins.push(v);
+                    }
+                    pend.push(WinUnit {
+                        at: row_at,
+                        rep: None,
+                        ins,
+                    });
+                    row_at += 1;
+                    continue;
+                }
                 let mut vals = AVec::new();
                 for it in qp.items.iter() {
                     vals.push(self.eval_row_sub(it, r).await?);
@@ -9077,6 +10745,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                     keys,
                     rowid,
                 });
+            }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                return self
+                    .win_project_async(
+                        qp.items.as_slice(),
+                        qp.order_by.as_slice(),
+                        qp.sources.len() == 1,
+                        wins.as_slice(),
+                        pend,
+                        rows,
+                        &[],
+                    )
+                    .await;
             }
             return Ok(out);
         }
@@ -9110,7 +10792,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             // v0.16: groups form and sort under each term's
             // collation (a NOCASE column groups 'a' with 'A').
             let gcolls = crate::query::exprs_colls(qp.group_by.as_slice());
-            let gdesc = group_desc(qp.group_by.as_slice(), qp.order_by.as_slice());
+            let gdesc = group_desc(
+                qp.group_by.as_slice(),
+                qp.items.as_slice(),
+                qp.order_by.as_slice(),
+            );
             for r in rows {
                 let mut key = AVec::new();
                 for g in qp.group_by.iter() {
@@ -9153,7 +10839,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 core::cmp::Ordering::Equal
             });
         }
+        #[cfg(feature = "window")]
+        let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
+            #[cfg(feature = "window")]
+            {
+                group_at = group_at.wrapping_add(1);
+            }
             if cap.is_some_and(|c| out.len() >= c) {
                 break;
             }
@@ -9181,6 +10873,23 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
             }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                let mut ins = AVec::new();
+                for w in wins.iter() {
+                    let mut v = AVec::new();
+                    for k in crate::window::children(w) {
+                        v.push(self.eval_group_sub(k, grows.as_slice(), &rep).await?);
+                    }
+                    ins.push(v);
+                }
+                pend.push(WinUnit {
+                    at: group_at,
+                    rep: Some(rep),
+                    ins,
+                });
+                continue;
+            }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
@@ -9194,6 +10903,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                 keys,
                 rowid: None,
             });
+        }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            return self
+                .win_project_async(
+                    qp.items.as_slice(),
+                    qp.order_by.as_slice(),
+                    false,
+                    wins.as_slice(),
+                    pend,
+                    rows,
+                    groups.as_slice(),
+                )
+                .await;
         }
         Ok(out)
     }
@@ -9211,8 +10934,35 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        // Window calls (v0.16, `window`; see `project_rows`).
+        #[cfg(feature = "window")]
+        let wins = crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice());
+        #[cfg(feature = "window")]
+        let cap = if wins.is_empty() { cap } else { None };
+        #[cfg(feature = "window")]
+        let mut pend: AVec<WinUnit> = AVec::new();
         if !plan.has_agg {
+            #[cfg(feature = "window")]
+            let mut row_at = 0usize;
             for r in rows {
+                #[cfg(feature = "window")]
+                if !wins.is_empty() {
+                    let mut ins = AVec::new();
+                    for w in wins.iter() {
+                        let mut v = AVec::new();
+                        for k in crate::window::children(w) {
+                            v.push(self.eval_row_sub(k, r).await?);
+                        }
+                        ins.push(v);
+                    }
+                    pend.push(WinUnit {
+                        at: row_at,
+                        rep: None,
+                        ins,
+                    });
+                    row_at += 1;
+                    continue;
+                }
                 let mut vals = AVec::new();
                 for it in plan.items.iter() {
                     vals.push(self.eval_row_sub(it, r).await?);
@@ -9226,6 +10976,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                     keys,
                     rowid: None,
                 });
+            }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                return self
+                    .win_project_async(
+                        plan.items.as_slice(),
+                        plan.order_by.as_slice(),
+                        false,
+                        wins.as_slice(),
+                        pend,
+                        rows,
+                        &[],
+                    )
+                    .await;
             }
             return Ok(out);
         }
@@ -9258,7 +11022,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             // v0.16: groups form and sort under each term's
             // collation (a NOCASE column groups 'a' with 'A').
             let gcolls = crate::query::exprs_colls(plan.group_by.as_slice());
-            let gdesc = group_desc(plan.group_by.as_slice(), plan.order_by.as_slice());
+            let gdesc = group_desc(
+                plan.group_by.as_slice(),
+                plan.items.as_slice(),
+                plan.order_by.as_slice(),
+            );
             for r in rows {
                 let mut key = AVec::new();
                 for g in plan.group_by.iter() {
@@ -9301,7 +11069,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 core::cmp::Ordering::Equal
             });
         }
+        #[cfg(feature = "window")]
+        let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
+            #[cfg(feature = "window")]
+            {
+                group_at = group_at.wrapping_add(1);
+            }
             if cap.is_some_and(|c| out.len() >= c) {
                 break;
             }
@@ -9329,6 +11103,23 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
             }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                let mut ins = AVec::new();
+                for w in wins.iter() {
+                    let mut v = AVec::new();
+                    for k in crate::window::children(w) {
+                        v.push(self.eval_group_sub(k, grows.as_slice(), &rep).await?);
+                    }
+                    ins.push(v);
+                }
+                pend.push(WinUnit {
+                    at: group_at,
+                    rep: Some(rep),
+                    ins,
+                });
+                continue;
+            }
             let mut vals = AVec::new();
             for it in plan.items.iter() {
                 vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
@@ -9341,6 +11132,76 @@ impl<'c, S: Storage> Statement<'c, S> {
                 out: vals,
                 keys,
                 rowid: None,
+            });
+        }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            return self
+                .win_project_async(
+                    plan.items.as_slice(),
+                    plan.order_by.as_slice(),
+                    false,
+                    wins.as_slice(),
+                    pend,
+                    rows,
+                    groups.as_slice(),
+                )
+                .await;
+        }
+        Ok(out)
+    }
+
+    /// The window path of `project_qp_async` / `sub_project`
+    /// (v0.16, `window`; see `win_project`): the projection
+    /// evaluates through `eval_row_sub` / `eval_group_sub`.
+    #[cfg(feature = "window")]
+    #[allow(clippy::too_many_arguments)]
+    async fn win_project_async(
+        &mut self,
+        items: &[RExpr],
+        order_by: &[(RExpr, crate::sql::SortOrder)],
+        single: bool,
+        wins: &[&RExpr],
+        mut units: AVec<WinUnit>,
+        rows: &[RowData],
+        groups: &[(AVec<OwnedValue>, AVec<RowData>)],
+    ) -> Result<AVec<Produced>, S::Error> {
+        let (order, vals, ti, to) = win_results::<S::Error>(wins, &mut units, items, order_by)?;
+        let empty = RowData::empty();
+        let mut out = AVec::with_capacity(order.len());
+        for &u in order.iter() {
+            let (Some(unit), Some(v)) = (units.as_slice().get(u), vals.as_slice().get(u)) else {
+                continue;
+            };
+            let mut vs = AVec::new();
+            let mut keys = AVec::new();
+            let mut rowid = None;
+            for (k, t) in ti.iter().chain(to.iter()).enumerate() {
+                let mut e = t.clone();
+                crate::window::fill(&mut e, v.as_slice());
+                let x = match &unit.rep {
+                    None => {
+                        let r = rows.get(unit.at).unwrap_or(&empty);
+                        if single {
+                            rowid = r.rowids.as_slice().first().copied().flatten();
+                        }
+                        self.eval_row_sub(&e, r).await?
+                    }
+                    Some(rep) => {
+                        let g = groups.get(unit.at).map(|g| g.1.as_slice()).unwrap_or(&[]);
+                        self.eval_group_sub(&e, g, rep).await?
+                    }
+                };
+                if k < ti.len() {
+                    vs.push(x);
+                } else {
+                    keys.push(x);
+                }
+            }
+            out.push(Produced {
+                out: vs,
+                keys,
+                rowid,
             });
         }
         Ok(out)
@@ -9390,7 +11251,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             verify.clone(),
             *empty_only,
         );
-        if empty_only {
+        if let Some(kind) = empty_only {
             let mut cursor = ScanCursor::new(root);
             let mut buf = AVec::new();
             if cursor
@@ -9398,9 +11259,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .await?
                 .is_some()
             {
-                return Err(Error::Schema {
-                    kind: SchemaKind::CannotAddColumn,
-                });
+                return Err(Error::Schema { kind });
             }
         }
         let mut cursor = ScanCursor::new(1);
@@ -9574,14 +11433,22 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut cursor = ScanCursor::new(1);
         let mut buf = AVec::new();
         let mut found = None;
+        // Its triggers go with it (v0.16, every profile).
+        let mut trigs = AVec::new();
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
             let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
+            if values.len() >= 3
+                && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"trigger"))
+                && matches!(&values.as_slice()[2], Value::Text(n) if eq_ci(n, name_b.as_slice()))
+            {
+                trigs.push(rowid);
+            }
             if values.len() >= 2
+                && found.is_none()
                 && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"view"))
                 && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, name_b.as_slice()))
             {
                 found = Some(rowid);
-                break;
             }
         }
         let Some(srowid) = found else {
@@ -9590,6 +11457,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             });
         };
         btree::btree_delete(&mut self.conn.pager, 1, srowid).await?;
+        for r in trigs.iter() {
+            btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
+        }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
@@ -9617,6 +11487,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Update { returning, .. } => returning.len(),
             #[cfg(all(feature = "v05", feature = "v07"))]
             Plan::Delete { returning, .. } => returning.len(),
+            #[cfg(feature = "triggers")]
+            Plan::Instead(ip) => ip.returning_width(),
             _ => 0,
         }
     }
@@ -10152,12 +12024,11 @@ fn always_false(e: &RExpr) -> bool {
 #[cfg(feature = "v04")]
 fn has_call(e: &RExpr) -> bool {
     match e {
-        RExpr::Scalar(..) | RExpr::Agg { .. } | RExpr::Like(..) => true,
+        RExpr::Scalar(..) | RExpr::Agg { .. } | RExpr::Like(..) | RExpr::Win(..) => true,
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_) => false,
@@ -10202,12 +12073,12 @@ fn const_or_group(e: &RExpr, group_by: &[RExpr]) -> bool {
         RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
         RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_)
         | RExpr::InSub(..)
-        | RExpr::Agg { .. } => false,
+        | RExpr::Agg { .. }
+        | RExpr::Win(..) => false,
         RExpr::Neg(x)
         | RExpr::Pos(x)
         | RExpr::Not(x)
@@ -10361,6 +12232,38 @@ fn derived_need(
         .then(|| skip.saturating_add(take))
 }
 
+/// The result column ORDER BY term `e` (resolved: `r`) names, if
+/// any (v0.16 review fix, `window`; the pin's `iOrderByCol`): an
+/// ordinal, a bare alias (under COLLATE too), or a window call the
+/// same as a result column's (the last such column).
+#[cfg(feature = "window")]
+fn order_ref(
+    e: &Expr,
+    r: &RExpr,
+    arena: &Arena,
+    items: &[RExpr],
+    aliases: &[Option<AVec<u8>>],
+) -> Option<usize> {
+    let (mut e, mut r) = (e, r);
+    while let (Expr::Collate(x, _), RExpr::Collate(y, _)) = (e, r) {
+        e = x;
+        r = y;
+    }
+    match e {
+        Expr::Literal(Literal::Integer(n)) => usize::try_from(*n)
+            .ok()
+            .and_then(|k| k.checked_sub(1))
+            .filter(|k| *k < items.len()),
+        Expr::Column { table: None, name } => {
+            let nb = handle_bytes(arena, *name);
+            aliases
+                .iter()
+                .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
+        }
+        _ => items.iter().rposition(|it| crate::window::same_call(r, it)),
+    }
+}
+
 /// The direction each GROUP BY term's groups come out in
 /// (v0.16): when the ORDER BY has exactly as many terms as the
 /// GROUP BY, the pin's group sorter takes each ORDER BY term's
@@ -10369,9 +12272,29 @@ fn derived_need(
 /// are — so ties under the ORDER BY keep that group order
 /// (`GROUP BY a ORDER BY b DESC` lists equal-`b` groups by `a`
 /// descending). Otherwise every group term is ascending.
+///
+/// A core with window calls (v0.16 review fix, `window`) ignores
+/// its ORDER BY here: the pin's `sqlite3WindowRewrite` moves the
+/// grouping into a subquery ordered by the innermost window's sort
+/// keys (`window::inner_sort_desc`), so those directions apply —
+/// when there are as many keys as GROUP BY terms — whatever the
+/// outer ORDER BY says.
 #[cfg(feature = "v04")]
-fn group_desc(group_by: &[RExpr], order_by: &[(RExpr, crate::sql::SortOrder)]) -> AVec<bool> {
+fn group_desc(
+    group_by: &[RExpr],
+    items: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+) -> AVec<bool> {
     let mut out = AVec::new();
+    #[cfg(feature = "window")]
+    if let Some(d) = crate::window::inner_sort_desc(items, order_by) {
+        for i in 0..group_by.len() {
+            out.push(d.len() == group_by.len() && d.as_slice().get(i).copied().unwrap_or(false));
+        }
+        return out;
+    }
+    #[cfg(not(feature = "window"))]
+    let _ = items;
     for i in 0..group_by.len() {
         out.push(group_by.len() == order_by.len() && order_by.get(i).is_some_and(|(_, o)| o.desc));
     }
@@ -10615,9 +12538,33 @@ fn project_rows<E>(
     cap: Option<usize>,
 ) -> Result<AVec<Produced>, E> {
     let mut out = AVec::new();
+    // Window calls (v0.16, `window`): each input row (or group)
+    // first evaluates the calls' inputs; the projection waits for
+    // the windows (`win_project`). A group LIMIT cannot apply.
+    #[cfg(feature = "window")]
+    let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
+    #[cfg(feature = "window")]
+    let cap = if wins.is_empty() { cap } else { None };
+    #[cfg(feature = "window")]
+    let mut pend: AVec<WinUnit> = AVec::new();
     if !qp.has_agg {
+        #[cfg(feature = "window")]
+        let mut row_at = 0usize;
         for r in rows {
             let ctx = Ctx::of(r).with(env);
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
+                    crate::query::eval::<E>(k, &ctx)
+                })?;
+                pend.push(WinUnit {
+                    at: row_at,
+                    rep: None,
+                    ins,
+                });
+                row_at += 1;
+                continue;
+            }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -10636,6 +12583,10 @@ fn project_rows<E>(
                 keys,
                 rowid,
             });
+        }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            return win_project::<E>(env, qp, wins.as_slice(), pend, rows, &[]);
         }
         return Ok(out);
     }
@@ -10667,7 +12618,11 @@ fn project_rows<E>(
     } else {
         // v0.16: groups form and sort under each term's collation.
         let gcolls = crate::query::exprs_colls(qp.group_by.as_slice());
-        let gdesc = group_desc(qp.group_by.as_slice(), qp.order_by.as_slice());
+        let gdesc = group_desc(
+            qp.group_by.as_slice(),
+            qp.items.as_slice(),
+            qp.order_by.as_slice(),
+        );
         for r in rows {
             let ctx = Ctx::of(r).with(env);
             let mut key = AVec::new();
@@ -10712,7 +12667,13 @@ fn project_rows<E>(
             core::cmp::Ordering::Equal
         });
     }
+    #[cfg(feature = "window")]
+    let mut group_at = usize::MAX;
     for (_, grows) in groups.iter() {
+        #[cfg(feature = "window")]
+        {
+            group_at = group_at.wrapping_add(1);
+        }
         if cap.is_some_and(|c| out.len() >= c) {
             break;
         }
@@ -10735,6 +12696,18 @@ fn project_rows<E>(
                 continue;
             }
         }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
+                crate::query::eval::<E>(k, &ctx)
+            })?;
+            pend.push(WinUnit {
+                at: group_at,
+                rep: Some(rep),
+                ins,
+            });
+            continue;
+        }
         let mut vals = AVec::new();
         for it in qp.items.iter() {
             vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -10747,6 +12720,117 @@ fn project_rows<E>(
             out: vals,
             keys,
             rowid: None,
+        });
+    }
+    #[cfg(feature = "window")]
+    if !wins.is_empty() {
+        return win_project::<E>(env, qp, wins.as_slice(), pend, rows, groups.as_slice());
+    }
+    Ok(out)
+}
+
+/// One input row of a core's windows (v0.16, `window`): the row
+/// (`rep` None: index into the joined rows) or group (`rep` its
+/// representative: index into the groups), and its window calls'
+/// input values.
+#[cfg(feature = "window")]
+struct WinUnit {
+    at: usize,
+    rep: Option<RowData>,
+    ins: AVec<AVec<OwnedValue>>,
+}
+
+/// The windows' results for `units` (v0.16, `window`): the units in
+/// the window order, each call's value per unit, and the stripped
+/// templates of the result columns and ORDER BY terms.
+#[cfg(feature = "window")]
+#[allow(clippy::type_complexity)]
+fn win_results<E>(
+    wins: &[&RExpr],
+    units: &mut AVec<WinUnit>,
+    items: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+) -> Result<
+    (
+        AVec<usize>,
+        AVec<AVec<OwnedValue>>,
+        AVec<RExpr>,
+        AVec<RExpr>,
+    ),
+    E,
+> {
+    let mut ins: AVec<AVec<AVec<OwnedValue>>> = AVec::with_capacity(units.len());
+    for u in units.as_mut_slice() {
+        ins.push(core::mem::take(&mut u.ins));
+    }
+    let (order, vals) =
+        crate::window::compute(wins, ins.as_slice()).map_err(|kind| Error::Schema { kind })?;
+    let mut ti = AVec::new();
+    for it in items {
+        ti.push(crate::window::strip(it));
+    }
+    let mut to = AVec::new();
+    for (e, _) in order_by {
+        to.push(crate::window::strip(e));
+    }
+    Ok((order, vals, ti, to))
+}
+
+/// `project_rows`' window path (v0.16, `window`): compute the
+/// windows, then project each unit in the window order with its
+/// calls' values in place.
+#[cfg(feature = "window")]
+fn win_project<E>(
+    env: &crate::query::Env,
+    qp: &QueryPlan,
+    wins: &[&RExpr],
+    mut units: AVec<WinUnit>,
+    rows: &[RowData],
+    groups: &[(AVec<OwnedValue>, AVec<RowData>)],
+) -> Result<AVec<Produced>, E> {
+    let (order, vals, ti, to) = win_results::<E>(
+        wins,
+        &mut units,
+        qp.items.as_slice(),
+        qp.order_by.as_slice(),
+    )?;
+    let empty = RowData::empty();
+    let mut out = AVec::with_capacity(order.len());
+    for &u in order.iter() {
+        let (Some(unit), Some(v)) = (units.as_slice().get(u), vals.as_slice().get(u)) else {
+            continue;
+        };
+        let (ctx, rowid) = match &unit.rep {
+            None => {
+                let r = rows.get(unit.at).unwrap_or(&empty);
+                let rowid = if qp.sources.len() == 1 {
+                    r.rowids.as_slice().first().copied().flatten()
+                } else {
+                    None
+                };
+                (Ctx::of(r).with(env), rowid)
+            }
+            Some(rep) => {
+                let g = groups.get(unit.at).map(|g| g.1.as_slice()).unwrap_or(&[]);
+                (Ctx::group(g, rep).with(env), None)
+            }
+        };
+        let mut vs = AVec::new();
+        for t in ti.iter() {
+            let mut e = t.clone();
+            crate::window::fill(&mut e, v.as_slice());
+            vs.push(crate::query::eval::<E>(&e, &ctx)?);
+        }
+        let mut keys = AVec::new();
+        for t in to.iter() {
+            let mut e = t.clone();
+            crate::window::fill(&mut e, v.as_slice());
+            keys.push(crate::query::eval::<E>(&e, &ctx)?);
+        }
+        out.push(Produced {
+            out: vs,
+            keys,
+            rowid,
         });
     }
     Ok(out)

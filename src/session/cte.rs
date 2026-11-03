@@ -37,6 +37,7 @@
 
 use super::*;
 use crate::arena::ABytes;
+use crate::error::ParseKind;
 use crate::sql::{
     CompoundOp, Cte, CteUse, FromSource, JoinKind, M10d, RecMark, UpsertAction, With,
 };
@@ -112,8 +113,18 @@ struct Expander<'c> {
     nest: usize,
     /// `Config::max_nesting`.
     max_nest: usize,
+    /// The connection's parser limits (`Config::limits`), for view
+    /// bodies re-parsed here.
+    lim: crate::sql::parser::Limits,
     /// SELECTs copied out of view and CTE bodies so far.
     copies: usize,
+    /// The pin's name-resolution depth at this point
+    /// (`Parse.nHeight`, v0.16 review fix): the heights of the
+    /// expressions the select being walked sits in, summed over
+    /// every enclosing select, view and CTE reference
+    /// (`SelectStmt::rctx`). A view or CTE body read here is
+    /// resolved that deep.
+    ctx: usize,
     /// The second walk: every expanded source's materialization
     /// id is settled, nothing is expanded.
     fixing: bool,
@@ -147,7 +158,9 @@ impl<S: Storage> Connection<S> {
             mats: AVec::new(),
             nest: 0,
             max_nest: self.cfg.max_nesting,
+            lim: self.cfg.limits(),
             copies: 0,
+            ctx: 0,
             fixing: false,
             sub_limit: false,
             returning: false,
@@ -222,6 +235,7 @@ impl<S: Storage> Connection<S> {
         mut select: SelectStmt,
     ) -> Result<SelectStmt, S::Error> {
         let mut x = self.expander(arena);
+        x.read_body::<S::Error>(select.rdepth)?;
         x.views.push(copy_vec(name));
         x.select::<S::Error>(&mut select)?;
         x.fixing = true;
@@ -420,11 +434,46 @@ impl Expander<'_> {
             }
             None => false,
         };
+        let ctx = self.ctx;
+        self.ctx = ctx.saturating_add(s.rctx as usize);
         let r = self.select_body::<E>(s);
+        self.ctx = ctx;
         if pushed {
             self.pop_frame();
         }
         r
+    }
+
+    /// A view or CTE body of resolution depth `rdepth` read here
+    /// (v0.16 review fix): the pin resolves it inside the reader's
+    /// expressions, so the depths add up — a chain of views or CTEs
+    /// each reading the last inside a scalar subquery is refused
+    /// once the sum passes the limit ("Expression tree is too
+    /// large"), however small each body is on its own.
+    fn read_body<E>(&self, rdepth: u32) -> Result<(), E> {
+        if self.ctx.saturating_add(rdepth as usize) > self.lim.expr_depth {
+            return Err(Error::Parse {
+                offset: 0,
+                kind: ParseKind::ExprTooDeep,
+            });
+        }
+        Ok(())
+    }
+
+    /// The pin's width limits that it checks when it resolves a
+    /// select (v0.16 review fix): a CTE or CREATE VIEW body is not
+    /// checked when it is parsed (an unused CTE never), so the
+    /// copies the expansion makes are checked here.
+    fn widths<E>(s: &SelectStmt) -> Result<(), E> {
+        let max = crate::sql::parser::MAX_COLUMN;
+        let kind = if s.items.len() > max || s.values.iter().any(|r| r.len() > max) {
+            ParseKind::TooManyColumns
+        } else if s.group_by.len() > max || s.order_by.len() > max {
+            ParseKind::TooManyTerms
+        } else {
+            return Ok(());
+        };
+        Err(Error::Parse { offset: 0, kind })
     }
 
     fn select_body<E>(&mut self, s: &mut SelectStmt) -> Result<(), E> {
@@ -465,6 +514,8 @@ impl Expander<'_> {
     fn core<E>(&mut self, s: &mut SelectStmt, o: &Outer) -> Result<(), E> {
         if self.fixing {
             self.share_views(s, o);
+        } else {
+            Self::widths::<E>(s)?;
         }
         self.items::<E>(s.items.as_mut_slice())?;
         self.sources::<E>(s.from.as_mut_slice(), o)?;
@@ -476,6 +527,17 @@ impl Expander<'_> {
         }
         if let Some(h) = &mut s.having {
             self.expr::<E>(h)?;
+        }
+        // The WINDOW clause's expressions (v0.16, `window`).
+        #[cfg(feature = "window")]
+        for (_, w) in s.windows.as_mut_slice() {
+            let mut r = Ok(());
+            w.exprs_mut(&mut |x| {
+                if r.is_ok() {
+                    r = self.expr::<E>(x);
+                }
+            });
+            r?;
         }
         for row in s.values.as_mut_slice() {
             for e in row.as_mut_slice() {
@@ -719,7 +781,8 @@ impl Expander<'_> {
             return Err(schema_err(SchemaKind::CircularView));
         }
         self.enter::<E>()?;
-        let parsed = crate::sql::parse::<E>(handle_bytes(self.ca, v.sql), self.arena);
+        let parsed =
+            crate::sql::parser::parse_view::<E>(handle_bytes(self.ca, v.sql), self.arena, self.lim);
         let Ok(Ast::CreateView {
             columns,
             mut select,
@@ -729,6 +792,10 @@ impl Expander<'_> {
             self.nest -= 1;
             return Err(parsed.err().unwrap_or(Error::Unsupported));
         };
+        if let Err(e) = self.read_body::<E>(select.rdepth) {
+            self.nest -= 1;
+            return Err(e);
+        }
         self.copies = self.copies.saturating_add(count_selects(&select));
         // A view's body sees no CTE of the query that reads it.
         let vis = core::mem::take(&mut self.vis);
@@ -778,6 +845,7 @@ impl Expander<'_> {
         if self.copies >= MAX_COPIES {
             return Err(schema_err(SchemaKind::NestedTooDeep));
         }
+        self.read_body::<E>(cte.select.rdepth)?;
         if let Some(m) = self
             .mats
             .as_mut_slice()
@@ -935,6 +1003,12 @@ impl Expander<'_> {
             Expr::Literal(_) | Expr::Column { .. } | Expr::HexTooBig(_) => {}
             #[cfg(feature = "params")]
             Expr::Param(..) => {}
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            Expr::TrigValue(..) => {}
+            #[cfg(feature = "triggers")]
+            Expr::Raise(_, None, _) => {}
+            #[cfg(feature = "triggers")]
+            Expr::Raise(_, Some(a), _) => self.expr::<E>(a)?,
             Expr::Binary(_, a, c) | Expr::Like(a, c, _) => {
                 self.expr::<E>(a)?;
                 self.expr::<E>(c)?;
@@ -997,6 +1071,16 @@ impl Expander<'_> {
                     }
                     if let Some(x) = &mut c.filter {
                         self.expr::<E>(x)?;
+                    }
+                    #[cfg(feature = "window")]
+                    if let Some(crate::sql::ast::Over::Spec(w)) = &mut c.over {
+                        let mut r = Ok(());
+                        w.exprs_mut(&mut |x| {
+                            if r.is_ok() {
+                                r = self.expr::<E>(x);
+                            }
+                        });
+                        r?;
                     }
                 }
             }
@@ -1444,6 +1528,16 @@ impl<S: Storage> Connection<S> {
                     return Err(schema_err(SchemaKind::ColumnCountMismatch));
                 }
                 if recursive {
+                    // The pin checks only the rightmost SELECT
+                    // (`p->pWin` in generateWithRecursiveQuery),
+                    // before its aggregate check.
+                    #[cfg(feature = "window")]
+                    if k + 1 == d.compound.len()
+                        && (p.items.iter().any(crate::window::has_win)
+                            || p.order_by.iter().any(|(e, _)| crate::window::has_win(e)))
+                    {
+                        return Err(schema_err(SchemaKind::RecursiveWindow));
+                    }
                     if p.has_agg || !p.group_by.is_empty() {
                         return Err(schema_err(SchemaKind::RecursiveAggregate));
                     }

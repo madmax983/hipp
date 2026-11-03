@@ -43,6 +43,7 @@ use crate::query::{
     resolve_scoped, truthy,
 };
 use crate::record::{Affinity, OwnedValue, Value, apply_affinity, encode_record};
+use crate::sql::parser::Limits;
 use crate::sql::{ConflictAction, Expr, SelectStmt, eq_ci, parse_expr_text};
 
 /// A STRICT table column's declared type (v0.16, `v16`).
@@ -422,9 +423,9 @@ fn copy(b: &[u8]) -> AVec<u8> {
 
 /// Re-parse one stored rule text into `arena`. The text is copied
 /// first: it may live in `arena` itself (CREATE TABLE validation).
-fn parse_rule<E>(text: &[u8], arena: &Arena) -> Result<Expr, E> {
+fn parse_rule<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<Expr, E> {
     let owned = copy(text);
-    parse_expr_text::<E>(owned.as_slice(), arena)
+    parse_expr_text::<E>(owned.as_slice(), arena, lim)
 }
 
 /// Resolve a table's rules (v0.16): STRICT types, generated
@@ -433,6 +434,7 @@ fn parse_rule<E>(text: &[u8], arena: &Arena) -> Result<Expr, E> {
 /// pin refuses.
 pub fn plan_rules<E>(
     arena: &Arena,
+    lim: Limits,
     tname: &[u8],
     cols: &[ColSpec<'_>],
     rowid_alias: Option<usize>,
@@ -483,7 +485,7 @@ pub fn plan_rules<E>(
         for (i, c) in cols.iter().enumerate() {
             virt.push(c.gen_text.is_some() && !c.stored);
             let Some(text) = c.gen_text else { continue };
-            let e = parse_rule::<E>(text, arena)?;
+            let e = parse_rule::<E>(text, arena, lim)?;
             if expr_any(&e, &mut |x| {
                 matches!(x, Expr::Column { table: Some(_), .. })
             }) {
@@ -562,7 +564,7 @@ pub fn plan_rules<E>(
         srcs.push(src);
         let cur = ScopeGroup::new(srcs, offsets, 0);
         for text in checks.iter() {
-            let e = parse_rule::<E>(text, arena)?;
+            let e = parse_rule::<E>(text, arena, lim)?;
             let mut planner = subquery_refused::<E>(SchemaKind::SubqueryInConstraint);
             let r = resolve_scoped::<E>(&e, arena, &cur, &[], &mut planner)?;
             if has_agg(&r) {
@@ -584,6 +586,7 @@ pub fn plan_rules<E>(
 /// ADD COLUMN validates the rewritten definition the same way.
 pub fn validate_def<E>(
     arena: &Arena,
+    lim: Limits,
     tname: &[u8],
     columns: &[crate::sql::ColumnDef],
     pk_columns: &[crate::arena::ABytes],
@@ -602,7 +605,7 @@ pub fn validate_def<E>(
             });
         }
         if let Some(h) = c.default_expr {
-            check_default_const::<E>(handle_bytes(arena, h), arena)?;
+            check_default_const::<E>(handle_bytes(arena, h), arena, lim)?;
         }
         let decl = handle_bytes(arena, c.decl);
         let name = handle_bytes(arena, c.name);
@@ -628,10 +631,20 @@ pub fn validate_def<E>(
     }
     let mut texts: AVec<&[u8]> = AVec::new();
     for h in checks.iter() {
+        // A CHECK holding RAISE() is accepted when the table is
+        // created (v0.16, `triggers`): the pin refuses it only where
+        // it is resolved, when a row is written.
+        #[cfg(feature = "triggers")]
+        if parse_rule::<E>(handle_bytes(arena, *h), arena, lim)
+            .is_ok_and(|e| expr_any(&e, &mut |x| matches!(x, Expr::Raise(..))))
+        {
+            continue;
+        }
         texts.push(handle_bytes(arena, *h));
     }
     plan_rules::<E>(
         arena,
+        lim,
         tname,
         specs.as_slice(),
         alias,
@@ -647,11 +660,15 @@ pub fn validate_def<E>(
 /// refuse such a column ("non-deterministic functions prohibited
 /// in generated columns").
 #[cfg(feature = "v16")]
-pub fn gen_uses_like<E>(arena: &Arena, columns: &[crate::sql::ColumnDef]) -> Result<bool, E> {
+pub fn gen_uses_like<E>(
+    arena: &Arena,
+    lim: Limits,
+    columns: &[crate::sql::ColumnDef],
+) -> Result<bool, E> {
     use crate::sql::handle_bytes;
     for c in columns.iter() {
         let Some(h) = c.gen_expr else { continue };
-        let e = parse_rule::<E>(handle_bytes(arena, h), arena)?;
+        let e = parse_rule::<E>(handle_bytes(arena, h), arena, lim)?;
         if expr_any(&e, &mut |x| match x {
             Expr::Like(..) => true,
             Expr::Func { name, .. } => eq_ci(handle_bytes(arena, *name), b"like"),
@@ -666,7 +683,7 @@ pub fn gen_uses_like<E>(arena: &Arena, columns: &[crate::sql::ColumnDef]) -> Res
 /// Whether `f` holds for any node of `e` (pre-order; subquery
 /// bodies are not entered — the subquery node itself is visited).
 /// The walk follows the expression's own nesting, which the
-/// parser bounds (`MAX_DEPTH`).
+/// parser bounds (`sql::parser::Limits`).
 pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
     if f(e) {
         return true;
@@ -679,6 +696,12 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | Expr::ExistsSubquery(_) => false,
         #[cfg(feature = "params")]
         Expr::Param(..) => false,
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        Expr::TrigValue(..) => false,
+        #[cfg(feature = "triggers")]
+        Expr::Raise(_, None, _) => false,
+        #[cfg(feature = "triggers")]
+        Expr::Raise(_, Some(a), _) => expr_any(a, f),
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => expr_any(a, f) || expr_any(b, f),
         Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             expr_any(a, f)
@@ -720,8 +743,8 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
 /// Whether a stored rule text holds a too-big hex literal
 /// (`Expr::HexTooBig`, v0.16 review fix): CREATE TABLE leaves
 /// such a CHECK to the statements that evaluate it.
-pub fn has_big_hex<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
-    let e = parse_rule::<E>(text, arena)?;
+pub fn has_big_hex<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<bool, E> {
+    let e = parse_rule::<E>(text, arena, lim)?;
     Ok(expr_any(&e, &mut |x| matches!(x, Expr::HexTooBig(_))))
 }
 
@@ -738,14 +761,21 @@ fn is_ctime(name: &[u8]) -> bool {
 /// the clock keywords, no subquery. Function names are NOT
 /// checked — the pin defers an unknown function to the INSERT
 /// that needs the default.
-pub fn check_default_const<E>(text: &[u8], arena: &Arena) -> Result<(), E> {
-    let e = parse_rule::<E>(text, arena)?;
+pub fn check_default_const<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<(), E> {
+    let e = parse_rule::<E>(text, arena, lim)?;
     let bad = expr_any(&e, &mut |x| match x {
         Expr::Column { table: None, name } => !is_ctime(crate::sql::handle_bytes(arena, *name)),
         Expr::Column { .. }
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_)
         | Expr::InSubquery(..) => true,
+        // A window call (the pin's `exprNodeIsConstant` refuses
+        // any EP_WinFunc node; v0.16 review fix: such a default
+        // left a schema the pin cannot load).
+        #[cfg(feature = "window")]
+        Expr::Func {
+            clause: Some(c), ..
+        } => c.over.is_some(),
         _ => false,
     });
     if bad {
@@ -761,7 +791,7 @@ pub fn check_default_const<E>(text: &[u8], arena: &Arena) -> Result<(), E> {
 /// (`-'3'`, `-x'01'`, `-NULL`) or CAST — never an operator,
 /// function or clock keyword ("Cannot add a column with
 /// non-constant default").
-pub fn alter_default_ok<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
+pub fn alter_default_ok<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<bool, E> {
     fn ok(e: &Expr) -> bool {
         match e {
             Expr::Literal(_) => true,
@@ -769,7 +799,7 @@ pub fn alter_default_ok<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
             _ => false,
         }
     }
-    Ok(ok(&parse_rule::<E>(text, arena)?))
+    Ok(ok(&parse_rule::<E>(text, arena, lim)?))
 }
 
 /// Evaluate an expression DEFAULT for one statement (v0.16): the
@@ -786,10 +816,11 @@ pub fn alter_default_ok<E>(text: &[u8], arena: &Arena) -> Result<bool, E> {
 pub fn eval_default<E>(
     text: &[u8],
     arena: &Arena,
+    lim: Limits,
     clock: &mut Clock,
     env: Option<&crate::query::Env>,
 ) -> Result<OwnedValue, E> {
-    let (r, row) = prepare_default::<E>(text, arena, clock)?;
+    let (r, row) = prepare_default::<E>(text, arena, lim, clock)?;
     eval_prepared_default::<E>(&r, &row, env)
 }
 
@@ -799,9 +830,10 @@ pub fn eval_default<E>(
 pub fn prepare_default<E>(
     text: &[u8],
     arena: &Arena,
+    lim: Limits,
     clock: &mut Clock,
 ) -> Result<(RExpr, RowData), E> {
-    let e = parse_rule::<E>(text, arena)?;
+    let e = parse_rule::<E>(text, arena, lim)?;
     let mut cols = AVec::new();
     for c in CTIME.iter() {
         cols.push((copy(c), Affinity::Blob));

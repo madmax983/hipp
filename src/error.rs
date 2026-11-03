@@ -43,6 +43,14 @@ pub enum SchemaKind {
     /// `SELECT *` with no FROM clause (v0.16 review fix; the pin's
     /// "no tables specified"). Name a table, or list the columns.
     NoTablesSpecified,
+    /// A result set of more than 2000 columns once `*` is expanded
+    /// (v0.16; the pin's "too many columns in result set"), or an
+    /// ALTER TABLE ADD COLUMN past 2000 ("too many columns on t").
+    /// Name fewer columns.
+    TooManyColumns,
+    /// A FROM clause joining more than 64 tables (v0.16; the pin's
+    /// "at most 64 tables in a join"). Split the query.
+    TooManyTables,
     /// `ALTER TABLE ... ADD COLUMN` named a column the table
     /// already has (v0.4).
     DuplicateColumn,
@@ -231,6 +239,83 @@ pub enum SchemaKind {
     /// out first.
     #[cfg(feature = "v16")]
     PercentileInfinite,
+    /// A window function where the pin forbids one (v0.16,
+    /// `window`; its "misuse of window function f()" / "misuse
+    /// of aliased window function x"): outside a result column
+    /// or an ORDER BY term of a SELECT (in WHERE, GROUP BY,
+    /// HAVING, ON, a write statement, a CHECK or an index), or
+    /// inside the arguments, PARTITION BY, ORDER BY or FILTER of
+    /// an aggregate or another window function; and a built-in
+    /// window function (`row_number()`, ...) called without
+    /// OVER. Compute it in a FROM subquery and filter outside.
+    #[cfg(feature = "window")]
+    MisusedWindow,
+    /// OVER on a function that is not a window function (v0.16,
+    /// `window`; the pin's "f() may not be used as a window
+    /// function"): a scalar function, or min / max with several
+    /// arguments. Use an aggregate or a built-in window function.
+    #[cfg(feature = "window")]
+    NotWindowFunction,
+    /// DISTINCT in a window function call (v0.16, `window`; the
+    /// pin's "DISTINCT is not supported for window functions").
+    /// Deduplicate in a subquery first.
+    #[cfg(feature = "window")]
+    WindowDistinct,
+    /// FILTER on a built-in window function, or an aggregate
+    /// ORDER BY inside a window aggregate's parentheses (v0.16,
+    /// `window`; the pin's "FILTER clause may only be used with
+    /// aggregate window functions" / "ORDER BY may not be used
+    /// with non-aggregate f()"). Order through the window's own
+    /// ORDER BY.
+    #[cfg(feature = "window")]
+    WindowClauseMisused,
+    /// `OVER name` / `OVER (name ...)` / `AS (name ...)` naming no
+    /// window of the select's WINDOW clause (v0.16, `window`; the
+    /// pin's "no such window"). Define it in the WINDOW clause.
+    #[cfg(feature = "window")]
+    NoSuchWindow,
+    /// A window that inherits from a named window but restates
+    /// its PARTITION BY, a second ORDER BY, or inherits from one
+    /// with an explicit frame (v0.16, `window`; the pin's "cannot
+    /// override ... of window"). Inherit only what the base
+    /// leaves out.
+    #[cfg(feature = "window")]
+    WindowOverride,
+    /// A RANGE frame with an `<expr> PRECEDING / FOLLOWING` bound
+    /// over other than exactly one ORDER BY term (v0.16, `window`;
+    /// the pin's "RANGE with offset PRECEDING/FOLLOWING requires
+    /// one ORDER BY expression"). Order by one expression, or use
+    /// ROWS / GROUPS.
+    #[cfg(feature = "window")]
+    RangeOffsetOrder,
+    /// A frame's starting offset that is not a non-negative
+    /// integer (ROWS / GROUPS) or number (RANGE) — NULL, text, a
+    /// blob, a fraction, a negative value or a non-constant
+    /// expression (v0.16, `window`; the pin's "frame starting
+    /// offset must be a non-negative integer / number"). Write a
+    /// non-negative literal.
+    #[cfg(feature = "window")]
+    FrameStartOffset,
+    /// The same for a frame's ending offset (v0.16, `window`).
+    #[cfg(feature = "window")]
+    FrameEndOffset,
+    /// `nth_value(x, N)` with an N that is not a positive integer
+    /// (v0.16, `window`; the pin's "second argument to nth_value
+    /// must be a positive integer"). Pass N >= 1.
+    #[cfg(feature = "window")]
+    NthValueArgument,
+    /// `ntile(N)` with an N that is not a positive integer for a
+    /// partition's first row (v0.16, `window`; the pin's
+    /// "argument of ntile must be a positive integer"). Pass N >=
+    /// 1.
+    #[cfg(feature = "window")]
+    NtileArgument,
+    /// A window call in the result columns or ORDER BY of a
+    /// recursive CTE's last recursive SELECT (v0.16, `window`; the
+    /// pin's "cannot use window functions in recursive queries").
+    /// Apply the window over the CTE's result instead.
+    #[cfg(feature = "window")]
+    RecursiveWindow,
     /// A FOREIGN KEY whose column lists disagree (v0.16 fix, the
     /// pin's "foreign key on x should reference only one column of
     /// table p" / "number of columns in foreign key does not match
@@ -238,6 +323,30 @@ pub enum SchemaKind {
     /// REFERENCES names at most one parent column, a table-level
     /// key as many as it lists. Make the lists the same length.
     ForeignKeyColumns,
+    /// A write left a foreign key unsatisfied while `PRAGMA
+    /// foreign_keys` is ON (v0.16, `foreign_keys`; the pin's
+    /// "FOREIGN KEY constraint failed"): a child row names a parent
+    /// key no parent row has, or a parent row still referred to went
+    /// — at the statement's end for an immediate key, at COMMIT (the
+    /// transaction staying open) for a deferred one; or a RESTRICT
+    /// action refused the change. Insert the parent first, delete
+    /// the children first, or defer the key.
+    #[cfg(feature = "foreign_keys")]
+    ForeignKeyViolation,
+    /// A foreign key whose parent columns are not the parent's
+    /// PRIMARY KEY or a UNIQUE index with their collations (v0.16,
+    /// `foreign_keys`; the pin's "foreign key mismatch - "c"
+    /// referencing "p""), found when a write needs the key. Give
+    /// the parent such a key, or reference the one it has.
+    #[cfg(feature = "foreign_keys")]
+    ForeignKeyMismatch,
+    /// `ALTER TABLE ADD COLUMN` of a REFERENCES column with a
+    /// non-NULL default to a table with rows while `PRAGMA
+    /// foreign_keys` is ON (v0.16 fix; the pin's "Cannot add a
+    /// REFERENCES column with non-NULL default value"). Add it with
+    /// no default, before the table has rows, or with the pragma off.
+    #[cfg(feature = "v16")]
+    ReferencesDefault,
     /// CREATE TABLE / INDEX / VIEW of a name starting with
     /// `sqlite_` (any case; the pin's "object name reserved for
     /// internal use"). Choose another name.
@@ -349,6 +458,89 @@ pub enum SchemaKind {
     /// rowid, with no rowid left for a new row.
     #[cfg(feature = "v16")]
     DatabaseFull,
+    /// A write to a table (or view) that has triggers, in a build
+    /// without the `triggers` feature (v0.16, every profile): the
+    /// triggers would not fire, so the write is refused rather
+    /// than silently skipping them. Build with feature `triggers`,
+    /// or drop the triggers with an engine that has them. Also a
+    /// trigger whose stored text hipp cannot parse (with
+    /// `triggers`).
+    TableHasTriggers,
+    /// `CREATE TRIGGER` of a name the schema already has (v0.16,
+    /// `triggers`; the pin's "trigger t already exists"). Pick
+    /// another name, or write `IF NOT EXISTS`.
+    #[cfg(feature = "triggers")]
+    DuplicateTrigger,
+    /// `DROP TRIGGER` of a name no trigger has (v0.16, `triggers`;
+    /// "no such trigger"). Write `IF EXISTS` to accept that.
+    #[cfg(feature = "triggers")]
+    UnknownTrigger,
+    /// A BEFORE / AFTER trigger on a view (v0.16, `triggers`;
+    /// "cannot create BEFORE trigger on view"). Use INSTEAD OF.
+    #[cfg(feature = "triggers")]
+    TriggerOnView,
+    /// An INSTEAD OF trigger on a table (v0.16, `triggers`;
+    /// "cannot create INSTEAD OF trigger on table"). Use BEFORE or
+    /// AFTER.
+    #[cfg(feature = "triggers")]
+    InsteadOfTable,
+    /// A schema-qualified table name on an INSERT / UPDATE /
+    /// DELETE inside a trigger body (v0.16, `triggers`; "qualified
+    /// table names are not allowed on INSERT, UPDATE, and DELETE
+    /// statements within triggers"). Write the bare name.
+    #[cfg(feature = "triggers")]
+    TriggerQualifiedTarget,
+    /// A `table.*` item in a RETURNING list (v0.16 review fix,
+    /// ungated; the pin's "RETURNING may not use \"TABLE.*\"
+    /// wildcards"). Write `*` or name the columns.
+    #[cfg(feature = "v07")]
+    ReturningTableStar,
+    /// RETURNING inside a trigger body (v0.16, `triggers`;
+    /// "cannot use RETURNING in a trigger"). Drop the clause.
+    #[cfg(feature = "triggers")]
+    TriggerReturning,
+    /// A trigger of the main schema that names a TEMP object, or a
+    /// TEMP trigger with a qualified name (v0.16, `triggers`; the
+    /// pin's "trigger ... cannot reference objects in database
+    /// temp" / "temporary trigger may not have qualified name").
+    /// Create a TEMP trigger, or drop the qualifier.
+    #[cfg(feature = "triggers")]
+    TriggerTempReference,
+    /// `RAISE()` outside a trigger program (v0.16, `triggers`;
+    /// "RAISE() may only be used within a trigger-program").
+    #[cfg(feature = "triggers")]
+    RaiseOutsideTrigger,
+    /// A trigger program ran `RAISE(ROLLBACK, msg)` (v0.16,
+    /// `triggers`): the statement failed and the transaction was
+    /// rolled back. The message is `Connection::raise_message`.
+    #[cfg(feature = "triggers")]
+    RaiseRollback,
+    /// A trigger program ran `RAISE(ABORT, msg)` (v0.16,
+    /// `triggers`): the statement failed and was rolled back.
+    #[cfg(feature = "triggers")]
+    RaiseAbort,
+    /// A trigger program ran `RAISE(FAIL, msg)` (v0.16,
+    /// `triggers`): the statement failed, keeping its changes so
+    /// far.
+    #[cfg(feature = "triggers")]
+    RaiseFail,
+    /// `RAISE(IGNORE)` reached the statement that fired the
+    /// trigger (v0.16, `triggers`). Never returned to a caller: the
+    /// statement skips the row and goes on.
+    #[cfg(feature = "triggers")]
+    RaiseIgnore,
+    /// Trigger programs nested deeper than
+    /// `Config::max_trigger_depth` (v0.16, `triggers`; the pin's
+    /// "triggers nested too deep" past 1000 levels).
+    /// Bound the recursion with a WHEN clause, or raise the limit
+    /// on a thread with the stack for it. (Foreign-key action
+    /// programs count too, `foreign_keys`.)
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+    TriggerDepth,
+    /// An upsert into a view (v0.16, `triggers`; "cannot UPSERT a
+    /// view"). Drop the ON CONFLICT clause.
+    #[cfg(feature = "triggers")]
+    UpsertView,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -359,8 +551,40 @@ pub enum ParseKind {
     InvalidLiteral,
     UnsupportedStatement,
     UnsupportedClause,
+    /// The statement nests deeper than the parser's stack limit
+    /// (the pin's "Recursion limit": 2500 grammar symbols, about
+    /// 2490 nested parentheses; `Config::max_parser_depth`), or a
+    /// CREATE TABLE item nests parentheses past it. Flatten the
+    /// nesting, or raise the limit with the thread's stack.
     RecursionLimit,
     TrailingInput,
+    /// An expression tree deeper than the expression depth limit
+    /// (v0.16; the pin's "Expression tree is too large (maximum
+    /// depth 1000)", `SQLITE_LIMIT_EXPR_DEPTH`;
+    /// `Config::max_expr_depth`), counted as the pin counts it —
+    /// including the sum of the heights of the expressions a
+    /// nested subquery sits in. Split the expression, or raise the
+    /// limit with the thread's stack.
+    ExprTooDeep,
+    /// A statement longer than 1,000,000,000 bytes (v0.16; the
+    /// pin's `SQLITE_LIMIT_SQL_LENGTH`, "statement too long").
+    StatementTooLong,
+    /// More columns than the pin's `SQLITE_MAX_COLUMN` (2000) in a
+    /// CREATE TABLE ("too many columns on t"), an index ("too many
+    /// columns in index"), a result list or VALUES row ("too many
+    /// columns in result set") or an UPDATE SET list ("too many
+    /// columns in set list") (v0.16). Split the table or the
+    /// statement.
+    TooManyColumns,
+    /// An ORDER BY or GROUP BY of more than 2000 terms (v0.16; the
+    /// pin's "too many terms in ORDER BY clause").
+    TooManyTerms,
+    /// A function call with more than 1000 arguments (v0.16; the
+    /// pin's "too many arguments on function f").
+    TooManyArguments,
+    /// A compound SELECT of more than 500 SELECTs (v0.16; the pin's
+    /// "too many terms in compound SELECT").
+    TooManyCompoundTerms,
     /// A join operator whose keywords do not form a join type
     /// (v0.16): `OUTER JOIN` alone, `INNER OUTER JOIN`, `LEFT
     /// CROSS JOIN`, more than three keywords — the pin's
@@ -393,6 +617,13 @@ pub enum ParseKind {
     /// the pin's "hex literal too big"). Write a shorter
     /// literal, or a decimal one.
     HexLiteralTooBig,
+    /// A window frame whose start comes after its end in the
+    /// pin's bound order — `CURRENT ROW` to `<expr> PRECEDING`,
+    /// or `<expr> FOLLOWING` to `PRECEDING` / `CURRENT ROW`
+    /// (v0.16, `window`; the pin's "unsupported frame
+    /// specification"). Put the earlier bound first.
+    #[cfg(feature = "window")]
+    UnsupportedFrame,
 }
 
 /// The core error type. Generic over the storage error `E`.

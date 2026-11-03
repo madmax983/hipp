@@ -5,6 +5,8 @@ pub mod ast;
 pub mod bind;
 pub mod lexer;
 pub mod parser;
+#[cfg(feature = "triggers")]
+pub mod trig;
 
 pub use ast::{
     Ast, BinOp, ColumnDef, CompoundOp, ConflictAction, ConstraintSet, Expr, FromSource,

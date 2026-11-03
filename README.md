@@ -299,9 +299,11 @@ aspirations.
   `auto_vacuum`); what hipp actually does (`journal_mode` is
   `delete`, `synchronous` FULL, `cache_size` its page pool,
   `busy_timeout`) — any write hipp cannot honour is refused, never
-  pretended; the flags `foreign_keys` (while on, writes to tables
-  in a foreign key are refused: hipp does not enforce them),
-  `recursive_triggers`, `ignore_check_constraints` (really skips
+  pretended; the flags `foreign_keys` (enforced with the
+  `foreign_keys` leaf; without it, while on, writes to tables in a
+  foreign key are refused),
+  `recursive_triggers` (honoured with `triggers`),
+  `ignore_check_constraints` (really skips
   CHECK) and `case_sensitive_like` (really changes LIKE);
   `table_info`, `table_xinfo` (the pin's dequoted declared
   types, hidden generated columns, view column types),
@@ -443,8 +445,117 @@ aspirations.
   Gaps: a statement naming a temp table and a main object
   (`INSERT INTO temp_t SELECT ... FROM main_t`, a join of both)
   is refused, as is ALTER TABLE of a main table a TEMP view reads;
-  files with triggers cannot be altered; re-created tables can get
+  files with triggers cannot be altered without the `triggers`
+  feature (with it, their texts are rewritten as the pin's);
+  re-created tables can get
   other root page numbers than on the pin (STATUS.md).
+- **Parser and evaluator depth limits (crash hardening).**
+  Ungated: within its limits no statement or stored schema text
+  overflows the stack (100 000 nested parentheses, signs, calls or
+  subqueries used to; in the tiny profile a long run of signs in
+  `INSERT ... VALUES` did). hipp counts what the pin counts — the
+  expression tree's height (`SQLITE_LIMIT_EXPR_DEPTH` 1000, with
+  the heights of the expressions a subquery sits in added during
+  resolution: 43 nested scalar subqueries read, 44 do not; a view
+  or CTE body counts where it is read, so a chain of views each
+  reading the last in a subquery adds up) and its LALR parser
+  stack (2500 symbols: 2493 nested parentheses, 831 nested calls,
+  414 nested FROM subqueries) — and refuses past them as the pin
+  does ("Expression tree is too large", "Recursion limit"), at the
+  pin's exact boundary in every probed context.
+  `Config::max_expr_depth` / `max_parser_depth` bound the stack one
+  statement's text needs (`Config::stack_budget(bytes)` derives
+  them from a thread's stack; the defaults, 1000 and 500, fit a 2
+  MiB thread in a release build); view and CTE bodies read inside
+  one another add up to `Config::max_nesting` levels on top
+  (default 250: an 8 MiB thread in release, about 32 MiB in a
+  debug build). The CLI runs the pin's limits. The hot recursive
+  walkers (parser, resolver, evaluator, FROM planner) were split
+  so each nesting level costs a few hundred bytes in release. Also
+  matched: 500 compound SELECTs (unless the last is a one-row
+  VALUES), 1000 call arguments, 2000 columns in a table, index,
+  result set (after `*`, RETURNING too), multi-row VALUES or
+  UPDATE SET list, 2000 ORDER BY / GROUP BY terms (result sets and
+  terms only where the pin resolves the select: not in an unused
+  CTE or a CREATE VIEW body), 64 joined tables, the statement
+  length. Ungated wrong-answer fixes: `ORDER BY 2 NOTNULL`,
+  `-(-2)`, `+(2)` are ordinals as on the pin and `ORDER BY TRUE`
+  is not; a schema row too large for page 1 next to the file
+  header no longer panics (page 1 now splits as the pin's does).
+  Tiny +252 B (STATUS.md).
+- **Window functions** (new leaf feature `window`, in `max` —
+  ADR 0002 — not `full`). `f(...) [FILTER (WHERE ...)] OVER
+  (PARTITION BY ... ORDER BY ... frame)`, `OVER name` and the
+  WINDOW clause with the pin's inheritance rules and refusals;
+  ROWS / RANGE / GROUPS frames with every bound and EXCLUDE
+  clause, RANGE offsets over mixed storage classes; row_number,
+  rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead,
+  first_value, last_value, nth_value and every aggregate (the
+  percentile family included) as window functions. The frame
+  engine transcribes the pin's generated program (checked against
+  its `EXPLAIN`), so sliding REAL sums round as they do there and
+  rows come out in the pin's order (nested window classes, each
+  sorting stably). Window calls in WHERE / GROUP BY / HAVING,
+  inside aggregates, in write statements and in a trigger's WHEN
+  are the pin's misuse; in a DEFAULT "not constant"; in a recursive
+  CTE's recursive SELECT refused. ORDER BY terms naming window
+  columns, compound ORDER BYs and GROUP BY feed the windows the
+  pin's way, so tie-dependent values match. Max +45.2 KB; tiny and
+  full unchanged (STATUS.md).
+
+- **Triggers** (new leaf feature `triggers`, in `max` — ADR
+  0002 — not `full`). CREATE [TEMP] TRIGGER (BEFORE / AFTER /
+  INSTEAD OF, INSERT / DELETE / UPDATE [OF], WHEN) stored with the
+  pin's text, DROP TRIGGER; bodies of INSERT / UPDATE / DELETE /
+  SELECT with NEW. / OLD. (the pin's affinity and collation rules),
+  RAISE(IGNORE / ROLLBACK / ABORT / FAIL) with the pin's
+  resolution, conflict-clause override, recursive_triggers, a
+  trigger depth limit (`Config::max_trigger_depth`: 24 by default,
+  sized for a 2 MiB thread; the CLI sets the pin's 1000 programs),
+  changes() / last_insert_rowid() frames,
+  REPLACE and upsert interplay, and INSTEAD OF triggers that make
+  views writable. ALTER TABLE rewrites trigger texts as the pin
+  does (its `excluded.` quirk included). Pin-made files with
+  triggers are read and written with their triggers firing; a
+  build without the feature refuses writes to a triggered table
+  (ungated, every profile — they used to skip the trigger
+  silently). TEMP triggers on main tables are refused. Tiny +196 B,
+  full +528 B (the ungated refusals), max +33.9 KB (STATUS.md).
+  Review fixes: BEFORE UPDATE computes NEW's generated columns over
+  the pin's new-column mask; a RAISE part-way through a body's
+  streaming INSERT ... SELECT / DELETE / UPDATE keeps the rows
+  before it; the whole trigger nest is checked at prepare; a depth
+  failure in a transaction keeps the rows when no program can
+  abort (the pin's missing statement journal); INSTEAD OF view
+  writes take RETURNING and a rowid assignment; RETURNING
+  subqueries are computed once unless they read the written table
+  directly. Ungated with them: `0 AND x` / `x OR 1` short-circuit
+  only over a lone 32-bit integer token (`-1 OR x` evaluates `x`),
+  REPLACE deletes its victims in the pin's index order, and
+  `RETURNING t.*` is refused as on the pin. Full +688 B, max +8.8 KB.
+- **Foreign-key enforcement** (new leaf feature `foreign_keys`, in
+  `max` — ADR 0002 — not `full`). With `PRAGMA foreign_keys = ON`
+  writes are checked as the pin checks them — with its violation
+  *counters*: immediate keys fail the statement at its end (even
+  under OR FAIL / IGNORE), `DEFERRABLE INITIALLY DEFERRED` keys and
+  `PRAGMA defer_foreign_keys` fail COMMIT / a committing RELEASE
+  with the transaction left open, savepoints restore the counts,
+  and a multi-row statement may fix its own violations (an orphan
+  left with the pragma off can cancel one, the pin's quirk; a
+  counter driven below zero fails as one above it). ON
+  DELETE / ON UPDATE CASCADE, SET NULL, SET DEFAULT, RESTRICT and NO
+  ACTION run as the pin's action programs (under ABORT, own
+  `changes()` frames, the trigger depth limit, firing the child's
+  triggers); composite and self-referencing keys with the pin's
+  three comparison rules; "foreign key mismatch" / "no such table"
+  when the write is prepared, over the whole cascade tree; REPLACE,
+  upsert, RETURNING, INSTEAD OF trigger bodies, DROP TABLE's
+  implicit DELETE and the pin's `isSetNullAction` quirk (replayed
+  over its whole compile order); `PRAGMA foreign_key_check [t]` and
+  `defer_foreign_keys`. Without the leaf the refusal stays.
+  Tiny unchanged, full +800 B (the ungated deferrable /
+  ADD COLUMN REFERENCES fixes), max +33.8 KB with the review fixes
+  (STATUS.md).
 
 ## What v0.13 does
 
@@ -773,13 +884,16 @@ A workspace: the zero-dependency core crate at the root plus
 (lexer, parser, AST, parameter binding), `query` (resolved-expression evaluator,
 v0.4), `agg` (aggregate folding: the pin's sum / percentile
 rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
-the v0.16 scalar function library),
+the v0.16 scalar function library), `window` (window functions:
+the pin's frame engine, feature `window`, v0.16),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor;
 `session/pragma` the PRAGMA statements and integrity check,
 `session/cte` view / CTE expansion and the recursive queue,
-`session/maint` savepoints, VACUUM, REINDEX and ANALYZE, v0.16),
+`session/maint` savepoints, VACUUM, REINDEX and ANALYZE,
+`session/trigger` trigger programs, v0.16; `sql/trig` the NEW. /
+OLD. binder),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

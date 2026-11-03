@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full"]
+max = ["full", "window", "triggers", "foreign_keys"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -139,6 +139,50 @@ params = []
 # rounded). Needs only the v0.4 expression evaluator. The tiny
 # profile excludes it per §2.
 math = ["v04"]
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): window functions -- `f(...) OVER (PARTITION BY ...
+# ORDER BY ... frame)`, named windows (`WINDOW w AS (...)`, `OVER
+# w`, `OVER (w ...)`), ROWS / RANGE / GROUPS frames with EXCLUDE,
+# the built-in window functions (row_number, rank, dense_rank,
+# percent_rank, cume_dist, ntile, lag, lead, first_value,
+# last_value, nth_value) and every aggregate as a window function,
+# with the pin's frame engine (its step / inverse order, so REAL
+# sums round as they do there). Builds on the v0.16 aggregate
+# completion (FILTER, string_agg, the percentile family), so it
+# implies `v16`. The tiny profile excludes it per §2.
+window = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): triggers -- CREATE [TEMP] TRIGGER [IF NOT EXISTS] ...
+# BEFORE | AFTER | INSTEAD OF INSERT | DELETE | UPDATE [OF cols]
+# ON table [FOR EACH ROW] [WHEN expr] BEGIN ...; END and DROP
+# TRIGGER, stored with the pin's text; bodies of INSERT / UPDATE /
+# DELETE / SELECT with NEW. / OLD. references and RAISE(), fired
+# in the pin's order with its recursion rules (PRAGMA
+# recursive_triggers, the depth limit), conflict-clause override,
+# changes() / last_insert_rowid() frames, REPLACE deletes and
+# INSTEAD OF triggers that make views writable; ALTER TABLE
+# rewrites trigger texts as the pin does. Builds on the v0.16
+# statement machinery (statement rollback, TEMP, ALTER), so it
+# implies `v16`. Without it a file's triggers are never skipped
+# silently: writes to a table that has one are refused. The tiny
+# profile excludes it per §2.
+triggers = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): foreign-key enforcement while `PRAGMA foreign_keys` is
+# ON -- the pin's per-statement and deferred violation counters
+# (DEFERRABLE INITIALLY DEFERRED keys checked at COMMIT / RELEASE,
+# PRAGMA defer_foreign_keys), ON DELETE / ON UPDATE CASCADE, SET
+# NULL, SET DEFAULT, RESTRICT and NO ACTION run as the pin's action
+# programs (firing the child's triggers when `triggers` is built
+# too), composite and self-referencing keys, "foreign key mismatch",
+# DROP TABLE's implicit DELETE, and PRAGMA foreign_key_check.
+# Parent keys are found through their PRIMARY KEY / UNIQUE index,
+# so it implies `indexes`; it builds on the v0.16 statement
+# machinery (statement rollback, savepoints), so it implies `v16`.
+# Without it a write to a table in a foreign key is refused while
+# the pragma is ON (never skipped silently). The tiny profile
+# excludes it per §2.
+foreign_keys = ["v16", "indexes"]
 
 [dependencies]
 

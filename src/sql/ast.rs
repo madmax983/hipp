@@ -83,8 +83,9 @@ pub struct ColumnDef {
 }
 
 /// One FOREIGN KEY / REFERENCES clause of a `CREATE TABLE`
-/// (v0.16, `v16`): parsed, never enforced; `PRAGMA
-/// foreign_key_list` reports it. Actions are the pin's codes:
+/// (v0.16, `v16`): `PRAGMA foreign_key_list` reports it, and the
+/// `foreign_keys` leaf enforces it while `PRAGMA foreign_keys` is
+/// ON. Actions are the pin's codes:
 /// 0 NO ACTION, 1 RESTRICT, 2 SET NULL, 3 SET DEFAULT, 4 CASCADE.
 #[cfg(feature = "v16")]
 #[derive(Debug, Clone)]
@@ -98,6 +99,11 @@ pub struct ForeignKey {
     pub to: AVec<ABytes>,
     pub on_update: u8,
     pub on_delete: u8,
+    /// `DEFERRABLE INITIALLY DEFERRED` (the pin's `isDeferred`): a
+    /// violation is counted against the transaction and checked at
+    /// COMMIT. A column-level deferrable clause applies to the
+    /// table's most recent foreign key, as on the pin.
+    pub deferred: bool,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -259,6 +265,92 @@ pub enum Expr {
     /// any expression when `n` is 1; the planner checks the size.
     #[cfg(feature = "v16")]
     RowItem(Box<Expr>, u16, u16),
+    /// `RAISE(IGNORE)` / `RAISE(ROLLBACK | ABORT | FAIL, msg)`
+    /// (v0.16, `triggers`), and whether it was parsed inside a
+    /// trigger program: elsewhere it parses (a CHECK constraint may
+    /// hold one, as on the pin) but does not resolve — the pin's
+    /// "RAISE() may only be used within a trigger-program".
+    /// Evaluating it ends the trigger program; the message is any
+    /// expression, read as text.
+    #[cfg(feature = "triggers")]
+    Raise(RaiseKind, Option<Box<Expr>>, bool),
+    /// A `NEW.col` / `OLD.col` reference of a trigger program,
+    /// replaced by the firing row's value (v0.16, `triggers`; see
+    /// `sql::trig`): the value, the comparison affinity it carries
+    /// (the pin's: none for a column, INTEGER for the rowid) and its
+    /// collating sequence (the column's; none for the rowid). Never
+    /// produced by the parser.
+    /// Also the `OLD.` / `NEW.` values of a foreign-key action
+    /// program (`foreign_keys`).
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+    TrigValue(Literal, Option<crate::record::Affinity>, Option<Coll>),
+}
+
+/// What `RAISE(...)` does (v0.16, `triggers`), as on the pin:
+/// `Ignore` abandons the trigger program and the row change that
+/// fired it (the statement goes on with its next row); `Rollback`
+/// fails the statement and rolls back the transaction; `Abort`
+/// fails and rolls back the statement; `Fail` fails the statement
+/// keeping what it changed so far.
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseKind {
+    Ignore,
+    Rollback,
+    Abort,
+    Fail,
+}
+
+/// When a trigger fires (v0.16, `triggers`).
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrigTime {
+    Before,
+    After,
+    /// `INSTEAD OF` (views only).
+    Instead,
+}
+
+/// The row change a trigger fires on (v0.16, `triggers`).
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrigEvent {
+    Insert,
+    Delete,
+    Update,
+}
+
+/// A parsed `CREATE TRIGGER` (v0.16, `triggers`). The WHEN clause
+/// and the body statements are kept as byte spans of the statement
+/// text: a trigger program is parsed again (and planned) each time
+/// it fires, with its `NEW.` / `OLD.` references bound to the row.
+#[cfg(feature = "triggers")]
+#[derive(Debug, Clone)]
+pub struct CreateTrigger {
+    /// The trigger's name (a `main.` / `temp.` qualifier dropped).
+    pub name: ABytes,
+    pub if_not_exists: bool,
+    /// The name was written with a schema qualifier.
+    pub qualified: bool,
+    pub time: TrigTime,
+    pub event: TrigEvent,
+    /// `UPDATE OF col, ...`: empty for any UPDATE.
+    pub of_cols: AVec<ABytes>,
+    /// The table (or view) after `ON`, as written.
+    pub table: ABytes,
+    /// Whether the table was written `temp.` qualified (and,
+    /// with `table_main`, `main.` qualified).
+    pub table_temp: bool,
+    pub table_main: bool,
+    /// The WHEN expression's text span (start, end).
+    pub when: Option<(usize, usize)>,
+    /// Each body statement's text span, without its `;`.
+    pub steps: AVec<(usize, usize)>,
+    /// Byte offset of the trigger's name token: the stored text is
+    /// `CREATE TRIGGER ` followed by the statement from here.
+    pub name_at: usize,
+    /// One past the closing `END`.
+    pub end: usize,
 }
 
 /// One SELECT result item (v0.4).
@@ -313,6 +405,165 @@ impl JoinKind {
 pub struct FuncClause {
     pub order_by: AVec<(Expr, SortOrder)>,
     pub filter: Option<Expr>,
+    /// The call's `OVER` clause (v0.16, `window`): the call is a
+    /// window function. `None` when none was written.
+    #[cfg(feature = "window")]
+    pub over: Option<Over>,
+}
+
+/// A call's `OVER` clause (v0.16, `window`).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub enum Over {
+    /// `OVER name`: the named window exactly as defined (its
+    /// frame included).
+    Named(ABytes),
+    /// `OVER (...)`: a window definition, possibly naming a base
+    /// window to inherit from.
+    Spec(Box<WindowDef>),
+}
+
+/// A window definition (v0.16, `window`): `[base] [PARTITION BY
+/// ...] [ORDER BY ...] [frame]`, as written in an `OVER (...)` or
+/// a `WINDOW name AS (...)` clause. The parser has already copied
+/// a `WINDOW` definition's base into it (the pin's
+/// `sqlite3WindowChain`); an `OVER (base ...)`'s base is resolved
+/// by the planner against the select's `WINDOW` list.
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub struct WindowDef {
+    /// The base window named first inside the parentheses.
+    pub base: Option<ABytes>,
+    pub partition: AVec<Expr>,
+    pub order_by: AVec<(Expr, SortOrder)>,
+    /// The frame; `None` when none was written (the pin's
+    /// implicit `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+    /// ROW`, which a derived window may still override).
+    pub frame: Option<Frame>,
+}
+
+/// Inherit a window definition's base (v0.16, `window`; the pin's
+/// `sqlite3WindowChain`): `w`'s base names the latest definition
+/// of that name in `list`; `w` takes its PARTITION BY and, when
+/// it has one, its ORDER BY. The pin refuses (`WindowOverride`) a
+/// `w` that restates the PARTITION BY, that has an ORDER BY when
+/// the base does, or whose base has an explicit frame.
+#[cfg(feature = "window")]
+pub fn chain_window(
+    w: &mut WindowDef,
+    list: &[(ABytes, WindowDef)],
+    arena: &crate::arena::Arena,
+) -> Result<(), crate::error::SchemaKind> {
+    use crate::error::SchemaKind;
+    let Some(base) = w.base else {
+        return Ok(());
+    };
+    let name = crate::sql::handle_bytes(arena, base);
+    let Some((_, b)) = list
+        .iter()
+        .rev()
+        .find(|(n, _)| crate::sql::eq_ci(crate::sql::handle_bytes(arena, *n), name))
+    else {
+        return Err(SchemaKind::NoSuchWindow);
+    };
+    if !w.partition.is_empty()
+        || (!b.order_by.is_empty() && !w.order_by.is_empty())
+        || b.frame.is_some()
+    {
+        return Err(SchemaKind::WindowOverride);
+    }
+    w.partition = b.partition.clone();
+    if !b.order_by.is_empty() {
+        w.order_by = b.order_by.clone();
+    }
+    w.base = None;
+    Ok(())
+}
+
+#[cfg(feature = "window")]
+impl WindowDef {
+    /// Every expression of the definition: PARTITION BY, ORDER BY,
+    /// then the frame offsets.
+    pub fn exprs_mut(&mut self, f: &mut dyn FnMut(&mut Expr)) {
+        for p in self.partition.as_mut_slice() {
+            f(p);
+        }
+        for (o, _) in self.order_by.as_mut_slice() {
+            f(o);
+        }
+        if let Some(fr) = &mut self.frame {
+            for b in [&mut fr.start, &mut fr.end] {
+                if let FrameBound::Preceding(e) | FrameBound::Following(e) = b {
+                    f(e);
+                }
+            }
+        }
+    }
+
+    /// `exprs_mut`, read-only.
+    pub fn exprs(&self, f: &mut dyn FnMut(&Expr)) {
+        for p in self.partition.iter() {
+            f(p);
+        }
+        for (o, _) in self.order_by.iter() {
+            f(o);
+        }
+        if let Some(fr) = &self.frame {
+            for b in [&fr.start, &fr.end] {
+                if let FrameBound::Preceding(e) | FrameBound::Following(e) = b {
+                    f(e);
+                }
+            }
+        }
+    }
+}
+
+/// A window frame (v0.16, `window`).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub unit: FrameUnit,
+    pub start: FrameBound,
+    pub end: FrameBound,
+    pub exclude: FrameExclude,
+}
+
+/// `ROWS`, `RANGE` or `GROUPS` (v0.16, `window`).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnit {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// One frame boundary (v0.16, `window`). An offset that is not a
+/// constant expression is NULL, as the pin's
+/// `sqlite3WindowOffsetExpr` makes it (so it fails with the
+/// pin's "frame ... offset must be a non-negative ..." error
+/// when a partition is read).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+/// A frame's `EXCLUDE` clause (v0.16, `window`). `NoOthers` is
+/// kept apart from no clause at all: on the pin it selects the
+/// full-scan frame engine (and makes the window compare unequal
+/// to one without the clause).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameExclude {
+    None,
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 /// The direction of one ORDER BY term (v0.16 adds NULL
@@ -511,6 +762,24 @@ pub struct SelectStmt {
     /// other.
     #[cfg(feature = "v16")]
     pub with: Option<Box<With>>,
+    /// The pin's name-resolution depth around this select (v0.16
+    /// depth limits, `v16`): the height of the expression of the
+    /// enclosing select it is resolved inside (`Parse.nHeight`
+    /// grows by that much on the way in); 0 for a statement, a FROM
+    /// subquery, a CTE or a view body. Set by the parser.
+    #[cfg(feature = "v16")]
+    pub rctx: u32,
+    /// The deepest sum of nested expression heights that resolving
+    /// this select on its own reaches (the parser's `sel_r`; v0.16,
+    /// `v16`). A view or CTE body is resolved where it is read, so
+    /// the expansion checks the reference's depth plus this.
+    #[cfg(feature = "v16")]
+    pub rdepth: u32,
+    /// The core's `WINDOW name AS (...)` definitions (v0.16,
+    /// `window`), in source order; a later definition of a name
+    /// shadows an earlier one, as on the pin.
+    #[cfg(feature = "window")]
+    pub windows: AVec<(ABytes, WindowDef)>,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
@@ -815,5 +1084,15 @@ pub enum Ast {
         /// The argument was a number token (the pin treats
         /// `integrity_check(5)` as a limit, `('5')` as a name).
         numeric: bool,
+    },
+    /// `CREATE TRIGGER` (v0.16, `triggers`).
+    #[cfg(feature = "triggers")]
+    CreateTrigger(Box<CreateTrigger>),
+    /// `DROP TRIGGER [IF EXISTS] [schema .] name` (v0.16,
+    /// `triggers`).
+    #[cfg(feature = "triggers")]
+    DropTrigger {
+        name: ABytes,
+        if_exists: bool,
     },
 }

@@ -750,7 +750,7 @@ pub async fn btree_insert<S: Storage>(
     let mut path: AVec<(u32, usize)> = AVec::new();
     let mut is_rightmost = true;
     let mut page = root;
-    let (leaf_page, leaf_cells, insert_pos) = loop {
+    let (mut leaf_page, leaf_cells, insert_pos) = loop {
         let idx = pager.load(page).await?;
         let snap = copy_bytes(pager.frame_data(idx));
         let h = head::<S::Error>(snap.as_slice(), page)?;
@@ -825,7 +825,25 @@ pub async fn btree_insert<S: Storage>(
         all.push(new_cell);
     }
 
-    let hdr_off = if leaf_page == 1 { 100 } else { 0 };
+    let mut hdr_off = if leaf_page == 1 { 100 } else { 0 };
+    if hdr_off != 0 && leaf_need(all.as_slice(), hdr_off) > usable {
+        // Page 1 as the root leaf overflows (v0.16 fix): as the
+        // pin's `balance_deeper`, page 1 becomes an interior page
+        // with no cells over one fresh child, which then takes the
+        // cells — or is balanced as any leaf under page 1 is (never
+        // by the quick split below). The quick split used to take
+        // the last cell of an empty page 1 (a subtract-with-overflow
+        // panic on a first CREATE TABLE whose schema text is about
+        // 3950 bytes).
+        let (cp, _) = pager.alloc_page().await?;
+        let idx = pager.dirty_page(1).await?;
+        let base = copy_bytes(pager.frame_data(idx));
+        let img = build_interior_image(1, page_size, &[], cp, base.as_slice());
+        pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
+        path.push((1, 0));
+        leaf_page = cp;
+        hdr_off = 0;
+    }
     if leaf_need(all.as_slice(), hdr_off) <= usable {
         let idx = pager.dirty_page(leaf_page).await?;
         let base = copy_bytes(pager.frame_data(idx));
@@ -835,7 +853,7 @@ pub async fn btree_insert<S: Storage>(
     }
 
     // ---- the leaf overflows: balance (v0.15) ----
-    if is_rightmost && insert_pos == leaf_cells.len() {
+    if is_rightmost && insert_pos == leaf_cells.len() && (root != 1 || path.len() > 1) {
         // Append into the tree's rightmost leaf: the pin's quick
         // split — the old leaf is left untouched and the new cell
         // goes alone onto a fresh page (probed, see the v0.15

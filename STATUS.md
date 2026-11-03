@@ -1978,7 +1978,8 @@ both (the misuse refusal, the HAVING `random()` overflow).
 
 **Honest gaps:**
 
-- Window functions (`OVER`) are not implemented (another leaf);
+- Window functions (`OVER`) are not implemented (another leaf;
+  since shipped as the `window` leaf — see "Window functions");
   `sum(a) OVER ()` and an aggregate with FILTER / ORDER BY plus
   OVER stay refused.
 - The DISTINCT-equals-ORDER-BY test compares columns, literals,
@@ -3547,6 +3548,1225 @@ COLUMN cut and the catalog guard.
 - hipp-cli `.tables` prints one name per line (the oracle shell
   columnates); `.dump` still differs from the shell's around
   `PRAGMA foreign_keys` / `writable_schema` and `sqlite_stat1`.
+
+### Parser and evaluator depth limits (2026-11-03)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, **ungated** (a crash fix on claimed paths, and the
+limits are where the pin refuses). Before it, the parser, the
+resolver, the planner, the evaluator and the tree's Clone / Drop
+recursed once per nesting level with no bound: 100 000 nested
+parentheses, signs, NOTs, calls, CASEs or subqueries in one
+statement (or in a stored CHECK / view text) overflowed the stack,
+and so did a long run of signs in the tiny profile's `INSERT ...
+VALUES (- - ... 1)` (`literal_at` recursed per sign).
+
+**Oracle-probing notes** (the pin's build: `MAX_EXPR_DEPTH=1000`,
+`MAX_FUNCTION_ARG=1000`, `MAX_COLUMN=2000`,
+`MAX_COMPOUND_SELECT=500`, `MAX_VARIABLE_NUMBER=32766`,
+`MAX_LIKE_PATTERN_LENGTH=50000`, `MAX_SQL_LENGTH=1000000000`;
+every boundary below was found by bisection on the pin):
+
+- *Expression height* ("Expression tree is too large (maximum
+  depth 1000)") is the pin's `Expr.nHeight`, checked as each node
+  is made: a leaf is 1 (`t.a` is 2, a DOT node); a node is one more
+  than its tallest operand; parentheses add nothing; `+` over a `+`
+  node re-uses it and `-` over one turns it into a `-` node (so
+  2494 `+` signs parse, 999 `-` do); a row value is a node of height
+  1 whatever its elements; `x ISNULL` / NOTNULL / `IS [NOT] NULL` /
+  `NOT NULL` over a numeric, string or blob literal (under any
+  signs) folds to the integer 0 / 1 (`1 ISNULL ISNULL ...` never
+  grows); `x IN ()` folds to a literal; `x IN (c)` with one
+  constant item and no COLLATE is `x = +c` (one node more), with
+  one scalar-subquery item it is `x IN (SELECT ...)`; NOT LIKE /
+  BETWEEN / IN / GLOB add a NOT node; a call is one more than its
+  tallest argument (FILTER, aggregate ORDER BY and OVER count
+  nothing); a subquery node is one more than its select's tallest
+  result column, WHERE, HAVING, GROUP BY, ORDER BY or LIMIT node
+  (LIMIT and OFFSET are one node) over all compound members.
+- *Resolution adds heights*: the pin's `sqlite3ResolveExprNames`
+  adds each resolved expression's height to `Parse.nHeight`, so a
+  subquery's expressions count with the heights of every
+  expression enclosing it: 43 nested scalar subqueries (sum of
+  heights 990) read, 44 do not; 41 nested `x IN (SELECT ...)`. FROM
+  subqueries and CTE bodies are resolved in their select's context,
+  not inside its expressions (`(SELECT 1 FROM (SELECT - - - - 1))`
+  counts 2 + 5). ON / USING terms are ANDed into the WHERE before
+  resolution (`sqlite3ProcessJoin`; `ON <5> WHERE 1` resolves a
+  height-6 tree). ORDER BY / GROUP BY ordinals are not resolved.
+  A CREATE VIEW body is not resolved until the view is read (the pin
+  creates a view no query can read).
+- *Compound sorter*: a member of UNION / EXCEPT / INTERSECT, or of
+  any compound with an ORDER BY, gets one node over each result
+  column (a COLLATE the pin adds), so its columns stop at 999;
+  UNION ALL alone adds none.
+- *Parser stack* ("Recursion limit"): the pin's LALR stack holds
+  2500 symbols, counted from the bottom entry: `SELECT (((1)))`
+  holds `SELECT distinct sclp scanpt` then one `(` per level (2493
+  levels), a call `idj LP distinct` per level (831), CASE `CASE
+  case_operand WHEN expr THEN` (498), a FROM subquery `SELECT
+  distinct selcollist FROM stl_prefix LP` (414), a core's end
+  `SELECT distinct selcollist from where_opt groupby_opt having_opt
+  orderby_opt limit_opt`. The bases of about 90 contexts were probed
+  and modelled (`INSERT VALUES` 8 / 10 / 9 / 11 by position, `UPDATE SET`
+  9, `WHERE` of UPDATE 10, of DELETE 7, `CREATE VIEW` 9 + the
+  select's, `ON` 10, `LIMIT` 10, `OFFSET` 12, CTE bodies 6 / 8 (+1
+  RECURSIVE), compound members 2 up, RETURNING, upsert, ...).
+- *Counts*: "too many terms in compound SELECT" past 500 SELECTs
+  (multi-row VALUES is one), "too many arguments on function f" past
+  1000, "too many columns on t" / "in index" / "in result set"
+  (after `*`) / "in set list" past 2000 (ALTER TABLE ADD COLUMN
+  too), "too many terms in ORDER BY clause" / "GROUP BY" past 2000,
+  "at most 64 tables in a join". The existing bound-parameter and
+  LIKE / GLOB pattern limits were confirmed.
+- *Found while probing* (ungated fix): `ORDER BY 2 NOTNULL` is the
+  ordinal 1 on the pin, `ORDER BY 1 ISNULL` / `GROUP BY 1 ISNULL`
+  the out-of-range ordinal 0 — the null-test fold makes an integer
+  literal; hipp sorted and grouped by a constant.
+- *Probed for the review fixes:* a view or CTE body is resolved
+  where it is read, inside the reader's expressions, so the sums
+  add up along a chain: views `v_i AS SELECT <m signs>(SELECT a
+  FROM v_{i-1})` read at m = 998 / 498 / 331 / 198 for 1 / 2 / 3 / 5
+  views, CTEs at 997 / 497 / 331 / 197 (likewise through IN, ON,
+  LIMIT and EXISTS readers). A view is one more permissive because
+  the pin keeps its tree reduced (`EXPRDUP_REDUCE`: a leaf loses its
+  height), so a lone leaf it resolves (`SELECT a`, the `1` of
+  `(SELECT 1)`) adds 0 there. An unused CTE is never resolved (its
+  2001 result columns, 2001 ORDER BY terms or 44 nested subqueries
+  pass), nor is a CREATE VIEW body until read; "too many columns
+  in result set" covers RETURNING (after `*`) and a multi-row VALUES,
+  not an INSERT's column list or one-row VALUES, and an upsert's
+  SET takes any number of terms. A compound past 500 SELECTs is
+  accepted when its last member is a one-row VALUES (600 SELECTs
+  then `VALUES(1)` read, `VALUES(1),(2)` do not).
+  `sqlite3ExprIsInteger` looks through COLLATE, unary `+` / `-`
+  and parentheses (`ORDER BY -(-2)` is the ordinal 2, `-(2)` out of
+  range) but not TRUE / FALSE. `DEFAULT (<signs> 1)` takes the
+  pin's two limits at 7 symbols for the first column and 9 for a
+  later one or ADD COLUMN (`+`: 2492 / 2490; `-`: 999). A first
+  CREATE TABLE whose schema row no longer fits page 1 makes page 1
+  an interior page with no cells over one child (`balance_deeper`),
+  and a leaf under page 1 is never quick-split (`balance_nonroot`).
+
+**Shipped (ungated):** `sql::parser::Limits` (`Config::limits`,
+`Config::max_expr_depth`, `Config::max_parser_depth`,
+`Config::depth_limits`, `Config::stack_budget`;
+`ParseKind::{ExprTooDeep, StatementTooLong, TooManyColumns,
+TooManyTerms, TooManyArguments, TooManyCompoundTerms}`,
+`SchemaKind::{TooManyColumns, TooManyTables}`). The parser carries
+the pin's two counts as it reads: `held` (the LALR symbols below
+the construct, checked on the way down so no recursion outruns it)
+and `eh` / `ek` (the height and kind of the expression just
+parsed), with the resolution sum carried up per select (`rsub`,
+`sel_r`) and the ON chain folded (`OnChain`). Every parse site
+takes the connection's limits: statements, stored schema texts at
+catalog load, view bodies at expansion (`parse_view`: the body's
+resolution depth is checked when it is read, not at CREATE VIEW),
+CHECK / DEFAULT / generated re-parses, ALTER's text walks.
+`literal_at` walks sign runs without recursion (tiny profile
+included, with the pin's limits on the run in `INSERT VALUES`,
+`WHERE rowid =` and a parenthesised DEFAULT — `sign_run`). The null-test fold (above). CREATE TABLE items
+nest parentheses up to the parser limit (they stopped at 32). The
+count limits above. The parser's `sql[a..b]` slices became checked
+`span`s; `cmp_op` / `arith`'s `unreachable!()` arms an error.
+
+**Review fixes (2026-11-03, ungated):** view and CTE bodies are
+checked where they are read: the parser records on each subquery
+the height of the expression the pin resolves it in
+(`SelectStmt::rctx`, marked when that expression is complete) and
+each select's own resolution depth (`SelectStmt::rdepth`); the
+view / CTE expansion carries the sum down (`Expander::ctx`) and
+refuses a body whose depth there passes the limit (a chain of views
+or CTEs used to pass any length — wrong answers, then a stack
+overflow; the review's 170-CTE chain aborted the CLI). CTE bodies
+are parsed deferred (`defer`, like a CREATE VIEW body) and a view's
+lone leaves count 0 (`reduced`). The width limits only resolution
+applies (result set, ORDER BY / GROUP BY terms, VALUES rows) are
+checked on the bodies the expansion copies, not in an unused CTE or
+a CREATE VIEW; RETURNING is held to 2000 columns after `*` before
+any row changes; an INSERT's one VALUES row and an upsert's SET are
+not limited; the compound limit exempts a one-row VALUES tail. The
+ordinal fold (`ordinal_term`) follows `sqlite3ExprIsInteger`. A
+parenthesised DEFAULT sign run is held to both limits at its
+column's stack base (hipp stored schemas the pin cannot open).
+`btree_insert` balances page 1 as the pin does (the empty page-1
+quick split panicked with a subtract overflow; a schema row of
+about 3950 bytes in a fresh file).
+
+*Stack.* With the tree height and the parser stack bounded, every
+recursive walk of one statement's text is too, and the resolution
+sum bounds the expressions of the view and CTE bodies it reads
+together; the bodies' own nesting (FROM levels, planner and executor
+frames per body) is bounded by `Config::max_nesting`, not by
+`stack_budget` (see below). To make the bound affordable the hot
+recursive functions were split so one nesting level puts a small
+frame on the stack: the parser's primary / unary / parenthesis /
+call / CASE / CAST / column paths, `resolve_scoped` (common nodes
+inline, the rest in `resolve_other` and one function per node
+kind), `eval` (likewise; `arith` / `cmp_op` evaluate operands then
+call out), the FROM planner (`plan_derived_source`,
+`synth_source`), the FROM-source parser. Measured on x86_64
+(release / debug, bytes per level): 911 / 3.7 K per nested
+parenthesis (was 2.1 K / 12 K), 640 / 3.3 K per height of a `+`
+chain (2.9 K / 24 K), 1.3 K / 9.5 K per nested call (3.1 K /
+26 K), 1.5 K / 8.2 K per nested CASE (2.9 K / 24 K), 8.9 K / 25 K
+per nested FROM subquery (parse, plan and execution). Worst
+statement at the pin's limits: 4.3 MiB release, 13 MiB debug; at
+the defaults (expressions 1000 deep, a 500-symbol parser stack):
+1.4 MiB / 5.3 MiB (a 2 MiB release thread, an 8 MiB debug one).
+`Config::stack_budget(bytes)` uses `STACK_BASE + parser_depth *
+STACK_PER_SYMBOL + expr_depth * STACK_PER_HEIGHT` (64 K + 1.5 K +
+704 B release, 320 K + 4 K + 3.4 K debug; a debug build needs 270
+KiB for `SELECT 1` — the step future alone is 100 KiB).
+`Config::tiny()` takes 64 / 64. The CLI sets the pin's limits on
+its 512 MiB thread. A view or CTE level read inside another costs
+up to about 24 KiB in release (a view reading the last one in an IN
+subquery; 12 KiB through a scalar subquery) and 130 KiB in debug:
+the default `max_nesting` of 250 needs about 6 MiB in release (an 8
+MiB thread) and 32 MiB in debug — measured, and documented on
+`Config::max_nesting`.
+
+**Tests:** `tests/depth_v16.rs` (8 tests): 36 nesting shapes at the
+pin's limits on both sides of every boundary vs the live pin
+(answers and error classes), the same shapes under
+`stack_budget(512 KiB)` (256 KiB in release) and under the
+defaults on an 8 MiB thread — each accepted up to hipp's boundary
+with the pin's answer, refused past it, and refused 50 times
+deeper, never an overflow; 18 count limits on both sides; a
+generated corpus (xorshift, `HIPP_DEPTH_CORPUS`, default 24 cases,
+300 ran clean) of random wrappers around random operands in random
+statement contexts, the boundary bisected on the pin; the
+regressions (null-test ordinals, CHECK past 32 parentheses, the
+CREATE VIEW deferral, IN-list rewrites, the ON chain, LIMIT /
+OFFSET, the compound sorter); 100 000-deep hostile statements on a
+default thread. `tests/depth_tiny_v16.rs` (3 tests, also built and
+run without the v0.4 grammar by `tiny_build_runs_these`): sign runs
+in every literal position of the tiny grammar at the pin's
+boundaries (searched live) on a small thread, 100 000-sign runs,
+2000 / 2001 columns (and the pin reading hipp's 2000-column file).
+Parser unit tests: the statement length limit, the ON fold.
+`hipp-cli/tests/cli_v16_depth.rs` (2 tests): a byte-identical
+batch of 15 shapes at and past their boundaries, the ordinal fold
+and the count limits. `tests/views_cte_v16.rs`'s pin-limit
+configuration now sets the pin's depth limits too. Review fixes:
+`tests/depth_v16.rs` +6 — view and CTE chains (1 to 5 bodies,
+reading the last in a scalar / IN / ON / LIMIT / EXISTS position,
+and a view's lone leaves) on both sides of the pin's boundary
+searched live; the review's crash chains refused on a 2 MiB
+release thread under the defaults; 27 ORDER BY / GROUP BY /
+compound ordinal terms; the deferred width limits (RETURNING with
+the table state after, INSERT column lists, upsert SET, unused
+CTEs, CREATE VIEW bodies and their readers); compounds ending in
+VALUES; ALTER TABLE ADD COLUMN DEFAULT sign runs.
+`tests/depth_tiny_v16.rs` +2 (also in the tiny build): DEFAULT
+sign runs at both column bases with the pin reading the file, and
+schema rows that stop fitting page 1 (page shapes equal to the
+pin's). `hipp-cli/tests/cli_v16_depth.rs` +1: a byte-identical
+batch of all of these.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size:** tiny **76,476 B** (Δ **+252 B** vs 76,224, ratchet raised
+to it): correctness fixes on the tiny profile's INSERT / SELECT /
+CREATE TABLE paths, within the +256 B allowance — the sign-run
+walk without recursion and its pin limits (the crash), the 2000-
+column checks of CREATE TABLE and the result list. Full **482,328 B**
+(Δ **+7,432 B** vs 474,896, ratchet raised to it) and max **482,312 B**
+(Δ **+7,408 B** vs 474,904): the parser's two counts in every
+construct, the resolution-depth fold, the count limits and the
+split walkers. Review fixes (on top of the window unit's 76,476 /
+482,304 / 524,224): tiny **76,728 B** (Δ **+252 B**, ratchet raised):
+correctness fixes on CREATE TABLE, within the +256 B allowance —
+the page-1 split (a panic) and the DEFAULT sign-run limits (a file
+the pin cannot open), with `sign_run` shared by the tiny literal
+paths; full **484,116 B** (Δ **+1,812 B**) and max **526,372 B**
+(Δ **+2,148 B**): the resolution marks and checks, the deferred width
+checks, the ordinal fold. `link.x`'s sizing FLASH region grew to
+1 MiB (max's budget, ADR 0002): max had reached the old 512 KiB.
+
+**Honest gaps:**
+
+- A flattened FROM subquery, view or CTE column that the outer
+  query reads becomes, on the pin, a copy of the column's expression
+  under a COLLATE node; the copy's height (+1, plus the reading
+  expression's) is checked there and not in hipp, so hipp accepts
+  `SELECT * FROM (SELECT <height 1000> FROM t)` where the pin refuses
+  it (the pin refuses at 999 + 1).
+- NATURAL join terms are not counted in the WHERE tree (USING ones
+  are), nor is the pin's shortcut of `ON 0`; in a view body the ON
+  chain's AND nodes, which the pin rebuilds over its reduced copy,
+  are counted at their parse-time heights. A subquery inside a
+  WINDOW clause definition counts its own expression's height, not
+  that of the call that uses the window. CHECK, expression DEFAULT
+  and generated expressions are re-parsed alone and counted at the
+  first column's base (a later column's sits two symbols higher on
+  the pin; a parenthesised signed-literal DEFAULT is exact);
+  likewise ALTER TABLE ADD COLUMN's. RETURNING after a
+  several-clause upsert and CAST type arguments use approximate
+  bases.
+- `Config::stack_budget` budgets one statement's text; the views and
+  CTEs it reads nest up to `max_nesting` levels deeper, which a
+  small stack must lower by hand (the per-level costs are on that
+  field). Nested FROM subqueries inside each body multiply with it.
+- The join limit is counted per FROM clause (the pin counts after
+  flattening, so a join of flattened subqueries can pass 64 there).
+- The stack costs are x86_64 measurements; other targets' frames
+  differ (32-bit ones are usually smaller), so `stack_budget` is an
+  estimate there — leave headroom. The debug build's 270 KiB base
+  (the step future) is untouched.
+- `SELECT * FROM (SELECT 1,1,1,1,1)` is still `Unsupported`
+  (pre-existing: past three duplicate names the pin switches to a
+  random column-name suffix).
+- The audit for other panics reachable from SQL covered the parser
+  and the evaluator, and (review) the page-1 split; the
+  `unreachable!()` / `expect` / slice indexing left in `session.rs`
+  and `btree.rs` guard structural invariants (plan kinds, a B-tree
+  descent's parent, non-empty balance groups), not data, and were
+  not rewritten.
+- `sqlite_schema` pages now split as the pin's do, but a balance of
+  many leaves under page 1 can still put a cell or two on a
+  different sibling than the pin (80 / 78 where the pin has 81 / 77
+  at 400 tables: the v0.15 window distribution), so the files are
+  not byte-identical there; both read and pass integrity checks.
+
+### Window functions (2026-11-03)
+
+**Status:** implemented behind the new leaf feature `window`
+(implies `v16`; in `max`, not `full`, per ADR 0002; its own
+`ci/feature-sets.txt` line `v16,window`), differentially tested
+against the live 3.54.1 pin. Census: the four `window_*` probes
+(row_number, partitioned running sum, rank / dense_rank, lag /
+lead) went from HIPP_ERR to MATCH.
+
+**Shipped (`window`):**
+
+- Grammar: `f(args) [FILTER (WHERE ...)] OVER (...)` and `OVER
+  name` after any call (OVER is a keyword only after `)` with `(`
+  or a name after it — a string, a quoted, plain or fallback
+  identifier or a join keyword, never FROM / WHERE / UNION /
+  LIMIT / ..., as in the pin's `analyzeOverKeyword` / `getToken`;
+  WINDOW only before `name AS`; FILTER after OVER is a syntax
+  error); window definitions `[base] [PARTITION BY ...] [ORDER BY
+  ...] [frame]`; frames `ROWS | RANGE | GROUPS` with one bound or
+  `BETWEEN` two (UNBOUNDED PRECEDING, `expr` PRECEDING, CURRENT
+  ROW, `expr` FOLLOWING, UNBOUNDED FOLLOWING) and EXCLUDE NO
+  OTHERS / CURRENT ROW / GROUP / TIES; the pin's "unsupported frame
+  specification" (`ParseKind::UnsupportedFrame`); a frame offset
+  that is not constant (a column, a call, a subquery) becomes NULL
+  as `sqlite3WindowOffsetExpr` makes it; bound parameters count as
+  constant (the bind walker reaches window definitions); the
+  WINDOW clause after HAVING, one per core.
+- Named windows (`sqlite3WindowChain` / `sqlite3WindowUpdate`):
+  `OVER w` copies w whole (frame included); `OVER (w ...)` and a
+  later `x AS (w ...)` inherit PARTITION BY / ORDER BY and refuse
+  restating PARTITION BY, a second ORDER BY or a base with an
+  explicit frame (`WindowOverride`); the latest definition of a
+  name wins; the first definition's base is never looked up; names
+  compare by their raw text, quotes included (`OVER [w]` names no
+  window `w`), case-insensitively; unused windows are not resolved;
+  a subquery sees only its own WINDOW clause (`NoSuchWindow`).
+- Functions: row_number, rank, dense_rank, percent_rank, cume_dist,
+  ntile, lag / lead (1-3 arguments: the offset is SQL arithmetic on
+  the row's 1-based position, so `lag(x, -1)` is lead, `lag(x,
+  'x')` the row itself, a fractional offset finds nothing; only the
+  buffered rows exist, so `lag(x, -2)` is NULL), first_value,
+  last_value, nth_value, and every aggregate — count / sum / total
+  / avg / min / max / group_concat / string_agg and median /
+  percentile / percentile_cont / percentile_disc — with FILTER.
+  The built-ins take the pin's fixed frames, which also decide
+  their window class.
+- The frame engine (`src/window.rs`, `Sim`): a transcription of
+  `sqlite3WindowCodeStep` / `windowCodeOp` / `windowCodeRangeTest`
+  checked against the pin's `EXPLAIN` programs: rows arrive into
+  the partition buffer one at a time, three cursors step rows into
+  the aggregate, invert them out and return rows, with the
+  countdown registers (`IfPos`), the `regEnd - regStart` rewrite of
+  `a FOLLOWING AND b FOLLOWING`, the empty-frame shortcut, RANGE /
+  GROUPS peer-group loops, the RANGE offset tests (DESC subtracts,
+  NULLS LAST / DESC NULLS FIRST tested apart, a text or blob key
+  takes no arithmetic, the term's collation) and the guards that
+  keep the start behind the end. `sum` / `total` / `avg` follow
+  that exact step / inverse sequence through the pin's KBN sum
+  (`SumCtx::inverse`, the pin's `sumInverse`), so REAL results
+  round identically and a sum stays REAL once a REAL row passed
+  through the frame; `group_concat` / `string_agg` keep the pin's
+  byte-length bookkeeping (`groupConcatInverse`); min / max over a
+  frame not starting UNBOUNDED PRECEDING keep the last of equal
+  values (the pin's ephemeral index), else the first. A frame with
+  any EXCLUDE (NO OTHERS included) runs the pin's full scan: a
+  fresh aggregate per row over the frame minus the excluded rows.
+- Classes and output order: calls with equal windows (frame and
+  EXCLUDE included; two windows over the same aggregate, `OVER
+  (ORDER BY sum(v))`, are equal) share a class; classes are
+  numbered in resolution order (result list, then ORDER BY); the
+  pin nests the second class inside the first and so on, each
+  sorting its input stably by partition and order keys, so rows
+  come out in the first class's order. An ORDER BY term naming a
+  result column (alias, ordinal, the same call; the pin's
+  `resolveAlias` copy), and an alias inside any other ORDER BY
+  term, is a *copy* of that column's calls: computed again, never
+  in the first class (`sqlite3WindowLink` does not link it), so it
+  nests below the result list's windows; the named column then
+  shows the copy's values (the pin reads it back from the sorter
+  key) — under DISTINCT the column keeps its own values and the
+  term sorts by them (`window::order_copies`). A compound's cores
+  sort by its ORDER BY, extended to every column under UNION /
+  INTERSECT / EXCEPT (`multiSelectOrderBy`), with the same copies
+  (`window::compound_sorts`). DISTINCT, the outer ORDER BY
+  (stable) and LIMIT apply after the windows; a group LIMIT no
+  longer stops a windowed query's groups early, nor does a
+  reader's LIMIT bound a windowed derived table's input. Windows
+  over groups see the groups in GROUP BY order with the innermost
+  class's sort directions when it has as many keys as the GROUP BY
+  (the rewrite's subquery ORDER BY the group sorter borrows) —
+  never the outer ORDER BY's.
+- Where calls may stand: result columns and ORDER BY terms of a
+  SELECT core (and each VALUES row, a one-row core on the pin);
+  anywhere else — WHERE, GROUP BY (ordinals and aliases included),
+  HAVING, ON, LIMIT, write statements, CHECK, inside an
+  aggregate's or another window call's arguments, PARTITION BY,
+  ORDER BY or FILTER, a trigger's WHEN — the pin's misuse
+  (`MisusedWindow`, also for an alias of a window call there and
+  for a built-in without OVER); in a column DEFAULT the pin's "not
+  constant" (`NotConstantDefault`); in the last recursive SELECT
+  of a recursive CTE `RecursiveWindow`. Aggregates inside window arguments belong to the core
+  (`sum(sum(c)) OVER (ORDER BY a)` over GROUP BY a), and make it
+  an aggregate query.
+- Errors (new `SchemaKind`s): `NotWindowFunction` (a scalar
+  function, multi-argument min / max), `WindowDistinct`,
+  `WindowClauseMisused` (FILTER on a built-in, an aggregate ORDER
+  BY with OVER), `NoSuchWindow`, `WindowOverride`,
+  `RecursiveWindow`,
+  `RangeOffsetOrder`, `FrameStartOffset` / `FrameEndOffset` (ROWS /
+  GROUPS: `MustBeInt` then >= 0; RANGE: a non-negative number,
+  numeric text included — checked when a partition starts, so not
+  over no rows), `NthValueArgument` (per returned row; per stepped
+  row under EXCLUDE), `NtileArgument` (the partition's first row's
+  value).
+- Plumbing: `RExpr::Win(Box<WinCall>, children)` holds the
+  arguments, FILTER, PARTITION BY and ORDER BY terms as children,
+  so every walker (correlation, subquery collection, aggregate
+  ownership, alias rebasing) sees them; without `window` the
+  variant's payload is uninhabited and its walker arms compile
+  away. The three projection paths (`project_rows`,
+  `project_qp_async`, `sub_project`) evaluate each unit's inputs,
+  call `window::compute`, then project in the window order with
+  the values filled in. View / CTE expansion, temp routing and
+  parameter binding walk window definitions.
+
+**Oracle-probing notes** (live pin, results and `EXPLAIN`):
+ties keep input order in every window sort (vdbesort is stable
+here); three windows over one table nest first-outermost (proved by
+row_number tie order); `sqlite3WindowLink` puts calls with unequal
+windows into the subquery in result-list order; the window
+sorter's order is the output order without an outer ORDER BY, an
+outer ORDER BY re-sorts stably; `count(*), count(*) OVER () ...
+WHERE 0` is `0|1` (one group); DISTINCT keeps the first row in
+window order; `VALUES (row_number() OVER ()), (2)` runs (each row is
+a core) while `INSERT ... VALUES (row_number() OVER ())` is misuse;
+`EXPLAIN` of `ROWS 1 PRECEDING AND 1 FOLLOWING` and `RANGE 1
+PRECEDING AND 2 FOLLOWING` matched the transcribed control flow op
+for op (AggStep / AggInverse / IfPos / peer `Compare` / `Jump`
+loops, the flush); `sum(x) OVER (ROWS 1 PRECEDING)` over 1, 2.5, 3,
+4 ends `7.0`; `ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING` returns
+every row from a fresh accumulator (total 0.0, sum NULL, count 0);
+min / max with NOCASE ties: `'a'` after `'A'` in a sliding frame,
+`'A'` from UNBOUNDED PRECEDING; `ntile(a)` reads the first row's a
+only; offsets: `1.0` and `'1'` pass for ROWS, `1.5` and `(SELECT 1)`
+fail, RANGE takes `1.5`, `'1'`, `' 1 '`, refuses `'x'`, `x'01'`, NULL
+and negatives; `?1` in a frame offset is a constant there.
+
+**Bugs found while testing (fixed, regression tests):** window
+names were compared dequoted (`OVER [w]` found `w`); bound
+parameters in frame offsets were neither treated as constant nor
+bound (the bind walker did not reach window definitions).
+
+**Review fixes (2026-11-03, regression tests in
+`tests/window_v16.rs` and the CLI `ordering` batch):**
+
+- A window call in a column DEFAULT (CREATE TABLE, ALTER TABLE ADD
+  COLUMN) was stored, leaving a schema the pin refuses to load
+  ("default value of column [b] is not constant"); it is now
+  `NotConstantDefault`, as `exprNodeIsConstant` refuses any
+  EP_WinFunc node.
+- Windows over groups under an outer ORDER BY of the same length
+  as the GROUP BY (`GROUP BY k ORDER BY k DESC`, `ORDER BY v
+  DESC`) saw the groups in the ORDER BY's direction (`group_desc`
+  borrowed it); they now see the GROUP BY order with the innermost
+  window's directions, as the pin's rewritten subquery does.
+- `f(...) over FROM t` (and before WHERE, UNION, LIMIT, ...) is an
+  alias again: OVER followed by a reserved keyword is not the
+  keyword.
+- `cannot use window functions in recursive queries`: a window call
+  in the rightmost recursive SELECT is `RecursiveWindow` (checked
+  before the aggregate check; the anchor, earlier recursive
+  SELECTs and subqueries may hold windows, as on the pin).
+- `row_number(*)` and the other zero-argument built-ins take `*`
+  (the pin's `f(*)` is `f()`); every other function with `*` is
+  `WrongArgumentCount`, not `Unsupported`.
+- ORDER BY terms naming window columns (and compound ORDER BYs)
+  changed the pin's window nesting but not hipp's, so tie-dependent
+  values (row_number, first_value, lag, group_concat over ties)
+  differed — now modelled as above. Two windows ordered or
+  partitioned by the same aggregate no longer form two classes
+  (`same_expr` compares aggregates under `window`).
+- Same pattern elsewhere: a trigger's WHEN was planned as `SELECT
+  <expr>`, so window calls and aggregates there ran; it is now
+  planned as a WHERE (`SELECT 1 WHERE <expr>`), giving the pin's
+  `MisusedWindow` / `MisusedAggregate` when the trigger fires.
+
+**Tests:** `tests/window_v16.rs` (20 tests; the review fixes
+added `default_refusals`, `over_as_alias`, `recursive_cte_windows`,
+`star_arguments`, `trigger_when_misuse`,
+`groups_ignore_outer_order`, `order_by_window_columns` and
+`generated_order_group_corpus` — ORDER BY aliases / ordinals /
+negated aliases / fresh calls, DISTINCT, LIMIT, GROUP BY with
+aggregates in window arguments and sort keys; about 6 000 such
+generated queries and 1 000 compound ones from a scratch fuzzer
+agreed in values with the pin while fixing): built-ins, aggregates
+over frames, RANGE offsets, named windows (and every refusal),
+the step / inverse order (REAL stickiness, rounding, overflow),
+group_concat's inverse with varying separators, output order
+(nested classes, DISTINCT, LIMIT, joins order-insensitively),
+windows over groups, windows in subqueries / views / CTEs /
+compounds / VALUES / CTAS / INSERT ... SELECT / UPDATE / DELETE,
+every refusal kind, bound parameters through the Statement API
+(re-executed), and a generated corpus (xorshift, `HIPP_WIN_CORPUS`
+default 240, `HIPP_WIN_SEED`) of random calls over random frames,
+partitions and orders on six random tables with mixed storage
+classes, rounding REALs and big integers — 1 500 extra statements
+(seed 7) and about 2 400 more from a scratch fuzzer agreed while
+developing. `hipp-cli/tests/cli_v16_window.rs` (5 tests):
+byte-identical batches one-shot and over stdin (built-ins, frames
+with REAL rendering, shapes, CTAS `.schema` and `.parameter`
+offsets) plus the oracle's integrity check of hipp's file.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size:** tiny **76,476 B** (Δ **0**: nothing of it is in the tiny
+profile). Full **482,304 B** (Δ **−24 B** vs 482,328, ratchet
+lowered: `RExpr::OutRef`, never built, gave way to the
+uninhabited-without-`window` `Win` variant at the enum's end). Max
+**524,224 B** (Δ **+41,912 B** vs 482,312, ratchet raised to it;
+over the 32 KiB justification threshold): the frame engine and its
+functions (`src/window.rs`), the grammar (OVER, WINDOW, frames) and
+the resolver for calls and named windows, and the window paths of
+the three projection loops — the whole leaf, which ADR 0002 put in
+`max` for exactly this.
+
+**Size after the review fixes:** tiny **76,924 B** (Δ **0**),
+full **484,644 B** (Δ **0**: the `same_expr` aggregate arm and the
+window paths are `window`-only), max **563,552 B** (Δ **+3,312 B**
+vs 560,240, ratchet raised: ORDER BY / compound copies, the class
+numbering, the group-direction rule and the recursive-CTE check).
+
+**Honest gaps:**
+
+- The parser's depth model counts nothing for window definitions
+  (their expressions are parsed with an approximate stack base);
+  an extreme nesting inside an OVER clause is bounded by hipp's
+  limits, not at the pin's exact boundary.
+- When the pin fails after printing rows (an `ntile` / `nth_value`
+  / sum-overflow error in a later partition), hipp returns the
+  error alone; the tests compare the refusal only.
+- Percentile window aggregates are recomputed over the frame per
+  row (each stepped row is checked as on the pin, but a P that
+  varies per row is only checked across the frame, not against the
+  first row ever stepped); min / max over sliding frames and
+  EXCLUDE frames are rescanned per row: O(frame) per row (rank and
+  peer groups are O(1) after an O(n) pass; sum / count /
+  group_concat are incremental).
+- A WINDOW definition no call uses is never resolved, so ALTER
+  TABLE RENAME COLUMN leaves its column names unchanged in a view
+  (the pin's rename walks it).
+- Row order with ties between joined rows follows hipp's join
+  order, which may differ from the pin's planner; the tests use
+  unique keys or compare such results as sets.
+- Errors from different calls / rows in one statement may be
+  reported in another order than the pin's (the kinds and
+  errored-vs-succeeded match).
+- ORDER BY copies follow the plain-SELECT rule in every core; when
+  the pin materializes a subquery or CTE with an ORDER BY naming a
+  window column (`MATERIALIZED`, or its planner's choice), it keeps
+  the column's own values and sorts by them, as under DISTINCT, so
+  tie-dependent values there can differ. The identical-expression
+  form of an ORDER BY reference is recognised for a bare window
+  call only (`ORDER BY row_number() OVER (...)`), not for a larger
+  expression holding one.
+- Row order across the cores of a compound with an ORDER BY
+  differs from the pin's merge for rows tied on the ORDER BY (not
+  window-specific: `SELECT b, k FROM t UNION ALL SELECT 0, 0 ORDER
+  BY 2 DESC` shows it too); the window values match, and the tests
+  compare compounds as sets. A LIMIT over such ties can then keep
+  other rows than the pin.
+
+### Triggers (2026-11-03)
+
+**Status:** implemented behind the new leaf feature `triggers`
+(implies `v16`; in `max`, not `full`, per ADR 0002; its own
+`ci/feature-sets.txt` line `v16,triggers`), differentially tested
+against the live 3.54.1 pin. Ungated (every profile): a file's
+triggers are never skipped silently any more — hipp used to run an
+INSERT into a pin-made table with a trigger and simply not fire it.
+
+**Shipped (`triggers`):**
+
+- `CREATE [TEMP] TRIGGER [IF NOT EXISTS] [schema.]name [BEFORE |
+  AFTER | INSTEAD OF] DELETE | INSERT | UPDATE [OF col, ...] ON
+  table [FOR EACH ROW] [WHEN expr] BEGIN stmt; ... END`, stored
+  with the pin's text (`CREATE TRIGGER ` and the statement from the
+  bare name to its END) and `tbl_name` as written after ON; `DROP
+  TRIGGER [IF EXISTS] [schema.]name`; trigger names a namespace of
+  their own per database; the pin's refusals (duplicate name,
+  reserved `sqlite_` name, system table, missing table, BEFORE /
+  AFTER on a view, INSTEAD OF on a table, qualified INSERT / UPDATE
+  / DELETE targets, RETURNING, DEFAULT VALUES, WITH before a
+  write, parameters, RAISE outside a trigger — a CHECK holding one
+  is accepted until a row is written, as on the pin). DROP TABLE
+  and DROP VIEW drop the triggers on them (ungated).
+- Firing (`session/trigger.rs`): triggers fire most recently
+  created first. Each program statement is parsed again from the
+  stored text, its `NEW.` / `OLD.` references bound to the row
+  (`sql/trig.rs`: no comparison affinity and the column's collation
+  for a column, INTEGER affinity for the rowid / INTEGER PRIMARY
+  KEY; a FROM source or write target called `new` / `old` shadows
+  them), planned and stepped as a statement of its own on the same
+  connection; it never commits or rolls back itself. INSERT: BEFORE
+  sees defaults, affinities and generated columns, `NEW.rowid` -1
+  until chosen; rowid, constraints and the write follow; AFTER sees
+  the stored row. UPDATE / DELETE: rows collected first, each read
+  again at its turn (gone: skipped), BEFORE triggers, read once
+  more (UPDATE: unassigned columns take the current values; NEW's
+  generated columns in BEFORE UPDATE are computed from the assigned
+  columns and those a firing BEFORE UPDATE trigger reads as NEW.x,
+  the others NULL — review fix), write, AFTER
+  triggers with the first-read OLD. `UPDATE OF` matches the SET
+  list. WHEN clauses, RAISE(IGNORE / ROLLBACK / ABORT / FAIL, msg)
+  (the message is any expression; `Connection::raise_message`),
+  `PRAGMA recursive_triggers`, the pin's depth limit
+  (`Config::max_trigger_depth`, the CLI sets the pin's 1000).
+  Failure resolution as the pin's: an explicit OR clause of the
+  firing statement overrides every body statement's (and cascades),
+  a constraint failure resolves by the body statement's action or
+  the table's ON CONFLICT ROLLBACK, FAIL keeps the changes so far,
+  ROLLBACK ends the transaction, IGNORE skips the row and the
+  remaining triggers of it. changes() / last_insert_rowid() and the
+  firing statement's count are a frame per program; a failed
+  program statement counts nothing in total_changes(). REPLACE
+  deletions fire DELETE triggers under recursive_triggers (an
+  IGNORE keeps the row and the write then fails; the row is checked
+  again after them, under ABORT); an upsert's DO UPDATE fires the
+  UPDATE triggers, its statements under ABORT.
+- INSTEAD OF triggers make a view writable: INSERT (VALUES or
+  SELECT, column lists), UPDATE (`SELECT *, <set values> FROM view
+  WHERE ...`, an alias qualifies nothing — the pin's quirk) and
+  DELETE fire them per view row with no affinity on NEW; the view
+  itself changes nothing (`changes()` 0); "cannot modify v because
+  it is a view" when no trigger (with a matching `UPDATE OF`) exists;
+  no upsert into a view.
+- Prepare-time checks: every body statement of the triggers a write
+  may fire is planned over all-NULL rows when the write is prepared
+  (the pin compiles them then), so "no such column: old.a" fails
+  even an `INSERT ... SELECT ... WHERE 0`; value-only errors wait.
+- ALTER TABLE RENAME / RENAME COLUMN / DROP COLUMN edit trigger
+  texts token by token as the pin: the ON table, UPDATE OF columns,
+  NEW / OLD columns, write targets with their column lists and SET
+  targets, upsert targets, `excluded.` columns (RENAME TO renames
+  the `excluded` qualifier itself, as the pin does), and every
+  reference the statements resolve to the table (planned as SELECTs
+  under the existing alter trace). Every trigger must read before
+  and after the change, as the pin checks it (SET targets and
+  INSERT column lists are not checked there: dropping a column only
+  a SET names succeeds on the pin, and here).
+- TEMP: a trigger on a TEMP table (TEMP or not, as on the pin) lives
+  in the temp database; `temp.` qualifiers, `DROP TRIGGER
+  temp.x`, the pin's "temporary trigger may not have qualified
+  name" / "cannot reference objects in database temp".
+- hipp-cli splits statements with the pin's `sqlite3_complete`
+  state machine (a trigger ends at a `;` after `; END`), `.schema`
+  shows triggers (`CREATE TRIGGER temp.` for the temp database's)
+  and `.dump` writes views, triggers, then indexes after the data
+  (the pin's order, `\n;` after a text holding `--`).
+
+**Ungated fixes:** writes (INSERT, UPDATE, DELETE, REPLACE,
+upsert) to a table with a trigger are refused without `triggers`
+(`SchemaKind::TableHasTriggers`; a trigger hipp cannot parse refuses
+them with it), every profile — tiny included; DROP TABLE / DROP
+VIEW drop their triggers; `0 AND x` / `x OR 1` with an integer
+literal operand no longer evaluate `x` (the pin simplifies them:
+`0 AND abs(-9223372036854775808)` is 0, not "integer overflow");
+hipp-cli's `.dump` object order.
+
+**Oracle-probing notes** (live pin): stored text from the bare name
+(`main.`, TEMP, IF NOT EXISTS gone); triggers on `T` stored with
+`tbl_name` `T`; firing order is reverse creation for main triggers
+(TEMP triggers on main tables fire first, in creation order — not
+built here); NEW in BEFORE INSERT has defaults / affinity /
+generated columns and rowid -1; `new.a = '5'` over INT 5 is 0,
+`new.rowid = '1'` 1, `'B' = new.b` (NOCASE) 1; a view's NEW has no
+affinity; DELETE / UPDATE re-read rows (row 2 deleted by a BEFORE
+trigger is skipped, row 3 updated by one is seen updated); BEFORE
+UPDATE's NEW generated columns are computed over the pin's new-column
+mask (see the review fixes); recursion: a trigger never
+re-enters itself without recursive_triggers, other triggers on the
+same table do; 1000 programs pass, the 1001st is "triggers nested
+too deep", counted before WHEN; RAISE(IGNORE) in a BEFORE trigger
+abandons the row and the row's other triggers, in a nested
+statement only that statement's row; FAIL / ABORT / ROLLBACK as
+documented; the conflict-override matrix (7 outer × 6 body forms,
+inside BEGIN); changes() inside a program is the last completed
+statement's of that frame, else the frame's entry value;
+last_insert_rowid() restored after a program; REPLACE + delete
+triggers only under recursive_triggers, an IGNORE there turns into
+"UNIQUE constraint failed"; upsert DO UPDATE fires BEFORE INSERT
+then UPDATE triggers (not AFTER INSERT), its update under ABORT
+(an OR IGNORE body statement fails); INSTEAD OF: `changes()` 0,
+RETURNING returns NEW, `UPDATE v AS w SET a = w.a` is "no such
+column: w.a"; body errors at prepare (zero rows too); ALTER texts
+(quoted forms `old."aa"`, `OLD."aa"` from `[a]`, `"t 2".id`,
+`"uu".xx` for `excluded.x`); every ALTER checks every trigger; the
+shell's stdin reading follows `sqlite3_complete` (`BEGIN END;`
+swallows the following lines). A depth error inside BEGIN keeps the
+statement's changes on the pin when its program has no abort point
+(no statement journal) — modelled since the review fixes.
+
+**Bugs found while testing (fixed, regression tests in
+`tests/triggers_v16.rs::regressions` and the matrices):** a failed
+program statement counted in total_changes(); program statements
+opened statement savepoints and so undid their own part of a FAIL;
+an upsert's update ran its triggers under the outer conflict
+action; a REPLACE victim kept by IGNORE, or re-created by its
+DELETE triggers, was overwritten; RAISE() was folded at plan time
+(`SELECT RAISE(FAIL, 'f') WHERE 1 = 2` raised); a RAISE(IGNORE)
+left a stale failure resolution that turned a later FAIL into
+ABORT; the depth limit counted one level early.
+
+**Tests:** `tests/triggers_v16.rs` (22 tests): stored text and the
+namespace, INSERT order / NEW values / counters, UPDATE OF / WHEN /
+collation, NEW / OLD affinity, re-read rows, generated columns, the
+RAISE matrix (7 × BEFORE / AFTER), RAISE messages and IGNORE
+nesting, the conflict-override matrix (42 scripts plus UPDATE /
+DELETE / table-level ROLLBACK), recursion and depth (999 / 1000 /
+1001, hipp's lowered limit), REPLACE and upsert (both pragma
+values), INSTEAD OF views, prepare-time errors, savepoints and
+statement rollback, three ALTER corpora, TEMP triggers, the TEMP
+trigger on a main table refusal, files the pin wrote (and the pin
+firing hipp's triggers), regressions, and a generated corpus
+(xorshift, `HIPP_TRIGGER_CORPUS` default 40, `HIPP_TRIGGER_SEED`)
+of random triggers (timing, event, OF, WHEN, RAISE, recursion,
+nested writes) over random writes, transactions and savepoints —
+about 3 600 generated scripts over nine seeds agreed while
+developing. Every script also checks the oracle reads hipp's file
+(integrity check and `.dump` equal). `tests/triggers_off_v16.rs` (3
+tests, also built and run in the tiny profile and `full`): a
+pin-made file's triggered table refuses writes without the feature
+and fires with it, other tables stay writable, DROP TABLE / VIEW
+drop the triggers. `hipp-cli/tests/cli_v16_triggers.rs` (6 tests):
+multi-line triggers over stdin, the `sqlite3_complete` edge cases,
+RAISE and 1000-deep recursion, `.schema`, `.dump` (byte-identical
+but for the pin's PRAGMA line, replayed into both engines), one-shot
+scripts. `tests/alter_v16.rs` and `hipp-cli/tests/cli_v04.rs` were
+updated (a file with triggers now alters as on the pin; `.dump`
+writes views before indexes, as the pin).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size:** tiny **76,924 B** (Δ **+196 B** vs 76,728, ratchet
+raised to it): a correctness fix on the INSERT path the tiny
+profile claims — the catalog notes the tables a file's triggers are
+on (`TableDef::triggered`) and INSERT refuses them
+(`TableHasTriggers`) instead of silently not running the trigger;
+within the +256 B allowance. Full **484,644 B** (Δ **+528 B** vs
+484,116, ratchet raised): the same refusal in UPDATE / DELETE, DROP
+TABLE / DROP VIEW removing triggers, and the `0 AND x` / `x OR 1`
+fix — no trigger code. Max **560,240 B** (Δ **+33,868 B** vs
+526,372, ratchet raised; over the 32 KiB justification threshold):
+the whole leaf — CREATE / DROP TRIGGER, the binder, the program
+runner and its failure resolution, the per-row hooks of every write
+path, INSTEAD OF planning and the ALTER trigger editor — which ADR
+0002 put in `max` for exactly this.
+
+**Honest gaps** (as of the review fixes below):
+
+- A TEMP trigger on a main table is refused (`Unsupported`), as is
+  a trigger in the temp database whose program writes a main table
+  ("no such table" when it fires — an error, never a skipped
+  trigger): the TEMP database is a separate private connection and
+  a statement runs in one database only. Firing across the two
+  needs one statement journal over both connections, and DROP /
+  ALTER of the main table propagated into the temp schema; that is
+  a change of the TEMP design, not of this unit.
+- UPDATE ... FROM of a view is refused (`Unsupported`). A RETURNING
+  subquery of a view write whose FROM names the view itself is
+  computed once (the pin computes it per row: hipp reads the view as
+  a derived table there).
+- `0 AND nosuch` is still "no such column" (the pin drops the other
+  operand unresolved).
+- A trigger program's INSERT ... SELECT / DELETE / UPDATE stopped
+  part-way by a RAISE keeps the rows before the failing one only for
+  the pin's streaming shapes hipp re-runs row by row (a lone scan of
+  one table without sort, grouping, compound, subquery or window;
+  UPDATE / DELETE one-pass): a join or a derived table there keeps
+  none. An UPDATE whose WHERE the pin answers through an index it
+  also updates is treated as one-pass (the pin is not).
+- A WHERE evaluated past a LIMIT still errors (hipp evaluates the
+  whole WHERE first; the pin stops at the LIMIT) — a query-engine
+  gap that a body's `INSERT ... SELECT ... LIMIT` shows too.
+- The abort-point analysis behind a depth failure in a transaction
+  is conservative (an unrecognised construct counts as an abort
+  point, i.e. hipp undoes the statement) and assumes nothing of
+  foreign keys (any `PRAGMA foreign_keys=ON` counts as one).
+- Declared `ON CONFLICT REPLACE` on a column constraint is not
+  honoured (the constraints unit's gap); the REPLACE victim order
+  matches the pin for OR REPLACE / REPLACE statements.
+- Trigger programs are parsed and planned per row: correct, but
+  O(rows × program size) planning work. Each nested program costs
+  about 15 KiB of stack in a release build and 262 KiB in a debug
+  one (`STACK_PER_TRIGGER`); the default `max_trigger_depth` is 24.
+  A body statement with deep expressions costs its own statement
+  budget per level on top.
+
+### Triggers — review fixes (2026-11-03)
+
+Thirteen review findings, each reproduced on the live pin first.
+
+**Fixed (all with regression tests in `tests/triggers_v16.rs`,
+`review_*`, a generated corpus, and `hipp-cli/tests/cli_v16_triggers.rs::review_fixes_render_as_the_pin`):**
+
+- BEFORE UPDATE: NEW's generated columns are computed, not NULL —
+  from the assigned columns and the columns some firing BEFORE
+  UPDATE trigger (WHEN included, `UPDATE OF` respected) reads as
+  `NEW.x`, the others NULL, columns past the 32nd always loaded (the
+  pin's `sqlite3TriggerColmask`).
+- A RAISE(FAIL | IGNORE) part-way through a body's INSERT ...
+  SELECT, DELETE or UPDATE keeps the rows written before it where
+  the pin streams (INSERT ... SELECT: target without INSERT
+  triggers, SELECT not reading it, a lone scan without sort /
+  grouping / compound / subquery; DELETE / UPDATE one-pass: no
+  triggers for the change, no foreign keys, no subquery in WHERE, no
+  rowid change, no REPLACE). hipp re-runs such a SELECT row by row
+  to the failing row (`insert_prefix`) and keeps the scanned prefix
+  of a WHERE (`scan_write_rows_into`, `one_pass`); IGNORE's rows
+  count in total_changes(). Found while testing: a trigger program's
+  multi-row VALUES insert into a table with INSERT triggers now
+  computes every row first, as the pin's temporary table does.
+- AND / OR (ungated, parser): only a lone integer token of a 32-bit
+  value (decimal or hex, in any parentheses) or TRUE / FALSE
+  short-circuits the other operand; `-1`, `+0`, `-0`, `1_0`,
+  `2147483648`, `0x80000000`, `1+0` leave it evaluated (marked with a
+  unary `+` the evaluator's `int_lit` does not see), so `-1 OR
+  abs(-9223372036854775808)` is "integer overflow" and a trigger's
+  `+0 AND RAISE(ABORT, ...)` raises, as on the pin.
+- REPLACE across several UNIQUE indexes deletes the conflicting rows
+  most recently created index first (ungated: the write plans list
+  indexes in the pin's prepended order), visible in DELETE triggers.
+- RETURNING: an uncorrelated subquery whose FROM does not name the
+  written table directly is computed once, when the first row
+  reaches it (`ret_hoist`), so later AFTER-trigger (or foreign-key
+  action) writes do not show; one naming it is per row, as probed.
+  UPDATE's RETURNING now runs before the row's AFTER triggers, as
+  INSERT's and DELETE's. Ungated: `RETURNING t.*` is the pin's error
+  (`SchemaKind::ReturningTableStar`; hipp expanded it).
+- Prepare-time checks cover the whole trigger nest (each trigger
+  once, at most `max_trigger_depth` deep, whatever the WHEN
+  clauses), plus the DELETE triggers a REPLACE fires under
+  recursive_triggers.
+- `Config::default().max_trigger_depth` is 24 (`DEFAULT_TRIGGER_DEPTH`;
+  100 overflowed a 2 MiB thread in some builds and an 8 MiB debug
+  main thread); `Config::stack_budget` lowers it to a quarter of its
+  room over `STACK_PER_TRIGGER` (15 KiB release / 262 KiB debug,
+  measured). README no longer claims the 1000-program limit for the
+  library (the CLI sets it).
+- A trigger-depth failure inside an explicit transaction keeps the
+  statement's changes when no program of it holds an abort point
+  (`nest_may_abort`: non-inlined function calls — coalesce, ifnull,
+  iif, likely, unlikely, likelihood and count / sum / total / avg /
+  group_concat are none, nullif and LIKE are — RAISE(ABORT), ABORT
+  constraints of written tables, foreign keys), as the pin without a
+  statement journal; probed over 12 body shapes.
+- Writes of a view through INSTEAD OF triggers take RETURNING (NEW
+  for INSERT / UPDATE, OLD for DELETE, after the triggers, rows a
+  RAISE(IGNORE) skipped not returned, no rowid, no affinity) and an
+  assignment of the view's rowid (the triggers fire, nothing
+  changes).
+- `CREATE TRIGGER main.x ... ON tt` resolves `tt` in main ("no such
+  table" over a temp-only table; over both, the trigger goes on
+  main's), and `ON temp.tt` with a `main.` name is "cannot reference
+  objects in database temp".
+
+**Not fixed:** the TEMP-trigger-on-main-table pair (see the honest
+gaps above: a design change of the TEMP database).
+
+**Oracle-probing notes:** the BEFORE UPDATE mask counts only
+triggers that fire for the SET list; INSERT ... SELECT with ORDER
+BY, GROUP BY, UNION ALL over the target, or INSERT triggers on the
+target keeps nothing; DISTINCT and WHERE stream; DELETE over an
+index streams; a DELETE / UPDATE WHERE with a subquery does not;
+`2147483647 OR x` is simplified, `2147483648 OR x` not,
+`00000000000002 OR x` is; RETURNING `(SELECT (SELECT count(*) FROM
+t))` and `(SELECT count(*) FROM (SELECT * FROM t))` are computed
+once, `(SELECT count(*) FROM log UNION ALL SELECT 1 FROM t)` per
+row; a view's RETURNING `(SELECT count(*) FROM log)` once, after the
+first row's INSTEAD OF triggers; `RETURNING v.*` is refused like
+`t.*`.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size** (vs the tree after the foreign-key unit): tiny **76,924 B**
+(Δ 0); full **486,076 B** (Δ **+688 B**, ratchet raised: the
+ungated AND / OR literal rule in the parser, the index order, the
+RETURNING `t.*` refusal); max **599,256 B** (Δ **+8,824 B**, ratchet
+raised: the leaf's fixes — new-column mask, part-way writes,
+RETURNING cache and view RETURNING, nested validation, abort-point
+analysis).
+
+### Foreign-key enforcement (2026-11-03)
+
+**Status:** implemented behind the new leaf feature `foreign_keys`
+(implies `v16` and `indexes`; in `max`, not `full`, per ADR 0002; its
+own `ci/feature-sets.txt` line `v16,foreign_keys`), differentially
+tested against the live 3.54.1 pin. Without the leaf, wave 3's
+refusal stays: while `PRAGMA foreign_keys` is ON a write to a table
+in a foreign key is refused (`Unsupported`), never run unchecked.
+
+**Shipped (`foreign_keys`, `src/session/fkey.rs`):**
+
+- The pin's **counters**, not a per-row verdict: a child row added
+  whose parent key is missing counts +1, a child row removed whose
+  parent is missing −1 (only while the counter is non-zero); a parent
+  row removed counts +1 per child still naming it, a parent row added
+  −1 per child it satisfies (again only while non-zero; the counter
+  can then go negative — the pin's quirk, so an orphan left with the
+  pragma off can cancel another statement's violation, and a counter
+  below zero fails as one above it, review fix below). Immediate
+  keys count per top-level statement and fail it at its end
+  ("FOREIGN KEY constraint failed", `SchemaKind::ForeignKeyViolation`,
+  the statement undone even under OR FAIL / IGNORE / ROLLBACK, the
+  transaction staying open); `DEFERRABLE INITIALLY DEFERRED` keys
+  (a column-level deferrable clause applies to the table's most
+  recent key, as `sqlite3DeferForeignKey`; `NOT DEFERRABLE INITIALLY
+  DEFERRED` is immediate) and every key under `PRAGMA
+  defer_foreign_keys` count per transaction: COMMIT and a committing
+  RELEASE fail with the transaction open, an autocommit statement
+  fails at its end, a savepoint saves the counters and ROLLBACK TO
+  restores them, a statement rollback restores its start values.
+  The pin's single-row special case: a top-level single-row INSERT
+  (no INSERT triggers, RETURNING, REPLACE, or upsert update firing
+  UPDATE triggers or changing a key) fails at once on an immediate
+  key and, as a parent, resolves nothing.
+- **Matching** as the pin: a child value takes the parent column's
+  affinity and is looked up in the parent's PRIMARY KEY / UNIQUE
+  index (`MustBeInt` for a rowid parent; a non-integer has none), a
+  self-referencing new row may be its own parent; parent-side scans
+  compare `parent = child` with both comparison affinities and the
+  parent's collation; action programs compare `OLD.pk = fk` with no
+  affinity on OLD (INTEGER for the rowid) — so a cascade can miss
+  rows the count found (probed: a REAL parent and TEXT children
+  '1', '1.0', ' 1': the count finds three, the CASCADE deletes one,
+  the DELETE fails).
+- **Actions** after the row's change (BEFORE triggers, checks,
+  write, actions, AFTER triggers — the pin's order): ON DELETE /
+  ON UPDATE CASCADE, SET NULL, SET DEFAULT (the child column's
+  default; NULL for a generated one), RESTRICT (immediate even for a
+  deferred key, skipped under defer_foreign_keys), NO ACTION; ON
+  UPDATE only when `NOT (old IS new)` under the parent collation.
+  Each runs as the pin's action program: a statement built as an AST
+  over `Expr::TrigValue` (now shared by `triggers` and
+  `foreign_keys`), under ABORT whatever the firing statement says
+  (an UPDATE action's triggers inherit ABORT — an `INSERT OR IGNORE`
+  there fails; a CASCADE DELETE's inherit nothing, review fix
+  below), a frame of its own for `changes()` / `last_insert_rowid()`,
+  counted towards `Config::max_trigger_depth` (now also a
+  `foreign_keys` setting), firing the child's triggers when
+  `triggers` is built; its failure aborts the firing statement.
+- **Keys resolve when the write is prepared** (`fk_validate`), for
+  the whole program tree the pin compiles then (a mismatch two
+  cascades away fails the statement): "foreign key mismatch"
+  (`ForeignKeyMismatch`) for a parent key that is no PRIMARY KEY /
+  UNIQUE index with the parent columns' collations, "no such table"
+  for a missing parent — only for the keys a statement uses, with
+  the pin's rules (a single-row INSERT into the parent uses none; an
+  UPDATE that changes any key locates every key on its table, its
+  `sqlite3FkOldmask`).
+- **REPLACE and upsert:** REPLACE victims are deleted with their
+  checks and actions (an UPDATE OR REPLACE loads all the table's
+  keys for them); DO UPDATE checks as an UPDATE. The pin's
+  `isSetNullAction` quirk: a child-row lookup is skipped when the
+  program the pin compiled last in the statement is that key's SET
+  NULL action (probed: `INSERT OR REPLACE INTO t VALUES (1, 99)`
+  succeeds with 99 missing) — replayed over the pin's whole compile
+  order since the review fixes below.
+- **DROP TABLE** first runs the pin's implicit `DELETE FROM` when
+  the table is a parent, or a child with deferred keys and
+  outstanding deferred violations (its own triggers silent, missing
+  parents empty, its unusable keys ignored; cascades run), then
+  fails before dropping on immediate violations; its count is the
+  drop's `changes()` when the pin compiles that DELETE.
+- RETURNING: immediate violations withhold the rows; deferred ones
+  fail an autocommit statement after its rows, as the pin's
+  `OP_FkCheck` / halt order.
+- `PRAGMA foreign_key_check [table]` (`table|rowid|parent|fkid`,
+  rows in rowid order, keys in list order, the parent as written, a
+  missing parent table reporting every keyed row, a mismatch failing
+  the pragma before any row) and `PRAGMA defer_foreign_keys` (cleared
+  when a transaction ends, as on the pin). `ALTER TABLE ... ADD
+  COLUMN` of a REFERENCES column with a non-NULL default is refused
+  while the pragma is ON and the table has rows (ungated under
+  `v16`, `SchemaKind::ReferencesDefault`; an empty table takes it
+  since the review fixes). Wave 3's ALTER TABLE RENAME
+  already rewrote REFERENCES in child tables (verified; tested here).
+- The parser records `ForeignKey::deferred`. COMMIT also checks the
+  TEMP database's counters.
+
+**Oracle-probing notes** (live pin, scripts in the unit's
+scratchpad): the counter semantics above, including `INSERT INTO s
+VALUES (7, 200), (100, NULL)` resolving an orphan 6→100 left with the
+pragma off and so admitting 7→200; `INSERT OR FAIL` with a counted
+violation undoes the whole statement; `INSERT OR IGNORE` of a row
+that conflicts never counts it; `INSERT OR ROLLBACK` keeps the
+transaction; RETURNING rows are not printed for an immediate
+violation but are for a deferred one in autocommit; COMMIT /
+RELEASE failures leave the transaction (and `defer_foreign_keys`)
+on; `defer_foreign_keys` resets when any transaction ends, also a
+read in autocommit (`SELECT * FROM t`), not after `SELECT 1` or a
+pragma; `PRAGMA foreign_keys` is a no-op inside a transaction;
+changes() = 1 and total_changes counts the cascades; inside cascade
+programs changes() is the frame's entry value; the order BEFORE
+DELETE trigger, action programs (grandchild SET NULL inside the
+child's delete), AFTER DELETE trigger; mismatch / no-such-table
+errors are prepare-time ("Parse error"), and which keys a statement
+locates; a TEMP child may only reference a TEMP parent and a main
+child only a main one ("no such table: temp.p"); MATCH clauses are
+accepted and `foreign_key_list` says NONE; cascade depth: a
+chain past the 1000-program limit fails ("triggers nested too deep",
+the whole statement undone); DROP TABLE runs the implicit DELETE with cascades, not
+its own triggers, and leaves `changes()` at its count (3), even 0
+when the DELETE is compiled and skipped; a failed DROP's cascades
+stay in total_changes(). `isSetNullAction`: the skip depends on
+which program the pin compiled last (probed over a dozen schemas:
+UPDATE triggers on the table and two self-referencing keys change
+it; DELETE triggers and other tables' CASCADE / RESTRICT keys do
+not). The whole-database `foreign_key_check` walks the pin's schema
+hash table; its hash function could not be fitted from orders
+probed for 1–40 tables (the PRAGMA unit's gap): hipp reproduces the
+order up to three tables and views.
+
+**Bugs found while testing (fixed; regression tests in
+`tests/foreign_keys_v16.rs::regressions*`):** an UPDATE OR REPLACE
+victim ran only the actions of the keys the UPDATE assigns;
+RETURNING rows were withheld before a deferred failure; a key error
+raised when the write ran (not when it was prepared) reset
+changes(); mismatches inside the action-program tree, and the
+`sqlite3FkOldmask` locate-all rule, were not reported; DROP TABLE's
+DELETE reported its own unusable keys; `isSetNullAction`; an INSERT
+counted DELETE / UPDATE triggers as making it multi-row; DROP TABLE
+left `changes()` alone where the pin set it.
+
+**Tests:** `tests/foreign_keys_v16.rs` (21 tests; also run with
+`--no-default-features --features std,v16,foreign_keys`, i.e.
+without `triggers`): counting and the orphan quirk, deferred keys
+and savepoints, `defer_foreign_keys`, every action, affinity /
+collation / composite keys in any column order, self-reference,
+mismatch and missing parents, DROP TABLE, ALTER TABLE, REPLACE and
+upsert, conflict clauses and RETURNING, `foreign_key_check`,
+cascade depth (1000 / 1001), MATCH, the pragma off, triggers fired by
+cascades (with RAISE), files the pin wrote (and the pin enforcing
+hipp's), regressions, and a generated corpus (xorshift,
+`HIPP_FK_CORPUS` default 60, `HIPP_FK_SEED`) of random parents (IPK,
+UNIQUE, composite PK), children, grandchildren on UNIQUE columns,
+self-referencing tables, actions, deferral, logging triggers and
+random INSERT / REPLACE / upsert / UPDATE / DELETE / INSERT ... SELECT,
+transactions, savepoints, pragma toggles, DROP TABLE and
+`foreign_key_check` — about 5 000 generated scripts over 40 seeds
+agreed while developing, each also checked by the pin reading
+hipp's file (integrity check and `.dump`). `hipp-cli/tests/
+cli_v16_foreign_keys.rs` (6 tests): cascades and checks, the check
+output, deferred commits and RETURNING, a `.dump` replayed with keys
+on, one-shot exit statuses, cascades firing triggers.
+`tests/pragma_v16.rs`'s refusal test now runs in builds without the
+leaf.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size:** tiny **76,924 B** (Δ **0**; the plain INSERT path keeps
+its tiny code: the key check is a `foreign_keys` block). Full
+**485,388 B** (Δ **+744 B** vs 484,644, ratchet raised): the ungated
+`v16` parts only — `ForeignKey::deferred` and the deferrable-clause
+reading, and ALTER TABLE ADD COLUMN's "Cannot add a REFERENCES column
+with non-NULL default value" check (`SchemaKind::ReferencesDefault`);
+no enforcement code. Max **590,432 B** (Δ **+26,880 B** vs 563,552,
+ratchet raised; under the 32 KiB justification threshold): the whole
+leaf — key resolution, lookups and scans, the counters, action
+programs, the write-path hooks, DROP TABLE's DELETE,
+`foreign_key_check` / `defer_foreign_keys`.
+
+**Honest gaps:**
+
+- The whole-database `foreign_key_check` lists tables in hipp's
+  approximation of the pin's hash order (exact up to three tables
+  and views); `foreign_key_check(t)` is exact. `pragma_foreign_key_
+  check(...)` as a table-valued function is refused.
+- `isSetNullAction`: see the review fixes below (now replayed over
+  the whole compile order; its remaining approximations are listed
+  there).
+- Mismatch errors inside a trigger body's own action tree surface
+  when the body runs (hipp validates one level at prepare).
+- Child scans are full scans of the child table per parent row
+  changed (O(parents × children)); child indexes are not used.
+- SET DEFAULT evaluates a non-constant default once per action
+  statement, not per row.
+- `defer_foreign_keys` is cleared after table-reading queries,
+  writes and (since the review fixes) the pragmas whose programs
+  read the file, in autocommit; it is per database: setting it does
+  not reach the TEMP database's statements.
+- An action program's statement journal: a depth error inside
+  BEGIN undoes the statement (as for triggers, STATUS above).
+
+### Foreign-key enforcement — review fixes (2026-11-03)
+
+Five review findings, each reproduced on the live pin first, all
+fixed; the generated corpora (the original one and a new one whose
+trigger programs write the keyed tables) then found eight more,
+also fixed. Regression tests: `tests/foreign_keys_v16.rs`
+`review_fixes` / `review_fixes_programs` (and
+`generated_corpus_programs`), `hipp-cli/tests/cli_v16_foreign_keys.rs`
+`review_fixes_byte_identical`.
+
+**Fixed (review findings):**
+
+- **INSTEAD OF trigger bodies' writes were never checked.** A write
+  of a view ended with a bare commit, so the violations its trigger
+  bodies counted were reset by the next statement: orphans committed.
+  `exec_instead` now ends with the statement's foreign-key check
+  (`fk_end_commit`), RETURNING rows of such a write are served
+  before an autocommit deferred failure (`serve_returning_fk`), as
+  for a table.
+- **Single-row INSERT: the key was checked before the rowid
+  conflict.** The plain INSERT path's key check (which halts at once
+  for a single-row INSERT) ran before `btree_insert` found a
+  duplicate rowid; the pin finds the conflict first. So the error
+  was the key's, and under OR ROLLBACK the transaction stayed open
+  (a later COMMIT kept earlier rows). The rowid is now looked up
+  first while keys are checked (the conflict-aware path and multi-row
+  writes already did).
+- **ADD COLUMN ... REFERENCES ... DEFAULT x refused on an empty
+  table.** The pin raises it through `sqlite3ErrorIfNotEmpty`; it is
+  now one of ADD COLUMN's table-has-rows refusals (the first the pin
+  emits, so it wins over the others), `AlterAdd::empty_only` now
+  carrying the error kind.
+- **A FAIL halt in a trigger program with violations pending**
+  (`RAISE(FAIL)`, a UNIQUE conflict under an outer OR FAIL) aborted
+  but reported the program's error; it now reports "FOREIGN KEY
+  constraint failed" (`trigger_failed` replaces the error).
+- **`isSetNullAction` beyond REPLACE.** The pin skips a child-row
+  lookup when the program it compiled *last in the whole statement*
+  is that key's SET NULL action — after a BEFORE trigger, REPLACE
+  deletion or upsert that compiled it, or in a program after a
+  statement that did. `fkey::Sim` now replays the pin's compile
+  order once per top-level write (only when some key has SET NULL):
+  each program compiled once per statement and conflict action
+  (`TriggerPrg` and its `orconf`); an INSERT's BEFORE triggers,
+  REPLACE deletions (DELETE triggers only under
+  `recursive_triggers`) or upsert UPDATE, the lookup, AFTER
+  triggers; an UPDATE's and a DELETE's triggers all first (the pin
+  compiles them for `sqlite3TriggerColmask`), REPLACE deletions,
+  the lookup, the actions; an action program's UPDATE under ABORT,
+  a CASCADE's DELETE inheriting nothing; a program's statements in
+  turn. The skipped keys are recorded per (program, statement) and
+  per top-level / upsert site; each statement picks its own when it
+  loads its keys. The old REPLACE-only model (`fk_note_replace`) is
+  gone.
+
+**Fixed (found by the corpora):**
+
+- A CASCADE DELETE's triggers ran under ABORT (an `INSERT OR IGNORE`
+  in them failed); the pin compiles them with no conflict action.
+- An upsert DO UPDATE counted as a multi-row write whatever it did,
+  so a mismatched key it leaves alone failed the INSERT ("foreign
+  key mismatch"); it is one only when it fires UPDATE triggers or
+  changes a key (`sqlite3FkRequired`), `Connection::upsert_multi`.
+- A counter below zero passed the checks: the pin's
+  `sqlite3VdbeCheckFkImmediate` / `CheckFkDeferred` fail any non-zero
+  count (probed: two orphans left with the pragma off, one counted
+  violation, then the parent row: −1, COMMIT fails).
+- An UPDATE changing no key checked self-referencing keys anyway;
+  the pin's `sqlite3FkRequired` checks none then.
+- `defer_foreign_keys` survived the pragmas whose programs read the
+  file (probed with the schema loaded: table_info, index_list,
+  integrity_check, user_version, page_count, journal_mode, table_list
+  … clear it; the flags, encoding, cache_size, auto_vacuum,
+  synchronous do not; foreign_key_check / foreign_key_list only when
+  a table they read has keys; a pragma that fails never ran).
+- `nest_may_abort` counted any key as an abort point when the pragma
+  is on; it now follows the pin's `sqlite3MayAbort` calls
+  (`fk_may_abort`): an immediate key's lookup of a row added, an
+  immediate key's parent removed unless CASCADE / SET NULL, a
+  RESTRICT program, only for writes requiring keys, and the action
+  programs' writes walked in turn (a SET NULL's own key not looked
+  up) — so a depth error inside BEGIN keeps the changes when the
+  pin does.
+- An upsert DO UPDATE did not read its row again after BEFORE
+  UPDATE triggers (`triggers`): a row they — or a cascade they ran —
+  deleted was updated anyway, a column they changed was overwritten.
+  It now does what UPDATE does: a vanished row is skipped, the
+  unassigned columns take their current values, the index entries
+  removed are the stored row's.
+
+**Oracle-probing notes:** INSTEAD OF writes fail on immediate
+violations (and deferred in autocommit, RETURNING rows first); the
+rowid conflict's "UNIQUE constraint failed: c.id" under every
+conflict clause, OR ROLLBACK then ending the transaction; ADD COLUMN
+REFERENCES DEFAULT on an empty table; `RAISE(FAIL)` with pending
+violations; `isSetNullAction` after BEFORE INSERT / UPDATE triggers,
+in later statements of a program, through INSTEAD OF bodies, upsert,
+and the cache by conflict action (a BEFORE UPDATE trigger compiled
+under ABORT by a SET NULL program and again under OE_Default by the
+statement makes the second compile the head); negative counters;
+which pragmas clear `defer_foreign_keys` (in one connection — a
+fresh connection's first schema load clears it too, see gaps); the
+abort points (deferred and CASCADE / SET NULL keys hold none, an
+UPDATE of a non-key column none).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed". The corpora agreed with the pin
+over 30+ seeds × 300 scripts each (both generators).
+
+**Size:** tiny **76,924 B** (Δ **0**). Full **486,132 B** (Δ **+56 B**
+vs the 486,076 ratchet, raised): ADD COLUMN's empty-only refusal
+carrying its error kind (ungated `v16`). Max **606,204 B** (Δ
+**+6,948 B** vs 599,256, raised; under the 32 KiB threshold): the
+compile-order replay, the abort-point model, the INSTEAD OF / FAIL /
+rowid / upsert fixes.
+
+**Honest gaps (after the review fixes):**
+
+- The compile-order replay keys trigger programs by name and the
+  conflict action hipp's runtime passes, which matches the pin's
+  `orconf` for every path probed; a trigger whose body fails to plan
+  contributes no programs. DROP TABLE's implicit DELETE is not
+  replayed (its SET NULL programs' own sites never matter: all their
+  key values are NULL).
+- A fresh connection's first schema load clears `defer_foreign_keys`
+  on the pin (`PRAGMA defer_foreign_keys = ON` as the first
+  statement, then any schema-reading statement); hipp loads the
+  schema when it opens, so it keeps the flag there.
+- `nest_may_abort` (triggers unit) still counts an UPDATE of a table
+  with a rowid alias as an abort point, where the pin opens no
+  statement journal unless the rowid changes: a depth error inside
+  BEGIN then undoes the statement where the pin keeps it (probed
+  with the pragma off too; the program corpus leaves
+  `recursive_triggers` off for it).
+- The program corpus keeps bodies that update the child tables off
+  the child tables: such scripts can grow the table per row updated
+  and run for minutes on both engines.
+- The original subsection's other gaps stand (hash order of the
+  whole-database `foreign_key_check`, full child scans, SET DEFAULT
+  evaluated once per action statement).
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

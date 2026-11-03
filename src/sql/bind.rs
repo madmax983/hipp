@@ -161,6 +161,12 @@ impl Binder<'_> {
             Expr::Literal(_) | Expr::Column { .. } => {}
             #[cfg(feature = "v04")]
             Expr::HexTooBig(_) => {}
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            Expr::TrigValue(..) => {}
+            #[cfg(feature = "triggers")]
+            Expr::Raise(_, None, _) => {}
+            #[cfg(feature = "triggers")]
+            Expr::Raise(_, Some(a), _) => self.expr::<E>(a)?,
             Expr::Binary(_, a, c) | Expr::Like(a, c, _) => {
                 self.expr::<E>(a)?;
                 self.expr::<E>(c)?;
@@ -225,10 +231,26 @@ impl Binder<'_> {
                     if let Some(x) = &mut c.filter {
                         self.expr::<E>(x)?;
                     }
+                    #[cfg(feature = "window")]
+                    if let Some(super::ast::Over::Spec(w)) = &mut c.over {
+                        self.window::<E>(w)?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// A window definition's expressions (v0.16, `window`).
+    #[cfg(feature = "window")]
+    fn window<E>(&self, w: &mut super::ast::WindowDef) -> Result<(), E> {
+        let mut r = Ok(());
+        w.exprs_mut(&mut |x| {
+            if r.is_ok() {
+                r = self.expr::<E>(x);
+            }
+        });
+        r
     }
 
     fn items<E>(&self, items: &mut [SelectItem]) -> Result<(), E> {
@@ -311,6 +333,10 @@ impl Binder<'_> {
         }
         if let Some(h) = &mut s.having {
             self.expr::<E>(h)?;
+        }
+        #[cfg(feature = "window")]
+        for (_, w) in s.windows.as_mut_slice() {
+            self.window::<E>(w)?;
         }
         for row in s.values.as_mut_slice() {
             for e in row.as_mut_slice() {
@@ -408,6 +434,12 @@ fn constant(e: &Expr) -> bool {
         Expr::Literal(_) | Expr::Column { .. } | Expr::Param(..) => true,
         #[cfg(feature = "v04")]
         Expr::HexTooBig(_) => true,
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        Expr::TrigValue(..) => true,
+        #[cfg(feature = "triggers")]
+        Expr::Raise(_, None, _) => true,
+        #[cfg(feature = "triggers")]
+        Expr::Raise(_, Some(a), _) => constant(a),
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => constant(a) && constant(b),
         Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             constant(a)
