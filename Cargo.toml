@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys", "json"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -198,6 +198,26 @@ foreign_keys = ["v16", "indexes"]
 # value conversions, table-valued sources in FROM), so it implies
 # `v16`. The tiny profile excludes it per §2.
 json = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): expression indexes, partial indexes and index-aware
+# planning -- CREATE [UNIQUE] INDEX ... ON t(expr [COLLATE c]
+# [DESC], ...) [WHERE expr] with the pin's restrictions
+# (deterministic functions only, no subqueries, parameters,
+# aggregates or qualified / rowid references in key expressions),
+# maintained on every write path (INSERT / UPDATE / DELETE /
+# REPLACE / upsert, UNIQUE enforced over the rows the WHERE admits,
+# upsert targets naming an expression or a partial index's WHERE),
+# PRAGMA index_info / index_xinfo (cid -2), integrity_check, REINDEX
+# and ALTER TABLE over them; and the planner that answers equality,
+# IN and range terms (and ORDER BY) through the rowid, PRIMARY KEY,
+# UNIQUE, ordinary, partial and expression indexes in SELECT,
+# subqueries, joins, UPDATE and DELETE, in the pin's row order.
+# Without it such indexes in a file are listed but refused for
+# writes (never left stale), and scans read the table in rowid
+# order. Builds on the v0.16 rule machinery (generated columns,
+# CHECK) and index collations, so it implies `v16` and `indexes`.
+# The tiny profile excludes it per §2.
+expr_index = ["v16", "indexes"]
 
 [dependencies]
 

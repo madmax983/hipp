@@ -1807,9 +1807,10 @@ fn regression_sqlite_master_qualifies_sqlite_schema() {
 }
 
 /// The full check of a table with an expression or partial index
-/// is refused before anything is reported (it printed a false
-/// "wrong # of entries", or "ok", then failed); the quick check,
-/// which reads no index keys, answers as the pin does.
+/// answers as the pin does (v0.16, `expr_index`); without it, it is
+/// refused before anything is reported (it printed a false "wrong #
+/// of entries", or "ok", then failed). The quick check, which reads
+/// no index keys, answers as the pin does either way.
 #[test]
 fn regression_integrity_check_expression_and_partial_indexes() {
     for (i, ix) in [
@@ -1829,8 +1830,13 @@ fn regression_integrity_check_expression_and_partial_indexes() {
         }
         for q in ["PRAGMA integrity_check", "PRAGMA integrity_check(t)"] {
             let (hok, hl, he) = hipp_script(&p, q);
-            assert!(!hok && hl.is_empty(), "{ix}: {q}: {hl:?}");
-            assert!(matches!(he, Some(Error::Unsupported)), "{he:?}");
+            if cfg!(feature = "expr_index") {
+                assert!(hok, "{ix}: {q}: {he:?}");
+                assert_eq!(hl, oracle_script(&p, q).1, "{ix}: {q}");
+            } else {
+                assert!(!hok && hl.is_empty(), "{ix}: {q}: {hl:?}");
+                assert!(matches!(he, Some(Error::Unsupported)), "{he:?}");
+            }
         }
     }
 }

@@ -96,6 +96,8 @@ impl<S: Storage> Connection<S> {
             gcols: None,
             rec: 0,
             tvf: kind,
+            #[cfg(feature = "expr_index")]
+            access: None,
         });
         Ok(w)
     }

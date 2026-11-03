@@ -894,6 +894,10 @@ impl<S: Storage> Statement<'_, S> {
         } else {
             None
         };
+        // v0.16 (`expr_index`): an expression / partial index
+        // computes its keys (resolved before anything is freed).
+        #[cfg(feature = "expr_index")]
+        let ext = self.conn.index_ext(&self.arena, &t, &ix)?;
         let pages = btree::collect_index_pages(&mut self.conn.pager, ix.root).await?;
         for &p in pages.iter() {
             if p != ix.root {
@@ -905,15 +909,22 @@ impl<S: Storage> Statement<'_, S> {
         let mut cursor = ScanCursor::new(t.root);
         let mut buf = AVec::new();
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-            let key = index_key_for_row(
+            let Some(key) = index_key_for_row(
                 cols.as_slice(),
+                #[cfg(feature = "expr_index")]
+                ext.as_deref(),
                 t.rowid_alias,
                 defaults.as_slice(),
                 buf.as_slice(),
                 t.columns.len(),
                 rowid,
                 gcols.as_deref(),
-            )?;
+                #[cfg(feature = "expr_index")]
+                Some(&self.conn.env),
+            )?
+            else {
+                continue;
+            };
             if ix.unique
                 && key_has_no_null(key.as_slice())
                 && btree::index_first_with_prefix(

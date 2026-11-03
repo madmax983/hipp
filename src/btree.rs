@@ -432,6 +432,11 @@ pub struct ScanCursor {
     leaf_cache_page: u32,
     leaf_img: AVec<u8>,
     leaf_meta: AVec<CellMeta>,
+    /// Rows below this rowid are skipped, interior pages descending
+    /// straight to it (v0.16, `expr_index`: a rowid range scan);
+    /// cleared once a row at or past it is reached.
+    #[cfg(feature = "expr_index")]
+    min: Option<i64>,
 }
 
 impl ScanCursor {
@@ -444,7 +449,18 @@ impl ScanCursor {
             leaf_cache_page: 0,
             leaf_img: AVec::new(),
             leaf_meta: AVec::new(),
+            #[cfg(feature = "expr_index")]
+            min: None,
         }
+    }
+
+    /// A scan starting at the first row whose rowid is `min` or more
+    /// (v0.16, `expr_index`).
+    #[cfg(feature = "expr_index")]
+    pub fn from_rowid(root: u32, min: i64) -> ScanCursor {
+        let mut c = ScanCursor::new(root);
+        c.min = Some(min);
+        c
     }
 
     /// Advance to the next row: (rowid, full payload).
@@ -520,6 +536,18 @@ impl ScanCursor {
                 }
                 let cell = self.leaf_meta.as_slice()[ci];
                 let (rowid, plen, ovf) = (cell.rowid, cell.payload_len, cell.overflow);
+                #[cfg(feature = "expr_index")]
+                if let Some(m) = self.min {
+                    if rowid < m {
+                        if let Some(ScanFrame::Leaf { next_cell, .. }) =
+                            self.stack.as_mut_slice().last_mut()
+                        {
+                            *next_cell = ci + 1;
+                        }
+                        continue;
+                    }
+                    self.min = None;
+                }
                 let local =
                     &self.leaf_img.as_slice()[cell.local_off..cell.local_off + cell.local_len];
                 // Checkpoint progress BEFORE the payload awaits
@@ -540,6 +568,16 @@ impl ScanCursor {
                 _ => unreachable!(),
             };
             let (pairs, rightmost) = interior_cells::<S::Error>(pager.frame_data(idx), page)?;
+            // A rowid range scan's first descent (v0.16): straight to
+            // the child that may hold its first row.
+            #[cfg(feature = "expr_index")]
+            let ci = match self.min {
+                Some(m) if ci == 0 => pairs
+                    .iter()
+                    .position(|(_, k)| *k >= m)
+                    .unwrap_or(pairs.len()),
+                _ => ci,
+            };
             if ci > pairs.len() {
                 self.stack.pop();
                 continue;

@@ -885,6 +885,11 @@ pub struct SubSource {
     /// shifts, aggregates, subqueries) sees them.
     #[cfg(feature = "json")]
     pub tvf: u8,
+    /// The source's index access path (v0.16, `expr_index`): the
+    /// rows an index or the rowid B-tree finds, in its order; `None`
+    /// scans the table in rowid order.
+    #[cfg(feature = "expr_index")]
+    pub access: Option<Box<crate::xplan::IdxAccess>>,
 }
 
 /// `SubSource::tvf`: the arguments read a FROM source to the left,
@@ -1417,7 +1422,7 @@ fn alias_from_outer<E>(
 /// rowid source at or past `at.1` by `by.1`, through nested
 /// subquery plans (v0.16, `alias_from_outer`).
 #[cfg(feature = "v16")]
-fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
+pub(crate) fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
     match e {
         RExpr::Column(slot, ..) => {
             if *slot >= at.0 {
@@ -4790,6 +4795,45 @@ fn adjust_in(x: &RExpr, xv: OwnedValue, iv: OwnedValue) -> (OwnedValue, OwnedVal
         CmpClass::Blob | CmpClass::None => return (xv, iv),
     };
     (apply_cmp_affinity(xv, aff), apply_cmp_affinity(iv, aff))
+}
+
+/// How an index lookup converts a probe value compared with an
+/// index key `key` (v0.16, `expr_index`; the pin's
+/// `indexAffinityOk` and comparison affinity): `None` when the
+/// comparison's affinity makes the index unusable (a numeric
+/// operand against a TEXT, BLOB or affinity-less key; a TEXT
+/// column against an affinity-less key), else the affinity applied
+/// to the probe (`Some(None)`: none).
+#[cfg(feature = "expr_index")]
+pub(crate) fn index_probe_aff(key: &RExpr, val: &RExpr) -> Option<Option<Affinity>> {
+    match (cmp_class(key), cmp_class(val)) {
+        (CmpClass::Numeric, _) => Some(Some(Affinity::Numeric)),
+        (_, CmpClass::Numeric) => None,
+        (CmpClass::Text, CmpClass::None) => Some(Some(Affinity::Text)),
+        (CmpClass::None, CmpClass::Text) => None,
+        _ => Some(None),
+    }
+}
+
+/// How an index lookup converts the items of a written `key IN
+/// (list)` (v0.16, `expr_index`): by the left operand's comparison
+/// affinity alone (`adjust_in`).
+#[cfg(feature = "expr_index")]
+pub(crate) fn index_in_aff(key: &RExpr) -> Option<Affinity> {
+    match cmp_class(key) {
+        CmpClass::Numeric => Some(Affinity::Numeric),
+        CmpClass::Text => Some(Affinity::Text),
+        CmpClass::Blob | CmpClass::None => None,
+    }
+}
+
+/// `apply_cmp_affinity` for index probes (v0.16, `expr_index`).
+#[cfg(feature = "expr_index")]
+pub(crate) fn probe_value(v: OwnedValue, aff: Option<Affinity>) -> OwnedValue {
+    match aff {
+        Some(a) => apply_cmp_affinity(v, a),
+        None => v,
+    }
 }
 
 fn apply_cmp_affinity(v: OwnedValue, aff: Affinity) -> OwnedValue {

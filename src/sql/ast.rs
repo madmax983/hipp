@@ -126,6 +126,12 @@ pub struct IndexColumnDef {
     /// `None` takes the table column's collation.
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub coll: Option<Coll>,
+    /// An expression key column (v0.16, `expr_index`): the item's
+    /// text, `COLLATE` included (`name` is then empty). A bare
+    /// column name, a lone string (the pin's `sqlite3StringToId`)
+    /// and either under a `COLLATE` are column items, `None` here.
+    #[cfg(feature = "expr_index")]
+    pub expr: Option<ABytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -839,6 +845,11 @@ pub struct Upsert {
     /// only an index column of that collation (the pin's
     /// upsert-target rule); `None` matches any.
     pub target_colls: AVec<Option<crate::record::Coll>>,
+    /// Per target item (v0.16, `expr_index`), parallel to `target`:
+    /// an expression item (`ON CONFLICT (a + b)`), its `COLLATE`
+    /// in `target_colls`; `None` for a column (named in `target`).
+    #[cfg(feature = "expr_index")]
+    pub target_exprs: AVec<Option<Expr>>,
     /// The target's optional index predicate (`ON CONFLICT (a)
     /// WHERE ...`): parsed and name-resolved at plan time (an
     /// unknown column errors, as in the oracle), but never
@@ -894,6 +905,9 @@ pub enum Ast {
         unique: bool,
         if_not_exists: bool,
         columns: AVec<IndexColumnDef>,
+        /// A partial index's `WHERE` text (v0.16, `expr_index`).
+        #[cfg(feature = "expr_index")]
+        filter: Option<ABytes>,
     },
     /// `DROP INDEX` (v0.3).
     DropIndex {

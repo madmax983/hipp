@@ -4969,6 +4969,186 @@ patch, validity check, the `json_each` cursor) and its wiring.
   abs(-9223372036854775808)`) is not computed, where the pin factors
   it out and fails.
 
+### Expression indexes, partial indexes and index-aware planning (2026-11-03)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `expr_index` (`expr_index =
+["v16", "indexes"]`, in `max`, not `full`; `v16,expr_index` in
+`ci/feature-sets.txt`). The unit measured +32.3 KB of `max`, which
+would leave `full` (486 KB) less than 6 KB under the ~500 KiB line
+ADR 0002 draws, so it is a leaf, as the unit's brief directs. Census
+(246 probes, 21 new): MATCH 203, HIPP_ERR 8, DIFF 2, BOTH_ERR 33 —
+`partial_index` and `expr_index` moved HIPP_ERR → MATCH, every new
+`xi_*` probe matches (15) or fails on both (6).
+
+**Shipped — leaf feature `expr_index`** (new `src/xplan.rs`,
+`src/session/xindex.rs`; `schema::IndexExt`, `query::SubSource::access`):
+
+- **Definitions.** `CREATE [UNIQUE] INDEX ... ON t(<expr> [COLLATE c]
+  [ASC|DESC], ...) [WHERE <expr>]`: every key item is an expression;
+  a bare column, a lone string (the pin's `sqlite3StringToId`) and
+  either under a top-level COLLATE stay column items (`(a)`, `'a'`,
+  `(a COLLATE NOCASE)`); an expression column's collation is its
+  explicit COLLATE, else BINARY. The pin's errors as remedy-named
+  kinds: `SubqueryInIndex`, `NonDeterministic` (random, randomblob,
+  changes, total_changes, last_insert_rowid, sqlite_version),
+  `QualifiedIndexColumn` (`t.a` in a key expression), `MisusedAggregate`,
+  `MisusedWindow`, `UnknownColumn` (`rowid` in a key expression, an
+  unknown name), `RowValueMisused`, `ParameterNotAllowed`; the WHERE
+  allows `t.b` and `rowid`. Stored texts are the pin's; ALTER TABLE
+  RENAME / RENAME COLUMN rewrite them, DROP COLUMN refuses a column an
+  index expression or WHERE reads, all as the pin (the alter.rs token
+  walk already covered both).
+- **Maintenance.** One key function (`ix_key` / `xindex::ext_key`)
+  serves every write path: INSERT (plain, OR REPLACE, OR IGNORE,
+  REPLACE, upsert DO UPDATE / NOTHING), UPDATE (incl. OR REPLACE),
+  DELETE, the REPLACE victim delete, CREATE INDEX population, REINDEX
+  and integrity_check. A row a partial index's WHERE does not make true
+  (NULL excludes) has no entry, so UNIQUE is enforced only among the
+  admitted rows. VIRTUAL generated columns are computed before the
+  expressions read them; REAL columns read as REALs (`rules::eval_row`).
+- **Upsert targets** (the pin's `sqlite3UpsertAnalyzeTarget`): target
+  items are expressions; the newest UNIQUE index whose key columns are
+  exactly the items (any order, an item's COLLATE matching) is the
+  target, a partial one only when the target's WHERE is the same
+  expression as the index's (`b > 0` matches `(b > 0)`, not `0 < b` or
+  `b > 1` — probed); such a target arbitrates only that index's
+  conflicts (`UpsertPlan::target_root`).
+- **Introspection.** `PRAGMA index_xinfo` / `index_info` give an
+  expression column cid -2 and no name (an INTEGER PRIMARY KEY column
+  keeps its cid, as on the pin); `index_list`'s `partial`;
+  integrity_check computes each row's entry and, for a partial index,
+  compares its entry count with the admitted rows (the pin's counter);
+  VACUUM copies the indexes byte for byte; ANALYZE writes their stats.
+- **Files the pin made** with such indexes are read and written; the
+  pin's integrity_check passes on every file hipp wrote in the suites.
+  An index hipp cannot compute (a function it lacks, e.g. the pin's
+  `date()`) makes writes to its table fail (`UnknownFunction`) rather
+  than leave the index stale; reads work.
+- **Index-aware planning** (`xplan`): each FROM source of every query
+  core (top level, subqueries, views, CTE bodies, trigger programs),
+  and each UPDATE / DELETE target, gets the access path the pin's
+  planner would pick for it from the schema and the query: the rowid
+  B-tree (`=`, IN, ranges, via a seekable `ScanCursor::from_rowid`) or
+  an index (an equality / IN prefix, then a range — also on the
+  trailing rowid —, or a full scan), a partial index only when the
+  WHERE implies its WHERE (`sqlite3ExprImpliesExpr` with the pin's
+  `exprImpliesNotNull` walk), an expression index when the query names
+  the same expression (`query::same_expr`). Terms: `=`, `IS`, `<`,
+  `<=`, `>`, `>=`, `BETWEEN`, `IN (list)`, `IS NULL`, the pin's
+  OR-to-IN rewrite and its virtual `x > NULL` for `x IS NOT NULL`; a
+  term is usable only under the index column's collation (any for IS
+  NULL) and when the pin's `indexAffinityOk` allows it, and its probe
+  is converted by the comparison's affinity (`query::index_probe_aff`).
+  The chooser reproduces the pin's no-statistics cost model in its
+  `LogEst` arithmetic (`whereLoopAddBtree[Index]`, `whereRangeScanEst`,
+  `whereLoopOutputAdjust`, `whereSortingCost`, the two-pass
+  `wherePathSolver` with its (cost, rows, unsorted-cost) tie order,
+  `sqlite3DefaultRowEst`, `szEst` widths, covering / ORDER BY / partial
+  full index scans) and the pin's "ordered inner loop" scan direction.
+  The executor reads only the rows the path finds, in its order, and
+  still evaluates every WHERE / ON term on them, so a plan can change
+  the order and the work, never the rows. A join source whose probes
+  read an earlier source is looked up per combination (`join_step`);
+  RIGHT / FULL joins keep whole tables. Rows that arrive in GROUP BY
+  order are grouped as they arrive (a DESC index emits groups largest
+  first, as the pin skips its group sorter). An UPDATE visits rows in
+  rowid order (the pin's two-pass write) unless it is the pin's
+  one-pass loop — no RETURNING, UPDATE trigger, foreign keys, FROM,
+  REPLACE, rowid change or WHERE subquery, and the loop's index not
+  changed by the SET — which keeps the index order (an `UPDATE OR FAIL`
+  stops where the pin stops); DELETE visits rowid order. A probe value
+  may be an uncorrelated or correlated subquery (evaluated on the row
+  padded to the core's width); non-deterministic values are not
+  probed. `SELECT col FROM t` on a table with an index goes through the
+  general planner (the pin may read a covering index).
+
+**Oracle-probing notes** (all on the live pin, before and during
+implementation): the error matrix above (`'x'` as a key item is a
+column name, `1` and `(a, a) = (1, 1)` in a WHERE are accepted, `x.a`
+is "no such column", `main.t.b` in a WHERE is accepted — hipp's parser
+refuses three-part names anywhere, a pre-existing gap); index_xinfo
+rows (`(d)` over an INTEGER PRIMARY KEY is cid 3); `UNIQUE constraint
+failed: index 'u'` for an expression index; upsert target matching is
+an exact expression compare; RENAME COLUMN to `[new col]` writes
+`"new col"`. Planner: no-ORDER-BY output follows the chosen index
+(ranges in key order, IN lists in the key column's direction — a DESC
+column walks them largest first —, `SELECT b FROM t` through a narrower
+covering index, `ORDER BY b DESC` over an ascending index gives ties in
+reverse rowid order, GROUP BY over `b DESC` emits groups descending);
+ties between equal-cost indexes go to the newest (the pin's prepended
+`pIndex` list), except that among loops delivering the ORDER BY the one
+with fewer key columns wins (`(d)` over `(d, a)`); an IN on an earlier
+column charges its iterations at its own level only (`b IN (16 values)
+AND c = ?` still prefers `(b, c)` to `(c)`); `x IS NULL` uses an index of
+any collation; `a + 1 = 1` implies `a IS NOT NULL` for a partial index;
+an ORDER BY a loop does not deliver still reverses it when the loop's
+IN columns held constant would (`d IN (...) ORDER BY b DESC` over
+`(d, b)`); UPDATE / DELETE with RETURNING or triggers visit rowid order,
+a one-pass UPDATE the index order (`UPDATE OR FAIL ... WHERE b > 2`).
+The pin's oracle build has no STAT4 (`PRAGMA compile_options`).
+
+**Bugs found during the unit** (all fixed, regression lines in
+`tests/expr_index_v16.rs` `regressions`): IN lists walked ascending on a
+DESC key column; `IS NULL` refused for an index of another collation;
+equal-cost ties broken by rows instead of the unsorted cost (a covering
+scan lost to the table scan); `exprImpliesNotNull` without the
+arithmetic walk (a partial index ignored); IN columns treated as ending
+the delivered ORDER BY; groups re-sorted after an index delivered a
+DESC GROUP BY order; a scalar-subquery probe evaluated on the unpadded
+outer row (wrong slots — caught by `tests/subqueries.rs`); the legacy
+`SELECT col FROM t` path skipping covering index scans.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed" (`v16,expr_index` compiles warning-free
+alone, as does `indexes`). New suites: `tests/expr_index_v16.rs` (13
+tests: partial and expression index maintenance, definition errors,
+introspection, ALTER / REINDEX / VACUUM, pin-made files written by hipp
+and checked by the pin, planner order, write order, joins and
+subqueries, regressions, two generated corpora — random schemas /
+indexes / data / queries compared row-for-row in order, random writes
+with RETURNING / OR FAIL / REPLACE / GROUP BY / correlated subqueries /
+joins plus the pin's integrity_check on every file — 150 and 75 cases by
+default, `HIPP_EXPRIDX_CORPUS` scales them, 800 / 400 agreed — and a
+100,000-row table where 300 index lookups run faster than 3 full scans
+and agree with the pin), `src/xplan.rs` unit tests (LogEst, szEst),
+`hipp-cli/tests/cli_v16_expr_index.rs` (3 tests, byte-identical
+one-shot and over stdin: schema texts and pragmas, planner order, a
+generated corpus). Existing suites updated where they asserted the old
+refusals (`tests/indexes.rs` — plus a new test that an uncomputable
+index blocks writes —, `tests/maintenance_v16.rs`, `tests/pragma_v16.rs`).
+
+**Size:** tiny **76,924 B** (Δ **0**). Full **486,300 B** (Δ **−16 B**,
+ratchet lowered: the write paths' shared key helper). Max **671,044 B**
+(Δ **+32,288 B** vs 638,756, raised; just under the 32 KiB threshold):
+the index definitions and maintenance (~7 KB) and the planner, its cost
+model and the access-path executor (~25 KB).
+
+**Honest gaps:**
+
+- The planner is a model of the pin's, not the pin's: joins run in FROM
+  order (the pin may reorder them; the suites compare join rows without
+  their order), no automatic indexes, no MULTI-INDEX OR, no LIKE prefix
+  ranges, no skip-scans, and `sqlite_stat1` / `sqlite_stat4` are never
+  read (after ANALYZE the pin may choose another index; hipp keeps the
+  default estimates). Some tie and cost details remain unexplained: a
+  partial index whose WHERE is `x IS NOT NULL` competing with an index
+  led by `x` (the pin's choice there depends on creation order in a way
+  the model does not reproduce; 1 in ~1,000 generated cases still
+  differs in row order).
+- Row order of an UPDATE treats foreign keys conservatively (any FK
+  enforcement makes it rowid order; the pin only when the FK columns
+  change) and detects constraint-level `ON CONFLICT REPLACE` by the
+  table text.
+- `INDEXED BY` / `NOT INDEXED` are not parsed; a covering index scan
+  still reads each table row (by rowid) rather than the index entry.
+- An expression index's key value takes no affinity (the pin applies the
+  expression's affinity, which only matters for a CAST to REAL of an
+  integral value: equal keys either way).
+- Three-part names (`main.t.b`) are refused everywhere, so such a
+  partial index WHERE written by the pin is a definition hipp cannot
+  compute: writes to its table are refused.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

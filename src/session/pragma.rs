@@ -1007,7 +1007,18 @@ impl<S: Storage> Connection<S> {
         let n = ix.columns.len();
         for (i, c) in ix.columns.iter().enumerate() {
             let col = c.col.or(t.rowid_alias);
+            // An expression column (v0.16, `expr_index`): cid -2,
+            // no name, as on the pin.
+            #[cfg(feature = "expr_index")]
+            let col = match &ix.ext {
+                Some(x) if x.exprs.as_slice().get(i).is_some_and(|e| e.is_some()) => {
+                    Some(usize::MAX)
+                }
+                _ => col,
+            };
             let (cid, cname) = match col {
+                #[cfg(feature = "expr_index")]
+                Some(usize::MAX) => (-2, OwnedValue::Null),
                 Some(k) => (
                     k as i64,
                     t.columns
@@ -1802,7 +1813,7 @@ impl<S: Storage> Statement<'_, S> {
         let indexes = if quick {
             AVec::new()
         } else {
-            let mut v = self.conn.write_index_plans(tname)?;
+            let mut v = self.conn.write_index_plans(&scratch(), tname)?;
             // The pin's `pIndex` order: newest first.
             let mut r = AVec::new();
             while let Some(x) = v.pop() {
@@ -1856,6 +1867,14 @@ impl<S: Storage> Statement<'_, S> {
         let mut buf = AVec::new();
         // The pin's messages name a row by its scan ordinal.
         let mut nrow: i64 = 0;
+        // Rows each index should hold (a partial index's count is
+        // checked against these, after the rows).
+        #[cfg(feature = "indexes")]
+        let mut in_index: AVec<u64> = AVec::new();
+        #[cfg(feature = "indexes")]
+        for _ in indexes.iter() {
+            in_index.push(0);
+        }
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
             if out.stop {
                 return Ok(());
@@ -1937,15 +1956,23 @@ impl<S: Storage> Statement<'_, S> {
                 }
             }
             #[cfg(feature = "indexes")]
-            for (ix, iname) in indexes.iter().zip(inames.iter()) {
-                let mut key = AVec::new();
-                for c in ix.cols.iter() {
-                    key.push(match c.col {
-                        Some(i) if Some(i) != alias => {
-                            rec.as_slice().get(i).cloned().unwrap_or(OwnedValue::Null)
-                        }
-                        _ => OwnedValue::Integer(rowid),
-                    });
+            for (j, (ix, iname)) in indexes.iter().zip(inames.iter()).enumerate() {
+                // v0.16 (`expr_index`): an expression index's key is
+                // computed; a row a partial index's WHERE rejects
+                // has no entry to find.
+                let Some(key) = ix_key::<S::Error>(
+                    ix,
+                    rec.as_slice(),
+                    rowid,
+                    alias,
+                    #[cfg(feature = "expr_index")]
+                    &self.conn.env,
+                )?
+                else {
+                    continue;
+                };
+                if let Some(n) = in_index.as_mut_slice().get_mut(j) {
+                    *n += 1;
                 }
                 let unique = ix.unique && key_has_no_null(key.as_slice());
                 let (found, dup) = btree::index_check_entry(
@@ -1975,6 +2002,27 @@ impl<S: Storage> Statement<'_, S> {
             }
         }
         let _ = nrow;
+        // A partial index's entry count against the rows its WHERE
+        // admits (v0.16, `expr_index`: the pin's per-index counter,
+        // compared after the row loop).
+        #[cfg(feature = "expr_index")]
+        for ((ix, iname), want) in indexes.iter().zip(inames.iter()).zip(in_index.iter()) {
+            if ix.ext.as_ref().is_none_or(|x| x.pred.is_none()) {
+                continue;
+            }
+            let mut cur = btree::IndexCursor::new(ix.root, ix.desc.as_slice());
+            let mut have = 0u64;
+            while cur.next_entry(&mut self.conn.pager).await?.is_some() {
+                have += 1;
+            }
+            if have != *want {
+                let mut m = copy_vec(b"wrong # of entries in index ");
+                m.extend_from_slice(iname.as_slice());
+                if !out.emit(m) {
+                    return Ok(());
+                }
+            }
+        }
         Ok(())
     }
 }

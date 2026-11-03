@@ -315,7 +315,7 @@ aspirations.
   — its record-header test ("database disk image is malformed")
   and its index seek, message shapes, order and limit (a full
   check of a table with an expression or partial index is
-  refused); the table-valued `pragma_table_info('t')` and
+  refused without `expr_index`); the table-valued `pragma_table_info('t')` and
   friends in FROM with the pin's hidden-column arities;
   `sqlite_schema` / `sqlite_master` readable as ordinary tables
   under either name (writes refused). Unknown pragma names are
@@ -411,7 +411,7 @@ aspirations.
   expression (`?`, `''`); a new rowid past 9223372036854775807
   takes an unused one. Gaps: whole-database ANALYZE row order (the
   pin's schema hash), VACUUM of a file with an expression or
-  partial index, VACUUM of an auto-vacuum file (refused: hipp
+  partial index without `expr_index`, VACUUM of an auto-vacuum file (refused: hipp
   writes no pointer maps), constraint-level ROLLBACK matched by
   constraint kind (STATUS.md).
 - **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
@@ -573,6 +573,30 @@ aspirations.
   ON / FILTER / CASE WHEN / iif conditions short-circuit AND / OR as
   the pin's jump code does. Tiny unchanged, full +184 B (that fix),
   max +32.6 KB (STATUS.md).
+- **Expression indexes, partial indexes and index-aware planning**
+  (new leaf feature `expr_index`, in `max` — ADR 0002 — not
+  `full`): `CREATE [UNIQUE] INDEX ... ON t(a + b, lower(c) COLLATE
+  NOCASE DESC) [WHERE expr]` with the pin's definition errors
+  (subqueries, non-deterministic functions, aggregates, window
+  calls, `t.a` / `rowid` in key expressions, parameters), maintained
+  by INSERT / UPDATE / DELETE / REPLACE / upsert (UNIQUE over the
+  rows the WHERE admits; `ON CONFLICT (a + b)` and `ON CONFLICT (a)
+  WHERE <the index's WHERE>` targets), PRAGMA index_list /
+  index_info / index_xinfo (cid -2), integrity_check (a partial
+  index's entry count included), REINDEX, VACUUM, ANALYZE and ALTER
+  TABLE RENAME / RENAME COLUMN / DROP COLUMN as the pin; files the
+  pin made with such indexes are read and written. The planner reads
+  equality, IN, range, IS NULL and OR-of-equality terms (and ORDER
+  BY / GROUP BY / DISTINCT) through the rowid, PRIMARY KEY, UNIQUE,
+  ordinary, partial and expression indexes in SELECT, subqueries,
+  joins (lookups per outer row), UPDATE and DELETE, choosing the
+  index the pin's cost model chooses without statistics, so rows
+  come in the pin's order (covering index scans, ORDER BY ties in
+  the index's direction, GROUP BY over a DESC index, an UPDATE OR
+  FAIL's partial work). A point lookup in a 100,000-row table reads
+  a few pages instead of the table. Without the leaf such indexes in
+  a file are refused for writes (never left stale) and scans read
+  rowid order. Tiny unchanged, full −16 B, max +32.3 KB (STATUS.md).
 
 ## What v0.13 does
 
@@ -841,7 +865,8 @@ aspirations.
   seam. Expression and partial foreign indexes are read as
   opaque metadata; writes to their tables are refused rather
   than allowed to desynchronise them. (Since v0.16, NOCASE /
-  RTRIM-collated indexes are maintained, not opaque.)
+  RTRIM-collated indexes are maintained, not opaque, and with
+  `expr_index` expression and partial indexes are too.)
 - Explicit transactions: `BEGIN` / `COMMIT` / `ROLLBACK` over the
   resumable commit machine.
 - Table B-trees with leaf/interior/root splits, overflow chains
@@ -884,7 +909,7 @@ No WAL (files in WAL mode are rejected with `WalUnsupported`),
 no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
 created (refused below `v16`, foreign ones load read-only there;
 `v16` maintains `sqlite_sequence`), no expression or partial
-indexes, no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
+indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed (all of these in the tiny profile: the
 `v04` ... `v16` rungs add them — views execute with `v16`), no
 UTF-16, no multi-process

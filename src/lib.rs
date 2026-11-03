@@ -39,6 +39,8 @@ pub mod sql;
 pub mod storage;
 #[cfg(feature = "window")]
 pub mod window;
+#[cfg(feature = "expr_index")]
+pub mod xplan;
 
 pub use error::{Error, SchemaKind, Scope};
 pub use record::{OwnedValue, Value};

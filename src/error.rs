@@ -189,9 +189,22 @@ pub enum SchemaKind {
     /// `changes()`, `total_changes()`, `last_insert_rowid()`,
     /// `sqlite_version()` — in a generated column (v0.16, `v16`;
     /// the pin's "non-deterministic functions prohibited in
-    /// generated columns"). Compute the value on INSERT instead.
+    /// generated columns"; also in an index expression or a partial
+    /// index's WHERE, v0.16 `expr_index`). Compute the value on
+    /// INSERT instead.
     #[cfg(feature = "v16")]
     NonDeterministic,
+    /// A subquery inside an index expression or a partial index's
+    /// WHERE (v0.16, `expr_index`; the pin's "subqueries prohibited
+    /// in index expressions / partial index WHERE clauses"). Index
+    /// a column of this table, or an expression over its columns.
+    #[cfg(feature = "expr_index")]
+    SubqueryInIndex,
+    /// A qualified column (`t.a`) inside an index expression (v0.16,
+    /// `expr_index`; the pin's "the \".\" operator prohibited in
+    /// index expressions"). Name the column bare.
+    #[cfg(feature = "expr_index")]
+    QualifiedIndexColumn,
     /// A string or blob result of 1,000,000,000 bytes or more
     /// (v0.16, `v16`; the pin's default `SQLITE_LIMIT_LENGTH`,
     /// "string or blob too big"): `zeroblob` / `randomblob` past

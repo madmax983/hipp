@@ -395,7 +395,7 @@ impl<S: Storage> Connection<S> {
         let pk = p.auto_sets.iter().find(|s| s.primary_key);
         let pname_b = handle_bytes(ca, p.name);
         'idx: for ix in self.catalog.indexes_for(ca, pname_b) {
-            if !ix.unique || ix.opaque || ix.columns.len() != n {
+            if !ix.unique || !ix.plain() || ix.columns.len() != n {
                 continue;
             }
             let mut cc = AVec::new();
@@ -943,11 +943,23 @@ fn update_replaces(plan: &Plan, tg: Option<&FkTarget>, assigned: &[bool], rowid_
         || indexes.iter().any(|ix| {
             ix.unique
                 && (all
+                    || ix_reads_any(ix)
                     || ix.cols.iter().any(|c| {
                         c.col
                             .is_some_and(|i| assigned.get(i).copied().unwrap_or(false))
                     }))
         })
+}
+
+/// An expression or partial index (v0.16, `expr_index`): its key
+/// may read any column, so it counts as changed.
+fn ix_reads_any(ix: &IndexPlan) -> bool {
+    #[cfg(feature = "expr_index")]
+    if ix.ext.is_some() {
+        return true;
+    }
+    let _ = ix;
+    false
 }
 
 /// Whether an INSERT OR REPLACE compiles REPLACE deletions on the

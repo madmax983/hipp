@@ -177,6 +177,45 @@ pub struct IndexDef {
     /// v0.3 (see the module docs): it is listed but not
     /// maintainable, and writes to its table are refused.
     pub opaque: bool,
+    /// An expression or partial index's extra definition (v0.16,
+    /// `expr_index`); `None` for an index on plain columns. Code
+    /// that only understands column keys must treat such an index
+    /// as it treats an opaque one (see `IndexDef::plain`).
+    #[cfg(feature = "expr_index")]
+    pub ext: Option<alloc::boxed::Box<IndexExt>>,
+}
+
+/// What an expression or partial index adds to its key columns
+/// (v0.16, `expr_index`): texts re-parsed and resolved against the
+/// table whenever the index is maintained or planned.
+#[cfg(feature = "expr_index")]
+#[derive(Debug, Clone)]
+pub struct IndexExt {
+    /// Per key column, parallel to `IndexDef::columns`: the item's
+    /// expression text for an expression column (its
+    /// `IndexColumn::col` is then `None` and its collation the
+    /// explicit `COLLATE`, else BINARY, as on the pin).
+    pub exprs: AVec<Option<ABytes>>,
+    /// The partial index's `WHERE` text.
+    pub filter: Option<ABytes>,
+}
+
+impl IndexDef {
+    /// An index on plain columns hipp maintains (not opaque, and
+    /// neither an expression nor a partial index).
+    pub fn plain(&self) -> bool {
+        #[cfg(feature = "expr_index")]
+        if self.ext.is_some() {
+            return false;
+        }
+        !self.opaque
+    }
+
+    /// A partial index (v0.16): its stored text has a WHERE.
+    #[cfg(feature = "expr_index")]
+    pub fn partial(&self) -> bool {
+        self.ext.as_ref().is_some_and(|x| x.filter.is_some())
+    }
 }
 
 /// One view (v0.4): stored SQL, inert (never executed). Column
@@ -737,14 +776,41 @@ pub async fn build_catalog<S: Storage>(
                     origin: IndexOrigin::Explicit,
                     columns: AVec::new(),
                     opaque: false,
+                    #[cfg(feature = "expr_index")]
+                    ext: None,
                 };
                 match parsed {
                     Ok(Ast::CreateIndex {
-                        unique, columns, ..
+                        unique,
+                        columns,
+                        #[cfg(feature = "expr_index")]
+                        filter,
+                        ..
                     }) => {
                         idx.unique = unique;
                         let mut ok = true;
+                        #[cfg(feature = "expr_index")]
+                        let mut ext = IndexExt {
+                            exprs: AVec::new(),
+                            filter: match filter {
+                                Some(h) => Some(intern(catalog_arena, handle_bytes(&scratch, h))?),
+                                None => None,
+                            },
+                        };
                         for cd in columns.iter() {
+                            #[cfg(feature = "expr_index")]
+                            if let Some(h) = cd.expr {
+                                ext.exprs
+                                    .push(Some(intern(catalog_arena, handle_bytes(&scratch, h))?));
+                                idx.columns.push(IndexColumn {
+                                    col: None,
+                                    desc: cd.desc,
+                                    coll: cd.coll.unwrap_or_default(),
+                                });
+                                continue;
+                            }
+                            #[cfg(feature = "expr_index")]
+                            ext.exprs.push(None);
                             let nb = handle_bytes(&scratch, cd.name);
                             match resolve_index_column(catalog_arena, &t, nb) {
                                 Ok(col) => idx.columns.push(IndexColumn {
@@ -759,6 +825,10 @@ pub async fn build_catalog<S: Storage>(
                             }
                         }
                         idx.opaque = !ok;
+                        #[cfg(feature = "expr_index")]
+                        if ext.filter.is_some() || ext.exprs.iter().any(|e| e.is_some()) {
+                            idx.ext = Some(alloc::boxed::Box::new(ext));
+                        }
                     }
                     _ => {
                         // Unparseable by the v0.3 grammar
@@ -796,6 +866,8 @@ pub async fn build_catalog<S: Storage>(
                     origin: IndexOrigin::Auto,
                     columns,
                     opaque,
+                    #[cfg(feature = "expr_index")]
+                    ext: None,
                 });
             }
         }

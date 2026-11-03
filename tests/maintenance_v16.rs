@@ -401,13 +401,20 @@ fn vacuum_pin_made_files() {
     assert!(hipp_exec(&h, &["VACUUM"]).is_none());
     common::cli(&o, "VACUUM;");
     assert_eq!(oracle_schema(&h), oracle_schema(&o));
-    // An index hipp cannot order is refused, not mis-copied.
+    // An expression index: copied (v0.16, `expr_index`), else
+    // refused, never mis-copied.
     common::cli(&o, "CREATE INDEX ex ON t(a + 1);");
     std::fs::copy(&o, &h).expect("copy");
-    assert!(matches!(
-        hipp_exec(&h, &["VACUUM"]),
-        Some(hipp::Error::Unsupported)
-    ));
+    if cfg!(feature = "expr_index") {
+        assert!(hipp_exec(&h, &["VACUUM"]).is_none());
+        common::cli(&o, "VACUUM;");
+        assert_eq!(oracle_schema(&h), oracle_schema(&o));
+    } else {
+        assert!(matches!(
+            hipp_exec(&h, &["VACUUM"]),
+            Some(hipp::Error::Unsupported)
+        ));
+    }
     assert_eq!(common::cli(&h, "PRAGMA integrity_check;"), "ok\n");
 }
 

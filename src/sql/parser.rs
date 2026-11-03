@@ -479,6 +479,10 @@ pub fn parse_params<E>(
         #[cfg(not(feature = "v16"))]
         Ast::CreateTable { .. } => true,
         Ast::AlterAddColumn { .. } | Ast::CreateView { .. } => true,
+        // "parameters prohibited in index expressions / partial
+        // index WHERE clauses" (v0.16, `expr_index`).
+        #[cfg(feature = "indexes")]
+        Ast::CreateIndex { .. } => true,
         // "trigger cannot use variables" (v0.16, `triggers`).
         #[cfg(feature = "triggers")]
         Ast::CreateTrigger(_) => true,
@@ -702,6 +706,11 @@ const RULE_HELD: usize = 7;
 /// bottom entry, `with`, `insert_cmd`, `INTO`, `xfullname`,
 /// `idlist_opt`.
 const INS_BASE: usize = 6;
+/// The pin's stack below a CREATE INDEX key item (`createkw
+/// uniqueflag INDEX ifnotexists nm dbnm ON nm LP sortlist`), v0.16
+/// (`expr_index`).
+#[cfg(feature = "expr_index")]
+const IDX_HELD: usize = 10;
 /// ... and below a RETURNING item of an INSERT without an upsert
 /// clause (`select RETURNING sclp scanpt`).
 #[cfg(feature = "v07")]
@@ -1422,6 +1431,47 @@ impl<'a> Parser<'a> {
         let table = self.name::<E>()?;
         self.expect::<E>(Tok::LParen)?;
         let mut columns: AVec<IndexColumnDef> = AVec::new();
+        // v0.16 (`expr_index`): every item is an expression; a
+        // bare column, a lone string and either under a COLLATE
+        // stay column items (the pin's `sqlite3StringToId`, then
+        // `TK_COLUMN` after `sqlite3ExprSkipCollate`).
+        #[cfg(feature = "expr_index")]
+        loop {
+            let at = self.cur().offset;
+            let e = self.item::<E>(IDX_HELD)?;
+            let end = self.cur().offset;
+            let (inner, coll) = match &e {
+                Expr::Collate(x, c) => (x.as_ref(), Some(*c)),
+                x => (x, None),
+            };
+            let col = match inner {
+                Expr::Column { table: None, name } => Some(*name),
+                Expr::Literal(Literal::Text(h)) => Some(*h),
+                _ => None,
+            };
+            let expr = match col {
+                Some(_) => None,
+                None => Some(self.arena.alloc_copy_handle(trim(self.span(at, end)))?),
+            };
+            let desc = if self.eat_kw(b"DESC") {
+                true
+            } else {
+                let _ = self.eat_kw(b"ASC");
+                false
+            };
+            columns.push(IndexColumnDef {
+                name: col.unwrap_or(ABytes::EMPTY),
+                desc,
+                coll,
+                expr,
+            });
+            if self.eat(Tok::Comma) {
+                continue;
+            }
+            self.expect::<E>(Tok::RParen)?;
+            break;
+        }
+        #[cfg(not(feature = "expr_index"))]
         loop {
             let col = self.name::<E>()?;
             // An expression index column looks like `abs(a)` or
@@ -1447,6 +1497,8 @@ impl<'a> Parser<'a> {
                 name: col,
                 desc,
                 coll,
+                #[cfg(feature = "expr_index")]
+                expr: None,
             });
             if self.eat(Tok::Comma) {
                 continue;
@@ -1458,7 +1510,18 @@ impl<'a> Parser<'a> {
         if columns.len() > MAX_COLUMN {
             return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
         }
-        // Partial indexes (WHERE ...) are a later phase.
+        // A partial index's WHERE (v0.16, `expr_index`); refused
+        // without it.
+        #[cfg(feature = "expr_index")]
+        let filter = if self.eat_kw(b"WHERE") {
+            let at = self.cur().offset;
+            self.item::<E>(IDX_HELD + 2)?;
+            let end = self.cur().offset;
+            Some(self.arena.alloc_copy_handle(trim(self.span(at, end)))?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "expr_index"))]
         if self.cur_is_kw(b"WHERE") {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
@@ -1468,6 +1531,8 @@ impl<'a> Parser<'a> {
             unique,
             if_not_exists,
             columns,
+            #[cfg(feature = "expr_index")]
+            filter,
         })
     }
 
@@ -2196,6 +2261,39 @@ impl<'a> Parser<'a> {
         self.expect_kw::<E>(b"CONFLICT")?;
         let mut target = AVec::new();
         let mut target_colls = AVec::new();
+        #[cfg(feature = "expr_index")]
+        let mut target_exprs = AVec::new();
+        // v0.16 (`expr_index`): `indexed-column` items are
+        // expressions; a bare column (under an optional COLLATE)
+        // names a column as before.
+        #[cfg(feature = "expr_index")]
+        if self.eat(Tok::LParen) {
+            loop {
+                let e = self.item::<E>(INS_BASE + 9)?;
+                let (inner, coll) = match e {
+                    Expr::Collate(x, c) => (*x, Some(c)),
+                    x => (x, None),
+                };
+                match inner {
+                    Expr::Column { table: None, name } => {
+                        target.push(name);
+                        target_exprs.push(None);
+                    }
+                    x => {
+                        target.push(ABytes::EMPTY);
+                        target_exprs.push(Some(x));
+                    }
+                }
+                target_colls.push(coll);
+                let _ = self.eat_kw(b"ASC") || self.eat_kw(b"DESC");
+                if self.eat(Tok::Comma) {
+                    continue;
+                }
+                self.expect::<E>(Tok::RParen)?;
+                break;
+            }
+        }
+        #[cfg(not(feature = "expr_index"))]
         if self.eat(Tok::LParen) {
             loop {
                 target.push(self.name::<E>()?);
@@ -2246,6 +2344,8 @@ impl<'a> Parser<'a> {
         Ok(Upsert {
             target,
             target_colls,
+            #[cfg(feature = "expr_index")]
+            target_exprs,
             target_filter,
             action,
         })
@@ -5357,6 +5457,8 @@ UPDATE USING VALUES WHEN WHERE",
                 desc,
                 #[cfg(any(feature = "v04", feature = "indexes"))]
                 coll,
+                #[cfg(feature = "expr_index")]
+                expr: None,
             });
             match tok(i) {
                 Some(Tok::Comma) => i += 1,
@@ -5785,6 +5887,8 @@ UPDATE USING VALUES WHEN WHERE",
                 desc: pk_desc,
                 #[cfg(any(feature = "v04", feature = "indexes"))]
                 coll: None,
+                #[cfg(feature = "expr_index")]
+                expr: None,
             });
             sets.push(ConstraintSet {
                 primary_key: true,
@@ -5798,6 +5902,8 @@ UPDATE USING VALUES WHEN WHERE",
                 desc: false,
                 #[cfg(any(feature = "v04", feature = "indexes"))]
                 coll: None,
+                #[cfg(feature = "expr_index")]
+                expr: None,
             });
             sets.push(ConstraintSet {
                 primary_key: false,

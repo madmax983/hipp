@@ -78,6 +78,8 @@ mod pragma;
 mod temp;
 #[cfg(feature = "triggers")]
 mod trigger;
+#[cfg(feature = "expr_index")]
+mod xindex;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -422,8 +424,10 @@ enum Access {
     Rowid(i64),
     /// `WHERE <indexed col> = <v>` (v0.3): secondary-index lookup
     /// on the index's first key column; `probe` is the literal
-    /// after the column's affinity has been applied.
-    #[cfg(feature = "indexes")]
+    /// after the column's affinity has been applied. (v0.16:
+    /// `expr_index` builds plan such lookups in the general
+    /// planner instead.)
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     Index {
         root: u32,
         desc: AVec<crate::record::KeyOrder>,
@@ -446,6 +450,10 @@ struct IndexPlan {
     /// Per-key-column direction and collation (v0.16), parallel
     /// to `cols`.
     desc: AVec<crate::record::KeyOrder>,
+    /// An expression or partial index's resolved definition
+    /// (v0.16, `expr_index`): keys are computed by `ix_key`.
+    #[cfg(feature = "expr_index")]
+    ext: Option<alloc::rc::Rc<xindex::IdxExt>>,
 }
 
 #[cfg(feature = "indexes")]
@@ -499,6 +507,10 @@ enum Plan {
         /// key on a VIRTUAL column, computed per row here.
         #[cfg(feature = "v04")]
         gcols: Option<Box<crate::rules::GenCols>>,
+        /// An expression or partial index's definition (v0.16,
+        /// `expr_index`).
+        #[cfg(feature = "expr_index")]
+        ext: Option<alloc::rc::Rc<xindex::IdxExt>>,
     },
     /// `DROP INDEX` (v0.3); `root: None` is the IF EXISTS no-op.
     #[cfg(feature = "indexes")]
@@ -593,6 +605,9 @@ enum Plan {
     /// against the row's original values.
     #[cfg(feature = "v05")]
     Update {
+        /// The target rows' access path (v0.16, `expr_index`).
+        #[cfg(feature = "expr_index")]
+        access: Option<Box<crate::xplan::IdxAccess>>,
         root: u32,
         rowid_alias: Option<usize>,
         ncols: usize,
@@ -626,6 +641,9 @@ enum Plan {
     /// `DELETE` (v0.5).
     #[cfg(feature = "v05")]
     Delete {
+        /// The target rows' access path (v0.16, `expr_index`).
+        #[cfg(feature = "expr_index")]
+        access: Option<Box<crate::xplan::IdxAccess>>,
         root: u32,
         rowid_alias: Option<usize>,
         ncols: usize,
@@ -1036,6 +1054,12 @@ struct UpsertPlan {
     /// to `target`: such a column arbitrates only an index key
     /// column of that collation.
     target_colls: AVec<Option<crate::record::Coll>>,
+    /// The expression or partial index the target names (v0.16,
+    /// `expr_index`: the pin's `sqlite3UpsertAnalyzeTarget` picks
+    /// it in its index-list order): only that index's conflicts
+    /// arbitrate. `None` for a rowid or plain-index target.
+    #[cfg(feature = "expr_index")]
+    target_root: Option<u32>,
     /// `DO UPDATE` when true; `DO NOTHING` when false (then
     /// `sets`/`filter` are empty / None).
     do_update: bool,
@@ -1307,11 +1331,11 @@ impl<S: Storage> Connection<S> {
             current: AVec::new(),
             current_rowid: None,
             row_ckpt,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_rowids: AVec::new(),
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_pos: 0,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_loaded: false,
             #[cfg(feature = "v04")]
             query_rows: AVec::new(),
@@ -1703,6 +1727,8 @@ impl<S: Storage> Connection<S> {
                 table,
                 columns,
                 unique,
+                #[cfg(feature = "expr_index")]
+                filter,
                 ..
             } => {
                 let tname = handle_bytes(arena, *table);
@@ -1714,7 +1740,24 @@ impl<S: Storage> Connection<S> {
                     })?
                     .usable()?;
                 let mut cols = AVec::new();
+                // v0.16 (`expr_index`): expression items and the
+                // WHERE resolve against the table with the pin's
+                // definition rules (`xindex`).
+                #[cfg(feature = "expr_index")]
+                let mut texts: AVec<Option<&[u8]>> = AVec::new();
                 for cd in columns.iter() {
+                    #[cfg(feature = "expr_index")]
+                    {
+                        texts.push(cd.expr.map(|h| handle_bytes(arena, h)));
+                        if cd.expr.is_some() {
+                            cols.push(IdxColPlan {
+                                col: None,
+                                desc: cd.desc,
+                                coll: cd.coll.unwrap_or_default(),
+                            });
+                            continue;
+                        }
+                    }
                     let nb = handle_bytes(arena, cd.name);
                     let col = match self.resolve_target(t, nb)? {
                         // `rowid` / `oid` / `_rowid_` name no column
@@ -1752,7 +1795,20 @@ impl<S: Storage> Connection<S> {
                 for c in t.columns.iter() {
                     defaults.push(read_default(&self.catalog_arena, c));
                 }
+                #[cfg(feature = "expr_index")]
+                let ext = if filter.is_some() || texts.iter().any(|x| x.is_some()) {
+                    Some(alloc::rc::Rc::new(self.compile_ext(
+                        arena,
+                        t,
+                        texts.as_slice(),
+                        filter.map(|h| handle_bytes(arena, h)),
+                    )?))
+                } else {
+                    None
+                };
                 Ok(Plan::CreateIndex {
+                    #[cfg(feature = "expr_index")]
+                    ext,
                     table_root: t.root,
                     rowid_alias: t.rowid_alias,
                     ncols: t.columns.len(),
@@ -1923,40 +1979,7 @@ impl<S: Storage> Connection<S> {
                     });
                 }
                 #[cfg(feature = "indexes")]
-                let indexes = {
-                    let mut out: AVec<IndexPlan> = AVec::new();
-                    for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
-                        if ix.opaque {
-                            // An index hipp cannot maintain:
-                            // refuse the write rather than let it
-                            // silently desynchronise (schema.rs).
-                            return Err(Error::Unsupported);
-                        }
-                        let mut cols = AVec::new();
-                        let mut desc = AVec::new();
-                        for c in ix.columns.iter() {
-                            let p = IdxColPlan {
-                                col: c.col,
-                                desc: c.desc,
-                                coll: c.coll,
-                            };
-                            desc.push(p.order());
-                            cols.push(p);
-                        }
-                        out.push(IndexPlan {
-                            root: ix.root,
-                            unique: ix.unique,
-                            cols,
-                            desc,
-                        });
-                    }
-                    // Checked most recently created first, as the pin
-                    // walks its (prepended) index list (v0.16 review
-                    // fix: which REPLACE victim goes first shows in
-                    // its DELETE triggers).
-                    out.as_mut_slice().reverse();
-                    out
-                };
+                let indexes = self.write_index_plans(arena, tname)?;
                 // v0.8: an INSERT ... SELECT source is planned
                 // as a subquery against the empty enclosing
                 // scope. Its result width must match the target
@@ -2770,16 +2793,27 @@ impl<S: Storage> Connection<S> {
         (sources, offsets)
     }
 
-    /// Index plans for an UPDATE/DELETE on `tname` (v0.5): the
-    /// same resolution INSERT performs — an index hipp cannot
-    /// maintain refuses the write.
-    #[cfg(all(feature = "v05", feature = "indexes"))]
-    fn write_index_plans(&self, tname: &[u8]) -> Result<AVec<IndexPlan>, S::Error> {
+    /// Index plans for a write on `tname` (v0.3 INSERT, v0.5
+    /// UPDATE / DELETE): an index hipp cannot maintain refuses the
+    /// write rather than let it silently desynchronise (schema.rs);
+    /// an expression or partial index (v0.16, `expr_index`) is
+    /// resolved here, so one hipp cannot compute refuses it too.
+    /// Most recently created first, as the pin walks its
+    /// (prepended) index list (v0.16 review fix: which REPLACE
+    /// victim goes first shows in its DELETE triggers).
+    #[cfg(feature = "indexes")]
+    fn write_index_plans(&self, arena: &Arena, tname: &[u8]) -> Result<AVec<IndexPlan>, S::Error> {
+        let _ = arena;
         let mut out: AVec<IndexPlan> = AVec::new();
         for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
             if ix.opaque {
                 return Err(Error::Unsupported);
             }
+            #[cfg(feature = "expr_index")]
+            let ext = match self.catalog.find(&self.catalog_arena, tname) {
+                Some(t) => self.index_ext(arena, t, ix)?,
+                None => None,
+            };
             let mut cols = AVec::new();
             let mut desc = AVec::new();
             for c in ix.columns.iter() {
@@ -2796,9 +2830,10 @@ impl<S: Storage> Connection<S> {
                 unique: ix.unique,
                 cols,
                 desc,
+                #[cfg(feature = "expr_index")]
+                ext,
             });
         }
-        // Most recently created first, as INSERT's (the pin's order).
         out.as_mut_slice().reverse();
         Ok(out)
     }
@@ -3289,22 +3324,35 @@ impl<S: Storage> Connection<S> {
         upsert: &crate::sql::Upsert,
     ) -> Result<UpsertPlan, S::Error> {
         use crate::query::{ScopeGroup, SourceDesc, has_agg, resolve_scoped};
-        if let Some(tf) = &upsert.target_filter {
+        #[cfg_attr(not(feature = "expr_index"), allow(unused_variables))]
+        let target_pred = match &upsert.target_filter {
             // Oracle behaviour, probed in v0.7 (pinned 3.54.1):
             // the conflict-target WHERE is name-resolved (an
-            // unknown column errors) but never evaluated for a
-            // non-partial index — WHERE 0 arbitrates exactly like
-            // WHERE 1. hipp creates no partial indexes (CREATE
-            // INDEX ... WHERE is refused), so resolve for
-            // validation and then drop the predicate.
-            let (sources, offsets) = self.single_source(t, tname);
-            let cur = ScopeGroup::new(sources, offsets, 0);
-            let mut planner = self.sub_planner(arena);
-            let r = resolve_scoped::<S::Error>(tf, arena, &cur, &[], &mut planner)?;
-            if has_agg(&r) {
-                return Err(Error::Unsupported);
+            // unknown column errors) but never evaluated — for a
+            // non-partial index WHERE 0 arbitrates exactly like
+            // WHERE 1; a partial index (v0.16, `expr_index`) is a
+            // target only when it is the same expression as the
+            // index's WHERE.
+            Some(tf) => {
+                let (sources, offsets) = self.single_source(t, tname);
+                let cur = ScopeGroup::new(sources, offsets, 0);
+                let mut planner = self.sub_planner(arena);
+                let r = resolve_scoped::<S::Error>(tf, arena, &cur, &[], &mut planner)?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                Some(r)
             }
-        }
+            None => None,
+        };
+        // v0.16 (`expr_index`): the index an expression target (or
+        // a target with a WHERE) names, in the pin's order.
+        #[cfg(feature = "expr_index")]
+        let target_root = if upsert.target.is_empty() {
+            None
+        } else {
+            self.upsert_ext_target(arena, t, tname, upsert, target_pred.as_ref())?
+        };
         // Canonical target set: the rowid-alias column and the
         // rowid names all canonicalise to Target::Rowid.
         let canon = |this: &Self, name: &[u8]| -> Result<Target, S::Error> {
@@ -3317,8 +3365,14 @@ impl<S: Storage> Connection<S> {
             None
         } else {
             let mut cols = AVec::new();
+            #[cfg(feature = "expr_index")]
+            let exprs = upsert.target_exprs.iter().any(|x| x.is_some());
+            #[cfg(not(feature = "expr_index"))]
+            let exprs = false;
             for n in upsert.target.iter() {
-                cols.push(canon(self, handle_bytes(arena, *n))?);
+                if !exprs {
+                    cols.push(canon(self, handle_bytes(arena, *n))?);
+                }
             }
             // The target must name the rowid / primary key or
             // exactly the key columns of one unique index (the
@@ -3328,7 +3382,7 @@ impl<S: Storage> Connection<S> {
             let mut matches_index = false;
             if !is_rowid {
                 for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
-                    if !ix.unique || ix.opaque {
+                    if !ix.unique || !ix.plain() {
                         continue;
                     }
                     let mut keyset = AVec::new();
@@ -3352,6 +3406,8 @@ impl<S: Storage> Connection<S> {
                     }
                 }
             }
+            #[cfg(feature = "expr_index")]
+            let matches_index = matches_index || target_root.is_some();
             if !is_rowid && !matches_index {
                 return Err(Error::Unsupported);
             }
@@ -3433,6 +3489,8 @@ impl<S: Storage> Connection<S> {
         Ok(UpsertPlan {
             target,
             target_colls: upsert.target_colls.clone(),
+            #[cfg(feature = "expr_index")]
+            target_root,
             do_update,
             sets,
             filter,
@@ -3568,7 +3626,21 @@ impl<S: Storage> Connection<S> {
         }
         #[cfg(feature = "v07")]
         let returning_r = self.plan_returning(arena, t, qualifier, returning)?;
+        #[cfg(feature = "expr_index")]
+        let access = self.plan_write_access(
+            arena,
+            t,
+            filter.as_ref(),
+            Some(xindex::UpdateInfo {
+                sets: sets.as_slice(),
+                returning: !returning_r.is_empty(),
+                from: !from_plans.is_empty(),
+                conflict,
+            }),
+        );
         Ok(Plan::Update {
+            #[cfg(feature = "expr_index")]
+            access,
             root: t.root,
             rowid_alias: t.rowid_alias,
             ncols: t.columns.len(),
@@ -3583,7 +3655,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v07")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
-            indexes: self.write_index_plans(tname)?,
+            indexes: self.write_index_plans(arena, tname)?,
             rules: self.table_rules(arena, t)?,
         })
     }
@@ -3624,6 +3696,8 @@ impl<S: Storage> Connection<S> {
         #[cfg(feature = "v07")]
         let returning_r = self.plan_returning(arena, t, tname, returning)?;
         Ok(Plan::Delete {
+            #[cfg(feature = "expr_index")]
+            access: self.plan_write_access(arena, t, filter.as_ref(), None),
             root: t.root,
             rowid_alias: t.rowid_alias,
             ncols: t.columns.len(),
@@ -3633,7 +3707,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v07")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
-            indexes: self.write_index_plans(tname)?,
+            indexes: self.write_index_plans(arena, tname)?,
             rules: if t.has_generated() {
                 self.table_rules(arena, t)?
             } else {
@@ -3724,6 +3798,17 @@ impl<S: Storage> Connection<S> {
         if t.has_generated() {
             return Err(Error::Unsupported);
         }
+        // v0.16 (`expr_index`): so does a table with an index — the
+        // pin may read a covering index instead of the table.
+        #[cfg(feature = "expr_index")]
+        if self
+            .catalog
+            .indexes_for(&self.catalog_arena, tname)
+            .next()
+            .is_some()
+        {
+            return Err(Error::Unsupported);
+        }
         let predicate: Option<(crate::arena::ABytes, Literal)> = match &stmt.filter {
             None => None,
             Some(Expr::Binary(BinOp::Eq, l, r)) => match (l.as_ref(), r.as_ref()) {
@@ -3742,6 +3827,11 @@ impl<S: Storage> Connection<S> {
                 match self.resolve_target(t, nb)? {
                     Target::Rowid => literal_rowid(arena, lit),
                     Target::Col(i) if Some(i) == t.rowid_alias => literal_rowid(arena, lit),
+                    // v0.16 (`expr_index`): the general planner
+                    // chooses among the indexes as the pin does.
+                    #[cfg(feature = "expr_index")]
+                    Target::Col(_) => return Err(Error::Unsupported),
+                    #[cfg(not(feature = "expr_index"))]
                     Target::Col(i) => {
                         // v0.3: an index on this column
                         // turns the predicate into a
@@ -4207,6 +4297,27 @@ impl<S: Storage> Connection<S> {
             });
         }
         cur.aliases.clear();
+        let limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
+        // v0.16 (`expr_index`): each table source's index access
+        // path, the pin's choice (`xplan`).
+        #[cfg(feature = "expr_index")]
+        self.plan_accesses(
+            arena,
+            sources.as_mut_slice(),
+            cur.offsets.as_slice(),
+            cur.first_src,
+            (base_width, base_src),
+            &xindex::CoreInfo {
+                items: items.as_slice(),
+                filter: filter.as_ref(),
+                group_by: group_by.as_slice(),
+                having: having.as_ref(),
+                order_by: order_by.as_slice(),
+                has_agg,
+                distinct: stmt.distinct,
+                limit: limit.as_ref(),
+            },
+        );
         let keys = CompKeys {
             names: item_aliases,
             colls: core_colls(items.as_slice(), &[]),
@@ -4220,7 +4331,7 @@ impl<S: Storage> Connection<S> {
             group_by,
             having,
             order_by,
-            limit: self.plan_limit(stmt.limit.as_deref(), arena)?,
+            limit,
             offset: self.plan_limit(stmt.offset.as_deref(), arena)?,
             has_agg,
             result_names,
@@ -4374,6 +4485,8 @@ impl<S: Storage> Connection<S> {
             rec: 0,
             #[cfg(feature = "json")]
             tvf: 0,
+            #[cfg(feature = "expr_index")]
+            access: None,
         });
         Ok(w)
     }
@@ -4513,6 +4626,8 @@ impl<S: Storage> Connection<S> {
                 rec: 0,
                 #[cfg(feature = "json")]
                 tvf: 0,
+                #[cfg(feature = "expr_index")]
+                access: None,
             });
             total += t.columns.len();
         }
@@ -4609,7 +4724,7 @@ impl<S: Storage> Connection<S> {
     /// `col` (preferring a UNIQUE one), convert the literal with
     /// the column's affinity, and lower to `Access::Index`.
     /// Returns None when no usable index exists.
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     fn plan_index_access(
         &self,
         t: &crate::schema::TableDef,
@@ -4624,7 +4739,7 @@ impl<S: Storage> Connection<S> {
         let mut chosen: Option<(u32, bool, AVec<crate::record::KeyOrder>)> = None;
         let col_coll = t.columns.as_slice().get(col).map(|c| c.coll);
         for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
-            if ix.opaque {
+            if !ix.plain() {
                 continue;
             }
             let Some(first) = ix.columns.as_slice().first() else {
@@ -4971,11 +5086,11 @@ pub struct Statement<'c, S: Storage> {
     row_ckpt: usize,
     /// Secondary-index scan state (v0.3): the rowids an
     /// `Access::Index` lookup produced, consumed one per step.
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     index_rowids: AVec<i64>,
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     index_pos: usize,
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     index_loaded: bool,
     /// v0.4 query results, materialised on first step.
     #[cfg(feature = "v04")]
@@ -5292,34 +5407,45 @@ fn create_has_rowid_alias(ast: &Ast, arena: &Arena) -> bool {
 
 /// Build an index key (the key columns' values, in index order)
 /// for one table row (v0.3). `payload` is the row's table record;
-/// short records materialise column defaults, as scans do.
+/// short records materialise column defaults, as scans do. v0.16
+/// (`expr_index`): an expression or partial index (`ext`) computes
+/// its key from the decoded row, and `None` means the row has no
+/// entry (the partial index's WHERE is not true for it).
 #[cfg(feature = "indexes")]
+#[allow(clippy::too_many_arguments)]
 fn index_key_for_row<E>(
     cols: &[IdxColPlan],
+    #[cfg(feature = "expr_index")] ext: Option<&xindex::IdxExt>,
     rowid_alias: Option<usize>,
     defaults: &[OwnedValue],
     payload: &[u8],
     ncols: usize,
     rowid: i64,
     #[cfg(feature = "v04")] gcols: Option<&crate::rules::GenCols>,
-) -> Result<AVec<OwnedValue>, E> {
-    // v0.16: with generated columns, decode around the VIRTUAL
-    // ones and compute them — an index may key on one.
+    #[cfg(feature = "expr_index")] env: Option<&crate::query::Env>,
+) -> Result<Option<AVec<OwnedValue>>, E> {
+    // v0.16: with generated columns (or an index computing from
+    // the whole row), decode around the VIRTUAL ones and compute
+    // them — an index may key on one.
+    #[cfg(feature = "expr_index")]
+    if let Some(x) = ext {
+        let mut rec = crate::rules::decode_rec::<E>(
+            payload,
+            ncols,
+            defaults,
+            gcols.map(|g| g.virt.as_slice()),
+        )?;
+        if let Some(g) = gcols {
+            g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
+        }
+        return xindex::ext_key::<E>(cols, x, rec.as_slice(), rowid, env);
+    }
     #[cfg(feature = "v04")]
     if let Some(g) = gcols {
         let mut rec =
             crate::rules::decode_rec::<E>(payload, ncols, defaults, Some(g.virt.as_slice()))?;
         g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
-        let mut key = AVec::new();
-        for c in cols {
-            key.push(match c.col {
-                Some(i) if Some(i) != rowid_alias => {
-                    rec.as_slice().get(i).cloned().unwrap_or(OwnedValue::Null)
-                }
-                _ => OwnedValue::Integer(rowid),
-            });
-        }
-        return Ok(key);
+        return Ok(Some(key_from_rec(cols, rowid_alias, rec.as_slice(), rowid)));
     }
     let mut dec: AVec<Value<'_>> = AVec::new();
     crate::record::decode_record_into::<E>(payload, ncols, &mut dec)?;
@@ -5338,7 +5464,30 @@ fn index_key_for_row<E>(
             }
         });
     }
-    Ok(key)
+    Ok(Some(key))
+}
+
+/// One row's key in index `ix`, from the row in record form
+/// (v0.16: every write path's key computation). `None` when the
+/// row has no entry in a partial index (`expr_index`).
+#[cfg(feature = "indexes")]
+fn ix_key<E>(
+    ix: &IndexPlan,
+    rec: &[OwnedValue],
+    rowid: i64,
+    rowid_alias: Option<usize>,
+    #[cfg(feature = "expr_index")] env: &crate::query::Env,
+) -> Result<Option<AVec<OwnedValue>>, E> {
+    #[cfg(feature = "expr_index")]
+    if let Some(x) = &ix.ext {
+        return xindex::ext_key::<E>(ix.cols.as_slice(), x, rec, rowid, Some(env));
+    }
+    Ok(Some(key_from_rec(
+        ix.cols.as_slice(),
+        rowid_alias,
+        rec,
+        rowid,
+    )))
 }
 
 /// Encode an index key payload: the record of key values with
@@ -5458,8 +5607,9 @@ fn row_data_for(
     RowData { vals, rowids }
 }
 
-/// An index key for one write-side row in record form (v0.5).
-#[cfg(all(feature = "v05", feature = "indexes"))]
+/// An index key on plain columns for one row in record form
+/// (v0.5; v0.16: every write path's, through `ix_key`).
+#[cfg(feature = "indexes")]
 fn key_from_rec(
     cols: &[IdxColPlan],
     rowid_alias: Option<usize>,
@@ -5469,14 +5619,8 @@ fn key_from_rec(
     let mut key = AVec::new();
     for c in cols {
         key.push(match c.col {
-            None => OwnedValue::Integer(rowid),
-            Some(i) => {
-                if Some(i) == rowid_alias {
-                    OwnedValue::Integer(rowid)
-                } else {
-                    rec[i].clone()
-                }
-            }
+            Some(i) if Some(i) != rowid_alias => rec.get(i).cloned().unwrap_or(OwnedValue::Null),
+            _ => OwnedValue::Integer(rowid),
         });
     }
     key
@@ -5634,15 +5778,22 @@ macro_rules! row_delete_fn {
                 };
                 let gcols = self.plan_rules().and_then(|r| r.gcols);
                 for ix in indexes.iter() {
-                    let key = index_key_for_row(
+                    let Some(key) = index_key_for_row(
                         ix.cols.as_slice(),
+                        #[cfg(feature = "expr_index")]
+                        ix.ext.as_deref(),
                         rowid_alias,
                         defaults,
                         payload.as_slice(),
                         ncols,
                         rowid,
                         gcols.as_ref(),
-                    )?;
+                        #[cfg(feature = "expr_index")]
+                        Some(&self.conn.env),
+                    )?
+                    else {
+                        continue;
+                    };
                     let enc = encode_index_payload(key.as_slice(), rowid);
                     btree::index_delete(
                         &mut self.conn.pager,
@@ -5692,11 +5843,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             current: AVec::new(),
             current_rowid: None,
             row_ckpt,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_rowids: AVec::new(),
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_pos: 0,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_loaded: false,
             #[cfg(feature = "v04")]
             query_rows: AVec::new(),
@@ -6096,7 +6247,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.row_buf.clear();
         self.current.clear();
         self.current_rowid = None;
-        #[cfg(feature = "indexes")]
+        #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
         {
             self.index_rowids.clear();
             self.index_pos = 0;
@@ -6577,6 +6728,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::CreateIndex { gcols, .. } => gcols.clone(),
             _ => None,
         };
+        #[cfg(feature = "expr_index")]
+        let ext = match &self.plan {
+            Plan::CreateIndex { ext, .. } => ext.clone(),
+            _ => None,
+        };
         let mut desc = AVec::new();
         for c in cols.iter() {
             desc.push(c.order());
@@ -6584,8 +6740,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut cursor = ScanCursor::new(table_root);
         let mut buf = AVec::new();
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-            let key = index_key_for_row(
+            let Some(key) = index_key_for_row(
                 cols.as_slice(),
+                #[cfg(feature = "expr_index")]
+                ext.as_deref(),
                 rowid_alias,
                 defaults.as_slice(),
                 buf.as_slice(),
@@ -6593,7 +6751,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 rowid,
                 #[cfg(feature = "v04")]
                 gcols.as_deref(),
-            )?;
+                #[cfg(feature = "expr_index")]
+                Some(&self.conn.env),
+            )?
+            else {
+                continue;
+            };
             if unique && key_has_no_null(key.as_slice()) {
                 let probe: AVec<OwnedValue> = key.clone();
                 if btree::index_first_with_prefix(
@@ -7496,13 +7659,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             AVec::new();
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row.as_slice()[i].clone(),
-                });
-            }
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row.as_slice(),
+                rowid,
+                *rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if ix.unique
                 && key_has_no_null(key.as_slice())
                 && btree::index_first_with_prefix(
@@ -7646,13 +7813,17 @@ impl<'c, S: Storage> Statement<'c, S> {
         btree::btree_insert(&mut self.conn.pager, root, rowid, rec.as_slice()).await?;
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row[i].clone(),
-                });
-            }
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row,
+                rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             let payload = encode_index_payload(key.as_slice(), rowid);
             btree::index_insert(
                 &mut self.conn.pager,
@@ -7691,7 +7862,17 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
-            let old_key = key_from_rec(ix.cols.as_slice(), rowid_alias, old_rec, old_rowid);
+            let Some(old_key) = ix_key::<S::Error>(
+                ix,
+                old_rec,
+                old_rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             let payload = encode_index_payload(old_key.as_slice(), old_rowid);
             btree::index_delete(
                 &mut self.conn.pager,
@@ -7708,7 +7889,17 @@ impl<'c, S: Storage> Statement<'c, S> {
         btree::btree_insert(&mut self.conn.pager, root, new_rowid, rec_bytes.as_slice()).await?;
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
-            let key = key_from_rec(ix.cols.as_slice(), rowid_alias, new_rec, new_rowid);
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                new_rec,
+                new_rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             let payload = encode_index_payload(key.as_slice(), new_rowid);
             btree::index_insert(
                 &mut self.conn.pager,
@@ -7771,24 +7962,34 @@ impl<'c, S: Storage> Statement<'c, S> {
         // the rowid itself, the index's canonical key-target set
         // when the conflict is index-borne).
         let mut conflicts: AVec<(i64, bool, Option<KeySet>)> = AVec::new();
+        // The index each conflict is on (v0.16, `expr_index`: an
+        // expression or partial index arbitrates by identity).
+        #[cfg(feature = "expr_index")]
+        let mut conflict_roots: AVec<u32> = AVec::new();
         if btree::seek_rowid(&mut self.conn.pager, root, rowid)
             .await?
             .is_some()
         {
             conflicts.push((rowid, true, None));
+            #[cfg(feature = "expr_index")]
+            conflict_roots.push(0);
         }
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
             if !ix.unique {
                 continue;
             }
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row.as_slice()[i].clone(),
-                });
-            }
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row.as_slice(),
+                rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if key_has_no_null(key.as_slice())
                 && let Some(other) = btree::index_first_with_prefix(
                     &mut self.conn.pager,
@@ -7809,7 +8010,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                         c.coll,
                     ));
                 }
+                #[cfg(feature = "expr_index")]
+                if ix.ext.is_some() {
+                    keyset.clear();
+                }
                 conflicts.push((other, false, Some(keyset)));
+                #[cfg(feature = "expr_index")]
+                conflict_roots.push(ix.root);
             }
         }
         if conflicts.is_empty() {
@@ -7827,9 +8034,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Upsert arbitration: the first conflict the clause
         // arbitrates, if any.
         if let Some(up) = &upsert {
+            #[cfg(not(feature = "expr_index"))]
             let arb = conflicts
                 .iter()
                 .position(|c| upsert_arbitrates(up, c.1, &c.2));
+            // v0.16 (`expr_index`): a target that names an
+            // expression or partial index arbitrates that index's
+            // conflicts only.
+            #[cfg(feature = "expr_index")]
+            let arb = conflicts
+                .iter()
+                .zip(conflict_roots.iter())
+                .position(|(c, r)| match up.target_root {
+                    Some(t) => !c.1 && *r == t,
+                    None => upsert_arbitrates(up, c.1, &c.2),
+                });
             if let Some(pos) = arb {
                 let crowid = conflicts.as_slice()[pos].0;
                 if !up.do_update {
@@ -7949,13 +8168,21 @@ impl<'c, S: Storage> Statement<'c, S> {
             if !ix.unique {
                 continue;
             }
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row.get(i).cloned().unwrap_or(OwnedValue::Null),
-                });
-            }
+            let alias = match &self.plan {
+                Plan::Insert { rowid_alias, .. } | Plan::Update { rowid_alias, .. } => *rowid_alias,
+                _ => None,
+            };
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row,
+                rowid,
+                alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if key_has_no_null(key.as_slice())
                 && let Some(other) = btree::index_first_with_prefix(
                     &mut self.conn.pager,
@@ -8158,12 +8385,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             if !ix.unique {
                 continue;
             }
-            let key = key_from_rec(
-                ix.cols.as_slice(),
-                rowid_alias,
+            let Some(key) = ix_key::<S::Error>(
+                ix,
                 new_rec.as_slice(),
                 new_rowid,
-            );
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if key_has_no_null(key.as_slice())
                 && let Some(other) = btree::index_first_with_prefix(
                     &mut self.conn.pager,
@@ -8359,7 +8591,54 @@ impl<'c, S: Storage> Statement<'c, S> {
         // v0.16: VIRTUAL generated columns are computed per row.
         let rules = self.plan_rules();
         let gcols = rules.as_ref().and_then(|r| r.gcols.as_ref());
-        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+        // v0.16 (`expr_index`): the rows an index finds — in rowid
+        // order, as the pin's two-pass write visits them, unless
+        // the pin's one-pass loop keeps the index's order.
+        #[cfg(feature = "expr_index")]
+        let mut found: Option<(AVec<i64>, usize)> = match &self.plan {
+            Plan::Update {
+                access: Some(acc), ..
+            }
+            | Plan::Delete {
+                access: Some(acc), ..
+            } => {
+                let acc = acc.clone();
+                let mut ids = self.access_rowids(root, &acc, &RowData::empty()).await?;
+                if !acc.one_pass {
+                    ids.as_mut_slice().sort_unstable();
+                    let mut d: AVec<i64> = AVec::new();
+                    for r in ids.iter() {
+                        if d.as_slice().last() != Some(r) {
+                            d.push(*r);
+                        }
+                    }
+                    ids = d;
+                }
+                Some((ids, 0))
+            }
+            _ => None,
+        };
+        loop {
+            #[cfg(feature = "expr_index")]
+            let next = match found.as_mut() {
+                Some((ids, at)) => {
+                    let Some(&r) = ids.as_slice().get(*at) else {
+                        break;
+                    };
+                    *at += 1;
+                    match btree::seek_rowid(&mut self.conn.pager, root, r).await? {
+                        Some(p) => {
+                            buf = p;
+                            Some(r)
+                        }
+                        None => continue,
+                    }
+                }
+                None => cursor.next_row_into(&mut self.conn.pager, &mut buf).await?,
+            };
+            #[cfg(not(feature = "expr_index"))]
+            let next = cursor.next_row_into(&mut self.conn.pager, &mut buf).await?;
+            let Some(rowid) = next else { break };
             let mut rec = crate::rules::decode_rec::<S::Error>(
                 buf.as_slice(),
                 ncols,
@@ -8763,12 +9042,17 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
                 #[cfg(feature = "indexes")]
                 for ix in indexes.iter() {
-                    let key = key_from_rec(
-                        ix.cols.as_slice(),
-                        rowid_alias,
+                    let Some(key) = ix_key::<S::Error>(
+                        ix,
                         new_rec.as_slice(),
                         new_rowid,
-                    );
+                        rowid_alias,
+                        #[cfg(feature = "expr_index")]
+                        &self.conn.env,
+                    )?
+                    else {
+                        continue;
+                    };
                     if ix.unique
                         && key_has_no_null(key.as_slice())
                         && let Some(other) = btree::index_first_with_prefix(
@@ -9076,12 +9360,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             #[cfg(feature = "indexes")]
             for ix in indexes.iter() {
-                let key = key_from_rec(
-                    ix.cols.as_slice(),
-                    rowid_alias,
+                let Some(key) = ix_key::<S::Error>(
+                    ix,
                     wrow.rec.as_slice(),
                     wrow.rowid,
-                );
+                    rowid_alias,
+                    #[cfg(feature = "expr_index")]
+                    &self.conn.env,
+                )?
+                else {
+                    continue;
+                };
                 let payload = encode_index_payload(key.as_slice(), wrow.rowid);
                 btree::index_delete(
                     &mut self.conn.pager,
@@ -9281,7 +9570,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// The v0.3 secondary-index scan: resolve the lookup's
     /// rowids once, then fetch each row by rowid.
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     async fn step_scan_index(&mut self) -> Result<Step, S::Error> {
         let (table_root, idx_root, desc, probe) = {
             let Plan::Scan { root, access, .. } = &self.plan else {
@@ -9335,7 +9624,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Per-row checkpoint rewind (§7.5.2): the previous row's
         // arena temporaries die before the next row is decoded.
         self.arena.rewind(self.row_ckpt);
-        #[cfg(feature = "indexes")]
+        #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
         {
             let is_index = matches!(
                 &self.plan,
@@ -9361,7 +9650,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             Access::FullScan => SimpleAccess::FullScan,
             Access::Rowid(r) => SimpleAccess::Rowid(*r),
             Access::Empty => SimpleAccess::Empty,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             Access::Index { .. } => unreachable!(),
         };
         match access {
@@ -9579,6 +9868,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             if sp.rec != 0 {
                 return Err(Error::Unsupported);
             }
+            // v0.16 (`expr_index`): the rows an index finds.
+            #[cfg(feature = "expr_index")]
+            if let Some(acc) = &sp.access {
+                let rows = self.access_rows(sp, acc, &RowData::empty()).await?;
+                src_rows.push(rows);
+                continue;
+            }
             let mut rows = AVec::new();
             let mut cursor = ScanCursor::new(sp.root);
             let mut buf = AVec::new();
@@ -9691,6 +9987,24 @@ impl<'c, S: Storage> Statement<'c, S> {
                     src_rows.push(rows);
                     continue;
                 }
+            }
+            // v0.16 (`expr_index`): the rows an index finds, for
+            // the enclosing row (a lateral path's rows are found per
+            // combination, in `join_step`).
+            #[cfg(feature = "expr_index")]
+            if let Some(acc) = &sp.access {
+                let rows = if acc.lateral {
+                    AVec::new()
+                } else {
+                    // The probes evaluate on the outer row padded to
+                    // the core's width, where a subquery in them
+                    // finds its own slots.
+                    let mut padded = outer.clone();
+                    pad_sources(&mut padded, sources);
+                    self.access_rows(sp, acc, &padded).await?
+                };
+                src_rows.push(rows);
+                continue;
             }
             let mut rows = AVec::new();
             let mut cursor = ScanCursor::new(sp.root);
@@ -10693,6 +11007,20 @@ impl<'c, S: Storage> Statement<'c, S> {
             } else {
                 rows
             };
+            // v0.16 (`expr_index`): an index lookup on the sources
+            // to the left — this combination's rows.
+            #[cfg(feature = "expr_index")]
+            let looked;
+            #[cfg(feature = "expr_index")]
+            let rows = match sp.access.as_deref() {
+                Some(a) if a.lateral => {
+                    let mut padded = acc.clone();
+                    pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
+                    looked = self.access_rows(sp, a, &padded).await?;
+                    &looked
+                }
+                _ => rows,
+            };
             let mut any = false;
             for (ri, (vals, rowid)) in rows.iter().enumerate() {
                 let mut acc2 = acc.clone();
@@ -10887,21 +11215,23 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
-            groups.as_mut_slice().sort_by(|a, b| {
-                for (((av, bv), c), d) in
-                    a.0.iter()
-                        .zip(b.0.iter())
-                        .zip(gcolls.iter())
-                        .zip(gdesc.iter())
-                {
-                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
-                    let o = if *d { o.reverse() } else { o };
-                    if o != core::cmp::Ordering::Equal {
-                        return o;
+            if !groups_arrive_ordered(qp.sources.as_slice()) {
+                groups.as_mut_slice().sort_by(|a, b| {
+                    for (((av, bv), c), d) in
+                        a.0.iter()
+                            .zip(b.0.iter())
+                            .zip(gcolls.iter())
+                            .zip(gdesc.iter())
+                    {
+                        let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                        let o = if *d { o.reverse() } else { o };
+                        if o != core::cmp::Ordering::Equal {
+                            return o;
+                        }
                     }
-                }
-                core::cmp::Ordering::Equal
-            });
+                    core::cmp::Ordering::Equal
+                });
+            }
         }
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
@@ -11117,21 +11447,23 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
-            groups.as_mut_slice().sort_by(|a, b| {
-                for (((av, bv), c), d) in
-                    a.0.iter()
-                        .zip(b.0.iter())
-                        .zip(gcolls.iter())
-                        .zip(gdesc.iter())
-                {
-                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
-                    let o = if *d { o.reverse() } else { o };
-                    if o != core::cmp::Ordering::Equal {
-                        return o;
+            if !groups_arrive_ordered(plan.sources.as_slice()) {
+                groups.as_mut_slice().sort_by(|a, b| {
+                    for (((av, bv), c), d) in
+                        a.0.iter()
+                            .zip(b.0.iter())
+                            .zip(gcolls.iter())
+                            .zip(gdesc.iter())
+                    {
+                        let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                        let o = if *d { o.reverse() } else { o };
+                        if o != core::cmp::Ordering::Equal {
+                            return o;
+                        }
                     }
-                }
-                core::cmp::Ordering::Equal
-            });
+                    core::cmp::Ordering::Equal
+                });
+            }
         }
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
@@ -12365,6 +12697,21 @@ fn group_desc(
     out
 }
 
+/// Whether a query's rows arrive in its GROUP BY order (v0.16,
+/// `expr_index`): its one source's index delivers it, and the pin
+/// then emits the groups as they arrive, skipping its group sorter.
+#[cfg(feature = "v04")]
+fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
+    #[cfg(feature = "expr_index")]
+    if let [s] = sources
+        && s.access.as_ref().is_some_and(|a| a.groups)
+    {
+        return true;
+    }
+    let _ = sources;
+    false
+}
+
 /// DISTINCT over produced rows (v0.4): first occurrences
 /// kept, values compared NULL-safely under each result
 /// column's collation (v0.16).
@@ -12467,6 +12814,16 @@ fn left_padded(
 #[cfg(feature = "v06")]
 fn query_plan_has_sub(qp: &QueryPlan) -> bool {
     use crate::query::has_sub;
+    // A lateral index lookup (v0.16, `expr_index`) runs in the
+    // async join too.
+    #[cfg(feature = "expr_index")]
+    if qp
+        .sources
+        .iter()
+        .any(|s| s.access.as_ref().is_some_and(|a| a.lateral))
+    {
+        return true;
+    }
     qp.sources.iter().any(|s| s.derived.is_some())
         || qp
             .sources
@@ -12709,21 +13066,23 @@ fn project_rows<E>(
             }
         }
         // SQLite's GROUP BY emits groups in key order (its sorter).
-        groups.as_mut_slice().sort_by(|a, b| {
-            for (((av, bv), c), d) in
-                a.0.iter()
-                    .zip(b.0.iter())
-                    .zip(gcolls.iter())
-                    .zip(gdesc.iter())
-            {
-                let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
-                let o = if *d { o.reverse() } else { o };
-                if o != core::cmp::Ordering::Equal {
-                    return o;
+        if !groups_arrive_ordered(qp.sources.as_slice()) {
+            groups.as_mut_slice().sort_by(|a, b| {
+                for (((av, bv), c), d) in
+                    a.0.iter()
+                        .zip(b.0.iter())
+                        .zip(gcolls.iter())
+                        .zip(gdesc.iter())
+                {
+                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                    let o = if *d { o.reverse() } else { o };
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
                 }
-            }
-            core::cmp::Ordering::Equal
-        });
+                core::cmp::Ordering::Equal
+            });
+        }
     }
     #[cfg(feature = "window")]
     let mut group_at = usize::MAX;

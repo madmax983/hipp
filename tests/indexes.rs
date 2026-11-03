@@ -962,11 +962,54 @@ fn opaque_index_blocks_writes_not_reads() {
         let rows = collect(&mut db, "SELECT id, a FROM t").await;
         assert_eq!(rows, vec!["1|-5", "2|7"]);
         let r = db.prepare("INSERT INTO t VALUES (3, 9)").await;
-        assert!(
-            matches!(r, Err(Error::Unsupported)),
-            "write under opaque index: {:?}",
-            r.err()
+        // v0.16: with `expr_index` (in the default build) the
+        // expression index is maintained; without it the write is
+        // refused rather than leaving the index stale.
+        if cfg!(feature = "expr_index") {
+            let mut st = r.expect("write maintains the expression index");
+            assert_eq!(st.step().await.expect("step"), Step::Done);
+            drop(st);
+            assert_eq!(
+                collect(&mut db, "SELECT id FROM t").await,
+                vec!["1", "2", "3"]
+            );
+        } else {
+            assert!(
+                matches!(r, Err(Error::Unsupported)),
+                "write under opaque index: {:?}",
+                r.err()
+            );
+        }
+        drop(db);
+        integrity(&path);
+    });
+}
+
+#[test]
+fn uncomputable_index_blocks_writes_not_reads() {
+    block_on(async {
+        // An expression index over a function hipp does not have
+        // (the pin's date()): reads work, writes are refused rather
+        // than leaving the index stale (v0.16).
+        let path = common::temp_db("v16-uncomputable");
+        common::cli(
+            &path,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); \
+             CREATE INDEX idt ON t(date(a)); INSERT INTO t VALUES (1,'2020-01-02');",
         );
+        let fs = FileStorage::open(&path).expect("fs open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
+        assert_eq!(
+            collect(&mut db, "SELECT id, a FROM t").await,
+            vec!["1|2020-01-02"]
+        );
+        for sql in [
+            "INSERT INTO t VALUES (3, 'x')",
+            "UPDATE t SET a = 'y'",
+            "DELETE FROM t",
+        ] {
+            assert!(db.prepare(sql).await.is_err(), "{sql}");
+        }
         drop(db);
         integrity(&path);
     });
