@@ -11,6 +11,8 @@ pub use ast::{
     IndexColumnDef, JoinKind, Literal, SelectItem, SelectList, SelectStmt, SortOrder, Upsert,
     UpsertAction,
 };
+#[cfg(feature = "v16")]
+pub use ast::{Cte, CteUse, M10d, RecMark, With};
 #[cfg(feature = "v04")]
 pub use parser::parse_expr_text;
 #[cfg(feature = "params")]

@@ -362,3 +362,243 @@ fn a6_cross_tool_real_sqlite_recovers_hipp_journal() {
         });
     }
 }
+
+// ---------------------------------------------------------------
+// v0.16: crash injection across whole transactions — savepoints,
+// statement savepoints, VACUUM, and the two journal fixes found on
+// the way (a spilled page this transaction allocated was journaled
+// when it changed again, and replay stops at such a record; a
+// freelist leaf freed and reused in one transaction was not
+// journaled). A crash at any op must leave the file byte-exactly
+// as before or as after the outermost transaction.
+// ---------------------------------------------------------------
+
+/// Run every statement to completion, ignoring errors (a dead
+/// device fails them all from the kill on).
+async fn run_all<S: Storage>(db: &mut Connection<S>, sqls: &[String]) {
+    for sql in sqls {
+        if let Ok(mut st) = db.prepare(sql).await {
+            while let Ok(Step::Row) = st.step().await {}
+        }
+    }
+}
+
+/// A recursive-CTE row source of `n` rows numbered from `from`
+/// with `width`-byte texts.
+#[cfg(feature = "v16")]
+fn rows_sql(table: &str, from: i64, n: i64, width: usize) -> String {
+    format!(
+        "INSERT INTO {table} WITH RECURSIVE c(i) AS (SELECT {from} UNION ALL \
+         SELECT i + 1 FROM c WHERE i < {}) SELECT i, printf('%0{width}d', i) FROM c",
+        from + n - 1
+    )
+}
+
+/// Every crash point of `txn` (run after `setup`, under `cfg`)
+/// recovers to the pre- or the post-image, bytes included, and
+/// the recovered file scans cleanly.
+fn crash_matrix(tag: &str, cfg: Config, setup: &[String], txn: &[String]) {
+    block_on(async {
+        let mem_pre = MemStorage::new();
+        {
+            let mut db = Connection::open(mem_pre.clone(), cfg.clone())
+                .await
+                .expect("open");
+            run_all(&mut db, setup).await;
+        }
+        let pre_bytes = mem_pre.snapshot();
+        let mem_post = MemStorage::new();
+        mem_post.set_snapshot(pre_bytes.clone());
+        {
+            let mut db = Connection::open(mem_post.clone(), cfg.clone())
+                .await
+                .expect("open");
+            run_all(&mut db, txn).await;
+        }
+        assert!(mem_post.journal_snapshot().is_none(), "{tag}: committed");
+        let post_bytes = mem_post.snapshot();
+        assert_ne!(
+            pre_bytes, post_bytes,
+            "{tag}: the transaction changes the file"
+        );
+        let total_ops = {
+            let mem = MemStorage::new();
+            mem.set_snapshot(pre_bytes.clone());
+            let cs = crash_storage(mem);
+            let mut db = Connection::open(cs.clone(), cfg.clone())
+                .await
+                .expect("open");
+            let before = cs.ops();
+            run_all(&mut db, txn).await;
+            drop(db);
+            cs.ops() - before
+        };
+        assert!(total_ops >= 4, "{tag}: ops {total_ops}");
+        let mut saw_pre = false;
+        for k in 0..total_ops {
+            let mem = MemStorage::new();
+            mem.set_snapshot(pre_bytes.clone());
+            let cs = crash_storage(mem.clone());
+            {
+                let mut db = Connection::open(cs.clone(), cfg.clone())
+                    .await
+                    .expect("open");
+                cs.st.borrow_mut().kill_at = Some(cs.ops() + k);
+                run_all(&mut db, txn).await;
+            }
+            let mut db = Connection::open(mem.clone(), cfg.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{tag} k={k}: reopen failed: {e:?}"));
+            let mut q = db.prepare("SELECT count(*) FROM t").await.expect("prep");
+            assert_eq!(q.step().await.expect("scan"), Step::Row, "{tag} k={k}");
+            drop(q);
+            drop(db);
+            let bytes = mem.snapshot();
+            if bytes == pre_bytes {
+                assert!(
+                    mem.journal_snapshot().is_none(),
+                    "{tag} k={k}: journal consumed"
+                );
+                saw_pre = true;
+            } else if bytes != post_bytes {
+                panic!("{tag} k={k}/{total_ops}: torn file");
+            }
+        }
+        assert!(saw_pre, "{tag}: a crash before the commit point restores");
+    });
+}
+
+fn strs(xs: &[&str]) -> Vec<String> {
+    xs.iter().map(|s| s.to_string()).collect()
+}
+
+#[cfg(feature = "v16")]
+#[test]
+fn v16_crash_savepoint_transaction() {
+    let setup = strs(&[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)",
+        "INSERT INTO t VALUES (1, 'one')",
+    ]);
+    // SAVEPOINT outside BEGIN: releasing it commits.
+    let txn = strs(&[
+        "SAVEPOINT a",
+        "INSERT INTO t VALUES (2, 'two')",
+        "SAVEPOINT b",
+        "INSERT INTO t VALUES (3, 'three')",
+        "CREATE TABLE u (v)",
+        "ROLLBACK TO b",
+        "INSERT INTO t VALUES (4, 'four')",
+        "INSERT INTO t VALUES (4, 'dup')",
+        "RELEASE a",
+    ]);
+    crash_matrix("savepoints", Config::default(), &setup, &txn);
+    // Inside BEGIN, with a statement that fails half-way.
+    let txn = strs(&[
+        "BEGIN",
+        "SAVEPOINT a",
+        "INSERT INTO t VALUES (2, 'two')",
+        "INSERT INTO t VALUES (3, 'x'), (1, 'dup')",
+        "RELEASE a",
+        "SAVEPOINT c",
+        "UPDATE t SET x = 'changed'",
+        "ROLLBACK TO c",
+        "COMMIT",
+    ]);
+    crash_matrix("savepoints-begin", Config::default(), &setup, &txn);
+}
+
+/// Spills under a small cache, with pages the transaction
+/// allocated changed again after their spill, inside savepoints
+/// rolled back to across the spills.
+#[cfg(feature = "v16")]
+#[test]
+fn v16_crash_spill_rechange_and_savepoints() {
+    let cfg = Config::default().cache_pages(4);
+    let setup = strs(&[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)",
+        "INSERT INTO t VALUES (1, 'one')",
+    ]);
+    let txn = vec![
+        "BEGIN".to_string(),
+        rows_sql("t", 2, 120, 150),
+        "SAVEPOINT s".to_string(),
+        "UPDATE t SET x = x || 'more'".to_string(),
+        rows_sql("t", 200, 60, 150),
+        "ROLLBACK TO s".to_string(),
+        "UPDATE t SET x = 'v' || x WHERE id % 3 = 0".to_string(),
+        "COMMIT".to_string(),
+    ];
+    crash_matrix("spill", cfg, &setup, &txn);
+}
+
+/// Pages freed and reused in one transaction.
+#[cfg(feature = "v16")]
+#[test]
+fn v16_crash_freelist_reuse() {
+    let setup = vec![
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)".to_string(),
+        rows_sql("t", 1, 150, 120),
+    ];
+    let txn = vec![
+        "BEGIN".to_string(),
+        "DELETE FROM t WHERE id > 20".to_string(),
+        rows_sql("t", 1000, 150, 100),
+        "COMMIT".to_string(),
+    ];
+    crash_matrix("freelist", Config::default(), &setup, &txn);
+}
+
+#[cfg(feature = "v16")]
+#[test]
+fn v16_crash_vacuum() {
+    let setup = vec![
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)".to_string(),
+        "CREATE INDEX tx ON t(x)".to_string(),
+        rows_sql("t", 1, 120, 100),
+        "DELETE FROM t WHERE id % 2 = 0".to_string(),
+    ];
+    crash_matrix("vacuum", Config::default(), &setup, &strs(&["VACUUM"]));
+    // A page-size change through VACUUM.
+    let mut txn = strs(&["PRAGMA page_size = 1024", "VACUUM"]);
+    crash_matrix("vacuum-1024", Config::default(), &setup, &txn);
+    txn[0] = "PRAGMA page_size = 16384".to_string();
+    crash_matrix("vacuum-16384", Config::default(), &setup, &txn);
+}
+
+/// The cross-tool case for a savepoint transaction (v0.16): copies
+/// of pages the transaction had already changed live past the
+/// largest rollback journal it can write, behind a zero record, so
+/// real SQLite's recovery stops before them at every kill point.
+#[cfg(feature = "v16")]
+#[test]
+fn v16_cross_tool_real_sqlite_recovers_savepoint_journal() {
+    let dir = std::env::temp_dir().join(format!("hipp-crash-sp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let base = dir.join("base.db");
+    let (code, _) = run_writer(&base, "setup", None, false);
+    assert_eq!(code, 0);
+    let probe = dir.join("probe.db");
+    std::fs::copy(&base, &probe).expect("copy");
+    let (code, err) = run_writer(&probe, "savepoint", None, true);
+    assert_eq!(code, 0, "count run: {err}");
+    assert_eq!(common::cli(&probe, "SELECT id FROM t;"), "1\n2\n4\n");
+    let total: usize = err
+        .lines()
+        .find_map(|l| l.strip_prefix("OPS="))
+        .and_then(|v| v.parse().ok())
+        .expect("OPS line");
+    for k in 0..total {
+        let f = dir.join(format!("sp{k}.db"));
+        std::fs::copy(&base, &f).expect("copy");
+        let (code, _) = run_writer(&f, "savepoint", Some(k), false);
+        assert_eq!(code, 42, "k={k}: writer should die at the boundary");
+        assert_eq!(
+            common::cli(&f, "PRAGMA integrity_check;").trim(),
+            "ok",
+            "k={k}"
+        );
+        let ids = common::cli(&f, "SELECT group_concat(id) FROM t;");
+        assert!(ids == "1\n" || ids == "1,2,4\n", "k={k}: ids {ids}");
+    }
+}

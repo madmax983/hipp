@@ -496,6 +496,108 @@ pub struct SourceDesc {
     /// an upsert's `excluded` row): no affinity and no
     /// collation in comparisons, as on the pin.
     pub registers: bool,
+    /// The source is the main schema table read without an alias
+    /// (v0.16): `sqlite_master` and `sqlite_schema` both qualify
+    /// its columns, as on the pin.
+    pub schema_table: bool,
+    /// The table an ALTER TABLE is renaming (v0.16, `v16`): every
+    /// reference resolved to this source is recorded in the shared
+    /// trace, with whether the source was read under an alias.
+    #[cfg(feature = "v16")]
+    pub trace: Option<(alloc::rc::Rc<core::cell::RefCell<AlterTrace>>, bool)>,
+}
+
+/// What an ALTER TABLE learns from planning a view (v0.16, `v16`):
+/// the name tokens that resolved to the table being altered. Each
+/// position is an `ABytes::pos` of the view's parsed text — a token
+/// handle — so the rename can edit exactly those tokens, as the
+/// pin's `renameColumnFunc` / `renameTableFunc` edit theirs.
+#[cfg(feature = "v16")]
+#[derive(Debug, Default)]
+pub struct AlterTrace {
+    /// The altered table's name.
+    pub table: AVec<u8>,
+    /// FROM-clause name tokens that read the table.
+    pub from: AVec<u32>,
+    /// Column references resolved to the table.
+    pub hits: AVec<TraceHit>,
+}
+
+/// One reference to the altered table's column (v0.16, `v16`).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy)]
+pub struct TraceHit {
+    /// The column-name token (`None` for `t.rowid` and `t.*`).
+    pub name: Option<u32>,
+    /// The column's index in the table (`usize::MAX` without one).
+    pub col: usize,
+    /// The qualifier token, when the source was read under the
+    /// table's own name (an alias is never the table's token).
+    pub qual: Option<u32>,
+}
+
+/// Record a resolved column reference in the trace of the source it
+/// resolved to (v0.16, `v16`; see `AlterTrace`): the first scope, in
+/// resolution order, holding a source that matches is the one the
+/// reference read; a scope whose result alias answered is not.
+#[cfg(feature = "v16")]
+fn trace_column(
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    table: Option<crate::arena::ABytes>,
+    name: crate::arena::ABytes,
+    arena: &Arena,
+) {
+    let q = table.map(|h| handle_bytes(arena, h));
+    let n = handle_bytes(arena, name);
+    for g in core::iter::once(cur).chain(enclosing.iter()) {
+        let mut any = false;
+        for src in g.sources.iter() {
+            if let Some(q) = q
+                && !src.named(q)
+            {
+                continue;
+            }
+            // `rowid` names the INTEGER PRIMARY KEY column when
+            // there is one (the pin renames it with that column).
+            let mut ci = src.column_index(n);
+            let rowid = ci.is_none() && is_rowid_name(n) && src.has_rowid;
+            if rowid {
+                ci = src.rowid_alias;
+            }
+            if ci.is_none() && !(rowid && q.is_some()) {
+                continue;
+            }
+            any = true;
+            if let Some((tr, aliased)) = &src.trace {
+                tr.borrow_mut().hits.push(TraceHit {
+                    name: ci.map(|_| name.pos),
+                    col: ci.unwrap_or(usize::MAX),
+                    qual: table.filter(|_| !*aliased).map(|h| h.pos),
+                });
+            }
+        }
+        if any || (q.is_none() && g.aliases.iter().any(|(a, _)| eq_ci(a.as_slice(), n))) {
+            return;
+        }
+    }
+}
+
+/// Record `q.*` over the altered table (v0.16, `v16`).
+#[cfg(feature = "v16")]
+pub fn trace_star(cur: &ScopeGroup, q: crate::arena::ABytes, arena: &Arena) {
+    let qn = handle_bytes(arena, q);
+    for src in cur.sources.iter() {
+        if src.named(qn)
+            && let Some((tr, false)) = &src.trace
+        {
+            tr.borrow_mut().hits.push(TraceHit {
+                name: None,
+                col: usize::MAX,
+                qual: Some(q.pos),
+            });
+        }
+    }
 }
 
 impl SourceDesc {
@@ -516,7 +618,16 @@ impl SourceDesc {
             using: AVec::new(),
             colls: AVec::new(),
             registers: false,
+            schema_table: false,
+            #[cfg(feature = "v16")]
+            trace: None,
         }
+    }
+
+    /// Whether qualifier `q` names this source.
+    pub fn named(&self, q: &[u8]) -> bool {
+        eq_ci(self.qualifier.as_slice(), q)
+            || (self.schema_table && (eq_ci(q, b"sqlite_master") || eq_ci(q, b"sqlite_schema")))
     }
 
     /// Whether `name` is one of this source's USING columns.
@@ -660,6 +771,26 @@ pub struct SubSource {
     /// The table's generated columns (v0.16): VIRTUAL ones are
     /// absent from the record and computed as each row is read.
     pub gcols: Option<Box<crate::rules::GenCols>>,
+    /// A recursive CTE's recursive reference (v0.16, `v16`): when
+    /// non-zero, the source's one row is the row the CTE's queue
+    /// last gave up (`RecInfo::id`); `root` is unused.
+    #[cfg(feature = "v16")]
+    pub rec: u32,
+}
+
+/// A recursive common table expression's shape (v0.16, `v16`),
+/// carried by its `SubPlan`: compound tails from index `split - 1`
+/// on are the recursive SELECTs, the plan's head and the tails
+/// before them the setup. `comp_order` / `limit` / `offset` are
+/// the CTE's own ORDER BY (the queue order) and row window.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy)]
+pub struct RecInfo {
+    pub split: usize,
+    /// UNION (rows seen before are dropped) rather than UNION ALL.
+    pub union: bool,
+    /// The id the recursive references read (`SubSource::rec`).
+    pub id: u32,
 }
 
 /// A planned subquery (v0.6): a full SELECT planned against the
@@ -742,6 +873,16 @@ pub struct SubPlan {
     /// b) = (SELECT ...)`), where part `i` is a copy of the plan
     /// yielding column `i` of the first row.
     pub scalar_col: usize,
+    /// A recursive CTE (v0.16, `v16`; see `RecInfo`).
+    #[cfg(feature = "v16")]
+    pub rec: Option<RecInfo>,
+    /// The shared materialization this derived table's rows come
+    /// from (v0.16 review fix, `v16`; `CteUse::mat`): non-zero when
+    /// every derived table with this id reads one result, computed
+    /// once per statement execution. Set only on an uncorrelated
+    /// plan.
+    #[cfg(feature = "v16")]
+    pub mat: u32,
 }
 
 impl SubPlan {
@@ -968,29 +1109,19 @@ pub(crate) fn resolve_column_in_group<E>(
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Option<Result<RExpr, E>> {
-    if let Some(q) = table {
-        for (si, src) in group.sources.iter().enumerate() {
-            if !eq_ci(src.qualifier.as_slice(), q) {
-                continue;
-            }
-            if let Some(ci) = src.column_index(name) {
-                return Some(Ok(src.column_ref(group, si, ci)));
-            }
-            if is_rowid_name(name) && src.has_rowid {
-                return Some(Ok(RExpr::Rowid(group.first_src + si)));
-            }
-            // The qualifier matched but the column does not
-            // exist here: the pin's `lookupName` goes on to the
-            // enclosing scopes (v0.16 fix: `SELECT (SELECT
-            // max(t.a) FROM u AS t) FROM t` reads the outer t.a;
-            // hipp answered "no such column").
-        }
-        return None;
-    }
+    // A qualified reference counts only the sources of that name
+    // (v0.16 fix, ungated: `SELECT t.a FROM t, t` read the first t
+    // where the pin reports "ambiguous column name"); a USING
+    // column shared by two of them resolves as unqualified.
     let mut cnt = 0usize;
     let mut found: Option<RExpr> = None;
     let mut full: AVec<RExpr> = AVec::new();
     for (si, src) in group.sources.iter().enumerate() {
+        if let Some(q) = table
+            && !src.named(q)
+        {
+            continue;
+        }
         let Some(ci) = src.column_index(name) else {
             continue;
         };
@@ -1013,6 +1144,33 @@ pub(crate) fn resolve_column_in_group<E>(
         }
         cnt += 1;
         found = Some(src.column_ref(group, si, ci));
+    }
+    if let Some(q) = table
+        && cnt == 0
+    {
+        // The qualifier matched no column: its rowid, or the
+        // enclosing scopes — the pin's `lookupName` goes on there
+        // (v0.16 fix: `SELECT (SELECT max(t.a) FROM u AS t) FROM t`
+        // reads the outer t.a; hipp answered "no such column").
+        // Two such sources with a rowid are ambiguous (v0.16
+        // review fix: `SELECT t.rowid FROM t, t` read the first).
+        if is_rowid_name(name) {
+            let mut rowid: Option<RExpr> = None;
+            for (si, src) in group.sources.iter().enumerate() {
+                if src.named(q) && src.has_rowid {
+                    if rowid.is_some() {
+                        return Some(Err(Error::Schema {
+                            kind: SchemaKind::AmbiguousColumn,
+                        }));
+                    }
+                    rowid = Some(RExpr::Rowid(group.first_src + si));
+                }
+            }
+            if let Some(r) = rowid {
+                return Some(Ok(r));
+            }
+        }
+        return None;
     }
     match (cnt, found) {
         (1, Some(e)) => Some(Ok(e)),
@@ -1254,7 +1412,7 @@ pub fn expand_star<E>(
     let mut hit = false;
     for (si, src) in srcs.iter().enumerate() {
         if let Some(q) = qual
-            && !eq_ci(src.qualifier.as_slice(), q)
+            && !src.named(q)
         {
             continue;
         }
@@ -1275,6 +1433,17 @@ pub fn expand_star<E>(
                     None => src.column_ref(cur, si, ci),
                 }
             } else {
+                // With several sources the pin expands `*` to
+                // `q.col` references, so two sources of one name
+                // sharing a column make it ambiguous (v0.16 fix,
+                // ungated: `SELECT * FROM t, t` answered).
+                if srcs.len() > 1
+                    && !src.qualifier.is_empty()
+                    && let Some(Err(e)) =
+                        resolve_column_in_group::<E>(cur, Some(src.qualifier.as_slice()), n)
+                {
+                    return Err(e);
+                }
                 src.column_ref(cur, si, ci)
             };
             out.push((e, cname.clone()));
@@ -1397,12 +1566,22 @@ pub fn resolve_scoped<E>(
         // `session::bind_ast`); the pin reads one there as NULL.
         #[cfg(feature = "params")]
         Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
-        Expr::Column { table, name } => resolve_column::<E>(
-            cur,
-            enclosing,
-            table.map(|h| handle_bytes(arena, h)),
-            handle_bytes(arena, *name),
-        )?,
+        Expr::Column { table, name } => {
+            let r = resolve_column::<E>(
+                cur,
+                enclosing,
+                table.map(|h| handle_bytes(arena, h)),
+                handle_bytes(arena, *name),
+            )?;
+            #[cfg(feature = "v16")]
+            if core::iter::once(cur)
+                .chain(enclosing.iter())
+                .any(|g| g.sources.iter().any(|s| s.trace.is_some()))
+            {
+                trace_column(cur, enclosing, *table, *name, arena);
+            }
+            r
+        }
         #[cfg(feature = "v16")]
         Expr::InSubquery(x, stmt, neg) if is_row(x) => {
             let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
@@ -1704,7 +1883,7 @@ pub fn resolve_scoped<E>(
                 enclosing,
                 &mut *planner,
             )?),
-            crate::record::affinity_of(handle_bytes(arena, *ty)),
+            crate::record::cast_affinity(handle_bytes(arena, *ty)),
         ),
         #[cfg(feature = "v16")]
         Expr::Collate(e, c) => RExpr::Collate(
@@ -3660,6 +3839,10 @@ pub struct Env {
     /// far (moved to `changes` when it succeeds).
     #[cfg(feature = "v16")]
     pub pending: core::cell::Cell<i64>,
+    /// `PRAGMA case_sensitive_like` (v0.16): LIKE and `like()`
+    /// compare ASCII letters case-sensitively while set.
+    #[cfg(feature = "v16")]
+    pub case_like: core::cell::Cell<bool>,
 }
 
 impl Env {
@@ -3678,6 +3861,8 @@ impl Env {
             prng: crate::func::Prng::new(seed),
             #[cfg(feature = "v16")]
             pending: core::cell::Cell::new(0),
+            #[cfg(feature = "v16")]
+            case_like: core::cell::Cell::new(false),
         }
     }
 
@@ -3722,6 +3907,10 @@ pub struct Ctx<'x> {
     rows: Option<&'x [RowData]>,
     rep: &'x RowData,
     env: Option<&'x Env>,
+    /// LIKE compares case-sensitively without the connection
+    /// state at hand (v0.16: a generated column's computation).
+    #[cfg(feature = "v16")]
+    like_cs: bool,
 }
 
 impl<'x> Ctx<'x> {
@@ -3731,7 +3920,16 @@ impl<'x> Ctx<'x> {
             rows: None,
             rep: r,
             env: None,
+            #[cfg(feature = "v16")]
+            like_cs: false,
         }
+    }
+    /// The same context with `PRAGMA case_sensitive_like` set to
+    /// `on` (v0.16).
+    #[cfg(feature = "v16")]
+    pub fn case_like(mut self, on: bool) -> Ctx<'x> {
+        self.like_cs = on;
+        self
     }
     /// An aggregate group's context: `rows` folds, `rep` supplies
     /// the bare columns.
@@ -3740,6 +3938,8 @@ impl<'x> Ctx<'x> {
             rows: Some(rows),
             rep,
             env: None,
+            #[cfg(feature = "v16")]
+            like_cs: false,
         }
     }
     /// The same context reading the connection state `env`.
@@ -3757,6 +3957,8 @@ impl<'x> Ctx<'x> {
             rows: None,
             rep: r,
             env: self.env,
+            #[cfg(feature = "v16")]
+            like_cs: self.like_cs,
         }
     }
 }
@@ -4415,6 +4617,20 @@ fn pattern_match(pat: &[u32], s: &[u8], info: PatInfo) -> bool {
     }
 }
 
+/// Whether `PRAGMA case_sensitive_like` is on for this
+/// evaluation (v0.16; off without the connection state).
+fn case_like(ctx: &Ctx<'_>) -> bool {
+    #[cfg(feature = "v16")]
+    {
+        ctx.like_cs || ctx.env.is_some_and(|e| e.case_like.get())
+    }
+    #[cfg(not(feature = "v16"))]
+    {
+        let _ = ctx;
+        false
+    }
+}
+
 /// The pin's `likeFunc` (v0.16): `like(pattern, subject[,
 /// escape])` / `glob(pattern, subject)`, and the LIKE / GLOB
 /// operators built on them. A pattern over 50,000 bytes is
@@ -4428,6 +4644,7 @@ pub fn like_glob<E>(
     subject: &OwnedValue,
     esc: Option<&OwnedValue>,
     glob: bool,
+    case_sensitive: bool,
 ) -> Result<OwnedValue, E> {
     if to_text(pat).map_or(0, |t| t.len()) > 50_000 {
         return Err(Error::Schema {
@@ -4448,7 +4665,7 @@ pub fn like_glob<E>(
             one: u32::from(b'_'),
             other: 0,
             set: false,
-            nocase: true,
+            nocase: !case_sensitive,
         }
     };
     if let Some(e) = esc {
@@ -4970,6 +5187,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             v1.unwrap_or(&OwnedValue::Null),
             v.get(2),
             f == ScalarFn::Glob,
+            case_like(ctx),
         )?,
         ScalarFn::MinN | ScalarFn::MaxN => {
             if v.iter().any(|x| matches!(x, OwnedValue::Null)) {
@@ -5258,7 +5476,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Like(x, p, neg) => {
             let xv = eval::<E>(x, ctx)?;
             let pv = eval::<E>(p, ctx)?;
-            match like_glob::<E>(&pv, &xv, None, false)? {
+            match like_glob::<E>(&pv, &xv, None, false, case_like(ctx))? {
                 OwnedValue::Integer(m) => bool_val((m != 0) != *neg),
                 other => other,
             }

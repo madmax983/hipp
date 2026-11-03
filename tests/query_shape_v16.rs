@@ -1385,23 +1385,33 @@ fn update_from_repeating_the_target_is_refused() {
 fn schema_qualifier_other_than_main_is_refused() {
     let tw = twins("schema-q", "CREATE TABLE s(a); INSERT INTO s VALUES(1)");
     tw.all(&["SELECT * FROM main.s", "SELECT * FROM MAIN.s"]);
+    tw.refuse_parse("SELECT * FROM foo.s");
+    // `temp.` names the TEMP database: hipp has one with `v16`
+    // (empty here, so these fail as on the pin), and refuses the
+    // qualifier without it.
     for sql in [
         "SELECT * FROM temp.s",
-        "SELECT * FROM foo.s",
         "INSERT INTO temp.s VALUES(2)",
         "DELETE FROM temp.s",
     ] {
-        tw.refuse_parse(sql);
+        if cfg!(feature = "v16") {
+            assert!(tw.same(sql).is_some(), "{sql}");
+        } else {
+            tw.refuse_parse(sql);
+        }
     }
     #[cfg(feature = "v16")]
     {
         tw.same("SELECT 1 IN main.s");
-        tw.refuse_parse("SELECT 1 IN temp.s");
+        assert!(tw.same("SELECT 1 IN temp.s").is_some());
     }
-    // The pin would make a temporary table outside the file.
-    assert!(matches!(
-        hipp_only(&tw, "CREATE TABLE temp.q(a)"),
-        Err(Error::Parse { .. })
-    ));
+    // Without `v16` the pin would make a temporary table outside
+    // the file; with it, hipp does too (never in the file).
+    let r = hipp_only(&tw, "CREATE TABLE temp.q(a)");
+    if cfg!(feature = "v16") {
+        assert!(r.is_ok(), "{r:?}");
+    } else {
+        assert!(matches!(r, Err(Error::Parse { .. })), "{r:?}");
+    }
     tw.finish("SELECT a FROM s");
 }

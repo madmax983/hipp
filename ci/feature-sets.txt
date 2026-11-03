@@ -2,7 +2,8 @@
 #   cargo clippy --lib --no-default-features --features "<set>" -- -D warnings
 # by CI (features job) and ci/local-gates.sh. An empty line-set is
 # written as `-` (the tiny profile). New feature rungs / leaves add
-# a line for themselves alone and stay covered by `full`.
+# a line for themselves alone and stay covered by `full` (or, for
+# the heavyweight leaves of ADR 0002, by `max`).
 -
 std
 indexes
@@ -21,3 +22,5 @@ indexes,v05
 indexes,v06
 full
 std,full
+max
+std,max

@@ -451,7 +451,7 @@ fn txn_state_errors() {
 }
 
 #[test]
-fn txn_statement_error_aborts_bracket() {
+fn txn_statement_error_aborts_statement_or_bracket() {
     block_on(async {
         let path = common::temp_db("v02-txn-abort");
         {
@@ -470,8 +470,11 @@ fn txn_statement_error_aborts_bracket() {
             exec(&mut db, "INSERT INTO t VALUES (2, 'two')")
                 .await
                 .unwrap();
-            // Duplicate rowid: error aborts the whole bracket
-            // (v0.2's documented, stricter-than-SQLite rule).
+            // Duplicate rowid. Without `v16` the error aborts the
+            // whole bracket (v0.2's documented, stricter-than-SQLite
+            // rule); with it (v0.16 statement savepoints) only the
+            // statement is undone and the bracket stays open, as on
+            // the pin — the ROLLBACK then undoes the bracket.
             let e = exec_err(&mut db, "INSERT INTO t VALUES (1, 'dup')").await;
             assert!(
                 matches!(
@@ -482,6 +485,13 @@ fn txn_statement_error_aborts_bracket() {
                 ),
                 "dup: {e:?}"
             );
+            #[cfg(feature = "v16")]
+            {
+                assert!(db.in_explicit_transaction(), "bracket kept");
+                let rows = collect(&mut db, "SELECT id FROM t").await;
+                assert_eq!(rows, vec!["1", "2"], "statement undone, bracket kept");
+                exec(&mut db, "ROLLBACK").await.unwrap();
+            }
             assert!(!db.in_explicit_transaction(), "bracket closed by abort");
             let rows = collect(&mut db, "SELECT id FROM t").await;
             assert_eq!(rows, vec!["1"], "bracket rows rolled back");

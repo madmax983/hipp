@@ -34,19 +34,36 @@ enum Db {
 fn open_db(path: &str) -> Result<Db, String> {
     block_on(async {
         if path == ":memory:" {
-            let conn = Connection::open(MemStorage::new(), Config::default().clock(now_ms))
+            let conn = Connection::open(MemStorage::new(), cli_config())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::Mem(conn))
         } else {
             let fs = FileStorage::open(std::path::Path::new(path)).map_err(|e| format!("{e:?}"))?;
-            let conn = Connection::open(fs, Config::default().clock(now_ms))
+            let conn = Connection::open(fs, cli_config())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::File(conn))
         }
     })
 }
+
+/// The CLI's engine configuration: the defaults, the system clock,
+/// and the pin's nesting limit for views and CTEs (999 levels read,
+/// 1000 are "nested too deep"), which `main`'s thread has the
+/// stack for, with a statement arena big enough to expand them
+/// (the default 64 KiB holds about 800 nested views).
+fn cli_config() -> Config {
+    let d = Config::default();
+    let (init, max) = (d.stmt_init, d.stmt_max.max(4 * 1024 * 1024));
+    d.clock(now_ms).max_nesting(1000).statement_arena(init, max)
+}
+
+/// The stack of the thread the CLI runs on: room for
+/// `cli_config`'s 1000 nested view / CTE levels in a debug build
+/// (each costs the planner and executor tens of KiB). Only the
+/// pages a statement touches are ever committed.
+const STACK_BYTES: usize = 512 * 1024 * 1024;
 
 /// The wall clock for CURRENT_TIME / CURRENT_DATE /
 /// CURRENT_TIMESTAMP defaults (v0.16): the core has none of its
@@ -65,6 +82,90 @@ fn now_ms() -> i64 {
 /// with `"` doubled. The keyword list is SQLite's documented one
 /// (147 words, sqlite.org/lang_keywords.html); the keyword case is
 /// inferred from the shell's quoting rule, not seen in CI.
+/// `CREATE TABLE x` as `CREATE TABLE temp.x` (and likewise for an
+/// index or a view): the oracle shell's `.schema` form of a TEMP
+/// database object.
+fn temp_text(sql: &[u8]) -> Vec<u8> {
+    for p in [
+        &b"CREATE TABLE "[..],
+        b"CREATE UNIQUE INDEX ",
+        b"CREATE INDEX ",
+        b"CREATE VIEW ",
+    ] {
+        if sql.starts_with(p) {
+            let mut v = p.to_vec();
+            v.extend_from_slice(b"temp.");
+            v.extend_from_slice(&sql[p.len()..]);
+            return v;
+        }
+    }
+    sql.to_vec()
+}
+
+/// `.schema [name]` for one database (`temp`: the TEMP database):
+/// every object with SQL text in schema (rowid) order, as the oracle
+/// shell prints them — `name` matches an object's name or its
+/// table's — each view followed by its `/* name(columns) */` comment.
+/// The column names are the view's planned ones (v0.16: views
+/// execute); a view that cannot be planned — a missing table, a
+/// column list of the wrong length, a cycle — gets no comment, as in
+/// the oracle shell.
+async fn print_schema<S: hipp::Storage>(
+    db: &mut Connection<S>,
+    arg: &str,
+    out: &mut dyn Write,
+    temp: bool,
+) {
+    let sql = if temp {
+        "SELECT type, name, tbl_name, sql FROM sqlite_temp_schema"
+    } else {
+        "SELECT type, name, tbl_name, sql FROM main.sqlite_schema"
+    };
+    // (type, name, tbl_name, sql) per schema row.
+    type SchemaRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    let mut rows: Vec<SchemaRow> = Vec::new();
+    if let Ok(mut st) = db.prepare(sql).await {
+        while let Ok(Step::Row) = st.step().await {
+            let col = |i| st.column_bytes(i).map(<[u8]>::to_vec);
+            if let (Some(t), Some(n), Some(tb), Some(q)) = (col(0), col(1), col(2), col(3)) {
+                rows.push((t, n, tb, q));
+            }
+        }
+    }
+    for (ty, name, tbl, sql) in rows.iter() {
+        let a = arg.as_bytes();
+        if !arg.is_empty() && !name.eq_ignore_ascii_case(a) && !tbl.eq_ignore_ascii_case(a) {
+            continue;
+        }
+        let _ = out.write_all(&if temp { temp_text(sql) } else { sql.clone() });
+        let _ = out.write_all(b";\n");
+        if ty.as_slice() != b"view" {
+            continue;
+        }
+        let cols = if temp {
+            db.temp_db().and_then(|t| t.view_columns(name))
+        } else {
+            db.view_columns(name)
+        };
+        let Some(cols) = cols else {
+            continue;
+        };
+        let _ = out.write_all(b"/* ");
+        if temp {
+            let _ = out.write_all(b"temp.");
+        }
+        let _ = out.write_all(&shell_quote_name(name));
+        let _ = out.write_all(b"(");
+        for (i, c) in cols.iter().enumerate() {
+            if i > 0 {
+                let _ = out.write_all(b",");
+            }
+            let _ = out.write_all(&shell_quote_name(c.as_slice()));
+        }
+        let _ = out.write_all(b") */\n");
+    }
+}
+
 fn shell_quote_name(c: &[u8]) -> Vec<u8> {
     let plain = c
         .first()
@@ -512,7 +613,12 @@ where
             Ok(Flow::Continue)
         }
         ".tables" => {
+            // `sqlite_*` tables (sqlite_sequence, sqlite_stat1) are
+            // not listed, as in the oracle shell.
             for t in db.tables().iter() {
+                if t.name.starts_with(b"sqlite_") {
+                    continue;
+                }
                 let _ = out.write_all(t.name);
                 let _ = out.write_all(b"\n");
             }
@@ -520,46 +626,28 @@ where
                 let _ = out.write_all(v.name);
                 let _ = out.write_all(b"\n");
             }
+            // The TEMP database's tables and views (v0.16), named
+            // `temp.x` as the oracle shell lists them.
+            if let Some(t) = db.temp_db() {
+                let names = t.tables().iter().map(|m| m.name).collect::<Vec<_>>();
+                let views = t.views().iter().map(|m| m.name).collect::<Vec<_>>();
+                for n in names.iter().chain(views.iter()) {
+                    if n.starts_with(b"sqlite_") {
+                        continue;
+                    }
+                    let _ = out.write_all(b"temp.");
+                    let _ = out.write_all(n);
+                    let _ = out.write_all(b"\n");
+                }
+            }
             Ok(Flow::Continue)
         }
         ".schema" => {
-            for t in db.tables().iter() {
-                if !arg.is_empty() && !t.name.eq_ignore_ascii_case(arg.as_bytes()) {
-                    continue;
-                }
-                let _ = out.write_all(t.sql);
-                let _ = out.write_all(b";\n");
-                // Explicit indexes on this table print right
-                // after it (oracle .schema order); implicit
-                // (sqlite_autoindex_*) entries carry no SQL and
-                // never print, as in the oracle shell.
-                for ix in db.indexes().iter() {
-                    if ix.table.eq_ignore_ascii_case(t.name)
-                        && let Some(sql) = ix.sql
-                    {
-                        let _ = out.write_all(sql);
-                        let _ = out.write_all(b";\n");
-                    }
-                }
-            }
-            // Views print after the tables (the oracle shell's
-            // .schema convention), each followed by its
-            // `/* name(columns) */` comment line.
-            for v in db.views().iter() {
-                if !arg.is_empty() && !v.name.eq_ignore_ascii_case(arg.as_bytes()) {
-                    continue;
-                }
-                let _ = out.write_all(v.sql);
-                let _ = out.write_all(b";\n/* ");
-                let _ = out.write_all(v.name);
-                let _ = out.write_all(b"(");
-                for (i, c) in v.columns.iter().enumerate() {
-                    if i > 0 {
-                        let _ = out.write_all(b",");
-                    }
-                    let _ = out.write_all(&shell_quote_name(c));
-                }
-                let _ = out.write_all(b") */\n");
+            print_schema(db, arg, out, false).await;
+            // The TEMP database's objects follow, named `temp.`, as
+            // the oracle shell prints them.
+            if db.temp_db().is_some() {
+                print_schema(db, arg, out, true).await;
             }
             Ok(Flow::Continue)
         }
@@ -591,9 +679,22 @@ where
                     (t.name.to_vec(), t.sql.to_vec(), list)
                 })
                 .collect();
-            for (name, sql, list) in &tables {
-                let _ = out.write_all(sql);
-                let _ = out.write_all(b";\n");
+            // `sqlite_sequence` (AUTOINCREMENT, v0.16) comes last and
+            // replays as `DELETE` + `INSERT`s, as in the oracle shell:
+            // the table itself is re-created by the AUTOINCREMENT
+            // table's CREATE (its own CREATE is a reserved name).
+            let is_seq = |n: &[u8]| n == b"sqlite_sequence";
+            let ordered = tables
+                .iter()
+                .filter(|t| !is_seq(&t.0))
+                .chain(tables.iter().filter(|t| is_seq(&t.0)));
+            for (name, sql, list) in ordered {
+                if is_seq(name) {
+                    let _ = out.write_all(b"DELETE FROM sqlite_sequence;\n");
+                } else {
+                    let _ = out.write_all(sql);
+                    let _ = out.write_all(b";\n");
+                }
                 let name = String::from_utf8_lossy(name);
                 let mut st = db
                     .prepare(&format!("SELECT {list} FROM {name}"))
@@ -677,6 +778,18 @@ fn usage() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Run on a thread with the stack `cli_config` needs (in place
+    // if the host cannot make one).
+    match std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(run)
+    {
+        Ok(h) => h.join().unwrap_or(ExitCode::FAILURE),
+        Err(_) => run(),
+    }
+}
+
+fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args.len() > 2 {
         return usage();

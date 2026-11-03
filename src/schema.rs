@@ -105,6 +105,10 @@ pub struct TableDef {
     /// (see `TableDef::usable`); the rest of the file works.
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub foreign_coll: bool,
+    /// The table's INTEGER PRIMARY KEY is AUTOINCREMENT (v0.16,
+    /// `v16`): every INSERT keeps its `sqlite_sequence` row.
+    #[cfg(feature = "v16")]
+    pub autoinc: bool,
 }
 
 impl TableDef {
@@ -188,6 +192,15 @@ pub struct Catalog {
     pub views: AVec<ViewDef>,
     /// Schema cookie this catalog was built from.
     pub cookie: u32,
+    /// Table and view names in `sqlite_schema` rowid (creation)
+    /// order (v0.16, `v16`): the order PRAGMA table_list and
+    /// integrity_check walk.
+    #[cfg(feature = "v16")]
+    pub objects: AVec<ABytes>,
+    /// `sqlite_schema` itself as a readable table (v0.16, `v16`):
+    /// root page 1, columns `type name tbl_name rootpage sql`.
+    #[cfg(feature = "v16")]
+    pub schema_table: Option<TableDef>,
 }
 
 impl Catalog {
@@ -197,7 +210,31 @@ impl Catalog {
             indexes: AVec::new(),
             views: AVec::new(),
             cookie,
+            #[cfg(feature = "v16")]
+            objects: AVec::new(),
+            #[cfg(feature = "v16")]
+            schema_table: None,
         }
+    }
+
+    /// The name names `sqlite_schema` (v0.16, `v16`): any case
+    /// of `sqlite_schema` / `sqlite_master`.
+    #[cfg(feature = "v16")]
+    pub fn is_schema_name(name: &[u8]) -> bool {
+        eq_ci(name, b"sqlite_schema") || eq_ci(name, b"sqlite_master")
+    }
+
+    /// A table to read (v0.16, `v16`): a catalog table, or
+    /// `sqlite_schema` under either of its names.
+    #[cfg(feature = "v16")]
+    pub fn find_readable<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x TableDef> {
+        self.find(arena, name).or_else(|| {
+            if Catalog::is_schema_name(name) {
+                self.schema_table.as_ref()
+            } else {
+                None
+            }
+        })
     }
 
     pub fn find<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x TableDef> {
@@ -216,6 +253,21 @@ impl Catalog {
         self.indexes
             .iter()
             .find(|t| eq_ci(handle_bytes(arena, t.name), name))
+    }
+
+    /// What a schema name is taken by (v0.16): `Some(true)` for an
+    /// index, `Some(false)` for a table or view, `None` when free —
+    /// tables, views and indexes share one namespace.
+    pub fn taken(&self, arena: &Arena, name: &[u8]) -> Option<bool> {
+        let hit = |h: ABytes| eq_ci(handle_bytes(arena, h), name);
+        if self.indexes.iter().any(|i| hit(i.name)) {
+            Some(true)
+        } else if self.tables.iter().any(|t| hit(t.name)) || self.views.iter().any(|v| hit(v.name))
+        {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     /// All indexes (explicit and implicit) on one table.
@@ -348,6 +400,48 @@ pub async fn build_catalog<S: Storage>(
     }
 
     let mut catalog = Catalog::empty(pager.schema_cookie());
+    #[cfg(feature = "v16")]
+    {
+        for row in rows.iter() {
+            if eq_ci(row.ty.as_slice(), b"table") || eq_ci(row.ty.as_slice(), b"view") {
+                catalog
+                    .objects
+                    .push(intern(catalog_arena, row.name.as_slice())?);
+            }
+        }
+        let mut columns = AVec::new();
+        for (n, d) in [
+            (b"type" as &[u8], b"TEXT" as &[u8]),
+            (b"name", b"TEXT"),
+            (b"tbl_name", b"TEXT"),
+            (b"rootpage", b"INT"),
+            (b"sql", b"TEXT"),
+        ] {
+            columns.push(Column {
+                name: intern(catalog_arena, n)?,
+                decl: intern(catalog_arena, d)?,
+                affinity: affinity_of(d),
+                default: None,
+                not_null: false,
+                default_expr: None,
+                gen_expr: None,
+                stored: false,
+                coll: Coll::Binary,
+            });
+        }
+        catalog.schema_table = Some(TableDef {
+            name: intern(catalog_arena, b"sqlite_master")?,
+            root: 1,
+            sql: ABytes::EMPTY,
+            columns,
+            rowid_alias: None,
+            auto_sets: AVec::new(),
+            checks: AVec::new(),
+            strict: false,
+            foreign_coll: false,
+            autoinc: false,
+        });
+    }
     // Scratch arena for parse trees (names are interned out of it
     // into the catalog arena before the next row).
     let scratch = Arena::new(crate::error::Scope::Statement, 0, 1 << 20);
@@ -382,6 +476,8 @@ pub async fn build_catalog<S: Storage>(
                     #[cfg(feature = "v16")]
                     strict: false,
                     foreign_coll: true,
+                    #[cfg(feature = "v16")]
+                    autoinc: false,
                 });
                 continue;
             }
@@ -412,7 +508,7 @@ pub async fn build_catalog<S: Storage>(
                     handle_bytes(&scratch, pk_columns.as_slice()[0]),
                 )
                 && !c.pk_desc
-                && eq_ci(trim(decl_bytes), b"INTEGER")
+                && eq_ci(crate::record::decl_token(decl_bytes), b"INTEGER")
             {
                 alias = Some(i);
             }
@@ -422,7 +518,7 @@ pub async fn build_catalog<S: Storage>(
             // values are stored as given (in an ordinary table
             // `ANY` is NUMERIC by the name rules).
             #[cfg(feature = "v16")]
-            if strict && eq_ci(trim(decl_bytes), b"ANY") {
+            if strict && eq_ci(crate::record::decl_token(decl_bytes), b"ANY") {
                 affinity = Affinity::Blob;
             }
             #[allow(unused_mut)]
@@ -501,6 +597,9 @@ pub async fn build_catalog<S: Storage>(
             strict,
             #[cfg(any(feature = "v04", feature = "indexes"))]
             foreign_coll: false,
+            #[cfg(feature = "v16")]
+            autoinc: rowid_alias.is_some()
+                && crate::sql::parser::has_autoincrement::<S::Error>(sql.as_slice(), &scratch),
         });
     }
 
@@ -672,6 +771,28 @@ fn derive_view_columns(
         }
         return out;
     }
+    // A VALUES view (v0.16): `column1`, `column2`, ... as on the
+    // pin.
+    #[cfg(feature = "v04")]
+    if let Some(row) = select.values.as_slice().first() {
+        for i in 0..row.len() {
+            let mut n = copy_avec(b"column");
+            let mut digits = AVec::new();
+            let mut k = i + 1;
+            while k > 0 {
+                digits.push(b'0' + (k % 10) as u8);
+                k /= 10;
+            }
+            while let Some(d) = digits.pop() {
+                n.push(d);
+            }
+            match intern(catalog_arena, n.as_slice()) {
+                Ok(h) => out.push(h),
+                Err(_) => return AVec::new(),
+            }
+        }
+        return out;
+    }
     // Source column-name lists, in FROM order — and (v0.16)
     // each source's NATURAL / USING join columns: an
     // unqualified `*` shows those once, at the left-most source
@@ -768,12 +889,38 @@ fn derive_view_columns(
                     // (the pin names `SELECT A FROM s` column `a`).
                     let nb = handle_bytes(scratch, *name);
                     let qb = table.map(|q| handle_bytes(scratch, q));
-                    sources
+                    let hit = sources
                         .iter()
                         .filter(|(q, _)| qb.is_none_or(|qb| eq_ci(q.as_slice(), qb)))
                         .flat_map(|(_, cols)| cols.iter())
-                        .find(|c| eq_ci(c.as_slice(), nb))
-                        .map_or(nb, |c| c.as_slice())
+                        .find(|c| eq_ci(c.as_slice(), nb));
+                    match hit {
+                        Some(c) => c.as_slice(),
+                        // v0.16: a rowid reference is named by the
+                        // rowid-alias column, as on the pin.
+                        #[cfg(feature = "v04")]
+                        None if eq_ci(nb, b"rowid")
+                            || eq_ci(nb, b"oid")
+                            || eq_ci(nb, b"_rowid_") =>
+                        {
+                            let alias = select
+                                .from
+                                .iter()
+                                .zip(sources.iter())
+                                .filter(|(_, (q, _))| qb.is_none_or(|qb| eq_ci(q.as_slice(), qb)))
+                                .find_map(|(src, _)| {
+                                    let t = catalog
+                                        .find(catalog_arena, handle_bytes(scratch, src.table))?;
+                                    let a = t.rowid_alias?;
+                                    t.columns
+                                        .as_slice()
+                                        .get(a)
+                                        .map(|c| handle_bytes(catalog_arena, c.name))
+                                });
+                            alias.unwrap_or(b"rowid")
+                        }
+                        None => nb,
+                    }
                 } else {
                     handle_bytes(scratch, *text)
                 };
@@ -861,16 +1008,4 @@ fn resolve_auto_sets(
         }
     }
     auto_sets
-}
-
-fn trim(b: &[u8]) -> &[u8] {
-    let mut s = 0;
-    let mut e = b.len();
-    while s < e && (b[s] as char).is_whitespace() {
-        s += 1;
-    }
-    while e > s && (b[e - 1] as char).is_whitespace() {
-        e -= 1;
-    }
-    &b[s..e]
 }

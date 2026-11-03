@@ -1728,34 +1728,48 @@ fn clock_is_read_once_per_statement() {
 }
 
 #[test]
-fn autoincrement_is_refused_at_create_and_read_from_foreign_files() {
-    // hipp keeps no `sqlite_sequence`; a table it created with
-    // AUTOINCREMENT made the pin's next INSERT report "database
-    // disk image is malformed". CREATE refuses the clause; a file
-    // the pin wrote (sqlite_sequence included) still loads, and
-    // hipp's writes keep it valid.
+fn autoincrement_is_kept_or_refused() {
+    // Without `v16` hipp keeps no `sqlite_sequence`: CREATE refuses
+    // the clause and an AUTOINCREMENT table the pin made is
+    // read-only (an INSERT that left the sequence behind let the
+    // pin hand out a rowid twice). With `v16` both work and the
+    // sequence is the pin's (tests/autoinc_v16.rs covers it).
     let h = common::temp_db("v16td-autoinc-h");
     for sql in [
         "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b)",
-        "CREATE TABLE t(a INTEGER, b, PRIMARY KEY (a AUTOINCREMENT))",
+        "CREATE TABLE t2(a INTEGER, b, PRIMARY KEY (a AUTOINCREMENT))",
     ] {
         let r = block_on(async {
             let mut db = open(&h).await;
             try_collect(&mut db, sql).await
         });
-        assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
+        if cfg!(feature = "v16") {
+            assert!(r.is_ok(), "{sql}: {r:?}");
+        } else {
+            assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
+        }
     }
     let o = common::temp_db("v16td-autoinc-o");
     common::cli(
         &o,
         "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b); INSERT INTO t(b) VALUES ('x');",
     );
-    let rows = block_on(async {
+    let (ins, rows) = block_on(async {
         let mut db = open(&o).await;
-        exec(&mut db, "INSERT INTO t(b) VALUES ('y')").await;
-        try_collect(&mut db, "SELECT a, b FROM t").await.unwrap()
+        let ins = try_collect(&mut db, "INSERT INTO t(b) VALUES ('y')").await;
+        (
+            ins,
+            try_collect(&mut db, "SELECT a, b FROM t").await.unwrap(),
+        )
     });
-    assert_eq!(rows, ["1|x", "2|y"]);
+    if cfg!(feature = "v16") {
+        assert!(ins.is_ok(), "{ins:?}");
+        assert_eq!(rows, ["1|x", "2|y"]);
+        assert_eq!(oracle_raw(&o, "SELECT * FROM sqlite_sequence;").1, ["t|2"]);
+    } else {
+        assert!(matches!(ins, Err(Error::Unsupported)), "{ins:?}");
+        assert_eq!(rows, ["1|x"]);
+    }
     assert_eq!(oracle_raw(&o, "PRAGMA integrity_check;").1, ["ok"]);
     assert!(oracle_raw(&o, "INSERT INTO t(b) VALUES ('z');").0);
 }

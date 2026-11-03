@@ -355,3 +355,36 @@ fn a5() {
 fn a7() {
     a7_rejections();
 }
+
+/// v0.16 review regression: a row without an explicit rowid when
+/// the largest rowid is 9223372036854775807. The pin picks an
+/// unused rowid (at random). With `v16` hipp takes the smallest
+/// unused positive rowid and the oracle reads the file; without it
+/// (the tiny profile) the insert fails cleanly and the file is
+/// unchanged.
+#[test]
+fn insert_after_the_largest_rowid() {
+    let path = common::temp_db("maxrowid");
+    common::cli(
+        &path,
+        "CREATE TABLE t(a); INSERT INTO t(rowid, a) VALUES (9223372036854775807, 0), (1, 1), (3, 3);",
+    );
+    let r = block_on(async {
+        let fs = FileStorage::open(&path).expect("fs open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
+        for sql in ["INSERT INTO t VALUES (10)", "INSERT INTO t VALUES (20)"] {
+            let mut st = db.prepare(sql).await.expect("prepare");
+            st.step().await?;
+        }
+        Ok::<(), Error<hipp::storage::FileError>>(())
+    });
+    assert_eq!(common::cli(&path, "PRAGMA integrity_check;"), "ok\n");
+    let rows = common::cli(&path, "SELECT rowid, a FROM t ORDER BY rowid;");
+    if cfg!(feature = "v16") {
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(rows, "1|1\n2|10\n3|3\n4|20\n9223372036854775807|0\n");
+    } else {
+        assert!(r.is_err());
+        assert_eq!(rows, "1|1\n3|3\n9223372036854775807|0\n");
+    }
+}

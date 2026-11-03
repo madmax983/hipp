@@ -30,9 +30,10 @@ pub struct ColumnDef {
     /// `PRIMARY KEY` appeared in this column's constraints (or the
     /// column was named by a table-level `PRIMARY KEY (col)`).
     pub primary_key: bool,
-    /// The column's PRIMARY KEY was written with `DESC` (the
-    /// SQLite quirk: such a key is NOT the rowid alias even when
-    /// the declared type is exactly INTEGER).
+    /// The column's own PRIMARY KEY constraint was written with
+    /// `DESC` (the SQLite quirk: such a key is NOT the rowid alias
+    /// even when the declared type is exactly INTEGER; a
+    /// table-level `PRIMARY KEY (a DESC)` is, as on the pin).
     pub pk_desc: bool,
     /// `UNIQUE` appeared in this column's constraints (v0.3).
     pub unique: bool,
@@ -74,6 +75,29 @@ pub struct ColumnDef {
     /// unknown name is refused at parse, as on the pin.
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub coll: Option<Coll>,
+    /// The DEFAULT clause's text as `PRAGMA table_info` shows it
+    /// (v0.16, `v16`): the expression as written, the outer
+    /// parentheses of `DEFAULT (expr)` removed.
+    #[cfg(feature = "v16")]
+    pub dflt_text: Option<ABytes>,
+}
+
+/// One FOREIGN KEY / REFERENCES clause of a `CREATE TABLE`
+/// (v0.16, `v16`): parsed, never enforced; `PRAGMA
+/// foreign_key_list` reports it. Actions are the pin's codes:
+/// 0 NO ACTION, 1 RESTRICT, 2 SET NULL, 3 SET DEFAULT, 4 CASCADE.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    /// The child columns (one for a column-level REFERENCES).
+    pub from: AVec<ABytes>,
+    /// The parent table as written.
+    pub table: ABytes,
+    /// The parent columns; empty when none were written (the
+    /// parent's PRIMARY KEY).
+    pub to: AVec<ABytes>,
+    pub on_update: u8,
+    pub on_delete: u8,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -332,6 +356,104 @@ pub struct FromSource {
     /// empty when the clause is absent.
     #[cfg(feature = "v04")]
     pub using: AVec<ABytes>,
+    /// A table-valued function's arguments (v0.16, `v16`):
+    /// `pragma_table_info('t')` and friends. `None` for an
+    /// ordinary table name.
+    #[cfg(feature = "v16")]
+    pub args: Option<AVec<Expr>>,
+    /// The name was written with its schema qualifier (`main.t`;
+    /// v0.16, `v16`): such a name never denotes a common table
+    /// expression, as on the pin.
+    #[cfg(feature = "v16")]
+    pub qualified: bool,
+    /// What the planner's view / CTE expansion made of this
+    /// source (v0.16, `v16`; `None` from the parser): see
+    /// `CteUse`.
+    #[cfg(feature = "v16")]
+    pub cte: Option<Box<CteUse>>,
+}
+
+/// A FROM source that the view / common-table-expression
+/// expansion rewrote (v0.16, `v16`; `session::cte`). The parser
+/// never builds one: the expansion turns a source naming a view
+/// or a CTE into a derived table holding a copy of its SELECT and
+/// records here what the derived table alone cannot say.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct CteUse {
+    /// The view's or CTE's column-name list, empty when none was
+    /// written. The planner checks its length against the SELECT's
+    /// width when the source is used (the pin's "expected N
+    /// columns" / "table x has N values for M columns").
+    pub columns: AVec<ABytes>,
+    /// The recursion role of the source.
+    pub rec: RecMark,
+    /// The source is a view (not a CTE): its unaliased column
+    /// references are named by their tables' own column names (the
+    /// pin resolves a view's SELECT before naming its columns, a
+    /// CTE's or FROM subquery's after: `SELECT rowid FROM t` names
+    /// its column after t's INTEGER PRIMARY KEY only in a view).
+    pub view: bool,
+    /// The shared materialization this source reads (v0.16 review
+    /// fix; 0: none, the derived table is computed for this
+    /// reference alone). Every source with the same non-zero id
+    /// reads one result, computed once per statement execution —
+    /// the pin's reuse of a materialized CTE (and of a view that
+    /// a FROM clause names twice); see `session::cte`.
+    pub mat: u32,
+}
+
+/// A CTE's `MATERIALIZED` / `NOT MATERIALIZED` hint (v0.16, `v16`).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum M10d {
+    /// No hint.
+    Any,
+    /// `AS MATERIALIZED`: computed once, never flattened.
+    Yes,
+    /// `AS NOT MATERIALIZED`.
+    No,
+}
+
+/// A source's part in a recursive CTE (v0.16, `v16`).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecMark {
+    /// An ordinary view / CTE use.
+    None,
+    /// The derived table is a recursive CTE: compound cores
+    /// `split..` (counting the head core as 0) are the recursive
+    /// SELECTs, the ones before them the setup; `id` names the
+    /// CTE's recursive references inside them.
+    Body { split: usize, id: u32 },
+    /// The one recursive reference (by `id`) in a recursive
+    /// SELECT's FROM clause: it reads the row the queue just gave
+    /// up.
+    Ref { id: u32 },
+}
+
+/// A `WITH [RECURSIVE] cte, ...` clause (v0.16, `v16`). The
+/// planner expands every reference before planning (the parser
+/// keeps the clause where it was written).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct With {
+    pub ctes: AVec<Cte>,
+}
+
+/// One common table expression, `name [(col, ...)] AS [[NOT]
+/// MATERIALIZED] (select)` (v0.16, `v16`). The hint decides, with
+/// the number of references, whether the references share one
+/// materialization (see `session::cte`).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone)]
+pub struct Cte {
+    pub name: ABytes,
+    /// The column-name list, empty when none was written.
+    pub columns: AVec<ABytes>,
+    pub select: SelectStmt,
+    /// The `[NOT] MATERIALIZED` hint.
+    pub hint: M10d,
 }
 
 /// A compound SELECT operator (v0.9). All four operators have
@@ -384,16 +506,21 @@ pub struct SelectStmt {
     /// the pin rejects a trailing ORDER BY / LIMIT as a syntax
     /// error, and so does the parser.
     pub values: AVec<AVec<Expr>>,
+    /// The statement's `WITH` clause (v0.16, `v16`): its CTEs are
+    /// visible to every core, every nested subquery and each
+    /// other.
+    #[cfg(feature = "v16")]
+    pub with: Option<Box<With>>,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
 /// of `INSERT OR ...` / `UPDATE OR ...`, and the standalone
-/// `REPLACE` verb (which is `INSERT` with `Replace`). `Abort`
-/// covers the ABORT and ROLLBACK spellings: hipp's write-error
-/// rule aborts (and rolls back) the whole transaction on any
-/// error, which is ROLLBACK's behaviour, ABORT's in autocommit,
-/// and the documented v0.5 simplification for ABORT inside an
-/// explicit transaction.
+/// `REPLACE` verb (which is `INSERT` with `Replace`). Without
+/// `v16`, `Abort` also covers the ROLLBACK spelling: hipp's
+/// write-error rule there rolls back the whole transaction on any
+/// error, which is ROLLBACK's behaviour and ABORT's in autocommit.
+/// With `v16` a failed statement inside a transaction undoes only
+/// itself (ABORT), and ROLLBACK has its own variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
     Abort,
@@ -407,6 +534,28 @@ pub enum ConflictAction {
     Fail,
     Ignore,
     Replace,
+    /// `OR ROLLBACK` (v0.16, `v16`): a constraint violation
+    /// (UNIQUE / PRIMARY KEY, NOT NULL, CHECK) errors like `Abort`
+    /// and also rolls back the whole transaction, ending it (in
+    /// autocommit it is `Abort`). Without `v16` OR ROLLBACK parses
+    /// as `Abort`: a failed statement then ends the transaction
+    /// anyway.
+    #[cfg(feature = "v16")]
+    Rollback,
+}
+
+impl ConflictAction {
+    /// Whether a conflict fails the statement without resolving
+    /// it in place: ABORT, or (v0.16) ROLLBACK, which differs only
+    /// in ending the transaction afterwards.
+    pub fn aborts(self) -> bool {
+        match self {
+            ConflictAction::Abort => true,
+            #[cfg(feature = "v16")]
+            ConflictAction::Rollback => true,
+            _ => false,
+        }
+    }
 }
 
 /// An `INSERT ... ON CONFLICT ...` upsert clause (v0.7).
@@ -464,6 +613,10 @@ pub enum Ast {
         /// `columns` is empty.
         #[cfg(feature = "v16")]
         as_select: Option<Box<SelectStmt>>,
+        /// FOREIGN KEY / REFERENCES clauses in statement order
+        /// (v0.16, `v16`).
+        #[cfg(feature = "v16")]
+        fkeys: AVec<ForeignKey>,
     },
     /// `CREATE [UNIQUE] INDEX` (v0.3).
     CreateIndex {
@@ -555,6 +708,29 @@ pub enum Ast {
         #[cfg(feature = "v04")]
         checks: AVec<ABytes>,
     },
+    /// `ALTER TABLE <t> RENAME TO <new>` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    AlterRename {
+        table: ABytes,
+        to: ABytes,
+    },
+    /// `ALTER TABLE <t> RENAME [COLUMN] <old> TO <new>` (v0.16,
+    /// `v16`). `quoted`: the new name was written quoted (or as a
+    /// string), so every edited token takes the quoted form, as on
+    /// the pin.
+    #[cfg(feature = "v16")]
+    AlterRenameColumn {
+        table: ABytes,
+        from: ABytes,
+        to: ABytes,
+        quoted: bool,
+    },
+    /// `ALTER TABLE <t> DROP [COLUMN] <c>` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    AlterDropColumn {
+        table: ABytes,
+        column: ABytes,
+    },
     /// `CREATE VIEW` (v0.4): stored SQL, inert — the SELECT is
     /// parsed and validated at plan time but never executed;
     /// selecting FROM a view is `Error::Unsupported`.
@@ -572,8 +748,72 @@ pub enum Ast {
     },
     /// `BEGIN [TRANSACTION]` (v0.2).
     Begin,
+    /// `BEGIN IMMEDIATE | EXCLUSIVE [TRANSACTION]` (v0.16, `v16`):
+    /// a BEGIN that, like the pin's write lock taken at once, fixes
+    /// an empty database's page size (`Pager::fix_layout`).
+    #[cfg(feature = "v16")]
+    BeginImmediate,
     /// `COMMIT [TRANSACTION]` / `END [TRANSACTION]` (v0.2).
     Commit,
     /// `ROLLBACK [TRANSACTION]` (v0.2).
     Rollback,
+    /// `SAVEPOINT name` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Savepoint {
+        name: ABytes,
+    },
+    /// `RELEASE [SAVEPOINT] name` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Release {
+        name: ABytes,
+    },
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    RollbackTo {
+        name: ABytes,
+    },
+    /// `VACUUM [schema] [INTO expr]` (v0.16, `v16`): `into` is the
+    /// expression naming the target file (any expression with a
+    /// text value: a literal, `?`, `'a' || 'b'`, a subquery).
+    #[cfg(feature = "v16")]
+    Vacuum {
+        schema: Option<ABytes>,
+        into: Option<Expr>,
+    },
+    /// `REINDEX [[schema .] name]` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Reindex {
+        schema: Option<ABytes>,
+        name: Option<ABytes>,
+    },
+    /// `ANALYZE [[schema .] name]` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    Analyze {
+        schema: Option<ABytes>,
+        name: Option<ABytes>,
+    },
+    /// `WITH ... INSERT / REPLACE / UPDATE / DELETE` (v0.16,
+    /// `v16`): the clause's CTEs are visible throughout the
+    /// statement (its SELECT, FROM, expressions and subqueries,
+    /// never as its target table). A `WITH ... SELECT` keeps its
+    /// clause in `SelectStmt::with` instead.
+    #[cfg(feature = "v16")]
+    With {
+        with: Box<With>,
+        body: Box<Ast>,
+    },
+    /// `PRAGMA [schema .] name [= value | (value)]` (v0.16,
+    /// `v16`). `value` is the argument's text as the pin hands it
+    /// to its pragma code: a name or string dequoted, a number as
+    /// written (with a leading `-` for a negative one, `+`
+    /// dropped).
+    #[cfg(feature = "v16")]
+    Pragma {
+        schema: Option<ABytes>,
+        name: ABytes,
+        value: Option<ABytes>,
+        /// The argument was a number token (the pin treats
+        /// `integrity_check(5)` as a limit, `('5')` as a name).
+        numeric: bool,
+    },
 }

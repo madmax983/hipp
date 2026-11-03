@@ -40,6 +40,9 @@ pub enum SchemaKind {
     /// An unqualified column name matches more than one FROM
     /// source (v0.4).
     AmbiguousColumn,
+    /// `SELECT *` with no FROM clause (v0.16 review fix; the pin's
+    /// "no tables specified"). Name a table, or list the columns.
+    NoTablesSpecified,
     /// `ALTER TABLE ... ADD COLUMN` named a column the table
     /// already has (v0.4).
     DuplicateColumn,
@@ -228,6 +231,124 @@ pub enum SchemaKind {
     /// out first.
     #[cfg(feature = "v16")]
     PercentileInfinite,
+    /// A FOREIGN KEY whose column lists disagree (v0.16 fix, the
+    /// pin's "foreign key on x should reference only one column of
+    /// table p" / "number of columns in foreign key does not match
+    /// the number of columns in the referenced table"): a column's
+    /// REFERENCES names at most one parent column, a table-level
+    /// key as many as it lists. Make the lists the same length.
+    ForeignKeyColumns,
+    /// CREATE TABLE / INDEX / VIEW of a name starting with
+    /// `sqlite_` (any case; the pin's "object name reserved for
+    /// internal use"). Choose another name.
+    ReservedName,
+    /// A schema qualifier that names no database (v0.16, `v16`;
+    /// the pin's "unknown database"). hipp has `main` only.
+    #[cfg(feature = "v16")]
+    UnknownDatabase,
+    /// `PRAGMA encoding` named no encoding the pin knows (v0.16,
+    /// `v16`; "unsupported encoding"). Use `UTF-8`.
+    #[cfg(feature = "v16")]
+    UnknownEncoding,
+    /// INSERT / UPDATE / DELETE / DROP / ALTER / CREATE INDEX
+    /// against `sqlite_schema` (v0.16, `v16`; the pin's "table
+    /// sqlite_master may not be modified"). Change the schema
+    /// with CREATE / DROP statements instead.
+    #[cfg(feature = "v16")]
+    SchemaTableReadOnly,
+    /// A view whose definition reads itself, directly or through
+    /// other views (v0.16, `v16`; the pin's "view v is circularly
+    /// defined", raised when the view is used). Redefine one of
+    /// the views without the cycle.
+    #[cfg(feature = "v16")]
+    CircularView,
+    /// A common table expression that reads itself where it may
+    /// not (v0.16, `v16`; the pin's "circular reference"): a CTE
+    /// that is not a UNION / UNION ALL compound whose last SELECTs
+    /// name it in their FROM clause, a reference from its setup
+    /// SELECTs, or a cycle between CTEs. Make the CTE recursive
+    /// in that shape, or break the cycle.
+    #[cfg(feature = "v16")]
+    CircularReference,
+    /// A recursive SELECT that reads its recursive table more than
+    /// once — twice in its FROM clause, or again inside a
+    /// subquery (v0.16, `v16`; the pin's "multiple references to
+    /// recursive table" / "multiple recursive references"). Read
+    /// the recursive table once per recursive SELECT.
+    #[cfg(feature = "v16")]
+    RecursiveReferences,
+    /// A recursive SELECT with an aggregate or GROUP BY (v0.16,
+    /// `v16`; the pin's "recursive aggregate queries not
+    /// supported"). Aggregate over the CTE's result instead.
+    #[cfg(feature = "v16")]
+    RecursiveAggregate,
+    /// One WITH clause names two CTEs alike (v0.16, `v16`; the
+    /// pin's "duplicate WITH table name"). Rename one.
+    #[cfg(feature = "v16")]
+    DuplicateCteName,
+    /// Views and common table expressions nested deeper than
+    /// `Config::max_nesting` allows, or a statement whose CTE
+    /// references copy 1000 SELECTs or more (v0.16, `v16`; the
+    /// pin's "VIEWs and/or subqueries nested too deep"). Define
+    /// the views or CTEs less deeply, or raise the limit (with
+    /// stack to match).
+    #[cfg(feature = "v16")]
+    NestedTooDeep,
+    /// `RELEASE` / `ROLLBACK TO` a name no open savepoint has
+    /// (v0.16, `v16`; the pin's "no such savepoint"). Open it with
+    /// `SAVEPOINT name` first; savepoints end with the transaction.
+    #[cfg(feature = "v16")]
+    NoSuchSavepoint,
+    /// `VACUUM` inside a transaction (v0.16, `v16`; the pin's
+    /// "cannot VACUUM from within a transaction"). COMMIT or
+    /// ROLLBACK first.
+    #[cfg(feature = "v16")]
+    VacuumInTransaction,
+    /// `VACUUM INTO` a file that already holds a database, or that
+    /// the connection's `Config::vacuum_into` hook could not write
+    /// (v0.16, `v16`; the pin's "output file already exists"), or a
+    /// name expression whose value is not text (the pin's
+    /// "non-text filename"). Name a new or empty file, as text.
+    #[cfg(feature = "v16")]
+    VacuumTarget,
+    /// `REINDEX x` where `x` names no collation, table or index
+    /// (v0.16, `v16`; the pin's "unable to identify the object to
+    /// be reindexed"). Name an existing one.
+    #[cfg(feature = "v16")]
+    ReindexTarget,
+    /// A schema change the pin refuses on one of its own tables
+    /// (v0.16): `sqlite_*` tables may not be indexed or altered,
+    /// and only `sqlite_stat*` may be dropped ("table sqlite_sequence
+    /// may not be dropped"). Leave the system tables to the engine.
+    #[cfg(any(feature = "indexes", feature = "v04"))]
+    SystemTable,
+    /// `AUTOINCREMENT` on a column that is not the table's INTEGER
+    /// PRIMARY KEY (v0.16, `v16`; "AUTOINCREMENT is only allowed on
+    /// an INTEGER PRIMARY KEY"). Declare the column `INTEGER
+    /// PRIMARY KEY` (not DESC), or drop the keyword.
+    #[cfg(feature = "v16")]
+    AutoincrementNotIntegerPk,
+    /// `ALTER TABLE ... RENAME COLUMN` to `rowid`, `oid` or
+    /// `_rowid_` (v0.16, `v16`; the pin's "cannot rename to rowid
+    /// alias"). Pick another name.
+    #[cfg(feature = "v16")]
+    RowidAliasName,
+    /// `ALTER TABLE ... DROP COLUMN` of a PRIMARY KEY or UNIQUE
+    /// column, or of a table's only column (v0.16, `v16`; the
+    /// pin's "cannot drop PRIMARY KEY column", "cannot drop UNIQUE
+    /// column", "no other columns exist"). Rebuild the table
+    /// instead (CREATE TABLE ... AS / INSERT ... SELECT).
+    #[cfg(feature = "v16")]
+    CannotDropColumn,
+    /// An AUTOINCREMENT table has handed out rowid
+    /// 9223372036854775807, or its largest rowid is that value
+    /// (v0.16, `v16`; the pin's "database or disk is full"): no
+    /// larger rowid exists and AUTOINCREMENT never reuses one.
+    /// Insert with an explicit smaller rowid, or reset the table's
+    /// `sqlite_sequence` row. Also a table holding every positive
+    /// rowid, with no rowid left for a new row.
+    #[cfg(feature = "v16")]
+    DatabaseFull,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -377,6 +498,44 @@ impl<E> Error<E> {
             #[cfg(feature = "params")]
             Error::ResetRequired => Error::ResetRequired,
             Error::Storage(e) => Error::Storage(e.into()),
+        }
+    }
+}
+
+impl<E> Error<E> {
+    /// Re-wrap this error for another storage error type, mapping
+    /// a `Storage` error through `f` (v0.16, `v16`: VACUUM builds
+    /// its image on an in-memory pager, whose errors surface under
+    /// the connection's storage type).
+    #[cfg(feature = "v16")]
+    pub fn map_storage<F>(self, f: impl FnOnce(E) -> Error<F>) -> Error<F> {
+        match self {
+            Error::Storage(e) => f(e),
+            Error::BadMagic => Error::BadMagic,
+            Error::TruncatedHeader => Error::TruncatedHeader,
+            Error::UnsupportedPageSize => Error::UnsupportedPageSize,
+            Error::UnsupportedEncoding => Error::UnsupportedEncoding,
+            Error::WalUnsupported => Error::WalUnsupported,
+            Error::ReservedBytesUnsupported => Error::ReservedBytesUnsupported,
+            Error::CorruptPage { page } => Error::CorruptPage { page },
+            Error::CorruptRecord => Error::CorruptRecord,
+            Error::BadVarint => Error::BadVarint,
+            Error::BadSerialType => Error::BadSerialType,
+            Error::OverflowChainCycle => Error::OverflowChainCycle,
+            Error::PageOutOfRange { page } => Error::PageOutOfRange { page },
+            Error::Unsupported => Error::Unsupported,
+            Error::Schema { kind } => Error::Schema { kind },
+            Error::Parse { offset, kind } => Error::Parse { offset, kind },
+            Error::CacheExhausted => Error::CacheExhausted,
+            Error::OperationInFlight => Error::OperationInFlight,
+            Error::TransactionState { nested } => Error::TransactionState { nested },
+            Error::ArenaExhausted { scope, needed } => Error::ArenaExhausted { scope, needed },
+            Error::CorruptJournal => Error::CorruptJournal,
+            Error::NoClock => Error::NoClock,
+            #[cfg(feature = "params")]
+            Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
+            #[cfg(feature = "params")]
+            Error::ResetRequired => Error::ResetRequired,
         }
     }
 }

@@ -405,6 +405,25 @@ impl<T> AVec<T> {
     pub fn iter(&self) -> core::slice::Iter<'_, T> {
         self.vec.iter()
     }
+    /// Insert `v` at `idx`, shifting later elements up; an index
+    /// past the end appends (never panics).
+    pub fn insert_at(&mut self, idx: usize, v: T) {
+        let i = idx.min(self.vec.len());
+        self.vec.insert(i, v);
+    }
+    /// Keep the first `n` elements (all of them when there are
+    /// fewer).
+    pub fn truncate(&mut self, n: usize) {
+        self.vec.truncate(n);
+    }
+    /// Remove the first `n` elements (all of them when there are
+    /// fewer), shifting the rest down.
+    pub fn remove_front(&mut self, n: usize) {
+        let n = n.min(self.vec.len());
+        self.vec.drain(..n);
+    }
+    /// Insert `v` at `at`, shifting later elements up (panics if
+    /// `at > len`, like `Vec::insert`).
     pub fn insert(&mut self, at: usize, v: T) {
         self.vec.insert(at, v);
     }

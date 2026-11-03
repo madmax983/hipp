@@ -7,6 +7,8 @@
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "v16")]
+use crate::arena::AVec;
 use crate::arena::Arena;
 use crate::error::{Error, Result};
 use crate::storage::{Sidecar, SidecarFile, Storage};
@@ -51,6 +53,17 @@ pub struct DbHeader {
     pub freelist_trunk: u32,
     pub freelist_count: u32,
     pub schema_cookie: u32,
+    /// The user version (offset 60, v0.16 `v16`: `PRAGMA
+    /// user_version`).
+    #[cfg(feature = "v16")]
+    pub user_version: u32,
+    /// The application id (offset 68, v0.16 `v16`).
+    #[cfg(feature = "v16")]
+    pub application_id: u32,
+    /// The auto-vacuum mode (v0.16 `v16`): 0 none, 1 full, 2
+    /// incremental (offsets 52 and 64).
+    #[cfg(feature = "v16")]
+    pub auto_vacuum: u8,
 }
 
 fn parse_page_size_field<E>(raw: u16) -> Result<u32, E> {
@@ -82,6 +95,14 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         return Err(Error::CorruptPage { page: 1 });
     }
     let encoding = be_u32(probe, 56);
+    // v0.16 (`v16`): the pin reads the encoding's low two bits: 0 —
+    // not set yet, as in its file after only a header write
+    // (`PRAGMA user_version = N` on a new file) — and 1 are UTF-8.
+    #[cfg(feature = "v16")]
+    let encoding = match encoding & 3 {
+        0 => 1,
+        e => e,
+    };
     if encoding == 2 || encoding == 3 {
         return Err(Error::UnsupportedEncoding);
     }
@@ -107,6 +128,18 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         freelist_trunk: be_u32(probe, 32),
         freelist_count: be_u32(probe, 36),
         schema_cookie: be_u32(probe, 40),
+        #[cfg(feature = "v16")]
+        user_version: be_u32(probe, 60),
+        #[cfg(feature = "v16")]
+        application_id: be_u32(probe, 68),
+        #[cfg(feature = "v16")]
+        auto_vacuum: if be_u32(probe, 52) == 0 {
+            0
+        } else if be_u32(probe, 64) != 0 {
+            2
+        } else {
+            1
+        },
     })
 }
 
@@ -176,6 +209,39 @@ struct Frame {
     clock_ref: bool,
 }
 
+/// One savepoint level (v0.16, `v16`): a named `SAVEPOINT`, or
+/// the anonymous statement savepoint a write statement inside a
+/// transaction runs under (so a failed statement undoes only
+/// itself, as on the pin).
+#[cfg(feature = "v16")]
+struct SpMark {
+    /// The savepoint's name as written (dequoted); `None` for a
+    /// statement savepoint.
+    name: Option<AVec<u8>>,
+    /// The savepoint opened the transaction (`SAVEPOINT` outside
+    /// `BEGIN`): releasing it commits.
+    starts_txn: bool,
+    /// Sub-journal length when the savepoint opened: the records
+    /// from here on undo what happened since.
+    sub_len: usize,
+    /// The header as it stood when the savepoint opened.
+    header: DbHeader,
+}
+
+/// One sub-journal record (v0.16, `v16`): `page`'s image as it was
+/// when it was first changed after the then-newest savepoint, at
+/// sidecar offset `off`. A page the transaction had not touched
+/// yet points at its rollback-journal record's image; any other
+/// was copied into the journal file's savepoint area
+/// (`Pager::sp_area`), past the largest rollback journal the
+/// transaction can write, so recovery never reaches it (it stops
+/// at the zero record in between, as the pin's does).
+#[cfg(feature = "v16")]
+struct SubRec {
+    page: u32,
+    off: u64,
+}
+
 pub struct Pager<S: Storage> {
     storage: S,
     header: DbHeader,
@@ -203,6 +269,30 @@ pub struct Pager<S: Storage> {
     nonce_counter: u64,
     nonce_seed: u64,
     pub txn_arena: Arena,
+    /// This open created the file (v0.16, `v16`): until its first
+    /// commit the database is "empty" in the pin's sense, so
+    /// `PRAGMA page_size` may still change.
+    #[cfg(feature = "v16")]
+    created: bool,
+    /// A write transaction has begun since the open (v0.16, `v16`):
+    /// the pin's `BTS_PAGESIZE_FIXED`, which a ROLLBACK does not
+    /// clear — the page size, encoding and auto-vacuum mode of an
+    /// empty database are fixed from then on.
+    #[cfg(feature = "v16")]
+    layout_fixed: bool,
+    /// Open savepoints, oldest first (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    sp: AVec<SpMark>,
+    /// The savepoint sub-journal (v0.16, `v16`): page images to
+    /// restore on `ROLLBACK TO`, in the order they were recorded.
+    /// It lives in memory; the rollback journal alone keeps crash
+    /// recovery exact (a crash undoes the whole transaction).
+    #[cfg(feature = "v16")]
+    sub: AVec<SubRec>,
+    /// The next free offset of the savepoint area (0: not placed
+    /// yet in this transaction; see `SubRec`).
+    #[cfg(feature = "v16")]
+    sub_off: u64,
 }
 
 impl<S: Storage> Pager<S> {
@@ -289,6 +379,15 @@ impl<S: Storage> Pager<S> {
                 header = parse_db_header::<S::Error>(&probe, fl)?;
             }
         }
+        // A header that claims more pages than the file holds is
+        // the pin's "malformed" (v0.16, `v16`: hipp read past the
+        // end as empty pages, which integrity_check reported).
+        #[cfg(feature = "v16")]
+        let fl = storage.len().await.map_err(Error::Storage)?;
+        #[cfg(feature = "v16")]
+        if u64::from(header.page_count) > fl.div_ceil(u64::from(header.page_size)) {
+            return Err(Error::CorruptPage { page: 1 });
+        }
 
         let frames = (0..cache_cap)
             .map(|_| Frame {
@@ -317,6 +416,16 @@ impl<S: Storage> Pager<S> {
                 nonce_counter: 0,
                 nonce_seed,
                 txn_arena,
+                #[cfg(feature = "v16")]
+                created: is_new,
+                #[cfg(feature = "v16")]
+                layout_fixed: false,
+                #[cfg(feature = "v16")]
+                sp: AVec::new(),
+                #[cfg(feature = "v16")]
+                sub: AVec::new(),
+                #[cfg(feature = "v16")]
+                sub_off: 0,
             },
             is_new,
         ))
@@ -446,6 +555,10 @@ impl<S: Storage> Pager<S> {
         // A9 enforcement point for the transaction scope (SPEC
         // §7.5.4): it fails before anything is written anywhere.
         self.txn_arena.charge(self.cache_cap * 4 + 64)?;
+        #[cfg(feature = "v16")]
+        {
+            self.layout_fixed = true;
+        }
         // Fresh nonce per transaction (SPEC §5.3; R2's entropy note:
         // the seed is Config-supplied; targets with real entropy
         // should seed it — a counter mix is the documented floor).
@@ -475,7 +588,12 @@ impl<S: Storage> Pager<S> {
     /// Ensure `page`'s original image is in the journal (appending a
     /// record if this transaction has not journaled it yet).
     async fn journal_original(&mut self, page: u32, frame_idx: usize) -> Result<(), S::Error> {
-        if self.journaled.contains(&page) {
+        // A page past the original size has no original: recovery
+        // truncates it away. (v0.16 fix, ungated: a page this
+        // transaction allocated, spilled and then changed again
+        // was journaled, and replay stops at such a record — the
+        // records after it were lost to a crash.)
+        if self.journaled.contains(&page) || page > self.orig_page_count {
             return Ok(());
         }
         let ps = self.header.page_size as usize;
@@ -510,6 +628,8 @@ impl<S: Storage> Pager<S> {
     pub async fn dirty_page(&mut self, page: u32) -> Result<usize, S::Error> {
         self.begin_write().await?;
         let idx = self.load(page).await?;
+        #[cfg(feature = "v16")]
+        self.sp_note(page, idx).await?;
         if !self.frames[idx].dirty {
             self.journal_original(page, idx).await?;
             self.frames[idx].dirty = true;
@@ -583,6 +703,21 @@ impl<S: Storage> Pager<S> {
                 let ti = self.dirty_page(trunk).await?;
                 put_be_u32(&mut self.frames[ti].data, 4, leaf_count - 1);
                 self.header.freelist_count -= 1;
+                // A leaf freed earlier in this transaction still
+                // holds a page the rolled-back state references:
+                // journal it (and note it for savepoints) before
+                // reuse. (v0.16 fix, ungated where pages can be
+                // freed: a crash after its new image landed tore
+                // the restored B-tree.) Leaves past the original
+                // size have no original to keep.
+                #[cfg(any(feature = "v05", feature = "indexes"))]
+                if leaf <= self.orig_page_count || self.dirty.contains(&leaf) {
+                    let li = self.dirty_page(leaf).await?;
+                    for b in self.frames[li].data.iter_mut() {
+                        *b = 0;
+                    }
+                    return Ok((leaf, li));
+                }
                 return self.fresh_frame(leaf).await;
             }
             // The trunk page itself becomes the allocated page. The
@@ -731,6 +866,27 @@ impl<S: Storage> Pager<S> {
         Ok((page, idx))
     }
 
+    /// Find or make a frame slot for `page` without reading from
+    /// the device: its own frame, an empty one, a clean one
+    /// evicted, else a dirty one spilled (SPEC §5.2 spill, v0.5;
+    /// v0.16 `v16`: `sp_rollback`'s restores).
+    #[cfg(feature = "v16")]
+    async fn frame_slot(&mut self, page: u32) -> Result<usize, S::Error> {
+        if let Some(i) = self.find_frame(page) {
+            return Ok(i);
+        }
+        if let Some(i) = self.frames.iter().position(|f| f.page == 0) {
+            return Ok(i);
+        }
+        match self.frames.iter().position(|f| !f.dirty) {
+            Some(i) => Ok(i),
+            None => match self.spill_one().await? {
+                Some(i) => Ok(i),
+                None => Err(Error::CacheExhausted),
+            },
+        }
+    }
+
     /// Finalise page 1's header fields inside its frame (change
     /// counter incremented, size, freelist, schema cookie,
     /// version-valid-for). Called once at commit start; page 1's
@@ -747,6 +903,108 @@ impl<S: Storage> Pager<S> {
         put_be_u32(d, 40, self.header.schema_cookie);
         put_be_u32(d, 92, new_counter);
         put_be_u32(d, 96, PIN_VERSION_NUMBER);
+        // The first schema change on a file whose schema format and
+        // encoding are still unset (0) sets them, as the pin's
+        // CREATE TABLE / VIEW does (v0.16, `v16`: such a file opens
+        // only there).
+        #[cfg(feature = "v16")]
+        if self
+            .txn_header
+            .is_some_and(|h| h.schema_cookie != self.header.schema_cookie)
+            && be_u32(d, 44) == 0
+        {
+            put_be_u32(d, 44, 4);
+            put_be_u32(d, 56, 1);
+        }
+        Ok(())
+    }
+
+    /// The parsed database header (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn header(&self) -> &DbHeader {
+        &self.header
+    }
+
+    /// The file is as this open created it (v0.16, `v16`): no
+    /// transaction has committed and none is open — the pin's
+    /// empty database, whose page size, encoding and auto-vacuum
+    /// mode are not fixed yet.
+    #[cfg(feature = "v16")]
+    pub fn pristine(&self) -> bool {
+        self.created
+            && self.header.change_counter == 1
+            && self.header.page_count == 1
+            && self.stage == CommitStage::Idle
+    }
+
+    /// The empty database's layout (page size, encoding,
+    /// auto-vacuum mode) may still change (v0.16, `v16`): it is
+    /// `pristine` and no write transaction has begun since the open
+    /// (`BEGIN IMMEDIATE` counts; see `fix_layout`).
+    #[cfg(feature = "v16")]
+    pub fn layout_open(&self) -> bool {
+        self.pristine() && !self.layout_fixed
+    }
+
+    /// Fix the layout as a write transaction's start does (v0.16,
+    /// `v16`: `BEGIN IMMEDIATE` / `EXCLUSIVE`, which take the
+    /// pin's write lock at once).
+    #[cfg(feature = "v16")]
+    pub fn fix_layout(&mut self) {
+        self.layout_fixed = true;
+    }
+
+    /// Write a 32-bit header field of page 1 inside the current
+    /// write transaction (v0.16, `v16`: `PRAGMA user_version` /
+    /// `application_id`), opening one if needed. Offsets 60 and
+    /// 68 also update the parsed header.
+    #[cfg(feature = "v16")]
+    pub async fn set_header_u32(&mut self, off: usize, v: u32) -> Result<(), S::Error> {
+        let idx = self.dirty_page(1).await?;
+        let d = &mut self.frames[idx].data;
+        if d.len() < off + 4 {
+            return Err(Error::CorruptPage { page: 1 });
+        }
+        put_be_u32(d, off, v);
+        match off {
+            60 => self.header.user_version = v,
+            68 => self.header.application_id = v,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Re-create a pristine file with another page size (v0.16,
+    /// `v16`: `PRAGMA page_size` before the first write). The
+    /// caller checks `pristine` and the size.
+    #[cfg(feature = "v16")]
+    pub async fn reformat(&mut self, page_size: u32) -> Result<(), S::Error> {
+        if !self.layout_open() {
+            return Err(Error::Unsupported);
+        }
+        let img = initial_page1(page_size);
+        self.storage
+            .set_len(u64::from(page_size))
+            .await
+            .map_err(Error::Storage)?;
+        self.storage
+            .write_at(0, &img)
+            .await
+            .map_err(Error::Storage)?;
+        self.storage.sync().await.map_err(Error::Storage)?;
+        self.header = parse_db_header::<S::Error>(&img, u64::from(page_size))?;
+        self.orig_page_count = self.header.page_count;
+        // The new page size is not transactional (the pin keeps it
+        // across ROLLBACK TO): an open savepoint returns to the
+        // reformatted empty file, not to the old page size.
+        for m in self.sp.as_mut_slice().iter_mut() {
+            m.header = self.header;
+        }
+        for f in self.frames.iter_mut() {
+            f.page = 0;
+            f.dirty = false;
+            f.data = alloc::vec![0u8; page_size as usize];
+        }
         Ok(())
     }
 
@@ -819,6 +1077,8 @@ impl<S: Storage> Pager<S> {
                     self.txn_header = None;
                     self.stage = CommitStage::Idle;
                     self.txn_arena.reset();
+                    #[cfg(feature = "v16")]
+                    self.sp_clear();
                     return Ok(());
                 }
                 CommitStage::Idle | CommitStage::Writing => unreachable!(),
@@ -831,6 +1091,8 @@ impl<S: Storage> Pager<S> {
     /// begun, the journal is replayed from the sidecar — the same
     /// code path open-recovery uses.
     pub async fn rollback(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "v16")]
+        self.sp_clear();
         match self.stage {
             CommitStage::Idle => return Ok(()),
             CommitStage::Writing if !self.spilled => {
@@ -846,14 +1108,16 @@ impl<S: Storage> Pager<S> {
             _ => {
                 // Commit had begun: replay the journal over whatever
                 // data pages landed, truncate, sync, delete.
-                let mut sc = self.sidecar.take().expect("sidecar from open");
+                // Borrowed in place (v0.16 fix, ungated: the sidecar
+                // was taken out and lost when the replay failed, so
+                // the next transaction panicked).
+                let sc = self.sidecar.as_mut().expect("sidecar from open");
                 let jlen = sc.len().await.map_err(Error::Storage)?;
                 if jlen > 0 {
-                    replay_journal(&mut self.storage, &mut sc, jlen).await?;
+                    replay_journal(&mut self.storage, sc, jlen).await?;
                 } else {
                     sc.delete().await.map_err(Error::Storage)?;
                 }
-                self.sidecar = Some(sc);
                 // Restore header counters from the rolled-back page 1.
                 let mut probe = [0u8; 100];
                 let fl = self.storage.len().await.map_err(Error::Storage)?;
@@ -876,6 +1140,279 @@ impl<S: Storage> Pager<S> {
         self.stage = CommitStage::Idle;
         self.txn_arena.reset();
         Ok(())
+    }
+
+    /// Record `page`'s current image in the sub-journal before it
+    /// changes, when a savepoint is open and the page has not been
+    /// recorded since the newest one opened (v0.16, `v16`; called
+    /// with the page loaded at frame `idx`, inside the write
+    /// transaction). A page the transaction has not touched is
+    /// about to get its rollback-journal record, which already
+    /// holds that image; any other is copied to the savepoint area
+    /// of the journal file, so no page image is held in RAM. Pages
+    /// past the newest savepoint's size need nothing: rolling back
+    /// to it truncates them away.
+    #[cfg(feature = "v16")]
+    async fn sp_note(&mut self, page: u32, idx: usize) -> Result<(), S::Error> {
+        let Some(top) = self.sp.as_slice().last() else {
+            return Ok(());
+        };
+        if page > top.header.page_count {
+            return Ok(());
+        }
+        let since = self.sub.as_slice().get(top.sub_len..).unwrap_or(&[]);
+        if since.iter().any(|r| r.page == page) {
+            return Ok(());
+        }
+        let off = if self.dirty.contains(&page) || page > self.orig_page_count {
+            let ps = u64::from(self.header.page_size);
+            if self.sub_off == 0 {
+                // Past the largest rollback journal this transaction
+                // can write (every original page once), plus one
+                // zero record where recovery stops.
+                self.sub_off = u64::from(SECTOR_SIZE)
+                    + (u64::from(self.orig_page_count) + 1).saturating_mul(ps + 8);
+            }
+            let off = self.sub_off;
+            let Some(sc) = self.sidecar.as_mut() else {
+                return Err(Error::OperationInFlight);
+            };
+            sc.write_at(off, &self.frames[idx].data)
+                .await
+                .map_err(Error::Storage)?;
+            // Four zero bytes after each image: the journal file
+            // never ends in the journal magic, which the pin would
+            // read as a super-journal name.
+            sc.write_at(off + ps, &[0u8; 4])
+                .await
+                .map_err(Error::Storage)?;
+            self.sub_off = off + ps + 4;
+            off
+        } else {
+            // `journal_original` appends this page's record next:
+            // the 4-byte page number, then the image.
+            self.journal_len + 4
+        };
+        self.sub.push(SubRec { page, off });
+        Ok(())
+    }
+
+    /// Open a savepoint (v0.16, `v16`): `name` for `SAVEPOINT name`
+    /// (`starts_txn` when it opened the transaction), `None` for a
+    /// statement savepoint. No I/O: the state to return to is the
+    /// current header plus the sub-journal from here on.
+    #[cfg(feature = "v16")]
+    pub fn sp_open(&mut self, name: Option<&[u8]>, starts_txn: bool) {
+        let name = name.map(|n| {
+            let mut v = AVec::with_capacity(n.len());
+            v.extend_from_slice(n);
+            v
+        });
+        self.sp.push(SpMark {
+            name,
+            starts_txn,
+            sub_len: self.sub.len(),
+            header: self.header,
+        });
+    }
+
+    /// Open savepoints, statement savepoints included (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn sp_depth(&self) -> usize {
+        self.sp.len()
+    }
+
+    /// The level of the newest savepoint named `name` (the pin
+    /// compares names ignoring ASCII case), if any (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn sp_find(&self, name: &[u8]) -> Option<usize> {
+        self.sp.as_slice().iter().rposition(|m| {
+            m.name
+                .as_ref()
+                .is_some_and(|n| n.as_slice().eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// The open savepoints, oldest first (v0.16, `v16`): each one's
+    /// name (`None` for a statement savepoint) and whether it
+    /// opened the transaction. The TEMP database replays them.
+    #[cfg(feature = "v16")]
+    pub fn sp_marks(&self) -> AVec<(Option<AVec<u8>>, bool)> {
+        let mut out = AVec::new();
+        for m in self.sp.iter() {
+            out.push((m.name.clone(), m.starts_txn));
+        }
+        out
+    }
+
+    /// Whether the savepoint at `level` opened the transaction
+    /// (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn sp_starts_txn(&self, level: usize) -> bool {
+        self.sp.as_slice().get(level).is_some_and(|m| m.starts_txn)
+    }
+
+    /// Close the savepoint at `level` and every newer one, keeping
+    /// their changes (v0.16, `v16`; `RELEASE`). The sub-journal is
+    /// kept while an older savepoint may still need it.
+    #[cfg(feature = "v16")]
+    pub fn sp_release(&mut self, level: usize) {
+        self.sp.truncate(level);
+        if self.sp.is_empty() {
+            self.sub.clear();
+            self.sub_off = 0;
+        }
+    }
+
+    /// Forget every savepoint (v0.16, `v16`): the transaction ended.
+    #[cfg(feature = "v16")]
+    pub fn sp_clear(&mut self) {
+        self.sp.clear();
+        self.sub.clear();
+        self.sub_off = 0;
+    }
+
+    /// Undo everything since the savepoint at `level` opened, which
+    /// stays open; newer ones close (v0.16, `v16`; `ROLLBACK TO`).
+    /// Each page recorded since then takes its earliest recorded
+    /// image (its image when the savepoint opened), pages the
+    /// file grew by are dropped, and the header is restored. The
+    /// transaction stays open; nothing is written to the file, and
+    /// the rollback journal is untouched, so a crash still restores
+    /// the transaction's start.
+    #[cfg(feature = "v16")]
+    pub async fn sp_rollback(&mut self, level: usize) -> Result<(), S::Error> {
+        let Some(m) = self.sp.as_slice().get(level) else {
+            return Ok(());
+        };
+        let (start, hdr) = (m.sub_len, m.header);
+        let ps = self.header.page_size as usize;
+        let mut done: AVec<u32> = AVec::new();
+        let mut buf: AVec<u8> = AVec::with_capacity(ps);
+        buf.extend_from_slice(&alloc::vec![0u8; ps]);
+        let mut i = start;
+        while let Some(rec) = self.sub.as_slice().get(i) {
+            i += 1;
+            let page = rec.page;
+            if page > hdr.page_count || done.as_slice().contains(&page) {
+                continue;
+            }
+            done.push(page);
+            let Some(sc) = self.sidecar.as_ref() else {
+                return Err(Error::OperationInFlight);
+            };
+            sc.read_at(rec.off, buf.as_mut_slice())
+                .await
+                .map_err(Error::Storage)?;
+            let idx = self.frame_slot(page).await?;
+            let f = &mut self.frames[idx];
+            f.data.copy_from_slice(buf.as_slice());
+            f.page = page;
+            f.dirty = true;
+            f.clock_ref = true;
+            if !self.dirty.contains(&page) {
+                self.dirty.push(page);
+            }
+        }
+        for f in self.frames.iter_mut() {
+            if f.page > hdr.page_count {
+                f.page = 0;
+                f.dirty = false;
+            }
+        }
+        self.dirty.retain(|p| *p <= hdr.page_count);
+        self.header = hdr;
+        self.sub.truncate(start);
+        self.sp.truncate(level + 1);
+        Ok(())
+    }
+
+    /// Replace the whole database with `img`, a complete database
+    /// image of `page_size`-byte pages (v0.16, `v16`: VACUUM), as
+    /// one crash-safe transaction: every original page is
+    /// journaled and the journal synced before the file changes,
+    /// so a crash at any point recovers the old file, and deleting
+    /// the journal is the commit point, as in `drive_commit`.
+    /// Page 1 is written last. The page size may change (`PRAGMA
+    /// page_size` before VACUUM); the cache is rebuilt for it. No
+    /// transaction may be open.
+    #[cfg(feature = "v16")]
+    pub async fn replace_image(&mut self, img: &[u8], page_size: u32) -> Result<(), S::Error> {
+        if self.stage != CommitStage::Idle {
+            return Err(Error::OperationInFlight);
+        }
+        let ps = page_size as usize;
+        if ps == 0 || img.len() < ps || !img.len().is_multiple_of(ps) {
+            return Err(Error::CorruptPage { page: 1 });
+        }
+        let new_header = parse_db_header::<S::Error>(img, img.len() as u64)?;
+        self.begin_write().await?;
+        for page in 1..=self.orig_page_count {
+            let idx = self.load(page).await?;
+            self.journal_original(page, idx).await?;
+        }
+        let Some(sc) = self.sidecar.as_mut() else {
+            return Err(Error::OperationInFlight);
+        };
+        sc.sync().await.map_err(Error::Storage)?;
+        // From here the main file changes: a rollback must replay
+        // the journal.
+        self.spilled = true;
+        if let Err(e) = self.write_image(img, ps).await {
+            let _ = self.rollback().await;
+            return Err(e);
+        }
+        let deleted = match self.sidecar.as_mut() {
+            Some(sc) => sc.delete().await.map_err(Error::Storage),
+            None => Err(Error::OperationInFlight),
+        };
+        if let Err(e) = deleted {
+            let _ = self.rollback().await;
+            return Err(e);
+        }
+        // Commit point passed: the cache is rebuilt for the image.
+        self.header = new_header;
+        self.orig_page_count = new_header.page_count;
+        for f in self.frames.iter_mut() {
+            f.page = 0;
+            f.dirty = false;
+            if f.data.len() != ps {
+                f.data = alloc::vec![0u8; ps];
+            }
+        }
+        self.dirty.clear();
+        self.journaled.clear();
+        self.journal_len = 0;
+        self.spilled = false;
+        self.txn_header = None;
+        self.stage = CommitStage::Idle;
+        self.txn_arena.reset();
+        self.sp_clear();
+        Ok(())
+    }
+
+    /// The main-file half of `replace_image`: pages 2.. then page
+    /// 1, the length, and a sync.
+    #[cfg(feature = "v16")]
+    async fn write_image(&mut self, img: &[u8], ps: usize) -> Result<(), S::Error> {
+        let mut off = ps;
+        while let Some(chunk) = img.get(off..off + ps) {
+            self.storage
+                .write_at(off as u64, chunk)
+                .await
+                .map_err(Error::Storage)?;
+            off += ps;
+        }
+        let first = img.get(..ps).ok_or(Error::CorruptPage { page: 1 })?;
+        self.storage
+            .write_at(0, first)
+            .await
+            .map_err(Error::Storage)?;
+        self.storage
+            .set_len(img.len() as u64)
+            .await
+            .map_err(Error::Storage)?;
+        self.storage.sync().await.map_err(Error::Storage)
     }
 
     /// Page pool bytes (for §4.1 accounting by the session layer).

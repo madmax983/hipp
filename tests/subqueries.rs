@@ -428,14 +428,16 @@ fn subquery_rejections() {
                 .is_err()
         );
         // Selecting from a view inside a subquery is refused
-        // (views are inert).
+        // (views are inert) — until v0.16's `v16`, which executes
+        // views (tests/views_cte_v16.rs).
         exec(&mut db, "CREATE VIEW v_dept AS SELECT id, name FROM dept")
             .await
             .expect("create view");
-        assert!(
+        assert_eq!(
             db.prepare("SELECT id FROM emp WHERE id IN (SELECT id FROM v_dept)")
                 .await
-                .is_err()
+                .is_err(),
+            !cfg!(feature = "v16")
         );
     });
 }

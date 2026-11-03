@@ -404,24 +404,39 @@ fn views_inert_both_directions() {
             )
             .await
             .unwrap();
-            // Inert: selecting from a view is refused, by design.
-            let r = db.prepare("SELECT * FROM v").await;
-            assert!(
-                matches!(r, Err(Error::Unsupported)),
-                "view select: {:?}",
-                r.err()
-            );
-            // Creating over unknown objects fails at prepare.
-            assert!(
-                db.prepare("CREATE VIEW bad AS SELECT * FROM nope")
-                    .await
-                    .is_err()
-            );
-            assert!(
-                db.prepare("CREATE VIEW bad2 AS SELECT nope FROM t")
-                    .await
-                    .is_err()
-            );
+            if cfg!(feature = "v16") {
+                // v0.16 (`v16`): views execute, and CREATE VIEW
+                // resolves nothing (as on the pin; tests/
+                // views_cte_v16.rs covers both).
+                assert_eq!(
+                    collect(&mut db, "SELECT * FROM v").await,
+                    vec!["1|x", "2|y"]
+                );
+                assert!(
+                    db.prepare("CREATE VIEW bad AS SELECT * FROM nope")
+                        .await
+                        .is_ok()
+                );
+            } else {
+                // Inert: selecting from a view is refused, by design.
+                let r = db.prepare("SELECT * FROM v").await;
+                assert!(
+                    matches!(r, Err(Error::Unsupported)),
+                    "view select: {:?}",
+                    r.err()
+                );
+                // Creating over unknown objects fails at prepare.
+                assert!(
+                    db.prepare("CREATE VIEW bad AS SELECT * FROM nope")
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    db.prepare("CREATE VIEW bad2 AS SELECT nope FROM t")
+                        .await
+                        .is_err()
+                );
+            }
             // Duplicate names fail; IF NOT EXISTS is a no-op.
             assert!(db.prepare("CREATE VIEW v AS SELECT a FROM t").await.is_ok());
             let mut st = db
@@ -466,8 +481,12 @@ fn views_inert_both_directions() {
         let views = db.views();
         assert_eq!(views.len(), 1);
         assert_eq!(views.as_slice()[0].columns.as_slice()[0], b"c");
-        let r = db.prepare("SELECT * FROM ov").await;
-        assert!(matches!(r, Err(Error::Unsupported)));
+        if cfg!(feature = "v16") {
+            assert_eq!(collect(&mut db, "SELECT * FROM ov").await, vec!["2|x"]);
+        } else {
+            let r = db.prepare("SELECT * FROM ov").await;
+            assert!(matches!(r, Err(Error::Unsupported)));
+        }
         exec(&mut db, "DROP VIEW ov").await.unwrap();
         assert_eq!(
             common::cli(

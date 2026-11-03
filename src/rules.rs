@@ -65,6 +65,7 @@ impl StrictType {
     /// The STRICT type a declared type names, if any of the six
     /// (case-insensitive, the whole declaration).
     pub fn of(decl: &[u8]) -> Option<StrictType> {
+        let decl = crate::record::decl_token(decl);
         Some(if eq_ci(decl, b"INT") || eq_ci(decl, b"INTEGER") {
             StrictType::Int
         } else if eq_ci(decl, b"REAL") {
@@ -114,6 +115,10 @@ pub struct GenCols {
     /// affinity, as on the pin).
     pub affs: AVec<Affinity>,
     pub rowid_alias: Option<usize>,
+    /// `PRAGMA case_sensitive_like` for this statement (v0.16 fix:
+    /// a generated column's LIKE ignored it). Set by the planner.
+    #[cfg(feature = "v16")]
+    pub case_like: bool,
 }
 
 impl GenCols {
@@ -132,7 +137,10 @@ impl GenCols {
                 continue;
             }
             let rd = eval_row(self.rowid_alias, self.affs.as_slice(), rec, rowid);
-            let v = eval::<E>(e, &Ctx::of(&rd))?;
+            let ctx = Ctx::of(&rd);
+            #[cfg(feature = "v16")]
+            let ctx = ctx.case_like(self.case_like);
+            let v = eval::<E>(e, &ctx)?;
             let aff = self
                 .affs
                 .as_slice()
@@ -543,6 +551,8 @@ pub fn plan_rules<E>(
             order,
             affs: affs.clone(),
             rowid_alias,
+            #[cfg(feature = "v16")]
+            case_like: false,
         });
     }
     if !checks.is_empty() {
@@ -599,12 +609,12 @@ pub fn validate_def<E>(
         if pk_columns.len() == 1
             && eq_ci(name, handle_bytes(arena, pk_columns[0]))
             && !c.pk_desc
-            && eq_ci(decl, b"INTEGER")
+            && eq_ci(crate::record::decl_token(decl), b"INTEGER")
         {
             alias = Some(i);
         }
         let mut affinity = crate::record::affinity_of(decl);
-        if strict && eq_ci(decl, b"ANY") {
+        if strict && eq_ci(crate::record::decl_token(decl), b"ANY") {
             affinity = Affinity::Blob;
         }
         specs.push(ColSpec {
@@ -628,6 +638,29 @@ pub fn validate_def<E>(
         texts.as_slice(),
         strict,
     )
+}
+
+/// Whether a generated column of `columns` calls LIKE — the
+/// operator or `like()` (v0.16): once `PRAGMA case_sensitive_like`
+/// has been set on a connection, the pin re-registers `like()` as
+/// non-deterministic, so CREATE TABLE / ALTER TABLE ADD COLUMN
+/// refuse such a column ("non-deterministic functions prohibited
+/// in generated columns").
+#[cfg(feature = "v16")]
+pub fn gen_uses_like<E>(arena: &Arena, columns: &[crate::sql::ColumnDef]) -> Result<bool, E> {
+    use crate::sql::handle_bytes;
+    for c in columns.iter() {
+        let Some(h) = c.gen_expr else { continue };
+        let e = parse_rule::<E>(handle_bytes(arena, h), arena)?;
+        if expr_any(&e, &mut |x| match x {
+            Expr::Like(..) => true,
+            Expr::Func { name, .. } => eq_ci(handle_bytes(arena, *name), b"like"),
+            _ => false,
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `f` holds for any node of `e` (pre-order; subquery
@@ -1053,7 +1086,7 @@ pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
 /// The pin's `sqlite3ExprAffinity` of one resolved result item:
 /// a column's affinity, a CAST's, INTEGER for a rowid, a scalar
 /// subquery's first result item's; none (BLOB) for anything else.
-#[cfg(feature = "v16")]
+#[cfg(feature = "v09")]
 pub fn item_affinity(e: &RExpr) -> Affinity {
     match e {
         RExpr::Column(_, a, _) | RExpr::Cast(_, a) => *a,
@@ -1071,7 +1104,7 @@ pub fn item_affinity(e: &RExpr) -> Affinity {
 /// The pin's `sqlite3ExprDataType` bits of one later compound
 /// core's result item (0x01 numeric-ish, 0x02 text, 0x04 blob),
 /// which can demote the leftmost core's affinity.
-#[cfg(feature = "v16")]
+#[cfg(feature = "v09")]
 pub fn item_datatype(e: &RExpr) -> u8 {
     match e {
         RExpr::Literal(OwnedValue::Null) => 0x00,
@@ -1096,5 +1129,44 @@ pub fn item_datatype(e: &RExpr) -> u8 {
             m
         }
         _ => 0x01,
+    }
+}
+
+/// Column `i`'s affinity as a compound SELECT's result column (the
+/// pin's `sqlite3SubqueryColumnTypes`; v0.16, ungated on the v0.9
+/// derived-table path): the leftmost core's `aff`, demoted to none
+/// (BLOB) when a later core's item can be of the other class — a
+/// TEXT column with a numeric item elsewhere, a numeric one with a
+/// text item — and a numeric CAST becoming NUMERIC (the pin's
+/// FLEXNUM). `head` is the leftmost core's item, `tails` the later
+/// cores.
+#[cfg(feature = "v09")]
+pub fn compound_affinity<'p>(
+    aff: Affinity,
+    head: Option<&RExpr>,
+    tails: impl Iterator<Item = &'p crate::query::SubPlan>,
+    i: usize,
+) -> Affinity {
+    let mut any = false;
+    let mut m = 0u8;
+    for tail in tails {
+        any = true;
+        if tail.values.is_empty() {
+            m |= tail.items.as_slice().get(i).map_or(0, item_datatype);
+        }
+        for row in tail.values.iter() {
+            m |= row.as_slice().get(i).map_or(0, item_datatype);
+        }
+    }
+    if !any || aff == Affinity::Blob {
+        return aff;
+    }
+    let numeric = matches!(aff, Affinity::Numeric | Affinity::Integer | Affinity::Real);
+    if (aff == Affinity::Text && m & 0x01 != 0) || (numeric && m & 0x02 != 0) {
+        Affinity::Blob
+    } else if numeric && matches!(head, Some(RExpr::Cast(..))) {
+        Affinity::Numeric
+    } else {
+        aff
     }
 }

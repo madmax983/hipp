@@ -136,6 +136,52 @@ pub fn parse_params<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, lexer::ParamTa
     Ok((ast, params))
 }
 
+/// `parse`, also returning the statement's tokens (v0.16, `v16`):
+/// every name in the tree is the handle of the token it was read
+/// from, so ALTER TABLE can map a resolved name back to its bytes
+/// in `sql` (`Token::offset`).
+#[cfg(feature = "v16")]
+pub fn parse_with_tokens<E>(sql: &[u8], arena: &Arena) -> Result<(Ast, AVec<Token>), E> {
+    let toks = lexer::lex::<E>(sql, arena)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let ast = p.statement::<E>()?;
+    p.expect_end::<E>()?;
+    Ok((ast, p.toks))
+}
+
+/// `parse_expr_text`, also returning the expression's tokens
+/// (v0.16, `v16`; see `parse_with_tokens`).
+#[cfg(feature = "v16")]
+pub fn parse_expr_with_tokens<E>(sql: &[u8], arena: &Arena) -> Result<(Expr, AVec<Token>), E> {
+    let toks = lexer::lex::<E>(sql, arena)?;
+    let mut p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let e = p.parse_expr::<E>()?;
+    if !p.at_eof() {
+        return Err(perr(p.cur().offset, ParseKind::TrailingInput));
+    }
+    Ok((e, p.toks))
+}
+
+/// The tokens of `sql` (v0.16, `v16`): ALTER TABLE walks a stored
+/// CREATE INDEX text by tokens (an expression or partial index is
+/// outside hipp's CREATE INDEX grammar).
+#[cfg(feature = "v16")]
+pub fn tokens<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
+    lexer::lex::<E>(sql, arena)
+}
+
 /// Parse one stand-alone expression (v0.16): the stored text of
 /// a CHECK constraint, generated column or DEFAULT, re-parsed by
 /// the planner into `arena`. The whole input must be the one
@@ -165,12 +211,15 @@ pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena) -> Result<Expr, E> {
 /// are not kept. Returns that prefix and the name's byte offset;
 /// `None` for text that does not lex.
 ///
-/// It also refuses AUTOINCREMENT (`Error::Unsupported`, v0.16):
-/// hipp does not maintain the companion `sqlite_sequence` table,
-/// and a file holding an AUTOINCREMENT table without it is
-/// "malformed" to the pin on its next INSERT. (Existing files that
-/// have one still load: the catalog parses, it does not create.)
-/// The word is reserved, so an unquoted occurrence is the clause.
+/// Without `v16` it also refuses AUTOINCREMENT
+/// (`Error::Unsupported`): those builds do not maintain the
+/// companion `sqlite_sequence` table, and a file holding an
+/// AUTOINCREMENT table without it is "malformed" to the pin on its
+/// next INSERT. The INSERT planner calls it on the target table's
+/// stored text for the same reason (an existing AUTOINCREMENT
+/// table is read-only there). With `v16` AUTOINCREMENT is
+/// maintained (`has_autoincrement`). The word is reserved, so an
+/// unquoted occurrence is the clause.
 pub fn schema_text_start<E>(
     sql: &[u8],
     arena: &Arena,
@@ -185,6 +234,7 @@ pub fn schema_text_start<E>(
         arena,
         sql,
     };
+    #[cfg(not(feature = "v16"))]
     if (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT")) {
         return Err(Error::Unsupported);
     }
@@ -211,6 +261,79 @@ pub fn schema_text_start<E>(
         i += 2;
     }
     Ok(t.get(i).map(|n| (prefix, n.offset)))
+}
+
+/// Whether a stored CREATE TABLE text declares AUTOINCREMENT
+/// (v0.16, `v16`): the word is reserved, so an unquoted
+/// occurrence can only be the PRIMARY KEY's clause. Text that
+/// does not lex has none.
+#[cfg(feature = "v16")]
+pub fn has_autoincrement<E>(sql: &[u8], arena: &Arena) -> bool {
+    let Ok(toks) = lexer::lex::<E>(sql, arena) else {
+        return false;
+    };
+    let p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT"))
+}
+
+/// Which constraint kinds of a `CREATE TABLE` text carry a
+/// constraint-level `ON CONFLICT ROLLBACK` (v0.16, `v16`): (a NOT
+/// NULL constraint, a UNIQUE or PRIMARY KEY constraint). hipp
+/// otherwise parses constraint-level conflict clauses without
+/// acting on them; this one decides whether a violation ends the
+/// whole transaction. Unlexable text: neither.
+#[cfg(feature = "v16")]
+pub fn rollback_constraints<E>(sql: &[u8], arena: &Arena) -> (bool, bool) {
+    let Ok(toks) = lexer::lex::<E>(sql, arena) else {
+        return (false, false);
+    };
+    let p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let tok = |i: usize| p.toks.as_slice().get(i).map(|t| t.tok);
+    let (mut nn, mut uq) = (false, false);
+    for i in 1..p.limit {
+        if !(p.is_kw(i, b"ON") && p.is_kw(i + 1, b"CONFLICT") && p.is_kw(i + 2, b"ROLLBACK")) {
+            continue;
+        }
+        // Back from the clause to the constraint's keyword: past a
+        // table constraint's column list and a PRIMARY KEY's order.
+        let mut j = i - 1;
+        if tok(j) == Some(Tok::RParen) {
+            let mut depth = 0usize;
+            loop {
+                match tok(j) {
+                    Some(Tok::RParen) => depth += 1,
+                    Some(Tok::LParen) => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                if depth == 0 || j == 0 {
+                    break;
+                }
+                j -= 1;
+            }
+            j = j.saturating_sub(1);
+        }
+        if p.is_kw(j, b"ASC") || p.is_kw(j, b"DESC") {
+            j = j.saturating_sub(1);
+        }
+        if p.is_kw(j, b"NULL") && j > 0 && p.is_kw(j - 1, b"NOT") {
+            nn = true;
+        } else if p.is_kw(j, b"UNIQUE") || p.is_kw(j, b"KEY") {
+            uq = true;
+        }
+    }
+    (nn, uq)
 }
 
 impl<'a> Parser<'a> {
@@ -316,8 +439,13 @@ impl<'a> Parser<'a> {
                 // hipp used to drop it and use `main.t`, where the
                 // pin finds no such table (or, for CREATE TABLE
                 // temp.t, makes a temporary one outside the file).
+                // v0.16 (`v16`): `temp.` too — the connection routes a
+                // statement naming the temp schema to its temp
+                // database (`session::temp`) before it plans it, so
+                // the planner never reads `temp.t` as `main.t`.
                 if matches!(self.cur().tok, Tok::Dot) {
-                    if !eq_ci(handle_bytes(self.arena, h), b"main") {
+                    let s = handle_bytes(self.arena, h);
+                    if !eq_ci(s, b"main") && !(cfg!(feature = "v16") && eq_ci(s, b"temp")) {
                         return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                     }
                     self.pos += 1;
@@ -327,6 +455,111 @@ impl<'a> Parser<'a> {
             }
             _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         }
+    }
+
+    /// Whether token `i` starts a `WITH` clause (v0.16, `v16`;
+    /// always false without it, so the clause stays a syntax
+    /// error there).
+    fn with_at(&self, i: usize) -> bool {
+        cfg!(feature = "v16") && self.is_kw(i, b"WITH")
+    }
+
+    /// `WITH [RECURSIVE] cte [, cte ...]` (v0.16, `v16`; the pin's
+    /// grammar): each CTE is `name [(col, ...)] AS [[NOT]
+    /// MATERIALIZED] (select-stmt)`.
+    #[cfg(feature = "v16")]
+    fn with_clause<E>(&mut self) -> Result<crate::sql::ast::With, E> {
+        self.expect_kw::<E>(b"WITH")?;
+        let _ = self.eat_kw(b"RECURSIVE");
+        let mut ctes = AVec::new();
+        loop {
+            let name = match self.cur().tok {
+                Tok::Ident(h, _) => {
+                    self.pos += 1;
+                    h
+                }
+                _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+            };
+            let mut columns = AVec::new();
+            if self.eat(Tok::LParen) {
+                loop {
+                    match self.cur().tok {
+                        Tok::Ident(h, _) => {
+                            self.pos += 1;
+                            columns.push(h);
+                        }
+                        _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+                    }
+                    if self.eat(Tok::Comma) {
+                        continue;
+                    }
+                    self.expect::<E>(Tok::RParen)?;
+                    break;
+                }
+            }
+            self.expect_kw::<E>(b"AS")?;
+            let hint = if self.eat_kw(b"NOT") {
+                self.expect_kw::<E>(b"MATERIALIZED")?;
+                crate::sql::ast::M10d::No
+            } else if self.eat_kw(b"MATERIALIZED") {
+                crate::sql::ast::M10d::Yes
+            } else {
+                crate::sql::ast::M10d::Any
+            };
+            self.expect::<E>(Tok::LParen)?;
+            let select = self.select_rich::<E>()?;
+            self.expect::<E>(Tok::RParen)?;
+            ctes.push(crate::sql::ast::Cte {
+                name,
+                columns,
+                select,
+                hint,
+            });
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        Ok(crate::sql::ast::With { ctes })
+    }
+
+    /// A statement led by a WITH clause (v0.16, `v16`): a select
+    /// statement keeps the clause itself; INSERT / REPLACE /
+    /// UPDATE / DELETE are wrapped in `Ast::With`.
+    #[cfg(feature = "v16")]
+    fn with_statement<E>(&mut self) -> Result<Ast, E> {
+        let save = self.pos;
+        let with = self.with_clause::<E>()?;
+        if self.cur_is_kw(b"SELECT") || self.cur_is_kw(b"VALUES") {
+            self.pos = save;
+            return Ok(Ast::Select(self.select_rich::<E>()?));
+        }
+        let body = if self.cur_is_kw(b"INSERT") {
+            self.insert::<E>(false)?
+        } else if self.cur_is_kw(b"REPLACE") {
+            self.replace_dispatch::<E>()?
+        } else if self.cur_is_kw(b"UPDATE") {
+            self.update_dispatch::<E>()?
+        } else if self.cur_is_kw(b"DELETE") {
+            self.delete_dispatch::<E>()?
+        } else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        Ok(Ast::With {
+            with: Box::new(with),
+            body: Box::new(body),
+        })
+    }
+
+    /// `name`, also saying whether the `main.` qualifier was
+    /// written (v0.16, `v16`: a qualified name never denotes a
+    /// CTE).
+    #[cfg(feature = "v16")]
+    fn name_q<E>(&mut self) -> Result<(ABytes, bool), E> {
+        let qualified = matches!(
+            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
+            Some(Tok::Dot)
+        );
+        Ok((self.name::<E>()?, qualified))
     }
 
     fn expect_end<E>(&mut self) -> Result<(), E> {
@@ -365,6 +598,15 @@ impl<'a> Parser<'a> {
             self.delete_dispatch::<E>()
         } else if self.cur_is_kw(b"SELECT") {
             self.select::<E>()
+        } else if self.with_at(self.pos) {
+            #[cfg(feature = "v16")]
+            {
+                self.with_statement::<E>()
+            }
+            #[cfg(not(feature = "v16"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
         } else if self.cur_is_kw(b"VALUES") {
             // A standalone VALUES statement (v0.9): a select
             // statement whose first core is a VALUES core.
@@ -380,9 +622,17 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             // BEGIN [TRANSACTION]; deferred/immediate/exclusive all
             // parse — the engine has one lock level in v0.2.
+            #[cfg(feature = "v16")]
+            let immediate = !self.eat_kw(b"DEFERRED")
+                && (self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE"));
+            #[cfg(not(feature = "v16"))]
             let _ =
                 self.eat_kw(b"DEFERRED") || self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE");
             let _ = self.eat_kw(b"TRANSACTION");
+            #[cfg(feature = "v16")]
+            if immediate {
+                return Ok(Ast::BeginImmediate);
+            }
             Ok(Ast::Begin)
         } else if self.cur_is_kw(b"COMMIT") || self.cur_is_kw(b"END") {
             self.pos += 1;
@@ -391,15 +641,195 @@ impl<'a> Parser<'a> {
         } else if self.cur_is_kw(b"ROLLBACK") {
             self.pos += 1;
             let _ = self.eat_kw(b"TRANSACTION");
-            // ROLLBACK TO <savepoint> is a later phase.
+            // ROLLBACK TO [SAVEPOINT] <name> (v0.16, `v16`).
             if self.cur_is_kw(b"TO") {
+                #[cfg(feature = "v16")]
+                {
+                    self.pos += 1;
+                    let _ = self.eat_kw(b"SAVEPOINT");
+                    let name = self.pragma_nm::<E>()?;
+                    return Ok(Ast::RollbackTo { name });
+                }
+                #[cfg(not(feature = "v16"))]
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
             Ok(Ast::Rollback)
+        } else if cfg!(feature = "v16")
+            && (self.cur_is_kw(b"SAVEPOINT")
+                || self.cur_is_kw(b"RELEASE")
+                || self.cur_is_kw(b"VACUUM")
+                || self.cur_is_kw(b"REINDEX")
+                || self.cur_is_kw(b"ANALYZE"))
+        {
+            #[cfg(feature = "v16")]
+            {
+                self.maint_stmt::<E>()
+            }
+            #[cfg(not(feature = "v16"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
+        } else if cfg!(feature = "v16") && self.cur_is_kw(b"PRAGMA") {
+            #[cfg(feature = "v16")]
+            {
+                self.pragma_stmt::<E>()
+            }
+            #[cfg(not(feature = "v16"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
         } else if self.at_eof() {
             Err(perr(self.cur().offset, ParseKind::UnexpectedEof))
         } else {
             Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+        }
+    }
+
+    /// The savepoint and maintenance statements (v0.16, `v16`):
+    /// `SAVEPOINT nm`, `RELEASE [SAVEPOINT] nm`, `VACUUM [nm]
+    /// [INTO expr]`, `REINDEX [nm [. nm]]`, `ANALYZE [nm [.
+    /// nm]]`, with the current token on the keyword.
+    #[cfg(feature = "v16")]
+    fn maint_stmt<E>(&mut self) -> Result<Ast, E> {
+        if self.eat_kw(b"SAVEPOINT") {
+            let name = self.pragma_nm::<E>()?;
+            return Ok(Ast::Savepoint { name });
+        }
+        if self.eat_kw(b"RELEASE") {
+            let _ = self.eat_kw(b"SAVEPOINT");
+            let name = self.pragma_nm::<E>()?;
+            return Ok(Ast::Release { name });
+        }
+        let vacuum = self.eat_kw(b"VACUUM");
+        let reindex = !vacuum && self.eat_kw(b"REINDEX");
+        if !vacuum && !reindex {
+            self.pos += 1; // ANALYZE
+        }
+        let mut first = None;
+        if !self.at_eof() && !matches!(self.cur().tok, Tok::Semi) && !self.cur_is_kw(b"INTO") {
+            first = Some(self.pragma_nm::<E>()?);
+        }
+        if vacuum {
+            let into = if self.eat_kw(b"INTO") {
+                Some(self.parse_expr::<E>()?)
+            } else {
+                None
+            };
+            return Ok(Ast::Vacuum {
+                schema: first,
+                into,
+            });
+        }
+        let (schema, name) = if first.is_some() && self.eat(Tok::Dot) {
+            (first, Some(self.pragma_nm::<E>()?))
+        } else {
+            (None, first)
+        };
+        Ok(if reindex {
+            Ast::Reindex { schema, name }
+        } else {
+            Ast::Analyze { schema, name }
+        })
+    }
+
+    /// `PRAGMA [nm .] nm [= nmnum | ( nmnum )]` (v0.16, `v16`;
+    /// the pin's grammar): `nmnum` is a signed number, a name
+    /// (an identifier that is not a reserved word, or a string),
+    /// or one of `ON`, `DELETE`, `DEFAULT`.
+    #[cfg(feature = "v16")]
+    fn pragma_stmt<E>(&mut self) -> Result<Ast, E> {
+        self.pos += 1;
+        let first = self.pragma_nm::<E>()?;
+        let (schema, name) = if self.eat(Tok::Dot) {
+            (Some(first), self.pragma_nm::<E>()?)
+        } else {
+            (None, first)
+        };
+        let paren = matches!(self.cur().tok, Tok::LParen);
+        let mut numeric = false;
+        let value = if self.eat(Tok::Eq) || self.eat(Tok::LParen) {
+            let i = self.pos + usize::from(matches!(self.cur().tok, Tok::Minus | Tok::Plus));
+            numeric = matches!(
+                self.toks.as_slice().get(i).map(|t| t.tok),
+                Some(Tok::Integer(_) | Tok::Real(_))
+            );
+            let v = self.pragma_value::<E>()?;
+            if paren {
+                self.expect::<E>(Tok::RParen)?;
+            }
+            Some(v)
+        } else {
+            None
+        };
+        Ok(Ast::Pragma {
+            schema,
+            name,
+            value,
+            numeric,
+        })
+    }
+
+    /// One PRAGMA name (`nm`): a non-reserved or quoted
+    /// identifier, or a string.
+    #[cfg(feature = "v16")]
+    fn pragma_nm<E>(&mut self) -> Result<ABytes, E> {
+        match self.cur().tok {
+            Tok::Ident(h, q) if q || !self.reserved(self.pos, true) => {
+                self.pos += 1;
+                Ok(h)
+            }
+            Tok::Text(h) => {
+                self.pos += 1;
+                Ok(h)
+            }
+            Tok::Eof => Err(perr(self.cur().offset, ParseKind::UnexpectedEof)),
+            _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
+        }
+    }
+
+    /// One PRAGMA argument (`nmnum` / `minus_num`) as text.
+    #[cfg(feature = "v16")]
+    fn pragma_value<E>(&mut self) -> Result<ABytes, E> {
+        let minus = matches!(self.cur().tok, Tok::Minus);
+        if minus || matches!(self.cur().tok, Tok::Plus) {
+            self.pos += 1;
+            if !matches!(self.cur().tok, Tok::Integer(_) | Tok::Real(_)) {
+                return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+            }
+        }
+        match self.cur().tok {
+            Tok::Integer(_) | Tok::Real(_) => {
+                let start = self.cur().offset;
+                let end = self.item_end_offset(self.pos + 1);
+                let text = trim(self.sql.get(start..end).unwrap_or_default());
+                // A digit separator makes the pin's tokenizer
+                // produce a token the PRAGMA grammar refuses.
+                if text.contains(&b'_') {
+                    return Err(perr(start, ParseKind::UnexpectedToken));
+                }
+                self.pos += 1;
+                let mut v: AVec<u8> = AVec::new();
+                if minus {
+                    v.push(b'-');
+                }
+                v.extend_from_slice(text);
+                Ok(self.arena.alloc_copy_handle(v.as_slice())?)
+            }
+            Tok::Ident(h, q)
+                if q || !self.reserved(self.pos, true)
+                    || self.cur_is_kw(b"ON")
+                    || self.cur_is_kw(b"DELETE")
+                    || self.cur_is_kw(b"DEFAULT") =>
+            {
+                self.pos += 1;
+                Ok(h)
+            }
+            Tok::Text(h) => {
+                self.pos += 1;
+                Ok(h)
+            }
+            Tok::Eof | Tok::Semi => Err(perr(self.cur().offset, ParseKind::UnexpectedEof)),
+            _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         }
     }
 
@@ -628,6 +1058,7 @@ impl<'a> Parser<'a> {
                 checks: AVec::new(),
                 strict: false,
                 as_select: Some(Box::new(select)),
+                fkeys: AVec::new(),
             });
         }
         self.expect::<E>(Tok::LParen)?;
@@ -639,6 +1070,8 @@ impl<'a> Parser<'a> {
         let mut sets: AVec<ConstraintSet> = AVec::new();
         #[cfg(feature = "v04")]
         let mut checks: AVec<ABytes> = AVec::new();
+        #[cfg(feature = "v16")]
+        let mut fkeys: AVec<crate::sql::ast::ForeignKey> = AVec::new();
         // Column definitions first, then table constraints (the
         // pin's `columnlist conslist_opt`): a column after a table
         // constraint is a syntax error.
@@ -654,6 +1087,8 @@ impl<'a> Parser<'a> {
                 &mut sets,
                 #[cfg(feature = "v04")]
                 &mut checks,
+                #[cfg(feature = "v16")]
+                &mut fkeys,
             )?;
             if in_cons && columns.len() != ncols {
                 return Err(perr(
@@ -664,6 +1099,15 @@ impl<'a> Parser<'a> {
         }
         if columns.is_empty() {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
+        // A PRIMARY KEY / UNIQUE list names the table's columns
+        // (v0.16 fix: `PRIMARY KEY (nosuch)` was written, and the
+        // pin then could not read the schema). The tiny profile
+        // keeps no constraint indexes at all (SPEC §2), so the
+        // check lives with them.
+        #[cfg(feature = "indexes")]
+        for s in sets.iter() {
+            self.known_columns::<E>(columns.as_slice(), s.columns.as_slice())?;
         }
         // Mark PK columns (candidate rowid-alias semantics: a PK
         // column written with DESC is not marked — see ast docs).
@@ -736,6 +1180,8 @@ impl<'a> Parser<'a> {
             strict,
             #[cfg(feature = "v16")]
             as_select: None,
+            #[cfg(feature = "v16")]
+            fkeys,
         })
     }
 
@@ -762,7 +1208,11 @@ impl<'a> Parser<'a> {
                 .first()
                 .and_then(|h| col(*h))
                 .is_some_and(|c| {
-                    !c.pk_desc && eq_ci(trim(handle_bytes(self.arena, c.decl)), b"INTEGER")
+                    !c.pk_desc
+                        && eq_ci(
+                            crate::record::decl_token(handle_bytes(self.arena, c.decl)),
+                            b"INTEGER",
+                        )
                 });
         let coll = |d: &IndexColumnDef| d.coll.or_else(|| col(d.name).and_then(|c| c.coll));
         let mut out: AVec<ConstraintSet> = AVec::new();
@@ -1099,7 +1549,7 @@ impl<'a> Parser<'a> {
     /// before.
     #[cfg(feature = "v08")]
     fn insert_source<E>(&mut self) -> Result<InsertSource, E> {
-        if self.cur_is_kw(b"SELECT") {
+        if self.cur_is_kw(b"SELECT") || self.with_at(self.pos) {
             return Ok(InsertSource {
                 rows: AVec::new(),
                 select: Some(Box::new(self.select_rich::<E>()?)),
@@ -1158,7 +1608,12 @@ impl<'a> Parser<'a> {
             Ok(ConflictAction::Replace)
         } else if self.eat_kw(b"FAIL") {
             Ok(ConflictAction::Fail)
-        } else if self.eat_kw(b"ABORT") || self.eat_kw(b"ROLLBACK") {
+        } else if self.eat_kw(b"ROLLBACK") {
+            #[cfg(feature = "v16")]
+            return Ok(ConflictAction::Rollback);
+            #[cfg(not(feature = "v16"))]
+            return Ok(ConflictAction::Abort);
+        } else if self.eat_kw(b"ABORT") {
             Ok(ConflictAction::Abort)
         } else {
             Err(perr(self.cur().offset, ParseKind::UnexpectedToken))
@@ -1358,6 +1813,8 @@ impl<'a> Parser<'a> {
             natural: false,
             #[cfg(feature = "v04")]
             using: AVec::new(),
+            #[cfg(feature = "v16")]
+            args: None,
         });
         // v0.2: optional WHERE <column> = <literal>. Any other
         // predicate shape is rejected here; whether <column> is the
@@ -1729,10 +2186,16 @@ impl<'a> Parser<'a> {
         // is required at plan time.
         #[cfg(feature = "v16")]
         if let Tok::Ident(..) = self.cur().tok {
-            let table = self.name::<E>()?;
+            let (table, qualified) = self.name_q::<E>()?;
+            // A copy, not the token's handle: the pin's ALTER TABLE
+            // RENAME leaves this name unedited (its "after rename"
+            // check then fails), and ALTER maps token handles only.
+            let table = self
+                .arena
+                .alloc_copy_handle(handle_bytes(self.arena, table))?;
             return Ok(Expr::InSubquery(
                 Box::new(l),
-                Box::new(self.table_select(table)),
+                Box::new(self.table_select(table, qualified)),
                 neg,
             ));
         }
@@ -1746,8 +2209,9 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             extra_parens += 1;
         }
-        let is_subquery =
-            self.cur_is_kw(b"SELECT") || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"));
+        let is_subquery = self.cur_is_kw(b"SELECT")
+            || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            || self.with_at(self.pos);
         if !is_subquery {
             // An expression list whose first item is
             // parenthesised: rewind and let the list parser see
@@ -1890,7 +2354,10 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 extra_parens += 1;
             }
-            if !self.cur_is_kw(b"SELECT") && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES")) {
+            if !self.cur_is_kw(b"SELECT")
+                && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+                && !self.with_at(self.pos)
+            {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
             let stmt = self.select_rich::<E>()?;
@@ -1900,7 +2367,10 @@ impl<'a> Parser<'a> {
             return Ok(Expr::ExistsSubquery(Box::new(stmt)));
         }
         if self.eat(Tok::LParen) {
-            if self.cur_is_kw(b"SELECT") || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES")) {
+            if self.cur_is_kw(b"SELECT")
+                || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+                || self.with_at(self.pos)
+            {
                 #[cfg(feature = "v06")]
                 {
                     let stmt = self.select_rich::<E>()?;
@@ -2105,7 +2575,17 @@ impl<'a> Parser<'a> {
     /// `v09` feature this is exactly the pre-v0.9 single core
     /// plus its tail.
     fn select_rich<E>(&mut self) -> Result<SelectStmt, E> {
+        #[cfg(feature = "v16")]
+        let with = if self.with_at(self.pos) {
+            Some(Box::new(self.with_clause::<E>()?))
+        } else {
+            None
+        };
         let mut head = self.select_core::<E>()?;
+        #[cfg(feature = "v16")]
+        {
+            head.with = with;
+        }
         #[cfg(feature = "v09")]
         {
             let mut compound: AVec<(CompoundOp, SelectStmt)> = AVec::new();
@@ -2194,6 +2674,8 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values,
+            #[cfg(feature = "v16")]
+            with: None,
         })
     }
 
@@ -2274,6 +2756,8 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values: AVec::new(),
+            #[cfg(feature = "v16")]
+            with: None,
         })
     }
 
@@ -2374,7 +2858,7 @@ impl<'a> Parser<'a> {
     /// `SELECT * FROM <table>` as an AST (v0.16: the subquery an
     /// `x IN table` operand stands for).
     #[cfg(feature = "v16")]
-    fn table_select(&self, table: ABytes) -> SelectStmt {
+    fn table_select(&self, table: ABytes, qualified: bool) -> SelectStmt {
         let mut items = AVec::new();
         items.push(SelectItem::Star);
         let mut from = AVec::new();
@@ -2386,6 +2870,9 @@ impl<'a> Parser<'a> {
             derived: None,
             natural: false,
             using: AVec::new(),
+            args: None,
+            qualified,
+            cte: None,
         });
         SelectStmt {
             distinct: false,
@@ -2399,6 +2886,7 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values: AVec::new(),
+            with: None,
         }
     }
 
@@ -2544,7 +3032,7 @@ impl<'a> Parser<'a> {
                 depth += 1;
                 i += 1;
             }
-            if self.is_kw(i, b"SELECT") || self.is_kw(i, b"VALUES") {
+            if self.is_kw(i, b"SELECT") || self.is_kw(i, b"VALUES") || self.with_at(i) {
                 for _ in 0..depth {
                     self.expect::<E>(Tok::LParen)?;
                 }
@@ -2562,10 +3050,36 @@ impl<'a> Parser<'a> {
                     derived: Some(Box::new(inner)),
                     natural,
                     using,
+                    #[cfg(feature = "v16")]
+                    args: None,
+                    #[cfg(feature = "v16")]
+                    qualified: false,
+                    #[cfg(feature = "v16")]
+                    cte: None,
                 });
             }
         }
+        #[cfg(feature = "v16")]
+        let (table, qualified) = self.name_q::<E>()?;
+        #[cfg(not(feature = "v16"))]
         let table = self.name::<E>()?;
+        // A table-valued function (v0.16): `name(arg, ...)`.
+        #[cfg(feature = "v16")]
+        let args = if self.eat(Tok::LParen) {
+            let mut v = AVec::new();
+            if !self.eat(Tok::RParen) {
+                loop {
+                    v.push(self.parse_expr::<E>()?);
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect::<E>(Tok::RParen)?;
+            }
+            Some(v)
+        } else {
+            None
+        };
         let alias = self.opt_alias();
         let (on, using) = self.join_constraint::<E>(natural, first)?;
         Ok(FromSource {
@@ -2576,6 +3090,12 @@ impl<'a> Parser<'a> {
             derived: None,
             natural,
             using,
+            #[cfg(feature = "v16")]
+            args,
+            #[cfg(feature = "v16")]
+            qualified,
+            #[cfg(feature = "v16")]
+            cte: None,
         })
     }
 
@@ -2585,6 +3105,34 @@ impl<'a> Parser<'a> {
         self.expect_kw::<E>(b"ALTER")?;
         self.expect_kw::<E>(b"TABLE")?;
         let table = self.name::<E>()?;
+        // RENAME TO / RENAME [COLUMN] / DROP [COLUMN] (v0.16,
+        // `v16`): every name is the pin's `nm` (an identifier, a
+        // keyword that is not reserved, or a string).
+        #[cfg(feature = "v16")]
+        if self.eat_kw(b"RENAME") {
+            if self.eat_kw(b"TO") {
+                let (to, _) = self.nm_tok::<E>()?;
+                return Ok(Ast::AlterRename { table, to });
+            }
+            // `COLUMN` is always the keyword here, as in the pin's
+            // grammar (`RENAME column TO x` is a syntax error there).
+            let _ = self.eat_kw(b"COLUMN");
+            let (from, _) = self.nm_tok::<E>()?;
+            self.expect_kw::<E>(b"TO")?;
+            let (to, quoted) = self.nm_tok::<E>()?;
+            return Ok(Ast::AlterRenameColumn {
+                table,
+                from,
+                to,
+                quoted,
+            });
+        }
+        #[cfg(feature = "v16")]
+        if self.eat_kw(b"DROP") {
+            let _ = self.eat_kw(b"COLUMN");
+            let (column, _) = self.nm_tok::<E>()?;
+            return Ok(Ast::AlterDropColumn { table, column });
+        }
         if !self.eat_kw(b"ADD") {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
@@ -2606,6 +3154,8 @@ impl<'a> Parser<'a> {
         let mut pk_desc: AVec<ABytes> = AVec::new();
         let mut sets: AVec<ConstraintSet> = AVec::new();
         let mut checks: AVec<ABytes> = AVec::new();
+        #[cfg(feature = "v16")]
+        let mut fkeys = AVec::new();
         self.create_item::<E>(
             from,
             to,
@@ -2614,6 +3164,8 @@ impl<'a> Parser<'a> {
             &mut pk_desc,
             &mut sets,
             &mut checks,
+            #[cfg(feature = "v16")]
+            &mut fkeys,
         )?;
         if columns.len() != 1 {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
@@ -2802,6 +3354,22 @@ UPDATE USING VALUES WHEN WHERE",
         }
     }
 
+    /// Consume one `nm` (v0.16, `v16`): its handle and whether it
+    /// was quoted (a quoted identifier or a string).
+    #[cfg(feature = "v16")]
+    fn nm_tok<E>(&mut self) -> Result<(ABytes, bool), E> {
+        if !self.nm_at(self.pos, self.limit) {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        }
+        let t = self.cur();
+        self.pos += 1;
+        match t.tok {
+            Tok::Ident(h, q) => Ok((h, q)),
+            Tok::Text(h) => Ok((h, true)),
+            _ => Err(perr(t.offset, ParseKind::UnexpectedToken)),
+        }
+    }
+
     /// Token `i` is a name (`nm`): an identifier that is not a
     /// reserved keyword, or a string.
     fn nm_at(&self, i: usize, to: usize) -> bool {
@@ -2840,15 +3408,24 @@ UPDATE USING VALUES WHEN WHERE",
     /// Skip a `REFERENCES nm [(cols)] {MATCH nm | ON
     /// DELETE|UPDATE|INSERT action}` clause whose REFERENCES is
     /// token `i`, returning the next index (foreign keys are
-    /// parsed, not enforced).
-    fn references<E>(&self, mut i: usize, to: usize) -> Result<usize, E> {
+    /// parsed, not enforced). `from` is the child column count
+    /// (one for a column constraint): a parent column list of
+    /// another length is the pin's error (v0.16 fix — such a
+    /// schema made the file unreadable to the pin).
+    fn references<E>(&self, mut i: usize, to: usize, from: usize) -> Result<usize, E> {
         let bad = |j: usize| Err(perr(self.item_end_offset(j), ParseKind::UnexpectedToken));
         if !self.nm_at(i + 1, to) {
             return bad(i + 1);
         }
         i += 2;
         if i < to && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
-            i = self.constraint_columns::<E>(i, to, false)?.1;
+            let (cols, next) = self.constraint_columns::<E>(i, to, false)?;
+            if cols.len() != from {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::ForeignKeyColumns,
+                });
+            }
+            i = next;
         }
         loop {
             if self.is_kw(i, b"MATCH") {
@@ -2876,6 +3453,86 @@ UPDATE USING VALUES WHEN WHERE",
                 return Ok(i);
             }
         }
+    }
+
+    /// The foreign key a `REFERENCES` clause at token `i` declares
+    /// (v0.16, `v16`; the clause was validated by `references`).
+    /// `ON INSERT` actions parse and are dropped, as on the pin;
+    /// `MATCH` is not recorded (the pin reports `NONE` always).
+    #[cfg(feature = "v16")]
+    fn fk_clause<E>(
+        &self,
+        from: AVec<ABytes>,
+        mut i: usize,
+        to: usize,
+    ) -> Result<crate::sql::ast::ForeignKey, E> {
+        let table = match self.toks.as_slice().get(i + 1).map(|t| t.tok) {
+            Some(Tok::Ident(h, _) | Tok::Text(h)) => h,
+            _ => {
+                return Err(perr(
+                    self.item_end_offset(i + 1),
+                    ParseKind::UnexpectedToken,
+                ));
+            }
+        };
+        i += 2;
+        let mut cols = AVec::new();
+        if i < to && matches!(self.toks.as_slice()[i].tok, Tok::LParen) {
+            let (c, next) = self.constraint_columns::<E>(i, to, false)?;
+            for x in c.iter() {
+                cols.push(x.name);
+            }
+            i = next;
+        }
+        let (mut on_update, mut on_delete) = (0u8, 0u8);
+        loop {
+            if self.is_kw(i, b"MATCH") {
+                i += 2;
+            } else if self.is_kw(i, b"ON") {
+                let act = if self.is_kw(i + 2, b"SET") {
+                    if self.is_kw(i + 3, b"NULL") { 2 } else { 3 }
+                } else if self.is_kw(i + 2, b"CASCADE") {
+                    4
+                } else if self.is_kw(i + 2, b"RESTRICT") {
+                    1
+                } else {
+                    0
+                };
+                if self.is_kw(i + 1, b"DELETE") {
+                    on_delete = act;
+                } else if self.is_kw(i + 1, b"UPDATE") {
+                    on_update = act;
+                }
+                i += if act == 1 || act == 4 { 3 } else { 4 };
+            } else {
+                break;
+            }
+        }
+        Ok(crate::sql::ast::ForeignKey {
+            from,
+            table,
+            to: cols,
+            on_update,
+            on_delete,
+        })
+    }
+
+    /// Every name of a constraint column list is one of the
+    /// table's columns (the pin's "no such column" / "unknown
+    /// column ... in foreign key definition"; `rowid` is not one).
+    fn known_columns<E>(&self, columns: &[ColumnDef], cols: &[IndexColumnDef]) -> Result<(), E> {
+        for c in cols {
+            let n = handle_bytes(self.arena, c.name);
+            if !columns
+                .iter()
+                .any(|d| eq_ci(handle_bytes(self.arena, d.name), n))
+            {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::UnknownColumn,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Skip an optional `[NOT] DEFERRABLE [INITIALLY DEFERRED |
@@ -2989,6 +3646,7 @@ UPDATE USING VALUES WHEN WHERE",
         pk_desc_names: &mut AVec<ABytes>,
         sets: &mut AVec<ConstraintSet>,
         #[cfg(feature = "v04")] checks: &mut AVec<ABytes>,
+        #[cfg(feature = "v16")] fkeys: &mut AVec<crate::sql::ast::ForeignKey>,
     ) -> Result<bool, E> {
         let bad = |j: usize| -> Result<bool, E> {
             Err(perr(self.item_end_offset(j), ParseKind::UnexpectedToken))
@@ -3027,11 +3685,12 @@ UPDATE USING VALUES WHEN WHERE",
                     }
                     let (cols, next) = self.constraint_columns::<E>(i + 1, to, pk)?;
                     if pk {
+                        // A table-level key's DESC does not stop the
+                        // rowid alias (the pin passes no sort order
+                        // for `PRIMARY KEY (a DESC)`; v0.16 fix: hipp
+                        // wrote an autoindex the pin calls orphan).
                         for c in cols.iter() {
                             pk_names.push(c.name);
-                            if c.desc {
-                                pk_desc_names.push(c.name);
-                            }
                         }
                     }
                     sets.push(ConstraintSet {
@@ -3057,11 +3716,23 @@ UPDATE USING VALUES WHEN WHERE",
                     ));
                 } else if self.is_kw(i, b"FOREIGN") && self.is_kw(i + 1, b"KEY") {
                     // Parsed, not enforced (see module docs).
-                    let next = self.constraint_columns::<E>(i + 2, to, false)?.1;
+                    let (cols, next) = self.constraint_columns::<E>(i + 2, to, false)?;
                     if !self.is_kw(next, b"REFERENCES") {
                         return bad(next);
                     }
-                    i = self.references::<E>(next, to)?;
+                    i = self.references::<E>(next, to, cols.len())?;
+                    // Each child column must be one of the table's
+                    // (v0.16 fix; all columns precede the table
+                    // constraints).
+                    self.known_columns::<E>(columns.as_slice(), cols.as_slice())?;
+                    #[cfg(feature = "v16")]
+                    {
+                        let mut from = AVec::new();
+                        for c in cols.iter() {
+                            from.push(c.name);
+                        }
+                        fkeys.push(self.fk_clause::<E>(from, next, to)?);
+                    }
                     i = self.deferrable(i);
                 } else {
                     return bad(i);
@@ -3141,6 +3812,8 @@ UPDATE USING VALUES WHEN WHERE",
         let mut gen_expr: Option<ABytes> = None;
         #[cfg(feature = "v04")]
         let mut stored = false;
+        #[cfg(feature = "v16")]
+        let mut dflt_text: Option<ABytes> = None;
         // Column constraints (`carglist`), in any order.
         while i < to {
             if self.is_kw(i, b"CONSTRAINT") {
@@ -3150,6 +3823,19 @@ UPDATE USING VALUES WHEN WHERE",
                 i += 2;
             } else if self.is_kw(i, b"DEFAULT") {
                 let (d, next) = self.default_clause::<E>(i + 1, to)?;
+                #[cfg(feature = "v16")]
+                {
+                    let paren = matches!(tok(i + 1), Some(Tok::LParen));
+                    let (a, b) = if paren {
+                        (i + 2, next - 1)
+                    } else {
+                        (i + 1, next)
+                    };
+                    let start = self.toks.as_slice().get(a).map_or(0, |t| t.offset);
+                    let end = self.item_end_offset(b);
+                    let text = trim(self.sql.get(start..end).unwrap_or_default());
+                    dflt_text = Some(self.arena.alloc_copy_handle(text)?);
+                }
                 match d {
                     Ok(lit) => {
                         default = Some(lit);
@@ -3225,7 +3911,13 @@ UPDATE USING VALUES WHEN WHERE",
                     ParseKind::RequiresEvaluator,
                 ));
             } else if self.is_kw(i, b"REFERENCES") {
-                i = self.references::<E>(i, to)?;
+                #[cfg(feature = "v16")]
+                {
+                    let mut from = AVec::new();
+                    from.push(col_name);
+                    fkeys.push(self.fk_clause::<E>(from, i, to)?);
+                }
+                i = self.references::<E>(i, to, 1)?;
             } else if self.is_kw(i, b"COLLATE") {
                 // v0.16: the column's collating sequence (it used
                 // to be parsed and ignored — comparisons and
@@ -3305,6 +3997,8 @@ UPDATE USING VALUES WHEN WHERE",
             stored,
             #[cfg(any(feature = "v04", feature = "indexes"))]
             coll,
+            #[cfg(feature = "v16")]
+            dflt_text,
         });
         // Constraint sets in statement order (v0.3): an inline
         // PRIMARY KEY / UNIQUE is a one-column set at this item's
@@ -3470,11 +4164,18 @@ impl<'a> Parser<'a> {
                 }
             } else if self.eat_kw(b"FAIL") {
                 conflict = ConflictAction::Fail;
-            } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"ROLLBACK")) {
+            } else if self.eat_kw(b"ROLLBACK") {
+                // v16: the whole transaction rolls back too; before
+                // it a failed statement ended the bracket anyway.
+                #[cfg(feature = "v16")]
+                {
+                    conflict = ConflictAction::Rollback;
+                }
+            } else if !self.eat_kw(b"ABORT") {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
-            // OR ABORT / ROLLBACK: the engine's default (abort
-            // the statement) — nothing to record.
+            // OR ABORT: the engine's default (abort the statement)
+            // — nothing to record.
         }
         let table = self.name::<E>()?;
         // The alias is optional, but `SET` must not be eaten as
@@ -3741,10 +4442,20 @@ mod tests {
             );
         }
         let auto = b"CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)";
+        #[cfg(not(feature = "v16"))]
         assert!(matches!(
             schema_text_start::<()>(auto, &arena),
             Err(Error::Unsupported)
         ));
+        #[cfg(feature = "v16")]
+        {
+            assert!(schema_text_start::<()>(auto, &arena).is_ok());
+            assert!(has_autoincrement::<()>(auto, &arena));
+            assert!(!has_autoincrement::<()>(
+                b"CREATE TABLE t(\"AUTOINCREMENT\" INTEGER PRIMARY KEY, b DEFAULT 'autoincrement')",
+                &arena
+            ));
+        }
     }
 
     /// v0.16 (evaluator builds): the clauses are kept for the

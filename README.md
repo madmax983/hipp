@@ -79,9 +79,9 @@ aspirations.
   tiny profile dropped 5.5 KB); ALTER TABLE ADD COLUMN takes
   non-constant defaults, NOT NULL and STORED columns on an empty
   table; one clock read per statement; hipp-cli supplies the
-  system clock; CREATE TABLE refuses AUTOINCREMENT (hipp keeps
-  no `sqlite_sequence`, and such a table read as malformed on
-  the pin).
+  system clock; below `v16` CREATE TABLE refuses AUTOINCREMENT
+  (those builds keep no `sqlite_sequence`, and such a table read
+  as malformed on the pin; `v16` maintains it, see below).
 - **Collations and pattern matching.** Ungated (column
   `COLLATE` was parsed and ignored): BINARY / NOCASE / RTRIM
   column collations with the pin's selection rule in every
@@ -288,6 +288,163 @@ aspirations.
   `'5' || char(0) || 'x'` as text); the numeric prefix behind
   arithmetic and CAST reads bytes, so a non-UTF-8 tail no longer
   zeroes it (`x'38ff' + 0` is 8).
+
+- **PRAGMA statements and `sqlite_schema`** (behind `v16`):
+  `PRAGMA [main.]name [= value | (value)]` with the pin's value
+  grammar and conversions; header values (`user_version`,
+  `application_id` read and write inside transactions;
+  `page_size` before the first write, or for the next VACUUM;
+  `page_count`,
+  `freelist_count`, `schema_version`, `encoding`,
+  `auto_vacuum`); what hipp actually does (`journal_mode` is
+  `delete`, `synchronous` FULL, `cache_size` its page pool,
+  `busy_timeout`) — any write hipp cannot honour is refused, never
+  pretended; the flags `foreign_keys` (while on, writes to tables
+  in a foreign key are refused: hipp does not enforce them),
+  `recursive_triggers`, `ignore_check_constraints` (really skips
+  CHECK) and `case_sensitive_like` (really changes LIKE);
+  `table_info`, `table_xinfo` (the pin's dequoted declared
+  types, hidden generated columns, view column types),
+  `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`,
+  `table_list`, `database_list` byte for byte, and
+  `collation_list` (the pin's library's three; its shell adds
+  two); `integrity_check` / `quick_check` with the pin's page
+  checks — auto-vacuum pointer maps and header fields included
+  — its record-header test ("database disk image is malformed")
+  and its index seek, message shapes, order and limit (a full
+  check of a table with an expression or partial index is
+  refused); the table-valued `pragma_table_info('t')` and
+  friends in FROM with the pin's hidden-column arities;
+  `sqlite_schema` / `sqlite_master` readable as ordinary tables
+  under either name (writes refused). Unknown pragma names are
+  ignored as on the pin; the pin's other known pragmas
+  (`function_list`, `locking_mode`, ...) are refused. Ungated
+  (review fixes included): CREATE of a `sqlite_*` name is
+  refused; declared types are dequoted as the pin keeps them
+  (affinity, the rowid alias and STRICT read that form: `"INTEGER"
+  PRIMARY KEY` is the alias, `[x] TEXT` is NUMERIC);
+  `PRIMARY KEY (a DESC)` as a table constraint is the rowid
+  alias; FOREIGN KEY and PRIMARY KEY / UNIQUE column lists are
+  validated (hipp wrote schemas the pin could not read); a table
+  named with arguments is "not a function". The tiny profile grew
+  232 B for these (STATUS.md). Gaps: the pin's schema hash order
+  (`table_list` with more than three objects), correlated
+  table-valued arguments, no temp database, cells off their page
+  in a damaged file (STATUS.md).
+
+- **Executed views and common table expressions** (behind
+  `v16`): views are read wherever a table is — FROM, joins
+  (NATURAL / USING / RIGHT / FULL), subqueries, `x IN view`,
+  compound members, view-on-view, UPDATE ... FROM, INSERT ...
+  SELECT, CREATE TABLE ... AS — with `CREATE VIEW v(a, b)`
+  column lists, the pin's lazy CREATE VIEW (a missing table,
+  a wrong-length column list or a cycle is the reader's error)
+  and its refusals of writes to a view. `WITH [RECURSIVE]`
+  before SELECT / VALUES / INSERT / REPLACE / UPDATE / DELETE
+  and inside any subquery: several CTEs, forward references,
+  column lists, the pin's materialization (a MATERIALIZED CTE,
+  or one read twice that the pin does not flatten, is computed
+  once and shared, as is a view a FROM clause names twice), the
+  pin's scoping (a CTE
+  shadows a table, never a DML target or a `main.` name; a view
+  never sees the reader's CTEs). Recursive CTEs run the pin's
+  queue — FIFO, or a priority queue (ties in arrival order)
+  under the CTE's ORDER BY; UNION drops rows seen before;
+  LIMIT / OFFSET count dequeued rows; several recursive SELECTs;
+  a bounded reader (LIMIT through a WHERE or a join, a scalar or
+  EXISTS subquery) stops an endless one — with its circular /
+  multiple-reference / recursive-aggregate errors and its
+  nesting limits (999 nested views or CTEs read, as on the pin,
+  in the CLI; `Config::max_nesting`, default 250, bounds the
+  stack a library caller needs). PRAGMA
+  `table_info` and the CLI's `.schema` comment use a view's
+  planned columns. Ungated fixes: tables, views and indexes
+  share one namespace (CREATE TABLE over a view's name worked;
+  tiny +48 B), `t.a` / `*` over two sources named `t` is
+  ambiguous, a derived compound's column affinity is demoted
+  across its cores, standard type names print as the pin's;
+  review fixes: CREATE VIEW IF NOT EXISTS over an index's name
+  errors, `t.rowid` over two `t`s is ambiguous, `SELECT *` with
+  no FROM is "no tables specified", and RETURNING runs after
+  each row's change (a DELETE's subqueries saw the row still
+  there; uncorrelated ones were frozen at the first row). Gaps:
+  where the pin's planner picks a co-routine or a flattening
+  the model does not foresee, a random() body may be shared
+  differently; mixed-affinity compound views compare by the
+  demoted affinity where the pin pushes some WHERE terms into
+  each core (STATUS.md).
+
+- **Savepoints and maintenance statements** (behind `v16`):
+  `SAVEPOINT` / `RELEASE [SAVEPOINT]` / `ROLLBACK [TRANSACTION]
+  TO [SAVEPOINT]` with the pin's nesting (a SAVEPOINT outside a
+  transaction starts one and releasing it commits; ROLLBACK TO
+  keeps the savepoint open; names ignore ASCII case; "no such
+  savepoint"), and **statement-level rollback**: a statement that
+  fails inside a transaction now undoes only itself — also half
+  way through a multi-row write — and the transaction stays open,
+  as on the pin (the tiny profile keeps the old whole-bracket
+  abort). The undo images live in the journal file past the
+  largest rollback journal the transaction can write, so no page
+  image is held in RAM and a crash still restores the
+  transaction's start (real SQLite recovers those journals too).
+  `VACUUM [main] [INTO expr]` rebuilds the file compactly with
+  the pin's schema order, rowid rules and header values, a
+  pending `PRAGMA page_size` applied, as one journaled
+  transaction (`Config::vacuum_into` writes VACUUM INTO's image;
+  the `std` default creates the file). `REINDEX [collation | table
+  | index]`, and `ANALYZE` writing `sqlite_stat1` exactly as the
+  pin computes it (hipp's planner does not read it; the pin then
+  plans the same over hipp's file). Ungated fixes found on the
+  way: two crash-recovery holes in the rollback journal (a page
+  the transaction allocated, spilled and changed again was
+  journaled, and replay stopped at that record; a freelist page
+  freed and reused in one transaction was not journaled), a
+  failed journal replay losing the sidecar (a panic next), and
+  `CREATE INDEX ... (rowid)` (the pin's "no such column"); the
+  tiny profile shrank 124 B. Review fixes: `OR ROLLBACK` and a
+  constraint-level `ON CONFLICT ROLLBACK` end the whole
+  transaction again; ROLLBACK TO across `PRAGMA page_size` keeps
+  the new size (it panicked); DROP TABLE / DROP INDEX delete their
+  `sqlite_stat1` rows (ungated); VACUUM INTO takes any text
+  expression (`?`, `''`); a new rowid past 9223372036854775807
+  takes an unused one. Gaps: whole-database ANALYZE row order (the
+  pin's schema hash), VACUUM of a file with an expression or
+  partial index, VACUUM of an auto-vacuum file (refused: hipp
+  writes no pointer maps), constraint-level ROLLBACK matched by
+  constraint kind (STATUS.md).
+- **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
+  `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
+  [COLUMN] a` edit the stored schema texts token by token exactly
+  as the pin does — byte-identical `sqlite_schema` rows for the
+  table, its indexes (automatic index names too), `REFERENCES`
+  elsewhere, CHECK / generated expressions and every view (the
+  planner traces which names resolve to the table) — with the
+  pin's refusals, and DROP COLUMN rewrites every row the way the
+  pin's rewrite stores it. `AUTOINCREMENT` keeps the pin's
+  `sqlite_sequence` (its CREATE text and root page order, the
+  max-ever rowid rule, "database or disk is full" at i64::MAX,
+  REPLACE / upsert / hand-edited rows), so files interoperate both
+  ways. `CREATE TEMP | TEMPORARY TABLE / VIEW`, indexes on temp
+  tables, `temp.` names and `sqlite_temp_schema` (bare or quoted)
+  use a per-connection in-memory temp database (temp names first,
+  transactions and savepoints applied to both, the connection's
+  pragmas such as `foreign_keys` / `case_sensitive_like` holding
+  there too, never written to the file, gone on close); a TEMP
+  view may read main tables. `CREATE TEMP INDEX` is a syntax
+  error, as on the pin. A failed ALTER leaves the session's
+  catalog as the file is, and "database or disk is full" rolls the
+  transaction back as the pin does. hipp-cli's `.schema` /
+  `.tables` / `.dump` follow. Ungated
+  fixes: a pin-made AUTOINCREMENT table is read-only below `v16`
+  (an INSERT left the counter behind), DROP TABLE removes its
+  `sqlite_sequence` row, `sqlite_*` tables can no longer be
+  indexed, altered or dropped, and ADD COLUMN on a table with
+  table constraints no longer writes unparsable text (tiny +28 B).
+  Gaps: a statement naming a temp table and a main object
+  (`INSERT INTO temp_t SELECT ... FROM main_t`, a join of both)
+  is refused, as is ALTER TABLE of a main table a TEMP view reads;
+  files with triggers cannot be altered; re-created tables can get
+  other root page numbers than on the pin (STATUS.md).
 
 ## What v0.13 does
 
@@ -597,9 +754,12 @@ differential testing. It is a separate crate and contributes
 
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
 no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
-created (refused; foreign ones load), no expression or partial
+created (refused below `v16`, foreign ones load read-only there;
+`v16` maintains `sqlite_sequence`), no expression or partial
 indexes, no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
-stored but never executed, no UTF-16, no multi-process
+stored but never executed (all of these in the tiny profile: the
+`v04` ... `v16` rungs add them — views execute with `v16`), no
+UTF-16, no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 
@@ -616,7 +776,10 @@ rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
 the v0.16 scalar function library),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
-(Connection/Statement, planner, tree-walking executor),
+(Connection/Statement, planner, tree-walking executor;
+`session/pragma` the PRAGMA statements and integrity check,
+`session/cte` view / CTE expansion and the recursive queue,
+`session/maint` savepoints, VACUUM, REINDEX and ANALYZE, v0.16),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.
