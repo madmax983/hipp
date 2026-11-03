@@ -144,7 +144,7 @@ fn err<E>(kind: SchemaKind) -> Error<E> {
 /// fire for, and where their values go.
 #[derive(Debug, Clone)]
 pub(super) struct InsteadPlan {
-    event: TrigEvent,
+    pub(super) event: TrigEvent,
     /// INSERT: the new rows' supplied values; UPDATE: the view's
     /// rows followed by the SET values; DELETE: the view's rows.
     source: Box<crate::query::SubPlan>,
@@ -154,7 +154,7 @@ pub(super) struct InsteadPlan {
     /// (UPDATE) goes to.
     map: AVec<usize>,
     /// UPDATE: the columns assigned.
-    assigned: AVec<bool>,
+    pub(super) assigned: AVec<bool>,
     /// The RETURNING list, over the view's columns (v0.16 review
     /// fix): evaluated for each row whose triggers ran to the end,
     /// after them, on NEW (INSERT, UPDATE) or OLD (DELETE), as on the
@@ -204,7 +204,7 @@ fn value_error<E>(e: &Error<E>) -> bool {
 /// Whether a statement's text has an explicit conflict clause
 /// (`INSERT OR ...`, `UPDATE OR ...`, `REPLACE`): the one its
 /// trigger programs inherit.
-fn explicit_conflict<E>(sql: &[u8], arena: &Arena) -> bool {
+pub(super) fn explicit_conflict<E>(sql: &[u8], arena: &Arena) -> bool {
     use crate::sql::lexer::Tok;
     let Ok(toks) = crate::sql::lexer::lex::<E>(sql, arena) else {
         return false;
@@ -245,6 +245,33 @@ fn write_shape(ast: &Ast) -> Option<(crate::arena::ABytes, ConflictAction, TrigE
             Some((*table, ConflictAction::Abort, TrigEvent::Delete, false))
         }
         Ast::With { body, .. } => write_shape(body),
+        _ => None,
+    }
+}
+
+/// One write `nest_may_abort` walks: table, event, conflict action,
+/// whether it has an upsert clause, an UPDATE's assigned column
+/// names, whether it is a SET NULL action's (`fk_may_abort`).
+type Work = (
+    AVec<u8>,
+    TrigEvent,
+    ConflictAction,
+    bool,
+    Option<AVec<AVec<u8>>>,
+    bool,
+);
+
+/// An UPDATE's assigned column names (`None`: no UPDATE).
+fn update_names(ast: &Ast, arena: &Arena) -> Option<AVec<AVec<u8>>> {
+    match ast {
+        Ast::Update { assignments, .. } => {
+            let mut out = AVec::new();
+            for (n, _) in assignments.iter() {
+                out.push(copy_vec(handle_bytes(arena, *n)));
+            }
+            Some(out)
+        }
+        Ast::With { body, .. } => update_names(body, arena),
         _ => None,
     }
 }
@@ -351,7 +378,7 @@ fn lexical_may_abort<E>(sql: &[u8], arena: &Arena) -> bool {
 }
 
 /// Set the conflict action of a body statement (the inherited one).
-fn force_conflict(ast: &mut Ast, c: ConflictAction) {
+pub(super) fn force_conflict(ast: &mut Ast, c: ConflictAction) {
     match ast {
         Ast::Insert { conflict, .. } | Ast::Update { conflict, .. } => *conflict = c,
         Ast::With { body, .. } => force_conflict(body, c),
@@ -360,7 +387,7 @@ fn force_conflict(ast: &mut Ast, c: ConflictAction) {
 }
 
 /// A body statement's own conflict action.
-fn ast_conflict(ast: &Ast) -> Option<ConflictAction> {
+pub(super) fn ast_conflict(ast: &Ast) -> Option<ConflictAction> {
     match ast {
         Ast::Insert { conflict, .. } | Ast::Update { conflict, .. } => Some(*conflict),
         Ast::With { body, .. } => ast_conflict(body),
@@ -739,7 +766,7 @@ impl<S: Storage> Connection<S> {
     /// The column names, collations and rowid alias `NEW` / `OLD`
     /// read for a table or view.
     #[allow(clippy::type_complexity)]
-    fn trigger_columns(
+    pub(super) fn trigger_columns(
         &self,
         table: &[u8],
         arena: &Arena,
@@ -972,12 +999,22 @@ impl<S: Storage> Connection<S> {
                 Err(e) => return Err(e),
             }
         }
-        for (a, b) in t.steps.iter() {
+        for (k, (a, b)) in t.steps.iter().enumerate() {
             self.env.pending.set(0);
-            match self
-                .run_step(t.sql.as_slice(), false, *a, *b, bind, orconf)
-                .await
+            // The keys the statement does not look up (`fkey::Sim`).
+            #[cfg(feature = "foreign_keys")]
             {
+                self.fk.next = self.fk.trig_site(t.name.as_slice(), orconf, k);
+            }
+            let r = self
+                .run_step(t.sql.as_slice(), false, *a, *b, bind, orconf)
+                .await;
+            #[cfg(feature = "foreign_keys")]
+            {
+                self.fk.next = [None; 2];
+            }
+            let _ = k;
+            match r {
                 Ok(_) => {}
                 Err(e) if ignore(&e) => return Ok(false),
                 Err(e) => return Err(e),
@@ -1062,7 +1099,12 @@ impl<S: Storage> Connection<S> {
     /// leaves the statement's changes in place. Conservative: what
     /// it cannot tell counts as an abort point (hipp's undo).
     pub(super) fn nest_may_abort(&self, sql: &[u8], arena: &Arena) -> bool {
-        if self.prag.foreign_keys || lexical_may_abort::<S::Error>(sql, arena) {
+        // Without the `foreign_keys` leaf such writes are refused.
+        #[cfg(not(feature = "foreign_keys"))]
+        if self.prag.foreign_keys {
+            return true;
+        }
+        if lexical_may_abort::<S::Error>(sql, arena) {
             return true;
         }
         let Ok(ast) = crate::sql::parser::parse::<S::Error>(sql, arena, self.cfg.limits()) else {
@@ -1072,14 +1114,50 @@ impl<S: Storage> Connection<S> {
             return false;
         };
         let orconf = explicit_conflict::<S::Error>(sql, arena).then_some(top.1);
-        let mut work: AVec<(AVec<u8>, TrigEvent, ConflictAction, bool)> = AVec::new();
-        work.push((copy_vec(handle_bytes(arena, top.0)), top.2, top.1, top.3));
+        let mut work: AVec<Work> = AVec::new();
+        work.push((
+            copy_vec(handle_bytes(arena, top.0)),
+            top.2,
+            top.1,
+            top.3,
+            update_names(&ast, arena),
+            false,
+        ));
         let mut seen: AVec<AVec<u8>> = AVec::new();
+        // The action programs walked (child table, event).
+        #[cfg(feature = "foreign_keys")]
+        let mut acted: AVec<(AVec<u8>, TrigEvent)> = AVec::new();
         let ca = &self.catalog_arena;
-        while let Some((table, event, conflict, upsert)) = work.pop() {
+        while let Some((table, event, conflict, upsert, names, set_null)) = work.pop() {
             if self.table_may_abort(table.as_slice(), event, conflict, upsert) {
                 return true;
             }
+            #[cfg(feature = "foreign_keys")]
+            if self.prag.foreign_keys {
+                let mut follow = AVec::new();
+                let cols = names.as_ref().map(|n| n.as_slice());
+                if self.fk_may_abort(table.as_slice(), event, cols, set_null, &mut follow) {
+                    return true;
+                }
+                for (t, ev, cols, null) in follow.iter() {
+                    if acted
+                        .iter()
+                        .any(|(n, e)| e == ev && eq_ci(n.as_slice(), t.as_slice()))
+                    {
+                        continue;
+                    }
+                    acted.push((t.clone(), *ev));
+                    work.push((
+                        t.clone(),
+                        *ev,
+                        ConflictAction::Abort,
+                        false,
+                        cols.clone(),
+                        *null,
+                    ));
+                }
+            }
+            let _ = (&names, set_null);
             let replace = conflict == ConflictAction::Replace
                 && event != TrigEvent::Delete
                 && self.prag.recursive_triggers;
@@ -1121,6 +1199,8 @@ impl<S: Storage> Connection<S> {
                             ev,
                             orconf.unwrap_or(c),
                             up,
+                            update_names(&ast, arena),
+                            false,
                         ));
                     }
                 }
@@ -1629,8 +1709,9 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// The end of a top-level write whose trigger program failed with
     /// `e`: resolved as the program's failure says (`Resolve`).
-    /// Whether it was such a failure.
-    pub(super) async fn trigger_failed(&mut self, e: &Error<S::Error>) -> bool {
+    /// Whether it was such a failure. A FAIL halt with foreign-key
+    /// violations outstanding becomes their failure (`e` replaced).
+    pub(super) async fn trigger_failed(&mut self, e: &mut Error<S::Error>) -> bool {
         if self.conn.in_trigger() {
             return false;
         }
@@ -1638,13 +1719,18 @@ impl<'c, S: Storage> Statement<'c, S> {
             return false;
         };
         // The pin's FAIL halt still checks the statement's foreign-key
-        // violations (`foreign_keys`): with any, it aborts.
+        // violations (`foreign_keys`): with any, it aborts with their
+        // error (v0.16 review fix: hipp kept the program's own).
         #[cfg(feature = "foreign_keys")]
-        let r = if r == Resolve::Fail && self.fk_end().is_err() {
+        let r = if r == Resolve::Fail
+            && let Err(fe) = self.fk_end()
+        {
+            *e = fe;
             Resolve::Abort
         } else {
             r
         };
+        let e = &*e;
         match r {
             Resolve::Fail => {
                 let committed = if self.conn.explicit_txn {
@@ -1701,21 +1787,21 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Ok(Step::Done);
         }
         if self.ret_loaded {
-            return Ok(self.serve_returning());
+            return self.serve_returning_fk().await;
         }
         let r = self.exec_instead().await;
         match r {
             Ok(()) if self.has_returning() => {
                 self.ret_loaded = true;
                 self.ret_pos = 0;
-                Ok(self.serve_returning())
+                self.serve_returning_fk().await
             }
             Ok(()) => {
                 self.phase = Phase::Done;
                 Ok(Step::Done)
             }
-            Err(e) => {
-                if !self.trigger_failed(&e).await {
+            Err(mut e) => {
+                if !self.trigger_failed(&mut e).await {
                     self.conn.env.finish(false);
                     abort_write!(self, &e);
                 }
@@ -1799,6 +1885,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
         }
+        // The trigger bodies' writes counted foreign-key violations
+        // into the statement (`foreign_keys`): the pin checks them
+        // when the view's statement halts, as for a table's.
+        #[cfg(feature = "foreign_keys")]
+        self.fk_end_commit().await?;
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }

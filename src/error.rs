@@ -341,9 +341,10 @@ pub enum SchemaKind {
     #[cfg(feature = "foreign_keys")]
     ForeignKeyMismatch,
     /// `ALTER TABLE ADD COLUMN` of a REFERENCES column with a
-    /// non-NULL default while `PRAGMA foreign_keys` is ON (v0.16 fix;
-    /// the pin's "Cannot add a REFERENCES column with non-NULL default
-    /// value"). Add it with no default, or with the pragma off.
+    /// non-NULL default to a table with rows while `PRAGMA
+    /// foreign_keys` is ON (v0.16 fix; the pin's "Cannot add a
+    /// REFERENCES column with non-NULL default value"). Add it with
+    /// no default, before the table has rows, or with the pragma off.
     #[cfg(feature = "v16")]
     ReferencesDefault,
     /// CREATE TABLE / INDEX / VIEW of a name starting with

@@ -682,8 +682,11 @@ enum Plan {
         /// The column may be added only while the table has no
         /// rows (v0.16, the pin's `sqlite3ErrorIfNotEmpty`): a
         /// non-constant default, NOT NULL without a default, a
-        /// STORED generated column.
-        empty_only: bool,
+        /// STORED generated column; with `PRAGMA foreign_keys` ON a
+        /// REFERENCES column with a non-NULL default. The error the
+        /// step raises when the table has rows (the first refusal
+        /// the pin emits).
+        empty_only: Option<SchemaKind>,
     },
     /// `CREATE VIEW` (v0.4).
     #[cfg(feature = "v04")]
@@ -1346,6 +1349,8 @@ impl<S: Storage> Connection<S> {
             fk: None,
             #[cfg(feature = "foreign_keys")]
             fk_del: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_skip: [None; 2],
         })
     }
 
@@ -2186,19 +2191,21 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::CannotAddColumn,
                     });
                 }
+                let mut empty_only = None;
                 // v0.16 fix (ungated): with `PRAGMA foreign_keys` ON a
-                // REFERENCES column takes no non-NULL default (the
-                // pin's "Cannot add a REFERENCES column with non-NULL
-                // default value").
+                // REFERENCES column takes no non-NULL default while
+                // the table has rows (the pin's "Cannot add a
+                // REFERENCES column with non-NULL default value",
+                // through `sqlite3ErrorIfNotEmpty` and emitted before
+                // its other such refusals; v0.16 review fix: an empty
+                // table takes the column).
                 #[cfg(feature = "v16")]
                 if self.prag.foreign_keys
                     && (column.default_expr.is_some()
                         || !matches!(literal_owned(arena, column.default), OwnedValue::Null))
                     && def_references::<S::Error>(handle_bytes(arena, *text), arena)
                 {
-                    return Err(Error::Schema {
-                        kind: SchemaKind::ReferencesDefault,
-                    });
+                    empty_only = Some(SchemaKind::ReferencesDefault);
                 }
                 // The pin's other refusals fire only when the table
                 // has rows (`sqlite3ErrorIfNotEmpty`, checked at
@@ -2208,7 +2215,7 @@ impl<S: Storage> Connection<S> {
                 // anywhere, `(1+2)` and CURRENT_TIMESTAMP only to an
                 // empty table (v0.16: they were always refused) —
                 // and NOT NULL with no default or a literal NULL.
-                let mut empty_only = column.generated && column.stored;
+                let mut refuse = column.generated && column.stored;
                 // The new column's value in every existing row.
                 let new_default = match column.default_expr {
                     Some(h) if !column.generated => {
@@ -2223,7 +2230,7 @@ impl<S: Storage> Connection<S> {
                                 Some(&self.env),
                             )?
                         } else {
-                            empty_only = true;
+                            refuse = true;
                             OwnedValue::Null
                         }
                     }
@@ -2234,7 +2241,10 @@ impl<S: Storage> Connection<S> {
                     && column.default_expr.is_none()
                     && matches!(new_default, OwnedValue::Null)
                 {
-                    empty_only = true;
+                    refuse = true;
+                }
+                if refuse && empty_only.is_none() {
+                    empty_only = Some(SchemaKind::CannotAddColumn);
                 }
                 let base = handle_bytes(&self.catalog_arena, t.sql);
                 let pos = add_column_offset::<S::Error>(base, arena)?;
@@ -5019,6 +5029,10 @@ pub struct Statement<'c, S: Storage> {
     /// (all of the table's, as a DELETE's).
     #[cfg(feature = "foreign_keys")]
     fk_del: Option<alloc::rc::Rc<fkey::FkTarget>>,
+    /// The keys whose new rows this write does not look up (the
+    /// pin's `isSetNullAction`; see `fkey::Sim`), loaded with `fk`.
+    #[cfg(feature = "foreign_keys")]
+    fk_skip: fkey::Skip,
 }
 
 /// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
@@ -5696,6 +5710,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             fk: None,
             #[cfg(feature = "foreign_keys")]
             fk_del: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_skip: [None; 2],
         }
     }
 }
@@ -6883,9 +6899,12 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// `changes()` counts the kept rows.
     /// (OR FAIL parses only with UPDATE (v0.5) / INSERT OR (v0.7).)
     #[cfg(feature = "v05")]
-    async fn write_failed(&mut self, e: Error<S::Error>) -> Error<S::Error> {
+    async fn write_failed(
+        &mut self,
+        #[allow(unused_mut)] mut e: Error<S::Error>,
+    ) -> Error<S::Error> {
         #[cfg(feature = "triggers")]
-        if self.trigger_failed(&e).await {
+        if self.trigger_failed(&mut e).await {
             return e;
         }
         let conflict = match &self.plan {
@@ -6980,8 +6999,6 @@ impl<'c, S: Storage> Statement<'c, S> {
         {
             let multi = self.insert_multi();
             self.fk_load(fkey::Event::Insert, multi)?;
-            let replace = self.insert_replaces();
-            self.fk_note_replace(replace);
         }
         #[cfg(feature = "v16")]
         self.autoinc_begin().await?;
@@ -7486,6 +7503,19 @@ impl<'c, S: Storage> Statement<'c, S> {
             let root = *root;
             drop(vals);
             if self.fk_active() {
+                // The pin finds a rowid conflict among the row's
+                // constraints, before its keys: a single-row INSERT
+                // halts on a violated key at once, so the conflict
+                // must win (v0.16 review fix — OR ROLLBACK then ends
+                // the transaction).
+                if btree::seek_rowid(&mut self.conn.pager, root, rowid)
+                    .await?
+                    .is_some()
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::DuplicateRowid,
+                    });
+                }
                 let lrow = self.fk_row(row.as_slice(), rowid, fk_affs.as_slice());
                 self.fk_new_row(lrow.as_slice(), rowid, None, None).await?;
             }
@@ -7957,6 +7987,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         if let Some(g) = gcols {
             g.fill::<S::Error>(orec.as_mut_slice(), crowid, true)?;
         }
+        // The row as stored when it is rewritten (read again after
+        // BEFORE UPDATE triggers); `orec` stays the OLD row.
+        #[allow(unused_mut)]
+        let mut stored = orec.clone();
         // Combined evaluation row: original ++ excluded.
         let orig_rd = row_data_for(rowid_alias, affs, orec.as_slice(), crowid);
         let prop_rd = row_data_for(rowid_alias, affs, row, rowid);
@@ -8017,6 +8051,28 @@ impl<'c, S: Storage> Statement<'c, S> {
             {
                 return Ok(());
             }
+            // Then the row is read again, as an UPDATE's (v0.16 review
+            // fix: the upsert used the row from before its triggers):
+            // gone — deleted by a trigger, or by a foreign-key cascade
+            // one ran — it is skipped; the columns DO UPDATE does not
+            // assign take their current values.
+            let Some(now) = self
+                .reload_write_row(root, defaults.len(), defaults, crowid)
+                .await?
+            else {
+                return Ok(());
+            };
+            for (i, v) in new_rec.as_mut_slice().iter_mut().enumerate() {
+                if !up_assigned.as_slice().get(i).copied().unwrap_or(false) {
+                    *v = now
+                        .rec
+                        .as_slice()
+                        .get(i)
+                        .cloned()
+                        .unwrap_or(OwnedValue::Null);
+                }
+            }
+            stored = now.rec;
         }
         // v0.10 NOT NULL: the DO UPDATE result row is checked
         // with ABORT semantics unconditionally (probed on the
@@ -8113,7 +8169,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.rewrite_stored_row(
             root,
             rowid_alias,
-            orec.as_slice(),
+            stored.as_slice(),
             crowid,
             new_rec.as_slice(),
             new_rowid,
@@ -8194,9 +8250,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                         self.ret_loaded = true;
                         self.ret_pos = 0;
                     }
-                    Err(e) => {
+                    #[allow(unused_mut)]
+                    Err(mut e) => {
                         #[cfg(feature = "triggers")]
-                        if self.trigger_failed(&e).await {
+                        if self.trigger_failed(&mut e).await {
                             return Err(e);
                         }
                         #[cfg(feature = "v16")]
@@ -8214,9 +8271,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.phase = Phase::Done;
                 Ok(Step::Done)
             }
-            Err(e) => {
+            #[allow(unused_mut)]
+            Err(mut e) => {
                 #[cfg(feature = "triggers")]
-                if self.trigger_failed(&e).await {
+                if self.trigger_failed(&mut e).await {
                     return Err(e);
                 }
                 #[cfg(feature = "v16")]
@@ -8442,7 +8500,6 @@ impl<'c, S: Storage> Statement<'c, S> {
             if replace {
                 self.fk_load_victims()?;
             }
-            self.fk_note_replace(replace);
         }
         let mut nn_assigned = AVec::new();
         for (i, f) in not_null.iter().enumerate() {
@@ -11194,7 +11251,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             verify.clone(),
             *empty_only,
         );
-        if empty_only {
+        if let Some(kind) = empty_only {
             let mut cursor = ScanCursor::new(root);
             let mut buf = AVec::new();
             if cursor
@@ -11202,9 +11259,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .await?
                 .is_some()
             {
-                return Err(Error::Schema {
-                    kind: SchemaKind::CannotAddColumn,
-                });
+                return Err(Error::Schema { kind });
             }
         }
         let mut cursor = ScanCursor::new(1);

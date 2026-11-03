@@ -260,3 +260,40 @@ SELECT * FROM c;
 ",
     );
 }
+
+/// Review fixes: writes made by INSTEAD OF trigger bodies are
+/// checked (the view's statement fails, its RETURNING rows withheld
+/// on an immediate key), the rowid conflict wins over the key in a
+/// single-row INSERT OR ROLLBACK (the transaction ends), ADD COLUMN
+/// of a REFERENCES column with a default on an empty table, and a
+/// cascade from a trigger deleting the row an upsert updates.
+#[test]
+fn review_fixes_byte_identical() {
+    same_stdin(
+        "review",
+        "PRAGMA foreign_keys = ON;
+CREATE TABLE p(a PRIMARY KEY, b);
+CREATE TABLE c(id INTEGER PRIMARY KEY, x REFERENCES p ON DELETE CASCADE);
+CREATE VIEW v AS SELECT * FROM c;
+CREATE TRIGGER tv INSTEAD OF INSERT ON v BEGIN INSERT INTO c VALUES (new.id, new.x); END;
+INSERT INTO v VALUES (1, 5) RETURNING id;
+SELECT count(*) FROM c;
+PRAGMA foreign_key_check;
+INSERT INTO p VALUES (1, 0);
+INSERT INTO v VALUES (1, 1) RETURNING id, x;
+BEGIN;
+INSERT INTO p VALUES (2, 0);
+INSERT OR ROLLBACK INTO c VALUES (1, 9);
+INSERT INTO p VALUES (3, 0);
+COMMIT;
+SELECT a FROM p;
+CREATE TABLE e(x REFERENCES p);
+ALTER TABLE e ADD COLUMN z REFERENCES p DEFAULT 1;
+SELECT sql FROM sqlite_schema WHERE name = 'e';
+CREATE TRIGGER tc BEFORE UPDATE ON c BEGIN DELETE FROM p WHERE a = old.x; END;
+INSERT INTO c VALUES (1, 3) ON CONFLICT (id) DO UPDATE SET x = 3;
+SELECT * FROM c;
+SELECT a FROM p;
+",
+    );
+}

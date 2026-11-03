@@ -93,9 +93,15 @@ pub(super) struct FkState {
     /// DROP TABLE's DELETE is about to load its triggers: it fires
     /// none (the pin's `disableTriggers`).
     pub silent: bool,
-    /// The pin's `isSetNullAction` quirk for the top-level write: the
-    /// key whose new rows are not looked up (see `fk_note_replace`).
-    skip: Option<(u32, usize)>,
+    /// The pin's `isSetNullAction` quirk (see `Sim`): the keys the
+    /// top-level write does not look up for its new rows.
+    top: Skip,
+    /// The same for the statements of the programs it runs: (program,
+    /// statement, keys).
+    sites: AVec<(Prog, usize, Skip)>,
+    /// The keys the program statement about to run skips (taken by
+    /// its `fk_load`).
+    pub next: Skip,
     /// DROP TABLE compiled its implicit DELETE: its count is the
     /// drop's `changes()`.
     pub drop_counted: bool,
@@ -131,9 +137,14 @@ impl FkState {
             }
     }
 
-    /// Outstanding transaction violations (the COMMIT check).
+    /// Outstanding transaction violations (the COMMIT check): a
+    /// counter that is not zero — below zero too (the pin's
+    /// `sqlite3VdbeCheckFkDeferred`; v0.16 review fix: a parent row
+    /// matching more children than were counted, an orphan left
+    /// while the pragma was off among them, drives it below zero and
+    /// the pin then fails the commit, where hipp passed it).
     pub(super) fn pending(&self) -> bool {
-        self.deferred.saturating_add(self.deferred_imm) > 0
+        self.deferred.saturating_add(self.deferred_imm) != 0
     }
 
     /// The transaction ended: every counter goes.
@@ -631,6 +642,13 @@ impl<S: Storage> Connection<S> {
         if unusable && required {
             return Err(mismatch());
         }
+        // An UPDATE that changes no key checks none — not even a
+        // self-referencing key (the pin's `sqlite3FkRequired`; v0.16
+        // review fix: hipp checked those, failing an UPDATE of a
+        // non-key column of a row with a missing parent).
+        if matches!(ev, Event::Update(..)) && !required {
+            return Ok(None);
+        }
         if out.child.is_empty() && out.parent.is_empty() {
             return Ok(None);
         }
@@ -665,8 +683,15 @@ impl<S: Storage> Connection<S> {
         {
             self.fk.depth += 1;
         }
+        // The action's UPDATE runs under ABORT and its triggers
+        // inherit that; a CASCADE's DELETE has no conflict action and
+        // its triggers inherit none, as on the pin (v0.16 review fix:
+        // they ran under ABORT, so their INSERT OR IGNORE failed).
         #[cfg(feature = "triggers")]
-        let orconf = self.trig.orconf.replace(ConflictAction::Abort);
+        let orconf = core::mem::replace(
+            &mut self.trig.orconf,
+            (!matches!(ast, Ast::Delete { .. })).then_some(ConflictAction::Abort),
+        );
         let env = (
             self.env.pending.get(),
             self.env.changes.get(),
@@ -946,7 +971,8 @@ fn insert_replaces(plan: &Plan) -> bool {
             }))
 }
 
-/// `Statement::insert_multi` but for triggers.
+/// `Statement::insert_multi` but for triggers (and an upsert's DO
+/// UPDATE: `Connection::upsert_multi`).
 fn insert_plan_multi(plan: &Plan) -> bool {
     match plan {
         Plan::Insert {
@@ -954,7 +980,6 @@ fn insert_plan_multi(plan: &Plan) -> bool {
             rows_r,
             select,
             conflict,
-            upsert,
             returning,
             ..
         } => {
@@ -962,7 +987,6 @@ fn insert_plan_multi(plan: &Plan) -> bool {
                 || rows_v.len() > 1
                 || rows_r.as_ref().is_some_and(|r| r.len() > 1)
                 || *conflict == ConflictAction::Replace
-                || upsert.as_ref().is_some_and(|u| u.do_update)
                 || !returning.is_empty()
         }
         _ => true,
@@ -970,6 +994,68 @@ fn insert_plan_multi(plan: &Plan) -> bool {
 }
 
 impl<S: Storage> Connection<S> {
+    /// Whether an INSERT's upsert DO UPDATE makes it a multi-row
+    /// write: the pin's nested UPDATE opens a statement journal only
+    /// when it fires UPDATE triggers or its assignments change a key
+    /// (`sqlite3FkRequired`; v0.16 review fix: every DO UPDATE
+    /// counted, so a mismatched key it does not change failed it).
+    pub(super) fn upsert_multi(&self, plan: &Plan, table: &[u8], arena: &Arena) -> bool {
+        let Plan::Insert {
+            upsert: Some(up),
+            cols,
+            rowid_alias,
+            ..
+        } = plan
+        else {
+            return false;
+        };
+        if !up.do_update {
+            return false;
+        }
+        let (a, r) = assigned_columns(up.sets.as_slice(), cols.len(), *rowid_alias);
+        #[cfg(feature = "triggers")]
+        {
+            let ca = &self.catalog_arena;
+            let names = self
+                .catalog
+                .find(ca, table)
+                .map(|t| {
+                    let mut v = AVec::new();
+                    for c in t.columns.iter() {
+                        v.push(copy_vec(handle_bytes(ca, c.name)));
+                    }
+                    v
+                })
+                .unwrap_or_default();
+            if self.catalog.triggers_on(ca, table).any(|t| {
+                t.event == crate::sql::ast::TrigEvent::Update
+                    && (t.of_cols.is_empty()
+                        || t.of_cols.iter().any(|c| {
+                            names
+                                .iter()
+                                .position(|n| eq_ci(n.as_slice(), handle_bytes(ca, *c)))
+                                .is_some_and(|i| {
+                                    a.as_slice().get(i).copied().unwrap_or(false)
+                                        || (r && Some(i) == *rowid_alias)
+                                })
+                        }))
+            }) {
+                return true;
+            }
+        }
+        match self.fk_target(table, Event::Update(a.as_slice(), r), true, false, arena) {
+            Ok(Some(tg)) => {
+                !tg.parent.is_empty()
+                    || tg
+                        .child
+                        .iter()
+                        .any(|f| modified(f.ccols.as_slice(), a.as_slice(), r, tg.alias))
+            }
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
     /// Resolve the keys a write will use when it is prepared (the
     /// pin's prepare-time "foreign key mismatch" / "no such table"),
     /// with every action program it compiles — the pin compiles the
@@ -1008,7 +1094,10 @@ impl<S: Storage> Connection<S> {
                     .any(|t| t.event == crate::sql::ast::TrigEvent::Insert);
                 #[cfg(not(feature = "triggers"))]
                 let trig = false;
-                let multi = trig || insert_plan_multi(plan) || self.in_program();
+                let multi = trig
+                    || insert_plan_multi(plan)
+                    || self.in_program()
+                    || self.upsert_multi(plan, name.as_slice(), arena);
                 self.fk_target(name.as_slice(), Event::Insert, multi, false, arena)?;
                 if insert_replaces(plan) {
                     todo.push((name, None));
@@ -1086,6 +1175,659 @@ impl<S: Storage> Connection<S> {
     }
 }
 
+/// A key's identity (`Fk::id`).
+type FkId = (u32, usize);
+
+/// The keys a write's new rows are not looked up for: its own
+/// INSERT / UPDATE, and an INSERT's upsert DO UPDATE.
+pub(super) type Skip = [Option<FkId>; 2];
+
+/// A program the pin compiles for a statement (a `TriggerPrg`): a
+/// trigger, by name and the conflict action its statements inherit
+/// (`None`: their own), or a key's ON DELETE (`false`) / ON UPDATE
+/// (`true`) action.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Prog {
+    #[cfg(feature = "triggers")]
+    Trig(AVec<u8>, Option<ConflictAction>),
+    Act(FkId, bool),
+}
+
+impl FkState {
+    /// The keys statement `k` of program `p` skips.
+    pub(super) fn site(&self, p: &Prog, k: usize) -> Skip {
+        self.sites
+            .iter()
+            .find(|e| e.0 == *p && e.1 == k)
+            .map_or([None; 2], |e| e.2)
+    }
+
+    /// `site` for a trigger program (without a copy of its name).
+    #[cfg(feature = "triggers")]
+    pub(super) fn trig_site(&self, name: &[u8], orconf: Option<ConflictAction>, k: usize) -> Skip {
+        self.sites
+            .iter()
+            .find(|e| {
+                e.1 == k && matches!(&e.0, Prog::Trig(n, o) if n.as_slice() == name && *o == orconf)
+            })
+            .map_or([None; 2], |e| e.2)
+    }
+}
+
+/// The pin's `isSetNullAction`, replayed. When the pin codes a
+/// child row's parent lookup it first asks whether the program
+/// being compiled is that key's ON DELETE / ON UPDATE SET NULL
+/// action — by looking at the program compiled *last* in the whole
+/// top-level statement (its `pTriggerPrg` list head), which may be
+/// one compiled earlier for something else. So a write coded just
+/// after such a program — after a BEFORE trigger, REPLACE deletion
+/// or upsert that compiled it, or in a program after a statement
+/// that did — admits orphans for that key (probed). Each program is
+/// compiled once per statement and conflict action, in the pin's
+/// order: an INSERT's BEFORE triggers, REPLACE deletions (their
+/// DELETE triggers under `recursive_triggers`) or upsert UPDATE, the
+/// lookup, AFTER triggers; an UPDATE's or DELETE's triggers all
+/// first (the pin computes their column masks), REPLACE deletions,
+/// the lookup, the actions; a program's statements in turn.
+#[derive(Default)]
+struct Sim {
+    /// The key whose SET NULL action was compiled last (`None`: the
+    /// last program is none such).
+    head: Option<FkId>,
+    compiled: AVec<Prog>,
+    sites: AVec<(Prog, usize, Skip)>,
+    top: Skip,
+}
+
+impl Sim {
+    /// Compile `p` (whether it was not yet): it becomes the head.
+    fn compile(&mut self, p: &Prog, set_null: Option<FkId>) -> bool {
+        if self.compiled.iter().any(|c| c == p) {
+            return false;
+        }
+        self.compiled.push(p.clone());
+        self.head = set_null;
+        true
+    }
+
+    /// A child-row lookup is coded at `at` (`None`: the top-level
+    /// write; `upsert`: its DO UPDATE's).
+    fn site(&mut self, at: Option<&(Prog, usize)>, upsert: bool) {
+        let Some(k) = self.head else {
+            return;
+        };
+        let set = |s: &mut Skip| {
+            if let Some(x) = s.get_mut(usize::from(upsert)) {
+                *x = Some(k);
+            }
+        };
+        match at {
+            None => set(&mut self.top),
+            Some((p, i)) => {
+                if let Some(e) = self
+                    .sites
+                    .as_mut_slice()
+                    .iter_mut()
+                    .find(|e| e.0 == *p && e.1 == *i)
+                {
+                    set(&mut e.2);
+                } else {
+                    let mut s = [None; 2];
+                    set(&mut s);
+                    self.sites.push((p.clone(), *i, s));
+                }
+            }
+        }
+    }
+}
+
+/// Where a statement being replayed is (`at`: the program statement
+/// it is, `None`: the top-level write) and the conflict action its
+/// triggers inherit (`orconf`: the pin's `onError`, `None` its
+/// OE_Default).
+#[derive(Clone, Copy)]
+struct SimAt<'x> {
+    at: Option<&'x (Prog, usize)>,
+    #[cfg_attr(not(feature = "triggers"), allow(dead_code))]
+    orconf: Option<ConflictAction>,
+}
+
+impl<S: Storage> Connection<S> {
+    /// Whether some key of the schema has a SET NULL action.
+    fn fk_set_null_exists(&self) -> bool {
+        let sc = Arena::new(Scope::Statement, 0, 1 << 20);
+        self.catalog.tables.iter().any(|t| {
+            sc.reset();
+            self.fk_clauses(t, &sc).is_ok_and(|fks| {
+                fks.iter()
+                    .any(|f| f.on_delete == SET_NULL || f.on_update == SET_NULL)
+            })
+        })
+    }
+
+    /// One write statement's compile.
+    fn sim_write(
+        &self,
+        sim: &mut Sim,
+        ast: &Ast,
+        plan: &Plan,
+        w: SimAt<'_>,
+        arena: &Arena,
+        depth: usize,
+    ) -> Result<(), S::Error> {
+        if depth >= self.cfg.max_trigger_depth {
+            return Ok(());
+        }
+        let body = match ast {
+            Ast::With { body, .. } => body.as_ref(),
+            a => a,
+        };
+        match (body, plan) {
+            #[cfg(feature = "triggers")]
+            (
+                Ast::Insert { table, .. } | Ast::Update { table, .. } | Ast::Delete { table, .. },
+                Plan::Instead(ip),
+            ) => {
+                use crate::sql::ast::{TrigEvent, TrigTime};
+                let name = copy_vec(handle_bytes(arena, *table));
+                let cols =
+                    (ip.event == TrigEvent::Update).then_some((ip.assigned.as_slice(), false));
+                let orconf = if ip.event == TrigEvent::Delete {
+                    None
+                } else {
+                    w.orconf
+                };
+                self.sim_triggers(
+                    sim,
+                    name.as_slice(),
+                    &[TrigTime::Instead],
+                    ip.event,
+                    cols,
+                    orconf,
+                    arena,
+                    depth,
+                )?;
+            }
+            (
+                Ast::Insert { table, .. },
+                Plan::Insert {
+                    upsert,
+                    cols,
+                    rowid_alias,
+                    ..
+                },
+            ) => {
+                let name = copy_vec(handle_bytes(arena, *table));
+                #[cfg(feature = "triggers")]
+                self.sim_triggers(
+                    sim,
+                    name.as_slice(),
+                    &[crate::sql::ast::TrigTime::Before],
+                    crate::sql::ast::TrigEvent::Insert,
+                    None,
+                    w.orconf,
+                    arena,
+                    depth,
+                )?;
+                if insert_replaces(plan) {
+                    self.sim_delete(sim, name.as_slice(), true, arena, depth)?;
+                }
+                if let Some(up) = upsert.as_ref().filter(|u| u.do_update) {
+                    let (a, r) = assigned_columns(up.sets.as_slice(), cols.len(), *rowid_alias);
+                    let uw = SimAt {
+                        at: w.at,
+                        orconf: Some(ConflictAction::Abort),
+                    };
+                    self.sim_update(
+                        sim,
+                        name.as_slice(),
+                        (a.as_slice(), r),
+                        false,
+                        uw,
+                        true,
+                        arena,
+                        depth,
+                    )?;
+                }
+                sim.site(w.at, false);
+                #[cfg(feature = "triggers")]
+                self.sim_triggers(
+                    sim,
+                    name.as_slice(),
+                    &[crate::sql::ast::TrigTime::After],
+                    crate::sql::ast::TrigEvent::Insert,
+                    None,
+                    w.orconf,
+                    arena,
+                    depth,
+                )?;
+            }
+            (
+                Ast::Update { table, .. },
+                Plan::Update {
+                    sets,
+                    ncols,
+                    rowid_alias,
+                    conflict,
+                    ..
+                },
+            ) => {
+                let name = copy_vec(handle_bytes(arena, *table));
+                let (a, r) = assigned_columns(sets.as_slice(), *ncols, *rowid_alias);
+                let tg = if *conflict == ConflictAction::Replace {
+                    self.fk_target(
+                        name.as_slice(),
+                        Event::Update(a.as_slice(), r),
+                        true,
+                        false,
+                        arena,
+                    )?
+                } else {
+                    None
+                };
+                let replaces = update_replaces(plan, tg.as_deref(), a.as_slice(), r);
+                self.sim_update(
+                    sim,
+                    name.as_slice(),
+                    (a.as_slice(), r),
+                    replaces,
+                    w,
+                    false,
+                    arena,
+                    depth,
+                )?;
+            }
+            (Ast::Delete { table, .. }, Plan::Delete { .. }) => {
+                let name = copy_vec(handle_bytes(arena, *table));
+                self.sim_delete(sim, name.as_slice(), false, arena, depth)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A row deletion's compile (`replace`: a REPLACE conflict's,
+    /// which compiles DELETE triggers only under
+    /// `recursive_triggers`, inheriting REPLACE; a DELETE statement's
+    /// inherit nothing).
+    fn sim_delete(
+        &self,
+        sim: &mut Sim,
+        name: &[u8],
+        replace: bool,
+        arena: &Arena,
+        depth: usize,
+    ) -> Result<(), S::Error> {
+        #[cfg(feature = "triggers")]
+        if !replace || self.prag.recursive_triggers {
+            use crate::sql::ast::{TrigEvent, TrigTime};
+            self.sim_triggers(
+                sim,
+                name,
+                &[TrigTime::Before, TrigTime::After],
+                TrigEvent::Delete,
+                None,
+                replace.then_some(ConflictAction::Replace),
+                arena,
+                depth,
+            )?;
+        }
+        let _ = replace;
+        self.sim_actions(sim, name, None, arena, depth)
+    }
+
+    /// An UPDATE's compile (`replaces`: it codes REPLACE deletions;
+    /// `upsert`: it is an upsert's DO UPDATE).
+    #[allow(clippy::too_many_arguments)]
+    fn sim_update(
+        &self,
+        sim: &mut Sim,
+        name: &[u8],
+        cols: (&[bool], bool),
+        replaces: bool,
+        w: SimAt<'_>,
+        upsert: bool,
+        arena: &Arena,
+        depth: usize,
+    ) -> Result<(), S::Error> {
+        #[cfg(feature = "triggers")]
+        {
+            use crate::sql::ast::{TrigEvent, TrigTime};
+            self.sim_triggers(
+                sim,
+                name,
+                &[TrigTime::Before, TrigTime::After],
+                TrigEvent::Update,
+                Some(cols),
+                w.orconf,
+                arena,
+                depth,
+            )?;
+        }
+        if replaces {
+            self.sim_delete(sim, name, true, arena, depth)?;
+        }
+        sim.site(w.at, upsert);
+        self.sim_actions(sim, name, Some(cols), arena, depth)
+    }
+
+    /// The action programs of a change to parent table `name`
+    /// (`cols`: an UPDATE's; `None`: a DELETE): each runs its
+    /// statement under ABORT — a CASCADE's DELETE inherits nothing.
+    fn sim_actions(
+        &self,
+        sim: &mut Sim,
+        name: &[u8],
+        cols: Option<(&[bool], bool)>,
+        arena: &Arena,
+        depth: usize,
+    ) -> Result<(), S::Error> {
+        let ev = match cols {
+            Some((a, r)) => Event::Update(a, r),
+            None => Event::Delete,
+        };
+        let Some(tg) = self.fk_target(name, ev, true, false, arena)? else {
+            return Ok(());
+        };
+        let upd = cols.is_some();
+        for f in tg.parent.iter() {
+            let act = if upd { f.on_update } else { f.on_delete };
+            if act == 0 || (act == RESTRICT && self.fk.defer) {
+                continue;
+            }
+            let p = Prog::Act(f.id, upd);
+            if !sim.compile(&p, (act == SET_NULL).then_some(f.id)) || act == RESTRICT {
+                continue;
+            }
+            let at = (p, 0);
+            let child = f.child.name.as_slice();
+            if act == CASCADE && !upd {
+                self.sim_delete(sim, child, false, arena, depth + 1)?;
+            } else {
+                let mut a = AVec::new();
+                for i in 0..f.child.ncols {
+                    a.push(f.ccols.as_slice().contains(&i));
+                }
+                let r = f.ccols.iter().any(|c| Some(*c) == f.child.alias);
+                let w = SimAt {
+                    at: Some(&at),
+                    orconf: Some(ConflictAction::Abort),
+                };
+                self.sim_update(
+                    sim,
+                    child,
+                    (a.as_slice(), r),
+                    false,
+                    w,
+                    false,
+                    arena,
+                    depth + 1,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The trigger programs on `table` at `times` for `event`
+    /// (`cols`: an UPDATE's assigned columns, for `UPDATE OF`), in
+    /// the table's trigger-list order, each with its statements
+    /// (`orconf`: what they inherit).
+    #[cfg(feature = "triggers")]
+    #[allow(clippy::too_many_arguments)]
+    fn sim_triggers(
+        &self,
+        sim: &mut Sim,
+        table: &[u8],
+        times: &[crate::sql::ast::TrigTime],
+        event: crate::sql::ast::TrigEvent,
+        cols: Option<(&[bool], bool)>,
+        orconf: Option<ConflictAction>,
+        arena: &Arena,
+        depth: usize,
+    ) -> Result<(), S::Error> {
+        use crate::sql::ast::TrigEvent;
+        let ca = &self.catalog_arena;
+        if self.catalog.triggers_on(ca, table).next().is_none() {
+            return Ok(());
+        }
+        let (names, colls, alias, view) = self.trigger_columns(table, arena)?;
+        let mut nulls = AVec::new();
+        for _ in names.iter() {
+            nulls.push(OwnedValue::Null);
+        }
+        let row = crate::sql::trig::RowRef {
+            vals: nulls.as_slice(),
+            rowid: 0,
+        };
+        let bind = crate::sql::trig::Binding {
+            names: names.as_slice(),
+            colls: colls.as_slice(),
+            alias,
+            view,
+            new: (event != TrigEvent::Delete).then_some(row),
+            old: (event != TrigEvent::Insert).then_some(row),
+        };
+        let mut trigs: AVec<&crate::schema::TriggerDef> = AVec::new();
+        for t in self.catalog.triggers_on(ca, table) {
+            trigs.push(t);
+        }
+        // The list order: the most recently created first.
+        for t in trigs.iter().rev() {
+            if !times.contains(&t.time) || t.event != event {
+                continue;
+            }
+            if let Some((a, r)) = cols
+                && !t.of_cols.is_empty()
+                && !t.of_cols.iter().any(|c| {
+                    let c = handle_bytes(ca, *c);
+                    names
+                        .iter()
+                        .position(|n| eq_ci(n.as_slice(), c))
+                        .is_some_and(|i| {
+                            a.get(i).copied().unwrap_or(false) || (r && Some(i) == alias)
+                        })
+                })
+            {
+                continue;
+            }
+            let p = Prog::Trig(copy_vec(handle_bytes(ca, t.name)), orconf);
+            if !sim.compile(&p, None) {
+                continue;
+            }
+            let sql = handle_bytes(ca, t.sql);
+            for (k, (a, b)) in t.steps.iter().enumerate() {
+                let ckpt = arena.checkpoint();
+                let text = sql.get(*a..*b).unwrap_or(&[]);
+                let planned = (|| -> Result<(Ast, Plan), S::Error> {
+                    let mut ast = crate::sql::parser::parse_trigger_step::<S::Error>(
+                        text,
+                        arena,
+                        self.cfg.limits(),
+                    )?;
+                    crate::sql::trig::bind_trigger::<S::Error>(&mut ast, &bind, arena)?;
+                    if let Some(c) = orconf {
+                        trigger::force_conflict(&mut ast, c);
+                    }
+                    let plan = self.plan_inner(arena, &ast)?;
+                    Ok((ast, plan))
+                })();
+                // A statement that does not plan compiles nothing
+                // (it fails when it runs). Its triggers inherit the
+                // program's conflict action, else its own clause.
+                let r = match planned {
+                    Ok((ast, plan)) => {
+                        let inherit = if orconf.is_some()
+                            || trigger::explicit_conflict::<S::Error>(text, arena)
+                        {
+                            trigger::ast_conflict(&ast)
+                        } else {
+                            None
+                        };
+                        let at = (p.clone(), k);
+                        let w = SimAt {
+                            at: Some(&at),
+                            orconf: inherit,
+                        };
+                        self.sim_write(sim, &ast, &plan, w, arena, depth + 1)
+                    }
+                    Err(_) => Ok(()),
+                };
+                arena.rewind(ckpt);
+                r?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A write `fk_may_abort` adds to the nest it walks: an action
+/// program's (table, event, an UPDATE's assigned column names,
+/// whether it is a SET NULL's — that key's lookup is not coded,
+/// the pin's `isSetNullAction`).
+#[cfg(feature = "triggers")]
+pub(super) type FkFollow = (
+    AVec<u8>,
+    crate::sql::ast::TrigEvent,
+    Option<AVec<AVec<u8>>>,
+    bool,
+);
+
+#[cfg(feature = "triggers")]
+impl<S: Storage> Connection<S> {
+    /// Whether a write of `table` (`event`; `assigned`: an UPDATE's
+    /// column names) holds a foreign-key *abort point*
+    /// (`nest_may_abort`): the pin's `sqlite3MayAbort` is coded for
+    /// an immediate key's child lookup of a row added (INSERT, an
+    /// UPDATE changing it), for an immediate key's parent row removed
+    /// unless its action is CASCADE / SET NULL, and for a RESTRICT
+    /// action program — and only when the write requires foreign
+    /// keys at all (an UPDATE changing no key does not). The action
+    /// programs' writes go to `follow` (probed; v0.16 review fix:
+    /// any key counted). Conservative where hipp cannot read a
+    /// table's keys.
+    pub(super) fn fk_may_abort(
+        &self,
+        table: &[u8],
+        event: crate::sql::ast::TrigEvent,
+        assigned: Option<&[AVec<u8>]>,
+        set_null: bool,
+        follow: &mut AVec<FkFollow>,
+    ) -> bool {
+        use crate::sql::ast::TrigEvent;
+        let ca = &self.catalog_arena;
+        let Some(t) = self.catalog.find(ca, table) else {
+            return false;
+        };
+        let sc = Arena::new(Scope::Statement, 0, 1 << 20);
+        let names_hit = |hs: &[crate::arena::ABytes], sc: &Arena| {
+            assigned.is_none_or(|a| {
+                hs.iter()
+                    .any(|h| a.iter().any(|n| eq_ci(n.as_slice(), handle_bytes(sc, *h))))
+            })
+        };
+        // The parent columns a key names: as written, else the
+        // table's PRIMARY KEY (its rowid alias, or a PRIMARY KEY set).
+        let pk_names = |sc: &Arena| -> AVec<crate::arena::ABytes> {
+            let mut out = AVec::new();
+            for (i, c) in t.columns.iter().enumerate() {
+                if (Some(i) == t.rowid_alias
+                    || t.auto_sets
+                        .iter()
+                        .any(|s| s.primary_key && s.columns.iter().any(|k| k.col == Some(i))))
+                    && let Ok(h) = sc.alloc_copy_handle(handle_bytes(ca, c.name))
+                {
+                    out.push(h);
+                }
+            }
+            out
+        };
+        let Ok(own) = self.fk_clauses(t, &sc) else {
+            return true;
+        };
+        // (child table, its key) for every key naming `table`.
+        let mut refs: AVec<(AVec<u8>, crate::sql::ast::ForeignKey)> = AVec::new();
+        for c in self.catalog.tables.iter() {
+            let Ok(fks) = self.fk_clauses(c, &sc) else {
+                return true;
+            };
+            for f in fks.iter() {
+                if eq_ci(handle_bytes(&sc, f.table), table) {
+                    refs.push((copy_vec(handle_bytes(ca, c.name)), f.clone()));
+                }
+            }
+        }
+        let parent_mod = |f: &crate::sql::ast::ForeignKey| {
+            if f.to.is_empty() {
+                names_hit(pk_names(&sc).as_slice(), &sc)
+            } else {
+                names_hit(f.to.as_slice(), &sc)
+            }
+        };
+        if event == TrigEvent::Update {
+            let required = own.iter().any(|f| names_hit(f.from.as_slice(), &sc))
+                || refs.iter().any(|(_, f)| parent_mod(f));
+            if !required {
+                return false;
+            }
+        }
+        // A SET NULL program's own key (its columns are exactly the
+        // ones assigned).
+        let own_null = |f: &crate::sql::ast::ForeignKey| {
+            set_null
+                && assigned.is_some_and(|a| {
+                    a.len() == f.from.len()
+                        && a.iter()
+                            .zip(f.from.iter())
+                            .all(|(n, h)| eq_ci(n.as_slice(), handle_bytes(&sc, *h)))
+                })
+        };
+        if event != TrigEvent::Delete
+            && own.iter().any(|f| {
+                !f.deferred
+                    && !own_null(f)
+                    && (event == TrigEvent::Insert
+                        || eq_ci(handle_bytes(&sc, f.table), table)
+                        || names_hit(f.from.as_slice(), &sc))
+            })
+        {
+            return true;
+        }
+        if event == TrigEvent::Insert {
+            return false;
+        }
+        for (child, f) in refs.iter() {
+            if event == TrigEvent::Update && !parent_mod(f) {
+                continue;
+            }
+            let act = if event == TrigEvent::Update {
+                f.on_update
+            } else {
+                f.on_delete
+            };
+            if (!f.deferred && act != CASCADE && act != SET_NULL)
+                || (act == RESTRICT && !self.fk.defer)
+            {
+                return true;
+            }
+            if act == CASCADE && event == TrigEvent::Delete {
+                follow.push((child.clone(), TrigEvent::Delete, None, false));
+            } else if act == CASCADE || act == SET_NULL || act == SET_DEFAULT {
+                let mut cols = AVec::new();
+                for h in f.from.iter() {
+                    cols.push(copy_vec(handle_bytes(&sc, *h)));
+                }
+                follow.push((
+                    child.clone(),
+                    TrigEvent::Update,
+                    Some(cols),
+                    act == SET_NULL,
+                ));
+            }
+        }
+        false
+    }
+}
+
 /// An `OLD.` / `NEW.` value of an action program: no comparison
 /// affinity and the parent column's collation; the INTEGER PRIMARY
 /// KEY reads as the rowid (INTEGER affinity, no collation).
@@ -1147,6 +1889,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         // DROP TABLE's DELETE (its first load only: the action
         // programs it runs check as any statement does).
         let ignore = core::mem::take(&mut self.conn.fk.ignore);
+        self.fk_skip = if self.conn.in_program() {
+            core::mem::take(&mut self.conn.fk.next)
+        } else {
+            self.conn.fk.top
+        };
         self.fk = self
             .conn
             .fk_target(name.as_slice(), ev, multi, ignore, &self.arena)?;
@@ -1168,70 +1915,6 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.conn
                 .fk_target(name.as_slice(), Event::Delete, true, false, &self.arena)?;
         Ok(())
-    }
-
-    /// A top-level INSERT / UPDATE whose REPLACE conflicts may delete
-    /// rows (`replace`): the pin compiles those deletions' ON DELETE
-    /// action programs before it looks up the new row's parents,
-    /// and its `isSetNullAction` then mistakes the last one compiled
-    /// for the program running — when that is a self-referencing
-    /// key's SET NULL, the new rows' lookups of that key are skipped
-    /// (probed: `INSERT OR REPLACE INTO t VALUES (1, 99)` over
-    /// `t(id INTEGER PRIMARY KEY, par REFERENCES t ON DELETE SET
-    /// NULL)` succeeds with 99 missing).
-    pub(super) fn fk_note_replace(&mut self, replace: bool) {
-        if self.conn.in_program() {
-            return;
-        }
-        self.conn.fk.skip = None;
-        if !replace {
-            return;
-        }
-        let Some(tg) = self.fk_del.clone().or_else(|| self.fk.clone()) else {
-            return;
-        };
-        let defer = self.conn.fk.defer;
-        let last = tg
-            .parent
-            .iter()
-            .rev()
-            .find(|f| f.on_delete != 0 && !(f.on_delete == RESTRICT && defer));
-        let Some(f) = last.filter(|f| f.selfref && f.on_delete == SET_NULL) else {
-            return;
-        };
-        // Compiling that program compiles programs of its own — the
-        // table's UPDATE triggers on those columns, ON UPDATE actions
-        // of keys on them — which come last instead.
-        let nested_action = tg.parent.iter().any(|g| {
-            g.on_update != 0
-                && !(g.on_update == RESTRICT && defer)
-                && g.pcols.iter().any(|c| f.ccols.as_slice().contains(c))
-        });
-        #[cfg(feature = "triggers")]
-        let nested_trigger = {
-            let ca = &self.conn.catalog_arena;
-            let mut names: AVec<&[u8]> = AVec::new();
-            for c in f.ccols.iter() {
-                if let Some(n) = f.child.names.as_slice().get(*c) {
-                    names.push(n.as_slice());
-                }
-            }
-            self.conn
-                .catalog
-                .triggers_on(ca, f.child.name.as_slice())
-                .any(|t| {
-                    t.event == crate::sql::ast::TrigEvent::Update
-                        && (t.of_cols.is_empty()
-                            || t.of_cols
-                                .iter()
-                                .any(|h| names.iter().any(|n| eq_ci(handle_bytes(ca, *h), n))))
-                })
-        };
-        #[cfg(not(feature = "triggers"))]
-        let nested_trigger = false;
-        if !nested_action && !nested_trigger {
-            self.conn.fk.skip = Some(f.id);
-        }
     }
 
     /// Whether an UPDATE OR REPLACE compiles REPLACE deletions (see
@@ -1259,7 +1942,23 @@ impl<'c, S: Storage> Statement<'c, S> {
                 return true;
             }
         }
-        insert_plan_multi(&self.plan)
+        if insert_plan_multi(&self.plan) {
+            return true;
+        }
+        let body = match &self.ast {
+            Ast::With { body, .. } => body.as_ref(),
+            a => a,
+        };
+        let Ast::Insert { table, .. } = body else {
+            return true;
+        };
+        let name = copy_vec(handle_bytes(&self.arena, *table));
+        let ckpt = self.arena.checkpoint();
+        let m = self
+            .conn
+            .upsert_multi(&self.plan, name.as_slice(), &self.arena);
+        self.arena.rewind(ckpt);
+        m
     }
 
     /// The write plan's column affinities.
@@ -1275,12 +1974,6 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Update { affs, .. } | Plan::Delete { affs, .. } => affs.clone(),
             _ => AVec::new(),
         }
-    }
-
-    /// Whether an INSERT OR REPLACE compiles REPLACE deletions (see
-    /// `insert_replaces`).
-    pub(super) fn insert_replaces(&self) -> bool {
-        insert_replaces(&self.plan)
     }
 
     /// The logical row of the written table (the rowid alias reads
@@ -1311,11 +2004,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         let Some(tg) = self.fk.clone() else {
             return Ok(());
         };
-        let skip = if self.conn.in_program() {
-            None
-        } else {
-            self.conn.fk.skip
-        };
+        // An upsert's DO UPDATE is a site of its own (`Skip`).
+        let upsert = changed.is_some() && matches!(self.plan, Plan::Insert { .. });
+        let skip = self.fk_skip[usize::from(upsert)];
         for f in tg.child.iter() {
             if !Self::fk_child_changes(&tg, f, changed) || skip == Some(f.id) {
                 continue;
@@ -1627,7 +2318,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.conn.cfg.stmt_max,
             );
             let ast = Self::fk_action_ast(f, p, act, oldv.as_slice(), new, &arena)?;
-            self.conn.fk_program(arena, ast).await?;
+            self.conn.fk.next = self.conn.fk.site(&Prog::Act(f.id, new.is_some()), 0);
+            let r = self.conn.fk_program(arena, ast).await;
+            self.conn.fk.next = [None; 2];
+            r?;
         }
         Ok(())
     }
@@ -1723,7 +2417,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.conn.in_program() {
             return Ok(());
         }
-        if self.conn.fk.stmt > 0 || (!self.conn.explicit_txn && self.conn.fk.pending()) {
+        // Not zero, as `pending` (the pin's
+        // `sqlite3VdbeCheckFkImmediate`).
+        if self.conn.fk.stmt != 0 || (!self.conn.explicit_txn && self.conn.fk.pending()) {
             return Err(violation());
         }
         Ok(())
@@ -1735,7 +2431,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     pub(super) async fn fk_end_commit(&mut self) -> Result<(), S::Error> {
         if !self.conn.in_program()
             && !self.conn.explicit_txn
-            && self.conn.fk.stmt <= 0
+            && self.conn.fk.stmt == 0
             && self.conn.fk.pending()
             && self.has_returning()
         {
@@ -1761,7 +2457,50 @@ impl<'c, S: Storage> Statement<'c, S> {
         st.abort = false;
         st.multi = false;
         st.late = false;
-        st.skip = None;
+        st.top = [None; 2];
+        st.sites.clear();
+        st.next = [None; 2];
+        self.fk_sim();
+    }
+
+    /// Replay the pin's compile of this top-level write (`Sim`) when
+    /// some key has a SET NULL action — no other key is ever skipped.
+    fn fk_sim(&mut self) {
+        let write = match &self.plan {
+            Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => true,
+            #[cfg(feature = "triggers")]
+            Plan::Instead(_) => true,
+            _ => false,
+        };
+        if !write || !self.conn.prag.foreign_keys || !self.conn.fk_set_null_exists() {
+            return;
+        }
+        // The statement's arena holds its AST; what the replay plans
+        // goes after it and is dropped.
+        let ckpt = self.arena.checkpoint();
+        let mut sim = Sim::default();
+        // The pin's `onError` of the statement: its explicit conflict
+        // clause (a DELETE has none).
+        #[cfg(feature = "triggers")]
+        let orconf = if trigger::explicit_conflict::<S::Error>(
+            handle_bytes(&self.arena, self.sql_text),
+            &self.arena,
+        ) {
+            trigger::ast_conflict(&self.ast)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "triggers"))]
+        let orconf = None;
+        let w = SimAt { at: None, orconf };
+        let r = self
+            .conn
+            .sim_write(&mut sim, &self.ast, &self.plan, w, &self.arena, 0);
+        self.arena.rewind(ckpt);
+        if r.is_ok() {
+            self.conn.fk.top = sim.top;
+            self.conn.fk.sites = sim.sites;
+        }
     }
 
     /// A top-level statement's step ended (`failed`; `was_txn`: a
@@ -1770,7 +2509,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.conn.in_program() {
             return;
         }
-        let touches = self.touches_db();
+        let touches = self.touches_db(failed);
         let st = &mut self.conn.fk;
         if failed && !st.kept {
             st.deferred = st.start.0;
@@ -1789,15 +2528,62 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// Whether the statement opens a transaction on the pin (reads
     /// or writes the file): pragmas and table-less queries do not.
-    fn touches_db(&self) -> bool {
+    fn touches_db(&self, failed: bool) -> bool {
         match &self.plan {
-            Plan::Pragma(_) => false,
+            // A pragma whose program reads the file does (probed on
+            // the pin with the schema loaded; v0.16 review fix: no
+            // pragma counted): the header and schema readers
+            // (table_info, index_list, integrity_check, user_version,
+            // page_count, journal_mode, ...) — not the flags, nor
+            // encoding, cache_size, auto_vacuum, synchronous;
+            // foreign_key_check / foreign_key_list only when a table
+            // they read has foreign keys. A pragma that failed never
+            // ran (its errors are the pin's prepare errors).
+            Plan::Pragma(p)
+                if matches!(
+                    p.prag,
+                    Some(pragma::Prag::ForeignKeyCheck | pragma::Prag::ForeignKeyList)
+                ) =>
+            {
+                !failed && self.pragma_reads_keys(p.arg.as_ref().map(|a| a.as_slice()))
+            }
+            Plan::Pragma(_) if failed => false,
+            Plan::Pragma(p) => !matches!(
+                p.prag,
+                None | Some(
+                    pragma::Prag::AutoVacuum
+                        | pragma::Prag::BusyTimeout
+                        | pragma::Prag::CacheSize
+                        | pragma::Prag::CaseSensitiveLike
+                        | pragma::Prag::CollationList
+                        | pragma::Prag::DatabaseList
+                        | pragma::Prag::DeferForeignKeys
+                        | pragma::Prag::Encoding
+                        | pragma::Prag::ForeignKeys
+                        | pragma::Prag::IgnoreCheckConstraints
+                        | pragma::Prag::PageSize
+                        | pragma::Prag::RecursiveTriggers
+                        | pragma::Prag::Synchronous
+                )
+            ),
             Plan::Query(_) => match &self.ast {
                 Ast::Select(s) => !s.from.is_empty(),
                 _ => true,
             },
             _ => true,
         }
+    }
+
+    /// Whether `foreign_key_check` / `foreign_key_list` of `table`
+    /// (`None`: every table) reads a table with foreign keys.
+    fn pragma_reads_keys(&self, table: Option<&[u8]>) -> bool {
+        let ca = &self.conn.catalog_arena;
+        let sc = Arena::new(Scope::Statement, 0, 1 << 20);
+        self.conn.catalog.tables.iter().any(|t| {
+            sc.reset();
+            table.is_none_or(|n| eq_ci(handle_bytes(ca, t.name), n))
+                && self.conn.fk_clauses(t, &sc).is_ok_and(|f| !f.is_empty())
+        })
     }
 
     /// DROP TABLE of `name` with foreign keys on: the pin's implicit

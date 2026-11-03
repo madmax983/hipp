@@ -1011,6 +1011,454 @@ fn files_interoperate() {
     });
 }
 
+/// Review fixes (each a bug found in review of the first cut).
+#[test]
+fn review_fixes() {
+    // A single-row INSERT that both repeats a rowid and violates an
+    // immediate key fails on the rowid, as on the pin: its OR
+    // ROLLBACK then ends the transaction (hipp failed on the key and
+    // kept the transaction open).
+    big(|| {
+        for verb in [
+            "INSERT",
+            "INSERT OR ABORT",
+            "INSERT OR ROLLBACK",
+            "INSERT OR FAIL",
+        ] {
+            let kinds = same(
+                "rev-rowid",
+                &lines(&format!(
+                    "PRAGMA foreign_keys = ON
+                    CREATE TABLE p(a PRIMARY KEY)
+                    CREATE TABLE c(id INTEGER PRIMARY KEY, x REFERENCES p, u UNIQUE)
+                    INSERT INTO p VALUES (1)
+                    INSERT INTO c VALUES (1, 1, 1)
+                    BEGIN
+                    INSERT INTO p VALUES (2)
+                    {verb} INTO c VALUES (1, 5, 7)
+                    INSERT INTO p VALUES (3)
+                    COMMIT
+                    BEGIN
+                    INSERT INTO p VALUES (4)
+                    {verb} INTO c VALUES (2, 5, 1)
+                    COMMIT
+                    {verb} INTO c VALUES (3, 5, 9)
+                    SELECT * FROM p
+                    SELECT * FROM c"
+                )),
+            );
+            assert!(
+                kinds
+                    .iter()
+                    .any(|k| k.starts_with("8: ") && k.contains("DuplicateRowid")),
+                "{verb}: {kinds:?}"
+            );
+            assert!(
+                kinds
+                    .iter()
+                    .any(|k| k.starts_with("15: ") && k.contains("ForeignKeyViolation")),
+                "{verb}: {kinds:?}"
+            );
+        }
+    });
+    // ADD COLUMN of a REFERENCES column with a non-NULL default is
+    // refused only when the table has rows (the pin's
+    // `sqlite3ErrorIfNotEmpty`).
+    run_same(
+        "rev-add-column",
+        "PRAGMA foreign_keys = ON
+        CREATE TABLE p(a PRIMARY KEY)
+        CREATE TABLE c(x REFERENCES p)
+        ALTER TABLE c ADD COLUMN z REFERENCES p DEFAULT 1
+        SELECT sql FROM sqlite_schema WHERE name = 'c'
+        INSERT INTO c(x) VALUES (NULL)
+        INSERT INTO p VALUES (1)
+        INSERT INTO c(x) VALUES (NULL)
+        ALTER TABLE c ADD COLUMN w REFERENCES p DEFAULT 1
+        ALTER TABLE c ADD COLUMN w REFERENCES p DEFAULT (1 + 1)
+        ALTER TABLE c ADD COLUMN w NOT NULL REFERENCES p DEFAULT 2
+        ALTER TABLE c ADD COLUMN w REFERENCES p
+        DELETE FROM c
+        ALTER TABLE c ADD COLUMN v REFERENCES p DEFAULT 2
+        ALTER TABLE c ADD COLUMN u REFERENCES p DEFAULT (1 + 1)
+        SELECT sql FROM sqlite_schema WHERE name = 'c'
+        INSERT INTO c(x) VALUES (1)
+        SELECT * FROM c",
+    );
+    // A counter below zero fails as one above it: a parent row that
+    // matches more children than were counted — orphans left while
+    // the pragma was off — fails the commit (and the statement, for
+    // an immediate key), as on the pin (found by the corpus).
+    run_same(
+        "rev-negative",
+        "CREATE TABLE p(a UNIQUE, b)
+        CREATE TABLE c0(x REFERENCES p(a) DEFERRABLE INITIALLY DEFERRED, n)
+        CREATE TABLE c1(x REFERENCES p(a), n)
+        INSERT INTO c0 VALUES (1, 0), (1, 0)
+        INSERT INTO c1 VALUES (1, 0), (1, 0)
+        PRAGMA foreign_keys = ON
+        BEGIN
+        INSERT INTO c0 VALUES (5, 0)
+        INSERT INTO p VALUES (1, 0)
+        SAVEPOINT s
+        RELEASE s
+        COMMIT
+        ROLLBACK
+        SAVEPOINT a
+        INSERT INTO c0 VALUES (5, 0)
+        INSERT INTO p VALUES (1, 0)
+        RELEASE a
+        ROLLBACK
+        BEGIN
+        INSERT INTO c0 VALUES (1, 0)
+        INSERT INTO p VALUES (1, 0)
+        COMMIT
+        ROLLBACK
+        BEGIN
+        INSERT INTO c0 VALUES (5, 0)
+        INSERT INTO c0 VALUES (1, 0)
+        INSERT INTO p VALUES (1, 0)
+        COMMIT
+        INSERT INTO c1 VALUES (5, 0), (6, 0)
+        INSERT INTO p VALUES (9, 0), (1, 0)
+        SELECT * FROM p
+        SELECT * FROM c0",
+    );
+    #[cfg(feature = "triggers")]
+    run_same(
+        "rev-negative-stmt",
+        "CREATE TABLE p(a UNIQUE, b)
+        CREATE TABLE c0(x REFERENCES p(a), n)
+        CREATE TABLE d(z)
+        CREATE TRIGGER t AFTER INSERT ON d BEGIN INSERT INTO c0 VALUES (5, 0); INSERT INTO p VALUES (new.z, 0); END
+        INSERT INTO c0 VALUES (1, 0), (1, 0), (2, 0)
+        PRAGMA foreign_keys = ON
+        INSERT INTO d VALUES (1)
+        INSERT INTO d VALUES (2)
+        SELECT * FROM c0
+        SELECT * FROM p",
+    );
+    // An UPDATE changing no key checks none, not even a
+    // self-referencing one; pragmas that read the file end the
+    // autocommit transaction and so clear `defer_foreign_keys`
+    // (found by the corpus).
+    run_same(
+        "rev-update-nokey",
+        "PRAGMA foreign_keys = ON
+        CREATE TABLE s(id INTEGER PRIMARY KEY, par REFERENCES s ON DELETE SET NULL, v)
+        REPLACE INTO s VALUES (1, 2, 3)
+        UPDATE OR IGNORE s SET v = 3 WHERE rowid % 2 = 1
+        UPDATE s SET v = 4
+        UPDATE s SET par = 2
+        UPDATE s SET par = 5
+        SELECT * FROM s",
+    );
+    run_same(
+        "rev-defer-pragmas",
+        "PRAGMA foreign_keys = ON
+        CREATE TABLE p(a INTEGER PRIMARY KEY, b)
+        CREATE TABLE c1(id INTEGER PRIMARY KEY, x REFERENCES p(a), y)
+        PRAGMA defer_foreign_keys = ON
+        PRAGMA integrity_check
+        PRAGMA defer_foreign_keys
+        BEGIN
+        INSERT OR IGNORE INTO c1 VALUES (1, 1, 2)
+        COMMIT
+        PRAGMA defer_foreign_keys = ON
+        PRAGMA foreign_key_check(p)
+        PRAGMA foreign_key_list(p)
+        PRAGMA defer_foreign_keys
+        PRAGMA foreign_key_check(c1)
+        PRAGMA defer_foreign_keys
+        PRAGMA defer_foreign_keys = ON
+        PRAGMA foreign_key_list(c1)
+        PRAGMA defer_foreign_keys
+        PRAGMA defer_foreign_keys = ON
+        PRAGMA encoding
+        PRAGMA synchronous
+        PRAGMA defer_foreign_keys
+        PRAGMA defer_foreign_keys = ON
+        PRAGMA table_info(c1)
+        PRAGMA defer_foreign_keys
+        PRAGMA defer_foreign_keys = ON
+        PRAGMA user_version
+        PRAGMA defer_foreign_keys
+        PRAGMA defer_foreign_keys = ON
+        PRAGMA page_size
+        PRAGMA recursive_triggers
+        PRAGMA case_sensitive_like = 0
+        PRAGMA defer_foreign_keys
+        INSERT OR REPLACE INTO c1 VALUES (1, 9, 1) RETURNING *
+        SELECT * FROM c1",
+    );
+    // An upsert's DO UPDATE makes the INSERT a multi-row write only
+    // when it fires UPDATE triggers or changes a key: a mismatched
+    // key it leaves alone fails nothing (found by the corpus).
+    run_same(
+        "rev-upsert-multi",
+        "PRAGMA foreign_keys = ON
+        CREATE TABLE p(a INTEGER UNIQUE, b, c)
+        CREATE TABLE g(j REFERENCES p, w)
+        INSERT INTO p VALUES (1, 1, 1)
+        INSERT INTO p VALUES (2, 1, 1) ON CONFLICT DO UPDATE SET b = 5
+        INSERT INTO p VALUES (1, 1, 1) ON CONFLICT DO UPDATE SET a = 5
+        INSERT INTO p VALUES (2, 1, 1) ON CONFLICT DO UPDATE SET a = excluded.a + 10
+        INSERT INTO p VALUES (3, 1, 1) ON CONFLICT (a) DO UPDATE SET c = 5
+        INSERT INTO p VALUES (4, 1, 1) ON CONFLICT DO NOTHING
+        INSERT INTO p VALUES (5, 1, 1), (6, 1, 1)
+        INSERT INTO p VALUES (7, 1, 1) RETURNING a
+        INSERT OR REPLACE INTO p VALUES (8, 1, 1)
+        SELECT * FROM p
+        CREATE TABLE q(a PRIMARY KEY, b)
+        CREATE TABLE c(id INTEGER PRIMARY KEY, x REFERENCES q, n UNIQUE)
+        CREATE TABLE cd(id INTEGER PRIMARY KEY, x REFERENCES q DEFERRABLE INITIALLY DEFERRED)
+        INSERT INTO q VALUES (1, 0)
+        INSERT INTO c VALUES (1, 1, 1)
+        INSERT INTO c VALUES (2, 9, 2) ON CONFLICT DO UPDATE SET n = 5
+        INSERT INTO c VALUES (1, 9, 2) ON CONFLICT (id) DO UPDATE SET n = 5
+        INSERT INTO c VALUES (1, 9, 2) ON CONFLICT (id) DO UPDATE SET x = 7
+        INSERT INTO c VALUES (1, 9, 2) ON CONFLICT (id) DO UPDATE SET x = 1
+        BEGIN
+        INSERT INTO cd VALUES (1, 5)
+        INSERT INTO q VALUES (5, 0) ON CONFLICT DO UPDATE SET b = 1
+        COMMIT
+        BEGIN
+        INSERT INTO c VALUES (3, 8, 3)
+        INSERT INTO cd VALUES (2, 6)
+        INSERT INTO q VALUES (6, 0) ON CONFLICT DO UPDATE SET b = 1
+        INSERT INTO q VALUES (6, 0) ON CONFLICT DO UPDATE SET a = 7
+        COMMIT
+        SELECT * FROM q
+        SELECT * FROM c
+        SELECT * FROM cd",
+    );
+}
+
+/// Review fixes that need trigger programs.
+#[cfg(feature = "triggers")]
+#[test]
+fn review_fixes_programs() {
+    // Writes made by INSTEAD OF trigger bodies count their
+    // violations into the view's statement: it fails on immediate
+    // ones (in autocommit on deferred ones too), RETURNING rows or
+    // not (hipp skipped the check and committed orphans).
+    run_same(
+        "rev-instead",
+        "PRAGMA foreign_keys = ON
+        CREATE TABLE p(a PRIMARY KEY)
+        CREATE TABLE c(x REFERENCES p)
+        CREATE TABLE cd(x REFERENCES p DEFERRABLE INITIALLY DEFERRED)
+        CREATE VIEW v AS SELECT * FROM c
+        CREATE TRIGGER tv INSTEAD OF INSERT ON v BEGIN INSERT INTO c VALUES (new.x); END
+        CREATE VIEW vd AS SELECT * FROM cd
+        CREATE TRIGGER tvd INSTEAD OF INSERT ON vd BEGIN INSERT INTO cd VALUES (new.x); END
+        INSERT INTO v VALUES (5)
+        INSERT INTO v VALUES (5) RETURNING x
+        INSERT INTO vd VALUES (5)
+        SELECT count(*) FROM c
+        SELECT count(*) FROM cd
+        BEGIN
+        INSERT INTO vd VALUES (6)
+        INSERT INTO v VALUES (6)
+        INSERT INTO p VALUES (6)
+        INSERT INTO v VALUES (6)
+        COMMIT
+        SELECT count(*) FROM cd
+        DELETE FROM p
+        CREATE VIEW w AS SELECT a FROM p
+        CREATE TRIGGER td INSTEAD OF DELETE ON w BEGIN DELETE FROM p WHERE a = old.a; END
+        CREATE TRIGGER tu INSTEAD OF UPDATE ON w BEGIN UPDATE p SET a = new.a WHERE a = old.a; END
+        INSERT INTO p VALUES (1)
+        INSERT INTO c VALUES (1)
+        BEGIN
+        DELETE FROM w
+        UPDATE w SET a = 2
+        UPDATE w SET a = 2 RETURNING a
+        COMMIT
+        DELETE FROM w
+        SELECT * FROM p
+        SELECT * FROM c
+        PRAGMA foreign_key_check",
+    );
+    // A RETURNING INSTEAD OF write with deferred violations in
+    // autocommit serves its rows, then fails.
+    big(|| {
+        same(
+            "rev-instead-ret",
+            &lines(
+                "PRAGMA foreign_keys = ON
+                CREATE TABLE p(a PRIMARY KEY)
+                CREATE TABLE cd(x REFERENCES p DEFERRABLE INITIALLY DEFERRED)
+                CREATE VIEW vd AS SELECT * FROM cd
+                CREATE TRIGGER tvd INSTEAD OF INSERT ON vd BEGIN INSERT INTO cd VALUES (new.x); END
+                INSERT INTO vd VALUES (5) RETURNING x
+                SELECT count(*) FROM cd",
+            ),
+        );
+    });
+    // A FAIL halt inside a trigger program with violations pending
+    // fails the statement with the key's error (hipp reported the
+    // program's own RAISE(FAIL) / UNIQUE error).
+    big(|| {
+        let kinds = same(
+            "rev-fail-halt",
+            &lines(
+                "PRAGMA foreign_keys = ON
+                CREATE TABLE p(a PRIMARY KEY)
+                CREATE TABLE c(x REFERENCES p)
+                CREATE TABLE d(y)
+                CREATE TRIGGER t AFTER INSERT ON d BEGIN INSERT INTO c VALUES (new.y); SELECT RAISE(FAIL, 'f') WHERE new.y = 3; END
+                INSERT INTO p VALUES (1), (2)
+                INSERT INTO d VALUES (1), (5), (3)
+                CREATE TABLE u(k UNIQUE)
+                CREATE TABLE e(y)
+                CREATE TRIGGER t2 AFTER INSERT ON e BEGIN INSERT INTO c VALUES (new.y); INSERT INTO u VALUES (new.y % 2); END
+                INSERT OR FAIL INTO e VALUES (1), (5), (3)
+                INSERT INTO p VALUES (3)
+                INSERT INTO d VALUES (1), (3)
+                INSERT OR FAIL INTO e VALUES (2), (4)
+                SELECT * FROM c
+                SELECT * FROM d
+                SELECT * FROM e
+                SELECT * FROM u",
+            ),
+        );
+        for n in ["7: ", "11: "] {
+            assert!(
+                kinds
+                    .iter()
+                    .any(|k| k.starts_with(n) && k.contains("ForeignKeyViolation")),
+                "{n}{kinds:?}"
+            );
+        }
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k.starts_with("13: ") && k.contains("RaiseFail")),
+            "{kinds:?}"
+        );
+    });
+    // An upsert's DO UPDATE reads its row again after BEFORE UPDATE
+    // triggers, as an UPDATE does: a row they (or a cascade they
+    // ran) deleted is skipped, a column they changed and DO UPDATE
+    // does not assign keeps their value (found by the corpus).
+    run_same(
+        "rev-upsert-reread",
+        "PRAGMA foreign_keys = ON
+        CREATE TABLE p(a PRIMARY KEY, b)
+        CREATE TABLE c0(id INTEGER PRIMARY KEY, x REFERENCES p(a) ON DELETE CASCADE, y)
+        CREATE TRIGGER t3 BEFORE UPDATE ON c0 BEGIN DELETE FROM p WHERE a = 1; END
+        INSERT INTO p VALUES (1, 0), (2, 0), (3, 1)
+        INSERT INTO c0 VALUES (NULL, 1, 1)
+        INSERT INTO c0 VALUES (1, 6, 0) ON CONFLICT (id) DO UPDATE SET x = 2
+        SELECT * FROM c0
+        SELECT * FROM p
+        CREATE TABLE c1(id INTEGER PRIMARY KEY, x, y UNIQUE)
+        CREATE TRIGGER t4 BEFORE UPDATE ON c1 BEGIN UPDATE c1 SET y = 77 WHERE id = old.id; END
+        INSERT INTO c1 VALUES (1, 1, 1)
+        INSERT INTO c1 VALUES (1, 6, 0) ON CONFLICT (id) DO UPDATE SET x = 2
+        SELECT * FROM c1
+        PRAGMA integrity_check
+        CREATE TABLE c2(id INTEGER PRIMARY KEY, x)
+        CREATE TRIGGER t5 BEFORE UPDATE ON c2 BEGIN DELETE FROM c2 WHERE id = 1; END
+        INSERT INTO c2 VALUES (1, 1), (2, 2)
+        INSERT INTO c2 VALUES (1, 6) ON CONFLICT (id) DO UPDATE SET x = 3
+        SELECT * FROM c2",
+    );
+    // The pin's `isSetNullAction` looks at the program compiled last
+    // in the whole statement: a BEFORE trigger, or an earlier
+    // statement of the program, that compiles a key's SET NULL action
+    // makes the write after it skip that key's lookups (hipp modelled
+    // only REPLACE).
+    // A depth failure inside a transaction keeps the statement's
+    // changes when no program holds an abort point: deferred keys,
+    // and immediate keys whose parent rows go with CASCADE / SET
+    // NULL, hold none; an UPDATE changing no key checks none
+    // (found by the corpus; the tables have no rowid alias, which
+    // hipp's model counts as an abort point for any UPDATE).
+    big(|| {
+        for (key, step) in [
+            (
+                "DEFERRABLE INITIALLY DEFERRED",
+                "UPDATE c0 SET x = 8 WHERE 0",
+            ),
+            ("DEFERRABLE INITIALLY DEFERRED", "DELETE FROM p WHERE 0"),
+            ("ON DELETE CASCADE", "DELETE FROM p WHERE 0"),
+            ("ON DELETE SET NULL", "DELETE FROM p WHERE 0"),
+            (
+                "ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+                "DELETE FROM p WHERE 0",
+            ),
+            (
+                "ON DELETE SET DEFAULT DEFERRABLE INITIALLY DEFERRED",
+                "DELETE FROM p WHERE 0",
+            ),
+            ("", "DELETE FROM p WHERE 0"),
+            ("", "UPDATE c0 SET y = 8 WHERE 0"),
+            ("", "UPDATE c0 SET x = 8 WHERE 0"),
+            ("ON UPDATE CASCADE", "UPDATE p SET a = 3 WHERE 0"),
+        ] {
+            same(
+                "rev-depth-abort",
+                &lines(&format!(
+                    "PRAGMA foreign_keys = ON
+                    PRAGMA recursive_triggers = ON
+                    CREATE TABLE p(a PRIMARY KEY, b)
+                    CREATE TABLE c0(id, x REFERENCES p(a) {key}, y)
+                    CREATE TABLE d(z, w)
+                    CREATE TRIGGER t1 AFTER INSERT ON d BEGIN INSERT INTO d VALUES (0, 0); {step}; END
+                    BEGIN
+                    INSERT INTO d VALUES (2, 1)
+                    SELECT count(*) FROM d
+                    COMMIT"
+                )),
+            );
+        }
+    });
+    run_same(
+        "rev-setnull-programs",
+        "PRAGMA foreign_keys = ON
+        CREATE TABLE p(a UNIQUE, b)
+        CREATE TABLE c(id INTEGER PRIMARY KEY, x REFERENCES p(a) ON DELETE SET NULL, y)
+        CREATE TRIGGER tr2 BEFORE INSERT ON c BEGIN DELETE FROM p WHERE a = new.id + 1; END
+        INSERT INTO c VALUES (1, 1, 4)
+        INSERT INTO c VALUES (2, 1, 4), (3, 7, 4)
+        DROP TRIGGER tr2
+        INSERT INTO c VALUES (4, 1, 4)
+        CREATE TABLE d(z)
+        CREATE TRIGGER td AFTER INSERT ON d BEGIN DELETE FROM p WHERE 0; INSERT INTO c VALUES (new.z, new.z, 0); END
+        INSERT INTO d VALUES (7)
+        CREATE TABLE e(z)
+        CREATE TRIGGER te AFTER INSERT ON e BEGIN INSERT INTO c VALUES (new.z, new.z, 0); DELETE FROM p WHERE 0; END
+        INSERT INTO e VALUES (8)
+        CREATE TABLE f(z)
+        CREATE TRIGGER tf AFTER INSERT ON f BEGIN UPDATE p SET a = a WHERE 0; INSERT INTO c VALUES (new.z, new.z, 0); END
+        INSERT INTO f VALUES (9)
+        CREATE TABLE c2(id INTEGER PRIMARY KEY, x REFERENCES p(a) ON UPDATE SET NULL)
+        CREATE TABLE g(z)
+        CREATE TRIGGER tg AFTER INSERT ON g BEGIN UPDATE p SET a = a WHERE 0; INSERT INTO c2 VALUES (new.z, new.z); END
+        INSERT INTO g VALUES (10)
+        CREATE TRIGGER tr3 BEFORE INSERT ON c2 BEGIN UPDATE p SET a = a WHERE 0; END
+        INSERT INTO c2 VALUES (11, 11)
+        UPDATE c2 SET x = 12 WHERE id = 11
+        CREATE TRIGGER tr4 BEFORE UPDATE ON c2 BEGIN UPDATE p SET a = a WHERE 0; END
+        UPDATE c2 SET x = 13 WHERE id = 11
+        CREATE TABLE h(z)
+        CREATE TRIGGER th AFTER INSERT ON h BEGIN DELETE FROM p WHERE 0; INSERT INTO lg VALUES (1); INSERT INTO c VALUES (new.z, new.z, 0); END
+        CREATE TABLE lg(m)
+        CREATE TRIGGER tlg AFTER INSERT ON lg BEGIN SELECT 1; END
+        INSERT INTO h VALUES (14)
+        CREATE VIEW vc AS SELECT * FROM c
+        CREATE TRIGGER tvc INSTEAD OF INSERT ON vc BEGIN DELETE FROM p WHERE 0; INSERT INTO c VALUES (new.id, new.x, new.y); END
+        INSERT INTO vc VALUES (15, 15, 0)
+        INSERT INTO p VALUES (100, 0)
+        INSERT INTO c VALUES (16, 100, 0) ON CONFLICT (id) DO UPDATE SET x = 17
+        INSERT INTO c VALUES (16, 100, 0) ON CONFLICT (id) DO UPDATE SET x = 18
+        SELECT * FROM c
+        SELECT * FROM c2",
+    );
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -1258,6 +1706,203 @@ fn gen_script(rng: &mut Rng) -> Vec<String> {
         s.push(format!("PRAGMA foreign_key_check({t})"));
     }
     s
+}
+
+/// One generated script whose trigger programs write the keyed
+/// tables: parent rows deleted / updated and child rows added from
+/// BEFORE / AFTER / INSTEAD OF bodies, under random conflict
+/// clauses, with SET NULL keys likely (the pin's `isSetNullAction`
+/// reads the last program it compiled), RAISE(FAIL) halts.
+#[cfg(feature = "triggers")]
+fn gen_program_script(rng: &mut Rng) -> Vec<String> {
+    // (No `recursive_triggers`: a program writing its own table then
+    // nests to the depth limit, where hipp's statement journal model
+    // is the triggers unit's approximation, see STATUS.md.)
+    let mut s: Vec<String> = vec!["PRAGMA foreign_keys = ON".into()];
+    let acts = [
+        "",
+        "ON DELETE SET NULL",
+        "ON DELETE SET NULL",
+        "ON UPDATE SET NULL",
+        "ON DELETE CASCADE",
+        "ON UPDATE CASCADE",
+        "ON DELETE SET DEFAULT",
+        "ON DELETE RESTRICT",
+    ];
+    s.push(format!(
+        "CREATE TABLE p(a {}, b)",
+        rng.pick(&["INTEGER PRIMARY KEY", "UNIQUE", "PRIMARY KEY"])
+    ));
+    let nc = 1 + rng.next() % 2;
+    for i in 0..nc {
+        s.push(format!(
+            "CREATE TABLE c{i}(id INTEGER PRIMARY KEY, x REFERENCES p(a) {} {}, y{})",
+            rng.pick(&acts),
+            rng.pick(&["", "", "DEFERRABLE INITIALLY DEFERRED"]),
+            rng.pick(&["", "", " UNIQUE"])
+        ));
+    }
+    if rng.chance(40) {
+        s.push(format!(
+            "CREATE TABLE s(id INTEGER PRIMARY KEY, par REFERENCES s {}, v)",
+            rng.pick(&acts)
+        ));
+    }
+    s.push("CREATE TABLE d(z, w)".into());
+    s.push("CREATE VIEW v AS SELECT id, x, y FROM c0".into());
+    let child = |rng: &mut Rng| format!("c{}", rng.next() % nc);
+    let mut bodies = Vec::new();
+    for _ in 0..(1 + rng.next() % 4) {
+        let mut steps = Vec::new();
+        for _ in 0..(1 + rng.next() % 3) {
+            let c = child(rng);
+            let st = match rng.next() % 9 {
+                0 => format!(
+                    "DELETE FROM p WHERE {}",
+                    rng.pick(&["0", "a = 99", "a = 1", "b = 0"])
+                ),
+                1 => format!("UPDATE p SET a = a WHERE {}", rng.pick(&["0", "a = 2"])),
+                2 => "UPDATE p SET a = a + 10 WHERE a = 3".into(),
+                3 | 4 => format!(
+                    "{} INTO {c} VALUES (NULL, {}, {})",
+                    rng.pick(&["INSERT", "INSERT", "INSERT OR IGNORE", "REPLACE"]),
+                    rng.pick(&["1", "2", "7", "NULL", "9"]),
+                    rng.pick(&["0", "1"])
+                ),
+                5 => format!(
+                    "UPDATE {c} SET x = {} WHERE id % 2 = 0",
+                    rng.pick(&["1", "8", "NULL"])
+                ),
+                6 => format!("DELETE FROM {c} WHERE id = 1"),
+                7 => "SELECT RAISE(FAIL, 'f') WHERE 0".into(),
+                _ => "INSERT INTO d VALUES (0, 0)".into(),
+            };
+            steps.push(st);
+        }
+        bodies.push(steps.join("; "));
+    }
+    for (n, b) in bodies.iter().enumerate() {
+        let mut on = rng.pick(&["d", "c0", "p", "v"]);
+        let ev = rng.pick(&["INSERT", "UPDATE", "DELETE"]);
+        // A body updating the children on a child (or its view) can
+        // grow the table per row it updates: both engines then run
+        // for minutes (probed), so such bodies go on d.
+        if on != "d" && on != "p" && b.contains("UPDATE c") {
+            on = "d";
+        }
+        let tm = if on == "v" {
+            "INSTEAD OF"
+        } else {
+            rng.pick(&["BEFORE", "AFTER"])
+        };
+        // A trigger on d that writes d again is skipped by the pin's
+        // non-recursive rule like any other.
+        s.push(format!(
+            "CREATE TRIGGER t{n} {tm} {ev} ON {on} BEGIN {b}; END"
+        ));
+    }
+    s.push("INSERT INTO p VALUES (1, 0), (2, 0), (3, 1)".into());
+    for _ in 0..(6 + rng.next() % 14) {
+        let c = child(rng);
+        let k = rng.next() % 100;
+        let st = if k < 25 {
+            format!(
+                "{} INTO {c} VALUES ({}, {}, {})",
+                rng.pick(&[
+                    "INSERT",
+                    "INSERT",
+                    "INSERT OR REPLACE",
+                    "INSERT OR FAIL",
+                    "INSERT OR IGNORE",
+                    "INSERT OR ROLLBACK"
+                ]),
+                rng.pick(&["1", "2", "3", "NULL", "4"]),
+                rng.pick(&["1", "2", "5", "NULL", "9"]),
+                rng.pick(&["0", "1", "2"])
+            )
+        } else if k < 40 {
+            format!(
+                "{} INTO d VALUES ({}, {})",
+                rng.pick(&["INSERT", "INSERT OR REPLACE", "INSERT OR FAIL"]),
+                rng.pick(&["1", "2", "5"]),
+                rng.pick(&["0", "1"])
+            )
+        } else if k < 50 {
+            format!(
+                "INSERT INTO v VALUES ({}, {}, 0)",
+                rng.pick(&["NULL", "7"]),
+                rng.pick(&["1", "5"])
+            )
+        } else if k < 58 {
+            format!(
+                "UPDATE v SET x = {} WHERE id % 2 = 1",
+                rng.pick(&["1", "6"])
+            )
+        } else if k < 62 {
+            "DELETE FROM v WHERE id = 2".into()
+        } else if k < 72 {
+            format!(
+                "{} {c} SET x = {} WHERE id % 2 = {}",
+                rng.pick(&["UPDATE", "UPDATE OR REPLACE", "UPDATE OR FAIL"]),
+                rng.pick(&["1", "2", "6", "NULL"]),
+                rng.next() % 2
+            )
+        } else if k < 80 {
+            format!("DELETE FROM p WHERE a = {}", rng.pick(&["1", "2", "3"]))
+        } else if k < 85 {
+            format!(
+                "UPDATE p SET a = {} WHERE a = {}",
+                rng.pick(&["4", "5"]),
+                rng.pick(&["1", "2"])
+            )
+        } else if k < 88 {
+            format!(
+                "INSERT INTO {c} VALUES (1, 6, 0) ON CONFLICT (id) DO UPDATE SET x = {}",
+                rng.pick(&["7", "2"])
+            )
+        } else if k < 95 {
+            rng.pick(&[
+                "BEGIN",
+                "COMMIT",
+                "ROLLBACK",
+                "PRAGMA defer_foreign_keys = ON",
+            ])
+            .into()
+        } else {
+            format!("PRAGMA foreign_key_check({c})")
+        };
+        s.push(st);
+    }
+    s.push("COMMIT".into());
+    for i in 0..nc {
+        s.push(format!("SELECT 'c{i}', * FROM c{i}"));
+    }
+    s.push("SELECT 'p', * FROM p".into());
+    s.push("SELECT 'd', * FROM d".into());
+    s.push("PRAGMA foreign_key_check(c0)".into());
+    s
+}
+
+/// Generated trigger programs writing keyed tables: rows, failing
+/// statements and final files agree with the pin.
+#[cfg(feature = "triggers")]
+#[test]
+fn generated_corpus_programs() {
+    big(|| {
+        let seed = std::env::var("HIPP_FK_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0x7072_6f67_7300_0016u64);
+        let mut rng = Rng(seed | 1);
+        let n = std::env::var("HIPP_FK_CORPUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60usize);
+        for case in 0..n {
+            let s = gen_program_script(&mut rng);
+            same(&format!("prog{case}"), &s);
+        }
+    });
 }
 
 /// Generated parent / child schemas and write sequences: rows, the

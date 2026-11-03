@@ -541,18 +541,21 @@ aspirations.
   `PRAGMA defer_foreign_keys` fail COMMIT / a committing RELEASE
   with the transaction left open, savepoints restore the counts,
   and a multi-row statement may fix its own violations (an orphan
-  left with the pragma off can cancel one, the pin's quirk). ON
+  left with the pragma off can cancel one, the pin's quirk; a
+  counter driven below zero fails as one above it). ON
   DELETE / ON UPDATE CASCADE, SET NULL, SET DEFAULT, RESTRICT and NO
   ACTION run as the pin's action programs (under ABORT, own
   `changes()` frames, the trigger depth limit, firing the child's
   triggers); composite and self-referencing keys with the pin's
   three comparison rules; "foreign key mismatch" / "no such table"
   when the write is prepared, over the whole cascade tree; REPLACE,
-  upsert, RETURNING, DROP TABLE's implicit DELETE and the pin's
-  `isSetNullAction` quirk; `PRAGMA foreign_key_check [t]` and
+  upsert, RETURNING, INSTEAD OF trigger bodies, DROP TABLE's
+  implicit DELETE and the pin's `isSetNullAction` quirk (replayed
+  over its whole compile order); `PRAGMA foreign_key_check [t]` and
   `defer_foreign_keys`. Without the leaf the refusal stays.
-  Tiny unchanged, full +744 B (the ungated deferrable /
-  ADD COLUMN REFERENCES fixes), max +26.9 KB (STATUS.md).
+  Tiny unchanged, full +800 B (the ungated deferrable /
+  ADD COLUMN REFERENCES fixes), max +33.8 KB with the review fixes
+  (STATUS.md).
 
 ## What v0.13 does
 
