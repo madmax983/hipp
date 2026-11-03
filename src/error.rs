@@ -239,6 +239,77 @@ pub enum SchemaKind {
     /// out first.
     #[cfg(feature = "v16")]
     PercentileInfinite,
+    /// A window function where the pin forbids one (v0.16,
+    /// `window`; its "misuse of window function f()" / "misuse
+    /// of aliased window function x"): outside a result column
+    /// or an ORDER BY term of a SELECT (in WHERE, GROUP BY,
+    /// HAVING, ON, a write statement, a CHECK or an index), or
+    /// inside the arguments, PARTITION BY, ORDER BY or FILTER of
+    /// an aggregate or another window function; and a built-in
+    /// window function (`row_number()`, ...) called without
+    /// OVER. Compute it in a FROM subquery and filter outside.
+    #[cfg(feature = "window")]
+    MisusedWindow,
+    /// OVER on a function that is not a window function (v0.16,
+    /// `window`; the pin's "f() may not be used as a window
+    /// function"): a scalar function, or min / max with several
+    /// arguments. Use an aggregate or a built-in window function.
+    #[cfg(feature = "window")]
+    NotWindowFunction,
+    /// DISTINCT in a window function call (v0.16, `window`; the
+    /// pin's "DISTINCT is not supported for window functions").
+    /// Deduplicate in a subquery first.
+    #[cfg(feature = "window")]
+    WindowDistinct,
+    /// FILTER on a built-in window function, or an aggregate
+    /// ORDER BY inside a window aggregate's parentheses (v0.16,
+    /// `window`; the pin's "FILTER clause may only be used with
+    /// aggregate window functions" / "ORDER BY may not be used
+    /// with non-aggregate f()"). Order through the window's own
+    /// ORDER BY.
+    #[cfg(feature = "window")]
+    WindowClauseMisused,
+    /// `OVER name` / `OVER (name ...)` / `AS (name ...)` naming no
+    /// window of the select's WINDOW clause (v0.16, `window`; the
+    /// pin's "no such window"). Define it in the WINDOW clause.
+    #[cfg(feature = "window")]
+    NoSuchWindow,
+    /// A window that inherits from a named window but restates
+    /// its PARTITION BY, a second ORDER BY, or inherits from one
+    /// with an explicit frame (v0.16, `window`; the pin's "cannot
+    /// override ... of window"). Inherit only what the base
+    /// leaves out.
+    #[cfg(feature = "window")]
+    WindowOverride,
+    /// A RANGE frame with an `<expr> PRECEDING / FOLLOWING` bound
+    /// over other than exactly one ORDER BY term (v0.16, `window`;
+    /// the pin's "RANGE with offset PRECEDING/FOLLOWING requires
+    /// one ORDER BY expression"). Order by one expression, or use
+    /// ROWS / GROUPS.
+    #[cfg(feature = "window")]
+    RangeOffsetOrder,
+    /// A frame's starting offset that is not a non-negative
+    /// integer (ROWS / GROUPS) or number (RANGE) — NULL, text, a
+    /// blob, a fraction, a negative value or a non-constant
+    /// expression (v0.16, `window`; the pin's "frame starting
+    /// offset must be a non-negative integer / number"). Write a
+    /// non-negative literal.
+    #[cfg(feature = "window")]
+    FrameStartOffset,
+    /// The same for a frame's ending offset (v0.16, `window`).
+    #[cfg(feature = "window")]
+    FrameEndOffset,
+    /// `nth_value(x, N)` with an N that is not a positive integer
+    /// (v0.16, `window`; the pin's "second argument to nth_value
+    /// must be a positive integer"). Pass N >= 1.
+    #[cfg(feature = "window")]
+    NthValueArgument,
+    /// `ntile(N)` with an N that is not a positive integer for a
+    /// partition's first row (v0.16, `window`; the pin's
+    /// "argument of ntile must be a positive integer"). Pass N >=
+    /// 1.
+    #[cfg(feature = "window")]
+    NtileArgument,
     /// A FOREIGN KEY whose column lists disagree (v0.16 fix, the
     /// pin's "foreign key on x should reference only one column of
     /// table p" / "number of columns in foreign key does not match
@@ -433,6 +504,13 @@ pub enum ParseKind {
     /// the pin's "hex literal too big"). Write a shorter
     /// literal, or a decimal one.
     HexLiteralTooBig,
+    /// A window frame whose start comes after its end in the
+    /// pin's bound order — `CURRENT ROW` to `<expr> PRECEDING`,
+    /// or `<expr> FOLLOWING` to `PRECEDING` / `CURRENT ROW`
+    /// (v0.16, `window`; the pin's "unsupported frame
+    /// specification"). Put the earlier bound first.
+    #[cfg(feature = "window")]
+    UnsupportedFrame,
 }
 
 /// The core error type. Generic over the storage error `E`.

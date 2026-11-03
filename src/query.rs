@@ -318,11 +318,11 @@ pub fn any_scalar(e: &RExpr, f: &dyn Fn(ScalarFn) -> bool) -> bool {
     let any = |x: &RExpr| any_scalar(x, f);
     match e {
         RExpr::Scalar(g, args) => f(*g) || args.iter().any(any),
+        RExpr::Win(_, args) => args.iter().any(any),
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_) => false,
@@ -348,6 +348,15 @@ pub fn any_scalar(e: &RExpr, f: &dyn Fn(ScalarFn) -> bool) -> bool {
         }
     }
 }
+
+/// A window call's description (v0.16, `window`; see
+/// `RExpr::Win`).
+#[cfg(feature = "window")]
+pub type WinBox = Box<crate::window::WinCall>;
+/// Uninhabited without `window`: `RExpr::Win` cannot be built,
+/// and the walkers' arms for it compile away.
+#[cfg(not(feature = "window"))]
+pub type WinBox = core::convert::Infallible;
 
 /// A resolved expression: column references are flat slot indices
 /// into `RowData::vals`; `Rowid(src)` reads `RowData::rowids[src]`.
@@ -452,8 +461,6 @@ pub enum RExpr {
         #[cfg(feature = "v16")]
         ext: Option<Box<AggExt>>,
     },
-    /// ORDER BY reference to an output column (0-based).
-    OutRef(usize),
     /// A subquery whose execution failed with an evaluation error
     /// (v0.16 review fix): `substitute` puts it where the
     /// subquery's value would go, and evaluating it raises
@@ -464,6 +471,18 @@ pub enum RExpr {
     /// their errors for the moment (if any) they are read.
     /// Produced only by `substitute`; never by the resolver.
     Raise(SchemaKind),
+    /// A window function call (v0.16, `window`): what the call is
+    /// (function, frame, the layout of the children) and its
+    /// children — arguments, FILTER, PARTITION BY and ORDER BY
+    /// terms, all evaluated per input row of the window (a row,
+    /// or a group of an aggregate query). Every walker sees the
+    /// children, so subqueries, correlation and aggregates inside
+    /// them behave as anywhere else. Never evaluated directly:
+    /// the executor computes the windows over the whole input and
+    /// puts each call's value in its place (`window::fill`)
+    /// before the result columns evaluate. Without `window` the
+    /// variant cannot be built (`WinBox` is uninhabited).
+    Win(WinBox, AVec<RExpr>),
 }
 
 /// One FROM source for resolution: qualifier (alias if given, else
@@ -702,6 +721,23 @@ pub struct ScopeGroup {
     /// `RETURNING (SELECT max(t.a) FROM u)` aggregates inside
     /// the subquery (9 for a one-row insert of a = 9).
     pub agg_owner: bool,
+    /// The window state of this group's SELECT core (v0.16,
+    /// `window`).
+    #[cfg(feature = "window")]
+    pub win: WinScope,
+}
+
+/// What window calls a SELECT core's resolution may make (v0.16,
+/// `window`): its WINDOW clause, whether calls are allowed where
+/// resolution stands (its result list and ORDER BY, outside any
+/// aggregate's or window call's own clauses — the pin's
+/// `NC_AllowWin`), and the next call's slot.
+#[cfg(feature = "window")]
+#[derive(Debug, Clone, Default)]
+pub struct WinScope {
+    pub defs: AVec<(crate::arena::ABytes, crate::sql::ast::WindowDef)>,
+    pub ok: core::cell::Cell<bool>,
+    pub next: core::cell::Cell<usize>,
 }
 
 impl ScopeGroup {
@@ -713,6 +749,8 @@ impl ScopeGroup {
             first_src,
             aliases: AVec::new(),
             agg_owner: true,
+            #[cfg(feature = "window")]
+            win: WinScope::default(),
         }
     }
 
@@ -946,7 +984,7 @@ pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
         RExpr::Rowid(src) => r.src(*src),
         RExpr::SubScalar(p) | RExpr::SubExists(p) => plan_refs_range(p, r),
         RExpr::InSub(x, p, _) => f(x) || plan_refs_range(p, r),
-        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) | RExpr::Raise(_) => false,
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
         RExpr::Neg(a)
         | RExpr::Pos(a)
@@ -965,7 +1003,9 @@ pub fn expr_refs_range(e: &RExpr, r: &RefRange) -> bool {
                 || whens.iter().any(|(w, t)| f(w) || f(t))
                 || otherwise.as_ref().is_some_and(|o| f(o))
         }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().any(f),
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } | RExpr::Win(_, args) => {
+            args.iter().any(f)
+        }
     }
 }
 
@@ -1227,6 +1267,15 @@ fn resolve_column<E>(
         if table.is_none()
             && let Some((_, e)) = g.aliases.iter().find(|(a, _)| eq_ci(a.as_slice(), name))
         {
+            // An alias of a window call outside the result list /
+            // ORDER BY (or from a subquery): the pin's "misuse of
+            // aliased window function" (v0.16, `window`).
+            #[cfg(feature = "window")]
+            if (depth > 0 || !cur.win.ok.get()) && crate::window::has_win(e) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::MisusedWindow,
+                });
+            }
             if depth == 0 {
                 return Ok(e.clone());
             }
@@ -1309,7 +1358,7 @@ fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
             shift_expr(x, at, by);
             shift_plan(p, at, by);
         }
-        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::OutRef(_) | RExpr::Raise(_) => {}
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
             shift_expr(a, at, by);
             shift_expr(b, at, by);
@@ -1344,7 +1393,7 @@ fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
                 shift_expr(t, at, by);
             }
         }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } | RExpr::Win(_, args) => {
             for a in args.as_mut_slice() {
                 shift_expr(a, at, by);
             }
@@ -2366,6 +2415,13 @@ fn resolve_args<E>(
 
 /// The scalar function a name calls (case-insensitive), or None
 /// for a name the pin does not define (or this build leaves out).
+/// Whether `name` is a scalar function (v0.16, `window`: OVER on
+/// one is the pin's "may not be used as a window function").
+#[cfg(feature = "window")]
+pub(crate) fn is_scalar_name(name: &[u8]) -> bool {
+    scalar_fn(name).is_some()
+}
+
 fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
     const BASE: &[(&[u8], ScalarFn)] = &[
         (b"abs", ScalarFn::Abs),
@@ -2470,6 +2526,15 @@ fn arity(f: ScalarFn) -> (usize, usize) {
     }
 }
 
+/// Without `window` a call resolves as `resolve_call_body` does.
+#[cfg(not(feature = "window"))]
+use resolve_call_body as resolve_func;
+
+/// A function call (v0.16, `window`: a call with OVER is a window
+/// call, a built-in window function without one the pin's misuse,
+/// and no window call may sit inside an aggregate's arguments,
+/// ORDER BY or FILTER).
+#[cfg(feature = "window")]
 #[allow(clippy::too_many_arguments)]
 fn resolve_func<E>(
     name: &[u8],
@@ -2482,6 +2547,38 @@ fn resolve_func<E>(
     enclosing: &[ScopeGroup],
     planner: SubPlanner<'_, E>,
 ) -> Result<RExpr, E> {
+    {
+        if let Some(c) = clause
+            && let Some(over) = &c.over
+        {
+            return crate::window::resolve_call::<E>(
+                name, distinct, star, args, c, over, arena, cur, enclosing, planner,
+            );
+        }
+        if crate::window::WinFn::builtin(name).is_some() {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedWindow,
+            });
+        }
+        let aggregate = agg_kind(name)
+            .is_some_and(|k| !(matches!(k, AggKind::Min | AggKind::Max) && args.len() > 1));
+        if aggregate {
+            let was = cur.win.ok.replace(false);
+            let r = resolve_call_body::<E>(
+                name, distinct, star, args, clause, arena, cur, enclosing, planner,
+            );
+            cur.win.ok.set(was);
+            return r;
+        }
+    }
+    resolve_call_body::<E>(
+        name, distinct, star, args, clause, arena, cur, enclosing, planner,
+    )
+}
+
+/// The aggregate a function name calls, if any.
+#[inline(always)]
+pub(crate) fn agg_kind(name: &[u8]) -> Option<AggKind> {
     const AGGS: &[(&[u8], AggKind)] = &[
         (b"count", AggKind::Count),
         (b"sum", AggKind::Sum),
@@ -2501,7 +2598,23 @@ fn resolve_func<E>(
         #[cfg(feature = "v16")]
         (b"percentile_disc", AggKind::PercentileDisc),
     ];
-    let agg = AGGS.iter().find(|(n, _)| eq_ci(name, n)).map(|(_, k)| *k);
+    AGGS.iter().find(|(n, _)| eq_ci(name, n)).map(|(_, k)| *k)
+}
+
+/// `resolve_func` without the window rules.
+#[allow(clippy::too_many_arguments)]
+fn resolve_call_body<E>(
+    name: &[u8],
+    distinct: bool,
+    star: bool,
+    args: &[Expr],
+    #[cfg(feature = "v16")] clause: Option<&crate::sql::ast::FuncClause>,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    planner: SubPlanner<'_, E>,
+) -> Result<RExpr, E> {
+    let agg = agg_kind(name);
     // The aggregate clauses on anything but an aggregate (v0.16,
     // `v16`): the pin refuses them at prepare. min / max with
     // several arguments are the scalar forms.
@@ -2830,7 +2943,6 @@ fn visit_all_aggs<'x>(e: &'x RExpr, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
             visit_aggs(a, d, f);
@@ -2869,7 +2981,7 @@ fn visit_all_aggs<'x>(e: &'x RExpr, d: u8, f: &mut dyn FnMut(&'x RExpr, u8)) {
                 visit_aggs(o, d, f);
             }
         }
-        RExpr::Scalar(_, args) => {
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) => {
             for a in args.iter() {
                 visit_aggs(a, d, f);
             }
@@ -3014,7 +3126,6 @@ fn direct_agg(e: &RExpr, p: &dyn Fn(&RExpr) -> bool) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
         RExpr::Neg(a)
@@ -3034,7 +3145,7 @@ fn direct_agg(e: &RExpr, p: &dyn Fn(&RExpr) -> bool) -> bool {
                 || whens.iter().any(|(w, t)| f(w) || f(t))
                 || otherwise.as_ref().is_some_and(|o| f(o))
         }
-        RExpr::Scalar(_, args) => args.iter().any(f),
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) => args.iter().any(f),
     }
 }
 
@@ -3120,7 +3231,6 @@ fn walk_aggs_mut<E>(
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => Ok(()),
         RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
             walk_aggs_mut(a, d, fold)?;
@@ -3161,7 +3271,7 @@ fn walk_aggs_mut<E>(
             }
             Ok(())
         }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => {
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } | RExpr::Win(_, args) => {
             for a in args.as_mut_slice() {
                 walk_aggs_mut(a, d, fold)?;
             }
@@ -3221,7 +3331,6 @@ pub fn has_sub(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) => has_sub(a) || has_sub(b),
         RExpr::Neg(a)
@@ -3242,7 +3351,7 @@ pub fn has_sub(e: &RExpr) -> bool {
                 || whens.iter().any(|(w, t)| has_sub(w) || has_sub(t))
                 || otherwise.as_ref().is_some_and(|o| has_sub(o))
         }
-        RExpr::Scalar(_, args) => args.iter().any(has_sub),
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) => args.iter().any(has_sub),
         RExpr::Agg { args, .. } => args.iter().any(has_sub),
     }
 }
@@ -3264,7 +3373,6 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) => {
             collect_subs(a, out);
@@ -3307,7 +3415,7 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
                 collect_subs(o, out);
             }
         }
-        RExpr::Scalar(_, args) => {
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) => {
             for a in args.iter() {
                 collect_subs(a, out);
             }
@@ -3438,7 +3546,6 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => e.clone(),
         RExpr::Binary(op, a, b) => RExpr::Binary(
             *op,
@@ -3487,6 +3594,16 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                 otherwise: sother,
             }
         }
+        #[cfg(feature = "window")]
+        RExpr::Win(c, args) => {
+            let mut out = AVec::new();
+            for a in args.iter() {
+                out.push(substitute(a, values, pos));
+            }
+            RExpr::Win(c.clone(), out)
+        }
+        #[cfg(not(feature = "window"))]
+        RExpr::Win(c, _) => match *c {},
         RExpr::Scalar(f, args) => {
             let mut out = AVec::new();
             for a in args.iter() {
@@ -3540,7 +3657,6 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => false,
         RExpr::Binary(_, a, b) => sub_in_agg_args(a) || sub_in_agg_args(b),
         RExpr::Neg(a)
@@ -3565,7 +3681,7 @@ pub fn sub_in_agg_args(e: &RExpr) -> bool {
                     .any(|(w, t)| sub_in_agg_args(w) || sub_in_agg_args(t))
                 || otherwise.as_ref().is_some_and(|o| sub_in_agg_args(o))
         }
-        RExpr::Scalar(_, args) => args.iter().any(sub_in_agg_args),
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) => args.iter().any(sub_in_agg_args),
     }
 }
 
@@ -3649,7 +3765,6 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => {}
         RExpr::Binary(_, a, b) => {
             collect_subs_outside_agg(a, out);
@@ -3692,7 +3807,7 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
                 collect_subs_outside_agg(o, out);
             }
         }
-        RExpr::Scalar(_, args) => {
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) => {
             for a in args.iter() {
                 collect_subs_outside_agg(a, out);
             }
@@ -3747,7 +3862,6 @@ pub fn substitute_group(
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_) => e.clone(),
         RExpr::Binary(op, a, b) => RExpr::Binary(
             *op,
@@ -3810,6 +3924,16 @@ pub fn substitute_group(
                 otherwise: sother,
             }
         }
+        #[cfg(feature = "window")]
+        RExpr::Win(c, args) => {
+            let mut out = AVec::new();
+            for a in args.iter() {
+                out.push(substitute_group(a, values, pos, agg_values, agg_pos));
+            }
+            RExpr::Win(c.clone(), out)
+        }
+        #[cfg(not(feature = "window"))]
+        RExpr::Win(c, _) => match *c {},
         RExpr::Scalar(f, args) => {
             let mut out = AVec::new();
             for a in args.iter() {
@@ -3963,7 +4087,7 @@ pub fn atoi_prefix(t: &[u8]) -> i64 {
 /// The integer the pin's `sqlite3VdbeIntValue` reads from a
 /// value (v0.16): reals truncate and clamp, text and blobs take
 /// their integer prefix (`atoi_prefix`).
-fn int_value(v: &OwnedValue) -> i64 {
+pub(crate) fn int_value(v: &OwnedValue) -> i64 {
     match v {
         OwnedValue::Null => 0,
         OwnedValue::Integer(i) => *i,
@@ -4402,7 +4526,6 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_) => false,
@@ -4425,6 +4548,7 @@ pub fn has_explicit_coll(e: &RExpr) -> bool {
                 || otherwise.as_deref().is_some_and(f)
         }
         RExpr::Scalar(_, args) => args.iter().any(f),
+        RExpr::Win(..) => false,
         RExpr::Agg { .. } => agg_parts(e).is_some_and(|p| p.args.iter().any(f)),
     }
 }
@@ -4547,7 +4671,6 @@ pub fn is_constant(e: &RExpr) -> bool {
         RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
         RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_)
@@ -4572,6 +4695,7 @@ pub fn is_constant(e: &RExpr) -> bool {
                 && otherwise.as_deref().is_none_or(is_constant)
         }
         RExpr::Scalar(_, args) => args.iter().all(is_constant),
+        RExpr::Win(..) => false,
     }
 }
 
@@ -4587,11 +4711,12 @@ fn has_raise(e: &RExpr) -> bool {
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_)
         | RExpr::InSub(..) => false,
-        RExpr::Agg { args, .. } | RExpr::Scalar(_, args) => args.iter().any(has_raise),
+        RExpr::Agg { args, .. } | RExpr::Scalar(_, args) | RExpr::Win(_, args) => {
+            args.iter().any(has_raise)
+        }
         RExpr::Neg(x)
         | RExpr::Pos(x)
         | RExpr::Not(x)
@@ -4673,7 +4798,7 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
 /// `arith` over its operands' values (out of line: `arith` is on
 /// the stack once per level of an arithmetic chain).
 #[inline(never)]
-fn arith_values<E>(op: BinOp, lv: OwnedValue, rv: OwnedValue) -> Result<OwnedValue, E> {
+pub(crate) fn arith_values<E>(op: BinOp, lv: OwnedValue, rv: OwnedValue) -> Result<OwnedValue, E> {
     if matches!(op, BinOp::Concat) {
         if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
             return Ok(OwnedValue::Null);
@@ -5659,7 +5784,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             Some(Some(r)) => OwnedValue::Integer(*r),
             _ => OwnedValue::Null,
         },
-        RExpr::OutRef(_) => return Err(Error::Unsupported),
+        RExpr::Win(..) => return Err(Error::Unsupported),
         RExpr::Raise(kind) => return Err(Error::Schema { kind: *kind }),
         RExpr::Pos(x) => eval::<E>(x, ctx)?,
         RExpr::Neg(x) => match to_number(&eval::<E>(x, ctx)?) {

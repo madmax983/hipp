@@ -481,6 +481,17 @@ impl Expander<'_> {
         if let Some(h) = &mut s.having {
             self.expr::<E>(h)?;
         }
+        // The WINDOW clause's expressions (v0.16, `window`).
+        #[cfg(feature = "window")]
+        for (_, w) in s.windows.as_mut_slice() {
+            let mut r = Ok(());
+            w.exprs_mut(&mut |x| {
+                if r.is_ok() {
+                    r = self.expr::<E>(x);
+                }
+            });
+            r?;
+        }
         for row in s.values.as_mut_slice() {
             for e in row.as_mut_slice() {
                 self.expr::<E>(e)?;
@@ -1002,6 +1013,16 @@ impl Expander<'_> {
                     }
                     if let Some(x) = &mut c.filter {
                         self.expr::<E>(x)?;
+                    }
+                    #[cfg(feature = "window")]
+                    if let Some(crate::sql::ast::Over::Spec(w)) = &mut c.over {
+                        let mut r = Ok(());
+                        w.exprs_mut(&mut |x| {
+                            if r.is_ok() {
+                                r = self.expr::<E>(x);
+                            }
+                        });
+                        r?;
                     }
                 }
             }

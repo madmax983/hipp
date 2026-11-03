@@ -470,6 +470,21 @@ aspirations.
   is the ordinal 1 as on the pin (a null test over a literal folds
   to an integer; hipp sorted by a constant). Tiny +252 B
   (STATUS.md).
+- **Window functions** (new leaf feature `window`, in `max` —
+  ADR 0002 — not `full`). `f(...) [FILTER (WHERE ...)] OVER
+  (PARTITION BY ... ORDER BY ... frame)`, `OVER name` and the
+  WINDOW clause with the pin's inheritance rules and refusals;
+  ROWS / RANGE / GROUPS frames with every bound and EXCLUDE
+  clause, RANGE offsets over mixed storage classes; row_number,
+  rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead,
+  first_value, last_value, nth_value and every aggregate (the
+  percentile family included) as window functions. The frame
+  engine transcribes the pin's generated program (checked against
+  its `EXPLAIN`), so sliding REAL sums round as they do there and
+  rows come out in the pin's order (nested window classes, each
+  sorting stably). Window calls in WHERE / GROUP BY / HAVING,
+  inside aggregates and in write statements are the pin's misuse.
+  Max +41.9 KB; tiny and full unchanged (STATUS.md).
 
 ## What v0.13 does
 
@@ -798,7 +813,8 @@ A workspace: the zero-dependency core crate at the root plus
 (lexer, parser, AST, parameter binding), `query` (resolved-expression evaluator,
 v0.4), `agg` (aggregate folding: the pin's sum / percentile
 rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
-the v0.16 scalar function library),
+the v0.16 scalar function library), `window` (window functions:
+the pin's frame engine, feature `window`, v0.16),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor;

@@ -1978,7 +1978,8 @@ both (the misuse refusal, the HAVING `random()` overflow).
 
 **Honest gaps:**
 
-- Window functions (`OVER`) are not implemented (another leaf);
+- Window functions (`OVER`) are not implemented (another leaf;
+  since shipped as the `window` leaf — see "Window functions");
   `sum(a) OVER ()` and an aggregate with FILTER / ORDER BY plus
   OVER stay refused.
 - The DISTINCT-equals-ORDER-BY test compares columns, literals,
@@ -3739,6 +3740,195 @@ split walkers.
   `session.rs` and `btree.rs` guard structural invariants (plan
   kinds, a B-tree descent's parent), not data, and were not
   rewritten.
+
+### Window functions (2026-11-03)
+
+**Status:** implemented behind the new leaf feature `window`
+(implies `v16`; in `max`, not `full`, per ADR 0002; its own
+`ci/feature-sets.txt` line `v16,window`), differentially tested
+against the live 3.54.1 pin. Census: the four `window_*` probes
+(row_number, partitioned running sum, rank / dense_rank, lag /
+lead) went from HIPP_ERR to MATCH.
+
+**Shipped (`window`):**
+
+- Grammar: `f(args) [FILTER (WHERE ...)] OVER (...)` and `OVER
+  name` after any call (OVER is a keyword only after `)` with `(`
+  or a name after it, as in the pin's `analyzeOverKeyword`;
+  WINDOW only before `name AS`; FILTER after OVER is a syntax
+  error); window definitions `[base] [PARTITION BY ...] [ORDER BY
+  ...] [frame]`; frames `ROWS | RANGE | GROUPS` with one bound or
+  `BETWEEN` two (UNBOUNDED PRECEDING, `expr` PRECEDING, CURRENT
+  ROW, `expr` FOLLOWING, UNBOUNDED FOLLOWING) and EXCLUDE NO
+  OTHERS / CURRENT ROW / GROUP / TIES; the pin's "unsupported frame
+  specification" (`ParseKind::UnsupportedFrame`); a frame offset
+  that is not constant (a column, a call, a subquery) becomes NULL
+  as `sqlite3WindowOffsetExpr` makes it; bound parameters count as
+  constant (the bind walker reaches window definitions); the
+  WINDOW clause after HAVING, one per core.
+- Named windows (`sqlite3WindowChain` / `sqlite3WindowUpdate`):
+  `OVER w` copies w whole (frame included); `OVER (w ...)` and a
+  later `x AS (w ...)` inherit PARTITION BY / ORDER BY and refuse
+  restating PARTITION BY, a second ORDER BY or a base with an
+  explicit frame (`WindowOverride`); the latest definition of a
+  name wins; the first definition's base is never looked up; names
+  compare by their raw text, quotes included (`OVER [w]` names no
+  window `w`), case-insensitively; unused windows are not resolved;
+  a subquery sees only its own WINDOW clause (`NoSuchWindow`).
+- Functions: row_number, rank, dense_rank, percent_rank, cume_dist,
+  ntile, lag / lead (1-3 arguments: the offset is SQL arithmetic on
+  the row's 1-based position, so `lag(x, -1)` is lead, `lag(x,
+  'x')` the row itself, a fractional offset finds nothing; only the
+  buffered rows exist, so `lag(x, -2)` is NULL), first_value,
+  last_value, nth_value, and every aggregate — count / sum / total
+  / avg / min / max / group_concat / string_agg and median /
+  percentile / percentile_cont / percentile_disc — with FILTER.
+  The built-ins take the pin's fixed frames, which also decide
+  their window class.
+- The frame engine (`src/window.rs`, `Sim`): a transcription of
+  `sqlite3WindowCodeStep` / `windowCodeOp` / `windowCodeRangeTest`
+  checked against the pin's `EXPLAIN` programs: rows arrive into
+  the partition buffer one at a time, three cursors step rows into
+  the aggregate, invert them out and return rows, with the
+  countdown registers (`IfPos`), the `regEnd - regStart` rewrite of
+  `a FOLLOWING AND b FOLLOWING`, the empty-frame shortcut, RANGE /
+  GROUPS peer-group loops, the RANGE offset tests (DESC subtracts,
+  NULLS LAST / DESC NULLS FIRST tested apart, a text or blob key
+  takes no arithmetic, the term's collation) and the guards that
+  keep the start behind the end. `sum` / `total` / `avg` follow
+  that exact step / inverse sequence through the pin's KBN sum
+  (`SumCtx::inverse`, the pin's `sumInverse`), so REAL results
+  round identically and a sum stays REAL once a REAL row passed
+  through the frame; `group_concat` / `string_agg` keep the pin's
+  byte-length bookkeeping (`groupConcatInverse`); min / max over a
+  frame not starting UNBOUNDED PRECEDING keep the last of equal
+  values (the pin's ephemeral index), else the first. A frame with
+  any EXCLUDE (NO OTHERS included) runs the pin's full scan: a
+  fresh aggregate per row over the frame minus the excluded rows.
+- Classes and output order: calls with equal windows (frame and
+  EXCLUDE included) share a class; classes are numbered in
+  resolution order (result list, then ORDER BY); the pin nests
+  the second class inside the first and so on, each sorting its
+  input stably by partition and order keys, so rows come out in
+  the first class's order. DISTINCT, the outer ORDER BY (stable)
+  and LIMIT apply after the windows; a group LIMIT no longer stops
+  a windowed query's groups early, nor does a reader's LIMIT bound
+  a windowed derived table's input.
+- Where calls may stand: result columns and ORDER BY terms of a
+  SELECT core (and each VALUES row, a one-row core on the pin);
+  anywhere else — WHERE, GROUP BY (ordinals and aliases included),
+  HAVING, ON, LIMIT, write statements, CHECK, inside an
+  aggregate's or another window call's arguments, PARTITION BY,
+  ORDER BY or FILTER — the pin's misuse (`MisusedWindow`, also for
+  an alias of a window call there and for a built-in without
+  OVER). Aggregates inside window arguments belong to the core
+  (`sum(sum(c)) OVER (ORDER BY a)` over GROUP BY a), and make it
+  an aggregate query.
+- Errors (new `SchemaKind`s): `NotWindowFunction` (a scalar
+  function, multi-argument min / max), `WindowDistinct`,
+  `WindowClauseMisused` (FILTER on a built-in, an aggregate ORDER
+  BY with OVER), `NoSuchWindow`, `WindowOverride`,
+  `RangeOffsetOrder`, `FrameStartOffset` / `FrameEndOffset` (ROWS /
+  GROUPS: `MustBeInt` then >= 0; RANGE: a non-negative number,
+  numeric text included — checked when a partition starts, so not
+  over no rows), `NthValueArgument` (per returned row; per stepped
+  row under EXCLUDE), `NtileArgument` (the partition's first row's
+  value).
+- Plumbing: `RExpr::Win(Box<WinCall>, children)` holds the
+  arguments, FILTER, PARTITION BY and ORDER BY terms as children,
+  so every walker (correlation, subquery collection, aggregate
+  ownership, alias rebasing) sees them; without `window` the
+  variant's payload is uninhabited and its walker arms compile
+  away. The three projection paths (`project_rows`,
+  `project_qp_async`, `sub_project`) evaluate each unit's inputs,
+  call `window::compute`, then project in the window order with
+  the values filled in. View / CTE expansion, temp routing and
+  parameter binding walk window definitions.
+
+**Oracle-probing notes** (live pin, results and `EXPLAIN`):
+ties keep input order in every window sort (vdbesort is stable
+here); three windows over one table nest first-outermost (proved by
+row_number tie order); `sqlite3WindowLink` puts calls with unequal
+windows into the subquery in result-list order; the window
+sorter's order is the output order without an outer ORDER BY, an
+outer ORDER BY re-sorts stably; `count(*), count(*) OVER () ...
+WHERE 0` is `0|1` (one group); DISTINCT keeps the first row in
+window order; `VALUES (row_number() OVER ()), (2)` runs (each row is
+a core) while `INSERT ... VALUES (row_number() OVER ())` is misuse;
+`EXPLAIN` of `ROWS 1 PRECEDING AND 1 FOLLOWING` and `RANGE 1
+PRECEDING AND 2 FOLLOWING` matched the transcribed control flow op
+for op (AggStep / AggInverse / IfPos / peer `Compare` / `Jump`
+loops, the flush); `sum(x) OVER (ROWS 1 PRECEDING)` over 1, 2.5, 3,
+4 ends `7.0`; `ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING` returns
+every row from a fresh accumulator (total 0.0, sum NULL, count 0);
+min / max with NOCASE ties: `'a'` after `'A'` in a sliding frame,
+`'A'` from UNBOUNDED PRECEDING; `ntile(a)` reads the first row's a
+only; offsets: `1.0` and `'1'` pass for ROWS, `1.5` and `(SELECT 1)`
+fail, RANGE takes `1.5`, `'1'`, `' 1 '`, refuses `'x'`, `x'01'`, NULL
+and negatives; `?1` in a frame offset is a constant there.
+
+**Bugs found while testing (fixed, regression tests):** window
+names were compared dequoted (`OVER [w]` found `w`); bound
+parameters in frame offsets were neither treated as constant nor
+bound (the bind walker did not reach window definitions).
+
+**Tests:** `tests/window_v16.rs` (12 tests): built-ins, aggregates
+over frames, RANGE offsets, named windows (and every refusal),
+the step / inverse order (REAL stickiness, rounding, overflow),
+group_concat's inverse with varying separators, output order
+(nested classes, DISTINCT, LIMIT, joins order-insensitively),
+windows over groups, windows in subqueries / views / CTEs /
+compounds / VALUES / CTAS / INSERT ... SELECT / UPDATE / DELETE,
+every refusal kind, bound parameters through the Statement API
+(re-executed), and a generated corpus (xorshift, `HIPP_WIN_CORPUS`
+default 240, `HIPP_WIN_SEED`) of random calls over random frames,
+partitions and orders on six random tables with mixed storage
+classes, rounding REALs and big integers — 1 500 extra statements
+(seed 7) and about 2 400 more from a scratch fuzzer agreed while
+developing. `hipp-cli/tests/cli_v16_window.rs` (4 tests):
+byte-identical batches one-shot and over stdin (built-ins, frames
+with REAL rendering, shapes, CTAS `.schema` and `.parameter`
+offsets) plus the oracle's integrity check of hipp's file.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size:** tiny **76,476 B** (Δ **0**: nothing of it is in the tiny
+profile). Full **482,304 B** (Δ **−24 B** vs 482,328, ratchet
+lowered: `RExpr::OutRef`, never built, gave way to the
+uninhabited-without-`window` `Win` variant at the enum's end). Max
+**524,224 B** (Δ **+41,912 B** vs 482,312, ratchet raised to it;
+over the 32 KiB justification threshold): the frame engine and its
+functions (`src/window.rs`), the grammar (OVER, WINDOW, frames) and
+the resolver for calls and named windows, and the window paths of
+the three projection loops — the whole leaf, which ADR 0002 put in
+`max` for exactly this.
+
+**Honest gaps:**
+
+- The parser's depth model counts nothing for window definitions
+  (their expressions are parsed with an approximate stack base);
+  an extreme nesting inside an OVER clause is bounded by hipp's
+  limits, not at the pin's exact boundary.
+- When the pin fails after printing rows (an `ntile` / `nth_value`
+  / sum-overflow error in a later partition), hipp returns the
+  error alone; the tests compare the refusal only.
+- Percentile window aggregates are recomputed over the frame per
+  row (each stepped row is checked as on the pin, but a P that
+  varies per row is only checked across the frame, not against the
+  first row ever stepped); min / max over sliding frames and
+  EXCLUDE frames are rescanned per row: O(frame) per row (rank and
+  peer groups are O(1) after an O(n) pass; sum / count /
+  group_concat are incremental).
+- A WINDOW definition no call uses is never resolved, so ALTER
+  TABLE RENAME COLUMN leaves its column names unchanged in a view
+  (the pin's rename walks it).
+- Row order with ties between joined rows follows hipp's join
+  order, which may differ from the pin's planner; the tests use
+  unique keys or compare such results as sets.
+- Errors from different calls / rows in one statement may be
+  reported in another order than the pin's (the kinds and
+  errored-vs-succeeded match).
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

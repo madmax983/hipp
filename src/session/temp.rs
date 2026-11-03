@@ -120,6 +120,10 @@ fn core_names(s: &SelectStmt, out: &mut AVec<(ABytes, Kind)>, ctes: &mut AVec<AB
     {
         expr_names(e, out, ctes);
     }
+    #[cfg(feature = "window")]
+    for (_, w) in s.windows.iter() {
+        w.exprs(&mut |x| expr_names(x, out, ctes));
+    }
     for row in s.values.iter() {
         for e in row.iter() {
             expr_names(e, out, ctes);
@@ -208,6 +212,10 @@ fn expr_names(e: &Expr, out: &mut AVec<(ABytes, Kind)>, ctes: &mut AVec<ABytes>)
                 }
                 for f in c.filter.iter() {
                     expr_names(f, out, ctes);
+                }
+                #[cfg(feature = "window")]
+                if let Some(crate::sql::ast::Over::Spec(w)) = &c.over {
+                    w.exprs(&mut |x| expr_names(x, out, ctes));
                 }
             }
         }

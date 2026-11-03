@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full"]
+max = ["full", "window"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -139,6 +139,18 @@ params = []
 # rounded). Needs only the v0.4 expression evaluator. The tiny
 # profile excludes it per §2.
 math = ["v04"]
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): window functions -- `f(...) OVER (PARTITION BY ...
+# ORDER BY ... frame)`, named windows (`WINDOW w AS (...)`, `OVER
+# w`, `OVER (w ...)`), ROWS / RANGE / GROUPS frames with EXCLUDE,
+# the built-in window functions (row_number, rank, dense_rank,
+# percent_rank, cume_dist, ntile, lag, lead, first_value,
+# last_value, nth_value) and every aggregate as a window function,
+# with the pin's frame engine (its step / inverse order, so REAL
+# sums round as they do there). Builds on the v0.16 aggregate
+# completion (FILTER, string_agg, the percentile family), so it
+# implies `v16`. The tiny profile excludes it per §2.
+window = ["v16"]
 
 [dependencies]
 

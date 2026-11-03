@@ -2807,12 +2807,25 @@ impl<S: Storage> Connection<S> {
                 _ => {}
             }
             let mut rr = AVec::new();
+            // Each VALUES row is a SELECT core of its own on the pin:
+            // its window calls (v0.16, `window`) run over that one
+            // row.
+            #[cfg(feature = "window")]
+            {
+                cur.win.ok.set(true);
+                cur.win.next.set(0);
+            }
             for e in r.iter() {
                 let re = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
                 if has_agg(&re) {
                     return Err(Error::Unsupported);
                 }
                 rr.push(re);
+            }
+            #[cfg(feature = "window")]
+            {
+                cur.win.ok.set(false);
+                crate::window::classify(rr.as_mut_slice(), &mut []);
             }
             rows_r.push(rr);
         }
@@ -3591,6 +3604,13 @@ impl<S: Storage> Connection<S> {
             &mut sources,
         )?;
         let mut cur = ScopeGroup::new(descs, offsets, base_src);
+        // v0.16 (`window`): the core's WINDOW clause, and window
+        // calls allowed in its result list.
+        #[cfg(feature = "window")]
+        {
+            cur.win.defs = stmt.windows.clone();
+            cur.win.ok.set(true);
+        }
         let using = plan_using::<S::Error>(stmt.from.as_slice(), arena, &mut cur)?;
         let mut planner = self.sub_planner(arena);
         // Items, with star expansion (USING-aware, v0.16);
@@ -3640,6 +3660,8 @@ impl<S: Storage> Connection<S> {
                 result_names.push(nm.clone());
             }
         }
+        #[cfg(feature = "window")]
+        cur.win.ok.set(false);
         // The pin's "too many columns in result set" once `*` is
         // expanded (v0.16 fix, ungated; the parser counts the
         // written items).
@@ -3712,6 +3734,15 @@ impl<S: Storage> Connection<S> {
                 enclosing,
                 &mut planner,
             )?;
+            // A window call there (through an ordinal or alias):
+            // the pin's "misuse of window function" (v0.16,
+            // `window`).
+            #[cfg(feature = "window")]
+            if crate::window::has_win(&r) {
+                return Err(Error::Schema {
+                    kind: SchemaKind::MisusedWindow,
+                });
+            }
             // The pin: "aggregate functions are not allowed in
             // the GROUP BY clause" (directly, or through an
             // ordinal / alias naming an aggregate item).
@@ -3735,11 +3766,20 @@ impl<S: Storage> Connection<S> {
                 &mut planner,
             )?),
         };
+        #[cfg(feature = "window")]
+        if having.as_ref().is_some_and(crate::window::has_win) {
+            return Err(Error::Schema {
+                kind: SchemaKind::MisusedWindow,
+            });
+        }
         // A compound head's ORDER BY resolves against the
         // combined result (comp_order), not this core's rows,
         // so the term loop is skipped for it.
         let mut order_by: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
         if stmt.compound.is_empty() {
+            // Window calls are allowed in ORDER BY terms too.
+            #[cfg(feature = "window")]
+            cur.win.ok.set(true);
             for (e, dir) in stmt.order_by.iter() {
                 let r = self.resolve_term(
                     e,
@@ -3756,7 +3796,12 @@ impl<S: Storage> Connection<S> {
                 dir.coll = crate::query::expr_coll(&r).unwrap_or_default();
                 order_by.push((r, dir));
             }
+            #[cfg(feature = "window")]
+            cur.win.ok.set(false);
         }
+        // The window classes (v0.16, `window`).
+        #[cfg(feature = "window")]
+        crate::window::classify(items.as_mut_slice(), order_by.as_mut_slice());
         // A subquery inside an aggregate's arguments needs
         // per-group-row execution (v0.11, the `v10` feature);
         // without it the plan is refused, as in v0.6.
@@ -8348,10 +8393,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             let empty = RowData::empty();
             let mut out = AVec::new();
             for r in qp.values.iter() {
-                let mut rv = AVec::new();
-                for e in r.iter() {
-                    rv.push(self.eval_row_sub(e, &empty).await?);
-                }
+                #[cfg(feature = "window")]
+                let rv = self.eval_values_row(r.as_slice(), &empty).await?;
+                #[cfg(not(feature = "window"))]
+                let rv = {
+                    let mut rv = AVec::new();
+                    for e in r.iter() {
+                        rv.push(self.eval_row_sub(e, &empty).await?);
+                    }
+                    rv
+                };
                 out.push(rv);
             }
             return Ok(out);
@@ -8424,10 +8475,17 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "v06")]
     async fn run_query_sub(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        // Window calls (v0.16, `window`) read every input row: no
+        // bound passes into the sources.
+        #[cfg(feature = "window")]
+        let wins = !crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice()).is_empty();
+        #[cfg(not(feature = "window"))]
+        #[cfg_attr(not(feature = "v09"), allow(unused_variables))]
+        let wins = false;
         #[cfg(feature = "v09")]
         let need = derived_need(
             qp.sources.as_slice(),
-            qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
+            wins || qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
             !qp.order_by.is_empty() || qp.distinct,
             window,
         );
@@ -8437,10 +8495,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         // outer loop through a WHERE or a join stops at the
         // reader's LIMIT, as the pin's co-routine does.
         #[cfg(feature = "v16")]
-        let grow = streams_first(
-            qp.sources.as_slice(),
-            qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct,
-        ) && (qp.filter.is_some() || qp.sources.len() > 1)
+        let grow = !wins
+            && streams_first(
+                qp.sources.as_slice(),
+                qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct,
+            )
+            && (qp.filter.is_some() || qp.sources.len() > 1)
             && window.1 != usize::MAX;
         #[cfg(not(feature = "v16"))]
         let grow = false;
@@ -8484,6 +8544,47 @@ impl<'c, S: Storage> Statement<'c, S> {
             .await?;
         self.finish_produced(&qp, produced, window);
         Ok(())
+    }
+
+    /// One VALUES row against `outer` (v0.16, `window`): its window
+    /// calls run over the row alone, as the pin's one-row SELECT
+    /// core it is.
+    #[cfg(feature = "window")]
+    async fn eval_values_row(
+        &mut self,
+        r: &[RExpr],
+        outer: &RowData,
+    ) -> Result<AVec<OwnedValue>, S::Error> {
+        let mut rv = AVec::new();
+        {
+            let wins = crate::window::calls(r, &[]);
+            if !wins.is_empty() {
+                let mut ins = AVec::new();
+                for w in wins.iter() {
+                    let mut v = AVec::new();
+                    for k in crate::window::children(w) {
+                        v.push(self.eval_row_sub(k, outer).await?);
+                    }
+                    ins.push(v);
+                }
+                let mut units = AVec::new();
+                units.push(ins);
+                let (_, vals) = crate::window::compute(wins.as_slice(), units.as_slice())
+                    .map_err(|kind| Error::Schema { kind })?;
+                let empty = AVec::new();
+                let v = vals.as_slice().first().unwrap_or(&empty);
+                for e in r {
+                    let mut t = crate::window::strip(e);
+                    crate::window::fill(&mut t, v.as_slice());
+                    rv.push(self.eval_row_sub(&t, outer).await?);
+                }
+                return Ok(rv);
+            }
+        }
+        for e in r {
+            rv.push(self.eval_row_sub(e, outer).await?);
+        }
+        Ok(rv)
     }
 
     /// Evaluate one expression for one row, executing any
@@ -8887,11 +8988,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         // The rows its reader takes bound the rows it must make.
         let (skip, take) = window;
         let streamed = (skip, need.map_or(take, |n| take.min(n)));
-        // Only a lone core streams its groups up to the LIMIT.
+        // Only a lone core streams its groups up to the LIMIT —
+        // and not over window calls (v0.16, `window`), which read
+        // every input row.
         #[cfg(feature = "v09")]
         let lone = plan.compound.is_empty();
         #[cfg(not(feature = "v09"))]
         let lone = true;
+        #[cfg(feature = "window")]
+        let lone = lone
+            && crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice()).is_empty();
         let cap = if lone {
             group_cap(
                 plan.group_by.as_slice(),
@@ -9031,10 +9137,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !plan.values.is_empty() {
             let mut out = AVec::new();
             for r in plan.values.iter() {
-                let mut rv = AVec::new();
-                for e in r.iter() {
-                    rv.push(self.eval_row_sub(e, outer).await?);
-                }
+                #[cfg(feature = "window")]
+                let rv = self.eval_values_row(r.as_slice(), outer).await?;
+                #[cfg(not(feature = "window"))]
+                let rv = {
+                    let mut rv = AVec::new();
+                    for e in r.iter() {
+                        rv.push(self.eval_row_sub(e, outer).await?);
+                    }
+                    rv
+                };
                 out.push(Produced {
                     out: rv,
                     keys: AVec::new(),
@@ -9222,8 +9334,35 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        // Window calls (v0.16, `window`; see `project_rows`).
+        #[cfg(feature = "window")]
+        let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
+        #[cfg(feature = "window")]
+        let cap = if wins.is_empty() { cap } else { None };
+        #[cfg(feature = "window")]
+        let mut pend: AVec<WinUnit> = AVec::new();
         if !qp.has_agg {
+            #[cfg(feature = "window")]
+            let mut row_at = 0usize;
             for r in rows {
+                #[cfg(feature = "window")]
+                if !wins.is_empty() {
+                    let mut ins = AVec::new();
+                    for w in wins.iter() {
+                        let mut v = AVec::new();
+                        for k in crate::window::children(w) {
+                            v.push(self.eval_row_sub(k, r).await?);
+                        }
+                        ins.push(v);
+                    }
+                    pend.push(WinUnit {
+                        at: row_at,
+                        rep: None,
+                        ins,
+                    });
+                    row_at += 1;
+                    continue;
+                }
                 let mut vals = AVec::new();
                 for it in qp.items.iter() {
                     vals.push(self.eval_row_sub(it, r).await?);
@@ -9242,6 +9381,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                     keys,
                     rowid,
                 });
+            }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                return self
+                    .win_project_async(
+                        qp.items.as_slice(),
+                        qp.order_by.as_slice(),
+                        qp.sources.len() == 1,
+                        wins.as_slice(),
+                        pend,
+                        rows,
+                        &[],
+                    )
+                    .await;
             }
             return Ok(out);
         }
@@ -9318,7 +9471,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 core::cmp::Ordering::Equal
             });
         }
+        #[cfg(feature = "window")]
+        let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
+            #[cfg(feature = "window")]
+            {
+                group_at = group_at.wrapping_add(1);
+            }
             if cap.is_some_and(|c| out.len() >= c) {
                 break;
             }
@@ -9346,6 +9505,23 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
             }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                let mut ins = AVec::new();
+                for w in wins.iter() {
+                    let mut v = AVec::new();
+                    for k in crate::window::children(w) {
+                        v.push(self.eval_group_sub(k, grows.as_slice(), &rep).await?);
+                    }
+                    ins.push(v);
+                }
+                pend.push(WinUnit {
+                    at: group_at,
+                    rep: Some(rep),
+                    ins,
+                });
+                continue;
+            }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
@@ -9359,6 +9535,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                 keys,
                 rowid: None,
             });
+        }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            return self
+                .win_project_async(
+                    qp.items.as_slice(),
+                    qp.order_by.as_slice(),
+                    false,
+                    wins.as_slice(),
+                    pend,
+                    rows,
+                    groups.as_slice(),
+                )
+                .await;
         }
         Ok(out)
     }
@@ -9376,8 +9566,35 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        // Window calls (v0.16, `window`; see `project_rows`).
+        #[cfg(feature = "window")]
+        let wins = crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice());
+        #[cfg(feature = "window")]
+        let cap = if wins.is_empty() { cap } else { None };
+        #[cfg(feature = "window")]
+        let mut pend: AVec<WinUnit> = AVec::new();
         if !plan.has_agg {
+            #[cfg(feature = "window")]
+            let mut row_at = 0usize;
             for r in rows {
+                #[cfg(feature = "window")]
+                if !wins.is_empty() {
+                    let mut ins = AVec::new();
+                    for w in wins.iter() {
+                        let mut v = AVec::new();
+                        for k in crate::window::children(w) {
+                            v.push(self.eval_row_sub(k, r).await?);
+                        }
+                        ins.push(v);
+                    }
+                    pend.push(WinUnit {
+                        at: row_at,
+                        rep: None,
+                        ins,
+                    });
+                    row_at += 1;
+                    continue;
+                }
                 let mut vals = AVec::new();
                 for it in plan.items.iter() {
                     vals.push(self.eval_row_sub(it, r).await?);
@@ -9391,6 +9608,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                     keys,
                     rowid: None,
                 });
+            }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                return self
+                    .win_project_async(
+                        plan.items.as_slice(),
+                        plan.order_by.as_slice(),
+                        false,
+                        wins.as_slice(),
+                        pend,
+                        rows,
+                        &[],
+                    )
+                    .await;
             }
             return Ok(out);
         }
@@ -9466,7 +9697,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 core::cmp::Ordering::Equal
             });
         }
+        #[cfg(feature = "window")]
+        let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
+            #[cfg(feature = "window")]
+            {
+                group_at = group_at.wrapping_add(1);
+            }
             if cap.is_some_and(|c| out.len() >= c) {
                 break;
             }
@@ -9494,6 +9731,23 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
             }
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                let mut ins = AVec::new();
+                for w in wins.iter() {
+                    let mut v = AVec::new();
+                    for k in crate::window::children(w) {
+                        v.push(self.eval_group_sub(k, grows.as_slice(), &rep).await?);
+                    }
+                    ins.push(v);
+                }
+                pend.push(WinUnit {
+                    at: group_at,
+                    rep: Some(rep),
+                    ins,
+                });
+                continue;
+            }
             let mut vals = AVec::new();
             for it in plan.items.iter() {
                 vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
@@ -9506,6 +9760,76 @@ impl<'c, S: Storage> Statement<'c, S> {
                 out: vals,
                 keys,
                 rowid: None,
+            });
+        }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            return self
+                .win_project_async(
+                    plan.items.as_slice(),
+                    plan.order_by.as_slice(),
+                    false,
+                    wins.as_slice(),
+                    pend,
+                    rows,
+                    groups.as_slice(),
+                )
+                .await;
+        }
+        Ok(out)
+    }
+
+    /// The window path of `project_qp_async` / `sub_project`
+    /// (v0.16, `window`; see `win_project`): the projection
+    /// evaluates through `eval_row_sub` / `eval_group_sub`.
+    #[cfg(feature = "window")]
+    #[allow(clippy::too_many_arguments)]
+    async fn win_project_async(
+        &mut self,
+        items: &[RExpr],
+        order_by: &[(RExpr, crate::sql::SortOrder)],
+        single: bool,
+        wins: &[&RExpr],
+        mut units: AVec<WinUnit>,
+        rows: &[RowData],
+        groups: &[(AVec<OwnedValue>, AVec<RowData>)],
+    ) -> Result<AVec<Produced>, S::Error> {
+        let (order, vals, ti, to) = win_results::<S::Error>(wins, &mut units, items, order_by)?;
+        let empty = RowData::empty();
+        let mut out = AVec::with_capacity(order.len());
+        for &u in order.iter() {
+            let (Some(unit), Some(v)) = (units.as_slice().get(u), vals.as_slice().get(u)) else {
+                continue;
+            };
+            let mut vs = AVec::new();
+            let mut keys = AVec::new();
+            let mut rowid = None;
+            for (k, t) in ti.iter().chain(to.iter()).enumerate() {
+                let mut e = t.clone();
+                crate::window::fill(&mut e, v.as_slice());
+                let x = match &unit.rep {
+                    None => {
+                        let r = rows.get(unit.at).unwrap_or(&empty);
+                        if single {
+                            rowid = r.rowids.as_slice().first().copied().flatten();
+                        }
+                        self.eval_row_sub(&e, r).await?
+                    }
+                    Some(rep) => {
+                        let g = groups.get(unit.at).map(|g| g.1.as_slice()).unwrap_or(&[]);
+                        self.eval_group_sub(&e, g, rep).await?
+                    }
+                };
+                if k < ti.len() {
+                    vs.push(x);
+                } else {
+                    keys.push(x);
+                }
+            }
+            out.push(Produced {
+                out: vs,
+                keys,
+                rowid,
             });
         }
         Ok(out)
@@ -10317,12 +10641,11 @@ fn always_false(e: &RExpr) -> bool {
 #[cfg(feature = "v04")]
 fn has_call(e: &RExpr) -> bool {
     match e {
-        RExpr::Scalar(..) | RExpr::Agg { .. } | RExpr::Like(..) => true,
+        RExpr::Scalar(..) | RExpr::Agg { .. } | RExpr::Like(..) | RExpr::Win(..) => true,
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
         | RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_) => false,
@@ -10367,12 +10690,12 @@ fn const_or_group(e: &RExpr, group_by: &[RExpr]) -> bool {
         RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
         RExpr::Column(..)
         | RExpr::Rowid(_)
-        | RExpr::OutRef(_)
         | RExpr::Raise(_)
         | RExpr::SubScalar(_)
         | RExpr::SubExists(_)
         | RExpr::InSub(..)
-        | RExpr::Agg { .. } => false,
+        | RExpr::Agg { .. }
+        | RExpr::Win(..) => false,
         RExpr::Neg(x)
         | RExpr::Pos(x)
         | RExpr::Not(x)
@@ -10780,9 +11103,33 @@ fn project_rows<E>(
     cap: Option<usize>,
 ) -> Result<AVec<Produced>, E> {
     let mut out = AVec::new();
+    // Window calls (v0.16, `window`): each input row (or group)
+    // first evaluates the calls' inputs; the projection waits for
+    // the windows (`win_project`). A group LIMIT cannot apply.
+    #[cfg(feature = "window")]
+    let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
+    #[cfg(feature = "window")]
+    let cap = if wins.is_empty() { cap } else { None };
+    #[cfg(feature = "window")]
+    let mut pend: AVec<WinUnit> = AVec::new();
     if !qp.has_agg {
+        #[cfg(feature = "window")]
+        let mut row_at = 0usize;
         for r in rows {
             let ctx = Ctx::of(r).with(env);
+            #[cfg(feature = "window")]
+            if !wins.is_empty() {
+                let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
+                    crate::query::eval::<E>(k, &ctx)
+                })?;
+                pend.push(WinUnit {
+                    at: row_at,
+                    rep: None,
+                    ins,
+                });
+                row_at += 1;
+                continue;
+            }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -10801,6 +11148,10 @@ fn project_rows<E>(
                 keys,
                 rowid,
             });
+        }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            return win_project::<E>(env, qp, wins.as_slice(), pend, rows, &[]);
         }
         return Ok(out);
     }
@@ -10877,7 +11228,13 @@ fn project_rows<E>(
             core::cmp::Ordering::Equal
         });
     }
+    #[cfg(feature = "window")]
+    let mut group_at = usize::MAX;
     for (_, grows) in groups.iter() {
+        #[cfg(feature = "window")]
+        {
+            group_at = group_at.wrapping_add(1);
+        }
         if cap.is_some_and(|c| out.len() >= c) {
             break;
         }
@@ -10900,6 +11257,18 @@ fn project_rows<E>(
                 continue;
             }
         }
+        #[cfg(feature = "window")]
+        if !wins.is_empty() {
+            let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
+                crate::query::eval::<E>(k, &ctx)
+            })?;
+            pend.push(WinUnit {
+                at: group_at,
+                rep: Some(rep),
+                ins,
+            });
+            continue;
+        }
         let mut vals = AVec::new();
         for it in qp.items.iter() {
             vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -10912,6 +11281,117 @@ fn project_rows<E>(
             out: vals,
             keys,
             rowid: None,
+        });
+    }
+    #[cfg(feature = "window")]
+    if !wins.is_empty() {
+        return win_project::<E>(env, qp, wins.as_slice(), pend, rows, groups.as_slice());
+    }
+    Ok(out)
+}
+
+/// One input row of a core's windows (v0.16, `window`): the row
+/// (`rep` None: index into the joined rows) or group (`rep` its
+/// representative: index into the groups), and its window calls'
+/// input values.
+#[cfg(feature = "window")]
+struct WinUnit {
+    at: usize,
+    rep: Option<RowData>,
+    ins: AVec<AVec<OwnedValue>>,
+}
+
+/// The windows' results for `units` (v0.16, `window`): the units in
+/// the window order, each call's value per unit, and the stripped
+/// templates of the result columns and ORDER BY terms.
+#[cfg(feature = "window")]
+#[allow(clippy::type_complexity)]
+fn win_results<E>(
+    wins: &[&RExpr],
+    units: &mut AVec<WinUnit>,
+    items: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+) -> Result<
+    (
+        AVec<usize>,
+        AVec<AVec<OwnedValue>>,
+        AVec<RExpr>,
+        AVec<RExpr>,
+    ),
+    E,
+> {
+    let mut ins: AVec<AVec<AVec<OwnedValue>>> = AVec::with_capacity(units.len());
+    for u in units.as_mut_slice() {
+        ins.push(core::mem::take(&mut u.ins));
+    }
+    let (order, vals) =
+        crate::window::compute(wins, ins.as_slice()).map_err(|kind| Error::Schema { kind })?;
+    let mut ti = AVec::new();
+    for it in items {
+        ti.push(crate::window::strip(it));
+    }
+    let mut to = AVec::new();
+    for (e, _) in order_by {
+        to.push(crate::window::strip(e));
+    }
+    Ok((order, vals, ti, to))
+}
+
+/// `project_rows`' window path (v0.16, `window`): compute the
+/// windows, then project each unit in the window order with its
+/// calls' values in place.
+#[cfg(feature = "window")]
+fn win_project<E>(
+    env: &crate::query::Env,
+    qp: &QueryPlan,
+    wins: &[&RExpr],
+    mut units: AVec<WinUnit>,
+    rows: &[RowData],
+    groups: &[(AVec<OwnedValue>, AVec<RowData>)],
+) -> Result<AVec<Produced>, E> {
+    let (order, vals, ti, to) = win_results::<E>(
+        wins,
+        &mut units,
+        qp.items.as_slice(),
+        qp.order_by.as_slice(),
+    )?;
+    let empty = RowData::empty();
+    let mut out = AVec::with_capacity(order.len());
+    for &u in order.iter() {
+        let (Some(unit), Some(v)) = (units.as_slice().get(u), vals.as_slice().get(u)) else {
+            continue;
+        };
+        let (ctx, rowid) = match &unit.rep {
+            None => {
+                let r = rows.get(unit.at).unwrap_or(&empty);
+                let rowid = if qp.sources.len() == 1 {
+                    r.rowids.as_slice().first().copied().flatten()
+                } else {
+                    None
+                };
+                (Ctx::of(r).with(env), rowid)
+            }
+            Some(rep) => {
+                let g = groups.get(unit.at).map(|g| g.1.as_slice()).unwrap_or(&[]);
+                (Ctx::group(g, rep).with(env), None)
+            }
+        };
+        let mut vs = AVec::new();
+        for t in ti.iter() {
+            let mut e = t.clone();
+            crate::window::fill(&mut e, v.as_slice());
+            vs.push(crate::query::eval::<E>(&e, &ctx)?);
+        }
+        let mut keys = AVec::new();
+        for t in to.iter() {
+            let mut e = t.clone();
+            crate::window::fill(&mut e, v.as_slice());
+            keys.push(crate::query::eval::<E>(&e, &ctx)?);
+        }
+        out.push(Produced {
+            out: vs,
+            keys,
+            rowid,
         });
     }
     Ok(out)

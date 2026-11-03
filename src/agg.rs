@@ -193,7 +193,7 @@ fn fold_rows(
 /// The pin's `SumCtx`: the integer sum while it is exact, else
 /// a Kahan–Babuška–Neumaier REAL sum (`r` + error term `err`).
 #[derive(Default)]
-struct SumCtx {
+pub(crate) struct SumCtx {
     r: f64,
     err: f64,
     i: i64,
@@ -280,7 +280,7 @@ impl SumCtx {
         self.approx = true;
     }
 
-    fn step(&mut self, v: &OwnedValue) {
+    pub(crate) fn step(&mut self, v: &OwnedValue) {
         let Some(x) = sum_in(v) else {
             return;
         };
@@ -308,6 +308,42 @@ impl SumCtx {
         }
     }
 
+    /// Take a value back out of the sum (v0.16, `window`): the
+    /// pin's `sumInverse`. While the sum is exact the value is
+    /// subtracted as an integer — an overflow there leaves the
+    /// sum approximate *without* seeding the REAL sum, as on the
+    /// pin; afterwards it is a Kahan–Babuška–Neumaier step of the
+    /// negated value (`i64::MIN` as `MAX` then 1).
+    #[cfg(feature = "window")]
+    pub(crate) fn inverse(&mut self, v: &OwnedValue) {
+        let Some(x) = sum_in(v) else {
+            return;
+        };
+        self.cnt = self.cnt.saturating_sub(1);
+        if !self.approx {
+            let i = match x {
+                SumIn::Int(i) => i,
+                SumIn::Real(r) => crate::query::num_to_i64(crate::query::Num::Real(r)),
+            };
+            match self.i.checked_sub(i) {
+                Some(s) => self.i = s,
+                None => {
+                    self.ovrfl = true;
+                    self.approx = true;
+                }
+            }
+            return;
+        }
+        match x {
+            SumIn::Int(i) if i == i64::MIN => {
+                self.kbn_int(i64::MAX);
+                self.kbn_int(1);
+            }
+            SumIn::Int(i) => self.kbn_int(-i),
+            SumIn::Real(r) => self.kbn(-r),
+        }
+    }
+
     /// The REAL value of the sum (the error term added unless it
     /// overflowed).
     fn real(&self) -> f64 {
@@ -321,7 +357,7 @@ impl SumCtx {
         }
     }
 
-    fn finish(&self, kind: AggKind) -> core::result::Result<OwnedValue, SchemaKind> {
+    pub(crate) fn finish(&self, kind: AggKind) -> core::result::Result<OwnedValue, SchemaKind> {
         // A NaN sum (`+inf` and `-inf` both added) is NULL, as
         // `sqlite3_result_double` stores it (v0.16 review fix:
         // sum / total / avg answered a REAL).
@@ -431,7 +467,7 @@ fn percentile(
 /// aggregate sort (the aggregate ORDER BY, the percentile values),
 /// instead of a `slice::sort_by` instantiation per call site.
 #[cfg(feature = "v16")]
-fn sort_stable(v: &mut AVec<usize>, le: &dyn Fn(usize, usize) -> bool) {
+pub(crate) fn sort_stable(v: &mut AVec<usize>, le: &dyn Fn(usize, usize) -> bool) {
     let n = v.len();
     let mut src: AVec<usize> = v.clone();
     let mut dst: AVec<usize> = v.clone();

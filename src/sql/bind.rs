@@ -225,10 +225,26 @@ impl Binder<'_> {
                     if let Some(x) = &mut c.filter {
                         self.expr::<E>(x)?;
                     }
+                    #[cfg(feature = "window")]
+                    if let Some(super::ast::Over::Spec(w)) = &mut c.over {
+                        self.window::<E>(w)?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// A window definition's expressions (v0.16, `window`).
+    #[cfg(feature = "window")]
+    fn window<E>(&self, w: &mut super::ast::WindowDef) -> Result<(), E> {
+        let mut r = Ok(());
+        w.exprs_mut(&mut |x| {
+            if r.is_ok() {
+                r = self.expr::<E>(x);
+            }
+        });
+        r
     }
 
     fn items<E>(&self, items: &mut [SelectItem]) -> Result<(), E> {
@@ -311,6 +327,10 @@ impl Binder<'_> {
         }
         if let Some(h) = &mut s.having {
             self.expr::<E>(h)?;
+        }
+        #[cfg(feature = "window")]
+        for (_, w) in s.windows.as_mut_slice() {
+            self.window::<E>(w)?;
         }
         for row in s.values.as_mut_slice() {
             for e in row.as_mut_slice() {

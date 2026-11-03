@@ -313,6 +313,165 @@ impl JoinKind {
 pub struct FuncClause {
     pub order_by: AVec<(Expr, SortOrder)>,
     pub filter: Option<Expr>,
+    /// The call's `OVER` clause (v0.16, `window`): the call is a
+    /// window function. `None` when none was written.
+    #[cfg(feature = "window")]
+    pub over: Option<Over>,
+}
+
+/// A call's `OVER` clause (v0.16, `window`).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub enum Over {
+    /// `OVER name`: the named window exactly as defined (its
+    /// frame included).
+    Named(ABytes),
+    /// `OVER (...)`: a window definition, possibly naming a base
+    /// window to inherit from.
+    Spec(Box<WindowDef>),
+}
+
+/// A window definition (v0.16, `window`): `[base] [PARTITION BY
+/// ...] [ORDER BY ...] [frame]`, as written in an `OVER (...)` or
+/// a `WINDOW name AS (...)` clause. The parser has already copied
+/// a `WINDOW` definition's base into it (the pin's
+/// `sqlite3WindowChain`); an `OVER (base ...)`'s base is resolved
+/// by the planner against the select's `WINDOW` list.
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub struct WindowDef {
+    /// The base window named first inside the parentheses.
+    pub base: Option<ABytes>,
+    pub partition: AVec<Expr>,
+    pub order_by: AVec<(Expr, SortOrder)>,
+    /// The frame; `None` when none was written (the pin's
+    /// implicit `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+    /// ROW`, which a derived window may still override).
+    pub frame: Option<Frame>,
+}
+
+/// Inherit a window definition's base (v0.16, `window`; the pin's
+/// `sqlite3WindowChain`): `w`'s base names the latest definition
+/// of that name in `list`; `w` takes its PARTITION BY and, when
+/// it has one, its ORDER BY. The pin refuses (`WindowOverride`) a
+/// `w` that restates the PARTITION BY, that has an ORDER BY when
+/// the base does, or whose base has an explicit frame.
+#[cfg(feature = "window")]
+pub fn chain_window(
+    w: &mut WindowDef,
+    list: &[(ABytes, WindowDef)],
+    arena: &crate::arena::Arena,
+) -> Result<(), crate::error::SchemaKind> {
+    use crate::error::SchemaKind;
+    let Some(base) = w.base else {
+        return Ok(());
+    };
+    let name = crate::sql::handle_bytes(arena, base);
+    let Some((_, b)) = list
+        .iter()
+        .rev()
+        .find(|(n, _)| crate::sql::eq_ci(crate::sql::handle_bytes(arena, *n), name))
+    else {
+        return Err(SchemaKind::NoSuchWindow);
+    };
+    if !w.partition.is_empty()
+        || (!b.order_by.is_empty() && !w.order_by.is_empty())
+        || b.frame.is_some()
+    {
+        return Err(SchemaKind::WindowOverride);
+    }
+    w.partition = b.partition.clone();
+    if !b.order_by.is_empty() {
+        w.order_by = b.order_by.clone();
+    }
+    w.base = None;
+    Ok(())
+}
+
+#[cfg(feature = "window")]
+impl WindowDef {
+    /// Every expression of the definition: PARTITION BY, ORDER BY,
+    /// then the frame offsets.
+    pub fn exprs_mut(&mut self, f: &mut dyn FnMut(&mut Expr)) {
+        for p in self.partition.as_mut_slice() {
+            f(p);
+        }
+        for (o, _) in self.order_by.as_mut_slice() {
+            f(o);
+        }
+        if let Some(fr) = &mut self.frame {
+            for b in [&mut fr.start, &mut fr.end] {
+                if let FrameBound::Preceding(e) | FrameBound::Following(e) = b {
+                    f(e);
+                }
+            }
+        }
+    }
+
+    /// `exprs_mut`, read-only.
+    pub fn exprs(&self, f: &mut dyn FnMut(&Expr)) {
+        for p in self.partition.iter() {
+            f(p);
+        }
+        for (o, _) in self.order_by.iter() {
+            f(o);
+        }
+        if let Some(fr) = &self.frame {
+            for b in [&fr.start, &fr.end] {
+                if let FrameBound::Preceding(e) | FrameBound::Following(e) = b {
+                    f(e);
+                }
+            }
+        }
+    }
+}
+
+/// A window frame (v0.16, `window`).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub unit: FrameUnit,
+    pub start: FrameBound,
+    pub end: FrameBound,
+    pub exclude: FrameExclude,
+}
+
+/// `ROWS`, `RANGE` or `GROUPS` (v0.16, `window`).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnit {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// One frame boundary (v0.16, `window`). An offset that is not a
+/// constant expression is NULL, as the pin's
+/// `sqlite3WindowOffsetExpr` makes it (so it fails with the
+/// pin's "frame ... offset must be a non-negative ..." error
+/// when a partition is read).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+/// A frame's `EXCLUDE` clause (v0.16, `window`). `NoOthers` is
+/// kept apart from no clause at all: on the pin it selects the
+/// full-scan frame engine (and makes the window compare unequal
+/// to one without the clause).
+#[cfg(feature = "window")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameExclude {
+    None,
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 /// The direction of one ORDER BY term (v0.16 adds NULL
@@ -511,6 +670,11 @@ pub struct SelectStmt {
     /// other.
     #[cfg(feature = "v16")]
     pub with: Option<Box<With>>,
+    /// The core's `WINDOW name AS (...)` definitions (v0.16,
+    /// `window`), in source order; a later definition of a name
+    /// shadows an earlier one, as on the pin.
+    #[cfg(feature = "window")]
+    pub windows: AVec<(ABytes, WindowDef)>,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`

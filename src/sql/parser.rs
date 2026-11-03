@@ -2267,10 +2267,27 @@ impl<'a> Parser<'a> {
                 // RETURNING (v0.16 fix, v07 grammar) ends an
                 // UPDATE ... FROM source list: `FROM s RETURNING v`
                 // used to alias `s` as RETURNING.
-                KWS.iter().any(|k| eq_ci(b, k)) || (cfg!(feature = "v07") && eq_ci(b, b"RETURNING"))
+                KWS.iter().any(|k| eq_ci(b, k))
+                    || (cfg!(feature = "v07") && eq_ci(b, b"RETURNING"))
+                    || (cfg!(feature = "window") && self.window_clause_at(self.pos))
             }
             _ => false,
         }
+    }
+
+    /// Whether token `i` starts a `WINDOW name AS` clause (v0.16,
+    /// `window`): the pin's tokenizer reads WINDOW as a keyword
+    /// only when an identifier (or string) and AS follow it
+    /// (`analyzeWindowKeyword`), so `SELECT 1 window` stays an
+    /// alias.
+    fn window_clause_at(&self, i: usize) -> bool {
+        cfg!(feature = "window")
+            && self.is_kw(i, b"WINDOW")
+            && matches!(
+                self.toks.as_slice().get(i + 1).map(|t| t.tok),
+                Some(Tok::Ident(..) | Tok::Text(_))
+            )
+            && self.is_kw(i + 2, b"AS")
     }
 
     /// An optional `[AS] name` alias: a quoted identifier, or a
@@ -3387,11 +3404,289 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(if order_by.is_empty() && filter.is_none() {
+        // `OVER (...)` / `OVER name` (v0.16, `window`): after the
+        // FILTER, as in the pin's `filter_over` (`OVER () FILTER`
+        // is a syntax error there).
+        #[cfg(feature = "window")]
+        let over = self.over_clause::<E>()?;
+        #[cfg(feature = "window")]
+        let none = over.is_none();
+        #[cfg(not(feature = "window"))]
+        let none = true;
+        Ok(if order_by.is_empty() && filter.is_none() && none {
             None
         } else {
-            Some(Box::new(crate::sql::ast::FuncClause { order_by, filter }))
+            Some(Box::new(crate::sql::ast::FuncClause {
+                order_by,
+                filter,
+                #[cfg(feature = "window")]
+                over,
+            }))
         })
+    }
+
+    /// A call's `OVER` clause (v0.16, `window`). OVER is a keyword
+    /// only right after the call's `)` with `(` or a name after it
+    /// (the pin's `analyzeOverKeyword`), so `sum(x) over` is still
+    /// an alias.
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn over_clause<E>(&mut self) -> Result<Option<crate::sql::ast::Over>, E> {
+        use crate::sql::ast::Over;
+        if !self.cur_is_kw(b"OVER") {
+            return Ok(None);
+        }
+        match self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) {
+            Some(Tok::LParen) => {
+                self.pos += 2;
+                // `... RP OVER LP`.
+                let w = self.window_def::<E>(self.held + 8)?;
+                self.expect::<E>(Tok::RParen)?;
+                Ok(Some(Over::Spec(Box::new(w))))
+            }
+            Some(Tok::Ident(..)) | Some(Tok::Text(_)) => {
+                let h = self.window_name::<E>(self.pos + 1)?;
+                self.pos += 2;
+                Ok(Some(Over::Named(h)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A window name token `i` as the pin keeps one: its raw text
+    /// with any quotes (`OVER [w]` names no window `w`), compared
+    /// case-insensitively (v0.16, `window`).
+    #[cfg(feature = "window")]
+    fn window_name<E>(&self, i: usize) -> Result<ABytes, E> {
+        let t = self.toks.as_slice().get(i.min(self.limit - 1)).copied();
+        let Some(t) = t else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        let quoted = match t.tok {
+            Tok::Ident(h, false) => return Ok(h),
+            Tok::Ident(_, true) | Tok::Text(_) => true,
+            _ => false,
+        };
+        if !quoted {
+            return Err(perr(t.offset, ParseKind::UnexpectedToken));
+        }
+        let b = self.sql;
+        let q = b.get(t.offset).copied().unwrap_or(b'"');
+        let close = if q == b'[' { b']' } else { q };
+        let mut j = t.offset + 1;
+        while j < b.len() {
+            if b.get(j) == Some(&close) {
+                if close != b']' && b.get(j + 1) == Some(&close) {
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+                break;
+            }
+            j += 1;
+        }
+        Ok(self.arena.alloc_copy_handle(self.span(t.offset, j))?)
+    }
+
+    /// A window definition inside its parentheses (v0.16,
+    /// `window`; the pin's `window` rule): `[base] [PARTITION BY
+    /// expr, ...] [ORDER BY term, ...] [frame]`. `held`
+    /// approximates the pin's stack below its expressions.
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn window_def<E>(&mut self, held: usize) -> Result<crate::sql::ast::WindowDef, E> {
+        const KWS: &[&[u8]] = &[b"PARTITION", b"ORDER", b"RANGE", b"ROWS", b"GROUPS"];
+        let base = match self.cur().tok {
+            Tok::Ident(_, q) if q || !KWS.iter().any(|k| self.cur_is_kw(k)) => {
+                let h = self.window_name::<E>(self.pos)?;
+                self.pos += 1;
+                Some(h)
+            }
+            Tok::Text(_) => {
+                let h = self.window_name::<E>(self.pos)?;
+                self.pos += 1;
+                Some(h)
+            }
+            _ => None,
+        };
+        let mut partition = AVec::new();
+        if self.eat_kw(b"PARTITION") {
+            self.expect_kw::<E>(b"BY")?;
+            loop {
+                let at = if partition.is_empty() { held } else { held + 2 };
+                partition.push(self.window_expr::<E>(at)?);
+                if !self.eat(Tok::Comma) {
+                    break;
+                }
+            }
+            if partition.len() > MAX_COLUMN {
+                return Err(perr(self.cur().offset, ParseKind::TooManyTerms));
+            }
+        }
+        let order_by = if self.eat_kw(b"ORDER") {
+            self.expect_kw::<E>(b"BY")?;
+            self.order_terms::<E>(held + 3, false)?
+        } else {
+            AVec::new()
+        };
+        let frame = self.frame_opt::<E>(held + 4)?;
+        Ok(crate::sql::ast::WindowDef {
+            base,
+            partition,
+            order_by,
+            frame,
+        })
+    }
+
+    /// One expression of a window definition, `held` symbols up.
+    #[cfg(feature = "window")]
+    fn window_expr<E>(&mut self, held: usize) -> Result<Expr, E> {
+        let h0 = self.held;
+        self.held = held;
+        self.peak::<E>(self.held)?;
+        let r = self.parse_expr::<E>();
+        self.held = h0;
+        r
+    }
+
+    /// A window's optional frame (v0.16, `window`; the pin's
+    /// `frame_opt`): `ROWS | RANGE | GROUPS` then one start bound
+    /// (the end is CURRENT ROW) or `BETWEEN start AND end`, then
+    /// an optional `EXCLUDE`. A start that comes after the end in
+    /// the pin's bound order is its "unsupported frame
+    /// specification".
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn frame_opt<E>(&mut self, held: usize) -> Result<Option<crate::sql::ast::Frame>, E> {
+        use crate::sql::ast::{Frame, FrameBound, FrameExclude, FrameUnit};
+        let unit = if self.eat_kw(b"ROWS") {
+            FrameUnit::Rows
+        } else if self.eat_kw(b"RANGE") {
+            FrameUnit::Range
+        } else if self.eat_kw(b"GROUPS") {
+            FrameUnit::Groups
+        } else {
+            return Ok(None);
+        };
+        let at = self.cur().offset;
+        let (start, end) = if self.eat_kw(b"BETWEEN") {
+            let s = self.frame_bound::<E>(held + 2, true)?;
+            self.expect_kw::<E>(b"AND")?;
+            let e = self.frame_bound::<E>(held + 4, false)?;
+            (s, e)
+        } else {
+            (
+                self.frame_bound::<E>(held + 1, true)?,
+                FrameBound::CurrentRow,
+            )
+        };
+        if matches!(
+            (&start, &end),
+            (FrameBound::CurrentRow, FrameBound::Preceding(_))
+                | (
+                    FrameBound::Following(_),
+                    FrameBound::Preceding(_) | FrameBound::CurrentRow
+                )
+        ) {
+            return Err(perr(at, ParseKind::UnsupportedFrame));
+        }
+        let exclude = if self.eat_kw(b"EXCLUDE") {
+            if self.eat_kw(b"NO") {
+                self.expect_kw::<E>(b"OTHERS")?;
+                FrameExclude::NoOthers
+            } else if self.eat_kw(b"CURRENT") {
+                self.expect_kw::<E>(b"ROW")?;
+                FrameExclude::CurrentRow
+            } else if self.eat_kw(b"GROUP") {
+                FrameExclude::Group
+            } else {
+                self.expect_kw::<E>(b"TIES")?;
+                FrameExclude::Ties
+            }
+        } else {
+            FrameExclude::None
+        };
+        Ok(Some(Frame {
+            unit,
+            start,
+            end,
+            exclude,
+        }))
+    }
+
+    /// One frame boundary (v0.16, `window`): `UNBOUNDED PRECEDING`
+    /// (a start only), `UNBOUNDED FOLLOWING` (an end only),
+    /// `CURRENT ROW`, or `expr PRECEDING | FOLLOWING` — an offset
+    /// that is not a constant expression becomes NULL, as the
+    /// pin's `sqlite3WindowOffsetExpr` makes it.
+    #[cfg(feature = "window")]
+    fn frame_bound<E>(
+        &mut self,
+        held: usize,
+        start: bool,
+    ) -> Result<crate::sql::ast::FrameBound, E> {
+        use crate::sql::ast::FrameBound;
+        if self.eat_kw(b"UNBOUNDED") {
+            return Ok(if start {
+                self.expect_kw::<E>(b"PRECEDING")?;
+                FrameBound::UnboundedPreceding
+            } else {
+                self.expect_kw::<E>(b"FOLLOWING")?;
+                FrameBound::UnboundedFollowing
+            });
+        }
+        if self.eat_kw(b"CURRENT") {
+            self.expect_kw::<E>(b"ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let e = self.window_expr::<E>(held)?;
+        let e = if offset_is_constant(&e) {
+            e
+        } else {
+            Expr::Literal(Literal::Null)
+        };
+        if self.eat_kw(b"PRECEDING") {
+            Ok(FrameBound::Preceding(Box::new(e)))
+        } else {
+            self.expect_kw::<E>(b"FOLLOWING")?;
+            Ok(FrameBound::Following(Box::new(e)))
+        }
+    }
+
+    /// A core's `WINDOW name AS (...), ...` clause (v0.16,
+    /// `window`), after HAVING. Each definition after the first
+    /// takes its base window's PARTITION BY / ORDER BY from the
+    /// definitions before it (the pin's `sqlite3WindowChain`;
+    /// the first definition's base is never looked up, as on the
+    /// pin).
+    #[cfg(feature = "window")]
+    #[inline(never)]
+    fn window_clause<E>(
+        &mut self,
+        held: usize,
+    ) -> Result<AVec<(ABytes, crate::sql::ast::WindowDef)>, E> {
+        let mut out: AVec<(ABytes, crate::sql::ast::WindowDef)> = AVec::new();
+        if !self.window_clause_at(self.pos) {
+            return Ok(out);
+        }
+        self.pos += 1;
+        loop {
+            let name = self.window_name::<E>(self.pos)?;
+            self.pos += 1;
+            self.expect_kw::<E>(b"AS")?;
+            self.expect::<E>(Tok::LParen)?;
+            let mut w = self.window_def::<E>(held + 4)?;
+            self.expect::<E>(Tok::RParen)?;
+            if !out.is_empty() {
+                crate::sql::ast::chain_window(&mut w, out.as_slice(), self.arena)
+                    .map_err(|kind| Error::Schema { kind })?;
+            }
+            out.push((name, w));
+            if !self.eat(Tok::Comma) {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     // ---------- rich SELECT ----------
@@ -3559,6 +3854,8 @@ impl<'a> Parser<'a> {
             values,
             #[cfg(feature = "v16")]
             with: None,
+            #[cfg(feature = "window")]
+            windows: AVec::new(),
         })
     }
 
@@ -3650,6 +3947,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // `... having_opt WINDOW windowdefn_list` (v0.16, `window`).
+        #[cfg(feature = "window")]
+        let windows = self.window_clause::<E>(base + 8)?;
         // The core's end: `SELECT distinct selcollist from
         // where_opt groupby_opt having_opt orderby_opt limit_opt`.
         self.peak::<E>(base + 9)?;
@@ -3668,6 +3968,8 @@ impl<'a> Parser<'a> {
             values: AVec::new(),
             #[cfg(feature = "v16")]
             with: None,
+            #[cfg(feature = "window")]
+            windows,
         })
     }
 
@@ -3852,6 +4154,8 @@ impl<'a> Parser<'a> {
             compound: AVec::new(),
             values: AVec::new(),
             with: None,
+            #[cfg(feature = "window")]
+            windows: AVec::new(),
         }
     }
 
@@ -5318,6 +5622,48 @@ impl<'a> Parser<'a> {
         };
         let name = self.name::<E>()?;
         Ok(Ast::DropTable { name, if_exists })
+    }
+}
+
+/// Whether a frame offset is a constant expression as the pin's
+/// parser sees one (v0.16, `window`; `sqlite3ExprIsConstant` before
+/// name resolution): literals, bound parameters and operators over
+/// them. Columns, calls (no function is known constant before
+/// resolution) and subqueries are not.
+#[cfg(feature = "window")]
+fn offset_is_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::HexTooBig(_) => true,
+        // A bound parameter counts as a constant there.
+        #[cfg(feature = "params")]
+        Expr::Param(..) => true,
+        Expr::Neg(x)
+        | Expr::Pos(x)
+        | Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull(x, _)
+        | Expr::Cast(x, _)
+        | Expr::Collate(x, _) => offset_is_constant(x),
+        Expr::Binary(_, a, b) | Expr::Like(a, b, _) => {
+            offset_is_constant(a) && offset_is_constant(b)
+        }
+        Expr::Between(x, a, b, _) => {
+            offset_is_constant(x) && offset_is_constant(a) && offset_is_constant(b)
+        }
+        Expr::InList(x, l, _) => offset_is_constant(x) && l.iter().all(offset_is_constant),
+        Expr::Vector(l) => l.iter().all(offset_is_constant),
+        Expr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_none_or(offset_is_constant)
+                && otherwise.as_deref().is_none_or(offset_is_constant)
+                && whens
+                    .iter()
+                    .all(|(w, t)| offset_is_constant(w) && offset_is_constant(t))
+        }
+        _ => false,
     }
 }
 
