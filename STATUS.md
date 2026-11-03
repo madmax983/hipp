@@ -4768,6 +4768,207 @@ rowid / upsert fixes.
   whole-database `foreign_key_check`, full child scans, SET DEFAULT
   evaluated once per action statement).
 
+### JSON functions (2026-11-03)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin (`/home/user/hipp-design/oracle/sqlite3`), gated behind the new
+leaf feature `json` (in `max`, not `full`). Census (225 probes):
+MATCH 186, HIPP_ERR 10, DIFF 2, BOTH_ERR 27 — the four JSON probes
+(`f_json`, `f_json_ops`, `f_json_each`, `f_json_agg`) moved
+HIPP_ERR → MATCH; no JSON probe is left in the other columns.
+
+**Shipped — leaf feature `json`** (`json = ["v16"]`, in `max`;
+`v16,json` in `ci/feature-sets.txt`; new `src/json.rs`,
+`src/session/json_tvf.rs`; `ScalarFn::Json`, `AggKind::Json`,
+`Tok::Ptr`):
+
+- `json`, `jsonb`, `json_array` / `jsonb_array`, `json_object` /
+  `jsonb_object`, `json_extract` / `jsonb_extract` (one path: the
+  SQL value; several: a JSON array), the `->` / `->>` operators
+  (lexed as `TK_PTR` at the precedence of `||`, left-associative; an
+  INTEGER right side is `[N]` / `[#-N]`, an all-alphanumeric label
+  `.label`, `[...]` itself, anything else `."text"`), `json_insert`
+  / `json_replace` / `json_set` / `json_array_insert` and their
+  `jsonb_` forms (`$[#]` appends; NULL paths skipped; `$` replaces
+  the whole document), `json_remove` / `jsonb_remove`, `json_patch`
+  / `jsonb_patch` (RFC 7396 over JSONB, the pin's in-place
+  algorithm), `json_type`, `json_valid` (flags 1 / 2 / 4 / 8),
+  `json_quote`, `json_array_length`, `json_error_position`,
+  `json_pretty`, the aggregates `json_group_array` /
+  `json_group_object` (and `jsonb_`; DISTINCT, aggregate ORDER BY,
+  FILTER, and as window functions when `window` is built), and the
+  table-valued `json_each` / `json_tree` / `jsonb_each` /
+  `jsonb_tree` in FROM with all ten columns (`key value type atom
+  id parent fullkey path`, hidden `json` / `root`), the rowid, the
+  optional root path, joins, and correlated (lateral) arguments
+  (`FROM t, json_each(t.doc)`, LEFT JOIN, inside subqueries).
+- **The JSONB format, byte for byte:** text is translated as the pin
+  does (minimal headers; numbers and strings keep their source text
+  — `json('1e5')` is `1e5`, a hex literal is INT5 — TEXT / TEXTJ /
+  TEXT5 / TEXTRAW chosen by the escapes a string holds, Infinity as
+  `9e999`), edits splice the blob with the pin's size-adjustment
+  walk and its `jsonBlobOverwrite` trick (a value replaced by one up
+  to 8 bytes shorter gets a denormalized header instead of a move:
+  `jsonb_set('[12345]','$[0]',1)` is `6BE30000000131`), a blob
+  argument is JSONB when the pin's `jsonArgIsJsonb` says so (a short
+  blob that reads like JSON text must pass the strict check), and
+  JSONB built from text that hits the nesting limit is the pin's
+  partial blob.
+- **JSON5 input:** comments, unquoted keys (identifier bytes,
+  `\uXXXX`), single quotes, `+`, `.5` / `5.`, hex, trailing commas,
+  Infinity / NaN / QNaN / SNaN in any case, the JSON5 white space
+  set and escapes (`\x41`, `\'`, `\v`, `\0`, line continuations) —
+  rendered canonically (`A`, `\u000b`, `5.0`, `0.5`, `9e999`).
+  `json_error_position` reports the pin's character offsets, the
+  quirks included (trailing garbage is position 1; a container's
+  bad continuation reports where the probe started).
+- **Values:** REALs into JSON text render as the pin's REAL → TEXT
+  conversion (`0.30000000000000004`, `1.0e+300`), ±Inf as
+  `9.0e+999` (into JSONB by the edit functions: `9e999`); integers beyond i64 come
+  back REAL, `-9223372036854775808` INTEGER, a 16-digit hex with
+  the top bit set a positive REAL; strings decode with the pin's
+  escape table (lone surrogates kept, invalid escapes dropped, a
+  trailing line continuation a NUL).
+- **The JSON subtype** (`query::eval_json_arg`): a JSON function's
+  text result is JSON to the JSON function it feeds (`json_array(json('[1]'))`
+  is `[[1]]`), through `+x`, COLLATE, CAST AS TEXT, CASE,
+  coalesce / ifnull, iif, nullif, scalar and aggregate min / max,
+  likely / unlikely / likelihood, a JSON aggregate (window results
+  too), and a `json_each` `value` that is an array or object
+  (`json::Op::EachValue`); lost through tables, subqueries, views,
+  CTEs and every other function, as on the pin.
+- **Limits:** text nesting past 1000 is "malformed JSON"; a path
+  lookup more than 1000 calls deep is "JSON path too deep" (the
+  pin's count: one call per step plus the final one, a created
+  substructure continuing the count); rendering a container deeper
+  than 1000 (pretty: any node) or merging deeper than 1000 is
+  "JSON nested too deep". Every walk is iterative: no recursion on
+  input-derived depth.
+- **Errors** (remedy-named `SchemaKind` variants): `JsonMalformed`,
+  `JsonBadPath`, `JsonPathTooDeep`, `JsonNestedTooDeep`,
+  `JsonBlobValue`, `JsonObjectOddArgs`, `JsonObjectLabel`,
+  `JsonOddArgs`, `JsonValidFlags`, `JsonNotArrayElement`; wrong
+  argument counts and `json_each(a, b, c)` are prepare-time
+  `WrongArgumentCount`.
+- **Table-valued sources** (`session/json_tvf.rs`): a call plans as
+  a source whose placeholder derived plan holds the resolved
+  arguments as its one VALUES row, so every plan walker
+  (correlation, shifts, aggregates, subqueries) sees them; arguments
+  that read only enclosing queries run once per execution, ones
+  that read a source to the left run per row of the sources before
+  it, after the WHERE terms (and an inner join's ON terms) that read
+  only those sources — the pin tests those first, so `FROM t,
+  json_each(t.j) WHERE json_valid(t.j)` never parses a malformed j.
+  `key`, `value` and `atom` hold the element's JSONB and decode
+  when read (the pin computes columns lazily: `count(*)` over a
+  document too deep to render answers); a scalar subquery's first
+  row stops the cursor there. An element whose header does not
+  decode stops the cursor with "malformed JSON" (the pin's).
+- **Ungated fix (claimed v0.4 paths): conditions short-circuit as
+  the pin's jump code does** (`query::cond`, `cond_row_sub`): WHERE,
+  ON, UPDATE / DELETE / upsert WHERE, aggregate FILTER, searched
+  CASE WHEN and iif conditions stop an AND at a term that is not
+  true and an OR at one that is, so `DELETE FROM t WHERE
+  json_valid(a) AND json_array_length(a) = 3` (and `x = 0 AND
+  abs(-9223372036854775808) > x` in a WHERE) no longer fail on rows
+  the first term rejects. A skipped operand that is a deterministic
+  constant is still computed in WHERE / ON / FILTER (the pin factors
+  constant terms out of its loop, so `WHERE x = 1 AND
+  abs(-9223372036854775808) > 0` fails there), never in CASE WHEN /
+  iif. Value contexts (`SELECT a AND b`) still evaluate both
+  operands, as the pin does.
+
+**Oracle-probing notes** (all on the live pin; recorded before
+implementation, refined by the corpora): the JSONB headers are
+minimal on translation and after edits, but untouched parts of a
+blob argument keep their own (even 9-byte) headers; the overwrite
+trick applies to replacements 1..=8 bytes shorter (`d` must fit a
+larger header: 1/2/4/8 from a 1-byte header, 1/3/7 from 2, 2/6 from
+3, 4 from 5); `jsonb_array` / `jsonb_group_array` go through text
+(`TEXTJ` for an escaped string) while `jsonb_set` stores a SQL text
+as TEXTRAW; `json_array_insert` exists in 3.54 (errors "not an
+array element" when the path's last byte is not `]`, before
+anything else); `json_valid` reads FLAGS with `sqlite3_value_int64`
+before looking at X (`json_valid(NULL, 0)` errors); `jsonb_each`
+/ `jsonb_tree` exist and return JSONB for containers; the hidden
+columns' values (`json` is the input text up to its first NUL, or
+the blob); `json_tree` with a root path reports the root row's key
+from the path text (`'$.a[1]'` gives the key `a[1]`, the pin's
+`jsonEachPathLength`); `->` / `->>` bind tighter than `*` and unary
+minus binds tighter than `->`; the depth thresholds above (probed
+with crafted JSONB at 998..1002 levels); `x = 1 AND json('x')` in a
+SELECT list fails on the pin, but not as a CASE WHEN / iif / WHERE
+condition.
+
+**Bugs the corpora found during the unit** (all fixed, regression
+lines in `tests/json_v16.rs` `regressions`): `json_patch` read the
+target's stale header after converting a non-object (the pin bounds
+payloads by the pre-edit size); `json_array_insert` raised "not an
+array element" only after a missing intermediate index; hex digits
+in `\u` escapes of blobs use the pin's nibble rule (`\u\x8c041` is
+U+C041); FLOAT5 `-` alone is malformed; JSONB detection in
+`json_error_position`, `json_each` and edit values is the strict
+`jsonArgIsJsonb`; eagerly decoded `json_each` columns failed
+`count(*)`; a malformed element made the cursor loop; scalar
+lookup found the math functions first and hid the JSON ones (`json`
+vs `math` ordering); the `json_each` WHERE pre-test (above) and a
+LEFT JOIN's ON, which the pin does *not* test first.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed" (`v16,json` compiles warning-free alone).
+New suites: `tests/json_v16.rs` (16 tests: JSONB / JSON5 text,
+values, paths and operators, edits / patch / overwrite, subtype
+rules, aggregates and windows, table-valued functions, schema and
+write paths, nesting limits, large documents, remedy-named errors,
+regressions, and three generated corpora — random JSON / JSON5 /
+malformed text with random paths through every function, random
+JSONB blobs with denormalized headers and corrupt bytes, random
+documents in a table through aggregates, windows, lateral joins and
+per-row edits; 1,500 cases each by default, `HIPP_JSON_CORPUS`
+scales them, 10,000 agreed); `src/json.rs` unit tests;
+`hipp-cli/tests/cli_v16_json.rs` (2 tests, byte-identical one-shot
+and over stdin: pretty text, raw blobs, tables and aggregates, and a
+generated corpus of valid documents through json / jsonb / paths /
+edits / json_tree).
+
+**Size:** tiny **76,924 B** (Δ **0**). Full **486,316 B** (Δ **+184 B**
+vs 486,132, ratchet raised): the ungated condition short-circuit
+(`query::cond` with its constant factoring, `cond_row_sub`) — the
+leaf itself is not in `full`. Max **638,756 B** (Δ **+32,552 B** vs
+606,204, raised; just under the 32 KiB threshold): the JSON engine
+(text / JSON5 parser, renderer, pretty printer, paths, edits, merge
+patch, validity check, the `json_each` cursor) and its wiring.
+
+**Honest gaps:**
+
+- The subtype does not survive a FROM subquery, view or CTE over
+  `json_each`'s `value` (`SELECT json_array(v) FROM (SELECT value v
+  FROM json_each('[[1]]'))` is `["[1]"]`; the pin flattens the
+  subquery and keeps it), nor an aggregate min / max whose argument
+  is only sometimes JSON (`min(json_extract(...))`).
+- A `json_each` value column compares with no collation (it reads
+  through the subtype wrapper), where the pin's column has BINARY:
+  only a comparison against a NOCASE / RTRIM column differs.
+- `json_each` / `json_tree` without arguments (`FROM json_each WHERE
+  json = ...`, the hidden-column constraint form) is refused
+  (`Unsupported`), as are arguments reading a source to the right
+  (the pin reorders the join) and a lateral call on the right of a
+  RIGHT / FULL join; `json_each()` with empty parentheses has no
+  rows, as on the pin.
+- Rows stream on the pin: a statement that fails part-way prints the
+  rows before the failure there, none in hipp (both fail). Columns
+  other than key / value / atom are computed for every row, and an
+  object whose last label has no value reads NULL where the pin reads
+  past the blob's end.
+- No parse cache: each call re-translates its text argument (the
+  pin keeps recent parses per statement), so a large document read
+  many times per row costs that many parses; edits copy the blob.
+- HAVING and CHECK constraints still evaluate both operands of AND /
+  OR (the condition fix covers the other sites listed), and a
+  constant buried inside a skipped comparison (`x = 1 AND y =
+  abs(-9223372036854775808)`) is not computed, where the pin factors
+  it out and fails.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

@@ -557,6 +557,23 @@ aspirations.
   ADD COLUMN REFERENCES fixes), max +33.8 KB with the review fixes
   (STATUS.md).
 
+- **JSON functions** (new leaf feature `json`, in `max` — ADR
+  0002 — not `full`): `json()` / `jsonb()` with the pin's JSONB
+  format byte for byte (its overwrite-in-place headers included),
+  JSON5 input with canonical output, `json_array` / `json_object`,
+  `json_extract` and the `->` / `->>` operators, `json_insert` /
+  `replace` / `set` / `array_insert` / `remove` (`$[#]` appends),
+  `json_patch`, `json_type`, `json_valid` (flags), `json_quote`,
+  `json_array_length`, `json_error_position`, `json_pretty`, every
+  `jsonb_` form, `json_group_array` / `json_group_object` (also as
+  window functions), and `json_each` / `json_tree` (and `jsonb_`) in
+  FROM with all their columns, correlated to the sources on their
+  left. The JSON subtype rules, the pin's errors and its 1000-level
+  nesting and path limits; every walk is iterative. Ungated: WHERE /
+  ON / FILTER / CASE WHEN / iif conditions short-circuit AND / OR as
+  the pin's jump code does. Tiny unchanged, full +184 B (that fix),
+  max +32.6 KB (STATUS.md).
+
 ## What v0.13 does
 
 - Everything v0.12 does (below), plus **uncorrelated-
@@ -885,14 +902,16 @@ A workspace: the zero-dependency core crate at the root plus
 v0.4), `agg` (aggregate folding: the pin's sum / percentile
 rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
 the v0.16 scalar function library), `window` (window functions:
-the pin's frame engine, feature `window`, v0.16),
+the pin's frame engine, feature `window`, v0.16), `json` (the JSON
+functions and JSONB, feature `json`, v0.16),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor;
 `session/pragma` the PRAGMA statements and integrity check,
 `session/cte` view / CTE expansion and the recursive queue,
 `session/maint` savepoints, VACUUM, REINDEX and ANALYZE,
-`session/trigger` trigger programs, v0.16; `sql/trig` the NEW. /
+`session/trigger` trigger programs, `session/json_tvf` the
+`json_each` / `json_tree` sources, v0.16; `sql/trig` the NEW. /
 OLD. binder),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build

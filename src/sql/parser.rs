@@ -2818,6 +2818,8 @@ impl<'a> Parser<'a> {
             Tok::Plus | Tok::Minus => BP_ADD,
             Tok::Star | Tok::Slash | Tok::Percent => BP_MUL,
             Tok::Concat => BP_CONCAT,
+            #[cfg(feature = "json")]
+            Tok::Ptr(_) => BP_CONCAT,
             Tok::Ident(h, false) => {
                 let b = handle_bytes(self.arena, h);
                 if eq_ci(b, b"OR") {
@@ -2888,6 +2890,25 @@ impl<'a> Parser<'a> {
             self.node::<E>(0, EK_CONST)?;
             self.ek |= EK_COLLATE;
             return Ok(Expr::Collate(Box::new(l), c));
+        }
+        // `expr -> expr` / `expr ->> expr` (v0.16, `json`): the pin
+        // parses them as calls of its functions `->` / `->>`.
+        #[cfg(feature = "json")]
+        if let Tok::Ptr(long) = self.cur().tok {
+            self.pos += 1;
+            let r = self.operand::<E>(2, bp + 1)?;
+            self.node::<E>(lh, lk)?;
+            let mut args = AVec::new();
+            args.push(l);
+            args.push(r);
+            let name: &[u8] = if long { b"->>" } else { b"->" };
+            return Ok(Expr::Func {
+                name: self.arena.alloc_copy_handle(name)?,
+                distinct: false,
+                star: false,
+                args,
+                clause: None,
+            });
         }
         let op = match self.cur().tok {
             Tok::Eq => BinOp::Eq,

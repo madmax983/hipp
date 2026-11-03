@@ -68,6 +68,11 @@ pub enum Tok {
     /// `Expr::HexTooBig` and resolution refuses it.
     #[cfg(feature = "v04")]
     HexTooBig,
+    /// `->` (false) and `->>` (true), the JSON extraction
+    /// operators (v0.16, `json`): the pin's `TK_PTR`, at the
+    /// precedence of `||`.
+    #[cfg(feature = "json")]
+    Ptr(bool),
     Eof,
 }
 
@@ -983,6 +988,15 @@ fn lex_inner<E>(
                     offset: off,
                 });
                 i += 2;
+            }
+            #[cfg(feature = "json")]
+            b'-' if i + 1 < n && sql[i + 1] == b'>' => {
+                let long = i + 2 < n && sql[i + 2] == b'>';
+                toks.push(Token {
+                    tok: Tok::Ptr(long),
+                    offset: off,
+                });
+                i += if long { 3 } else { 2 };
             }
             b'-' => {
                 toks.push(Token {

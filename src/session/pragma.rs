@@ -898,6 +898,12 @@ impl<S: Storage> Connection<S> {
                 let mut base = 0usize;
                 for sp in plan.sources.iter() {
                     if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
+                        // A table-valued function's columns have no
+                        // declared type (v0.16, `json`).
+                        #[cfg(feature = "json")]
+                        if sp.tvf != 0 {
+                            return None;
+                        }
                         if let Some(d) = &sp.derived {
                             let it = d.items.as_slice().get(k).or_else(|| {
                                 d.values
@@ -1347,6 +1353,10 @@ fn item_aff(plan: &crate::query::SubPlan, e: &RExpr) -> Option<Affinity> {
             let mut base = 0usize;
             for sp in plan.sources.iter() {
                 if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
+                    #[cfg(feature = "json")]
+                    if sp.tvf != 0 {
+                        return None;
+                    }
                     if let Some(d) = &sp.derived {
                         let it = d.items.as_slice().get(k).or_else(|| {
                             d.values

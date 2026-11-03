@@ -688,6 +688,23 @@ pub fn fill(e: &mut RExpr, vals: &[OwnedValue]) {
             .get(c.shown.unwrap_or(c.slot))
             .cloned()
             .unwrap_or(OwnedValue::Null);
+        // A JSON aggregate's text keeps the JSON subtype (v0.16,
+        // `json`: `json_array(json_group_array(x) OVER ())`).
+        #[cfg(feature = "json")]
+        if let WinFn::Agg(AggKind::Json(j)) = c.func
+            && !j.blob
+        {
+            let mut a = AVec::new();
+            a.push(RExpr::Literal(v));
+            *e = RExpr::Scalar(
+                crate::query::ScalarFn::Json(crate::json::JsonFn {
+                    op: crate::json::Op::Subtyped,
+                    blob: false,
+                }),
+                a,
+            );
+            return;
+        }
         *e = RExpr::Literal(v);
         return;
     }
@@ -1587,6 +1604,9 @@ impl<'a> Member<'a> {
                     self.gc.step(&x, sep);
                 }
             }
+            // Folded over the frame when its value is read.
+            #[cfg(feature = "json")]
+            AggKind::Json(_) => {}
             AggKind::Median
             | AggKind::Percentile
             | AggKind::PercentileCont
@@ -2012,6 +2032,8 @@ pub fn resolve_call<E>(
                     AggKind::Percentile | AggKind::PercentileCont | AggKind::PercentileDisc => {
                         (2, 2)
                     }
+                    #[cfg(feature = "json")]
+                    AggKind::Json(j) => (j.nargs(), j.nargs()),
                     _ => (1, 1),
                 };
                 (WinFn::Agg(k), lo, hi)
@@ -2075,6 +2097,16 @@ pub fn resolve_call<E>(
     let r = resolve_kids::<E>(args, clause, &def, arena, cur, enclosing, planner);
     cur.win.ok.set(was);
     let (kids, order) = r?;
+    // A JSON aggregate folds its rows' JSON text (v0.16, `json`).
+    #[cfg(feature = "json")]
+    let (kids, n) = {
+        let mut kids = kids;
+        let n = match func {
+            WinFn::Agg(AggKind::Json(j)) => crate::query::json_agg_args(j, false, n, &mut kids),
+            _ => n,
+        };
+        (kids, n)
+    };
     let frame = match &def.frame {
         None => None,
         Some(f) => {

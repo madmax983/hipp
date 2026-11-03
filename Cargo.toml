@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys"]
+max = ["full", "window", "triggers", "foreign_keys", "json"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -183,6 +183,21 @@ triggers = ["v16"]
 # the pragma is ON (never skipped silently). The tiny profile
 # excludes it per §2.
 foreign_keys = ["v16", "indexes"]
+
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): the JSON functions -- json(), jsonb() and the pin's JSONB
+# binary format (byte-identical blobs), json_array / json_object,
+# json_extract and the -> / ->> operators, json_insert / replace /
+# set / remove / array_insert (and their jsonb_ forms), json_patch,
+# json_type, json_valid, json_quote, json_array_length,
+# json_error_position, json_pretty, the json_group_array /
+# json_group_object aggregates (window functions too when `window`
+# is built) and the json_each / json_tree table-valued functions,
+# with JSON5 input, the JSON subtype rules and the 1000-level
+# nesting limit. Builds on the v0.16 function library (printf's
+# value conversions, table-valued sources in FROM), so it implies
+# `v16`. The tiny profile excludes it per §2.
+json = ["v16"]
 
 [dependencies]
 

@@ -61,10 +61,16 @@ fn fold_rows(
     let first = |i: usize| rows.as_slice().get(i).and_then(|r| r.as_slice().first());
     // DISTINCT: the first of equal non-NULL values, in input order
     // (NULLs never count, so they are dropped here).
+    // A JSON aggregate steps one NULL of a DISTINCT call (v0.16,
+    // `json`: `json_group_array(DISTINCT x)` holds `null` once).
+    #[cfg(feature = "json")]
+    let keep_null = matches!(p.kind, AggKind::Json(_));
+    #[cfg(not(feature = "json"))]
+    let keep_null = false;
     if p.distinct && !p.unique {
         let mut kept: AVec<usize> = AVec::new();
         for &i in idx.iter() {
-            let Some(v) = first(i).filter(|v| !matches!(v, OwnedValue::Null)) else {
+            let Some(v) = first(i).filter(|v| keep_null || !matches!(v, OwnedValue::Null)) else {
                 continue;
             };
             if kept
@@ -187,6 +193,13 @@ fn fold_rows(
         | AggKind::Percentile
         | AggKind::PercentileCont
         | AggKind::PercentileDisc => percentile(p.kind, sel),
+        // The per-row JSON text is the last argument (a DISTINCT
+        // call keeps the value itself first, for the test).
+        #[cfg(feature = "json")]
+        AggKind::Json(j) => {
+            let at = p.args.len().saturating_sub(1);
+            Ok(j.fold(sel.iter().filter_map(|r| r.get(at))))
+        }
     }
 }
 

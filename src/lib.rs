@@ -22,6 +22,8 @@ pub mod btree;
 pub mod error;
 #[cfg(feature = "v16")]
 pub mod func;
+#[cfg(feature = "json")]
+pub mod json;
 #[cfg(feature = "math")]
 pub mod math;
 pub mod pager;

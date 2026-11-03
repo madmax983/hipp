@@ -68,6 +68,8 @@ mod alter;
 mod cte;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
+#[cfg(feature = "json")]
+mod json_tvf;
 #[cfg(feature = "v16")]
 mod maint;
 #[cfg(feature = "v16")]
@@ -4370,6 +4372,8 @@ impl<S: Storage> Connection<S> {
             gcols: None,
             #[cfg(feature = "v16")]
             rec: 0,
+            #[cfg(feature = "json")]
+            tvf: 0,
         });
         Ok(w)
     }
@@ -4404,6 +4408,21 @@ impl<S: Storage> Connection<S> {
             if let Some(crate::sql::RecMark::Ref { id }) = s.cte.as_ref().map(|c| c.rec) {
                 total += self.plan_rec_ref(s, id, arena, descs, plans)?;
                 continue;
+            }
+            // v0.16 (`json`): json_each / json_tree and their jsonb_
+            // forms, unless a table or view takes the name.
+            #[cfg(feature = "json")]
+            if s.derived.is_none() {
+                let n = handle_bytes(arena, s.table);
+                let k = crate::json::tvf_kind(n);
+                let ca = &self.catalog_arena;
+                if k != 0
+                    && self.catalog.find_readable(ca, n).is_none()
+                    && self.catalog.find_view(ca, n).is_none()
+                {
+                    total += self.plan_json_tvf(s, k, arena, descs, plans)?;
+                    continue;
+                }
             }
             // v0.16: a table-valued pragma function, or the empty
             // temp schema, as the derived table of its rows.
@@ -4492,6 +4511,8 @@ impl<S: Storage> Connection<S> {
                 gcols,
                 #[cfg(feature = "v16")]
                 rec: 0,
+                #[cfg(feature = "json")]
+                tvf: 0,
             });
             total += t.columns.len();
         }
@@ -4527,6 +4548,11 @@ impl<S: Storage> Connection<S> {
         let mut hoisted = None;
         let mut using = using.as_slice().iter();
         for (i, (s, plan)) in from.iter().zip(plans.iter_mut()).enumerate() {
+            // A JSON table-valued function's arguments (v0.16).
+            #[cfg(feature = "json")]
+            if plan.tvf != 0 {
+                self.plan_tvf_args(s, i, arena, cur, enclosing, plan, &mut *planner)?;
+            }
             let mut cond = using.next().cloned().flatten();
             if let Some(on) = &s.on {
                 let r = resolve_scoped::<S::Error>(on, arena, cur, enclosing, &mut *planner)?;
@@ -8002,7 +8028,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             combined.rowids.push(*r);
         }
         if let Some(f) = &up.filter
-            && crate::query::truthy(&self.eval_row_sub(f, &combined).await?) != Some(true)
+            && !self.cond_row_sub(f, &combined).await?
         {
             return Ok(()); // WHERE false: neither insert nor update.
         }
@@ -8346,12 +8372,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             if let Some(f) = filter {
                 let rd = row_data_for(rowid_alias, affs, rec.as_slice(), rowid);
                 #[cfg(feature = "v06")]
-                let keep = crate::query::truthy(&self.eval_row_sub(f, &rd).await?) == Some(true);
+                let keep = self.cond_row_sub(f, &rd).await?;
                 #[cfg(not(feature = "v06"))]
-                let keep = crate::query::truthy(&crate::query::eval::<S::Error>(
-                    f,
-                    &Ctx::of(&rd).with(&self.conn.env),
-                )?) == Some(true);
+                let keep = crate::query::cond::<S::Error>(f, &Ctx::of(&rd).with(&self.conn.env))?;
                 if !keep {
                     continue;
                 }
@@ -8577,9 +8600,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for c in joined.iter() {
                     let keep = match &filter {
                         None => true,
-                        Some(f) => {
-                            crate::query::truthy(&self.eval_row_sub(f, c).await?) == Some(true)
-                        }
+                        Some(f) => self.cond_row_sub(f, c).await?,
                     };
                     if keep {
                         last = Some(c.clone());
@@ -9623,6 +9644,22 @@ impl<'c, S: Storage> Statement<'c, S> {
         let _ = (outer, need);
         let mut src_rows: AVec<AVec<(AVec<OwnedValue>, Option<i64>)>> = AVec::new();
         for sp in sources.iter() {
+            // v0.16 (`json`): a JSON table-valued function's rows —
+            // computed in the join when its arguments read a source
+            // to its left (`join_step`).
+            #[cfg(feature = "json")]
+            if sp.tvf != 0 {
+                if sp.tvf & crate::query::TVF_LATERAL != 0 {
+                    src_rows.push(AVec::new());
+                    continue;
+                }
+                let mut padded = outer.clone();
+                pad_sources(&mut padded, sources);
+                let need = if src_rows.is_empty() { need } else { None };
+                let rows = self.json_tvf_rows(sp, &padded, need).await?;
+                src_rows.push(rows);
+                continue;
+            }
             // v0.16: a recursive reference's one row.
             #[cfg(feature = "v16")]
             if sp.rec != 0 {
@@ -9951,6 +9988,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(rv)
     }
 
+    /// Whether condition `e` holds for `row` (v0.16 fix, ungated):
+    /// `eval_row_sub` with the pin's jump code for AND / OR
+    /// (`query::cond`), so `WHERE json_valid(j) AND j ->> 'a' = 1`
+    /// never evaluates the second term for a row the first rejects.
+    #[cfg(feature = "v06")]
+    async fn cond_row_sub(&mut self, e: &RExpr, row: &RowData) -> Result<bool, S::Error> {
+        if !crate::query::has_sub(e) {
+            return crate::query::cond::<S::Error>(e, &Ctx::of(row).with(&self.conn.env));
+        }
+        let values = self.compute_sub_values(e, row).await?;
+        let mut pos = 0;
+        let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
+        crate::query::cond::<S::Error>(&e2, &Ctx::of(row).with(&self.conn.env))
+    }
+
     /// Evaluate one expression for one row, executing any
     /// subquery nodes it contains first (v0.6). Expressions
     /// without subqueries take the plain synchronous path.
@@ -10066,7 +10118,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             // The FILTER first: a row it rejects is not stepped,
             // and nothing else of it is evaluated.
             if let Some(f) = p.filter
-                && crate::query::truthy(&self.eval_row_sub(f, r).await?) != Some(true)
+                && !self.cond_row_sub(f, r).await?
             {
                 continue;
             }
@@ -10147,7 +10199,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut rep = first;
         for r in grows {
             if let Some(f) = m.filter
-                && crate::query::truthy(&self.eval_row_sub(f, r).await?) != Some(true)
+                && !self.cond_row_sub(f, r).await?
             {
                 continue;
             }
@@ -10618,14 +10670,28 @@ impl<'c, S: Storage> Statement<'c, S> {
             let (Some(sp), Some(rows)) = (sources.get(idx), src_rows.get(idx)) else {
                 let keep = match filter {
                     None => true,
-                    Some(f) => {
-                        crate::query::truthy(&self.eval_row_sub(f, &acc).await?) == Some(true)
-                    }
+                    Some(f) => self.cond_row_sub(f, &acc).await?,
                 };
                 if keep {
                     out.push(acc);
                 }
                 return Ok(());
+            };
+            // A JSON table-valued function reading the sources to its
+            // left (v0.16, `json`): its rows for this combination.
+            #[cfg(feature = "json")]
+            let lateral;
+            #[cfg(feature = "json")]
+            let rows = if sp.tvf & crate::query::TVF_LATERAL != 0 {
+                match self.lateral_rows(sources, idx, filter, &acc).await? {
+                    Some(r) => {
+                        lateral = r;
+                        &lateral
+                    }
+                    None => return Ok(()),
+                }
+            } else {
+                rows
             };
             let mut any = false;
             for (ri, (vals, rowid)) in rows.iter().enumerate() {
@@ -10648,11 +10714,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     Some(on) if crate::query::has_sub(on) => {
                         let mut padded = acc2.clone();
                         pad_sources(&mut padded, sources.get(idx + 1..).unwrap_or(&[]));
-                        crate::query::truthy(&self.eval_row_sub(on, &padded).await?) == Some(true)
+                        self.cond_row_sub(on, &padded).await?
                     }
-                    Some(on) => {
-                        crate::query::truthy(&self.eval_row_sub(on, &acc2).await?) == Some(true)
-                    }
+                    Some(on) => self.cond_row_sub(on, &acc2).await?,
                 };
                 if on_ok {
                     any = true;
@@ -12481,10 +12545,7 @@ fn join_rows<E>(
     let (Some(sp), Some(rows)) = (qp.sources.as_slice().get(idx), src_rows.get(idx)) else {
         let keep = match &qp.filter {
             None => true,
-            Some(f) => {
-                crate::query::truthy(&crate::query::eval::<E>(f, &Ctx::of(acc).with(env))?)
-                    == Some(true)
-            }
+            Some(f) => crate::query::cond::<E>(f, &Ctx::of(acc).with(env))?,
         };
         if keep {
             out.push(acc.clone());
@@ -12500,10 +12561,7 @@ fn join_rows<E>(
         acc.rowids.push(*rowid);
         let on_ok = match &sp.on {
             None => true,
-            Some(on) => {
-                crate::query::truthy(&crate::query::eval::<E>(on, &Ctx::of(acc).with(env))?)
-                    == Some(true)
-            }
+            Some(on) => crate::query::cond::<E>(on, &Ctx::of(acc).with(env))?,
         };
         if on_ok {
             any = true;
@@ -12950,7 +13008,7 @@ fn pick_rep_from<E>(
     for r in grows {
         let ctx = Ctx::of(r).with(env);
         if let Some(f) = m.filter
-            && crate::query::truthy(&crate::query::eval::<E>(f, &ctx)?) != Some(true)
+            && !crate::query::cond::<E>(f, &ctx)?
         {
             continue;
         }

@@ -1132,6 +1132,17 @@ fn outer_of(s: &SelectStmt, tail: bool, compound: bool, arena: &Arena) -> Outer 
     }
 }
 
+/// Whether `n` names a JSON aggregate (v0.16, `json`).
+fn json_agg_name(n: &[u8]) -> bool {
+    #[cfg(feature = "json")]
+    return crate::json::JsonAgg::lookup(n).is_some();
+    #[cfg(not(feature = "json"))]
+    {
+        let _ = n;
+        false
+    }
+}
+
 /// Whether a core aggregates: GROUP BY, HAVING, or an aggregate
 /// call (outside subqueries) in its result list or ORDER BY.
 fn core_is_agg(s: &SelectStmt, arena: &Arena) -> bool {
@@ -1153,7 +1164,7 @@ fn core_is_agg(s: &SelectStmt, arena: &Arena) -> bool {
         crate::rules::expr_any(e, &mut |x| match x {
             Expr::Func { name, args, .. } => {
                 let n = handle_bytes(arena, *name);
-                AGGS.iter().any(|a| eq_ci(n, a))
+                (AGGS.iter().any(|a| eq_ci(n, a)) || json_agg_name(n))
                     && !((eq_ci(n, b"min") || eq_ci(n, b"max")) && args.len() > 1)
             }
             _ => false,
@@ -1602,6 +1613,8 @@ impl<S: Storage> Connection<S> {
             derived: None,
             gcols: None,
             rec: id,
+            #[cfg(feature = "json")]
+            tvf: 0,
         });
         Ok(w)
     }

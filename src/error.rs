@@ -541,6 +541,57 @@ pub enum SchemaKind {
     /// view"). Drop the ON CONFLICT clause.
     #[cfg(feature = "triggers")]
     UpsertView,
+    /// A JSON argument that is neither JSON text (RFC 8259 or
+    /// JSON5) nor JSONB, or JSONB whose contents do not decode
+    /// (v0.16, `json`; the pin's "malformed JSON"). Pass valid
+    /// JSON, or check it first with `json_valid()`.
+    #[cfg(feature = "json")]
+    JsonMalformed,
+    /// A JSON path that does not start with `$` or does not parse
+    /// (v0.16, `json`; the pin's "bad JSON path: ..."). Write
+    /// `$`, then `.key`, `."quoted key"`, `[N]` or `[#-N]` steps.
+    #[cfg(feature = "json")]
+    JsonBadPath,
+    /// A JSON path walked more than 1000 steps deep (v0.16,
+    /// `json`; the pin's "JSON path too deep"). Use a shorter path.
+    #[cfg(feature = "json")]
+    JsonPathTooDeep,
+    /// JSON rendered or merged more than 1000 levels deep (v0.16,
+    /// `json`; the pin's "JSON nested too deep"). Nest less deeply.
+    #[cfg(feature = "json")]
+    JsonNestedTooDeep,
+    /// A BLOB that is not JSONB given as a JSON value (v0.16,
+    /// `json`; the pin's "JSON cannot hold BLOB values"). Encode it
+    /// first, e.g. with `hex()`.
+    #[cfg(feature = "json")]
+    JsonBlobValue,
+    /// `json_object()` / `jsonb_object()` with an odd number of
+    /// arguments (v0.16, `json`; the pin's "json_object() requires
+    /// an even number of arguments"). Pass label / value pairs.
+    #[cfg(feature = "json")]
+    JsonObjectOddArgs,
+    /// A `json_object()` label that is not TEXT (v0.16, `json`;
+    /// the pin's "json_object() labels must be TEXT"). Cast the
+    /// label to TEXT.
+    #[cfg(feature = "json")]
+    JsonObjectLabel,
+    /// `json_insert()` / `json_replace()` / `json_set()` /
+    /// `json_array_insert()` (or a `jsonb_` form) with an even
+    /// number of arguments (v0.16, `json`; the pin's "json_set()
+    /// needs an odd number of arguments"). Pass the JSON, then
+    /// path / value pairs.
+    #[cfg(feature = "json")]
+    JsonOddArgs,
+    /// `json_valid(X, FLAGS)` with FLAGS outside 1..=15 (v0.16,
+    /// `json`; the pin's "FLAGS parameter to json_valid() must be
+    /// between 1 and 15").
+    #[cfg(feature = "json")]
+    JsonValidFlags,
+    /// `json_array_insert()` at a path that names an object member
+    /// or the root (v0.16, `json`; the pin's "not an array
+    /// element"). End the path with an array index.
+    #[cfg(feature = "json")]
+    JsonNotArrayElement,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
