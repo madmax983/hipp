@@ -4139,7 +4139,9 @@ INSERT into a pin-made table with a trigger and simply not fire it.
   the stored row. UPDATE / DELETE: rows collected first, each read
   again at its turn (gone: skipped), BEFORE triggers, read once
   more (UPDATE: unassigned columns take the current values; NEW's
-  generated columns are NULL in BEFORE UPDATE), write, AFTER
+  generated columns in BEFORE UPDATE are computed from the assigned
+  columns and those a firing BEFORE UPDATE trigger reads as NEW.x,
+  the others NULL — review fix), write, AFTER
   triggers with the first-read OLD. `UPDATE OF` matches the SET
   list. WHEN clauses, RAISE(IGNORE / ROLLBACK / ABORT / FAIL, msg)
   (the message is any expression; `Connection::raise_message`),
@@ -4206,7 +4208,8 @@ generated columns and rowid -1; `new.a = '5'` over INT 5 is 0,
 `new.rowid = '1'` 1, `'B' = new.b` (NOCASE) 1; a view's NEW has no
 affinity; DELETE / UPDATE re-read rows (row 2 deleted by a BEFORE
 trigger is skipped, row 3 updated by one is seen updated); BEFORE
-UPDATE's NEW generated columns are NULL; recursion: a trigger never
+UPDATE's NEW generated columns are computed over the pin's new-column
+mask (see the review fixes); recursion: a trigger never
 re-enters itself without recursive_triggers, other triggers on the
 same table do; 1000 programs pass, the 1001st is "triggers nested
 too deep", counted before WHEN; RAISE(IGNORE) in a BEFORE trigger
@@ -4225,10 +4228,9 @@ column: w.a"; body errors at prepare (zero rows too); ALTER texts
 (quoted forms `old."aa"`, `OLD."aa"` from `[a]`, `"t 2".id`,
 `"uu".xx` for `excluded.x`); every ALTER checks every trigger; the
 shell's stdin reading follows `sqlite3_complete` (`BEGIN END;`
-swallows the following lines). Not modelled: a depth (or other
-non-constraint) error inside BEGIN keeps the statement's changes on
-the pin when its program has no abort point (no statement journal);
-hipp undoes the statement.
+swallows the following lines). A depth error inside BEGIN keeps the
+statement's changes on the pin when its program has no abort point
+(no statement journal) — modelled since the review fixes.
 
 **Bugs found while testing (fixed, regression tests in
 `tests/triggers_v16.rs::regressions` and the matrices):** a failed
@@ -4287,31 +4289,140 @@ runner and its failure resolution, the per-row hooks of every write
 path, INSTEAD OF planning and the ALTER trigger editor — which ADR
 0002 put in `max` for exactly this.
 
-**Honest gaps:**
+**Honest gaps** (as of the review fixes below):
 
 - A TEMP trigger on a main table is refused (`Unsupported`), as is
   a trigger in the temp database whose program writes a main table
-  ("no such table" when it fires): hipp runs a statement in one
-  database only.
-- RETURNING on a write of a view, and UPDATE ... FROM of a view,
-  are refused (`Unsupported`).
-- A depth (or other non-constraint) error inside an explicit
-  transaction undoes the statement; the pin keeps its changes when
-  its program has no abort point (see the probing notes).
-- Prepare-time checks cover the triggers the statement fires
-  directly (with all-NULL rows); a deeper program's name errors
-  surface when it runs (the pin compiles the whole nest at prepare),
-  and the parser's depth model starts a trigger statement at an
-  approximate stack base.
+  ("no such table" when it fires — an error, never a skipped
+  trigger): the TEMP database is a separate private connection and
+  a statement runs in one database only. Firing across the two
+  needs one statement journal over both connections, and DROP /
+  ALTER of the main table propagated into the temp schema; that is
+  a change of the TEMP design, not of this unit.
+- UPDATE ... FROM of a view is refused (`Unsupported`). A RETURNING
+  subquery of a view write whose FROM names the view itself is
+  computed once (the pin computes it per row: hipp reads the view as
+  a derived table there).
 - `0 AND nosuch` is still "no such column" (the pin drops the other
-  operand unresolved); `-0 AND x` is simplified here (hipp folds the
-  sign into the literal; the pin does not).
+  operand unresolved).
+- A trigger program's INSERT ... SELECT / DELETE / UPDATE stopped
+  part-way by a RAISE keeps the rows before the failing one only for
+  the pin's streaming shapes hipp re-runs row by row (a lone scan of
+  one table without sort, grouping, compound, subquery or window;
+  UPDATE / DELETE one-pass): a join or a derived table there keeps
+  none. An UPDATE whose WHERE the pin answers through an index it
+  also updates is treated as one-pass (the pin is not).
+- A WHERE evaluated past a LIMIT still errors (hipp evaluates the
+  whole WHERE first; the pin stops at the LIMIT) — a query-engine
+  gap that a body's `INSERT ... SELECT ... LIMIT` shows too.
+- The abort-point analysis behind a depth failure in a transaction
+  is conservative (an unrecognised construct counts as an abort
+  point, i.e. hipp undoes the statement) and assumes nothing of
+  foreign keys (any `PRAGMA foreign_keys=ON` counts as one).
+- Declared `ON CONFLICT REPLACE` on a column constraint is not
+  honoured (the constraints unit's gap); the REPLACE victim order
+  matches the pin for OR REPLACE / REPLACE statements.
 - Trigger programs are parsed and planned per row: correct, but
-  O(rows × program size) planning work; each nested program costs
-  about 20 KiB of stack in a release build and 255 KiB in a debug
-  one (`Config::max_trigger_depth`, default 100).
-- RETURNING rows are computed before the row's AFTER triggers run
-  (their subqueries do not see the triggers' writes).
+  O(rows × program size) planning work. Each nested program costs
+  about 15 KiB of stack in a release build and 262 KiB in a debug
+  one (`STACK_PER_TRIGGER`); the default `max_trigger_depth` is 24.
+  A body statement with deep expressions costs its own statement
+  budget per level on top.
+
+### Triggers — review fixes (2026-11-03)
+
+Thirteen review findings, each reproduced on the live pin first.
+
+**Fixed (all with regression tests in `tests/triggers_v16.rs`,
+`review_*`, a generated corpus, and `hipp-cli/tests/cli_v16_triggers.rs::review_fixes_render_as_the_pin`):**
+
+- BEFORE UPDATE: NEW's generated columns are computed, not NULL —
+  from the assigned columns and the columns some firing BEFORE
+  UPDATE trigger (WHEN included, `UPDATE OF` respected) reads as
+  `NEW.x`, the others NULL, columns past the 32nd always loaded (the
+  pin's `sqlite3TriggerColmask`).
+- A RAISE(FAIL | IGNORE) part-way through a body's INSERT ...
+  SELECT, DELETE or UPDATE keeps the rows written before it where
+  the pin streams (INSERT ... SELECT: target without INSERT
+  triggers, SELECT not reading it, a lone scan without sort /
+  grouping / compound / subquery; DELETE / UPDATE one-pass: no
+  triggers for the change, no foreign keys, no subquery in WHERE, no
+  rowid change, no REPLACE). hipp re-runs such a SELECT row by row
+  to the failing row (`insert_prefix`) and keeps the scanned prefix
+  of a WHERE (`scan_write_rows_into`, `one_pass`); IGNORE's rows
+  count in total_changes(). Found while testing: a trigger program's
+  multi-row VALUES insert into a table with INSERT triggers now
+  computes every row first, as the pin's temporary table does.
+- AND / OR (ungated, parser): only a lone integer token of a 32-bit
+  value (decimal or hex, in any parentheses) or TRUE / FALSE
+  short-circuits the other operand; `-1`, `+0`, `-0`, `1_0`,
+  `2147483648`, `0x80000000`, `1+0` leave it evaluated (marked with a
+  unary `+` the evaluator's `int_lit` does not see), so `-1 OR
+  abs(-9223372036854775808)` is "integer overflow" and a trigger's
+  `+0 AND RAISE(ABORT, ...)` raises, as on the pin.
+- REPLACE across several UNIQUE indexes deletes the conflicting rows
+  most recently created index first (ungated: the write plans list
+  indexes in the pin's prepended order), visible in DELETE triggers.
+- RETURNING: an uncorrelated subquery whose FROM does not name the
+  written table directly is computed once, when the first row
+  reaches it (`ret_hoist`), so later AFTER-trigger (or foreign-key
+  action) writes do not show; one naming it is per row, as probed.
+  UPDATE's RETURNING now runs before the row's AFTER triggers, as
+  INSERT's and DELETE's. Ungated: `RETURNING t.*` is the pin's error
+  (`SchemaKind::ReturningTableStar`; hipp expanded it).
+- Prepare-time checks cover the whole trigger nest (each trigger
+  once, at most `max_trigger_depth` deep, whatever the WHEN
+  clauses), plus the DELETE triggers a REPLACE fires under
+  recursive_triggers.
+- `Config::default().max_trigger_depth` is 24 (`DEFAULT_TRIGGER_DEPTH`;
+  100 overflowed a 2 MiB thread in some builds and an 8 MiB debug
+  main thread); `Config::stack_budget` lowers it to a quarter of its
+  room over `STACK_PER_TRIGGER` (15 KiB release / 262 KiB debug,
+  measured). README no longer claims the 1000-program limit for the
+  library (the CLI sets it).
+- A trigger-depth failure inside an explicit transaction keeps the
+  statement's changes when no program of it holds an abort point
+  (`nest_may_abort`: non-inlined function calls — coalesce, ifnull,
+  iif, likely, unlikely, likelihood and count / sum / total / avg /
+  group_concat are none, nullif and LIKE are — RAISE(ABORT), ABORT
+  constraints of written tables, foreign keys), as the pin without a
+  statement journal; probed over 12 body shapes.
+- Writes of a view through INSTEAD OF triggers take RETURNING (NEW
+  for INSERT / UPDATE, OLD for DELETE, after the triggers, rows a
+  RAISE(IGNORE) skipped not returned, no rowid, no affinity) and an
+  assignment of the view's rowid (the triggers fire, nothing
+  changes).
+- `CREATE TRIGGER main.x ... ON tt` resolves `tt` in main ("no such
+  table" over a temp-only table; over both, the trigger goes on
+  main's), and `ON temp.tt` with a `main.` name is "cannot reference
+  objects in database temp".
+
+**Not fixed:** the TEMP-trigger-on-main-table pair (see the honest
+gaps above: a design change of the TEMP database).
+
+**Oracle-probing notes:** the BEFORE UPDATE mask counts only
+triggers that fire for the SET list; INSERT ... SELECT with ORDER
+BY, GROUP BY, UNION ALL over the target, or INSERT triggers on the
+target keeps nothing; DISTINCT and WHERE stream; DELETE over an
+index streams; a DELETE / UPDATE WHERE with a subquery does not;
+`2147483647 OR x` is simplified, `2147483648 OR x` not,
+`00000000000002 OR x` is; RETURNING `(SELECT (SELECT count(*) FROM
+t))` and `(SELECT count(*) FROM (SELECT * FROM t))` are computed
+once, `(SELECT count(*) FROM log UNION ALL SELECT 1 FROM t)` per
+row; a view's RETURNING `(SELECT count(*) FROM log)` once, after the
+first row's INSTEAD OF triggers; `RETURNING v.*` is refused like
+`t.*`.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size** (vs the tree after the foreign-key unit): tiny **76,924 B**
+(Δ 0); full **486,076 B** (Δ **+688 B**, ratchet raised: the
+ungated AND / OR literal rule in the parser, the index order, the
+RETURNING `t.*` refusal); max **599,256 B** (Δ **+8,824 B**, ratchet
+raised: the leaf's fixes — new-column mask, part-way writes,
+RETURNING cache and view RETURNING, nested validation, abort-point
+analysis).
 
 ### Foreign-key enforcement (2026-11-03)
 

@@ -3441,6 +3441,69 @@ pub fn has_sub(e: &RExpr) -> bool {
 /// node itself where a node has current-scope children (only
 /// `InSub` does). `substitute` consumes values in exactly this
 /// order.
+/// The ids of the subquery plans in `e`, at any depth, whose FROM
+/// clause (of any compound arm) names the table whose root page is
+/// `root` directly (v0.16 review fix, `triggers` / `foreign_keys`):
+/// the pin evaluates such a RETURNING subquery for every row, and
+/// any other uncorrelated one once — even one that reads the table
+/// through a nested subquery, a derived table, a view or a CTE
+/// (probed). See `Statement::eval_returning`.
+#[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+pub fn subs_reading(e: &RExpr, root: u32, out: &mut AVec<usize>) {
+    let mut subs = AVec::new();
+    collect_subs(e, &mut subs);
+    for k in subs.iter() {
+        let p = match k {
+            SubKind::Scalar(p) | SubKind::Exists(p) | SubKind::In(p) => *p,
+        };
+        plan_subs_reading(p, root, out);
+    }
+}
+
+/// `subs_reading` over one plan and the plans inside it.
+#[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+fn plan_subs_reading(p: &SubPlan, root: u32, out: &mut AVec<usize>) {
+    let mut direct = false;
+    let mut cores: AVec<&SubPlan> = AVec::new();
+    cores.push(p);
+    for (_, c) in p.compound.iter() {
+        cores.push(c);
+    }
+    for c in cores.iter() {
+        for s in c.sources.iter() {
+            match &s.derived {
+                Some(d) => plan_subs_reading(d, root, out),
+                #[cfg(feature = "v16")]
+                None if s.rec != 0 => {}
+                None => direct |= s.root == root,
+            }
+            if let Some(on) = &s.on {
+                subs_reading(on, root, out);
+            }
+        }
+        for e in c.items.iter().chain(c.group_by.iter()) {
+            subs_reading(e, root, out);
+        }
+        for e in c.filter.iter().chain(c.having.iter()) {
+            subs_reading(e, root, out);
+        }
+        for (e, _) in c.order_by.iter() {
+            subs_reading(e, root, out);
+        }
+        for r in c.values.iter() {
+            for e in r.iter() {
+                subs_reading(e, root, out);
+            }
+        }
+    }
+    for e in p.limit.iter().chain(p.offset.iter()) {
+        subs_reading(e, root, out);
+    }
+    if direct {
+        out.push(p.id);
+    }
+}
+
 pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
     match e {
         RExpr::SubScalar(p) => out.push(SubKind::Scalar(p)),

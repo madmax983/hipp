@@ -19,7 +19,10 @@
 //!   deleted it — a deleted one is skipped). After the BEFORE
 //!   triggers the row is read once more: the columns the UPDATE does
 //!   not assign take their current values. `NEW`'s generated columns
-//!   are NULL in a BEFORE UPDATE trigger. AFTER triggers see the
+//!   in a BEFORE UPDATE trigger are computed from the assigned
+//!   columns and those some firing BEFORE UPDATE trigger reads as
+//!   `NEW.x` (the pin's new-column mask); other columns count as
+//!   NULL there. AFTER triggers see the
 //!   OLD row as it was read before the BEFORE triggers.
 //! - `UPDATE OF cols` fires when the statement assigns one of them.
 //! - Triggers fire most recently created first (the pin's list order).
@@ -86,9 +89,11 @@ pub(super) struct TrigState {
     /// The conflict action the statement about to run inherits
     /// from the program running it (`None`: its own).
     pub orconf: Option<ConflictAction>,
-    /// Trigger bodies are being planned for validation (no
-    /// validation nests).
-    pub validating: core::cell::Cell<bool>,
+    /// Trigger bodies are being planned for validation: the
+    /// triggers checked so far (each once, as the pin compiles each
+    /// program once), and how deep the check has nested.
+    pub validated: core::cell::RefCell<Option<AVec<AVec<u8>>>>,
+    pub validate_depth: core::cell::Cell<usize>,
 }
 
 /// One trigger a write may fire, copied out of the catalog.
@@ -101,6 +106,10 @@ pub(super) struct Trig {
     sql: AVec<u8>,
     when: Option<(usize, usize)>,
     steps: AVec<(usize, usize)>,
+    /// A BEFORE UPDATE trigger's `NEW.x` column names (`None`: not
+    /// such a trigger, or its text did not parse — every column
+    /// counts then).
+    new_refs: Option<AVec<AVec<u8>>>,
 }
 
 /// The triggers of one write's table, in firing order.
@@ -146,6 +155,21 @@ pub(super) struct InsteadPlan {
     map: AVec<usize>,
     /// UPDATE: the columns assigned.
     assigned: AVec<bool>,
+    /// The RETURNING list, over the view's columns (v0.16 review
+    /// fix): evaluated for each row whose triggers ran to the end,
+    /// after them, on NEW (INSERT, UPDATE) or OLD (DELETE), as on the
+    /// pin.
+    returning: AVec<RExpr>,
+}
+
+impl InsteadPlan {
+    pub(super) fn has_returning(&self) -> bool {
+        !self.returning.is_empty()
+    }
+
+    pub(super) fn returning_width(&self) -> usize {
+        self.returning.len()
+    }
 }
 
 /// Errors a body statement planned over all-NULL rows may meet only
@@ -200,6 +224,128 @@ fn explicit_conflict<E>(sql: &[u8], arena: &Arena) -> bool {
             _ if kw(i, b"DELETE") => return false,
             _ => {}
         }
+    }
+    false
+}
+
+/// A write statement's target, conflict action, event and whether it
+/// has an upsert clause (`None`: no write).
+fn write_shape(ast: &Ast) -> Option<(crate::arena::ABytes, ConflictAction, TrigEvent, bool)> {
+    match ast {
+        Ast::Insert {
+            table,
+            conflict,
+            upsert,
+            ..
+        } => Some((*table, *conflict, TrigEvent::Insert, upsert.is_some())),
+        Ast::Update {
+            table, conflict, ..
+        } => Some((*table, *conflict, TrigEvent::Update, false)),
+        Ast::Delete { table, .. } => {
+            Some((*table, ConflictAction::Abort, TrigEvent::Delete, false))
+        }
+        Ast::With { body, .. } => write_shape(body),
+        _ => None,
+    }
+}
+
+/// Whether a statement's text calls a function the pin codes as a
+/// call (an abort point: `nest_may_abort`), `RAISE(ABORT)`, or LIKE /
+/// GLOB / REGEXP / MATCH. The inlined functions (coalesce, ifnull,
+/// iif, if, likely, unlikely, likelihood) and the aggregates count,
+/// sum, total, avg, group_concat, string_agg are none (probed).
+/// Conservative: unlexable text counts as one.
+fn lexical_may_abort<E>(sql: &[u8], arena: &Arena) -> bool {
+    use crate::sql::lexer::Tok;
+    let Ok(toks) = crate::sql::lexer::lex::<E>(sql, arena) else {
+        return true;
+    };
+    let t = toks.as_slice();
+    let word = |i: usize| match t.get(i).map(|x| x.tok) {
+        Some(Tok::Ident(h, false)) => Some(handle_bytes(arena, h)),
+        _ => None,
+    };
+    let is = |i: usize, w: &[u8]| word(i).is_some_and(|b| eq_ci(b, w));
+    const NOT_CALLS: &[&[u8]] = &[
+        b"IN",
+        b"VALUES",
+        b"EXISTS",
+        b"CAST",
+        b"AS",
+        b"OVER",
+        b"FILTER",
+        b"USING",
+        b"AND",
+        b"OR",
+        b"NOT",
+        b"WHEN",
+        b"THEN",
+        b"ELSE",
+        b"CASE",
+        b"SELECT",
+        b"WHERE",
+        b"SET",
+        b"ON",
+        b"BY",
+        b"IS",
+        b"BETWEEN",
+        b"FROM",
+        b"JOIN",
+        b"DISTINCT",
+        b"ALL",
+        b"UNION",
+        b"INTERSECT",
+        b"EXCEPT",
+        b"LIMIT",
+        b"OFFSET",
+        b"HAVING",
+        b"ESCAPE",
+        b"DO",
+        b"CONFLICT",
+        b"WITH",
+        b"RECURSIVE",
+        b"coalesce",
+        b"ifnull",
+        b"iif",
+        b"if",
+        b"likely",
+        b"unlikely",
+        b"likelihood",
+        b"count",
+        b"sum",
+        b"total",
+        b"avg",
+        b"group_concat",
+        b"string_agg",
+    ];
+    for i in 0..t.len() {
+        if ["LIKE", "GLOB", "REGEXP", "MATCH"]
+            .iter()
+            .any(|k| is(i, k.as_bytes()))
+        {
+            return true;
+        }
+        if !matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::LParen)) {
+            continue;
+        }
+        match t.get(i).map(|x| x.tok) {
+            Some(Tok::Ident(..)) => {}
+            _ => continue,
+        }
+        // `INTO t (cols)`: a column list.
+        if i > 0 && is(i - 1, b"INTO") {
+            continue;
+        }
+        if is(i, b"RAISE") {
+            if is(i + 2, b"ABORT") {
+                return true;
+            }
+            continue;
+        }
+        if word(i).is_some_and(|w| NOT_CALLS.iter().any(|k| eq_ci(w, k))) {
+            continue;
+        }
+        return true;
     }
     false
 }
@@ -337,6 +483,7 @@ impl<S: Storage> Connection<S> {
         };
         let mut map = AVec::new();
         let mut assigned = AVec::new();
+        let ret_items;
         let select = match ast {
             Ast::Insert {
                 columns,
@@ -349,9 +496,7 @@ impl<S: Storage> Connection<S> {
                 if upsert.is_some() {
                     return Err(err(SchemaKind::UpsertView));
                 }
-                if !returning.is_empty() {
-                    return Err(Error::Unsupported);
-                }
+                ret_items = Some(returning);
                 match columns {
                     Some(cs) => {
                         for c in cs.iter() {
@@ -383,15 +528,25 @@ impl<S: Storage> Connection<S> {
                 returning,
                 ..
             } => {
-                if !from.is_empty() || !returning.is_empty() {
+                if !from.is_empty() {
                     return Err(Error::Unsupported);
                 }
+                ret_items = Some(returning);
                 for _ in 0..ncols {
                     assigned.push(false);
                 }
                 let mut extra = AVec::new();
                 for (c, e) in assignments.iter() {
-                    let i = col(*c)?;
+                    // The view's rowid (v0.16 review fix): the pin
+                    // takes the assignment and evaluates its value,
+                    // but NEW holds no rowid of a view — nothing
+                    // changes (`usize::MAX`: no column).
+                    let i = match col(*c) {
+                        Err(_) if crate::query::is_rowid_name(handle_bytes(arena, *c)) => {
+                            usize::MAX
+                        }
+                        r => r?,
+                    };
                     map.push(i);
                     if let Some(a) = assigned.as_mut_slice().get_mut(i) {
                         *a = true;
@@ -405,9 +560,7 @@ impl<S: Storage> Connection<S> {
             Ast::Delete {
                 filter, returning, ..
             } => {
-                if !returning.is_empty() {
-                    return Err(Error::Unsupported);
-                }
+                ret_items = Some(returning);
                 crate::sql::parser::star_select(table, None, filter.clone(), AVec::new(), arena)
             }
             _ => return Ok(None),
@@ -425,12 +578,49 @@ impl<S: Storage> Connection<S> {
         if event == TrigEvent::Insert && width != map.len() {
             return Err(err(SchemaKind::ColumnCountMismatch));
         }
+        // RETURNING reads the view's columns under its name (no
+        // affinity, no rowid: the pin's "no such column: rowid").
+        // Its subqueries read views as any statement's do.
+        // (as the items of a FROM-less SELECT).
+        let exp_ret = match ret_items {
+            Some(items) if !items.is_empty() => {
+                let mut s = crate::sql::parser::star_select(table, None, None, AVec::new(), arena);
+                s.from.clear();
+                s.items = items.clone();
+                self.expand_ast(arena, &Ast::Select(s))?
+            }
+            _ => None,
+        };
+        let ret_items = match exp_ret.as_ref() {
+            Some(Ast::Select(s)) => Some(&s.items),
+            _ => ret_items,
+        };
+        let returning = match ret_items {
+            Some(items) if !items.is_empty() => {
+                let mut cols = AVec::new();
+                for n in names.iter() {
+                    cols.push((n.clone(), crate::record::Affinity::Blob));
+                }
+                let mut sources = AVec::new();
+                sources.push(crate::query::SourceDesc::new(
+                    copy_vec(name),
+                    cols,
+                    None,
+                    false,
+                ));
+                let mut offsets = AVec::new();
+                offsets.push(0);
+                self.plan_returning_in(arena, sources, offsets, items)?
+            }
+            _ => AVec::new(),
+        };
         Ok(Some(Plan::Instead(Box::new(InsteadPlan {
             event,
             source: Box::new(source),
             ncols,
             map,
             assigned,
+            returning,
         }))))
     }
 
@@ -467,14 +657,24 @@ impl<S: Storage> Connection<S> {
             for c in t.of_cols.iter() {
                 of_cols.push(copy_vec(handle_bytes(ca, *c)));
             }
+            let sql = handle_bytes(ca, t.sql);
+            let new_refs = if t.time == TrigTime::Before && t.event == TrigEvent::Update {
+                let ckpt = arena.checkpoint();
+                let r = self.new_refs(sql, t.when, t.steps.as_slice(), arena);
+                arena.rewind(ckpt);
+                r
+            } else {
+                None
+            };
             trigs.push(Trig {
                 name: copy_vec(handle_bytes(ca, t.name)),
                 time: t.time,
                 event: t.event,
                 of_cols,
-                sql: copy_vec(handle_bytes(ca, t.sql)),
+                sql: copy_vec(sql),
                 when: t.when,
                 steps: t.steps.clone(),
+                new_refs,
             });
         }
         if trigs.is_empty() {
@@ -498,6 +698,42 @@ impl<S: Storage> Connection<S> {
             trigs,
             orconf,
         })))
+    }
+
+    /// The column names a trigger's WHEN clause and body read as
+    /// `NEW.x` (`None`: its text does not parse).
+    fn new_refs(
+        &self,
+        sql: &[u8],
+        when: Option<(usize, usize)>,
+        steps: &[(usize, usize)],
+        arena: &Arena,
+    ) -> Option<AVec<AVec<u8>>> {
+        let mut out = AVec::new();
+        for (w, (a, b)) in when
+            .iter()
+            .map(|x| (true, *x))
+            .chain(steps.iter().map(|x| (false, *x)))
+        {
+            let mut text = AVec::new();
+            if w {
+                text.extend_from_slice(b"SELECT 1 WHERE ");
+            }
+            text.extend_from_slice(sql.get(a..b)?);
+            let ast = crate::sql::parser::parse_trigger_step::<S::Error>(
+                text.as_slice(),
+                arena,
+                self.cfg.limits(),
+            )
+            .ok()?;
+            let refs = crate::sql::trig::trigger_refs::<S::Error>(&ast, arena).ok()?;
+            for (q, n) in refs.iter() {
+                if eq_ci(handle_bytes(arena, *q), b"new") {
+                    out.push(copy_vec(handle_bytes(arena, *n)));
+                }
+            }
+        }
+        Some(out)
     }
 
     /// The column names, collations and rowid alias `NEW` / `OLD`
@@ -534,9 +770,13 @@ impl<S: Storage> Connection<S> {
     /// Plan every body statement of the triggers a write of `table`
     /// on `event` may fire, over all-NULL rows, so a statement whose
     /// triggers do not resolve fails when it is prepared, as on the
-    /// pin. Errors only the values could cause are not reported. Not
-    /// nested (a trigger body's own triggers are checked when it
-    /// runs), and not done for a statement of a trigger program.
+    /// pin. Errors only the values could cause are not reported.
+    /// Nested (v0.16 review fix): planning a body statement checks
+    /// the triggers it may fire in turn, whatever their WHEN clauses
+    /// — each trigger once, at most `max_trigger_depth` deep — as the
+    /// pin compiles the whole nest when the statement is prepared.
+    /// Not done for a statement of a trigger program (the nest was
+    /// checked when its top statement was prepared).
     pub(super) fn validate_triggers(
         &self,
         table: &[u8],
@@ -544,16 +784,29 @@ impl<S: Storage> Connection<S> {
         assigned: Option<&[AVec<u8>]>,
         arena: &Arena,
     ) -> Result<(), S::Error> {
-        if self.trig.validating.get() || self.in_trigger() {
+        if self.in_trigger() {
             return Ok(());
         }
         let ca = &self.catalog_arena;
         if self.catalog.triggers_on(ca, table).next().is_none() {
             return Ok(());
         }
-        self.trig.validating.set(true);
-        let r = self.validate_inner(table, event, assigned, arena);
-        self.trig.validating.set(false);
+        let top = self.trig.validated.borrow().is_none();
+        if top {
+            *self.trig.validated.borrow_mut() = Some(AVec::new());
+        }
+        let depth = self.trig.validate_depth.get();
+        let r = if depth >= self.cfg.max_trigger_depth {
+            Ok(())
+        } else {
+            self.trig.validate_depth.set(depth + 1);
+            let r = self.validate_inner(table, event, assigned, arena);
+            self.trig.validate_depth.set(depth);
+            r
+        };
+        if top {
+            *self.trig.validated.borrow_mut() = None;
+        }
         r
     }
 
@@ -594,6 +847,17 @@ impl<S: Storage> Connection<S> {
                 })
             {
                 continue;
+            }
+            let tname = handle_bytes(ca, t.name);
+            {
+                let mut seen = self.trig.validated.borrow_mut();
+                let Some(seen) = seen.as_mut() else {
+                    continue;
+                };
+                if seen.iter().any(|n| n.as_slice() == tname) {
+                    continue;
+                }
+                seen.push(copy_vec(tname));
             }
             let sql = handle_bytes(ca, t.sql);
             let mut spans: AVec<(bool, usize, usize)> = AVec::new();
@@ -788,6 +1052,119 @@ impl<S: Storage> Connection<S> {
         Ok(first)
     }
 
+    /// Whether a statement (`sql`) and every trigger program it may
+    /// run hold an *abort point* (v0.16 review fix): the pin opens a
+    /// statement journal only for a statement that may halt with
+    /// ABORT — a constraint checked under ABORT, a call of a
+    /// non-inlined function (LIKE / GLOB included), `RAISE(ABORT)`,
+    /// foreign keys. Without one, a failure that is no constraint's
+    /// (the trigger depth limit) inside an explicit transaction
+    /// leaves the statement's changes in place. Conservative: what
+    /// it cannot tell counts as an abort point (hipp's undo).
+    pub(super) fn nest_may_abort(&self, sql: &[u8], arena: &Arena) -> bool {
+        if self.prag.foreign_keys || lexical_may_abort::<S::Error>(sql, arena) {
+            return true;
+        }
+        let Ok(ast) = crate::sql::parser::parse::<S::Error>(sql, arena, self.cfg.limits()) else {
+            return true;
+        };
+        let Some(top) = write_shape(&ast) else {
+            return false;
+        };
+        let orconf = explicit_conflict::<S::Error>(sql, arena).then_some(top.1);
+        let mut work: AVec<(AVec<u8>, TrigEvent, ConflictAction, bool)> = AVec::new();
+        work.push((copy_vec(handle_bytes(arena, top.0)), top.2, top.1, top.3));
+        let mut seen: AVec<AVec<u8>> = AVec::new();
+        let ca = &self.catalog_arena;
+        while let Some((table, event, conflict, upsert)) = work.pop() {
+            if self.table_may_abort(table.as_slice(), event, conflict, upsert) {
+                return true;
+            }
+            let replace = conflict == ConflictAction::Replace
+                && event != TrigEvent::Delete
+                && self.prag.recursive_triggers;
+            for t in self.catalog.triggers_on(ca, table.as_slice()) {
+                if t.event != event && !(replace && t.event == TrigEvent::Delete) {
+                    continue;
+                }
+                let name = handle_bytes(ca, t.name);
+                if seen.iter().any(|n| n.as_slice() == name) {
+                    continue;
+                }
+                seen.push(copy_vec(name));
+                let text = handle_bytes(ca, t.sql);
+                let mut spans: AVec<(usize, usize)> = AVec::new();
+                if let Some(w) = t.when {
+                    spans.push(w);
+                }
+                spans.extend_from_slice(t.steps.as_slice());
+                for (a, b) in spans.iter() {
+                    let Some(step) = text.get(*a..*b) else {
+                        return true;
+                    };
+                    if lexical_may_abort::<S::Error>(step, arena) {
+                        return true;
+                    }
+                }
+                for (a, b) in t.steps.iter() {
+                    let step = text.get(*a..*b).unwrap_or(&[]);
+                    let Ok(ast) = crate::sql::parser::parse_trigger_step::<S::Error>(
+                        step,
+                        arena,
+                        self.cfg.limits(),
+                    ) else {
+                        return true;
+                    };
+                    if let Some((tb, c, ev, up)) = write_shape(&ast) {
+                        work.push((
+                            copy_vec(handle_bytes(arena, tb)),
+                            ev,
+                            orconf.unwrap_or(c),
+                            up,
+                        ));
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether a write of `table` checks a constraint that may halt
+    /// with ABORT under `conflict` (`nest_may_abort`; conservative).
+    fn table_may_abort(
+        &self,
+        table: &[u8],
+        event: TrigEvent,
+        conflict: ConflictAction,
+        upsert: bool,
+    ) -> bool {
+        let ca = &self.catalog_arena;
+        let Some(t) = self.catalog.find(ca, table) else {
+            // A view (its INSTEAD OF triggers are walked) or unknown.
+            return self.catalog.find_view(ca, table).is_none();
+        };
+        if event == TrigEvent::Delete {
+            return false;
+        }
+        let not_null = t.columns.iter().any(|c| c.not_null);
+        let other = !t.checks.is_empty()
+            || t.strict
+            || t.has_generated()
+            || t.rowid_alias.is_some()
+            || upsert
+            || (event == TrigEvent::Insert && t.columns.iter().any(|c| c.default_expr.is_some()))
+            || self
+                .catalog
+                .indexes_for(ca, table)
+                .any(|i| i.unique || i.opaque);
+        match conflict {
+            ConflictAction::Abort => not_null || other,
+            // REPLACE: a NOT NULL without default and CHECK abort.
+            ConflictAction::Replace => not_null || !t.checks.is_empty() || t.strict,
+            _ => false,
+        }
+    }
+
     /// Record how a failure of a program's statement resolves the
     /// firing statement (the innermost failure's, which is the first
     /// recorded).
@@ -868,6 +1245,239 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(())
     }
 
+    /// The columns a BEFORE UPDATE trigger's `NEW` holds for an
+    /// UPDATE assigning `cols` (and the rowid when `rowid_set`): the
+    /// pin loads an unassigned column into `NEW` only when one of the
+    /// BEFORE UPDATE triggers that fire reads it as `NEW.x` (or it
+    /// is past the 32nd column), and computes the generated columns
+    /// from that row — the other columns read as NULL. Per column:
+    /// whether it is loaded.
+    pub(super) fn before_update_loaded(&self, cols: &[bool], rowid_set: bool) -> AVec<bool> {
+        let mut loaded = AVec::new();
+        let Some(tg) = self.trig.as_ref() else {
+            return loaded;
+        };
+        for i in 0..tg.names.len() {
+            loaded.push(i > 31 || cols.get(i).copied().unwrap_or(false));
+        }
+        for t in tg.trigs.iter() {
+            if t.time != TrigTime::Before || t.event != TrigEvent::Update {
+                continue;
+            }
+            if !Self::of_overlap(tg, t, cols, rowid_set) {
+                continue;
+            }
+            let Some(refs) = t.new_refs.as_ref() else {
+                for l in loaded.as_mut_slice() {
+                    *l = true;
+                }
+                continue;
+            };
+            for r in refs.iter() {
+                match tg
+                    .names
+                    .iter()
+                    .position(|n| eq_ci(n.as_slice(), r.as_slice()))
+                {
+                    // A column past the 32nd sets every bit of the pin's mask.
+                    Some(i) if i > 31 => {
+                        for l in loaded.as_mut_slice() {
+                            *l = true;
+                        }
+                    }
+                    Some(i) => {
+                        if let Some(l) = loaded.as_mut_slice().get_mut(i) {
+                            *l = true;
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        loaded
+    }
+
+    /// Whether an UPDATE assigning `cols` fires `t` by its `UPDATE OF`
+    /// list (always, without one).
+    fn of_overlap(tg: &Target, t: &Trig, cols: &[bool], rowid_set: bool) -> bool {
+        t.of_cols.is_empty()
+            || t.of_cols.iter().any(|c| {
+                match tg
+                    .names
+                    .iter()
+                    .position(|n| eq_ci(n.as_slice(), c.as_slice()))
+                {
+                    Some(i) if Some(i) == tg.alias => {
+                        rowid_set || cols.get(i).copied().unwrap_or(false)
+                    }
+                    Some(i) => cols.get(i).copied().unwrap_or(false),
+                    None => false,
+                }
+            })
+    }
+
+    /// The rows an INSERT ... SELECT of a trigger program had
+    /// written before its SELECT failed with `e` (v0.16 review fix;
+    /// `None`: none, the statement fails as it is). The pin streams
+    /// such a SELECT into the target row by row — unless the target
+    /// has INSERT triggers or the SELECT reads it (a temporary table
+    /// then holds every row first), or it sorts, groups, aggregates
+    /// or compounds — so a `RAISE(FAIL | IGNORE)` reached on a later
+    /// row keeps the rows before it. hipp computes the SELECT first:
+    /// for such a lone scan of one table it is run again row by row
+    /// to the failing row, and those rows are inserted. The flag:
+    /// whether that run failed too (it may not: the pin stops at a
+    /// LIMIT before the row hipp's whole-SELECT run failed on).
+    pub(super) async fn insert_prefix(
+        &mut self,
+    ) -> Result<Option<(AVec<AVec<OwnedValue>>, bool)>, S::Error> {
+        if !self.conn.in_trigger()
+            || self.fires(TrigTime::Before, TrigEvent::Insert)
+            || self.fires(TrigTime::After, TrigEvent::Insert)
+        {
+            return Ok(None);
+        }
+        let (plan, target) = match &self.plan {
+            Plan::Insert {
+                select: Some(p),
+                root,
+                ..
+            } => (p.clone(), *root),
+            _ => return Ok(None),
+        };
+        let Some(src) = plan.sources.as_slice().first() else {
+            return Ok(None);
+        };
+        #[cfg(feature = "window")]
+        let windowed =
+            !crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice()).is_empty();
+        #[cfg(not(feature = "window"))]
+        let windowed = false;
+        if plan.sources.len() != 1
+            || src.derived.is_some()
+            || src.rec != 0
+            || src.on.is_some()
+            || src.root == target
+            || plan.rec.is_some()
+            || !plan.compound.is_empty()
+            || !plan.values.is_empty()
+            || !plan.group_by.is_empty()
+            || plan.has_agg
+            || !plan.order_by.is_empty()
+            || windowed
+            || (plan.distinct && (plan.limit.is_some() || plan.offset.is_some()))
+            || plan.items.iter().any(crate::query::has_sub)
+            || plan.filter.as_ref().is_some_and(crate::query::has_sub)
+        {
+            return Ok(None);
+        }
+        let (skip, take) = self.limit_window(&plan.limit, &plan.offset).await?;
+        let empty = RowData::empty();
+        let src_rows = self
+            .materialise_sources_sub(plan.sources.as_slice(), &empty, None)
+            .await?;
+        let mut produced = AVec::new();
+        let mut failed = false;
+        for (vals, rowid) in src_rows
+            .as_slice()
+            .first()
+            .map_or(&[][..], |r| r.as_slice())
+        {
+            if produced.len() >= skip.saturating_add(take) {
+                break;
+            }
+            let mut acc = RowData::empty();
+            for v in vals.iter() {
+                acc.vals.push(v.clone());
+            }
+            acc.rowids.push(*rowid);
+            if let Some(f) = &plan.filter {
+                match self.eval_row_sub(f, &acc).await {
+                    Ok(v) if crate::query::truthy(&v) == Some(true) => {}
+                    Ok(_) => continue,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            match self
+                .sub_project(&plan, &empty, core::slice::from_ref(&acc), None)
+                .await
+            {
+                Ok(p) => produced.extend_from_slice(p.as_slice()),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if plan.distinct {
+            produced = dedup_produced(
+                produced,
+                crate::query::exprs_colls(plan.items.as_slice()).as_slice(),
+            );
+        }
+        let mut rows = AVec::new();
+        for p in produced.iter().skip(skip).take(take) {
+            rows.push(p.out.clone());
+        }
+        Ok(Some((rows, failed)))
+    }
+
+    /// The end of a trigger program's write that failed part-way
+    /// with `e` after changing rows (`insert_prefix`, `one_pass`): a
+    /// `RAISE(IGNORE)` ends the program normally, so the rows count
+    /// in `total_changes()`, as on the pin.
+    pub(super) fn failed_part_way(&mut self, e: Error<S::Error>) -> Error<S::Error> {
+        if matches!(
+            e,
+            Error::Schema {
+                kind: SchemaKind::RaiseIgnore
+            }
+        ) {
+            self.conn.env.finish(true);
+        }
+        e
+    }
+
+    /// Whether an UPDATE / DELETE of a trigger program whose WHERE
+    /// failed part-way keeps the rows it had changed before the
+    /// failing one (v0.16 review fix): the pin's one-pass write —
+    /// no triggers for the change on the target, no foreign keys to
+    /// check, no subquery in the WHERE, and (UPDATE) no rowid change
+    /// or REPLACE — changes each row as the scan passes it.
+    pub(super) fn one_pass(
+        &self,
+        event: TrigEvent,
+        changed: Option<(&[bool], bool)>,
+        filter: Option<&RExpr>,
+        replace: bool,
+    ) -> bool {
+        if !self.conn.in_trigger() || replace || filter.is_some_and(crate::query::has_sub) {
+            return false;
+        }
+        #[cfg(feature = "foreign_keys")]
+        if self.fk.is_some() {
+            return false;
+        }
+        if changed.is_some_and(|(_, rowid)| rowid) {
+            return false;
+        }
+        match (self.trig.as_ref(), changed) {
+            (None, _) => true,
+            (Some(tg), Some((cols, rowid))) => !tg.trigs.iter().any(|t| {
+                t.event == event
+                    && t.time != TrigTime::Instead
+                    && Self::of_overlap(tg, t, cols, rowid)
+            }),
+            (Some(tg), None) => !tg
+                .trigs
+                .iter()
+                .any(|t| t.event == event && t.time != TrigTime::Instead),
+        }
+    }
+
     /// Whether this write's table has triggers on `event` at `time`.
     pub(super) fn fires(&self, time: TrigTime, event: TrigEvent) -> bool {
         self.trig.as_ref().is_some_and(|t| t.has(time, event))
@@ -918,20 +1528,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 continue;
             }
             if let Some((cols, rowid_set)) = changed
-                && !t.of_cols.is_empty()
-                && !t.of_cols.iter().any(|c| {
-                    match tg
-                        .names
-                        .iter()
-                        .position(|n| eq_ci(n.as_slice(), c.as_slice()))
-                    {
-                        Some(i) if Some(i) == tg.alias => {
-                            rowid_set || cols.get(i).copied().unwrap_or(false)
-                        }
-                        Some(i) => cols.get(i).copied().unwrap_or(false),
-                        None => false,
-                    }
-                })
+                && !Self::of_overlap(&tg, t, cols, rowid_set)
             {
                 continue;
             }
@@ -1068,6 +1665,26 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let _ = self.conn.pager.rollback().await;
                 self.conn.explicit_txn = false;
             }
+            // A depth failure in an explicit transaction, where no
+            // program of the statement holds an abort point, keeps
+            // the changes: the pin opened no statement journal
+            // (`nest_may_abort`, v0.16 review fix).
+            Resolve::Abort
+                if self.conn.explicit_txn
+                    && matches!(
+                        e,
+                        Error::Schema {
+                            kind: SchemaKind::TriggerDepth
+                        }
+                    )
+                    && !self.conn.nest_may_abort(
+                        copy_vec(handle_bytes(&self.arena, self.sql_text)).as_slice(),
+                        &self.arena,
+                    ) =>
+            {
+                self.conn.env.finish(true);
+                self.keep_stmt();
+            }
             Resolve::Abort => {
                 self.conn.env.finish(false);
                 abort_write!(self, e);
@@ -1083,8 +1700,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
+        if self.ret_loaded {
+            return Ok(self.serve_returning());
+        }
         let r = self.exec_instead().await;
         match r {
+            Ok(()) if self.has_returning() => {
+                self.ret_loaded = true;
+                self.ret_pos = 0;
+                Ok(self.serve_returning())
+            }
             Ok(()) => {
                 self.phase = Phase::Done;
                 Ok(Step::Done)
@@ -1120,14 +1745,18 @@ impl<'c, S: Storage> Statement<'c, S> {
                             *slot = v.clone();
                         }
                     }
-                    self.fire(
-                        TrigTime::Instead,
-                        TrigEvent::Insert,
-                        None,
-                        None,
-                        Some((new.as_slice(), 0)),
-                    )
-                    .await?;
+                    if self
+                        .fire(
+                            TrigTime::Instead,
+                            TrigEvent::Insert,
+                            None,
+                            None,
+                            Some((new.as_slice(), 0)),
+                        )
+                        .await?
+                    {
+                        self.instead_returning(&ip, new.as_slice()).await?;
+                    }
                 }
                 TrigEvent::Update => {
                     let old = r.get(..ip.ncols).unwrap_or(r);
@@ -1140,25 +1769,33 @@ impl<'c, S: Storage> Statement<'c, S> {
                             *slot = v.clone();
                         }
                     }
-                    self.fire(
-                        TrigTime::Instead,
-                        TrigEvent::Update,
-                        Some((ip.assigned.as_slice(), false)),
-                        Some((old, 0)),
-                        Some((new.as_slice(), 0)),
-                    )
-                    .await?;
+                    if self
+                        .fire(
+                            TrigTime::Instead,
+                            TrigEvent::Update,
+                            Some((ip.assigned.as_slice(), false)),
+                            Some((old, 0)),
+                            Some((new.as_slice(), 0)),
+                        )
+                        .await?
+                    {
+                        self.instead_returning(&ip, new.as_slice()).await?;
+                    }
                 }
                 TrigEvent::Delete => {
                     let old = r.get(..ip.ncols).unwrap_or(r);
-                    self.fire(
-                        TrigTime::Instead,
-                        TrigEvent::Delete,
-                        None,
-                        Some((old, 0)),
-                        None,
-                    )
-                    .await?;
+                    if self
+                        .fire(
+                            TrigTime::Instead,
+                            TrigEvent::Delete,
+                            None,
+                            Some((old, 0)),
+                            None,
+                        )
+                        .await?
+                    {
+                        self.instead_returning(&ip, old).await?;
+                    }
                 }
             }
         }
@@ -1166,6 +1803,24 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.conn.pager.drive_commit().await?;
         }
         self.conn.env.finish(true);
+        Ok(())
+    }
+
+    /// One RETURNING row of a write of a view (`InsteadPlan::returning`).
+    async fn instead_returning(
+        &mut self,
+        ip: &InsteadPlan,
+        row: &[OwnedValue],
+    ) -> Result<(), S::Error> {
+        if ip.returning.is_empty() {
+            return Ok(());
+        }
+        let mut rd = RowData::empty();
+        rd.vals.extend_from_slice(row);
+        rd.rowids.push(None);
+        let vals = self.eval_returning(ip.returning.as_slice(), &rd).await?;
+        self.ret_rows.push(vals);
+        self.ret_rowids.push(None);
         Ok(())
     }
 

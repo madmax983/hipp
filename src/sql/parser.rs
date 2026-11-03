@@ -2747,14 +2747,64 @@ impl<'a> Parser<'a> {
     /// An expression whose operators all bind at least as
     /// tightly as `min`.
     fn expr_bp<E>(&mut self, min: u8) -> Result<Expr, E> {
+        let p0 = self.pos;
         let mut l = self.expr_prefix::<E>()?;
         while let Some(bp) = self.infix_bp() {
             if bp < min {
                 break;
             }
+            if bp == BP_OR || bp == BP_AND {
+                self.mark_and_or_operand(&mut l, p0);
+            }
             l = self.expr_infix::<E>(l, bp)?;
         }
         Ok(l)
+    }
+
+    /// An integer-literal operand of AND / OR (tokens `p0` to the
+    /// cursor) that the pin does not treat as a constant truth
+    /// value is wrapped in a unary `+` (v0.16 review fix, ungated):
+    /// the pin simplifies `0 AND x` / `x OR 1` only over a single
+    /// integer token holding a 32-bit value (or TRUE / FALSE), so
+    /// `-1 OR x`, `+0 AND x`, `1_0 OR x` and `2147483648 OR x` still
+    /// evaluate `x` there (the evaluator's short-circuit, `int_lit`,
+    /// sees only a bare literal).
+    fn mark_and_or_operand(&self, e: &mut Expr, p0: usize) {
+        if !matches!(e, Expr::Literal(Literal::Integer(_))) {
+            return;
+        }
+        let toks = self.toks.as_slice().get(p0..self.pos).unwrap_or(&[]);
+        let mut a = 0;
+        let mut b = toks.len();
+        while b > a + 1
+            && matches!(toks.get(a).map(|t| t.tok), Some(Tok::LParen))
+            && matches!(toks.get(b - 1).map(|t| t.tok), Some(Tok::RParen))
+        {
+            a += 1;
+            b -= 1;
+        }
+        let simple = b == a + 1
+            && toks.get(a).is_some_and(|t| match t.tok {
+                Tok::Integer(v) => {
+                    (0..=i64::from(i32::MAX)).contains(&v)
+                        && !self
+                            .sql
+                            .get(t.offset..)
+                            .unwrap_or(&[])
+                            .iter()
+                            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+                            .any(|c| *c == b'_')
+                }
+                Tok::Ident(h, false) => {
+                    let w = handle_bytes(self.arena, h);
+                    eq_ci(w, b"TRUE") || eq_ci(w, b"FALSE")
+                }
+                _ => false,
+            });
+        if !simple {
+            let inner = core::mem::replace(e, Expr::Literal(Literal::Null));
+            *e = Expr::Pos(Box::new(inner));
+        }
     }
 
     /// The binding power of the operator at the cursor, if it
@@ -2818,8 +2868,10 @@ impl<'a> Parser<'a> {
         let (lh, lk) = (self.eh, self.ek);
         if bp == BP_OR || bp == BP_AND {
             self.pos += 1;
+            let r0 = self.pos;
             // `expr AND expr`: two symbols below the right operand.
-            let r = self.operand::<E>(2, bp + 1)?;
+            let mut r = self.operand::<E>(2, bp + 1)?;
+            self.mark_and_or_operand(&mut r, r0);
             self.node::<E>(lh, lk)?;
             return Ok(bin(if bp == BP_OR { BinOp::Or } else { BinOp::And }, l, r));
         }

@@ -222,3 +222,50 @@ fn one_shot_scripts() {
     let o = temp_db("oneshot-o");
     assert_eq!(run_arg(&hipp_bin(), &h, sql), run_arg(&oracle(), &o, sql));
 }
+
+/// v0.16 review fixes, as the shell renders them: NEW's generated
+/// columns in BEFORE UPDATE, part-way RAISE(FAIL) in a body write,
+/// RETURNING through an INSTEAD OF view and with AFTER triggers,
+/// REPLACE victims' order, the AND / OR literal rule, and a depth
+/// failure that keeps a transaction's rows.
+#[test]
+fn review_fixes_render_as_the_pin() {
+    same_stdin(
+        "review",
+        "CREATE TABLE g(id INTEGER PRIMARY KEY, a, b, c AS (a||b), d AS (b||a) STORED);
+CREATE TABLE log(x);
+CREATE TRIGGER gu BEFORE UPDATE ON g BEGIN
+  INSERT INTO log VALUES(quote(new.c)||quote(new.b)||quote(new.d));
+END;
+INSERT INTO g(a, b) VALUES('x', 'y');
+UPDATE g SET a = 'z';
+SELECT * FROM log;
+CREATE TABLE t(a); CREATE TABLE u(b); INSERT INTO u VALUES(1),(2),(3);
+CREATE TRIGGER ti AFTER INSERT ON t BEGIN
+  DELETE FROM u WHERE CASE WHEN b=2 THEN RAISE(FAIL,'two') ELSE 1 END;
+END;
+INSERT INTO t VALUES(1);
+SELECT * FROM u;
+SELECT total_changes();
+CREATE TABLE r(a); CREATE VIEW v AS SELECT a FROM r;
+CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO r VALUES(new.a); INSERT INTO log VALUES(new.a); END;
+INSERT INTO v VALUES(5),(6) RETURNING a, (SELECT count(*) FROM log), typeof(a);
+CREATE TRIGGER ra AFTER INSERT ON r BEGIN INSERT INTO log VALUES(-new.a); END;
+INSERT INTO r VALUES(7),(8) RETURNING a, (SELECT count(*) FROM log), (SELECT count(*) FROM r);
+PRAGMA recursive_triggers=1;
+CREATE TABLE q(a UNIQUE, b UNIQUE);
+CREATE TRIGGER qd AFTER DELETE ON q BEGIN INSERT INTO log VALUES('d'||old.a||old.b); END;
+INSERT INTO q VALUES(1,1),(2,2);
+INSERT OR REPLACE INTO q VALUES(1,2);
+SELECT x FROM log WHERE x LIKE 'd%';
+SELECT -1 OR abs(-9223372036854775808);
+SELECT 0 AND abs(-9223372036854775808), (1) OR abs(-9223372036854775808);
+CREATE TABLE z(a);
+CREATE TRIGGER zr AFTER INSERT ON z BEGIN INSERT INTO z VALUES(new.a+1); END;
+BEGIN;
+INSERT INTO z VALUES(0);
+COMMIT;
+SELECT count(*), max(a) FROM z;
+",
+    );
+}

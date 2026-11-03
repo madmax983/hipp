@@ -14,7 +14,9 @@
 //!   INTEGER affinity. UPDATE / DELETE re-read each row (a deleted
 //!   one is skipped), and the BEFORE UPDATE row once more (NEW's
 //!   unassigned columns take the current values; NEW's generated
-//!   columns are NULL there). `UPDATE OF` fires on the SET list.
+//!   columns are computed from the assigned columns and those a
+//!   firing BEFORE UPDATE trigger reads as NEW.x, the rest NULL).
+//!   `UPDATE OF` fires on the SET list.
 //! - A trigger does not fire while it runs unless `PRAGMA
 //!   recursive_triggers`; 1000 nested programs at most ("triggers
 //!   nested too deep"), a program counting before its WHEN clause.
@@ -1146,4 +1148,455 @@ fn regressions() {
         SELECT 1 AND abs(-9223372036854775808)
         SELECT 0 OR abs(-9223372036854775808)",
     );
+}
+
+// ---------------- v0.16 review fixes ----------------
+
+/// NEW's generated columns in a BEFORE UPDATE trigger are computed
+/// from the assigned columns and those some firing BEFORE UPDATE
+/// trigger reads as NEW.x; the other columns count as NULL (hipp
+/// used to make every generated column NULL).
+#[test]
+fn review_before_update_generated_columns() {
+    run_same(
+        "rv-gen-1",
+        "CREATE TABLE t(a, g AS (a*2), s AS (a+1) STORED)
+        CREATE TABLE log(x)
+        CREATE TRIGGER tu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES(quote(new.g)||' '||quote(new.s)); END
+        INSERT INTO t(a) VALUES(3)
+        UPDATE t SET a=5
+        SELECT * FROM log
+        SELECT * FROM t",
+    );
+    run_same(
+        "rv-gen-2",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c AS (a||b), d AS (b||a) STORED)
+        CREATE TABLE log(x)
+        CREATE TRIGGER tu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES(quote(new.c)||quote(new.b)||quote(new.d)||quote(new.id)); END
+        INSERT INTO t(a, b) VALUES('x', 'y')
+        UPDATE t SET a='z'
+        UPDATE t SET id=7
+        SELECT * FROM log
+        SELECT * FROM t",
+    );
+    // Only the triggers that fire count: `UPDATE OF b` does not for
+    // SET a, and a WHEN clause's NEW.x counts.
+    run_same(
+        "rv-gen-3",
+        "CREATE TABLE t(a, b, g AS (a+b), h AS (coalesce(b,'n')) STORED)
+        CREATE TABLE log(x)
+        CREATE TRIGGER t1 BEFORE UPDATE OF b ON t BEGIN INSERT INTO log VALUES('t1 '||quote(new.b)); END
+        CREATE TRIGGER t2 BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('t2 '||quote(new.g)||quote(new.h)); END
+        INSERT INTO t(a,b) VALUES(1,2)
+        UPDATE t SET a=5
+        UPDATE t SET b=7
+        CREATE TRIGGER t3 BEFORE UPDATE ON t WHEN new.b IS NOT NULL BEGIN SELECT 1; END
+        UPDATE t SET a=6
+        SELECT * FROM log
+        SELECT * FROM t",
+    );
+}
+
+/// A trigger program's INSERT ... SELECT, DELETE or UPDATE that a
+/// RAISE(FAIL | IGNORE) stops part-way keeps the rows it wrote before
+/// the failing one where the pin streams the write (no triggers on
+/// its target, no subquery, no sort, ...), and none where it does
+/// not (hipp used to keep none).
+#[test]
+fn review_raise_part_way_through_a_body_write() {
+    let base = "CREATE TABLE t(a)
+        CREATE TABLE u(b)
+        INSERT INTO u VALUES(1),(2),(3)
+        CREATE TABLE log(x)";
+    let bodies = [
+        "INSERT INTO log SELECT CASE WHEN b=2 THEN RAISE(FAIL,'two') ELSE b END FROM u",
+        "INSERT INTO log SELECT DISTINCT CASE WHEN b=2 THEN RAISE(FAIL,'two') ELSE b END FROM u",
+        "INSERT INTO log SELECT b FROM u WHERE CASE WHEN b=2 THEN RAISE(FAIL,'two') ELSE 1 END",
+        "INSERT INTO log SELECT CASE WHEN b=2 THEN RAISE(FAIL,'two') ELSE b END FROM u ORDER BY b",
+        "INSERT INTO log SELECT count(*) FROM u GROUP BY CASE WHEN b=2 THEN RAISE(FAIL,'two') ELSE b END",
+        "INSERT INTO log SELECT CASE WHEN x=2 THEN RAISE(FAIL,'two') ELSE x END FROM (SELECT b x FROM u UNION ALL SELECT x FROM log)",
+        "INSERT INTO log VALUES(1),(RAISE(FAIL,'x')),(3)",
+        "DELETE FROM u WHERE CASE WHEN b=2 THEN RAISE(FAIL,'q') ELSE 1 END",
+        "DELETE FROM u WHERE CASE WHEN b=2 THEN RAISE(IGNORE) ELSE 1 END",
+        "DELETE FROM u WHERE CASE WHEN b=2 THEN RAISE(FAIL,'q') ELSE b IN (SELECT b FROM u) END",
+        "UPDATE u SET b=b*10 WHERE CASE WHEN b=2 THEN RAISE(FAIL,'q') ELSE 1 END",
+        "UPDATE u SET b=b*10 WHERE CASE WHEN b=2 THEN RAISE(FAIL,'q') ELSE (SELECT 1) END",
+        "UPDATE u SET rowid=rowid+10 WHERE CASE WHEN b=2 THEN RAISE(FAIL,'q') ELSE 1 END",
+        "UPDATE OR REPLACE u SET b=b*10 WHERE CASE WHEN b=2 THEN RAISE(FAIL,'q') ELSE 1 END",
+    ];
+    big(move || {
+        for (i, body) in bodies.iter().enumerate() {
+            for extra in [
+                "",
+                "CREATE TRIGGER ud AFTER DELETE ON u BEGIN SELECT 1; END",
+                "CREATE TRIGGER lt AFTER INSERT ON log BEGIN SELECT 1; END",
+            ] {
+                for (time, txn) in [("AFTER", false), ("BEFORE", false), ("AFTER", true)] {
+                    let mut s = lines(base);
+                    if !extra.is_empty() {
+                        s.push(extra.into());
+                    }
+                    s.push(format!(
+                        "CREATE TRIGGER ti {time} INSERT ON t BEGIN {body}; END"
+                    ));
+                    if txn {
+                        s.push("BEGIN".into());
+                    }
+                    s.push("INSERT INTO t VALUES(1)".into());
+                    if txn {
+                        s.push("COMMIT".into());
+                    }
+                    s.push("SELECT 't', * FROM t".into());
+                    s.push("SELECT 'u', rowid, * FROM u".into());
+                    s.push("SELECT 'log', * FROM log".into());
+                    s.push("SELECT changes(), total_changes()".into());
+                    same(&format!("rv-part-{i}-{}-{time}-{txn}", extra.len()), &s);
+                }
+            }
+        }
+    });
+}
+
+/// Generated: a body write over a few rows, a RAISE of each kind on
+/// a random row, with or without triggers on the written table and a
+/// transaction around the firing statement.
+#[test]
+fn review_raise_part_way_generated() {
+    big(|| {
+        let mut rng = Rng(0x5eed_0016_7261_6973);
+        for case in 0..40 {
+            let n = 2 + rng.next() % 4;
+            let at = 1 + rng.next() % n;
+            let raise = rng.pick(&["RAISE(FAIL,'f')", "RAISE(IGNORE)", "RAISE(ABORT,'a')"]);
+            let cond = format!("CASE WHEN b={at} THEN {raise} ELSE 1 END");
+            let body = match rng.next() % 4 {
+                0 => format!("INSERT INTO log SELECT b FROM u WHERE {cond}"),
+                1 => format!("INSERT INTO log SELECT b * ({cond}) FROM u"),
+                2 => format!("DELETE FROM u WHERE {cond}"),
+                _ => format!("UPDATE u SET b = b + 100 WHERE {cond}"),
+            };
+            let mut s = lines(
+                "CREATE TABLE t(a)
+                CREATE TABLE u(b)
+                CREATE TABLE log(x)",
+            );
+            let vals: Vec<String> = (1..=n).map(|v| format!("({v})")).collect();
+            s.push(format!("INSERT INTO u VALUES {}", vals.join(", ")));
+            if rng.next().is_multiple_of(3) {
+                s.push(
+                    rng.pick(&[
+                        "CREATE TRIGGER x AFTER INSERT ON log BEGIN SELECT 1; END",
+                        "CREATE TRIGGER x BEFORE DELETE ON u BEGIN SELECT 1; END",
+                        "CREATE TRIGGER x AFTER UPDATE ON u BEGIN SELECT 1; END",
+                    ])
+                    .into(),
+                );
+            }
+            let time = rng.pick(&["BEFORE", "AFTER"]);
+            s.push(format!(
+                "CREATE TRIGGER ti {time} INSERT ON t BEGIN {body}; END"
+            ));
+            let txn = rng.next().is_multiple_of(2);
+            if txn {
+                s.push("BEGIN".into());
+            }
+            s.push("INSERT INTO t VALUES(1), (2)".into());
+            if txn {
+                s.push("COMMIT".into());
+            }
+            s.push("SELECT 't', * FROM t".into());
+            s.push("SELECT 'u', * FROM u".into());
+            s.push("SELECT 'log', * FROM log".into());
+            same(&format!("rv-partgen-{case}"), &s);
+        }
+    });
+}
+
+/// The ungated AND / OR simplification applies only where the pin's
+/// does: over a lone 32-bit integer token (`-1`, `+0`, `1_0` and
+/// `2147483648` are not), so a trigger's RAISE behind one still runs.
+#[test]
+fn review_and_or_literal_short_circuit_in_triggers() {
+    run_same(
+        "rv-andor",
+        "CREATE TABLE t(a)
+        CREATE TRIGGER tr BEFORE INSERT ON t BEGIN SELECT +0 AND RAISE(ABORT,'no'); END
+        INSERT INTO t VALUES(1)
+        DROP TRIGGER tr
+        CREATE TRIGGER tr BEFORE INSERT ON t BEGIN SELECT -1 OR RAISE(ABORT,'no2'); END
+        INSERT INTO t VALUES(2)
+        DROP TRIGGER tr
+        CREATE TRIGGER tr BEFORE INSERT ON t BEGIN SELECT 0 AND RAISE(ABORT,'no3'); SELECT RAISE(ABORT,'no4') OR (1); END
+        INSERT INTO t VALUES(3)
+        SELECT count(*), group_concat(a) FROM t",
+    );
+}
+
+/// REPLACE over several UNIQUE indexes deletes the conflicting rows
+/// most recently created index first, as the pin (its DELETE
+/// triggers show the order).
+#[test]
+fn review_replace_victim_order() {
+    run_same(
+        "rv-order-1",
+        "PRAGMA recursive_triggers=1
+        CREATE TABLE t(a UNIQUE, b UNIQUE, c)
+        CREATE TABLE log(x)
+        CREATE TRIGGER td AFTER DELETE ON t BEGIN INSERT INTO log VALUES('d'||old.a||old.b); END
+        INSERT INTO t VALUES(1,1,0),(2,2,0)
+        INSERT OR REPLACE INTO t VALUES(1,2,9)
+        SELECT group_concat(x) FROM log
+        CREATE TABLE w(a, b, c UNIQUE, d UNIQUE)
+        CREATE UNIQUE INDEX wa ON w(a)
+        CREATE UNIQUE INDEX wb ON w(b)
+        CREATE TRIGGER wd AFTER DELETE ON w BEGIN INSERT INTO log VALUES('w'||old.a||old.b||old.c||old.d); END
+        INSERT INTO w VALUES(1,1,1,1),(2,2,2,2),(3,3,3,3),(4,4,4,4)
+        DELETE FROM log
+        INSERT OR REPLACE INTO w VALUES(1,2,3,4)
+        SELECT group_concat(x) FROM log
+        DELETE FROM w
+        DELETE FROM log
+        INSERT INTO w VALUES(1,1,1,1),(2,2,2,2),(3,3,3,3),(4,4,4,4)
+        UPDATE OR REPLACE w SET a=2, b=3, c=4 WHERE d=1
+        SELECT group_concat(x) FROM log
+        SELECT * FROM w",
+    );
+    run_same(
+        "rv-order-2",
+        "PRAGMA recursive_triggers=1
+        CREATE TABLE log(x)
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a UNIQUE, b, UNIQUE(b))
+        CREATE TRIGGER td AFTER DELETE ON t BEGIN INSERT INTO log VALUES('d'||old.id||old.a||old.b); END
+        INSERT INTO t VALUES(1,1,1),(2,2,2),(3,3,3)
+        REPLACE INTO t VALUES(1,2,3)
+        SELECT group_concat(x) FROM log
+        CREATE TABLE v(a, b, c)
+        CREATE UNIQUE INDEX vb ON v(b)
+        CREATE UNIQUE INDEX va ON v(a)
+        CREATE TRIGGER vd AFTER DELETE ON v BEGIN INSERT INTO log VALUES('v'||old.a||old.b||old.c); END
+        INSERT INTO v VALUES(1,1,1),(2,2,2)
+        INSERT INTO v VALUES(1,2,0) ON CONFLICT(b) DO UPDATE SET c=9
+        INSERT INTO v VALUES(1,2,0) ON CONFLICT(a) DO UPDATE SET c=8
+        INSERT OR REPLACE INTO v VALUES(1,2,7)
+        SELECT group_concat(x) FROM log
+        SELECT * FROM v",
+    );
+}
+
+/// An uncorrelated RETURNING subquery is computed once, when the
+/// first row reaches it, unless its FROM names the written table
+/// directly; and RETURNING runs before the row's AFTER triggers
+/// (UPDATE too).
+#[test]
+fn review_returning_subqueries_and_triggers() {
+    run_same(
+        "rv-ret",
+        "CREATE TABLE t(a)
+        CREATE TABLE log(x)
+        CREATE TRIGGER ti AFTER INSERT ON t BEGIN INSERT INTO log VALUES(new.a); END
+        INSERT INTO t VALUES(1),(2),(3) RETURNING a, (SELECT count(*) FROM log), (SELECT max(x) FROM log)
+        INSERT INTO t VALUES(4),(5) RETURNING a, (SELECT count(*) FROM t), (SELECT (SELECT count(*) FROM t))
+        INSERT INTO t VALUES(6),(7) RETURNING a, (SELECT count(*) FROM log WHERE x < a), a IN (SELECT x FROM log), EXISTS (SELECT 1 FROM log WHERE x = 7)
+        INSERT INTO t VALUES(8),(9) RETURNING a, (SELECT count(*) FROM log WHERE x IN (SELECT a FROM t)), (SELECT count(*) FROM (SELECT * FROM t))
+        INSERT INTO t VALUES(10),(11) RETURNING a, (SELECT count(*) FROM log UNION ALL SELECT 1 FROM t LIMIT 1)
+        INSERT INTO t SELECT 12 UNION ALL SELECT 13 RETURNING a, (SELECT count(*) FROM log)
+        CREATE TRIGGER tu AFTER UPDATE ON t BEGIN INSERT INTO log VALUES(new.a); END
+        UPDATE t SET a=a+100 WHERE a < 3 RETURNING a, (SELECT count(*) FROM log), (SELECT count(*) FROM log WHERE x >= a)
+        CREATE TRIGGER td AFTER DELETE ON t BEGIN INSERT INTO log VALUES(-old.a); END
+        DELETE FROM t WHERE a > 100 RETURNING a, (SELECT count(*) FROM log)
+        INSERT INTO t VALUES(1) RETURNING t.*
+        SELECT count(*) FROM log",
+    );
+}
+
+/// Name errors anywhere in the trigger nest a statement may run fail
+/// it when it is prepared, whatever the WHEN clauses (hipp checked
+/// only the triggers it fires directly).
+#[test]
+fn review_nested_programs_checked_at_prepare() {
+    run_same(
+        "rv-nest",
+        "CREATE TABLE t(a)
+        CREATE TABLE u(b)
+        CREATE TABLE log(x)
+        CREATE TRIGGER tt AFTER INSERT ON t WHEN new.a>5 BEGIN INSERT INTO u VALUES(new.a); END
+        CREATE TRIGGER tu AFTER INSERT ON u BEGIN INSERT INTO log VALUES(new.zz); END
+        INSERT INTO t VALUES(1)
+        SELECT * FROM t
+        DROP TRIGGER tu
+        CREATE TRIGGER tu AFTER INSERT ON u BEGIN INSERT INTO t VALUES(new.b); INSERT INTO log VALUES(nosuch); END
+        INSERT INTO t VALUES(2)
+        DROP TRIGGER tu
+        CREATE TRIGGER tu AFTER UPDATE OF zz ON u BEGIN SELECT nosuch; END
+        CREATE TRIGGER tv AFTER INSERT ON u BEGIN UPDATE u SET b = 1; END
+        INSERT INTO t VALUES(3)
+        SELECT * FROM t
+        PRAGMA recursive_triggers=1
+        CREATE TABLE r(a UNIQUE)
+        CREATE TRIGGER rd AFTER DELETE ON r BEGIN INSERT INTO log VALUES(old.zz); END
+        INSERT INTO r VALUES(1)
+        INSERT OR REPLACE INTO r VALUES(2)
+        PRAGMA recursive_triggers=0
+        INSERT OR REPLACE INTO r VALUES(3)
+        SELECT * FROM r",
+    );
+}
+
+/// A trigger-depth failure inside an explicit transaction keeps the
+/// statement's changes where no program holds an abort point (the
+/// pin opens no statement journal), and undoes them where one does.
+#[test]
+fn review_depth_failure_in_a_transaction() {
+    let bodies = [
+        "INSERT INTO t VALUES(new.a+1)",
+        "INSERT INTO t VALUES(abs(new.a)+1)",
+        "INSERT INTO t SELECT new.a+1",
+        "INSERT INTO t VALUES(new.a+1); SELECT RAISE(ABORT,'x') WHERE 0",
+        "INSERT INTO t VALUES(new.a+1); SELECT RAISE(FAIL,'x') WHERE 0",
+        "UPDATE u SET b=b+1; INSERT INTO t VALUES(new.a+1)",
+        "INSERT INTO t VALUES(coalesce(new.a,0)+1)",
+        "INSERT INTO t VALUES(nullif(new.a,-1)+1)",
+        "INSERT INTO t SELECT new.a+1 WHERE 'a' LIKE 'a'",
+        "INSERT INTO t(a) VALUES(new.a+1)",
+        "INSERT INTO t VALUES(new.a+1); INSERT INTO w VALUES(1)",
+        "INSERT INTO t VALUES(new.a+1); INSERT OR IGNORE INTO w VALUES(1)",
+    ];
+    big(move || {
+        for (i, body) in bodies.iter().enumerate() {
+            let mut s = lines(
+                "PRAGMA recursive_triggers=1
+                CREATE TABLE t(a)
+                CREATE TABLE u(b)
+                CREATE TABLE w(c UNIQUE)
+                INSERT INTO u VALUES(1)",
+            );
+            s.push(format!(
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN {body}; END"
+            ));
+            s.push("BEGIN".into());
+            s.push("INSERT INTO t VALUES(0)".into());
+            s.push("SELECT count(*) FROM t".into());
+            s.push("COMMIT".into());
+            s.push("SELECT count(*), max(a) FROM t".into());
+            s.push("INSERT INTO t VALUES(0)".into());
+            s.push("SELECT count(*) FROM t".into());
+            same(&format!("rv-depth-{i}"), &s);
+        }
+        same(
+            "rv-depth-delete",
+            &lines(
+                "PRAGMA recursive_triggers=1
+                CREATE TABLE t(a)
+                CREATE TRIGGER tr AFTER DELETE ON t BEGIN DELETE FROM t WHERE a=old.a+1; END
+                INSERT INTO t WITH RECURSIVE c(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM c WHERE x<1100) SELECT x FROM c
+                BEGIN
+                DELETE FROM t WHERE a=0
+                COMMIT
+                SELECT count(*) FROM t",
+            ),
+        );
+    });
+}
+
+/// Views written through INSTEAD OF triggers: RETURNING (NEW for an
+/// INSERT / UPDATE, OLD for a DELETE, after the triggers), and an
+/// assignment of the view's rowid (the trigger fires, nothing
+/// changes).
+#[test]
+fn review_instead_of_returning_and_rowid() {
+    run_same(
+        "rv-view",
+        "CREATE TABLE t(a, b)
+        CREATE VIEW v AS SELECT a, b FROM t
+        CREATE TABLE log(x, y)
+        CREATE TRIGGER ti INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES(new.a, new.b); INSERT INTO log VALUES('i', new.a); END
+        CREATE TRIGGER tu INSTEAD OF UPDATE ON v BEGIN UPDATE t SET a=new.a WHERE a=old.a; INSERT INTO log VALUES(old.a, new.a); END
+        CREATE TRIGGER td INSTEAD OF DELETE ON v BEGIN DELETE FROM t WHERE a=old.a; END
+        INSERT INTO v VALUES(1, 2) RETURNING *
+        INSERT INTO v(a) VALUES(3), ('5') RETURNING a, b, a+1, typeof(a), (SELECT count(*) FROM log), (SELECT count(*) FROM t)
+        INSERT INTO v SELECT 7, 8 RETURNING v.a, b
+        UPDATE v SET a=10 WHERE a=1 RETURNING *, (SELECT count(*) FROM t WHERE a=10)
+        DELETE FROM v WHERE a=3 RETURNING *
+        INSERT INTO v VALUES(1, 2) RETURNING rowid
+        INSERT INTO v VALUES(1, 2) RETURNING nosuch
+        INSERT INTO v VALUES(1, 2) RETURNING v.*
+        UPDATE v SET rowid=5
+        UPDATE v SET oid=5, a=11 WHERE a=10
+        UPDATE v SET _rowid_=abs(-9223372036854775808)
+        SELECT changes()
+        SELECT * FROM t
+        SELECT * FROM log",
+    );
+    run_same(
+        "rv-view-ignore",
+        "CREATE TABLE t(a INT)
+        CREATE VIEW v AS SELECT a FROM t
+        CREATE TRIGGER ti INSTEAD OF INSERT ON v WHEN new.a=2 BEGIN SELECT RAISE(IGNORE); END
+        INSERT INTO v VALUES(1),(2),(3) RETURNING a, changes()
+        CREATE TRIGGER tu INSTEAD OF UPDATE OF a ON v BEGIN SELECT 1; END
+        UPDATE v SET rowid=5",
+    );
+}
+
+/// `CREATE TRIGGER main.x ... ON tt` puts the trigger and its table
+/// in main: over a temp-only table it is the pin's "no such table".
+#[test]
+fn review_main_qualified_trigger_on_temp_table() {
+    run_same(
+        "rv-mainq",
+        "CREATE TEMP TABLE tt(a)
+        CREATE TRIGGER main.tr AFTER INSERT ON tt BEGIN SELECT 1; END
+        CREATE TRIGGER main.tr AFTER INSERT ON temp.tt BEGIN SELECT 1; END
+        CREATE TEMP TRIGGER main.tr AFTER INSERT ON tt BEGIN SELECT 1; END
+        SELECT 'temp', name FROM sqlite_temp_schema
+        SELECT 'main', name FROM sqlite_schema
+        CREATE TABLE tt(a)
+        CREATE TRIGGER main.tr AFTER INSERT ON tt BEGIN SELECT 1; END
+        SELECT 'temp', name FROM sqlite_temp_schema
+        SELECT 'main', name, tbl_name FROM sqlite_schema",
+    );
+}
+
+/// `Config::default()`'s trigger depth fits its stack sizing: on a
+/// thread of the stack `stack_budget` was given, a recursive trigger
+/// meets `TriggerDepth`, never a stack overflow.
+#[test]
+fn review_default_trigger_depth_fits_the_stack() {
+    assert_eq!(
+        Config::default().max_trigger_depth,
+        hipp::session::DEFAULT_TRIGGER_DEPTH
+    );
+    for stack in [2usize << 20, 8 << 20] {
+        let cfg = Config::default().stack_budget(stack);
+        assert!(cfg.max_trigger_depth <= hipp::session::DEFAULT_TRIGGER_DEPTH);
+        let depth = cfg.max_trigger_depth;
+        let r = std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || {
+                block_on(async {
+                    let mut db = Connection::open(hipp::MemStorage::new(), cfg)
+                        .await
+                        .expect("open");
+                    for s in [
+                        "PRAGMA recursive_triggers=1",
+                        "CREATE TABLE t(a)",
+                        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t VALUES (new.a+1); END",
+                    ] {
+                        let mut q = db.prepare(s).await.expect("prepare");
+                        q.step().await.expect("step");
+                    }
+                    let mut q = db.prepare("INSERT INTO t VALUES (1)").await.expect("prepare");
+                    matches!(
+                        q.step().await,
+                        Err(hipp::Error::Schema {
+                            kind: hipp::SchemaKind::TriggerDepth
+                        })
+                    )
+                })
+            })
+            .expect("thread")
+            .join()
+            .expect("no overflow");
+        assert!(r, "depth {depth} on {stack} bytes");
+    }
 }

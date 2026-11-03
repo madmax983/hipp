@@ -489,6 +489,11 @@ pub enum SchemaKind {
     /// statements within triggers"). Write the bare name.
     #[cfg(feature = "triggers")]
     TriggerQualifiedTarget,
+    /// A `table.*` item in a RETURNING list (v0.16 review fix,
+    /// ungated; the pin's "RETURNING may not use \"TABLE.*\"
+    /// wildcards"). Write `*` or name the columns.
+    #[cfg(feature = "v07")]
+    ReturningTableStar,
     /// RETURNING inside a trigger body (v0.16, `triggers`;
     /// "cannot use RETURNING in a trigger"). Drop the clause.
     #[cfg(feature = "triggers")]

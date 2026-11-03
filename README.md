@@ -509,8 +509,10 @@ aspirations.
   pin's text, DROP TRIGGER; bodies of INSERT / UPDATE / DELETE /
   SELECT with NEW. / OLD. (the pin's affinity and collation rules),
   RAISE(IGNORE / ROLLBACK / ABORT / FAIL) with the pin's
-  resolution, conflict-clause override, recursive_triggers, the
-  1000-program depth limit, changes() / last_insert_rowid() frames,
+  resolution, conflict-clause override, recursive_triggers, a
+  trigger depth limit (`Config::max_trigger_depth`: 24 by default,
+  sized for a 2 MiB thread; the CLI sets the pin's 1000 programs),
+  changes() / last_insert_rowid() frames,
   REPLACE and upsert interplay, and INSTEAD OF triggers that make
   views writable. ALTER TABLE rewrites trigger texts as the pin
   does (its `excluded.` quirk included). Pin-made files with
@@ -519,6 +521,18 @@ aspirations.
   (ungated, every profile — they used to skip the trigger
   silently). TEMP triggers on main tables are refused. Tiny +196 B,
   full +528 B (the ungated refusals), max +33.9 KB (STATUS.md).
+  Review fixes: BEFORE UPDATE computes NEW's generated columns over
+  the pin's new-column mask; a RAISE part-way through a body's
+  streaming INSERT ... SELECT / DELETE / UPDATE keeps the rows
+  before it; the whole trigger nest is checked at prepare; a depth
+  failure in a transaction keeps the rows when no program can
+  abort (the pin's missing statement journal); INSTEAD OF view
+  writes take RETURNING and a rowid assignment; RETURNING
+  subqueries are computed once unless they read the written table
+  directly. Ungated with them: `0 AND x` / `x OR 1` short-circuit
+  only over a lone 32-bit integer token (`-1 OR x` evaluates `x`),
+  REPLACE deletes its victims in the pin's index order, and
+  `RETURNING t.*` is refused as on the pin. Full +688 B, max +8.8 KB.
 - **Foreign-key enforcement** (new leaf feature `foreign_keys`, in
   `max` — ADR 0002 — not `full`). With `PRAGMA foreign_keys = ON`
   writes are checked as the pin checks them — with its violation

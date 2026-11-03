@@ -1469,3 +1469,89 @@ fn generated_comparison_affinity_corpus() {
         tw.same(&format!("SELECT {} FROM c", xs.join(", ")));
     }
 }
+
+// ---------------- AND / OR constant operands (ungated) ----------------
+
+/// The pin simplifies `x AND 0` / `x OR 1` (skipping `x`) only when
+/// the constant is a lone integer token of a 32-bit value (decimal
+/// or hex, any parentheses) or TRUE / FALSE: `-1`, `+0`, `-0`,
+/// `1_0`, `2147483648`, `0x80000000` and `1+0` leave `x` evaluated
+/// (v0.16 review fix: hipp skipped it for any integer literal its
+/// parser folded, so `-1 OR abs(-9223372036854775808)` was 1).
+#[test]
+fn and_or_constant_operands() {
+    let tw = twins("andor", "");
+    let boom = "abs(-9223372036854775808)";
+    let consts = [
+        "0",
+        "1",
+        "7",
+        "(0)",
+        "((1))",
+        "0x0",
+        "0x7fffffff",
+        "0x80000000",
+        "2147483647",
+        "2147483648",
+        "00000000000002",
+        "+0",
+        "-1",
+        "-0",
+        "1_0",
+        "0.0",
+        "1+0",
+        "true",
+        "false",
+        "(0 AND 1)",
+        "(1 OR 0)",
+        "CAST(0 AS INT)",
+        "'0'",
+    ];
+    for c in consts {
+        for sql in [
+            format!("SELECT {c} AND {boom}"),
+            format!("SELECT {boom} AND {c}"),
+            format!("SELECT {c} OR {boom}"),
+            format!("SELECT {boom} OR {c}"),
+        ] {
+            tw.same(&sql);
+        }
+    }
+    // Generated nests of constants, columns-free.
+    let mut rng = Rng(0xa2d0_0016_0b5e_eed1);
+    for _ in 0..60 {
+        let mut e = rng.pick(&consts).to_string();
+        for _ in 0..1 + rng.below(3) {
+            let op = rng.pick(&["AND", "OR"]);
+            let other = if rng.below(2) == 0 {
+                boom.to_string()
+            } else {
+                rng.pick(&consts).to_string()
+            };
+            e = if rng.below(2) == 0 {
+                format!("({e}) {op} {other}")
+            } else {
+                format!("{other} {op} ({e})")
+            };
+        }
+        tw.same(&format!("SELECT {e}"));
+    }
+    tw.all(&["SELECT -1 OR 0, +0 AND 1, 1_0 OR 0, typeof(+5 AND 1), 1 AND 7, 7 OR 0"]);
+}
+
+/// `RETURNING t.*` is the pin's error (v0.16 review fix: hipp
+/// expanded it).
+#[test]
+fn returning_table_star_is_refused() {
+    let tw = twins("retstar", "CREATE TABLE t(a)");
+    tw.refuse(
+        "INSERT INTO t VALUES (1) RETURNING t.*",
+        SchemaKind::ReturningTableStar,
+    );
+    tw.refuse(
+        "UPDATE t SET a = 2 RETURNING x.*",
+        SchemaKind::ReturningTableStar,
+    );
+    tw.all(&["INSERT INTO t VALUES (3) RETURNING *", "SELECT * FROM t"]);
+    tw.finish("SELECT * FROM t;");
+}

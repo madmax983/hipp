@@ -500,10 +500,20 @@ impl<S: Storage> Connection<S> {
             Ast::CreateTrigger(ct) => {
                 let tn = handle_bytes(arena, ct.table);
                 let tq = tok_index(t, ct.table).and_then(|i| qualifier(t, i, arena));
+                let nq = tok_index(t, ct.name).and_then(|i| qualifier(t, i, arena));
+                // A `main.` trigger name puts the trigger, and its
+                // table, in main (v0.16 review fix: the pin's "no such
+                // table: main.tt" over a temp-only table).
+                if nq == Some(false) && !temp_kw {
+                    if tq == Some(true) {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::TriggerTempReference,
+                        });
+                    }
+                    return Ok(Route::Main);
+                }
                 let on_temp = tq == Some(true) || (tq.is_none() && self.temp_has(tn, false));
-                let named_temp = tok_index(t, ct.name)
-                    .and_then(|i| qualifier(t, i, arena))
-                    .is_some();
+                let named_temp = nq.is_some();
                 if temp_kw && named_temp {
                     return Err(Error::Schema {
                         kind: SchemaKind::TriggerTempReference,
