@@ -994,6 +994,12 @@ impl<S: Storage> Pager<S> {
         self.storage.sync().await.map_err(Error::Storage)?;
         self.header = parse_db_header::<S::Error>(&img, u64::from(page_size))?;
         self.orig_page_count = self.header.page_count;
+        // The new page size is not transactional (the pin keeps it
+        // across ROLLBACK TO): an open savepoint returns to the
+        // reformatted empty file, not to the old page size.
+        for m in self.sp.as_mut_slice().iter_mut() {
+            m.header = self.header;
+        }
         for f in self.frames.iter_mut() {
             f.page = 0;
             f.dirty = false;

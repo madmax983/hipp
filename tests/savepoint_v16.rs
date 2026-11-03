@@ -534,3 +534,223 @@ fn connection_api_and_savepoints() {
         assert_eq!(q.column_i64(0), Some(0));
     });
 }
+
+/// Review regression: `OR ROLLBACK` (statement level) and a
+/// constraint-level `ON CONFLICT ROLLBACK` end the whole
+/// transaction on a violation, as on the pin — not only the
+/// failed statement — while ABORT, FAIL, IGNORE, REPLACE and an
+/// upsert's DO UPDATE keep it open. In BEGIN and SAVEPOINT
+/// transactions, for UNIQUE, PRIMARY KEY, NOT NULL and CHECK.
+#[test]
+fn conflict_rollback_ends_the_transaction() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "or-rollback-insert",
+            "CREATE TABLE t(a UNIQUE)
+            INSERT INTO t VALUES (1)
+            BEGIN
+            INSERT INTO t VALUES (9)
+            INSERT OR ROLLBACK INTO t VALUES (1)
+            SELECT * FROM t
+            COMMIT
+            SELECT * FROM t",
+        ),
+        (
+            "or-rollback-update-savepoint",
+            "CREATE TABLE t(a UNIQUE)
+            INSERT INTO t VALUES (1)
+            SAVEPOINT s
+            INSERT INTO t VALUES (9)
+            UPDATE OR ROLLBACK t SET a = 1 WHERE a = 9
+            SELECT * FROM t
+            RELEASE s
+            SELECT * FROM t",
+        ),
+        (
+            "or-rollback-not-null-check",
+            "CREATE TABLE t(a NOT NULL, b CHECK (b > 0))
+            BEGIN
+            INSERT INTO t VALUES (1, 1)
+            INSERT OR ROLLBACK INTO t VALUES (NULL, 1)
+            SELECT count(*) FROM t
+            COMMIT
+            BEGIN
+            INSERT INTO t VALUES (2, 2)
+            INSERT OR ROLLBACK INTO t VALUES (3, 0)
+            COMMIT
+            SELECT * FROM t",
+        ),
+        (
+            "or-rollback-multirow-and-ddl",
+            "CREATE TABLE t(a UNIQUE)
+            INSERT INTO t VALUES (1)
+            BEGIN
+            CREATE TABLE u(x)
+            INSERT INTO u VALUES (1)
+            INSERT INTO t VALUES (5)
+            INSERT OR ROLLBACK INTO t VALUES (2), (1)
+            SELECT changes(), total_changes()
+            SELECT * FROM u
+            COMMIT
+            SELECT name FROM sqlite_schema
+            SELECT * FROM t
+            INSERT OR ROLLBACK INTO t VALUES (3), (1)
+            SELECT * FROM t",
+        ),
+        (
+            "constraint-level",
+            "CREATE TABLE n(a NOT NULL ON CONFLICT ROLLBACK, b)
+            CREATE TABLE q(a UNIQUE ON CONFLICT ROLLBACK, b NOT NULL)
+            CREATE TABLE p(a INTEGER PRIMARY KEY ON CONFLICT ROLLBACK, b)
+            CREATE TABLE m(a, b, UNIQUE (a, b) ON CONFLICT ROLLBACK)
+            CREATE TABLE d(a, b, PRIMARY KEY (a DESC) ON CONFLICT ROLLBACK)
+            INSERT INTO q VALUES (1, 1)
+            INSERT INTO p VALUES (1, 1)
+            INSERT INTO m VALUES (1, 1)
+            INSERT INTO d VALUES (1, 1)
+            BEGIN
+            INSERT INTO n VALUES (1, 1)
+            INSERT INTO n VALUES (NULL, 2)
+            COMMIT
+            BEGIN
+            INSERT INTO q VALUES (2, 2)
+            INSERT INTO q VALUES (3, NULL)
+            SELECT * FROM q
+            INSERT INTO q VALUES (1, 3)
+            COMMIT
+            BEGIN
+            INSERT INTO p VALUES (2, 2)
+            INSERT INTO p VALUES (1, 3)
+            COMMIT
+            SAVEPOINT s
+            INSERT INTO m VALUES (2, 2)
+            INSERT INTO m VALUES (1, 1)
+            RELEASE s
+            BEGIN
+            INSERT INTO d VALUES (2, 2)
+            INSERT INTO d VALUES (1, 9)
+            COMMIT
+            SELECT * FROM n
+            SELECT * FROM q
+            SELECT * FROM p
+            SELECT * FROM m
+            SELECT * FROM d",
+        ),
+        (
+            "other-actions-keep-it-open",
+            "CREATE TABLE t(a UNIQUE ON CONFLICT ROLLBACK)
+            CREATE TABLE u(a UNIQUE)
+            INSERT INTO t VALUES (1)
+            INSERT INTO u VALUES (1)
+            BEGIN
+            INSERT INTO t VALUES (5)
+            INSERT OR IGNORE INTO t VALUES (1)
+            INSERT OR REPLACE INTO t VALUES (1)
+            INSERT INTO u VALUES (5)
+            INSERT OR ABORT INTO u VALUES (1)
+            INSERT OR FAIL INTO u VALUES (7), (1)
+            REPLACE INTO u VALUES (1)
+            INSERT OR ROLLBACK INTO u VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 5
+            INSERT OR ROLLBACK INTO u VALUES (8) ON CONFLICT (a) DO NOTHING
+            COMMIT
+            SELECT * FROM t
+            SELECT * FROM u",
+        ),
+        (
+            "temp-follows",
+            "CREATE TABLE t(a UNIQUE)
+            INSERT INTO t VALUES (1)
+            CREATE TEMP TABLE x(a UNIQUE)
+            INSERT INTO x VALUES (1)
+            BEGIN
+            INSERT INTO x VALUES (2)
+            INSERT OR ROLLBACK INTO t VALUES (1)
+            SELECT * FROM x
+            BEGIN
+            INSERT INTO t VALUES (3)
+            INSERT OR ROLLBACK INTO x VALUES (1)
+            SELECT * FROM t
+            COMMIT
+            SELECT * FROM t
+            SELECT * FROM x",
+        ),
+    ];
+    for (tag, script) in cases {
+        same(tag, &lines(script));
+    }
+}
+
+/// Review regression: `PRAGMA page_size` on an empty database is
+/// not transactional — ROLLBACK TO a savepoint opened before it
+/// keeps the new size (hipp put back the old header and panicked
+/// on the next write).
+#[test]
+fn page_size_survives_rollback_to() {
+    same(
+        "pgsz-sp",
+        &lines(
+            "SAVEPOINT a
+            PRAGMA page_size = 1024
+            ROLLBACK TO a
+            CREATE TABLE u(y)
+            PRAGMA page_size
+            SELECT 'alive'
+            RELEASE a
+            PRAGMA page_size",
+        ),
+    );
+    same(
+        "pgsz-begin",
+        &lines(
+            "BEGIN
+            PRAGMA page_size = 1024
+            SAVEPOINT a
+            PRAGMA page_size = 8192
+            ROLLBACK TO a
+            CREATE TABLE u(y)
+            INSERT INTO u VALUES (zeroblob(5000))
+            PRAGMA page_size
+            COMMIT
+            PRAGMA page_size
+            SELECT length(y) FROM u",
+        ),
+    );
+    same(
+        "pgsz-nested",
+        &lines(
+            "PRAGMA page_size = 1024
+            SAVEPOINT a
+            SAVEPOINT b
+            PRAGMA page_size = 2048
+            ROLLBACK TO a
+            PRAGMA page_size
+            ROLLBACK
+            PRAGMA page_size
+            CREATE TABLE t(x)
+            PRAGMA page_size",
+        ),
+    );
+    // `:memory:` takes the same path.
+    block_on(async {
+        let mut db = Connection::open(hipp::storage::MemStorage::new(), Config::default())
+            .await
+            .expect("open");
+        for sql in [
+            "SAVEPOINT a",
+            "PRAGMA page_size = 1024",
+            "ROLLBACK TO a",
+            "CREATE TABLE u(y)",
+            "INSERT INTO u VALUES (1)",
+            "RELEASE a",
+        ] {
+            let mut q = db.prepare(sql).await.expect(sql);
+            while q.step().await.expect(sql) == Step::Row {}
+        }
+        let mut q = db.prepare("PRAGMA page_size").await.expect("prep");
+        assert_eq!(q.step().await.expect("step"), Step::Row);
+        assert!(matches!(
+            q.column_value(0),
+            Some(hipp::Value::Integer(1024))
+        ));
+    });
+}

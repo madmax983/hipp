@@ -1098,6 +1098,8 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v16")]
             stmt_sp: None,
             #[cfg(feature = "v16")]
+            upsert_failed: false,
+            #[cfg(feature = "v16")]
             autoinc: None,
         })
     }
@@ -4404,6 +4406,11 @@ pub struct Statement<'c, S: Storage> {
     /// `abort_write`), while it is open.
     #[cfg(feature = "v16")]
     stmt_sp: Option<usize>,
+    /// An upsert's DO UPDATE failed (v0.16, `v16`): its conflicts
+    /// resolve by ABORT whatever the statement's OR clause says, as
+    /// on the pin, so OR ROLLBACK does not end the transaction.
+    #[cfg(feature = "v16")]
+    upsert_failed: bool,
     /// The running INSERT's AUTOINCREMENT state (v0.16, `v16`).
     #[cfg(feature = "v16")]
     autoinc: Option<Autoinc>,
@@ -4701,17 +4708,6 @@ pub(crate) fn resolve_not_null<E>(
             continue;
         }
         match action {
-            ConflictAction::Abort => {
-                return Err(Error::Schema {
-                    kind: SchemaKind::NotNullViolation,
-                });
-            }
-            #[cfg(feature = "v05")]
-            ConflictAction::Fail => {
-                return Err(Error::Schema {
-                    kind: SchemaKind::NotNullViolation,
-                });
-            }
             ConflictAction::Ignore => return Ok(false),
             ConflictAction::Replace => {
                 if matches!(defaults[i], OwnedValue::Null) {
@@ -4720,6 +4716,13 @@ pub(crate) fn resolve_not_null<E>(
                     });
                 }
                 row[i] = apply_affinity(defaults[i].clone(), affs[i]);
+            }
+            // ABORT, FAIL, ROLLBACK: the statement fails (FAIL and
+            // ROLLBACK differ only in what the failure undoes).
+            _ => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::NotNullViolation,
+                });
             }
         }
     }
@@ -4946,6 +4949,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "v16")]
             self.mats.clear();
         }
+        #[cfg(feature = "v16")]
+        let was_txn = self.conn.explicit_txn;
         let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
             || {
                 #[cfg(feature = "v16")]
@@ -5044,6 +5049,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
+        // A failure that ended the transaction (OR ROLLBACK, an
+        // I/O-class error) ends the TEMP database's too.
+        #[cfg(feature = "v16")]
+        if r.is_err()
+            && was_txn
+            && !self.conn.explicit_txn
+            && !matches!(self.plan, Plan::Temp { .. })
+        {
+            self.conn.mirror_temp(b"ROLLBACK").await;
+        }
         // A transaction statement applies to the TEMP database too.
         #[cfg(feature = "v16")]
         if r.is_ok()
@@ -5486,8 +5501,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         sql: Option<&[u8]>,
     ) -> Result<(), S::Error> {
         let pager = &mut self.conn.pager;
+        // At the largest rowid: v16 takes an unused one, as the pin
+        // does; without it the insert fails as a duplicate (v0.16
+        // review fix: the next rowid was computed unchecked).
+        #[cfg(feature = "v16")]
+        let rowid = btree::new_rowid(pager, 1).await?;
+        #[cfg(not(feature = "v16"))]
         let rowid = match btree::seek_max_rowid(pager, 1).await? {
-            Some(m) => m + 1,
+            Some(m) => m.saturating_add(1),
             None => 1,
         };
         let mut vals: AVec<Value<'_>> = AVec::new();
@@ -5787,17 +5808,19 @@ impl<'c, S: Storage> Statement<'c, S> {
             let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
             if values.len() >= 2
                 && matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index"))
-                && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, name_b.as_slice()))
+                && let Value::Text(n) = &values.as_slice()[1]
+                && eq_ci(n, name_b.as_slice())
             {
-                schema_rowid = Some(rowid);
+                schema_rowid = Some((rowid, copy_vec(n)));
                 break;
             }
         }
-        let Some(schema_rowid) = schema_rowid else {
+        let Some((schema_rowid, stored)) = schema_rowid else {
             return Err(Error::Schema {
                 kind: SchemaKind::UnknownIndex,
             });
         };
+        self.clear_stat_rows(1, stored.as_slice()).await?;
         // Collect first, then free: freeing rewrites the freelist
         // linkage the traversal is not using, but the traversal
         // must see the intact tree.
@@ -6161,12 +6184,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 btree::btree_delete(pager, ai.seq_root, r).await?;
                 r
             }
-            None => match btree::seek_max_rowid(pager, ai.seq_root).await? {
-                Some(m) => m.checked_add(1).ok_or(Error::Schema {
-                    kind: SchemaKind::DatabaseFull,
-                })?,
-                None => 1,
-            },
+            None => btree::new_rowid(pager, ai.seq_root).await?,
         };
         let mut vals: AVec<Value<'_>> = AVec::new();
         vals.push(Value::Text(ai.name.as_slice()));
@@ -6310,6 +6328,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                         kind: SchemaKind::DatabaseFull,
                     })?)
                 }
+                #[cfg(feature = "v16")]
+                None => btree::new_rowid(pager, *root).await?,
+                #[cfg(not(feature = "v16"))]
                 None => match btree::seek_max_rowid(pager, *root).await? {
                     Some(m) => m.checked_add(1).ok_or(Error::Schema {
                         kind: SchemaKind::DatatypeMismatch,
@@ -6396,7 +6417,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let routed = match &self.plan {
                 Plan::Insert {
                     conflict, upsert, ..
-                } => *conflict != ConflictAction::Abort || upsert.is_some(),
+                } => !conflict.aborts() || upsert.is_some(),
                 _ => unreachable!(),
             };
             if routed {
@@ -6714,7 +6735,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !up.do_update {
                     return Ok(()); // DO NOTHING: skip the row.
                 }
-                return self
+                let r = self
                     .exec_upsert_update(
                         up,
                         row.as_slice(),
@@ -6727,6 +6748,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                         not_nulls.as_slice(),
                     )
                     .await;
+                #[cfg(feature = "v16")]
+                if r.is_err() {
+                    self.upsert_failed = true;
+                }
+                return r;
             }
             // A conflict the clause does not arbitrate falls back
             // to the statement's own conflict action (Abort by
@@ -6749,7 +6775,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.push_insert_returning(row.as_slice(), rowid).await?;
                 Ok(())
             }
-            ConflictAction::Abort | ConflictAction::Fail => Err(Error::Schema {
+            // ABORT, FAIL, ROLLBACK: the statement fails.
+            _ => Err(Error::Schema {
                 kind: if conflicts.as_slice()[0].1 {
                     SchemaKind::DuplicateRowid
                 } else {
@@ -7360,11 +7387,6 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !conflict_rows.is_empty() {
                     match conflict_action {
                         ConflictAction::Ignore => continue,
-                        ConflictAction::Abort | ConflictAction::Fail => {
-                            return Err(Error::Schema {
-                                kind: first_err.unwrap_or(SchemaKind::UniqueViolation),
-                            });
-                        }
                         ConflictAction::Replace => {
                             #[cfg(feature = "v07")]
                             {
@@ -7386,6 +7408,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                                     kind: first_err.unwrap_or(SchemaKind::UniqueViolation),
                                 });
                             }
+                        }
+                        // ABORT, FAIL, ROLLBACK: the statement fails.
+                        _ => {
+                            return Err(Error::Schema {
+                                kind: first_err.unwrap_or(SchemaKind::UniqueViolation),
+                            });
                         }
                     }
                 }
@@ -7514,6 +7542,41 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(())
     }
 
+    /// Delete the statistics rows of a dropped table (`col` 0, the
+    /// `tbl` column) or index (`col` 1, `idx`) from every
+    /// `sqlite_stat1` .. `sqlite_stat4` table the database has, as
+    /// the pin's DROP TABLE / DROP INDEX do (v0.16 review fix,
+    /// ungated: hipp left them, so a later table of the same name
+    /// inherited made-up statistics). `name` is the name as stored
+    /// in the schema, compared exactly, as the pin's `tbl = name`.
+    #[cfg(any(feature = "v05", feature = "indexes"))]
+    async fn clear_stat_rows(&mut self, col: usize, name: &[u8]) -> Result<(), S::Error> {
+        for stat in [
+            b"sqlite_stat1",
+            b"sqlite_stat2",
+            b"sqlite_stat3",
+            b"sqlite_stat4",
+        ] {
+            let Some(t) = self.conn.catalog.find(&self.conn.catalog_arena, stat) else {
+                continue;
+            };
+            let root = t.root;
+            let mut gone = AVec::new();
+            let mut cursor = ScanCursor::new(root);
+            let mut buf = AVec::new();
+            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+                let values = crate::record::decode_record::<S::Error>(buf.as_slice(), col + 1)?;
+                if matches!(values.as_slice().get(col), Some(Value::Text(n)) if *n == name) {
+                    gone.push(rowid);
+                }
+            }
+            for r in gone.iter() {
+                btree::btree_delete(&mut self.conn.pager, root, *r).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// `DROP TABLE` (v0.5): free every page of the table B-tree
     /// and of each of its indexes (B-tree pages + overflow
     /// chains) to the freelist, then remove the schema rows.
@@ -7539,6 +7602,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Schema rowids: the table's own row plus every index
         // row it owns (explicit and implicit alike).
         let mut schema_rowids = AVec::new();
+        let mut stored: Option<AVec<u8>> = None;
         {
             let mut cursor = ScanCursor::new(1);
             let mut buf = AVec::new();
@@ -7547,6 +7611,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if values.len() >= 3 {
                     let is_table_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"table"))
                         && matches!(&values.as_slice()[1], Value::Text(n) if eq_ci(n, name_b.as_slice()));
+                    if is_table_row && let Value::Text(n) = &values.as_slice()[1] {
+                        stored = Some(copy_vec(n));
+                    }
                     let is_index_row = matches!(&values.as_slice()[0], Value::Text(t) if eq_ci(t, b"index"))
                         && matches!(&values.as_slice()[2], Value::Text(n) if eq_ci(n, name_b.as_slice()));
                     if is_table_row || is_index_row {
@@ -7554,6 +7621,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
+        }
+        // Before any page is freed: the table may be a statistics
+        // table itself.
+        if let Some(n) = &stored {
+            self.clear_stat_rows(0, n.as_slice()).await?;
         }
         let mut pages = btree::collect_table_pages(&mut self.conn.pager, root).await?;
         for ir in index_roots.iter() {

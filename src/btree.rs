@@ -559,6 +559,35 @@ impl ScanCursor {
     }
 }
 
+/// The rowid a new row without an explicit one takes in the table
+/// rooted at `root` (v0.16, `v16`): one past the largest, 1 for an
+/// empty table, and when the largest is 9223372036854775807 the
+/// smallest unused positive rowid — the pin picks a random unused
+/// one, and any unused rowid serves (v0.16 review fix: ANALYZE and
+/// INSERT failed there). `DatabaseFull` when every positive rowid
+/// is taken. Without `v16` such an insert fails.
+#[cfg(feature = "v16")]
+pub async fn new_rowid<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<i64, S::Error> {
+    let max = seek_max_rowid(pager, root).await?;
+    if let Some(n) = max.map_or(Some(1), |m| m.checked_add(1)) {
+        return Ok(n);
+    }
+    let mut cur = ScanCursor::new(root);
+    let mut buf = AVec::new();
+    let mut want = 1i64;
+    while let Some(id) = cur.next_row_into(pager, &mut buf).await? {
+        if id > want {
+            break;
+        }
+        if id == want {
+            want = want.checked_add(1).ok_or(Error::Schema {
+                kind: SchemaKind::DatabaseFull,
+            })?;
+        }
+    }
+    Ok(want)
+}
+
 /// Largest rowid in the table rooted at `root`, if any.
 pub async fn seek_max_rowid<S: Storage>(
     pager: &mut Pager<S>,

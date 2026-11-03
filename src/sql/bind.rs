@@ -112,6 +112,9 @@ impl Binder<'_> {
                 b.with::<E>(with)?;
                 b.ast::<E>(body)?;
             }
+            // `VACUUM INTO ?` (v0.16).
+            #[cfg(feature = "v16")]
+            Ast::Vacuum { into: Some(e), .. } => b.expr::<E>(e)?,
             // Every other statement holds no parameters: the parser
             // refuses them in stored definitions (CREATE TABLE / VIEW,
             // ALTER TABLE) and the rest have no expressions.

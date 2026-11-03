@@ -168,3 +168,36 @@ fn statement_abort_byte_identical() {
 fn maintenance_byte_identical() {
     byte_identical("maint", MAINT);
 }
+
+/// Review regressions: OR ROLLBACK ends the transaction (the
+/// later COMMIT fails on both), ROLLBACK TO keeps a new page size,
+/// DROP clears sqlite_stat1, VACUUM INTO takes an expression.
+const REVIEW_FIXES: &str = "\
+SAVEPOINT a;
+PRAGMA page_size = 1024;
+ROLLBACK TO a;
+CREATE TABLE t(a UNIQUE, b);
+RELEASE a;
+PRAGMA page_size;
+INSERT INTO t VALUES (1, 'one');
+BEGIN;
+INSERT INTO t VALUES (9, 'nine');
+INSERT OR ROLLBACK INTO t VALUES (1, 'dup');
+SELECT * FROM t;
+COMMIT;
+CREATE INDEX tb ON t(b);
+CREATE TABLE u(x);
+INSERT INTO u VALUES (1), (2);
+ANALYZE;
+SELECT * FROM sqlite_stat1 ORDER BY tbl, idx;
+DROP INDEX tb;
+DROP TABLE u;
+SELECT * FROM sqlite_stat1 ORDER BY tbl, idx;
+VACUUM INTO '' || '';
+SELECT count(*) FROM t;
+";
+
+#[test]
+fn review_fixes_byte_identical() {
+    byte_identical("review", REVIEW_FIXES);
+}

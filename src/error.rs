@@ -306,8 +306,9 @@ pub enum SchemaKind {
     VacuumInTransaction,
     /// `VACUUM INTO` a file that already holds a database, or that
     /// the connection's `Config::vacuum_into` hook could not write
-    /// (v0.16, `v16`; the pin's "output file already exists").
-    /// Name a new or empty file.
+    /// (v0.16, `v16`; the pin's "output file already exists"), or a
+    /// name expression whose value is not text (the pin's
+    /// "non-text filename"). Name a new or empty file, as text.
     #[cfg(feature = "v16")]
     VacuumTarget,
     /// `REINDEX x` where `x` names no collation, table or index
@@ -344,7 +345,8 @@ pub enum SchemaKind {
     /// (v0.16, `v16`; the pin's "database or disk is full"): no
     /// larger rowid exists and AUTOINCREMENT never reuses one.
     /// Insert with an explicit smaller rowid, or reset the table's
-    /// `sqlite_sequence` row.
+    /// `sqlite_sequence` row. Also a table holding every positive
+    /// rowid, with no rowid left for a new row.
     #[cfg(feature = "v16")]
     DatabaseFull,
 }

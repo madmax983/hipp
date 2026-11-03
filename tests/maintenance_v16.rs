@@ -714,3 +714,258 @@ fn create_index_on_rowid_pseudo_column_is_refused() {
         ),
     );
 }
+
+/// Review regression: DROP TABLE / DROP INDEX delete their
+/// statistics rows (`tbl` / `idx` = the stored name, exactly) from
+/// sqlite_stat1, as the pin's DROP does; DROP VIEW and ALTER TABLE
+/// leave them. A later table of the same name starts with none.
+#[test]
+fn drop_clears_statistics() {
+    same(
+        "drop-stat-index",
+        &lines(
+            "CREATE TABLE t(a, b)
+            CREATE INDEX ia ON t(a)
+            CREATE INDEX ib ON t(b)
+            INSERT INTO t VALUES (1, 2), (3, 4)
+            ANALYZE
+            DROP INDEX ia
+            SELECT * FROM sqlite_stat1 ORDER BY idx
+            DROP TABLE t
+            SELECT count(*) FROM sqlite_stat1",
+        ),
+    );
+    same(
+        "drop-stat-table",
+        &lines(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b)
+            INSERT INTO t VALUES (1, 2), (3, 4)
+            ANALYZE
+            DROP TABLE t
+            SELECT * FROM sqlite_stat1
+            CREATE TABLE t(z)
+            SELECT * FROM sqlite_stat1",
+        ),
+    );
+    same(
+        "drop-stat-exact-names",
+        &lines(
+            "CREATE TABLE T(a)
+            CREATE INDEX IA ON T(a)
+            INSERT INTO T VALUES (1)
+            ANALYZE
+            INSERT INTO sqlite_stat1 VALUES ('t', 'ia', 'x'), ('T', 'other', 'y')
+            DROP INDEX ia
+            SELECT * FROM sqlite_stat1 ORDER BY 1, 2
+            DROP TABLE t
+            SELECT * FROM sqlite_stat1",
+        ),
+    );
+    same(
+        "drop-stat-txn-view-alter",
+        &lines(
+            "CREATE TABLE t(a)
+            CREATE TABLE w(a, b)
+            CREATE INDEX wa ON w(a)
+            INSERT INTO t VALUES (1)
+            INSERT INTO w VALUES (1, 2)
+            ANALYZE
+            BEGIN
+            DROP TABLE t
+            SELECT count(*) FROM sqlite_stat1
+            ROLLBACK
+            SELECT * FROM sqlite_stat1 ORDER BY tbl
+            CREATE VIEW v AS SELECT 1
+            INSERT INTO sqlite_stat1 VALUES ('v', NULL, '3')
+            DROP VIEW v
+            ALTER TABLE w RENAME TO w2
+            ALTER TABLE w2 DROP COLUMN b
+            SELECT * FROM sqlite_stat1 ORDER BY tbl
+            DROP TABLE sqlite_stat1
+            SELECT name FROM sqlite_schema
+            ANALYZE
+            SELECT * FROM sqlite_stat1 ORDER BY tbl",
+        ),
+    );
+}
+
+/// Review regression: ANALYZE of a table or index named in
+/// another case replaces the rows under the stored name (it left
+/// duplicates); the schema table is `sqlite_master`.
+#[test]
+fn analyze_names_as_stored() {
+    same(
+        "analyze-case",
+        &lines(
+            "CREATE TABLE t(a)
+            INSERT INTO t VALUES (1)
+            ANALYZE
+            ANALYZE T
+            SELECT * FROM sqlite_stat1
+            CREATE INDEX i ON t(a)
+            ANALYZE I
+            ANALYZE MAIN.T
+            SELECT * FROM sqlite_stat1 ORDER BY idx
+            INSERT INTO sqlite_stat1 VALUES ('sqlite_master', NULL, '1'), ('sqlite_schema', NULL, '1'), ('V', NULL, '1')
+            CREATE VIEW v AS SELECT 1
+            ANALYZE SQLITE_SCHEMA
+            ANALYZE V
+            SELECT * FROM sqlite_stat1 ORDER BY tbl, idx",
+        ),
+    );
+}
+
+/// Review regression: VACUUM places sqlite_sequence after the
+/// first table whose CREATE has the AUTOINCREMENT *keyword* — not
+/// the word inside a string, a quoted name or a comment.
+#[test]
+fn vacuum_autoincrement_is_a_token() {
+    for (tag, sql) in [
+        (
+            "autoinc-default",
+            "CREATE TABLE a(x DEFAULT 'autoincrement');
+             CREATE TABLE b(id INTEGER PRIMARY KEY AUTOINCREMENT, y);
+             INSERT INTO b(y) VALUES (1);",
+        ),
+        (
+            "autoinc-name-comment",
+            "CREATE TABLE a(\"autoincrement\" INT /* AUTOINCREMENT */);
+             CREATE TABLE c(z);
+             CREATE TABLE b(id INTEGER PRIMARY KEY AUTOINCREMENT, y);
+             INSERT INTO b(y) VALUES (1), (2);",
+        ),
+    ] {
+        let o = common::temp_db(&format!("v16mt-{tag}-o"));
+        let h = common::temp_db(&format!("v16mt-{tag}-h"));
+        common::cli(&o, sql);
+        std::fs::copy(&o, &h).expect("copy");
+        assert!(hipp_exec(&h, &["VACUUM"]).is_none(), "{tag}");
+        common::cli(&o, "VACUUM;");
+        assert_eq!(oracle_schema(&h), oracle_schema(&o), "{tag}");
+        assert_eq!(
+            common::cli(&h, "SELECT name, rootpage FROM sqlite_schema;"),
+            common::cli(&o, "SELECT name, rootpage FROM sqlite_schema;"),
+            "{tag}"
+        );
+    }
+}
+
+/// Review regression: a new row's rowid when the largest rowid is
+/// 9223372036854775807 — the pin picks an unused one (at random);
+/// hipp failed ANALYZE (and INSERT) with DatatypeMismatch. hipp
+/// now takes the smallest unused positive rowid.
+#[test]
+fn new_rowid_after_the_largest() {
+    let o = common::temp_db("v16mt-maxrowid-o");
+    let h = common::temp_db("v16mt-maxrowid-h");
+    common::cli(
+        &o,
+        "CREATE TABLE t(a); CREATE TABLE u(b); INSERT INTO t VALUES (1); INSERT INTO u VALUES (1);
+         ANALYZE; UPDATE sqlite_stat1 SET rowid = 9223372036854775807 WHERE tbl = 'u';
+         CREATE TABLE w(x); INSERT INTO w(rowid, x) VALUES (9223372036854775807, 0), (1, 1), (2, 2);",
+    );
+    std::fs::copy(&o, &h).expect("copy");
+    let stmts = [
+        "ANALYZE t",
+        "INSERT INTO w VALUES (3)",
+        "INSERT INTO w VALUES (4)",
+    ];
+    assert!(hipp_exec(&h, &stmts).is_none());
+    let mut script = String::new();
+    for s in stmts {
+        script.push_str(s);
+        script.push_str(";\n");
+    }
+    common::cli(&o, &script);
+    let view = "SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl; \
+                SELECT count(*), count(DISTINCT rowid), min(rowid) > 0, sum(x) FROM w; \
+                PRAGMA integrity_check;";
+    assert_eq!(common::cli(&h, view), common::cli(&o, view));
+    // hipp's choice: the smallest unused positive rowids.
+    assert_eq!(
+        common::cli(&h, "SELECT rowid FROM w WHERE x >= 3 ORDER BY x;"),
+        "3\n4\n"
+    );
+}
+
+/// Review regression: VACUUM INTO takes any expression with a text
+/// value (`'a' || 'b'`, a subquery, a bound parameter); NULL, a
+/// number or a blob is the pin's "non-text filename"; `INTO ''` is
+/// the pin's anonymous temporary database and succeeds, writing
+/// nothing.
+#[test]
+fn vacuum_into_expressions() {
+    let dir = std::env::temp_dir().join(format!("hipp-v16mt-intoexpr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let src = dir.join("src.db");
+    let (_, e) = hipp_run(&src, &lines(VACUUM_BASE));
+    assert!(e.is_empty());
+    let d = dir.display();
+    let concat = format!("VACUUM INTO '{d}/' || 'cat.db'");
+    let sub = format!("VACUUM main INTO (SELECT lower('{d}/SUB.db'))");
+    assert!(hipp_exec(&src, &[&concat, &sub, "VACUUM INTO ''"]).is_none());
+    for f in ["cat.db", "sub.db"] {
+        let p = dir.join(f);
+        assert_eq!(common::cli(&p, "PRAGMA integrity_check;"), "ok\n", "{f}");
+        assert_eq!(
+            common::cli(&p, "SELECT count(*), sum(length(b)) FROM t;"),
+            common::cli(&src, "SELECT count(*), sum(length(b)) FROM t;")
+        );
+    }
+    let before = std::fs::read_dir(&dir).expect("ls").count();
+    for bad in ["VACUUM INTO NULL", "VACUUM INTO 123", "VACUUM INTO x'41'"] {
+        match hipp_exec(&src, &[bad]) {
+            Some(hipp::Error::Schema {
+                kind: hipp::SchemaKind::VacuumTarget,
+            }) => {}
+            other => panic!("{bad}: {other:?}"),
+        }
+        // The pin errors too.
+        let o = std::process::Command::new(common::oracle())
+            .arg(&src)
+            .arg(format!("{bad};"))
+            .output()
+            .expect("oracle runs");
+        assert!(!o.status.success(), "{bad}");
+    }
+    assert!(hipp_exec(&src, &["VACUUM INTO nosuchcol"]).is_some());
+    assert!(hipp_exec(&src, &["VACUUM INTO count(*)"]).is_some());
+    assert_eq!(std::fs::read_dir(&dir).expect("ls").count(), before);
+    // A bound parameter.
+    #[cfg(feature = "params")]
+    block_on(async {
+        let mut db = open(&src).await;
+        let p = dir.join("bound.db");
+        let mut q = db.prepare("VACUUM INTO ?1").await.expect("prep");
+        q.bind_text(1, &p.display().to_string()).expect("bind");
+        assert_eq!(q.step().await.expect("step"), Step::Done);
+        drop(q);
+        assert_eq!(common::cli(&p, "PRAGMA integrity_check;"), "ok\n");
+    });
+}
+
+/// An auto-vacuum file: VACUUM is refused (hipp writes no pointer
+/// maps, so it cannot rebuild one; the pin keeps auto_vacuum = 1),
+/// leaving the file untouched. `PRAGMA auto_vacuum = 0` first
+/// makes it a plain file, as on the pin.
+#[test]
+fn vacuum_of_an_auto_vacuum_file() {
+    let o = common::temp_db("v16mt-autovac-o");
+    let h = common::temp_db("v16mt-autovac-h");
+    common::cli(
+        &o,
+        "PRAGMA auto_vacuum = FULL; CREATE TABLE t(a); INSERT INTO t VALUES (1), (2);",
+    );
+    std::fs::copy(&o, &h).expect("copy");
+    let bytes = std::fs::read(&h).expect("read");
+    assert!(matches!(
+        hipp_exec(&h, &["VACUUM"]),
+        Some(hipp::Error::Unsupported)
+    ));
+    assert_eq!(std::fs::read(&h).expect("read"), bytes);
+    assert!(hipp_exec(&h, &["PRAGMA auto_vacuum = 0", "VACUUM"]).is_none());
+    common::cli(&o, "PRAGMA auto_vacuum = 0; VACUUM;");
+    assert_eq!(oracle_schema(&h), oracle_schema(&o));
+    assert_eq!(common::cli(&h, "PRAGMA auto_vacuum;"), "0\n");
+}

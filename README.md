@@ -387,7 +387,7 @@ aspirations.
   largest rollback journal the transaction can write, so no page
   image is held in RAM and a crash still restores the
   transaction's start (real SQLite recovers those journals too).
-  `VACUUM [main] [INTO 'file']` rebuilds the file compactly with
+  `VACUUM [main] [INTO expr]` rebuilds the file compactly with
   the pin's schema order, rowid rules and header values, a
   pending `PRAGMA page_size` applied, as one journaled
   transaction (`Config::vacuum_into` writes VACUUM INTO's image;
@@ -401,9 +401,17 @@ aspirations.
   freed and reused in one transaction was not journaled), a
   failed journal replay losing the sidecar (a panic next), and
   `CREATE INDEX ... (rowid)` (the pin's "no such column"); the
-  tiny profile shrank 124 B. Gaps: whole-database ANALYZE row
-  order (the pin's schema hash), VACUUM of a file with an
-  expression or partial index (STATUS.md).
+  tiny profile shrank 124 B. Review fixes: `OR ROLLBACK` and a
+  constraint-level `ON CONFLICT ROLLBACK` end the whole
+  transaction again; ROLLBACK TO across `PRAGMA page_size` keeps
+  the new size (it panicked); DROP TABLE / DROP INDEX delete their
+  `sqlite_stat1` rows (ungated); VACUUM INTO takes any text
+  expression (`?`, `''`); a new rowid past 9223372036854775807
+  takes an unused one. Gaps: whole-database ANALYZE row order (the
+  pin's schema hash), VACUUM of a file with an expression or
+  partial index, VACUUM of an auto-vacuum file (refused: hipp
+  writes no pointer maps), constraint-level ROLLBACK matched by
+  constraint kind (STATUS.md).
 - **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
   `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
   [COLUMN] a` edit the stored schema texts token by token exactly

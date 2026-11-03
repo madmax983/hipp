@@ -689,6 +689,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 env.total_changes.get(),
             );
             let c = self.conn.temp_conn().await?;
+            let in_txn = c.explicit_txn;
             c.env.last_rowid.set(last);
             c.env.changes.set(changes);
             let before = c.env.total_changes.get();
@@ -720,11 +721,18 @@ impl<'c, S: Storage> Statement<'c, S> {
                 c.env.changes.get(),
                 c.env.total_changes.get(),
             );
+            let ended = in_txn && !c.explicit_txn;
             let env = &self.conn.env;
             env.last_rowid.set(l2);
             env.changes.set(c2);
             env.total_changes
                 .set(total.saturating_add(t2.saturating_sub(before)));
+            // A failure that ended the temp database's transaction
+            // (OR ROLLBACK, an I/O-class error) ends the main one.
+            if r.is_err() && ended && self.conn.explicit_txn {
+                let _ = self.conn.pager.rollback().await;
+                self.conn.explicit_txn = false;
+            }
             r.map_err(mem_err)?;
             self.query_rows = rows;
             self.query_rowids = rowids;

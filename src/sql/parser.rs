@@ -282,6 +282,60 @@ pub fn has_autoincrement<E>(sql: &[u8], arena: &Arena) -> bool {
     (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT"))
 }
 
+/// Which constraint kinds of a `CREATE TABLE` text carry a
+/// constraint-level `ON CONFLICT ROLLBACK` (v0.16, `v16`): (a NOT
+/// NULL constraint, a UNIQUE or PRIMARY KEY constraint). hipp
+/// otherwise parses constraint-level conflict clauses without
+/// acting on them; this one decides whether a violation ends the
+/// whole transaction. Unlexable text: neither.
+#[cfg(feature = "v16")]
+pub fn rollback_constraints<E>(sql: &[u8], arena: &Arena) -> (bool, bool) {
+    let Ok(toks) = lexer::lex::<E>(sql, arena) else {
+        return (false, false);
+    };
+    let p = Parser {
+        limit: toks.len(),
+        toks,
+        pos: 0,
+        arena,
+        sql,
+    };
+    let tok = |i: usize| p.toks.as_slice().get(i).map(|t| t.tok);
+    let (mut nn, mut uq) = (false, false);
+    for i in 1..p.limit {
+        if !(p.is_kw(i, b"ON") && p.is_kw(i + 1, b"CONFLICT") && p.is_kw(i + 2, b"ROLLBACK")) {
+            continue;
+        }
+        // Back from the clause to the constraint's keyword: past a
+        // table constraint's column list and a PRIMARY KEY's order.
+        let mut j = i - 1;
+        if tok(j) == Some(Tok::RParen) {
+            let mut depth = 0usize;
+            loop {
+                match tok(j) {
+                    Some(Tok::RParen) => depth += 1,
+                    Some(Tok::LParen) => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                if depth == 0 || j == 0 {
+                    break;
+                }
+                j -= 1;
+            }
+            j = j.saturating_sub(1);
+        }
+        if p.is_kw(j, b"ASC") || p.is_kw(j, b"DESC") {
+            j = j.saturating_sub(1);
+        }
+        if p.is_kw(j, b"NULL") && j > 0 && p.is_kw(j - 1, b"NOT") {
+            nn = true;
+        } else if p.is_kw(j, b"UNIQUE") || p.is_kw(j, b"KEY") {
+            uq = true;
+        }
+    }
+    (nn, uq)
+}
+
 impl<'a> Parser<'a> {
     fn cur(&self) -> Token {
         let i = self.pos.min(self.limit - 1);
@@ -633,7 +687,7 @@ impl<'a> Parser<'a> {
 
     /// The savepoint and maintenance statements (v0.16, `v16`):
     /// `SAVEPOINT nm`, `RELEASE [SAVEPOINT] nm`, `VACUUM [nm]
-    /// [INTO 'file']`, `REINDEX [nm [. nm]]`, `ANALYZE [nm [.
+    /// [INTO expr]`, `REINDEX [nm [. nm]]`, `ANALYZE [nm [.
     /// nm]]`, with the current token on the keyword.
     #[cfg(feature = "v16")]
     fn maint_stmt<E>(&mut self) -> Result<Ast, E> {
@@ -657,14 +711,7 @@ impl<'a> Parser<'a> {
         }
         if vacuum {
             let into = if self.eat_kw(b"INTO") {
-                match self.cur().tok {
-                    Tok::Text(h) => {
-                        self.pos += 1;
-                        Some(h)
-                    }
-                    Tok::Eof => return Err(perr(self.cur().offset, ParseKind::UnexpectedEof)),
-                    _ => return Err(perr(self.cur().offset, ParseKind::UnsupportedClause)),
-                }
+                Some(self.parse_expr::<E>()?)
             } else {
                 None
             };
@@ -1561,7 +1608,12 @@ impl<'a> Parser<'a> {
             Ok(ConflictAction::Replace)
         } else if self.eat_kw(b"FAIL") {
             Ok(ConflictAction::Fail)
-        } else if self.eat_kw(b"ABORT") || self.eat_kw(b"ROLLBACK") {
+        } else if self.eat_kw(b"ROLLBACK") {
+            #[cfg(feature = "v16")]
+            return Ok(ConflictAction::Rollback);
+            #[cfg(not(feature = "v16"))]
+            return Ok(ConflictAction::Abort);
+        } else if self.eat_kw(b"ABORT") {
             Ok(ConflictAction::Abort)
         } else {
             Err(perr(self.cur().offset, ParseKind::UnexpectedToken))
@@ -4112,11 +4164,18 @@ impl<'a> Parser<'a> {
                 }
             } else if self.eat_kw(b"FAIL") {
                 conflict = ConflictAction::Fail;
-            } else if !(self.eat_kw(b"ABORT") || self.eat_kw(b"ROLLBACK")) {
+            } else if self.eat_kw(b"ROLLBACK") {
+                // v16: the whole transaction rolls back too; before
+                // it a failed statement ended the bracket anyway.
+                #[cfg(feature = "v16")]
+                {
+                    conflict = ConflictAction::Rollback;
+                }
+            } else if !self.eat_kw(b"ABORT") {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
-            // OR ABORT / ROLLBACK: the engine's default (abort
-            // the statement) — nothing to record.
+            // OR ABORT: the engine's default (abort the statement)
+            // — nothing to record.
         }
         let table = self.name::<E>()?;
         // The alias is optional, but `SET` must not be eaten as

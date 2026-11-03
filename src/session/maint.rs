@@ -11,7 +11,7 @@
 //!   inside a transaction runs under its own statement savepoint,
 //!   so a failed statement undoes only itself and the transaction
 //!   stays open, as on the pin (the `abort_write` macro).
-//! - `VACUUM [main | temp] [INTO 'file']`: the database is rebuilt
+//! - `VACUUM [main | temp] [INTO expr]`: the database is rebuilt
 //!   compactly into an in-memory image with the pin's schema order
 //!   (tables with their automatic indexes, then the other indexes,
 //!   then views and triggers), row and index records copied byte
@@ -41,9 +41,11 @@ pub(super) enum Maint {
     Savepoint(AVec<u8>),
     Release(AVec<u8>),
     RollbackTo(AVec<u8>),
-    /// `VACUUM [main] [INTO 'file']`.
+    /// `VACUUM [main] [INTO expr]`: the target's name expression,
+    /// resolved against no table (evaluated when the statement
+    /// runs).
     Vacuum {
-        into: Option<AVec<u8>>,
+        into: Option<RExpr>,
     },
     /// A statement with nothing to do in hipp (`VACUUM temp`:
     /// hipp has no temp schema, and the pin's is empty).
@@ -152,7 +154,17 @@ impl<S: Storage> Connection<S> {
                     (true, None) => Maint::Nothing,
                     // The temp schema's image: hipp has none.
                     (true, Some(_)) => return Err(Error::Unsupported),
-                    (false, into) => Maint::Vacuum { into: into.map(b) },
+                    (false, None) => Maint::Vacuum { into: None },
+                    (false, Some(e)) => {
+                        use crate::query::{ScopeGroup, has_agg, resolve_scoped};
+                        let cur = ScopeGroup::new(AVec::new(), AVec::new(), 0);
+                        let mut planner = self.sub_planner(arena);
+                        let re = resolve_scoped::<S::Error>(e, arena, &cur, &[], &mut planner)?;
+                        if has_agg(&re) {
+                            return Err(Error::Unsupported);
+                        }
+                        Maint::Vacuum { into: Some(re) }
+                    }
                 }
             }
             Ast::Reindex { schema, name } => {
@@ -250,10 +262,17 @@ impl<S: Storage> Connection<S> {
             }
             Some(_) => {}
         }
-        if self.catalog.find_index(&self.catalog_arena, n).is_some() {
-            Ok(Analyze::Index(copy_vec(n)))
-        } else if self.names_table(n) {
-            Ok(Analyze::Table(copy_vec(n)))
+        // The name as the schema stores it: the pin deletes the old
+        // rows by `tbl = zName` / `idx = zName`, exactly.
+        let ca = &self.catalog_arena;
+        if let Some(ix) = self.catalog.find_index(ca, n) {
+            Ok(Analyze::Index(copy_vec(handle_bytes(ca, ix.name))))
+        } else if let Some(t) = self.catalog.find(ca, n) {
+            Ok(Analyze::Table(copy_vec(handle_bytes(ca, t.name))))
+        } else if let Some(v) = self.catalog.find_view(ca, n) {
+            Ok(Analyze::Table(copy_vec(handle_bytes(ca, v.name))))
+        } else if Catalog::is_schema_name(n) {
+            Ok(Analyze::Table(copy_vec(b"sqlite_master")))
         } else {
             Err(Error::Schema {
                 kind: SchemaKind::UnknownTable,
@@ -266,7 +285,11 @@ impl<S: Storage> Statement<'_, S> {
     /// Open this statement's savepoint before its first step, when
     /// it may write inside a transaction (see the `abort_write` macro).
     pub(super) fn open_stmt(&mut self) {
-        if self.phase != Phase::Fresh || !self.conn.explicit_txn || self.stmt_sp.is_some() {
+        if self.phase != Phase::Fresh {
+            return;
+        }
+        self.upsert_failed = false;
+        if !self.conn.explicit_txn || self.stmt_sp.is_some() {
             return;
         }
         let writes = match &self.plan {
@@ -321,7 +344,11 @@ impl<S: Storage> Statement<'_, S> {
         let Some(level) = self.stmt_sp else {
             return false;
         };
-        if !self.conn.explicit_txn || self.conn.pager.sp_depth() <= level || ends_transaction(e) {
+        if !self.conn.explicit_txn
+            || self.conn.pager.sp_depth() <= level
+            || ends_transaction(e)
+            || self.resolves_rollback(e)
+        {
             return false;
         }
         if self.conn.pager.sp_rollback(level).await.is_err() {
@@ -330,6 +357,50 @@ impl<S: Storage> Statement<'_, S> {
         self.conn.pager.sp_release(level);
         self.stmt_sp = None;
         true
+    }
+
+    /// Whether `e`, a constraint violation of this INSERT / UPDATE,
+    /// resolves by ROLLBACK and so ends the whole transaction, as on
+    /// the pin: the statement's `OR ROLLBACK`, or, under the default
+    /// action, the table's constraint-level `ON CONFLICT ROLLBACK`
+    /// on a constraint of the violated kind (NOT NULL; UNIQUE /
+    /// PRIMARY KEY). CHECK constraints take no conflict clause.
+    fn resolves_rollback(&self, e: &Error<S::Error>) -> bool {
+        let (conflict, root) = match &self.plan {
+            Plan::Insert { conflict, root, .. } | Plan::Update { conflict, root, .. } => {
+                (*conflict, *root)
+            }
+            _ => return false,
+        };
+        let (nn, uq) = match e {
+            Error::Schema {
+                kind: SchemaKind::NotNullViolation,
+            } => (true, false),
+            Error::Schema {
+                kind: SchemaKind::UniqueViolation | SchemaKind::DuplicateRowid,
+            } => (false, true),
+            Error::Schema {
+                kind: SchemaKind::CheckViolation,
+            } => (false, false),
+            _ => return false,
+        };
+        if self.upsert_failed {
+            return false;
+        }
+        match conflict {
+            ConflictAction::Rollback => return true,
+            ConflictAction::Abort => {}
+            _ => return false,
+        }
+        let ca = &self.conn.catalog_arena;
+        let Some(t) = self.conn.catalog.tables.iter().find(|t| t.root == root) else {
+            return false;
+        };
+        let (rn, ru) = crate::sql::parser::rollback_constraints::<S::Error>(
+            handle_bytes(ca, t.sql),
+            &self.arena,
+        );
+        (nn && rn) || (uq && ru)
     }
 
     pub(super) async fn step_maint(&mut self) -> Result<Step, S::Error> {
@@ -349,7 +420,20 @@ impl<S: Storage> Statement<'_, S> {
             }
             Maint::Release(name) => self.release(name.as_slice()).await?,
             Maint::RollbackTo(name) => self.rollback_to(name.as_slice()).await?,
-            Maint::Vacuum { into } => self.vacuum(into.as_ref().map(|v| v.as_slice())).await?,
+            Maint::Vacuum { into: None } => self.vacuum(None).await?,
+            Maint::Vacuum { into: Some(e) } => {
+                // The pin's "non-text filename": the name must be
+                // text (NULL, numbers and blobs are refused).
+                let name = match self.eval_row_sub(&e, &RowData::empty()).await? {
+                    OwnedValue::Text(t) => t,
+                    _ => {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::VacuumTarget,
+                        });
+                    }
+                };
+                self.vacuum(Some(name.as_slice())).await?
+            }
             Maint::Reindex(r) => {
                 let r = self.reindex(&r).await;
                 self.finish_write(r).await?;
@@ -438,9 +522,11 @@ impl<S: Storage> Statement<'_, S> {
         if av != 0 {
             return Err(Error::Unsupported);
         }
+        // `INTO ''` is the pin's anonymous temporary database: the
+        // image is built (and its errors reported), then dropped.
         let write = match into {
-            Some(_) => Some(self.conn.cfg.vacuum_into.ok_or(Error::Unsupported)?),
-            None => None,
+            Some(n) if !n.is_empty() => Some(self.conn.cfg.vacuum_into.ok_or(Error::Unsupported)?),
+            _ => None,
         };
         let ps = self
             .conn
@@ -484,7 +570,8 @@ impl<S: Storage> Statement<'_, S> {
                     });
                 }
             }
-            _ => {
+            (Some(_), None) => {} // `INTO ''`
+            (None, _) => {
                 self.conn.pager.replace_image(img.as_slice(), ps).await?;
                 self.conn.prag.vacuum_page_size = None;
                 self.conn.prag.vacuum_autovac = None;
@@ -531,11 +618,12 @@ impl<S: Storage> Statement<'_, S> {
         let seq = rs
             .iter()
             .position(|r| r.is(b"table") && eq_ci(r.name.as_slice(), b"sqlite_sequence"));
+        // The AUTOINCREMENT keyword, as a token: not the word inside
+        // a string, a quoted name or a comment.
+        let arena = &self.arena;
         let autoinc = |r: &SchemaRow| {
             r.sql.as_ref().is_some_and(|s| {
-                s.as_slice()
-                    .windows(13)
-                    .any(|w| w.eq_ignore_ascii_case(b"AUTOINCREMENT"))
+                crate::sql::parser::has_autoincrement::<S::Error>(s.as_slice(), arena)
             })
         };
         let mut order: AVec<usize> = AVec::new();
@@ -929,13 +1017,7 @@ impl<S: Storage> Statement<'_, S> {
             btree::btree_delete(&mut self.conn.pager, root, id).await?;
         }
         for (tn, ixn, stat) in out.iter() {
-            let next = btree::seek_max_rowid(&mut self.conn.pager, root)
-                .await?
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or(Error::Schema {
-                    kind: SchemaKind::DatatypeMismatch,
-                })?;
+            let next = btree::new_rowid(&mut self.conn.pager, root).await?;
             let mut vals: AVec<Value<'_>> = AVec::new();
             vals.push(Value::Text(tn.as_slice()));
             vals.push(match ixn {

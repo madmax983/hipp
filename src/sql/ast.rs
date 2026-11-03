@@ -515,12 +515,12 @@ pub struct SelectStmt {
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
 /// of `INSERT OR ...` / `UPDATE OR ...`, and the standalone
-/// `REPLACE` verb (which is `INSERT` with `Replace`). `Abort`
-/// covers the ABORT and ROLLBACK spellings: hipp's write-error
-/// rule aborts (and rolls back) the whole transaction on any
-/// error, which is ROLLBACK's behaviour, ABORT's in autocommit,
-/// and the documented v0.5 simplification for ABORT inside an
-/// explicit transaction.
+/// `REPLACE` verb (which is `INSERT` with `Replace`). Without
+/// `v16`, `Abort` also covers the ROLLBACK spelling: hipp's
+/// write-error rule there rolls back the whole transaction on any
+/// error, which is ROLLBACK's behaviour and ABORT's in autocommit.
+/// With `v16` a failed statement inside a transaction undoes only
+/// itself (ABORT), and ROLLBACK has its own variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
     Abort,
@@ -534,6 +534,28 @@ pub enum ConflictAction {
     Fail,
     Ignore,
     Replace,
+    /// `OR ROLLBACK` (v0.16, `v16`): a constraint violation
+    /// (UNIQUE / PRIMARY KEY, NOT NULL, CHECK) errors like `Abort`
+    /// and also rolls back the whole transaction, ending it (in
+    /// autocommit it is `Abort`). Without `v16` OR ROLLBACK parses
+    /// as `Abort`: a failed statement then ends the transaction
+    /// anyway.
+    #[cfg(feature = "v16")]
+    Rollback,
+}
+
+impl ConflictAction {
+    /// Whether a conflict fails the statement without resolving
+    /// it in place: ABORT, or (v0.16) ROLLBACK, which differs only
+    /// in ending the transaction afterwards.
+    pub fn aborts(self) -> bool {
+        match self {
+            ConflictAction::Abort => true,
+            #[cfg(feature = "v16")]
+            ConflictAction::Rollback => true,
+            _ => false,
+        }
+    }
 }
 
 /// An `INSERT ... ON CONFLICT ...` upsert clause (v0.7).
@@ -750,12 +772,13 @@ pub enum Ast {
     RollbackTo {
         name: ABytes,
     },
-    /// `VACUUM [schema] [INTO 'file']` (v0.16, `v16`): `into` is
-    /// the target file name (a string literal).
+    /// `VACUUM [schema] [INTO expr]` (v0.16, `v16`): `into` is the
+    /// expression naming the target file (any expression with a
+    /// text value: a literal, `?`, `'a' || 'b'`, a subquery).
     #[cfg(feature = "v16")]
     Vacuum {
         schema: Option<ABytes>,
-        into: Option<ABytes>,
+        into: Option<Expr>,
     },
     /// `REINDEX [[schema .] name]` (v0.16, `v16`).
     #[cfg(feature = "v16")]

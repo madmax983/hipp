@@ -2992,7 +2992,7 @@ Release, RollbackTo, Vacuum, Reindex, Analyze}`, `Plan::Maint`,
   rule ("a failed statement aborts the whole bracket") wherever
   `v16` is built; `tests/dialect.rs` asserts both rules by
   feature.
-- *VACUUM [main | temp] [INTO 'file'].* The schema rows are read
+- *VACUUM [main | temp] [INTO expr].* The schema rows are read
   raw and re-emitted in the pin's order — each table (rootpage >
   0, `sqlite_sequence` excepted) followed by its automatic
   indexes and, after the first AUTOINCREMENT table, by
@@ -3040,7 +3040,8 @@ Release, RollbackTo, Vacuum, Reindex, Analyze}`, `Plan::Maint`,
   and empty indexes get no row; tables named `sqlite_*` are
   skipped; a view or system table only creates the table. Old
   rows go first exactly as the pin deletes them (`tbl = name`,
-  `idx = name`, or all); new rows take rowid max + 1. Indexes are
+  `idx = name`, or all); new rows take rowid max + 1 (or an unused
+one past the maximum: see the review fixes). Indexes are
   emitted in reverse creation order, tables in reverse schema
   order (see the gap). hipp's planner does not read the
   statistics: they are written so the files interoperate, and the
@@ -3175,14 +3176,116 @@ the ANALYZE statistics, their grammar and plans.
 - The savepoint area's offset grows with the database (the
   largest possible rollback journal): sparse on a file system,
   but a `MemStorage` journal allocates the gap.
-- VACUUM INTO takes a string literal only (no bound parameter or
-  expression); `Config::vacuum_into` reports success as a bool.
+- `Config::vacuum_into` reports success as a bool. (VACUUM INTO
+  takes any text expression since the review fixes below.)
 - Statement-level rollback is `v16` only: without it a failed
   statement still ends the whole bracket (the v0.2 rule).
 - Found outside this unit: after the same statements hipp's file
   can have one more freelist page than the pin's (B-tree merge
   differences on DELETE), and the change counter can differ by
   one before any VACUUM.
+
+**Review fixes (2026-11-03).** Seven findings against this unit,
+each reproduced on the live pin first, fixed with a regression
+test (`tests/savepoint_v16.rs`
+`conflict_rollback_ends_the_transaction`,
+`page_size_survives_rollback_to`; `tests/maintenance_v16.rs`
+`drop_clears_statistics`, `analyze_names_as_stored`,
+`vacuum_autoincrement_is_a_token`, `new_rowid_after_the_largest`,
+`vacuum_into_expressions`, `vacuum_of_an_auto_vacuum_file`;
+`tests/differential.rs` `insert_after_the_largest_rowid`;
+`hipp-cli/tests/cli_v16_savepoint.rs` `review_fixes_byte_identical`):
+
+- *ROLLBACK TO across `PRAGMA page_size` panicked* (`v16`):
+  `sp_rollback` put back the header a savepoint saved, page size
+  included, over frames `reformat` had already resized; the next
+  write ran 4096-byte metadata over 1024-byte frames
+  (`copy_from_slice` panic). The pin keeps the new size: it is not
+  transactional. `Pager::reformat` now rebases every open mark on
+  the reformatted empty file. Files and `:memory:` both.
+- *OR ROLLBACK undid only the statement* (`v16`): hipp parsed OR
+  ROLLBACK as ABORT, which was right only while every failure
+  ended the bracket; under statement savepoints the transaction
+  stayed open and a later COMMIT / RELEASE succeeded where the pin
+  says "no transaction is active" / "no such savepoint". New
+  `ConflictAction::Rollback` (`v16`; it resolves as ABORT
+  everywhere except what the failure undoes): a UNIQUE / PRIMARY
+  KEY / NOT NULL / CHECK violation under it ends the whole
+  transaction (`Statement::resolves_rollback`, consulted by
+  `stmt_rollback`), in BEGIN and SAVEPOINT transactions, INSERT
+  and UPDATE alike. A constraint-level `ON CONFLICT ROLLBACK`
+  (hipp otherwise parses constraint conflict clauses without
+  acting on them) is honoured the same way under the default
+  action: `parser::rollback_constraints` finds which constraint
+  kinds (NOT NULL; UNIQUE / PRIMARY KEY, column or table
+  constraint) carry it, and a violation of that kind ends the
+  transaction. Probed: OR IGNORE / REPLACE / FAIL / ABORT override
+  it, and an upsert's DO UPDATE failing resolves by ABORT whatever
+  the OR clause says (`Statement::upsert_failed`). A failure that
+  ends the transaction now also rolls back the TEMP database's, and
+  a TEMP statement's ROLLBACK resolution ends the main one (both
+  were left open). Autocommit is unchanged (ROLLBACK = ABORT there).
+- *DROP left stale `sqlite_stat1` rows* (ungated, `v05` /
+  `indexes`: pin-made files carry statistics too): DROP TABLE now
+  deletes `tbl = name` and DROP INDEX `idx = name` rows from every
+  `sqlite_stat1` .. `sqlite_stat4` present, comparing the stored
+  name exactly, as the pin's `sqlite3ClearStatTables`; before the
+  pages are freed (DROP TABLE sqlite_stat1 included). Probed: DROP
+  VIEW, ALTER TABLE RENAME / RENAME COLUMN / DROP COLUMN leave the
+  rows, as hipp does. Also found here: `ANALYZE T` / `ANALYZE I`
+  for a table `t` / index `i` deleted by the name as typed and so
+  duplicated the rows; ANALYZE now uses the stored name
+  (`sqlite_master` for the schema table), as the pin.
+- *VACUUM placed `sqlite_sequence` by substring*: the
+  AUTOINCREMENT test matched the bytes anywhere (a string
+  default, a quoted name, a comment); it is the keyword token now
+  (`parser::has_autoincrement`, as the catalog uses).
+- *ANALYZE failed when `sqlite_stat1` held rowid
+  9223372036854775807* (`DatatypeMismatch`). Same pattern
+  elsewhere: INSERT without a rowid failed there, and the schema
+  row's rowid was computed unchecked (`m + 1`, an overflow on a
+  file-derived value). With `v16`, `btree::new_rowid` takes the
+  smallest unused positive rowid (the pin picks a random unused
+  one; `DatabaseFull` only when all are taken) for INSERT,
+  `sqlite_stat1`, `sqlite_sequence` and the schema table. Without
+  `v16` (tiny): INSERT still fails cleanly (`DatatypeMismatch`)
+  and the schema row's rowid saturates, so its insert fails as a
+  duplicate rather than wrapping.
+- *VACUUM INTO took only a string literal*: it takes any
+  expression now, resolved against no table and evaluated when the
+  statement runs (`'a' || 'b'`, a subquery, a bound `?`); a value
+  that is not text is the pin's "non-text filename"
+  (`VacuumTarget`); `VACUUM INTO ''` — the pin's anonymous
+  temporary database — builds the image and discards it,
+  succeeding, without needing `Config::vacuum_into`.
+- *VACUUM of an auto-vacuum file is refused* (`Unsupported`):
+  **not fixed, kept as a documented refusal.** The pin rebuilds it
+  with pointer maps and keeps `auto_vacuum = 1`; hipp writes no
+  pointer maps, and probing showed that hipp's ordinary writes to
+  a pin-made auto-vacuum file already leave pointer-map entries
+  stale ("Failed to read ptrmap key" in the pin's integrity check
+  after an INSERT that allocates pages — a pre-existing gap of the
+  write path, recorded since v0.15 as "auto-vacuum / ptrmap write
+  support has no recorded demand"). Producing a fresh auto-vacuum
+  image would hand back a file the next hipp write damages; the
+  refusal leaves the file untouched, and `PRAGMA auto_vacuum = 0;
+  VACUUM` converts it, as on the pin.
+
+Remaining gaps from the review: a constraint-level `ON CONFLICT
+ROLLBACK` is matched by constraint kind, not by the constraint
+that failed — a table with `a NOT NULL ON CONFLICT ROLLBACK, b NOT
+NULL` ends the transaction on either column's NULL (the pin: only
+`a`'s), and a UNIQUE index created with CREATE UNIQUE INDEX takes
+the table's UNIQUE-constraint ROLLBACK; an explicit `OR ABORT`
+parses as the default, so it does not override a constraint-level
+ROLLBACK as it does on the pin. Constraint-level IGNORE / REPLACE
+/ FAIL remain parsed and not acted on (as before). Gates: `cargo
+fmt --all` and the full `ci/local-gates.sh` run end with "==> all
+gates passed". Size: tiny **76,224 B** (Δ **−4 B** vs 76,228,
+ratchet lowered; the schema row's checked rowid costs a few bytes,
+offset elsewhere). Full **471,016 B** (Δ **+2,968 B** vs 468,048,
+ratchet raised): the ROLLBACK resolution and constraint scan, stat
+clearing on DROP, `new_rowid`, the VACUUM INTO expression.
 
 ### ALTER TABLE, AUTOINCREMENT and TEMP tables (2026-11-03)
 
