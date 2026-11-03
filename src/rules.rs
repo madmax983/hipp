@@ -40,7 +40,7 @@ use crate::arena::{AVec, Arena};
 use crate::error::{Error, Result, SchemaKind};
 use crate::query::{
     Ctx, RExpr, RefRange, RowData, ScopeGroup, SourceDesc, SubPlan, eval, expr_refs_range, has_agg,
-    resolve_scoped, truthy,
+    resolve_scoped,
 };
 use crate::record::{Affinity, OwnedValue, Value, apply_affinity, encode_record};
 use crate::sql::parser::Limits;
@@ -274,7 +274,9 @@ impl TableRules {
                     Some(env) => Ctx::of(&rd).with(env),
                     None => Ctx::of(&rd),
                 };
-                if truthy(&eval::<E>(c, &ctx)?) == Some(false) {
+                // AND / OR stop early, as the pin's jump code
+                // (`query::cond_false`; v0.16 review fix).
+                if crate::query::cond_false::<E>(c, &ctx)? {
                     if action == ConflictAction::Ignore {
                         return Ok(false);
                     }

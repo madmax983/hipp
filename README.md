@@ -569,10 +569,16 @@ aspirations.
   window functions), and `json_each` / `json_tree` (and `jsonb_`) in
   FROM with all their columns, correlated to the sources on their
   left. The JSON subtype rules, the pin's errors and its 1000-level
-  nesting and path limits; every walk is iterative. Ungated: WHERE /
-  ON / FILTER / CASE WHEN / iif conditions short-circuit AND / OR as
-  the pin's jump code does. Tiny unchanged, full +184 B (that fix),
-  max +32.6 KB (STATUS.md).
+  nesting and path limits; every walk is iterative, text parses in
+  linear time, and `json_each` rows hold handles into the document
+  rather than copies of it (linear memory at 200,000 elements).
+  Ungated: WHERE / ON / FILTER / HAVING / CHECK / CASE WHEN / iif
+  conditions stop AND / OR / NOT early as the pin's jump code does
+  (subquery operands last, correlated WHERE terms after the rest),
+  and a WHERE clause's constant terms run once before any row, with
+  the pin's constant propagation. Review fixes also bind trigger
+  NEW / OLD inside table-valued function arguments. Sizes in
+  STATUS.md.
 - **Expression indexes, partial indexes and index-aware planning**
   (new leaf feature `expr_index`, in `max` — ADR 0002 — not
   `full`): `CREATE [UNIQUE] INDEX ... ON t(a + b, lower(c) COLLATE

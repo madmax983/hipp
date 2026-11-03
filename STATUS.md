@@ -4963,11 +4963,136 @@ patch, validity check, the `json_each` cursor) and its wiring.
 - No parse cache: each call re-translates its text argument (the
   pin keeps recent parses per statement), so a large document read
   many times per row costs that many parses; edits copy the blob.
-- HAVING and CHECK constraints still evaluate both operands of AND /
-  OR (the condition fix covers the other sites listed), and a
-  constant buried inside a skipped comparison (`x = 1 AND y =
-  abs(-9223372036854775808)`) is not computed, where the pin factors
-  it out and fails.
+- (HAVING / CHECK short-circuit and the WHERE constant-term model:
+  fixed by the review below.)
+
+### JSON functions — review fixes (2026-11-03)
+
+Six review findings, each reproduced first (release build, live pin).
+
+**Fixed (regression tests in `tests/json_v16.rs`:
+`large_documents_scale`, `review_regressions`, `tvf_in_triggers`):**
+
+- **`json_each` / `json_tree` memory.** Rows no longer carry the
+  document: the call's document goes into a per-statement registry
+  (`Env::json_docs`, `json::TvfDocs`; `Statement::step` drops what
+  its step added when it returns, a nested trigger step only its
+  own), and the key / value / atom / hidden `json` columns hold
+  16-byte handles decoded when read (`json::each_column`, a new
+  `Op::EachJson` wrapper for `json`). A lateral call also clears the
+  left-hand values that only its arguments read before joining its
+  rows (`SubSource::tvf_dead`, planned per core from every other
+  reader: items, WHERE, GROUP BY, HAVING, ORDER BY, ON clauses,
+  other sources' plans, index probes), so `FROM d, json_each(d.j)`
+  no longer copies `d.j` into each row. Measured (release): 20,001
+  integers through `FROM d, json_each(d.j)` 0.10 s / 37 MB (was
+  35-53 s / 8.3 GB); a 4.9 MB object of 200,000 members 0.8 s /
+  330 MB through `json_each` and 2.8 s / 1 GB through `json_tree`
+  (600,001 rows), both SIGKILLed before.
+- **Quadratic text parse.** `splice` rebuilt the whole blob each
+  time a container's header shrank on close; it now edits in place
+  (`AVec::replace_range`, the pin's memmove — only the container's
+  own payload moves). `json_valid` over 1.2 MB of 100,000 objects
+  1.7 s → 0.03 s; `j ->> '$.k5[1]'` over 4.9 MB 30.7 s → 0.06 s.
+- **NEW / OLD in a table-valued function's arguments** inside a
+  trigger body (`json_each(new.a)`, also in a scalar subquery, an
+  `IN (SELECT key FROM json_each(new.a))`, UPDATE ... FROM
+  `json_each(new.a)`): the binder (`sql::trig`) now binds
+  `FromSource::args`, with only the sources before the call in scope
+  (`json_each(new.a) AS new` still reads the trigger row), and ALTER
+  TABLE RENAME COLUMN rewrites them.
+- **AND / OR / NOT jump code, ungated** (claimed paths): `query::cond`
+  now answers "is it true" / "is it false" with early stops through
+  NOT as well (`NOT (json_valid(b) AND b ->> 0 = 1)`), and is used
+  by aggregate FILTER over a table (`agg_row`, which the earlier fix
+  missed), HAVING (`cond_group_sub`) and CHECK (`cond_false`, a CHECK
+  fails only when false). With subqueries (`cond_row_sub`, now an
+  async walk) a subquery runs only when its operand is reached, and
+  an AND / OR whose left operand holds a subquery and right one does
+  not tests the right one first (the pin's `exprEvalRhsFirst`). A
+  WHERE clause (`where_row_sub`) tests its terms in order, those
+  holding a correlated subquery last (`TERM_VARSELECT`) — except a
+  top-level `x IN (SELECT ...)`, which the pin tests in place
+  (probed).
+- **WHERE constant terms, ungated.** The per-row "evaluate a
+  skipped constant" model is gone (it failed `a = 1 OR json('[') IS
+  NULL` and a LEFT JOIN ON constant, which the pin never reaches).
+  Instead the top-level constant AND terms of WHERE and inner-join
+  ON clauses are computed once, in order, before any row is read,
+  stopping at the first that is not true, which then rejects every
+  row — so they fail over an empty table too, as on the pin
+  (`query::constant_terms_hold` for UPDATE / DELETE,
+  `join_constants_hold` for SELECT cores, sync and async joins).
+  For a SELECT this follows the pin's constant propagation: a term
+  `column = literal` (BINARY, the last for a column, scanning right
+  to left) stands the literal, with the column's affinity, in for
+  the column in the other terms (a BLOB-affinity column only as a
+  comparison operand), so `x = 1 AND (x = 2 OR json('[') IS NULL)`
+  fails up front and `a = 1 AND json('[') IS NULL AND a = 2` does
+  not (`2 = 1` stops first).
+- **Compound scalar subquery subtype.** `json_array((SELECT
+  json('[1]') UNION ALL SELECT 2))` is `[[1]]` as on the pin: a
+  compound (not INTERSECT) whose arms' result columns are each
+  always-JSON text or never text keeps the subtype on a text value
+  (`query::sub_literal`).
+- **Found while fixing:** with HAVING now stopping AND / OR early,
+  `HAVING count(*) > 5 AND sum(v) > 0` skipped `sum(v)`'s overflow;
+  the pin finalizes every aggregate of a group, the HAVING's
+  included, before testing it — now so in all three HAVING paths
+  (`tests/aggregates_v16.rs` caught it).
+
+**Not changed:** item 6 of the AND/OR finding (an index- or
+rowid-satisfiable term tested first) already matched the pin after
+the `expr_index` unit (`WHERE b -> 0 = 1 AND a = 2` with an index on
+`a` or `a INTEGER PRIMARY KEY`), and is now pinned by tests.
+
+**Oracle-probing notes:** constant terms evaluate in written order
+and stop at the first false one (`1 = 2 AND json('[')` succeeds on
+an empty table, the reverse fails); FILTER, CASE WHEN, iif and a
+LEFT JOIN's ON factor nothing; an uncorrelated EXISTS term is
+computed up front, an uncorrelated scalar subquery term is not;
+`x NOT IN (correlated)` and `(x IN (correlated)) IS NOT NULL` wait,
+`x IN (correlated)` does not; a compound keeps the producing arm's
+subtype (UNION / UNION ALL / EXCEPT), INTERSECT drops it; pragma
+table-valued functions inside a trigger body or a view fail on the
+pin when used ("unsafe use of virtual table") — hipp runs them
+(pre-existing, the PRAGMA unit's surface).
+
+**Gates:** `cargo fmt --all`; full `ci/local-gates.sh` ends with
+"==> all gates passed". `tests/json_v16.rs` grows to 19 tests.
+
+**Size:** tiny **76,924 B** (Δ **0**; the `json_each` document
+release sits inside `step`'s body, so no extra future layer reaches
+the tiny build). Full **489,396 B** (Δ **+3,096 B** vs 486,300,
+ratchet raised, headroom 34,892 B): all ungated — the async
+condition walk (`cond_is_sub`, `where_row_sub`), the WHERE
+constant-term pass with constant propagation, the HAVING / CHECK
+jump code and HAVING's aggregate finalization, the trigger binder's
+TVF arguments. Max **677,252 B** (Δ **+6,208 B** vs 671,044, raised):
+the above plus the `json_each` document registry and handles, the
+lateral dead-slot planning and the compound-subtype rule.
+
+**Honest gaps (remaining):**
+
+- A join still copies each left row into every combination: when a
+  large left value is read by something besides a lateral call's
+  arguments (`FROM d, json_each(d.j) WHERE length(d.j) > 5`), or for
+  any plain table join (`FROM d, t2` with 20,000 rows of t2 against a
+  100 KB `d.j` aborts on allocation, pre-existing and not JSON's),
+  memory is O(rows × size). Reading the hidden `json` column copies
+  the document per row read (`count(json)` over 20,000 rows of a
+  100 KB document takes 2 GB).
+- Rows are still built for the whole call up front (O(rows) small
+  rows: ~1.6 KB each with the join's copy), where the pin streams.
+- Constant propagation is not transitive (`t.a = u.a AND u.a = 2 AND
+  (t.a = 3 OR json('[') IS NULL)` fails on the pin, not in hipp),
+  binds only literal values, and is skipped when a RIGHT / FULL join
+  is present; an uncorrelated EXISTS term is not computed up front;
+  a correlated subquery's outer-column terms are not constants.
+- A compound scalar subquery with an arm that may return plain text
+  (`SELECT json('[1]') UNION ALL SELECT 'x'`) drops the subtype even
+  when the JSON arm produced the value (hipp does not track which
+  arm a row came from).
 
 ### Expression indexes, partial indexes and index-aware planning (2026-11-03)
 

@@ -192,9 +192,7 @@ impl Walker<'_> {
             } => {
                 let n = self.scope.len();
                 self.scope.push(alias.unwrap_or(*table));
-                for f in from.iter() {
-                    self.scope.push(f.alias.unwrap_or(f.table));
-                }
+                self.scope_from::<E>(from.as_mut_slice())?;
                 for f in from.as_mut_slice() {
                     if let Some(on) = &mut f.on {
                         self.expr::<E>(on)?;
@@ -390,12 +388,25 @@ impl Walker<'_> {
             }
         }
         let n = self.scope.len();
-        for f in s.from.iter() {
-            self.scope.push(f.alias.unwrap_or(f.table));
-        }
-        let r = self.core_exprs::<E>(s);
+        let r = self.scope_from::<E>(s.from.as_mut_slice());
+        let r = r.and_then(|()| self.core_exprs::<E>(s));
         self.scope.truncate(n);
         r
+    }
+
+    /// Bring FROM sources `from` into scope in order, binding each
+    /// table-valued function's arguments (`json_each(new.a)`; v0.16
+    /// review fix: they were left unbound) with only the sources
+    /// before it in scope, as they resolve.
+    fn scope_from<E>(&mut self, from: &mut [super::ast::FromSource]) -> Result<(), E> {
+        for f in from {
+            #[cfg(feature = "v16")]
+            for a in f.args.iter_mut().flat_map(|a| a.as_mut_slice().iter_mut()) {
+                self.expr::<E>(a)?;
+            }
+            self.scope.push(f.alias.unwrap_or(f.table));
+        }
+        Ok(())
     }
 
     fn core_exprs<E>(&mut self, s: &mut SelectStmt) -> Result<(), E> {

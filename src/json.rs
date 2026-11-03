@@ -240,16 +240,11 @@ fn append_node(b: &mut AVec<u8>, t: u8, sz: usize, payload: Option<&[u8]>) {
     }
 }
 
-/// Replace `del` bytes at `at` by `ins`.
+/// Replace `del` bytes at `at` by `ins`, in place (the pin's
+/// memmove: only the bytes after the range move, so closing a
+/// container while parsing costs its own payload, not the blob).
 fn splice(b: &mut AVec<u8>, at: usize, del: usize, ins: &[u8]) {
-    let s = b.as_slice();
-    let at = at.min(s.len());
-    let end = at.saturating_add(del).min(s.len());
-    let mut out = AVec::with_capacity(s.len() - (end - at) + ins.len());
-    out.extend_from_slice(s.get(..at).unwrap_or(&[]));
-    out.extend_from_slice(ins);
-    out.extend_from_slice(s.get(end..).unwrap_or(&[]));
-    *b = out;
+    b.replace_range(at, del, ins);
 }
 
 /// The pin's `jsonBlobChangePayloadSize`: rewrite the header at `i`
@@ -2961,6 +2956,9 @@ pub enum Op {
     /// A `json_each` / `json_tree` `key` column: an object member's
     /// label decoded.
     EachKey,
+    /// A `json_each` / `json_tree` hidden `json` column: the call's
+    /// first argument.
+    EachJson,
     /// A value that carries the JSON subtype (a JSON aggregate's
     /// window result).
     Subtyped,
@@ -2979,6 +2977,13 @@ pub struct JsonFn {
     pub op: Op,
     /// The `jsonb_` form: a JSON result is JSONB.
     pub blob: bool,
+}
+
+impl Op {
+    /// A `json_each` / `json_tree` column read (`each_column`).
+    pub fn is_each_column(self) -> bool {
+        matches!(self, Op::EachValue | Op::EachKey | Op::EachJson)
+    }
 }
 
 impl JsonFn {
@@ -3047,9 +3052,13 @@ impl JsonFn {
     /// "wrong number of arguments" at prepare).
     pub fn arity(self) -> (usize, usize) {
         match self.op {
-            Op::Json | Op::Quote | Op::ErrorPosition | Op::Subtyped | Op::Frag | Op::EachKey => {
-                (1, 1)
-            }
+            Op::Json
+            | Op::Quote
+            | Op::ErrorPosition
+            | Op::Subtyped
+            | Op::Frag
+            | Op::EachKey
+            | Op::EachJson => (1, 1),
             Op::Arrow | Op::Arrow2 | Op::Patch | Op::EachValue | Op::ObjFrag => (2, 2),
             Op::Type | Op::Valid | Op::ArrayLength | Op::Pretty => (1, 2),
             _ => (0, usize::MAX),
@@ -3298,27 +3307,8 @@ pub fn eval(f: JsonFn, args: &[(OwnedValue, bool)]) -> R<(OwnedValue, bool)> {
                 false,
             )
         }
-        Op::EachValue => {
-            let container = matches!(arg(1), OwnedValue::Text(t) if matches!(t.as_slice(), b"array" | b"object"));
-            match arg(0) {
-                // The rows hold the element as JSONB; it decodes when
-                // the column is read, as on the pin (`count(*)` over a
-                // document too deep to render answers).
-                OwnedValue::Blob(b) if container => {
-                    if f.blob {
-                        (OwnedValue::Blob(b.clone()), false)
-                    } else {
-                        text_result(render_doc(b.as_slice(), 0)?)
-                    }
-                }
-                OwnedValue::Blob(b) => (sql_value(b.as_slice(), 0, false)?, false),
-                v => (v.clone(), false),
-            }
-        }
-        Op::EachKey => match arg(0) {
-            OwnedValue::Blob(b) => (sql_value(b.as_slice(), 0, false)?, false),
-            v => (v.clone(), false),
-        },
+        // Read through `each_column`, with the call's document.
+        Op::EachValue | Op::EachKey | Op::EachJson => return Err(SchemaKind::JsonMalformed),
         Op::Subtyped => (arg(0).clone(), matches!(arg(0), OwnedValue::Text(_))),
         Op::Frag => {
             let (v, s) = args.first().cloned().unwrap_or((OwnedValue::Null, false));
@@ -3554,6 +3544,95 @@ pub fn tvf_kind(name: &[u8]) -> u8 {
         .map_or(0, |(_, k)| *k)
 }
 
+/// One `json_each` / `json_tree` call's document, held while the
+/// statement that made the call runs (`Env::json_docs`): its rows
+/// name it by index rather than carry it, so a call over a document
+/// of n elements costs O(n) memory, not O(n²).
+#[derive(Debug)]
+pub struct TvfDoc {
+    /// The document as JSONB.
+    doc: AVec<u8>,
+    /// The `json` column when the argument was text (its C-string
+    /// prefix); None when it was JSONB, which `doc` holds as given.
+    text: Option<AVec<u8>>,
+}
+
+/// The documents of the running statement's `json_each` /
+/// `json_tree` calls, in call order.
+pub type TvfDocs = core::cell::RefCell<AVec<TvfDoc>>;
+
+/// A row's reference to byte `off` of document `id`: 16 bytes,
+/// read back only by `each_column` (the key, value, atom and json
+/// columns hold nothing else).
+fn handle(id: usize, off: usize) -> OwnedValue {
+    let mut h = AVec::with_capacity(16);
+    h.extend_from_slice(&(id as u64).to_be_bytes());
+    h.extend_from_slice(&(off as u64).to_be_bytes());
+    OwnedValue::Blob(h)
+}
+
+fn unhandle(v: &OwnedValue) -> Option<(usize, usize)> {
+    let OwnedValue::Blob(h) = v else {
+        return None;
+    };
+    let h = h.as_slice();
+    let id = u64::from_be_bytes(h.get(..8)?.try_into().ok()?);
+    let off = u64::from_be_bytes(h.get(8..16)?.try_into().ok()?);
+    Some((usize::try_from(id).ok()?, usize::try_from(off).ok()?))
+}
+
+/// Read a `json_each` / `json_tree` column (`Op::EachValue`,
+/// `EachKey`, `EachJson`; argument 0 the row's value, a handle
+/// into `docs`, or a plain value; `EachValue`'s argument 1 the
+/// row's `type`): the element decodes now, as the pin's columns are
+/// computed only when a query reads them (`count(*)` over a
+/// document too deep to render answers). A value that is an array
+/// or object keeps the JSON subtype.
+pub fn each_column(
+    f: JsonFn,
+    args: &[(OwnedValue, bool)],
+    docs: Option<&TvfDocs>,
+) -> R<(OwnedValue, bool)> {
+    let arg = |i: usize| args.get(i).map(|a| &a.0).unwrap_or(&OwnedValue::Null);
+    let Some((id, off)) = unhandle(arg(0)) else {
+        return Ok((arg(0).clone(), false));
+    };
+    let docs = docs
+        .ok_or(SchemaKind::JsonMalformed)?
+        .try_borrow()
+        .map_err(|_| SchemaKind::JsonMalformed)?;
+    let d = docs.as_slice().get(id).ok_or(SchemaKind::JsonMalformed)?;
+    let b = d.doc.as_slice();
+    if f.op == Op::EachJson {
+        let mut t = AVec::new();
+        return Ok(match &d.text {
+            Some(z) => {
+                t.extend_from_slice(z.as_slice());
+                (OwnedValue::Text(t), false)
+            }
+            None => {
+                t.extend_from_slice(b);
+                (OwnedValue::Blob(t), false)
+            }
+        });
+    }
+    let (n, sz) = payload(b, off);
+    let elem = slice(b, off, n + sz);
+    let container =
+        matches!(arg(1), OwnedValue::Text(t) if matches!(t.as_slice(), b"array" | b"object"));
+    Ok(if f.op == Op::EachValue && container {
+        if f.blob {
+            let mut t = AVec::new();
+            t.extend_from_slice(elem);
+            (OwnedValue::Blob(t), false)
+        } else {
+            text_result(render_doc(elem, 0)?)
+        }
+    } else {
+        (sql_value(elem, 0, false)?, false)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct Parent {
     head: usize,
@@ -3565,6 +3644,8 @@ struct Parent {
 
 struct Cursor<'a> {
     b: &'a [u8],
+    /// The document's index in `TvfDocs`.
+    id: usize,
     i: usize,
     end: usize,
     etype: u8,
@@ -3702,7 +3783,7 @@ impl Cursor<'_> {
         OwnedValue::Text(t)
     }
 
-    fn row(&self, json: &OwnedValue) -> R<AVec<OwnedValue>> {
+    fn row(&self) -> R<AVec<OwnedValue>> {
         let mut r = AVec::with_capacity(10);
         // key
         r.push(match self.parents.as_slice().last() {
@@ -3727,10 +3808,7 @@ impl Cursor<'_> {
             Some(top) => {
                 if self.etype == T_OBJECT {
                     // The label, decoded when read (`Op::EachKey`).
-                    let (n, sz) = payload(self.b, self.i);
-                    let mut t = AVec::new();
-                    t.extend_from_slice(slice(self.b, self.i, n + sz));
-                    OwnedValue::Blob(t)
+                    handle(self.id, self.i)
                 } else {
                     OwnedValue::Integer(top.key)
                 }
@@ -3738,18 +3816,14 @@ impl Cursor<'_> {
         });
         let vi = self.skip_label();
         let t = g(self.b, vi) & 0x0f;
-        // value: the element as JSONB, decoded when read
-        // (`Op::EachValue`), as the pin's columns are computed only
-        // when a query reads them.
-        let (vn, vsz) = payload(self.b, vi);
-        let mut elem = AVec::new();
-        elem.extend_from_slice(slice(self.b, vi, vn + vsz));
-        // An object whose last label has no value: nothing to read
-        // (the pin reads past the blob's end there).
+        // value: the element, decoded when read (`Op::EachValue`),
+        // as the pin's columns are computed only when a query reads
+        // them. An object whose last label has no value: nothing to
+        // read (the pin reads past the blob's end there).
         let elem = if vi >= self.b.len() {
             OwnedValue::Null
         } else {
-            OwnedValue::Blob(elem)
+            handle(self.id, vi)
         };
         r.push(elem.clone());
         // type
@@ -3778,8 +3852,8 @@ impl Cursor<'_> {
             0,
             self.path_length(),
         )));
-        // json
-        r.push(json.clone());
+        // json (`Op::EachJson`)
+        r.push(handle(self.id, 0));
         // root
         r.push(Self::text(slice(self.path.as_slice(), 0, self.nroot)));
         Ok(r)
@@ -3789,35 +3863,44 @@ impl Cursor<'_> {
 /// The rows of `json_each` / `json_tree` (`kind` as `tvf_kind`)
 /// over its arguments (the JSON, then the optional root path):
 /// each row's ten `TVF_COLUMNS` values and its rowid, at most
-/// `limit` of them.
+/// `limit` of them. The document joins `docs`, where the rows'
+/// key, value, atom and json columns point (`each_column`).
 #[allow(clippy::type_complexity)]
 pub fn tvf_rows(
     kind: u8,
     args: &[OwnedValue],
     limit: Option<usize>,
+    docs: &TvfDocs,
 ) -> R<AVec<(AVec<OwnedValue>, Option<i64>)>> {
     let mut out = AVec::new();
     let Some(input) = args.first() else {
         return Ok(out);
     };
     let recursive = kind & 3 == 2;
-    let (doc, json) = match input {
+    let (doc, text) = match input {
         OwnedValue::Blob(b) if is_jsonb(b.as_slice()) => {
             let mut c = AVec::new();
             c.extend_from_slice(b.as_slice());
-            (c, input.clone())
+            (c, None)
         }
         _ => {
             let Some(t) = crate::query::to_text(input) else {
                 return Ok(out);
             };
             let d = text_to_doc(t.as_slice()).map_err(|_| SchemaKind::JsonMalformed)?;
-            (d.b, Cursor::text(cstr(t.as_slice())))
+            let mut z = AVec::new();
+            z.extend_from_slice(cstr(t.as_slice()));
+            (d.b, Some(z))
         }
     };
+    let id = docs
+        .try_borrow()
+        .map_err(|_| SchemaKind::JsonMalformed)?
+        .len();
     let b = doc.as_slice();
     let mut cur = Cursor {
         b,
+        id,
         i: 0,
         end: 0,
         etype: 0,
@@ -3875,13 +3958,18 @@ pub fn tvf_rows(
         });
     }
     while cur.i < cur.end {
-        let row = cur.row(&json)?;
+        let row = cur.row()?;
         out.push((row, Some(cur.rowid)));
         // A reader that stops early never steps the pin's cursor on.
         if limit.is_some_and(|l| out.len() >= l) {
             break;
         }
         cur.next()?;
+    }
+    if !out.is_empty() {
+        docs.try_borrow_mut()
+            .map_err(|_| SchemaKind::JsonMalformed)?
+            .push(TvfDoc { doc, text });
     }
     Ok(out)
 }

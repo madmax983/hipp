@@ -4318,6 +4318,26 @@ impl<S: Storage> Connection<S> {
                 limit: limit.as_ref(),
             },
         );
+        // v0.16 (`json`): what a lateral `json_each` may drop
+        // from the rows it joins onto.
+        #[cfg(feature = "json")]
+        {
+            let mut rest: AVec<&RExpr> = AVec::new();
+            for e in items
+                .iter()
+                .chain(filter.iter())
+                .chain(group_by.iter())
+                .chain(having.iter())
+                .chain(order_by.iter().map(|(e, _)| e))
+            {
+                rest.push(e);
+            }
+            json_tvf::plan_tvf_dead(
+                sources.as_mut_slice(),
+                cur.offsets.as_slice(),
+                rest.as_slice(),
+            );
+        }
         let keys = CompKeys {
             names: item_aliases,
             colls: core_colls(items.as_slice(), &[]),
@@ -4485,6 +4505,8 @@ impl<S: Storage> Connection<S> {
             rec: 0,
             #[cfg(feature = "json")]
             tvf: 0,
+            #[cfg(feature = "json")]
+            tvf_dead: AVec::new(),
             #[cfg(feature = "expr_index")]
             access: None,
         });
@@ -4626,6 +4648,8 @@ impl<S: Storage> Connection<S> {
                 rec: 0,
                 #[cfg(feature = "json")]
                 tvf: 0,
+                #[cfg(feature = "json")]
+                tvf_dead: AVec::new(),
                 #[cfg(feature = "expr_index")]
                 access: None,
             });
@@ -5914,6 +5938,13 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// again, so the plan reflects the values bound, the schema
     /// and the clock at the time.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
+        // The `json_each` documents this step holds (v0.16, `json`;
+        // `Env::json_docs`) go once the plan has run: its rows are
+        // projected by then (a query materialises its result in
+        // its first step), and a nested step (a trigger body) drops
+        // only its own.
+        #[cfg(feature = "json")]
+        let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
         #[cfg(feature = "params")]
         if !self.binds.started {
             self.replan().await?;
@@ -6049,6 +6080,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Instead(_) => self.step_instead().await,
             Plan::Rollback => self.step_rollback().await,
         };
+        #[cfg(feature = "json")]
+        if let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut() {
+            d.truncate(mark);
+        }
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
         #[cfg(feature = "foreign_keys")]
@@ -8586,6 +8621,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         filter: &Option<RExpr>,
         out: &mut AVec<WriteRow>,
     ) -> Result<(), S::Error> {
+        // The WHERE clause's constant terms, once, first (v0.16
+        // review fix): false, and no row is written.
+        if let Some(f) = filter
+            && !crate::query::constant_terms_hold::<S::Error>(
+                f,
+                &Ctx::of(&RowData::empty()).with(&self.conn.env),
+            )?
+        {
+            return Ok(());
+        }
         let mut cursor = ScanCursor::new(root);
         let mut buf = AVec::new();
         // v0.16: VIRTUAL generated columns are computed per row.
@@ -8651,7 +8696,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             if let Some(f) = filter {
                 let rd = row_data_for(rowid_alias, affs, rec.as_slice(), rowid);
                 #[cfg(feature = "v06")]
-                let keep = self.cond_row_sub(f, &rd).await?;
+                let keep = self.where_row_sub(f, &rd).await?;
                 #[cfg(not(feature = "v06"))]
                 let keep = crate::query::cond::<S::Error>(f, &Ctx::of(&rd).with(&self.conn.env))?;
                 if !keep {
@@ -8879,7 +8924,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for c in joined.iter() {
                     let keep = match &filter {
                         None => true,
-                        Some(f) => self.cond_row_sub(f, c).await?,
+                        Some(f) => self.where_row_sub(f, c).await?,
                     };
                     if keep {
                         last = Some(c.clone());
@@ -10303,18 +10348,99 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// Whether condition `e` holds for `row` (v0.16 fix, ungated):
-    /// `eval_row_sub` with the pin's jump code for AND / OR
+    /// `eval_row_sub` with the pin's jump code for AND / OR / NOT
     /// (`query::cond`), so `WHERE json_valid(j) AND j ->> 'a' = 1`
     /// never evaluates the second term for a row the first rejects.
+    /// A subquery runs only when its operand is reached, and an AND
+    /// / OR whose left operand holds a subquery and right one does
+    /// not tests the right one first (the pin's `exprEvalRhsFirst`).
     #[cfg(feature = "v06")]
     async fn cond_row_sub(&mut self, e: &RExpr, row: &RowData) -> Result<bool, S::Error> {
-        if !crate::query::has_sub(e) {
-            return crate::query::cond::<S::Error>(e, &Ctx::of(row).with(&self.conn.env));
+        self.cond_is_sub(e, row, true).await
+    }
+
+    /// `cond_row_sub` asking whether `e` is `want` (`query::cond_is`).
+    #[cfg(feature = "v06")]
+    fn cond_is_sub<'a>(
+        &'a mut self,
+        e: &'a RExpr,
+        row: &'a RowData,
+        want: bool,
+    ) -> CondFuture<'a, S::Error> {
+        Box::pin(async move {
+            if !crate::query::has_sub(e) {
+                return crate::query::cond_is::<S::Error>(
+                    e,
+                    &Ctx::of(row).with(&self.conn.env),
+                    want,
+                );
+            }
+            match e {
+                RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r)
+                    if crate::query::int_lit(l).is_none() && crate::query::int_lit(r).is_none() =>
+                {
+                    let (first, second) = if crate::query::has_sub(l) && !crate::query::has_sub(r) {
+                        (&**r, &**l)
+                    } else {
+                        (&**l, &**r)
+                    };
+                    let decisive = (*op == BinOp::Or) == want;
+                    let a = self.cond_is_sub(first, row, want).await?;
+                    if a == decisive {
+                        return Ok(a);
+                    }
+                    self.cond_is_sub(second, row, want).await
+                }
+                RExpr::Not(x) => self.cond_is_sub(x, row, !want).await,
+                _ => Ok(crate::query::truthy(&self.eval_row_sub(e, row).await?) == Some(want)),
+            }
+        })
+    }
+
+    /// Whether WHERE clause `f` holds for `row` (v0.16 review fix,
+    /// ungated): `cond_row_sub` over its AND terms in order, those
+    /// holding a correlated subquery after the rest, as the pin
+    /// codes them (`TERM_VARSELECT`): `WHERE EXISTS (SELECT .. FROM
+    /// json_each(t.j)) AND json_valid(t.j)` never runs the subquery
+    /// for a row the second term rejects.
+    #[cfg(feature = "v06")]
+    async fn where_row_sub(&mut self, f: &RExpr, row: &RowData) -> Result<bool, S::Error> {
+        if !crate::query::has_sub(f) {
+            return self.cond_row_sub(f, row).await;
         }
-        let values = self.compute_sub_values(e, row).await?;
-        let mut pos = 0;
-        let e2 = crate::query::substitute(e, values.as_slice(), &mut pos);
-        crate::query::cond::<S::Error>(&e2, &Ctx::of(row).with(&self.conn.env))
+        // A term `x IN (SELECT ...)` is the pin's IN constraint, tested
+        // in place even when correlated (probed); any other term
+        // holding a correlated subquery waits.
+        let late = |t: &RExpr| match t {
+            RExpr::InSub(x, _, false) => crate::query::has_corr_sub(x),
+            _ => crate::query::has_corr_sub(t),
+        };
+        let mut terms = AVec::new();
+        crate::query::and_terms(f, &mut terms);
+        for pass in [false, true] {
+            for t in terms.iter() {
+                if late(t) == pass && !self.cond_row_sub(t, row).await? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether HAVING condition `e` holds for a group (v0.16 review
+    /// fix, ungated): AND / OR stop early (`query::cond`) when it
+    /// holds no subquery.
+    #[cfg(feature = "v06")]
+    async fn cond_group_sub(
+        &mut self,
+        e: &RExpr,
+        rows: &[RowData],
+        rep: &RowData,
+    ) -> Result<bool, S::Error> {
+        if !crate::query::has_sub(e) {
+            return crate::query::cond::<S::Error>(e, &Ctx::group(rows, rep).with(&self.conn.env));
+        }
+        Ok(crate::query::truthy(&self.eval_group_sub(e, rows, rep).await?) == Some(true))
     }
 
     /// Evaluate one expression for one row, executing any
@@ -10371,9 +10497,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
                 for r in rows {
                     let ctx = Ctx::of(r).with(&self.conn.env);
-                    if let Some(vs) = crate::query::agg_row::<S::Error>(&p, &mut |x| {
-                        crate::query::eval::<S::Error>(x, &ctx)
-                    })? {
+                    if let Some(vs) = crate::query::agg_row::<S::Error>(&p, &ctx)? {
                         arg_rows.push(vs);
                     }
                 }
@@ -10936,6 +11060,15 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &RowData,
         out: &mut AVec<RowData>,
     ) -> Result<(), S::Error> {
+        // The WHERE clause's constant terms, once, first (v0.16
+        // review fix): false, and no row joins.
+        if !crate::query::join_constants_hold::<S::Error>(
+            filter,
+            sources,
+            &Ctx::of(outer).with(&self.conn.env),
+        )? {
+            return Ok(());
+        }
         let mut matched = right_match_flags(sources, src_rows);
         self.join_step(
             sources,
@@ -10984,7 +11117,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let (Some(sp), Some(rows)) = (sources.get(idx), src_rows.get(idx)) else {
                 let keep = match filter {
                     None => true,
-                    Some(f) => self.cond_row_sub(f, &acc).await?,
+                    Some(f) => self.where_row_sub(f, &acc).await?,
                 };
                 if keep {
                     out.push(acc);
@@ -10996,10 +11129,23 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "json")]
             let lateral;
             #[cfg(feature = "json")]
+            let mut acc = acc;
+            #[cfg(feature = "json")]
             let rows = if sp.tvf & crate::query::TVF_LATERAL != 0 {
                 match self.lateral_rows(sources, idx, filter, &acc).await? {
                     Some(r) => {
                         lateral = r;
+                        // The left values only the call read: not
+                        // copied into each of its rows.
+                        let here = acc.vals.len();
+                        for back in sp.tvf_dead.iter() {
+                            if let Some(v) = here
+                                .checked_sub(*back)
+                                .and_then(|s| acc.vals.as_mut_slice().get_mut(s))
+                            {
+                                *v = OwnedValue::Null;
+                            }
+                        }
                         &lateral
                     }
                     None => return Ok(()),
@@ -11258,12 +11404,15 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
-                for a in group_aggs(qp.items.as_slice(), qp.order_by.as_slice()).iter() {
+                // Every aggregate of the group finalizes before its
+                // HAVING runs, the HAVING's own included (its AND / OR
+                // then stop early over the values).
+                let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
+                crate::query::collect_outer_aggs(h, &mut aggs);
+                for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
-                    != Some(true)
-                {
+                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
                     continue;
                 }
             }
@@ -11490,12 +11639,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
-                for a in group_aggs(plan.items.as_slice(), plan.order_by.as_slice()).iter() {
+                let mut aggs = group_aggs(plan.items.as_slice(), plan.order_by.as_slice());
+                crate::query::collect_outer_aggs(h, &mut aggs);
+                for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
-                    != Some(true)
-                {
+                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
                     continue;
                 }
             }
@@ -11940,6 +12089,11 @@ impl<'c, S: Storage> Statement<'c, S> {
 type SubplanFuture<'x, E> = core::pin::Pin<
     alloc::boxed::Box<dyn core::future::Future<Output = Result<AVec<AVec<OwnedValue>>, E>> + 'x>,
 >;
+
+/// A boxed recursive condition future (v0.16, `cond_is_sub`).
+#[cfg(feature = "v06")]
+type CondFuture<'x, E> =
+    core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<bool, E>> + 'x>>;
 
 /// A boxed recursive-join future (v0.6).
 #[cfg(feature = "v06")]
@@ -12858,6 +13012,15 @@ fn join_all<E>(
     src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
     out: &mut AVec<RowData>,
 ) -> Result<(), E> {
+    // The WHERE clause's constant terms, once, first (v0.16 review
+    // fix): false, and no row joins.
+    if !crate::query::join_constants_hold::<E>(
+        qp.filter.as_ref(),
+        qp.sources.as_slice(),
+        &Ctx::of(&RowData::empty()).with(env),
+    )? {
+        return Ok(());
+    }
     let mut matched = right_match_flags(qp.sources.as_slice(), src_rows);
     join_rows::<E>(
         env,
@@ -13106,10 +13269,14 @@ fn project_rows<E>(
             if !pass {
                 continue;
             }
-            for a in group_aggs(qp.items.as_slice(), qp.order_by.as_slice()).iter() {
+            // Every aggregate of the group, the HAVING's included,
+            // finalizes before the HAVING runs.
+            let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
+            crate::query::collect_outer_aggs(h, &mut aggs);
+            for a in aggs.iter() {
                 crate::query::eval::<E>(a, &ctx)?;
             }
-            if crate::query::truthy(&crate::query::eval::<E>(h, &ctx)?) != Some(true) {
+            if !crate::query::cond::<E>(h, &ctx)? {
                 continue;
             }
         }

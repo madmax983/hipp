@@ -754,6 +754,47 @@ json_array_length((select json_group_array(json_array(i)) from n))
     );
 }
 
+/// Review regression: documents of 50,000 to 100,000 elements stay
+/// linear. Parsing text used to copy the whole blob each time a
+/// container's header shrank (O(n²) in the containers: seconds per
+/// call at 1 MB), and `json_each` / `json_tree` copied the input
+/// document into every row's hidden `json` column, and the table's
+/// row into every joined row (O(rows × size): gigabytes for a 100 KB
+/// array, an allocation-failure abort beyond).
+#[test]
+fn large_documents_scale() {
+    let start = std::time::Instant::now();
+    agree(
+        "large-scale",
+        &[
+            "CREATE TABLE d(j)",
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000) INSERT INTO d SELECT json_group_array(json_object('a', i)) FROM c",
+            "CREATE TABLE e(j)",
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i < 20000) INSERT INTO e SELECT json_group_array(i) FROM c",
+            "CREATE TABLE f(j)",
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 50000) INSERT INTO f SELECT json_group_object('k' || i, json_array(i, i + 1)) FROM c",
+        ],
+        &lines(
+            r#"
+json_valid(j), length(j), length(jsonb(j)), j ->> '$[99999].a' from d
+json_array_length(j), json_extract(j, '$[50000]') from d
+count(*), sum(value) from e, json_each(e.j)
+count(*) from json_each((select j from e))
+count(*), sum(key), min(json), max(length(json)) from e, json_each(e.j) where key % 5000 = 0
+count(*), sum(value ->> 1) from f, json_tree(f.j) where type = 'array'
+count(*), sum(length(fullkey)) from f, json_tree(f.j)
+j ->> '$.k49999[1]', length(json_set(j, '$.k7[0]', 99)), length(json_pretty(j)) from f
+count(*) from d, json_each(d.j) where value ->> 'a' > 99990
+"#,
+        ),
+    );
+    let took = start.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(120),
+        "large documents took {took:?}"
+    );
+}
+
 #[test]
 fn errors_are_remedy_named() {
     let cases: &[(&str, SchemaKind)] = &[
@@ -849,6 +890,228 @@ x = 1 AND json('x') from (select 0 x)
 "#,
         ),
     );
+}
+
+/// Review regressions: TVF arguments reading a trigger's NEW / OLD,
+/// the AND / OR / NOT jump code everywhere a condition is tested
+/// (aggregate FILTER over a table, HAVING, CHECK, NOT, subquery
+/// operands tested last, correlated-subquery WHERE terms after the
+/// others), WHERE constant terms computed once up front (over no
+/// rows too, after constant propagation, never for an OR operand or
+/// an outer join's ON), and a compound scalar subquery's JSON
+/// subtype.
+#[test]
+fn review_regressions() {
+    agree(
+        "review",
+        &[
+            "CREATE TABLE t(a, b)",
+            "INSERT INTO t VALUES (1, 'x'), (2, '[1]')",
+            "CREATE TABLE u(a)",
+            "INSERT INTO u VALUES (1)",
+            "CREATE TABLE e(a)",
+            "CREATE TABLE ti(a INTEGER PRIMARY KEY, b)",
+            "INSERT INTO ti VALUES (1, 'x'), (2, '[1]')",
+            "CREATE TABLE tx(a, b)",
+            "CREATE INDEX txa ON tx(a)",
+            "INSERT INTO tx VALUES (1, 'x'), (2, '[1]')",
+        ],
+        &lines(
+            r#"
+count(*) filter (where json_valid(b) and b ->> 0 = 1) from t
+json_group_array(a) filter (where json_valid(b) and b ->> 0 = 1) from t
+sum(a) filter (where json_valid(b) and b ->> 0 = 1), (select 1) from t
+a, count(*) filter (where not json_valid(b) or b ->> 0 = 1) over () from t
+!SELECT a FROM t WHERE NOT (json_valid(b) AND b ->> 0 = 1)
+!SELECT a FROM t WHERE NOT NOT (json_valid(b) AND b ->> 0 = 1)
+!SELECT a FROM t WHERE NOT (NOT json_valid(b) OR b ->> 0 <> 1)
+!SELECT a FROM t WHERE (json_valid(b) AND b ->> 0 = 1) IS NOT 0
+!SELECT a FROM t GROUP BY a HAVING json_valid(max(b)) AND max(b) ->> 0 = 1
+!SELECT a FROM t GROUP BY a HAVING NOT json_valid(max(b)) OR max(b) ->> 0 = 1
+!SELECT * FROM t WHERE EXISTS (SELECT 1 FROM json_each(t.b) WHERE value = 1) AND json_valid(b)
+!SELECT * FROM t WHERE (SELECT count(*) FROM json_each(t.b)) AND json_valid(b)
+!SELECT * FROM t WHERE (SELECT count(*) FROM json_each(t.b)) OR NOT json_valid(b)
+!SELECT * FROM t WHERE b ->> 0 = (SELECT 1) AND json_valid(b)
+!SELECT * FROM t WHERE b ->> 0 = (SELECT a FROM u WHERE u.a = t.a) AND json_valid(b)
+!SELECT * FROM t WHERE t.a IN (SELECT key FROM json_each(t.b)) AND json_valid(b)
+!SELECT * FROM t WHERE t.a NOT IN (SELECT key FROM json_each(t.b)) AND json_valid(b)
+!SELECT * FROM t WHERE EXISTS (SELECT 1 FROM json_each(t.b)) AND a = 2
+!SELECT * FROM t WHERE NOT (EXISTS (SELECT 1 FROM json_each(t.b)) AND json_valid(b))
+!SELECT * FROM t, u WHERE (SELECT count(*) FROM json_each(t.b)) AND json_valid(t.b)
+!SELECT * FROM t LEFT JOIN u ON json_valid(t.b) AND EXISTS (SELECT 1 FROM json_each(t.b))
+!SELECT * FROM ti WHERE b -> 0 = 1 AND a = 2
+!SELECT * FROM tx WHERE b -> 0 = 1 AND a = 2
+!SELECT * FROM t WHERE b -> 0 = 1 AND a = 2
+!SELECT * FROM u WHERE a = 1 OR json('[') IS NULL
+!SELECT * FROM u WHERE a = 2 OR json('[') IS NULL
+!SELECT * FROM u WHERE NOT (a = 1 OR json('[') IS NULL)
+!SELECT * FROM e WHERE (a = 1 OR json('[') IS NULL)
+!SELECT * FROM e WHERE a = 1 AND json('[') IS NULL
+!SELECT * FROM e WHERE NOT (json('[') IS NULL)
+!SELECT * FROM e WHERE 1 = 2 AND json('[') IS NULL
+!SELECT * FROM e WHERE json('[') IS NULL AND 1 = 2
+!SELECT * FROM u WHERE abs(-1) = 2 AND json('[') IS NULL
+!SELECT * FROM e WHERE abs(-9223372036854775808) AND length('x') = 2
+!SELECT * FROM e, u WHERE e.a = u.a AND json('[') IS NULL
+!SELECT * FROM e JOIN u ON json('[') IS NULL
+!SELECT * FROM e LEFT JOIN t ON json('[') IS NULL
+!SELECT * FROM u LEFT JOIN t ON json('[') IS NULL
+!SELECT * FROM u LEFT JOIN t ON t.a = 5 AND json('[') IS NULL
+!SELECT * FROM u WHERE a = 2 AND (a = 1 OR json('[') IS NULL)
+!SELECT * FROM e WHERE a = 2 AND (a = 1 OR json('[') IS NULL)
+!SELECT * FROM u WHERE a = 1 AND json('[') IS NULL AND a = 2
+!SELECT * FROM e WHERE a = 1 AND json('[') IS NULL AND a = 2
+!SELECT * FROM u WHERE a = 1 AND (a <> 2 OR json('[') IS NULL)
+!SELECT * FROM u WHERE a = 1 AND (a + 1 = 3 OR json('[') IS NULL)
+!SELECT * FROM t WHERE a = 1 COLLATE nocase AND (a = 2 OR json('[') IS NULL)
+!SELECT count(*) FROM e WHERE a = 1 AND json('[') IS NULL
+!SELECT (SELECT 1 FROM e WHERE json('[') IS NULL) FROM u
+!SELECT (SELECT 1 FROM e WHERE json('[') IS NULL) FROM e
+count(*) filter (where a = 2 and json('[') is null) from u
+case when a = 2 and json('[') is null then 1 end from u
+iif(json_valid(b) and b ->> 0 = 1, 'y', 'n') from t
+json_array((select json('[1]') union all select 2)), json_array((select json('[1]') union select 2))
+json_array((select json('[1]') except select 2)), json_array((select json('[1]') intersect select json('[1]')))
+json_array((select json('[1]') union all select 2 limit 1)), json_array((select 2 union all select json('[1]')))
+json_array((select json_array(1) from u union all select 2)), json_array((values (json('[1]')) union all values (2)))
+json_array((select json_quote('a') union all select null)), json_array((select json_group_array(1) union all select 2))
+json_array((select '[1]' -> '$' union all select 2)), json_array((select '[1]' ->> '$' union all select 2))
+json_array((select json('[1]') limit 1)), json_array((select b from t where a = 2 union all select 2))
+"#,
+        ),
+    );
+    // DML: the WHERE constant terms and the jump code; CHECK.
+    for (tag, stmts) in [
+        (
+            "review-dml-empty",
+            &[
+                "DELETE FROM e WHERE a = 1 AND json('[') IS NULL",
+                "UPDATE e SET a = 1 WHERE a = 1 AND json('[') IS NULL",
+                "DELETE FROM u WHERE a = 2 AND json('[') IS NULL",
+                "UPDATE u SET a = 1 WHERE a = 2 AND json('[') IS NULL",
+                "SELECT * FROM u",
+            ][..],
+        ),
+        (
+            "review-dml-jump",
+            &[
+                "DELETE FROM t WHERE json_valid(b) AND b ->> 0 = 1",
+                "SELECT * FROM t",
+                "UPDATE t SET a = 9 WHERE NOT (json_valid(b) AND b ->> 0 = 1)",
+                "UPDATE t SET a = 7 WHERE EXISTS (SELECT 1 FROM json_each(t.b)) AND json_valid(b)",
+                "SELECT * FROM t",
+            ][..],
+        ),
+        (
+            "review-check",
+            &[
+                "CREATE TABLE c1(x, CHECK (NOT json_valid(x) OR x ->> 0 > 0))",
+                "INSERT INTO c1 VALUES ('zz'), ('[5]')",
+                "INSERT INTO c1 VALUES ('[0]')",
+                "CREATE TABLE c2(x, CHECK (json_valid(x) AND x ->> 0 > 0))",
+                "INSERT INTO c2 VALUES ('zz')",
+                "CREATE TABLE c3(x, CHECK (x IS NULL OR json_valid(x) AND x ->> 0 > 0))",
+                "INSERT INTO c3 VALUES (NULL), ('[3]')",
+                "SELECT * FROM c1, c3",
+            ][..],
+        ),
+    ] {
+        let stmts: Vec<String> = stmts.iter().map(|s| s.to_string()).collect();
+        agree(
+            tag,
+            &[
+                "CREATE TABLE t(a, b)",
+                "INSERT INTO t VALUES (1, 'x'), (2, '[1]')",
+                "CREATE TABLE u(a)",
+                "INSERT INTO u VALUES (1)",
+                "CREATE TABLE e(a)",
+            ],
+            &stmts,
+        );
+    }
+}
+
+/// Review regression: a table-valued function's arguments read the
+/// trigger's NEW / OLD row (they were left unbound: "no such
+/// column" when the trigger fired), with only the sources before it
+/// in scope, and ALTER TABLE RENAME COLUMN edits them.
+#[test]
+fn tvf_in_triggers() {
+    let cases: &[&[&str]] = &[
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(a, k, v)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT new.a, key, value FROM json_each(new.a); END",
+            "INSERT INTO t VALUES ('[1,2]'), ('{\"x\":3}')",
+            "SELECT * FROM log",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(a, k)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.a, (SELECT group_concat(key) FROM json_each(new.a))); END",
+            "INSERT INTO t VALUES ('{\"x\":1,\"y\":2}')",
+            "SELECT * FROM log",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE k(k, n)",
+            "INSERT INTO k VALUES (0, 0), (1, 0), (5, 0)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE k SET n = n + 1 WHERE k IN (SELECT key FROM json_each(new.a)); END",
+            "INSERT INTO t VALUES ('[7,8]')",
+            "SELECT * FROM k",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE k(k, n)",
+            "INSERT INTO k VALUES ('x', 0), ('y', 0)",
+            "CREATE TRIGGER tr AFTER UPDATE ON t BEGIN UPDATE k SET n = e.value FROM json_each(new.a) e WHERE e.key = k.k; END",
+            "INSERT INTO t VALUES ('{}')",
+            "UPDATE t SET a = '{\"x\":4}'",
+            "SELECT * FROM k",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(n)",
+            "CREATE TRIGGER tr BEFORE DELETE ON t BEGIN INSERT INTO log SELECT count(*) FROM json_tree(old.a); END",
+            "INSERT INTO t VALUES ('[1,[2]]')",
+            "DELETE FROM t",
+            "SELECT * FROM log",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(x)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT value FROM json_each(new.a) AS new; END",
+            "INSERT INTO t VALUES ('[1]')",
+            "SELECT * FROM log",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(x)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT y.value FROM json_each(new.a) new, json_each(new.value) y; END",
+            "INSERT INTO t VALUES ('[[1,2],[3]]')",
+            "SELECT * FROM log",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(x)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log WITH c AS (SELECT value v FROM json_each(new.a)) SELECT sum(v) FROM c; END",
+            "INSERT INTO t VALUES ('[1,5,9]')",
+            "SELECT * FROM log",
+        ],
+        &[
+            "CREATE TABLE t(a)",
+            "CREATE TABLE log(a, k, v)",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT new.a, key, value FROM json_each(new.a) WHERE new.a IS NOT NULL; END",
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger'",
+            "INSERT INTO t VALUES ('[3]')",
+            "SELECT * FROM log",
+        ],
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        let stmts: Vec<String> = c.iter().map(|s| s.to_string()).collect();
+        agree(&format!("trigger-tvf-{i}"), &[], &stmts);
+    }
 }
 
 // ---------------------------------------------------------------

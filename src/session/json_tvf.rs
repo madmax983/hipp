@@ -12,7 +12,7 @@
 //! themselves come from `json::tvf_rows`.
 
 use super::*;
-use crate::query::{SourceDesc, SubPlan, TVF_LATERAL};
+use crate::query::{SourceDesc, SubPlan, TVF_LATERAL, and_terms};
 
 impl<S: Storage> Connection<S> {
     /// Plan FROM source `s`, a call of the JSON table-valued
@@ -96,6 +96,8 @@ impl<S: Storage> Connection<S> {
             gcols: None,
             rec: 0,
             tvf: kind,
+            #[cfg(feature = "json")]
+            tvf_dead: AVec::new(),
             #[cfg(feature = "expr_index")]
             access: None,
         });
@@ -158,14 +160,55 @@ impl<S: Storage> Connection<S> {
     }
 }
 
-/// The AND terms of `e`.
-fn and_terms<'e>(e: &'e RExpr, out: &mut AVec<&'e RExpr>) {
-    match e {
-        RExpr::Binary(BinOp::And, l, r) => {
-            and_terms(l, out);
-            and_terms(r, out);
+/// Fill each lateral JSON table-valued source's `tvf_dead`
+/// (v0.16, `json`): the slots of the core's sources before it
+/// (`offsets`, the first slot of each source) that its arguments
+/// read and nothing else does — no result item, WHERE, GROUP BY,
+/// HAVING or ORDER BY term (`rest`), no ON clause, no other
+/// source's plan, no index probe. The join clears them once the
+/// call has run: without that each of a document's rows carried
+/// the whole document along with the row of the table it came
+/// from (O(rows × size) memory for `FROM t, json_each(t.j)`).
+pub(super) fn plan_tvf_dead(sources: &mut [SourcePlan], offsets: &[usize], rest: &[&RExpr]) {
+    use crate::query::{RefRange, expr_refs_range, plan_refs_range};
+    let first = offsets.first().copied().unwrap_or(0);
+    for k in 0..sources.len() {
+        let Some(sp) = sources.get(k) else {
+            continue;
+        };
+        if sp.tvf & TVF_LATERAL == 0 {
+            continue;
         }
-        _ => out.push(e),
+        let here = offsets.get(k).copied().unwrap_or(first);
+        let mut dead = AVec::new();
+        for slot in first..here {
+            let r = RefRange {
+                w: (slot, slot + 1),
+                s: (0, 0),
+            };
+            let args = sp
+                .derived
+                .as_deref()
+                .and_then(|d| d.values.as_slice().first());
+            if !args.is_some_and(|a| a.iter().any(|e| expr_refs_range(e, &r))) {
+                continue;
+            }
+            let elsewhere = rest.iter().any(|e| expr_refs_range(e, &r))
+                || sources.iter().enumerate().any(|(j, s)| {
+                    #[cfg(feature = "expr_index")]
+                    if s.access.as_deref().is_some_and(|a| a.lateral) {
+                        return true;
+                    }
+                    s.on.as_ref().is_some_and(|e| expr_refs_range(e, &r))
+                        || (j != k && s.derived.as_deref().is_some_and(|d| plan_refs_range(d, &r)))
+                });
+            if !elsewhere {
+                dead.push(here - slot);
+            }
+        }
+        if let Some(sp) = sources.get_mut(k) {
+            sp.tvf_dead = dead;
+        }
     }
 }
 
@@ -184,7 +227,7 @@ impl<S: Storage> Statement<'_, S> {
         filter: Option<&RExpr>,
         acc: &RowData,
     ) -> Result<Option<AVec<(AVec<OwnedValue>, Option<i64>)>>, S::Error> {
-        use crate::query::{RefRange, expr_refs_range, truthy};
+        use crate::query::{RefRange, expr_refs_range};
         let Some(sp) = sources.get(idx) else {
             return Ok(Some(AVec::new()));
         };
@@ -202,9 +245,7 @@ impl<S: Storage> Statement<'_, S> {
             and_terms(f, &mut terms);
         }
         for t in terms.iter() {
-            if !expr_refs_range(t, &later)
-                && truthy(&self.eval_row_sub(t, &padded).await?) != Some(true)
-            {
+            if !expr_refs_range(t, &later) && !self.cond_row_sub(t, &padded).await? {
                 return Ok(None);
             }
         }
@@ -217,9 +258,7 @@ impl<S: Storage> Statement<'_, S> {
             and_terms(o, &mut on);
         }
         for t in on.iter() {
-            if !expr_refs_range(t, &later)
-                && truthy(&self.eval_row_sub(t, &padded).await?) != Some(true)
-            {
+            if !expr_refs_range(t, &later) && !self.cond_row_sub(t, &padded).await? {
                 return Ok(None);
             }
         }
@@ -245,7 +284,12 @@ impl<S: Storage> Statement<'_, S> {
                 args.push(self.eval_row_sub(a, row).await?);
             }
         }
-        crate::json::tvf_rows(sp.tvf & !TVF_LATERAL, args.as_slice(), need)
-            .map_err(|kind| Error::Schema { kind })
+        crate::json::tvf_rows(
+            sp.tvf & !TVF_LATERAL,
+            args.as_slice(),
+            need,
+            &self.conn.env.json_docs,
+        )
+        .map_err(|kind| Error::Schema { kind })
     }
 }

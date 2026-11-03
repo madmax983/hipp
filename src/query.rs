@@ -184,21 +184,18 @@ pub fn agg_parts(e: &RExpr) -> Option<AggParts<'_>> {
 
 /// One group row's contribution to an aggregate (`agg_parts`):
 /// None when its FILTER does not pass (NULL or false: the row is
-/// not stepped, and nothing else of it is evaluated), else the
-/// values of `inputs()`. `ev` evaluates an expression against
-/// the row.
-pub fn agg_row<E>(
-    p: &AggParts<'_>,
-    ev: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
-) -> Result<Option<AVec<OwnedValue>>, E> {
+/// not stepped, and nothing else of it is evaluated; AND / OR stop
+/// early, `cond`), else the values of `inputs()` against the row
+/// `ctx`.
+pub fn agg_row<E>(p: &AggParts<'_>, ctx: &Ctx<'_>) -> Result<Option<AVec<OwnedValue>>, E> {
     if let Some(f) = p.filter
-        && truthy(&ev(f)?) != Some(true)
+        && !cond::<E>(f, ctx)?
     {
         return Ok(None);
     }
     let mut vs = AVec::new();
     for a in p.inputs() {
-        vs.push(ev(a)?);
+        vs.push(eval::<E>(a, ctx)?);
     }
     Ok(Some(vs))
 }
@@ -709,13 +706,14 @@ impl SourceDesc {
                 },
             )
         };
-        // A `json_each` key / value / atom decodes from JSONB when
-        // read, and a value keeps the JSON subtype of a container
-        // (v0.16, `json`; `json::Op::EachValue`, which reads the
-        // `type` column too).
+        // A `json_each` key / value / atom / json column decodes
+        // from its call's document when read (the row holds a
+        // handle, `json::TvfDocs`), and a value keeps the JSON
+        // subtype of a container (v0.16, `json`;
+        // `json::Op::EachValue`, which reads the `type` column too).
         #[cfg(feature = "json")]
         if self.json_tvf != 0
-            && matches!(ci, 0 | 1 | 3)
+            && matches!(ci, 0 | 1 | 3 | 8)
             && let RExpr::Column(slot, ..) = r
         {
             let base = slot.saturating_sub(ci);
@@ -723,6 +721,8 @@ impl SourceDesc {
             a.push(r);
             let op = if ci == 0 {
                 crate::json::Op::EachKey
+            } else if ci == 8 {
+                crate::json::Op::EachJson
             } else {
                 a.push(RExpr::Column(
                     base + 2,
@@ -885,6 +885,14 @@ pub struct SubSource {
     /// shifts, aggregates, subqueries) sees them.
     #[cfg(feature = "json")]
     pub tvf: u8,
+    /// A lateral JSON table-valued source's (v0.16, `json`): the
+    /// slots of the sources before it that nothing but its
+    /// arguments reads, as distances back from its own first slot
+    /// (so a plan shifted whole keeps them). The join clears them
+    /// once the call has run, so the rows it makes do not each
+    /// carry a copy of the document (`FROM t, json_each(t.j)`).
+    #[cfg(feature = "json")]
+    pub tvf_dead: AVec<usize>,
     /// The source's index access path (v0.16, `expr_index`): the
     /// rows an index or the rowid B-tree finds, in its order; `None`
     /// scans the table in rowid order.
@@ -3565,6 +3573,43 @@ pub fn has_sub(e: &RExpr) -> bool {
     }
 }
 
+/// Whether `e` holds a current-scope subquery that is correlated
+/// (v0.16 review fix: the pin tests a WHERE term holding one after
+/// the others, its `TERM_VARSELECT`).
+pub fn has_corr_sub(e: &RExpr) -> bool {
+    let f = has_corr_sub;
+    match e {
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => !p.uncorrelated,
+        RExpr::InSub(x, p, _) => !p.uncorrelated || f(x),
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::Raise(_) => false,
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => f(a),
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_ref().is_some_and(|b| f(b))
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_ref().is_some_and(|o| f(o))
+        }
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) | RExpr::Agg { args, .. } => {
+            args.iter().any(f)
+        }
+    }
+}
+
 /// Collect the current-scope subquery nodes of `e` in
 /// substitution traversal order (v0.6): children before the
 /// node itself where a node has current-scope children (only
@@ -3794,13 +3839,99 @@ fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool
 
 /// `values` is consumed in `collect_subs` order; the caller
 /// guarantees the counts match.
+/// A scalar subquery node `e`'s value `v` as a literal. A compound
+/// subquery's text keeps the JSON subtype when every arm's result
+/// carries it or is never text (v0.16 review fix, `json`; probed:
+/// `json_array((SELECT json('[1]') UNION ALL SELECT 2))` is
+/// `[[1]]`, and so for UNION / EXCEPT, not INTERSECT; a plain
+/// subquery drops it).
+fn sub_literal(e: &RExpr, v: &OwnedValue) -> RExpr {
+    #[cfg(feature = "json")]
+    if let (RExpr::SubScalar(p), OwnedValue::Text(_)) = (e, v)
+        && compound_keeps_json(p)
+    {
+        let mut a = AVec::new();
+        a.push(RExpr::Literal(v.clone()));
+        return RExpr::Scalar(
+            ScalarFn::Json(crate::json::JsonFn {
+                op: crate::json::Op::Subtyped,
+                blob: false,
+            }),
+            a,
+        );
+    }
+    let _ = e;
+    RExpr::Literal(v.clone())
+}
+
+/// `sub_literal`'s test: `p` is a compound without INTERSECT whose
+/// arms' result columns (`scalar_col`) are each a JSON text result
+/// (a JSON function or aggregate that always is) or never text (a
+/// numeric or NULL literal, a `jsonb` result), at least one the
+/// former. An arm whose column might be plain text leaves the
+/// value without the subtype (hipp does not track which arm a row
+/// came from).
+#[cfg(feature = "json")]
+fn compound_keeps_json(p: &SubPlan) -> bool {
+    if p.compound.is_empty()
+        || p.compound
+            .iter()
+            .any(|(op, _)| *op == crate::sql::CompoundOp::Intersect)
+    {
+        return false;
+    }
+    // Some(true): JSON text; Some(false): never text; None: either.
+    fn class(e: &RExpr) -> Option<bool> {
+        match e {
+            RExpr::Scalar(ScalarFn::Json(f), _) if f.always_json() => Some(true),
+            RExpr::Scalar(ScalarFn::Json(f), _) if f.blob => Some(false),
+            RExpr::Agg {
+                kind: AggKind::Json(a),
+                ..
+            } => Some(!a.blob),
+            RExpr::Literal(OwnedValue::Integer(_) | OwnedValue::Real(_) | OwnedValue::Null)
+            | RExpr::AffLiteral(
+                OwnedValue::Integer(_) | OwnedValue::Real(_) | OwnedValue::Null,
+                ..,
+            ) => Some(false),
+            _ => None,
+        }
+    }
+    let col = p.scalar_col;
+    let mut json = false;
+    let arms = core::iter::once(p).chain(p.compound.iter().map(|(_, t)| &**t));
+    for arm in arms {
+        let mut cells: AVec<&RExpr> = AVec::new();
+        if arm.values.is_empty()
+            && let Some(c) = arm.items.as_slice().get(col)
+        {
+            cells.push(c);
+        }
+        for r in arm.values.iter() {
+            if let Some(c) = r.as_slice().get(col) {
+                cells.push(c);
+            }
+        }
+        if cells.is_empty() {
+            return false;
+        }
+        for c in cells.iter() {
+            match class(c) {
+                Some(j) => json |= j,
+                None => return false,
+            }
+        }
+    }
+    json
+}
+
 pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
     match e {
         RExpr::SubScalar(_) | RExpr::SubExists(_) => {
             let v = match &values[*pos] {
                 SubValue::One(v, aff) => match aff {
                     Some(a) => RExpr::AffLiteral(v.clone(), Some(*a), None),
-                    None => RExpr::Literal(v.clone()),
+                    None => sub_literal(e, v),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
                 SubValue::Fail(k) => RExpr::Raise(*k),
@@ -4116,7 +4247,7 @@ pub fn substitute_group(
             let v = match &values[*pos] {
                 SubValue::One(v, aff) => match aff {
                     Some(a) => RExpr::AffLiteral(v.clone(), Some(*a), None),
-                    None => RExpr::Literal(v.clone()),
+                    None => sub_literal(e, v),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
                 SubValue::Fail(k) => RExpr::Raise(*k),
@@ -4540,6 +4671,14 @@ pub struct Env {
     /// `triggers`; `Connection::raise_message`).
     #[cfg(feature = "triggers")]
     pub raise_msg: core::cell::RefCell<AVec<u8>>,
+    /// The documents of the `json_each` / `json_tree` calls the
+    /// running statement has made (v0.16, `json`): their rows hold
+    /// handles into these, decoded when a column is read, so a row
+    /// costs its own few bytes, not the document
+    /// (`json::TvfDocs`). `Statement::step` drops the ones it added
+    /// when it returns.
+    #[cfg(feature = "json")]
+    pub json_docs: crate::json::TvfDocs,
 }
 
 impl Env {
@@ -4562,6 +4701,8 @@ impl Env {
             case_like: core::cell::Cell::new(false),
             #[cfg(feature = "triggers")]
             raise_msg: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "json")]
+            json_docs: core::cell::RefCell::new(AVec::new()),
         }
     }
 
@@ -5057,7 +5198,7 @@ pub fn is_constant(e: &RExpr) -> bool {
 /// An integer literal's truth (`None` for any other expression).
 /// An AND over a false one is false too, an OR over a true one true
 /// (the pin's simplified operator is such a literal again).
-fn int_lit(e: &RExpr) -> Option<bool> {
+pub(crate) fn int_lit(e: &RExpr) -> Option<bool> {
     match e {
         RExpr::Literal(OwnedValue::Integer(i)) => Some(*i != 0),
         RExpr::Binary(BinOp::And, a, b)
@@ -5675,7 +5816,7 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
         ScalarFn::Iif => {
             let mut i = 0usize;
             while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
-                match cond_case::<E>(c, ctx) {
+                match cond::<E>(c, ctx) {
                     Err(e) => return Some(Err(e)),
                     Ok(true) => return Some(eval::<E>(t, ctx)),
                     Ok(false) => {}
@@ -6049,6 +6190,11 @@ fn eval_json_call<E>(
     for a in args {
         vs.push(eval_json_arg::<E>(a, ctx)?);
     }
+    // A `json_each` column reads its call's document.
+    if f.op.is_each_column() {
+        return crate::json::each_column(f, vs.as_slice(), ctx.env.map(|e| &e.json_docs))
+            .map_err(|kind| Error::Schema { kind });
+    }
     crate::json::eval(f, vs.as_slice()).map_err(|kind| Error::Schema { kind })
 }
 
@@ -6092,7 +6238,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             let args = args.as_slice();
             let mut i = 0usize;
             while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
-                if cond_case::<E>(c, ctx)? {
+                if cond::<E>(c, ctx)? {
                     return eval_json_arg::<E>(t, ctx);
                 }
                 i += 2;
@@ -6169,7 +6315,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
                 }
                 None => {
                     for (w, t) in whens.iter() {
-                        if cond_case::<E>(w, ctx)? {
+                        if cond::<E>(w, ctx)? {
                             return eval_json_arg::<E>(t, ctx);
                         }
                     }
@@ -6214,7 +6360,7 @@ fn eval_agg<E>(e: &RExpr, rows: &[RowData], ctx: &Ctx<'_>) -> Result<OwnedValue,
     let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
     for r in rows {
         let rc = ctx.as_row(r);
-        if let Some(vs) = agg_row::<E>(&p, &mut |x| eval::<E>(x, &rc))? {
+        if let Some(vs) = agg_row::<E>(&p, &rc)? {
             arg_rows.push(vs);
         }
     }
@@ -6524,7 +6670,7 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
             None => {
                 for (w, t) in whens.iter() {
-                    if cond_case::<E>(w, ctx)? {
+                    if cond::<E>(w, ctx)? {
                         out = eval::<E>(t, ctx)?;
                         done = true;
                         break;
@@ -6541,55 +6687,185 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
 
 /// Whether condition `e` holds (v0.16 fix, ungated): its value is
 /// true, computed as the pin's jump code computes a WHERE / ON /
-/// FILTER term or a CASE WHEN / iif condition (`sqlite3ExprIfTrue`)
-/// — AND stops at an operand that is not true, OR at one that is,
-/// and the other operand is never evaluated (so its errors never
+/// FILTER term or a CASE WHEN / iif condition (`sqlite3ExprIfTrue`
+/// / `sqlite3ExprIfFalse`) — AND stops at an operand that is not
+/// true, OR at one that is, NOT asks its operand whether it is
+/// false (so `NOT (a AND b)` stops at a false `a`), and an operand
+/// the answer no longer needs is never evaluated (its errors never
 /// surface). The same answer as `truthy(eval(e)) == Some(true)`
-/// whenever both operands evaluate. An integer-literal operand
+/// whenever every operand evaluates. An integer-literal operand
 /// keeps `eval`'s simplification (`x AND 0` evaluates nothing).
 ///
-/// A WHERE / ON / FILTER term (`factored`) also evaluates a skipped
-/// operand that is a constant: the pin computes constant terms once
-/// before its loop, so their errors surface whatever the other
-/// operand says (`WHERE x = 1 AND abs(-9223372036854775808) > 0`
-/// fails); a CASE WHEN / iif condition factors nothing.
+/// A WHERE clause's constant terms are computed once before its
+/// rows, as the pin does (`constant_terms_hold`), not here.
 pub fn cond<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
-    cond_in::<E>(e, ctx, true)
+    cond_is::<E>(e, ctx, true)
 }
 
-/// `cond` for a CASE WHEN / iif condition.
-fn cond_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
-    cond_in::<E>(e, ctx, false)
+/// Whether condition `e` is false (NULL is not), with `cond`'s
+/// early stops: a CHECK constraint fails exactly when it is (the
+/// pin's `sqlite3ExprIfTrue(.., SQLITE_JUMPIFNULL)`).
+pub fn cond_false<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
+    cond_is::<E>(e, ctx, false)
 }
 
-fn cond_in<E>(e: &RExpr, ctx: &Ctx<'_>, factored: bool) -> Result<bool, E> {
+/// Whether `e` is `want` (true or false; NULL is neither).
+pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
     match e {
         RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r)
             if int_lit(l).is_none() && int_lit(r).is_none() =>
         {
-            let a = cond_in::<E>(l, ctx, factored)?;
-            if a == (*op == BinOp::Or) {
-                if factored {
-                    skipped_constants::<E>(r, ctx)?;
-                }
+            // AND is false, OR true, as soon as one operand is.
+            let decisive = (*op == BinOp::Or) == want;
+            let a = cond_is::<E>(l, ctx, want)?;
+            if a == decisive {
                 return Ok(a);
             }
-            cond_in::<E>(r, ctx, factored)
+            cond_is::<E>(r, ctx, want)
         }
-        _ => Ok(truthy(&eval::<E>(e, ctx)?) == Some(true)),
+        RExpr::Not(x) => cond_is::<E>(x, ctx, !want),
+        _ => Ok(truthy(&eval::<E>(e, ctx)?) == Some(want)),
     }
 }
 
-/// The constant terms of an AND / OR operand `cond` skips, computed
-/// for their errors (see `cond`).
-fn skipped_constants<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(), E> {
-    match e {
-        RExpr::Binary(BinOp::And | BinOp::Or, l, r) => {
-            skipped_constants::<E>(l, ctx)?;
-            skipped_constants::<E>(r, ctx)
+/// Whether the constant terms of WHERE clause `filter` (its
+/// top-level AND terms that read no column, no subquery and
+/// nothing non-deterministic) hold, computed in order before any
+/// row is read and stopping at the first that does not — the pin
+/// codes them ahead of its loop (`sqlite3WhereBegin`), so their
+/// errors surface even over no rows (v0.16 review fix, ungated).
+/// False: the clause rejects every row. An UPDATE / DELETE asks
+/// this; a SELECT core asks `join_constants_hold`.
+pub fn constant_terms_hold<E>(filter: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
+    let mut terms: AVec<&RExpr> = AVec::new();
+    and_terms(filter, &mut terms);
+    for t in terms.iter() {
+        if factorable(t) && !cond::<E>(t, ctx)? {
+            return Ok(false);
         }
-        _ if factorable(e) => eval::<E>(e, ctx).map(|_| ()),
-        _ => Ok(()),
+    }
+    Ok(true)
+}
+
+/// A constant-propagation binding (`join_constants_hold`): the
+/// column slot, the index of the term defining it, the literal with
+/// the column's affinity applied, the column's affinity and
+/// collation.
+type ConstBind = (usize, usize, OwnedValue, Affinity, Option<Coll>);
+
+/// `constant_terms_hold` for a SELECT core: the WHERE clause
+/// `filter`, then the ON clause of each inner-joined source (the
+/// pin moves those into WHERE; an outer join's ON is tested per
+/// row), after the pin's constant propagation (`propagateConstants`):
+/// a term `column = literal` (BINARY, the literal of no affinity;
+/// the last such term of a column, the pin scanning right to left)
+/// stands the literal, with the column's affinity, in for that
+/// column in the other terms — as a comparison operand only when
+/// the column has BLOB affinity — so `WHERE x = 1 AND (x = 2 OR
+/// json('[') IS NULL)` computes its second term up front as well.
+pub fn join_constants_hold<E>(
+    filter: Option<&RExpr>,
+    sources: &[SubSource],
+    ctx: &Ctx<'_>,
+) -> Result<bool, E> {
+    let mut terms: AVec<&RExpr> = AVec::new();
+    if let Some(f) = filter {
+        and_terms(f, &mut terms);
+    }
+    let right_join = sources.iter().any(|s| s.kind.pads_left());
+    for s in sources {
+        if let Some(on) = &s.on
+            && !s.kind.pads_left()
+            && !s.kind.pads_right()
+        {
+            and_terms(on, &mut terms);
+        }
+    }
+    let mut binds: AVec<ConstBind> = AVec::new();
+    if terms.len() > 1 && !right_join {
+        for (i, t) in terms.iter().enumerate().rev() {
+            let RExpr::Binary(BinOp::Eq, l, r) = t else {
+                continue;
+            };
+            for (c, v) in [(&**r, &**l), (&**l, &**r)] {
+                if let (RExpr::Column(slot, aff, coll), RExpr::Literal(lit)) = (c, v)
+                    && coll.unwrap_or_default() == Coll::Binary
+                    && !binds.iter().any(|b| b.0 == *slot)
+                {
+                    binds.push((
+                        *slot,
+                        i,
+                        crate::record::apply_affinity(lit.clone(), *aff),
+                        *aff,
+                        *coll,
+                    ));
+                }
+            }
+        }
+    }
+    for (i, t) in terms.iter().enumerate() {
+        let t2;
+        let t: &RExpr = if binds.is_empty() {
+            t
+        } else {
+            t2 = propagate(t, binds.as_slice(), i, false);
+            &t2
+        };
+        if factorable(t) && !cond::<E>(t, ctx)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `join_constants_hold`'s rewrite of term `i` (`binds`): a bound
+/// column becomes its literal, unless the term defines it; a BLOB
+/// affinity column only as an operand of `=`, `<`, `<=`, `>`, `>=`
+/// or IS (`operand`), the right one only when the left one is not
+/// of TEXT affinity (the pin's `propagateConstantExprRewrite`).
+/// Other node kinds are left as they are: one still reading a
+/// column is no constant term (a narrower rewrite than the pin's).
+fn propagate(e: &RExpr, binds: &[ConstBind], i: usize, operand: bool) -> RExpr {
+    let p = |x: &RExpr, o: bool| Box::new(propagate(x, binds, i, o));
+    match e {
+        RExpr::Column(slot, ..) => match binds.iter().find(|b| b.0 == *slot) {
+            Some((_, def, v, aff, coll)) if *def != i && (operand || *aff != Affinity::Blob) => {
+                RExpr::AffLiteral(v.clone(), Some(*aff), *coll)
+            }
+            _ => e.clone(),
+        },
+        RExpr::Binary(
+            op @ (BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Is),
+            l,
+            r,
+        ) => {
+            let text = matches!(&**l, RExpr::Column(_, Affinity::Text, _));
+            RExpr::Binary(*op, p(l, true), p(r, !text))
+        }
+        RExpr::Binary(op, l, r) => RExpr::Binary(*op, p(l, false), p(r, false)),
+        RExpr::Not(x) => RExpr::Not(p(x, false)),
+        RExpr::Neg(x) => RExpr::Neg(p(x, false)),
+        RExpr::IsNull(x, n) => RExpr::IsNull(p(x, false), *n),
+        RExpr::Cast(x, a) => RExpr::Cast(p(x, false), *a),
+        RExpr::Scalar(f, args) => {
+            let mut out = AVec::new();
+            for a in args.iter() {
+                out.push(propagate(a, binds, i, false));
+            }
+            RExpr::Scalar(*f, out)
+        }
+        _ => e.clone(),
+    }
+}
+
+/// The top-level AND terms of `e`, in order.
+pub fn and_terms<'e>(e: &'e RExpr, out: &mut AVec<&'e RExpr>) {
+    match e {
+        RExpr::Binary(BinOp::And, l, r) => {
+            and_terms(l, out);
+            and_terms(r, out);
+        }
+        _ => out.push(e),
     }
 }
 

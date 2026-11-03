@@ -1615,6 +1615,8 @@ impl<S: Storage> Connection<S> {
             rec: id,
             #[cfg(feature = "json")]
             tvf: 0,
+            #[cfg(feature = "json")]
+            tvf_dead: AVec::new(),
             #[cfg(feature = "expr_index")]
             access: None,
         });
