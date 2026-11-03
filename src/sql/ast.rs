@@ -394,6 +394,25 @@ pub struct CteUse {
     /// CTE's or FROM subquery's after: `SELECT rowid FROM t` names
     /// its column after t's INTEGER PRIMARY KEY only in a view).
     pub view: bool,
+    /// The shared materialization this source reads (v0.16 review
+    /// fix; 0: none, the derived table is computed for this
+    /// reference alone). Every source with the same non-zero id
+    /// reads one result, computed once per statement execution —
+    /// the pin's reuse of a materialized CTE (and of a view that
+    /// a FROM clause names twice); see `session::cte`.
+    pub mat: u32,
+}
+
+/// A CTE's `MATERIALIZED` / `NOT MATERIALIZED` hint (v0.16, `v16`).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum M10d {
+    /// No hint.
+    Any,
+    /// `AS MATERIALIZED`: computed once, never flattened.
+    Yes,
+    /// `AS NOT MATERIALIZED`.
+    No,
 }
 
 /// A source's part in a recursive CTE (v0.16, `v16`).
@@ -423,8 +442,9 @@ pub struct With {
 }
 
 /// One common table expression, `name [(col, ...)] AS [[NOT]
-/// MATERIALIZED] (select)` (v0.16, `v16`). The MATERIALIZED hints
-/// are accepted and ignored: they change no result.
+/// MATERIALIZED] (select)` (v0.16, `v16`). The hint decides, with
+/// the number of references, whether the references share one
+/// materialization (see `session::cte`).
 #[cfg(feature = "v16")]
 #[derive(Debug, Clone)]
 pub struct Cte {
@@ -432,6 +452,8 @@ pub struct Cte {
     /// The column-name list, empty when none was written.
     pub columns: AVec<ABytes>,
     pub select: SelectStmt,
+    /// The `[NOT] MATERIALIZED` hint.
+    pub hint: M10d,
 }
 
 /// A compound SELECT operator (v0.9). All four operators have

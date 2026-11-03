@@ -37,11 +37,17 @@
 
 use super::*;
 use crate::arena::ABytes;
-use crate::sql::{CompoundOp, Cte, CteUse, FromSource, RecMark, UpsertAction, With};
+use crate::sql::{
+    CompoundOp, Cte, CteUse, FromSource, JoinKind, M10d, RecMark, UpsertAction, With,
+};
 
-/// How deep views and CTE bodies may nest inside one another
-/// before the expansion gives up (`ParseKind::RecursionLimit`).
-const MAX_EXPANSION_DEPTH: usize = 64;
+/// How many SELECTs the expansion of one statement may copy out of
+/// view and CTE bodies before a CTE reference is refused (the pin's
+/// "VIEWs and/or subqueries nested too deep", `NestedTooDeep`:
+/// probed, a chain of 999 CTEs reads and 1000 do not; the copies of
+/// views read before count as well). It also bounds the work of a
+/// CTE whose references double at each level.
+const MAX_COPIES: usize = 1000;
 
 /// What a reference to a CTE means while that CTE's own body is
 /// being expanded.
@@ -59,6 +65,29 @@ enum Busy {
 struct Frame {
     ctes: AVec<Cte>,
     busy: AVec<Busy>,
+    /// Each CTE's materialization id (`CteUse::mat`).
+    ids: AVec<u32>,
+}
+
+/// The SELECT a FROM source is read by, as the pin's query
+/// flattener sees it (`flattenSubquery`'s restrictions on the
+/// outer query; see `Expander::flattens`).
+#[derive(Debug, Clone, Copy, Default)]
+struct Outer {
+    /// How many sources its FROM clause has.
+    nsrc: usize,
+    filter: bool,
+    limit: bool,
+    order: bool,
+    /// Aggregate (an aggregate call, GROUP BY or HAVING).
+    agg: bool,
+    group: bool,
+    distinct: bool,
+    /// A member of a compound SELECT.
+    compound: bool,
+    /// Its result list calls a function or holds a subquery (the
+    /// pin's `SF_ComplexResult`).
+    complex: bool,
 }
 
 /// The expansion walk (see the module docs).
@@ -75,7 +104,30 @@ struct Expander<'c> {
     views: AVec<AVec<u8>>,
     /// The next recursive-CTE id (`RecMark`); 0 is never used.
     next_id: u32,
-    depth: usize,
+    /// Materialization ids (`CteUse::mat`, index + 1): each CTE's
+    /// hint and how many references expanded it, or a group of
+    /// one view's references sharing one materialization.
+    mats: AVec<(M10d, u32)>,
+    /// How deep view and CTE bodies nest at this point.
+    nest: usize,
+    /// `Config::max_nesting`.
+    max_nest: usize,
+    /// SELECTs copied out of view and CTE bodies so far.
+    copies: usize,
+    /// The second walk: every expanded source's materialization
+    /// id is settled, nothing is expanded.
+    fixing: bool,
+    /// The SELECT about to be walked is a scalar or EXISTS
+    /// subquery, which the pin gives a LIMIT of its own before
+    /// flattening.
+    sub_limit: bool,
+    /// Walking a RETURNING clause: the pin runs it as a trigger
+    /// program after each row's change, where every FROM subquery
+    /// (view, CTE) is materialized once for the whole statement
+    /// (probed: `RETURNING (SELECT group_concat(x) FROM (SELECT b x
+    /// FROM t))` repeats the first row's value while `(SELECT
+    /// group_concat(b) FROM t)` follows the update).
+    returning: bool,
 }
 
 fn schema_err<E>(kind: SchemaKind) -> Error<E> {
@@ -83,12 +135,8 @@ fn schema_err<E>(kind: SchemaKind) -> Error<E> {
 }
 
 impl<S: Storage> Connection<S> {
-    /// Expand every view and CTE reference in `ast` into a derived
-    /// table (v0.16, `v16`; see the module docs). `None` when the
-    /// statement holds nothing to expand (it plans as written).
-    /// INSERT into a view is refused here (`IsView`).
-    pub(super) fn expand_ast(&self, arena: &Arena, ast: &Ast) -> Result<Option<Ast>, S::Error> {
-        let mut x = Expander {
+    fn expander<'c>(&'c self, arena: &'c Arena) -> Expander<'c> {
+        Expander {
             catalog: &self.catalog,
             ca: &self.catalog_arena,
             arena,
@@ -96,8 +144,22 @@ impl<S: Storage> Connection<S> {
             vis: AVec::new(),
             views: AVec::new(),
             next_id: 1,
-            depth: 0,
-        };
+            mats: AVec::new(),
+            nest: 0,
+            max_nest: self.cfg.max_nesting,
+            copies: 0,
+            fixing: false,
+            sub_limit: false,
+            returning: false,
+        }
+    }
+
+    /// Expand every view and CTE reference in `ast` into a derived
+    /// table (v0.16, `v16`; see the module docs). `None` when the
+    /// statement holds nothing to expand (it plans as written).
+    /// INSERT into a view is refused here (`IsView`).
+    pub(super) fn expand_ast(&self, arena: &Arena, ast: &Ast) -> Result<Option<Ast>, S::Error> {
+        let mut x = self.expander(arena);
         match ast {
             Ast::Select(_)
             | Ast::Insert { .. }
@@ -108,6 +170,8 @@ impl<S: Storage> Connection<S> {
                 as_select: Some(_), ..
             } => {
                 let mut out = ast.clone();
+                x.ast::<S::Error>(&mut out)?;
+                x.fixing = true;
                 x.ast::<S::Error>(&mut out)?;
                 Ok(Some(out))
             }
@@ -124,20 +188,11 @@ impl<S: Storage> Connection<S> {
         arena: &Arena,
         v: &crate::schema::ViewDef,
     ) -> Result<(SelectStmt, AVec<ABytes>), S::Error> {
-        let mut x = Expander {
-            catalog: &self.catalog,
-            ca: &self.catalog_arena,
-            arena,
-            frames: AVec::new(),
-            vis: AVec::new(),
-            views: AVec::new(),
-            next_id: 1,
-            depth: 0,
-        };
+        let mut x = self.expander(arena);
         let mut f = FromSource {
             table: arena.alloc_copy_handle(handle_bytes(&self.catalog_arena, v.name))?,
             alias: None,
-            kind: crate::sql::JoinKind::Inner,
+            kind: JoinKind::Inner,
             on: None,
             derived: None,
             natural: false,
@@ -149,7 +204,11 @@ impl<S: Storage> Connection<S> {
         x.view::<S::Error>(&mut f, v)?;
         let cols = f.cte.map(|c| c.columns).unwrap_or_default();
         match f.derived {
-            Some(d) => Ok((*d, cols)),
+            Some(mut d) => {
+                x.fixing = true;
+                x.select::<S::Error>(&mut d)?;
+                Ok((*d, cols))
+            }
             None => Err(Error::Unsupported),
         }
     }
@@ -240,7 +299,7 @@ impl Expander<'_> {
                         }
                     }
                 }
-                self.items::<E>(returning.as_mut_slice())?;
+                self.returning_items::<E>(returning.as_mut_slice())?;
             }
             Ast::Update {
                 assignments,
@@ -252,11 +311,17 @@ impl Expander<'_> {
                 for (_, e) in assignments.as_mut_slice() {
                     self.expr::<E>(e)?;
                 }
-                self.sources::<E>(from.as_mut_slice())?;
+                // UPDATE ... FROM joins the target to the sources.
+                let o = Outer {
+                    nsrc: from.len() + 1,
+                    filter: filter.is_some(),
+                    ..Outer::default()
+                };
+                self.sources::<E>(from.as_mut_slice(), &o)?;
                 if let Some(f) = filter {
                     self.expr::<E>(f)?;
                 }
-                self.items::<E>(returning.as_mut_slice())?;
+                self.returning_items::<E>(returning.as_mut_slice())?;
             }
             Ast::Delete {
                 filter, returning, ..
@@ -264,7 +329,7 @@ impl Expander<'_> {
                 if let Some(f) = filter {
                     self.expr::<E>(f)?;
                 }
-                self.items::<E>(returning.as_mut_slice())?;
+                self.returning_items::<E>(returning.as_mut_slice())?;
             }
             Ast::CreateTable {
                 as_select: Some(s), ..
@@ -299,11 +364,13 @@ impl Expander<'_> {
             }
         }
         let mut busy = AVec::new();
-        for _ in ctes.iter() {
+        let mut ids = AVec::new();
+        for c in ctes.iter() {
             busy.push(Busy::Free);
+            ids.push(self.new_mat(c.hint, 0));
         }
         self.vis.push(self.frames.len());
-        self.frames.push(Frame { ctes, busy });
+        self.frames.push(Frame { ctes, busy, ids });
         Ok(())
     }
 
@@ -312,19 +379,24 @@ impl Expander<'_> {
         self.frames.pop();
     }
 
+    /// A fresh materialization id.
+    fn new_mat(&mut self, hint: M10d, uses: u32) -> u32 {
+        self.mats.push((hint, uses));
+        u32::try_from(self.mats.len()).unwrap_or(0)
+    }
+
+    /// Enter one more nested view or CTE body (`Config::
+    /// max_nesting`; the pin's "VIEWs and/or subqueries nested too
+    /// deep" at 1000 nested views).
     fn enter<E>(&mut self) -> Result<(), E> {
-        self.depth += 1;
-        if self.depth > MAX_EXPANSION_DEPTH {
-            return Err(Error::Parse {
-                offset: 0,
-                kind: crate::error::ParseKind::RecursionLimit,
-            });
+        if self.nest + 1 >= self.max_nest.max(1) {
+            return Err(schema_err(SchemaKind::NestedTooDeep));
         }
+        self.nest += 1;
         Ok(())
     }
 
     fn select<E>(&mut self, s: &mut SelectStmt) -> Result<(), E> {
-        self.enter::<E>()?;
         let pushed = match s.with.take() {
             Some(w) => {
                 self.push_frame::<E>(*w)?;
@@ -336,14 +408,25 @@ impl Expander<'_> {
         if pushed {
             self.pop_frame();
         }
-        self.depth -= 1;
         r
     }
 
     fn select_body<E>(&mut self, s: &mut SelectStmt) -> Result<(), E> {
-        self.core::<E>(s)?;
-        for (_, c) in s.compound.as_mut_slice() {
-            self.core::<E>(c)?;
+        let implicit = core::mem::take(&mut self.sub_limit);
+        let n = s.compound.len();
+        let mut head = outer_of(s, n == 0, n > 0, self.arena);
+        head.limit |= implicit && n == 0;
+        self.core::<E>(s, &head)?;
+        let (order, limit) = (!s.order_by.is_empty(), s.limit.is_some() || implicit);
+        for (k, (_, c)) in s.compound.as_mut_slice().iter_mut().enumerate() {
+            let mut o = outer_of(c, false, true, self.arena);
+            // The compound's ORDER BY / LIMIT belong to its last
+            // SELECT, as in the pin's parse tree.
+            if k + 1 == n {
+                o.order = order;
+                o.limit = limit;
+            }
+            self.core::<E>(c, &o)?;
         }
         self.tail::<E>(s)
     }
@@ -363,9 +446,12 @@ impl Expander<'_> {
     }
 
     /// One core's own clauses.
-    fn core<E>(&mut self, s: &mut SelectStmt) -> Result<(), E> {
+    fn core<E>(&mut self, s: &mut SelectStmt, o: &Outer) -> Result<(), E> {
+        if self.fixing {
+            self.share_views(s, o);
+        }
         self.items::<E>(s.items.as_mut_slice())?;
-        self.sources::<E>(s.from.as_mut_slice())?;
+        self.sources::<E>(s.from.as_mut_slice(), o)?;
         if let Some(f) = &mut s.filter {
             self.expr::<E>(f)?;
         }
@@ -383,6 +469,14 @@ impl Expander<'_> {
         Ok(())
     }
 
+    /// A RETURNING clause's items (see `Expander::returning`).
+    fn returning_items<E>(&mut self, items: &mut [SelectItem]) -> Result<(), E> {
+        let was = core::mem::replace(&mut self.returning, true);
+        let r = self.items::<E>(items);
+        self.returning = was;
+        r
+    }
+
     fn items<E>(&mut self, items: &mut [SelectItem]) -> Result<(), E> {
         for it in items {
             if let SelectItem::Expr(e, _, _) = it {
@@ -392,11 +486,16 @@ impl Expander<'_> {
         Ok(())
     }
 
-    fn sources<E>(&mut self, from: &mut [FromSource]) -> Result<(), E> {
-        for f in from.iter_mut() {
-            self.source::<E>(f)?;
-            if let Some(on) = &mut f.on {
-                self.expr::<E>(on)?;
+    fn sources<E>(&mut self, from: &mut [FromSource], o: &Outer) -> Result<(), E> {
+        let n = from.len();
+        for i in 0..n {
+            // The next source's join (the pin's co-routine test).
+            let next = from.get(i + 1).map(|f| f.kind);
+            if let Some(f) = from.get_mut(i) {
+                self.source::<E>(f, o, i, next)?;
+                if let Some(on) = &mut f.on {
+                    self.expr::<E>(on)?;
+                }
             }
         }
         Ok(())
@@ -418,9 +517,48 @@ impl Expander<'_> {
         None
     }
 
-    fn source<E>(&mut self, f: &mut FromSource) -> Result<(), E> {
+    fn source<E>(
+        &mut self,
+        f: &mut FromSource,
+        o: &Outer,
+        idx: usize,
+        next: Option<JoinKind>,
+    ) -> Result<(), E> {
+        if self.fixing {
+            if let Some(c) = &mut f.cte
+                && c.mat != 0
+            {
+                // A CTE's references share its materialization
+                // when it is MATERIALIZED, or has no hint and was
+                // read more than once (the pin's `CteUse`).
+                let (hint, uses) = self
+                    .mats
+                    .as_slice()
+                    .get((c.mat as usize).wrapping_sub(1))
+                    .copied()
+                    .unwrap_or((M10d::No, 0));
+                if !(hint == M10d::Yes || (hint == M10d::Any && uses >= 2)) {
+                    c.mat = 0;
+                }
+            }
+            if let Some(d) = &mut f.derived {
+                return self.select::<E>(d);
+            }
+            return Ok(());
+        }
         if let Some(d) = &mut f.derived {
-            return self.select::<E>(d);
+            self.select::<E>(d)?;
+            // Under RETURNING, a FROM subquery is computed once for
+            // the statement.
+            if self.returning && f.cte.is_none() {
+                f.cte = Some(Box::new(CteUse {
+                    columns: AVec::new(),
+                    rec: RecMark::None,
+                    view: false,
+                    mat: self.new_mat(M10d::Yes, 1),
+                }));
+            }
+            return Ok(());
         }
         if let Some(args) = &mut f.args {
             for e in args.as_mut_slice() {
@@ -436,16 +574,126 @@ impl Expander<'_> {
         if !f.qualified
             && let Some((fi, ci)) = self.find_cte(name.as_slice())
         {
-            return self.cte::<E>(f, fi, ci);
+            self.cte::<E>(f, fi, ci)?;
+            // A reference the pin flattens into its reader is
+            // computed for that reader alone.
+            // A MATERIALIZED or recursive CTE never is.
+            let flat = match (&f.derived, &f.cte) {
+                (Some(d), Some(c)) => {
+                    let hint = self
+                        .mats
+                        .as_slice()
+                        .get((c.mat as usize).wrapping_sub(1))
+                        .map_or(M10d::Any, |m| m.0);
+                    hint != M10d::Yes
+                        && matches!(c.rec, RecMark::None)
+                        && flattens(d, o, f.kind, idx, next, self.arena)
+                }
+                _ => true,
+            };
+            if let Some(c) = &mut f.cte {
+                if flat && !self.returning {
+                    c.mat = 0;
+                } else if self.returning
+                    && let Some(m) = self
+                        .mats
+                        .as_mut_slice()
+                        .get_mut((c.mat as usize).wrapping_sub(1))
+                    && m.0 != M10d::Yes
+                {
+                    // Materialized once under RETURNING (see above).
+                    m.0 = M10d::Yes;
+                }
+            }
+            return Ok(());
         }
         if self.catalog.find(self.ca, name.as_slice()).is_some() {
             return Ok(());
         }
         let catalog = self.catalog;
         if let Some(v) = catalog.find_view(self.ca, name.as_slice()) {
-            return self.view::<E>(f, v);
+            self.view::<E>(f, v)?;
+            // A candidate for sharing with a same-named view of
+            // this FROM clause (`share_views`), unless flattened.
+            if let (Some(d), Some(c)) = (&f.derived, &mut f.cte)
+                && (self.returning || !flattens(d, o, f.kind, idx, next, self.arena))
+            {
+                c.mat = if self.returning {
+                    self.new_mat(M10d::Yes, 1)
+                } else {
+                    u32::MAX
+                };
+            }
         }
         Ok(())
+    }
+
+    /// The pin reuses one materialization for a view that a FROM
+    /// clause names twice (`isSelfJoinView`), unless one of the two
+    /// was flattened or had a WHERE term pushed into it. A FROM
+    /// subquery, view or CTE that the pin flattens into its reader
+    /// brings its own sources into the reader's FROM clause, so
+    /// those take part too. Gives each group of such views one
+    /// materialization id (the second walk, top-down: the groups
+    /// are settled before the bodies are walked).
+    fn share_views(&mut self, s: &mut SelectStmt, o: &Outer) {
+        let mut groups: AVec<(AVec<u8>, u32, u32)> = AVec::new();
+        self.share_in(s, o, &mut groups);
+        if groups.iter().any(|g| g.2 < 2) {
+            let mut lone = AVec::new();
+            for g in groups.iter().filter(|g| g.2 < 2) {
+                lone.push(g.1);
+            }
+            unshare(s, lone.as_slice());
+        }
+    }
+
+    fn share_in(&mut self, s: &mut SelectStmt, o: &Outer, groups: &mut AVec<(AVec<u8>, u32, u32)>) {
+        let n = s.from.len();
+        for i in 0..n {
+            let pushed = pushed_down(s, i, self.arena);
+            let next = s.from.as_slice().get(i + 1).map(|f| f.kind);
+            let arena = self.arena;
+            let Some(f) = s.from.as_mut_slice().get_mut(i) else {
+                break;
+            };
+            let kind = f.kind;
+            match f.cte.as_mut() {
+                Some(c) if c.view && c.mat == u32::MAX => {
+                    if pushed {
+                        c.mat = 0;
+                        continue;
+                    }
+                    let name = handle_bytes(arena, f.table);
+                    let id = match groups
+                        .as_mut_slice()
+                        .iter_mut()
+                        .find(|g| eq_ci(g.0.as_slice(), name))
+                    {
+                        Some(g) => {
+                            g.2 = g.2.saturating_add(1);
+                            g.1
+                        }
+                        None => {
+                            let id = self.new_mat(M10d::Yes, 2);
+                            groups.push((copy_vec(name), id, 1));
+                            id
+                        }
+                    };
+                    c.mat = id;
+                }
+                Some(c) if c.mat != 0 || !matches!(c.rec, RecMark::None) => {}
+                _ => {
+                    if let Some(d) = f.derived.as_deref_mut()
+                        && d.compound.is_empty()
+                        && flattens(d, o, kind, i, next, arena)
+                    {
+                        let inner = outer_of(d, true, false, arena);
+                        self.share_in(d, &inner, groups);
+                    }
+                }
+            }
+        }
     }
 
     /// Rewrite `f` into the derived table of view `v`.
@@ -454,20 +702,25 @@ impl Expander<'_> {
         if self.views.iter().any(|n| eq_ci(n.as_slice(), name)) {
             return Err(schema_err(SchemaKind::CircularView));
         }
-        let Ast::CreateView {
+        self.enter::<E>()?;
+        let parsed = crate::sql::parse::<E>(handle_bytes(self.ca, v.sql), self.arena);
+        let Ok(Ast::CreateView {
             columns,
             mut select,
             ..
-        } = crate::sql::parse::<E>(handle_bytes(self.ca, v.sql), self.arena)?
+        }) = parsed
         else {
-            return Err(Error::Unsupported);
+            self.nest -= 1;
+            return Err(parsed.err().unwrap_or(Error::Unsupported));
         };
+        self.copies = self.copies.saturating_add(count_selects(&select));
         // A view's body sees no CTE of the query that reads it.
         let vis = core::mem::take(&mut self.vis);
         self.views.push(copy_vec(name));
         let r = self.select::<E>(&mut select);
         self.views.pop();
         self.vis = vis;
+        self.nest -= 1;
         r?;
         if f.alias.is_none() {
             f.alias = Some(f.table);
@@ -477,6 +730,7 @@ impl Expander<'_> {
             columns: columns.unwrap_or_default(),
             rec: RecMark::None,
             view: true,
+            mat: 0,
         }));
         Ok(())
     }
@@ -484,7 +738,7 @@ impl Expander<'_> {
     /// Rewrite `f` into the derived table of CTE `ci` of frame
     /// `fi` (the pin's `withExpand`; see the module docs).
     fn cte<E>(&mut self, f: &mut FromSource, fi: usize, ci: usize) -> Result<(), E> {
-        let (cte, busy) = {
+        let (cte, busy, mat) = {
             let frame = self
                 .frames
                 .as_slice()
@@ -496,12 +750,24 @@ impl Expander<'_> {
                 .get(ci)
                 .ok_or(schema_err::<E>(SchemaKind::UnknownTable))?;
             let busy = frame.busy.as_slice().get(ci).copied().unwrap_or(Busy::Free);
-            (cte.clone(), busy)
+            let mat = frame.ids.as_slice().get(ci).copied().unwrap_or(0);
+            (cte.clone(), busy, mat)
         };
         match busy {
             Busy::Free => {}
             Busy::Circular => return Err(schema_err(SchemaKind::CircularReference)),
             Busy::MultiRec => return Err(schema_err(SchemaKind::RecursiveReferences)),
+        }
+        self.copies = self.copies.saturating_add(count_selects(&cte.select));
+        if self.copies >= MAX_COPIES {
+            return Err(schema_err(SchemaKind::NestedTooDeep));
+        }
+        if let Some(m) = self
+            .mats
+            .as_mut_slice()
+            .get_mut((mat as usize).wrapping_sub(1))
+        {
+            m.1 = m.1.saturating_add(1);
         }
         let name = copy_vec(handle_bytes(self.arena, cte.name));
         let mut body = cte.select;
@@ -515,7 +781,11 @@ impl Expander<'_> {
             self.vis = v;
         }
         let id = self.next_id;
-        let r = self.cte_body::<E>(&mut body, name.as_slice(), fi, ci, id);
+        let r = self.enter::<E>().and_then(|()| {
+            let r = self.cte_body::<E>(&mut body, name.as_slice(), fi, ci, id);
+            self.nest -= 1;
+            r
+        });
         self.set_busy(fi, ci, Busy::Free);
         self.vis = saved;
         let split = r?;
@@ -533,6 +803,7 @@ impl Expander<'_> {
                 None => RecMark::None,
             },
             view: false,
+            mat,
         }));
         Ok(())
     }
@@ -558,7 +829,6 @@ impl Expander<'_> {
         ci: usize,
         id: u32,
     ) -> Result<Option<usize>, E> {
-        self.enter::<E>()?;
         // Mark the recursive references: walk from the rightmost
         // core leftwards while the operator matches the rightmost
         // one and the core names the CTE in its FROM clause.
@@ -580,7 +850,6 @@ impl Expander<'_> {
                     .filter(|s| is_ref(s, name, self.arena))
                     .count();
                 if refs > 1 {
-                    self.depth -= 1;
                     return Err(schema_err(SchemaKind::RecursiveReferences));
                 }
                 if refs == 0 {
@@ -592,6 +861,7 @@ impl Expander<'_> {
                             columns: AVec::new(),
                             rec: RecMark::Ref { id },
                             view: false,
+                            mat: 0,
                         }));
                     }
                 }
@@ -599,30 +869,12 @@ impl Expander<'_> {
             }
         }
         self.set_busy(fi, ci, Busy::Circular);
-        let r = if split < ncores {
-            self.rec_body::<E>(body, split, fi, ci)
+        if split < ncores {
+            self.rec_body::<E>(body, split, fi, ci)?;
         } else {
-            self.select_body_with::<E>(body)
-        };
-        self.depth -= 1;
-        r?;
-        Ok((split < ncores).then_some(split))
-    }
-
-    /// `select_body` with the statement's own WITH clause entered.
-    fn select_body_with<E>(&mut self, s: &mut SelectStmt) -> Result<(), E> {
-        let pushed = match s.with.take() {
-            Some(w) => {
-                self.push_frame::<E>(*w)?;
-                true
-            }
-            None => false,
-        };
-        let r = self.select_body::<E>(s);
-        if pushed {
-            self.pop_frame();
+            self.select::<E>(body)?;
         }
-        r
+        Ok((split < ncores).then_some(split))
     }
 
     /// A recursive CTE's body: the setup cores with the CTE
@@ -643,12 +895,15 @@ impl Expander<'_> {
             None => false,
         };
         let r = (|| {
-            self.core::<E>(body)?;
+            let n = body.compound.len();
+            let head = outer_of(body, false, true, self.arena);
+            self.core::<E>(body, &head)?;
             for (k, (_, c)) in body.compound.as_mut_slice().iter_mut().enumerate() {
                 if k + 1 == split {
                     self.set_busy(fi, ci, Busy::MultiRec);
                 }
-                self.core::<E>(c)?;
+                let o = outer_of(c, false, n > 0, self.arena);
+                self.core::<E>(c, &o)?;
             }
             self.set_busy(fi, ci, Busy::MultiRec);
             self.tail::<E>(body)
@@ -691,7 +946,10 @@ impl Expander<'_> {
                 self.expr::<E>(a)?;
                 self.select::<E>(s)?;
             }
-            Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) => self.select::<E>(s)?,
+            Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) => {
+                self.sub_limit = true;
+                self.select::<E>(s)?;
+            }
             Expr::Between(a, c, d, _) => {
                 self.expr::<E>(a)?;
                 self.expr::<E>(c)?;
@@ -729,6 +987,274 @@ impl Expander<'_> {
         }
         Ok(())
     }
+}
+
+/// Clear the materialization ids in `lone` (view groups of one)
+/// from the FROM sources of `s` and of its derived tables.
+fn unshare(s: &mut SelectStmt, lone: &[u32]) {
+    for f in s.from.as_mut_slice() {
+        if let Some(c) = f.cte.as_mut()
+            && lone.contains(&c.mat)
+        {
+            c.mat = 0;
+        }
+        if let Some(d) = f.derived.as_deref_mut() {
+            unshare(d, lone);
+        }
+    }
+}
+
+/// The flattener's view of core `s` as the reader of its FROM
+/// sources; `tail` says whether the statement's ORDER BY / LIMIT
+/// are this core's.
+fn outer_of(s: &SelectStmt, tail: bool, compound: bool, arena: &Arena) -> Outer {
+    Outer {
+        nsrc: s.from.len(),
+        filter: s.filter.is_some(),
+        limit: tail && s.limit.is_some(),
+        order: tail && !s.order_by.is_empty(),
+        agg: core_is_agg(s, arena),
+        group: !s.group_by.is_empty(),
+        distinct: s.distinct,
+        compound,
+        complex: s.items.iter().any(|it| match it {
+            SelectItem::Expr(e, ..) => crate::rules::expr_any(e, &mut |x| {
+                matches!(
+                    x,
+                    Expr::Func { .. }
+                        | Expr::ScalarSubquery(_)
+                        | Expr::ExistsSubquery(_)
+                        | Expr::InSubquery(..)
+                )
+            }),
+            _ => false,
+        }),
+    }
+}
+
+/// Whether a core aggregates: GROUP BY, HAVING, or an aggregate
+/// call (outside subqueries) in its result list or ORDER BY.
+fn core_is_agg(s: &SelectStmt, arena: &Arena) -> bool {
+    const AGGS: [&[u8]; 12] = [
+        b"count",
+        b"sum",
+        b"avg",
+        b"total",
+        b"min",
+        b"max",
+        b"group_concat",
+        b"string_agg",
+        b"median",
+        b"percentile",
+        b"percentile_cont",
+        b"percentile_disc",
+    ];
+    let is_agg = |e: &Expr| {
+        crate::rules::expr_any(e, &mut |x| match x {
+            Expr::Func { name, args, .. } => {
+                let n = handle_bytes(arena, *name);
+                AGGS.iter().any(|a| eq_ci(n, a))
+                    && !((eq_ci(n, b"min") || eq_ci(n, b"max")) && args.len() > 1)
+            }
+            _ => false,
+        })
+    };
+    !s.group_by.is_empty()
+        || s.having.is_some()
+        || s.items.iter().any(|it| match it {
+            SelectItem::Expr(e, ..) => is_agg(e),
+            _ => false,
+        })
+        || s.order_by.iter().any(|(e, _)| is_agg(e))
+}
+
+/// Whether the pin's query flattener merges FROM source `idx` of a
+/// reader shaped `o` — whose own join is `kind`, the next source's
+/// `next` — with body `d` into the reader (`flattenSubquery` and
+/// its caller's restrictions, the ones that hold before planning).
+/// A flattened view or CTE is computed afresh for its reader; one
+/// that is not may share a materialization. The pin's further
+/// restrictions on what flattening the body would merge (its
+/// column affinities across a compound, nested flattening) are not
+/// modelled.
+fn flattens(
+    d: &SelectStmt,
+    o: &Outer,
+    kind: JoinKind,
+    idx: usize,
+    next: Option<JoinKind>,
+    arena: &Arena,
+) -> bool {
+    let outer_rhs = matches!(kind, JoinKind::Left | JoinKind::Full);
+    if matches!(kind, JoinKind::Right) {
+        return false;
+    }
+    let lim = d.limit.is_some();
+    if lim && (o.nsrc > 1 || o.agg || o.limit || o.compound || o.filter || o.distinct) {
+        return false;
+    }
+    if d.offset.is_some() {
+        return false;
+    }
+    // A FROM subquery's ORDER BY that orders nothing is dropped
+    // first; one that stays blocks flattening under an ordered or
+    // aggregate reader, or a first source read as a co-routine by
+    // a reader with a complex result.
+    let order = !d.order_by.is_empty() && (lim || !(o.order || o.nsrc > 1));
+    if order
+        && (o.order
+            || o.agg
+            || (idx == 0
+                && o.complex
+                && (o.nsrc == 1
+                    || matches!(
+                        next,
+                        Some(JoinKind::Left | JoinKind::Full | JoinKind::Cross)
+                    ))))
+    {
+        return false;
+    }
+    let plain = |c: &SelectStmt| {
+        c.values.is_empty() && !c.from.is_empty() && !c.distinct && !core_is_agg(c, arena)
+    };
+    if !d.compound.is_empty() {
+        return !lim
+            && !order
+            && !o.agg
+            && !o.distinct
+            && !outer_rhs
+            && plain(d)
+            && d.compound
+                .iter()
+                .all(|(op, c)| *op == CompoundOp::UnionAll && plain(c));
+    }
+    if !plain(d) {
+        return false;
+    }
+    if outer_rhs && (d.from.len() > 1 || o.group) {
+        return false;
+    }
+    if idx > 0
+        && d.from
+            .iter()
+            .any(|f| matches!(f.kind, JoinKind::Right | JoinKind::Full))
+    {
+        return false;
+    }
+    true
+}
+
+/// Whether the pin pushes a WHERE term of core `s` down into its
+/// FROM source `idx` (`pushDownWhereTerms`): a term of the WHERE
+/// clause (or of an inner join's ON) that reads only that source's
+/// columns, by its name, with no subquery — into a body without a
+/// LIMIT.
+fn pushed_down(s: &SelectStmt, idx: usize, arena: &Arena) -> bool {
+    let Some(f) = s.from.as_slice().get(idx) else {
+        return false;
+    };
+    if f.derived.as_ref().is_some_and(|d| d.limit.is_some()) {
+        return false;
+    }
+    let q = handle_bytes(arena, f.alias.unwrap_or(f.table));
+    let only_this = |e: &Expr| {
+        let mut cols = 0usize;
+        let other = crate::rules::expr_any(e, &mut |x| match x {
+            Expr::Column { table, .. } => match table {
+                Some(t) if eq_ci(handle_bytes(arena, *t), q) => {
+                    cols += 1;
+                    false
+                }
+                _ => true,
+            },
+            Expr::ScalarSubquery(_) | Expr::ExistsSubquery(_) | Expr::InSubquery(..) => true,
+            _ => false,
+        });
+        !other && cols > 0
+    };
+    let mut terms: AVec<&Expr> = AVec::new();
+    if let Some(w) = &s.filter {
+        conjuncts(w, &mut terms);
+    }
+    for g in s.from.iter() {
+        if matches!(g.kind, JoinKind::Inner | JoinKind::Cross)
+            && let Some(on) = &g.on
+        {
+            conjuncts(on, &mut terms);
+        }
+    }
+    terms.iter().any(|t| only_this(t))
+}
+
+/// The AND-separated terms of `e`.
+fn conjuncts<'e>(e: &'e Expr, out: &mut AVec<&'e Expr>) {
+    match e {
+        Expr::Binary(crate::sql::BinOp::And, a, b) => {
+            conjuncts(a, out);
+            conjuncts(b, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// How many SELECTs `s` holds: its cores, and those of its derived
+/// tables, subqueries and WITH clause.
+fn count_selects(s: &SelectStmt) -> usize {
+    let mut n = 0usize;
+    count_into(s, &mut n);
+    n
+}
+
+fn count_into(s: &SelectStmt, n: &mut usize) {
+    count_core(s, n);
+    for (_, c) in s.compound.iter() {
+        count_core(c, n);
+    }
+    for (e, _) in s.order_by.iter() {
+        count_expr(e, n);
+    }
+    if let Some(w) = &s.with {
+        for c in w.ctes.iter() {
+            count_into(&c.select, n);
+        }
+    }
+}
+
+fn count_core(s: &SelectStmt, n: &mut usize) {
+    *n = n.saturating_add(1);
+    for it in s.items.iter() {
+        if let SelectItem::Expr(e, ..) = it {
+            count_expr(e, n);
+        }
+    }
+    for f in s.from.iter() {
+        if let Some(d) = &f.derived {
+            count_into(d, n);
+        }
+        if let Some(on) = &f.on {
+            count_expr(on, n);
+        }
+    }
+    for e in s
+        .filter
+        .iter()
+        .chain(s.having.iter())
+        .chain(s.group_by.iter())
+    {
+        count_expr(e, n);
+    }
+}
+
+fn count_expr(e: &Expr, n: &mut usize) {
+    crate::rules::expr_any(e, &mut |x| {
+        match x {
+            Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) | Expr::InSubquery(_, s, _) => {
+                count_into(s, n)
+            }
+            _ => {}
+        }
+        false
+    });
 }
 
 /// Whether FROM source `s` is a direct (recursive) reference to
@@ -1047,6 +1573,37 @@ impl RecQueue<'_> {
 }
 
 impl<S: Storage> Statement<'_, S> {
+    /// The rows of a derived table that shares a materialization
+    /// (v0.16 review fix, `v16`; `SubPlan::mat`): computed by the
+    /// first reader of this execution, then served to every other.
+    /// A recursive CTE is computed only as far as a bounded reader
+    /// needs (`need`), and again when a later reader needs more.
+    pub(super) async fn shared_rows(
+        &mut self,
+        d: &crate::query::SubPlan,
+        outer: &RowData,
+        need: Option<usize>,
+    ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
+        for (id, rows, complete) in self.mats.iter() {
+            if *id == d.mat && (*complete || need.is_some_and(|n| rows.len() >= n)) {
+                return Ok(rows.clone());
+            }
+        }
+        let ask = if d.rec.is_some() { need } else { None };
+        let rows = self.exec_subplan_need(d, outer, ask).await?;
+        let complete = ask.is_none_or(|n| rows.len() < n);
+        match self
+            .mats
+            .as_mut_slice()
+            .iter_mut()
+            .find(|(id, ..)| *id == d.mat)
+        {
+            Some(slot) => *slot = (d.mat, rows.clone(), complete),
+            None => self.mats.push((d.mat, rows.clone(), complete)),
+        }
+        Ok(rows)
+    }
+
     /// Run a recursive CTE (v0.16, `v16`; the pin's
     /// `generateWithRecursiveQuery`): LIMIT / OFFSET evaluate
     /// first (a LIMIT of 0 runs nothing), the setup's rows enter

@@ -990,3 +990,471 @@ fn view_and_cte_column_naming() {
         refuse(&format!("nme{i}"), &format!("{t} {s}"), SchemaKind::UnknownColumn);
     }
 }
+
+// ---------------- review fixes ----------------
+
+/// Regression: every reference to a CTE pasted a fresh copy of its
+/// body, so a body calling random() gave each reference its own
+/// rows. The pin materializes a CTE once and shares it when it is
+/// MATERIALIZED, or has no hint and is read more than once without
+/// being flattened (no FROM clause, an aggregate, DISTINCT, a LIMIT
+/// under a join or a bounded reader, a recursive CTE); a view named
+/// twice in one FROM clause shares one materialization too
+/// (`isSelfJoinView`), and a flattened reference is computed for
+/// its reader alone. Each case prints only equalities and counts,
+/// which are the same on every run.
+#[test]
+fn shared_materializations() {
+    let t = "CREATE TABLE t(a); INSERT INTO t VALUES (1), (2), (3); \
+             CREATE TABLE u(b); INSERT INTO u VALUES (5), (6);";
+    for (i, s) in [
+        // The review's cases.
+        "WITH c AS (SELECT abs(random()) % 100000 r) SELECT count(*) FROM c WHERE r IN (SELECT r FROM c)",
+        "WITH c AS MATERIALIZED (SELECT random() r) SELECT a.r = b.r FROM c a, c b",
+        "WITH c AS MATERIALIZED (SELECT random() r) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a)) FROM t",
+        "WITH RECURSIVE c(x) AS (SELECT abs(random()) % 1000 UNION ALL SELECT x FROM c LIMIT 2) SELECT a.x = b.x FROM c a, c b LIMIT 1",
+        "CREATE VIEW v AS SELECT random() r; SELECT a.r = b.r FROM v a, v b",
+        // CTEs read more than once and not flattened share.
+        "WITH c AS (SELECT random() r) SELECT (SELECT r FROM c) = (SELECT r FROM c)",
+        "WITH c AS (SELECT random() r) SELECT r = (SELECT r FROM c) FROM c",
+        "WITH c AS (SELECT random() r) SELECT count(*) FROM c x, c y, c z WHERE x.r = y.r AND y.r = z.r",
+        "WITH c AS (SELECT random() r), d AS (SELECT r FROM c) SELECT (SELECT r FROM d) = (SELECT r FROM d)",
+        "WITH c AS (SELECT random() r FROM t LIMIT 1) SELECT (SELECT r FROM c LIMIT 1) = (SELECT r FROM c LIMIT 1)",
+        "WITH c AS (SELECT random() r FROM t LIMIT 1) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a LIMIT 1)), (SELECT r FROM c) = (SELECT r FROM c) FROM t",
+        "WITH c AS (SELECT random() r) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a)), (SELECT r FROM c) = (SELECT r FROM c) FROM t",
+        "WITH c AS (SELECT random() r) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a)) FROM t, c",
+        "WITH c AS MATERIALIZED (SELECT a, random() r FROM t) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH c AS MATERIALIZED (SELECT a, random() r FROM t) SELECT count(*) FROM c x WHERE x.r IN (SELECT r FROM c)",
+        "WITH c AS (SELECT a, random() r FROM t ORDER BY 1 LIMIT 10) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH c AS (SELECT count(*), random() r FROM t) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH c AS (SELECT random() r FROM t UNION ALL SELECT 5) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH c AS (SELECT DISTINCT a, random() r FROM t) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH c AS (SELECT a, random() r FROM t GROUP BY a) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH RECURSIVE c(x) AS (SELECT abs(random()) % 1000 UNION ALL SELECT x FROM c LIMIT 2) SELECT (SELECT x FROM c) = (SELECT x FROM c)",
+        "WITH RECURSIVE c(x) AS MATERIALIZED (SELECT abs(random()) % 1000 UNION ALL SELECT x FROM c LIMIT 2) SELECT count(DISTINCT (SELECT x FROM c WHERE t.a = t.a)) FROM t",
+        // A flattened, single, or NOT MATERIALIZED reference is
+        // computed for its reader.
+        "WITH c AS (SELECT a, random() r FROM t) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH c AS (SELECT a, random() r FROM t) SELECT count(*) FROM c x WHERE x.r IN (SELECT r FROM c)",
+        "WITH c AS (SELECT a, random() r FROM t) SELECT count(*) FROM c x, c y WHERE x.r = y.r AND x.a > 1",
+        "WITH c AS (SELECT a, random() r FROM t UNION ALL SELECT a, random() FROM t) SELECT count(*) FROM c x, c y WHERE x.r = y.r",
+        "WITH c AS NOT MATERIALIZED (SELECT random() r) SELECT (SELECT r FROM c) = (SELECT r FROM c)",
+        "WITH c AS NOT MATERIALIZED (SELECT random() r FROM t LIMIT 1) SELECT (SELECT r FROM c LIMIT 1) = (SELECT r FROM c LIMIT 1)",
+        "WITH c AS (SELECT random() r FROM t LIMIT 1) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a LIMIT 1)) FROM t",
+        "WITH c AS (SELECT random() r) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a)) FROM t",
+        "WITH c AS (SELECT random() r UNION ALL SELECT 2) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a)) FROM t",
+        "WITH RECURSIVE c(x) AS (SELECT abs(random()) % 1000 UNION ALL SELECT x FROM c LIMIT 2) SELECT count(DISTINCT (SELECT x FROM c WHERE t.a = t.a)) FROM t",
+        // Views: the same view twice in one FROM clause (or brought
+        // there by a flattened view), unless flattened or a WHERE
+        // term is pushed into one.
+        "CREATE VIEW v AS SELECT random() r; SELECT count(*) FROM u, v a, v b WHERE a.r = b.r",
+        "CREATE VIEW v AS SELECT random() r; SELECT count(*) FROM v a, u, v b WHERE a.r = b.r",
+        "CREATE VIEW v AS SELECT random() r; SELECT count(*) FROM v a, v b, v c WHERE a.r = b.r AND b.r = c.r",
+        "CREATE VIEW v AS SELECT random() r; CREATE VIEW w AS SELECT * FROM v; SELECT count(*) FROM w a, w b WHERE a.r = b.r",
+        "CREATE VIEW v AS SELECT random() r; SELECT count(*) FROM v a, v b WHERE a.r = b.r AND a.r > 0",
+        "CREATE VIEW v AS SELECT random() r; SELECT (SELECT r FROM v) = (SELECT r FROM v)",
+        "CREATE VIEW w AS SELECT a, random() r FROM t; SELECT count(*) FROM w a, w b WHERE a.r = b.r",
+        "SELECT count(*) FROM (SELECT random() r) a, (SELECT random() r) b WHERE a.r = b.r",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(same(&format!("mat{i}"), &format!("{t} {s}")).is_none(), "{s}");
+    }
+}
+
+/// Regression: an endless recursive CTE read through a WHERE, a
+/// join, a scalar subquery or EXISTS never ended (its rows grew
+/// without bound); the pin reads such a first source as a
+/// co-routine and stops at the reader's bound.
+#[test]
+fn endless_recursive_cte_stops_at_the_reader() {
+    let c = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c)";
+    for (i, s) in [
+        "SELECT x FROM c WHERE x > 5 LIMIT 2",
+        "SELECT x FROM c WHERE x > 5 LIMIT 2 OFFSET 3",
+        "SELECT x FROM c WHERE x % 2 = 0 LIMIT 2 OFFSET 1",
+        "SELECT (SELECT x FROM c LIMIT 1 OFFSET 5)",
+        "SELECT (SELECT x FROM c WHERE x > 3)",
+        "SELECT EXISTS (SELECT x FROM c WHERE x > 3)",
+        "SELECT * FROM c, (SELECT 1) LIMIT 2",
+        "SELECT * FROM c LEFT JOIN (SELECT 2 y) ON x = y LIMIT 3",
+        "SELECT x + 1 FROM (SELECT x FROM c WHERE x > 3) LIMIT 2",
+        "SELECT x FROM (SELECT x FROM c) WHERE x > 40 LIMIT 3",
+        "SELECT x FROM c WHERE x IN (7, 9, 11) LIMIT 3",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            same(&format!("endless{i}"), &format!("{c} {s}")).is_none(),
+            "{s}"
+        );
+    }
+    // A finite CTE read the same ways reads it whole.
+    let f = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10)";
+    for (i, s) in [
+        "SELECT x FROM c WHERE x > 5 LIMIT 20",
+        "SELECT x FROM c WHERE x > 50 LIMIT 2",
+        "SELECT (SELECT x FROM c WHERE x > 30)",
+        "SELECT EXISTS (SELECT x FROM c WHERE x > 30)",
+        "SELECT * FROM c, (SELECT 1 y) LIMIT 5 OFFSET 7",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            same(&format!("finite{i}"), &format!("{f} {s}")).is_none(),
+            "{s}"
+        );
+    }
+}
+
+/// Run `f` on a thread with room for deeply nested views.
+fn deep<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(f)
+        .expect("thread")
+        .join()
+        .expect("join")
+}
+
+/// A script through hipp with the pin's nesting limit (and an arena
+/// to expand it in), compared to the oracle.
+fn same_deep(tag: &str, script: String, cfg: Config) -> Option<SchemaKind> {
+    let h = common::temp_db(&format!("v16vcd-{tag}-h"));
+    let o = common::temp_db(&format!("v16vcd-{tag}-o"));
+    let (ook, ol) = oracle_script(&o, &script);
+    let s2 = script.clone();
+    let (hok, hl, he) = deep(move || {
+        block_on(async {
+            let mut db = Connection::open(FileStorage::open(&h).expect("fs"), cfg)
+                .await
+                .expect("open");
+            let mut lines = Vec::new();
+            for stmt in split(&s2) {
+                let mut q = match db.prepare(&stmt).await {
+                    Ok(q) => q,
+                    Err(e) => return (false, lines, Some(format!("{e:?}"))),
+                };
+                loop {
+                    match q.step().await {
+                        Ok(Step::Row) => {
+                            let mut l = String::new();
+                            render(&q, &mut l);
+                            lines.push(l);
+                        }
+                        Ok(Step::Done) => break,
+                        Err(e) => return (false, lines, Some(format!("{e:?}"))),
+                    }
+                }
+            }
+            (true, lines, None)
+        })
+    });
+    assert_eq!(hl, ol, "{tag}: hipp error {he:?}");
+    assert_eq!(hok, ook, "{tag}: hipp error {he:?}");
+    he.map(|e| {
+        if e.contains("NestedTooDeep") {
+            SchemaKind::NestedTooDeep
+        } else {
+            panic!("{tag}: {e}")
+        }
+    })
+}
+
+fn view_chain(n: usize) -> String {
+    let mut s = String::from(
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1); CREATE VIEW v0 AS SELECT a FROM t;",
+    );
+    for i in 1..n {
+        s.push_str(&format!(
+            " CREATE VIEW v{i} AS SELECT a + 1 AS a FROM v{};",
+            i - 1
+        ));
+    }
+    s.push_str(&format!(" SELECT * FROM v{};", n - 1));
+    s
+}
+
+fn cte_chain(n: usize, sub: bool) -> String {
+    let mut s = String::from("WITH c0 AS (SELECT 1 x)");
+    for i in 1..n {
+        if sub {
+            s.push_str(&format!(
+                ", c{i} AS (SELECT x + 1 x FROM (SELECT x FROM c{}))",
+                i - 1
+            ));
+        } else {
+            s.push_str(&format!(", c{i} AS (SELECT x + 1 x FROM c{})", i - 1));
+        }
+    }
+    s.push_str(&format!(" SELECT * FROM c{}", n - 1));
+    s
+}
+
+/// Regression: views or CTEs nested 63 deep were refused
+/// (`RecursionLimit`); the pin reads 999 nested views or CTEs and
+/// refuses 1000 ("VIEWs and/or subqueries nested too deep"), and
+/// refuses a statement whose CTE references copy 1000 SELECTs (so
+/// a CTE whose references double at each level fails fast instead
+/// of growing exponentially). hipp's limit is
+/// `Config::max_nesting` (default 250, for an 8 MiB stack).
+#[test]
+fn nesting_limits() {
+    let pin = || {
+        Config::default()
+            .max_nesting(1000)
+            .statement_arena(16 * 1024, 8 * 1024 * 1024)
+    };
+    for n in [63, 70, 300, 999] {
+        assert_eq!(same_deep(&format!("vc{n}"), view_chain(n), pin()), None);
+        assert_eq!(
+            same_deep(&format!("cc{n}"), cte_chain(n, false), pin()),
+            None
+        );
+    }
+    assert_eq!(same_deep("cc500s", cte_chain(500, true), pin()), None);
+    for (tag, s) in [
+        ("vc1000", view_chain(1000)),
+        ("cc1000", cte_chain(1000, false)),
+        ("cc501s", cte_chain(501, true)),
+    ] {
+        assert_eq!(same_deep(tag, s, pin()), Some(SchemaKind::NestedTooDeep));
+    }
+    // CTE references copied side by side count too, views read
+    // before a CTE included.
+    let side = |n: usize, lead: &str| {
+        let mut s = format!(
+            "CREATE VIEW v AS SELECT 1 x; WITH c AS (SELECT 1 x) SELECT count(*) FROM (SELECT {lead}"
+        );
+        for i in 0..n {
+            s.push_str(&format!("(SELECT x FROM c) a{i}, "));
+        }
+        s.push_str("1 z)");
+        s
+    };
+    assert_eq!(same_deep("side900", side(900, ""), pin()), None);
+    assert_eq!(
+        same_deep("side1100", side(1100, ""), pin()),
+        Some(SchemaKind::NestedTooDeep)
+    );
+    let views_first = {
+        let mut s = String::from(
+            "CREATE VIEW v AS SELECT 1 x; WITH c AS (SELECT 1 x) SELECT count(*) FROM (SELECT ",
+        );
+        for i in 0..1100 {
+            s.push_str(&format!("(SELECT x FROM v) a{i}, "));
+        }
+        s.push_str("(SELECT x FROM c) z)");
+        s
+    };
+    assert_eq!(
+        same_deep("vfirst", views_first, pin()),
+        Some(SchemaKind::NestedTooDeep)
+    );
+    for k in [9, 15, 30] {
+        let mut s = String::from("WITH c0 AS (SELECT 1 x)");
+        for i in 1..=k {
+            s.push_str(&format!(
+                ", c{i} AS (SELECT a.x + b.x x FROM c{} a, c{} b)",
+                i - 1,
+                i - 1
+            ));
+        }
+        s.push_str(&format!(" SELECT * FROM c{k}"));
+        assert_eq!(
+            same_deep(&format!("exp{k}"), s, pin()),
+            Some(SchemaKind::NestedTooDeep)
+        );
+    }
+    // FROM subqueries nest freely (the expansion's old cap counted
+    // them too).
+    let mut d = String::from("SELECT * FROM ");
+    for _ in 0..150 {
+        d.push_str("(SELECT * FROM ");
+    }
+    d.push_str("(SELECT 1)");
+    for _ in 0..150 {
+        d.push(')');
+    }
+    assert_eq!(same_deep("derived150", d, pin()), None);
+    // The default limit refuses cleanly.
+    let h = common::temp_db("v16vcd-default");
+    let r = deep(move || {
+        block_on(async {
+            let mut db = Connection::open(FileStorage::open(&h).expect("fs"), Config::default())
+                .await
+                .expect("open");
+            for stmt in split(&view_chain(300)) {
+                let mut q = match db.prepare(&stmt).await {
+                    Ok(q) => q,
+                    Err(e) => return Some(format!("{e:?}")),
+                };
+                while let Ok(Step::Row) = q.step().await {}
+            }
+            None
+        })
+    });
+    assert!(r.is_some_and(|e| e.contains("NestedTooDeep")));
+}
+
+/// Regression: CREATE VIEW IF NOT EXISTS over an index's name did
+/// nothing; the pin's "there is already an index named i".
+#[test]
+fn create_view_over_an_index_name() {
+    let t = "CREATE TABLE t(a); CREATE INDEX i ON t(a);";
+    refuse(
+        "cvi0",
+        &format!("{t} CREATE VIEW IF NOT EXISTS i AS SELECT 1"),
+        SchemaKind::DuplicateIndex,
+    );
+    refuse(
+        "cvi1",
+        &format!("{t} CREATE VIEW i AS SELECT 1"),
+        SchemaKind::DuplicateIndex,
+    );
+    assert!(
+        same(
+            "cvi2",
+            &format!("{t} CREATE VIEW IF NOT EXISTS t AS SELECT 1; SELECT 5")
+        )
+        .is_none()
+    );
+    assert!(
+        same(
+            "cvi3",
+            &format!("{t} CREATE VIEW v AS SELECT 1; CREATE VIEW IF NOT EXISTS v AS SELECT 2; SELECT * FROM v")
+        )
+        .is_none()
+    );
+}
+
+/// Regression: a qualified rowid over two sources of that name with
+/// a rowid read the first; the pin's "ambiguous column name".
+#[test]
+fn qualified_rowid_is_ambiguous() {
+    let t =
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1); CREATE TABLE u(b); INSERT INTO u VALUES (2);";
+    for (i, s) in [
+        "SELECT t.rowid FROM t, t",
+        "SELECT t.oid FROM t, t",
+        "SELECT t._rowid_ FROM t AS t, u AS t",
+        "SELECT t.rowid FROM t JOIN t USING (a)",
+        "SELECT rowid FROM t, t",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(
+            &format!("rid{i}"),
+            &format!("{t} {s}"),
+            SchemaKind::AmbiguousColumn,
+        );
+    }
+    for (i, s) in [
+        "SELECT t.rowid FROM t, (SELECT 1 b) t",
+        "SELECT t.rowid FROM (SELECT 1 b) t, t",
+        "SELECT t.rowid FROM t, (SELECT 1 rowid) t",
+        "SELECT t.rowid FROM (SELECT 7 rowid) t, t",
+        "SELECT t.rowid, u.rowid FROM t, u",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            same(&format!("nrid{i}"), &format!("{t} {s}")).is_none(),
+            "{s}"
+        );
+    }
+}
+
+/// Regression (fixed with the PRAGMA unit's review): a quoted
+/// declared type prints dequoted, standard names in their spelling,
+/// for tables and the views over them.
+#[test]
+fn table_info_quoted_type_names() {
+    assert!(
+        same(
+            "qty",
+            "CREATE TABLE t(a \"foo\", b [bar baz], c \"varchar\"(10), d 'text', e \"integer\" PRIMARY KEY, \
+             f \"\", g `x y`, h \"a\"\"b\", i 'int'); PRAGMA table_info(t); \
+             CREATE VIEW v AS SELECT * FROM t; PRAGMA table_info(v)"
+        )
+        .is_none()
+    );
+}
+
+/// Regression: `SELECT *` with no FROM clause — in a view, a CTE, a
+/// FROM subquery or anywhere — gave one row of no columns; the
+/// pin's "no tables specified".
+#[test]
+fn star_without_from() {
+    for (i, s) in [
+        "SELECT *",
+        "SELECT *, 1",
+        "SELECT 1, *",
+        "CREATE VIEW v AS SELECT *; SELECT count(*) FROM v",
+        "CREATE VIEW v AS SELECT *; PRAGMA table_info(v)",
+        "WITH c AS (SELECT *) SELECT * FROM c",
+        "SELECT * FROM (SELECT *)",
+        "SELECT (SELECT *)",
+        "SELECT 1 WHERE EXISTS (SELECT *)",
+        "VALUES (1) UNION SELECT *",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1); SELECT (SELECT *) FROM t",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(&format!("star{i}"), s, SchemaKind::NoTablesSpecified);
+    }
+    assert!(
+        same(
+            "star-ok",
+            "CREATE VIEW v AS SELECT *; SELECT count(*); SELECT 1"
+        )
+        .is_none()
+    );
+}
+
+/// Regression: RETURNING ran a DELETE's subqueries before the row's
+/// delete, and hoisted every uncorrelated subquery across the rows;
+/// the pin evaluates RETURNING after each row's change, afresh, as
+/// a trigger program — where a FROM subquery, view or CTE is
+/// materialized once for the whole statement.
+#[test]
+fn returning_sees_each_change() {
+    let t = "CREATE TABLE t(a PRIMARY KEY, b); INSERT INTO t VALUES (1, 0), (2, 0), (3, 0); \
+             CREATE TABLE u(c); INSERT INTO u VALUES (1);";
+    for (i, s) in [
+        "DELETE FROM t WHERE a >= 2 RETURNING a, (SELECT count(*) FROM t)",
+        "DELETE FROM t RETURNING a, (SELECT count(*) FROM t), (SELECT group_concat(a) FROM t)",
+        "DELETE FROM t WHERE a = 2 RETURNING a, (SELECT count(*) FROM t WHERE a = 2), (SELECT max(a) FROM t)",
+        "DELETE FROM t WHERE a >= 2 RETURNING a, EXISTS (SELECT 1 FROM t WHERE a = 3)",
+        "CREATE VIEW v AS SELECT count(*) n FROM t; DELETE FROM t WHERE a = 2 RETURNING a, (SELECT n FROM v)",
+        "DELETE FROM t WHERE a IN (SELECT a FROM t WHERE a > 1) RETURNING a, (SELECT count(*) FROM t)",
+        "DELETE FROM t WHERE a >= 2 RETURNING a, (SELECT count(*) FROM t) + (SELECT count(*) FROM t)",
+        "UPDATE t SET b = a * 10 RETURNING a, (SELECT sum(b) FROM t)",
+        "UPDATE t SET b = (SELECT count(*) FROM t WHERE b > 0) + 1 RETURNING a, b",
+        "UPDATE t SET b = 1 RETURNING a, (SELECT sum(b) FROM t), (SELECT sum(b) FROM t WHERE a > 0)",
+        "INSERT INTO t VALUES (4, 0), (5, 0) RETURNING a, (SELECT count(*) FROM t)",
+        "INSERT INTO t SELECT a + 10, b FROM t RETURNING a, (SELECT count(*) FROM t)",
+        "INSERT INTO t VALUES (1, 0), (7, 0) ON CONFLICT (a) DO UPDATE SET b = 9 RETURNING a, b, (SELECT sum(b) FROM t)",
+        // FROM subqueries, views and CTEs: once per statement.
+        "DELETE FROM t WHERE a >= 2 RETURNING a, (WITH c AS (SELECT count(*) n FROM t) SELECT x.n + y.n FROM c x, c y)",
+        "DELETE FROM t WHERE a >= 2 RETURNING a, (WITH c AS (SELECT count(*) n FROM t) SELECT x.n FROM c x)",
+        "DELETE FROM t WHERE a >= 2 RETURNING a, (SELECT n FROM (SELECT count(*) n FROM t))",
+        "DELETE FROM t WHERE a >= 2 RETURNING a, (SELECT count(*) FROM (SELECT * FROM t)), (SELECT count(*) FROM t)",
+        "UPDATE t SET b = 1 RETURNING a, (SELECT sum(b) FROM (SELECT b FROM t LIMIT 5))",
+        "UPDATE t SET b = 1 RETURNING a, (SELECT group_concat(x) FROM (SELECT b x FROM t))",
+        "UPDATE t SET b = 1 RETURNING a, (SELECT count(*) FROM u, (SELECT b x FROM t) WHERE x = 1)",
+        "CREATE VIEW v AS SELECT b FROM t; UPDATE t SET b = 1 RETURNING a, (SELECT sum(b) FROM v)",
+        "WITH c AS NOT MATERIALIZED (SELECT b FROM t) UPDATE t SET b = 1 RETURNING a, (SELECT sum(b) FROM c)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(same(&format!("ret{i}"), &format!("{t} {s}")).is_none(), "{s}");
+    }
+}

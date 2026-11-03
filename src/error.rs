@@ -40,6 +40,9 @@ pub enum SchemaKind {
     /// An unqualified column name matches more than one FROM
     /// source (v0.4).
     AmbiguousColumn,
+    /// `SELECT *` with no FROM clause (v0.16 review fix; the pin's
+    /// "no tables specified"). Name a table, or list the columns.
+    NoTablesSpecified,
     /// `ALTER TABLE ... ADD COLUMN` named a column the table
     /// already has (v0.4).
     DuplicateColumn,
@@ -283,6 +286,14 @@ pub enum SchemaKind {
     /// pin's "duplicate WITH table name"). Rename one.
     #[cfg(feature = "v16")]
     DuplicateCteName,
+    /// Views and common table expressions nested deeper than
+    /// `Config::max_nesting` allows, or a statement whose CTE
+    /// references copy 1000 SELECTs or more (v0.16, `v16`; the
+    /// pin's "VIEWs and/or subqueries nested too deep"). Define
+    /// the views or CTEs less deeply, or raise the limit (with
+    /// stack to match).
+    #[cfg(feature = "v16")]
+    NestedTooDeep,
     /// `RELEASE` / `ROLLBACK TO` a name no open savepoint has
     /// (v0.16, `v16`; the pin's "no such savepoint"). Open it with
     /// `SAVEPOINT name` first; savepoints end with the transaction.

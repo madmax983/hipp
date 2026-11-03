@@ -370,11 +370,14 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_kw::<E>(b"AS")?;
-            if self.eat_kw(b"NOT") {
+            let hint = if self.eat_kw(b"NOT") {
                 self.expect_kw::<E>(b"MATERIALIZED")?;
+                crate::sql::ast::M10d::No
+            } else if self.eat_kw(b"MATERIALIZED") {
+                crate::sql::ast::M10d::Yes
             } else {
-                let _ = self.eat_kw(b"MATERIALIZED");
-            }
+                crate::sql::ast::M10d::Any
+            };
             self.expect::<E>(Tok::LParen)?;
             let select = self.select_rich::<E>()?;
             self.expect::<E>(Tok::RParen)?;
@@ -382,6 +385,7 @@ impl<'a> Parser<'a> {
                 name,
                 columns,
                 select,
+                hint,
             });
             if !self.eat(Tok::Comma) {
                 break;

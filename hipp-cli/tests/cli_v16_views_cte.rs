@@ -200,3 +200,54 @@ fn recursive_generated_byte_identical() {
     }
     byte_identical("recgen", &batch);
 }
+
+/// Review fixes, printed by both shells: shared CTE / view
+/// materializations (equalities of random() values, the same on
+/// every run), endless recursive CTEs read through a WHERE, a join
+/// or a scalar subquery, RETURNING after each row's change, and
+/// `SELECT *` with no FROM clause.
+#[test]
+fn review_fixes_byte_identical() {
+    byte_identical(
+        "review",
+        "\
+CREATE TABLE t(a PRIMARY KEY, b);
+INSERT INTO t VALUES (1, 0), (2, 0), (3, 0);
+CREATE VIEW v AS SELECT random() r;
+WITH c AS (SELECT abs(random()) % 100000 r) SELECT count(*) FROM c WHERE r IN (SELECT r FROM c);
+WITH c AS MATERIALIZED (SELECT random() r) SELECT a.r = b.r FROM c a, c b;
+WITH c AS MATERIALIZED (SELECT random() r) SELECT count(DISTINCT (SELECT r FROM c WHERE t.a = t.a)) FROM t;
+WITH RECURSIVE c(x) AS (SELECT abs(random()) % 1000 UNION ALL SELECT x FROM c LIMIT 2) SELECT a.x = b.x FROM c a, c b LIMIT 1;
+SELECT a.r = b.r FROM v a, v b;
+WITH c AS (SELECT a, random() r FROM t) SELECT count(*) FROM c x, c y WHERE x.r = y.r;
+WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c WHERE x > 5 LIMIT 2;
+WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT (SELECT x FROM c WHERE x > 3);
+WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT EXISTS (SELECT 1 FROM c WHERE x > 9);
+WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x * 2 FROM c) SELECT x, y FROM c, (SELECT 'k' y) WHERE x > 100 LIMIT 3;
+DELETE FROM t WHERE a >= 2 RETURNING a, (SELECT count(*) FROM t), (SELECT n FROM (SELECT count(*) n FROM t));
+UPDATE t SET b = 7 RETURNING a, (SELECT sum(b) FROM t);
+SELECT 1;
+SELECT *;
+",
+    );
+}
+
+/// A chain of 999 views reads (the pin's limit; 1000 are "nested
+/// too deep"): the CLI runs the engine with `max_nesting` 1000 on a
+/// thread with the stack for it.
+#[test]
+fn deep_view_chain_byte_identical() {
+    for n in [999usize, 1000] {
+        let mut s = String::from(
+            "CREATE TABLE t(a);\nINSERT INTO t VALUES (1);\nCREATE VIEW v0 AS SELECT a FROM t;\n",
+        );
+        for i in 1..n {
+            s.push_str(&format!(
+                "CREATE VIEW v{i} AS SELECT a + 1 AS a FROM v{};\n",
+                i - 1
+            ));
+        }
+        s.push_str(&format!("SELECT 'start';\nSELECT * FROM v{};\n", n - 1));
+        byte_identical(&format!("deep{n}"), &s);
+    }
+}

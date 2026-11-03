@@ -2667,7 +2667,8 @@ table-valued arity rules, and the generated-column LIKE plumbing.
   CREATE TABLE / VIEW ... AS) and before INSERT / REPLACE /
   UPDATE / DELETE (`Ast::With`, unwrapped by the expansion);
   `DuplicateCteName` (checked used or not), column lists
-  (`ColumnCountMismatch` on use), hints accepted and ignored.
+  (`ColumnCountMismatch` on use), the MATERIALIZED / NOT
+  MATERIALIZED hints (honoured since the review fixes below).
   Bound parameters inside CTE bodies bind (`sql::bind`).
 - *WITH RECURSIVE* (the pin's `withExpand` +
   `generateWithRecursiveQuery`): a CTE that is a UNION / UNION
@@ -2786,13 +2787,13 @@ affinity fixes and the view column naming.
 
 **Honest gaps:**
 
-- An endless recursive CTE stops only at its own LIMIT or a
-  reader that takes a bounded prefix with nothing else in
-  between (`SELECT ... FROM c LIMIT n`); `SELECT x FROM c WHERE
-  x > 5 LIMIT 2` over an endless CTE never ends in hipp, where
-  the pin's coroutine stops. A view or CTE is materialised per
-  reference (and per outer row when correlated); no index helps a
-  WHERE over one.
+- (Updated by the review fixes below.) An endless recursive CTE
+  stops at its own LIMIT or at a bounded reader that reads it as
+  its first source; one read second in a join, or under an
+  ORDER BY / GROUP BY / DISTINCT / aggregate, never ends — as on
+  the pin. A view or CTE that does not share a materialization is
+  computed per reference (and per outer row when correlated); no
+  index helps a WHERE over one.
 - A WHERE comparison over a view / CTE / FROM subquery that is a
   compound of mixed column affinity: hipp uses the demoted
   affinity everywhere; the pin pushes some operators (`>`, `>=`,
@@ -2808,6 +2809,131 @@ affinity fixes and the view column naming.
 - Found outside this unit: hipp's parser accepts keywords as
   bare names in a CREATE VIEW column list (`v(select)`), which
   the pin rejects.
+
+**Review fixes (2026-11-03)** — all behind `v16` except where
+marked; each has a regression test in `tests/views_cte_v16.rs`
+(and `hipp-cli/tests/cli_v16_views_cte.rs` for the rendered ones):
+
+- *Shared materializations* (high): every reference pasted a
+  fresh copy of the CTE body, so a random() body gave each
+  reference its own rows (`WITH c AS (SELECT abs(random()) % 1e5
+  r) SELECT count(*) FROM c WHERE r IN (SELECT r FROM c)` was 0,
+  1 on the pin), and the hints were thrown away. Probed (results
+  and EXPLAIN QUERY PLAN): the pin flattens a reference into its
+  reader when its query flattener can, and otherwise
+  materializes; all references of one CTE that are not flattened
+  share one materialization, computed once per statement (even
+  inside a correlated subquery), when the CTE is MATERIALIZED or
+  has no hint and was expanded twice or more; a single use runs
+  as a co-routine (per execution). A view named twice in one FROM
+  clause — or brought into it by a flattened view — shares one
+  (`isSelfJoinView`) unless flattened or a WHERE / inner-ON term
+  that reads only it is pushed into it. Recursive CTEs are never
+  flattened. The expansion now counts each CTE's references and
+  models the flattener's restrictions that hold before planning
+  (`session::cte::flattens`: no FROM, aggregate, DISTINCT, OFFSET,
+  LIMIT under a join / aggregate / LIMIT / WHERE / DISTINCT /
+  compound reader, ORDER BY under an ordered or aggregate reader
+  or a complex-result first source, compound rules 17a–f, the
+  right side of a LEFT / FULL / RIGHT join; a scalar or EXISTS
+  subquery counts as LIMITed, as the pin adds its LIMIT before
+  flattening). A second walk settles `CteUse::mat`; the planner
+  copies it to `SubPlan::mat` for an uncorrelated plan and the
+  executor serves every reader of one id from
+  `Statement::mats` (cleared per execution; a recursive CTE's
+  entry may hold only a bounded reader's prefix and is extended
+  when a later reader needs more).
+- *RETURNING* (ungated v0.7 fix, low): a DELETE's RETURNING ran
+  before the row's delete (`DELETE ... WHERE a = 2 RETURNING
+  (SELECT count(*) FROM t)` was 3, 2 on the pin), and an
+  uncorrelated subquery was hoisted across the rows (`UPDATE t SET
+  b = a * 10 RETURNING (SELECT sum(b) FROM t)` repeated 10; the
+  pin gives 10, 30, 60). The pin runs RETURNING after each row's
+  change as a trigger program: its subqueries run afresh per row
+  (`eval_returning` sets the hoist cache aside), but every FROM
+  subquery, view or CTE inside it is materialized once for the
+  statement (probed: `RETURNING (SELECT group_concat(x) FROM
+  (SELECT b x FROM t))` repeats the first row's value), which the
+  expansion marks (`Expander::returning`).
+- *Endless recursive CTEs* (medium): `SELECT x FROM c WHERE x > 5
+  LIMIT 2` over an endless CTE ran forever and grew without
+  bound; the pin reads a first FROM source as a co-routine and
+  stops. A query (top level or subquery) whose first source is a
+  recursive CTE (directly or through plain cores) and that has no
+  grouping, aggregate, ORDER BY, DISTINCT or RIGHT / FULL join
+  now reads it with a doubling row bound until its LIMIT is met
+  or the CTE runs out (`streams_first`, `need_bounds`); a scalar
+  or EXISTS subquery reads one row (the pin's implicit LIMIT 1).
+  A CTE shared by two readers is materialized whole, as on the
+  pin (so an endless one never ends on either).
+- *Nesting limits* (medium): the expansion refused views or CTEs
+  nested 63 deep (and FROM subqueries 64 deep, a regression of
+  this unit). Probed: the pin reads 999 nested views or CTEs and
+  refuses 1000 ("VIEWs and/or subqueries nested too deep"); it
+  also refuses a statement once the SELECTs copied by CTE
+  references reach 1000 — side-by-side references and views
+  expanded earlier included (a chain of 500 CTEs whose bodies hold
+  a FROM subquery reads, 501 does not; 1100 `(SELECT x FROM v)`
+  then one CTE reference does not) — so a CTE whose references
+  double per level fails at once instead of growing as 2^n
+  (low finding). hipp: `SchemaKind::NestedTooDeep` for both
+  (`MAX_COPIES` 1000, counted at each CTE reference), and the
+  nesting bound is the new `Config::max_nesting`: hipp's planner
+  recurses per level (~9 KiB of stack in release, ~30 KiB in
+  debug, measured), so the default is 250 (an 8 MiB thread),
+  `Config::tiny()` 16; the CLI sets the pin's 1000, runs on a
+  512 MiB-stack thread and gives the statement arena 4 MiB (999
+  nested views need ~70 KiB of it). FROM subqueries are no longer
+  counted.
+- *CREATE VIEW IF NOT EXISTS over an index's name* (low, v0.4
+  path) did nothing; it is `DuplicateIndex`, as on the pin. Over
+  a table or view of the name it stays a no-op.
+- *`t.rowid` over two sources named `t` with a rowid* (low, v0.4
+  path) read the first; it is `AmbiguousColumn` (a derived `t`
+  without a rowid column does not count; one with a real `rowid`
+  column wins, as on the pin).
+- *Quoted declared types in PRAGMA table_info* (low): already
+  fixed by the PRAGMA unit's review (`shown_type` dequotes as
+  `sqlite3AddColumn` does); a regression test for tables and the
+  views over them was added.
+- *`SELECT *` with no FROM clause* (low, ungated v0.4 path) gave
+  one row of no columns (in a view, CTE, FROM subquery, scalar
+  subquery, compound); it is the pin's "no tables specified",
+  `SchemaKind::NoTablesSpecified`.
+
+**Review-fix gates:** `cargo fmt --all` and the full
+`ci/local-gates.sh` run end with "==> all gates passed". Census
+unchanged (171 MATCH). Size: tiny **76,200 B** (Δ **0**; the
+fixes on tiny-claimed paths compile out of it); full **430,016
+B** (Δ **+5,344 B** vs 424,672, ratchet raised to it): the
+flattener model and materialization ids in the expansion, the
+shared-materialization cache, the bounded first-source loop and
+the RETURNING / rowid / `SELECT *` / CREATE VIEW fixes.
+
+**Review-fix honest gaps:**
+
+- Whether a reference shares a materialization follows a model
+  of the pin's planner. Known differences, all visible only
+  through non-deterministic functions (random(), randomblob()):
+  the pin runs the first of two same-named views as a co-routine
+  when its reader aggregates or reads only some columns (`SELECT
+  count(*) FROM w a, w b` with a LIMIT view: not shared on the
+  pin, shared in hipp); a NOT MATERIALIZED CTE that cannot be
+  flattened is still shared by the pin between references of one
+  FROM clause (hipp: never); the flattener's affinity rule for
+  compounds (17h) and nested flattening beyond views brought into
+  a FROM clause are not modelled; inside RETURNING a view named
+  twice is materialized twice. Results without such functions do
+  not depend on any of this.
+- `MAX_COPIES` counts copied SELECTs; the pin's counter includes
+  something more (998 side-by-side references read on the pin,
+  999 do not; hipp reads 999). A view chain past
+  `Config::max_nesting` is `NestedTooDeep` where the pin (up to
+  999) reads it; raise the limit with the stack to match.
+- The SQL parser itself still recurses per nesting level of
+  parentheses and subqueries, unbounded (pre-existing, outside
+  this unit): about 1000 nested FROM subqueries overflow the
+  CLI's stack in a debug build.
 
 ### Savepoints and maintenance statements (2026-11-02)
 

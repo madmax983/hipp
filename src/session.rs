@@ -99,6 +99,16 @@ pub struct Config {
     /// `storage::write_new_file`.
     #[cfg(feature = "v16")]
     pub vacuum_into: Option<VacuumWriter>,
+    /// How deep view and CTE bodies may nest inside one another
+    /// (v0.16, `v16`): a statement reaching this many levels fails
+    /// with `SchemaKind::NestedTooDeep`. The pin allows 999 nested
+    /// views (1000 is its "nested too deep"). Each level costs
+    /// hipp's planner and executor stack — about 10 KiB in a
+    /// release build, 30 KiB in a debug one — so the default (250)
+    /// suits an 8 MiB thread; raise it to 1000 for the pin's limit
+    /// on a thread with the stack for it (the CLI does).
+    #[cfg(feature = "v16")]
+    pub max_nesting: usize,
 }
 
 /// The `VACUUM INTO` writer's type (v0.16, `v16`; see
@@ -125,6 +135,8 @@ impl Default for Config {
             vacuum_into: Some(crate::storage::write_new_file),
             #[cfg(all(feature = "v16", not(feature = "std")))]
             vacuum_into: None,
+            #[cfg(feature = "v16")]
+            max_nesting: 250,
         }
     }
 }
@@ -148,6 +160,8 @@ impl Config {
             clock: None,
             #[cfg(feature = "v16")]
             vacuum_into: None,
+            #[cfg(feature = "v16")]
+            max_nesting: 16,
         }
     }
 
@@ -172,6 +186,12 @@ impl Config {
     }
     pub fn nonce_seed(mut self, seed: u64) -> Config {
         self.nonce_seed = seed;
+        self
+    }
+    /// Set `max_nesting` (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn max_nesting(mut self, levels: usize) -> Config {
+        self.max_nesting = levels;
         self
     }
     pub fn page_size(mut self, n: u32) -> Config {
@@ -993,6 +1013,8 @@ impl<S: Storage> Connection<S> {
             deferred: None,
             #[cfg(feature = "v16")]
             rec_rows: AVec::new(),
+            #[cfg(feature = "v16")]
+            mats: AVec::new(),
             #[cfg(feature = "v16")]
             stmt_sp: None,
         })
@@ -2397,6 +2419,8 @@ impl<S: Storage> Connection<S> {
                 scalar_col: 0,
                 #[cfg(feature = "v16")]
                 rec: None,
+                #[cfg(feature = "v16")]
+                mat: 0,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
@@ -2432,6 +2456,8 @@ impl<S: Storage> Connection<S> {
             scalar_col: 0,
             #[cfg(feature = "v16")]
             rec: None,
+            #[cfg(feature = "v16")]
+            mat: 0,
         };
         self.stamp_subplan(&mut plan, base_width, base_src);
         Ok((plan, core.keys))
@@ -3272,6 +3298,13 @@ impl<S: Storage> Connection<S> {
                 SelectItem::Star => None,
                 SelectItem::TableStar(q) => Some(handle_bytes(arena, *q)),
             };
+            // `*` over no FROM clause (v0.16 review fix: one row of
+            // no columns; the pin's "no tables specified").
+            if qual.is_none() && cur.sources.is_empty() {
+                return Err(Error::Schema {
+                    kind: SchemaKind::NoTablesSpecified,
+                });
+            }
             let mut expanded = AVec::new();
             let hit = crate::query::expand_star::<S::Error>(&cur, qual, &mut expanded)?;
             if !hit && qual.is_some() {
@@ -3548,6 +3581,15 @@ impl<S: Storage> Connection<S> {
                 // is `id` to `s.id`, NATURAL and USING (review
                 // regression: every duplicate stayed `id`, and
                 // `SELECT *` over a USING join dropped them all).
+                // A shared materialization (`CteUse::mat`) is read
+                // only by a plan that needs nothing of its reader.
+                #[cfg(feature = "v16")]
+                {
+                    dplan.mat = match s.cte.as_ref() {
+                        Some(c) if dplan.uncorrelated => c.mat,
+                        _ => 0,
+                    };
+                }
                 #[cfg(feature = "v16")]
                 if s.cte.as_ref().is_some_and(|c| c.view) {
                     dplan.result_names = self.result_col_names(
@@ -4166,6 +4208,12 @@ pub struct Statement<'c, S: Storage> {
     /// reads the last entry with its id.
     #[cfg(feature = "v16")]
     rec_rows: AVec<(u32, AVec<OwnedValue>)>,
+    /// Shared materializations of this execution (v0.16 review
+    /// fix, `v16`; `SubPlan::mat`): (id, rows, complete). A
+    /// recursive CTE's entry may hold only the prefix a bounded
+    /// reader took (`complete` false).
+    #[cfg(feature = "v16")]
+    mats: AVec<(u32, AVec<AVec<OwnedValue>>, bool)>,
     /// The savepoint level of the statement savepoint this write
     /// runs under inside a transaction (v0.16, `v16`; see
     /// `abort_write`), while it is open.
@@ -4606,6 +4654,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v06")]
         if self.phase == Phase::Fresh {
             self.hoist.clear();
+            #[cfg(feature = "v16")]
+            self.mats.clear();
         }
         let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
             || {
@@ -4877,6 +4927,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v16")]
         {
             self.deferred = None;
+            self.mats.clear();
         }
         #[cfg(feature = "v07")]
         {
@@ -5431,17 +5482,34 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Evaluate RETURNING expressions for one affected row
     /// (v0.7): subqueries execute against the row at hand via
     /// the v0.6 substitution path, exactly as in a SELECT list.
+    ///
+    /// v0.16 review fix: the pin runs RETURNING after each row's
+    /// change, as a trigger program, so its subqueries see the
+    /// table as changed so far and are never hoisted across rows:
+    /// each row evaluates them afresh (`hoist` is set aside
+    /// meanwhile). A shared CTE materialization is still computed
+    /// once per statement, as on the pin (its `OP_Once` holds
+    /// across the rows).
     #[cfg(feature = "v07")]
     async fn eval_returning(
         &mut self,
         exprs: &[RExpr],
         rd: &RowData,
     ) -> Result<AVec<OwnedValue>, S::Error> {
+        let hoist = core::mem::take(&mut self.hoist);
         let mut out = AVec::new();
+        let mut r = Ok(());
         for e in exprs {
-            out.push(self.eval_row_sub(e, rd).await?);
+            match self.eval_row_sub(e, rd).await {
+                Ok(v) => out.push(v),
+                Err(err) => {
+                    r = Err(err);
+                    break;
+                }
+            }
         }
-        Ok(out)
+        self.hoist = hoist;
+        r.map(|()| out)
     }
 
     /// Delete one row and every index entry it owns (v0.7):
@@ -6929,22 +6997,6 @@ impl<'c, S: Storage> Statement<'c, S> {
             _ => unreachable!(),
         };
         for wrow in rows.iter() {
-            // RETURNING reads the row's pre-delete values,
-            // evaluated before this row is removed (earlier rows
-            // of the same statement are already gone, as in
-            // SQLite's row-by-row processing).
-            #[cfg(feature = "v07")]
-            if !returning.is_empty() {
-                let rd = row_data_for(
-                    rowid_alias,
-                    affs.as_slice(),
-                    wrow.rec.as_slice(),
-                    wrow.rowid,
-                );
-                let vals = self.eval_returning(returning.as_slice(), &rd).await?;
-                self.ret_rows.push(vals);
-                self.ret_rowids.push(Some(wrow.rowid));
-            }
             #[cfg(feature = "indexes")]
             for ix in indexes.iter() {
                 let key = key_from_rec(
@@ -6965,6 +7017,22 @@ impl<'c, S: Storage> Statement<'c, S> {
             btree::btree_delete(&mut self.conn.pager, root, wrow.rowid).await?;
             #[cfg(feature = "v16")]
             self.conn.env.note_change();
+            // RETURNING reads the row's pre-delete values, its
+            // subqueries the table with this row (and every
+            // earlier one) gone — the pin evaluates it after the
+            // row's delete (v0.16 review fix: it ran before).
+            #[cfg(feature = "v07")]
+            if !returning.is_empty() {
+                let rd = row_data_for(
+                    rowid_alias,
+                    affs.as_slice(),
+                    wrow.rec.as_slice(),
+                    wrow.rowid,
+                );
+                let vals = self.eval_returning(returning.as_slice(), &rd).await?;
+                self.ret_rows.push(vals);
+                self.ret_rowids.push(Some(wrow.rowid));
+            }
         }
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
@@ -7409,6 +7477,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "v09")]
             {
                 if let Some(d) = &sp.derived {
+                    // `need` bounds the first source only (the outer
+                    // loop the reader stops early).
+                    let need = if src_rows.is_empty() { need } else { None };
+                    #[cfg(feature = "v16")]
+                    let inner = if d.mat != 0 {
+                        self.shared_rows(d, outer, need).await?
+                    } else {
+                        self.exec_subplan_need(d, outer, need).await?
+                    };
+                    #[cfg(not(feature = "v16"))]
                     let inner = self.exec_subplan_need(d, outer, need).await?;
                     let mut rows = AVec::new();
                     for r in inner.iter() {
@@ -7605,18 +7683,43 @@ impl<'c, S: Storage> Statement<'c, S> {
         );
         #[cfg(not(feature = "v09"))]
         let need = None;
-        let src_rows = self
-            .materialise_sources_sub(qp.sources.as_slice(), &RowData::empty(), need)
-            .await?;
-        let mut rows: AVec<RowData> = AVec::new();
-        self.join_sources(
+        // v0.16 review fix: an endless recursive CTE read as the
+        // outer loop through a WHERE or a join stops at the
+        // reader's LIMIT, as the pin's co-routine does.
+        #[cfg(feature = "v16")]
+        let grow = streams_first(
             qp.sources.as_slice(),
-            qp.filter.as_ref(),
-            src_rows.as_slice(),
-            &RowData::empty(),
-            &mut rows,
-        )
-        .await?;
+            qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct,
+        ) && (qp.filter.is_some() || qp.sources.len() > 1)
+            && window.1 != usize::MAX;
+        #[cfg(not(feature = "v16"))]
+        let grow = false;
+        let target = window.0.saturating_add(window.1);
+        let mut n = if grow { target.max(1) } else { 0 };
+        let mut rows: AVec<RowData> = AVec::new();
+        loop {
+            let src_rows = self
+                .materialise_sources_sub(
+                    qp.sources.as_slice(),
+                    &RowData::empty(),
+                    if grow { Some(n) } else { need },
+                )
+                .await?;
+            rows.clear();
+            self.join_sources(
+                qp.sources.as_slice(),
+                qp.filter.as_ref(),
+                src_rows.as_slice(),
+                &RowData::empty(),
+                &mut rows,
+            )
+            .await?;
+            let first = src_rows.as_slice().first().map_or(0, |r| r.len());
+            if !grow || rows.len() >= target || first < n {
+                break;
+            }
+            n = n.saturating_mul(2);
+        }
         let produced = self
             .project_qp_async(
                 &qp,
@@ -7944,7 +8047,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         use crate::query::{SubKind, SubValue};
         Ok(match kind {
             SubKind::Scalar(plan) => {
-                let rows = self.exec_subplan(plan, outer).await?;
+                // Only the first row is read (the pin's implicit
+                // LIMIT 1, v0.16 review fix: an endless recursive
+                // CTE under a scalar subquery answers).
+                let rows = self.exec_subplan_need(plan, outer, Some(1)).await?;
                 SubValue::One(
                     match rows.as_slice().first() {
                         Some(r) => r
@@ -7958,7 +8064,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 )
             }
             SubKind::Exists(plan) => {
-                let rows = self.exec_subplan(plan, outer).await?;
+                let rows = self.exec_subplan_need(plan, outer, Some(1)).await?;
                 SubValue::One(
                     OwnedValue::Integer(if rows.is_empty() { 0 } else { 1 }),
                     None,
@@ -8061,7 +8167,34 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         #[cfg(not(feature = "v09"))]
         let src_need = None;
-        let mut produced = self.exec_subplan_core(&plan, outer, cap, src_need).await?;
+        // v0.16 review fix: an endless recursive CTE read through
+        // a WHERE or a join stops at the reader's bound (see
+        // `run_query_sub`).
+        #[cfg(feature = "v16")]
+        let grow = lone
+            && plan.values.is_empty()
+            && streams_first(
+                plan.sources.as_slice(),
+                plan.group_by.is_empty()
+                    && !plan.has_agg
+                    && plan.order_by.is_empty()
+                    && !plan.distinct,
+            )
+            && (plan.filter.is_some() || plan.sources.len() > 1)
+            && streamed.1 != usize::MAX;
+        #[cfg(not(feature = "v16"))]
+        let grow = false;
+        let target = streamed.0.saturating_add(streamed.1);
+        let mut n = if grow { target.max(1) } else { 0 };
+        let mut produced = loop {
+            let (p, first) = self
+                .exec_subplan_core_n(&plan, outer, cap, if grow { Some(n) } else { src_need })
+                .await?;
+            if !grow || p.len() >= target || first < n {
+                break p;
+            }
+            n = n.saturating_mul(2);
+        };
         // Compound finish (v0.9): combine the core rows with
         // each tail core's rows, left to right, then the
         // compound ORDER BY / LIMIT.
@@ -8120,7 +8253,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// apply the core's own DISTINCT. ORDER BY / LIMIT are the
     /// caller's job (they belong to the whole statement, or to
     /// the compound).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "v09")]
     async fn exec_subplan_core(
         &mut self,
         plan: &crate::query::SubPlan,
@@ -8128,6 +8261,20 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
         need: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
+        Ok(self.exec_subplan_core_n(plan, outer, cap, need).await?.0)
+    }
+
+    /// `exec_subplan_core`, also returning how many rows its first
+    /// source gave (v0.16 review fix: whether a bounded first
+    /// derived table ran out).
+    #[cfg(feature = "v06")]
+    async fn exec_subplan_core_n(
+        &mut self,
+        plan: &crate::query::SubPlan,
+        outer: &RowData,
+        cap: Option<usize>,
+        need: Option<usize>,
+    ) -> Result<(AVec<Produced>, usize), S::Error> {
         // A VALUES core (v0.9): the rows evaluate against the
         // outer row directly.
         #[cfg(feature = "v09")]
@@ -8144,7 +8291,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     rowid: None,
                 });
             }
-            return Ok(out);
+            let n = out.len();
+            return Ok((out, n));
         }
         // Materialise the subquery's own sources (a derived
         // table's rows are its subplan's result for this outer
@@ -8152,6 +8300,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let src_rows = self
             .materialise_sources_sub(plan.sources.as_slice(), outer, need)
             .await?;
+        let first = src_rows.as_slice().first().map_or(0, |r| r.len());
         let mut joined: AVec<RowData> = AVec::new();
         self.join_sources(
             plan.sources.as_slice(),
@@ -8170,7 +8319,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 crate::query::exprs_colls(plan.items.as_slice()).as_slice(),
             );
         }
-        Ok(produced)
+        Ok((produced, first))
     }
 
     /// The nested-loop join of `sources` onto `outer` (v0.6
@@ -8765,29 +8914,30 @@ impl<'c, S: Storage> Statement<'c, S> {
             unreachable!()
         };
         let name_b = copy_vec(handle_bytes(&self.arena, *name));
-        let taken = self
+        // One namespace for tables, views and indexes; IF NOT EXISTS
+        // excuses a table or view of the name, never an index (the
+        // pin's "there is already an index named i", v0.16 review
+        // fix).
+        match self
             .conn
             .catalog
-            .find(&self.conn.catalog_arena, name_b.as_slice())
-            .is_some()
-            || self
-                .conn
-                .catalog
-                .find_index(&self.conn.catalog_arena, name_b.as_slice())
-                .is_some()
-            || self
-                .conn
-                .catalog
-                .find_view(&self.conn.catalog_arena, name_b.as_slice())
-                .is_some();
-        if taken {
-            if *if_not_exists {
+            .taken(&self.conn.catalog_arena, name_b.as_slice())
+        {
+            Some(true) => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::DuplicateIndex,
+                });
+            }
+            Some(false) if *if_not_exists => {
                 self.phase = Phase::Done;
                 return Ok(());
             }
-            return Err(Error::Schema {
-                kind: SchemaKind::DuplicateView,
-            });
+            Some(false) => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::DuplicateView,
+                });
+            }
+            None => {}
         }
         let raw = handle_bytes(&self.arena, self.sql_text);
         let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
@@ -9570,6 +9720,46 @@ fn group_cap(
 /// subquery after OFFSET + LIMIT rows. None: every row is
 /// needed (an outer WHERE may be pushed into the subquery on the
 /// pin, which hipp does not model; see STATUS.md).
+/// Whether a reader's `need` bounds what derived plan `p`
+/// computes (v0.16 review fix, `v16`): a recursive CTE stops its
+/// queue there, and a plain core passes the bound on to a first
+/// source that honours it (`streams_first`).
+#[cfg(feature = "v16")]
+fn need_bounds(p: &crate::query::SubPlan) -> bool {
+    if p.rec.is_some() {
+        return true;
+    }
+    p.compound.is_empty()
+        && p.values.is_empty()
+        && streams_first(
+            p.sources.as_slice(),
+            p.group_by.is_empty() && !p.has_agg && p.order_by.is_empty() && !p.distinct,
+        )
+}
+
+/// Whether a query over `sources` (`plain`: no grouping,
+/// aggregate, ORDER BY or DISTINCT) makes its first rows from a
+/// prefix of its first source's: the first source is a derived
+/// table that honours a row bound (`need_bounds`) and no RIGHT /
+/// FULL join emits rows after the main loop. The pin runs such a
+/// first source as a co-routine and stops it at the reader's
+/// LIMIT, so an endless recursive CTE read through a WHERE or a
+/// join answers (v0.16 review fix, `v16`).
+#[cfg(feature = "v16")]
+fn streams_first(sources: &[SourcePlan], plain: bool) -> bool {
+    plain
+        && !sources.iter().any(|s| {
+            matches!(
+                s.kind,
+                crate::sql::JoinKind::Right | crate::sql::JoinKind::Full
+            )
+        })
+        && sources
+            .first()
+            .and_then(|s| s.derived.as_deref())
+            .is_some_and(|d| d.mat == 0 && need_bounds(d))
+}
+
 #[cfg(feature = "v09")]
 fn derived_need(
     sources: &[SourcePlan],

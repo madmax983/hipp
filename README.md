@@ -342,24 +342,37 @@ aspirations.
   and its refusals of writes to a view. `WITH [RECURSIVE]`
   before SELECT / VALUES / INSERT / REPLACE / UPDATE / DELETE
   and inside any subquery: several CTEs, forward references,
-  column lists, MATERIALIZED hints, the pin's scoping (a CTE
+  column lists, the pin's materialization (a MATERIALIZED CTE,
+  or one read twice that the pin does not flatten, is computed
+  once and shared, as is a view a FROM clause names twice), the
+  pin's scoping (a CTE
   shadows a table, never a DML target or a `main.` name; a view
   never sees the reader's CTEs). Recursive CTEs run the pin's
   queue — FIFO, or a priority queue (ties in arrival order)
   under the CTE's ORDER BY; UNION drops rows seen before;
   LIMIT / OFFSET count dequeued rows; several recursive SELECTs;
-  an outer `LIMIT` stops an endless one — with its circular /
-  multiple-reference / recursive-aggregate errors. PRAGMA
+  a bounded reader (LIMIT through a WHERE or a join, a scalar or
+  EXISTS subquery) stops an endless one — with its circular /
+  multiple-reference / recursive-aggregate errors and its
+  nesting limits (999 nested views or CTEs read, as on the pin,
+  in the CLI; `Config::max_nesting`, default 250, bounds the
+  stack a library caller needs). PRAGMA
   `table_info` and the CLI's `.schema` comment use a view's
   planned columns. Ungated fixes: tables, views and indexes
   share one namespace (CREATE TABLE over a view's name worked;
   tiny +48 B), `t.a` / `*` over two sources named `t` is
   ambiguous, a derived compound's column affinity is demoted
-  across its cores, standard type names print as the pin's.
-  Gaps: an endless recursive CTE behind a WHERE never ends;
-  mixed-affinity compound views compare by the demoted affinity
-  where the pin pushes some WHERE terms into each core
-  (STATUS.md).
+  across its cores, standard type names print as the pin's;
+  review fixes: CREATE VIEW IF NOT EXISTS over an index's name
+  errors, `t.rowid` over two `t`s is ambiguous, `SELECT *` with
+  no FROM is "no tables specified", and RETURNING runs after
+  each row's change (a DELETE's subqueries saw the row still
+  there; uncorrelated ones were frozen at the first row). Gaps:
+  where the pin's planner picks a co-routine or a flattening
+  the model does not foresee, a random() body may be shared
+  differently; mixed-affinity compound views compare by the
+  demoted affinity where the pin pushes some WHERE terms into
+  each core (STATUS.md).
 
 - **Savepoints and maintenance statements** (behind `v16`):
   `SAVEPOINT` / `RELEASE [SAVEPOINT]` / `ROLLBACK [TRANSACTION]

@@ -34,19 +34,36 @@ enum Db {
 fn open_db(path: &str) -> Result<Db, String> {
     block_on(async {
         if path == ":memory:" {
-            let conn = Connection::open(MemStorage::new(), Config::default().clock(now_ms))
+            let conn = Connection::open(MemStorage::new(), cli_config())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::Mem(conn))
         } else {
             let fs = FileStorage::open(std::path::Path::new(path)).map_err(|e| format!("{e:?}"))?;
-            let conn = Connection::open(fs, Config::default().clock(now_ms))
+            let conn = Connection::open(fs, cli_config())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::File(conn))
         }
     })
 }
+
+/// The CLI's engine configuration: the defaults, the system clock,
+/// and the pin's nesting limit for views and CTEs (999 levels read,
+/// 1000 are "nested too deep"), which `main`'s thread has the
+/// stack for, with a statement arena big enough to expand them
+/// (the default 64 KiB holds about 800 nested views).
+fn cli_config() -> Config {
+    let d = Config::default();
+    let (init, max) = (d.stmt_init, d.stmt_max.max(4 * 1024 * 1024));
+    d.clock(now_ms).max_nesting(1000).statement_arena(init, max)
+}
+
+/// The stack of the thread the CLI runs on: room for
+/// `cli_config`'s 1000 nested view / CTE levels in a debug build
+/// (each costs the planner and executor tens of KiB). Only the
+/// pages a statement touches are ever committed.
+const STACK_BYTES: usize = 512 * 1024 * 1024;
 
 /// The wall clock for CURRENT_TIME / CURRENT_DATE /
 /// CURRENT_TIMESTAMP defaults (v0.16): the core has none of its
@@ -685,6 +702,18 @@ fn usage() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Run on a thread with the stack `cli_config` needs (in place
+    // if the host cannot make one).
+    match std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(run)
+    {
+        Ok(h) => h.join().unwrap_or(ExitCode::FAILURE),
+        Err(_) => run(),
+    }
+}
+
+fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args.len() > 2 {
         return usage();

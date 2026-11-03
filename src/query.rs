@@ -776,6 +776,13 @@ pub struct SubPlan {
     /// A recursive CTE (v0.16, `v16`; see `RecInfo`).
     #[cfg(feature = "v16")]
     pub rec: Option<RecInfo>,
+    /// The shared materialization this derived table's rows come
+    /// from (v0.16 review fix, `v16`; `CteUse::mat`): non-zero when
+    /// every derived table with this id reads one result, computed
+    /// once per statement execution. Set only on an uncorrelated
+    /// plan.
+    #[cfg(feature = "v16")]
+    pub mat: u32,
 }
 
 impl SubPlan {
@@ -1045,11 +1052,22 @@ pub(crate) fn resolve_column_in_group<E>(
         // enclosing scopes — the pin's `lookupName` goes on there
         // (v0.16 fix: `SELECT (SELECT max(t.a) FROM u AS t) FROM t`
         // reads the outer t.a; hipp answered "no such column").
+        // Two such sources with a rowid are ambiguous (v0.16
+        // review fix: `SELECT t.rowid FROM t, t` read the first).
         if is_rowid_name(name) {
+            let mut rowid: Option<RExpr> = None;
             for (si, src) in group.sources.iter().enumerate() {
                 if src.named(q) && src.has_rowid {
-                    return Some(Ok(RExpr::Rowid(group.first_src + si)));
+                    if rowid.is_some() {
+                        return Some(Err(Error::Schema {
+                            kind: SchemaKind::AmbiguousColumn,
+                        }));
+                    }
+                    rowid = Some(RExpr::Rowid(group.first_src + si));
                 }
+            }
+            if let Some(r) = rowid {
+                return Some(Ok(r));
             }
         }
         return None;
