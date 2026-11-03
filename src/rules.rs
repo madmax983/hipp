@@ -767,6 +767,13 @@ pub fn check_default_const<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_)
         | Expr::InSubquery(..) => true,
+        // A window call (the pin's `exprNodeIsConstant` refuses
+        // any EP_WinFunc node; v0.16 review fix: such a default
+        // left a schema the pin cannot load).
+        #[cfg(feature = "window")]
+        Expr::Func {
+            clause: Some(c), ..
+        } => c.over.is_some(),
         _ => false,
     });
     if bad {

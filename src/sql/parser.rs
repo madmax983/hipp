@@ -3679,7 +3679,10 @@ impl<'a> Parser<'a> {
     /// A call's `OVER` clause (v0.16, `window`). OVER is a keyword
     /// only right after the call's `)` with `(` or a name after it
     /// (the pin's `analyzeOverKeyword`), so `sum(x) over` is still
-    /// an alias.
+    /// an alias. A "name" there is the pin's `getToken` ID: a
+    /// string, a quoted or fallback identifier, a join keyword —
+    /// never a keyword like FROM, WHERE, UNION or LIMIT (v0.16
+    /// review fix: `count(*) over FROM t` is an alias).
     #[cfg(feature = "window")]
     #[inline(never)]
     fn over_clause<E>(&mut self) -> Result<Option<crate::sql::ast::Over>, E> {
@@ -3687,7 +3690,11 @@ impl<'a> Parser<'a> {
         if !self.cur_is_kw(b"OVER") {
             return Ok(None);
         }
-        match self.toks.as_slice().get(self.pos + 1).map(|t| t.tok) {
+        let i = self.pos + 1;
+        match self.toks.as_slice().get(i).map(|t| t.tok) {
+            Some(Tok::Ident(_, false)) if self.reserved(i, true) || self.is_kw(i, b"INDEXED") => {
+                Ok(None)
+            }
             Some(Tok::LParen) => {
                 self.pos += 2;
                 // `... RP OVER LP`.

@@ -2892,6 +2892,49 @@ pub fn same_expr(a: &RExpr, b: &RExpr) -> bool {
         (RExpr::Cast(x, f), RExpr::Cast(y, g)) => f == g && same_expr(x, y),
         (RExpr::Collate(x, c), RExpr::Collate(y, d)) => c == d && same_expr(x, y),
         (RExpr::Scalar(f, x), RExpr::Scalar(g, y)) => f == g && all(x.as_slice(), y.as_slice()),
+        // Aggregates (v0.16 review fix, `window`): two windows over
+        // groups ordered or partitioned by the same aggregate
+        // (`OVER (ORDER BY sum(v))`) are the same window.
+        #[cfg(feature = "window")]
+        (
+            RExpr::Agg {
+                kind: k1,
+                distinct: d1,
+                star: s1,
+                args: a1,
+                lvl: l1,
+                inert: i1,
+                ext: e1,
+                ..
+            },
+            RExpr::Agg {
+                kind: k2,
+                distinct: d2,
+                star: s2,
+                args: a2,
+                lvl: l2,
+                inert: i2,
+                ext: e2,
+                ..
+            },
+        ) => {
+            k1 == k2
+                && d1 == d2
+                && s1 == s2
+                && l1 == l2
+                && i1 == i2
+                && match (e1, e2) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        x.nargs == y.nargs
+                            && x.filter == y.filter
+                            && x.unique == y.unique
+                            && x.order.as_slice() == y.order.as_slice()
+                    }
+                    _ => false,
+                }
+                && all(a1.as_slice(), a2.as_slice())
+        }
         _ => false,
     }
 }

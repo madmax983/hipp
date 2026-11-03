@@ -617,7 +617,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Parse, bind and plan one statement of a trigger program
-    /// (`when`: the WHEN clause, as `SELECT <expr>`).
+    /// (`when`: the WHEN clause, as `SELECT 1 WHERE <expr>`).
     #[allow(clippy::too_many_arguments)]
     fn plan_step(
         &self,
@@ -632,7 +632,11 @@ impl<S: Storage> Connection<S> {
         let body = sql.get(a..b).unwrap_or(&[]);
         let mut text = AVec::new();
         if when {
-            text.extend_from_slice(b"SELECT ");
+            // As a WHERE (v0.16 review fix): the pin resolves a WHEN
+            // clause like one, so an aggregate or window call there
+            // is its "misuse of aggregate / window function". A row
+            // comes back exactly when the condition is true.
+            text.extend_from_slice(b"SELECT 1 WHERE ");
         }
         text.extend_from_slice(body);
         let mut ast = crate::sql::parser::parse_trigger_step::<S::Error>(

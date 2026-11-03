@@ -1526,6 +1526,16 @@ impl<S: Storage> Connection<S> {
                     return Err(schema_err(SchemaKind::ColumnCountMismatch));
                 }
                 if recursive {
+                    // The pin checks only the rightmost SELECT
+                    // (`p->pWin` in generateWithRecursiveQuery),
+                    // before its aggregate check.
+                    #[cfg(feature = "window")]
+                    if k + 1 == d.compound.len()
+                        && (p.items.iter().any(crate::window::has_win)
+                            || p.order_by.iter().any(|(e, _)| crate::window::has_win(e)))
+                    {
+                        return Err(schema_err(SchemaKind::RecursiveWindow));
+                    }
                     if p.has_agg || !p.group_by.is_empty() {
                         return Err(schema_err(SchemaKind::RecursiveAggregate));
                     }

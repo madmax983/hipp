@@ -2922,6 +2922,40 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v16")]
             mat: 0,
         };
+        // A compound's cores sort by its ORDER BY (and, under
+        // UNION / INTERSECT / EXCEPT, every column) on the pin,
+        // which copies their window columns (v0.16 review fix,
+        // `window`; see `window::compound_sorts`).
+        #[cfg(feature = "window")]
+        if !plan.compound.is_empty() {
+            let mut ops = AVec::new();
+            for (op, _) in plan.compound.iter() {
+                ops.push(*op);
+            }
+            let mut cols = AVec::new();
+            for (j, _) in plan.comp_order.iter() {
+                cols.push(*j);
+            }
+            let sorts =
+                crate::window::compound_sorts(ops.as_slice(), cols.as_slice(), plan.items.len());
+            let mut it = sorts.iter();
+            if let Some(c) = it.next() {
+                crate::window::compound_copies(
+                    plan.items.as_mut_slice(),
+                    &mut plan.order_by,
+                    c.as_slice(),
+                    plan.distinct,
+                );
+            }
+            for ((_, t), c) in plan.compound.as_mut_slice().iter_mut().zip(it) {
+                crate::window::compound_copies(
+                    t.items.as_mut_slice(),
+                    &mut t.order_by,
+                    c.as_slice(),
+                    t.distinct,
+                );
+            }
+        }
         self.stamp_subplan(&mut plan, base_width, base_src);
         Ok((plan, core.keys))
     }
@@ -3710,7 +3744,8 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(not(feature = "v09"))]
         let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
-        let qp = QueryPlan {
+        #[cfg_attr(not(feature = "window"), allow(unused_mut))]
+        let mut plan = QueryPlan {
             sources: core.sources,
             items: core.items,
             filter: core.filter,
@@ -3726,7 +3761,41 @@ impl<S: Storage> Connection<S> {
             values: AVec::new(),
             comp_order,
         };
-        Ok((qp, core.keys))
+        // A compound's cores sort by its ORDER BY (and, under
+        // UNION / INTERSECT / EXCEPT, every column) on the pin,
+        // which copies their window columns (v0.16 review fix,
+        // `window`; see `window::compound_sorts`).
+        #[cfg(feature = "window")]
+        if !plan.compound.is_empty() {
+            let mut ops = AVec::new();
+            for (op, _) in plan.compound.iter() {
+                ops.push(*op);
+            }
+            let mut cols = AVec::new();
+            for (j, _) in plan.comp_order.iter() {
+                cols.push(*j);
+            }
+            let sorts =
+                crate::window::compound_sorts(ops.as_slice(), cols.as_slice(), plan.items.len());
+            let mut it = sorts.iter();
+            if let Some(c) = it.next() {
+                crate::window::compound_copies(
+                    plan.items.as_mut_slice(),
+                    &mut plan.order_by,
+                    c.as_slice(),
+                    plan.distinct,
+                );
+            }
+            for ((_, t), c) in plan.compound.as_mut_slice().iter_mut().zip(it) {
+                crate::window::compound_copies(
+                    t.items.as_mut_slice(),
+                    &mut t.order_by,
+                    c.as_slice(),
+                    t.distinct,
+                );
+            }
+        }
+        Ok((plan, core.keys))
     }
 
     /// The shared core planner (v0.16: the common body of
@@ -3931,6 +4000,10 @@ impl<S: Storage> Connection<S> {
         // combined result (comp_order), not this core's rows,
         // so the term loop is skipped for it.
         let mut order_by: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+        // Which result column each ORDER BY term names, if any
+        // (v0.16 review fix, `window`; see `window::order_copies`).
+        #[cfg(feature = "window")]
+        let mut order_refs: AVec<Option<usize>> = AVec::new();
         if stmt.compound.is_empty() {
             // Window calls are allowed in ORDER BY terms too.
             #[cfg(feature = "window")]
@@ -3946,6 +4019,14 @@ impl<S: Storage> Connection<S> {
                     enclosing,
                     &mut planner,
                 )?;
+                #[cfg(feature = "window")]
+                order_refs.push(order_ref(
+                    e,
+                    &r,
+                    arena,
+                    items.as_slice(),
+                    item_aliases.as_slice(),
+                ));
                 // v0.16: the term sorts by its collation.
                 let mut dir = *dir;
                 dir.coll = crate::query::expr_coll(&r).unwrap_or_default();
@@ -3956,7 +4037,15 @@ impl<S: Storage> Connection<S> {
         }
         // The window classes (v0.16, `window`).
         #[cfg(feature = "window")]
-        crate::window::classify(items.as_mut_slice(), order_by.as_mut_slice());
+        {
+            crate::window::order_copies(
+                items.as_mut_slice(),
+                order_by.as_mut_slice(),
+                order_refs.as_slice(),
+                stmt.distinct,
+            );
+            crate::window::classify(items.as_mut_slice(), order_by.as_mut_slice());
+        }
         // A subquery inside an aggregate's arguments needs
         // per-group-row execution (v0.11, the `v10` feature);
         // without it the plan is refused, as in v0.6.
@@ -10057,7 +10146,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             // v0.16: groups form and sort under each term's
             // collation (a NOCASE column groups 'a' with 'A').
             let gcolls = crate::query::exprs_colls(qp.group_by.as_slice());
-            let gdesc = group_desc(qp.group_by.as_slice(), qp.order_by.as_slice());
+            let gdesc = group_desc(
+                qp.group_by.as_slice(),
+                qp.items.as_slice(),
+                qp.order_by.as_slice(),
+            );
             for r in rows {
                 let mut key = AVec::new();
                 for g in qp.group_by.iter() {
@@ -10283,7 +10376,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             // v0.16: groups form and sort under each term's
             // collation (a NOCASE column groups 'a' with 'A').
             let gcolls = crate::query::exprs_colls(plan.group_by.as_slice());
-            let gdesc = group_desc(plan.group_by.as_slice(), plan.order_by.as_slice());
+            let gdesc = group_desc(
+                plan.group_by.as_slice(),
+                plan.items.as_slice(),
+                plan.order_by.as_slice(),
+            );
             for r in rows {
                 let mut key = AVec::new();
                 for g in plan.group_by.iter() {
@@ -11489,6 +11586,38 @@ fn derived_need(
         .then(|| skip.saturating_add(take))
 }
 
+/// The result column ORDER BY term `e` (resolved: `r`) names, if
+/// any (v0.16 review fix, `window`; the pin's `iOrderByCol`): an
+/// ordinal, a bare alias (under COLLATE too), or a window call the
+/// same as a result column's (the last such column).
+#[cfg(feature = "window")]
+fn order_ref(
+    e: &Expr,
+    r: &RExpr,
+    arena: &Arena,
+    items: &[RExpr],
+    aliases: &[Option<AVec<u8>>],
+) -> Option<usize> {
+    let (mut e, mut r) = (e, r);
+    while let (Expr::Collate(x, _), RExpr::Collate(y, _)) = (e, r) {
+        e = x;
+        r = y;
+    }
+    match e {
+        Expr::Literal(Literal::Integer(n)) => usize::try_from(*n)
+            .ok()
+            .and_then(|k| k.checked_sub(1))
+            .filter(|k| *k < items.len()),
+        Expr::Column { table: None, name } => {
+            let nb = handle_bytes(arena, *name);
+            aliases
+                .iter()
+                .position(|a| a.as_ref().is_some_and(|x| eq_ci(x.as_slice(), nb)))
+        }
+        _ => items.iter().rposition(|it| crate::window::same_call(r, it)),
+    }
+}
+
 /// The direction each GROUP BY term's groups come out in
 /// (v0.16): when the ORDER BY has exactly as many terms as the
 /// GROUP BY, the pin's group sorter takes each ORDER BY term's
@@ -11497,9 +11626,29 @@ fn derived_need(
 /// are — so ties under the ORDER BY keep that group order
 /// (`GROUP BY a ORDER BY b DESC` lists equal-`b` groups by `a`
 /// descending). Otherwise every group term is ascending.
+///
+/// A core with window calls (v0.16 review fix, `window`) ignores
+/// its ORDER BY here: the pin's `sqlite3WindowRewrite` moves the
+/// grouping into a subquery ordered by the innermost window's sort
+/// keys (`window::inner_sort_desc`), so those directions apply —
+/// when there are as many keys as GROUP BY terms — whatever the
+/// outer ORDER BY says.
 #[cfg(feature = "v04")]
-fn group_desc(group_by: &[RExpr], order_by: &[(RExpr, crate::sql::SortOrder)]) -> AVec<bool> {
+fn group_desc(
+    group_by: &[RExpr],
+    items: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+) -> AVec<bool> {
     let mut out = AVec::new();
+    #[cfg(feature = "window")]
+    if let Some(d) = crate::window::inner_sort_desc(items, order_by) {
+        for i in 0..group_by.len() {
+            out.push(d.len() == group_by.len() && d.as_slice().get(i).copied().unwrap_or(false));
+        }
+        return out;
+    }
+    #[cfg(not(feature = "window"))]
+    let _ = items;
     for i in 0..group_by.len() {
         out.push(group_by.len() == order_by.len() && order_by.get(i).is_some_and(|(_, o)| o.desc));
     }
@@ -11823,7 +11972,11 @@ fn project_rows<E>(
     } else {
         // v0.16: groups form and sort under each term's collation.
         let gcolls = crate::query::exprs_colls(qp.group_by.as_slice());
-        let gdesc = group_desc(qp.group_by.as_slice(), qp.order_by.as_slice());
+        let gdesc = group_desc(
+            qp.group_by.as_slice(),
+            qp.items.as_slice(),
+            qp.order_by.as_slice(),
+        );
         for r in rows {
             let ctx = Ctx::of(r).with(env);
             let mut key = AVec::new();

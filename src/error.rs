@@ -310,6 +310,12 @@ pub enum SchemaKind {
     /// 1.
     #[cfg(feature = "window")]
     NtileArgument,
+    /// A window call in the result columns or ORDER BY of a
+    /// recursive CTE's last recursive SELECT (v0.16, `window`; the
+    /// pin's "cannot use window functions in recursive queries").
+    /// Apply the window over the CTE's result instead.
+    #[cfg(feature = "window")]
+    RecursiveWindow,
     /// A FOREIGN KEY whose column lists disagree (v0.16 fix, the
     /// pin's "foreign key on x should reference only one column of
     /// table p" / "number of columns in foreign key does not match

@@ -208,6 +208,12 @@ pub struct WinCall {
     pub slot: usize,
     /// The call's window class within the core (`classify`).
     pub class: usize,
+    /// An ORDER BY copy of a result column's call (`order_copies`):
+    /// never in the outermost class.
+    pub copy: bool,
+    /// The slot whose value this node shows (`order_copies`; None:
+    /// its own).
+    pub shown: Option<usize>,
 }
 
 impl WinCall {
@@ -236,6 +242,8 @@ impl WinCall {
             frame,
             slot: 0,
             class: 0,
+            copy: false,
+            shown: None,
         }
     }
 
@@ -397,28 +405,51 @@ pub fn calls<'x>(items: &'x [RExpr], order: &'x [(RExpr, SortOrder)]) -> AVec<&'
     out
 }
 
-/// Number the window classes of a core (`WinCall::class`): calls
-/// in slot order, each in the class of the first earlier call
-/// whose window is the same, else in a new one.
+/// Number the window classes of a core (`WinCall::class`), as
+/// the pin nests them (`sqlite3WindowLink` / `sqlite3WindowRewrite`):
+/// class 0 is the first call's window with every later call of the
+/// same window — ORDER BY copies (`order_copies`) excepted, which
+/// the pin never links there; every other call is pushed into a
+/// subquery, whose first call's window is class 1 (copies now
+/// included), and so on. Calls are taken in slot order.
 pub fn classify(items: &mut [RExpr], order: &mut [(RExpr, SortOrder)]) {
     let mut classes: AVec<(usize, usize)> = AVec::new();
     {
         let list = calls(items, order);
-        let mut reps: AVec<&RExpr> = AVec::new();
-        for e in list.iter() {
-            let RExpr::Win(c, kids) = e else { continue };
-            let hit = reps.iter().position(|r| {
-                let RExpr::Win(d, dk) = r else { return false };
-                same_window(c, kids.as_slice(), d, dk.as_slice())
-            });
-            let class = match hit {
-                Some(k) => k,
-                None => {
-                    reps.push(e);
-                    reps.len() - 1
-                }
+        let mut left: AVec<&RExpr> = list;
+        let mut class = 0usize;
+        while !left.is_empty() {
+            let top = class == 0;
+            let head = left
+                .iter()
+                .position(|e| matches!(e, RExpr::Win(c, _) if !(top && c.copy)))
+                .unwrap_or(0);
+            let Some(&h) = left.as_slice().get(head) else {
+                break;
             };
-            classes.push((c.slot, class));
+            let RExpr::Win(hc, hk) = h else { break };
+            let mut rest = AVec::new();
+            for e in left.iter() {
+                let RExpr::Win(c, kids) = e else { continue };
+                if !(top && c.copy) && same_window(c, kids.as_slice(), hc, hk.as_slice()) {
+                    classes.push((c.slot, class));
+                } else {
+                    rest.push(*e);
+                }
+            }
+            if rest.len() == left.len() {
+                // The head itself always joins (a lone copy).
+                classes.push((hc.slot, class));
+                let mut keep = AVec::new();
+                for e in rest.iter() {
+                    if !matches!(e, RExpr::Win(c, _) if c.slot == hc.slot) {
+                        keep.push(*e);
+                    }
+                }
+                rest = keep;
+            }
+            left = rest;
+            class += 1;
         }
     }
     let set = |e: &mut RExpr| set_class(e, classes.as_slice());
@@ -428,6 +459,193 @@ pub fn classify(items: &mut [RExpr], order: &mut [(RExpr, SortOrder)]) {
     for (e, _) in order.iter_mut() {
         set(e);
     }
+}
+
+/// The pin's ORDER BY copies (v0.16 review fix, `window`): an ORDER
+/// BY term naming a result column (`refs[i]`: by alias, ordinal or
+/// as the same expression) is a copy of that column's expression
+/// (`resolveAlias`), and so is an alias inside any other term —
+/// its window calls are separate calls, computed again, nested
+/// below the result list's own (`classify`). Every ORDER BY call
+/// is renumbered after the result columns' slots, in walk order.
+/// A result column a reference term names then shows the copy's
+/// values (the pin reads it back from the sorter key) — except
+/// under DISTINCT, where the term sorts by the column's own.
+pub fn order_copies(
+    items: &mut [RExpr],
+    order: &mut [(RExpr, SortOrder)],
+    refs: &[Option<usize>],
+    distinct: bool,
+) {
+    let mut item_slots: AVec<usize> = AVec::new();
+    for e in items.iter() {
+        visit(e, &mut |w| {
+            if let RExpr::Win(c, _) = w {
+                item_slots.push(c.slot);
+            }
+        });
+    }
+    let mut next = item_slots.iter().map(|s| s + 1).max().unwrap_or(0);
+    for (i, (e, _)) in order.iter_mut().enumerate() {
+        let whole = refs.get(i).copied().flatten().is_some();
+        visit_mut(e, &mut |c| {
+            c.copy = whole || item_slots.as_slice().contains(&c.slot);
+            c.slot = next;
+            next = next.saturating_add(1);
+        });
+    }
+    // The last term naming a column wins (the pin's loop).
+    for j in 0..items.len() {
+        let Some(i) = refs.iter().rposition(|r| *r == Some(j)) else {
+            continue;
+        };
+        let (Some(it), Some((oe, _))) = (items.get_mut(j), order.get_mut(i)) else {
+            continue;
+        };
+        let mut src: AVec<usize> = AVec::new();
+        visit(it, &mut |w| {
+            if let RExpr::Win(c, _) = w {
+                src.push(c.slot);
+            }
+        });
+        let mut dst: AVec<usize> = AVec::new();
+        visit(oe, &mut |w| {
+            if let RExpr::Win(c, _) = w {
+                dst.push(c.slot);
+            }
+        });
+        let (from, to) = if distinct { (oe, &src) } else { (it, &dst) };
+        let mut k = 0usize;
+        visit_mut(from, &mut |c| {
+            c.shown = to.as_slice().get(k).copied();
+            k += 1;
+        });
+    }
+}
+
+/// The DESC flag of each sort key of a core's innermost window
+/// class (partition terms ascending, then its ORDER BY), or None
+/// without window calls (v0.16 review fix). The pin's rewrite puts
+/// the grouping in the innermost subquery with that sort as its
+/// ORDER BY, whose directions the group sorter then borrows.
+pub fn inner_sort_desc(items: &[RExpr], order: &[(RExpr, SortOrder)]) -> Option<AVec<bool>> {
+    let list = calls(items, order);
+    let inner = list
+        .iter()
+        .filter_map(|e| match e {
+            RExpr::Win(c, _) => Some(c),
+            _ => None,
+        })
+        .fold(None::<&WinCall>, |m, c| match m {
+            Some(b) if b.class >= c.class => Some(b),
+            _ => Some(c),
+        })?;
+    let mut out = AVec::new();
+    for _ in 0..inner.npart {
+        out.push(false);
+    }
+    for o in inner.order.iter() {
+        out.push(o.desc);
+    }
+    Some(out)
+}
+
+/// The result columns each core of a compound sorts by on the pin
+/// (v0.16 review fix, `window`; `multiSelectOrderBy`): the
+/// compound's ORDER BY columns `order`, which every UNION /
+/// INTERSECT / EXCEPT (`ops[i]` joins core `i + 1`) extends with
+/// the remaining columns for its two sides; index 0 is the head.
+pub fn compound_sorts(
+    ops: &[crate::sql::CompoundOp],
+    order: &[usize],
+    width: usize,
+) -> AVec<AVec<usize>> {
+    let mut t: AVec<usize> = AVec::new();
+    for &j in order {
+        t.push(j);
+    }
+    let mut out: AVec<AVec<usize>> = AVec::new();
+    for _ in 0..=ops.len() {
+        out.push(AVec::new());
+    }
+    for i in (0..ops.len()).rev() {
+        if ops.get(i) != Some(&crate::sql::CompoundOp::UnionAll) {
+            for j in 0..width {
+                if !t.as_slice().contains(&j) {
+                    t.push(j);
+                }
+            }
+        }
+        if let Some(o) = out.as_mut_slice().get_mut(i + 1) {
+            *o = t.clone();
+        }
+    }
+    if let Some(o) = out.as_mut_slice().first_mut() {
+        *o = t;
+    }
+    out
+}
+
+/// One compound core's share of `compound_sorts` (v0.16 review fix,
+/// `window`): the columns `cols` it sorts by become ORDER BY copies
+/// of its window columns (`order_copies`), kept in its `order`
+/// (a compound core's ORDER BY is otherwise empty and never sorts
+/// it), and its classes are numbered again.
+pub fn compound_copies(
+    items: &mut [RExpr],
+    order: &mut AVec<(RExpr, SortOrder)>,
+    cols: &[usize],
+    distinct: bool,
+) {
+    let mut refs: AVec<Option<usize>> = AVec::new();
+    for &j in cols {
+        if let Some(e) = items.get(j)
+            && has_win(e)
+        {
+            order.push((
+                e.clone(),
+                SortOrder {
+                    desc: false,
+                    nulls_first: true,
+                    coll: Default::default(),
+                },
+            ));
+            refs.push(Some(j));
+        }
+    }
+    if refs.is_empty() {
+        return;
+    }
+    order_copies(items, order.as_mut_slice(), refs.as_slice(), distinct);
+    classify(items, order.as_mut_slice());
+}
+
+/// `visit`, mutably: `f` on every Win node's call.
+fn visit_mut(e: &mut RExpr, f: &mut dyn FnMut(&mut WinCall)) {
+    if let RExpr::Win(c, _) = e {
+        f(c);
+        return;
+    }
+    each_child_mut(e, &mut |x| visit_mut(x, f));
+}
+
+/// Whether two resolved window calls are the same call (the pin's
+/// `sqlite3ExprCompare` of an ORDER BY term with a result column):
+/// function, arguments and window alike.
+pub fn same_call(a: &RExpr, b: &RExpr) -> bool {
+    let (RExpr::Win(x, xk), RExpr::Win(y, yk)) = (a, b) else {
+        return false;
+    };
+    x.func == y.func
+        && x.star == y.star
+        && x.nargs == y.nargs
+        && x.filter == y.filter
+        && same_window(x, xk.as_slice(), y, yk.as_slice())
+        && xk.len() == yk.len()
+        && xk
+            .iter()
+            .zip(yk.iter())
+            .all(|(p, q)| crate::query::same_expr(p, q))
 }
 
 fn set_class(e: &mut RExpr, classes: &[(usize, usize)]) {
@@ -466,7 +684,10 @@ fn same_window<'x>(a: &WinCall, ak: &'x [RExpr], b: &WinCall, bk: &'x [RExpr]) -
 /// value: `vals[slot]`.
 pub fn fill(e: &mut RExpr, vals: &[OwnedValue]) {
     if let RExpr::Win(c, _) = e {
-        let v = vals.get(c.slot).cloned().unwrap_or(OwnedValue::Null);
+        let v = vals
+            .get(c.shown.unwrap_or(c.slot))
+            .cloned()
+            .unwrap_or(OwnedValue::Null);
         *e = RExpr::Literal(v);
         return;
     }
@@ -1807,10 +2028,11 @@ pub fn resolve_call<E>(
     if !cur.win.ok.get() {
         return err(SchemaKind::MisusedWindow);
     }
-    if star && func != WinFn::Agg(AggKind::Count) {
-        return Err(Error::Unsupported);
-    }
-    if !star && (n < lo || n > hi) {
+    // `f(*)` is `f()` on the pin (its parser drops the star), so
+    // the zero-argument built-ins and count accept it and every
+    // other function has the wrong argument count.
+    let n = if star { 0 } else { n };
+    if n < lo || n > hi {
         return err(SchemaKind::WrongArgumentCount);
     }
     if clause.filter.is_some() && !matches!(func, WinFn::Agg(_)) {

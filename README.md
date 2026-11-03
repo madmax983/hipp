@@ -495,8 +495,12 @@ aspirations.
   its `EXPLAIN`), so sliding REAL sums round as they do there and
   rows come out in the pin's order (nested window classes, each
   sorting stably). Window calls in WHERE / GROUP BY / HAVING,
-  inside aggregates and in write statements are the pin's misuse.
-  Max +41.9 KB; tiny and full unchanged (STATUS.md).
+  inside aggregates, in write statements and in a trigger's WHEN
+  are the pin's misuse; in a DEFAULT "not constant"; in a recursive
+  CTE's recursive SELECT refused. ORDER BY terms naming window
+  columns, compound ORDER BYs and GROUP BY feed the windows the
+  pin's way, so tie-dependent values match. Max +45.2 KB; tiny and
+  full unchanged (STATUS.md).
 
 - **Triggers** (new leaf feature `triggers`, in `max` — ADR
   0002 — not `full`). CREATE [TEMP] TRIGGER (BEFORE / AFTER /

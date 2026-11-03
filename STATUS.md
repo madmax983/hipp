@@ -3843,7 +3843,9 @@ lead) went from HIPP_ERR to MATCH.
 
 - Grammar: `f(args) [FILTER (WHERE ...)] OVER (...)` and `OVER
   name` after any call (OVER is a keyword only after `)` with `(`
-  or a name after it, as in the pin's `analyzeOverKeyword`;
+  or a name after it — a string, a quoted, plain or fallback
+  identifier or a join keyword, never FROM / WHERE / UNION /
+  LIMIT / ..., as in the pin's `analyzeOverKeyword` / `getToken`;
   WINDOW only before `name AS`; FILTER after OVER is a syntax
   error); window definitions `[base] [PARTITION BY ...] [ORDER BY
   ...] [frame]`; frames `ROWS | RANGE | GROUPS` with one bound or
@@ -3895,28 +3897,47 @@ lead) went from HIPP_ERR to MATCH.
   any EXCLUDE (NO OTHERS included) runs the pin's full scan: a
   fresh aggregate per row over the frame minus the excluded rows.
 - Classes and output order: calls with equal windows (frame and
-  EXCLUDE included) share a class; classes are numbered in
-  resolution order (result list, then ORDER BY); the pin nests
-  the second class inside the first and so on, each sorting its
-  input stably by partition and order keys, so rows come out in
-  the first class's order. DISTINCT, the outer ORDER BY (stable)
-  and LIMIT apply after the windows; a group LIMIT no longer stops
-  a windowed query's groups early, nor does a reader's LIMIT bound
-  a windowed derived table's input.
+  EXCLUDE included; two windows over the same aggregate, `OVER
+  (ORDER BY sum(v))`, are equal) share a class; classes are
+  numbered in resolution order (result list, then ORDER BY); the
+  pin nests the second class inside the first and so on, each
+  sorting its input stably by partition and order keys, so rows
+  come out in the first class's order. An ORDER BY term naming a
+  result column (alias, ordinal, the same call; the pin's
+  `resolveAlias` copy), and an alias inside any other ORDER BY
+  term, is a *copy* of that column's calls: computed again, never
+  in the first class (`sqlite3WindowLink` does not link it), so it
+  nests below the result list's windows; the named column then
+  shows the copy's values (the pin reads it back from the sorter
+  key) — under DISTINCT the column keeps its own values and the
+  term sorts by them (`window::order_copies`). A compound's cores
+  sort by its ORDER BY, extended to every column under UNION /
+  INTERSECT / EXCEPT (`multiSelectOrderBy`), with the same copies
+  (`window::compound_sorts`). DISTINCT, the outer ORDER BY
+  (stable) and LIMIT apply after the windows; a group LIMIT no
+  longer stops a windowed query's groups early, nor does a
+  reader's LIMIT bound a windowed derived table's input. Windows
+  over groups see the groups in GROUP BY order with the innermost
+  class's sort directions when it has as many keys as the GROUP BY
+  (the rewrite's subquery ORDER BY the group sorter borrows) —
+  never the outer ORDER BY's.
 - Where calls may stand: result columns and ORDER BY terms of a
   SELECT core (and each VALUES row, a one-row core on the pin);
   anywhere else — WHERE, GROUP BY (ordinals and aliases included),
   HAVING, ON, LIMIT, write statements, CHECK, inside an
   aggregate's or another window call's arguments, PARTITION BY,
-  ORDER BY or FILTER — the pin's misuse (`MisusedWindow`, also for
-  an alias of a window call there and for a built-in without
-  OVER). Aggregates inside window arguments belong to the core
+  ORDER BY or FILTER, a trigger's WHEN — the pin's misuse
+  (`MisusedWindow`, also for an alias of a window call there and
+  for a built-in without OVER); in a column DEFAULT the pin's "not
+  constant" (`NotConstantDefault`); in the last recursive SELECT
+  of a recursive CTE `RecursiveWindow`. Aggregates inside window arguments belong to the core
   (`sum(sum(c)) OVER (ORDER BY a)` over GROUP BY a), and make it
   an aggregate query.
 - Errors (new `SchemaKind`s): `NotWindowFunction` (a scalar
   function, multi-argument min / max), `WindowDistinct`,
   `WindowClauseMisused` (FILTER on a built-in, an aggregate ORDER
   BY with OVER), `NoSuchWindow`, `WindowOverride`,
+  `RecursiveWindow`,
   `RangeOffsetOrder`, `FrameStartOffset` / `FrameEndOffset` (ROWS /
   GROUPS: `MustBeInt` then >= 0; RANGE: a non-negative number,
   numeric text included — checked when a partition starts, so not
@@ -3961,7 +3982,49 @@ names were compared dequoted (`OVER [w]` found `w`); bound
 parameters in frame offsets were neither treated as constant nor
 bound (the bind walker did not reach window definitions).
 
-**Tests:** `tests/window_v16.rs` (12 tests): built-ins, aggregates
+**Review fixes (2026-11-03, regression tests in
+`tests/window_v16.rs` and the CLI `ordering` batch):**
+
+- A window call in a column DEFAULT (CREATE TABLE, ALTER TABLE ADD
+  COLUMN) was stored, leaving a schema the pin refuses to load
+  ("default value of column [b] is not constant"); it is now
+  `NotConstantDefault`, as `exprNodeIsConstant` refuses any
+  EP_WinFunc node.
+- Windows over groups under an outer ORDER BY of the same length
+  as the GROUP BY (`GROUP BY k ORDER BY k DESC`, `ORDER BY v
+  DESC`) saw the groups in the ORDER BY's direction (`group_desc`
+  borrowed it); they now see the GROUP BY order with the innermost
+  window's directions, as the pin's rewritten subquery does.
+- `f(...) over FROM t` (and before WHERE, UNION, LIMIT, ...) is an
+  alias again: OVER followed by a reserved keyword is not the
+  keyword.
+- `cannot use window functions in recursive queries`: a window call
+  in the rightmost recursive SELECT is `RecursiveWindow` (checked
+  before the aggregate check; the anchor, earlier recursive
+  SELECTs and subqueries may hold windows, as on the pin).
+- `row_number(*)` and the other zero-argument built-ins take `*`
+  (the pin's `f(*)` is `f()`); every other function with `*` is
+  `WrongArgumentCount`, not `Unsupported`.
+- ORDER BY terms naming window columns (and compound ORDER BYs)
+  changed the pin's window nesting but not hipp's, so tie-dependent
+  values (row_number, first_value, lag, group_concat over ties)
+  differed — now modelled as above. Two windows ordered or
+  partitioned by the same aggregate no longer form two classes
+  (`same_expr` compares aggregates under `window`).
+- Same pattern elsewhere: a trigger's WHEN was planned as `SELECT
+  <expr>`, so window calls and aggregates there ran; it is now
+  planned as a WHERE (`SELECT 1 WHERE <expr>`), giving the pin's
+  `MisusedWindow` / `MisusedAggregate` when the trigger fires.
+
+**Tests:** `tests/window_v16.rs` (20 tests; the review fixes
+added `default_refusals`, `over_as_alias`, `recursive_cte_windows`,
+`star_arguments`, `trigger_when_misuse`,
+`groups_ignore_outer_order`, `order_by_window_columns` and
+`generated_order_group_corpus` — ORDER BY aliases / ordinals /
+negated aliases / fresh calls, DISTINCT, LIMIT, GROUP BY with
+aggregates in window arguments and sort keys; about 6 000 such
+generated queries and 1 000 compound ones from a scratch fuzzer
+agreed in values with the pin while fixing): built-ins, aggregates
 over frames, RANGE offsets, named windows (and every refusal),
 the step / inverse order (REAL stickiness, rounding, overflow),
 group_concat's inverse with varying separators, output order
@@ -3974,7 +4037,7 @@ default 240, `HIPP_WIN_SEED`) of random calls over random frames,
 partitions and orders on six random tables with mixed storage
 classes, rounding REALs and big integers — 1 500 extra statements
 (seed 7) and about 2 400 more from a scratch fuzzer agreed while
-developing. `hipp-cli/tests/cli_v16_window.rs` (4 tests):
+developing. `hipp-cli/tests/cli_v16_window.rs` (5 tests):
 byte-identical batches one-shot and over stdin (built-ins, frames
 with REAL rendering, shapes, CTAS `.schema` and `.parameter`
 offsets) plus the oracle's integrity check of hipp's file.
@@ -3992,6 +4055,12 @@ functions (`src/window.rs`), the grammar (OVER, WINDOW, frames) and
 the resolver for calls and named windows, and the window paths of
 the three projection loops — the whole leaf, which ADR 0002 put in
 `max` for exactly this.
+
+**Size after the review fixes:** tiny **76,924 B** (Δ **0**),
+full **484,644 B** (Δ **0**: the `same_expr` aggregate arm and the
+window paths are `window`-only), max **563,552 B** (Δ **+3,312 B**
+vs 560,240, ratchet raised: ORDER BY / compound copies, the class
+numbering, the group-direction rule and the recursive-CTE check).
 
 **Honest gaps:**
 
@@ -4018,6 +4087,20 @@ the three projection loops — the whole leaf, which ADR 0002 put in
 - Errors from different calls / rows in one statement may be
   reported in another order than the pin's (the kinds and
   errored-vs-succeeded match).
+- ORDER BY copies follow the plain-SELECT rule in every core; when
+  the pin materializes a subquery or CTE with an ORDER BY naming a
+  window column (`MATERIALIZED`, or its planner's choice), it keeps
+  the column's own values and sorts by them, as under DISTINCT, so
+  tie-dependent values there can differ. The identical-expression
+  form of an ORDER BY reference is recognised for a bare window
+  call only (`ORDER BY row_number() OVER (...)`), not for a larger
+  expression holding one.
+- Row order across the cores of a compound with an ORDER BY
+  differs from the pin's merge for rows tied on the ORDER BY (not
+  window-specific: `SELECT b, k FROM t UNION ALL SELECT 0, 0 ORDER
+  BY 2 DESC` shows it too); the window values match, and the tests
+  compare compounds as sets. A LIMIT over such ties can then keep
+  other rows than the pin.
 
 ### Triggers (2026-11-03)
 

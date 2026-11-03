@@ -143,6 +143,20 @@ SELECT * FROM u;
 SELECT c, sum(c) OVER (ORDER BY c ROWS BETWEEN ?1 PRECEDING AND CURRENT ROW), nth_value(c, :n) OVER (ORDER BY c) FROM t;
 ";
 
+/// Review regressions: ORDER BY naming window columns, windows
+/// over groups under an outer ORDER BY, `f(...) over` aliases,
+/// `f(*)` built-ins.
+const ORDERING: &str = "\
+SELECT b, count(*) OVER (PARTITION BY a) c, row_number() OVER (ORDER BY n) FROM t ORDER BY c;
+SELECT b, row_number() OVER (ORDER BY a) ra, row_number() OVER (ORDER BY n) rn, sum(r) OVER (ORDER BY a ROWS 1 PRECEDING) s FROM t ORDER BY ra, 3;
+SELECT b, row_number() OVER (ORDER BY a) ra, row_number() OVER (ORDER BY n) rn FROM t ORDER BY -ra;
+SELECT a, row_number() OVER (), sum(sum(r)) OVER (ROWS UNBOUNDED PRECEDING) FROM t GROUP BY a ORDER BY a DESC;
+SELECT a, first_value(a) OVER (ORDER BY count(*) DESC), avg(r) FROM t GROUP BY a ORDER BY 3;
+SELECT count(*) over FROM t;
+SELECT abs(1) over UNION SELECT 2.5;
+SELECT row_number(*) OVER (ORDER BY c), cume_dist(*) OVER (ORDER BY a) FROM t;
+";
+
 fn batch(body: &str) -> String {
     format!("{SETUP}{body}")
 }
@@ -171,4 +185,9 @@ fn cli_v16_window_ctas_params_stdin_byte_identical() {
     assert_eq!(got, run_stdin(&oracle(), &b, &input));
     assert!(!got.is_empty());
     assert_eq!(run(&oracle(), &a, "PRAGMA integrity_check;"), b"ok\n");
+}
+
+#[test]
+fn cli_v16_window_ordering_byte_identical() {
+    byte_identical("ordering", &batch(ORDERING));
 }

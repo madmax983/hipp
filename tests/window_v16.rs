@@ -693,6 +693,389 @@ fn refusals() {
         .expect("refused");
 }
 
+// ---------------- review regressions ----------------
+
+/// A window call in a column DEFAULT is the pin's "default value of
+/// column is not constant" (v0.16 review fix: hipp stored it, and
+/// the pin then could not open the file).
+#[test]
+fn default_refusals() {
+    let tw = twins("default", "CREATE TABLE t(a); INSERT INTO t VALUES (1)");
+    for sql in [
+        "CREATE TABLE z(a, b DEFAULT (sum(1) OVER ()))",
+        "CREATE TABLE z(a, b DEFAULT (abs(1) OVER ()))",
+        "CREATE TABLE z(a, b DEFAULT (row_number() OVER ()))",
+        "CREATE TABLE z(a, b DEFAULT (1 + coalesce(2, count(*) OVER w)))",
+        "CREATE TABLE z(a, b DEFAULT (abs(1) FILTER (WHERE 1) OVER ()))",
+        "ALTER TABLE t ADD COLUMN b DEFAULT (count(*) OVER ())",
+        "ALTER TABLE t ADD COLUMN b DEFAULT (abs(1) OVER ())",
+    ] {
+        tw.refuse(sql, SchemaKind::NotConstantDefault);
+    }
+    // A window inside a subquery default is the subquery's refusal.
+    tw.refuse(
+        "CREATE TABLE z(a, b DEFAULT ((SELECT count(*) OVER ())))",
+        SchemaKind::NotConstantDefault,
+    );
+    tw.all(&[
+        "CREATE TABLE z(a, b DEFAULT (abs(-1)))",
+        "INSERT INTO z(a) VALUES (1)",
+        "SELECT * FROM z",
+    ]);
+    // The pin still reads hipp's file.
+    assert_eq!(
+        common::cli(&tw.hipp, "PRAGMA integrity_check;").trim(),
+        "ok"
+    );
+}
+
+/// `f(...) over` is an alias unless `(` or an identifier follows;
+/// FROM, WHERE, UNION, LIMIT, ... are no identifiers (v0.16 review
+/// fix: hipp read OVER as a keyword before them).
+#[test]
+fn over_as_alias() {
+    let tw = twins(
+        "overalias",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1), (2)",
+    );
+    tw.all(&[
+        "SELECT count(*) over FROM t",
+        "SELECT abs(a) over FROM t",
+        "SELECT max(a) over FROM t WHERE a > 0",
+        "SELECT abs(1) over UNION SELECT 2",
+        "SELECT abs(1) over INTERSECT SELECT 1",
+        "SELECT abs(1) over EXCEPT SELECT 2",
+        "SELECT abs(1) over LIMIT 1",
+        "SELECT abs(1) over ORDER BY 1",
+        "SELECT abs(1) over, 2",
+        "SELECT abs(1) over",
+        "SELECT count(*) over FROM t GROUP BY a",
+        "SELECT a FROM t ORDER BY abs(a) over",
+        "SELECT abs(1) over AND 1 FROM t",
+        "SELECT abs(1) over NOT NULL FROM t",
+        "SELECT abs(1) over IS NULL FROM t",
+        // Names after OVER: plain, quoted, fallback and join keywords.
+        "SELECT count(*) over w FROM t WINDOW w AS ()",
+        "SELECT count(*) over 'w' FROM t WINDOW 'w' AS ()",
+        "SELECT count(*) over \"w\" FROM t WINDOW \"w\" AS ()",
+        "SELECT count(*) over current FROM t WINDOW current AS ()",
+    ]);
+    tw.refuse("SELECT count(*) over left FROM t", SchemaKind::NoSuchWindow);
+    tw.refuse("SELECT count(*) over over FROM t", SchemaKind::NoSuchWindow);
+    tw.refuse_parse("SELECT abs(1) over AS x FROM t");
+    tw.refuse_parse("SELECT abs(1) over INDEXED FROM t");
+}
+
+/// The pin's "cannot use window functions in recursive queries":
+/// a window call in the last recursive SELECT's result columns
+/// (v0.16 review fix: hipp ran it).
+#[test]
+fn recursive_cte_windows() {
+    let tw = twins("recwin", "");
+    for sql in [
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT max(n) OVER () + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        "WITH r(n) AS (SELECT 1 UNION ALL SELECT sum(n) OVER () + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT max(n) OVER () + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 10 FROM r WHERE n < 3 UNION ALL SELECT max(n) OVER () + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        // Before the aggregate check.
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT count(*) OVER () + 1 FROM r WHERE n < 3 GROUP BY n) SELECT n FROM r",
+        "WITH RECURSIVE r(n, m) AS (SELECT 1, 1 UNION ALL SELECT n + 1, (row_number() OVER ()) FROM r WHERE n < 3) SELECT n FROM r LIMIT 0",
+    ] {
+        tw.refuse(sql, SchemaKind::RecursiveWindow);
+    }
+    tw.refuse(
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT max(n) + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        SchemaKind::RecursiveAggregate,
+    );
+    tw.all(&[
+        // Only the rightmost SELECT is checked; the setup and
+        // subqueries may hold windows; an unused CTE is never planned.
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT max(n) OVER () + 1 FROM r WHERE n < 3 UNION ALL SELECT n + 10 FROM r WHERE n < 3) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT row_number() OVER () UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT (SELECT row_number() OVER ()) + n FROM r WHERE n < 3) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 WINDOW w AS ()) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT max(n) OVER () + 1 FROM r WHERE n < 3) SELECT 5",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT max(n) OVER () + 1 FROM (SELECT 5 AS n)) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3), s(m) AS (SELECT row_number() OVER () FROM r) SELECT m FROM s",
+        "CREATE VIEW v AS WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT max(n) OVER () + 1 FROM r WHERE n < 3) SELECT n FROM r",
+    ]);
+    tw.refuse("SELECT * FROM v", SchemaKind::RecursiveWindow);
+}
+
+/// `f(*)` is `f()` on the pin: the zero-argument built-ins take it,
+/// the rest have the wrong argument count (v0.16 review fix: hipp
+/// refused every one as Unsupported).
+#[test]
+fn star_arguments() {
+    let tw = twins(
+        "star",
+        "CREATE TABLE t(a); INSERT INTO t VALUES (1), (2), (2)",
+    );
+    tw.all(&[
+        "SELECT row_number(*) OVER (ORDER BY a), rank(*) OVER (ORDER BY a), cume_dist(*) OVER (ORDER BY a) FROM t",
+        "SELECT percent_rank(*) OVER (ORDER BY a), dense_rank(*) OVER (ORDER BY a) FROM t",
+        "SELECT count(*) OVER (ORDER BY a), count() OVER (ORDER BY a) FROM t",
+    ]);
+    for sql in [
+        "SELECT ntile(*) OVER () FROM t",
+        "SELECT sum(*) OVER () FROM t",
+        "SELECT lag(*) OVER () FROM t",
+        "SELECT first_value(*) OVER () FROM t",
+        "SELECT group_concat(*) OVER () FROM t",
+    ] {
+        tw.refuse(sql, SchemaKind::WrongArgumentCount);
+    }
+    tw.refuse("SELECT row_number(*) FROM t", SchemaKind::MisusedWindow);
+    tw.refuse_parse("SELECT row_number(DISTINCT *) OVER () FROM t");
+}
+
+/// A trigger's WHEN is resolved like a WHERE: window and aggregate
+/// calls there are misuse (v0.16 review fix: hipp evaluated them).
+#[test]
+fn trigger_when_misuse() {
+    let tw = twins("trigwhen", "CREATE TABLE t(a); CREATE TABLE u(x)");
+    tw.all(&["CREATE TRIGGER tw AFTER INSERT ON t WHEN (count(*) OVER ()) > 0 BEGIN INSERT INTO u VALUES (new.a); END"]);
+    tw.refuse("INSERT INTO t VALUES (1)", SchemaKind::MisusedWindow);
+    tw.all(&["SELECT * FROM t", "SELECT * FROM u", "DROP TRIGGER tw"]);
+    tw.all(&["CREATE TRIGGER ta AFTER INSERT ON t WHEN count(*) > 0 BEGIN INSERT INTO u VALUES (new.a); END"]);
+    tw.refuse("INSERT INTO t VALUES (1)", SchemaKind::MisusedAggregate);
+    tw.all(&[
+        "DROP TRIGGER ta",
+        "CREATE TRIGGER tb AFTER INSERT ON t WHEN (SELECT count(*) OVER ()) > 0 AND new.a BEGIN INSERT INTO u VALUES (new.a); END",
+        "INSERT INTO t VALUES (1), (0), (NULL), (0.5), ('x'), ('2')",
+        "SELECT * FROM u",
+    ]);
+}
+
+/// Windows over groups see the groups in GROUP BY order, with the
+/// innermost window's sort directions — never the outer ORDER BY's
+/// (v0.16 review fix: `ORDER BY k DESC` reversed the windows' input).
+#[test]
+fn groups_ignore_outer_order() {
+    let tw = twins(
+        "grouporder",
+        "CREATE TABLE t(k, v, w); INSERT INTO t VALUES (1,10,5),(2,20,5),(3,30,5),(1,1,1);
+CREATE TABLE g(id, a, b, k); INSERT INTO g VALUES (1,'a','a',2),(2,0,0,2),(3,'b','b',2),(4,0,1,0),(5,0,'b',1),(6,2,1,2),(7,0,0,2),(8,'b',3,0)",
+    );
+    tw.all(&[
+        "SELECT k, row_number() OVER (), sum(sum(v)) OVER (ROWS UNBOUNDED PRECEDING) FROM t GROUP BY k ORDER BY k DESC",
+        "SELECT k, row_number() OVER () FROM t GROUP BY k ORDER BY v DESC",
+        "SELECT k, row_number() OVER () FROM t GROUP BY k ORDER BY -k",
+        "SELECT k, row_number() OVER () FROM t GROUP BY k ORDER BY sum(v) DESC",
+        "SELECT k, lag(k) OVER () FROM t GROUP BY k ORDER BY k DESC",
+        "SELECT k, first_value(k) OVER (ORDER BY max(w)), count(*) c FROM t GROUP BY k ORDER BY c DESC",
+        // The innermost window's DESC orders the groups for its ties.
+        "SELECT k, first_value(k) OVER (ORDER BY max(b) DESC) FROM g GROUP BY k",
+        "SELECT k, first_value(k) OVER (ORDER BY max(id) > 3 DESC) FROM g GROUP BY k",
+        "SELECT k, first_value(k) OVER (ORDER BY count(*) > 1 DESC) FROM g GROUP BY k ORDER BY k",
+        "SELECT k, first_value(k) OVER (ORDER BY max(b) DESC GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING), count(*) c FROM g GROUP BY k ORDER BY c DESC",
+        "SELECT k, first_value(k) OVER (ORDER BY max(b) DESC), row_number() OVER (ORDER BY min(a)) FROM g GROUP BY k",
+        "SELECT k, row_number() OVER (ORDER BY min(a)), first_value(k) OVER (ORDER BY max(b) DESC) FROM g GROUP BY k",
+        // Two windows over the same aggregate are one window.
+        "SELECT k, row_number() OVER (ORDER BY sum(a)), row_number() OVER (), rank() OVER (ORDER BY sum(a)) FROM g GROUP BY k",
+        "SELECT k, count(*) OVER (PARTITION BY k ORDER BY k), row_number() OVER (ORDER BY sum(a)) c1, row_number() OVER () FROM g GROUP BY k ORDER BY 4 DESC, 3 DESC",
+    ]);
+}
+
+/// An ORDER BY term naming a result column (alias, ordinal, the
+/// same call) copies its window calls; the copies nest below the
+/// result list's windows and the column shows the copy's values
+/// (v0.16 review fix: the order ties saw differed from the pin's).
+#[test]
+fn order_by_window_columns() {
+    let tw = twins(
+        "ordercopy",
+        "CREATE TABLE t(p, x, k); INSERT INTO t VALUES (1,'a',2),(1,'b',1),(1,'c',2),(2,'d',1);
+CREATE TABLE u(id, a, b, c); INSERT INTO u VALUES (1,0,1,1),(2,1,0,0),(3,1,1,0),(4,0,0,1),(5,1,1,1),(6,0,1,0),(7,1,0,1),(8,0,0,0)",
+    );
+    let b = "SELECT id, row_number() OVER (ORDER BY a) AS ra, row_number() OVER (ORDER BY b) AS rb, row_number() OVER (ORDER BY c) AS rc FROM u";
+    let tails = [
+        "",
+        " ORDER BY id",
+        " ORDER BY ra",
+        " ORDER BY rb",
+        " ORDER BY rc",
+        " ORDER BY 2",
+        " ORDER BY 4, 3",
+        " ORDER BY 4, 3, 2",
+        " ORDER BY -ra",
+        " ORDER BY -rb",
+        " ORDER BY +ra",
+        " ORDER BY (ra)",
+        " ORDER BY rb, ra",
+        " ORDER BY ra, rb",
+        " ORDER BY ra, ra",
+        " ORDER BY ra COLLATE NOCASE",
+        " ORDER BY row_number() OVER (ORDER BY b)",
+        " ORDER BY row_number() OVER (ORDER BY b) + 0",
+        " ORDER BY row_number() OVER (ORDER BY a)",
+        " ORDER BY row_number() OVER (ORDER BY a) + 0",
+        " ORDER BY rc DESC, -ra",
+        " ORDER BY ra LIMIT 3",
+    ];
+    for t in tails {
+        tw.same(&format!("{b}{t}"));
+    }
+    tw.all(&[
+        "SELECT x, count(*) OVER (PARTITION BY k) c, row_number() OVER (ORDER BY p) FROM t ORDER BY c",
+        "SELECT x, row_number() OVER (ORDER BY p) r, count(*) OVER (PARTITION BY k) FROM t ORDER BY r",
+        "SELECT x, row_number() OVER (ORDER BY p) r, count(*) OVER (PARTITION BY k) FROM t ORDER BY 2",
+        "SELECT DISTINCT id, row_number() OVER (ORDER BY a) ra, row_number() OVER (ORDER BY b) rb, row_number() OVER (ORDER BY c) rc FROM u ORDER BY ra",
+        "SELECT DISTINCT id, row_number() OVER (ORDER BY a) ra, row_number() OVER (ORDER BY b) rb, row_number() OVER (ORDER BY c) rc FROM u ORDER BY ra, rc",
+        "SELECT DISTINCT a, row_number() OVER (ORDER BY a) ra FROM u ORDER BY ra",
+        "SELECT id, row_number() OVER (ORDER BY a) ra, row_number() OVER (ORDER BY a) rb FROM u ORDER BY rb",
+        "SELECT id, row_number() OVER (ORDER BY a) + row_number() OVER (ORDER BY b) ra, row_number() OVER (ORDER BY c) rb FROM u ORDER BY ra",
+        "SELECT id, row_number() OVER (ORDER BY c) FROM u ORDER BY row_number() OVER (ORDER BY a), row_number() OVER (ORDER BY b)",
+    ]);
+    // A compound's cores sort by its ORDER BY, and under UNION /
+    // INTERSECT / EXCEPT by every column (the pin's merge), which
+    // copies their window columns the same way. (Rows compared as
+    // sets: hipp's tie order across compound cores is not the
+    // pin's merge order.)
+    let x = "SELECT 100, 100, 100, 100";
+    for t in [
+        format!("{b} UNION ALL {x} ORDER BY 2"),
+        format!("{b} UNION ALL {x} ORDER BY 1"),
+        format!("{b} UNION ALL {x} ORDER BY 4, 3"),
+        format!("{b} UNION ALL {x}"),
+        format!("{b} UNION {x}"),
+        format!("{b} UNION {x} ORDER BY 1"),
+        format!("{b} EXCEPT {x}"),
+        format!("{b} INTERSECT {b}"),
+        format!("{x} UNION ALL {b} ORDER BY 2"),
+        format!("{b} UNION ALL {x} UNION {b}"),
+        format!("{b} UNION {x} UNION ALL {b}"),
+        format!("SELECT * FROM ({b} UNION ALL {x} ORDER BY 2)"),
+        format!(
+            "SELECT id, row_number() OVER (ORDER BY a) + 1, row_number() OVER (ORDER BY b), 0 FROM u UNION {x}"
+        ),
+    ] {
+        tw.same_set(&t);
+    }
+}
+
+/// Generated ORDER BY and GROUP BY shapes over several windows
+/// (aliases, ordinals, negated aliases, fresh calls, DISTINCT,
+/// LIMIT; aggregates inside window arguments and sort keys).
+#[test]
+fn generated_order_group_corpus() {
+    let n: usize = std::env::var("HIPP_WIN_CORPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let seed: u64 = std::env::var("HIPP_WIN_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x0b1d_0016);
+    let mut rng = Rng(seed | 1);
+    const V: &[&str] = &["NULL", "1", "2", "3", "1.5", "'a'", "'b'", "0"];
+    for case in 0..n {
+        let rows = rng.below(10);
+        let mut setup = String::from("CREATE TABLE t(id, a, b, k)");
+        if rows > 0 {
+            let mut vals = Vec::new();
+            for i in 0..rows {
+                vals.push(format!(
+                    "({},{},{},{})",
+                    i + 1,
+                    rng.pick(V),
+                    rng.pick(V),
+                    rng.below(3)
+                ));
+            }
+            setup.push_str(&format!("; INSERT INTO t VALUES {}", vals.join(",")));
+        }
+        let tw = twins(&format!("ogc{}", case % 4), &setup);
+        let grp = rng.chance(35);
+        let cols: &[&str] = if grp {
+            &["k", "sum(a)", "count(*)", "max(b)"]
+        } else {
+            &["id", "a", "b", "k"]
+        };
+        let spec = |rng: &mut Rng| -> String {
+            let mut parts = Vec::new();
+            if rng.chance(45) {
+                let p = if grp {
+                    rng.pick(&["k", "count(*)"])
+                } else {
+                    rng.pick(&["k", "b"])
+                };
+                parts.push(format!("PARTITION BY {p}"));
+            }
+            if rng.chance(70) {
+                parts.push(format!(
+                    "ORDER BY {}{}",
+                    rng.pick(cols),
+                    rng.pick(&["", " DESC"])
+                ));
+            }
+            if rng.chance(30) {
+                parts.push(
+                    rng.pick(&[
+                        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW",
+                        "ROWS UNBOUNDED PRECEDING",
+                        "GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING",
+                    ])
+                    .to_string(),
+                );
+            }
+            parts.join(" ")
+        };
+        let call = |rng: &mut Rng| -> String {
+            let c = rng.pick(cols);
+            let f = match rng.below(10) {
+                0 => "row_number()".to_string(),
+                1 => "rank()".to_string(),
+                2 => "count(*)".to_string(),
+                3 => format!("sum({c})"),
+                4 => format!("group_concat({c})"),
+                5 => format!("first_value({c})"),
+                6 => format!("lag({c})"),
+                7 => format!("nth_value({c}, 2)"),
+                8 => "dense_rank()".to_string(),
+                _ => "cume_dist()".to_string(),
+            };
+            format!("{f} OVER ({})", spec(rng))
+        };
+        let nitems = 1 + rng.below(4);
+        let mut items = Vec::new();
+        for i in 0..nitems {
+            let e = if rng.chance(60) {
+                call(&mut rng)
+            } else {
+                rng.pick(cols).to_string()
+            };
+            items.push(format!("{e} AS c{i}"));
+        }
+        let mut sql = format!(
+            "SELECT {}{} FROM t",
+            if rng.chance(10) { "DISTINCT " } else { "" },
+            items.join(", ")
+        );
+        if grp {
+            sql.push_str(" GROUP BY k");
+        }
+        if rng.chance(85) {
+            let mut terms = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                let t = match rng.below(10) {
+                    0..=3 => format!("c{}", rng.below(nitems)),
+                    4 | 5 => format!("{}", 1 + rng.below(nitems)),
+                    6 => format!("-c{}", rng.below(nitems)),
+                    7 => call(&mut rng),
+                    _ => rng.pick(cols).to_string(),
+                };
+                terms.push(format!("{t}{}", rng.pick(&["", " DESC"])));
+            }
+            sql.push_str(&format!(" ORDER BY {}", terms.join(", ")));
+        }
+        if rng.chance(20) {
+            sql.push_str(&format!(" LIMIT {}", rng.below(6)));
+        }
+        tw.same(&sql);
+    }
+}
+
 // ---------------- bound parameters ----------------
 
 #[test]
