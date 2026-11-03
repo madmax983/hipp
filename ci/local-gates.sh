@@ -31,6 +31,7 @@ while IFS= read -r line; do
 done < ci/feature-sets.txt
 cargo test -q --lib --no-default-features
 cargo test -q --lib --no-default-features --features full
+cargo test -q --lib --no-default-features --features max
 
 if [[ "${quick}" == 0 ]]; then
   step "tests (workspace)"
@@ -50,6 +51,7 @@ for t in thumbv7em-none-eabihf thumbv6m-none-eabi riscv32imac-unknown-none-elf w
   if rustup target list --installed | grep -qx "${t}"; then
     cargo build -q --lib --release --target "${t}" --no-default-features
     cargo build -q --lib --release --target "${t}" --no-default-features --features full
+    cargo build -q --lib --release --target "${t}" --no-default-features --features max
     echo "  ${t}: ok"
   else
     echo "  ${t}: target not installed, skipped (rustup target add ${t})"
@@ -62,4 +64,7 @@ python3 ci/size_gate.py --section tiny target/thumbv7em-none-eabihf/tiny/hipp_th
 step "size gate: full"
 cargo build -q --profile tiny --target thumbv7em-none-eabihf --no-default-features --features full --bin hipp_thumb_demo
 python3 ci/size_gate.py --section full target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
+step "size gate: max"
+cargo build -q --profile tiny --target thumbv7em-none-eabihf --no-default-features --features max --bin hipp_thumb_demo
+python3 ci/size_gate.py --section max target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
 step "all gates passed"

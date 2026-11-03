@@ -10,7 +10,12 @@ license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
-default = ["std", "full"]
+default = ["std", "max"]
+# Everything (ADR 0002): `full` plus the heavyweight v0.16 leaves
+# (window functions, triggers, foreign keys, JSON, ...) that do not
+# fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
+# differential tests) use it; CI ratchets its size separately.
+max = ["full"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.

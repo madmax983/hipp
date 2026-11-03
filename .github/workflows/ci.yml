@@ -73,6 +73,8 @@ jobs:
         run: cargo test --lib --no-default-features
       - name: Library unit tests, full no_std profile
         run: cargo test --lib --no-default-features --features full
+      - name: Library unit tests, max no_std profile (ADR 0002)
+        run: cargo test --lib --no-default-features --features max
 
   test:
     name: test (vs pinned SQLite 3.54.1 oracle)
@@ -121,9 +123,11 @@ jobs:
         run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features
       - name: Core, full no_std profile
         run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features --features full
+      - name: Core, max no_std profile (ADR 0002)
+        run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features --features max
 
   size:
-    name: size gate (thumbv7em tiny + full)
+    name: size gate (thumbv7em tiny + full + max)
     needs: fmt
     runs-on: ubuntu-24.04
     steps:
@@ -141,6 +145,10 @@ jobs:
         run: cargo build --profile tiny --target thumbv7em-none-eabihf --no-default-features --features full --bin hipp_thumb_demo
       - name: Full-profile gate + ratchet
         run: python3 ci/size_gate.py --section full target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
+      - name: Build max no_std profile demo (ADR 0002)
+        run: cargo build --profile tiny --target thumbv7em-none-eabihf --no-default-features --features max --bin hipp_thumb_demo
+      - name: Max-profile gate + ratchet
+        run: python3 ci/size_gate.py --section max target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
 
   miri:
     name: miri (arena unsafe + engine end-to-end)
