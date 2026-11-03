@@ -969,3 +969,371 @@ fn hostile_statements_are_refused_on_a_default_thread() {
         assert!(matches!(got, Out::Err(_)), "{shown}: {got:?}");
     }
 }
+
+// ---------------- v0.16 review fixes ----------------
+
+/// A script: a chain of `k` views whose bodies read the previous
+/// one through `body(m, prev)`, then the last one read.
+fn view_chain(k: usize, m: usize, body: fn(usize, &str) -> String) -> String {
+    let mut sql = format!("{};\n", T.replace("; ", ";\n"));
+    let mut prev = String::from("t");
+    for i in 0..k {
+        sql.push_str(&format!("CREATE VIEW v{i} AS {};\n", body(m, &prev)));
+        prev = format!("v{i}");
+    }
+    sql.push_str(&format!("SELECT * FROM {prev};\n"));
+    sql
+}
+
+/// `view_chain` with CTEs.
+fn cte_chain(k: usize, m: usize, body: fn(usize, &str) -> String) -> String {
+    let mut parts = Vec::new();
+    let mut prev = String::from("t");
+    for i in 0..k {
+        parts.push(format!("c{i} AS ({})", body(m, &prev)));
+        prev = format!("c{i}");
+    }
+    format!(
+        "{};\nWITH {} SELECT * FROM {prev};\n",
+        T.replace("; ", ";\n"),
+        parts.join(", ")
+    )
+}
+
+/// View and CTE bodies are resolved where they are read, inside the
+/// reader's expressions, so their depths add up along a chain (the
+/// review's finding: hipp checked each body on its own, accepted
+/// chains the pin refuses and overflowed the stack on long ones).
+/// Both sides of the pin's boundary, searched live, for chains of
+/// 1 to 5 views or CTEs reading the previous one in a scalar
+/// subquery, an IN subquery, an ON term, a LIMIT and EXISTS — and a
+/// view body's lone leaves, which add nothing there (the pin keeps a
+/// view's tree reduced).
+#[test]
+fn view_and_cte_chains_add_their_depths() {
+    type Body = fn(usize, &str) -> String;
+    let bodies: [(&str, Body); 6] = [
+        ("scalar", |m, p| {
+            format!("SELECT {}(SELECT a FROM {p}) AS a", rep("- ", m))
+        }),
+        ("IN", |m, p| {
+            format!(
+                "SELECT a FROM t WHERE {}a IN (SELECT a FROM {p})",
+                rep("NOT ", m)
+            )
+        }),
+        ("ON", |m, p| {
+            format!(
+                "SELECT x.a AS a FROM t AS x JOIN t AS y ON {}(SELECT a FROM {p})",
+                rep("NOT ", m)
+            )
+        }),
+        ("LIMIT", |m, p| {
+            format!("SELECT a FROM t LIMIT {}(SELECT a FROM {p})", rep("- ", m))
+        }),
+        ("EXISTS", |m, p| {
+            format!(
+                "SELECT a FROM t WHERE {}EXISTS (SELECT a FROM {p})",
+                rep("NOT ", m)
+            )
+        }),
+        ("leaf", |m, p| {
+            format!("SELECT {}(SELECT (SELECT 1) FROM {p}) AS a", rep("- ", m))
+        }),
+    ];
+    type Chain = fn(usize, usize, Body) -> String;
+    let chains: [(&str, Chain); 2] = [("views", view_chain), ("CTEs", cte_chain)];
+    for (cn, chain) in chains {
+        for (bn, body) in bodies {
+            for k in [1, 2, 3, 5] {
+                let b = boundary(1000, |m| pin_script(&chain(k, m, body)).1 == 0);
+                assert!(b > 0, "{cn} / {bn} / {k}");
+                for m in [b, b + 1] {
+                    let sql = chain(k, m, body);
+                    assert_eq!(
+                        hipp_script(&sql),
+                        pin_script(&sql),
+                        "{cn} of {k} / {bn} at {m}"
+                    );
+                }
+            }
+        }
+    }
+    // A view read by a CTE read in a deep expression.
+    for m in [600, 700, 800] {
+        let pre = format!(
+            "{T}; CREATE VIEW v AS SELECT {}1{} AS x",
+            rep("(SELECT ", 20),
+            rep(")", 20)
+        );
+        let sql = format!(
+            "WITH c AS (SELECT (SELECT x FROM v) AS y) SELECT {}(SELECT y FROM c)",
+            rep("- ", m)
+        );
+        let want = pin(&pre, &sql);
+        let got = on_stack(PIN_STACK, move || hipp(pin_cfg(), &pre, &sql));
+        assert_eq!(got, want, "view in a CTE at {m}");
+    }
+}
+
+/// The review's crash shapes, refused cleanly under the default
+/// configuration on a 2 MiB thread in a release build (8 MiB in a
+/// debug one): 4 chained views and 170 chained CTEs, each reading
+/// the previous one in a scalar subquery under 990 `+ 1` terms.
+#[test]
+fn view_and_cte_chains_are_refused_on_a_default_thread() {
+    let stack = if cfg!(debug_assertions) {
+        8 * 1024 * 1024
+    } else {
+        2 * 1024 * 1024
+    };
+    let body = |p: &str| format!("SELECT (SELECT a FROM {p}){} AS a", rep("+1", 990));
+    let mut pre = String::from(T);
+    let mut prev = String::from("t");
+    for i in 0..4 {
+        pre.push_str(&format!("; CREATE VIEW v{i} AS {}", body(&prev)));
+        prev = format!("v{i}");
+    }
+    let mut parts = Vec::new();
+    let mut cprev = String::from("t");
+    for i in 0..170 {
+        parts.push(format!("c{i}(a) AS ({})", body(&cprev)));
+        cprev = format!("c{i}");
+    }
+    let cases = [
+        (pre.clone(), format!("SELECT * FROM {prev}")),
+        (pre, "SELECT * FROM v1".to_string()),
+        (
+            T.to_string(),
+            format!("WITH {} SELECT * FROM {cprev}", parts.join(",")),
+        ),
+    ];
+    for (pre, sql) in cases {
+        let shown = sql[..sql.len().min(40)].to_string();
+        let got = on_stack(stack, move || {
+            hipp(
+                Config::default().statement_arena(16 * 1024, 256 * 1024 * 1024),
+                &pre,
+                &sql,
+            )
+        });
+        assert_eq!(got, Out::Err("ExprTooDeep".into()), "{shown}");
+    }
+}
+
+/// A script run statement by statement: the rows of each, and how
+/// many failed (the pin's CLI goes on after an error, as this does).
+fn hipp_script(sql: &str) -> (String, usize) {
+    let sql = sql.to_string();
+    on_stack(PIN_STACK, move || {
+        block_on(async move {
+            let mut db = Connection::open(MemStorage::new(), pin_cfg())
+                .await
+                .expect("open");
+            let (mut out, mut errors) = (String::new(), 0);
+            for s in sql.split(";\n").filter(|s| !s.trim().is_empty()) {
+                let mut st = match db.prepare(s).await {
+                    Ok(st) => st,
+                    Err(_) => {
+                        errors += 1;
+                        continue;
+                    }
+                };
+                loop {
+                    match st.step().await {
+                        Ok(Step::Row) => {
+                            let line: Vec<String> = (0..st.column_count())
+                                .map(|i| render(st.column_value(i)))
+                                .collect();
+                            out.push_str(&line.join("|"));
+                            out.push('\n');
+                        }
+                        Ok(Step::Done) => break,
+                        Err(_) => {
+                            errors += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            (out, errors)
+        })
+    })
+}
+
+fn pin_script(sql: &str) -> (String, usize) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(common::oracle())
+        .arg(":memory:")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("oracle runs");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(sql.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("oracle finishes");
+    let errors = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with("Error") || l.starts_with("Parse error"))
+        .count();
+    (String::from_utf8_lossy(&out.stdout).into_owned(), errors)
+}
+
+/// Both engines print the same rows and fail the same statements.
+fn scripts_agree(sql: &str) {
+    let want = pin_script(sql);
+    let got = hipp_script(sql);
+    assert_eq!(got, want, "{}", &sql[..sql.len().min(160)]);
+}
+
+/// ORDER BY / GROUP BY ordinals as the pin's `sqlite3ExprIsInteger`
+/// sees them (review fix): through COLLATE, unary signs and
+/// parentheses over a 32-bit integer (or a folded null test) — so
+/// `-(-2)` is the ordinal 2 and `-(2)` out of range — but never
+/// TRUE / FALSE.
+#[test]
+fn ordinal_terms_match_the_oracle() {
+    let terms = [
+        "-(-2)",
+        "+(2)",
+        "-(2)",
+        "-(-2 NOTNULL)",
+        "(2)",
+        "-(-(2))",
+        "+(+(+2))",
+        "(-(-1))",
+        "- (+ (- -2))",
+        "-(1 ISNULL)",
+        "-('a' NOTNULL)",
+        "+(-(-1))",
+        "-(-2) COLLATE nocase",
+        "-(2) COLLATE nocase",
+        "-1 COLLATE nocase",
+        "TRUE",
+        "FALSE",
+        "-TRUE",
+        "+TRUE",
+        "(TRUE)",
+        "TRUE NOTNULL",
+        "4294967297",
+        "-(-4294967297)",
+        "2147483648",
+        "-0",
+        "2.0",
+        "1 IN ()",
+    ];
+    let mut sql =
+        String::from("CREATE TABLE t(a, b);\nINSERT INTO t VALUES (3, 'x'), (1, 'z'), (2, 'y');\n");
+    for t in terms {
+        sql.push_str(&format!(
+            "SELECT 'term {t}';\nSELECT a, b FROM t ORDER BY {t};\nSELECT a, b FROM t GROUP BY {t};\n\
+             SELECT a, b FROM t UNION ALL SELECT 9, 9 ORDER BY {t};\n"
+        ));
+    }
+    scripts_agree(&sql);
+}
+
+/// The width limits the pin checks only where it reads a select as
+/// one (review fixes): RETURNING's result set (refused before any
+/// row changes), and none for an INSERT's column list and one-row
+/// VALUES, an upsert's SET, an unused CTE or a CREATE VIEW body —
+/// which is refused when read.
+#[test]
+fn deferred_width_limits_match_the_oracle() {
+    let a = |n: usize| vec!["a"; n].join(",");
+    let one = |n: usize| vec!["1"; n].join(",");
+    let cols = (1..=2000)
+        .map(|i| format!("c{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "CREATE TABLE u(a UNIQUE);\n\
+         INSERT INTO u VALUES (1) RETURNING {a2001};\nSELECT count(*) FROM u;\n\
+         INSERT INTO u VALUES (1) RETURNING {a2000};\nSELECT count(*) FROM u;\n\
+         UPDATE u SET a = 2 RETURNING {a2001};\nSELECT a FROM u;\n\
+         DELETE FROM u RETURNING {a2001};\nSELECT count(*) FROM u;\n\
+         INSERT INTO u VALUES (5) RETURNING (SELECT {o2001});\nSELECT count(*) FROM u;\n\
+         CREATE TABLE w({cols});\n\
+         INSERT INTO w(c1) VALUES (1) RETURNING *, 1;\nSELECT count(*) FROM w;\n\
+         INSERT INTO w(c1) VALUES (1) RETURNING *;\nSELECT count(*) FROM w;\n\
+         DELETE FROM u;\n\
+         INSERT INTO u({a2001}) VALUES ({o2001});\nSELECT * FROM u;\n\
+         INSERT INTO u({a2001}) VALUES ({o2001}), ({o2001});\nSELECT count(*) FROM u;\n\
+         INSERT INTO u VALUES (1) ON CONFLICT(a) DO UPDATE SET {set};\nSELECT a FROM u;\n\
+         UPDATE u SET {set};\nSELECT a FROM u;\n\
+         WITH c AS (SELECT {o2001}) SELECT 'unused';\n\
+         WITH c AS (SELECT {o2001}) SELECT 2 FROM c;\n\
+         WITH c AS (VALUES ({o2001})) SELECT 'unused values';\n\
+         WITH c AS (SELECT 1 FROM u ORDER BY {a2001}) SELECT 'unused order';\n\
+         WITH c AS (SELECT 1 FROM u GROUP BY {a2001}) SELECT 'unused group';\n\
+         WITH c AS (SELECT 1 FROM u GROUP BY {a2001}) SELECT * FROM c;\n\
+         WITH c AS (SELECT (SELECT {o2001})) SELECT 'unused nested';\n\
+         WITH c AS (SELECT (SELECT {o2001})) SELECT * FROM c;\n\
+         CREATE VIEW v1 AS SELECT {o2001};\nSELECT 'v1';\nSELECT * FROM v1;\n\
+         CREATE VIEW v2 AS SELECT 1 FROM u ORDER BY {a2001};\nSELECT 'v2';\nSELECT * FROM v2;\n\
+         CREATE VIEW v3(x{xs}) AS SELECT 1;\nSELECT 'v3';\n\
+         VALUES ({o2001});\nSELECT 'end';\n",
+        a2001 = a(2001),
+        a2000 = a(2000),
+        o2001 = one(2001),
+        set = vec!["a = a + 1"; 2001].join(", "),
+        xs = (1..2001).map(|i| format!(",x{i}")).collect::<String>(),
+    );
+    scripts_agree(&sql);
+}
+
+/// The compound limit (review fix): 500 SELECTs, unless the last
+/// member is a one-row VALUES (the pin's `SF_Values` exemption) — a
+/// multi-row VALUES there counts.
+#[test]
+fn compound_values_tail_matches_the_oracle() {
+    let chain =
+        |members: Vec<&str>| format!("SELECT count(*) FROM ({});\n", members.join(" UNION ALL "));
+    let (s, v, m) = ("SELECT 1", "VALUES(1)", "VALUES(1),(2)");
+    let mut sql = String::new();
+    for members in [
+        vec![s; 501],
+        [vec![s; 500], vec![v]].concat(),
+        [vec![s; 600], vec![v]].concat(),
+        [vec![s; 600], vec![v, v]].concat(),
+        [vec![v], vec![s; 500]].concat(),
+        [vec![s], vec![v; 500]].concat(),
+        vec![v; 501],
+        vec![m; 501],
+        [vec![s; 499], vec![m]].concat(),
+        [vec![s; 500], vec![m]].concat(),
+        [vec![s; 300], vec![v], vec![s; 300]].concat(),
+    ] {
+        sql.push_str(&chain(members));
+    }
+    sql.push_str(&format!(
+        "{} UNION VALUES(1);\nSELECT 'end';\n",
+        vec![s; 600].join(" UNION ")
+    ));
+    scripts_agree(&sql);
+}
+
+/// A DEFAULT of ALTER TABLE ADD COLUMN under a run of signs (review
+/// fix): held to the pin's limits (two symbols up on its stack), not
+/// stored past them.
+#[test]
+fn add_column_default_sign_runs_match_the_oracle() {
+    for r in ["+ ", "- ", "+ - "] {
+        let f = |n: usize| {
+            format!(
+                "CREATE TABLE u(y);\nINSERT INTO u VALUES (5);\n\
+                 ALTER TABLE u ADD COLUMN x DEFAULT ({}1);\nSELECT * FROM u;\n",
+                r.repeat(n)
+            )
+        };
+        let b = boundary(3000, |n| pin_script(&f(n)).1 == 0);
+        assert!(b > 0, "{r}");
+        scripts_agree(&f(b));
+        scripts_agree(&f(b + 1));
+    }
+}

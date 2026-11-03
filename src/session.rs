@@ -107,10 +107,14 @@ pub struct Config {
     /// (v0.16, `v16`): a statement reaching this many levels fails
     /// with `SchemaKind::NestedTooDeep`. The pin allows 999 nested
     /// views (1000 is its "nested too deep"). Each level costs
-    /// hipp's planner and executor stack — about 10 KiB in a
-    /// release build, 30 KiB in a debug one — so the default (250)
-    /// suits an 8 MiB thread; raise it to 1000 for the pin's limit
-    /// on a thread with the stack for it (the CLI does).
+    /// hipp's planner and executor stack — measured on x86_64 up to
+    /// about 24 KiB in a release build (a view reading the last one
+    /// in an `IN` subquery) and 130 KiB in a debug one — on top of
+    /// what `max_expr_depth` / `max_parser_depth` bound, so the
+    /// default (250) suits an 8 MiB thread in release (about 32 MiB
+    /// in debug); `Config::stack_budget` does not lower it. Raise it
+    /// to 1000 for the pin's limit on a thread with the stack for it
+    /// (the CLI does).
     #[cfg(feature = "v16")]
     pub max_nesting: usize,
     /// The deepest expression a statement may hold (v0.16), counted
@@ -119,15 +123,20 @@ pub struct Config {
     /// `ParseKind::ExprTooDeep`. Every recursive walk of a statement
     /// — the parser, the resolver and planner, the evaluator, the
     /// tree's Clone and Drop — is bounded by it and by
-    /// `max_parser_depth`, so together they bound the stack a
-    /// statement needs: about `STACK_BASE + max_parser_depth *
+    /// `max_parser_depth`. A view or CTE body counts where it is
+    /// read, as on the pin: the depths of a chain of bodies read
+    /// inside one another add up to this limit, and the chain is at
+    /// most `max_nesting` long. Together they bound the stack a
+    /// statement's own text needs: about `STACK_BASE + max_parser_depth *
     /// STACK_PER_SYMBOL + max_expr_depth * STACK_PER_HEIGHT` bytes
     /// (measured on x86_64; see `Config::stack_budget`). The
     /// defaults (1000, the pin's, and 500 symbols) need about
     /// 1.4 MiB in a release build and 5.3 MiB in a debug one; the
     /// pin's limits about 4.3 MiB and 13 MiB — set them on a thread
     /// with that stack (the CLI does), or derive limits from the
-    /// stack you have with `stack_budget`.
+    /// stack you have with `stack_budget`. The views and CTEs a
+    /// statement reads cost their nesting levels on top (see
+    /// `max_nesting`).
     #[cfg(feature = "v04")]
     pub max_expr_depth: usize,
     /// The deepest nesting the parser takes (v0.16), counted in the
@@ -277,7 +286,9 @@ impl Config {
     /// costs measured for this build profile — fits. Up to half the
     /// room past the base goes to the expression depth, the rest to
     /// the parser's. A stack below the base leaves both 0: nothing
-    /// but the statements without expressions parses then.
+    /// but the statements without expressions parses then. It
+    /// budgets a statement's own text: lower `max_nesting` too when
+    /// statements read views or CTEs on a small stack.
     #[cfg(feature = "v04")]
     pub fn stack_budget(self, bytes: usize) -> Config {
         let room = bytes.saturating_sub(STACK_BASE);
@@ -2962,6 +2973,14 @@ impl<S: Storage> Connection<S> {
                     out.push(r);
                 }
             }
+        }
+        // The pin's "too many columns in result set" (v0.16 review
+        // fix, ungated): a RETURNING list is a result set, counted
+        // once `*` is expanded and checked before any row changes.
+        if out.len() > crate::sql::parser::MAX_COLUMN {
+            return Err(Error::Schema {
+                kind: SchemaKind::TooManyColumns,
+            });
         }
         Ok(out)
     }

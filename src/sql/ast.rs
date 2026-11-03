@@ -670,6 +670,19 @@ pub struct SelectStmt {
     /// other.
     #[cfg(feature = "v16")]
     pub with: Option<Box<With>>,
+    /// The pin's name-resolution depth around this select (v0.16
+    /// depth limits, `v16`): the height of the expression of the
+    /// enclosing select it is resolved inside (`Parse.nHeight`
+    /// grows by that much on the way in); 0 for a statement, a FROM
+    /// subquery, a CTE or a view body. Set by the parser.
+    #[cfg(feature = "v16")]
+    pub rctx: u32,
+    /// The deepest sum of nested expression heights that resolving
+    /// this select on its own reaches (the parser's `sel_r`; v0.16,
+    /// `v16`). A view or CTE body is resolved where it is read, so
+    /// the expansion checks the reference's depth plus this.
+    #[cfg(feature = "v16")]
+    pub rdepth: u32,
     /// The core's `WINDOW name AS (...)` definitions (v0.16,
     /// `window`), in source order; a later definition of a name
     /// shadows an earlier one, as on the pin.

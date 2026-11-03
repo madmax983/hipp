@@ -250,6 +250,117 @@ fn column_counts_match_the_oracle() {
     );
 }
 
+/// A parenthesised DEFAULT literal under a run of signs (v0.16
+/// review fix): the parser folds it without the expression grammar,
+/// and that path skipped both limits, so hipp stored a schema the
+/// pin then refused to open ("malformed database schema"). Both
+/// sides of the pin's boundary for the first column (7 symbols below
+/// the run) and a later one (9), and the pin reads the file hipp
+/// writes at the boundary.
+#[test]
+fn default_sign_runs_match_the_oracle() {
+    for r in ["+ ", "- ", "+ - "] {
+        for c in ["x DEFAULT ({}), y", "y, x DEFAULT ({})"] {
+            let f = move |n: usize| {
+                format!(
+                    "CREATE TABLE u({});\nINSERT INTO u(y) VALUES (5);\nSELECT x, y FROM u",
+                    c.replace("{}", &format!("{}1", r.repeat(n)))
+                )
+            };
+            let b = pin_boundary(3000, &f);
+            assert!(b > 0, "{c} / {r}");
+            agree(&f(b));
+            agree(&f(b + 1));
+            let db = common::temp_db("depth-tiny-default");
+            let create = format!(
+                "CREATE TABLE u({})",
+                c.replace("{}", &format!("{}1", r.repeat(b)))
+            );
+            let path = db.clone();
+            on_small_stack(move || {
+                block_on(async move {
+                    let fs = FileStorage::open(&path).expect("file");
+                    let cfg = Config::default().statement_arena(16 * 1024, 1 << 22);
+                    #[cfg(feature = "v04")]
+                    let cfg = cfg.depth_limits(
+                        hipp::sql::parser::PIN_EXPR_DEPTH,
+                        hipp::sql::parser::PIN_PARSER_DEPTH,
+                    );
+                    let mut c = Connection::open(fs, cfg).await.expect("open");
+                    assert_eq!(script(&mut c, &create).await, Out::Rows(String::new()));
+                })
+            });
+            assert_eq!(common::cli(&db, "PRAGMA integrity_check;"), "ok\n");
+        }
+    }
+    // Far past both: refused, no overflow.
+    for r in ["+", "- "] {
+        let sql = format!("CREATE TABLE u(x DEFAULT ({}1))", r.repeat(100_000));
+        assert!(matches!(hipp(&sql), Out::Err(_)), "{r}");
+    }
+}
+
+/// (page type, cell count) of every page of the file at `path`.
+fn page_shapes(path: &std::path::Path) -> Vec<(u8, u16)> {
+    let d = std::fs::read(path).expect("read db");
+    let page = 4096;
+    (0..d.len() / page)
+        .map(|p| {
+            let h = p * page + if p == 0 { 100 } else { 0 };
+            (d[h], u16::from_be_bytes([d[h + 3], d[h + 4]]))
+        })
+        .collect()
+}
+
+/// A schema row that no longer fits page 1 beside the file header
+/// (v0.16 review fix: inserting it panicked with a subtract overflow
+/// when page 1 held no row yet). The pin moves page 1's rows down
+/// into one child page when they fit there (page 1 becomes an
+/// interior page with no cells): hipp writes the same pages, around
+/// the sizes where the row stops fitting page 1, and the pin reads
+/// the file.
+#[test]
+fn schema_rows_past_page_one_match_the_oracle() {
+    for (pre, n) in [
+        ("", 3900),
+        ("", 3950),
+        ("", 3990),
+        ("", 4050),
+        ("CREATE TABLE a1(x);\nCREATE TABLE a2(x);\n", 3850),
+        ("CREATE TABLE a1(x);\nCREATE TABLE a2(x);\n", 3900),
+        ("CREATE TABLE a1(x);\nCREATE TABLE a2(x);\n", 3950),
+    ] {
+        let sql = format!("{pre}CREATE TABLE u(a DEFAULT '{}')", "x".repeat(n));
+        let (mine, theirs) = (
+            common::temp_db("depth-tiny-page1-h"),
+            common::temp_db("depth-tiny-page1-p"),
+        );
+        let (path, script_sql) = (mine.clone(), sql.clone());
+        on_small_stack(move || {
+            block_on(async move {
+                let fs = FileStorage::open(&path).expect("file");
+                let cfg = Config::default().statement_arena(16 * 1024, 1 << 22);
+                let mut c = Connection::open(fs, cfg).await.expect("open");
+                assert_eq!(script(&mut c, &script_sql).await, Out::Rows(String::new()));
+            })
+        });
+        common::cli(&theirs, &format!("{sql};"));
+        assert_eq!(
+            page_shapes(&mine),
+            page_shapes(&theirs),
+            "{n} after {pre:?}"
+        );
+        assert_eq!(common::cli(&mine, "PRAGMA integrity_check;"), "ok\n");
+        assert_eq!(
+            common::cli(
+                &mine,
+                "SELECT length(sql) > 3800 FROM sqlite_schema WHERE name = 'u';"
+            ),
+            "1\n"
+        );
+    }
+}
+
 /// The default test run builds this file without the v0.4 grammar
 /// (`--no-default-features --features std`, its own target
 /// directory) and requires every test above to pass there.
@@ -284,11 +395,13 @@ fn tiny_build_runs_these() {
         "sign_runs_match_the_oracle_at_their_boundaries",
         "hostile_sign_runs_are_refused",
         "column_counts_match_the_oracle",
+        "default_sign_runs_match_the_oracle",
+        "schema_rows_past_page_one_match_the_oracle",
     ] {
         assert!(
             stdout.contains(&format!("test {name} ... ok")),
             "{name} did not pass in the tiny build:\n{stdout}"
         );
     }
-    assert!(stdout.contains("3 passed"), "{stdout}");
+    assert!(stdout.contains("5 passed"), "{stdout}");
 }

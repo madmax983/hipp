@@ -3623,6 +3623,30 @@ every boundary below was found by bisection on the pin):
   ordinal 1 on the pin, `ORDER BY 1 ISNULL` / `GROUP BY 1 ISNULL`
   the out-of-range ordinal 0 — the null-test fold makes an integer
   literal; hipp sorted and grouped by a constant.
+- *Probed for the review fixes:* a view or CTE body is resolved
+  where it is read, inside the reader's expressions, so the sums
+  add up along a chain: views `v_i AS SELECT <m signs>(SELECT a
+  FROM v_{i-1})` read at m = 998 / 498 / 331 / 198 for 1 / 2 / 3 / 5
+  views, CTEs at 997 / 497 / 331 / 197 (likewise through IN, ON,
+  LIMIT and EXISTS readers). A view is one more permissive because
+  the pin keeps its tree reduced (`EXPRDUP_REDUCE`: a leaf loses its
+  height), so a lone leaf it resolves (`SELECT a`, the `1` of
+  `(SELECT 1)`) adds 0 there. An unused CTE is never resolved (its
+  2001 result columns, 2001 ORDER BY terms or 44 nested subqueries
+  pass), nor is a CREATE VIEW body until read; "too many columns
+  in result set" covers RETURNING (after `*`) and a multi-row VALUES,
+  not an INSERT's column list or one-row VALUES, and an upsert's
+  SET takes any number of terms. A compound past 500 SELECTs is
+  accepted when its last member is a one-row VALUES (600 SELECTs
+  then `VALUES(1)` read, `VALUES(1),(2)` do not).
+  `sqlite3ExprIsInteger` looks through COLLATE, unary `+` / `-`
+  and parentheses (`ORDER BY -(-2)` is the ordinal 2, `-(2)` out of
+  range) but not TRUE / FALSE. `DEFAULT (<signs> 1)` takes the
+  pin's two limits at 7 symbols for the first column and 9 for a
+  later one or ADD COLUMN (`+`: 2492 / 2490; `-`: 999). A first
+  CREATE TABLE whose schema row no longer fits page 1 makes page 1
+  an interior page with no cells over one child (`balance_deeper`),
+  and a leaf under page 1 is never quick-split (`balance_nonroot`).
 
 **Shipped (ungated):** `sql::parser::Limits` (`Config::limits`,
 `Config::max_expr_depth`, `Config::max_parser_depth`,
@@ -3640,14 +3664,41 @@ catalog load, view bodies at expansion (`parse_view`: the body's
 resolution depth is checked when it is read, not at CREATE VIEW),
 CHECK / DEFAULT / generated re-parses, ALTER's text walks.
 `literal_at` walks sign runs without recursion (tiny profile
-included, with the pin's limits on the run in `INSERT VALUES` and
-`WHERE rowid =`). The null-test fold (above). CREATE TABLE items
+included, with the pin's limits on the run in `INSERT VALUES`,
+`WHERE rowid =` and a parenthesised DEFAULT — `sign_run`). The null-test fold (above). CREATE TABLE items
 nest parentheses up to the parser limit (they stopped at 32). The
 count limits above. The parser's `sql[a..b]` slices became checked
 `span`s; `cmp_op` / `arith`'s `unreachable!()` arms an error.
 
+**Review fixes (2026-11-03, ungated):** view and CTE bodies are
+checked where they are read: the parser records on each subquery
+the height of the expression the pin resolves it in
+(`SelectStmt::rctx`, marked when that expression is complete) and
+each select's own resolution depth (`SelectStmt::rdepth`); the
+view / CTE expansion carries the sum down (`Expander::ctx`) and
+refuses a body whose depth there passes the limit (a chain of views
+or CTEs used to pass any length — wrong answers, then a stack
+overflow; the review's 170-CTE chain aborted the CLI). CTE bodies
+are parsed deferred (`defer`, like a CREATE VIEW body) and a view's
+lone leaves count 0 (`reduced`). The width limits only resolution
+applies (result set, ORDER BY / GROUP BY terms, VALUES rows) are
+checked on the bodies the expansion copies, not in an unused CTE or
+a CREATE VIEW; RETURNING is held to 2000 columns after `*` before
+any row changes; an INSERT's one VALUES row and an upsert's SET are
+not limited; the compound limit exempts a one-row VALUES tail. The
+ordinal fold (`ordinal_term`) follows `sqlite3ExprIsInteger`. A
+parenthesised DEFAULT sign run is held to both limits at its
+column's stack base (hipp stored schemas the pin cannot open).
+`btree_insert` balances page 1 as the pin does (the empty page-1
+quick split panicked with a subtract overflow; a schema row of
+about 3950 bytes in a fresh file).
+
 *Stack.* With the tree height and the parser stack bounded, every
-recursive walk is too; to make the bound affordable the hot
+recursive walk of one statement's text is too, and the resolution
+sum bounds the expressions of the view and CTE bodies it reads
+together; the bodies' own nesting (FROM levels, planner and executor
+frames per body) is bounded by `Config::max_nesting`, not by
+`stack_budget` (see below). To make the bound affordable the hot
 recursive functions were split so one nesting level puts a small
 frame on the stack: the parser's primary / unary / parenthesis /
 call / CASE / CAST / column paths, `resolve_scoped` (common nodes
@@ -3668,7 +3719,12 @@ STACK_PER_SYMBOL + expr_depth * STACK_PER_HEIGHT` (64 K + 1.5 K +
 704 B release, 320 K + 4 K + 3.4 K debug; a debug build needs 270
 KiB for `SELECT 1` — the step future alone is 100 KiB).
 `Config::tiny()` takes 64 / 64. The CLI sets the pin's limits on
-its 512 MiB thread.
+its 512 MiB thread. A view or CTE level read inside another costs
+up to about 24 KiB in release (a view reading the last one in an IN
+subquery; 12 KiB through a scalar subquery) and 130 KiB in debug:
+the default `max_nesting` of 250 needs about 6 MiB in release (an 8
+MiB thread) and 32 MiB in debug — measured, and documented on
+`Config::max_nesting`.
 
 **Tests:** `tests/depth_v16.rs` (8 tests): 36 nesting shapes at the
 pin's limits on both sides of every boundary vs the live pin
@@ -3692,7 +3748,21 @@ Parser unit tests: the statement length limit, the ON fold.
 `hipp-cli/tests/cli_v16_depth.rs` (2 tests): a byte-identical
 batch of 15 shapes at and past their boundaries, the ordinal fold
 and the count limits. `tests/views_cte_v16.rs`'s pin-limit
-configuration now sets the pin's depth limits too.
+configuration now sets the pin's depth limits too. Review fixes:
+`tests/depth_v16.rs` +6 — view and CTE chains (1 to 5 bodies,
+reading the last in a scalar / IN / ON / LIMIT / EXISTS position,
+and a view's lone leaves) on both sides of the pin's boundary
+searched live; the review's crash chains refused on a 2 MiB
+release thread under the defaults; 27 ORDER BY / GROUP BY /
+compound ordinal terms; the deferred width limits (RETURNING with
+the table state after, INSERT column lists, upsert SET, unused
+CTEs, CREATE VIEW bodies and their readers); compounds ending in
+VALUES; ALTER TABLE ADD COLUMN DEFAULT sign runs.
+`tests/depth_tiny_v16.rs` +2 (also in the tiny build): DEFAULT
+sign runs at both column bases with the pin reading the file, and
+schema rows that stop fitting page 1 (page shapes equal to the
+pin's). `hipp-cli/tests/cli_v16_depth.rs` +1: a byte-identical
+batch of all of these.
 
 **Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
 end with "==> all gates passed".
@@ -3705,7 +3775,15 @@ column checks of CREATE TABLE and the result list. Full **482,328 B**
 (Δ **+7,432 B** vs 474,896, ratchet raised to it) and max **482,312 B**
 (Δ **+7,408 B** vs 474,904): the parser's two counts in every
 construct, the resolution-depth fold, the count limits and the
-split walkers.
+split walkers. Review fixes (on top of the window unit's 76,476 /
+482,304 / 524,224): tiny **76,728 B** (Δ **+252 B**, ratchet raised):
+correctness fixes on CREATE TABLE, within the +256 B allowance —
+the page-1 split (a panic) and the DEFAULT sign-run limits (a file
+the pin cannot open), with `sign_run` shared by the tiny literal
+paths; full **484,116 B** (Δ **+1,812 B**) and max **526,372 B**
+(Δ **+2,148 B**): the resolution marks and checks, the deferred width
+checks, the ordinal fold. `link.x`'s sizing FLASH region grew to
+1 MiB (max's budget, ADR 0002): max had reached the old 512 KiB.
 
 **Honest gaps:**
 
@@ -3715,17 +3793,22 @@ split walkers.
   expression's) is checked there and not in hipp, so hipp accepts
   `SELECT * FROM (SELECT <height 1000> FROM t)` where the pin refuses
   it (the pin refuses at 999 + 1).
-- A view's or CTE's resolution depth is checked at the select that
-  owns it (a view: on its own, when read; a CTE: the select with the
-  WITH clause); the pin resolves either where it is read, inside
-  any enclosing expressions. NATURAL join terms are not counted in
-  the WHERE tree (USING ones are), nor is the pin's shortcut of `ON
-  0`. CHECK / DEFAULT / generated expressions are re-parsed alone
-  and counted at the first column's base (a later column's sits two
-  symbols higher on the pin); likewise ALTER TABLE ADD COLUMN's.
-  RETURNING after a several-clause upsert and CAST type arguments
-  use approximate bases. PRAGMA `table_info` of a view and ALTER's
-  view re-plans read the view body without the resolution check.
+- NATURAL join terms are not counted in the WHERE tree (USING ones
+  are), nor is the pin's shortcut of `ON 0`; in a view body the ON
+  chain's AND nodes, which the pin rebuilds over its reduced copy,
+  are counted at their parse-time heights. A subquery inside a
+  WINDOW clause definition counts its own expression's height, not
+  that of the call that uses the window. CHECK, expression DEFAULT
+  and generated expressions are re-parsed alone and counted at the
+  first column's base (a later column's sits two symbols higher on
+  the pin; a parenthesised signed-literal DEFAULT is exact);
+  likewise ALTER TABLE ADD COLUMN's. RETURNING after a
+  several-clause upsert and CAST type arguments use approximate
+  bases.
+- `Config::stack_budget` budgets one statement's text; the views and
+  CTEs it reads nest up to `max_nesting` levels deeper, which a
+  small stack must lower by hand (the per-level costs are on that
+  field). Nested FROM subqueries inside each body multiply with it.
 - The join limit is counted per FROM clause (the pin counts after
   flattening, so a join of flattened subqueries can pass 64 there).
 - The stack costs are x86_64 measurements; other targets' frames
@@ -3736,10 +3819,16 @@ split walkers.
   (pre-existing: past three duplicate names the pin switches to a
   random column-name suffix).
 - The audit for other panics reachable from SQL covered the parser
-  and the evaluator; the `unreachable!()` / `expect` left in
-  `session.rs` and `btree.rs` guard structural invariants (plan
-  kinds, a B-tree descent's parent), not data, and were not
-  rewritten.
+  and the evaluator, and (review) the page-1 split; the
+  `unreachable!()` / `expect` / slice indexing left in `session.rs`
+  and `btree.rs` guard structural invariants (plan kinds, a B-tree
+  descent's parent, non-empty balance groups), not data, and were
+  not rewritten.
+- `sqlite_schema` pages now split as the pin's do, but a balance of
+  many leaves under page 1 can still put a cell or two on a
+  different sibling than the pin (80 / 78 where the pin has 81 / 77
+  at 400 tables: the v0.15 window distribution), so the files are
+  not byte-identical there; both read and pass integrity checks.
 
 ### Window functions (2026-11-03)
 

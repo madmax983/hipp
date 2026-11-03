@@ -446,30 +446,39 @@ aspirations.
   files with triggers cannot be altered; re-created tables can get
   other root page numbers than on the pin (STATUS.md).
 - **Parser and evaluator depth limits (crash hardening).**
-  Ungated: no statement or stored schema text can overflow the
-  stack any more (100 000 nested parentheses, signs, calls or
+  Ungated: within its limits no statement or stored schema text
+  overflows the stack (100 000 nested parentheses, signs, calls or
   subqueries used to; in the tiny profile a long run of signs in
   `INSERT ... VALUES` did). hipp counts what the pin counts — the
   expression tree's height (`SQLITE_LIMIT_EXPR_DEPTH` 1000, with
   the heights of the expressions a subquery sits in added during
-  resolution: 43 nested scalar subqueries read, 44 do not) and
-  its LALR parser stack (2500 symbols: 2493 nested parentheses,
-  831 nested calls, 414 nested FROM subqueries) — and refuses past
-  them as the pin does ("Expression tree is too large",
-  "Recursion limit"), at the pin's exact boundary in every probed
-  context. `Config::max_expr_depth` / `max_parser_depth` bound the
-  stack a statement needs (`Config::stack_budget(bytes)` derives
+  resolution: 43 nested scalar subqueries read, 44 do not; a view
+  or CTE body counts where it is read, so a chain of views each
+  reading the last in a subquery adds up) and its LALR parser
+  stack (2500 symbols: 2493 nested parentheses, 831 nested calls,
+  414 nested FROM subqueries) — and refuses past them as the pin
+  does ("Expression tree is too large", "Recursion limit"), at the
+  pin's exact boundary in every probed context.
+  `Config::max_expr_depth` / `max_parser_depth` bound the stack one
+  statement's text needs (`Config::stack_budget(bytes)` derives
   them from a thread's stack; the defaults, 1000 and 500, fit a 2
-  MiB thread in a release build); the CLI runs the pin's. The
-  hot recursive walkers (parser, resolver, evaluator, FROM
-  planner) were split so each nesting level costs a few hundred
-  bytes in release. Also matched: 500 compound SELECTs, 1000 call
-  arguments, 2000 columns in a table, index, result set (after
-  `*`), VALUES row or SET list, 2000 ORDER BY / GROUP BY terms, 64
-  joined tables, the statement length; and `ORDER BY 2 NOTNULL`
-  is the ordinal 1 as on the pin (a null test over a literal folds
-  to an integer; hipp sorted by a constant). Tiny +252 B
-  (STATUS.md).
+  MiB thread in a release build); view and CTE bodies read inside
+  one another add up to `Config::max_nesting` levels on top
+  (default 250: an 8 MiB thread in release, about 32 MiB in a
+  debug build). The CLI runs the pin's limits. The hot recursive
+  walkers (parser, resolver, evaluator, FROM planner) were split
+  so each nesting level costs a few hundred bytes in release. Also
+  matched: 500 compound SELECTs (unless the last is a one-row
+  VALUES), 1000 call arguments, 2000 columns in a table, index,
+  result set (after `*`, RETURNING too), multi-row VALUES or
+  UPDATE SET list, 2000 ORDER BY / GROUP BY terms (result sets and
+  terms only where the pin resolves the select: not in an unused
+  CTE or a CREATE VIEW body), 64 joined tables, the statement
+  length. Ungated wrong-answer fixes: `ORDER BY 2 NOTNULL`,
+  `-(-2)`, `+(2)` are ordinals as on the pin and `ORDER BY TRUE`
+  is not; a schema row too large for page 1 next to the file
+  header no longer panics (page 1 now splits as the pin's does).
+  Tiny +252 B (STATUS.md).
 - **Window functions** (new leaf feature `window`, in `max` —
   ADR 0002 — not `full`). `f(...) [FILTER (WHERE ...)] OVER
   (PARTITION BY ... ORDER BY ... frame)`, `OVER name` and the

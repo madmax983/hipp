@@ -177,3 +177,82 @@ SELECT 'after';
     let (got, _) = run_stdin(&hipp_bin(), &sql);
     assert_eq!(got, want);
 }
+
+/// The review fixes, rendered (v0.16): view and CTE chains whose
+/// depths add up (the 170-CTE chain used to overflow the CLI's
+/// stack), ordinals under signs and parentheses, RETURNING's width
+/// (the refused statement changes nothing), compound chains ending
+/// in a one-row VALUES, the widths only a read body is held to, and
+/// a schema row too large for page 1.
+#[test]
+fn review_fixes_byte_identical() {
+    let mut sql =
+        String::from("CREATE TABLE t(a, b);\nINSERT INTO t VALUES (3, 'x'), (1, 'z'), (2, 'y');\n");
+    // Views: each reads the last inside a scalar subquery.
+    let mut prev = String::from("t");
+    for i in 0..3 {
+        sql.push_str(&format!(
+            "CREATE VIEW v{i} AS SELECT {}(SELECT a FROM {prev} LIMIT 1) AS a;\n",
+            rep("- ", 330)
+        ));
+        prev = format!("v{i}");
+    }
+    sql.push_str("SELECT * FROM v1;\nSELECT * FROM v2;\nSELECT 'views';\n");
+    // The CTE chain of the review: refused, no crash.
+    let mut parts = Vec::new();
+    let mut prev = String::from("t");
+    for i in 0..170 {
+        parts.push(format!(
+            "c{i}(a) AS (SELECT (SELECT a FROM {prev} LIMIT 1){})",
+            rep("+1", 990)
+        ));
+        prev = format!("c{i}");
+    }
+    sql.push_str(&format!(
+        "WITH {} SELECT * FROM {prev};\nSELECT 'ctes';\n",
+        parts.join(",")
+    ));
+    for t in ["-(-2)", "+(2)", "-(2)", "-(-2 NOTNULL)", "TRUE", "(-(-1))"] {
+        sql.push_str(&format!(
+            "SELECT a, b FROM t ORDER BY {t};\nSELECT a, b FROM t GROUP BY {t};\n"
+        ));
+    }
+    sql.push_str("SELECT a, b FROM t UNION ALL SELECT 9, 9 ORDER BY -(-2);\n");
+    let wide = vec!["a"; 2001].join(",");
+    sql.push_str(&format!(
+        "INSERT INTO t VALUES (4, 'w') RETURNING {wide};\nSELECT count(*) FROM t;\n\
+         DELETE FROM t RETURNING {wide};\nSELECT count(*) FROM t;\n\
+         UPDATE t SET a = 0 RETURNING {wide};\nSELECT sum(a) FROM t;\n"
+    ));
+    let members = |n: usize, tail: &str| {
+        format!(
+            "SELECT count(*) FROM ({}{tail});\n",
+            vec!["SELECT 1"; n].join(" UNION ALL ")
+        )
+    };
+    sql.push_str(&members(600, " UNION ALL VALUES(1)"));
+    sql.push_str(&members(600, " UNION ALL VALUES(1), (2)"));
+    let ones = vec!["1"; 2001].join(",");
+    sql.push_str(&format!(
+        "WITH c AS (SELECT {ones}) SELECT 'unused';\n\
+         CREATE VIEW wide AS SELECT {ones};\nSELECT 'created';\nSELECT * FROM wide;\n\
+         INSERT INTO t(a{}) VALUES (5{});\nSELECT count(*) FROM t;\n",
+        rep(",a", 2000),
+        rep(",5", 2000)
+    ));
+    sql.push_str(&format!(
+        "CREATE TABLE big(a DEFAULT '{}');\nSELECT count(*) FROM sqlite_schema;\n",
+        "x".repeat(3950)
+    ));
+    let (want, pin_errors) = run_stdin(&oracle(), &sql);
+    let (got, hipp_errors) = run_stdin(&hipp_bin(), &sql);
+    assert_eq!(got, want);
+    assert_eq!(hipp_errors, pin_errors);
+    for marker in ["views\n", "ctes\n", "unused\n", "created\n", "601\n"] {
+        assert!(got.contains(marker), "{marker:?} missing from:\n{got}");
+    }
+    // v2, the CTE chain, `-(2)` and `-(-2 NOTNULL)` twice
+    // each, the three RETURNINGs, 600 members then a two-row VALUES,
+    // reading the wide view.
+    assert_eq!(pin_errors, 11, "{got}");
+}
