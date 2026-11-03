@@ -3253,16 +3253,9 @@ pub async fn index_insert<S: Storage>(
     };
 
     // ---- merge into the leaf in key order ----
-    let mut all: AVec<IndexCell> = AVec::new();
-    for (i, c) in leaf_cells.iter().enumerate() {
-        if i == leaf_pos {
-            all.push(new_cell.clone());
-        }
-        all.push(c.clone());
-    }
-    if leaf_pos == leaf_cells.len() {
-        all.push(new_cell);
-    }
+    // The parsed leaf cells are not needed afterwards: reuse them.
+    let mut all = leaf_cells;
+    all.insert(leaf_pos, new_cell);
 
     let hdr_off = 0usize; // index roots are never page 1
     if index_page_need(all.as_slice(), hdr_off, false) <= usable {

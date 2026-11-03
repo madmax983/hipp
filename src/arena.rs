@@ -422,6 +422,11 @@ impl<T> AVec<T> {
         let n = n.min(self.vec.len());
         self.vec.drain(..n);
     }
+    /// Insert `v` at `at`, shifting later elements up (panics if
+    /// `at > len`, like `Vec::insert`).
+    pub fn insert(&mut self, at: usize, v: T) {
+        self.vec.insert(at, v);
+    }
 }
 
 impl<T> Default for AVec<T> {
