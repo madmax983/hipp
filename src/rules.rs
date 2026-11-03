@@ -696,8 +696,10 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | Expr::ExistsSubquery(_) => false,
         #[cfg(feature = "params")]
         Expr::Param(..) => false,
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        Expr::TrigValue(..) => false,
         #[cfg(feature = "triggers")]
-        Expr::TrigValue(..) | Expr::Raise(_, None, _) => false,
+        Expr::Raise(_, None, _) => false,
         #[cfg(feature = "triggers")]
         Expr::Raise(_, Some(a), _) => expr_any(a, f),
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => expr_any(a, f) || expr_any(b, f),

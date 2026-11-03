@@ -299,8 +299,9 @@ aspirations.
   `auto_vacuum`); what hipp actually does (`journal_mode` is
   `delete`, `synchronous` FULL, `cache_size` its page pool,
   `busy_timeout`) — any write hipp cannot honour is refused, never
-  pretended; the flags `foreign_keys` (while on, writes to tables
-  in a foreign key are refused: hipp does not enforce them),
+  pretended; the flags `foreign_keys` (enforced with the
+  `foreign_keys` leaf; without it, while on, writes to tables in a
+  foreign key are refused),
   `recursive_triggers` (honoured with `triggers`),
   `ignore_check_constraints` (really skips
   CHECK) and `case_sensitive_like` (really changes LIKE);
@@ -518,6 +519,26 @@ aspirations.
   (ungated, every profile — they used to skip the trigger
   silently). TEMP triggers on main tables are refused. Tiny +196 B,
   full +528 B (the ungated refusals), max +33.9 KB (STATUS.md).
+- **Foreign-key enforcement** (new leaf feature `foreign_keys`, in
+  `max` — ADR 0002 — not `full`). With `PRAGMA foreign_keys = ON`
+  writes are checked as the pin checks them — with its violation
+  *counters*: immediate keys fail the statement at its end (even
+  under OR FAIL / IGNORE), `DEFERRABLE INITIALLY DEFERRED` keys and
+  `PRAGMA defer_foreign_keys` fail COMMIT / a committing RELEASE
+  with the transaction left open, savepoints restore the counts,
+  and a multi-row statement may fix its own violations (an orphan
+  left with the pragma off can cancel one, the pin's quirk). ON
+  DELETE / ON UPDATE CASCADE, SET NULL, SET DEFAULT, RESTRICT and NO
+  ACTION run as the pin's action programs (under ABORT, own
+  `changes()` frames, the trigger depth limit, firing the child's
+  triggers); composite and self-referencing keys with the pin's
+  three comparison rules; "foreign key mismatch" / "no such table"
+  when the write is prepared, over the whole cascade tree; REPLACE,
+  upsert, RETURNING, DROP TABLE's implicit DELETE and the pin's
+  `isSetNullAction` quirk; `PRAGMA foreign_key_check [t]` and
+  `defer_foreign_keys`. Without the leaf the refusal stays.
+  Tiny unchanged, full +744 B (the ungated deferrable /
+  ADD COLUMN REFERENCES fixes), max +26.9 KB (STATUS.md).
 
 ## What v0.13 does
 

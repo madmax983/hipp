@@ -791,7 +791,12 @@ impl<S: Storage> Connection<S> {
     /// Record how a failure of a program's statement resolves the
     /// firing statement (the innermost failure's, which is the first
     /// recorded).
-    fn note_failure(&mut self, e: &Error<S::Error>, conflict: Option<ConflictAction>, rb: bool) {
+    pub(super) fn note_failure(
+        &mut self,
+        e: &Error<S::Error>,
+        conflict: Option<ConflictAction>,
+        rb: bool,
+    ) {
         // RAISE(IGNORE) fails nothing: the program that ran it ends.
         if self.trig.resolve.is_some()
             || matches!(
@@ -850,6 +855,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             Ast::Delete { table, .. } => (*table, None),
             _ => return Ok(()),
         };
+        // DROP TABLE's implicit DELETE fires none (`foreign_keys`).
+        #[cfg(feature = "foreign_keys")]
+        if core::mem::take(&mut self.conn.fk.silent) {
+            return Ok(());
+        }
         let name = copy_vec(handle_bytes(&self.arena, table));
         let sql = copy_vec(handle_bytes(&self.arena, self.sql_text));
         self.trig =
@@ -1029,6 +1039,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let Some(r) = self.conn.trig.resolve.take() else {
             return false;
+        };
+        // The pin's FAIL halt still checks the statement's foreign-key
+        // violations (`foreign_keys`): with any, it aborts.
+        #[cfg(feature = "foreign_keys")]
+        let r = if r == Resolve::Fail && self.fk_end().is_err() {
+            Resolve::Abort
+        } else {
+            r
         };
         match r {
             Resolve::Fail => {

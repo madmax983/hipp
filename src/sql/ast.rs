@@ -83,8 +83,9 @@ pub struct ColumnDef {
 }
 
 /// One FOREIGN KEY / REFERENCES clause of a `CREATE TABLE`
-/// (v0.16, `v16`): parsed, never enforced; `PRAGMA
-/// foreign_key_list` reports it. Actions are the pin's codes:
+/// (v0.16, `v16`): `PRAGMA foreign_key_list` reports it, and the
+/// `foreign_keys` leaf enforces it while `PRAGMA foreign_keys` is
+/// ON. Actions are the pin's codes:
 /// 0 NO ACTION, 1 RESTRICT, 2 SET NULL, 3 SET DEFAULT, 4 CASCADE.
 #[cfg(feature = "v16")]
 #[derive(Debug, Clone)]
@@ -98,6 +99,11 @@ pub struct ForeignKey {
     pub to: AVec<ABytes>,
     pub on_update: u8,
     pub on_delete: u8,
+    /// `DEFERRABLE INITIALLY DEFERRED` (the pin's `isDeferred`): a
+    /// violation is counted against the transaction and checked at
+    /// COMMIT. A column-level deferrable clause applies to the
+    /// table's most recent foreign key, as on the pin.
+    pub deferred: bool,
 }
 
 /// One UNIQUE or PRIMARY KEY constraint of a `CREATE TABLE`, in
@@ -274,7 +280,9 @@ pub enum Expr {
     /// (the pin's: none for a column, INTEGER for the rowid) and its
     /// collating sequence (the column's; none for the rowid). Never
     /// produced by the parser.
-    #[cfg(feature = "triggers")]
+    /// Also the `OLD.` / `NEW.` values of a foreign-key action
+    /// program (`foreign_keys`).
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     TrigValue(Literal, Option<crate::record::Affinity>, Option<Coll>),
 }
 

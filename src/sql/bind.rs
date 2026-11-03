@@ -161,8 +161,10 @@ impl Binder<'_> {
             Expr::Literal(_) | Expr::Column { .. } => {}
             #[cfg(feature = "v04")]
             Expr::HexTooBig(_) => {}
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            Expr::TrigValue(..) => {}
             #[cfg(feature = "triggers")]
-            Expr::TrigValue(..) | Expr::Raise(_, None, _) => {}
+            Expr::Raise(_, None, _) => {}
             #[cfg(feature = "triggers")]
             Expr::Raise(_, Some(a), _) => self.expr::<E>(a)?,
             Expr::Binary(_, a, c) | Expr::Like(a, c, _) => {
@@ -432,8 +434,10 @@ fn constant(e: &Expr) -> bool {
         Expr::Literal(_) | Expr::Column { .. } | Expr::Param(..) => true,
         #[cfg(feature = "v04")]
         Expr::HexTooBig(_) => true,
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        Expr::TrigValue(..) => true,
         #[cfg(feature = "triggers")]
-        Expr::TrigValue(..) | Expr::Raise(_, None, _) => true,
+        Expr::Raise(_, None, _) => true,
         #[cfg(feature = "triggers")]
         Expr::Raise(_, Some(a), _) => constant(a),
         Expr::Binary(_, a, b) | Expr::Like(a, b, _) => constant(a) && constant(b),

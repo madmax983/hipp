@@ -19,6 +19,7 @@ params
 v04,math
 v16,window
 v16,triggers
+v16,foreign_keys
 indexes,v04
 indexes,v05
 indexes,v06

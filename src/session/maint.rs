@@ -299,8 +299,8 @@ impl<S: Storage> Statement<'_, S> {
         }
         // A statement of a trigger program undoes nothing itself (the
         // statement that fired the trigger does, `session::trigger`).
-        #[cfg(feature = "triggers")]
-        if self.conn.in_trigger() {
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        if self.conn.in_program() {
             return;
         }
         let writes = match &self.plan {
@@ -341,6 +341,10 @@ impl<S: Storage> Statement<'_, S> {
     /// Keep what this statement changed although it failed (OR
     /// FAIL): its savepoint is released.
     pub(super) fn keep_stmt(&mut self) {
+        #[cfg(feature = "foreign_keys")]
+        {
+            self.conn.fk.kept = true;
+        }
         if let Some(level) = self.stmt_sp.take()
             && self.conn.pager.sp_depth() > level
         {
@@ -425,6 +429,11 @@ impl<S: Storage> Statement<'_, S> {
         match m {
             Maint::Nothing => {}
             Maint::Savepoint(name) => {
+                #[cfg(feature = "foreign_keys")]
+                {
+                    let level = self.conn.pager.sp_depth();
+                    self.conn.fk.savepoint(level);
+                }
                 let starts = !self.conn.explicit_txn;
                 self.conn.pager.sp_open(Some(name.as_slice()), starts);
                 self.conn.explicit_txn = true;
@@ -488,11 +497,17 @@ impl<S: Storage> Statement<'_, S> {
             .sp_find(name)
             .ok_or_else(Self::no_such_savepoint)?;
         if level == 0 && self.conn.pager.sp_starts_txn(0) {
+            // Outstanding deferred foreign-key violations fail it,
+            // everything staying open (`foreign_keys`).
+            #[cfg(feature = "foreign_keys")]
+            self.conn.fk_commit_check()?;
             self.conn.pager.drive_commit().await?;
             self.conn.pager.sp_clear();
             self.conn.explicit_txn = false;
         } else {
             self.conn.pager.sp_release(level);
+            #[cfg(feature = "foreign_keys")]
+            self.conn.fk.release(level);
         }
         Ok(())
     }
@@ -511,6 +526,9 @@ impl<S: Storage> Statement<'_, S> {
             self.conn.explicit_txn = false;
             return Err(e);
         }
+        // The deferred foreign-key counters return with it.
+        #[cfg(feature = "foreign_keys")]
+        self.conn.fk.rollback_to(level);
         // The schema may have rolled back with it.
         self.conn.rebuild_catalog().await
     }

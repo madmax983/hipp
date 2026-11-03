@@ -1003,8 +1003,10 @@ impl Expander<'_> {
             Expr::Literal(_) | Expr::Column { .. } | Expr::HexTooBig(_) => {}
             #[cfg(feature = "params")]
             Expr::Param(..) => {}
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            Expr::TrigValue(..) => {}
             #[cfg(feature = "triggers")]
-            Expr::TrigValue(..) | Expr::Raise(_, None, _) => {}
+            Expr::Raise(_, None, _) => {}
             #[cfg(feature = "triggers")]
             Expr::Raise(_, Some(a), _) => self.expr::<E>(a)?,
             Expr::Binary(_, a, c) | Expr::Like(a, c, _) => {

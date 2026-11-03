@@ -323,6 +323,29 @@ pub enum SchemaKind {
     /// REFERENCES names at most one parent column, a table-level
     /// key as many as it lists. Make the lists the same length.
     ForeignKeyColumns,
+    /// A write left a foreign key unsatisfied while `PRAGMA
+    /// foreign_keys` is ON (v0.16, `foreign_keys`; the pin's
+    /// "FOREIGN KEY constraint failed"): a child row names a parent
+    /// key no parent row has, or a parent row still referred to went
+    /// — at the statement's end for an immediate key, at COMMIT (the
+    /// transaction staying open) for a deferred one; or a RESTRICT
+    /// action refused the change. Insert the parent first, delete
+    /// the children first, or defer the key.
+    #[cfg(feature = "foreign_keys")]
+    ForeignKeyViolation,
+    /// A foreign key whose parent columns are not the parent's
+    /// PRIMARY KEY or a UNIQUE index with their collations (v0.16,
+    /// `foreign_keys`; the pin's "foreign key mismatch - "c"
+    /// referencing "p""), found when a write needs the key. Give
+    /// the parent such a key, or reference the one it has.
+    #[cfg(feature = "foreign_keys")]
+    ForeignKeyMismatch,
+    /// `ALTER TABLE ADD COLUMN` of a REFERENCES column with a
+    /// non-NULL default while `PRAGMA foreign_keys` is ON (v0.16 fix;
+    /// the pin's "Cannot add a REFERENCES column with non-NULL default
+    /// value"). Add it with no default, or with the pragma off.
+    #[cfg(feature = "v16")]
+    ReferencesDefault,
     /// CREATE TABLE / INDEX / VIEW of a name starting with
     /// `sqlite_` (any case; the pin's "object name reserved for
     /// internal use"). Choose another name.
@@ -504,8 +527,9 @@ pub enum SchemaKind {
     /// `Config::max_trigger_depth` (v0.16, `triggers`; the pin's
     /// "triggers nested too deep" past 1000 levels).
     /// Bound the recursion with a WHEN clause, or raise the limit
-    /// on a thread with the stack for it.
-    #[cfg(feature = "triggers")]
+    /// on a thread with the stack for it. (Foreign-key action
+    /// programs count too, `foreign_keys`.)
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     TriggerDepth,
     /// An upsert into a view (v0.16, `triggers`; "cannot UPSERT a
     /// view"). Drop the ON CONFLICT clause.

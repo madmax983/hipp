@@ -1634,7 +1634,7 @@ pub fn resolve_scoped<E>(
         #[cfg(feature = "params")]
         Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
         Expr::Column { table, name } => resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?,
-        #[cfg(feature = "triggers")]
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         Expr::TrigValue(lit, aff, coll) => {
             RExpr::AffLiteral(literal_value(arena, *lit), *aff, *coll)
         }
@@ -4520,7 +4520,17 @@ fn cmp_class(e: &RExpr) -> CmpClass {
 /// (v0.16 review fix: `(SELECT 1 UNION SELECT t FROM c) = 1`
 /// over TEXT t is 1 on the pin, hipp gave 0).
 fn adjust_cmp(l: &RExpr, r: &RExpr, lv: OwnedValue, rv: OwnedValue) -> (OwnedValue, OwnedValue) {
-    let (lc, rc) = (cmp_class(l), cmp_class(r));
+    adjust_classes(cmp_class(l), cmp_class(r), lv, rv)
+}
+
+/// `adjust_cmp` over the operands' comparison classes.
+#[inline(always)]
+fn adjust_classes(
+    lc: CmpClass,
+    rc: CmpClass,
+    lv: OwnedValue,
+    rv: OwnedValue,
+) -> (OwnedValue, OwnedValue) {
     let aff = if lc == CmpClass::Numeric || rc == CmpClass::Numeric {
         Affinity::Numeric
     } else if (lc == CmpClass::Text && rc == CmpClass::None)
@@ -4534,6 +4544,28 @@ fn adjust_cmp(l: &RExpr, r: &RExpr, lv: OwnedValue, rv: OwnedValue) -> (OwnedVal
         return (lv, rv);
     };
     (apply_cmp_affinity(lv, aff), apply_cmp_affinity(rv, aff))
+}
+
+/// `l = r` as a comparison of two values whose operands carry the
+/// comparison affinities `la` / `ra` (`None`: no affinity), under
+/// `coll` (v0.16, `foreign_keys`: the pin's foreign-key scans and
+/// action programs compare a parent value with a child column so).
+/// NULL equals nothing.
+#[cfg(feature = "foreign_keys")]
+pub(crate) fn fk_eq(
+    l: &OwnedValue,
+    la: Option<Affinity>,
+    r: &OwnedValue,
+    ra: Option<Affinity>,
+    coll: Coll,
+) -> bool {
+    if matches!(l, OwnedValue::Null) || matches!(r, OwnedValue::Null) {
+        return false;
+    }
+    let lc = la.map_or(CmpClass::None, class_of_affinity);
+    let rc = ra.map_or(CmpClass::None, class_of_affinity);
+    let (lv, rv) = adjust_classes(lc, rc, l.clone(), r.clone());
+    compare_coll(&lv.as_value(), &rv.as_value(), coll) == core::cmp::Ordering::Equal
 }
 
 /// The affinity conversion of an IN over a subquery's set
@@ -4708,7 +4740,7 @@ pub fn expr_coll(e: &RExpr) -> Option<Coll> {
     loop {
         match p {
             RExpr::Column(_, _, c) => return *c,
-            #[cfg(feature = "triggers")]
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             RExpr::AffLiteral(_, _, Some(c)) => return Some(*c),
             RExpr::Collate(_, c) => return Some(*c),
             RExpr::Cast(x, _) | RExpr::Pos(x) => p = x,

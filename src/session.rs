@@ -42,9 +42,13 @@ macro_rules! abort_write {
         // A statement of a trigger program (v0.16, `triggers`) undoes
         // nothing itself: the statement that fired the trigger does,
         // as the failure's resolution says (`session::trigger`).
-        #[cfg(feature = "triggers")]
-        let undone = $s.conn.in_trigger() || $s.stmt_rollback($e).await;
-        #[cfg(all(feature = "v16", not(feature = "triggers")))]
+        // (A foreign-key action program's statements likewise.)
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+        let undone = $s.conn.in_program() || $s.stmt_rollback($e).await;
+        #[cfg(all(
+            feature = "v16",
+            not(any(feature = "triggers", feature = "foreign_keys"))
+        ))]
         let undone = $s.stmt_rollback($e).await;
         #[cfg(not(feature = "v16"))]
         let undone = {
@@ -62,6 +66,8 @@ macro_rules! abort_write {
 mod alter;
 #[cfg(feature = "v16")]
 mod cte;
+#[cfg(feature = "foreign_keys")]
+mod fkey;
 #[cfg(feature = "v16")]
 mod maint;
 #[cfg(feature = "v16")]
@@ -166,8 +172,10 @@ pub struct Config {
     /// (about 26 MiB in a debug one); raise it to 1000 for the pin's
     /// limit on a thread with the stack for it (the CLI does). Only
     /// recursive triggers (`PRAGMA recursive_triggers`) nest deeper
-    /// than the schema's number of triggers.
-    #[cfg(feature = "triggers")]
+    /// than the schema's number of triggers. Foreign-key action
+    /// programs (`foreign_keys`: a cascade through a chain of rows)
+    /// count as trigger programs, as on the pin.
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub max_trigger_depth: usize,
 }
 
@@ -201,7 +209,7 @@ impl Default for Config {
             max_expr_depth: DEFAULT_EXPR_DEPTH,
             #[cfg(feature = "v04")]
             max_parser_depth: DEFAULT_PARSER_DEPTH,
-            #[cfg(feature = "triggers")]
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: 100,
         }
     }
@@ -264,7 +272,7 @@ impl Config {
             max_expr_depth: 64,
             #[cfg(feature = "v04")]
             max_parser_depth: 64,
-            #[cfg(feature = "triggers")]
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: 8,
         }
     }
@@ -298,8 +306,8 @@ impl Config {
         self.max_nesting = levels;
         self
     }
-    /// Set `max_trigger_depth` (v0.16, `triggers`).
-    #[cfg(feature = "triggers")]
+    /// Set `max_trigger_depth` (v0.16, `triggers` / `foreign_keys`).
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub fn max_trigger_depth(mut self, levels: usize) -> Config {
         self.max_trigger_depth = levels;
         self
@@ -1101,6 +1109,10 @@ pub struct Connection<S: Storage> {
     /// The running trigger programs (v0.16, `triggers`).
     #[cfg(feature = "triggers")]
     trig: trigger::TrigState,
+    /// The foreign-key violation counters and action programs
+    /// (v0.16, `foreign_keys`).
+    #[cfg(feature = "foreign_keys")]
+    fk: fkey::FkState,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1143,6 +1155,8 @@ impl<S: Storage> Connection<S> {
             is_temp: false,
             #[cfg(feature = "triggers")]
             trig: trigger::TrigState::default(),
+            #[cfg(feature = "foreign_keys")]
+            fk: fkey::FkState::default(),
         };
         conn.rebuild_catalog().await?;
         Ok(conn)
@@ -1295,6 +1309,10 @@ impl<S: Storage> Connection<S> {
             autoinc: None,
             #[cfg(feature = "triggers")]
             trig: None,
+            #[cfg(feature = "foreign_keys")]
+            fk: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_del: None,
         })
     }
 
@@ -1406,7 +1424,12 @@ impl<S: Storage> Connection<S> {
                 _ => {}
             }
         }
-        self.plan_inner(arena, ast)
+        let plan = self.plan_inner(arena, ast)?;
+        // v0.16 (`foreign_keys`): the keys a write uses resolve when
+        // it is prepared, as on the pin.
+        #[cfg(feature = "foreign_keys")]
+        self.fk_validate(ast, &plan, arena)?;
+        Ok(plan)
     }
 
     fn plan_inner(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
@@ -1471,7 +1494,8 @@ impl<S: Storage> Connection<S> {
         }
         // v0.16: `sqlite_schema` is readable, never writable; and
         // with `PRAGMA foreign_keys = ON` a table in a foreign key
-        // is not writable either (hipp does not enforce them).
+        // is not writable either unless `foreign_keys` enforces
+        // them.
         #[cfg(feature = "v16")]
         {
             let target = match ast {
@@ -1490,6 +1514,10 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::SchemaTableReadOnly,
                     });
                 }
+                // Without `foreign_keys` a table in a foreign key is
+                // not writable while the pragma is ON (never skipped
+                // silently); with it the keys are enforced.
+                #[cfg(not(feature = "foreign_keys"))]
                 if !matches!(ast, Ast::CreateIndex { .. }) {
                     self.fk_guard(n)?;
                 }
@@ -2098,6 +2126,20 @@ impl<S: Storage> Connection<S> {
                 if column.primary_key || column.pk_desc || column.unique {
                     return Err(Error::Schema {
                         kind: SchemaKind::CannotAddColumn,
+                    });
+                }
+                // v0.16 fix (ungated): with `PRAGMA foreign_keys` ON a
+                // REFERENCES column takes no non-NULL default (the
+                // pin's "Cannot add a REFERENCES column with non-NULL
+                // default value").
+                #[cfg(feature = "v16")]
+                if self.prag.foreign_keys
+                    && (column.default_expr.is_some()
+                        || !matches!(literal_owned(arena, column.default), OwnedValue::Null))
+                    && def_references::<S::Error>(handle_bytes(arena, *text), arena)
+                {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::ReferencesDefault,
                     });
                 }
                 // The pin's other refusals fire only when the table
@@ -4894,6 +4936,16 @@ pub struct Statement<'c, S: Storage> {
     /// when its execution starts; `None` when it fires none.
     #[cfg(feature = "triggers")]
     trig: Option<alloc::rc::Rc<trigger::Target>>,
+    /// The foreign keys this write checks and acts on (v0.16,
+    /// `foreign_keys`), loaded when its execution starts; `None`
+    /// when `PRAGMA foreign_keys` is off or the table takes part in
+    /// none.
+    #[cfg(feature = "foreign_keys")]
+    fk: Option<alloc::rc::Rc<fkey::FkTarget>>,
+    /// An UPDATE OR REPLACE's keys for the rows its conflicts delete
+    /// (all of the table's, as a DELETE's).
+    #[cfg(feature = "foreign_keys")]
+    fk_del: Option<alloc::rc::Rc<fkey::FkTarget>>,
 }
 
 /// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
@@ -4931,6 +4983,51 @@ fn reserved_name<E>(name: &[u8]) -> Result<(), E> {
 /// integer 5 on the pin, where hipp used to return the text.
 fn read_default(arena: &Arena, c: &crate::schema::Column) -> OwnedValue {
     apply_affinity(literal_owned(arena, c.default), c.affinity)
+}
+
+/// Whether a column definition's text declares a REFERENCES
+/// clause (v0.16).
+#[cfg(feature = "v16")]
+fn def_references<E>(text: &[u8], arena: &Arena) -> bool {
+    use crate::sql::lexer::Tok;
+    let Ok(toks) = crate::sql::lexer::lex::<E>(text, arena) else {
+        return false;
+    };
+    toks.iter().any(
+        |t| matches!(t.tok, Tok::Ident(h, false) if eq_ci(handle_bytes(arena, h), b"REFERENCES")),
+    )
+}
+
+#[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+impl<S: Storage> Connection<S> {
+    /// Whether a trigger or foreign-key action program (or DROP
+    /// TABLE's inline DELETE) is running: its statements commit,
+    /// roll back and check nothing themselves.
+    pub(super) fn in_program(&self) -> bool {
+        #[cfg(feature = "triggers")]
+        if self.in_trigger() {
+            return true;
+        }
+        #[cfg(all(feature = "foreign_keys", not(feature = "triggers")))]
+        if self.fk.depth > 0 {
+            return true;
+        }
+        #[cfg(feature = "foreign_keys")]
+        if self.fk.nest > 0 {
+            return true;
+        }
+        false
+    }
+}
+
+/// An INSERT plan's column affinities (v0.16, `foreign_keys`).
+#[cfg(feature = "foreign_keys")]
+fn ins_affs(cols: &[InsCol]) -> AVec<crate::record::Affinity> {
+    let mut out = AVec::new();
+    for c in cols {
+        out.push(c.affinity);
+    }
+    out
 }
 
 /// Whether `e` calls `last_insert_rowid()` (v0.16), whose value
@@ -5393,12 +5490,72 @@ fn integral_f64(f: f64) -> Option<i64> {
     None
 }
 
+/// One row's deletion with its index entries (v0.7; see
+/// `Statement::delete_row_completely`), written once for its two
+/// names.
+macro_rules! row_delete_fn {
+    (#[$m:meta] $name:ident) => {
+        /// Delete one row and every index entry it owns (v0.7): the
+        /// shared tail of OR REPLACE and upsert conflict handling. A
+        /// rowid that is already gone is a no-op.
+        #[$m]
+        async fn $name(
+            &mut self,
+            root: u32,
+            rowid_alias: Option<usize>,
+            ncols: usize,
+            defaults: &[OwnedValue],
+            rowid: i64,
+        ) -> Result<(), S::Error> {
+            #[cfg(feature = "indexes")]
+            {
+                let indexes: AVec<IndexPlan> = match &self.plan {
+                    Plan::Insert { indexes, .. } => indexes.clone(),
+                    Plan::Update { indexes, .. } => indexes.clone(),
+                    Plan::Delete { indexes, .. } => indexes.clone(),
+                    _ => AVec::new(),
+                };
+                let Some(payload) = btree::seek_rowid(&mut self.conn.pager, root, rowid).await?
+                else {
+                    return Ok(());
+                };
+                let gcols = self.plan_rules().and_then(|r| r.gcols);
+                for ix in indexes.iter() {
+                    let key = index_key_for_row(
+                        ix.cols.as_slice(),
+                        rowid_alias,
+                        defaults,
+                        payload.as_slice(),
+                        ncols,
+                        rowid,
+                        gcols.as_ref(),
+                    )?;
+                    let enc = encode_index_payload(key.as_slice(), rowid);
+                    btree::index_delete(
+                        &mut self.conn.pager,
+                        ix.root,
+                        enc.as_slice(),
+                        ix.desc.as_slice(),
+                    )
+                    .await?;
+                }
+            }
+            #[cfg(not(feature = "indexes"))]
+            {
+                let _ = (rowid_alias, ncols, defaults);
+            }
+            btree::btree_delete(&mut self.conn.pager, root, rowid).await?;
+            Ok(())
+        }
+    };
+}
+
 impl<'c, S: Storage> Statement<'c, S> {
     /// A statement over its parts (v0.16, `triggers`: the statements
     /// of a trigger program, `session::trigger`; the same fields as
     /// `Connection::prepare` sets, which builds its statement in
     /// place — a call here costs the tiny profile the struct's move).
-    #[cfg(feature = "triggers")]
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     fn assemble(
         conn: &'c mut Connection<S>,
         arena: Arena,
@@ -5460,6 +5617,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             autoinc: None,
             #[cfg(feature = "triggers")]
             trig: None,
+            #[cfg(feature = "foreign_keys")]
+            fk: None,
+            #[cfg(feature = "foreign_keys")]
+            fk_del: None,
         }
     }
 }
@@ -5566,6 +5727,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
         #[cfg(feature = "v16")]
         self.open_stmt();
+        #[cfg(feature = "foreign_keys")]
+        self.fk_stmt_begin();
         let r = match &self.plan {
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
@@ -5618,6 +5781,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
+        #[cfg(feature = "foreign_keys")]
+        self.fk_stmt_end(r.is_err(), was_txn);
         // A failure that ended the transaction (OR ROLLBACK, an
         // I/O-class error) ends the TEMP database's too.
         #[cfg(feature = "v16")]
@@ -5868,6 +6033,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !self.conn.explicit_txn {
             return Err(Error::TransactionState { nested: false });
         }
+        // Outstanding deferred foreign-key violations fail COMMIT,
+        // the transaction staying open (v0.16, `foreign_keys`).
+        #[cfg(feature = "foreign_keys")]
+        self.conn.fk_commit_check()?;
         self.conn.pager.drive_commit().await?;
         // Every savepoint ends with the transaction (v0.16, `v16`).
         #[cfg(feature = "v16")]
@@ -6417,6 +6586,25 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
     }
 
+    /// `serve_returning`, and after the last row an autocommit
+    /// write's deferred foreign-key violations (v0.16,
+    /// `foreign_keys`): the pin checks them when the statement
+    /// halts, after its RETURNING rows (its immediate ones before).
+    #[cfg(feature = "v07")]
+    async fn serve_returning_fk(&mut self) -> Result<Step, S::Error> {
+        let step = self.serve_returning();
+        #[cfg(feature = "foreign_keys")]
+        if step == Step::Done && core::mem::take(&mut self.conn.fk.late) {
+            self.conn.env.finish(false);
+            let _ = self.conn.pager.rollback().await;
+            self.conn.explicit_txn = false;
+            return Err(Error::Schema {
+                kind: SchemaKind::ForeignKeyViolation,
+            });
+        }
+        Ok(step)
+    }
+
     /// Serve one buffered RETURNING row (v0.7), query-style.
     #[cfg(feature = "v07")]
     fn serve_returning(&mut self) -> Step {
@@ -6468,7 +6656,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Delete one row and every index entry it owns (v0.7):
     /// the shared tail of OR REPLACE and upsert conflict
     /// handling. A rowid that is already gone is a no-op.
-    #[cfg(feature = "v07")]
+    #[cfg(all(feature = "v07", feature = "foreign_keys"))]
     async fn delete_row_completely(
         &mut self,
         root: u32,
@@ -6477,45 +6665,59 @@ impl<'c, S: Storage> Statement<'c, S> {
         defaults: &[OwnedValue],
         rowid: i64,
     ) -> Result<(), S::Error> {
-        #[cfg(feature = "indexes")]
-        {
-            let indexes: AVec<IndexPlan> = match &self.plan {
-                Plan::Insert { indexes, .. } => indexes.clone(),
-                Plan::Update { indexes, .. } => indexes.clone(),
-                Plan::Delete { indexes, .. } => indexes.clone(),
-                _ => AVec::new(),
-            };
-            let Some(payload) = btree::seek_rowid(&mut self.conn.pager, root, rowid).await? else {
+        // v0.16 (`foreign_keys`): a REPLACE victim's keys, as a
+        // DELETE's (the pin deletes it through `GenerateRowDelete`).
+        let fk_main = match self.fk_del.clone() {
+            Some(d) => self.fk.replace(d),
+            None => self.fk.clone(),
+        };
+        let r = self
+            .delete_victim(root, rowid_alias, ncols, defaults, rowid)
+            .await;
+        self.fk = fk_main;
+        r
+    }
+
+    /// `delete_row_completely` with the victim's foreign keys
+    /// (v0.16, `foreign_keys`).
+    #[cfg(feature = "foreign_keys")]
+    async fn delete_victim(
+        &mut self,
+        root: u32,
+        rowid_alias: Option<usize>,
+        ncols: usize,
+        defaults: &[OwnedValue],
+        rowid: i64,
+    ) -> Result<(), S::Error> {
+        let fk_old = if self.fk_active() {
+            let Some(r) = self.reload_write_row(root, ncols, defaults, rowid).await? else {
                 return Ok(());
             };
-            let gcols = self.plan_rules().and_then(|r| r.gcols);
-            for ix in indexes.iter() {
-                let key = index_key_for_row(
-                    ix.cols.as_slice(),
-                    rowid_alias,
-                    defaults,
-                    payload.as_slice(),
-                    ncols,
-                    rowid,
-                    gcols.as_ref(),
-                )?;
-                let enc = encode_index_payload(key.as_slice(), rowid);
-                btree::index_delete(
-                    &mut self.conn.pager,
-                    ix.root,
-                    enc.as_slice(),
-                    ix.desc.as_slice(),
-                )
-                .await?;
-            }
+            let affs = self.plan_affs();
+            let lrow = self.fk_row(r.rec.as_slice(), rowid, affs.as_slice());
+            self.fk_old_row(lrow.as_slice(), rowid, None).await?;
+            Some(lrow)
+        } else {
+            None
+        };
+        self.delete_row_raw(root, rowid_alias, ncols, defaults, rowid)
+            .await?;
+        if let Some(lrow) = &fk_old {
+            self.fk_actions(lrow.as_slice(), None, None).await?;
         }
-        #[cfg(not(feature = "indexes"))]
-        {
-            let _ = (rowid_alias, ncols, defaults);
-        }
-        btree::btree_delete(&mut self.conn.pager, root, rowid).await?;
         Ok(())
     }
+
+    // The row deletion itself: `delete_row_completely` without
+    // `foreign_keys` (as it always was), its `delete_row_raw` with.
+    row_delete_fn!(
+        #[cfg(all(feature = "v07", feature = "foreign_keys"))]
+        delete_row_raw
+    );
+    row_delete_fn!(
+        #[cfg(all(feature = "v07", not(feature = "foreign_keys")))]
+        delete_row_completely
+    );
 
     async fn step_insert(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
@@ -6533,7 +6735,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v07")]
         if self.has_returning() {
-            return Ok(self.serve_returning());
+            return self.serve_returning_fk().await;
         }
         let r = self.exec_insert().await;
         match r {
@@ -6607,6 +6809,22 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             );
         if keep {
+            // v0.16 (`foreign_keys`): an action program's failure
+            // aborts the statement whatever its clause says; and the
+            // pin's OR FAIL halt still checks the statement's
+            // foreign-key violations (in autocommit the
+            // transaction's too), undoing it when there are any.
+            #[cfg(feature = "foreign_keys")]
+            {
+                if self.conn.fk.abort {
+                    return Ok(false);
+                }
+                if let Err(fe) = self.fk_end() {
+                    self.conn.env.finish(false);
+                    abort_write!(self, &fe);
+                    return Err(fe);
+                }
+            }
             let committed = if self.conn.explicit_txn {
                 Ok(())
             } else {
@@ -6617,9 +6835,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     // A failed statement of a trigger program counts
                     // nothing (the pin's count is taken when a
                     // program's statement completes).
-                    #[cfg(feature = "triggers")]
-                    let kept = !self.conn.in_trigger();
-                    #[cfg(not(feature = "triggers"))]
+                    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+                    let kept = !self.conn.in_program();
+                    #[cfg(not(any(feature = "triggers", feature = "foreign_keys")))]
                     let kept = true;
                     #[cfg(feature = "v16")]
                     self.conn.env.finish(kept);
@@ -6644,6 +6862,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.conn.env.pending.set(0);
         #[cfg(feature = "triggers")]
         self.load_triggers()?;
+        #[cfg(feature = "foreign_keys")]
+        {
+            let multi = self.insert_multi();
+            self.fk_load(fkey::Event::Insert, multi)?;
+            let replace = self.insert_replaces();
+            self.fk_note_replace(replace);
+        }
         #[cfg(feature = "v16")]
         self.autoinc_begin().await?;
         // v0.16: VALUES rows that read last_insert_rowid() evaluate
@@ -6673,6 +6898,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 self.exec_insert_row(rv).await?;
             }
             self.autoinc_end().await?;
+            #[cfg(feature = "foreign_keys")]
+            self.fk_end_commit().await?;
+            #[cfg(not(feature = "foreign_keys"))]
             if !self.conn.explicit_txn {
                 self.conn.pager.drive_commit().await?;
             }
@@ -6690,6 +6918,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v16")]
         self.autoinc_end().await?;
+        #[cfg(feature = "foreign_keys")]
+        self.fk_end_commit().await?;
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
@@ -7050,6 +7281,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             }),
             _ => None,
         };
+        #[cfg(feature = "foreign_keys")]
+        let fk_affs = ins_affs(cols.as_slice());
         let pager = &mut self.conn.pager;
         let mut vals: AVec<Value<'_>> = AVec::new();
         for (i, v) in row.iter().enumerate() {
@@ -7101,6 +7334,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let mut rec = AVec::new();
         encode_record(vals.as_slice(), &mut rec);
+        // v0.16 (`foreign_keys`): the row's keys, after its other
+        // constraints and before it is stored (the pin's order).
+        #[cfg(feature = "foreign_keys")]
+        let (pager, root) = {
+            let root = *root;
+            drop(vals);
+            if self.fk_active() {
+                let lrow = self.fk_row(row.as_slice(), rowid, fk_affs.as_slice());
+                self.fk_new_row(lrow.as_slice(), rowid, None, None).await?;
+            }
+            (&mut self.conn.pager, root)
+        };
+        #[cfg(feature = "foreign_keys")]
+        btree::btree_insert(pager, root, rowid, rec.as_slice()).await?;
+        #[cfg(not(feature = "foreign_keys"))]
         btree::btree_insert(pager, *root, rowid, rec.as_slice()).await?;
         // v0.3 index work, part 2: maintain every index.
         #[cfg(feature = "indexes")]
@@ -7364,6 +7612,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
         }
         if conflicts.is_empty() {
+            #[cfg(feature = "foreign_keys")]
+            if self.fk_active() {
+                let lrow = self.fk_row(row.as_slice(), rowid, affs.as_slice());
+                self.fk_new_row(lrow.as_slice(), rowid, None, None).await?;
+            }
             self.insert_row_raw(row.as_slice(), rowid).await?;
             self.push_insert_returning(row.as_slice(), rowid).await?;
             #[cfg(feature = "triggers")]
@@ -7440,6 +7693,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                         .await?
                 {
                     return Err(Error::Schema { kind });
+                }
+                #[cfg(feature = "foreign_keys")]
+                if self.fk_active() {
+                    let lrow = self.fk_row(row.as_slice(), rowid, affs.as_slice());
+                    self.fk_new_row(lrow.as_slice(), rowid, None, None).await?;
                 }
                 self.insert_row_raw(row.as_slice(), rowid).await?;
                 self.push_insert_returning(row.as_slice(), rowid).await?;
@@ -7694,6 +7952,19 @@ impl<'c, S: Storage> Statement<'c, S> {
                 });
             }
         }
+        // v0.16 (`foreign_keys`): the update's keys, as an UPDATE's.
+        #[cfg(feature = "foreign_keys")]
+        let fk_rows = if self.fk_active() {
+            let lold = self.fk_row(orec.as_slice(), crowid, affs);
+            let lnew = self.fk_row(new_rec.as_slice(), new_rowid, affs);
+            let ch = Some((assigned.as_slice(), rowid_set));
+            self.fk_old_row(lold.as_slice(), crowid, ch).await?;
+            self.fk_new_row(lnew.as_slice(), new_rowid, Some(crowid), ch)
+                .await?;
+            Some((lold, lnew))
+        } else {
+            None
+        };
         self.rewrite_stored_row(
             root,
             rowid_alias,
@@ -7703,6 +7974,15 @@ impl<'c, S: Storage> Statement<'c, S> {
             new_rowid,
         )
         .await?;
+        #[cfg(feature = "foreign_keys")]
+        if let Some((lold, lnew)) = &fk_rows {
+            self.fk_actions(
+                lold.as_slice(),
+                Some(lnew.as_slice()),
+                Some((assigned.as_slice(), rowid_set)),
+            )
+            .await?;
+        }
         #[cfg(feature = "v16")]
         self.conn.env.note_change();
         self.push_insert_returning(new_rec.as_slice(), new_rowid)
@@ -7743,7 +8023,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     Err(e) => return Err(self.write_failed(e).await),
                 }
             }
-            return Ok(self.serve_returning());
+            return self.serve_returning_fk().await;
         }
         let r = self.exec_update().await;
         match r {
@@ -7781,7 +8061,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
-            return Ok(self.serve_returning());
+            return self.serve_returning_fk().await;
         }
         let r = self.exec_delete().await;
         match r {
@@ -7814,6 +8094,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(Step::Done)
             }
             Err(e) => {
+                #[cfg(feature = "foreign_keys")]
+                if core::mem::take(&mut self.conn.fk.drop_counted) {
+                    self.conn.env.finish(false);
+                }
                 abort_write!(self, &e);
                 Err(e)
             }
@@ -7976,6 +8260,19 @@ impl<'c, S: Storage> Statement<'c, S> {
         // v0.16: the statement's change set — NOT NULL and CHECK
         // apply to assigned columns only, as on the pin.
         let (assigned, rowid_set) = assigned_columns(sets.as_slice(), ncols, rowid_alias);
+        #[cfg(feature = "foreign_keys")]
+        self.fk_load(fkey::Event::Update(assigned.as_slice(), rowid_set), true)?;
+        // (The pin deletes REPLACE victims only where the update can
+        // conflict: a new rowid, or a UNIQUE index it changes.)
+        #[cfg(feature = "foreign_keys")]
+        {
+            let replace = conflict_action == ConflictAction::Replace
+                && self.fk_update_replace(assigned.as_slice(), rowid_set);
+            if replace {
+                self.fk_load_victims()?;
+            }
+            self.fk_note_replace(replace);
+        }
         let mut nn_assigned = AVec::new();
         for (i, f) in not_null.iter().enumerate() {
             nn_assigned.push(*f && assigned.as_slice().get(i).copied().unwrap_or(false));
@@ -7996,6 +8293,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         let triggered = self.trig.is_some();
         #[cfg(not(feature = "triggers"))]
         let triggered = false;
+        // v0.16 (`foreign_keys`): an action may change rows too.
+        #[cfg(feature = "foreign_keys")]
+        let triggered = triggered || self.fk_active();
         for snap_row in rows.iter() {
             let reloaded;
             let wrow = if stale || triggered {
@@ -8282,6 +8582,21 @@ impl<'c, S: Storage> Statement<'c, S> {
                         }
                     }
                 }
+                // v0.16 (`foreign_keys`): the old row's keys while it is
+                // stored, the new row's as if it were gone (the pin
+                // deletes it in between).
+                #[cfg(feature = "foreign_keys")]
+                let fk_rows = if self.fk_active() {
+                    let lold = self.fk_row(wrow.rec.as_slice(), wrow.rowid, affs.as_slice());
+                    let lnew = self.fk_row(new_rec.as_slice(), new_rowid, affs.as_slice());
+                    let ch = Some((assigned.as_slice(), rowid_set));
+                    self.fk_old_row(lold.as_slice(), wrow.rowid, ch).await?;
+                    self.fk_new_row(lnew.as_slice(), new_rowid, Some(cur_rowid), ch)
+                        .await?;
+                    Some((lold, lnew))
+                } else {
+                    None
+                };
                 // Apply against the row as currently stored.
                 self.rewrite_stored_row(
                     root,
@@ -8293,6 +8608,16 @@ impl<'c, S: Storage> Statement<'c, S> {
                 )
                 .await?;
                 stale |= new_rowid != cur_rowid;
+                #[cfg(feature = "foreign_keys")]
+                if let Some((lold, lnew)) = &fk_rows {
+                    self.fk_actions(
+                        lold.as_slice(),
+                        Some(lnew.as_slice()),
+                        Some((assigned.as_slice(), rowid_set)),
+                    )
+                    .await?;
+                    stale = true;
+                }
                 #[cfg(feature = "triggers")]
                 if self.fires(
                     crate::sql::ast::TrigTime::After,
@@ -8324,6 +8649,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             let _ = applied;
         }
+        #[cfg(feature = "foreign_keys")]
+        self.fk_end_commit().await?;
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
@@ -8377,6 +8705,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Delete { returning, .. } => returning.clone(),
             _ => unreachable!(),
         };
+        #[cfg(feature = "foreign_keys")]
+        self.fk_load(fkey::Event::Delete, true)?;
         for snap_row in rows.iter() {
             // v0.16 (`triggers`): with triggers each row is read again
             // when its turn comes (gone: skipped), BEFORE DELETE
@@ -8429,6 +8759,26 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             #[cfg(not(feature = "triggers"))]
             let wrow = snap_row;
+            // v0.16 (`foreign_keys`): an earlier row's actions may have
+            // deleted or changed this one; its keys are checked while
+            // it is stored, its actions run once it is gone.
+            #[cfg(feature = "foreign_keys")]
+            let fk_now;
+            #[cfg(feature = "foreign_keys")]
+            let (wrow, fk_old) = if self.fk_active() {
+                let Some(r) = self
+                    .reload_write_row(root, ncols, defaults.as_slice(), wrow.rowid)
+                    .await?
+                else {
+                    continue;
+                };
+                fk_now = r;
+                let lrow = self.fk_row(fk_now.rec.as_slice(), fk_now.rowid, affs.as_slice());
+                self.fk_old_row(lrow.as_slice(), fk_now.rowid, None).await?;
+                (&fk_now, Some(lrow))
+            } else {
+                (wrow, None)
+            };
             #[cfg(feature = "indexes")]
             for ix in indexes.iter() {
                 let key = key_from_rec(
@@ -8449,6 +8799,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             btree::btree_delete(&mut self.conn.pager, root, wrow.rowid).await?;
             #[cfg(feature = "v16")]
             self.conn.env.note_change();
+            #[cfg(feature = "foreign_keys")]
+            if let Some(lrow) = &fk_old {
+                self.fk_actions(lrow.as_slice(), None, None).await?;
+            }
             // RETURNING reads the row's pre-delete values, its
             // subqueries the table with this row (and every
             // earlier one) gone — the pin evaluates it after the
@@ -8482,6 +8836,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .await?;
             }
         }
+        #[cfg(feature = "foreign_keys")]
+        self.fk_end_commit().await?;
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }
@@ -8547,6 +8904,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             unreachable!()
         };
         let name_b = copy_vec(handle_bytes(&self.arena, *name));
+        // v0.16 (`foreign_keys`): the pin's implicit DELETE first.
+        #[cfg(feature = "foreign_keys")]
+        self.fk_drop(name_b.as_slice()).await?;
         // Schema rowids: the table's own row plus every index
         // row it owns (explicit and implicit alike).
         let mut schema_rowids = AVec::new();
@@ -8606,6 +8966,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
         }
         self.conn.pager.bump_schema_cookie();
+        #[cfg(feature = "foreign_keys")]
+        {
+            self.fk_end_commit().await?;
+            if core::mem::take(&mut self.conn.fk.drop_counted) {
+                self.conn.env.finish(true);
+            }
+        }
+        #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
             self.conn.pager.drive_commit().await?;
         }

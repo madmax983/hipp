@@ -4313,6 +4313,208 @@ path, INSTEAD OF planning and the ALTER trigger editor — which ADR
 - RETURNING rows are computed before the row's AFTER triggers run
   (their subqueries do not see the triggers' writes).
 
+### Foreign-key enforcement (2026-11-03)
+
+**Status:** implemented behind the new leaf feature `foreign_keys`
+(implies `v16` and `indexes`; in `max`, not `full`, per ADR 0002; its
+own `ci/feature-sets.txt` line `v16,foreign_keys`), differentially
+tested against the live 3.54.1 pin. Without the leaf, wave 3's
+refusal stays: while `PRAGMA foreign_keys` is ON a write to a table
+in a foreign key is refused (`Unsupported`), never run unchecked.
+
+**Shipped (`foreign_keys`, `src/session/fkey.rs`):**
+
+- The pin's **counters**, not a per-row verdict: a child row added
+  whose parent key is missing counts +1, a child row removed whose
+  parent is missing −1 (only while the counter is non-zero); a parent
+  row removed counts +1 per child still naming it, a parent row added
+  −1 per child it satisfies (again only while non-zero; the counter
+  can then go negative — the pin's quirk, so an orphan left with the
+  pragma off can cancel another statement's violation). Immediate
+  keys count per top-level statement and fail it at its end
+  ("FOREIGN KEY constraint failed", `SchemaKind::ForeignKeyViolation`,
+  the statement undone even under OR FAIL / IGNORE / ROLLBACK, the
+  transaction staying open); `DEFERRABLE INITIALLY DEFERRED` keys
+  (a column-level deferrable clause applies to the table's most
+  recent key, as `sqlite3DeferForeignKey`; `NOT DEFERRABLE INITIALLY
+  DEFERRED` is immediate) and every key under `PRAGMA
+  defer_foreign_keys` count per transaction: COMMIT and a committing
+  RELEASE fail with the transaction open, an autocommit statement
+  fails at its end, a savepoint saves the counters and ROLLBACK TO
+  restores them, a statement rollback restores its start values.
+  The pin's single-row special case: a top-level single-row INSERT
+  (no INSERT triggers, RETURNING, REPLACE or upsert update) fails at
+  once on an immediate key and, as a parent, resolves nothing.
+- **Matching** as the pin: a child value takes the parent column's
+  affinity and is looked up in the parent's PRIMARY KEY / UNIQUE
+  index (`MustBeInt` for a rowid parent; a non-integer has none), a
+  self-referencing new row may be its own parent; parent-side scans
+  compare `parent = child` with both comparison affinities and the
+  parent's collation; action programs compare `OLD.pk = fk` with no
+  affinity on OLD (INTEGER for the rowid) — so a cascade can miss
+  rows the count found (probed: a REAL parent and TEXT children
+  '1', '1.0', ' 1': the count finds three, the CASCADE deletes one,
+  the DELETE fails).
+- **Actions** after the row's change (BEFORE triggers, checks,
+  write, actions, AFTER triggers — the pin's order): ON DELETE /
+  ON UPDATE CASCADE, SET NULL, SET DEFAULT (the child column's
+  default; NULL for a generated one), RESTRICT (immediate even for a
+  deferred key, skipped under defer_foreign_keys), NO ACTION; ON
+  UPDATE only when `NOT (old IS new)` under the parent collation.
+  Each runs as the pin's action program: a statement built as an AST
+  over `Expr::TrigValue` (now shared by `triggers` and
+  `foreign_keys`), under ABORT whatever the firing statement says
+  (its triggers' bodies inherit ABORT — an `INSERT OR IGNORE` there
+  fails), a frame of its own for `changes()` / `last_insert_rowid()`,
+  counted towards `Config::max_trigger_depth` (now also a
+  `foreign_keys` setting), firing the child's triggers when
+  `triggers` is built; its failure aborts the firing statement.
+- **Keys resolve when the write is prepared** (`fk_validate`), for
+  the whole program tree the pin compiles then (a mismatch two
+  cascades away fails the statement): "foreign key mismatch"
+  (`ForeignKeyMismatch`) for a parent key that is no PRIMARY KEY /
+  UNIQUE index with the parent columns' collations, "no such table"
+  for a missing parent — only for the keys a statement uses, with
+  the pin's rules (a single-row INSERT into the parent uses none; an
+  UPDATE that changes any key locates every key on its table, its
+  `sqlite3FkOldmask`).
+- **REPLACE and upsert:** REPLACE victims are deleted with their
+  checks and actions (an UPDATE OR REPLACE loads all the table's
+  keys for them); DO UPDATE checks as an UPDATE. The pin's
+  `isSetNullAction` quirk is reproduced for top-level writes: when
+  a REPLACE compiles the deletion programs of a self-referencing
+  ON DELETE SET NULL key last, that key's new-row lookups are
+  skipped (probed: `INSERT OR REPLACE INTO t VALUES (1, 99)` succeeds
+  with 99 missing; not when compiling that program compiles UPDATE
+  triggers or ON UPDATE actions after it).
+- **DROP TABLE** first runs the pin's implicit `DELETE FROM` when
+  the table is a parent, or a child with deferred keys and
+  outstanding deferred violations (its own triggers silent, missing
+  parents empty, its unusable keys ignored; cascades run), then
+  fails before dropping on immediate violations; its count is the
+  drop's `changes()` when the pin compiles that DELETE.
+- RETURNING: immediate violations withhold the rows; deferred ones
+  fail an autocommit statement after its rows, as the pin's
+  `OP_FkCheck` / halt order.
+- `PRAGMA foreign_key_check [table]` (`table|rowid|parent|fkid`,
+  rows in rowid order, keys in list order, the parent as written, a
+  missing parent table reporting every keyed row, a mismatch failing
+  the pragma before any row) and `PRAGMA defer_foreign_keys` (cleared
+  when a transaction ends, as on the pin). `ALTER TABLE ... ADD
+  COLUMN` of a REFERENCES column with a non-NULL default is refused
+  while the pragma is ON (ungated under `v16`,
+  `SchemaKind::ReferencesDefault`). Wave 3's ALTER TABLE RENAME
+  already rewrote REFERENCES in child tables (verified; tested here).
+- The parser records `ForeignKey::deferred`. COMMIT also checks the
+  TEMP database's counters.
+
+**Oracle-probing notes** (live pin, scripts in the unit's
+scratchpad): the counter semantics above, including `INSERT INTO s
+VALUES (7, 200), (100, NULL)` resolving an orphan 6→100 left with the
+pragma off and so admitting 7→200; `INSERT OR FAIL` with a counted
+violation undoes the whole statement; `INSERT OR IGNORE` of a row
+that conflicts never counts it; `INSERT OR ROLLBACK` keeps the
+transaction; RETURNING rows are not printed for an immediate
+violation but are for a deferred one in autocommit; COMMIT /
+RELEASE failures leave the transaction (and `defer_foreign_keys`)
+on; `defer_foreign_keys` resets when any transaction ends, also a
+read in autocommit (`SELECT * FROM t`), not after `SELECT 1` or a
+pragma; `PRAGMA foreign_keys` is a no-op inside a transaction;
+changes() = 1 and total_changes counts the cascades; inside cascade
+programs changes() is the frame's entry value; the order BEFORE
+DELETE trigger, action programs (grandchild SET NULL inside the
+child's delete), AFTER DELETE trigger; mismatch / no-such-table
+errors are prepare-time ("Parse error"), and which keys a statement
+locates; a TEMP child may only reference a TEMP parent and a main
+child only a main one ("no such table: temp.p"); MATCH clauses are
+accepted and `foreign_key_list` says NONE; cascade depth: a
+chain past the 1000-program limit fails ("triggers nested too deep",
+the whole statement undone); DROP TABLE runs the implicit DELETE with cascades, not
+its own triggers, and leaves `changes()` at its count (3), even 0
+when the DELETE is compiled and skipped; a failed DROP's cascades
+stay in total_changes(). `isSetNullAction`: the skip depends on
+which program the pin compiled last (probed over a dozen schemas:
+UPDATE triggers on the table and two self-referencing keys change
+it; DELETE triggers and other tables' CASCADE / RESTRICT keys do
+not). The whole-database `foreign_key_check` walks the pin's schema
+hash table; its hash function could not be fitted from orders
+probed for 1–40 tables (the PRAGMA unit's gap): hipp reproduces the
+order up to three tables and views.
+
+**Bugs found while testing (fixed; regression tests in
+`tests/foreign_keys_v16.rs::regressions*`):** an UPDATE OR REPLACE
+victim ran only the actions of the keys the UPDATE assigns;
+RETURNING rows were withheld before a deferred failure; a key error
+raised when the write ran (not when it was prepared) reset
+changes(); mismatches inside the action-program tree, and the
+`sqlite3FkOldmask` locate-all rule, were not reported; DROP TABLE's
+DELETE reported its own unusable keys; `isSetNullAction`; an INSERT
+counted DELETE / UPDATE triggers as making it multi-row; DROP TABLE
+left `changes()` alone where the pin set it.
+
+**Tests:** `tests/foreign_keys_v16.rs` (21 tests; also run with
+`--no-default-features --features std,v16,foreign_keys`, i.e.
+without `triggers`): counting and the orphan quirk, deferred keys
+and savepoints, `defer_foreign_keys`, every action, affinity /
+collation / composite keys in any column order, self-reference,
+mismatch and missing parents, DROP TABLE, ALTER TABLE, REPLACE and
+upsert, conflict clauses and RETURNING, `foreign_key_check`,
+cascade depth (1000 / 1001), MATCH, the pragma off, triggers fired by
+cascades (with RAISE), files the pin wrote (and the pin enforcing
+hipp's), regressions, and a generated corpus (xorshift,
+`HIPP_FK_CORPUS` default 60, `HIPP_FK_SEED`) of random parents (IPK,
+UNIQUE, composite PK), children, grandchildren on UNIQUE columns,
+self-referencing tables, actions, deferral, logging triggers and
+random INSERT / REPLACE / upsert / UPDATE / DELETE / INSERT ... SELECT,
+transactions, savepoints, pragma toggles, DROP TABLE and
+`foreign_key_check` — about 5 000 generated scripts over 40 seeds
+agreed while developing, each also checked by the pin reading
+hipp's file (integrity check and `.dump`). `hipp-cli/tests/
+cli_v16_foreign_keys.rs` (6 tests): cascades and checks, the check
+output, deferred commits and RETURNING, a `.dump` replayed with keys
+on, one-shot exit statuses, cascades firing triggers.
+`tests/pragma_v16.rs`'s refusal test now runs in builds without the
+leaf.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run
+end with "==> all gates passed".
+
+**Size:** tiny **76,924 B** (Δ **0**; the plain INSERT path keeps
+its tiny code: the key check is a `foreign_keys` block). Full
+**485,388 B** (Δ **+744 B** vs 484,644, ratchet raised): the ungated
+`v16` parts only — `ForeignKey::deferred` and the deferrable-clause
+reading, and ALTER TABLE ADD COLUMN's "Cannot add a REFERENCES column
+with non-NULL default value" check (`SchemaKind::ReferencesDefault`);
+no enforcement code. Max **590,432 B** (Δ **+26,880 B** vs 563,552,
+ratchet raised; under the 32 KiB justification threshold): the whole
+leaf — key resolution, lookups and scans, the counters, action
+programs, the write-path hooks, DROP TABLE's DELETE,
+`foreign_key_check` / `defer_foreign_keys`.
+
+**Honest gaps:**
+
+- The whole-database `foreign_key_check` lists tables in hipp's
+  approximation of the pin's hash order (exact up to three tables
+  and views); `foreign_key_check(t)` is exact. `pragma_foreign_key_
+  check(...)` as a table-valued function is refused.
+- `isSetNullAction` is modelled for top-level writes and the
+  nested programs named above; inside trigger / action programs,
+  and where a program was compiled earlier in the same statement,
+  hipp checks the new row (the pin's outcome depends on its whole
+  compile order).
+- Mismatch errors inside a trigger body's own action tree surface
+  when the body runs (hipp validates one level at prepare).
+- Child scans are full scans of the child table per parent row
+  changed (O(parents × children)); child indexes are not used.
+- SET DEFAULT evaluates a non-constant default once per action
+  statement, not per row.
+- `defer_foreign_keys` is cleared after table-reading queries and
+  writes in autocommit, not after the pragmas that read the file
+  (the pin's `bIsReader`); it is per database: setting it does not
+  reach the TEMP database's statements.
+- An action program's statement journal: a depth error inside
+  BEGIN undoes the statement (as for triggers, STATUS above).
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

@@ -301,8 +301,10 @@ fn mark_ctx(e: &mut Expr, h: usize) {
             Expr::Literal(_) | Expr::Column { .. } | Expr::HexTooBig(_) => {}
             #[cfg(feature = "params")]
             Expr::Param(..) => {}
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
+            Expr::TrigValue(..) => {}
             #[cfg(feature = "triggers")]
-            Expr::TrigValue(..) | Expr::Raise(_, None, _) => {}
+            Expr::Raise(_, None, _) => {}
             #[cfg(feature = "triggers")]
             Expr::Raise(_, Some(a), _) => todo.push(a),
             Expr::Binary(_, a, b) | Expr::Like(a, b, _) => {
@@ -5173,6 +5175,7 @@ UPDATE USING VALUES WHEN WHERE",
             to: cols,
             on_update,
             on_delete,
+            deferred: false,
         })
     }
 
@@ -5196,6 +5199,17 @@ UPDATE USING VALUES WHEN WHERE",
 
     /// Skip an optional `[NOT] DEFERRABLE [INITIALLY DEFERRED |
     /// IMMEDIATE]` at token `i` (parsed, not enforced).
+    /// Whether the deferrable clause at token `i` (`deferrable`'s
+    /// grammar) makes its foreign key deferred: `DEFERRABLE
+    /// INITIALLY DEFERRED` only (`NOT DEFERRABLE INITIALLY
+    /// DEFERRED` is immediate, as on the pin).
+    #[cfg(feature = "v16")]
+    fn defers(&self, i: usize) -> bool {
+        self.is_kw(i, b"DEFERRABLE")
+            && self.is_kw(i + 1, b"INITIALLY")
+            && self.is_kw(i + 2, b"DEFERRED")
+    }
+
     fn deferrable(&self, mut i: usize) -> usize {
         let start = i;
         if self.is_kw(i, b"NOT") {
@@ -5391,6 +5405,9 @@ UPDATE USING VALUES WHEN WHERE",
                             from.push(c.name);
                         }
                         fkeys.push(self.fk_clause::<E>(from, next, to)?);
+                        if let Some(f) = fkeys.as_mut_slice().last_mut() {
+                            f.deferred = self.defers(i);
+                        }
                     }
                     i = self.deferrable(i);
                 } else {
@@ -5550,6 +5567,12 @@ UPDATE USING VALUES WHEN WHERE",
                 let next = self.deferrable(i);
                 if next == i {
                     return bad(i + 1);
+                }
+                // The pin's `sqlite3DeferForeignKey`: the table's most
+                // recent foreign key, whichever column declared it.
+                #[cfg(feature = "v16")]
+                if let Some(f) = fkeys.as_mut_slice().last_mut() {
+                    f.deferred = self.defers(i);
                 }
                 i = next;
             } else if self.is_kw(i, b"PRIMARY") {
