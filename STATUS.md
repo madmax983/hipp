@@ -3268,7 +3268,9 @@ test (`tests/savepoint_v16.rs`
   stale ("Failed to read ptrmap key" in the pin's integrity check
   after an INSERT that allocates pages — a pre-existing gap of the
   write path, recorded since v0.15 as "auto-vacuum / ptrmap write
-  support has no recorded demand"). Producing a fresh auto-vacuum
+  support has no recorded demand"; ~~left open~~ closed by the
+  honest-gap sweep's review fixes: every write to such a file is now
+  refused, `Error::AutoVacuumUnsupported`). Producing a fresh auto-vacuum
   image would hand back a file the next hipp write damages; the
   refusal leaves the file untouched, and `PRAGMA auto_vacuum = 0;
   VACUUM` converts it, as on the pin.
@@ -6284,11 +6286,11 @@ raised): the UPDATE page rules and `btree_overwrite`, the WAL claim.
 - **VACUUM of an auto-vacuum file / `PRAGMA incremental_vacuum`**:
   **kept as the documented refusal.** The pin's pointer-map pages
   would have to be maintained by every page allocation, free and
-  B-tree balance on the write path (today a hipp write to a pin-made
-  auto-vacuum file already leaves them stale, see "Savepoints and
-  maintenance statements"); that is a pager project well past this
-  unit's budget, and a fresh auto-vacuum image would be damaged by
-  the next hipp write. `PRAGMA auto_vacuum = 0; VACUUM` converts.
+  B-tree balance on the write path; that is a pager project well
+  past this unit's budget, and a fresh auto-vacuum image would be
+  damaged by the next hipp write. `PRAGMA auto_vacuum = 0; VACUUM`
+  converts. (~~A hipp write to a pin-made auto-vacuum file leaves
+  the maps stale~~: the review fixes refuse every such write.)
 
 **Oracle-probing notes** (live pin, `sqlite3 DB` over stdin, one
 statement per line): `NOT NULL ON CONFLICT IGNORE` skips the row,
@@ -6377,7 +6379,143 @@ statements run (and the temp UPDATE / DELETE refusal).
   are checked but do not change the scan order; a partial index named
   there is an index hipp cannot read (`Unsupported`).
 - VACUUM of an auto-vacuum file and `PRAGMA incremental_vacuum` stay
-  refused (above).
+  refused (above); since the review fixes, so does every other write
+  to such a file.
+- ~~Pin-written CHECK / partial-index texts with three-part names
+  are no longer opaque~~ overclaimed: a `temp.` or unknown schema
+  part on a main table was still refused — closed by the review
+  fixes, as are the regressions and refusals listed there.
+
+### Honest-gap sweep — review fixes (2026-11-04)
+
+**Fixed** (each reproduced and compared with the live 3.54.1 pin):
+
+- *Main views and triggers read TEMP tables* (regression of the
+  sweep, `v16` / `triggers`): the new temp-first routing reached the
+  bodies of views and triggers stored in main, so a temp table
+  shadowed their tables (`SELECT * FROM v` answered the temp rows; a
+  trigger wrote rows read from a temp table) and stood in for a
+  missing one where the pin says "no such table: main.t". The pin
+  binds such a body's unqualified names to its own database
+  (`sqlite3FixSrcList`). The view / CTE expander now marks every
+  table name it walks in a main view's body (`Expander::fix_main`,
+  set by `view` and `expand_parsed_view`) and in a trigger program's
+  statements (`TrigState::fix_main`, set by `plan_step` and by the
+  ALTER TABLE re-plan of trigger texts) as main-qualified, once the
+  body's own CTEs are resolved. ALTER TABLE of a main table that a
+  temp table shadows rewrites its views and triggers again (it
+  failed with "no such table" / "no such column").
+- *INDEXED BY / NOT INDEXED on a trigger body's UPDATE / DELETE was
+  stored* (`triggers`), after which the pin found the schema
+  malformed: now the pin's parse error
+  (`SchemaKind::TriggerIndexedTarget`, checked before RETURNING, as
+  on the pin). Elsewhere in a body (a SELECT, UPDATE ... FROM, a
+  subquery) the clause stays allowed.
+- *Writes to an auto-vacuum file corrupted it* (ungated: a claimed
+  write path). hipp keeps no pointer-map pages, and an INSERT or
+  CREATE that allocated pages left the pin's maps stale (its
+  integrity check: "Failed to read ptrmap key"). `Pager` now notes a
+  non-zero header offset 52 at open and `begin_write` refuses
+  (`Error::AutoVacuumUnsupported`), leaving the file byte-identical;
+  reads work, and `PRAGMA auto_vacuum = NONE; VACUUM` — whose image
+  is plain, so `replace_image` lifts the refusal for it alone —
+  converts the file, after which writes work.
+- *NOT INDEXED on a view or CTE* was "no such index"; the pin accepts
+  it (only INDEXED BY names an index there).
+- *Three-part names.* The schema part of a CHECK's or partial
+  index's name is ignored, any word, as on the pin (`NC_IsCheck` /
+  `NC_PartIdx`): `CHECK (temp.u.a > 0)` on a main table, `bogus.t.a`,
+  and `main.t.b` in a TEMP table's CHECK were refused (by the router
+  or the resolver), and pin-written files with them failed every
+  INSERT (`query::DB_ANY`; the router now places such a `temp.` in a
+  CREATE TABLE / CREATE INDEX). Resolution filters sources by
+  database (`SourceDesc::in_db`, `query::group_column`) instead of
+  checking the first source of the name: `main.t.b, temp.t.b FROM
+  main.t, temp.t` was "ambiguous", `(SELECT main.t.b FROM temp.t)
+  FROM main.t` failed, and `*` / `t.*` over `main.t, temp.t` were
+  "ambiguous" (the pin expands them per database). Table-valued
+  functions (`pragma_*`, `json_each` / `json_tree`) are main's, the
+  empty temp schema temp's. The temp schema table answers to
+  `sqlite_temp_master` / `sqlite_temp_schema` (with a schema
+  written, also to `sqlite_master` / `sqlite_schema`) and no longer
+  to a bare `sqlite_master` / `sqlite_schema` qualifier (the pin's
+  `isValidSchemaTableName`): `sqlite_temp_master.name FROM
+  sqlite_temp_master` was "no such column", `sqlite_schema.name FROM
+  temp.sqlite_schema` answered.
+- *INDEXED BY a partial index on a LEFT JOIN's right table* was "no
+  query solution" whenever the implying term sat in WHERE. The pin
+  makes the join inner when the WHERE rejects the table's NULL row
+  (`sqlite3ExprImpliesNonNullRow`, modelled as `xplan::Src::
+  null_rejects`: comparisons, arithmetic, IN lists and BETWEEN by
+  their left operand, AND / OR, a top-level IS NOT NULL only where
+  the pin's AND chain tries its left operands; IS / IS NOT, IS NULL,
+  functions, LIKE and CASE do not count), and then the WHERE may
+  imply the index.
+- *CREATE TABLE ... AS over a TEMP view* (main CTAS) was "no such
+  table": the views are now written in after its `AS`
+  (`inline_temp_views`, `start`). A TEMP CTAS or temp INSERT ...
+  SELECT over a TEMP view of main tables, or over a main view, failed
+  the same way: the fed SELECT now gets the temp views inlined
+  (`route`) and its views and CTEs expanded (`expand_ast`) like any
+  main statement.
+- Code: `resolve_col_ref` has its `#[inline(never)]` back (the
+  three-part check had been inserted between the attribute and the
+  function), and the three-part doc no longer claims `temporary` is
+  accepted (the pin takes only `temp`).
+
+**Oracle-probing notes:** `CREATE VIEW mv AS SELECT * FROM t` over a
+temp-only t is stored and fails when read ("no such table: main.t");
+`... FROM temp.t` in a main view or trigger is "cannot reference
+objects in database temp"; FK actions name their child table and are
+unaffected by a temp table of its name. `DELETE FROM t NOT INDEXED`
+in a trigger body: "the NOT INDEXED clause is not allowed on UPDATE
+or DELETE statements within triggers" (before the RETURNING error);
+`SELECT ... FROM t INDEXED BY i` there is fine. `SELECT * FROM
+(SELECT 1) NOT INDEXED` and `pragma_table_info('t') NOT INDEXED` are
+syntax errors on both. `CHECK (main.x.a > 0)` (wrong table) is "no
+such column: x.a"; in generated columns `temp.t.a` is "no such
+column" and `main.t.a` '"." operator prohibited'. `main.s.x FROM
+(SELECT 1 x) s` and `main.c.x` of a CTE: "no such column". `u LEFT
+JOIN t INDEXED BY tp ... WHERE t.b LIKE '1' AND t.b IS NOT NULL` is
+"no query solution" (LIKE is a function; the trailing IS NOT NULL is
+walked, not tried), while `WHERE u.x > 0 AND (t.b IS NOT NULL AND
+u.y > 0)` answers. On the pin an auto-vacuum file takes `PRAGMA
+user_version = 3`; hipp refuses that header write too.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **−16 B** vs 76,976, ratchet lowered;
+the ungated auto-vacuum write refusal costs a few bytes in the
+pager, and the code around it compiled smaller). Full **498,456 B**
+(Δ **+204 B** vs 498,252, ratchet raised; under 500 KiB): the main
+views / triggers mark, the database filter of three-part names, the
+temp schema table's names, the CTAS / fed-SELECT temp-view inlining.
+Max **749,488 B** (Δ **+1,276 B** vs 748,212, ratchet raised): the same
+plus the trigger-body index-clause check (`triggers`) and the LEFT
+JOIN null-rejection test (`expr_index`).
+
+**Tests:** `tests/gaps_v16.rs` — `main_objects_read_main_only` (view
+and trigger shadowing and missing tables, ALTER re-plans, FK
+actions), `indexed_by_review` (trigger bodies, derived sources, 22
+LEFT JOIN forms), `indexed_by_trigger_leaves_file_readable`,
+`three_part_review` (CHECK / partial / generated / index-key texts,
+main and temp side by side, table-valued functions, the temp schema
+table's names), `pin_written_ignored_qualifiers` (a pin-written file
+hipp writes), `temp_views_feed_writes` (main and TEMP CTAS, temp
+INSERT over TEMP and main views), `auto_vacuum_file_is_not_written`
+(FULL and INCREMENTAL: refused writes leave the file byte-identical,
+then the conversion). `hipp-cli/tests/cli_v16_gaps.rs`:
+`review_fixes`, byte-identical one-shot and over stdin.
+
+**Honest gaps (still open):**
+
+- Every write to an auto-vacuum file is refused, header-only ones
+  (`PRAGMA user_version`) included, which the pin performs; VACUUM
+  of such a file keeps its refusal unless `auto_vacuum = NONE` was
+  set first.
+- `PRAGMA table_info` of a TEMP view over main tables still fails
+  (above).
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

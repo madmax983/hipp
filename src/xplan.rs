@@ -246,6 +246,51 @@ impl Src {
         )
     }
 
+    /// Whether WHERE clause `e` is false or NULL whenever this
+    /// source's columns are all NULL — the pin's
+    /// `sqlite3ExprImpliesNonNullRow` (v0.16 review fix): it turns a
+    /// LEFT JOIN to this source into an inner join, so the WHERE may
+    /// imply the source's `INDEXED BY` partial index. As on the pin,
+    /// a top-level `IS NOT NULL` counts only where the AND chain's
+    /// left operands are tried.
+    pub fn null_rejects(&self, e: &RExpr) -> bool {
+        let mut p = e;
+        while let RExpr::Collate(a, _) = p {
+            p = a;
+        }
+        if let RExpr::IsNull(a, true) = p {
+            return self.non_null_row(a);
+        }
+        while let RExpr::Binary(BinOp::And, l, r) = p {
+            if self.null_rejects(l) {
+                return true;
+            }
+            p = r;
+        }
+        self.non_null_row(p)
+    }
+
+    /// The pin's `impliesNotNullRow` walk under `null_rejects`.
+    fn non_null_row(&self, e: &RExpr) -> bool {
+        match e {
+            RExpr::Column(slot, ..) => (self.base..self.base + self.ncols).contains(slot),
+            RExpr::Rowid(s) => *s == self.src,
+            RExpr::Binary(BinOp::And | BinOp::Or, a, b) => {
+                self.non_null_row(a) && self.non_null_row(b)
+            }
+            RExpr::Binary(BinOp::Is | BinOp::IsNot, ..) => false,
+            RExpr::Binary(_, a, b) => self.non_null_row(a) || self.non_null_row(b),
+            RExpr::InList(a, l, ..) if !l.is_empty() => self.non_null_row(a),
+            RExpr::Neg(a)
+            | RExpr::Pos(a)
+            | RExpr::Not(a)
+            | RExpr::Cast(a, _)
+            | RExpr::Collate(a, _)
+            | RExpr::Between(a, ..) => self.non_null_row(a),
+            _ => false,
+        }
+    }
+
     /// Whether `e` is this source's rowid (or its alias column).
     pub fn is_rowid(&self, e: &RExpr) -> bool {
         match e {

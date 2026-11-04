@@ -194,3 +194,45 @@ fn three_part_names() {
 fn temp_and_main() {
     byte_identical("temp-main", TEMP_MAIN);
 }
+
+/// Review fixes that answer: main views and triggers read main
+/// only, `NOT INDEXED` on views and CTEs, a forced partial index
+/// under a LEFT JOIN the WHERE makes inner, schema parts a CHECK
+/// or partial index ignores, `main.t` beside `temp.t`, table-valued
+/// functions as main's, and CREATE TABLE ... AS / temp INSERT over
+/// TEMP views.
+const REVIEW: &str = r#"
+CREATE TABLE t(a, b REAL); INSERT INTO t VALUES (1, 0.5), (2, NULL), (3, 3.25);
+CREATE VIEW v AS SELECT * FROM t;
+CREATE TABLE l(x);
+CREATE TRIGGER tr AFTER INSERT ON l BEGIN INSERT INTO l SELECT a + 100 FROM t WHERE new.x < 10 AND a = 1; END;
+CREATE TEMP TABLE t(a, b REAL); INSERT INTO temp.t VALUES (99, 9.5), (1, 1.5);
+SELECT * FROM v;
+INSERT INTO l VALUES (1);
+SELECT * FROM l;
+SELECT * FROM v NOT INDEXED;
+WITH c AS (SELECT 1.5 x) SELECT * FROM c NOT INDEXED;
+CREATE INDEX main.tp ON t(a) WHERE b IS NOT NULL;
+SELECT * FROM l LEFT JOIN main.t INDEXED BY tp ON main.t.a = l.x - 100 WHERE main.t.b > 0;
+SELECT main.t.b, temp.t.b FROM main.t, temp.t WHERE main.t.a = temp.t.a;
+SELECT * FROM main.t, temp.t WHERE main.t.a = temp.t.a;
+SELECT main.p.name, main.p.type FROM pragma_table_info('l') p;
+SELECT main.j.value FROM json_each('[1.5, 2]') j;
+CREATE TABLE u(a CHECK (temp.u.a > 0), b, CHECK (bogus.u.b IS NOT 0));
+CREATE INDEX ui ON u(a) WHERE temp.u.a > 1;
+INSERT INTO u VALUES (2.5, 1), (1, 2);
+SELECT * FROM u INDEXED BY ui WHERE a > 1;
+CREATE TEMP VIEW tv AS SELECT a, b FROM main.t WHERE b IS NOT NULL;
+CREATE TABLE n AS SELECT * FROM tv;
+CREATE TEMP TABLE tn AS SELECT * FROM tv;
+INSERT INTO temp.t SELECT * FROM tv;
+SELECT * FROM n;
+SELECT * FROM tn;
+SELECT * FROM temp.t ORDER BY a;
+SELECT sql FROM sqlite_schema ORDER BY name;
+"#;
+
+#[test]
+fn review_fixes() {
+    byte_identical("review", REVIEW);
+}

@@ -49,6 +49,9 @@ impl<S: Storage> Connection<S> {
         let mut desc = SourceDesc::new(qual, cols, None, true);
         desc.kind = s.kind;
         desc.json_tvf = kind;
+        // An eponymous table of main's (v0.16 review fix: `main.j.value`
+        // was "no such column").
+        desc.db = 1;
         descs.push(desc);
         let w = crate::json::TVF_COLUMNS.len();
         let mut affs = AVec::new();

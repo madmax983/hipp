@@ -458,7 +458,6 @@ pub fn plan_rules<E>(
     checks: &[&[u8]],
     strict: bool,
     has_rowid: bool,
-    #[cfg(feature = "v16")] db: u8,
 ) -> Result<TableRules, E> {
     let mut rules = TableRules::default();
     if strict {
@@ -582,10 +581,12 @@ pub fn plan_rules<E>(
         // (v0.16; the pin's "no such column: rowid").
         let mut src = SourceDesc::new(copy(tname), descs, rowid_alias, has_rowid);
         src.colls = colls;
-        // `main.t.col` / `temp.t.col` reach the table in its database.
+        // A three-part name's schema part is ignored in a CHECK, as
+        // on the pin (v0.16 review fix: `temp.t.a` on a main table,
+        // or `bogus.t.a`, was refused).
         #[cfg(feature = "v16")]
         {
-            src.db = db;
+            src.db = crate::query::DB_ANY;
         }
         srcs.push(src);
         let cur = ScopeGroup::new(srcs, offsets, 0);
@@ -620,7 +621,6 @@ pub fn validate_def<E>(
     checks: &[crate::arena::ABytes],
     strict: bool,
     has_rowid: bool,
-    #[cfg(feature = "v16")] db: u8,
 ) -> Result<TableRules, E> {
     use crate::sql::handle_bytes;
     let mut specs: AVec<ColSpec<'_>> = AVec::new();
@@ -681,8 +681,6 @@ pub fn validate_def<E>(
         texts.as_slice(),
         strict,
         has_rowid,
-        #[cfg(feature = "v16")]
-        db,
     )
 }
 

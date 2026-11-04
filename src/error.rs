@@ -537,6 +537,12 @@ pub enum SchemaKind {
     /// statements within triggers"). Write the bare name.
     #[cfg(feature = "triggers")]
     TriggerQualifiedTarget,
+    /// `INDEXED BY` / `NOT INDEXED` on an UPDATE or DELETE inside a
+    /// trigger body (v0.16 review fix, `triggers`; the pin's "the
+    /// INDEXED BY clause is not allowed on UPDATE or DELETE
+    /// statements within triggers"). Drop the clause.
+    #[cfg(feature = "triggers")]
+    TriggerIndexedTarget,
     /// A `table.*` item in a RETURNING list (v0.16 review fix,
     /// ungated; the pin's "RETURNING may not use \"TABLE.*\"
     /// wildcards"). Write `*` or name the columns.
@@ -766,6 +772,12 @@ pub enum Error<E> {
     WalUnsupported,
     /// Reserved-bytes-per-page != 0 on a write path.
     ReservedBytesUnsupported,
+    /// A write to an auto-vacuum database (header offset 52
+    /// non-zero; v0.16 review fix): hipp keeps no pointer-map pages,
+    /// so it reads such a file but never writes it. Convert it
+    /// first with `PRAGMA auto_vacuum = NONE; VACUUM` (hipp or
+    /// SQLite), or write it with SQLite.
+    AutoVacuumUnsupported,
     /// A page's bytes violate the format.
     CorruptPage { page: u32 },
     /// A record's bytes violate the format.
@@ -842,6 +854,7 @@ impl<E> Error<E> {
             Error::UnsupportedEncoding => Error::UnsupportedEncoding,
             Error::WalUnsupported => Error::WalUnsupported,
             Error::ReservedBytesUnsupported => Error::ReservedBytesUnsupported,
+            Error::AutoVacuumUnsupported => Error::AutoVacuumUnsupported,
             Error::CorruptPage { page } => Error::CorruptPage { page },
             Error::CorruptRecord => Error::CorruptRecord,
             Error::BadVarint => Error::BadVarint,
@@ -883,6 +896,7 @@ impl<E> Error<E> {
             Error::UnsupportedEncoding => Error::UnsupportedEncoding,
             Error::WalUnsupported => Error::WalUnsupported,
             Error::ReservedBytesUnsupported => Error::ReservedBytesUnsupported,
+            Error::AutoVacuumUnsupported => Error::AutoVacuumUnsupported,
             Error::CorruptPage { page } => Error::CorruptPage { page },
             Error::CorruptRecord => Error::CorruptRecord,
             Error::BadVarint => Error::BadVarint,

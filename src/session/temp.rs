@@ -791,21 +791,48 @@ impl<S: Storage> Connection<S> {
             col_quals.as_slice().contains(&i)
                 && matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot))
         };
+        // A CHECK constraint's or partial index's three-part name
+        // (`temp.t.a`), kept as text by the parser: the pin ignores
+        // its schema part (`query::DB_ANY`), and elsewhere in a table
+        // or index definition (generated columns, key expressions)
+        // the main resolver refuses it as the pin does (v0.16 review
+        // fix: such definitions were refused).
+        let def = matches!(
+            ast,
+            Ast::CreateTable {
+                as_select: None,
+                ..
+            } | Ast::CreateIndex { .. }
+        );
+        let def3 = |i: usize| def && matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot));
         let unplaced = (0..t.len()).any(|i| {
             qualifier(t, i, arena) == Some(true)
                 && !routed.as_slice().contains(&i)
                 && !col3(i)
+                && !def3(i)
                 && !(col_quals.as_slice().contains(&(i.wrapping_sub(2)))
                     && !matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot | Tok::LParen)))
         });
         // TEMP views over main tables (and no temp table): the
         // statement runs on main with the views written in.
-        if created.is_none() && !unplaced && !views.is_empty() {
+        // A main CREATE TABLE ... AS SELECT reading them gets them
+        // after its `AS` (v0.16 review fix: "no such table").
+        let ctas = match (&ast, created) {
+            (
+                Ast::CreateTable {
+                    as_select: Some(_), ..
+                },
+                Some((h, false)),
+            ) if !create_temp => tok_index(t, h).map(|i| i + 2),
+            _ => None,
+        };
+        if (created.is_none() || ctas.is_some()) && !unplaced && !views.is_empty() {
             let target = match &ast {
                 Ast::Insert { table, .. }
                 | Ast::Update { table, .. }
                 | Ast::Delete { table, .. } => Some(handle_bytes(arena, *table)),
                 Ast::Select(_) | Ast::With { .. } => None,
+                _ if ctas.is_some() => None,
                 _ => Some(&b""[..]),
             };
             let dml_on_view = target.is_some_and(|n| n.is_empty() || self.temp_view(n).is_some());
@@ -818,7 +845,8 @@ impl<S: Storage> Connection<S> {
                     views.as_slice(),
                     ctes.as_slice(),
                     cuts.as_slice(),
-                    (temp > views.len(), main > 0),
+                    (temp > views.len(), main > 0 || ctas.is_some()),
+                    ctas.unwrap_or(0),
                     arena,
                 )?
             {
@@ -827,7 +855,18 @@ impl<S: Storage> Connection<S> {
         }
         // v0.16: a temp write fed by a SELECT reading main (INSERT
         // INTO temp.x SELECT ..., CREATE TEMP TABLE x AS SELECT ...).
-        if (temp > 0 || create_temp) && main > 0 && !unplaced && renames.is_empty() {
+        // TEMP views over main count as main's (v0.16 review fix: their
+        // feed is written in as CTEs, `prepare_temp_fed`).
+        let mut fed_main = main > 0;
+        if !fed_main && (temp > 0 || create_temp) {
+            let (mut order, mut refs) = (AVec::new(), AVec::new());
+            for v in views.iter() {
+                fed_main |= self
+                    .temp_view_closure(v.as_slice(), &mut order, &mut refs, 0, arena)?
+                    .1;
+            }
+        }
+        if (temp > 0 || create_temp) && fed_main && !unplaced && renames.is_empty() {
             // `CREATE TEMP TABLE IF NOT EXISTS x AS ...` over an
             // existing `x` does nothing, reading nothing.
             if let Ast::CreateTable {
@@ -1054,6 +1093,7 @@ impl<S: Storage> Connection<S> {
         ctes: &[ABytes],
         cuts: &[(usize, usize)],
         (temp, main): (bool, bool),
+        start: usize,
         arena: &Arena,
     ) -> Result<Option<AVec<u8>>, S::Error> {
         let mut order = AVec::new();
@@ -1079,13 +1119,21 @@ impl<S: Storage> Connection<S> {
         if clash {
             return Err(Error::Unsupported);
         }
+        // The query starts at token `start` (after `CREATE TABLE x AS`
+        // for CREATE TABLE ... AS SELECT; v0.16 review fix): the WITH
+        // list goes in there, after the text before it as written.
+        let head = t.get(start).map_or(0, |x| x.offset);
+        if cuts.iter().any(|c| c.0 < head) {
+            return Err(Error::Unsupported);
+        }
         let mut cuts_v: AVec<(usize, usize)> = AVec::new();
         for &c in cuts {
-            cuts_v.push(c);
+            cuts_v.push((c.0.saturating_sub(head), c.1.saturating_sub(head)));
         }
-        let body = apply_cuts(text.as_slice(), &mut cuts_v);
-        let word = |i: usize, w: &[u8]| matches!(t.get(i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
-        let mut out = copy_vec(b"WITH ");
+        let body = apply_cuts(text.as_slice().get(head..).unwrap_or_default(), &mut cuts_v);
+        let word = |i: usize, w: &[u8]| matches!(t.get(start + i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
+        let mut out = copy_vec(text.as_slice().get(..head).unwrap_or_default());
+        out.extend_from_slice(b"WITH ");
         // The statement's own WITH [RECURSIVE] continues the list.
         let rest = if word(0, b"WITH") {
             let k = if word(1, b"RECURSIVE") {
@@ -1094,7 +1142,7 @@ impl<S: Storage> Connection<S> {
             } else {
                 1
             };
-            let Some(at) = t.get(k).map(|x| x.offset) else {
+            let Some(at) = t.get(start + k).map(|x| x.offset.saturating_sub(head)) else {
                 return Err(Error::Unsupported);
             };
             Some(at)
@@ -1608,8 +1656,18 @@ impl<S: Storage> Connection<S> {
         f: FedRoute,
         arena: &Arena,
     ) -> Result<super::Plan, S::Error> {
-        let ast = crate::sql::parse::<S::Error>(f.feed.as_slice(), arena, self.cfg.limits())?;
-        let Ast::Select(sel) = &ast else {
+        // TEMP views over main the SELECT reads are written in as
+        // CTEs, as for a main statement (`inline_temp_views`).
+        let routed = match self.route(f.feed.as_slice(), arena)? {
+            Route::MainAs(text) => Some(text),
+            _ => None,
+        };
+        let feed = routed.as_ref().unwrap_or(&f.feed);
+        let ast = crate::sql::parse::<S::Error>(feed.as_slice(), arena, self.cfg.limits())?;
+        // Its views and CTEs are expanded as a main statement's are
+        // (v0.16 review fix: a view read there was "no such table").
+        let expanded = self.expand_ast(arena, &ast)?;
+        let Ast::Select(sel) = expanded.as_ref().unwrap_or(&ast) else {
             return Err(Error::Unsupported);
         };
         // Parameters would need binding on both sides.

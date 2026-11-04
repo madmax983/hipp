@@ -139,6 +139,11 @@ struct Expander<'c> {
     /// FROM t))` repeats the first row's value while `(SELECT
     /// group_concat(b) FROM t)` follows the update).
     returning: bool,
+    /// Walking the body of a view or trigger stored in main (v0.16
+    /// review fix): its unqualified table names are main's, never
+    /// a TEMP table's (the pin's `sqlite3FixSrcList`), so a temp
+    /// table neither shadows them nor is read for a missing one.
+    fix_main: bool,
 }
 
 fn schema_err<E>(kind: SchemaKind) -> Error<E> {
@@ -164,6 +169,10 @@ impl<S: Storage> Connection<S> {
             fixing: false,
             sub_limit: false,
             returning: false,
+            #[cfg(feature = "triggers")]
+            fix_main: self.trig.fix_main.get(),
+            #[cfg(not(feature = "triggers"))]
+            fix_main: false,
         }
     }
 
@@ -238,6 +247,8 @@ impl<S: Storage> Connection<S> {
     ) -> Result<SelectStmt, S::Error> {
         let mut x = self.expander(arena);
         x.read_body::<S::Error>(select.rdepth)?;
+        // A stored view's names are its database's (`fix_main`).
+        x.fix_main = true;
         x.views.push(copy_vec(name));
         x.select::<S::Error>(&mut select)?;
         x.fixing = true;
@@ -687,6 +698,9 @@ impl Expander<'_> {
             }
             return Ok(());
         }
+        if self.fix_main {
+            f.qualified = true;
+        }
         if self.catalog.find(self.ca, name.as_slice()).is_some() {
             return Ok(());
         }
@@ -802,7 +816,11 @@ impl Expander<'_> {
         // A view's body sees no CTE of the query that reads it.
         let vis = core::mem::take(&mut self.vis);
         self.views.push(copy_vec(name));
+        // Its names are main's (the expander reads main's views
+        // only; on the temp connection the mark routes nothing).
+        let fixed = core::mem::replace(&mut self.fix_main, true);
         let r = self.select::<E>(&mut select);
+        self.fix_main = fixed;
         self.views.pop();
         self.vis = vis;
         self.nest -= 1;

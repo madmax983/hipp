@@ -341,6 +341,12 @@ pub struct Pager<S: Storage> {
     storage: S,
     header: DbHeader,
     reserved_bytes: u8,
+    /// The file is an auto-vacuum database (header offset 52
+    /// non-zero; v0.16 review fix, ungated): it carries pointer-map
+    /// pages hipp does not maintain, so every write is refused
+    /// (`Error::AutoVacuumUnsupported`) — before, writes left the
+    /// maps stale and the pin then found the file corrupt.
+    ptrmaps: bool,
     frames: Vec<Frame>,
     cache_cap: usize,
     sidecar: Option<S::Sidecar>,
@@ -538,6 +544,7 @@ impl<S: Storage> Pager<S> {
         let in_log = wal.as_ref().is_some_and(|w| w.mx_frame > 0);
         #[cfg(not(feature = "wal"))]
         let in_log = false;
+        let ptrmaps = probe[52..56] != [0; 4];
         // A header that claims more pages than the file holds is
         // the pin's "malformed" (v0.16, `v16`: hipp read past the
         // end as empty pages, which integrity_check reported).
@@ -562,6 +569,7 @@ impl<S: Storage> Pager<S> {
                 storage,
                 header,
                 reserved_bytes,
+                ptrmaps,
                 frames,
                 cache_cap,
                 sidecar: Some(sidecar),
@@ -754,6 +762,9 @@ impl<S: Storage> Pager<S> {
     pub async fn begin_write(&mut self) -> Result<(), S::Error> {
         if self.reserved_bytes != 0 {
             return Err(Error::ReservedBytesUnsupported);
+        }
+        if self.ptrmaps {
+            return Err(Error::AutoVacuumUnsupported);
         }
         match self.stage {
             CommitStage::Idle => {}
@@ -1725,8 +1736,23 @@ impl<S: Storage> Pager<S> {
     /// Page 1 is written last. The page size may change (`PRAGMA
     /// page_size` before VACUUM); the cache is rebuilt for it. No
     /// transaction may be open.
+    ///
+    /// The image is a plain (non-auto-vacuum) database, so it may
+    /// replace an auto-vacuum file (`PRAGMA auto_vacuum = NONE;
+    /// VACUUM`): the write refusal is lifted for it, and kept when
+    /// the replacement fails.
     #[cfg(feature = "v16")]
     pub async fn replace_image(&mut self, img: &[u8], page_size: u32) -> Result<(), S::Error> {
+        let pm = core::mem::replace(&mut self.ptrmaps, false);
+        let r = self.replace_image_inner(img, page_size).await;
+        if r.is_err() {
+            self.ptrmaps = pm;
+        }
+        r
+    }
+
+    #[cfg(feature = "v16")]
+    async fn replace_image_inner(&mut self, img: &[u8], page_size: u32) -> Result<(), S::Error> {
         if self.stage != CommitStage::Idle {
             return Err(Error::OperationInFlight);
         }

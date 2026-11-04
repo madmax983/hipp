@@ -6630,6 +6630,20 @@ impl<'a> Parser<'a> {
             Ast::Update { returning, .. } | Ast::Delete { returning, .. } => !returning.is_empty(),
             _ => false,
         };
+        // Checked before RETURNING, as on the pin (v0.16 review fix:
+        // the clause was stored and the pin then found the schema
+        // malformed).
+        if let Ast::Update {
+            indexed: Some(_), ..
+        }
+        | Ast::Delete {
+            indexed: Some(_), ..
+        } = &ast
+        {
+            return Err(Error::Schema {
+                kind: crate::error::SchemaKind::TriggerIndexedTarget,
+            });
+        }
         if returning {
             return Err(Error::Schema {
                 kind: crate::error::SchemaKind::TriggerReturning,

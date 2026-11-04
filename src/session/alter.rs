@@ -880,7 +880,12 @@ impl<S: Storage> Connection<S> {
             self.alter_trace = Some(tr.clone());
             let r = (|| -> Result<(), S::Error> {
                 let wrapped = Ast::Select(sel);
-                let expanded = self.expand_ast(arena, &wrapped)?;
+                // A stored trigger's names are its database's
+                // (`Expander::fix_main`; v0.16 review fix).
+                let fixed = self.trig.fix_main.replace(!self.is_temp);
+                let expanded = self.expand_ast(arena, &wrapped);
+                self.trig.fix_main.set(fixed);
+                let expanded = expanded?;
                 if let Some(Ast::Select(s)) = expanded.as_ref().or(Some(&wrapped)) {
                     self.plan_subquery(s, arena, &[])?;
                 }

@@ -1822,8 +1822,6 @@ impl<S: Storage> Connection<S> {
                     kept.as_slice(),
                     strict,
                     !wr_def,
-                    #[cfg(feature = "v16")]
-                    self.db_no(),
                 )?;
                 #[cfg(feature = "v16")]
                 if self.prag.like_redefined
@@ -2446,8 +2444,6 @@ impl<S: Storage> Connection<S> {
                     checks.as_slice(),
                     strict_def,
                     t.has_rowid(),
-                    #[cfg(feature = "v16")]
-                    self.db_no(),
                 )?;
                 // The pin re-checks the whole rewritten definition.
                 #[cfg(feature = "v16")]
@@ -2874,8 +2870,6 @@ impl<S: Storage> Connection<S> {
             checks.as_slice(),
             strict,
             t.has_rowid(),
-            #[cfg(feature = "v16")]
-            self.db_no(),
         )?;
         #[cfg(feature = "v16")]
         if let Some(g) = rules.gcols.as_mut() {
@@ -4757,10 +4751,19 @@ impl<S: Storage> Connection<S> {
         };
         let mut desc = SourceDesc::new(qual, cols, None, false);
         desc.kind = s.kind;
-        // A view is a schema object (v0.16): `main.v.col` reaches it.
+        // A view is a schema object (v0.16): `main.v.col` reaches it;
+        // a table-valued pragma function is main's, the empty temp
+        // schema temp's (v0.16 review fix: both were unreachable).
         #[cfg(feature = "v16")]
         if s.cte.as_ref().is_some_and(|c| c.view) {
             desc.db = self.db_no();
+        } else if s.derived.is_none() {
+            let n = handle_bytes(arena, s.table);
+            desc.db = if eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master") {
+                2
+            } else {
+                1
+            };
         }
         // v0.16: a derived column compares by its
         // leftmost core's item collation (BINARY when
@@ -4872,9 +4875,10 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v09")]
             if let Some(d) = derived {
                 // A view or CTE has no index (the pin's "no such
-                // index", v0.16).
+                // index", v0.16); NOT INDEXED asks for none and is
+                // accepted (v0.16 review fix).
                 #[cfg(feature = "v16")]
-                if s.indexed.is_some() {
+                if matches!(s.indexed, Some(crate::sql::IndexHint::By(_))) {
                     return Err(Error::Schema {
                         kind: SchemaKind::UnknownIndex,
                     });
@@ -4944,6 +4948,13 @@ impl<S: Storage> Connection<S> {
                 desc.db = self.db_no();
             }
             desc.schema_table = t.root == 1 && s.alias.is_none();
+            // The temp database's schema table answers to its own
+            // names only, whatever the FROM clause wrote (v0.16
+            // review fix: `sqlite_schema.name FROM temp.sqlite_schema`).
+            #[cfg(feature = "v16")]
+            if self.is_temp && desc.schema_table {
+                desc.qualifier = copy_vec(b"sqlite_temp_master");
+            }
             // An ALTER TABLE tracing references to its table (v0.16).
             #[cfg(feature = "v16")]
             if let Some(tr) = &self.alter_trace

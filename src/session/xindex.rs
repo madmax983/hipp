@@ -82,11 +82,15 @@ impl<S: Storage> Connection<S> {
         let colls = table_colls(t);
         let mut offsets = AVec::new();
         offsets.push(0);
+        // A partial index's WHERE ignores a three-part name's schema
+        // part, as on the pin (v0.16 review fix: `temp.t.a` on a main
+        // table, or `bogus.t.a`, was refused); a key expression may
+        // not qualify a column at all (`QualifiedIndexColumn`).
         let scope = |qualifier: &[u8], rowid: bool| {
             let mut srcs = AVec::new();
             let mut src = SourceDesc::new(copy_vec(qualifier), descs.clone(), t.rowid_alias, rowid);
             src.colls = colls.clone();
-            src.db = self.db_no();
+            src.db = crate::query::DB_ANY;
             srcs.push(src);
             ScopeGroup::new(srcs, offsets.clone(), 0)
         };
@@ -1053,6 +1057,11 @@ impl<S: Storage> Connection<S> {
             };
             let mut conj: AVec<&RExpr> = AVec::new();
             if i == 0 || !sp.kind.pads_right() {
+                conj.extend_from_slice(wconj.as_slice());
+            } else if info.filter.is_some_and(|f| s.null_rejects(f)) {
+                // A WHERE term no NULL-extended row passes makes the
+                // LEFT JOIN an inner join, as the pin simplifies it
+                // (v0.16 review fix: "no query solution").
                 conj.extend_from_slice(wconj.as_slice());
             }
             if let Some(on) = &sp.on {

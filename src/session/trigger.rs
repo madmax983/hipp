@@ -94,6 +94,10 @@ pub(super) struct TrigState {
     /// program once), and how deep the check has nested.
     pub validated: core::cell::RefCell<Option<AVec<AVec<u8>>>>,
     pub validate_depth: core::cell::Cell<usize>,
+    /// A trigger program's statement is being planned on the main
+    /// database (v0.16 review fix): its unqualified table names
+    /// are main's, never a TEMP table's (`Expander::fix_main`).
+    pub fix_main: core::cell::Cell<bool>,
 }
 
 /// One trigger a write may fire, copied out of the catalog.
@@ -941,8 +945,10 @@ impl<S: Storage> Connection<S> {
         if let Some(c) = orconf {
             force_conflict(&mut ast, c);
         }
-        let plan = self.plan(arena, &ast)?;
-        Ok((ast, plan))
+        let fixed = self.trig.fix_main.replace(!self.is_temp);
+        let plan = self.plan(arena, &ast);
+        self.trig.fix_main.set(fixed);
+        Ok((ast, plan?))
     }
 
     /// Run one trigger program for a row. `Ok(false)`: it ran

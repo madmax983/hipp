@@ -413,7 +413,8 @@ aspirations.
   takes an unused one. Gaps: whole-database ANALYZE row order (the
   pin's schema hash), VACUUM of a file with an expression or
   partial index without `expr_index`, VACUUM of an auto-vacuum file (refused: hipp
-  writes no pointer maps; kept by the honest-gap sweep) (STATUS.md).
+  writes no pointer maps; kept by the honest-gap sweep, which also
+  refuses every other write to such a file) (STATUS.md).
 - **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
   `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
   [COLUMN] a` edit the stored schema texts token by token exactly
@@ -730,8 +731,15 @@ aspirations.
   — main statements reading temp tables, `INSERT INTO temp.x SELECT
   ... FROM main.y` and `CREATE TEMP TABLE x AS SELECT ...` over main,
   TEMP views over both, pragma functions on temp objects. VACUUM of
-  an auto-vacuum file stays refused (no pointer-map upkeep). Gaps
-  and sizes in STATUS.md.
+  an auto-vacuum file stays refused (no pointer-map upkeep), and
+  since the review fixes so does every other write to such a file
+  (they used to leave the pin's pointer maps stale). Review fixes
+  also keep views and triggers stored in main reading main only (a
+  temp table no longer shadows their tables), refuse INDEXED BY on a
+  trigger body's UPDATE / DELETE as the pin does, ignore the schema
+  part of CHECK / partial-index names as the pin does, and tell
+  `main.t` from `temp.t` in one statement. Gaps and sizes in
+  STATUS.md.
 
 ## What v0.13 does
 
@@ -1050,7 +1058,10 @@ created (refused below `v16`, foreign ones load read-only there;
 indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed (all of these in the tiny profile: the
 `v04` ... `v16` rungs add them — views execute with `v16`), no
-UTF-16 databases without the `utf16` leaf (refused at open), no multi-process
+UTF-16 databases without the `utf16` leaf (refused at open), no
+writes to auto-vacuum files (read only: hipp keeps no pointer-map
+pages, so writes are refused with `AutoVacuumUnsupported` until
+`PRAGMA auto_vacuum = NONE; VACUUM` converts the file), no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 

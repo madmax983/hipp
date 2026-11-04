@@ -507,6 +507,13 @@ pub enum RExpr {
     Win(WinBox, AVec<RExpr>),
 }
 
+/// `SourceDesc::db` of a CHECK constraint's or partial index's
+/// table (v0.16 review fix, `v16`): the pin ignores the schema part
+/// of a three-part name there (`main.t.a`, `temp.t.a`, even
+/// `bogus.t.a` reach table `t`, whichever database holds it).
+#[cfg(feature = "v16")]
+pub const DB_ANY: u8 = 0xff;
+
 /// One FROM source for resolution: qualifier (alias if given, else
 /// the table name), column names + affinities in table order, and
 /// the rowid-alias column index if any.
@@ -549,7 +556,9 @@ pub struct SourceDesc {
     /// The database a table or view source lives in (v0.16, `v16`):
     /// 1 main, 2 temp; 0 for anything else (a derived table, a CTE,
     /// `excluded`), which no three-part name `schema.table.column`
-    /// reaches.
+    /// reaches. A table-valued function is main's (1), as on the
+    /// pin; a CHECK constraint's or partial index's table is
+    /// `DB_ANY`, which every schema part reaches.
     #[cfg(feature = "v16")]
     pub db: u8,
     /// A `json_each` / `json_tree` source (v0.16, `json`): its
@@ -681,10 +690,28 @@ impl SourceDesc {
         }
     }
 
+    /// Whether a three-part name of database `db` (0: none
+    /// written) may reach this source (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn in_db(&self, db: u8) -> bool {
+        db == 0 || self.db == db || self.db == DB_ANY
+    }
+
     /// Whether qualifier `q` names this source.
     pub fn named(&self, q: &[u8]) -> bool {
-        eq_ci(self.qualifier.as_slice(), q)
-            || (self.schema_table && (eq_ci(q, b"sqlite_master") || eq_ci(q, b"sqlite_schema")))
+        // The temp database's schema table is its
+        // `sqlite_temp_schema` / `sqlite_temp_master` only (v0.16
+        // review fix: the router renames the FROM name alone, so its
+        // own name was "no such column" and main's was taken).
+        #[cfg(feature = "v16")]
+        let (m, s) = if self.db == 2 {
+            (&b"sqlite_temp_master"[..], &b"sqlite_temp_schema"[..])
+        } else {
+            (&b"sqlite_master"[..], &b"sqlite_schema"[..])
+        };
+        #[cfg(not(feature = "v16"))]
+        let (m, s) = (b"sqlite_master", b"sqlite_schema");
+        eq_ci(self.qualifier.as_slice(), q) || (self.schema_table && (eq_ci(q, m) || eq_ci(q, s)))
     }
 
     /// Whether `name` is one of this source's USING columns.
@@ -1266,6 +1293,35 @@ pub(crate) fn resolve_column_in_group<E>(
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Option<Result<RExpr, E>> {
+    #[cfg(feature = "v16")]
+    let r = group_column::<E>(group, table, name, 0);
+    #[cfg(not(feature = "v16"))]
+    let r = group_column::<E>(group, table, name);
+    r
+}
+
+/// `resolve_column_in_group`, counting (v0.16, `v16`) only the
+/// sources of database `db` when it is not 0 — a three-part name
+/// `main.t.col` / `temp.t.col` (`SourceDesc::in_db`).
+fn group_column<E>(
+    group: &ScopeGroup,
+    table: Option<&[u8]>,
+    name: &[u8],
+    #[cfg(feature = "v16")] db: u8,
+) -> Option<Result<RExpr, E>> {
+    // With a schema written, the temp schema table also answers to
+    // main's names (the pin's `isValidSchemaTableName`).
+    #[cfg(feature = "v16")]
+    let named = |src: &SourceDesc, q: &[u8]| {
+        (src.named(q)
+            || (db != 0
+                && src.db == 2
+                && src.schema_table
+                && (eq_ci(q, b"sqlite_master") || eq_ci(q, b"sqlite_schema"))))
+            && src.in_db(db)
+    };
+    #[cfg(not(feature = "v16"))]
+    let named = |src: &SourceDesc, q: &[u8]| src.named(q);
     // A qualified reference counts only the sources of that name
     // (v0.16 fix, ungated: `SELECT t.a FROM t, t` read the first t
     // where the pin reports "ambiguous column name"); a USING
@@ -1275,7 +1331,7 @@ pub(crate) fn resolve_column_in_group<E>(
     let mut full: AVec<RExpr> = AVec::new();
     for (si, src) in group.sources.iter().enumerate() {
         if let Some(q) = table
-            && !src.named(q)
+            && !named(src, q)
         {
             continue;
         }
@@ -1314,7 +1370,7 @@ pub(crate) fn resolve_column_in_group<E>(
         if is_rowid_name(name) {
             let mut rowid: Option<RExpr> = None;
             for (si, src) in group.sources.iter().enumerate() {
-                if src.named(q) && src.has_rowid {
+                if named(src, q) && src.has_rowid {
                     if rowid.is_some() {
                         return Some(Err(Error::Schema {
                             kind: SchemaKind::AmbiguousColumn,
@@ -1369,6 +1425,7 @@ fn resolve_column<E>(
     enclosing: &[ScopeGroup],
     table: Option<&[u8]>,
     name: &[u8],
+    #[cfg(feature = "v16")] db: u8,
 ) -> Result<RExpr, E> {
     #[cfg(not(feature = "v16"))]
     for g in core::iter::once(cur).chain(enclosing.iter()) {
@@ -1378,7 +1435,7 @@ fn resolve_column<E>(
     }
     #[cfg(feature = "v16")]
     for (depth, g) in core::iter::once(cur).chain(enclosing.iter()).enumerate() {
-        if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
+        if let Some(r) = group_column::<E>(g, table, name, db) {
             return r;
         }
         if table.is_none()
@@ -1608,10 +1665,19 @@ pub fn expand_star<E>(
                 // `q.col` references, so two sources of one name
                 // sharing a column make it ambiguous (v0.16 fix,
                 // ungated: `SELECT * FROM t, t` answered).
+                // The pin writes `schema.q.col` for a table, so a main
+                // and a temp table of one name are told apart (v0.16
+                // review fix).
                 if srcs.len() > 1
                     && !src.qualifier.is_empty()
-                    && let Some(Err(e)) =
-                        resolve_column_in_group::<E>(cur, Some(src.qualifier.as_slice()), n)
+                    && let Some(Err(e)) = {
+                        let q = Some(src.qualifier.as_slice());
+                        #[cfg(feature = "v16")]
+                        let dup = group_column::<E>(cur, q, n, src.db);
+                        #[cfg(not(feature = "v16"))]
+                        let dup = resolve_column_in_group::<E>(cur, q, n);
+                        dup
+                    }
                 {
                     return Err(e);
                 }
@@ -1747,10 +1813,11 @@ pub fn resolve_scoped<E>(
             name,
             schema,
         } => {
-            if let Some(sc) = schema {
-                check_schema_ref::<E>(*sc, *table, arena, cur, enclosing)?;
-            }
-            resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?
+            let db = match schema {
+                None => 0,
+                Some(sc) => schema_db(handle_bytes(arena, *sc)),
+            };
+            resolve_col_ref::<E>(*table, *name, arena, cur, enclosing, db)?
         }
         #[cfg(not(feature = "v16"))]
         Expr::Column { table, name } => resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?,
@@ -1842,55 +1909,41 @@ pub fn resolve_scoped<E>(
     })
 }
 
-/// A column reference (out of line: see `resolve_scoped`).
-#[inline(never)]
-/// The schema of a three-part column name `sc.table.column` (v0.16,
-/// `v16`): the source `table` names must be a table or view of that
-/// database (`main`, or `temp` / `temporary`, case-insensitive), as
-/// on the pin; otherwise "no such column" (`UnknownColumn`).
+/// The database a three-part column name's schema part names
+/// (v0.16, `v16`; `SourceDesc::db`): 1 for `main`, 2 for `temp`
+/// (case-insensitive; the pin takes no other spelling, `temporary`
+/// included), else 3, which only a CHECK constraint's or partial
+/// index's table (`DB_ANY`) matches — as on the pin, which ignores
+/// the schema part there. A name matching no source of its
+/// database is "no such column" (`UnknownColumn`).
 #[cfg(feature = "v16")]
-fn check_schema_ref<E>(
-    sc: crate::arena::ABytes,
-    table: Option<crate::arena::ABytes>,
-    arena: &Arena,
-    cur: &ScopeGroup,
-    enclosing: &[ScopeGroup],
-) -> Result<(), E> {
-    let no = Error::Schema {
-        kind: SchemaKind::UnknownColumn,
-    };
-    let Some(t) = table else {
-        return Err(no);
-    };
-    let q = handle_bytes(arena, t);
-    let scb = handle_bytes(arena, sc);
-    let want = if eq_ci(scb, b"main") {
+fn schema_db(sc: &[u8]) -> u8 {
+    if eq_ci(sc, b"main") {
         1
-    } else if eq_ci(scb, b"temp") {
+    } else if eq_ci(sc, b"temp") {
         2
     } else {
-        return Err(no);
-    };
-    for g in core::iter::once(cur).chain(enclosing.iter()) {
-        if let Some(s) = g.sources.iter().find(|s| s.named(q)) {
-            return if s.db == want { Ok(()) } else { Err(no) };
-        }
+        3
     }
-    Err(no)
 }
 
+/// A column reference (out of line: see `resolve_scoped`).
+#[inline(never)]
 fn resolve_col_ref<E>(
     table: Option<crate::arena::ABytes>,
     name: crate::arena::ABytes,
     arena: &Arena,
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
+    #[cfg(feature = "v16")] db: u8,
 ) -> Result<RExpr, E> {
     let r = resolve_column::<E>(
         cur,
         enclosing,
         table.map(|h| handle_bytes(arena, h)),
         handle_bytes(arena, name),
+        #[cfg(feature = "v16")]
+        db,
     )?;
     #[cfg(feature = "v16")]
     if core::iter::once(cur)

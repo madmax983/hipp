@@ -1466,3 +1466,431 @@ PRAGMA index_list(t);
         run_same(leak(format!("pragma_tvf_temp-{tag}")), script);
     }
 }
+
+/// Review fixes (regressions): a view or trigger stored in main
+/// reads main only — a temp table neither shadows its unqualified
+/// names nor stands in for a missing one (the pin binds them to
+/// main, `sqlite3FixSrcList`: "no such table: main.t"), also when
+/// an ALTER TABLE re-plans them; FK actions are untouched.
+#[test]
+fn main_objects_read_main_only() {
+    for (tag, script) in [
+        (
+            "view_shadow",
+            r#"
+CREATE TABLE t(a);
+INSERT INTO t VALUES(1);
+CREATE VIEW v AS SELECT * FROM t;
+CREATE TEMP TABLE t(a);
+INSERT INTO t VALUES(99);
+SELECT * FROM v;
+SELECT * FROM t;
+CREATE VIEW v2 AS SELECT a FROM main.t WHERE a IN t;
+SELECT * FROM v2;
+CREATE VIEW v3 AS WITH c AS (SELECT a FROM t) SELECT (SELECT max(a) FROM c), (SELECT count(*) FROM t WHERE a > 50);
+SELECT * FROM v3;
+PRAGMA table_info(v);
+"#,
+        ),
+        (
+            "view_missing",
+            r#"
+CREATE TABLE m(a);
+INSERT INTO m VALUES(1),(2);
+CREATE TEMP TABLE t(a);
+INSERT INTO t VALUES(5),(2);
+CREATE VIEW mv AS SELECT * FROM t;
+SELECT * FROM mv;
+CREATE VIEW mv2 AS SELECT * FROM m WHERE a IN (SELECT a FROM t);
+SELECT * FROM mv2;
+CREATE VIEW mv3 AS SELECT * FROM m WHERE a IN t;
+SELECT * FROM mv3;
+CREATE TEMP VIEW tv AS SELECT * FROM m WHERE a IN t;
+SELECT * FROM tv;
+"#,
+        ),
+        (
+            "trigger_shadow",
+            r#"
+CREATE TABLE t(a);
+CREATE TABLE l(x);
+CREATE TRIGGER tr AFTER INSERT ON l BEGIN INSERT INTO l SELECT a+100 FROM t WHERE new.x<10; END;
+INSERT INTO t VALUES(1);
+CREATE TEMP TABLE t(a);
+INSERT INTO temp.t VALUES(99);
+INSERT INTO l VALUES(1);
+SELECT * FROM l;
+CREATE TRIGGER tr2 AFTER INSERT ON l WHEN (SELECT count(*) FROM t) > 0 BEGIN UPDATE t SET a=a+(SELECT count(*) FROM t); DELETE FROM l WHERE x IN (SELECT a+100 FROM t); END;
+INSERT INTO l VALUES(2);
+SELECT * FROM l;
+SELECT * FROM main.t;
+SELECT * FROM temp.t;
+"#,
+        ),
+        (
+            "trigger_missing",
+            r#"
+CREATE TABLE m(a);
+CREATE TABLE l(x);
+CREATE TEMP TABLE t(a);
+INSERT INTO t VALUES(5);
+CREATE TRIGGER tr AFTER INSERT ON l BEGIN INSERT INTO m SELECT a FROM t; END;
+INSERT INTO l VALUES(1);
+SELECT count(*) FROM l;
+SELECT count(*) FROM m;
+"#,
+        ),
+        (
+            "alter_replans",
+            r#"
+CREATE TABLE t(a);
+CREATE TABLE l(x);
+CREATE VIEW v AS SELECT a FROM t;
+CREATE TRIGGER tr AFTER INSERT ON l BEGIN INSERT INTO l SELECT a FROM t WHERE new.x<0; END;
+CREATE TEMP TABLE t(a);
+ALTER TABLE main.t RENAME a TO z;
+SELECT sql FROM sqlite_master ORDER BY name;
+ALTER TABLE main.t RENAME TO t2;
+SELECT sql FROM sqlite_master ORDER BY name;
+ALTER TABLE temp.t RENAME TO tq;
+SELECT * FROM v;
+"#,
+        ),
+        (
+            "fk_actions",
+            r#"
+PRAGMA foreign_keys=1;
+CREATE TABLE p(id PRIMARY KEY);
+CREATE TABLE c(pid REFERENCES p ON DELETE CASCADE);
+INSERT INTO p VALUES(1),(2);
+INSERT INTO c VALUES(1),(2);
+CREATE TEMP TABLE c(pid);
+INSERT INTO temp.c VALUES(1);
+DELETE FROM p WHERE id=1;
+SELECT * FROM main.c;
+SELECT * FROM temp.c;
+"#,
+        ),
+    ] {
+        run_same(leak(format!("main_objects-{tag}")), script);
+    }
+}
+
+/// Review fixes: `INDEXED BY` / `NOT INDEXED` on an UPDATE or DELETE
+/// in a trigger body is the pin's parse error (it was stored, and
+/// the pin then found the schema malformed); elsewhere in a body it
+/// is allowed. `NOT INDEXED` on a view or CTE is accepted. A WHERE
+/// that rejects NULL rows of a LEFT JOIN's right table makes the
+/// join inner, so it may imply that table's forced partial index.
+#[test]
+fn indexed_by_review() {
+    for (tag, script) in [
+        (
+            "trigger_body",
+            r#"
+CREATE TABLE t(a,b);
+CREATE INDEX ta ON t(a);
+CREATE TABLE l(x);
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t NOT INDEXED WHERE a=new.a+100; END;
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t INDEXED BY ta SET b=1 WHERE a=new.a+100; END;
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t INDEXED BY nope WHERE a=1; END;
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE OR IGNORE t NOT INDEXED SET b=1 RETURNING *; END;
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO l SELECT a FROM t INDEXED BY ta WHERE a>0; DELETE FROM l WHERE x IN (SELECT a FROM t NOT INDEXED); UPDATE l SET x=1 FROM t INDEXED BY ta WHERE t.a=l.x; END;
+INSERT INTO t VALUES(1,1);
+SELECT * FROM l;
+SELECT name FROM sqlite_master ORDER BY name;
+"#,
+        ),
+        (
+            "derived",
+            r#"
+CREATE TABLE t(a,b);
+INSERT INTO t VALUES(1,2);
+CREATE VIEW v AS SELECT * FROM t;
+SELECT * FROM v NOT INDEXED;
+SELECT * FROM v AS w NOT INDEXED;
+WITH c AS (SELECT 1 x) SELECT * FROM c NOT INDEXED;
+SELECT * FROM v INDEXED BY i;
+WITH c AS (SELECT 1 x) SELECT * FROM c INDEXED BY i;
+SELECT * FROM sqlite_schema NOT INDEXED;
+"#,
+        ),
+        (
+            "left_join",
+            r#"
+CREATE TABLE t(a,b);
+CREATE INDEX tp ON t(a) WHERE b IS NOT NULL;
+CREATE INDEX tn ON t(a) WHERE b IS NULL;
+CREATE INDEX tg ON t(a) WHERE b>0;
+CREATE TABLE u(x,y);
+INSERT INTO t VALUES(1,1),(2,NULL),(3,3),(3,-3),(1,NULL);
+INSERT INTO u VALUES(1,1),(2,2),(3,3),(4,4);
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE t.b>0;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE t.b IS NOT NULL;
+SELECT * FROM u LEFT JOIN t INDEXED BY tn ON t.a=u.x WHERE t.b IS NULL;
+SELECT * FROM u LEFT JOIN t INDEXED BY tg ON t.a=u.x WHERE t.b>0 OR u.x=4;
+SELECT * FROM u LEFT JOIN t INDEXED BY tg ON t.a=u.x WHERE t.b>0 OR t.a>5;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE u.y>0 AND t.b=3;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x;
+SELECT * FROM u LEFT JOIN t AS z INDEXED BY tp ON z.a=u.x WHERE z.b>0;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x LEFT JOIN t AS t2 ON t2.a=t.a WHERE t.b>0;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE t.b IS 3;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE t.b IN (1,3);
+SELECT * FROM u LEFT JOIN t INDEXED BY tg ON t.a=u.x WHERE t.b BETWEEN 1 AND 3;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE NOT t.b IS NULL;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE t.b+0>0;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE t.b LIKE '1' AND t.b IS NOT NULL;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE t.b IS NOT NULL AND u.x>0;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE u.x>0 AND t.b IS NOT NULL;
+SELECT * FROM u LEFT JOIN t INDEXED BY tp ON t.a=u.x WHERE u.x>0 AND (t.b IS NOT NULL AND u.y>0);
+SELECT * FROM u LEFT JOIN t INDEXED BY tg ON t.a=u.x WHERE abs(t.b)>0 AND t.b>0;
+SELECT * FROM u LEFT JOIN t INDEXED BY tg ON t.a=u.x WHERE CASE WHEN t.b THEN 1 END AND t.b>0;
+SELECT count(*) FROM u LEFT JOIN t INDEXED BY tg ON t.a=u.x WHERE t.b>0;
+"#,
+        ),
+    ] {
+        run_same(leak(format!("indexed_by_review-{tag}")), script);
+    }
+}
+
+/// The pin can still open a file after hipp refused a trigger body
+/// with an index clause on its UPDATE / DELETE.
+#[test]
+fn indexed_by_trigger_leaves_file_readable() {
+    let h = common::temp_db("v16gap-trigidx-h");
+    common::cli(
+        &h,
+        "CREATE TABLE t(a,b);
+CREATE INDEX ta ON t(a);",
+    );
+    let (_, errs, _) = hipp_run(
+        &h,
+        &lines(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t NOT INDEXED WHERE a=new.a+100; END",
+        ),
+    );
+    assert_eq!(errs, vec![1]);
+    assert_eq!(common::cli(&h, "PRAGMA integrity_check;").trim(), "ok");
+}
+
+/// Review fixes: three-part names. The schema part of a CHECK's or
+/// partial index's name is ignored (any word: the pin's NC_IsCheck /
+/// NC_PartIdx), including texts the pin wrote; table-valued
+/// functions are main's; the temp schema table answers to its own
+/// names; `main.t` and `temp.t` in one FROM clause are told apart,
+/// also by `*` and `t.*`, and an inner scope's other-database table
+/// does not hide the outer one.
+#[test]
+fn three_part_review() {
+    for (tag, script) in [
+        (
+            "check_partial",
+            r#"
+CREATE TABLE u(a CHECK(temp.u.a>0));
+INSERT INTO u VALUES(5);
+INSERT INTO u VALUES(-5);
+CREATE TABLE w(a CHECK(bogus.w.a>0), CHECK(main.w.a<10));
+INSERT INTO w VALUES(3);
+INSERT INTO w VALUES(30);
+CREATE TABLE x(a CHECK(main.y.a>0));
+CREATE TABLE t(a,b);
+CREATE INDEX i1 ON t(a) WHERE temp.t.a>0;
+CREATE INDEX i2 ON t(b) WHERE bogus.t.b>0;
+INSERT INTO t VALUES(1,1),(-1,2),(2,-2);
+SELECT * FROM t INDEXED BY i1 WHERE a>0;
+SELECT * FROM t INDEXED BY i2 WHERE b>0;
+CREATE INDEX i3 ON t(temp.t.a+1);
+CREATE TABLE g(a, b AS (temp.g.a*2));
+CREATE TEMP TABLE t2(a,b CHECK(temp.t2.b>0));
+INSERT INTO t2 VALUES(1,1);
+INSERT INTO t2 VALUES(1,-1);
+CREATE TEMP TABLE t3(a,b CHECK(main.t3.b>0));
+INSERT INTO t3 VALUES(1,1);
+INSERT INTO t3 VALUES(1,-1);
+CREATE INDEX temp.i4 ON t3(a) WHERE main.t3.a>0;
+SELECT * FROM t3 WHERE a>0;
+SELECT * FROM t2;
+ALTER TABLE u RENAME TO u2;
+ALTER TABLE w RENAME a TO z;
+ALTER TABLE t RENAME a TO q;
+SELECT sql FROM sqlite_master ORDER BY name;
+"#,
+        ),
+        (
+            "sources",
+            r#"
+CREATE TABLE t(a,b);
+CREATE TEMP TABLE t(a,b);
+INSERT INTO main.t VALUES(1,'m');
+INSERT INTO temp.t VALUES(2,'t');
+INSERT INTO temp.t VALUES(1,'x');
+CREATE VIEW v AS SELECT 1 a;
+CREATE TEMP VIEW tv AS SELECT 3 a;
+SELECT main.t.b, temp.t.b FROM main.t, temp.t;
+SELECT main.t.b FROM main.t, temp.t WHERE temp.t.a=2;
+SELECT t.b FROM main.t, temp.t;
+SELECT * FROM main.t, temp.t;
+SELECT t.* FROM main.t, temp.t;
+SELECT * FROM main.t JOIN temp.t USING(a);
+SELECT * FROM main.t NATURAL JOIN temp.t;
+SELECT main.t.rowid, temp.t.rowid FROM main.t, temp.t;
+SELECT temp.t.b, count(*) FROM main.t, temp.t GROUP BY temp.t.b ORDER BY 1;
+SELECT (SELECT main.t.b FROM temp.t) FROM main.t;
+SELECT (SELECT temp.t.b FROM main.t) FROM temp.t ORDER BY 1;
+SELECT * FROM t, t;
+SELECT main.p.name FROM pragma_table_info('t') p;
+SELECT main.pragma_table_info.name FROM pragma_table_info('t');
+SELECT temp.p.name FROM pragma_table_info('t') p;
+SELECT main.j.value FROM json_each('[1,2]') j;
+SELECT temp.j.value FROM json_each('[1]') j;
+SELECT main.s.x FROM (SELECT 1 x) s;
+SELECT main.v.a FROM v;
+SELECT temp.tv.a FROM tv;
+SELECT x.t.b FROM t;
+"#,
+        ),
+        (
+            "temp_schema_names",
+            r#"
+SELECT temp.sqlite_temp_schema.name FROM temp.sqlite_temp_schema;
+SELECT sqlite_temp_master.name FROM sqlite_temp_master;
+CREATE TEMP TABLE t(a);
+SELECT sqlite_temp_schema.name FROM sqlite_temp_schema;
+SELECT temp.sqlite_temp_schema.name FROM temp.sqlite_temp_schema;
+SELECT temp.sqlite_temp_master.name FROM sqlite_temp_master;
+SELECT main.sqlite_temp_master.name FROM sqlite_temp_master;
+SELECT sqlite_master.name FROM sqlite_temp_master;
+SELECT sqlite_schema.name FROM temp.sqlite_schema;
+SELECT sqlite_temp_master.name FROM temp.sqlite_master;
+SELECT temp.sqlite_master.name FROM temp.sqlite_master;
+SELECT sqlite_temp_master.name FROM sqlite_master;
+SELECT main.sqlite_master.name FROM main.sqlite_master;
+"#,
+        ),
+    ] {
+        run_same(leak(format!("three_part_review-{tag}")), script);
+    }
+}
+
+/// Files the pin wrote with schema-qualified names it ignores in a
+/// CHECK or partial-index WHERE (`temp.u.a` on a main table,
+/// `bogus.t.b`) are written by hipp as by the pin.
+#[test]
+fn pin_written_ignored_qualifiers() {
+    let h = common::temp_db("v16gap-pinq-h");
+    let o = common::temp_db("v16gap-pinq-o");
+    let setup = "CREATE TABLE u(a CHECK(temp.u.a>0)); CREATE TABLE t(a,b); \
+                 CREATE INDEX i1 ON t(a) WHERE temp.t.a>0; \
+                 CREATE TABLE w(a CHECK(bogus.w.a>0)); CREATE INDEX i2 ON t(b) WHERE bogus.t.b>0;";
+    assert_eq!(common::cli(&o, setup), "");
+    std::fs::copy(&o, &h).expect("copy");
+    let stmts = lines(
+        "INSERT INTO u VALUES(5)
+         INSERT INTO u VALUES(-5)
+         INSERT INTO t VALUES(1,1),(-1,-1),(2,-2)
+         INSERT INTO w VALUES(3)
+         UPDATE t SET b = -b
+         SELECT * FROM t INDEXED BY i1 WHERE a>0
+         SELECT * FROM t INDEXED BY i2 WHERE b>0
+         SELECT * FROM u",
+    );
+    let (hl, he, kinds) = hipp_run(&h, &stmts);
+    let (ol, oe) = oracle_run(&o, &stmts);
+    assert_eq!(hl, ol, "{kinds:?}");
+    assert_eq!(he, oe, "{kinds:?}");
+    assert_eq!(common::cli(&h, "PRAGMA integrity_check;").trim(), "ok");
+    assert_eq!(common::cli(&h, ".dump"), common::cli(&o, ".dump"));
+}
+
+/// Review fixes: CREATE TABLE ... AS SELECT (main or TEMP) and a
+/// temp INSERT ... SELECT reading TEMP views (over main or temp
+/// tables) or main views.
+#[test]
+fn temp_views_feed_writes() {
+    run_same(
+        "temp_views_feed",
+        r#"
+CREATE TABLE m(a INT, b TEXT);
+INSERT INTO m VALUES(1,'x'),(2,'y');
+CREATE TEMP VIEW v AS SELECT a, b FROM m;
+CREATE TEMP TABLE tt(c);
+INSERT INTO tt VALUES(9);
+CREATE TEMP VIEW tv AS SELECT c FROM tt;
+CREATE VIEW mv AS SELECT a FROM m;
+CREATE TABLE m2 AS SELECT * FROM v;
+SELECT * FROM m2;
+SELECT typeof(a), typeof(b) FROM m2;
+CREATE TABLE IF NOT EXISTS m2 AS SELECT a+1 FROM v WHERE a>1;
+CREATE TABLE main.m3 AS WITH w AS (SELECT a FROM v) SELECT * FROM w;
+SELECT * FROM m3;
+CREATE TABLE m4 AS SELECT * FROM v, tv;
+SELECT * FROM m4;
+CREATE TABLE m5 AS SELECT * FROM tv;
+SELECT * FROM m5;
+CREATE TABLE m6 AS SELECT (SELECT count(*) FROM tv) n, (SELECT max(a) FROM v) x;
+SELECT * FROM m6;
+CREATE TABLE m AS SELECT * FROM v;
+CREATE TEMP TABLE t1 AS SELECT * FROM v;
+SELECT * FROM temp.t1;
+CREATE TEMP TABLE t2 AS SELECT * FROM v, tv;
+SELECT * FROM t2;
+CREATE TEMP TABLE t3 AS SELECT * FROM mv;
+SELECT * FROM t3;
+CREATE TEMP TABLE t4 AS SELECT * FROM m WHERE a IN (SELECT a FROM v);
+SELECT * FROM t4;
+INSERT INTO tt SELECT a FROM v;
+INSERT INTO temp.tt SELECT a FROM mv WHERE a>1;
+SELECT * FROM tt;
+INSERT INTO m SELECT c, 'z' FROM tv;
+SELECT * FROM m;
+SELECT sql FROM sqlite_master ORDER BY name;
+SELECT sql FROM sqlite_temp_master ORDER BY name;
+"#,
+    );
+}
+
+/// Review fix (ungated): an auto-vacuum file the pin made is never
+/// written — hipp keeps no pointer maps, and writing left them
+/// stale (the pin's integrity check then failed). Reads work, the
+/// file stays byte-identical, and `PRAGMA auto_vacuum = NONE;
+/// VACUUM` converts it, after which writes work.
+#[test]
+fn auto_vacuum_file_is_not_written() {
+    for mode in ["FULL", "INCREMENTAL"] {
+        let h = common::temp_db(&format!("v16gap-av-{mode}"));
+        let setup =
+            format!("PRAGMA auto_vacuum={mode}; CREATE TABLE t(a); INSERT INTO t VALUES(1),(2);");
+        assert_eq!(common::cli(&h, &setup), "");
+        let before = std::fs::read(&h).expect("read");
+        let (rows, errs, kinds) = hipp_run(
+            &h,
+            &lines(
+                "SELECT * FROM t
+                 CREATE TABLE u(b)
+                 INSERT INTO t VALUES(randomblob(9000))
+                 DELETE FROM t
+                 PRAGMA user_version = 3
+                 VACUUM
+                 PRAGMA incremental_vacuum
+                 SELECT count(*) FROM t",
+            ),
+        );
+        assert_eq!(rows, vec!["1", "2", "2"], "{kinds:?}");
+        assert_eq!(errs, vec![2, 3, 4, 5, 6, 7], "{kinds:?}");
+        assert!(kinds[0].contains("AutoVacuumUnsupported"), "{kinds:?}");
+        assert_eq!(std::fs::read(&h).expect("read"), before, "{mode}");
+        let (rows, errs, kinds) = hipp_run(
+            &h,
+            &lines(
+                "PRAGMA auto_vacuum = NONE
+                 VACUUM
+                 PRAGMA auto_vacuum
+                 INSERT INTO t VALUES(3)
+                 SELECT * FROM t",
+            ),
+        );
+        assert!(errs.is_empty(), "{kinds:?}");
+        assert_eq!(rows, vec!["0", "1", "2", "3"]);
+        assert_eq!(common::cli(&h, "PRAGMA integrity_check;").trim(), "ok");
+    }
+}
