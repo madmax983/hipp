@@ -409,6 +409,12 @@ fn compute_jd(p: &mut Dt) {
     p.ijd = c_i64(((x1 + x2 + d + b) as f64 - 1524.5) * 86_400_000.0);
     p.valid_jd = true;
     if p.valid_hms {
+        if p.h == 24 {
+            // 3.54: a `24:00` value's day-of-month overflow is
+            // folded into the next-midnight normalisation, so
+            // `'floor'` has nothing left to move back.
+            p.n_floor = 0;
+        }
         let t = (p.h * 3_600_000 + p.mi * 60_000).wrapping_add(c_i64(p.s * 1000.0 + 0.5));
         p.ijd = p.ijd.wrapping_add(t);
         if p.tz != 0 {
@@ -681,17 +687,6 @@ const XFORM: [(&[u8], f32, f32); 6] = [
     (b"year", 14_713.0, 31_536_000.0),
 ];
 
-/// The days of month `m` of year `y` (proleptic Gregorian, C
-/// remainders for negative years as the pin computes them).
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        2 if crem(y, 4) == 0 && (crem(y, 100) != 0 || crem(y, 400) == 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
 /// Normalise a month count into 1..=12, carrying into the year
 /// (the pin's `x = M>0 ? (M-1)/12 : (M-12)/12`).
 fn carry_months(p: &mut Dt) {
@@ -702,6 +697,13 @@ fn carry_months(p: &mut Dt) {
     };
     p.y += x;
     p.mo -= x * 12;
+}
+
+/// 23:59:59.999, the time `'end of day'` and `'end of year'` set.
+fn end_of_day(p: &mut Dt) {
+    p.h = 23;
+    p.mi = 59;
+    p.s = 59.999;
 }
 
 /// The pin's `parseModifier` (3.54.1, with `'end of'` and the
@@ -741,21 +743,33 @@ fn parse_modifier(t: &TimeCtx<'_>, z: &[u8], p: &mut Dt, idx: usize) -> Res<bool
                 let unit = tail(z, 7);
                 compute_ymd(p);
                 p.valid_hms = true;
-                p.h = 23;
-                p.mi = 59;
-                p.s = 59.999;
                 p.raw_s = false;
                 p.tz = 0;
                 p.valid_jd = false;
                 if eq_ci(unit, b"month") {
-                    p.d = days_in_month(p.y, p.mo);
+                    // The pin's 'end of month' is the next month's
+                    // first midnight less one millisecond: in
+                    // December 9999 that midnight is out of range
+                    // (an error), and an invalid value falls back to
+                    // 2000-01-01 before the subtraction.
+                    p.h = 0;
+                    p.mi = 0;
+                    p.s = 0.0;
+                    p.d = 1;
+                    p.mo += 1;
+                    carry_months(p);
+                    compute_jd(p);
+                    p.ijd = p.ijd.wrapping_sub(1);
+                    clear_ymd_hms_tz(p);
                     p.n_floor = 0;
                     rc = false;
                 } else if eq_ci(unit, b"year") {
+                    end_of_day(p);
                     p.mo = 12;
                     p.d = 31;
                     rc = false;
                 } else if eq_ci(unit, b"day") {
+                    end_of_day(p);
                     rc = false;
                 }
             }

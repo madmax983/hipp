@@ -757,12 +757,16 @@ aspirations.
   `'now'` reads `Config::clock` once per statement execution;
   `'localtime'` / `'utc'` read the new `Config::tz_offset` hook (UTC
   without one); under `std` both default to the system clock and
-  the `TZ` zone, read as the C library reads it (TZif files and
-  POSIX rules, no dependency). In a CHECK, index expression or
-  generated column, reading either fails as on the pin. Ungated:
-  the bare keywords are calls, never a table's own "current_date"
-  column (they used to resolve as one), and `current_date()` is a
-  syntax error. Without the leaf the functions stay unknown.
+  the `TZ` zone, read as glibc's `localtime` reads it (TZif files
+  with glibc's checks, leap corrections and footer rules; POSIX TZ
+  strings with its partial-parse results and `posixrules` fallback;
+  no dependency). In a CHECK, index expression or generated column,
+  reading either fails as on the pin. Ungated: the bare keywords are
+  calls, never a table's own "current_date" column (they used to
+  resolve as one), and `current_date()` / `current_date.x` are
+  syntax errors. Review fixes: `'end of month'` in December 9999 or
+  on an invalid value, and `'floor'` after a `24:00` overflow, now
+  match the pin. Without the leaf the functions stay unknown.
 - **ATTACH / DETACH and several databases** (leaf `attach`, in
   `max`). `ATTACH [DATABASE] expr AS expr [KEY expr]` (a file,
   `':memory:'`, `''` / NULL for a private temporary database) and

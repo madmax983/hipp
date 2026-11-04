@@ -792,6 +792,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `name.*` at the cursor (a result column): the qualifier. A
+    /// bare wall-clock keyword never qualifies (the pin's CTIME_KW:
+    /// `current_date.*` is a syntax error at the dot).
+    #[cfg(feature = "v04")]
+    fn table_star_at(&self) -> Option<ABytes> {
+        let (h, quoted, _) = self.ident_at(self.pos)?;
+        let t = self.toks.as_slice();
+        let star = matches!(t.get(self.pos + 1).map(|t| t.tok), Some(Tok::Dot))
+            && matches!(t.get(self.pos + 2).map(|t| t.tok), Some(Tok::Star));
+        (star && (quoted || !is_ctime_kw(handle_bytes(self.arena, h)))).then_some(h)
+    }
+
     fn is_kw(&self, i: usize, word: &[u8]) -> bool {
         match self.ident_at(i) {
             Some((h, false, _)) => eq_ci(handle_bytes(self.arena, h), word),
@@ -2490,16 +2502,7 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
-            } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
-                    Some(Tok::Dot)
-                )
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
-                    Some(Tok::Star)
-                )
-            {
+            } else if let Some(h) = self.table_star_at() {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
             } else {
@@ -3628,28 +3631,26 @@ impl<'a> Parser<'a> {
                 // (v0.16, ungated): the pin's CTIME_KW, a call of
                 // the function of that name — never a column (a
                 // table's quoted "current_date" column is not what
-                // the bare keyword reads), and never written with
-                // parentheses.
+                // the bare keyword reads), never written with
+                // parentheses, and never a qualifier
+                // (`current_date.x` is a syntax error at the dot).
                 if !quoted && is_ctime_kw(handle_bytes(self.arena, h)) {
-                    match self.toks.as_slice().get(self.pos + 1) {
-                        Some(t) if matches!(t.tok, Tok::LParen) => {
-                            return Err(perr(t.offset, ParseKind::UnexpectedToken));
-                        }
-                        Some(t) if matches!(t.tok, Tok::Dot) => {}
-                        _ => {
-                            self.pos += 1;
-                            self.need::<E>(1)?;
-                            self.set_h::<E>(1, EK_CONST)?;
-                            return Ok(Expr::Func {
-                                name: h,
-                                distinct: false,
-                                star: false,
-                                args: AVec::new(),
-                                #[cfg(feature = "v16")]
-                                clause: None,
-                            });
-                        }
+                    if let Some(t) = self.toks.as_slice().get(self.pos + 1)
+                        && matches!(t.tok, Tok::LParen | Tok::Dot)
+                    {
+                        return Err(perr(t.offset, ParseKind::UnexpectedToken));
                     }
+                    self.pos += 1;
+                    self.need::<E>(1)?;
+                    self.set_h::<E>(1, EK_CONST)?;
+                    return Ok(Expr::Func {
+                        name: h,
+                        distinct: false,
+                        star: false,
+                        args: AVec::new(),
+                        #[cfg(feature = "v16")]
+                        clause: None,
+                    });
                 }
                 // Function call: ident followed by '('.
                 if !quoted
@@ -4494,16 +4495,7 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
-            } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
-                    Some(Tok::Dot)
-                )
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
-                    Some(Tok::Star)
-                )
-            {
+            } else if let Some(h) = self.table_star_at() {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
             } else {

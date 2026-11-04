@@ -6679,18 +6679,127 @@ formatters). **`full` decision:** `full` with `datetime` measures
   evaluated at prepare (as before). The TEMP database's connection
   has its own cache, so a statement mixing main and temp can see two
   instants.
-- The zone hook gives an offset only; the pin's `localtime_r` also
-  knows leap-second ("right/") zones, whose `tm_sec` can be 60 —
-  `systime` ignores TZif leap records. A POSIX TZ string with a
-  daylight name and no rules uses the US rules, where glibc consults
-  the `posixrules` file (identical for 2007..2037). `systime` reads
-  the zone file on every conversion (no global cache by design).
+- The zone hook gives an offset only (see the review fixes below
+  for what `systime` now models of glibc and what it still does
+  not). `systime` reads the zone file on every conversion (no
+  global cache by design).
 - The pin's "non-deterministic use of date() in ..." message is
   `SchemaKind::NonDeterministic` (the same kind as the CREATE-time
   refusal); in a generated column a date function that needs the
   clock and has no connection state reports the same.
 - Not in `full` (above); without the leaf, `SELECT current_date`
   is refused rather than answered.
+
+### Date and time functions — review fixes (2026-11-04)
+
+Four review findings, each reproduced on the live pin first; all
+fixed, with regression tests.
+
+**Fixed:**
+
+- `'end of month'` (leaf `datetime`) is now the pin's "first
+  midnight of the next month, less one millisecond": in December
+  9999 that midnight is out of range, so the value is an error
+  (NULL, and `'localtime'` / `'utc'` after it give the pin's
+  error-recovery `2000-01-01 00:00:00`). On a value already invalid,
+  the fallback 2000-01-01 is taken before the subtraction, so `'utc'`
+  after it gives `1999-12-31 23:59:59`. hipp used to set the last day
+  and 23:59:59.999 directly. `'end of day'` / `'end of year'` do set
+  the time directly on the pin, and keep doing so.
+- `'floor'` after a `24:00` value with a day-of-month overflow
+  (`'2024-02-30 24:00:00'`) no longer moves back a day: the pin folds
+  the overflow into the next-midnight normalisation, with or without
+  a zone suffix (`compute_jd` clears the floor count for hour 24).
+- `systime` (std only) is now a model of glibc 2.39's `localtime`,
+  not just of well-formed zones. POSIX TZ strings are parsed as
+  `__tzset_parse_tz` does, partial results included. A missing or
+  malformed rule part keeps the offsets and whatever the rule parser
+  filled in before it stopped, so `EST5EDT,M3.2.0` is the US rules,
+  trailing junk keeps the rule with a 00:00 change, and a failed
+  start rule leaves both changes near January 1st. A missing
+  daylight name leaves a daylight offset of 0. The `<...>` names,
+  `%hu` scanning (blanks, signs, 16-bit wrap) and the
+  southern-hemisphere test follow glibc. TZif files are read with
+  `__tzfile_read`'s checks, so a file glibc rejects is UTC on both
+  sides: a type index out of range, a DST flag other than 0/1, an
+  abbreviation index past the names, counts that overrun the file,
+  or no byte left for the footer. A version byte other than 0 means
+  64-bit data, and the footer is everything between the newline and
+  the last byte (up to a NUL). glibc's transition search is used,
+  and leap-second records now correct the offset, as
+  `__tz_convert` does. A daylight name without rules takes the
+  `posixrules` file from `TZDIR`, its transitions shifted as the
+  pin's glibc shifts them. In a TZif footer, such a string computes
+  with the zeroed rules, as on glibc. An empty `TZDIR` is the
+  default directory.
+- Ungated parser fix: an unquoted CURRENT_* keyword followed by `.`
+  is a syntax error at the dot, as the pin's CTIME_KW is. This covers
+  `current_date.x` and the `current_date.*` result column, in SELECT
+  and RETURNING. hipp used to read it as a qualified column.
+
+**Oracle-probing notes:** to fit glibc's `__tzfile_default`, I
+used hand-made `posixrules` files under `TZDIR`. The standard-time
+shift is the string's offset less the file's latest standard
+offset. The daylight-time shift ignores the file's daylight
+offsets. glibc frees `old_tz` on this path, so it re-parses the zone
+on every `localtime` call. Each such re-parse shifts by the
+previous call's reset `rule_dstoff` (the string's own daylight
+offset), so there is no shift. The first conversion of a process
+sees 0 instead. hipp models the steady state, and the CLI tests
+warm up with one conversion. glibc's month table read for a rule
+month outside 1..12 (kept from a failed `M` parse) was also probed:
+reads before the table come out 0, and reads past it depend on the
+libc build.
+
+**Tests:**
+- `tests/datetime_v16.rs`:
+  - 27 new fixed-corpus cases.
+  - `end_of_combinations_match_pin`: 10,206 combinations of base
+    values, a modifier before, `end of day / month / year` and up to
+    two modifiers after, in UTC, with every third case also in New
+    York.
+  - 12 new statements in `clock_keywords_never_read_a_column`
+    (success or failure must agree).
+- `hipp-cli/tests/cli_v16_datetime.rs`:
+  - `tz_strings_match_pin`: 25 fixed strings, including every
+    review repro, and 150 xorshift mutations.
+  - `tzif_files_match_pin`: 13 crafted files covering footers, leap
+    records, bad indices, flags and the version byte, and 150
+    truncated or corrupted real zone files.
+  - `rule_less_zones_use_posixrules`: Chicago, Berlin and Sydney as
+    `posixrules`, plus the system file.
+  - All are byte-compared against the pin under `TZ`.
+- `systime` lib tests: `partial_rules_keep_the_offsets` and
+  `hostile_files_never_panic` (2,000 corruptions, extreme instants).
+- Ad hoc: 3,000 more corrupted files and 1,400 more TZ strings, with
+  no differences outside the month-table case below.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**: the parser fix is ungated
+but the tiny profile does not build the changed paths). Full
+**500,184 B** (Δ **0**). Max **794,912 B** (Δ **+104 B** vs 794,808,
+ratchet raised): `'end of month'` now goes through `computeJD`.
+`systime` is std-only and is not in any size profile. `full`
+decision unchanged: the leaf stays in `max` only.
+
+**Honest gaps:**
+
+- A POSIX rule month outside 1..12 that a failed parse leaves
+  behind (`M13.1.0`, `M35.2.0`) makes glibc read outside its month
+  table. hipp reads 0 there, which matches the pin before the table
+  but not past it.
+- The first `localtime` conversion of a pin process for a rule-less
+  daylight zone (`XST3XDT`) shifts the daylight transitions by the
+  zone's daylight offset; hipp gives the result of every later
+  conversion. In a TZif footer, a rule-less daylight zone also makes
+  glibc replace the zone's file with `posixrules` for later
+  conversions; hipp does not.
+- At the exact instant of a leap second, glibc's `tm_sec` is 60; the
+  offset-only hook cannot say so (the correction itself is applied).
+  A file with no types, where glibc reads past its array or asserts,
+  is treated as unreadable.
 
 ### ATTACH / DETACH and several databases (2026-11-04)
 

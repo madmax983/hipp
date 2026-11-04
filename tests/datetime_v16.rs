@@ -458,6 +458,36 @@ const FIXED: &[&str] = &[
     "datetime('2000-05-17', 'end of month ')",
     "datetime('2000-05-17', 'end of')",
     "datetime('2001-02-31', 'end of day', 'floor')",
+    // Review regressions: 'end of month' is the next month's first
+    // midnight less 1 ms (an error in December 9999; an invalid
+    // value falls back to 2000-01-01 before the subtraction).
+    "datetime('9999-12-15', 'end of month')",
+    "datetime('9999-12-15', 'end of month', 'localtime')",
+    "datetime('9999-12-15', 'end of month', 'utc')",
+    "datetime(5, '-25 days', 'end of month', 'utc')",
+    "datetime(5, '-25 days', 'end of month', 'localtime')",
+    "datetime(5, '-25 days', 'end of month')",
+    "unixepoch('9999-12-31 23:59:59.999', 'subsecond', 'end of month')",
+    "julianday('9999-11-30', '+1 month', 'end of month')",
+    "strftime('%f %J', '9999-12-01', 'start of month', 'end of month')",
+    "datetime('9999-11-15', 'end of month', 'subsec')",
+    "datetime('2024-02-30', 'end of month', 'floor')",
+    "datetime('2024-02-30', 'end of month', 'floor', 'floor')",
+    "datetime('-4713-11-24 12:00', 'end of month')",
+    "datetime(5, '-25 days', 'end of year', 'utc')",
+    "datetime(5, '-25 days', 'end of day', 'utc')",
+    // Review regressions: a `24:00` value's day-of-month overflow is
+    // folded into the next midnight; 'floor' has nothing to undo.
+    "datetime('2024-02-30 24:00:00', 'floor')",
+    "datetime('2024-02-30 24:00:00', 'end of day', 'floor')",
+    "datetime('2024-02-30 24:00:00', 'end of year', 'floor')",
+    "datetime('2024-02-30 24:00:00', 'start of day', 'floor')",
+    "datetime('2024-02-30 24:00:00', 'start of month', 'floor')",
+    "datetime('2024-02-30 24:00:00+01:00', 'floor')",
+    "datetime('2024-02-30 24:00:00Z', 'floor')",
+    "datetime('2023-02-31 24:00', 'end of year', 'floor')",
+    "datetime('2024-04-31 24:00:00.000', 'floor')",
+    "datetime('2024-02-30 12:00:00+01:00', 'floor')",
     "datetime('2001-02-31', 'end of month', 'floor')",
     "datetime('2001-02-31', 'end of year', 'floor')",
     "datetime('2001-02-31', 'start of day', 'floor')",
@@ -926,6 +956,78 @@ fn generated_corpus_matches_pin_in_every_zone() {
     }
 }
 
+/// Every combination of a base value, a modifier before, an `'end
+/// of'` modifier and up to two modifiers after it (review
+/// regression: `'end of month'` in December 9999 and on invalid
+/// values, and `'floor'` after a `24:00` overflow, differed).
+#[test]
+fn end_of_combinations_match_pin() {
+    const BASES: &[&str] = &[
+        "'2024-02-30 24:00:00'",
+        "'2024-01-31 24:00'",
+        "'2023-02-29'",
+        "'2024-02-29 12:34:56.789'",
+        "'2000-12-31 23:59:59.999'",
+        "'9999-12-15'",
+        "'9999-12-31 23:59:59.999'",
+        "'9999-11-30 12:00'",
+        "'-4713-11-24 12:00'",
+        "'0000-01-01'",
+        "5",
+        "2460000.25",
+        "'12:00'",
+        "'2001-06-15 10:00+05:30'",
+    ];
+    const BEFORE: &[&str] = &[
+        "",
+        "'-25 days'",
+        "'+1 month'",
+        "'localtime'",
+        "'utc'",
+        "'start of month'",
+        "'subsec'",
+        "'auto'",
+        "'+10 years'",
+    ];
+    const END: &[&str] = &["'end of day'", "'end of month'", "'end of year'"];
+    const AFTER: &[&str] = &[
+        "",
+        "'floor'",
+        "'ceiling'",
+        "'utc'",
+        "'localtime'",
+        "'+1 day'",
+        "'subsec'",
+        "'start of day'",
+        "'weekday 0'",
+    ];
+    let funcs = ["datetime", "julianday", "unixepoch"];
+    let mut exprs = Vec::new();
+    for (bi, b) in BASES.iter().enumerate() {
+        for pre in BEFORE {
+            for (ei, e) in END.iter().enumerate() {
+                for a1 in AFTER {
+                    for a2 in ["", "'floor'", "'utc'"] {
+                        let mut args = vec![b.to_string()];
+                        args.extend(
+                            [*pre, *e, *a1, a2]
+                                .iter()
+                                .filter(|m| !m.is_empty())
+                                .map(|m| m.to_string()),
+                        );
+                        let f = funcs[(bi + ei + exprs.len()) % funcs.len()];
+                        exprs.push(format!("{f}({})", args.join(", ")));
+                    }
+                }
+            }
+        }
+    }
+    // UTC throughout; New York over every third case.
+    assert_same("UTC", zone_utc, &exprs);
+    let ny: Vec<String> = exprs.iter().step_by(3).cloned().collect();
+    assert_same("America/New_York", zone_ny, &ny);
+}
+
 /// Instants around the daylight-saving transitions (and in years
 /// the pin maps into 1970..2037), through 'localtime' and 'utc'.
 #[test]
@@ -1271,6 +1373,20 @@ fn clock_keywords_never_read_a_column() {
             "INSERT INTO y(z) VALUES (1)",
             "ALTER TABLE y ADD COLUMN d DEFAULT CURRENT_TIME",
             "CREATE TABLE z(a DEFAULT (\"current_date\"))",
+            // Review regression: a bare keyword never qualifies a
+            // column (hipp read `current_date.x` as one).
+            "CREATE TABLE current_date(x)",
+            "INSERT INTO current_date VALUES (1)",
+            "SELECT current_date.x FROM current_date",
+            "SELECT current_date.* FROM current_date",
+            "SELECT current_time.x",
+            "SELECT current_date . x FROM x AS current_date",
+            "SELECT x FROM current_date",
+            "SELECT \"current_date\".x, \"current_date\".* FROM current_date",
+            "SELECT x.current_date FROM x",
+            "CREATE TABLE w(a DEFAULT current_date.x)",
+            "CREATE TABLE w2(a CHECK (current_date.x))",
+            "INSERT INTO x VALUES (1, 2, 3) RETURNING current_date.*",
         ],
         "SELECT current_date = 5, \"current_date\", x.current_time, current_time = 6, \
          typeof(CURRENT_TIME), length(current_timestamp) FROM x; \
