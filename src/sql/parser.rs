@@ -143,6 +143,10 @@ struct Parser<'a> {
     /// legal only here.
     #[cfg(feature = "triggers")]
     in_trig: bool,
+    /// The schema qualifier the last `name` call consumed (v0.16,
+    /// `attach`): `aux` of `aux.t`, `None` for a bare name.
+    #[cfg(feature = "attach")]
+    last_schema: Option<ABytes>,
 }
 
 /// The ON / USING terms of one select core (v0.16): the pin's
@@ -759,6 +763,8 @@ impl<'a> Parser<'a> {
             core_h: 0,
             #[cfg(feature = "triggers")]
             in_trig: false,
+            #[cfg(feature = "attach")]
+            last_schema: None,
         }
     }
 
@@ -784,6 +790,18 @@ impl<'a> Parser<'a> {
             Tok::Ident(h, q) => Some((h, q, self.toks.as_slice()[i].offset)),
             _ => None,
         }
+    }
+
+    /// `name.*` at the cursor (a result column): the qualifier. A
+    /// bare wall-clock keyword never qualifies (the pin's CTIME_KW:
+    /// `current_date.*` is a syntax error at the dot).
+    #[cfg(feature = "v04")]
+    fn table_star_at(&self) -> Option<ABytes> {
+        let (h, quoted, _) = self.ident_at(self.pos)?;
+        let t = self.toks.as_slice();
+        let star = matches!(t.get(self.pos + 1).map(|t| t.tok), Some(Tok::Dot))
+            && matches!(t.get(self.pos + 2).map(|t| t.tok), Some(Tok::Star));
+        (star && (quoted || !is_ctime_kw(handle_bytes(self.arena, h)))).then_some(h)
     }
 
     fn is_kw(&self, i: usize, word: &[u8]) -> bool {
@@ -873,13 +891,31 @@ impl<'a> Parser<'a> {
                 // statement naming the temp schema to its temp
                 // database (`session::temp`) before it plans it, so
                 // the planner never reads `temp.t` as `main.t`.
+                // v0.16 (`attach`): any qualifier — the connection
+                // routes a statement by its schema names before it
+                // plans it (`session::attach`), and the planner reads a
+                // FROM source's (`FromSource::schema`).
                 if matches!(self.cur().tok, Tok::Dot) {
                     let s = handle_bytes(self.arena, h);
-                    if !eq_ci(s, b"main") && !(cfg!(feature = "v16") && eq_ci(s, b"temp")) {
+                    if !cfg!(feature = "attach")
+                        && !eq_ci(s, b"main")
+                        && !(cfg!(feature = "v16") && eq_ci(s, b"temp"))
+                    {
                         return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                     }
                     self.pos += 1;
+                    #[cfg(feature = "attach")]
+                    {
+                        let n = self.name::<E>();
+                        self.last_schema = Some(h);
+                        return n;
+                    }
+                    #[cfg(not(feature = "attach"))]
                     return self.name::<E>();
+                }
+                #[cfg(feature = "attach")]
+                {
+                    self.last_schema = None;
                 }
                 Ok(h)
             }
@@ -1135,6 +1171,17 @@ impl<'a> Parser<'a> {
             {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
+        } else if cfg!(feature = "attach")
+            && (self.cur_is_kw(b"ATTACH") || self.cur_is_kw(b"DETACH"))
+        {
+            #[cfg(feature = "attach")]
+            {
+                self.attach_stmt::<E>()
+            }
+            #[cfg(not(feature = "attach"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
         } else if cfg!(feature = "v16") && self.cur_is_kw(b"PRAGMA") {
             #[cfg(feature = "v16")]
             {
@@ -1197,6 +1244,45 @@ impl<'a> Parser<'a> {
         } else {
             Ast::Analyze { schema, name }
         })
+    }
+
+    /// `ATTACH [DATABASE] expr AS expr [KEY expr]` and `DETACH
+    /// [DATABASE] expr` (v0.16, `attach`; the pin's grammar). An
+    /// operand that is a lone identifier is its name as text, as the
+    /// pin's `resolveAttachExpr` makes it (`ATTACH f AS a` attaches
+    /// the file `f` as `a`); anything else is an expression evaluated
+    /// when the statement runs.
+    #[cfg(feature = "attach")]
+    fn attach_stmt<E>(&mut self) -> Result<Ast, E> {
+        let attach = self.eat_kw(b"ATTACH");
+        if !attach {
+            self.pos += 1; // DETACH
+        }
+        let _ = self.eat_kw(b"DATABASE");
+        let operand = |p: &mut Self, held: usize| -> Result<Expr, E> {
+            let e = p.item::<E>(held)?;
+            Ok(match e {
+                Expr::Column {
+                    table: None,
+                    name,
+                    schema: None,
+                } => Expr::Literal(Literal::Text(name)),
+                e => e,
+            })
+        };
+        if !attach {
+            let name = operand(self, 2)?;
+            return Ok(Ast::Detach { name });
+        }
+        let file = operand(self, 2)?;
+        self.expect_kw::<E>(b"AS")?;
+        let name = operand(self, 4)?;
+        let key = if self.eat_kw(b"KEY") {
+            Some(operand(self, 6)?)
+        } else {
+            None
+        };
+        Ok(Ast::Attach { file, name, key })
     }
 
     /// `PRAGMA [nm .] nm [= nmnum | ( nmnum )]` (v0.16, `v16`;
@@ -2416,16 +2502,7 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
-            } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
-                    Some(Tok::Dot)
-                )
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
-                    Some(Tok::Star)
-                )
-            {
+            } else if let Some(h) = self.table_star_at() {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
             } else {
@@ -2543,6 +2620,8 @@ impl<'a> Parser<'a> {
             using: AVec::new(),
             #[cfg(feature = "v16")]
             args: None,
+            #[cfg(feature = "attach")]
+            schema: None,
         });
         // v0.2: optional WHERE <column> = <literal>. Any other
         // predicate shape is rejected here; whether <column> is the
@@ -3548,6 +3627,31 @@ impl<'a> Parser<'a> {
                 if self.cur_is_kw(b"CASE") {
                     return self.expr_case::<E>();
                 }
+                // CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP
+                // (v0.16, ungated): the pin's CTIME_KW, a call of
+                // the function of that name — never a column (a
+                // table's quoted "current_date" column is not what
+                // the bare keyword reads), never written with
+                // parentheses, and never a qualifier
+                // (`current_date.x` is a syntax error at the dot).
+                if !quoted && is_ctime_kw(handle_bytes(self.arena, h)) {
+                    if let Some(t) = self.toks.as_slice().get(self.pos + 1)
+                        && matches!(t.tok, Tok::LParen | Tok::Dot)
+                    {
+                        return Err(perr(t.offset, ParseKind::UnexpectedToken));
+                    }
+                    self.pos += 1;
+                    self.need::<E>(1)?;
+                    self.set_h::<E>(1, EK_CONST)?;
+                    return Ok(Expr::Func {
+                        name: h,
+                        distinct: false,
+                        star: false,
+                        args: AVec::new(),
+                        #[cfg(feature = "v16")]
+                        clause: None,
+                    });
+                }
                 // Function call: ident followed by '('.
                 if !quoted
                     && matches!(
@@ -3620,12 +3724,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.need::<E>(1)?;
-        let k = if is_ctime_kw(handle_bytes(self.arena, h)) {
-            EK_CONST
-        } else {
-            0
-        };
-        self.set_h::<E>(1, k)?;
+        self.set_h::<E>(1, 0)?;
         Ok(Expr::Column {
             table: None,
             name: h,
@@ -4396,16 +4495,7 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat(Tok::Star) {
                 items.push(SelectItem::Star);
-            } else if let Some((h, _, _)) = self.ident_at(self.pos)
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
-                    Some(Tok::Dot)
-                )
-                && matches!(
-                    self.toks.as_slice().get(self.pos + 2).map(|t| t.tok),
-                    Some(Tok::Star)
-                )
-            {
+            } else if let Some(h) = self.table_star_at() {
                 self.pos += 3;
                 items.push(SelectItem::TableStar(h));
             } else {
@@ -4702,6 +4792,8 @@ impl<'a> Parser<'a> {
             args: None,
             qualified,
             in_temp,
+            #[cfg(feature = "attach")]
+            schema: self.last_schema,
             cte: None,
             indexed: None,
         });
@@ -4934,6 +5026,8 @@ impl<'a> Parser<'a> {
                     qualified: false,
                     #[cfg(feature = "v16")]
                     in_temp: false,
+                    #[cfg(feature = "attach")]
+                    schema: None,
                     #[cfg(feature = "v16")]
                     cte: None,
                     #[cfg(feature = "v16")]
@@ -4956,6 +5050,8 @@ impl<'a> Parser<'a> {
     ) -> Result<FromSource, E> {
         #[cfg(feature = "v16")]
         let (table, qualified, in_temp) = self.name_q::<E>()?;
+        #[cfg(feature = "attach")]
+        let schema = self.last_schema;
         #[cfg(not(feature = "v16"))]
         let table = self.name::<E>()?;
         // A table-valued function (v0.16): `name(arg, ...)`.
@@ -5006,6 +5102,8 @@ impl<'a> Parser<'a> {
             qualified,
             #[cfg(feature = "v16")]
             in_temp,
+            #[cfg(feature = "attach")]
+            schema,
             #[cfg(feature = "v16")]
             cte: None,
             #[cfg(feature = "v16")]
@@ -6447,7 +6545,9 @@ impl<'a> Parser<'a> {
         let mut qualified = false;
         if self.eat(Tok::Dot) {
             let s = handle_bytes(self.arena, name);
-            if !eq_ci(s, b"main") && !eq_ci(s, b"temp") {
+            // An attached database's name is checked by the router
+            // (v0.16, `attach`).
+            if !cfg!(feature = "attach") && !eq_ci(s, b"main") && !eq_ci(s, b"temp") {
                 return Err(Error::Schema {
                     kind: crate::error::SchemaKind::UnknownDatabase,
                 });

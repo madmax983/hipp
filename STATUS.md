@@ -6517,6 +6517,990 @@ then the conversion). `hipp-cli/tests/cli_v16_gaps.rs`:
 - `PRAGMA table_info` of a TEMP view over main tables still fails
   (above).
 
+### Date and time functions (2026-11-04)
+
+**Shipped** (leaf `datetime`, requires `v16`; in `max`, not `full`):
+
+- `date()`, `time()`, `datetime()`, `julianday()`, `unixepoch()`,
+  `strftime()`, `timediff()` and the `CURRENT_DATE` / `CURRENT_TIME`
+  / `CURRENT_TIMESTAMP` keywords in any expression (`src/datetime.rs`).
+  The engine is a model of the pin's `date.c`: its `DateTime` record
+  (integer-millisecond Julian day `iJD` plus civil fields, each half
+  valid or not, the raw-number, error, subsec, UTC and local flags,
+  the `floor` day count), every parser, modifier and formatter
+  updating those fields in the pin's order with C's truncating
+  integer division / remainder, `core` `f64` only (sums, products,
+  quotients: IEEE-identical), and x86-64's float-to-integer
+  conversion (NaN / out of range is the "integer indefinite"). The
+  `%f` / `%J` / subsec `%s` / `timediff` seconds go through
+  `func::printf`'s pin-fitted `%06.3f` / `%.16g` / `%.3f`; julianday()
+  is a REAL rendered by `record::render_real`. The engine is not
+  generic over the storage error (one instantiation).
+- Time values: `[-]YYYY-MM-DD`, then spaces or `T`s, `HH:MM[:SS[.F]]`
+  (fraction truncated at .999, rounded below), `[+-]HH:MM` / `Z`
+  zones, bare times (2000-01-01), numbers (Julian day when in
+  0..5373484.5; `'unixepoch'` / `'auto'` / `'julianday'` as the first
+  modifier), numeric text (the pin's whole-text `sqlite3AtoF`),
+  `'now'`, `'subsec'` / `'subsecond'` as a value; BLOBs read as text,
+  a NUL ends any text.
+- Modifiers: `NNN days|hours|minutes|seconds|months|years` (signed,
+  fractional, the `float` limits, months / years through the
+  day-of-month overflow and its `nFloor`), `[+-]YYYY-MM-DD[ HH:MM[:SS[.F]]]`,
+  `[+-]HH:MM[:SS[.F]]`, `start of day|month|year`, 3.54's
+  `end of day|month|year`, `weekday N` and 3.54's backward
+  `weekday -N`, `unixepoch`, `julianday`, `auto`, `localtime`,
+  `utc` (the pin's four-guess inversion), `subsec` / `subsecond`,
+  `ceiling`, `floor`.
+- `Config::clock` (existing) is now read by `'now'` too; under `std`
+  `Config::default()` supplies the system clock (`systime::now_ms`;
+  it used to be `None`, so `Config::default().no_clock()` is the new
+  way to say "no clock"). The statement's instant is cached in
+  `query::Env` and owned by one statement from its prepare (whose
+  plan may read it for a DEFAULT) through its execution, trigger and
+  foreign-key programs included; another statement running in
+  between, or `Statement::reset`, makes the next read fresh
+  (`Env::claim_clock` / `own_clock` / `release_clock`).
+- New `Config::tz_offset: Option<TzOffset>` (`fn(i64) -> Option<i64>`:
+  Unix seconds → seconds east of UTC; `None` result is
+  `SchemaKind::LocalTimeUnavailable`, the pin's "local time
+  unavailable"). No hook is UTC (the `no_std` default); under `std`
+  the default is `systime::local_offset`, which reads `TZ` as glibc
+  does: unset → `/etc/localtime`, empty → UTC, a leading `:` dropped,
+  a TZif file under `$TZDIR` or `/usr/share/zoneinfo` (64-bit data,
+  the first standard type before the first transition, the footer
+  POSIX rule at or after the last), else a POSIX TZ string (`Jn`,
+  `n`, `Mm.w.d`, `/time` up to ±167 h, southern-hemisphere rules; a
+  daylight name without rules takes M3.2.0,M11.1.0), else UTC. The
+  hook is asked, as the pin asks `localtime_r`, only about instants
+  in 1970-01-01 .. 2038-01-18: others are moved to the year of the
+  same leap phase in 1997..2003 and back. The CLI dropped its own
+  clock and uses the defaults.
+- "Pure" contexts: a CHECK constraint, an index expression or a
+  partial index's WHERE (`Ctx::pure`) and a generated column (no
+  connection state) fail the statement with
+  `SchemaKind::NonDeterministic` when a date function reads the
+  clock (`'now'`, no arguments, `'subsec'` as the value) or the zone
+  (`'localtime'`, `'utc'`), as the pin's `sqlite3NotPureFunc` does;
+  the CURRENT_* keywords are non-deterministic functions there
+  (refused in generated columns and indexes at CREATE, allowed in a
+  CHECK).
+- Ungated (every profile with the parser): an unquoted `CURRENT_TIME`
+  / `CURRENT_DATE` / `CURRENT_TIMESTAMP` parses as a call of no
+  arguments (the pin's `CTIME_KW`), so a table's own quoted
+  `"current_date"` column no longer stands in for the bare keyword
+  (a silent wrong answer: `SELECT current_date = 5 FROM x` was 1),
+  and `current_date()` is a syntax error. Without the leaf the call
+  resolves to the DEFAULT clock pseudo-columns (renamed with a
+  leading NUL, which no column name holds) and is "no such function"
+  anywhere else; DEFAULT CURRENT_* keeps working (lib test
+  `rules::clock_tests` runs in both `full` and `max`).
+
+**Oracle-probing notes** (all on the live 3.54.1 pin; the binary's
+strings listed the modifier names, which is how `end of ` was found):
+
+- 3.54.1 knows no `%y` (NULL, as every unknown conversion and a
+  trailing `%`); the known set is `d e f F G g H I j J k l m M p P R
+  s S T u U V w W Y %`. `%J` is `%.16g`; `%Y` of year -12 is `-012`.
+- New in 3.54 against the 3.4x code: `end of day|month|year` (23:59:59.999;
+  month end resets the floor count, year end does not, on a raw number
+  it is NULL); `weekday -N` (back to the latest such weekday, a no-op
+  on one; `-0` is backward Sunday, ±7 and fractions NULL); hour 24 only
+  as exactly `24:00:00[.000]`, normalised to the next midnight when a
+  date is given (at parse) or when the Julian day is computed — so
+  `datetime('24:00', 'start of day')` is still 2000-01-01; an explicit
+  `+00:00` / `-00:00` zone marks the value UTC (`'utc'` is then a
+  no-op) while a non-zero one does so only once applied
+  (`datetime('12:00+01:00', 'utc')` in New York is 16:00).
+- Quirks reproduced: a value made invalid by a modifier and then
+  `'localtime'`'d comes back (the error flag is cleared): year 2000 if
+  the error came from the year range, year 0 if from the Julian-day
+  range, its negative milliseconds printed as `'0' + digit`
+  punctuation (`00.,''`); day-of-month overflow survives `start of
+  day` (`2001-02-31 00:00:00`) and a lone YYYY-MM-DD with day > 28 is
+  normalised; a fraction of 400 digits is NaN and the date NULL; a
+  `[+-]YYYY-MM-DD HH:MM` modifier negates its time too;
+  `'+24:00'` adds nothing (the time-of-day is taken modulo a day).
+- 'now' is stable per `sqlite3_step` on the pin (re-read when a step
+  starts); `SELECT current_date()` is a syntax error; `timediff` with
+  other than two arguments is a prepare-time error.
+
+**Tests:** `tests/datetime_v16.rs` (11 tests): a fixed corpus of ~400
+expressions (every form, modifier and conversion, the boundaries,
+quirks and a regression case per bug found while fitting: hour 24,
+zero-offset UTC, NaN fractions, the backward weekday, `end of`, `%y`)
+and a generated corpus (xorshift64: random values in all input forms,
+edge years, leap days, negative / huge Julian days, fractional seconds,
+random modifier chains, random strftime formats; 6,000 cases in UTC
+and 2,500 in each other zone, `HIPP_DATETIME_CORPUS` scales it —
+160,000 ran clean once) and a DST corpus (3,000 instants around the
+transitions and outside 1970..2037 through localtime / utc chains),
+each byte-compared as `quote()` against the pin in UTC,
+America/New_York, Asia/Kolkata and Australia/Lord_Howe (pin under
+`TZ`, hipp through `systime::zone_offset`); 'now' against the pin's
+value for the clock's instant; a ticking clock read once per
+statement (DEFAULTs, a trigger, a multi-row INSERT, re-execution);
+`NoClock`; `LocalTimeUnavailable`; the pure contexts, the keywords
+vs a `"current_date"` column, timediff's arity and a UTF-16 database
+as statement scripts on both engines (success / failure and results
+must agree, the pin checks hipp's file). `hipp-cli/tests/cli_v16_datetime.rs`:
+a rendering batch (with CURRENT_* defaults, a date CHECK and a date
+index) and a 400-statement generated batch, byte-identical one-shot
+and over stdin in UTC, New York and Kolkata (the CLI reads `TZ`
+itself). Ad-hoc fuzzing while fitting also covered Sao_Paulo,
+Chatham, Casablanca, Godthab, Gaza, `EST5EDT`, `XYZ-5:30`, a
+`M3.5.0/-2` rule, `:Europe/Paris`, empty and unknown `TZ` (all clean).
+`tests/indexes.rs` now uses `unistr_quote()` as its function hipp
+lacks (it used `date()`); `tests/table_defs_v16.rs` asks for
+`no_clock()` where it tests `NoClock`.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed". (One earlier run failed
+`views_cte_v16::shared_materializations` on a `random() % 1000`
+collision on the pin's side — a pre-existing flake, unrelated; it
+passed on rerun.)
+
+**Size:** tiny **76,960 B** (Δ **0**). Full **498,880 B** (Δ **+424 B**
+vs 498,456, ratchet raised; the ungated keyword fix: the parser's call
+node and the pseudo-column resolution). Max **765,344 B** (Δ
+**+15,856 B** vs 749,488, ratchet raised): the leaf is about 15.4 KB
+on thumbv7em (soft double arithmetic, the modifier parser and the
+formatters). **`full` decision:** `full` with `datetime` measures
+518,192 B, over the 512,000 B line, so the leaf stays in `max` only
+(ADR 0002).
+
+**Honest gaps:**
+
+- 'now' is read once per statement execution, where the pin re-reads
+  it at each `sqlite3_step`: a streaming SELECT that crosses a
+  millisecond shows one instant on hipp and possibly several on the
+  pin. A statement prepared before another statement runs reads the
+  clock again at its first step (plan-time DEFAULTs keep the value
+  read at prepare). Without `params` an INSERT's DEFAULTs are
+  evaluated at prepare (as before). The TEMP database's connection
+  has its own cache, so a statement mixing main and temp can see two
+  instants.
+- The zone hook gives an offset only (see the review fixes below
+  for what `systime` now models of glibc and what it still does
+  not). `systime` reads the zone file on every conversion (no
+  global cache by design).
+- The pin's "non-deterministic use of date() in ..." message is
+  `SchemaKind::NonDeterministic` (the same kind as the CREATE-time
+  refusal); in a generated column a date function that needs the
+  clock and has no connection state reports the same.
+- Not in `full` (above); without the leaf, `SELECT current_date`
+  is refused rather than answered.
+
+### Date and time functions — review fixes (2026-11-04)
+
+Four review findings, each reproduced on the live pin first; all
+fixed, with regression tests.
+
+**Fixed:**
+
+- `'end of month'` (leaf `datetime`) is now the pin's "first
+  midnight of the next month, less one millisecond": in December
+  9999 that midnight is out of range, so the value is an error
+  (NULL, and `'localtime'` / `'utc'` after it give the pin's
+  error-recovery `2000-01-01 00:00:00`). On a value already invalid,
+  the fallback 2000-01-01 is taken before the subtraction, so `'utc'`
+  after it gives `1999-12-31 23:59:59`. hipp used to set the last day
+  and 23:59:59.999 directly. `'end of day'` / `'end of year'` do set
+  the time directly on the pin, and keep doing so.
+- `'floor'` after a `24:00` value with a day-of-month overflow
+  (`'2024-02-30 24:00:00'`) no longer moves back a day: the pin folds
+  the overflow into the next-midnight normalisation, with or without
+  a zone suffix (`compute_jd` clears the floor count for hour 24).
+- `systime` (std only) is now a model of glibc 2.39's `localtime`,
+  not just of well-formed zones. POSIX TZ strings are parsed as
+  `__tzset_parse_tz` does, partial results included. A missing or
+  malformed rule part keeps the offsets and whatever the rule parser
+  filled in before it stopped, so `EST5EDT,M3.2.0` is the US rules,
+  trailing junk keeps the rule with a 00:00 change, and a failed
+  start rule leaves both changes near January 1st. A missing
+  daylight name leaves a daylight offset of 0. The `<...>` names,
+  `%hu` scanning (blanks, signs, 16-bit wrap) and the
+  southern-hemisphere test follow glibc. TZif files are read with
+  `__tzfile_read`'s checks, so a file glibc rejects is UTC on both
+  sides: a type index out of range, a DST flag other than 0/1, an
+  abbreviation index past the names, counts that overrun the file,
+  or no byte left for the footer. A version byte other than 0 means
+  64-bit data, and the footer is everything between the newline and
+  the last byte (up to a NUL). glibc's transition search is used,
+  and leap-second records now correct the offset, as
+  `__tz_convert` does. A daylight name without rules takes the
+  `posixrules` file from `TZDIR`, its transitions shifted as the
+  pin's glibc shifts them. In a TZif footer, such a string computes
+  with the zeroed rules, as on glibc. An empty `TZDIR` is the
+  default directory.
+- Ungated parser fix: an unquoted CURRENT_* keyword followed by `.`
+  is a syntax error at the dot, as the pin's CTIME_KW is. This covers
+  `current_date.x` and the `current_date.*` result column, in SELECT
+  and RETURNING. hipp used to read it as a qualified column.
+
+**Oracle-probing notes:** to fit glibc's `__tzfile_default`, I
+used hand-made `posixrules` files under `TZDIR`. The standard-time
+shift is the string's offset less the file's latest standard
+offset. The daylight-time shift ignores the file's daylight
+offsets. glibc frees `old_tz` on this path, so it re-parses the zone
+on every `localtime` call. Each such re-parse shifts by the
+previous call's reset `rule_dstoff` (the string's own daylight
+offset), so there is no shift. The first conversion of a process
+sees 0 instead. hipp models the steady state, and the CLI tests
+warm up with one conversion. glibc's month table read for a rule
+month outside 1..12 (kept from a failed `M` parse) was also probed:
+reads before the table come out 0, and reads past it depend on the
+libc build.
+
+**Tests:**
+- `tests/datetime_v16.rs`:
+  - 27 new fixed-corpus cases.
+  - `end_of_combinations_match_pin`: 10,206 combinations of base
+    values, a modifier before, `end of day / month / year` and up to
+    two modifiers after, in UTC, with every third case also in New
+    York.
+  - 12 new statements in `clock_keywords_never_read_a_column`
+    (success or failure must agree).
+- `hipp-cli/tests/cli_v16_datetime.rs`:
+  - `tz_strings_match_pin`: 25 fixed strings, including every
+    review repro, and 150 xorshift mutations.
+  - `tzif_files_match_pin`: 13 crafted files covering footers, leap
+    records, bad indices, flags and the version byte, and 150
+    truncated or corrupted real zone files.
+  - `rule_less_zones_use_posixrules`: Chicago, Berlin and Sydney as
+    `posixrules`, plus the system file.
+  - All are byte-compared against the pin under `TZ`.
+- `systime` lib tests: `partial_rules_keep_the_offsets` and
+  `hostile_files_never_panic` (2,000 corruptions, extreme instants).
+- Ad hoc: 3,000 more corrupted files and 1,400 more TZ strings, with
+  no differences outside the month-table case below.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**: the parser fix is ungated
+but the tiny profile does not build the changed paths). Full
+**500,184 B** (Δ **0**). Max **794,912 B** (Δ **+104 B** vs 794,808,
+ratchet raised): `'end of month'` now goes through `computeJD`.
+`systime` is std-only and is not in any size profile. `full`
+decision unchanged: the leaf stays in `max` only.
+
+**Honest gaps:**
+
+- A POSIX rule month outside 1..12 that a failed parse leaves
+  behind (`M13.1.0`, `M35.2.0`) makes glibc read outside its month
+  table. hipp reads 0 there, which matches the pin before the table
+  but not past it.
+- The first `localtime` conversion of a pin process for a rule-less
+  daylight zone (`XST3XDT`) shifts the daylight transitions by the
+  zone's daylight offset; hipp gives the result of every later
+  conversion. In a TZif footer, a rule-less daylight zone also makes
+  glibc replace the zone's file with `posixrules` for later
+  conversions; hipp does not.
+- At the exact instant of a leap second, glibc's `tm_sec` is 60; the
+  offset-only hook cannot say so (the correction itself is applied).
+  A file with no types, where glibc reads past its array or asserts,
+  is treated as unreadable.
+
+### ATTACH / DETACH and several databases (2026-11-04)
+
+**Shipped** (leaf `attach`, requires `v16`; in `max`, not `full`;
+new `src/session/attach.rs`, `Plan::{Att, Attach}`,
+`Ast::{Attach, Detach}`, `FromSource::schema`, `SourceDesc::dbname`,
+`SubSource::ext`, `SchemaKind::{DatabaseInUse, TooManyAttached,
+CannotOpenDatabase, CannotDetach, NoSuchDatabase, DatabaseLocked,
+AttachEncoding, CrossDatabaseReference}`):
+
+- *The model.* Each attached database is a `Connection` of the main
+  one's storage type, owned by it (`Connection::attached`) — the TEMP
+  database's design (`session::temp`) generalised to N databases, not
+  a parallel path: a statement is routed before it is planned
+  (`route_attach`, ahead of the TEMP router) by the pin's resolution —
+  `aux.x` is aux's, an unqualified name temp's, then main's, then each
+  attached database's in attach order. A statement whose names all
+  live in one attached database runs there with that database's
+  qualifiers cut (three-part names included), so DDL, ALTER TABLE
+  (all forms), DROP, VACUUM [INTO], REINDEX, ANALYZE, `PRAGMA aux.x`,
+  `aux.sqlite_schema`, indexes, views, triggers, foreign keys,
+  AUTOINCREMENT, WITHOUT ROWID, STRICT, generated columns and WAL work
+  inside it exactly as in main. A write of an attached table that
+  reads other databases runs there too, the tables it reads elsewhere
+  handed over as *external sources* (`ExtTab`: columns at prepare,
+  rows — read in rowid / key order from their own database, VIRTUAL
+  columns computed — when it runs; nothing the statement does can
+  change those databases, so the rows read first are the rows). Any
+  other statement naming an attached object (a query over several
+  databases, a write of main reading attached tables, main or TEMP
+  CREATE TABLE ... AS, `INSERT INTO temp.x SELECT` via the TEMP feed)
+  runs on main, where `ext_source` makes each attached table such a
+  source; a three-part `aux.t.c` reaches it by `SourceDesc::dbname`.
+- *ATTACH / DETACH.* `ATTACH [DATABASE] expr AS expr [KEY expr]`
+  (operands evaluated at step, subqueries allowed; a lone identifier
+  is its own text, the pin's `resolveAttachExpr`; NULL / `''` is a
+  private temporary database, `':memory:'` an in-memory one; KEY is
+  evaluated and ignored), the pin's checks in its order: more than 10
+  ("too many attached databases - max 10"), the name against `main`,
+  `temp` and the attached names in any case ("database X is already in
+  use"), the open ("unable to open database"), then the encoding
+  (a non-empty database of another encoding is refused, an empty one
+  takes main's). An ATTACH inside a transaction replays BEGIN and the
+  open savepoints into the new database. `DETACH [DATABASE] expr`:
+  "no such database" (`temp` before the TEMP database exists),
+  "cannot detach database main / temp", "database X is locked" when
+  the open transaction has read or written it. `Connection::close`
+  closes the attached databases (WAL checkpoint and `-wal` removal).
+  `PRAGMA database_list` numbers them from 2 as the pin does.
+- *Storage.* `Connection::set_attach_hook(FnMut(AttachTarget) ->
+  Option<S>)` lets a `no_std` caller supply storage for a name; without
+  a hook `Storage::open_attached` is asked (new trait method, default
+  none): `MemStorage` makes `:memory:` / temporary databases,
+  `FileStorage` opens files relative to the working directory, as the
+  pin does, and backs `:memory:` / `''` with a private temporary file
+  (`FileStorage::anonymous`, removed when dropped; `is_memory` for the
+  former, so its journal mode is `memory`). A file already open on the
+  connection (main or attached) is refused (`Unsupported`): two pagers
+  over one file would cache each other's pages stale.
+- *Transactions and the super-journal.* BEGIN / COMMIT / ROLLBACK /
+  SAVEPOINT / RELEASE / ROLLBACK TO apply to every database (as to the
+  TEMP one); a failure that ends one database's transaction (OR
+  ROLLBACK, an I/O-class error) ends them all. A COMMIT (or the RELEASE
+  that commits) first checks every attached database's deferred
+  foreign keys; when two or more rollback-journal databases with a
+  file name (not WAL, not `:memory:`, synchronous not OFF — the pin's
+  `aMJNeeded`) have written and main has a file name, it runs the
+  pin's protocol (`commit_all`, `Pager::commit_phase_one`): the
+  super-journal `<main>-mjXXXXXX9XX` (six hex digits, `9`, two more,
+  re-drawn while the name exists) holding each journal's full name
+  NUL-terminated, synced; in each journal, at the next sector boundary
+  (synchronous FULL), the pointer record — lock-byte page number,
+  name, length, the pin's signed-byte checksum, journal magic — after
+  which the journal is truncated there, synced, and the database
+  written and synced (phase one); deleting the super-journal is the
+  commit point; then each journal is deleted (phase two). Otherwise
+  each database commits on its own, as in the pin's simple case.
+  Super-journals are opened through the new `Storage::open_named`
+  (default none: such storage writes none). Ungated within `v16`
+  (a correctness fix on the open path): hot-journal recovery reads the
+  pointer (the pin's `readSuperJournal`) — a journal whose
+  super-journal is gone belongs to a committed transaction and is
+  deleted unplayed; one whose super-journal exists is rolled back and
+  the super-journal deleted once no journal it lists points at it
+  (`pager_delsuper`). (Before, hipp rolled back every hot journal, so
+  a pin-made multi-database commit cut between its commit point and
+  the journal deletions came back half committed.)
+- *Cross-database rules.* A view or trigger of one database may not
+  name another's object with a qualifier ("view / trigger X cannot
+  reference objects in database Y", `CrossDatabaseReference`); its
+  unqualified names bind to its own database (a main view over a name
+  only an attached database has fails when read, "no such table:
+  main.t"); `CREATE INDEX aux.i ON aux.t` is the pin's syntax error;
+  an unqualified CREATE INDEX / TRIGGER is main's. A table-valued
+  pragma's qualifier is ignored (`aux.pragma_table_info('t')` is
+  `pragma_table_info('t')`), its schema argument chooses the
+  database, and an unqualified argument follows the search order.
+  `PRAGMA table_list` lists every database (an attached one under its
+  own name); connection-wide pragmas (`foreign_keys`, `encoding`,
+  `collation_list`, ...) under an attached name set the connection's
+  and are copied into each attached database (`sync_att`).
+- *hipp-cli*: `.databases` (`name: file r/w`, `""` without a file),
+  `.schema` and `.tables` list attached objects as `name.x` (quoted
+  as the shell quotes a name).
+- *Parser* (with `attach` only): any schema qualifier parses (the
+  router checks it); without the leaf a qualifier other than main /
+  temp stays a parse refusal and ATTACH / DETACH stay
+  `UnsupportedStatement`.
+
+**Oracle-probing notes** (live 3.54.1 pin, scripts over stdin; the
+multi-database commit traced with `strace`): an attached name is
+compared without case and may be any text (`'w x'`, `7`, `''`, the
+result of `'x' || 'y'` or a subquery); `ATTACH NULL AS n` is a
+temporary database, `AS NULL` the name `''`; the limit is checked
+before the name (`ATTACH 'x' AS ''` with ten attached: "too many");
+the same file may be attached twice; `ATTACH a AS b` attaches the file
+`a`, `AS c || 'd'` is "no such column: c". Detaching inside a
+transaction works for an untouched database and is "database X is
+locked" once read or written. `CREATE INDEX ix ON u` where only an
+attached `u` exists: "no such table: main.u"; `DROP TABLE u` drops
+the attached one; `DROP TABLE IF EXISTS nosuch.t` succeeds;
+`CREATE TABLE nosuch.t`, `PRAGMA nosuch.x`, `VACUUM nosuch` are
+"unknown database"; reads of `nosuch.t` "no such table: nosuch.t".
+Stored texts drop the created name's qualifier (`CREATE VIEW v AS
+SELECT * FROM a.t` keeps the body's; a trigger keeps `ON a.t`). A
+TEMP trigger may sit on an attached table. The pin's commit: journals
+written first; super-journal created `O_EXCL`, names written and
+fsynced; per database the pointer record at the sector boundary
+(page number `PENDING_BYTE / page_size + 1`), the journal fsynced, its
+header rewritten with the record count and fsynced again, the
+database written and fsynced; the super-journal unlinked; then the
+journals. Killing the pin (strace fault injection) on entry to each
+write, fsync, truncate and unlink of that commit, and recovering:
+before the unlink of the super-journal everything rolls back, after
+it everything is committed.
+
+**Tests:** `tests/attach_v16.rs` (14 tests) — hand corpora for
+ATTACH / DETACH (names, limits, errors, `:memory:` / temporary,
+inside transactions and savepoints), name resolution (search order,
+unknown schemas, three-part names, `x IN aux.t`, NATURAL / USING,
+schema tables), schema objects in attached databases (AUTOINCREMENT,
+WITHOUT ROWID, STRICT, generated columns, views, every ALTER form,
+triggers and the cross-database rules, foreign keys, VACUUM [INTO],
+REINDEX, ANALYZE, integrity checks), schema-scoped pragmas and
+table-valued pragmas (incl. a WAL attached database), statements
+across databases (joins, compounds, CTEs, correlated subqueries,
+INSERT ... SELECT both ways, UPDATE / DELETE reading other databases,
+UPDATE ... FROM, CTAS in main / aux / TEMP, upsert, RETURNING),
+transactions (savepoints, OR ROLLBACK / OR FAIL across databases,
+deferred foreign keys at COMMIT, DETACH locks), encodings (`utf16`),
+files interoperating both ways, the `no_std` hook over a `MemStorage`
+registry, the same-file refusal, the documented refusals, a generated
+corpus of random three-database scripts (xorshift64: writes, reads,
+transactions, savepoints, DETACH / re-ATTACH; 24 by default,
+`HIPP_ATTACH_CORPUS=400` ran clean) and the regressions below; every
+script runs on both engines in twin directories and compares rows,
+failing statements and the pin's integrity check and `.dump` of every
+database file. `tests/crash.rs`: `v16_crash_multi_database_commit`,
+`v16_crash_three_databases_and_savepoints`,
+`v16_crash_attached_only_commit` (a storage over a shared in-memory
+file system dies at every mutating op of a multi-database commit;
+hipp recovers every database to all-pre or all-post, bytes included,
+and the same crashed files written to disk are recovered alike by
+the real pin, integrity checks included) and
+`v16_cross_tool_hipp_recovers_pin_super_journal` (the pin killed on
+entry to each pwrite / fsync / ftruncate / unlink of its own
+multi-database commit; hipp recovers in place exactly as the pin does;
+skipped where `strace` is missing). `hipp-cli/tests/cli_v16_attach.rs`:
+byte-identical batches one-shot and over stdin (`PRAGMA
+database_list`, cross-database statements) and a `.databases` /
+`.schema` script. `tests/query_shape_v16.rs`: `foo.s` is "no such
+table" with the leaf.
+
+**Regressions found and fixed while building it:** a table-valued
+pragma under an attached qualifier was routed to that database (it
+listed only its tables); a WITHOUT ROWID table read from another
+database was refused; connection-wide pragmas under an attached name
+were "unknown database"; `PRAGMA aux.table_list` named the database
+`main`; a RELEASE that committed several databases through the
+super-journal left the attached ones inside a transaction (their
+savepoints had gone with phase two), so their later autocommit writes
+were never committed; `DROP ... IF EXISTS nosuch.x` failed in the
+parameter path; `aux.t.c` in a write of aux that read main was not
+cut; `SELECT main.t.x FROM aux.t` answered instead of "no such
+column"; a main view's names reached attached tables.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**: the super-journal recovery is
+gated on `v16`, see the gaps). Full **500,184 B** (Δ **+1,304 B** vs
+498,880, ratchet raised; under 512 KiB): the super-journal-aware
+hot-journal recovery (about 1,480 B, a correctness fix on the open
+path; the rest of the unit compiled `full` 176 B smaller). Max
+**794,808 B** (Δ **+29,464 B** vs 765,344, ratchet raised; under the
+32 KiB justification line): the router, external sources, ATTACH /
+DETACH, the commit protocol and the attached connections' recursion
+points (boxed futures).
+
+**Honest gaps:**
+
+- External sources are read whole, in rowid / key order, with no
+  index access path: an unordered query whose pin plan walks an index
+  of an attached table (or an `INSERT ... SELECT` without ORDER BY
+  feeding one) can list rows in another order. `INDEXED BY` on such a
+  source is not checked there.
+- A correlated subquery (or a join) over another database's table
+  scans that table's rows once per evaluation; since the review fix
+  they are read from the file once per execution and kept, but the
+  scan stays linear per outer row (the review's 3000 x 3000 lookup:
+  about 10 s in a debug build, where the pin seeks its rowid).
+- Refused (`Unsupported`) where the pin answers: an attached database's
+  view read together with another database's table; a TEMP trigger on
+  a main or attached table (the TEMP unit's gap), or one writing a
+  schema-qualified table (`INSERT INTO main.m ...` / `a.t`: a trigger
+  program runs inside the database that fires it, with no router to
+  the others); a TEMP UPDATE / DELETE / INSERT VALUES reading
+  another database (only `INSERT ... SELECT` / CTAS feed the temp
+  database); a three-part name of another database inside a write of
+  an attached table; an unqualified name meaning a table of another
+  database in a statement that also names the same-named table of the
+  attached database it writes; attaching a file the connection already
+  has open.
+- An unqualified `PRAGMA integrity_check` / `quick_check` /
+  `foreign_key_check` checks main only (the pin checks every
+  database); `PRAGMA aux.x` checks aux.
+- A string-literal schema qualifier (`'aux'.t`) does not parse
+  (`"aux".t` does).
+- A super-journal whose writing was cut before any journal pointed at
+  it stays behind (as on the pin). Below `v16` (tiny, the lower
+  rungs) recovery still rolls back every hot journal, so a pin-made
+  multi-database commit cut after its commit point would come back
+  half committed there; those builds have no storage that names
+  files (`open_named`) of their own.
+- `PRAGMA table_list` right after an AUTOINCREMENT table is created
+  lists `sqlite_sequence` before it, where the pin (in that session)
+  lists the table first (pre-existing hash-order difference, main
+  included; once the file is reopened the pin's order is hipp's).
+- Outside a transaction a plain `ANALYZE` / `REINDEX` commits each
+  database on its own (the pin's one statement commits them together
+  through the super-journal).
+- ATTACH of a file that does not exist leaves a 4,096-byte empty
+  database where the pin leaves a 0-byte file: hipp's `Pager::open`
+  writes page 1 of every empty file it opens (main included, in every
+  profile — the tiny profile's open path). The file is valid and reads
+  the same on both engines (`PRAGMA aux.page_count` is 0 on both).
+- `PRAGMA aux.foreign_key_list(t)` inside a transaction locks aux
+  against DETACH whether or not `t` has foreign keys (the pin only
+  when it has some).
+
+### ATTACH / DETACH — review fixes (2026-11-04)
+
+Nine findings; seven fixed with regressions
+(`tests/attach_v16.rs`: `review_regressions`, `bound_attach_operands`,
+`documented_refusals`; `hipp-cli/tests/cli_v16_attach.rs`:
+`review_regressions`, `super_journal_directory_syncs`), one narrowed to
+a clean refusal, one recorded as a gap.
+
+- *Bound parameters in ATTACH / DETACH* evaluated as NULL (`bind_ast`
+  did not visit their operands), so `ATTACH :f AS :n` attached a
+  private temporary database named `''`. The operands (and `KEY`) are
+  bound now; re-executing after `reset` with new bindings attaches
+  again.
+- *Cross-database rule for views and triggers* (the pin's `DbFixer`).
+  It is now one AST check (`foreign_names`): every FROM / target name
+  of the statement, table-valued functions included (new
+  `temp::Kind::Func`), must carry no qualifier but its own database's;
+  column qualifiers and three-part column names are not checked, as on
+  the pin. A trigger's WHEN clause (as `SELECT 1 WHERE ...`) and each
+  body statement are parsed and checked (the WHEN clause was not: a
+  trigger in `a` reading `main.t` there was stored and then read a's
+  own `t` when it fired). Main triggers are checked too (their body and
+  WHEN clause could name attached tables), and so are main views before
+  the router's nothing-attached shortcut (`CREATE VIEW v AS SELECT *
+  FROM a.pragma_table_info('t')` was stored). Two over-refusals went
+  with the old token scan: `SELECT main.t.x FROM t` in a trigger of
+  `a`, and `SELECT a.x FROM t AS a` in a main trigger, are accepted as
+  on the pin. Same pattern without `attach` (ungated within `v16` +
+  `triggers`): a `main.`-named trigger's body / WHEN clause naming a
+  `temp.` object was stored; it is `TriggerTempReference` now.
+- *Plain ANALYZE skipped attached databases* (no `a.sqlite_stat1`).
+  `ANALYZE` without a name, `REINDEX` without one and `REINDEX
+  <collation>` now run on every attached database after main
+  (`maint_attached`; TEMP stays skipped by ANALYZE, as on the pin).
+- *Own-database three-part names in stored objects*: a view or trigger
+  of `a` writing `a.t.x` failed with "no such column" when read or
+  fired (so a trigger made its table unwritable). An attached
+  connection's own sources answer to its alias
+  (`SourceDesc::dbname`, `Connection::own_dbname`).
+- *TEMP triggers writing qualified tables* were reported as the pin's
+  "qualified table names are not allowed ..." error, which the pin
+  applies only to the other databases' triggers. They are refused as
+  `Unsupported` now; running them needs trigger programs dispatched
+  through the top-level router (TEMP triggers on main tables are the
+  TEMP unit's existing refusal). README no longer says "everywhere the
+  pin takes them".
+- *DETACH locks*: reading an attached database through a table-valued
+  pragma (schema argument, an object found there, or `pragma_table_list`
+  / `PRAGMA table_list`) inside a transaction marks it used
+  (`Attached::used` is a `Cell` now: the pragma source is planned
+  through `&self`). The reverse, probed alongside: `PRAGMA
+  aux.page_size` / `journal_mode` / `cache_size` / `synchronous` /
+  `auto_vacuum` / `journal_size_limit` / `wal_checkpoint` read no page
+  on the pin and no longer lock (`Prag::no_lock`, `OnRoute::lock`).
+- *Directory syncs* (`FileStorage`, std only, so no profile size): a
+  sidecar this handle created syncs its directory on its first sync —
+  the rollback journal, the super-journal and the WAL, as the pin's
+  `unixSync` with `UNIXFILE_DIRSYNC` — and a file opened by name
+  (`open_named`: the super-journal) syncs its directory after its
+  deletion, the multi-database commit point (`unixDelete(..,
+  dirSync=1)`); the super-journal is created `O_EXCL`. Traced: hipp's
+  two-database commit now shows the pin's directory fsyncs.
+- *Performance* (narrowed): on main, an external source's rows are read
+  from their database once per execution and kept until `reset`
+  (`scan_ext`, `forget_ext_rows`); the review's 3000-row correlated
+  lookup went from about 20 s to 10 s (debug). The remaining
+  per-evaluation scan is in the gaps above; TEMP tables read by main
+  (`scan_temp`) have the same per-evaluation read (pre-existing, TEMP
+  unit).
+- *Not fixed*: the 4,096-byte file an ATTACH of a new name leaves (see
+  the gaps above: the core's open path, main included).
+
+**Found along the way, not this unit's** (pre-existing, left as they
+were): the pin refuses a view over a table-valued pragma when read
+("unsafe use of virtual table"), hipp reads it; `PRAGMA cache_size`
+reports 16 where the pin reports -2000; hipp-cli's `.parameter set`
+does not create the TEMP database as the pin's does; hipp bumps the
+file change counter on writes the pin skips (an ANALYZE that changes
+nothing, REINDEX).
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**). Full **500,200 B** (Δ **+16 B**
+vs 500,184, ratchet raised): the ungated fixes in the TEMP router (a
+`main.`-named trigger's `temp.` references, the TEMP trigger refusal);
+the rest is gated on `attach` (`Kind::Func` included). Max **815,328
+B** (Δ **+1,400 B** vs 813,928, ratchet raised): the AST cross-database
+check, ANALYZE / REINDEX over attached databases, the lock flag, the
+row cache. (A first cut instantiated the parser over `()` for the
+trigger check: +44 KiB; it uses the storage's error type now.)
+
+### Auto-vacuum files (2026-11-04)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated (leaf `autovacuum`, implies `v16`, in `max` —
+ADR 0002 — not `full`; its own `v16,autovacuum` line in
+`ci/feature-sets.txt`). Without the leaf today's refusal stands
+unchanged: an auto-vacuum file is read, every write is refused
+with `Error::AutoVacuumUnsupported` and leaves the file
+byte-identical (pinned by the `pager` unit test
+`auto_vacuum_file_refused_without_leaf`, run by the gates'
+`--features full` lib tests, and the existing suites' tests,
+now `cfg(not(feature = "autovacuum"))`).
+
+**Shipped (`src/autovac.rs`, `autovacuum`):**
+
+- **Pointer maps, derived.** The pin keeps its map with
+  `ptrmapPut` calls along every write path; hipp's B-tree code
+  rebuilds whole pages, so the map is instead derived: at each
+  commit of an auto-vacuum file (`Pager::drive_commit` →
+  `autovac::pre_commit`) every tree named by `sqlite_schema`
+  (rowid tables, indexes, WITHOUT ROWID and expression-index trees
+  alike — the walk reads raw pages), every overflow chain and the
+  freelist are walked into a `Map` (role, parent per page:
+  ROOTPAGE / FREEPAGE / OVERFLOW1 / OVERFLOW2 / BTREE), and the
+  pointer-map pages whose bytes differ are rewritten. The map is a
+  function of the file's structure, so the entries are the pin's
+  whatever path wrote the pages — inserts, deletes, balance splits
+  and merges, overflow chains made and freed, freelist trunk / leaf
+  changes, index, WITHOUT ROWID and expression-index writes,
+  REINDEX, ALTER, triggers, foreign-key actions. A page nothing
+  references, or one referenced twice, is corruption
+  (`CorruptPage`), never a guessed entry. Entries past the end of
+  the file are left as they are, as on the pin. Pointer-map pages
+  sit at the pin's positions (`ptrmapPageno`, the lock-byte page
+  skipped) for every page size; growing the file over one makes it
+  a zeroed pointer-map page and allocates the next
+  (`Pager::grow_page`, the pin's `allocateBtreePage` at the end).
+- **Root placement.** `btree::alloc_root` (every CREATE TABLE /
+  INDEX / automatic index / `sqlite_sequence` / `sqlite_stat1` /
+  CREATE TABLE AS root, and VACUUM's) is, on an auto-vacuum file,
+  the pin's `btreeCreateTable`: the page after header offset 52
+  (the largest root), skipping pointer-map and lock-byte pages,
+  taken with `BTALLOC_EXACT` (searching the freelist when the map
+  says it is free); a B-tree or overflow page there is moved out of
+  the way first (`relocatePage` / `modifyPagePointer`), then offset
+  52 is updated.
+- **Drop.** DROP TABLE / DROP INDEX on an auto-vacuum file follow
+  `sqlite3CodeDropTable` / `destroyRootPage` / `btreeDropTable`:
+  the `sqlite_sequence` row and the schema rows first, then each
+  tree largest root first — its pages freed in `clearDatabasePage`
+  order (each cell's subtree, its overflow chain, the right
+  subtree), the root freed if it is the largest, else the largest
+  root copied into its slot, freed, and its `sqlite_schema` row
+  pointed at the slot (`autovac::schema_set_root`); offset 52
+  decremented past pointer-map pages.
+- **FULL** (`autoVacuumCommit`): at commit, `finalDbSize`, then
+  `incrVacuumStep(commit)` from the last page down — free pages
+  dropped, used pages moved into the free pages the pin's
+  `BTALLOC_ANY` allocation hands out (trunk leaf 0 swapped with the
+  last, an empty trunk itself) — then the freelist emptied and the
+  file truncated. **INCREMENTAL:** commits keep free pages; `PRAGMA
+  incremental_vacuum[(N)]` runs N of the pin's
+  `sqlite3BtreeIncrVacuum` steps (`BTALLOC_EXACT` for a free last
+  page, `BTALLOC_LE` below the final size otherwise) and returns
+  one zero-column row per page removed; N is read with
+  `sqlite3GetInt32` (`'2abc'` is 2, `' 2'`, `9999999999`, `''`,
+  `0`, negatives and no argument mean every page). It works on a
+  FULL file inside a transaction too; on a plain or the temp
+  database it does nothing; `pragma_incremental_vacuum` is "no such
+  table", as on the pin.
+- **Truncation is crash- and savepoint-safe.** Pages cut off are
+  dropped from the commit's write set. (As first shipped, every
+  page past the new end was journaled and sub-journaled up front;
+  the review fixes below replace that with the pin's scheme:
+  truncation after the journal's deletion, no record for a cut
+  page unless it is reused.)
+- **PRAGMA auto_vacuum.** The mode is always kept for the next
+  VACUUM; an empty database takes FULL / INCREMENTAL at once
+  (header offsets 52 = 1 and 64 written and committed, so the page
+  size is fixed from then on, as the pin's pragma creates the
+  file); an auto-vacuum file switches between FULL and INCREMENTAL
+  in place (offset 64); to or from NONE waits for VACUUM. The
+  connection's mode (`Pager::av_mode`) is the pin's in-memory one:
+  it survives ROLLBACK / ROLLBACK TO, and the next write puts it
+  back into the header (`ensure_header`, the pin's `newDatabase`).
+  The getter reports it.
+- **VACUUM / VACUUM INTO** build the image as an auto-vacuum
+  database when the file is one (or `auto_vacuum` was set first):
+  roots in the pin's order after the largest, pointer-map pages
+  skipped, the map written at the image's commit; offsets 52 / 64
+  kept. `auto_vacuum = NONE; VACUUM` still converts to a plain file,
+  `= FULL; VACUUM` converts a plain one.
+- **WAL, savepoints, ATTACH.** The upkeep runs in `drive_commit`,
+  so WAL commits (the commit frame carries the truncated size; the
+  checkpoint truncates the file), RELEASE / COMMIT of savepoints and
+  each attached database's commit (its own pager) all get it.
+
+**Ungated fix:** `Pager::free_page` filled a freelist trunk to its
+capacity (`usable/4 - 2` leaves); the pin's `freePage2` stops at
+`usable/4 - 8` (so files stay readable by SQLite before 3.6.0).
+hipp's trunks, and so the pages a FULL commit or
+incremental_vacuum moves into, now match the pin's
+(`freelist_trunk_capacity`). Tiny: no change in size (one constant).
+
+**Ungated fix (found by the generated corpus):** when a delete left
+page 1 — `sqlite_schema`'s root — an interior page with no cell,
+`collapse_table_root` copied the child into it without checking that
+it fits beside page 1's 100-byte header; a full child's cells were
+packed over the pointer array, and the pin then found the schema
+malformed. A 512-byte-page file whose schema had two leaves was
+corrupted by a DROP TABLE or ALTER TABLE ADD COLUMN (plain files
+too, at HEAD before this unit). Now a child that does not fit stays
+under a cell-less root, as the pin's `balance_nonroot` does (it
+shrinks only when `hdrOffset <= nFree`), so the pin's page 1 is
+matched (`page1_root_keeps_an_oversized_child`).
+
+**Oracle-probing notes (live pin):** `PRAGMA auto_vacuum = FULL`
+alone on a new file writes a 1-page file with offset 52 = 1;
+offset 52 is the largest root page (3 for the first table: page 2
+is the pointer map). Values: `none` / `full` / `incremental`, 0 /
+1 / 2, `'full'`, `"FULL"`; `1.5` is 1 (atoi); 3, -1, 7 and `abc`
+are 0. `auto_vacuum = 1` then `page_size = 1024`: the size stays
+4096; the reverse order applies both. After `user_version = 5` the
+mode cannot change. `BEGIN; auto_vacuum = 1; ROLLBACK` leaves an
+empty file but the getter says 1, and the next CREATE makes the
+file auto-vacuum (likewise `SAVEPOINT` / `ROLLBACK TO`). On an
+auto-vacuum file `= 0` keeps the getter's value (the change waits
+for this connection's VACUUM); FULL <-> INCREMENTAL is immediate.
+VACUUM INTO keeps the mode (or the pending one). DROP TABLE of a
+table and its UNIQUE index (roots 4, 5, largest 7): 7 moves to 5,
+6 to 4, freelist trunk 7 with leaf 6, offset 52 = 5. CREATE TABLE
+after data moves the leaf at the slot to the end of the file.
+`incremental_vacuum(N)` prints one empty line per page in list
+mode; `PRAGMA temp.incremental_vacuum`
+and a plain file print nothing. On a FULL file freelist_count is 0
+after every commit; inside a transaction it counts the free pages
+and `incremental_vacuum` removes them. WAL + FULL truncates
+logically at commit and physically at the checkpoint. Page
+choice: hipp writes a row's table cell before its index entries
+(the pin the reverse) and splits some index pages differently, so
+files with indexes written row by row can place pages
+differently (as plain files already do); without that the pin's page counts, pointer maps and root pages are
+matched page for page (`layouts_match_the_pin`).
+
+**Tests:** `tests/autovacuum_v16.rs` (live pin, one connection per
+script, rows and failing statements compared; both integrity
+checks; layouts — page count, freelist count, offsets 52 / 64 and
+every pointer-map entry — compared where page choice is
+deterministic): `layouts_match_the_pin` (roots, drops moving roots
+of tables / indexes / `sqlite_sequence`, CREATE moving a leaf,
+overflow chains, FULL truncation, incremental, incremental DROP),
+`page_sizes_and_map_pages` (512 … 65536, maps over several
+pointer-map pages, both modes), `pragma_auto_vacuum` (22 scripts:
+values, empty database, switches, ROLLBACK / ROLLBACK TO keeping
+the mode), `incremental_vacuum_arguments` (18 argument forms plus
+temp / plain / FULL-in-a-transaction / table-valued / ROLLBACK /
+savepoint cases), `vacuum_of_auto_vacuum_files` (VACUUM keeping /
+setting / dropping / switching the mode, a page-size change, 5
+VACUUM INTO cases), `files_cross_both_ways` (pin files written by
+hipp and hipp files written by the pin, both modes, two page
+sizes), `transactions_and_wal` (ROLLBACK, nested savepoints, a
+statement rollback, WAL in both modes and a journal-mode switch),
+`integrity_check_of_damaged_maps` (7 damaged pin files: the pin's
+messages and limits on hipp), `freelist_trunk_capacity` (the
+regression), and generated corpora `generated_corpus_journal` (40
+scripts) / `generated_corpus_wal` (20; `HIPP_AV_CORPUS` scales
+both) of random CREATE / INSERT / DELETE / UPDATE / DROP /
+incremental_vacuum / VACUUM / BEGIN ... COMMIT|ROLLBACK / SAVEPOINT
+scripts on FULL and INCREMENTAL files at 512, 1024 and 4096-byte
+pages (also expression indexes, WITHOUT ROWID tables, CREATE TABLE
+AS, ALTER TABLE ADD COLUMN, DROP INDEX, REINDEX and ANALYZE): rows
+and errors equal, FULL never leaves a free page after a commit,
+both integrity checks pass (500 scripts run clean with
+`HIPP_AV_CORPUS=250`). `page1_root_keeps_an_oversized_child` (the
+page-1 regression, plain and both modes). `tests/crash.rs`:
+`v16_crash_autovacuum_full` (a FULL delete commit's page moves and
+truncation, a transaction freeing and reusing pages, DROP INDEX
+moving a root, CREATE moving a page) and
+`v16_crash_incremental_vacuum` (`incremental_vacuum(7)`, all, and
+inside a transaction with inserts): every kill point recovers in
+hipp to the pre- or post-image byte for byte, and the pin, given
+the crashed file and journal, recovers to the pre- or post-rows
+with its integrity check ok. `hipp-cli/tests/cli_v16_autovacuum.rs`
+(4 tests: FULL, INCREMENTAL and pragma / VACUUM batches
+byte-identical one-shot and over stdin; a pin-written file written
+by hipp's shell).
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+(the 3.54.1 pin live) ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**: the root allocation is a
+macro, so builds without the leaf pay no extra future; the two
+ungated fixes compiled to the same size). Full **500,184 B** (Δ
+**0**; the leaf is not in `full`). Max **813,928 B** (Δ **+19,016**
+vs 794,912, ratchet raised; under the 32 KiB justification
+threshold): `src/autovac.rs` (derive, write, allocate, relocate,
+FULL commit, incremental steps, root placement, drop), the pager's
+growth / tail keeping and the PRAGMA / VACUUM / DROP wiring.
+
+**Honest gaps:**
+
+- **Commit cost.** The map is derived by walking the whole file at
+  every commit of an auto-vacuum file (and at each CREATE and
+  `incremental_vacuum`): correct by construction, but O(pages) per
+  commit where the pin's upkeep is O(pages changed). Plain files
+  pay nothing.
+- **Page choice where hipp's B-tree differs.** hipp's general
+  allocation (`alloc_page` takes a trunk's last leaf; the pin's
+  callers pass `nearby` hints), its table-before-index insert order
+  and its index split policy are unchanged, so after such writes
+  files can differ from the pin's page by page (same contents,
+  valid maps, both integrity checks pass). The moves this unit
+  owns (root placement, DROP, FULL commit, incremental_vacuum) use
+  the pin's allocator and match given the same freelist.
+- The byte content of free pages and of pointer-map entries past
+  the end of the file is not the pin's (never read by either
+  engine).
+- `PRAGMA auto_vacuum` on the TEMP database and the pin's
+  `sqlite3_autovacuum_pages` callback (no SQL surface) are not
+  modelled.
+
+### Auto-vacuum files — review fixes (2026-11-04)
+
+Four review findings on the unit above; all four addressed.
+
+- **Cut-off pages were journaled (fixed).** `Pager::keep_tail`
+  wrote every page past the new end of the file to the rollback
+  journal and the savepoint sub-journal before a FULL commit or a
+  `PRAGMA incremental_vacuum` step, free leaves included, so the
+  journal grew as large as the freed data. A FULL `DROP TABLE` of
+  a 12 MB table wrote 3,013 page images, against 10 on the pin.
+  Probed on the pin with `strace`: it `unlink`s the journal and
+  only then `ftruncate`s the file (its `pager_end_transaction`),
+  and fetches free leaves without their content. So until the
+  journal is gone, the cut-off pages are still on disk for a
+  rollback, and none of them needs a record. hipp now does the
+  same. The commit's `SyncData` stage only grows an auto-vacuum
+  file; it is shrunk after `DeleteJournal`, best effort (the
+  commit point has passed, and a longer file is valid: its header
+  gives the page count, as the pin's does after a crash there).
+  `keep_tail` is gone. The pages a truncation cut off keep their
+  frames, and they are recorded only when they are written again.
+  That happens when the file grows back into them
+  (`Pager::grow_frame`): they then take a journal record (if
+  original) and a savepoint record before they are zeroed.
+  `autovac::allocate` no longer makes a freelist leaf writable
+  itself: incremental_vacuum's `BTALLOC_EXACT` leaf is cut, not
+  written, and the other callers make it writable themselves.
+  Savepoints now allow for a file that shrinks mid-transaction.
+  `sp_note` records a page within *any* open savepoint's size (the
+  pin's `subjRequiresPage`), not only the newest one's.
+  `sp_rollback` keeps, and restores, the pages an older savepoint
+  still covers. A page that is journaled but has left the write
+  set has its image copied to the sub-journal. These rules matter
+  only when the file shrinks, so they are gated by the leaf. Now
+  the review's DROP TABLE and incremental_vacuum cases each write 7
+  page images in all, journal and database together (3,015 and
+  3,011 before). The incremental_vacuum file came out
+  byte-identical to the pin's. Regressions:
+  `tests/crash.rs` `v16_crash_autovacuum_cut_pages_not_journaled`
+  (a FULL DROP of ~300 pages and an incremental_vacuum of ~300 free
+  pages each take fewer than 60 storage operations, where three
+  per page were needed before; crash matrices of those, of a
+  transaction that grows back into the pages it cut, and of a FULL
+  delete whose commit moves pages: every kill point recovers in
+  hipp to the pre-image, or to the post-image possibly followed by
+  the not-yet-truncated tail, and the pin recovers the same files
+  with integrity_check ok). The crash matrices accept that tail.
+  `tests/autovacuum_v16.rs` `savepoints_across_a_shrinking_file`
+  covers ROLLBACK TO a savepoint taken after an incremental_vacuum,
+  then one taken before it, with the file grown back in between.
+  It fails if `sp_rollback` drops the older savepoint's pages.
+- **Found while testing: integrity_check inside a transaction
+  (fixed).** hipp writes the derived pointer map only at commit,
+  so `BEGIN; DELETE ...; PRAGMA integrity_check` on an auto-vacuum
+  file reported "Bad ptr map entry" for every entry the
+  transaction had changed. The pin's map is always current, so
+  its check says `ok`. Inside an open write transaction, the
+  check now writes the derived map first (`autovac::refresh_map`).
+  Outside a transaction the committed map is checked as it is, so
+  damaged maps are still reported
+  (`integrity_check_of_damaged_maps`). Covered by
+  `savepoints_across_a_shrinking_file` and the CLI `attached_file`
+  batch.
+- **Lock-byte page untested (now tested).** `lock_byte_page`
+  crafts a sparse 1 GiB file at 64 KiB pages: the pin's page 1 and
+  pointer maps, and a table of four rows whose 4,095-page overflow
+  chains fill pages 4 to 16384. Each overflow page holds only its
+  4-byte link, so about 64 MB is written. Statement by statement on
+  both engines, it grows the file past page 16385 (a CREATE moving
+  page 4 to 16386, an insert), shrinks it back across that page (a
+  FULL `DROP TABLE`; on INCREMENTAL, `incremental_vacuum(2)` and
+  then all), and creates a table again. Rows, page counts, freelist
+  counts, offsets 52 / 64 and every pointer-map entry match the pin
+  after each statement. The lock-byte page's slot holds no entry,
+  each file ends at its page count, and the pin's integrity_check
+  passes on both files. hipp's own integrity check and `count(*)`
+  read all 268 MB of each row's payload, which is too slow for a
+  test, so the matching layouts stand in for them.
+- **ATTACH interplay untested (now tested).**
+  `attached_auto_vacuum_files` runs six scripts with an attached
+  file and compares each file's layout with the pin's:
+  `aux.auto_vacuum` on an empty attached file; CREATE / CREATE
+  INDEX / DROP moving roots in it; `aux.incremental_vacuum(N)` and
+  the unqualified pragma (main's, a no-op); a FULL aux inside a
+  BEGIN ... COMMIT across main and aux, and a ROLLBACK; both files
+  auto-vacuum in different modes with savepoints across them;
+  `VACUUM aux`, `VACUUM aux INTO`, `aux.auto_vacuum = 0; VACUUM
+  aux`; a plain aux converted by VACUUM. `tests/crash.rs`
+  `v16_crash_multi_database_auto_vacuum` (through
+  `multi_crash_matrix_with`) covers a FULL attached file truncated
+  inside a super-journal commit, and an INCREMENTAL one vacuumed
+  inside it. Every kill point recovers all three databases to one
+  side, in hipp and in the pin, with integrity_check ok. The CLI
+  suite adds `attached_file`, byte-identical one-shot and over
+  stdin. The incremental_vacuum steps and the integrity check
+  inside a transaction run on an attached file.
+- **README overclaimed page-count parity (fixed).** The README
+  bullet now says that the moves this leaf owns choose the pin's
+  pages, so layouts match given the same tree shapes. Where hipp's
+  general B-tree shapes trees differently, page counts can differ.
+  Reproduced on the pin: an index plus deleting every second row
+  gives 58 pages against 57; `ALTER TABLE DROP COLUMN`, an UPDATE
+  resizing blobs, REINDEX and DELETE merging differ too, as the
+  honest gaps above say. A plain aux converted by VACUUM and then
+  deleted from gives 10 pages against 9: the same cause, so that
+  test case uses DROP instead.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh`
+run (the 3.54.1 pin live) ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**). Full **500,200 B** (Δ
+**0**: every new rule is gated by the leaf, and `sp_rollback`'s
+limit is a macro so that builds without the leaf keep no extra
+local across its awaits — a plain `let` cost 8 B there). Max
+**815,792 B** (Δ **+464** vs 815,328, ratchet raised): the deferred
+truncation, `grow_frame`, the savepoint rules and `refresh_map`,
+less `keep_tail`.
+
+**Honest gaps (added):**
+
+- `Pager::alloc_page`, which every file uses and which predates
+  this unit, still journals a freelist leaf that was free before
+  the transaction when it reuses it: at most one page per page of
+  new data. The pin skips this (it fetches the leaf with
+  `NOCONTENT` unless the leaf was freed in the same transaction).
+  Unlike the fixed finding, this cost scales with the data written,
+  not the data freed. Matching the pin needs a per-transaction
+  record of freed pages in the core pager, which the tiny profile
+  would pay for, so it is left as is.
+- hipp's integrity check and `count(*)` read every overflow page
+  of a row (the pin's skip the payload). On very large rows this is
+  slow; it is not specific to auto-vacuum files.
+- hipp writes page 1 of an empty main database file whenever it
+  opens one, even if nothing is ever written to it (`SELECT 1` is
+  enough); the pin leaves a 0-byte file. This predates this unit
+  and is not specific to it, so the attached tests do not compare
+  a main file that the pin left empty.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

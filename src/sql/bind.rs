@@ -115,6 +115,17 @@ impl Binder<'_> {
             // `VACUUM INTO ?` (v0.16).
             #[cfg(feature = "v16")]
             Ast::Vacuum { into: Some(e), .. } => b.expr::<E>(e)?,
+            // `ATTACH ? AS ? [KEY ?]` / `DETACH ?` (v0.16, `attach`).
+            #[cfg(feature = "attach")]
+            Ast::Attach { file, name, key } => {
+                b.expr::<E>(file)?;
+                b.expr::<E>(name)?;
+                if let Some(k) = key {
+                    b.expr::<E>(k)?;
+                }
+            }
+            #[cfg(feature = "attach")]
+            Ast::Detach { name } => b.expr::<E>(name)?,
             // Every other statement holds no parameters: the parser
             // refuses them in stored definitions (CREATE TABLE / VIEW,
             // ALTER TABLE) and the rest have no expressions.

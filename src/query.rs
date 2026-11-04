@@ -300,6 +300,10 @@ pub enum ScalarFn {
     /// JSON subtype (`eval_json_arg`).
     #[cfg(feature = "json")]
     Json(crate::json::JsonFn),
+    /// The date and time functions (v0.16, leaf feature
+    /// `datetime`): `crate::datetime::eval`.
+    #[cfg(feature = "datetime")]
+    Date(crate::datetime::DateFn),
     /// `RAISE(kind[, message])` (v0.16, `triggers`): evaluating it
     /// records the message (`Env::raise_msg`) and fails with the
     /// kind's error (`SchemaKind::RaiseIgnore`, ...), which the
@@ -321,7 +325,14 @@ impl ScalarFn {
                 | ScalarFn::Changes
                 | ScalarFn::TotalChanges
                 | ScalarFn::SqliteVersion
-        )
+        ) || {
+            #[cfg(feature = "datetime")]
+            {
+                matches!(self, ScalarFn::Date(d) if d.nondeterministic())
+            }
+            #[cfg(not(feature = "datetime"))]
+            false
+        }
     }
 }
 
@@ -561,6 +572,10 @@ pub struct SourceDesc {
     /// `DB_ANY`, which every schema part reaches.
     #[cfg(feature = "v16")]
     pub db: u8,
+    /// The attached database's name a three-part name reaches this
+    /// source by (v0.16, `attach`; empty for main / temp sources).
+    #[cfg(feature = "attach")]
+    pub dbname: AVec<u8>,
     /// A `json_each` / `json_tree` source (v0.16, `json`): its
     /// `json` and `root` columns are hidden from `*`, and its
     /// `value` column carries the JSON subtype for an array or
@@ -685,6 +700,8 @@ impl SourceDesc {
             trace: None,
             #[cfg(feature = "v16")]
             db: 0,
+            #[cfg(feature = "attach")]
+            dbname: AVec::new(),
             #[cfg(feature = "json")]
             json_tvf: 0,
         }
@@ -941,6 +958,12 @@ pub struct SubSource {
     /// statement reads it there (`root` is a temp page).
     #[cfg(feature = "v16")]
     pub temp: bool,
+    /// The table is another database's (v0.16, `attach`): 1 + its
+    /// index in the connection's external sources (with `temp` set,
+    /// so it is scanned in rowid order, never through an index); 0
+    /// for none.
+    #[cfg(feature = "attach")]
+    pub ext: u16,
 }
 
 /// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
@@ -1816,6 +1839,20 @@ pub fn resolve_scoped<E>(
             let db = match schema {
                 None => 0,
                 Some(sc) => schema_db(handle_bytes(arena, *sc)),
+            };
+            // An attached database's name reaches its sources (v0.16,
+            // `attach`).
+            #[cfg(feature = "attach")]
+            let db = match schema {
+                Some(sc) if db == 3 => {
+                    let n = handle_bytes(arena, *sc);
+                    core::iter::once(cur)
+                        .chain(enclosing.iter())
+                        .flat_map(|g| g.sources.iter())
+                        .find(|s| !s.dbname.is_empty() && eq_ci(s.dbname.as_slice(), n))
+                        .map_or(db, |s| s.db)
+                }
+                _ => db,
             };
             resolve_col_ref::<E>(*table, *name, arena, cur, enclosing, db)?
         }
@@ -2727,6 +2764,12 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
     {
         return Some(ScalarFn::Json(j));
     }
+    #[cfg(feature = "datetime")]
+    if f.is_none()
+        && let Some(d) = crate::datetime::DateFn::lookup(name)
+    {
+        return Some(ScalarFn::Date(d));
+    }
     #[cfg(feature = "math")]
     if f.is_none() {
         return crate::math::MathFn::lookup(name).map(ScalarFn::Math);
@@ -2775,6 +2818,8 @@ fn arity(f: ScalarFn) -> (usize, usize) {
         ScalarFn::Math(m) => m.arity(),
         #[cfg(feature = "json")]
         ScalarFn::Json(j) => j.arity(),
+        #[cfg(feature = "datetime")]
+        ScalarFn::Date(d) => d.arity(),
         _ => (1, 1),
     }
 }
@@ -2904,6 +2949,27 @@ fn resolve_call_body<E>(
     enclosing: &[ScopeGroup],
     planner: SubPlanner<'_, E>,
 ) -> Result<RExpr, E> {
+    // CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP without the
+    // `datetime` leaf (v0.16): the clock pseudo-columns a DEFAULT
+    // expression resolves against (`rules::prepare_default`);
+    // anywhere else there are none, and the keyword is refused.
+    #[cfg(not(feature = "datetime"))]
+    if args.is_empty()
+        && !star
+        && let Some(col) = crate::rules::ctime_column(name)
+    {
+        return resolve_column::<E>(
+            cur,
+            enclosing,
+            None,
+            col,
+            #[cfg(feature = "v16")]
+            0,
+        )
+        .map_err(|_| Error::Schema {
+            kind: SchemaKind::UnknownFunction,
+        });
+    }
     let agg = agg_kind(name);
     // The aggregate clauses on anything but an aggregate (v0.16,
     // `v16`): the pin refuses them at prepare. min / max with
@@ -4831,6 +4897,25 @@ pub struct Env {
     /// conversions see (`crate::utf16`).
     #[cfg(feature = "utf16")]
     pub enc: core::cell::Cell<crate::record::TextEnc>,
+    /// The running statement's instant (v0.16, `datetime`): a
+    /// Julian day in milliseconds, read from `clock` on the first
+    /// need and kept until the next top-level statement execution
+    /// (the pin's `sqlite3StmtCurrentTime`).
+    #[cfg(feature = "datetime")]
+    pub now: core::cell::Cell<Option<i64>>,
+    /// The statement whose instant `now` holds (v0.16, `datetime`;
+    /// `claim_clock`), and the last claim handed out.
+    #[cfg(feature = "datetime")]
+    pub now_owner: core::cell::Cell<u64>,
+    #[cfg(feature = "datetime")]
+    pub now_seq: core::cell::Cell<u64>,
+    /// The wall clock (`Config::clock`; v0.16, `datetime`).
+    #[cfg(feature = "datetime")]
+    pub clock: Option<fn() -> i64>,
+    /// The time-zone hook (`Config::tz_offset`; v0.16, `datetime`):
+    /// `None` is UTC.
+    #[cfg(feature = "datetime")]
+    pub tz: Option<crate::datetime::TzOffset>,
 }
 
 impl Env {
@@ -4857,6 +4942,16 @@ impl Env {
             json_docs: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "utf16")]
             enc: core::cell::Cell::new(crate::record::TextEnc::Utf8),
+            #[cfg(feature = "datetime")]
+            now: core::cell::Cell::new(None),
+            #[cfg(feature = "datetime")]
+            now_owner: core::cell::Cell::new(0),
+            #[cfg(feature = "datetime")]
+            now_seq: core::cell::Cell::new(0),
+            #[cfg(feature = "datetime")]
+            clock: None,
+            #[cfg(feature = "datetime")]
+            tz: None,
         }
     }
 
@@ -4887,6 +4982,35 @@ impl Env {
         self.pending.set(self.pending.get().saturating_add(1));
     }
 
+    /// A new statement's claim on the clock cache (v0.16,
+    /// `datetime`): the cache empties, so the statement reads the
+    /// clock once, on first need, and keeps that instant.
+    #[cfg(feature = "datetime")]
+    pub fn claim_clock(&self) -> u64 {
+        let id = self.now_seq.get().wrapping_add(1);
+        self.now_seq.set(id);
+        self.now_owner.set(id);
+        self.now.set(None);
+        id
+    }
+    /// Statement `id` runs (v0.16, `datetime`): when another
+    /// statement used the cache since, it is emptied and `id`'s.
+    #[cfg(feature = "datetime")]
+    pub fn own_clock(&self, id: u64) {
+        if self.now_owner.get() != id {
+            self.now_owner.set(id);
+            self.now.set(None);
+        }
+    }
+    /// Statement `id` is reset (v0.16, `datetime`): its next
+    /// execution reads the clock again.
+    #[cfg(feature = "datetime")]
+    pub fn release_clock(&self, id: u64) {
+        if self.now_owner.get() == id {
+            self.now.set(None);
+        }
+    }
+
     /// The end of an INSERT / UPDATE / DELETE: on success its
     /// count becomes `changes()` and joins `total_changes()`; a
     /// failed statement leaves `changes()` 0.
@@ -4915,6 +5039,11 @@ pub struct Ctx<'x> {
     /// state at hand (v0.16: a generated column's computation).
     #[cfg(feature = "v16")]
     like_cs: bool,
+    /// The pin's "pure" evaluation (v0.16, `datetime`): a CHECK
+    /// constraint or an index expression, where a date and time
+    /// function may read neither the clock nor the time zone.
+    #[cfg(feature = "datetime")]
+    pure: bool,
 }
 
 impl<'x> Ctx<'x> {
@@ -4926,6 +5055,23 @@ impl<'x> Ctx<'x> {
             env: None,
             #[cfg(feature = "v16")]
             like_cs: false,
+            #[cfg(feature = "datetime")]
+            pure: false,
+        }
+    }
+    /// The same context evaluating a CHECK constraint or an index
+    /// expression (v0.16, `datetime`; see the `pure` field).
+    #[cfg(feature = "datetime")]
+    pub fn pure(mut self) -> Ctx<'x> {
+        self.pure = true;
+        self
+    }
+    /// What a date and time function reads (v0.16, `datetime`).
+    #[cfg(feature = "datetime")]
+    fn time(&self) -> crate::datetime::TimeCtx<'x> {
+        crate::datetime::TimeCtx {
+            env: self.env,
+            pure: self.pure,
         }
     }
     /// The same context with `PRAGMA case_sensitive_like` set to
@@ -4944,6 +5090,8 @@ impl<'x> Ctx<'x> {
             env: None,
             #[cfg(feature = "v16")]
             like_cs: false,
+            #[cfg(feature = "datetime")]
+            pure: false,
         }
     }
     /// The same context reading the connection state `env`.
@@ -4973,6 +5121,8 @@ impl<'x> Ctx<'x> {
             env: self.env,
             #[cfg(feature = "v16")]
             like_cs: self.like_cs,
+            #[cfg(feature = "datetime")]
+            pure: self.pure,
         }
     }
 }
@@ -6231,6 +6381,10 @@ fn scalar_values<E>(
     #[cfg(feature = "math")]
     if let ScalarFn::Math(m) = f {
         return Ok(crate::math::eval(m, v));
+    }
+    #[cfg(feature = "datetime")]
+    if let ScalarFn::Date(d) = f {
+        return crate::datetime::eval::<E>(d, v, ctx.time());
     }
     let Some(v0) = v.first() else {
         // The argument-free calls.

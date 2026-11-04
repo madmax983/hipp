@@ -989,13 +989,14 @@ fn opaque_index_blocks_writes_not_reads() {
 fn uncomputable_index_blocks_writes_not_reads() {
     block_on(async {
         // An expression index over a function hipp does not have
-        // (the pin's date()): reads work, writes are refused rather
+        // (the pin's unistr_quote(); it used to be date(), until the
+        // `datetime` leaf): reads work, writes are refused rather
         // than leaving the index stale (v0.16).
         let path = common::temp_db("v16-uncomputable");
         common::cli(
             &path,
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); \
-             CREATE INDEX idt ON t(date(a)); INSERT INTO t VALUES (1,'2020-01-02');",
+             CREATE INDEX idt ON t(unistr_quote(a)); INSERT INTO t VALUES (1,'2020-01-02');",
         );
         let fs = FileStorage::open(&path).expect("fs open");
         let mut db = Connection::open(fs, Config::default()).await.expect("open");

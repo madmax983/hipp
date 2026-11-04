@@ -62,8 +62,31 @@ macro_rules! abort_write {
     }};
 }
 
+/// A new table's or index's root page: in an auto-vacuum file
+/// (v0.16, `autovacuum`) the pin's slot after the largest root
+/// (`crate::autovac::alloc_root`), elsewhere any page. A macro, so
+/// builds without the leaf pay for no extra future.
+macro_rules! alloc_root {
+    ($pager:expr) => {{
+        #[cfg(feature = "autovacuum")]
+        let r = crate::autovac::alloc_root($pager).await?;
+        #[cfg(not(feature = "autovacuum"))]
+        let (r, _) = $pager.alloc_page().await?;
+        r
+    }};
+    ($pager:expr, $err:expr) => {{
+        #[cfg(feature = "autovacuum")]
+        let r = crate::autovac::alloc_root($pager).await.map_err($err)?;
+        #[cfg(not(feature = "autovacuum"))]
+        let (r, _) = $pager.alloc_page().await.map_err($err)?;
+        r
+    }};
+}
+
 #[cfg(feature = "v16")]
 mod alter;
+#[cfg(feature = "attach")]
+mod attach;
 #[cfg(feature = "v16")]
 mod cte;
 #[cfg(feature = "foreign_keys")]
@@ -105,11 +128,26 @@ pub struct Config {
     /// The wall clock (v0.16): a caller-supplied function
     /// returning the current Unix time in milliseconds, read by
     /// `DEFAULT CURRENT_TIME` / `CURRENT_DATE` /
-    /// `CURRENT_TIMESTAMP` (at most once per statement). The
-    /// core has no clock of its own; with `None` a statement
-    /// that needs one fails with `Error::NoClock`.
+    /// `CURRENT_TIMESTAMP` (at most once per statement) and, with
+    /// `datetime`, by `'now'` and the `CURRENT_*` keywords in any
+    /// expression (once per statement execution, shared by all of
+    /// them, as the pin's `sqlite3StmtCurrentTime`). The core has
+    /// no clock of its own; with `None` a statement that needs one
+    /// fails with `Error::NoClock`. Under `std`, `Config::default()`
+    /// supplies the system clock (`systime::now_ms`).
     #[cfg(feature = "v04")]
     pub clock: Option<fn() -> i64>,
+    /// The time zone (v0.16, `datetime`): the offset east of UTC,
+    /// in seconds, at an instant given in Unix seconds — what the
+    /// `'localtime'` and `'utc'` modifiers convert by (the pin asks
+    /// `localtime_r`; it does so for instants in 1970..2038 only,
+    /// and so is this hook asked). `None` is UTC. Under `std`,
+    /// `Config::default()` supplies the process's zone
+    /// (`systime::local_offset`, which reads `TZ` as the C library
+    /// does). A hook returning `None` fails the statement with
+    /// `SchemaKind::LocalTimeUnavailable`.
+    #[cfg(feature = "datetime")]
+    pub tz_offset: Option<crate::datetime::TzOffset>,
     /// The `VACUUM INTO 'file'` writer (v0.16, `v16`): called with
     /// the file name as written and the finished database image,
     /// it creates the file and returns `true`, or returns `false`
@@ -206,8 +244,14 @@ impl Default for Config {
             catalog_init: 16 * 1024,
             catalog_max: 256 * 1024,
             nonce_seed: 0x6869_7070_5eed_0001,
-            #[cfg(feature = "v04")]
+            #[cfg(all(feature = "v04", feature = "std"))]
+            clock: Some(crate::systime::now_ms),
+            #[cfg(all(feature = "v04", not(feature = "std")))]
             clock: None,
+            #[cfg(all(feature = "datetime", feature = "std"))]
+            tz_offset: Some(crate::systime::local_offset),
+            #[cfg(all(feature = "datetime", not(feature = "std")))]
+            tz_offset: None,
             #[cfg(all(feature = "v16", feature = "std"))]
             vacuum_into: Some(crate::storage::write_new_file),
             #[cfg(all(feature = "v16", not(feature = "std")))]
@@ -288,6 +332,8 @@ impl Config {
             nonce_seed: 0x6869_7070_5eed_0001,
             #[cfg(feature = "v04")]
             clock: None,
+            #[cfg(feature = "datetime")]
+            tz_offset: None,
             #[cfg(feature = "v16")]
             vacuum_into: None,
             #[cfg(feature = "v16")]
@@ -392,6 +438,20 @@ impl Config {
     #[cfg(feature = "v04")]
     pub fn clock(mut self, now: fn() -> i64) -> Config {
         self.clock = Some(now);
+        self
+    }
+    /// Remove the wall clock (v0.16): statements that need it fail
+    /// with `Error::NoClock` (the `no_std` default).
+    #[cfg(feature = "v04")]
+    pub fn no_clock(mut self) -> Config {
+        self.clock = None;
+        self
+    }
+    /// Supply the time zone (v0.16, `datetime`; see the
+    /// `tz_offset` field). `None` is UTC.
+    #[cfg(feature = "datetime")]
+    pub fn tz_offset(mut self, zone: Option<crate::datetime::TzOffset>) -> Config {
+        self.tz_offset = zone;
         self
     }
     /// Supply the `VACUUM INTO` writer (v0.16, `v16`; see the
@@ -752,6 +812,13 @@ enum Plan {
         /// VALUES row they replace; `temp::TempFeed`).
         feed: Option<Box<temp::TempFeed>>,
     },
+    /// A statement routed to an attached database (v0.16, `attach`;
+    /// `session::attach`).
+    #[cfg(feature = "attach")]
+    Att(Box<attach::AttPlan>),
+    /// `ATTACH` / `DETACH` (v0.16, `attach`).
+    #[cfg(feature = "attach")]
+    Attach(Box<attach::AttachPlan>),
     /// `ALTER TABLE ... RENAME TO / RENAME COLUMN / DROP COLUMN`
     /// (v0.16, `v16`; `session::alter`).
     #[cfg(feature = "v16")]
@@ -1247,6 +1314,22 @@ pub struct Connection<S: Storage> {
     /// (v0.16, `foreign_keys`).
     #[cfg(feature = "foreign_keys")]
     fk: fkey::FkState,
+    /// The attached databases, in attach order (v0.16, `attach`;
+    /// `session::attach`).
+    #[cfg(feature = "attach")]
+    attached: AVec<attach::Attached<S>>,
+    /// This connection is an attached database of another, by this
+    /// name (v0.16, `attach`).
+    #[cfg(feature = "attach")]
+    alias: Option<AVec<u8>>,
+    /// Where ATTACH gets storage (v0.16, `attach`;
+    /// `Connection::set_attach_hook`).
+    #[cfg(feature = "attach")]
+    attach_hook: Option<attach::AttachHook<S>>,
+    /// The tables of other databases the current statement reads
+    /// (v0.16, `attach`; `attach::ExtTab`).
+    #[cfg(feature = "attach")]
+    ext: core::cell::RefCell<AVec<attach::ExtTab>>,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1291,9 +1374,22 @@ impl<S: Storage> Connection<S> {
             trig: trigger::TrigState::default(),
             #[cfg(feature = "foreign_keys")]
             fk: fkey::FkState::default(),
+            #[cfg(feature = "attach")]
+            attached: AVec::new(),
+            #[cfg(feature = "attach")]
+            alias: None,
+            #[cfg(feature = "attach")]
+            attach_hook: None,
+            #[cfg(feature = "attach")]
+            ext: core::cell::RefCell::new(AVec::new()),
         };
         #[cfg(feature = "utf16")]
         conn.set_text_enc(conn.pager.text_enc());
+        #[cfg(feature = "datetime")]
+        {
+            conn.env.clock = conn.cfg.clock;
+            conn.env.tz = conn.cfg.tz_offset;
+        }
         conn.rebuild_catalog().await?;
         Ok(conn)
     }
@@ -1342,6 +1438,9 @@ impl<S: Storage> Connection<S> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
         }
+        // A new statement reads the clock afresh (v0.16, `datetime`).
+        #[cfg(feature = "datetime")]
+        let clock_id = self.env.claim_clock();
         if self.pager.schema_cookie() != self.catalog.cookie {
             self.rebuild_catalog().await?;
         }
@@ -1363,8 +1462,31 @@ impl<S: Storage> Connection<S> {
         // main as the text `MainAs` gives.)
         #[cfg(feature = "v16")]
         let mut main_as = None;
+        // v0.16 (`attach`): a statement naming an attached database
+        // is routed first (`session::attach`); the tables of other
+        // databases the last one read are forgotten.
+        #[cfg(feature = "attach")]
+        if self.alias.is_none() {
+            self.ext.borrow_mut().clear();
+        }
+        #[cfg(feature = "attach")]
+        let (att_plan, temp_route) = match self.route_attach(sql.as_bytes(), &arena)? {
+            None => (None, self.route(sql.as_bytes(), &arena)?),
+            Some(attach::AttRoute::Main) => (None, temp::Route::Main),
+            Some(attach::AttRoute::Temp(r)) => (None, r),
+            Some(attach::AttRoute::On(on)) => {
+                (Some(self.prepare_att(*on).await?), temp::Route::Main)
+            }
+            Some(attach::AttRoute::Nothing) => {
+                (Some(Plan::Maint(maint::Maint::Nothing)), temp::Route::Main)
+            }
+        };
+        #[cfg(all(feature = "v16", not(feature = "attach")))]
+        let temp_route = self.route(sql.as_bytes(), &arena)?;
         #[cfg(feature = "v16")]
-        let routed = match self.route(sql.as_bytes(), &arena)? {
+        let routed = match temp_route {
+            #[cfg(feature = "attach")]
+            temp::Route::Main if att_plan.is_some() => att_plan,
             temp::Route::Main => None,
             temp::Route::MainAs(text) => {
                 main_as = Some(text);
@@ -1393,11 +1515,16 @@ impl<S: Storage> Connection<S> {
         let (ast, plan, binds) = match routed {
             #[cfg(feature = "v16")]
             Some(p) => {
-                let Plan::Temp { sql: t, .. } = &p else {
-                    return Err(Error::Unsupported);
+                let t = match &p {
+                    Plan::Temp { sql: t, .. } => t.as_slice(),
+                    #[cfg(feature = "attach")]
+                    Plan::Att(a) => a.sql.as_slice(),
+                    #[cfg(feature = "attach")]
+                    Plan::Maint(_) => &b"SELECT 1"[..],
+                    _ => return Err(Error::Unsupported),
                 };
                 let (_, table) =
-                    crate::sql::parse_params::<S::Error>(t.as_slice(), &arena, self.cfg.limits())?;
+                    crate::sql::parse_params::<S::Error>(t, &arena, self.cfg.limits())?;
                 let mut values = AVec::new();
                 for _ in 0..table.count {
                     values.push(OwnedValue::Null);
@@ -1416,6 +1543,8 @@ impl<S: Storage> Connection<S> {
         };
         let row_ckpt = arena.checkpoint();
         Ok(Statement {
+            #[cfg(feature = "datetime")]
+            clock_id,
             #[cfg(feature = "params")]
             binds,
             conn: self,
@@ -1734,6 +1863,14 @@ impl<S: Storage> Connection<S> {
                 value,
                 numeric,
             } => self.plan_pragma(arena, *schema, *name, *value, *numeric),
+            // ATTACH / DETACH run on the connection that owns the
+            // attached databases only (v0.16, `attach`).
+            #[cfg(feature = "attach")]
+            Ast::Attach { .. } | Ast::Detach { .. } if self.alias.is_some() || self.is_temp => {
+                Err(Error::Unsupported)
+            }
+            #[cfg(feature = "attach")]
+            Ast::Attach { .. } | Ast::Detach { .. } => self.plan_attach(arena, ast),
             #[cfg(feature = "v16")]
             Ast::AlterRename { .. }
             | Ast::AlterRenameColumn { .. }
@@ -2803,6 +2940,10 @@ impl<S: Storage> Connection<S> {
             crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
             return Ok(names.as_slice().get(k).cloned());
         }
+        #[cfg(feature = "attach")]
+        if sp.ext != 0 {
+            return Ok(self.ext_col(sp.ext, k).map(|c| c.0));
+        }
         #[cfg(feature = "v16")]
         if sp.temp
             && let Some(tc) = self.temp.as_deref()
@@ -2951,6 +3092,10 @@ impl<S: Storage> Connection<S> {
         #[cfg(feature = "v16")]
         {
             src.db = self.db_no();
+        }
+        #[cfg(feature = "attach")]
+        {
+            src.dbname = self.own_dbname();
         }
         sources.push(src);
         let mut offsets = AVec::new();
@@ -3876,6 +4021,15 @@ impl<S: Storage> Connection<S> {
         if self.is_temp { 2 } else { 1 }
     }
 
+    /// The name a three-part name reaches this database's sources by
+    /// besides `main` (v0.16, `attach`): an attached database's alias
+    /// (a view or trigger stored there may write `aux.t.c`, as on the
+    /// pin); empty for main and temp.
+    #[cfg(feature = "attach")]
+    pub(super) fn own_dbname(&self) -> AVec<u8> {
+        self.alias.clone().unwrap_or_default()
+    }
+
     /// Resolve an `INDEXED BY` / `NOT INDEXED` on table `t` (v0.16,
     /// `v16`): the pin's "no such index" (`UnknownIndex`) when `t`
     /// has no index of the name. An index hipp cannot read (an
@@ -4651,6 +4805,15 @@ impl<S: Storage> Connection<S> {
         arena: &Arena,
     ) -> Result<Option<Box<crate::sql::SelectStmt>>, S::Error> {
         let n = handle_bytes(arena, s.table);
+        // A table-valued pragma function's schema qualifier is
+        // ignored, as on the pin (its `schema` argument chooses the
+        // database; v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        if s.schema.is_some() && n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_")) {
+            let mut s2 = s.clone();
+            s2.schema = None;
+            return self.synth_source(&s2, arena);
+        }
         let ca = &self.catalog_arena;
         let exists =
             self.catalog.find_readable(ca, n).is_some() || self.catalog.find_view(ca, n).is_some();
@@ -4757,6 +4920,10 @@ impl<S: Storage> Connection<S> {
         #[cfg(feature = "v16")]
         if s.cte.as_ref().is_some_and(|c| c.view) {
             desc.db = self.db_no();
+            #[cfg(feature = "attach")]
+            {
+                desc.dbname = self.own_dbname();
+            }
         } else if s.derived.is_none() {
             let n = handle_bytes(arena, s.table);
             desc.db = if eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master") {
@@ -4805,6 +4972,8 @@ impl<S: Storage> Connection<S> {
             hint: crate::query::Hint::Any,
             #[cfg(feature = "v16")]
             temp: false,
+            #[cfg(feature = "attach")]
+            ext: 0,
         });
         Ok(w)
     }
@@ -4887,6 +5056,12 @@ impl<S: Storage> Connection<S> {
                 continue;
             }
             let tname = handle_bytes(arena, s.table);
+            // A table of another database (v0.16, `attach`).
+            #[cfg(feature = "attach")]
+            if let Some(k) = self.ext_source(s, arena)? {
+                total += self.plan_ext_source(s, k, arena, descs, plans)?;
+                continue;
+            }
             // A TEMP table read by a main statement (v0.16): an
             // unqualified name is the temp database's first, as on
             // the pin (the router cut a `temp.` and left `main.` in).
@@ -4947,6 +5122,10 @@ impl<S: Storage> Connection<S> {
             {
                 desc.db = self.db_no();
             }
+            #[cfg(feature = "attach")]
+            {
+                desc.dbname = self.own_dbname();
+            }
             desc.schema_table = t.root == 1 && s.alias.is_none();
             // The temp database's schema table answers to its own
             // names only, whatever the FROM clause wrote (v0.16
@@ -4993,6 +5172,8 @@ impl<S: Storage> Connection<S> {
                 hint,
                 #[cfg(feature = "v16")]
                 temp: false,
+                #[cfg(feature = "attach")]
+                ext: 0,
             });
             total += t.columns.len();
         }
@@ -5194,6 +5375,10 @@ impl<S: Storage> Connection<S> {
     /// committed is lost either way. On an error the database stays
     /// as it was (the log kept).
     pub async fn close(mut self) -> Result<(), S::Error> {
+        // The attached databases close first, each as its own
+        // (v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        self.close_attached().await;
         #[cfg(feature = "wal")]
         return self.pager.close_wal().await;
         #[cfg(not(feature = "wal"))]
@@ -5466,6 +5651,10 @@ fn binding_dependent<E>(e: &Error<E>) -> bool {
 }
 
 pub struct Statement<'c, S: Storage> {
+    /// The statement's claim on the connection's clock cache
+    /// (v0.16, `datetime`; `query::Env::claim_clock`).
+    #[cfg(feature = "datetime")]
+    clock_id: u64,
     #[cfg(feature = "params")]
     binds: Binds,
     conn: &'c mut Connection<S>,
@@ -6290,6 +6479,9 @@ impl<'c, S: Storage> Statement<'c, S> {
     ) -> Statement<'c, S> {
         let row_ckpt = arena.checkpoint();
         Statement {
+            // A program's statements share their trigger's instant.
+            #[cfg(feature = "datetime")]
+            clock_id: conn.env.now_owner.get(),
             #[cfg(feature = "params")]
             binds,
             conn,
@@ -6383,6 +6575,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         // only its own.
         #[cfg(feature = "json")]
         let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
+        // The statement's instant (v0.16, `datetime`): kept while
+        // this statement owns the clock cache — from its prepare
+        // (whose plan may read it for a DEFAULT) through its
+        // execution, trigger programs included — and read afresh
+        // once another statement has run in between.
+        #[cfg(feature = "datetime")]
+        self.conn.env.own_clock(self.clock_id);
         #[cfg(feature = "params")]
         if !self.binds.started {
             self.replan().await?;
@@ -6477,6 +6676,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Alter16 { .. } => self.step_alter16().await,
             #[cfg(feature = "v16")]
             Plan::Temp { .. } => self.step_temp().await,
+            #[cfg(feature = "attach")]
+            Plan::Att(_) => self.step_att().await,
+            #[cfg(feature = "attach")]
+            Plan::Attach(_) => self.step_attach().await,
             Plan::CreateTable => self.step_create().await,
             #[cfg(feature = "v16")]
             Plan::CreateTableAs { .. } => self.step_create_as().await,
@@ -6535,6 +6738,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             && !matches!(self.plan, Plan::Temp { .. })
         {
             self.conn.mirror_temp(b"ROLLBACK").await;
+            // ... and every attached database's (v0.16, `attach`).
+            #[cfg(feature = "attach")]
+            if !matches!(self.plan, Plan::Att(_)) {
+                self.conn.mirror_att(b"ROLLBACK").await;
+            }
         }
         // A transaction statement applies to the TEMP database too.
         #[cfg(feature = "v16")]
@@ -6552,7 +6760,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         {
             let sql = copy_vec(handle_bytes(&self.arena, self.sql_text));
             self.conn.mirror_temp(sql.as_slice()).await;
+            #[cfg(feature = "attach")]
+            self.conn.mirror_att(sql.as_slice()).await;
         }
+        // Outside a transaction no attached database is in use
+        // (v0.16, `attach`: DETACH's "database is locked").
+        #[cfg(feature = "attach")]
+        self.conn.att_txn_ended();
         // Keep the connection's catalog in step with the schema
         // cookie after DDL / transaction boundaries, so metadata
         // readers (tables(), indexes()) see the new state without
@@ -6591,6 +6805,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         // The TEMP database plans its own statements.
         #[cfg(feature = "v16")]
         if matches!(self.plan, Plan::Temp { .. }) {
+            self.binds.stale = false;
+            return Ok(());
+        }
+        // An attached database plans its own (v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        if matches!(self.plan, Plan::Att(_)) {
             self.binds.stale = false;
             return Ok(());
         }
@@ -6727,9 +6947,15 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// undone. Bindings may change only while reset.
     #[cfg(feature = "params")]
     pub fn reset(&mut self) {
+        // The next execution reads the clock afresh (v0.16).
+        #[cfg(feature = "datetime")]
+        self.conn.env.release_clock(self.clock_id);
         self.binds.started = false;
         self.binds.stale = true;
         self.phase = Phase::Fresh;
+        // Another database's rows are read again (v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        self.forget_ext_rows();
         self.cursor = None;
         self.row_buf.clear();
         self.current.clear();
@@ -6800,6 +7026,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         // the transaction staying open (v0.16, `foreign_keys`).
         #[cfg(feature = "foreign_keys")]
         self.conn.fk_commit_check()?;
+        // Every database's commit, atomic across their files (v0.16,
+        // `attach`).
+        #[cfg(feature = "attach")]
+        self.conn.commit_all().await?;
         self.conn.pager.drive_commit().await?;
         // Every savepoint ends with the transaction (v0.16, `v16`).
         #[cfg(feature = "v16")]
@@ -6976,7 +7206,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             _ => return Err(Error::Unsupported),
         };
         let rows = self.exec_subplan(&select, &RowData::empty()).await?;
-        let (root, _) = self.conn.pager.alloc_page().await?;
+        let root = alloc_root!(&mut self.conn.pager);
         btree::create_empty_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(b"table", name, name, root, Some(sql.as_slice()))
             .await?;
@@ -7040,7 +7270,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         sql_text: &[u8],
         #[cfg(feature = "v16")] autoinc: bool,
     ) -> Result<(), S::Error> {
-        let (root, _) = self.conn.pager.alloc_page().await?;
+        let root = alloc_root!(&mut self.conn.pager);
         // A WITHOUT ROWID table's B-tree is an index B-tree (v0.16).
         #[cfg(feature = "without_rowid")]
         if create_without_rowid(&self.ast) {
@@ -7068,7 +7298,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .find(&self.conn.catalog_arena, b"sqlite_sequence")
                 .is_none()
         {
-            let (sroot, _) = self.conn.pager.alloc_page().await?;
+            let sroot = alloc_root!(&mut self.conn.pager);
             btree::create_empty_root(&mut self.conn.pager, sroot).await?;
             self.insert_schema_row(
                 b"table",
@@ -7148,7 +7378,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         // Phase 2: one empty index B-tree + schema row per name.
         for auto_name in names.iter() {
-            let (root, _) = self.conn.pager.alloc_page().await?;
+            let root = alloc_root!(&mut self.conn.pager);
             btree::create_empty_index_root(&mut self.conn.pager, root).await?;
             self.insert_schema_row(b"index", auto_name.as_slice(), table, root, None)
                 .await?;
@@ -7216,7 +7446,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let raw = handle_bytes(&self.arena, self.sql_text);
         let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
-        let (root, _) = self.conn.pager.alloc_page().await?;
+        let root = alloc_root!(&mut self.conn.pager);
         btree::create_empty_index_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(
             b"index",
@@ -7378,6 +7608,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Collect first, then free: freeing rewrites the freelist
         // linkage the traversal is not using, but the traversal
         // must see the intact tree.
+        // An auto-vacuum file (v0.16, `autovacuum`): the schema row
+        // first, then the tree, the largest root moving into its slot.
+        #[cfg(feature = "autovacuum")]
+        if self.conn.pager.autovac() {
+            btree::btree_delete(&mut self.conn.pager, 1, schema_rowid).await?;
+            let moved = crate::autovac::drop_tree(&mut self.conn.pager, root).await?;
+            if moved != 0 {
+                crate::autovac::schema_set_root(&mut self.conn.pager, moved, root).await?;
+            }
+            self.conn.pager.bump_schema_cookie();
+            if !self.conn.explicit_txn {
+                self.conn.pager.drive_commit().await?;
+            }
+            return Ok(());
+        }
         let pages = btree::collect_index_pages(&mut self.conn.pager, root).await?;
         for p in pages.iter() {
             self.conn.pager.free_page(*p).await?;
@@ -10355,6 +10600,34 @@ impl<'c, S: Storage> Statement<'c, S> {
         if let Some(n) = &stored {
             self.clear_stat_rows(0, n.as_slice()).await?;
         }
+        // An auto-vacuum file (v0.16, `autovacuum`) drops as the pin
+        // does: the AUTOINCREMENT row and the schema rows first, then
+        // each tree, largest root first, the largest root moving into
+        // a freed slot (its schema row following it).
+        #[cfg(feature = "autovacuum")]
+        if self.conn.pager.autovac() {
+            if let Some((sroot, tname)) = &seq {
+                self.drop_seq_row(*sroot, tname.as_slice()).await?;
+            }
+            for r in schema_rowids.iter() {
+                btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
+            }
+            let mut roots: AVec<u32> = AVec::new();
+            roots.push(root);
+            for ir in index_roots.iter() {
+                if *ir != root {
+                    roots.push(*ir);
+                }
+            }
+            roots.as_mut_slice().sort_unstable_by(|a, b| b.cmp(a));
+            for r in roots.iter() {
+                let moved = crate::autovac::drop_tree(&mut self.conn.pager, *r).await?;
+                if moved != 0 {
+                    crate::autovac::schema_set_root(&mut self.conn.pager, moved, *r).await?;
+                }
+            }
+            return self.drop_table_end().await;
+        }
         let mut pages = btree::collect_table_pages(&mut self.conn.pager, root).await?;
         for ir in index_roots.iter() {
             // A WITHOUT ROWID table's key is the table's tree (v0.16).
@@ -10372,21 +10645,33 @@ impl<'c, S: Storage> Statement<'c, S> {
         for r in schema_rowids.iter() {
             btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
         }
-        if let Some((sroot, tname)) = seq {
-            let mut gone = AVec::new();
-            let mut cursor = ScanCursor::new(sroot);
-            let mut buf = AVec::new();
-            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-                let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 1)?;
-                if matches!(values.as_slice().first(), Some(Value::Text(n)) if *n == tname.as_slice())
-                {
-                    gone.push(rowid);
-                }
-            }
-            for r in gone.iter() {
-                btree::btree_delete(&mut self.conn.pager, sroot, *r).await?;
+        if let Some((sroot, tname)) = &seq {
+            self.drop_seq_row(*sroot, tname.as_slice()).await?;
+        }
+        self.drop_table_end().await
+    }
+
+    /// Remove a dropped AUTOINCREMENT table's `sqlite_sequence` row.
+    #[cfg(feature = "v05")]
+    async fn drop_seq_row(&mut self, sroot: u32, tname: &[u8]) -> Result<(), S::Error> {
+        let mut gone = AVec::new();
+        let mut cursor = ScanCursor::new(sroot);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 1)?;
+            if matches!(values.as_slice().first(), Some(Value::Text(n)) if *n == tname) {
+                gone.push(rowid);
             }
         }
+        for r in gone.iter() {
+            btree::btree_delete(&mut self.conn.pager, sroot, *r).await?;
+        }
+        Ok(())
+    }
+
+    /// DROP TABLE's end: the schema cookie, then the commit.
+    #[cfg(feature = "v05")]
+    async fn drop_table_end(&mut self) -> Result<(), S::Error> {
         self.conn.pager.bump_schema_cookie();
         #[cfg(feature = "foreign_keys")]
         {
@@ -12855,6 +13140,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Pragma(p) => p.width(),
             #[cfg(feature = "v16")]
             Plan::Temp { width, .. } => *width,
+            #[cfg(feature = "attach")]
+            Plan::Att(a) => a.width,
             #[cfg(feature = "v07")]
             Plan::Insert { returning, .. } => returning.len(),
             #[cfg(all(feature = "v05", feature = "v07"))]

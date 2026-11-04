@@ -98,7 +98,7 @@ type Boxed<'x, T> = core::pin::Pin<Box<dyn core::future::Future<Output = T> + 'x
 
 /// What one name in a statement refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     /// A table or view read or written.
     Object,
     /// An index named by DROP INDEX.
@@ -106,6 +106,11 @@ enum Kind {
     /// The table qualifier of a column (`q.col`, `q.*`): no
     /// object; a `temp` here is a table or alias called so.
     Qual,
+    /// A table-valued function's name (`FROM f(...)`): no object of
+    /// a database, though a view or trigger may not qualify it with
+    /// another's name (v0.16, `attach`).
+    #[cfg(feature = "attach")]
+    Func,
 }
 
 /// Every table / view name a SELECT reads (handles), and its CTE
@@ -169,6 +174,9 @@ fn from_names(
         match &f.derived {
             Some(d) => select_names(d, out, ctes),
             None if f.args.is_none() => out.push((f.table, Kind::Object)),
+            #[cfg(feature = "attach")]
+            None => out.push((f.table, Kind::Func)),
+            #[cfg(not(feature = "attach"))]
             None => {}
         }
         if let Some(args) = &f.args {
@@ -264,7 +272,7 @@ fn returning_names(items: &[SelectItem], out: &mut AVec<(ABytes, Kind)>, ctes: &
 
 /// The names a statement refers to, the name it creates (with
 /// whether it is an index), and its CTE names.
-fn ast_names(
+pub(super) fn ast_names(
     ast: &Ast,
     out: &mut AVec<(ABytes, Kind)>,
     ctes: &mut AVec<ABytes>,
@@ -372,7 +380,7 @@ fn ast_names(
 }
 
 /// The token whose handle is `h`, by index.
-fn tok_index(toks: &[Token], h: ABytes) -> Option<usize> {
+pub(super) fn tok_index(toks: &[Token], h: ABytes) -> Option<usize> {
     if h.len == 0 {
         return None;
     }
@@ -396,7 +404,7 @@ fn qualifier(toks: &[Token], i: usize, arena: &Arena) -> Option<bool> {
 
 /// The bytes of the `temp.` qualifier before token `i` (its start
 /// to the name's): what the temp database's text leaves out.
-fn qual_cut(toks: &[Token], i: usize) -> Option<(usize, usize)> {
+pub(super) fn qual_cut(toks: &[Token], i: usize) -> Option<(usize, usize)> {
     Some((toks.get(i.checked_sub(2)?)?.offset, toks.get(i)?.offset))
 }
 
@@ -404,7 +412,7 @@ fn qual_cut(toks: &[Token], i: usize) -> Option<(usize, usize)> {
 /// (a `temp.` qualifier); an empty `(a, a)` one renames the
 /// `sqlite_temp_schema` / `sqlite_temp_master` token at `a`, bare
 /// or quoted, to `sqlite_schema`.
-fn apply_cuts(src: &[u8], cuts: &mut AVec<(usize, usize)>) -> AVec<u8> {
+pub(super) fn apply_cuts(src: &[u8], cuts: &mut AVec<(usize, usize)>) -> AVec<u8> {
     cuts.as_mut_slice().sort_by_key(|c| c.0);
     let mut out = AVec::new();
     let mut pos = 0usize;
@@ -459,7 +467,7 @@ fn token_end(src: &[u8], a: usize) -> usize {
     e
 }
 
-fn is_temp_schema_name(n: &[u8]) -> bool {
+pub(super) fn is_temp_schema_name(n: &[u8]) -> bool {
     eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master")
 }
 
@@ -513,6 +521,15 @@ impl<S: Storage> Connection<S> {
         );
         let (ast, toks) = match parsed {
             Ok(a) => a,
+            // A TEMP trigger may write a schema-qualified table (the
+            // pin's rule against them is for the other databases'
+            // triggers): hipp runs a trigger program in its own
+            // database only, so that is refused (v0.16 review fix: it
+            // was reported as the pin's error).
+            #[cfg(feature = "triggers")]
+            Err(Error::Schema {
+                kind: SchemaKind::TriggerQualifiedTarget,
+            }) if temp_kw => return Err(Error::Unsupported),
             // The main database's parse reports the error (or the
             // TEMP keyword is not followed by TABLE / VIEW).
             Err(e) if temp_kw => return Err(e),
@@ -535,7 +552,12 @@ impl<S: Storage> Connection<S> {
                 // table, in main (v0.16 review fix: the pin's "no such
                 // table: main.tt" over a temp-only table).
                 if nq == Some(false) && !temp_kw {
-                    if tq == Some(true) {
+                    // Nor may its WHEN clause or body name a `temp.`
+                    // object (v0.16 review fix: only the ON table was
+                    // checked on this path).
+                    if tq == Some(true)
+                        || (0..t.len()).any(|i| qualifier(t, i, arena) == Some(true))
+                    {
                         return Err(Error::Schema {
                             kind: SchemaKind::TriggerTempReference,
                         });
@@ -695,6 +717,10 @@ impl<S: Storage> Connection<S> {
                         && !routed.as_slice().contains(&k)
                 })
             });
+            #[cfg(feature = "attach")]
+            if *kind == Kind::Func {
+                continue;
+            }
             if *kind == Kind::Qual {
                 if let Some(i) = i {
                     col_quals.push(i);
@@ -966,7 +992,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// The temp database's view named so.
-    fn temp_view(&self, name: &[u8]) -> Option<&crate::schema::ViewDef> {
+    pub(super) fn temp_view(&self, name: &[u8]) -> Option<&crate::schema::ViewDef> {
         let c = self.temp.as_deref()?;
         c.catalog.find_view(&c.catalog_arena, name)
     }
@@ -1036,6 +1062,10 @@ impl<S: Storage> Connection<S> {
         select_names(&select, &mut names, &mut ctes);
         let (mut reads_temp, mut reads_main) = (false, false);
         for (h, kind) in names.iter() {
+            #[cfg(feature = "attach")]
+            if *kind == Kind::Func {
+                continue;
+            }
             if *kind == Kind::Qual {
                 continue;
             }
@@ -1171,7 +1201,7 @@ impl<S: Storage> Connection<S> {
     /// The main database may have an object (`index`: an index)
     /// named so: one in its catalog, or a name the planner resolves
     /// itself (`sqlite_*` tables, `pragma_*` functions).
-    fn main_has(&self, name: &[u8], index: bool) -> bool {
+    pub(super) fn main_has(&self, name: &[u8], index: bool) -> bool {
         let ca = &self.catalog_arena;
         let pre = |p: &[u8]| name.get(..p.len()).is_some_and(|h| eq_ci(h, p));
         pre(b"sqlite_")
@@ -1293,7 +1323,7 @@ impl<S: Storage> Connection<S> {
 }
 
 /// Run one statement on the temp database to completion.
-async fn run_temp(c: &mut Connection<MemStorage>, sql: &[u8]) -> Result<(), MemError> {
+pub(super) async fn run_temp(c: &mut Connection<MemStorage>, sql: &[u8]) -> Result<(), MemError> {
     let Ok(text) = core::str::from_utf8(sql) else {
         return Err(Error::Unsupported);
     };
@@ -1490,6 +1520,8 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "expr_index")]
             hint: crate::query::Hint::Any,
             temp: true,
+            #[cfg(feature = "attach")]
+            ext: 0,
         });
         Ok(t.columns.len())
     }
@@ -1504,6 +1536,11 @@ impl<S: Storage> Statement<'_, S> {
         &mut self,
         sp: &super::SourcePlan,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        // Another database's table (v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        if sp.ext != 0 {
+            return self.scan_ext(sp).await;
+        }
         let Some(tc) = self.conn.temp.as_deref_mut() else {
             return Err(Error::Schema {
                 kind: SchemaKind::UnknownTable,
@@ -1555,7 +1592,7 @@ impl<S: Storage> Connection<S> {
     /// leading WITH, or a `CREATE TEMP TABLE x AS SELECT ...`. The
     /// SELECT is the text after the target (its own WITH included);
     /// the temp half is the INSERT with a `VALUES` row in its place.
-    fn fed_route(
+    pub(super) fn fed_route(
         &self,
         ast: &Ast,
         text: &AVec<u8>,

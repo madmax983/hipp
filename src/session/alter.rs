@@ -681,6 +681,8 @@ impl<S: Storage> Connection<S> {
                         args: None,
                         qualified: false,
                         in_temp: false,
+                        #[cfg(feature = "attach")]
+                        schema: None,
                         cte: None,
                         indexed: None,
                     });

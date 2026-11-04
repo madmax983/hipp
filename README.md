@@ -412,9 +412,10 @@ aspirations.
   expression (`?`, `''`); a new rowid past 9223372036854775807
   takes an unused one. Gaps: whole-database ANALYZE row order (the
   pin's schema hash), VACUUM of a file with an expression or
-  partial index without `expr_index`, VACUUM of an auto-vacuum file (refused: hipp
-  writes no pointer maps; kept by the honest-gap sweep, which also
-  refuses every other write to such a file) (STATUS.md).
+  partial index without `expr_index`, VACUUM of an auto-vacuum file
+  without the `autovacuum` leaf (refused: no pointer-map upkeep; the
+  honest-gap sweep refuses every other write to such a file too, and
+  the leaf lifts both) (STATUS.md).
 - **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
   `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
   [COLUMN] a` edit the stored schema texts token by token exactly
@@ -730,16 +731,105 @@ aspirations.
   longer opaque; and statements across the TEMP and main databases
   — main statements reading temp tables, `INSERT INTO temp.x SELECT
   ... FROM main.y` and `CREATE TEMP TABLE x AS SELECT ...` over main,
-  TEMP views over both, pragma functions on temp objects. VACUUM of
-  an auto-vacuum file stays refused (no pointer-map upkeep), and
-  since the review fixes so does every other write to such a file
-  (they used to leave the pin's pointer maps stale). Review fixes
+  TEMP views over both, pragma functions on temp objects. Without
+  the `autovacuum` leaf VACUUM of an auto-vacuum file stays refused
+  (no pointer-map upkeep), and since the review fixes so does every
+  other write to such a file (they used to leave the pin's pointer
+  maps stale); the leaf (below) writes them. Review fixes
   also keep views and triggers stored in main reading main only (a
   temp table no longer shadows their tables), refuse INDEXED BY on a
   trigger body's UPDATE / DELETE as the pin does, ignore the schema
   part of CHECK / partial-index names as the pin does, and tell
   `main.t` from `temp.t` in one statement. Gaps and sizes in
   STATUS.md.
+- **Date and time functions** (leaf `datetime`, in `max`; too big
+  for `full`'s budget). `date()`, `time()`, `datetime()`,
+  `julianday()`, `unixepoch()`, `strftime()` (every conversion the
+  pin knows; `%y` and the other unknown ones are NULL, as on
+  3.54.1), `timediff()` and `CURRENT_DATE` / `CURRENT_TIME` /
+  `CURRENT_TIMESTAMP` in any expression, as a model of the pin's
+  `date.c`: its integer-millisecond Julian day, every time-value
+  form (`YYYY-MM-DD`, `T` or spaces, `HH:MM[:SS[.F]]`, zones,
+  `24:00`, Julian-day and Unix numbers, `'now'`), every modifier
+  in its order and rounding (NNN units with the month / year
+  overflow rules, `+/-YYYY-MM-DD HH:MM`, `start of` / 3.54's `end
+  of`, `weekday N` and 3.54's backward `weekday -N`, `unixepoch`,
+  `julianday`, `auto`, `localtime`, `utc`, `subsec`, `ceiling` /
+  `floor`), byte for byte on a generated corpus in four time zones.
+  `'now'` reads `Config::clock` once per statement execution;
+  `'localtime'` / `'utc'` read the new `Config::tz_offset` hook (UTC
+  without one); under `std` both default to the system clock and
+  the `TZ` zone, read as glibc's `localtime` reads it (TZif files
+  with glibc's checks, leap corrections and footer rules; POSIX TZ
+  strings with its partial-parse results and `posixrules` fallback;
+  no dependency). In a CHECK, index expression or generated column,
+  reading either fails as on the pin. Ungated: the bare keywords are
+  calls, never a table's own "current_date" column (they used to
+  resolve as one), and `current_date()` / `current_date.x` are
+  syntax errors. Review fixes: `'end of month'` in December 9999 or
+  on an invalid value, and `'floor'` after a `24:00` overflow, now
+  match the pin. Without the leaf the functions stay unknown.
+- **ATTACH / DETACH and several databases** (leaf `attach`, in
+  `max`). `ATTACH [DATABASE] expr AS expr [KEY expr]` (a file,
+  `':memory:'`, `''` / NULL for a private temporary database) and
+  `DETACH [DATABASE] expr` with the pin's limit of 10 and its
+  errors (already in use, cannot detach main / temp, no such
+  database, database is locked inside a transaction that used it,
+  the encoding rule; bound parameters as operands);
+  `PRAGMA database_list`, schema-qualified names (`aux.t`,
+  `aux.t.col`, `aux.sqlite_schema`, `PRAGMA aux.x`, `VACUUM aux
+  [INTO]`, `REINDEX` / `ANALYZE` / `ALTER` / `DROP` / `CREATE TABLE
+  / INDEX / VIEW / TRIGGER aux.x`; a plain `ANALYZE` / `REINDEX`
+  covers every database; views and triggers keep to their own
+  database, WHEN clauses included) and the pin's unqualified-name
+  order (temp, main, then attached in attach order). Not yet: TEMP
+  triggers on main or attached tables, or writing schema-qualified
+  tables (refused cleanly), and index access paths into another
+  database's tables (they are read whole, once per execution). Each attached
+  database is a connection of its own owned by the main one — the
+  TEMP database's model made N-ary — so every feature works inside
+  it; statements across databases (joins, subqueries, compounds,
+  `INSERT INTO aux.t SELECT ... FROM main.t` both ways, UPDATE /
+  DELETE reading other databases, `UPDATE ... FROM`, CREATE TABLE
+  ... AS) read the other databases' tables as external sources.
+  One transaction spans every database, savepoints included; a
+  rollback-journal commit of several files is atomic through the
+  pin's super-journal (`<main>-mjXXXXXX9XX`, the journal-tail
+  pointer), and hot-journal recovery honours it — crash-tested at
+  every write boundary, with the real pin recovering hipp's crashed
+  files and hipp recovering the pin's. `no_std` callers supply an
+  attached name's storage through `Connection::set_attach_hook`;
+  `FileStorage` opens files. hipp-cli gains `.databases`.
+- **Auto-vacuum files** (leaf `autovacuum`, in `max`). Files with
+  pointer maps are written as the pin writes them: every entry
+  (ROOTPAGE, FREEPAGE, OVERFLOW1, OVERFLOW2, BTREE) on the pin's
+  pointer-map pages at every page size, derived from the trees and
+  the freelist at each commit so every write path keeps them right;
+  CREATE TABLE / INDEX put the root after the largest root, moving
+  the page there out of the way; DROP TABLE / INDEX move the largest
+  root into the freed slot and rewrite its `sqlite_schema.rootpage`;
+  `auto_vacuum = FULL` moves pages from the end into the free pages
+  and truncates at every commit (the pin's `autoVacuumCommit`);
+  `INCREMENTAL` keeps them for `PRAGMA incremental_vacuum[(N)]` (the
+  pin's argument rules, one empty row per page). `PRAGMA
+  auto_vacuum` sets the mode of an empty database (writing its
+  header at once, the mode surviving a ROLLBACK as on the pin),
+  switches FULL and INCREMENTAL in place, and leaves a change to or
+  from NONE to VACUUM, which (VACUUM INTO too) otherwise keeps the
+  mode. The moves this leaf owns — root placement, DROP, FULL's
+  commit, incremental_vacuum — choose the pin's pages, so given the
+  same tree shapes the root pages, page counts and pointer maps are
+  the pin's; where hipp's general B-tree shapes trees differently
+  (delete merging, index splits, ALTER, UPDATE resizing rows,
+  REINDEX) page counts can differ, with the same contents and valid
+  maps. Each engine writes the other's files (attached ones too),
+  integrity checks pass both ways (inside a transaction as well),
+  and crashes during the page moves or incremental_vacuum recover
+  (in hipp and in the pin) to the last commit. As on the pin, pages
+  cut off the end get no journal record: the file is truncated only
+  after the journal is deleted. Ungated: freelist trunks hold the
+  pin's `usable/4 - 8` leaves. Without the leaf such files stay
+  read only (`AutoVacuumUnsupported`).
 
 ## What v0.13 does
 
@@ -1040,7 +1130,8 @@ and `cargo test --workspace`.
 A std binary shell (`hipp-cli/`, decision D4): interactive,
 stdin-batch and one-shot modes with list-format output
 byte-diffable against the pinned oracle CLI, plus `.tables`,
-`.schema`, `.dump`, `.open`, `.parameter` (v0.16: `set`,
+`.schema`, `.dump`, `.open`, `.databases` (v0.16, with attached
+databases in `.schema` / `.tables`), `.parameter` (v0.16: `set`,
 `unset`, `clear`, `list`, `init`, bound by name as the oracle
 shell binds them), `.exit`. Its first job is
 differential testing. It is a separate crate and contributes
@@ -1059,9 +1150,12 @@ indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABL
 stored but never executed (all of these in the tiny profile: the
 `v04` ... `v16` rungs add them — views execute with `v16`), no
 UTF-16 databases without the `utf16` leaf (refused at open), no
-writes to auto-vacuum files (read only: hipp keeps no pointer-map
-pages, so writes are refused with `AutoVacuumUnsupported` until
-`PRAGMA auto_vacuum = NONE; VACUUM` converts the file), no multi-process
+writes to auto-vacuum files without the `autovacuum` leaf (read
+only: writes are refused with `AutoVacuumUnsupported` until `PRAGMA
+auto_vacuum = NONE; VACUUM` converts the file; with it they are
+written, pointer maps kept), no
+ATTACH without the `attach` leaf (refused; with it, one file is
+attached once — hipp has no shared page cache), no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 
@@ -1090,6 +1184,9 @@ OLD. binder), `wr` (WITHOUT ROWID trees behind the rowid-shaped
 B-tree interface, feature `without_rowid`, v0.16), `utf16`
 (UTF-16 text conversions and the record translation of UTF-16
 files, feature `utf16`, v0.16),
+`datetime` (the date and time functions, feature `datetime`,
+v0.16), `autovac` (auto-vacuum pointer maps and page moves,
+feature `autovacuum`, v0.16), `systime` (the host clock and time zone, feature `std`),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

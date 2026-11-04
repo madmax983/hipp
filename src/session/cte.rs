@@ -222,6 +222,8 @@ impl<S: Storage> Connection<S> {
             args: None,
             qualified: true,
             in_temp: false,
+            #[cfg(feature = "attach")]
+            schema: None,
             cte: None,
             indexed: None,
         };
@@ -1643,6 +1645,8 @@ impl<S: Storage> Connection<S> {
             hint: crate::query::Hint::Any,
             #[cfg(feature = "v16")]
             temp: false,
+            #[cfg(feature = "attach")]
+            ext: 0,
         });
         Ok(w)
     }

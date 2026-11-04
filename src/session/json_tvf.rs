@@ -107,6 +107,8 @@ impl<S: Storage> Connection<S> {
             hint: crate::query::Hint::Any,
             #[cfg(feature = "v16")]
             temp: false,
+            #[cfg(feature = "attach")]
+            ext: 0,
         });
         Ok(w)
     }

@@ -41,6 +41,9 @@ pub(super) enum Prag {
     ForeignKeys,
     FreelistCount,
     IgnoreCheckConstraints,
+    /// `incremental_vacuum [(N)]` (v0.16, `autovacuum`).
+    #[cfg(feature = "autovacuum")]
+    IncrementalVacuum,
     IndexInfo,
     IndexList,
     IndexXinfo,
@@ -80,6 +83,8 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("foreign_keys", Prag::ForeignKeys),
     ("freelist_count", Prag::FreelistCount),
     ("ignore_check_constraints", Prag::IgnoreCheckConstraints),
+    #[cfg(feature = "autovacuum")]
+    ("incremental_vacuum", Prag::IncrementalVacuum),
     ("index_info", Prag::IndexInfo),
     ("index_list", Prag::IndexList),
     ("index_xinfo", Prag::IndexXinfo),
@@ -140,6 +145,25 @@ pub(super) fn lookup<E>(name: &[u8]) -> Result<Option<Prag>, E> {
 }
 
 impl Prag {
+    /// Answered without reading a page of the database (v0.16,
+    /// `attach`): `PRAGMA aux.x` of one inside a transaction leaves
+    /// DETACH free, as on the pin.
+    #[cfg(feature = "attach")]
+    pub(super) fn no_lock(self) -> bool {
+        #[cfg(feature = "wal")]
+        if matches!(self, Prag::JournalSizeLimit | Prag::WalCheckpoint) {
+            return true;
+        }
+        matches!(
+            self,
+            Prag::AutoVacuum
+                | Prag::CacheSize
+                | Prag::JournalMode
+                | Prag::PageSize
+                | Prag::Synchronous
+        )
+    }
+
     /// A setting of the connection, not of one database: a
     /// `temp.` (or `main.`) qualifier is ignored, as on the pin.
     pub(super) fn connection_wide(self) -> bool {
@@ -219,6 +243,12 @@ impl Prag {
     }
 
     fn width(self) -> usize {
+        // The pin's `incremental_vacuum` rows have no column (v0.16,
+        // `autovacuum`).
+        #[cfg(feature = "autovacuum")]
+        if self == Prag::IncrementalVacuum {
+            return 0;
+        }
         match self.columns().len() {
             0 => 1,
             n => n,
@@ -227,6 +257,10 @@ impl Prag {
 
     /// No table-valued form on the pin (v0.16).
     fn no_table(self) -> bool {
+        #[cfg(feature = "autovacuum")]
+        if self == Prag::IncrementalVacuum {
+            return true;
+        }
         #[cfg(feature = "wal")]
         if matches!(self, Prag::WalCheckpoint | Prag::WalAutocheckpoint) {
             return true;
@@ -332,7 +366,7 @@ fn push_row(rows: &mut Rows, vals: &[OwnedValue]) {
 }
 
 /// Decimal text of an integer.
-fn dec(mut v: i64, out: &mut AVec<u8>) {
+pub(super) fn dec(mut v: i64, out: &mut AVec<u8>) {
     if v < 0 {
         out.push(b'-');
     }
@@ -587,17 +621,27 @@ impl<S: Storage> Connection<S> {
         numeric: bool,
     ) -> Result<Plan, S::Error> {
         let mut temp = false;
+        // An attached database's name reaches here only for what the
+        // router leaves to main (v0.16, `attach`): a connection-wide
+        // setting, `database_list`.
+        #[cfg(feature = "attach")]
+        let att = schema.is_some_and(|h| self.att_index(handle_bytes(arena, h)).is_some());
+        #[cfg(not(feature = "attach"))]
+        let att = false;
         if let Some(h) = schema {
             let b = handle_bytes(arena, h);
             if eq_ci(b, b"temp") {
                 temp = true;
-            } else if !eq_ci(b, b"main") {
+            } else if !eq_ci(b, b"main") && !att {
                 return Err(Error::Schema {
                     kind: SchemaKind::UnknownDatabase,
                 });
             }
         }
         let prag = lookup::<S::Error>(handle_bytes(arena, name))?;
+        if att && prag.is_some_and(|p| !p.connection_wide() && p != Prag::DatabaseList) {
+            return Err(Error::Unsupported);
+        }
         // hipp has no temp database: a known pragma against it
         // is refused (an unknown one is still ignored).
         if temp && prag.is_some_and(|p| !p.connection_wide()) {
@@ -687,6 +731,11 @@ impl<S: Storage> Connection<S> {
                 i64::from(h.page_count)
             })),
             Prag::FreelistCount => row1(int(i64::from(h.freelist_count))),
+            // The connection's mode (v0.16, `autovacuum`: the pin's
+            // in-memory one, which a ROLLBACK keeps).
+            #[cfg(feature = "autovacuum")]
+            Prag::AutoVacuum => row1(int(i64::from(self.pager.av_mode()))),
+            #[cfg(not(feature = "autovacuum"))]
             Prag::AutoVacuum => row1(int(i64::from(h.auto_vacuum))),
             Prag::Encoding => row1(text(match self.pager.text_enc() {
                 crate::record::TextEnc::Utf8 => b"UTF-8",
@@ -720,6 +769,9 @@ impl<S: Storage> Connection<S> {
             // A checkpoint is run by the statement (`step_pragma`).
             #[cfg(feature = "wal")]
             Prag::WalCheckpoint => return Err(Error::Unsupported),
+            // Run by the statement (`run_pragma`).
+            #[cfg(feature = "autovacuum")]
+            Prag::IncrementalVacuum => return Err(Error::Unsupported),
             Prag::CacheSize => row1(int(self.cfg.cache_pages as i64)),
             Prag::BusyTimeout => row1(int(i64::from(self.prag.busy_timeout))),
             Prag::ForeignKeys => row1(int(i64::from(self.prag.foreign_keys))),
@@ -751,6 +803,19 @@ impl<S: Storage> Connection<S> {
                 );
                 if self.temp.is_some() {
                     push_row(&mut rows, &[int(1), text(b"temp"), text(b"")]);
+                }
+                // The attached databases, numbered from 2 (v0.16,
+                // `attach`).
+                #[cfg(feature = "attach")]
+                for (i, a) in self.attached.iter().enumerate() {
+                    push_row(
+                        &mut rows,
+                        &[
+                            int(i as i64 + 2),
+                            text(a.name.as_slice()),
+                            text(a.conn.pager.storage().file_name()),
+                        ],
+                    );
                 }
                 rows
             }
@@ -808,10 +873,16 @@ impl<S: Storage> Connection<S> {
                     if arg.is_some_and(|a| !eq_ci(a, name)) {
                         continue;
                     }
+                    // An attached database lists itself by its name
+                    // (v0.16, `attach`).
+                    #[cfg(feature = "attach")]
+                    let label = self.schema_label();
+                    #[cfg(not(feature = "attach"))]
+                    let label = b"main";
                     push_row(
                         &mut rows,
                         &[
-                            text(b"main"),
+                            text(label),
                             text(shown),
                             text(ty),
                             int(ncol as i64),
@@ -820,10 +891,12 @@ impl<S: Storage> Connection<S> {
                         ],
                     );
                 }
+                #[cfg(feature = "attach")]
+                let main_only = p.main_only || self.alias.is_some();
+                #[cfg(not(feature = "attach"))]
+                let main_only = p.main_only;
                 // The TEMP database's objects (v0.16), as `temp`.
-                if !p.main_only
-                    && let Some(tc) = &self.temp
-                {
+                if !main_only && let Some(tc) = &self.temp {
                     let tp = PragmaPlan {
                         prag: Some(Prag::TableList),
                         arg: p.arg.clone(),
@@ -843,7 +916,7 @@ impl<S: Storage> Connection<S> {
                         rows.push(r);
                     }
                 }
-                if !p.main_only && arg.is_none_or(|a| eq_ci(a, b"sqlite_temp_master")) {
+                if !main_only && arg.is_none_or(|a| eq_ci(a, b"sqlite_temp_master")) {
                     push_row(
                         &mut rows,
                         &[
@@ -855,6 +928,25 @@ impl<S: Storage> Connection<S> {
                             int(0),
                         ],
                     );
+                }
+                // Then each attached database's, under its name (v0.16,
+                // `attach`).
+                #[cfg(feature = "attach")]
+                if !main_only {
+                    let ap = PragmaPlan {
+                        prag: Some(Prag::TableList),
+                        arg: p.arg.clone(),
+                        numeric: false,
+                        main_only: true,
+                    };
+                    for a in self.attached.iter() {
+                        if self.explicit_txn {
+                            a.used.set(true);
+                        }
+                        for r in a.conn.pragma_rows(arena, &ap)?.iter() {
+                            rows.push(r.clone());
+                        }
+                    }
                 }
                 rows
             }
@@ -1057,6 +1149,11 @@ impl<S: Storage> Connection<S> {
                                     .and_then(|r| r.as_slice().get(k))
                             })?;
                             return self.ztype(d, it);
+                        }
+                        #[cfg(feature = "attach")]
+                        if sp.ext != 0 {
+                            let decl = self.ext_col(sp.ext, k)?.1;
+                            return if decl.is_empty() { None } else { Some(decl) };
                         }
                         let (cat, ca) = match self.temp.as_deref() {
                             Some(tc) if sp.temp => (&tc.catalog, &tc.catalog_arena),
@@ -1450,6 +1547,52 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
             .filter(|_| has_schema)
             .cloned()
             .flatten();
+        // An attached database named by the schema argument, or —
+        // without one — holding the object (temp, main, then attached
+        // in order) answers (v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        {
+            let att = match (&schema, &arg) {
+                (Some(s), _) => self.att_index(s.as_slice()),
+                (None, Some(a)) if prag != Prag::TableList && !self.attached.is_empty() => {
+                    let elsewhere = self.temp_has(a.as_slice(), false)
+                        || self.temp_has(a.as_slice(), true)
+                        || self.main_has(a.as_slice(), false)
+                        || self.main_has(a.as_slice(), true)
+                        || self
+                            .catalog
+                            .find_view(&self.catalog_arena, a.as_slice())
+                            .is_some();
+                    if elsewhere {
+                        None
+                    } else {
+                        self.attached.iter().position(|x| {
+                            let ca = &x.conn.catalog_arena;
+                            x.conn.catalog.taken(ca, a.as_slice()).is_some()
+                        })
+                    }
+                }
+                _ => None,
+            };
+            if let Some(i) = att
+                && let Some(x) = self.attached.as_slice().get(i)
+            {
+                // It reads that database: inside a transaction, DETACH
+                // finds it locked (v0.16 review fix).
+                if self.explicit_txn {
+                    x.used.set(true);
+                }
+                let mut a2 = AVec::new();
+                if let Some(a) = args {
+                    for (k, e) in a.iter().enumerate() {
+                        if k < usize::from(has_arg) {
+                            a2.push(e.clone());
+                        }
+                    }
+                }
+                return x.conn.pragma_source(arena, name, Some(&a2));
+            }
+        }
         // A schema other than main: the temp database holds no
         // objects in hipp (`sqlite_temp_schema` is empty), but its
         // header values are not hipp's to report (as for `PRAGMA
@@ -1699,6 +1842,37 @@ impl<S: Storage> Statement<'_, S> {
         self.step_query().await
     }
 
+    /// `PRAGMA auto_vacuum = mode` (v0.16, `autovacuum`), as on the
+    /// pin: the mode is always kept for the next VACUUM; an empty
+    /// database takes it at once (its header written, as the pin's
+    /// pragma creates the file); an auto-vacuum file switches between
+    /// FULL and INCREMENTAL (header offset 64); a change to or from
+    /// NONE otherwise waits for VACUUM.
+    #[cfg(feature = "autovacuum")]
+    async fn set_auto_vacuum(&mut self, want: u8, pristine: bool) -> Result<Rows, S::Error> {
+        let cur = self.conn.pager.av_mode();
+        if !pristine {
+            self.conn.prag.vacuum_autovac = Some(want);
+        }
+        if want == cur {
+            return Ok(AVec::new());
+        }
+        if pristine && want != 0 {
+            crate::autovac::set_mode(&mut self.conn.pager, want).await?;
+        } else if !pristine && want != 0 && cur != 0 {
+            let pager = &mut self.conn.pager;
+            pager.set_header_u32(64, u32::from(want == 2)).await?;
+            pager.set_av_mode(want);
+            pager.header_mut().auto_vacuum = want;
+        } else {
+            return Ok(AVec::new());
+        }
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(AVec::new())
+    }
+
     async fn run_pragma(&mut self) -> Result<Rows, S::Error> {
         let Plan::Pragma(p) = &self.plan else {
             return Err(Error::Unsupported);
@@ -1719,6 +1893,25 @@ impl<S: Storage> Statement<'_, S> {
             return self
                 .wal_checkpoint(p.arg.as_ref().map(|a| a.as_slice()))
                 .await;
+        }
+        // v0.16 (`autovacuum`): one empty row per page removed; a
+        // limit that is not a positive 32-bit integer (or none) is
+        // every page, as the pin reads it (`sqlite3GetInt32`).
+        #[cfg(feature = "autovacuum")]
+        if prag == Prag::IncrementalVacuum {
+            let limit = match p.arg.as_ref().and_then(|a| get_int32(a.as_slice())) {
+                Some(n) if n > 0 => n as u32,
+                _ => i32::MAX as u32,
+            };
+            let steps = crate::autovac::incremental(&mut self.conn.pager, limit).await?;
+            if self.conn.pager.in_txn() && !self.conn.explicit_txn {
+                self.conn.pager.drive_commit().await?;
+            }
+            let mut rows: Rows = AVec::new();
+            for _ in 0..steps {
+                rows.push(AVec::new());
+            }
+            return Ok(rows);
         }
         let Some(arg) = p.arg.as_ref().map(|a| copy_vec(a.as_slice())) else {
             return self.conn.pragma_rows(&self.arena, &p);
@@ -1820,7 +2013,11 @@ impl<S: Storage> Statement<'_, S> {
                         _ => 0,
                     }
                 };
+                #[cfg(feature = "autovacuum")]
+                return self.set_auto_vacuum(want, pristine).await;
+                #[cfg(not(feature = "autovacuum"))]
                 let cur = self.conn.pager.header().auto_vacuum;
+                #[cfg(not(feature = "autovacuum"))]
                 if want == cur || (!pristine && (want == 0 || cur == 0)) {
                     // Unchanged, or (as on the pin) a change that
                     // waits for the next VACUUM.
@@ -1829,7 +2026,7 @@ impl<S: Storage> Statement<'_, S> {
                     }
                     Ok(AVec::new())
                 } else {
-                    // hipp keeps no pointer maps.
+                    // hipp keeps no pointer maps without `autovacuum`.
                     Err(Error::Unsupported)
                 }
             }
@@ -3187,6 +3384,10 @@ async fn bt_check<S: Storage>(
     partial: bool,
     counts: &mut AVec<u64>,
 ) -> Result<(), S::Error> {
+    #[cfg(feature = "autovacuum")]
+    if ck.autovac {
+        crate::autovac::refresh_map(pager).await?;
+    }
     if !partial {
         let (trunk, n) = (pager.header().freelist_trunk, pager.header().freelist_count);
         check_list(ck, pager, true, trunk, n, Pfx::Freelist).await?;

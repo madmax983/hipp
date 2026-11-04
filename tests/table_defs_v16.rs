@@ -569,9 +569,10 @@ fn clock_defaults_read_the_config_hook() {
         let parts: Vec<&str> = want[0].split('|').collect();
         let row = format!("{}|{}|{}|{}!", parts[0], parts[1], parts[2], parts[2]);
         assert_eq!(rows, [row.clone(), row]);
-        // A supplied value needs no clock.
+        // A supplied value needs no clock (`no_clock`: under `std`
+        // the default configuration has the system clock).
         drop(db);
-        let mut db = open(&path).await;
+        let mut db = open_with(&path, Config::default().no_clock()).await;
         exec(&mut db, "INSERT INTO t VALUES (1, 2, 3, 4, 5)").await;
         let e = try_collect(&mut db, "INSERT INTO t(z) VALUES (6)").await;
         assert!(matches!(e, Err(Error::NoClock)), "{e:?}");

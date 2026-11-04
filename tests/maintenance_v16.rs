@@ -952,10 +952,13 @@ fn vacuum_into_expressions() {
     });
 }
 
-/// An auto-vacuum file: VACUUM is refused (hipp writes no pointer
-/// maps, so it cannot rebuild one; the pin keeps auto_vacuum = 1),
-/// leaving the file untouched. `PRAGMA auto_vacuum = 0` first
-/// makes it a plain file, as on the pin.
+/// An auto-vacuum file without the `autovacuum` leaf: VACUUM is
+/// refused (hipp writes no pointer maps, so it cannot rebuild one;
+/// the pin keeps auto_vacuum = 1), leaving the file untouched.
+/// `PRAGMA auto_vacuum = 0` first makes it a plain file, as on the
+/// pin. (With the leaf VACUUM keeps the mode:
+/// tests/autovacuum_v16.rs.)
+#[cfg(not(feature = "autovacuum"))]
 #[test]
 fn vacuum_of_an_auto_vacuum_file() {
     let o = common::temp_db("v16mt-autovac-o");
