@@ -30,8 +30,17 @@ pub enum SchemaKind {
     /// substitution whose column default is itself NULL, and
     /// unconditionally for an upsert DO UPDATE result row.
     NotNullViolation,
-    /// `DROP INDEX` named an index that does not exist (v0.3).
+    /// `DROP INDEX` named an index that does not exist (v0.3);
+    /// v0.16 (`v16`): an `INDEXED BY` naming no index of its table
+    /// (or naming one on a view or CTE) — the pin's "no such
+    /// index". Name one of the table's indexes, or drop the clause.
     UnknownIndex,
+    /// `INDEXED BY` names a partial index the statement's WHERE
+    /// does not imply (v0.16, `expr_index`; the pin's "no query
+    /// solution"). Add the index's WHERE condition to the query, or
+    /// name another index.
+    #[cfg(feature = "expr_index")]
+    NoQuerySolution,
     /// `DROP INDEX` named an index owned by a UNIQUE / PRIMARY KEY
     /// constraint, which SQLite refuses to drop (v0.3).
     DropAutoIndex,
@@ -189,9 +198,22 @@ pub enum SchemaKind {
     /// `changes()`, `total_changes()`, `last_insert_rowid()`,
     /// `sqlite_version()` — in a generated column (v0.16, `v16`;
     /// the pin's "non-deterministic functions prohibited in
-    /// generated columns"). Compute the value on INSERT instead.
+    /// generated columns"; also in an index expression or a partial
+    /// index's WHERE, v0.16 `expr_index`). Compute the value on
+    /// INSERT instead.
     #[cfg(feature = "v16")]
     NonDeterministic,
+    /// A subquery inside an index expression or a partial index's
+    /// WHERE (v0.16, `expr_index`; the pin's "subqueries prohibited
+    /// in index expressions / partial index WHERE clauses"). Index
+    /// a column of this table, or an expression over its columns.
+    #[cfg(feature = "expr_index")]
+    SubqueryInIndex,
+    /// A qualified column (`t.a`) inside an index expression (v0.16,
+    /// `expr_index`; the pin's "the \".\" operator prohibited in
+    /// index expressions"). Name the column bare.
+    #[cfg(feature = "expr_index")]
+    QualifiedIndexColumn,
     /// A string or blob result of 1,000,000,000 bytes or more
     /// (v0.16, `v16`; the pin's default `SQLITE_LIMIT_LENGTH`,
     /// "string or blob too big"): `zeroblob` / `randomblob` past
@@ -420,6 +442,25 @@ pub enum SchemaKind {
     /// "non-text filename"). Name a new or empty file, as text.
     #[cfg(feature = "v16")]
     VacuumTarget,
+    /// `PRAGMA synchronous = ...` inside an explicit transaction
+    /// (v0.16, `v16`; the pin's "Safety level may not be changed
+    /// inside a transaction", raised when the statement is
+    /// prepared). COMMIT or ROLLBACK first.
+    #[cfg(feature = "v16")]
+    SafetyLevelInTransaction,
+    /// `PRAGMA journal_mode = WAL` (or from WAL to another mode)
+    /// inside an explicit transaction that has not written yet
+    /// (v0.16, `wal`; the pin's "cannot change into / out of wal
+    /// mode from within a transaction"). COMMIT or ROLLBACK first.
+    /// (Once the transaction has written, the pin — and hipp —
+    /// leave the mode alone and report the current one.)
+    #[cfg(feature = "wal")]
+    WalModeInTransaction,
+    /// `PRAGMA wal_checkpoint` inside a transaction that has read or
+    /// written the database (v0.16, `wal`; the pin's "database table
+    /// is locked"). COMMIT or ROLLBACK first.
+    #[cfg(feature = "wal")]
+    CheckpointLocked,
     /// `REINDEX x` where `x` names no collation, table or index
     /// (v0.16, `v16`; the pin's "unable to identify the object to
     /// be reindexed"). Name an existing one.
@@ -437,6 +478,12 @@ pub enum SchemaKind {
     /// PRIMARY KEY` (not DESC), or drop the keyword.
     #[cfg(feature = "v16")]
     AutoincrementNotIntegerPk,
+    /// `AUTOINCREMENT` on a WITHOUT ROWID table (v0.16,
+    /// `without_rowid`; the pin's "AUTOINCREMENT not allowed on
+    /// WITHOUT ROWID tables"): such a table has no rowid to count.
+    /// Drop the keyword, or the WITHOUT ROWID option.
+    #[cfg(feature = "without_rowid")]
+    AutoincrementWithoutRowid,
     /// `ALTER TABLE ... RENAME COLUMN` to `rowid`, `oid` or
     /// `_rowid_` (v0.16, `v16`; the pin's "cannot rename to rowid
     /// alias"). Pick another name.
@@ -490,6 +537,12 @@ pub enum SchemaKind {
     /// statements within triggers"). Write the bare name.
     #[cfg(feature = "triggers")]
     TriggerQualifiedTarget,
+    /// `INDEXED BY` / `NOT INDEXED` on an UPDATE or DELETE inside a
+    /// trigger body (v0.16 review fix, `triggers`; the pin's "the
+    /// INDEXED BY clause is not allowed on UPDATE or DELETE
+    /// statements within triggers"). Drop the clause.
+    #[cfg(feature = "triggers")]
+    TriggerIndexedTarget,
     /// A `table.*` item in a RETURNING list (v0.16 review fix,
     /// ungated; the pin's "RETURNING may not use \"TABLE.*\"
     /// wildcards"). Write `*` or name the columns.
@@ -541,6 +594,57 @@ pub enum SchemaKind {
     /// view"). Drop the ON CONFLICT clause.
     #[cfg(feature = "triggers")]
     UpsertView,
+    /// A JSON argument that is neither JSON text (RFC 8259 or
+    /// JSON5) nor JSONB, or JSONB whose contents do not decode
+    /// (v0.16, `json`; the pin's "malformed JSON"). Pass valid
+    /// JSON, or check it first with `json_valid()`.
+    #[cfg(feature = "json")]
+    JsonMalformed,
+    /// A JSON path that does not start with `$` or does not parse
+    /// (v0.16, `json`; the pin's "bad JSON path: ..."). Write
+    /// `$`, then `.key`, `."quoted key"`, `[N]` or `[#-N]` steps.
+    #[cfg(feature = "json")]
+    JsonBadPath,
+    /// A JSON path walked more than 1000 steps deep (v0.16,
+    /// `json`; the pin's "JSON path too deep"). Use a shorter path.
+    #[cfg(feature = "json")]
+    JsonPathTooDeep,
+    /// JSON rendered or merged more than 1000 levels deep (v0.16,
+    /// `json`; the pin's "JSON nested too deep"). Nest less deeply.
+    #[cfg(feature = "json")]
+    JsonNestedTooDeep,
+    /// A BLOB that is not JSONB given as a JSON value (v0.16,
+    /// `json`; the pin's "JSON cannot hold BLOB values"). Encode it
+    /// first, e.g. with `hex()`.
+    #[cfg(feature = "json")]
+    JsonBlobValue,
+    /// `json_object()` / `jsonb_object()` with an odd number of
+    /// arguments (v0.16, `json`; the pin's "json_object() requires
+    /// an even number of arguments"). Pass label / value pairs.
+    #[cfg(feature = "json")]
+    JsonObjectOddArgs,
+    /// A `json_object()` label that is not TEXT (v0.16, `json`;
+    /// the pin's "json_object() labels must be TEXT"). Cast the
+    /// label to TEXT.
+    #[cfg(feature = "json")]
+    JsonObjectLabel,
+    /// `json_insert()` / `json_replace()` / `json_set()` /
+    /// `json_array_insert()` (or a `jsonb_` form) with an even
+    /// number of arguments (v0.16, `json`; the pin's "json_set()
+    /// needs an odd number of arguments"). Pass the JSON, then
+    /// path / value pairs.
+    #[cfg(feature = "json")]
+    JsonOddArgs,
+    /// `json_valid(X, FLAGS)` with FLAGS outside 1..=15 (v0.16,
+    /// `json`; the pin's "FLAGS parameter to json_valid() must be
+    /// between 1 and 15").
+    #[cfg(feature = "json")]
+    JsonValidFlags,
+    /// `json_array_insert()` at a path that names an object member
+    /// or the root (v0.16, `json`; the pin's "not an array
+    /// element"). End the path with an array index.
+    #[cfg(feature = "json")]
+    JsonNotArrayElement,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -601,6 +705,20 @@ pub enum ParseKind {
     /// ignoring the clause. Build with feature `v04` (or
     /// `full`), or drop the clause.
     RequiresEvaluator,
+    /// A constraint-level `ON CONFLICT FAIL | IGNORE | REPLACE`
+    /// in a build without the conflict-resolving write path
+    /// (v0.16; below `v07`): hipp cannot resolve the violation as
+    /// the pin would, so it refuses the table instead of ignoring
+    /// the clause. Build with feature `v07` (or `full`), or drop
+    /// the clause (ABORT and ROLLBACK need no feature).
+    #[cfg(not(feature = "v07"))]
+    RequiresConflictResolution,
+    /// Two PRIMARY KEY / UNIQUE constraints on the same columns
+    /// with different `ON CONFLICT` clauses (v0.16, `v07`; the
+    /// pin's "conflicting ON CONFLICT clauses specified"). Give
+    /// them one clause, or drop the repeat.
+    #[cfg(feature = "v07")]
+    ConflictingOnConflict,
     /// `?0`, or `?NNN` past 32766 (v0.16, `params`; the pin's
     /// "variable number must be between ?1 and ?32766"). Number
     /// parameters from ?1 up to ?32766.
@@ -624,6 +742,16 @@ pub enum ParseKind {
     /// specification"). Put the earlier bound first.
     #[cfg(feature = "window")]
     UnsupportedFrame,
+    /// `WITHOUT <name>` with a name other than ROWID (v0.16,
+    /// `without_rowid`; the pin's "unknown table option"). The
+    /// table options are STRICT and WITHOUT ROWID.
+    #[cfg(feature = "without_rowid")]
+    UnknownTableOption,
+    /// A WITHOUT ROWID table with no PRIMARY KEY (v0.16,
+    /// `without_rowid`; the pin's "PRIMARY KEY missing on table
+    /// t"). Declare one: its columns key the table's B-tree.
+    #[cfg(feature = "without_rowid")]
+    PrimaryKeyMissing,
 }
 
 /// The core error type. Generic over the storage error `E`.
@@ -637,10 +765,19 @@ pub enum Error<E> {
     UnsupportedPageSize,
     /// Text encoding 2/3 (UTF-16) — SPEC §3.7.
     UnsupportedEncoding,
-    /// Header read/write version 2 (WAL) — SPEC §3.1.
+    /// Header read/write version 2 (WAL) — SPEC §3.1 — or, v0.16, a
+    /// non-empty `-wal` log beside the database: a build without the
+    /// `wal` leaf cannot read the committed pages a log may hold.
+    /// Build with `wal`, or checkpoint the database with SQLite.
     WalUnsupported,
     /// Reserved-bytes-per-page != 0 on a write path.
     ReservedBytesUnsupported,
+    /// A write to an auto-vacuum database (header offset 52
+    /// non-zero; v0.16 review fix): hipp keeps no pointer-map pages,
+    /// so it reads such a file but never writes it. Convert it
+    /// first with `PRAGMA auto_vacuum = NONE; VACUUM` (hipp or
+    /// SQLite), or write it with SQLite.
+    AutoVacuumUnsupported,
     /// A page's bytes violate the format.
     CorruptPage { page: u32 },
     /// A record's bytes violate the format.
@@ -688,6 +825,14 @@ pub enum Error<E> {
     /// at any time and never returns it.)
     #[cfg(feature = "params")]
     ResetRequired,
+    /// Another connection holds the database in WAL mode (v0.16,
+    /// `wal`): a live SQLite connection, which shares its wal-index
+    /// through the `-shm` hipp cannot take part in, or another hipp
+    /// connection (this process's too), whose heap wal-index this one
+    /// would not see. Close the other connection first
+    /// (`Storage::claim_wal` reports it).
+    #[cfg(feature = "wal")]
+    DatabaseBusy,
     /// The caller's storage device error.
     Storage(E),
 }
@@ -709,6 +854,7 @@ impl<E> Error<E> {
             Error::UnsupportedEncoding => Error::UnsupportedEncoding,
             Error::WalUnsupported => Error::WalUnsupported,
             Error::ReservedBytesUnsupported => Error::ReservedBytesUnsupported,
+            Error::AutoVacuumUnsupported => Error::AutoVacuumUnsupported,
             Error::CorruptPage { page } => Error::CorruptPage { page },
             Error::CorruptRecord => Error::CorruptRecord,
             Error::BadVarint => Error::BadVarint,
@@ -728,6 +874,8 @@ impl<E> Error<E> {
             Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
             #[cfg(feature = "params")]
             Error::ResetRequired => Error::ResetRequired,
+            #[cfg(feature = "wal")]
+            Error::DatabaseBusy => Error::DatabaseBusy,
             Error::Storage(e) => Error::Storage(e.into()),
         }
     }
@@ -748,6 +896,7 @@ impl<E> Error<E> {
             Error::UnsupportedEncoding => Error::UnsupportedEncoding,
             Error::WalUnsupported => Error::WalUnsupported,
             Error::ReservedBytesUnsupported => Error::ReservedBytesUnsupported,
+            Error::AutoVacuumUnsupported => Error::AutoVacuumUnsupported,
             Error::CorruptPage { page } => Error::CorruptPage { page },
             Error::CorruptRecord => Error::CorruptRecord,
             Error::BadVarint => Error::BadVarint,
@@ -767,6 +916,8 @@ impl<E> Error<E> {
             Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
             #[cfg(feature = "params")]
             Error::ResetRequired => Error::ResetRequired,
+            #[cfg(feature = "wal")]
+            Error::DatabaseBusy => Error::DatabaseBusy,
         }
     }
 }

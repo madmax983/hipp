@@ -395,7 +395,7 @@ impl<S: Storage> Connection<S> {
         let pk = p.auto_sets.iter().find(|s| s.primary_key);
         let pname_b = handle_bytes(ca, p.name);
         'idx: for ix in self.catalog.indexes_for(ca, pname_b) {
-            if !ix.unique || ix.opaque || ix.columns.len() != n {
+            if !ix.unique || !ix.plain() || ix.columns.len() != n {
                 continue;
             }
             let mut cc = AVec::new();
@@ -924,12 +924,14 @@ async fn parent_found<S: Storage>(
 /// an ON UPDATE action (`tg`, its loaded keys) — any UNIQUE index.
 fn update_replaces(plan: &Plan, tg: Option<&FkTarget>, assigned: &[bool], rowid_set: bool) -> bool {
     let Plan::Update {
-        indexes, conflict, ..
+        indexes, ipk_act, ..
     } = plan
     else {
         return false;
     };
-    if *conflict != ConflictAction::Replace {
+    // v0.16: per constraint (an OR REPLACE makes every one REPLACE).
+    let r = ConflictAction::Replace;
+    if *ipk_act != r && !indexes.iter().any(|ix| ix.unique && ix.act == r) {
         return false;
     }
     let alias = tg.and_then(|t| t.alias);
@@ -939,10 +941,12 @@ fn update_replaces(plan: &Plan, tg: Option<&FkTarget>, assigned: &[bool], rowid_
             .any(|f| f.selfref && modified(f.ccols.as_slice(), assigned, rowid_set, alias))
             || tg.parent.iter().any(|f| f.on_update != 0)
     });
-    rowid_set
+    (rowid_set && *ipk_act == r)
         || indexes.iter().any(|ix| {
             ix.unique
+                && ix.act == r
                 && (all
+                    || ix_reads_any(ix)
                     || ix.cols.iter().any(|c| {
                         c.col
                             .is_some_and(|i| assigned.get(i).copied().unwrap_or(false))
@@ -950,11 +954,22 @@ fn update_replaces(plan: &Plan, tg: Option<&FkTarget>, assigned: &[bool], rowid_
         })
 }
 
+/// An expression or partial index (v0.16, `expr_index`): its key
+/// may read any column, so it counts as changed.
+fn ix_reads_any(ix: &IndexPlan) -> bool {
+    #[cfg(feature = "expr_index")]
+    if ix.ext.is_some() {
+        return true;
+    }
+    let _ = ix;
+    false
+}
+
 /// Whether an INSERT OR REPLACE compiles REPLACE deletions on the
 /// pin: it supplies the rowid, or the table has a UNIQUE index.
 fn insert_replaces(plan: &Plan) -> bool {
     let Plan::Insert {
-        conflict,
+        ipk_act,
         targets,
         rowid_alias,
         indexes,
@@ -963,9 +978,11 @@ fn insert_replaces(plan: &Plan) -> bool {
     else {
         return false;
     };
-    *conflict == ConflictAction::Replace
-        && (indexes.iter().any(|ix| ix.unique)
-            || targets.iter().any(|t| match t {
+    // v0.16: per constraint (an OR REPLACE makes every one REPLACE).
+    let r = ConflictAction::Replace;
+    indexes.iter().any(|ix| ix.unique && ix.act == r)
+        || (*ipk_act == r
+            && targets.iter().any(|t| match t {
                 Target::Rowid => true,
                 Target::Col(i) => Some(*i) == *rowid_alias,
             }))
@@ -979,14 +996,16 @@ fn insert_plan_multi(plan: &Plan) -> bool {
             rows_v,
             rows_r,
             select,
-            conflict,
+            ipk_act,
+            indexes,
             returning,
             ..
         } => {
             select.is_some()
                 || rows_v.len() > 1
                 || rows_r.as_ref().is_some_and(|r| r.len() > 1)
-                || *conflict == ConflictAction::Replace
+                || *ipk_act == ConflictAction::Replace
+                || indexes.iter().any(|ix| ix.act == ConflictAction::Replace)
                 || !returning.is_empty()
         }
         _ => true,
@@ -1408,13 +1427,16 @@ impl<S: Storage> Connection<S> {
                     sets,
                     ncols,
                     rowid_alias,
-                    conflict,
+                    ipk_act,
+                    indexes,
                     ..
                 },
             ) => {
                 let name = copy_vec(handle_bytes(arena, *table));
                 let (a, r) = assigned_columns(sets.as_slice(), *ncols, *rowid_alias);
-                let tg = if *conflict == ConflictAction::Replace {
+                let tg = if *ipk_act == ConflictAction::Replace
+                    || indexes.iter().any(|ix| ix.act == ConflictAction::Replace)
+                {
                     self.fk_target(
                         name.as_slice(),
                         Event::Update(a.as_slice(), r),
@@ -2351,6 +2373,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Box::new(Expr::Column {
                     table: None,
                     name: col(i)?,
+                    schema: None,
                 }),
             );
             filter = Some(match filter {
@@ -2364,6 +2387,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 table,
                 filter,
                 returning: AVec::new(),
+                indexed: None,
             });
         }
         Self::fk_update_ast(f, p, act, new, table, filter, arena)
@@ -2408,6 +2432,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             from: AVec::new(),
             filter,
             returning: AVec::new(),
+            indexed: None,
         })
     }
 

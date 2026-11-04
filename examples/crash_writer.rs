@@ -11,6 +11,13 @@
 //!   wrapper whose ROLLBACK TO reads page images back from the
 //!   journal file's savepoint area; it commits rows 2 and 4.
 //!
+//! - `wal_setup` (v0.16, `wal`): the db + table + first row in WAL
+//!   mode, the connection dropped so its log stays.
+//! - `wal_txn` (v0.16, `wal`): a WAL-mode workload under the kill
+//!   wrapper — an insert, a transaction, a TRUNCATE checkpoint, an
+//!   insert into the restarted log, then `Connection::close`
+//!   (checkpoint, log removed); it commits rows 2, 3 and 4.
+//!
 //! Env `KILL_AT` = mutating-op index at which to die (default:
 //! never). Env `COUNT=1` prints the total mutating-op count to
 //! stderr after a successful insert.
@@ -68,6 +75,14 @@ impl Storage for KillStorage {
             kill: self.kill,
         })
     }
+    #[cfg(feature = "wal")]
+    fn claim_wal(&mut self) -> bool {
+        self.inner.claim_wal()
+    }
+    #[cfg(feature = "wal")]
+    fn release_wal(&mut self) {
+        self.inner.release_wal()
+    }
 }
 
 impl SidecarFile for KillSidecar {
@@ -117,6 +132,46 @@ fn main() {
                 ] {
                     let mut st = db.prepare(sql).await.expect("prep");
                     assert_eq!(st.step().await.expect("step"), Step::Done);
+                }
+            }
+            #[cfg(feature = "wal")]
+            "wal_setup" => {
+                let fs = FileStorage::open(&path).expect("fs");
+                let mut db = Connection::open(fs, Config::default()).await.expect("open");
+                for sql in [
+                    "PRAGMA journal_mode = WAL",
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)",
+                    "INSERT INTO t VALUES (1, 'one')",
+                ] {
+                    let mut st = db.prepare(sql).await.expect("prep");
+                    while st.step().await.expect("step") == Step::Row {}
+                }
+            }
+            #[cfg(feature = "wal")]
+            "wal_txn" => {
+                let n = Rc::new(Cell::new(0));
+                let fs = KillStorage {
+                    inner: FileStorage::open(&path).expect("fs"),
+                    n: n.clone(),
+                    kill,
+                };
+                let mut db = Connection::open(fs, Config::default()).await.expect("open");
+                for sql in [
+                    "PRAGMA wal_autocheckpoint = 0",
+                    "INSERT INTO t VALUES (2, 'two')",
+                    "BEGIN",
+                    "INSERT INTO t VALUES (3, 'three')",
+                    "UPDATE t SET x = x || '!'",
+                    "COMMIT",
+                    "PRAGMA wal_checkpoint(TRUNCATE)",
+                    "INSERT INTO t VALUES (4, 'four')",
+                ] {
+                    let mut st = db.prepare(sql).await.expect("prep");
+                    while st.step().await.expect("step") == Step::Row {}
+                }
+                db.close().await.expect("close");
+                if std::env::var("COUNT").is_ok() {
+                    eprintln!("OPS={}", n.get());
                 }
             }
             "insert" | "savepoint" => {

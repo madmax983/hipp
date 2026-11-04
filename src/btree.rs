@@ -16,7 +16,7 @@ use crate::record::{decode_varint, encode_varint};
 use crate::storage::Storage;
 
 #[cfg(feature = "indexes")]
-use crate::record::{KeyOrder, compare_coll};
+use crate::record::{KeyOrder, compare_coll, compare_coll_in};
 #[cfg(feature = "indexes")]
 use crate::record::{OwnedValue, Value, decode_record, encode_record};
 
@@ -411,7 +411,29 @@ pub async fn assemble_payload_into<S: Storage>(
         }
         next = following;
     }
+    // A UTF-16 database's record reads as UTF-8 above this layer
+    // (v0.16, `utf16`; `utf16::transcode_record`).
+    #[cfg(feature = "utf16")]
+    if let Some(be) = crate::utf16::byte_order(pager.text_enc()) {
+        let raw = core::mem::take(out);
+        crate::utf16::transcode_record::<S::Error>(raw.as_slice(), be, false, out)?;
+    }
     Ok(())
+}
+
+/// The bytes a record is stored as (v0.16, `utf16`): None in a
+/// UTF-8 database (the record itself), else its TEXT values in the
+/// file's UTF-16.
+#[cfg(feature = "utf16")]
+fn stored_record<E>(enc: crate::record::TextEnc, rec: &[u8]) -> Result<Option<AVec<u8>>, E> {
+    match crate::utf16::byte_order(enc) {
+        None => Ok(None),
+        Some(be) => {
+            let mut out = AVec::new();
+            crate::utf16::transcode_record::<E>(rec, be, true, &mut out)?;
+            Ok(Some(out))
+        }
+    }
 }
 
 enum ScanFrame {
@@ -432,6 +454,20 @@ pub struct ScanCursor {
     leaf_cache_page: u32,
     leaf_img: AVec<u8>,
     leaf_meta: AVec<CellMeta>,
+    /// Rows below this rowid are skipped, interior pages descending
+    /// straight to it (v0.16, `expr_index`: a rowid range scan);
+    /// cleared once a row at or past it is reached.
+    #[cfg(feature = "expr_index")]
+    min: Option<i64>,
+    /// The table's root, and — once the first row is asked for and
+    /// the root is a WITHOUT ROWID table's clustered tree (v0.16,
+    /// `without_rowid`) — the cursor over that tree.
+    #[cfg(feature = "without_rowid")]
+    root: u32,
+    #[cfg(feature = "without_rowid")]
+    wr: Option<(usize, alloc::boxed::Box<IndexCursor>)>,
+    #[cfg(feature = "without_rowid")]
+    wr_checked: bool,
 }
 
 impl ScanCursor {
@@ -444,7 +480,24 @@ impl ScanCursor {
             leaf_cache_page: 0,
             leaf_img: AVec::new(),
             leaf_meta: AVec::new(),
+            #[cfg(feature = "expr_index")]
+            min: None,
+            #[cfg(feature = "without_rowid")]
+            root,
+            #[cfg(feature = "without_rowid")]
+            wr: None,
+            #[cfg(feature = "without_rowid")]
+            wr_checked: false,
         }
+    }
+
+    /// A scan starting at the first row whose rowid is `min` or more
+    /// (v0.16, `expr_index`).
+    #[cfg(feature = "expr_index")]
+    pub fn from_rowid(root: u32, min: i64) -> ScanCursor {
+        let mut c = ScanCursor::new(root);
+        c.min = Some(min);
+        c
     }
 
     /// Advance to the next row: (rowid, full payload).
@@ -468,6 +521,29 @@ impl ScanCursor {
     ) -> Result<Option<i64>, S::Error> {
         if self.done {
             return Ok(None);
+        }
+        // A WITHOUT ROWID table (v0.16): its clustered tree in key
+        // order, each row in the table's column order under a
+        // handle standing in for the rowid.
+        #[cfg(feature = "without_rowid")]
+        {
+            if !self.wr_checked {
+                self.wr_checked = true;
+                if let Some(t) = pager.wr.table_of(self.root) {
+                    let cur = crate::wr::clustered_cursor(pager, t);
+                    self.wr = Some((t, alloc::boxed::Box::new(cur)));
+                }
+            }
+            if let Some((t, cur)) = self.wr.as_mut() {
+                // The layouts may have been rebuilt since (a schema
+                // change part-way through the statement).
+                *t = pager.wr.table_of(self.root).ok_or(Error::Unsupported)?;
+                let r = crate::wr::scan_next(pager, *t, cur, buf).await?;
+                if r.is_none() {
+                    self.done = true;
+                }
+                return Ok(r);
+            }
         }
         let usable = pager.usable() as usize;
         loop {
@@ -520,6 +596,18 @@ impl ScanCursor {
                 }
                 let cell = self.leaf_meta.as_slice()[ci];
                 let (rowid, plen, ovf) = (cell.rowid, cell.payload_len, cell.overflow);
+                #[cfg(feature = "expr_index")]
+                if let Some(m) = self.min {
+                    if rowid < m {
+                        if let Some(ScanFrame::Leaf { next_cell, .. }) =
+                            self.stack.as_mut_slice().last_mut()
+                        {
+                            *next_cell = ci + 1;
+                        }
+                        continue;
+                    }
+                    self.min = None;
+                }
                 let local =
                     &self.leaf_img.as_slice()[cell.local_off..cell.local_off + cell.local_len];
                 // Checkpoint progress BEFORE the payload awaits
@@ -540,6 +628,16 @@ impl ScanCursor {
                 _ => unreachable!(),
             };
             let (pairs, rightmost) = interior_cells::<S::Error>(pager.frame_data(idx), page)?;
+            // A rowid range scan's first descent (v0.16): straight to
+            // the child that may hold its first row.
+            #[cfg(feature = "expr_index")]
+            let ci = match self.min {
+                Some(m) if ci == 0 => pairs
+                    .iter()
+                    .position(|(_, k)| *k >= m)
+                    .unwrap_or(pairs.len()),
+                _ => ci,
+            };
             if ci > pairs.len() {
                 self.stack.pop();
                 continue;
@@ -568,6 +666,11 @@ impl ScanCursor {
 /// is taken. Without `v16` such an insert fails.
 #[cfg(feature = "v16")]
 pub async fn new_rowid<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<i64, S::Error> {
+    // A WITHOUT ROWID table's new row (v0.16): a fresh handle.
+    #[cfg(feature = "without_rowid")]
+    if pager.wr.table_of(root).is_some() {
+        return Ok(pager.wr.fresh(root));
+    }
     let max = seek_max_rowid(pager, root).await?;
     if let Some(n) = max.map_or(Some(1), |m| m.checked_add(1)) {
         return Ok(n);
@@ -593,6 +696,12 @@ pub async fn seek_max_rowid<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
 ) -> Result<Option<i64>, S::Error> {
+    // A WITHOUT ROWID table has no rowids (v0.16): its rows take
+    // fresh handles (`new_rowid`).
+    #[cfg(feature = "without_rowid")]
+    if pager.wr.table_of(root).is_some() {
+        return Ok(None);
+    }
     let usable = pager.usable() as usize;
     let mut page = root;
     loop {
@@ -614,43 +723,199 @@ pub async fn seek_max_rowid<S: Storage>(
     }
 }
 
+#[cfg(feature = "expr_index")]
+/// One level of `seek_rowid`.
+enum SeekStep {
+    Child(u32),
+    Missing,
+    Found {
+        local_off: usize,
+        local_len: usize,
+        payload_len: usize,
+        overflow: u32,
+    },
+}
+
+#[cfg(feature = "expr_index")]
+/// The rowid key of table-page cell `i` (and, on a leaf, the
+/// offset just past its varints and its payload length; on an
+/// interior page, its child).
+fn cell_key<E>(
+    bytes: &[u8],
+    h: &PageHead,
+    i: usize,
+    page: u32,
+    leaf: bool,
+) -> Result<(i64, usize, u64), E> {
+    let at = cell_ptr::<E>(bytes, h, i, page)?;
+    if leaf {
+        let c = bytes.get(at..).ok_or(Error::CorruptPage { page })?;
+        let (plen, n1) = decode_varint::<E>(c)?;
+        let (key, n2) = decode_varint::<E>(c.get(n1..).ok_or(Error::CorruptPage { page })?)?;
+        Ok((key as i64, at + n1 + n2, plen))
+    } else {
+        let child = bytes
+            .get(at..at.saturating_add(4))
+            .and_then(|c| <[u8; 4]>::try_from(c).ok())
+            .map(u32::from_be_bytes)
+            .ok_or(Error::CorruptPage { page })?;
+        let (key, _) = decode_varint::<E>(bytes.get(at + 4..).ok_or(Error::CorruptPage { page })?)?;
+        Ok((key as i64, 0, u64::from(child)))
+    }
+}
+
+#[cfg(feature = "expr_index")]
+fn seek_step<E>(bytes: &[u8], page: u32, usable: usize, rowid: i64) -> Result<SeekStep, E> {
+    let h = head::<E>(bytes, page)?;
+    let leaf = h.is_leaf();
+    if h.kind
+        != (if leaf {
+            KIND_LEAF_TABLE
+        } else {
+            KIND_INTERIOR_TABLE
+        })
+    {
+        return Err(Error::Unsupported);
+    }
+    // The first cell whose key is >= rowid.
+    let (mut lo, mut hi) = (0usize, usize::from(h.ncell));
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (k, ..) = cell_key::<E>(bytes, &h, mid, page, leaf)?;
+        if k < rowid {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if !leaf {
+        if lo >= usize::from(h.ncell) {
+            return Ok(SeekStep::Child(h.rightmost));
+        }
+        let (_, _, child) = cell_key::<E>(bytes, &h, lo, page, false)?;
+        return Ok(SeekStep::Child(child as u32));
+    }
+    if lo >= usize::from(h.ncell) {
+        return Ok(SeekStep::Missing);
+    }
+    let (k, start, plen) = cell_key::<E>(bytes, &h, lo, page, true)?;
+    if k != rowid {
+        return Ok(SeekStep::Missing);
+    }
+    let plen = usize::try_from(plen).map_err(|_| Error::CorruptPage { page })?;
+    let local = table_leaf_local(usable, plen);
+    let end = start
+        .checked_add(local)
+        .ok_or(Error::CorruptPage { page })?;
+    let overflow = if plen > local {
+        bytes
+            .get(end..end.saturating_add(4))
+            .and_then(|c| <[u8; 4]>::try_from(c).ok())
+            .map(u32::from_be_bytes)
+            .ok_or(Error::CorruptPage { page })?
+    } else {
+        0
+    };
+    Ok(SeekStep::Found {
+        local_off: start,
+        local_len: local,
+        payload_len: plen,
+        overflow,
+    })
+}
+
 /// Find one row by rowid.
 pub async fn seek_rowid<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
     rowid: i64,
 ) -> Result<Option<AVec<u8>>, S::Error> {
-    let usable = pager.usable() as usize;
-    let mut page = root;
-    loop {
-        let idx = pager.load(page).await?;
-        let snap = copy_bytes(pager.frame_data(idx));
-        let h = head::<S::Error>(snap.as_slice(), page)?;
-        if h.is_leaf() {
-            if h.kind != KIND_LEAF_TABLE {
-                return Err(Error::Unsupported);
+    // A WITHOUT ROWID table (v0.16): the row the handle names.
+    #[cfg(feature = "without_rowid")]
+    if let Some(t) = pager.wr.table_of(root) {
+        return crate::wr::seek(pager, t, rowid).await;
+    }
+    // v0.16 review fix (`expr_index`): index-driven plans seek once
+    // per row they find, so the leaf seeks by binary search.
+    #[cfg(feature = "expr_index")]
+    return seek_rowid_fast(pager, root, rowid).await;
+    #[cfg(not(feature = "expr_index"))]
+    {
+        let usable = pager.usable() as usize;
+        let mut page = root;
+        loop {
+            let idx = pager.load(page).await?;
+            let snap = copy_bytes(pager.frame_data(idx));
+            let h = head::<S::Error>(snap.as_slice(), page)?;
+            if h.is_leaf() {
+                if h.kind != KIND_LEAF_TABLE {
+                    return Err(Error::Unsupported);
+                }
+                let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                for c in cells.iter() {
+                    if c.rowid == rowid {
+                        let local = copy_bytes(c.local_bytes());
+                        return Ok(Some(
+                            assemble_payload(pager, local.as_slice(), c.payload_len, c.overflow)
+                                .await?,
+                        ));
+                    }
+                }
+                return Ok(None);
             }
-            let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
-            for c in cells.iter() {
-                if c.rowid == rowid {
-                    let local = copy_bytes(c.local_bytes());
-                    return Ok(Some(
-                        assemble_payload(pager, local.as_slice(), c.payload_len, c.overflow)
-                            .await?,
-                    ));
+            let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
+            let mut child = rightmost;
+            for (c, k) in pairs.iter() {
+                if rowid <= *k {
+                    child = *c;
+                    break;
                 }
             }
-            return Ok(None);
+            page = child;
         }
-        let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
-        let mut child = rightmost;
-        for (c, k) in pairs.iter() {
-            if rowid <= *k {
-                child = *c;
-                break;
+    }
+}
+/// `seek_rowid` by binary search over the borrowed frame (v0.16
+/// review fix, `expr_index`): no page snapshot and no per-cell parse,
+/// only the found cell's payload copied; the descent depth is bounded,
+/// so a cyclic file errors.
+#[cfg(feature = "expr_index")]
+async fn seek_rowid_fast<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    rowid: i64,
+) -> Result<Option<AVec<u8>>, S::Error> {
+    let usable = pager.usable() as usize;
+    let mut page = root;
+    let mut hops = 0u32;
+    loop {
+        hops = hops.saturating_add(1);
+        if hops > 64 {
+            return Err(Error::CorruptPage { page });
+        }
+        let idx = pager.load(page).await?;
+        let step = seek_step::<S::Error>(pager.frame_data(idx), page, usable, rowid)?;
+        match step {
+            SeekStep::Child(c) => page = c,
+            SeekStep::Missing => return Ok(None),
+            SeekStep::Found {
+                local_off,
+                local_len,
+                payload_len,
+                overflow,
+            } => {
+                let local = {
+                    let d = pager.frame_data(idx);
+                    let end = local_off
+                        .checked_add(local_len)
+                        .ok_or(Error::CorruptPage { page })?;
+                    copy_bytes(d.get(local_off..end).ok_or(Error::CorruptPage { page })?)
+                };
+                return Ok(Some(
+                    assemble_payload(pager, local.as_slice(), payload_len, overflow).await?,
+                ));
             }
         }
-        page = child;
     }
 }
 
@@ -744,6 +1009,16 @@ pub async fn btree_insert<S: Storage>(
     rowid: i64,
     payload: &[u8],
 ) -> Result<(), S::Error> {
+    // A WITHOUT ROWID table (v0.16): the handle's row becomes
+    // `payload`, stored in the clustered tree under its key.
+    #[cfg(feature = "without_rowid")]
+    if let Some(t) = pager.wr.table_of(root) {
+        return crate::wr::put(pager, t, rowid, payload).await;
+    }
+    #[cfg(feature = "utf16")]
+    let conv = stored_record::<S::Error>(pager.text_enc(), payload)?;
+    #[cfg(feature = "utf16")]
+    let payload = conv.as_ref().map_or(payload, |c| c.as_slice());
     let usable = pager.usable() as usize;
     let page_size = pager.page_size() as usize;
     // ---- descent, remembering (interior page, child index) ----
@@ -892,18 +1167,30 @@ pub async fn btree_insert<S: Storage>(
         if groups.iter().any(|g| leaf_need(g.as_slice(), 0) > usable) {
             groups = greedy_leaf_groups(all.as_slice(), usable);
         }
-        if groups.len() != 2 {
+        // Usually two children; three when a cell of nearly a page
+        // lands between two halves of a full leaf (the greedy
+        // groups; the pin's balance_deeper then splits as well).
+        let n = groups.len();
+        if n < 2 {
             return Err(Error::Unsupported);
         }
-        let divider = groups.as_slice()[0].as_slice()[groups.as_slice()[0].len() - 1].rowid;
-        let (lp, _) = pager.alloc_page().await?;
-        let (rp, _) = pager.alloc_page().await?;
-        write_leaf_page(pager, lp, groups.as_slice()[0].as_slice(), true).await?;
-        write_leaf_page(pager, rp, groups.as_slice()[1].as_slice(), true).await?;
+        let mut pairs: AVec<(u32, i64)> = AVec::new();
+        let mut right = 0u32;
+        for (i, g) in groups.iter().enumerate() {
+            let Some(last) = g.as_slice().last() else {
+                return Err(Error::Unsupported);
+            };
+            let (pg, _) = pager.alloc_page().await?;
+            write_leaf_page(pager, pg, g.as_slice(), true).await?;
+            if i + 1 < n {
+                pairs.push((pg, last.rowid));
+            } else {
+                right = pg;
+            }
+        }
         let idx = pager.dirty_page(root).await?;
         let base = copy_bytes(pager.frame_data(idx));
-        let pairs = [(lp, divider)];
-        let img = build_interior_image(root, page_size, &pairs, rp, base.as_slice());
+        let img = build_interior_image(root, page_size, pairs.as_slice(), right, base.as_slice());
         set_page_image(pager, root, img.as_slice()).await?;
         return Ok(());
     }
@@ -1135,7 +1422,6 @@ async fn cascade_table_up<S: Storage>(
             return ins_root_table_interior(pager, root, pairs, rightmost).await;
         }
         let pos = path
-            .as_slice()
             .iter()
             .position(|(p, _)| *p == page)
             .ok_or(Error::Unsupported)?;
@@ -1266,10 +1552,10 @@ async fn ins_balance_table_leaf_window<S: Storage>(
         groups = greedy_leaf_groups(all.as_slice(), usable);
     }
     let n_new = groups.len();
-    // Write the window pages (allocating one extra at the end of
+    // Write the window pages (allocating extra ones at the end of
     // the window when the balance grows), free any excess.
     let mut pages_out: AVec<u32> = window_pages.clone();
-    if n_new > window_pages.len() {
+    while pages_out.len() < n_new {
         let (np, _) = pager.alloc_page().await?;
         pages_out.push(np);
     }
@@ -1397,7 +1683,7 @@ async fn ins_balance_table_interior_window<S: Storage>(
     }
     let n_new = groups.len();
     let mut pages_out: AVec<u32> = window_pages.clone();
-    if n_new > window_pages.len() {
+    while pages_out.len() < n_new {
         let (np, _) = pager.alloc_page().await?;
         pages_out.push(np);
     }
@@ -2267,6 +2553,99 @@ async fn btree_rebuild_without<S: Storage>(
     Ok(())
 }
 
+/// Overwrite row `rowid` of the table rooted at `root` in place
+/// when its stored payload is exactly `payload.len()` bytes (v0.16,
+/// `wal`): the pin's `btreeOverwriteCell`, which writes (and so
+/// dirties, logging a WAL frame) only the local part and the overflow
+/// pages whose bytes differ. `Ok(false)`: no such row, or a payload
+/// of another size, which the caller deletes and inserts. A WITHOUT
+/// ROWID row is only recognised unchanged (`Ok(true)`, nothing
+/// written).
+#[cfg(feature = "wal")]
+pub async fn btree_overwrite<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    rowid: i64,
+    payload: &[u8],
+) -> Result<bool, S::Error> {
+    #[cfg(feature = "without_rowid")]
+    if pager.wr.table_of(root).is_some() {
+        return Ok(seek_rowid(pager, root, rowid)
+            .await?
+            .is_some_and(|b| b.as_slice() == payload));
+    }
+    #[cfg(feature = "utf16")]
+    let conv = stored_record::<S::Error>(pager.text_enc(), payload)?;
+    #[cfg(feature = "utf16")]
+    let payload = conv.as_ref().map_or(payload, |c| c.as_slice());
+    let usable = pager.usable() as usize;
+    let mut page = root;
+    let mut hops = 0u32;
+    let cell = loop {
+        hops = hops.saturating_add(1);
+        if hops > 64 {
+            return Err(Error::CorruptPage { page });
+        }
+        let idx = pager.load(page).await?;
+        let d = pager.frame_data(idx);
+        if head::<S::Error>(d, page)?.is_leaf() {
+            let cells = leaf_cells_meta::<S::Error>(d, page, usable)?;
+            match cells.iter().find(|c| c.rowid == rowid) {
+                Some(c) => break *c,
+                None => return Ok(false),
+            }
+        }
+        let (pairs, rightmost) = interior_cells::<S::Error>(d, page)?;
+        page = pairs
+            .iter()
+            .find(|(_, k)| rowid <= *k)
+            .map_or(rightmost, |(c, _)| *c);
+    };
+    if cell.payload_len != payload.len() || cell.local_len > payload.len() {
+        return Ok(false);
+    }
+    let (local, mut rest) = payload.split_at(cell.local_len);
+    let end = cell
+        .local_off
+        .checked_add(cell.local_len)
+        .ok_or(Error::CorruptPage { page })?;
+    let idx = pager.load(page).await?;
+    if pager.frame_data(idx).get(cell.local_off..end) != Some(local) {
+        let idx = pager.dirty_page(page).await?;
+        pager
+            .frame_data_mut(idx)
+            .get_mut(cell.local_off..end)
+            .ok_or(Error::CorruptPage { page })?
+            .copy_from_slice(local);
+    }
+    let per = usable.checked_sub(4).ok_or(Error::CorruptPage { page })?;
+    let mut ov = cell.overflow;
+    while !rest.is_empty() {
+        if ov == 0 || per == 0 {
+            return Err(Error::CorruptPage { page });
+        }
+        let (chunk, tail) = rest.split_at(rest.len().min(per));
+        let idx = pager.load(ov).await?;
+        let d = pager.frame_data(idx);
+        let next = d
+            .get(..4)
+            .map(|b| be_u32(b, 0))
+            .ok_or(Error::CorruptPage { page: ov })?;
+        let span = 4..4 + chunk.len();
+        if d.get(span.clone()) != Some(chunk) {
+            let idx = pager.dirty_page(ov).await?;
+            pager
+                .frame_data_mut(idx)
+                .get_mut(span)
+                .ok_or(Error::CorruptPage { page: ov })?
+                .copy_from_slice(chunk);
+        }
+        rest = tail;
+        ov = next;
+    }
+    Ok(true)
+}
+
 /// Delete the row `rowid` from the table rooted at `root`.
 /// Returns whether a row was present.
 pub async fn btree_delete<S: Storage>(
@@ -2274,6 +2653,12 @@ pub async fn btree_delete<S: Storage>(
     root: u32,
     rowid: i64,
 ) -> Result<bool, S::Error> {
+    // A WITHOUT ROWID table (v0.16): the handle's row leaves the
+    // clustered tree.
+    #[cfg(feature = "without_rowid")]
+    if let Some(t) = pager.wr.table_of(root) {
+        return crate::wr::delete(pager, t, rowid).await;
+    }
     let usable = pager.usable() as usize;
     // Descent, remembering (interior page, child index) pairs —
     // the balance cascade walks this path back up.
@@ -2420,6 +2805,24 @@ pub fn index_local(usable: usize, payload_len: usize) -> usize {
     if k <= x { k } else { m }
 }
 
+/// A cell takes at least 4 bytes of its page, as on the pin (its
+/// `fillInCell` pads a shorter one with zeros; v0.16: only a WITHOUT
+/// ROWID table's records, with no rowid, are that short). `after` is
+/// what follows the cell on its page, read for the padding bytes.
+#[cfg(any(feature = "indexes", feature = "v05"))]
+#[inline(always)]
+fn pad_cell(img: &mut AVec<u8>, after: &[u8]) {
+    #[cfg(feature = "without_rowid")]
+    {
+        let mut k = 0usize;
+        while img.len() < 4 {
+            img.push(after.get(k).copied().unwrap_or(0));
+            k += 1;
+        }
+    }
+    let _ = (img, after);
+}
+
 /// One parsed index cell (leaf or interior).
 #[cfg(any(feature = "indexes", feature = "v05"))]
 #[derive(Clone)]
@@ -2482,6 +2885,7 @@ fn parse_index_cell<E>(
     }
     let mut img = AVec::with_capacity(total);
     img.extend_from_slice(&bytes[at..at + total]);
+    pad_cell(&mut img, bytes.get(at + total..).unwrap_or(&[]));
     Ok(IndexCell {
         child,
         bytes: img,
@@ -2535,13 +2939,18 @@ fn build_index_image(
     rightmost: u32,
     interior: bool,
     base: &[u8],
-) -> AVec<u8> {
+) -> Option<AVec<u8>> {
+    let hdr_off = if page == 1 { 100 } else { 0 };
+    let hdr_len = if interior { 12 } else { 8 };
+    // A cell list that does not fit the page is a balance bug, never
+    // something to write: refuse it instead of underflowing.
+    if index_page_need(cells, hdr_off, interior) > page_size || base.len() < hdr_off {
+        return None;
+    }
     let mut img = vec_zeroed(page_size);
     if page == 1 {
         img.as_mut_slice()[0..100].copy_from_slice(&base[0..100]);
     }
-    let hdr_off = if page == 1 { 100 } else { 0 };
-    let hdr_len = if interior { 12 } else { 8 };
     let out = img.as_mut_slice();
     let mut content = page_size;
     let mut ptrs = AVec::new();
@@ -2565,7 +2974,7 @@ fn build_index_image(
     for (i, p) in ptrs.iter().enumerate() {
         put_be_u16(out, hdr_off + hdr_len + 2 * i, *p);
     }
-    img
+    Some(img)
 }
 
 #[cfg(feature = "indexes")]
@@ -2596,7 +3005,8 @@ async fn write_index_page<S: Storage>(
         pager.dirty_page(page).await?
     };
     let base = copy_bytes(pager.frame_data(idx));
-    let img = build_index_image(page, page_size, cells, rightmost, interior, base.as_slice());
+    let img = build_index_image(page, page_size, cells, rightmost, interior, base.as_slice())
+        .ok_or(Error::CorruptPage { page })?;
     pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
     Ok(())
 }
@@ -2613,7 +3023,8 @@ pub async fn create_empty_index_root<S: Storage>(
     pager.mark_frame_dirty(idx);
     let base = copy_bytes(pager.frame_data(idx));
     let empty: &[IndexCell] = &[];
-    let img = build_index_image(page, page_size, empty, 0, false, base.as_slice());
+    let img = build_index_image(page, page_size, empty, 0, false, base.as_slice())
+        .ok_or(Error::CorruptPage { page })?;
     pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
     Ok(())
 }
@@ -2636,9 +3047,35 @@ impl IndexEntry {
     }
 }
 
-/// Decode an index key payload (a record of `nfields` values).
+/// How the entries of the index B-tree rooted at `root` decode:
+/// `desc.len() + 1` fields, the last the rowid, or — 0 — every field
+/// of a record with no rowid (v0.16, `without_rowid`: a WITHOUT
+/// ROWID table's clustered tree or one of its secondary indexes,
+/// whose callers pass the tree's full comparison order).
+#[cfg(feature = "indexes")]
+fn entry_fields<S: Storage>(pager: &Pager<S>, root: u32, desc: &[KeyOrder]) -> usize {
+    #[cfg(feature = "without_rowid")]
+    if pager.wr.is_raw(root) {
+        return 0;
+    }
+    let _ = (pager, root);
+    desc.len() + 1
+}
+
+/// Decode an index key payload (a record of `nfields` values; with
+/// `nfields == 0`, a record of any length with no rowid — see
+/// `entry_fields`).
 #[cfg(feature = "indexes")]
 pub fn decode_index_entry<E>(payload: &[u8], nfields: usize) -> Result<IndexEntry, E> {
+    #[cfg(feature = "without_rowid")]
+    if nfields == 0 {
+        let vals = decode_record::<E>(payload, usize::MAX)?;
+        let mut out = AVec::new();
+        for v in vals.iter() {
+            out.push(OwnedValue::from_value(*v));
+        }
+        return Ok(IndexEntry { values: out });
+    }
     let vals = decode_record::<E>(payload, nfields)?;
     if vals.len() != nfields {
         return Err(Error::CorruptRecord);
@@ -2729,7 +3166,8 @@ async fn index_cell_payload<S: Storage>(
 /// Compare two decoded keys field by field under each key
 /// column's collation (v0.16); `desc[j].desc` reverses
 /// column j's comparison (the rowid field, last, is never in
-/// `desc` and always compares ascending). NULL ordering follows
+/// `desc` and always compares ascending), in a database of text
+/// encoding `enc`. NULL ordering follows
 /// `compare_values` (NULL smallest; reversed under DESC, which is
 /// what the oracle does).
 #[cfg(feature = "indexes")]
@@ -2737,11 +3175,12 @@ pub fn compare_entries(
     a: &[OwnedValue],
     b: &[OwnedValue],
     desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for j in 0..a.len().min(b.len()) {
         let o = desc.get(j).copied().unwrap_or_default();
-        let c = compare_coll(&a[j].as_value(), &b[j].as_value(), o.coll);
+        let c = compare_coll_in(&a[j].as_value(), &b[j].as_value(), o.coll, enc);
         let c = if o.desc { c.reverse() } else { c };
         if c != Ordering::Equal {
             return c;
@@ -2766,6 +3205,7 @@ fn recell(child: Option<u32>, source: &IndexCell, source_prefix: usize) -> Index
         }
     }
     bytes.extend_from_slice(&source.bytes.as_slice()[source_prefix..]);
+    pad_cell(&mut bytes, &[]);
     IndexCell {
         child: child.unwrap_or(0),
         payload_off: source.payload_off - source_prefix + if child.is_some() { 4 } else { 0 },
@@ -3138,7 +3578,7 @@ async fn ins_root_index_interior<S: Storage>(
 async fn cascade_index_up<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
-    path: &AVec<(u32, usize)>,
+    path: &[(u32, usize)],
     first: InsUpIdx,
 ) -> Result<(), S::Error> {
     let mut up = first;
@@ -3155,14 +3595,13 @@ async fn cascade_index_up<S: Storage>(
             return ins_root_index_interior(pager, root, cells, rightmost).await;
         }
         let pos = path
-            .as_slice()
             .iter()
             .position(|(p, _)| *p == page)
             .ok_or(Error::Unsupported)?;
         if pos == 0 {
             return Err(Error::Unsupported);
         }
-        let (gp, gtrigger) = path.as_slice()[pos - 1];
+        let (gp, gtrigger) = path[pos - 1];
         up = ins_balance_index_interior_window(pager, gp, gtrigger, page, cells, rightmost).await?;
     }
 }
@@ -3185,7 +3624,12 @@ async fn index_search_pos<S: Storage>(
         let mid = lo + (hi - lo) / 2;
         let p = index_cell_payload(pager, &cells[mid]).await?;
         let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-        match compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) {
+        match compare_entries(
+            probe.values.as_slice(),
+            e.values.as_slice(),
+            desc,
+            pager.text_enc(),
+        ) {
             Ordering::Equal => {
                 return Err(Error::Schema {
                     kind: SchemaKind::DuplicateRowid,
@@ -3204,15 +3648,42 @@ async fn index_search_pos<S: Storage>(
 /// `DuplicateRowid` schema error — they can only arise from an
 /// engine bug, since UNIQUE conflicts are pre-checked by the
 /// session layer on the key columns alone.
-#[cfg(feature = "indexes")]
+#[cfg(feature = "without_rowid")]
 pub async fn index_insert<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
     payload: &[u8],
     desc: &[KeyOrder],
 ) -> Result<(), S::Error> {
+    // A WITHOUT ROWID table's trees (v0.16): its clustered tree
+    // takes its rows through `btree_insert`; a secondary index's
+    // entry trades the rowid for the row's key columns.
+    match pager.wr.view_of(root) {
+        crate::wr::WrView::Pk(_) => return Ok(()),
+        crate::wr::WrView::Sec(i) => {
+            let (raw, orders) = pager.wr.sec_payload::<S::Error>(i, payload)?;
+            return index_insert_core(pager, root, raw.as_slice(), orders.as_slice()).await;
+        }
+        _ => {}
+    }
+    index_insert_core(pager, root, payload, desc).await
+}
+
+/// Without WITHOUT ROWID tables there is nothing to translate.
+#[cfg(all(feature = "indexes", not(feature = "without_rowid")))]
+pub use self::index_insert_core as index_insert;
+
+/// `index_insert` without the WITHOUT ROWID translation: `payload`
+/// is the tree's own record and `desc` its full comparison order.
+#[cfg(feature = "indexes")]
+pub async fn index_insert_core<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    payload: &[u8],
+    desc: &[KeyOrder],
+) -> Result<(), S::Error> {
     let usable = pager.usable() as usize;
-    let nfields = desc.len() + 1;
+    let nfields = entry_fields(pager, root, desc);
     let probe = decode_index_entry::<S::Error>(payload, nfields)?;
     // ---- descent, remembering (interior page, child index) ----
     // The child index counts into the page's children array
@@ -3249,6 +3720,10 @@ pub async fn index_insert<S: Storage>(
     };
 
     // ---- build the new leaf cell (overflow first) ----
+    #[cfg(feature = "utf16")]
+    let conv = stored_record::<S::Error>(pager.text_enc(), payload)?;
+    #[cfg(feature = "utf16")]
+    let payload = conv.as_ref().map_or(payload, |c| c.as_slice());
     let local_len = index_local(usable, payload.len());
     let overflow_head = write_overflow(pager, payload, local_len).await?;
     let mut cell_bytes = AVec::new();
@@ -3261,9 +3736,11 @@ pub async fn index_insert<S: Storage>(
             cell_bytes.push(b);
         }
     }
+    let payload_off = cell_bytes.len() - local_len - if overflow_head != 0 { 4 } else { 0 };
+    pad_cell(&mut cell_bytes, &[]);
     let new_cell = IndexCell {
         child: 0,
-        payload_off: cell_bytes.len() - local_len - if overflow_head != 0 { 4 } else { 0 },
+        payload_off,
         bytes: cell_bytes,
         payload_len: payload.len(),
         local_len,
@@ -3302,7 +3779,7 @@ pub async fn index_insert<S: Storage>(
     }
     let (parent, trigger) = *path.as_slice().last().expect("non-root leaf has a parent");
     let up = ins_balance_index_leaf_window(pager, parent, trigger, leaf_page, all).await?;
-    cascade_index_up(pager, root, &path, up).await
+    cascade_index_up(pager, root, path.as_slice(), up).await
 }
 
 // ----------------------------------------------------------------
@@ -3323,6 +3800,7 @@ fn cmp_entry_probe(
     entry: &[OwnedValue],
     probe: &[KeyPart],
     desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for j in 0..entry.len().min(probe.len()) {
@@ -3330,7 +3808,7 @@ fn cmp_entry_probe(
             KeyPart::Min => return Ordering::Greater,
             KeyPart::Val(v) => {
                 let o = desc.get(j).copied().unwrap_or_default();
-                let c = compare_coll(&entry[j].as_value(), &v.as_value(), o.coll);
+                let c = compare_coll_in(&entry[j].as_value(), &v.as_value(), o.coll, enc);
                 let c = if o.desc { c.reverse() } else { c };
                 if c != Ordering::Equal {
                     return c;
@@ -3347,12 +3825,17 @@ fn cmp_entry_probe(
 /// search ended at (`lwr`: on an ordered page, the first entry
 /// greater than `probe`) and `false`.
 #[cfg(feature = "indexes")]
-fn bin_search(entries: &[IndexEntry], probe: &[KeyPart], desc: &[KeyOrder]) -> (usize, bool) {
+fn bin_search(
+    entries: &[IndexEntry],
+    probe: &[KeyPart],
+    desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
+) -> (usize, bool) {
     let (mut lo, mut hi) = (0usize, entries.len());
     while lo < hi {
         let mid = lo + (hi - 1 - lo) / 2;
         let Some(e) = entries.get(mid) else { break };
-        match cmp_entry_probe(e.values.as_slice(), probe, desc) {
+        match cmp_entry_probe(e.values.as_slice(), probe, desc, enc) {
             core::cmp::Ordering::Less => lo = mid + 1,
             core::cmp::Ordering::Greater => hi = mid,
             core::cmp::Ordering::Equal => return (mid, true),
@@ -3387,6 +3870,14 @@ enum IdxFrame {
 pub struct IndexCursor {
     stack: AVec<IdxFrame>,
     nfields: usize,
+    /// The tree's root (v0.16, `without_rowid`).
+    #[cfg(feature = "without_rowid")]
+    root: u32,
+    /// How entries reach the caller (v0.16, `without_rowid`): a
+    /// cursor over a WITHOUT ROWID table's tree yields
+    /// `key ... handle` entries, as an index of a rowid table does.
+    #[cfg(feature = "without_rowid")]
+    view: crate::wr::WrView,
 }
 
 #[cfg(feature = "indexes")]
@@ -3398,7 +3889,23 @@ impl IndexCursor {
         IndexCursor {
             stack,
             nfields: desc.len() + 1,
+            #[cfg(feature = "without_rowid")]
+            root,
+            #[cfg(feature = "without_rowid")]
+            view: crate::wr::WrView::Unknown,
         }
+    }
+
+    /// A cursor over the whole tree whose entries decode as
+    /// `nfields` says (`entry_fields`), never translated.
+    pub(crate) fn with_fields(root: u32, desc: &[KeyOrder], nfields: usize) -> IndexCursor {
+        let mut c = IndexCursor::new(root, desc);
+        c.nfields = nfields;
+        #[cfg(feature = "without_rowid")]
+        {
+            c.view = crate::wr::WrView::Plain;
+        }
+        c
     }
 
     /// A cursor positioned at the first entry >= `probe` (a full
@@ -3409,6 +3916,20 @@ impl IndexCursor {
         desc: &[KeyOrder],
         probe: &[KeyPart],
     ) -> Result<IndexCursor, S::Error> {
+        // A WITHOUT ROWID table's tree (v0.16): the probe's rowid
+        // part becomes the tree's key-column suffix, and the cursor
+        // translates its entries.
+        #[cfg(feature = "without_rowid")]
+        {
+            let view = pager.wr.view_of(root);
+            if let crate::wr::WrView::Pk(_) | crate::wr::WrView::Sec(_) = view {
+                let (p2, orders) = pager.wr.probe_for(view, probe);
+                let (mut cur, _) =
+                    Self::seek_found(pager, root, orders.as_slice(), p2.as_slice()).await?;
+                cur.view = view;
+                return Ok(cur);
+            }
+        }
         Ok(Self::seek_found(pager, root, desc, probe).await?.0)
     }
 
@@ -3425,8 +3946,8 @@ impl IndexCursor {
         probe: &[KeyPart],
     ) -> Result<(IndexCursor, bool), S::Error> {
         let usable = pager.usable() as usize;
-        let nfields = desc.len() + 1;
-        let mut cur = IndexCursor::new(root, desc);
+        let nfields = entry_fields(pager, root, desc);
+        let mut cur = IndexCursor::with_fields(root, desc, nfields);
         cur.stack.clear();
         let mut page = root;
         loop {
@@ -3443,7 +3964,7 @@ impl IndexCursor {
                     let p = index_cell_payload(pager, c).await?;
                     entries.push(decode_index_entry::<S::Error>(p.as_slice(), nfields)?);
                 }
-                let (pos, found) = bin_search(entries.as_slice(), probe, desc);
+                let (pos, found) = bin_search(entries.as_slice(), probe, desc, pager.text_enc());
                 cur.stack.push(IdxFrame::Leaf { entries, next: pos });
                 return Ok((cur, found));
             }
@@ -3463,7 +3984,7 @@ impl IndexCursor {
             // First divider >= probe (Equal only for a full-key
             // probe: prefix probes pad with Min and can never be
             // Equal to a real entry).
-            let (i, equal) = bin_search(entries.as_slice(), probe, desc);
+            let (i, equal) = bin_search(entries.as_slice(), probe, desc, pager.text_enc());
             if equal {
                 // The divider itself is the lower bound; yield it
                 // next, then continue with its right subtree.
@@ -3531,11 +4052,37 @@ impl IndexCursor {
         })
     }
 
+    /// An entry as the caller sees it (v0.16: a WITHOUT ROWID
+    /// tree's entries translated, `crate::wr`).
+    #[inline(always)]
+    fn yield_entry<S: Storage>(
+        &self,
+        pager: &mut Pager<S>,
+        e: IndexEntry,
+    ) -> Result<Option<IndexEntry>, S::Error> {
+        #[cfg(feature = "without_rowid")]
+        if let crate::wr::WrView::Pk(_) | crate::wr::WrView::Sec(_) = self.view {
+            return Ok(Some(pager.wr.translate::<S::Error>(self.view, e)?));
+        }
+        let _ = pager;
+        Ok(Some(e))
+    }
+
     /// The next entry in key order, if any.
     pub async fn next_entry<S: Storage>(
         &mut self,
         pager: &mut Pager<S>,
     ) -> Result<Option<IndexEntry>, S::Error> {
+        #[cfg(feature = "without_rowid")]
+        {
+            use crate::wr::WrView;
+            if self.view == WrView::Unknown {
+                self.view = pager.wr.view_of(self.root);
+                if self.view != WrView::Plain {
+                    self.nfields = 0;
+                }
+            }
+        }
         loop {
             match self.stack.as_slice().last() {
                 None => return Ok(None),
@@ -3556,7 +4103,7 @@ impl IndexCursor {
                             entries,
                             next: next + 1,
                         });
-                        return Ok(Some(e));
+                        return self.yield_entry(pager, e);
                     }
                     unreachable!()
                 }
@@ -3579,7 +4126,7 @@ impl IndexCursor {
                                 children,
                                 seq: seq + 1,
                             });
-                            return Ok(Some(e));
+                            return self.yield_entry(pager, e);
                         }
                         let child = children.as_slice()[seq / 2];
                         self.stack.push(IdxFrame::Interior {
@@ -3623,6 +4170,13 @@ pub async fn index_prefix_rowids<S: Storage>(
     desc: &[KeyOrder],
     prefix: &[OwnedValue],
 ) -> Result<AVec<i64>, S::Error> {
+    #[cfg(feature = "without_rowid")]
+    {
+        let view = pager.wr.view_of(root);
+        if let crate::wr::WrView::Pk(_) | crate::wr::WrView::Sec(_) = view {
+            return crate::wr::prefix_handles(pager, root, view, prefix).await;
+        }
+    }
     let mut probe: AVec<KeyPart> = AVec::new();
     for v in prefix {
         probe.push(KeyPart::Val(v.clone()));
@@ -3659,8 +4213,29 @@ pub async fn index_check_entry<S: Storage>(
     unique: bool,
 ) -> Result<(bool, bool), S::Error> {
     let mut full: AVec<OwnedValue> = AVec::new();
-    full.extend_from_slice(key);
-    full.push(OwnedValue::Integer(rowid));
+    // A WITHOUT ROWID table's secondary index (v0.16): the entry
+    // ends with the row's key columns, not a rowid.
+    #[cfg(feature = "without_rowid")]
+    let wr_orders;
+    #[cfg(feature = "without_rowid")]
+    let desc = match pager.wr.view_of(root) {
+        crate::wr::WrView::Sec(i) => {
+            let (f, o) = pager.wr.sec_full::<S::Error>(i, key, rowid)?;
+            full = f;
+            wr_orders = o;
+            wr_orders.as_slice()
+        }
+        _ => {
+            full.extend_from_slice(key);
+            full.push(OwnedValue::Integer(rowid));
+            desc
+        }
+    };
+    #[cfg(not(feature = "without_rowid"))]
+    {
+        full.extend_from_slice(key);
+        full.push(OwnedValue::Integer(rowid));
+    }
     // The in-order successor so far: the divider after the child
     // the descent last went left of.
     let mut succ: Option<(u32, usize)> = None;
@@ -3681,7 +4256,7 @@ pub async fn index_check_entry<S: Storage>(
         while lo < hi {
             let mid = lo + (hi - 1 - lo) / 2;
             let rec = index_payload_at(pager, snap.as_slice(), &h, mid, page).await?;
-            match pin_rec_cmp(rec.as_slice(), full.as_slice(), desc) {
+            match pin_rec_cmp(rec.as_slice(), full.as_slice(), desc, pager.text_enc()) {
                 Some(c) if c < 0 => lo = mid + 1,
                 Some(c) if c > 0 => hi = mid,
                 Some(_) => {
@@ -3729,10 +4304,12 @@ pub async fn index_check_entry<S: Storage>(
             // `OP_IdxGT` over the key columns: a key-prefix tie (the
             // pin's `default_rc` -1) or less is a duplicate.
             let dup = match next {
-                Some(rec) => match pin_rec_cmp_from(rec.as_slice(), key, desc, false) {
-                    Some(c) => c <= 0,
-                    None => return Err(Error::CorruptRecord),
-                },
+                Some(rec) => {
+                    match pin_rec_cmp_from(rec.as_slice(), key, desc, false, pager.text_enc()) {
+                        Some(c) => c <= 0,
+                        None => return Err(Error::CorruptRecord),
+                    }
+                }
                 None => false,
             };
             return Ok((true, dup));
@@ -3756,7 +4333,12 @@ pub async fn index_check_entry<S: Storage>(
 /// pin's corruption verdict (`errCode`), which it reports only if
 /// the comparison then reads as equal.
 #[cfg(all(feature = "indexes", feature = "v16"))]
-fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i32> {
+fn pin_rec_cmp(
+    rec: &[u8],
+    probe: &[OwnedValue],
+    desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
+) -> Option<i32> {
     let b = |i: usize| rec.get(i).copied().unwrap_or(0);
     let o0 = desc.first().copied().unwrap_or_default();
     let (r1, r2) = if o0.desc { (1, -1) } else { (-1, 1) };
@@ -3772,13 +4354,16 @@ fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i3
                     } else if *v < lhs {
                         r2
                     } else if probe.len() > 1 {
-                        return pin_rec_cmp_from(rec, probe, desc, true);
+                        return pin_rec_cmp_from(rec, probe, desc, true, enc);
                     } else {
                         0
                     });
                 }
             }
-            Some(OwnedValue::Text(z)) if o0.coll == crate::record::Coll::Binary => {
+            Some(OwnedValue::Text(z))
+                if o0.coll == crate::record::Coll::Binary
+                    && enc == crate::record::TextEnc::Utf8 =>
+            {
                 let (st, _) = rec_varint32(rec, 1);
                 if st < 12 {
                     return Some(r1);
@@ -3798,7 +4383,7 @@ fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i3
                     core::cmp::Ordering::Less => r1,
                     core::cmp::Ordering::Equal => match n.cmp(&z.len()) {
                         core::cmp::Ordering::Equal if probe.len() > 1 => {
-                            return pin_rec_cmp_from(rec, probe, desc, true);
+                            return pin_rec_cmp_from(rec, probe, desc, true, enc);
                         }
                         core::cmp::Ordering::Equal => 0,
                         core::cmp::Ordering::Greater => r2,
@@ -3809,7 +4394,7 @@ fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i3
             _ => {}
         }
     }
-    pin_rec_cmp_from(rec, probe, desc, false)
+    pin_rec_cmp_from(rec, probe, desc, false, enc)
 }
 
 /// `sqlite3VdbeRecordCompareWithSkip` (see `pin_rec_cmp`); `skip`
@@ -3820,8 +4405,9 @@ fn pin_rec_cmp_from(
     probe: &[OwnedValue],
     desc: &[KeyOrder],
     skip: bool,
+    enc: crate::record::TextEnc,
 ) -> Option<i32> {
-    use crate::record::{Coll, Value, compare_coll};
+    use crate::record::{Coll, Value, compare_coll, compare_coll_in};
     let b = |i: usize| rec.get(i).copied().unwrap_or(0);
     let nkey = rec.len() as u64;
     let (mut idx1, hdr, mut d1, mut i) = if skip {
@@ -3868,10 +4454,11 @@ fn pin_rec_cmp_from(
                     }
                     let body = rec.get(at..at + n as usize).unwrap_or_default();
                     let coll = desc.get(i).map(|o| o.coll).unwrap_or_default();
-                    ord(compare_coll(
+                    ord(compare_coll_in(
                         &Value::Text(body),
                         &Value::Text(z.as_slice()),
                         coll,
+                        enc,
                     ))
                 }
             }
@@ -4083,6 +4670,11 @@ pub async fn collect_table_pages<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
 ) -> Result<AVec<u32>, S::Error> {
+    // A WITHOUT ROWID table's tree is an index B-tree (v0.16).
+    #[cfg(feature = "without_rowid")]
+    if pager.wr.table_of(root).is_some() {
+        return collect_index_pages(pager, root).await;
+    }
     let usable = pager.usable() as usize;
     let mut out: AVec<u32> = AVec::new();
     let mut stack: AVec<u32> = AVec::new();
@@ -4195,6 +4787,11 @@ enum IndexBalance {
     /// non-root parent). No window page was written; the caller
     /// falls back to a rebuild.
     Rebuild,
+    /// The window's entries need more pages than it has, or the
+    /// parent no longer fits its new dividers. No page was
+    /// written; the caller runs the insert-side balance, which
+    /// allocates pages and cascades a parent overflow upward.
+    Grow,
 }
 
 /// The cells, rightmost pointer and ordered children of an
@@ -4494,18 +5091,8 @@ async fn balance_index_leaf_window<S: Storage>(
     let n_new = index_min_pages(all.as_slice(), usable, false).min(window_pages.len());
     let (pages, dividers) = partition_index(all.as_slice(), n_new, usable, false);
     let n_new = pages.len();
-    for (i, g) in pages.iter().enumerate() {
-        write_index_page(pager, window_pages[i], g.as_slice(), 0, false, false).await?;
-    }
-    for wp in window_pages.iter().skip(n_new) {
-        pager.free_page(*wp).await?;
-    }
-    let new_pages: AVec<u32> = {
-        let mut v = AVec::new();
-        for wp in window_pages.iter().take(n_new) {
-            v.push(*wp);
-        }
-        v
+    let Some(new_pages) = take_pages(window_pages, n_new) else {
+        return Ok(IndexBalance::Grow);
     };
     let (nc, nright) = index_parent_after(
         pcells,
@@ -4516,10 +5103,36 @@ async fn balance_index_leaf_window<S: Storage>(
         dividers.as_slice(),
         0,
     );
+    // The lifted dividers may be larger than the ones pulled down:
+    // a parent that no longer fits needs the growing balance.
+    if index_page_need(nc.as_slice(), 0, true) > usable {
+        return Ok(IndexBalance::Grow);
+    }
+    for (g, wp) in pages.iter().zip(new_pages.iter()) {
+        write_index_page(pager, *wp, g.as_slice(), 0, false, false).await?;
+    }
+    for wp in window_pages.iter().skip(n_new) {
+        pager.free_page(*wp).await?;
+    }
     write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
     Ok(IndexBalance::Done {
         children_removed: window_pages.len() - n_new,
     })
+}
+
+/// The first `n` of a window's pages, or None when a partition
+/// needs more pages than the window has (the delete balance never
+/// allocates; the caller switches to the growing insert balance).
+#[cfg(feature = "indexes")]
+fn take_pages(window_pages: &[u32], n: usize) -> Option<AVec<u32>> {
+    if n > window_pages.len() {
+        return None;
+    }
+    let mut v = AVec::new();
+    for wp in window_pages.iter().take(n) {
+        v.push(*wp);
+    }
+    Some(v)
 }
 
 #[cfg(feature = "indexes")]
@@ -4582,23 +5195,8 @@ async fn balance_index_interior_window<S: Storage>(
     let n_new = index_min_pages(all.as_slice(), usable, true).min(window_pages.len());
     let (pages, dividers) = partition_index(all.as_slice(), n_new, usable, true);
     let n_new = pages.len();
-    for (i, g) in pages.iter().enumerate() {
-        let right = if i + 1 < n_new {
-            dividers.as_slice()[i].child
-        } else {
-            trailing
-        };
-        write_index_page(pager, window_pages[i], g.as_slice(), right, true, false).await?;
-    }
-    for wp in window_pages.iter().skip(n_new) {
-        pager.free_page(*wp).await?;
-    }
-    let new_pages: AVec<u32> = {
-        let mut v = AVec::new();
-        for wp in window_pages.iter().take(n_new) {
-            v.push(*wp);
-        }
-        v
+    let Some(new_pages) = take_pages(window_pages, n_new) else {
+        return Ok(IndexBalance::Grow);
     };
     let (nc, nright) = index_parent_after(
         pcells,
@@ -4609,6 +5207,19 @@ async fn balance_index_interior_window<S: Storage>(
         dividers.as_slice(),
         4,
     );
+    if index_page_need(nc.as_slice(), 0, true) > usable {
+        return Ok(IndexBalance::Grow);
+    }
+    for (i, (g, wp)) in pages.iter().zip(new_pages.iter()).enumerate() {
+        let right = match dividers.as_slice().get(i) {
+            Some(d) if i + 1 < n_new => d.child,
+            _ => trailing,
+        };
+        write_index_page(pager, *wp, g.as_slice(), right, true, false).await?;
+    }
+    for wp in window_pages.iter().skip(n_new) {
+        pager.free_page(*wp).await?;
+    }
     write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
     Ok(IndexBalance::Done {
         children_removed: window_pages.len() - n_new,
@@ -4667,9 +5278,15 @@ async fn index_rebuild_without<S: Storage>(
     use core::cmp::Ordering;
     let mut keep: AVec<AVec<u8>> = AVec::new();
     {
-        let mut cur = IndexCursor::new(root, desc);
+        let nf = entry_fields(pager, root, desc);
+        let mut cur = IndexCursor::with_fields(root, desc, nf);
         while let Some(e) = cur.next_entry(pager).await? {
-            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc) == Ordering::Equal
+            if compare_entries(
+                e.values.as_slice(),
+                skip.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) == Ordering::Equal
             {
                 continue;
             }
@@ -4685,7 +5302,7 @@ async fn index_rebuild_without<S: Storage>(
     let empty: &[IndexCell] = &[];
     write_index_page(pager, root, empty, 0, false, false).await?;
     for p in keep.iter() {
-        index_insert(pager, root, p.as_slice(), desc).await?;
+        index_insert_core(pager, root, p.as_slice(), desc).await?;
     }
     Ok(())
 }
@@ -4718,8 +5335,32 @@ enum IndexRemoval {
 /// written wherever the entry lives by then (re-seek — a
 /// balance may have moved it). The whole-tree rebuild survives
 /// only as the degenerate-window fallback.
-#[cfg(feature = "indexes")]
+#[cfg(feature = "without_rowid")]
 pub async fn index_delete<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    payload: &[u8],
+    desc: &[KeyOrder],
+) -> Result<bool, S::Error> {
+    // A WITHOUT ROWID table's trees (v0.16; see `index_insert`).
+    match pager.wr.view_of(root) {
+        crate::wr::WrView::Pk(_) => return Ok(true),
+        crate::wr::WrView::Sec(i) => {
+            let (raw, orders) = pager.wr.sec_payload::<S::Error>(i, payload)?;
+            return index_delete_core(pager, root, raw.as_slice(), orders.as_slice()).await;
+        }
+        _ => {}
+    }
+    index_delete_core(pager, root, payload, desc).await
+}
+
+/// Without WITHOUT ROWID tables there is nothing to translate.
+#[cfg(all(feature = "indexes", not(feature = "without_rowid")))]
+pub use self::index_delete_core as index_delete;
+
+/// `index_delete` without the WITHOUT ROWID translation.
+#[cfg(feature = "indexes")]
+pub async fn index_delete_core<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
     payload: &[u8],
@@ -4727,7 +5368,7 @@ pub async fn index_delete<S: Storage>(
 ) -> Result<bool, S::Error> {
     use core::cmp::Ordering;
     let usable = pager.usable() as usize;
-    let nfields = desc.len() + 1;
+    let nfields = entry_fields(pager, root, desc);
     let target = decode_index_entry::<S::Error>(payload, nfields)?;
     // ---- descent, recording (page, child index) pairs ----
     let mut path: AVec<(u32, usize)> = AVec::new();
@@ -4750,8 +5391,12 @@ pub async fn index_delete<S: Storage>(
             for (i, c) in cells.iter().enumerate() {
                 let p = index_cell_payload(pager, c).await?;
                 let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-                if compare_entries(e.values.as_slice(), leaf_target.values.as_slice(), desc)
-                    == Ordering::Equal
+                if compare_entries(
+                    e.values.as_slice(),
+                    leaf_target.values.as_slice(),
+                    desc,
+                    pager.text_enc(),
+                ) == Ordering::Equal
                 {
                     hit = Some(i);
                     break;
@@ -4777,7 +5422,12 @@ pub async fn index_delete<S: Storage>(
         for (i, c) in cells.iter().enumerate() {
             let p = index_cell_payload(pager, c).await?;
             let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-            match compare_entries(leaf_target.values.as_slice(), e.values.as_slice(), desc) {
+            match compare_entries(
+                leaf_target.values.as_slice(),
+                e.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) {
                 Ordering::Equal => {
                     hit = Some(i);
                     break;
@@ -4804,7 +5454,7 @@ pub async fn index_delete<S: Storage>(
             // after the leaf removal (see below).
             let child = cells.as_slice()[pos].child;
             let pred = {
-                let mut cur = IndexCursor::new(child, desc);
+                let mut cur = IndexCursor::with_fields(child, desc, nfields);
                 let mut last: Option<IndexEntry> = None;
                 while let Some(e) = cur.next_entry(pager).await? {
                     last = Some(e);
@@ -4829,6 +5479,12 @@ pub async fn index_delete<S: Storage>(
                 return Ok(true);
             };
             let pred_payload = encode_entry_payload(&pred);
+            #[cfg(feature = "utf16")]
+            let pred_payload =
+                match stored_record::<S::Error>(pager.text_enc(), pred_payload.as_slice())? {
+                    Some(c) => c,
+                    None => pred_payload,
+                };
             let local_len = index_local(usable, pred_payload.len());
             let ovf = write_overflow(pager, pred_payload.as_slice(), local_len).await?;
             let mut cell_bytes = AVec::new();
@@ -4841,9 +5497,11 @@ pub async fn index_delete<S: Storage>(
                     cell_bytes.push(b);
                 }
             }
+            let payload_off = cell_bytes.len() - local_len - if ovf != 0 { 4 } else { 0 };
+            pad_cell(&mut cell_bytes, &[]);
             let pred_cell = IndexCell {
                 child: 0,
-                payload_off: cell_bytes.len() - local_len - if ovf != 0 { 4 } else { 0 },
+                payload_off,
                 bytes: cell_bytes,
                 payload_len: pred_payload.len(),
                 local_len,
@@ -4929,11 +5587,25 @@ async fn index_remove_from_leaf<S: Storage>(
         write_index_page(pager, leaf_page, kept.as_slice(), 0, false, false).await?;
         return Ok(IndexRemoval::Done);
     }
-    let (parent, trigger) = *path.last().expect("non-root leaf has a parent");
-    let outcome =
-        balance_index_window(pager, root, parent, trigger, Some((leaf_page, kept))).await?;
+    let Some(&(parent, trigger)) = path.last() else {
+        return Err(Error::CorruptPage { page: leaf_page });
+    };
+    let outcome = balance_index_window(
+        pager,
+        root,
+        parent,
+        trigger,
+        Some((leaf_page, kept.clone())),
+    )
+    .await?;
     let mut removed_children = match outcome {
         IndexBalance::Rebuild => return Ok(IndexRemoval::RebuildBeforeWrite),
+        IndexBalance::Grow => {
+            let up = ins_balance_index_leaf_window(pager, parent, trigger, leaf_page, kept).await?;
+            cascade_index_up(pager, root, path, up).await?;
+            collapse_index_root(pager, root).await?;
+            return Ok(IndexRemoval::Done);
+        }
         IndexBalance::Done { children_removed } => children_removed,
     };
     // Cascade, mirroring the table delete: balance each
@@ -4967,6 +5639,15 @@ async fn index_remove_from_leaf<S: Storage>(
         let outcome = balance_index_window(pager, root, gp, gtrigger, None).await?;
         match outcome {
             IndexBalance::Rebuild => return Ok(IndexRemoval::RebuildAfterRemoval),
+            IndexBalance::Grow => {
+                // No preset: page 0 is never a window page, so every
+                // window page is read from its image.
+                let up = ins_balance_index_interior_window(pager, gp, gtrigger, 0, AVec::new(), 0)
+                    .await?;
+                cascade_index_up(pager, root, path, up).await?;
+                collapse_index_root(pager, root).await?;
+                return Ok(IndexRemoval::Done);
+            }
             IndexBalance::Done { children_removed } => {
                 removed_children = children_removed;
             }
@@ -4994,7 +5675,7 @@ async fn index_apply_replacement<S: Storage>(
 ) -> Result<(), S::Error> {
     use core::cmp::Ordering;
     let usable = pager.usable() as usize;
-    let nfields = desc.len() + 1;
+    let nfields = entry_fields(pager, root, desc);
     let mut page = root;
     loop {
         let idx = pager.load(page).await?;
@@ -5008,8 +5689,12 @@ async fn index_apply_replacement<S: Storage>(
             for (i, c) in cells.iter().enumerate() {
                 let p = index_cell_payload(pager, c).await?;
                 let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-                if compare_entries(e.values.as_slice(), target.values.as_slice(), desc)
-                    == Ordering::Equal
+                if compare_entries(
+                    e.values.as_slice(),
+                    target.values.as_slice(),
+                    desc,
+                    pager.text_enc(),
+                ) == Ordering::Equal
                 {
                     let mut nc: AVec<IndexCell> = AVec::new();
                     for (j, cc) in cells.iter().enumerate() {
@@ -5048,7 +5733,12 @@ async fn index_apply_replacement<S: Storage>(
         for (i, c) in cells.iter().enumerate() {
             let p = index_cell_payload(pager, c).await?;
             let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-            match compare_entries(target.values.as_slice(), e.values.as_slice(), desc) {
+            match compare_entries(
+                target.values.as_slice(),
+                e.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) {
                 Ordering::Equal => {
                     hit = Some(i);
                     break;
@@ -5103,9 +5793,15 @@ async fn index_rebuild_without_extra<S: Storage>(
     use core::cmp::Ordering;
     let mut keep: AVec<AVec<u8>> = AVec::new();
     {
-        let mut cur = IndexCursor::new(root, desc);
+        let nf = entry_fields(pager, root, desc);
+        let mut cur = IndexCursor::with_fields(root, desc, nf);
         while let Some(e) = cur.next_entry(pager).await? {
-            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc) == Ordering::Equal
+            if compare_entries(
+                e.values.as_slice(),
+                skip.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) == Ordering::Equal
             {
                 continue;
             }
@@ -5113,7 +5809,12 @@ async fn index_rebuild_without_extra<S: Storage>(
         }
     }
     if let Some(x) = extra
-        && compare_entries(x.values.as_slice(), skip.values.as_slice(), desc) != Ordering::Equal
+        && compare_entries(
+            x.values.as_slice(),
+            skip.values.as_slice(),
+            desc,
+            pager.text_enc(),
+        ) != Ordering::Equal
     {
         keep.push(encode_entry_payload(x));
     }
@@ -5126,7 +5827,7 @@ async fn index_rebuild_without_extra<S: Storage>(
     let empty: &[IndexCell] = &[];
     write_index_page(pager, root, empty, 0, false, false).await?;
     for p in keep.iter() {
-        index_insert(pager, root, p.as_slice(), desc).await?;
+        index_insert_core(pager, root, p.as_slice(), desc).await?;
     }
     Ok(())
 }

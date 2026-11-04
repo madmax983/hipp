@@ -94,6 +94,10 @@ pub(super) struct TrigState {
     /// program once), and how deep the check has nested.
     pub validated: core::cell::RefCell<Option<AVec<AVec<u8>>>>,
     pub validate_depth: core::cell::Cell<usize>,
+    /// A trigger program's statement is being planned on the main
+    /// database (v0.16 review fix): its unqualified table names
+    /// are main's, never a TEMP table's (`Expander::fix_main`).
+    pub fix_main: core::cell::Cell<bool>,
 }
 
 /// One trigger a write may fire, copied out of the catalog.
@@ -779,7 +783,9 @@ impl<S: Storage> Connection<S> {
                 names.push(copy_vec(handle_bytes(ca, c.name)));
                 colls.push(Some(c.coll));
             }
-            return Ok((names, colls, t.rowid_alias, false));
+            // A WITHOUT ROWID table's NEW / OLD hold no rowid, as a
+            // view's do not (v0.16).
+            return Ok((names, colls, t.rowid_alias, !t.has_rowid()));
         }
         let Some(v) = self.catalog.find_view(ca, table) else {
             return Err(err(SchemaKind::UnknownTable));
@@ -939,8 +945,10 @@ impl<S: Storage> Connection<S> {
         if let Some(c) = orconf {
             force_conflict(&mut ast, c);
         }
-        let plan = self.plan(arena, &ast)?;
-        Ok((ast, plan))
+        let fixed = self.trig.fix_main.replace(!self.is_temp);
+        let plan = self.plan(arena, &ast);
+        self.trig.fix_main.set(fixed);
+        Ok((ast, plan?))
     }
 
     /// Run one trigger program for a row. `Ok(false)`: it ran
@@ -1081,7 +1089,9 @@ impl<S: Storage> Connection<S> {
                 Ok(Step::Done) => break,
                 Err(e) => {
                     let rb = st.resolves_rollback(&e);
-                    st.conn.note_failure(&e, conflict, rb);
+                    // The failing constraint's own action (v0.16).
+                    let c = st.fail_act.get().or(conflict);
+                    st.conn.note_failure(&e, c, rb);
                     return Err(e);
                 }
             }
@@ -1158,7 +1168,7 @@ impl<S: Storage> Connection<S> {
                 }
             }
             let _ = (&names, set_null);
-            let replace = conflict == ConflictAction::Replace
+            let replace = self.table_replaces(table.as_slice(), conflict)
                 && event != TrigEvent::Delete
                 && self.prag.recursive_triggers;
             for t in self.catalog.triggers_on(ca, table.as_slice()) {
@@ -1238,7 +1248,8 @@ impl<S: Storage> Connection<S> {
                 .indexes_for(ca, table)
                 .any(|i| i.unique || i.opaque);
         match conflict {
-            ConflictAction::Abort => not_null || other,
+            // No OR clause (v0.16): conservatively, as ABORT.
+            ConflictAction::Abort | ConflictAction::Unset => not_null || other,
             // REPLACE: a NOT NULL without default and CHECK abort.
             ConflictAction::Replace => not_null || !t.checks.is_empty() || t.strict,
             _ => false,

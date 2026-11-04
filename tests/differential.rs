@@ -206,18 +206,28 @@ fn a5_overflow_both_directions() {
 
 fn a7_rejections() {
     block_on(async {
-        // WAL fixture → WalUnsupported.
+        // WAL fixture → WalUnsupported without the `wal` leaf; with it
+        // (v0.16) the file opens and reads (tests/wal_v16.rs).
         let wal =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wal.db");
         let fs = FileStorage::open(&wal).expect("fs open");
         let r = Connection::open(fs, Config::default()).await;
+        #[cfg(not(feature = "wal"))]
         assert!(
             matches!(r, Err(Error::WalUnsupported)),
             "wal: {:?}",
             r.err(),
         );
+        #[cfg(feature = "wal")]
+        {
+            let mut db = r.expect("wal fixture opens");
+            let mut q = db.prepare("SELECT count(*) FROM t").await.expect("prep");
+            assert_eq!(q.step().await.expect("step"), Step::Row);
+            assert_eq!(q.column_i64(0).expect("count"), 1);
+        }
 
-        // UTF-16 file (oracle-created) → UnsupportedEncoding.
+        // UTF-16 file (oracle-created) → UnsupportedEncoding without
+        // the `utf16` leaf; with it (v0.16) the file opens.
         let path = common::temp_db("a7-utf16");
         common::cli(
             &path,
@@ -225,11 +235,14 @@ fn a7_rejections() {
         );
         let fs = FileStorage::open(&path).expect("fs open");
         let r = Connection::open(fs, Config::default()).await;
+        #[cfg(not(feature = "utf16"))]
         assert!(
             matches!(r, Err(Error::UnsupportedEncoding)),
             "utf16: {:?}",
             r.err(),
         );
+        #[cfg(feature = "utf16")]
+        assert!(r.is_ok(), "utf16: {:?}", r.err());
 
         // Garbage → BadMagic.
         let mem = MemStorage::new();

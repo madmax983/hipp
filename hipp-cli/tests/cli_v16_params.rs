@@ -28,7 +28,8 @@ fn oracle() -> PathBuf {
 }
 
 fn temp_db(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("hipp-cli-v16pa-{tag}-{}", std::process::id()));
+    let dir =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hipp-cli-v16pa-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir.join("test.db")

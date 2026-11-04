@@ -34,7 +34,7 @@ enum Db {
 fn open_db(path: &str) -> Result<Db, String> {
     block_on(async {
         if path == ":memory:" {
-            let conn = Connection::open(MemStorage::new(), cli_config())
+            let conn = Connection::open(MemStorage::memory_db(), cli_config())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::Mem(conn))
@@ -44,6 +44,18 @@ fn open_db(path: &str) -> Result<Db, String> {
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::File(conn))
+        }
+    })
+}
+
+/// Close the database as the oracle shell does at exit and on
+/// `.open` (v0.16): in WAL mode the log is checkpointed and the
+/// `-wal` file removed (`Connection::close`).
+fn close_db(db: Db) -> Result<(), String> {
+    block_on(async {
+        match db {
+            Db::File(c) => c.close().await.map_err(|e| format!("{e:?}")),
+            Db::Mem(c) => c.close().await.map_err(|e| format!("{e:?}")),
         }
     })
 }
@@ -593,8 +605,10 @@ fn split_script(script: &str) -> (Vec<String>, bool) {
             start = i;
         }
     }
-    let tail = script[start..].trim();
-    let complete = tail.is_empty();
+    // An unterminated tail keeps its trailing whitespace: a CREATE
+    // TABLE with options or a CREATE INDEX stores it, as on the pin.
+    let tail = script[start..].trim_start();
+    let complete = tail.trim_end().is_empty();
     if !complete {
         out.push(tail.to_string());
     }
@@ -851,7 +865,17 @@ async fn dispatch(
             if path.is_empty() {
                 return Err("usage: .open <path|:memory:>".to_string());
             }
-            *db = open_db(path)?;
+            // The pin's order: close the current database first (a
+            // WAL-mode log is checkpointed and removed), then open
+            // the new one. Opening first would leave two connections
+            // on one file, and the old one's close would unlink the
+            // log the new one appends to. If the open fails, the pin
+            // carries on with a substitute in-memory database.
+            let old = std::mem::replace(db, open_db(":memory:")?);
+            let closed = close_db(old);
+            let opened = open_db(path).map(|new| *db = new);
+            closed?;
+            opened?;
             return Ok(Flow::Continue);
         }
         match db {
@@ -860,10 +884,12 @@ async fn dispatch(
         }
     } else {
         match db {
-            Db::File(c) => run_statement(c, trimmed, params, out)
+            // The statement as written (only leading space dropped):
+            // its trailing text can belong in sqlite_schema.sql.
+            Db::File(c) => run_statement(c, input.trim_start(), params, out)
                 .await
                 .map(|()| Flow::Continue),
-            Db::Mem(c) => run_statement(c, trimmed, params, out)
+            Db::Mem(c) => run_statement(c, input.trim_start(), params, out)
                 .await
                 .map(|()| Flow::Continue),
         }
@@ -900,6 +926,19 @@ fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let code = session(&mut db, &args);
+    // The oracle shell closes the database however the session
+    // ended (v0.16: a WAL-mode log is checkpointed and removed).
+    if let Err(e) = close_db(db) {
+        eprintln!("Error: {e}");
+        return ExitCode::FAILURE;
+    }
+    code
+}
+
+/// Run the one-shot SQL argument, or the interactive / stdin
+/// session, against `db`.
+fn session(db: &mut Db, args: &[String]) -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut params = Params::new();
 
@@ -907,7 +946,7 @@ fn run() -> ExitCode {
     // statements), stop at the first error.
     if let Some(sql) = args.get(1) {
         for stmt in split_statements(sql) {
-            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
+            match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {
@@ -941,9 +980,11 @@ fn run() -> ExitCode {
             }
             None => break,
         };
-        let line = line.trim_end();
+        // Lines keep their trailing spaces (the pin's input buffer
+        // does, and a schema text can hold them).
+        let line = line.as_str();
         if buffer.is_empty() && line.trim_start().starts_with('.') {
-            match block_on(dispatch(&mut db, line.trim(), &mut params, &mut out)) {
+            match block_on(dispatch(db, line.trim(), &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => eprintln!("Error: {e}"),
@@ -957,7 +998,7 @@ fn run() -> ExitCode {
         if buffer.trim_end().ends_with(';') && split_script(&buffer).1 {
             let script = std::mem::take(&mut buffer);
             for stmt in split_statements(&script) {
-                match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
+                match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit) => return ExitCode::SUCCESS,
                     Err(e) => eprintln!("Error: {e}"),
@@ -968,7 +1009,7 @@ fn run() -> ExitCode {
     // A trailing unterminated statement still runs at EOF.
     if !buffer.trim().is_empty() {
         for stmt in split_statements(&buffer) {
-            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
+            match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {

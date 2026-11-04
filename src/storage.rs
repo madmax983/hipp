@@ -15,10 +15,24 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-/// Which sidecar file is being opened. v0.1 needs exactly one kind.
+/// Which sidecar file is being opened. v0.1 needs exactly one kind;
+/// the `wal` leaf (v0.16) adds the write-ahead log and the pin's
+/// shared-memory index file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sidecar {
+    /// `<db>-journal`: the rollback journal (and, in WAL mode, the
+    /// savepoint scratch area).
     RollbackJournal,
+    /// `<db>-wal`: the write-ahead log (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    Wal,
+    /// `<db>-shm`: the pin's wal-index file (v0.16, `wal`). hipp
+    /// never writes it (its wal-index lives in heap memory, as the
+    /// pin's does in `locking_mode=EXCLUSIVE`); it only asks whether
+    /// one exists and deletes a stale one at close, as the pin's last
+    /// connection does.
+    #[cfg(feature = "wal")]
+    Shm,
 }
 
 /// A sidecar file (the rollback journal in v0.1): the same byte
@@ -71,6 +85,46 @@ pub trait Storage {
     fn file_name(&self) -> &[u8] {
         &[]
     }
+    /// Whether a non-empty write-ahead log (`<db>-wal`) sits beside
+    /// this database (v0.16). Consulted only by builds without the
+    /// `wal` leaf, which then refuse the database
+    /// (`Error::WalUnsupported`): the pin opens such a database in
+    /// WAL mode whatever its header says, so its committed pages may
+    /// be in the log and the main file stale. With the leaf the log
+    /// is read through `Sidecar::Wal`. The default, for storage that
+    /// keeps no log, is `false`; `FileStorage` looks for the file.
+    fn log_beside(&self) -> bool {
+        false
+    }
+    /// Claim the database for this connection's WAL mode (v0.16,
+    /// `wal`), called when a database opens in WAL mode and when it
+    /// enters it. `false` when another connection holds it: a live
+    /// SQLite connection, whose shared-memory wal-index hipp cannot
+    /// take part in, or another hipp connection (in this process or
+    /// another), whose heap wal-index this one would not see — its
+    /// close would checkpoint and delete the log this one appends
+    /// to. hipp then refuses with `Error::DatabaseBusy`. The claim
+    /// lasts until `release_wal`, or until the storage is dropped.
+    /// The default, for storage only one connection can reach,
+    /// claims nothing and returns `true`.
+    #[cfg(feature = "wal")]
+    fn claim_wal(&mut self) -> bool {
+        true
+    }
+    /// Release a `claim_wal` hold (v0.16, `wal`): the database left
+    /// WAL mode or closed. The default does nothing.
+    #[cfg(feature = "wal")]
+    fn release_wal(&mut self) {}
+    /// This storage is an in-memory database (v0.16, the pin's
+    /// `:memory:`): `PRAGMA journal_mode` reports and keeps `memory`,
+    /// so it never enters WAL mode. The default is `false`, a file;
+    /// `MemStorage::new` models a file too (the test and
+    /// crash-injection workhorse), `MemStorage::memory_db` makes an
+    /// in-memory database.
+    #[cfg(feature = "v16")]
+    fn is_memory(&self) -> bool {
+        false
+    }
 }
 
 /// Optional advisory locking surface (SPEC §5.1): defined now so the
@@ -101,6 +155,12 @@ pub struct MemError;
 struct MemInner {
     data: Vec<u8>,
     journal: Option<Vec<u8>>,
+    /// The `-wal` sidecar (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    wal: Option<Vec<u8>>,
+    /// The `-shm` sidecar (v0.16, `wal`): only tests create one.
+    #[cfg(feature = "wal")]
+    shm: Option<Vec<u8>>,
 }
 
 /// In-memory `Storage`. Cloning shares the same underlying bytes —
@@ -109,6 +169,10 @@ struct MemInner {
 #[derive(Clone)]
 pub struct MemStorage {
     inner: Rc<RefCell<MemInner>>,
+    /// An in-memory database rather than a model of a file (v0.16,
+    /// `Storage::is_memory`).
+    #[cfg(feature = "v16")]
+    memory: bool,
 }
 
 impl MemStorage {
@@ -117,7 +181,13 @@ impl MemStorage {
             inner: Rc::new(RefCell::new(MemInner {
                 data: Vec::new(),
                 journal: None,
+                #[cfg(feature = "wal")]
+                wal: None,
+                #[cfg(feature = "wal")]
+                shm: None,
             })),
+            #[cfg(feature = "v16")]
+            memory: false,
         }
     }
 
@@ -127,7 +197,23 @@ impl MemStorage {
             inner: Rc::new(RefCell::new(MemInner {
                 data,
                 journal: None,
+                #[cfg(feature = "wal")]
+                wal: None,
+                #[cfg(feature = "wal")]
+                shm: None,
             })),
+            #[cfg(feature = "v16")]
+            memory: false,
+        }
+    }
+
+    /// An in-memory database (v0.16): the pin's `:memory:`, whose
+    /// journal mode is `memory` (`Storage::is_memory`).
+    #[cfg(feature = "v16")]
+    pub fn memory_db() -> MemStorage {
+        MemStorage {
+            memory: true,
+            ..MemStorage::new()
         }
     }
 
@@ -154,6 +240,31 @@ impl MemStorage {
     pub fn journal_exists(&self) -> bool {
         self.inner.borrow().journal.is_some()
     }
+
+    /// Snapshot the `-wal` sidecar's bytes, if it exists (v0.16,
+    /// `wal`; test/crash tooling).
+    #[cfg(feature = "wal")]
+    pub fn wal_snapshot(&self) -> Option<Vec<u8>> {
+        self.inner.borrow().wal.clone()
+    }
+
+    /// Replace/clear the `-wal` sidecar (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    pub fn set_wal(&self, wal: Option<Vec<u8>>) {
+        self.inner.borrow_mut().wal = wal;
+    }
+
+    /// Replace/clear the `-shm` sidecar (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    pub fn set_shm(&self, shm: Option<Vec<u8>>) {
+        self.inner.borrow_mut().shm = shm;
+    }
+
+    /// Whether a `-shm` sidecar exists (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    pub fn shm_exists(&self) -> bool {
+        self.inner.borrow().shm.is_some()
+    }
 }
 
 impl Default for MemStorage {
@@ -165,6 +276,34 @@ impl Default for MemStorage {
 pub struct MemSidecar {
     inner: Rc<RefCell<MemInner>>,
     existed: bool,
+    /// Which sidecar this is (v0.16, `wal`; always the journal
+    /// without it).
+    #[cfg(feature = "wal")]
+    kind: Sidecar,
+}
+
+impl MemSidecar {
+    /// This sidecar's bytes in `inner`.
+    #[inline(always)]
+    fn get<'a>(&self, inner: &'a MemInner) -> &'a Option<Vec<u8>> {
+        #[cfg(feature = "wal")]
+        match self.kind {
+            Sidecar::Wal => return &inner.wal,
+            Sidecar::Shm => return &inner.shm,
+            Sidecar::RollbackJournal => {}
+        }
+        &inner.journal
+    }
+    #[inline(always)]
+    fn get_mut<'a>(&self, inner: &'a mut MemInner) -> &'a mut Option<Vec<u8>> {
+        #[cfg(feature = "wal")]
+        match self.kind {
+            Sidecar::Wal => return &mut inner.wal,
+            Sidecar::Shm => return &mut inner.shm,
+            Sidecar::RollbackJournal => {}
+        }
+        &mut inner.journal
+    }
 }
 
 fn read_exact(data: &[u8], offset: u64, buf: &mut [u8]) -> Result<(), MemError> {
@@ -195,15 +334,13 @@ impl SidecarFile for MemSidecar {
     }
     async fn len(&self) -> Result<u64, MemError> {
         Ok(self
-            .inner
-            .borrow()
-            .journal
+            .get(&self.inner.borrow())
             .as_ref()
             .map_or(0, |j| j.len() as u64))
     }
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), MemError> {
         let inner = self.inner.borrow();
-        match &inner.journal {
+        match self.get(&inner) {
             Some(j) => read_exact(j, offset, buf),
             None => {
                 if buf.is_empty() {
@@ -216,20 +353,16 @@ impl SidecarFile for MemSidecar {
     }
     async fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), MemError> {
         let mut inner = self.inner.borrow_mut();
-        if inner.journal.is_none() {
-            inner.journal = Some(Vec::new());
-        }
-        write_exact(inner.journal.as_mut().expect("just set"), offset, buf)
+        write_exact(
+            self.get_mut(&mut inner).get_or_insert_with(Vec::new),
+            offset,
+            buf,
+        )
     }
     async fn set_len(&mut self, len: u64) -> Result<(), MemError> {
         let mut inner = self.inner.borrow_mut();
-        if inner.journal.is_none() {
-            inner.journal = Some(Vec::new());
-        }
-        inner
-            .journal
-            .as_mut()
-            .expect("just set")
+        self.get_mut(&mut inner)
+            .get_or_insert_with(Vec::new)
             .resize(len as usize, 0);
         Ok(())
     }
@@ -237,7 +370,7 @@ impl SidecarFile for MemSidecar {
         Ok(())
     }
     async fn delete(&mut self) -> Result<(), MemError> {
-        self.inner.borrow_mut().journal = None;
+        *self.get_mut(&mut self.inner.borrow_mut()) = None;
         Ok(())
     }
 }
@@ -262,12 +395,20 @@ impl Storage for MemStorage {
     async fn sync(&mut self) -> Result<(), MemError> {
         Ok(())
     }
-    async fn sidecar(&mut self, _kind: Sidecar) -> Result<MemSidecar, MemError> {
-        let existed = self.inner.borrow().journal.is_some();
-        Ok(MemSidecar {
+    #[cfg(feature = "v16")]
+    fn is_memory(&self) -> bool {
+        self.memory
+    }
+    async fn sidecar(&mut self, kind: Sidecar) -> Result<MemSidecar, MemError> {
+        let _ = kind;
+        let sc = MemSidecar {
             inner: Rc::clone(&self.inner),
-            existed,
-        })
+            existed: false,
+            #[cfg(feature = "wal")]
+            kind,
+        };
+        let existed = sc.get(&self.inner.borrow()).is_some();
+        Ok(MemSidecar { existed, ..sc })
     }
 }
 
@@ -434,6 +575,63 @@ mod file_storage {
             s.push("-journal");
             PathBuf::from(s)
         }
+
+        /// `<db><suffix>` (v0.16: `-wal`, `-shm`).
+        fn sibling(&self, suffix: &str) -> PathBuf {
+            let mut s = self.path.clone().into_os_string();
+            s.push(suffix);
+            PathBuf::from(s)
+        }
+    }
+
+    /// Whether a process other than this one holds a POSIX lock on
+    /// any of `paths` (v0.16, `wal`; Linux: read from `/proc/locks`,
+    /// whose lines name the locked file as `MAJOR:MINOR:INODE`, the
+    /// device numbers in hex). A live SQLite connection holds one on
+    /// its database in WAL mode (and on the `-shm`). Anything that
+    /// cannot be read counts as unlocked.
+    #[cfg(all(feature = "wal", target_os = "linux"))]
+    fn posix_locked(paths: &[PathBuf]) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let ids: std::vec::Vec<(u64, u64, u64)> = paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| {
+                let d = m.dev();
+                let major = ((d >> 8) & 0xfff) | ((d >> 32) & !0xfff);
+                let minor = (d & 0xff) | ((d >> 12) & !0xff);
+                (major, minor, m.ino())
+            })
+            .collect();
+        if ids.is_empty() {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string("/proc/locks") else {
+            return false;
+        };
+        let me = u64::from(std::process::id());
+        text.lines().any(|line| {
+            let f: std::vec::Vec<&str> = line.split_whitespace().collect();
+            // "1: POSIX  ADVISORY  READ 966 fe:00:3287306 128 128"
+            let (Some(kind), Some(pid), Some(id)) = (f.get(1), f.get(4), f.get(5)) else {
+                return false;
+            };
+            if *kind != "POSIX" || pid.parse::<u64>().ok() == Some(me) {
+                return false;
+            }
+            let mut parts = id.split(':');
+            let (Some(a), Some(b), Some(c)) = (parts.next(), parts.next(), parts.next()) else {
+                return false;
+            };
+            let (Ok(a), Ok(b), Ok(c)) = (
+                u64::from_str_radix(a, 16),
+                u64::from_str_radix(b, 16),
+                c.parse::<u64>(),
+            ) else {
+                return false;
+            };
+            ids.contains(&(a, b, c))
+        })
     }
 
     impl Storage for FileStorage {
@@ -460,8 +658,38 @@ mod file_storage {
         fn file_name(&self) -> &[u8] {
             &self.full
         }
-        async fn sidecar(&mut self, _kind: Sidecar) -> Result<FileSidecar, FileError> {
-            let path = self.journal_path();
+        fn log_beside(&self) -> bool {
+            std::fs::metadata(self.sibling("-wal")).is_ok_and(|m| m.len() > 0)
+        }
+        /// A live SQLite connection is seen by its POSIX lock (Linux:
+        /// `/proc/locks`); hipp connections, this process's included,
+        /// by an exclusive `flock` on the database file (Unix), which
+        /// SQLite's POSIX locks neither take nor see.
+        #[cfg(feature = "wal")]
+        fn claim_wal(&mut self) -> bool {
+            #[cfg(target_os = "linux")]
+            if posix_locked(&[self.path.clone(), self.sibling("-shm")]) {
+                return false;
+            }
+            #[cfg(unix)]
+            if let Err(std::fs::TryLockError::WouldBlock) = self.file.try_lock() {
+                return false;
+            }
+            true
+        }
+        #[cfg(feature = "wal")]
+        fn release_wal(&mut self) {
+            #[cfg(unix)]
+            let _ = self.file.unlock();
+        }
+        async fn sidecar(&mut self, kind: Sidecar) -> Result<FileSidecar, FileError> {
+            let path = match kind {
+                Sidecar::RollbackJournal => self.journal_path(),
+                #[cfg(feature = "wal")]
+                Sidecar::Wal => self.sibling("-wal"),
+                #[cfg(feature = "wal")]
+                Sidecar::Shm => self.sibling("-shm"),
+            };
             let existed = path.exists();
             let file = if existed {
                 Some(

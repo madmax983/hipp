@@ -68,6 +68,8 @@ mod alter;
 mod cte;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
+#[cfg(feature = "json")]
+mod json_tvf;
 #[cfg(feature = "v16")]
 mod maint;
 #[cfg(feature = "v16")]
@@ -76,6 +78,8 @@ mod pragma;
 mod temp;
 #[cfg(feature = "triggers")]
 mod trigger;
+#[cfg(feature = "expr_index")]
+mod xindex;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -420,8 +424,10 @@ enum Access {
     Rowid(i64),
     /// `WHERE <indexed col> = <v>` (v0.3): secondary-index lookup
     /// on the index's first key column; `probe` is the literal
-    /// after the column's affinity has been applied.
-    #[cfg(feature = "indexes")]
+    /// after the column's affinity has been applied. (v0.16:
+    /// `expr_index` builds plan such lookups in the general
+    /// planner instead.)
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     Index {
         root: u32,
         desc: AVec<crate::record::KeyOrder>,
@@ -444,6 +450,60 @@ struct IndexPlan {
     /// Per-key-column direction and collation (v0.16), parallel
     /// to `cols`.
     desc: AVec<crate::record::KeyOrder>,
+    /// An expression or partial index's resolved definition
+    /// (v0.16, `expr_index`): keys are computed by `ix_key`.
+    #[cfg(feature = "expr_index")]
+    ext: Option<alloc::rc::Rc<xindex::IdxExt>>,
+    /// The index's own `ON CONFLICT` clause (v0.16, `v07`; an
+    /// automatic index's constraint's).
+    #[cfg(feature = "v07")]
+    own: Option<ConflictAction>,
+    /// How a conflict on this index resolves under the statement
+    /// (v0.16, `v07`; `ConflictAction::over`), set by
+    /// `resolve_index_conflicts`.
+    #[cfg(feature = "v07")]
+    act: ConflictAction,
+}
+
+/// Whether an UPDATE may delete REPLACE victims as the pin's
+/// `bReplace` (v0.16, `expr_index`): OR REPLACE, or, without an OR
+/// clause, an index declared `ON CONFLICT REPLACE` whose key the
+/// SET changes (an expression index counts as changed).
+#[cfg(feature = "expr_index")]
+fn update_replaces_any(stmt: ConflictAction, sets: &[(Target, RExpr)], ixs: &[IndexPlan]) -> bool {
+    let set = |c: Option<usize>| {
+        sets.iter().any(|(tg, _)| match (tg, c) {
+            (Target::Col(i), Some(j)) => *i == j,
+            (Target::Rowid, None) => true,
+            _ => false,
+        })
+    };
+    stmt == ConflictAction::Replace
+        || (stmt == ConflictAction::Unset
+            && ixs.iter().any(|ix| {
+                ix.own == Some(ConflictAction::Replace)
+                    && (ix.ext.is_some() || ix.cols.iter().any(|c| set(c.col)))
+            }))
+}
+
+/// Resolve each index's conflict action under the statement's
+/// (v0.16, `v07`) and order the indexes as the pin checks them:
+/// its index list keeps every index whose own clause is REPLACE
+/// after the others (`sqlite3CreateIndex`), so a REPLACE deletion
+/// happens only once no other constraint can fail or skip the row.
+#[cfg(all(feature = "indexes", feature = "v07"))]
+fn resolve_index_conflicts(ixs: &mut AVec<IndexPlan>, stmt: ConflictAction) {
+    let mut out: AVec<IndexPlan> = AVec::new();
+    for last in [false, true] {
+        for ix in ixs.iter() {
+            if (ix.own == Some(ConflictAction::Replace)) == last {
+                let mut ix = ix.clone();
+                ix.act = stmt.over(ix.own);
+                out.push(ix);
+            }
+        }
+    }
+    *ixs = out;
 }
 
 #[cfg(feature = "indexes")]
@@ -497,6 +557,10 @@ enum Plan {
         /// key on a VIRTUAL column, computed per row here.
         #[cfg(feature = "v04")]
         gcols: Option<Box<crate::rules::GenCols>>,
+        /// An expression or partial index's definition (v0.16,
+        /// `expr_index`).
+        #[cfg(feature = "expr_index")]
+        ext: Option<alloc::rc::Rc<xindex::IdxExt>>,
     },
     /// `DROP INDEX` (v0.3); `root: None` is the IF EXISTS no-op.
     #[cfg(feature = "indexes")]
@@ -537,8 +601,14 @@ enum Plan {
         select: Option<Box<crate::query::SubPlan>>,
         /// The `OR ...` conflict clause (v0.7; the parser only
         /// produces a non-default value under the feature, and
-        /// the executor only consults it there).
+        /// the executor only consults it there). v0.16: `Unset` is
+        /// planned as `Abort`; the constraints' own clauses are in
+        /// `ipk_act`, `InsCol::nn_act` and `IndexPlan::act`.
         conflict: ConflictAction,
+        /// How a rowid conflict resolves (v0.16, `v07`): the
+        /// statement's action over the INTEGER PRIMARY KEY's clause.
+        #[cfg(feature = "v07")]
+        ipk_act: ConflictAction,
         /// The planned upsert clause (v0.7).
         #[cfg(feature = "v07")]
         upsert: Option<UpsertPlan>,
@@ -591,6 +661,9 @@ enum Plan {
     /// against the row's original values.
     #[cfg(feature = "v05")]
     Update {
+        /// The target rows' access path (v0.16, `expr_index`).
+        #[cfg(feature = "expr_index")]
+        access: Option<Box<crate::xplan::IdxAccess>>,
         root: u32,
         rowid_alias: Option<usize>,
         ncols: usize,
@@ -603,8 +676,16 @@ enum Plan {
         sets: AVec<(Target, RExpr)>,
         filter: Option<RExpr>,
         /// The `OR ...` conflict clause (v0.7; before it, only
-        /// the IGNORE widening existed, as `or_ignore`).
+        /// the IGNORE widening existed, as `or_ignore`). v0.16:
+        /// `Unset` is planned as `Abort` (see `Plan::Insert`).
         conflict: ConflictAction,
+        /// Per column, how a NULL in a NOT NULL column resolves
+        /// (v0.16, `v07`), parallel to `not_null`.
+        #[cfg(feature = "v07")]
+        nn_acts: AVec<ConflictAction>,
+        /// How a rowid conflict resolves (v0.16, `v07`).
+        #[cfg(feature = "v07")]
+        ipk_act: ConflictAction,
         /// `FROM` sources (v0.7), materialised at step time and
         /// nested-loop joined onto each target row; empty when
         /// the clause is absent. The SET/filter expressions were
@@ -624,6 +705,9 @@ enum Plan {
     /// `DELETE` (v0.5).
     #[cfg(feature = "v05")]
     Delete {
+        /// The target rows' access path (v0.16, `expr_index`).
+        #[cfg(feature = "expr_index")]
+        access: Option<Box<crate::xplan::IdxAccess>>,
         root: u32,
         rowid_alias: Option<usize>,
         ncols: usize,
@@ -661,6 +745,12 @@ enum Plan {
     Temp {
         sql: AVec<u8>,
         width: usize,
+        /// The rows a temp write reads from the main database (v0.16:
+        /// `INSERT INTO temp.x SELECT ... FROM main.y`, `CREATE TEMP
+        /// TABLE x AS SELECT ...`): computed on main when the
+        /// statement runs, then inserted by `sql` (an INSERT whose
+        /// VALUES row they replace; `temp::TempFeed`).
+        feed: Option<Box<temp::TempFeed>>,
     },
     /// `ALTER TABLE ... RENAME TO / RENAME COLUMN / DROP COLUMN`
     /// (v0.16, `v16`; `session::alter`).
@@ -992,6 +1082,10 @@ struct InsCol {
     /// where such a default's errors surface).
     #[cfg(feature = "v16")]
     per_row: Option<(RExpr, RowData)>,
+    /// How a NULL in this NOT NULL column resolves (v0.16, `v07`):
+    /// the statement's action over the column's own clause.
+    #[cfg(feature = "v07")]
+    nn_act: ConflictAction,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1034,6 +1128,12 @@ struct UpsertPlan {
     /// to `target`: such a column arbitrates only an index key
     /// column of that collation.
     target_colls: AVec<Option<crate::record::Coll>>,
+    /// The expression or partial index the target names (v0.16,
+    /// `expr_index`: the pin's `sqlite3UpsertAnalyzeTarget` picks
+    /// it in its index-list order): only that index's conflicts
+    /// arbitrate. `None` for a rowid or plain-index target.
+    #[cfg(feature = "expr_index")]
+    target_root: Option<u32>,
     /// `DO UPDATE` when true; `DO NOTHING` when false (then
     /// `sets`/`filter` are empty / None).
     do_update: bool,
@@ -1192,8 +1292,18 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "foreign_keys")]
             fk: fkey::FkState::default(),
         };
+        #[cfg(feature = "utf16")]
+        conn.set_text_enc(conn.pager.text_enc());
         conn.rebuild_catalog().await?;
         Ok(conn)
+    }
+
+    /// Set the connection's text encoding (v0.16, `utf16`): the
+    /// pager's (what records are stored as) and the evaluator's.
+    #[cfg(feature = "utf16")]
+    pub(crate) fn set_text_enc(&mut self, enc: crate::record::TextEnc) {
+        self.pager.set_text_enc(enc);
+        self.env.enc.set(enc);
     }
 
     async fn rebuild_catalog(&mut self) -> Result<(), S::Error> {
@@ -1209,6 +1319,11 @@ impl<S: Storage> Connection<S> {
         }
         self.catalog =
             build_catalog(&mut self.pager, &self.catalog_arena, self.cfg.limits()).await?;
+        #[cfg(feature = "without_rowid")]
+        {
+            let (t, i) = crate::wr::layouts(&self.catalog, &self.catalog_arena);
+            self.pager.wr.set_layout(t, i);
+        }
         Ok(())
     }
 
@@ -1230,6 +1345,14 @@ impl<S: Storage> Connection<S> {
         if self.pager.schema_cookie() != self.catalog.cookie {
             self.rebuild_catalog().await?;
         }
+        // A new statement's rows take new handles (v0.16).
+        #[cfg(feature = "without_rowid")]
+        {
+            self.pager.wr.clear_handles();
+            if let Some(t) = self.temp.as_mut() {
+                t.pager.wr.clear_handles();
+            }
+        }
         let arena = Arena::new(Scope::Statement, self.cfg.stmt_init, self.cfg.stmt_max);
         // The original statement text, retained for CREATE TABLE:
         // it is what lands in `sqlite_schema.sql` (§5.5).
@@ -1248,6 +1371,7 @@ impl<S: Storage> Connection<S> {
                 None
             }
             temp::Route::Temp(text) => Some(self.prepare_temp(text, &arena).await?),
+            temp::Route::TempFed(f) => Some(self.prepare_temp_fed(*f, &arena).await?),
         };
         #[cfg(feature = "v16")]
         let main_text = main_as.as_ref().map_or(sql.as_bytes(), |t| t.as_slice());
@@ -1305,11 +1429,11 @@ impl<S: Storage> Connection<S> {
             current: AVec::new(),
             current_rowid: None,
             row_ckpt,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_rowids: AVec::new(),
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_pos: 0,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_loaded: false,
             #[cfg(feature = "v04")]
             query_rows: AVec::new(),
@@ -1341,6 +1465,8 @@ impl<S: Storage> Connection<S> {
             stmt_sp: None,
             #[cfg(feature = "v16")]
             upsert_failed: false,
+            #[cfg(feature = "v07")]
+            fail_act: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
             autoinc: None,
             #[cfg(feature = "triggers")]
@@ -1374,7 +1500,11 @@ impl<S: Storage> Connection<S> {
             >,
         > = Box::pin(c.prepare(t));
         let width = prep.await.map_err(temp::mem_err)?.column_count();
-        Ok(Plan::Temp { sql: text, width })
+        Ok(Plan::Temp {
+            sql: text,
+            width,
+            feed: None,
+        })
     }
 
     /// Parse and plan a statement that may hold parameters (v0.16,
@@ -1439,12 +1569,18 @@ impl<S: Storage> Connection<S> {
             };
             // A REPLACE's deletions fire the DELETE triggers under
             // `recursive_triggers`: the pin compiles them too.
-            let replace =
-                |c: &ConflictAction| *c == ConflictAction::Replace && self.prag.recursive_triggers;
+            // (v0.16: or, without an OR clause, a constraint's own
+            // ON CONFLICT REPLACE.)
+            let replace = |c: &ConflictAction, t: &crate::arena::ABytes| {
+                self.table_replaces(handle_bytes(arena, *t), *c) && self.prag.recursive_triggers
+            };
             match body {
-                Ast::Insert { conflict, .. } | Ast::Update { conflict, .. }
-                    if replace(conflict) =>
-                {
+                Ast::Insert {
+                    conflict, table, ..
+                }
+                | Ast::Update {
+                    conflict, table, ..
+                } if replace(conflict, table) => {
                     let (Ast::Insert { table, .. } | Ast::Update { table, .. }) = body else {
                         return Err(Error::Unsupported);
                     };
@@ -1653,6 +1789,10 @@ impl<S: Storage> Connection<S> {
                 let strict = *strict;
                 #[cfg(not(feature = "v16"))]
                 let strict = false;
+                #[cfg(feature = "without_rowid")]
+                let wr_def = create_without_rowid(ast);
+                #[cfg(not(feature = "without_rowid"))]
+                let wr_def = false;
                 // v0.16: refuse what the pin refuses at definition
                 // time (DEFAULT / PK on a generated column, a
                 // non-constant DEFAULT, a generated-column loop,
@@ -1681,6 +1821,7 @@ impl<S: Storage> Connection<S> {
                     pk_columns.as_slice(),
                     kept.as_slice(),
                     strict,
+                    !wr_def,
                 )?;
                 #[cfg(feature = "v16")]
                 if self.prag.like_redefined
@@ -1701,6 +1842,8 @@ impl<S: Storage> Connection<S> {
                 table,
                 columns,
                 unique,
+                #[cfg(feature = "expr_index")]
+                filter,
                 ..
             } => {
                 let tname = handle_bytes(arena, *table);
@@ -1712,7 +1855,24 @@ impl<S: Storage> Connection<S> {
                     })?
                     .usable()?;
                 let mut cols = AVec::new();
+                // v0.16 (`expr_index`): expression items and the
+                // WHERE resolve against the table with the pin's
+                // definition rules (`xindex`).
+                #[cfg(feature = "expr_index")]
+                let mut texts: AVec<Option<&[u8]>> = AVec::new();
                 for cd in columns.iter() {
+                    #[cfg(feature = "expr_index")]
+                    {
+                        texts.push(cd.expr.map(|h| handle_bytes(arena, h)));
+                        if cd.expr.is_some() {
+                            cols.push(IdxColPlan {
+                                col: None,
+                                desc: cd.desc,
+                                coll: cd.coll.unwrap_or_default(),
+                            });
+                            continue;
+                        }
+                    }
                     let nb = handle_bytes(arena, cd.name);
                     let col = match self.resolve_target(t, nb)? {
                         // `rowid` / `oid` / `_rowid_` name no column
@@ -1750,7 +1910,20 @@ impl<S: Storage> Connection<S> {
                 for c in t.columns.iter() {
                     defaults.push(read_default(&self.catalog_arena, c));
                 }
+                #[cfg(feature = "expr_index")]
+                let ext = if filter.is_some() || texts.iter().any(|x| x.is_some()) {
+                    Some(alloc::rc::Rc::new(self.compile_ext(
+                        arena,
+                        t,
+                        texts.as_slice(),
+                        filter.map(|h| handle_bytes(arena, h)),
+                    )?))
+                } else {
+                    None
+                };
                 Ok(Plan::CreateIndex {
+                    #[cfg(feature = "expr_index")]
+                    ext,
                     table_root: t.root,
                     rowid_alias: t.rowid_alias,
                     ncols: t.columns.len(),
@@ -1878,10 +2051,21 @@ impl<S: Storage> Connection<S> {
                     }
                 }
                 let mut cols = AVec::new();
+                // v0.16 (`v07`): each constraint's action under the
+                // statement's; the statement action itself is ABORT
+                // when it has no OR clause.
+                #[cfg(feature = "v07")]
+                let stmt = *conflict;
+                #[cfg(feature = "v07")]
+                let conflict = &stmt.over(None);
                 // One clock read for the whole statement.
                 #[cfg(feature = "v04")]
                 let mut clock = crate::rules::Clock::new(self.cfg.clock);
                 for (i, c) in t.columns.iter().enumerate() {
+                    #[cfg(feature = "v07")]
+                    let nn_act = stmt.over(c.nn_conflict);
+                    #[cfg(all(feature = "v04", not(feature = "v07")))]
+                    let nn_act = *conflict;
                     // v0.16: an expression DEFAULT the catalog
                     // could not fold is evaluated only when a row
                     // can need it — the column is not supplied,
@@ -1894,7 +2078,7 @@ impl<S: Storage> Connection<S> {
                     #[cfg(feature = "v04")]
                     let default = if c.default_expr.is_some()
                         && (!targets.iter().any(|tg| *tg == Target::Col(i))
-                            || (c.not_null && *conflict == ConflictAction::Replace))
+                            || (c.not_null && nn_act == ConflictAction::Replace))
                     {
                         #[cfg(feature = "v16")]
                         {
@@ -1918,43 +2102,15 @@ impl<S: Storage> Connection<S> {
                         not_null: c.not_null,
                         #[cfg(feature = "v16")]
                         per_row,
+                        #[cfg(feature = "v07")]
+                        nn_act,
                     });
                 }
                 #[cfg(feature = "indexes")]
-                let indexes = {
-                    let mut out: AVec<IndexPlan> = AVec::new();
-                    for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
-                        if ix.opaque {
-                            // An index hipp cannot maintain:
-                            // refuse the write rather than let it
-                            // silently desynchronise (schema.rs).
-                            return Err(Error::Unsupported);
-                        }
-                        let mut cols = AVec::new();
-                        let mut desc = AVec::new();
-                        for c in ix.columns.iter() {
-                            let p = IdxColPlan {
-                                col: c.col,
-                                desc: c.desc,
-                                coll: c.coll,
-                            };
-                            desc.push(p.order());
-                            cols.push(p);
-                        }
-                        out.push(IndexPlan {
-                            root: ix.root,
-                            unique: ix.unique,
-                            cols,
-                            desc,
-                        });
-                    }
-                    // Checked most recently created first, as the pin
-                    // walks its (prepended) index list (v0.16 review
-                    // fix: which REPLACE victim goes first shows in
-                    // its DELETE triggers).
-                    out.as_mut_slice().reverse();
-                    out
-                };
+                #[allow(unused_mut)]
+                let mut indexes = self.write_index_plans(arena, tname)?;
+                #[cfg(all(feature = "indexes", feature = "v07"))]
+                resolve_index_conflicts(&mut indexes, stmt);
                 // v0.8: an INSERT ... SELECT source is planned
                 // as a subquery against the empty enclosing
                 // scope. Its result width must match the target
@@ -2115,6 +2271,8 @@ impl<S: Storage> Connection<S> {
                     #[cfg(feature = "v08")]
                     select: select_plan,
                     conflict: *conflict,
+                    #[cfg(feature = "v07")]
+                    ipk_act: stmt.over(t.ipk_conflict),
                     #[cfg(feature = "v07")]
                     upsert: upsert_plan,
                     #[cfg(feature = "v07")]
@@ -2285,6 +2443,7 @@ impl<S: Storage> Connection<S> {
                     pk_columns.as_slice(),
                     checks.as_slice(),
                     strict_def,
+                    t.has_rowid(),
                 )?;
                 // The pin re-checks the whole rewritten definition.
                 #[cfg(feature = "v16")]
@@ -2405,6 +2564,8 @@ impl<S: Storage> Connection<S> {
                 from,
                 filter,
                 returning,
+                #[cfg(feature = "v16")]
+                indexed,
             } => self.plan_update(
                 arena,
                 table,
@@ -2414,13 +2575,24 @@ impl<S: Storage> Connection<S> {
                 from,
                 filter,
                 returning,
+                #[cfg(feature = "v16")]
+                *indexed,
             ),
             #[cfg(feature = "v05")]
             Ast::Delete {
                 table,
                 filter,
                 returning,
-            } => self.plan_delete(arena, table, filter, returning),
+                #[cfg(feature = "v16")]
+                indexed,
+            } => self.plan_delete(
+                arena,
+                table,
+                filter,
+                returning,
+                #[cfg(feature = "v16")]
+                *indexed,
+            ),
             #[cfg(feature = "v05")]
             Ast::DropTable { name, if_exists } => {
                 let nb = handle_bytes(arena, *name);
@@ -2631,6 +2803,18 @@ impl<S: Storage> Connection<S> {
             crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
             return Ok(names.as_slice().get(k).cloned());
         }
+        #[cfg(feature = "v16")]
+        if sp.temp
+            && let Some(tc) = self.temp.as_deref()
+        {
+            return Ok(tc
+                .catalog
+                .tables
+                .iter()
+                .find(|t| t.root == sp.root)
+                .and_then(|t| t.columns.as_slice().get(k))
+                .map(|c| copy_vec(handle_bytes(&tc.catalog_arena, c.name))));
+        }
         Ok(self
             .catalog
             .tables
@@ -2685,6 +2869,7 @@ impl<S: Storage> Connection<S> {
             t.rowid_alias,
             checks.as_slice(),
             strict,
+            t.has_rowid(),
         )?;
         #[cfg(feature = "v16")]
         if let Some(g) = rules.gcols.as_mut() {
@@ -2760,24 +2945,40 @@ impl<S: Storage> Connection<S> {
             ));
         }
         let mut sources = AVec::new();
-        let mut src = crate::query::SourceDesc::new(copy_vec(qualifier), cols, t.rowid_alias, true);
+        let mut src =
+            crate::query::SourceDesc::new(copy_vec(qualifier), cols, t.rowid_alias, t.has_rowid());
         src.colls = table_colls(t);
+        #[cfg(feature = "v16")]
+        {
+            src.db = self.db_no();
+        }
         sources.push(src);
         let mut offsets = AVec::new();
         offsets.push(0);
         (sources, offsets)
     }
 
-    /// Index plans for an UPDATE/DELETE on `tname` (v0.5): the
-    /// same resolution INSERT performs — an index hipp cannot
-    /// maintain refuses the write.
-    #[cfg(all(feature = "v05", feature = "indexes"))]
-    fn write_index_plans(&self, tname: &[u8]) -> Result<AVec<IndexPlan>, S::Error> {
+    /// Index plans for a write on `tname` (v0.3 INSERT, v0.5
+    /// UPDATE / DELETE): an index hipp cannot maintain refuses the
+    /// write rather than let it silently desynchronise (schema.rs);
+    /// an expression or partial index (v0.16, `expr_index`) is
+    /// resolved here, so one hipp cannot compute refuses it too.
+    /// Most recently created first, as the pin walks its
+    /// (prepended) index list (v0.16 review fix: which REPLACE
+    /// victim goes first shows in its DELETE triggers).
+    #[cfg(feature = "indexes")]
+    fn write_index_plans(&self, arena: &Arena, tname: &[u8]) -> Result<AVec<IndexPlan>, S::Error> {
+        let _ = arena;
         let mut out: AVec<IndexPlan> = AVec::new();
         for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
             if ix.opaque {
                 return Err(Error::Unsupported);
             }
+            #[cfg(feature = "expr_index")]
+            let ext = match self.catalog.find(&self.catalog_arena, tname) {
+                Some(t) => self.index_ext(arena, t, ix)?,
+                None => None,
+            };
             let mut cols = AVec::new();
             let mut desc = AVec::new();
             for c in ix.columns.iter() {
@@ -2794,9 +2995,14 @@ impl<S: Storage> Connection<S> {
                 unique: ix.unique,
                 cols,
                 desc,
+                #[cfg(feature = "expr_index")]
+                ext,
+                #[cfg(feature = "v07")]
+                own: ix.conflict,
+                #[cfg(feature = "v07")]
+                act: ConflictAction::Abort,
             });
         }
-        // Most recently created first, as INSERT's (the pin's order).
         out.as_mut_slice().reverse();
         Ok(out)
     }
@@ -2893,7 +3099,10 @@ impl<S: Storage> Connection<S> {
                     kind: SchemaKind::TermOutOfRange,
                 });
         }
-        if let Expr::Column { table: None, name } = e {
+        if let Expr::Column {
+            table: None, name, ..
+        } = e
+        {
             let nb = handle_bytes(arena, *name);
             if let Some(item) = aliases
                 .iter()
@@ -3238,6 +3447,12 @@ impl<S: Storage> Connection<S> {
         use crate::query::{has_agg, resolve_scoped};
         let mut cur = crate::query::ScopeGroup::new(sources, offsets, 0);
         cur.agg_owner = false;
+        // The pin's RETURNING row is no schema object: `main.t.col`
+        // is "no such column" there (v0.16).
+        #[cfg(feature = "v16")]
+        for s in cur.sources.as_mut_slice() {
+            s.db = 0;
+        }
         let mut planner = self.sub_planner(arena);
         let mut out = AVec::new();
         for it in items.iter() {
@@ -3287,22 +3502,35 @@ impl<S: Storage> Connection<S> {
         upsert: &crate::sql::Upsert,
     ) -> Result<UpsertPlan, S::Error> {
         use crate::query::{ScopeGroup, SourceDesc, has_agg, resolve_scoped};
-        if let Some(tf) = &upsert.target_filter {
+        #[cfg_attr(not(feature = "expr_index"), allow(unused_variables))]
+        let target_pred = match &upsert.target_filter {
             // Oracle behaviour, probed in v0.7 (pinned 3.54.1):
             // the conflict-target WHERE is name-resolved (an
-            // unknown column errors) but never evaluated for a
-            // non-partial index — WHERE 0 arbitrates exactly like
-            // WHERE 1. hipp creates no partial indexes (CREATE
-            // INDEX ... WHERE is refused), so resolve for
-            // validation and then drop the predicate.
-            let (sources, offsets) = self.single_source(t, tname);
-            let cur = ScopeGroup::new(sources, offsets, 0);
-            let mut planner = self.sub_planner(arena);
-            let r = resolve_scoped::<S::Error>(tf, arena, &cur, &[], &mut planner)?;
-            if has_agg(&r) {
-                return Err(Error::Unsupported);
+            // unknown column errors) but never evaluated — for a
+            // non-partial index WHERE 0 arbitrates exactly like
+            // WHERE 1; a partial index (v0.16, `expr_index`) is a
+            // target only when it is the same expression as the
+            // index's WHERE.
+            Some(tf) => {
+                let (sources, offsets) = self.single_source(t, tname);
+                let cur = ScopeGroup::new(sources, offsets, 0);
+                let mut planner = self.sub_planner(arena);
+                let r = resolve_scoped::<S::Error>(tf, arena, &cur, &[], &mut planner)?;
+                if has_agg(&r) {
+                    return Err(Error::Unsupported);
+                }
+                Some(r)
             }
-        }
+            None => None,
+        };
+        // v0.16 (`expr_index`): the index an expression target (or
+        // a target with a WHERE) names, in the pin's order.
+        #[cfg(feature = "expr_index")]
+        let target_root = if upsert.target.is_empty() {
+            None
+        } else {
+            self.upsert_ext_target(arena, t, tname, upsert, target_pred.as_ref())?
+        };
         // Canonical target set: the rowid-alias column and the
         // rowid names all canonicalise to Target::Rowid.
         let canon = |this: &Self, name: &[u8]| -> Result<Target, S::Error> {
@@ -3315,8 +3543,14 @@ impl<S: Storage> Connection<S> {
             None
         } else {
             let mut cols = AVec::new();
+            #[cfg(feature = "expr_index")]
+            let exprs = upsert.target_exprs.iter().any(|x| x.is_some());
+            #[cfg(not(feature = "expr_index"))]
+            let exprs = false;
             for n in upsert.target.iter() {
-                cols.push(canon(self, handle_bytes(arena, *n))?);
+                if !exprs {
+                    cols.push(canon(self, handle_bytes(arena, *n))?);
+                }
             }
             // The target must name the rowid / primary key or
             // exactly the key columns of one unique index (the
@@ -3326,7 +3560,7 @@ impl<S: Storage> Connection<S> {
             let mut matches_index = false;
             if !is_rowid {
                 for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
-                    if !ix.unique || ix.opaque {
+                    if !ix.unique || !ix.plain() {
                         continue;
                     }
                     let mut keyset = AVec::new();
@@ -3350,6 +3584,8 @@ impl<S: Storage> Connection<S> {
                     }
                 }
             }
+            #[cfg(feature = "expr_index")]
+            let matches_index = matches_index || target_root.is_some();
             if !is_rowid && !matches_index {
                 return Err(Error::Unsupported);
             }
@@ -3379,7 +3615,8 @@ impl<S: Storage> Connection<S> {
                     ));
                 }
                 let mut ex_sources = AVec::new();
-                let mut ex = SourceDesc::new(copy_vec(b"excluded"), ex_cols, t.rowid_alias, true);
+                let mut ex =
+                    SourceDesc::new(copy_vec(b"excluded"), ex_cols, t.rowid_alias, t.has_rowid());
                 ex.registers = true;
                 ex_sources.push(ex);
                 let mut ex_offsets = AVec::new();
@@ -3431,6 +3668,8 @@ impl<S: Storage> Connection<S> {
         Ok(UpsertPlan {
             target,
             target_colls: upsert.target_colls.clone(),
+            #[cfg(feature = "expr_index")]
+            target_root,
             do_update,
             sets,
             filter,
@@ -3454,12 +3693,15 @@ impl<S: Storage> Connection<S> {
         from: &AVec<crate::sql::FromSource>,
         filter: &Option<Expr>,
         returning: &AVec<SelectItem>,
+        #[cfg(feature = "v16")] indexed: Option<crate::sql::IndexHint>,
     ) -> Result<Plan, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
         #[cfg(not(feature = "v07"))]
         let _ = returning;
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
+        #[cfg(feature = "v16")]
+        let hint = self.index_hint(arena, t, indexed)?;
         let qualifier: &[u8] = match alias {
             Some(a) => handle_bytes(arena, *a),
             None => tname,
@@ -3550,12 +3792,25 @@ impl<S: Storage> Connection<S> {
         let mut defaults = AVec::new();
         let mut affs = AVec::new();
         let mut not_null = AVec::new();
+        // v0.16 (`v07`): each constraint's action under the
+        // statement's (`ConflictAction::over`); the statement action
+        // itself is ABORT when it has no OR clause.
+        #[cfg(feature = "v07")]
+        let stmt = conflict;
+        #[cfg(feature = "v07")]
+        let conflict = stmt.over(None);
+        #[cfg(feature = "v07")]
+        let mut nn_acts = AVec::new();
         let mut clock = crate::rules::Clock::new(self.cfg.clock);
         for c in t.columns.iter() {
+            #[cfg(feature = "v07")]
+            let nn_act = stmt.over(c.nn_conflict);
+            #[cfg(not(feature = "v07"))]
+            let nn_act = conflict;
             // v0.16: an unfolded expression DEFAULT matters to an
-            // UPDATE only as OR REPLACE's NOT NULL substitute.
+            // UPDATE only as a REPLACE's NOT NULL substitute.
             defaults.push(
-                if c.default_expr.is_some() && c.not_null && conflict == ConflictAction::Replace {
+                if c.default_expr.is_some() && c.not_null && nn_act == ConflictAction::Replace {
                     self.column_default(arena, c, &mut clock)?
                 } else {
                     read_default(&self.catalog_arena, c)
@@ -3563,10 +3818,34 @@ impl<S: Storage> Connection<S> {
             );
             affs.push(c.affinity);
             not_null.push(c.not_null);
+            #[cfg(feature = "v07")]
+            nn_acts.push(nn_act);
         }
+        #[cfg(feature = "indexes")]
+        #[allow(unused_mut)]
+        let mut indexes = self.write_index_plans(arena, tname)?;
+        #[cfg(all(feature = "indexes", feature = "v07"))]
+        resolve_index_conflicts(&mut indexes, stmt);
         #[cfg(feature = "v07")]
         let returning_r = self.plan_returning(arena, t, qualifier, returning)?;
+        #[cfg(feature = "expr_index")]
+        let access = self.plan_write_access(
+            arena,
+            t,
+            filter.as_ref(),
+            Some(xindex::UpdateInfo {
+                sets: sets.as_slice(),
+                returning: !returning_r.is_empty(),
+                from: !from_plans.is_empty(),
+                replaces: update_replaces_any(stmt, sets.as_slice(), indexes.as_slice()),
+            }),
+            hint,
+        )?;
+        #[cfg(all(feature = "v16", not(feature = "expr_index")))]
+        let _ = hint;
         Ok(Plan::Update {
+            #[cfg(feature = "expr_index")]
+            access,
             root: t.root,
             rowid_alias: t.rowid_alias,
             ncols: t.columns.len(),
@@ -3577,13 +3856,82 @@ impl<S: Storage> Connection<S> {
             filter,
             conflict,
             #[cfg(feature = "v07")]
+            nn_acts,
+            #[cfg(feature = "v07")]
+            ipk_act: stmt.over(t.ipk_conflict),
+            #[cfg(feature = "v07")]
             from_sources: from_plans,
             #[cfg(feature = "v07")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
-            indexes: self.write_index_plans(tname)?,
+            indexes,
             rules: self.table_rules(arena, t)?,
         })
+    }
+
+    /// This connection's database for three-part names (v0.16,
+    /// `v16`; `SourceDesc::db`): 1 main, 2 temp.
+    #[cfg(feature = "v16")]
+    pub(super) fn db_no(&self) -> u8 {
+        if self.is_temp { 2 } else { 1 }
+    }
+
+    /// Resolve an `INDEXED BY` / `NOT INDEXED` on table `t` (v0.16,
+    /// `v16`): the pin's "no such index" (`UnknownIndex`) when `t`
+    /// has no index of the name. An index hipp cannot read (an
+    /// expression or partial one below `expr_index`) is refused
+    /// (`Unsupported`). Builds without the `expr_index` planner only
+    /// check the clause: their scans keep rowid order.
+    #[cfg(feature = "v16")]
+    fn index_hint(
+        &self,
+        arena: &Arena,
+        t: &crate::schema::TableDef,
+        h: Option<crate::sql::IndexHint>,
+    ) -> Result<crate::query::Hint, S::Error> {
+        use crate::query::Hint;
+        let ca = &self.catalog_arena;
+        Ok(match h {
+            None => Hint::Any,
+            Some(crate::sql::IndexHint::Not) => Hint::Not,
+            Some(crate::sql::IndexHint::By(n)) => {
+                let name = handle_bytes(arena, n);
+                let Some(ix) = self
+                    .catalog
+                    .indexes_for(ca, handle_bytes(ca, t.name))
+                    .find(|i| eq_ci(handle_bytes(ca, i.name), name))
+                else {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::UnknownIndex,
+                    });
+                };
+                if ix.opaque {
+                    return Err(Error::Unsupported);
+                }
+                Hint::By(ix.root)
+            }
+        })
+    }
+
+    /// Whether a write of `t` under the statement action `stmt` may
+    /// delete rows to resolve a conflict (v0.16, `v07`): OR REPLACE,
+    /// or, without an OR clause, a rowid or UNIQUE / PRIMARY KEY
+    /// constraint declared `ON CONFLICT REPLACE` (a NOT NULL one
+    /// substitutes its default and deletes nothing).
+    #[cfg(feature = "triggers")]
+    pub(super) fn table_replaces(&self, name: &[u8], stmt: ConflictAction) -> bool {
+        let r = Some(ConflictAction::Replace);
+        let ca = &self.catalog_arena;
+        match stmt {
+            ConflictAction::Replace => true,
+            ConflictAction::Unset => {
+                self.catalog
+                    .find(ca, name)
+                    .is_some_and(|t| t.ipk_conflict == r)
+                    || self.catalog.indexes_for(ca, name).any(|i| i.conflict == r)
+            }
+            _ => false,
+        }
     }
 
     /// Plan a DELETE (v0.5; RETURNING is v0.7).
@@ -3594,12 +3942,16 @@ impl<S: Storage> Connection<S> {
         table: &crate::arena::ABytes,
         filter: &Option<Expr>,
         returning: &AVec<SelectItem>,
+        #[cfg(feature = "v16")] indexed: Option<crate::sql::IndexHint>,
     ) -> Result<Plan, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
         #[cfg(not(feature = "v07"))]
         let _ = returning;
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
+        #[cfg(feature = "v16")]
+        #[allow(unused_variables)]
+        let hint = self.index_hint(arena, t, indexed)?;
         let (sources, offsets) = self.single_source(t, tname);
         let cur = crate::query::ScopeGroup::new(sources, offsets, 0);
         let mut planner = self.sub_planner(arena);
@@ -3622,6 +3974,8 @@ impl<S: Storage> Connection<S> {
         #[cfg(feature = "v07")]
         let returning_r = self.plan_returning(arena, t, tname, returning)?;
         Ok(Plan::Delete {
+            #[cfg(feature = "expr_index")]
+            access: self.plan_write_access(arena, t, filter.as_ref(), None, hint)?,
             root: t.root,
             rowid_alias: t.rowid_alias,
             ncols: t.columns.len(),
@@ -3631,7 +3985,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v07")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
-            indexes: self.write_index_plans(tname)?,
+            indexes: self.write_index_plans(arena, tname)?,
             rules: if t.has_generated() {
                 self.table_rules(arena, t)?
             } else {
@@ -3722,6 +4076,17 @@ impl<S: Storage> Connection<S> {
         if t.has_generated() {
             return Err(Error::Unsupported);
         }
+        // v0.16 (`expr_index`): so does a table with an index — the
+        // pin may read a covering index instead of the table.
+        #[cfg(feature = "expr_index")]
+        if self
+            .catalog
+            .indexes_for(&self.catalog_arena, tname)
+            .next()
+            .is_some()
+        {
+            return Err(Error::Unsupported);
+        }
         let predicate: Option<(crate::arena::ABytes, Literal)> = match &stmt.filter {
             None => None,
             Some(Expr::Binary(BinOp::Eq, l, r)) => match (l.as_ref(), r.as_ref()) {
@@ -3740,6 +4105,11 @@ impl<S: Storage> Connection<S> {
                 match self.resolve_target(t, nb)? {
                     Target::Rowid => literal_rowid(arena, lit),
                     Target::Col(i) if Some(i) == t.rowid_alias => literal_rowid(arena, lit),
+                    // v0.16 (`expr_index`): the general planner
+                    // chooses among the indexes as the pin does.
+                    #[cfg(feature = "expr_index")]
+                    Target::Col(_) => return Err(Error::Unsupported),
+                    #[cfg(not(feature = "expr_index"))]
                     Target::Col(i) => {
                         // v0.3: an index on this column
                         // turns the predicate into a
@@ -4205,6 +4575,47 @@ impl<S: Storage> Connection<S> {
             });
         }
         cur.aliases.clear();
+        let limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
+        // v0.16 (`expr_index`): each table source's index access
+        // path, the pin's choice (`xplan`).
+        #[cfg(feature = "expr_index")]
+        self.plan_accesses(
+            arena,
+            sources.as_mut_slice(),
+            cur.offsets.as_slice(),
+            cur.first_src,
+            (base_width, base_src),
+            &xindex::CoreInfo {
+                items: items.as_slice(),
+                filter: filter.as_ref(),
+                group_by: group_by.as_slice(),
+                having: having.as_ref(),
+                order_by: order_by.as_slice(),
+                has_agg,
+                distinct: stmt.distinct,
+                limit: limit.as_ref(),
+            },
+        )?;
+        // v0.16 (`json`): what a lateral `json_each` may drop
+        // from the rows it joins onto.
+        #[cfg(feature = "json")]
+        {
+            let mut rest: AVec<&RExpr> = AVec::new();
+            for e in items
+                .iter()
+                .chain(filter.iter())
+                .chain(group_by.iter())
+                .chain(having.iter())
+                .chain(order_by.iter().map(|(e, _)| e))
+            {
+                rest.push(e);
+            }
+            json_tvf::plan_tvf_dead(
+                sources.as_mut_slice(),
+                cur.offsets.as_slice(),
+                rest.as_slice(),
+            );
+        }
         let keys = CompKeys {
             names: item_aliases,
             colls: core_colls(items.as_slice(), &[]),
@@ -4218,7 +4629,7 @@ impl<S: Storage> Connection<S> {
             group_by,
             having,
             order_by,
-            limit: self.plan_limit(stmt.limit.as_deref(), arena)?,
+            limit,
             offset: self.plan_limit(stmt.offset.as_deref(), arena)?,
             has_agg,
             result_names,
@@ -4340,6 +4751,20 @@ impl<S: Storage> Connection<S> {
         };
         let mut desc = SourceDesc::new(qual, cols, None, false);
         desc.kind = s.kind;
+        // A view is a schema object (v0.16): `main.v.col` reaches it;
+        // a table-valued pragma function is main's, the empty temp
+        // schema temp's (v0.16 review fix: both were unreachable).
+        #[cfg(feature = "v16")]
+        if s.cte.as_ref().is_some_and(|c| c.view) {
+            desc.db = self.db_no();
+        } else if s.derived.is_none() {
+            let n = handle_bytes(arena, s.table);
+            desc.db = if eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master") {
+                2
+            } else {
+                1
+            };
+        }
         // v0.16: a derived column compares by its
         // leftmost core's item collation (BINARY when
         // the item has none — still a column's).
@@ -4370,6 +4795,16 @@ impl<S: Storage> Connection<S> {
             gcols: None,
             #[cfg(feature = "v16")]
             rec: 0,
+            #[cfg(feature = "json")]
+            tvf: 0,
+            #[cfg(feature = "json")]
+            tvf_dead: AVec::new(),
+            #[cfg(feature = "expr_index")]
+            access: None,
+            #[cfg(feature = "expr_index")]
+            hint: crate::query::Hint::Any,
+            #[cfg(feature = "v16")]
+            temp: false,
         });
         Ok(w)
     }
@@ -4405,6 +4840,21 @@ impl<S: Storage> Connection<S> {
                 total += self.plan_rec_ref(s, id, arena, descs, plans)?;
                 continue;
             }
+            // v0.16 (`json`): json_each / json_tree and their jsonb_
+            // forms, unless a table or view takes the name.
+            #[cfg(feature = "json")]
+            if s.derived.is_none() {
+                let n = handle_bytes(arena, s.table);
+                let k = crate::json::tvf_kind(n);
+                let ca = &self.catalog_arena;
+                if k != 0
+                    && self.catalog.find_readable(ca, n).is_none()
+                    && self.catalog.find_view(ca, n).is_none()
+                {
+                    total += self.plan_json_tvf(s, k, arena, descs, plans)?;
+                    continue;
+                }
+            }
             // v0.16: a table-valued pragma function, or the empty
             // temp schema, as the derived table of its rows.
             // A table or view of the name shadows the function; given
@@ -4424,10 +4874,37 @@ impl<S: Storage> Connection<S> {
             // against `derived_scope` only (no LATERAL).
             #[cfg(feature = "v09")]
             if let Some(d) = derived {
+                // A view or CTE has no index (the pin's "no such
+                // index", v0.16); NOT INDEXED asks for none and is
+                // accepted (v0.16 review fix).
+                #[cfg(feature = "v16")]
+                if matches!(s.indexed, Some(crate::sql::IndexHint::By(_))) {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::UnknownIndex,
+                    });
+                }
                 total += self.plan_derived_source(s, d, arena, derived_scope, descs, plans)?;
                 continue;
             }
             let tname = handle_bytes(arena, s.table);
+            // A TEMP table read by a main statement (v0.16): an
+            // unqualified name is the temp database's first, as on
+            // the pin (the router cut a `temp.` and left `main.` in).
+            #[cfg(feature = "v16")]
+            if !self.is_temp && (s.in_temp || !s.qualified) {
+                match self.temp.as_deref() {
+                    Some(tc) if let Some(tt) = tc.catalog.find(&tc.catalog_arena, tname) => {
+                        total += self.plan_temp_source(s, tc, tt, arena, descs, plans)?;
+                        continue;
+                    }
+                    _ if s.in_temp => {
+                        return Err(Error::Schema {
+                            kind: SchemaKind::UnknownTable,
+                        });
+                    }
+                    _ => {}
+                }
+            }
             #[cfg(feature = "v16")]
             let found = self.catalog.find_readable(&self.catalog_arena, tname);
             #[cfg(not(feature = "v16"))]
@@ -4445,6 +4922,9 @@ impl<S: Storage> Connection<S> {
                     });
                 }
             };
+            #[cfg(feature = "v16")]
+            #[allow(unused_variables)]
+            let hint = self.index_hint(arena, t, s.indexed)?;
             let mut cols = AVec::new();
             let mut affs = AVec::new();
             let mut defaults = AVec::new();
@@ -4460,10 +4940,21 @@ impl<S: Storage> Connection<S> {
                 Some(a) => copy_vec(handle_bytes(arena, a)),
                 None => copy_vec(tname),
             };
-            let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, true);
+            let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, t.has_rowid());
             desc.kind = s.kind;
             desc.colls = table_colls(t);
+            #[cfg(feature = "v16")]
+            {
+                desc.db = self.db_no();
+            }
             desc.schema_table = t.root == 1 && s.alias.is_none();
+            // The temp database's schema table answers to its own
+            // names only, whatever the FROM clause wrote (v0.16
+            // review fix: `sqlite_schema.name FROM temp.sqlite_schema`).
+            #[cfg(feature = "v16")]
+            if self.is_temp && desc.schema_table {
+                desc.qualifier = copy_vec(b"sqlite_temp_master");
+            }
             // An ALTER TABLE tracing references to its table (v0.16).
             #[cfg(feature = "v16")]
             if let Some(tr) = &self.alter_trace
@@ -4492,6 +4983,16 @@ impl<S: Storage> Connection<S> {
                 gcols,
                 #[cfg(feature = "v16")]
                 rec: 0,
+                #[cfg(feature = "json")]
+                tvf: 0,
+                #[cfg(feature = "json")]
+                tvf_dead: AVec::new(),
+                #[cfg(feature = "expr_index")]
+                access: None,
+                #[cfg(feature = "expr_index")]
+                hint,
+                #[cfg(feature = "v16")]
+                temp: false,
             });
             total += t.columns.len();
         }
@@ -4527,6 +5028,11 @@ impl<S: Storage> Connection<S> {
         let mut hoisted = None;
         let mut using = using.as_slice().iter();
         for (i, (s, plan)) in from.iter().zip(plans.iter_mut()).enumerate() {
+            // A JSON table-valued function's arguments (v0.16).
+            #[cfg(feature = "json")]
+            if plan.tvf != 0 {
+                self.plan_tvf_args(s, i, arena, cur, enclosing, plan, &mut *planner)?;
+            }
             let mut cond = using.next().cloned().flatten();
             if let Some(on) = &s.on {
                 let r = resolve_scoped::<S::Error>(on, arena, cur, enclosing, &mut *planner)?;
@@ -4583,7 +5089,7 @@ impl<S: Storage> Connection<S> {
     /// `col` (preferring a UNIQUE one), convert the literal with
     /// the column's affinity, and lower to `Access::Index`.
     /// Returns None when no usable index exists.
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     fn plan_index_access(
         &self,
         t: &crate::schema::TableDef,
@@ -4598,7 +5104,7 @@ impl<S: Storage> Connection<S> {
         let mut chosen: Option<(u32, bool, AVec<crate::record::KeyOrder>)> = None;
         let col_coll = t.columns.as_slice().get(col).map(|c| c.coll);
         for ix in self.catalog.indexes_for(&self.catalog_arena, tname) {
-            if ix.opaque {
+            if !ix.plain() {
                 continue;
             }
             let Some(first) = ix.columns.as_slice().first() else {
@@ -4642,12 +5148,28 @@ impl<S: Storage> Connection<S> {
                 return Ok(Target::Col(i));
             }
         }
-        if eq_ci(name, b"rowid") || eq_ci(name, b"oid") || eq_ci(name, b"_rowid_") {
+        if t.has_rowid()
+            && (eq_ci(name, b"rowid") || eq_ci(name, b"oid") || eq_ci(name, b"_rowid_"))
+        {
             return Ok(Target::Rowid);
         }
         Err(Error::Schema {
             kind: SchemaKind::UnknownColumn,
         })
+    }
+
+    /// One row inserted into the table rooted at `root` (v0.16):
+    /// it counts as a change, and sets `last_insert_rowid()` unless
+    /// the table is WITHOUT ROWID (the pin leaves it alone then).
+    #[cfg(feature = "v16")]
+    fn note_insert(&self, root: u32, rowid: i64) {
+        #[cfg(feature = "without_rowid")]
+        if self.pager.wr.table_of(root).is_some() {
+            self.env.note_change();
+            return;
+        }
+        let _ = root;
+        self.env.note_insert(rowid);
     }
 
     /// Drive a transaction left mid-commit by a dropped future to
@@ -4662,6 +5184,20 @@ impl<S: Storage> Connection<S> {
         // explicit bracket that contained it (v0.2).
         self.explicit_txn = false;
         Ok(true)
+    }
+
+    /// Close the connection (v0.16): an open transaction is rolled
+    /// back and — in WAL mode (`wal`) — the log is checkpointed and
+    /// the `-wal` file (and a stale `-shm`) deleted, as the pin's
+    /// close does. A connection dropped without `close` leaves its
+    /// log for the next open to read (as after a crash); nothing
+    /// committed is lost either way. On an error the database stays
+    /// as it was (the log kept).
+    pub async fn close(mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "wal")]
+        return self.pager.close_wal().await;
+        #[cfg(not(feature = "wal"))]
+        self.pager.rollback().await
     }
 
     /// Roll back the connection's open transaction, if any.
@@ -4945,11 +5481,11 @@ pub struct Statement<'c, S: Storage> {
     row_ckpt: usize,
     /// Secondary-index scan state (v0.3): the rowids an
     /// `Access::Index` lookup produced, consumed one per step.
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     index_rowids: AVec<i64>,
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     index_pos: usize,
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     index_loaded: bool,
     /// v0.4 query results, materialised on first step.
     #[cfg(feature = "v04")]
@@ -5012,6 +5548,13 @@ pub struct Statement<'c, S: Storage> {
     /// on the pin, so OR ROLLBACK does not end the transaction.
     #[cfg(feature = "v16")]
     upsert_failed: bool,
+    /// The resolved action of the constraint whose violation failed
+    /// this write (v0.16, `v07`): a constraint-level `ON CONFLICT
+    /// FAIL / ROLLBACK` decides what the failure undoes, so the
+    /// statement's own action is not enough. `None`: the statement
+    /// action applies (a CHECK, or no constraint failed).
+    #[cfg(feature = "v07")]
+    fail_act: core::cell::Cell<Option<ConflictAction>>,
     /// The running INSERT's AUTOINCREMENT state (v0.16, `v16`).
     #[cfg(feature = "v16")]
     autoinc: Option<Autoinc>,
@@ -5163,11 +5706,16 @@ fn copy_vec(b: &[u8]) -> AVec<u8> {
 /// holds the re-lexed tokens. AUTOINCREMENT is refused
 /// (`Error::Unsupported`: hipp keeps no `sqlite_sequence`).
 fn trimmed_sql_text<E>(raw: &[u8], arena: &Arena) -> Result<AVec<u8>, E> {
+    // The pin's end of the stored text where it fixes one (see
+    // `schema_text_end`), else the statement minus any trailing
+    // semicolon/whitespace.
     let mut end = raw.len();
     while end > 0 && (raw[end - 1] == b';' || (raw[end - 1] as char).is_whitespace()) {
         end -= 1;
     }
-    let raw = &raw[..end];
+    #[cfg(any(feature = "v16", feature = "indexes"))]
+    let end = crate::sql::parser::schema_text_end::<E>(raw, arena).unwrap_or(end);
+    let raw = &raw[..end.min(raw.len())];
     Ok(
         match crate::sql::parser::schema_text_start::<E>(raw, arena)? {
             Some((prefix, at)) if at <= raw.len() => {
@@ -5237,6 +5785,18 @@ fn table_autoinc<E>(t: &crate::schema::TableDef, cat: &Arena, arena: &Arena) -> 
     crate::sql::parser::schema_text_start::<E>(handle_bytes(cat, t.sql), arena).is_err()
 }
 
+/// Whether a CREATE TABLE is WITHOUT ROWID (v0.16).
+#[cfg(feature = "without_rowid")]
+fn create_without_rowid(ast: &Ast) -> bool {
+    matches!(
+        ast,
+        Ast::CreateTable {
+            without_rowid: true,
+            ..
+        }
+    )
+}
+
 /// Whether a parsed CREATE TABLE has a rowid alias (v0.16, `v16`):
 /// exactly one PRIMARY KEY column, declared exactly INTEGER and not
 /// written `INTEGER PRIMARY KEY DESC` — the rule `schema.rs` applies
@@ -5266,34 +5826,45 @@ fn create_has_rowid_alias(ast: &Ast, arena: &Arena) -> bool {
 
 /// Build an index key (the key columns' values, in index order)
 /// for one table row (v0.3). `payload` is the row's table record;
-/// short records materialise column defaults, as scans do.
+/// short records materialise column defaults, as scans do. v0.16
+/// (`expr_index`): an expression or partial index (`ext`) computes
+/// its key from the decoded row, and `None` means the row has no
+/// entry (the partial index's WHERE is not true for it).
 #[cfg(feature = "indexes")]
+#[allow(clippy::too_many_arguments)]
 fn index_key_for_row<E>(
     cols: &[IdxColPlan],
+    #[cfg(feature = "expr_index")] ext: Option<&xindex::IdxExt>,
     rowid_alias: Option<usize>,
     defaults: &[OwnedValue],
     payload: &[u8],
     ncols: usize,
     rowid: i64,
     #[cfg(feature = "v04")] gcols: Option<&crate::rules::GenCols>,
-) -> Result<AVec<OwnedValue>, E> {
-    // v0.16: with generated columns, decode around the VIRTUAL
-    // ones and compute them — an index may key on one.
+    #[cfg(feature = "expr_index")] env: Option<&crate::query::Env>,
+) -> Result<Option<AVec<OwnedValue>>, E> {
+    // v0.16: with generated columns (or an index computing from
+    // the whole row), decode around the VIRTUAL ones and compute
+    // them — an index may key on one.
+    #[cfg(feature = "expr_index")]
+    if let Some(x) = ext {
+        let mut rec = crate::rules::decode_rec::<E>(
+            payload,
+            ncols,
+            defaults,
+            gcols.map(|g| g.virt.as_slice()),
+        )?;
+        if let Some(g) = gcols {
+            g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
+        }
+        return xindex::ext_key::<E>(cols, x, rec.as_slice(), rowid, env);
+    }
     #[cfg(feature = "v04")]
     if let Some(g) = gcols {
         let mut rec =
             crate::rules::decode_rec::<E>(payload, ncols, defaults, Some(g.virt.as_slice()))?;
         g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
-        let mut key = AVec::new();
-        for c in cols {
-            key.push(match c.col {
-                Some(i) if Some(i) != rowid_alias => {
-                    rec.as_slice().get(i).cloned().unwrap_or(OwnedValue::Null)
-                }
-                _ => OwnedValue::Integer(rowid),
-            });
-        }
-        return Ok(key);
+        return Ok(Some(key_from_rec(cols, rowid_alias, rec.as_slice(), rowid)));
     }
     let mut dec: AVec<Value<'_>> = AVec::new();
     crate::record::decode_record_into::<E>(payload, ncols, &mut dec)?;
@@ -5312,7 +5883,30 @@ fn index_key_for_row<E>(
             }
         });
     }
-    Ok(key)
+    Ok(Some(key))
+}
+
+/// One row's key in index `ix`, from the row in record form
+/// (v0.16: every write path's key computation). `None` when the
+/// row has no entry in a partial index (`expr_index`).
+#[cfg(feature = "indexes")]
+fn ix_key<E>(
+    ix: &IndexPlan,
+    rec: &[OwnedValue],
+    rowid: i64,
+    rowid_alias: Option<usize>,
+    #[cfg(feature = "expr_index")] env: &crate::query::Env,
+) -> Result<Option<AVec<OwnedValue>>, E> {
+    #[cfg(feature = "expr_index")]
+    if let Some(x) = &ix.ext {
+        return xindex::ext_key::<E>(ix.cols.as_slice(), x, rec, rowid, Some(env));
+    }
+    Ok(Some(key_from_rec(
+        ix.cols.as_slice(),
+        rowid_alias,
+        rec,
+        rowid,
+    )))
 }
 
 /// Encode an index key payload: the record of key values with
@@ -5342,7 +5936,8 @@ fn key_has_no_null(key: &[OwnedValue]) -> bool {
 /// record form (affinities applied, defaults materialised);
 /// the rowid-alias column is exempt — its record field is
 /// NULL by construction and its value lives in the rowid.
-/// Per statement conflict action:
+/// Per conflict action — the statement's, or (v0.16, `v07`) each
+/// column's own from `nn`:
 /// - `Abort` (ABORT / FAIL / ROLLBACK / the default): any
 ///   NULL in a NOT NULL column is `NotNullViolation`.
 /// - `Ignore`: returns `Ok(false)` — the caller skips this
@@ -5366,31 +5961,71 @@ pub(crate) fn resolve_not_null<E>(
     affs: &[crate::record::Affinity],
     rowid_alias: Option<usize>,
     action: ConflictAction,
+    #[cfg(feature = "v07")] nn: NnActs<'_>,
 ) -> Result<bool, E> {
+    // A REPLACE whose default is NULL fails as ABORT, but only after
+    // every column had its turn (the pin's second pass): a later
+    // column's IGNORE still skips the row, its FAIL still fails it.
+    #[cfg(feature = "v07")]
+    let mut deferred = false;
     for i in 0..row.len() {
         if !not_null[i] || Some(i) == rowid_alias || !matches!(row[i], OwnedValue::Null) {
             continue;
         }
-        match action {
+        #[cfg(feature = "v07")]
+        let act = nn.acts.get(i).copied().unwrap_or(action);
+        #[cfg(not(feature = "v07"))]
+        let act = action;
+        match act {
             ConflictAction::Ignore => return Ok(false),
             ConflictAction::Replace => {
                 if matches!(defaults[i], OwnedValue::Null) {
+                    // One action for every column below v07: no
+                    // later column can decide otherwise.
+                    #[cfg(not(feature = "v07"))]
                     return Err(Error::Schema {
                         kind: SchemaKind::NotNullViolation,
                     });
+                    #[cfg(feature = "v07")]
+                    {
+                        deferred = true;
+                    }
+                } else {
+                    row[i] = apply_affinity(defaults[i].clone(), affs[i]);
                 }
-                row[i] = apply_affinity(defaults[i].clone(), affs[i]);
             }
             // ABORT, FAIL, ROLLBACK: the statement fails (FAIL and
             // ROLLBACK differ only in what the failure undoes).
             _ => {
+                #[cfg(feature = "v07")]
+                nn.failed.set(Some(act));
                 return Err(Error::Schema {
                     kind: SchemaKind::NotNullViolation,
                 });
             }
         }
     }
+    #[cfg(feature = "v07")]
+    if deferred {
+        nn.failed.set(Some(ConflictAction::Abort));
+        return Err(Error::Schema {
+            kind: SchemaKind::NotNullViolation,
+        });
+    }
     Ok(true)
+}
+
+/// Per-column NOT NULL resolution (v0.16, `v07`): each column's
+/// action (`acts`, parallel to the row; empty: the statement's
+/// action for every column) and where the action of a failing
+/// column is recorded (`Statement::fail_act`).
+#[cfg(feature = "v07")]
+#[derive(Clone, Copy)]
+pub struct NnActs<'a> {
+    /// Per column, its NOT NULL action; empty: the statement's.
+    pub acts: &'a [ConflictAction],
+    /// Set to the action of the column whose NULL fails the row.
+    pub failed: &'a core::cell::Cell<Option<ConflictAction>>,
 }
 
 /// One row an UPDATE/DELETE will touch (v0.5), in record form:
@@ -5432,8 +6067,9 @@ fn row_data_for(
     RowData { vals, rowids }
 }
 
-/// An index key for one write-side row in record form (v0.5).
-#[cfg(all(feature = "v05", feature = "indexes"))]
+/// An index key on plain columns for one row in record form
+/// (v0.5; v0.16: every write path's, through `ix_key`).
+#[cfg(feature = "indexes")]
 fn key_from_rec(
     cols: &[IdxColPlan],
     rowid_alias: Option<usize>,
@@ -5443,14 +6079,8 @@ fn key_from_rec(
     let mut key = AVec::new();
     for c in cols {
         key.push(match c.col {
-            None => OwnedValue::Integer(rowid),
-            Some(i) => {
-                if Some(i) == rowid_alias {
-                    OwnedValue::Integer(rowid)
-                } else {
-                    rec[i].clone()
-                }
-            }
+            Some(i) if Some(i) != rowid_alias => rec.get(i).cloned().unwrap_or(OwnedValue::Null),
+            _ => OwnedValue::Integer(rowid),
         });
     }
     key
@@ -5608,15 +6238,22 @@ macro_rules! row_delete_fn {
                 };
                 let gcols = self.plan_rules().and_then(|r| r.gcols);
                 for ix in indexes.iter() {
-                    let key = index_key_for_row(
+                    let Some(key) = index_key_for_row(
                         ix.cols.as_slice(),
+                        #[cfg(feature = "expr_index")]
+                        ix.ext.as_deref(),
                         rowid_alias,
                         defaults,
                         payload.as_slice(),
                         ncols,
                         rowid,
                         gcols.as_ref(),
-                    )?;
+                        #[cfg(feature = "expr_index")]
+                        Some(&self.conn.env),
+                    )?
+                    else {
+                        continue;
+                    };
                     let enc = encode_index_payload(key.as_slice(), rowid);
                     btree::index_delete(
                         &mut self.conn.pager,
@@ -5666,11 +6303,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             current: AVec::new(),
             current_rowid: None,
             row_ckpt,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_rowids: AVec::new(),
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_pos: 0,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_loaded: false,
             #[cfg(feature = "v04")]
             query_rows: AVec::new(),
@@ -5702,6 +6339,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             stmt_sp: None,
             #[cfg(feature = "v16")]
             upsert_failed: false,
+            #[cfg(feature = "v07")]
+            fail_act: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
             autoinc: None,
             #[cfg(feature = "triggers")]
@@ -5737,6 +6376,13 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// again, so the plan reflects the values bound, the schema
     /// and the clock at the time.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
+        // The `json_each` documents this step holds (v0.16, `json`;
+        // `Env::json_docs`) go once the plan has run: its rows are
+        // projected by then (a query materialises its result in
+        // its first step), and a nested step (a trigger body) drops
+        // only its own.
+        #[cfg(feature = "json")]
+        let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
         #[cfg(feature = "params")]
         if !self.binds.started {
             self.replan().await?;
@@ -5872,6 +6518,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Instead(_) => self.step_instead().await,
             Plan::Rollback => self.step_rollback().await,
         };
+        #[cfg(feature = "json")]
+        if let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut() {
+            d.truncate(mark);
+        }
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
         #[cfg(feature = "foreign_keys")]
@@ -5909,6 +6559,20 @@ impl<'c, S: Storage> Statement<'c, S> {
         // waiting for the next prepare (§5.5).
         if ddl_or_txn && r.is_ok() && self.conn.pager.schema_cookie() != self.conn.catalog.cookie {
             self.conn.rebuild_catalog().await?;
+        }
+        // A UTF-16 database's result text is what the pin's
+        // `sqlite3_column_text` shows (v0.16, `utf16`): an unpaired
+        // surrogate combines with the unit after it (`utf16::view`).
+        #[cfg(feature = "utf16")]
+        if matches!(r, Ok(Step::Row)) && self.conn.pager.text_enc() != crate::record::TextEnc::Utf8
+        {
+            for v in self.current.as_mut_slice().iter_mut() {
+                if let OwnedValue::Text(t) = &*v
+                    && let Some(x) = crate::utf16::view(t.as_slice())
+                {
+                    *v = OwnedValue::Text(x);
+                }
+            }
         }
         r
     }
@@ -6070,7 +6734,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.row_buf.clear();
         self.current.clear();
         self.current_rowid = None;
-        #[cfg(feature = "indexes")]
+        #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
         {
             self.index_rowids.clear();
             self.index_pos = 0;
@@ -6113,6 +6777,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Err(Error::TransactionState { nested: true });
         }
         self.conn.explicit_txn = true;
+        // The pin's checkpoint refuses a transaction that has read
+        // the file since BEGIN (v0.16, `wal`).
+        #[cfg(feature = "wal")]
+        self.conn.pager.clear_touched();
         self.phase = Phase::Done;
         Ok(Step::Done)
     }
@@ -6203,6 +6871,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v16")]
         let autoinc =
             crate::sql::parser::has_autoincrement::<S::Error>(sql_text.as_slice(), &self.arena);
+        // ... and never on a WITHOUT ROWID table (the pin's
+        // "AUTOINCREMENT not allowed on WITHOUT ROWID tables").
+        #[cfg(feature = "without_rowid")]
+        if autoinc && create_without_rowid(&self.ast) {
+            return Err(Error::Schema {
+                kind: SchemaKind::AutoincrementWithoutRowid,
+            });
+        }
         #[cfg(feature = "v16")]
         if autoinc && !create_has_rowid_alias(&self.ast, &self.arena) {
             return Err(Error::Schema {
@@ -6365,6 +7041,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v16")] autoinc: bool,
     ) -> Result<(), S::Error> {
         let (root, _) = self.conn.pager.alloc_page().await?;
+        // A WITHOUT ROWID table's B-tree is an index B-tree (v0.16).
+        #[cfg(feature = "without_rowid")]
+        if create_without_rowid(&self.ast) {
+            btree::create_empty_index_root(&mut self.conn.pager, root).await?;
+        } else {
+            btree::create_empty_root(&mut self.conn.pager, root).await?;
+        }
+        #[cfg(not(feature = "without_rowid"))]
         btree::create_empty_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(b"table", name, name, root, Some(sql_text))
             .await?;
@@ -6430,6 +7114,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
+            #[cfg(feature = "without_rowid")]
+            let wr = create_without_rowid(&self.ast);
+            #[cfg(feature = "without_rowid")]
+            if wr {
+                alias = false;
+            }
             let mut out: AVec<AVec<u8>> = AVec::new();
             let mut n = 0usize;
             for set in constraint_sets.iter() {
@@ -6437,6 +7127,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
                 n += 1;
+                // A WITHOUT ROWID table's PRIMARY KEY is the table's
+                // own tree: numbered, but with no tree or row (v0.16).
+                #[cfg(feature = "without_rowid")]
+                if set.primary_key && wr {
+                    continue;
+                }
                 let mut auto_name = AVec::new();
                 for b in b"sqlite_autoindex_" {
                     auto_name.push(*b);
@@ -6551,15 +7247,35 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::CreateIndex { gcols, .. } => gcols.clone(),
             _ => None,
         };
+        #[cfg(feature = "expr_index")]
+        let ext = match &self.plan {
+            Plan::CreateIndex { ext, .. } => ext.clone(),
+            _ => None,
+        };
         let mut desc = AVec::new();
         for c in cols.iter() {
             desc.push(c.order());
         }
+        // An index on a WITHOUT ROWID table holds the table's key
+        // columns (v0.16): lay it out before it is populated.
+        #[cfg(feature = "without_rowid")]
+        {
+            let mut lay = AVec::new();
+            for c in cols.iter() {
+                lay.push((c.col, c.order()));
+            }
+            self.conn
+                .pager
+                .wr
+                .add_index(table_root, root, lay.as_slice());
+        }
         let mut cursor = ScanCursor::new(table_root);
         let mut buf = AVec::new();
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-            let key = index_key_for_row(
+            let Some(key) = index_key_for_row(
                 cols.as_slice(),
+                #[cfg(feature = "expr_index")]
+                ext.as_deref(),
                 rowid_alias,
                 defaults.as_slice(),
                 buf.as_slice(),
@@ -6567,7 +7283,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 rowid,
                 #[cfg(feature = "v04")]
                 gcols.as_deref(),
-            )?;
+                #[cfg(feature = "expr_index")]
+                Some(&self.conn.env),
+            )?
+            else {
+                continue;
+            };
             if unique && key_has_no_null(key.as_slice()) {
                 let probe: AVec<OwnedValue> = key.clone();
                 if btree::index_first_with_prefix(
@@ -6911,6 +7632,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
             _ => ConflictAction::Abort,
         };
+        // v0.16: the failing constraint's own action, when it has one.
+        #[cfg(feature = "v07")]
+        let conflict = self.fail_act.get().unwrap_or(conflict);
         match self.fail_in_place(conflict, &e).await {
             Ok(true) => return e,
             Ok(false) => {}
@@ -7371,6 +8095,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut nn_flags = AVec::new();
             let mut nn_defaults = AVec::new();
             let mut nn_affs = AVec::new();
+            #[cfg(feature = "v07")]
+            let mut acts = AVec::new();
+            #[cfg(feature = "v07")]
+            for c in cols.iter() {
+                acts.push(c.nn_act);
+            }
+            #[cfg(feature = "v07")]
+            let nn = NnActs {
+                acts: acts.as_slice(),
+                failed: &self.fail_act,
+            };
             #[cfg(feature = "v16")]
             for (c, d) in cols.iter().zip(row_defaults.iter()) {
                 nn_flags.push(c.not_null);
@@ -7393,6 +8128,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     nn_affs.as_slice(),
                     *rowid_alias,
                     action,
+                    #[cfg(feature = "v07")]
+                    nn,
                     None,
                     Some(&self.conn.env),
                 )?,
@@ -7403,6 +8140,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     nn_affs.as_slice(),
                     *rowid_alias,
                     action,
+                    #[cfg(feature = "v07")]
+                    nn,
                 )?,
             };
             #[cfg(not(feature = "v04"))]
@@ -7413,6 +8152,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 nn_affs.as_slice(),
                 *rowid_alias,
                 action,
+                #[cfg(feature = "v07")]
+                nn,
             )?;
             if !proceed {
                 return Ok(()); // OR IGNORE: skip this row.
@@ -7424,10 +8165,25 @@ impl<'c, S: Storage> Statement<'c, S> {
         // skips, or updates instead of failing.
         #[cfg(feature = "v07")]
         {
+            // v0.16: so does a constraint whose own clause resolves
+            // it other than ABORT.
             let routed = match &self.plan {
                 Plan::Insert {
-                    conflict, upsert, ..
-                } => !conflict.aborts() || upsert.is_some(),
+                    conflict,
+                    upsert,
+                    ipk_act,
+                    ..
+                } => {
+                    !conflict.aborts() || upsert.is_some() || *ipk_act != ConflictAction::Abort || {
+                        #[cfg(feature = "indexes")]
+                        let other = indexes
+                            .iter()
+                            .any(|ix| ix.unique && ix.act != ConflictAction::Abort);
+                        #[cfg(not(feature = "indexes"))]
+                        let other = false;
+                        other
+                    }
+                }
                 _ => unreachable!(),
             };
             if routed {
@@ -7470,13 +8226,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             AVec::new();
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row.as_slice()[i].clone(),
-                });
-            }
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row.as_slice(),
+                rowid,
+                *rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if ix.unique
                 && key_has_no_null(key.as_slice())
                 && btree::index_first_with_prefix(
@@ -7531,8 +8291,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             let payload = encode_index_payload(key.as_slice(), rowid);
             btree::index_insert(pager, *ix_root, payload.as_slice(), desc.as_slice()).await?;
         }
-        #[cfg(feature = "v16")]
-        self.conn.env.note_insert(rowid);
+        #[cfg(all(feature = "v16", feature = "foreign_keys"))]
+        self.conn.note_insert(root, rowid);
+        #[cfg(all(feature = "v16", not(feature = "foreign_keys")))]
+        self.conn.note_insert(*root, rowid);
         #[cfg(feature = "v07")]
         self.push_insert_returning(row.as_slice(), rowid).await?;
         #[cfg(feature = "triggers")]
@@ -7620,13 +8382,17 @@ impl<'c, S: Storage> Statement<'c, S> {
         btree::btree_insert(&mut self.conn.pager, root, rowid, rec.as_slice()).await?;
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row[i].clone(),
-                });
-            }
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row,
+                rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             let payload = encode_index_payload(key.as_slice(), rowid);
             btree::index_insert(
                 &mut self.conn.pager,
@@ -7637,7 +8403,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             .await?;
         }
         #[cfg(feature = "v16")]
-        self.conn.env.note_insert(rowid);
+        self.conn.note_insert(root, rowid);
         Ok(())
     }
 
@@ -7645,6 +8411,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// old row out, new row in, new index entries in — the apply
     /// tail shared by UPDATE (v0.5) and upsert DO UPDATE (v0.7).
     #[cfg(feature = "v05")]
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_stored_row(
         &mut self,
         root: u32,
@@ -7653,9 +8420,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         old_rowid: i64,
         new_rec: &[OwnedValue],
         new_rowid: i64,
+        changed: (&[bool], bool),
     ) -> Result<(), S::Error> {
         #[cfg(not(feature = "indexes"))]
         let _ = old_rec;
+        let _ = changed;
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
             Plan::Insert { indexes, .. } => indexes.clone(),
@@ -7663,10 +8432,119 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Delete { indexes, .. } => indexes.clone(),
             _ => AVec::new(),
         };
+        let rules = self.plan_rules();
+        // v0.16 (`wal`): the pages the pin leaves clean, so a WAL
+        // log holds its frames and no more (probed page by page).
+        // An index no changed column, generated column or rowid
+        // reaches is left alone; one with an expression (or VIRTUAL
+        // generated) key part is rewritten only when its entry
+        // differs; a plain one the change reaches is rewritten. The
+        // row itself is rewritten only when its record differs or
+        // its key (rowid, WITHOUT ROWID primary key) is assigned;
+        // a record of the same size is overwritten in place, only
+        // its pages whose bytes differ written (`btree_overwrite`).
+        #[cfg(feature = "wal")]
+        let (eff, key_set, wr_key) = {
+            let eff = match rules.as_ref() {
+                Some(r) => r.changed_cols(changed.0, changed.1),
+                None => {
+                    let mut m = AVec::new();
+                    m.extend_from_slice(changed.0);
+                    m
+                }
+            };
+            // A WITHOUT ROWID table: whether its key is assigned, and
+            // whether its value changes (its index entries end in the
+            // key, not in the handle the payloads carry).
+            #[cfg(feature = "without_rowid")]
+            let (pk, pk_moved) = self
+                .conn
+                .pager
+                .wr
+                .table_of(root)
+                .and_then(|t| self.conn.pager.wr.tables.as_slice().get(t))
+                .map_or((false, false), |t| {
+                    (
+                        t.pk_cols
+                            .iter()
+                            .any(|c| eff.as_slice().get(*c).copied().unwrap_or(false)),
+                        t.pk_cols.iter().any(|c| old_rec.get(*c) != new_rec.get(*c)),
+                    )
+                });
+            #[cfg(not(feature = "without_rowid"))]
+            let (pk, pk_moved) = (false, false);
+            (eff, changed.1 || pk, pk_moved)
+        };
+        #[cfg(all(feature = "wal", not(feature = "indexes")))]
+        let _ = (&eff, wr_key);
+        #[cfg(all(feature = "wal", feature = "indexes"))]
+        let virt = rules.as_ref().and_then(|r| r.virt());
+        #[cfg(all(feature = "wal", feature = "indexes"))]
+        let mut keep: AVec<bool> = AVec::new();
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
-            let old_key = key_from_rec(ix.cols.as_slice(), rowid_alias, old_rec, old_rowid);
+            let Some(old_key) = ix_key::<S::Error>(
+                ix,
+                old_rec,
+                old_rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                #[cfg(feature = "wal")]
+                keep.push(false);
+                continue;
+            };
             let payload = encode_index_payload(old_key.as_slice(), old_rowid);
+            #[cfg(feature = "wal")]
+            {
+                let reach = |c: Option<usize>| match c {
+                    Some(c) => eff.as_slice().get(c).copied().unwrap_or(false),
+                    None => key_set,
+                };
+                let is_virt = |c: Option<usize>| {
+                    c.is_some_and(|c| virt.is_some_and(|v| v.get(c) == Some(&true)))
+                };
+                let (mut touched, mut compare) = (key_set, false);
+                for (_i, c) in ix.cols.iter().enumerate() {
+                    #[cfg(feature = "expr_index")]
+                    if let Some(Some(e)) = ix.ext.as_ref().and_then(|x| x.exprs.as_slice().get(_i))
+                    {
+                        touched |= crate::rules::reads_any(e, eff.as_slice(), key_set);
+                        compare = true;
+                        continue;
+                    }
+                    touched |= reach(c.col);
+                    compare |= is_virt(c.col);
+                }
+                #[cfg(feature = "expr_index")]
+                if let Some(p) = ix.ext.as_ref().and_then(|x| x.pred.as_ref()) {
+                    touched |= crate::rules::reads_any(p, eff.as_slice(), key_set);
+                }
+                // A WITHOUT ROWID row's entries end in its key, not
+                // the handle the payload carries: a changed key is
+                // always a rewrite.
+                let same = touched
+                    && compare
+                    && !wr_key
+                    && ix_key::<S::Error>(
+                        ix,
+                        new_rec,
+                        new_rowid,
+                        rowid_alias,
+                        #[cfg(feature = "expr_index")]
+                        &self.conn.env,
+                    )?
+                    .is_some_and(|k| {
+                        encode_index_payload(k.as_slice(), new_rowid).as_slice()
+                            == payload.as_slice()
+                    });
+                keep.push(!touched || same);
+                if !touched || same {
+                    continue;
+                }
+            }
             btree::index_delete(
                 &mut self.conn.pager,
                 ix.root,
@@ -7675,14 +8553,39 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             .await?;
         }
-        btree::btree_delete(&mut self.conn.pager, root, old_rowid).await?;
-        let rules = self.plan_rules();
         let rec_bytes =
             crate::rules::encode_rec(new_rec, rowid_alias, rules.as_ref().and_then(|r| r.virt()));
-        btree::btree_insert(&mut self.conn.pager, root, new_rowid, rec_bytes.as_slice()).await?;
+        #[cfg(feature = "wal")]
+        let same_row = !key_set
+            && new_rowid == old_rowid
+            && btree::btree_overwrite(&mut self.conn.pager, root, old_rowid, rec_bytes.as_slice())
+                .await?;
+        #[cfg(not(feature = "wal"))]
+        let same_row = false;
+        if !same_row {
+            btree::btree_delete(&mut self.conn.pager, root, old_rowid).await?;
+            btree::btree_insert(&mut self.conn.pager, root, new_rowid, rec_bytes.as_slice())
+                .await?;
+        }
         #[cfg(feature = "indexes")]
-        for ix in indexes.iter() {
-            let key = key_from_rec(ix.cols.as_slice(), rowid_alias, new_rec, new_rowid);
+        for (i, ix) in indexes.iter().enumerate() {
+            #[cfg(feature = "wal")]
+            if keep.as_slice().get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            #[cfg(not(feature = "wal"))]
+            let _ = i;
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                new_rec,
+                new_rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             let payload = encode_index_payload(key.as_slice(), new_rowid);
             btree::index_insert(
                 &mut self.conn.pager,
@@ -7705,7 +8608,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         row: AVec<OwnedValue>,
         rowid: i64,
     ) -> Result<(), S::Error> {
-        let (root, rowid_alias, defaults, affs, not_nulls, conflict_action, upsert) =
+        let (root, rowid_alias, defaults, affs, not_nulls, conflict_action, upsert, ipk_act) =
             match &self.plan {
                 Plan::Insert {
                     root,
@@ -7713,6 +8616,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     cols,
                     conflict,
                     upsert,
+                    ipk_act,
                     ..
                 } => {
                     let mut defaults = AVec::new();
@@ -7731,6 +8635,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         not_nulls,
                         *conflict,
                         upsert.clone(),
+                        *ipk_act,
                     )
                 }
                 _ => unreachable!(),
@@ -7745,24 +8650,38 @@ impl<'c, S: Storage> Statement<'c, S> {
         // the rowid itself, the index's canonical key-target set
         // when the conflict is index-borne).
         let mut conflicts: AVec<(i64, bool, Option<KeySet>)> = AVec::new();
+        // Each conflict's resolution (v0.16): the rowid's or the
+        // index's action under the statement's.
+        let mut acts: AVec<ConflictAction> = AVec::new();
+        // The index each conflict is on (v0.16, `expr_index`: an
+        // expression or partial index arbitrates by identity).
+        #[cfg(feature = "expr_index")]
+        let mut conflict_roots: AVec<u32> = AVec::new();
         if btree::seek_rowid(&mut self.conn.pager, root, rowid)
             .await?
             .is_some()
         {
             conflicts.push((rowid, true, None));
+            acts.push(ipk_act);
+            #[cfg(feature = "expr_index")]
+            conflict_roots.push(0);
         }
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
             if !ix.unique {
                 continue;
             }
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row.as_slice()[i].clone(),
-                });
-            }
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row.as_slice(),
+                rowid,
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if key_has_no_null(key.as_slice())
                 && let Some(other) = btree::index_first_with_prefix(
                     &mut self.conn.pager,
@@ -7783,7 +8702,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                         c.coll,
                     ));
                 }
+                #[cfg(feature = "expr_index")]
+                if ix.ext.is_some() {
+                    keyset.clear();
+                }
                 conflicts.push((other, false, Some(keyset)));
+                acts.push(ix.act);
+                #[cfg(feature = "expr_index")]
+                conflict_roots.push(ix.root);
             }
         }
         if conflicts.is_empty() {
@@ -7801,9 +8727,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Upsert arbitration: the first conflict the clause
         // arbitrates, if any.
         if let Some(up) = &upsert {
+            #[cfg(not(feature = "expr_index"))]
             let arb = conflicts
                 .iter()
                 .position(|c| upsert_arbitrates(up, c.1, &c.2));
+            // v0.16 (`expr_index`): a target that names an
+            // expression or partial index arbitrates that index's
+            // conflicts only.
+            #[cfg(feature = "expr_index")]
+            let arb = conflicts
+                .iter()
+                .zip(conflict_roots.iter())
+                .position(|(c, r)| match up.target_root {
+                    Some(t) => !c.1 && *r == t,
+                    None => upsert_arbitrates(up, c.1, &c.2),
+                });
             if let Some(pos) = arb {
                 let crowid = conflicts.as_slice()[pos].0;
                 if !up.do_update {
@@ -7826,19 +8764,45 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if r.is_err() {
                     self.upsert_failed = true;
                 }
+                // Its conflicts resolve by ABORT, whatever the OR
+                // clause or the constraints say (the pin's nested
+                // UPDATE runs under an explicit OE_Abort; v0.16 fix:
+                // INSERT OR FAIL kept the rows before it).
+                if r.is_err() {
+                    self.fail_act.set(Some(ConflictAction::Abort));
+                }
                 return r;
             }
             // A conflict the clause does not arbitrate falls back
             // to the statement's own conflict action (Abort by
             // default — the oracle's behaviour, probed in v0.7).
         }
-        match conflict_action {
-            ConflictAction::Ignore => Ok(()),
-            ConflictAction::Replace => {
+        // v0.16: in the pin's order (the rowid, then the indexes with
+        // every REPLACE one last), the first conflict that does not
+        // resolve by REPLACE decides: IGNORE skips the row, the rest
+        // fail the statement. Only when every conflict is REPLACE are
+        // the conflicting rows deleted.
+        let _ = conflict_action;
+        let decides = conflicts
+            .iter()
+            .zip(acts.iter())
+            .find(|(_, a)| **a != ConflictAction::Replace);
+        match decides {
+            Some((_, ConflictAction::Ignore)) => Ok(()),
+            None => {
+                // A rowid REPLACE runs after the index checks unless
+                // the statement itself says REPLACE (the pin's
+                // "defer IPK REPLACE until last").
+                #[cfg(feature = "indexes")]
+                let defer = conflict_action != ConflictAction::Replace && !indexes.is_empty();
+                #[cfg(not(feature = "indexes"))]
+                let defer = false;
                 let mut victims: AVec<i64> = AVec::new();
-                for c in conflicts.iter() {
-                    if !victims.iter().any(|v| *v == c.0) {
-                        victims.push(c.0);
+                for pass in [false, true] {
+                    for c in conflicts.iter() {
+                        if (c.1 && defer) == pass && !victims.iter().any(|v| *v == c.0) {
+                            victims.push(c.0);
+                        }
                     }
                 }
                 #[cfg(feature = "triggers")]
@@ -7881,13 +8845,16 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Ok(())
             }
             // ABORT, FAIL, ROLLBACK: the statement fails.
-            _ => Err(Error::Schema {
-                kind: if conflicts.as_slice()[0].1 {
-                    SchemaKind::DuplicateRowid
-                } else {
-                    SchemaKind::UniqueViolation
-                },
-            }),
+            Some((c, a)) => {
+                self.fail_act.set(Some(*a));
+                Err(Error::Schema {
+                    kind: if c.1 {
+                        SchemaKind::DuplicateRowid
+                    } else {
+                        SchemaKind::UniqueViolation
+                    },
+                })
+            }
         }
     }
 
@@ -7923,13 +8890,21 @@ impl<'c, S: Storage> Statement<'c, S> {
             if !ix.unique {
                 continue;
             }
-            let mut key = AVec::new();
-            for c in ix.cols.iter() {
-                key.push(match c.col {
-                    None => OwnedValue::Integer(rowid),
-                    Some(i) => row.get(i).cloned().unwrap_or(OwnedValue::Null),
-                });
-            }
+            let alias = match &self.plan {
+                Plan::Insert { rowid_alias, .. } | Plan::Update { rowid_alias, .. } => *rowid_alias,
+                _ => None,
+            };
+            let Some(key) = ix_key::<S::Error>(
+                ix,
+                row,
+                rowid,
+                alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if key_has_no_null(key.as_slice())
                 && let Some(other) = btree::index_first_with_prefix(
                     &mut self.conn.pager,
@@ -8002,7 +8977,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             combined.rowids.push(*r);
         }
         if let Some(f) = &up.filter
-            && crate::query::truthy(&self.eval_row_sub(f, &combined).await?) != Some(true)
+            && !self.cond_row_sub(f, &combined).await?
         {
             return Ok(()); // WHERE false: neither insert nor update.
         }
@@ -8098,6 +9073,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                     affs,
                     rowid_alias,
                     ConflictAction::Abort,
+                    NnActs {
+                        acts: &[],
+                        failed: &self.fail_act,
+                    },
                     Some((assigned.as_slice(), rowid_set)),
                     Some(&self.conn.env),
                 )?;
@@ -8114,6 +9093,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                     affs,
                     rowid_alias,
                     ConflictAction::Abort,
+                    NnActs {
+                        acts: &[],
+                        failed: &self.fail_act,
+                    },
                 )?;
             }
         }
@@ -8132,12 +9115,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             if !ix.unique {
                 continue;
             }
-            let key = key_from_rec(
-                ix.cols.as_slice(),
-                rowid_alias,
+            let Some(key) = ix_key::<S::Error>(
+                ix,
                 new_rec.as_slice(),
                 new_rowid,
-            );
+                rowid_alias,
+                #[cfg(feature = "expr_index")]
+                &self.conn.env,
+            )?
+            else {
+                continue;
+            };
             if key_has_no_null(key.as_slice())
                 && let Some(other) = btree::index_first_with_prefix(
                     &mut self.conn.pager,
@@ -8173,6 +9161,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             crowid,
             new_rec.as_slice(),
             new_rowid,
+            (assigned.as_slice(), rowid_set),
         )
         .await?;
         #[cfg(feature = "foreign_keys")]
@@ -8328,12 +9317,84 @@ impl<'c, S: Storage> Statement<'c, S> {
         filter: &Option<RExpr>,
         out: &mut AVec<WriteRow>,
     ) -> Result<(), S::Error> {
+        // The WHERE clause's constant terms, once, first (v0.16
+        // review fix): false, and no row is written.
+        if let Some(f) = filter
+            && !crate::query::constant_terms_hold::<S::Error>(
+                f,
+                &Ctx::of(&RowData::empty()).with(&self.conn.env),
+            )?
+        {
+            return Ok(());
+        }
         let mut cursor = ScanCursor::new(root);
         let mut buf = AVec::new();
         // v0.16: VIRTUAL generated columns are computed per row.
         let rules = self.plan_rules();
         let gcols = rules.as_ref().and_then(|r| r.gcols.as_ref());
-        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+        // v0.16 (`expr_index`): the rows an index finds — in rowid
+        // order, as the pin's two-pass write visits them, unless
+        // the pin's one-pass loop keeps the index's order.
+        #[cfg(feature = "expr_index")]
+        let mut found: Option<(AVec<i64>, usize)> = match &self.plan {
+            Plan::Update {
+                access: Some(acc), ..
+            }
+            | Plan::Delete {
+                access: Some(acc), ..
+            } => {
+                let acc = acc.clone();
+                // The probes evaluate on a NULL row of the table's
+                // width, where a subquery in them finds its own slots
+                // (v0.16 review fix).
+                let mut padded = RowData::empty();
+                for _ in 0..ncols {
+                    padded.vals.push(OwnedValue::Null);
+                }
+                padded.rowids.push(None);
+                let mut ids = self.access_rowids(root, &acc, &padded).await?;
+                if !acc.one_pass {
+                    ids.as_mut_slice().sort_unstable();
+                    // A WITHOUT ROWID table's two-pass write visits
+                    // its rows in key order (v0.16).
+                    #[cfg(feature = "without_rowid")]
+                    {
+                        let enc = self.conn.pager.text_enc();
+                        self.conn.pager.wr.sort_handles(root, &mut ids, enc);
+                    }
+                    let mut d: AVec<i64> = AVec::new();
+                    for r in ids.iter() {
+                        if d.as_slice().last() != Some(r) {
+                            d.push(*r);
+                        }
+                    }
+                    ids = d;
+                }
+                Some((ids, 0))
+            }
+            _ => None,
+        };
+        loop {
+            #[cfg(feature = "expr_index")]
+            let next = match found.as_mut() {
+                Some((ids, at)) => {
+                    let Some(&r) = ids.as_slice().get(*at) else {
+                        break;
+                    };
+                    *at += 1;
+                    match btree::seek_rowid(&mut self.conn.pager, root, r).await? {
+                        Some(p) => {
+                            buf = p;
+                            Some(r)
+                        }
+                        None => continue,
+                    }
+                }
+                None => cursor.next_row_into(&mut self.conn.pager, &mut buf).await?,
+            };
+            #[cfg(not(feature = "expr_index"))]
+            let next = cursor.next_row_into(&mut self.conn.pager, &mut buf).await?;
+            let Some(rowid) = next else { break };
             let mut rec = crate::rules::decode_rec::<S::Error>(
                 buf.as_slice(),
                 ncols,
@@ -8346,12 +9407,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             if let Some(f) = filter {
                 let rd = row_data_for(rowid_alias, affs, rec.as_slice(), rowid);
                 #[cfg(feature = "v06")]
-                let keep = crate::query::truthy(&self.eval_row_sub(f, &rd).await?) == Some(true);
+                let keep = self.where_row_sub(f, &rd).await?;
                 #[cfg(not(feature = "v06"))]
-                let keep = crate::query::truthy(&crate::query::eval::<S::Error>(
-                    f,
-                    &Ctx::of(&rd).with(&self.conn.env),
-                )?) == Some(true);
+                let keep = crate::query::cond::<S::Error>(f, &Ctx::of(&rd).with(&self.conn.env))?;
                 if !keep {
                     continue;
                 }
@@ -8422,6 +9480,16 @@ impl<'c, S: Storage> Statement<'c, S> {
                 ),
                 _ => unreachable!(),
             };
+        // Per-constraint actions (v0.16, `v07`).
+        #[cfg(feature = "v07")]
+        let (nn_acts, ipk_act) = match &self.plan {
+            Plan::Update {
+                nn_acts, ipk_act, ..
+            } => (nn_acts.clone(), *ipk_act),
+            _ => unreachable!(),
+        };
+        #[cfg(not(feature = "v07"))]
+        let ipk_act = conflict_action;
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
             Plan::Update { indexes, .. } => indexes.clone(),
@@ -8471,6 +9539,19 @@ impl<'c, S: Storage> Statement<'c, S> {
         // v0.16: the statement's change set — NOT NULL and CHECK
         // apply to assigned columns only, as on the pin.
         let (assigned, rowid_set) = assigned_columns(sets.as_slice(), ncols, rowid_alias);
+        // Whether any constraint resolves by REPLACE (v0.16: OR
+        // REPLACE, or a constraint's own clause).
+        #[cfg(feature = "indexes")]
+        let any_replace = ipk_act == ConflictAction::Replace || {
+            #[cfg(feature = "v07")]
+            let r = indexes.iter().any(|ix| ix.act == ConflictAction::Replace);
+            #[cfg(not(feature = "v07"))]
+            let r = conflict_action == ConflictAction::Replace;
+            r
+        };
+        #[cfg(not(feature = "indexes"))]
+        let any_replace = ipk_act == ConflictAction::Replace;
+        let _ = any_replace;
         #[cfg(feature = "foreign_keys")]
         self.fk_load(fkey::Event::Update(assigned.as_slice(), rowid_set), true)?;
         // A trigger program's one-pass UPDATE keeps the rows its
@@ -8484,7 +9565,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         crate::sql::ast::TrigEvent::Update,
                         Some((assigned.as_slice(), rowid_set)),
                         filter.as_ref(),
-                        conflict_action == ConflictAction::Replace,
+                        any_replace,
                     ) =>
             {
                 Some(e)
@@ -8495,8 +9576,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // conflict: a new rowid, or a UNIQUE index it changes.)
         #[cfg(feature = "foreign_keys")]
         {
-            let replace = conflict_action == ConflictAction::Replace
-                && self.fk_update_replace(assigned.as_slice(), rowid_set);
+            let replace = any_replace && self.fk_update_replace(assigned.as_slice(), rowid_set);
             if replace {
                 self.fk_load_victims()?;
             }
@@ -8577,9 +9657,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for c in joined.iter() {
                     let keep = match &filter {
                         None => true,
-                        Some(f) => {
-                            crate::query::truthy(&self.eval_row_sub(f, c).await?) == Some(true)
-                        }
+                        Some(f) => self.where_row_sub(f, c).await?,
                     };
                     if keep {
                         last = Some(c.clone());
@@ -8711,6 +9789,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                         affs.as_slice(),
                         rowid_alias,
                         conflict_action,
+                        #[cfg(feature = "v07")]
+                        NnActs {
+                            acts: nn_acts.as_slice(),
+                            failed: &self.fail_act,
+                        },
                         Some((assigned.as_slice(), rowid_set)),
                         Some(&self.conn.env),
                     )?,
@@ -8721,6 +9804,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                         affs.as_slice(),
                         rowid_alias,
                         conflict_action,
+                        #[cfg(feature = "v07")]
+                        NnActs {
+                            acts: nn_acts.as_slice(),
+                            failed: &self.fail_act,
+                        },
                     )?,
                 };
                 if !proceed {
@@ -8731,23 +9819,43 @@ impl<'c, S: Storage> Statement<'c, S> {
                 // collect every conflicting rowid, then let the
                 // statement's conflict action decide.
                 let mut conflict_rows: AVec<i64> = AVec::new();
-                let mut first_err: Option<SchemaKind> = None;
+                // Every violated constraint in the pin's order, with
+                // its action (v0.16): (is the rowid, action).
+                let mut violated: AVec<(bool, ConflictAction)> = AVec::new();
+                // A rowid REPLACE runs after the index checks unless
+                // the statement itself says REPLACE (as for INSERT).
+                #[cfg(feature = "indexes")]
+                let defer = ipk_act == ConflictAction::Replace
+                    && conflict_action != ConflictAction::Replace
+                    && !indexes.is_empty();
+                #[cfg(not(feature = "indexes"))]
+                let defer = false;
+                let mut rowid_victim = None;
                 if new_rowid != cur_rowid
                     && btree::seek_rowid(&mut self.conn.pager, root, new_rowid)
                         .await?
                         .is_some()
                 {
-                    conflict_rows.push(new_rowid);
-                    first_err = Some(SchemaKind::DuplicateRowid);
+                    if defer {
+                        rowid_victim = Some(new_rowid);
+                    } else {
+                        conflict_rows.push(new_rowid);
+                    }
+                    violated.push((true, ipk_act));
                 }
                 #[cfg(feature = "indexes")]
                 for ix in indexes.iter() {
-                    let key = key_from_rec(
-                        ix.cols.as_slice(),
-                        rowid_alias,
+                    let Some(key) = ix_key::<S::Error>(
+                        ix,
                         new_rec.as_slice(),
                         new_rowid,
-                    );
+                        rowid_alias,
+                        #[cfg(feature = "expr_index")]
+                        &self.conn.env,
+                    )?
+                    else {
+                        continue;
+                    };
                     if ix.unique
                         && key_has_no_null(key.as_slice())
                         && let Some(other) = btree::index_first_with_prefix(
@@ -8758,18 +9866,39 @@ impl<'c, S: Storage> Statement<'c, S> {
                         )
                         .await?
                         && other != cur_rowid
-                        && !conflict_rows.iter().any(|r| *r == other)
                     {
-                        conflict_rows.push(other);
-                        if first_err.is_none() {
-                            first_err = Some(SchemaKind::UniqueViolation);
+                        #[cfg(feature = "v07")]
+                        violated.push((false, ix.act));
+                        #[cfg(not(feature = "v07"))]
+                        violated.push((false, conflict_action));
+                        if !conflict_rows.iter().any(|r| *r == other) {
+                            conflict_rows.push(other);
                         }
                     }
                 }
+                if let Some(v) = rowid_victim
+                    && !conflict_rows.iter().any(|r| *r == v)
+                {
+                    conflict_rows.push(v);
+                }
+                let first_err = violated.as_slice().first().map(|(r, _)| {
+                    if *r {
+                        SchemaKind::DuplicateRowid
+                    } else {
+                        SchemaKind::UniqueViolation
+                    }
+                });
+                // The first violated constraint that does not resolve
+                // by REPLACE decides (v0.16; see `exec_insert_row_v07`).
+                let decides = violated
+                    .iter()
+                    .find(|(_, a)| *a != ConflictAction::Replace)
+                    .copied();
+                let _ = first_err;
                 if !conflict_rows.is_empty() {
-                    match conflict_action {
-                        ConflictAction::Ignore => continue,
-                        ConflictAction::Replace => {
+                    match decides.map(|d| d.1) {
+                        Some(ConflictAction::Ignore) => continue,
+                        None => {
                             #[cfg(feature = "v07")]
                             {
                                 stale = true;
@@ -8820,10 +9949,15 @@ impl<'c, S: Storage> Statement<'c, S> {
                             }
                         }
                         // ABORT, FAIL, ROLLBACK: the statement fails.
-                        _ => {
-                            return Err(Error::Schema {
-                                kind: first_err.unwrap_or(SchemaKind::UniqueViolation),
-                            });
+                        Some(a) => {
+                            #[cfg(feature = "v07")]
+                            self.fail_act.set(Some(a));
+                            let _ = a;
+                            let kind = match decides {
+                                Some((true, _)) => SchemaKind::DuplicateRowid,
+                                _ => SchemaKind::UniqueViolation,
+                            };
+                            return Err(Error::Schema { kind });
                         }
                     }
                 }
@@ -8850,6 +9984,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     cur_rowid,
                     new_rec.as_slice(),
                     new_rowid,
+                    (assigned.as_slice(), rowid_set),
                 )
                 .await?;
                 stale |= new_rowid != cur_rowid;
@@ -9055,12 +10190,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             #[cfg(feature = "indexes")]
             for ix in indexes.iter() {
-                let key = key_from_rec(
-                    ix.cols.as_slice(),
-                    rowid_alias,
+                let Some(key) = ix_key::<S::Error>(
+                    ix,
                     wrow.rec.as_slice(),
                     wrow.rowid,
-                );
+                    rowid_alias,
+                    #[cfg(feature = "expr_index")]
+                    &self.conn.env,
+                )?
+                else {
+                    continue;
+                };
                 let payload = encode_index_payload(key.as_slice(), wrow.rowid);
                 btree::index_delete(
                     &mut self.conn.pager,
@@ -9217,6 +10357,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let mut pages = btree::collect_table_pages(&mut self.conn.pager, root).await?;
         for ir in index_roots.iter() {
+            // A WITHOUT ROWID table's key is the table's tree (v0.16).
+            if *ir == root {
+                continue;
+            }
             let ipages = btree::collect_index_pages(&mut self.conn.pager, *ir).await?;
             for p in ipages.iter() {
                 pages.push(*p);
@@ -9260,7 +10404,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// The v0.3 secondary-index scan: resolve the lookup's
     /// rowids once, then fetch each row by rowid.
-    #[cfg(feature = "indexes")]
+    #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     async fn step_scan_index(&mut self) -> Result<Step, S::Error> {
         let (table_root, idx_root, desc, probe) = {
             let Plan::Scan { root, access, .. } = &self.plan else {
@@ -9314,7 +10458,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Per-row checkpoint rewind (§7.5.2): the previous row's
         // arena temporaries die before the next row is decoded.
         self.arena.rewind(self.row_ckpt);
-        #[cfg(feature = "indexes")]
+        #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
         {
             let is_index = matches!(
                 &self.plan,
@@ -9340,7 +10484,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             Access::FullScan => SimpleAccess::FullScan,
             Access::Rowid(r) => SimpleAccess::Rowid(*r),
             Access::Empty => SimpleAccess::Empty,
-            #[cfg(feature = "indexes")]
+            #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             Access::Index { .. } => unreachable!(),
         };
         match access {
@@ -9558,6 +10702,20 @@ impl<'c, S: Storage> Statement<'c, S> {
             if sp.rec != 0 {
                 return Err(Error::Unsupported);
             }
+            // v0.16: a TEMP table read by a main statement.
+            #[cfg(feature = "v16")]
+            if sp.temp {
+                let rows = self.scan_temp(sp).await?;
+                src_rows.push(rows);
+                continue;
+            }
+            // v0.16 (`expr_index`): the rows an index finds.
+            #[cfg(feature = "expr_index")]
+            if let Some(acc) = &sp.access {
+                let rows = self.access_rows(sp, acc, &RowData::empty()).await?;
+                src_rows.push(rows);
+                continue;
+            }
             let mut rows = AVec::new();
             let mut cursor = ScanCursor::new(sp.root);
             let mut buf = AVec::new();
@@ -9623,6 +10781,22 @@ impl<'c, S: Storage> Statement<'c, S> {
         let _ = (outer, need);
         let mut src_rows: AVec<AVec<(AVec<OwnedValue>, Option<i64>)>> = AVec::new();
         for sp in sources.iter() {
+            // v0.16 (`json`): a JSON table-valued function's rows —
+            // computed in the join when its arguments read a source
+            // to its left (`join_step`).
+            #[cfg(feature = "json")]
+            if sp.tvf != 0 {
+                if sp.tvf & crate::query::TVF_LATERAL != 0 {
+                    src_rows.push(AVec::new());
+                    continue;
+                }
+                let mut padded = outer.clone();
+                pad_sources(&mut padded, sources);
+                let need = if src_rows.is_empty() { need } else { None };
+                let rows = self.json_tvf_rows(sp, &padded, need).await?;
+                src_rows.push(rows);
+                continue;
+            }
             // v0.16: a recursive reference's one row.
             #[cfg(feature = "v16")]
             if sp.rec != 0 {
@@ -9654,6 +10828,31 @@ impl<'c, S: Storage> Statement<'c, S> {
                     src_rows.push(rows);
                     continue;
                 }
+            }
+            // v0.16: a TEMP table read by a main statement.
+            #[cfg(feature = "v16")]
+            if sp.temp {
+                let rows = self.scan_temp(sp).await?;
+                src_rows.push(rows);
+                continue;
+            }
+            // v0.16 (`expr_index`): the rows an index finds, for
+            // the enclosing row (a lateral path's rows are found per
+            // combination, in `join_step`).
+            #[cfg(feature = "expr_index")]
+            if let Some(acc) = &sp.access {
+                let rows = if acc.lateral {
+                    AVec::new()
+                } else {
+                    // The probes evaluate on the outer row padded to
+                    // the core's width, where a subquery in them
+                    // finds its own slots.
+                    let mut padded = outer.clone();
+                    pad_sources(&mut padded, sources);
+                    self.access_rows(sp, acc, &padded).await?
+                };
+                src_rows.push(rows);
+                continue;
             }
             let mut rows = AVec::new();
             let mut cursor = ScanCursor::new(sp.root);
@@ -9731,6 +10930,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 tails.as_slice(),
                 cores.as_slice(),
                 qp.comp_order.as_slice(),
+                self.conn.pager.text_enc(),
             )
         };
         let rows = apply_window(rows, window);
@@ -9812,11 +11012,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 crate::query::exprs_colls(qp.items.as_slice()).as_slice(),
             );
         }
+        let enc = self.conn.pager.text_enc();
         produced.as_mut_slice().sort_by(|x, y| {
             crate::query::order_keys_cmp(
                 x.keys.as_slice(),
                 y.keys.as_slice(),
                 qp.order_by.iter().map(|(_, o)| *o),
+                enc,
             )
         });
         let mut kept_rows: AVec<AVec<OwnedValue>> = AVec::new();
@@ -9933,8 +11135,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
                 let mut units = AVec::new();
                 units.push(ins);
-                let (_, vals) = crate::window::compute(wins.as_slice(), units.as_slice())
-                    .map_err(|kind| Error::Schema { kind })?;
+                let (_, vals) = crate::window::compute(
+                    wins.as_slice(),
+                    units.as_slice(),
+                    self.conn.pager.text_enc(),
+                )
+                .map_err(|kind| Error::Schema { kind })?;
                 let empty = AVec::new();
                 let v = vals.as_slice().first().unwrap_or(&empty);
                 for e in r {
@@ -9949,6 +11155,102 @@ impl<'c, S: Storage> Statement<'c, S> {
             rv.push(self.eval_row_sub(e, outer).await?);
         }
         Ok(rv)
+    }
+
+    /// Whether condition `e` holds for `row` (v0.16 fix, ungated):
+    /// `eval_row_sub` with the pin's jump code for AND / OR / NOT
+    /// (`query::cond`), so `WHERE json_valid(j) AND j ->> 'a' = 1`
+    /// never evaluates the second term for a row the first rejects.
+    /// A subquery runs only when its operand is reached, and an AND
+    /// / OR whose left operand holds a subquery and right one does
+    /// not tests the right one first (the pin's `exprEvalRhsFirst`).
+    #[cfg(feature = "v06")]
+    async fn cond_row_sub(&mut self, e: &RExpr, row: &RowData) -> Result<bool, S::Error> {
+        self.cond_is_sub(e, row, true).await
+    }
+
+    /// `cond_row_sub` asking whether `e` is `want` (`query::cond_is`).
+    #[cfg(feature = "v06")]
+    fn cond_is_sub<'a>(
+        &'a mut self,
+        e: &'a RExpr,
+        row: &'a RowData,
+        want: bool,
+    ) -> CondFuture<'a, S::Error> {
+        Box::pin(async move {
+            if !crate::query::has_sub(e) {
+                return crate::query::cond_is::<S::Error>(
+                    e,
+                    &Ctx::of(row).with(&self.conn.env),
+                    want,
+                );
+            }
+            match e {
+                RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r)
+                    if crate::query::int_lit(l).is_none() && crate::query::int_lit(r).is_none() =>
+                {
+                    let (first, second) = if crate::query::has_sub(l) && !crate::query::has_sub(r) {
+                        (&**r, &**l)
+                    } else {
+                        (&**l, &**r)
+                    };
+                    let decisive = (*op == BinOp::Or) == want;
+                    let a = self.cond_is_sub(first, row, want).await?;
+                    if a == decisive {
+                        return Ok(a);
+                    }
+                    self.cond_is_sub(second, row, want).await
+                }
+                RExpr::Not(x) => self.cond_is_sub(x, row, !want).await,
+                _ => Ok(crate::query::truthy(&self.eval_row_sub(e, row).await?) == Some(want)),
+            }
+        })
+    }
+
+    /// Whether WHERE clause `f` holds for `row` (v0.16 review fix,
+    /// ungated): `cond_row_sub` over its AND terms in order, those
+    /// holding a correlated subquery after the rest, as the pin
+    /// codes them (`TERM_VARSELECT`): `WHERE EXISTS (SELECT .. FROM
+    /// json_each(t.j)) AND json_valid(t.j)` never runs the subquery
+    /// for a row the second term rejects.
+    #[cfg(feature = "v06")]
+    async fn where_row_sub(&mut self, f: &RExpr, row: &RowData) -> Result<bool, S::Error> {
+        if !crate::query::has_sub(f) {
+            return self.cond_row_sub(f, row).await;
+        }
+        // A term `x IN (SELECT ...)` is the pin's IN constraint, tested
+        // in place even when correlated (probed); any other term
+        // holding a correlated subquery waits.
+        let late = |t: &RExpr| match t {
+            RExpr::InSub(x, _, false) => crate::query::has_corr_sub(x),
+            _ => crate::query::has_corr_sub(t),
+        };
+        let mut terms = AVec::new();
+        crate::query::and_terms(f, &mut terms);
+        for pass in [false, true] {
+            for t in terms.iter() {
+                if late(t) == pass && !self.cond_row_sub(t, row).await? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether HAVING condition `e` holds for a group (v0.16 review
+    /// fix, ungated): AND / OR stop early (`query::cond`) when it
+    /// holds no subquery.
+    #[cfg(feature = "v06")]
+    async fn cond_group_sub(
+        &mut self,
+        e: &RExpr,
+        rows: &[RowData],
+        rep: &RowData,
+    ) -> Result<bool, S::Error> {
+        if !crate::query::has_sub(e) {
+            return crate::query::cond::<S::Error>(e, &Ctx::group(rows, rep).with(&self.conn.env));
+        }
+        Ok(crate::query::truthy(&self.eval_group_sub(e, rows, rep).await?) == Some(true))
     }
 
     /// Evaluate one expression for one row, executing any
@@ -10005,13 +11307,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
                 for r in rows {
                     let ctx = Ctx::of(r).with(&self.conn.env);
-                    if let Some(vs) = crate::query::agg_row::<S::Error>(&p, &mut |x| {
-                        crate::query::eval::<S::Error>(x, &ctx)
-                    })? {
+                    if let Some(vs) = crate::query::agg_row::<S::Error>(&p, &ctx)? {
                         arg_rows.push(vs);
                     }
                 }
-                crate::agg::fold::<S::Error>(&p, arg_rows)
+                crate::agg::fold::<S::Error>(&p, arg_rows, self.conn.pager.text_enc())
             })?;
             return Box::pin(self.eval_group_sub(&e2, rows, rep)).await;
         }
@@ -10066,7 +11366,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             // The FILTER first: a row it rejects is not stepped,
             // and nothing else of it is evaluated.
             if let Some(f) = p.filter
-                && crate::query::truthy(&self.eval_row_sub(f, r).await?) != Some(true)
+                && !self.cond_row_sub(f, r).await?
             {
                 continue;
             }
@@ -10076,7 +11376,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             arg_rows.push(vs);
         }
-        crate::agg::fold::<S::Error>(&p, arg_rows)
+        crate::agg::fold::<S::Error>(&p, arg_rows, self.conn.pager.text_enc())
     }
 
     /// The representative row for a top-level query's group
@@ -10147,12 +11447,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut rep = first;
         for r in grows {
             if let Some(f) = m.filter
-                && crate::query::truthy(&self.eval_row_sub(f, r).await?) != Some(true)
+                && !self.cond_row_sub(f, r).await?
             {
                 continue;
             }
             let v = self.eval_row_sub(m.arg, r).await?;
-            if extremum_step(m.kind, coll, &mut best, v) {
+            if extremum_step(m.kind, coll, &mut best, v, self.conn.pager.text_enc()) {
                 rep = r;
             }
         }
@@ -10436,6 +11736,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 tails.push((*op, right));
                 cores.push(core_colls(tail.items.as_slice(), tail.values.as_slice()));
             }
+            let enc = self.conn.pager.text_enc();
             let rows = if union_first_row(
                 &plan.limit,
                 &plan.offset,
@@ -10449,15 +11750,18 @@ impl<'c, S: Storage> Statement<'c, S> {
                     tails.as_slice(),
                     cores.as_slice(),
                     plan.comp_order.as_slice(),
+                    enc,
                 )
             };
             return Ok(apply_window(rows, window));
         }
+        let enc = self.conn.pager.text_enc();
         produced.as_mut_slice().sort_by(|x, y| {
             crate::query::order_keys_cmp(
                 x.keys.as_slice(),
                 y.keys.as_slice(),
                 plan.order_by.iter().map(|(_, o)| *o),
+                enc,
             )
         });
         let mut rows: AVec<AVec<OwnedValue>> = AVec::new();
@@ -10570,6 +11874,15 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &RowData,
         out: &mut AVec<RowData>,
     ) -> Result<(), S::Error> {
+        // The WHERE clause's constant terms, once, first (v0.16
+        // review fix): false, and no row joins.
+        if !crate::query::join_constants_hold::<S::Error>(
+            filter,
+            sources,
+            &Ctx::of(outer).with(&self.conn.env),
+        )? {
+            return Ok(());
+        }
         let mut matched = right_match_flags(sources, src_rows);
         self.join_step(
             sources,
@@ -10618,14 +11931,55 @@ impl<'c, S: Storage> Statement<'c, S> {
             let (Some(sp), Some(rows)) = (sources.get(idx), src_rows.get(idx)) else {
                 let keep = match filter {
                     None => true,
-                    Some(f) => {
-                        crate::query::truthy(&self.eval_row_sub(f, &acc).await?) == Some(true)
-                    }
+                    Some(f) => self.where_row_sub(f, &acc).await?,
                 };
                 if keep {
                     out.push(acc);
                 }
                 return Ok(());
+            };
+            // A JSON table-valued function reading the sources to its
+            // left (v0.16, `json`): its rows for this combination.
+            #[cfg(feature = "json")]
+            let lateral;
+            #[cfg(feature = "json")]
+            let mut acc = acc;
+            #[cfg(feature = "json")]
+            let rows = if sp.tvf & crate::query::TVF_LATERAL != 0 {
+                match self.lateral_rows(sources, idx, filter, &acc).await? {
+                    Some(r) => {
+                        lateral = r;
+                        // The left values only the call read: not
+                        // copied into each of its rows.
+                        let here = acc.vals.len();
+                        for back in sp.tvf_dead.iter() {
+                            if let Some(v) = here
+                                .checked_sub(*back)
+                                .and_then(|s| acc.vals.as_mut_slice().get_mut(s))
+                            {
+                                *v = OwnedValue::Null;
+                            }
+                        }
+                        &lateral
+                    }
+                    None => return Ok(()),
+                }
+            } else {
+                rows
+            };
+            // v0.16 (`expr_index`): an index lookup on the sources
+            // to the left — this combination's rows.
+            #[cfg(feature = "expr_index")]
+            let looked;
+            #[cfg(feature = "expr_index")]
+            let rows = match sp.access.as_deref() {
+                Some(a) if a.lateral => {
+                    let mut padded = acc.clone();
+                    pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
+                    looked = self.access_rows(sp, a, &padded).await?;
+                    &looked
+                }
+                _ => rows,
             };
             let mut any = false;
             for (ri, (vals, rowid)) in rows.iter().enumerate() {
@@ -10648,11 +12002,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     Some(on) if crate::query::has_sub(on) => {
                         let mut padded = acc2.clone();
                         pad_sources(&mut padded, sources.get(idx + 1..).unwrap_or(&[]));
-                        crate::query::truthy(&self.eval_row_sub(on, &padded).await?) == Some(true)
+                        self.cond_row_sub(on, &padded).await?
                     }
-                    Some(on) => {
-                        crate::query::truthy(&self.eval_row_sub(on, &acc2).await?) == Some(true)
-                    }
+                    Some(on) => self.cond_row_sub(on, &acc2).await?,
                 };
                 if on_ok {
                     any = true;
@@ -10823,21 +12175,25 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
-            groups.as_mut_slice().sort_by(|a, b| {
-                for (((av, bv), c), d) in
-                    a.0.iter()
-                        .zip(b.0.iter())
-                        .zip(gcolls.iter())
-                        .zip(gdesc.iter())
-                {
-                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
-                    let o = if *d { o.reverse() } else { o };
-                    if o != core::cmp::Ordering::Equal {
-                        return o;
+            if !groups_arrive_ordered(qp.sources.as_slice()) {
+                let enc = self.conn.pager.text_enc();
+                groups.as_mut_slice().sort_by(|a, b| {
+                    for (((av, bv), c), d) in
+                        a.0.iter()
+                            .zip(b.0.iter())
+                            .zip(gcolls.iter())
+                            .zip(gdesc.iter())
+                    {
+                        let o =
+                            crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
+                        let o = if *d { o.reverse() } else { o };
+                        if o != core::cmp::Ordering::Equal {
+                            return o;
+                        }
                     }
-                }
-                core::cmp::Ordering::Equal
-            });
+                    core::cmp::Ordering::Equal
+                });
+            }
         }
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
@@ -10864,12 +12220,15 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
-                for a in group_aggs(qp.items.as_slice(), qp.order_by.as_slice()).iter() {
+                // Every aggregate of the group finalizes before its
+                // HAVING runs, the HAVING's own included (its AND / OR
+                // then stop early over the values).
+                let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
+                crate::query::collect_outer_aggs(h, &mut aggs);
+                for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
-                    != Some(true)
-                {
+                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
                     continue;
                 }
             }
@@ -11053,21 +12412,25 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
-            groups.as_mut_slice().sort_by(|a, b| {
-                for (((av, bv), c), d) in
-                    a.0.iter()
-                        .zip(b.0.iter())
-                        .zip(gcolls.iter())
-                        .zip(gdesc.iter())
-                {
-                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
-                    let o = if *d { o.reverse() } else { o };
-                    if o != core::cmp::Ordering::Equal {
-                        return o;
+            if !groups_arrive_ordered(plan.sources.as_slice()) {
+                let enc = self.conn.pager.text_enc();
+                groups.as_mut_slice().sort_by(|a, b| {
+                    for (((av, bv), c), d) in
+                        a.0.iter()
+                            .zip(b.0.iter())
+                            .zip(gcolls.iter())
+                            .zip(gdesc.iter())
+                    {
+                        let o =
+                            crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
+                        let o = if *d { o.reverse() } else { o };
+                        if o != core::cmp::Ordering::Equal {
+                            return o;
+                        }
                     }
-                }
-                core::cmp::Ordering::Equal
-            });
+                    core::cmp::Ordering::Equal
+                });
+            }
         }
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
@@ -11094,12 +12457,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
-                for a in group_aggs(plan.items.as_slice(), plan.order_by.as_slice()).iter() {
+                let mut aggs = group_aggs(plan.items.as_slice(), plan.order_by.as_slice());
+                crate::query::collect_outer_aggs(h, &mut aggs);
+                for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if crate::query::truthy(&self.eval_group_sub(h, grows.as_slice(), &rep).await?)
-                    != Some(true)
-                {
+                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
                     continue;
                 }
             }
@@ -11166,7 +12529,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         rows: &[RowData],
         groups: &[(AVec<OwnedValue>, AVec<RowData>)],
     ) -> Result<AVec<Produced>, S::Error> {
-        let (order, vals, ti, to) = win_results::<S::Error>(wins, &mut units, items, order_by)?;
+        let (order, vals, ti, to) = win_results::<S::Error>(
+            wins,
+            &mut units,
+            items,
+            order_by,
+            self.conn.pager.text_enc(),
+        )?;
         let empty = RowData::empty();
         let mut out = AVec::with_capacity(order.len());
         for &u in order.iter() {
@@ -11314,6 +12683,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                     v.affs.as_slice(),
                     v.rowid_alias,
                     ConflictAction::Abort,
+                    #[cfg(feature = "v07")]
+                    NnActs {
+                        acts: &[],
+                        failed: &core::cell::Cell::new(None),
+                    },
                     None,
                     Some(&self.conn.env),
                 )?;
@@ -11545,6 +12919,11 @@ type SubplanFuture<'x, E> = core::pin::Pin<
     alloc::boxed::Box<dyn core::future::Future<Output = Result<AVec<AVec<OwnedValue>>, E>> + 'x>,
 >;
 
+/// A boxed recursive condition future (v0.16, `cond_is_sub`).
+#[cfg(feature = "v06")]
+type CondFuture<'x, E> =
+    core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<bool, E>> + 'x>>;
+
 /// A boxed recursive-join future (v0.6).
 #[cfg(feature = "v06")]
 type JoinFuture<'x, E> =
@@ -11615,7 +12994,7 @@ fn resolve_compound_order<E>(
             Expr::Literal(Literal::Integer(n)) if *n >= 1 && (*n as usize) <= width => {
                 Some(*n as usize - 1)
             }
-            Expr::Column { table, name } => {
+            Expr::Column { table, name, .. } => {
                 let nb = handle_bytes(arena, *name);
                 let qb = table.map(|h| handle_bytes(arena, h));
                 core::iter::once(head)
@@ -11733,12 +13112,14 @@ fn compound_key_cmp(
     a: &[OwnedValue],
     b: &[OwnedValue],
     colls: &[crate::record::Coll],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        let c = crate::record::compare_coll(
+        let c = crate::record::compare_coll_in(
             &x.as_value(),
             &y.as_value(),
             colls.get(i).copied().unwrap_or_default(),
+            enc,
         );
         if c != core::cmp::Ordering::Equal {
             return c;
@@ -11765,14 +13146,15 @@ fn merge_compound(
     mut right: AVec<AVec<OwnedValue>>,
     key: &[crate::record::Coll],
     dup: &[crate::record::Coll],
+    enc: crate::record::TextEnc,
 ) -> AVec<AVec<OwnedValue>> {
     use crate::sql::CompoundOp::{Except, Intersect, Union, UnionAll};
     use core::cmp::Ordering::{Equal, Greater, Less};
     left.as_mut_slice()
-        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key));
+        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key, enc));
     right
         .as_mut_slice()
-        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key));
+        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key, enc));
     let (l, r) = (left.as_slice(), right.as_slice());
     let mut out: AVec<AVec<OwnedValue>> = AVec::new();
     let emit = |out: &mut AVec<AVec<OwnedValue>>, row: &AVec<OwnedValue>| {
@@ -11789,7 +13171,7 @@ fn merge_compound(
     let (mut i, mut j) = (0usize, 0usize);
     loop {
         match (l.get(i), r.get(j)) {
-            (Some(a), Some(b)) => match compound_key_cmp(a.as_slice(), b.as_slice(), key) {
+            (Some(a), Some(b)) => match compound_key_cmp(a.as_slice(), b.as_slice(), key, enc) {
                 Less => {
                     if op != Intersect {
                         emit(&mut out, a);
@@ -11850,6 +13232,7 @@ fn run_compound(
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
     cores: &[AVec<Option<crate::record::Coll>>],
     order: &[(usize, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
 ) -> AVec<AVec<OwnedValue>> {
     use crate::sql::CompoundOp::UnionAll;
     let width = cores.first().map_or(0, |c| c.len());
@@ -11881,6 +13264,7 @@ fn run_compound(
                 right.clone(),
                 key.as_slice(),
                 prefix(k + 1).as_slice(),
+                enc,
             );
         } else {
             for r in right.iter() {
@@ -11889,7 +13273,7 @@ fn run_compound(
         }
     }
     rows.as_mut_slice()
-        .sort_by(|a, b| compound_order_cmp(a, b, order));
+        .sort_by(|a, b| compound_order_cmp(a, b, order, enc));
     rows
 }
 
@@ -11961,10 +13345,11 @@ fn compound_order_cmp(
     a: &AVec<OwnedValue>,
     b: &AVec<OwnedValue>,
     order: &[(usize, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     for (idx, o) in order.iter() {
         if let (Some(x), Some(y)) = (a.as_slice().get(*idx), b.as_slice().get(*idx)) {
-            let c = crate::query::order_cmp(x, y, *o);
+            let c = crate::query::order_cmp(x, y, *o, enc);
             if c != core::cmp::Ordering::Equal {
                 return c;
             }
@@ -12254,7 +13639,9 @@ fn order_ref(
             .ok()
             .and_then(|k| k.checked_sub(1))
             .filter(|k| *k < items.len()),
-        Expr::Column { table: None, name } => {
+        Expr::Column {
+            table: None, name, ..
+        } => {
             let nb = handle_bytes(arena, *name);
             aliases
                 .iter()
@@ -12299,6 +13686,21 @@ fn group_desc(
         out.push(group_by.len() == order_by.len() && order_by.get(i).is_some_and(|(_, o)| o.desc));
     }
     out
+}
+
+/// Whether a query's rows arrive in its GROUP BY order (v0.16,
+/// `expr_index`): its one source's index delivers it, and the pin
+/// then emits the groups as they arrive, skipping its group sorter.
+#[cfg(feature = "v04")]
+fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
+    #[cfg(feature = "expr_index")]
+    if let [s] = sources
+        && s.access.as_ref().is_some_and(|a| a.groups)
+    {
+        return true;
+    }
+    let _ = sources;
+    false
 }
 
 /// DISTINCT over produced rows (v0.4): first occurrences
@@ -12403,6 +13805,16 @@ fn left_padded(
 #[cfg(feature = "v06")]
 fn query_plan_has_sub(qp: &QueryPlan) -> bool {
     use crate::query::has_sub;
+    // A lateral index lookup (v0.16, `expr_index`) runs in the
+    // async join too.
+    #[cfg(feature = "expr_index")]
+    if qp
+        .sources
+        .iter()
+        .any(|s| s.access.as_ref().is_some_and(|a| a.lateral))
+    {
+        return true;
+    }
     qp.sources.iter().any(|s| s.derived.is_some())
         || qp
             .sources
@@ -12437,6 +13849,15 @@ fn join_all<E>(
     src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
     out: &mut AVec<RowData>,
 ) -> Result<(), E> {
+    // The WHERE clause's constant terms, once, first (v0.16 review
+    // fix): false, and no row joins.
+    if !crate::query::join_constants_hold::<E>(
+        qp.filter.as_ref(),
+        qp.sources.as_slice(),
+        &Ctx::of(&RowData::empty()).with(env),
+    )? {
+        return Ok(());
+    }
     let mut matched = right_match_flags(qp.sources.as_slice(), src_rows);
     join_rows::<E>(
         env,
@@ -12481,10 +13902,7 @@ fn join_rows<E>(
     let (Some(sp), Some(rows)) = (qp.sources.as_slice().get(idx), src_rows.get(idx)) else {
         let keep = match &qp.filter {
             None => true,
-            Some(f) => {
-                crate::query::truthy(&crate::query::eval::<E>(f, &Ctx::of(acc).with(env))?)
-                    == Some(true)
-            }
+            Some(f) => crate::query::cond::<E>(f, &Ctx::of(acc).with(env))?,
         };
         if keep {
             out.push(acc.clone());
@@ -12500,10 +13918,7 @@ fn join_rows<E>(
         acc.rowids.push(*rowid);
         let on_ok = match &sp.on {
             None => true,
-            Some(on) => {
-                crate::query::truthy(&crate::query::eval::<E>(on, &Ctx::of(acc).with(env))?)
-                    == Some(true)
-            }
+            Some(on) => crate::query::cond::<E>(on, &Ctx::of(acc).with(env))?,
         };
         if on_ok {
             any = true;
@@ -12651,21 +14066,24 @@ fn project_rows<E>(
             }
         }
         // SQLite's GROUP BY emits groups in key order (its sorter).
-        groups.as_mut_slice().sort_by(|a, b| {
-            for (((av, bv), c), d) in
-                a.0.iter()
-                    .zip(b.0.iter())
-                    .zip(gcolls.iter())
-                    .zip(gdesc.iter())
-            {
-                let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
-                let o = if *d { o.reverse() } else { o };
-                if o != core::cmp::Ordering::Equal {
-                    return o;
+        if !groups_arrive_ordered(qp.sources.as_slice()) {
+            let enc = env.text_enc();
+            groups.as_mut_slice().sort_by(|a, b| {
+                for (((av, bv), c), d) in
+                    a.0.iter()
+                        .zip(b.0.iter())
+                        .zip(gcolls.iter())
+                        .zip(gdesc.iter())
+                {
+                    let o = crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
+                    let o = if *d { o.reverse() } else { o };
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
                 }
-            }
-            core::cmp::Ordering::Equal
-        });
+                core::cmp::Ordering::Equal
+            });
+        }
     }
     #[cfg(feature = "window")]
     let mut group_at = usize::MAX;
@@ -12689,10 +14107,14 @@ fn project_rows<E>(
             if !pass {
                 continue;
             }
-            for a in group_aggs(qp.items.as_slice(), qp.order_by.as_slice()).iter() {
+            // Every aggregate of the group, the HAVING's included,
+            // finalizes before the HAVING runs.
+            let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
+            crate::query::collect_outer_aggs(h, &mut aggs);
+            for a in aggs.iter() {
                 crate::query::eval::<E>(a, &ctx)?;
             }
-            if crate::query::truthy(&crate::query::eval::<E>(h, &ctx)?) != Some(true) {
+            if !crate::query::cond::<E>(h, &ctx)? {
                 continue;
             }
         }
@@ -12750,6 +14172,7 @@ fn win_results<E>(
     units: &mut AVec<WinUnit>,
     items: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
 ) -> Result<
     (
         AVec<usize>,
@@ -12764,7 +14187,7 @@ fn win_results<E>(
         ins.push(core::mem::take(&mut u.ins));
     }
     let (order, vals) =
-        crate::window::compute(wins, ins.as_slice()).map_err(|kind| Error::Schema { kind })?;
+        crate::window::compute(wins, ins.as_slice(), enc).map_err(|kind| Error::Schema { kind })?;
     let mut ti = AVec::new();
     for it in items {
         ti.push(crate::window::strip(it));
@@ -12793,6 +14216,7 @@ fn win_project<E>(
         &mut units,
         qp.items.as_slice(),
         qp.order_by.as_slice(),
+        env.text_enc(),
     )?;
     let empty = RowData::empty();
     let mut out = AVec::with_capacity(order.len());
@@ -12905,6 +14329,7 @@ fn extremum_step(
     coll: crate::record::Coll,
     best: &mut Option<OwnedValue>,
     v: OwnedValue,
+    enc: crate::record::TextEnc,
 ) -> bool {
     if matches!(v, OwnedValue::Null) {
         return best.is_none();
@@ -12912,7 +14337,7 @@ fn extremum_step(
     let take = match best {
         None => true,
         Some(b) => {
-            let o = crate::record::compare_coll(&v.as_value(), &b.as_value(), coll);
+            let o = crate::record::compare_coll_in(&v.as_value(), &b.as_value(), coll, enc);
             if kind == crate::query::AggKind::Min {
                 o == core::cmp::Ordering::Less
             } else {
@@ -12950,12 +14375,12 @@ fn pick_rep_from<E>(
     for r in grows {
         let ctx = Ctx::of(r).with(env);
         if let Some(f) = m.filter
-            && crate::query::truthy(&crate::query::eval::<E>(f, &ctx)?) != Some(true)
+            && !crate::query::cond::<E>(f, &ctx)?
         {
             continue;
         }
         let v = crate::query::eval::<E>(m.arg, &ctx)?;
-        if extremum_step(m.kind, coll, &mut best, v) {
+        if extremum_step(m.kind, coll, &mut best, v, env.text_enc()) {
             rep = r;
         }
     }

@@ -422,6 +422,19 @@ impl<T> AVec<T> {
         let n = n.min(self.vec.len());
         self.vec.drain(..n);
     }
+    /// Replace the elements in `at..at + del` (clamped to the
+    /// length) by `ins`, in place: only the elements after the
+    /// range move (v0.16, `json`: a JSONB header resized while
+    /// parsing shifts just its container's payload).
+    pub fn replace_range(&mut self, at: usize, del: usize, ins: &[T])
+    where
+        T: Clone,
+    {
+        let len = self.vec.len();
+        let at = at.min(len);
+        let end = at.saturating_add(del).min(len);
+        self.vec.splice(at..end, ins.iter().cloned());
+    }
     /// Insert `v` at `at`, shifting later elements up (panics if
     /// `at > len`, like `Vec::insert`).
     pub fn insert(&mut self, at: usize, v: T) {

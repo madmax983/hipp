@@ -322,7 +322,7 @@ fn vacuum_errors() {
 
 #[test]
 fn vacuum_into_writes_the_pins_file() {
-    let dir = std::env::temp_dir().join(format!("hipp-v16mt-into-{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-v16mt-into");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let src = dir.join("src.db");
@@ -401,13 +401,20 @@ fn vacuum_pin_made_files() {
     assert!(hipp_exec(&h, &["VACUUM"]).is_none());
     common::cli(&o, "VACUUM;");
     assert_eq!(oracle_schema(&h), oracle_schema(&o));
-    // An index hipp cannot order is refused, not mis-copied.
+    // An expression index: copied (v0.16, `expr_index`), else
+    // refused, never mis-copied.
     common::cli(&o, "CREATE INDEX ex ON t(a + 1);");
     std::fs::copy(&o, &h).expect("copy");
-    assert!(matches!(
-        hipp_exec(&h, &["VACUUM"]),
-        Some(hipp::Error::Unsupported)
-    ));
+    if cfg!(feature = "expr_index") {
+        assert!(hipp_exec(&h, &["VACUUM"]).is_none());
+        common::cli(&o, "VACUUM;");
+        assert_eq!(oracle_schema(&h), oracle_schema(&o));
+    } else {
+        assert!(matches!(
+            hipp_exec(&h, &["VACUUM"]),
+            Some(hipp::Error::Unsupported)
+        ));
+    }
     assert_eq!(common::cli(&h, "PRAGMA integrity_check;"), "ok\n");
 }
 
@@ -895,7 +902,7 @@ fn new_rowid_after_the_largest() {
 /// nothing.
 #[test]
 fn vacuum_into_expressions() {
-    let dir = std::env::temp_dir().join(format!("hipp-v16mt-intoexpr-{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-v16mt-intoexpr");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let src = dir.join("src.db");

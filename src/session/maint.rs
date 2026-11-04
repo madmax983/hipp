@@ -376,46 +376,34 @@ impl<S: Storage> Statement<'_, S> {
 
     /// Whether `e`, a constraint violation of this INSERT / UPDATE,
     /// resolves by ROLLBACK and so ends the whole transaction, as on
-    /// the pin: the statement's `OR ROLLBACK`, or, under the default
-    /// action, the table's constraint-level `ON CONFLICT ROLLBACK`
-    /// on a constraint of the violated kind (NOT NULL; UNIQUE /
-    /// PRIMARY KEY). CHECK constraints take no conflict clause.
+    /// the pin: the statement's `OR ROLLBACK`, or, without an OR
+    /// clause, the failed constraint's own `ON CONFLICT ROLLBACK`
+    /// (NOT NULL; UNIQUE / PRIMARY KEY; v0.16: the very constraint
+    /// that failed, recorded in `fail_act`). CHECK constraints take
+    /// no conflict clause.
     pub(super) fn resolves_rollback(&self, e: &Error<S::Error>) -> bool {
-        let (conflict, root) = match &self.plan {
-            Plan::Insert { conflict, root, .. } | Plan::Update { conflict, root, .. } => {
-                (*conflict, *root)
+        let conflict = match &self.plan {
+            Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
+            _ => return false,
+        };
+        if !matches!(
+            e,
+            Error::Schema {
+                kind: SchemaKind::NotNullViolation
+                    | SchemaKind::UniqueViolation
+                    | SchemaKind::DuplicateRowid
+                    | SchemaKind::CheckViolation,
             }
-            _ => return false,
-        };
-        let (nn, uq) = match e {
-            Error::Schema {
-                kind: SchemaKind::NotNullViolation,
-            } => (true, false),
-            Error::Schema {
-                kind: SchemaKind::UniqueViolation | SchemaKind::DuplicateRowid,
-            } => (false, true),
-            Error::Schema {
-                kind: SchemaKind::CheckViolation,
-            } => (false, false),
-            _ => return false,
-        };
+        ) {
+            return false;
+        }
         if self.upsert_failed {
             return false;
         }
-        match conflict {
-            ConflictAction::Rollback => return true,
-            ConflictAction::Abort => {}
-            _ => return false,
-        }
-        let ca = &self.conn.catalog_arena;
-        let Some(t) = self.conn.catalog.tables.iter().find(|t| t.root == root) else {
-            return false;
-        };
-        let (rn, ru) = crate::sql::parser::rollback_constraints::<S::Error>(
-            handle_bytes(ca, t.sql),
-            &self.arena,
-        );
-        (nn && rn) || (uq && ru)
+        // The failing constraint's own action when it resolved by its
+        // clause (NOT NULL, UNIQUE / PRIMARY KEY, the rowid); a CHECK
+        // takes the statement's.
+        self.fail_act.get().unwrap_or(conflict) == ConflictAction::Rollback
     }
 
     pub(super) async fn step_maint(&mut self) -> Result<Step, S::Error> {
@@ -436,6 +424,12 @@ impl<S: Storage> Statement<'_, S> {
                 }
                 let starts = !self.conn.explicit_txn;
                 self.conn.pager.sp_open(Some(name.as_slice()), starts);
+                // As at BEGIN (v0.16, `wal`: the checkpoint's
+                // read-since-the-transaction-began rule).
+                #[cfg(feature = "wal")]
+                if starts {
+                    self.conn.pager.clear_touched();
+                }
                 self.conn.explicit_txn = true;
             }
             Maint::Release(name) => self.release(name.as_slice()).await?,
@@ -529,8 +523,16 @@ impl<S: Storage> Statement<'_, S> {
         // The deferred foreign-key counters return with it.
         #[cfg(feature = "foreign_keys")]
         self.conn.fk.rollback_to(level);
-        // The schema may have rolled back with it.
-        self.conn.rebuild_catalog().await
+        // The schema may have rolled back with it. (Re-reading it is
+        // not a read of the transaction's: v0.16, `wal`.)
+        #[cfg(feature = "wal")]
+        let touched = self.conn.pager.touched();
+        self.conn.rebuild_catalog().await?;
+        #[cfg(feature = "wal")]
+        if !touched {
+            self.conn.pager.clear_touched();
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------- VACUUM
@@ -562,6 +564,15 @@ impl<S: Storage> Statement<'_, S> {
             .prag
             .vacuum_page_size
             .unwrap_or(self.conn.pager.page_size());
+        // The page size of a WAL-mode database cannot change: its
+        // VACUUM keeps it, as on the pin (VACUUM INTO takes the new
+        // one; v0.16, `wal`).
+        #[cfg(feature = "wal")]
+        let ps = if into.is_none() && self.conn.pager.wal_mode() {
+            self.conn.pager.page_size()
+        } else {
+            ps
+        };
         let mut img = self.compact_image(ps, into.is_some()).await?;
         // Page 1's header, as the pin leaves it.
         let h = *self.conn.pager.header();
@@ -585,12 +596,27 @@ impl<S: Storage> Statement<'_, S> {
         put_be_u32(d, 44, 4);
         put_be_u32(d, 48, cache_size);
         put_be_u32(d, 52, 0);
+        #[cfg(feature = "utf16")]
+        put_be_u32(d, 56, crate::pager::enc_code(self.conn.pager.text_enc()));
+        #[cfg(not(feature = "utf16"))]
         put_be_u32(d, 56, 1);
         put_be_u32(d, 60, h.user_version);
         put_be_u32(d, 64, 0);
         put_be_u32(d, 68, h.application_id);
         put_be_u32(d, 92, counter);
         put_be_u32(d, 96, crate::pager::PIN_VERSION_NUMBER);
+        // File-format bytes: WAL for an in-place VACUUM of a WAL-mode
+        // database, rollback for VACUUM INTO, as the pin writes them
+        // (v0.16, `wal`).
+        #[cfg(feature = "wal")]
+        if let Some(v) = d.get_mut(18..20) {
+            let w = if into.is_none() && self.conn.pager.wal_mode() {
+                2
+            } else {
+                1
+            };
+            v.copy_from_slice(&[w, w]);
+        }
         match (into, write) {
             (Some(name), Some(write)) => {
                 if !write(name, img.as_slice()) {
@@ -699,6 +725,9 @@ impl<S: Storage> Statement<'_, S> {
         )
         .await
         .map_err(mem_err)?;
+        // VACUUM keeps the encoding (v0.16, `utf16`).
+        #[cfg(feature = "utf16")]
+        dst.set_text_enc(self.conn.pager.text_enc());
         let mut rowid = 0i64;
         // (source root, new root, is a table, schema index)
         let mut copies: AVec<(u32, u32, bool, usize)> = AVec::new();
@@ -706,7 +735,19 @@ impl<S: Storage> Statement<'_, S> {
             let r = &rs[i];
             let table = r.is(b"table");
             let (root, _) = dst.alloc_page().await.map_err(mem_err)?;
-            if table {
+            // A WITHOUT ROWID table's tree, and its indexes, are copied
+            // as raw records (v0.16).
+            #[cfg(feature = "without_rowid")]
+            let src_root = r.root.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+            #[cfg(feature = "without_rowid")]
+            let wr = self.conn.pager.wr.is_raw(src_root);
+            #[cfg(feature = "without_rowid")]
+            if wr {
+                dst.wr.raw_roots.push(root);
+            }
+            #[cfg(not(feature = "without_rowid"))]
+            let wr = false;
+            if table && !wr {
                 btree::create_empty_root(&mut dst, root)
                     .await
                     .map_err(mem_err)?;
@@ -748,6 +789,16 @@ impl<S: Storage> Statement<'_, S> {
         }
         for &(src, root, table, i) in copies.iter() {
             let r = &rs[i];
+            #[cfg(feature = "without_rowid")]
+            if let Some(orders) = self.conn.pager.wr.orders_of(src) {
+                let keys = btree::index_payloads(&mut self.conn.pager, src).await?;
+                for k in keys.iter() {
+                    btree::index_insert_core(&mut dst, root, k.as_slice(), orders.as_slice())
+                        .await
+                        .map_err(mem_err)?;
+                }
+                continue;
+            }
             if table {
                 let keep = keep_rowids
                     || rs
@@ -861,6 +912,11 @@ impl<S: Storage> Statement<'_, S> {
         if ix.opaque {
             return Ok(());
         }
+        // A WITHOUT ROWID table's key is the table itself (v0.16).
+        #[cfg(feature = "without_rowid")]
+        if ix.clustered {
+            return Ok(());
+        }
         let ix = ix.clone();
         let t = self
             .conn
@@ -894,6 +950,10 @@ impl<S: Storage> Statement<'_, S> {
         } else {
             None
         };
+        // v0.16 (`expr_index`): an expression / partial index
+        // computes its keys (resolved before anything is freed).
+        #[cfg(feature = "expr_index")]
+        let ext = self.conn.index_ext(&self.arena, &t, &ix)?;
         let pages = btree::collect_index_pages(&mut self.conn.pager, ix.root).await?;
         for &p in pages.iter() {
             if p != ix.root {
@@ -905,15 +965,22 @@ impl<S: Storage> Statement<'_, S> {
         let mut cursor = ScanCursor::new(t.root);
         let mut buf = AVec::new();
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-            let key = index_key_for_row(
+            let Some(key) = index_key_for_row(
                 cols.as_slice(),
+                #[cfg(feature = "expr_index")]
+                ext.as_deref(),
                 t.rowid_alias,
                 defaults.as_slice(),
                 buf.as_slice(),
                 t.columns.len(),
                 rowid,
                 gcols.as_deref(),
-            )?;
+                #[cfg(feature = "expr_index")]
+                Some(&self.conn.env),
+            )?
+            else {
+                continue;
+            };
             if ix.unique
                 && key_has_no_null(key.as_slice())
                 && btree::index_first_with_prefix(
@@ -998,6 +1065,21 @@ impl<S: Storage> Statement<'_, S> {
             let stat = match ixn {
                 None => self.table_stat(tn.as_slice()).await?,
                 Some(n) => self.index_stat(n.as_slice()).await?,
+            };
+            // A WITHOUT ROWID table's key is listed under the table's
+            // name (v0.16), as on the pin.
+            #[cfg(feature = "without_rowid")]
+            let ixn = &match ixn {
+                Some(n)
+                    if self
+                        .conn
+                        .catalog
+                        .find_index(&self.conn.catalog_arena, n.as_slice())
+                        .is_some_and(|i| i.clustered) =>
+                {
+                    Some(tn.clone())
+                }
+                other => other.clone(),
             };
             if let Some(s) = stat {
                 out.push((tn.clone(), ixn.clone(), s));

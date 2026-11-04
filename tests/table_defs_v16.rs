@@ -1219,7 +1219,16 @@ fn strict_table_definitions_and_precedence() {
     ] {
         tw.refuse_any(sql);
     }
-    // WITHOUT ROWID stays cleanly refused (the pin takes these).
+    // Both table options together (v0.16, `without_rowid`): taken as
+    // on the pin. Without the leaf, WITHOUT ROWID is refused cleanly.
+    #[cfg(feature = "without_rowid")]
+    tw.all(&[
+        "CREATE TABLE s11(a INT PRIMARY KEY) WITHOUT ROWID, STRICT",
+        "CREATE TABLE s12(a INT PRIMARY KEY) STRICT, WITHOUT ROWID",
+        "INSERT INTO s11 VALUES ('5')",
+        "SELECT a, typeof(a) FROM s11",
+    ]);
+    #[cfg(not(feature = "without_rowid"))]
     block_on(async {
         let mut db = open(&tw.hipp).await;
         for sql in [

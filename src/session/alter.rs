@@ -240,7 +240,7 @@ type Change = (usize, AVec<u8>, AVec<u8>, Option<AVec<u8>>);
 fn walk_cols(e: &Expr, out: &mut AVec<(Option<ABytes>, ABytes)>) {
     use crate::sql::Expr as X;
     match e {
-        X::Column { table, name } => out.push((*table, *name)),
+        X::Column { table, name, .. } => out.push((*table, *name)),
         X::Binary(_, a, b) | X::Like(a, b, _) => {
             walk_cols(a, out);
             walk_cols(b, out);
@@ -680,7 +680,9 @@ impl<S: Storage> Connection<S> {
                         using: AVec::new(),
                         args: None,
                         qualified: false,
+                        in_temp: false,
                         cte: None,
+                        indexed: None,
                     });
                     probe.filter = None;
                     probe.group_by = AVec::new();
@@ -878,7 +880,12 @@ impl<S: Storage> Connection<S> {
             self.alter_trace = Some(tr.clone());
             let r = (|| -> Result<(), S::Error> {
                 let wrapped = Ast::Select(sel);
-                let expanded = self.expand_ast(arena, &wrapped)?;
+                // A stored trigger's names are its database's
+                // (`Expander::fix_main`; v0.16 review fix).
+                let fixed = self.trig.fix_main.replace(!self.is_temp);
+                let expanded = self.expand_ast(arena, &wrapped);
+                self.trig.fix_main.set(fixed);
+                let expanded = expanded?;
                 if let Some(Ast::Select(s)) = expanded.as_ref().or(Some(&wrapped)) {
                     self.plan_subquery(s, arena, &[])?;
                 }
@@ -1540,6 +1547,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         layout: &[(bool, OwnedValue)],
         col: usize,
     ) -> Result<(), S::Error> {
+        // A WITHOUT ROWID table (v0.16): its clustered records lose
+        // the column in place (never a key column).
+        #[cfg(feature = "without_rowid")]
+        if let Some(t) = self.conn.pager.wr.table_of(root) {
+            let stored = layout.iter().take(col).filter(|l| l.0).count();
+            return crate::wr::drop_field(&mut self.conn.pager, t, stored).await;
+        }
         let mut rowids = AVec::new();
         {
             let mut cursor = ScanCursor::new(root);
@@ -1589,7 +1603,10 @@ fn compound_order_hits(s: &SelectStmt, arena: &Arena, hits: &mut AVec<crate::que
         return;
     }
     for (e, _) in s.order_by.iter() {
-        let Expr::Column { table: None, name } = e else {
+        let Expr::Column {
+            table: None, name, ..
+        } = e
+        else {
             continue;
         };
         let n = handle_bytes(arena, *name);

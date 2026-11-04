@@ -39,19 +39,96 @@ use crate::error::{Error, Result, SchemaKind};
 use crate::query::{
     AggKind, AggParts, args_coll, parse_num_prefix, real_value, to_text, values_equal_coll,
 };
-use crate::record::{OwnedValue, compare_coll, fabs, text_to_number};
+use crate::record::{OwnedValue, fabs, text_to_number};
 
 /// Fold one aggregate over the per-row input values of the rows
 /// it steps (`rows`: one entry per row whose FILTER passed, each
 /// holding `p.inputs()`' values — arguments, then ORDER BY keys).
-pub fn fold<E>(p: &AggParts<'_>, rows: AVec<AVec<OwnedValue>>) -> Result<OwnedValue, E> {
-    fold_rows(p, rows).map_err(|kind| Error::Schema { kind })
+///
+/// `enc` is the database's text encoding (min / max and ORDER BY
+/// compare text by its BINARY order).
+pub fn fold<E>(
+    p: &AggParts<'_>,
+    rows: AVec<AVec<OwnedValue>>,
+    enc: crate::record::TextEnc,
+) -> Result<OwnedValue, E> {
+    #[cfg(feature = "utf16")]
+    let rows = match crate::utf16::byte_order(enc) {
+        Some(_) => return fold16(p, rows, enc).map_err(|kind| Error::Schema { kind }),
+        None => rows,
+    };
+    fold_rows(p, rows, enc).map_err(|kind| Error::Schema { kind })
+}
+
+/// `fold` in a UTF-16 database (v0.16, `utf16`): the arguments as
+/// the pin's aggregates read them (`arg16`), the text result through
+/// its conversion of a function result (`result16`).
+#[cfg(feature = "utf16")]
+fn fold16(
+    p: &AggParts<'_>,
+    mut rows: AVec<AVec<OwnedValue>>,
+    enc: crate::record::TextEnc,
+) -> core::result::Result<OwnedValue, SchemaKind> {
+    let n = p.args.len();
+    if matches!(
+        p.kind,
+        AggKind::GroupConcat | AggKind::Sum | AggKind::Total | AggKind::Avg
+    ) {
+        for r in rows.as_mut_slice() {
+            for x in r.as_mut_slice().iter_mut().take(n) {
+                *x = arg16(p.kind, core::mem::replace(x, OwnedValue::Null), enc);
+            }
+        }
+    }
+    Ok(result16(p.kind, fold_rows(p, rows, enc)?))
+}
+
+/// One argument of aggregate `kind` in a UTF-16 database (v0.16,
+/// `utf16`; the window engine's too): group_concat / string_agg read
+/// it as the pin's `sqlite3_value_text` does (a BLOB as UTF-16 text,
+/// a TEXT's `utf16::view`); sum / total / avg read a BLOB's number
+/// through its UTF-16 text (it stays non-integer: `sum(x'3100')` is
+/// 1.0). Any other value or kind is returned as it is.
+#[cfg(feature = "utf16")]
+pub(crate) fn arg16(kind: AggKind, v: OwnedValue, enc: crate::record::TextEnc) -> OwnedValue {
+    match (kind, v) {
+        (AggKind::GroupConcat, OwnedValue::Blob(b)) => {
+            OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), enc))
+        }
+        (AggKind::GroupConcat, OwnedValue::Text(t)) => match crate::utf16::view(t.as_slice()) {
+            Some(v) => OwnedValue::Text(v),
+            None => OwnedValue::Text(t),
+        },
+        (AggKind::Sum | AggKind::Total | AggKind::Avg, OwnedValue::Blob(b)) => {
+            OwnedValue::Blob(crate::utf16::decode(b.as_slice(), enc))
+        }
+        (_, v) => v,
+    }
+}
+
+/// Aggregate `kind`'s result in a UTF-16 database (v0.16, `utf16`):
+/// group_concat's and the JSON aggregates' text goes through the
+/// pin's UTF-8 → UTF-16 conversion (`utf16::normalize`).
+#[cfg(feature = "utf16")]
+pub(crate) fn result16(kind: AggKind, r: OwnedValue) -> OwnedValue {
+    #[cfg(feature = "json")]
+    let text_result = matches!(kind, AggKind::GroupConcat | AggKind::Json(_));
+    #[cfg(not(feature = "json"))]
+    let text_result = kind == AggKind::GroupConcat;
+    if text_result
+        && let OwnedValue::Text(t) = &r
+        && let Some(n) = crate::utf16::normalize(t.as_slice())
+    {
+        return OwnedValue::Text(n);
+    }
+    r
 }
 
 /// `fold`, generic-free (one copy whatever the storage error).
 fn fold_rows(
     p: &AggParts<'_>,
     rows: AVec<AVec<OwnedValue>>,
+    enc: crate::record::TextEnc,
 ) -> core::result::Result<OwnedValue, SchemaKind> {
     let coll = args_coll(p.args);
     let mut idx: AVec<usize> = AVec::with_capacity(rows.len());
@@ -61,10 +138,16 @@ fn fold_rows(
     let first = |i: usize| rows.as_slice().get(i).and_then(|r| r.as_slice().first());
     // DISTINCT: the first of equal non-NULL values, in input order
     // (NULLs never count, so they are dropped here).
+    // A JSON aggregate steps one NULL of a DISTINCT call (v0.16,
+    // `json`: `json_group_array(DISTINCT x)` holds `null` once).
+    #[cfg(feature = "json")]
+    let keep_null = matches!(p.kind, AggKind::Json(_));
+    #[cfg(not(feature = "json"))]
+    let keep_null = false;
     if p.distinct && !p.unique {
         let mut kept: AVec<usize> = AVec::new();
         for &i in idx.iter() {
-            let Some(v) = first(i).filter(|v| !matches!(v, OwnedValue::Null)) else {
+            let Some(v) = first(i).filter(|v| keep_null || !matches!(v, OwnedValue::Null)) else {
                 continue;
             };
             if kept
@@ -87,7 +170,7 @@ fn fold_rows(
                 .unwrap_or(&[])
         };
         let cmp = |a: usize, b: usize| {
-            crate::query::order_keys_cmp(keys(a), keys(b), p.order.iter().copied())
+            crate::query::order_keys_cmp(keys(a), keys(b), p.order.iter().copied(), enc)
         };
         sort_stable(&mut idx, &|a, b| cmp(a, b) != core::cmp::Ordering::Greater);
         if p.unique {
@@ -141,7 +224,8 @@ fn fold_rows(
                 best = Some(match best {
                     None => v,
                     Some(b) => {
-                        let ord = compare_coll(&v.as_value(), &b.as_value(), coll);
+                        let ord =
+                            crate::record::compare_coll_in(&v.as_value(), &b.as_value(), coll, enc);
                         let take = if p.kind == AggKind::Min {
                             ord == core::cmp::Ordering::Less
                         } else {
@@ -187,6 +271,13 @@ fn fold_rows(
         | AggKind::Percentile
         | AggKind::PercentileCont
         | AggKind::PercentileDisc => percentile(p.kind, sel),
+        // The per-row JSON text is the last argument (a DISTINCT
+        // call keeps the value itself first, for the test).
+        #[cfg(feature = "json")]
+        AggKind::Json(j) => {
+            let at = p.args.len().saturating_sub(1);
+            Ok(j.fold(sel.iter().filter_map(|r| r.get(at))))
+        }
     }
 }
 

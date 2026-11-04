@@ -85,6 +85,12 @@ pub enum AggKind {
     /// value at or below the interpolation point, no blending.
     #[cfg(feature = "v16")]
     PercentileDisc,
+    /// `json_group_array` / `json_group_object` and their `jsonb_`
+    /// forms (v0.16, `json`): the arguments are wrapped in the
+    /// per-row JSON text (`json::JsonAgg::frag_fn`), which the fold
+    /// joins.
+    #[cfg(feature = "json")]
+    Json(crate::json::JsonAgg),
 }
 
 /// How an aggregate's `args` divide when it was written with an
@@ -178,21 +184,18 @@ pub fn agg_parts(e: &RExpr) -> Option<AggParts<'_>> {
 
 /// One group row's contribution to an aggregate (`agg_parts`):
 /// None when its FILTER does not pass (NULL or false: the row is
-/// not stepped, and nothing else of it is evaluated), else the
-/// values of `inputs()`. `ev` evaluates an expression against
-/// the row.
-pub fn agg_row<E>(
-    p: &AggParts<'_>,
-    ev: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
-) -> Result<Option<AVec<OwnedValue>>, E> {
+/// not stepped, and nothing else of it is evaluated; AND / OR stop
+/// early, `cond`), else the values of `inputs()` against the row
+/// `ctx`.
+pub fn agg_row<E>(p: &AggParts<'_>, ctx: &Ctx<'_>) -> Result<Option<AVec<OwnedValue>>, E> {
     if let Some(f) = p.filter
-        && truthy(&ev(f)?) != Some(true)
+        && !cond::<E>(f, ctx)?
     {
         return Ok(None);
     }
     let mut vs = AVec::new();
     for a in p.inputs() {
-        vs.push(ev(a)?);
+        vs.push(eval::<E>(a, ctx)?);
     }
     Ok(Some(vs))
 }
@@ -292,6 +295,11 @@ pub enum ScalarFn {
     /// `crate::math::eval`.
     #[cfg(feature = "math")]
     Math(crate::math::MathFn),
+    /// The JSON functions (v0.16, leaf feature `json`):
+    /// `crate::json::eval`, over arguments evaluated with their
+    /// JSON subtype (`eval_json_arg`).
+    #[cfg(feature = "json")]
+    Json(crate::json::JsonFn),
     /// `RAISE(kind[, message])` (v0.16, `triggers`): evaluating it
     /// records the message (`Env::raise_msg`) and fails with the
     /// kind's error (`SchemaKind::RaiseIgnore`, ...), which the
@@ -499,6 +507,13 @@ pub enum RExpr {
     Win(WinBox, AVec<RExpr>),
 }
 
+/// `SourceDesc::db` of a CHECK constraint's or partial index's
+/// table (v0.16 review fix, `v16`): the pin ignores the schema part
+/// of a three-part name there (`main.t.a`, `temp.t.a`, even
+/// `bogus.t.a` reach table `t`, whichever database holds it).
+#[cfg(feature = "v16")]
+pub const DB_ANY: u8 = 0xff;
+
 /// One FROM source for resolution: qualifier (alias if given, else
 /// the table name), column names + affinities in table order, and
 /// the rowid-alias column index if any.
@@ -538,6 +553,20 @@ pub struct SourceDesc {
     /// trace, with whether the source was read under an alias.
     #[cfg(feature = "v16")]
     pub trace: Option<(alloc::rc::Rc<core::cell::RefCell<AlterTrace>>, bool)>,
+    /// The database a table or view source lives in (v0.16, `v16`):
+    /// 1 main, 2 temp; 0 for anything else (a derived table, a CTE,
+    /// `excluded`), which no three-part name `schema.table.column`
+    /// reaches. A table-valued function is main's (1), as on the
+    /// pin; a CHECK constraint's or partial index's table is
+    /// `DB_ANY`, which every schema part reaches.
+    #[cfg(feature = "v16")]
+    pub db: u8,
+    /// A `json_each` / `json_tree` source (v0.16, `json`): its
+    /// `json` and `root` columns are hidden from `*`, and its
+    /// `value` column carries the JSON subtype for an array or
+    /// object (`json::Op::EachValue`).
+    #[cfg(feature = "json")]
+    pub json_tvf: u8,
 }
 
 /// What an ALTER TABLE learns from planning a view (v0.16, `v16`):
@@ -654,13 +683,35 @@ impl SourceDesc {
             schema_table: false,
             #[cfg(feature = "v16")]
             trace: None,
+            #[cfg(feature = "v16")]
+            db: 0,
+            #[cfg(feature = "json")]
+            json_tvf: 0,
         }
+    }
+
+    /// Whether a three-part name of database `db` (0: none
+    /// written) may reach this source (v0.16, `v16`).
+    #[cfg(feature = "v16")]
+    pub fn in_db(&self, db: u8) -> bool {
+        db == 0 || self.db == db || self.db == DB_ANY
     }
 
     /// Whether qualifier `q` names this source.
     pub fn named(&self, q: &[u8]) -> bool {
-        eq_ci(self.qualifier.as_slice(), q)
-            || (self.schema_table && (eq_ci(q, b"sqlite_master") || eq_ci(q, b"sqlite_schema")))
+        // The temp database's schema table is its
+        // `sqlite_temp_schema` / `sqlite_temp_master` only (v0.16
+        // review fix: the router renames the FROM name alone, so its
+        // own name was "no such column" and main's was taken).
+        #[cfg(feature = "v16")]
+        let (m, s) = if self.db == 2 {
+            (&b"sqlite_temp_master"[..], &b"sqlite_temp_schema"[..])
+        } else {
+            (&b"sqlite_master"[..], &b"sqlite_schema"[..])
+        };
+        #[cfg(not(feature = "v16"))]
+        let (m, s) = (b"sqlite_master", b"sqlite_schema");
+        eq_ci(self.qualifier.as_slice(), q) || (self.schema_table && (eq_ci(q, m) || eq_ci(q, s)))
     }
 
     /// Whether `name` is one of this source's USING columns.
@@ -690,6 +741,39 @@ impl SourceDesc {
                 },
             )
         };
+        // A `json_each` key / value / atom / json column decodes
+        // from its call's document when read (the row holds a
+        // handle, `json::TvfDocs`), and a value keeps the JSON
+        // subtype of a container (v0.16, `json`;
+        // `json::Op::EachValue`, which reads the `type` column too).
+        #[cfg(feature = "json")]
+        if self.json_tvf != 0
+            && matches!(ci, 0 | 1 | 3 | 8)
+            && let RExpr::Column(slot, ..) = r
+        {
+            let base = slot.saturating_sub(ci);
+            let mut a = AVec::new();
+            a.push(r);
+            let op = if ci == 0 {
+                crate::json::Op::EachKey
+            } else if ci == 8 {
+                crate::json::Op::EachJson
+            } else {
+                a.push(RExpr::Column(
+                    base + 2,
+                    Affinity::Blob,
+                    Some(Coll::default()),
+                ));
+                crate::json::Op::EachValue
+            };
+            return RExpr::Scalar(
+                ScalarFn::Json(crate::json::JsonFn {
+                    op,
+                    blob: self.json_tvf & 4 != 0,
+                }),
+                a,
+            );
+        }
         // A register reads as `+value`: no comparison affinity.
         if self.registers {
             RExpr::Pos(Box::new(r))
@@ -828,7 +912,53 @@ pub struct SubSource {
     /// last gave up (`RecInfo::id`); `root` is unused.
     #[cfg(feature = "v16")]
     pub rec: u32,
+    /// A `json_each` / `json_tree` source (v0.16, `json`): its kind
+    /// (`json::tvf_kind`, with `TVF_LATERAL` when its arguments
+    /// read a source to its left), 0 for any other source. Its
+    /// `derived` plan is a placeholder whose one VALUES row holds
+    /// the resolved arguments, so every plan walker (correlation,
+    /// shifts, aggregates, subqueries) sees them.
+    #[cfg(feature = "json")]
+    pub tvf: u8,
+    /// A lateral JSON table-valued source's (v0.16, `json`): the
+    /// slots of the sources before it that nothing but its
+    /// arguments reads, as distances back from its own first slot
+    /// (so a plan shifted whole keeps them). The join clears them
+    /// once the call has run, so the rows it makes do not each
+    /// carry a copy of the document (`FROM t, json_each(t.j)`).
+    #[cfg(feature = "json")]
+    pub tvf_dead: AVec<usize>,
+    /// The source's index access path (v0.16, `expr_index`): the
+    /// rows an index or the rowid B-tree finds, in its order; `None`
+    /// scans the table in rowid order.
+    #[cfg(feature = "expr_index")]
+    pub access: Option<Box<crate::xplan::IdxAccess>>,
+    /// The source's `INDEXED BY` / `NOT INDEXED` (v0.16,
+    /// `expr_index`), which the access planner obeys.
+    #[cfg(feature = "expr_index")]
+    pub hint: Hint,
+    /// The table is the TEMP database's (v0.16, `v16`): a main
+    /// statement reads it there (`root` is a temp page).
+    #[cfg(feature = "v16")]
+    pub temp: bool,
 }
+
+/// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
+/// any access path, only the index rooted at the page given, or no
+/// index at all (rowid lookups stay).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Hint {
+    #[default]
+    Any,
+    By(u32),
+    Not,
+}
+
+/// `SubSource::tvf`: the arguments read a FROM source to the left,
+/// so the rows are computed per row of the sources before it.
+#[cfg(feature = "json")]
+pub const TVF_LATERAL: u8 = 0x80;
 
 /// A recursive common table expression's shape (v0.16, `v16`),
 /// carried by its `SubPlan`: compound tails from index `split - 1`
@@ -1163,6 +1293,35 @@ pub(crate) fn resolve_column_in_group<E>(
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Option<Result<RExpr, E>> {
+    #[cfg(feature = "v16")]
+    let r = group_column::<E>(group, table, name, 0);
+    #[cfg(not(feature = "v16"))]
+    let r = group_column::<E>(group, table, name);
+    r
+}
+
+/// `resolve_column_in_group`, counting (v0.16, `v16`) only the
+/// sources of database `db` when it is not 0 — a three-part name
+/// `main.t.col` / `temp.t.col` (`SourceDesc::in_db`).
+fn group_column<E>(
+    group: &ScopeGroup,
+    table: Option<&[u8]>,
+    name: &[u8],
+    #[cfg(feature = "v16")] db: u8,
+) -> Option<Result<RExpr, E>> {
+    // With a schema written, the temp schema table also answers to
+    // main's names (the pin's `isValidSchemaTableName`).
+    #[cfg(feature = "v16")]
+    let named = |src: &SourceDesc, q: &[u8]| {
+        (src.named(q)
+            || (db != 0
+                && src.db == 2
+                && src.schema_table
+                && (eq_ci(q, b"sqlite_master") || eq_ci(q, b"sqlite_schema"))))
+            && src.in_db(db)
+    };
+    #[cfg(not(feature = "v16"))]
+    let named = |src: &SourceDesc, q: &[u8]| src.named(q);
     // A qualified reference counts only the sources of that name
     // (v0.16 fix, ungated: `SELECT t.a FROM t, t` read the first t
     // where the pin reports "ambiguous column name"); a USING
@@ -1172,7 +1331,7 @@ pub(crate) fn resolve_column_in_group<E>(
     let mut full: AVec<RExpr> = AVec::new();
     for (si, src) in group.sources.iter().enumerate() {
         if let Some(q) = table
-            && !src.named(q)
+            && !named(src, q)
         {
             continue;
         }
@@ -1211,7 +1370,7 @@ pub(crate) fn resolve_column_in_group<E>(
         if is_rowid_name(name) {
             let mut rowid: Option<RExpr> = None;
             for (si, src) in group.sources.iter().enumerate() {
-                if src.named(q) && src.has_rowid {
+                if named(src, q) && src.has_rowid {
                     if rowid.is_some() {
                         return Some(Err(Error::Schema {
                             kind: SchemaKind::AmbiguousColumn,
@@ -1266,6 +1425,7 @@ fn resolve_column<E>(
     enclosing: &[ScopeGroup],
     table: Option<&[u8]>,
     name: &[u8],
+    #[cfg(feature = "v16")] db: u8,
 ) -> Result<RExpr, E> {
     #[cfg(not(feature = "v16"))]
     for g in core::iter::once(cur).chain(enclosing.iter()) {
@@ -1275,7 +1435,7 @@ fn resolve_column<E>(
     }
     #[cfg(feature = "v16")]
     for (depth, g) in core::iter::once(cur).chain(enclosing.iter()).enumerate() {
-        if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
+        if let Some(r) = group_column::<E>(g, table, name, db) {
             return r;
         }
         if table.is_none()
@@ -1355,7 +1515,7 @@ fn alias_from_outer<E>(
 /// rowid source at or past `at.1` by `by.1`, through nested
 /// subquery plans (v0.16, `alias_from_outer`).
 #[cfg(feature = "v16")]
-fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
+pub(crate) fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
     match e {
         RExpr::Column(slot, ..) => {
             if *slot >= at.0 {
@@ -1485,6 +1645,11 @@ pub fn expand_star<E>(
             if qual.is_none() && si > 0 && src.uses(n) {
                 continue;
             }
+            // A table-valued function's hidden columns (v0.16).
+            #[cfg(feature = "json")]
+            if src.json_tvf != 0 && ci >= crate::json::TVF_VISIBLE {
+                continue;
+            }
             let joined = qual.is_none()
                 && last_right.is_some_and(|r| si < r)
                 && srcs
@@ -1500,10 +1665,19 @@ pub fn expand_star<E>(
                 // `q.col` references, so two sources of one name
                 // sharing a column make it ambiguous (v0.16 fix,
                 // ungated: `SELECT * FROM t, t` answered).
+                // The pin writes `schema.q.col` for a table, so a main
+                // and a temp table of one name are told apart (v0.16
+                // review fix).
                 if srcs.len() > 1
                     && !src.qualifier.is_empty()
-                    && let Some(Err(e)) =
-                        resolve_column_in_group::<E>(cur, Some(src.qualifier.as_slice()), n)
+                    && let Some(Err(e)) = {
+                        let q = Some(src.qualifier.as_slice());
+                        #[cfg(feature = "v16")]
+                        let dup = group_column::<E>(cur, q, n, src.db);
+                        #[cfg(not(feature = "v16"))]
+                        let dup = resolve_column_in_group::<E>(cur, q, n);
+                        dup
+                    }
                 {
                     return Err(e);
                 }
@@ -1633,6 +1807,19 @@ pub fn resolve_scoped<E>(
         // `session::bind_ast`); the pin reads one there as NULL.
         #[cfg(feature = "params")]
         Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
+        #[cfg(feature = "v16")]
+        Expr::Column {
+            table,
+            name,
+            schema,
+        } => {
+            let db = match schema {
+                None => 0,
+                Some(sc) => schema_db(handle_bytes(arena, *sc)),
+            };
+            resolve_col_ref::<E>(*table, *name, arena, cur, enclosing, db)?
+        }
+        #[cfg(not(feature = "v16"))]
         Expr::Column { table, name } => resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?,
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         Expr::TrigValue(lit, aff, coll) => {
@@ -1722,6 +1909,24 @@ pub fn resolve_scoped<E>(
     })
 }
 
+/// The database a three-part column name's schema part names
+/// (v0.16, `v16`; `SourceDesc::db`): 1 for `main`, 2 for `temp`
+/// (case-insensitive; the pin takes no other spelling, `temporary`
+/// included), else 3, which only a CHECK constraint's or partial
+/// index's table (`DB_ANY`) matches — as on the pin, which ignores
+/// the schema part there. A name matching no source of its
+/// database is "no such column" (`UnknownColumn`).
+#[cfg(feature = "v16")]
+fn schema_db(sc: &[u8]) -> u8 {
+    if eq_ci(sc, b"main") {
+        1
+    } else if eq_ci(sc, b"temp") {
+        2
+    } else {
+        3
+    }
+}
+
 /// A column reference (out of line: see `resolve_scoped`).
 #[inline(never)]
 fn resolve_col_ref<E>(
@@ -1730,12 +1935,15 @@ fn resolve_col_ref<E>(
     arena: &Arena,
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
+    #[cfg(feature = "v16")] db: u8,
 ) -> Result<RExpr, E> {
     let r = resolve_column::<E>(
         cur,
         enclosing,
         table.map(|h| handle_bytes(arena, h)),
         handle_bytes(arena, name),
+        #[cfg(feature = "v16")]
+        db,
     )?;
     #[cfg(feature = "v16")]
     if core::iter::once(cur)
@@ -2513,6 +2721,12 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
         .chain(V16.iter())
         .find(|(n, _)| eq_ci(name, n))
         .map(|(_, f)| *f);
+    #[cfg(feature = "json")]
+    if f.is_none()
+        && let Some(j) = crate::json::JsonFn::lookup(name)
+    {
+        return Some(ScalarFn::Json(j));
+    }
     #[cfg(feature = "math")]
     if f.is_none() {
         return crate::math::MathFn::lookup(name).map(ScalarFn::Math);
@@ -2559,6 +2773,8 @@ fn arity(f: ScalarFn) -> (usize, usize) {
         ScalarFn::ConcatWs => (2, usize::MAX),
         #[cfg(feature = "math")]
         ScalarFn::Math(m) => m.arity(),
+        #[cfg(feature = "json")]
+        ScalarFn::Json(j) => j.arity(),
         _ => (1, 1),
     }
 }
@@ -2635,7 +2851,44 @@ pub(crate) fn agg_kind(name: &[u8]) -> Option<AggKind> {
         #[cfg(feature = "v16")]
         (b"percentile_disc", AggKind::PercentileDisc),
     ];
-    AGGS.iter().find(|(n, _)| eq_ci(name, n)).map(|(_, k)| *k)
+    let k = AGGS.iter().find(|(n, _)| eq_ci(name, n)).map(|(_, k)| *k);
+    #[cfg(feature = "json")]
+    if k.is_none() {
+        return crate::json::JsonAgg::lookup(name).map(AggKind::Json);
+    }
+    k
+}
+
+/// A JSON aggregate's argument layout (v0.16, `json`): its own
+/// arguments (the first `nargs` of `all`; the ORDER BY keys and
+/// FILTER follow) become the per-row JSON text the fold joins —
+/// `Frag(x)` for an array (the value itself first under DISTINCT,
+/// which tests it), `ObjFrag(label, value)` for an object. Returns
+/// the new argument count.
+#[cfg(feature = "json")]
+pub(crate) fn json_agg_args(
+    a: crate::json::JsonAgg,
+    distinct: bool,
+    nargs: usize,
+    all: &mut AVec<RExpr>,
+) -> usize {
+    let n = nargs.min(all.len());
+    let mut own: AVec<RExpr> = AVec::new();
+    own.extend_from_slice(all.as_slice().get(..n).unwrap_or(&[]));
+    let rest: AVec<RExpr> = {
+        let mut r = AVec::new();
+        r.extend_from_slice(all.as_slice().get(n..).unwrap_or(&[]));
+        r
+    };
+    let mut out: AVec<RExpr> = AVec::new();
+    if distinct && !a.object {
+        out.extend_from_slice(own.as_slice());
+    }
+    out.push(RExpr::Scalar(ScalarFn::Json(a.frag_fn()), own));
+    let k = out.len();
+    out.extend_from_slice(rest.as_slice());
+    *all = out;
+    k
 }
 
 /// `resolve_func` without the window rules.
@@ -2696,6 +2949,8 @@ fn resolve_call_body<E>(
             AggKind::Count => (0, 1),
             #[cfg(feature = "v16")]
             AggKind::Percentile | AggKind::PercentileCont | AggKind::PercentileDisc => (2, 2),
+            #[cfg(feature = "json")]
+            AggKind::Json(j) => (j.nargs(), j.nargs()),
             _ => (1, 1),
         };
         if star && kind != AggKind::Count {
@@ -2794,6 +3049,16 @@ fn resolve_call_body<E>(
         // ORDER BY (min / max's ignored one included) names an
         // inner source belongs to the inner query, as on the pin.
         let lvl = agg_level(all.as_slice(), ignored, cur, enclosing);
+        #[cfg(feature = "json")]
+        let mut ext = ext;
+        #[cfg(feature = "json")]
+        if let AggKind::Json(j) = kind {
+            let nargs = ext.as_ref().map_or(all.len(), |x| x.nargs);
+            let k = json_agg_args(j, distinct, nargs, &mut all);
+            if let Some(x) = ext.as_mut() {
+                x.nargs = k;
+            }
+        }
         return Ok(RExpr::Agg {
             kind,
             distinct,
@@ -3436,6 +3701,43 @@ pub fn has_sub(e: &RExpr) -> bool {
     }
 }
 
+/// Whether `e` holds a current-scope subquery that is correlated
+/// (v0.16 review fix: the pin tests a WHERE term holding one after
+/// the others, its `TERM_VARSELECT`).
+pub fn has_corr_sub(e: &RExpr) -> bool {
+    let f = has_corr_sub;
+    match e {
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => !p.uncorrelated,
+        RExpr::InSub(x, p, _) => !p.uncorrelated || f(x),
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::Raise(_) => false,
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => f(a),
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_ref().is_some_and(|b| f(b))
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_ref().is_some_and(|o| f(o))
+        }
+        RExpr::Scalar(_, args) | RExpr::Win(_, args) | RExpr::Agg { args, .. } => {
+            args.iter().any(f)
+        }
+    }
+}
+
 /// Collect the current-scope subquery nodes of `e` in
 /// substitution traversal order (v0.6): children before the
 /// node itself where a node has current-scope children (only
@@ -3595,6 +3897,25 @@ fn in_sub_lhs(x: &RExpr, plan: &SubPlan, sx: RExpr) -> RExpr {
     RExpr::Collate(Box::new(sx), coll)
 }
 
+/// The collation `x IN (SELECT ...)` compares under (v0.16 review
+/// fix, `expr_index`: an index probe's): the pin's binary-comparison
+/// rule over `x` and the (rightmost core's) first result item, as
+/// `in_sub_lhs` applies it.
+#[cfg(feature = "expr_index")]
+pub(crate) fn in_sub_coll(x: &RExpr, plan: &SubPlan) -> Coll {
+    let core = plan.compound.as_slice().last().map_or(plan, |(_, t)| t);
+    let item = core.items.as_slice().first().or_else(|| {
+        core.values
+            .as_slice()
+            .first()
+            .and_then(|r| r.as_slice().first())
+    });
+    match item {
+        Some(i) => binary_coll(x, i),
+        None => expr_coll(x).unwrap_or_default(),
+    }
+}
+
 /// An IN subquery node after substitution: an `InList` (marked
 /// as substituted) of the subquery's values, with the left
 /// operand `sx` (the substituted `x`) carrying the membership
@@ -3665,13 +3986,99 @@ fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool
 
 /// `values` is consumed in `collect_subs` order; the caller
 /// guarantees the counts match.
+/// A scalar subquery node `e`'s value `v` as a literal. A compound
+/// subquery's text keeps the JSON subtype when every arm's result
+/// carries it or is never text (v0.16 review fix, `json`; probed:
+/// `json_array((SELECT json('[1]') UNION ALL SELECT 2))` is
+/// `[[1]]`, and so for UNION / EXCEPT, not INTERSECT; a plain
+/// subquery drops it).
+fn sub_literal(e: &RExpr, v: &OwnedValue) -> RExpr {
+    #[cfg(feature = "json")]
+    if let (RExpr::SubScalar(p), OwnedValue::Text(_)) = (e, v)
+        && compound_keeps_json(p)
+    {
+        let mut a = AVec::new();
+        a.push(RExpr::Literal(v.clone()));
+        return RExpr::Scalar(
+            ScalarFn::Json(crate::json::JsonFn {
+                op: crate::json::Op::Subtyped,
+                blob: false,
+            }),
+            a,
+        );
+    }
+    let _ = e;
+    RExpr::Literal(v.clone())
+}
+
+/// `sub_literal`'s test: `p` is a compound without INTERSECT whose
+/// arms' result columns (`scalar_col`) are each a JSON text result
+/// (a JSON function or aggregate that always is) or never text (a
+/// numeric or NULL literal, a `jsonb` result), at least one the
+/// former. An arm whose column might be plain text leaves the
+/// value without the subtype (hipp does not track which arm a row
+/// came from).
+#[cfg(feature = "json")]
+fn compound_keeps_json(p: &SubPlan) -> bool {
+    if p.compound.is_empty()
+        || p.compound
+            .iter()
+            .any(|(op, _)| *op == crate::sql::CompoundOp::Intersect)
+    {
+        return false;
+    }
+    // Some(true): JSON text; Some(false): never text; None: either.
+    fn class(e: &RExpr) -> Option<bool> {
+        match e {
+            RExpr::Scalar(ScalarFn::Json(f), _) if f.always_json() => Some(true),
+            RExpr::Scalar(ScalarFn::Json(f), _) if f.blob => Some(false),
+            RExpr::Agg {
+                kind: AggKind::Json(a),
+                ..
+            } => Some(!a.blob),
+            RExpr::Literal(OwnedValue::Integer(_) | OwnedValue::Real(_) | OwnedValue::Null)
+            | RExpr::AffLiteral(
+                OwnedValue::Integer(_) | OwnedValue::Real(_) | OwnedValue::Null,
+                ..,
+            ) => Some(false),
+            _ => None,
+        }
+    }
+    let col = p.scalar_col;
+    let mut json = false;
+    let arms = core::iter::once(p).chain(p.compound.iter().map(|(_, t)| &**t));
+    for arm in arms {
+        let mut cells: AVec<&RExpr> = AVec::new();
+        if arm.values.is_empty()
+            && let Some(c) = arm.items.as_slice().get(col)
+        {
+            cells.push(c);
+        }
+        for r in arm.values.iter() {
+            if let Some(c) = r.as_slice().get(col) {
+                cells.push(c);
+            }
+        }
+        if cells.is_empty() {
+            return false;
+        }
+        for c in cells.iter() {
+            match class(c) {
+                Some(j) => json |= j,
+                None => return false,
+            }
+        }
+    }
+    json
+}
+
 pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
     match e {
         RExpr::SubScalar(_) | RExpr::SubExists(_) => {
             let v = match &values[*pos] {
                 SubValue::One(v, aff) => match aff {
                     Some(a) => RExpr::AffLiteral(v.clone(), Some(*a), None),
-                    None => RExpr::Literal(v.clone()),
+                    None => sub_literal(e, v),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
                 SubValue::Fail(k) => RExpr::Raise(*k),
@@ -3987,7 +4394,7 @@ pub fn substitute_group(
             let v = match &values[*pos] {
                 SubValue::One(v, aff) => match aff {
                     Some(a) => RExpr::AffLiteral(v.clone(), Some(*a), None),
-                    None => RExpr::Literal(v.clone()),
+                    None => sub_literal(e, v),
                 },
                 SubValue::Many(_, _) => RExpr::Literal(OwnedValue::Null),
                 SubValue::Fail(k) => RExpr::Raise(*k),
@@ -4411,6 +4818,19 @@ pub struct Env {
     /// `triggers`; `Connection::raise_message`).
     #[cfg(feature = "triggers")]
     pub raise_msg: core::cell::RefCell<AVec<u8>>,
+    /// The documents of the `json_each` / `json_tree` calls the
+    /// running statement has made (v0.16, `json`): their rows hold
+    /// handles into these, decoded when a column is read, so a row
+    /// costs its own few bytes, not the document
+    /// (`json::TvfDocs`). `Statement::step` drops the ones it added
+    /// when it returns.
+    #[cfg(feature = "json")]
+    pub json_docs: crate::json::TvfDocs,
+    /// The database's text encoding (v0.16, `utf16`): what the
+    /// BINARY collation, hex(), CAST(... AS BLOB) and blob-to-text
+    /// conversions see (`crate::utf16`).
+    #[cfg(feature = "utf16")]
+    pub enc: core::cell::Cell<crate::record::TextEnc>,
 }
 
 impl Env {
@@ -4433,7 +4853,21 @@ impl Env {
             case_like: core::cell::Cell::new(false),
             #[cfg(feature = "triggers")]
             raise_msg: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "json")]
+            json_docs: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "utf16")]
+            enc: core::cell::Cell::new(crate::record::TextEnc::Utf8),
         }
+    }
+
+    /// The database's text encoding (v0.16; UTF-8 without
+    /// `utf16`).
+    #[inline]
+    pub fn text_enc(&self) -> crate::record::TextEnc {
+        #[cfg(feature = "utf16")]
+        return self.enc.get();
+        #[cfg(not(feature = "utf16"))]
+        crate::record::TextEnc::Utf8
     }
 
     /// One row inserted with `rowid` (an INSERT, the REPLACE
@@ -4519,6 +4953,16 @@ impl<'x> Ctx<'x> {
     }
     fn row(&self) -> &'x RowData {
         self.rep
+    }
+    /// The database's text encoding (v0.16; UTF-8 without the
+    /// connection state or the `utf16` leaf).
+    #[inline]
+    pub fn enc(&self) -> crate::record::TextEnc {
+        #[cfg(feature = "utf16")]
+        if let Some(e) = self.env {
+            return e.enc.get();
+        }
+        crate::record::TextEnc::Utf8
     }
     /// A row context over one of the group's rows, for evaluating
     /// aggregate arguments per group row (same connection state).
@@ -4666,6 +5110,45 @@ fn adjust_in(x: &RExpr, xv: OwnedValue, iv: OwnedValue) -> (OwnedValue, OwnedVal
         CmpClass::Blob | CmpClass::None => return (xv, iv),
     };
     (apply_cmp_affinity(xv, aff), apply_cmp_affinity(iv, aff))
+}
+
+/// How an index lookup converts a probe value compared with an
+/// index key `key` (v0.16, `expr_index`; the pin's
+/// `indexAffinityOk` and comparison affinity): `None` when the
+/// comparison's affinity makes the index unusable (a numeric
+/// operand against a TEXT, BLOB or affinity-less key; a TEXT
+/// column against an affinity-less key), else the affinity applied
+/// to the probe (`Some(None)`: none).
+#[cfg(feature = "expr_index")]
+pub(crate) fn index_probe_aff(key: &RExpr, val: &RExpr) -> Option<Option<Affinity>> {
+    match (cmp_class(key), cmp_class(val)) {
+        (CmpClass::Numeric, _) => Some(Some(Affinity::Numeric)),
+        (_, CmpClass::Numeric) => None,
+        (CmpClass::Text, CmpClass::None) => Some(Some(Affinity::Text)),
+        (CmpClass::None, CmpClass::Text) => None,
+        _ => Some(None),
+    }
+}
+
+/// How an index lookup converts the items of a written `key IN
+/// (list)` (v0.16, `expr_index`): by the left operand's comparison
+/// affinity alone (`adjust_in`).
+#[cfg(feature = "expr_index")]
+pub(crate) fn index_in_aff(key: &RExpr) -> Option<Affinity> {
+    match cmp_class(key) {
+        CmpClass::Numeric => Some(Affinity::Numeric),
+        CmpClass::Text => Some(Affinity::Text),
+        CmpClass::Blob | CmpClass::None => None,
+    }
+}
+
+/// `apply_cmp_affinity` for index probes (v0.16, `expr_index`).
+#[cfg(feature = "expr_index")]
+pub(crate) fn probe_value(v: OwnedValue, aff: Option<Affinity>) -> OwnedValue {
+    match aff {
+        Some(a) => apply_cmp_affinity(v, a),
+        None => v,
+    }
 }
 
 fn apply_cmp_affinity(v: OwnedValue, aff: Affinity) -> OwnedValue {
@@ -4889,7 +5372,7 @@ pub fn is_constant(e: &RExpr) -> bool {
 /// An integer literal's truth (`None` for any other expression).
 /// An AND over a false one is false too, an OR over a true one true
 /// (the pin's simplified operator is such a literal again).
-fn int_lit(e: &RExpr) -> Option<bool> {
+pub(crate) fn int_lit(e: &RExpr) -> Option<bool> {
     match e {
         RExpr::Literal(OwnedValue::Integer(i)) => Some(*i != 0),
         RExpr::Binary(BinOp::And, a, b)
@@ -4956,7 +5439,7 @@ fn in_list_coll(x: &RExpr) -> Coll {
 fn cmp_op<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     let lv = eval::<E>(l, ctx)?;
     let rv = eval::<E>(r, ctx)?;
-    cmp_values::<E>(op, l, r, lv, rv)
+    cmp_values::<E>(op, l, r, lv, rv, ctx.enc())
 }
 
 /// `cmp_op` over its operands' values (out of line: `cmp_op` is
@@ -4968,6 +5451,7 @@ fn cmp_values<E>(
     r: &RExpr,
     lv: OwnedValue,
     rv: OwnedValue,
+    enc: crate::record::TextEnc,
 ) -> Result<OwnedValue, E> {
     let (lv, rv) = adjust_cmp(l, r, lv, rv);
     // v0.16: the comparison's collating sequence (column
@@ -4980,7 +5464,7 @@ fn cmp_values<E>(
     if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
         return Ok(OwnedValue::Null);
     }
-    let ord = compare_coll(&lv.as_value(), &rv.as_value(), coll);
+    let ord = crate::record::compare_coll_in(&lv.as_value(), &rv.as_value(), coll, enc);
     use core::cmp::Ordering::*;
     let b = match op {
         BinOp::Eq => ord == Equal,
@@ -4997,7 +5481,86 @@ fn cmp_values<E>(
 fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     let lv = eval::<E>(l, ctx)?;
     let rv = eval::<E>(r, ctx)?;
+    #[cfg(feature = "utf16")]
+    if ctx.enc() != crate::record::TextEnc::Utf8 {
+        let r = arith_values::<E>(op, blob_text(lv, ctx), blob_text(rv, ctx))?;
+        // `||` joins the UTF-16 bytes: a high surrogate at the end of
+        // the left side pairs with a low one starting the right.
+        if let OwnedValue::Text(t) = &r
+            && let Some(c) = crate::utf16::canon(t.as_slice())
+        {
+            return Ok(OwnedValue::Text(c));
+        }
+        return Ok(r);
+    }
     arith_values::<E>(op, lv, rv)
+}
+
+/// A BLOB read as text (or as a number through text) in a UTF-16
+/// database (v0.16, `utf16`): its bytes decode from UTF-16, as the
+/// pin's blob-to-text conversion does (`x'3100' + 1` is 2 in
+/// UTF-16le). Anything else, or any value in a UTF-8 database, is
+/// returned as it is.
+#[cfg(feature = "utf16")]
+pub(crate) fn blob_text(v: OwnedValue, ctx: &Ctx<'_>) -> OwnedValue {
+    match v {
+        OwnedValue::Blob(b) if ctx.enc() != crate::record::TextEnc::Utf8 => {
+            OwnedValue::Text(crate::utf16::decode(b.as_slice(), ctx.enc()))
+        }
+        v => v,
+    }
+}
+
+/// A value as the pin's `sqlite3_value_text` reads it in a UTF-16
+/// database (v0.16, `utf16`; the LIKE operator): a BLOB's bytes
+/// through the pin's UTF-16 → UTF-8 conversion, a TEXT's `view`.
+#[cfg(feature = "utf16")]
+fn text_view(v: OwnedValue, ctx: &Ctx<'_>) -> OwnedValue {
+    match v {
+        OwnedValue::Blob(b) if ctx.enc() != crate::record::TextEnc::Utf8 => {
+            OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), ctx.enc()))
+        }
+        OwnedValue::Text(t) if ctx.enc() != crate::record::TextEnc::Utf8 => {
+            match crate::utf16::view(t.as_slice()) {
+                Some(v) => OwnedValue::Text(v),
+                None => OwnedValue::Text(t),
+            }
+        }
+        v => v,
+    }
+}
+
+/// A value read as a number (unary minus, `randomblob(N)`): in a
+/// UTF-16 database a BLOB is read through its UTF-16 text
+/// (`blob_text`; `-x'32002E003500'` is -2.5 in UTF-16le).
+#[cfg(feature = "utf16")]
+fn num_arg(v: OwnedValue, ctx: &Ctx<'_>) -> OwnedValue {
+    blob_text(v, ctx)
+}
+
+#[cfg(not(feature = "utf16"))]
+#[inline(always)]
+fn num_arg(v: OwnedValue, _ctx: &Ctx<'_>) -> OwnedValue {
+    v
+}
+
+/// `CAST(x AS ...)` in the context's database (v0.16, `utf16`): in
+/// a UTF-16 database a BLOB cast to another type is first read as
+/// UTF-16 text, and a TEXT or number cast to BLOB takes its UTF-16
+/// bytes.
+#[cfg(feature = "utf16")]
+fn cast_in(v: OwnedValue, aff: Affinity, ctx: &Ctx<'_>) -> OwnedValue {
+    if ctx.enc() != crate::record::TextEnc::Utf8 {
+        if aff == Affinity::Blob {
+            if let OwnedValue::Blob(_) | OwnedValue::Null = v {
+                return v;
+            }
+            let t = to_text(&v).unwrap_or_default();
+            return OwnedValue::Blob(crate::utf16::encode(t.as_slice(), ctx.enc()));
+        }
+        return cast_value(&blob_text(v, ctx), aff);
+    }
+    cast_value(&v, aff)
 }
 
 /// `arith` over its operands' values (out of line: `arith` is on
@@ -5507,13 +6070,10 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
         ScalarFn::Iif => {
             let mut i = 0usize;
             while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
-                match eval::<E>(c, ctx) {
+                match cond::<E>(c, ctx) {
                     Err(e) => return Some(Err(e)),
-                    Ok(cv) => {
-                        if truthy(&cv) == Some(true) {
-                            return Some(eval::<E>(t, ctx));
-                        }
-                    }
+                    Ok(true) => return Some(eval::<E>(t, ctx)),
+                    Ok(false) => {}
                 }
                 i += 2;
             }
@@ -5536,7 +6096,7 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
             Some(match f {
                 ScalarFn::Random => Ok(OwnedValue::Integer(env.prng.random())),
                 ScalarFn::Randomblob => match args.first().map(|a| eval::<E>(a, ctx)) {
-                    Some(Ok(n)) => env.prng.blob::<E>(&n),
+                    Some(Ok(n)) => env.prng.blob::<E>(&num_arg(n, ctx)),
                     Some(Err(e)) => Err(e),
                     None => Ok(OwnedValue::Null),
                 },
@@ -5550,6 +6110,10 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
 }
 
 fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    #[cfg(feature = "json")]
+    if let ScalarFn::Json(j) = f {
+        return eval_json_call::<E>(j, args, ctx).map(|r| r.0);
+    }
     if let Some(r) = eval_lazy::<E>(f, args, ctx) {
         return r;
     }
@@ -5557,7 +6121,113 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
     for a in args {
         vs.push(eval::<E>(a, ctx)?);
     }
-    let v = vs.as_slice();
+    #[cfg(feature = "utf16")]
+    if let Some(be) = crate::utf16::byte_order(ctx.enc()) {
+        return eval_scalar16::<E>(f, args, vs, ctx, be);
+    }
+    scalar_values::<E>(f, args, vs.as_slice(), ctx)
+}
+
+/// `eval_scalar` in a UTF-16 database (v0.16, `utf16`): what the
+/// pin's functions see of the stored encoding. `hex()` and
+/// `octet_length()` of a TEXT read its UTF-16 bytes; a BLOB
+/// argument a function reads as text (or as a number) is first
+/// decoded from UTF-16 (`upper(x'61006200')` is 'AB'); and a text
+/// result goes through the pin's UTF-8 → UTF-16 conversion
+/// (`utf16::normalize`), except from the functions that return an
+/// argument as it is.
+#[cfg(feature = "utf16")]
+#[inline(never)]
+fn eval_scalar16<E>(
+    f: ScalarFn,
+    args: &[RExpr],
+    mut vs: AVec<OwnedValue>,
+    ctx: &Ctx<'_>,
+    be: bool,
+) -> Result<OwnedValue, E> {
+    use ScalarFn as F;
+    let enc = ctx.enc();
+    match (f, vs.as_slice().first()) {
+        (F::Hex, Some(OwnedValue::Text(t))) => {
+            let mut b = AVec::new();
+            crate::utf16::encode_into(t.as_slice(), be, &mut b);
+            return Ok(hex_text(b.as_slice()));
+        }
+        (F::OctetLength, Some(OwnedValue::Text(t))) => {
+            return Ok(OwnedValue::Integer(
+                crate::utf16::encoded_len(t.as_slice()) as i64
+            ));
+        }
+        (F::OctetLength, Some(x @ (OwnedValue::Integer(_) | OwnedValue::Real(_)))) => {
+            let n = to_text(x).map_or(0, |t| t.len());
+            return Ok(OwnedValue::Integer(n.saturating_mul(2) as i64));
+        }
+        _ => {}
+    }
+    let all_blobs = vs.iter().all(|x| matches!(x, OwnedValue::Blob(_)));
+    let pass = matches!(
+        f,
+        F::Coalesce | F::Nullif | F::Iif | F::MinN | F::MaxN | F::Likely | F::Typeof
+    );
+    if !pass {
+        for (i, x) in vs.as_mut_slice().iter_mut().enumerate() {
+            // A BLOB the function reads as bytes, or (sign() and
+            // the math functions: NULL for a BLOB) not at all, stays.
+            let keep_blob = match f {
+                F::Length | F::OctetLength | F::Hex | F::Quote | F::Sign => true,
+                // log(B, X) reads X with `sqlite3_value_double`,
+                // through its UTF-16 text.
+                #[cfg(feature = "math")]
+                F::Math(m) => !(m == crate::math::MathFn::Log && i == 1),
+                F::Substr => i == 0,
+                F::Instr => all_blobs,
+                _ => false,
+            };
+            match &*x {
+                OwnedValue::Blob(b) if !keep_blob => {
+                    *x = OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), enc));
+                }
+                // Text is read as the pin's conversion shows it.
+                OwnedValue::Text(t) => {
+                    if let Some(v) = crate::utf16::view(t.as_slice()) {
+                        *x = OwnedValue::Text(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let r = scalar_values::<E>(f, args, vs.as_slice(), ctx)?;
+    if !pass
+        && let OwnedValue::Text(t) = &r
+        && let Some(n) = crate::utf16::normalize(t.as_slice())
+    {
+        return Ok(OwnedValue::Text(n));
+    }
+    Ok(r)
+}
+
+/// `bytes` as upper-case hex digits (TEXT).
+#[cfg_attr(not(feature = "utf16"), inline(always))]
+fn hex_text(bytes: &[u8]) -> OwnedValue {
+    let mut out = AVec::new();
+    for b in bytes {
+        let (hi, lo) = (b >> 4, b & 0xf);
+        out.push(if hi < 10 { b'0' + hi } else { b'A' + hi - 10 });
+        out.push(if lo < 10 { b'0' + lo } else { b'A' + lo - 10 });
+    }
+    OwnedValue::Text(out)
+}
+
+/// `eval_scalar` over the evaluated argument values (one copy:
+/// inlined into `eval_scalar` unless `utf16` calls it twice).
+#[cfg_attr(not(feature = "utf16"), inline(always))]
+fn scalar_values<E>(
+    f: ScalarFn,
+    args: &[RExpr],
+    v: &[OwnedValue],
+    ctx: &Ctx<'_>,
+) -> Result<OwnedValue, E> {
     #[cfg(feature = "math")]
     if let ScalarFn::Math(m) = f {
         return Ok(crate::math::eval(m, v));
@@ -5677,17 +6347,20 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             if matches!(v0, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
-                let bytes = to_text(v0).unwrap_or_default();
-                let mut out = AVec::new();
-                for b in bytes.as_slice() {
-                    let (hi, lo) = (b >> 4, b & 0xf);
-                    out.push(if hi < 10 { b'0' + hi } else { b'A' + hi - 10 });
-                    out.push(if lo < 10 { b'0' + lo } else { b'A' + lo - 10 });
-                }
-                OwnedValue::Text(out)
+                hex_text(to_text(v0).unwrap_or_default().as_slice())
             }
         }
-        ScalarFn::Sign => match to_number(v0) {
+        // The pin's `sqlite3_value_numeric_type`: a number, or a
+        // text that is wholly one; a BLOB or any other text is NULL
+        // (v0.16 fix, ungated: `sign(x'32')` and `sign('2x')` were 1).
+        ScalarFn::Sign => match match v0 {
+            OwnedValue::Text(t) => crate::record::text_to_number(t.as_slice()),
+            OwnedValue::Integer(_) | OwnedValue::Real(_) => Some(v0.clone()),
+            _ => None,
+        }
+        .as_ref()
+        .and_then(to_number)
+        {
             None => OwnedValue::Null,
             Some(n) => {
                 let x = n.as_f64();
@@ -5849,7 +6522,12 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 let coll = args_coll(args);
                 let mut best = v0.clone();
                 for x in v.get(1..).unwrap_or(&[]) {
-                    let ord = compare_coll(&x.as_value(), &best.as_value(), coll);
+                    let ord = crate::record::compare_coll_in(
+                        &x.as_value(),
+                        &best.as_value(),
+                        coll,
+                        ctx.enc(),
+                    );
                     let take = if f == ScalarFn::MinN {
                         ord != core::cmp::Ordering::Greater
                     } else {
@@ -5867,6 +6545,232 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
     })
 }
 
+/// A JSON function's call (v0.16, `json`): its arguments with
+/// their JSON subtype (`eval_json_arg`), then `json::eval`.
+#[cfg(feature = "json")]
+#[inline(never)]
+fn eval_json_call<E>(
+    f: crate::json::JsonFn,
+    args: &[RExpr],
+    ctx: &Ctx<'_>,
+) -> Result<(OwnedValue, bool), E> {
+    let mut vs: AVec<(OwnedValue, bool)> = AVec::with_capacity(args.len());
+    for a in args {
+        vs.push(eval_json_arg::<E>(a, ctx)?);
+    }
+    #[cfg(feature = "utf16")]
+    if !f.op.is_each_column() {
+        for (i, (v, _)) in vs.as_mut_slice().iter_mut().enumerate() {
+            json_arg16(v, |i| f.op.reads_text(i), i, ctx.enc());
+        }
+    }
+    // A `json_each` column reads its call's document.
+    if f.op.is_each_column() {
+        return crate::json::each_column(f, vs.as_slice(), ctx.env.map(|e| &e.json_docs))
+            .map_err(|kind| Error::Schema { kind });
+    }
+    let r = crate::json::eval(f, vs.as_slice()).map_err(|kind| Error::Schema { kind })?;
+    // A text result goes through the pin's UTF-8 → UTF-16 conversion
+    // (v0.16, `utf16`: a lone surrogate becomes U+FFFD).
+    #[cfg(feature = "utf16")]
+    if ctx.enc() != crate::record::TextEnc::Utf8
+        && let (OwnedValue::Text(t), sub) = &r
+        && let Some(n) = crate::utf16::normalize(t.as_slice())
+    {
+        return Ok((OwnedValue::Text(n), *sub));
+    }
+    Ok(r)
+}
+
+/// A JSON function's argument `i` in a UTF-16 database (v0.16,
+/// `utf16`): text reads as the pin's conversion shows it (`view`),
+/// and a BLOB that is not JSONB where the function reads text
+/// (`reads_text`) decodes from UTF-16, as the pin's
+/// `sqlite3_value_text` does (`json_valid(x'7b007d00')` is 1 in
+/// UTF-16le).
+#[cfg(all(feature = "json", feature = "utf16"))]
+pub(crate) fn json_arg16(
+    v: &mut OwnedValue,
+    reads_text: impl Fn(usize) -> bool,
+    i: usize,
+    enc: crate::record::TextEnc,
+) {
+    if enc == crate::record::TextEnc::Utf8 {
+        return;
+    }
+    match &*v {
+        OwnedValue::Text(t) => {
+            if let Some(x) = crate::utf16::view(t.as_slice()) {
+                *v = OwnedValue::Text(x);
+            }
+        }
+        OwnedValue::Blob(b) if reads_text(i) && !crate::json::is_jsonb(b.as_slice()) => {
+            *v = OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), enc));
+        }
+        _ => {}
+    }
+}
+
+/// An expression's value and whether it carries the JSON subtype
+/// (v0.16, `json`; the pin's `sqlite3_value_subtype`): a JSON
+/// function's text result does, and so does a value passed on
+/// unchanged by `+x`, COLLATE, CAST to TEXT, CASE, coalesce /
+/// ifnull, iif, nullif, the multi-argument min / max and likely /
+/// unlikely / likelihood, as on the pin; so does a JSON
+/// aggregate's text result. Anything else — a column (but a
+/// `json_each` value, see `json::Op::EachValue`), a subquery, any
+/// other function, a value read back from a table — does not.
+#[cfg(feature = "json")]
+pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, bool), E> {
+    let plain = |x: &RExpr| -> Result<(OwnedValue, bool), E> { Ok((eval::<E>(x, ctx)?, false)) };
+    match e {
+        RExpr::Scalar(ScalarFn::Json(f), args) => eval_json_call::<E>(*f, args.as_slice(), ctx),
+        RExpr::Pos(x) | RExpr::Collate(x, _) => eval_json_arg::<E>(x, ctx),
+        RExpr::Cast(x, Affinity::Text) => {
+            let (v, sub) = eval_json_arg::<E>(x, ctx)?;
+            Ok(match v {
+                OwnedValue::Text(_) => (v, sub),
+                #[cfg(feature = "utf16")]
+                other => (cast_in(other, Affinity::Text, ctx), false),
+                #[cfg(not(feature = "utf16"))]
+                other => (cast_value(&other, Affinity::Text), false),
+            })
+        }
+        RExpr::Scalar(ScalarFn::Likely, args) => match args.as_slice().first() {
+            Some(a) => eval_json_arg::<E>(a, ctx),
+            None => Ok((OwnedValue::Null, false)),
+        },
+        RExpr::Scalar(ScalarFn::Coalesce, args) => {
+            let args = args.as_slice();
+            for a in args {
+                let r = eval_json_arg::<E>(a, ctx)?;
+                if !matches!(r.0, OwnedValue::Null) {
+                    return Ok(r);
+                }
+            }
+            Ok((OwnedValue::Null, false))
+        }
+        RExpr::Scalar(ScalarFn::Iif, args) => {
+            let args = args.as_slice();
+            let mut i = 0usize;
+            while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
+                if cond::<E>(c, ctx)? {
+                    return eval_json_arg::<E>(t, ctx);
+                }
+                i += 2;
+            }
+            match args.get(i) {
+                Some(o) => eval_json_arg::<E>(o, ctx),
+                None => Ok((OwnedValue::Null, false)),
+            }
+        }
+        RExpr::Scalar(ScalarFn::Nullif, args) => {
+            let args = args.as_slice();
+            let (Some(a), Some(b)) = (args.first(), args.get(1)) else {
+                return plain(e);
+            };
+            let (va, sa) = eval_json_arg::<E>(a, ctx)?;
+            let vb = eval::<E>(b, ctx)?;
+            if !matches!(va, OwnedValue::Null)
+                && !matches!(vb, OwnedValue::Null)
+                && values_equal_coll(&va, &vb, args_coll(args))
+            {
+                return Ok((OwnedValue::Null, false));
+            }
+            Ok((va, sa))
+        }
+        RExpr::Scalar(f @ (ScalarFn::MinN | ScalarFn::MaxN), args) => {
+            let args = args.as_slice();
+            let mut vs: AVec<(OwnedValue, bool)> = AVec::with_capacity(args.len());
+            for a in args {
+                vs.push(eval_json_arg::<E>(a, ctx)?);
+            }
+            if vs.iter().any(|x| matches!(x.0, OwnedValue::Null)) {
+                return Ok((OwnedValue::Null, false));
+            }
+            let coll = args_coll(args);
+            let mut best = 0usize;
+            for (k, x) in vs.iter().enumerate().skip(1) {
+                let Some(b) = vs.as_slice().get(best) else {
+                    break;
+                };
+                let ord = crate::record::compare_coll_in(
+                    &x.0.as_value(),
+                    &b.0.as_value(),
+                    coll,
+                    ctx.enc(),
+                );
+                let take = if *f == ScalarFn::MinN {
+                    ord != core::cmp::Ordering::Greater
+                } else {
+                    ord == core::cmp::Ordering::Greater
+                };
+                if take {
+                    best = k;
+                }
+            }
+            Ok(vs
+                .as_slice()
+                .get(best)
+                .cloned()
+                .unwrap_or((OwnedValue::Null, false)))
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            match base {
+                Some(b) => {
+                    let bv = eval::<E>(b, ctx)?;
+                    for (w, t) in whens.iter() {
+                        let wv = eval::<E>(w, ctx)?;
+                        let (bv2, wv2) = adjust_cmp(b, w, bv.clone(), wv);
+                        if !matches!(bv2, OwnedValue::Null)
+                            && !matches!(wv2, OwnedValue::Null)
+                            && values_equal_coll(&bv2, &wv2, binary_coll(b, w))
+                        {
+                            return eval_json_arg::<E>(t, ctx);
+                        }
+                    }
+                }
+                None => {
+                    for (w, t) in whens.iter() {
+                        if cond::<E>(w, ctx)? {
+                            return eval_json_arg::<E>(t, ctx);
+                        }
+                    }
+                }
+            }
+            match otherwise {
+                Some(o) => eval_json_arg::<E>(o, ctx),
+                None => Ok((OwnedValue::Null, false)),
+            }
+        }
+        RExpr::Agg {
+            kind: AggKind::Json(a),
+            ..
+        } if !a.blob => {
+            let v = eval::<E>(e, ctx)?;
+            let sub = matches!(v, OwnedValue::Text(_));
+            Ok((v, sub))
+        }
+        // An aggregate min / max is one of its argument's values,
+        // subtype and all (when the argument is always JSON).
+        RExpr::Agg {
+            kind: AggKind::Min | AggKind::Max,
+            args,
+            ..
+        } if matches!(args.as_slice().first(), Some(RExpr::Scalar(ScalarFn::Json(f), _)) if f.always_json()) =>
+        {
+            let v = eval::<E>(e, ctx)?;
+            let sub = matches!(v, OwnedValue::Text(_));
+            Ok((v, sub))
+        }
+        _ => plain(e),
+    }
+}
+
 /// Fold one aggregate over a group's rows: evaluate its inputs
 /// per row (synchronously; `agg_row` applies its FILTER) and fold
 /// the values (`agg::fold`).
@@ -5877,11 +6781,11 @@ fn eval_agg<E>(e: &RExpr, rows: &[RowData], ctx: &Ctx<'_>) -> Result<OwnedValue,
     let mut arg_rows: AVec<AVec<OwnedValue>> = AVec::new();
     for r in rows {
         let rc = ctx.as_row(r);
-        if let Some(vs) = agg_row::<E>(&p, &mut |x| eval::<E>(x, &rc))? {
+        if let Some(vs) = agg_row::<E>(&p, &rc)? {
             arg_rows.push(vs);
         }
     }
-    crate::agg::fold::<E>(&p, arg_rows)
+    crate::agg::fold::<E>(&p, arg_rows, ctx.enc())
 }
 
 /// Evaluate a resolved expression.
@@ -6028,7 +6932,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Win(..) => return Err(Error::Unsupported),
         RExpr::Raise(kind) => return Err(Error::Schema { kind: *kind }),
         RExpr::Pos(x) => eval::<E>(x, ctx)?,
-        RExpr::Neg(x) => match to_number(&eval::<E>(x, ctx)?) {
+        RExpr::Neg(x) => match to_number(&num_arg(eval::<E>(x, ctx)?, ctx)) {
             None => OwnedValue::Null,
             Some(Num::Int(i)) => match i.checked_neg() {
                 Some(n) => OwnedValue::Integer(n),
@@ -6089,6 +6993,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             #[cfg(feature = "v16")]
             BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => eval_other::<E>(e, ctx)?,
         },
+        #[cfg(feature = "utf16")]
+        RExpr::Cast(x, aff) => cast_in(eval::<E>(x, ctx)?, *aff, ctx),
+        #[cfg(not(feature = "utf16"))]
         RExpr::Cast(x, aff) => cast_value(&eval::<E>(x, ctx)?, *aff),
         RExpr::Collate(x, _) => eval::<E>(x, ctx)?,
         // Everything else out of line: this function is on the
@@ -6187,7 +7094,7 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
             None => {
                 for (w, t) in whens.iter() {
-                    if truthy(&eval::<E>(w, ctx)?) == Some(true) {
+                    if cond::<E>(w, ctx)? {
                         out = eval::<E>(t, ctx)?;
                         done = true;
                         break;
@@ -6200,6 +7107,203 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         }
         out
     })
+}
+
+/// Whether condition `e` holds (v0.16 fix, ungated): its value is
+/// true, computed as the pin's jump code computes a WHERE / ON /
+/// FILTER term or a CASE WHEN / iif condition (`sqlite3ExprIfTrue`
+/// / `sqlite3ExprIfFalse`) — AND stops at an operand that is not
+/// true, OR at one that is, NOT asks its operand whether it is
+/// false (so `NOT (a AND b)` stops at a false `a`), and an operand
+/// the answer no longer needs is never evaluated (its errors never
+/// surface). The same answer as `truthy(eval(e)) == Some(true)`
+/// whenever every operand evaluates. An integer-literal operand
+/// keeps `eval`'s simplification (`x AND 0` evaluates nothing).
+///
+/// A WHERE clause's constant terms are computed once before its
+/// rows, as the pin does (`constant_terms_hold`), not here.
+pub fn cond<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
+    cond_is::<E>(e, ctx, true)
+}
+
+/// Whether condition `e` is false (NULL is not), with `cond`'s
+/// early stops: a CHECK constraint fails exactly when it is (the
+/// pin's `sqlite3ExprIfTrue(.., SQLITE_JUMPIFNULL)`).
+pub fn cond_false<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
+    cond_is::<E>(e, ctx, false)
+}
+
+/// Whether `e` is `want` (true or false; NULL is neither).
+pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
+    match e {
+        RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r)
+            if int_lit(l).is_none() && int_lit(r).is_none() =>
+        {
+            // AND is false, OR true, as soon as one operand is.
+            let decisive = (*op == BinOp::Or) == want;
+            let a = cond_is::<E>(l, ctx, want)?;
+            if a == decisive {
+                return Ok(a);
+            }
+            cond_is::<E>(r, ctx, want)
+        }
+        RExpr::Not(x) => cond_is::<E>(x, ctx, !want),
+        #[cfg(feature = "utf16")]
+        _ => Ok(truthy(&blob_text(eval::<E>(e, ctx)?, ctx)) == Some(want)),
+        #[cfg(not(feature = "utf16"))]
+        _ => Ok(truthy(&eval::<E>(e, ctx)?) == Some(want)),
+    }
+}
+
+/// Whether the constant terms of WHERE clause `filter` (its
+/// top-level AND terms that read no column, no subquery and
+/// nothing non-deterministic) hold, computed in order before any
+/// row is read and stopping at the first that does not — the pin
+/// codes them ahead of its loop (`sqlite3WhereBegin`), so their
+/// errors surface even over no rows (v0.16 review fix, ungated).
+/// False: the clause rejects every row. An UPDATE / DELETE asks
+/// this; a SELECT core asks `join_constants_hold`.
+pub fn constant_terms_hold<E>(filter: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
+    let mut terms: AVec<&RExpr> = AVec::new();
+    and_terms(filter, &mut terms);
+    for t in terms.iter() {
+        if factorable(t) && !cond::<E>(t, ctx)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// A constant-propagation binding (`join_constants_hold`): the
+/// column slot, the index of the term defining it, the literal with
+/// the column's affinity applied, the column's affinity and
+/// collation.
+type ConstBind = (usize, usize, OwnedValue, Affinity, Option<Coll>);
+
+/// `constant_terms_hold` for a SELECT core: the WHERE clause
+/// `filter`, then the ON clause of each inner-joined source (the
+/// pin moves those into WHERE; an outer join's ON is tested per
+/// row), after the pin's constant propagation (`propagateConstants`):
+/// a term `column = literal` (BINARY, the literal of no affinity;
+/// the last such term of a column, the pin scanning right to left)
+/// stands the literal, with the column's affinity, in for that
+/// column in the other terms — as a comparison operand only when
+/// the column has BLOB affinity — so `WHERE x = 1 AND (x = 2 OR
+/// json('[') IS NULL)` computes its second term up front as well.
+pub fn join_constants_hold<E>(
+    filter: Option<&RExpr>,
+    sources: &[SubSource],
+    ctx: &Ctx<'_>,
+) -> Result<bool, E> {
+    let mut terms: AVec<&RExpr> = AVec::new();
+    if let Some(f) = filter {
+        and_terms(f, &mut terms);
+    }
+    let right_join = sources.iter().any(|s| s.kind.pads_left());
+    for s in sources {
+        if let Some(on) = &s.on
+            && !s.kind.pads_left()
+            && !s.kind.pads_right()
+        {
+            and_terms(on, &mut terms);
+        }
+    }
+    let mut binds: AVec<ConstBind> = AVec::new();
+    if terms.len() > 1 && !right_join {
+        for (i, t) in terms.iter().enumerate().rev() {
+            let RExpr::Binary(BinOp::Eq, l, r) = t else {
+                continue;
+            };
+            for (c, v) in [(&**r, &**l), (&**l, &**r)] {
+                if let (RExpr::Column(slot, aff, coll), RExpr::Literal(lit)) = (c, v)
+                    && coll.unwrap_or_default() == Coll::Binary
+                    && !binds.iter().any(|b| b.0 == *slot)
+                {
+                    binds.push((
+                        *slot,
+                        i,
+                        crate::record::apply_affinity(lit.clone(), *aff),
+                        *aff,
+                        *coll,
+                    ));
+                }
+            }
+        }
+    }
+    for (i, t) in terms.iter().enumerate() {
+        let t2;
+        let t: &RExpr = if binds.is_empty() {
+            t
+        } else {
+            t2 = propagate(t, binds.as_slice(), i, false);
+            &t2
+        };
+        if factorable(t) && !cond::<E>(t, ctx)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `join_constants_hold`'s rewrite of term `i` (`binds`): a bound
+/// column becomes its literal, unless the term defines it; a BLOB
+/// affinity column only as an operand of `=`, `<`, `<=`, `>`, `>=`
+/// or IS (`operand`), the right one only when the left one is not
+/// of TEXT affinity (the pin's `propagateConstantExprRewrite`).
+/// Other node kinds are left as they are: one still reading a
+/// column is no constant term (a narrower rewrite than the pin's).
+fn propagate(e: &RExpr, binds: &[ConstBind], i: usize, operand: bool) -> RExpr {
+    let p = |x: &RExpr, o: bool| Box::new(propagate(x, binds, i, o));
+    match e {
+        RExpr::Column(slot, ..) => match binds.iter().find(|b| b.0 == *slot) {
+            Some((_, def, v, aff, coll)) if *def != i && (operand || *aff != Affinity::Blob) => {
+                RExpr::AffLiteral(v.clone(), Some(*aff), *coll)
+            }
+            _ => e.clone(),
+        },
+        RExpr::Binary(
+            op @ (BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Is),
+            l,
+            r,
+        ) => {
+            let text = matches!(&**l, RExpr::Column(_, Affinity::Text, _));
+            RExpr::Binary(*op, p(l, true), p(r, !text))
+        }
+        RExpr::Binary(op, l, r) => RExpr::Binary(*op, p(l, false), p(r, false)),
+        RExpr::Not(x) => RExpr::Not(p(x, false)),
+        RExpr::Neg(x) => RExpr::Neg(p(x, false)),
+        RExpr::IsNull(x, n) => RExpr::IsNull(p(x, false), *n),
+        RExpr::Cast(x, a) => RExpr::Cast(p(x, false), *a),
+        RExpr::Scalar(f, args) => {
+            let mut out = AVec::new();
+            for a in args.iter() {
+                out.push(propagate(a, binds, i, false));
+            }
+            RExpr::Scalar(*f, out)
+        }
+        _ => e.clone(),
+    }
+}
+
+/// The top-level AND terms of `e`, in order.
+pub fn and_terms<'e>(e: &'e RExpr, out: &mut AVec<&'e RExpr>) {
+    match e {
+        RExpr::Binary(BinOp::And, l, r) => {
+            and_terms(l, out);
+            and_terms(r, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// A constant the pin computes once per statement: no column, no
+/// subquery, nothing non-deterministic.
+fn factorable(e: &RExpr) -> bool {
+    #[cfg(feature = "v16")]
+    if any_scalar(e, &|f| f.nondeterministic()) {
+        return false;
+    }
+    is_constant(e)
 }
 
 /// The nodes `eval` leaves out of its own frame.
@@ -6250,6 +7354,8 @@ fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Like(x, p, neg) => {
             let xv = eval::<E>(x, ctx)?;
             let pv = eval::<E>(p, ctx)?;
+            #[cfg(feature = "utf16")]
+            let (xv, pv) = (text_view(xv, ctx), text_view(pv, ctx));
             match like_glob::<E>(&pv, &xv, None, false, case_like(ctx))? {
                 OwnedValue::Integer(m) => bool_val((m != 0) != *neg),
                 other => other,
@@ -6298,7 +7404,15 @@ pub fn eval_const<E>(expr: &Expr, arena: &Arena) -> Result<OwnedValue, E> {
 /// default is NULL-smallest, i.e. first ascending and last
 /// descending); any other pair compares by the storage-class
 /// ordering, reversed for DESC.
-pub fn order_cmp(a: &OwnedValue, b: &OwnedValue, o: SortOrder) -> core::cmp::Ordering {
+///
+/// `enc` is the database's text encoding (the BINARY order of a
+/// UTF-16 database is its UTF-16 bytes'; `record::compare_coll_in`).
+pub fn order_cmp(
+    a: &OwnedValue,
+    b: &OwnedValue,
+    o: SortOrder,
+    enc: crate::record::TextEnc,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (matches!(a, OwnedValue::Null), matches!(b, OwnedValue::Null)) {
         (true, true) => Ordering::Equal,
@@ -6317,7 +7431,7 @@ pub fn order_cmp(a: &OwnedValue, b: &OwnedValue, o: SortOrder) -> core::cmp::Ord
             }
         }
         (false, false) => {
-            let c = compare_coll(&a.as_value(), &b.as_value(), o.coll);
+            let c = crate::record::compare_coll_in(&a.as_value(), &b.as_value(), o.coll, enc);
             if o.desc { c.reverse() } else { c }
         }
     }
@@ -6329,9 +7443,10 @@ pub fn order_keys_cmp(
     a: &[OwnedValue],
     b: &[OwnedValue],
     dirs: impl Iterator<Item = SortOrder>,
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     for ((x, y), o) in a.iter().zip(b.iter()).zip(dirs) {
-        let c = order_cmp(x, y, o);
+        let c = order_cmp(x, y, o, enc);
         if c != core::cmp::Ordering::Equal {
             return c;
         }

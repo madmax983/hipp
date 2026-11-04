@@ -14,7 +14,7 @@ pub use ast::{
     UpsertAction,
 };
 #[cfg(feature = "v16")]
-pub use ast::{Cte, CteUse, M10d, RecMark, With};
+pub use ast::{Cte, CteUse, IndexHint, M10d, RecMark, With};
 #[cfg(feature = "v04")]
 pub use parser::parse_expr_text;
 #[cfg(feature = "params")]

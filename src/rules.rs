@@ -40,7 +40,7 @@ use crate::arena::{AVec, Arena};
 use crate::error::{Error, Result, SchemaKind};
 use crate::query::{
     Ctx, RExpr, RefRange, RowData, ScopeGroup, SourceDesc, SubPlan, eval, expr_refs_range, has_agg,
-    resolve_scoped, truthy,
+    resolve_scoped,
 };
 use crate::record::{Affinity, OwnedValue, Value, apply_affinity, encode_record};
 use crate::sql::parser::Limits;
@@ -180,6 +180,24 @@ impl TableRules {
         self.gcols.as_ref().map(|g| g.virt.as_slice())
     }
 
+    /// An UPDATE's effective change set (v0.16): per column, whether
+    /// the statement assigns it (`m`) or it is a generated column
+    /// computed from an assigned column or, when `rowid` is set, the
+    /// rowid. Dependency order makes one pass enough.
+    pub fn changed_cols(&self, m: &[bool], rowid: bool) -> AVec<bool> {
+        let mut eff: AVec<bool> = AVec::new();
+        eff.extend_from_slice(m);
+        if let Some(g) = self.gcols.as_ref() {
+            for (ci, e) in g.order.iter() {
+                let dep = reads_any(e, eff.as_slice(), rowid);
+                if let Some(slot) = eff.as_mut_slice().get_mut(*ci) {
+                    *slot = *slot || dep;
+                }
+            }
+        }
+        eff
+    }
+
     /// Apply the table's rules to one fully-built proposed row
     /// in record form (see the module docs for the order).
     /// `Ok(false)` means OR IGNORE skips the row (a NOT NULL or
@@ -204,6 +222,7 @@ impl TableRules {
         affs: &[Affinity],
         rowid_alias: Option<usize>,
         action: ConflictAction,
+        #[cfg(feature = "v07")] nn_acts: crate::session::NnActs<'_>,
         changed: Option<(&[bool], bool)>,
         env: Option<&crate::query::Env>,
     ) -> Result<bool, E> {
@@ -220,6 +239,8 @@ impl TableRules {
             affs,
             rowid_alias,
             action,
+            #[cfg(feature = "v07")]
+            nn_acts,
         )? {
             return Ok(false);
         }
@@ -236,6 +257,8 @@ impl TableRules {
                 affs,
                 rowid_alias,
                 action,
+                #[cfg(feature = "v07")]
+                nn_acts,
             )? {
                 return Ok(false);
             }
@@ -251,20 +274,10 @@ impl TableRules {
             // The effective change set: assigned columns, then
             // generated columns reading any of them (dependency
             // order makes one pass enough).
-            let mut eff: AVec<bool> = AVec::new();
-            let mut rowid_changed = true;
-            if let Some((m, r)) = changed {
-                rowid_changed = r;
-                eff.extend_from_slice(m);
-                if let Some(g) = gcols {
-                    for (ci, e) in g.order.iter() {
-                        let dep = reads_any(e, eff.as_slice(), rowid_changed);
-                        if let Some(slot) = eff.as_mut_slice().get_mut(*ci) {
-                            *slot = *slot || dep;
-                        }
-                    }
-                }
-            }
+            let (eff, rowid_changed) = match changed {
+                Some((m, r)) => (self.changed_cols(m, r), r),
+                None => (AVec::new(), true),
+            };
             let rd = eval_row(rowid_alias, affs, row, rowid);
             for c in self.checks.iter() {
                 if changed.is_some() && !reads_any(c, eff.as_slice(), rowid_changed) {
@@ -274,7 +287,9 @@ impl TableRules {
                     Some(env) => Ctx::of(&rd).with(env),
                     None => Ctx::of(&rd),
                 };
-                if truthy(&eval::<E>(c, &ctx)?) == Some(false) {
+                // AND / OR stop early, as the pin's jump code
+                // (`query::cond_false`; v0.16 review fix).
+                if crate::query::cond_false::<E>(c, &ctx)? {
                     if action == ConflictAction::Ignore {
                         return Ok(false);
                     }
@@ -290,7 +305,7 @@ impl TableRules {
 
 /// Whether a rule expression over a table row reads any column
 /// flagged in `cols`, or the rowid when `rowid` is set.
-fn reads_any(e: &RExpr, cols: &[bool], rowid: bool) -> bool {
+pub fn reads_any(e: &RExpr, cols: &[bool], rowid: bool) -> bool {
     (rowid
         && expr_refs_range(
             e,
@@ -431,7 +446,9 @@ fn parse_rule<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<Expr, E> {
 /// Resolve a table's rules (v0.16): STRICT types, generated
 /// columns (validated and ordered), CHECK constraints — with the
 /// pin's definition-time errors, so CREATE TABLE refuses what the
-/// pin refuses.
+/// pin refuses. `has_rowid` is false for a WITHOUT ROWID table (a
+/// CHECK may not read its rowid).
+#[allow(clippy::too_many_arguments)]
 pub fn plan_rules<E>(
     arena: &Arena,
     lim: Limits,
@@ -440,6 +457,7 @@ pub fn plan_rules<E>(
     rowid_alias: Option<usize>,
     checks: &[&[u8]],
     strict: bool,
+    has_rowid: bool,
 ) -> Result<TableRules, E> {
     let mut rules = TableRules::default();
     if strict {
@@ -559,8 +577,17 @@ pub fn plan_rules<E>(
     }
     if !checks.is_empty() {
         let mut srcs = AVec::new();
-        let mut src = SourceDesc::new(copy(tname), descs, rowid_alias, true);
+        // A CHECK reads the rowid, except a WITHOUT ROWID table's
+        // (v0.16; the pin's "no such column: rowid").
+        let mut src = SourceDesc::new(copy(tname), descs, rowid_alias, has_rowid);
         src.colls = colls;
+        // A three-part name's schema part is ignored in a CHECK, as
+        // on the pin (v0.16 review fix: `temp.t.a` on a main table,
+        // or `bogus.t.a`, was refused).
+        #[cfg(feature = "v16")]
+        {
+            src.db = crate::query::DB_ANY;
+        }
         srcs.push(src);
         let cur = ScopeGroup::new(srcs, offsets, 0);
         for text in checks.iter() {
@@ -584,6 +611,7 @@ pub fn plan_rules<E>(
 /// column, an expression DEFAULT is constant, and every CHECK /
 /// generation expression resolves (see `plan_rules`). ALTER TABLE
 /// ADD COLUMN validates the rewritten definition the same way.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_def<E>(
     arena: &Arena,
     lim: Limits,
@@ -592,6 +620,7 @@ pub fn validate_def<E>(
     pk_columns: &[crate::arena::ABytes],
     checks: &[crate::arena::ABytes],
     strict: bool,
+    has_rowid: bool,
 ) -> Result<TableRules, E> {
     use crate::sql::handle_bytes;
     let mut specs: AVec<ColSpec<'_>> = AVec::new();
@@ -610,6 +639,7 @@ pub fn validate_def<E>(
         let decl = handle_bytes(arena, c.decl);
         let name = handle_bytes(arena, c.name);
         if pk_columns.len() == 1
+            && has_rowid
             && eq_ci(name, handle_bytes(arena, pk_columns[0]))
             && !c.pk_desc
             && eq_ci(crate::record::decl_token(decl), b"INTEGER")
@@ -650,6 +680,7 @@ pub fn validate_def<E>(
         alias,
         texts.as_slice(),
         strict,
+        has_rowid,
     )
 }
 
@@ -764,7 +795,9 @@ fn is_ctime(name: &[u8]) -> bool {
 pub fn check_default_const<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<(), E> {
     let e = parse_rule::<E>(text, arena, lim)?;
     let bad = expr_any(&e, &mut |x| match x {
-        Expr::Column { table: None, name } => !is_ctime(crate::sql::handle_bytes(arena, *name)),
+        Expr::Column {
+            table: None, name, ..
+        } => !is_ctime(crate::sql::handle_bytes(arena, *name)),
         Expr::Column { .. }
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_)

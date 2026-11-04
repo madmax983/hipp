@@ -15,7 +15,8 @@ aspirations.
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
-  files, and real SQLite recovers hipp's rollback journals.
+  files, and real SQLite recovers hipp's rollback journals (and,
+  with the `wal` leaf, its write-ahead logs).
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
 
@@ -63,8 +64,8 @@ aspirations.
   (`RequiresEvaluator`) instead of ignoring them, and still
   shrank. Behind `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE
   ... AS SELECT (the pin's column names, declared types and
-  schema text, byte for byte) and STRICT tables. WITHOUT ROWID
-  stays refused. Review fixes (every profile): CREATE TABLE
+  schema text, byte for byte) and STRICT tables. (WITHOUT ROWID
+  came later, in its own leaf: see below.) Review fixes (every profile): CREATE TABLE
   items are walked with the pin's grammar, so malformed
   constraint lists (`CHECK(a>0) bar`, `DEFAULT abs(1)`,
   `PRIMARY KEY (a) foo`) are syntax errors instead of schemas
@@ -315,7 +316,7 @@ aspirations.
   — its record-header test ("database disk image is malformed")
   and its index seek, message shapes, order and limit (a full
   check of a table with an expression or partial index is
-  refused); the table-valued `pragma_table_info('t')` and
+  refused without `expr_index`); the table-valued `pragma_table_info('t')` and
   friends in FROM with the pin's hidden-column arities;
   `sqlite_schema` / `sqlite_master` readable as ordinary tables
   under either name (writes refused). Unknown pragma names are
@@ -411,9 +412,9 @@ aspirations.
   expression (`?`, `''`); a new rowid past 9223372036854775807
   takes an unused one. Gaps: whole-database ANALYZE row order (the
   pin's schema hash), VACUUM of a file with an expression or
-  partial index, VACUUM of an auto-vacuum file (refused: hipp
-  writes no pointer maps), constraint-level ROLLBACK matched by
-  constraint kind (STATUS.md).
+  partial index without `expr_index`, VACUUM of an auto-vacuum file (refused: hipp
+  writes no pointer maps; kept by the honest-gap sweep, which also
+  refuses every other write to such a file) (STATUS.md).
 - **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
   `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
   [COLUMN] a` edit the stored schema texts token by token exactly
@@ -442,9 +443,9 @@ aspirations.
   `sqlite_sequence` row, `sqlite_*` tables can no longer be
   indexed, altered or dropped, and ADD COLUMN on a table with
   table constraints no longer writes unparsable text (tiny +28 B).
-  Gaps: a statement naming a temp table and a main object
-  (`INSERT INTO temp_t SELECT ... FROM main_t`, a join of both)
-  is refused, as is ALTER TABLE of a main table a TEMP view reads;
+  Gaps: a temp UPDATE / DELETE that reads main tables is refused
+  (statements mixing the two databases otherwise run since the
+  honest-gap sweep), as is ALTER TABLE of a main table a TEMP view reads;
   files with triggers cannot be altered without the `triggers`
   feature (with it, their texts are rewritten as the pin's);
   re-created tables can get
@@ -556,6 +557,189 @@ aspirations.
   Tiny unchanged, full +800 B (the ungated deferrable /
   ADD COLUMN REFERENCES fixes), max +33.8 KB with the review fixes
   (STATUS.md).
+
+- **JSON functions** (new leaf feature `json`, in `max` — ADR
+  0002 — not `full`): `json()` / `jsonb()` with the pin's JSONB
+  format byte for byte (its overwrite-in-place headers included),
+  JSON5 input with canonical output, `json_array` / `json_object`,
+  `json_extract` and the `->` / `->>` operators, `json_insert` /
+  `replace` / `set` / `array_insert` / `remove` (`$[#]` appends),
+  `json_patch`, `json_type`, `json_valid` (flags), `json_quote`,
+  `json_array_length`, `json_error_position`, `json_pretty`, every
+  `jsonb_` form, `json_group_array` / `json_group_object` (also as
+  window functions), and `json_each` / `json_tree` (and `jsonb_`) in
+  FROM with all their columns, correlated to the sources on their
+  left. The JSON subtype rules, the pin's errors and its 1000-level
+  nesting and path limits; every walk is iterative, text parses in
+  linear time, and `json_each` rows hold handles into the document
+  rather than copies of it (linear memory at 200,000 elements).
+  Ungated: WHERE / ON / FILTER / HAVING / CHECK / CASE WHEN / iif
+  conditions stop AND / OR / NOT early as the pin's jump code does
+  (subquery operands last, correlated WHERE terms after the rest),
+  and a WHERE clause's constant terms run once before any row, with
+  the pin's constant propagation. Review fixes also bind trigger
+  NEW / OLD inside table-valued function arguments. Sizes in
+  STATUS.md.
+- **Expression indexes, partial indexes and index-aware planning**
+  (new leaf feature `expr_index`, in `max` — ADR 0002 — not
+  `full`): `CREATE [UNIQUE] INDEX ... ON t(a + b, lower(c) COLLATE
+  NOCASE DESC) [WHERE expr]` with the pin's definition errors
+  (subqueries, non-deterministic functions, aggregates, window
+  calls, `t.a` / `rowid` in key expressions, parameters), maintained
+  by INSERT / UPDATE / DELETE / REPLACE / upsert (UNIQUE over the
+  rows the WHERE admits; `ON CONFLICT (a + b)` and `ON CONFLICT (a)
+  WHERE <the index's WHERE>` targets), PRAGMA index_list /
+  index_info / index_xinfo (cid -2), integrity_check (a partial
+  index's entry count included), REINDEX, VACUUM, ANALYZE and ALTER
+  TABLE RENAME / RENAME COLUMN / DROP COLUMN as the pin; files the
+  pin made with such indexes are read and written. The planner reads
+  equality, IN (list or `IN (SELECT ...)`), range, IS NULL and
+  OR-of-equality terms (and ORDER BY / GROUP BY / DISTINCT, NULLS
+  FIRST / LAST included) through the rowid, PRIMARY KEY, UNIQUE,
+  ordinary, partial and expression indexes in SELECT, subqueries,
+  joins (lookups per outer row), UPDATE and DELETE, choosing the
+  index the pin's cost model chooses without statistics, so rows
+  come in the pin's order (covering index scans, ORDER BY ties in
+  the index's direction, GROUP BY over a DESC index, an UPDATE OR
+  FAIL's partial work). A point lookup in a 100,000-row table reads
+  a few pages instead of the table, and a covering index's rows
+  come from its entries without table lookups. Without the leaf such indexes in
+  a file are refused for writes (never left stale) and scans read
+  rowid order. Tiny unchanged, full −16 B, max +32.3 KB (STATUS.md).
+- **WITHOUT ROWID tables** (new leaf feature `without_rowid`, in
+  `max` — ADR 0002 — not `full`): `CREATE TABLE ... WITHOUT ROWID`
+  (also with STRICT) stored exactly as the pin stores it — a
+  clustered index B-tree keyed by the PRIMARY KEY (a repeated key
+  column dropped, key collations and DESC ordering the tree) with
+  the other stored columns after it, secondary indexes and UNIQUE
+  constraints holding the key columns instead of a rowid, cells of
+  at least 4 bytes, overflow by the index-cell rules — so files
+  interoperate both ways and the pin's integrity_check passes on
+  hipp's. The pin's rules and errors: PRIMARY KEY required, no
+  AUTOINCREMENT, `WITHOUT <other>` refused, `rowid` / `oid` /
+  `_rowid_` unknown everywhere (SELECT, WHERE, RETURNING, SET,
+  INSERT columns, indexes, CHECK, trigger NEW / OLD), NOT NULL key
+  columns, INTEGER PRIMARY KEY no rowid alias, `last_insert_rowid()`
+  untouched. Every path works on them: INSERT, OR IGNORE / REPLACE,
+  upsert (also updating the key), RETURNING, UPDATE moving a row
+  whose key changes (two-pass, in key order, as the pin), DELETE,
+  triggers, foreign keys with such parents and children,
+  savepoints, crash recovery, joins, views, subqueries, PRAGMA
+  table_info / table_list / index_list / index_info / index_xinfo
+  (the key as `sqlite_autoindex_t_N`, origin `pk`), integrity_check,
+  ALTER TABLE RENAME / ADD COLUMN / RENAME COLUMN / DROP COLUMN,
+  DROP TABLE, VACUUM, REINDEX and ANALYZE. Scans follow the pin's
+  planner for these tables (its cheapest covering index, newest on a
+  tie, its UPDATE / DELETE costing). Without the leaf a file holding
+  such a table is refused at open, as before. Fixed on the way: an
+  `IS NULL` lookup through a UNIQUE index no longer counts as one
+  row (GROUP BY groups came unsorted). Review fixes: an index
+  delete rebalance that panicked or wrote a corrupt page when its
+  new dividers were larger (also ordinary indexes) and two table
+  insert-balance cases that grew by more than one page; NOCASE
+  stops at a NUL byte as the pin's; `PRAGMA index_info(t)` of a
+  WITHOUT ROWID table describes its key; DROP COLUMN of a last
+  column; stored texts keep the whitespace after table options
+  and indexes as the pin's do. Records and cells match the pin's
+  byte for byte, but page allocation does not (a few more pages);
+  index_xinfo prints collation names in upper case. Sizes in
+  STATUS.md.
+- **UTF-16 databases** (new leaf feature `utf16`, in `max` — ADR
+  0002 — not `full`): files whose header text encoding is 2
+  (UTF-16le) or 3 (UTF-16be) open, read and write as on the pin,
+  and `PRAGMA encoding = 'UTF-16' | 'UTF-16le' | 'UTF-16be'` (or
+  `UTF16...`, any case; `UTF-16` alone is little-endian, the pin's
+  native order; `PRAGMA temp.encoding` too) chooses one while the
+  database has no schema — header-only writes such as `PRAGMA
+  user_version` leave it open, a schema change (even rolled back,
+  TEMP too) fixes it, as on the pin — and `PRAGMA encoding`
+  reports it. Records (and sqlite_schema's text)
+  are translated at the B-tree boundary, so serial types count
+  UTF-16 bytes and files interoperate both ways (the pin's
+  integrity_check passes on hipp's and hipp's on the pin's, unpaired
+  surrogates included: text is held losslessly, so index builds and
+  copies keep the stored units; VACUUM keeps the encoding).
+  The BINARY collation compares the UTF-16 bytes with memcmp as
+  the pin does — UTF-16le orders by the low byte first, UTF-16be
+  sorts astral characters below U+E000 — in ORDER BY, indexes,
+  ranges, min / max, GROUP BY, compounds, windows and aggregates;
+  NOCASE and RTRIM compare the UTF-8 form, as the pin defines them
+  for UTF-8 only. hex() and CAST(... AS BLOB) give the UTF-16
+  bytes, octet_length counts them, a blob read as text (CAST, ||,
+  upper, LIKE, numbers from blobs, sum, group_concat, JSON
+  documents) decodes from UTF-16 while the math functions and
+  sign() give NULL for it, function results go through the pin's
+  conversion (a lone surrogate becomes U+FFFD), and text with
+  unpaired surrogates shows as the pin shows it. Without the leaf
+  such a file is refused at open (`UnsupportedEncoding`), never
+  misread. Fixed on the way (ungated): `unicode(char(65534))` is
+  65534, and `sign()` of a BLOB or of a text that is not wholly a
+  number is NULL, as on the pin. Gaps and sizes in STATUS.md.
+- **WAL journal mode** (new leaf feature `wal`, in `max` — ADR 0002
+  — not `full`): a database whose header says WAL (or with a
+  non-empty `-wal` beside it) opens with the committed frames of
+  its log replayed — the pin's header and frame checks, both
+  checksum byte orders, stop at the first invalid frame, frames
+  after the last commit ignored — so data the pin left
+  uncheckpointed is visible. `PRAGMA journal_mode = WAL | DELETE`
+  switches both ways (the pin's prefix match of the name, its
+  in-transaction rules); commits append frames in the pin's layout
+  (header, salts, cumulative checksums, commit frames, pages
+  rewritten in place within a transaction, log restarts after a
+  full checkpoint), so the pin reads, recovers and checkpoints
+  hipp's log. `PRAGMA wal_checkpoint` (PASSIVE / FULL / RESTART /
+  TRUNCATE / NOOP, the `busy|log|checkpointed` row), the automatic
+  checkpoint (`wal_autocheckpoint`, 1000 by default),
+  `journal_size_limit`, every `synchronous` level, and
+  `Connection::close` (checkpoint, `-wal` and a stale `-shm`
+  removed, as the pin's close; the CLI closes at exit). Single
+  process, as the pin's `locking_mode=EXCLUSIVE`: the wal-index
+  lives in heap memory, no `-shm` is written, and a database a
+  live SQLite connection, or another hipp connection (this
+  process's too), holds in WAL mode is refused (`DatabaseBusy`). An
+  in-memory database (the CLI's `:memory:`,
+  `MemStorage::memory_db`) stays in journal mode `memory`, as on
+  the pin. An UPDATE writes only the pages the pin writes (an
+  unchanged row or index entry is not rewritten), so checkpoint
+  counts match.
+  Savepoints and statement rollback work inside WAL transactions;
+  crash injection at every write (frames, checkpoints, restarts,
+  mode switches, close) recovers the last committed state, which
+  the pin's integrity check accepts. Without the leaf a database
+  whose header says WAL, or with a non-empty `-wal` beside it
+  (which the pin opens in WAL mode whatever the header says), is
+  refused at open (`WalUnsupported`), never read stale. Fixed on
+  the way (ungated, `v16`): `PRAGMA journal_mode = w` (a prefix)
+  is the pin's WAL, no longer a silent query; `PRAGMA synchronous
+  = ...` inside a transaction is the pin's error. Gaps and sizes
+  in STATUS.md.
+- **Honest-gap sweep.** Constraint-level `ON CONFLICT` clauses
+  (`NOT NULL` / `UNIQUE` / `PRIMARY KEY ... ON CONFLICT ROLLBACK |
+  ABORT | FAIL | IGNORE | REPLACE`) are honoured instead of
+  ignored (ungated from `v07`; below it FAIL / IGNORE / REPLACE are
+  refused at parse) with the pin's precedence — an explicit `OR`
+  clause, then the constraint's, then ABORT — its index order
+  (REPLACE indexes and the rowid REPLACE last), NOT NULL ...
+  REPLACE defaults, CHECK ignoring its clause, and the upsert /
+  trigger / foreign-key interplay. Behind `v16`: `INDEXED BY name`
+  / `NOT INDEXED` in FROM, UPDATE and DELETE (the pin's "no such
+  index" and "no query solution"; with `expr_index` the planner uses
+  exactly that index, or none); three-part column names
+  `main.t.col` / `temp.t.col` everywhere the pin takes them, so
+  pin-written CHECK and partial-index texts that use them are no
+  longer opaque; and statements across the TEMP and main databases
+  — main statements reading temp tables, `INSERT INTO temp.x SELECT
+  ... FROM main.y` and `CREATE TEMP TABLE x AS SELECT ...` over main,
+  TEMP views over both, pragma functions on temp objects. VACUUM of
+  an auto-vacuum file stays refused (no pointer-map upkeep), and
+  since the review fixes so does every other write to such a file
+  (they used to leave the pin's pointer maps stale). Review fixes
+  also keep views and triggers stored in main reading main only (a
+  temp table no longer shadows their tables), refuse INDEXED BY on a
+  trigger body's UPDATE / DELETE as the pin does, ignore the schema
+  part of CHECK / partial-index names as the pin does, and tell
+  `main.t` from `temp.t` in one statement. Gaps and sizes in
+  STATUS.md.
 
 ## What v0.13 does
 
@@ -824,7 +1008,8 @@ aspirations.
   seam. Expression and partial foreign indexes are read as
   opaque metadata; writes to their tables are refused rather
   than allowed to desynchronise them. (Since v0.16, NOCASE /
-  RTRIM-collated indexes are maintained, not opaque.)
+  RTRIM-collated indexes are maintained, not opaque, and with
+  `expr_index` expression and partial indexes are too.)
 - Explicit transactions: `BEGIN` / `COMMIT` / `ROLLBACK` over the
   resumable commit machine.
 - Table B-trees with leaf/interior/root splits, overflow chains
@@ -863,14 +1048,20 @@ differential testing. It is a separate crate and contributes
 
 ## Non-goals (SPEC §3)
 
-No WAL (files in WAL mode are rejected with `WalUnsupported`),
-no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
+No WAL without the `wal` leaf (files in WAL mode, or with a
+non-empty `-wal` beside them, are then rejected with
+`WalUnsupported`; with it, single-process WAL only — no shared
+`-shm` wal-index, one connection per WAL database), no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
+them), no AUTOINCREMENT tables
 created (refused below `v16`, foreign ones load read-only there;
 `v16` maintains `sqlite_sequence`), no expression or partial
-indexes, no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
+indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed (all of these in the tiny profile: the
 `v04` ... `v16` rungs add them — views execute with `v16`), no
-UTF-16, no multi-process
+UTF-16 databases without the `utf16` leaf (refused at open), no
+writes to auto-vacuum files (read only: hipp keeps no pointer-map
+pages, so writes are refused with `AutoVacuumUnsupported` until
+`PRAGMA auto_vacuum = NONE; VACUUM` converts the file), no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 
@@ -885,15 +1076,20 @@ A workspace: the zero-dependency core crate at the root plus
 v0.4), `agg` (aggregate folding: the pin's sum / percentile
 rules, aggregate ORDER BY and DISTINCT, v0.16), `func` (printf and
 the v0.16 scalar function library), `window` (window functions:
-the pin's frame engine, feature `window`, v0.16),
+the pin's frame engine, feature `window`, v0.16), `json` (the JSON
+functions and JSONB, feature `json`, v0.16),
 `rules` (CHECK / generated-column / STRICT / DEFAULT
 rules and the generated-column row codec, v0.16), `session`
 (Connection/Statement, planner, tree-walking executor;
 `session/pragma` the PRAGMA statements and integrity check,
 `session/cte` view / CTE expansion and the recursive queue,
 `session/maint` savepoints, VACUUM, REINDEX and ANALYZE,
-`session/trigger` trigger programs, v0.16; `sql/trig` the NEW. /
-OLD. binder),
+`session/trigger` trigger programs, `session/json_tvf` the
+`json_each` / `json_tree` sources, v0.16; `sql/trig` the NEW. /
+OLD. binder), `wr` (WITHOUT ROWID trees behind the rowid-shaped
+B-tree interface, feature `without_rowid`, v0.16), `utf16`
+(UTF-16 text conversions and the record translation of UTF-16
+files, feature `utf16`, v0.16),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

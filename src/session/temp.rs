@@ -25,9 +25,12 @@
 //!   in as common table expressions (`inline_temp_views`); an ALTER
 //!   TABLE of a main table such a view reads is refused (the pin
 //!   rewrites the view);
-//! - a statement that names a temp table and a main object is
-//!   refused (`Unsupported`): the two databases never meet inside
-//!   one statement in hipp.
+//! - (v0.16 honest-gap sweep) a statement of the main database may
+//!   read temp tables (`plan_temp_source`: an unqualified name is
+//!   temp first), and a temp INSERT ... SELECT / CREATE TABLE ... AS
+//!   SELECT that reads main is fed the SELECT's rows from main
+//!   (`Route::TempFed`); a temp UPDATE / DELETE that reads main is
+//!   still refused (`Unsupported`).
 //!
 //! The connection-wide pragmas (`foreign_keys`, `case_sensitive_like`,
 //! `ignore_check_constraints`, ...) are the main connection's, copied
@@ -55,6 +58,32 @@ pub(super) enum Route {
     /// views over main tables, with those views written in as
     /// common table expressions (`Connection::inline_temp_views`).
     MainAs(AVec<u8>),
+    /// A write of the temp database fed by a SELECT that reads the
+    /// main one (v0.16; `Connection::prepare_temp_fed`).
+    TempFed(Box<FedRoute>),
+}
+
+/// How a temp write reads main (v0.16, `Route::TempFed`).
+pub(super) struct FedRoute {
+    /// The SELECT, as main's text.
+    feed: AVec<u8>,
+    /// The temp INSERT, its source replaced by a VALUES row of
+    /// NULLs (`None` for CREATE TABLE ... AS, whose INSERT is made
+    /// from the table's columns).
+    insert: Option<AVec<u8>>,
+    /// CREATE TABLE ... AS: the new table's name.
+    ctas: Option<AVec<u8>>,
+    /// The INSERT's VALUES width.
+    width: usize,
+}
+
+/// The planned main half of a temp write that reads main (v0.16,
+/// `Plan::Temp::feed`): the SELECT, and for CREATE TABLE ... AS the
+/// temp database's CREATE TABLE text (run first; the statement's own
+/// text is then the INSERT of the rows).
+pub(super) struct TempFeed {
+    select: Box<crate::query::SubPlan>,
+    create: Option<AVec<u8>>,
 }
 
 /// The temp database's errors under the connection's storage type
@@ -307,6 +336,7 @@ fn ast_names(
             table,
             filter,
             returning,
+            ..
         } => {
             out.push((*table, Kind::Object));
             for e in filter.iter() {
@@ -752,40 +782,138 @@ impl<S: Storage> Connection<S> {
         // does not resolve. A `temp.a` whose `temp` qualifies a
         // column (a table or alias called `temp`) is no schema and
         // stays as written.
+        // v0.16: the `temp.` of a three-part column name
+        // `temp.x.col` (its table token `x` qualifies a column) is
+        // placed: it binds where the statement runs (the temp
+        // database's resolver takes `temp.`, main's `main.`, and each
+        // refuses the other's, as on the pin).
+        let col3 = |i: usize| {
+            col_quals.as_slice().contains(&i)
+                && matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot))
+        };
+        // A CHECK constraint's or partial index's three-part name
+        // (`temp.t.a`), kept as text by the parser: the pin ignores
+        // its schema part (`query::DB_ANY`), and elsewhere in a table
+        // or index definition (generated columns, key expressions)
+        // the main resolver refuses it as the pin does (v0.16 review
+        // fix: such definitions were refused).
+        let def = matches!(
+            ast,
+            Ast::CreateTable {
+                as_select: None,
+                ..
+            } | Ast::CreateIndex { .. }
+        );
+        let def3 = |i: usize| def && matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot));
         let unplaced = (0..t.len()).any(|i| {
             qualifier(t, i, arena) == Some(true)
                 && !routed.as_slice().contains(&i)
+                && !col3(i)
+                && !def3(i)
                 && !(col_quals.as_slice().contains(&(i.wrapping_sub(2)))
                     && !matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot | Tok::LParen)))
         });
         // TEMP views over main tables (and no temp table): the
         // statement runs on main with the views written in.
-        if created.is_none() && !unplaced && !views.is_empty() {
+        // A main CREATE TABLE ... AS SELECT reading them gets them
+        // after its `AS` (v0.16 review fix: "no such table").
+        let ctas = match (&ast, created) {
+            (
+                Ast::CreateTable {
+                    as_select: Some(_), ..
+                },
+                Some((h, false)),
+            ) if !create_temp => tok_index(t, h).map(|i| i + 2),
+            _ => None,
+        };
+        if (created.is_none() || ctas.is_some()) && !unplaced && !views.is_empty() {
             let target = match &ast {
                 Ast::Insert { table, .. }
                 | Ast::Update { table, .. }
                 | Ast::Delete { table, .. } => Some(handle_bytes(arena, *table)),
                 Ast::Select(_) | Ast::With { .. } => None,
+                _ if ctas.is_some() => None,
                 _ => Some(&b""[..]),
             };
             let dml_on_view = target.is_some_and(|n| n.is_empty() || self.temp_view(n).is_some());
             if !dml_on_view
+                && self.target_in_main(&ast, t, arena)
+                && renames.is_empty()
                 && let Some(out) = self.inline_temp_views(
                     &text,
                     t,
                     views.as_slice(),
                     ctes.as_slice(),
                     cuts.as_slice(),
-                    (temp > views.len(), main > 0),
+                    (temp > views.len(), main > 0 || ctas.is_some()),
+                    ctas.unwrap_or(0),
                     arena,
                 )?
             {
                 return Ok(Route::MainAs(out));
             }
         }
+        // v0.16: a temp write fed by a SELECT reading main (INSERT
+        // INTO temp.x SELECT ..., CREATE TEMP TABLE x AS SELECT ...).
+        // TEMP views over main count as main's (v0.16 review fix: their
+        // feed is written in as CTEs, `prepare_temp_fed`).
+        let mut fed_main = main > 0;
+        if !fed_main && (temp > 0 || create_temp) {
+            let (mut order, mut refs) = (AVec::new(), AVec::new());
+            for v in views.iter() {
+                fed_main |= self
+                    .temp_view_closure(v.as_slice(), &mut order, &mut refs, 0, arena)?
+                    .1;
+            }
+        }
+        if (temp > 0 || create_temp) && fed_main && !unplaced && renames.is_empty() {
+            // `CREATE TEMP TABLE IF NOT EXISTS x AS ...` over an
+            // existing `x` does nothing, reading nothing.
+            if let Ast::CreateTable {
+                name,
+                if_not_exists: true,
+                as_select: Some(_),
+                ..
+            } = &ast
+                && create_temp
+                && self.temp_has(handle_bytes(arena, *name), false)
+            {
+                let mut noop = copy_vec(b"CREATE TABLE IF NOT EXISTS \"");
+                for &b in handle_bytes(arena, *name) {
+                    noop.push(b);
+                    if b == b'"' {
+                        noop.push(b'"');
+                    }
+                }
+                noop.extend_from_slice(b"\" AS SELECT 1");
+                return Ok(Route::Temp(noop));
+            }
+            if let Some(f) = self.fed_route(&ast, &text, t, create_temp, arena)? {
+                return Ok(Route::TempFed(Box::new(f)));
+            }
+        }
         let to_temp = create_temp || (temp > 0 && main == 0 && created.is_none());
         if !to_temp {
-            if temp > 0 || unplaced {
+            if unplaced {
+                return Err(Error::Unsupported);
+            }
+            // v0.16: a statement of the main database may read TEMP
+            // tables (`plan_temp_source`) — a query, a write of a main
+            // table, CREATE TABLE ... AS SELECT in main — but not
+            // write one, nor read the temp schema table.
+            if temp > 0
+                && (!renames.is_empty()
+                    || !self.target_in_main(&ast, t, arena)
+                    || !matches!(
+                        ast,
+                        Ast::Select(_)
+                            | Ast::With { .. }
+                            | Ast::Insert { .. }
+                            | Ast::Update { .. }
+                            | Ast::Delete { .. }
+                            | Ast::CreateTable { .. }
+                    ))
+            {
                 return Err(Error::Unsupported);
             }
             return Ok(Route::Main);
@@ -965,21 +1093,19 @@ impl<S: Storage> Connection<S> {
         ctes: &[ABytes],
         cuts: &[(usize, usize)],
         (temp, main): (bool, bool),
+        start: usize,
         arena: &Arena,
     ) -> Result<Option<AVec<u8>>, S::Error> {
         let mut order = AVec::new();
         let mut refs = AVec::new();
-        let (mut reads_temp, mut reads_main) = (temp, main);
+        let _ = temp;
+        let mut reads_main = main;
         for v in views {
-            let (a, b) = self.temp_view_closure(v.as_slice(), &mut order, &mut refs, 0, arena)?;
-            reads_temp |= a;
+            let (_, b) = self.temp_view_closure(v.as_slice(), &mut order, &mut refs, 0, arena)?;
             reads_main |= b;
         }
-        // Both databases in one statement: refused (see the module
-        // docs); temp objects only: the temp database runs it.
-        if reads_temp && reads_main {
-            return Err(Error::Unsupported);
-        }
+        // Temp objects only: the temp database runs it (v0.16: with
+        // main ones too, main runs it, reading the temp tables there).
         if !reads_main {
             return Ok(None);
         }
@@ -993,13 +1119,21 @@ impl<S: Storage> Connection<S> {
         if clash {
             return Err(Error::Unsupported);
         }
+        // The query starts at token `start` (after `CREATE TABLE x AS`
+        // for CREATE TABLE ... AS SELECT; v0.16 review fix): the WITH
+        // list goes in there, after the text before it as written.
+        let head = t.get(start).map_or(0, |x| x.offset);
+        if cuts.iter().any(|c| c.0 < head) {
+            return Err(Error::Unsupported);
+        }
         let mut cuts_v: AVec<(usize, usize)> = AVec::new();
         for &c in cuts {
-            cuts_v.push(c);
+            cuts_v.push((c.0.saturating_sub(head), c.1.saturating_sub(head)));
         }
-        let body = apply_cuts(text.as_slice(), &mut cuts_v);
-        let word = |i: usize, w: &[u8]| matches!(t.get(i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
-        let mut out = copy_vec(b"WITH ");
+        let body = apply_cuts(text.as_slice().get(head..).unwrap_or_default(), &mut cuts_v);
+        let word = |i: usize, w: &[u8]| matches!(t.get(start + i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
+        let mut out = copy_vec(text.as_slice().get(..head).unwrap_or_default());
+        out.extend_from_slice(b"WITH ");
         // The statement's own WITH [RECURSIVE] continues the list.
         let rest = if word(0, b"WITH") {
             let k = if word(1, b"RECURSIVE") {
@@ -1008,7 +1142,7 @@ impl<S: Storage> Connection<S> {
             } else {
                 1
             };
-            let Some(at) = t.get(k).map(|x| x.offset) else {
+            let Some(at) = t.get(start + k).map(|x| x.offset.saturating_sub(head)) else {
                 return Err(Error::Unsupported);
             };
             Some(at)
@@ -1049,8 +1183,27 @@ impl<S: Storage> Connection<S> {
             }
     }
 
+    /// Whether a write statement's target (an INSERT / UPDATE /
+    /// DELETE table, a CREATE TABLE's new table) is a main table, or
+    /// the statement writes none (v0.16): `main.x`, or an unqualified
+    /// name the temp database does not have.
+    fn target_in_main(&self, ast: &Ast, t: &[Token], arena: &Arena) -> bool {
+        let target = match ast {
+            Ast::Insert { table, .. }
+            | Ast::Update { table, .. }
+            | Ast::Delete { table, .. }
+            | Ast::CreateTable { name: table, .. } => *table,
+            Ast::With { body, .. } => return self.target_in_main(body, t, arena),
+            _ => return true,
+        };
+        match tok_index(t, target).and_then(|i| qualifier(t, i, arena)) {
+            Some(q) => !q,
+            None => !self.temp_has(handle_bytes(arena, target), false),
+        }
+    }
+
     /// The temp database has an object (`index`: an index) named so.
-    fn temp_has(&self, name: &[u8], index: bool) -> bool {
+    pub(super) fn temp_has(&self, name: &[u8], index: bool) -> bool {
         self.temp.as_ref().is_some_and(|c| {
             let ca = &c.catalog_arena;
             if index {
@@ -1072,6 +1225,10 @@ impl<S: Storage> Connection<S> {
                 Box::pin(Connection::open(MemStorage::new(), cfg));
             let mut c = open.await.map_err(mem_err)?;
             c.is_temp = true;
+            // The TEMP database stores text as main does (v0.16,
+            // `utf16`).
+            #[cfg(feature = "utf16")]
+            c.set_text_enc(self.pager.text_enc());
             // Replay the open transaction.
             let mut script: AVec<AVec<u8>> = AVec::new();
             if self.explicit_txn {
@@ -1117,6 +1274,12 @@ impl<S: Storage> Connection<S> {
             c.prag.busy_timeout = p.busy_timeout;
             c.prag.like_redefined = p.like_redefined;
             c.env.case_like.set(like);
+            // The encoding is the connection's: main's, chosen while
+            // the TEMP schema is still unwritten (v0.16, `utf16`).
+            #[cfg(feature = "utf16")]
+            if c.pager.text_enc() != self.pager.text_enc() {
+                c.set_text_enc(self.pager.text_enc());
+            }
         }
     }
 
@@ -1152,10 +1315,21 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Ok(Step::Done);
         }
         if !self.query_loaded {
-            let Plan::Temp { sql, .. } = &self.plan else {
+            let Plan::Temp { sql, feed, .. } = &self.plan else {
                 return Err(Error::Unsupported);
             };
             let sql = sql.clone();
+            // A temp write reading main (v0.16): its rows first, read
+            // here; a CTAS's table is created before they go in, and
+            // it changes no counter (as on the pin).
+            let (fed, create) = match feed {
+                Some(f) => {
+                    let (select, create) = (f.select.clone(), f.create.clone());
+                    let rows = self.exec_subplan(&select, &RowData::empty()).await?;
+                    (Some(rows), create)
+                }
+                None => (None, None),
+            };
             #[cfg(feature = "params")]
             let binds = self.binds.values.clone();
             let env = &self.conn.env;
@@ -1175,9 +1349,26 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut rows = AVec::new();
             let mut rowids = AVec::new();
             let r = async {
+                if let Some(ct) = &create {
+                    run_temp(c, ct.as_slice()).await?;
+                }
                 let prep: Boxed<'_, Result<Statement<'_, MemStorage>, MemError>> =
                     Box::pin(c.prepare(text));
                 let mut st = prep.await?;
+                if let (
+                    Some(rows),
+                    Plan::Insert {
+                        rows_v,
+                        rows_r,
+                        select,
+                        ..
+                    },
+                ) = (&fed, &mut st.plan)
+                {
+                    *rows_v = rows.clone();
+                    *rows_r = None;
+                    *select = None;
+                }
                 #[cfg(feature = "params")]
                 for (i, v) in binds.iter().enumerate() {
                     st.bind_value(i + 1, v.as_value())?;
@@ -1199,10 +1390,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             );
             let ended = in_txn && !c.explicit_txn;
             let env = &self.conn.env;
-            env.last_rowid.set(l2);
-            env.changes.set(c2);
-            env.total_changes
-                .set(total.saturating_add(t2.saturating_sub(before)));
+            if create.is_none() {
+                env.last_rowid.set(l2);
+                env.changes.set(c2);
+                env.total_changes
+                    .set(total.saturating_add(t2.saturating_sub(before)));
+            }
             // A failure that ended the temp database's transaction
             // (OR ROLLBACK, an I/O-class error) ends the main one.
             if r.is_err() && ended && self.conn.explicit_txn {
@@ -1225,5 +1418,327 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.query_pos += 1;
         self.phase = Phase::Running;
         Ok(Step::Row)
+    }
+}
+
+impl<S: Storage> Connection<S> {
+    /// A FROM source naming a TEMP table, read by a statement of the
+    /// main database (v0.16): its columns as the temp catalog has
+    /// them, its rows read from the temp database when the statement
+    /// runs (`Statement::scan_temp`). The rows come in rowid order
+    /// (no index access path: a temp index is not planned here).
+    pub(super) fn plan_temp_source(
+        &self,
+        s: &crate::sql::FromSource,
+        tc: &Connection<MemStorage>,
+        t: &crate::schema::TableDef,
+        arena: &Arena,
+        descs: &mut AVec<crate::query::SourceDesc>,
+        plans: &mut AVec<super::SourcePlan>,
+    ) -> Result<usize, S::Error> {
+        let ca = &tc.catalog_arena;
+        let t = t.usable::<MemError>().map_err(mem_err)?;
+        // `INDEXED BY` is checked against the temp table's indexes.
+        tc.index_hint(arena, t, s.indexed).map_err(mem_err)?;
+        let mut cols = AVec::new();
+        let mut affs = AVec::new();
+        let mut defaults = AVec::new();
+        for c in t.columns.iter() {
+            cols.push((copy_vec(handle_bytes(ca, c.name)), c.affinity));
+            affs.push(c.affinity);
+            defaults.push(super::read_default(ca, c));
+        }
+        let qual = match s.alias {
+            Some(a) => copy_vec(handle_bytes(arena, a)),
+            None => copy_vec(handle_bytes(arena, s.table)),
+        };
+        let mut desc = crate::query::SourceDesc::new(qual, cols, t.rowid_alias, t.has_rowid());
+        desc.kind = s.kind;
+        desc.colls = super::table_colls(t);
+        desc.db = 2;
+        descs.push(desc);
+        let gcols = if t.has_generated() {
+            tc.table_rules(arena, t)
+                .map_err(mem_err)?
+                .and_then(|r| r.gcols)
+                .map(Box::new)
+        } else {
+            None
+        };
+        // A WITHOUT ROWID temp table is read through its own key
+        // order, which this scan does not model.
+        if !t.has_rowid() {
+            return Err(Error::Unsupported);
+        }
+        plans.push(super::SourcePlan {
+            root: t.root,
+            kind: s.kind,
+            on: None,
+            rowid_alias: t.rowid_alias,
+            ncols: t.columns.len(),
+            affs,
+            defaults,
+            derived: None,
+            gcols,
+            rec: 0,
+            #[cfg(feature = "json")]
+            tvf: 0,
+            #[cfg(feature = "json")]
+            tvf_dead: AVec::new(),
+            #[cfg(feature = "expr_index")]
+            access: None,
+            #[cfg(feature = "expr_index")]
+            hint: crate::query::Hint::Any,
+            temp: true,
+        });
+        Ok(t.columns.len())
+    }
+}
+
+impl<S: Storage> Statement<'_, S> {
+    /// The rows of a TEMP table source of a main statement (v0.16;
+    /// `Connection::plan_temp_source`), read from the temp database
+    /// in rowid order as a query reads them (defaults materialised,
+    /// VIRTUAL columns computed, REAL columns forced).
+    pub(super) async fn scan_temp(
+        &mut self,
+        sp: &super::SourcePlan,
+    ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        let Some(tc) = self.conn.temp.as_deref_mut() else {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownTable,
+            });
+        };
+        // The table must still be there as planned (a statement
+        // prepared before a temp DROP / re-CREATE is not read from a
+        // freed page).
+        if !tc
+            .catalog
+            .tables
+            .iter()
+            .any(|t| t.root == sp.root && t.columns.len() == sp.ncols)
+        {
+            return Err(Error::Schema {
+                kind: SchemaKind::UnknownTable,
+            });
+        }
+        let mut rows = AVec::new();
+        let mut cursor = crate::btree::ScanCursor::new(sp.root);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor
+            .next_row_into(&mut tc.pager, &mut buf)
+            .await
+            .map_err(mem_err)?
+        {
+            let virt = sp.gcols.as_ref().map(|g| g.virt.as_slice());
+            let mut rec = crate::rules::decode_rec::<S::Error>(
+                buf.as_slice(),
+                sp.ncols,
+                sp.defaults.as_slice(),
+                virt,
+            )?;
+            if let Some(g) = &sp.gcols {
+                g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
+            }
+            let rd =
+                crate::rules::eval_row(sp.rowid_alias, sp.affs.as_slice(), rec.as_slice(), rowid);
+            rows.push((rd.vals, Some(rowid)));
+        }
+        Ok(rows)
+    }
+}
+
+impl<S: Storage> Connection<S> {
+    /// The two halves of a temp write that reads main (v0.16), or
+    /// `None` when the statement is not one: an `INSERT [OR ...] INTO
+    /// <temp table> [(cols)] SELECT ...` with no upsert, RETURNING or
+    /// leading WITH, or a `CREATE TEMP TABLE x AS SELECT ...`. The
+    /// SELECT is the text after the target (its own WITH included);
+    /// the temp half is the INSERT with a `VALUES` row in its place.
+    fn fed_route(
+        &self,
+        ast: &Ast,
+        text: &AVec<u8>,
+        t: &[Token],
+        create_temp: bool,
+        arena: &Arena,
+    ) -> Result<Option<FedRoute>, S::Error> {
+        let src = text.as_slice();
+        match ast {
+            Ast::Insert {
+                table,
+                columns,
+                select: Some(_),
+                upsert: None,
+                returning,
+                ..
+            } if returning.is_empty() && !self.target_in_main(ast, t, arena) => {
+                let Some(ti) = tok_index(t, *table) else {
+                    return Ok(None);
+                };
+                let mut k = ti + 1;
+                if matches!(t.get(k).map(|x| x.tok), Some(Tok::LParen)) {
+                    while k < t.len() && !matches!(t.get(k).map(|x| x.tok), Some(Tok::RParen)) {
+                        k += 1;
+                    }
+                    k += 1;
+                }
+                let Some(at) = t.get(k).map(|x| x.offset) else {
+                    return Ok(None);
+                };
+                let width = match columns {
+                    Some(c) => c.len(),
+                    None => {
+                        let Some(tc) = self.temp.as_deref() else {
+                            return Ok(None);
+                        };
+                        let ca = &tc.catalog_arena;
+                        let Some(tt) = tc.catalog.find(ca, handle_bytes(arena, *table)) else {
+                            return Ok(None);
+                        };
+                        tt.columns.iter().filter(|c| c.gen_expr.is_none()).count()
+                    }
+                };
+                let mut cuts = AVec::new();
+                if qualifier(t, ti, arena) == Some(true)
+                    && let Some(c) = qual_cut(t, ti)
+                {
+                    cuts.push(c);
+                }
+                let head = src.get(..at).unwrap_or_default();
+                let mut insert = apply_cuts(head, &mut cuts);
+                insert.extend_from_slice(b"VALUES (");
+                for i in 0..width {
+                    if i > 0 {
+                        insert.push(b',');
+                    }
+                    insert.extend_from_slice(b"NULL");
+                }
+                insert.push(b')');
+                Ok(Some(FedRoute {
+                    feed: copy_vec(src.get(at..).unwrap_or_default()),
+                    insert: Some(insert),
+                    ctas: None,
+                    width,
+                }))
+            }
+            Ast::CreateTable {
+                name,
+                as_select: Some(_),
+                ..
+            } if create_temp => {
+                // The SELECT follows the AS after the name.
+                let Some(ni) = tok_index(t, *name) else {
+                    return Ok(None);
+                };
+                let as_at = (ni + 1..t.len()).find(|&i| {
+                    matches!(t[i].tok, Tok::Ident(h, false) if eq_ci(handle_bytes(arena, h), b"AS"))
+                });
+                let Some(at) = as_at.and_then(|i| t.get(i + 1)).map(|x| x.offset) else {
+                    return Ok(None);
+                };
+                Ok(Some(FedRoute {
+                    feed: copy_vec(src.get(at..).unwrap_or_default()),
+                    insert: None,
+                    ctas: Some(copy_vec(handle_bytes(arena, *name))),
+                    width: 0,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Prepare a temp write that reads main (v0.16; `fed_route`):
+    /// the SELECT is planned here, on main (it may read temp tables
+    /// too), and the temp half prepared there.
+    pub(super) async fn prepare_temp_fed(
+        &mut self,
+        f: FedRoute,
+        arena: &Arena,
+    ) -> Result<super::Plan, S::Error> {
+        // TEMP views over main the SELECT reads are written in as
+        // CTEs, as for a main statement (`inline_temp_views`).
+        let routed = match self.route(f.feed.as_slice(), arena)? {
+            Route::MainAs(text) => Some(text),
+            _ => None,
+        };
+        let feed = routed.as_ref().unwrap_or(&f.feed);
+        let ast = crate::sql::parse::<S::Error>(feed.as_slice(), arena, self.cfg.limits())?;
+        // Its views and CTEs are expanded as a main statement's are
+        // (v0.16 review fix: a view read there was "no such table").
+        let expanded = self.expand_ast(arena, &ast)?;
+        let Ast::Select(sel) = expanded.as_ref().unwrap_or(&ast) else {
+            return Err(Error::Unsupported);
+        };
+        // Parameters would need binding on both sides.
+        #[cfg(feature = "params")]
+        if crate::sql::parse_params::<S::Error>(f.feed.as_slice(), arena, self.cfg.limits())?
+            .1
+            .count
+            > 0
+        {
+            return Err(Error::Unsupported);
+        }
+        let mut width = f.width;
+        let (select, create, insert) = match &f.ctas {
+            Some(name) => {
+                if self.temp_has(name.as_slice(), false) {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::DuplicateTable,
+                    });
+                }
+                let super::Plan::CreateTableAs {
+                    select: Some(select),
+                    sql,
+                    affs,
+                } = self.plan_create_as(arena, name.as_slice(), sel)?
+                else {
+                    return Err(Error::Unsupported);
+                };
+                let mut insert = copy_vec(b"INSERT INTO \"");
+                for &b in name.iter() {
+                    insert.push(b);
+                    if b == b'"' {
+                        insert.push(b'"');
+                    }
+                }
+                insert.extend_from_slice(b"\" VALUES (");
+                for i in 0..affs.len() {
+                    if i > 0 {
+                        insert.push(b',');
+                    }
+                    insert.extend_from_slice(b"NULL");
+                }
+                insert.push(b')');
+                width = affs.len();
+                (select, Some(sql), insert)
+            }
+            None => {
+                let select = self.plan_subquery(sel, arena, &[])?;
+                (Box::new(select), None, f.insert.unwrap_or_default())
+            }
+        };
+        let c = self.temp_conn().await?;
+        // The temp half's own prepare errors are the statement's (a
+        // CTAS's INSERT names a table that does not exist yet).
+        if create.is_none() {
+            let Ok(t) = core::str::from_utf8(insert.as_slice()) else {
+                return Err(Error::Unsupported);
+            };
+            let prep: Boxed<'_, Result<Statement<'_, MemStorage>, MemError>> =
+                Box::pin(c.prepare(t));
+            prep.await.map_err(mem_err)?;
+        }
+        // Each SELECT row is one VALUES row of the INSERT's width.
+        if select.width() != width {
+            return Err(Error::Schema {
+                kind: SchemaKind::ColumnCountMismatch,
+            });
+        }
+        Ok(super::Plan::Temp {
+            sql: insert,
+            width: 0,
+            feed: Some(Box::new(TempFeed { select, create })),
+        })
     }
 }

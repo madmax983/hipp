@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -123,6 +123,10 @@ v10 = ["v09"]
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.
+# The honest-gap sweep adds INDEXED BY / NOT INDEXED, three-part
+# column names and statements across the TEMP and main databases.
+# (Constraint-level ON CONFLICT clauses are *not* gated here: they
+# correct claimed `v07` write paths.)
 v16 = ["v10"]
 # v0.16 leaf (ADR 0001): bound parameters -- `?`, `?NNN`, `:name`,
 # `@name`, `$name` with the pin's numbering, the Statement bind_*
@@ -183,6 +187,94 @@ triggers = ["v16"]
 # the pragma is ON (never skipped silently). The tiny profile
 # excludes it per §2.
 foreign_keys = ["v16", "indexes"]
+
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): the JSON functions -- json(), jsonb() and the pin's JSONB
+# binary format (byte-identical blobs), json_array / json_object,
+# json_extract and the -> / ->> operators, json_insert / replace /
+# set / remove / array_insert (and their jsonb_ forms), json_patch,
+# json_type, json_valid, json_quote, json_array_length,
+# json_error_position, json_pretty, the json_group_array /
+# json_group_object aggregates (window functions too when `window`
+# is built) and the json_each / json_tree table-valued functions,
+# with JSON5 input, the JSON subtype rules and the 1000-level
+# nesting limit. Builds on the v0.16 function library (printf's
+# value conversions, table-valued sources in FROM), so it implies
+# `v16`. The tiny profile excludes it per §2.
+json = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): expression indexes, partial indexes and index-aware
+# planning -- CREATE [UNIQUE] INDEX ... ON t(expr [COLLATE c]
+# [DESC], ...) [WHERE expr] with the pin's restrictions
+# (deterministic functions only, no subqueries, parameters,
+# aggregates or qualified / rowid references in key expressions),
+# maintained on every write path (INSERT / UPDATE / DELETE /
+# REPLACE / upsert, UNIQUE enforced over the rows the WHERE admits,
+# upsert targets naming an expression or a partial index's WHERE),
+# PRAGMA index_info / index_xinfo (cid -2), integrity_check, REINDEX
+# and ALTER TABLE over them; and the planner that answers equality,
+# IN and range terms (and ORDER BY) through the rowid, PRIMARY KEY,
+# UNIQUE, ordinary, partial and expression indexes in SELECT,
+# subqueries, joins, UPDATE and DELETE, in the pin's row order.
+# Without it such indexes in a file are listed but refused for
+# writes (never left stale), and scans read the table in rowid
+# order. Builds on the v0.16 rule machinery (generated columns,
+# CHECK) and index collations, so it implies `v16` and `indexes`.
+# The tiny profile excludes it per §2.
+expr_index = ["v16", "indexes"]
+# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`): WITHOUT ROWID tables -- CREATE TABLE ... WITHOUT ROWID
+# with the pin's rules and errors (PRIMARY KEY required, no
+# AUTOINCREMENT, no rowid / oid / _rowid_, NOT NULL PRIMARY KEY
+# columns, INTEGER PRIMARY KEY no rowid alias, repeated key
+# columns dropped, key collations and DESC ordering the tree),
+# stored as the pin stores them: a clustered index B-tree keyed by
+# the PRIMARY KEY with the other columns after it, secondary
+# indexes holding the key columns instead of a rowid, byte for
+# byte (files interoperate both ways). Every read and write path
+# works on them -- INSERT / UPDATE (moving a row whose key
+# changes) / DELETE / REPLACE / upsert / RETURNING, lookups and
+# scans in the pin's order, joins, views, triggers, foreign keys,
+# ALTER TABLE, DROP TABLE, VACUUM, the PRAGMAs and integrity_check
+# -- through a translation layer at the B-tree boundary
+# (`src/wr.rs`). Without it a file holding such a table is refused
+# at open, as before. Builds on the v0.16 statement machinery and
+# index B-trees, so it implies `v16` and `indexes`. The tiny
+# profile excludes it per §2.
+without_rowid = ["v16", "indexes"]
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): UTF-16
+# databases -- files whose header text encoding is 2 (UTF-16le) or 3
+# (UTF-16be) open and write as on the pin, and PRAGMA encoding =
+# 'UTF-16' / 'UTF-16le' / 'UTF-16be' picks one for a new database
+# (ignored once it has content). Records are translated at the
+# B-tree boundary (text is UTF-8 inside the engine); the BINARY
+# collation compares the UTF-16 bytes as the pin's memcmp does
+# (tables, indexes, ORDER BY, min / max, compounds, windows), and
+# hex(), CAST(... AS BLOB), octet_length() and every blob read as
+# text see UTF-16 (`src/utf16.rs`). Without it such a file is
+# refused at open (`Error::UnsupportedEncoding`), never misread.
+# Builds on the v0.16 PRAGMA machinery, so it implies `v16`. The
+# tiny profile excludes it per §2.
+utf16 = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): write-ahead
+# logging -- files whose header says WAL (bytes 18 / 19 = 2) open
+# with the committed frames of their `-wal` file replayed (salts and
+# both checksum byte orders validated as the pin does, stopping at
+# the first invalid frame, frames after the last commit ignored);
+# PRAGMA journal_mode = WAL / DELETE switch in both directions;
+# commits append frames in the pin's layout (WAL header, salts,
+# cumulative checksums, commit markers) so the pin reads and
+# recovers hipp's log; PRAGMA wal_checkpoint (PASSIVE / FULL /
+# RESTART / TRUNCATE), the automatic checkpoint (PRAGMA
+# wal_autocheckpoint, 1000 pages by default), checkpoint and `-wal`
+# removal at `Connection::close`, PRAGMA synchronous levels and
+# journal_size_limit. Single-process, as the pin's
+# locking_mode=EXCLUSIVE: the wal-index lives in heap memory and no
+# `-shm` is written (a `-shm` another process holds is refused).
+# Without it a WAL file is refused at open (`Error::WalUnsupported`),
+# never read stale. Builds on the v0.16 PRAGMA and savepoint
+# machinery, so it implies `v16`. The tiny profile excludes it per §2.
+wal = ["v16"]
 
 [dependencies]
 

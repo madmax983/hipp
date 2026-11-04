@@ -139,6 +139,11 @@ struct Expander<'c> {
     /// FROM t))` repeats the first row's value while `(SELECT
     /// group_concat(b) FROM t)` follows the update).
     returning: bool,
+    /// Walking the body of a view or trigger stored in main (v0.16
+    /// review fix): its unqualified table names are main's, never
+    /// a TEMP table's (the pin's `sqlite3FixSrcList`), so a temp
+    /// table neither shadows them nor is read for a missing one.
+    fix_main: bool,
 }
 
 fn schema_err<E>(kind: SchemaKind) -> Error<E> {
@@ -164,6 +169,10 @@ impl<S: Storage> Connection<S> {
             fixing: false,
             sub_limit: false,
             returning: false,
+            #[cfg(feature = "triggers")]
+            fix_main: self.trig.fix_main.get(),
+            #[cfg(not(feature = "triggers"))]
+            fix_main: false,
         }
     }
 
@@ -212,7 +221,9 @@ impl<S: Storage> Connection<S> {
             using: AVec::new(),
             args: None,
             qualified: true,
+            in_temp: false,
             cte: None,
+            indexed: None,
         };
         x.view::<S::Error>(&mut f, v)?;
         let cols = f.cte.map(|c| c.columns).unwrap_or_default();
@@ -236,6 +247,8 @@ impl<S: Storage> Connection<S> {
     ) -> Result<SelectStmt, S::Error> {
         let mut x = self.expander(arena);
         x.read_body::<S::Error>(select.rdepth)?;
+        // A stored view's names are its database's (`fix_main`).
+        x.fix_main = true;
         x.views.push(copy_vec(name));
         x.select::<S::Error>(&mut select)?;
         x.fixing = true;
@@ -685,6 +698,9 @@ impl Expander<'_> {
             }
             return Ok(());
         }
+        if self.fix_main {
+            f.qualified = true;
+        }
         if self.catalog.find(self.ca, name.as_slice()).is_some() {
             return Ok(());
         }
@@ -800,7 +816,11 @@ impl Expander<'_> {
         // A view's body sees no CTE of the query that reads it.
         let vis = core::mem::take(&mut self.vis);
         self.views.push(copy_vec(name));
+        // Its names are main's (the expander reads main's views
+        // only; on the temp connection the mark routes nothing).
+        let fixed = core::mem::replace(&mut self.fix_main, true);
         let r = self.select::<E>(&mut select);
+        self.fix_main = fixed;
         self.views.pop();
         self.vis = vis;
         self.nest -= 1;
@@ -1132,6 +1152,17 @@ fn outer_of(s: &SelectStmt, tail: bool, compound: bool, arena: &Arena) -> Outer 
     }
 }
 
+/// Whether `n` names a JSON aggregate (v0.16, `json`).
+fn json_agg_name(n: &[u8]) -> bool {
+    #[cfg(feature = "json")]
+    return crate::json::JsonAgg::lookup(n).is_some();
+    #[cfg(not(feature = "json"))]
+    {
+        let _ = n;
+        false
+    }
+}
+
 /// Whether a core aggregates: GROUP BY, HAVING, or an aggregate
 /// call (outside subqueries) in its result list or ORDER BY.
 fn core_is_agg(s: &SelectStmt, arena: &Arena) -> bool {
@@ -1153,7 +1184,7 @@ fn core_is_agg(s: &SelectStmt, arena: &Arena) -> bool {
         crate::rules::expr_any(e, &mut |x| match x {
             Expr::Func { name, args, .. } => {
                 let n = handle_bytes(arena, *name);
-                AGGS.iter().any(|a| eq_ci(n, a))
+                (AGGS.iter().any(|a| eq_ci(n, a)) || json_agg_name(n))
                     && !((eq_ci(n, b"min") || eq_ci(n, b"max")) && args.len() > 1)
             }
             _ => false,
@@ -1602,6 +1633,16 @@ impl<S: Storage> Connection<S> {
             derived: None,
             gcols: None,
             rec: id,
+            #[cfg(feature = "json")]
+            tvf: 0,
+            #[cfg(feature = "json")]
+            tvf_dead: AVec::new(),
+            #[cfg(feature = "expr_index")]
+            access: None,
+            #[cfg(feature = "expr_index")]
+            hint: crate::query::Hint::Any,
+            #[cfg(feature = "v16")]
+            temp: false,
         });
         Ok(w)
     }
@@ -1611,6 +1652,8 @@ impl<S: Storage> Connection<S> {
 /// an ORDER BY — a binary heap on (ORDER BY key, arrival).
 struct RecQueue<'o> {
     order: &'o [(usize, crate::sql::SortOrder)],
+    /// The database's text encoding (its BINARY order).
+    enc: crate::record::TextEnc,
     rows: AVec<(u64, AVec<OwnedValue>)>,
     head: usize,
     seq: u64,
@@ -1620,7 +1663,8 @@ impl RecQueue<'_> {
     fn less(&self, a: usize, b: usize) -> bool {
         match (self.rows.as_slice().get(a), self.rows.as_slice().get(b)) {
             (Some((sa, ra)), Some((sb, rb))) => {
-                compound_order_cmp(ra, rb, self.order).then(sa.cmp(sb)) == core::cmp::Ordering::Less
+                compound_order_cmp(ra, rb, self.order, self.enc).then(sa.cmp(sb))
+                    == core::cmp::Ordering::Less
             }
             _ => false,
         }
@@ -1758,7 +1802,9 @@ impl<S: Storage> Statement<'_, S> {
         for i in 0..width {
             colls.push(compound_col_coll(cores.iter(), i));
         }
+        let enc = self.conn.pager.text_enc();
         let mut queue = RecQueue {
+            enc,
             order: plan.comp_order.as_slice(),
             rows: AVec::new(),
             head: 0,
@@ -1771,7 +1817,7 @@ impl<S: Storage> Statement<'_, S> {
                 return true;
             }
             let key = |r: &AVec<OwnedValue>| -> core::cmp::Ordering {
-                compound_key_cmp(r.as_slice(), row.as_slice(), colls.as_slice())
+                compound_key_cmp(r.as_slice(), row.as_slice(), colls.as_slice(), enc)
             };
             match seen.as_slice().binary_search_by(key) {
                 Ok(_) => false,

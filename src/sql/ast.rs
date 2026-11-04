@@ -80,6 +80,11 @@ pub struct ColumnDef {
     /// parentheses of `DEFAULT (expr)` removed.
     #[cfg(feature = "v16")]
     pub dflt_text: Option<ABytes>,
+    /// The NOT NULL constraint's own `ON CONFLICT` clause (v0.16,
+    /// `v07`): the last NOT NULL's, as on the pin; `None` when it
+    /// has none (ABORT unless the statement's `OR` clause decides).
+    #[cfg(feature = "v07")]
+    pub nn_conflict: Option<ConflictAction>,
 }
 
 /// One FOREIGN KEY / REFERENCES clause of a `CREATE TABLE`
@@ -114,6 +119,10 @@ pub struct ForeignKey {
 pub struct ConstraintSet {
     pub primary_key: bool,
     pub columns: AVec<IndexColumnDef>,
+    /// The constraint's own `ON CONFLICT` clause (v0.16, `v07`);
+    /// `None` when it has none.
+    #[cfg(feature = "v07")]
+    pub conflict: Option<ConflictAction>,
 }
 
 /// One indexed column in a `CREATE INDEX` column list (v0.3).
@@ -126,6 +135,12 @@ pub struct IndexColumnDef {
     /// `None` takes the table column's collation.
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub coll: Option<Coll>,
+    /// An expression key column (v0.16, `expr_index`): the item's
+    /// text, `COLLATE` included (`name` is then empty). A bare
+    /// column name, a lone string (the pin's `sqlite3StringToId`)
+    /// and either under a `COLLATE` are column items, `None` here.
+    #[cfg(feature = "expr_index")]
+    pub expr: Option<ABytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +192,11 @@ pub enum Expr {
     Column {
         table: Option<ABytes>,
         name: ABytes,
+        /// The schema of a three-part name `schema.table.column`
+        /// (v0.16, `v16`): the column of table `table` in that
+        /// database (`main`, `temp`). `None` for one or two parts.
+        #[cfg(feature = "v16")]
+        schema: Option<ABytes>,
     },
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// Unary minus.
@@ -617,11 +637,31 @@ pub struct FromSource {
     /// expression, as on the pin.
     #[cfg(feature = "v16")]
     pub qualified: bool,
+    /// The qualifier was `temp` (v0.16, `v16`): the TEMP database's
+    /// table, which a main statement reads there.
+    #[cfg(feature = "v16")]
+    pub in_temp: bool,
     /// What the planner's view / CTE expansion made of this
     /// source (v0.16, `v16`; `None` from the parser): see
     /// `CteUse`.
     #[cfg(feature = "v16")]
     pub cte: Option<Box<CteUse>>,
+    /// `INDEXED BY name` / `NOT INDEXED` after the source (v0.16,
+    /// `v16`).
+    #[cfg(feature = "v16")]
+    pub indexed: Option<IndexHint>,
+}
+
+/// A FROM source's (or an UPDATE / DELETE target's) index clause
+/// (v0.16, `v16`): `INDEXED BY name` makes the planner use that
+/// index of the table (the pin's "no such index" when the table has
+/// none of the name, "no query solution" when it is a partial index
+/// the WHERE does not imply); `NOT INDEXED` makes it use none.
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy)]
+pub enum IndexHint {
+    By(ABytes),
+    Not,
 }
 
 /// A FROM source that the view / common-table-expression
@@ -811,9 +851,30 @@ pub enum ConflictAction {
     /// anyway.
     #[cfg(feature = "v16")]
     Rollback,
+    /// No `OR` clause at all (v0.16, `v07`): each constraint's own
+    /// `ON CONFLICT` clause decides, ABORT when it has none (the
+    /// pin's `OE_Default`). Only the parser produces it; the
+    /// planner resolves it per constraint and hands the executors
+    /// `Abort` as the statement action.
+    #[cfg(feature = "v07")]
+    Unset,
 }
 
 impl ConflictAction {
+    /// The action a constraint whose own clause is `own` resolves
+    /// by under this statement action (v0.16, `v07`): an explicit
+    /// `OR` clause wins, then the constraint's clause, then ABORT.
+    #[cfg(feature = "v07")]
+    pub fn over(self, own: Option<ConflictAction>) -> ConflictAction {
+        match self {
+            ConflictAction::Unset => match own {
+                Some(ConflictAction::Unset) | None => ConflictAction::Abort,
+                Some(a) => a,
+            },
+            a => a,
+        }
+    }
+
     /// Whether a conflict fails the statement without resolving
     /// it in place: ABORT, or (v0.16) ROLLBACK, which differs only
     /// in ending the transaction afterwards.
@@ -822,6 +883,8 @@ impl ConflictAction {
             ConflictAction::Abort => true,
             #[cfg(feature = "v16")]
             ConflictAction::Rollback => true,
+            #[cfg(feature = "v07")]
+            ConflictAction::Unset => true,
             _ => false,
         }
     }
@@ -839,6 +902,11 @@ pub struct Upsert {
     /// only an index column of that collation (the pin's
     /// upsert-target rule); `None` matches any.
     pub target_colls: AVec<Option<crate::record::Coll>>,
+    /// Per target item (v0.16, `expr_index`), parallel to `target`:
+    /// an expression item (`ON CONFLICT (a + b)`), its `COLLATE`
+    /// in `target_colls`; `None` for a column (named in `target`).
+    #[cfg(feature = "expr_index")]
+    pub target_exprs: AVec<Option<Expr>>,
     /// The target's optional index predicate (`ON CONFLICT (a)
     /// WHERE ...`): parsed and name-resolved at plan time (an
     /// unknown column errors, as in the oracle), but never
@@ -877,6 +945,10 @@ pub enum Ast {
         /// The `STRICT` table option (v0.16, feature `v16`).
         #[cfg(feature = "v16")]
         strict: bool,
+        /// The `WITHOUT ROWID` table option (v0.16, feature
+        /// `without_rowid`).
+        #[cfg(feature = "without_rowid")]
+        without_rowid: bool,
         /// `CREATE TABLE ... AS SELECT ...` (v0.16, feature
         /// `v16`): the columns are derived from the SELECT and
         /// `columns` is empty.
@@ -894,6 +966,9 @@ pub enum Ast {
         unique: bool,
         if_not_exists: bool,
         columns: AVec<IndexColumnDef>,
+        /// A partial index's `WHERE` text (v0.16, `expr_index`).
+        #[cfg(feature = "expr_index")]
+        filter: Option<ABytes>,
     },
     /// `DROP INDEX` (v0.3).
     DropIndex {
@@ -950,6 +1025,9 @@ pub enum Ast {
         /// only — SQLite refuses FROM columns there ("no such
         /// column", oracle-verified).
         returning: AVec<SelectItem>,
+        /// The target's `INDEXED BY` / `NOT INDEXED` (v0.16, `v16`).
+        #[cfg(feature = "v16")]
+        indexed: Option<IndexHint>,
     },
     /// `DELETE FROM <t> [WHERE <expr>] [RETURNING ...]` (v0.5;
     /// RETURNING is v0.7).
@@ -957,6 +1035,9 @@ pub enum Ast {
         table: ABytes,
         filter: Option<Expr>,
         returning: AVec<SelectItem>,
+        /// The target's `INDEXED BY` / `NOT INDEXED` (v0.16, `v16`).
+        #[cfg(feature = "v16")]
+        indexed: Option<IndexHint>,
     },
     /// `DROP TABLE [IF EXISTS] <name>` (v0.5).
     DropTable {

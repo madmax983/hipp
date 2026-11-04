@@ -46,6 +46,9 @@ pub(super) enum Prag {
     IndexXinfo,
     IntegrityCheck,
     JournalMode,
+    /// `journal_size_limit` (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    JournalSizeLimit,
     PageCount,
     PageSize,
     QuickCheck,
@@ -56,6 +59,12 @@ pub(super) enum Prag {
     TableList,
     TableXinfo,
     UserVersion,
+    /// `wal_autocheckpoint` (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    WalAutocheckpoint,
+    /// `wal_checkpoint [(mode)]` (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    WalCheckpoint,
 }
 
 const PRAGMAS: &[(&str, Prag)] = &[
@@ -76,6 +85,8 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("index_xinfo", Prag::IndexXinfo),
     ("integrity_check", Prag::IntegrityCheck),
     ("journal_mode", Prag::JournalMode),
+    #[cfg(feature = "wal")]
+    ("journal_size_limit", Prag::JournalSizeLimit),
     ("page_count", Prag::PageCount),
     ("page_size", Prag::PageSize),
     ("quick_check", Prag::QuickCheck),
@@ -86,6 +97,10 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("table_list", Prag::TableList),
     ("table_xinfo", Prag::TableXinfo),
     ("user_version", Prag::UserVersion),
+    #[cfg(feature = "wal")]
+    ("wal_autocheckpoint", Prag::WalAutocheckpoint),
+    #[cfg(feature = "wal")]
+    ("wal_checkpoint", Prag::WalCheckpoint),
 ];
 
 /// The foreign-key pragmas (v0.16, `foreign_keys`; refused without
@@ -132,6 +147,16 @@ impl Prag {
         if self == Prag::DeferForeignKeys {
             return true;
         }
+        #[cfg(feature = "wal")]
+        if self == Prag::WalAutocheckpoint {
+            return true;
+        }
+        // The text encoding is the connection's (v0.16, `utf16`:
+        // `PRAGMA temp.encoding = 'UTF-16be'` sets it).
+        #[cfg(feature = "utf16")]
+        if self == Prag::Encoding {
+            return true;
+        }
         matches!(
             self,
             Prag::ForeignKeys
@@ -174,6 +199,8 @@ impl Prag {
             #[cfg(feature = "foreign_keys")]
             Prag::ForeignKeyCheck => &["table", "rowid", "parent", "fkid"],
             Prag::DatabaseList => &["seq", "name", "file"],
+            #[cfg(feature = "wal")]
+            Prag::WalCheckpoint => &["busy", "log", "checkpointed"],
             Prag::CollationList => &["seq", "name"],
             _ => &[],
         }
@@ -196,6 +223,25 @@ impl Prag {
             0 => 1,
             n => n,
         }
+    }
+
+    /// No table-valued form on the pin (v0.16).
+    fn no_table(self) -> bool {
+        #[cfg(feature = "wal")]
+        if matches!(self, Prag::WalCheckpoint | Prag::WalAutocheckpoint) {
+            return true;
+        }
+        false
+    }
+
+    /// `journal_size_limit`, whose table-valued form takes a schema
+    /// (v0.16, `wal`).
+    fn sized_journal(self) -> bool {
+        #[cfg(feature = "wal")]
+        if self == Prag::JournalSizeLimit {
+            return true;
+        }
+        false
     }
 
     /// Takes a table / index name argument.
@@ -408,6 +454,50 @@ fn boolean(z: &[u8]) -> bool {
     safety_level(z, true, 0) != 0
 }
 
+/// `p` without its value: the query form.
+fn p_query(p: &PragmaPlan) -> PragmaPlan {
+    PragmaPlan {
+        prag: p.prag,
+        arg: None,
+        numeric: p.numeric,
+        main_only: p.main_only,
+    }
+}
+
+/// The pin's `sqlite3DecOrHexToI64` as `journal_size_limit` reads
+/// it (v0.16, `wal`): `0x` and hex digits (wrapping into 64 bits),
+/// else an optionally signed decimal prefix after leading spaces,
+/// clamped to 64 bits; no digits read as 0.
+#[cfg(feature = "wal")]
+fn atoi64(z: &[u8]) -> i64 {
+    if let Some(h) = z
+        .strip_prefix(b"0x")
+        .or_else(|| z.strip_prefix(b"0X"))
+        .filter(|h| h.first().is_some_and(|c| c.is_ascii_hexdigit()))
+    {
+        let mut u: u64 = 0;
+        for c in h.iter().take_while(|c| c.is_ascii_hexdigit()) {
+            u = (u << 4) | u64::from((*c as char).to_digit(16).unwrap_or(0));
+        }
+        return u as i64;
+    }
+    let mut i = 0;
+    while z.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+        i += 1;
+    }
+    let neg = z.get(i) == Some(&b'-');
+    if matches!(z.get(i), Some(b'-' | b'+')) {
+        i += 1;
+    }
+    let mut v: i128 = 0;
+    while let Some(c) = z.get(i).filter(|c| c.is_ascii_digit()) {
+        v = (v * 10 + i128::from(*c - b'0')).min(i128::from(i64::MAX) + 1);
+        i += 1;
+    }
+    let v = if neg { -v } else { v };
+    v.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
 /// A STRICT column's standard type name for its declaration (the
 /// pin's dequoted token, `record::decl_token`).
 fn std_type(decl: &[u8]) -> &'static [u8] {
@@ -514,6 +604,13 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         }
         let arg = value.map(|h| copy_vec(handle_bytes(arena, h)));
+        // The pin refuses a safety-level change inside a transaction
+        // when the statement is prepared (v0.16 fix).
+        if prag == Some(Prag::Synchronous) && arg.is_some() && self.explicit_txn {
+            return Err(Error::Schema {
+                kind: SchemaKind::SafetyLevelInTransaction,
+            });
+        }
         // A table name — or a number outside 32 bits, which the pin
         // also reads as one (v0.16 fix) — must name a table.
         if let (Some(Prag::IntegrityCheck | Prag::QuickCheck), Some(a)) = (prag, &arg)
@@ -591,11 +688,38 @@ impl<S: Storage> Connection<S> {
             })),
             Prag::FreelistCount => row1(int(i64::from(h.freelist_count))),
             Prag::AutoVacuum => row1(int(i64::from(h.auto_vacuum))),
-            Prag::Encoding => row1(text(b"UTF-8")),
+            Prag::Encoding => row1(text(match self.pager.text_enc() {
+                crate::record::TextEnc::Utf8 => b"UTF-8",
+                #[cfg(feature = "utf16")]
+                crate::record::TextEnc::Utf16le => b"UTF-16le",
+                #[cfg(feature = "utf16")]
+                crate::record::TextEnc::Utf16be => b"UTF-16be",
+            })),
+            // An in-memory database's mode is `memory` (v0.16 fix:
+            // hipp's `:memory:` reported `delete`).
+            Prag::JournalMode if self.pager.storage().is_memory() => row1(text(b"memory")),
+            #[cfg(not(feature = "wal"))]
             Prag::JournalMode => row1(text(b"delete")),
+            #[cfg(feature = "wal")]
+            Prag::JournalMode => row1(text(if self.pager.wal_mode() {
+                b"wal"
+            } else {
+                b"delete"
+            })),
             // hipp syncs the journal before any page moves and
             // the file before the journal goes: FULL.
+            #[cfg(not(feature = "wal"))]
             Prag::Synchronous => row1(int(2)),
+            // The safety level `PRAGMA synchronous` set (v0.16, `wal`).
+            #[cfg(feature = "wal")]
+            Prag::Synchronous => row1(int(i64::from(self.pager.wal_cfg.sync) - 1)),
+            #[cfg(feature = "wal")]
+            Prag::JournalSizeLimit => row1(int(self.pager.wal_cfg.size_limit)),
+            #[cfg(feature = "wal")]
+            Prag::WalAutocheckpoint => row1(int(i64::from(self.pager.wal_cfg.autocheckpoint))),
+            // A checkpoint is run by the statement (`step_pragma`).
+            #[cfg(feature = "wal")]
+            Prag::WalCheckpoint => return Err(Error::Unsupported),
             Prag::CacheSize => row1(int(self.cfg.cache_pages as i64)),
             Prag::BusyTimeout => row1(int(i64::from(self.prag.busy_timeout))),
             Prag::ForeignKeys => row1(int(i64::from(self.prag.foreign_keys))),
@@ -649,24 +773,38 @@ impl<S: Storage> Connection<S> {
             Prag::TableList => {
                 let mut rows = AVec::new();
                 for o in self.hash_order().iter() {
-                    let (name, shown, ty, ncol, strict): (&[u8], &[u8], &[u8], usize, bool) =
-                        match o {
-                            Obj::Table(t) => {
-                                let n = handle_bytes(ca, t.name);
-                                (n, n, b"table", t.columns.len(), t.strict)
-                            }
-                            Obj::View(v) => {
-                                // The planned columns (v0.16 fix: the
-                                // catalog's list is empty for a view
-                                // hipp did not derive at load); none
-                                // for one that cannot be planned, as
-                                // on the pin.
-                                let n = handle_bytes(ca, v.name);
-                                let ncol = self.view_columns(n).map_or(0, |c| c.len());
-                                (n, n, b"view", ncol, false)
-                            }
-                            Obj::Schema => (b"sqlite_master", b"sqlite_schema", b"table", 5, false),
-                        };
+                    #[allow(clippy::type_complexity)]
+                    let (name, shown, ty, ncol, strict, wr): (
+                        &[u8],
+                        &[u8],
+                        &[u8],
+                        usize,
+                        bool,
+                        bool,
+                    ) = match o {
+                        Obj::Table(t) => {
+                            let n = handle_bytes(ca, t.name);
+                            (n, n, b"table", t.columns.len(), t.strict, !t.has_rowid())
+                        }
+                        Obj::View(v) => {
+                            // The planned columns (v0.16 fix: the
+                            // catalog's list is empty for a view
+                            // hipp did not derive at load); none
+                            // for one that cannot be planned, as
+                            // on the pin.
+                            let n = handle_bytes(ca, v.name);
+                            let ncol = self.view_columns(n).map_or(0, |c| c.len());
+                            (n, n, b"view", ncol, false, false)
+                        }
+                        Obj::Schema => (
+                            b"sqlite_master",
+                            b"sqlite_schema",
+                            b"table",
+                            5,
+                            false,
+                            false,
+                        ),
+                    };
                     if arg.is_some_and(|a| !eq_ci(a, name)) {
                         continue;
                     }
@@ -677,7 +815,7 @@ impl<S: Storage> Connection<S> {
                             text(shown),
                             text(ty),
                             int(ncol as i64),
-                            int(0),
+                            int(i64::from(wr)),
                             int(i64::from(strict)),
                         ],
                     );
@@ -792,7 +930,14 @@ impl<S: Storage> Connection<S> {
                 r.push(int(if x { i as i64 } else { cid }));
                 r.push(text(cname));
                 r.push(text(shown_type(handle_bytes(&sc, c.decl)).as_slice()));
-                r.push(int(i64::from(c.not_null)));
+                // The catalog's flag: a WITHOUT ROWID table's key
+                // columns are NOT NULL too (v0.16).
+                let nn = t
+                    .columns
+                    .as_slice()
+                    .get(i)
+                    .map_or(c.not_null, |tc| tc.not_null);
+                r.push(int(i64::from(nn)));
                 r.push(dflt);
                 r.push(int(pk));
                 if x {
@@ -898,6 +1043,12 @@ impl<S: Storage> Connection<S> {
                 let mut base = 0usize;
                 for sp in plan.sources.iter() {
                     if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
+                        // A table-valued function's columns have no
+                        // declared type (v0.16, `json`).
+                        #[cfg(feature = "json")]
+                        if sp.tvf != 0 {
+                            return None;
+                        }
                         if let Some(d) = &sp.derived {
                             let it = d.items.as_slice().get(k).or_else(|| {
                                 d.values
@@ -907,9 +1058,12 @@ impl<S: Storage> Connection<S> {
                             })?;
                             return self.ztype(d, it);
                         }
-                        let t = self.catalog.tables.iter().find(|t| t.root == sp.root)?;
-                        let decl =
-                            handle_bytes(&self.catalog_arena, t.columns.as_slice().get(k)?.decl);
+                        let (cat, ca) = match self.temp.as_deref() {
+                            Some(tc) if sp.temp => (&tc.catalog, &tc.catalog_arena),
+                            _ => (&self.catalog, &self.catalog_arena),
+                        };
+                        let t = cat.tables.iter().find(|t| t.root == sp.root)?;
+                        let decl = handle_bytes(ca, t.columns.as_slice().get(k)?.decl);
                         return if decl.is_empty() {
                             None
                         } else {
@@ -988,7 +1142,17 @@ impl<S: Storage> Connection<S> {
     fn index_info_rows(&self, name: &[u8], x: bool) -> Result<Rows, S::Error> {
         let ca = &self.catalog_arena;
         let mut rows = AVec::new();
-        let Some(ix) = self.catalog.find_index(ca, name) else {
+        let ix = self.catalog.find_index(ca, name);
+        // No index of that name: a WITHOUT ROWID table's name
+        // describes its PRIMARY KEY index (v0.16), as on the pin.
+        #[cfg(feature = "without_rowid")]
+        let ix = ix.or_else(|| {
+            let t = self.catalog.find(ca, name).filter(|t| !t.has_rowid())?;
+            self.catalog
+                .indexes_for(ca, handle_bytes(ca, t.name))
+                .find(|i| i.clustered)
+        });
+        let Some(ix) = ix else {
             return Ok(rows);
         };
         if ix.opaque {
@@ -1001,7 +1165,18 @@ impl<S: Storage> Connection<S> {
         let n = ix.columns.len();
         for (i, c) in ix.columns.iter().enumerate() {
             let col = c.col.or(t.rowid_alias);
+            // An expression column (v0.16, `expr_index`): cid -2,
+            // no name, as on the pin.
+            #[cfg(feature = "expr_index")]
+            let col = match &ix.ext {
+                Some(x) if x.exprs.as_slice().get(i).is_some_and(|e| e.is_some()) => {
+                    Some(usize::MAX)
+                }
+                _ => col,
+            };
             let (cid, cname) = match col {
+                #[cfg(feature = "expr_index")]
+                Some(usize::MAX) => (-2, OwnedValue::Null),
                 Some(k) => (
                     k as i64,
                     t.columns
@@ -1021,6 +1196,72 @@ impl<S: Storage> Connection<S> {
                 r.push(int(1));
             }
             rows.push(r);
+        }
+        // A WITHOUT ROWID table's index ends with columns, not the
+        // rowid (v0.16): the clustered key with every other stored
+        // column (BINARY), a secondary index with the key columns
+        // it does not hold.
+        #[cfg(feature = "without_rowid")]
+        if !t.has_rowid() {
+            if x {
+                let col_row = |rows: &mut Rows, seq: usize, k: usize, desc: bool, coll| {
+                    let cname = t
+                        .columns
+                        .as_slice()
+                        .get(k)
+                        .map_or(OwnedValue::Null, |c| text(handle_bytes(ca, c.name)));
+                    push_row(
+                        rows,
+                        &[
+                            int(seq as i64),
+                            int(k as i64),
+                            cname,
+                            int(i64::from(desc)),
+                            text(coll_name(coll)),
+                            int(0),
+                        ],
+                    );
+                };
+                let mut seq = n;
+                if ix.clustered {
+                    for (k, c) in t.columns.iter().enumerate() {
+                        let virt = c.gen_expr.is_some() && !c.stored;
+                        if virt || ix.columns.iter().any(|kc| kc.col == Some(k)) {
+                            continue;
+                        }
+                        col_row(&mut rows, seq, k, false, crate::record::Coll::Binary);
+                        seq += 1;
+                    }
+                } else if let Some(pk) = self
+                    .catalog
+                    .indexes_for(ca, handle_bytes(ca, t.name))
+                    .find(|i| i.clustered)
+                {
+                    for pc in pk.columns.iter() {
+                        let held = ix.columns.iter().enumerate().any(|(i, kc)| {
+                            #[cfg(feature = "expr_index")]
+                            if ix.ext.as_ref().is_some_and(|e| {
+                                e.exprs.as_slice().get(i).is_some_and(|x| x.is_some())
+                            }) {
+                                return false;
+                            }
+                            let _ = i;
+                            kc.col == pc.col && kc.coll == pc.coll
+                        });
+                        if held {
+                            continue;
+                        }
+                        // A UNIQUE constraint's index appends them
+                        // ascending (the pin's `bAscKeyBug`).
+                        let desc = pc.desc && ix.origin != crate::schema::IndexOrigin::Auto;
+                        if let Some(k) = pc.col {
+                            col_row(&mut rows, seq, k, desc, pc.coll);
+                            seq += 1;
+                        }
+                    }
+                }
+            }
+            return Ok(rows);
         }
         if x {
             push_row(
@@ -1146,7 +1387,9 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
             return Ok(None);
         };
         let prag = match PRAGMAS.iter().find(|(n, _)| eq_ci(n.as_bytes(), rest)) {
-            Some((_, p)) if *p != Prag::CaseSensitiveLike => *p,
+            // (The pin has no `pragma_wal_checkpoint` /
+            // `pragma_wal_autocheckpoint`, v0.16 `wal`.)
+            Some((_, p)) if *p != Prag::CaseSensitiveLike && !p.no_table() => *p,
             _ => return Ok(None),
         };
         if matches!(prag, Prag::IntegrityCheck | Prag::QuickCheck) {
@@ -1188,7 +1431,8 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
                         | Prag::PageCount
                         | Prag::PageSize
                         | Prag::Synchronous
-                ));
+                )
+                || prag.sized_journal());
         if vals.len() > usize::from(has_arg) + usize::from(has_schema) {
             return Err(Error::Schema {
                 kind: SchemaKind::WrongArgumentCount,
@@ -1223,7 +1467,34 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
                 });
             }
         }
-        let rows = if temp || (has_arg && prag != Prag::TableList && arg.is_none()) {
+        // v0.16: a name the TEMP database has (temp first, as on the
+        // pin), or the `temp` schema: that database's rows.
+        let in_temp = has_arg
+            && prag != Prag::TableList
+            && !self.is_temp
+            && match (&schema, &arg) {
+                (Some(_), Some(_)) => temp,
+                (None, Some(a)) => {
+                    self.temp_has(a.as_slice(), false) || self.temp_has(a.as_slice(), true)
+                }
+                _ => false,
+            };
+        let rows = if in_temp {
+            match self.temp.as_deref() {
+                Some(tc) => tc
+                    .pragma_rows(
+                        arena,
+                        &PragmaPlan {
+                            prag: Some(prag),
+                            arg,
+                            numeric: false,
+                            main_only: false,
+                        },
+                    )
+                    .map_err(super::temp::mem_err)?,
+                None => AVec::new(),
+            }
+        } else if temp || (has_arg && prag != Prag::TableList && arg.is_none()) {
             AVec::new()
         } else {
             self.pragma_rows(
@@ -1272,7 +1543,7 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
                     if i > 0 {
                         sql.push(b',');
                     }
-                    sql_literal(v, &mut sql);
+                    sql_literal(v, &mut sql, self.pager.text_enc());
                 }
                 sql.push(b')');
             }
@@ -1290,8 +1561,10 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
 }
 
 /// An SQL literal for a pragma value: integers in decimal, text
-/// as `CAST(x'..' AS TEXT)` (any bytes survive), NULL.
-fn sql_literal(v: &OwnedValue, out: &mut AVec<u8>) {
+/// as `CAST(x'..' AS TEXT)` (any bytes survive; in a UTF-16
+/// database, v0.16 `utf16`, the blob holds the text's UTF-16 bytes,
+/// which that CAST reads back), NULL.
+fn sql_literal(v: &OwnedValue, out: &mut AVec<u8>, enc: crate::record::TextEnc) {
     match v {
         OwnedValue::Integer(i) => {
             // i64::MIN has no positive literal.
@@ -1307,6 +1580,13 @@ fn sql_literal(v: &OwnedValue, out: &mut AVec<u8>) {
                 out.extend_from_slice(b"CAST(");
             }
             out.extend_from_slice(b"x'");
+            #[cfg(feature = "utf16")]
+            let t = &if blob {
+                t.clone()
+            } else {
+                crate::utf16::encode(t.as_slice(), enc)
+            };
+            let _ = enc;
             for b in t.iter() {
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 out.push(HEX[usize::from(b >> 4)]);
@@ -1347,6 +1627,10 @@ fn item_aff(plan: &crate::query::SubPlan, e: &RExpr) -> Option<Affinity> {
             let mut base = 0usize;
             for sp in plan.sources.iter() {
                 if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
+                    #[cfg(feature = "json")]
+                    if sp.tvf != 0 {
+                        return None;
+                    }
                     if let Some(d) = &sp.derived {
                         let it = d.items.as_slice().get(k).or_else(|| {
                             d.values
@@ -1430,6 +1714,12 @@ impl<S: Storage> Statement<'_, S> {
         if prag == Prag::ForeignKeyCheck {
             return self.fk_check(&p).await;
         }
+        #[cfg(feature = "wal")]
+        if prag == Prag::WalCheckpoint {
+            return self
+                .wal_checkpoint(p.arg.as_ref().map(|a| a.as_slice()))
+                .await;
+        }
         let Some(arg) = p.arg.as_ref().map(|a| copy_vec(a.as_slice())) else {
             return self.conn.pragma_rows(&self.arena, &p);
         };
@@ -1477,13 +1767,41 @@ impl<S: Storage> Statement<'_, S> {
                     ("UTF-16", false),
                     ("UTF16", false),
                 ];
+                // v0.16 (`utf16`): the pin's encoding stays open
+                // while the database has no schema and neither it nor
+                // the TEMP database has had a schema change since the
+                // open (`Pager::enc_open`).
+                #[cfg(feature = "utf16")]
+                let pristine = self.conn.pager.enc_open()
+                    && self.conn.catalog.tables.is_empty()
+                    && self.conn.catalog.views.is_empty()
+                    && !self
+                        .conn
+                        .temp
+                        .as_deref()
+                        .is_some_and(|t| t.pager.schema_changed());
                 if !pristine {
                     // Fixed once the database has content: ignored.
                     return Ok(AVec::new());
                 }
-                match NAMES.iter().find(|(n, _)| eq_ci(n.as_bytes(), arg)) {
-                    Some((_, true)) => Ok(AVec::new()),
-                    Some((_, false)) => Err(Error::UnsupportedEncoding),
+                match NAMES.iter().position(|(n, _)| eq_ci(n.as_bytes(), arg)) {
+                    #[cfg(feature = "utf16")]
+                    Some(i) => {
+                        use crate::record::TextEnc;
+                        // `UTF-16` alone is the native order; hipp
+                        // takes the pin's (x86-64): little-endian.
+                        let enc = match i {
+                            0 | 1 => TextEnc::Utf8,
+                            3 | 5 => TextEnc::Utf16be,
+                            _ => TextEnc::Utf16le,
+                        };
+                        self.conn.set_text_enc(enc);
+                        Ok(AVec::new())
+                    }
+                    #[cfg(not(feature = "utf16"))]
+                    Some(i) if NAMES.get(i).is_some_and(|n| n.1) => Ok(AVec::new()),
+                    #[cfg(not(feature = "utf16"))]
+                    Some(_) => Err(Error::UnsupportedEncoding),
                     None => Err(Error::Schema {
                         kind: SchemaKind::UnknownEncoding,
                     }),
@@ -1517,12 +1835,30 @@ impl<S: Storage> Statement<'_, S> {
             }
             Prag::JournalMode => {
                 const MODES: [&str; 6] = ["delete", "persist", "off", "truncate", "memory", "wal"];
-                match MODES.iter().position(|m| eq_ci(m.as_bytes(), arg)) {
-                    // An unknown mode queries the current one.
-                    None | Some(0) => Ok(row1(text(b"delete"))),
+                // The pin takes the first mode the value is a prefix
+                // of, ignoring case (`w` is WAL, `''` DELETE; v0.16
+                // fix: hipp compared whole names).
+                let mode = MODES.iter().position(|m| {
+                    m.len() >= arg.len()
+                        && eq_ci(m.as_bytes().get(..arg.len()).unwrap_or_default(), arg)
+                });
+                match mode {
+                    // An unknown mode queries the current one; an
+                    // in-memory database keeps `memory` whatever is
+                    // asked, as on the pin (v0.16 fix: hipp's
+                    // `:memory:` entered WAL mode).
+                    None => self.conn.pragma_rows(&self.arena, &p_query(&p)),
+                    Some(_) if self.conn.pager.storage().is_memory() => {
+                        self.conn.pragma_rows(&self.arena, &p_query(&p))
+                    }
+                    #[cfg(feature = "wal")]
+                    Some(m @ (0 | 5)) => self.set_journal_mode(m == 5, &p).await,
+                    #[cfg(not(feature = "wal"))]
+                    Some(0) => Ok(row1(text(b"delete"))),
                     Some(_) => Err(Error::Unsupported),
                 }
             }
+            #[cfg(not(feature = "wal"))]
             Prag::Synchronous => {
                 let level = (u32::from(safety_level(arg, false, 1)) + 1) & 7;
                 let level = if level == 0 { 1 } else { level };
@@ -1532,6 +1868,25 @@ impl<S: Storage> Statement<'_, S> {
                     // hipp always syncs as FULL does.
                     Err(Error::Unsupported)
                 }
+            }
+            // Any safety level (v0.16, `wal`): OFF skips every sync,
+            // NORMAL syncs a WAL-mode log only at checkpoints, FULL
+            // and EXTRA at every commit (`pager::WalCfg::sync`).
+            #[cfg(feature = "wal")]
+            Prag::Synchronous => {
+                let level = (safety_level(arg, false, 1).wrapping_add(1)) & 7;
+                self.conn.pager.wal_cfg.sync = if level == 0 { 1 } else { level };
+                Ok(AVec::new())
+            }
+            #[cfg(feature = "wal")]
+            Prag::WalAutocheckpoint => {
+                self.conn.pager.wal_cfg.autocheckpoint = atoi(arg).max(0) as u32;
+                self.conn.pragma_rows(&self.arena, &p)
+            }
+            #[cfg(feature = "wal")]
+            Prag::JournalSizeLimit => {
+                self.conn.pager.wal_cfg.size_limit = atoi64(arg).max(-1);
+                self.conn.pragma_rows(&self.arena, &p)
             }
             Prag::CacheSize => {
                 if i64::from(atoi(arg)) == self.conn.cfg.cache_pages as i64 {
@@ -1660,6 +2015,12 @@ impl<S: Storage> Statement<'_, S> {
                 }
                 let mut ixs = AVec::new();
                 for ix in self.conn.table_indexes(name).iter() {
+                    // A WITHOUT ROWID table's key is the table's own
+                    // tree (v0.16), checked as the table.
+                    #[cfg(feature = "without_rowid")]
+                    if ix.clustered {
+                        continue;
+                    }
                     // The full check computes each row's key in
                     // every index; hipp cannot for an expression or
                     // partial index, so it refuses before reporting
@@ -1792,7 +2153,7 @@ impl<S: Storage> Statement<'_, S> {
         let indexes = if quick {
             AVec::new()
         } else {
-            let mut v = self.conn.write_index_plans(tname)?;
+            let mut v = self.conn.write_index_plans(&scratch(), tname)?;
             // The pin's `pIndex` order: newest first.
             let mut r = AVec::new();
             while let Some(x) = v.pop() {
@@ -1808,6 +2169,20 @@ impl<S: Storage> Statement<'_, S> {
                 n.push(copy_vec(handle_bytes(ca, ix.name)));
             }
             n
+        };
+        // A WITHOUT ROWID table's key is its own tree (v0.16): no
+        // entry to look for.
+        #[cfg(feature = "without_rowid")]
+        let (indexes, inames) = {
+            let mut a = AVec::new();
+            let mut b = AVec::new();
+            for (ix, n) in indexes.iter().zip(inames.iter()) {
+                if ix.root != root {
+                    a.push(ix.clone());
+                    b.push(n.clone());
+                }
+            }
+            (a, b)
         };
         #[cfg(not(feature = "indexes"))]
         let _ = quick;
@@ -1846,6 +2221,14 @@ impl<S: Storage> Statement<'_, S> {
         let mut buf = AVec::new();
         // The pin's messages name a row by its scan ordinal.
         let mut nrow: i64 = 0;
+        // Rows each index should hold (a partial index's count is
+        // checked against these, after the rows).
+        #[cfg(feature = "indexes")]
+        let mut in_index: AVec<u64> = AVec::new();
+        #[cfg(feature = "indexes")]
+        for _ in indexes.iter() {
+            in_index.push(0);
+        }
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
             if out.stop {
                 return Ok(());
@@ -1927,15 +2310,23 @@ impl<S: Storage> Statement<'_, S> {
                 }
             }
             #[cfg(feature = "indexes")]
-            for (ix, iname) in indexes.iter().zip(inames.iter()) {
-                let mut key = AVec::new();
-                for c in ix.cols.iter() {
-                    key.push(match c.col {
-                        Some(i) if Some(i) != alias => {
-                            rec.as_slice().get(i).cloned().unwrap_or(OwnedValue::Null)
-                        }
-                        _ => OwnedValue::Integer(rowid),
-                    });
+            for (j, (ix, iname)) in indexes.iter().zip(inames.iter()).enumerate() {
+                // v0.16 (`expr_index`): an expression index's key is
+                // computed; a row a partial index's WHERE rejects
+                // has no entry to find.
+                let Some(key) = ix_key::<S::Error>(
+                    ix,
+                    rec.as_slice(),
+                    rowid,
+                    alias,
+                    #[cfg(feature = "expr_index")]
+                    &self.conn.env,
+                )?
+                else {
+                    continue;
+                };
+                if let Some(n) = in_index.as_mut_slice().get_mut(j) {
+                    *n += 1;
                 }
                 let unique = ix.unique && key_has_no_null(key.as_slice());
                 let (found, dup) = btree::index_check_entry(
@@ -1965,6 +2356,27 @@ impl<S: Storage> Statement<'_, S> {
             }
         }
         let _ = nrow;
+        // A partial index's entry count against the rows its WHERE
+        // admits (v0.16, `expr_index`: the pin's per-index counter,
+        // compared after the row loop).
+        #[cfg(feature = "expr_index")]
+        for ((ix, iname), want) in indexes.iter().zip(inames.iter()).zip(in_index.iter()) {
+            if ix.ext.as_ref().is_none_or(|x| x.pred.is_none()) {
+                continue;
+            }
+            let mut cur = btree::IndexCursor::new(ix.root, ix.desc.as_slice());
+            let mut have = 0u64;
+            while cur.next_entry(&mut self.conn.pager).await?.is_some() {
+                have += 1;
+            }
+            if have != *want {
+                let mut m = copy_vec(b"wrong # of entries in index ");
+                m.extend_from_slice(iname.as_slice());
+                if !out.emit(m) {
+                    return Ok(());
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -2834,4 +3246,70 @@ async fn bt_check<S: Storage>(
         }
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------
+// WAL mode (v0.16, `wal`).
+// ----------------------------------------------------------------
+
+#[cfg(feature = "wal")]
+impl<S: Storage> Statement<'_, S> {
+    /// `PRAGMA journal_mode = WAL | DELETE` (v0.16, `wal`), as the
+    /// pin's `OP_JournalMode` decides: no change once the open
+    /// transaction has written (the current mode is reported), "cannot
+    /// change into / out of wal mode from within a transaction" in an
+    /// explicit one that has not, else the switch (`Pager::enter_wal`
+    /// / `leave_wal`). Reports the mode in force after it.
+    async fn set_journal_mode(&mut self, wal: bool, p: &PragmaPlan) -> Result<Rows, S::Error> {
+        // The TEMP database never enters WAL mode (the pin's temporary
+        // storage): the request reports its mode.
+        if wal != self.conn.pager.wal_mode() && !self.conn.pager.in_txn() && !self.conn.is_temp {
+            if self.conn.explicit_txn {
+                return Err(Error::Schema {
+                    kind: SchemaKind::WalModeInTransaction,
+                });
+            }
+            if wal {
+                self.conn.pager.enter_wal().await?;
+            } else {
+                self.conn.pager.leave_wal().await?;
+            }
+        }
+        self.conn.pragma_rows(&self.arena, &p_query(p))
+    }
+
+    /// `PRAGMA wal_checkpoint [(PASSIVE | FULL | RESTART | TRUNCATE |
+    /// NOOP)]` (v0.16, `wal`; any other value is PASSIVE): the pin's
+    /// row `busy | log | checkpointed` — hipp is the file's only
+    /// process, so never busy; `0 | -1 | -1` outside WAL mode. A
+    /// transaction that has read or written the database refuses it
+    /// (the pin's "database table is locked"), in either mode.
+    async fn wal_checkpoint(&mut self, arg: Option<&[u8]>) -> Result<Rows, S::Error> {
+        use crate::pager::Checkpoint;
+        let is = |w: &[u8]| arg.is_some_and(|a| eq_ci(a, w));
+        if self.conn.pager.in_txn() || (self.conn.explicit_txn && self.conn.pager.touched()) {
+            return Err(Error::Schema {
+                kind: SchemaKind::CheckpointLocked,
+            });
+        }
+        let r = if is(b"noop") {
+            self.conn.pager.wal_frames()
+        } else {
+            let mode = if is(b"full") {
+                Checkpoint::Full
+            } else if is(b"restart") {
+                Checkpoint::Restart
+            } else if is(b"truncate") {
+                Checkpoint::Truncate
+            } else {
+                Checkpoint::Passive
+            };
+            self.conn.pager.checkpoint(mode).await?
+        };
+        self.conn.pager.open_fresh_wal();
+        let (log, done) = r.map_or((-1, -1), |(a, b)| (i64::from(a), i64::from(b)));
+        let mut rows = AVec::new();
+        push_row(&mut rows, &[int(0), int(log), int(done)]);
+        Ok(rows)
+    }
 }

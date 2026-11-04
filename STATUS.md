@@ -308,8 +308,8 @@ view / derived name dedupe and the UPDATE ... FROM check).
   (fixed by the column-constraints review pass, below);
   with min()/max() plus another aggregate the pin still takes
   bare columns from the extremum row, hipp's `pick_rep` only
-  for a lone min/max. A three-part `main.t.col` reference is
-  refused.
+  for a lone min/max. ~~A three-part `main.t.col` reference is
+  refused.~~ (closed by the honest-gap sweep, below)
 - ~~`-9223372036854775808` is an INTEGER literal on the pin and
   a REAL in hipp~~ — fixed by the column-constraints review pass
   (below).
@@ -605,10 +605,9 @@ the planner and the async step state machines (~8 KB)).
 
 - `PRAGMA ignore_check_constraints` is not offered: hipp has no
   PRAGMA statements yet (another unit's surface).
-- Constraint-level conflict clauses (`a UNIQUE ON CONFLICT
+- ~~Constraint-level conflict clauses (`a UNIQUE ON CONFLICT
   IGNORE`, `NOT NULL ON CONFLICT REPLACE`) are still parsed and
-  ignored: such a write errors where the pin would resolve it
-  (an error, never a silent wrong answer).
+  ignored~~ (closed by the honest-gap sweep, below).
 - hipp's function library has no non-deterministic function,
   so the pin's "non-deterministic functions prohibited in
   generated columns" cannot arise; a unit adding `random()` or
@@ -1760,9 +1759,9 @@ and the function-name table.
   hipp raises), an expression-folding gap outside this unit.
 - OR ABORT inside an explicit transaction still rolls back the
   whole transaction (the documented v0.5 simplification); OR
-  FAIL and OR ROLLBACK match the pin there. Column-level conflict
+  FAIL and OR ROLLBACK match the pin there. ~~Column-level conflict
   clauses (`NOT NULL ON CONFLICT FAIL`) are still parsed and
-  ignored (see "Column constraints and table definitions").
+  ignored~~ (closed by the honest-gap sweep, below).
 - `random()` / `randomblob()` are not the pin's ChaCha20 stream —
   types, lengths and ranges match, values do not (and the seed is
   `Config::nonce_seed`, shared with the journal nonces).
@@ -2582,7 +2581,9 @@ table-valued arity rules, and the generated-column LIKE plumbing.
   is unsupported), and `pragma_integrity_check` /
   `pragma_quick_check` are refused in FROM.
 - No temp database: `temp.` pragmas, and header values of temp
-  through the table-valued forms, are refused.
+  through the table-valued forms, are refused. (~~Table-valued
+  pragmas on TEMP objects~~ (closed by the honest-gap sweep, below): `pragma_table_info('t')` /
+  `('t', 'temp')`, `pragma_index_list`, `pragma_index_info` ...)
 - Foreign keys are refused under `foreign_keys = ON`, not
   enforced (ADR 0001's `foreign_keys` leaf is the place for
   that); `recursive_triggers` is stored with no triggers to
@@ -2610,8 +2611,8 @@ table-valued arity rules, and the generated-column LIKE plumbing.
   tiny profile (it keeps no constraint indexes; such a table
   already lacks the pin's autoindex there).
 - View column types: a scalar subquery item's declared type is
-  not carried (its affinity is). Three-part column names
-  (`main.sqlite_schema.name`) do not parse (hipp-wide).
+  not carried (its affinity is). ~~Three-part column names
+  (`main.sqlite_schema.name`) do not parse (hipp-wide).~~ (closed by the honest-gap sweep, below)
 - `CREATE TABLE x AS SELECT * FROM sqlite_schema`: the pin's
   SELECT also sees its own all-NULL placeholder schema row; hipp's
   does not.
@@ -3267,12 +3268,14 @@ test (`tests/savepoint_v16.rs`
   stale ("Failed to read ptrmap key" in the pin's integrity check
   after an INSERT that allocates pages — a pre-existing gap of the
   write path, recorded since v0.15 as "auto-vacuum / ptrmap write
-  support has no recorded demand"). Producing a fresh auto-vacuum
+  support has no recorded demand"; ~~left open~~ closed by the
+  honest-gap sweep's review fixes: every write to such a file is now
+  refused, `Error::AutoVacuumUnsupported`). Producing a fresh auto-vacuum
   image would hand back a file the next hipp write damages; the
   refusal leaves the file untouched, and `PRAGMA auto_vacuum = 0;
   VACUUM` converts it, as on the pin.
 
-Remaining gaps from the review: a constraint-level `ON CONFLICT
+Remaining gaps from the review: ~~a constraint-level `ON CONFLICT
 ROLLBACK` is matched by constraint kind, not by the constraint
 that failed — a table with `a NOT NULL ON CONFLICT ROLLBACK, b NOT
 NULL` ends the transaction on either column's NULL (the pin: only
@@ -3280,7 +3283,7 @@ NULL` ends the transaction on either column's NULL (the pin: only
 the table's UNIQUE-constraint ROLLBACK; an explicit `OR ABORT`
 parses as the default, so it does not override a constraint-level
 ROLLBACK as it does on the pin. Constraint-level IGNORE / REPLACE
-/ FAIL remain parsed and not acted on (as before). Gates: `cargo
+/ FAIL remain parsed and not acted on (as before).~~ (closed by the honest-gap sweep, below). Gates: `cargo
 fmt --all` and the full `ci/local-gates.sh` run end with "==> all
 gates passed". Size: tiny **76,224 B** (Δ **−4 B** vs 76,228,
 ratchet lowered; the schema row's checked rowid costs a few bytes,
@@ -3521,17 +3524,17 @@ COLUMN cut and the catalog guard.
 
 **Honest gaps:**
 
-- A statement that names a temp table (or a TEMP view reading
+- ~~A statement that names a temp table (or a TEMP view reading
   one) and a main object (`SELECT ... FROM main_t, temp_t`,
   `CREATE TEMP TABLE x AS SELECT * FROM main_t`, `INSERT INTO
   temp_t SELECT ... FROM main_t`, a TEMP view over both) is refused
-  (`Unsupported`): hipp's two databases never meet inside one
-  statement. TEMP views over main tables are read (review fix,
+  (`Unsupported`)~~ (closed by the honest-gap sweep, below); a temp UPDATE / DELETE that reads main is
+  still refused. TEMP views over main tables are read (review fix,
   below), but `PRAGMA table_info` of one fails (the temp database
   plans it without main), and an ALTER TABLE of a main table such
   a view reads is refused where the pin rewrites the view.
-  Three-part names (`temp.x.a`) do not parse;
-  `pragma_table_info('x', 'temp')` is refused; `VACUUM temp INTO`
+  ~~Three-part names (`temp.x.a`) do not parse;
+  `pragma_table_info('x', 'temp')` is refused~~ (closed by the honest-gap sweep, below); `VACUUM temp INTO`
   is refused (plain `VACUUM temp` does nothing, as on the pin for
   an in-memory temp database). The earlier "`ANALYZE temp` is
   refused" gap is closed.
@@ -4319,8 +4322,8 @@ path, INSTEAD OF planning and the ALTER trigger editor — which ADR
   is conservative (an unrecognised construct counts as an abort
   point, i.e. hipp undoes the statement) and assumes nothing of
   foreign keys (any `PRAGMA foreign_keys=ON` counts as one).
-- Declared `ON CONFLICT REPLACE` on a column constraint is not
-  honoured (the constraints unit's gap); the REPLACE victim order
+- ~~Declared `ON CONFLICT REPLACE` on a column constraint is not
+  honoured (the constraints unit's gap)~~ (closed by the honest-gap sweep, below); the REPLACE victim order
   matches the pin for OR REPLACE / REPLACE statements.
 - Trigger programs are parsed and planned per row: correct, but
   O(rows × program size) planning work. Each nested program costs
@@ -4767,6 +4770,1752 @@ rowid / upsert fixes.
 - The original subsection's other gaps stand (hash order of the
   whole-database `foreign_key_check`, full child scans, SET DEFAULT
   evaluated once per action statement).
+
+### JSON functions (2026-11-03)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin (`/home/user/hipp-design/oracle/sqlite3`), gated behind the new
+leaf feature `json` (in `max`, not `full`). Census (225 probes):
+MATCH 186, HIPP_ERR 10, DIFF 2, BOTH_ERR 27 — the four JSON probes
+(`f_json`, `f_json_ops`, `f_json_each`, `f_json_agg`) moved
+HIPP_ERR → MATCH; no JSON probe is left in the other columns.
+
+**Shipped — leaf feature `json`** (`json = ["v16"]`, in `max`;
+`v16,json` in `ci/feature-sets.txt`; new `src/json.rs`,
+`src/session/json_tvf.rs`; `ScalarFn::Json`, `AggKind::Json`,
+`Tok::Ptr`):
+
+- `json`, `jsonb`, `json_array` / `jsonb_array`, `json_object` /
+  `jsonb_object`, `json_extract` / `jsonb_extract` (one path: the
+  SQL value; several: a JSON array), the `->` / `->>` operators
+  (lexed as `TK_PTR` at the precedence of `||`, left-associative; an
+  INTEGER right side is `[N]` / `[#-N]`, an all-alphanumeric label
+  `.label`, `[...]` itself, anything else `."text"`), `json_insert`
+  / `json_replace` / `json_set` / `json_array_insert` and their
+  `jsonb_` forms (`$[#]` appends; NULL paths skipped; `$` replaces
+  the whole document), `json_remove` / `jsonb_remove`, `json_patch`
+  / `jsonb_patch` (RFC 7396 over JSONB, the pin's in-place
+  algorithm), `json_type`, `json_valid` (flags 1 / 2 / 4 / 8),
+  `json_quote`, `json_array_length`, `json_error_position`,
+  `json_pretty`, the aggregates `json_group_array` /
+  `json_group_object` (and `jsonb_`; DISTINCT, aggregate ORDER BY,
+  FILTER, and as window functions when `window` is built), and the
+  table-valued `json_each` / `json_tree` / `jsonb_each` /
+  `jsonb_tree` in FROM with all ten columns (`key value type atom
+  id parent fullkey path`, hidden `json` / `root`), the rowid, the
+  optional root path, joins, and correlated (lateral) arguments
+  (`FROM t, json_each(t.doc)`, LEFT JOIN, inside subqueries).
+- **The JSONB format, byte for byte:** text is translated as the pin
+  does (minimal headers; numbers and strings keep their source text
+  — `json('1e5')` is `1e5`, a hex literal is INT5 — TEXT / TEXTJ /
+  TEXT5 / TEXTRAW chosen by the escapes a string holds, Infinity as
+  `9e999`), edits splice the blob with the pin's size-adjustment
+  walk and its `jsonBlobOverwrite` trick (a value replaced by one up
+  to 8 bytes shorter gets a denormalized header instead of a move:
+  `jsonb_set('[12345]','$[0]',1)` is `6BE30000000131`), a blob
+  argument is JSONB when the pin's `jsonArgIsJsonb` says so (a short
+  blob that reads like JSON text must pass the strict check), and
+  JSONB built from text that hits the nesting limit is the pin's
+  partial blob.
+- **JSON5 input:** comments, unquoted keys (identifier bytes,
+  `\uXXXX`), single quotes, `+`, `.5` / `5.`, hex, trailing commas,
+  Infinity / NaN / QNaN / SNaN in any case, the JSON5 white space
+  set and escapes (`\x41`, `\'`, `\v`, `\0`, line continuations) —
+  rendered canonically (`A`, `\u000b`, `5.0`, `0.5`, `9e999`).
+  `json_error_position` reports the pin's character offsets, the
+  quirks included (trailing garbage is position 1; a container's
+  bad continuation reports where the probe started).
+- **Values:** REALs into JSON text render as the pin's REAL → TEXT
+  conversion (`0.30000000000000004`, `1.0e+300`), ±Inf as
+  `9.0e+999` (into JSONB by the edit functions: `9e999`); integers beyond i64 come
+  back REAL, `-9223372036854775808` INTEGER, a 16-digit hex with
+  the top bit set a positive REAL; strings decode with the pin's
+  escape table (lone surrogates kept, invalid escapes dropped, a
+  trailing line continuation a NUL).
+- **The JSON subtype** (`query::eval_json_arg`): a JSON function's
+  text result is JSON to the JSON function it feeds (`json_array(json('[1]'))`
+  is `[[1]]`), through `+x`, COLLATE, CAST AS TEXT, CASE,
+  coalesce / ifnull, iif, nullif, scalar and aggregate min / max,
+  likely / unlikely / likelihood, a JSON aggregate (window results
+  too), and a `json_each` `value` that is an array or object
+  (`json::Op::EachValue`); lost through tables, subqueries, views,
+  CTEs and every other function, as on the pin.
+- **Limits:** text nesting past 1000 is "malformed JSON"; a path
+  lookup more than 1000 calls deep is "JSON path too deep" (the
+  pin's count: one call per step plus the final one, a created
+  substructure continuing the count); rendering a container deeper
+  than 1000 (pretty: any node) or merging deeper than 1000 is
+  "JSON nested too deep". Every walk is iterative: no recursion on
+  input-derived depth.
+- **Errors** (remedy-named `SchemaKind` variants): `JsonMalformed`,
+  `JsonBadPath`, `JsonPathTooDeep`, `JsonNestedTooDeep`,
+  `JsonBlobValue`, `JsonObjectOddArgs`, `JsonObjectLabel`,
+  `JsonOddArgs`, `JsonValidFlags`, `JsonNotArrayElement`; wrong
+  argument counts and `json_each(a, b, c)` are prepare-time
+  `WrongArgumentCount`.
+- **Table-valued sources** (`session/json_tvf.rs`): a call plans as
+  a source whose placeholder derived plan holds the resolved
+  arguments as its one VALUES row, so every plan walker
+  (correlation, shifts, aggregates, subqueries) sees them; arguments
+  that read only enclosing queries run once per execution, ones
+  that read a source to the left run per row of the sources before
+  it, after the WHERE terms (and an inner join's ON terms) that read
+  only those sources — the pin tests those first, so `FROM t,
+  json_each(t.j) WHERE json_valid(t.j)` never parses a malformed j.
+  `key`, `value` and `atom` hold the element's JSONB and decode
+  when read (the pin computes columns lazily: `count(*)` over a
+  document too deep to render answers); a scalar subquery's first
+  row stops the cursor there. An element whose header does not
+  decode stops the cursor with "malformed JSON" (the pin's).
+- **Ungated fix (claimed v0.4 paths): conditions short-circuit as
+  the pin's jump code does** (`query::cond`, `cond_row_sub`): WHERE,
+  ON, UPDATE / DELETE / upsert WHERE, aggregate FILTER, searched
+  CASE WHEN and iif conditions stop an AND at a term that is not
+  true and an OR at one that is, so `DELETE FROM t WHERE
+  json_valid(a) AND json_array_length(a) = 3` (and `x = 0 AND
+  abs(-9223372036854775808) > x` in a WHERE) no longer fail on rows
+  the first term rejects. A skipped operand that is a deterministic
+  constant is still computed in WHERE / ON / FILTER (the pin factors
+  constant terms out of its loop, so `WHERE x = 1 AND
+  abs(-9223372036854775808) > 0` fails there), never in CASE WHEN /
+  iif. Value contexts (`SELECT a AND b`) still evaluate both
+  operands, as the pin does.
+
+**Oracle-probing notes** (all on the live pin; recorded before
+implementation, refined by the corpora): the JSONB headers are
+minimal on translation and after edits, but untouched parts of a
+blob argument keep their own (even 9-byte) headers; the overwrite
+trick applies to replacements 1..=8 bytes shorter (`d` must fit a
+larger header: 1/2/4/8 from a 1-byte header, 1/3/7 from 2, 2/6 from
+3, 4 from 5); `jsonb_array` / `jsonb_group_array` go through text
+(`TEXTJ` for an escaped string) while `jsonb_set` stores a SQL text
+as TEXTRAW; `json_array_insert` exists in 3.54 (errors "not an
+array element" when the path's last byte is not `]`, before
+anything else); `json_valid` reads FLAGS with `sqlite3_value_int64`
+before looking at X (`json_valid(NULL, 0)` errors); `jsonb_each`
+/ `jsonb_tree` exist and return JSONB for containers; the hidden
+columns' values (`json` is the input text up to its first NUL, or
+the blob); `json_tree` with a root path reports the root row's key
+from the path text (`'$.a[1]'` gives the key `a[1]`, the pin's
+`jsonEachPathLength`); `->` / `->>` bind tighter than `*` and unary
+minus binds tighter than `->`; the depth thresholds above (probed
+with crafted JSONB at 998..1002 levels); `x = 1 AND json('x')` in a
+SELECT list fails on the pin, but not as a CASE WHEN / iif / WHERE
+condition.
+
+**Bugs the corpora found during the unit** (all fixed, regression
+lines in `tests/json_v16.rs` `regressions`): `json_patch` read the
+target's stale header after converting a non-object (the pin bounds
+payloads by the pre-edit size); `json_array_insert` raised "not an
+array element" only after a missing intermediate index; hex digits
+in `\u` escapes of blobs use the pin's nibble rule (`\u\x8c041` is
+U+C041); FLOAT5 `-` alone is malformed; JSONB detection in
+`json_error_position`, `json_each` and edit values is the strict
+`jsonArgIsJsonb`; eagerly decoded `json_each` columns failed
+`count(*)`; a malformed element made the cursor loop; scalar
+lookup found the math functions first and hid the JSON ones (`json`
+vs `math` ordering); the `json_each` WHERE pre-test (above) and a
+LEFT JOIN's ON, which the pin does *not* test first.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed" (`v16,json` compiles warning-free alone).
+New suites: `tests/json_v16.rs` (16 tests: JSONB / JSON5 text,
+values, paths and operators, edits / patch / overwrite, subtype
+rules, aggregates and windows, table-valued functions, schema and
+write paths, nesting limits, large documents, remedy-named errors,
+regressions, and three generated corpora — random JSON / JSON5 /
+malformed text with random paths through every function, random
+JSONB blobs with denormalized headers and corrupt bytes, random
+documents in a table through aggregates, windows, lateral joins and
+per-row edits; 1,500 cases each by default, `HIPP_JSON_CORPUS`
+scales them, 10,000 agreed); `src/json.rs` unit tests;
+`hipp-cli/tests/cli_v16_json.rs` (2 tests, byte-identical one-shot
+and over stdin: pretty text, raw blobs, tables and aggregates, and a
+generated corpus of valid documents through json / jsonb / paths /
+edits / json_tree).
+
+**Size:** tiny **76,924 B** (Δ **0**). Full **486,316 B** (Δ **+184 B**
+vs 486,132, ratchet raised): the ungated condition short-circuit
+(`query::cond` with its constant factoring, `cond_row_sub`) — the
+leaf itself is not in `full`. Max **638,756 B** (Δ **+32,552 B** vs
+606,204, raised; just under the 32 KiB threshold): the JSON engine
+(text / JSON5 parser, renderer, pretty printer, paths, edits, merge
+patch, validity check, the `json_each` cursor) and its wiring.
+
+**Honest gaps:**
+
+- The subtype does not survive a FROM subquery, view or CTE over
+  `json_each`'s `value` (`SELECT json_array(v) FROM (SELECT value v
+  FROM json_each('[[1]]'))` is `["[1]"]`; the pin flattens the
+  subquery and keeps it), nor an aggregate min / max whose argument
+  is only sometimes JSON (`min(json_extract(...))`).
+- A `json_each` value column compares with no collation (it reads
+  through the subtype wrapper), where the pin's column has BINARY:
+  only a comparison against a NOCASE / RTRIM column differs.
+- `json_each` / `json_tree` without arguments (`FROM json_each WHERE
+  json = ...`, the hidden-column constraint form) is refused
+  (`Unsupported`), as are arguments reading a source to the right
+  (the pin reorders the join) and a lateral call on the right of a
+  RIGHT / FULL join; `json_each()` with empty parentheses has no
+  rows, as on the pin.
+- Rows stream on the pin: a statement that fails part-way prints the
+  rows before the failure there, none in hipp (both fail). Columns
+  other than key / value / atom are computed for every row, and an
+  object whose last label has no value reads NULL where the pin reads
+  past the blob's end.
+- No parse cache: each call re-translates its text argument (the
+  pin keeps recent parses per statement), so a large document read
+  many times per row costs that many parses; edits copy the blob.
+- (HAVING / CHECK short-circuit and the WHERE constant-term model:
+  fixed by the review below.)
+
+### JSON functions — review fixes (2026-11-03)
+
+Six review findings, each reproduced first (release build, live pin).
+
+**Fixed (regression tests in `tests/json_v16.rs`:
+`large_documents_scale`, `review_regressions`, `tvf_in_triggers`):**
+
+- **`json_each` / `json_tree` memory.** Rows no longer carry the
+  document: the call's document goes into a per-statement registry
+  (`Env::json_docs`, `json::TvfDocs`; `Statement::step` drops what
+  its step added when it returns, a nested trigger step only its
+  own), and the key / value / atom / hidden `json` columns hold
+  16-byte handles decoded when read (`json::each_column`, a new
+  `Op::EachJson` wrapper for `json`). A lateral call also clears the
+  left-hand values that only its arguments read before joining its
+  rows (`SubSource::tvf_dead`, planned per core from every other
+  reader: items, WHERE, GROUP BY, HAVING, ORDER BY, ON clauses,
+  other sources' plans, index probes), so `FROM d, json_each(d.j)`
+  no longer copies `d.j` into each row. Measured (release): 20,001
+  integers through `FROM d, json_each(d.j)` 0.10 s / 37 MB (was
+  35-53 s / 8.3 GB); a 4.9 MB object of 200,000 members 0.8 s /
+  330 MB through `json_each` and 2.8 s / 1 GB through `json_tree`
+  (600,001 rows), both SIGKILLed before.
+- **Quadratic text parse.** `splice` rebuilt the whole blob each
+  time a container's header shrank on close; it now edits in place
+  (`AVec::replace_range`, the pin's memmove — only the container's
+  own payload moves). `json_valid` over 1.2 MB of 100,000 objects
+  1.7 s → 0.03 s; `j ->> '$.k5[1]'` over 4.9 MB 30.7 s → 0.06 s.
+- **NEW / OLD in a table-valued function's arguments** inside a
+  trigger body (`json_each(new.a)`, also in a scalar subquery, an
+  `IN (SELECT key FROM json_each(new.a))`, UPDATE ... FROM
+  `json_each(new.a)`): the binder (`sql::trig`) now binds
+  `FromSource::args`, with only the sources before the call in scope
+  (`json_each(new.a) AS new` still reads the trigger row), and ALTER
+  TABLE RENAME COLUMN rewrites them.
+- **AND / OR / NOT jump code, ungated** (claimed paths): `query::cond`
+  now answers "is it true" / "is it false" with early stops through
+  NOT as well (`NOT (json_valid(b) AND b ->> 0 = 1)`), and is used
+  by aggregate FILTER over a table (`agg_row`, which the earlier fix
+  missed), HAVING (`cond_group_sub`) and CHECK (`cond_false`, a CHECK
+  fails only when false). With subqueries (`cond_row_sub`, now an
+  async walk) a subquery runs only when its operand is reached, and
+  an AND / OR whose left operand holds a subquery and right one does
+  not tests the right one first (the pin's `exprEvalRhsFirst`). A
+  WHERE clause (`where_row_sub`) tests its terms in order, those
+  holding a correlated subquery last (`TERM_VARSELECT`) — except a
+  top-level `x IN (SELECT ...)`, which the pin tests in place
+  (probed).
+- **WHERE constant terms, ungated.** The per-row "evaluate a
+  skipped constant" model is gone (it failed `a = 1 OR json('[') IS
+  NULL` and a LEFT JOIN ON constant, which the pin never reaches).
+  Instead the top-level constant AND terms of WHERE and inner-join
+  ON clauses are computed once, in order, before any row is read,
+  stopping at the first that is not true, which then rejects every
+  row — so they fail over an empty table too, as on the pin
+  (`query::constant_terms_hold` for UPDATE / DELETE,
+  `join_constants_hold` for SELECT cores, sync and async joins).
+  For a SELECT this follows the pin's constant propagation: a term
+  `column = literal` (BINARY, the last for a column, scanning right
+  to left) stands the literal, with the column's affinity, in for
+  the column in the other terms (a BLOB-affinity column only as a
+  comparison operand), so `x = 1 AND (x = 2 OR json('[') IS NULL)`
+  fails up front and `a = 1 AND json('[') IS NULL AND a = 2` does
+  not (`2 = 1` stops first).
+- **Compound scalar subquery subtype.** `json_array((SELECT
+  json('[1]') UNION ALL SELECT 2))` is `[[1]]` as on the pin: a
+  compound (not INTERSECT) whose arms' result columns are each
+  always-JSON text or never text keeps the subtype on a text value
+  (`query::sub_literal`).
+- **Found while fixing:** with HAVING now stopping AND / OR early,
+  `HAVING count(*) > 5 AND sum(v) > 0` skipped `sum(v)`'s overflow;
+  the pin finalizes every aggregate of a group, the HAVING's
+  included, before testing it — now so in all three HAVING paths
+  (`tests/aggregates_v16.rs` caught it).
+
+**Not changed:** item 6 of the AND/OR finding (an index- or
+rowid-satisfiable term tested first) already matched the pin after
+the `expr_index` unit (`WHERE b -> 0 = 1 AND a = 2` with an index on
+`a` or `a INTEGER PRIMARY KEY`), and is now pinned by tests.
+
+**Oracle-probing notes:** constant terms evaluate in written order
+and stop at the first false one (`1 = 2 AND json('[')` succeeds on
+an empty table, the reverse fails); FILTER, CASE WHEN, iif and a
+LEFT JOIN's ON factor nothing; an uncorrelated EXISTS term is
+computed up front, an uncorrelated scalar subquery term is not;
+`x NOT IN (correlated)` and `(x IN (correlated)) IS NOT NULL` wait,
+`x IN (correlated)` does not; a compound keeps the producing arm's
+subtype (UNION / UNION ALL / EXCEPT), INTERSECT drops it; pragma
+table-valued functions inside a trigger body or a view fail on the
+pin when used ("unsafe use of virtual table") — hipp runs them
+(pre-existing, the PRAGMA unit's surface).
+
+**Gates:** `cargo fmt --all`; full `ci/local-gates.sh` ends with
+"==> all gates passed". `tests/json_v16.rs` grows to 19 tests.
+
+**Size:** tiny **76,924 B** (Δ **0**; the `json_each` document
+release sits inside `step`'s body, so no extra future layer reaches
+the tiny build). Full **489,396 B** (Δ **+3,096 B** vs 486,300,
+ratchet raised, headroom 34,892 B): all ungated — the async
+condition walk (`cond_is_sub`, `where_row_sub`), the WHERE
+constant-term pass with constant propagation, the HAVING / CHECK
+jump code and HAVING's aggregate finalization, the trigger binder's
+TVF arguments. Max **677,252 B** (Δ **+6,208 B** vs 671,044, raised):
+the above plus the `json_each` document registry and handles, the
+lateral dead-slot planning and the compound-subtype rule.
+
+**Honest gaps (remaining):**
+
+- A join still copies each left row into every combination: when a
+  large left value is read by something besides a lateral call's
+  arguments (`FROM d, json_each(d.j) WHERE length(d.j) > 5`), or for
+  any plain table join (`FROM d, t2` with 20,000 rows of t2 against a
+  100 KB `d.j` aborts on allocation, pre-existing and not JSON's),
+  memory is O(rows × size). Reading the hidden `json` column copies
+  the document per row read (`count(json)` over 20,000 rows of a
+  100 KB document takes 2 GB).
+- Rows are still built for the whole call up front (O(rows) small
+  rows: ~1.6 KB each with the join's copy), where the pin streams.
+- Constant propagation is not transitive (`t.a = u.a AND u.a = 2 AND
+  (t.a = 3 OR json('[') IS NULL)` fails on the pin, not in hipp),
+  binds only literal values, and is skipped when a RIGHT / FULL join
+  is present; an uncorrelated EXISTS term is not computed up front;
+  a correlated subquery's outer-column terms are not constants.
+- A compound scalar subquery with an arm that may return plain text
+  (`SELECT json('[1]') UNION ALL SELECT 'x'`) drops the subtype even
+  when the JSON arm produced the value (hipp does not track which
+  arm a row came from).
+
+### Expression indexes, partial indexes and index-aware planning (2026-11-03)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `expr_index` (`expr_index =
+["v16", "indexes"]`, in `max`, not `full`; `v16,expr_index` in
+`ci/feature-sets.txt`). The unit measured +32.3 KB of `max`, which
+would leave `full` (486 KB) less than 6 KB under the ~500 KiB line
+ADR 0002 draws, so it is a leaf, as the unit's brief directs. Census
+(246 probes, 21 new): MATCH 203, HIPP_ERR 8, DIFF 2, BOTH_ERR 33 —
+`partial_index` and `expr_index` moved HIPP_ERR → MATCH, every new
+`xi_*` probe matches (15) or fails on both (6).
+
+**Shipped — leaf feature `expr_index`** (new `src/xplan.rs`,
+`src/session/xindex.rs`; `schema::IndexExt`, `query::SubSource::access`):
+
+- **Definitions.** `CREATE [UNIQUE] INDEX ... ON t(<expr> [COLLATE c]
+  [ASC|DESC], ...) [WHERE <expr>]`: every key item is an expression;
+  a bare column, a lone string (the pin's `sqlite3StringToId`) and
+  either under a top-level COLLATE stay column items (`(a)`, `'a'`,
+  `(a COLLATE NOCASE)`); an expression column's collation is its
+  explicit COLLATE, else BINARY. The pin's errors as remedy-named
+  kinds: `SubqueryInIndex`, `NonDeterministic` (random, randomblob,
+  changes, total_changes, last_insert_rowid, sqlite_version),
+  `QualifiedIndexColumn` (`t.a` in a key expression), `MisusedAggregate`,
+  `MisusedWindow`, `UnknownColumn` (`rowid` in a key expression, an
+  unknown name), `RowValueMisused`, `ParameterNotAllowed`; the WHERE
+  allows `t.b` and `rowid`. Stored texts are the pin's; ALTER TABLE
+  RENAME / RENAME COLUMN rewrite them, DROP COLUMN refuses a column an
+  index expression or WHERE reads, all as the pin (the alter.rs token
+  walk already covered both).
+- **Maintenance.** One key function (`ix_key` / `xindex::ext_key`)
+  serves every write path: INSERT (plain, OR REPLACE, OR IGNORE,
+  REPLACE, upsert DO UPDATE / NOTHING), UPDATE (incl. OR REPLACE),
+  DELETE, the REPLACE victim delete, CREATE INDEX population, REINDEX
+  and integrity_check. A row a partial index's WHERE does not make true
+  (NULL excludes) has no entry, so UNIQUE is enforced only among the
+  admitted rows. VIRTUAL generated columns are computed before the
+  expressions read them; REAL columns read as REALs (`rules::eval_row`).
+- **Upsert targets** (the pin's `sqlite3UpsertAnalyzeTarget`): target
+  items are expressions; the newest UNIQUE index whose key columns are
+  exactly the items (any order, an item's COLLATE matching) is the
+  target, a partial one only when the target's WHERE is the same
+  expression as the index's (`b > 0` matches `(b > 0)`, not `0 < b` or
+  `b > 1` — probed); such a target arbitrates only that index's
+  conflicts (`UpsertPlan::target_root`).
+- **Introspection.** `PRAGMA index_xinfo` / `index_info` give an
+  expression column cid -2 and no name (an INTEGER PRIMARY KEY column
+  keeps its cid, as on the pin); `index_list`'s `partial`;
+  integrity_check computes each row's entry and, for a partial index,
+  compares its entry count with the admitted rows (the pin's counter);
+  VACUUM copies the indexes byte for byte; ANALYZE writes their stats.
+- **Files the pin made** with such indexes are read and written; the
+  pin's integrity_check passes on every file hipp wrote in the suites.
+  An index hipp cannot compute (a function it lacks, e.g. the pin's
+  `date()`) makes writes to its table fail (`UnknownFunction`) rather
+  than leave the index stale; reads work.
+- **Index-aware planning** (`xplan`): each FROM source of every query
+  core (top level, subqueries, views, CTE bodies, trigger programs),
+  and each UPDATE / DELETE target, gets the access path the pin's
+  planner would pick for it from the schema and the query: the rowid
+  B-tree (`=`, IN, ranges, via a seekable `ScanCursor::from_rowid`) or
+  an index (an equality / IN prefix, then a range — also on the
+  trailing rowid —, or a full scan), a partial index only when the
+  WHERE implies its WHERE (`sqlite3ExprImpliesExpr` with the pin's
+  `exprImpliesNotNull` walk), an expression index when the query names
+  the same expression (`query::same_expr`). Terms: `=`, `IS`, `<`,
+  `<=`, `>`, `>=`, `BETWEEN`, `IN (list)`, `IS NULL`, the pin's
+  OR-to-IN rewrite and its virtual `x > NULL` for `x IS NOT NULL`; a
+  term is usable only under the index column's collation (any for IS
+  NULL) and when the pin's `indexAffinityOk` allows it, and its probe
+  is converted by the comparison's affinity (`query::index_probe_aff`).
+  The chooser reproduces the pin's no-statistics cost model in its
+  `LogEst` arithmetic (`whereLoopAddBtree[Index]`, `whereRangeScanEst`,
+  `whereLoopOutputAdjust`, `whereSortingCost`, the two-pass
+  `wherePathSolver` with its (cost, rows, unsorted-cost) tie order,
+  `sqlite3DefaultRowEst`, `szEst` widths, covering / ORDER BY / partial
+  full index scans) and the pin's "ordered inner loop" scan direction.
+  The executor reads only the rows the path finds, in its order, and
+  still evaluates every WHERE / ON term on them, so a plan can change
+  the order and the work, never the rows. A join source whose probes
+  read an earlier source is looked up per combination (`join_step`);
+  RIGHT / FULL joins keep whole tables. Rows that arrive in GROUP BY
+  order are grouped as they arrive (a DESC index emits groups largest
+  first, as the pin skips its group sorter). An UPDATE visits rows in
+  rowid order (the pin's two-pass write) unless it is the pin's
+  one-pass loop — no RETURNING, UPDATE trigger, foreign keys, FROM,
+  REPLACE, rowid change or WHERE subquery, and the loop's index not
+  changed by the SET — which keeps the index order (an `UPDATE OR FAIL`
+  stops where the pin stops); DELETE visits rowid order. A probe value
+  may be an uncorrelated or correlated subquery (evaluated on the row
+  padded to the core's width); non-deterministic values are not
+  probed. `SELECT col FROM t` on a table with an index goes through the
+  general planner (the pin may read a covering index).
+
+**Oracle-probing notes** (all on the live pin, before and during
+implementation): the error matrix above (`'x'` as a key item is a
+column name, `1` and `(a, a) = (1, 1)` in a WHERE are accepted, `x.a`
+is "no such column", `main.t.b` in a WHERE is accepted — hipp's parser
+refuses three-part names anywhere, a pre-existing gap); index_xinfo
+rows (`(d)` over an INTEGER PRIMARY KEY is cid 3); `UNIQUE constraint
+failed: index 'u'` for an expression index; upsert target matching is
+an exact expression compare; RENAME COLUMN to `[new col]` writes
+`"new col"`. Planner: no-ORDER-BY output follows the chosen index
+(ranges in key order, IN lists in the key column's direction — a DESC
+column walks them largest first —, `SELECT b FROM t` through a narrower
+covering index, `ORDER BY b DESC` over an ascending index gives ties in
+reverse rowid order, GROUP BY over `b DESC` emits groups descending);
+ties between equal-cost indexes go to the newest (the pin's prepended
+`pIndex` list), except that among loops delivering the ORDER BY the one
+with fewer key columns wins (`(d)` over `(d, a)`); an IN on an earlier
+column charges its iterations at its own level only (`b IN (16 values)
+AND c = ?` still prefers `(b, c)` to `(c)`); `x IS NULL` uses an index of
+any collation; `a + 1 = 1` implies `a IS NOT NULL` for a partial index;
+an ORDER BY a loop does not deliver still reverses it when the loop's
+IN columns held constant would (`d IN (...) ORDER BY b DESC` over
+`(d, b)`); UPDATE / DELETE with RETURNING or triggers visit rowid order,
+a one-pass UPDATE the index order (`UPDATE OR FAIL ... WHERE b > 2`).
+The pin's oracle build has no STAT4 (`PRAGMA compile_options`).
+
+**Bugs found during the unit** (all fixed, regression lines in
+`tests/expr_index_v16.rs` `regressions`): IN lists walked ascending on a
+DESC key column; `IS NULL` refused for an index of another collation;
+equal-cost ties broken by rows instead of the unsorted cost (a covering
+scan lost to the table scan); `exprImpliesNotNull` without the
+arithmetic walk (a partial index ignored); IN columns treated as ending
+the delivered ORDER BY; groups re-sorted after an index delivered a
+DESC GROUP BY order; a scalar-subquery probe evaluated on the unpadded
+outer row (wrong slots — caught by `tests/subqueries.rs`); the legacy
+`SELECT col FROM t` path skipping covering index scans.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed" (`v16,expr_index` compiles warning-free
+alone, as does `indexes`). New suites: `tests/expr_index_v16.rs` (13
+tests: partial and expression index maintenance, definition errors,
+introspection, ALTER / REINDEX / VACUUM, pin-made files written by hipp
+and checked by the pin, planner order, write order, joins and
+subqueries, regressions, two generated corpora — random schemas /
+indexes / data / queries compared row-for-row in order, random writes
+with RETURNING / OR FAIL / REPLACE / GROUP BY / correlated subqueries /
+joins plus the pin's integrity_check on every file — 150 and 75 cases by
+default, `HIPP_EXPRIDX_CORPUS` scales them, 800 / 400 agreed — and a
+100,000-row table where 300 index lookups run faster than 3 full scans
+and agree with the pin), `src/xplan.rs` unit tests (LogEst, szEst),
+`hipp-cli/tests/cli_v16_expr_index.rs` (3 tests, byte-identical
+one-shot and over stdin: schema texts and pragmas, planner order, a
+generated corpus). Existing suites updated where they asserted the old
+refusals (`tests/indexes.rs` — plus a new test that an uncomputable
+index blocks writes —, `tests/maintenance_v16.rs`, `tests/pragma_v16.rs`).
+
+**Size:** tiny **76,924 B** (Δ **0**). Full **486,300 B** (Δ **−16 B**,
+ratchet lowered: the write paths' shared key helper). Max **671,044 B**
+(Δ **+32,288 B** vs 638,756, raised; just under the 32 KiB threshold):
+the index definitions and maintenance (~7 KB) and the planner, its cost
+model and the access-path executor (~25 KB).
+
+**Honest gaps:**
+
+- The planner is a model of the pin's, not the pin's: joins run in FROM
+  order (the pin may reorder them; the suites compare join rows without
+  their order), no automatic indexes, no MULTI-INDEX OR, no LIKE prefix
+  ranges, no skip-scans, and `sqlite_stat1` / `sqlite_stat4` are never
+  read (after ANALYZE the pin may choose another index; hipp keeps the
+  default estimates). Some tie and cost details remain unexplained: a
+  partial index whose WHERE is `x IS NOT NULL` competing with an index
+  led by `x` (the pin's choice there depends on creation order in a way
+  the model does not reproduce; 1 in ~1,000 generated cases still
+  differs in row order).
+- Row order of an UPDATE treats foreign keys conservatively (any FK
+  enforcement makes it rowid order; the pin only when the FK columns
+  change) ~~and detects constraint-level `ON CONFLICT REPLACE` by the
+  table text~~ (the honest-gap sweep: the pin's `bReplace`, an index
+  declared REPLACE whose key the SET changes).
+- ~~`INDEXED BY` / `NOT INDEXED` are not parsed.~~ (closed by the honest-gap sweep, below) (A covering index scan
+  read each table row by rowid; fixed by the review below for rowid
+  tables.)
+- An expression index's key value takes no affinity (the pin applies the
+  expression's affinity, which only matters for a CAST to REAL of an
+  integral value: equal keys either way).
+- ~~Three-part names (`main.t.b`) are refused everywhere, so such a
+  partial index WHERE written by the pin is a definition hipp cannot
+  compute: writes to its table are refused.~~ (closed by the honest-gap sweep, below)
+
+### Expression indexes and index-aware planning — review fixes (2026-11-04)
+
+Five review findings, each reproduced first against the live pin and
+the pre-fix build (debug builds, `select count(*) ...` over a
+10,000-row table with an index on `a`).
+
+**Fixed (regression tests in `tests/expr_index_v16.rs`:
+`review_regressions`, `generated_review`; CLI
+`cli_v16_expr_index_review_byte_identical`):**
+
+- **Index-driven reads slower than the scans they replaced** (medium).
+  The cause was not the subqueries: every row an access path found was
+  re-read through `btree::seek_rowid`, which copied each page on the
+  way down and parsed every cell of it, about 100 µs a row in a debug
+  build. That cost hit covering scans (`count(*)` now reads a narrower
+  index, as the pin does), rowid ranges, and any WHERE whose plan
+  changed to an index walk. Three fixes. `seek_rowid` now
+  binary-searches the borrowed frame and copies only the found cell's
+  payload, and bounds the descent depth so a cyclic file errors. It is
+  gated with the leaf (`expr_index`, whose plans seek per row), so
+  builds without it keep the old seek and tiny does not grow (the
+  ungated form measured +492 B tiny). A rowid
+  range streams its rows from the cursor instead of seeking them again.
+  A covering index builds its rows from the entries (the
+  `IdxAccess::cover` map, rowid tables only), so no table lookup
+  happens. To keep that safe, the planner's "columns read" now also
+  counts a table-valued source's arguments (`core_reads`). Measured
+  (debug, 10k rows; earlier figures are the pre-fix build):
+  `count(*) FROM t` 1.05 s → 0.026 s (the no-index table 0.024 s);
+  `WHERE exists (SELECT 1 FROM s WHERE x=7)` 1.13 s → 0.031 s;
+  `WHERE +a IN (SELECT x FROM s)` 1.11 s → 0.040 s; `WHERE rowid >
+  5000` 0.52 s → 0.034 s. An uncorrelated subquery was already
+  computed once per statement (`sub_value_for`'s hoist).
+- **`x IN (SELECT ...)` never used an index** (medium). It is now a
+  term (`xplan::TOp::InSub`) costed as the pin does (a subquery is
+  taken to return 25 rows, LogEst 46). The probe set is the
+  subquery's values, computed once when uncorrelated, converted by the
+  comparison affinity, and sorted and deduplicated under the IN
+  collation (`query::in_sub_coll`). Rows therefore come out in the
+  pin's ephemeral-table key order (ints, then text). This works on
+  plain, expression and rowid keys, in SELECT cores, lateral join
+  lookups, and UPDATE / DELETE targets (uncorrelated only, not
+  UPDATE ... FROM). `a IN (SELECT x FROM s)` over 10k rows went from
+  1.08 s to 0.009 s. One bug turned up while doing this: a write's
+  probes were evaluated on the bare empty row, so a subquery read its
+  own columns from the wrong slots and found nothing (`DELETE ...
+  WHERE a IN (SELECT x FROM s WHERE x = 3)` deleted nothing). The
+  probes now evaluate on a NULL row of the table's width.
+- **`NOT BETWEEN` / `NOT IN (SELECT ...)` implied a partial index's
+  `IS NOT NULL`** (low). The negation flag now acts as the pin's
+  `seenNot` in `exprImpliesNotNull`, so the pin's table scan and its
+  row order are kept.
+- **A commuted comparison did not imply a partial WHERE** (low).
+  `0 < b` now implies `b > 0`, as the pin's `exprAnalyze` commutes a
+  comparison whose right operand is a column (`xplan::implies1`).
+- **`ORDER BY x NULLS LAST` / `x DESC NULLS FIRST` over an index that
+  puts the NULLs at the other end** (low). The first ORDER BY column
+  after the equality columns is now delivered, as the pin's
+  `WHERE_BIGNULL_SORT` two-pass scan does. In each probe, the rows
+  whose key is NULL move to the requested end in scan order
+  (`IdxAccess::bignull`). Ties come out as on the pin.
+
+**Probing notes:** the pin probes `IN (SELECT ...)` once per sorted,
+deduplicated value (`SEARCH t USING COVERING INDEX i (a=?)`), for a DESC
+key column largest first. With `NULLS LAST` over `(a DESC, b)` it scans
+the index backwards and reads the NULL keys in a second pass. With
+`DESC NULLS FIRST` it reads them first. In both cases the scan
+direction within the NULLs holds. An equality prefix (`x = 1 ORDER BY a
+NULLS LAST` over `(x, a DESC)`) keeps the two-pass scan; on an IN prefix
+it runs per value.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed". The generated corpora agreed at
+`HIPP_EXPRIDX_CORPUS=1500`, except one `generated_queries` case
+(`genq1497`) that also differs on the pre-fix build. It is the known
+gap below.
+
+**Size:** tiny **76,924 B** (Δ **0**; the fast seek is gated with the
+leaf, see above). Full **489,268 B** (Δ **0**; `query::in_sub_coll` is
+leaf-only, so the IN-subquery collation helper `full` uses is
+unchanged). Max **704,360 B** (Δ **+4,884 B** vs 699,476, ratchet
+raised): the binary-search seek, row streaming and covering rows, the
+IN-subquery term and probe, the BIGNULL scan and the implication
+fixes.
+
+**Honest gaps (updated):** the covering-scan row lookup gap is closed
+for rowid tables (WITHOUT ROWID tables still read the row through
+their key). `IN (SELECT ...)` on a row value (`(a, b) IN (SELECT ...)`)
+and a correlated IN subquery in an UPDATE / DELETE WHERE are not
+probed; they are filtered over the scan, which gives the same rows in
+rowid order, as before. The partial-`x IS NOT NULL`-versus-index-on-`x`
+tie (about 1 in 1,000 generated cases, row order only) remains.
+
+### WITHOUT ROWID tables (2026-11-04)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `without_rowid`
+(`without_rowid = ["v16", "indexes"]`, in `max`, not `full`;
+`v16,without_rowid` in `ci/feature-sets.txt`). It measured +22.2 KB
+of `max`; `full` has ~35 KB of headroom, but ADR 0002 sends a
+storage subsystem of that weight to `max`, so it is a leaf. Probe
+lists (~140 statements, `census/` style, one-shot vs the pin) all
+match or fail on both sides.
+
+**Design.** A WITHOUT ROWID table is the pin's: an index B-tree
+(the *clustered* tree) whose records hold the PRIMARY KEY fields
+first, then every other stored column in table order. The rest of
+hipp is rowid-shaped, so `src/wr.rs` translates at the B-tree
+boundary: the pager carries the WITHOUT ROWID layouts (rebuilt
+with the catalog) and a per-statement table of *handles* — `i64`s
+standing in for rowids, each bound to a row's canonical key record
+(an open-addressing hash makes the same key always the same
+handle). `ScanCursor`, `seek_rowid`, `btree_insert` (= "the
+handle's row becomes this record", deleting its old entry and any
+entry at the new key), `btree_delete`, `new_rowid` (a fresh
+handle), `collect_table_pages` and the index entry points
+(`index_insert` / `index_delete` / `index_prefix_rowids` /
+`IndexCursor::seek` / `next_entry` / `index_check_entry`) dispatch
+on the root. The table's PRIMARY KEY is listed as an automatic
+index whose root is the table's (`IndexDef::clustered`), so UNIQUE
+checks, REPLACE victims, upsert targets and foreign-key parent
+lookups find rows in the clustered tree, while its "maintenance" is
+the row write itself; a secondary index's `key, rowid` entries
+become `key, key columns` on the way in and back on the way out.
+Without the feature the dispatch compiles out (`index_insert` /
+`index_delete` are the untranslated functions re-exported), which
+is why `full` shrank.
+
+**Shipped — leaf feature `without_rowid`:**
+
+- **Definitions** as the pin: `WITHOUT ROWID` in any case, with or
+  around STRICT; `WITHOUT <other>` is `ParseKind::UnknownTableOption`,
+  no PRIMARY KEY `ParseKind::PrimaryKeyMissing`, AUTOINCREMENT
+  `SchemaKind::AutoincrementWithoutRowid`; key columns NOT NULL (the
+  NOT NULL error, ignoring a PRIMARY KEY's `ON CONFLICT`); INTEGER
+  PRIMARY KEY is no alias (`'abc'` is stored); a key column repeated
+  with the same collation is dropped (`PRIMARY KEY(a, a)`, kept under
+  another: `(a, a COLLATE NOCASE)`); `UNIQUE(a)` repeating the key
+  merges into it; the key takes its autoindex number among the
+  UNIQUE sets but has no schema row and no tree of its own.
+- **`rowid` / `oid` / `_rowid_`** are unknown names in SELECT,
+  WHERE, RETURNING, UPDATE SET, INSERT column lists, CREATE INDEX
+  (keys and partial WHERE), CHECK, generated columns and trigger
+  NEW / OLD; a column so named reads as itself.
+  `last_insert_rowid()` ignores these inserts; `changes()` counts
+  them.
+- **Layout, byte for byte** (records and cells; page allocation
+  differs, see the review fixes below): clustered records as above (VIRTUAL
+  columns not stored, rows short of later ADD COLUMNs read their
+  defaults); secondary indexes append the key columns they do not
+  hold with the same collation, with the key's collation and
+  direction — ascending for a UNIQUE constraint's own index (the
+  pin's `bAscKeyBug`, shown by index_xinfo); cells of at least 4
+  bytes (the pin pads a 3-byte cell — a one-column key of a small
+  integer); overflow by the index-cell local-payload rules.
+- **Writes:** INSERT, OR IGNORE / REPLACE / FAIL / ABORT, upsert
+  (DO NOTHING, DO UPDATE also of the key), RETURNING, UPDATE moving
+  a row whose key changes, DELETE, the REPLACE victims, triggers,
+  foreign keys (WITHOUT ROWID parents found through their key,
+  children scanned, CASCADE / SET NULL), savepoints and crash
+  recovery through the existing journal. A handle names its key, as
+  the pin's two-pass writes name a row by its key: after
+  `UPDATE OR REPLACE m SET a = a + 1` moves row 1 onto key 2 (its
+  victim deleted), the loop's next key finds the moved row and moves
+  it again — `2|1, 3|1, 4|1` as on the pin.
+- **Order:** scans in key order (DESC / collated keys); the planner
+  (`xplan`, with `expr_index`) models these tables the pin's way —
+  no rowid loops, the clustered key an index (covering, its width all
+  stored columns), every index's full scan a candidate, a secondary
+  index covering its key and appended columns (a UNIQUE constraint's
+  own index only its key, the pin's `colNotIdxed` being computed
+  before the append), the pin's `whereLoopInsert` list (loops
+  compete per `iSortIdx` class; a later equal loop does not displace
+  an earlier one, a better one takes its place), GROUP BY delivered
+  by the key order; UPDATE / DELETE: the WHERE's columns only, an
+  index lookup costed as not covering, a key change two-pass, the
+  two-pass visit in key order.
+- **Schema statements:** PRAGMA table_info (key columns `notnull`
+  1), table_xinfo, table_list (`wr` 1), index_list (the key as
+  `sqlite_autoindex_t_N`, origin `pk`), index_info / index_xinfo
+  (the clustered key with the other stored columns BINARY, a
+  secondary index with its appended key columns, never cid -1),
+  integrity_check (hipp's own, and the pin's on hipp's files);
+  ALTER TABLE RENAME / RENAME COLUMN (texts), ADD COLUMN, DROP
+  COLUMN (records rewritten in place as the pin rewrites them,
+  `encode_record_plain`; key columns refused), DROP TABLE (the tree
+  freed once), VACUUM (trees copied raw), REINDEX (the key skipped),
+  ANALYZE (the key's row named by the table, as on the pin), CREATE
+  INDEX on a populated table, TEMP tables.
+
+**Oracle-probing notes** (all on the live pin, before and during the
+work): the record layouts above, dumped from pin-written pages
+(`CREATE TABLE t(a INT, b TEXT, c, PRIMARY KEY(c, a))` stores
+`[c, a, b]`, an index on `b` stores `[b, c, a]`); no schema row for
+the key, `sqlite_autoindex_t_2` for `a PRIMARY KEY, b UNIQUE`, `_1`
+for `a UNIQUE, b PRIMARY KEY`; index_list newest first with the key
+in its constraint's place; the error texts named above; `INSERT ...
+VALUES('abc')` into an INTEGER key; `UPDATE t SET a = a + 1` over
+keys 1, 2, 3 is a UNIQUE error, `a = a + 10 RETURNING *` gives 11,
+12, 13; two-pass writes (RETURNING, triggers, key changes) visit key
+order; one-pass UPDATE / DELETE walk the chosen index; the planner
+cases above (`SELECT *` through the newest equally wide covering
+index; `x UNIQUE` declared before a composite key never chosen to
+cover the key columns; `UPDATE t SET d = 1 WHERE a > 5` takes the
+PRIMARY KEY over an index on `a` alone, `UPDATE t SET d = 1` the
+narrowest index); DROP COLUMN rewrites the clustered records with
+serial type 1 for 0 / 1 and leaves unaffected indexes alone; 3-byte
+cells padded to 4 (the pin's "Multiple uses for byte" otherwise).
+
+**Bugs found during the unit** (fixed; regression lines in
+`tests/without_rowid_v16.rs` `regressions`): REINDEX rebuilt the
+clustered key as an index (emptying the table); DROP TABLE freed the
+tree twice; CREATE INDEX filled an index with rowid entries before
+the catalog knew it; DROP COLUMN rewrote by the old layout; ANALYZE
+named the key's statistics by its index; 3-byte cells (above);
+UPDATE OR REPLACE onto a victim's key processed rows by identity,
+not by key. **Ungated, on a claimed path** (`expr_index` planner,
+also rowid tables): an `IS` / `IS NULL` lookup through a UNIQUE index
+counted as a one-row loop, so its GROUP BY groups came out unsorted
+(`SELECT b, count(*) FROM t WHERE a IS NULL GROUP BY b`; the pin's
+WHERE_ONEROW needs `=`).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed". New suites: `tests/without_rowid_v16.rs`
+(15 tests: definitions and errors, rowid names, last_insert_rowid,
+writes and conflicts, key order and lookups, the pin's scan order,
+secondary indexes and pragmas, ALTER / DROP / VACUUM / REINDEX /
+ANALYZE, triggers / foreign keys / transactions, overflowing rows and
+keys, pin-made files written by hipp, hipp-made files read and
+VACUUMed by the pin, regressions, and two generated corpora — random
+schemas with composite / collated / DESC / repeated keys, UNIQUE
+constraints and indexes, random writes (OR IGNORE / REPLACE / FAIL,
+upsert, RETURNING, key updates, deletes) and queries compared in
+order with the pin's integrity_check on hipp's file, 120 cases by
+default; and files crossing between the engines mid-sequence both
+ways, 30 by default — `HIPP_WR_CORPUS` scales them: 1,450 / 1,000
+agreed before the last fix, 1,200 / 300 after it),
+`tests/crash.rs` `v16_crash_without_rowid` (a crash at every write
+boundary of a splitting / key-moving / deleting transaction recovers
+to the pre- or post-image), `hipp-cli/tests/cli_v16_without_rowid.rs`
+(3 tests, byte-identical one-shot and over stdin: schema texts and
+pragmas, writes and order, a generated corpus); `tests/table_defs_v16.rs`
+now expects `WITHOUT ROWID, STRICT` to work as on the pin.
+
+**Size:** tiny **76,924 B** (Δ **0**). Full **489,268 B** (Δ **−128 B**,
+ratchet lowered: the index entry points restructured so the
+untranslated functions are the public ones there). Max **699,476 B**
+(Δ **+22,224 B** vs 677,252, raised; under the 32 KiB threshold): the
+translation layer and handles (~12 KB), catalog / pragma / ALTER /
+VACUUM support (~5 KB) and the planner model (~5 KB).
+
+**Honest gaps:**
+
+- Without `without_rowid` (the tiny and `full` profiles) a file
+  holding a WITHOUT ROWID table still fails to open (its schema does
+  not parse there), as before this unit.
+- Handles cost memory per statement for every row a statement
+  touches (a scan of N rows binds N keys); a point lookup by key
+  goes index seek → handle → seek again.
+- The planner model has the expression-index unit's limits, plus:
+  equality on a secondary index's appended key columns is not a
+  usable term (the order matches, the cost estimate may not), and
+  the UPDATE / DELETE costing rule ("lookups not covering, full
+  scans covering the WHERE's columns") is fitted from probes, not
+  derived.
+- `PRAGMA table_list`'s row order (the pin's hash order) differs
+  from the pin's once there are more than ~8 tables — pre-existing,
+  for rowid tables too; the suites list tables by name.
+- ~~Constraint-level `ON CONFLICT` clauses are still ignored for every
+  table (pre-existing).~~ (closed by the honest-gap sweep, below)
+
+### WITHOUT ROWID tables — review fixes (2026-11-04)
+
+Seven review findings, each reproduced first on the pre-fix build and
+compared with the live 3.54.1 pin.
+
+**Fixed (regression tests in `tests/without_rowid_v16.rs`:
+`review_regressions` (with a generated part: random large keys moved
+and deleted at page sizes 1024 and 4096), `schema_text_ends_as_the_pins`;
+the generated corpora now also draw texts holding NUL; CLI
+`cli_v16_without_rowid_review_byte_identical`):**
+
+- **Panic / CorruptRecord in the index delete rebalance** (high;
+  ungated, `indexes`: rowid-table indexes too). A delete's window
+  balance pulls the parent's dividers down and lifts new ones, which
+  can be larger. The parent then no longer fit (the page builder's
+  `content -= len` underflowed: a panic at the default page size on a
+  WITHOUT ROWID UPDATE that grows keys to ~1 KB), or the window
+  needed more pages than it had (a page written with cells over its
+  pointer array, read back as `CorruptRecord` by the next DELETE at
+  page size 1024). The delete balance now checks both before writing
+  any page and, when either fails, hands the window to the insert-side
+  balance (`IndexBalance::Grow`), which allocates pages and cascades a
+  parent overflow upward (`cascade_index_up`), as the pin's
+  `balance_nonroot` grows on delete. `build_index_image` refuses a
+  cell list that does not fit its page (`CorruptPage`) instead of
+  writing it. Same pattern on the table side, found by the new
+  generated test: an insert balance that grows its window by two pages
+  indexed past the allocated pages (a panic), and a root leaf whose
+  cells need three pages (a near-page row inserted between two halves
+  of a full leaf) was refused `Unsupported`. Both are fixed (allocate
+  as many pages as the partition needs; a root leaf splits into any
+  number of children). These are ungated INSERT fixes on the tiny
+  profile's path.
+- **NOCASE over text holding NUL** (high; ungated, every profile with
+  collations). The pin's `sqlite3StrNICmp` stops at the first NUL of
+  the left string; only the lengths decide after it. hipp compared
+  every byte, so a NOCASE key tree was out of the pin's order (its
+  integrity_check: "row not in PRIMARY KEY order") and UNIQUE let
+  through keys the pin calls equal. `record::compare_text` now stops
+  there too, which also fixes NOCASE ORDER BY / GROUP BY / DISTINCT /
+  comparisons and rowid-table autoindexes.
+- **PRAGMA index_info / index_xinfo of a WITHOUT ROWID table's name**
+  (high). They describe the table's PRIMARY KEY index, as the pin's
+  `sqlite3PrimaryKeyIndex` fallback does (also `pragma_index_info('t')`);
+  a rowid table's name still gives no rows.
+- **ALTER TABLE DROP COLUMN of the last column, or of a column before
+  a key column** (medium). `wr::drop_field` read the dropped field's
+  place from the layout rebuilt after the schema change: past the end,
+  or a key field, so the statement failed with `CorruptRecord`. It now
+  counts the place from the key width and the stored non-key fields
+  before the column, which is the same in both layouts. (The earlier
+  section's "DROP COLUMN rewrote by the old layout" fix covered only
+  the case where the next column was a non-key one.)
+- **Stored schema text after table options** (medium). The pin's
+  `sqlite3EndTable` keeps a table with options (STRICT, WITHOUT ROWID)
+  up to the statement's `;`, whitespace and comments included (to the
+  end of the text when there is no `;`), and a plain table up to its
+  closing `)` (a comment after it is dropped); `sqlite3CreateIndex`
+  keeps an index up to its `;` as well. hipp trimmed the whitespace,
+  and kept a comment after a plain table's `)`. `parser::schema_text_end`
+  now gives the pin's end. The CLI no longer trims lines' trailing
+  spaces or a statement's trailing whitespace, so `.schema` and
+  `sqlite_schema.sql` match over stdin and one-shot. Gated on `v16` or
+  `indexes`: in the tiny profile the comment after a plain table's `)`
+  is still kept (the ungated form measured +232 B tiny; the pin reads
+  the text either way).
+
+**Not fixed:**
+
+- **index_xinfo collation spelling** (low, predates the unit: rowid
+  tables too). The pin prints the collation name as written (`nocase`,
+  `NoCase`, `BiNaRy`; `BINARY` when none is written); hipp prints
+  `BINARY` / `NOCASE` / `RTRIM`. Keeping the spelling means carrying it
+  through the parser's `Expr::Collate`, the catalog's column and index
+  definitions and the autoindex sets: that belongs to the collations
+  subsystem, not this unit.
+- **page_count of hipp-written WITHOUT ROWID files** (low, docs). hipp's
+  index B-tree split policy (shared with ordinary indexes) can use a few
+  more pages than the pin (31 vs 29 for 281 medium rows). Records and
+  cells are byte-compatible, integrity checks pass both ways, and the
+  contents and order match. Page allocation is not the pin's, and the
+  earlier section's "byte for byte" refers to the record and cell
+  layout only.
+
+**Probing notes:** `sqlite3StrNICmp(a, b, min(len))` then the length
+difference: `x'610078' = x'610079' COLLATE NOCASE` is 1 on the pin and
+`x'0061'` equals `x'0062'`. Stored texts (one-shot and stdin):
+`... WITHOUT ROWID ;` keeps the space, `... STRICT /* x */  ` with no `;`
+keeps the comment and both spaces, `CREATE TABLE a1(a) /* x */ ;` stores
+`CREATE TABLE a1(a)`, `CREATE INDEX i ON t(a)   ` keeps the spaces, a
+view still trims trailing whitespace but keeps the comment.
+`index_xinfo` on the pin: `PRIMARY KEY(a, b COLLATE "Binary")` shows
+`Binary`; `c collate 'NOCASE'` shows `NOCASE`.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed". The generated corpora agreed at
+`HIPP_WR_CORPUS=1100` (before the NUL values were added) and 600 (after).
+
+**Size:** tiny **77,004 B** (Δ **+80 B**, ratchet raised; justified:
+INSERT fixes on the tiny profile's path, a panic when an insert
+balance grows by two pages and an `Unsupported` refusal of a three-way
+root leaf split). Full **490,628 B** (Δ **+1,360 B**, raised; ungated
+fixes on claimed paths: the growing index delete balance, the page
+builder's fit check, NOCASE, the schema-text end). Max **705,768 B**
+(Δ **+1,408 B** vs 704,360, raised): the same plus the index_info
+fallback and the DROP COLUMN position.
+
+**Honest gaps (updated):** besides the two above, PRAGMA table-valued
+functions (`pragma_index_info('x')` and the others) do not see TEMP
+objects (they read only `main`); this predates the unit and affects
+rowid tables too. The unit's earlier gaps stand.
+
+### UTF-16 databases (2026-11-04)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `utf16` (`utf16 = ["v16"]`,
+in `max`, not `full`; `v16,utf16` in `ci/feature-sets.txt`). Without
+it a file whose header text encoding is 2 or 3 is refused at open
+with `Error::UnsupportedEncoding` exactly as before (unit test
+`pager::tests::utf16_header` runs in the `full` lib tests; the
+`differential.rs` a7 check is gated), and `PRAGMA encoding =
+'UTF-16...'` on an empty database is still that error.
+
+**Design.** Text stays UTF-8 inside the engine. A UTF-16 file's
+records are translated at the B-tree boundary
+(`utf16::transcode_record`): `btree::assemble_payload_into` — the
+one path every table row and index key is read through — turns its
+TEXT values into a lossless UTF-8 form (an unpaired surrogate kept
+as its three-byte form; review fix below), and `btree_insert` /
+`index_insert_core` / the index-delete predecessor cell turn them
+back into the file's UTF-16 (serial types counting UTF-16 bytes), so
+everything above (catalog, ALTER, VACUUM, WITHOUT ROWID's `wr`
+layer, triggers, foreign keys) works unchanged. What the pin exposes
+of the UTF-16 bytes is rebuilt from the UTF-8 form by
+`utf16::Units` (its `READ_UTF8` / `WRITE_UTF16` arithmetic): the
+connection's encoding (`record::TextEnc`, a zero-sized type without
+the leaf) reaches every BINARY comparison as a parameter —
+`record::compare_coll_in`, `query::order_cmp`, `btree::compare_entries`
+and the probe / integrity comparisons, the compound merge, GROUP BY
+sorts, aggregates, the window engine, xindex probe sorting and range
+bounds, WITHOUT ROWID handle sorting — and the evaluator reads it
+from `query::Env::enc` (`Ctx::enc`).
+
+**Shipped — leaf feature `utf16`:**
+
+- Files with header encoding 2 / 3 open, read and write; the
+  header field is written (with the first schema change) as the pin
+  writes it; VACUUM / VACUUM INTO keep it; a TEMP database stores
+  text as main does.
+- `PRAGMA encoding = 'UTF-8' | 'UTF8' | 'UTF-16' | 'UTF16' |
+  'UTF-16le' | 'UTF16le' | 'UTF-16be' | 'UTF16be'` (any case;
+  `UTF-16` alone is little-endian, the pin's native order on its
+  x86-64 build; `PRAGMA temp.encoding` is the same setting) while
+  the encoding is open — the database has no schema, its encoding
+  field is still 0 (a new file, or one that only got header writes)
+  and neither main nor TEMP has had a schema change since the open
+  (`Pager::enc_open`; review fix below); the last choice wins; once fixed any value,
+  even an unknown one, is ignored (an unknown name while open is
+  `SchemaKind::UnknownEncoding`, as before). `PRAGMA encoding` and
+  `pragma_encoding` report `UTF-8` / `UTF-16le` / `UTF-16be`.
+- BINARY over the UTF-16 bytes (memcmp, then length) everywhere text
+  is ordered: ORDER BY, index B-trees (insert, seek, range scans,
+  UNIQUE, integrity_check), min / max (aggregate, scalar, the
+  bare-column rule), GROUP BY output, UNION / INTERSECT / EXCEPT,
+  windows (partitions, ORDER BY, RANGE frames, min / max frames),
+  aggregate ORDER BY, IN-list probe order, comparisons. NOCASE and
+  RTRIM compare the UTF-8 form.
+- Functions: `hex(text)` and `CAST(text AS BLOB)` give the UTF-16
+  bytes (`CAST(12 AS BLOB)` too; `hex(12)` stays `3132`, as on the
+  pin); `octet_length` counts UTF-16 bytes (twice the rendering for
+  numbers); a BLOB read as text or as a number through text decodes
+  from UTF-16 — `CAST(blob AS TEXT / INTEGER / REAL / NUMERIC)`,
+  `||`, arithmetic, `WHERE blob`, LIKE / GLOB (operator and
+  function), upper / lower / trim / replace / instr (unless both are
+  blobs) / unicode / printf / concat / unhex / char / round / abs /
+  zeroblob / randomblob arguments, group_concat / string_agg; length,
+  hex, quote, substr's first argument, typeof keep the bytes; a
+  function's text result goes through the pin's UTF-8 → UTF-16
+  conversion (`utf16::normalize`: a lone surrogate becomes U+FFFD),
+  except the ones that return an argument (coalesce, nullif, iif,
+  min / max, likely); the PRAGMA table-valued functions' internal
+  literals are UTF-16-aware.
+- Invalid stored UTF-16 is held losslessly and shown as the pin
+  shows it: an odd trailing byte dropped (also by `CAST(blob AS
+  TEXT)`); an unpaired surrogate kept as its 3-byte form, so copies,
+  index builds, `||`, CAST, equality and BINARY order see the stored
+  units; where the pin reads text through its UTF-16 → UTF-8
+  conversion (result columns, function arguments, LIKE, NOCASE /
+  RTRIM, JSON) hipp reads `utf16::view`, which combines a surrogate
+  with whatever unit follows it.
+
+**Fixed on the way (ungated, the v16 function library):**
+`unicode()` replaced U+FFFE / U+FFFF with 65533; the pin returns
+65534 / 65535 (`unicode(char(65534))`).
+
+**Oracle-probing notes** (live pin, before implementing): the
+UTF-16le order is the low byte first (`'' < U+0100 < U+1F600 < 'a'`),
+UTF-16be puts astral characters below U+E000; NOCASE and RTRIM order
+like UTF-8 in both (`'a' < U+0100`); an index scan and `x > 'a'`
+follow the BINARY bytes; `hex(char(55296))` is `FDFF` (FFFD) while
+`hex(CAST(x'00D8' AS TEXT))` is `00D8`, `x || ''` and
+`coalesce(x, 1)` keep it, `upper` / `quote` / `trim` / `substr` /
+`group_concat` give FFFD; `char(65534)` stores FFFE; `CAST(x'410042'
+AS TEXT)` is `A` (`4100`); `x'3100' + 1` is 2 (UTF-16le) and
+`x'0031' = 1` is 0; `CASE WHEN x'0031'` is true in UTF-16be;
+`sum(x'3100')` is 1.0 (a blob stays non-integer); `upper(x'41')` is
+empty; `PRAGMA encoding` after `SELECT 1`, `BEGIN`, a schema read or
+`PRAGMA page_size` still changes it, after `CREATE TEMP TABLE` it
+does not, after CREATE + DROP TABLE it does not; a file whose field
+is 0 (written by `PRAGMA user_version` alone) chooses on reopen;
+`PRAGMA encoding = 'bogus'` is "unsupported encoding" only while
+open. One early probe showed `unicode()` of a stored lone surrogate
+as 55296; repeated probes give 65533 everywhere (that value is not
+tested). `concat()` of a blob reads past the converted text on the
+pin (`concat('<', x'61006200', '>')` is `<ab`, garbage after the
+NUL): not modelled, not tested.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` end
+with "==> all gates passed". New suites: `tests/utf16_v16.rs` (10
+tests: PRAGMA names and reporting, when the encoding is fixed, a
+reopened field-0 file, the BINARY order of every query shape in both
+byte orders with and without indexes, text functions, blobs read as
+text, invalid UTF-16, VACUUM / ALTER / TEMP / WITHOUT ROWID with
+overflow pages, files written by each engine read, extended and
+integrity-checked by the other, and a generated corpus of random
+Unicode text — BMP, astral, combining, NUL-containing, random
+`char(N)` including surrogates — with random writes and 15 query
+shapes in alternating byte orders, 24 cases by default,
+`HIPP_UTF16_CORPUS` scales it: 300 / 300 agreed); every statement is
+compared with the live pin and the pin's integrity_check runs on
+hipp's file; unit tests in `src/utf16.rs` (translations, BINARY
+order, records) and `src/pager.rs`; `hipp-cli/tests/cli_v16_utf16.rs`
+(byte-identical one-shot and over stdin in UTF-16le / be / native,
+`.schema` / `.tables` of non-ASCII names, each CLI reading the other's
+file, a generated corpus). `tests/differential.rs` a7 and
+`tests/pragma_v16.rs` now expect UTF-16 to work when the leaf is
+built.
+
+**Size:** tiny **77,004 B** (Δ **0**; the header check keeps its old
+code without the leaf). Full **490,692 B** (Δ **+64 B**, ratchet
+raised: the ungated `unicode()` fix and codegen shifts from the
+zero-sized encoding parameters — no UTF-16 code is in `full`). Max
+**713,504 B** (Δ **+7,736 B** vs 705,768, raised; under the 32 KiB
+threshold): the conversions and record translation (~3 KB), the
+evaluator's UTF-16 paths (~2.5 KB), the encoding-aware comparisons
+and PRAGMA / pager / VACUUM support.
+
+**Review fixes (2026-11-04).** Seven findings reproduced on the
+live pin, all fixed with regressions in `tests/utf16_v16.rs`
+(`regression_*`, plus surrogate-heavy raw units in the generated
+corpus: 300 / 300 agreed) and `hipp-cli/tests/cli_v16_utf16.rs`
+(`unpaired_surrogates_render_as_the_pin`):
+
+- **Unpaired surrogates corrupted indexes and lookups** (high). The
+  boundary decode combined any surrogate with the next unit (the
+  pin's display conversion), so `00D8 6100` was held as U+10061 and
+  re-encoded `00D8 61DC`: hipp's CREATE INDEX / REINDEX wrote keys
+  that did not match the pin's rows (the pin's integrity_check
+  failed), seeks on a valid pin file missed (`a = char(0x10000)`
+  found the wrong row, hipp's integrity_check reported a missing
+  entry), and within one statement `CAST(x'DC00D800' AS TEXT)`
+  equalled `char(0x10000)` (false UNIQUE violations, reordered
+  `hex()`). Root cause fixed: `utf16::decode_into` is now lossless
+  (only a high + low pair combines), the pin's lossy conversion is
+  `decode_pin_into` / `view`, applied where the pin reads
+  `sqlite3_value_text`: `Statement::step`'s result columns, scalar
+  function arguments (`eval_scalar16`), aggregate and window
+  group_concat arguments (`agg::arg16`), the LIKE operator, NOCASE /
+  RTRIM (`record::compare_coll_in`) and JSON arguments; `||` joins a
+  split pair (`utf16::canon`). `x || 'a'` across a trailing
+  surrogate now matches too (an earlier gap).
+- **Math functions and sign() on a BLOB** (high). The math functions
+  and `sign()` keep a BLOB argument (NULL, as in UTF-8); `log(B, X)`
+  reads X through its UTF-16 text, as the pin's
+  `sqlite3_value_double`. Same pattern fixed in unary minus,
+  `randomblob(N)`, `sum` / `avg` / `total` (aggregate and window) and
+  window group_concat / string_agg (an earlier gap). Ungated fix
+  found on the way: `sign()` of a BLOB or of a text that is not
+  wholly a number (`sign('2x')`) was 1 / 0 in every encoding; the
+  pin's is NULL.
+- **JSON on a non-JSONB BLOB** (high). A BLOB in a document or path
+  position (`json::Op::reads_text`; `json_each` / `json_tree` too)
+  decodes from UTF-16 when it is not JSONB; value positions still
+  reject it; text arguments read as `view`; JSON text results (and
+  the JSON aggregates') go through `utf16::normalize`, so a lone
+  surrogate becomes U+FFFD (an earlier gap); `CAST(blob AS TEXT)`
+  inside a JSON argument decodes too (it read raw bytes).
+- **Header-only writes fixed the encoding** (high). With `utf16` a
+  new file's schema-format and encoding fields stay 0 until the
+  first schema change, as in the pin's file (`pager::initial_page1`;
+  the header bytes now match after `PRAGMA user_version`), and the
+  encoding stays open across header writes in the same connection
+  and on reopen in either engine (the earlier reopen gap). A schema
+  change, even rolled back or inside a released savepoint, fixes it
+  (`Pager::schema_changed`, set by `bump_schema_cookie`).
+- **`PRAGMA temp.encoding = ...` ignored** (medium). The encoding is
+  a connection-wide pragma (`Prag::connection_wide`); the TEMP
+  database follows main's (`sync_temp`). Only a TEMP schema change
+  fixes the encoding — reading `temp.sqlite_master`, `PRAGMA
+  temp.user_version` or `temp.page_size` do not, as on the pin
+  (hipp used to fix it as soon as the TEMP database existed).
+- **Docs** (low): the interop and gap claims above and in README
+  are corrected.
+
+Probed on the pin for these fixes: the `view` cases above (`length`,
+`unicode`, `quote`, `substr`, `instr`, LIKE / GLOB, `upper`,
+`printf`, `group_concat`, NOCASE all read the combined character;
+`hex`, `CAST AS BLOB`, `octet_length`, `coalesce`, `min`, `||` keep
+the bytes); every math function, `log(2, blob)`, unary minus,
+`randomblob`, sum / avg / total and their window forms on BLOBs in
+all three encodings; 26 JSON calls with BLOB arguments in all three
+encodings (error-vs-error agreement for value positions); 18 PRAGMA
+encoding scripts (header writes, rolled-back CREATE, savepoints,
+BEGIN IMMEDIATE, TEMP reads / writes / DDL).
+
+**Size after the review fixes:** tiny **76,964 B** (Δ **0**). Full
+**490,996 B** (Δ **+80 B**, ratchet raised: the ungated `sign()`
+fix). Max **737,376 B** (Δ **+5,296 B** vs 732,080, raised): the
+lossless decode / `view` / `canon`, the argument and result
+translations in functions, aggregates, windows and JSON, and the
+encoding-open tracking.
+
+**Honest gaps:**
+
+- `concat()` / `concat_ws()` with BLOB arguments: the pin reads past
+  its converted text (`concat_ws(x'32002E003500', 'a', 'b')` is
+  `a2.5` there); hipp gives the decoded text.
+- A TEXT bound through `bind_value` that is not valid UTF-8 and
+  holds a surrogate's three-byte form is stored as that surrogate
+  (not probed: the pin's conversion of such bound text may differ).
+- `UTF-16` alone always means little-endian (the pin's on x86-64; a
+  big-endian pin build would choose big-endian).
+- A hipp-created file gets its page 1 written at open (the pin's
+  stays empty until the first write), and its change counter after a
+  header-only write differs from the pin's by one (pre-existing, every
+  encoding). `.dump` differs from the pin's for every encoding
+  (pre-existing).
+- ~~`INDEXED BY` is not parsed (pre-existing; the regression tests use
+  the planner's own index choice).~~ (closed by the honest-gap sweep, below)
+
+### WAL journal mode (2026-11-04)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `wal` (`wal = ["v16"]`, in
+`max`, not `full`; `v16,wal` in `ci/feature-sets.txt`). Without it a
+file whose header says WAL is refused at open with
+`Error::WalUnsupported`, as before (`pager::tests::wal_header` and
+`wal_database_refused_at_open` run in the `full` lib tests;
+`tests/differential.rs` a7 is gated).
+
+**Design.** The storage trait gains two sidecar kinds
+(`Sidecar::Wal`, `Sidecar::Shm`, gated) through the same
+`Storage::sidecar` call, so the `-wal` is reachable in no_std on any
+caller storage (`MemStorage` keeps one buffer per kind; `FileStorage`
+names them `<db>-wal` / `<db>-shm`), plus `Storage::locked_elsewhere`
+(since the review fixes `claim_wal` / `release_wal`; default `false`; `FileStorage` on Linux reads `/proc/locks` for a
+POSIX lock another process holds on the database or its `-shm` — a
+live pin connection). `src/wal.rs` is the log: the pin's format
+(header, salts, cumulative checksums in either byte order, commit
+frames), recovery as the pin's (`Wal::recover`), the heap wal-index
+(page → newest frame, sorted `AVec`), appends that overwrite a page
+the transaction already logged and reseal the checksums before the
+commit frame (the pin's `iReCksum`), restarts and
+`journal_size_limit` truncation. The pager reads pages through the
+log, spills dirty pages into it as uncommitted frames, commits by
+appending the resident dirty pages in page order with the commit
+frame last (two new resumable stages, `WalFrames` / `WalSync`),
+rolls back by forgetting the transaction's frames, checkpoints
+(`Pager::checkpoint`), switches modes (`enter_wal` / `leave_wal`:
+file-format bytes through a rollback-journal transaction, in the
+pin's order) and retires the log at close (`close_wal`). The
+database file changes only in a checkpoint. Savepoints keep their
+page images in the journal file's savepoint area as in rollback mode
+(from a zero first sector, deleted when the transaction ends).
+`Connection::close` (ungated; a rollback without the leaf) is new;
+hipp-cli closes at exit and on `.open`, as the pin's shell.
+
+**Shipped — leaf feature `wal`:**
+
+- Reading: a header with bytes 18 / 19 = 2, or a non-empty `-wal`
+  beside any header (the pin reads it then too), opens in WAL mode
+  with the committed frames replayed — page 1's header and the page
+  count from the last commit frame; a log with a bad magic, version,
+  page size or header checksum is empty; frames stop at the first
+  bad salt / checksum / page 0; frames after the last commit are
+  ignored. A log beside an empty database file is deleted, as on the
+  pin. Big-endian logs read and extend in their order.
+- `PRAGMA journal_mode = WAL | DELETE` both ways, reporting the mode
+  in force; the pin's prefix match of the name; no change (silently)
+  once the open transaction has written, "cannot change into / out
+  of wal mode from within a transaction" (`SchemaKind::
+  WalModeInTransaction`) in one that has not; the TEMP database
+  stays out of WAL mode.
+- Writing: the pin's frame layout and order, page 1 only when the
+  transaction changed it (the change counter moves only then, as
+  there), LE checksums, random salts for a new log; a restart after
+  a full checkpoint (sequence + 1, first salt + 1).
+- `PRAGMA wal_checkpoint [(PASSIVE | FULL | RESTART | TRUNCATE |
+  NOOP)]` (others PASSIVE): `0|log|checkpointed`, `0|-1|-1` outside
+  WAL mode; refused inside a transaction that read or wrote
+  (`SchemaKind::CheckpointLocked`, either mode); the pin's first
+  checkpoint after entering WAL mode opens its log with a read.
+  `PRAGMA wal_autocheckpoint` (connection-wide; ≤ 0 → 0), the
+  automatic PASSIVE checkpoint after a commit at that many frames;
+  `PRAGMA journal_size_limit` (and `pragma_journal_size_limit`);
+  `PRAGMA synchronous` at every level (OFF: no syncs; NORMAL: the
+  log synced only by checkpoints; FULL / EXTRA: at every commit).
+- Close: checkpoint, `-wal` and a stale `-shm` deleted, the file
+  still marked WAL (the pin's persistent WAL mode).
+- VACUUM in WAL mode writes the image as one transaction of frames
+  and keeps the page size; VACUUM INTO writes a rollback-mode file
+  with the pending page size, as on the pin.
+- A database a live SQLite connection holds is refused at open (and
+  at the switch to WAL) with `Error::DatabaseBusy`.
+
+**Fixed on the way (ungated, the `v16` PRAGMA code):** `PRAGMA
+journal_mode = w` (any prefix of a mode name) was a silent query —
+now the pin's mode (refused without the leaf for WAL);
+`PRAGMA synchronous = ...` inside a transaction is the pin's prepare
+error (`SchemaKind::SafetyLevelInTransaction`).
+
+**Oracle-probing notes** (live pin, before implementing): the
+switch writes bytes 18 / 19 = 2 in a rollback transaction (change
+counter + 1; on a new file page 1 is written with fields 44 / 56 still
+0); the `-wal` appears at the first read or write after it, not at
+the pragma; frames come page-sorted, page 1 only when changed; magic
+`0x377f0682` on the x86-64 pin; a new log has sequence 0 and random
+salts; after every frame is checkpointed the next write rewrites the
+header (sequence + 1, salt 1 + 1, new salt 2) without truncating the
+file, unless `journal_size_limit` trims it at the first commit
+(to max(limit, frames' end)); TRUNCATE empties it and the next header
+takes sequence + 1; `PRAGMA wal_checkpoint` is `0|-1|-1` in rollback
+mode and "database table is locked" in a transaction that touched
+the file (BEGIN alone is fine, `PRAGMA user_version` counts); NOOP
+copies nothing; `wal_autocheckpoint = -3` / `'abc'` / `99999999999`
+report 0, `2.7` 2; `journal_size_limit = -5` is -1, `'x'` 0;
+`synchronous = 7` is 0, `4` reports 4, `bogus` / `-1` 1; inside a
+transaction a safety-level change fails at prepare; the shell closes
+(checkpoint, `-wal` and `-shm` removed) even after an error;
+`locking_mode = EXCLUSIVE` leaves only the `-wal` on a kill; a
+header saying rollback with a non-empty valid `-wal` is read through
+it and the mode reported `wal`, a 0-byte one leaves rollback mode
+alone; an empty database file deletes its `-wal`; VACUUM in WAL mode
+ignores a pending page size, VACUUM INTO uses it and writes 1 / 1; a
+live pin holds a POSIX read lock on its database's SHARED range and
+on the `-shm` DMS byte (exclusive mode: a write lock on the
+database), which `/proc/locks` shows.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` end
+with "==> all gates passed". New suites: `tests/wal_v16.rs` (15
+tests: PRAGMA values and switches, safety levels and limits,
+checkpoints of every mode with `-wal` sizes compared between
+statements, VACUUM / VACUUM INTO, the pin's killed logs read and
+extended (stale `-shm`), 50 rewritten logs — both byte orders,
+truncated at every frame, every salt and checksum broken, a bad
+header, a torn last frame, trailing junk — read exactly as the pin
+reads them, header / empty-log cases, hipp's logs parsed by an
+independent parser and read, recovered, checkpointed and extended by
+the pin, a live pin connection refused, the errors, savepoints, and
+two generated corpora of WAL workloads — writes, savepoints,
+statement failures, checkpoints, mode switches, VACUUM — on both
+engines, outputs and files compared and each engine reading the
+other's log, 30 + 15 by default, `HIPP_WAL_CORPUS` scales them: 400
+agreed); `tests/crash.rs` gains four WAL crash matrices (every
+write of frame appends with spills and in-place rewrites, savepoints
+and a failing statement, every checkpoint mode, restarts,
+`journal_size_limit`, the automatic checkpoint, mode switches both
+ways, VACUUM, the checkpoint at close — each recovers the state
+after the completed statements or after the one in flight, passes
+hipp's and the pin's integrity checks and reads the same on the pin)
+and the cross-tool case (a hipp process killed at every write of a
+WAL workload and its close, recovered by the pin, read alike by
+hipp; `crash_writer` modes `wal_setup` / `wal_txn`); unit tests in
+`src/wal.rs` and `src/pager.rs`; `hipp-cli/tests/cli_v16_wal.rs`
+(byte-identical PRAGMA rows one-shot and over stdin, the one-shot
+error stop, the oracle's killed log read, `.open`, a generated
+corpus; the files both CLIs leave compared). `tests/pragma_v16.rs`
+and `tests/differential.rs` now expect WAL to work with the leaf.
+
+**Size:** tiny **76,964 B** (Δ **−40 B**, ratchet lowered: the
+`MemSidecar` writes lost two `expect`s). Full **490,916 B** (Δ
+**+224 B**, ratchet raised: the ungated journal_mode prefix match and
+safety-level refusal; no WAL code is in `full`). Max **732,080 B** (Δ
+**+18,576 B** vs 713,504, raised; under the 32 KiB threshold): the log
+format and recovery (`src/wal.rs`), the pager's WAL paths (reads,
+spills, the commit stages, checkpoints, switches, close), the
+PRAGMAs and the `Connection::close` wiring.
+
+**Honest gaps:**
+
+- Frame counts match the pin's for the probed workloads, but not in
+  general: after deletes hipp's B-trees are not always laid out page
+  for page as the pin's (pre-existing), so a transaction may log
+  other pages; hipp's page cache (`Config::cache_pages`, 16 by
+  default) spills into the log long before the pin's (2000 KiB); the
+  pin's "don't write" of pages freed in a transaction is not modelled;
+  a ROLLBACK TO may leave other pages dirty than on the pin. The
+  generated corpora compare checkpoint rows by meaning (frames
+  present, all checkpointed), the hand-written suites exactly.
+  (An UPDATE that rewrote unchanged index entries and rows was a
+  further, common cause: fixed in the review fixes below.)
+- The pin creates the empty `-wal` at its first read in WAL mode;
+  hipp at its first frame. The checkpoint's "locked" rule reads
+  "a page was read since BEGIN / SAVEPOINT" (a schema re-read after
+  another statement's schema change counts).
+- Single process: a `-shm` held by a live connection is detected only
+  on Linux (`/proc/locks`) and only at open and at the switch to WAL;
+  hipp never writes a `-shm`, so a pin connection opened later
+  beside hipp's is not coordinated with (never do that). `busy` is
+  always 0. `PRAGMA locking_mode` stays refused. (A second hipp
+  connection is refused since the review fixes below.)
+- `journal_mode` PERSIST / TRUNCATE / MEMORY / OFF are still refused
+  (from WAL mode too). (The CLI's `:memory:` database entered WAL
+  mode: fixed below.)
+- `PRAGMA encoding` after `journal_mode = WAL` on a new database is
+  ignored by hipp (its page 1 already says UTF-8); the pin still
+  takes it.
+- (Without the leaf, a rollback-mode header with a non-empty `-wal`
+  beside it was read from the database file. This gap's claim that
+  only hand-placed files get there was wrong — the pin opens such a
+  database in WAL mode and commits into the log; fixed below.)
+- A log whose page size differs from the database's with committed
+  frames is refused (`CorruptPage`). `synchronous = NORMAL` in
+  rollback mode syncs as FULL; EXTRA does not sync the directory. A
+  commit whose final sync fails is rolled back in memory after its
+  commit frame's salts are overwritten, best effort.
+
+### WAL journal mode — review fixes (2026-11-04)
+
+Four review findings, each reproduced first on the pre-fix build and
+compared with the live 3.54.1 pin.
+
+**Fixed (regression tests: `tests/wal_v16.rs`
+`a_second_hipp_connection_is_refused`, `memory_db_stays_memory`;
+`src/pager.rs` `log_beside_rollback_header` (run by the tiny, `full`
+and `max` lib tests); `hipp-cli/tests/cli_v16_wal.rs`
+`dot_open_same_wal_db_then_killed`, `dot_open_failure_substitutes_memory`,
+`memory_database_stays_memory`, `update_frames_match`):**
+
+- **`.open` of the WAL database already open lost commits on a crash**
+  (high). hipp-cli opened the new connection before closing the old
+  one; the new one rebuilt its heap wal-index from the `-wal`, then
+  the old one's close checkpointed and unlinked that file, and the new
+  one's later commits went to the unlinked inode — shown by its
+  SELECTs, on no file once the process died. The CLI now closes first,
+  as the pin's shell does, and when the new open fails it carries on
+  with a substitute in-memory database, as the pin does (it kept the
+  old one). The root cause — two connections on one WAL database in
+  one process — is closed in the library too: the storage hook
+  `Storage::locked_elsewhere` became `claim_wal` / `release_wal`.
+  `FileStorage` takes an exclusive `flock` on the database file when a
+  database opens in or enters WAL mode (Unix; SQLite's POSIX locks
+  neither take nor see it) and drops it on leaving WAL mode, at close
+  or when dropped; a second hipp connection, in this process or
+  another, gets `DatabaseBusy` at open or at `journal_mode = WAL`.
+  The live-pin check (`/proc/locks`) is unchanged. `crash_writer`'s
+  wrapper forwards the hooks.
+- **Builds without `wal` read a stale main file beside the pin's
+  committed frames** (high; every build without the leaf, the tiny
+  profile included). The no-wal open path looked only at header bytes
+  18 / 19, but the pin opens a database in WAL mode whenever a
+  non-empty `-wal` sits beside it (probed: 100 bytes of junk there,
+  `journal_mode` reports `wal` and commits go into the log with the
+  header still 1 / 1). hipp then returned the old rows and committed
+  into the main file under the log, where the pin's replay hid them.
+  A new hook, `Storage::log_beside` (default `false`; `FileStorage`
+  looks for a non-empty `<db>-wal`), is consulted at open without the
+  leaf: such a database is refused with `WalUnsupported`. (A log beside
+  an empty file is refused there too, where the pin would delete it.)
+  With the leaf the log is read through `Sidecar::Wal`, as before. The
+  earlier gap's "only hand-placed" claim and README's "never read
+  stale" were wrong until now.
+- **An UPDATE logged pages the pin leaves clean** (medium; `wal`).
+  Every UPDATE deleted and reinserted every index entry and the row,
+  so an index no assigned column reaches, or a row whose record did
+  not change, was written: one frame per such page too many in
+  `wal_checkpoint`'s `log|checkpointed` (`t(a PRIMARY KEY, b)`, `SET
+  b = 'y'`: 0|2|2 against the pin's 0|1|1). Probed page by page on the
+  pin (its `-wal` listed by `.system`): an index is left alone unless
+  an assigned column, a generated column computed from one, its WHERE
+  or the rowid (a WITHOUT ROWID primary key) reaches it; a plain one
+  that is reached is rewritten even with its entry unchanged (`SET a =
+  a` on `t(a)` logs the index page); one with an expression or VIRTUAL
+  generated key part only when its entry changes (`t(a+0)`, `SET a =
+  a`: nothing; a WITHOUT ROWID row whose key value changes rewrites
+  every entry the change reaches, as its entries end in the key — the
+  first gate run caught a version that compared handles there); the row is rewritten only when its key is assigned or
+  its record changes, and a record of the same size is overwritten in
+  place, only its local part and overflow pages whose bytes differ
+  written (the pin's `btreeOverwriteCell`: `SET b = 'z'` past a 5000-byte
+  blob logs one overflow page). `rewrite_stored_row` (UPDATE and
+  upsert DO UPDATE) now does all that (`btree::btree_overwrite`,
+  `TableRules::changed_cols`, the CHECK path's change set factored
+  out). Gated on `wal`, where the counts show: without the leaf the
+  old rewrite stays (rollback mode then journals the extra pages,
+  which no result shows), so `full` does not grow.
+- **In-memory databases entered WAL mode** (medium). The pin keeps a
+  `:memory:` database in journal mode `memory`: every `journal_mode`
+  query and assignment (WAL, DELETE, OFF, …) reports `memory`,
+  `wal_checkpoint` is `0|-1|-1`; hipp reported `delete` (before this
+  unit too), then switched to WAL and checkpointed. A new hook,
+  `Storage::is_memory` (`v16`, default `false`), and
+  `MemStorage::memory_db()` mark an in-memory database (plain
+  `MemStorage::new()` still models a file, as the tests and crash
+  injectors need); the CLI's `:memory:` uses it. Ungated within the
+  `v16` PRAGMA code. (`PRAGMA temp.journal_mode` stays `delete`, as on
+  the pin.)
+
+**Probing notes:** the pin's shell `.open` closes first, and on a
+failed open prints its error and "using substitute in-memory
+database". UPDATE pages (two-row tables, one leaf per tree, the
+pin's frames listed): `t(a)` / `SET a = 1` with a already 1 → the
+index page; `t(a+0)`, `t(lower(a))`, `t(a, b || '')` → none; `t(c)
+WHERE a > 0`, `SET a = a` → the index page; `t(c) WHERE a > 5` (row
+outside the index before and after), `SET a = 2` → the table page
+only; `c AS (a + 1) VIRTUAL` indexed, `SET a = a` → none, STORED → the
+index page; `t(a INTEGER PRIMARY KEY, …)` with `SET a = a` → the table
+and every plain index, not an expression index; WITHOUT ROWID `SET b =
+b` → none, `SET a = a` → table and index. A REAL column's integral
+value is stored by the pin as an integer (serial type 1), by hipp as
+an 8-byte real (pre-existing); both read 1.0.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` end
+with "==> all gates passed". `update_frames_match`'s generated part
+agreed exactly (rows, checkpoint row, integrity) at
+`HIPP_WAL_CORPUS=400`.
+
+**Size:** tiny **76,976 B** (Δ **0**: the no-wal check is a default
+method `MemStorage` does not override). Full **498,252 B** (Δ
+**+72 B**, ratchet raised: the ungated in-memory journal-mode fix in the
+`v16` PRAGMA code). Max **748,212 B** (Δ **+2,952 B** vs 745,260,
+raised): the UPDATE page rules and `btree_overwrite`, the WAL claim.
+
+**Honest gaps (updated):**
+
+- The pin's `hasFK > 1` case (an UPDATE of a parent key that an FK
+  with an ON UPDATE action references rewrites every index) is not
+  modelled: hipp logs only the indexes the change reaches.
+- A record whose size changes is still deleted and reinserted (the
+  pin frees and reallocates its overflow pages differently: a
+  5000-byte blob grown by one byte logs 4 frames on the pin, 2 on
+  hipp); pre-existing layout differences after deletes stand.
+- A row the pin wrote with a REAL column's integral value is a
+  different record to hipp (integer vs 8-byte real, pre-existing), so
+  hipp rewrites it where the pin finds it unchanged.
+- The WAL claim is advisory and Unix-only (`flock`); a non-Unix
+  `FileStorage` claims nothing. Rollback-mode connections take no
+  lock, so two hipp connections on one rollback-mode file are still
+  not coordinated (pre-existing).
+- Without the leaf a non-empty `-wal` beside an empty database file
+  is refused rather than deleted as the pin does; a caller's own
+  storage must implement `log_beside` to be checked.
+- The unit's other gaps stand.
+
+### Honest-gap sweep: constraint conflict clauses, INDEXED BY, three-part names, TEMP across databases (2026-11-04)
+
+**Shipped** (each probed on the live 3.54.1 pin first):
+
+- **Constraint-level `ON CONFLICT` clauses** (ungated from `v07`: a
+  silent wrong answer on claimed paths — a `NOT NULL ON CONFLICT
+  FAIL` multi-row INSERT lost the rows before the failing one, an
+  `ON CONFLICT IGNORE` / `REPLACE` errored where the pin resolves).
+  The parser keeps each NOT NULL / PRIMARY KEY / UNIQUE clause
+  (`ColumnDef::nn_conflict`, `ConstraintSet::conflict`; a repeated
+  constraint merges, two different clauses are the pin's
+  "conflicting ON CONFLICT clauses specified",
+  `ParseKind::ConflictingOnConflict`); the catalog carries them
+  (`Column::nn_conflict`, `TableDef::ipk_conflict`,
+  `IndexDef::conflict`). A statement without an `OR` clause now
+  parses as `ConflictAction::Unset`, and the planner resolves each
+  constraint by `ConflictAction::over` (explicit statement clause >
+  constraint clause > ABORT) into `InsCol::nn_act`,
+  `Plan::{Insert,Update}::ipk_act`, `Update::nn_acts` and
+  `IndexPlan::act`. Indexes are checked in the pin's list order —
+  newest first, every index whose own clause is REPLACE after the
+  others — with a rowid REPLACE deferred past them unless the
+  statement says REPLACE; the first violated constraint that does not
+  resolve by REPLACE decides (IGNORE skips the row, ABORT / FAIL /
+  ROLLBACK fail it), and only all-REPLACE conflicts delete victims.
+  NOT NULL ... REPLACE substitutes the default; a NULL default fails
+  as ABORT after the later columns had their turn (the pin's second
+  pass). The failing constraint's own action is recorded
+  (`Statement::fail_act`), so FAIL keeps and ROLLBACK ends exactly
+  as that constraint says (this replaces the review-era text scan
+  `rollback_constraints`, which matched by constraint *kind*). CHECK
+  ignores its clause, as on the pin; the column-level `CHECK ...
+  ON CONFLICT` stays a syntax error. Interplay: an upsert's DO UPDATE
+  resolves by ABORT whatever the clauses say (regression found here:
+  `INSERT OR FAIL ... DO UPDATE` kept the rows before a failing DO
+  UPDATE; the pin keeps none); trigger bodies take the firing
+  statement's explicit clause, else their constraints'; REPLACE
+  victims fire DELETE triggers under `recursive_triggers` and FK
+  actions as statement REPLACE does; the pin's `bReplace` (UPDATE
+  one-pass order) now reads the indexes' clauses instead of the
+  table text. Builds below `v07` (tiny, `indexes`, `v04` .. `v06`)
+  refuse FAIL / IGNORE / REPLACE constraint clauses at parse
+  (`ParseKind::RequiresConflictResolution`, the CHECK precedent);
+  ROLLBACK / ABORT need nothing.
+- **`INDEXED BY name` / `NOT INDEXED`** (`v16`) on FROM sources and
+  UPDATE / DELETE targets (`IndexHint`, `query::Hint`): "no such
+  index" (`UnknownIndex`) for a name the table lacks and on a view
+  or CTE; with `expr_index`, "no query solution"
+  (`SchemaKind::NoQuerySolution`) for a partial index the WHERE
+  (and the source's ON) does not imply, and the planner (`xplan::
+  choose`) considers only the named index, its full scan always a
+  candidate (the pin's `isIndexedBy`), or no index at all (rowid
+  lookups stay; ignored on WITHOUT ROWID tables, as the pin's
+  `notIndexed` is). Without `expr_index` the clause is checked and
+  the scan keeps rowid order. `t INDEXED BY` is never an alias.
+- **Three-part column names** `schema.table.column` (`v16`,
+  `Expr::Column::schema`) in every expression context the pin allows
+  them — select items, WHERE / GROUP BY / HAVING / ORDER BY, ON,
+  correlated subqueries, UPDATE / DELETE, CHECK texts, partial-index
+  WHERE texts, views, trigger bodies — the table part matching the
+  source's qualifier (its alias when it has one), the schema the
+  source's database (`SourceDesc::db`: main or temp; a derived
+  table, CTE or RETURNING row is none). Pin-written files with such
+  CHECKs / partial indexes are no longer opaque, and ALTER TABLE
+  RENAME rewrites the names as the pin does. Generated columns and
+  index keys refuse them, `schema.table.*` is a syntax error (pin).
+- **TEMP across databases** (`v16`): a statement of the main
+  database reads TEMP tables (`Connection::plan_temp_source`,
+  `Statement::scan_temp`): joins, subqueries, compounds, `x IN
+  temp.t`, INSERT / UPDATE / DELETE of a main table and CREATE TABLE
+  ... AS in main that read temp; an unqualified name is temp first,
+  `main.x` / `temp.x` are honoured (`FromSource::in_temp`). A temp
+  INSERT ... SELECT and CREATE TEMP TABLE ... AS SELECT that read
+  main run their SELECT on main and feed the rows to the temp
+  database (`Route::TempFed`, `Plan::Temp::feed`; a CTAS changes no
+  counter, as on the pin). TEMP views over main and temp tables
+  together are inlined into main statements. Table-valued pragmas
+  (`pragma_table_info`, `pragma_index_list`, `pragma_index_info`,
+  ...) see TEMP objects, temp first, and take the `'temp'` schema.
+- **VACUUM of an auto-vacuum file / `PRAGMA incremental_vacuum`**:
+  **kept as the documented refusal.** The pin's pointer-map pages
+  would have to be maintained by every page allocation, free and
+  B-tree balance on the write path; that is a pager project well
+  past this unit's budget, and a fresh auto-vacuum image would be
+  damaged by the next hipp write. `PRAGMA auto_vacuum = 0; VACUUM`
+  converts. (~~A hipp write to a pin-made auto-vacuum file leaves
+  the maps stale~~: the review fixes refuse every such write.)
+
+**Oracle-probing notes** (live pin, `sqlite3 DB` over stdin, one
+statement per line): `NOT NULL ON CONFLICT IGNORE` skips the row,
+`REPLACE` takes the DEFAULT (none or NULL: ABORT), FAIL keeps earlier
+rows; `UNIQUE ON CONFLICT IGNORE` + `UNIQUE ON CONFLICT FAIL` on one
+row: the newer index decides (b checked before a); an explicit
+CREATE UNIQUE INDEX (OE_Abort) is checked before an older
+constraint's IGNORE; `a UNIQUE REPLACE, b UNIQUE IGNORE` over (1,2)
+conflicting on both: IGNORE wins (REPLACE last); `id INTEGER PRIMARY
+KEY ON CONFLICT REPLACE, b UNIQUE ON CONFLICT IGNORE`: IGNORE wins
+(rowid REPLACE deferred); table-level `CHECK (...) ON CONFLICT IGNORE`
+parses and is ignored, column-level is "near ON: syntax error"; `OR
+ABORT` overrides a constraint ROLLBACK; `a NOT NULL ON CONFLICT
+ROLLBACK, b NOT NULL`: b's NULL aborts the statement only; DO UPDATE
+under `INSERT OR FAIL` keeps nothing; a TEMP-less trigger body
+inherits the outer explicit clause. `INDEXED BY ib WHERE a > 0`
+scans ib (b order); `INDEXED BY main.ia` and `INSERT ... INDEXED BY`
+are syntax errors; a view / CTE source is "no such index"; a partial
+index `WHERE c > 'x'` with `WHERE c = 'z'` is "no query solution"
+(only identical / IS NOT NULL implications count); NOT INDEXED on a
+WITHOUT ROWID table still walks its covering index. `main.x.a FROM t
+AS x` resolves, `main.t.a FROM t AS x` does not; `temp.t.a FROM t`
+resolves to the temp t that shadows main; RETURNING / generated
+columns / index expressions refuse three-part names. CTAS (main or
+temp) leaves changes() / total_changes() / last_insert_rowid()
+alone; `CREATE TEMP TABLE IF NOT EXISTS u AS ...` over an existing u
+reads nothing.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed" (fmt, clippy on default /
+all-features / every `ci/feature-sets.txt` line, workspace tests,
+the four no_std targets, the tiny / full / max size gates).
+
+**Size:** tiny **76,976 B** (Δ **+12 B** vs 76,964, ratchet raised to
+it; a correctness fix on the CREATE TABLE path the tiny profile
+claims, within the +256 B allowance: below `v07` a constraint-level
+FAIL / IGNORE / REPLACE is refused at parse instead of ignored, so a
+multi-row INSERT no longer loses the pin's FAIL rows silently). Full
+**498,180 B** (Δ **+7,184 B** vs 490,996, ratchet raised; under 500
+KiB): the per-constraint resolution (ungated from `v07`) and the
+`v16` surface — INDEXED BY checks, three-part names, temp sources,
+temp feeds, pragma rows from temp. Max **745,260 B** (Δ **+7,884 B**
+vs 737,376, ratchet raised): the same plus the forced / forbidden
+index planning and "no query solution" (`expr_index`).
+
+**Tests:** `tests/gaps_v16.rs` — five hand corpora (constraint
+clauses incl. upsert / trigger / FK / WITHOUT ROWID interplay and the
+regressions above; INDEXED BY incl. joins, subqueries, partial,
+expression and WITHOUT ROWID indexes; three-part names incl. temp
+shadowing; main/temp statements; pragma functions on temp objects),
+a generated corpus of 160 random constraint-clause schemas and
+writes (in and out of transactions, every statement clause) and 96
+random INDEXED BY / NOT INDEXED queries whose unordered rows must
+come in the pin's order, and a pin-written file with three-part
+CHECK / partial-index / view texts that hipp writes and renames.
+Every case compares rows, failing statements and the pin's `.dump`
+of both files, plus the pin's integrity check of hipp's.
+`hipp-cli/tests/cli_v16_gaps.rs`: four byte-identical batches,
+one-shot and over stdin. `tests/temp_v16.rs` now asserts the mixed
+statements run (and the temp UPDATE / DELETE refusal).
+
+**Honest gaps:**
+
+- A temp UPDATE / DELETE whose expressions read main tables, and an
+  INSERT ... SELECT into temp with an upsert, RETURNING, a leading
+  WITH or bound parameters, are still refused (`Unsupported`): the
+  temp database cannot read main, and only a whole SELECT can be fed
+  across. TEMP triggers on main tables (and temp triggers whose
+  bodies write main tables) stay refused, as before.
+- Temp tables read by a main statement are scanned in rowid order
+  with no index access path (a temp index is not planned there, and
+  `INDEXED BY` on them is checked only), so unordered output over a
+  temp index can differ in order from the pin's; a WITHOUT ROWID
+  temp table is refused in a mixed statement.
+- `PRAGMA table_info` / `pragma_table_info` of a TEMP view over main
+  tables fails (the temp database plans the view), and
+  `temp.pragma_table_info(...)` (a schema-qualified function) and
+  correlated pragma-function arguments stay refused.
+- Constraint resolution approximations: with an upsert, the pin
+  checks the target index first and then the rowid (`upsertIpkDelay`);
+  hipp checks the rowid first — they differ only in which error a row
+  violating both the rowid and a non-target index under different
+  clauses reports. A REPLACE deletion whose DELETE triggers re-create
+  a conflict is re-checked under ABORT (as for statement REPLACE).
+- Without `expr_index` (the `full` profile) INDEXED BY / NOT INDEXED
+  are checked but do not change the scan order; a partial index named
+  there is an index hipp cannot read (`Unsupported`).
+- VACUUM of an auto-vacuum file and `PRAGMA incremental_vacuum` stay
+  refused (above); since the review fixes, so does every other write
+  to such a file.
+- ~~Pin-written CHECK / partial-index texts with three-part names
+  are no longer opaque~~ overclaimed: a `temp.` or unknown schema
+  part on a main table was still refused — closed by the review
+  fixes, as are the regressions and refusals listed there.
+
+### Honest-gap sweep — review fixes (2026-11-04)
+
+**Fixed** (each reproduced and compared with the live 3.54.1 pin):
+
+- *Main views and triggers read TEMP tables* (regression of the
+  sweep, `v16` / `triggers`): the new temp-first routing reached the
+  bodies of views and triggers stored in main, so a temp table
+  shadowed their tables (`SELECT * FROM v` answered the temp rows; a
+  trigger wrote rows read from a temp table) and stood in for a
+  missing one where the pin says "no such table: main.t". The pin
+  binds such a body's unqualified names to its own database
+  (`sqlite3FixSrcList`). The view / CTE expander now marks every
+  table name it walks in a main view's body (`Expander::fix_main`,
+  set by `view` and `expand_parsed_view`) and in a trigger program's
+  statements (`TrigState::fix_main`, set by `plan_step` and by the
+  ALTER TABLE re-plan of trigger texts) as main-qualified, once the
+  body's own CTEs are resolved. ALTER TABLE of a main table that a
+  temp table shadows rewrites its views and triggers again (it
+  failed with "no such table" / "no such column").
+- *INDEXED BY / NOT INDEXED on a trigger body's UPDATE / DELETE was
+  stored* (`triggers`), after which the pin found the schema
+  malformed: now the pin's parse error
+  (`SchemaKind::TriggerIndexedTarget`, checked before RETURNING, as
+  on the pin). Elsewhere in a body (a SELECT, UPDATE ... FROM, a
+  subquery) the clause stays allowed.
+- *Writes to an auto-vacuum file corrupted it* (ungated: a claimed
+  write path). hipp keeps no pointer-map pages, and an INSERT or
+  CREATE that allocated pages left the pin's maps stale (its
+  integrity check: "Failed to read ptrmap key"). `Pager` now notes a
+  non-zero header offset 52 at open and `begin_write` refuses
+  (`Error::AutoVacuumUnsupported`), leaving the file byte-identical;
+  reads work, and `PRAGMA auto_vacuum = NONE; VACUUM` — whose image
+  is plain, so `replace_image` lifts the refusal for it alone —
+  converts the file, after which writes work.
+- *NOT INDEXED on a view or CTE* was "no such index"; the pin accepts
+  it (only INDEXED BY names an index there).
+- *Three-part names.* The schema part of a CHECK's or partial
+  index's name is ignored, any word, as on the pin (`NC_IsCheck` /
+  `NC_PartIdx`): `CHECK (temp.u.a > 0)` on a main table, `bogus.t.a`,
+  and `main.t.b` in a TEMP table's CHECK were refused (by the router
+  or the resolver), and pin-written files with them failed every
+  INSERT (`query::DB_ANY`; the router now places such a `temp.` in a
+  CREATE TABLE / CREATE INDEX). Resolution filters sources by
+  database (`SourceDesc::in_db`, `query::group_column`) instead of
+  checking the first source of the name: `main.t.b, temp.t.b FROM
+  main.t, temp.t` was "ambiguous", `(SELECT main.t.b FROM temp.t)
+  FROM main.t` failed, and `*` / `t.*` over `main.t, temp.t` were
+  "ambiguous" (the pin expands them per database). Table-valued
+  functions (`pragma_*`, `json_each` / `json_tree`) are main's, the
+  empty temp schema temp's. The temp schema table answers to
+  `sqlite_temp_master` / `sqlite_temp_schema` (with a schema
+  written, also to `sqlite_master` / `sqlite_schema`) and no longer
+  to a bare `sqlite_master` / `sqlite_schema` qualifier (the pin's
+  `isValidSchemaTableName`): `sqlite_temp_master.name FROM
+  sqlite_temp_master` was "no such column", `sqlite_schema.name FROM
+  temp.sqlite_schema` answered.
+- *INDEXED BY a partial index on a LEFT JOIN's right table* was "no
+  query solution" whenever the implying term sat in WHERE. The pin
+  makes the join inner when the WHERE rejects the table's NULL row
+  (`sqlite3ExprImpliesNonNullRow`, modelled as `xplan::Src::
+  null_rejects`: comparisons, arithmetic, IN lists and BETWEEN by
+  their left operand, AND / OR, a top-level IS NOT NULL only where
+  the pin's AND chain tries its left operands; IS / IS NOT, IS NULL,
+  functions, LIKE and CASE do not count), and then the WHERE may
+  imply the index.
+- *CREATE TABLE ... AS over a TEMP view* (main CTAS) was "no such
+  table": the views are now written in after its `AS`
+  (`inline_temp_views`, `start`). A TEMP CTAS or temp INSERT ...
+  SELECT over a TEMP view of main tables, or over a main view, failed
+  the same way: the fed SELECT now gets the temp views inlined
+  (`route`) and its views and CTEs expanded (`expand_ast`) like any
+  main statement.
+- Code: `resolve_col_ref` has its `#[inline(never)]` back (the
+  three-part check had been inserted between the attribute and the
+  function), and the three-part doc no longer claims `temporary` is
+  accepted (the pin takes only `temp`).
+
+**Oracle-probing notes:** `CREATE VIEW mv AS SELECT * FROM t` over a
+temp-only t is stored and fails when read ("no such table: main.t");
+`... FROM temp.t` in a main view or trigger is "cannot reference
+objects in database temp"; FK actions name their child table and are
+unaffected by a temp table of its name. `DELETE FROM t NOT INDEXED`
+in a trigger body: "the NOT INDEXED clause is not allowed on UPDATE
+or DELETE statements within triggers" (before the RETURNING error);
+`SELECT ... FROM t INDEXED BY i` there is fine. `SELECT * FROM
+(SELECT 1) NOT INDEXED` and `pragma_table_info('t') NOT INDEXED` are
+syntax errors on both. `CHECK (main.x.a > 0)` (wrong table) is "no
+such column: x.a"; in generated columns `temp.t.a` is "no such
+column" and `main.t.a` '"." operator prohibited'. `main.s.x FROM
+(SELECT 1 x) s` and `main.c.x` of a CTE: "no such column". `u LEFT
+JOIN t INDEXED BY tp ... WHERE t.b LIKE '1' AND t.b IS NOT NULL` is
+"no query solution" (LIKE is a function; the trailing IS NOT NULL is
+walked, not tried), while `WHERE u.x > 0 AND (t.b IS NOT NULL AND
+u.y > 0)` answers. On the pin an auto-vacuum file takes `PRAGMA
+user_version = 3`; hipp refuses that header write too.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **−16 B** vs 76,976, ratchet lowered;
+the ungated auto-vacuum write refusal costs a few bytes in the
+pager, and the code around it compiled smaller). Full **498,456 B**
+(Δ **+204 B** vs 498,252, ratchet raised; under 500 KiB): the main
+views / triggers mark, the database filter of three-part names, the
+temp schema table's names, the CTAS / fed-SELECT temp-view inlining.
+Max **749,488 B** (Δ **+1,276 B** vs 748,212, ratchet raised): the same
+plus the trigger-body index-clause check (`triggers`) and the LEFT
+JOIN null-rejection test (`expr_index`).
+
+**Tests:** `tests/gaps_v16.rs` — `main_objects_read_main_only` (view
+and trigger shadowing and missing tables, ALTER re-plans, FK
+actions), `indexed_by_review` (trigger bodies, derived sources, 22
+LEFT JOIN forms), `indexed_by_trigger_leaves_file_readable`,
+`three_part_review` (CHECK / partial / generated / index-key texts,
+main and temp side by side, table-valued functions, the temp schema
+table's names), `pin_written_ignored_qualifiers` (a pin-written file
+hipp writes), `temp_views_feed_writes` (main and TEMP CTAS, temp
+INSERT over TEMP and main views), `auto_vacuum_file_is_not_written`
+(FULL and INCREMENTAL: refused writes leave the file byte-identical,
+then the conversion). `hipp-cli/tests/cli_v16_gaps.rs`:
+`review_fixes`, byte-identical one-shot and over stdin.
+
+**Honest gaps (still open):**
+
+- Every write to an auto-vacuum file is refused, header-only ones
+  (`PRAGMA user_version`) included, which the pin performs; VACUUM
+  of such a file keeps its refusal unless `auto_vacuum = NONE` was
+  set first.
+- `PRAGMA table_info` of a TEMP view over main tables still fails
+  (above).
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

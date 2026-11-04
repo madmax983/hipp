@@ -22,6 +22,8 @@ pub mod btree;
 pub mod error;
 #[cfg(feature = "v16")]
 pub mod func;
+#[cfg(feature = "json")]
+pub mod json;
 #[cfg(feature = "math")]
 pub mod math;
 pub mod pager;
@@ -35,8 +37,16 @@ pub mod session;
 pub mod sql;
 #[allow(unsafe_code)] // no-op waker construction for block_on only
 pub mod storage;
+#[cfg(feature = "utf16")]
+pub mod utf16;
+#[cfg(feature = "wal")]
+pub mod wal;
 #[cfg(feature = "window")]
 pub mod window;
+#[cfg(feature = "without_rowid")]
+pub mod wr;
+#[cfg(feature = "expr_index")]
+pub mod xplan;
 
 pub use error::{Error, SchemaKind, Scope};
 pub use record::{OwnedValue, Value};
