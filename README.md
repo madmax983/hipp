@@ -592,15 +592,17 @@ aspirations.
   index's entry count included), REINDEX, VACUUM, ANALYZE and ALTER
   TABLE RENAME / RENAME COLUMN / DROP COLUMN as the pin; files the
   pin made with such indexes are read and written. The planner reads
-  equality, IN, range, IS NULL and OR-of-equality terms (and ORDER
-  BY / GROUP BY / DISTINCT) through the rowid, PRIMARY KEY, UNIQUE,
+  equality, IN (list or `IN (SELECT ...)`), range, IS NULL and
+  OR-of-equality terms (and ORDER BY / GROUP BY / DISTINCT, NULLS
+  FIRST / LAST included) through the rowid, PRIMARY KEY, UNIQUE,
   ordinary, partial and expression indexes in SELECT, subqueries,
   joins (lookups per outer row), UPDATE and DELETE, choosing the
   index the pin's cost model chooses without statistics, so rows
   come in the pin's order (covering index scans, ORDER BY ties in
   the index's direction, GROUP BY over a DESC index, an UPDATE OR
   FAIL's partial work). A point lookup in a 100,000-row table reads
-  a few pages instead of the table. Without the leaf such indexes in
+  a few pages instead of the table, and a covering index's rows
+  come from its entries without table lookups. Without the leaf such indexes in
   a file are refused for writes (never left stale) and scans read
   rowid order. Tiny unchanged, full −16 B, max +32.3 KB (STATUS.md).
 - **WITHOUT ROWID tables** (new leaf feature `without_rowid`, in

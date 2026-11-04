@@ -741,6 +741,182 @@ fn regressions() {
     agree("regress", &stmts, &ordered);
 }
 
+/// Review fixes (v0.16), each pinned: `x IN (SELECT ...)` probes an
+/// index in the subquery's sorted key order (the pin's ephemeral IN
+/// table), NOT BETWEEN / NOT IN (SELECT) do not imply a partial
+/// index's `IS NOT NULL`, a commuted comparison (`0 < b`) implies the
+/// WHERE `b > 0`, and an ORDER BY whose NULLs the index puts at the
+/// other end is the pin's two-pass WHERE_BIGNULL_SORT scan.
+#[test]
+fn review_regressions() {
+    let stmts = lines(
+        "CREATE TABLE t(a);
+         CREATE INDEX i ON t(a);
+         INSERT INTO t VALUES (1), (2), ('1'), ('a'), (3), (1.5);
+         CREATE TABLE s(x);
+         INSERT INTO s VALUES (3), ('a'), (1), (2), ('1'), (NULL);
+         SELECT rowid, a FROM t WHERE a IN (SELECT x FROM s);
+         SELECT rowid, a FROM t WHERE a IN (SELECT x FROM s ORDER BY x DESC);
+         SELECT rowid, a FROM t WHERE a IN (SELECT x FROM s) ORDER BY a DESC;
+         SELECT rowid, a FROM t WHERE rowid IN (SELECT x FROM s);
+         SELECT rowid, a FROM t WHERE a NOT IN (SELECT x FROM s WHERE x IS NOT NULL);
+         SELECT count(*) FROM t WHERE a IN (SELECT x FROM s WHERE x > 1);
+         SELECT rowid FROM t WHERE a IN (SELECT x FROM s WHERE x = t.a);
+         CREATE TABLE u(b TEXT);
+         CREATE INDEX iu ON u(lower(b) DESC);
+         INSERT INTO u VALUES ('A'), ('b'), ('C'), ('b');
+         CREATE TABLE s2(x);
+         INSERT INTO s2 VALUES ('c'), ('b'), ('a');
+         SELECT rowid, b FROM u WHERE lower(b) IN (SELECT x FROM s2);
+         CREATE TABLE p(a, b, c);
+         CREATE INDEX p2 ON p(b DESC) WHERE a IS NOT NULL;
+         INSERT INTO p VALUES (1,1,1), (1,2,2), (2,NULL,3), (NULL,1,4), (3,3,5), (2,2,6), (1.5,'x',7), ('a',x'01',8), (NULL,NULL,9);
+         SELECT c FROM p WHERE a NOT BETWEEN 1 AND 2;
+         SELECT c FROM p WHERE a NOT IN (SELECT 1);
+         SELECT c FROM p WHERE a BETWEEN 1 AND 2;
+         SELECT c FROM p WHERE a IN (SELECT 1);
+         CREATE TABLE q(a, b, c);
+         CREATE INDEX q1 ON q(a) WHERE b > 0;
+         CREATE INDEX q2 ON q(c) WHERE b IS NOT NULL;
+         INSERT INTO q VALUES (1,1,1), (1,0,2), (1,NULL,3), (2,5,6), (2,-1,7), (1,1,NULL), (3,'x',1.5), (1,x'00',9);
+         SELECT rowid FROM q WHERE a = 1 AND 0 < b;
+         SELECT rowid FROM q WHERE a = 1 AND b > 0;
+         CREATE TABLE v(a, b, c);
+         CREATE INDEX v1 ON v(a DESC, b);
+         INSERT INTO v VALUES (1,1,1), (1,2,2), (2,NULL,3), (NULL,1,4), (3,3,5), (2,2,6), (1.5,'x',7), ('a',x'01',8), (NULL,NULL,9);
+         SELECT c FROM v ORDER BY a NULLS LAST;
+         SELECT c FROM v ORDER BY a DESC NULLS FIRST;
+         SELECT c FROM v ORDER BY a NULLS LAST, b;
+         SELECT c FROM v ORDER BY a DESC NULLS FIRST LIMIT 3;
+         CREATE TABLE w(x, a, c);
+         CREATE INDEX w1 ON w(x, a DESC);
+         INSERT INTO w VALUES (1,1,1), (1,2,2), (1,NULL,3), (2,NULL,4), (1,3,5), (2,2,6), (1,1.5,7), (2,'a',8), (1,NULL,9), (2,1,10);
+         SELECT c FROM w WHERE x = 1 ORDER BY a NULLS LAST;
+         SELECT c FROM w WHERE x IN (2, 1) ORDER BY x, a NULLS LAST;
+         SELECT c FROM w WHERE x IN (2, 1) ORDER BY x DESC, a DESC NULLS FIRST;
+         SELECT c FROM w ORDER BY x, a NULLS LAST
+         -- UPDATE / DELETE probe an index with an uncorrelated IN
+         -- (SELECT ...), evaluated on a row of the table's width (a
+         -- probe on the bare empty row read the subquery's columns
+         -- from the wrong slots and found nothing).
+         CREATE TABLE wt(a, b REAL);
+         CREATE INDEX wti ON wt(a);
+         CREATE TABLE ws(x);
+         INSERT INTO ws VALUES (3), (4);
+         INSERT INTO wt VALUES (3, 5), (4, 6), (5, 7), (4, 8);
+         DELETE FROM wt WHERE a IN (SELECT x FROM ws WHERE x = 3) RETURNING b;
+         UPDATE wt SET b = b + 1 WHERE a IN (SELECT x FROM ws) RETURNING b;
+         UPDATE wt SET b = b + 1 WHERE a IN (SELECT a FROM wt WHERE a > 4) RETURNING b;
+         DELETE FROM wt WHERE a IN (SELECT a + 1 FROM wt) RETURNING b;
+         SELECT * FROM wt",
+    );
+    agree("review", &stmts, &ordered);
+}
+
+/// Review fixes, generated (xorshift PRNG): IN (SELECT ...) on plain,
+/// expression and rowid keys, NOT BETWEEN / NOT IN and commuted
+/// comparisons against partial indexes, NULLS FIRST / LAST over ASC
+/// and DESC indexes — rows and row order agree with the pin.
+#[test]
+fn generated_review() {
+    let n = corpus_size(150);
+    let mut r = Rng(0x7e71_e3ed_2026_1104);
+    let cols = ["a", "b", "c"];
+    for case in 0..n {
+        let mut s: Vec<String> = Vec::new();
+        let mut defs: Vec<String> = Vec::new();
+        for c in cols {
+            defs.push(format!(
+                "{c} {}",
+                r.pick(&["", "INTEGER", "TEXT", "REAL", "NUMERIC"])
+            ));
+        }
+        s.push(format!("CREATE TABLE t({})", defs.join(", ")));
+        s.push("CREATE TABLE s(x)".into());
+        for i in 0..1 + r.below(3) {
+            let k = 1 + r.below(2) as usize;
+            let mut items = Vec::new();
+            for _ in 0..k {
+                let c = r.pick(&cols);
+                items.push(match r.below(8) {
+                    0 => format!("{c} + 1"),
+                    1 => format!("lower({c})"),
+                    _ => format!("{c}{}", r.pick(&["", " DESC", " DESC"])),
+                });
+            }
+            let w = match r.below(5) {
+                0 => format!(" WHERE {} IS NOT NULL", r.pick(&cols)),
+                1 => format!(" WHERE {} > 0", r.pick(&cols)),
+                _ => String::new(),
+            };
+            s.push(format!("CREATE INDEX i{i} ON t({}){w}", items.join(", ")));
+        }
+        for _ in 0..r.below(20) {
+            let v: Vec<String> = (0..3).map(|_| gen_val(&mut r, true)).collect();
+            s.push(format!("INSERT INTO t VALUES ({})", v.join(", ")));
+        }
+        for _ in 0..r.below(6) {
+            s.push(format!("INSERT INTO s VALUES ({})", gen_val(&mut r, true)));
+        }
+        for _ in 0..6 {
+            let c = r.pick(&cols);
+            let c2 = r.pick(&cols);
+            let sel = r.pick(&["*", "rowid", "a", "rowid, b", c]);
+            let v1 = gen_val(&mut r, false);
+            let v2 = gen_val(&mut r, false);
+            let w = match r.below(12) {
+                0 | 1 => format!("{c} IN (SELECT x FROM s)"),
+                2 => format!("lower({c}) IN (SELECT x FROM s)"),
+                3 => format!("{c} + 1 IN (SELECT x FROM s WHERE x IS NOT NULL)"),
+                4 => "rowid IN (SELECT x FROM s)".into(),
+                5 => format!("{c} NOT BETWEEN {v1} AND {v2}"),
+                6 => format!("{c} NOT IN (SELECT x FROM s)"),
+                7 => format!("{v1} < {c}"),
+                8 => format!("{c} = {v1} AND 0 < {c2}"),
+                9 => format!("{c2} IN (SELECT x FROM s) AND {c} > {v1}"),
+                _ => "1".into(),
+            };
+            let ob = match r.below(6) {
+                0 | 1 => format!(
+                    " ORDER BY {}{}",
+                    r.pick(&cols),
+                    r.pick(&[
+                        " NULLS LAST",
+                        " DESC NULLS FIRST",
+                        " NULLS FIRST",
+                        " DESC NULLS LAST"
+                    ])
+                ),
+                2 => format!(
+                    " ORDER BY {}{}, {}",
+                    r.pick(&cols),
+                    r.pick(&[" NULLS LAST", " DESC NULLS FIRST"]),
+                    r.pick(&cols)
+                ),
+                _ => String::new(),
+            };
+            s.push(format!("SELECT {sel} FROM t WHERE {w}{ob}"));
+        }
+        // Writes probing with an IN subquery (rowid order, RETURNING).
+        let c = r.pick(&cols);
+        match r.below(3) {
+            0 => s.push(format!(
+                "UPDATE t SET {} = {} WHERE {c} IN (SELECT x FROM s) RETURNING rowid, *",
+                r.pick(&cols),
+                gen_val(&mut r, false)
+            )),
+            1 => s.push(format!(
+                "DELETE FROM t WHERE lower({c}) IN (SELECT x FROM s) RETURNING *"
+            )),
+            _ => s.push(format!(
+                "DELETE FROM t WHERE {c} IN (SELECT {c} FROM t WHERE {c} > 1) RETURNING rowid"
+            )),
+        }
+        s.push("SELECT rowid, * FROM t".into());
+        agree(&format!("genr{case}"), &s, &ordered);
+    }
+}
+
 // --------------------------------------------------------- generated
 
 fn gen_val(r: &mut Rng, blobs: bool) -> String {

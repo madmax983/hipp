@@ -383,6 +383,24 @@ fn rowid_bound(v: &OwnedValue, lower: bool, incl: bool) -> Rb {
     }
 }
 
+/// Range bounds on the rowid as `(from, to)` rowids (`None`: open);
+/// `None` when no rowid satisfies them.
+fn rowid_span(
+    lo: &Option<(OwnedValue, bool)>,
+    hi: &Option<(OwnedValue, bool)>,
+) -> Option<(Option<i64>, Option<i64>)> {
+    let rb = |b: &Option<(OwnedValue, bool)>, lower: bool| match b {
+        None => Rb::All,
+        Some((v, incl)) => rowid_bound(v, lower, *incl),
+    };
+    let at = |b: Rb| match b {
+        Rb::At(x) => Some(Some(x)),
+        Rb::All => Some(None),
+        Rb::Empty => None,
+    };
+    Some((at(rb(lo, true))?, at(rb(hi, false))?))
+}
+
 /// A probe value as an exact rowid (v0.16).
 fn rowid_eq(v: &OwnedValue) -> Option<i64> {
     match v {
@@ -402,8 +420,64 @@ impl<'c, S: Storage> Statement<'c, S> {
         acc: &crate::xplan::IdxAccess,
         row: &RowData,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
-        let rowids = self.access_rowids(sp.root, acc, row).await?;
         let mut out = AVec::new();
+        // The rowid B-tree walked over a range (v0.16 review fix):
+        // its rows as the walk meets them, not re-sought by rowid.
+        if acc.root == 0 && acc.eq.is_empty() {
+            let (Some(lo), Some(hi)) = (
+                self.bound_val(&acc.lo, row).await?,
+                self.bound_val(&acc.hi, row).await?,
+            ) else {
+                return Ok(out);
+            };
+            let Some((lo_r, hi_r)) = rowid_span(&lo, &hi) else {
+                return Ok(out);
+            };
+            let mut cur = match lo_r {
+                Some(m) => btree::ScanCursor::from_rowid(sp.root, m),
+                None => btree::ScanCursor::new(sp.root),
+            };
+            let mut buf = AVec::new();
+            while let Some(r) = cur.next_row_into(&mut self.conn.pager, &mut buf).await? {
+                if hi_r.is_some_and(|h| r > h) {
+                    break;
+                }
+                out.push((source_row::<S::Error>(sp, r, buf.as_slice())?, Some(r)));
+            }
+            if acc.reverse {
+                out.as_mut_slice().reverse();
+            }
+            return Ok(out);
+        }
+        // A covering index (v0.16 review fix): the rows come from its
+        // entries — the key columns the query reads, every other
+        // column NULL — with no table lookup.
+        if let Some(cover) = &acc.cover {
+            let mut ents: AVec<AVec<OwnedValue>> = AVec::new();
+            let rowids = self.access_walk(sp.root, acc, row, Some(&mut ents)).await?;
+            for (rowid, e) in rowids.iter().zip(ents.iter()) {
+                let mut rec: AVec<OwnedValue> = AVec::new();
+                for _ in 0..sp.ncols {
+                    rec.push(OwnedValue::Null);
+                }
+                for (j, c) in cover.iter().enumerate() {
+                    if let (Some(c), Some(v)) = (c, e.as_slice().get(j))
+                        && let Some(slot) = rec.as_mut_slice().get_mut(*c)
+                    {
+                        *slot = v.clone();
+                    }
+                }
+                let rd = crate::rules::eval_row(
+                    sp.rowid_alias,
+                    sp.affs.as_slice(),
+                    rec.as_slice(),
+                    *rowid,
+                );
+                out.push((rd.vals, Some(*rowid)));
+            }
+            return Ok(out);
+        }
+        let rowids = self.access_rowids(sp.root, acc, row).await?;
         for rowid in rowids.iter() {
             if let Some(p) = btree::seek_rowid(&mut self.conn.pager, sp.root, *rowid).await? {
                 out.push((
@@ -432,6 +506,31 @@ impl<'c, S: Storage> Statement<'c, S> {
                 continue;
             }
             vals.push(v);
+        }
+        // An IN subquery (v0.16 review fix): its values, computed
+        // once per statement when uncorrelated (`sub_value_for`).
+        if let Some(e) = &p.sub {
+            let mut kinds: AVec<crate::query::SubKind<'_>> = AVec::new();
+            crate::query::collect_subs(e, &mut kinds);
+            for k in kinds.iter() {
+                match self.sub_value_for(k, row).await? {
+                    crate::query::SubValue::Many(vs, _) => {
+                        for v in vs.iter() {
+                            let v = crate::query::probe_value(v.clone(), p.aff);
+                            if !matches!(v, OwnedValue::Null) {
+                                vals.push(v);
+                            }
+                        }
+                    }
+                    crate::query::SubValue::One(v, _) => {
+                        let v = crate::query::probe_value(v, p.aff);
+                        if !matches!(v, OwnedValue::Null) {
+                            vals.push(v);
+                        }
+                    }
+                    crate::query::SubValue::Fail(kind) => return Err(Error::Schema { kind }),
+                }
+            }
         }
         if p.is_in {
             vals.as_mut_slice()
@@ -480,6 +579,18 @@ impl<'c, S: Storage> Statement<'c, S> {
         acc: &crate::xplan::IdxAccess,
         row: &RowData,
     ) -> Result<AVec<i64>, S::Error> {
+        self.access_walk(table_root, acc, row, None).await
+    }
+
+    /// `access_rowids`, also keeping each index entry's values in
+    /// `ents` (in step with the rowids) when given.
+    async fn access_walk(
+        &mut self,
+        table_root: u32,
+        acc: &crate::xplan::IdxAccess,
+        row: &RowData,
+        mut ents: Option<&mut AVec<AVec<OwnedValue>>>,
+    ) -> Result<AVec<i64>, S::Error> {
         use crate::record::compare_coll;
         use core::cmp::Ordering;
         let mut out: AVec<i64> = AVec::new();
@@ -514,21 +625,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
                 return Ok(out);
             }
-            let rb = |b: &Option<(OwnedValue, bool)>, lower: bool| match b {
-                None => Rb::All,
-                Some((v, incl)) => rowid_bound(v, lower, *incl),
-            };
-            let (lo_b, hi_b) = (rb(&lo, true), rb(&hi, false));
-            if lo_b == Rb::Empty || hi_b == Rb::Empty {
+            let Some((lo_r, hi_r)) = rowid_span(&lo, &hi) else {
                 return Ok(out);
-            }
-            let lo_r = match lo_b {
-                Rb::At(x) => Some(x),
-                _ => None,
-            };
-            let hi_r = match hi_b {
-                Rb::At(x) => Some(x),
-                _ => None,
             };
             let mut cur = match lo_r {
                 Some(m) => btree::ScanCursor::from_rowid(table_root, m),
@@ -608,6 +706,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 (Rb::All, Rb::All)
             };
             let mut found: AVec<i64> = AVec::new();
+            let ents_from = ents.as_deref().map_or(0, |es| es.len());
+            let mut nulls: AVec<bool> = AVec::new();
             let none_left = lo_r == Rb::Empty || hi_r == Rb::Empty;
             loop {
                 if none_left {
@@ -675,9 +775,56 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
                 found.push(rowid);
+                if let Some((f, _)) = acc.bignull {
+                    nulls.push(matches!(vals.get(f), Some(OwnedValue::Null)));
+                }
+                if let Some(es) = ents.as_deref_mut() {
+                    es.push(e.values);
+                }
             }
             if acc.reverse {
                 found.as_mut_slice().reverse();
+                nulls.as_mut_slice().reverse();
+                if let Some(tail) = ents
+                    .as_deref_mut()
+                    .and_then(|es| es.as_mut_slice().get_mut(ents_from..))
+                {
+                    tail.reverse();
+                }
+            }
+            // The pin's WHERE_BIGNULL_SORT: its second pass reads the
+            // NULL keys, put where the ORDER BY wants them.
+            if let Some((_, first)) = acc.bignull {
+                let order = |want_null: bool| {
+                    nulls
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, n)| **n == want_null)
+                        .map(|(i, _)| i)
+                };
+                let mut perm: AVec<usize> = AVec::new();
+                for i in order(first).chain(order(!first)) {
+                    perm.push(i);
+                }
+                let mut f2: AVec<i64> = AVec::new();
+                for i in perm.iter() {
+                    if let Some(r) = found.as_slice().get(*i) {
+                        f2.push(*r);
+                    }
+                }
+                found = f2;
+                if let Some(es) = ents.as_deref_mut() {
+                    let mut moved: AVec<AVec<OwnedValue>> = AVec::new();
+                    for i in perm.iter() {
+                        if let Some(e) = es.as_mut_slice().get_mut(ents_from + *i) {
+                            moved.push(core::mem::take(e));
+                        }
+                    }
+                    es.truncate(ents_from);
+                    for e in moved.as_mut_slice() {
+                        es.push(core::mem::take(e));
+                    }
+                }
             }
             out.extend_from_slice(found.as_slice());
             // The next combination (the last list varies fastest).
@@ -726,7 +873,14 @@ fn core_reads(info: &CoreInfo<'_>, sources: &[SourcePlan], slot: usize) -> bool 
         || info.group_by.iter().any(f)
         || info.having.is_some_and(f)
         || info.order_by.iter().any(|(e, _)| f(e))
-        || sources.iter().any(|s| s.on.as_ref().is_some_and(f))
+        || sources.iter().any(|s| {
+            s.on.as_ref().is_some_and(f)
+                // A table-valued source's arguments (v0.16 review
+                // fix: they live in its placeholder plan).
+                || s.derived
+                    .as_ref()
+                    .is_some_and(|d| crate::query::plan_refs_range(d, &r))
+        })
 }
 
 impl<S: Storage> Connection<S> {
@@ -988,7 +1142,23 @@ impl<S: Storage> Connection<S> {
                 indexes: models.as_slice(),
                 wr: !t.has_rowid(),
             };
-            if let Some(a) = choose(&q, &s, &tab, ts.as_slice()) {
+            if let Some(mut a) = choose(&q, &s, &tab, ts.as_slice()) {
+                // A covering index of a rowid table: the rows come
+                // from its entries (v0.16 review fix).
+                if t.has_rowid()
+                    && a.root != 0
+                    && let Some(m) = models.iter().find(|m| m.root == a.root)
+                    && m.covers(needed.as_slice())
+                {
+                    let mut map: AVec<Option<usize>> = AVec::new();
+                    for k in m.keys.iter() {
+                        map.push(match k {
+                            crate::xplan::IdxKey::Col(c) => Some(*c),
+                            _ => None,
+                        });
+                    }
+                    a.cover = Some(map);
+                }
                 plans.push((i, a));
             }
         }
@@ -1049,6 +1219,15 @@ impl<S: Storage> Connection<S> {
             s: (0, usize::MAX),
         };
         let avail = |e: &RExpr| -> Option<bool> {
+            // An uncorrelated `IN (SELECT ...)` (v0.16 review fix):
+            // its values are computed once, before the first write.
+            if let RExpr::InSub(_, p, _) = e
+                && p.uncorrelated
+                && p.id != 0
+                && !update.as_ref().is_some_and(|u| u.from)
+            {
+                return Some(false);
+            }
             if expr_refs_range(e, &all)
                 || crate::query::any_scalar(e, &crate::query::ScalarFn::nondeterministic)
             {

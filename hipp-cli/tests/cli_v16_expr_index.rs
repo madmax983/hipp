@@ -155,6 +155,32 @@ UPDATE u SET v = v + 10 WHERE w > 1;
 SELECT * FROM u;
 "#;
 
+/// Review fixes: IN (SELECT ...) probes in the subquery's key order,
+/// NOT BETWEEN / NOT IN against a partial index, a commuted `0 < b`,
+/// and NULLS FIRST / LAST over a DESC index (the pin's two-pass scan).
+const REVIEW: &str = r#"
+CREATE TABLE t(a, b REAL);
+CREATE INDEX i ON t(a);
+INSERT INTO t VALUES (1, 1), (2, 2.5), ('1', NULL), ('a', 4), (3, 5), (1.5, 6);
+CREATE TABLE s(x);
+INSERT INTO s VALUES (3), ('a'), (1), (2), ('1'), (NULL);
+SELECT rowid, a, b FROM t WHERE a IN (SELECT x FROM s);
+SELECT a, b FROM t WHERE rowid IN (SELECT x FROM s);
+DELETE FROM t WHERE a IN (SELECT x FROM s WHERE x = 3) RETURNING b;
+CREATE TABLE p(a, b, c);
+CREATE INDEX p2 ON p(b DESC) WHERE a IS NOT NULL;
+CREATE INDEX p3 ON p(c) WHERE b > 0;
+INSERT INTO p VALUES (1, 1, 1), (1, 2, 2), (2, NULL, 3), (NULL, 1, 4), (3, 3, 5), (2, 2, 6), (1.5, 'x', 7), ('a', x'01', 8), (NULL, NULL, 9);
+SELECT c FROM p WHERE a NOT BETWEEN 1 AND 2;
+SELECT c FROM p WHERE a NOT IN (SELECT 1);
+SELECT c FROM p WHERE c > 2 AND 0 < b;
+CREATE TABLE v(a, b, c);
+CREATE INDEX v1 ON v(a DESC, b);
+INSERT INTO v SELECT a, b, c FROM p;
+SELECT a, b, c FROM v ORDER BY a NULLS LAST;
+SELECT a, b, c FROM v ORDER BY a DESC NULLS FIRST;
+"#;
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -260,4 +286,9 @@ fn cli_v16_expr_index_order_byte_identical() {
 #[test]
 fn cli_v16_expr_index_corpus_byte_identical() {
     byte_identical("corpus", &corpus(0x5eed_0016_e1d0_0001, 40));
+}
+
+#[test]
+fn cli_v16_expr_index_review_byte_identical() {
+    byte_identical("review", REVIEW);
 }

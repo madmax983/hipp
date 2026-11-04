@@ -8741,7 +8741,15 @@ impl<'c, S: Storage> Statement<'c, S> {
                 access: Some(acc), ..
             } => {
                 let acc = acc.clone();
-                let mut ids = self.access_rowids(root, &acc, &RowData::empty()).await?;
+                // The probes evaluate on a NULL row of the table's
+                // width, where a subquery in them finds its own slots
+                // (v0.16 review fix).
+                let mut padded = RowData::empty();
+                for _ in 0..ncols {
+                    padded.vals.push(OwnedValue::Null);
+                }
+                padded.rowids.push(None);
+                let mut ids = self.access_rowids(root, &acc, &padded).await?;
                 if !acc.one_pass {
                     ids.as_mut_slice().sort_unstable();
                     // A WITHOUT ROWID table's two-pass write visits

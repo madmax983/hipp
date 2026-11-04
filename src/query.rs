@@ -3769,6 +3769,25 @@ fn in_sub_lhs(x: &RExpr, plan: &SubPlan, sx: RExpr) -> RExpr {
     RExpr::Collate(Box::new(sx), coll)
 }
 
+/// The collation `x IN (SELECT ...)` compares under (v0.16 review
+/// fix, `expr_index`: an index probe's): the pin's binary-comparison
+/// rule over `x` and the (rightmost core's) first result item, as
+/// `in_sub_lhs` applies it.
+#[cfg(feature = "expr_index")]
+pub(crate) fn in_sub_coll(x: &RExpr, plan: &SubPlan) -> Coll {
+    let core = plan.compound.as_slice().last().map_or(plan, |(_, t)| t);
+    let item = core.items.as_slice().first().or_else(|| {
+        core.values
+            .as_slice()
+            .first()
+            .and_then(|r| r.as_slice().first())
+    });
+    match item {
+        Some(i) => binary_coll(x, i),
+        None => expr_coll(x).unwrap_or_default(),
+    }
+}
+
 /// An IN subquery node after substitution: an `InList` (marked
 /// as substituted) of the subquery's values, with the left
 /// operand `sx` (the substituted `x`) carrying the membership

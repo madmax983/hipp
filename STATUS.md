@@ -5265,14 +5265,108 @@ model and the access-path executor (~25 KB).
   enforcement makes it rowid order; the pin only when the FK columns
   change) and detects constraint-level `ON CONFLICT REPLACE` by the
   table text.
-- `INDEXED BY` / `NOT INDEXED` are not parsed; a covering index scan
-  still reads each table row (by rowid) rather than the index entry.
+- `INDEXED BY` / `NOT INDEXED` are not parsed. (A covering index scan
+  read each table row by rowid; fixed by the review below for rowid
+  tables.)
 - An expression index's key value takes no affinity (the pin applies the
   expression's affinity, which only matters for a CAST to REAL of an
   integral value: equal keys either way).
 - Three-part names (`main.t.b`) are refused everywhere, so such a
   partial index WHERE written by the pin is a definition hipp cannot
   compute: writes to its table are refused.
+
+### Expression indexes and index-aware planning — review fixes (2026-11-04)
+
+Five review findings, each reproduced first against the live pin and
+the pre-fix build (debug builds, `select count(*) ...` over a
+10,000-row table with an index on `a`).
+
+**Fixed (regression tests in `tests/expr_index_v16.rs`:
+`review_regressions`, `generated_review`; CLI
+`cli_v16_expr_index_review_byte_identical`):**
+
+- **Index-driven reads slower than the scans they replaced** (medium).
+  The cause was not the subqueries: every row an access path found was
+  re-read through `btree::seek_rowid`, which copied each page on the
+  way down and parsed every cell of it, about 100 µs a row in a debug
+  build. That cost hit covering scans (`count(*)` now reads a narrower
+  index, as the pin does), rowid ranges, and any WHERE whose plan
+  changed to an index walk. Three fixes. `seek_rowid` now
+  binary-searches the borrowed frame and copies only the found cell's
+  payload, and bounds the descent depth so a cyclic file errors. It is
+  gated with the leaf (`expr_index`, whose plans seek per row), so
+  builds without it keep the old seek and tiny does not grow (the
+  ungated form measured +492 B tiny). A rowid
+  range streams its rows from the cursor instead of seeking them again.
+  A covering index builds its rows from the entries (the
+  `IdxAccess::cover` map, rowid tables only), so no table lookup
+  happens. To keep that safe, the planner's "columns read" now also
+  counts a table-valued source's arguments (`core_reads`). Measured
+  (debug, 10k rows; earlier figures are the pre-fix build):
+  `count(*) FROM t` 1.05 s → 0.026 s (the no-index table 0.024 s);
+  `WHERE exists (SELECT 1 FROM s WHERE x=7)` 1.13 s → 0.031 s;
+  `WHERE +a IN (SELECT x FROM s)` 1.11 s → 0.040 s; `WHERE rowid >
+  5000` 0.52 s → 0.034 s. An uncorrelated subquery was already
+  computed once per statement (`sub_value_for`'s hoist).
+- **`x IN (SELECT ...)` never used an index** (medium). It is now a
+  term (`xplan::TOp::InSub`) costed as the pin does (a subquery is
+  taken to return 25 rows, LogEst 46). The probe set is the
+  subquery's values, computed once when uncorrelated, converted by the
+  comparison affinity, and sorted and deduplicated under the IN
+  collation (`query::in_sub_coll`). Rows therefore come out in the
+  pin's ephemeral-table key order (ints, then text). This works on
+  plain, expression and rowid keys, in SELECT cores, lateral join
+  lookups, and UPDATE / DELETE targets (uncorrelated only, not
+  UPDATE ... FROM). `a IN (SELECT x FROM s)` over 10k rows went from
+  1.08 s to 0.009 s. One bug turned up while doing this: a write's
+  probes were evaluated on the bare empty row, so a subquery read its
+  own columns from the wrong slots and found nothing (`DELETE ...
+  WHERE a IN (SELECT x FROM s WHERE x = 3)` deleted nothing). The
+  probes now evaluate on a NULL row of the table's width.
+- **`NOT BETWEEN` / `NOT IN (SELECT ...)` implied a partial index's
+  `IS NOT NULL`** (low). The negation flag now acts as the pin's
+  `seenNot` in `exprImpliesNotNull`, so the pin's table scan and its
+  row order are kept.
+- **A commuted comparison did not imply a partial WHERE** (low).
+  `0 < b` now implies `b > 0`, as the pin's `exprAnalyze` commutes a
+  comparison whose right operand is a column (`xplan::implies1`).
+- **`ORDER BY x NULLS LAST` / `x DESC NULLS FIRST` over an index that
+  puts the NULLs at the other end** (low). The first ORDER BY column
+  after the equality columns is now delivered, as the pin's
+  `WHERE_BIGNULL_SORT` two-pass scan does. In each probe, the rows
+  whose key is NULL move to the requested end in scan order
+  (`IdxAccess::bignull`). Ties come out as on the pin.
+
+**Probing notes:** the pin probes `IN (SELECT ...)` once per sorted,
+deduplicated value (`SEARCH t USING COVERING INDEX i (a=?)`), for a DESC
+key column largest first. With `NULLS LAST` over `(a DESC, b)` it scans
+the index backwards and reads the NULL keys in a second pass. With
+`DESC NULLS FIRST` it reads them first. In both cases the scan
+direction within the NULLs holds. An equality prefix (`x = 1 ORDER BY a
+NULLS LAST` over `(x, a DESC)`) keeps the two-pass scan; on an IN prefix
+it runs per value.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed". The generated corpora agreed at
+`HIPP_EXPRIDX_CORPUS=1500`, except one `generated_queries` case
+(`genq1497`) that also differs on the pre-fix build. It is the known
+gap below.
+
+**Size:** tiny **76,924 B** (Δ **0**; the fast seek is gated with the
+leaf, see above). Full **489,268 B** (Δ **0**; `query::in_sub_coll` is
+leaf-only, so the IN-subquery collation helper `full` uses is
+unchanged). Max **704,360 B** (Δ **+4,884 B** vs 699,476, ratchet
+raised): the binary-search seek, row streaming and covering rows, the
+IN-subquery term and probe, the BIGNULL scan and the implication
+fixes.
+
+**Honest gaps (updated):** the covering-scan row lookup gap is closed
+for rowid tables (WITHOUT ROWID tables still read the row through
+their key). `IN (SELECT ...)` on a row value (`(a, b) IN (SELECT ...)`)
+and a correlated IN subquery in an UPDATE / DELETE WHERE are not
+probed; they are filtered over the scan, which gives the same rows in
+rowid order, as before. The partial-`x IS NOT NULL`-versus-index-on-`x`
+tie (about 1 in 1,000 generated cases, row order only) remains.
 
 ### WITHOUT ROWID tables (2026-11-04)
 

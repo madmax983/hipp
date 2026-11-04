@@ -701,6 +701,107 @@ pub async fn seek_max_rowid<S: Storage>(
     }
 }
 
+#[cfg(feature = "expr_index")]
+/// One level of `seek_rowid`.
+enum SeekStep {
+    Child(u32),
+    Missing,
+    Found {
+        local_off: usize,
+        local_len: usize,
+        payload_len: usize,
+        overflow: u32,
+    },
+}
+
+#[cfg(feature = "expr_index")]
+/// The rowid key of table-page cell `i` (and, on a leaf, the
+/// offset just past its varints and its payload length; on an
+/// interior page, its child).
+fn cell_key<E>(
+    bytes: &[u8],
+    h: &PageHead,
+    i: usize,
+    page: u32,
+    leaf: bool,
+) -> Result<(i64, usize, u64), E> {
+    let at = cell_ptr::<E>(bytes, h, i, page)?;
+    if leaf {
+        let c = bytes.get(at..).ok_or(Error::CorruptPage { page })?;
+        let (plen, n1) = decode_varint::<E>(c)?;
+        let (key, n2) = decode_varint::<E>(c.get(n1..).ok_or(Error::CorruptPage { page })?)?;
+        Ok((key as i64, at + n1 + n2, plen))
+    } else {
+        let child = bytes
+            .get(at..at.saturating_add(4))
+            .and_then(|c| <[u8; 4]>::try_from(c).ok())
+            .map(u32::from_be_bytes)
+            .ok_or(Error::CorruptPage { page })?;
+        let (key, _) = decode_varint::<E>(bytes.get(at + 4..).ok_or(Error::CorruptPage { page })?)?;
+        Ok((key as i64, 0, u64::from(child)))
+    }
+}
+
+#[cfg(feature = "expr_index")]
+fn seek_step<E>(bytes: &[u8], page: u32, usable: usize, rowid: i64) -> Result<SeekStep, E> {
+    let h = head::<E>(bytes, page)?;
+    let leaf = h.is_leaf();
+    if h.kind
+        != (if leaf {
+            KIND_LEAF_TABLE
+        } else {
+            KIND_INTERIOR_TABLE
+        })
+    {
+        return Err(Error::Unsupported);
+    }
+    // The first cell whose key is >= rowid.
+    let (mut lo, mut hi) = (0usize, usize::from(h.ncell));
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (k, ..) = cell_key::<E>(bytes, &h, mid, page, leaf)?;
+        if k < rowid {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if !leaf {
+        if lo >= usize::from(h.ncell) {
+            return Ok(SeekStep::Child(h.rightmost));
+        }
+        let (_, _, child) = cell_key::<E>(bytes, &h, lo, page, false)?;
+        return Ok(SeekStep::Child(child as u32));
+    }
+    if lo >= usize::from(h.ncell) {
+        return Ok(SeekStep::Missing);
+    }
+    let (k, start, plen) = cell_key::<E>(bytes, &h, lo, page, true)?;
+    if k != rowid {
+        return Ok(SeekStep::Missing);
+    }
+    let plen = usize::try_from(plen).map_err(|_| Error::CorruptPage { page })?;
+    let local = table_leaf_local(usable, plen);
+    let end = start
+        .checked_add(local)
+        .ok_or(Error::CorruptPage { page })?;
+    let overflow = if plen > local {
+        bytes
+            .get(end..end.saturating_add(4))
+            .and_then(|c| <[u8; 4]>::try_from(c).ok())
+            .map(u32::from_be_bytes)
+            .ok_or(Error::CorruptPage { page })?
+    } else {
+        0
+    };
+    Ok(SeekStep::Found {
+        local_off: start,
+        local_len: local,
+        payload_len: plen,
+        overflow,
+    })
+}
+
 /// Find one row by rowid.
 pub async fn seek_rowid<S: Storage>(
     pager: &mut Pager<S>,
@@ -712,37 +813,87 @@ pub async fn seek_rowid<S: Storage>(
     if let Some(t) = pager.wr.table_of(root) {
         return crate::wr::seek(pager, t, rowid).await;
     }
-    let usable = pager.usable() as usize;
-    let mut page = root;
-    loop {
-        let idx = pager.load(page).await?;
-        let snap = copy_bytes(pager.frame_data(idx));
-        let h = head::<S::Error>(snap.as_slice(), page)?;
-        if h.is_leaf() {
-            if h.kind != KIND_LEAF_TABLE {
-                return Err(Error::Unsupported);
+    // v0.16 review fix (`expr_index`): index-driven plans seek once
+    // per row they find, so the leaf seeks by binary search.
+    #[cfg(feature = "expr_index")]
+    return seek_rowid_fast(pager, root, rowid).await;
+    #[cfg(not(feature = "expr_index"))]
+    {
+        let usable = pager.usable() as usize;
+        let mut page = root;
+        loop {
+            let idx = pager.load(page).await?;
+            let snap = copy_bytes(pager.frame_data(idx));
+            let h = head::<S::Error>(snap.as_slice(), page)?;
+            if h.is_leaf() {
+                if h.kind != KIND_LEAF_TABLE {
+                    return Err(Error::Unsupported);
+                }
+                let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+                for c in cells.iter() {
+                    if c.rowid == rowid {
+                        let local = copy_bytes(c.local_bytes());
+                        return Ok(Some(
+                            assemble_payload(pager, local.as_slice(), c.payload_len, c.overflow)
+                                .await?,
+                        ));
+                    }
+                }
+                return Ok(None);
             }
-            let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
-            for c in cells.iter() {
-                if c.rowid == rowid {
-                    let local = copy_bytes(c.local_bytes());
-                    return Ok(Some(
-                        assemble_payload(pager, local.as_slice(), c.payload_len, c.overflow)
-                            .await?,
-                    ));
+            let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
+            let mut child = rightmost;
+            for (c, k) in pairs.iter() {
+                if rowid <= *k {
+                    child = *c;
+                    break;
                 }
             }
-            return Ok(None);
+            page = child;
         }
-        let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
-        let mut child = rightmost;
-        for (c, k) in pairs.iter() {
-            if rowid <= *k {
-                child = *c;
-                break;
+    }
+}
+/// `seek_rowid` by binary search over the borrowed frame (v0.16
+/// review fix, `expr_index`): no page snapshot and no per-cell parse,
+/// only the found cell's payload copied; the descent depth is bounded,
+/// so a cyclic file errors.
+#[cfg(feature = "expr_index")]
+async fn seek_rowid_fast<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    rowid: i64,
+) -> Result<Option<AVec<u8>>, S::Error> {
+    let usable = pager.usable() as usize;
+    let mut page = root;
+    let mut hops = 0u32;
+    loop {
+        hops = hops.saturating_add(1);
+        if hops > 64 {
+            return Err(Error::CorruptPage { page });
+        }
+        let idx = pager.load(page).await?;
+        let step = seek_step::<S::Error>(pager.frame_data(idx), page, usable, rowid)?;
+        match step {
+            SeekStep::Child(c) => page = c,
+            SeekStep::Missing => return Ok(None),
+            SeekStep::Found {
+                local_off,
+                local_len,
+                payload_len,
+                overflow,
+            } => {
+                let local = {
+                    let d = pager.frame_data(idx);
+                    let end = local_off
+                        .checked_add(local_len)
+                        .ok_or(Error::CorruptPage { page })?;
+                    copy_bytes(d.get(local_off..end).ok_or(Error::CorruptPage { page })?)
+                };
+                return Ok(Some(
+                    assemble_payload(pager, local.as_slice(), payload_len, overflow).await?,
+                ));
             }
         }
-        page = child;
     }
 }
 

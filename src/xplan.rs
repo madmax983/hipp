@@ -181,6 +181,10 @@ pub enum TOp {
     /// `IS` (a NULL value finds NULL keys).
     Is,
     In(AVec<RExpr>),
+    /// `x IN (SELECT ...)` (v0.16 review fix): the subquery node with
+    /// a NULL left operand, evaluated (once, when uncorrelated) into
+    /// the probe values.
+    InSub(RExpr),
     Lt,
     Le,
     Gt,
@@ -211,7 +215,7 @@ pub struct Term {
 
 impl Term {
     fn is_eq(&self) -> bool {
-        matches!(self.op, TOp::Eq | TOp::Is | TOp::In(_))
+        matches!(self.op, TOp::Eq | TOp::Is | TOp::In(_) | TOp::InSub(_))
     }
     fn lower(&self) -> bool {
         matches!(self.op, TOp::Gt | TOp::Ge)
@@ -387,6 +391,42 @@ fn add_terms(
                 vnull: false,
             });
         }
+        // `x IN (SELECT ...)` (v0.16 review fix): probed with the
+        // subquery's values, as the pin's ephemeral IN table.
+        RExpr::InSub(x, plan, false) => {
+            let key = strip(x);
+            if plan.width() != 1
+                || matches!(key, RExpr::Scalar(crate::query::ScalarFn::Vector, _))
+                || !s.reads(key)
+            {
+                return;
+            }
+            let probe = RExpr::InSub(
+                alloc::boxed::Box::new(RExpr::Literal(crate::record::OwnedValue::Null)),
+                plan.clone(),
+                false,
+            );
+            let Some(lateral) = avail(&probe) else { return };
+            let rhs = RExpr::AffLiteral(
+                crate::record::OwnedValue::Null,
+                crate::query::result_affinity(plan),
+                None,
+            );
+            let Some(aff) = crate::query::index_probe_aff(x, &rhs) else {
+                return;
+            };
+            out.push(Term {
+                parent: ci,
+                key: key.clone(),
+                op: TOp::InSub(probe),
+                val: RExpr::Literal(crate::record::OwnedValue::Null),
+                coll: crate::query::in_sub_coll(x, plan),
+                aff,
+                lateral,
+                isnull: false,
+                vnull: false,
+            });
+        }
         RExpr::IsNull(x, false) => {
             let key = strip(x);
             if !s.reads(key) {
@@ -532,7 +572,7 @@ impl IdxModel {
     }
 
     /// Whether every column the query reads is a key column.
-    fn covers(&self, needed: &[bool]) -> bool {
+    pub fn covers(&self, needed: &[bool]) -> bool {
         self.covers_all
             || needed.iter().enumerate().all(|(c, n)| {
                 !*n || self
@@ -575,6 +615,34 @@ pub fn implies(conj: &[&RExpr], pred: &RExpr) -> bool {
 }
 
 fn implies1(c: &RExpr, p: &RExpr) -> bool {
+    if implies2(c, p) {
+        return true;
+    }
+    // The pin's `exprAnalyze` commutes a comparison whose right
+    // operand is a column (`0 < b` is the term `b > 0`; when both
+    // operands are columns it adds the commuted copy): either form
+    // may imply the WHERE (v0.16 review fix).
+    if let RExpr::Binary(op, l, r) = c
+        && matches!(
+            op,
+            BinOp::Eq | BinOp::Is | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        )
+        && matches!(strip(r), RExpr::Column(..) | RExpr::Rowid(_))
+    {
+        let fop = match op {
+            BinOp::Lt => BinOp::Gt,
+            BinOp::Le => BinOp::Ge,
+            BinOp::Gt => BinOp::Lt,
+            BinOp::Ge => BinOp::Le,
+            o => *o,
+        };
+        let commuted = RExpr::Binary(fop, r.clone(), l.clone());
+        return implies2(&commuted, p);
+    }
+    false
+}
+
+fn implies2(c: &RExpr, p: &RExpr) -> bool {
     if same_expr(c, p) {
         return true;
     }
@@ -600,13 +668,16 @@ fn not_null(c: &RExpr, x: &RExpr) -> bool {
         }
         match p {
             RExpr::InList(l, ..) => stack.push((l, true)),
-            RExpr::InSub(l, ..) => {
-                if !seen_not {
+            // `NOT IN (SELECT ...)` / `NOT BETWEEN` are the pin's
+            // TK_NOT over the operator, so `seen_not` holds there
+            // (v0.16 review fix: the negation was ignored).
+            RExpr::InSub(l, _, neg) => {
+                if !seen_not && !neg {
                     stack.push((l, true));
                 }
             }
-            RExpr::Between(l, a, b, _) => {
-                if !seen_not {
+            RExpr::Between(l, a, b, neg) => {
+                if !seen_not && !neg {
                     stack.push((l, true));
                     stack.push((b, true));
                     stack.push((a, true));
@@ -663,6 +734,10 @@ struct Loop {
     /// backwards for them.
     sorted: usize,
     reverse: bool,
+    /// The pin's `WHERE_BIGNULL_SORT`: an ORDER BY term wants its
+    /// NULLs where the index does not put them (`Some(nulls_first)`);
+    /// the loop moves the NULL-keyed rows to that end.
+    bignull: Option<bool>,
 }
 
 /// What the planner needs about the query around the source.
@@ -705,6 +780,9 @@ pub struct Table<'x> {
 pub struct Probe {
     pub vals: AVec<RExpr>,
     pub is_in: bool,
+    /// An IN subquery whose values are the probe set (v0.16 review
+    /// fix; `vals` is then empty).
+    pub sub: Option<RExpr>,
     /// `IS` semantics: a NULL value finds NULL keys.
     pub is: bool,
     pub aff: Option<Affinity>,
@@ -740,6 +818,14 @@ pub struct IdxAccess {
     /// The rows arrive in GROUP BY order: the groups are emitted as
     /// they arrive (a DESC index column: largest first), not sorted.
     pub groups: bool,
+    /// The index covers the query (v0.16 review fix): per entry
+    /// field, the table column it holds. The rows are built from the
+    /// entries, with no table lookup (set by the SELECT planner).
+    pub cover: Option<AVec<Option<usize>>>,
+    /// The pin's two-pass WHERE_BIGNULL_SORT scan (v0.16 review fix):
+    /// `(key field, nulls_first)` — each probe's rows with a NULL in
+    /// that key field move to the front (or back), in scan order.
+    pub bignull: Option<(usize, bool)>,
 }
 
 /// The pin's `whereSortingCost`.
@@ -766,7 +852,8 @@ fn sort_cost(q: &Query<'_>, n_row: i32, n_ob: usize, n_sorted: usize) -> i32 {
 
 /// Whether term `t` is an IN list.
 fn is_in(ts: &[Term], t: usize) -> bool {
-    ts.get(t).is_some_and(|t| matches!(t.op, TOp::In(_)))
+    ts.get(t)
+        .is_some_and(|t| matches!(t.op, TOp::In(_) | TOp::InSub(_)))
 }
 
 /// One column the loop delivers in order: the key, its direction.
@@ -789,10 +876,10 @@ fn order_sat(
     ts: &[Term],
     l: &Loop,
     in_eq: bool,
-) -> (usize, bool) {
+) -> (usize, bool, Option<bool>) {
     let n = q.order.len();
     if n == 0 {
-        return (0, false);
+        return (0, false, None);
     }
     // A loop that finds at most one row delivers any order.
     let one = |ix: Option<&IdxModel>| {
@@ -816,7 +903,7 @@ fn order_sat(
     };
     let ix = l.ix.and_then(|i| tab.indexes.get(i));
     if one(ix) {
-        return (n, false);
+        return (n, false, None);
     }
     // The delivered columns: the key columns (a single-value
     // equality column is constant; an IN column is walked in key
@@ -858,16 +945,18 @@ fn order_sat(
     let mut next = 0usize;
     let mut rev: Option<bool> = None;
     let mut sat = 0usize;
+    let mut bignull = None;
     for (e, o) in q.order.iter() {
         let e0 = strip(e);
         if constant(e0) {
             sat += 1;
             continue;
         }
-        // NULLs must come where the index puts them.
-        if !q.group && o.nulls_first == o.desc {
-            break;
-        }
+        // NULLs must come where the index puts them — except on the
+        // first column after the equality ones, which the pin's
+        // WHERE_BIGNULL_SORT loop reads in two passes (v0.16 review
+        // fix: hipp sorted instead, ties in another order).
+        let big = !q.group && o.nulls_first == o.desc;
         while cols.as_slice().get(next).is_some_and(|(_, k)| *k) {
             next += 1;
         }
@@ -900,6 +989,12 @@ fn order_sat(
             Some(p) if p != r => break,
             _ => {}
         }
+        if big {
+            if next != l.eq.len() {
+                break;
+            }
+            bignull = Some(o.nulls_first);
+        }
         sat += 1;
         let was_rowid = matches!(c, Ord::Rowid);
         next += 1;
@@ -909,7 +1004,7 @@ fn order_sat(
             break;
         }
     }
-    (sat.min(n), rev.unwrap_or(false))
+    (sat.min(n), rev.unwrap_or(false), bignull)
 }
 
 /// The pin's `whereLoopOutputAdjust` for one loop.
@@ -961,6 +1056,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
             out: adjust(q, s, ts, &[], ROWS, ROWS),
             sorted: 0,
             reverse: false,
+            bignull: None,
         });
         let a_rowid = [ROWS, 0];
         add_index(q, s, tab, ts, None, &a_rowid, tab.width, true, &mut loops);
@@ -1005,6 +1101,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
                 out: adjust(q, s, ts, &[], rsize, rsize),
                 sorted: 0,
                 reverse: false,
+                bignull: None,
             });
         }
         // A WITHOUT ROWID table's UPDATE / DELETE (v0.16): the pin
@@ -1029,9 +1126,10 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         loops = insert_loops(q, s, tab, ts, loops);
     }
     for l in loops.as_mut_slice() {
-        let (sorted, reverse) = order_sat(q, s, tab, ts, l, false);
+        let (sorted, reverse, bignull) = order_sat(q, s, tab, ts, l, false);
         l.sorted = sorted;
         l.reverse = reverse;
+        l.bignull = bignull;
     }
     // Pass 1: the cheapest loop; its rows estimate the sort.
     let mut best = 0usize;
@@ -1081,7 +1179,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         && !(l.ix.is_none() && !l.eq.is_empty())
         && l.eq.iter().any(|t| is_in(ts, *t))
     {
-        let (sat, rev) = order_sat(q, s, tab, ts, &l, true);
+        let (sat, rev, _) = order_sat(q, s, tab, ts, &l, true);
         if sat >= q.order.len() {
             reverse = rev;
         }
@@ -1106,6 +1204,11 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
     }
     let mut a = lower(s, tab, ts, &l, reverse);
     a.groups = groups;
+    // The NULL-keyed rows' column: the first after the equality ones
+    // (never the rowid, which is not NULL).
+    if l.ix.is_some() && l.eq.len() < a.desc.len() {
+        a.bignull = l.bignull.map(|f| (l.eq.len(), f));
+    }
     Some(a)
 }
 
@@ -1250,6 +1353,8 @@ fn add_index(
             if t.is_eq() {
                 let n_in = match &t.op {
                     TOp::In(items) => log_est(items.len() as u64),
+                    // The pin's tuning: a subquery returns 25 rows.
+                    TOp::InSub(_) => 46,
                     _ => 0,
                 };
                 let cur = a.get(k).copied().unwrap_or(rsize);
@@ -1273,6 +1378,7 @@ fn add_index(
                     out: o2,
                     sorted: 0,
                     reverse: false,
+                    bignull: None,
                 });
                 deeper.push((used, in_mul + n_in, out));
             } else if t.lower() {
@@ -1287,6 +1393,7 @@ fn add_index(
                     out: adjust(q, s, ts, used.as_slice(), rsize, lo_out + in_mul),
                     sorted: 0,
                     reverse: false,
+                    bignull: None,
                 });
                 // ... and with each upper bound on the same column.
                 for (ui, u) in ts.iter().enumerate() {
@@ -1304,6 +1411,7 @@ fn add_index(
                         out: adjust(q, s, ts, used.as_slice(), rsize, both + in_mul),
                         sorted: 0,
                         reverse: false,
+                        bignull: None,
                     });
                 }
             } else if t.upper() {
@@ -1318,6 +1426,7 @@ fn add_index(
                     out: adjust(q, s, ts, used.as_slice(), rsize, hi_out + in_mul),
                     sorted: 0,
                     reverse: false,
+                    bignull: None,
                 });
             }
         }
@@ -1358,17 +1467,19 @@ fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxA
     let mut eq = AVec::new();
     for t in l.eq.iter().filter_map(|i| ts.get(*i)) {
         lateral |= t.lateral;
-        let (vals, is_in) = match &t.op {
-            TOp::In(items) => (items.clone(), true),
+        let (vals, is_in, sub) = match &t.op {
+            TOp::In(items) => (items.clone(), true, None),
+            TOp::InSub(e) => (AVec::new(), true, Some(e.clone())),
             _ => {
                 let mut v = AVec::new();
                 v.push(t.val.clone());
-                (v, false)
+                (v, false, None)
             }
         };
         eq.push(Probe {
             vals,
             is_in,
+            sub,
             is: matches!(t.op, TOp::Is),
             aff: t.aff,
         });
@@ -1402,6 +1513,8 @@ fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxA
         lateral,
         one_pass: false,
         groups: false,
+        cover: None,
+        bignull: None,
     }
 }
 
