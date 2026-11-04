@@ -1015,7 +1015,17 @@ impl<S: Storage> Connection<S> {
     fn index_info_rows(&self, name: &[u8], x: bool) -> Result<Rows, S::Error> {
         let ca = &self.catalog_arena;
         let mut rows = AVec::new();
-        let Some(ix) = self.catalog.find_index(ca, name) else {
+        let ix = self.catalog.find_index(ca, name);
+        // No index of that name: a WITHOUT ROWID table's name
+        // describes its PRIMARY KEY index (v0.16), as on the pin.
+        #[cfg(feature = "without_rowid")]
+        let ix = ix.or_else(|| {
+            let t = self.catalog.find(ca, name).filter(|t| !t.has_rowid())?;
+            self.catalog
+                .indexes_for(ca, handle_bytes(ca, t.name))
+                .find(|i| i.clustered)
+        });
+        let Some(ix) = ix else {
             return Ok(rows);
         };
         if ix.opaque {

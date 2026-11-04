@@ -5421,7 +5421,8 @@ is why `full` shrank.
   NEW / OLD; a column so named reads as itself.
   `last_insert_rowid()` ignores these inserts; `changes()` counts
   them.
-- **Layout, byte for byte:** clustered records as above (VIRTUAL
+- **Layout, byte for byte** (records and cells; page allocation
+  differs, see the review fixes below): clustered records as above (VIRTUAL
   columns not stored, rows short of later ADD COLUMNs read their
   defaults); secondary indexes append the key columns they do not
   hold with the same collation, with the key's collation and
@@ -5544,6 +5545,118 @@ VACUUM support (~5 KB) and the planner model (~5 KB).
   for rowid tables too; the suites list tables by name.
 - Constraint-level `ON CONFLICT` clauses are still ignored for every
   table (pre-existing).
+
+### WITHOUT ROWID tables — review fixes (2026-11-04)
+
+Seven review findings, each reproduced first on the pre-fix build and
+compared with the live 3.54.1 pin.
+
+**Fixed (regression tests in `tests/without_rowid_v16.rs`:
+`review_regressions` (with a generated part: random large keys moved
+and deleted at page sizes 1024 and 4096), `schema_text_ends_as_the_pins`;
+the generated corpora now also draw texts holding NUL; CLI
+`cli_v16_without_rowid_review_byte_identical`):**
+
+- **Panic / CorruptRecord in the index delete rebalance** (high;
+  ungated, `indexes`: rowid-table indexes too). A delete's window
+  balance pulls the parent's dividers down and lifts new ones, which
+  can be larger. The parent then no longer fit (the page builder's
+  `content -= len` underflowed: a panic at the default page size on a
+  WITHOUT ROWID UPDATE that grows keys to ~1 KB), or the window
+  needed more pages than it had (a page written with cells over its
+  pointer array, read back as `CorruptRecord` by the next DELETE at
+  page size 1024). The delete balance now checks both before writing
+  any page and, when either fails, hands the window to the insert-side
+  balance (`IndexBalance::Grow`), which allocates pages and cascades a
+  parent overflow upward (`cascade_index_up`), as the pin's
+  `balance_nonroot` grows on delete. `build_index_image` refuses a
+  cell list that does not fit its page (`CorruptPage`) instead of
+  writing it. Same pattern on the table side, found by the new
+  generated test: an insert balance that grows its window by two pages
+  indexed past the allocated pages (a panic), and a root leaf whose
+  cells need three pages (a near-page row inserted between two halves
+  of a full leaf) was refused `Unsupported`. Both are fixed (allocate
+  as many pages as the partition needs; a root leaf splits into any
+  number of children). These are ungated INSERT fixes on the tiny
+  profile's path.
+- **NOCASE over text holding NUL** (high; ungated, every profile with
+  collations). The pin's `sqlite3StrNICmp` stops at the first NUL of
+  the left string; only the lengths decide after it. hipp compared
+  every byte, so a NOCASE key tree was out of the pin's order (its
+  integrity_check: "row not in PRIMARY KEY order") and UNIQUE let
+  through keys the pin calls equal. `record::compare_text` now stops
+  there too, which also fixes NOCASE ORDER BY / GROUP BY / DISTINCT /
+  comparisons and rowid-table autoindexes.
+- **PRAGMA index_info / index_xinfo of a WITHOUT ROWID table's name**
+  (high). They describe the table's PRIMARY KEY index, as the pin's
+  `sqlite3PrimaryKeyIndex` fallback does (also `pragma_index_info('t')`);
+  a rowid table's name still gives no rows.
+- **ALTER TABLE DROP COLUMN of the last column, or of a column before
+  a key column** (medium). `wr::drop_field` read the dropped field's
+  place from the layout rebuilt after the schema change: past the end,
+  or a key field, so the statement failed with `CorruptRecord`. It now
+  counts the place from the key width and the stored non-key fields
+  before the column, which is the same in both layouts. (The earlier
+  section's "DROP COLUMN rewrote by the old layout" fix covered only
+  the case where the next column was a non-key one.)
+- **Stored schema text after table options** (medium). The pin's
+  `sqlite3EndTable` keeps a table with options (STRICT, WITHOUT ROWID)
+  up to the statement's `;`, whitespace and comments included (to the
+  end of the text when there is no `;`), and a plain table up to its
+  closing `)` (a comment after it is dropped); `sqlite3CreateIndex`
+  keeps an index up to its `;` as well. hipp trimmed the whitespace,
+  and kept a comment after a plain table's `)`. `parser::schema_text_end`
+  now gives the pin's end. The CLI no longer trims lines' trailing
+  spaces or a statement's trailing whitespace, so `.schema` and
+  `sqlite_schema.sql` match over stdin and one-shot. Gated on `v16` or
+  `indexes`: in the tiny profile the comment after a plain table's `)`
+  is still kept (the ungated form measured +232 B tiny; the pin reads
+  the text either way).
+
+**Not fixed:**
+
+- **index_xinfo collation spelling** (low, predates the unit: rowid
+  tables too). The pin prints the collation name as written (`nocase`,
+  `NoCase`, `BiNaRy`; `BINARY` when none is written); hipp prints
+  `BINARY` / `NOCASE` / `RTRIM`. Keeping the spelling means carrying it
+  through the parser's `Expr::Collate`, the catalog's column and index
+  definitions and the autoindex sets: that belongs to the collations
+  subsystem, not this unit.
+- **page_count of hipp-written WITHOUT ROWID files** (low, docs). hipp's
+  index B-tree split policy (shared with ordinary indexes) can use a few
+  more pages than the pin (31 vs 29 for 281 medium rows). Records and
+  cells are byte-compatible, integrity checks pass both ways, and the
+  contents and order match. Page allocation is not the pin's, and the
+  earlier section's "byte for byte" refers to the record and cell
+  layout only.
+
+**Probing notes:** `sqlite3StrNICmp(a, b, min(len))` then the length
+difference: `x'610078' = x'610079' COLLATE NOCASE` is 1 on the pin and
+`x'0061'` equals `x'0062'`. Stored texts (one-shot and stdin):
+`... WITHOUT ROWID ;` keeps the space, `... STRICT /* x */  ` with no `;`
+keeps the comment and both spaces, `CREATE TABLE a1(a) /* x */ ;` stores
+`CREATE TABLE a1(a)`, `CREATE INDEX i ON t(a)   ` keeps the spaces, a
+view still trims trailing whitespace but keeps the comment.
+`index_xinfo` on the pin: `PRIMARY KEY(a, b COLLATE "Binary")` shows
+`Binary`; `c collate 'NOCASE'` shows `NOCASE`.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed". The generated corpora agreed at
+`HIPP_WR_CORPUS=1100` (before the NUL values were added) and 600 (after).
+
+**Size:** tiny **77,004 B** (Δ **+80 B**, ratchet raised; justified:
+INSERT fixes on the tiny profile's path, a panic when an insert
+balance grows by two pages and an `Unsupported` refusal of a three-way
+root leaf split). Full **490,628 B** (Δ **+1,360 B**, raised; ungated
+fixes on claimed paths: the growing index delete balance, the page
+builder's fit check, NOCASE, the schema-text end). Max **705,768 B**
+(Δ **+1,408 B** vs 704,360, raised): the same plus the index_info
+fallback and the DROP COLUMN position.
+
+**Honest gaps (updated):** besides the two above, PRAGMA table-valued
+functions (`pragma_index_info('x')` and the others) do not see TEMP
+objects (they read only `main`); this predates the unit and affects
+rowid tables too. The unit's earlier gaps stand.
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

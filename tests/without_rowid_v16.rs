@@ -286,8 +286,15 @@ fn gen_val(r: &mut Rng) -> String {
             "'{}'",
             r.pick(&["a", "B", "b", "c", "A", "10", "2", "a ", "B  "])
         )
-    } else {
+    } else if x < 96 {
         format!("x'0{}'", r.below(10))
+    } else {
+        // Text holding a NUL: NOCASE stops comparing there, as the
+        // pin's sqlite3StrNICmp does.
+        format!(
+            "cast(x'{}' as text)",
+            r.pick(&["0061", "0062", "00", "006100", "4100", "610042", "6100"])
+        )
     }
 }
 
@@ -1110,4 +1117,226 @@ fn regressions() {
          PRAGMA integrity_check",
     );
     agree("regress", &stmts, &ordered);
+}
+
+/// Review findings (v0.16): each statement agrees with the pin and
+/// the pin's integrity_check passes on hipp's file.
+#[test]
+fn review_regressions() {
+    // An index delete's rebalance lifted dividers larger than the
+    // ones it pulled down: the parent overflowed (a panic in the
+    // page builder at the default page size), or the window needed
+    // more pages than it had (a corrupt page, then CorruptRecord).
+    let stmts = lines(
+        "CREATE TABLE t(a, b, c, PRIMARY KEY(a DESC, c)) WITHOUT ROWID;
+         CREATE INDEX i0 ON t(c, b);
+         INSERT INTO t VALUES (printf('%.*c', 714, 'p'), 7.5, 3);
+         WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<176) INSERT INTO t SELECT -x, 'abcd', -x FROM q;
+         UPDATE t SET c = 5.75;
+         UPDATE t SET c = zeroblob(986) WHERE a < 1;
+         SELECT count(*), sum(length(c)) FROM t;
+         PRAGMA integrity_check",
+    );
+    agree("rv-grow4096", &stmts, &ordered);
+    let stmts = lines(
+        "PRAGMA page_size=1024;
+         CREATE TABLE t(a PRIMARY KEY, b, c) WITHOUT ROWID;
+         WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<300) INSERT INTO t SELECT printf('%.*c',(x*37)%1224,'k')||x, printf('%.*c',(x*53)%2048,'v'), x FROM q;
+         DELETE FROM t WHERE c%3=0;
+         SELECT count(*), sum(length(a)), sum(length(b)) FROM t;
+         DELETE FROM t WHERE c%3=1;
+         SELECT count(*), sum(length(a)) FROM t;
+         PRAGMA integrity_check",
+    );
+    agree("rv-grow1024", &stmts, &ordered);
+    // The same balance on an ordinary index of a rowid table.
+    let stmts = lines(
+        "PRAGMA page_size=1024;
+         CREATE TABLE r(a, b, c);
+         CREATE INDEX ra ON r(a, c);
+         WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<300) INSERT INTO r SELECT printf('%.*c',(x*37)%1224,'k')||x, printf('%.*c',(x*53)%2048,'v'), x FROM q;
+         DELETE FROM r WHERE c%3=0;
+         UPDATE r SET a = printf('%.*c', (c*71)%900, 'z') WHERE c%5=1;
+         DELETE FROM r WHERE c%7=2;
+         SELECT count(*), sum(length(a)) FROM r;
+         SELECT c FROM r WHERE a > 'k' ORDER BY a, c LIMIT 5;
+         PRAGMA integrity_check",
+    );
+    agree("rv-grow-rowid", &stmts, &ordered);
+    // An insert balance growing by more than one page: a root leaf
+    // split three ways (a cell of nearly a page between two halves
+    // of a full leaf; hipp refused it), and a window growing by two.
+    let stmts = lines(
+        "CREATE TABLE t(a);
+         WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<20) INSERT INTO t(rowid, a) SELECT x, printf('%.*c', 90, 'a') FROM q;
+         WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<20) INSERT INTO t(rowid, a) SELECT x+1000, printf('%.*c', 90, 'a') FROM q;
+         INSERT INTO t(rowid, a) VALUES (500, printf('%.*c', 3900, 'b'));
+         WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<20) INSERT INTO t(rowid, a) SELECT x+2000, printf('%.*c', 90, 'a') FROM q;
+         INSERT INTO t(rowid, a) VALUES (1500, printf('%.*c', 3900, 'c'));
+         INSERT INTO t(rowid, a) VALUES (10, printf('%.*c', 3900, 'd')) ON CONFLICT DO UPDATE SET a = excluded.a;
+         SELECT rowid, length(a) FROM t WHERE length(a) > 100;
+         SELECT count(*), sum(length(a)) FROM t;
+         PRAGMA integrity_check",
+    );
+    agree("rv-grow-root", &stmts, &ordered);
+    // Generated: random large keys moved and deleted at both page
+    // sizes; the pin's integrity_check after every batch.
+    let mut r = Rng(0x0005_eed0_fb16_c0de);
+    for case in 0..corpus_size(6) {
+        let ps = if case % 2 == 0 { 1024 } else { 4096 };
+        let mut s = vec![
+            format!("PRAGMA page_size={ps}"),
+            "CREATE TABLE g(a, b, c, PRIMARY KEY(a DESC, c)) WITHOUT ROWID".to_string(),
+            "CREATE INDEX gi ON g(c, b)".to_string(),
+        ];
+        let n = r.int(80, 220);
+        s.push(format!(
+            "WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<{n}) \
+             INSERT INTO g SELECT x, printf('%.*c', (x*{}) % {}, 'b'), x FROM q",
+            r.int(7, 61),
+            ps / 2
+        ));
+        for _ in 0..8 {
+            let m = r.int(2, 9);
+            let k = r.int(0, m - 1);
+            s.push(match r.below(3) {
+                0 => format!(
+                    "UPDATE g SET c = zeroblob((a*{}) % {}) WHERE a % {m} = {k}",
+                    r.int(3, 97),
+                    ps / 4
+                ),
+                1 => format!("DELETE FROM g WHERE a % {m} = {k}"),
+                _ => format!(
+                    "UPDATE g SET a = printf('%.*c', (a*{}) % {}, 'a') || a WHERE a % {m} = {k}",
+                    r.int(3, 97),
+                    ps / 4
+                ),
+            });
+            s.push("SELECT count(*), sum(length(a)), sum(length(c)) FROM g".to_string());
+        }
+        s.push("PRAGMA integrity_check".to_string());
+        agree(&format!("rv-gen{case}"), &s, &ordered);
+    }
+
+    // NOCASE stops at a NUL byte, then compares lengths
+    // (sqlite3StrNICmp): the tree's order and UNIQUE agree with the
+    // pin's.
+    let stmts = lines(
+        "CREATE TABLE t(c0 TEXT COLLATE NOCASE, n, PRIMARY KEY(c0)) WITHOUT ROWID;
+         INSERT INTO t VALUES (cast(x'0061' as text),1),(cast(x'0062' as text),2),(cast(x'00' as text),3),(cast(x'006100' as text),4);
+         INSERT INTO t VALUES (cast(x'0061' as text),1),(cast(x'00' as text),3),(cast(x'006100' as text),4),(cast(x'41' as text),5),(cast(x'4100' as text),6),(cast(x'610042' as text),7);
+         INSERT INTO t VALUES (cast(x'610043' as text), 8);
+         SELECT hex(c0), n FROM t;
+         SELECT hex(c0) FROM t WHERE c0 = cast(x'610078' as text);
+         SELECT cast(x'610078' as text) = cast(x'610079' as text) COLLATE NOCASE, cast(x'610078' as text) < cast(x'6100' as text) COLLATE NOCASE, 'a' < cast(x'6100' as text) COLLATE NOCASE;
+         CREATE TABLE r(a TEXT COLLATE NOCASE PRIMARY KEY, b);
+         CREATE INDEX rb ON r(b COLLATE NOCASE);
+         INSERT INTO r VALUES (cast(x'0061' as text), cast(x'4200' as text)),(cast(x'0062' as text), cast(x'620063' as text));
+         INSERT OR IGNORE INTO r VALUES (cast(x'0063' as text), 1),(cast(x'00' as text), 2),(cast(x'4100' as text), 3),(cast(x'6100' as text), 4);
+         SELECT hex(a) FROM r ORDER BY a;
+         SELECT hex(a) FROM r ORDER BY a COLLATE NOCASE DESC;
+         SELECT hex(b) FROM r ORDER BY b COLLATE NOCASE, a;
+         SELECT count(DISTINCT b COLLATE NOCASE) FROM r;
+         PRAGMA integrity_check",
+    );
+    agree("rv-nocase-nul", &stmts, &ordered);
+
+    // index_info / index_xinfo of a WITHOUT ROWID table's name
+    // describe its PRIMARY KEY index; a rowid table's name nothing.
+    let stmts = lines(
+        "CREATE TABLE t(a, b TEXT COLLATE NOCASE, c, PRIMARY KEY(b DESC, a)) WITHOUT ROWID;
+         PRAGMA index_info(t);
+         PRAGMA index_xinfo(t);
+         SELECT * FROM pragma_index_info('t');
+         SELECT * FROM pragma_index_xinfo('T');
+         PRAGMA main.index_info(t);
+         CREATE TABLE r(a PRIMARY KEY, b);
+         PRAGMA index_info(r);
+         CREATE TEMP TABLE tt(x, y, PRIMARY KEY(y)) WITHOUT ROWID;
+         PRAGMA index_xinfo(tt);
+         PRAGMA temp.index_xinfo(tt);
+         CREATE VIEW v AS SELECT 1;
+         PRAGMA index_info(v)",
+    );
+    agree("rv-index-info", &stmts, &ordered);
+
+    // DROP COLUMN of the last column, or of one before a key column,
+    // rewrites the records by the old layout.
+    let stmts = lines(
+        "CREATE TABLE t(a PRIMARY KEY, b, c) WITHOUT ROWID;
+         INSERT INTO t VALUES(1,2,3),(4,5,6);
+         ALTER TABLE t DROP COLUMN c;
+         SELECT * FROM t;
+         CREATE TABLE u(a, b, c, PRIMARY KEY(c)) WITHOUT ROWID;
+         INSERT INTO u VALUES(1,2,3),(7,8,9);
+         ALTER TABLE u DROP COLUMN b;
+         SELECT * FROM u;
+         ALTER TABLE u DROP COLUMN a;
+         SELECT * FROM u;
+         CREATE TABLE w(a, b, c, d AS (a+1), e, f, PRIMARY KEY(e, b)) WITHOUT ROWID;
+         CREATE INDEX wi ON w(f);
+         INSERT INTO w(a,b,c,e,f) VALUES(1,2,3,4,5),(6,7,8,9,10);
+         ALTER TABLE w DROP COLUMN f;
+         DROP INDEX wi;
+         ALTER TABLE w DROP COLUMN f;
+         SELECT * FROM w;
+         ALTER TABLE w DROP COLUMN c;
+         SELECT * FROM w;
+         ALTER TABLE w ADD COLUMN g DEFAULT 'x';
+         INSERT INTO w(a,b,e,g) VALUES (11,12,13,14);
+         SELECT * FROM w;
+         ALTER TABLE w DROP COLUMN g;
+         SELECT * FROM w;
+         PRAGMA integrity_check",
+    );
+    agree("rv-drop-column", &stmts, &ordered);
+}
+
+/// The stored schema text keeps what the pin keeps after a table's
+/// options or an index (whitespace and comments up to the `;`, or to
+/// the end of the text) and drops what follows a plain table's `)`.
+#[test]
+fn schema_text_ends_as_the_pins() {
+    let stmts = [
+        "CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID ;",
+        "CREATE TABLE w(a PRIMARY KEY) WITHOUT ROWID\n;",
+        "CREATE TABLE s(a int) STRICT  ;",
+        "CREATE TABLE s2(a int primary key) STRICT, WITHOUT ROWID ;",
+        "CREATE TABLE s3(a primary key) without rowid /* c */ ;",
+        "CREATE TABLE s4(a primary key) without rowid -- c\n  ;",
+        "CREATE TABLE s5(a)  ;",
+        "CREATE TABLE s6(a int) strict\t\n",
+        "CREATE TABLE s7(a int) strict   ",
+        "CREATE TABLE s8(a int) strict /* x */  ",
+        "CREATE TABLE s9(a int) strict;   ",
+        "CREATE TABLE s11(a int primary key) without rowid,strict",
+        "CREATE TABLE s12(a int) strict -- x",
+        "CREATE TABLE a1(a) /* x */ ;",
+        "CREATE TABLE a2(a) -- x",
+        "CREATE TABLE a3(a)   ",
+        "CREATE TABLE IF NOT EXISTS main.a7(a, b CHECK(b>(1)) ) /* w */",
+        "CREATE INDEX i1 ON a1(a) /* y */ ;",
+        "CREATE INDEX i ON a3(a)   ",
+        "CREATE INDEX i2 ON a3(a) where a > 1 -- x",
+        "CREATE UNIQUE INDEX i3 ON a3(a) /*u*/;  ",
+        "CREATE INDEX i9 ON a3((a+1)) ;",
+        "CREATE VIEW v1 AS SELECT 1 /* z */  ;",
+        "  CREATE VIEW v2 AS SELECT 2   ",
+    ];
+    let h = fresh("schema-text-h");
+    let o = fresh("schema-text-o");
+    let stmts: Vec<String> = stmts.iter().map(|s| s.to_string()).collect();
+    for (i, g) in hipp_file(&h, &stmts).iter().enumerate() {
+        assert!(g.is_ok(), "{:?}: {g:?}", stmts[i]);
+    }
+    for s in &stmts {
+        common::cli(&o, s);
+    }
+    let q = "SELECT name, quote(sql) FROM sqlite_schema ORDER BY name";
+    let got = hipp_file(&h, &[q.to_string()]);
+    assert_eq!(
+        String::from_utf8_lossy(got[0].as_ref().expect("hipp reads")),
+        common::cli(&o, q).trim_end_matches('\n')
+    );
+    both_ok(&h);
 }

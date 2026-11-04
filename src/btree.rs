@@ -1141,18 +1141,30 @@ pub async fn btree_insert<S: Storage>(
         if groups.iter().any(|g| leaf_need(g.as_slice(), 0) > usable) {
             groups = greedy_leaf_groups(all.as_slice(), usable);
         }
-        if groups.len() != 2 {
+        // Usually two children; three when a cell of nearly a page
+        // lands between two halves of a full leaf (the greedy
+        // groups; the pin's balance_deeper then splits as well).
+        let n = groups.len();
+        if n < 2 {
             return Err(Error::Unsupported);
         }
-        let divider = groups.as_slice()[0].as_slice()[groups.as_slice()[0].len() - 1].rowid;
-        let (lp, _) = pager.alloc_page().await?;
-        let (rp, _) = pager.alloc_page().await?;
-        write_leaf_page(pager, lp, groups.as_slice()[0].as_slice(), true).await?;
-        write_leaf_page(pager, rp, groups.as_slice()[1].as_slice(), true).await?;
+        let mut pairs: AVec<(u32, i64)> = AVec::new();
+        let mut right = 0u32;
+        for (i, g) in groups.iter().enumerate() {
+            let Some(last) = g.as_slice().last() else {
+                return Err(Error::Unsupported);
+            };
+            let (pg, _) = pager.alloc_page().await?;
+            write_leaf_page(pager, pg, g.as_slice(), true).await?;
+            if i + 1 < n {
+                pairs.push((pg, last.rowid));
+            } else {
+                right = pg;
+            }
+        }
         let idx = pager.dirty_page(root).await?;
         let base = copy_bytes(pager.frame_data(idx));
-        let pairs = [(lp, divider)];
-        let img = build_interior_image(root, page_size, &pairs, rp, base.as_slice());
+        let img = build_interior_image(root, page_size, pairs.as_slice(), right, base.as_slice());
         set_page_image(pager, root, img.as_slice()).await?;
         return Ok(());
     }
@@ -1384,7 +1396,6 @@ async fn cascade_table_up<S: Storage>(
             return ins_root_table_interior(pager, root, pairs, rightmost).await;
         }
         let pos = path
-            .as_slice()
             .iter()
             .position(|(p, _)| *p == page)
             .ok_or(Error::Unsupported)?;
@@ -1515,10 +1526,10 @@ async fn ins_balance_table_leaf_window<S: Storage>(
         groups = greedy_leaf_groups(all.as_slice(), usable);
     }
     let n_new = groups.len();
-    // Write the window pages (allocating one extra at the end of
+    // Write the window pages (allocating extra ones at the end of
     // the window when the balance grows), free any excess.
     let mut pages_out: AVec<u32> = window_pages.clone();
-    if n_new > window_pages.len() {
+    while pages_out.len() < n_new {
         let (np, _) = pager.alloc_page().await?;
         pages_out.push(np);
     }
@@ -1646,7 +1657,7 @@ async fn ins_balance_table_interior_window<S: Storage>(
     }
     let n_new = groups.len();
     let mut pages_out: AVec<u32> = window_pages.clone();
-    if n_new > window_pages.len() {
+    while pages_out.len() < n_new {
         let (np, _) = pager.alloc_page().await?;
         pages_out.push(np);
     }
@@ -2809,13 +2820,18 @@ fn build_index_image(
     rightmost: u32,
     interior: bool,
     base: &[u8],
-) -> AVec<u8> {
+) -> Option<AVec<u8>> {
+    let hdr_off = if page == 1 { 100 } else { 0 };
+    let hdr_len = if interior { 12 } else { 8 };
+    // A cell list that does not fit the page is a balance bug, never
+    // something to write: refuse it instead of underflowing.
+    if index_page_need(cells, hdr_off, interior) > page_size || base.len() < hdr_off {
+        return None;
+    }
     let mut img = vec_zeroed(page_size);
     if page == 1 {
         img.as_mut_slice()[0..100].copy_from_slice(&base[0..100]);
     }
-    let hdr_off = if page == 1 { 100 } else { 0 };
-    let hdr_len = if interior { 12 } else { 8 };
     let out = img.as_mut_slice();
     let mut content = page_size;
     let mut ptrs = AVec::new();
@@ -2839,7 +2855,7 @@ fn build_index_image(
     for (i, p) in ptrs.iter().enumerate() {
         put_be_u16(out, hdr_off + hdr_len + 2 * i, *p);
     }
-    img
+    Some(img)
 }
 
 #[cfg(feature = "indexes")]
@@ -2870,7 +2886,8 @@ async fn write_index_page<S: Storage>(
         pager.dirty_page(page).await?
     };
     let base = copy_bytes(pager.frame_data(idx));
-    let img = build_index_image(page, page_size, cells, rightmost, interior, base.as_slice());
+    let img = build_index_image(page, page_size, cells, rightmost, interior, base.as_slice())
+        .ok_or(Error::CorruptPage { page })?;
     pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
     Ok(())
 }
@@ -2887,7 +2904,8 @@ pub async fn create_empty_index_root<S: Storage>(
     pager.mark_frame_dirty(idx);
     let base = copy_bytes(pager.frame_data(idx));
     let empty: &[IndexCell] = &[];
-    let img = build_index_image(page, page_size, empty, 0, false, base.as_slice());
+    let img = build_index_image(page, page_size, empty, 0, false, base.as_slice())
+        .ok_or(Error::CorruptPage { page })?;
     pager.frame_data_mut(idx).copy_from_slice(img.as_slice());
     Ok(())
 }
@@ -3439,7 +3457,7 @@ async fn ins_root_index_interior<S: Storage>(
 async fn cascade_index_up<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
-    path: &AVec<(u32, usize)>,
+    path: &[(u32, usize)],
     first: InsUpIdx,
 ) -> Result<(), S::Error> {
     let mut up = first;
@@ -3456,14 +3474,13 @@ async fn cascade_index_up<S: Storage>(
             return ins_root_index_interior(pager, root, cells, rightmost).await;
         }
         let pos = path
-            .as_slice()
             .iter()
             .position(|(p, _)| *p == page)
             .ok_or(Error::Unsupported)?;
         if pos == 0 {
             return Err(Error::Unsupported);
         }
-        let (gp, gtrigger) = path.as_slice()[pos - 1];
+        let (gp, gtrigger) = path[pos - 1];
         up = ins_balance_index_interior_window(pager, gp, gtrigger, page, cells, rightmost).await?;
     }
 }
@@ -3632,7 +3649,7 @@ pub async fn index_insert_core<S: Storage>(
     }
     let (parent, trigger) = *path.as_slice().last().expect("non-root leaf has a parent");
     let up = ins_balance_index_leaf_window(pager, parent, trigger, leaf_page, all).await?;
-    cascade_index_up(pager, root, &path, up).await
+    cascade_index_up(pager, root, path.as_slice(), up).await
 }
 
 // ----------------------------------------------------------------
@@ -4622,6 +4639,11 @@ enum IndexBalance {
     /// non-root parent). No window page was written; the caller
     /// falls back to a rebuild.
     Rebuild,
+    /// The window's entries need more pages than it has, or the
+    /// parent no longer fits its new dividers. No page was
+    /// written; the caller runs the insert-side balance, which
+    /// allocates pages and cascades a parent overflow upward.
+    Grow,
 }
 
 /// The cells, rightmost pointer and ordered children of an
@@ -4921,18 +4943,8 @@ async fn balance_index_leaf_window<S: Storage>(
     let n_new = index_min_pages(all.as_slice(), usable, false).min(window_pages.len());
     let (pages, dividers) = partition_index(all.as_slice(), n_new, usable, false);
     let n_new = pages.len();
-    for (i, g) in pages.iter().enumerate() {
-        write_index_page(pager, window_pages[i], g.as_slice(), 0, false, false).await?;
-    }
-    for wp in window_pages.iter().skip(n_new) {
-        pager.free_page(*wp).await?;
-    }
-    let new_pages: AVec<u32> = {
-        let mut v = AVec::new();
-        for wp in window_pages.iter().take(n_new) {
-            v.push(*wp);
-        }
-        v
+    let Some(new_pages) = take_pages(window_pages, n_new) else {
+        return Ok(IndexBalance::Grow);
     };
     let (nc, nright) = index_parent_after(
         pcells,
@@ -4943,10 +4955,36 @@ async fn balance_index_leaf_window<S: Storage>(
         dividers.as_slice(),
         0,
     );
+    // The lifted dividers may be larger than the ones pulled down:
+    // a parent that no longer fits needs the growing balance.
+    if index_page_need(nc.as_slice(), 0, true) > usable {
+        return Ok(IndexBalance::Grow);
+    }
+    for (g, wp) in pages.iter().zip(new_pages.iter()) {
+        write_index_page(pager, *wp, g.as_slice(), 0, false, false).await?;
+    }
+    for wp in window_pages.iter().skip(n_new) {
+        pager.free_page(*wp).await?;
+    }
     write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
     Ok(IndexBalance::Done {
         children_removed: window_pages.len() - n_new,
     })
+}
+
+/// The first `n` of a window's pages, or None when a partition
+/// needs more pages than the window has (the delete balance never
+/// allocates; the caller switches to the growing insert balance).
+#[cfg(feature = "indexes")]
+fn take_pages(window_pages: &[u32], n: usize) -> Option<AVec<u32>> {
+    if n > window_pages.len() {
+        return None;
+    }
+    let mut v = AVec::new();
+    for wp in window_pages.iter().take(n) {
+        v.push(*wp);
+    }
+    Some(v)
 }
 
 #[cfg(feature = "indexes")]
@@ -5009,23 +5047,8 @@ async fn balance_index_interior_window<S: Storage>(
     let n_new = index_min_pages(all.as_slice(), usable, true).min(window_pages.len());
     let (pages, dividers) = partition_index(all.as_slice(), n_new, usable, true);
     let n_new = pages.len();
-    for (i, g) in pages.iter().enumerate() {
-        let right = if i + 1 < n_new {
-            dividers.as_slice()[i].child
-        } else {
-            trailing
-        };
-        write_index_page(pager, window_pages[i], g.as_slice(), right, true, false).await?;
-    }
-    for wp in window_pages.iter().skip(n_new) {
-        pager.free_page(*wp).await?;
-    }
-    let new_pages: AVec<u32> = {
-        let mut v = AVec::new();
-        for wp in window_pages.iter().take(n_new) {
-            v.push(*wp);
-        }
-        v
+    let Some(new_pages) = take_pages(window_pages, n_new) else {
+        return Ok(IndexBalance::Grow);
     };
     let (nc, nright) = index_parent_after(
         pcells,
@@ -5036,6 +5059,19 @@ async fn balance_index_interior_window<S: Storage>(
         dividers.as_slice(),
         4,
     );
+    if index_page_need(nc.as_slice(), 0, true) > usable {
+        return Ok(IndexBalance::Grow);
+    }
+    for (i, (g, wp)) in pages.iter().zip(new_pages.iter()).enumerate() {
+        let right = match dividers.as_slice().get(i) {
+            Some(d) if i + 1 < n_new => d.child,
+            _ => trailing,
+        };
+        write_index_page(pager, *wp, g.as_slice(), right, true, false).await?;
+    }
+    for wp in window_pages.iter().skip(n_new) {
+        pager.free_page(*wp).await?;
+    }
     write_index_page(pager, parent, nc.as_slice(), nright, true, false).await?;
     Ok(IndexBalance::Done {
         children_removed: window_pages.len() - n_new,
@@ -5383,11 +5419,25 @@ async fn index_remove_from_leaf<S: Storage>(
         write_index_page(pager, leaf_page, kept.as_slice(), 0, false, false).await?;
         return Ok(IndexRemoval::Done);
     }
-    let (parent, trigger) = *path.last().expect("non-root leaf has a parent");
-    let outcome =
-        balance_index_window(pager, root, parent, trigger, Some((leaf_page, kept))).await?;
+    let Some(&(parent, trigger)) = path.last() else {
+        return Err(Error::CorruptPage { page: leaf_page });
+    };
+    let outcome = balance_index_window(
+        pager,
+        root,
+        parent,
+        trigger,
+        Some((leaf_page, kept.clone())),
+    )
+    .await?;
     let mut removed_children = match outcome {
         IndexBalance::Rebuild => return Ok(IndexRemoval::RebuildBeforeWrite),
+        IndexBalance::Grow => {
+            let up = ins_balance_index_leaf_window(pager, parent, trigger, leaf_page, kept).await?;
+            cascade_index_up(pager, root, path, up).await?;
+            collapse_index_root(pager, root).await?;
+            return Ok(IndexRemoval::Done);
+        }
         IndexBalance::Done { children_removed } => children_removed,
     };
     // Cascade, mirroring the table delete: balance each
@@ -5421,6 +5471,15 @@ async fn index_remove_from_leaf<S: Storage>(
         let outcome = balance_index_window(pager, root, gp, gtrigger, None).await?;
         match outcome {
             IndexBalance::Rebuild => return Ok(IndexRemoval::RebuildAfterRemoval),
+            IndexBalance::Grow => {
+                // No preset: page 0 is never a window page, so every
+                // window page is read from its image.
+                let up = ins_balance_index_interior_window(pager, gp, gtrigger, 0, AVec::new(), 0)
+                    .await?;
+                cascade_index_up(pager, root, path, up).await?;
+                collapse_index_root(pager, root).await?;
+                return Ok(IndexRemoval::Done);
+            }
             IndexBalance::Done { children_removed } => {
                 removed_children = children_removed;
             }

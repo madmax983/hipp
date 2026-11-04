@@ -424,11 +424,17 @@ pub fn compare_text(a: &[u8], b: &[u8], coll: Coll) -> core::cmp::Ordering {
     match coll {
         Coll::Binary => a.cmp(b),
         Coll::NoCase => {
-            let n = a.len().min(b.len());
-            for (x, y) in a[..n].iter().zip(b[..n].iter()) {
+            // The pin's sqlite3StrNICmp over the shorter length:
+            // it stops at the first NUL of `a` (comparing it with
+            // `b`'s byte there), so bytes after a shared NUL are
+            // ignored and only the lengths decide.
+            for (x, y) in a.iter().zip(b.iter()) {
                 let c = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
                 if c != core::cmp::Ordering::Equal {
                     return c;
+                }
+                if *x == 0 {
+                    break;
                 }
             }
             a.len().cmp(&b.len())

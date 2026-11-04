@@ -892,15 +892,17 @@ pub async fn drop_field<S: Storage>(
         .get(t)
         .ok_or(Error::CorruptRecord)?
         .clone();
-    let p = tb
+    // The field's place in the records on disk: the key fields,
+    // then the non-key stored fields before it in table order. The
+    // fields before `stored` are the same columns whether `tb` is
+    // the layout from before or after the schema change, so this
+    // never reads the dropped field's own entry.
+    let before = tb
         .pos
         .as_slice()
-        .get(stored)
-        .copied()
+        .get(..stored)
         .ok_or(Error::CorruptRecord)?;
-    if p < tb.npk {
-        return Err(Error::CorruptRecord);
-    }
+    let p = tb.npk + before.iter().filter(|&&q| q >= tb.npk).count();
     let recs = crate::btree::index_payloads(pager, tb.root).await?;
     for r in recs.iter() {
         let vals = decode_record::<S::Error>(r.as_slice(), usize::MAX)?;

@@ -632,7 +632,16 @@ aspirations.
   tie, its UPDATE / DELETE costing). Without the leaf a file holding
   such a table is refused at open, as before. Fixed on the way: an
   `IS NULL` lookup through a UNIQUE index no longer counts as one
-  row (GROUP BY groups came unsorted). Tiny unchanged; sizes in
+  row (GROUP BY groups came unsorted). Review fixes: an index
+  delete rebalance that panicked or wrote a corrupt page when its
+  new dividers were larger (also ordinary indexes) and two table
+  insert-balance cases that grew by more than one page; NOCASE
+  stops at a NUL byte as the pin's; `PRAGMA index_info(t)` of a
+  WITHOUT ROWID table describes its key; DROP COLUMN of a last
+  column; stored texts keep the whitespace after table options
+  and indexes as the pin's do. Records and cells match the pin's
+  byte for byte, but page allocation does not (a few more pages);
+  index_xinfo prints collation names in upper case. Sizes in
   STATUS.md.
 
 ## What v0.13 does

@@ -611,6 +611,34 @@ pub fn schema_text_start<E>(
     Ok(t.get(i).map(|n| (prefix, n.offset)))
 }
 
+/// Where the stored schema text of the CREATE statement `sql` ends,
+/// where the pin's rule fixes it (v0.16): a CREATE TABLE ending in
+/// its column list's `)` ends there (what follows is dropped,
+/// comments included); a table with options (STRICT, WITHOUT ROWID)
+/// and an index keep everything up to the statement's `;` (or the
+/// end of the text), whitespace and comments included. `None` (a
+/// view, or text that does not lex): the caller trims whitespace.
+/// Not built for the tiny profile (no table options, no indexes),
+/// whose stored text stays the statement minus its trailing `;` and
+/// whitespace.
+#[cfg(any(feature = "v16", feature = "indexes"))]
+pub fn schema_text_end<E>(sql: &[u8], arena: &Arena) -> Option<usize> {
+    let toks = lexer::lex::<E>(sql, arena).ok()?;
+    let p = Parser::new(toks, arena, sql, Limits::PIN);
+    let kind = 1 + usize::from(p.is_kw(1, b"UNIQUE"));
+    let t = p.toks.as_slice();
+    // The statement's last token before its `;`s and the end.
+    let mut l = t.len();
+    while l > 0 && matches!(t[l - 1].tok, Tok::Semi | Tok::Eof) {
+        l -= 1;
+    }
+    match t.get(l.wrapping_sub(1)) {
+        _ if p.is_kw(kind, b"VIEW") => None,
+        Some(c) if matches!(c.tok, Tok::RParen) && !p.is_kw(kind, b"INDEX") => Some(c.offset + 1),
+        _ => t.get(l).map(|semi| semi.offset),
+    }
+}
+
 /// Whether a stored CREATE TABLE text declares AUTOINCREMENT
 /// (v0.16, `v16`): the word is reserved, so an unquoted
 /// occurrence can only be the PRIMARY KEY's clause. Text that

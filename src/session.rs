@@ -5366,11 +5366,16 @@ fn copy_vec(b: &[u8]) -> AVec<u8> {
 /// holds the re-lexed tokens. AUTOINCREMENT is refused
 /// (`Error::Unsupported`: hipp keeps no `sqlite_sequence`).
 fn trimmed_sql_text<E>(raw: &[u8], arena: &Arena) -> Result<AVec<u8>, E> {
+    // The pin's end of the stored text where it fixes one (see
+    // `schema_text_end`), else the statement minus any trailing
+    // semicolon/whitespace.
     let mut end = raw.len();
     while end > 0 && (raw[end - 1] == b';' || (raw[end - 1] as char).is_whitespace()) {
         end -= 1;
     }
-    let raw = &raw[..end];
+    #[cfg(any(feature = "v16", feature = "indexes"))]
+    let end = crate::sql::parser::schema_text_end::<E>(raw, arena).unwrap_or(end);
+    let raw = &raw[..end.min(raw.len())];
     Ok(
         match crate::sql::parser::schema_text_start::<E>(raw, arena)? {
             Some((prefix, at)) if at <= raw.len() => {

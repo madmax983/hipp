@@ -593,8 +593,10 @@ fn split_script(script: &str) -> (Vec<String>, bool) {
             start = i;
         }
     }
-    let tail = script[start..].trim();
-    let complete = tail.is_empty();
+    // An unterminated tail keeps its trailing whitespace: a CREATE
+    // TABLE with options or a CREATE INDEX stores it, as on the pin.
+    let tail = script[start..].trim_start();
+    let complete = tail.trim_end().is_empty();
     if !complete {
         out.push(tail.to_string());
     }
@@ -860,10 +862,12 @@ async fn dispatch(
         }
     } else {
         match db {
-            Db::File(c) => run_statement(c, trimmed, params, out)
+            // The statement as written (only leading space dropped):
+            // its trailing text can belong in sqlite_schema.sql.
+            Db::File(c) => run_statement(c, input.trim_start(), params, out)
                 .await
                 .map(|()| Flow::Continue),
-            Db::Mem(c) => run_statement(c, trimmed, params, out)
+            Db::Mem(c) => run_statement(c, input.trim_start(), params, out)
                 .await
                 .map(|()| Flow::Continue),
         }
@@ -941,7 +945,9 @@ fn run() -> ExitCode {
             }
             None => break,
         };
-        let line = line.trim_end();
+        // Lines keep their trailing spaces (the pin's input buffer
+        // does, and a schema text can hold them).
+        let line = line.as_str();
         if buffer.is_empty() && line.trim_start().starts_with('.') {
             match block_on(dispatch(&mut db, line.trim(), &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}

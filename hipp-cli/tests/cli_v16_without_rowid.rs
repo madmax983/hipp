@@ -267,3 +267,59 @@ fn cli_v16_without_rowid_corpus_byte_identical() {
         byte_identical(&format!("corpus{i}"), &corpus(*seed, 25));
     }
 }
+
+/// Review findings (v0.16): the stored texts keep the whitespace and
+/// comments a table's options or an index leave before the `;` (and
+/// `.schema` shows them), a WITHOUT ROWID table's name describes its
+/// PRIMARY KEY index, DROP COLUMN of the last column or one before a
+/// key column, NOCASE over text holding NUL, and large keys moved
+/// and deleted.
+const REVIEW: &str = "CREATE TABLE t(a PRIMARY KEY, b, c) WITHOUT ROWID ;
+CREATE TABLE w(a PRIMARY KEY, b) WITHOUT ROWID
+;
+CREATE TABLE s(a INT, b TEXT) STRICT  /* note */  ;
+CREATE TABLE p(a, b) /* dropped */ ;
+CREATE INDEX wb ON w(b)   ;
+CREATE VIEW v AS SELECT a FROM t  /* kept */  ;
+SELECT name, quote(sql) FROM sqlite_schema ORDER BY name;
+INSERT INTO t VALUES (1, 2, 3), (4, 5, 6);
+ALTER TABLE t DROP COLUMN c;
+SELECT * FROM t;
+CREATE TABLE u(a, b, c, PRIMARY KEY(c)) WITHOUT ROWID;
+INSERT INTO u VALUES (1, 2, 3), (7, 8, 9);
+ALTER TABLE u DROP COLUMN b;
+SELECT * FROM u;
+CREATE TABLE k(a, b TEXT COLLATE NOCASE, c, PRIMARY KEY(b DESC, a)) WITHOUT ROWID;
+PRAGMA index_info(k);
+PRAGMA index_xinfo(k);
+SELECT * FROM pragma_index_info('k');
+CREATE TABLE n(c0 TEXT COLLATE NOCASE PRIMARY KEY, x) WITHOUT ROWID;
+INSERT INTO n VALUES (cast(x'0061' as text), 1), (cast(x'00' as text), 2), (cast(x'4100' as text), 3);
+INSERT OR IGNORE INTO n VALUES (cast(x'0062' as text), 4), (cast(x'610042' as text), 5), (cast(x'006100' as text), 6);
+SELECT hex(c0), x FROM n;
+CREATE TABLE g(a, b, c, PRIMARY KEY(a DESC, c)) WITHOUT ROWID;
+CREATE INDEX gi ON g(c, b);
+INSERT INTO g VALUES (printf('%.*c', 714, 'p'), 7.5, 3);
+WITH RECURSIVE q(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM q WHERE x<176) INSERT INTO g SELECT -x, 'abcd', -x FROM q;
+UPDATE g SET c = 5.75;
+UPDATE g SET c = zeroblob(986) WHERE a < 1;
+SELECT count(*), sum(length(c)) FROM g;
+PRAGMA integrity_check;
+";
+
+#[test]
+fn cli_v16_without_rowid_review_byte_identical() {
+    byte_identical("review", REVIEW);
+    // `.schema` over stdin shows the kept texts, trailing spaces of
+    // the input lines included.
+    let input = "CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID   \n  ;\n\
+                 CREATE TABLE s(a INT) STRICT -- c\n;\n\
+                 CREATE INDEX si ON s(a) /* i */ ;\n.schema\n";
+    let a = temp_db("review-schema-hipp");
+    let b = temp_db("review-schema-ora");
+    assert_eq!(
+        String::from_utf8_lossy(&run_stdin(&hipp_bin(), &a, input)),
+        String::from_utf8_lossy(&run_stdin(&oracle(), &b, input)),
+    );
+    assert_eq!(run(&oracle(), &a, "PRAGMA integrity_check;"), b"ok\n");
+}
