@@ -1055,9 +1055,12 @@ impl<S: Storage> Connection<S> {
                             })?;
                             return self.ztype(d, it);
                         }
-                        let t = self.catalog.tables.iter().find(|t| t.root == sp.root)?;
-                        let decl =
-                            handle_bytes(&self.catalog_arena, t.columns.as_slice().get(k)?.decl);
+                        let (cat, ca) = match self.temp.as_deref() {
+                            Some(tc) if sp.temp => (&tc.catalog, &tc.catalog_arena),
+                            _ => (&self.catalog, &self.catalog_arena),
+                        };
+                        let t = cat.tables.iter().find(|t| t.root == sp.root)?;
+                        let decl = handle_bytes(ca, t.columns.as_slice().get(k)?.decl);
                         return if decl.is_empty() {
                             None
                         } else {
@@ -1461,7 +1464,34 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
                 });
             }
         }
-        let rows = if temp || (has_arg && prag != Prag::TableList && arg.is_none()) {
+        // v0.16: a name the TEMP database has (temp first, as on the
+        // pin), or the `temp` schema: that database's rows.
+        let in_temp = has_arg
+            && prag != Prag::TableList
+            && !self.is_temp
+            && match (&schema, &arg) {
+                (Some(_), Some(_)) => temp,
+                (None, Some(a)) => {
+                    self.temp_has(a.as_slice(), false) || self.temp_has(a.as_slice(), true)
+                }
+                _ => false,
+            };
+        let rows = if in_temp {
+            match self.temp.as_deref() {
+                Some(tc) => tc
+                    .pragma_rows(
+                        arena,
+                        &PragmaPlan {
+                            prag: Some(prag),
+                            arg,
+                            numeric: false,
+                            main_only: false,
+                        },
+                    )
+                    .map_err(super::temp::mem_err)?,
+                None => AVec::new(),
+            }
+        } else if temp || (has_arg && prag != Prag::TableList && arg.is_none()) {
             AVec::new()
         } else {
             self.pragma_rows(

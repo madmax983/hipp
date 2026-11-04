@@ -1083,7 +1083,9 @@ impl<S: Storage> Connection<S> {
                 Ok(Step::Done) => break,
                 Err(e) => {
                     let rb = st.resolves_rollback(&e);
-                    st.conn.note_failure(&e, conflict, rb);
+                    // The failing constraint's own action (v0.16).
+                    let c = st.fail_act.get().or(conflict);
+                    st.conn.note_failure(&e, c, rb);
                     return Err(e);
                 }
             }
@@ -1160,7 +1162,7 @@ impl<S: Storage> Connection<S> {
                 }
             }
             let _ = (&names, set_null);
-            let replace = conflict == ConflictAction::Replace
+            let replace = self.table_replaces(table.as_slice(), conflict)
                 && event != TrigEvent::Delete
                 && self.prag.recursive_triggers;
             for t in self.catalog.triggers_on(ca, table.as_slice()) {
@@ -1240,7 +1242,8 @@ impl<S: Storage> Connection<S> {
                 .indexes_for(ca, table)
                 .any(|i| i.unique || i.opaque);
         match conflict {
-            ConflictAction::Abort => not_null || other,
+            // No OR clause (v0.16): conservatively, as ABORT.
+            ConflictAction::Abort | ConflictAction::Unset => not_null || other,
             // REPLACE: a NOT NULL without default and CHECK abort.
             ConflictAction::Replace => not_null || !t.checks.is_empty() || t.strict,
             _ => false,

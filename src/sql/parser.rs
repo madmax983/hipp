@@ -5,11 +5,12 @@
 //! SQLite must re-parse (§5.5) — and, since v0.16, nothing more:
 //! every item is walked clause by clause, because whatever is
 //! accepted is stored verbatim and must load on the pin. Foreign
-//! keys, constraint-level ON CONFLICT and DEFERRABLE are parsed
+//! keys (without the `foreign_keys` leaf) and DEFERRABLE are parsed
 //! and not enforced; CHECK, DEFAULT, generated columns, COLLATE,
-//! NOT NULL, PRIMARY KEY and UNIQUE are (CHECK and generated
-//! columns only with the v0.4 evaluator — the tiny profile refuses
-//! them).
+//! NOT NULL, PRIMARY KEY, UNIQUE and (v0.16, `v07`) their
+//! constraint-level ON CONFLICT clauses are (CHECK and generated
+//! columns only with the v0.4 evaluator, a FAIL / IGNORE / REPLACE
+//! clause only with `v07` — smaller builds refuse them).
 
 use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
@@ -18,6 +19,8 @@ use crate::record::Coll;
 
 #[cfg(feature = "v09")]
 use super::ast::CompoundOp;
+#[cfg(feature = "v16")]
+use super::ast::IndexHint;
 #[cfg(feature = "v04")]
 use super::ast::SortOrder;
 #[cfg(feature = "v07")]
@@ -652,52 +655,21 @@ pub fn has_autoincrement<E>(sql: &[u8], arena: &Arena) -> bool {
     (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT"))
 }
 
-/// Which constraint kinds of a `CREATE TABLE` text carry a
-/// constraint-level `ON CONFLICT ROLLBACK` (v0.16, `v16`): (a NOT
-/// NULL constraint, a UNIQUE or PRIMARY KEY constraint). hipp
-/// otherwise parses constraint-level conflict clauses without
-/// acting on them; this one decides whether a violation ends the
-/// whole transaction. Unlexable text: neither.
-#[cfg(feature = "v16")]
-pub fn rollback_constraints<E>(sql: &[u8], arena: &Arena) -> (bool, bool) {
-    let Ok(toks) = lexer::lex::<E>(sql, arena) else {
-        return (false, false);
-    };
-    let p = Parser::new(toks, arena, sql, Limits::PIN);
-    let tok = |i: usize| p.toks.as_slice().get(i).map(|t| t.tok);
-    let (mut nn, mut uq) = (false, false);
-    for i in 1..p.limit {
-        if !(p.is_kw(i, b"ON") && p.is_kw(i + 1, b"CONFLICT") && p.is_kw(i + 2, b"ROLLBACK")) {
-            continue;
-        }
-        // Back from the clause to the constraint's keyword: past a
-        // table constraint's column list and a PRIMARY KEY's order.
-        let mut j = i - 1;
-        if tok(j) == Some(Tok::RParen) {
-            let mut depth = 0usize;
-            loop {
-                match tok(j) {
-                    Some(Tok::RParen) => depth += 1,
-                    Some(Tok::LParen) => depth = depth.saturating_sub(1),
-                    _ => {}
-                }
-                if depth == 0 || j == 0 {
-                    break;
-                }
-                j -= 1;
-            }
-            j = j.saturating_sub(1);
-        }
-        if p.is_kw(j, b"ASC") || p.is_kw(j, b"DESC") {
-            j = j.saturating_sub(1);
-        }
-        if p.is_kw(j, b"NULL") && j > 0 && p.is_kw(j - 1, b"NOT") {
-            nn = true;
-        } else if p.is_kw(j, b"UNIQUE") || p.is_kw(j, b"KEY") {
-            uq = true;
-        }
+/// Two `ON CONFLICT` clauses of one PRIMARY KEY / UNIQUE
+/// constraint (v0.16, `v07`): a repeated constraint takes the
+/// clause either one gives; two different clauses are the pin's
+/// "conflicting ON CONFLICT clauses specified".
+#[cfg(feature = "v07")]
+fn merge_conflict<E>(
+    a: Option<ConflictAction>,
+    b: Option<ConflictAction>,
+    at: usize,
+) -> Result<Option<ConflictAction>, E> {
+    match (a, b) {
+        (Some(x), Some(y)) if x != y => Err(perr(at, ParseKind::ConflictingOnConflict)),
+        (Some(x), _) => Ok(Some(x)),
+        (None, y) => Ok(y),
     }
-    (nn, uq)
 }
 
 /// The pin's `SQLITE_LIMIT_SQL_LENGTH` check (v0.16): a statement
@@ -1030,12 +1002,21 @@ impl<'a> Parser<'a> {
     /// written (v0.16, `v16`: a qualified name never denotes a
     /// CTE).
     #[cfg(feature = "v16")]
-    fn name_q<E>(&mut self) -> Result<(ABytes, bool), E> {
+    fn name_q<E>(&mut self) -> Result<(ABytes, bool, bool), E> {
         let qualified = matches!(
             self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
             Some(Tok::Dot)
         );
-        Ok((self.name::<E>()?, qualified))
+        let temp = qualified && self.cur_is_kw(b"temp");
+        Ok((self.name::<E>()?, qualified, temp))
+    }
+
+    /// Whether `INDEXED BY` / `NOT INDEXED` starts here (v0.16):
+    /// then `INDEXED` is no alias.
+    #[cfg(feature = "v04")]
+    fn at_index_hint(&self) -> bool {
+        (self.cur_is_kw(b"INDEXED") && self.is_kw(self.pos + 1, b"BY"))
+            || (self.cur_is_kw(b"NOT") && self.is_kw(self.pos + 1, b"INDEXED"))
     }
 
     fn expect_end<E>(&mut self) -> Result<(), E> {
@@ -1473,7 +1454,9 @@ impl<'a> Parser<'a> {
                 x => (x, None),
             };
             let col = match inner {
-                Expr::Column { table: None, name } => Some(*name),
+                Expr::Column {
+                    table: None, name, ..
+                } => Some(*name),
                 Expr::Literal(Literal::Text(h)) => Some(*h),
                 _ => None,
             };
@@ -1745,7 +1728,7 @@ impl<'a> Parser<'a> {
         #[cfg(not(feature = "without_rowid"))]
         let without_rowid = false;
         #[cfg(feature = "indexes")]
-        let sets = self.dedupe_sets(sets, &columns, &pk_columns, without_rowid);
+        let sets = self.dedupe_sets::<E>(sets, &columns, &pk_columns, without_rowid)?;
         #[cfg(not(feature = "indexes"))]
         let _ = without_rowid;
         // Trailing clauses: WITHOUT ROWID is outside v0.1.
@@ -1781,13 +1764,13 @@ impl<'a> Parser<'a> {
     /// UNIQUE set by the PRIMARY KEY makes the earlier set the
     /// key's. The rowid-alias key (no index) never merges.
     #[cfg(feature = "indexes")]
-    fn dedupe_sets(
+    fn dedupe_sets<E>(
         &self,
         sets: AVec<ConstraintSet>,
         columns: &AVec<ColumnDef>,
         pk_columns: &AVec<ABytes>,
         without_rowid: bool,
-    ) -> AVec<ConstraintSet> {
+    ) -> Result<AVec<ConstraintSet>, E> {
         let name = |h: ABytes| handle_bytes(self.arena, h);
         let col = |h: ABytes| columns.iter().find(|c| eq_ci(name(c.name), name(h)));
         let alias = !without_rowid
@@ -1821,11 +1804,15 @@ impl<'a> Parser<'a> {
                     .find(|k| indexed(k) && same(k))
             {
                 k.primary_key |= s.primary_key;
+                #[cfg(feature = "v07")]
+                {
+                    k.conflict = merge_conflict::<E>(k.conflict, s.conflict, self.cur().offset)?;
+                }
                 continue;
             }
             out.push(s.clone());
         }
-        out
+        Ok(out)
     }
 
     /// The index of the `)` matching the `(` at token `k`,
@@ -2257,11 +2244,11 @@ impl<'a> Parser<'a> {
     }
 
     /// The optional `OR <action>` after INSERT / UPDATE (v0.7):
-    /// absent is `Abort` (the engine default).
+    /// absent is `Unset` (v0.16: the constraints' own clauses decide).
     #[cfg(feature = "v07")]
     fn conflict_clause<E>(&mut self) -> Result<ConflictAction, E> {
         if !self.eat_kw(b"OR") {
-            return Ok(ConflictAction::Abort);
+            return Ok(ConflictAction::Unset);
         }
         if self.eat_kw(b"IGNORE") {
             Ok(ConflictAction::Ignore)
@@ -2335,7 +2322,9 @@ impl<'a> Parser<'a> {
                     x => (x, None),
                 };
                 match inner {
-                    Expr::Column { table: None, name } => {
+                    Expr::Column {
+                        table: None, name, ..
+                    } => {
                         target.push(name);
                         target_exprs.push(None);
                     }
@@ -3253,7 +3242,7 @@ impl<'a> Parser<'a> {
         // is required at plan time.
         #[cfg(feature = "v16")]
         if let Tok::Ident(..) = self.cur().tok {
-            let (table, qualified) = self.name_q::<E>()?;
+            let (table, qualified, in_temp) = self.name_q::<E>()?;
             // `expr in_op nm dbnm paren_exprlist`; the subquery's
             // one result column (`*`) is a leaf.
             self.need::<E>(5)?;
@@ -3268,7 +3257,7 @@ impl<'a> Parser<'a> {
                 .alloc_copy_handle(handle_bytes(self.arena, table))?;
             return Ok(Expr::InSubquery(
                 Box::new(l),
-                Box::new(self.table_select(table, qualified)),
+                Box::new(self.table_select(table, qualified, in_temp)),
                 neg,
             ));
         }
@@ -3599,6 +3588,23 @@ impl<'a> Parser<'a> {
             match self.cur().tok {
                 Tok::Ident(h2, _) => {
                     self.pos += 1;
+                    // `nm DOT nm DOT nm` (v0.16, `v16`): a column of
+                    // table `h2` in database `h` — the pin's DOT node
+                    // over a leaf and another DOT.
+                    #[cfg(feature = "v16")]
+                    if matches!(self.cur().tok, Tok::Dot)
+                        && let Some(Tok::Ident(h3, _)) =
+                            self.toks.as_slice().get(self.pos + 1).map(|t| t.tok)
+                    {
+                        self.pos += 2;
+                        self.need::<E>(5)?;
+                        self.set_h::<E>(3, 0)?;
+                        return Ok(Expr::Column {
+                            table: Some(h2),
+                            name: h3,
+                            schema: Some(h),
+                        });
+                    }
                     // `nm DOT nm`: the pin's DOT node over
                     // two leaves.
                     self.need::<E>(3)?;
@@ -3606,6 +3612,8 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Column {
                         table: Some(h),
                         name: h2,
+                        #[cfg(feature = "v16")]
+                        schema: None,
                     });
                 }
                 _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
@@ -3621,6 +3629,8 @@ impl<'a> Parser<'a> {
         Ok(Expr::Column {
             table: None,
             name: h,
+            #[cfg(feature = "v16")]
+            schema: None,
         })
     }
 
@@ -4677,7 +4687,7 @@ impl<'a> Parser<'a> {
     /// `SELECT * FROM <table>` as an AST (v0.16: the subquery an
     /// `x IN table` operand stands for).
     #[cfg(feature = "v16")]
-    fn table_select(&self, table: ABytes, qualified: bool) -> SelectStmt {
+    fn table_select(&self, table: ABytes, qualified: bool, in_temp: bool) -> SelectStmt {
         let mut items = AVec::new();
         items.push(SelectItem::Star);
         let mut from = AVec::new();
@@ -4691,7 +4701,9 @@ impl<'a> Parser<'a> {
             using: AVec::new(),
             args: None,
             qualified,
+            in_temp,
             cte: None,
+            indexed: None,
         });
         SelectStmt {
             distinct: false,
@@ -4921,7 +4933,11 @@ impl<'a> Parser<'a> {
                     #[cfg(feature = "v16")]
                     qualified: false,
                     #[cfg(feature = "v16")]
+                    in_temp: false,
+                    #[cfg(feature = "v16")]
                     cte: None,
+                    #[cfg(feature = "v16")]
+                    indexed: None,
                 }));
             }
         }
@@ -4939,7 +4955,7 @@ impl<'a> Parser<'a> {
         fb: usize,
     ) -> Result<FromSource, E> {
         #[cfg(feature = "v16")]
-        let (table, qualified) = self.name_q::<E>()?;
+        let (table, qualified, in_temp) = self.name_q::<E>()?;
         #[cfg(not(feature = "v16"))]
         let table = self.name::<E>()?;
         // A table-valued function (v0.16): `name(arg, ...)`.
@@ -4961,7 +4977,19 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let alias = self.opt_alias();
+        let alias = if self.at_index_hint() {
+            None
+        } else {
+            self.opt_alias()
+        };
+        // `stl_prefix nm dbnm as indexed_opt on_using` (a function
+        // call takes none).
+        #[cfg(feature = "v16")]
+        let indexed = if args.is_none() {
+            self.index_hint::<E>()?
+        } else {
+            None
+        };
         // `stl_prefix nm dbnm as ON expr`.
         let (on, using) = self.join_constraint::<E>(natural, first, fb + 5)?;
         Ok(FromSource {
@@ -4977,7 +5005,11 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "v16")]
             qualified,
             #[cfg(feature = "v16")]
+            in_temp,
+            #[cfg(feature = "v16")]
             cte: None,
+            #[cfg(feature = "v16")]
+            indexed,
         })
     }
 
@@ -5275,26 +5307,61 @@ UPDATE USING VALUES WHEN WHERE",
             }
     }
 
-    /// Skip an optional `ON CONFLICT <action>` at token `i`,
-    /// returning the next index. Parsed, not acted on (an
-    /// honest gap: such a write errors where the pin resolves).
-    fn onconf<E>(&self, i: usize, to: usize) -> Result<usize, E> {
+    /// An optional constraint-level `ON CONFLICT <action>` at token
+    /// `i`: the next index and the action (`None` when absent).
+    /// v0.16: the action is kept (`v07`) and honoured by the write
+    /// paths; a build without the conflict-resolving write path
+    /// refuses FAIL / IGNORE / REPLACE rather than ignore them.
+    /// `acts`: whether the clause takes effect (a CHECK's is parsed
+    /// and ignored, as on the pin, so it is never refused).
+    fn onconf<E>(
+        &self,
+        i: usize,
+        to: usize,
+        acts: bool,
+    ) -> Result<(usize, Option<ConflictAction>), E> {
         if !self.is_kw(i, b"ON") {
-            return Ok(i);
+            return Ok((i, None));
         }
-        if i + 2 < to
-            && self.is_kw(i + 1, b"CONFLICT")
-            && [
-                b"ROLLBACK" as &[u8],
-                b"ABORT",
-                b"FAIL",
-                b"IGNORE",
-                b"REPLACE",
-            ]
-            .iter()
-            .any(|w| self.is_kw(i + 2, w))
-        {
-            return Ok(i + 3);
+        if i + 2 < to && self.is_kw(i + 1, b"CONFLICT") {
+            let w = i + 2;
+            let act = if self.is_kw(w, b"ROLLBACK") {
+                #[cfg(feature = "v16")]
+                let a = ConflictAction::Rollback;
+                #[cfg(not(feature = "v16"))]
+                let a = ConflictAction::Abort;
+                Some(a)
+            } else if self.is_kw(w, b"ABORT") {
+                Some(ConflictAction::Abort)
+            } else if self.is_kw(w, b"FAIL")
+                || self.is_kw(w, b"IGNORE")
+                || self.is_kw(w, b"REPLACE")
+            {
+                #[cfg(feature = "v07")]
+                let a = if self.is_kw(w, b"FAIL") {
+                    ConflictAction::Fail
+                } else if self.is_kw(w, b"IGNORE") {
+                    ConflictAction::Ignore
+                } else {
+                    ConflictAction::Replace
+                };
+                #[cfg(not(feature = "v07"))]
+                if acts {
+                    return Err(perr(
+                        self.toks.as_slice()[w].offset,
+                        ParseKind::RequiresConflictResolution,
+                    ));
+                }
+                #[cfg(not(feature = "v07"))]
+                let a = ConflictAction::Abort;
+                let _ = acts;
+                Some(a)
+            } else {
+                None
+            };
+            if act.is_some() {
+                return Ok((i + 3, act));
+            }
         }
         Err(perr(self.item_end_offset(i), ParseKind::UnexpectedToken))
     }
@@ -5601,11 +5668,16 @@ UPDATE USING VALUES WHEN WHERE",
                             pk_names.push(c.name);
                         }
                     }
+                    let (n, conf) = self.onconf::<E>(next, to, true)?;
+                    i = n;
+                    #[cfg(not(feature = "v07"))]
+                    let _ = conf;
                     sets.push(ConstraintSet {
                         primary_key: pk,
                         columns: cols,
+                        #[cfg(feature = "v07")]
+                        conflict: conf,
                     });
-                    i = self.onconf::<E>(next, to)?;
                 } else if self.is_kw(i, b"CHECK") {
                     // Table-level CHECK (v0.16): enforced on every
                     // write path through the v0.4 evaluator; a
@@ -5615,7 +5687,7 @@ UPDATE USING VALUES WHEN WHERE",
                     {
                         let (close, text) = self.paren_text::<E>(i + 1, to)?;
                         checks.push(text);
-                        i = self.onconf::<E>(close + 1, to)?;
+                        i = self.onconf::<E>(close + 1, to, false)?.0;
                     }
                     #[cfg(not(feature = "v04"))]
                     return Err(perr(
@@ -5705,6 +5777,9 @@ UPDATE USING VALUES WHEN WHERE",
         let mut unique = false;
         let mut default: Option<Literal> = None;
         let mut not_null = false;
+        // The constraints' own ON CONFLICT clauses (v0.16, `v07`).
+        #[cfg(feature = "v07")]
+        let (mut nn_conf, mut pk_conf, mut uq_conf) = (None, None, None);
         #[cfg(any(feature = "v04", feature = "indexes"))]
         let mut coll = None;
         // Without the evaluator (tiny) neither can become true:
@@ -5794,10 +5869,19 @@ UPDATE USING VALUES WHEN WHERE",
                 }
                 i = next;
             } else if self.is_kw(i, b"NULL") {
-                i = self.onconf::<E>(i + 1, to)?;
+                i = self.onconf::<E>(i + 1, to, false)?.0;
             } else if self.is_kw(i, b"NOT") && self.is_kw(i + 1, b"NULL") {
                 not_null = true;
-                i = self.onconf::<E>(i + 2, to)?;
+                let (n, c) = self.onconf::<E>(i + 2, to, true)?;
+                i = n;
+                // The last NOT NULL's clause, as the pin's
+                // `sqlite3AddNotNull` (no clause: the default).
+                #[cfg(feature = "v07")]
+                {
+                    nn_conf = c;
+                }
+                #[cfg(not(feature = "v07"))]
+                let _ = c;
             } else if self.is_kw(i, b"NOT") || self.is_kw(i, b"DEFERRABLE") {
                 let next = self.deferrable(i);
                 if next == i {
@@ -5822,13 +5906,29 @@ UPDATE USING VALUES WHEN WHERE",
                 } else if self.is_kw(i, b"ASC") {
                     i += 1;
                 }
-                i = self.onconf::<E>(i, to)?;
+                let (n, c) = self.onconf::<E>(i, to, true)?;
+                i = n;
+                #[cfg(feature = "v07")]
+                {
+                    pk_conf = c;
+                }
+                #[cfg(not(feature = "v07"))]
+                let _ = c;
                 if self.is_kw(i, b"AUTOINCREMENT") {
                     i += 1;
                 }
             } else if self.is_kw(i, b"UNIQUE") {
                 unique = true;
-                i = self.onconf::<E>(i + 1, to)?;
+                let (n, c) = self.onconf::<E>(i + 1, to, true)?;
+                // A repeated UNIQUE is the same constraint: its
+                // clauses merge as the pin's duplicate-index rule.
+                #[cfg(feature = "v07")]
+                {
+                    uq_conf = merge_conflict::<E>(uq_conf, c, self.toks.as_slice()[i].offset)?;
+                }
+                #[cfg(not(feature = "v07"))]
+                let _ = c;
+                i = n;
             } else if self.is_kw(i, b"CHECK") {
                 // Column-level CHECK (v0.16): a table check like
                 // any other.
@@ -5932,6 +6032,8 @@ UPDATE USING VALUES WHEN WHERE",
             coll,
             #[cfg(feature = "v16")]
             dflt_text,
+            #[cfg(feature = "v07")]
+            nn_conflict: nn_conf,
         });
         // Constraint sets in statement order (v0.3): an inline
         // PRIMARY KEY / UNIQUE is a one-column set at this item's
@@ -5953,6 +6055,8 @@ UPDATE USING VALUES WHEN WHERE",
             sets.push(ConstraintSet {
                 primary_key: true,
                 columns: cols,
+                #[cfg(feature = "v07")]
+                conflict: pk_conf,
             });
         }
         if unique {
@@ -5968,6 +6072,8 @@ UPDATE USING VALUES WHEN WHERE",
             sets.push(ConstraintSet {
                 primary_key: false,
                 columns: cols,
+                #[cfg(feature = "v07")]
+                conflict: uq_conf,
             });
         }
         Ok(false)
@@ -6104,6 +6210,11 @@ impl<'a> Parser<'a> {
         // OR clause: under v05 alone only IGNORE widens behaviour
         // (ABORT/FAIL/ROLLBACK are the default); OR REPLACE is a
         // v0.7 addition, rejected by name without the feature.
+        // No OR clause: each constraint's own clause decides (v0.16,
+        // `v07`; below it there are none).
+        #[cfg(feature = "v07")]
+        let mut conflict = ConflictAction::Unset;
+        #[cfg(not(feature = "v07"))]
         let mut conflict = ConflictAction::Abort;
         if self.eat_kw(b"OR") {
             if self.eat_kw(b"IGNORE") {
@@ -6127,20 +6238,29 @@ impl<'a> Parser<'a> {
                 {
                     conflict = ConflictAction::Rollback;
                 }
-            } else if !self.eat_kw(b"ABORT") {
+                #[cfg(not(feature = "v16"))]
+                {
+                    conflict = ConflictAction::Abort;
+                }
+            } else if self.eat_kw(b"ABORT") {
+                // An explicit OR ABORT overrides the constraints'
+                // own clauses (v0.16).
+                conflict = ConflictAction::Abort;
+            } else {
                 return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
             }
-            // OR ABORT: the engine's default (abort the statement)
-            // — nothing to record.
         }
         let table = self.name::<E>()?;
         // The alias is optional, but `SET` must not be eaten as
-        // one (it is not in the clause-keyword stop list).
-        let alias = if self.cur_is_kw(b"SET") {
+        // one (it is not in the clause-keyword stop list), nor
+        // (v0.16) the `INDEXED` of `INDEXED BY`.
+        let alias = if self.cur_is_kw(b"SET") || self.at_index_hint() {
             None
         } else {
             self.opt_alias()
         };
+        #[cfg(feature = "v16")]
+        let indexed = self.index_hint::<E>()?;
         self.expect_kw::<E>(b"SET")?;
         // `with UPDATE orconf xfullname indexed_opt SET nm EQ expr`.
         let assignments = self.set_list::<E>(9)?;
@@ -6183,7 +6303,25 @@ impl<'a> Parser<'a> {
             from,
             filter,
             returning,
+            #[cfg(feature = "v16")]
+            indexed,
         })
+    }
+
+    /// An optional `INDEXED BY name` / `NOT INDEXED` (v0.16, `v16`;
+    /// the pin's `indexed_opt`: the name is a plain `nm`).
+    #[cfg(feature = "v16")]
+    fn index_hint<E>(&mut self) -> Result<Option<IndexHint>, E> {
+        if !self.at_index_hint() {
+            return Ok(None);
+        }
+        if self.eat_kw(b"NOT") {
+            self.pos += 1;
+            return Ok(Some(IndexHint::Not));
+        }
+        self.pos += 2;
+        let (name, _) = self.nm_tok::<E>()?;
+        Ok(Some(IndexHint::By(name)))
     }
 
     /// The optional `FROM <source> [, <source> | JOIN ...]` of
@@ -6201,6 +6339,8 @@ impl<'a> Parser<'a> {
         self.expect_kw::<E>(b"DELETE")?;
         self.expect_kw::<E>(b"FROM")?;
         let table = self.name::<E>()?;
+        #[cfg(feature = "v16")]
+        let indexed = self.index_hint::<E>()?;
         // `with DELETE FROM xfullname indexed_opt WHERE expr`.
         let filter = if self.eat_kw(b"WHERE") {
             Some(self.item::<E>(7)?)
@@ -6215,6 +6355,8 @@ impl<'a> Parser<'a> {
             table,
             filter,
             returning,
+            #[cfg(feature = "v16")]
+            indexed,
         })
     }
 
@@ -6647,7 +6789,7 @@ pub fn star_select(
 ) -> SelectStmt {
     let toks = AVec::new();
     let p = Parser::new(toks, arena, &[], Limits::PIN);
-    let mut s = p.table_select(table, false);
+    let mut s = p.table_select(table, false, false);
     if let Some(f) = s.from.as_mut_slice().first_mut() {
         f.alias = alias;
     }
@@ -6749,6 +6891,28 @@ mod tests {
         ] {
             assert_eq!(kind(sql), None, "{sql}");
         }
+        // Constraint-level FAIL / IGNORE / REPLACE (v0.16): kept with
+        // the conflict-resolving write path, refused below it.
+        for sql in [
+            "CREATE TABLE t(a INT PRIMARY KEY ASC ON CONFLICT IGNORE, b UNIQUE ON CONFLICT FAIL)",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL ON CONFLICT REPLACE)",
+            "CREATE TABLE t(a, b, UNIQUE (b) ON CONFLICT REPLACE)",
+        ] {
+            #[cfg(feature = "v07")]
+            assert_eq!(kind(sql), None, "{sql}");
+            #[cfg(not(feature = "v07"))]
+            assert_eq!(
+                kind(sql),
+                Some(ParseKind::RequiresConflictResolution),
+                "{sql}"
+            );
+        }
+        // A CHECK's clause is ignored (as on the pin), never refused.
+        #[cfg(feature = "v04")]
+        assert_eq!(
+            kind("CREATE TABLE t(a, CHECK (a > 0) ON CONFLICT IGNORE)"),
+            None
+        );
     }
 
     /// v0.16, every build: CREATE TABLE items follow the pin's
@@ -6804,12 +6968,11 @@ mod tests {
             "CREATE TABLE t(a 'text' \"int\" [x] `y`, b VARCHAR(-10, +20.5))",
             "CREATE TABLE t(a DOUBLE PRECISION(10), b UNSIGNED BIG INT, c KEY)",
             "CREATE TABLE t(a, key INT, natural, indexed, left)",
-            "CREATE TABLE t(a INT PRIMARY KEY ASC ON CONFLICT IGNORE, b UNIQUE ON CONFLICT ABORT)",
-            "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL ON CONFLICT REPLACE)",
+            "CREATE TABLE t(a INT PRIMARY KEY ASC ON CONFLICT ROLLBACK, b UNIQUE ON CONFLICT ABORT)",
             "CREATE TABLE t(a NULL NOT NULL DEFAULT 1 DEFAULT 2 CONSTRAINT c CONSTRAINT 'd')",
             "CREATE TABLE t(a REFERENCES p (x) ON DELETE CASCADE ON UPDATE SET NULL \
              MATCH FULL ON INSERT NO ACTION NOT DEFERRABLE INITIALLY IMMEDIATE, b DEFERRABLE)",
-            "CREATE TABLE t(a, b, PRIMARY KEY (a DESC, b ASC) ON CONFLICT FAIL UNIQUE (b) \
+            "CREATE TABLE t(a, b, PRIMARY KEY (a DESC, b ASC) ON CONFLICT ABORT UNIQUE (b) \
              CONSTRAINT f FOREIGN KEY (a, b) REFERENCES p ON DELETE SET DEFAULT \
              DEFERRABLE INITIALLY DEFERRED, CONSTRAINT lone)",
             "CREATE TABLE t(a INTEGER, PRIMARY KEY (a AUTOINCREMENT))",

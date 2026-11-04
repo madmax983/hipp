@@ -291,10 +291,13 @@ fn never_in_the_file_and_gone_on_close() {
     });
 }
 
-/// A statement naming objects of both databases runs on the pin;
-/// hipp refuses it rather than reading the wrong one.
+/// A statement naming objects of both databases (v0.16 gaps unit):
+/// a main statement reads TEMP tables, and a temp INSERT / CREATE
+/// TABLE ... AS is fed by a SELECT over main (`tests/gaps_v16.rs`
+/// compares the results with the pin). A temp UPDATE / DELETE that
+/// reads main is still refused rather than read the wrong table.
 #[test]
-fn refused_when_both_databases_meet() {
+fn both_databases_meet() {
     let p = common::temp_db("v16tm-mixed");
     common::cli(&p, "CREATE TABLE m(a); INSERT INTO m VALUES (1);");
     block_on(async {
@@ -308,12 +311,20 @@ fn refused_when_both_databases_meet() {
             "INSERT INTO m SELECT * FROM x",
             "SELECT (SELECT count(*) FROM x) FROM m",
             "CREATE TEMP TABLE y AS SELECT * FROM m",
-            "CREATE INDEX temp.mi ON m(a)",
             "SELECT * FROM main.m JOIN temp.x",
+        ] {
+            let mut q = db.prepare(sql).await.expect(sql);
+            while q.step().await.expect(sql) == Step::Row {}
+        }
+        for sql in [
+            "UPDATE x SET a = (SELECT max(a) FROM m)",
+            "DELETE FROM x WHERE a IN (SELECT a FROM m)",
         ] {
             let r = db.prepare(sql).await.map(|_| ());
             assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
         }
+        let r = db.prepare("CREATE INDEX temp.mi ON m(a)").await.map(|_| ());
+        assert!(r.is_err(), "{r:?}");
     });
 }
 

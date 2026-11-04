@@ -58,6 +58,10 @@ pub struct Column {
     /// `COLLATE` clause was written).
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub coll: Coll,
+    /// The NOT NULL constraint's own `ON CONFLICT` clause (v0.16,
+    /// `v07`; `None`: none).
+    #[cfg(feature = "v07")]
+    pub nn_conflict: Option<crate::sql::ConflictAction>,
 }
 
 /// One column of an index key (v0.3). `col == None` is the rowid
@@ -78,6 +82,9 @@ pub struct IndexColumn {
 pub struct AutoSet {
     pub primary_key: bool,
     pub columns: AVec<IndexColumn>,
+    /// The constraint's own `ON CONFLICT` clause (v0.16, `v07`).
+    #[cfg(feature = "v07")]
+    pub conflict: Option<crate::sql::ConflictAction>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +127,11 @@ pub struct TableDef {
     /// no rowid and no rowid alias.
     #[cfg(feature = "without_rowid")]
     pub without_rowid: bool,
+    /// The INTEGER PRIMARY KEY's own `ON CONFLICT` clause (v0.16,
+    /// `v07`): how a rowid conflict resolves (the pin's
+    /// `keyConf`); `None` when it has none.
+    #[cfg(feature = "v07")]
+    pub ipk_conflict: Option<crate::sql::ConflictAction>,
 }
 
 impl TableDef {
@@ -204,6 +216,11 @@ pub struct IndexDef {
     /// clustered tree, and its key columns are the table's key.
     #[cfg(feature = "without_rowid")]
     pub clustered: bool,
+    /// A UNIQUE / PRIMARY KEY constraint's own `ON CONFLICT`
+    /// clause (v0.16, `v07`): the automatic index's; `None` for
+    /// an explicit index and a constraint without one.
+    #[cfg(feature = "v07")]
+    pub conflict: Option<crate::sql::ConflictAction>,
 }
 
 /// What an expression or partial index adds to its key columns
@@ -529,9 +546,12 @@ fn place_clustered_keys(
             autos += 1;
         }
         let at = at.unwrap_or_else(|| last.map_or(catalog.indexes.len(), |l| l + 1));
-        let Some(columns) = t.auto_sets.as_slice().get(k).map(|s| s.columns.clone()) else {
+        let Some(set) = t.auto_sets.as_slice().get(k) else {
             continue;
         };
+        let columns = set.columns.clone();
+        #[cfg(feature = "v07")]
+        let conflict = set.conflict;
         adds.push((
             at,
             IndexDef {
@@ -546,6 +566,8 @@ fn place_clustered_keys(
                 #[cfg(feature = "expr_index")]
                 ext: None,
                 clustered: true,
+                #[cfg(feature = "v07")]
+                conflict,
             },
         ));
     }
@@ -623,6 +645,7 @@ pub async fn build_catalog<S: Storage>(
                 gen_expr: None,
                 stored: false,
                 coll: Coll::Binary,
+                nn_conflict: None,
             });
         }
         catalog.schema_table = Some(TableDef {
@@ -640,6 +663,7 @@ pub async fn build_catalog<S: Storage>(
             triggered: false,
             #[cfg(feature = "without_rowid")]
             without_rowid: false,
+            ipk_conflict: None,
         });
     }
     // Scratch arena for parse trees (names are interned out of it
@@ -682,6 +706,8 @@ pub async fn build_catalog<S: Storage>(
                     triggered: false,
                     #[cfg(feature = "without_rowid")]
                     without_rowid: false,
+                    #[cfg(feature = "v07")]
+                    ipk_conflict: None,
                 });
                 continue;
             }
@@ -779,9 +805,20 @@ pub async fn build_catalog<S: Storage>(
                 stored: c.stored,
                 #[cfg(any(feature = "v04", feature = "indexes"))]
                 coll: c.coll.unwrap_or_default(),
+                #[cfg(feature = "v07")]
+                nn_conflict: if c.not_null { c.nn_conflict } else { None },
             });
         }
         let rowid_alias = alias;
+        // The rowid alias's PRIMARY KEY clause (v0.16, `v07`).
+        #[cfg(feature = "v07")]
+        let ipk_conflict = match rowid_alias {
+            Some(_) => constraint_sets
+                .iter()
+                .find(|s| s.primary_key)
+                .and_then(|s| s.conflict),
+            None => None,
+        };
         #[cfg(feature = "indexes")]
         #[allow(unused_mut)]
         let mut auto_sets = resolve_auto_sets(
@@ -842,6 +879,8 @@ pub async fn build_catalog<S: Storage>(
             }),
             #[cfg(feature = "without_rowid")]
             without_rowid,
+            #[cfg(feature = "v07")]
+            ipk_conflict,
         });
     }
 
@@ -882,6 +921,8 @@ pub async fn build_catalog<S: Storage>(
                 opaque: true,
                 #[cfg(feature = "without_rowid")]
                 clustered: false,
+                #[cfg(feature = "v07")]
+                conflict: None,
             });
             continue;
         }
@@ -904,6 +945,8 @@ pub async fn build_catalog<S: Storage>(
                     ext: None,
                     #[cfg(feature = "without_rowid")]
                     clustered: false,
+                    #[cfg(feature = "v07")]
+                    conflict: None,
                 };
                 match parsed {
                     Ok(Ast::CreateIndex {
@@ -1003,6 +1046,8 @@ pub async fn build_catalog<S: Storage>(
                     ext: None,
                     #[cfg(feature = "without_rowid")]
                     clustered: false,
+                    #[cfg(feature = "v07")]
+                    conflict: set.as_ref().and_then(|s| s.conflict),
                 });
             }
         }
@@ -1218,7 +1263,7 @@ fn derive_view_columns(
             crate::sql::SelectItem::Expr(e, alias, text) => {
                 let name: &[u8] = if let Some(a) = alias {
                     handle_bytes(scratch, *a)
-                } else if let crate::sql::Expr::Column { table, name } = e {
+                } else if let crate::sql::Expr::Column { table, name, .. } = e {
                     // v0.16: the referenced column's own spelling
                     // (the pin names `SELECT A FROM s` column `a`).
                     let nb = handle_bytes(scratch, *name);
@@ -1338,6 +1383,8 @@ fn resolve_auto_sets(
             auto_sets.push(AutoSet {
                 primary_key: s.primary_key,
                 columns: set_cols,
+                #[cfg(feature = "v07")]
+                conflict: s.conflict,
             });
         }
     }

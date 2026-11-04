@@ -241,6 +241,7 @@ impl Walker<'_> {
             Expr::Column {
                 table: Some(q),
                 name,
+                ..
             } => {
                 let qb = handle_bytes(self.arena, *q);
                 let nb = handle_bytes(self.arena, *name);

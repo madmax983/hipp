@@ -123,6 +123,10 @@ v10 = ["v09"]
 # Builds on the v0.11 subquery machinery (a LIMIT may be a
 # scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
 # so it implies `v10`. The tiny profile excludes it per §2.
+# The honest-gap sweep adds INDEXED BY / NOT INDEXED, three-part
+# column names and statements across the TEMP and main databases.
+# (Constraint-level ON CONFLICT clauses are *not* gated here: they
+# correct claimed `v07` write paths.)
 v16 = ["v10"]
 # v0.16 leaf (ADR 0001): bound parameters -- `?`, `?NNN`, `:name`,
 # `@name`, `$name` with the pin's numbering, the Statement bind_*

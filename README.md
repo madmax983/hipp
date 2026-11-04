@@ -413,8 +413,7 @@ aspirations.
   takes an unused one. Gaps: whole-database ANALYZE row order (the
   pin's schema hash), VACUUM of a file with an expression or
   partial index without `expr_index`, VACUUM of an auto-vacuum file (refused: hipp
-  writes no pointer maps), constraint-level ROLLBACK matched by
-  constraint kind (STATUS.md).
+  writes no pointer maps; kept by the honest-gap sweep) (STATUS.md).
 - **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
   `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
   [COLUMN] a` edit the stored schema texts token by token exactly
@@ -443,9 +442,9 @@ aspirations.
   `sqlite_sequence` row, `sqlite_*` tables can no longer be
   indexed, altered or dropped, and ADD COLUMN on a table with
   table constraints no longer writes unparsable text (tiny +28 B).
-  Gaps: a statement naming a temp table and a main object
-  (`INSERT INTO temp_t SELECT ... FROM main_t`, a join of both)
-  is refused, as is ALTER TABLE of a main table a TEMP view reads;
+  Gaps: a temp UPDATE / DELETE that reads main tables is refused
+  (statements mixing the two databases otherwise run since the
+  honest-gap sweep), as is ALTER TABLE of a main table a TEMP view reads;
   files with triggers cannot be altered without the `triggers`
   feature (with it, their texts are rewritten as the pin's);
   re-created tables can get
@@ -705,6 +704,26 @@ aspirations.
   is the pin's WAL, no longer a silent query; `PRAGMA synchronous
   = ...` inside a transaction is the pin's error. Gaps and sizes
   in STATUS.md.
+- **Honest-gap sweep.** Constraint-level `ON CONFLICT` clauses
+  (`NOT NULL` / `UNIQUE` / `PRIMARY KEY ... ON CONFLICT ROLLBACK |
+  ABORT | FAIL | IGNORE | REPLACE`) are honoured instead of
+  ignored (ungated from `v07`; below it FAIL / IGNORE / REPLACE are
+  refused at parse) with the pin's precedence — an explicit `OR`
+  clause, then the constraint's, then ABORT — its index order
+  (REPLACE indexes and the rowid REPLACE last), NOT NULL ...
+  REPLACE defaults, CHECK ignoring its clause, and the upsert /
+  trigger / foreign-key interplay. Behind `v16`: `INDEXED BY name`
+  / `NOT INDEXED` in FROM, UPDATE and DELETE (the pin's "no such
+  index" and "no query solution"; with `expr_index` the planner uses
+  exactly that index, or none); three-part column names
+  `main.t.col` / `temp.t.col` everywhere the pin takes them, so
+  pin-written CHECK and partial-index texts that use them are no
+  longer opaque; and statements across the TEMP and main databases
+  — main statements reading temp tables, `INSERT INTO temp.x SELECT
+  ... FROM main.y` and `CREATE TEMP TABLE x AS SELECT ...` over main,
+  TEMP views over both, pragma functions on temp objects. VACUUM of
+  an auto-vacuum file stays refused (no pointer-map upkeep). Gaps
+  and sizes in STATUS.md.
 
 ## What v0.13 does
 

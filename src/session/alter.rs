@@ -240,7 +240,7 @@ type Change = (usize, AVec<u8>, AVec<u8>, Option<AVec<u8>>);
 fn walk_cols(e: &Expr, out: &mut AVec<(Option<ABytes>, ABytes)>) {
     use crate::sql::Expr as X;
     match e {
-        X::Column { table, name } => out.push((*table, *name)),
+        X::Column { table, name, .. } => out.push((*table, *name)),
         X::Binary(_, a, b) | X::Like(a, b, _) => {
             walk_cols(a, out);
             walk_cols(b, out);
@@ -680,7 +680,9 @@ impl<S: Storage> Connection<S> {
                         using: AVec::new(),
                         args: None,
                         qualified: false,
+                        in_temp: false,
                         cte: None,
+                        indexed: None,
                     });
                     probe.filter = None;
                     probe.group_by = AVec::new();
@@ -1596,7 +1598,10 @@ fn compound_order_hits(s: &SelectStmt, arena: &Arena, hits: &mut AVec<crate::que
         return;
     }
     for (e, _) in s.order_by.iter() {
-        let Expr::Column { table: None, name } = e else {
+        let Expr::Column {
+            table: None, name, ..
+        } = e
+        else {
             continue;
         };
         let n = handle_bytes(arena, *name);

@@ -376,46 +376,34 @@ impl<S: Storage> Statement<'_, S> {
 
     /// Whether `e`, a constraint violation of this INSERT / UPDATE,
     /// resolves by ROLLBACK and so ends the whole transaction, as on
-    /// the pin: the statement's `OR ROLLBACK`, or, under the default
-    /// action, the table's constraint-level `ON CONFLICT ROLLBACK`
-    /// on a constraint of the violated kind (NOT NULL; UNIQUE /
-    /// PRIMARY KEY). CHECK constraints take no conflict clause.
+    /// the pin: the statement's `OR ROLLBACK`, or, without an OR
+    /// clause, the failed constraint's own `ON CONFLICT ROLLBACK`
+    /// (NOT NULL; UNIQUE / PRIMARY KEY; v0.16: the very constraint
+    /// that failed, recorded in `fail_act`). CHECK constraints take
+    /// no conflict clause.
     pub(super) fn resolves_rollback(&self, e: &Error<S::Error>) -> bool {
-        let (conflict, root) = match &self.plan {
-            Plan::Insert { conflict, root, .. } | Plan::Update { conflict, root, .. } => {
-                (*conflict, *root)
+        let conflict = match &self.plan {
+            Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
+            _ => return false,
+        };
+        if !matches!(
+            e,
+            Error::Schema {
+                kind: SchemaKind::NotNullViolation
+                    | SchemaKind::UniqueViolation
+                    | SchemaKind::DuplicateRowid
+                    | SchemaKind::CheckViolation,
             }
-            _ => return false,
-        };
-        let (nn, uq) = match e {
-            Error::Schema {
-                kind: SchemaKind::NotNullViolation,
-            } => (true, false),
-            Error::Schema {
-                kind: SchemaKind::UniqueViolation | SchemaKind::DuplicateRowid,
-            } => (false, true),
-            Error::Schema {
-                kind: SchemaKind::CheckViolation,
-            } => (false, false),
-            _ => return false,
-        };
+        ) {
+            return false;
+        }
         if self.upsert_failed {
             return false;
         }
-        match conflict {
-            ConflictAction::Rollback => return true,
-            ConflictAction::Abort => {}
-            _ => return false,
-        }
-        let ca = &self.conn.catalog_arena;
-        let Some(t) = self.conn.catalog.tables.iter().find(|t| t.root == root) else {
-            return false;
-        };
-        let (rn, ru) = crate::sql::parser::rollback_constraints::<S::Error>(
-            handle_bytes(ca, t.sql),
-            &self.arena,
-        );
-        (nn && rn) || (uq && ru)
+        // The failing constraint's own action when it resolved by its
+        // clause (NOT NULL, UNIQUE / PRIMARY KEY, the rowid); a CHECK
+        // takes the statement's.
+        self.fail_act.get().unwrap_or(conflict) == ConflictAction::Rollback
     }
 
     pub(super) async fn step_maint(&mut self) -> Result<Step, S::Error> {

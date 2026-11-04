@@ -30,8 +30,17 @@ pub enum SchemaKind {
     /// substitution whose column default is itself NULL, and
     /// unconditionally for an upsert DO UPDATE result row.
     NotNullViolation,
-    /// `DROP INDEX` named an index that does not exist (v0.3).
+    /// `DROP INDEX` named an index that does not exist (v0.3);
+    /// v0.16 (`v16`): an `INDEXED BY` naming no index of its table
+    /// (or naming one on a view or CTE) — the pin's "no such
+    /// index". Name one of the table's indexes, or drop the clause.
     UnknownIndex,
+    /// `INDEXED BY` names a partial index the statement's WHERE
+    /// does not imply (v0.16, `expr_index`; the pin's "no query
+    /// solution"). Add the index's WHERE condition to the query, or
+    /// name another index.
+    #[cfg(feature = "expr_index")]
+    NoQuerySolution,
     /// `DROP INDEX` named an index owned by a UNIQUE / PRIMARY KEY
     /// constraint, which SQLite refuses to drop (v0.3).
     DropAutoIndex,
@@ -690,6 +699,20 @@ pub enum ParseKind {
     /// ignoring the clause. Build with feature `v04` (or
     /// `full`), or drop the clause.
     RequiresEvaluator,
+    /// A constraint-level `ON CONFLICT FAIL | IGNORE | REPLACE`
+    /// in a build without the conflict-resolving write path
+    /// (v0.16; below `v07`): hipp cannot resolve the violation as
+    /// the pin would, so it refuses the table instead of ignoring
+    /// the clause. Build with feature `v07` (or `full`), or drop
+    /// the clause (ABORT and ROLLBACK need no feature).
+    #[cfg(not(feature = "v07"))]
+    RequiresConflictResolution,
+    /// Two PRIMARY KEY / UNIQUE constraints on the same columns
+    /// with different `ON CONFLICT` clauses (v0.16, `v07`; the
+    /// pin's "conflicting ON CONFLICT clauses specified"). Give
+    /// them one clause, or drop the repeat.
+    #[cfg(feature = "v07")]
+    ConflictingOnConflict,
     /// `?0`, or `?NNN` past 32766 (v0.16, `params`; the pin's
     /// "variable number must be between ?1 and ?32766"). Number
     /// parameters from ?1 up to ?32766.

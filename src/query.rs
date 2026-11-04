@@ -546,6 +546,12 @@ pub struct SourceDesc {
     /// trace, with whether the source was read under an alias.
     #[cfg(feature = "v16")]
     pub trace: Option<(alloc::rc::Rc<core::cell::RefCell<AlterTrace>>, bool)>,
+    /// The database a table or view source lives in (v0.16, `v16`):
+    /// 1 main, 2 temp; 0 for anything else (a derived table, a CTE,
+    /// `excluded`), which no three-part name `schema.table.column`
+    /// reaches.
+    #[cfg(feature = "v16")]
+    pub db: u8,
     /// A `json_each` / `json_tree` source (v0.16, `json`): its
     /// `json` and `root` columns are hidden from `*`, and its
     /// `value` column carries the JSON subtype for an array or
@@ -668,6 +674,8 @@ impl SourceDesc {
             schema_table: false,
             #[cfg(feature = "v16")]
             trace: None,
+            #[cfg(feature = "v16")]
+            db: 0,
             #[cfg(feature = "json")]
             json_tvf: 0,
         }
@@ -898,6 +906,26 @@ pub struct SubSource {
     /// scans the table in rowid order.
     #[cfg(feature = "expr_index")]
     pub access: Option<Box<crate::xplan::IdxAccess>>,
+    /// The source's `INDEXED BY` / `NOT INDEXED` (v0.16,
+    /// `expr_index`), which the access planner obeys.
+    #[cfg(feature = "expr_index")]
+    pub hint: Hint,
+    /// The table is the TEMP database's (v0.16, `v16`): a main
+    /// statement reads it there (`root` is a temp page).
+    #[cfg(feature = "v16")]
+    pub temp: bool,
+}
+
+/// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
+/// any access path, only the index rooted at the page given, or no
+/// index at all (rowid lookups stay).
+#[cfg(feature = "v16")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Hint {
+    #[default]
+    Any,
+    By(u32),
+    Not,
 }
 
 /// `SubSource::tvf`: the arguments read a FROM source to the left,
@@ -1713,6 +1741,18 @@ pub fn resolve_scoped<E>(
         // `session::bind_ast`); the pin reads one there as NULL.
         #[cfg(feature = "params")]
         Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
+        #[cfg(feature = "v16")]
+        Expr::Column {
+            table,
+            name,
+            schema,
+        } => {
+            if let Some(sc) = schema {
+                check_schema_ref::<E>(*sc, *table, arena, cur, enclosing)?;
+            }
+            resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?
+        }
+        #[cfg(not(feature = "v16"))]
         Expr::Column { table, name } => resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?,
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         Expr::TrigValue(lit, aff, coll) => {
@@ -1804,6 +1844,41 @@ pub fn resolve_scoped<E>(
 
 /// A column reference (out of line: see `resolve_scoped`).
 #[inline(never)]
+/// The schema of a three-part column name `sc.table.column` (v0.16,
+/// `v16`): the source `table` names must be a table or view of that
+/// database (`main`, or `temp` / `temporary`, case-insensitive), as
+/// on the pin; otherwise "no such column" (`UnknownColumn`).
+#[cfg(feature = "v16")]
+fn check_schema_ref<E>(
+    sc: crate::arena::ABytes,
+    table: Option<crate::arena::ABytes>,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+) -> Result<(), E> {
+    let no = Error::Schema {
+        kind: SchemaKind::UnknownColumn,
+    };
+    let Some(t) = table else {
+        return Err(no);
+    };
+    let q = handle_bytes(arena, t);
+    let scb = handle_bytes(arena, sc);
+    let want = if eq_ci(scb, b"main") {
+        1
+    } else if eq_ci(scb, b"temp") {
+        2
+    } else {
+        return Err(no);
+    };
+    for g in core::iter::once(cur).chain(enclosing.iter()) {
+        if let Some(s) = g.sources.iter().find(|s| s.named(q)) {
+            return if s.db == want { Ok(()) } else { Err(no) };
+        }
+    }
+    Err(no)
+}
+
 fn resolve_col_ref<E>(
     table: Option<crate::arena::ABytes>,
     name: crate::arena::ABytes,

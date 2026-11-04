@@ -100,6 +100,10 @@ impl<S: Storage> Connection<S> {
             tvf_dead: AVec::new(),
             #[cfg(feature = "expr_index")]
             access: None,
+            #[cfg(feature = "expr_index")]
+            hint: crate::query::Hint::Any,
+            #[cfg(feature = "v16")]
+            temp: false,
         });
         Ok(w)
     }

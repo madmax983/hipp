@@ -773,6 +773,10 @@ pub struct Table<'x> {
     /// index (`covers_all`) is the table, and every index's full
     /// scan is a candidate (the pin's `!HasRowid` rule).
     pub wr: bool,
+    /// The source's `INDEXED BY` / `NOT INDEXED` (v0.16): only the
+    /// named index (its full scan always a candidate, as the pin's
+    /// `isIndexedBy`), or only the table itself.
+    pub hint: crate::query::Hint,
 }
 
 /// How an executor reads one probe set.
@@ -1043,10 +1047,16 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
 pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<IdxAccess> {
     let mut loops: AVec<Loop> = AVec::new();
     let order_rowid = !q.order.is_empty();
+    use crate::query::Hint;
+    // The index `INDEXED BY` names (v0.16): the only candidate.
+    let forced = match tab.hint {
+        Hint::By(r) => Some(r),
+        _ => None,
+    };
     // The full table scan, and the rowid "index": one row per key
     // (a WITHOUT ROWID table has neither: its clustered index is
     // among the indexes).
-    if !tab.wr {
+    if !tab.wr && forced.is_none() {
         loops.push(Loop {
             ix: None,
             eq: AVec::new(),
@@ -1063,6 +1073,12 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
     }
     let _ = order_rowid;
     for (i, m) in tab.indexes.iter().enumerate() {
+        // `NOT INDEXED`: no index (the pin ignores it on a WITHOUT
+        // ROWID table, whose indexes are all it has); `INDEXED BY`:
+        // that one.
+        if (tab.hint == Hint::Not && !tab.wr) || forced.is_some_and(|r| r != m.root) {
+            continue;
+        }
         if let Some(p) = &m.pred
             && !implies(q.conj, p)
         {
@@ -1086,7 +1102,11 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         let rsize = a.as_slice()[0];
         // The full index scan.
         let orders = !q.order.is_empty() && m.might_order(s, q.order);
-        if orders || m.pred.is_some() || tab.wr || (q.cover_scan && covering && m.width < tab.width)
+        if orders
+            || m.pred.is_some()
+            || tab.wr
+            || forced.is_some()
+            || (q.cover_scan && covering && m.width < tab.width)
         {
             let mut run = rsize + 1 + (15 * m.width) / tab.width.max(1);
             if !covering {

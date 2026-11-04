@@ -308,8 +308,8 @@ view / derived name dedupe and the UPDATE ... FROM check).
   (fixed by the column-constraints review pass, below);
   with min()/max() plus another aggregate the pin still takes
   bare columns from the extremum row, hipp's `pick_rep` only
-  for a lone min/max. A three-part `main.t.col` reference is
-  refused.
+  for a lone min/max. ~~A three-part `main.t.col` reference is
+  refused.~~ (closed by the honest-gap sweep, below)
 - ~~`-9223372036854775808` is an INTEGER literal on the pin and
   a REAL in hipp~~ — fixed by the column-constraints review pass
   (below).
@@ -605,10 +605,9 @@ the planner and the async step state machines (~8 KB)).
 
 - `PRAGMA ignore_check_constraints` is not offered: hipp has no
   PRAGMA statements yet (another unit's surface).
-- Constraint-level conflict clauses (`a UNIQUE ON CONFLICT
+- ~~Constraint-level conflict clauses (`a UNIQUE ON CONFLICT
   IGNORE`, `NOT NULL ON CONFLICT REPLACE`) are still parsed and
-  ignored: such a write errors where the pin would resolve it
-  (an error, never a silent wrong answer).
+  ignored~~ (closed by the honest-gap sweep, below).
 - hipp's function library has no non-deterministic function,
   so the pin's "non-deterministic functions prohibited in
   generated columns" cannot arise; a unit adding `random()` or
@@ -1760,9 +1759,9 @@ and the function-name table.
   hipp raises), an expression-folding gap outside this unit.
 - OR ABORT inside an explicit transaction still rolls back the
   whole transaction (the documented v0.5 simplification); OR
-  FAIL and OR ROLLBACK match the pin there. Column-level conflict
+  FAIL and OR ROLLBACK match the pin there. ~~Column-level conflict
   clauses (`NOT NULL ON CONFLICT FAIL`) are still parsed and
-  ignored (see "Column constraints and table definitions").
+  ignored~~ (closed by the honest-gap sweep, below).
 - `random()` / `randomblob()` are not the pin's ChaCha20 stream —
   types, lengths and ranges match, values do not (and the seed is
   `Config::nonce_seed`, shared with the journal nonces).
@@ -2582,7 +2581,9 @@ table-valued arity rules, and the generated-column LIKE plumbing.
   is unsupported), and `pragma_integrity_check` /
   `pragma_quick_check` are refused in FROM.
 - No temp database: `temp.` pragmas, and header values of temp
-  through the table-valued forms, are refused.
+  through the table-valued forms, are refused. (~~Table-valued
+  pragmas on TEMP objects~~ (closed by the honest-gap sweep, below): `pragma_table_info('t')` /
+  `('t', 'temp')`, `pragma_index_list`, `pragma_index_info` ...)
 - Foreign keys are refused under `foreign_keys = ON`, not
   enforced (ADR 0001's `foreign_keys` leaf is the place for
   that); `recursive_triggers` is stored with no triggers to
@@ -2610,8 +2611,8 @@ table-valued arity rules, and the generated-column LIKE plumbing.
   tiny profile (it keeps no constraint indexes; such a table
   already lacks the pin's autoindex there).
 - View column types: a scalar subquery item's declared type is
-  not carried (its affinity is). Three-part column names
-  (`main.sqlite_schema.name`) do not parse (hipp-wide).
+  not carried (its affinity is). ~~Three-part column names
+  (`main.sqlite_schema.name`) do not parse (hipp-wide).~~ (closed by the honest-gap sweep, below)
 - `CREATE TABLE x AS SELECT * FROM sqlite_schema`: the pin's
   SELECT also sees its own all-NULL placeholder schema row; hipp's
   does not.
@@ -3272,7 +3273,7 @@ test (`tests/savepoint_v16.rs`
   refusal leaves the file untouched, and `PRAGMA auto_vacuum = 0;
   VACUUM` converts it, as on the pin.
 
-Remaining gaps from the review: a constraint-level `ON CONFLICT
+Remaining gaps from the review: ~~a constraint-level `ON CONFLICT
 ROLLBACK` is matched by constraint kind, not by the constraint
 that failed — a table with `a NOT NULL ON CONFLICT ROLLBACK, b NOT
 NULL` ends the transaction on either column's NULL (the pin: only
@@ -3280,7 +3281,7 @@ NULL` ends the transaction on either column's NULL (the pin: only
 the table's UNIQUE-constraint ROLLBACK; an explicit `OR ABORT`
 parses as the default, so it does not override a constraint-level
 ROLLBACK as it does on the pin. Constraint-level IGNORE / REPLACE
-/ FAIL remain parsed and not acted on (as before). Gates: `cargo
+/ FAIL remain parsed and not acted on (as before).~~ (closed by the honest-gap sweep, below). Gates: `cargo
 fmt --all` and the full `ci/local-gates.sh` run end with "==> all
 gates passed". Size: tiny **76,224 B** (Δ **−4 B** vs 76,228,
 ratchet lowered; the schema row's checked rowid costs a few bytes,
@@ -3521,17 +3522,17 @@ COLUMN cut and the catalog guard.
 
 **Honest gaps:**
 
-- A statement that names a temp table (or a TEMP view reading
+- ~~A statement that names a temp table (or a TEMP view reading
   one) and a main object (`SELECT ... FROM main_t, temp_t`,
   `CREATE TEMP TABLE x AS SELECT * FROM main_t`, `INSERT INTO
   temp_t SELECT ... FROM main_t`, a TEMP view over both) is refused
-  (`Unsupported`): hipp's two databases never meet inside one
-  statement. TEMP views over main tables are read (review fix,
+  (`Unsupported`)~~ (closed by the honest-gap sweep, below); a temp UPDATE / DELETE that reads main is
+  still refused. TEMP views over main tables are read (review fix,
   below), but `PRAGMA table_info` of one fails (the temp database
   plans it without main), and an ALTER TABLE of a main table such
   a view reads is refused where the pin rewrites the view.
-  Three-part names (`temp.x.a`) do not parse;
-  `pragma_table_info('x', 'temp')` is refused; `VACUUM temp INTO`
+  ~~Three-part names (`temp.x.a`) do not parse;
+  `pragma_table_info('x', 'temp')` is refused~~ (closed by the honest-gap sweep, below); `VACUUM temp INTO`
   is refused (plain `VACUUM temp` does nothing, as on the pin for
   an in-memory temp database). The earlier "`ANALYZE temp` is
   refused" gap is closed.
@@ -4319,8 +4320,8 @@ path, INSTEAD OF planning and the ALTER trigger editor — which ADR
   is conservative (an unrecognised construct counts as an abort
   point, i.e. hipp undoes the statement) and assumes nothing of
   foreign keys (any `PRAGMA foreign_keys=ON` counts as one).
-- Declared `ON CONFLICT REPLACE` on a column constraint is not
-  honoured (the constraints unit's gap); the REPLACE victim order
+- ~~Declared `ON CONFLICT REPLACE` on a column constraint is not
+  honoured (the constraints unit's gap)~~ (closed by the honest-gap sweep, below); the REPLACE victim order
   matches the pin for OR REPLACE / REPLACE statements.
 - Trigger programs are parsed and planned per row: correct, but
   O(rows × program size) planning work. Each nested program costs
@@ -5263,17 +5264,18 @@ model and the access-path executor (~25 KB).
   differs in row order).
 - Row order of an UPDATE treats foreign keys conservatively (any FK
   enforcement makes it rowid order; the pin only when the FK columns
-  change) and detects constraint-level `ON CONFLICT REPLACE` by the
-  table text.
-- `INDEXED BY` / `NOT INDEXED` are not parsed. (A covering index scan
+  change) ~~and detects constraint-level `ON CONFLICT REPLACE` by the
+  table text~~ (the honest-gap sweep: the pin's `bReplace`, an index
+  declared REPLACE whose key the SET changes).
+- ~~`INDEXED BY` / `NOT INDEXED` are not parsed.~~ (closed by the honest-gap sweep, below) (A covering index scan
   read each table row by rowid; fixed by the review below for rowid
   tables.)
 - An expression index's key value takes no affinity (the pin applies the
   expression's affinity, which only matters for a CAST to REAL of an
   integral value: equal keys either way).
-- Three-part names (`main.t.b`) are refused everywhere, so such a
+- ~~Three-part names (`main.t.b`) are refused everywhere, so such a
   partial index WHERE written by the pin is a definition hipp cannot
-  compute: writes to its table are refused.
+  compute: writes to its table are refused.~~ (closed by the honest-gap sweep, below)
 
 ### Expression indexes and index-aware planning — review fixes (2026-11-04)
 
@@ -5543,8 +5545,8 @@ VACUUM support (~5 KB) and the planner model (~5 KB).
 - `PRAGMA table_list`'s row order (the pin's hash order) differs
   from the pin's once there are more than ~8 tables — pre-existing,
   for rowid tables too; the suites list tables by name.
-- Constraint-level `ON CONFLICT` clauses are still ignored for every
-  table (pre-existing).
+- ~~Constraint-level `ON CONFLICT` clauses are still ignored for every
+  table (pre-existing).~~ (closed by the honest-gap sweep, below)
 
 ### WITHOUT ROWID tables — review fixes (2026-11-04)
 
@@ -5883,8 +5885,8 @@ encoding-open tracking.
   header-only write differs from the pin's by one (pre-existing, every
   encoding). `.dump` differs from the pin's for every encoding
   (pre-existing).
-- `INDEXED BY` is not parsed (pre-existing; the regression tests use
-  the planner's own index choice).
+- ~~`INDEXED BY` is not parsed (pre-existing; the regression tests use
+  the planner's own index choice).~~ (closed by the honest-gap sweep, below)
 
 ### WAL journal mode (2026-11-04)
 
@@ -6068,6 +6070,183 @@ PRAGMAs and the `Connection::close` wiring.
   rollback mode syncs as FULL; EXTRA does not sync the directory. A
   commit whose final sync fails is rolled back in memory after its
   commit frame's salts are overwritten, best effort.
+
+### Honest-gap sweep: constraint conflict clauses, INDEXED BY, three-part names, TEMP across databases (2026-11-04)
+
+**Shipped** (each probed on the live 3.54.1 pin first):
+
+- **Constraint-level `ON CONFLICT` clauses** (ungated from `v07`: a
+  silent wrong answer on claimed paths — a `NOT NULL ON CONFLICT
+  FAIL` multi-row INSERT lost the rows before the failing one, an
+  `ON CONFLICT IGNORE` / `REPLACE` errored where the pin resolves).
+  The parser keeps each NOT NULL / PRIMARY KEY / UNIQUE clause
+  (`ColumnDef::nn_conflict`, `ConstraintSet::conflict`; a repeated
+  constraint merges, two different clauses are the pin's
+  "conflicting ON CONFLICT clauses specified",
+  `ParseKind::ConflictingOnConflict`); the catalog carries them
+  (`Column::nn_conflict`, `TableDef::ipk_conflict`,
+  `IndexDef::conflict`). A statement without an `OR` clause now
+  parses as `ConflictAction::Unset`, and the planner resolves each
+  constraint by `ConflictAction::over` (explicit statement clause >
+  constraint clause > ABORT) into `InsCol::nn_act`,
+  `Plan::{Insert,Update}::ipk_act`, `Update::nn_acts` and
+  `IndexPlan::act`. Indexes are checked in the pin's list order —
+  newest first, every index whose own clause is REPLACE after the
+  others — with a rowid REPLACE deferred past them unless the
+  statement says REPLACE; the first violated constraint that does not
+  resolve by REPLACE decides (IGNORE skips the row, ABORT / FAIL /
+  ROLLBACK fail it), and only all-REPLACE conflicts delete victims.
+  NOT NULL ... REPLACE substitutes the default; a NULL default fails
+  as ABORT after the later columns had their turn (the pin's second
+  pass). The failing constraint's own action is recorded
+  (`Statement::fail_act`), so FAIL keeps and ROLLBACK ends exactly
+  as that constraint says (this replaces the review-era text scan
+  `rollback_constraints`, which matched by constraint *kind*). CHECK
+  ignores its clause, as on the pin; the column-level `CHECK ...
+  ON CONFLICT` stays a syntax error. Interplay: an upsert's DO UPDATE
+  resolves by ABORT whatever the clauses say (regression found here:
+  `INSERT OR FAIL ... DO UPDATE` kept the rows before a failing DO
+  UPDATE; the pin keeps none); trigger bodies take the firing
+  statement's explicit clause, else their constraints'; REPLACE
+  victims fire DELETE triggers under `recursive_triggers` and FK
+  actions as statement REPLACE does; the pin's `bReplace` (UPDATE
+  one-pass order) now reads the indexes' clauses instead of the
+  table text. Builds below `v07` (tiny, `indexes`, `v04` .. `v06`)
+  refuse FAIL / IGNORE / REPLACE constraint clauses at parse
+  (`ParseKind::RequiresConflictResolution`, the CHECK precedent);
+  ROLLBACK / ABORT need nothing.
+- **`INDEXED BY name` / `NOT INDEXED`** (`v16`) on FROM sources and
+  UPDATE / DELETE targets (`IndexHint`, `query::Hint`): "no such
+  index" (`UnknownIndex`) for a name the table lacks and on a view
+  or CTE; with `expr_index`, "no query solution"
+  (`SchemaKind::NoQuerySolution`) for a partial index the WHERE
+  (and the source's ON) does not imply, and the planner (`xplan::
+  choose`) considers only the named index, its full scan always a
+  candidate (the pin's `isIndexedBy`), or no index at all (rowid
+  lookups stay; ignored on WITHOUT ROWID tables, as the pin's
+  `notIndexed` is). Without `expr_index` the clause is checked and
+  the scan keeps rowid order. `t INDEXED BY` is never an alias.
+- **Three-part column names** `schema.table.column` (`v16`,
+  `Expr::Column::schema`) in every expression context the pin allows
+  them — select items, WHERE / GROUP BY / HAVING / ORDER BY, ON,
+  correlated subqueries, UPDATE / DELETE, CHECK texts, partial-index
+  WHERE texts, views, trigger bodies — the table part matching the
+  source's qualifier (its alias when it has one), the schema the
+  source's database (`SourceDesc::db`: main or temp; a derived
+  table, CTE or RETURNING row is none). Pin-written files with such
+  CHECKs / partial indexes are no longer opaque, and ALTER TABLE
+  RENAME rewrites the names as the pin does. Generated columns and
+  index keys refuse them, `schema.table.*` is a syntax error (pin).
+- **TEMP across databases** (`v16`): a statement of the main
+  database reads TEMP tables (`Connection::plan_temp_source`,
+  `Statement::scan_temp`): joins, subqueries, compounds, `x IN
+  temp.t`, INSERT / UPDATE / DELETE of a main table and CREATE TABLE
+  ... AS in main that read temp; an unqualified name is temp first,
+  `main.x` / `temp.x` are honoured (`FromSource::in_temp`). A temp
+  INSERT ... SELECT and CREATE TEMP TABLE ... AS SELECT that read
+  main run their SELECT on main and feed the rows to the temp
+  database (`Route::TempFed`, `Plan::Temp::feed`; a CTAS changes no
+  counter, as on the pin). TEMP views over main and temp tables
+  together are inlined into main statements. Table-valued pragmas
+  (`pragma_table_info`, `pragma_index_list`, `pragma_index_info`,
+  ...) see TEMP objects, temp first, and take the `'temp'` schema.
+- **VACUUM of an auto-vacuum file / `PRAGMA incremental_vacuum`**:
+  **kept as the documented refusal.** The pin's pointer-map pages
+  would have to be maintained by every page allocation, free and
+  B-tree balance on the write path (today a hipp write to a pin-made
+  auto-vacuum file already leaves them stale, see "Savepoints and
+  maintenance statements"); that is a pager project well past this
+  unit's budget, and a fresh auto-vacuum image would be damaged by
+  the next hipp write. `PRAGMA auto_vacuum = 0; VACUUM` converts.
+
+**Oracle-probing notes** (live pin, `sqlite3 DB` over stdin, one
+statement per line): `NOT NULL ON CONFLICT IGNORE` skips the row,
+`REPLACE` takes the DEFAULT (none or NULL: ABORT), FAIL keeps earlier
+rows; `UNIQUE ON CONFLICT IGNORE` + `UNIQUE ON CONFLICT FAIL` on one
+row: the newer index decides (b checked before a); an explicit
+CREATE UNIQUE INDEX (OE_Abort) is checked before an older
+constraint's IGNORE; `a UNIQUE REPLACE, b UNIQUE IGNORE` over (1,2)
+conflicting on both: IGNORE wins (REPLACE last); `id INTEGER PRIMARY
+KEY ON CONFLICT REPLACE, b UNIQUE ON CONFLICT IGNORE`: IGNORE wins
+(rowid REPLACE deferred); table-level `CHECK (...) ON CONFLICT IGNORE`
+parses and is ignored, column-level is "near ON: syntax error"; `OR
+ABORT` overrides a constraint ROLLBACK; `a NOT NULL ON CONFLICT
+ROLLBACK, b NOT NULL`: b's NULL aborts the statement only; DO UPDATE
+under `INSERT OR FAIL` keeps nothing; a TEMP-less trigger body
+inherits the outer explicit clause. `INDEXED BY ib WHERE a > 0`
+scans ib (b order); `INDEXED BY main.ia` and `INSERT ... INDEXED BY`
+are syntax errors; a view / CTE source is "no such index"; a partial
+index `WHERE c > 'x'` with `WHERE c = 'z'` is "no query solution"
+(only identical / IS NOT NULL implications count); NOT INDEXED on a
+WITHOUT ROWID table still walks its covering index. `main.x.a FROM t
+AS x` resolves, `main.t.a FROM t AS x` does not; `temp.t.a FROM t`
+resolves to the temp t that shadows main; RETURNING / generated
+columns / index expressions refuse three-part names. CTAS (main or
+temp) leaves changes() / total_changes() / last_insert_rowid()
+alone; `CREATE TEMP TABLE IF NOT EXISTS u AS ...` over an existing u
+reads nothing.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed" (fmt, clippy on default /
+all-features / every `ci/feature-sets.txt` line, workspace tests,
+the four no_std targets, the tiny / full / max size gates).
+
+**Size:** tiny **76,976 B** (Δ **+12 B** vs 76,964, ratchet raised to
+it; a correctness fix on the CREATE TABLE path the tiny profile
+claims, within the +256 B allowance: below `v07` a constraint-level
+FAIL / IGNORE / REPLACE is refused at parse instead of ignored, so a
+multi-row INSERT no longer loses the pin's FAIL rows silently). Full
+**498,180 B** (Δ **+7,184 B** vs 490,996, ratchet raised; under 500
+KiB): the per-constraint resolution (ungated from `v07`) and the
+`v16` surface — INDEXED BY checks, three-part names, temp sources,
+temp feeds, pragma rows from temp. Max **745,260 B** (Δ **+7,884 B**
+vs 737,376, ratchet raised): the same plus the forced / forbidden
+index planning and "no query solution" (`expr_index`).
+
+**Tests:** `tests/gaps_v16.rs` — five hand corpora (constraint
+clauses incl. upsert / trigger / FK / WITHOUT ROWID interplay and the
+regressions above; INDEXED BY incl. joins, subqueries, partial,
+expression and WITHOUT ROWID indexes; three-part names incl. temp
+shadowing; main/temp statements; pragma functions on temp objects),
+a generated corpus of 160 random constraint-clause schemas and
+writes (in and out of transactions, every statement clause) and 96
+random INDEXED BY / NOT INDEXED queries whose unordered rows must
+come in the pin's order, and a pin-written file with three-part
+CHECK / partial-index / view texts that hipp writes and renames.
+Every case compares rows, failing statements and the pin's `.dump`
+of both files, plus the pin's integrity check of hipp's.
+`hipp-cli/tests/cli_v16_gaps.rs`: four byte-identical batches,
+one-shot and over stdin. `tests/temp_v16.rs` now asserts the mixed
+statements run (and the temp UPDATE / DELETE refusal).
+
+**Honest gaps:**
+
+- A temp UPDATE / DELETE whose expressions read main tables, and an
+  INSERT ... SELECT into temp with an upsert, RETURNING, a leading
+  WITH or bound parameters, are still refused (`Unsupported`): the
+  temp database cannot read main, and only a whole SELECT can be fed
+  across. TEMP triggers on main tables (and temp triggers whose
+  bodies write main tables) stay refused, as before.
+- Temp tables read by a main statement are scanned in rowid order
+  with no index access path (a temp index is not planned there, and
+  `INDEXED BY` on them is checked only), so unordered output over a
+  temp index can differ in order from the pin's; a WITHOUT ROWID
+  temp table is refused in a mixed statement.
+- `PRAGMA table_info` / `pragma_table_info` of a TEMP view over main
+  tables fails (the temp database plans the view), and
+  `temp.pragma_table_info(...)` (a schema-qualified function) and
+  correlated pragma-function arguments stay refused.
+- Constraint resolution approximations: with an upsert, the pin
+  checks the target index first and then the rowid (`upsertIpkDelay`);
+  hipp checks the rowid first — they differ only in which error a row
+  violating both the rowid and a non-target index under different
+  clauses reports. A REPLACE deletion whose DELETE triggers re-create
+  a conflict is re-checked under ABORT (as for statement REPLACE).
+- Without `expr_index` (the `full` profile) INDEXED BY / NOT INDEXED
+  are checked but do not change the scan order; a partial index named
+  there is an index hipp cannot read (`Unsupported`).
+- VACUUM of an auto-vacuum file and `PRAGMA incremental_vacuum` stay
+  refused (above).
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

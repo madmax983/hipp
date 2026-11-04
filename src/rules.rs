@@ -204,6 +204,7 @@ impl TableRules {
         affs: &[Affinity],
         rowid_alias: Option<usize>,
         action: ConflictAction,
+        #[cfg(feature = "v07")] nn_acts: crate::session::NnActs<'_>,
         changed: Option<(&[bool], bool)>,
         env: Option<&crate::query::Env>,
     ) -> Result<bool, E> {
@@ -220,6 +221,8 @@ impl TableRules {
             affs,
             rowid_alias,
             action,
+            #[cfg(feature = "v07")]
+            nn_acts,
         )? {
             return Ok(false);
         }
@@ -236,6 +239,8 @@ impl TableRules {
                 affs,
                 rowid_alias,
                 action,
+                #[cfg(feature = "v07")]
+                nn_acts,
             )? {
                 return Ok(false);
             }
@@ -445,6 +450,7 @@ pub fn plan_rules<E>(
     checks: &[&[u8]],
     strict: bool,
     has_rowid: bool,
+    #[cfg(feature = "v16")] db: u8,
 ) -> Result<TableRules, E> {
     let mut rules = TableRules::default();
     if strict {
@@ -568,6 +574,11 @@ pub fn plan_rules<E>(
         // (v0.16; the pin's "no such column: rowid").
         let mut src = SourceDesc::new(copy(tname), descs, rowid_alias, has_rowid);
         src.colls = colls;
+        // `main.t.col` / `temp.t.col` reach the table in its database.
+        #[cfg(feature = "v16")]
+        {
+            src.db = db;
+        }
         srcs.push(src);
         let cur = ScopeGroup::new(srcs, offsets, 0);
         for text in checks.iter() {
@@ -601,6 +612,7 @@ pub fn validate_def<E>(
     checks: &[crate::arena::ABytes],
     strict: bool,
     has_rowid: bool,
+    #[cfg(feature = "v16")] db: u8,
 ) -> Result<TableRules, E> {
     use crate::sql::handle_bytes;
     let mut specs: AVec<ColSpec<'_>> = AVec::new();
@@ -661,6 +673,8 @@ pub fn validate_def<E>(
         texts.as_slice(),
         strict,
         has_rowid,
+        #[cfg(feature = "v16")]
+        db,
     )
 }
 
@@ -775,7 +789,9 @@ fn is_ctime(name: &[u8]) -> bool {
 pub fn check_default_const<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<(), E> {
     let e = parse_rule::<E>(text, arena, lim)?;
     let bad = expr_any(&e, &mut |x| match x {
-        Expr::Column { table: None, name } => !is_ctime(crate::sql::handle_bytes(arena, *name)),
+        Expr::Column {
+            table: None, name, ..
+        } => !is_ctime(crate::sql::handle_bytes(arena, *name)),
         Expr::Column { .. }
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_)

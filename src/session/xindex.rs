@@ -86,6 +86,7 @@ impl<S: Storage> Connection<S> {
             let mut srcs = AVec::new();
             let mut src = SourceDesc::new(copy_vec(qualifier), descs.clone(), t.rowid_alias, rowid);
             src.colls = colls.clone();
+            src.db = self.db_no();
             srcs.push(src);
             ScopeGroup::new(srcs, offsets.clone(), 0)
         };
@@ -256,6 +257,7 @@ impl<S: Storage> Connection<S> {
                     &Expr::Column {
                         table: None,
                         name: *n,
+                        schema: None,
                     },
                     arena,
                     &cur,
@@ -1024,27 +1026,55 @@ impl<S: Storage> Connection<S> {
         first_src: usize,
         outer: (usize, usize),
         info: &CoreInfo<'_>,
-    ) {
+    ) -> Result<(), S::Error> {
         use crate::query::{RefRange, expr_refs_range};
         use crate::xplan::{Query, Src, Table, choose, conjuncts, log_est, terms};
-        // RIGHT / FULL joins emit each right row's no-match: every
-        // source keeps its whole table.
-        if sources.iter().any(|s| s.kind.pads_left()) {
-            return;
-        }
-        let n = sources.len();
-        let core_end = match (offsets.last(), sources.last()) {
-            (Some(o), Some(s)) => o + s.ncols,
-            _ => return,
-        };
         let mut wconj: AVec<&RExpr> = AVec::new();
         if let Some(f) = info.filter {
             conjuncts(f, &mut wconj);
         }
+        // `INDEXED BY` a partial index the WHERE (and the source's
+        // ON) does not imply: the pin's "no query solution".
+        for (i, sp) in sources.iter().enumerate() {
+            if sp.hint == crate::query::Hint::Any || sp.temp {
+                continue;
+            }
+            let (Some(t), Some(&base)) = (
+                self.catalog.tables.iter().find(|t| t.root == sp.root),
+                offsets.get(i),
+            ) else {
+                continue;
+            };
+            let s = Src {
+                base,
+                ncols: sp.ncols,
+                src: first_src + i,
+                rowid_alias: sp.rowid_alias,
+            };
+            let mut conj: AVec<&RExpr> = AVec::new();
+            if i == 0 || !sp.kind.pads_right() {
+                conj.extend_from_slice(wconj.as_slice());
+            }
+            if let Some(on) = &sp.on {
+                conjuncts(on, &mut conj);
+            }
+            self.hint_solvable(arena, t, sp.hint, &s, conj.as_slice())?;
+        }
+        // RIGHT / FULL joins emit each right row's no-match: every
+        // source keeps its whole table.
+        if sources.iter().any(|s| s.kind.pads_left()) {
+            return Ok(());
+        }
+        let n = sources.len();
+        let core_end = match (offsets.last(), sources.last()) {
+            (Some(o), Some(s)) => o + s.ncols,
+            _ => return Ok(()),
+        };
         let mut plans: AVec<(usize, crate::xplan::IdxAccess)> = AVec::new();
         for i in 0..n {
             let Some(sp) = sources.get(i) else { break };
-            if sp.derived.is_some() || sp.root <= 1 || sp.rec != 0 {
+            // (A TEMP table's root is the temp database's page.)
+            if sp.derived.is_some() || sp.root <= 1 || sp.rec != 0 || sp.temp {
                 continue;
             }
             #[cfg(feature = "json")]
@@ -1144,6 +1174,7 @@ impl<S: Storage> Connection<S> {
                 width,
                 indexes: models.as_slice(),
                 wr: !t.has_rowid(),
+                hint: sp.hint,
             };
             if let Some(mut a) = choose(&q, &s, &tab, ts.as_slice()) {
                 // A covering index of a rowid table: the rows come
@@ -1170,6 +1201,35 @@ impl<S: Storage> Connection<S> {
                 sp.access = Some(Box::new(a.clone()));
             }
         }
+        Ok(())
+    }
+
+    /// Whether an `INDEXED BY` index can serve table `t` read as
+    /// source `s` under the conjuncts `conj` (v0.16): a partial
+    /// index only when they imply its WHERE (`NoQuerySolution`
+    /// otherwise, as on the pin); an index hipp cannot compute is
+    /// refused (`Unsupported`).
+    pub(super) fn hint_solvable(
+        &self,
+        arena: &Arena,
+        t: &crate::schema::TableDef,
+        hint: crate::query::Hint,
+        s: &crate::xplan::Src,
+        conj: &[&RExpr],
+    ) -> Result<(), S::Error> {
+        let crate::query::Hint::By(root) = hint else {
+            return Ok(());
+        };
+        let (_, models) = self.table_models(arena, t, s);
+        match models.iter().find(|m| m.root == root) {
+            None => Err(Error::Unsupported),
+            Some(m) => match &m.pred {
+                Some(p) if !crate::xplan::implies(conj, p) => Err(Error::Schema {
+                    kind: SchemaKind::NoQuerySolution,
+                }),
+                _ => Ok(()),
+            },
+        }
     }
 }
 
@@ -1178,7 +1238,9 @@ pub(super) struct UpdateInfo<'x> {
     pub sets: &'x [(Target, RExpr)],
     pub returning: bool,
     pub from: bool,
-    pub conflict: ConflictAction,
+    /// The UPDATE may delete REPLACE victims: OR REPLACE, or a
+    /// constraint declared `ON CONFLICT REPLACE` (v0.16).
+    pub replaces: bool,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1195,7 +1257,8 @@ impl<S: Storage> Connection<S> {
         t: &crate::schema::TableDef,
         filter: Option<&RExpr>,
         update: Option<UpdateInfo<'_>>,
-    ) -> Option<Box<crate::xplan::IdxAccess>> {
+        hint: crate::query::Hint,
+    ) -> Result<Option<Box<crate::xplan::IdxAccess>>, S::Error> {
         use crate::query::{RefRange, expr_refs_range};
         use crate::xplan::{IdxKey, Query, Src, Table, choose, conjuncts, terms};
         // A WITHOUT ROWID table is read through its cheapest index
@@ -1203,12 +1266,15 @@ impl<S: Storage> Connection<S> {
         // then walks that index.
         let wr = !t.has_rowid();
         let always = RExpr::Literal(OwnedValue::Integer(1));
+        // A forced index is walked even with no WHERE.
+        let forced = matches!(hint, crate::query::Hint::By(_));
         let f = match filter {
             Some(f) => f,
-            None if wr => &always,
-            None => return None,
+            None if wr || forced => &always,
+            None => return Ok(None),
         };
         let ca = &self.catalog_arena;
+        let _ = ca;
         let s = Src {
             base: 0,
             ncols: t.columns.len(),
@@ -1238,9 +1304,10 @@ impl<S: Storage> Connection<S> {
             }
             Some(false)
         };
+        self.hint_solvable(arena, t, hint, &s, conj.as_slice())?;
         let ts = terms(conj.as_slice(), &s, &avail);
-        if ts.is_empty() && !wr {
-            return None;
+        if ts.is_empty() && !wr && !forced {
+            return Ok(None);
         }
         let one_pass = update.as_ref().is_some_and(|u| {
             #[cfg(feature = "triggers")]
@@ -1250,10 +1317,7 @@ impl<S: Storage> Connection<S> {
                 .any(|tr| tr.event == crate::sql::ast::TrigEvent::Update);
             #[cfg(not(feature = "triggers"))]
             let trig = false;
-            let replace = u.conflict == ConflictAction::Replace || {
-                let sql = handle_bytes(ca, t.sql);
-                sql.windows(7).any(|w| w.eq_ignore_ascii_case(b"REPLACE"))
-            };
+            let replace = u.replaces;
             // Changing the key (the rowid, or — v0.16 — a WITHOUT
             // ROWID table's PRIMARY KEY column) is two-pass, as on the
             // pin (its `chngKey`).
@@ -1309,8 +1373,11 @@ impl<S: Storage> Connection<S> {
             width,
             indexes: models.as_slice(),
             wr: !t.has_rowid(),
+            hint,
         };
-        let mut acc = choose(&q, &s, &tab, ts.as_slice())?;
+        let Some(mut acc) = choose(&q, &s, &tab, ts.as_slice()) else {
+            return Ok(None);
+        };
         // A loop whose index the SET changes is not one-pass.
         let changed = |e: &RExpr| {
             update.as_ref().is_some_and(|u| {
@@ -1339,6 +1406,6 @@ impl<S: Storage> Connection<S> {
                 })
         });
         acc.one_pass = one_pass && !modified;
-        Some(Box::new(acc))
+        Ok(Some(Box::new(acc)))
     }
 }

@@ -212,7 +212,9 @@ impl<S: Storage> Connection<S> {
             using: AVec::new(),
             args: None,
             qualified: true,
+            in_temp: false,
             cte: None,
+            indexed: None,
         };
         x.view::<S::Error>(&mut f, v)?;
         let cols = f.cte.map(|c| c.columns).unwrap_or_default();
@@ -1619,6 +1621,10 @@ impl<S: Storage> Connection<S> {
             tvf_dead: AVec::new(),
             #[cfg(feature = "expr_index")]
             access: None,
+            #[cfg(feature = "expr_index")]
+            hint: crate::query::Hint::Any,
+            #[cfg(feature = "v16")]
+            temp: false,
         });
         Ok(w)
     }
