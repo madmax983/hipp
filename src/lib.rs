@@ -57,6 +57,8 @@ pub use record::{OwnedValue, Value};
 pub use session::{
     ArenaStats, Config, Connection, IndexMeta, Statement, Step, TableMeta, ViewMeta,
 };
+#[cfg(feature = "attach")]
+pub use storage::AttachTarget;
 pub use storage::{MemStorage, Storage};
 
 #[cfg(feature = "std")]

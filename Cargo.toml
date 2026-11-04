@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -292,6 +292,28 @@ wal = ["v16"]
 # function"), never wrong; DEFAULT CURRENT_* still works. The
 # tiny profile excludes it per §2.
 datetime = ["v16"]
+
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): ATTACH /
+# DETACH and statements across several databases -- `ATTACH
+# [DATABASE] expr AS expr` (a file, ':memory:', '' for a private
+# temporary database) and `DETACH [DATABASE] expr` with the pin's
+# limit of 10 attached databases and its errors; schema-qualified
+# names (`aux.t`, `aux.t.col`, `aux.sqlite_schema`, `PRAGMA aux.x`,
+# `aux.pragma_table_info(...)`) everywhere the pin takes them, the
+# pin's unqualified-name order (temp, main, then attached in attach
+# order), DDL / ALTER / VACUUM / REINDEX / ANALYZE in an attached
+# database, statements reading several databases, and transactions
+# spanning them -- a rollback-journal commit of several files made
+# atomic by the pin's super-journal (`<main>-mjXXXXXX9XX`, the
+# journal-tail pointer to it), which recovery by either engine
+# honours. Each attached database is a `Connection` of the main
+# one's storage type, opened through `Connection::set_attach_hook`
+# (no_std) or `Storage::open_attached` (`FileStorage` under `std`).
+# Builds on the v0.16 TEMP-database routing, so it implies `v16`.
+# Without it ATTACH / DETACH are refused (`UnsupportedStatement`)
+# and a qualifier other than main / temp is refused as before. The
+# tiny profile excludes it per §2.
+attach = ["v16"]
 
 [dependencies]
 

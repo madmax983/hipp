@@ -6692,6 +6692,236 @@ formatters). **`full` decision:** `full` with `datetime` measures
 - Not in `full` (above); without the leaf, `SELECT current_date`
   is refused rather than answered.
 
+### ATTACH / DETACH and several databases (2026-11-04)
+
+**Shipped** (leaf `attach`, requires `v16`; in `max`, not `full`;
+new `src/session/attach.rs`, `Plan::{Att, Attach}`,
+`Ast::{Attach, Detach}`, `FromSource::schema`, `SourceDesc::dbname`,
+`SubSource::ext`, `SchemaKind::{DatabaseInUse, TooManyAttached,
+CannotOpenDatabase, CannotDetach, NoSuchDatabase, DatabaseLocked,
+AttachEncoding, CrossDatabaseReference}`):
+
+- *The model.* Each attached database is a `Connection` of the main
+  one's storage type, owned by it (`Connection::attached`) — the TEMP
+  database's design (`session::temp`) generalised to N databases, not
+  a parallel path: a statement is routed before it is planned
+  (`route_attach`, ahead of the TEMP router) by the pin's resolution —
+  `aux.x` is aux's, an unqualified name temp's, then main's, then each
+  attached database's in attach order. A statement whose names all
+  live in one attached database runs there with that database's
+  qualifiers cut (three-part names included), so DDL, ALTER TABLE
+  (all forms), DROP, VACUUM [INTO], REINDEX, ANALYZE, `PRAGMA aux.x`,
+  `aux.sqlite_schema`, indexes, views, triggers, foreign keys,
+  AUTOINCREMENT, WITHOUT ROWID, STRICT, generated columns and WAL work
+  inside it exactly as in main. A write of an attached table that
+  reads other databases runs there too, the tables it reads elsewhere
+  handed over as *external sources* (`ExtTab`: columns at prepare,
+  rows — read in rowid / key order from their own database, VIRTUAL
+  columns computed — when it runs; nothing the statement does can
+  change those databases, so the rows read first are the rows). Any
+  other statement naming an attached object (a query over several
+  databases, a write of main reading attached tables, main or TEMP
+  CREATE TABLE ... AS, `INSERT INTO temp.x SELECT` via the TEMP feed)
+  runs on main, where `ext_source` makes each attached table such a
+  source; a three-part `aux.t.c` reaches it by `SourceDesc::dbname`.
+- *ATTACH / DETACH.* `ATTACH [DATABASE] expr AS expr [KEY expr]`
+  (operands evaluated at step, subqueries allowed; a lone identifier
+  is its own text, the pin's `resolveAttachExpr`; NULL / `''` is a
+  private temporary database, `':memory:'` an in-memory one; KEY is
+  evaluated and ignored), the pin's checks in its order: more than 10
+  ("too many attached databases - max 10"), the name against `main`,
+  `temp` and the attached names in any case ("database X is already in
+  use"), the open ("unable to open database"), then the encoding
+  (a non-empty database of another encoding is refused, an empty one
+  takes main's). An ATTACH inside a transaction replays BEGIN and the
+  open savepoints into the new database. `DETACH [DATABASE] expr`:
+  "no such database" (`temp` before the TEMP database exists),
+  "cannot detach database main / temp", "database X is locked" when
+  the open transaction has read or written it. `Connection::close`
+  closes the attached databases (WAL checkpoint and `-wal` removal).
+  `PRAGMA database_list` numbers them from 2 as the pin does.
+- *Storage.* `Connection::set_attach_hook(FnMut(AttachTarget) ->
+  Option<S>)` lets a `no_std` caller supply storage for a name; without
+  a hook `Storage::open_attached` is asked (new trait method, default
+  none): `MemStorage` makes `:memory:` / temporary databases,
+  `FileStorage` opens files relative to the working directory, as the
+  pin does, and backs `:memory:` / `''` with a private temporary file
+  (`FileStorage::anonymous`, removed when dropped; `is_memory` for the
+  former, so its journal mode is `memory`). A file already open on the
+  connection (main or attached) is refused (`Unsupported`): two pagers
+  over one file would cache each other's pages stale.
+- *Transactions and the super-journal.* BEGIN / COMMIT / ROLLBACK /
+  SAVEPOINT / RELEASE / ROLLBACK TO apply to every database (as to the
+  TEMP one); a failure that ends one database's transaction (OR
+  ROLLBACK, an I/O-class error) ends them all. A COMMIT (or the RELEASE
+  that commits) first checks every attached database's deferred
+  foreign keys; when two or more rollback-journal databases with a
+  file name (not WAL, not `:memory:`, synchronous not OFF — the pin's
+  `aMJNeeded`) have written and main has a file name, it runs the
+  pin's protocol (`commit_all`, `Pager::commit_phase_one`): the
+  super-journal `<main>-mjXXXXXX9XX` (six hex digits, `9`, two more,
+  re-drawn while the name exists) holding each journal's full name
+  NUL-terminated, synced; in each journal, at the next sector boundary
+  (synchronous FULL), the pointer record — lock-byte page number,
+  name, length, the pin's signed-byte checksum, journal magic — after
+  which the journal is truncated there, synced, and the database
+  written and synced (phase one); deleting the super-journal is the
+  commit point; then each journal is deleted (phase two). Otherwise
+  each database commits on its own, as in the pin's simple case.
+  Super-journals are opened through the new `Storage::open_named`
+  (default none: such storage writes none). Ungated within `v16`
+  (a correctness fix on the open path): hot-journal recovery reads the
+  pointer (the pin's `readSuperJournal`) — a journal whose
+  super-journal is gone belongs to a committed transaction and is
+  deleted unplayed; one whose super-journal exists is rolled back and
+  the super-journal deleted once no journal it lists points at it
+  (`pager_delsuper`). (Before, hipp rolled back every hot journal, so
+  a pin-made multi-database commit cut between its commit point and
+  the journal deletions came back half committed.)
+- *Cross-database rules.* A view or trigger of one database may not
+  name another's object with a qualifier ("view / trigger X cannot
+  reference objects in database Y", `CrossDatabaseReference`); its
+  unqualified names bind to its own database (a main view over a name
+  only an attached database has fails when read, "no such table:
+  main.t"); `CREATE INDEX aux.i ON aux.t` is the pin's syntax error;
+  an unqualified CREATE INDEX / TRIGGER is main's. A table-valued
+  pragma's qualifier is ignored (`aux.pragma_table_info('t')` is
+  `pragma_table_info('t')`), its schema argument chooses the
+  database, and an unqualified argument follows the search order.
+  `PRAGMA table_list` lists every database (an attached one under its
+  own name); connection-wide pragmas (`foreign_keys`, `encoding`,
+  `collation_list`, ...) under an attached name set the connection's
+  and are copied into each attached database (`sync_att`).
+- *hipp-cli*: `.databases` (`name: file r/w`, `""` without a file),
+  `.schema` and `.tables` list attached objects as `name.x` (quoted
+  as the shell quotes a name).
+- *Parser* (with `attach` only): any schema qualifier parses (the
+  router checks it); without the leaf a qualifier other than main /
+  temp stays a parse refusal and ATTACH / DETACH stay
+  `UnsupportedStatement`.
+
+**Oracle-probing notes** (live 3.54.1 pin, scripts over stdin; the
+multi-database commit traced with `strace`): an attached name is
+compared without case and may be any text (`'w x'`, `7`, `''`, the
+result of `'x' || 'y'` or a subquery); `ATTACH NULL AS n` is a
+temporary database, `AS NULL` the name `''`; the limit is checked
+before the name (`ATTACH 'x' AS ''` with ten attached: "too many");
+the same file may be attached twice; `ATTACH a AS b` attaches the file
+`a`, `AS c || 'd'` is "no such column: c". Detaching inside a
+transaction works for an untouched database and is "database X is
+locked" once read or written. `CREATE INDEX ix ON u` where only an
+attached `u` exists: "no such table: main.u"; `DROP TABLE u` drops
+the attached one; `DROP TABLE IF EXISTS nosuch.t` succeeds;
+`CREATE TABLE nosuch.t`, `PRAGMA nosuch.x`, `VACUUM nosuch` are
+"unknown database"; reads of `nosuch.t` "no such table: nosuch.t".
+Stored texts drop the created name's qualifier (`CREATE VIEW v AS
+SELECT * FROM a.t` keeps the body's; a trigger keeps `ON a.t`). A
+TEMP trigger may sit on an attached table. The pin's commit: journals
+written first; super-journal created `O_EXCL`, names written and
+fsynced; per database the pointer record at the sector boundary
+(page number `PENDING_BYTE / page_size + 1`), the journal fsynced, its
+header rewritten with the record count and fsynced again, the
+database written and fsynced; the super-journal unlinked; then the
+journals. Killing the pin (strace fault injection) on entry to each
+write, fsync, truncate and unlink of that commit, and recovering:
+before the unlink of the super-journal everything rolls back, after
+it everything is committed.
+
+**Tests:** `tests/attach_v16.rs` (14 tests) — hand corpora for
+ATTACH / DETACH (names, limits, errors, `:memory:` / temporary,
+inside transactions and savepoints), name resolution (search order,
+unknown schemas, three-part names, `x IN aux.t`, NATURAL / USING,
+schema tables), schema objects in attached databases (AUTOINCREMENT,
+WITHOUT ROWID, STRICT, generated columns, views, every ALTER form,
+triggers and the cross-database rules, foreign keys, VACUUM [INTO],
+REINDEX, ANALYZE, integrity checks), schema-scoped pragmas and
+table-valued pragmas (incl. a WAL attached database), statements
+across databases (joins, compounds, CTEs, correlated subqueries,
+INSERT ... SELECT both ways, UPDATE / DELETE reading other databases,
+UPDATE ... FROM, CTAS in main / aux / TEMP, upsert, RETURNING),
+transactions (savepoints, OR ROLLBACK / OR FAIL across databases,
+deferred foreign keys at COMMIT, DETACH locks), encodings (`utf16`),
+files interoperating both ways, the `no_std` hook over a `MemStorage`
+registry, the same-file refusal, the documented refusals, a generated
+corpus of random three-database scripts (xorshift64: writes, reads,
+transactions, savepoints, DETACH / re-ATTACH; 24 by default,
+`HIPP_ATTACH_CORPUS=400` ran clean) and the regressions below; every
+script runs on both engines in twin directories and compares rows,
+failing statements and the pin's integrity check and `.dump` of every
+database file. `tests/crash.rs`: `v16_crash_multi_database_commit`,
+`v16_crash_three_databases_and_savepoints`,
+`v16_crash_attached_only_commit` (a storage over a shared in-memory
+file system dies at every mutating op of a multi-database commit;
+hipp recovers every database to all-pre or all-post, bytes included,
+and the same crashed files written to disk are recovered alike by
+the real pin, integrity checks included) and
+`v16_cross_tool_hipp_recovers_pin_super_journal` (the pin killed on
+entry to each pwrite / fsync / ftruncate / unlink of its own
+multi-database commit; hipp recovers in place exactly as the pin does;
+skipped where `strace` is missing). `hipp-cli/tests/cli_v16_attach.rs`:
+byte-identical batches one-shot and over stdin (`PRAGMA
+database_list`, cross-database statements) and a `.databases` /
+`.schema` script. `tests/query_shape_v16.rs`: `foo.s` is "no such
+table" with the leaf.
+
+**Regressions found and fixed while building it:** a table-valued
+pragma under an attached qualifier was routed to that database (it
+listed only its tables); a WITHOUT ROWID table read from another
+database was refused; connection-wide pragmas under an attached name
+were "unknown database"; `PRAGMA aux.table_list` named the database
+`main`; a RELEASE that committed several databases through the
+super-journal left the attached ones inside a transaction (their
+savepoints had gone with phase two), so their later autocommit writes
+were never committed; `DROP ... IF EXISTS nosuch.x` failed in the
+parameter path; `aux.t.c` in a write of aux that read main was not
+cut; `SELECT main.t.x FROM aux.t` answered instead of "no such
+column"; a main view's names reached attached tables.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**: the super-journal recovery is
+gated on `v16`, see the gaps). Full **500,184 B** (Δ **+1,304 B** vs
+498,880, ratchet raised; under 512 KiB): the super-journal-aware
+hot-journal recovery (about 1,480 B, a correctness fix on the open
+path; the rest of the unit compiled `full` 176 B smaller). Max
+**794,808 B** (Δ **+29,464 B** vs 765,344, ratchet raised; under the
+32 KiB justification line): the router, external sources, ATTACH /
+DETACH, the commit protocol and the attached connections' recursion
+points (boxed futures).
+
+**Honest gaps:**
+
+- External sources are read whole, in rowid / key order, with no
+  index access path: an unordered query whose pin plan walks an index
+  of an attached table (or an `INSERT ... SELECT` without ORDER BY
+  feeding one) can list rows in another order. `INDEXED BY` on such a
+  source is not checked there.
+- Refused (`Unsupported`) where the pin answers: an attached database's
+  view read together with another database's table; a TEMP trigger on
+  an attached table; a TEMP UPDATE / DELETE / INSERT VALUES reading
+  another database (only `INSERT ... SELECT` / CTAS feed the temp
+  database); a three-part name of another database inside a write of
+  an attached table; an unqualified name meaning a table of another
+  database in a statement that also names the same-named table of the
+  attached database it writes; attaching a file the connection already
+  has open.
+- An unqualified `PRAGMA integrity_check` / `quick_check` /
+  `foreign_key_check` checks main only (the pin checks every
+  database); `PRAGMA aux.x` checks aux.
+- A string-literal schema qualifier (`'aux'.t`) does not parse
+  (`"aux".t` does).
+- A super-journal whose writing was cut before any journal pointed at
+  it stays behind (as on the pin). Below `v16` (tiny, the lower
+  rungs) recovery still rolls back every hot journal, so a pin-made
+  multi-database commit cut after its commit point would come back
+  half committed there; those builds have no storage that names
+  files (`open_named`) of their own.
+- `PRAGMA table_list` right after an AUTOINCREMENT table is created
+  lists `sqlite_sequence` before it, where the pin (in that session)
+  lists the table first (pre-existing hash-order difference, main
+  included; once the file is reopened the pin's order is hipp's).
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

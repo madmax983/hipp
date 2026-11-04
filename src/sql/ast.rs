@@ -641,6 +641,12 @@ pub struct FromSource {
     /// table, which a main statement reads there.
     #[cfg(feature = "v16")]
     pub in_temp: bool,
+    /// The schema qualifier as written (v0.16, `attach`): `aux` of
+    /// `aux.t` — `main` and `temp` included — or `None`. The planner
+    /// reads an attached database's table through it
+    /// (`session::attach`).
+    #[cfg(feature = "attach")]
+    pub schema: Option<ABytes>,
     /// What the planner's view / CTE expansion made of this
     /// source (v0.16, `v16`; `None` from the parser): see
     /// `CteUse`.
@@ -1165,6 +1171,20 @@ pub enum Ast {
         /// The argument was a number token (the pin treats
         /// `integrity_check(5)` as a limit, `('5')` as a name).
         numeric: bool,
+    },
+    /// `ATTACH [DATABASE] file AS name [KEY key]` (v0.16, `attach`):
+    /// the operands as expressions (a lone identifier already read
+    /// as its text, as on the pin).
+    #[cfg(feature = "attach")]
+    Attach {
+        file: Expr,
+        name: Expr,
+        key: Option<Expr>,
+    },
+    /// `DETACH [DATABASE] name` (v0.16, `attach`).
+    #[cfg(feature = "attach")]
+    Detach {
+        name: Expr,
     },
     /// `CREATE TRIGGER` (v0.16, `triggers`).
     #[cfg(feature = "triggers")]

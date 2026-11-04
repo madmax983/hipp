@@ -332,7 +332,7 @@ fn push_row(rows: &mut Rows, vals: &[OwnedValue]) {
 }
 
 /// Decimal text of an integer.
-fn dec(mut v: i64, out: &mut AVec<u8>) {
+pub(super) fn dec(mut v: i64, out: &mut AVec<u8>) {
     if v < 0 {
         out.push(b'-');
     }
@@ -587,17 +587,27 @@ impl<S: Storage> Connection<S> {
         numeric: bool,
     ) -> Result<Plan, S::Error> {
         let mut temp = false;
+        // An attached database's name reaches here only for what the
+        // router leaves to main (v0.16, `attach`): a connection-wide
+        // setting, `database_list`.
+        #[cfg(feature = "attach")]
+        let att = schema.is_some_and(|h| self.att_index(handle_bytes(arena, h)).is_some());
+        #[cfg(not(feature = "attach"))]
+        let att = false;
         if let Some(h) = schema {
             let b = handle_bytes(arena, h);
             if eq_ci(b, b"temp") {
                 temp = true;
-            } else if !eq_ci(b, b"main") {
+            } else if !eq_ci(b, b"main") && !att {
                 return Err(Error::Schema {
                     kind: SchemaKind::UnknownDatabase,
                 });
             }
         }
         let prag = lookup::<S::Error>(handle_bytes(arena, name))?;
+        if att && prag.is_some_and(|p| !p.connection_wide() && p != Prag::DatabaseList) {
+            return Err(Error::Unsupported);
+        }
         // hipp has no temp database: a known pragma against it
         // is refused (an unknown one is still ignored).
         if temp && prag.is_some_and(|p| !p.connection_wide()) {
@@ -752,6 +762,19 @@ impl<S: Storage> Connection<S> {
                 if self.temp.is_some() {
                     push_row(&mut rows, &[int(1), text(b"temp"), text(b"")]);
                 }
+                // The attached databases, numbered from 2 (v0.16,
+                // `attach`).
+                #[cfg(feature = "attach")]
+                for (i, a) in self.attached.iter().enumerate() {
+                    push_row(
+                        &mut rows,
+                        &[
+                            int(i as i64 + 2),
+                            text(a.name.as_slice()),
+                            text(a.conn.pager.storage().file_name()),
+                        ],
+                    );
+                }
                 rows
             }
             Prag::TableInfo | Prag::TableXinfo => match arg {
@@ -808,10 +831,16 @@ impl<S: Storage> Connection<S> {
                     if arg.is_some_and(|a| !eq_ci(a, name)) {
                         continue;
                     }
+                    // An attached database lists itself by its name
+                    // (v0.16, `attach`).
+                    #[cfg(feature = "attach")]
+                    let label = self.schema_label();
+                    #[cfg(not(feature = "attach"))]
+                    let label = b"main";
                     push_row(
                         &mut rows,
                         &[
-                            text(b"main"),
+                            text(label),
                             text(shown),
                             text(ty),
                             int(ncol as i64),
@@ -820,10 +849,12 @@ impl<S: Storage> Connection<S> {
                         ],
                     );
                 }
+                #[cfg(feature = "attach")]
+                let main_only = p.main_only || self.alias.is_some();
+                #[cfg(not(feature = "attach"))]
+                let main_only = p.main_only;
                 // The TEMP database's objects (v0.16), as `temp`.
-                if !p.main_only
-                    && let Some(tc) = &self.temp
-                {
+                if !main_only && let Some(tc) = &self.temp {
                     let tp = PragmaPlan {
                         prag: Some(Prag::TableList),
                         arg: p.arg.clone(),
@@ -843,7 +874,7 @@ impl<S: Storage> Connection<S> {
                         rows.push(r);
                     }
                 }
-                if !p.main_only && arg.is_none_or(|a| eq_ci(a, b"sqlite_temp_master")) {
+                if !main_only && arg.is_none_or(|a| eq_ci(a, b"sqlite_temp_master")) {
                     push_row(
                         &mut rows,
                         &[
@@ -855,6 +886,22 @@ impl<S: Storage> Connection<S> {
                             int(0),
                         ],
                     );
+                }
+                // Then each attached database's, under its name (v0.16,
+                // `attach`).
+                #[cfg(feature = "attach")]
+                if !main_only {
+                    let ap = PragmaPlan {
+                        prag: Some(Prag::TableList),
+                        arg: p.arg.clone(),
+                        numeric: false,
+                        main_only: true,
+                    };
+                    for a in self.attached.iter() {
+                        for r in a.conn.pragma_rows(arena, &ap)?.iter() {
+                            rows.push(r.clone());
+                        }
+                    }
                 }
                 rows
             }
@@ -1057,6 +1104,11 @@ impl<S: Storage> Connection<S> {
                                     .and_then(|r| r.as_slice().get(k))
                             })?;
                             return self.ztype(d, it);
+                        }
+                        #[cfg(feature = "attach")]
+                        if sp.ext != 0 {
+                            let decl = self.ext_col(sp.ext, k)?.1;
+                            return if decl.is_empty() { None } else { Some(decl) };
                         }
                         let (cat, ca) = match self.temp.as_deref() {
                             Some(tc) if sp.temp => (&tc.catalog, &tc.catalog_arena),
@@ -1450,6 +1502,47 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
             .filter(|_| has_schema)
             .cloned()
             .flatten();
+        // An attached database named by the schema argument, or —
+        // without one — holding the object (temp, main, then attached
+        // in order) answers (v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        {
+            let att = match (&schema, &arg) {
+                (Some(s), _) => self.att_index(s.as_slice()),
+                (None, Some(a)) if prag != Prag::TableList && !self.attached.is_empty() => {
+                    let elsewhere = self.temp_has(a.as_slice(), false)
+                        || self.temp_has(a.as_slice(), true)
+                        || self.main_has(a.as_slice(), false)
+                        || self.main_has(a.as_slice(), true)
+                        || self
+                            .catalog
+                            .find_view(&self.catalog_arena, a.as_slice())
+                            .is_some();
+                    if elsewhere {
+                        None
+                    } else {
+                        self.attached.iter().position(|x| {
+                            let ca = &x.conn.catalog_arena;
+                            x.conn.catalog.taken(ca, a.as_slice()).is_some()
+                        })
+                    }
+                }
+                _ => None,
+            };
+            if let Some(i) = att
+                && let Some(x) = self.attached.as_slice().get(i)
+            {
+                let mut a2 = AVec::new();
+                if let Some(a) = args {
+                    for (k, e) in a.iter().enumerate() {
+                        if k < usize::from(has_arg) {
+                            a2.push(e.clone());
+                        }
+                    }
+                }
+                return x.conn.pragma_source(arena, name, Some(&a2));
+            }
+        }
         // A schema other than main: the temp database holds no
         // objects in hipp (`sqlite_temp_schema` is empty), but its
         // header values are not hipp's to report (as for `PRAGMA

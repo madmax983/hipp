@@ -572,6 +572,10 @@ pub struct SourceDesc {
     /// `DB_ANY`, which every schema part reaches.
     #[cfg(feature = "v16")]
     pub db: u8,
+    /// The attached database's name a three-part name reaches this
+    /// source by (v0.16, `attach`; empty for main / temp sources).
+    #[cfg(feature = "attach")]
+    pub dbname: AVec<u8>,
     /// A `json_each` / `json_tree` source (v0.16, `json`): its
     /// `json` and `root` columns are hidden from `*`, and its
     /// `value` column carries the JSON subtype for an array or
@@ -696,6 +700,8 @@ impl SourceDesc {
             trace: None,
             #[cfg(feature = "v16")]
             db: 0,
+            #[cfg(feature = "attach")]
+            dbname: AVec::new(),
             #[cfg(feature = "json")]
             json_tvf: 0,
         }
@@ -952,6 +958,12 @@ pub struct SubSource {
     /// statement reads it there (`root` is a temp page).
     #[cfg(feature = "v16")]
     pub temp: bool,
+    /// The table is another database's (v0.16, `attach`): 1 + its
+    /// index in the connection's external sources (with `temp` set,
+    /// so it is scanned in rowid order, never through an index); 0
+    /// for none.
+    #[cfg(feature = "attach")]
+    pub ext: u16,
 }
 
 /// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
@@ -1827,6 +1839,20 @@ pub fn resolve_scoped<E>(
             let db = match schema {
                 None => 0,
                 Some(sc) => schema_db(handle_bytes(arena, *sc)),
+            };
+            // An attached database's name reaches its sources (v0.16,
+            // `attach`).
+            #[cfg(feature = "attach")]
+            let db = match schema {
+                Some(sc) if db == 3 => {
+                    let n = handle_bytes(arena, *sc);
+                    core::iter::once(cur)
+                        .chain(enclosing.iter())
+                        .flat_map(|g| g.sources.iter())
+                        .find(|s| !s.dbname.is_empty() && eq_ci(s.dbname.as_slice(), n))
+                        .map_or(db, |s| s.db)
+                }
+                _ => db,
             };
             resolve_col_ref::<E>(*table, *name, arena, cur, enclosing, db)?
         }

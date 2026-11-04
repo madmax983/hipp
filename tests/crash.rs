@@ -957,3 +957,573 @@ fn v16_cross_tool_real_sqlite_recovers_hipp_wal() {
         assert_eq!(hipp_ids, ids, "k={k}: hipp and the pin recover alike");
     }
 }
+
+// ---------------------------------------------------------------
+// v0.16 (`attach`): crash injection across a commit of several
+// databases. A storage over a shared in-memory file system (every
+// database, journal and the super-journal are named files) dies at
+// op k; reopening every database recovers them all to the pre- or
+// all to the post-image, bytes included — and the same crashed
+// files, written to disk, are recovered alike by the real pin.
+// ---------------------------------------------------------------
+
+#[cfg(feature = "attach")]
+mod multi {
+    use super::*;
+    use hipp::storage::{AttachTarget, MemSidecar};
+    use std::collections::BTreeMap;
+
+    /// The shared file system: database files (each a `MemStorage`,
+    /// its journal its sidecar) and stand-alone files (super-journals,
+    /// each the journal slot of its own `MemStorage`).
+    #[derive(Default)]
+    pub(super) struct Fs {
+        pub(super) dbs: BTreeMap<Vec<u8>, MemStorage>,
+        pub(super) files: BTreeMap<Vec<u8>, MemStorage>,
+    }
+
+    #[derive(Clone)]
+    pub(super) struct FsStorage {
+        name: Vec<u8>,
+        mem: MemStorage,
+        fs: Rc<RefCell<Fs>>,
+        st: Rc<RefCell<CrashState>>,
+    }
+
+    impl FsStorage {
+        pub(super) fn open(
+            fs: &Rc<RefCell<Fs>>,
+            st: &Rc<RefCell<CrashState>>,
+            name: &[u8],
+        ) -> Self {
+            let mem = fs
+                .borrow_mut()
+                .dbs
+                .entry(name.to_vec())
+                .or_default()
+                .clone();
+            FsStorage {
+                name: name.to_vec(),
+                mem,
+                fs: fs.clone(),
+                st: st.clone(),
+            }
+        }
+    }
+
+    impl Storage for FsStorage {
+        type Error = CrashError;
+        type Sidecar = CrashSidecar;
+
+        async fn len(&self) -> Result<u64, CrashError> {
+            self.mem.len().await.map_err(CrashError::Inner)
+        }
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), CrashError> {
+            self.mem
+                .read_at(offset, buf)
+                .await
+                .map_err(CrashError::Inner)
+        }
+        async fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), CrashError> {
+            gate_state(&self.st)?;
+            self.mem
+                .write_at(offset, buf)
+                .await
+                .map_err(CrashError::Inner)
+        }
+        async fn set_len(&mut self, len: u64) -> Result<(), CrashError> {
+            gate_state(&self.st)?;
+            self.mem.set_len(len).await.map_err(CrashError::Inner)
+        }
+        async fn sync(&mut self) -> Result<(), CrashError> {
+            gate_state(&self.st)?;
+            self.mem.sync().await.map_err(CrashError::Inner)
+        }
+        async fn sidecar(&mut self, kind: Sidecar) -> Result<CrashSidecar, CrashError> {
+            Ok(CrashSidecar {
+                inner: self.mem.sidecar(kind).await.map_err(CrashError::Inner)?,
+                st: self.st.clone(),
+            })
+        }
+        fn file_name(&self) -> &[u8] {
+            &self.name
+        }
+        fn open_attached(&self, target: AttachTarget<'_>) -> Option<Self> {
+            match target {
+                AttachTarget::File(n) => {
+                    // Relative to the main file's directory.
+                    let dir = match self.name.iter().rposition(|&b| b == b'/') {
+                        Some(i) => &self.name[..=i],
+                        None => &[][..],
+                    };
+                    let mut full = dir.to_vec();
+                    full.extend_from_slice(n);
+                    Some(FsStorage::open(&self.fs, &self.st, &full))
+                }
+                _ => None,
+            }
+        }
+        async fn open_named(&mut self, name: &[u8]) -> Result<Option<CrashSidecar>, CrashError> {
+            // A database's journal, by its name.
+            if let Some(db) = name.strip_suffix(b"-journal") {
+                let mem = self.fs.borrow().dbs.get(db).cloned();
+                if let Some(mut m) = mem {
+                    let inner: MemSidecar = m
+                        .sidecar(Sidecar::RollbackJournal)
+                        .await
+                        .map_err(CrashError::Inner)?;
+                    return Ok(Some(CrashSidecar {
+                        inner,
+                        st: self.st.clone(),
+                    }));
+                }
+            }
+            let mut m = self
+                .fs
+                .borrow_mut()
+                .files
+                .entry(name.to_vec())
+                .or_default()
+                .clone();
+            let inner = m
+                .sidecar(Sidecar::RollbackJournal)
+                .await
+                .map_err(CrashError::Inner)?;
+            Ok(Some(CrashSidecar {
+                inner,
+                st: self.st.clone(),
+            }))
+        }
+    }
+
+    /// Every file's bytes: databases with their journals, and the
+    /// stand-alone files that exist.
+    pub(super) type Image = (
+        BTreeMap<Vec<u8>, (Vec<u8>, Option<Vec<u8>>)>,
+        BTreeMap<Vec<u8>, Vec<u8>>,
+    );
+
+    pub(super) fn image(fs: &Rc<RefCell<Fs>>) -> Image {
+        let fs = fs.borrow();
+        let dbs = fs
+            .dbs
+            .iter()
+            .map(|(k, m)| (k.clone(), (m.snapshot(), m.journal_snapshot())))
+            .collect();
+        let files = fs
+            .files
+            .iter()
+            .filter_map(|(k, m)| m.journal_snapshot().map(|j| (k.clone(), j)))
+            .collect();
+        (dbs, files)
+    }
+
+    pub(super) fn restore(img: &Image) -> Rc<RefCell<Fs>> {
+        let mut fs = Fs::default();
+        for (k, (d, j)) in img.0.iter() {
+            let m = MemStorage::new();
+            m.set_snapshot(d.clone());
+            m.set_journal(j.clone());
+            fs.dbs.insert(k.clone(), m);
+        }
+        for (k, b) in img.1.iter() {
+            let m = MemStorage::new();
+            m.set_journal(Some(b.clone()));
+            fs.files.insert(k.clone(), m);
+        }
+        Rc::new(RefCell::new(fs))
+    }
+
+    /// The rows of each database, as one text: `t` in main, `u` in
+    /// `a`, `w` in `b`.
+    pub(super) async fn contents(db: &mut Connection<FsStorage>) -> String {
+        let mut out = String::new();
+        for q in [
+            "SELECT group_concat(id) FROM t",
+            "SELECT group_concat(id) FROM a.u",
+            "SELECT group_concat(id) FROM b.w",
+        ] {
+            let mut st = db.prepare(q).await.expect("prep");
+            assert_eq!(st.step().await.expect("step"), Step::Row);
+            if let Some(b) = st.column_bytes(0) {
+                out.push_str(&String::from_utf8_lossy(b));
+            }
+            out.push(';');
+        }
+        out
+    }
+
+    pub(super) async fn open_all(
+        fs: &Rc<RefCell<Fs>>,
+        st: &Rc<RefCell<CrashState>>,
+        root: &str,
+    ) -> Connection<FsStorage> {
+        let main = FsStorage::open(fs, st, format!("{root}/main.db").as_bytes());
+        let mut db = Connection::open(main, Config::default())
+            .await
+            .expect("open main");
+        run_all(
+            &mut db,
+            &strs(&["ATTACH 'a.db' AS a", "ATTACH 'b.db' AS b"]),
+        )
+        .await;
+        db
+    }
+}
+
+/// Write a crashed multi-database image to real files under `dir`
+/// (its names are absolute paths there).
+#[cfg(feature = "attach")]
+fn image_to_disk(img: &multi::Image) {
+    for (k, (d, j)) in img.0.iter() {
+        let p = std::path::PathBuf::from(String::from_utf8_lossy(k).to_string());
+        std::fs::write(&p, d).expect("write db");
+        let mut jp = p.clone().into_os_string();
+        jp.push("-journal");
+        match j {
+            Some(j) => std::fs::write(&jp, j).expect("write journal"),
+            None => {
+                let _ = std::fs::remove_file(&jp);
+            }
+        }
+    }
+    for (k, b) in img.1.iter() {
+        let p = std::path::PathBuf::from(String::from_utf8_lossy(k).to_string());
+        std::fs::write(&p, b).expect("write file");
+    }
+}
+
+#[cfg(feature = "attach")]
+fn multi_crash_matrix(tag: &str, txn: &[&str]) {
+    use multi::*;
+    let dir =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hipp-crash-mj-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let root = dir.to_string_lossy().to_string();
+    let txn = strs(txn);
+    block_on(async {
+        let st = Rc::new(RefCell::new(CrashState::default()));
+        let fs = Rc::new(RefCell::new(Fs::default()));
+        {
+            let mut db = open_all(&fs, &st, &root).await;
+            run_all(
+                &mut db,
+                &strs(&[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)",
+                    "INSERT INTO t VALUES (1, 'one')",
+                    "CREATE TABLE a.u (id INTEGER PRIMARY KEY, x TEXT)",
+                    "INSERT INTO a.u VALUES (1, 'one')",
+                    "CREATE TABLE b.w (id INTEGER PRIMARY KEY, x TEXT)",
+                    "INSERT INTO b.w VALUES (1, 'one')",
+                ]),
+            )
+            .await;
+        }
+        let pre = image(&fs);
+        let pre_rows = {
+            let fs = restore(&pre);
+            let mut db = open_all(&fs, &st, &root).await;
+            contents(&mut db).await
+        };
+        // The post-image, and the commit's op count.
+        let fs = restore(&pre);
+        let total = {
+            let mut db = open_all(&fs, &st, &root).await;
+            let before = st.borrow().ops;
+            run_all(&mut db, &txn).await;
+            st.borrow().ops - before
+        };
+        let post = image(&fs);
+        assert!(post.1.is_empty(), "{tag}: the super-journal is gone");
+        assert!(
+            post.0.values().all(|(_, j)| j.is_none()),
+            "{tag}: every journal is gone"
+        );
+        let post_rows = {
+            let fs = restore(&post);
+            let mut db = open_all(&fs, &st, &root).await;
+            contents(&mut db).await
+        };
+        assert_ne!(pre_rows, post_rows, "{tag}: the transaction changes rows");
+        let (mut saw_pre, mut saw_post, mut saw_super) = (false, false, false);
+        for k in 0..total {
+            let fs = restore(&pre);
+            {
+                let mut db = open_all(&fs, &st, &root).await;
+                let at = st.borrow().ops + k;
+                st.borrow_mut().kill_at = Some(at);
+                run_all(&mut db, &txn).await;
+            }
+            // The process dies here: nothing is cleaned up.
+            st.borrow_mut().kill_at = None;
+            st.borrow_mut().dead = false;
+            let crashed = image(&fs);
+            saw_super |= !crashed.1.is_empty();
+            // hipp recovers every database to one side.
+            let rows = {
+                let fs = restore(&crashed);
+                let mut db = open_all(&fs, &st, &root).await;
+                let r = contents(&mut db).await;
+                drop(db);
+                let rec = image(&fs);
+                if r == pre_rows {
+                    assert_eq!(
+                        rec.0.iter().map(|(k, v)| (k, &v.0)).collect::<Vec<_>>(),
+                        pre.0.iter().map(|(k, v)| (k, &v.0)).collect::<Vec<_>>(),
+                        "{tag} k={k}: pre-image bytes"
+                    );
+                } else {
+                    assert_eq!(
+                        rec.0.iter().map(|(k, v)| (k, &v.0)).collect::<Vec<_>>(),
+                        post.0.iter().map(|(k, v)| (k, &v.0)).collect::<Vec<_>>(),
+                        "{tag} k={k}: post-image bytes"
+                    );
+                }
+                assert!(
+                    rec.0.values().all(|(_, j)| j.is_none()),
+                    "{tag} k={k}: journals consumed"
+                );
+                // (A super-journal no journal points at yet — a crash
+                // while it was being written — stays behind, as the
+                // pin leaves it.)
+                r
+            };
+            if rows == pre_rows {
+                saw_pre = true;
+            } else if rows == post_rows {
+                saw_post = true;
+            } else {
+                panic!("{tag} k={k}/{total}: torn: {rows} (pre {pre_rows}, post {post_rows})");
+            }
+            // The real pin recovers the same crashed files alike.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            image_to_disk(&crashed);
+            let main = dir.join("main.db");
+            let out = common::cli(
+                &main,
+                &format!(
+                    "ATTACH '{root}/a.db' AS a; ATTACH '{root}/b.db' AS b; \
+                     SELECT group_concat(id) FROM t; SELECT group_concat(id) FROM a.u; \
+                     SELECT group_concat(id) FROM b.w; PRAGMA integrity_check; \
+                     PRAGMA a.integrity_check; PRAGMA b.integrity_check;"
+                ),
+            );
+            let ora: Vec<&str> = out.lines().collect();
+            let ora_rows = format!(
+                "{};{};{};",
+                ora.first().unwrap_or(&""),
+                ora.get(1).unwrap_or(&""),
+                ora.get(2).unwrap_or(&"")
+            );
+            assert_eq!(ora_rows, rows, "{tag} k={k}: the pin recovers alike");
+            assert_eq!(&ora[3..], &["ok", "ok", "ok"], "{tag} k={k}");
+        }
+        assert!(saw_pre && saw_post, "{tag}: both sides reached");
+        assert!(saw_super, "{tag}: some crash left the super-journal");
+    });
+}
+
+#[cfg(feature = "attach")]
+#[test]
+fn v16_crash_multi_database_commit() {
+    multi_crash_matrix(
+        "two",
+        &[
+            "BEGIN",
+            "INSERT INTO t VALUES (2, 'two')",
+            "INSERT INTO a.u VALUES (2, 'two')",
+            "COMMIT",
+        ],
+    );
+}
+
+#[cfg(feature = "attach")]
+#[test]
+fn v16_crash_three_databases_and_savepoints() {
+    multi_crash_matrix(
+        "three",
+        &[
+            "SAVEPOINT s",
+            "INSERT INTO a.u VALUES (2, 'two')",
+            "SAVEPOINT q",
+            "INSERT INTO b.w SELECT id + 10, x FROM a.u",
+            "ROLLBACK TO q",
+            "INSERT INTO b.w VALUES (3, printf('%.3000c', 'w'))",
+            "UPDATE t SET x = (SELECT group_concat(x) FROM a.u)",
+            "RELEASE s",
+        ],
+    );
+}
+
+/// Only the attached databases are written (main's name still names
+/// the super-journal).
+#[cfg(feature = "attach")]
+#[test]
+fn v16_crash_attached_only_commit() {
+    multi_crash_matrix(
+        "att",
+        &[
+            "BEGIN",
+            "INSERT INTO a.u VALUES (2, 'two')",
+            "INSERT INTO b.w VALUES (2, 'two')",
+            "COMMIT",
+        ],
+    );
+}
+
+/// The other direction (v0.16, `attach`): the real pin killed (by
+/// `strace`'s fault injection) on entry to each write, sync, truncate
+/// and unlink of a multi-database commit leaves journals and a
+/// super-journal that hipp recovers exactly as the pin itself does —
+/// all databases to one side. Skipped where `strace` cannot run.
+#[cfg(feature = "attach")]
+#[test]
+fn v16_cross_tool_hipp_recovers_pin_super_journal() {
+    use std::process::{Command, Stdio};
+    if Command::new("strace")
+        .arg("-V")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("strace not available: skipped");
+        return;
+    }
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-crash-pin-mj");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let main = dir.join("main.db");
+    let a = dir.join("a.db");
+    let setup = format!(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, x); INSERT INTO t VALUES (1, 'one'); \
+         ATTACH '{}' AS a; CREATE TABLE a.u(id INTEGER PRIMARY KEY, x); \
+         INSERT INTO a.u VALUES (1, 'one');",
+        a.display()
+    );
+    common::cli(&main, &setup);
+    let pre = (
+        std::fs::read(&main).expect("main"),
+        std::fs::read(&a).expect("a"),
+    );
+    let txn = format!(
+        "ATTACH '{}' AS a;\nBEGIN;\nINSERT INTO t VALUES (2, 'two');\n\
+         INSERT INTO a.u VALUES (2, printf('%.5000c', 'u'));\nCOMMIT;\n",
+        a.display()
+    );
+    let reset = || {
+        for e in std::fs::read_dir(&dir).expect("dir") {
+            let _ = std::fs::remove_file(e.expect("entry").path());
+        }
+        std::fs::write(&main, &pre.0).expect("main");
+        std::fs::write(&a, &pre.1).expect("a");
+    };
+    let snapshot = || -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        std::fs::read_dir(&dir)
+            .expect("dir")
+            .map(|e| {
+                let p = e.expect("entry").path();
+                let b = std::fs::read(&p).expect("read");
+                (p, b)
+            })
+            .collect()
+    };
+    let restore = |files: &[(std::path::PathBuf, Vec<u8>)]| {
+        for e in std::fs::read_dir(&dir).expect("dir") {
+            let _ = std::fs::remove_file(e.expect("entry").path());
+        }
+        for (p, b) in files {
+            std::fs::write(p, b).expect("write");
+        }
+    };
+    let (mut saw_pre, mut saw_post, mut saw_super) = (false, false, false);
+    for sys in ["pwrite64", "fsync", "ftruncate", "unlink"] {
+        for n in 1.. {
+            reset();
+            let mut child = Command::new("strace")
+                .args(["-f", "-qq", "-o", "/dev/null", "-e"])
+                .arg(format!("inject={sys}:signal=KILL:when={n}"))
+                .arg(common::oracle())
+                .arg(&main)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("strace runs");
+            {
+                use std::io::Write;
+                let _ = child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin")
+                    .write_all(txn.as_bytes());
+            }
+            let status = child.wait().expect("wait");
+            if status.success() {
+                break; // no n-th such call: this syscall is exhausted
+            }
+            let crashed = snapshot();
+            saw_super |= crashed
+                .iter()
+                .any(|(p, _)| p.to_string_lossy().contains("-mj"));
+            // hipp recovers in place (the names inside are absolute).
+            let hipp_rows = block_on(async {
+                let fs = hipp::FileStorage::open(&main).expect("fs");
+                let mut db = Connection::open(fs, Config::default())
+                    .await
+                    .expect("hipp open");
+                let mut out = String::new();
+                for q in [
+                    format!("ATTACH '{}' AS a", a.display()),
+                    "SELECT group_concat(id) FROM t".to_string(),
+                    "SELECT group_concat(id) FROM a.u".to_string(),
+                ] {
+                    let mut st = db.prepare(&q).await.expect("prep");
+                    while st.step().await.expect("step") == Step::Row {
+                        out.push_str(&String::from_utf8_lossy(
+                            st.column_bytes(0).unwrap_or_default(),
+                        ));
+                        out.push(';');
+                    }
+                }
+                out
+            });
+            assert_eq!(
+                common::cli(
+                    &main,
+                    &format!(
+                        "ATTACH '{}' AS a; PRAGMA integrity_check; PRAGMA a.integrity_check;",
+                        a.display()
+                    )
+                ),
+                "ok\nok\n",
+                "{sys}#{n}: hipp's recovery"
+            );
+            // The pin recovers the same crashed files.
+            restore(&crashed);
+            let out = common::cli(
+                &main,
+                &format!(
+                    "ATTACH '{}' AS a; SELECT group_concat(id) FROM t; \
+                     SELECT group_concat(id) FROM a.u;",
+                    a.display()
+                ),
+            );
+            let pin_rows: String = out.lines().map(|l| format!("{l};")).collect();
+            assert_eq!(
+                hipp_rows, pin_rows,
+                "{sys}#{n}: hipp and the pin recover alike"
+            );
+            match hipp_rows.as_str() {
+                "1;1;" => saw_pre = true,
+                "1,2;1,2;" => saw_post = true,
+                r => panic!("{sys}#{n}: torn recovery {r}"),
+            }
+        }
+    }
+    assert!(
+        saw_pre && saw_post && saw_super,
+        "both sides and a super-journal seen"
+    );
+}

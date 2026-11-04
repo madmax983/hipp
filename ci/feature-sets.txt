@@ -26,6 +26,7 @@ v16,without_rowid
 v16,utf16
 v16,wal
 v16,datetime
+v16,attach
 indexes,v04
 indexes,v05
 indexes,v06

@@ -440,6 +440,16 @@ impl<T> AVec<T> {
     pub fn insert(&mut self, at: usize, v: T) {
         self.vec.insert(at, v);
     }
+    /// Remove and return the element at `idx`, shifting later ones
+    /// down; `None` (nothing removed) past the end (v0.16, `attach`:
+    /// DETACH closes up the database list).
+    pub fn remove_at(&mut self, idx: usize) -> Option<T> {
+        if idx < self.vec.len() {
+            Some(self.vec.remove(idx))
+        } else {
+            None
+        }
+    }
 }
 
 impl<T> Default for AVec<T> {

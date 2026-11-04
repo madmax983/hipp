@@ -763,6 +763,32 @@ aspirations.
   the bare keywords are calls, never a table's own "current_date"
   column (they used to resolve as one), and `current_date()` is a
   syntax error. Without the leaf the functions stay unknown.
+- **ATTACH / DETACH and several databases** (leaf `attach`, in
+  `max`). `ATTACH [DATABASE] expr AS expr [KEY expr]` (a file,
+  `':memory:'`, `''` / NULL for a private temporary database) and
+  `DETACH [DATABASE] expr` with the pin's limit of 10 and its
+  errors (already in use, cannot detach main / temp, no such
+  database, database is locked inside a transaction that used it,
+  the encoding rule); `PRAGMA database_list`, schema-qualified
+  names everywhere the pin takes them (`aux.t`, `aux.t.col`,
+  `aux.sqlite_schema`, `PRAGMA aux.x`, `VACUUM aux [INTO]`,
+  `REINDEX` / `ANALYZE` / `ALTER` / `DROP` / `CREATE TABLE / INDEX
+  / VIEW / TRIGGER aux.x`) and the pin's unqualified-name order
+  (temp, main, then attached in attach order). Each attached
+  database is a connection of its own owned by the main one — the
+  TEMP database's model made N-ary — so every feature works inside
+  it; statements across databases (joins, subqueries, compounds,
+  `INSERT INTO aux.t SELECT ... FROM main.t` both ways, UPDATE /
+  DELETE reading other databases, `UPDATE ... FROM`, CREATE TABLE
+  ... AS) read the other databases' tables as external sources.
+  One transaction spans every database, savepoints included; a
+  rollback-journal commit of several files is atomic through the
+  pin's super-journal (`<main>-mjXXXXXX9XX`, the journal-tail
+  pointer), and hot-journal recovery honours it — crash-tested at
+  every write boundary, with the real pin recovering hipp's crashed
+  files and hipp recovering the pin's. `no_std` callers supply an
+  attached name's storage through `Connection::set_attach_hook`;
+  `FileStorage` opens files. hipp-cli gains `.databases`.
 
 ## What v0.13 does
 
@@ -1063,7 +1089,8 @@ and `cargo test --workspace`.
 A std binary shell (`hipp-cli/`, decision D4): interactive,
 stdin-batch and one-shot modes with list-format output
 byte-diffable against the pinned oracle CLI, plus `.tables`,
-`.schema`, `.dump`, `.open`, `.parameter` (v0.16: `set`,
+`.schema`, `.dump`, `.open`, `.databases` (v0.16, with attached
+databases in `.schema` / `.tables`), `.parameter` (v0.16: `set`,
 `unset`, `clear`, `list`, `init`, bound by name as the oracle
 shell binds them), `.exit`. Its first job is
 differential testing. It is a separate crate and contributes
@@ -1084,7 +1111,9 @@ stored but never executed (all of these in the tiny profile: the
 UTF-16 databases without the `utf16` leaf (refused at open), no
 writes to auto-vacuum files (read only: hipp keeps no pointer-map
 pages, so writes are refused with `AutoVacuumUnsupported` until
-`PRAGMA auto_vacuum = NONE; VACUUM` converts the file), no multi-process
+`PRAGMA auto_vacuum = NONE; VACUUM` converts the file), no
+ATTACH without the `attach` leaf (refused; with it, one file is
+attached once — hipp has no shared page cache), no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 

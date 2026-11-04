@@ -4,7 +4,7 @@
 //! is byte-diffable against the pinned SQLite oracle CLI.
 //!
 //! Its first job is differential testing; demo surface second.
-//! Dot-commands: `.tables`, `.schema`, `.dump`, `.open`,
+//! Dot-commands: `.tables`, `.schema`, `.dump`, `.open`, `.databases`,
 //! `.parameter`, `.exit` (alias `.quit`). No line editing, no
 //! `.import`/`.export`, no format/flag parity beyond diffable
 //! basics.
@@ -101,6 +101,14 @@ const STACK_BYTES: usize = 512 * 1024 * 1024;
 /// index or a view): the oracle shell's `.schema` form of a TEMP
 /// database object.
 fn temp_text(sql: &[u8]) -> Vec<u8> {
+    prefixed_text(sql, b"temp")
+}
+
+/// `CREATE TABLE x` as `CREATE TABLE <db>.x` (and likewise for an
+/// index, a view or a trigger): the oracle shell's `.schema` form of
+/// an object of a TEMP (`temp`) or attached database (its name,
+/// quoted as `shell_quote_name` quotes).
+fn prefixed_text(sql: &[u8], db: &[u8]) -> Vec<u8> {
     for p in [
         &b"CREATE TABLE "[..],
         b"CREATE UNIQUE INDEX ",
@@ -110,7 +118,8 @@ fn temp_text(sql: &[u8]) -> Vec<u8> {
     ] {
         if sql.starts_with(p) {
             let mut v = p.to_vec();
-            v.extend_from_slice(b"temp.");
+            v.extend_from_slice(db);
+            v.push(b'.');
             v.extend_from_slice(&sql[p.len()..]);
             return v;
         }
@@ -126,13 +135,28 @@ fn temp_text(sql: &[u8]) -> Vec<u8> {
 /// execute); a view that cannot be planned — a missing table, a
 /// column list of the wrong length, a cycle — gets no comment, as in
 /// the oracle shell.
+///
+/// `attached`: the attached database at that index (v0.16), printed
+/// as the oracle shell prints one — every name prefixed with its
+/// database's name, quoted as a column name would be.
 async fn print_schema<S: hipp::Storage>(
     db: &mut Connection<S>,
     arg: &str,
     out: &mut dyn Write,
     temp: bool,
+    attached: Option<usize>,
 ) {
-    let sql = if temp {
+    let att_name = attached.and_then(|i| db.attached_db(i).map(|(n, _)| n.to_vec()));
+    let quoted = att_name.as_deref().map(shell_quote_name);
+    let att_sql = att_name.as_ref().map(|n| {
+        let mut q = String::from("SELECT type, name, tbl_name, sql FROM \"");
+        q.push_str(&String::from_utf8_lossy(n).replace('"', "\"\""));
+        q.push_str("\".sqlite_schema");
+        q
+    });
+    let sql = if let Some(q) = att_sql.as_deref() {
+        q
+    } else if temp {
         "SELECT type, name, tbl_name, sql FROM sqlite_temp_schema"
     } else {
         "SELECT type, name, tbl_name, sql FROM main.sqlite_schema"
@@ -153,12 +177,19 @@ async fn print_schema<S: hipp::Storage>(
         if !arg.is_empty() && !name.eq_ignore_ascii_case(a) && !tbl.eq_ignore_ascii_case(a) {
             continue;
         }
-        let _ = out.write_all(&if temp { temp_text(sql) } else { sql.clone() });
+        let shown = match &quoted {
+            Some(q) => prefixed_text(sql, q),
+            None if temp => temp_text(sql),
+            None => sql.clone(),
+        };
+        let _ = out.write_all(&shown);
         let _ = out.write_all(b";\n");
         if ty.as_slice() != b"view" {
             continue;
         }
-        let cols = if temp {
+        let cols = if let Some(i) = attached {
+            db.attached_db(i).and_then(|(_, a)| a.view_columns(name))
+        } else if temp {
             db.temp_db().and_then(|t| t.view_columns(name))
         } else {
             db.view_columns(name)
@@ -167,7 +198,10 @@ async fn print_schema<S: hipp::Storage>(
             continue;
         };
         let _ = out.write_all(b"/* ");
-        if temp {
+        if let Some(q) = &quoted {
+            let _ = out.write_all(q);
+            let _ = out.write_all(b".");
+        } else if temp {
             let _ = out.write_all(b"temp.");
         }
         let _ = out.write_all(&shell_quote_name(name));
@@ -733,14 +767,55 @@ where
                     let _ = out.write_all(b"\n");
                 }
             }
+            // The attached databases' (v0.16), as `name.x`.
+            let mut i = 0;
+            while let Some((an, a)) = db.attached_db(i) {
+                let names = a.tables().iter().map(|m| m.name).collect::<Vec<_>>();
+                let views = a.views().iter().map(|m| m.name).collect::<Vec<_>>();
+                for n in names.iter().chain(views.iter()) {
+                    if n.starts_with(b"sqlite_") {
+                        continue;
+                    }
+                    let _ = out.write_all(an);
+                    let _ = out.write_all(b".");
+                    let _ = out.write_all(n);
+                    let _ = out.write_all(b"\n");
+                }
+                i += 1;
+            }
             Ok(Flow::Continue)
         }
         ".schema" => {
-            print_schema(db, arg, out, false).await;
+            print_schema(db, arg, out, false, None).await;
             // The TEMP database's objects follow, named `temp.`, as
             // the oracle shell prints them.
             if db.temp_db().is_some() {
-                print_schema(db, arg, out, true).await;
+                print_schema(db, arg, out, true, None).await;
+            }
+            // Then each attached database's (v0.16), `name.`-prefixed.
+            let mut i = 0;
+            while db.attached_db(i).is_some() {
+                print_schema(db, arg, out, false, Some(i)).await;
+                i += 1;
+            }
+            Ok(Flow::Continue)
+        }
+        ".databases" => {
+            // `name: file r/w`, `""` for a database without a file,
+            // as the oracle shell prints `PRAGMA database_list`.
+            if let Ok(mut st) = db.prepare("PRAGMA database_list").await {
+                while let Ok(Step::Row) = st.step().await {
+                    let name = st.column_bytes(1).unwrap_or_default().to_vec();
+                    let file = st.column_bytes(2).unwrap_or_default().to_vec();
+                    let _ = out.write_all(&name);
+                    let _ = out.write_all(b": ");
+                    if file.is_empty() {
+                        let _ = out.write_all(b"\"\"");
+                    } else {
+                        let _ = out.write_all(&file);
+                    }
+                    let _ = out.write_all(b" r/w\n");
+                }
             }
             Ok(Flow::Continue)
         }

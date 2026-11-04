@@ -658,6 +658,50 @@ pub enum SchemaKind {
     /// element"). End the path with an array index.
     #[cfg(feature = "json")]
     JsonNotArrayElement,
+    /// `ATTACH ... AS name` where `name` is `main`, `temp` or an
+    /// attached database's (any case; v0.16, `attach`; the pin's
+    /// "database X is already in use"). Choose another name, or
+    /// DETACH that database first.
+    #[cfg(feature = "attach")]
+    DatabaseInUse,
+    /// An eleventh attached database (v0.16, `attach`; the pin's
+    /// "too many attached databases - max 10"). DETACH one first.
+    #[cfg(feature = "attach")]
+    TooManyAttached,
+    /// The storage for an ATTACH could not be opened (v0.16,
+    /// `attach`; the pin's "unable to open database"): no such
+    /// directory, no permission, or storage that reaches no files
+    /// (`MemStorage` without `Connection::set_attach_hook`). Fix the
+    /// name, or supply a hook.
+    #[cfg(feature = "attach")]
+    CannotOpenDatabase,
+    /// `DETACH main` / `DETACH temp` (v0.16, `attach`; the pin's
+    /// "cannot detach database X"). Only attached databases detach.
+    #[cfg(feature = "attach")]
+    CannotDetach,
+    /// `DETACH` of a name no database has (v0.16, `attach`; the
+    /// pin's "no such database: X"). Check `PRAGMA database_list`.
+    #[cfg(feature = "attach")]
+    NoSuchDatabase,
+    /// `DETACH` of a database the open transaction has read or
+    /// written (v0.16, `attach`; the pin's "database X is locked").
+    /// COMMIT or ROLLBACK first.
+    #[cfg(feature = "attach")]
+    DatabaseLocked,
+    /// ATTACH of a database whose text encoding differs from the
+    /// main database's (v0.16, `attach`; the pin's "attached
+    /// databases must use the same text encoding as main
+    /// database"). Convert one of them (VACUUM INTO a database made
+    /// with the other's `PRAGMA encoding`).
+    #[cfg(feature = "attach")]
+    AttachEncoding,
+    /// A view or trigger of one database naming an object of
+    /// another with a schema qualifier (v0.16, `attach`; the pin's
+    /// "view v cannot reference objects in database X", "trigger t
+    /// cannot reference objects in database X"). Make it a TEMP view
+    /// / trigger, or keep it in one database.
+    #[cfg(feature = "attach")]
+    CrossDatabaseReference,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

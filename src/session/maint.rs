@@ -495,6 +495,9 @@ impl<S: Storage> Statement<'_, S> {
             // everything staying open (`foreign_keys`).
             #[cfg(feature = "foreign_keys")]
             self.conn.fk_commit_check()?;
+            // Every database's commit (v0.16, `attach`).
+            #[cfg(feature = "attach")]
+            self.conn.commit_all().await?;
             self.conn.pager.drive_commit().await?;
             self.conn.pager.sp_clear();
             self.conn.explicit_txn = false;

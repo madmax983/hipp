@@ -1385,7 +1385,13 @@ fn update_from_repeating_the_target_is_refused() {
 fn schema_qualifier_other_than_main_is_refused() {
     let tw = twins("schema-q", "CREATE TABLE s(a); INSERT INTO s VALUES(1)");
     tw.all(&["SELECT * FROM main.s", "SELECT * FROM MAIN.s"]);
-    tw.refuse_parse("SELECT * FROM foo.s");
+    // With `attach` an unknown schema is the pin's "no such table:
+    // foo.s"; without it hipp refuses the qualifier at parse.
+    if cfg!(feature = "attach") {
+        tw.refuse("SELECT * FROM foo.s", SchemaKind::UnknownTable);
+    } else {
+        tw.refuse_parse("SELECT * FROM foo.s");
+    }
     // `temp.` names the TEMP database: hipp has one with `v16`
     // (empty here, so these fail as on the pin), and refuses the
     // qualifier without it.

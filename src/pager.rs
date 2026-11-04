@@ -14,6 +14,17 @@ use crate::error::{Error, Result};
 use crate::storage::{Sidecar, SidecarFile, Storage};
 
 pub const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+/// The pin's lock byte offset (`PENDING_BYTE`): a super-journal
+/// pointer record is tagged with the page holding it, plus one.
+pub const PENDING_BYTE: u32 = 0x4000_0000;
+
+/// The pin's checksum of a super-journal name (`writeSuperJournal` /
+/// `readSuperJournal`): each byte added as a signed `char`, as on
+/// x86-64.
+pub fn super_cksum(name: &[u8]) -> u32 {
+    name.iter()
+        .fold(0u32, |c, &b| c.wrapping_add(i32::from(b as i8) as u32))
+}
 pub const SECTOR_SIZE: u32 = 512;
 /// SQLITE_VERSION_NUMBER written into header offset 96 (D1 pin).
 pub const PIN_VERSION_NUMBER: u32 = 3_054_001;
@@ -426,6 +437,15 @@ pub struct Pager<S: Storage> {
     /// checkpoint opens it with a read transaction.
     #[cfg(feature = "wal")]
     wal_fresh: bool,
+    /// The super-journal this commit's journal points at (v0.16,
+    /// `attach`; `commit_phase_one`): written at the journal's end
+    /// before it is synced.
+    #[cfg(feature = "attach")]
+    super_name: Option<AVec<u8>>,
+    /// Stop the commit before the journal is deleted (v0.16,
+    /// `attach`: phase one of a multi-database commit).
+    #[cfg(feature = "attach")]
+    hold: bool,
 }
 
 impl<S: Storage> Pager<S> {
@@ -523,6 +543,34 @@ impl<S: Storage> Pager<S> {
             .map_err(Error::Storage)?;
         let jlen = sidecar.len().await.map_err(Error::Storage)?;
         if sidecar.existed() && jlen > 0 {
+            // A journal pointing at a super-journal that is gone
+            // belongs to a multi-database commit that completed: it
+            // is not hot, and is deleted unplayed (the pin's
+            // `pager_playback` / `pager_end_transaction`). One whose
+            // super-journal is still there is rolled back, and the
+            // super-journal deleted once no journal names it (v0.16,
+            // `v16`; below it every hot journal is rolled back).
+            #[cfg(feature = "v16")]
+            let recovered = {
+                let sup = read_super(&mut sidecar, jlen).await?;
+                let hot = match &sup {
+                    None => true,
+                    Some(n) => storage
+                        .open_named(n.as_slice())
+                        .await
+                        .map_err(Error::Storage)?
+                        .is_none_or(|f| f.existed()),
+                };
+                if !hot {
+                    sidecar.delete().await.map_err(Error::Storage)?;
+                }
+                let recovered = hot && replay_journal(&mut storage, &mut sidecar, jlen).await?;
+                if recovered && let Some(n) = &sup {
+                    del_super(&mut storage, n.as_slice()).await?;
+                }
+                recovered
+            };
+            #[cfg(not(feature = "v16"))]
             let recovered = replay_journal(&mut storage, &mut sidecar, jlen).await?;
             if recovered {
                 // Header fields may have been rolled back too.
@@ -608,6 +656,10 @@ impl<S: Storage> Pager<S> {
                 touched: false,
                 #[cfg(feature = "wal")]
                 wal_fresh: false,
+                #[cfg(feature = "attach")]
+                super_name: None,
+                #[cfg(feature = "attach")]
+                hold: false,
             },
             is_new,
         ))
@@ -1387,6 +1439,12 @@ impl<S: Storage> Pager<S> {
                     return Ok(());
                 }
                 CommitStage::SyncJournal => {
+                    // A multi-database commit's pointer to its
+                    // super-journal (v0.16, `attach`).
+                    #[cfg(feature = "attach")]
+                    if let Some(name) = self.super_name.take() {
+                        self.write_super(name.as_slice()).await?;
+                    }
                     let sidecar = self.sidecar.as_mut().expect("sidecar from open");
                     // `PRAGMA synchronous = OFF` skips every sync
                     // (v0.16, `wal`).
@@ -1435,6 +1493,13 @@ impl<S: Storage> Pager<S> {
                         self.storage.sync().await.map_err(Error::Storage)?;
                     }
                     self.stage = CommitStage::DeleteJournal;
+                    // Phase one of a multi-database commit ends here
+                    // (v0.16, `attach`): the journal stays until the
+                    // super-journal is gone.
+                    #[cfg(feature = "attach")]
+                    if self.hold {
+                        return Ok(());
+                    }
                 }
                 CommitStage::DeleteJournal => {
                     let sidecar = self.sidecar.as_mut().expect("sidecar from open");
@@ -1457,6 +1522,101 @@ impl<S: Storage> Pager<S> {
                 CommitStage::Idle | CommitStage::Writing => unreachable!(),
             }
         }
+    }
+
+    /// This pager's write transaction needs a super-journal when it
+    /// commits with others (v0.16, `attach`; the pin's `aMJNeeded`):
+    /// a rollback journal (not WAL), a database with a file (not
+    /// `:memory:`), synchronous not OFF.
+    #[cfg(feature = "attach")]
+    pub fn super_candidate(&self) -> bool {
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() || self.wal_cfg.sync == 0 {
+            return false;
+        }
+        self.stage == CommitStage::Writing
+            && !self.storage.is_memory()
+            && !self.storage.file_name().is_empty()
+    }
+
+    /// The journal's file name, as a super-journal lists it (v0.16,
+    /// `attach`): the database's, plus `-journal`.
+    #[cfg(feature = "attach")]
+    pub fn journal_name(&self) -> AVec<u8> {
+        let mut v = AVec::new();
+        v.extend_from_slice(self.storage.file_name());
+        v.extend_from_slice(b"-journal");
+        v
+    }
+
+    /// The storage, mutably (v0.16, `attach`: the super-journal is
+    /// opened through main's).
+    #[cfg(feature = "attach")]
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.storage
+    }
+
+    /// Random bits for a super-journal's name (v0.16, `attach`).
+    #[cfg(feature = "attach")]
+    pub fn rand_u32(&mut self) -> u32 {
+        (self.rand64() >> 16) as u32
+    }
+
+    /// Phase one of a multi-database commit (v0.16, `attach`): the
+    /// journal gets its pointer to super-journal `name`, is synced,
+    /// and the database written and synced; the journal is kept until
+    /// `drive_commit` runs again (phase two).
+    #[cfg(feature = "attach")]
+    pub async fn commit_phase_one(&mut self, name: &[u8]) -> Result<(), S::Error> {
+        let mut v = AVec::new();
+        v.extend_from_slice(name);
+        self.super_name = Some(v);
+        self.hold = true;
+        let r = self.drive_commit().await;
+        self.hold = false;
+        self.super_name = None;
+        r
+    }
+
+    /// The pin's super-journal pointer (`writeSuperJournal`): at the
+    /// next sector boundary (synchronous FULL) or the journal's end,
+    /// the lock-byte page number, the name, its length, its checksum
+    /// and the journal magic; the journal ends there (a savepoint area
+    /// past it is cut, as the pin truncates a longer file).
+    #[cfg(feature = "attach")]
+    async fn write_super(&mut self, name: &[u8]) -> Result<(), S::Error> {
+        #[cfg(feature = "wal")]
+        let full = self.wal_cfg.sync >= 2;
+        #[cfg(not(feature = "wal"))]
+        let full = true;
+        let sector = u64::from(SECTOR_SIZE);
+        let off = if full && self.journal_len > 0 {
+            self.journal_len.div_ceil(sector) * sector
+        } else {
+            self.journal_len
+        };
+        let len = u32::try_from(name.len()).map_err(|_| Error::Unsupported)?;
+        let sj_pgno = PENDING_BYTE / self.header.page_size.max(1) + 1;
+        let mut head = [0u8; 4];
+        put_be_u32(&mut head, 0, sj_pgno);
+        let mut tail = [0u8; 16];
+        put_be_u32(&mut tail, 0, len);
+        put_be_u32(&mut tail, 4, super_cksum(name));
+        tail[8..16].copy_from_slice(&JOURNAL_MAGIC);
+        let sidecar = self.sidecar.as_mut().expect("sidecar from open");
+        sidecar.write_at(off, &head).await.map_err(Error::Storage)?;
+        sidecar
+            .write_at(off + 4, name)
+            .await
+            .map_err(Error::Storage)?;
+        let end = off + 4 + u64::from(len);
+        sidecar.write_at(end, &tail).await.map_err(Error::Storage)?;
+        let total = end + 16;
+        if sidecar.len().await.map_err(Error::Storage)? > total {
+            sidecar.set_len(total).await.map_err(Error::Storage)?;
+        }
+        self.journal_len = total;
+        Ok(())
     }
 
     /// Roll back the open transaction (SPEC §5.3.3). If no data page
@@ -1836,7 +1996,7 @@ impl<S: Storage> Pager<S> {
 
     /// The next salt bits for the log (v0.16, `wal`): the nonce
     /// stream (the Config-supplied seed mixed with a counter).
-    #[cfg(feature = "wal")]
+    #[cfg(any(feature = "wal", feature = "attach"))]
     fn rand64(&mut self) -> u64 {
         self.nonce_counter = self.nonce_counter.wrapping_add(1);
         let mut x = self.nonce_seed ^ self.nonce_counter.wrapping_mul(0x9e37_79b1_85eb_ca87);
@@ -2220,6 +2380,82 @@ async fn open_wal<S: Storage>(
 /// delete the journal. Returns whether a valid journal was found.
 /// Segmented journals (page-count > 0 with repeated headers) are
 /// handled; hipp's own journals are single-segment (count = -1).
+/// The super-journal name at a journal's end, if its pointer record
+/// is there and checks out (v0.16, `v16`: below it every hot journal
+/// is rolled back, as before) (the pin's `readSuperJournal`: length,
+/// checksum and magic in the last 16 bytes, the name before them).
+#[cfg(feature = "v16")]
+async fn read_super<F: crate::storage::SidecarFile>(
+    j: &mut F,
+    jlen: u64,
+) -> Result<Option<AVec<u8>>, F::Error> {
+    if jlen < 16 {
+        return Ok(None);
+    }
+    let mut tail = [0u8; 16];
+    j.read_at(jlen - 16, &mut tail)
+        .await
+        .map_err(Error::Storage)?;
+    let len = u64::from(be_u32(&tail, 0));
+    if tail[8..16] != JOURNAL_MAGIC || len == 0 || len > jlen - 16 || len > 4096 {
+        return Ok(None);
+    }
+    let mut name = AVec::new();
+    for _ in 0..len {
+        name.push(0u8);
+    }
+    j.read_at(jlen - 16 - len, name.as_mut_slice())
+        .await
+        .map_err(Error::Storage)?;
+    if super_cksum(name.as_slice()) != be_u32(&tail, 4) {
+        return Ok(None);
+    }
+    // A NUL ends the name, as in the pin's C string.
+    if let Some(z) = name.iter().position(|&b| b == 0) {
+        name.truncate(z);
+    }
+    Ok(if name.is_empty() { None } else { Some(name) })
+}
+
+/// Delete super-journal `name` unless a journal it lists still points
+/// at it (the pin's `pager_delsuper`, after a rollback).
+#[cfg(feature = "v16")]
+async fn del_super<S: Storage>(storage: &mut S, name: &[u8]) -> Result<(), S::Error> {
+    let Some(mut sup) = storage.open_named(name).await.map_err(Error::Storage)? else {
+        return Ok(());
+    };
+    if !sup.existed() {
+        return Ok(());
+    }
+    let n = sup.len().await.map_err(Error::Storage)?;
+    let mut body = AVec::new();
+    for _ in 0..n.min(1 << 20) {
+        body.push(0u8);
+    }
+    sup.read_at(0, body.as_mut_slice())
+        .await
+        .map_err(Error::Storage)?;
+    for child in body.as_slice().split(|&b| b == 0) {
+        if child.is_empty() {
+            continue;
+        }
+        let Some(mut j) = storage.open_named(child).await.map_err(Error::Storage)? else {
+            continue;
+        };
+        if !j.existed() {
+            continue;
+        }
+        let jl = j.len().await.map_err(Error::Storage)?;
+        if read_super(&mut j, jl)
+            .await?
+            .is_some_and(|s| s.as_slice() == name)
+        {
+            return Ok(());
+        }
+    }
+    sup.delete().await.map_err(Error::Storage)
+}
+
 async fn replay_journal<S: Storage>(
     storage: &mut S,
     sidecar: &mut S::Sidecar,

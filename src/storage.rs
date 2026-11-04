@@ -125,6 +125,54 @@ pub trait Storage {
     fn is_memory(&self) -> bool {
         false
     }
+    /// Open the storage of a database `ATTACH` names (v0.16,
+    /// `attach`), or `None` when this kind of storage cannot reach
+    /// it (the statement then fails with
+    /// `SchemaKind::CannotOpenDatabase`, the pin's "unable to open
+    /// database"). Consulted when the connection has no
+    /// `Connection::set_attach_hook`. The default reaches nothing;
+    /// `MemStorage` makes `:memory:` and temporary databases in RAM,
+    /// `FileStorage` opens files (relative names against the working
+    /// directory, as the pin does) and backs `:memory:` and `''` with
+    /// a private temporary file removed when it is dropped.
+    #[cfg(feature = "attach")]
+    fn open_attached(&self, target: AttachTarget<'_>) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        let _ = target;
+        None
+    }
+    /// Open (creating it only when first written) the file named
+    /// `name` — a full path as `file_name` gives them, plus a suffix
+    /// — as a sidecar-shaped file (v0.16): the pin's super-journal
+    /// (`<main>-mjXXXXXX9XX`), which a multi-database commit writes
+    /// and hot-journal recovery looks for, and another database's
+    /// journal named in one. `Ok(None)` when this storage has no such
+    /// namespace (the default): such storage writes no super-journal
+    /// (a commit of several databases is then atomic per database
+    /// only, as the pin's is for a database without a file name), and
+    /// recovery rolls back a journal that names one.
+    async fn open_named(&mut self, name: &[u8]) -> Result<Option<Self::Sidecar>, Self::Error> {
+        let _ = name;
+        Ok(None)
+    }
+}
+
+/// What an `ATTACH` asks storage for (v0.16, `attach`;
+/// `Storage::open_attached`, `Connection::set_attach_hook`).
+#[cfg(feature = "attach")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachTarget<'a> {
+    /// A file, by the name the ATTACH expression gave (its text as
+    /// written; not necessarily UTF-8).
+    File(&'a [u8]),
+    /// `':memory:'`: a private in-memory database (journal mode
+    /// `memory`, no file name).
+    Memory,
+    /// `''` or NULL: a private temporary database, gone once it is
+    /// detached (no file name).
+    Temporary,
 }
 
 /// Optional advisory locking surface (SPEC §5.1): defined now so the
@@ -399,6 +447,17 @@ impl Storage for MemStorage {
     fn is_memory(&self) -> bool {
         self.memory
     }
+    /// `:memory:` and temporary databases live in RAM (a temporary
+    /// one models a file, as `MemStorage::new` does); a file name
+    /// reaches nothing, there being no file system.
+    #[cfg(feature = "attach")]
+    fn open_attached(&self, target: AttachTarget<'_>) -> Option<MemStorage> {
+        match target {
+            AttachTarget::Memory => Some(MemStorage::memory_db()),
+            AttachTarget::Temporary => Some(MemStorage::new()),
+            AttachTarget::File(_) => None,
+        }
+    }
     async fn sidecar(&mut self, kind: Sidecar) -> Result<MemSidecar, MemError> {
         let _ = kind;
         let sc = MemSidecar {
@@ -551,6 +610,11 @@ mod file_storage {
         /// The absolute path, as text (v0.16: `PRAGMA
         /// database_list`).
         full: std::vec::Vec<u8>,
+        /// A private temporary file standing for a `:memory:` (`Some(true)`)
+        /// or temporary (`Some(false)`) database (v0.16, `attach`;
+        /// `FileStorage::anonymous`): it has no name to show, and it
+        /// and its sidecars are removed when the storage is dropped.
+        anon: Option<bool>,
     }
 
     impl FileStorage {
@@ -567,7 +631,53 @@ mod file_storage {
                 .to_string_lossy()
                 .into_owned()
                 .into_bytes();
-            Ok(FileStorage { file, path, full })
+            Ok(FileStorage {
+                file,
+                path,
+                full,
+                anon: None,
+            })
+        }
+
+        /// A private database in a fresh file of the system's
+        /// temporary directory (v0.16): with `memory`, the pin's
+        /// `:memory:` (`Storage::is_memory`: journal mode `memory`),
+        /// else the pin's temporary database (`ATTACH '' AS x`).
+        /// Either has an empty file name (`PRAGMA database_list`
+        /// shows none), and the file and its sidecars are removed
+        /// when the storage is dropped.
+        pub fn anonymous(memory: bool) -> Result<FileStorage, FileError> {
+            let dir = std::env::temp_dir();
+            let pid = std::process::id();
+            let mut seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ (u64::from(pid) << 32);
+            for _ in 0..64 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let path = dir.join(std::format!("hipp-{pid}-{seed:016x}.db"));
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        return Ok(FileStorage {
+                            file,
+                            path,
+                            full: std::vec::Vec::new(),
+                            anon: Some(memory),
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(FileError)
         }
 
         fn journal_path(&self) -> PathBuf {
@@ -581,6 +691,19 @@ mod file_storage {
             let mut s = self.path.clone().into_os_string();
             s.push(suffix);
             PathBuf::from(s)
+        }
+    }
+
+    impl Drop for FileStorage {
+        /// A private temporary database (`FileStorage::anonymous`)
+        /// leaves nothing behind.
+        fn drop(&mut self) {
+            if self.anon.is_some() {
+                let _ = std::fs::remove_file(&self.path);
+                for suffix in ["-journal", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(self.sibling(suffix));
+                }
+            }
         }
     }
 
@@ -657,6 +780,59 @@ mod file_storage {
         }
         fn file_name(&self) -> &[u8] {
             &self.full
+        }
+        #[cfg(feature = "v16")]
+        fn is_memory(&self) -> bool {
+            self.anon == Some(true)
+        }
+        /// A file by name, relative to the working directory, as the
+        /// pin opens one; `:memory:` and `''` as a private temporary
+        /// file (`FileStorage::anonymous`).
+        #[cfg(feature = "attach")]
+        fn open_attached(&self, target: super::AttachTarget<'_>) -> Option<FileStorage> {
+            match target {
+                super::AttachTarget::Memory => FileStorage::anonymous(true).ok(),
+                super::AttachTarget::Temporary => FileStorage::anonymous(false).ok(),
+                super::AttachTarget::File(name) => {
+                    #[cfg(unix)]
+                    let path = {
+                        use std::os::unix::ffi::OsStrExt;
+                        PathBuf::from(std::ffi::OsStr::from_bytes(name))
+                    };
+                    #[cfg(not(unix))]
+                    let path = PathBuf::from(core::str::from_utf8(name).ok()?);
+                    FileStorage::open(path).ok()
+                }
+            }
+        }
+        async fn open_named(&mut self, name: &[u8]) -> Result<Option<FileSidecar>, FileError> {
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(std::ffi::OsStr::from_bytes(name))
+            };
+            #[cfg(not(unix))]
+            let path = match core::str::from_utf8(name) {
+                Ok(p) => PathBuf::from(p),
+                Err(_) => return Ok(None),
+            };
+            let existed = path.exists();
+            let file = if existed {
+                Some(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(false)
+                        .open(&path)?,
+                )
+            } else {
+                None
+            };
+            Ok(Some(FileSidecar {
+                path,
+                file,
+                existed,
+            }))
         }
         fn log_beside(&self) -> bool {
             std::fs::metadata(self.sibling("-wal")).is_ok_and(|m| m.len() > 0)

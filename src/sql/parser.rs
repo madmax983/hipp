@@ -143,6 +143,10 @@ struct Parser<'a> {
     /// legal only here.
     #[cfg(feature = "triggers")]
     in_trig: bool,
+    /// The schema qualifier the last `name` call consumed (v0.16,
+    /// `attach`): `aux` of `aux.t`, `None` for a bare name.
+    #[cfg(feature = "attach")]
+    last_schema: Option<ABytes>,
 }
 
 /// The ON / USING terms of one select core (v0.16): the pin's
@@ -759,6 +763,8 @@ impl<'a> Parser<'a> {
             core_h: 0,
             #[cfg(feature = "triggers")]
             in_trig: false,
+            #[cfg(feature = "attach")]
+            last_schema: None,
         }
     }
 
@@ -873,13 +879,31 @@ impl<'a> Parser<'a> {
                 // statement naming the temp schema to its temp
                 // database (`session::temp`) before it plans it, so
                 // the planner never reads `temp.t` as `main.t`.
+                // v0.16 (`attach`): any qualifier — the connection
+                // routes a statement by its schema names before it
+                // plans it (`session::attach`), and the planner reads a
+                // FROM source's (`FromSource::schema`).
                 if matches!(self.cur().tok, Tok::Dot) {
                     let s = handle_bytes(self.arena, h);
-                    if !eq_ci(s, b"main") && !(cfg!(feature = "v16") && eq_ci(s, b"temp")) {
+                    if !cfg!(feature = "attach")
+                        && !eq_ci(s, b"main")
+                        && !(cfg!(feature = "v16") && eq_ci(s, b"temp"))
+                    {
                         return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                     }
                     self.pos += 1;
+                    #[cfg(feature = "attach")]
+                    {
+                        let n = self.name::<E>();
+                        self.last_schema = Some(h);
+                        return n;
+                    }
+                    #[cfg(not(feature = "attach"))]
                     return self.name::<E>();
+                }
+                #[cfg(feature = "attach")]
+                {
+                    self.last_schema = None;
                 }
                 Ok(h)
             }
@@ -1135,6 +1159,17 @@ impl<'a> Parser<'a> {
             {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
+        } else if cfg!(feature = "attach")
+            && (self.cur_is_kw(b"ATTACH") || self.cur_is_kw(b"DETACH"))
+        {
+            #[cfg(feature = "attach")]
+            {
+                self.attach_stmt::<E>()
+            }
+            #[cfg(not(feature = "attach"))]
+            {
+                Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+            }
         } else if cfg!(feature = "v16") && self.cur_is_kw(b"PRAGMA") {
             #[cfg(feature = "v16")]
             {
@@ -1197,6 +1232,45 @@ impl<'a> Parser<'a> {
         } else {
             Ast::Analyze { schema, name }
         })
+    }
+
+    /// `ATTACH [DATABASE] expr AS expr [KEY expr]` and `DETACH
+    /// [DATABASE] expr` (v0.16, `attach`; the pin's grammar). An
+    /// operand that is a lone identifier is its name as text, as the
+    /// pin's `resolveAttachExpr` makes it (`ATTACH f AS a` attaches
+    /// the file `f` as `a`); anything else is an expression evaluated
+    /// when the statement runs.
+    #[cfg(feature = "attach")]
+    fn attach_stmt<E>(&mut self) -> Result<Ast, E> {
+        let attach = self.eat_kw(b"ATTACH");
+        if !attach {
+            self.pos += 1; // DETACH
+        }
+        let _ = self.eat_kw(b"DATABASE");
+        let operand = |p: &mut Self, held: usize| -> Result<Expr, E> {
+            let e = p.item::<E>(held)?;
+            Ok(match e {
+                Expr::Column {
+                    table: None,
+                    name,
+                    schema: None,
+                } => Expr::Literal(Literal::Text(name)),
+                e => e,
+            })
+        };
+        if !attach {
+            let name = operand(self, 2)?;
+            return Ok(Ast::Detach { name });
+        }
+        let file = operand(self, 2)?;
+        self.expect_kw::<E>(b"AS")?;
+        let name = operand(self, 4)?;
+        let key = if self.eat_kw(b"KEY") {
+            Some(operand(self, 6)?)
+        } else {
+            None
+        };
+        Ok(Ast::Attach { file, name, key })
     }
 
     /// `PRAGMA [nm .] nm [= nmnum | ( nmnum )]` (v0.16, `v16`;
@@ -2543,6 +2617,8 @@ impl<'a> Parser<'a> {
             using: AVec::new(),
             #[cfg(feature = "v16")]
             args: None,
+            #[cfg(feature = "attach")]
+            schema: None,
         });
         // v0.2: optional WHERE <column> = <literal>. Any other
         // predicate shape is rejected here; whether <column> is the
@@ -4724,6 +4800,8 @@ impl<'a> Parser<'a> {
             args: None,
             qualified,
             in_temp,
+            #[cfg(feature = "attach")]
+            schema: self.last_schema,
             cte: None,
             indexed: None,
         });
@@ -4956,6 +5034,8 @@ impl<'a> Parser<'a> {
                     qualified: false,
                     #[cfg(feature = "v16")]
                     in_temp: false,
+                    #[cfg(feature = "attach")]
+                    schema: None,
                     #[cfg(feature = "v16")]
                     cte: None,
                     #[cfg(feature = "v16")]
@@ -4978,6 +5058,8 @@ impl<'a> Parser<'a> {
     ) -> Result<FromSource, E> {
         #[cfg(feature = "v16")]
         let (table, qualified, in_temp) = self.name_q::<E>()?;
+        #[cfg(feature = "attach")]
+        let schema = self.last_schema;
         #[cfg(not(feature = "v16"))]
         let table = self.name::<E>()?;
         // A table-valued function (v0.16): `name(arg, ...)`.
@@ -5028,6 +5110,8 @@ impl<'a> Parser<'a> {
             qualified,
             #[cfg(feature = "v16")]
             in_temp,
+            #[cfg(feature = "attach")]
+            schema,
             #[cfg(feature = "v16")]
             cte: None,
             #[cfg(feature = "v16")]
@@ -6469,7 +6553,9 @@ impl<'a> Parser<'a> {
         let mut qualified = false;
         if self.eat(Tok::Dot) {
             let s = handle_bytes(self.arena, name);
-            if !eq_ci(s, b"main") && !eq_ci(s, b"temp") {
+            // An attached database's name is checked by the router
+            // (v0.16, `attach`).
+            if !cfg!(feature = "attach") && !eq_ci(s, b"main") && !eq_ci(s, b"temp") {
                 return Err(Error::Schema {
                     kind: crate::error::SchemaKind::UnknownDatabase,
                 });
