@@ -19,15 +19,18 @@
 //!   UTF-16 bytes (`encode`), and a blob read as text is decoded
 //!   from UTF-16 (`decode`).
 //!
-//! Invalid UTF-16 follows the pin's translation (no replacement
-//! character on decode): an odd trailing byte is dropped, any
-//! surrogate followed by another unit combines with it into one
-//! supplementary code point, and a surrogate that ends the text is
-//! kept as its three-byte form (ED xx xx). Encoding writes such a
-//! lone surrogate back as itself, so stored text that only passes
-//! through a statement keeps its bytes; text a function builds is
-//! normalised as the pin's UTF-8 → UTF-16 conversion of a function
-//! result normalises it (`normalize`: surrogates become U+FFFD).
+//! Invalid UTF-16 is held losslessly: a high surrogate followed by
+//! a low one is the character they name, any other surrogate is kept
+//! as its three-byte form (`ED A0..BF xx`), an odd trailing byte is
+//! dropped (`decode_into`). So stored bytes survive any statement
+//! that only moves them (a copy, an index build, `||`, CAST), and
+//! comparisons see exactly the stored units. Where the pin reads
+//! such text through its UTF-16 → UTF-8 conversion — which combines
+//! any surrogate with the unit after it — hipp reads `view`: a
+//! statement's result columns, function arguments, LIKE / GLOB,
+//! NOCASE / RTRIM, JSON. Text a function builds is normalised as the
+//! pin's UTF-8 → UTF-16 conversion of a function result normalises
+//! it (`normalize`: surrogates become U+FFFD).
 
 use core::cmp::Ordering;
 
@@ -65,26 +68,99 @@ fn put_utf8(c: u32, out: &mut AVec<u8>) {
     }
 }
 
-/// UTF-16 bytes → the pin's UTF-8 form, appended to `out`.
-pub fn decode_into(b: &[u8], be: bool, out: &mut AVec<u8>) {
-    let unit = |p: &[u8]| -> u32 {
-        let (x, y) = match p {
-            [x, y, ..] => (u32::from(*x), u32::from(*y)),
-            _ => (0, 0),
-        };
-        if be { (x << 8) | y } else { (y << 8) | x }
+/// One UTF-16 code unit of `p` (a two-byte chunk) in the given
+/// byte order.
+fn unit(p: &[u8], be: bool) -> u32 {
+    let (x, y) = match p {
+        [x, y, ..] => (u32::from(*x), u32::from(*y)),
+        _ => (0, 0),
     };
+    if be { (x << 8) | y } else { (y << 8) | x }
+}
+
+/// UTF-16 bytes → hipp's lossless internal form, appended to `out`
+/// (an odd trailing byte dropped). A high surrogate followed by a
+/// low one is the supplementary character they name; any other
+/// surrogate is kept as its three-byte form (`ED A0..BF xx`), so
+/// `encode_into` gives the stored units back exactly and BINARY
+/// order (`cmp`) is the pin's memcmp over them. What the pin's own
+/// UTF-16 → UTF-8 conversion shows of such text is `view`.
+pub fn decode_into(b: &[u8], be: bool, out: &mut AVec<u8>) {
+    let mut chunks = b.chunks_exact(2).peekable();
+    while let Some(p) = chunks.next() {
+        let mut c = unit(p, be);
+        if (0xD800..0xDC00).contains(&c)
+            && let Some(q) = chunks.peek()
+            && (0xDC00..0xE000).contains(&unit(q, be))
+        {
+            let c2 = unit(q, be);
+            chunks.next();
+            c = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+        }
+        put_utf8(c, out);
+    }
+}
+
+/// UTF-16 bytes → the UTF-8 the pin's `sqlite3VdbeMemTranslate`
+/// gives (its `READ_UTF16`: any surrogate followed by another unit
+/// combines with it into one supplementary code point; a surrogate
+/// that ends the text keeps its three-byte form), appended to
+/// `out`. This is what the pin's `sqlite3_value_text` and its CLI
+/// show of a UTF-16 text.
+pub fn decode_pin_into(b: &[u8], be: bool, out: &mut AVec<u8>) {
     let mut chunks = b.chunks_exact(2);
     while let Some(p) = chunks.next() {
-        let mut c = unit(p);
+        let mut c = unit(p, be);
         if (0xD800..0xE000).contains(&c)
             && let Some(q) = chunks.next()
         {
-            let c2 = unit(q);
+            let c2 = unit(q, be);
             c = (c2 & 0x3FF) + ((c & 0x3F) << 10) + (((c & 0x3C0) + 0x40) << 10);
         }
         put_utf8(c, out);
     }
+}
+
+/// Whether internal text `t` holds a surrogate's three-byte form
+/// (an unpaired surrogate, or one ending the text).
+pub fn has_surrogate(t: &[u8]) -> bool {
+    t.windows(2)
+        .any(|w| matches!(w, [0xED, b] if (0xA0..=0xBF).contains(b)))
+}
+
+/// What the pin shows of internal text `t` (`decode_pin_into` of
+/// its UTF-16): None when that is `t` itself (no unpaired
+/// surrogate). Applied where the pin reads a UTF-16 value through
+/// `sqlite3_value_text` — a statement's result columns, function
+/// arguments, LIKE / GLOB, the NOCASE and RTRIM collations, JSON.
+pub fn view(t: &[u8]) -> Option<AVec<u8>> {
+    if !has_surrogate(t) {
+        return None;
+    }
+    let mut u = AVec::new();
+    encode_into(t, true, &mut u);
+    let mut out = AVec::new();
+    decode_pin_into(u.as_slice(), true, &mut out);
+    Some(out)
+}
+
+/// Internal text `t` in its canonical form (`decode_into` of its
+/// UTF-16): None when it is already canonical. Two texts joined
+/// byte-wise (`||`) can leave a high surrogate's three-byte form
+/// right before a low one's; the pin's concatenation of their UTF-16
+/// bytes makes them a pair.
+pub fn canon(t: &[u8]) -> Option<AVec<u8>> {
+    let split_pair = t.windows(5).any(|w| {
+        matches!(w, [0xED, h, _, 0xED, l] if (0xA0..=0xAF).contains(h) && (0xB0..=0xBF).contains(l))
+    });
+    if !split_pair {
+        return None;
+    }
+    let mut u = AVec::new();
+    encode_into(t, true, &mut u);
+    let mut out = AVec::new();
+    decode_into(u.as_slice(), true, &mut out);
+    if out.as_slice() == t { None } else { Some(out) }
 }
 
 /// `decode_into` as a fresh vector.
@@ -92,6 +168,17 @@ pub fn decode(b: &[u8], enc: TextEnc) -> AVec<u8> {
     let mut out = AVec::new();
     match byte_order(enc) {
         Some(be) => decode_into(b, be, &mut out),
+        None => out.extend_from_slice(b),
+    }
+    out
+}
+
+/// `decode_pin_into` as a fresh vector (UTF-8: the bytes
+/// unchanged).
+pub fn decode_pin(b: &[u8], enc: TextEnc) -> AVec<u8> {
+    let mut out = AVec::new();
+    match byte_order(enc) {
+        Some(be) => decode_pin_into(b, be, &mut out),
         None => out.extend_from_slice(b),
     }
     out
@@ -346,19 +433,42 @@ mod tests {
         );
         // An odd trailing byte is dropped.
         assert_eq!(dec(&[0x41, 0, 0x42], false).as_slice(), b"A");
-        // A surrogate followed by any unit combines with it.
+        // Held losslessly: an unpaired surrogate keeps its 3-byte
+        // form and encodes back to itself, whatever follows it.
+        for (u, be) in [
+            (&[0u8, 0xd8, 0x61, 0][..], false),
+            (&[0xd8, 0, 0, 0x61][..], true),
+            (&[0, 0xdc, 0, 0xd8][..], false),
+            (&[0, 0xd8, 0, 0xd8, 0, 0xdc][..], false),
+            (&[0, 0xd8][..], false),
+        ] {
+            let t = dec(u, be);
+            assert_eq!(enc(t.as_slice(), be).as_slice(), u);
+        }
         assert_eq!(
             dec(&[0, 0xd8, 0x61, 0], false).as_slice(),
-            "\u{10061}".as_bytes()
+            &[0xed, 0xa0, 0x80, b'a']
         );
-        assert_eq!(
-            dec(&[0, 0xdc, 0x61, 0], false).as_slice(),
-            "\u{10061}".as_bytes()
-        );
-        // A surrogate that ends the text keeps its 3-byte form, and
-        // encodes back to itself.
         assert_eq!(dec(&[0, 0xd8], false).as_slice(), &[0xed, 0xa0, 0x80]);
-        assert_eq!(enc(&[0xed, 0xa0, 0x80], false).as_slice(), &[0, 0xd8]);
+        // The pin's own conversion (`view`): a surrogate followed by
+        // any unit combines with it; one ending the text stays.
+        let shown = |u: &[u8]| {
+            let t = dec(u, false);
+            view(t.as_slice()).map_or(t.as_slice().to_vec(), |v| v.as_slice().to_vec())
+        };
+        assert_eq!(shown(&[0, 0xd8, 0x61, 0]), "\u{10061}".as_bytes());
+        assert_eq!(shown(&[0, 0xdc, 0x61, 0]), "\u{10061}".as_bytes());
+        assert_eq!(shown(&[0, 0xdc, 0, 0xd8]), "\u{10000}".as_bytes());
+        assert_eq!(shown(&[0, 0xd8]), &[0xed, 0xa0, 0x80]);
+        assert!(view("a\u{1f600}".as_bytes()).is_none());
+        // `||` across a split pair joins it (`canon`).
+        let mut j = dec(&[0, 0xd8], false);
+        j.extend_from_slice(dec(&[0, 0xdc], false).as_slice());
+        assert_eq!(
+            canon(j.as_slice()).map(|v| v.as_slice().to_vec()),
+            Some("\u{10000}".as_bytes().to_vec())
+        );
+        assert!(canon(dec(&[0, 0xdc, 0, 0xd8], false).as_slice()).is_none());
         // A function result's surrogate becomes U+FFFD.
         assert_eq!(
             normalize(&[b'x', 0xed, 0xa0, 0x80]).map(|v| v.as_slice().to_vec()),
@@ -385,6 +495,12 @@ mod tests {
         assert_eq!(be("a", "\u{100}"), Ordering::Less);
         assert_eq!(be("", "\u{0}"), Ordering::Less);
         assert_eq!(be("x\u{e9}", "x\u{e9}"), Ordering::Equal);
+        // Unpaired surrogates order by their stored units: D800 0061
+        // is not the pair D800 DC61.
+        let lone = dec(&[0xd8, 0, 0, 0x61], true);
+        let pair = dec(&[0xd8, 0, 0xdc, 0x61], true);
+        assert_eq!(cmp(lone.as_slice(), pair.as_slice(), true), Ordering::Less);
+        assert_ne!(lone.as_slice(), pair.as_slice());
     }
 
     /// Records translate both ways, other values untouched.

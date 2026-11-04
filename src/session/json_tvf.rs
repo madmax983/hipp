@@ -284,6 +284,12 @@ impl<S: Storage> Statement<'_, S> {
                 args.push(self.eval_row_sub(a, row).await?);
             }
         }
+        // A UTF-16 database's document or path BLOB decodes from
+        // UTF-16 (v0.16, `utf16`).
+        #[cfg(feature = "utf16")]
+        for (i, v) in args.as_mut_slice().iter_mut().enumerate() {
+            crate::query::json_arg16(v, |i| i < 2, i, self.conn.pager.text_enc());
+        }
         crate::json::tvf_rows(
             sp.tvf & !TVF_LATERAL,
             args.as_slice(),

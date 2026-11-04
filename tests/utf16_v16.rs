@@ -20,9 +20,10 @@
 //!   give UTF-16 bytes, octet_length counts them, a blob read as text
 //!   (CAST, ||, upper, LIKE, numbers from blobs) decodes from UTF-16,
 //!   function results go through the pin's conversion.
-//! - Invalid UTF-16 read as the pin reads it (odd bytes dropped, a
-//!   lone surrogate at the end kept, surrogates followed by any unit
-//!   combined).
+//! - Invalid UTF-16 kept byte for byte (odd bytes dropped): an
+//!   unpaired surrogate stays as stored through copies, index builds,
+//!   `||`, CAST, equality and BINARY order, and is shown as the pin
+//!   shows it (a surrogate followed by any unit combined with it).
 //! - VACUUM keeps the encoding, files interoperate both ways (the
 //!   pin's integrity_check on hipp's files and hipp's on the pin's,
 //!   overflow pages and indexes included), and a generated corpus
@@ -305,12 +306,30 @@ fn gen_text(r: &mut Rng) -> String {
         s.push_str(ALPHABET[r.below(ALPHABET.len() as u64) as usize]);
     }
     let lit = format!("'{}'", s.replace('\'', "''"));
-    match r.below(10) {
+    match r.below(12) {
         0 => format!("{lit} || char(0) || 'x'"),
         1 => format!("{lit} || char({})", r.below(0x11_0000)),
         2 => format!("char({}, {})", r.below(0x3_0000), r.below(0x1_0000)),
+        3 | 4 => format!("{lit} || {}", raw_units(r)),
         _ => lit,
     }
+}
+
+/// Raw UTF-16 as text (`CAST(x'...' AS TEXT)`), surrogate-heavy: lone
+/// and reversed surrogates, pairs, and the units around them, read in
+/// either byte order.
+fn raw_units(r: &mut Rng) -> String {
+    const UNITS: [u16; 10] = [
+        0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xD83D, 0xDE00, 0x0061, 0xE000, 0x00E9, 0x6100,
+    ];
+    let mut h = String::new();
+    for _ in 0..(1 + r.below(4)) {
+        h.push_str(&format!(
+            "{:04X}",
+            UNITS[r.below(UNITS.len() as u64) as usize]
+        ));
+    }
+    format!("CAST(x'{h}' AS TEXT)")
 }
 
 // ------------------------------------------------------------ PRAGMA
@@ -519,11 +538,9 @@ fn blobs_read_as_text() {
     }
 }
 
-/// Invalid UTF-16 in stored data reads as on the pin. (A surrogate
-/// followed by a unit that does not pair with it reads as the pin
-/// reads it — one supplementary character — but hipp stores it back
-/// as the valid pair, so its hex() differs: STATUS.md, honest gaps.
-/// Such a value (`g`) is only rendered here.)
+/// Invalid UTF-16 in stored data reads as on the pin, and a
+/// surrogate followed by a unit that does not pair with it (`g`)
+/// keeps its stored bytes through copies, updates and an index.
 #[test]
 fn invalid_utf16_reads_as_the_pin() {
     for (k, (order, bad, mix)) in [
@@ -577,7 +594,14 @@ fn invalid_utf16_reads_as_the_pin() {
              SELECT hex(x) FROM t ORDER BY x;
              CREATE TABLE g(x);
              INSERT INTO g VALUES (CAST(x'{mix}' AS TEXT));
-             SELECT x, length(x), unicode(x), length(x || 'z') FROM g"
+             SELECT x, length(x), unicode(x), length(x || 'z') FROM g;
+             SELECT hex(x), hex(x || 'z'), hex(CAST(x AS BLOB)), x || 'z' FROM g;
+             INSERT INTO g SELECT x FROM g;
+             UPDATE g SET x = x WHERE rowid = 1;
+             CREATE INDEX gi ON g(x);
+             SELECT rowid, hex(x) FROM g WHERE x = CAST(x'{mix}' AS TEXT);
+             SELECT count(*) FROM g WHERE x = char(unicode(x));
+             PRAGMA integrity_check"
         ));
         agree(&format!("invalid{k}"), &stmts);
     }
@@ -750,4 +774,299 @@ fn generated_corpus() {
         }
         agree(&format!("gen{case}"), &stmts);
     }
+}
+
+// ------------------------------------------------ review regressions
+
+/// A pin file whose text holds unpaired surrogates (stored through
+/// `CAST(blob AS TEXT)`): hipp's index builds write the table rows'
+/// exact bytes, its lookups find the pin's entries, and both
+/// integrity checks pass (it rebuilt them from re-encoded text).
+#[test]
+fn regression_unpaired_surrogates_in_pin_files() {
+    for (k, (order, lone, pair)) in [
+        (
+            "UTF-16le",
+            ["00D86100", "00DC00D8", "00D800D8", "6100DFFF"],
+            "00D800DC",
+        ),
+        (
+            "UTF-16be",
+            ["D8000061", "DC00D800", "D800D800", "0061DFFF"],
+            "D800DC00",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut vals: Vec<String> = lone
+            .iter()
+            .enumerate()
+            .map(|(i, h)| format!("(CAST(x'{h}' AS TEXT), {i})"))
+            .collect();
+        vals.push("(char(0x10000), 10), ('z', 11), (char(0x10061), 12)".to_string());
+        for (j, with_index) in [true, false].iter().enumerate() {
+            let p = fresh(&format!("lone{k}{j}"));
+            common::cli(
+                &p,
+                &format!(
+                    "PRAGMA encoding = '{order}'; CREATE TABLE t(a TEXT, b); {} INSERT INTO t VALUES {};",
+                    if *with_index {
+                        "CREATE INDEX ia ON t(a);"
+                    } else {
+                        ""
+                    },
+                    vals.join(", ")
+                ),
+            );
+            let mut stmts = vec![
+                "PRAGMA integrity_check".to_string(),
+                format!("SELECT b FROM t WHERE a = CAST(x'{pair}' AS TEXT)"),
+                "SELECT b FROM t WHERE a = char(0x10061) ORDER BY b".to_string(),
+                "SELECT b, hex(a) FROM t ORDER BY a, b".to_string(),
+            ];
+            for h in lone.iter() {
+                stmts.push(format!("SELECT b FROM t WHERE a = CAST(x'{h}' AS TEXT)"));
+            }
+            if *with_index {
+                stmts.push("REINDEX".to_string());
+            } else {
+                stmts.push("CREATE INDEX ia ON t(a)".to_string());
+                stmts.push("CREATE UNIQUE INDEX ua ON t(a, b)".to_string());
+            }
+            stmts.push("SELECT b FROM t WHERE a > 'a' ORDER BY a".to_string());
+            stmts.push("PRAGMA integrity_check".to_string());
+            // Each engine on its own copy of the pin's file.
+            let q = fresh(&format!("lone{k}{j}-pin"));
+            std::fs::copy(&p, &q).expect("copy");
+            let got = hipp_file(&p, &stmts);
+            let want = oracle_file(&q, &stmts[..stmts.len() - 1]);
+            assert_eq!(
+                got[0].as_ref().ok().map(|b| b.as_slice()),
+                Some(&b"ok"[..]),
+                "{order}: hipp's integrity_check on the pin's file"
+            );
+            for (i, w) in want.iter().enumerate().skip(1) {
+                assert_eq!(
+                    got[i].as_ref().ok(),
+                    w.as_ref(),
+                    "{order} (index {with_index}): {}",
+                    stmts[i]
+                );
+            }
+            both_ok(&p);
+        }
+    }
+    // The same through hipp's own writes, compared statement by
+    // statement: equality, hex, order and UNIQUE see the stored units.
+    for (k, (order, rev, pair)) in [
+        ("UTF-16le", "00DC00D8", "00D800DC"),
+        ("UTF-16be", "DC00D800", "D800DC00"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let stmts = lines(&format!(
+            "PRAGMA encoding = '{order}';
+             CREATE TABLE t(a TEXT UNIQUE);
+             CREATE TABLE w(k TEXT PRIMARY KEY) WITHOUT ROWID;
+             INSERT INTO t VALUES (char(0x10000));
+             INSERT INTO t VALUES (CAST(x'{rev}' AS TEXT));
+             INSERT INTO t VALUES (CAST(x'{pair}' AS TEXT));
+             INSERT INTO w SELECT a FROM t;
+             SELECT hex(a) FROM t ORDER BY 1;
+             SELECT hex(k), length(k) FROM w ORDER BY k;
+             SELECT CAST(x'{rev}' AS TEXT) = char(0x10000), hex(CAST(x'{rev}' AS TEXT)), length(CAST(x'{rev}' AS TEXT));
+             SELECT CAST(x'{rev}' AS TEXT) = CAST(x'{pair}' AS TEXT) COLLATE NOCASE;
+             SELECT hex(substr(CAST(x'{rev}' AS TEXT), 1, 1)), hex(upper(CAST(x'{rev}' AS TEXT)));
+             SELECT hex(CAST(x'{}' AS TEXT) || CAST(x'{}' AS TEXT)), length(CAST(x'{}' AS TEXT) || CAST(x'{}' AS TEXT));
+             SELECT count(DISTINCT a), count(*) FROM t;
+             SELECT a FROM t ORDER BY a;
+             PRAGMA integrity_check",
+            &pair[..4], &pair[4..], &pair[..4], &pair[4..],
+        ));
+        let (errs, hp) = agree(&format!("lone-own{k}"), &stmts);
+        assert_eq!(errs, 1, "{order}: only the UNIQUE duplicate fails");
+        both_ok(&hp);
+    }
+}
+
+/// In a UTF-16 database the math functions and sign() give NULL for a
+/// BLOB, as in UTF-8; a BLOB read as a number (unary minus, log's
+/// second argument, randomblob, sum / avg / total, windows too) reads
+/// its UTF-16 text; sign() of a text that is not wholly a number is
+/// NULL (that last also in UTF-8).
+#[test]
+fn regression_blobs_as_numbers() {
+    for (k, (order, b)) in [
+        ("UTF-8", "322E35"),
+        ("UTF-16le", "32002E003500"),
+        ("UTF-16be", "0032002E0035"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let x = format!("x'{b}'");
+        let stmts = lines(&format!(
+            "PRAGMA encoding = '{order}';
+             SELECT sqrt({x}), ln({x}), ceil({x}), floor({x}), pow({x}, 2), exp({x}), log10({x}), trunc({x}), mod({x}, 3), sign({x});
+             SELECT atan2({x}, 1), atan2(1, {x}), log({x}), log({x}, 8), log(2, {x}), radians({x}), degrees({x}), acos({x}), pi();
+             SELECT sign('2x'), sign(' 3 '), sign('-1e3'), sign(''), sign('abc'), sign(-0.0), sign(NULL), sign(5);
+             SELECT -{x}, -'2.5', length(randomblob({x})), abs({x}), round({x}), {x} * 2, CAST({x} AS REAL);
+             CREATE TABLE t(v, o);
+             INSERT INTO t VALUES ({x}, 1), ({x}, 2), (1, 3);
+             SELECT sum(v), avg(v), total(v), group_concat(v), string_agg(v, {x}) FROM t;
+             SELECT sum(v) OVER (ORDER BY o), avg(v) OVER (ROWS 1 PRECEDING), total(v) OVER (), group_concat(v) OVER (ORDER BY o), string_agg(v, '-') OVER (ORDER BY o ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY o;
+             SELECT sum(v) OVER (ORDER BY o GROUPS 1 PRECEDING EXCLUDE CURRENT ROW), group_concat(v, v) OVER (ORDER BY o RANGE BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t ORDER BY o"
+        ));
+        agree(&format!("num{k}"), &stmts);
+    }
+}
+
+/// JSON functions in a UTF-16 database read a BLOB that is not JSONB
+/// as UTF-16 text where they read text (documents, paths), reject it
+/// where they take a value, and their text results go through the
+/// pin's conversion (a lone surrogate becomes U+FFFD).
+#[test]
+fn regression_json_blob_arguments() {
+    for (k, (order, doc, arr, path, lone)) in [
+        ("UTF-8", "7B7D", "5B315D", "24", "D800"),
+        (
+            "UTF-16le",
+            "7B007D00",
+            "5B0031005D00",
+            "24005B0030005D00",
+            "00D8",
+        ),
+        (
+            "UTF-16be",
+            "007B007D",
+            "005B0031005D",
+            "0024005B0030005D",
+            "D800",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let stmts = lines(&format!(
+            "PRAGMA encoding = '{order}';
+             CREATE TABLE t(j);
+             INSERT INTO t VALUES (CAST('{{\"a\":[1,2]}}' AS BLOB));
+             SELECT json_extract(j, '$.a[1]'), json_valid(j), json(j), json_type(j), j ->> '$.a', json_array_length(j, '$.a') FROM t;
+             SELECT json_valid(x'{doc}'), json_valid(x'7b007d00'), json_valid(x'007b007d'), json_valid(x'7b7d'), json_valid(x'{doc}', 1), json_valid(x'{doc}', 8);
+             SELECT json(x'{doc}'), json_type(x'{arr}'), json_array_length(x'{arr}'), x'{arr}' ->> 0, json_extract('[5]', x'{path}');
+             SELECT json_insert(x'{doc}', '$.a', 1), json_patch(x'{doc}', '{{}}'), json_patch('{{}}', x'{doc}'), json_remove(x'{arr}', '$[0]'), json_pretty(x'{doc}'), hex(jsonb(x'{doc}'));
+             SELECT json_error_position(x'7b00'), json_error_position(x'{doc}');
+             SELECT count(*) FROM json_each(x'{arr}');
+             SELECT count(*) FROM json_tree(x'{arr}');
+             SELECT group_concat(value) FROM json_each('[[7,8]]', x'{path}');
+             SELECT json_array(x'3100');
+             SELECT json_quote(x'3100');
+             SELECT json_set(x'{doc}', '$.a', x'3100');
+             SELECT json_object(x'6100', 1);
+             SELECT json_quote(CAST(x'{lone}' AS TEXT)), json_array(CAST(x'{lone}' AS TEXT)), json_group_array(CAST(x'{lone}' AS TEXT)), json_quote(CAST(x'{lone}6100' AS TEXT));
+             SELECT json(CAST(x'{arr}' AS TEXT))"
+        ));
+        agree(&format!("json{k}"), &stmts);
+    }
+}
+
+/// A header-only write (`PRAGMA user_version` / `application_id`) does
+/// not fix the encoding, in the same connection or on reopen, and
+/// leaves the header's schema-format and encoding fields 0 as the
+/// pin's does; a schema change, even rolled back, fixes it.
+#[test]
+fn regression_header_write_then_encoding() {
+    for (k, script) in [
+        "PRAGMA user_version = 5; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding; CREATE TABLE t(a); INSERT INTO t VALUES ('\u{e9}'); SELECT hex(a) FROM t",
+        "PRAGMA encoding = 'UTF-16le'; PRAGMA user_version = 3; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding; CREATE TABLE t(a); INSERT INTO t VALUES ('\u{e9}'); SELECT hex(a) FROM t",
+        "PRAGMA application_id = 9; PRAGMA page_size = 1024; PRAGMA encoding = 'UTF-16le'; PRAGMA encoding; PRAGMA page_size",
+        "BEGIN; CREATE TABLE x(a); ROLLBACK; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "PRAGMA user_version = 1; BEGIN; CREATE TABLE x(a); ROLLBACK; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "BEGIN; SAVEPOINT a; CREATE TABLE x(a); ROLLBACK TO a; COMMIT; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "BEGIN IMMEDIATE; COMMIT; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "CREATE TABLE x(a); DROP TABLE x; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let stmts: Vec<String> = script.split("; ").map(str::to_string).collect();
+        agree(&format!("hdr{k}"), &stmts);
+    }
+    // The header bytes of a file that only got a header write.
+    let (h, o) = (fresh("hdr-bytes-h"), fresh("hdr-bytes-o"));
+    hipp_file(&h, &["PRAGMA user_version = 5".to_string()]);
+    common::cli(&o, "PRAGMA user_version = 5;");
+    let (hb, ob) = (
+        std::fs::read(&h).expect("read"),
+        std::fs::read(&o).expect("read"),
+    );
+    assert_eq!(hb[44..48], ob[44..48], "schema format field");
+    assert_eq!(hb[56..64], ob[56..64], "encoding and user_version fields");
+    // Each engine chooses the other's such file's encoding on reopen.
+    for (p, writer_is_hipp) in [(&h, true), (&o, false)] {
+        let stmts = lines(
+            "PRAGMA encoding = 'UTF-16be';
+             CREATE TABLE t(a);
+             INSERT INTO t VALUES ('\u{1f600}')",
+        );
+        if writer_is_hipp {
+            let out = common::cli(p, &format!("{};", stmts.join(";\n")));
+            assert_eq!(out, "", "the pin extends hipp's file");
+        } else {
+            assert!(hipp_file(p, &stmts).iter().all(|r| r.is_ok()));
+        }
+        assert_eq!(
+            common::cli(p, "PRAGMA encoding; SELECT hex(a) FROM t;"),
+            "UTF-16be\nD83DDE00\n"
+        );
+        let got = hipp_file(
+            p,
+            &[
+                "PRAGMA encoding".to_string(),
+                "SELECT hex(a) FROM t".to_string(),
+            ],
+        );
+        assert_eq!(
+            got[0].as_ref().ok().map(|b| b.as_slice()),
+            Some(&b"UTF-16be"[..])
+        );
+        assert_eq!(
+            got[1].as_ref().ok().map(|b| b.as_slice()),
+            Some(&b"D83DDE00"[..])
+        );
+        both_ok(p);
+    }
+}
+
+/// `PRAGMA temp.encoding` is the connection's encoding, as on the pin;
+/// only a TEMP schema change (even rolled back) fixes it, not reading
+/// the TEMP database or writing its header.
+#[test]
+fn regression_temp_encoding_pragma() {
+    for (k, script) in [
+        "PRAGMA temp.encoding = 'UTF-16be'; PRAGMA encoding; CREATE TABLE t(a); INSERT INTO t VALUES ('\u{e9}'); SELECT hex(a) FROM t",
+        "PRAGMA temp.encoding = 'UTF-16be'; PRAGMA temp.encoding; PRAGMA main.encoding; PRAGMA encoding = 'UTF-16le'; PRAGMA encoding",
+        "PRAGMA temp.encoding = 'UTF-16be'; CREATE TEMP TABLE x(a); INSERT INTO x VALUES ('\u{e9}'); SELECT hex(a) FROM x; PRAGMA encoding",
+        "PRAGMA temp.user_version = 3; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "PRAGMA temp.page_size = 1024; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "SELECT count(*) FROM temp.sqlite_master; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "PRAGMA temp.integrity_check; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "CREATE TEMP TABLE x(a); DROP TABLE x; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "BEGIN; CREATE TEMP TABLE x(a); ROLLBACK; PRAGMA encoding = 'UTF-16be'; PRAGMA encoding",
+        "CREATE TEMP VIEW v AS SELECT 1; PRAGMA temp.encoding = 'UTF-16be'; PRAGMA encoding",
+        "PRAGMA encoding = 'UTF-16be'; SELECT count(*) FROM temp.sqlite_master; PRAGMA encoding = 'UTF-16le'; CREATE TEMP TABLE y(a); INSERT INTO y VALUES ('\u{e9}'); SELECT hex(a) FROM y; CREATE TABLE t(a); INSERT INTO t VALUES ('\u{e9}'); SELECT hex(a) FROM t; PRAGMA encoding",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let stmts: Vec<String> = script.split("; ").map(str::to_string).collect();
+        agree(&format!("tempenc{k}"), &stmts);
+    }
+    let (errs, _) = agree(
+        "tempenc-bogus",
+        &["PRAGMA temp.encoding = 'bogus'", "PRAGMA encoding"].map(str::to_string),
+    );
+    assert_eq!(errs, 1);
 }

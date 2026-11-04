@@ -204,8 +204,15 @@ pub fn initial_page1(page_size: u32) -> Vec<u8> {
     put_be_u32(&mut p, 24, 1); // change counter
     put_be_u32(&mut p, 28, 1); // size in pages
     put_be_u32(&mut p, 40, 0); // schema cookie
-    put_be_u32(&mut p, 44, 4); // schema format 4
-    put_be_u32(&mut p, 56, 1); // UTF-8
+    // Schema format 4, UTF-8. With `utf16` (v0.16) both stay 0 as
+    // in the pin's new file, until the first schema change sets
+    // them (`commit`): a file that only got header writes (`PRAGMA
+    // user_version`) may still choose its encoding.
+    #[cfg(not(feature = "utf16"))]
+    {
+        put_be_u32(&mut p, 44, 4);
+        put_be_u32(&mut p, 56, 1);
+    }
     put_be_u32(&mut p, 92, 1); // version-valid-for = change counter
     put_be_u32(&mut p, 96, PIN_VERSION_NUMBER);
     // B-tree leaf header at offset 100.
@@ -368,6 +375,12 @@ pub struct Pager<S: Storage> {
     /// empty database are fixed from then on.
     #[cfg(feature = "v16")]
     layout_fixed: bool,
+    /// A schema change has been made since the open (v0.16, `utf16`;
+    /// a ROLLBACK does not clear it): as on the pin, the text
+    /// encoding is fixed from then on, though a file that only got
+    /// header writes may still choose it.
+    #[cfg(feature = "utf16")]
+    schema_changed: bool,
     /// Open savepoints, oldest first (v0.16, `v16`).
     #[cfg(feature = "v16")]
     sp: AVec<SpMark>,
@@ -558,6 +571,8 @@ impl<S: Storage> Pager<S> {
                 created: is_new,
                 #[cfg(feature = "v16")]
                 layout_fixed: false,
+                #[cfg(feature = "utf16")]
+                schema_changed: false,
                 #[cfg(feature = "v16")]
                 sp: AVec::new(),
                 #[cfg(feature = "v16")]
@@ -1130,6 +1145,7 @@ impl<S: Storage> Pager<S> {
             .is_some_and(|h| h.schema_cookie != self.header.schema_cookie)
         {
             put_be_u32(d, 56, enc_code(self.header.text_enc));
+            self.header.enc_unset = false;
         }
         Ok(())
     }
@@ -1257,6 +1273,27 @@ impl<S: Storage> Pager<S> {
 
     pub fn bump_schema_cookie(&mut self) {
         self.header.schema_cookie = self.header.schema_cookie.wrapping_add(1);
+        #[cfg(feature = "utf16")]
+        {
+            self.schema_changed = true;
+        }
+    }
+
+    /// A schema change has been made since the open, even one rolled
+    /// back (v0.16, `utf16`).
+    #[cfg(feature = "utf16")]
+    pub fn schema_changed(&self) -> bool {
+        self.schema_changed
+    }
+
+    /// The text encoding may still be chosen (v0.16, `utf16`; the
+    /// pin's encoding is not fixed yet): no schema change since the
+    /// open, and the file is as created or its encoding field is
+    /// still 0 (only header writes so far). The caller also checks
+    /// that the database has no schema.
+    #[cfg(feature = "utf16")]
+    pub fn enc_open(&self) -> bool {
+        !self.schema_changed && (self.layout_open() || self.header.enc_unset)
     }
 
     /// Drive the commit stage machine as far as the device allows.

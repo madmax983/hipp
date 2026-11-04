@@ -151,6 +151,12 @@ impl Prag {
         if self == Prag::WalAutocheckpoint {
             return true;
         }
+        // The text encoding is the connection's (v0.16, `utf16`:
+        // `PRAGMA temp.encoding = 'UTF-16be'` sets it).
+        #[cfg(feature = "utf16")]
+        if self == Prag::Encoding {
+            return true;
+        }
         matches!(
             self,
             Prag::ForeignKeys
@@ -1729,14 +1735,18 @@ impl<S: Storage> Statement<'_, S> {
                     ("UTF16", false),
                 ];
                 // v0.16 (`utf16`): the pin's encoding stays open
-                // until the file has a schema (its header field is
-                // still unset) and no TEMP database exists.
+                // while the database has no schema and neither it nor
+                // the TEMP database has had a schema change since the
+                // open (`Pager::enc_open`).
                 #[cfg(feature = "utf16")]
-                let pristine = (pristine
-                    || (self.conn.pager.header().enc_unset
-                        && self.conn.catalog.tables.is_empty()
-                        && self.conn.catalog.views.is_empty()))
-                    && self.conn.temp.is_none();
+                let pristine = self.conn.pager.enc_open()
+                    && self.conn.catalog.tables.is_empty()
+                    && self.conn.catalog.views.is_empty()
+                    && !self
+                        .conn
+                        .temp
+                        .as_deref()
+                        .is_some_and(|t| t.pager.schema_changed());
                 if !pristine {
                     // Fixed once the database has content: ignored.
                     return Ok(AVec::new());

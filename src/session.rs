@@ -6201,6 +6201,20 @@ impl<'c, S: Storage> Statement<'c, S> {
         if ddl_or_txn && r.is_ok() && self.conn.pager.schema_cookie() != self.conn.catalog.cookie {
             self.conn.rebuild_catalog().await?;
         }
+        // A UTF-16 database's result text is what the pin's
+        // `sqlite3_column_text` shows (v0.16, `utf16`): an unpaired
+        // surrogate combines with the unit after it (`utf16::view`).
+        #[cfg(feature = "utf16")]
+        if matches!(r, Ok(Step::Row)) && self.conn.pager.text_enc() != crate::record::TextEnc::Utf8
+        {
+            for v in self.current.as_mut_slice().iter_mut() {
+                if let OwnedValue::Text(t) = &*v
+                    && let Some(x) = crate::utf16::view(t.as_slice())
+                {
+                    *v = OwnedValue::Text(x);
+                }
+            }
+        }
         r
     }
 

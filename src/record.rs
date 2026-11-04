@@ -480,7 +480,7 @@ pub enum TextEnc {
 /// UTF-16 database the BINARY collation compares the UTF-16 bytes
 /// (`utf16::cmp`), as the pin's memcmp over its stored text does.
 /// NOCASE and RTRIM compare the UTF-8 form in every encoding (the
-/// pin defines them for UTF-8 only and converts).
+/// pin defines them for UTF-8 only and converts: `utf16::view`).
 #[inline(always)]
 pub fn compare_coll_in(
     a: &Value<'_>,
@@ -489,10 +489,18 @@ pub fn compare_coll_in(
     enc: TextEnc,
 ) -> core::cmp::Ordering {
     #[cfg(feature = "utf16")]
-    if let (Value::Text(x), Value::Text(y), Coll::Binary, Some(be)) =
-        (a, b, coll, crate::utf16::byte_order(enc))
-    {
-        return crate::utf16::cmp(x, y, be);
+    if let (Value::Text(x), Value::Text(y), Some(be)) = (a, b, crate::utf16::byte_order(enc)) {
+        if coll == Coll::Binary {
+            return crate::utf16::cmp(x, y, be);
+        }
+        // NOCASE / RTRIM see the pin's UTF-8 conversion of each side.
+        if crate::utf16::has_surrogate(x) || crate::utf16::has_surrogate(y) {
+            let vx = crate::utf16::view(x);
+            let vy = crate::utf16::view(y);
+            let x = vx.as_ref().map_or(*x, |v| v.as_slice());
+            let y = vy.as_ref().map_or(*y, |v| v.as_slice());
+            return compare_text(x, y, coll);
+        }
     }
     let _ = enc;
     compare_coll(a, b, coll)

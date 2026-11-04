@@ -5354,7 +5354,17 @@ fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue
     let lv = eval::<E>(l, ctx)?;
     let rv = eval::<E>(r, ctx)?;
     #[cfg(feature = "utf16")]
-    let (lv, rv) = (blob_text(lv, ctx), blob_text(rv, ctx));
+    if ctx.enc() != crate::record::TextEnc::Utf8 {
+        let r = arith_values::<E>(op, blob_text(lv, ctx), blob_text(rv, ctx))?;
+        // `||` joins the UTF-16 bytes: a high surrogate at the end of
+        // the left side pairs with a low one starting the right.
+        if let OwnedValue::Text(t) = &r
+            && let Some(c) = crate::utf16::canon(t.as_slice())
+        {
+            return Ok(OwnedValue::Text(c));
+        }
+        return Ok(r);
+    }
     arith_values::<E>(op, lv, rv)
 }
 
@@ -5371,6 +5381,39 @@ pub(crate) fn blob_text(v: OwnedValue, ctx: &Ctx<'_>) -> OwnedValue {
         }
         v => v,
     }
+}
+
+/// A value as the pin's `sqlite3_value_text` reads it in a UTF-16
+/// database (v0.16, `utf16`; the LIKE operator): a BLOB's bytes
+/// through the pin's UTF-16 → UTF-8 conversion, a TEXT's `view`.
+#[cfg(feature = "utf16")]
+fn text_view(v: OwnedValue, ctx: &Ctx<'_>) -> OwnedValue {
+    match v {
+        OwnedValue::Blob(b) if ctx.enc() != crate::record::TextEnc::Utf8 => {
+            OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), ctx.enc()))
+        }
+        OwnedValue::Text(t) if ctx.enc() != crate::record::TextEnc::Utf8 => {
+            match crate::utf16::view(t.as_slice()) {
+                Some(v) => OwnedValue::Text(v),
+                None => OwnedValue::Text(t),
+            }
+        }
+        v => v,
+    }
+}
+
+/// A value read as a number (unary minus, `randomblob(N)`): in a
+/// UTF-16 database a BLOB is read through its UTF-16 text
+/// (`blob_text`; `-x'32002E003500'` is -2.5 in UTF-16le).
+#[cfg(feature = "utf16")]
+fn num_arg(v: OwnedValue, ctx: &Ctx<'_>) -> OwnedValue {
+    blob_text(v, ctx)
+}
+
+#[cfg(not(feature = "utf16"))]
+#[inline(always)]
+fn num_arg(v: OwnedValue, _ctx: &Ctx<'_>) -> OwnedValue {
+    v
 }
 
 /// `CAST(x AS ...)` in the context's database (v0.16, `utf16`): in
@@ -5925,7 +5968,7 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
             Some(match f {
                 ScalarFn::Random => Ok(OwnedValue::Integer(env.prng.random())),
                 ScalarFn::Randomblob => match args.first().map(|a| eval::<E>(a, ctx)) {
-                    Some(Ok(n)) => env.prng.blob::<E>(&n),
+                    Some(Ok(n)) => env.prng.blob::<E>(&num_arg(n, ctx)),
                     Some(Err(e)) => Err(e),
                     None => Ok(OwnedValue::Null),
                 },
@@ -5998,16 +6041,32 @@ fn eval_scalar16<E>(
         f,
         F::Coalesce | F::Nullif | F::Iif | F::MinN | F::MaxN | F::Likely | F::Typeof
     );
-    for (i, x) in vs.as_mut_slice().iter_mut().enumerate() {
-        let keep = pass
-            || match f {
-                F::Length | F::OctetLength | F::Hex | F::Quote => true,
+    if !pass {
+        for (i, x) in vs.as_mut_slice().iter_mut().enumerate() {
+            // A BLOB the function reads as bytes, or (sign() and
+            // the math functions: NULL for a BLOB) not at all, stays.
+            let keep_blob = match f {
+                F::Length | F::OctetLength | F::Hex | F::Quote | F::Sign => true,
+                // log(B, X) reads X with `sqlite3_value_double`,
+                // through its UTF-16 text.
+                #[cfg(feature = "math")]
+                F::Math(m) => !(m == crate::math::MathFn::Log && i == 1),
                 F::Substr => i == 0,
                 F::Instr => all_blobs,
                 _ => false,
             };
-        if let (OwnedValue::Blob(b), false) = (&*x, keep) {
-            *x = OwnedValue::Text(crate::utf16::decode(b.as_slice(), enc));
+            match &*x {
+                OwnedValue::Blob(b) if !keep_blob => {
+                    *x = OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), enc));
+                }
+                // Text is read as the pin's conversion shows it.
+                OwnedValue::Text(t) => {
+                    if let Some(v) = crate::utf16::view(t.as_slice()) {
+                        *x = OwnedValue::Text(v);
+                    }
+                }
+                _ => {}
+            }
         }
     }
     let r = scalar_values::<E>(f, args, vs.as_slice(), ctx)?;
@@ -6163,7 +6222,17 @@ fn scalar_values<E>(
                 hex_text(to_text(v0).unwrap_or_default().as_slice())
             }
         }
-        ScalarFn::Sign => match to_number(v0) {
+        // The pin's `sqlite3_value_numeric_type`: a number, or a
+        // text that is wholly one; a BLOB or any other text is NULL
+        // (v0.16 fix, ungated: `sign(x'32')` and `sign('2x')` were 1).
+        ScalarFn::Sign => match match v0 {
+            OwnedValue::Text(t) => crate::record::text_to_number(t.as_slice()),
+            OwnedValue::Integer(_) | OwnedValue::Real(_) => Some(v0.clone()),
+            _ => None,
+        }
+        .as_ref()
+        .and_then(to_number)
+        {
             None => OwnedValue::Null,
             Some(n) => {
                 let x = n.as_f64();
@@ -6361,12 +6430,57 @@ fn eval_json_call<E>(
     for a in args {
         vs.push(eval_json_arg::<E>(a, ctx)?);
     }
+    #[cfg(feature = "utf16")]
+    if !f.op.is_each_column() {
+        for (i, (v, _)) in vs.as_mut_slice().iter_mut().enumerate() {
+            json_arg16(v, |i| f.op.reads_text(i), i, ctx.enc());
+        }
+    }
     // A `json_each` column reads its call's document.
     if f.op.is_each_column() {
         return crate::json::each_column(f, vs.as_slice(), ctx.env.map(|e| &e.json_docs))
             .map_err(|kind| Error::Schema { kind });
     }
-    crate::json::eval(f, vs.as_slice()).map_err(|kind| Error::Schema { kind })
+    let r = crate::json::eval(f, vs.as_slice()).map_err(|kind| Error::Schema { kind })?;
+    // A text result goes through the pin's UTF-8 → UTF-16 conversion
+    // (v0.16, `utf16`: a lone surrogate becomes U+FFFD).
+    #[cfg(feature = "utf16")]
+    if ctx.enc() != crate::record::TextEnc::Utf8
+        && let (OwnedValue::Text(t), sub) = &r
+        && let Some(n) = crate::utf16::normalize(t.as_slice())
+    {
+        return Ok((OwnedValue::Text(n), *sub));
+    }
+    Ok(r)
+}
+
+/// A JSON function's argument `i` in a UTF-16 database (v0.16,
+/// `utf16`): text reads as the pin's conversion shows it (`view`),
+/// and a BLOB that is not JSONB where the function reads text
+/// (`reads_text`) decodes from UTF-16, as the pin's
+/// `sqlite3_value_text` does (`json_valid(x'7b007d00')` is 1 in
+/// UTF-16le).
+#[cfg(all(feature = "json", feature = "utf16"))]
+pub(crate) fn json_arg16(
+    v: &mut OwnedValue,
+    reads_text: impl Fn(usize) -> bool,
+    i: usize,
+    enc: crate::record::TextEnc,
+) {
+    if enc == crate::record::TextEnc::Utf8 {
+        return;
+    }
+    match &*v {
+        OwnedValue::Text(t) => {
+            if let Some(x) = crate::utf16::view(t.as_slice()) {
+                *v = OwnedValue::Text(x);
+            }
+        }
+        OwnedValue::Blob(b) if reads_text(i) && !crate::json::is_jsonb(b.as_slice()) => {
+            *v = OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), enc));
+        }
+        _ => {}
+    }
 }
 
 /// An expression's value and whether it carries the JSON subtype
@@ -6388,6 +6502,9 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             let (v, sub) = eval_json_arg::<E>(x, ctx)?;
             Ok(match v {
                 OwnedValue::Text(_) => (v, sub),
+                #[cfg(feature = "utf16")]
+                other => (cast_in(other, Affinity::Text, ctx), false),
+                #[cfg(not(feature = "utf16"))]
                 other => (cast_value(&other, Affinity::Text), false),
             })
         }
@@ -6687,7 +6804,7 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Win(..) => return Err(Error::Unsupported),
         RExpr::Raise(kind) => return Err(Error::Schema { kind: *kind }),
         RExpr::Pos(x) => eval::<E>(x, ctx)?,
-        RExpr::Neg(x) => match to_number(&eval::<E>(x, ctx)?) {
+        RExpr::Neg(x) => match to_number(&num_arg(eval::<E>(x, ctx)?, ctx)) {
             None => OwnedValue::Null,
             Some(Num::Int(i)) => match i.checked_neg() {
                 Some(n) => OwnedValue::Integer(n),
@@ -7110,7 +7227,7 @@ fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             let xv = eval::<E>(x, ctx)?;
             let pv = eval::<E>(p, ctx)?;
             #[cfg(feature = "utf16")]
-            let (xv, pv) = (blob_text(xv, ctx), blob_text(pv, ctx));
+            let (xv, pv) = (text_view(xv, ctx), text_view(pv, ctx));
             match like_glob::<E>(&pv, &xv, None, false, case_like(ctx))? {
                 OwnedValue::Integer(m) => bool_val((m != 0) != *neg),
                 other => other,

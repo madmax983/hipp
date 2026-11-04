@@ -1595,6 +1595,10 @@ impl<'a> Member<'a> {
             return Ok(());
         }
         let x = self.arg(part, pos, 0);
+        // A UTF-16 database's group_concat / sum read as the pin's
+        // (v0.16, `utf16`; `agg::fold` does the same for a fold).
+        #[cfg(feature = "utf16")]
+        let x = crate::agg::arg16(kind, x, part.enc);
         let null = matches!(x, OwnedValue::Null);
         match kind {
             AggKind::Count => {
@@ -1611,7 +1615,10 @@ impl<'a> Member<'a> {
             }
             AggKind::GroupConcat => {
                 let sep = if self.call.nargs > 1 {
-                    Some(crate::query::to_text(&self.arg(part, pos, 1)))
+                    let v = self.arg(part, pos, 1);
+                    #[cfg(feature = "utf16")]
+                    let v = crate::agg::arg16(kind, v, part.enc);
+                    Some(crate::query::to_text(&v))
                 } else {
                     None
                 };
@@ -1749,6 +1756,10 @@ impl<'a> Member<'a> {
             WinFn::Agg(kind) => match kind {
                 AggKind::Count => OwnedValue::Integer(self.count),
                 AggKind::Sum | AggKind::Total | AggKind::Avg => self.sum.finish(kind)?,
+                #[cfg(feature = "utf16")]
+                AggKind::GroupConcat if part.enc != crate::record::TextEnc::Utf8 => {
+                    crate::agg::result16(kind, self.gc.value())
+                }
                 AggKind::GroupConcat => self.gc.value(),
                 AggKind::Min | AggKind::Max if unbounded => {
                     self.best.clone().unwrap_or(OwnedValue::Null)

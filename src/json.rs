@@ -2321,7 +2321,7 @@ fn might_be_binary(b: &[u8]) -> bool {
 
 /// The pin's `jsonArgIsJsonb`: `might_be_binary`, and a short blob
 /// that reads like JSON text must also pass the strict check.
-fn is_jsonb(b: &[u8]) -> bool {
+pub(crate) fn is_jsonb(b: &[u8]) -> bool {
     if !might_be_binary(b) {
         return false;
     }
@@ -2980,6 +2980,29 @@ pub struct JsonFn {
 }
 
 impl Op {
+    /// Whether argument `i` is read as text when it is not JSONB —
+    /// a JSON document, a path, `json_pretty`'s indent (the pin's
+    /// `sqlite3_value_text`; v0.16, `utf16`: a UTF-16 database's
+    /// BLOB there decodes from UTF-16). A value argument (an array
+    /// element, a label, a value to insert) rejects a BLOB instead.
+    #[cfg(feature = "utf16")]
+    pub fn reads_text(self, i: usize) -> bool {
+        match self {
+            Op::Json | Op::ErrorPosition => i == 0,
+            Op::Valid => i == 0,
+            Op::Extract
+            | Op::Arrow
+            | Op::Arrow2
+            | Op::Remove
+            | Op::Type
+            | Op::ArrayLength
+            | Op::Patch
+            | Op::Pretty => true,
+            Op::Insert | Op::Replace | Op::Set | Op::ArrayInsert => i == 0 || i % 2 == 1,
+            _ => false,
+        }
+    }
+
     /// A `json_each` / `json_tree` column read (`each_column`).
     pub fn is_each_column(self) -> bool {
         matches!(self, Op::EachValue | Op::EachKey | Op::EachJson)

@@ -649,12 +649,16 @@ aspirations.
   (UTF-16le) or 3 (UTF-16be) open, read and write as on the pin,
   and `PRAGMA encoding = 'UTF-16' | 'UTF-16le' | 'UTF-16be'` (or
   `UTF16...`, any case; `UTF-16` alone is little-endian, the pin's
-  native order) chooses one for an empty database — a silent no-op
-  once it has a schema or a TEMP database, as on the pin — and
-  `PRAGMA encoding` reports it. Records (and sqlite_schema's text)
+  native order; `PRAGMA temp.encoding` too) chooses one while the
+  database has no schema — header-only writes such as `PRAGMA
+  user_version` leave it open, a schema change (even rolled back,
+  TEMP too) fixes it, as on the pin — and `PRAGMA encoding`
+  reports it. Records (and sqlite_schema's text)
   are translated at the B-tree boundary, so serial types count
   UTF-16 bytes and files interoperate both ways (the pin's
-  integrity_check passes on hipp's; VACUUM keeps the encoding).
+  integrity_check passes on hipp's and hipp's on the pin's, unpaired
+  surrogates included: text is held losslessly, so index builds and
+  copies keep the stored units; VACUUM keeps the encoding).
   The BINARY collation compares the UTF-16 bytes with memcmp as
   the pin does — UTF-16le orders by the low byte first, UTF-16be
   sorts astral characters below U+E000 — in ORDER BY, indexes,
@@ -662,14 +666,15 @@ aspirations.
   NOCASE and RTRIM compare the UTF-8 form, as the pin defines them
   for UTF-8 only. hex() and CAST(... AS BLOB) give the UTF-16
   bytes, octet_length counts them, a blob read as text (CAST, ||,
-  upper, LIKE, numbers from blobs, group_concat) decodes from
-  UTF-16, function results go through the pin's conversion (a lone
-  surrogate becomes U+FFFD), invalid stored UTF-16 reads as the
-  pin reads it. Without the leaf such a file is refused at open
-  (`UnsupportedEncoding`), never misread. Fixed on the way
-  (ungated): `unicode(char(65534))` is 65534, as on the pin. Gaps
-  (a surrogate followed by a non-matching unit is re-encoded as a
-  pair when rewritten) and sizes in STATUS.md.
+  upper, LIKE, numbers from blobs, sum, group_concat, JSON
+  documents) decodes from UTF-16 while the math functions and
+  sign() give NULL for it, function results go through the pin's
+  conversion (a lone surrogate becomes U+FFFD), and text with
+  unpaired surrogates shows as the pin shows it. Without the leaf
+  such a file is refused at open (`UnsupportedEncoding`), never
+  misread. Fixed on the way (ungated): `unicode(char(65534))` is
+  65534, and `sign()` of a BLOB or of a text that is not wholly a
+  number is NULL, as on the pin. Gaps and sizes in STATUS.md.
 - **WAL journal mode** (new leaf feature `wal`, in `max` — ADR 0002
   — not `full`): a database whose header says WAL (or with a
   non-empty `-wal` beside it) opens with the committed frames of

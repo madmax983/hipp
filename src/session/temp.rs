@@ -1121,6 +1121,12 @@ impl<S: Storage> Connection<S> {
             c.prag.busy_timeout = p.busy_timeout;
             c.prag.like_redefined = p.like_redefined;
             c.env.case_like.set(like);
+            // The encoding is the connection's: main's, chosen while
+            // the TEMP schema is still unwritten (v0.16, `utf16`).
+            #[cfg(feature = "utf16")]
+            if c.pager.text_enc() != self.pager.text_enc() {
+                c.set_text_enc(self.pager.text_enc());
+            }
         }
     }
 

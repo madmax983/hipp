@@ -134,6 +134,52 @@ fn basics_both_orders() {
     }
 }
 
+/// Text with unpaired and reversed surrogates (stored through
+/// `CAST(blob AS TEXT)`) renders as the pin's CLI renders it — a
+/// surrogate combined with the unit after it — while its stored
+/// bytes, index and order stay the pin's (review regression).
+#[test]
+fn unpaired_surrogates_render_as_the_pin() {
+    for (k, (order, units)) in [
+        (
+            "UTF-16le",
+            ["00D86100", "00DC00D8", "00D8", "6100DFFF", "00D800DC"],
+        ),
+        (
+            "UTF-16be",
+            ["D8000061", "DC00D800", "D800", "0061DFFF", "D800DC00"],
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let rows: Vec<String> = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| format!("(CAST(x'{u}' AS TEXT), {i})"))
+            .collect();
+        let batch = format!(
+            "PRAGMA encoding = '{order}';
+CREATE TABLE t(a TEXT, b);
+INSERT INTO t VALUES {};
+CREATE INDEX ia ON t(a);
+SELECT a, b, hex(a), length(a) FROM t ORDER BY a, b;
+SELECT a || 'z', upper(a), quote(a) FROM t ORDER BY b;
+SELECT b FROM t WHERE a = CAST(x'{}' AS TEXT);
+SELECT group_concat(a, '|') FROM t;
+PRAGMA integrity_check;
+",
+            rows.join(", "),
+            units[0]
+        );
+        byte_identical(
+            &format!("lone{k}"),
+            &batch,
+            "SELECT a, hex(a) FROM t ORDER BY a, b; PRAGMA integrity_check;",
+        );
+    }
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {

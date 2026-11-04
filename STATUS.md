@@ -5673,7 +5673,8 @@ with `Error::UnsupportedEncoding` exactly as before (unit test
 records are translated at the B-tree boundary
 (`utf16::transcode_record`): `btree::assemble_payload_into` — the
 one path every table row and index key is read through — turns its
-TEXT values into the pin's UTF-8 form, and `btree_insert` /
+TEXT values into a lossless UTF-8 form (an unpaired surrogate kept
+as its three-byte form; review fix below), and `btree_insert` /
 `index_insert_core` / the index-delete predecessor cell turn them
 back into the file's UTF-16 (serial types counting UTF-16 bytes), so
 everything above (catalog, ALTER, VACUUM, WITHOUT ROWID's `wr`
@@ -5697,9 +5698,11 @@ from `query::Env::enc` (`Ctx::enc`).
 - `PRAGMA encoding = 'UTF-8' | 'UTF8' | 'UTF-16' | 'UTF16' |
   'UTF-16le' | 'UTF16le' | 'UTF-16be' | 'UTF16be'` (any case;
   `UTF-16` alone is little-endian, the pin's native order on its
-  x86-64 build) while the encoding is open — the database has no
-  schema yet (pristine, or a file whose field is still 0) and no
-  TEMP database exists; the last choice wins; once fixed any value,
+  x86-64 build; `PRAGMA temp.encoding` is the same setting) while
+  the encoding is open — the database has no schema, its encoding
+  field is still 0 (a new file, or one that only got header writes)
+  and neither main nor TEMP has had a schema change since the open
+  (`Pager::enc_open`; review fix below); the last choice wins; once fixed any value,
   even an unknown one, is ignored (an unknown name while open is
   `SchemaKind::UnknownEncoding`, as before). `PRAGMA encoding` and
   `pragma_encoding` report `UTF-8` / `UTF-16le` / `UTF-16be`.
@@ -5725,11 +5728,14 @@ from `query::Env::enc` (`Ctx::enc`).
   except the ones that return an argument (coalesce, nullif, iif,
   min / max, likely); the PRAGMA table-valued functions' internal
   literals are UTF-16-aware.
-- Invalid stored UTF-16 reads as the pin reads it: an odd trailing
-  byte dropped (also by `CAST(blob AS TEXT)`), a surrogate followed
-  by any unit combined with it, a surrogate ending the text kept as
-  its 3-byte form (rendered raw by the CLI) and written back as
-  itself.
+- Invalid stored UTF-16 is held losslessly and shown as the pin
+  shows it: an odd trailing byte dropped (also by `CAST(blob AS
+  TEXT)`); an unpaired surrogate kept as its 3-byte form, so copies,
+  index builds, `||`, CAST, equality and BINARY order see the stored
+  units; where the pin reads text through its UTF-16 → UTF-8
+  conversion (result columns, function arguments, LIKE, NOCASE /
+  RTRIM, JSON) hipp reads `utf16::view`, which combines a surrogate
+  with whatever unit follows it.
 
 **Fixed on the way (ungated, the v16 function library):**
 `unicode()` replaced U+FFFE / U+FFFF with 65533; the pin returns
@@ -5787,30 +5793,98 @@ threshold): the conversions and record translation (~3 KB), the
 evaluator's UTF-16 paths (~2.5 KB), the encoding-aware comparisons
 and PRAGMA / pager / VACUUM support.
 
+**Review fixes (2026-11-04).** Seven findings reproduced on the
+live pin, all fixed with regressions in `tests/utf16_v16.rs`
+(`regression_*`, plus surrogate-heavy raw units in the generated
+corpus: 300 / 300 agreed) and `hipp-cli/tests/cli_v16_utf16.rs`
+(`unpaired_surrogates_render_as_the_pin`):
+
+- **Unpaired surrogates corrupted indexes and lookups** (high). The
+  boundary decode combined any surrogate with the next unit (the
+  pin's display conversion), so `00D8 6100` was held as U+10061 and
+  re-encoded `00D8 61DC`: hipp's CREATE INDEX / REINDEX wrote keys
+  that did not match the pin's rows (the pin's integrity_check
+  failed), seeks on a valid pin file missed (`a = char(0x10000)`
+  found the wrong row, hipp's integrity_check reported a missing
+  entry), and within one statement `CAST(x'DC00D800' AS TEXT)`
+  equalled `char(0x10000)` (false UNIQUE violations, reordered
+  `hex()`). Root cause fixed: `utf16::decode_into` is now lossless
+  (only a high + low pair combines), the pin's lossy conversion is
+  `decode_pin_into` / `view`, applied where the pin reads
+  `sqlite3_value_text`: `Statement::step`'s result columns, scalar
+  function arguments (`eval_scalar16`), aggregate and window
+  group_concat arguments (`agg::arg16`), the LIKE operator, NOCASE /
+  RTRIM (`record::compare_coll_in`) and JSON arguments; `||` joins a
+  split pair (`utf16::canon`). `x || 'a'` across a trailing
+  surrogate now matches too (an earlier gap).
+- **Math functions and sign() on a BLOB** (high). The math functions
+  and `sign()` keep a BLOB argument (NULL, as in UTF-8); `log(B, X)`
+  reads X through its UTF-16 text, as the pin's
+  `sqlite3_value_double`. Same pattern fixed in unary minus,
+  `randomblob(N)`, `sum` / `avg` / `total` (aggregate and window) and
+  window group_concat / string_agg (an earlier gap). Ungated fix
+  found on the way: `sign()` of a BLOB or of a text that is not
+  wholly a number (`sign('2x')`) was 1 / 0 in every encoding; the
+  pin's is NULL.
+- **JSON on a non-JSONB BLOB** (high). A BLOB in a document or path
+  position (`json::Op::reads_text`; `json_each` / `json_tree` too)
+  decodes from UTF-16 when it is not JSONB; value positions still
+  reject it; text arguments read as `view`; JSON text results (and
+  the JSON aggregates') go through `utf16::normalize`, so a lone
+  surrogate becomes U+FFFD (an earlier gap); `CAST(blob AS TEXT)`
+  inside a JSON argument decodes too (it read raw bytes).
+- **Header-only writes fixed the encoding** (high). With `utf16` a
+  new file's schema-format and encoding fields stay 0 until the
+  first schema change, as in the pin's file (`pager::initial_page1`;
+  the header bytes now match after `PRAGMA user_version`), and the
+  encoding stays open across header writes in the same connection
+  and on reopen in either engine (the earlier reopen gap). A schema
+  change, even rolled back or inside a released savepoint, fixes it
+  (`Pager::schema_changed`, set by `bump_schema_cookie`).
+- **`PRAGMA temp.encoding = ...` ignored** (medium). The encoding is
+  a connection-wide pragma (`Prag::connection_wide`); the TEMP
+  database follows main's (`sync_temp`). Only a TEMP schema change
+  fixes the encoding — reading `temp.sqlite_master`, `PRAGMA
+  temp.user_version` or `temp.page_size` do not, as on the pin
+  (hipp used to fix it as soon as the TEMP database existed).
+- **Docs** (low): the interop and gap claims above and in README
+  are corrected.
+
+Probed on the pin for these fixes: the `view` cases above (`length`,
+`unicode`, `quote`, `substr`, `instr`, LIKE / GLOB, `upper`,
+`printf`, `group_concat`, NOCASE all read the combined character;
+`hex`, `CAST AS BLOB`, `octet_length`, `coalesce`, `min`, `||` keep
+the bytes); every math function, `log(2, blob)`, unary minus,
+`randomblob`, sum / avg / total and their window forms on BLOBs in
+all three encodings; 26 JSON calls with BLOB arguments in all three
+encodings (error-vs-error agreement for value positions); 18 PRAGMA
+encoding scripts (header writes, rolled-back CREATE, savepoints,
+BEGIN IMMEDIATE, TEMP reads / writes / DDL).
+
+**Size after the review fixes:** tiny **76,964 B** (Δ **0**). Full
+**490,996 B** (Δ **+80 B**, ratchet raised: the ungated `sign()`
+fix). Max **737,376 B** (Δ **+5,296 B** vs 732,080, raised): the
+lossless decode / `view` / `canon`, the argument and result
+translations in functions, aggregates, windows and JSON, and the
+encoding-open tracking.
+
 **Honest gaps:**
 
-- A surrogate followed by a unit that does not pair with it (stored
-  by another writer or by `CAST(blob AS TEXT)`) reads as the pin
-  reads it — one supplementary character — but hipp holds text as
-  UTF-8, so when such a value is written again (UPDATE, INSERT ...
-  SELECT, a copy) it is stored as the valid pair, and its `hex()` /
-  BINARY order use that pair (`00D86100` reads back as `00D861DC`).
-  A lone surrogate ending a text round-trips exactly; text the pin
-  concatenates byte-wise across such a surrogate (`x || 'a'` where x
-  ends in one) renders differently.
-- `sum()` / `avg()` / `total()` of a BLOB read its raw bytes, not
-  UTF-16 (`sum(x'0031')` in UTF-16be); the window form of
-  group_concat does not decode blob arguments; JSON functions do not
-  normalise lone surrogates.
-- `concat()` with blob arguments: the pin reads past its converted
-  text (above); hipp gives the decoded text.
+- `concat()` / `concat_ws()` with BLOB arguments: the pin reads past
+  its converted text (`concat_ws(x'32002E003500', 'a', 'b')` is
+  `a2.5` there); hipp gives the decoded text.
+- A TEXT bound through `bind_value` that is not valid UTF-8 and
+  holds a surrogate's three-byte form is stored as that surrogate
+  (not probed: the pin's conversion of such bound text may differ).
 - `UTF-16` alone always means little-endian (the pin's on x86-64; a
   big-endian pin build would choose big-endian).
-- hipp writes the encoding field (1) into a new file at creation; the
-  pin leaves it 0 until the first schema write, so a hipp-created
-  file that only got header writes is UTF-8-fixed on reopen in both
-  engines (the pin's own such file is not). `.dump` differs from the
-  pin's for every encoding (pre-existing).
+- A hipp-created file gets its page 1 written at open (the pin's
+  stays empty until the first write), and its change counter after a
+  header-only write differs from the pin's by one (pre-existing, every
+  encoding). `.dump` differs from the pin's for every encoding
+  (pre-existing).
+- `INDEXED BY` is not parsed (pre-existing; the regression tests use
+  the planner's own index choice).
 
 ### WAL journal mode (2026-11-04)
 

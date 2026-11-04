@@ -60,33 +60,68 @@ pub fn fold<E>(
     fold_rows(p, rows, enc).map_err(|kind| Error::Schema { kind })
 }
 
-/// `fold` in a UTF-16 database (v0.16, `utf16`): group_concat /
-/// string_agg read a BLOB argument as UTF-16 text, and their text goes through the pin's conversion of a
-/// function result (`utf16::normalize`).
+/// `fold` in a UTF-16 database (v0.16, `utf16`): the arguments as
+/// the pin's aggregates read them (`arg16`), the text result through
+/// its conversion of a function result (`result16`).
 #[cfg(feature = "utf16")]
 fn fold16(
     p: &AggParts<'_>,
     mut rows: AVec<AVec<OwnedValue>>,
     enc: crate::record::TextEnc,
 ) -> core::result::Result<OwnedValue, SchemaKind> {
-    if p.kind == AggKind::GroupConcat {
-        let n = p.args.len();
+    let n = p.args.len();
+    if matches!(
+        p.kind,
+        AggKind::GroupConcat | AggKind::Sum | AggKind::Total | AggKind::Avg
+    ) {
         for r in rows.as_mut_slice() {
             for x in r.as_mut_slice().iter_mut().take(n) {
-                if let OwnedValue::Blob(b) = x {
-                    *x = OwnedValue::Text(crate::utf16::decode(b.as_slice(), enc));
-                }
+                *x = arg16(p.kind, core::mem::replace(x, OwnedValue::Null), enc);
             }
         }
     }
-    let r = fold_rows(p, rows, enc)?;
-    if p.kind == AggKind::GroupConcat
+    Ok(result16(p.kind, fold_rows(p, rows, enc)?))
+}
+
+/// One argument of aggregate `kind` in a UTF-16 database (v0.16,
+/// `utf16`; the window engine's too): group_concat / string_agg read
+/// it as the pin's `sqlite3_value_text` does (a BLOB as UTF-16 text,
+/// a TEXT's `utf16::view`); sum / total / avg read a BLOB's number
+/// through its UTF-16 text (it stays non-integer: `sum(x'3100')` is
+/// 1.0). Any other value or kind is returned as it is.
+#[cfg(feature = "utf16")]
+pub(crate) fn arg16(kind: AggKind, v: OwnedValue, enc: crate::record::TextEnc) -> OwnedValue {
+    match (kind, v) {
+        (AggKind::GroupConcat, OwnedValue::Blob(b)) => {
+            OwnedValue::Text(crate::utf16::decode_pin(b.as_slice(), enc))
+        }
+        (AggKind::GroupConcat, OwnedValue::Text(t)) => match crate::utf16::view(t.as_slice()) {
+            Some(v) => OwnedValue::Text(v),
+            None => OwnedValue::Text(t),
+        },
+        (AggKind::Sum | AggKind::Total | AggKind::Avg, OwnedValue::Blob(b)) => {
+            OwnedValue::Blob(crate::utf16::decode(b.as_slice(), enc))
+        }
+        (_, v) => v,
+    }
+}
+
+/// Aggregate `kind`'s result in a UTF-16 database (v0.16, `utf16`):
+/// group_concat's and the JSON aggregates' text goes through the
+/// pin's UTF-8 → UTF-16 conversion (`utf16::normalize`).
+#[cfg(feature = "utf16")]
+pub(crate) fn result16(kind: AggKind, r: OwnedValue) -> OwnedValue {
+    #[cfg(feature = "json")]
+    let text_result = matches!(kind, AggKind::GroupConcat | AggKind::Json(_));
+    #[cfg(not(feature = "json"))]
+    let text_result = kind == AggKind::GroupConcat;
+    if text_result
         && let OwnedValue::Text(t) = &r
         && let Some(n) = crate::utf16::normalize(t.as_slice())
     {
-        return Ok(OwnedValue::Text(n));
+        return OwnedValue::Text(n);
     }
-    Ok(r)
+    r
 }
 
 /// `fold`, generic-free (one copy whatever the storage error).
