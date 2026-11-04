@@ -3384,6 +3384,10 @@ async fn bt_check<S: Storage>(
     partial: bool,
     counts: &mut AVec<u64>,
 ) -> Result<(), S::Error> {
+    #[cfg(feature = "autovacuum")]
+    if ck.autovac {
+        crate::autovac::refresh_map(pager).await?;
+    }
     if !partial {
         let (trunk, n) = (pager.header().freelist_trunk, pager.header().freelist_count);
         check_list(ck, pager, true, trunk, n, Pfx::Freelist).await?;

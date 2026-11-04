@@ -7212,11 +7212,12 @@ now `cfg(not(feature = "autovacuum"))`).
   FULL file inside a transaction too; on a plain or the temp
   database it does nothing; `pragma_incremental_vacuum` is "no such
   table", as on the pin.
-- **Truncation is crash- and savepoint-safe.** Before the file
-  shrinks, every page past the new end is journaled (if original)
-  and noted in the savepoint sub-journal (`Pager::keep_tail`), as
-  the pin journals a truncated tail; pages cut off are dropped
-  from the commit's write set.
+- **Truncation is crash- and savepoint-safe.** Pages cut off are
+  dropped from the commit's write set. (As first shipped, every
+  page past the new end was journaled and sub-journaled up front;
+  the review fixes below replace that with the pin's scheme:
+  truncation after the journal's deletion, no record for a cut
+  page unless it is reused.)
 - **PRAGMA auto_vacuum.** The mode is always kept for the next
   VACUUM; an empty database takes FULL / INCREMENTAL at once
   (header offsets 52 = 1 and 64 written and committed, so the page
@@ -7361,6 +7362,144 @@ growth / tail keeping and the PRAGMA / VACUUM / DROP wiring.
 - `PRAGMA auto_vacuum` on the TEMP database and the pin's
   `sqlite3_autovacuum_pages` callback (no SQL surface) are not
   modelled.
+
+### Auto-vacuum files — review fixes (2026-11-04)
+
+Four review findings on the unit above; all four addressed.
+
+- **Cut-off pages were journaled (fixed).** `Pager::keep_tail`
+  wrote every page past the new end of the file to the rollback
+  journal and the savepoint sub-journal before a FULL commit or a
+  `PRAGMA incremental_vacuum` step, free leaves included, so the
+  journal grew as large as the freed data. A FULL `DROP TABLE` of
+  a 12 MB table wrote 3,013 page images, against 10 on the pin.
+  Probed on the pin with `strace`: it `unlink`s the journal and
+  only then `ftruncate`s the file (its `pager_end_transaction`),
+  and fetches free leaves without their content. So until the
+  journal is gone, the cut-off pages are still on disk for a
+  rollback, and none of them needs a record. hipp now does the
+  same. The commit's `SyncData` stage only grows an auto-vacuum
+  file; it is shrunk after `DeleteJournal`, best effort (the
+  commit point has passed, and a longer file is valid: its header
+  gives the page count, as the pin's does after a crash there).
+  `keep_tail` is gone. The pages a truncation cut off keep their
+  frames, and they are recorded only when they are written again.
+  That happens when the file grows back into them
+  (`Pager::grow_frame`): they then take a journal record (if
+  original) and a savepoint record before they are zeroed.
+  `autovac::allocate` no longer makes a freelist leaf writable
+  itself: incremental_vacuum's `BTALLOC_EXACT` leaf is cut, not
+  written, and the other callers make it writable themselves.
+  Savepoints now allow for a file that shrinks mid-transaction.
+  `sp_note` records a page within *any* open savepoint's size (the
+  pin's `subjRequiresPage`), not only the newest one's.
+  `sp_rollback` keeps, and restores, the pages an older savepoint
+  still covers. A page that is journaled but has left the write
+  set has its image copied to the sub-journal. These rules matter
+  only when the file shrinks, so they are gated by the leaf. Now
+  the review's DROP TABLE and incremental_vacuum cases each write 7
+  page images in all, journal and database together (3,015 and
+  3,011 before). The incremental_vacuum file came out
+  byte-identical to the pin's. Regressions:
+  `tests/crash.rs` `v16_crash_autovacuum_cut_pages_not_journaled`
+  (a FULL DROP of ~300 pages and an incremental_vacuum of ~300 free
+  pages each take fewer than 60 storage operations, where three
+  per page were needed before; crash matrices of those, of a
+  transaction that grows back into the pages it cut, and of a FULL
+  delete whose commit moves pages: every kill point recovers in
+  hipp to the pre-image, or to the post-image possibly followed by
+  the not-yet-truncated tail, and the pin recovers the same files
+  with integrity_check ok). The crash matrices accept that tail.
+  `tests/autovacuum_v16.rs` `savepoints_across_a_shrinking_file`
+  covers ROLLBACK TO a savepoint taken after an incremental_vacuum,
+  then one taken before it, with the file grown back in between.
+  It fails if `sp_rollback` drops the older savepoint's pages.
+- **Found while testing: integrity_check inside a transaction
+  (fixed).** hipp writes the derived pointer map only at commit,
+  so `BEGIN; DELETE ...; PRAGMA integrity_check` on an auto-vacuum
+  file reported "Bad ptr map entry" for every entry the
+  transaction had changed. The pin's map is always current, so
+  its check says `ok`. Inside an open write transaction, the
+  check now writes the derived map first (`autovac::refresh_map`).
+  Outside a transaction the committed map is checked as it is, so
+  damaged maps are still reported
+  (`integrity_check_of_damaged_maps`). Covered by
+  `savepoints_across_a_shrinking_file` and the CLI `attached_file`
+  batch.
+- **Lock-byte page untested (now tested).** `lock_byte_page`
+  crafts a sparse 1 GiB file at 64 KiB pages: the pin's page 1 and
+  pointer maps, and a table of four rows whose 4,095-page overflow
+  chains fill pages 4 to 16384. Each overflow page holds only its
+  4-byte link, so about 64 MB is written. Statement by statement on
+  both engines, it grows the file past page 16385 (a CREATE moving
+  page 4 to 16386, an insert), shrinks it back across that page (a
+  FULL `DROP TABLE`; on INCREMENTAL, `incremental_vacuum(2)` and
+  then all), and creates a table again. Rows, page counts, freelist
+  counts, offsets 52 / 64 and every pointer-map entry match the pin
+  after each statement. The lock-byte page's slot holds no entry,
+  each file ends at its page count, and the pin's integrity_check
+  passes on both files. hipp's own integrity check and `count(*)`
+  read all 268 MB of each row's payload, which is too slow for a
+  test, so the matching layouts stand in for them.
+- **ATTACH interplay untested (now tested).**
+  `attached_auto_vacuum_files` runs six scripts with an attached
+  file and compares each file's layout with the pin's:
+  `aux.auto_vacuum` on an empty attached file; CREATE / CREATE
+  INDEX / DROP moving roots in it; `aux.incremental_vacuum(N)` and
+  the unqualified pragma (main's, a no-op); a FULL aux inside a
+  BEGIN ... COMMIT across main and aux, and a ROLLBACK; both files
+  auto-vacuum in different modes with savepoints across them;
+  `VACUUM aux`, `VACUUM aux INTO`, `aux.auto_vacuum = 0; VACUUM
+  aux`; a plain aux converted by VACUUM. `tests/crash.rs`
+  `v16_crash_multi_database_auto_vacuum` (through
+  `multi_crash_matrix_with`) covers a FULL attached file truncated
+  inside a super-journal commit, and an INCREMENTAL one vacuumed
+  inside it. Every kill point recovers all three databases to one
+  side, in hipp and in the pin, with integrity_check ok. The CLI
+  suite adds `attached_file`, byte-identical one-shot and over
+  stdin. The incremental_vacuum steps and the integrity check
+  inside a transaction run on an attached file.
+- **README overclaimed page-count parity (fixed).** The README
+  bullet now says that the moves this leaf owns choose the pin's
+  pages, so layouts match given the same tree shapes. Where hipp's
+  general B-tree shapes trees differently, page counts can differ.
+  Reproduced on the pin: an index plus deleting every second row
+  gives 58 pages against 57; `ALTER TABLE DROP COLUMN`, an UPDATE
+  resizing blobs, REINDEX and DELETE merging differ too, as the
+  honest gaps above say. A plain aux converted by VACUUM and then
+  deleted from gives 10 pages against 9: the same cause, so that
+  test case uses DROP instead.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh`
+run (the 3.54.1 pin live) ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**). Full **500,200 B** (Δ
+**0**: every new rule is gated by the leaf, and `sp_rollback`'s
+limit is a macro so that builds without the leaf keep no extra
+local across its awaits — a plain `let` cost 8 B there). Max
+**815,792 B** (Δ **+464** vs 815,328, ratchet raised): the deferred
+truncation, `grow_frame`, the savepoint rules and `refresh_map`,
+less `keep_tail`.
+
+**Honest gaps (added):**
+
+- `Pager::alloc_page`, which every file uses and which predates
+  this unit, still journals a freelist leaf that was free before
+  the transaction when it reuses it: at most one page per page of
+  new data. The pin skips this (it fetches the leaf with
+  `NOCONTENT` unless the leaf was freed in the same transaction).
+  Unlike the fixed finding, this cost scales with the data written,
+  not the data freed. Matching the pin needs a per-transaction
+  record of freed pages in the core pager, which the tiny profile
+  would pay for, so it is left as is.
+- hipp's integrity check and `count(*)` read every overflow page
+  of a row (the pin's skip the payload). On very large rows this is
+  slow; it is not specific to auto-vacuum files.
+- hipp writes page 1 of an empty main database file whenever it
+  opens one, even if nothing is ever written to it (`SELECT 1` is
+  enough); the pin leaves a 0-byte file. This predates this unit
+  and is not specific to it, so the attached tests do not compare
+  a main file that the pin left empty.
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

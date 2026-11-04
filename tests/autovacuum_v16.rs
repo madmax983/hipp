@@ -179,6 +179,16 @@ fn be32(d: &[u8], o: usize) -> u32 {
 
 fn layout(path: &Path) -> Layout {
     let d = std::fs::read(path).expect("read");
+    if d.is_empty() {
+        // A database never written (an attached main left empty).
+        return Layout {
+            pages: 0,
+            free: 0,
+            largest_root: 0,
+            incr: 0,
+            map: Vec::new(),
+        };
+    }
     let raw = u16::from_be_bytes([d[16], d[17]]) as usize;
     let ps = if raw == 1 { 65536 } else { raw };
     let pages = (d.len() / ps) as u32;
@@ -922,5 +932,395 @@ fn page1_root_keeps_an_oversized_child() {
             );
             twin(&format!("page1-{i}-{j}"), &s, exact);
         }
+    }
+}
+
+/// Savepoints around `PRAGMA incremental_vacuum`, which shrinks the
+/// file mid-transaction: a `ROLLBACK TO` a savepoint taken after the
+/// shrink, then one taken before it, must bring back the pages cut
+/// off in between — moved in-use pages, pages changed before the
+/// savepoint, and cut pages the file grew back into (v0.16 review
+/// fix: the cut-off tail is no longer journaled up front, so the
+/// savepoints keep what they need themselves).
+#[test]
+fn savepoints_across_a_shrinking_file() {
+    let base = format!(
+        "PRAGMA page_size = 1024; PRAGMA auto_vacuum = 2; \
+         CREATE TABLE t(a INTEGER PRIMARY KEY, b); CREATE TABLE k(y); \
+         INSERT INTO t {} SELECT v, hex(zeroblob(150)) || v FROM s; \
+         INSERT INTO k {} SELECT hex(zeroblob(1250)) || v FROM s; \
+         DELETE FROM t WHERE a % 2 = 0",
+        rows_of(300),
+        rows_of(20)
+    );
+    let check = "SELECT count(*), sum(length(b)) FROM t; SELECT count(*), sum(length(y)), group_concat(substr(y, 2501)) FROM k; PRAGMA integrity_check";
+    let ins = |from: u32, n: u32| {
+        format!(
+            "INSERT INTO t {} SELECT v + {from}, hex(zeroblob(450)) || v FROM s",
+            rows_of(n)
+        )
+    };
+    let cases = [
+        // Shrink, savepoint, grow back into the cut pages, roll back
+        // to both.
+        format!(
+            "{base}; BEGIN; UPDATE k SET y = hex(zeroblob(1200)) || rowid WHERE rowid > 10; SAVEPOINT a; \
+             DELETE FROM t WHERE a < 120; PRAGMA incremental_vacuum(40); PRAGMA page_count; \
+             SAVEPOINT b; {}; PRAGMA page_count; ROLLBACK TO b; {}; ROLLBACK TO a; \
+             PRAGMA page_count; {check}; COMMIT; PRAGMA page_count; PRAGMA freelist_count; {check}",
+            ins(1000, 60),
+            ins(2000, 10)
+        ),
+        // The same, released instead of rolled back to the outer one.
+        format!(
+            "{base}; BEGIN; SAVEPOINT a; DELETE FROM t WHERE a > 200; PRAGMA incremental_vacuum(25); \
+             SAVEPOINT b; {}; ROLLBACK TO b; PRAGMA incremental_vacuum(5); RELEASE a; COMMIT; \
+             PRAGMA page_count; PRAGMA freelist_count; {check}",
+            ins(1000, 30)
+        ),
+        // Two shrinks in nested savepoints, the inner one rolled back
+        // twice.
+        format!(
+            "{base}; SAVEPOINT a; PRAGMA incremental_vacuum(10); SAVEPOINT b; DELETE FROM k WHERE rowid % 2 = 0; \
+             PRAGMA incremental_vacuum(30); {}; ROLLBACK TO b; PRAGMA incremental_vacuum(3); {}; \
+             ROLLBACK TO b; {check}; ROLLBACK TO a; {check}; RELEASE a; PRAGMA page_count; {check}",
+            ins(1000, 40),
+            ins(3000, 5)
+        ),
+        // A FULL file whose transaction shrinks only at commit.
+        format!(
+            "{}; BEGIN; SAVEPOINT a; DELETE FROM t WHERE a < 250; SAVEPOINT b; {}; ROLLBACK TO b; \
+             DELETE FROM k WHERE rowid < 15; RELEASE a; COMMIT; PRAGMA page_count; PRAGMA freelist_count; {check}",
+            base.replace("auto_vacuum = 2", "auto_vacuum = 1"),
+            ins(1000, 30)
+        ),
+    ];
+    for (i, s) in cases.iter().enumerate() {
+        twin(&format!("spshrink{i}"), s, false);
+    }
+}
+
+// ---------------------------------------------------------------
+// The lock-byte page. At 64 KiB pages it is page 16385 (the page
+// holding byte offset 2^30); it is never part of the database, has no
+// pointer-map entry, and is skipped when the file grows, shrinks
+// (`finalDbSize`) and by `PRAGMA incremental_vacuum`. A file reaching
+// it is 1 GiB, so the test crafts a sparse one: a table of four rows
+// whose overflow chains fill pages 4 to 16384 (each overflow page
+// holds only its 4-byte link; the rest are holes), with the pin's
+// page 1 and pointer maps around them.
+// ---------------------------------------------------------------
+
+const BIG_PS: usize = 65536;
+const BIG_PAGES: u32 = 16384;
+
+/// The SQLite varint of `v` (below 2^56).
+fn varint(mut v: u64, out: &mut Vec<u8>) {
+    let mut b = Vec::new();
+    loop {
+        b.push((v & 0x7f) as u8);
+        v >>= 7;
+        if v == 0 {
+            break;
+        }
+    }
+    b.reverse();
+    let n = b.len();
+    for (i, x) in b.into_iter().enumerate() {
+        out.push(if i + 1 < n { x | 0x80 } else { x });
+    }
+}
+
+#[cfg(unix)]
+fn write_big(path: &Path, mode: &str) {
+    use std::os::unix::fs::FileExt;
+    // The pin's empty auto-vacuum file with one table: pages 1, 2
+    // (pointer map) and 3 (t's root).
+    let base = path.with_extension("base");
+    let _ = std::fs::remove_file(&base);
+    oracle_run(
+        &base,
+        &stmts(&format!(
+            "PRAGMA page_size = 65536; PRAGMA auto_vacuum = {mode}; CREATE TABLE t(x)"
+        )),
+    );
+    let b = std::fs::read(&base).expect("base");
+    assert_eq!(b.len(), 3 * BIG_PS, "three pages");
+    let usable = BIG_PS as u32;
+    let per = usable / 5 + 1;
+    let is_map = |p: u32| p >= 2 && (p - 2).is_multiple_of(per);
+    let chain_pages: Vec<u32> = (4..=BIG_PAGES).filter(|p| !is_map(*p)).collect();
+    assert_eq!(chain_pages.len(), 4 * 4095);
+    let f = std::fs::File::create(path).expect("create");
+    f.set_len(u64::from(BIG_PAGES) * BIG_PS as u64)
+        .expect("len");
+    let mut p1 = b[..BIG_PS].to_vec();
+    p1[28..32].copy_from_slice(&BIG_PAGES.to_be_bytes());
+    f.write_all_at(&p1, 0).expect("page 1");
+    // Four cells, each a one-blob record whose payload leaves the
+    // pin's minimum local part (8199 bytes) on the leaf and fills
+    // exactly 4095 overflow pages.
+    let min_local = (usable - 12) * 32 / 255 - 23;
+    let total = u64::from(min_local) + 4095 * u64::from(usable - 4);
+    let blob = total - 6;
+    let mut leaf = vec![0u8; BIG_PS];
+    leaf[0] = 13;
+    let mut maps: Vec<(u32, u8, u32)> = vec![(3, 1, 0)];
+    for r in 0..4usize {
+        let pages = &chain_pages[r * 4095..(r + 1) * 4095];
+        let mut cell = Vec::new();
+        varint(total, &mut cell);
+        varint(r as u64 + 1, &mut cell);
+        let mut rec = Vec::new();
+        varint(2 * blob + 12, &mut rec);
+        assert_eq!(rec.len(), 5);
+        cell.push(6);
+        cell.extend_from_slice(&rec);
+        cell.resize(cell.len() + min_local as usize - 6, 0);
+        cell.extend_from_slice(&pages[0].to_be_bytes());
+        let off = BIG_PS - cell.len() * (r + 1);
+        leaf[off..off + cell.len()].copy_from_slice(&cell);
+        leaf[8 + 2 * r..10 + 2 * r].copy_from_slice(&(off as u16).to_be_bytes());
+        leaf[5..7].copy_from_slice(&(off as u16).to_be_bytes());
+        for (i, p) in pages.iter().enumerate() {
+            let next = pages.get(i + 1).copied().unwrap_or(0);
+            f.write_all_at(&next.to_be_bytes(), u64::from(p - 1) * BIG_PS as u64)
+                .expect("link");
+            maps.push(if i == 0 {
+                (*p, 3, 3)
+            } else {
+                (*p, 4, pages[i - 1])
+            });
+        }
+    }
+    leaf[3..5].copy_from_slice(&4u16.to_be_bytes());
+    f.write_all_at(&leaf, 2 * BIG_PS as u64).expect("leaf");
+    for m in [2u32, 2 + per] {
+        let mut pg = vec![0u8; BIG_PS];
+        for (p, t, par) in maps.iter().filter(|(p, _, _)| *p > m && *p < m + per) {
+            let e = 5 * (p - m - 1) as usize;
+            pg[e] = *t;
+            pg[e + 1..e + 5].copy_from_slice(&par.to_be_bytes());
+        }
+        f.write_all_at(&pg, u64::from(m - 1) * BIG_PS as u64)
+            .expect("map");
+    }
+}
+
+/// [`Layout`] of a big sparse file, read page by page.
+#[cfg(unix)]
+fn big_layout(path: &Path) -> Layout {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(path).expect("open");
+    let mut h = [0u8; 100];
+    f.read_exact_at(&mut h, 0).expect("header");
+    let pages = be32(&h, 28);
+    assert_eq!(
+        f.metadata().expect("meta").len(),
+        u64::from(pages) * BIG_PS as u64,
+        "{}: the file ends at its page count",
+        path.display()
+    );
+    let per = BIG_PS as u32 / 5 + 1;
+    let mut map = Vec::new();
+    let mut m = 2u32;
+    while m <= pages {
+        let mut pg = vec![0u8; BIG_PS];
+        f.read_exact_at(&mut pg, u64::from(m - 1) * BIG_PS as u64)
+            .expect("map page");
+        for q in m + 1..(m + per).min(pages + 1) {
+            let e = 5 * (q - m - 1) as usize;
+            map.push((q, pg[e], be32(&pg, e + 1)));
+        }
+        m += per;
+    }
+    Layout {
+        pages,
+        free: be32(&h, 36),
+        largest_root: be32(&h, 52),
+        incr: be32(&h, 64),
+        map,
+    }
+}
+
+/// Grow past the lock-byte page (CREATE moving a page to the end,
+/// an insert), then shrink back across it (FULL's commit, PRAGMA
+/// incremental_vacuum), statement by statement against the pin:
+/// rows, page counts, pointer maps and root pages must match, and
+/// each engine's integrity check passes on the other's file.
+#[cfg(unix)]
+#[test]
+fn lock_byte_page() {
+    let pend = 1_073_741_824 / BIG_PS as u32 + 1;
+    assert_eq!(pend, 16385);
+    for (mode, script) in [
+        (
+            "FULL",
+            "CREATE TABLE u(y); PRAGMA page_count; INSERT INTO u VALUES (zeroblob(200000)); \
+             PRAGMA page_count; DROP TABLE u; PRAGMA page_count; CREATE TABLE v(y); \
+             INSERT INTO v VALUES (zeroblob(70000)); DELETE FROM v; PRAGMA page_count",
+        ),
+        (
+            "INCREMENTAL",
+            "CREATE TABLE u(y); INSERT INTO u VALUES (zeroblob(200000)); DROP TABLE u; \
+             PRAGMA page_count; PRAGMA freelist_count; PRAGMA incremental_vacuum(2); \
+             PRAGMA freelist_count; PRAGMA incremental_vacuum; PRAGMA page_count; \
+             PRAGMA freelist_count; CREATE TABLE w(y); PRAGMA page_count",
+        ),
+    ] {
+        let (h, o) = twin_paths(&format!("lockbyte-{mode}"));
+        write_big(&h, mode);
+        write_big(&o, mode);
+        assert_eq!(big_layout(&h), big_layout(&o));
+        let mut crossed = false;
+        for st in stmts(script) {
+            let one = vec![st.clone()];
+            assert_eq!(hipp_run(&h, &one), oracle_run(&o, &one), "{mode}: {st}");
+            let (lh, lo) = (big_layout(&h), big_layout(&o));
+            crossed |= lh.pages > pend;
+            assert_eq!(lh, lo, "{mode}: layout after {st}");
+            assert!(
+                lh.map.iter().any(|e| e.0 == pend) == (lh.pages >= pend),
+                "{mode}: the map covers the lock-byte page's slot"
+            );
+            if lh.pages >= pend {
+                let e = lh.map.iter().find(|e| e.0 == pend).copied();
+                assert_eq!(
+                    e,
+                    Some((pend, 0, 0)),
+                    "{mode}: no entry for the lock-byte page"
+                );
+            }
+        }
+        assert!(crossed, "{mode}: the file grew past the lock-byte page");
+        // The pin checks both files (hipp's integrity check and
+        // count(*) read every row's 268 MB payload, too slow for a
+        // test: the layouts matching stands in for them).
+        let q = stmts("PRAGMA integrity_check; SELECT count(*) FROM t");
+        let ok = (vec!["ok".to_string(), "4".to_string()], vec![]);
+        assert_eq!(oracle_run(&h, &q), ok, "{mode}: the pin checks hipp's file");
+        assert_eq!(oracle_run(&o, &q), ok, "{mode}: and its own");
+        let q = stmts("SELECT name, rootpage FROM sqlite_schema ORDER BY 1");
+        assert_eq!(hipp_run(&o, &q), oracle_run(&h, &q), "{mode}: schemas");
+        // The crafted files are 1 GiB sparse: do not leave them behind.
+        let _ = std::fs::remove_file(&h);
+        let _ = std::fs::remove_file(&o);
+    }
+}
+
+// ---------------------------------------------------------------
+// Auto-vacuum files as attached databases (with `attach`): the
+// schema-qualified pragmas, root moves in an attached file, a FULL
+// attached file truncated inside a multi-database commit, VACUUM of
+// an attached file. Twin directories; `{d}` in a script is the
+// directory. Rows and errors must agree, every file's layout must be
+// the pin's, and the pin's integrity check passes on hipp's files.
+// ---------------------------------------------------------------
+
+#[cfg(feature = "attach")]
+fn attached_twin(tag: &str, script: &str, files: &[&str]) {
+    let (h, o) = twin_paths(&format!("att-{tag}"));
+    let (hd, od) = (h.parent().expect("dir"), o.parent().expect("dir"));
+    let sub = |d: &Path| {
+        stmts(script)
+            .into_iter()
+            .map(|s| s.replace("{d}", &d.to_string_lossy()))
+            .collect::<Vec<_>>()
+    };
+    let a = hipp_run(&h, &sub(hd));
+    let b = oracle_run(&o, &sub(od));
+    assert_eq!(a, b, "{tag}: rows / errors\n{script}");
+    for f in files {
+        let (fh, fo) = (hd.join(f), od.join(f));
+        // A main database the script never writes stays empty on the
+        // pin (hipp writes its page 1 on open: not this unit's).
+        if std::fs::metadata(&fo).map_or(0, |m| m.len()) == 0 {
+            continue;
+        }
+        assert_eq!(
+            common::cli(&fh, "PRAGMA integrity_check;").trim(),
+            "ok",
+            "{tag}: the pin checks hipp's {f}"
+        );
+        assert_eq!(layout(&fh), layout(&fo), "{tag}: {f}'s layout\n{script}");
+    }
+}
+
+#[cfg(feature = "attach")]
+#[test]
+fn attached_auto_vacuum_files() {
+    let data = |db: &str, n: u32| {
+        format!(
+            "CREATE TABLE {db}.t(a INTEGER PRIMARY KEY, b); INSERT INTO {db}.t {} \
+             SELECT v, zeroblob(700) || v FROM s",
+            rows_of(n)
+        )
+    };
+    let files = ["test.db", "aux.db"];
+    let cases = [
+        // The mode set on an empty attached file; CREATE / DROP move
+        // roots there and rewrite its schema's rootpage.
+        format!(
+            "ATTACH '{{d}}/aux.db' AS aux; PRAGMA aux.auto_vacuum = 1; PRAGMA aux.auto_vacuum; \
+             PRAGMA main.auto_vacuum; {}; CREATE TABLE aux.u(c); INSERT INTO aux.u VALUES (1); \
+             CREATE INDEX aux.ub ON t(b); DROP TABLE aux.t; SELECT name, rootpage FROM aux.sqlite_schema; \
+             PRAGMA aux.page_count; PRAGMA aux.freelist_count; PRAGMA aux.integrity_check",
+            data("aux", 120)
+        ),
+        // INCREMENTAL: PRAGMA aux.incremental_vacuum(N); the
+        // unqualified pragma runs on main (not auto-vacuum).
+        format!(
+            "ATTACH '{{d}}/aux.db' AS aux; PRAGMA aux.auto_vacuum = 2; {}; \
+             DELETE FROM aux.t WHERE a % 2 = 0; PRAGMA aux.freelist_count; PRAGMA aux.incremental_vacuum(5); \
+             PRAGMA aux.freelist_count; PRAGMA aux.page_count; PRAGMA incremental_vacuum; \
+             PRAGMA aux.freelist_count; PRAGMA aux.incremental_vacuum; PRAGMA aux.page_count; \
+             PRAGMA aux.freelist_count",
+            data("aux", 150)
+        ),
+        // A transaction across main and a FULL aux: the aux file is
+        // truncated inside the super-journal commit.
+        format!(
+            "ATTACH '{{d}}/aux.db' AS aux; PRAGMA aux.auto_vacuum = 1; {}; CREATE TABLE m(x); \
+             BEGIN; INSERT INTO m VALUES (1); DELETE FROM aux.t WHERE a > 40; PRAGMA aux.page_count; \
+             COMMIT; PRAGMA aux.page_count; PRAGMA aux.freelist_count; SELECT count(*) FROM aux.t; \
+             BEGIN; INSERT INTO m VALUES (2); DELETE FROM aux.t WHERE a > 10; ROLLBACK; \
+             PRAGMA aux.page_count; SELECT count(*) FROM aux.t; SELECT * FROM m",
+            data("aux", 150)
+        ),
+        // Both files auto-vacuum, different modes, savepoints across.
+        format!(
+            "PRAGMA auto_vacuum = 1; ATTACH '{{d}}/aux.db' AS aux; PRAGMA aux.auto_vacuum = 2; {}; {}; \
+             SAVEPOINT s; DELETE FROM main.t WHERE a % 3 = 0; DELETE FROM aux.t WHERE a % 3 = 1; \
+             PRAGMA aux.incremental_vacuum(4); SAVEPOINT r; DROP TABLE main.t; ROLLBACK TO r; \
+             RELEASE s; PRAGMA main.page_count; PRAGMA main.freelist_count; PRAGMA aux.page_count; \
+             PRAGMA aux.freelist_count; SELECT count(*) FROM main.t; SELECT count(*) FROM aux.t",
+            data("main", 100),
+            data("aux", 100)
+        ),
+        // VACUUM aux keeps its mode; a pending change is applied by
+        // it; VACUUM aux INTO a new file.
+        format!(
+            "ATTACH '{{d}}/aux.db' AS aux; PRAGMA aux.auto_vacuum = 2; {}; DELETE FROM aux.t WHERE a < 60; \
+             VACUUM aux; PRAGMA aux.auto_vacuum; PRAGMA aux.page_count; PRAGMA aux.freelist_count; \
+             VACUUM aux INTO '{{d}}/copy.db'; PRAGMA aux.auto_vacuum = 0; PRAGMA aux.auto_vacuum; \
+             VACUUM aux; PRAGMA aux.auto_vacuum; PRAGMA aux.page_count; \
+             ATTACH '{{d}}/copy.db' AS c; PRAGMA c.auto_vacuum; PRAGMA c.page_count; \
+             SELECT count(*) FROM c.t",
+            data("aux", 120)
+        ),
+        // A plain aux turned auto-vacuum by VACUUM.
+        format!(
+            "ATTACH '{{d}}/aux.db' AS aux; {}; PRAGMA aux.auto_vacuum = 1; PRAGMA aux.auto_vacuum; \
+             VACUUM aux; PRAGMA aux.auto_vacuum; CREATE TABLE aux.u(c); DROP TABLE aux.t; \
+             PRAGMA aux.page_count; PRAGMA aux.freelist_count",
+            data("aux", 80)
+        ),
+    ];
+    for (i, s) in cases.iter().enumerate() {
+        let mut fs = files.to_vec();
+        if s.contains("copy.db") {
+            fs.push("copy.db");
+        }
+        attached_twin(&format!("{i}"), s, &fs);
     }
 }

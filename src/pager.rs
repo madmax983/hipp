@@ -1521,6 +1521,17 @@ impl<S: Storage> Pager<S> {
                 CommitStage::SyncData => {
                     let want = u64::from(self.header.page_count) * u64::from(self.header.page_size);
                     let cur = self.storage.len().await.map_err(Error::Storage)?;
+                    // An auto-vacuum file that shrank is truncated
+                    // only once the journal is gone (v0.16,
+                    // `autovacuum`; the pin's `pager_end_transaction`):
+                    // until then the cut-off pages are on disk for a
+                    // rollback, so none of them needs a journal record.
+                    #[cfg(feature = "autovacuum")]
+                    let cur = if cur > want && self.ptrmaps {
+                        want
+                    } else {
+                        cur
+                    };
                     if cur != want {
                         self.storage.set_len(want).await.map_err(Error::Storage)?;
                     }
@@ -1543,6 +1554,21 @@ impl<S: Storage> Pager<S> {
                 CommitStage::DeleteJournal => {
                     let sidecar = self.sidecar.as_mut().expect("sidecar from open");
                     sidecar.delete().await.map_err(Error::Storage)?;
+                    // The deferred truncation of a shrunk auto-vacuum
+                    // file (v0.16, `autovacuum`; see `SyncData`). The
+                    // commit point has passed, so it is best effort: a
+                    // longer file is still valid (its header gives the
+                    // page count, as the pin's does after a crash here).
+                    #[cfg(feature = "autovacuum")]
+                    if self.ptrmaps {
+                        let want =
+                            u64::from(self.header.page_count) * u64::from(self.header.page_size);
+                        if let Ok(cur) = self.storage.len().await
+                            && cur > want
+                        {
+                            let _ = self.storage.set_len(want).await;
+                        }
+                    }
                     // Commit point passed. Clean up.
                     for f in self.frames.iter_mut() {
                         f.dirty = false;
@@ -1743,6 +1769,22 @@ impl<S: Storage> Pager<S> {
         let Some(top) = self.sp.as_slice().last() else {
             return Ok(());
         };
+        // The file only grows within a transaction, so the newest
+        // savepoint's size is the largest — except in an auto-vacuum
+        // file, where `PRAGMA incremental_vacuum` shrinks it (v0.16,
+        // `autovacuum`): a page past the newest savepoint's size but
+        // within an older one's is still recorded (the pin's
+        // `subjRequiresPage` asks every savepoint).
+        #[cfg(feature = "autovacuum")]
+        if self
+            .sp
+            .as_slice()
+            .iter()
+            .all(|m| page > m.header.page_count)
+        {
+            return Ok(());
+        }
+        #[cfg(not(feature = "autovacuum"))]
         if page > top.header.page_count {
             return Ok(());
         }
@@ -1758,7 +1800,17 @@ impl<S: Storage> Pager<S> {
         let copy = self.wal.is_some();
         #[cfg(not(feature = "wal"))]
         let copy = false;
-        let off = if copy || self.dirty.contains(&page) || page > self.orig_page_count {
+        // A page journaled but no longer in the write set (a cut-off
+        // page `sp_rollback` let go, v0.16 `autovacuum`) gets no new
+        // journal record, so its image is copied too.
+        #[cfg(feature = "autovacuum")]
+        let own = copy
+            || self.journaled.contains(&page)
+            || self.dirty.contains(&page)
+            || page > self.orig_page_count;
+        #[cfg(not(feature = "autovacuum"))]
+        let own = copy || self.dirty.contains(&page) || page > self.orig_page_count;
+        let off = if own {
             let ps = u64::from(self.header.page_size);
             #[cfg(feature = "wal")]
             if copy && self.sub_off == 0 {
@@ -1885,6 +1937,33 @@ impl<S: Storage> Pager<S> {
             return Ok(());
         };
         let (start, hdr) = (m.sub_len, m.header);
+        // The last page kept: this savepoint's size, or (v0.16,
+        // `autovacuum`) an older savepoint's when larger — `PRAGMA
+        // incremental_vacuum` shrinks the file, and a page past this
+        // savepoint's end but within an older one's keeps its image
+        // (restored here, left in the cache) for a later `ROLLBACK
+        // TO` that older savepoint; the commit drops it with the rest
+        // of the cut-off tail.
+        #[cfg(feature = "autovacuum")]
+        let keep = self
+            .sp
+            .as_slice()
+            .get(..=level)
+            .unwrap_or(&[])
+            .iter()
+            .fold(hdr.page_count, |a, m| a.max(m.header.page_count));
+        #[cfg(feature = "autovacuum")]
+        macro_rules! keep {
+            () => {
+                keep
+            };
+        }
+        #[cfg(not(feature = "autovacuum"))]
+        macro_rules! keep {
+            () => {
+                hdr.page_count
+            };
+        }
         let ps = self.header.page_size as usize;
         let mut done: AVec<u32> = AVec::new();
         let mut buf: AVec<u8> = AVec::with_capacity(ps);
@@ -1893,7 +1972,7 @@ impl<S: Storage> Pager<S> {
         while let Some(rec) = self.sub.as_slice().get(i) {
             i += 1;
             let page = rec.page;
-            if page > hdr.page_count || done.as_slice().contains(&page) {
+            if page > keep!() || done.as_slice().contains(&page) {
                 continue;
             }
             done.push(page);
@@ -1914,12 +1993,12 @@ impl<S: Storage> Pager<S> {
             }
         }
         for f in self.frames.iter_mut() {
-            if f.page > hdr.page_count {
+            if f.page > keep!() {
                 f.page = 0;
                 f.dirty = false;
             }
         }
-        self.dirty.retain(|p| *p <= hdr.page_count);
+        self.dirty.retain(|p| *p <= keep!());
         self.header = hdr;
         self.sub.truncate(start);
         self.sp.truncate(level + 1);
@@ -2077,8 +2156,10 @@ impl<S: Storage> Pager<S> {
     /// file): the lock-byte page is skipped, and a pointer-map
     /// position becomes a zeroed pointer-map page with the page
     /// after it allocated. A page an earlier truncation of this
-    /// transaction cut off is reused fresh (its images were kept by
-    /// `keep_tail`).
+    /// transaction cut off (`PRAGMA incremental_vacuum`) still holds
+    /// what a rollback or `ROLLBACK TO` restores, so it is journaled
+    /// and recorded for the savepoints before it is reused
+    /// ([`Pager::grow_frame`]).
     #[cfg(feature = "autovacuum")]
     pub async fn grow_page(&mut self) -> Result<(u32, usize), S::Error> {
         self.begin_write().await?;
@@ -2094,32 +2175,38 @@ impl<S: Storage> Pager<S> {
         }
         if crate::autovac::is_ptrmap(usable, ps, page) {
             self.header.page_count = page;
-            self.fresh_frame(page).await?;
+            self.grow_frame(page).await?;
             page += 1;
             if page == pend {
                 page += 1;
             }
         }
         self.header.page_count = page;
-        self.fresh_frame(page).await
+        self.grow_frame(page).await
     }
 
-    /// Before the file shrinks to `n` pages (v0.16, `autovacuum`):
-    /// every page past `n` keeps its image for a rollback (the
-    /// journal) and a `ROLLBACK TO` (the sub-journal), as the pin
-    /// journals a truncated tail before it commits.
+    /// A zeroed, dirty frame for `page`, which `grow_page` just
+    /// counted back into the file (v0.16, `autovacuum`). A page past
+    /// the transaction's original size that it never wrote is new
+    /// (`fresh_frame`: nothing to keep). Any other was cut off the
+    /// end earlier in this transaction, and the file still holds its
+    /// image — truncation waits for the commit (`DeleteJournal`) —
+    /// so it goes through `dirty_page` (journal record, savepoint
+    /// record) first. This is the only place a cut-off page is
+    /// written again; a page cut off and never reused needs no
+    /// journal record at all (the pin's rule: its free leaves are
+    /// fetched without content, its truncation follows the
+    /// journal's deletion).
     #[cfg(feature = "autovacuum")]
-    pub async fn keep_tail(&mut self, n: u32) -> Result<(), S::Error> {
-        let mut p = n.saturating_add(1);
-        while p <= self.header.page_count {
-            let idx = self.load(p).await?;
-            self.sp_note(p, idx).await?;
-            if !self.frames[idx].dirty {
-                self.journal_original(p, idx).await?;
+    async fn grow_frame(&mut self, page: u32) -> Result<(u32, usize), S::Error> {
+        if page <= self.orig_page_count || self.dirty.contains(&page) {
+            let idx = self.dirty_page(page).await?;
+            for b in self.frames[idx].data.iter_mut() {
+                *b = 0;
             }
-            p += 1;
+            return Ok((page, idx));
         }
-        Ok(())
+        self.fresh_frame(page).await
     }
 
     /// The next salt bits for the log (v0.16, `wal`): the nonce

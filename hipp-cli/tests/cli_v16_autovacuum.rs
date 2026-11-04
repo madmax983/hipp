@@ -207,3 +207,64 @@ fn pin_file_written_by_hipp() {
         assert_eq!(run(&oracle(), &a, "PRAGMA integrity_check;"), b"ok\n");
     }
 }
+
+/// An auto-vacuum file as an attached database, and the integrity
+/// check inside an open transaction (v0.16 review fixes): one batch
+/// per engine in its own directory (`{d}`), byte-identical.
+const ATTACHED: &str = r#"
+ATTACH '{d}/aux.db' AS aux;
+PRAGMA aux.auto_vacuum = INCREMENTAL;
+PRAGMA aux.auto_vacuum;
+CREATE TABLE aux.t(a INTEGER PRIMARY KEY, b);
+INSERT INTO aux.t WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 60) SELECT v, zeroblob(1500) FROM s;
+CREATE TABLE aux.u(c);
+DELETE FROM aux.t WHERE a > 20;
+PRAGMA aux.freelist_count;
+PRAGMA aux.incremental_vacuum(2);
+SELECT 'after 2';
+BEGIN;
+DELETE FROM aux.t WHERE a > 10;
+PRAGMA aux.integrity_check;
+PRAGMA aux.incremental_vacuum;
+PRAGMA aux.integrity_check;
+COMMIT;
+PRAGMA aux.page_count;
+PRAGMA aux.freelist_count;
+DROP TABLE aux.t;
+SELECT name, rootpage FROM aux.sqlite_schema;
+PRAGMA aux.page_count;
+PRAGMA aux.auto_vacuum = FULL;
+CREATE TABLE aux.v(d);
+INSERT INTO aux.v SELECT zeroblob(4000) FROM aux.u UNION ALL SELECT zeroblob(9000);
+DELETE FROM aux.v;
+PRAGMA aux.page_count;
+PRAGMA aux.freelist_count;
+"#;
+
+#[test]
+fn attached_file() {
+    let a = temp_db("attached-hipp");
+    let b = temp_db("attached-ora");
+    let batch = |db: &Path| {
+        let d = db.parent().expect("dir").to_string_lossy().to_string();
+        ATTACHED.replace("{d}", &d)
+    };
+    let got = run(&hipp_bin(), &a, &batch(&a));
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(&run(&oracle(), &b, &batch(&b))),
+        "attached"
+    );
+    assert!(!got.is_empty());
+    let aux = a.parent().expect("dir").join("aux.db");
+    assert_eq!(run(&oracle(), &aux, "PRAGMA integrity_check;"), b"ok\n");
+    let (a2, b2) = (
+        temp_db("attached-hipp-stdin"),
+        temp_db("attached-ora-stdin"),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_stdin(&hipp_bin(), &a2, &batch(&a2))),
+        String::from_utf8_lossy(&run_stdin(&oracle(), &b2, &batch(&b2))),
+        "attached (stdin)"
+    );
+}

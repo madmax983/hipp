@@ -461,7 +461,16 @@ fn crash_matrix(tag: &str, cfg: Config, setup: &[String], txn: &[String]) {
                 );
                 saw_pre = true;
             } else if bytes != post_bytes {
-                panic!("{tag} k={k}/{total_ops}: torn file");
+                // A shrinking auto-vacuum commit truncates the file
+                // after the journal's deletion, its commit point (the
+                // pin's order): a crash in between leaves the
+                // committed image followed by the old tail, which the
+                // header's page count excludes.
+                let tail_only = bytes.len() > post_bytes.len()
+                    && bytes.starts_with(&post_bytes)
+                    && mem.journal_snapshot().is_none()
+                    && post_bytes.get(52..56).is_some_and(|b| b != [0; 4]);
+                assert!(tail_only, "{tag} k={k}/{total_ops}: torn file");
             }
         }
         assert!(saw_pre, "{tag}: a crash before the commit point restores");
@@ -1195,6 +1204,13 @@ fn image_to_disk(img: &multi::Image) {
 
 #[cfg(feature = "attach")]
 fn multi_crash_matrix(tag: &str, txn: &[&str]) {
+    multi_crash_matrix_with(tag, &[], &[], txn);
+}
+
+/// [`multi_crash_matrix`] with statements run before (`first`) and
+/// after (`then`) its setup.
+#[cfg(feature = "attach")]
+fn multi_crash_matrix_with(tag: &str, first: &[&str], then: &[&str], txn: &[&str]) {
     use multi::*;
     let dir =
         std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hipp-crash-mj-{tag}"));
@@ -1207,6 +1223,7 @@ fn multi_crash_matrix(tag: &str, txn: &[&str]) {
         let fs = Rc::new(RefCell::new(Fs::default()));
         {
             let mut db = open_all(&fs, &st, &root).await;
+            run_all(&mut db, &strs(first)).await;
             run_all(
                 &mut db,
                 &strs(&[
@@ -1219,6 +1236,7 @@ fn multi_crash_matrix(tag: &str, txn: &[&str]) {
                 ]),
             )
             .await;
+            run_all(&mut db, &strs(then)).await;
         }
         let pre = image(&fs);
         let pre_rows = {
@@ -1274,11 +1292,27 @@ fn multi_crash_matrix(tag: &str, txn: &[&str]) {
                         "{tag} k={k}: pre-image bytes"
                     );
                 } else {
+                    // A shrinking auto-vacuum file is truncated after
+                    // its journal's deletion: a crash in between leaves
+                    // the committed image followed by the old tail.
+                    let same = |a: &Vec<u8>, b: &Vec<u8>| {
+                        a == b
+                            || (a.len() > b.len()
+                                && a.starts_with(b)
+                                && b.get(52..56).is_some_and(|x| x != [0; 4]))
+                    };
                     assert_eq!(
-                        rec.0.iter().map(|(k, v)| (k, &v.0)).collect::<Vec<_>>(),
-                        post.0.iter().map(|(k, v)| (k, &v.0)).collect::<Vec<_>>(),
-                        "{tag} k={k}: post-image bytes"
+                        rec.0.keys().collect::<Vec<_>>(),
+                        post.0.keys().collect::<Vec<_>>(),
+                        "{tag} k={k}: files"
                     );
+                    for (name, (bytes, _)) in rec.0.iter() {
+                        let want = &post.0[name].0;
+                        assert!(
+                            same(bytes, want),
+                            "{tag} k={k}: {name:?}'s post-image bytes"
+                        );
+                    }
                 }
                 assert!(
                     rec.0.values().all(|(_, j)| j.is_none()),
@@ -1353,6 +1387,44 @@ fn v16_crash_three_databases_and_savepoints() {
             "INSERT INTO b.w VALUES (3, printf('%.3000c', 'w'))",
             "UPDATE t SET x = (SELECT group_concat(x) FROM a.u)",
             "RELEASE s",
+        ],
+    );
+}
+
+/// An auto-vacuum attached file in a multi-database commit (v0.16
+/// `autovacuum` with `attach`): a FULL file's page moves and its
+/// truncation, and an INCREMENTAL file's `PRAGMA incremental_vacuum`,
+/// inside the super-journal commit.
+#[cfg(all(feature = "attach", feature = "autovacuum"))]
+#[test]
+fn v16_crash_multi_database_auto_vacuum() {
+    let fill = "INSERT INTO a.u WITH RECURSIVE c(i) AS (SELECT 2 UNION ALL \
+                SELECT i + 1 FROM c WHERE i < 61) SELECT i, printf('%.2000c', 'u') FROM c";
+    multi_crash_matrix_with(
+        "av-full",
+        &["PRAGMA a.auto_vacuum = FULL"],
+        &[
+            fill,
+            "CREATE TABLE a.k (y)",
+            "INSERT INTO a.k VALUES (printf('%.5000c', 'k'))",
+        ],
+        &[
+            "BEGIN",
+            "INSERT INTO t VALUES (2, 'two')",
+            "DELETE FROM a.u WHERE id > 1",
+            "COMMIT",
+        ],
+    );
+    multi_crash_matrix_with(
+        "av-inc",
+        &["PRAGMA a.auto_vacuum = INCREMENTAL"],
+        &[fill, "DELETE FROM a.u WHERE id > 1"],
+        &[
+            "BEGIN",
+            "INSERT INTO t VALUES (2, 'two')",
+            "INSERT INTO b.w VALUES (2, 'two')",
+            "PRAGMA a.incremental_vacuum",
+            "COMMIT",
         ],
     );
 }
@@ -1680,4 +1752,83 @@ fn v16_crash_incremental_vacuum() {
         crash_matrix(&format!("av-{tag}"), Config::default(), &setup, &txn);
         pin_recovers_autovacuum(tag, &setup, &txn);
     }
+}
+
+/// Storage operations (writes, syncs, truncations, deletions) `txn`
+/// takes after `setup`.
+#[cfg(feature = "autovacuum")]
+fn ops_of(setup: &[String], txn: &[String]) -> usize {
+    block_on(async {
+        let mem = MemStorage::new();
+        {
+            let mut db = Connection::open(mem.clone(), Config::default())
+                .await
+                .expect("open");
+            run_all(&mut db, setup).await;
+        }
+        let cs = crash_storage(mem);
+        let mut db = Connection::open(cs.clone(), Config::default())
+            .await
+            .expect("open");
+        let before = cs.ops();
+        run_all(&mut db, txn).await;
+        drop(db);
+        cs.ops() - before
+    })
+}
+
+/// Pages cut off the end of an auto-vacuum file get no journal
+/// record (v0.16 review fix: every page past the new end was
+/// journaled, free leaves included, so dropping a large table or
+/// `PRAGMA incremental_vacuum` after a large delete wrote a journal
+/// as large as the freed data; the pin writes a handful of pages).
+/// The truncation now follows the journal's deletion, as on the
+/// pin, and a cut-off page the transaction grows back into is
+/// journaled when it is reused. Every kill point still recovers.
+#[cfg(feature = "autovacuum")]
+#[test]
+fn v16_crash_autovacuum_cut_pages_not_journaled() {
+    let setup = |mode: &str| {
+        vec![
+            format!("PRAGMA auto_vacuum = {mode}"),
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)".to_string(),
+            rows_sql("t", 1, 5, 50),
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, x TEXT)".to_string(),
+            rows_sql("a", 1, 300, 3000),
+            "CREATE TABLE z (q)".to_string(),
+            "INSERT INTO z VALUES (2)".to_string(),
+        ]
+    };
+    // About 300 pages are cut each time: three operations per
+    // journal record would be some 900.
+    let full = setup("FULL");
+    let drop = strs(&["DROP TABLE a"]);
+    let n = ops_of(&full, &drop);
+    assert!(n < 60, "FULL DROP TABLE: {n} storage operations");
+    crash_matrix("av-cut-full-drop", Config::default(), &full, &drop);
+    pin_recovers_autovacuum("cut-full-drop", &full, &drop);
+    let mut inc = setup("INCREMENTAL");
+    inc.push("DELETE FROM a".to_string());
+    let vac = strs(&["PRAGMA incremental_vacuum"]);
+    let n = ops_of(&inc, &vac);
+    assert!(n < 60, "incremental_vacuum: {n} storage operations");
+    crash_matrix("av-cut-inc", Config::default(), &inc, &vac);
+    pin_recovers_autovacuum("cut-inc", &inc, &vac);
+    // Cut, then grown back into within the transaction: the reused
+    // pages' originals are journaled before they change.
+    let regrow = vec![
+        "BEGIN".to_string(),
+        "PRAGMA incremental_vacuum".to_string(),
+        rows_sql("t", 100, 40, 3000),
+        "COMMIT".to_string(),
+    ];
+    crash_matrix("av-cut-regrow", Config::default(), &inc, &regrow);
+    pin_recovers_autovacuum("cut-regrow", &inc, &regrow);
+    // The same in FULL mode: a large delete whose commit moves the
+    // pages after the freed ones back and truncates.
+    let mut full2 = full.clone();
+    full2.push(rows_sql("z", 10, 30, 3000).replace("SELECT i, printf", "SELECT printf"));
+    let del = strs(&["DELETE FROM a WHERE id > 20"]);
+    crash_matrix("av-cut-full-move", Config::default(), &full2, &del);
+    pin_recovers_autovacuum("cut-full-move", &full2, &del);
 }

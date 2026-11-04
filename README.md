@@ -816,13 +816,20 @@ aspirations.
   header at once, the mode surviving a ROLLBACK as on the pin),
   switches FULL and INCREMENTAL in place, and leaves a change to or
   from NONE to VACUUM, which (VACUUM INTO too) otherwise keeps the
-  mode. Root pages, page counts and pointer maps match the pin's
-  where its page choice is deterministic; each engine writes the
-  other's files, integrity checks pass both ways, and crashes
-  during the page moves or incremental_vacuum recover (in hipp and
-  in the pin) to the last commit. Ungated: freelist trunks hold the
-  pin's `usable/4 - 8` leaves. Without the leaf such files stay read
-  only (`AutoVacuumUnsupported`).
+  mode. The moves this leaf owns — root placement, DROP, FULL's
+  commit, incremental_vacuum — choose the pin's pages, so given the
+  same tree shapes the root pages, page counts and pointer maps are
+  the pin's; where hipp's general B-tree shapes trees differently
+  (delete merging, index splits, ALTER, UPDATE resizing rows,
+  REINDEX) page counts can differ, with the same contents and valid
+  maps. Each engine writes the other's files (attached ones too),
+  integrity checks pass both ways (inside a transaction as well),
+  and crashes during the page moves or incremental_vacuum recover
+  (in hipp and in the pin) to the last commit. As on the pin, pages
+  cut off the end get no journal record: the file is truncated only
+  after the journal is deleted. Ungated: freelist trunks hold the
+  pin's `usable/4 - 8` leaves. Without the leaf such files stay
+  read only (`AutoVacuumUnsupported`).
 
 ## What v0.13 does
 

@@ -373,6 +373,24 @@ pub async fn write_map<S: Storage>(pager: &mut Pager<S>, map: &Map) -> Result<()
     Ok(())
 }
 
+/// Bring the pointer-map pages up to date inside an open write
+/// transaction (`PRAGMA integrity_check`, which the pin answers from
+/// its always-current map; v0.16 review fix: hipp writes the derived
+/// map only at commit, so a check before `COMMIT` reported every
+/// entry the transaction had changed). Outside a write transaction
+/// the maps on disk are the committed ones and are left alone, so a
+/// damaged map is still reported; a file whose structure cannot be
+/// walked keeps its map for the check to report.
+pub async fn refresh_map<S: Storage>(pager: &mut Pager<S>) -> Result<(), S::Error> {
+    if !pager.autovac() || pager.stage() != crate::pager::CommitStage::Writing {
+        return Ok(());
+    }
+    match derive(pager).await {
+        Ok(map) => write_map(pager, &map).await,
+        Err(_) => Ok(()),
+    }
+}
+
 /// The largest root page (header offset 52).
 pub async fn largest_root<S: Storage>(pager: &mut Pager<S>) -> Result<u32, S::Error> {
     ensure_header(pager).await?;
@@ -407,8 +425,9 @@ fn abs32(x: i32) -> i32 {
 }
 
 /// The pin's `allocateBtreePage`: a page off the freelist (`nearby`
-/// and `mode` choosing which), else one more page at the end. The
-/// page is made writable; its content is the caller's to set.
+/// and `mode` choosing which), else one more page at the end. A
+/// trunk or a new page comes back writable; a freelist leaf is the
+/// caller's to make writable (see below).
 async fn allocate<S: Storage>(
     pager: &mut Pager<S>,
     map: &Map,
@@ -513,7 +532,11 @@ async fn allocate<S: Storage>(
                     put_be_u32(td, 8 + 4 * closest as usize, last);
                 }
                 put_be_u32(td, 4, k - 1);
-                pager.dirty_page(page).await?;
+                // The leaf itself is not made writable: every caller
+                // either writes it (`relocate`, `alloc_root`, through
+                // `dirty_page`) or cuts it off the end of the file
+                // (`incr_vacuum_step`), where its image needs no
+                // journal record (the pin fetches it without content).
                 return Ok(page);
             }
         }
@@ -706,7 +729,6 @@ async fn incr_vacuum_step<S: Storage>(
                 break;
             }
         }
-        pager.keep_tail(l).await?;
         pager.header_mut().page_count = l;
     }
     Ok(true)
@@ -738,7 +760,6 @@ pub async fn pre_commit<S: Storage>(pager: &mut Pager<S>) -> Result<(), S::Error
                 }
                 i -= 1;
             }
-            pager.keep_tail(fin).await?;
             let h = pager.header_mut();
             h.freelist_trunk = 0;
             h.freelist_count = 0;
