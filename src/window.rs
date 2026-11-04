@@ -52,7 +52,7 @@ use crate::agg::SumCtx;
 use crate::arena::AVec;
 use crate::error::SchemaKind;
 use crate::query::{AggKind, RExpr, truthy};
-use crate::record::{Affinity, OwnedValue, apply_affinity, compare_coll, compare_values};
+use crate::record::{Affinity, OwnedValue, apply_affinity, compare_values};
 use crate::sql::ast::{FrameExclude, FrameUnit};
 use crate::sql::{BinOp, SortOrder};
 
@@ -730,6 +730,7 @@ pub fn children(e: &RExpr) -> &[RExpr] {
 pub fn compute(
     calls: &[&RExpr],
     inputs: &[AVec<AVec<OwnedValue>>],
+    enc: crate::record::TextEnc,
 ) -> Result<(AVec<usize>, AVec<AVec<OwnedValue>>), SchemaKind> {
     let n = inputs.len();
     let mut perm: AVec<usize> = AVec::with_capacity(n);
@@ -792,7 +793,7 @@ pub fn compute(
                 .unwrap_or(&[])
         };
         let cmp = |a: usize, b: usize| {
-            crate::query::order_keys_cmp(keys(a), keys(b), dirs.iter().copied())
+            crate::query::order_keys_cmp(keys(a), keys(b), dirs.iter().copied(), enc)
         };
         crate::agg::sort_stable(&mut perm, &|a, b| cmp(a, b) != core::cmp::Ordering::Greater);
         // Partitions: runs of rows with equal partition keys.
@@ -805,7 +806,7 @@ pub fn compute(
             while let Some(&u) = perm.as_slice().get(hi) {
                 let a = keys(first).get(..npart).unwrap_or(&[]);
                 let b = keys(u).get(..npart).unwrap_or(&[]);
-                if crate::query::order_keys_cmp(a, b, dirs.iter().copied())
+                if crate::query::order_keys_cmp(a, b, dirs.iter().copied(), enc)
                     != core::cmp::Ordering::Equal
                 {
                     break;
@@ -821,6 +822,7 @@ pub fn compute(
                 inputs,
                 rows,
                 &mut res,
+                enc,
             )?;
             lo = hi;
         }
@@ -839,6 +841,7 @@ fn run_partition(
     inputs: &[AVec<AVec<OwnedValue>>],
     rows: &[usize],
     res: &mut AVec<AVec<OwnedValue>>,
+    enc: crate::record::TextEnc,
 ) -> Result<(), SchemaKind> {
     let mut okeys: AVec<&[OwnedValue]> = AVec::with_capacity(rows.len());
     for &u in rows {
@@ -864,7 +867,8 @@ fn run_partition(
         let (Some(x), Some(y)) = (okeys.as_slice().get(a), okeys.as_slice().get(b)) else {
             return false;
         };
-        crate::query::order_keys_cmp(x, y, rc.order.iter().copied()) == core::cmp::Ordering::Equal
+        crate::query::order_keys_cmp(x, y, rc.order.iter().copied(), enc)
+            == core::cmp::Ordering::Equal
     };
     for p in 0..rows.len() {
         if p == 0 || !peers(p, p - 1) {
@@ -882,6 +886,7 @@ fn run_partition(
         order: rc.order.as_slice(),
         gno: gno.as_slice(),
         gbounds: gbounds.as_slice(),
+        enc,
     };
     let full = rc.frame.exclude != FrameExclude::None;
     let mut sink = |ev: Ev| -> Result<(), SchemaKind> {
@@ -892,6 +897,7 @@ fn run_partition(
     };
     let mut sim = Sim {
         frame: &rc.frame,
+        enc,
         order: rc.order.as_slice(),
         keys: okeys.as_slice(),
         offsets: (
@@ -939,6 +945,8 @@ struct Part<'a> {
     /// Each position's peer group, and each group's bounds.
     gno: &'a [usize],
     gbounds: &'a [(usize, usize)],
+    /// The database's text encoding (its BINARY order).
+    enc: crate::record::TextEnc,
 }
 
 impl Part<'_> {
@@ -956,7 +964,8 @@ impl Part<'_> {
         let (Some(x), Some(y)) = (self.keys.get(a), self.keys.get(b)) else {
             return false;
         };
-        crate::query::order_keys_cmp(x, y, self.order.iter().copied()) == core::cmp::Ordering::Equal
+        crate::query::order_keys_cmp(x, y, self.order.iter().copied(), self.enc)
+            == core::cmp::Ordering::Equal
     }
 
     /// The peer group of `pos`: (number, first, one past last).
@@ -1031,6 +1040,8 @@ impl Cmp {
 /// positions; `None` is a cursor that ran off the buffer.
 struct Sim<'a> {
     frame: &'a WinFrame,
+    /// The database's text encoding (its BINARY order).
+    enc: crate::record::TextEnc,
     order: &'a [SortOrder],
     keys: &'a [&'a [OwnedValue]],
     /// The start / end offsets' values (None: no offset).
@@ -1069,7 +1080,8 @@ impl Sim<'_> {
         let (Some(x), Some(y)) = (self.keys.get(a), self.keys.get(b)) else {
             return false;
         };
-        crate::query::order_keys_cmp(x, y, self.order.iter().copied()) == core::cmp::Ordering::Equal
+        crate::query::order_keys_cmp(x, y, self.order.iter().copied(), self.enc)
+            == core::cmp::Ordering::Equal
     }
 
     /// Check and load the offsets (the partition's first row).
@@ -1433,7 +1445,12 @@ impl Sim<'_> {
             let bop = if sub { BinOp::Sub } else { BinOp::Add };
             a = crate::query::arith_values::<()>(bop, a, v).unwrap_or(OwnedValue::Null);
         }
-        op.holds(compare_coll(&a.as_value(), &b.as_value(), o.coll))
+        op.holds(crate::record::compare_coll_in(
+            &a.as_value(),
+            &b.as_value(),
+            o.coll,
+            self.enc,
+        ))
     }
 }
 
@@ -1622,7 +1639,12 @@ impl<'a> Member<'a> {
                     let better = match &self.best {
                         None => true,
                         Some(b) => {
-                            let o = compare_coll(&x.as_value(), &b.as_value(), coll);
+                            let o = crate::record::compare_coll_in(
+                                &x.as_value(),
+                                &b.as_value(),
+                                coll,
+                                part.enc,
+                            );
                             if kind == AggKind::Max {
                                 o == core::cmp::Ordering::Greater
                             } else {
@@ -1672,7 +1694,7 @@ impl<'a> Member<'a> {
             }
             rows.push(r);
         }
-        crate::agg::fold::<()>(&p, rows).map_err(|e| match e {
+        crate::agg::fold::<()>(&p, rows, part.enc).map_err(|e| match e {
             crate::error::Error::Schema { kind } => kind,
             _ => SchemaKind::IntegerOverflow,
         })
@@ -1696,7 +1718,12 @@ impl<'a> Member<'a> {
             let take = match &best {
                 None => true,
                 Some(b) => {
-                    let o = compare_coll(&v.as_value(), &b.as_value(), coll);
+                    let o = crate::record::compare_coll_in(
+                        &v.as_value(),
+                        &b.as_value(),
+                        coll,
+                        part.enc,
+                    );
                     let o = if max { o } else { o.reverse() };
                     match o {
                         core::cmp::Ordering::Greater => true,

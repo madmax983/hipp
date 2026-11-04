@@ -228,7 +228,7 @@ fn encode_with<F: Fn(i64) -> u64>(values: &[Value<'_>], out: &mut AVec<u8>, int_
     }
 }
 
-fn varint_size(v: u64) -> usize {
+pub(crate) fn varint_size(v: u64) -> usize {
     let mut n = 1;
     let mut x = v >> 7;
     while x > 0 {
@@ -459,6 +459,43 @@ pub fn compare_coll(a: &Value<'_>, b: &Value<'_>, coll: Coll) -> core::cmp::Orde
         (Value::Text(x), Value::Text(y)) => compare_text(x, y, coll),
         _ => compare_values(a, b),
     }
+}
+
+/// A database's text encoding (header offset 56; v0.16). Without
+/// the `utf16` leaf only UTF-8 exists: a UTF-16 file is refused at
+/// open (`Error::UnsupportedEncoding`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextEnc {
+    #[default]
+    Utf8,
+    /// Header value 2 (v0.16, `utf16`).
+    #[cfg(feature = "utf16")]
+    Utf16le,
+    /// Header value 3 (v0.16, `utf16`).
+    #[cfg(feature = "utf16")]
+    Utf16be,
+}
+
+/// `compare_coll` in a database of encoding `enc` (v0.16): in a
+/// UTF-16 database the BINARY collation compares the UTF-16 bytes
+/// (`utf16::cmp`), as the pin's memcmp over its stored text does.
+/// NOCASE and RTRIM compare the UTF-8 form in every encoding (the
+/// pin defines them for UTF-8 only and converts).
+#[inline(always)]
+pub fn compare_coll_in(
+    a: &Value<'_>,
+    b: &Value<'_>,
+    coll: Coll,
+    enc: TextEnc,
+) -> core::cmp::Ordering {
+    #[cfg(feature = "utf16")]
+    if let (Value::Text(x), Value::Text(y), Coll::Binary, Some(be)) =
+        (a, b, coll, crate::utf16::byte_order(enc))
+    {
+        return crate::utf16::cmp(x, y, be);
+    }
+    let _ = enc;
+    compare_coll(a, b, coll)
 }
 
 /// One index key column's ordering (v0.16): its direction and

@@ -5658,6 +5658,160 @@ functions (`pragma_index_info('x')` and the others) do not see TEMP
 objects (they read only `main`); this predates the unit and affects
 rowid tables too. The unit's earlier gaps stand.
 
+### UTF-16 databases (2026-11-04)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `utf16` (`utf16 = ["v16"]`,
+in `max`, not `full`; `v16,utf16` in `ci/feature-sets.txt`). Without
+it a file whose header text encoding is 2 or 3 is refused at open
+with `Error::UnsupportedEncoding` exactly as before (unit test
+`pager::tests::utf16_header` runs in the `full` lib tests; the
+`differential.rs` a7 check is gated), and `PRAGMA encoding =
+'UTF-16...'` on an empty database is still that error.
+
+**Design.** Text stays UTF-8 inside the engine. A UTF-16 file's
+records are translated at the B-tree boundary
+(`utf16::transcode_record`): `btree::assemble_payload_into` — the
+one path every table row and index key is read through — turns its
+TEXT values into the pin's UTF-8 form, and `btree_insert` /
+`index_insert_core` / the index-delete predecessor cell turn them
+back into the file's UTF-16 (serial types counting UTF-16 bytes), so
+everything above (catalog, ALTER, VACUUM, WITHOUT ROWID's `wr`
+layer, triggers, foreign keys) works unchanged. What the pin exposes
+of the UTF-16 bytes is rebuilt from the UTF-8 form by
+`utf16::Units` (its `READ_UTF8` / `WRITE_UTF16` arithmetic): the
+connection's encoding (`record::TextEnc`, a zero-sized type without
+the leaf) reaches every BINARY comparison as a parameter —
+`record::compare_coll_in`, `query::order_cmp`, `btree::compare_entries`
+and the probe / integrity comparisons, the compound merge, GROUP BY
+sorts, aggregates, the window engine, xindex probe sorting and range
+bounds, WITHOUT ROWID handle sorting — and the evaluator reads it
+from `query::Env::enc` (`Ctx::enc`).
+
+**Shipped — leaf feature `utf16`:**
+
+- Files with header encoding 2 / 3 open, read and write; the
+  header field is written (with the first schema change) as the pin
+  writes it; VACUUM / VACUUM INTO keep it; a TEMP database stores
+  text as main does.
+- `PRAGMA encoding = 'UTF-8' | 'UTF8' | 'UTF-16' | 'UTF16' |
+  'UTF-16le' | 'UTF16le' | 'UTF-16be' | 'UTF16be'` (any case;
+  `UTF-16` alone is little-endian, the pin's native order on its
+  x86-64 build) while the encoding is open — the database has no
+  schema yet (pristine, or a file whose field is still 0) and no
+  TEMP database exists; the last choice wins; once fixed any value,
+  even an unknown one, is ignored (an unknown name while open is
+  `SchemaKind::UnknownEncoding`, as before). `PRAGMA encoding` and
+  `pragma_encoding` report `UTF-8` / `UTF-16le` / `UTF-16be`.
+- BINARY over the UTF-16 bytes (memcmp, then length) everywhere text
+  is ordered: ORDER BY, index B-trees (insert, seek, range scans,
+  UNIQUE, integrity_check), min / max (aggregate, scalar, the
+  bare-column rule), GROUP BY output, UNION / INTERSECT / EXCEPT,
+  windows (partitions, ORDER BY, RANGE frames, min / max frames),
+  aggregate ORDER BY, IN-list probe order, comparisons. NOCASE and
+  RTRIM compare the UTF-8 form.
+- Functions: `hex(text)` and `CAST(text AS BLOB)` give the UTF-16
+  bytes (`CAST(12 AS BLOB)` too; `hex(12)` stays `3132`, as on the
+  pin); `octet_length` counts UTF-16 bytes (twice the rendering for
+  numbers); a BLOB read as text or as a number through text decodes
+  from UTF-16 — `CAST(blob AS TEXT / INTEGER / REAL / NUMERIC)`,
+  `||`, arithmetic, `WHERE blob`, LIKE / GLOB (operator and
+  function), upper / lower / trim / replace / instr (unless both are
+  blobs) / unicode / printf / concat / unhex / char / round / abs /
+  zeroblob / randomblob arguments, group_concat / string_agg; length,
+  hex, quote, substr's first argument, typeof keep the bytes; a
+  function's text result goes through the pin's UTF-8 → UTF-16
+  conversion (`utf16::normalize`: a lone surrogate becomes U+FFFD),
+  except the ones that return an argument (coalesce, nullif, iif,
+  min / max, likely); the PRAGMA table-valued functions' internal
+  literals are UTF-16-aware.
+- Invalid stored UTF-16 reads as the pin reads it: an odd trailing
+  byte dropped (also by `CAST(blob AS TEXT)`), a surrogate followed
+  by any unit combined with it, a surrogate ending the text kept as
+  its 3-byte form (rendered raw by the CLI) and written back as
+  itself.
+
+**Fixed on the way (ungated, the v16 function library):**
+`unicode()` replaced U+FFFE / U+FFFF with 65533; the pin returns
+65534 / 65535 (`unicode(char(65534))`).
+
+**Oracle-probing notes** (live pin, before implementing): the
+UTF-16le order is the low byte first (`'' < U+0100 < U+1F600 < 'a'`),
+UTF-16be puts astral characters below U+E000; NOCASE and RTRIM order
+like UTF-8 in both (`'a' < U+0100`); an index scan and `x > 'a'`
+follow the BINARY bytes; `hex(char(55296))` is `FDFF` (FFFD) while
+`hex(CAST(x'00D8' AS TEXT))` is `00D8`, `x || ''` and
+`coalesce(x, 1)` keep it, `upper` / `quote` / `trim` / `substr` /
+`group_concat` give FFFD; `char(65534)` stores FFFE; `CAST(x'410042'
+AS TEXT)` is `A` (`4100`); `x'3100' + 1` is 2 (UTF-16le) and
+`x'0031' = 1` is 0; `CASE WHEN x'0031'` is true in UTF-16be;
+`sum(x'3100')` is 1.0 (a blob stays non-integer); `upper(x'41')` is
+empty; `PRAGMA encoding` after `SELECT 1`, `BEGIN`, a schema read or
+`PRAGMA page_size` still changes it, after `CREATE TEMP TABLE` it
+does not, after CREATE + DROP TABLE it does not; a file whose field
+is 0 (written by `PRAGMA user_version` alone) chooses on reopen;
+`PRAGMA encoding = 'bogus'` is "unsupported encoding" only while
+open. One early probe showed `unicode()` of a stored lone surrogate
+as 55296; repeated probes give 65533 everywhere (that value is not
+tested). `concat()` of a blob reads past the converted text on the
+pin (`concat('<', x'61006200', '>')` is `<ab`, garbage after the
+NUL): not modelled, not tested.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` end
+with "==> all gates passed". New suites: `tests/utf16_v16.rs` (10
+tests: PRAGMA names and reporting, when the encoding is fixed, a
+reopened field-0 file, the BINARY order of every query shape in both
+byte orders with and without indexes, text functions, blobs read as
+text, invalid UTF-16, VACUUM / ALTER / TEMP / WITHOUT ROWID with
+overflow pages, files written by each engine read, extended and
+integrity-checked by the other, and a generated corpus of random
+Unicode text — BMP, astral, combining, NUL-containing, random
+`char(N)` including surrogates — with random writes and 15 query
+shapes in alternating byte orders, 24 cases by default,
+`HIPP_UTF16_CORPUS` scales it: 300 / 300 agreed); every statement is
+compared with the live pin and the pin's integrity_check runs on
+hipp's file; unit tests in `src/utf16.rs` (translations, BINARY
+order, records) and `src/pager.rs`; `hipp-cli/tests/cli_v16_utf16.rs`
+(byte-identical one-shot and over stdin in UTF-16le / be / native,
+`.schema` / `.tables` of non-ASCII names, each CLI reading the other's
+file, a generated corpus). `tests/differential.rs` a7 and
+`tests/pragma_v16.rs` now expect UTF-16 to work when the leaf is
+built.
+
+**Size:** tiny **77,004 B** (Δ **0**; the header check keeps its old
+code without the leaf). Full **490,692 B** (Δ **+64 B**, ratchet
+raised: the ungated `unicode()` fix and codegen shifts from the
+zero-sized encoding parameters — no UTF-16 code is in `full`). Max
+**713,504 B** (Δ **+7,736 B** vs 705,768, raised; under the 32 KiB
+threshold): the conversions and record translation (~3 KB), the
+evaluator's UTF-16 paths (~2.5 KB), the encoding-aware comparisons
+and PRAGMA / pager / VACUUM support.
+
+**Honest gaps:**
+
+- A surrogate followed by a unit that does not pair with it (stored
+  by another writer or by `CAST(blob AS TEXT)`) reads as the pin
+  reads it — one supplementary character — but hipp holds text as
+  UTF-8, so when such a value is written again (UPDATE, INSERT ...
+  SELECT, a copy) it is stored as the valid pair, and its `hex()` /
+  BINARY order use that pair (`00D86100` reads back as `00D861DC`).
+  A lone surrogate ending a text round-trips exactly; text the pin
+  concatenates byte-wise across such a surrogate (`x || 'a'` where x
+  ends in one) renders differently.
+- `sum()` / `avg()` / `total()` of a BLOB read its raw bytes, not
+  UTF-16 (`sum(x'0031')` in UTF-16be); the window form of
+  group_concat does not decode blob arguments; JSON functions do not
+  normalise lone surrogates.
+- `concat()` with blob arguments: the pin reads past its converted
+  text (above); hipp gives the decoded text.
+- `UTF-16` alone always means little-endian (the pin's on x86-64; a
+  big-endian pin build would choose big-endian).
+- hipp writes the encoding field (1) into a new file at creation; the
+  pin leaves it 0 until the first schema write, so a hipp-created
+  file that only got header writes is UTF-8-fixed on reopen in both
+  engines (the pin's own such file is not). `.dump` differs from the
+  pin's for every encoding (pre-existing).
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

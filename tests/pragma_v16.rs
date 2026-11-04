@@ -408,8 +408,10 @@ fn page_size_encoding_and_auto_vacuum_on_a_fresh_database() {
         "PRAGMA encoding = 'nonsense'",
         SchemaKind::UnknownEncoding,
     );
-    // What hipp cannot honour is refused, never pretended.
+    // What hipp cannot honour is refused, never pretended (a UTF-16
+    // encoding is honoured with the `utf16` leaf: tests/utf16_v16.rs).
     for (i, s) in [
+        #[cfg(not(feature = "utf16"))]
         "PRAGMA encoding = 'UTF-16le'",
         "PRAGMA auto_vacuum = 1",
         "PRAGMA auto_vacuum = incremental",

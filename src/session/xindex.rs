@@ -533,8 +533,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
         }
         if p.is_in {
-            vals.as_mut_slice()
-                .sort_by(|a, b| crate::record::compare_coll(&a.as_value(), &b.as_value(), coll));
+            let enc = self.conn.pager.text_enc();
+            vals.as_mut_slice().sort_by(|a, b| {
+                crate::record::compare_coll_in(&a.as_value(), &b.as_value(), coll, enc)
+            });
             let mut d: AVec<OwnedValue> = AVec::new();
             for v in vals.iter() {
                 let dup = d.as_slice().last().is_some_and(|l| {
@@ -591,8 +593,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         row: &RowData,
         mut ents: Option<&mut AVec<AVec<OwnedValue>>>,
     ) -> Result<AVec<i64>, S::Error> {
-        use crate::record::compare_coll;
+        use crate::record::{compare_coll, compare_coll_in};
         use core::cmp::Ordering;
+        let enc = self.conn.pager.text_enc();
         let mut out: AVec<i64> = AVec::new();
         let (Some(lo), Some(hi)) = (
             self.bound_val(&acc.lo, row).await?,
@@ -741,7 +744,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         continue;
                     }
                     if let Some((l, incl)) = &lo {
-                        let c = compare_coll(&v.as_value(), &l.as_value(), ko.coll);
+                        let c = compare_coll_in(&v.as_value(), &l.as_value(), ko.coll, enc);
                         if c == Ordering::Less || (c == Ordering::Equal && !incl) {
                             if ko.desc {
                                 break;
@@ -750,7 +753,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         }
                     }
                     if let Some((h, incl)) = &hi {
-                        let c = compare_coll(&v.as_value(), &h.as_value(), ko.coll);
+                        let c = compare_coll_in(&v.as_value(), &h.as_value(), ko.coll, enc);
                         if c == Ordering::Greater || (c == Ordering::Equal && !incl) {
                             if ko.desc {
                                 continue;

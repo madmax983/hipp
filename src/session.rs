@@ -1218,8 +1218,18 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "foreign_keys")]
             fk: fkey::FkState::default(),
         };
+        #[cfg(feature = "utf16")]
+        conn.set_text_enc(conn.pager.text_enc());
         conn.rebuild_catalog().await?;
         Ok(conn)
+    }
+
+    /// Set the connection's text encoding (v0.16, `utf16`): the
+    /// pager's (what records are stored as) and the evaluator's.
+    #[cfg(feature = "utf16")]
+    pub(crate) fn set_text_enc(&mut self, enc: crate::record::TextEnc) {
+        self.pager.set_text_enc(enc);
+        self.env.enc.set(enc);
     }
 
     async fn rebuild_catalog(&mut self) -> Result<(), S::Error> {
@@ -8760,7 +8770,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                     // A WITHOUT ROWID table's two-pass write visits
                     // its rows in key order (v0.16).
                     #[cfg(feature = "without_rowid")]
-                    self.conn.pager.wr.sort_handles(root, &mut ids);
+                    {
+                        let enc = self.conn.pager.text_enc();
+                        self.conn.pager.wr.sort_handles(root, &mut ids, enc);
+                    }
                     let mut d: AVec<i64> = AVec::new();
                     for r in ids.iter() {
                         if d.as_slice().last() != Some(r) {
@@ -10241,6 +10254,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 tails.as_slice(),
                 cores.as_slice(),
                 qp.comp_order.as_slice(),
+                self.conn.pager.text_enc(),
             )
         };
         let rows = apply_window(rows, window);
@@ -10322,11 +10336,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 crate::query::exprs_colls(qp.items.as_slice()).as_slice(),
             );
         }
+        let enc = self.conn.pager.text_enc();
         produced.as_mut_slice().sort_by(|x, y| {
             crate::query::order_keys_cmp(
                 x.keys.as_slice(),
                 y.keys.as_slice(),
                 qp.order_by.iter().map(|(_, o)| *o),
+                enc,
             )
         });
         let mut kept_rows: AVec<AVec<OwnedValue>> = AVec::new();
@@ -10443,8 +10459,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
                 let mut units = AVec::new();
                 units.push(ins);
-                let (_, vals) = crate::window::compute(wins.as_slice(), units.as_slice())
-                    .map_err(|kind| Error::Schema { kind })?;
+                let (_, vals) = crate::window::compute(
+                    wins.as_slice(),
+                    units.as_slice(),
+                    self.conn.pager.text_enc(),
+                )
+                .map_err(|kind| Error::Schema { kind })?;
                 let empty = AVec::new();
                 let v = vals.as_slice().first().unwrap_or(&empty);
                 for e in r {
@@ -10615,7 +10635,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         arg_rows.push(vs);
                     }
                 }
-                crate::agg::fold::<S::Error>(&p, arg_rows)
+                crate::agg::fold::<S::Error>(&p, arg_rows, self.conn.pager.text_enc())
             })?;
             return Box::pin(self.eval_group_sub(&e2, rows, rep)).await;
         }
@@ -10680,7 +10700,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             arg_rows.push(vs);
         }
-        crate::agg::fold::<S::Error>(&p, arg_rows)
+        crate::agg::fold::<S::Error>(&p, arg_rows, self.conn.pager.text_enc())
     }
 
     /// The representative row for a top-level query's group
@@ -10756,7 +10776,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 continue;
             }
             let v = self.eval_row_sub(m.arg, r).await?;
-            if extremum_step(m.kind, coll, &mut best, v) {
+            if extremum_step(m.kind, coll, &mut best, v, self.conn.pager.text_enc()) {
                 rep = r;
             }
         }
@@ -11040,6 +11060,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 tails.push((*op, right));
                 cores.push(core_colls(tail.items.as_slice(), tail.values.as_slice()));
             }
+            let enc = self.conn.pager.text_enc();
             let rows = if union_first_row(
                 &plan.limit,
                 &plan.offset,
@@ -11053,15 +11074,18 @@ impl<'c, S: Storage> Statement<'c, S> {
                     tails.as_slice(),
                     cores.as_slice(),
                     plan.comp_order.as_slice(),
+                    enc,
                 )
             };
             return Ok(apply_window(rows, window));
         }
+        let enc = self.conn.pager.text_enc();
         produced.as_mut_slice().sort_by(|x, y| {
             crate::query::order_keys_cmp(
                 x.keys.as_slice(),
                 y.keys.as_slice(),
                 plan.order_by.iter().map(|(_, o)| *o),
+                enc,
             )
         });
         let mut rows: AVec<AVec<OwnedValue>> = AVec::new();
@@ -11476,6 +11500,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             if !groups_arrive_ordered(qp.sources.as_slice()) {
+                let enc = self.conn.pager.text_enc();
                 groups.as_mut_slice().sort_by(|a, b| {
                     for (((av, bv), c), d) in
                         a.0.iter()
@@ -11483,7 +11508,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                             .zip(gcolls.iter())
                             .zip(gdesc.iter())
                     {
-                        let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                        let o =
+                            crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
                         let o = if *d { o.reverse() } else { o };
                         if o != core::cmp::Ordering::Equal {
                             return o;
@@ -11711,6 +11737,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             if !groups_arrive_ordered(plan.sources.as_slice()) {
+                let enc = self.conn.pager.text_enc();
                 groups.as_mut_slice().sort_by(|a, b| {
                     for (((av, bv), c), d) in
                         a.0.iter()
@@ -11718,7 +11745,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                             .zip(gcolls.iter())
                             .zip(gdesc.iter())
                     {
-                        let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                        let o =
+                            crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
                         let o = if *d { o.reverse() } else { o };
                         if o != core::cmp::Ordering::Equal {
                             return o;
@@ -11825,7 +11853,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         rows: &[RowData],
         groups: &[(AVec<OwnedValue>, AVec<RowData>)],
     ) -> Result<AVec<Produced>, S::Error> {
-        let (order, vals, ti, to) = win_results::<S::Error>(wins, &mut units, items, order_by)?;
+        let (order, vals, ti, to) = win_results::<S::Error>(
+            wins,
+            &mut units,
+            items,
+            order_by,
+            self.conn.pager.text_enc(),
+        )?;
         let empty = RowData::empty();
         let mut out = AVec::with_capacity(order.len());
         for &u in order.iter() {
@@ -12397,12 +12431,14 @@ fn compound_key_cmp(
     a: &[OwnedValue],
     b: &[OwnedValue],
     colls: &[crate::record::Coll],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        let c = crate::record::compare_coll(
+        let c = crate::record::compare_coll_in(
             &x.as_value(),
             &y.as_value(),
             colls.get(i).copied().unwrap_or_default(),
+            enc,
         );
         if c != core::cmp::Ordering::Equal {
             return c;
@@ -12429,14 +12465,15 @@ fn merge_compound(
     mut right: AVec<AVec<OwnedValue>>,
     key: &[crate::record::Coll],
     dup: &[crate::record::Coll],
+    enc: crate::record::TextEnc,
 ) -> AVec<AVec<OwnedValue>> {
     use crate::sql::CompoundOp::{Except, Intersect, Union, UnionAll};
     use core::cmp::Ordering::{Equal, Greater, Less};
     left.as_mut_slice()
-        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key));
+        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key, enc));
     right
         .as_mut_slice()
-        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key));
+        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key, enc));
     let (l, r) = (left.as_slice(), right.as_slice());
     let mut out: AVec<AVec<OwnedValue>> = AVec::new();
     let emit = |out: &mut AVec<AVec<OwnedValue>>, row: &AVec<OwnedValue>| {
@@ -12453,7 +12490,7 @@ fn merge_compound(
     let (mut i, mut j) = (0usize, 0usize);
     loop {
         match (l.get(i), r.get(j)) {
-            (Some(a), Some(b)) => match compound_key_cmp(a.as_slice(), b.as_slice(), key) {
+            (Some(a), Some(b)) => match compound_key_cmp(a.as_slice(), b.as_slice(), key, enc) {
                 Less => {
                     if op != Intersect {
                         emit(&mut out, a);
@@ -12514,6 +12551,7 @@ fn run_compound(
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
     cores: &[AVec<Option<crate::record::Coll>>],
     order: &[(usize, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
 ) -> AVec<AVec<OwnedValue>> {
     use crate::sql::CompoundOp::UnionAll;
     let width = cores.first().map_or(0, |c| c.len());
@@ -12545,6 +12583,7 @@ fn run_compound(
                 right.clone(),
                 key.as_slice(),
                 prefix(k + 1).as_slice(),
+                enc,
             );
         } else {
             for r in right.iter() {
@@ -12553,7 +12592,7 @@ fn run_compound(
         }
     }
     rows.as_mut_slice()
-        .sort_by(|a, b| compound_order_cmp(a, b, order));
+        .sort_by(|a, b| compound_order_cmp(a, b, order, enc));
     rows
 }
 
@@ -12625,10 +12664,11 @@ fn compound_order_cmp(
     a: &AVec<OwnedValue>,
     b: &AVec<OwnedValue>,
     order: &[(usize, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     for (idx, o) in order.iter() {
         if let (Some(x), Some(y)) = (a.as_slice().get(*idx), b.as_slice().get(*idx)) {
-            let c = crate::query::order_cmp(x, y, *o);
+            let c = crate::query::order_cmp(x, y, *o, enc);
             if c != core::cmp::Ordering::Equal {
                 return c;
             }
@@ -13344,6 +13384,7 @@ fn project_rows<E>(
         }
         // SQLite's GROUP BY emits groups in key order (its sorter).
         if !groups_arrive_ordered(qp.sources.as_slice()) {
+            let enc = env.text_enc();
             groups.as_mut_slice().sort_by(|a, b| {
                 for (((av, bv), c), d) in
                     a.0.iter()
@@ -13351,7 +13392,7 @@ fn project_rows<E>(
                         .zip(gcolls.iter())
                         .zip(gdesc.iter())
                 {
-                    let o = crate::record::compare_coll(&av.as_value(), &bv.as_value(), *c);
+                    let o = crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
                     let o = if *d { o.reverse() } else { o };
                     if o != core::cmp::Ordering::Equal {
                         return o;
@@ -13448,6 +13489,7 @@ fn win_results<E>(
     units: &mut AVec<WinUnit>,
     items: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
 ) -> Result<
     (
         AVec<usize>,
@@ -13462,7 +13504,7 @@ fn win_results<E>(
         ins.push(core::mem::take(&mut u.ins));
     }
     let (order, vals) =
-        crate::window::compute(wins, ins.as_slice()).map_err(|kind| Error::Schema { kind })?;
+        crate::window::compute(wins, ins.as_slice(), enc).map_err(|kind| Error::Schema { kind })?;
     let mut ti = AVec::new();
     for it in items {
         ti.push(crate::window::strip(it));
@@ -13491,6 +13533,7 @@ fn win_project<E>(
         &mut units,
         qp.items.as_slice(),
         qp.order_by.as_slice(),
+        env.text_enc(),
     )?;
     let empty = RowData::empty();
     let mut out = AVec::with_capacity(order.len());
@@ -13603,6 +13646,7 @@ fn extremum_step(
     coll: crate::record::Coll,
     best: &mut Option<OwnedValue>,
     v: OwnedValue,
+    enc: crate::record::TextEnc,
 ) -> bool {
     if matches!(v, OwnedValue::Null) {
         return best.is_none();
@@ -13610,7 +13654,7 @@ fn extremum_step(
     let take = match best {
         None => true,
         Some(b) => {
-            let o = crate::record::compare_coll(&v.as_value(), &b.as_value(), coll);
+            let o = crate::record::compare_coll_in(&v.as_value(), &b.as_value(), coll, enc);
             if kind == crate::query::AggKind::Min {
                 o == core::cmp::Ordering::Less
             } else {
@@ -13653,7 +13697,7 @@ fn pick_rep_from<E>(
             continue;
         }
         let v = crate::query::eval::<E>(m.arg, &ctx)?;
-        if extremum_step(m.kind, coll, &mut best, v) {
+        if extremum_step(m.kind, coll, &mut best, v, env.text_enc()) {
             rep = r;
         }
     }

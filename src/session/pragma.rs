@@ -591,7 +591,13 @@ impl<S: Storage> Connection<S> {
             })),
             Prag::FreelistCount => row1(int(i64::from(h.freelist_count))),
             Prag::AutoVacuum => row1(int(i64::from(h.auto_vacuum))),
-            Prag::Encoding => row1(text(b"UTF-8")),
+            Prag::Encoding => row1(text(match self.pager.text_enc() {
+                crate::record::TextEnc::Utf8 => b"UTF-8",
+                #[cfg(feature = "utf16")]
+                crate::record::TextEnc::Utf16le => b"UTF-16le",
+                #[cfg(feature = "utf16")]
+                crate::record::TextEnc::Utf16be => b"UTF-16be",
+            })),
             Prag::JournalMode => row1(text(b"delete")),
             // hipp syncs the journal before any page moves and
             // the file before the journal goes: FULL.
@@ -1386,7 +1392,7 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
                     if i > 0 {
                         sql.push(b',');
                     }
-                    sql_literal(v, &mut sql);
+                    sql_literal(v, &mut sql, self.pager.text_enc());
                 }
                 sql.push(b')');
             }
@@ -1404,8 +1410,10 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
 }
 
 /// An SQL literal for a pragma value: integers in decimal, text
-/// as `CAST(x'..' AS TEXT)` (any bytes survive), NULL.
-fn sql_literal(v: &OwnedValue, out: &mut AVec<u8>) {
+/// as `CAST(x'..' AS TEXT)` (any bytes survive; in a UTF-16
+/// database, v0.16 `utf16`, the blob holds the text's UTF-16 bytes,
+/// which that CAST reads back), NULL.
+fn sql_literal(v: &OwnedValue, out: &mut AVec<u8>, enc: crate::record::TextEnc) {
     match v {
         OwnedValue::Integer(i) => {
             // i64::MIN has no positive literal.
@@ -1421,6 +1429,13 @@ fn sql_literal(v: &OwnedValue, out: &mut AVec<u8>) {
                 out.extend_from_slice(b"CAST(");
             }
             out.extend_from_slice(b"x'");
+            #[cfg(feature = "utf16")]
+            let t = &if blob {
+                t.clone()
+            } else {
+                crate::utf16::encode(t.as_slice(), enc)
+            };
+            let _ = enc;
             for b in t.iter() {
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 out.push(HEX[usize::from(b >> 4)]);
@@ -1595,13 +1610,37 @@ impl<S: Storage> Statement<'_, S> {
                     ("UTF-16", false),
                     ("UTF16", false),
                 ];
+                // v0.16 (`utf16`): the pin's encoding stays open
+                // until the file has a schema (its header field is
+                // still unset) and no TEMP database exists.
+                #[cfg(feature = "utf16")]
+                let pristine = (pristine
+                    || (self.conn.pager.header().enc_unset
+                        && self.conn.catalog.tables.is_empty()
+                        && self.conn.catalog.views.is_empty()))
+                    && self.conn.temp.is_none();
                 if !pristine {
                     // Fixed once the database has content: ignored.
                     return Ok(AVec::new());
                 }
-                match NAMES.iter().find(|(n, _)| eq_ci(n.as_bytes(), arg)) {
-                    Some((_, true)) => Ok(AVec::new()),
-                    Some((_, false)) => Err(Error::UnsupportedEncoding),
+                match NAMES.iter().position(|(n, _)| eq_ci(n.as_bytes(), arg)) {
+                    #[cfg(feature = "utf16")]
+                    Some(i) => {
+                        use crate::record::TextEnc;
+                        // `UTF-16` alone is the native order; hipp
+                        // takes the pin's (x86-64): little-endian.
+                        let enc = match i {
+                            0 | 1 => TextEnc::Utf8,
+                            3 | 5 => TextEnc::Utf16be,
+                            _ => TextEnc::Utf16le,
+                        };
+                        self.conn.set_text_enc(enc);
+                        Ok(AVec::new())
+                    }
+                    #[cfg(not(feature = "utf16"))]
+                    Some(i) if NAMES.get(i).is_some_and(|n| n.1) => Ok(AVec::new()),
+                    #[cfg(not(feature = "utf16"))]
+                    Some(_) => Err(Error::UnsupportedEncoding),
                     None => Err(Error::Schema {
                         kind: SchemaKind::UnknownEncoding,
                     }),

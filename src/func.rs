@@ -909,7 +909,9 @@ fn utf8_read(s: &[u8]) -> u32 {
             }
             c = (c << 6).wrapping_add(u32::from(b & 0x3f));
         }
-        if c < 0x80 || (c & 0xffff_f800) == 0xd800 || (c & 0xffff_fffe) == 0xfffe {
+        // U+FFFE / U+FFFF read as themselves on the 3.54.1 pin
+        // (v0.16 fix, ungated: `unicode(char(65534))` is 65534).
+        if c < 0x80 || (c & 0xffff_f800) == 0xd800 {
             c = 0xfffd;
         }
     }

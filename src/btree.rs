@@ -16,7 +16,7 @@ use crate::record::{decode_varint, encode_varint};
 use crate::storage::Storage;
 
 #[cfg(feature = "indexes")]
-use crate::record::{KeyOrder, compare_coll};
+use crate::record::{KeyOrder, compare_coll, compare_coll_in};
 #[cfg(feature = "indexes")]
 use crate::record::{OwnedValue, Value, decode_record, encode_record};
 
@@ -411,7 +411,29 @@ pub async fn assemble_payload_into<S: Storage>(
         }
         next = following;
     }
+    // A UTF-16 database's record reads as UTF-8 above this layer
+    // (v0.16, `utf16`; `utf16::transcode_record`).
+    #[cfg(feature = "utf16")]
+    if let Some(be) = crate::utf16::byte_order(pager.text_enc()) {
+        let raw = core::mem::take(out);
+        crate::utf16::transcode_record::<S::Error>(raw.as_slice(), be, false, out)?;
+    }
     Ok(())
+}
+
+/// The bytes a record is stored as (v0.16, `utf16`): None in a
+/// UTF-8 database (the record itself), else its TEXT values in the
+/// file's UTF-16.
+#[cfg(feature = "utf16")]
+fn stored_record<E>(enc: crate::record::TextEnc, rec: &[u8]) -> Result<Option<AVec<u8>>, E> {
+    match crate::utf16::byte_order(enc) {
+        None => Ok(None),
+        Some(be) => {
+            let mut out = AVec::new();
+            crate::utf16::transcode_record::<E>(rec, be, true, &mut out)?;
+            Ok(Some(out))
+        }
+    }
 }
 
 enum ScanFrame {
@@ -993,6 +1015,10 @@ pub async fn btree_insert<S: Storage>(
     if let Some(t) = pager.wr.table_of(root) {
         return crate::wr::put(pager, t, rowid, payload).await;
     }
+    #[cfg(feature = "utf16")]
+    let conv = stored_record::<S::Error>(pager.text_enc(), payload)?;
+    #[cfg(feature = "utf16")]
+    let payload = conv.as_ref().map_or(payload, |c| c.as_slice());
     let usable = pager.usable() as usize;
     let page_size = pager.page_size() as usize;
     // ---- descent, remembering (interior page, child index) ----
@@ -3047,7 +3073,8 @@ async fn index_cell_payload<S: Storage>(
 /// Compare two decoded keys field by field under each key
 /// column's collation (v0.16); `desc[j].desc` reverses
 /// column j's comparison (the rowid field, last, is never in
-/// `desc` and always compares ascending). NULL ordering follows
+/// `desc` and always compares ascending), in a database of text
+/// encoding `enc`. NULL ordering follows
 /// `compare_values` (NULL smallest; reversed under DESC, which is
 /// what the oracle does).
 #[cfg(feature = "indexes")]
@@ -3055,11 +3082,12 @@ pub fn compare_entries(
     a: &[OwnedValue],
     b: &[OwnedValue],
     desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for j in 0..a.len().min(b.len()) {
         let o = desc.get(j).copied().unwrap_or_default();
-        let c = compare_coll(&a[j].as_value(), &b[j].as_value(), o.coll);
+        let c = compare_coll_in(&a[j].as_value(), &b[j].as_value(), o.coll, enc);
         let c = if o.desc { c.reverse() } else { c };
         if c != Ordering::Equal {
             return c;
@@ -3503,7 +3531,12 @@ async fn index_search_pos<S: Storage>(
         let mid = lo + (hi - lo) / 2;
         let p = index_cell_payload(pager, &cells[mid]).await?;
         let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-        match compare_entries(probe.values.as_slice(), e.values.as_slice(), desc) {
+        match compare_entries(
+            probe.values.as_slice(),
+            e.values.as_slice(),
+            desc,
+            pager.text_enc(),
+        ) {
             Ordering::Equal => {
                 return Err(Error::Schema {
                     kind: SchemaKind::DuplicateRowid,
@@ -3594,6 +3627,10 @@ pub async fn index_insert_core<S: Storage>(
     };
 
     // ---- build the new leaf cell (overflow first) ----
+    #[cfg(feature = "utf16")]
+    let conv = stored_record::<S::Error>(pager.text_enc(), payload)?;
+    #[cfg(feature = "utf16")]
+    let payload = conv.as_ref().map_or(payload, |c| c.as_slice());
     let local_len = index_local(usable, payload.len());
     let overflow_head = write_overflow(pager, payload, local_len).await?;
     let mut cell_bytes = AVec::new();
@@ -3670,6 +3707,7 @@ fn cmp_entry_probe(
     entry: &[OwnedValue],
     probe: &[KeyPart],
     desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for j in 0..entry.len().min(probe.len()) {
@@ -3677,7 +3715,7 @@ fn cmp_entry_probe(
             KeyPart::Min => return Ordering::Greater,
             KeyPart::Val(v) => {
                 let o = desc.get(j).copied().unwrap_or_default();
-                let c = compare_coll(&entry[j].as_value(), &v.as_value(), o.coll);
+                let c = compare_coll_in(&entry[j].as_value(), &v.as_value(), o.coll, enc);
                 let c = if o.desc { c.reverse() } else { c };
                 if c != Ordering::Equal {
                     return c;
@@ -3694,12 +3732,17 @@ fn cmp_entry_probe(
 /// search ended at (`lwr`: on an ordered page, the first entry
 /// greater than `probe`) and `false`.
 #[cfg(feature = "indexes")]
-fn bin_search(entries: &[IndexEntry], probe: &[KeyPart], desc: &[KeyOrder]) -> (usize, bool) {
+fn bin_search(
+    entries: &[IndexEntry],
+    probe: &[KeyPart],
+    desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
+) -> (usize, bool) {
     let (mut lo, mut hi) = (0usize, entries.len());
     while lo < hi {
         let mid = lo + (hi - 1 - lo) / 2;
         let Some(e) = entries.get(mid) else { break };
-        match cmp_entry_probe(e.values.as_slice(), probe, desc) {
+        match cmp_entry_probe(e.values.as_slice(), probe, desc, enc) {
             core::cmp::Ordering::Less => lo = mid + 1,
             core::cmp::Ordering::Greater => hi = mid,
             core::cmp::Ordering::Equal => return (mid, true),
@@ -3828,7 +3871,7 @@ impl IndexCursor {
                     let p = index_cell_payload(pager, c).await?;
                     entries.push(decode_index_entry::<S::Error>(p.as_slice(), nfields)?);
                 }
-                let (pos, found) = bin_search(entries.as_slice(), probe, desc);
+                let (pos, found) = bin_search(entries.as_slice(), probe, desc, pager.text_enc());
                 cur.stack.push(IdxFrame::Leaf { entries, next: pos });
                 return Ok((cur, found));
             }
@@ -3848,7 +3891,7 @@ impl IndexCursor {
             // First divider >= probe (Equal only for a full-key
             // probe: prefix probes pad with Min and can never be
             // Equal to a real entry).
-            let (i, equal) = bin_search(entries.as_slice(), probe, desc);
+            let (i, equal) = bin_search(entries.as_slice(), probe, desc, pager.text_enc());
             if equal {
                 // The divider itself is the lower bound; yield it
                 // next, then continue with its right subtree.
@@ -4120,7 +4163,7 @@ pub async fn index_check_entry<S: Storage>(
         while lo < hi {
             let mid = lo + (hi - 1 - lo) / 2;
             let rec = index_payload_at(pager, snap.as_slice(), &h, mid, page).await?;
-            match pin_rec_cmp(rec.as_slice(), full.as_slice(), desc) {
+            match pin_rec_cmp(rec.as_slice(), full.as_slice(), desc, pager.text_enc()) {
                 Some(c) if c < 0 => lo = mid + 1,
                 Some(c) if c > 0 => hi = mid,
                 Some(_) => {
@@ -4168,10 +4211,12 @@ pub async fn index_check_entry<S: Storage>(
             // `OP_IdxGT` over the key columns: a key-prefix tie (the
             // pin's `default_rc` -1) or less is a duplicate.
             let dup = match next {
-                Some(rec) => match pin_rec_cmp_from(rec.as_slice(), key, desc, false) {
-                    Some(c) => c <= 0,
-                    None => return Err(Error::CorruptRecord),
-                },
+                Some(rec) => {
+                    match pin_rec_cmp_from(rec.as_slice(), key, desc, false, pager.text_enc()) {
+                        Some(c) => c <= 0,
+                        None => return Err(Error::CorruptRecord),
+                    }
+                }
                 None => false,
             };
             return Ok((true, dup));
@@ -4195,7 +4240,12 @@ pub async fn index_check_entry<S: Storage>(
 /// pin's corruption verdict (`errCode`), which it reports only if
 /// the comparison then reads as equal.
 #[cfg(all(feature = "indexes", feature = "v16"))]
-fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i32> {
+fn pin_rec_cmp(
+    rec: &[u8],
+    probe: &[OwnedValue],
+    desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
+) -> Option<i32> {
     let b = |i: usize| rec.get(i).copied().unwrap_or(0);
     let o0 = desc.first().copied().unwrap_or_default();
     let (r1, r2) = if o0.desc { (1, -1) } else { (-1, 1) };
@@ -4211,13 +4261,16 @@ fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i3
                     } else if *v < lhs {
                         r2
                     } else if probe.len() > 1 {
-                        return pin_rec_cmp_from(rec, probe, desc, true);
+                        return pin_rec_cmp_from(rec, probe, desc, true, enc);
                     } else {
                         0
                     });
                 }
             }
-            Some(OwnedValue::Text(z)) if o0.coll == crate::record::Coll::Binary => {
+            Some(OwnedValue::Text(z))
+                if o0.coll == crate::record::Coll::Binary
+                    && enc == crate::record::TextEnc::Utf8 =>
+            {
                 let (st, _) = rec_varint32(rec, 1);
                 if st < 12 {
                     return Some(r1);
@@ -4237,7 +4290,7 @@ fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i3
                     core::cmp::Ordering::Less => r1,
                     core::cmp::Ordering::Equal => match n.cmp(&z.len()) {
                         core::cmp::Ordering::Equal if probe.len() > 1 => {
-                            return pin_rec_cmp_from(rec, probe, desc, true);
+                            return pin_rec_cmp_from(rec, probe, desc, true, enc);
                         }
                         core::cmp::Ordering::Equal => 0,
                         core::cmp::Ordering::Greater => r2,
@@ -4248,7 +4301,7 @@ fn pin_rec_cmp(rec: &[u8], probe: &[OwnedValue], desc: &[KeyOrder]) -> Option<i3
             _ => {}
         }
     }
-    pin_rec_cmp_from(rec, probe, desc, false)
+    pin_rec_cmp_from(rec, probe, desc, false, enc)
 }
 
 /// `sqlite3VdbeRecordCompareWithSkip` (see `pin_rec_cmp`); `skip`
@@ -4259,8 +4312,9 @@ fn pin_rec_cmp_from(
     probe: &[OwnedValue],
     desc: &[KeyOrder],
     skip: bool,
+    enc: crate::record::TextEnc,
 ) -> Option<i32> {
-    use crate::record::{Coll, Value, compare_coll};
+    use crate::record::{Coll, Value, compare_coll, compare_coll_in};
     let b = |i: usize| rec.get(i).copied().unwrap_or(0);
     let nkey = rec.len() as u64;
     let (mut idx1, hdr, mut d1, mut i) = if skip {
@@ -4307,10 +4361,11 @@ fn pin_rec_cmp_from(
                     }
                     let body = rec.get(at..at + n as usize).unwrap_or_default();
                     let coll = desc.get(i).map(|o| o.coll).unwrap_or_default();
-                    ord(compare_coll(
+                    ord(compare_coll_in(
                         &Value::Text(body),
                         &Value::Text(z.as_slice()),
                         coll,
+                        enc,
                     ))
                 }
             }
@@ -5133,7 +5188,12 @@ async fn index_rebuild_without<S: Storage>(
         let nf = entry_fields(pager, root, desc);
         let mut cur = IndexCursor::with_fields(root, desc, nf);
         while let Some(e) = cur.next_entry(pager).await? {
-            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc) == Ordering::Equal
+            if compare_entries(
+                e.values.as_slice(),
+                skip.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) == Ordering::Equal
             {
                 continue;
             }
@@ -5238,8 +5298,12 @@ pub async fn index_delete_core<S: Storage>(
             for (i, c) in cells.iter().enumerate() {
                 let p = index_cell_payload(pager, c).await?;
                 let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-                if compare_entries(e.values.as_slice(), leaf_target.values.as_slice(), desc)
-                    == Ordering::Equal
+                if compare_entries(
+                    e.values.as_slice(),
+                    leaf_target.values.as_slice(),
+                    desc,
+                    pager.text_enc(),
+                ) == Ordering::Equal
                 {
                     hit = Some(i);
                     break;
@@ -5265,7 +5329,12 @@ pub async fn index_delete_core<S: Storage>(
         for (i, c) in cells.iter().enumerate() {
             let p = index_cell_payload(pager, c).await?;
             let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-            match compare_entries(leaf_target.values.as_slice(), e.values.as_slice(), desc) {
+            match compare_entries(
+                leaf_target.values.as_slice(),
+                e.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) {
                 Ordering::Equal => {
                     hit = Some(i);
                     break;
@@ -5317,6 +5386,12 @@ pub async fn index_delete_core<S: Storage>(
                 return Ok(true);
             };
             let pred_payload = encode_entry_payload(&pred);
+            #[cfg(feature = "utf16")]
+            let pred_payload =
+                match stored_record::<S::Error>(pager.text_enc(), pred_payload.as_slice())? {
+                    Some(c) => c,
+                    None => pred_payload,
+                };
             let local_len = index_local(usable, pred_payload.len());
             let ovf = write_overflow(pager, pred_payload.as_slice(), local_len).await?;
             let mut cell_bytes = AVec::new();
@@ -5521,8 +5596,12 @@ async fn index_apply_replacement<S: Storage>(
             for (i, c) in cells.iter().enumerate() {
                 let p = index_cell_payload(pager, c).await?;
                 let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-                if compare_entries(e.values.as_slice(), target.values.as_slice(), desc)
-                    == Ordering::Equal
+                if compare_entries(
+                    e.values.as_slice(),
+                    target.values.as_slice(),
+                    desc,
+                    pager.text_enc(),
+                ) == Ordering::Equal
                 {
                     let mut nc: AVec<IndexCell> = AVec::new();
                     for (j, cc) in cells.iter().enumerate() {
@@ -5561,7 +5640,12 @@ async fn index_apply_replacement<S: Storage>(
         for (i, c) in cells.iter().enumerate() {
             let p = index_cell_payload(pager, c).await?;
             let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-            match compare_entries(target.values.as_slice(), e.values.as_slice(), desc) {
+            match compare_entries(
+                target.values.as_slice(),
+                e.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) {
                 Ordering::Equal => {
                     hit = Some(i);
                     break;
@@ -5619,7 +5703,12 @@ async fn index_rebuild_without_extra<S: Storage>(
         let nf = entry_fields(pager, root, desc);
         let mut cur = IndexCursor::with_fields(root, desc, nf);
         while let Some(e) = cur.next_entry(pager).await? {
-            if compare_entries(e.values.as_slice(), skip.values.as_slice(), desc) == Ordering::Equal
+            if compare_entries(
+                e.values.as_slice(),
+                skip.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            ) == Ordering::Equal
             {
                 continue;
             }
@@ -5627,7 +5716,12 @@ async fn index_rebuild_without_extra<S: Storage>(
         }
     }
     if let Some(x) = extra
-        && compare_entries(x.values.as_slice(), skip.values.as_slice(), desc) != Ordering::Equal
+        && compare_entries(
+            x.values.as_slice(),
+            skip.values.as_slice(),
+            desc,
+            pager.text_enc(),
+        ) != Ordering::Equal
     {
         keep.push(encode_entry_payload(x));
     }

@@ -643,6 +643,32 @@ aspirations.
   byte for byte, but page allocation does not (a few more pages);
   index_xinfo prints collation names in upper case. Sizes in
   STATUS.md.
+- **UTF-16 databases** (new leaf feature `utf16`, in `max` — ADR
+  0002 — not `full`): files whose header text encoding is 2
+  (UTF-16le) or 3 (UTF-16be) open, read and write as on the pin,
+  and `PRAGMA encoding = 'UTF-16' | 'UTF-16le' | 'UTF-16be'` (or
+  `UTF16...`, any case; `UTF-16` alone is little-endian, the pin's
+  native order) chooses one for an empty database — a silent no-op
+  once it has a schema or a TEMP database, as on the pin — and
+  `PRAGMA encoding` reports it. Records (and sqlite_schema's text)
+  are translated at the B-tree boundary, so serial types count
+  UTF-16 bytes and files interoperate both ways (the pin's
+  integrity_check passes on hipp's; VACUUM keeps the encoding).
+  The BINARY collation compares the UTF-16 bytes with memcmp as
+  the pin does — UTF-16le orders by the low byte first, UTF-16be
+  sorts astral characters below U+E000 — in ORDER BY, indexes,
+  ranges, min / max, GROUP BY, compounds, windows and aggregates;
+  NOCASE and RTRIM compare the UTF-8 form, as the pin defines them
+  for UTF-8 only. hex() and CAST(... AS BLOB) give the UTF-16
+  bytes, octet_length counts them, a blob read as text (CAST, ||,
+  upper, LIKE, numbers from blobs, group_concat) decodes from
+  UTF-16, function results go through the pin's conversion (a lone
+  surrogate becomes U+FFFD), invalid stored UTF-16 reads as the
+  pin reads it. Without the leaf such a file is refused at open
+  (`UnsupportedEncoding`), never misread. Fixed on the way
+  (ungated): `unicode(char(65534))` is 65534, as on the pin. Gaps
+  (a surrogate followed by a non-matching unit is re-encoded as a
+  pair when rewritten) and sizes in STATUS.md.
 
 ## What v0.13 does
 
@@ -959,7 +985,7 @@ created (refused below `v16`, foreign ones load read-only there;
 indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
 stored but never executed (all of these in the tiny profile: the
 `v04` ... `v16` rungs add them — views execute with `v16`), no
-UTF-16, no multi-process
+UTF-16 databases without the `utf16` leaf (refused at open), no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 
@@ -985,7 +1011,9 @@ rules and the generated-column row codec, v0.16), `session`
 `session/trigger` trigger programs, `session/json_tvf` the
 `json_each` / `json_tree` sources, v0.16; `sql/trig` the NEW. /
 OLD. binder), `wr` (WITHOUT ROWID trees behind the rowid-shaped
-B-tree interface, feature `without_rowid`, v0.16),
+B-tree interface, feature `without_rowid`, v0.16), `utf16`
+(UTF-16 text conversions and the record translation of UTF-16
+files, feature `utf16`, v0.16),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

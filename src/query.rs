@@ -4698,6 +4698,11 @@ pub struct Env {
     /// when it returns.
     #[cfg(feature = "json")]
     pub json_docs: crate::json::TvfDocs,
+    /// The database's text encoding (v0.16, `utf16`): what the
+    /// BINARY collation, hex(), CAST(... AS BLOB) and blob-to-text
+    /// conversions see (`crate::utf16`).
+    #[cfg(feature = "utf16")]
+    pub enc: core::cell::Cell<crate::record::TextEnc>,
 }
 
 impl Env {
@@ -4722,7 +4727,19 @@ impl Env {
             raise_msg: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "json")]
             json_docs: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "utf16")]
+            enc: core::cell::Cell::new(crate::record::TextEnc::Utf8),
         }
+    }
+
+    /// The database's text encoding (v0.16; UTF-8 without
+    /// `utf16`).
+    #[inline]
+    pub fn text_enc(&self) -> crate::record::TextEnc {
+        #[cfg(feature = "utf16")]
+        return self.enc.get();
+        #[cfg(not(feature = "utf16"))]
+        crate::record::TextEnc::Utf8
     }
 
     /// One row inserted with `rowid` (an INSERT, the REPLACE
@@ -4808,6 +4825,16 @@ impl<'x> Ctx<'x> {
     }
     fn row(&self) -> &'x RowData {
         self.rep
+    }
+    /// The database's text encoding (v0.16; UTF-8 without the
+    /// connection state or the `utf16` leaf).
+    #[inline]
+    pub fn enc(&self) -> crate::record::TextEnc {
+        #[cfg(feature = "utf16")]
+        if let Some(e) = self.env {
+            return e.enc.get();
+        }
+        crate::record::TextEnc::Utf8
     }
     /// A row context over one of the group's rows, for evaluating
     /// aggregate arguments per group row (same connection state).
@@ -5284,7 +5311,7 @@ fn in_list_coll(x: &RExpr) -> Coll {
 fn cmp_op<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     let lv = eval::<E>(l, ctx)?;
     let rv = eval::<E>(r, ctx)?;
-    cmp_values::<E>(op, l, r, lv, rv)
+    cmp_values::<E>(op, l, r, lv, rv, ctx.enc())
 }
 
 /// `cmp_op` over its operands' values (out of line: `cmp_op` is
@@ -5296,6 +5323,7 @@ fn cmp_values<E>(
     r: &RExpr,
     lv: OwnedValue,
     rv: OwnedValue,
+    enc: crate::record::TextEnc,
 ) -> Result<OwnedValue, E> {
     let (lv, rv) = adjust_cmp(l, r, lv, rv);
     // v0.16: the comparison's collating sequence (column
@@ -5308,7 +5336,7 @@ fn cmp_values<E>(
     if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
         return Ok(OwnedValue::Null);
     }
-    let ord = compare_coll(&lv.as_value(), &rv.as_value(), coll);
+    let ord = crate::record::compare_coll_in(&lv.as_value(), &rv.as_value(), coll, enc);
     use core::cmp::Ordering::*;
     let b = match op {
         BinOp::Eq => ord == Equal,
@@ -5325,7 +5353,43 @@ fn cmp_values<E>(
 fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     let lv = eval::<E>(l, ctx)?;
     let rv = eval::<E>(r, ctx)?;
+    #[cfg(feature = "utf16")]
+    let (lv, rv) = (blob_text(lv, ctx), blob_text(rv, ctx));
     arith_values::<E>(op, lv, rv)
+}
+
+/// A BLOB read as text (or as a number through text) in a UTF-16
+/// database (v0.16, `utf16`): its bytes decode from UTF-16, as the
+/// pin's blob-to-text conversion does (`x'3100' + 1` is 2 in
+/// UTF-16le). Anything else, or any value in a UTF-8 database, is
+/// returned as it is.
+#[cfg(feature = "utf16")]
+pub(crate) fn blob_text(v: OwnedValue, ctx: &Ctx<'_>) -> OwnedValue {
+    match v {
+        OwnedValue::Blob(b) if ctx.enc() != crate::record::TextEnc::Utf8 => {
+            OwnedValue::Text(crate::utf16::decode(b.as_slice(), ctx.enc()))
+        }
+        v => v,
+    }
+}
+
+/// `CAST(x AS ...)` in the context's database (v0.16, `utf16`): in
+/// a UTF-16 database a BLOB cast to another type is first read as
+/// UTF-16 text, and a TEXT or number cast to BLOB takes its UTF-16
+/// bytes.
+#[cfg(feature = "utf16")]
+fn cast_in(v: OwnedValue, aff: Affinity, ctx: &Ctx<'_>) -> OwnedValue {
+    if ctx.enc() != crate::record::TextEnc::Utf8 {
+        if aff == Affinity::Blob {
+            if let OwnedValue::Blob(_) | OwnedValue::Null = v {
+                return v;
+            }
+            let t = to_text(&v).unwrap_or_default();
+            return OwnedValue::Blob(crate::utf16::encode(t.as_slice(), ctx.enc()));
+        }
+        return cast_value(&blob_text(v, ctx), aff);
+    }
+    cast_value(&v, aff)
 }
 
 /// `arith` over its operands' values (out of line: `arith` is on
@@ -5886,7 +5950,97 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
     for a in args {
         vs.push(eval::<E>(a, ctx)?);
     }
-    let v = vs.as_slice();
+    #[cfg(feature = "utf16")]
+    if let Some(be) = crate::utf16::byte_order(ctx.enc()) {
+        return eval_scalar16::<E>(f, args, vs, ctx, be);
+    }
+    scalar_values::<E>(f, args, vs.as_slice(), ctx)
+}
+
+/// `eval_scalar` in a UTF-16 database (v0.16, `utf16`): what the
+/// pin's functions see of the stored encoding. `hex()` and
+/// `octet_length()` of a TEXT read its UTF-16 bytes; a BLOB
+/// argument a function reads as text (or as a number) is first
+/// decoded from UTF-16 (`upper(x'61006200')` is 'AB'); and a text
+/// result goes through the pin's UTF-8 → UTF-16 conversion
+/// (`utf16::normalize`), except from the functions that return an
+/// argument as it is.
+#[cfg(feature = "utf16")]
+#[inline(never)]
+fn eval_scalar16<E>(
+    f: ScalarFn,
+    args: &[RExpr],
+    mut vs: AVec<OwnedValue>,
+    ctx: &Ctx<'_>,
+    be: bool,
+) -> Result<OwnedValue, E> {
+    use ScalarFn as F;
+    let enc = ctx.enc();
+    match (f, vs.as_slice().first()) {
+        (F::Hex, Some(OwnedValue::Text(t))) => {
+            let mut b = AVec::new();
+            crate::utf16::encode_into(t.as_slice(), be, &mut b);
+            return Ok(hex_text(b.as_slice()));
+        }
+        (F::OctetLength, Some(OwnedValue::Text(t))) => {
+            return Ok(OwnedValue::Integer(
+                crate::utf16::encoded_len(t.as_slice()) as i64
+            ));
+        }
+        (F::OctetLength, Some(x @ (OwnedValue::Integer(_) | OwnedValue::Real(_)))) => {
+            let n = to_text(x).map_or(0, |t| t.len());
+            return Ok(OwnedValue::Integer(n.saturating_mul(2) as i64));
+        }
+        _ => {}
+    }
+    let all_blobs = vs.iter().all(|x| matches!(x, OwnedValue::Blob(_)));
+    let pass = matches!(
+        f,
+        F::Coalesce | F::Nullif | F::Iif | F::MinN | F::MaxN | F::Likely | F::Typeof
+    );
+    for (i, x) in vs.as_mut_slice().iter_mut().enumerate() {
+        let keep = pass
+            || match f {
+                F::Length | F::OctetLength | F::Hex | F::Quote => true,
+                F::Substr => i == 0,
+                F::Instr => all_blobs,
+                _ => false,
+            };
+        if let (OwnedValue::Blob(b), false) = (&*x, keep) {
+            *x = OwnedValue::Text(crate::utf16::decode(b.as_slice(), enc));
+        }
+    }
+    let r = scalar_values::<E>(f, args, vs.as_slice(), ctx)?;
+    if !pass
+        && let OwnedValue::Text(t) = &r
+        && let Some(n) = crate::utf16::normalize(t.as_slice())
+    {
+        return Ok(OwnedValue::Text(n));
+    }
+    Ok(r)
+}
+
+/// `bytes` as upper-case hex digits (TEXT).
+#[cfg_attr(not(feature = "utf16"), inline(always))]
+fn hex_text(bytes: &[u8]) -> OwnedValue {
+    let mut out = AVec::new();
+    for b in bytes {
+        let (hi, lo) = (b >> 4, b & 0xf);
+        out.push(if hi < 10 { b'0' + hi } else { b'A' + hi - 10 });
+        out.push(if lo < 10 { b'0' + lo } else { b'A' + lo - 10 });
+    }
+    OwnedValue::Text(out)
+}
+
+/// `eval_scalar` over the evaluated argument values (one copy:
+/// inlined into `eval_scalar` unless `utf16` calls it twice).
+#[cfg_attr(not(feature = "utf16"), inline(always))]
+fn scalar_values<E>(
+    f: ScalarFn,
+    args: &[RExpr],
+    v: &[OwnedValue],
+    ctx: &Ctx<'_>,
+) -> Result<OwnedValue, E> {
     #[cfg(feature = "math")]
     if let ScalarFn::Math(m) = f {
         return Ok(crate::math::eval(m, v));
@@ -6006,14 +6160,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
             if matches!(v0, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
-                let bytes = to_text(v0).unwrap_or_default();
-                let mut out = AVec::new();
-                for b in bytes.as_slice() {
-                    let (hi, lo) = (b >> 4, b & 0xf);
-                    out.push(if hi < 10 { b'0' + hi } else { b'A' + hi - 10 });
-                    out.push(if lo < 10 { b'0' + lo } else { b'A' + lo - 10 });
-                }
-                OwnedValue::Text(out)
+                hex_text(to_text(v0).unwrap_or_default().as_slice())
             }
         }
         ScalarFn::Sign => match to_number(v0) {
@@ -6178,7 +6325,12 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
                 let coll = args_coll(args);
                 let mut best = v0.clone();
                 for x in v.get(1..).unwrap_or(&[]) {
-                    let ord = compare_coll(&x.as_value(), &best.as_value(), coll);
+                    let ord = crate::record::compare_coll_in(
+                        &x.as_value(),
+                        &best.as_value(),
+                        coll,
+                        ctx.enc(),
+                    );
                     let take = if f == ScalarFn::MinN {
                         ord != core::cmp::Ordering::Greater
                     } else {
@@ -6297,7 +6449,12 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
                 let Some(b) = vs.as_slice().get(best) else {
                     break;
                 };
-                let ord = compare_coll(&x.0.as_value(), &b.0.as_value(), coll);
+                let ord = crate::record::compare_coll_in(
+                    &x.0.as_value(),
+                    &b.0.as_value(),
+                    coll,
+                    ctx.enc(),
+                );
                 let take = if *f == ScalarFn::MinN {
                     ord != core::cmp::Ordering::Greater
                 } else {
@@ -6383,7 +6540,7 @@ fn eval_agg<E>(e: &RExpr, rows: &[RowData], ctx: &Ctx<'_>) -> Result<OwnedValue,
             arg_rows.push(vs);
         }
     }
-    crate::agg::fold::<E>(&p, arg_rows)
+    crate::agg::fold::<E>(&p, arg_rows, ctx.enc())
 }
 
 /// Evaluate a resolved expression.
@@ -6591,6 +6748,9 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             #[cfg(feature = "v16")]
             BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => eval_other::<E>(e, ctx)?,
         },
+        #[cfg(feature = "utf16")]
+        RExpr::Cast(x, aff) => cast_in(eval::<E>(x, ctx)?, *aff, ctx),
+        #[cfg(not(feature = "utf16"))]
         RExpr::Cast(x, aff) => cast_value(&eval::<E>(x, ctx)?, *aff),
         RExpr::Collate(x, _) => eval::<E>(x, ctx)?,
         // Everything else out of line: this function is on the
@@ -6743,6 +6903,9 @@ pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E
             cond_is::<E>(r, ctx, want)
         }
         RExpr::Not(x) => cond_is::<E>(x, ctx, !want),
+        #[cfg(feature = "utf16")]
+        _ => Ok(truthy(&blob_text(eval::<E>(e, ctx)?, ctx)) == Some(want)),
+        #[cfg(not(feature = "utf16"))]
         _ => Ok(truthy(&eval::<E>(e, ctx)?) == Some(want)),
     }
 }
@@ -6946,6 +7109,8 @@ fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         RExpr::Like(x, p, neg) => {
             let xv = eval::<E>(x, ctx)?;
             let pv = eval::<E>(p, ctx)?;
+            #[cfg(feature = "utf16")]
+            let (xv, pv) = (blob_text(xv, ctx), blob_text(pv, ctx));
             match like_glob::<E>(&pv, &xv, None, false, case_like(ctx))? {
                 OwnedValue::Integer(m) => bool_val((m != 0) != *neg),
                 other => other,
@@ -6994,7 +7159,15 @@ pub fn eval_const<E>(expr: &Expr, arena: &Arena) -> Result<OwnedValue, E> {
 /// default is NULL-smallest, i.e. first ascending and last
 /// descending); any other pair compares by the storage-class
 /// ordering, reversed for DESC.
-pub fn order_cmp(a: &OwnedValue, b: &OwnedValue, o: SortOrder) -> core::cmp::Ordering {
+///
+/// `enc` is the database's text encoding (the BINARY order of a
+/// UTF-16 database is its UTF-16 bytes'; `record::compare_coll_in`).
+pub fn order_cmp(
+    a: &OwnedValue,
+    b: &OwnedValue,
+    o: SortOrder,
+    enc: crate::record::TextEnc,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (matches!(a, OwnedValue::Null), matches!(b, OwnedValue::Null)) {
         (true, true) => Ordering::Equal,
@@ -7013,7 +7186,7 @@ pub fn order_cmp(a: &OwnedValue, b: &OwnedValue, o: SortOrder) -> core::cmp::Ord
             }
         }
         (false, false) => {
-            let c = compare_coll(&a.as_value(), &b.as_value(), o.coll);
+            let c = crate::record::compare_coll_in(&a.as_value(), &b.as_value(), o.coll, enc);
             if o.desc { c.reverse() } else { c }
         }
     }
@@ -7025,9 +7198,10 @@ pub fn order_keys_cmp(
     a: &[OwnedValue],
     b: &[OwnedValue],
     dirs: impl Iterator<Item = SortOrder>,
+    enc: crate::record::TextEnc,
 ) -> core::cmp::Ordering {
     for ((x, y), o) in a.iter().zip(b.iter()).zip(dirs) {
-        let c = order_cmp(x, y, o);
+        let c = order_cmp(x, y, o, enc);
         if c != core::cmp::Ordering::Equal {
             return c;
         }

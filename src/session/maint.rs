@@ -585,6 +585,9 @@ impl<S: Storage> Statement<'_, S> {
         put_be_u32(d, 44, 4);
         put_be_u32(d, 48, cache_size);
         put_be_u32(d, 52, 0);
+        #[cfg(feature = "utf16")]
+        put_be_u32(d, 56, crate::pager::enc_code(self.conn.pager.text_enc()));
+        #[cfg(not(feature = "utf16"))]
         put_be_u32(d, 56, 1);
         put_be_u32(d, 60, h.user_version);
         put_be_u32(d, 64, 0);
@@ -699,6 +702,9 @@ impl<S: Storage> Statement<'_, S> {
         )
         .await
         .map_err(mem_err)?;
+        // VACUUM keeps the encoding (v0.16, `utf16`).
+        #[cfg(feature = "utf16")]
+        dst.set_text_enc(self.conn.pager.text_enc());
         let mut rowid = 0i64;
         // (source root, new root, is a table, schema index)
         let mut copies: AVec<(u32, u32, bool, usize)> = AVec::new();

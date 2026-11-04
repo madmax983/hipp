@@ -924,8 +924,9 @@ pub async fn drop_field<S: Storage>(
 impl WrState {
     /// Sort handles of table `root`'s rows into the table's key
     /// order (a WITHOUT ROWID table's "rowid order"); handles with
-    /// no row go last. Other roots are left as they are.
-    pub fn sort_handles(&self, root: u32, ids: &mut AVec<i64>) {
+    /// no row go last. Other roots are left as they are. `enc` is
+    /// the database's text encoding (its BINARY order).
+    pub fn sort_handles(&self, root: u32, ids: &mut AVec<i64>, enc: crate::record::TextEnc) {
         let Some(t) = self
             .table_of(root)
             .and_then(|t| self.tables.as_slice().get(t))
@@ -939,7 +940,7 @@ impl WrState {
         }
         keyed.as_mut_slice().sort_by(|a, b| match (&a.0, &b.0) {
             (Some(x), Some(y)) => {
-                crate::btree::compare_entries(x.as_slice(), y.as_slice(), t.orders.as_slice())
+                crate::btree::compare_entries(x.as_slice(), y.as_slice(), t.orders.as_slice(), enc)
             }
             (Some(_), None) => core::cmp::Ordering::Less,
             (None, Some(_)) => core::cmp::Ordering::Greater,

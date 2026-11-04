@@ -39,19 +39,61 @@ use crate::error::{Error, Result, SchemaKind};
 use crate::query::{
     AggKind, AggParts, args_coll, parse_num_prefix, real_value, to_text, values_equal_coll,
 };
-use crate::record::{OwnedValue, compare_coll, fabs, text_to_number};
+use crate::record::{OwnedValue, fabs, text_to_number};
 
 /// Fold one aggregate over the per-row input values of the rows
 /// it steps (`rows`: one entry per row whose FILTER passed, each
 /// holding `p.inputs()`' values — arguments, then ORDER BY keys).
-pub fn fold<E>(p: &AggParts<'_>, rows: AVec<AVec<OwnedValue>>) -> Result<OwnedValue, E> {
-    fold_rows(p, rows).map_err(|kind| Error::Schema { kind })
+///
+/// `enc` is the database's text encoding (min / max and ORDER BY
+/// compare text by its BINARY order).
+pub fn fold<E>(
+    p: &AggParts<'_>,
+    rows: AVec<AVec<OwnedValue>>,
+    enc: crate::record::TextEnc,
+) -> Result<OwnedValue, E> {
+    #[cfg(feature = "utf16")]
+    let rows = match crate::utf16::byte_order(enc) {
+        Some(_) => return fold16(p, rows, enc).map_err(|kind| Error::Schema { kind }),
+        None => rows,
+    };
+    fold_rows(p, rows, enc).map_err(|kind| Error::Schema { kind })
+}
+
+/// `fold` in a UTF-16 database (v0.16, `utf16`): group_concat /
+/// string_agg read a BLOB argument as UTF-16 text, and their text goes through the pin's conversion of a
+/// function result (`utf16::normalize`).
+#[cfg(feature = "utf16")]
+fn fold16(
+    p: &AggParts<'_>,
+    mut rows: AVec<AVec<OwnedValue>>,
+    enc: crate::record::TextEnc,
+) -> core::result::Result<OwnedValue, SchemaKind> {
+    if p.kind == AggKind::GroupConcat {
+        let n = p.args.len();
+        for r in rows.as_mut_slice() {
+            for x in r.as_mut_slice().iter_mut().take(n) {
+                if let OwnedValue::Blob(b) = x {
+                    *x = OwnedValue::Text(crate::utf16::decode(b.as_slice(), enc));
+                }
+            }
+        }
+    }
+    let r = fold_rows(p, rows, enc)?;
+    if p.kind == AggKind::GroupConcat
+        && let OwnedValue::Text(t) = &r
+        && let Some(n) = crate::utf16::normalize(t.as_slice())
+    {
+        return Ok(OwnedValue::Text(n));
+    }
+    Ok(r)
 }
 
 /// `fold`, generic-free (one copy whatever the storage error).
 fn fold_rows(
     p: &AggParts<'_>,
     rows: AVec<AVec<OwnedValue>>,
+    enc: crate::record::TextEnc,
 ) -> core::result::Result<OwnedValue, SchemaKind> {
     let coll = args_coll(p.args);
     let mut idx: AVec<usize> = AVec::with_capacity(rows.len());
@@ -93,7 +135,7 @@ fn fold_rows(
                 .unwrap_or(&[])
         };
         let cmp = |a: usize, b: usize| {
-            crate::query::order_keys_cmp(keys(a), keys(b), p.order.iter().copied())
+            crate::query::order_keys_cmp(keys(a), keys(b), p.order.iter().copied(), enc)
         };
         sort_stable(&mut idx, &|a, b| cmp(a, b) != core::cmp::Ordering::Greater);
         if p.unique {
@@ -147,7 +189,8 @@ fn fold_rows(
                 best = Some(match best {
                     None => v,
                     Some(b) => {
-                        let ord = compare_coll(&v.as_value(), &b.as_value(), coll);
+                        let ord =
+                            crate::record::compare_coll_in(&v.as_value(), &b.as_value(), coll, enc);
                         let take = if p.kind == AggKind::Min {
                             ord == core::cmp::Ordering::Less
                         } else {

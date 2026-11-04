@@ -1628,6 +1628,8 @@ impl<S: Storage> Connection<S> {
 /// an ORDER BY — a binary heap on (ORDER BY key, arrival).
 struct RecQueue<'o> {
     order: &'o [(usize, crate::sql::SortOrder)],
+    /// The database's text encoding (its BINARY order).
+    enc: crate::record::TextEnc,
     rows: AVec<(u64, AVec<OwnedValue>)>,
     head: usize,
     seq: u64,
@@ -1637,7 +1639,8 @@ impl RecQueue<'_> {
     fn less(&self, a: usize, b: usize) -> bool {
         match (self.rows.as_slice().get(a), self.rows.as_slice().get(b)) {
             (Some((sa, ra)), Some((sb, rb))) => {
-                compound_order_cmp(ra, rb, self.order).then(sa.cmp(sb)) == core::cmp::Ordering::Less
+                compound_order_cmp(ra, rb, self.order, self.enc).then(sa.cmp(sb))
+                    == core::cmp::Ordering::Less
             }
             _ => false,
         }
@@ -1775,7 +1778,9 @@ impl<S: Storage> Statement<'_, S> {
         for i in 0..width {
             colls.push(compound_col_coll(cores.iter(), i));
         }
+        let enc = self.conn.pager.text_enc();
         let mut queue = RecQueue {
+            enc,
             order: plan.comp_order.as_slice(),
             rows: AVec::new(),
             head: 0,
@@ -1788,7 +1793,7 @@ impl<S: Storage> Statement<'_, S> {
                 return true;
             }
             let key = |r: &AVec<OwnedValue>| -> core::cmp::Ordering {
-                compound_key_cmp(r.as_slice(), row.as_slice(), colls.as_slice())
+                compound_key_cmp(r.as_slice(), row.as_slice(), colls.as_slice(), enc)
             };
             match seen.as_slice().binary_search_by(key) {
                 Ok(_) => false,

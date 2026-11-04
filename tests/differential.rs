@@ -217,7 +217,8 @@ fn a7_rejections() {
             r.err(),
         );
 
-        // UTF-16 file (oracle-created) → UnsupportedEncoding.
+        // UTF-16 file (oracle-created) → UnsupportedEncoding without
+        // the `utf16` leaf; with it (v0.16) the file opens.
         let path = common::temp_db("a7-utf16");
         common::cli(
             &path,
@@ -225,11 +226,14 @@ fn a7_rejections() {
         );
         let fs = FileStorage::open(&path).expect("fs open");
         let r = Connection::open(fs, Config::default()).await;
+        #[cfg(not(feature = "utf16"))]
         assert!(
             matches!(r, Err(Error::UnsupportedEncoding)),
             "utf16: {:?}",
             r.err(),
         );
+        #[cfg(feature = "utf16")]
+        assert!(r.is_ok(), "utf16: {:?}", r.err());
 
         // Garbage → BadMagic.
         let mem = MemStorage::new();

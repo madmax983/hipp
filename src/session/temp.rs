@@ -1072,6 +1072,10 @@ impl<S: Storage> Connection<S> {
                 Box::pin(Connection::open(MemStorage::new(), cfg));
             let mut c = open.await.map_err(mem_err)?;
             c.is_temp = true;
+            // The TEMP database stores text as main does (v0.16,
+            // `utf16`).
+            #[cfg(feature = "utf16")]
+            c.set_text_enc(self.pager.text_enc());
             // Replay the open transaction.
             let mut script: AVec<AVec<u8>> = AVec::new();
             if self.explicit_txn {

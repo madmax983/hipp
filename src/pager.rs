@@ -64,6 +64,15 @@ pub struct DbHeader {
     /// incremental (offsets 52 and 64).
     #[cfg(feature = "v16")]
     pub auto_vacuum: u8,
+    /// The text encoding (offset 56; v0.16, `utf16`). A field still
+    /// 0 reads as UTF-8, as on the pin.
+    #[cfg(feature = "utf16")]
+    pub text_enc: crate::record::TextEnc,
+    /// The encoding field is still 0 (v0.16, `utf16`): the pin's
+    /// file after only header writes, whose encoding `PRAGMA
+    /// encoding` may still choose.
+    #[cfg(feature = "utf16")]
+    pub enc_unset: bool,
 }
 
 fn parse_page_size_field<E>(raw: u16) -> Result<u32, E> {
@@ -103,10 +112,22 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         0 => 1,
         e => e,
     };
+    #[cfg(feature = "utf16")]
+    let text_enc = match encoding {
+        2 => crate::record::TextEnc::Utf16le,
+        3 => crate::record::TextEnc::Utf16be,
+        _ => crate::record::TextEnc::Utf8,
+    };
+    #[cfg(not(feature = "utf16"))]
     if encoding == 2 || encoding == 3 {
         return Err(Error::UnsupportedEncoding);
     }
+    #[cfg(not(feature = "utf16"))]
     if encoding != 1 {
+        return Err(Error::CorruptPage { page: 1 });
+    }
+    #[cfg(feature = "utf16")]
+    if !(1..=3).contains(&encoding) {
         return Err(Error::CorruptPage { page: 1 });
     }
     let change_counter = be_u32(probe, 24);
@@ -140,7 +161,21 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         } else {
             1
         },
+        #[cfg(feature = "utf16")]
+        text_enc,
+        #[cfg(feature = "utf16")]
+        enc_unset: be_u32(probe, 56) == 0,
     })
+}
+
+/// The header's offset-56 value for `enc` (v0.16, `utf16`).
+#[cfg(feature = "utf16")]
+pub fn enc_code(enc: crate::record::TextEnc) -> u32 {
+    match enc {
+        crate::record::TextEnc::Utf8 => 1,
+        crate::record::TextEnc::Utf16le => 2,
+        crate::record::TextEnc::Utf16be => 3,
+    }
 }
 
 /// Build a fresh page-1 image: database header + empty
@@ -922,6 +957,15 @@ impl<S: Storage> Pager<S> {
             put_be_u32(d, 44, 4);
             put_be_u32(d, 56, 1);
         }
+        // The encoding `PRAGMA encoding` chose for the empty database
+        // lands with its first schema change (v0.16, `utf16`).
+        #[cfg(feature = "utf16")]
+        if self
+            .txn_header
+            .is_some_and(|h| h.schema_cookie != self.header.schema_cookie)
+        {
+            put_be_u32(d, 56, enc_code(self.header.text_enc));
+        }
         Ok(())
     }
 
@@ -929,6 +973,32 @@ impl<S: Storage> Pager<S> {
     #[cfg(feature = "v16")]
     pub fn header(&self) -> &DbHeader {
         &self.header
+    }
+
+    /// The database's text encoding (v0.16; always UTF-8 without
+    /// `utf16`).
+    #[inline]
+    pub fn text_enc(&self) -> crate::record::TextEnc {
+        #[cfg(feature = "utf16")]
+        return self.header.text_enc;
+        #[cfg(not(feature = "utf16"))]
+        crate::record::TextEnc::Utf8
+    }
+
+    /// Choose the text encoding of an empty database (v0.16,
+    /// `utf16`: `PRAGMA encoding = ...` while the encoding is not
+    /// fixed); the header field is written with the first schema
+    /// change. A TEMP database's pager takes its main database's
+    /// encoding through this too.
+    #[cfg(feature = "utf16")]
+    pub fn set_text_enc(&mut self, enc: crate::record::TextEnc) {
+        self.header.text_enc = enc;
+        if let Some(h) = self.txn_header.as_mut() {
+            h.text_enc = enc;
+        }
+        for m in self.sp.as_mut_slice().iter_mut() {
+            m.header.text_enc = enc;
+        }
     }
 
     /// The file is as this open created it (v0.16, `v16`): no
@@ -998,7 +1068,13 @@ impl<S: Storage> Pager<S> {
             .await
             .map_err(Error::Storage)?;
         self.storage.sync().await.map_err(Error::Storage)?;
+        #[cfg(feature = "utf16")]
+        let enc = self.header.text_enc;
         self.header = parse_db_header::<S::Error>(&img, u64::from(page_size))?;
+        #[cfg(feature = "utf16")]
+        {
+            self.header.text_enc = enc;
+        }
         self.orig_page_count = self.header.page_count;
         // The new page size is not transactional (the pin keeps it
         // across ROLLBACK TO): an open savepoint returns to the
@@ -1521,4 +1597,29 @@ async fn replay_journal<S: Storage>(
     storage.sync().await.map_err(Error::Storage)?;
     sidecar.delete().await.map_err(Error::Storage)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A UTF-16 header (offset 56 = 2 / 3) is refused cleanly
+    /// without the `utf16` leaf — never read as UTF-8 — and opens
+    /// with it (v0.16).
+    #[test]
+    fn utf16_header() {
+        for code in [2u32, 3] {
+            let mut p = initial_page1(4096);
+            put_be_u32(&mut p, 56, code);
+            let r = parse_db_header::<()>(&p, 4096);
+            #[cfg(not(feature = "utf16"))]
+            assert!(matches!(r, Err(Error::UnsupportedEncoding)));
+            #[cfg(feature = "utf16")]
+            assert_eq!(
+                r.ok().map(|h| enc_code(h.text_enc)),
+                Some(code),
+                "encoding {code}"
+            );
+        }
+    }
 }
