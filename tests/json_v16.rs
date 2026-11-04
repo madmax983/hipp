@@ -137,7 +137,8 @@ fn oracle_run(setup: &[String], stmts: &[String]) -> Vec<Option<Vec<u8>>> {
     // both directions fill.
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("hipp-json-v16-{}-{n}.sql", std::process::id()));
+    let path =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hipp-json-v16-{n}.sql"));
     std::fs::File::create(&path)
         .and_then(|mut f| f.write_all(script.as_bytes()))
         .expect("write script");

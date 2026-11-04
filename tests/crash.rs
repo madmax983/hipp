@@ -317,7 +317,7 @@ fn run_writer(
 
 #[test]
 fn a6_cross_tool_real_sqlite_recovers_hipp_journal() {
-    let dir = std::env::temp_dir().join(format!("hipp-crash-{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-crash");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let base = dir.join("base.db");
@@ -572,7 +572,7 @@ fn v16_crash_vacuum() {
 #[cfg(feature = "v16")]
 #[test]
 fn v16_cross_tool_real_sqlite_recovers_savepoint_journal() {
-    let dir = std::env::temp_dir().join(format!("hipp-crash-sp-{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-crash-sp");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let base = dir.join("base.db");

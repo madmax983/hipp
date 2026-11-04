@@ -49,7 +49,7 @@ pub fn cli(db: &std::path::Path, sql: &str) -> String {
 
 /// Create a fresh temp directory path for one test database.
 pub fn temp_db(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("hipp-test-{}-{}", std::process::id(), tag));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hipp-test-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir.join("test.db")

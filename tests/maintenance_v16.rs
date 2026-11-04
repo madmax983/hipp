@@ -322,7 +322,7 @@ fn vacuum_errors() {
 
 #[test]
 fn vacuum_into_writes_the_pins_file() {
-    let dir = std::env::temp_dir().join(format!("hipp-v16mt-into-{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-v16mt-into");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let src = dir.join("src.db");
@@ -902,7 +902,7 @@ fn new_rowid_after_the_largest() {
 /// nothing.
 #[test]
 fn vacuum_into_expressions() {
-    let dir = std::env::temp_dir().join(format!("hipp-v16mt-intoexpr-{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-v16mt-intoexpr");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let src = dir.join("src.db");

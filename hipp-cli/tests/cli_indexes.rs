@@ -21,7 +21,7 @@ fn hipp_cli() -> PathBuf {
 }
 
 fn temp_db(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("hipp-cli-{tag}-{}.db", std::process::id()));
+    let p = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hipp-cli-{tag}.db"));
     let _ = std::fs::remove_file(&p);
     p
 }
