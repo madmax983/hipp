@@ -358,6 +358,13 @@ pub struct Pager<S: Storage> {
     /// (`Error::AutoVacuumUnsupported`) — before, writes left the
     /// maps stale and the pin then found the file corrupt.
     ptrmaps: bool,
+    /// The auto-vacuum mode as the connection knows it (v0.16,
+    /// `autovacuum`; the pin's in-memory `autoVacuum` /
+    /// `incrVacuum`): set by `PRAGMA auto_vacuum` on an empty
+    /// database it survives a ROLLBACK, and the next write puts it
+    /// back into the header, as the pin's does.
+    #[cfg(feature = "autovacuum")]
+    av_mode: u8,
     frames: Vec<Frame>,
     cache_cap: usize,
     sidecar: Option<S::Sidecar>,
@@ -618,6 +625,8 @@ impl<S: Storage> Pager<S> {
                 header,
                 reserved_bytes,
                 ptrmaps,
+                #[cfg(feature = "autovacuum")]
+                av_mode: if ptrmaps { header.auto_vacuum } else { 0 },
                 frames,
                 cache_cap,
                 sidecar: Some(sidecar),
@@ -815,6 +824,9 @@ impl<S: Storage> Pager<S> {
         if self.reserved_bytes != 0 {
             return Err(Error::ReservedBytesUnsupported);
         }
+        // Without `autovacuum` an auto-vacuum file is never written
+        // (v0.16; with it the pointer maps are kept: `crate::autovac`).
+        #[cfg(not(feature = "autovacuum"))]
         if self.ptrmaps {
             return Err(Error::AutoVacuumUnsupported);
         }
@@ -1056,6 +1068,11 @@ impl<S: Storage> Pager<S> {
             }
             return Ok((trunk, ti));
         }
+        // An auto-vacuum file skips its pointer-map pages (v0.16).
+        #[cfg(feature = "autovacuum")]
+        if self.ptrmaps {
+            return self.grow_page().await;
+        }
         // Grow: page_count + 1.
         let page = self.header.page_count + 1;
         self.header.page_count = page;
@@ -1103,7 +1120,13 @@ impl<S: Storage> Pager<S> {
         if leaf_count > self.trunk_capacity() {
             return Err(Error::CorruptPage { page: trunk });
         }
-        if leaf_count < self.trunk_capacity() {
+        // The pin fills a trunk to `usable/4 - 8` leaves only (its
+        // `freePage2`, for files older versions read; v0.16 fix,
+        // ungated: hipp filled it to capacity, so its freelists, and
+        // the pages auto-vacuum moves into them, differed).
+        // (`leaf_count` is at most the capacity, checked above;
+        // capacity - 6 is usable/4 - 8.)
+        if leaf_count + 6 < self.trunk_capacity() {
             // Append as a leaf of the current trunk.
             let ti = self.dirty_page(trunk).await?;
             put_be_u32(&mut self.frames[ti].data, 8 + 4 * leaf_count as usize, page);
@@ -1376,6 +1399,22 @@ impl<S: Storage> Pager<S> {
         match self.stage {
             CommitStage::Idle => return Ok(()),
             CommitStage::Writing => {
+                // An auto-vacuum file's commit-time upkeep (v0.16,
+                // `autovacuum`): FULL's page moves and truncation,
+                // then the pointer map; pages cut off the end are
+                // not written.
+                #[cfg(feature = "autovacuum")]
+                if self.ptrmaps && !self.dirty.is_empty() {
+                    crate::autovac::pre_commit(self).await?;
+                    let n = self.header.page_count;
+                    for f in self.frames.iter_mut() {
+                        if f.page > n {
+                            f.page = 0;
+                            f.dirty = false;
+                        }
+                    }
+                    self.dirty.retain(|p| *p <= n);
+                }
                 self.finalise_page1().await?;
                 self.stage = CommitStage::SyncJournal;
                 // WAL mode (v0.16, `wal`): frames in page order, as
@@ -1908,6 +1947,16 @@ impl<S: Storage> Pager<S> {
         if r.is_err() {
             self.ptrmaps = pm;
         }
+        // An auto-vacuum image (v0.16, `autovacuum`) keeps its maps.
+        #[cfg(feature = "autovacuum")]
+        if r.is_ok() {
+            self.ptrmaps = img.get(52..56).is_some_and(|b| b != [0; 4]);
+            self.av_mode = if self.ptrmaps {
+                self.header.auto_vacuum
+            } else {
+                0
+            };
+        }
         r
     }
 
@@ -1992,6 +2041,85 @@ impl<S: Storage> Pager<S> {
             .await
             .map_err(Error::Storage)?;
         self.storage.sync().await.map_err(Error::Storage)
+    }
+
+    /// The file is an auto-vacuum database whose pointer maps this
+    /// pager keeps (v0.16, `autovacuum`).
+    #[cfg(feature = "autovacuum")]
+    pub fn autovac(&self) -> bool {
+        self.ptrmaps
+    }
+
+    /// The connection's auto-vacuum mode (v0.16, `autovacuum`): 0
+    /// none, 1 full, 2 incremental (`PRAGMA auto_vacuum`).
+    #[cfg(feature = "autovacuum")]
+    pub fn av_mode(&self) -> u8 {
+        self.av_mode
+    }
+
+    /// Set the connection's auto-vacuum mode (v0.16, `autovacuum`):
+    /// a non-zero mode means the file carries pointer maps.
+    #[cfg(feature = "autovacuum")]
+    pub(crate) fn set_av_mode(&mut self, mode: u8) {
+        self.av_mode = mode;
+        self.ptrmaps = mode != 0;
+    }
+
+    /// The parsed header, for the page moves of `crate::autovac`
+    /// (v0.16, `autovacuum`): freelist head and count, page count.
+    #[cfg(feature = "autovacuum")]
+    pub(crate) fn header_mut(&mut self) -> &mut DbHeader {
+        &mut self.header
+    }
+
+    /// One more page at the end of an auto-vacuum file (v0.16,
+    /// `autovacuum`; the pin's `allocateBtreePage` growing the
+    /// file): the lock-byte page is skipped, and a pointer-map
+    /// position becomes a zeroed pointer-map page with the page
+    /// after it allocated. A page an earlier truncation of this
+    /// transaction cut off is reused fresh (its images were kept by
+    /// `keep_tail`).
+    #[cfg(feature = "autovacuum")]
+    pub async fn grow_page(&mut self) -> Result<(u32, usize), S::Error> {
+        self.begin_write().await?;
+        let (usable, ps) = (self.usable(), self.header.page_size);
+        let pend = crate::autovac::pending_page(ps);
+        let mut page = self
+            .header
+            .page_count
+            .checked_add(1)
+            .ok_or(Error::Unsupported)?;
+        if page == pend {
+            page += 1;
+        }
+        if crate::autovac::is_ptrmap(usable, ps, page) {
+            self.header.page_count = page;
+            self.fresh_frame(page).await?;
+            page += 1;
+            if page == pend {
+                page += 1;
+            }
+        }
+        self.header.page_count = page;
+        self.fresh_frame(page).await
+    }
+
+    /// Before the file shrinks to `n` pages (v0.16, `autovacuum`):
+    /// every page past `n` keeps its image for a rollback (the
+    /// journal) and a `ROLLBACK TO` (the sub-journal), as the pin
+    /// journals a truncated tail before it commits.
+    #[cfg(feature = "autovacuum")]
+    pub async fn keep_tail(&mut self, n: u32) -> Result<(), S::Error> {
+        let mut p = n.saturating_add(1);
+        while p <= self.header.page_count {
+            let idx = self.load(p).await?;
+            self.sp_note(p, idx).await?;
+            if !self.frames[idx].dirty {
+                self.journal_original(p, idx).await?;
+            }
+            p += 1;
+        }
+        Ok(())
     }
 
     /// The next salt bits for the log (v0.16, `wal`): the nonce
@@ -2550,6 +2678,42 @@ async fn replay_journal<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without the `autovacuum` leaf an auto-vacuum file (offset 52
+    /// non-zero) opens for reading but no write transaction begins
+    /// on it (v0.16): its pointer maps would go stale.
+    #[cfg(all(feature = "v16", not(feature = "autovacuum")))]
+    #[test]
+    fn auto_vacuum_file_refused_without_leaf() {
+        use crate::storage::{MemStorage, block_on};
+        for incr in [0u32, 1] {
+            let mut img = initial_page1(4096);
+            put_be_u32(&mut img, 44, 4);
+            put_be_u32(&mut img, 56, 1);
+            put_be_u32(&mut img, 52, 1);
+            put_be_u32(&mut img, 64, incr);
+            let mem = MemStorage::new();
+            mem.set_snapshot(img.clone());
+            block_on(async {
+                let arena = Arena::new(crate::error::Scope::Transaction, 1024, 1 << 20);
+                let (mut p, created) = Pager::open(mem.clone(), 4, 4096, 7, arena)
+                    .await
+                    .expect("open");
+                assert!(!created);
+                assert_eq!(p.header().auto_vacuum, 1 + incr as u8);
+                assert!(p.load(1).await.is_ok(), "reads work");
+                assert!(matches!(
+                    p.begin_write().await,
+                    Err(Error::AutoVacuumUnsupported)
+                ));
+                assert!(matches!(
+                    p.alloc_page().await,
+                    Err(Error::AutoVacuumUnsupported)
+                ));
+            });
+            assert_eq!(mem.snapshot(), img, "the file is untouched");
+        }
+    }
 
     /// A WAL header (file-format bytes 18 / 19 = 2) is refused cleanly
     /// without the `wal` leaf — never read from the possibly stale

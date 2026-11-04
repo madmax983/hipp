@@ -27,6 +27,7 @@ v16,utf16
 v16,wal
 v16,datetime
 v16,attach
+v16,autovacuum
 indexes,v04
 indexes,v05
 indexes,v06

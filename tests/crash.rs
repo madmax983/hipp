@@ -1527,3 +1527,157 @@ fn v16_cross_tool_hipp_recovers_pin_super_journal() {
         "both sides and a super-journal seen"
     );
 }
+
+// ---------------------------------------------------------------
+// v0.16 (`autovacuum`): crash injection while an auto-vacuum file
+// commits — FULL's page moves into free pages and the truncation
+// (`autoVacuumCommit`), a root moved by DROP / CREATE, and PRAGMA
+// incremental_vacuum's steps. Every kill point recovers (in hipp)
+// to the pre- or post-image byte for byte; the same crashed file
+// and journal, handed to the pin, recover to a state its integrity
+// check passes with the pre- or the post-transaction rows.
+// ---------------------------------------------------------------
+
+/// The pin recovers every kill point of `txn` (after `setup`) to the
+/// pre- or post-transaction state, its integrity check passing (the
+/// kill points before the journal's deletion roll back).
+#[cfg(feature = "autovacuum")]
+fn pin_recovers_autovacuum(tag: &str, setup: &[String], txn: &[String]) {
+    let dir =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hipp-crash-av-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let q = "PRAGMA integrity_check; SELECT count(*), total(length(x)) FROM t;";
+    block_on(async {
+        let mem = MemStorage::new();
+        {
+            let mut db = Connection::open(mem.clone(), Config::default())
+                .await
+                .expect("open");
+            run_all(&mut db, setup).await;
+        }
+        let pre = mem.snapshot();
+        let write = |name: &str, bytes: &[u8], journal: Option<Vec<u8>>| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).expect("write");
+            let j = dir.join(format!("{name}-journal"));
+            let _ = std::fs::remove_file(&j);
+            if let Some(jb) = journal {
+                std::fs::write(&j, jb).expect("journal");
+            }
+            p
+        };
+        let pre_rows = common::cli(&write("pre.db", &pre, None), q);
+        let post_mem = MemStorage::new();
+        post_mem.set_snapshot(pre.clone());
+        {
+            let mut db = Connection::open(post_mem.clone(), Config::default())
+                .await
+                .expect("open");
+            run_all(&mut db, txn).await;
+        }
+        let post_rows = common::cli(&write("post.db", &post_mem.snapshot(), None), q);
+        assert!(
+            pre_rows.starts_with("ok\n") && post_rows.starts_with("ok\n"),
+            "{tag}"
+        );
+        let total = {
+            let m = MemStorage::new();
+            m.set_snapshot(pre.clone());
+            let cs = crash_storage(m);
+            let mut db = Connection::open(cs.clone(), Config::default())
+                .await
+                .expect("open");
+            let before = cs.ops();
+            run_all(&mut db, txn).await;
+            drop(db);
+            cs.ops() - before
+        };
+        // The commit point is the journal's deletion, the last op:
+        // every kill before it rolls back.
+        let mut saw_pre = false;
+        for k in 0..total {
+            let m = MemStorage::new();
+            m.set_snapshot(pre.clone());
+            let cs = crash_storage(m.clone());
+            {
+                let mut db = Connection::open(cs.clone(), Config::default())
+                    .await
+                    .expect("open");
+                cs.st.borrow_mut().kill_at = Some(cs.ops() + k);
+                run_all(&mut db, txn).await;
+            }
+            let f = write(&format!("k{k}.db"), &m.snapshot(), m.journal_snapshot());
+            let rows = common::cli(&f, q);
+            if rows == pre_rows {
+                saw_pre = true;
+            } else if rows != post_rows {
+                panic!("{tag} k={k}/{total}: the pin recovered {rows:?}");
+            }
+        }
+        assert!(saw_pre, "{tag}: a crash before the commit point restores");
+    });
+}
+
+#[cfg(feature = "autovacuum")]
+#[test]
+fn v16_crash_autovacuum_full() {
+    let setup = vec![
+        "PRAGMA auto_vacuum = FULL".to_string(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)".to_string(),
+        "CREATE INDEX tx ON t(x)".to_string(),
+        "CREATE TABLE u (y)".to_string(),
+        rows_sql("t", 1, 150, 120),
+        "INSERT INTO u VALUES (zeroblob(9000))".to_string(),
+    ];
+    // Pages from the end moved into the free pages, then truncated.
+    let txn = strs(&["DELETE FROM t WHERE id % 3 = 0"]);
+    crash_matrix("av-full-delete", Config::default(), &setup, &txn);
+    pin_recovers_autovacuum("full-delete", &setup, &txn);
+    // A transaction that frees, reuses and frees again.
+    let txn = vec![
+        "BEGIN".to_string(),
+        "DELETE FROM t WHERE id > 40".to_string(),
+        rows_sql("t", 1000, 30, 100),
+        "DELETE FROM u".to_string(),
+        "COMMIT".to_string(),
+    ];
+    crash_matrix("av-full-txn", Config::default(), &setup, &txn);
+    pin_recovers_autovacuum("full-txn", &setup, &txn);
+    // DROP INDEX moves the largest root (u's) into its slot; CREATE
+    // moves the page after the largest root out of the way.
+    let txn = strs(&["DROP INDEX tx"]);
+    crash_matrix("av-full-drop", Config::default(), &setup, &txn);
+    pin_recovers_autovacuum("full-drop", &setup, &txn);
+    let txn = strs(&["CREATE TABLE v (z)"]);
+    crash_matrix("av-full-create", Config::default(), &setup, &txn);
+}
+
+#[cfg(feature = "autovacuum")]
+#[test]
+fn v16_crash_incremental_vacuum() {
+    let setup = vec![
+        "PRAGMA auto_vacuum = INCREMENTAL".to_string(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)".to_string(),
+        "CREATE INDEX tx ON t(x)".to_string(),
+        rows_sql("t", 1, 200, 120),
+        "DELETE FROM t WHERE id % 2 = 0".to_string(),
+    ];
+    for (tag, txn) in [
+        ("inc-7", strs(&["PRAGMA incremental_vacuum(7)"])),
+        ("inc-all", strs(&["PRAGMA incremental_vacuum"])),
+        (
+            "inc-txn",
+            vec![
+                "BEGIN".to_string(),
+                "PRAGMA incremental_vacuum(3)".to_string(),
+                rows_sql("t", 1000, 20, 100),
+                "PRAGMA incremental_vacuum(2)".to_string(),
+                "COMMIT".to_string(),
+            ],
+        ),
+    ] {
+        crash_matrix(&format!("av-{tag}"), Config::default(), &setup, &txn);
+        pin_recovers_autovacuum(tag, &setup, &txn);
+    }
+}

@@ -2476,13 +2476,26 @@ async fn collapse_table_root<S: Storage>(pager: &mut Pager<S>, root: u32) -> Res
         let cidx = pager.load(child).await?;
         let csnap = copy_bytes(pager.frame_data(cidx));
         let ch = head::<S::Error>(csnap.as_slice(), child)?;
+        // Page 1 holds 100 bytes fewer than its child: a child that
+        // does not fit stays, under a root with no cell (the pin's
+        // `balance_nonroot` shrinks only when `hdrOffset <= nFree`;
+        // v0.16 fix, ungated: the cells were packed over the
+        // pointer array, corrupting `sqlite_schema` — a DROP TABLE
+        // or ALTER of a 512-byte-page file with a two-leaf schema).
+        let hdr_off = if root == 1 { 100 } else { 0 };
         match ch.kind {
             KIND_LEAF_TABLE => {
                 let cells = leaf_cells::<S::Error>(csnap.as_slice(), child, usable)?;
+                if leaf_need(cells.as_slice(), hdr_off) > usable {
+                    return Ok(());
+                }
                 write_leaf_page(pager, root, cells.as_slice(), false).await?;
             }
             KIND_INTERIOR_TABLE => {
                 let (cpairs, cright) = interior_cells::<S::Error>(csnap.as_slice(), child)?;
+                if interior_need(cpairs.as_slice(), hdr_off) > usable {
+                    return Ok(());
+                }
                 write_interior_page(pager, root, cpairs.as_slice(), cright, false).await?;
             }
             _ => return Err(Error::CorruptPage { page: child }),

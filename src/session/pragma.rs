@@ -41,6 +41,9 @@ pub(super) enum Prag {
     ForeignKeys,
     FreelistCount,
     IgnoreCheckConstraints,
+    /// `incremental_vacuum [(N)]` (v0.16, `autovacuum`).
+    #[cfg(feature = "autovacuum")]
+    IncrementalVacuum,
     IndexInfo,
     IndexList,
     IndexXinfo,
@@ -80,6 +83,8 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("foreign_keys", Prag::ForeignKeys),
     ("freelist_count", Prag::FreelistCount),
     ("ignore_check_constraints", Prag::IgnoreCheckConstraints),
+    #[cfg(feature = "autovacuum")]
+    ("incremental_vacuum", Prag::IncrementalVacuum),
     ("index_info", Prag::IndexInfo),
     ("index_list", Prag::IndexList),
     ("index_xinfo", Prag::IndexXinfo),
@@ -219,6 +224,12 @@ impl Prag {
     }
 
     fn width(self) -> usize {
+        // The pin's `incremental_vacuum` rows have no column (v0.16,
+        // `autovacuum`).
+        #[cfg(feature = "autovacuum")]
+        if self == Prag::IncrementalVacuum {
+            return 0;
+        }
         match self.columns().len() {
             0 => 1,
             n => n,
@@ -227,6 +238,10 @@ impl Prag {
 
     /// No table-valued form on the pin (v0.16).
     fn no_table(self) -> bool {
+        #[cfg(feature = "autovacuum")]
+        if self == Prag::IncrementalVacuum {
+            return true;
+        }
         #[cfg(feature = "wal")]
         if matches!(self, Prag::WalCheckpoint | Prag::WalAutocheckpoint) {
             return true;
@@ -697,6 +712,11 @@ impl<S: Storage> Connection<S> {
                 i64::from(h.page_count)
             })),
             Prag::FreelistCount => row1(int(i64::from(h.freelist_count))),
+            // The connection's mode (v0.16, `autovacuum`: the pin's
+            // in-memory one, which a ROLLBACK keeps).
+            #[cfg(feature = "autovacuum")]
+            Prag::AutoVacuum => row1(int(i64::from(self.pager.av_mode()))),
+            #[cfg(not(feature = "autovacuum"))]
             Prag::AutoVacuum => row1(int(i64::from(h.auto_vacuum))),
             Prag::Encoding => row1(text(match self.pager.text_enc() {
                 crate::record::TextEnc::Utf8 => b"UTF-8",
@@ -730,6 +750,9 @@ impl<S: Storage> Connection<S> {
             // A checkpoint is run by the statement (`step_pragma`).
             #[cfg(feature = "wal")]
             Prag::WalCheckpoint => return Err(Error::Unsupported),
+            // Run by the statement (`run_pragma`).
+            #[cfg(feature = "autovacuum")]
+            Prag::IncrementalVacuum => return Err(Error::Unsupported),
             Prag::CacheSize => row1(int(self.cfg.cache_pages as i64)),
             Prag::BusyTimeout => row1(int(i64::from(self.prag.busy_timeout))),
             Prag::ForeignKeys => row1(int(i64::from(self.prag.foreign_keys))),
@@ -1792,6 +1815,37 @@ impl<S: Storage> Statement<'_, S> {
         self.step_query().await
     }
 
+    /// `PRAGMA auto_vacuum = mode` (v0.16, `autovacuum`), as on the
+    /// pin: the mode is always kept for the next VACUUM; an empty
+    /// database takes it at once (its header written, as the pin's
+    /// pragma creates the file); an auto-vacuum file switches between
+    /// FULL and INCREMENTAL (header offset 64); a change to or from
+    /// NONE otherwise waits for VACUUM.
+    #[cfg(feature = "autovacuum")]
+    async fn set_auto_vacuum(&mut self, want: u8, pristine: bool) -> Result<Rows, S::Error> {
+        let cur = self.conn.pager.av_mode();
+        if !pristine {
+            self.conn.prag.vacuum_autovac = Some(want);
+        }
+        if want == cur {
+            return Ok(AVec::new());
+        }
+        if pristine && want != 0 {
+            crate::autovac::set_mode(&mut self.conn.pager, want).await?;
+        } else if !pristine && want != 0 && cur != 0 {
+            let pager = &mut self.conn.pager;
+            pager.set_header_u32(64, u32::from(want == 2)).await?;
+            pager.set_av_mode(want);
+            pager.header_mut().auto_vacuum = want;
+        } else {
+            return Ok(AVec::new());
+        }
+        if !self.conn.explicit_txn {
+            self.conn.pager.drive_commit().await?;
+        }
+        Ok(AVec::new())
+    }
+
     async fn run_pragma(&mut self) -> Result<Rows, S::Error> {
         let Plan::Pragma(p) = &self.plan else {
             return Err(Error::Unsupported);
@@ -1812,6 +1866,25 @@ impl<S: Storage> Statement<'_, S> {
             return self
                 .wal_checkpoint(p.arg.as_ref().map(|a| a.as_slice()))
                 .await;
+        }
+        // v0.16 (`autovacuum`): one empty row per page removed; a
+        // limit that is not a positive 32-bit integer (or none) is
+        // every page, as the pin reads it (`sqlite3GetInt32`).
+        #[cfg(feature = "autovacuum")]
+        if prag == Prag::IncrementalVacuum {
+            let limit = match p.arg.as_ref().and_then(|a| get_int32(a.as_slice())) {
+                Some(n) if n > 0 => n as u32,
+                _ => i32::MAX as u32,
+            };
+            let steps = crate::autovac::incremental(&mut self.conn.pager, limit).await?;
+            if self.conn.pager.in_txn() && !self.conn.explicit_txn {
+                self.conn.pager.drive_commit().await?;
+            }
+            let mut rows: Rows = AVec::new();
+            for _ in 0..steps {
+                rows.push(AVec::new());
+            }
+            return Ok(rows);
         }
         let Some(arg) = p.arg.as_ref().map(|a| copy_vec(a.as_slice())) else {
             return self.conn.pragma_rows(&self.arena, &p);
@@ -1913,7 +1986,11 @@ impl<S: Storage> Statement<'_, S> {
                         _ => 0,
                     }
                 };
+                #[cfg(feature = "autovacuum")]
+                return self.set_auto_vacuum(want, pristine).await;
+                #[cfg(not(feature = "autovacuum"))]
                 let cur = self.conn.pager.header().auto_vacuum;
+                #[cfg(not(feature = "autovacuum"))]
                 if want == cur || (!pristine && (want == 0 || cur == 0)) {
                     // Unchanged, or (as on the pin) a change that
                     // waits for the next VACUUM.
@@ -1922,7 +1999,7 @@ impl<S: Storage> Statement<'_, S> {
                     }
                     Ok(AVec::new())
                 } else {
-                    // hipp keeps no pointer maps.
+                    // hipp keeps no pointer maps without `autovacuum`.
                     Err(Error::Unsupported)
                 }
             }

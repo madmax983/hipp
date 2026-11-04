@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach", "autovacuum"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -314,6 +314,24 @@ datetime = ["v16"]
 # and a qualifier other than main / temp is refused as before. The
 # tiny profile excludes it per §2.
 attach = ["v16"]
+
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): auto-vacuum
+# files -- the pin's pointer-map pages (btree.c's ptrmap logic) kept
+# correct by every write (ROOTPAGE, FREEPAGE, OVERFLOW1, OVERFLOW2
+# and BTREE entries, re-derived from the trees and the freelist at
+# commit), CREATE TABLE / INDEX placing the new root at the pin's
+# page (moving the page there), DROP TABLE / INDEX moving the last
+# root into the freed slot and rewriting sqlite_schema.rootpage,
+# auto_vacuum = FULL's truncation at every commit (the pin's
+# autoVacuumCommit), auto_vacuum = INCREMENTAL with PRAGMA
+# incremental_vacuum[(N)], PRAGMA auto_vacuum on an empty database
+# (and between FULL and INCREMENTAL) and VACUUM / VACUUM INTO of an
+# auto-vacuum file keeping its mode (`src/autovac.rs`). Without it an
+# auto-vacuum file is read but every write is refused
+# (`Error::AutoVacuumUnsupported`), never left with stale maps.
+# Builds on the v0.16 PRAGMA and VACUUM machinery, so it implies
+# `v16`. The tiny profile excludes it per §2.
+autovacuum = ["v16"]
 
 [dependencies]
 

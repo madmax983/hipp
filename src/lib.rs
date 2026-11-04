@@ -18,6 +18,8 @@ extern crate std;
 pub mod agg;
 #[allow(unsafe_code)] // the bounded arena exception (SPEC §6)
 pub mod arena;
+#[cfg(feature = "autovacuum")]
+pub mod autovac;
 pub mod btree;
 #[cfg(feature = "datetime")]
 pub mod datetime;

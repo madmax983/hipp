@@ -7031,6 +7031,226 @@ points (boxed futures).
   lists the table first (pre-existing hash-order difference, main
   included; once the file is reopened the pin's order is hipp's).
 
+### Auto-vacuum files (2026-11-04)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated (leaf `autovacuum`, implies `v16`, in `max` —
+ADR 0002 — not `full`; its own `v16,autovacuum` line in
+`ci/feature-sets.txt`). Without the leaf today's refusal stands
+unchanged: an auto-vacuum file is read, every write is refused
+with `Error::AutoVacuumUnsupported` and leaves the file
+byte-identical (pinned by the `pager` unit test
+`auto_vacuum_file_refused_without_leaf`, run by the gates'
+`--features full` lib tests, and the existing suites' tests,
+now `cfg(not(feature = "autovacuum"))`).
+
+**Shipped (`src/autovac.rs`, `autovacuum`):**
+
+- **Pointer maps, derived.** The pin keeps its map with
+  `ptrmapPut` calls along every write path; hipp's B-tree code
+  rebuilds whole pages, so the map is instead derived: at each
+  commit of an auto-vacuum file (`Pager::drive_commit` →
+  `autovac::pre_commit`) every tree named by `sqlite_schema`
+  (rowid tables, indexes, WITHOUT ROWID and expression-index trees
+  alike — the walk reads raw pages), every overflow chain and the
+  freelist are walked into a `Map` (role, parent per page:
+  ROOTPAGE / FREEPAGE / OVERFLOW1 / OVERFLOW2 / BTREE), and the
+  pointer-map pages whose bytes differ are rewritten. The map is a
+  function of the file's structure, so the entries are the pin's
+  whatever path wrote the pages — inserts, deletes, balance splits
+  and merges, overflow chains made and freed, freelist trunk / leaf
+  changes, index, WITHOUT ROWID and expression-index writes,
+  REINDEX, ALTER, triggers, foreign-key actions. A page nothing
+  references, or one referenced twice, is corruption
+  (`CorruptPage`), never a guessed entry. Entries past the end of
+  the file are left as they are, as on the pin. Pointer-map pages
+  sit at the pin's positions (`ptrmapPageno`, the lock-byte page
+  skipped) for every page size; growing the file over one makes it
+  a zeroed pointer-map page and allocates the next
+  (`Pager::grow_page`, the pin's `allocateBtreePage` at the end).
+- **Root placement.** `btree::alloc_root` (every CREATE TABLE /
+  INDEX / automatic index / `sqlite_sequence` / `sqlite_stat1` /
+  CREATE TABLE AS root, and VACUUM's) is, on an auto-vacuum file,
+  the pin's `btreeCreateTable`: the page after header offset 52
+  (the largest root), skipping pointer-map and lock-byte pages,
+  taken with `BTALLOC_EXACT` (searching the freelist when the map
+  says it is free); a B-tree or overflow page there is moved out of
+  the way first (`relocatePage` / `modifyPagePointer`), then offset
+  52 is updated.
+- **Drop.** DROP TABLE / DROP INDEX on an auto-vacuum file follow
+  `sqlite3CodeDropTable` / `destroyRootPage` / `btreeDropTable`:
+  the `sqlite_sequence` row and the schema rows first, then each
+  tree largest root first — its pages freed in `clearDatabasePage`
+  order (each cell's subtree, its overflow chain, the right
+  subtree), the root freed if it is the largest, else the largest
+  root copied into its slot, freed, and its `sqlite_schema` row
+  pointed at the slot (`autovac::schema_set_root`); offset 52
+  decremented past pointer-map pages.
+- **FULL** (`autoVacuumCommit`): at commit, `finalDbSize`, then
+  `incrVacuumStep(commit)` from the last page down — free pages
+  dropped, used pages moved into the free pages the pin's
+  `BTALLOC_ANY` allocation hands out (trunk leaf 0 swapped with the
+  last, an empty trunk itself) — then the freelist emptied and the
+  file truncated. **INCREMENTAL:** commits keep free pages; `PRAGMA
+  incremental_vacuum[(N)]` runs N of the pin's
+  `sqlite3BtreeIncrVacuum` steps (`BTALLOC_EXACT` for a free last
+  page, `BTALLOC_LE` below the final size otherwise) and returns
+  one zero-column row per page removed; N is read with
+  `sqlite3GetInt32` (`'2abc'` is 2, `' 2'`, `9999999999`, `''`,
+  `0`, negatives and no argument mean every page). It works on a
+  FULL file inside a transaction too; on a plain or the temp
+  database it does nothing; `pragma_incremental_vacuum` is "no such
+  table", as on the pin.
+- **Truncation is crash- and savepoint-safe.** Before the file
+  shrinks, every page past the new end is journaled (if original)
+  and noted in the savepoint sub-journal (`Pager::keep_tail`), as
+  the pin journals a truncated tail; pages cut off are dropped
+  from the commit's write set.
+- **PRAGMA auto_vacuum.** The mode is always kept for the next
+  VACUUM; an empty database takes FULL / INCREMENTAL at once
+  (header offsets 52 = 1 and 64 written and committed, so the page
+  size is fixed from then on, as the pin's pragma creates the
+  file); an auto-vacuum file switches between FULL and INCREMENTAL
+  in place (offset 64); to or from NONE waits for VACUUM. The
+  connection's mode (`Pager::av_mode`) is the pin's in-memory one:
+  it survives ROLLBACK / ROLLBACK TO, and the next write puts it
+  back into the header (`ensure_header`, the pin's `newDatabase`).
+  The getter reports it.
+- **VACUUM / VACUUM INTO** build the image as an auto-vacuum
+  database when the file is one (or `auto_vacuum` was set first):
+  roots in the pin's order after the largest, pointer-map pages
+  skipped, the map written at the image's commit; offsets 52 / 64
+  kept. `auto_vacuum = NONE; VACUUM` still converts to a plain file,
+  `= FULL; VACUUM` converts a plain one.
+- **WAL, savepoints, ATTACH.** The upkeep runs in `drive_commit`,
+  so WAL commits (the commit frame carries the truncated size; the
+  checkpoint truncates the file), RELEASE / COMMIT of savepoints and
+  each attached database's commit (its own pager) all get it.
+
+**Ungated fix:** `Pager::free_page` filled a freelist trunk to its
+capacity (`usable/4 - 2` leaves); the pin's `freePage2` stops at
+`usable/4 - 8` (so files stay readable by SQLite before 3.6.0).
+hipp's trunks, and so the pages a FULL commit or
+incremental_vacuum moves into, now match the pin's
+(`freelist_trunk_capacity`). Tiny: no change in size (one constant).
+
+**Ungated fix (found by the generated corpus):** when a delete left
+page 1 — `sqlite_schema`'s root — an interior page with no cell,
+`collapse_table_root` copied the child into it without checking that
+it fits beside page 1's 100-byte header; a full child's cells were
+packed over the pointer array, and the pin then found the schema
+malformed. A 512-byte-page file whose schema had two leaves was
+corrupted by a DROP TABLE or ALTER TABLE ADD COLUMN (plain files
+too, at HEAD before this unit). Now a child that does not fit stays
+under a cell-less root, as the pin's `balance_nonroot` does (it
+shrinks only when `hdrOffset <= nFree`), so the pin's page 1 is
+matched (`page1_root_keeps_an_oversized_child`).
+
+**Oracle-probing notes (live pin):** `PRAGMA auto_vacuum = FULL`
+alone on a new file writes a 1-page file with offset 52 = 1;
+offset 52 is the largest root page (3 for the first table: page 2
+is the pointer map). Values: `none` / `full` / `incremental`, 0 /
+1 / 2, `'full'`, `"FULL"`; `1.5` is 1 (atoi); 3, -1, 7 and `abc`
+are 0. `auto_vacuum = 1` then `page_size = 1024`: the size stays
+4096; the reverse order applies both. After `user_version = 5` the
+mode cannot change. `BEGIN; auto_vacuum = 1; ROLLBACK` leaves an
+empty file but the getter says 1, and the next CREATE makes the
+file auto-vacuum (likewise `SAVEPOINT` / `ROLLBACK TO`). On an
+auto-vacuum file `= 0` keeps the getter's value (the change waits
+for this connection's VACUUM); FULL <-> INCREMENTAL is immediate.
+VACUUM INTO keeps the mode (or the pending one). DROP TABLE of a
+table and its UNIQUE index (roots 4, 5, largest 7): 7 moves to 5,
+6 to 4, freelist trunk 7 with leaf 6, offset 52 = 5. CREATE TABLE
+after data moves the leaf at the slot to the end of the file.
+`incremental_vacuum(N)` prints one empty line per page in list
+mode; `PRAGMA temp.incremental_vacuum`
+and a plain file print nothing. On a FULL file freelist_count is 0
+after every commit; inside a transaction it counts the free pages
+and `incremental_vacuum` removes them. WAL + FULL truncates
+logically at commit and physically at the checkpoint. Page
+choice: hipp writes a row's table cell before its index entries
+(the pin the reverse) and splits some index pages differently, so
+files with indexes written row by row can place pages
+differently (as plain files already do); without that the pin's page counts, pointer maps and root pages are
+matched page for page (`layouts_match_the_pin`).
+
+**Tests:** `tests/autovacuum_v16.rs` (live pin, one connection per
+script, rows and failing statements compared; both integrity
+checks; layouts — page count, freelist count, offsets 52 / 64 and
+every pointer-map entry — compared where page choice is
+deterministic): `layouts_match_the_pin` (roots, drops moving roots
+of tables / indexes / `sqlite_sequence`, CREATE moving a leaf,
+overflow chains, FULL truncation, incremental, incremental DROP),
+`page_sizes_and_map_pages` (512 … 65536, maps over several
+pointer-map pages, both modes), `pragma_auto_vacuum` (22 scripts:
+values, empty database, switches, ROLLBACK / ROLLBACK TO keeping
+the mode), `incremental_vacuum_arguments` (18 argument forms plus
+temp / plain / FULL-in-a-transaction / table-valued / ROLLBACK /
+savepoint cases), `vacuum_of_auto_vacuum_files` (VACUUM keeping /
+setting / dropping / switching the mode, a page-size change, 5
+VACUUM INTO cases), `files_cross_both_ways` (pin files written by
+hipp and hipp files written by the pin, both modes, two page
+sizes), `transactions_and_wal` (ROLLBACK, nested savepoints, a
+statement rollback, WAL in both modes and a journal-mode switch),
+`integrity_check_of_damaged_maps` (7 damaged pin files: the pin's
+messages and limits on hipp), `freelist_trunk_capacity` (the
+regression), and generated corpora `generated_corpus_journal` (40
+scripts) / `generated_corpus_wal` (20; `HIPP_AV_CORPUS` scales
+both) of random CREATE / INSERT / DELETE / UPDATE / DROP /
+incremental_vacuum / VACUUM / BEGIN ... COMMIT|ROLLBACK / SAVEPOINT
+scripts on FULL and INCREMENTAL files at 512, 1024 and 4096-byte
+pages (also expression indexes, WITHOUT ROWID tables, CREATE TABLE
+AS, ALTER TABLE ADD COLUMN, DROP INDEX, REINDEX and ANALYZE): rows
+and errors equal, FULL never leaves a free page after a commit,
+both integrity checks pass (500 scripts run clean with
+`HIPP_AV_CORPUS=250`). `page1_root_keeps_an_oversized_child` (the
+page-1 regression, plain and both modes). `tests/crash.rs`:
+`v16_crash_autovacuum_full` (a FULL delete commit's page moves and
+truncation, a transaction freeing and reusing pages, DROP INDEX
+moving a root, CREATE moving a page) and
+`v16_crash_incremental_vacuum` (`incremental_vacuum(7)`, all, and
+inside a transaction with inserts): every kill point recovers in
+hipp to the pre- or post-image byte for byte, and the pin, given
+the crashed file and journal, recovers to the pre- or post-rows
+with its integrity check ok. `hipp-cli/tests/cli_v16_autovacuum.rs`
+(4 tests: FULL, INCREMENTAL and pragma / VACUUM batches
+byte-identical one-shot and over stdin; a pin-written file written
+by hipp's shell).
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+(the 3.54.1 pin live) ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**: the root allocation is a
+macro, so builds without the leaf pay no extra future; the two
+ungated fixes compiled to the same size). Full **500,184 B** (Δ
+**0**; the leaf is not in `full`). Max **813,928 B** (Δ **+19,016**
+vs 794,912, ratchet raised; under the 32 KiB justification
+threshold): `src/autovac.rs` (derive, write, allocate, relocate,
+FULL commit, incremental steps, root placement, drop), the pager's
+growth / tail keeping and the PRAGMA / VACUUM / DROP wiring.
+
+**Honest gaps:**
+
+- **Commit cost.** The map is derived by walking the whole file at
+  every commit of an auto-vacuum file (and at each CREATE and
+  `incremental_vacuum`): correct by construction, but O(pages) per
+  commit where the pin's upkeep is O(pages changed). Plain files
+  pay nothing.
+- **Page choice where hipp's B-tree differs.** hipp's general
+  allocation (`alloc_page` takes a trunk's last leaf; the pin's
+  callers pass `nearby` hints), its table-before-index insert order
+  and its index split policy are unchanged, so after such writes
+  files can differ from the pin's page by page (same contents,
+  valid maps, both integrity checks pass). The moves this unit
+  owns (root placement, DROP, FULL commit, incremental_vacuum) use
+  the pin's allocator and match given the same freelist.
+- The byte content of free pages and of pointer-map entries past
+  the end of the file is not the pin's (never read by either
+  engine).
+- `PRAGMA auto_vacuum` on the TEMP database and the pin's
+  `sqlite3_autovacuum_pages` callback (no SQL surface) are not
+  modelled.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

@@ -62,6 +62,27 @@ macro_rules! abort_write {
     }};
 }
 
+/// A new table's or index's root page: in an auto-vacuum file
+/// (v0.16, `autovacuum`) the pin's slot after the largest root
+/// (`crate::autovac::alloc_root`), elsewhere any page. A macro, so
+/// builds without the leaf pay for no extra future.
+macro_rules! alloc_root {
+    ($pager:expr) => {{
+        #[cfg(feature = "autovacuum")]
+        let r = crate::autovac::alloc_root($pager).await?;
+        #[cfg(not(feature = "autovacuum"))]
+        let (r, _) = $pager.alloc_page().await?;
+        r
+    }};
+    ($pager:expr, $err:expr) => {{
+        #[cfg(feature = "autovacuum")]
+        let r = crate::autovac::alloc_root($pager).await.map_err($err)?;
+        #[cfg(not(feature = "autovacuum"))]
+        let (r, _) = $pager.alloc_page().await.map_err($err)?;
+        r
+    }};
+}
+
 #[cfg(feature = "v16")]
 mod alter;
 #[cfg(feature = "attach")]
@@ -7161,7 +7182,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             _ => return Err(Error::Unsupported),
         };
         let rows = self.exec_subplan(&select, &RowData::empty()).await?;
-        let (root, _) = self.conn.pager.alloc_page().await?;
+        let root = alloc_root!(&mut self.conn.pager);
         btree::create_empty_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(b"table", name, name, root, Some(sql.as_slice()))
             .await?;
@@ -7225,7 +7246,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         sql_text: &[u8],
         #[cfg(feature = "v16")] autoinc: bool,
     ) -> Result<(), S::Error> {
-        let (root, _) = self.conn.pager.alloc_page().await?;
+        let root = alloc_root!(&mut self.conn.pager);
         // A WITHOUT ROWID table's B-tree is an index B-tree (v0.16).
         #[cfg(feature = "without_rowid")]
         if create_without_rowid(&self.ast) {
@@ -7253,7 +7274,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .find(&self.conn.catalog_arena, b"sqlite_sequence")
                 .is_none()
         {
-            let (sroot, _) = self.conn.pager.alloc_page().await?;
+            let sroot = alloc_root!(&mut self.conn.pager);
             btree::create_empty_root(&mut self.conn.pager, sroot).await?;
             self.insert_schema_row(
                 b"table",
@@ -7333,7 +7354,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         // Phase 2: one empty index B-tree + schema row per name.
         for auto_name in names.iter() {
-            let (root, _) = self.conn.pager.alloc_page().await?;
+            let root = alloc_root!(&mut self.conn.pager);
             btree::create_empty_index_root(&mut self.conn.pager, root).await?;
             self.insert_schema_row(b"index", auto_name.as_slice(), table, root, None)
                 .await?;
@@ -7401,7 +7422,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let raw = handle_bytes(&self.arena, self.sql_text);
         let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
-        let (root, _) = self.conn.pager.alloc_page().await?;
+        let root = alloc_root!(&mut self.conn.pager);
         btree::create_empty_index_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(
             b"index",
@@ -7563,6 +7584,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Collect first, then free: freeing rewrites the freelist
         // linkage the traversal is not using, but the traversal
         // must see the intact tree.
+        // An auto-vacuum file (v0.16, `autovacuum`): the schema row
+        // first, then the tree, the largest root moving into its slot.
+        #[cfg(feature = "autovacuum")]
+        if self.conn.pager.autovac() {
+            btree::btree_delete(&mut self.conn.pager, 1, schema_rowid).await?;
+            let moved = crate::autovac::drop_tree(&mut self.conn.pager, root).await?;
+            if moved != 0 {
+                crate::autovac::schema_set_root(&mut self.conn.pager, moved, root).await?;
+            }
+            self.conn.pager.bump_schema_cookie();
+            if !self.conn.explicit_txn {
+                self.conn.pager.drive_commit().await?;
+            }
+            return Ok(());
+        }
         let pages = btree::collect_index_pages(&mut self.conn.pager, root).await?;
         for p in pages.iter() {
             self.conn.pager.free_page(*p).await?;
@@ -10540,6 +10576,34 @@ impl<'c, S: Storage> Statement<'c, S> {
         if let Some(n) = &stored {
             self.clear_stat_rows(0, n.as_slice()).await?;
         }
+        // An auto-vacuum file (v0.16, `autovacuum`) drops as the pin
+        // does: the AUTOINCREMENT row and the schema rows first, then
+        // each tree, largest root first, the largest root moving into
+        // a freed slot (its schema row following it).
+        #[cfg(feature = "autovacuum")]
+        if self.conn.pager.autovac() {
+            if let Some((sroot, tname)) = &seq {
+                self.drop_seq_row(*sroot, tname.as_slice()).await?;
+            }
+            for r in schema_rowids.iter() {
+                btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
+            }
+            let mut roots: AVec<u32> = AVec::new();
+            roots.push(root);
+            for ir in index_roots.iter() {
+                if *ir != root {
+                    roots.push(*ir);
+                }
+            }
+            roots.as_mut_slice().sort_unstable_by(|a, b| b.cmp(a));
+            for r in roots.iter() {
+                let moved = crate::autovac::drop_tree(&mut self.conn.pager, *r).await?;
+                if moved != 0 {
+                    crate::autovac::schema_set_root(&mut self.conn.pager, moved, *r).await?;
+                }
+            }
+            return self.drop_table_end().await;
+        }
         let mut pages = btree::collect_table_pages(&mut self.conn.pager, root).await?;
         for ir in index_roots.iter() {
             // A WITHOUT ROWID table's key is the table's tree (v0.16).
@@ -10557,21 +10621,33 @@ impl<'c, S: Storage> Statement<'c, S> {
         for r in schema_rowids.iter() {
             btree::btree_delete(&mut self.conn.pager, 1, *r).await?;
         }
-        if let Some((sroot, tname)) = seq {
-            let mut gone = AVec::new();
-            let mut cursor = ScanCursor::new(sroot);
-            let mut buf = AVec::new();
-            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-                let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 1)?;
-                if matches!(values.as_slice().first(), Some(Value::Text(n)) if *n == tname.as_slice())
-                {
-                    gone.push(rowid);
-                }
-            }
-            for r in gone.iter() {
-                btree::btree_delete(&mut self.conn.pager, sroot, *r).await?;
+        if let Some((sroot, tname)) = &seq {
+            self.drop_seq_row(*sroot, tname.as_slice()).await?;
+        }
+        self.drop_table_end().await
+    }
+
+    /// Remove a dropped AUTOINCREMENT table's `sqlite_sequence` row.
+    #[cfg(feature = "v05")]
+    async fn drop_seq_row(&mut self, sroot: u32, tname: &[u8]) -> Result<(), S::Error> {
+        let mut gone = AVec::new();
+        let mut cursor = ScanCursor::new(sroot);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 1)?;
+            if matches!(values.as_slice().first(), Some(Value::Text(n)) if *n == tname) {
+                gone.push(rowid);
             }
         }
+        for r in gone.iter() {
+            btree::btree_delete(&mut self.conn.pager, sroot, *r).await?;
+        }
+        Ok(())
+    }
+
+    /// DROP TABLE's end: the schema cookie, then the commit.
+    #[cfg(feature = "v05")]
+    async fn drop_table_end(&mut self) -> Result<(), S::Error> {
         self.conn.pager.bump_schema_cookie();
         #[cfg(feature = "foreign_keys")]
         {

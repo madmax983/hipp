@@ -418,7 +418,10 @@ fn page_size_encoding_and_auto_vacuum_on_a_fresh_database() {
     for (i, s) in [
         #[cfg(not(feature = "utf16"))]
         "PRAGMA encoding = 'UTF-16le'",
+        // Honoured with the `autovacuum` leaf (tests/autovacuum_v16.rs).
+        #[cfg(not(feature = "autovacuum"))]
         "PRAGMA auto_vacuum = 1",
+        #[cfg(not(feature = "autovacuum"))]
         "PRAGMA auto_vacuum = incremental",
         // WAL mode and the safety levels are honoured with the `wal`
         // leaf (tests/wal_v16.rs).

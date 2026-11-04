@@ -412,9 +412,10 @@ aspirations.
   expression (`?`, `''`); a new rowid past 9223372036854775807
   takes an unused one. Gaps: whole-database ANALYZE row order (the
   pin's schema hash), VACUUM of a file with an expression or
-  partial index without `expr_index`, VACUUM of an auto-vacuum file (refused: hipp
-  writes no pointer maps; kept by the honest-gap sweep, which also
-  refuses every other write to such a file) (STATUS.md).
+  partial index without `expr_index`, VACUUM of an auto-vacuum file
+  without the `autovacuum` leaf (refused: no pointer-map upkeep; the
+  honest-gap sweep refuses every other write to such a file too, and
+  the leaf lifts both) (STATUS.md).
 - **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
   `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
   [COLUMN] a` edit the stored schema texts token by token exactly
@@ -730,10 +731,11 @@ aspirations.
   longer opaque; and statements across the TEMP and main databases
   — main statements reading temp tables, `INSERT INTO temp.x SELECT
   ... FROM main.y` and `CREATE TEMP TABLE x AS SELECT ...` over main,
-  TEMP views over both, pragma functions on temp objects. VACUUM of
-  an auto-vacuum file stays refused (no pointer-map upkeep), and
-  since the review fixes so does every other write to such a file
-  (they used to leave the pin's pointer maps stale). Review fixes
+  TEMP views over both, pragma functions on temp objects. Without
+  the `autovacuum` leaf VACUUM of an auto-vacuum file stays refused
+  (no pointer-map upkeep), and since the review fixes so does every
+  other write to such a file (they used to leave the pin's pointer
+  maps stale); the leaf (below) writes them. Review fixes
   also keep views and triggers stored in main reading main only (a
   temp table no longer shadows their tables), refuse INDEXED BY on a
   trigger body's UPDATE / DELETE as the pin does, ignore the schema
@@ -793,6 +795,29 @@ aspirations.
   files and hipp recovering the pin's. `no_std` callers supply an
   attached name's storage through `Connection::set_attach_hook`;
   `FileStorage` opens files. hipp-cli gains `.databases`.
+- **Auto-vacuum files** (leaf `autovacuum`, in `max`). Files with
+  pointer maps are written as the pin writes them: every entry
+  (ROOTPAGE, FREEPAGE, OVERFLOW1, OVERFLOW2, BTREE) on the pin's
+  pointer-map pages at every page size, derived from the trees and
+  the freelist at each commit so every write path keeps them right;
+  CREATE TABLE / INDEX put the root after the largest root, moving
+  the page there out of the way; DROP TABLE / INDEX move the largest
+  root into the freed slot and rewrite its `sqlite_schema.rootpage`;
+  `auto_vacuum = FULL` moves pages from the end into the free pages
+  and truncates at every commit (the pin's `autoVacuumCommit`);
+  `INCREMENTAL` keeps them for `PRAGMA incremental_vacuum[(N)]` (the
+  pin's argument rules, one empty row per page). `PRAGMA
+  auto_vacuum` sets the mode of an empty database (writing its
+  header at once, the mode surviving a ROLLBACK as on the pin),
+  switches FULL and INCREMENTAL in place, and leaves a change to or
+  from NONE to VACUUM, which (VACUUM INTO too) otherwise keeps the
+  mode. Root pages, page counts and pointer maps match the pin's
+  where its page choice is deterministic; each engine writes the
+  other's files, integrity checks pass both ways, and crashes
+  during the page moves or incremental_vacuum recover (in hipp and
+  in the pin) to the last commit. Ungated: freelist trunks hold the
+  pin's `usable/4 - 8` leaves. Without the leaf such files stay read
+  only (`AutoVacuumUnsupported`).
 
 ## What v0.13 does
 
@@ -1113,9 +1138,10 @@ indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABL
 stored but never executed (all of these in the tiny profile: the
 `v04` ... `v16` rungs add them — views execute with `v16`), no
 UTF-16 databases without the `utf16` leaf (refused at open), no
-writes to auto-vacuum files (read only: hipp keeps no pointer-map
-pages, so writes are refused with `AutoVacuumUnsupported` until
-`PRAGMA auto_vacuum = NONE; VACUUM` converts the file), no
+writes to auto-vacuum files without the `autovacuum` leaf (read
+only: writes are refused with `AutoVacuumUnsupported` until `PRAGMA
+auto_vacuum = NONE; VACUUM` converts the file; with it they are
+written, pointer maps kept), no
 ATTACH without the `attach` leaf (refused; with it, one file is
 attached once — hipp has no shared page cache), no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
@@ -1147,7 +1173,8 @@ B-tree interface, feature `without_rowid`, v0.16), `utf16`
 (UTF-16 text conversions and the record translation of UTF-16
 files, feature `utf16`, v0.16),
 `datetime` (the date and time functions, feature `datetime`,
-v0.16), `systime` (the host clock and time zone, feature `std`),
+v0.16), `autovac` (auto-vacuum pointer maps and page moves,
+feature `autovacuum`, v0.16), `systime` (the host clock and time zone, feature `std`),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

@@ -1854,6 +1854,9 @@ SELECT sql FROM sqlite_temp_master ORDER BY name;
 /// stale (the pin's integrity check then failed). Reads work, the
 /// file stays byte-identical, and `PRAGMA auto_vacuum = NONE;
 /// VACUUM` converts it, after which writes work.
+// Without the `autovacuum` leaf (with it the file is written:
+// tests/autovacuum_v16.rs).
+#[cfg(not(feature = "autovacuum"))]
 #[test]
 fn auto_vacuum_file_is_not_written() {
     for mode in ["FULL", "INCREMENTAL"] {

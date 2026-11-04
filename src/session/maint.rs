@@ -546,13 +546,23 @@ impl<S: Storage> Statement<'_, S> {
                 kind: SchemaKind::VacuumInTransaction,
             });
         }
-        // hipp keeps no pointer maps: an auto-vacuum file can only
-        // be vacuumed into a plain one (`PRAGMA auto_vacuum = 0`).
+        // The image's auto-vacuum mode: a pending `PRAGMA auto_vacuum`
+        // or the file's own, as on the pin (VACUUM INTO too). Without
+        // `autovacuum` hipp keeps no pointer maps: an auto-vacuum file
+        // can only be vacuumed into a plain one (`auto_vacuum = 0`).
+        #[cfg(feature = "autovacuum")]
+        let av = self
+            .conn
+            .prag
+            .vacuum_autovac
+            .unwrap_or(self.conn.pager.av_mode());
+        #[cfg(not(feature = "autovacuum"))]
         let av = self
             .conn
             .prag
             .vacuum_autovac
             .unwrap_or(self.conn.pager.header().auto_vacuum);
+        #[cfg(not(feature = "autovacuum"))]
         if av != 0 {
             return Err(Error::Unsupported);
         }
@@ -576,7 +586,7 @@ impl<S: Storage> Statement<'_, S> {
         } else {
             ps
         };
-        let mut img = self.compact_image(ps, into.is_some()).await?;
+        let mut img = self.compact_image(ps, into.is_some(), av).await?;
         // Page 1's header, as the pin leaves it.
         let h = *self.conn.pager.header();
         let i1 = self.conn.pager.load(1).await?;
@@ -598,13 +608,17 @@ impl<S: Storage> Statement<'_, S> {
         put_be_u32(d, 40, h.schema_cookie.wrapping_add(1));
         put_be_u32(d, 44, 4);
         put_be_u32(d, 48, cache_size);
-        put_be_u32(d, 52, 0);
+        // An auto-vacuum image keeps the largest root and the mode
+        // its build wrote (v0.16, `autovacuum`).
+        if av == 0 {
+            put_be_u32(d, 52, 0);
+            put_be_u32(d, 64, 0);
+        }
         #[cfg(feature = "utf16")]
         put_be_u32(d, 56, crate::pager::enc_code(self.conn.pager.text_enc()));
         #[cfg(not(feature = "utf16"))]
         put_be_u32(d, 56, 1);
         put_be_u32(d, 60, h.user_version);
-        put_be_u32(d, 64, 0);
         put_be_u32(d, 68, h.application_id);
         put_be_u32(d, 92, counter);
         put_be_u32(d, 96, crate::pager::PIN_VERSION_NUMBER);
@@ -665,7 +679,12 @@ impl<S: Storage> Statement<'_, S> {
     /// Build the vacuumed database image (header fields other than
     /// the page size, layout and schema are patched by the
     /// caller). `keep_rowids`: VACUUM INTO keeps every rowid.
-    async fn compact_image(&mut self, ps: u32, keep_rowids: bool) -> Result<AVec<u8>, S::Error> {
+    async fn compact_image(
+        &mut self,
+        ps: u32,
+        keep_rowids: bool,
+        av: u8,
+    ) -> Result<AVec<u8>, S::Error> {
         let rows = self.schema_rows().await?;
         let rs = rows.as_slice();
         // The pin's order: each table (sqlite_sequence once, after
@@ -731,13 +750,24 @@ impl<S: Storage> Statement<'_, S> {
         // VACUUM keeps the encoding (v0.16, `utf16`).
         #[cfg(feature = "utf16")]
         dst.set_text_enc(self.conn.pager.text_enc());
+        // An auto-vacuum image is built as one (v0.16, `autovacuum`):
+        // roots after the largest, pointer-map pages skipped and
+        // written at its commit.
+        #[cfg(feature = "autovacuum")]
+        if av != 0 {
+            crate::autovac::set_mode(&mut dst, av)
+                .await
+                .map_err(mem_err)?;
+        }
+        #[cfg(not(feature = "autovacuum"))]
+        let _ = av;
         let mut rowid = 0i64;
         // (source root, new root, is a table, schema index)
         let mut copies: AVec<(u32, u32, bool, usize)> = AVec::new();
         for &i in order.iter() {
             let r = &rs[i];
             let table = r.is(b"table");
-            let (root, _) = dst.alloc_page().await.map_err(mem_err)?;
+            let root = alloc_root!(&mut dst, mem_err);
             // A WITHOUT ROWID table's tree, and its indexes, are copied
             // as raw records (v0.16).
             #[cfg(feature = "without_rowid")]
@@ -1096,7 +1126,7 @@ impl<S: Storage> Statement<'_, S> {
         {
             Some(t) => t.root,
             None => {
-                let (root, _) = self.conn.pager.alloc_page().await?;
+                let root = alloc_root!(&mut self.conn.pager);
                 btree::create_empty_root(&mut self.conn.pager, root).await?;
                 self.insert_schema_row(
                     b"table",
