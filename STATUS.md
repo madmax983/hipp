@@ -5903,7 +5903,7 @@ file whose header says WAL is refused at open with
 `Storage::sidecar` call, so the `-wal` is reachable in no_std on any
 caller storage (`MemStorage` keeps one buffer per kind; `FileStorage`
 names them `<db>-wal` / `<db>-shm`), plus `Storage::locked_elsewhere`
-(default `false`; `FileStorage` on Linux reads `/proc/locks` for a
+(since the review fixes `claim_wal` / `release_wal`; default `false`; `FileStorage` on Linux reads `/proc/locks` for a
 POSIX lock another process holds on the database or its `-shm` — a
 live pin connection). `src/wal.rs` is the log: the pin's format
 (header, salts, cumulative checksums in either byte order, commit
@@ -6047,6 +6047,8 @@ PRAGMAs and the `Connection::close` wiring.
   a ROLLBACK TO may leave other pages dirty than on the pin. The
   generated corpora compare checkpoint rows by meaning (frames
   present, all checkpointed), the hand-written suites exactly.
+  (An UPDATE that rewrote unchanged index entries and rows was a
+  further, common cause: fixed in the review fixes below.)
 - The pin creates the empty `-wal` at its first read in WAL mode;
   hipp at its first frame. The checkpoint's "locked" rule reads
   "a page was read since BEGIN / SAVEPOINT" (a schema re-read after
@@ -6055,21 +6057,150 @@ PRAGMAs and the `Connection::close` wiring.
   on Linux (`/proc/locks`) and only at open and at the switch to WAL;
   hipp never writes a `-shm`, so a pin connection opened later
   beside hipp's is not coordinated with (never do that). `busy` is
-  always 0. `PRAGMA locking_mode` stays refused.
+  always 0. `PRAGMA locking_mode` stays refused. (A second hipp
+  connection is refused since the review fixes below.)
 - `journal_mode` PERSIST / TRUNCATE / MEMORY / OFF are still refused
-  (from WAL mode too). The CLI's `:memory:` database (`MemStorage`)
-  enters WAL mode; the pin's reports `memory` and cannot.
+  (from WAL mode too). (The CLI's `:memory:` database entered WAL
+  mode: fixed below.)
 - `PRAGMA encoding` after `journal_mode = WAL` on a new database is
   ignored by hipp (its page 1 already says UTF-8); the pin still
   takes it.
-- Without the leaf, a rollback-mode header with a non-empty `-wal`
-  beside it (hand-placed: the pin never leaves committed frames
-  beside such a header) is read from the database file.
+- (Without the leaf, a rollback-mode header with a non-empty `-wal`
+  beside it was read from the database file. This gap's claim that
+  only hand-placed files get there was wrong — the pin opens such a
+  database in WAL mode and commits into the log; fixed below.)
 - A log whose page size differs from the database's with committed
   frames is refused (`CorruptPage`). `synchronous = NORMAL` in
   rollback mode syncs as FULL; EXTRA does not sync the directory. A
   commit whose final sync fails is rolled back in memory after its
   commit frame's salts are overwritten, best effort.
+
+### WAL journal mode — review fixes (2026-11-04)
+
+Four review findings, each reproduced first on the pre-fix build and
+compared with the live 3.54.1 pin.
+
+**Fixed (regression tests: `tests/wal_v16.rs`
+`a_second_hipp_connection_is_refused`, `memory_db_stays_memory`;
+`src/pager.rs` `log_beside_rollback_header` (run by the tiny, `full`
+and `max` lib tests); `hipp-cli/tests/cli_v16_wal.rs`
+`dot_open_same_wal_db_then_killed`, `dot_open_failure_substitutes_memory`,
+`memory_database_stays_memory`, `update_frames_match`):**
+
+- **`.open` of the WAL database already open lost commits on a crash**
+  (high). hipp-cli opened the new connection before closing the old
+  one; the new one rebuilt its heap wal-index from the `-wal`, then
+  the old one's close checkpointed and unlinked that file, and the new
+  one's later commits went to the unlinked inode — shown by its
+  SELECTs, on no file once the process died. The CLI now closes first,
+  as the pin's shell does, and when the new open fails it carries on
+  with a substitute in-memory database, as the pin does (it kept the
+  old one). The root cause — two connections on one WAL database in
+  one process — is closed in the library too: the storage hook
+  `Storage::locked_elsewhere` became `claim_wal` / `release_wal`.
+  `FileStorage` takes an exclusive `flock` on the database file when a
+  database opens in or enters WAL mode (Unix; SQLite's POSIX locks
+  neither take nor see it) and drops it on leaving WAL mode, at close
+  or when dropped; a second hipp connection, in this process or
+  another, gets `DatabaseBusy` at open or at `journal_mode = WAL`.
+  The live-pin check (`/proc/locks`) is unchanged. `crash_writer`'s
+  wrapper forwards the hooks.
+- **Builds without `wal` read a stale main file beside the pin's
+  committed frames** (high; every build without the leaf, the tiny
+  profile included). The no-wal open path looked only at header bytes
+  18 / 19, but the pin opens a database in WAL mode whenever a
+  non-empty `-wal` sits beside it (probed: 100 bytes of junk there,
+  `journal_mode` reports `wal` and commits go into the log with the
+  header still 1 / 1). hipp then returned the old rows and committed
+  into the main file under the log, where the pin's replay hid them.
+  A new hook, `Storage::log_beside` (default `false`; `FileStorage`
+  looks for a non-empty `<db>-wal`), is consulted at open without the
+  leaf: such a database is refused with `WalUnsupported`. (A log beside
+  an empty file is refused there too, where the pin would delete it.)
+  With the leaf the log is read through `Sidecar::Wal`, as before. The
+  earlier gap's "only hand-placed" claim and README's "never read
+  stale" were wrong until now.
+- **An UPDATE logged pages the pin leaves clean** (medium; `wal`).
+  Every UPDATE deleted and reinserted every index entry and the row,
+  so an index no assigned column reaches, or a row whose record did
+  not change, was written: one frame per such page too many in
+  `wal_checkpoint`'s `log|checkpointed` (`t(a PRIMARY KEY, b)`, `SET
+  b = 'y'`: 0|2|2 against the pin's 0|1|1). Probed page by page on the
+  pin (its `-wal` listed by `.system`): an index is left alone unless
+  an assigned column, a generated column computed from one, its WHERE
+  or the rowid (a WITHOUT ROWID primary key) reaches it; a plain one
+  that is reached is rewritten even with its entry unchanged (`SET a =
+  a` on `t(a)` logs the index page); one with an expression or VIRTUAL
+  generated key part only when its entry changes (`t(a+0)`, `SET a =
+  a`: nothing; a WITHOUT ROWID row whose key value changes rewrites
+  every entry the change reaches, as its entries end in the key — the
+  first gate run caught a version that compared handles there); the row is rewritten only when its key is assigned or
+  its record changes, and a record of the same size is overwritten in
+  place, only its local part and overflow pages whose bytes differ
+  written (the pin's `btreeOverwriteCell`: `SET b = 'z'` past a 5000-byte
+  blob logs one overflow page). `rewrite_stored_row` (UPDATE and
+  upsert DO UPDATE) now does all that (`btree::btree_overwrite`,
+  `TableRules::changed_cols`, the CHECK path's change set factored
+  out). Gated on `wal`, where the counts show: without the leaf the
+  old rewrite stays (rollback mode then journals the extra pages,
+  which no result shows), so `full` does not grow.
+- **In-memory databases entered WAL mode** (medium). The pin keeps a
+  `:memory:` database in journal mode `memory`: every `journal_mode`
+  query and assignment (WAL, DELETE, OFF, …) reports `memory`,
+  `wal_checkpoint` is `0|-1|-1`; hipp reported `delete` (before this
+  unit too), then switched to WAL and checkpointed. A new hook,
+  `Storage::is_memory` (`v16`, default `false`), and
+  `MemStorage::memory_db()` mark an in-memory database (plain
+  `MemStorage::new()` still models a file, as the tests and crash
+  injectors need); the CLI's `:memory:` uses it. Ungated within the
+  `v16` PRAGMA code. (`PRAGMA temp.journal_mode` stays `delete`, as on
+  the pin.)
+
+**Probing notes:** the pin's shell `.open` closes first, and on a
+failed open prints its error and "using substitute in-memory
+database". UPDATE pages (two-row tables, one leaf per tree, the
+pin's frames listed): `t(a)` / `SET a = 1` with a already 1 → the
+index page; `t(a+0)`, `t(lower(a))`, `t(a, b || '')` → none; `t(c)
+WHERE a > 0`, `SET a = a` → the index page; `t(c) WHERE a > 5` (row
+outside the index before and after), `SET a = 2` → the table page
+only; `c AS (a + 1) VIRTUAL` indexed, `SET a = a` → none, STORED → the
+index page; `t(a INTEGER PRIMARY KEY, …)` with `SET a = a` → the table
+and every plain index, not an expression index; WITHOUT ROWID `SET b =
+b` → none, `SET a = a` → table and index. A REAL column's integral
+value is stored by the pin as an integer (serial type 1), by hipp as
+an 8-byte real (pre-existing); both read 1.0.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` end
+with "==> all gates passed". `update_frames_match`'s generated part
+agreed exactly (rows, checkpoint row, integrity) at
+`HIPP_WAL_CORPUS=400`.
+
+**Size:** tiny **76,976 B** (Δ **0**: the no-wal check is a default
+method `MemStorage` does not override). Full **498,252 B** (Δ
+**+72 B**, ratchet raised: the ungated in-memory journal-mode fix in the
+`v16` PRAGMA code). Max **748,212 B** (Δ **+2,952 B** vs 745,260,
+raised): the UPDATE page rules and `btree_overwrite`, the WAL claim.
+
+**Honest gaps (updated):**
+
+- The pin's `hasFK > 1` case (an UPDATE of a parent key that an FK
+  with an ON UPDATE action references rewrites every index) is not
+  modelled: hipp logs only the indexes the change reaches.
+- A record whose size changes is still deleted and reinserted (the
+  pin frees and reallocates its overflow pages differently: a
+  5000-byte blob grown by one byte logs 4 frames on the pin, 2 on
+  hipp); pre-existing layout differences after deletes stand.
+- A row the pin wrote with a REAL column's integral value is a
+  different record to hipp (integer vs 8-byte real, pre-existing), so
+  hipp rewrites it where the pin finds it unchanged.
+- The WAL claim is advisory and Unix-only (`flock`); a non-Unix
+  `FileStorage` claims nothing. Rollback-mode connections take no
+  lock, so two hipp connections on one rollback-mode file are still
+  not coordinated (pre-existing).
+- Without the leaf a non-empty `-wal` beside an empty database file
+  is refused rather than deleted as the pin does; a caller's own
+  storage must implement `log_beside` to be checked.
+- The unit's other gaps stand.
 
 ### Honest-gap sweep: constraint conflict clauses, INDEXED BY, three-part names, TEMP across databases (2026-11-04)
 

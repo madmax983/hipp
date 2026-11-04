@@ -885,6 +885,116 @@ fn a_live_pin_connection_is_refused() {
     assert_eq!(hipp_query(&o, "PRAGMA journal_mode"), "wal");
 }
 
+/// Two hipp connections on one WAL database in one process (v0.16
+/// review fix): each would keep its own heap wal-index, and the
+/// first one's close would checkpoint and unlink the log the second
+/// appends to, its commits then on no file at all. The second is
+/// refused (`DatabaseBusy`) while the first holds the database in WAL
+/// mode — at open, or when it would enter WAL mode — and opens once
+/// the first has closed or left WAL mode. Every commit stays on disk.
+#[cfg(unix)]
+#[test]
+fn a_second_hipp_connection_is_refused() {
+    let h = common::temp_db("wal-two");
+    block_on(async {
+        let open = || async {
+            Connection::open(FileStorage::open(&h).expect("fs"), Config::default()).await
+        };
+        let exec = |db: &mut Connection<FileStorage>, sql: &'static str| {
+            let fut = async move {
+                let mut q = db.prepare(sql).await?;
+                while q.step().await? == Step::Row {}
+                Ok::<(), Error<FsError>>(())
+            };
+            block_on(fut)
+        };
+        let mut a = open().await.expect("first");
+        exec(&mut a, "PRAGMA journal_mode = WAL").expect("wal");
+        exec(&mut a, "CREATE TABLE t(a)").expect("create");
+        exec(&mut a, "INSERT INTO t VALUES (1)").expect("insert");
+        assert!(matches!(open().await.map(|_| ()), Err(Error::DatabaseBusy)));
+        a.close().await.expect("close");
+        let mut b = open().await.expect("second, after the first closed");
+        exec(&mut b, "INSERT INTO t VALUES (2)").expect("insert");
+        // The log is the one on disk: a crash (the connection
+        // dropped, nothing checkpointed) loses nothing.
+        drop(b);
+        assert_eq!(pin_query(&h, "SELECT a FROM t ORDER BY a"), "1\n2");
+        // A rollback-mode connection may not enter WAL mode while
+        // another holds the database in it; once that one has left
+        // WAL mode, it may.
+        let mut c = open().await.expect("third");
+        exec(&mut c, "PRAGMA journal_mode = DELETE").expect("delete");
+        let mut d = open().await.expect("rollback-mode open");
+        exec(&mut c, "PRAGMA journal_mode = WAL").expect("wal again");
+        assert!(matches!(
+            exec(&mut d, "PRAGMA journal_mode = WAL"),
+            Err(Error::DatabaseBusy)
+        ));
+        exec(&mut c, "PRAGMA journal_mode = DELETE").expect("leave");
+        drop(c);
+        drop(d);
+    });
+    assert_eq!(
+        pin_query(&h, "SELECT a FROM t ORDER BY a; PRAGMA integrity_check"),
+        "1\n2\nok"
+    );
+}
+
+/// `MemStorage::memory_db` is an in-memory database (v0.16 review
+/// fix): its journal mode is `memory` whatever is asked, as the pin's
+/// `:memory:` — no WAL mode, `wal_checkpoint` `0|-1|-1`. A plain
+/// `MemStorage` models a file and switches as one.
+#[test]
+fn memory_db_stays_memory() {
+    use hipp::MemStorage;
+    fn rows(storage: MemStorage, sql: &[&str]) -> Vec<String> {
+        block_on(async {
+            let mut db = Connection::open(storage, Config::default())
+                .await
+                .expect("open");
+            let mut out = Vec::new();
+            for s in sql {
+                let mut q = db.prepare(s).await.expect("prepare");
+                while q.step().await.expect("step") == Step::Row {
+                    let mut line = String::new();
+                    for i in 0..q.column_count() {
+                        if i > 0 {
+                            line.push('|');
+                        }
+                        match q.column_value(i) {
+                            Some(hipp::Value::Integer(v)) => line.push_str(&v.to_string()),
+                            Some(hipp::Value::Text(b)) => {
+                                line.push_str(&String::from_utf8_lossy(b))
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.push(line);
+                }
+            }
+            out
+        })
+    }
+    let sql = [
+        "PRAGMA journal_mode",
+        "PRAGMA journal_mode = WAL",
+        "PRAGMA journal_mode = OFF",
+        "CREATE TABLE t(a)",
+        "INSERT INTO t VALUES (1)",
+        "PRAGMA wal_checkpoint",
+        "PRAGMA journal_mode",
+    ];
+    assert_eq!(
+        rows(MemStorage::memory_db(), &sql),
+        ["memory", "memory", "memory", "0|-1|-1", "memory"]
+    );
+    let file = MemStorage::new();
+    let got = rows(file.clone(), &sql[..2]);
+    assert_eq!(got, ["delete", "wal"]);
+    assert_eq!(file.snapshot().get(18..20), Some(&[2u8, 2][..]));
+}
+
 #[test]
 fn errors_are_the_pins() {
     let h = common::temp_db("wal-err");

@@ -2553,6 +2553,99 @@ async fn btree_rebuild_without<S: Storage>(
     Ok(())
 }
 
+/// Overwrite row `rowid` of the table rooted at `root` in place
+/// when its stored payload is exactly `payload.len()` bytes (v0.16,
+/// `wal`): the pin's `btreeOverwriteCell`, which writes (and so
+/// dirties, logging a WAL frame) only the local part and the overflow
+/// pages whose bytes differ. `Ok(false)`: no such row, or a payload
+/// of another size, which the caller deletes and inserts. A WITHOUT
+/// ROWID row is only recognised unchanged (`Ok(true)`, nothing
+/// written).
+#[cfg(feature = "wal")]
+pub async fn btree_overwrite<S: Storage>(
+    pager: &mut Pager<S>,
+    root: u32,
+    rowid: i64,
+    payload: &[u8],
+) -> Result<bool, S::Error> {
+    #[cfg(feature = "without_rowid")]
+    if pager.wr.table_of(root).is_some() {
+        return Ok(seek_rowid(pager, root, rowid)
+            .await?
+            .is_some_and(|b| b.as_slice() == payload));
+    }
+    #[cfg(feature = "utf16")]
+    let conv = stored_record::<S::Error>(pager.text_enc(), payload)?;
+    #[cfg(feature = "utf16")]
+    let payload = conv.as_ref().map_or(payload, |c| c.as_slice());
+    let usable = pager.usable() as usize;
+    let mut page = root;
+    let mut hops = 0u32;
+    let cell = loop {
+        hops = hops.saturating_add(1);
+        if hops > 64 {
+            return Err(Error::CorruptPage { page });
+        }
+        let idx = pager.load(page).await?;
+        let d = pager.frame_data(idx);
+        if head::<S::Error>(d, page)?.is_leaf() {
+            let cells = leaf_cells_meta::<S::Error>(d, page, usable)?;
+            match cells.iter().find(|c| c.rowid == rowid) {
+                Some(c) => break *c,
+                None => return Ok(false),
+            }
+        }
+        let (pairs, rightmost) = interior_cells::<S::Error>(d, page)?;
+        page = pairs
+            .iter()
+            .find(|(_, k)| rowid <= *k)
+            .map_or(rightmost, |(c, _)| *c);
+    };
+    if cell.payload_len != payload.len() || cell.local_len > payload.len() {
+        return Ok(false);
+    }
+    let (local, mut rest) = payload.split_at(cell.local_len);
+    let end = cell
+        .local_off
+        .checked_add(cell.local_len)
+        .ok_or(Error::CorruptPage { page })?;
+    let idx = pager.load(page).await?;
+    if pager.frame_data(idx).get(cell.local_off..end) != Some(local) {
+        let idx = pager.dirty_page(page).await?;
+        pager
+            .frame_data_mut(idx)
+            .get_mut(cell.local_off..end)
+            .ok_or(Error::CorruptPage { page })?
+            .copy_from_slice(local);
+    }
+    let per = usable.checked_sub(4).ok_or(Error::CorruptPage { page })?;
+    let mut ov = cell.overflow;
+    while !rest.is_empty() {
+        if ov == 0 || per == 0 {
+            return Err(Error::CorruptPage { page });
+        }
+        let (chunk, tail) = rest.split_at(rest.len().min(per));
+        let idx = pager.load(ov).await?;
+        let d = pager.frame_data(idx);
+        let next = d
+            .get(..4)
+            .map(|b| be_u32(b, 0))
+            .ok_or(Error::CorruptPage { page: ov })?;
+        let span = 4..4 + chunk.len();
+        if d.get(span.clone()) != Some(chunk) {
+            let idx = pager.dirty_page(ov).await?;
+            pager
+                .frame_data_mut(idx)
+                .get_mut(span)
+                .ok_or(Error::CorruptPage { page: ov })?
+                .copy_from_slice(chunk);
+        }
+        rest = tail;
+        ov = next;
+    }
+    Ok(true)
+}
+
 /// Delete the row `rowid` from the table rooted at `root`.
 /// Returns whether a row was present.
 pub async fn btree_delete<S: Storage>(

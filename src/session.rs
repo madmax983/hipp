@@ -8400,6 +8400,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// old row out, new row in, new index entries in — the apply
     /// tail shared by UPDATE (v0.5) and upsert DO UPDATE (v0.7).
     #[cfg(feature = "v05")]
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_stored_row(
         &mut self,
         root: u32,
@@ -8408,9 +8409,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         old_rowid: i64,
         new_rec: &[OwnedValue],
         new_rowid: i64,
+        changed: (&[bool], bool),
     ) -> Result<(), S::Error> {
         #[cfg(not(feature = "indexes"))]
         let _ = old_rec;
+        let _ = changed;
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
             Plan::Insert { indexes, .. } => indexes.clone(),
@@ -8418,6 +8421,55 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Delete { indexes, .. } => indexes.clone(),
             _ => AVec::new(),
         };
+        let rules = self.plan_rules();
+        // v0.16 (`wal`): the pages the pin leaves clean, so a WAL
+        // log holds its frames and no more (probed page by page).
+        // An index no changed column, generated column or rowid
+        // reaches is left alone; one with an expression (or VIRTUAL
+        // generated) key part is rewritten only when its entry
+        // differs; a plain one the change reaches is rewritten. The
+        // row itself is rewritten only when its record differs or
+        // its key (rowid, WITHOUT ROWID primary key) is assigned;
+        // a record of the same size is overwritten in place, only
+        // its pages whose bytes differ written (`btree_overwrite`).
+        #[cfg(feature = "wal")]
+        let (eff, key_set, wr_key) = {
+            let eff = match rules.as_ref() {
+                Some(r) => r.changed_cols(changed.0, changed.1),
+                None => {
+                    let mut m = AVec::new();
+                    m.extend_from_slice(changed.0);
+                    m
+                }
+            };
+            // A WITHOUT ROWID table: whether its key is assigned, and
+            // whether its value changes (its index entries end in the
+            // key, not in the handle the payloads carry).
+            #[cfg(feature = "without_rowid")]
+            let (pk, pk_moved) = self
+                .conn
+                .pager
+                .wr
+                .table_of(root)
+                .and_then(|t| self.conn.pager.wr.tables.as_slice().get(t))
+                .map_or((false, false), |t| {
+                    (
+                        t.pk_cols
+                            .iter()
+                            .any(|c| eff.as_slice().get(*c).copied().unwrap_or(false)),
+                        t.pk_cols.iter().any(|c| old_rec.get(*c) != new_rec.get(*c)),
+                    )
+                });
+            #[cfg(not(feature = "without_rowid"))]
+            let (pk, pk_moved) = (false, false);
+            (eff, changed.1 || pk, pk_moved)
+        };
+        #[cfg(all(feature = "wal", not(feature = "indexes")))]
+        let _ = (&eff, wr_key);
+        #[cfg(all(feature = "wal", feature = "indexes"))]
+        let virt = rules.as_ref().and_then(|r| r.virt());
+        #[cfg(all(feature = "wal", feature = "indexes"))]
+        let mut keep: AVec<bool> = AVec::new();
         #[cfg(feature = "indexes")]
         for ix in indexes.iter() {
             let Some(old_key) = ix_key::<S::Error>(
@@ -8429,9 +8481,59 @@ impl<'c, S: Storage> Statement<'c, S> {
                 &self.conn.env,
             )?
             else {
+                #[cfg(feature = "wal")]
+                keep.push(false);
                 continue;
             };
             let payload = encode_index_payload(old_key.as_slice(), old_rowid);
+            #[cfg(feature = "wal")]
+            {
+                let reach = |c: Option<usize>| match c {
+                    Some(c) => eff.as_slice().get(c).copied().unwrap_or(false),
+                    None => key_set,
+                };
+                let is_virt = |c: Option<usize>| {
+                    c.is_some_and(|c| virt.is_some_and(|v| v.get(c) == Some(&true)))
+                };
+                let (mut touched, mut compare) = (key_set, false);
+                for (_i, c) in ix.cols.iter().enumerate() {
+                    #[cfg(feature = "expr_index")]
+                    if let Some(Some(e)) = ix.ext.as_ref().and_then(|x| x.exprs.as_slice().get(_i))
+                    {
+                        touched |= crate::rules::reads_any(e, eff.as_slice(), key_set);
+                        compare = true;
+                        continue;
+                    }
+                    touched |= reach(c.col);
+                    compare |= is_virt(c.col);
+                }
+                #[cfg(feature = "expr_index")]
+                if let Some(p) = ix.ext.as_ref().and_then(|x| x.pred.as_ref()) {
+                    touched |= crate::rules::reads_any(p, eff.as_slice(), key_set);
+                }
+                // A WITHOUT ROWID row's entries end in its key, not
+                // the handle the payload carries: a changed key is
+                // always a rewrite.
+                let same = touched
+                    && compare
+                    && !wr_key
+                    && ix_key::<S::Error>(
+                        ix,
+                        new_rec,
+                        new_rowid,
+                        rowid_alias,
+                        #[cfg(feature = "expr_index")]
+                        &self.conn.env,
+                    )?
+                    .is_some_and(|k| {
+                        encode_index_payload(k.as_slice(), new_rowid).as_slice()
+                            == payload.as_slice()
+                    });
+                keep.push(!touched || same);
+                if !touched || same {
+                    continue;
+                }
+            }
             btree::index_delete(
                 &mut self.conn.pager,
                 ix.root,
@@ -8440,13 +8542,28 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             .await?;
         }
-        btree::btree_delete(&mut self.conn.pager, root, old_rowid).await?;
-        let rules = self.plan_rules();
         let rec_bytes =
             crate::rules::encode_rec(new_rec, rowid_alias, rules.as_ref().and_then(|r| r.virt()));
-        btree::btree_insert(&mut self.conn.pager, root, new_rowid, rec_bytes.as_slice()).await?;
+        #[cfg(feature = "wal")]
+        let same_row = !key_set
+            && new_rowid == old_rowid
+            && btree::btree_overwrite(&mut self.conn.pager, root, old_rowid, rec_bytes.as_slice())
+                .await?;
+        #[cfg(not(feature = "wal"))]
+        let same_row = false;
+        if !same_row {
+            btree::btree_delete(&mut self.conn.pager, root, old_rowid).await?;
+            btree::btree_insert(&mut self.conn.pager, root, new_rowid, rec_bytes.as_slice())
+                .await?;
+        }
         #[cfg(feature = "indexes")]
-        for ix in indexes.iter() {
+        for (i, ix) in indexes.iter().enumerate() {
+            #[cfg(feature = "wal")]
+            if keep.as_slice().get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            #[cfg(not(feature = "wal"))]
+            let _ = i;
             let Some(key) = ix_key::<S::Error>(
                 ix,
                 new_rec,
@@ -9033,6 +9150,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             crowid,
             new_rec.as_slice(),
             new_rowid,
+            (assigned.as_slice(), rowid_set),
         )
         .await?;
         #[cfg(feature = "foreign_keys")]
@@ -9855,6 +9973,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     cur_rowid,
                     new_rec.as_slice(),
                     new_rowid,
+                    (assigned.as_slice(), rowid_set),
                 )
                 .await?;
                 stale |= new_rowid != cur_rowid;

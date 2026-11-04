@@ -695,6 +695,9 @@ impl<S: Storage> Connection<S> {
                 #[cfg(feature = "utf16")]
                 crate::record::TextEnc::Utf16be => b"UTF-16be",
             })),
+            // An in-memory database's mode is `memory` (v0.16 fix:
+            // hipp's `:memory:` reported `delete`).
+            Prag::JournalMode if self.pager.storage().is_memory() => row1(text(b"memory")),
             #[cfg(not(feature = "wal"))]
             Prag::JournalMode => row1(text(b"delete")),
             #[cfg(feature = "wal")]
@@ -1840,8 +1843,14 @@ impl<S: Storage> Statement<'_, S> {
                         && eq_ci(m.as_bytes().get(..arg.len()).unwrap_or_default(), arg)
                 });
                 match mode {
-                    // An unknown mode queries the current one.
+                    // An unknown mode queries the current one; an
+                    // in-memory database keeps `memory` whatever is
+                    // asked, as on the pin (v0.16 fix: hipp's
+                    // `:memory:` entered WAL mode).
                     None => self.conn.pragma_rows(&self.arena, &p_query(&p)),
+                    Some(_) if self.conn.pager.storage().is_memory() => {
+                        self.conn.pragma_rows(&self.arena, &p_query(&p))
+                    }
                     #[cfg(feature = "wal")]
                     Some(m @ (0 | 5)) => self.set_journal_mode(m == 5, &p).await,
                     #[cfg(not(feature = "wal"))]

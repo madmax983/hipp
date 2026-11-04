@@ -338,3 +338,312 @@ fn generated_corpus() {
         );
     }
 }
+
+/// `.open` of the WAL database already open (v0.16 review fix): the
+/// oracle closes the old connection before opening the new one, so
+/// the new one's log is the file on disk. hipp opened first, and the
+/// old connection's close then checkpointed and unlinked the log the
+/// new one went on appending to: killed, its committed rows were
+/// gone. Both CLIs are killed after the second insert; the oracle
+/// then reads rows 1 and 2 from each one's files.
+#[test]
+fn dot_open_same_wal_db_then_killed() {
+    use std::io::{BufRead, Write};
+    let h = temp_db("os-h");
+    let o = temp_db("os-o");
+    let script = |db: &Path| {
+        format!(
+            "PRAGMA journal_mode = WAL;\nCREATE TABLE t(a);\nINSERT INTO t VALUES (1);\n.open {}\nINSERT INTO t VALUES (2);\nSELECT 'done';\n",
+            db.display()
+        )
+    };
+    // hipp-cli has no `.system`: killed once it has printed `done`.
+    let mut child = Command::new(hipp_bin())
+        .arg(&h)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("cli spawns");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(script(&h).as_bytes()).expect("write stdin");
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut seen = String::new();
+    while !seen.contains("done") {
+        let mut line = String::new();
+        if out.read_line(&mut line).expect("read stdout") == 0 {
+            break;
+        }
+        seen.push_str(&line);
+    }
+    child.kill().expect("kill");
+    let _ = child.wait();
+    drop(stdin);
+    assert_eq!(seen, "wal\ndone\n");
+    run_stdin(
+        &oracle(),
+        &o,
+        &format!("{}.system kill -9 $PPID\n", script(&o)),
+    );
+    for db in [&h, &o] {
+        assert_eq!(
+            run(
+                &oracle(),
+                db,
+                "SELECT a FROM t ORDER BY a; PRAGMA integrity_check;"
+            )
+            .1,
+            b"1\n2\nok\n",
+            "{}",
+            db.display()
+        );
+    }
+    // Run to the end, the checkpoint rows agree too.
+    let a = temp_db("os2-h");
+    let b = temp_db("os2-o");
+    let tail = "INSERT INTO t VALUES (3);\nPRAGMA wal_checkpoint;\nSELECT a FROM t;\n";
+    assert_eq!(
+        String::from_utf8_lossy(&run_stdin(
+            &hipp_bin(),
+            &a,
+            &format!("{}{tail}", script(&a))
+        )),
+        String::from_utf8_lossy(&run_stdin(&oracle(), &b, &format!("{}{tail}", script(&b)))),
+    );
+    closed_alike("os2", &a, &b);
+}
+
+/// `.open` of a file that cannot be opened (v0.16): the oracle closes
+/// the current database first and carries on with a substitute
+/// in-memory one; so does hipp (it kept the old database).
+#[test]
+fn dot_open_failure_substitutes_memory() {
+    let a = temp_db("of-h");
+    let b = temp_db("of-o");
+    let batch = "CREATE TABLE t(a);\nINSERT INTO t VALUES (1);\n.open /nonexistent-hipp-dir/x.db\nSELECT * FROM t;\nPRAGMA database_list;\nPRAGMA journal_mode;\nSELECT 1;\n";
+    assert_eq!(
+        String::from_utf8_lossy(&run_stdin(&hipp_bin(), &a, batch)),
+        String::from_utf8_lossy(&run_stdin(&oracle(), &b, batch)),
+    );
+    closed_alike("of", &a, &b);
+}
+
+/// An in-memory database's journal mode is `memory` whatever is asked
+/// (v0.16 review fix: hipp's `:memory:` reported `delete`, entered
+/// WAL mode and ran checkpoints); `wal_checkpoint` is `0|-1|-1`, the
+/// TEMP database's mode `delete`, the other WAL pragmas their
+/// defaults.
+#[test]
+fn memory_database_stays_memory() {
+    let q = "PRAGMA journal_mode; PRAGMA journal_mode = WAL; PRAGMA journal_mode = DELETE; PRAGMA journal_mode = MEMORY; PRAGMA journal_mode = OFF; PRAGMA journal_mode = TRUNCATE; PRAGMA journal_mode = PERSIST; PRAGMA journal_mode = bogus; PRAGMA main.journal_mode; CREATE TABLE t(a); INSERT INTO t VALUES (1); PRAGMA wal_checkpoint; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode; PRAGMA temp.journal_mode; PRAGMA wal_autocheckpoint; PRAGMA journal_size_limit; PRAGMA synchronous; SELECT * FROM pragma_journal_mode; BEGIN; INSERT INTO t VALUES (2); PRAGMA journal_mode = WAL; COMMIT; SELECT * FROM t;";
+    let mem = Path::new(":memory:");
+    let got = run(&hipp_bin(), mem, q);
+    let want = run(&oracle(), mem, q);
+    assert_eq!(got.0, want.0);
+    assert_eq!(
+        String::from_utf8_lossy(&got.1),
+        String::from_utf8_lossy(&want.1)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_stdin(&hipp_bin(), mem, &q.replace("; ", ";\n"))),
+        String::from_utf8_lossy(&run_stdin(&oracle(), mem, &q.replace("; ", ";\n"))),
+    );
+}
+
+/// The pages an UPDATE leaves clean (v0.16 review fix): an index no
+/// assigned column reaches was rewritten unchanged, and so was a row
+/// whose record did not change, each a frame too many in
+/// `wal_checkpoint`'s `log|checkpointed`. Probed page by page on the
+/// oracle: a plain index an assigned column (or a generated column
+/// computed from one, a partial index's WHERE, the rowid) reaches is
+/// rewritten even when its entry is unchanged; one with an expression
+/// or VIRTUAL generated key part only when its entry changes; the row
+/// only when its record changes or its key is assigned; a record of
+/// the same size is overwritten in place, its unchanged overflow
+/// pages not written.
+#[test]
+fn update_frames_match() {
+    let base = "CREATE TABLE t(a, b, c); INSERT INTO t VALUES (1, 'x', 3), (2, NULL, 4);";
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for ix in [
+        "t(a)",
+        "t(a+0)",
+        "t(a, b)",
+        "t(b, a)",
+        "t(c) WHERE a > 0",
+        "t(c) WHERE a > 5",
+        "t(lower(a))",
+        "t(a, b || '')",
+        "t(a) WHERE c > 0",
+        "t(a+0) WHERE a > 0",
+        "t(c+0) WHERE a > 0",
+    ] {
+        for set in ["a = a", "a = 1", "a = 2", "c = c", "b = b", "b = 'y'"] {
+            cases.push((
+                format!("{base} CREATE INDEX i ON {ix};"),
+                format!("UPDATE t SET {set} WHERE rowid = 1"),
+            ));
+        }
+    }
+    for g in ["VIRTUAL", "STORED"] {
+        for set in ["a = a", "a = 2", "b = b"] {
+            cases.push((
+                format!("CREATE TABLE t(a, b, c AS (a + 1) {g}); CREATE INDEX i ON t(c); INSERT INTO t(a, b) VALUES (1, 'x'), (2, NULL);"),
+                format!("UPDATE t SET {set} WHERE rowid = 1"),
+            ));
+        }
+    }
+    for ix in ["t(b)", "t(b+0)", "t(c, a)"] {
+        for set in ["a = a", "a = 1", "b = b"] {
+            cases.push((
+                format!("CREATE TABLE t(a INTEGER PRIMARY KEY, b, c); CREATE INDEX i ON {ix}; INSERT INTO t VALUES (1, 'x', 3), (2, NULL, 4);"),
+                format!("UPDATE t SET {set} WHERE a = 1"),
+            ));
+        }
+    }
+    for set in ["b = b", "b = 'y'", "a = a", "c = c"] {
+        cases.push((
+            "CREATE TABLE t(a PRIMARY KEY, b, c) WITHOUT ROWID; CREATE INDEX i ON t(c); INSERT INTO t VALUES (1, 'x', 3), (2, NULL, 4);".to_string(),
+            format!("UPDATE t SET {set} WHERE a = 1"),
+        ));
+    }
+    // A WITHOUT ROWID key that changes moves every entry (they end in
+    // the key), one assigned unchanged leaves expression entries alone.
+    for set in [
+        "a = a + 10",
+        "a = a",
+        "b = b || '!'",
+        "c = c",
+        "c = 5",
+        "a = 1, c = c",
+    ] {
+        cases.push((
+            "CREATE TABLE t(a, b, c, PRIMARY KEY(a, b)) WITHOUT ROWID; CREATE INDEX i ON t(c * 2) WHERE c > 0; CREATE INDEX j ON t(b || ''); CREATE INDEX k ON t(c); INSERT INTO t VALUES (1, 'x', 3), (2, 'y', 1);".to_string(),
+            format!("UPDATE t SET {set} WHERE a = 1"),
+        ));
+    }
+    for set in ["a = 'X'", "a = a", "a = 'x'"] {
+        cases.push((
+            "CREATE TABLE t(a TEXT COLLATE NOCASE PRIMARY KEY, b) WITHOUT ROWID; CREATE INDEX i ON t(b + 0); INSERT INTO t VALUES ('x', 1);".to_string(),
+            format!("UPDATE t SET {set}"),
+        ));
+    }
+    for (setup, up) in [
+        (
+            "CREATE TABLE t(a PRIMARY KEY, b); INSERT INTO t VALUES (1, 'x'), (2, NULL);",
+            "UPDATE t SET b = 'y' WHERE a = 1",
+        ),
+        (
+            "CREATE TABLE t(a, b); CREATE INDEX ia ON t(a); CREATE INDEX ib ON t(b); INSERT INTO t VALUES (1, 'x'), (2, NULL);",
+            "UPDATE t SET b = 'y' WHERE rowid = 1",
+        ),
+        (
+            "CREATE TABLE t(a, b); INSERT INTO t VALUES (1, 2); ALTER TABLE t ADD COLUMN d DEFAULT 5;",
+            "UPDATE t SET a = 1",
+        ),
+        // (Not a REAL column's integral value: the oracle stores it
+        // as an integer, hipp as an 8-byte real, so a row the oracle
+        // wrote is a different record to hipp; STATUS.md gaps.)
+        (
+            "CREATE TABLE t(a, b); INSERT INTO t VALUES (zeroblob(5000), 'y');",
+            "UPDATE t SET b = 'z'",
+        ),
+        (
+            "CREATE TABLE t(a, b); INSERT INTO t VALUES (zeroblob(9000), 'y');",
+            "UPDATE t SET a = zeroblob(9000)",
+        ),
+        (
+            "CREATE TABLE t(a PRIMARY KEY, b, c); CREATE INDEX i ON t(c); INSERT INTO t VALUES (1, 'x', 3);",
+            "INSERT INTO t VALUES (1, 'z', 9) ON CONFLICT(a) DO UPDATE SET b = 'x'",
+        ),
+        (
+            "CREATE TABLE t(a PRIMARY KEY, b, c); CREATE INDEX i ON t(c); INSERT INTO t VALUES (1, 'x', 3);",
+            "INSERT INTO t VALUES (1, 'z', 9) ON CONFLICT(a) DO UPDATE SET c = 3",
+        ),
+        (
+            "PRAGMA encoding = 'UTF-16le'; CREATE TABLE t(a, b); INSERT INTO t VALUES ('x', 'y');",
+            "UPDATE t SET a = 'x'",
+        ),
+    ] {
+        cases.push((setup.to_string(), up.to_string()));
+    }
+    // Generated: small tables (one leaf each), indexes of every kind,
+    // assignments drawn from a small domain so many leave values as
+    // they were.
+    let mut rng = Rng(0x0016_0a1e_u64);
+    let n: usize = std::env::var("HIPP_WAL_CORPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let kinds = [
+        "a",
+        "b",
+        "c",
+        "a, b",
+        "c, a",
+        "a + 0",
+        "b || ''",
+        "g",
+        "s",
+        "a) WHERE b > 1 AND (1",
+        "c + 0) WHERE a < 3 AND (1",
+        "b) WHERE c IS NOT NULL AND (1",
+    ];
+    let vals = ["1", "2", "3", "NULL", "'x'", "a", "b", "c"];
+    for _ in 0..n {
+        let mut setup =
+            String::from("CREATE TABLE t(a, b, c, g AS (a + 1) VIRTUAL, s AS (b || 'q') STORED);");
+        for k in 0..(1 + rng.below(3)) {
+            let unique = if rng.below(4) == 0 { "UNIQUE " } else { "" };
+            let kind = kinds[rng.below(kinds.len() as u64) as usize];
+            // A UNIQUE index of rows sharing keys cannot be built.
+            let unique = if kind.contains("WHERE") { "" } else { unique };
+            setup.push_str(&format!("CREATE {unique}INDEX i{k} ON t({kind});"));
+        }
+        setup.push_str("INSERT OR IGNORE INTO t(a, b, c) VALUES ");
+        for r in 0..(2 + rng.below(6)) {
+            if r > 0 {
+                setup.push(',');
+            }
+            setup.push_str(&format!("({r}, {}, {})", rng.below(3), rng.below(3)));
+        }
+        setup.push(';');
+        let mut sets = Vec::new();
+        for col in ["a", "b", "c"] {
+            if rng.below(2) == 0 {
+                sets.push(format!(
+                    "{col} = {}",
+                    vals[rng.below(vals.len() as u64) as usize]
+                ));
+            }
+        }
+        if sets.is_empty() {
+            sets.push("b = b".to_string());
+        }
+        let up = format!(
+            "UPDATE OR IGNORE t SET {} WHERE rowid % {} = {}",
+            sets.join(", "),
+            1 + rng.below(3),
+            rng.below(2)
+        );
+        cases.push((setup, up));
+    }
+    for (i, (setup, up)) in cases.iter().enumerate() {
+        // Every column the table has, in an order both engines agree
+        // on (a statement error would end an oracle stdin line).
+        let three = setup.split(';').next().is_some_and(|t| t.contains(", c"));
+        let sel = if three {
+            "SELECT a, b, c FROM t ORDER BY 1, 2, 3"
+        } else {
+            "SELECT * FROM t ORDER BY 1, 2"
+        };
+        byte_identical(
+            &format!("up{i}"),
+            setup,
+            &format!(
+                "PRAGMA journal_mode = WAL; {up}; PRAGMA wal_checkpoint; {sel}; PRAGMA integrity_check;"
+            ),
+            "SELECT count(*) FROM t;",
+        );
+    }
+}

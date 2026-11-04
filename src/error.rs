@@ -759,7 +759,10 @@ pub enum Error<E> {
     UnsupportedPageSize,
     /// Text encoding 2/3 (UTF-16) — SPEC §3.7.
     UnsupportedEncoding,
-    /// Header read/write version 2 (WAL) — SPEC §3.1.
+    /// Header read/write version 2 (WAL) — SPEC §3.1 — or, v0.16, a
+    /// non-empty `-wal` log beside the database: a build without the
+    /// `wal` leaf cannot read the committed pages a log may hold.
+    /// Build with `wal`, or checkpoint the database with SQLite.
     WalUnsupported,
     /// Reserved-bytes-per-page != 0 on a write path.
     ReservedBytesUnsupported,
@@ -810,11 +813,12 @@ pub enum Error<E> {
     /// at any time and never returns it.)
     #[cfg(feature = "params")]
     ResetRequired,
-    /// Another process holds the database or its `-shm` file (v0.16,
-    /// `wal`): a live SQLite connection in WAL mode shares its
-    /// wal-index through the `-shm`, which hipp — single-process, its
-    /// wal-index in heap memory — cannot take part in. Close the other
-    /// connection first (`Storage::locked_elsewhere` reports it).
+    /// Another connection holds the database in WAL mode (v0.16,
+    /// `wal`): a live SQLite connection, which shares its wal-index
+    /// through the `-shm` hipp cannot take part in, or another hipp
+    /// connection (this process's too), whose heap wal-index this one
+    /// would not see. Close the other connection first
+    /// (`Storage::claim_wal` reports it).
     #[cfg(feature = "wal")]
     DatabaseBusy,
     /// The caller's storage device error.

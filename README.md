@@ -694,11 +694,19 @@ aspirations.
   removed, as the pin's close; the CLI closes at exit). Single
   process, as the pin's `locking_mode=EXCLUSIVE`: the wal-index
   lives in heap memory, no `-shm` is written, and a database a
-  live SQLite connection holds is refused (`DatabaseBusy`).
+  live SQLite connection, or another hipp connection (this
+  process's too), holds in WAL mode is refused (`DatabaseBusy`). An
+  in-memory database (the CLI's `:memory:`,
+  `MemStorage::memory_db`) stays in journal mode `memory`, as on
+  the pin. An UPDATE writes only the pages the pin writes (an
+  unchanged row or index entry is not rewritten), so checkpoint
+  counts match.
   Savepoints and statement rollback work inside WAL transactions;
   crash injection at every write (frames, checkpoints, restarts,
   mode switches, close) recovers the last committed state, which
-  the pin's integrity check accepts. Without the leaf a WAL file is
+  the pin's integrity check accepts. Without the leaf a database
+  whose header says WAL, or with a non-empty `-wal` beside it
+  (which the pin opens in WAL mode whatever the header says), is
   refused at open (`WalUnsupported`), never read stale. Fixed on
   the way (ungated, `v16`): `PRAGMA journal_mode = w` (a prefix)
   is the pin's WAL, no longer a silent query; `PRAGMA synchronous
@@ -1032,9 +1040,10 @@ differential testing. It is a separate crate and contributes
 
 ## Non-goals (SPEC §3)
 
-No WAL without the `wal` leaf (files in WAL mode are then rejected
-with `WalUnsupported`; with it, single-process WAL only — no
-shared `-shm` wal-index), no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
+No WAL without the `wal` leaf (files in WAL mode, or with a
+non-empty `-wal` beside them, are then rejected with
+`WalUnsupported`; with it, single-process WAL only — no shared
+`-shm` wal-index, one connection per WAL database), no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
 them), no AUTOINCREMENT tables
 created (refused below `v16`, foreign ones load read-only there;
 `v16` maintains `sqlite_sequence`), no expression or partial

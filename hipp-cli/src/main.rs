@@ -34,7 +34,7 @@ enum Db {
 fn open_db(path: &str) -> Result<Db, String> {
     block_on(async {
         if path == ":memory:" {
-            let conn = Connection::open(MemStorage::new(), cli_config())
+            let conn = Connection::open(MemStorage::memory_db(), cli_config())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             Ok(Db::Mem(conn))
@@ -865,8 +865,17 @@ async fn dispatch(
             if path.is_empty() {
                 return Err("usage: .open <path|:memory:>".to_string());
             }
-            let new = open_db(path)?;
-            close_db(std::mem::replace(db, new))?;
+            // The pin's order: close the current database first (a
+            // WAL-mode log is checkpointed and removed), then open
+            // the new one. Opening first would leave two connections
+            // on one file, and the old one's close would unlink the
+            // log the new one appends to. If the open fails, the pin
+            // carries on with a substitute in-memory database.
+            let old = std::mem::replace(db, open_db(":memory:")?);
+            let closed = close_db(old);
+            let opened = open_db(path).map(|new| *db = new);
+            closed?;
+            opened?;
             return Ok(Flow::Continue);
         }
         match db {

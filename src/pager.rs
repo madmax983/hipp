@@ -465,19 +465,28 @@ impl<S: Storage> Pager<S> {
     ) -> Result<(Pager<S>, bool), S::Error> {
         let file_len = storage.len().await.map_err(Error::Storage)?;
         let mut is_new = false;
+        // Without `wal`, a non-empty log beside the file is refused
+        // whatever page 1 says (v0.16 review fix: it was read stale,
+        // and written under the log's frames): the pin opens such a
+        // database in WAL mode, so its committed pages may be in the
+        // log (`Storage::log_beside`).
+        #[cfg(not(feature = "wal"))]
+        if storage.log_beside() {
+            return Err(Error::WalUnsupported);
+        }
+        // A log beside an empty database belongs to no database: the
+        // pin deletes it (v0.16, `wal`).
+        #[cfg(feature = "wal")]
         if file_len == 0 {
-            // A log beside an empty database belongs to no database:
-            // the pin deletes it (v0.16, `wal`).
-            #[cfg(feature = "wal")]
-            {
-                let mut w = storage
-                    .sidecar(Sidecar::Wal)
-                    .await
-                    .map_err(Error::Storage)?;
-                if w.existed() {
-                    w.delete().await.map_err(Error::Storage)?;
-                }
+            let mut w = storage
+                .sidecar(Sidecar::Wal)
+                .await
+                .map_err(Error::Storage)?;
+            if w.existed() {
+                w.delete().await.map_err(Error::Storage)?;
             }
+        }
+        if file_len == 0 {
             // Create-new: header + empty schema leaf, then a sync.
             // A crash here leaves a zero/garbage file that fails
             // validation on next open — never a torn database.
@@ -2038,9 +2047,25 @@ impl<S: Storage> Pager<S> {
         if self.stage != CommitStage::Idle {
             return Err(Error::OperationInFlight);
         }
-        if self.storage.locked_elsewhere() {
+        if !self.storage.claim_wal() {
             return Err(Error::DatabaseBusy);
         }
+        let w = match self.open_new_wal().await {
+            Ok(w) => w,
+            Err(e) => {
+                self.storage.release_wal();
+                return Err(e);
+            }
+        };
+        self.wal = Some(w);
+        self.wal_fresh = true;
+        Ok(())
+    }
+
+    /// `enter_wal`'s switch once the database is claimed: bytes 18 /
+    /// 19 written, the log opened from a new generation.
+    #[cfg(feature = "wal")]
+    async fn open_new_wal(&mut self) -> Result<crate::wal::Wal<S::Sidecar>, S::Error> {
         self.set_file_version(2).await?;
         let sc = self
             .storage
@@ -2050,9 +2075,7 @@ impl<S: Storage> Pager<S> {
         let mut w = crate::wal::Wal::recover(sc, self.header.page_size).await?;
         w.truncated();
         w.set_page_size(self.header.page_size);
-        self.wal = Some(w);
-        self.wal_fresh = true;
-        Ok(())
+        Ok(w)
     }
 
     /// Checkpoint everything, then delete the log and a stale `-shm`
@@ -2080,6 +2103,7 @@ impl<S: Storage> Pager<S> {
         if shm.existed() {
             shm.delete().await.map_err(Error::Storage)?;
         }
+        self.storage.release_wal();
         Ok(true)
     }
 
@@ -2142,7 +2166,7 @@ async fn open_wal<S: Storage>(
             return Ok(None);
         }
     }
-    if storage.locked_elsewhere() {
+    if !storage.claim_wal() {
         return Err(Error::DatabaseBusy);
     }
     let mut w = crate::wal::Wal::recover(sc, header.page_size).await?;
@@ -2299,6 +2323,79 @@ mod tests {
             Arena::new(crate::error::Scope::Transaction, 1024, 4096),
         ));
         assert!(matches!(r, Err(Error::WalUnsupported)));
+    }
+
+    /// A non-empty `-wal` beside a rollback-mode header (v0.16 review
+    /// fix): the pin opens such a database in WAL mode and commits
+    /// into the log, so without the `wal` leaf it is refused
+    /// (`Storage::log_beside`) — it was read stale, and written under
+    /// the log. With the leaf a log of no valid frames leaves the
+    /// main file as it is, and one beside an empty file is deleted,
+    /// as on the pin.
+    #[test]
+    fn log_beside_rollback_header() {
+        use crate::storage::MemStorage;
+        fn open<S: Storage>(s: S) -> Result<(), S::Error> {
+            crate::storage::block_on(Pager::open(
+                s,
+                4,
+                4096,
+                1,
+                Arena::new(crate::error::Scope::Transaction, 1024, 4096),
+            ))
+            .map(|_| ())
+        }
+        /// MemStorage with a log beside it, as `log_beside` sees one.
+        struct Logged(MemStorage);
+        impl Storage for Logged {
+            type Error = crate::storage::MemError;
+            type Sidecar = crate::storage::MemSidecar;
+            async fn len(&self) -> core::result::Result<u64, Self::Error> {
+                self.0.len().await
+            }
+            async fn read_at(&self, o: u64, b: &mut [u8]) -> core::result::Result<(), Self::Error> {
+                self.0.read_at(o, b).await
+            }
+            async fn write_at(
+                &mut self,
+                o: u64,
+                b: &[u8],
+            ) -> core::result::Result<(), Self::Error> {
+                self.0.write_at(o, b).await
+            }
+            async fn set_len(&mut self, l: u64) -> core::result::Result<(), Self::Error> {
+                self.0.set_len(l).await
+            }
+            async fn sync(&mut self) -> core::result::Result<(), Self::Error> {
+                self.0.sync().await
+            }
+            async fn sidecar(
+                &mut self,
+                k: Sidecar,
+            ) -> core::result::Result<Self::Sidecar, Self::Error> {
+                self.0.sidecar(k).await
+            }
+            fn log_beside(&self) -> bool {
+                true
+            }
+        }
+        let r = open(Logged(MemStorage::from_bytes(initial_page1(4096))));
+        #[cfg(not(feature = "wal"))]
+        assert!(matches!(r, Err(Error::WalUnsupported)));
+        #[cfg(feature = "wal")]
+        assert!(r.is_ok());
+        assert!(open(MemStorage::from_bytes(initial_page1(4096))).is_ok());
+        #[cfg(feature = "wal")]
+        {
+            let mem = MemStorage::from_bytes(initial_page1(4096));
+            mem.set_wal(Some(alloc::vec![7u8; 100]));
+            assert!(open(mem.clone()).is_ok());
+            assert!(mem.wal_snapshot().is_some());
+            let mem = MemStorage::new();
+            mem.set_wal(Some(alloc::vec![7u8; 100]));
+            assert!(open(mem.clone()).is_ok());
+            assert!(mem.wal_snapshot().is_none());
+        }
     }
 
     /// A UTF-16 header (offset 56 = 2 / 3) is refused cleanly

@@ -85,13 +85,44 @@ pub trait Storage {
     fn file_name(&self) -> &[u8] {
         &[]
     }
-    /// Another process holds a lock on this database or its `-shm`
-    /// (v0.16, `wal`): a live SQLite connection, whose shared-memory
-    /// wal-index hipp cannot take part in. hipp then refuses to open
-    /// the database in WAL mode (`Error::DatabaseBusy`). The default,
-    /// for storage only this process can reach, is `false`.
+    /// Whether a non-empty write-ahead log (`<db>-wal`) sits beside
+    /// this database (v0.16). Consulted only by builds without the
+    /// `wal` leaf, which then refuse the database
+    /// (`Error::WalUnsupported`): the pin opens such a database in
+    /// WAL mode whatever its header says, so its committed pages may
+    /// be in the log and the main file stale. With the leaf the log
+    /// is read through `Sidecar::Wal`. The default, for storage that
+    /// keeps no log, is `false`; `FileStorage` looks for the file.
+    fn log_beside(&self) -> bool {
+        false
+    }
+    /// Claim the database for this connection's WAL mode (v0.16,
+    /// `wal`), called when a database opens in WAL mode and when it
+    /// enters it. `false` when another connection holds it: a live
+    /// SQLite connection, whose shared-memory wal-index hipp cannot
+    /// take part in, or another hipp connection (in this process or
+    /// another), whose heap wal-index this one would not see — its
+    /// close would checkpoint and delete the log this one appends
+    /// to. hipp then refuses with `Error::DatabaseBusy`. The claim
+    /// lasts until `release_wal`, or until the storage is dropped.
+    /// The default, for storage only one connection can reach,
+    /// claims nothing and returns `true`.
     #[cfg(feature = "wal")]
-    fn locked_elsewhere(&self) -> bool {
+    fn claim_wal(&mut self) -> bool {
+        true
+    }
+    /// Release a `claim_wal` hold (v0.16, `wal`): the database left
+    /// WAL mode or closed. The default does nothing.
+    #[cfg(feature = "wal")]
+    fn release_wal(&mut self) {}
+    /// This storage is an in-memory database (v0.16, the pin's
+    /// `:memory:`): `PRAGMA journal_mode` reports and keeps `memory`,
+    /// so it never enters WAL mode. The default is `false`, a file;
+    /// `MemStorage::new` models a file too (the test and
+    /// crash-injection workhorse), `MemStorage::memory_db` makes an
+    /// in-memory database.
+    #[cfg(feature = "v16")]
+    fn is_memory(&self) -> bool {
         false
     }
 }
@@ -138,6 +169,10 @@ struct MemInner {
 #[derive(Clone)]
 pub struct MemStorage {
     inner: Rc<RefCell<MemInner>>,
+    /// An in-memory database rather than a model of a file (v0.16,
+    /// `Storage::is_memory`).
+    #[cfg(feature = "v16")]
+    memory: bool,
 }
 
 impl MemStorage {
@@ -151,6 +186,8 @@ impl MemStorage {
                 #[cfg(feature = "wal")]
                 shm: None,
             })),
+            #[cfg(feature = "v16")]
+            memory: false,
         }
     }
 
@@ -165,6 +202,18 @@ impl MemStorage {
                 #[cfg(feature = "wal")]
                 shm: None,
             })),
+            #[cfg(feature = "v16")]
+            memory: false,
+        }
+    }
+
+    /// An in-memory database (v0.16): the pin's `:memory:`, whose
+    /// journal mode is `memory` (`Storage::is_memory`).
+    #[cfg(feature = "v16")]
+    pub fn memory_db() -> MemStorage {
+        MemStorage {
+            memory: true,
+            ..MemStorage::new()
         }
     }
 
@@ -346,6 +395,10 @@ impl Storage for MemStorage {
     async fn sync(&mut self) -> Result<(), MemError> {
         Ok(())
     }
+    #[cfg(feature = "v16")]
+    fn is_memory(&self) -> bool {
+        self.memory
+    }
     async fn sidecar(&mut self, kind: Sidecar) -> Result<MemSidecar, MemError> {
         let _ = kind;
         let sc = MemSidecar {
@@ -523,8 +576,7 @@ mod file_storage {
             PathBuf::from(s)
         }
 
-        /// `<db><suffix>` (v0.16, `wal`: `-wal`, `-shm`).
-        #[cfg(feature = "wal")]
+        /// `<db><suffix>` (v0.16: `-wal`, `-shm`).
         fn sibling(&self, suffix: &str) -> PathBuf {
             let mut s = self.path.clone().into_os_string();
             s.push(suffix);
@@ -606,12 +658,29 @@ mod file_storage {
         fn file_name(&self) -> &[u8] {
             &self.full
         }
+        fn log_beside(&self) -> bool {
+            std::fs::metadata(self.sibling("-wal")).is_ok_and(|m| m.len() > 0)
+        }
+        /// A live SQLite connection is seen by its POSIX lock (Linux:
+        /// `/proc/locks`); hipp connections, this process's included,
+        /// by an exclusive `flock` on the database file (Unix), which
+        /// SQLite's POSIX locks neither take nor see.
         #[cfg(feature = "wal")]
-        fn locked_elsewhere(&self) -> bool {
+        fn claim_wal(&mut self) -> bool {
             #[cfg(target_os = "linux")]
-            return posix_locked(&[self.path.clone(), self.sibling("-shm")]);
-            #[cfg(not(target_os = "linux"))]
-            false
+            if posix_locked(&[self.path.clone(), self.sibling("-shm")]) {
+                return false;
+            }
+            #[cfg(unix)]
+            if let Err(std::fs::TryLockError::WouldBlock) = self.file.try_lock() {
+                return false;
+            }
+            true
+        }
+        #[cfg(feature = "wal")]
+        fn release_wal(&mut self) {
+            #[cfg(unix)]
+            let _ = self.file.unlock();
         }
         async fn sidecar(&mut self, kind: Sidecar) -> Result<FileSidecar, FileError> {
             let path = match kind {

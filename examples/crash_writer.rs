@@ -75,6 +75,14 @@ impl Storage for KillStorage {
             kill: self.kill,
         })
     }
+    #[cfg(feature = "wal")]
+    fn claim_wal(&mut self) -> bool {
+        self.inner.claim_wal()
+    }
+    #[cfg(feature = "wal")]
+    fn release_wal(&mut self) {
+        self.inner.release_wal()
+    }
 }
 
 impl SidecarFile for KillSidecar {

@@ -180,6 +180,24 @@ impl TableRules {
         self.gcols.as_ref().map(|g| g.virt.as_slice())
     }
 
+    /// An UPDATE's effective change set (v0.16): per column, whether
+    /// the statement assigns it (`m`) or it is a generated column
+    /// computed from an assigned column or, when `rowid` is set, the
+    /// rowid. Dependency order makes one pass enough.
+    pub fn changed_cols(&self, m: &[bool], rowid: bool) -> AVec<bool> {
+        let mut eff: AVec<bool> = AVec::new();
+        eff.extend_from_slice(m);
+        if let Some(g) = self.gcols.as_ref() {
+            for (ci, e) in g.order.iter() {
+                let dep = reads_any(e, eff.as_slice(), rowid);
+                if let Some(slot) = eff.as_mut_slice().get_mut(*ci) {
+                    *slot = *slot || dep;
+                }
+            }
+        }
+        eff
+    }
+
     /// Apply the table's rules to one fully-built proposed row
     /// in record form (see the module docs for the order).
     /// `Ok(false)` means OR IGNORE skips the row (a NOT NULL or
@@ -256,20 +274,10 @@ impl TableRules {
             // The effective change set: assigned columns, then
             // generated columns reading any of them (dependency
             // order makes one pass enough).
-            let mut eff: AVec<bool> = AVec::new();
-            let mut rowid_changed = true;
-            if let Some((m, r)) = changed {
-                rowid_changed = r;
-                eff.extend_from_slice(m);
-                if let Some(g) = gcols {
-                    for (ci, e) in g.order.iter() {
-                        let dep = reads_any(e, eff.as_slice(), rowid_changed);
-                        if let Some(slot) = eff.as_mut_slice().get_mut(*ci) {
-                            *slot = *slot || dep;
-                        }
-                    }
-                }
-            }
+            let (eff, rowid_changed) = match changed {
+                Some((m, r)) => (self.changed_cols(m, r), r),
+                None => (AVec::new(), true),
+            };
             let rd = eval_row(rowid_alias, affs, row, rowid);
             for c in self.checks.iter() {
                 if changed.is_some() && !reads_any(c, eff.as_slice(), rowid_changed) {
@@ -297,7 +305,7 @@ impl TableRules {
 
 /// Whether a rule expression over a table row reads any column
 /// flagged in `cols`, or the rowid when `rowid` is set.
-fn reads_any(e: &RExpr, cols: &[bool], rowid: bool) -> bool {
+pub fn reads_any(e: &RExpr, cols: &[bool], rowid: bool) -> bool {
     (rowid
         && expr_refs_range(
             e,
