@@ -7006,9 +7006,17 @@ points (boxed futures).
   of an attached table (or an `INSERT ... SELECT` without ORDER BY
   feeding one) can list rows in another order. `INDEXED BY` on such a
   source is not checked there.
+- A correlated subquery (or a join) over another database's table
+  scans that table's rows once per evaluation; since the review fix
+  they are read from the file once per execution and kept, but the
+  scan stays linear per outer row (the review's 3000 x 3000 lookup:
+  about 10 s in a debug build, where the pin seeks its rowid).
 - Refused (`Unsupported`) where the pin answers: an attached database's
   view read together with another database's table; a TEMP trigger on
-  an attached table; a TEMP UPDATE / DELETE / INSERT VALUES reading
+  a main or attached table (the TEMP unit's gap), or one writing a
+  schema-qualified table (`INSERT INTO main.m ...` / `a.t`: a trigger
+  program runs inside the database that fires it, with no router to
+  the others); a TEMP UPDATE / DELETE / INSERT VALUES reading
   another database (only `INSERT ... SELECT` / CTAS feed the temp
   database); a three-part name of another database inside a write of
   an attached table; an unqualified name meaning a table of another
@@ -7030,6 +7038,109 @@ points (boxed futures).
   lists `sqlite_sequence` before it, where the pin (in that session)
   lists the table first (pre-existing hash-order difference, main
   included; once the file is reopened the pin's order is hipp's).
+- Outside a transaction a plain `ANALYZE` / `REINDEX` commits each
+  database on its own (the pin's one statement commits them together
+  through the super-journal).
+- ATTACH of a file that does not exist leaves a 4,096-byte empty
+  database where the pin leaves a 0-byte file: hipp's `Pager::open`
+  writes page 1 of every empty file it opens (main included, in every
+  profile — the tiny profile's open path). The file is valid and reads
+  the same on both engines (`PRAGMA aux.page_count` is 0 on both).
+- `PRAGMA aux.foreign_key_list(t)` inside a transaction locks aux
+  against DETACH whether or not `t` has foreign keys (the pin only
+  when it has some).
+
+### ATTACH / DETACH — review fixes (2026-11-04)
+
+Nine findings; seven fixed with regressions
+(`tests/attach_v16.rs`: `review_regressions`, `bound_attach_operands`,
+`documented_refusals`; `hipp-cli/tests/cli_v16_attach.rs`:
+`review_regressions`, `super_journal_directory_syncs`), one narrowed to
+a clean refusal, one recorded as a gap.
+
+- *Bound parameters in ATTACH / DETACH* evaluated as NULL (`bind_ast`
+  did not visit their operands), so `ATTACH :f AS :n` attached a
+  private temporary database named `''`. The operands (and `KEY`) are
+  bound now; re-executing after `reset` with new bindings attaches
+  again.
+- *Cross-database rule for views and triggers* (the pin's `DbFixer`).
+  It is now one AST check (`foreign_names`): every FROM / target name
+  of the statement, table-valued functions included (new
+  `temp::Kind::Func`), must carry no qualifier but its own database's;
+  column qualifiers and three-part column names are not checked, as on
+  the pin. A trigger's WHEN clause (as `SELECT 1 WHERE ...`) and each
+  body statement are parsed and checked (the WHEN clause was not: a
+  trigger in `a` reading `main.t` there was stored and then read a's
+  own `t` when it fired). Main triggers are checked too (their body and
+  WHEN clause could name attached tables), and so are main views before
+  the router's nothing-attached shortcut (`CREATE VIEW v AS SELECT *
+  FROM a.pragma_table_info('t')` was stored). Two over-refusals went
+  with the old token scan: `SELECT main.t.x FROM t` in a trigger of
+  `a`, and `SELECT a.x FROM t AS a` in a main trigger, are accepted as
+  on the pin. Same pattern without `attach` (ungated within `v16` +
+  `triggers`): a `main.`-named trigger's body / WHEN clause naming a
+  `temp.` object was stored; it is `TriggerTempReference` now.
+- *Plain ANALYZE skipped attached databases* (no `a.sqlite_stat1`).
+  `ANALYZE` without a name, `REINDEX` without one and `REINDEX
+  <collation>` now run on every attached database after main
+  (`maint_attached`; TEMP stays skipped by ANALYZE, as on the pin).
+- *Own-database three-part names in stored objects*: a view or trigger
+  of `a` writing `a.t.x` failed with "no such column" when read or
+  fired (so a trigger made its table unwritable). An attached
+  connection's own sources answer to its alias
+  (`SourceDesc::dbname`, `Connection::own_dbname`).
+- *TEMP triggers writing qualified tables* were reported as the pin's
+  "qualified table names are not allowed ..." error, which the pin
+  applies only to the other databases' triggers. They are refused as
+  `Unsupported` now; running them needs trigger programs dispatched
+  through the top-level router (TEMP triggers on main tables are the
+  TEMP unit's existing refusal). README no longer says "everywhere the
+  pin takes them".
+- *DETACH locks*: reading an attached database through a table-valued
+  pragma (schema argument, an object found there, or `pragma_table_list`
+  / `PRAGMA table_list`) inside a transaction marks it used
+  (`Attached::used` is a `Cell` now: the pragma source is planned
+  through `&self`). The reverse, probed alongside: `PRAGMA
+  aux.page_size` / `journal_mode` / `cache_size` / `synchronous` /
+  `auto_vacuum` / `journal_size_limit` / `wal_checkpoint` read no page
+  on the pin and no longer lock (`Prag::no_lock`, `OnRoute::lock`).
+- *Directory syncs* (`FileStorage`, std only, so no profile size): a
+  sidecar this handle created syncs its directory on its first sync —
+  the rollback journal, the super-journal and the WAL, as the pin's
+  `unixSync` with `UNIXFILE_DIRSYNC` — and a file opened by name
+  (`open_named`: the super-journal) syncs its directory after its
+  deletion, the multi-database commit point (`unixDelete(..,
+  dirSync=1)`); the super-journal is created `O_EXCL`. Traced: hipp's
+  two-database commit now shows the pin's directory fsyncs.
+- *Performance* (narrowed): on main, an external source's rows are read
+  from their database once per execution and kept until `reset`
+  (`scan_ext`, `forget_ext_rows`); the review's 3000-row correlated
+  lookup went from about 20 s to 10 s (debug). The remaining
+  per-evaluation scan is in the gaps above; TEMP tables read by main
+  (`scan_temp`) have the same per-evaluation read (pre-existing, TEMP
+  unit).
+- *Not fixed*: the 4,096-byte file an ATTACH of a new name leaves (see
+  the gaps above: the core's open path, main included).
+
+**Found along the way, not this unit's** (pre-existing, left as they
+were): the pin refuses a view over a table-valued pragma when read
+("unsafe use of virtual table"), hipp reads it; `PRAGMA cache_size`
+reports 16 where the pin reports -2000; hipp-cli's `.parameter set`
+does not create the TEMP database as the pin's does; hipp bumps the
+file change counter on writes the pin skips (an ANALYZE that changes
+nothing, REINDEX).
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed".
+
+**Size:** tiny **76,960 B** (Δ **0**). Full **500,200 B** (Δ **+16 B**
+vs 500,184, ratchet raised): the ungated fixes in the TEMP router (a
+`main.`-named trigger's `temp.` references, the TEMP trigger refusal);
+the rest is gated on `attach` (`Kind::Func` included). Max **815,328
+B** (Δ **+1,400 B** vs 813,928, ratchet raised): the AST cross-database
+check, ANALYZE / REINDEX over attached databases, the lock flag, the
+row cache. (A first cut instantiated the parser over `()` for the
+trigger check: +44 KiB; it uses the storage's error type now.)
 
 ### Auto-vacuum files (2026-11-04)
 

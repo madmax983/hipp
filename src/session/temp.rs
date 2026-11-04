@@ -106,6 +106,11 @@ pub(super) enum Kind {
     /// The table qualifier of a column (`q.col`, `q.*`): no
     /// object; a `temp` here is a table or alias called so.
     Qual,
+    /// A table-valued function's name (`FROM f(...)`): no object of
+    /// a database, though a view or trigger may not qualify it with
+    /// another's name (v0.16, `attach`).
+    #[cfg(feature = "attach")]
+    Func,
 }
 
 /// Every table / view name a SELECT reads (handles), and its CTE
@@ -169,6 +174,9 @@ fn from_names(
         match &f.derived {
             Some(d) => select_names(d, out, ctes),
             None if f.args.is_none() => out.push((f.table, Kind::Object)),
+            #[cfg(feature = "attach")]
+            None => out.push((f.table, Kind::Func)),
+            #[cfg(not(feature = "attach"))]
             None => {}
         }
         if let Some(args) = &f.args {
@@ -513,6 +521,15 @@ impl<S: Storage> Connection<S> {
         );
         let (ast, toks) = match parsed {
             Ok(a) => a,
+            // A TEMP trigger may write a schema-qualified table (the
+            // pin's rule against them is for the other databases'
+            // triggers): hipp runs a trigger program in its own
+            // database only, so that is refused (v0.16 review fix: it
+            // was reported as the pin's error).
+            #[cfg(feature = "triggers")]
+            Err(Error::Schema {
+                kind: SchemaKind::TriggerQualifiedTarget,
+            }) if temp_kw => return Err(Error::Unsupported),
             // The main database's parse reports the error (or the
             // TEMP keyword is not followed by TABLE / VIEW).
             Err(e) if temp_kw => return Err(e),
@@ -535,7 +552,12 @@ impl<S: Storage> Connection<S> {
                 // table, in main (v0.16 review fix: the pin's "no such
                 // table: main.tt" over a temp-only table).
                 if nq == Some(false) && !temp_kw {
-                    if tq == Some(true) {
+                    // Nor may its WHEN clause or body name a `temp.`
+                    // object (v0.16 review fix: only the ON table was
+                    // checked on this path).
+                    if tq == Some(true)
+                        || (0..t.len()).any(|i| qualifier(t, i, arena) == Some(true))
+                    {
                         return Err(Error::Schema {
                             kind: SchemaKind::TriggerTempReference,
                         });
@@ -695,6 +717,10 @@ impl<S: Storage> Connection<S> {
                         && !routed.as_slice().contains(&k)
                 })
             });
+            #[cfg(feature = "attach")]
+            if *kind == Kind::Func {
+                continue;
+            }
             if *kind == Kind::Qual {
                 if let Some(i) = i {
                     col_quals.push(i);
@@ -1036,6 +1062,10 @@ impl<S: Storage> Connection<S> {
         select_names(&select, &mut names, &mut ctes);
         let (mut reads_temp, mut reads_main) = (false, false);
         for (h, kind) in names.iter() {
+            #[cfg(feature = "attach")]
+            if *kind == Kind::Func {
+                continue;
+            }
             if *kind == Kind::Qual {
                 continue;
             }

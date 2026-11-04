@@ -3093,6 +3093,10 @@ impl<S: Storage> Connection<S> {
         {
             src.db = self.db_no();
         }
+        #[cfg(feature = "attach")]
+        {
+            src.dbname = self.own_dbname();
+        }
         sources.push(src);
         let mut offsets = AVec::new();
         offsets.push(0);
@@ -4017,6 +4021,15 @@ impl<S: Storage> Connection<S> {
         if self.is_temp { 2 } else { 1 }
     }
 
+    /// The name a three-part name reaches this database's sources by
+    /// besides `main` (v0.16, `attach`): an attached database's alias
+    /// (a view or trigger stored there may write `aux.t.c`, as on the
+    /// pin); empty for main and temp.
+    #[cfg(feature = "attach")]
+    pub(super) fn own_dbname(&self) -> AVec<u8> {
+        self.alias.clone().unwrap_or_default()
+    }
+
     /// Resolve an `INDEXED BY` / `NOT INDEXED` on table `t` (v0.16,
     /// `v16`): the pin's "no such index" (`UnknownIndex`) when `t`
     /// has no index of the name. An index hipp cannot read (an
@@ -4907,6 +4920,10 @@ impl<S: Storage> Connection<S> {
         #[cfg(feature = "v16")]
         if s.cte.as_ref().is_some_and(|c| c.view) {
             desc.db = self.db_no();
+            #[cfg(feature = "attach")]
+            {
+                desc.dbname = self.own_dbname();
+            }
         } else if s.derived.is_none() {
             let n = handle_bytes(arena, s.table);
             desc.db = if eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master") {
@@ -5104,6 +5121,10 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "v16")]
             {
                 desc.db = self.db_no();
+            }
+            #[cfg(feature = "attach")]
+            {
+                desc.dbname = self.own_dbname();
             }
             desc.schema_table = t.root == 1 && s.alias.is_none();
             // The temp database's schema table answers to its own
@@ -6932,6 +6953,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.binds.started = false;
         self.binds.stale = true;
         self.phase = Phase::Fresh;
+        // Another database's rows are read again (v0.16, `attach`).
+        #[cfg(feature = "attach")]
+        self.forget_ext_rows();
         self.cursor = None;
         self.row_buf.clear();
         self.current.clear();

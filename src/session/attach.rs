@@ -65,7 +65,7 @@ pub(super) struct Attached<S: Storage> {
     pub(super) conn: Box<Connection<S>>,
     /// The open transaction has read or written it (DETACH's
     /// "database is locked").
-    pub(super) used: bool,
+    pub(super) used: core::cell::Cell<bool>,
 }
 
 /// A table of another database that the current statement reads
@@ -100,6 +100,10 @@ pub(super) struct OnRoute {
     db: usize,
     sql: AVec<u8>,
     ext: AVec<ExtReq>,
+    /// Running it inside a transaction locks the database against
+    /// DETACH (`Attached::used`): `false` for the pragmas the pin
+    /// answers without reading the file (`PRAGMA aux.page_size`, ...).
+    lock: bool,
 }
 
 /// Where `route_attach` sends a statement that involves an attached
@@ -122,6 +126,8 @@ pub(super) struct AttPlan {
     pub(super) sql: AVec<u8>,
     pub(super) width: usize,
     ext: AVec<ExtReq>,
+    /// `OnRoute::lock`.
+    lock: bool,
 }
 
 /// A planned ATTACH (`file: Some`) or DETACH (`Plan::Attach`).
@@ -149,6 +155,70 @@ struct Ref {
     schema_tok: Option<usize>,
     name: AVec<u8>,
     schema: Option<AVec<u8>>,
+}
+
+/// Whether a FROM / target name of `ast` (parsed with tokens `t`) is
+/// qualified with a schema other than `own` — the pin's `DbFixer`
+/// rule for a view or trigger stored in database `own`. Table-valued
+/// functions count (`main.pragma_table_info(...)`); a column's
+/// qualifiers (`aux.t.c`) do not, as on the pin.
+fn foreign_names(ast: &Ast, t: &[Token], arena: &Arena, own: &[u8]) -> bool {
+    let mut names = AVec::new();
+    let mut ctes = AVec::new();
+    let _ = ast_names(ast, &mut names, &mut ctes);
+    let mut placed: AVec<usize> = AVec::new();
+    for (h, kind) in names.iter() {
+        if *kind == Kind::Qual {
+            continue;
+        }
+        let n = handle_bytes(arena, *h);
+        // A name the parser copied (`x IN aux.t`) is found by its
+        // text among the qualified names not yet placed.
+        let i = tok_index(t, *h).or_else(|| {
+            (0..t.len()).find(|&k| {
+                ident(t, k, arena).is_some_and(|y| eq_ci(y, n))
+                    && schema_tok(t, k).is_some()
+                    && !placed.as_slice().contains(&k)
+            })
+        });
+        if let Some(i) = i {
+            placed.push(i);
+        }
+        if i.and_then(|i| schema_tok(t, i))
+            .and_then(|k| ident(t, k, arena))
+            .is_some_and(|q| !eq_ci(q, own))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether trigger `ct`'s WHEN clause or a statement of its body
+/// (`src` is the CREATE TRIGGER text) names an object of a database
+/// other than `own` (`foreign_names`). A part that does not parse is
+/// left to the statement's own parse to report.
+#[cfg(feature = "triggers")]
+fn trigger_reaches<E>(
+    ct: &crate::sql::ast::CreateTrigger,
+    src: &[u8],
+    arena: &Arena,
+    lim: crate::sql::parser::Limits,
+    own: &[u8],
+) -> bool {
+    let mut parts: AVec<AVec<u8>> = AVec::new();
+    if let Some((a, b)) = ct.when {
+        let mut w = copy_vec(b"SELECT 1 WHERE ");
+        w.extend_from_slice(src.get(a..b).unwrap_or_default());
+        parts.push(w);
+    }
+    for &(a, b) in ct.steps.iter() {
+        parts.push(copy_vec(src.get(a..b).unwrap_or_default()));
+    }
+    parts.iter().any(|p| {
+        crate::sql::parser::parse_trigger_step_tokens::<E>(p.as_slice(), arena, lim)
+            .is_ok_and(|(ast, toks)| foreign_names(&ast, toks.as_slice(), arena, own))
+    })
 }
 
 /// The schema qualifier's token before name token `i` (`aux` of
@@ -441,7 +511,12 @@ impl<S: Storage> Connection<S> {
             apply_cuts(src, &mut cuts)
         };
         let on = |db: usize, sql: AVec<u8>, ext: AVec<ExtReq>| {
-            Ok(Some(AttRoute::On(Box::new(OnRoute { db, sql, ext }))))
+            Ok(Some(AttRoute::On(Box::new(OnRoute {
+                db,
+                sql,
+                ext,
+                lock: true,
+            }))))
         };
         match body {
             Ast::Attach { .. }
@@ -478,7 +553,15 @@ impl<S: Storage> Connection<S> {
                             });
                         };
                         let k = tok_index(t, *h).unwrap_or(0);
-                        on(i, cut(&[k]), AVec::new())
+                        // The pin reads no page for these (v0.16 review
+                        // fix: DETACH inside a transaction succeeds).
+                        let lock = !p.is_some_and(|p| p.no_lock());
+                        Ok(Some(AttRoute::On(Box::new(OnRoute {
+                            db: i,
+                            sql: cut(&[k]),
+                            ext: AVec::new(),
+                            lock,
+                        }))))
                     }
                     None => {
                         let Some(v) = value else {
@@ -586,7 +669,7 @@ impl<S: Storage> Connection<S> {
         let mut refs: AVec<Ref> = AVec::new();
         let mut placed: AVec<usize> = AVec::new();
         for (h, kind) in names.iter() {
-            if *kind == Kind::Qual {
+            if matches!(kind, Kind::Qual | Kind::Func) {
                 continue;
             }
             let n = handle_bytes(arena, *h);
@@ -714,6 +797,18 @@ impl<S: Storage> Connection<S> {
             };
             created_loc = Some(loc);
         }
+        // A main view may not name another database's objects with a
+        // qualifier (table-valued pragma functions included; three-part
+        // column names are not checked, as on the pin); unqualified,
+        // they bind to main (stored, and read later as the pin does).
+        if matches!(body, Ast::CreateView { .. })
+            && created_loc == Some(Loc::Main)
+            && foreign_names(&ast, t, arena, b"main")
+        {
+            return Err(Error::Schema {
+                kind: SchemaKind::CrossDatabaseReference,
+            });
+        }
         let any_att = refs.iter().any(|r| matches!(r.loc, Loc::Att(_)))
             || matches!(created_loc, Some(Loc::Att(_)))
             || three.iter().any(|x| matches!(x.1, Loc::Att(_)));
@@ -755,18 +850,7 @@ impl<S: Storage> Connection<S> {
         match home {
             Loc::Main | Loc::Nowhere => {
                 if matches!(body, Ast::CreateView { .. }) {
-                    // A main view may not name another database's
-                    // objects with a qualifier; unqualified, they bind
-                    // to main (stored, and read later as the pin does).
-                    if refs
-                        .iter()
-                        .any(|r| matches!(r.loc, Loc::Att(_)) && r.schema.is_some())
-                        || three.iter().any(|x| matches!(x.1, Loc::Att(_)))
-                    {
-                        return Err(Error::Schema {
-                            kind: SchemaKind::CrossDatabaseReference,
-                        });
-                    }
+                    // Checked above.
                     return Ok(None);
                 }
                 if matches!(
@@ -812,14 +896,7 @@ impl<S: Storage> Connection<S> {
                     Ast::CreateView { .. } => {
                         // Its names bind to its own database; a
                         // qualifier naming another is the pin's error.
-                        if refs.iter().any(|r| {
-                            r.schema.is_some()
-                                && r.loc != Loc::Att(i)
-                                && !r.schema.as_ref().is_some_and(|q| {
-                                    att_name(i).is_some_and(|a| eq_ci(a, q.as_slice()))
-                                })
-                        }) || three.iter().any(|x| matches!(x.1, Loc::Att(j) if j != i))
-                        {
+                        if foreign_names(&ast, t, arena, att_name(i).unwrap_or_default()) {
                             return Err(Error::Schema {
                                 kind: SchemaKind::CrossDatabaseReference,
                             });
@@ -932,11 +1009,27 @@ impl<S: Storage> Connection<S> {
             });
         }
         let Some(i) = n_att else {
+            let temp = temp_kw || nq.is_some_and(|q| eq_ci(q, b"temp"));
             // A main or TEMP trigger on an attached table.
             if t_att.is_some() {
-                if temp_kw || nq.is_some_and(|q| eq_ci(q, b"temp")) {
+                if temp {
                     return Err(Error::Unsupported);
                 }
+                return Err(Error::Schema {
+                    kind: SchemaKind::CrossDatabaseReference,
+                });
+            }
+            // A main trigger (not one on a TEMP table, which is the
+            // temp database's) may name only main's objects, in its
+            // WHEN clause as in its body (v0.16 review fix).
+            let on_temp = tq.is_some_and(|q| eq_ci(q, b"temp"))
+                || (tq.is_none()
+                    && !nq.is_some_and(|q| eq_ci(q, b"main"))
+                    && self.temp_has(handle_bytes(arena, ct.table), false));
+            if !temp
+                && !on_temp
+                && trigger_reaches::<S::Error>(ct, src, arena, self.cfg.limits(), b"main")
+            {
                 return Err(Error::Schema {
                     kind: SchemaKind::CrossDatabaseReference,
                 });
@@ -953,27 +1046,18 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::CrossDatabaseReference,
             });
         }
-        // The body may not name another database (the pin's "trigger
-        // X cannot reference objects in database Y").
-        let others = |q: &[u8]| {
-            eq_ci(q, b"main") || eq_ci(q, b"temp") || self.att_index(q).is_some_and(|j| j != i)
-        };
-        for &(a, b) in ct.steps.iter() {
-            for k in 0..t.len() {
-                let Some(x) = t.get(k) else { continue };
-                if x.offset < a || x.offset >= b {
-                    continue;
-                }
-                if matches!(t.get(k + 1).map(|y| y.tok), Some(Tok::Dot))
-                    && !(k > 0 && matches!(t.get(k - 1).map(|y| y.tok), Some(Tok::Dot)))
-                    && ident(t, k, arena).is_some_and(others)
-                    && !ident(t, k, arena).is_some_and(|n| eq_ci(n, b"new") || eq_ci(n, b"old"))
-                {
-                    return Err(Error::Schema {
-                        kind: SchemaKind::CrossDatabaseReference,
-                    });
-                }
-            }
+        // The WHEN clause and the body may not name another database
+        // (the pin's "trigger X cannot reference objects in database
+        // Y"; v0.16 review fix: the WHEN clause was not checked).
+        let own = self
+            .attached
+            .as_slice()
+            .get(i)
+            .map_or(&[][..], |a| a.name.as_slice());
+        if trigger_reaches::<S::Error>(ct, src, arena, self.cfg.limits(), own) {
+            return Err(Error::Schema {
+                kind: SchemaKind::CrossDatabaseReference,
+            });
         }
         let mut cuts = AVec::new();
         if let Some(k) = nk
@@ -985,6 +1069,7 @@ impl<S: Storage> Connection<S> {
             db: i,
             sql: apply_cuts(src, &mut cuts),
             ext: AVec::new(),
+            lock: true,
         }))))
     }
 
@@ -1033,7 +1118,7 @@ impl<S: Storage> Connection<S> {
                 if self.explicit_txn
                     && let Some(a) = self.attached.as_mut_slice().get_mut(i)
                 {
-                    a.used = true;
+                    a.used.set(true);
                 }
                 match self.attached.as_mut_slice().get_mut(i) {
                     Some(a) => {
@@ -1244,12 +1329,30 @@ impl<S: Storage> Connection<S> {
         self.att_txn_ended();
     }
 
+    /// Run `sql` (a plain `ANALYZE` / `REINDEX` of main;
+    /// `Statement::step_maint`) on every attached database, in attach
+    /// order. Each one counts as used by an open transaction.
+    pub(super) async fn maint_attached(&mut self, sql: &[u8]) -> Result<(), S::Error> {
+        if self.alias.is_some() || self.is_temp {
+            return Ok(());
+        }
+        let txn = self.explicit_txn;
+        for a in self.attached.as_mut_slice().iter_mut() {
+            if txn {
+                a.used.set(true);
+            }
+            let r: Boxed<'_, Result<(), S::Error>> = Box::pin(run_on(&mut a.conn, sql));
+            r.await?;
+        }
+        Ok(())
+    }
+
     /// Forget which attached databases the transaction used, when none
     /// is open.
     pub(super) fn att_txn_ended(&mut self) {
         if !self.explicit_txn {
             for a in self.attached.as_mut_slice().iter_mut() {
-                a.used = false;
+                a.used.set(false);
             }
         }
     }
@@ -1374,7 +1477,7 @@ impl<S: Storage> Connection<S> {
         self.attached.push(Attached {
             name: copy_vec(name),
             conn: Box::new(c),
-            used: false,
+            used: core::cell::Cell::new(false),
         });
         self.sync_att();
         Ok(())
@@ -1404,7 +1507,7 @@ impl<S: Storage> Connection<S> {
             .attached
             .as_slice()
             .get(i)
-            .is_some_and(|a| a.used || a.conn.pager.in_txn())
+            .is_some_and(|a| a.used.get() || a.conn.pager.in_txn())
         {
             return Err(Error::Schema {
                 kind: SchemaKind::DatabaseLocked,
@@ -1529,7 +1632,7 @@ impl<S: Storage> Connection<S> {
     /// there now (its errors are prepare errors, as on the pin) and
     /// again when it runs.
     pub(super) async fn prepare_att(&mut self, r: OnRoute) -> Result<Plan, S::Error> {
-        let OnRoute { db, sql, ext } = r;
+        let OnRoute { db, sql, ext, lock } = r;
         let tabs = self.ext_tabs(ext.as_slice())?;
         self.sync_att();
         let Ok(text) = core::str::from_utf8(sql.as_slice()) else {
@@ -1551,6 +1654,7 @@ impl<S: Storage> Connection<S> {
             sql,
             width: width?,
             ext,
+            lock,
         })))
     }
 }
@@ -1566,7 +1670,7 @@ impl<S: Storage> Statement<'_, S> {
             let Plan::Att(p) = &self.plan else {
                 return Err(Error::Unsupported);
             };
-            let (db, sql, ext) = (p.db, p.sql.clone(), p.ext.clone());
+            let (db, sql, ext, lock) = (p.db, p.sql.clone(), p.ext.clone(), p.lock);
             // The tables it reads elsewhere, read now.
             let mut tabs = self.conn.ext_tabs(ext.as_slice())?;
             for t in tabs.as_mut_slice().iter_mut() {
@@ -1588,8 +1692,8 @@ impl<S: Storage> Statement<'_, S> {
                     kind: SchemaKind::NoSuchDatabase,
                 });
             };
-            if in_main_txn {
-                a.used = true;
+            if in_main_txn && lock {
+                a.used.set(true);
             }
             let c = &mut a.conn;
             let in_txn = c.explicit_txn;
@@ -1714,6 +1818,25 @@ impl<S: Storage> Statement<'_, S> {
                 kind: SchemaKind::UnknownTable,
             });
         }
-        self.conn.ext_rows(db, name.as_slice()).await
+        // Read once per execution (v0.16 review fix: a correlated
+        // subquery read the whole table again for every outer row).
+        // Nothing a statement run on main does changes another
+        // database, so the rows stay the rows until `reset`.
+        let rows = self.conn.ext_rows(db, name.as_slice()).await?;
+        if let Some(e) = self.conn.ext.borrow_mut().as_mut_slice().get_mut(k) {
+            e.rows = Some(rows.clone());
+        }
+        Ok(rows)
+    }
+
+    /// Forget the rows `scan_ext` kept (a new execution, after
+    /// `reset`, reads them again).
+    #[cfg(feature = "params")]
+    pub(super) fn forget_ext_rows(&mut self) {
+        if self.conn.alias.is_none() && !self.conn.is_temp {
+            for e in self.conn.ext.borrow_mut().as_mut_slice().iter_mut() {
+                e.rows = None;
+            }
+        }
     }
 }

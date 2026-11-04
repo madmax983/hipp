@@ -508,19 +508,48 @@ mod file_storage {
         path: PathBuf,
         file: Option<File>,
         existed: bool,
+        /// This handle created the file, and its directory entry is
+        /// not yet synced: the first `sync` syncs the directory too,
+        /// as the pin's `unixSync` does for a journal, super-journal
+        /// or log it created (v0.16 review fix).
+        dir_pending: bool,
+        /// A file opened by name (`Storage::open_named`: the
+        /// super-journal): created exclusively, and its deletion — a
+        /// multi-database commit's commit point — synced in its
+        /// directory, as the pin's `unixDelete(.., dirSync=1)`.
+        named: bool,
+    }
+
+    /// Sync the directory holding `path` (best effort, as the pin's:
+    /// a directory that cannot be opened is skipped).
+    fn sync_dir(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            let dir = match path.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d,
+                _ => std::path::Path::new("."),
+            };
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     impl FileSidecar {
         fn ensure(&mut self) -> Result<&mut File, FileError> {
             if self.file.is_none() {
-                self.file = Some(
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(&self.path)?,
-                );
+                let created = !self.path.exists();
+                let mut o = OpenOptions::new();
+                o.read(true).write(true);
+                if created && self.named {
+                    o.create_new(true);
+                } else {
+                    o.create(true).truncate(false);
+                }
+                self.file = Some(o.open(&self.path)?);
+                self.dir_pending = created;
             }
             Ok(self.file.as_mut().expect("just set"))
         }
@@ -563,13 +592,23 @@ mod file_storage {
         async fn sync(&mut self) -> Result<(), FileError> {
             if let Some(f) = &self.file {
                 f.sync_all()?;
+                if self.dir_pending {
+                    sync_dir(&self.path);
+                    self.dir_pending = false;
+                }
             }
             Ok(())
         }
         async fn delete(&mut self) -> Result<(), FileError> {
             self.file = None;
+            self.dir_pending = false;
             match std::fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    if self.named {
+                        sync_dir(&self.path);
+                    }
+                    Ok(())
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.into()),
             }
@@ -832,6 +871,8 @@ mod file_storage {
                 path,
                 file,
                 existed,
+                dir_pending: false,
+                named: true,
             }))
         }
         fn log_beside(&self) -> bool {
@@ -882,6 +923,8 @@ mod file_storage {
                 path,
                 file,
                 existed,
+                dir_pending: false,
+                named: false,
             })
         }
     }

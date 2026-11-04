@@ -449,12 +449,30 @@ impl<S: Storage> Statement<'_, S> {
                 self.vacuum(Some(name.as_slice())).await?
             }
             Maint::Reindex(r) => {
+                let every = matches!(r, Reindex::All | Reindex::Coll(_));
                 let r = self.reindex(&r).await;
                 self.finish_write(r).await?;
+                // A plain `REINDEX` (or one of a collation) rebuilds
+                // every attached database's indexes too (v0.16 review
+                // fix, `attach`: the pin's `reindexDatabases`).
+                #[cfg(feature = "attach")]
+                if every && matches!(self.ast, Ast::Reindex { schema: None, .. }) {
+                    let sql = copy_vec(handle_bytes(&self.arena, self.sql_text));
+                    self.conn.maint_attached(sql.as_slice()).await?;
+                }
+                let _ = every;
             }
             Maint::Analyze(a) => {
                 let r = self.analyze(&a).await;
                 self.finish_write(r).await?;
+                // A plain `ANALYZE` analyzes every attached database
+                // too, after main (v0.16 review fix, `attach`: the
+                // pin's `sqlite3Analyze` covers every database but
+                // TEMP).
+                #[cfg(feature = "attach")]
+                if matches!(self.ast, Ast::Analyze { name: None, .. }) {
+                    self.conn.maint_attached(b"ANALYZE").await?;
+                }
             }
         }
         self.phase = Phase::Done;

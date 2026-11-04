@@ -1161,10 +1161,239 @@ fn regressions() {
     );
 }
 
+/// Regressions from the unit's review (each probed on the live pin).
+#[test]
+fn review_regressions() {
+    each(
+        "rv",
+        &[
+            // A trigger's WHEN clause naming another database: the pin
+            // refuses it ("trigger tr cannot reference objects in
+            // database main"); hipp created it, and it then read the
+            // attached database's own `t` when it fired. (Objects
+            // naming their own database by its alias are dropped at
+            // the end: the file opened alone would be malformed.)
+            "CREATE TABLE t(x)
+             CREATE TABLE m(x)
+             ATTACH '{d}/a.db' AS a
+             CREATE TABLE a.t(x)
+             CREATE TABLE a.log(m)
+             INSERT INTO a.t VALUES (1), (2), (3)
+             CREATE TRIGGER a.tr8 AFTER INSERT ON t WHEN (SELECT count(*) FROM main.t) > 0 BEGIN INSERT INTO log VALUES (new.x); END
+             CREATE TRIGGER a.tr9 AFTER INSERT ON t WHEN new.x IN (SELECT x FROM main.m) BEGIN INSERT INTO log VALUES (new.x); END
+             CREATE TRIGGER a.tr10 AFTER INSERT ON t WHEN new.x IN (SELECT x FROM a.t) BEGIN INSERT INTO log VALUES (new.x); END
+             CREATE TRIGGER a.tr11 AFTER INSERT ON t WHEN EXISTS (SELECT 1 FROM temp.sqlite_schema) BEGIN SELECT 1; END
+             INSERT INTO a.t VALUES (9)
+             SELECT * FROM a.log
+             SELECT name FROM a.sqlite_schema ORDER BY 1
+             DROP TRIGGER a.tr10",
+            // Main triggers: their WHEN clause and body may name only
+            // main's objects (a `main.`-named one included); a column
+            // qualifier that happens to be a database's name is no
+            // reference.
+            "CREATE TABLE t(x)
+             CREATE TABLE m(x)
+             CREATE TEMP TABLE tt(x)
+             ATTACH '{d}/a.db' AS a
+             CREATE TABLE a.t(x)
+             CREATE TRIGGER main.tr1 AFTER INSERT ON m BEGIN SELECT x FROM a.t; END
+             CREATE TRIGGER main.tr2 AFTER INSERT ON m BEGIN SELECT x FROM temp.tt; END
+             CREATE TRIGGER main.tr3 AFTER INSERT ON m WHEN EXISTS (SELECT 1 FROM temp.tt) BEGIN SELECT 1; END
+             CREATE TRIGGER tr4 AFTER INSERT ON m WHEN EXISTS (SELECT 1 FROM a.t) BEGIN SELECT 1; END
+             CREATE TRIGGER tr5 AFTER INSERT ON main.t BEGIN SELECT a.x FROM t AS a; END
+             CREATE TRIGGER tr6 AFTER INSERT ON main.t WHEN (SELECT a.x FROM t AS a) BEGIN SELECT 1; END
+             CREATE TRIGGER main.tr7 AFTER INSERT ON m BEGIN SELECT x FROM main.t; END
+             INSERT INTO m VALUES (1)
+             SELECT name FROM sqlite_schema ORDER BY 1",
+            // Table-valued pragma functions count as references of
+            // their qualifier's database in a view or trigger; three-
+            // part column names do not, as on the pin.
+            "CREATE TABLE t(x)
+             CREATE TABLE m(x)
+             ATTACH '{d}/a.db' AS a
+             CREATE TABLE a.t(x)
+             CREATE VIEW a.v8 AS SELECT * FROM main.pragma_table_info('m')
+             CREATE VIEW a.v9 AS SELECT name FROM a.pragma_table_info('t')
+             CREATE VIEW a.v10 AS SELECT name FROM pragma_table_info('t')
+             CREATE VIEW v11 AS SELECT * FROM a.pragma_table_info('t')
+             CREATE VIEW v12 AS SELECT name FROM main.pragma_table_info('t')
+             CREATE VIEW a.v13 AS SELECT * FROM temp.pragma_table_info('t')
+             CREATE VIEW a.v1 AS SELECT main.t.x FROM t
+             CREATE VIEW v2 AS SELECT a.t.x FROM t
+             CREATE TRIGGER a.tr4 AFTER INSERT ON t BEGIN SELECT main.t.x FROM t; END
+             CREATE TRIGGER a.tr7 AFTER INSERT ON t BEGIN SELECT 1 FROM a.t JOIN (SELECT * FROM main.t) s; END
+             CREATE TRIGGER a.tr8 AFTER INSERT ON t BEGIN SELECT 1 FROM t WHERE x IN main.t; END
+             CREATE TRIGGER a.tr9 AFTER INSERT ON t BEGIN INSERT INTO t SELECT name FROM main.pragma_table_list; END
+             SELECT name FROM a.sqlite_schema ORDER BY 1
+             SELECT name FROM sqlite_schema ORDER BY 1
+             DROP VIEW a.v9",
+            // A view or trigger stored in an attached database may name
+            // its columns `a.t.x` by the database's own name: reading
+            // the view, and every insert that fired the trigger, failed
+            // with "no such column".
+            "ATTACH '{d}/a.db' AS a
+             CREATE TABLE a.t(x)
+             INSERT INTO a.t VALUES (1)
+             CREATE TABLE a.log(m)
+             CREATE VIEW a.v2 AS SELECT a.t.x FROM t
+             SELECT * FROM a.v2
+             CREATE TRIGGER a.tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT a.t.x FROM t WHERE a.t.x = new.x; END
+             INSERT INTO a.t VALUES (2)
+             SELECT * FROM a.log
+             SELECT * FROM a.t
+             SELECT a.t.x FROM a.t ORDER BY 1",
+            // A plain ANALYZE / REINDEX covers every attached database
+            // (ANALYZE skipped them: no `a.sqlite_stat1`).
+            "CREATE TABLE m(x)
+             CREATE INDEX mi ON m(x)
+             INSERT INTO m VALUES (1), (2)
+             ATTACH '{d}/a.db' AS a
+             ATTACH '{d}/b.db' AS b
+             CREATE TABLE a.t(x)
+             CREATE INDEX a.ti ON t(x)
+             INSERT INTO a.t VALUES (1), (1), (2)
+             CREATE TABLE b.u(y COLLATE NOCASE)
+             CREATE INDEX b.ui ON u(y)
+             INSERT INTO b.u VALUES ('a'), ('B')
+             ANALYZE
+             SELECT * FROM sqlite_stat1
+             SELECT * FROM a.sqlite_stat1
+             SELECT * FROM b.sqlite_stat1
+             REINDEX
+             REINDEX nocase
+             BEGIN
+             ANALYZE
+             DETACH b
+             COMMIT
+             ANALYZE main
+             PRAGMA b.integrity_check",
+            // Reading an attached database through a table-valued
+            // pragma (with a schema argument, by an object's name, or
+            // `table_list`) locks it against DETACH inside a
+            // transaction; PRAGMA aux.page_size and the like do not.
+            "ATTACH '{d}/a.db' AS a
+             CREATE TABLE a.t(x)
+             BEGIN
+             SELECT * FROM pragma_table_info('t', 'a')
+             DETACH a
+             COMMIT
+             BEGIN
+             SELECT name FROM pragma_table_info('t')
+             DETACH a
+             COMMIT
+             BEGIN
+             SELECT count(*) FROM pragma_table_list
+             DETACH a
+             COMMIT
+             BEGIN
+             PRAGMA a.page_size
+             PRAGMA a.journal_mode
+             PRAGMA a.synchronous
+             PRAGMA a.auto_vacuum
+             DETACH a
+             COMMIT
+             SELECT name FROM pragma_database_list",
+            // A correlated subquery over another database's table (it
+            // is read once per execution now, not once per outer row).
+            "CREATE TABLE t(k INTEGER PRIMARY KEY)
+             WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 300) INSERT INTO t SELECT n FROM r
+             ATTACH '{d}/a.db' AS a
+             CREATE TABLE a.u(k INTEGER PRIMARY KEY, y)
+             INSERT INTO a.u SELECT k, k * 2 FROM t
+             SELECT sum((SELECT y FROM a.u WHERE u.k = t.k)) FROM t
+             SELECT count(*) FROM t WHERE k IN (SELECT y FROM a.u)",
+        ],
+    );
+}
+
+/// `ATTACH ? AS ?` / `DETACH ?` with bound parameters (review fix:
+/// the operands evaluated as NULL, so a private temporary database
+/// named '' was attached and the named file never opened). The pin
+/// runs the same statements with the values written as literals.
+#[cfg(feature = "params")]
+#[test]
+fn bound_attach_operands() {
+    let h = fresh_dir("bound-h");
+    let o = fresh_dir("bound-o");
+    let hd = h.to_string_lossy().to_string();
+    let rows = block_on(async {
+        let fs = FileStorage::open(h.join("main.db")).expect("fs");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
+        let file = format!("{hd}/p.db");
+        {
+            let mut q = db.prepare("ATTACH :f AS :n").await.expect("prepare");
+            q.bind_text(1, &file).expect("bind");
+            q.bind_text(2, "pp").expect("bind");
+            assert_eq!(q.step().await.expect("attach"), Step::Done);
+        }
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT name, file FROM pragma_database_list WHERE name NOT IN ('main', 'temp')",
+            "CREATE TABLE pp.t(x)",
+            "INSERT INTO pp.t VALUES (1), (2)",
+        ] {
+            let mut q = db.prepare(sql).await.expect(sql);
+            while q.step().await.expect(sql) == Step::Row {
+                let mut l = String::new();
+                render(&q, &mut l);
+                out.push(l.replace(&hd, "{d}"));
+            }
+        }
+        {
+            // Rebound and run again: a second database.
+            let mut q = db.prepare("ATTACH ?1 AS ?2").await.expect("prepare");
+            q.bind_text(1, &format!("{hd}/q.db")).expect("bind");
+            q.bind_text(2, "qq").expect("bind");
+            assert_eq!(q.step().await.expect("attach"), Step::Done);
+            q.reset();
+            q.bind_text(1, &format!("{hd}/r.db")).expect("bind");
+            q.bind_text(2, "rr").expect("bind");
+            assert_eq!(q.step().await.expect("attach"), Step::Done);
+        }
+        {
+            let mut q = db.prepare("DETACH ?").await.expect("prepare");
+            q.bind_text(1, "qq").expect("bind");
+            assert_eq!(q.step().await.expect("detach"), Step::Done);
+        }
+        let mut q = db
+            .prepare("SELECT group_concat(name) FROM pragma_database_list")
+            .await
+            .expect("list");
+        while q.step().await.expect("list") == Step::Row {
+            let mut l = String::new();
+            render(&q, &mut l);
+            out.push(l);
+        }
+        drop(q);
+        db.close().await.expect("close");
+        out
+    });
+    let (orows, oerrs) = oracle_run(
+        &o,
+        &lines(
+            "ATTACH '{d}/p.db' AS pp
+             SELECT name, file FROM pragma_database_list WHERE name NOT IN ('main', 'temp')
+             CREATE TABLE pp.t(x)
+             INSERT INTO pp.t VALUES (1), (2)
+             ATTACH '{d}/q.db' AS qq
+             ATTACH '{d}/r.db' AS rr
+             DETACH qq
+             SELECT group_concat(name) FROM pragma_database_list",
+        ),
+    );
+    assert!(oerrs.is_empty(), "{oerrs:?}");
+    assert_eq!(rows, orows);
+    assert_eq!(
+        common::cli(&h.join("p.db"), ".dump"),
+        common::cli(&o.join("p.db"), ".dump")
+    );
+}
+
 /// What hipp refuses cleanly where the pin answers (STATUS.md's
 /// honest gaps): a TEMP write other than INSERT ... SELECT reading an
 /// attached table, an attached view read together with another
-/// database's table, a TEMP trigger on an attached table.
+/// database's table, a TEMP trigger on an attached table or writing a
+/// schema-qualified table.
 #[test]
 fn documented_refusals() {
     let d = fresh_dir("refusals");
@@ -1190,6 +1419,12 @@ fn documented_refusals() {
             "DELETE FROM tt WHERE z IN (SELECT x FROM a.t)",
             "SELECT * FROM a.v, m",
             "CREATE TEMP TRIGGER tg AFTER INSERT ON a.t BEGIN SELECT 1; END",
+            // A TEMP trigger writing a schema-qualified table (review
+            // fix: it was reported as the pin's "qualified table names
+            // are not allowed", which the pin applies to the other
+            // databases' triggers only).
+            "CREATE TEMP TRIGGER tq AFTER INSERT ON tt BEGIN INSERT INTO main.m VALUES (1); END",
+            "CREATE TEMP TRIGGER tq AFTER INSERT ON tt BEGIN DELETE FROM a.t; END",
         ] {
             let r = db.prepare(sql).await.map(|_| ());
             assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");

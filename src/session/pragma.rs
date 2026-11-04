@@ -145,6 +145,25 @@ pub(super) fn lookup<E>(name: &[u8]) -> Result<Option<Prag>, E> {
 }
 
 impl Prag {
+    /// Answered without reading a page of the database (v0.16,
+    /// `attach`): `PRAGMA aux.x` of one inside a transaction leaves
+    /// DETACH free, as on the pin.
+    #[cfg(feature = "attach")]
+    pub(super) fn no_lock(self) -> bool {
+        #[cfg(feature = "wal")]
+        if matches!(self, Prag::JournalSizeLimit | Prag::WalCheckpoint) {
+            return true;
+        }
+        matches!(
+            self,
+            Prag::AutoVacuum
+                | Prag::CacheSize
+                | Prag::JournalMode
+                | Prag::PageSize
+                | Prag::Synchronous
+        )
+    }
+
     /// A setting of the connection, not of one database: a
     /// `temp.` (or `main.`) qualifier is ignored, as on the pin.
     pub(super) fn connection_wide(self) -> bool {
@@ -921,6 +940,9 @@ impl<S: Storage> Connection<S> {
                         main_only: true,
                     };
                     for a in self.attached.iter() {
+                        if self.explicit_txn {
+                            a.used.set(true);
+                        }
                         for r in a.conn.pragma_rows(arena, &ap)?.iter() {
                             rows.push(r.clone());
                         }
@@ -1555,6 +1577,11 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
             if let Some(i) = att
                 && let Some(x) = self.attached.as_slice().get(i)
             {
+                // It reads that database: inside a transaction, DETACH
+                // finds it locked (v0.16 review fix).
+                if self.explicit_txn {
+                    x.used.set(true);
+                }
                 let mut a2 = AVec::new();
                 if let Some(a) = args {
                     for (k, e) in a.iter().enumerate() {

@@ -167,3 +167,121 @@ fn dot_commands_over_attached_databases() {
          .databases\n",
     );
 }
+
+/// `ATTACH :f AS :n` with `.parameter set` values (review fix: bound
+/// operands evaluated as NULL, attaching a private temporary database
+/// named ''; the pin's `.parameter` creates the TEMP database, which
+/// hipp-cli's does not, so `temp` is left out of the listing), and the review's cross-database regressions as the
+/// shell shows them.
+#[test]
+fn review_regressions() {
+    script_identical(
+        "params",
+        ".parameter set :f 'p.db'\n\
+         .parameter set :n 'pp'\n\
+         ATTACH :f AS :n;\n\
+         SELECT name, file FROM pragma_database_list WHERE name NOT IN ('main', 'temp');\n\
+         CREATE TABLE pp.t(x);\n\
+         INSERT INTO pp.t VALUES (1);\n\
+         SELECT * FROM pp.t;\n\
+         DETACH :n;\n\
+         SELECT name FROM pragma_database_list WHERE name <> 'temp';\n",
+    );
+    byte_identical(
+        "analyze",
+        "CREATE TABLE m(x); CREATE INDEX mi ON m(x); INSERT INTO m VALUES (1), (2); \
+         ATTACH 'a.db' AS a; CREATE TABLE a.t(x); CREATE INDEX a.ti ON t(x); \
+         INSERT INTO a.t VALUES (1), (1), (2); ANALYZE; \
+         SELECT * FROM sqlite_stat1; SELECT * FROM a.sqlite_stat1;",
+    );
+    byte_identical(
+        "own3",
+        "ATTACH 'a.db' AS a; CREATE TABLE a.t(x); INSERT INTO a.t VALUES (1); \
+         CREATE TABLE a.log(m); CREATE VIEW a.v2 AS SELECT a.t.x FROM t; SELECT * FROM a.v2; \
+         CREATE TRIGGER a.tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT a.t.x FROM t WHERE a.t.x = new.x; END; \
+         INSERT INTO a.t VALUES (2); SELECT * FROM a.log; SELECT * FROM a.t; \
+         DROP VIEW a.v2; DROP TRIGGER a.tr;",
+    );
+}
+
+/// A commit across two rollback-journal databases syncs the
+/// super-journal's directory after creating it (exclusively) and after
+/// deleting it — the commit point — as the pin's `unixSync` /
+/// `unixDelete(.., dirSync=1)` do (review fix). Traced with `strace`;
+/// skipped where it cannot run.
+#[test]
+fn super_journal_directory_syncs() {
+    if Command::new("strace")
+        .arg("-o")
+        .arg("/dev/null")
+        .arg("true")
+        .status()
+        .map_or(true, |s| !s.success())
+    {
+        eprintln!("strace not available: skipped");
+        return;
+    }
+    let d = temp_dir("dirsync");
+    run(
+        &hipp_bin(),
+        &d,
+        "CREATE TABLE t(x); ATTACH 'a.db' AS a; CREATE TABLE a.t(x);",
+    );
+    let trace = d.join("trace.txt");
+    let out = Command::new("strace")
+        .arg("-f")
+        .arg("-o")
+        .arg(&trace)
+        .arg("-e")
+        .arg("trace=openat,unlink,fsync")
+        .arg(hipp_bin())
+        .arg("main.db")
+        .arg("ATTACH 'a.db' AS a; BEGIN; INSERT INTO t VALUES (1); INSERT INTO a.t VALUES (2); COMMIT;")
+        .current_dir(&d)
+        .output()
+        .expect("strace runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&trace).expect("trace");
+    let calls: Vec<&str> = text.lines().collect();
+    let create = calls
+        .iter()
+        .position(|l| l.contains("-mj") && l.contains("openat"))
+        .expect("super-journal created");
+    assert!(calls[create].contains("O_EXCL"), "{}", calls[create]);
+    let unlink = calls
+        .iter()
+        .position(|l| l.contains("-mj") && l.contains("unlink"))
+        .expect("super-journal deleted");
+    // An fsync of a directory opened after each.
+    let dir_sync_after = |from: usize| {
+        calls[from + 1..].iter().any(|l| {
+            l.contains("openat")
+                && !l.contains("O_CREAT")
+                && !l.contains(".db")
+                && l.contains("O_RDONLY")
+        }) && calls[from + 1..].iter().any(|l| l.contains("fsync("))
+    };
+    assert!(dir_sync_after(create), "{text}");
+    let after_unlink: Vec<&&str> = calls[unlink + 1..].iter().collect();
+    let dir_open = after_unlink
+        .iter()
+        .position(|l| l.contains("openat") && l.contains("O_RDONLY") && !l.contains(".db"))
+        .expect("directory opened after the commit point");
+    let fd = after_unlink[dir_open]
+        .rsplit("= ")
+        .next()
+        .map(str::trim)
+        .expect("fd")
+        .to_string();
+    assert!(
+        after_unlink[dir_open..]
+            .iter()
+            .any(|l| l.contains(&format!("fsync({fd})"))),
+        "{text}"
+    );
+    integrity_ok(&d);
+}

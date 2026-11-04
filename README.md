@@ -775,12 +775,17 @@ aspirations.
   `DETACH [DATABASE] expr` with the pin's limit of 10 and its
   errors (already in use, cannot detach main / temp, no such
   database, database is locked inside a transaction that used it,
-  the encoding rule); `PRAGMA database_list`, schema-qualified
-  names everywhere the pin takes them (`aux.t`, `aux.t.col`,
-  `aux.sqlite_schema`, `PRAGMA aux.x`, `VACUUM aux [INTO]`,
-  `REINDEX` / `ANALYZE` / `ALTER` / `DROP` / `CREATE TABLE / INDEX
-  / VIEW / TRIGGER aux.x`) and the pin's unqualified-name order
-  (temp, main, then attached in attach order). Each attached
+  the encoding rule; bound parameters as operands);
+  `PRAGMA database_list`, schema-qualified names (`aux.t`,
+  `aux.t.col`, `aux.sqlite_schema`, `PRAGMA aux.x`, `VACUUM aux
+  [INTO]`, `REINDEX` / `ANALYZE` / `ALTER` / `DROP` / `CREATE TABLE
+  / INDEX / VIEW / TRIGGER aux.x`; a plain `ANALYZE` / `REINDEX`
+  covers every database; views and triggers keep to their own
+  database, WHEN clauses included) and the pin's unqualified-name
+  order (temp, main, then attached in attach order). Not yet: TEMP
+  triggers on main or attached tables, or writing schema-qualified
+  tables (refused cleanly), and index access paths into another
+  database's tables (they are read whole, once per execution). Each attached
   database is a connection of its own owned by the main one — the
   TEMP database's model made N-ary — so every feature works inside
   it; statements across databases (joins, subqueries, compounds,
