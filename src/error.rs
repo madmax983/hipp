@@ -450,6 +450,12 @@ pub enum SchemaKind {
     /// PRIMARY KEY` (not DESC), or drop the keyword.
     #[cfg(feature = "v16")]
     AutoincrementNotIntegerPk,
+    /// `AUTOINCREMENT` on a WITHOUT ROWID table (v0.16,
+    /// `without_rowid`; the pin's "AUTOINCREMENT not allowed on
+    /// WITHOUT ROWID tables"): such a table has no rowid to count.
+    /// Drop the keyword, or the WITHOUT ROWID option.
+    #[cfg(feature = "without_rowid")]
+    AutoincrementWithoutRowid,
     /// `ALTER TABLE ... RENAME COLUMN` to `rowid`, `oid` or
     /// `_rowid_` (v0.16, `v16`; the pin's "cannot rename to rowid
     /// alias"). Pick another name.
@@ -688,6 +694,16 @@ pub enum ParseKind {
     /// specification"). Put the earlier bound first.
     #[cfg(feature = "window")]
     UnsupportedFrame,
+    /// `WITHOUT <name>` with a name other than ROWID (v0.16,
+    /// `without_rowid`; the pin's "unknown table option"). The
+    /// table options are STRICT and WITHOUT ROWID.
+    #[cfg(feature = "without_rowid")]
+    UnknownTableOption,
+    /// A WITHOUT ROWID table with no PRIMARY KEY (v0.16,
+    /// `without_rowid`; the pin's "PRIMARY KEY missing on table
+    /// t"). Declare one: its columns key the table's B-tree.
+    #[cfg(feature = "without_rowid")]
+    PrimaryKeyMissing,
 }
 
 /// The core error type. Generic over the storage error `E`.

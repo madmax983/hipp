@@ -129,7 +129,7 @@ impl<S: Storage> Connection<S> {
                 let owned = copy_vec(text);
                 let e =
                     crate::sql::parser::parse_expr_text::<S::Error>(owned.as_slice(), arena, lim)?;
-                let cur = scope(handle_bytes(ca, t.name), true);
+                let cur = scope(handle_bytes(ca, t.name), t.has_rowid());
                 let r = resolve_scoped::<S::Error>(&e, arena, &cur, &[], &mut refuse)?;
                 check(&r)?;
                 Some(r)
@@ -766,7 +766,9 @@ impl<S: Storage> Connection<S> {
             };
             let mut keys = AVec::new();
             let mut desc = AVec::new();
-            let mut wi: u32 = 1;
+            // The rowid's width; a WITHOUT ROWID table's entries end
+            // with columns instead (below).
+            let mut wi: u32 = u32::from(t.has_rowid());
             for (k, c) in ix.columns.iter().enumerate() {
                 let e = ext
                     .as_ref()
@@ -791,6 +793,52 @@ impl<S: Storage> Connection<S> {
                     coll: c.coll,
                 });
             }
+            // A WITHOUT ROWID table (v0.16): the clustered index holds
+            // every stored column, a secondary index the key columns
+            // it lacks (`crate::wr`).
+            #[allow(unused_mut)]
+            let mut suffix = AVec::new();
+            #[allow(unused_mut)]
+            let mut covers_all = false;
+            // A UNIQUE constraint's index (see `IdxModel::suffix_covers`).
+            let auto = ix.origin == crate::schema::IndexOrigin::Auto;
+            #[cfg(feature = "without_rowid")]
+            if !t.has_rowid() {
+                if ix.clustered {
+                    covers_all = true;
+                    for (k, c) in t.columns.iter().enumerate() {
+                        let virt = c.gen_expr.is_some() && !c.stored;
+                        if !virt && !ix.columns.iter().any(|kc| kc.col == Some(k)) {
+                            wi += szs.as_slice().get(k).copied().unwrap_or(1);
+                        }
+                    }
+                } else if let Some(pk) = self
+                    .catalog
+                    .indexes_for(ca, handle_bytes(ca, t.name))
+                    .find(|i| i.clustered)
+                {
+                    for pc in pk.columns.iter() {
+                        let held = ix.columns.iter().enumerate().any(|(k, kc)| {
+                            !matches!(keys.as_slice().get(k), Some(IdxKey::Expr(_)))
+                                && kc.col == pc.col
+                                && kc.coll == pc.coll
+                        });
+                        if held {
+                            continue;
+                        }
+                        if let Some(c) = pc.col {
+                            wi += szs.as_slice().get(c).copied().unwrap_or(1);
+                            suffix.push((
+                                IdxKey::Col(c),
+                                crate::record::KeyOrder {
+                                    desc: pc.desc && !auto,
+                                    coll: pc.coll,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
             out.push(IdxModel {
                 root: ix.root,
                 unique: ix.unique,
@@ -798,6 +846,9 @@ impl<S: Storage> Connection<S> {
                 desc,
                 pred: ext.as_ref().and_then(|x| x.pred.as_ref()).map(shift),
                 width: log_est(u64::from(wi) * 4),
+                suffix,
+                covers_all,
+                suffix_covers: !auto,
             });
         }
         (width, out)
@@ -935,6 +986,7 @@ impl<S: Storage> Connection<S> {
             let tab = Table {
                 width,
                 indexes: models.as_slice(),
+                wr: !t.has_rowid(),
             };
             if let Some(a) = choose(&q, &s, &tab, ts.as_slice()) {
                 plans.push((i, a));
@@ -973,7 +1025,16 @@ impl<S: Storage> Connection<S> {
     ) -> Option<Box<crate::xplan::IdxAccess>> {
         use crate::query::{RefRange, expr_refs_range};
         use crate::xplan::{IdxKey, Query, Src, Table, choose, conjuncts, terms};
-        let f = filter?;
+        // A WITHOUT ROWID table is read through its cheapest index
+        // even with no usable term (v0.16): the pin's one-pass loop
+        // then walks that index.
+        let wr = !t.has_rowid();
+        let always = RExpr::Literal(OwnedValue::Integer(1));
+        let f = match filter {
+            Some(f) => f,
+            None if wr => &always,
+            None => return None,
+        };
         let ca = &self.catalog_arena;
         let s = Src {
             base: 0,
@@ -996,7 +1057,7 @@ impl<S: Storage> Connection<S> {
             Some(false)
         };
         let ts = terms(conj.as_slice(), &s, &avail);
-        if ts.is_empty() {
+        if ts.is_empty() && !wr {
             return None;
         }
         let one_pass = update.as_ref().is_some_and(|u| {
@@ -1011,9 +1072,21 @@ impl<S: Storage> Connection<S> {
                 let sql = handle_bytes(ca, t.sql);
                 sql.windows(7).any(|w| w.eq_ignore_ascii_case(b"REPLACE"))
             };
+            // Changing the key (the rowid, or — v0.16 — a WITHOUT
+            // ROWID table's PRIMARY KEY column) is two-pass, as on the
+            // pin (its `chngKey`).
+            #[cfg(feature = "without_rowid")]
+            let pk = self
+                .catalog
+                .indexes_for(ca, handle_bytes(ca, t.name))
+                .find(|i| i.clustered);
+            #[cfg(feature = "without_rowid")]
+            let in_pk = |i: usize| pk.is_some_and(|p| p.columns.iter().any(|c| c.col == Some(i)));
+            #[cfg(not(feature = "without_rowid"))]
+            let in_pk = |_: usize| false;
             let rowid = u.sets.iter().any(|(tg, _)| match tg {
                 Target::Rowid => true,
-                Target::Col(i) => Some(*i) == t.rowid_alias,
+                Target::Col(i) => Some(*i) == t.rowid_alias || in_pk(*i),
             });
             !u.returning
                 && !u.from
@@ -1037,7 +1110,10 @@ impl<S: Storage> Connection<S> {
             group: false,
             group_by: false,
             ncols_out: 0,
-            needed: if one_pass {
+            // The pin's `colUsed`: a WITHOUT ROWID table's loop
+            // covers the WHERE's columns (the SET and RETURNING
+            // expressions are not counted).
+            needed: if one_pass && !wr {
                 None
             } else {
                 Some(needed.as_slice())
@@ -1050,6 +1126,7 @@ impl<S: Storage> Connection<S> {
         let tab = Table {
             width,
             indexes: models.as_slice(),
+            wr: !t.has_rowid(),
         };
         let mut acc = choose(&q, &s, &tab, ts.as_slice())?;
         // A loop whose index the SET changes is not one-pass.

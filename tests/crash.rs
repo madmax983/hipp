@@ -602,3 +602,28 @@ fn v16_cross_tool_real_sqlite_recovers_savepoint_journal() {
         assert!(ids == "1\n" || ids == "1,2,4\n", "k={k}: ids {ids}");
     }
 }
+
+/// A WITHOUT ROWID table's clustered tree and secondary index
+/// through the journal (v0.16, `without_rowid`): a crash at every
+/// write boundary of a transaction that inserts (splitting the
+/// trees), moves rows by key and deletes recovers to the pre- or
+/// post-image.
+#[cfg(feature = "without_rowid")]
+#[test]
+fn v16_crash_without_rowid() {
+    let setup = strs(&[
+        "CREATE TABLE t (id TEXT PRIMARY KEY, x TEXT) WITHOUT ROWID",
+        "CREATE INDEX tx ON t(x)",
+        "INSERT INTO t VALUES ('k1', 'one')",
+    ]);
+    let txn = vec![
+        "BEGIN".to_string(),
+        "INSERT INTO t WITH RECURSIVE c(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM c \
+         WHERE i < 150) SELECT printf('k%04d', i), printf('%0120d', i) FROM c"
+            .to_string(),
+        "UPDATE t SET id = id || 'm' WHERE x LIKE '%5'".to_string(),
+        "DELETE FROM t WHERE x LIKE '%3'".to_string(),
+        "COMMIT".to_string(),
+    ];
+    crash_matrix("without-rowid", Config::default(), &setup, &txn);
+}

@@ -63,8 +63,8 @@ aspirations.
   (`RequiresEvaluator`) instead of ignoring them, and still
   shrank. Behind `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE
   ... AS SELECT (the pin's column names, declared types and
-  schema text, byte for byte) and STRICT tables. WITHOUT ROWID
-  stays refused. Review fixes (every profile): CREATE TABLE
+  schema text, byte for byte) and STRICT tables. (WITHOUT ROWID
+  came later, in its own leaf: see below.) Review fixes (every profile): CREATE TABLE
   items are walked with the pin's grammar, so malformed
   constraint lists (`CHECK(a>0) bar`, `DEFAULT abs(1)`,
   `PRIMARY KEY (a) foo`) are syntax errors instead of schemas
@@ -603,6 +603,35 @@ aspirations.
   a few pages instead of the table. Without the leaf such indexes in
   a file are refused for writes (never left stale) and scans read
   rowid order. Tiny unchanged, full −16 B, max +32.3 KB (STATUS.md).
+- **WITHOUT ROWID tables** (new leaf feature `without_rowid`, in
+  `max` — ADR 0002 — not `full`): `CREATE TABLE ... WITHOUT ROWID`
+  (also with STRICT) stored exactly as the pin stores it — a
+  clustered index B-tree keyed by the PRIMARY KEY (a repeated key
+  column dropped, key collations and DESC ordering the tree) with
+  the other stored columns after it, secondary indexes and UNIQUE
+  constraints holding the key columns instead of a rowid, cells of
+  at least 4 bytes, overflow by the index-cell rules — so files
+  interoperate both ways and the pin's integrity_check passes on
+  hipp's. The pin's rules and errors: PRIMARY KEY required, no
+  AUTOINCREMENT, `WITHOUT <other>` refused, `rowid` / `oid` /
+  `_rowid_` unknown everywhere (SELECT, WHERE, RETURNING, SET,
+  INSERT columns, indexes, CHECK, trigger NEW / OLD), NOT NULL key
+  columns, INTEGER PRIMARY KEY no rowid alias, `last_insert_rowid()`
+  untouched. Every path works on them: INSERT, OR IGNORE / REPLACE,
+  upsert (also updating the key), RETURNING, UPDATE moving a row
+  whose key changes (two-pass, in key order, as the pin), DELETE,
+  triggers, foreign keys with such parents and children,
+  savepoints, crash recovery, joins, views, subqueries, PRAGMA
+  table_info / table_list / index_list / index_info / index_xinfo
+  (the key as `sqlite_autoindex_t_N`, origin `pk`), integrity_check,
+  ALTER TABLE RENAME / ADD COLUMN / RENAME COLUMN / DROP COLUMN,
+  DROP TABLE, VACUUM, REINDEX and ANALYZE. Scans follow the pin's
+  planner for these tables (its cheapest covering index, newest on a
+  tie, its UPDATE / DELETE costing). Without the leaf a file holding
+  such a table is refused at open, as before. Fixed on the way: an
+  `IS NULL` lookup through a UNIQUE index no longer counts as one
+  row (GROUP BY groups came unsorted). Tiny unchanged; sizes in
+  STATUS.md.
 
 ## What v0.13 does
 
@@ -912,7 +941,8 @@ differential testing. It is a separate crate and contributes
 ## Non-goals (SPEC §3)
 
 No WAL (files in WAL mode are rejected with `WalUnsupported`),
-no WITHOUT ROWID tables (refused), no AUTOINCREMENT tables
+no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
+them), no AUTOINCREMENT tables
 created (refused below `v16`, foreign ones load read-only there;
 `v16` maintains `sqlite_sequence`), no expression or partial
 indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
@@ -943,7 +973,8 @@ rules and the generated-column row codec, v0.16), `session`
 `session/maint` savepoints, VACUUM, REINDEX and ANALYZE,
 `session/trigger` trigger programs, `session/json_tvf` the
 `json_each` / `json_tree` sources, v0.16; `sql/trig` the NEW. /
-OLD. binder),
+OLD. binder), `wr` (WITHOUT ROWID trees behind the rowid-shaped
+B-tree interface, feature `without_rowid`, v0.16),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

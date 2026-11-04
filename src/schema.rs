@@ -114,9 +114,25 @@ pub struct TableDef {
     /// (`SchemaKind::TableHasTriggers`).
     #[cfg(not(feature = "triggers"))]
     pub triggered: bool,
+    /// A WITHOUT ROWID table (v0.16, `without_rowid`): `root` is
+    /// its clustered index B-tree, its PRIMARY KEY is the automatic
+    /// index whose root is `root` (`IndexDef::clustered`), it has
+    /// no rowid and no rowid alias.
+    #[cfg(feature = "without_rowid")]
+    pub without_rowid: bool,
 }
 
 impl TableDef {
+    /// Whether the table has a rowid (every table but a WITHOUT
+    /// ROWID one, v0.16): `rowid`, `oid` and `_rowid_` name it.
+    pub fn has_rowid(&self) -> bool {
+        #[cfg(feature = "without_rowid")]
+        if self.without_rowid {
+            return false;
+        }
+        true
+    }
+
     /// The table, unless it names a collating sequence hipp
     /// does not have (v0.16): statements that read or write
     /// such a table are refused with
@@ -183,6 +199,11 @@ pub struct IndexDef {
     /// as it treats an opaque one (see `IndexDef::plain`).
     #[cfg(feature = "expr_index")]
     pub ext: Option<alloc::boxed::Box<IndexExt>>,
+    /// The PRIMARY KEY of a WITHOUT ROWID table (v0.16,
+    /// `without_rowid`): no schema row, `root` is the table's
+    /// clustered tree, and its key columns are the table's key.
+    #[cfg(feature = "without_rowid")]
+    pub clustered: bool,
 }
 
 /// What an expression or partial index adds to its key columns
@@ -471,6 +492,71 @@ fn col_coll(t: &TableDef, col: Option<usize>) -> Coll {
         .unwrap_or_default()
 }
 
+/// List each WITHOUT ROWID table's PRIMARY KEY among its indexes
+/// (v0.16, `without_rowid`): an automatic index on the table's own
+/// root, numbered by its constraint's place among the table's
+/// UNIQUE / PRIMARY KEY sets, placed where its schema row would be
+/// (after the automatic indexes of earlier sets, before later ones
+/// and before every explicit index).
+#[cfg(feature = "without_rowid")]
+fn place_clustered_keys(
+    catalog: &mut Catalog,
+    arena: &Arena,
+) -> core::result::Result<(), crate::error::ArenaError> {
+    let mut adds: AVec<(usize, IndexDef)> = AVec::new();
+    for t in catalog.tables.iter().filter(|t| t.without_rowid) {
+        let Some(k) = t.auto_sets.iter().position(|s| s.primary_key) else {
+            continue;
+        };
+        let tname = handle_bytes(arena, t.name);
+        let mut name = AVec::new();
+        name.extend_from_slice(b"sqlite_autoindex_");
+        name.extend_from_slice(tname);
+        name.push(b'_');
+        crate::record::render_int(k as i64 + 1, &mut name);
+        let mut at = None;
+        let mut autos = 0usize;
+        let mut last = None;
+        for (i, ix) in catalog.indexes.iter().enumerate() {
+            if !eq_ci(handle_bytes(arena, ix.table), tname) {
+                continue;
+            }
+            last = Some(i);
+            if ix.origin == IndexOrigin::Explicit || autos == k {
+                at = Some(i);
+                break;
+            }
+            autos += 1;
+        }
+        let at = at.unwrap_or_else(|| last.map_or(catalog.indexes.len(), |l| l + 1));
+        let Some(columns) = t.auto_sets.as_slice().get(k).map(|s| s.columns.clone()) else {
+            continue;
+        };
+        adds.push((
+            at,
+            IndexDef {
+                name: intern(arena, name.as_slice())?,
+                table: t.name,
+                root: t.root,
+                sql: None,
+                unique: true,
+                origin: IndexOrigin::Auto,
+                columns,
+                opaque: false,
+                #[cfg(feature = "expr_index")]
+                ext: None,
+                clustered: true,
+            },
+        ));
+    }
+    // Later positions first, so earlier ones stay valid.
+    adds.as_mut_slice().sort_by_key(|a| a.0);
+    while let Some((at, ix)) = adds.pop() {
+        catalog.indexes.insert_at(at.min(catalog.indexes.len()), ix);
+    }
+    Ok(())
+}
+
 /// Build the catalog by scanning `sqlite_schema` (root page 1).
 pub async fn build_catalog<S: Storage>(
     pager: &mut Pager<S>,
@@ -552,6 +638,8 @@ pub async fn build_catalog<S: Storage>(
             autoinc: false,
             #[cfg(not(feature = "triggers"))]
             triggered: false,
+            #[cfg(feature = "without_rowid")]
+            without_rowid: false,
         });
     }
     // Scratch arena for parse trees (names are interned out of it
@@ -592,6 +680,8 @@ pub async fn build_catalog<S: Storage>(
                     autoinc: false,
                     #[cfg(not(feature = "triggers"))]
                     triggered: false,
+                    #[cfg(feature = "without_rowid")]
+                    without_rowid: false,
                 });
                 continue;
             }
@@ -605,11 +695,15 @@ pub async fn build_catalog<S: Storage>(
             checks,
             #[cfg(feature = "v16")]
             strict,
+            #[cfg(feature = "without_rowid")]
+            without_rowid,
             ..
         } = ast
         else {
             return Err(Error::CorruptRecord);
         };
+        #[cfg(not(feature = "without_rowid"))]
+        let without_rowid = false;
         let mut cols: AVec<Column> = AVec::new();
         let mut alias = None;
         for (i, c) in columns.iter().enumerate() {
@@ -617,6 +711,7 @@ pub async fn build_catalog<S: Storage>(
             // Rowid alias rule: exactly one PK column (below), of
             // declared type exactly INTEGER, not written DESC.
             if pk_columns.len() == 1
+                && !without_rowid
                 && eq_ci(
                     handle_bytes(&scratch, c.name),
                     handle_bytes(&scratch, pk_columns.as_slice()[0]),
@@ -660,12 +755,19 @@ pub async fn build_catalog<S: Storage>(
                     Err(_) => default_expr = Some(intern(catalog_arena, text)?),
                 }
             }
+            // A WITHOUT ROWID table's key columns are NOT NULL
+            // (v0.16; the pin marks them so, and PRAGMA table_info
+            // shows it).
+            let in_pk = without_rowid
+                && pk_columns
+                    .iter()
+                    .any(|p| eq_ci(handle_bytes(&scratch, *p), handle_bytes(&scratch, c.name)));
             cols.push(Column {
                 name: intern(catalog_arena, handle_bytes(&scratch, c.name))?,
                 decl: intern(catalog_arena, decl_bytes)?,
                 affinity,
                 default,
-                not_null: c.not_null,
+                not_null: c.not_null || in_pk,
                 #[cfg(feature = "v04")]
                 default_expr,
                 #[cfg(feature = "v04")]
@@ -681,7 +783,8 @@ pub async fn build_catalog<S: Storage>(
         }
         let rowid_alias = alias;
         #[cfg(feature = "indexes")]
-        let auto_sets = resolve_auto_sets(
+        #[allow(unused_mut)]
+        let mut auto_sets = resolve_auto_sets(
             &scratch,
             catalog_arena,
             cols.as_slice(),
@@ -689,6 +792,23 @@ pub async fn build_catalog<S: Storage>(
             &rowid_alias,
             &pk_columns,
         );
+        // A WITHOUT ROWID key drops a column repeated with the same
+        // collation (v0.16; the pin's `isDupColumn`).
+        #[cfg(feature = "without_rowid")]
+        if without_rowid {
+            for set in auto_sets.as_mut_slice().iter_mut() {
+                if !set.primary_key {
+                    continue;
+                }
+                let mut kept: AVec<IndexColumn> = AVec::new();
+                for c in set.columns.iter() {
+                    if !kept.iter().any(|k| k.col == c.col && k.coll == c.coll) {
+                        kept.push(*c);
+                    }
+                }
+                set.columns = kept;
+            }
+        }
         #[cfg(not(feature = "indexes"))]
         let auto_sets: AVec<AutoSet> = AVec::new();
         #[cfg(not(feature = "indexes"))]
@@ -720,6 +840,8 @@ pub async fn build_catalog<S: Storage>(
                 eq_ci(r.ty.as_slice(), b"trigger")
                     && eq_ci(r.tbl_name.as_slice(), row.name.as_slice())
             }),
+            #[cfg(feature = "without_rowid")]
+            without_rowid,
         });
     }
 
@@ -758,6 +880,8 @@ pub async fn build_catalog<S: Storage>(
                 },
                 columns: AVec::new(),
                 opaque: true,
+                #[cfg(feature = "without_rowid")]
+                clustered: false,
             });
             continue;
         }
@@ -778,6 +902,8 @@ pub async fn build_catalog<S: Storage>(
                     opaque: false,
                     #[cfg(feature = "expr_index")]
                     ext: None,
+                    #[cfg(feature = "without_rowid")]
+                    clustered: false,
                 };
                 match parsed {
                     Ok(Ast::CreateIndex {
@@ -852,6 +978,13 @@ pub async fn build_catalog<S: Storage>(
                             )
                     })
                     .count();
+                // A WITHOUT ROWID table's PRIMARY KEY has no row of
+                // its own (v0.16): the rows are its other sets'.
+                #[cfg(feature = "without_rowid")]
+                let pos = match t.auto_sets.iter().position(|s| s.primary_key) {
+                    Some(k) if t.without_rowid && pos >= k => pos + 1,
+                    _ => pos,
+                };
                 let set = t.auto_sets.as_slice().get(pos).cloned();
                 let (unique, columns, opaque) = match &set {
                     Some(s) => (true, s.columns.clone(), false),
@@ -868,10 +1001,18 @@ pub async fn build_catalog<S: Storage>(
                     opaque,
                     #[cfg(feature = "expr_index")]
                     ext: None,
+                    #[cfg(feature = "without_rowid")]
+                    clustered: false,
                 });
             }
         }
     }
+    // The PRIMARY KEY of each WITHOUT ROWID table (v0.16): listed
+    // with the table's automatic indexes, in its constraint's
+    // place, named by its number among them (the pin keeps no
+    // schema row for it).
+    #[cfg(feature = "without_rowid")]
+    place_clustered_keys(&mut catalog, catalog_arena)?;
     // Pass 3: views (v0.4) — stored SQL, inert. Column names are
     // derived from the stored SELECT against the tables and the
     // views already derived (views may layer on views).

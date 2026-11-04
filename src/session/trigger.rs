@@ -779,7 +779,9 @@ impl<S: Storage> Connection<S> {
                 names.push(copy_vec(handle_bytes(ca, c.name)));
                 colls.push(Some(c.coll));
             }
-            return Ok((names, colls, t.rowid_alias, false));
+            // A WITHOUT ROWID table's NEW / OLD hold no rowid, as a
+            // view's do not (v0.16).
+            return Ok((names, colls, t.rowid_alias, !t.has_rowid()));
         }
         let Some(v) = self.catalog.find_view(ca, table) else {
             return Err(err(SchemaKind::UnknownTable));

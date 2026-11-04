@@ -706,7 +706,19 @@ impl<S: Storage> Statement<'_, S> {
             let r = &rs[i];
             let table = r.is(b"table");
             let (root, _) = dst.alloc_page().await.map_err(mem_err)?;
-            if table {
+            // A WITHOUT ROWID table's tree, and its indexes, are copied
+            // as raw records (v0.16).
+            #[cfg(feature = "without_rowid")]
+            let src_root = r.root.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+            #[cfg(feature = "without_rowid")]
+            let wr = self.conn.pager.wr.is_raw(src_root);
+            #[cfg(feature = "without_rowid")]
+            if wr {
+                dst.wr.raw_roots.push(root);
+            }
+            #[cfg(not(feature = "without_rowid"))]
+            let wr = false;
+            if table && !wr {
                 btree::create_empty_root(&mut dst, root)
                     .await
                     .map_err(mem_err)?;
@@ -748,6 +760,16 @@ impl<S: Storage> Statement<'_, S> {
         }
         for &(src, root, table, i) in copies.iter() {
             let r = &rs[i];
+            #[cfg(feature = "without_rowid")]
+            if let Some(orders) = self.conn.pager.wr.orders_of(src) {
+                let keys = btree::index_payloads(&mut self.conn.pager, src).await?;
+                for k in keys.iter() {
+                    btree::index_insert_core(&mut dst, root, k.as_slice(), orders.as_slice())
+                        .await
+                        .map_err(mem_err)?;
+                }
+                continue;
+            }
             if table {
                 let keep = keep_rowids
                     || rs
@@ -859,6 +881,11 @@ impl<S: Storage> Statement<'_, S> {
             return Ok(());
         };
         if ix.opaque {
+            return Ok(());
+        }
+        // A WITHOUT ROWID table's key is the table itself (v0.16).
+        #[cfg(feature = "without_rowid")]
+        if ix.clustered {
             return Ok(());
         }
         let ix = ix.clone();
@@ -1009,6 +1036,21 @@ impl<S: Storage> Statement<'_, S> {
             let stat = match ixn {
                 None => self.table_stat(tn.as_slice()).await?,
                 Some(n) => self.index_stat(n.as_slice()).await?,
+            };
+            // A WITHOUT ROWID table's key is listed under the table's
+            // name (v0.16), as on the pin.
+            #[cfg(feature = "without_rowid")]
+            let ixn = &match ixn {
+                Some(n)
+                    if self
+                        .conn
+                        .catalog
+                        .find_index(&self.conn.catalog_arena, n.as_slice())
+                        .is_some_and(|i| i.clustered) =>
+                {
+                    Some(tn.clone())
+                }
+                other => other.clone(),
             };
             if let Some(s) = stat {
                 out.push((tn.clone(), ixn.clone(), s));

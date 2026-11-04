@@ -498,6 +498,18 @@ pub struct IdxModel {
     pub pred: Option<RExpr>,
     /// `szIdxRow` (LogEst).
     pub width: i32,
+    /// The columns a WITHOUT ROWID table's secondary index holds
+    /// after its key, in entry order (v0.16: the table's key
+    /// columns it lacks), with their orders; empty otherwise.
+    pub suffix: AVec<(IdxKey, KeyOrder)>,
+    /// The entries hold every column (a WITHOUT ROWID table's
+    /// clustered index, v0.16).
+    pub covers_all: bool,
+    /// `suffix` counts toward covering (v0.16: not for a UNIQUE
+    /// constraint's index of a WITHOUT ROWID table, whose
+    /// not-indexed columns the pin computed before the key columns
+    /// were appended).
+    pub suffix_covers: bool,
 }
 
 impl IdxModel {
@@ -521,12 +533,19 @@ impl IdxModel {
 
     /// Whether every column the query reads is a key column.
     fn covers(&self, needed: &[bool]) -> bool {
-        needed.iter().enumerate().all(|(c, n)| {
-            !*n || self
-                .keys
-                .iter()
-                .any(|k| matches!(k, IdxKey::Col(x) if *x == c))
-        })
+        self.covers_all
+            || needed.iter().enumerate().all(|(c, n)| {
+                !*n || self
+                    .keys
+                    .iter()
+                    .chain(
+                        self.suffix
+                            .iter()
+                            .filter(|_| self.suffix_covers)
+                            .map(|(k, _)| k),
+                    )
+                    .any(|k| matches!(k, IdxKey::Col(x) if *x == c))
+            })
     }
 
     /// Whether an ORDER BY term might be delivered by this index (the
@@ -675,6 +694,10 @@ pub struct Table<'x> {
     /// `szTabRow`.
     pub width: i32,
     pub indexes: &'x [IdxModel],
+    /// A WITHOUT ROWID table (v0.16): no rowid loops; its clustered
+    /// index (`covers_all`) is the table, and every index's full
+    /// scan is a candidate (the pin's `!HasRowid` rule).
+    pub wr: bool,
 }
 
 /// How an executor reads one probe set.
@@ -750,6 +773,9 @@ fn is_in(ts: &[Term], t: usize) -> bool {
 enum Ord<'x> {
     Key(&'x IdxKey, KeyOrder),
     Rowid,
+    /// Past a WITHOUT ROWID index's full key (v0.16): the rows are
+    /// unique, every later term is tie-free.
+    End,
 }
 
 /// How many leading ORDER BY terms a loop delivers, and whether
@@ -775,7 +801,17 @@ fn order_sat(
             && l.eq.iter().all(|t| !is_in(ts, *t))
             && match ix {
                 None => !l.eq.is_empty(),
-                Some(m) => m.unique && l.eq.len() >= m.keys.len(),
+                // v0.16 fix: `IS` / `IS NULL` on a UNIQUE index may find
+                // many rows (NULLs repeat); the pin's WHERE_ONEROW needs
+                // `=` there.
+                Some(m) => {
+                    m.unique
+                        && l.eq.len() >= m.keys.len()
+                        && l.eq.iter().all(|t| {
+                            ts.get(*t)
+                                .is_some_and(|t| matches!(t.op, TOp::Eq) && !t.isnull)
+                        })
+                }
             }
     };
     let ix = l.ix.and_then(|i| tab.indexes.get(i));
@@ -803,7 +839,14 @@ fn order_sat(
                     constant,
                 ));
             }
-            cols.push((Ord::Rowid, false));
+            if tab.wr {
+                for (key, o) in m.suffix.iter() {
+                    cols.push((Ord::Key(key, *o), false));
+                }
+                cols.push((Ord::End, false));
+            } else {
+                cols.push((Ord::Rowid, false));
+            }
         }
     }
     // Constant keys: the loop's equality columns, and any WHERE
@@ -831,7 +874,12 @@ fn order_sat(
         let Some((c, _)) = cols.as_slice().get(next) else {
             break;
         };
+        if matches!(c, Ord::End) {
+            sat = n;
+            break;
+        }
         let (hit, kdesc) = match c {
+            Ord::End => (false, false),
             Ord::Rowid => (s.is_rowid(e0), false),
             Ord::Key(k, ko) => (
                 ko.coll == o.coll
@@ -900,21 +948,24 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
 pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<IdxAccess> {
     let mut loops: AVec<Loop> = AVec::new();
     let order_rowid = !q.order.is_empty();
-    // The full table scan.
-    loops.push(Loop {
-        ix: None,
-        eq: AVec::new(),
-        lo: None,
-        hi: None,
-        run: ROWS + 16,
-        out: adjust(q, s, ts, &[], ROWS, ROWS),
-        sorted: 0,
-        reverse: false,
-    });
+    // The full table scan, and the rowid "index": one row per key
+    // (a WITHOUT ROWID table has neither: its clustered index is
+    // among the indexes).
+    if !tab.wr {
+        loops.push(Loop {
+            ix: None,
+            eq: AVec::new(),
+            lo: None,
+            hi: None,
+            run: ROWS + 16,
+            out: adjust(q, s, ts, &[], ROWS, ROWS),
+            sorted: 0,
+            reverse: false,
+        });
+        let a_rowid = [ROWS, 0];
+        add_index(q, s, tab, ts, None, &a_rowid, tab.width, true, &mut loops);
+    }
     let _ = order_rowid;
-    // The rowid "index": one row per key.
-    let a_rowid = [ROWS, 0];
-    add_index(q, s, tab, ts, None, &a_rowid, tab.width, true, &mut loops);
     for (i, m) in tab.indexes.iter().enumerate() {
         if let Some(p) = &m.pred
             && !implies(q.conj, p)
@@ -939,7 +990,8 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         let rsize = a.as_slice()[0];
         // The full index scan.
         let orders = !q.order.is_empty() && m.might_order(s, q.order);
-        if orders || m.pred.is_some() || (q.cover_scan && covering && m.width < tab.width) {
+        if orders || m.pred.is_some() || tab.wr || (q.cover_scan && covering && m.width < tab.width)
+        {
             let mut run = rsize + 1 + (15 * m.width) / tab.width.max(1);
             if !covering {
                 run = log_est_add(run, rsize + 16);
@@ -955,6 +1007,12 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
                 reverse: false,
             });
         }
+        // A WITHOUT ROWID table's UPDATE / DELETE (v0.16): the pin
+        // costs a secondary index's lookups as not covering (probed:
+        // `UPDATE t SET d = 1 WHERE a > 5` takes the PRIMARY KEY over
+        // an index on `a` alone), its full scans as covering the
+        // WHERE's columns.
+        let covering_lookup = covering && (q.cover_scan || !tab.wr || m.covers_all);
         add_index(
             q,
             s,
@@ -963,9 +1021,12 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
             Some(i),
             a.as_slice(),
             m.width,
-            covering,
+            covering_lookup,
             &mut loops,
         );
+    }
+    if tab.wr {
+        loops = insert_loops(q, s, tab, ts, loops);
     }
     for l in loops.as_mut_slice() {
         let (sorted, reverse) = order_sat(q, s, tab, ts, l, false);
@@ -1025,12 +1086,105 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
             reverse = rev;
         }
     }
-    if l.ix.is_none() && l.eq.is_empty() && l.lo.is_none() && l.hi.is_none() && !reverse {
+    // The table's own order: the rowid B-tree, or a WITHOUT ROWID
+    // table's clustered index, read forward in full.
+    let natural = match l.ix.and_then(|i| tab.indexes.get(i)) {
+        None => true,
+        Some(m) => m.covers_all,
+    };
+    // (A WITHOUT ROWID table read in its key order that delivers the
+    // GROUP BY still says so: the groups are emitted as they come.)
+    let groups = q.group_by && l.sorted >= q.order.len();
+    if natural
+        && l.eq.is_empty()
+        && l.lo.is_none()
+        && l.hi.is_none()
+        && !reverse
+        && !(tab.wr && groups)
+    {
         return None;
     }
     let mut a = lower(s, tab, ts, &l, reverse);
-    a.groups = q.group_by && l.sorted >= q.order.len();
+    a.groups = groups;
     Some(a)
+}
+
+/// The pin's `whereLoopInsert` over a WITHOUT ROWID table's loops,
+/// in the order they were made (v0.16): loops of one "sort index"
+/// class (the index's position when it might deliver the ORDER BY,
+/// else 0 — the pin's `iSortIdx`) compete; a loop no cheaper (`rRun`)
+/// and no smaller (`nOut`) than an earlier one of its class, with no
+/// fewer prerequisites, is dropped, and one at least as good as an
+/// earlier one takes that loop's place in the list (dropping the
+/// later ones it also beats). The list order then breaks the path
+/// solver's ties. (Rowid tables keep the plain candidate order the
+/// expression-index unit validated.)
+fn insert_loops(
+    q: &Query<'_>,
+    s: &Src,
+    tab: &Table<'_>,
+    ts: &[Term],
+    loops: AVec<Loop>,
+) -> AVec<Loop> {
+    let class = |l: &Loop| -> usize {
+        match l.ix.and_then(|i| tab.indexes.get(i).map(|m| (i, m))) {
+            Some((i, m)) if !q.order.is_empty() && m.might_order(s, q.order) => i + 1,
+            _ => 0,
+        }
+    };
+    let lateral = |l: &Loop| {
+        l.eq.iter()
+            .chain(l.lo.iter())
+            .chain(l.hi.iter())
+            .any(|t| ts.get(*t).is_some_and(|t| t.lateral))
+    };
+    // `a`'s prerequisites are a subset of `b`'s.
+    let subset = |a: &Loop, b: &Loop| !lateral(a) || lateral(b);
+    let mut out: AVec<Loop> = AVec::new();
+    for t in loops.iter() {
+        let ct = class(t);
+        let mut discard = false;
+        let mut at: Option<usize> = None;
+        for (i, p) in out.iter().enumerate() {
+            if class(p) != ct {
+                continue;
+            }
+            if subset(p, t) && p.run <= t.run && p.out <= t.out {
+                discard = true;
+                break;
+            }
+            if subset(t, p) && p.run >= t.run && p.out >= t.out {
+                at = Some(i);
+                break;
+            }
+        }
+        if discard {
+            continue;
+        }
+        match at {
+            None => out.push(t.clone()),
+            Some(i) => {
+                // Later loops the template also beats go too.
+                let mut kept: AVec<Loop> = AVec::new();
+                for (j, p) in out.iter().enumerate() {
+                    if j == i {
+                        kept.push(t.clone());
+                    } else if j > i
+                        && class(p) == ct
+                        && subset(t, p)
+                        && p.run >= t.run
+                        && p.out >= t.out
+                    {
+                        continue;
+                    } else {
+                        kept.push(p.clone());
+                    }
+                }
+                out = kept;
+            }
+        }
+    }
+    out
 }
 
 /// The equality / range loops of one index (the rowid B-tree when
@@ -1240,7 +1394,7 @@ fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxA
     IdxAccess {
         root,
         desc,
-        range_rowid: root != 0 && eq.len() == nkeys,
+        range_rowid: !tab.wr && root != 0 && eq.len() == nkeys,
         eq,
         lo,
         hi,

@@ -1540,6 +1540,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         layout: &[(bool, OwnedValue)],
         col: usize,
     ) -> Result<(), S::Error> {
+        // A WITHOUT ROWID table (v0.16): its clustered records lose
+        // the column in place (never a key column).
+        #[cfg(feature = "without_rowid")]
+        if let Some(t) = self.conn.pager.wr.table_of(root) {
+            let stored = layout.iter().take(col).filter(|l| l.0).count();
+            return crate::wr::drop_field(&mut self.conn.pager, t, stored).await;
+        }
         let mut rowids = AVec::new();
         {
             let mut cursor = ScanCursor::new(root);

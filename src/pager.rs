@@ -293,6 +293,10 @@ pub struct Pager<S: Storage> {
     /// yet in this transaction; see `SubRec`).
     #[cfg(feature = "v16")]
     sub_off: u64,
+    /// The WITHOUT ROWID trees' layouts and the statement's row
+    /// handles (v0.16, `without_rowid`; see `crate::wr`).
+    #[cfg(feature = "without_rowid")]
+    pub wr: crate::wr::WrState,
 }
 
 impl<S: Storage> Pager<S> {
@@ -426,6 +430,8 @@ impl<S: Storage> Pager<S> {
                 sub: AVec::new(),
                 #[cfg(feature = "v16")]
                 sub_off: 0,
+                #[cfg(feature = "without_rowid")]
+                wr: crate::wr::WrState::default(),
             },
             is_new,
         ))

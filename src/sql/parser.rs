@@ -1580,6 +1580,8 @@ impl<'a> Parser<'a> {
                 constraint_sets: AVec::new(),
                 checks: AVec::new(),
                 strict: false,
+                #[cfg(feature = "without_rowid")]
+                without_rowid: false,
                 as_select: Some(Box::new(select)),
                 fkeys: AVec::new(),
             });
@@ -1671,27 +1673,53 @@ impl<'a> Parser<'a> {
             // SQLite: "table has more than one primary key".
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
-        #[cfg(feature = "indexes")]
-        let sets = self.dedupe_sets(sets, &columns, &pk_columns);
         // Table options (v0.16, `v16`): a comma-separated list of
         // STRICT and WITHOUT ROWID, as on the pin (`STRICT,STRICT`
         // parses; `STRICT STRICT` does not). WITHOUT ROWID stays
         // outside every hipp phase and is refused.
         #[cfg(feature = "v16")]
         let mut strict = false;
+        #[cfg(feature = "without_rowid")]
+        let mut without_rowid = false;
         #[cfg(feature = "v16")]
         if self.cur_is_kw(b"STRICT") || self.cur_is_kw(b"WITHOUT") {
             loop {
                 if self.cur_is_kw(b"WITHOUT") {
+                    // `WITHOUT <name>` (v0.16, `without_rowid`):
+                    // ROWID in any case; any other name is the
+                    // pin's "unknown table option".
+                    #[cfg(feature = "without_rowid")]
+                    {
+                        self.pos += 1;
+                        if !self.cur_is_kw(b"ROWID") {
+                            return Err(perr(self.cur().offset, ParseKind::UnknownTableOption));
+                        }
+                        self.pos += 1;
+                        without_rowid = true;
+                    }
+                    #[cfg(not(feature = "without_rowid"))]
                     return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
+                } else {
+                    self.expect_kw::<E>(b"STRICT")?;
+                    strict = true;
                 }
-                self.expect_kw::<E>(b"STRICT")?;
-                strict = true;
                 if !self.eat(Tok::Comma) {
                     break;
                 }
             }
         }
+        // A WITHOUT ROWID table needs a PRIMARY KEY (the pin's
+        // "PRIMARY KEY missing on table t").
+        #[cfg(feature = "without_rowid")]
+        if without_rowid && pk_sets == 0 {
+            return Err(perr(self.cur().offset, ParseKind::PrimaryKeyMissing));
+        }
+        #[cfg(not(feature = "without_rowid"))]
+        let without_rowid = false;
+        #[cfg(feature = "indexes")]
+        let sets = self.dedupe_sets(sets, &columns, &pk_columns, without_rowid);
+        #[cfg(not(feature = "indexes"))]
+        let _ = without_rowid;
         // Trailing clauses: WITHOUT ROWID is outside v0.1.
         #[cfg(not(feature = "v16"))]
         if self.cur_is_kw(b"WITHOUT") {
@@ -1707,6 +1735,8 @@ impl<'a> Parser<'a> {
             checks,
             #[cfg(feature = "v16")]
             strict,
+            #[cfg(feature = "without_rowid")]
+            without_rowid,
             #[cfg(feature = "v16")]
             as_select: None,
             #[cfg(feature = "v16")]
@@ -1728,10 +1758,12 @@ impl<'a> Parser<'a> {
         sets: AVec<ConstraintSet>,
         columns: &AVec<ColumnDef>,
         pk_columns: &AVec<ABytes>,
+        without_rowid: bool,
     ) -> AVec<ConstraintSet> {
         let name = |h: ABytes| handle_bytes(self.arena, h);
         let col = |h: ABytes| columns.iter().find(|c| eq_ci(name(c.name), name(h)));
-        let alias = pk_columns.len() == 1
+        let alias = !without_rowid
+            && pk_columns.len() == 1
             && pk_columns
                 .as_slice()
                 .first()

@@ -1235,6 +1235,11 @@ impl<S: Storage> Connection<S> {
         }
         self.catalog =
             build_catalog(&mut self.pager, &self.catalog_arena, self.cfg.limits()).await?;
+        #[cfg(feature = "without_rowid")]
+        {
+            let (t, i) = crate::wr::layouts(&self.catalog, &self.catalog_arena);
+            self.pager.wr.set_layout(t, i);
+        }
         Ok(())
     }
 
@@ -1255,6 +1260,14 @@ impl<S: Storage> Connection<S> {
         }
         if self.pager.schema_cookie() != self.catalog.cookie {
             self.rebuild_catalog().await?;
+        }
+        // A new statement's rows take new handles (v0.16).
+        #[cfg(feature = "without_rowid")]
+        {
+            self.pager.wr.clear_handles();
+            if let Some(t) = self.temp.as_mut() {
+                t.pager.wr.clear_handles();
+            }
         }
         let arena = Arena::new(Scope::Statement, self.cfg.stmt_init, self.cfg.stmt_max);
         // The original statement text, retained for CREATE TABLE:
@@ -1679,6 +1692,10 @@ impl<S: Storage> Connection<S> {
                 let strict = *strict;
                 #[cfg(not(feature = "v16"))]
                 let strict = false;
+                #[cfg(feature = "without_rowid")]
+                let wr_def = create_without_rowid(ast);
+                #[cfg(not(feature = "without_rowid"))]
+                let wr_def = false;
                 // v0.16: refuse what the pin refuses at definition
                 // time (DEFAULT / PK on a generated column, a
                 // non-constant DEFAULT, a generated-column loop,
@@ -1707,6 +1724,7 @@ impl<S: Storage> Connection<S> {
                     pk_columns.as_slice(),
                     kept.as_slice(),
                     strict,
+                    !wr_def,
                 )?;
                 #[cfg(feature = "v16")]
                 if self.prag.like_redefined
@@ -2310,6 +2328,7 @@ impl<S: Storage> Connection<S> {
                     pk_columns.as_slice(),
                     checks.as_slice(),
                     strict_def,
+                    t.has_rowid(),
                 )?;
                 // The pin re-checks the whole rewritten definition.
                 #[cfg(feature = "v16")]
@@ -2710,6 +2729,7 @@ impl<S: Storage> Connection<S> {
             t.rowid_alias,
             checks.as_slice(),
             strict,
+            t.has_rowid(),
         )?;
         #[cfg(feature = "v16")]
         if let Some(g) = rules.gcols.as_mut() {
@@ -2785,7 +2805,8 @@ impl<S: Storage> Connection<S> {
             ));
         }
         let mut sources = AVec::new();
-        let mut src = crate::query::SourceDesc::new(copy_vec(qualifier), cols, t.rowid_alias, true);
+        let mut src =
+            crate::query::SourceDesc::new(copy_vec(qualifier), cols, t.rowid_alias, t.has_rowid());
         src.colls = table_colls(t);
         sources.push(src);
         let mut offsets = AVec::new();
@@ -3437,7 +3458,8 @@ impl<S: Storage> Connection<S> {
                     ));
                 }
                 let mut ex_sources = AVec::new();
-                let mut ex = SourceDesc::new(copy_vec(b"excluded"), ex_cols, t.rowid_alias, true);
+                let mut ex =
+                    SourceDesc::new(copy_vec(b"excluded"), ex_cols, t.rowid_alias, t.has_rowid());
                 ex.registers = true;
                 ex_sources.push(ex);
                 let mut ex_offsets = AVec::new();
@@ -4614,7 +4636,7 @@ impl<S: Storage> Connection<S> {
                 Some(a) => copy_vec(handle_bytes(arena, a)),
                 None => copy_vec(tname),
             };
-            let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, true);
+            let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, t.has_rowid());
             desc.kind = s.kind;
             desc.colls = table_colls(t);
             desc.schema_table = t.root == 1 && s.alias.is_none();
@@ -4807,12 +4829,28 @@ impl<S: Storage> Connection<S> {
                 return Ok(Target::Col(i));
             }
         }
-        if eq_ci(name, b"rowid") || eq_ci(name, b"oid") || eq_ci(name, b"_rowid_") {
+        if t.has_rowid()
+            && (eq_ci(name, b"rowid") || eq_ci(name, b"oid") || eq_ci(name, b"_rowid_"))
+        {
             return Ok(Target::Rowid);
         }
         Err(Error::Schema {
             kind: SchemaKind::UnknownColumn,
         })
+    }
+
+    /// One row inserted into the table rooted at `root` (v0.16):
+    /// it counts as a change, and sets `last_insert_rowid()` unless
+    /// the table is WITHOUT ROWID (the pin leaves it alone then).
+    #[cfg(feature = "v16")]
+    fn note_insert(&self, root: u32, rowid: i64) {
+        #[cfg(feature = "without_rowid")]
+        if self.pager.wr.table_of(root).is_some() {
+            self.env.note_change();
+            return;
+        }
+        let _ = root;
+        self.env.note_insert(rowid);
     }
 
     /// Drive a transaction left mid-commit by a dropped future to
@@ -5400,6 +5438,18 @@ fn table_autoinc<E>(t: &crate::schema::TableDef, cat: &Arena, arena: &Arena) -> 
     return t.autoinc;
     #[cfg(not(feature = "v16"))]
     crate::sql::parser::schema_text_start::<E>(handle_bytes(cat, t.sql), arena).is_err()
+}
+
+/// Whether a CREATE TABLE is WITHOUT ROWID (v0.16).
+#[cfg(feature = "without_rowid")]
+fn create_without_rowid(ast: &Ast) -> bool {
+    matches!(
+        ast,
+        Ast::CreateTable {
+            without_rowid: true,
+            ..
+        }
+    )
 }
 
 /// Whether a parsed CREATE TABLE has a rowid alias (v0.16, `v16`):
@@ -6415,6 +6465,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v16")]
         let autoinc =
             crate::sql::parser::has_autoincrement::<S::Error>(sql_text.as_slice(), &self.arena);
+        // ... and never on a WITHOUT ROWID table (the pin's
+        // "AUTOINCREMENT not allowed on WITHOUT ROWID tables").
+        #[cfg(feature = "without_rowid")]
+        if autoinc && create_without_rowid(&self.ast) {
+            return Err(Error::Schema {
+                kind: SchemaKind::AutoincrementWithoutRowid,
+            });
+        }
         #[cfg(feature = "v16")]
         if autoinc && !create_has_rowid_alias(&self.ast, &self.arena) {
             return Err(Error::Schema {
@@ -6577,6 +6635,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v16")] autoinc: bool,
     ) -> Result<(), S::Error> {
         let (root, _) = self.conn.pager.alloc_page().await?;
+        // A WITHOUT ROWID table's B-tree is an index B-tree (v0.16).
+        #[cfg(feature = "without_rowid")]
+        if create_without_rowid(&self.ast) {
+            btree::create_empty_index_root(&mut self.conn.pager, root).await?;
+        } else {
+            btree::create_empty_root(&mut self.conn.pager, root).await?;
+        }
+        #[cfg(not(feature = "without_rowid"))]
         btree::create_empty_root(&mut self.conn.pager, root).await?;
         self.insert_schema_row(b"table", name, name, root, Some(sql_text))
             .await?;
@@ -6642,6 +6708,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                     }
                 }
             }
+            #[cfg(feature = "without_rowid")]
+            let wr = create_without_rowid(&self.ast);
+            #[cfg(feature = "without_rowid")]
+            if wr {
+                alias = false;
+            }
             let mut out: AVec<AVec<u8>> = AVec::new();
             let mut n = 0usize;
             for set in constraint_sets.iter() {
@@ -6649,6 +6721,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
                 n += 1;
+                // A WITHOUT ROWID table's PRIMARY KEY is the table's
+                // own tree: numbered, but with no tree or row (v0.16).
+                #[cfg(feature = "without_rowid")]
+                if set.primary_key && wr {
+                    continue;
+                }
                 let mut auto_name = AVec::new();
                 for b in b"sqlite_autoindex_" {
                     auto_name.push(*b);
@@ -6771,6 +6849,19 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut desc = AVec::new();
         for c in cols.iter() {
             desc.push(c.order());
+        }
+        // An index on a WITHOUT ROWID table holds the table's key
+        // columns (v0.16): lay it out before it is populated.
+        #[cfg(feature = "without_rowid")]
+        {
+            let mut lay = AVec::new();
+            for c in cols.iter() {
+                lay.push((c.col, c.order()));
+            }
+            self.conn
+                .pager
+                .wr
+                .add_index(table_root, root, lay.as_slice());
         }
         let mut cursor = ScanCursor::new(table_root);
         let mut buf = AVec::new();
@@ -7759,8 +7850,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             let payload = encode_index_payload(key.as_slice(), rowid);
             btree::index_insert(pager, *ix_root, payload.as_slice(), desc.as_slice()).await?;
         }
-        #[cfg(feature = "v16")]
-        self.conn.env.note_insert(rowid);
+        #[cfg(all(feature = "v16", feature = "foreign_keys"))]
+        self.conn.note_insert(root, rowid);
+        #[cfg(all(feature = "v16", not(feature = "foreign_keys")))]
+        self.conn.note_insert(*root, rowid);
         #[cfg(feature = "v07")]
         self.push_insert_returning(row.as_slice(), rowid).await?;
         #[cfg(feature = "triggers")]
@@ -7869,7 +7962,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             .await?;
         }
         #[cfg(feature = "v16")]
-        self.conn.env.note_insert(rowid);
+        self.conn.note_insert(root, rowid);
         Ok(())
     }
 
@@ -8651,6 +8744,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let mut ids = self.access_rowids(root, &acc, &RowData::empty()).await?;
                 if !acc.one_pass {
                     ids.as_mut_slice().sort_unstable();
+                    // A WITHOUT ROWID table's two-pass write visits
+                    // its rows in key order (v0.16).
+                    #[cfg(feature = "without_rowid")]
+                    self.conn.pager.wr.sort_handles(root, &mut ids);
                     let mut d: AVec<i64> = AVec::new();
                     for r in ids.iter() {
                         if d.as_slice().last() != Some(r) {
@@ -9572,6 +9669,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let mut pages = btree::collect_table_pages(&mut self.conn.pager, root).await?;
         for ir in index_roots.iter() {
+            // A WITHOUT ROWID table's key is the table's tree (v0.16).
+            if *ir == root {
+                continue;
+            }
             let ipages = btree::collect_index_pages(&mut self.conn.pager, *ir).await?;
             for p in ipages.iter() {
                 pages.push(*p);

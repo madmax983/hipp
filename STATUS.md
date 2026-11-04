@@ -5274,6 +5274,183 @@ model and the access-path executor (~25 KB).
   partial index WHERE written by the pin is a definition hipp cannot
   compute: writes to its table are refused.
 
+### WITHOUT ROWID tables (2026-11-04)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `without_rowid`
+(`without_rowid = ["v16", "indexes"]`, in `max`, not `full`;
+`v16,without_rowid` in `ci/feature-sets.txt`). It measured +22.2 KB
+of `max`; `full` has ~35 KB of headroom, but ADR 0002 sends a
+storage subsystem of that weight to `max`, so it is a leaf. Probe
+lists (~140 statements, `census/` style, one-shot vs the pin) all
+match or fail on both sides.
+
+**Design.** A WITHOUT ROWID table is the pin's: an index B-tree
+(the *clustered* tree) whose records hold the PRIMARY KEY fields
+first, then every other stored column in table order. The rest of
+hipp is rowid-shaped, so `src/wr.rs` translates at the B-tree
+boundary: the pager carries the WITHOUT ROWID layouts (rebuilt
+with the catalog) and a per-statement table of *handles* — `i64`s
+standing in for rowids, each bound to a row's canonical key record
+(an open-addressing hash makes the same key always the same
+handle). `ScanCursor`, `seek_rowid`, `btree_insert` (= "the
+handle's row becomes this record", deleting its old entry and any
+entry at the new key), `btree_delete`, `new_rowid` (a fresh
+handle), `collect_table_pages` and the index entry points
+(`index_insert` / `index_delete` / `index_prefix_rowids` /
+`IndexCursor::seek` / `next_entry` / `index_check_entry`) dispatch
+on the root. The table's PRIMARY KEY is listed as an automatic
+index whose root is the table's (`IndexDef::clustered`), so UNIQUE
+checks, REPLACE victims, upsert targets and foreign-key parent
+lookups find rows in the clustered tree, while its "maintenance" is
+the row write itself; a secondary index's `key, rowid` entries
+become `key, key columns` on the way in and back on the way out.
+Without the feature the dispatch compiles out (`index_insert` /
+`index_delete` are the untranslated functions re-exported), which
+is why `full` shrank.
+
+**Shipped — leaf feature `without_rowid`:**
+
+- **Definitions** as the pin: `WITHOUT ROWID` in any case, with or
+  around STRICT; `WITHOUT <other>` is `ParseKind::UnknownTableOption`,
+  no PRIMARY KEY `ParseKind::PrimaryKeyMissing`, AUTOINCREMENT
+  `SchemaKind::AutoincrementWithoutRowid`; key columns NOT NULL (the
+  NOT NULL error, ignoring a PRIMARY KEY's `ON CONFLICT`); INTEGER
+  PRIMARY KEY is no alias (`'abc'` is stored); a key column repeated
+  with the same collation is dropped (`PRIMARY KEY(a, a)`, kept under
+  another: `(a, a COLLATE NOCASE)`); `UNIQUE(a)` repeating the key
+  merges into it; the key takes its autoindex number among the
+  UNIQUE sets but has no schema row and no tree of its own.
+- **`rowid` / `oid` / `_rowid_`** are unknown names in SELECT,
+  WHERE, RETURNING, UPDATE SET, INSERT column lists, CREATE INDEX
+  (keys and partial WHERE), CHECK, generated columns and trigger
+  NEW / OLD; a column so named reads as itself.
+  `last_insert_rowid()` ignores these inserts; `changes()` counts
+  them.
+- **Layout, byte for byte:** clustered records as above (VIRTUAL
+  columns not stored, rows short of later ADD COLUMNs read their
+  defaults); secondary indexes append the key columns they do not
+  hold with the same collation, with the key's collation and
+  direction — ascending for a UNIQUE constraint's own index (the
+  pin's `bAscKeyBug`, shown by index_xinfo); cells of at least 4
+  bytes (the pin pads a 3-byte cell — a one-column key of a small
+  integer); overflow by the index-cell local-payload rules.
+- **Writes:** INSERT, OR IGNORE / REPLACE / FAIL / ABORT, upsert
+  (DO NOTHING, DO UPDATE also of the key), RETURNING, UPDATE moving
+  a row whose key changes, DELETE, the REPLACE victims, triggers,
+  foreign keys (WITHOUT ROWID parents found through their key,
+  children scanned, CASCADE / SET NULL), savepoints and crash
+  recovery through the existing journal. A handle names its key, as
+  the pin's two-pass writes name a row by its key: after
+  `UPDATE OR REPLACE m SET a = a + 1` moves row 1 onto key 2 (its
+  victim deleted), the loop's next key finds the moved row and moves
+  it again — `2|1, 3|1, 4|1` as on the pin.
+- **Order:** scans in key order (DESC / collated keys); the planner
+  (`xplan`, with `expr_index`) models these tables the pin's way —
+  no rowid loops, the clustered key an index (covering, its width all
+  stored columns), every index's full scan a candidate, a secondary
+  index covering its key and appended columns (a UNIQUE constraint's
+  own index only its key, the pin's `colNotIdxed` being computed
+  before the append), the pin's `whereLoopInsert` list (loops
+  compete per `iSortIdx` class; a later equal loop does not displace
+  an earlier one, a better one takes its place), GROUP BY delivered
+  by the key order; UPDATE / DELETE: the WHERE's columns only, an
+  index lookup costed as not covering, a key change two-pass, the
+  two-pass visit in key order.
+- **Schema statements:** PRAGMA table_info (key columns `notnull`
+  1), table_xinfo, table_list (`wr` 1), index_list (the key as
+  `sqlite_autoindex_t_N`, origin `pk`), index_info / index_xinfo
+  (the clustered key with the other stored columns BINARY, a
+  secondary index with its appended key columns, never cid -1),
+  integrity_check (hipp's own, and the pin's on hipp's files);
+  ALTER TABLE RENAME / RENAME COLUMN (texts), ADD COLUMN, DROP
+  COLUMN (records rewritten in place as the pin rewrites them,
+  `encode_record_plain`; key columns refused), DROP TABLE (the tree
+  freed once), VACUUM (trees copied raw), REINDEX (the key skipped),
+  ANALYZE (the key's row named by the table, as on the pin), CREATE
+  INDEX on a populated table, TEMP tables.
+
+**Oracle-probing notes** (all on the live pin, before and during the
+work): the record layouts above, dumped from pin-written pages
+(`CREATE TABLE t(a INT, b TEXT, c, PRIMARY KEY(c, a))` stores
+`[c, a, b]`, an index on `b` stores `[b, c, a]`); no schema row for
+the key, `sqlite_autoindex_t_2` for `a PRIMARY KEY, b UNIQUE`, `_1`
+for `a UNIQUE, b PRIMARY KEY`; index_list newest first with the key
+in its constraint's place; the error texts named above; `INSERT ...
+VALUES('abc')` into an INTEGER key; `UPDATE t SET a = a + 1` over
+keys 1, 2, 3 is a UNIQUE error, `a = a + 10 RETURNING *` gives 11,
+12, 13; two-pass writes (RETURNING, triggers, key changes) visit key
+order; one-pass UPDATE / DELETE walk the chosen index; the planner
+cases above (`SELECT *` through the newest equally wide covering
+index; `x UNIQUE` declared before a composite key never chosen to
+cover the key columns; `UPDATE t SET d = 1 WHERE a > 5` takes the
+PRIMARY KEY over an index on `a` alone, `UPDATE t SET d = 1` the
+narrowest index); DROP COLUMN rewrites the clustered records with
+serial type 1 for 0 / 1 and leaves unaffected indexes alone; 3-byte
+cells padded to 4 (the pin's "Multiple uses for byte" otherwise).
+
+**Bugs found during the unit** (fixed; regression lines in
+`tests/without_rowid_v16.rs` `regressions`): REINDEX rebuilt the
+clustered key as an index (emptying the table); DROP TABLE freed the
+tree twice; CREATE INDEX filled an index with rowid entries before
+the catalog knew it; DROP COLUMN rewrote by the old layout; ANALYZE
+named the key's statistics by its index; 3-byte cells (above);
+UPDATE OR REPLACE onto a victim's key processed rows by identity,
+not by key. **Ungated, on a claimed path** (`expr_index` planner,
+also rowid tables): an `IS` / `IS NULL` lookup through a UNIQUE index
+counted as a one-row loop, so its GROUP BY groups came out unsorted
+(`SELECT b, count(*) FROM t WHERE a IS NULL GROUP BY b`; the pin's
+WHERE_ONEROW needs `=`).
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` run end
+with "==> all gates passed". New suites: `tests/without_rowid_v16.rs`
+(15 tests: definitions and errors, rowid names, last_insert_rowid,
+writes and conflicts, key order and lookups, the pin's scan order,
+secondary indexes and pragmas, ALTER / DROP / VACUUM / REINDEX /
+ANALYZE, triggers / foreign keys / transactions, overflowing rows and
+keys, pin-made files written by hipp, hipp-made files read and
+VACUUMed by the pin, regressions, and two generated corpora — random
+schemas with composite / collated / DESC / repeated keys, UNIQUE
+constraints and indexes, random writes (OR IGNORE / REPLACE / FAIL,
+upsert, RETURNING, key updates, deletes) and queries compared in
+order with the pin's integrity_check on hipp's file, 120 cases by
+default; and files crossing between the engines mid-sequence both
+ways, 30 by default — `HIPP_WR_CORPUS` scales them: 1,450 / 1,000
+agreed before the last fix, 1,200 / 300 after it),
+`tests/crash.rs` `v16_crash_without_rowid` (a crash at every write
+boundary of a splitting / key-moving / deleting transaction recovers
+to the pre- or post-image), `hipp-cli/tests/cli_v16_without_rowid.rs`
+(3 tests, byte-identical one-shot and over stdin: schema texts and
+pragmas, writes and order, a generated corpus); `tests/table_defs_v16.rs`
+now expects `WITHOUT ROWID, STRICT` to work as on the pin.
+
+**Size:** tiny **76,924 B** (Δ **0**). Full **489,268 B** (Δ **−128 B**,
+ratchet lowered: the index entry points restructured so the
+untranslated functions are the public ones there). Max **699,476 B**
+(Δ **+22,224 B** vs 677,252, raised; under the 32 KiB threshold): the
+translation layer and handles (~12 KB), catalog / pragma / ALTER /
+VACUUM support (~5 KB) and the planner model (~5 KB).
+
+**Honest gaps:**
+
+- Without `without_rowid` (the tiny and `full` profiles) a file
+  holding a WITHOUT ROWID table still fails to open (its schema does
+  not parse there), as before this unit.
+- Handles cost memory per statement for every row a statement
+  touches (a scan of N rows binds N keys); a point lookup by key
+  goes index seek → handle → seek again.
+- The planner model has the expression-index unit's limits, plus:
+  equality on a secondary index's appended key columns is not a
+  usable term (the order matches, the cost estimate may not), and
+  the UPDATE / DELETE costing rule ("lookups not covering, full
+  scans covering the WHERE's columns") is fitted from probes, not
+  derived.
+- `PRAGMA table_list`'s row order (the pin's hash order) differs
+  from the pin's once there are more than ~8 tables — pre-existing,
+  for rowid tables too; the suites list tables by name.
+- Constraint-level `ON CONFLICT` clauses are still ignored for every
+  table (pre-existing).
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

@@ -39,6 +39,8 @@ pub mod sql;
 pub mod storage;
 #[cfg(feature = "window")]
 pub mod window;
+#[cfg(feature = "without_rowid")]
+pub mod wr;
 #[cfg(feature = "expr_index")]
 pub mod xplan;
 

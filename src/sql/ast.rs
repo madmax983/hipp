@@ -888,6 +888,10 @@ pub enum Ast {
         /// The `STRICT` table option (v0.16, feature `v16`).
         #[cfg(feature = "v16")]
         strict: bool,
+        /// The `WITHOUT ROWID` table option (v0.16, feature
+        /// `without_rowid`).
+        #[cfg(feature = "without_rowid")]
+        without_rowid: bool,
         /// `CREATE TABLE ... AS SELECT ...` (v0.16, feature
         /// `v16`): the columns are derived from the SELECT and
         /// `columns` is empty.

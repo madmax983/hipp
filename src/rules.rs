@@ -433,7 +433,9 @@ fn parse_rule<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<Expr, E> {
 /// Resolve a table's rules (v0.16): STRICT types, generated
 /// columns (validated and ordered), CHECK constraints — with the
 /// pin's definition-time errors, so CREATE TABLE refuses what the
-/// pin refuses.
+/// pin refuses. `has_rowid` is false for a WITHOUT ROWID table (a
+/// CHECK may not read its rowid).
+#[allow(clippy::too_many_arguments)]
 pub fn plan_rules<E>(
     arena: &Arena,
     lim: Limits,
@@ -442,6 +444,7 @@ pub fn plan_rules<E>(
     rowid_alias: Option<usize>,
     checks: &[&[u8]],
     strict: bool,
+    has_rowid: bool,
 ) -> Result<TableRules, E> {
     let mut rules = TableRules::default();
     if strict {
@@ -561,7 +564,9 @@ pub fn plan_rules<E>(
     }
     if !checks.is_empty() {
         let mut srcs = AVec::new();
-        let mut src = SourceDesc::new(copy(tname), descs, rowid_alias, true);
+        // A CHECK reads the rowid, except a WITHOUT ROWID table's
+        // (v0.16; the pin's "no such column: rowid").
+        let mut src = SourceDesc::new(copy(tname), descs, rowid_alias, has_rowid);
         src.colls = colls;
         srcs.push(src);
         let cur = ScopeGroup::new(srcs, offsets, 0);
@@ -586,6 +591,7 @@ pub fn plan_rules<E>(
 /// column, an expression DEFAULT is constant, and every CHECK /
 /// generation expression resolves (see `plan_rules`). ALTER TABLE
 /// ADD COLUMN validates the rewritten definition the same way.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_def<E>(
     arena: &Arena,
     lim: Limits,
@@ -594,6 +600,7 @@ pub fn validate_def<E>(
     pk_columns: &[crate::arena::ABytes],
     checks: &[crate::arena::ABytes],
     strict: bool,
+    has_rowid: bool,
 ) -> Result<TableRules, E> {
     use crate::sql::handle_bytes;
     let mut specs: AVec<ColSpec<'_>> = AVec::new();
@@ -612,6 +619,7 @@ pub fn validate_def<E>(
         let decl = handle_bytes(arena, c.decl);
         let name = handle_bytes(arena, c.name);
         if pk_columns.len() == 1
+            && has_rowid
             && eq_ci(name, handle_bytes(arena, pk_columns[0]))
             && !c.pk_desc
             && eq_ci(crate::record::decl_token(decl), b"INTEGER")
@@ -652,6 +660,7 @@ pub fn validate_def<E>(
         alias,
         texts.as_slice(),
         strict,
+        has_rowid,
     )
 }
 

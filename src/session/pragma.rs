@@ -649,24 +649,38 @@ impl<S: Storage> Connection<S> {
             Prag::TableList => {
                 let mut rows = AVec::new();
                 for o in self.hash_order().iter() {
-                    let (name, shown, ty, ncol, strict): (&[u8], &[u8], &[u8], usize, bool) =
-                        match o {
-                            Obj::Table(t) => {
-                                let n = handle_bytes(ca, t.name);
-                                (n, n, b"table", t.columns.len(), t.strict)
-                            }
-                            Obj::View(v) => {
-                                // The planned columns (v0.16 fix: the
-                                // catalog's list is empty for a view
-                                // hipp did not derive at load); none
-                                // for one that cannot be planned, as
-                                // on the pin.
-                                let n = handle_bytes(ca, v.name);
-                                let ncol = self.view_columns(n).map_or(0, |c| c.len());
-                                (n, n, b"view", ncol, false)
-                            }
-                            Obj::Schema => (b"sqlite_master", b"sqlite_schema", b"table", 5, false),
-                        };
+                    #[allow(clippy::type_complexity)]
+                    let (name, shown, ty, ncol, strict, wr): (
+                        &[u8],
+                        &[u8],
+                        &[u8],
+                        usize,
+                        bool,
+                        bool,
+                    ) = match o {
+                        Obj::Table(t) => {
+                            let n = handle_bytes(ca, t.name);
+                            (n, n, b"table", t.columns.len(), t.strict, !t.has_rowid())
+                        }
+                        Obj::View(v) => {
+                            // The planned columns (v0.16 fix: the
+                            // catalog's list is empty for a view
+                            // hipp did not derive at load); none
+                            // for one that cannot be planned, as
+                            // on the pin.
+                            let n = handle_bytes(ca, v.name);
+                            let ncol = self.view_columns(n).map_or(0, |c| c.len());
+                            (n, n, b"view", ncol, false, false)
+                        }
+                        Obj::Schema => (
+                            b"sqlite_master",
+                            b"sqlite_schema",
+                            b"table",
+                            5,
+                            false,
+                            false,
+                        ),
+                    };
                     if arg.is_some_and(|a| !eq_ci(a, name)) {
                         continue;
                     }
@@ -677,7 +691,7 @@ impl<S: Storage> Connection<S> {
                             text(shown),
                             text(ty),
                             int(ncol as i64),
-                            int(0),
+                            int(i64::from(wr)),
                             int(i64::from(strict)),
                         ],
                     );
@@ -792,7 +806,14 @@ impl<S: Storage> Connection<S> {
                 r.push(int(if x { i as i64 } else { cid }));
                 r.push(text(cname));
                 r.push(text(shown_type(handle_bytes(&sc, c.decl)).as_slice()));
-                r.push(int(i64::from(c.not_null)));
+                // The catalog's flag: a WITHOUT ROWID table's key
+                // columns are NOT NULL too (v0.16).
+                let nn = t
+                    .columns
+                    .as_slice()
+                    .get(i)
+                    .map_or(c.not_null, |tc| tc.not_null);
+                r.push(int(i64::from(nn)));
                 r.push(dflt);
                 r.push(int(pk));
                 if x {
@@ -1038,6 +1059,72 @@ impl<S: Storage> Connection<S> {
                 r.push(int(1));
             }
             rows.push(r);
+        }
+        // A WITHOUT ROWID table's index ends with columns, not the
+        // rowid (v0.16): the clustered key with every other stored
+        // column (BINARY), a secondary index with the key columns
+        // it does not hold.
+        #[cfg(feature = "without_rowid")]
+        if !t.has_rowid() {
+            if x {
+                let col_row = |rows: &mut Rows, seq: usize, k: usize, desc: bool, coll| {
+                    let cname = t
+                        .columns
+                        .as_slice()
+                        .get(k)
+                        .map_or(OwnedValue::Null, |c| text(handle_bytes(ca, c.name)));
+                    push_row(
+                        rows,
+                        &[
+                            int(seq as i64),
+                            int(k as i64),
+                            cname,
+                            int(i64::from(desc)),
+                            text(coll_name(coll)),
+                            int(0),
+                        ],
+                    );
+                };
+                let mut seq = n;
+                if ix.clustered {
+                    for (k, c) in t.columns.iter().enumerate() {
+                        let virt = c.gen_expr.is_some() && !c.stored;
+                        if virt || ix.columns.iter().any(|kc| kc.col == Some(k)) {
+                            continue;
+                        }
+                        col_row(&mut rows, seq, k, false, crate::record::Coll::Binary);
+                        seq += 1;
+                    }
+                } else if let Some(pk) = self
+                    .catalog
+                    .indexes_for(ca, handle_bytes(ca, t.name))
+                    .find(|i| i.clustered)
+                {
+                    for pc in pk.columns.iter() {
+                        let held = ix.columns.iter().enumerate().any(|(i, kc)| {
+                            #[cfg(feature = "expr_index")]
+                            if ix.ext.as_ref().is_some_and(|e| {
+                                e.exprs.as_slice().get(i).is_some_and(|x| x.is_some())
+                            }) {
+                                return false;
+                            }
+                            let _ = i;
+                            kc.col == pc.col && kc.coll == pc.coll
+                        });
+                        if held {
+                            continue;
+                        }
+                        // A UNIQUE constraint's index appends them
+                        // ascending (the pin's `bAscKeyBug`).
+                        let desc = pc.desc && ix.origin != crate::schema::IndexOrigin::Auto;
+                        if let Some(k) = pc.col {
+                            col_row(&mut rows, seq, k, desc, pc.coll);
+                            seq += 1;
+                        }
+                    }
+                }
+            }
+            return Ok(rows);
         }
         if x {
             push_row(
@@ -1681,6 +1768,12 @@ impl<S: Storage> Statement<'_, S> {
                 }
                 let mut ixs = AVec::new();
                 for ix in self.conn.table_indexes(name).iter() {
+                    // A WITHOUT ROWID table's key is the table's own
+                    // tree (v0.16), checked as the table.
+                    #[cfg(feature = "without_rowid")]
+                    if ix.clustered {
+                        continue;
+                    }
                     // The full check computes each row's key in
                     // every index; hipp cannot for an expression or
                     // partial index, so it refuses before reporting
@@ -1829,6 +1922,20 @@ impl<S: Storage> Statement<'_, S> {
                 n.push(copy_vec(handle_bytes(ca, ix.name)));
             }
             n
+        };
+        // A WITHOUT ROWID table's key is its own tree (v0.16): no
+        // entry to look for.
+        #[cfg(feature = "without_rowid")]
+        let (indexes, inames) = {
+            let mut a = AVec::new();
+            let mut b = AVec::new();
+            for (ix, n) in indexes.iter().zip(inames.iter()) {
+                if ix.root != root {
+                    a.push(ix.clone());
+                    b.push(n.clone());
+                }
+            }
+            (a, b)
         };
         #[cfg(not(feature = "indexes"))]
         let _ = quick;
