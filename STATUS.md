@@ -5812,6 +5812,189 @@ and PRAGMA / pager / VACUUM support.
   engines (the pin's own such file is not). `.dump` differs from the
   pin's for every encoding (pre-existing).
 
+### WAL journal mode (2026-11-04)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated behind the new leaf feature `wal` (`wal = ["v16"]`, in
+`max`, not `full`; `v16,wal` in `ci/feature-sets.txt`). Without it a
+file whose header says WAL is refused at open with
+`Error::WalUnsupported`, as before (`pager::tests::wal_header` and
+`wal_database_refused_at_open` run in the `full` lib tests;
+`tests/differential.rs` a7 is gated).
+
+**Design.** The storage trait gains two sidecar kinds
+(`Sidecar::Wal`, `Sidecar::Shm`, gated) through the same
+`Storage::sidecar` call, so the `-wal` is reachable in no_std on any
+caller storage (`MemStorage` keeps one buffer per kind; `FileStorage`
+names them `<db>-wal` / `<db>-shm`), plus `Storage::locked_elsewhere`
+(default `false`; `FileStorage` on Linux reads `/proc/locks` for a
+POSIX lock another process holds on the database or its `-shm` — a
+live pin connection). `src/wal.rs` is the log: the pin's format
+(header, salts, cumulative checksums in either byte order, commit
+frames), recovery as the pin's (`Wal::recover`), the heap wal-index
+(page → newest frame, sorted `AVec`), appends that overwrite a page
+the transaction already logged and reseal the checksums before the
+commit frame (the pin's `iReCksum`), restarts and
+`journal_size_limit` truncation. The pager reads pages through the
+log, spills dirty pages into it as uncommitted frames, commits by
+appending the resident dirty pages in page order with the commit
+frame last (two new resumable stages, `WalFrames` / `WalSync`),
+rolls back by forgetting the transaction's frames, checkpoints
+(`Pager::checkpoint`), switches modes (`enter_wal` / `leave_wal`:
+file-format bytes through a rollback-journal transaction, in the
+pin's order) and retires the log at close (`close_wal`). The
+database file changes only in a checkpoint. Savepoints keep their
+page images in the journal file's savepoint area as in rollback mode
+(from a zero first sector, deleted when the transaction ends).
+`Connection::close` (ungated; a rollback without the leaf) is new;
+hipp-cli closes at exit and on `.open`, as the pin's shell.
+
+**Shipped — leaf feature `wal`:**
+
+- Reading: a header with bytes 18 / 19 = 2, or a non-empty `-wal`
+  beside any header (the pin reads it then too), opens in WAL mode
+  with the committed frames replayed — page 1's header and the page
+  count from the last commit frame; a log with a bad magic, version,
+  page size or header checksum is empty; frames stop at the first
+  bad salt / checksum / page 0; frames after the last commit are
+  ignored. A log beside an empty database file is deleted, as on the
+  pin. Big-endian logs read and extend in their order.
+- `PRAGMA journal_mode = WAL | DELETE` both ways, reporting the mode
+  in force; the pin's prefix match of the name; no change (silently)
+  once the open transaction has written, "cannot change into / out
+  of wal mode from within a transaction" (`SchemaKind::
+  WalModeInTransaction`) in one that has not; the TEMP database
+  stays out of WAL mode.
+- Writing: the pin's frame layout and order, page 1 only when the
+  transaction changed it (the change counter moves only then, as
+  there), LE checksums, random salts for a new log; a restart after
+  a full checkpoint (sequence + 1, first salt + 1).
+- `PRAGMA wal_checkpoint [(PASSIVE | FULL | RESTART | TRUNCATE |
+  NOOP)]` (others PASSIVE): `0|log|checkpointed`, `0|-1|-1` outside
+  WAL mode; refused inside a transaction that read or wrote
+  (`SchemaKind::CheckpointLocked`, either mode); the pin's first
+  checkpoint after entering WAL mode opens its log with a read.
+  `PRAGMA wal_autocheckpoint` (connection-wide; ≤ 0 → 0), the
+  automatic PASSIVE checkpoint after a commit at that many frames;
+  `PRAGMA journal_size_limit` (and `pragma_journal_size_limit`);
+  `PRAGMA synchronous` at every level (OFF: no syncs; NORMAL: the
+  log synced only by checkpoints; FULL / EXTRA: at every commit).
+- Close: checkpoint, `-wal` and a stale `-shm` deleted, the file
+  still marked WAL (the pin's persistent WAL mode).
+- VACUUM in WAL mode writes the image as one transaction of frames
+  and keeps the page size; VACUUM INTO writes a rollback-mode file
+  with the pending page size, as on the pin.
+- A database a live SQLite connection holds is refused at open (and
+  at the switch to WAL) with `Error::DatabaseBusy`.
+
+**Fixed on the way (ungated, the `v16` PRAGMA code):** `PRAGMA
+journal_mode = w` (any prefix of a mode name) was a silent query —
+now the pin's mode (refused without the leaf for WAL);
+`PRAGMA synchronous = ...` inside a transaction is the pin's prepare
+error (`SchemaKind::SafetyLevelInTransaction`).
+
+**Oracle-probing notes** (live pin, before implementing): the
+switch writes bytes 18 / 19 = 2 in a rollback transaction (change
+counter + 1; on a new file page 1 is written with fields 44 / 56 still
+0); the `-wal` appears at the first read or write after it, not at
+the pragma; frames come page-sorted, page 1 only when changed; magic
+`0x377f0682` on the x86-64 pin; a new log has sequence 0 and random
+salts; after every frame is checkpointed the next write rewrites the
+header (sequence + 1, salt 1 + 1, new salt 2) without truncating the
+file, unless `journal_size_limit` trims it at the first commit
+(to max(limit, frames' end)); TRUNCATE empties it and the next header
+takes sequence + 1; `PRAGMA wal_checkpoint` is `0|-1|-1` in rollback
+mode and "database table is locked" in a transaction that touched
+the file (BEGIN alone is fine, `PRAGMA user_version` counts); NOOP
+copies nothing; `wal_autocheckpoint = -3` / `'abc'` / `99999999999`
+report 0, `2.7` 2; `journal_size_limit = -5` is -1, `'x'` 0;
+`synchronous = 7` is 0, `4` reports 4, `bogus` / `-1` 1; inside a
+transaction a safety-level change fails at prepare; the shell closes
+(checkpoint, `-wal` and `-shm` removed) even after an error;
+`locking_mode = EXCLUSIVE` leaves only the `-wal` on a kill; a
+header saying rollback with a non-empty valid `-wal` is read through
+it and the mode reported `wal`, a 0-byte one leaves rollback mode
+alone; an empty database file deletes its `-wal`; VACUUM in WAL mode
+ignores a pending page size, VACUUM INTO uses it and writes 1 / 1; a
+live pin holds a POSIX read lock on its database's SHARED range and
+on the `-shm` DMS byte (exclusive mode: a write lock on the
+database), which `/proc/locks` shows.
+
+**Gates:** `cargo fmt --all` and the full `ci/local-gates.sh` end
+with "==> all gates passed". New suites: `tests/wal_v16.rs` (15
+tests: PRAGMA values and switches, safety levels and limits,
+checkpoints of every mode with `-wal` sizes compared between
+statements, VACUUM / VACUUM INTO, the pin's killed logs read and
+extended (stale `-shm`), 50 rewritten logs — both byte orders,
+truncated at every frame, every salt and checksum broken, a bad
+header, a torn last frame, trailing junk — read exactly as the pin
+reads them, header / empty-log cases, hipp's logs parsed by an
+independent parser and read, recovered, checkpointed and extended by
+the pin, a live pin connection refused, the errors, savepoints, and
+two generated corpora of WAL workloads — writes, savepoints,
+statement failures, checkpoints, mode switches, VACUUM — on both
+engines, outputs and files compared and each engine reading the
+other's log, 30 + 15 by default, `HIPP_WAL_CORPUS` scales them: 400
+agreed); `tests/crash.rs` gains four WAL crash matrices (every
+write of frame appends with spills and in-place rewrites, savepoints
+and a failing statement, every checkpoint mode, restarts,
+`journal_size_limit`, the automatic checkpoint, mode switches both
+ways, VACUUM, the checkpoint at close — each recovers the state
+after the completed statements or after the one in flight, passes
+hipp's and the pin's integrity checks and reads the same on the pin)
+and the cross-tool case (a hipp process killed at every write of a
+WAL workload and its close, recovered by the pin, read alike by
+hipp; `crash_writer` modes `wal_setup` / `wal_txn`); unit tests in
+`src/wal.rs` and `src/pager.rs`; `hipp-cli/tests/cli_v16_wal.rs`
+(byte-identical PRAGMA rows one-shot and over stdin, the one-shot
+error stop, the oracle's killed log read, `.open`, a generated
+corpus; the files both CLIs leave compared). `tests/pragma_v16.rs`
+and `tests/differential.rs` now expect WAL to work with the leaf.
+
+**Size:** tiny **76,964 B** (Δ **−40 B**, ratchet lowered: the
+`MemSidecar` writes lost two `expect`s). Full **490,916 B** (Δ
+**+224 B**, ratchet raised: the ungated journal_mode prefix match and
+safety-level refusal; no WAL code is in `full`). Max **732,080 B** (Δ
+**+18,576 B** vs 713,504, raised; under the 32 KiB threshold): the log
+format and recovery (`src/wal.rs`), the pager's WAL paths (reads,
+spills, the commit stages, checkpoints, switches, close), the
+PRAGMAs and the `Connection::close` wiring.
+
+**Honest gaps:**
+
+- Frame counts match the pin's for the probed workloads, but not in
+  general: after deletes hipp's B-trees are not always laid out page
+  for page as the pin's (pre-existing), so a transaction may log
+  other pages; hipp's page cache (`Config::cache_pages`, 16 by
+  default) spills into the log long before the pin's (2000 KiB); the
+  pin's "don't write" of pages freed in a transaction is not modelled;
+  a ROLLBACK TO may leave other pages dirty than on the pin. The
+  generated corpora compare checkpoint rows by meaning (frames
+  present, all checkpointed), the hand-written suites exactly.
+- The pin creates the empty `-wal` at its first read in WAL mode;
+  hipp at its first frame. The checkpoint's "locked" rule reads
+  "a page was read since BEGIN / SAVEPOINT" (a schema re-read after
+  another statement's schema change counts).
+- Single process: a `-shm` held by a live connection is detected only
+  on Linux (`/proc/locks`) and only at open and at the switch to WAL;
+  hipp never writes a `-shm`, so a pin connection opened later
+  beside hipp's is not coordinated with (never do that). `busy` is
+  always 0. `PRAGMA locking_mode` stays refused.
+- `journal_mode` PERSIST / TRUNCATE / MEMORY / OFF are still refused
+  (from WAL mode too). The CLI's `:memory:` database (`MemStorage`)
+  enters WAL mode; the pin's reports `memory` and cannot.
+- `PRAGMA encoding` after `journal_mode = WAL` on a new database is
+  ignored by hipp (its page 1 already says UTF-8); the pin still
+  takes it.
+- Without the leaf, a rollback-mode header with a non-empty `-wal`
+  beside it (hand-placed: the pin never leaves committed frames
+  beside such a header) is read from the database file.
+- A log whose page size differs from the database's with committed
+  frames is refused (`CorruptPage`). `synchronous = NORMAL` in
+  rollback mode syncs as FULL; EXTRA does not sync the directory. A
+  commit whose final sync fails is rolled back in memory after its
+  commit frame's salts are overwritten, best effort.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

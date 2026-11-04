@@ -24,6 +24,7 @@ v16,json
 v16,expr_index
 v16,without_rowid
 v16,utf16
+v16,wal
 indexes,v04
 indexes,v05
 indexes,v06

@@ -436,6 +436,12 @@ impl<S: Storage> Statement<'_, S> {
                 }
                 let starts = !self.conn.explicit_txn;
                 self.conn.pager.sp_open(Some(name.as_slice()), starts);
+                // As at BEGIN (v0.16, `wal`: the checkpoint's
+                // read-since-the-transaction-began rule).
+                #[cfg(feature = "wal")]
+                if starts {
+                    self.conn.pager.clear_touched();
+                }
                 self.conn.explicit_txn = true;
             }
             Maint::Release(name) => self.release(name.as_slice()).await?,
@@ -529,8 +535,16 @@ impl<S: Storage> Statement<'_, S> {
         // The deferred foreign-key counters return with it.
         #[cfg(feature = "foreign_keys")]
         self.conn.fk.rollback_to(level);
-        // The schema may have rolled back with it.
-        self.conn.rebuild_catalog().await
+        // The schema may have rolled back with it. (Re-reading it is
+        // not a read of the transaction's: v0.16, `wal`.)
+        #[cfg(feature = "wal")]
+        let touched = self.conn.pager.touched();
+        self.conn.rebuild_catalog().await?;
+        #[cfg(feature = "wal")]
+        if !touched {
+            self.conn.pager.clear_touched();
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------- VACUUM
@@ -562,6 +576,15 @@ impl<S: Storage> Statement<'_, S> {
             .prag
             .vacuum_page_size
             .unwrap_or(self.conn.pager.page_size());
+        // The page size of a WAL-mode database cannot change: its
+        // VACUUM keeps it, as on the pin (VACUUM INTO takes the new
+        // one; v0.16, `wal`).
+        #[cfg(feature = "wal")]
+        let ps = if into.is_none() && self.conn.pager.wal_mode() {
+            self.conn.pager.page_size()
+        } else {
+            ps
+        };
         let mut img = self.compact_image(ps, into.is_some()).await?;
         // Page 1's header, as the pin leaves it.
         let h = *self.conn.pager.header();
@@ -594,6 +617,18 @@ impl<S: Storage> Statement<'_, S> {
         put_be_u32(d, 68, h.application_id);
         put_be_u32(d, 92, counter);
         put_be_u32(d, 96, crate::pager::PIN_VERSION_NUMBER);
+        // File-format bytes: WAL for an in-place VACUUM of a WAL-mode
+        // database, rollback for VACUUM INTO, as the pin writes them
+        // (v0.16, `wal`).
+        #[cfg(feature = "wal")]
+        if let Some(v) = d.get_mut(18..20) {
+            let w = if into.is_none() && self.conn.pager.wal_mode() {
+                2
+            } else {
+                1
+            };
+            v.copy_from_slice(&[w, w]);
+        }
         match (into, write) {
             (Some(name), Some(write)) => {
                 if !write(name, img.as_slice()) {

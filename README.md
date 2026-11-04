@@ -15,7 +15,8 @@ aspirations.
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
-  files, and real SQLite recovers hipp's rollback journals.
+  files, and real SQLite recovers hipp's rollback journals (and,
+  with the `wal` leaf, its write-ahead logs).
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
 
@@ -669,6 +670,36 @@ aspirations.
   (ungated): `unicode(char(65534))` is 65534, as on the pin. Gaps
   (a surrogate followed by a non-matching unit is re-encoded as a
   pair when rewritten) and sizes in STATUS.md.
+- **WAL journal mode** (new leaf feature `wal`, in `max` — ADR 0002
+  — not `full`): a database whose header says WAL (or with a
+  non-empty `-wal` beside it) opens with the committed frames of
+  its log replayed — the pin's header and frame checks, both
+  checksum byte orders, stop at the first invalid frame, frames
+  after the last commit ignored — so data the pin left
+  uncheckpointed is visible. `PRAGMA journal_mode = WAL | DELETE`
+  switches both ways (the pin's prefix match of the name, its
+  in-transaction rules); commits append frames in the pin's layout
+  (header, salts, cumulative checksums, commit frames, pages
+  rewritten in place within a transaction, log restarts after a
+  full checkpoint), so the pin reads, recovers and checkpoints
+  hipp's log. `PRAGMA wal_checkpoint` (PASSIVE / FULL / RESTART /
+  TRUNCATE / NOOP, the `busy|log|checkpointed` row), the automatic
+  checkpoint (`wal_autocheckpoint`, 1000 by default),
+  `journal_size_limit`, every `synchronous` level, and
+  `Connection::close` (checkpoint, `-wal` and a stale `-shm`
+  removed, as the pin's close; the CLI closes at exit). Single
+  process, as the pin's `locking_mode=EXCLUSIVE`: the wal-index
+  lives in heap memory, no `-shm` is written, and a database a
+  live SQLite connection holds is refused (`DatabaseBusy`).
+  Savepoints and statement rollback work inside WAL transactions;
+  crash injection at every write (frames, checkpoints, restarts,
+  mode switches, close) recovers the last committed state, which
+  the pin's integrity check accepts. Without the leaf a WAL file is
+  refused at open (`WalUnsupported`), never read stale. Fixed on
+  the way (ungated, `v16`): `PRAGMA journal_mode = w` (a prefix)
+  is the pin's WAL, no longer a silent query; `PRAGMA synchronous
+  = ...` inside a transaction is the pin's error. Gaps and sizes
+  in STATUS.md.
 
 ## What v0.13 does
 
@@ -977,8 +1008,9 @@ differential testing. It is a separate crate and contributes
 
 ## Non-goals (SPEC §3)
 
-No WAL (files in WAL mode are rejected with `WalUnsupported`),
-no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
+No WAL without the `wal` leaf (files in WAL mode are then rejected
+with `WalUnsupported`; with it, single-process WAL only — no
+shared `-shm` wal-index), no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
 them), no AUTOINCREMENT tables
 created (refused below `v16`, foreign ones load read-only there;
 `v16` maintains `sqlite_sequence`), no expression or partial

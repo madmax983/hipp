@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -252,6 +252,25 @@ without_rowid = ["v16", "indexes"]
 # Builds on the v0.16 PRAGMA machinery, so it implies `v16`. The
 # tiny profile excludes it per §2.
 utf16 = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): write-ahead
+# logging -- files whose header says WAL (bytes 18 / 19 = 2) open
+# with the committed frames of their `-wal` file replayed (salts and
+# both checksum byte orders validated as the pin does, stopping at
+# the first invalid frame, frames after the last commit ignored);
+# PRAGMA journal_mode = WAL / DELETE switch in both directions;
+# commits append frames in the pin's layout (WAL header, salts,
+# cumulative checksums, commit markers) so the pin reads and
+# recovers hipp's log; PRAGMA wal_checkpoint (PASSIVE / FULL /
+# RESTART / TRUNCATE), the automatic checkpoint (PRAGMA
+# wal_autocheckpoint, 1000 pages by default), checkpoint and `-wal`
+# removal at `Connection::close`, PRAGMA synchronous levels and
+# journal_size_limit. Single-process, as the pin's
+# locking_mode=EXCLUSIVE: the wal-index lives in heap memory and no
+# `-shm` is written (a `-shm` another process holds is refused).
+# Without it a WAL file is refused at open (`Error::WalUnsupported`),
+# never read stale. Builds on the v0.16 PRAGMA and savepoint
+# machinery, so it implies `v16`. The tiny profile excludes it per §2.
+wal = ["v16"]
 
 [dependencies]
 

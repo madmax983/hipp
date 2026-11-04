@@ -48,6 +48,18 @@ fn open_db(path: &str) -> Result<Db, String> {
     })
 }
 
+/// Close the database as the oracle shell does at exit and on
+/// `.open` (v0.16): in WAL mode the log is checkpointed and the
+/// `-wal` file removed (`Connection::close`).
+fn close_db(db: Db) -> Result<(), String> {
+    block_on(async {
+        match db {
+            Db::File(c) => c.close().await.map_err(|e| format!("{e:?}")),
+            Db::Mem(c) => c.close().await.map_err(|e| format!("{e:?}")),
+        }
+    })
+}
+
 /// The CLI's engine configuration: the defaults, the system clock,
 /// the pin's nesting limit for views and CTEs (999 levels read,
 /// 1000 are "nested too deep") and its expression and parser depth
@@ -853,7 +865,8 @@ async fn dispatch(
             if path.is_empty() {
                 return Err("usage: .open <path|:memory:>".to_string());
             }
-            *db = open_db(path)?;
+            let new = open_db(path)?;
+            close_db(std::mem::replace(db, new))?;
             return Ok(Flow::Continue);
         }
         match db {
@@ -904,6 +917,19 @@ fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let code = session(&mut db, &args);
+    // The oracle shell closes the database however the session
+    // ended (v0.16: a WAL-mode log is checkpointed and removed).
+    if let Err(e) = close_db(db) {
+        eprintln!("Error: {e}");
+        return ExitCode::FAILURE;
+    }
+    code
+}
+
+/// Run the one-shot SQL argument, or the interactive / stdin
+/// session, against `db`.
+fn session(db: &mut Db, args: &[String]) -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut params = Params::new();
 
@@ -911,7 +937,7 @@ fn run() -> ExitCode {
     // statements), stop at the first error.
     if let Some(sql) = args.get(1) {
         for stmt in split_statements(sql) {
-            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
+            match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {
@@ -949,7 +975,7 @@ fn run() -> ExitCode {
         // does, and a schema text can hold them).
         let line = line.as_str();
         if buffer.is_empty() && line.trim_start().starts_with('.') {
-            match block_on(dispatch(&mut db, line.trim(), &mut params, &mut out)) {
+            match block_on(dispatch(db, line.trim(), &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => eprintln!("Error: {e}"),
@@ -963,7 +989,7 @@ fn run() -> ExitCode {
         if buffer.trim_end().ends_with(';') && split_script(&buffer).1 {
             let script = std::mem::take(&mut buffer);
             for stmt in split_statements(&script) {
-                match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
+                match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit) => return ExitCode::SUCCESS,
                     Err(e) => eprintln!("Error: {e}"),
@@ -974,7 +1000,7 @@ fn run() -> ExitCode {
     // A trailing unterminated statement still runs at EOF.
     if !buffer.trim().is_empty() {
         for stmt in split_statements(&buffer) {
-            match block_on(dispatch(&mut db, &stmt, &mut params, &mut out)) {
+            match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {

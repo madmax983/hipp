@@ -627,3 +627,333 @@ fn v16_crash_without_rowid() {
     ];
     crash_matrix("without-rowid", Config::default(), &setup, &txn);
 }
+
+// ---------------------------------------------------------------
+// v0.16 (`wal`): crash injection in WAL mode — frame appends (with
+// the cache spilling into the log, savepoints and statement
+// rollback), the commit frame, checkpoints of every kind (the
+// automatic one too), log restarts, `journal_size_limit`
+// truncation, mode switches and the checkpoint at close. A crash at
+// any op must recover the last committed state: the state after the
+// statements that completed, or after the one in flight. The
+// recovered file and log also pass the pin's integrity check and
+// read the same there.
+// ---------------------------------------------------------------
+
+/// The table's contents and hipp's integrity check, as one line.
+#[cfg(feature = "wal")]
+async fn wal_content<S: Storage>(db: &mut Connection<S>) -> String
+where
+    S::Error: core::fmt::Debug,
+{
+    let mut out = String::new();
+    for sql in [
+        "SELECT count(*), group_concat(id || ':' || length(x)) FROM (SELECT * FROM t ORDER BY id)",
+        "PRAGMA integrity_check",
+    ] {
+        let mut q = db.prepare(sql).await.expect("prep");
+        while q.step().await.expect("step") == Step::Row {
+            for i in 0..q.column_count() {
+                if i > 0 {
+                    out.push('|');
+                }
+                match q.column_value(i) {
+                    Some(hipp::Value::Integer(v)) => out.push_str(&v.to_string()),
+                    Some(hipp::Value::Text(b)) => out.push_str(&String::from_utf8_lossy(b)),
+                    _ => {}
+                }
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Write a MemStorage's database and log to `path` (+ `-wal`).
+#[cfg(feature = "wal")]
+fn mem_to_files(mem: &MemStorage, path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let _ = std::fs::remove_file(&wal);
+    std::fs::write(path, mem.snapshot()).expect("db");
+    if let Some(w) = mem.wal_snapshot() {
+        std::fs::write(&wal, w).expect("wal");
+    }
+}
+
+#[cfg(feature = "wal")]
+fn wal_crash_matrix(tag: &str, cfg: Config, setup: &[String], steps: &[String], close: bool) {
+    block_on(async {
+        let pre = MemStorage::new();
+        {
+            let mut db = Connection::open(pre.clone(), cfg.clone())
+                .await
+                .expect("open");
+            run_all(&mut db, setup).await;
+        }
+        let (pre_db, pre_wal) = (pre.snapshot(), pre.wal_snapshot());
+        assert!(pre_db.get(18) == Some(&2), "{tag}: setup enters WAL mode");
+        let fresh = || {
+            let m = MemStorage::new();
+            m.set_snapshot(pre_db.clone());
+            m.set_wal(pre_wal.clone());
+            m
+        };
+        // The committed state after each prefix of the steps: what a
+        // new connection reads from a copy of the files (inside an
+        // explicit transaction, the state before it).
+        async fn committed(mem: &MemStorage, cfg: &Config) -> String {
+            let m = MemStorage::new();
+            m.set_snapshot(mem.snapshot());
+            m.set_wal(mem.wal_snapshot());
+            m.set_journal(mem.journal_snapshot());
+            let mut db = Connection::open(m, cfg.clone()).await.expect("open copy");
+            wal_content(&mut db).await
+        }
+        let mut states = Vec::new();
+        {
+            let mem = fresh();
+            let mut db = Connection::open(mem.clone(), cfg.clone())
+                .await
+                .expect("open");
+            states.push(committed(&mem, &cfg).await);
+            for s in steps {
+                run_all(&mut db, std::slice::from_ref(s)).await;
+                states.push(committed(&mem, &cfg).await);
+            }
+            if close {
+                db.close().await.expect("close");
+                assert!(mem.wal_snapshot().is_none(), "{tag}: close removes the log");
+            }
+        }
+        assert_ne!(states.first(), states.last(), "{tag}: the steps change t");
+        let total_ops = {
+            let cs = crash_storage(fresh());
+            let mut db = Connection::open(cs.clone(), cfg.clone())
+                .await
+                .expect("open");
+            let before = cs.ops();
+            run_all(&mut db, steps).await;
+            if close {
+                db.close().await.expect("close");
+            }
+            cs.ops() - before
+        };
+        assert!(total_ops >= 8, "{tag}: ops {total_ops}");
+        let file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("hipp-walcrash-{tag}.db"));
+        let mut seen = std::collections::BTreeSet::new();
+        for k in 0..total_ops {
+            let mem = fresh();
+            let cs = crash_storage(mem.clone());
+            let mut done = steps.len();
+            {
+                let mut db = Connection::open(cs.clone(), cfg.clone())
+                    .await
+                    .expect("open");
+                cs.st.borrow_mut().kill_at = Some(cs.ops() + k);
+                for (i, s) in steps.iter().enumerate() {
+                    run_all(&mut db, std::slice::from_ref(s)).await;
+                    if cs.st.borrow().dead {
+                        done = i;
+                        break;
+                    }
+                }
+                if close && done == steps.len() {
+                    let _ = db.close().await;
+                }
+            }
+            let mut db = Connection::open(mem.clone(), cfg.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{tag} k={k}: reopen failed: {e:?}"));
+            let got = wal_content(&mut db).await;
+            drop(db);
+            let ok = [done, done + 1]
+                .iter()
+                .any(|&i| states.get(i) == Some(&got));
+            assert!(
+                ok,
+                "{tag} k={k}/{total_ops}: recovered {got:?}, not the state after step {done} or {}",
+                done + 1
+            );
+            assert!(got.ends_with("ok\n"), "{tag} k={k}: hipp integrity {got}");
+            seen.insert(got.clone());
+            // The pin reads the same files the same way.
+            mem_to_files(&mem, &file);
+            assert_eq!(
+                common::cli(&file, "PRAGMA integrity_check;").trim(),
+                "ok",
+                "{tag} k={k}: the pin's integrity check"
+            );
+            let q = "SELECT count(*), group_concat(id || ':' || length(x)) FROM (SELECT * FROM t ORDER BY id);";
+            assert_eq!(
+                common::cli(&file, q),
+                got.lines()
+                    .next()
+                    .map(|l| format!("{l}\n"))
+                    .unwrap_or_default(),
+                "{tag} k={k}: the pin's read"
+            );
+        }
+        assert!(
+            seen.len() >= 2,
+            "{tag}: crashes recover more than one state"
+        );
+    });
+}
+
+#[cfg(feature = "wal")]
+fn wal_setup() -> Vec<String> {
+    strs(&[
+        "PRAGMA journal_mode = WAL",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)",
+        "CREATE INDEX tx ON t(x)",
+        "INSERT INTO t VALUES (1, 'one')",
+    ])
+}
+
+/// Frame appends, a transaction with savepoints and a failing
+/// statement, checkpoints of each kind, restarts, and close.
+#[cfg(feature = "wal")]
+#[test]
+fn v16_crash_wal_frames_and_checkpoints() {
+    let steps = vec![
+        "PRAGMA wal_autocheckpoint = 0".to_string(),
+        "INSERT INTO t VALUES (2, 'two')".to_string(),
+        rows_sql("t", 10, 40, 300),
+        "BEGIN".to_string(),
+        "UPDATE t SET x = x || 'u' WHERE id % 2 = 0".to_string(),
+        "SAVEPOINT s".to_string(),
+        "DELETE FROM t WHERE id > 30".to_string(),
+        "ROLLBACK TO s".to_string(),
+        "INSERT INTO t VALUES (3, 'x'), (1, 'dup')".to_string(),
+        "INSERT INTO t VALUES (4, 'four')".to_string(),
+        "COMMIT".to_string(),
+        "PRAGMA wal_checkpoint(PASSIVE)".to_string(),
+        "INSERT INTO t VALUES (5, 'five')".to_string(),
+        "PRAGMA journal_size_limit = 0".to_string(),
+        "PRAGMA wal_checkpoint(FULL)".to_string(),
+        "DELETE FROM t WHERE id % 3 = 0".to_string(),
+        "PRAGMA wal_checkpoint(TRUNCATE)".to_string(),
+        "INSERT INTO t VALUES (6, printf('%05000d', 6))".to_string(),
+    ];
+    wal_crash_matrix("frames", Config::default(), &wal_setup(), &steps, true);
+}
+
+/// The automatic checkpoint, under a cache small enough that
+/// transactions spill pages into the log and rewrite them in place.
+#[cfg(feature = "wal")]
+#[test]
+fn v16_crash_wal_autocheckpoint_and_spills() {
+    let steps = vec![
+        "PRAGMA wal_autocheckpoint = 6".to_string(),
+        "BEGIN".to_string(),
+        rows_sql("t", 10, 90, 200),
+        "SAVEPOINT s".to_string(),
+        "UPDATE t SET x = x || 'more'".to_string(),
+        "ROLLBACK TO s".to_string(),
+        "UPDATE t SET x = 'v' || x WHERE id % 3 = 0".to_string(),
+        "COMMIT".to_string(),
+        "INSERT INTO t VALUES (2, 'two')".to_string(),
+        "INSERT INTO t VALUES (3, 'three')".to_string(),
+        "DELETE FROM t WHERE id % 2 = 1".to_string(),
+    ];
+    wal_crash_matrix(
+        "autockpt",
+        Config::default().cache_pages(4),
+        &wal_setup(),
+        &steps,
+        false,
+    );
+}
+
+/// Leaving and re-entering WAL mode, and VACUUM in WAL mode.
+#[cfg(feature = "wal")]
+#[test]
+fn v16_crash_wal_mode_switches_and_vacuum() {
+    let steps = vec![
+        "PRAGMA wal_autocheckpoint = 0".to_string(),
+        rows_sql("t", 10, 30, 400),
+        "PRAGMA journal_mode = DELETE".to_string(),
+        "INSERT INTO t VALUES (2, 'two')".to_string(),
+        "PRAGMA journal_mode = WAL".to_string(),
+        "DELETE FROM t WHERE id % 2 = 0".to_string(),
+        "VACUUM".to_string(),
+        "INSERT INTO t VALUES (3, 'three')".to_string(),
+    ];
+    wal_crash_matrix("switch", Config::default(), &wal_setup(), &steps, true);
+}
+
+/// The cross-tool case in WAL mode: a hipp process killed at every
+/// write boundary of a WAL workload (frames, a checkpoint, a log
+/// restart, the checkpoint and log removal at close) leaves files
+/// real SQLite recovers to a committed state that passes its
+/// integrity check, and hipp reads them the same way.
+#[cfg(feature = "wal")]
+#[test]
+fn v16_cross_tool_real_sqlite_recovers_hipp_wal() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-crash-wal");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let base = dir.join("base.db");
+    let (code, err) = run_writer(&base, "wal_setup", None, false);
+    assert_eq!(code, 0, "{err}");
+    let side = |p: &std::path::Path, s: &str| {
+        let mut o = p.as_os_str().to_owned();
+        o.push(s);
+        std::path::PathBuf::from(o)
+    };
+    assert!(side(&base, "-wal").exists(), "setup leaves its log");
+    let copy = |to: &std::path::Path| {
+        std::fs::copy(&base, to).expect("copy");
+        std::fs::copy(side(&base, "-wal"), side(to, "-wal")).expect("copy log");
+    };
+    let probe = dir.join("probe.db");
+    copy(&probe);
+    let (code, err) = run_writer(&probe, "wal_txn", None, true);
+    assert_eq!(code, 0, "count run: {err}");
+    assert!(!side(&probe, "-wal").exists(), "close removes the log");
+    assert_eq!(
+        common::cli(&probe, "SELECT group_concat(id) FROM t;"),
+        "1,2,3,4\n"
+    );
+    let total: usize = err
+        .lines()
+        .find_map(|l| l.strip_prefix("OPS="))
+        .and_then(|v| v.parse().ok())
+        .expect("OPS line");
+    let states = ["1", "1,2", "1,2,3", "1,2,3,4"];
+    for k in 0..total {
+        let f = dir.join(format!("w{k}.db"));
+        copy(&f);
+        let (code, _) = run_writer(&f, "wal_txn", Some(k), false);
+        assert_eq!(code, 42, "k={k}: writer should die at the boundary");
+        // hipp's view first (on a copy: the pin's close checkpoints).
+        let g = dir.join(format!("w{k}-h.db"));
+        std::fs::copy(&f, &g).expect("copy");
+        if side(&f, "-wal").exists() {
+            std::fs::copy(side(&f, "-wal"), side(&g, "-wal")).expect("copy log");
+        }
+        let hipp_ids = block_on(async {
+            let fs = hipp::FileStorage::open(&g).expect("fs");
+            let mut db = Connection::open(fs, Config::default())
+                .await
+                .expect("hipp open");
+            let mut ids = Vec::new();
+            for id in scan_ids(&mut db).await {
+                ids.push(id.to_string());
+            }
+            ids.join(",")
+        });
+        assert_eq!(
+            common::cli(&f, "PRAGMA integrity_check;").trim(),
+            "ok",
+            "k={k}"
+        );
+        let ids = common::cli(&f, "SELECT group_concat(id) FROM t;");
+        let ids = ids.trim();
+        assert!(states.contains(&ids), "k={k}: ids {ids}");
+        assert_eq!(hipp_ids, ids, "k={k}: hipp and the pin recover alike");
+    }
+}

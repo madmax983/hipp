@@ -4877,6 +4877,20 @@ impl<S: Storage> Connection<S> {
         Ok(true)
     }
 
+    /// Close the connection (v0.16): an open transaction is rolled
+    /// back and — in WAL mode (`wal`) — the log is checkpointed and
+    /// the `-wal` file (and a stale `-shm`) deleted, as the pin's
+    /// close does. A connection dropped without `close` leaves its
+    /// log for the next open to read (as after a crash); nothing
+    /// committed is lost either way. On an error the database stays
+    /// as it was (the log kept).
+    pub async fn close(mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "wal")]
+        return self.pager.close_wal().await;
+        #[cfg(not(feature = "wal"))]
+        self.pager.rollback().await
+    }
+
     /// Roll back the connection's open transaction, if any.
     pub async fn rollback(&mut self) -> Result<(), S::Error> {
         self.pager.rollback().await?;
@@ -6390,6 +6404,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Err(Error::TransactionState { nested: true });
         }
         self.conn.explicit_txn = true;
+        // The pin's checkpoint refuses a transaction that has read
+        // the file since BEGIN (v0.16, `wal`).
+        #[cfg(feature = "wal")]
+        self.conn.pager.clear_touched();
         self.phase = Phase::Done;
         Ok(Step::Done)
     }

@@ -433,6 +433,25 @@ pub enum SchemaKind {
     /// "non-text filename"). Name a new or empty file, as text.
     #[cfg(feature = "v16")]
     VacuumTarget,
+    /// `PRAGMA synchronous = ...` inside an explicit transaction
+    /// (v0.16, `v16`; the pin's "Safety level may not be changed
+    /// inside a transaction", raised when the statement is
+    /// prepared). COMMIT or ROLLBACK first.
+    #[cfg(feature = "v16")]
+    SafetyLevelInTransaction,
+    /// `PRAGMA journal_mode = WAL` (or from WAL to another mode)
+    /// inside an explicit transaction that has not written yet
+    /// (v0.16, `wal`; the pin's "cannot change into / out of wal
+    /// mode from within a transaction"). COMMIT or ROLLBACK first.
+    /// (Once the transaction has written, the pin — and hipp —
+    /// leave the mode alone and report the current one.)
+    #[cfg(feature = "wal")]
+    WalModeInTransaction,
+    /// `PRAGMA wal_checkpoint` inside a transaction that has read or
+    /// written the database (v0.16, `wal`; the pin's "database table
+    /// is locked"). COMMIT or ROLLBACK first.
+    #[cfg(feature = "wal")]
+    CheckpointLocked,
     /// `REINDEX x` where `x` names no collation, table or index
     /// (v0.16, `v16`; the pin's "unable to identify the object to
     /// be reindexed"). Name an existing one.
@@ -768,6 +787,13 @@ pub enum Error<E> {
     /// at any time and never returns it.)
     #[cfg(feature = "params")]
     ResetRequired,
+    /// Another process holds the database or its `-shm` file (v0.16,
+    /// `wal`): a live SQLite connection in WAL mode shares its
+    /// wal-index through the `-shm`, which hipp — single-process, its
+    /// wal-index in heap memory — cannot take part in. Close the other
+    /// connection first (`Storage::locked_elsewhere` reports it).
+    #[cfg(feature = "wal")]
+    DatabaseBusy,
     /// The caller's storage device error.
     Storage(E),
 }
@@ -808,6 +834,8 @@ impl<E> Error<E> {
             Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
             #[cfg(feature = "params")]
             Error::ResetRequired => Error::ResetRequired,
+            #[cfg(feature = "wal")]
+            Error::DatabaseBusy => Error::DatabaseBusy,
             Error::Storage(e) => Error::Storage(e.into()),
         }
     }
@@ -847,6 +875,8 @@ impl<E> Error<E> {
             Error::BindIndexOutOfRange { index } => Error::BindIndexOutOfRange { index },
             #[cfg(feature = "params")]
             Error::ResetRequired => Error::ResetRequired,
+            #[cfg(feature = "wal")]
+            Error::DatabaseBusy => Error::DatabaseBusy,
         }
     }
 }

@@ -260,7 +260,12 @@ fn known_but_unimplemented_pragmas_are_refused() {
         } else {
             "foreign_key_check"
         },
-        "wal_checkpoint",
+        // Implemented by the `wal` leaf.
+        if cfg!(feature = "wal") {
+            "cache_spill"
+        } else {
+            "wal_checkpoint"
+        },
         "query_only",
         "writable_schema",
         "optimize",
@@ -415,12 +420,18 @@ fn page_size_encoding_and_auto_vacuum_on_a_fresh_database() {
         "PRAGMA encoding = 'UTF-16le'",
         "PRAGMA auto_vacuum = 1",
         "PRAGMA auto_vacuum = incremental",
+        // WAL mode and the safety levels are honoured with the `wal`
+        // leaf (tests/wal_v16.rs).
+        #[cfg(not(feature = "wal"))]
         "PRAGMA journal_mode = wal",
         "PRAGMA journal_mode = memory",
         "PRAGMA journal_mode = off",
         "PRAGMA journal_mode = truncate",
+        #[cfg(not(feature = "wal"))]
         "PRAGMA synchronous = OFF",
+        #[cfg(not(feature = "wal"))]
         "PRAGMA synchronous = normal",
+        #[cfg(not(feature = "wal"))]
         "PRAGMA synchronous = extra",
         "PRAGMA cache_size = -8000",
     ]

@@ -96,7 +96,10 @@ pub fn parse_db_header<E>(probe: &[u8], file_len: u64) -> Result<DbHeader, E> {
         return Err(Error::BadMagic);
     }
     let page_size = parse_page_size_field::<E>(be_u16(probe, 16))?;
-    // Write version at 18, read version at 19; 2 means WAL.
+    // Write version at 18, read version at 19; 2 means WAL (read
+    // through the log with the `wal` leaf, v0.16; refused without
+    // it, never read stale).
+    #[cfg(not(feature = "wal"))]
     if probe[18] == 2 || probe[19] == 2 {
         return Err(Error::WalUnsupported);
     }
@@ -235,6 +238,56 @@ pub enum CommitStage {
     SyncData,
     /// Commit: deleting the journal — the commit point.
     DeleteJournal,
+    /// WAL-mode commit (v0.16, `wal`): appending dirty page `next`
+    /// of the (page-sorted) dirty list as a frame; the last one is
+    /// the commit frame — the commit point once it is on the file.
+    #[cfg(feature = "wal")]
+    WalFrames { next: usize },
+    /// WAL-mode commit: syncing the log (`synchronous` FULL or
+    /// EXTRA), then publishing the frames.
+    #[cfg(feature = "wal")]
+    WalSync,
+}
+
+/// A `PRAGMA wal_checkpoint` mode (v0.16, `wal`). hipp is the only
+/// process on the file, so no checkpoint ever waits on a reader:
+/// PASSIVE, FULL and RESTART all copy every committed frame (the
+/// next write then restarts the log); TRUNCATE also empties the
+/// `-wal` file.
+#[cfg(feature = "wal")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpoint {
+    Passive,
+    Full,
+    Restart,
+    Truncate,
+}
+
+/// The WAL-related settings of one database (v0.16, `wal`).
+#[cfg(feature = "wal")]
+#[derive(Debug, Clone, Copy)]
+pub struct WalCfg {
+    /// The pin's safety level (`PRAGMA synchronous` + 1): 1 OFF (no
+    /// syncs), 2 NORMAL (the log synced only by checkpoints), 3 FULL
+    /// (the default; the log synced at every commit), 4 and above
+    /// EXTRA (as FULL).
+    pub sync: u8,
+    /// Checkpoint after a commit leaves this many frames in the log
+    /// (`PRAGMA wal_autocheckpoint`; 0: never).
+    pub autocheckpoint: u32,
+    /// `PRAGMA journal_size_limit` in bytes (-1: none).
+    pub size_limit: i64,
+}
+
+#[cfg(feature = "wal")]
+impl Default for WalCfg {
+    fn default() -> WalCfg {
+        WalCfg {
+            sync: 3,
+            autocheckpoint: crate::wal::DEFAULT_AUTOCHECKPOINT,
+            size_limit: -1,
+        }
+    }
 }
 
 struct Frame {
@@ -332,6 +385,28 @@ pub struct Pager<S: Storage> {
     /// handles (v0.16, `without_rowid`; see `crate::wr`).
     #[cfg(feature = "without_rowid")]
     pub wr: crate::wr::WrState,
+    /// The write-ahead log, while the database is in WAL mode
+    /// (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    wal: Option<crate::wal::Wal<S::Sidecar>>,
+    /// The WAL settings (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    pub wal_cfg: WalCfg,
+    /// In WAL mode the savepoint area lives in the journal file
+    /// (v0.16, `wal`): set once this transaction wrote there, so the
+    /// file is deleted when it ends.
+    #[cfg(feature = "wal")]
+    sp_file: bool,
+    /// A page has been read since `clear_touched` (v0.16, `wal`:
+    /// the pin refuses a checkpoint inside a transaction that has
+    /// read the database).
+    #[cfg(feature = "wal")]
+    touched: bool,
+    /// WAL mode was entered and no page has been read since (v0.16,
+    /// `wal`): the pin has not opened its log yet, and its first
+    /// checkpoint opens it with a read transaction.
+    #[cfg(feature = "wal")]
+    wal_fresh: bool,
 }
 
 impl<S: Storage> Pager<S> {
@@ -378,6 +453,18 @@ impl<S: Storage> Pager<S> {
         let file_len = storage.len().await.map_err(Error::Storage)?;
         let mut is_new = false;
         if file_len == 0 {
+            // A log beside an empty database belongs to no database:
+            // the pin deletes it (v0.16, `wal`).
+            #[cfg(feature = "wal")]
+            {
+                let mut w = storage
+                    .sidecar(Sidecar::Wal)
+                    .await
+                    .map_err(Error::Storage)?;
+                if w.existed() {
+                    w.delete().await.map_err(Error::Storage)?;
+                }
+            }
             // Create-new: header + empty schema leaf, then a sync.
             // A crash here leaves a zero/garbage file that fails
             // validation on next open — never a torn database.
@@ -396,6 +483,7 @@ impl<S: Storage> Pager<S> {
             .await
             .map_err(Error::Storage)?;
         let mut header = parse_db_header::<S::Error>(&probe, file_len)?;
+        #[cfg(not(feature = "wal"))]
         let reserved_bytes = probe[20];
 
         // Hot-journal recovery: a journal that exists, is well-formed
@@ -418,15 +506,26 @@ impl<S: Storage> Pager<S> {
                 header = parse_db_header::<S::Error>(&probe, fl)?;
             }
         }
+        // WAL mode (v0.16, `wal`): the committed frames of the log
+        // replace their pages, page 1's header included.
+        #[cfg(feature = "wal")]
+        let wal = open_wal(&mut storage, &mut probe, &mut header).await?;
+        #[cfg(feature = "wal")]
+        let reserved_bytes = probe[20];
+        #[cfg(feature = "wal")]
+        let in_log = wal.as_ref().is_some_and(|w| w.mx_frame > 0);
+        #[cfg(not(feature = "wal"))]
+        let in_log = false;
         // A header that claims more pages than the file holds is
         // the pin's "malformed" (v0.16, `v16`: hipp read past the
         // end as empty pages, which integrity_check reported).
         #[cfg(feature = "v16")]
         let fl = storage.len().await.map_err(Error::Storage)?;
         #[cfg(feature = "v16")]
-        if u64::from(header.page_count) > fl.div_ceil(u64::from(header.page_size)) {
+        if !in_log && u64::from(header.page_count) > fl.div_ceil(u64::from(header.page_size)) {
             return Err(Error::CorruptPage { page: 1 });
         }
+        let _ = in_log;
 
         let frames = (0..cache_cap)
             .map(|_| Frame {
@@ -467,6 +566,16 @@ impl<S: Storage> Pager<S> {
                 sub_off: 0,
                 #[cfg(feature = "without_rowid")]
                 wr: crate::wr::WrState::default(),
+                #[cfg(feature = "wal")]
+                wal,
+                #[cfg(feature = "wal")]
+                wal_cfg: WalCfg::default(),
+                #[cfg(feature = "wal")]
+                sp_file: false,
+                #[cfg(feature = "wal")]
+                touched: false,
+                #[cfg(feature = "wal")]
+                wal_fresh: false,
             },
             is_new,
         ))
@@ -488,6 +597,11 @@ impl<S: Storage> Pager<S> {
     /// by pointer, so pins survive everything (SPEC §5.2).
     pub async fn load(&mut self, page: u32) -> Result<usize, S::Error> {
         self.check_page(page)?;
+        #[cfg(feature = "wal")]
+        {
+            self.touched = true;
+            self.wal_fresh = false;
+        }
         if let Some(i) = self.find_frame(page) {
             self.frames[i].clock_ref = true;
             return Ok(i);
@@ -526,12 +640,29 @@ impl<S: Storage> Pager<S> {
         };
         let ps = self.header.page_size as usize;
         let off = u64::from(page - 1) * ps as u64;
+        // In WAL mode (v0.16, `wal`) a page with a frame in the log
+        // is read from its newest one.
+        #[cfg(feature = "wal")]
+        let from_log = match self.wal.as_ref() {
+            Some(w) => match w.lookup(page) {
+                Some(fr) => {
+                    w.read_page(fr, &mut self.frames[vi].data).await?;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        #[cfg(not(feature = "wal"))]
+        let from_log = false;
         // Disjoint field borrows (frames vs storage): the read lands
         // directly in the frame — no copy, no allocation (SPEC §5.2).
-        self.storage
-            .read_at(off, &mut self.frames[vi].data)
-            .await
-            .map_err(Error::Storage)?;
+        if !from_log {
+            self.storage
+                .read_at(off, &mut self.frames[vi].data)
+                .await
+                .map_err(Error::Storage)?;
+        }
         self.frames[vi].page = page;
         self.frames[vi].dirty = false;
         self.frames[vi].clock_ref = true;
@@ -552,6 +683,20 @@ impl<S: Storage> Pager<S> {
             return Ok(None);
         };
         let page = self.frames[i].page;
+        // In WAL mode (v0.16, `wal`) the page goes to the log as a
+        // frame of the open transaction (no commit marker), as the
+        // pin spills: the database file never changes outside a
+        // checkpoint.
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() {
+            let rand = self.rand64();
+            let sync = self.wal_cfg.sync >= 3;
+            if let Some(w) = self.wal.as_mut() {
+                w.append(page, &self.frames[i].data, 0, rand, sync).await?;
+            }
+            self.frames[i].dirty = false;
+            return Ok(Some(i));
+        }
         let off = u64::from(page - 1) * u64::from(self.header.page_size);
         self.storage
             .write_at(off, &self.frames[i].data)
@@ -608,6 +753,14 @@ impl<S: Storage> Pager<S> {
         x ^= x >> 33;
         self.nonce = (x as u32) | 1;
         self.orig_page_count = self.header.page_count;
+        // WAL mode (v0.16, `wal`): no rollback journal — the log's
+        // frames past the last commit frame are the transaction.
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() {
+            self.txn_header = Some(self.header);
+            self.stage = CommitStage::Writing;
+            return Ok(());
+        }
         // Journal header sector: magic, page-count = -1 (single
         // segment, "to end of file"), nonce, original size, sector
         // size, page size; zero-padded to one sector.
@@ -635,6 +788,11 @@ impl<S: Storage> Pager<S> {
         // was journaled, and replay stops at such a record — the
         // records after it were lost to a crash.)
         if self.journaled.contains(&page) || page > self.orig_page_count {
+            return Ok(());
+        }
+        // WAL mode keeps no rollback journal (v0.16, `wal`).
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() {
             return Ok(());
         }
         let ps = self.header.page_size as usize;
@@ -933,6 +1091,13 @@ impl<S: Storage> Pager<S> {
     /// version-valid-for). Called once at commit start; page 1's
     /// original is journaled first by the usual path.
     async fn finalise_page1(&mut self) -> Result<(), S::Error> {
+        // In WAL mode (v0.16, `wal`) page 1 is written only when the
+        // transaction changed it or a header field, as on the pin
+        // (whose change counter moves only then).
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() && !self.dirty.contains(&1) && self.txn_header == Some(self.header) {
+            return Ok(());
+        }
         let idx = self.dirty_page(1).await?;
         let new_counter = self.header.change_counter + 1;
         self.header.change_counter = new_counter;
@@ -1104,14 +1269,77 @@ impl<S: Storage> Pager<S> {
             CommitStage::Writing => {
                 self.finalise_page1().await?;
                 self.stage = CommitStage::SyncJournal;
+                // WAL mode (v0.16, `wal`): frames in page order, as
+                // the pin writes them.
+                // A page spilled to the log and not changed since is
+                // there already; with none left in the cache the
+                // commit frame is page 1's (the pin's rule).
+                #[cfg(feature = "wal")]
+                if let Some(w) = self.wal.as_ref() {
+                    let frames = &self.frames;
+                    self.dirty
+                        .retain(|p| frames.iter().any(|f| f.page == *p && f.dirty));
+                    if self.dirty.is_empty() && w.tx_frames() {
+                        self.dirty.push(1);
+                    }
+                    self.dirty.sort_unstable();
+                    self.stage = CommitStage::WalFrames { next: 0 };
+                }
             }
             _ => {}
         }
         loop {
             match self.stage {
+                #[cfg(feature = "wal")]
+                CommitStage::WalFrames { next } => {
+                    let Some(&page) = self.dirty.get(next) else {
+                        self.stage = CommitStage::WalSync;
+                        continue;
+                    };
+                    let idx = self.load(page).await?;
+                    let commit = if next + 1 == self.dirty.len() {
+                        self.header.page_count
+                    } else {
+                        0
+                    };
+                    let rand = self.rand64();
+                    let sync = self.wal_cfg.sync >= 3;
+                    let Some(w) = self.wal.as_mut() else {
+                        return Err(Error::OperationInFlight);
+                    };
+                    w.append(page, &self.frames[idx].data, commit, rand, sync)
+                        .await?;
+                    self.stage = CommitStage::WalFrames { next: next + 1 };
+                }
+                #[cfg(feature = "wal")]
+                CommitStage::WalSync => {
+                    let (sync, limit) = (self.wal_cfg.sync >= 3, self.wal_cfg.size_limit);
+                    let n_page = self.header.page_count;
+                    let Some(w) = self.wal.as_mut() else {
+                        return Err(Error::OperationInFlight);
+                    };
+                    if w.tx_frames() {
+                        if sync {
+                            w.sync().await?;
+                        }
+                        w.committed(n_page, limit).await;
+                    }
+                    // Commit point passed. Clean up.
+                    self.end_txn().await;
+                    self.auto_checkpoint().await;
+                    return Ok(());
+                }
                 CommitStage::SyncJournal => {
                     let sidecar = self.sidecar.as_mut().expect("sidecar from open");
-                    sidecar.sync().await.map_err(Error::Storage)?;
+                    // `PRAGMA synchronous = OFF` skips every sync
+                    // (v0.16, `wal`).
+                    #[cfg(feature = "wal")]
+                    let skip = self.wal_cfg.sync < 2;
+                    #[cfg(not(feature = "wal"))]
+                    let skip = false;
+                    if !skip {
+                        sidecar.sync().await.map_err(Error::Storage)?;
+                    }
                     self.stage = CommitStage::WritePages { next: 0 };
                 }
                 CommitStage::WritePages { next } => {
@@ -1142,7 +1370,13 @@ impl<S: Storage> Pager<S> {
                     if cur != want {
                         self.storage.set_len(want).await.map_err(Error::Storage)?;
                     }
-                    self.storage.sync().await.map_err(Error::Storage)?;
+                    #[cfg(feature = "wal")]
+                    let skip = self.wal_cfg.sync < 2;
+                    #[cfg(not(feature = "wal"))]
+                    let skip = false;
+                    if !skip {
+                        self.storage.sync().await.map_err(Error::Storage)?;
+                    }
                     self.stage = CommitStage::DeleteJournal;
                 }
                 CommitStage::DeleteJournal => {
@@ -1177,6 +1411,20 @@ impl<S: Storage> Pager<S> {
         self.sp_clear();
         match self.stage {
             CommitStage::Idle => return Ok(()),
+            // WAL mode (v0.16, `wal`): nothing reached the database
+            // file; the transaction's frames are forgotten (a commit
+            // frame already written, when the commit failed at its
+            // sync, is voided first).
+            #[cfg(feature = "wal")]
+            stage if self.wal.is_some() => {
+                if let Some(w) = self.wal.as_mut() {
+                    w.rollback(stage == CommitStage::WalSync).await;
+                }
+                if let Some(h) = self.txn_header.take() {
+                    self.header = h;
+                }
+                self.drop_sp_file().await;
+            }
             CommitStage::Writing if !self.spilled => {
                 let sidecar = self.sidecar.as_mut().expect("sidecar from open");
                 sidecar.delete().await.map_err(Error::Storage)?;
@@ -1246,8 +1494,21 @@ impl<S: Storage> Pager<S> {
         if since.iter().any(|r| r.page == page) {
             return Ok(());
         }
-        let off = if self.dirty.contains(&page) || page > self.orig_page_count {
+        // WAL mode (v0.16, `wal`) keeps no rollback journal: every
+        // image is copied to the savepoint area, which starts past a
+        // zero first sector (a hot-journal check never takes it for
+        // a journal).
+        #[cfg(feature = "wal")]
+        let copy = self.wal.is_some();
+        #[cfg(not(feature = "wal"))]
+        let copy = false;
+        let off = if copy || self.dirty.contains(&page) || page > self.orig_page_count {
             let ps = u64::from(self.header.page_size);
+            #[cfg(feature = "wal")]
+            if copy && self.sub_off == 0 {
+                self.sub_off = u64::from(SECTOR_SIZE);
+                self.sp_file = true;
+            }
             if self.sub_off == 0 {
                 // Past the largest rollback journal this transaction
                 // can write (every original page once), plus one
@@ -1428,6 +1689,10 @@ impl<S: Storage> Pager<S> {
             return Err(Error::CorruptPage { page: 1 });
         }
         let new_header = parse_db_header::<S::Error>(img, img.len() as u64)?;
+        #[cfg(feature = "wal")]
+        if self.wal.is_some() {
+            return self.replace_image_wal(img, new_header).await;
+        }
         self.begin_write().await?;
         for page in 1..=self.orig_page_count {
             let idx = self.load(page).await?;
@@ -1497,10 +1762,370 @@ impl<S: Storage> Pager<S> {
         self.storage.sync().await.map_err(Error::Storage)
     }
 
+    /// The next salt bits for the log (v0.16, `wal`): the nonce
+    /// stream (the Config-supplied seed mixed with a counter).
+    #[cfg(feature = "wal")]
+    fn rand64(&mut self) -> u64 {
+        self.nonce_counter = self.nonce_counter.wrapping_add(1);
+        let mut x = self.nonce_seed ^ self.nonce_counter.wrapping_mul(0x9e37_79b1_85eb_ca87);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^ (x >> 33)
+    }
+
+    /// The database is in WAL mode (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    pub fn wal_mode(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    /// The log's last committed frame and the frames checkpointed so
+    /// far, in WAL mode (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    pub fn wal_frames(&self) -> Option<(u32, u32)> {
+        self.wal.as_ref().map(|w| (w.mx_frame, w.backfill))
+    }
+
+    /// Whether a page was read since `clear_touched` (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    pub fn touched(&self) -> bool {
+        self.touched
+    }
+
+    /// Start watching for page reads (v0.16, `wal`: at `BEGIN`).
+    #[cfg(feature = "wal")]
+    pub fn clear_touched(&mut self) {
+        self.touched = false;
+    }
+
+    /// Count a read of the database as the pin's first checkpoint
+    /// after entering WAL mode makes one (it opens its log with a
+    /// `PRAGMA table_list`; v0.16, `wal`). Returns whether it did.
+    #[cfg(feature = "wal")]
+    pub fn open_fresh_wal(&mut self) -> bool {
+        let fresh = self.wal_fresh && self.wal.is_some();
+        if fresh {
+            self.touched = true;
+            self.wal_fresh = false;
+        }
+        fresh
+    }
+
+    /// Delete the journal file a WAL-mode transaction used for its
+    /// savepoint area (v0.16, `wal`; best effort: what is left has a
+    /// zero first sector, which no recovery takes for a journal).
+    #[cfg(feature = "wal")]
+    async fn drop_sp_file(&mut self) {
+        if self.sp_file {
+            if let Some(sc) = self.sidecar.as_mut() {
+                let _ = sc.delete().await;
+            }
+            self.sp_file = false;
+        }
+    }
+
+    /// A WAL-mode transaction is over, its frames published or
+    /// forgotten (v0.16, `wal`): the cache keeps its (now clean)
+    /// pages.
+    #[cfg(feature = "wal")]
+    async fn end_txn(&mut self) {
+        for f in self.frames.iter_mut() {
+            f.dirty = false;
+        }
+        self.dirty.clear();
+        self.journaled.clear();
+        self.journal_len = 0;
+        self.spilled = false;
+        self.txn_header = None;
+        self.stage = CommitStage::Idle;
+        self.txn_arena.reset();
+        self.sp_clear();
+        self.drop_sp_file().await;
+    }
+
+    /// The automatic checkpoint after a commit (v0.16, `wal`): a
+    /// PASSIVE one once the log holds `wal_autocheckpoint` frames or
+    /// more, as the pin's default WAL hook runs. Its failure does not
+    /// undo the commit (the pin ignores it too); the frames stay in
+    /// the log for the next checkpoint.
+    #[cfg(feature = "wal")]
+    async fn auto_checkpoint(&mut self) {
+        let n = self.wal_cfg.autocheckpoint;
+        if n > 0 && self.wal.as_ref().is_some_and(|w| w.mx_frame >= n) {
+            let _ = self.checkpoint(Checkpoint::Passive).await;
+        }
+    }
+
+    /// Copy the log's committed frames into the database file
+    /// (v0.16, `wal`; `PRAGMA wal_checkpoint`): the log is synced,
+    /// each page's newest frame not yet copied is written, the file
+    /// is cut to the committed size and synced (`synchronous = OFF`
+    /// skips the syncs). The next write transaction then restarts
+    /// the log; TRUNCATE also empties the `-wal` file now. Returns
+    /// the pin's (log, checkpointed) frame counts, or `None` when
+    /// the database is not in WAL mode. No transaction may be open.
+    #[cfg(feature = "wal")]
+    pub async fn checkpoint(&mut self, mode: Checkpoint) -> Result<Option<(u32, u32)>, S::Error> {
+        if self.stage != CommitStage::Idle {
+            return Err(Error::OperationInFlight);
+        }
+        let sync = self.wal_cfg.sync >= 2;
+        let ps = self.header.page_size as usize;
+        let Some(w) = self.wal.as_mut() else {
+            return Ok(None);
+        };
+        if w.mx_frame > w.backfill {
+            if sync {
+                w.sync().await?;
+            }
+            let mut buf: AVec<u8> = AVec::with_capacity(ps);
+            buf.extend_from_slice(&alloc::vec![0u8; ps]);
+            let (from, n) = (w.backfill, w.n_page);
+            for &(page, frame) in w.committed_frames() {
+                if frame <= from || page > n || page == 0 {
+                    continue;
+                }
+                w.read_page(frame, buf.as_mut_slice()).await?;
+                self.storage
+                    .write_at(u64::from(page - 1) * ps as u64, buf.as_slice())
+                    .await
+                    .map_err(Error::Storage)?;
+            }
+            let want = u64::from(n) * ps as u64;
+            if self.storage.len().await.map_err(Error::Storage)? != want {
+                self.storage.set_len(want).await.map_err(Error::Storage)?;
+            }
+            if sync {
+                self.storage.sync().await.map_err(Error::Storage)?;
+            }
+            w.backfill = w.mx_frame;
+        }
+        if mode == Checkpoint::Truncate && w.backfill == w.mx_frame {
+            w.file.set_len(0).await.map_err(Error::Storage)?;
+            if sync {
+                w.sync().await?;
+            }
+            w.truncated();
+        }
+        Ok(Some((w.mx_frame, w.backfill)))
+    }
+
+    /// VACUUM's image in WAL mode (v0.16, `wal`): every page appended
+    /// to the log as one transaction, whose commit frame says the new
+    /// size; the database file changes only at the next checkpoint.
+    /// The page size cannot change in WAL mode (the caller keeps it).
+    #[cfg(feature = "wal")]
+    async fn replace_image_wal(
+        &mut self,
+        img: &[u8],
+        new_header: DbHeader,
+    ) -> Result<(), S::Error> {
+        let ps = self.header.page_size as usize;
+        if new_header.page_size as usize != ps {
+            return Err(Error::Unsupported);
+        }
+        self.begin_write().await?;
+        let n = new_header.page_count;
+        let r = self.append_image(img, ps, n).await;
+        if let Err(e) = r {
+            let _ = self.rollback().await;
+            return Err(e);
+        }
+        let limit = self.wal_cfg.size_limit;
+        if let Some(w) = self.wal.as_mut() {
+            w.committed(n, limit).await;
+        }
+        self.header = new_header;
+        self.orig_page_count = n;
+        for f in self.frames.iter_mut() {
+            f.page = 0;
+        }
+        self.end_txn().await;
+        self.auto_checkpoint().await;
+        Ok(())
+    }
+
+    /// `replace_image_wal`'s frames, then the log's sync.
+    #[cfg(feature = "wal")]
+    async fn append_image(&mut self, img: &[u8], ps: usize, n: u32) -> Result<(), S::Error> {
+        let sync = self.wal_cfg.sync >= 3;
+        for page in 1..=n {
+            let at = (page as usize - 1) * ps;
+            let chunk = img.get(at..at + ps).ok_or(Error::CorruptPage { page })?;
+            let rand = self.rand64();
+            let commit = if page == n { n } else { 0 };
+            let Some(w) = self.wal.as_mut() else {
+                return Err(Error::OperationInFlight);
+            };
+            w.append(page, chunk, commit, rand, sync).await?;
+        }
+        self.stage = CommitStage::WalSync;
+        if sync && let Some(w) = self.wal.as_mut() {
+            w.sync().await?;
+        }
+        Ok(())
+    }
+
+    /// Write `vals` at page 1's offset `off` (bytes 18 / 19, v0.16
+    /// `wal`) as one rollback-journal transaction of its own, unless
+    /// they are already there.
+    #[cfg(feature = "wal")]
+    async fn set_file_version(&mut self, v: u8) -> Result<(), S::Error> {
+        let i1 = self.load(1).await?;
+        if self.frames[i1].data.get(18..20) == Some(&[v, v][..]) {
+            return Ok(());
+        }
+        let idx = self.dirty_page(1).await?;
+        if let Some(d) = self.frames[idx].data.get_mut(18..20) {
+            d.copy_from_slice(&[v, v]);
+        }
+        if let Err(e) = self.drive_commit().await {
+            let _ = self.rollback().await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Enter WAL mode (v0.16, `wal`; `PRAGMA journal_mode = WAL`):
+    /// page 1's file-format bytes (18, 19) become 2 in a
+    /// rollback-journal transaction, as the pin writes them, then
+    /// writes go to the `-wal` log. A log already beside the file
+    /// held no frames hipp would read (else it opened in WAL mode):
+    /// it is reused from a new generation. No transaction may be
+    /// open; a database another process holds is `DatabaseBusy`.
+    #[cfg(feature = "wal")]
+    pub async fn enter_wal(&mut self) -> Result<(), S::Error> {
+        if self.wal.is_some() {
+            return Ok(());
+        }
+        if self.stage != CommitStage::Idle {
+            return Err(Error::OperationInFlight);
+        }
+        if self.storage.locked_elsewhere() {
+            return Err(Error::DatabaseBusy);
+        }
+        self.set_file_version(2).await?;
+        let sc = self
+            .storage
+            .sidecar(Sidecar::Wal)
+            .await
+            .map_err(Error::Storage)?;
+        let mut w = crate::wal::Wal::recover(sc, self.header.page_size).await?;
+        w.truncated();
+        w.set_page_size(self.header.page_size);
+        self.wal = Some(w);
+        self.wal_fresh = true;
+        Ok(())
+    }
+
+    /// Checkpoint everything, then delete the log and a stale `-shm`
+    /// (v0.16, `wal`), as the pin's last connection does at close
+    /// and on leaving WAL mode. Returns whether the database was in
+    /// WAL mode. On a failure the log stays (and the database stays
+    /// in WAL mode), so nothing committed is lost.
+    #[cfg(feature = "wal")]
+    async fn retire_wal(&mut self) -> Result<bool, S::Error> {
+        if self.checkpoint(Checkpoint::Passive).await?.is_none() {
+            return Ok(false);
+        }
+        let Some(mut w) = self.wal.take() else {
+            return Ok(false);
+        };
+        if let Err(e) = w.file.delete().await {
+            self.wal = Some(w);
+            return Err(Error::Storage(e));
+        }
+        let mut shm = self
+            .storage
+            .sidecar(Sidecar::Shm)
+            .await
+            .map_err(Error::Storage)?;
+        if shm.existed() {
+            shm.delete().await.map_err(Error::Storage)?;
+        }
+        Ok(true)
+    }
+
+    /// Leave WAL mode (v0.16, `wal`; `PRAGMA journal_mode = DELETE`):
+    /// checkpoint, delete the log, then write file-format bytes 1 in
+    /// a rollback-journal transaction, the pin's order — a crash in
+    /// between leaves a complete database still marked WAL, with no
+    /// log. No transaction may be open.
+    #[cfg(feature = "wal")]
+    pub async fn leave_wal(&mut self) -> Result<(), S::Error> {
+        if self.stage != CommitStage::Idle {
+            return Err(Error::OperationInFlight);
+        }
+        if self.retire_wal().await? {
+            self.set_file_version(1).await?;
+        }
+        Ok(())
+    }
+
+    /// Close the database (v0.16, `wal`; `Connection::close`): in WAL
+    /// mode, checkpoint and delete the log as the pin does. Any open
+    /// transaction is rolled back first.
+    #[cfg(feature = "wal")]
+    pub async fn close_wal(&mut self) -> Result<(), S::Error> {
+        if self.stage != CommitStage::Idle {
+            self.rollback().await?;
+        }
+        self.retire_wal().await.map(|_| ())
+    }
+
     /// Page pool bytes (for §4.1 accounting by the session layer).
     pub fn pool_bytes(&self) -> usize {
         self.cache_cap * self.header.page_size as usize
     }
+}
+
+/// Open the database's write-ahead log when it is in WAL mode
+/// (v0.16, `wal`): page 1 says so (bytes 18 / 19 = 2), or a non-empty
+/// `-wal` file sits beside it (the pin then reads it whatever page 1
+/// says). The committed frames' page 1 replaces `probe` and `header`,
+/// whose page count becomes the last commit's size. A database
+/// another process holds is `DatabaseBusy`.
+#[cfg(feature = "wal")]
+async fn open_wal<S: Storage>(
+    storage: &mut S,
+    probe: &mut [u8; 100],
+    header: &mut DbHeader,
+) -> Result<Option<crate::wal::Wal<S::Sidecar>>, S::Error> {
+    let sc = storage
+        .sidecar(Sidecar::Wal)
+        .await
+        .map_err(Error::Storage)?;
+    if probe[18] != 2 && probe[19] != 2 {
+        let len = if sc.existed() {
+            sc.len().await.map_err(Error::Storage)?
+        } else {
+            0
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+    }
+    if storage.locked_elsewhere() {
+        return Err(Error::DatabaseBusy);
+    }
+    let mut w = crate::wal::Wal::recover(sc, header.page_size).await?;
+    if w.mx_frame == 0 {
+        w.set_page_size(header.page_size);
+        return Ok(Some(w));
+    }
+    let ps = w.page_size();
+    if let Some(f) = w.lookup(1) {
+        let mut img: AVec<u8> = AVec::with_capacity(ps as usize);
+        img.extend_from_slice(&alloc::vec![0u8; ps as usize]);
+        w.read_page(f, img.as_mut_slice()).await?;
+        probe.copy_from_slice(img.as_slice().get(..100).ok_or(Error::TruncatedHeader)?);
+    }
+    *header = parse_db_header::<S::Error>(&probe[..], u64::from(w.n_page) * u64::from(ps))?;
+    if header.page_size != ps {
+        return Err(Error::CorruptPage { page: 1 });
+    }
+    header.page_count = w.n_page;
+    Ok(Some(w))
 }
 
 /// Replay a hot rollback journal over the main file (SPEC §5.3.4),
@@ -1602,6 +2227,42 @@ async fn replay_journal<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A WAL header (file-format bytes 18 / 19 = 2) is refused cleanly
+    /// without the `wal` leaf — never read from the possibly stale
+    /// database file — and parsed with it (v0.16).
+    #[test]
+    fn wal_header() {
+        for (w, r) in [(2u8, 2u8), (1, 2), (2, 1)] {
+            let mut p = initial_page1(4096);
+            p[18] = w;
+            p[19] = r;
+            let h = parse_db_header::<()>(&p, 4096);
+            #[cfg(not(feature = "wal"))]
+            assert!(matches!(h, Err(Error::WalUnsupported)), "{w}/{r}");
+            #[cfg(feature = "wal")]
+            assert!(h.is_ok(), "{w}/{r}");
+        }
+    }
+
+    /// Without the `wal` leaf a WAL-mode database is refused at open,
+    /// whatever its `-wal` holds (v0.16).
+    #[cfg(not(feature = "wal"))]
+    #[test]
+    fn wal_database_refused_at_open() {
+        let mut p = initial_page1(4096);
+        p[18] = 2;
+        p[19] = 2;
+        let mem = crate::storage::MemStorage::from_bytes(p);
+        let r = crate::storage::block_on(Pager::open(
+            mem,
+            4,
+            4096,
+            1,
+            Arena::new(crate::error::Scope::Transaction, 1024, 4096),
+        ));
+        assert!(matches!(r, Err(Error::WalUnsupported)));
+    }
 
     /// A UTF-16 header (offset 56 = 2 / 3) is refused cleanly
     /// without the `utf16` leaf — never read as UTF-8 — and opens

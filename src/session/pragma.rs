@@ -46,6 +46,9 @@ pub(super) enum Prag {
     IndexXinfo,
     IntegrityCheck,
     JournalMode,
+    /// `journal_size_limit` (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    JournalSizeLimit,
     PageCount,
     PageSize,
     QuickCheck,
@@ -56,6 +59,12 @@ pub(super) enum Prag {
     TableList,
     TableXinfo,
     UserVersion,
+    /// `wal_autocheckpoint` (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    WalAutocheckpoint,
+    /// `wal_checkpoint [(mode)]` (v0.16, `wal`).
+    #[cfg(feature = "wal")]
+    WalCheckpoint,
 }
 
 const PRAGMAS: &[(&str, Prag)] = &[
@@ -76,6 +85,8 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("index_xinfo", Prag::IndexXinfo),
     ("integrity_check", Prag::IntegrityCheck),
     ("journal_mode", Prag::JournalMode),
+    #[cfg(feature = "wal")]
+    ("journal_size_limit", Prag::JournalSizeLimit),
     ("page_count", Prag::PageCount),
     ("page_size", Prag::PageSize),
     ("quick_check", Prag::QuickCheck),
@@ -86,6 +97,10 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("table_list", Prag::TableList),
     ("table_xinfo", Prag::TableXinfo),
     ("user_version", Prag::UserVersion),
+    #[cfg(feature = "wal")]
+    ("wal_autocheckpoint", Prag::WalAutocheckpoint),
+    #[cfg(feature = "wal")]
+    ("wal_checkpoint", Prag::WalCheckpoint),
 ];
 
 /// The foreign-key pragmas (v0.16, `foreign_keys`; refused without
@@ -132,6 +147,10 @@ impl Prag {
         if self == Prag::DeferForeignKeys {
             return true;
         }
+        #[cfg(feature = "wal")]
+        if self == Prag::WalAutocheckpoint {
+            return true;
+        }
         matches!(
             self,
             Prag::ForeignKeys
@@ -174,6 +193,8 @@ impl Prag {
             #[cfg(feature = "foreign_keys")]
             Prag::ForeignKeyCheck => &["table", "rowid", "parent", "fkid"],
             Prag::DatabaseList => &["seq", "name", "file"],
+            #[cfg(feature = "wal")]
+            Prag::WalCheckpoint => &["busy", "log", "checkpointed"],
             Prag::CollationList => &["seq", "name"],
             _ => &[],
         }
@@ -196,6 +217,25 @@ impl Prag {
             0 => 1,
             n => n,
         }
+    }
+
+    /// No table-valued form on the pin (v0.16).
+    fn no_table(self) -> bool {
+        #[cfg(feature = "wal")]
+        if matches!(self, Prag::WalCheckpoint | Prag::WalAutocheckpoint) {
+            return true;
+        }
+        false
+    }
+
+    /// `journal_size_limit`, whose table-valued form takes a schema
+    /// (v0.16, `wal`).
+    fn sized_journal(self) -> bool {
+        #[cfg(feature = "wal")]
+        if self == Prag::JournalSizeLimit {
+            return true;
+        }
+        false
     }
 
     /// Takes a table / index name argument.
@@ -408,6 +448,50 @@ fn boolean(z: &[u8]) -> bool {
     safety_level(z, true, 0) != 0
 }
 
+/// `p` without its value: the query form.
+fn p_query(p: &PragmaPlan) -> PragmaPlan {
+    PragmaPlan {
+        prag: p.prag,
+        arg: None,
+        numeric: p.numeric,
+        main_only: p.main_only,
+    }
+}
+
+/// The pin's `sqlite3DecOrHexToI64` as `journal_size_limit` reads
+/// it (v0.16, `wal`): `0x` and hex digits (wrapping into 64 bits),
+/// else an optionally signed decimal prefix after leading spaces,
+/// clamped to 64 bits; no digits read as 0.
+#[cfg(feature = "wal")]
+fn atoi64(z: &[u8]) -> i64 {
+    if let Some(h) = z
+        .strip_prefix(b"0x")
+        .or_else(|| z.strip_prefix(b"0X"))
+        .filter(|h| h.first().is_some_and(|c| c.is_ascii_hexdigit()))
+    {
+        let mut u: u64 = 0;
+        for c in h.iter().take_while(|c| c.is_ascii_hexdigit()) {
+            u = (u << 4) | u64::from((*c as char).to_digit(16).unwrap_or(0));
+        }
+        return u as i64;
+    }
+    let mut i = 0;
+    while z.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+        i += 1;
+    }
+    let neg = z.get(i) == Some(&b'-');
+    if matches!(z.get(i), Some(b'-' | b'+')) {
+        i += 1;
+    }
+    let mut v: i128 = 0;
+    while let Some(c) = z.get(i).filter(|c| c.is_ascii_digit()) {
+        v = (v * 10 + i128::from(*c - b'0')).min(i128::from(i64::MAX) + 1);
+        i += 1;
+    }
+    let v = if neg { -v } else { v };
+    v.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
 /// A STRICT column's standard type name for its declaration (the
 /// pin's dequoted token, `record::decl_token`).
 fn std_type(decl: &[u8]) -> &'static [u8] {
@@ -514,6 +598,13 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         }
         let arg = value.map(|h| copy_vec(handle_bytes(arena, h)));
+        // The pin refuses a safety-level change inside a transaction
+        // when the statement is prepared (v0.16 fix).
+        if prag == Some(Prag::Synchronous) && arg.is_some() && self.explicit_txn {
+            return Err(Error::Schema {
+                kind: SchemaKind::SafetyLevelInTransaction,
+            });
+        }
         // A table name — or a number outside 32 bits, which the pin
         // also reads as one (v0.16 fix) — must name a table.
         if let (Some(Prag::IntegrityCheck | Prag::QuickCheck), Some(a)) = (prag, &arg)
@@ -598,10 +689,28 @@ impl<S: Storage> Connection<S> {
                 #[cfg(feature = "utf16")]
                 crate::record::TextEnc::Utf16be => b"UTF-16be",
             })),
+            #[cfg(not(feature = "wal"))]
             Prag::JournalMode => row1(text(b"delete")),
+            #[cfg(feature = "wal")]
+            Prag::JournalMode => row1(text(if self.pager.wal_mode() {
+                b"wal"
+            } else {
+                b"delete"
+            })),
             // hipp syncs the journal before any page moves and
             // the file before the journal goes: FULL.
+            #[cfg(not(feature = "wal"))]
             Prag::Synchronous => row1(int(2)),
+            // The safety level `PRAGMA synchronous` set (v0.16, `wal`).
+            #[cfg(feature = "wal")]
+            Prag::Synchronous => row1(int(i64::from(self.pager.wal_cfg.sync) - 1)),
+            #[cfg(feature = "wal")]
+            Prag::JournalSizeLimit => row1(int(self.pager.wal_cfg.size_limit)),
+            #[cfg(feature = "wal")]
+            Prag::WalAutocheckpoint => row1(int(i64::from(self.pager.wal_cfg.autocheckpoint))),
+            // A checkpoint is run by the statement (`step_pragma`).
+            #[cfg(feature = "wal")]
+            Prag::WalCheckpoint => return Err(Error::Unsupported),
             Prag::CacheSize => row1(int(self.cfg.cache_pages as i64)),
             Prag::BusyTimeout => row1(int(i64::from(self.prag.busy_timeout))),
             Prag::ForeignKeys => row1(int(i64::from(self.prag.foreign_keys))),
@@ -1266,7 +1375,9 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
             return Ok(None);
         };
         let prag = match PRAGMAS.iter().find(|(n, _)| eq_ci(n.as_bytes(), rest)) {
-            Some((_, p)) if *p != Prag::CaseSensitiveLike => *p,
+            // (The pin has no `pragma_wal_checkpoint` /
+            // `pragma_wal_autocheckpoint`, v0.16 `wal`.)
+            Some((_, p)) if *p != Prag::CaseSensitiveLike && !p.no_table() => *p,
             _ => return Ok(None),
         };
         if matches!(prag, Prag::IntegrityCheck | Prag::QuickCheck) {
@@ -1308,7 +1419,8 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
                         | Prag::PageCount
                         | Prag::PageSize
                         | Prag::Synchronous
-                ));
+                )
+                || prag.sized_journal());
         if vals.len() > usize::from(has_arg) + usize::from(has_schema) {
             return Err(Error::Schema {
                 kind: SchemaKind::WrongArgumentCount,
@@ -1563,6 +1675,12 @@ impl<S: Storage> Statement<'_, S> {
         if prag == Prag::ForeignKeyCheck {
             return self.fk_check(&p).await;
         }
+        #[cfg(feature = "wal")]
+        if prag == Prag::WalCheckpoint {
+            return self
+                .wal_checkpoint(p.arg.as_ref().map(|a| a.as_slice()))
+                .await;
+        }
         let Some(arg) = p.arg.as_ref().map(|a| copy_vec(a.as_slice())) else {
             return self.conn.pragma_rows(&self.arena, &p);
         };
@@ -1674,12 +1792,24 @@ impl<S: Storage> Statement<'_, S> {
             }
             Prag::JournalMode => {
                 const MODES: [&str; 6] = ["delete", "persist", "off", "truncate", "memory", "wal"];
-                match MODES.iter().position(|m| eq_ci(m.as_bytes(), arg)) {
+                // The pin takes the first mode the value is a prefix
+                // of, ignoring case (`w` is WAL, `''` DELETE; v0.16
+                // fix: hipp compared whole names).
+                let mode = MODES.iter().position(|m| {
+                    m.len() >= arg.len()
+                        && eq_ci(m.as_bytes().get(..arg.len()).unwrap_or_default(), arg)
+                });
+                match mode {
                     // An unknown mode queries the current one.
-                    None | Some(0) => Ok(row1(text(b"delete"))),
+                    None => self.conn.pragma_rows(&self.arena, &p_query(&p)),
+                    #[cfg(feature = "wal")]
+                    Some(m @ (0 | 5)) => self.set_journal_mode(m == 5, &p).await,
+                    #[cfg(not(feature = "wal"))]
+                    Some(0) => Ok(row1(text(b"delete"))),
                     Some(_) => Err(Error::Unsupported),
                 }
             }
+            #[cfg(not(feature = "wal"))]
             Prag::Synchronous => {
                 let level = (u32::from(safety_level(arg, false, 1)) + 1) & 7;
                 let level = if level == 0 { 1 } else { level };
@@ -1689,6 +1819,25 @@ impl<S: Storage> Statement<'_, S> {
                     // hipp always syncs as FULL does.
                     Err(Error::Unsupported)
                 }
+            }
+            // Any safety level (v0.16, `wal`): OFF skips every sync,
+            // NORMAL syncs a WAL-mode log only at checkpoints, FULL
+            // and EXTRA at every commit (`pager::WalCfg::sync`).
+            #[cfg(feature = "wal")]
+            Prag::Synchronous => {
+                let level = (safety_level(arg, false, 1).wrapping_add(1)) & 7;
+                self.conn.pager.wal_cfg.sync = if level == 0 { 1 } else { level };
+                Ok(AVec::new())
+            }
+            #[cfg(feature = "wal")]
+            Prag::WalAutocheckpoint => {
+                self.conn.pager.wal_cfg.autocheckpoint = atoi(arg).max(0) as u32;
+                self.conn.pragma_rows(&self.arena, &p)
+            }
+            #[cfg(feature = "wal")]
+            Prag::JournalSizeLimit => {
+                self.conn.pager.wal_cfg.size_limit = atoi64(arg).max(-1);
+                self.conn.pragma_rows(&self.arena, &p)
             }
             Prag::CacheSize => {
                 if i64::from(atoi(arg)) == self.conn.cfg.cache_pages as i64 {
@@ -3048,4 +3197,70 @@ async fn bt_check<S: Storage>(
         }
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------
+// WAL mode (v0.16, `wal`).
+// ----------------------------------------------------------------
+
+#[cfg(feature = "wal")]
+impl<S: Storage> Statement<'_, S> {
+    /// `PRAGMA journal_mode = WAL | DELETE` (v0.16, `wal`), as the
+    /// pin's `OP_JournalMode` decides: no change once the open
+    /// transaction has written (the current mode is reported), "cannot
+    /// change into / out of wal mode from within a transaction" in an
+    /// explicit one that has not, else the switch (`Pager::enter_wal`
+    /// / `leave_wal`). Reports the mode in force after it.
+    async fn set_journal_mode(&mut self, wal: bool, p: &PragmaPlan) -> Result<Rows, S::Error> {
+        // The TEMP database never enters WAL mode (the pin's temporary
+        // storage): the request reports its mode.
+        if wal != self.conn.pager.wal_mode() && !self.conn.pager.in_txn() && !self.conn.is_temp {
+            if self.conn.explicit_txn {
+                return Err(Error::Schema {
+                    kind: SchemaKind::WalModeInTransaction,
+                });
+            }
+            if wal {
+                self.conn.pager.enter_wal().await?;
+            } else {
+                self.conn.pager.leave_wal().await?;
+            }
+        }
+        self.conn.pragma_rows(&self.arena, &p_query(p))
+    }
+
+    /// `PRAGMA wal_checkpoint [(PASSIVE | FULL | RESTART | TRUNCATE |
+    /// NOOP)]` (v0.16, `wal`; any other value is PASSIVE): the pin's
+    /// row `busy | log | checkpointed` — hipp is the file's only
+    /// process, so never busy; `0 | -1 | -1` outside WAL mode. A
+    /// transaction that has read or written the database refuses it
+    /// (the pin's "database table is locked"), in either mode.
+    async fn wal_checkpoint(&mut self, arg: Option<&[u8]>) -> Result<Rows, S::Error> {
+        use crate::pager::Checkpoint;
+        let is = |w: &[u8]| arg.is_some_and(|a| eq_ci(a, w));
+        if self.conn.pager.in_txn() || (self.conn.explicit_txn && self.conn.pager.touched()) {
+            return Err(Error::Schema {
+                kind: SchemaKind::CheckpointLocked,
+            });
+        }
+        let r = if is(b"noop") {
+            self.conn.pager.wal_frames()
+        } else {
+            let mode = if is(b"full") {
+                Checkpoint::Full
+            } else if is(b"restart") {
+                Checkpoint::Restart
+            } else if is(b"truncate") {
+                Checkpoint::Truncate
+            } else {
+                Checkpoint::Passive
+            };
+            self.conn.pager.checkpoint(mode).await?
+        };
+        self.conn.pager.open_fresh_wal();
+        let (log, done) = r.map_or((-1, -1), |(a, b)| (i64::from(a), i64::from(b)));
+        let mut rows = AVec::new();
+        push_row(&mut rows, &[int(0), int(log), int(done)]);
+        Ok(rows)
+    }
 }
