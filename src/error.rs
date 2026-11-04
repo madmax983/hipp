@@ -201,8 +201,21 @@ pub enum SchemaKind {
     /// generated columns"; also in an index expression or a partial
     /// index's WHERE, v0.16 `expr_index`). Compute the value on
     /// INSERT instead.
+    ///
+    /// v0.16 (`datetime`): also a date and time function that would
+    /// read the clock (`'now'`, no time value) or the time zone
+    /// (`'localtime'`, `'utc'`) inside a CHECK constraint, an index
+    /// expression or a generated column (the pin's
+    /// "non-deterministic use of date() in a CHECK constraint").
+    /// Pass the instant as a value instead.
     #[cfg(feature = "v16")]
     NonDeterministic,
+    /// `'localtime'` / `'utc'` asked the time-zone hook
+    /// (`Config::tz_offset`) for an instant it could not convert
+    /// (v0.16, `datetime`; the pin's "local time unavailable").
+    /// Supply a hook that knows the zone, or none for UTC.
+    #[cfg(feature = "datetime")]
+    LocalTimeUnavailable,
     /// A subquery inside an index expression or a partial index's
     /// WHERE (v0.16, `expr_index`; the pin's "subqueries prohibited
     /// in index expressions / partial index WHERE clauses"). Index

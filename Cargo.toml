@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -275,6 +275,23 @@ utf16 = ["v16"]
 # never read stale. Builds on the v0.16 PRAGMA and savepoint
 # machinery, so it implies `v16`. The tiny profile excludes it per §2.
 wal = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: in `max`; see STATUS.md for why not
+# `full`): the date and time functions -- date(), time(),
+# datetime(), julianday(), unixepoch(), strftime() (every
+# conversion the pin knows), timediff() and CURRENT_DATE /
+# CURRENT_TIME / CURRENT_TIMESTAMP in any expression -- as a model
+# of the pin's date.c: its integer-millisecond Julian day, every
+# time-value form and modifier (NNN units, +/-YYYY-MM-DD HH:MM,
+# start of / end of, weekday [-]N, unixepoch, julianday, auto,
+# localtime, utc, subsec, ceiling / floor) in its order and with
+# its rounding. 'now' reads `Config::clock` once per statement;
+# 'localtime' / 'utc' read `Config::tz_offset` (UTC without one;
+# the system clock and zone under `std`). Builds on the v0.16
+# function library (printf's REAL conversions), so it implies
+# `v16`. Without it the functions are unknown (the pin's "no such
+# function"), never wrong; DEFAULT CURRENT_* still works. The
+# tiny profile excludes it per §2.
+datetime = ["v16"]
 
 [dependencies]
 

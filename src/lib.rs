@@ -19,6 +19,8 @@ pub mod agg;
 #[allow(unsafe_code)] // the bounded arena exception (SPEC §6)
 pub mod arena;
 pub mod btree;
+#[cfg(feature = "datetime")]
+pub mod datetime;
 pub mod error;
 #[cfg(feature = "v16")]
 pub mod func;
@@ -37,6 +39,8 @@ pub mod session;
 pub mod sql;
 #[allow(unsafe_code)] // no-op waker construction for block_on only
 pub mod storage;
+#[cfg(feature = "std")]
+pub mod systime;
 #[cfg(feature = "utf16")]
 pub mod utf16;
 #[cfg(feature = "wal")]

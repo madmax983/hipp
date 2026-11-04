@@ -287,6 +287,9 @@ impl TableRules {
                     Some(env) => Ctx::of(&rd).with(env),
                     None => Ctx::of(&rd),
                 };
+                // A CHECK is "pure" for the date and time functions.
+                #[cfg(feature = "datetime")]
+                let ctx = ctx.pure();
                 // AND / OR stop early, as the pin's jump code
                 // (`query::cond_false`; v0.16 review fix).
                 if crate::query::cond_false::<E>(c, &ctx)? {
@@ -779,12 +782,23 @@ pub fn has_big_hex<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<bool, E
     Ok(expr_any(&e, &mut |x| matches!(x, Expr::HexTooBig(_))))
 }
 
-/// The wall-clock keyword names, the pseudo-columns a DEFAULT
-/// expression resolves them as.
-const CTIME: [&[u8]; 3] = [b"current_time", b"current_date", b"current_timestamp"];
+/// The wall-clock pseudo-columns a DEFAULT expression resolves
+/// the CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP keywords
+/// as (without the `datetime` leaf, which evaluates them as
+/// functions). The keyword parses as a call; its column name
+/// starts with a NUL, which no real (or quoted) column name holds,
+/// so a table's own "current_date" column never stands in for it
+/// (v0.16 fix).
+const CTIME: [&[u8]; 3] = [b"\0current_time", b"\0current_date", b"\0current_timestamp"];
 
-fn is_ctime(name: &[u8]) -> bool {
-    CTIME.iter().any(|c| eq_ci(c, name))
+/// The pseudo-column a wall-clock keyword (a call of no
+/// arguments named `current_time`, ...) reads (v0.16).
+#[cfg(not(feature = "datetime"))]
+pub fn ctime_column(name: &[u8]) -> Option<&'static [u8]> {
+    CTIME
+        .iter()
+        .find(|c| c.get(1..).is_some_and(|n| eq_ci(n, name)))
+        .copied()
 }
 
 /// CREATE TABLE's DEFAULT check (v0.16; the pin's "default value
@@ -794,10 +808,9 @@ fn is_ctime(name: &[u8]) -> bool {
 /// that needs the default.
 pub fn check_default_const<E>(text: &[u8], arena: &Arena, lim: Limits) -> Result<(), E> {
     let e = parse_rule::<E>(text, arena, lim)?;
+    // The clock keywords parse as calls (v0.16): any column
+    // reference is one to a table.
     let bad = expr_any(&e, &mut |x| match x {
-        Expr::Column {
-            table: None, name, ..
-        } => !is_ctime(crate::sql::handle_bytes(arena, *name)),
         Expr::Column { .. }
         | Expr::ScalarSubquery(_)
         | Expr::ExistsSubquery(_)
@@ -1233,5 +1246,79 @@ pub fn compound_affinity<'p>(
         Affinity::Numeric
     } else {
         aff
+    }
+}
+
+/// The clock keywords with and without the `datetime` leaf (v0.16;
+/// run by `cargo test --lib` for `full`, which lacks the leaf, and
+/// for `max`, which has it).
+#[cfg(all(test, feature = "v16"))]
+mod clock_tests {
+    use crate::session::{Config, Connection, Step};
+    use crate::storage::{MemStorage, block_on};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    fn fixed() -> i64 {
+        1_700_000_000_123
+    }
+
+    async fn rows(db: &mut Connection<MemStorage>, sql: &str) -> Option<Vec<String>> {
+        let mut q = db.prepare(sql).await.ok()?;
+        let mut out = Vec::new();
+        while q.step().await.ok()? == Step::Row {
+            let mut line = String::new();
+            for i in 0..q.column_count() {
+                if i > 0 {
+                    line.push('|');
+                }
+                match q.column_value(i) {
+                    Some(crate::Value::Text(b)) => {
+                        line.push_str(core::str::from_utf8(b).unwrap_or("?"))
+                    }
+                    Some(crate::Value::Integer(v)) => {
+                        let mut t = crate::arena::AVec::new();
+                        crate::record::render_int(v, &mut t);
+                        line.push_str(core::str::from_utf8(t.as_slice()).unwrap_or("?"));
+                    }
+                    _ => line.push('?'),
+                }
+            }
+            out.push(line);
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn clock_keywords() {
+        block_on(async {
+            let cfg = Config::default().clock(fixed);
+            let mut db = Connection::open(MemStorage::new(), cfg)
+                .await
+                .unwrap_or_else(|_| panic!("open"));
+            let setup = [
+                "CREATE TABLE t(\"current_date\", a DEFAULT CURRENT_TIMESTAMP, \
+                 b DEFAULT (CURRENT_DATE || 'x'), c DEFAULT current_time)",
+                "INSERT INTO t(\"current_date\") VALUES (5)",
+            ];
+            for s in setup {
+                assert!(rows(&mut db, s).await.is_some(), "{s}");
+            }
+            let got = rows(&mut db, "SELECT a, b, c FROM t").await;
+            assert_eq!(
+                got.as_deref(),
+                Some(&[String::from("2023-11-14 22:13:20|2023-11-14x|22:13:20")][..])
+            );
+            // The bare keyword never reads the table's column.
+            let kw = rows(&mut db, "SELECT current_date FROM t").await;
+            #[cfg(feature = "datetime")]
+            assert_eq!(kw.as_deref(), Some(&[String::from("2023-11-14")][..]));
+            #[cfg(not(feature = "datetime"))]
+            assert_eq!(kw, None);
+            let q = rows(&mut db, "SELECT \"current_date\" FROM t").await;
+            assert_eq!(q.as_deref(), Some(&[String::from("5")][..]));
+            // `current_date()` is a syntax error, as on the pin.
+            assert_eq!(rows(&mut db, "SELECT current_date()").await, None);
+        });
     }
 }

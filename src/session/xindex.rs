@@ -211,6 +211,9 @@ pub(super) fn ext_key<E>(
         Some(env) => Ctx::of(&rd).with(env),
         None => Ctx::of(&rd),
     };
+    // Index expressions are "pure" for the date and time functions.
+    #[cfg(feature = "datetime")]
+    let ctx = ctx.pure();
     if let Some(p) = &x.pred
         && !crate::query::cond::<E>(p, &ctx)?
     {

@@ -6517,6 +6517,181 @@ then the conversion). `hipp-cli/tests/cli_v16_gaps.rs`:
 - `PRAGMA table_info` of a TEMP view over main tables still fails
   (above).
 
+### Date and time functions (2026-11-04)
+
+**Shipped** (leaf `datetime`, requires `v16`; in `max`, not `full`):
+
+- `date()`, `time()`, `datetime()`, `julianday()`, `unixepoch()`,
+  `strftime()`, `timediff()` and the `CURRENT_DATE` / `CURRENT_TIME`
+  / `CURRENT_TIMESTAMP` keywords in any expression (`src/datetime.rs`).
+  The engine is a model of the pin's `date.c`: its `DateTime` record
+  (integer-millisecond Julian day `iJD` plus civil fields, each half
+  valid or not, the raw-number, error, subsec, UTC and local flags,
+  the `floor` day count), every parser, modifier and formatter
+  updating those fields in the pin's order with C's truncating
+  integer division / remainder, `core` `f64` only (sums, products,
+  quotients: IEEE-identical), and x86-64's float-to-integer
+  conversion (NaN / out of range is the "integer indefinite"). The
+  `%f` / `%J` / subsec `%s` / `timediff` seconds go through
+  `func::printf`'s pin-fitted `%06.3f` / `%.16g` / `%.3f`; julianday()
+  is a REAL rendered by `record::render_real`. The engine is not
+  generic over the storage error (one instantiation).
+- Time values: `[-]YYYY-MM-DD`, then spaces or `T`s, `HH:MM[:SS[.F]]`
+  (fraction truncated at .999, rounded below), `[+-]HH:MM` / `Z`
+  zones, bare times (2000-01-01), numbers (Julian day when in
+  0..5373484.5; `'unixepoch'` / `'auto'` / `'julianday'` as the first
+  modifier), numeric text (the pin's whole-text `sqlite3AtoF`),
+  `'now'`, `'subsec'` / `'subsecond'` as a value; BLOBs read as text,
+  a NUL ends any text.
+- Modifiers: `NNN days|hours|minutes|seconds|months|years` (signed,
+  fractional, the `float` limits, months / years through the
+  day-of-month overflow and its `nFloor`), `[+-]YYYY-MM-DD[ HH:MM[:SS[.F]]]`,
+  `[+-]HH:MM[:SS[.F]]`, `start of day|month|year`, 3.54's
+  `end of day|month|year`, `weekday N` and 3.54's backward
+  `weekday -N`, `unixepoch`, `julianday`, `auto`, `localtime`,
+  `utc` (the pin's four-guess inversion), `subsec` / `subsecond`,
+  `ceiling`, `floor`.
+- `Config::clock` (existing) is now read by `'now'` too; under `std`
+  `Config::default()` supplies the system clock (`systime::now_ms`;
+  it used to be `None`, so `Config::default().no_clock()` is the new
+  way to say "no clock"). The statement's instant is cached in
+  `query::Env` and owned by one statement from its prepare (whose
+  plan may read it for a DEFAULT) through its execution, trigger and
+  foreign-key programs included; another statement running in
+  between, or `Statement::reset`, makes the next read fresh
+  (`Env::claim_clock` / `own_clock` / `release_clock`).
+- New `Config::tz_offset: Option<TzOffset>` (`fn(i64) -> Option<i64>`:
+  Unix seconds → seconds east of UTC; `None` result is
+  `SchemaKind::LocalTimeUnavailable`, the pin's "local time
+  unavailable"). No hook is UTC (the `no_std` default); under `std`
+  the default is `systime::local_offset`, which reads `TZ` as glibc
+  does: unset → `/etc/localtime`, empty → UTC, a leading `:` dropped,
+  a TZif file under `$TZDIR` or `/usr/share/zoneinfo` (64-bit data,
+  the first standard type before the first transition, the footer
+  POSIX rule at or after the last), else a POSIX TZ string (`Jn`,
+  `n`, `Mm.w.d`, `/time` up to ±167 h, southern-hemisphere rules; a
+  daylight name without rules takes M3.2.0,M11.1.0), else UTC. The
+  hook is asked, as the pin asks `localtime_r`, only about instants
+  in 1970-01-01 .. 2038-01-18: others are moved to the year of the
+  same leap phase in 1997..2003 and back. The CLI dropped its own
+  clock and uses the defaults.
+- "Pure" contexts: a CHECK constraint, an index expression or a
+  partial index's WHERE (`Ctx::pure`) and a generated column (no
+  connection state) fail the statement with
+  `SchemaKind::NonDeterministic` when a date function reads the
+  clock (`'now'`, no arguments, `'subsec'` as the value) or the zone
+  (`'localtime'`, `'utc'`), as the pin's `sqlite3NotPureFunc` does;
+  the CURRENT_* keywords are non-deterministic functions there
+  (refused in generated columns and indexes at CREATE, allowed in a
+  CHECK).
+- Ungated (every profile with the parser): an unquoted `CURRENT_TIME`
+  / `CURRENT_DATE` / `CURRENT_TIMESTAMP` parses as a call of no
+  arguments (the pin's `CTIME_KW`), so a table's own quoted
+  `"current_date"` column no longer stands in for the bare keyword
+  (a silent wrong answer: `SELECT current_date = 5 FROM x` was 1),
+  and `current_date()` is a syntax error. Without the leaf the call
+  resolves to the DEFAULT clock pseudo-columns (renamed with a
+  leading NUL, which no column name holds) and is "no such function"
+  anywhere else; DEFAULT CURRENT_* keeps working (lib test
+  `rules::clock_tests` runs in both `full` and `max`).
+
+**Oracle-probing notes** (all on the live 3.54.1 pin; the binary's
+strings listed the modifier names, which is how `end of ` was found):
+
+- 3.54.1 knows no `%y` (NULL, as every unknown conversion and a
+  trailing `%`); the known set is `d e f F G g H I j J k l m M p P R
+  s S T u U V w W Y %`. `%J` is `%.16g`; `%Y` of year -12 is `-012`.
+- New in 3.54 against the 3.4x code: `end of day|month|year` (23:59:59.999;
+  month end resets the floor count, year end does not, on a raw number
+  it is NULL); `weekday -N` (back to the latest such weekday, a no-op
+  on one; `-0` is backward Sunday, ±7 and fractions NULL); hour 24 only
+  as exactly `24:00:00[.000]`, normalised to the next midnight when a
+  date is given (at parse) or when the Julian day is computed — so
+  `datetime('24:00', 'start of day')` is still 2000-01-01; an explicit
+  `+00:00` / `-00:00` zone marks the value UTC (`'utc'` is then a
+  no-op) while a non-zero one does so only once applied
+  (`datetime('12:00+01:00', 'utc')` in New York is 16:00).
+- Quirks reproduced: a value made invalid by a modifier and then
+  `'localtime'`'d comes back (the error flag is cleared): year 2000 if
+  the error came from the year range, year 0 if from the Julian-day
+  range, its negative milliseconds printed as `'0' + digit`
+  punctuation (`00.,''`); day-of-month overflow survives `start of
+  day` (`2001-02-31 00:00:00`) and a lone YYYY-MM-DD with day > 28 is
+  normalised; a fraction of 400 digits is NaN and the date NULL; a
+  `[+-]YYYY-MM-DD HH:MM` modifier negates its time too;
+  `'+24:00'` adds nothing (the time-of-day is taken modulo a day).
+- 'now' is stable per `sqlite3_step` on the pin (re-read when a step
+  starts); `SELECT current_date()` is a syntax error; `timediff` with
+  other than two arguments is a prepare-time error.
+
+**Tests:** `tests/datetime_v16.rs` (11 tests): a fixed corpus of ~400
+expressions (every form, modifier and conversion, the boundaries,
+quirks and a regression case per bug found while fitting: hour 24,
+zero-offset UTC, NaN fractions, the backward weekday, `end of`, `%y`)
+and a generated corpus (xorshift64: random values in all input forms,
+edge years, leap days, negative / huge Julian days, fractional seconds,
+random modifier chains, random strftime formats; 6,000 cases in UTC
+and 2,500 in each other zone, `HIPP_DATETIME_CORPUS` scales it —
+160,000 ran clean once) and a DST corpus (3,000 instants around the
+transitions and outside 1970..2037 through localtime / utc chains),
+each byte-compared as `quote()` against the pin in UTC,
+America/New_York, Asia/Kolkata and Australia/Lord_Howe (pin under
+`TZ`, hipp through `systime::zone_offset`); 'now' against the pin's
+value for the clock's instant; a ticking clock read once per
+statement (DEFAULTs, a trigger, a multi-row INSERT, re-execution);
+`NoClock`; `LocalTimeUnavailable`; the pure contexts, the keywords
+vs a `"current_date"` column, timediff's arity and a UTF-16 database
+as statement scripts on both engines (success / failure and results
+must agree, the pin checks hipp's file). `hipp-cli/tests/cli_v16_datetime.rs`:
+a rendering batch (with CURRENT_* defaults, a date CHECK and a date
+index) and a 400-statement generated batch, byte-identical one-shot
+and over stdin in UTC, New York and Kolkata (the CLI reads `TZ`
+itself). Ad-hoc fuzzing while fitting also covered Sao_Paulo,
+Chatham, Casablanca, Godthab, Gaza, `EST5EDT`, `XYZ-5:30`, a
+`M3.5.0/-2` rule, `:Europe/Paris`, empty and unknown `TZ` (all clean).
+`tests/indexes.rs` now uses `unistr_quote()` as its function hipp
+lacks (it used `date()`); `tests/table_defs_v16.rs` asks for
+`no_clock()` where it tests `NoClock`.
+
+**Gates:** `cargo fmt --all`, then the full `ci/local-gates.sh` run
+ends with "==> all gates passed". (One earlier run failed
+`views_cte_v16::shared_materializations` on a `random() % 1000`
+collision on the pin's side — a pre-existing flake, unrelated; it
+passed on rerun.)
+
+**Size:** tiny **76,960 B** (Δ **0**). Full **498,880 B** (Δ **+424 B**
+vs 498,456, ratchet raised; the ungated keyword fix: the parser's call
+node and the pseudo-column resolution). Max **765,344 B** (Δ
+**+15,856 B** vs 749,488, ratchet raised): the leaf is about 15.4 KB
+on thumbv7em (soft double arithmetic, the modifier parser and the
+formatters). **`full` decision:** `full` with `datetime` measures
+518,192 B, over the 512,000 B line, so the leaf stays in `max` only
+(ADR 0002).
+
+**Honest gaps:**
+
+- 'now' is read once per statement execution, where the pin re-reads
+  it at each `sqlite3_step`: a streaming SELECT that crosses a
+  millisecond shows one instant on hipp and possibly several on the
+  pin. A statement prepared before another statement runs reads the
+  clock again at its first step (plan-time DEFAULTs keep the value
+  read at prepare). Without `params` an INSERT's DEFAULTs are
+  evaluated at prepare (as before). The TEMP database's connection
+  has its own cache, so a statement mixing main and temp can see two
+  instants.
+- The zone hook gives an offset only; the pin's `localtime_r` also
+  knows leap-second ("right/") zones, whose `tm_sec` can be 60 —
+  `systime` ignores TZif leap records. A POSIX TZ string with a
+  daylight name and no rules uses the US rules, where glibc consults
+  the `posixrules` file (identical for 2007..2037). `systime` reads
+  the zone file on every conversion (no global cache by design).
+- The pin's "non-deterministic use of date() in ..." message is
+  `SchemaKind::NonDeterministic` (the same kind as the CREATE-time
+  refusal); in a generated column a date function that needs the
+  clock and has no connection state reports the same.
+- Not in `full` (above); without the leaf, `SELECT current_date`
+  is refused rather than answered.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

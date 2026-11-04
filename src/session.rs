@@ -105,11 +105,26 @@ pub struct Config {
     /// The wall clock (v0.16): a caller-supplied function
     /// returning the current Unix time in milliseconds, read by
     /// `DEFAULT CURRENT_TIME` / `CURRENT_DATE` /
-    /// `CURRENT_TIMESTAMP` (at most once per statement). The
-    /// core has no clock of its own; with `None` a statement
-    /// that needs one fails with `Error::NoClock`.
+    /// `CURRENT_TIMESTAMP` (at most once per statement) and, with
+    /// `datetime`, by `'now'` and the `CURRENT_*` keywords in any
+    /// expression (once per statement execution, shared by all of
+    /// them, as the pin's `sqlite3StmtCurrentTime`). The core has
+    /// no clock of its own; with `None` a statement that needs one
+    /// fails with `Error::NoClock`. Under `std`, `Config::default()`
+    /// supplies the system clock (`systime::now_ms`).
     #[cfg(feature = "v04")]
     pub clock: Option<fn() -> i64>,
+    /// The time zone (v0.16, `datetime`): the offset east of UTC,
+    /// in seconds, at an instant given in Unix seconds — what the
+    /// `'localtime'` and `'utc'` modifiers convert by (the pin asks
+    /// `localtime_r`; it does so for instants in 1970..2038 only,
+    /// and so is this hook asked). `None` is UTC. Under `std`,
+    /// `Config::default()` supplies the process's zone
+    /// (`systime::local_offset`, which reads `TZ` as the C library
+    /// does). A hook returning `None` fails the statement with
+    /// `SchemaKind::LocalTimeUnavailable`.
+    #[cfg(feature = "datetime")]
+    pub tz_offset: Option<crate::datetime::TzOffset>,
     /// The `VACUUM INTO 'file'` writer (v0.16, `v16`): called with
     /// the file name as written and the finished database image,
     /// it creates the file and returns `true`, or returns `false`
@@ -206,8 +221,14 @@ impl Default for Config {
             catalog_init: 16 * 1024,
             catalog_max: 256 * 1024,
             nonce_seed: 0x6869_7070_5eed_0001,
-            #[cfg(feature = "v04")]
+            #[cfg(all(feature = "v04", feature = "std"))]
+            clock: Some(crate::systime::now_ms),
+            #[cfg(all(feature = "v04", not(feature = "std")))]
             clock: None,
+            #[cfg(all(feature = "datetime", feature = "std"))]
+            tz_offset: Some(crate::systime::local_offset),
+            #[cfg(all(feature = "datetime", not(feature = "std")))]
+            tz_offset: None,
             #[cfg(all(feature = "v16", feature = "std"))]
             vacuum_into: Some(crate::storage::write_new_file),
             #[cfg(all(feature = "v16", not(feature = "std")))]
@@ -288,6 +309,8 @@ impl Config {
             nonce_seed: 0x6869_7070_5eed_0001,
             #[cfg(feature = "v04")]
             clock: None,
+            #[cfg(feature = "datetime")]
+            tz_offset: None,
             #[cfg(feature = "v16")]
             vacuum_into: None,
             #[cfg(feature = "v16")]
@@ -392,6 +415,20 @@ impl Config {
     #[cfg(feature = "v04")]
     pub fn clock(mut self, now: fn() -> i64) -> Config {
         self.clock = Some(now);
+        self
+    }
+    /// Remove the wall clock (v0.16): statements that need it fail
+    /// with `Error::NoClock` (the `no_std` default).
+    #[cfg(feature = "v04")]
+    pub fn no_clock(mut self) -> Config {
+        self.clock = None;
+        self
+    }
+    /// Supply the time zone (v0.16, `datetime`; see the
+    /// `tz_offset` field). `None` is UTC.
+    #[cfg(feature = "datetime")]
+    pub fn tz_offset(mut self, zone: Option<crate::datetime::TzOffset>) -> Config {
+        self.tz_offset = zone;
         self
     }
     /// Supply the `VACUUM INTO` writer (v0.16, `v16`; see the
@@ -1294,6 +1331,11 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(feature = "utf16")]
         conn.set_text_enc(conn.pager.text_enc());
+        #[cfg(feature = "datetime")]
+        {
+            conn.env.clock = conn.cfg.clock;
+            conn.env.tz = conn.cfg.tz_offset;
+        }
         conn.rebuild_catalog().await?;
         Ok(conn)
     }
@@ -1342,6 +1384,9 @@ impl<S: Storage> Connection<S> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
         }
+        // A new statement reads the clock afresh (v0.16, `datetime`).
+        #[cfg(feature = "datetime")]
+        let clock_id = self.env.claim_clock();
         if self.pager.schema_cookie() != self.catalog.cookie {
             self.rebuild_catalog().await?;
         }
@@ -1416,6 +1461,8 @@ impl<S: Storage> Connection<S> {
         };
         let row_ckpt = arena.checkpoint();
         Ok(Statement {
+            #[cfg(feature = "datetime")]
+            clock_id,
             #[cfg(feature = "params")]
             binds,
             conn: self,
@@ -5466,6 +5513,10 @@ fn binding_dependent<E>(e: &Error<E>) -> bool {
 }
 
 pub struct Statement<'c, S: Storage> {
+    /// The statement's claim on the connection's clock cache
+    /// (v0.16, `datetime`; `query::Env::claim_clock`).
+    #[cfg(feature = "datetime")]
+    clock_id: u64,
     #[cfg(feature = "params")]
     binds: Binds,
     conn: &'c mut Connection<S>,
@@ -6290,6 +6341,9 @@ impl<'c, S: Storage> Statement<'c, S> {
     ) -> Statement<'c, S> {
         let row_ckpt = arena.checkpoint();
         Statement {
+            // A program's statements share their trigger's instant.
+            #[cfg(feature = "datetime")]
+            clock_id: conn.env.now_owner.get(),
             #[cfg(feature = "params")]
             binds,
             conn,
@@ -6383,6 +6437,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         // only its own.
         #[cfg(feature = "json")]
         let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
+        // The statement's instant (v0.16, `datetime`): kept while
+        // this statement owns the clock cache — from its prepare
+        // (whose plan may read it for a DEFAULT) through its
+        // execution, trigger programs included — and read afresh
+        // once another statement has run in between.
+        #[cfg(feature = "datetime")]
+        self.conn.env.own_clock(self.clock_id);
         #[cfg(feature = "params")]
         if !self.binds.started {
             self.replan().await?;
@@ -6727,6 +6788,9 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// undone. Bindings may change only while reset.
     #[cfg(feature = "params")]
     pub fn reset(&mut self) {
+        // The next execution reads the clock afresh (v0.16).
+        #[cfg(feature = "datetime")]
+        self.conn.env.release_clock(self.clock_id);
         self.binds.started = false;
         self.binds.stale = true;
         self.phase = Phase::Fresh;

@@ -3548,6 +3548,33 @@ impl<'a> Parser<'a> {
                 if self.cur_is_kw(b"CASE") {
                     return self.expr_case::<E>();
                 }
+                // CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP
+                // (v0.16, ungated): the pin's CTIME_KW, a call of
+                // the function of that name — never a column (a
+                // table's quoted "current_date" column is not what
+                // the bare keyword reads), and never written with
+                // parentheses.
+                if !quoted && is_ctime_kw(handle_bytes(self.arena, h)) {
+                    match self.toks.as_slice().get(self.pos + 1) {
+                        Some(t) if matches!(t.tok, Tok::LParen) => {
+                            return Err(perr(t.offset, ParseKind::UnexpectedToken));
+                        }
+                        Some(t) if matches!(t.tok, Tok::Dot) => {}
+                        _ => {
+                            self.pos += 1;
+                            self.need::<E>(1)?;
+                            self.set_h::<E>(1, EK_CONST)?;
+                            return Ok(Expr::Func {
+                                name: h,
+                                distinct: false,
+                                star: false,
+                                args: AVec::new(),
+                                #[cfg(feature = "v16")]
+                                clause: None,
+                            });
+                        }
+                    }
+                }
                 // Function call: ident followed by '('.
                 if !quoted
                     && matches!(
@@ -3620,12 +3647,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.need::<E>(1)?;
-        let k = if is_ctime_kw(handle_bytes(self.arena, h)) {
-            EK_CONST
-        } else {
-            0
-        };
-        self.set_h::<E>(1, k)?;
+        self.set_h::<E>(1, 0)?;
         Ok(Expr::Column {
             table: None,
             name: h,

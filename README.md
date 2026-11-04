@@ -740,6 +740,29 @@ aspirations.
   part of CHECK / partial-index names as the pin does, and tell
   `main.t` from `temp.t` in one statement. Gaps and sizes in
   STATUS.md.
+- **Date and time functions** (leaf `datetime`, in `max`; too big
+  for `full`'s budget). `date()`, `time()`, `datetime()`,
+  `julianday()`, `unixepoch()`, `strftime()` (every conversion the
+  pin knows; `%y` and the other unknown ones are NULL, as on
+  3.54.1), `timediff()` and `CURRENT_DATE` / `CURRENT_TIME` /
+  `CURRENT_TIMESTAMP` in any expression, as a model of the pin's
+  `date.c`: its integer-millisecond Julian day, every time-value
+  form (`YYYY-MM-DD`, `T` or spaces, `HH:MM[:SS[.F]]`, zones,
+  `24:00`, Julian-day and Unix numbers, `'now'`), every modifier
+  in its order and rounding (NNN units with the month / year
+  overflow rules, `+/-YYYY-MM-DD HH:MM`, `start of` / 3.54's `end
+  of`, `weekday N` and 3.54's backward `weekday -N`, `unixepoch`,
+  `julianday`, `auto`, `localtime`, `utc`, `subsec`, `ceiling` /
+  `floor`), byte for byte on a generated corpus in four time zones.
+  `'now'` reads `Config::clock` once per statement execution;
+  `'localtime'` / `'utc'` read the new `Config::tz_offset` hook (UTC
+  without one); under `std` both default to the system clock and
+  the `TZ` zone, read as the C library reads it (TZif files and
+  POSIX rules, no dependency). In a CHECK, index expression or
+  generated column, reading either fails as on the pin. Ungated:
+  the bare keywords are calls, never a table's own "current_date"
+  column (they used to resolve as one), and `current_date()` is a
+  syntax error. Without the leaf the functions stay unknown.
 
 ## What v0.13 does
 
@@ -1090,6 +1113,8 @@ OLD. binder), `wr` (WITHOUT ROWID trees behind the rowid-shaped
 B-tree interface, feature `without_rowid`, v0.16), `utf16`
 (UTF-16 text conversions and the record translation of UTF-16
 files, feature `utf16`, v0.16),
+`datetime` (the date and time functions, feature `datetime`,
+v0.16), `systime` (the host clock and time zone, feature `std`),
 `error` (remedy-named errors).
 Design: `docs/SPEC.md` (rev. 0.3) and `docs/RISKS.md`. Build
 status and acceptance evidence: `STATUS.md`.

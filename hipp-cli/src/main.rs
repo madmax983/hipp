@@ -60,17 +60,19 @@ fn close_db(db: Db) -> Result<(), String> {
     })
 }
 
-/// The CLI's engine configuration: the defaults, the system clock,
-/// the pin's nesting limit for views and CTEs (999 levels read,
-/// 1000 are "nested too deep") and its expression and parser depth
+/// The CLI's engine configuration: the defaults (under `std` they
+/// include the system clock and, with `datetime`, the process's
+/// time zone as `TZ` names it, so `'now'` and `'localtime'` read
+/// what the pin's shell reads), the pin's nesting limit for views
+/// and CTEs (999 levels read, 1000 are "nested too deep") and its
+/// expression and parser depth
 /// limits (1000, 2500), which `main`'s thread has the stack for,
 /// with a statement arena big enough to expand them (the default
 /// 64 KiB holds about 800 nested views, or 2500 tokens).
 fn cli_config() -> Config {
     let d = Config::default();
     let (init, max) = (d.stmt_init, d.stmt_max.max(4 * 1024 * 1024));
-    d.clock(now_ms)
-        .max_nesting(1000)
+    d.max_nesting(1000)
         .max_trigger_depth(1000)
         .depth_limits(
             hipp::sql::parser::PIN_EXPR_DEPTH,
@@ -87,16 +89,6 @@ fn cli_config() -> Config {
 /// 20 MiB in a release one). Only the
 /// pages a statement touches are ever committed.
 const STACK_BYTES: usize = 512 * 1024 * 1024;
-
-/// The wall clock for CURRENT_TIME / CURRENT_DATE /
-/// CURRENT_TIMESTAMP defaults (v0.16): the core has none of its
-/// own; the CLI, a std program, supplies the system time in Unix
-/// milliseconds (0 if the system clock reads before 1970).
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
 
 /// A column name as the shell's `.schema` view comment prints it
 /// (v0.16, CI against the pin: `/* v(a,"+b",b,Q) */`): bare when
