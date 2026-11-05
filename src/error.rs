@@ -702,6 +702,78 @@ pub enum SchemaKind {
     /// / trigger, or keep it in one database.
     #[cfg(feature = "attach")]
     CrossDatabaseReference,
+    /// `CREATE VIRTUAL TABLE ... USING m` or a statement reading or
+    /// writing a virtual table whose module hipp does not have
+    /// (v0.16, `vtab`; the pin's "no such module: m"). The rest of
+    /// the file works; use an engine with the module for that table.
+    #[cfg(feature = "vtab")]
+    NoSuchModule,
+    /// A shadow table of a virtual table (`t_node`, ...) as the
+    /// target of INSERT / UPDATE / DELETE / ALTER / CREATE TRIGGER
+    /// (v0.16, `vtab`; the pin shell's defensive "table t_node may
+    /// not be modified"), or of CREATE INDEX (which the pin allows,
+    /// but hipp's module writes would not maintain the index).
+    /// Write the virtual table instead.
+    #[cfg(feature = "vtab")]
+    ShadowReadOnly,
+    /// DROP TABLE of a shadow table (v0.16, `vtab`; "table t_node
+    /// may not be dropped"). DROP the virtual table instead.
+    #[cfg(feature = "vtab")]
+    ShadowNoDrop,
+    /// A write to a virtual table whose module has no xUpdate
+    /// (v0.16, `vtab`: `generate_series`, `dbstat`; the pin's "table
+    /// X may not be modified").
+    #[cfg(feature = "vtab")]
+    VtabReadOnly,
+    /// CREATE INDEX or CREATE TRIGGER on a virtual table (v0.16,
+    /// `vtab`; "virtual tables may not be indexed", "cannot create
+    /// triggers on virtual tables").
+    #[cfg(feature = "vtab")]
+    VtabNotIndexable,
+    /// ALTER TABLE ADD / DROP / RENAME COLUMN of a virtual table
+    /// (v0.16, `vtab`; "virtual tables may not be altered"), or
+    /// RENAME TO of one hipp cannot rename (not an R*Tree, or while
+    /// the schema has views or triggers whose text would change).
+    #[cfg(feature = "vtab")]
+    VtabNotAlterable,
+    /// The virtual table's own storage is inconsistent (v0.16,
+    /// `vtab`; the pin's SQLITE_CORRUPT_VTAB, "database disk image
+    /// is malformed"): an R*Tree node missing, of the wrong size, or
+    /// not linked as its `%_parent` / `%_rowid` rows say. Rebuild the
+    /// table; `rtreecheck()` names what is wrong.
+    #[cfg(feature = "vtab")]
+    VtabCorrupt,
+    /// `generate_series()` with no usable START (v0.16, `vtab`; the
+    /// pin's "first argument to "generate_series()" missing or
+    /// unusable"). Pass a start, or constrain `value`.
+    #[cfg(feature = "vtab")]
+    SeriesFirstArgument,
+    /// `rtree(...)` with fewer than one dimension (v0.16, `rtree`;
+    /// "Too few columns for an rtree table").
+    #[cfg(feature = "rtree")]
+    RtreeTooFewColumns,
+    /// More than five dimensions or 100 auxiliary columns (v0.16,
+    /// `rtree`; "Too many columns for an rtree table").
+    #[cfg(feature = "rtree")]
+    RtreeTooManyColumns,
+    /// An odd number of coordinate columns (v0.16, `rtree`; "Wrong
+    /// number of columns for an rtree table").
+    #[cfg(feature = "rtree")]
+    RtreeWrongColumns,
+    /// A coordinate column after an auxiliary one (v0.16, `rtree`;
+    /// "Auxiliary rtree columns must be last").
+    #[cfg(feature = "rtree")]
+    RtreeAuxNotLast,
+    /// A row whose lower bound exceeds its upper in some dimension
+    /// (v0.16, `rtree`; "rtree constraint failed: t.(x0<=x1)"),
+    /// whatever the conflict clause (OR IGNORE skips the row).
+    /// Order each pair low, high.
+    #[cfg(feature = "rtree")]
+    RtreeConstraint,
+    /// `rtreedepth()` of something not a node blob (v0.16, `rtree`;
+    /// "Invalid argument to rtreedepth()").
+    #[cfg(feature = "rtree")]
+    RtreeDepthArgument,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

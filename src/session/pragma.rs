@@ -606,6 +606,9 @@ fn scratch() -> Arena {
 enum Obj<'x> {
     Table(&'x crate::schema::TableDef),
     View(&'x crate::schema::ViewDef),
+    /// A virtual table (v0.16, `vtab`).
+    #[cfg(feature = "vtab")]
+    Vtab(&'x crate::schema::VtabDef),
     Schema,
 }
 
@@ -705,6 +708,11 @@ impl<S: Storage> Connection<S> {
                 out.push(Obj::Table(t));
             } else if let Some(v) = self.catalog.find_view(ca, n) {
                 out.push(Obj::View(v));
+            } else {
+                #[cfg(feature = "vtab")]
+                if let Some(v) = self.catalog.find_vtab(ca, n) {
+                    out.push(Obj::Vtab(v));
+                }
             }
         }
         out.push(Obj::Schema);
@@ -849,7 +857,23 @@ impl<S: Storage> Connection<S> {
                     ) = match o {
                         Obj::Table(t) => {
                             let n = handle_bytes(ca, t.name);
-                            (n, n, b"table", t.columns.len(), t.strict, !t.has_rowid())
+                            // A virtual table's shadow table (v0.16,
+                            // `vtab`).
+                            #[cfg(feature = "vtab")]
+                            let ty: &[u8] = if self.catalog.is_shadow(ca, n) {
+                                b"shadow"
+                            } else {
+                                b"table"
+                            };
+                            #[cfg(not(feature = "vtab"))]
+                            let ty: &[u8] = b"table";
+                            (n, n, ty, t.columns.len(), t.strict, !t.has_rowid())
+                        }
+                        #[cfg(feature = "vtab")]
+                        Obj::Vtab(v) => {
+                            let n = handle_bytes(ca, v.name);
+                            let ncol = v.tab.as_ref().map_or(0, |t| t.cols.len());
+                            (n, n, b"virtual", ncol, false, false)
                         }
                         Obj::View(v) => {
                             // The planned columns (v0.16 fix: the
@@ -986,6 +1010,32 @@ impl<S: Storage> Connection<S> {
                 }
                 push_row(&mut rows, &r[..if x { 7 } else { 6 }]);
             }
+            return Ok(rows);
+        }
+        // A virtual table's declared columns (v0.16, `vtab`): HIDDEN
+        // ones only in table_xinfo.
+        #[cfg(feature = "vtab")]
+        if let Some(found) = self.vtab_named(name) {
+            let (tab, _) = found?;
+            let mut cid = 0i64;
+            for c in tab.cols.iter() {
+                if c.hidden && !x {
+                    continue;
+                }
+                let mut r = AVec::new();
+                r.push(int(cid));
+                r.push(text(c.name.as_slice()));
+                r.push(text(c.decl));
+                r.push(int(0));
+                r.push(OwnedValue::Null);
+                r.push(int(0));
+                if x {
+                    r.push(int(i64::from(c.hidden)));
+                }
+                push_row(&mut rows, r.as_slice());
+                cid += 1;
+            }
+            let _ = arena;
             return Ok(rows);
         }
         if let Some(t) = self.catalog.find(ca, name) {
@@ -1137,7 +1187,7 @@ impl<S: Storage> Connection<S> {
                     if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
                         // A table-valued function's columns have no
                         // declared type (v0.16, `json`).
-                        #[cfg(feature = "json")]
+                        #[cfg(any(feature = "json", feature = "vtab"))]
                         if sp.tvf != 0 {
                             return None;
                         }
@@ -1770,7 +1820,7 @@ fn item_aff(plan: &crate::query::SubPlan, e: &RExpr) -> Option<Affinity> {
             let mut base = 0usize;
             for sp in plan.sources.iter() {
                 if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
-                    #[cfg(feature = "json")]
+                    #[cfg(any(feature = "json", feature = "vtab"))]
                     if sp.tvf != 0 {
                         return None;
                     }
@@ -2203,6 +2253,8 @@ impl<S: Storage> Statement<'_, S> {
                     Obj::Table(t) => (handle_bytes(ca, t.name), t.root),
                     Obj::Schema => (b"sqlite_master", 1),
                     Obj::View(_) => continue,
+                    #[cfg(feature = "vtab")]
+                    Obj::Vtab(_) => continue,
                 };
                 if let Some(o) = &only
                     && !(eq_ci(o.as_slice(), name)

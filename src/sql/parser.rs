@@ -1068,6 +1068,15 @@ impl<'a> Parser<'a> {
         if self.cur_is_kw(b"CREATE") {
             if self.is_kw(self.pos + 1, b"TABLE") {
                 self.create_table::<E>()
+            } else if cfg!(feature = "vtab") && self.is_kw(self.pos + 1, b"VIRTUAL") {
+                #[cfg(feature = "vtab")]
+                {
+                    self.create_virtual::<E>()
+                }
+                #[cfg(not(feature = "vtab"))]
+                {
+                    Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+                }
             } else if self.is_kw(self.pos + 1, b"INDEX") {
                 self.create_index_dispatch::<E>(false)
             } else if self.is_kw(self.pos + 1, b"UNIQUE") {
@@ -1651,6 +1660,71 @@ impl<'a> Parser<'a> {
     }
 
     // ---------------- CREATE TABLE ----------------
+
+    /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module
+    /// [(arg, ...)]` (v0.16, `vtab`): each argument is the span of
+    /// its tokens (the pin's `vtabarg`: any tokens, commas only
+    /// inside parentheses; an empty one is dropped), and the stored
+    /// text runs from the name token to the closing parenthesis (or
+    /// the module name), as the pin's `sqlite3VtabFinishParse` keeps
+    /// it.
+    #[cfg(feature = "vtab")]
+    fn create_virtual<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"CREATE")?;
+        self.expect_kw::<E>(b"VIRTUAL")?;
+        self.expect_kw::<E>(b"TABLE")?;
+        let if_not_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"NOT")?;
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        let start = self
+            .toks
+            .as_slice()
+            .get(self.pos.wrapping_sub(1))
+            .map_or(0, |t| t.offset);
+        self.expect_kw::<E>(b"USING")?;
+        let mod_off = self.cur().offset;
+        let module = self.name::<E>()?;
+        let mut end = token_end(self.sql, mod_off);
+        let mut args = AVec::new();
+        if matches!(self.cur().tok, Tok::LParen) {
+            self.pos += 1;
+            let items = self.split_items::<E>()?;
+            for (from, to) in items.iter() {
+                if from >= to {
+                    continue;
+                }
+                let first = self.toks.as_slice().get(*from).map_or(0, |t| t.offset);
+                let last = self.toks.as_slice().get(*to - 1).map_or(0, |t| t.offset);
+                let t = self
+                    .sql
+                    .get(first..token_end(self.sql, last))
+                    .unwrap_or(&[]);
+                args.push(self.arena.alloc_copy_handle(t)?);
+            }
+            let close = self
+                .toks
+                .as_slice()
+                .get(self.pos.wrapping_sub(1))
+                .map_or(0, |t| t.offset);
+            end = close + 1;
+        }
+        self.expect_end::<E>()?;
+        let text = self
+            .arena
+            .alloc_copy_handle(self.sql.get(start..end).unwrap_or(&[]))?;
+        Ok(Ast::CreateVirtual {
+            name,
+            if_not_exists,
+            module,
+            args,
+            text,
+        })
+    }
 
     fn create_table<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"CREATE")?;
@@ -6800,7 +6874,7 @@ impl<'a> Parser<'a> {
 /// One past the last byte of the token starting at `off` of `sql`
 /// (v0.16, `triggers`): an identifier / number / keyword run, a
 /// quoted string or name, or a one- / two-byte operator.
-#[cfg(feature = "triggers")]
+#[cfg(any(feature = "triggers", feature = "vtab"))]
 pub fn token_end(sql: &[u8], off: usize) -> usize {
     let n = sql.len();
     let Some(&c) = sql.get(off) else {
@@ -6893,7 +6967,7 @@ pub fn parse_trigger_step_tokens<E>(
 /// `SELECT *[, extra ...] FROM table [AS alias] [WHERE filter]` as an
 /// AST (v0.16, `triggers`): the rows an UPDATE / DELETE of a view
 /// hands its INSTEAD OF triggers.
-#[cfg(feature = "triggers")]
+#[cfg(any(feature = "triggers", feature = "rtree"))]
 pub fn star_select(
     table: ABytes,
     alias: Option<ABytes>,

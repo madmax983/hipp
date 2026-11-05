@@ -384,6 +384,21 @@ impl<S: Storage> Statement<'_, S> {
     pub(super) fn resolves_rollback(&self, e: &Error<S::Error>) -> bool {
         let conflict = match &self.plan {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
+            // An R*Tree write (v0.16, `rtree`): its UNIQUE and rtree
+            // constraints.
+            #[cfg(feature = "rtree")]
+            Plan::Vtab(p) => match &**p {
+                super::vtab::VtPlan::Write(w) => {
+                    return w.conflict == ConflictAction::Rollback
+                        && matches!(
+                            e,
+                            Error::Schema {
+                                kind: SchemaKind::UniqueViolation | SchemaKind::RtreeConstraint,
+                            }
+                        );
+                }
+                _ => return false,
+            },
             _ => return false,
         };
         if !matches!(

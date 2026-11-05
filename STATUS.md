@@ -7501,6 +7501,194 @@ less `keep_tail`.
   and is not specific to it, so the attached tests do not compare
   a main file that the pin left empty.
 
+### Virtual tables, generate_series, dbstat and the R*Tree (2026-11-05)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated: leaf `vtab` (implies `v16`) for the framework,
+`generate_series` and `dbstat`; leaf `rtree` (implies `vtab`); both
+in `max` (ADR 0002), not `full`; their own `v16,vtab` and
+`v16,vtab,rtree` lines in `ci/feature-sets.txt`. Without `vtab` a
+file holding a virtual table is refused at open, as before.
+
+**Shipped:**
+
+- **One module abstraction** (`src/vtab.rs`), Rust traits modelled
+  on `sqlite3_module`, no C ABI: `Vtab::connect` (xCreate /
+  xConnect: declared columns, HIDDEN), `best_index` over an
+  `IndexInfo` (aConstraint column / op / usable, aOrderBy; out
+  argvIndex / omit, idxNum, idxStr, orderByConsumed, cost, rows),
+  `VtCursor` (xFilter / xNext / xEof / xColumn / xRowid),
+  `eponymous`, `creatable`, `writable` (xUpdate), `shadow_name`
+  (xShadowName). The planner (`session::vtab`): a virtual-table
+  FROM source plans like a JSON table-valued function (whose lateral
+  machinery it now shares: `SourcePlan::tvf` / `tvf_dead`, the
+  per-row argument evaluation); once WHERE is resolved each
+  `col op expr` term (`=`, `<`, `<=`, `>`, `>=`, `IS`, either way
+  round, a BETWEEN's halves after the other terms), each inner ON
+  term and each table-valued-function argument (an `=` on the next
+  hidden column) becomes a constraint, usable when it reads only
+  enclosing queries and sources to its left; the module's choice
+  picks the filter's arguments and omitted terms leave the WHERE.
+  Transactions, savepoints and statement rollback: every module
+  keeps its state in the file, so the pager's journals are its
+  xBegin / xSync / xCommit / xRollback / savepoint hooks.
+- **CREATE VIRTUAL TABLE [IF NOT EXISTS] t USING m[(args)]**: the
+  pin's row (`table`, root 0, `CREATE VIRTUAL TABLE ` + the text
+  from the name token to the closing parenthesis; empty arguments
+  dropped), the name rules (taken, `sqlite_` reserved). DROP TABLE
+  deletes it, then (xDestroy) an R*Tree's `%_node`, `%_rowid`,
+  `%_parent` (auto-vacuum files too). A file holding a virtual
+  table of a module hipp lacks opens: the table is listed (PRAGMA
+  table_list `virtual`), statements touching it are "no such
+  module", and its shadow tables (any `<t>_*` table: hipp cannot
+  ask the module) are listed read only — not read when hipp's
+  grammar cannot parse their text (fts3/4 quote names as strings).
+  Shadow tables refuse INSERT / UPDATE / DELETE / DROP / ALTER /
+  CREATE TRIGGER (the shell's defensive mode); virtual tables
+  refuse CREATE INDEX / TRIGGER and ALTER except an R*Tree's
+  RENAME TO (its shadow tables renamed, the pin's quoted text).
+  PRAGMA table_info / table_xinfo (hidden columns) / table_list
+  (`virtual`, `shadow`); `.schema` prints the pin's `/* t(cols) */`
+  line and `.dump` the pin's `writable_schema` rows.
+- **generate_series** (the shell's ext/misc/series.c): eponymous
+  only (CREATE ... USING it is "no such module"), hidden `start` /
+  `stop` / `step`, its `seriesBestIndex` (start / stop / step `=`;
+  `value` / rowid `=` / `IS` / `>` / `>=` / `<` / `<=`, the last of
+  each kind used and omitted; the "first argument ... missing or
+  unusable" error, also when the start reads a source the pin's
+  no-prerequisite plan cannot use), `seriesFilter`'s 64-bit
+  arithmetic (wrap-safe spans, REAL bounds rounded inward, NULL
+  argument → no rows, step 0 → 1, `i64::MIN` steps).
+- **dbstat** (`SQLITE_ENABLE_DBSTAT_VTAB`): every column of
+  `statColumn` for the main database (`sqlite_schema` then each tree
+  in schema order, or name order when ORDER BY name), `statNext`'s
+  walk (page, its cells' overflow pages, children, right child;
+  `/000/` and `/000+000000` paths), `unused` / `payload` /
+  `mx_payload` as `statDecodePage` and `getLocalPayload` compute
+  them, `aggregate = 1` rows, `schema` / `name` constraints,
+  `dbstat(schema, aggregate)`, and `CREATE VIRTUAL TABLE ... USING
+  dbstat`.
+- **R*Tree** (`src/rtree.rs`, `session::rtree`): `rtree` /
+  `rtree_i32`, 1-5 dimensions, up to 100 `+aux` columns, the
+  argument errors; the shadow tables with the pin's text, the root
+  node of `min(page_size - 64, 4 + 51 × cell)` bytes. The tree code
+  is the pin's: ChooseLeaf, AdjustTree, the R*-tree
+  `splitNodeStartree` (margin-then-overlap-then-area, the pin's merge
+  sorts), root splits numbering the right node first, delete with
+  under-full nodes removed and their cells reinserted (latest
+  removed first), the root collapsed, nodes numbered after the
+  largest `%_node` key. Writes are a pure function over a `Store`
+  of the shadow rows read so far (a `Miss` reads one more and the
+  write runs again); its result goes through the pager in the
+  statement's transaction. Coordinates round outward to float32
+  (`rtreeValueDown` / `Up`); `rtree_i32` clamps to 32 bits; the id
+  is `sqlite3_value_int64` of the value; no affinity on any value.
+  "rtree constraint failed" and UNIQUE under OR ABORT / FAIL /
+  IGNORE / REPLACE / ROLLBACK as `rtreeUpdate` resolves them; UPDATE
+  in scan order, DELETE in rowid order (the pin's RowSet). Reads:
+  `rtreeBestIndex` (rowid `=` first; else each `=`, `<`, `<=`, `>`,
+  `>=` on a coordinate, `<=` / `>=` omitted, 20 at most),
+  `rtreeFilter`'s value classes (text → TRUE / FALSE, NULL never,
+  ±2^48 integers widen `<` / `>`), the depth-first walk.
+  `rtreecheck([schema,] t)` (every message of `rtreeCheckTable`;
+  "Schema corrupt or not an rtree" for a narrow table),
+  `rtreenode(n, blob)`, `rtreedepth(blob)`.
+
+**Probing notes (live pin):**
+
+- The pin's 3.54.1 R*Tree never forces a reinsertion: every full
+  node splits. (`Reinsert` and `iReinsertHeight` exist in rtree.c,
+  but its node images match only the split-only model: fitted
+  first as "reset to −1 per insert", which disagreed on the first
+  leaf overflow, then "0 per connection, only rising", which
+  disagreed on the first internal overflow; split-only matches
+  every generated corpus.)
+- An UPDATE / DELETE of an R*Tree leaves `last_insert_rowid()` at
+  the last shadow row the module's internal INSERTs wrote; hipp
+  approximates the pin's node-release order (exact for one-node
+  trees).
+- `dbstat('nosuch')` and `dbstat(NULL)` return no rows, no error;
+  an empty (never written) database has no rows; `dbstat` in a view
+  is "unsafe use of virtual table" on the pin (hipp runs it).
+- `rtreecheck('nosuch')` is "SQL logic error"; `rtreenode(257, b)`
+  is NULL (no `u8` truncation of the dimension count).
+- The pin shell allows CREATE INDEX on a shadow table (hipp
+  refuses: its module writes would not maintain the index; a file
+  with one refuses R*Tree writes).
+- The pin's shell is built with assertions: `generate_series(1, 10)
+  ORDER BY value DESC LIMIT 3` aborts it in `seriesNext`; the tests
+  avoid that shape.
+
+**Tests:** `tests/vtab_v16.rs` (CREATE / DROP storage and errors,
+unknown-module file, generate_series corpus of 46 queries + a
+generated corpus of 120 with random bounds / steps / constraints,
+dbstat byte for byte on a pin-written file, PRAGMAs);
+`tests/rtree_v16.rs` (CREATE across page sizes, a writes corpus,
+rtree_i32, float32 boundaries, 30 query shapes, functions and
+errors, transactions / savepoints / every conflict clause, 14
+generated 1-5-dimension workloads (`HIPP_RTREE_CORPUS` for more)
+compared statement by statement with every shadow row byte for
+byte and each engine's rtreecheck / integrity_check run on the
+other's file, files moving between engines mid-workload);
+`tests/crash.rs` `v16_crash_rtree_writes` (every crash point of
+split-heavy transactions, an autocommit DELETE, a failing statement
+and a savepoint); `hipp-cli/tests/cli_v16_vtab.rs` (byte-identical
+stdout: generate_series, R*Tree reals, `.schema`, dbstat).
+Regression tests for the bugs found: the pin's split-only tree
+(generated corpora), DELETE in rowid order, OR FAIL / OR ROLLBACK on
+"rtree constraint failed", `rtreenode`'s dimension check, the
+fresh-database `dbstat`, DROP of an unknown module's table,
+`rtreecheck` of a narrow table, the legacy planner's virtual-table
+names.
+
+**Gates:** `ci/local-gates.sh` (full) passes: fmt, clippy `-D
+warnings` (default, all features, every feature-set line including
+`v16,vtab` and `v16,vtab,rtree`), workspace tests, the no_std targets,
+the three size gates.
+
+**Size:** tiny **76,960 B** (Δ **0**; the catalog loader keeps
+its tiny-profile code path unchanged); full **500,200 B** (Δ **0**:
+both leaves are in `max` only); max **874,832 B** (Δ **+59,040 B**,
+ratchet raised to it — over the 32 KiB justification threshold:
+the module framework, its planner pass and statements ≈ 18 KiB,
+generate_series ≈ 3 KiB, dbstat ≈ 6 KiB, the R*Tree with its
+shadow-table writes, queries and checks ≈ 32 KiB; 173,744 B of the
+1 MiB budget remain).
+
+**Honest gaps:**
+
+- json_each / json_tree and the pragma table-valued functions are
+  not moved onto the module traits: they share the planner's
+  table-valued machinery (`SourcePlan::tvf`, lateral arguments)
+  with virtual tables, and moving them would grow `full`.
+- IN lists are not offered to xBestIndex (they filter in WHERE), and
+  the pin's OR / IN multi-lookup plans are not made: unordered
+  results of `rowid IN (...)` or `a = 1 OR b < 2` over an R*Tree can
+  come in tree order where the pin's come in lookup order. ORDER BY
+  is always sorted by hipp (orderByConsumed is ignored; same rows);
+  LIMIT / OFFSET constraints are not passed to modules.
+- A virtual-table source whose arguments read a source to its
+  *right* is refused (the pin reorders the join); so is one on the
+  right of a RIGHT / FULL join with lateral arguments.
+- `dbstat` walks the main database only (`temp` / attached schemas
+  give no rows); `dbstat` inside a view or trigger runs (the pin's
+  "unsafe use of virtual table").
+- PRAGMA integrity_check does not run the R*Tree's xIntegrity (use
+  `rtreecheck()`); `rtreecheck` reads only `main`.
+- `last_insert_rowid()` after an R*Tree UPDATE / DELETE of a
+  multi-level tree can differ (the pin's internal-INSERT order is
+  approximated); a new rowid past 9223372036854775807 is the
+  smallest unused one (the pin's is random).
+- MATCH (geometry callbacks), UPSERT, RETURNING and UPDATE ... FROM
+  on an R*Tree, CREATE INDEX on a shadow table, ALTER TABLE RENAME
+  of an R*Tree while the schema has views or triggers, and virtual
+  tables in TEMP or attached databases are refused.
+- A file holding a virtual table of an unknown module whose shadow
+  tables hipp cannot parse (fts3 / fts4) opens, but those tables are
+  not readable and a full PRAGMA integrity_check fails there
+  (`integrity_check(t)` of other tables works).
+- hipp-cli's `.tables` does not list virtual tables.
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the

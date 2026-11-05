@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach", "autovacuum"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach", "autovacuum", "vtab", "rtree"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -332,6 +332,36 @@ attach = ["v16"]
 # Builds on the v0.16 PRAGMA and VACUUM machinery, so it implies
 # `v16`. The tiny profile excludes it per §2.
 autovacuum = ["v16"]
+
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): virtual tables --
+# one internal module abstraction modelled on the pin's sqlite3_module
+# (xBestIndex with constraint / ORDER BY usage, cost, rows, idxNum,
+# idxStr, orderByConsumed; xFilter / xNext / xEof / xColumn / xRowid;
+# xUpdate; hidden columns; eponymous modules), Rust traits with no C
+# ABI (`src/vtab.rs`, `session::vtab`). CREATE VIRTUAL TABLE [IF NOT
+# EXISTS] t USING module(args) and DROP TABLE of one, stored in
+# `sqlite_schema` as the pin stores them; a file holding a virtual
+# table of a module hipp lacks opens, and only statements touching
+# that table are refused ("no such module"). Modules: the eponymous
+# `generate_series` (as the pin's shell ships it) and `dbstat`
+# (eponymous, or CREATE VIRTUAL TABLE ... USING dbstat(schema)).
+# Shadow tables are read only, as under the pin shell's defensive
+# mode. Builds on the v0.16 table-valued sources and PRAGMA machinery,
+# so it implies `v16`. Without it a file holding a virtual table is
+# refused at open, as before. The tiny profile excludes it per Sec. 2.
+vtab = ["v16"]
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): the R*Tree
+# module of the pin's rtree.c -- rtree / rtree_i32 tables of 1 to 5
+# dimensions with auxiliary `+columns`, shadow tables %_node /
+# %_parent / %_rowid byte-compatible with the pin's (node size from
+# the page size, its ChooseLeaf / R*-tree split / delete-and-reinsert
+# algorithm and node numbering, float32 coordinates rounded outward
+# as rtreeValueDown / rtreeValueUp), its xBestIndex (rowid lookups,
+# coordinate =, <, <=, >, >=, BETWEEN), its constraint errors and
+# REPLACE handling, rtreecheck(), rtreenode(), rtreedepth()
+# (`src/rtree.rs`, `session::rtree`). MATCH (geometry callbacks) is
+# refused. Implies `vtab`. The tiny profile excludes it per Sec. 2.
+rtree = ["vtab"]
 
 [dependencies]
 

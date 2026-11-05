@@ -1832,3 +1832,39 @@ fn v16_crash_autovacuum_cut_pages_not_journaled() {
     crash_matrix("av-cut-full-move", Config::default(), &full2, &del);
     pin_recovers_autovacuum("cut-full-move", &full2, &del);
 }
+
+/// R*Tree writes (v0.16, `rtree`): inserts that split nodes, deletes
+/// that remove and reinsert them, updates — every crash point
+/// recovers to the pre- or post-image of the shadow tables.
+#[cfg(feature = "rtree")]
+#[test]
+fn v16_crash_rtree_writes() {
+    let setup = strs(&[
+        "PRAGMA page_size = 1024",
+        "CREATE VIRTUAL TABLE t USING rtree(id, x0, x1, y0, y1, +tag)",
+        "INSERT INTO t SELECT value, value, value + 2, -value, 1 - value, 'r' || value FROM generate_series(1, 60)",
+    ]);
+    let txn = strs(&[
+        "BEGIN",
+        "INSERT INTO t SELECT value + 100, value % 17, value % 17 + 5, value, value + 1, NULL FROM generate_series(1, 90)",
+        "DELETE FROM t WHERE id % 3 = 0",
+        "UPDATE t SET x1 = x1 + 1 WHERE id < 30",
+        "COMMIT",
+    ]);
+    crash_matrix("rtree", Config::default(), &setup, &txn);
+    // One autocommit statement; inside a transaction, a statement
+    // failing half-way (its statement journal undoes the nodes it
+    // split) and a savepoint rolled back.
+    let txn = strs(&["DELETE FROM t WHERE id % 2 = 1"]);
+    crash_matrix("rtree-autocommit", Config::default(), &setup, &txn);
+    let txn = strs(&[
+        "BEGIN",
+        "INSERT INTO t SELECT value + 300, value, value, value, value, 'x' FROM generate_series(1, 40)",
+        "INSERT INTO t SELECT value + 400, value, value, value, value, 'y' FROM generate_series(1, 40) UNION ALL SELECT 999, 9, 2, 3, 4, 'bad'",
+        "SAVEPOINT s",
+        "DELETE FROM t WHERE id < 50",
+        "ROLLBACK TO s",
+        "COMMIT",
+    ]);
+    crash_matrix("rtree-stmt", Config::default(), &setup, &txn);
+}

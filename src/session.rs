@@ -91,16 +91,20 @@ mod attach;
 mod cte;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
-#[cfg(feature = "json")]
+#[cfg(any(feature = "json", feature = "vtab"))]
 mod json_tvf;
 #[cfg(feature = "v16")]
 mod maint;
 #[cfg(feature = "v16")]
 mod pragma;
+#[cfg(feature = "rtree")]
+mod rtree;
 #[cfg(feature = "v16")]
 mod temp;
 #[cfg(feature = "triggers")]
 mod trigger;
+#[cfg(feature = "vtab")]
+mod vtab;
 #[cfg(feature = "expr_index")]
 mod xindex;
 
@@ -591,6 +595,9 @@ impl IdxColPlan {
 #[allow(clippy::large_enum_variant)]
 enum Plan {
     CreateTable,
+    /// A virtual-table statement (v0.16, `vtab`; `session::vtab`).
+    #[cfg(feature = "vtab")]
+    Vtab(Box<vtab::VtPlan>),
     /// `CREATE TABLE ... AS SELECT` (v0.16, `v16`): the source
     /// plan, the derived `sqlite_schema` text (the pin's
     /// `createTableStmt` form) and the new columns' affinities.
@@ -1768,6 +1775,11 @@ impl<S: Storage> Connection<S> {
         let expanded = self.expand_ast(arena, ast)?;
         #[cfg(feature = "v16")]
         let ast = expanded.as_ref().unwrap_or(ast);
+        // v0.16 (`vtab`): statements on virtual and shadow tables.
+        #[cfg(feature = "vtab")]
+        if let Some(p) = self.plan_vtab_stmt(arena, ast)? {
+            return Ok(p);
+        }
         // The pin reserves every `sqlite_*` name (any case) for
         // itself (v0.16 fix, ungated: hipp created such tables,
         // indexes and views). Files that already hold one still
@@ -1850,6 +1862,10 @@ impl<S: Storage> Connection<S> {
             // Unwrapped by `expand_ast` above.
             #[cfg(feature = "v16")]
             Ast::With { .. } => Err(Error::Unsupported),
+            // Planned by `plan_vtab_stmt` above (v0.16, `vtab`); a
+            // TEMP database has no virtual tables.
+            #[cfg(feature = "vtab")]
+            Ast::CreateVirtual { .. } => Err(Error::Unsupported),
             #[cfg(feature = "triggers")]
             Ast::CreateTrigger(t) => self.plan_create_trigger(arena, t),
             #[cfg(feature = "triggers")]
@@ -4203,6 +4219,12 @@ impl<S: Storage> Connection<S> {
     /// columns, optional `WHERE <col> = <literal>`.
     fn plan_legacy_select(&self, stmt: &SelectStmt, arena: &Arena) -> Result<Plan, S::Error> {
         let tname = handle_bytes(arena, stmt.from.as_slice()[0].table);
+        // v0.16 (`vtab`): a virtual table reads through the general
+        // planner.
+        #[cfg(feature = "vtab")]
+        if self.vtab_named(tname).is_some() {
+            return Err(Error::Unsupported);
+        }
         let t = match self.catalog.find(&self.catalog_arena, tname) {
             Some(t) => t.usable()?,
             // v0.16: `sqlite_schema` and the table-valued pragma
@@ -4569,7 +4591,8 @@ impl<S: Storage> Connection<S> {
             using,
             &mut planner,
         )?;
-        let filter = match &stmt.filter {
+        #[cfg_attr(not(feature = "vtab"), allow(unused_mut))]
+        let mut filter = match &stmt.filter {
             None => hoisted,
             Some(e) => {
                 let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
@@ -4586,6 +4609,9 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
+        // v0.16 (`vtab`): each virtual table's xBestIndex.
+        #[cfg(feature = "vtab")]
+        self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter)?;
         // GROUP BY / HAVING / ORDER BY terms: an output ordinal
         // or alias substitutes the item expression itself
         // (SQLite's rule, per clause — see `resolve_term`), so
@@ -4750,9 +4776,10 @@ impl<S: Storage> Connection<S> {
                 limit: limit.as_ref(),
             },
         )?;
-        // v0.16 (`json`): what a lateral `json_each` may drop
-        // from the rows it joins onto.
-        #[cfg(feature = "json")]
+        // v0.16 (`json`, `vtab`): what a lateral `json_each` or
+        // virtual table may drop from the rows it joins onto; and
+        // (`vtab`) each virtual table's constraints (its xBestIndex).
+        #[cfg(any(feature = "json", feature = "vtab"))]
         {
             let mut rest: AVec<&RExpr> = AVec::new();
             for e in items
@@ -4962,10 +4989,12 @@ impl<S: Storage> Connection<S> {
             gcols: None,
             #[cfg(feature = "v16")]
             rec: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf_dead: AVec::new(),
+            #[cfg(feature = "vtab")]
+            vt: None,
             #[cfg(feature = "expr_index")]
             access: None,
             #[cfg(feature = "expr_index")]
@@ -5023,6 +5052,14 @@ impl<S: Storage> Connection<S> {
                     total += self.plan_json_tvf(s, k, arena, descs, plans)?;
                     continue;
                 }
+            }
+            // v0.16 (`vtab`): a virtual table, or an eponymous module.
+            #[cfg(feature = "vtab")]
+            if s.derived.is_none()
+                && let Some(w) = self.plan_vtab_source(s, arena, descs, plans)?
+            {
+                total += w;
+                continue;
             }
             // v0.16: a table-valued pragma function, or the empty
             // temp schema, as the derived table of its rows.
@@ -5162,10 +5199,12 @@ impl<S: Storage> Connection<S> {
                 gcols,
                 #[cfg(feature = "v16")]
                 rec: 0,
-                #[cfg(feature = "json")]
+                #[cfg(any(feature = "json", feature = "vtab"))]
                 tvf: 0,
-                #[cfg(feature = "json")]
+                #[cfg(any(feature = "json", feature = "vtab"))]
                 tvf_dead: AVec::new(),
+                #[cfg(feature = "vtab")]
+                vt: None,
                 #[cfg(feature = "expr_index")]
                 access: None,
                 #[cfg(feature = "expr_index")]
@@ -5210,7 +5249,7 @@ impl<S: Storage> Connection<S> {
         let mut using = using.as_slice().iter();
         for (i, (s, plan)) in from.iter().zip(plans.iter_mut()).enumerate() {
             // A JSON table-valued function's arguments (v0.16).
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             if plan.tvf != 0 {
                 self.plan_tvf_args(s, i, arena, cur, enclosing, plan, &mut *planner)?;
             }
@@ -6603,6 +6642,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         let was_txn = self.conn.explicit_txn;
         let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
             || {
+                #[cfg(feature = "vtab")]
+                {
+                    matches!(self.plan, Plan::Vtab(_))
+                }
+                #[cfg(not(feature = "vtab"))]
+                {
+                    false
+                }
+            }
+            || {
                 #[cfg(feature = "v16")]
                 {
                     matches!(
@@ -6681,6 +6730,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "attach")]
             Plan::Attach(_) => self.step_attach().await,
             Plan::CreateTable => self.step_create().await,
+            #[cfg(feature = "vtab")]
+            Plan::Vtab(_) => self.step_vtab().await,
             #[cfg(feature = "v16")]
             Plan::CreateTableAs { .. } => self.step_create_as().await,
             #[cfg(feature = "v04")]
@@ -7875,6 +7926,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let conflict = match &self.plan {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
+            #[cfg(feature = "rtree")]
+            Plan::Vtab(p) => match &**p {
+                vtab::VtPlan::Write(w) => w.conflict,
+                _ => ConflictAction::Abort,
+            },
             _ => ConflictAction::Abort,
         };
         // v0.16: the failing constraint's own action, when it has one.
@@ -7901,7 +7957,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         e: &Error<S::Error>,
     ) -> core::result::Result<bool, Error<S::Error>> {
         let keep = conflict == ConflictAction::Fail
-            && matches!(
+            && (matches!(
                 e,
                 Error::Schema {
                     kind: SchemaKind::UniqueViolation
@@ -7909,7 +7965,22 @@ impl<'c, S: Storage> Statement<'c, S> {
                         | SchemaKind::NotNullViolation
                         | SchemaKind::CheckViolation
                 }
-            );
+            ) || {
+                // An R*Tree's constraint (v0.16, `rtree`).
+                #[cfg(feature = "rtree")]
+                {
+                    matches!(
+                        e,
+                        Error::Schema {
+                            kind: SchemaKind::RtreeConstraint
+                        }
+                    )
+                }
+                #[cfg(not(feature = "rtree"))]
+                {
+                    false
+                }
+            });
         if keep {
             // v0.16 (`foreign_keys`): an action program's failure
             // aborts the statement whatever its clause says; and the
@@ -11069,7 +11140,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             // v0.16 (`json`): a JSON table-valued function's rows —
             // computed in the join when its arguments read a source
             // to its left (`join_step`).
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             if sp.tvf != 0 {
                 if sp.tvf & crate::query::TVF_LATERAL != 0 {
                     src_rows.push(AVec::new());
@@ -12225,11 +12296,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             // A JSON table-valued function reading the sources to its
             // left (v0.16, `json`): its rows for this combination.
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             let lateral;
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             let mut acc = acc;
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             let rows = if sp.tvf & crate::query::TVF_LATERAL != 0 {
                 match self.lateral_rows(sources, idx, filter, &acc).await? {
                     Some(r) => {

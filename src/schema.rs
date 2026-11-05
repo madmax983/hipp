@@ -112,6 +112,12 @@ pub struct TableDef {
     /// (see `TableDef::usable`); the rest of the file works.
     #[cfg(any(feature = "v04", feature = "indexes"))]
     pub foreign_coll: bool,
+    /// A shadow table of a virtual table whose module hipp lacks,
+    /// with stored SQL hipp cannot parse (v0.16, `vtab`: fts3/4
+    /// quote their names as strings). Listed, never read or written
+    /// (`SchemaKind::NoSuchModule`).
+    #[cfg(feature = "vtab")]
+    pub shadow_opaque: bool,
     /// The table's INTEGER PRIMARY KEY is AUTOINCREMENT (v0.16,
     /// `v16`): every INSERT keeps its `sqlite_sequence` row.
     #[cfg(feature = "v16")]
@@ -153,6 +159,12 @@ impl TableDef {
     pub fn usable<E>(&self) -> Result<&TableDef, E> {
         #[cfg(any(feature = "v04", feature = "indexes"))]
         if self.foreign_coll {
+            #[cfg(feature = "vtab")]
+            if self.shadow_opaque {
+                return Err(Error::Schema {
+                    kind: crate::error::SchemaKind::NoSuchModule,
+                });
+            }
             return Err(Error::Schema {
                 kind: crate::error::SchemaKind::UnknownCollation,
             });
@@ -291,8 +303,27 @@ pub struct TriggerDef {
     pub steps: AVec<(usize, usize)>,
 }
 
+/// A virtual table of the file (v0.16, `vtab`): its `sqlite_schema`
+/// row (type `table`, root page 0, `CREATE VIRTUAL TABLE` text), the
+/// module named there and its arguments, and the module's declared
+/// table (`Err`: the module is one hipp lacks — the pin's "no such
+/// module" — or its arguments are refused; only statements touching
+/// the table see that).
+#[cfg(feature = "vtab")]
+#[derive(Debug)]
+pub struct VtabDef {
+    pub name: ABytes,
+    pub sql: ABytes,
+    pub module: ABytes,
+    pub args: AVec<ABytes>,
+    pub tab: core::result::Result<crate::vtab::VTab, crate::error::SchemaKind>,
+}
+
 pub struct Catalog {
     pub tables: AVec<TableDef>,
+    /// Virtual tables (v0.16, `vtab`), in `sqlite_schema` order.
+    #[cfg(feature = "vtab")]
+    pub vtabs: AVec<VtabDef>,
     pub indexes: AVec<IndexDef>,
     pub views: AVec<ViewDef>,
     /// The triggers in `sqlite_schema` rowid (creation) order
@@ -317,6 +348,8 @@ impl Catalog {
     pub fn empty(cookie: u32) -> Catalog {
         Catalog {
             tables: AVec::new(),
+            #[cfg(feature = "vtab")]
+            vtabs: AVec::new(),
             indexes: AVec::new(),
             views: AVec::new(),
             #[cfg(feature = "triggers")]
@@ -413,8 +446,41 @@ impl Catalog {
         {
             Some(false)
         } else {
+            #[cfg(feature = "vtab")]
+            if self.vtabs.iter().any(|v| hit(v.name)) {
+                return Some(false);
+            }
             None
         }
+    }
+
+    /// The virtual table of this name (v0.16, `vtab`).
+    #[cfg(feature = "vtab")]
+    pub fn find_vtab<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x VtabDef> {
+        self.vtabs
+            .iter()
+            .find(|v| eq_ci(handle_bytes(arena, v.name), name))
+    }
+
+    /// Whether `name` is a shadow table of one of the file's virtual
+    /// tables (v0.16, `vtab`; the pin's `sqlite3ShadowTableName`:
+    /// `<vtab>_<suffix>` where the vtab's module claims the suffix,
+    /// or any suffix when hipp lacks the module).
+    #[cfg(feature = "vtab")]
+    pub fn is_shadow(&self, arena: &Arena, name: &[u8]) -> bool {
+        use crate::vtab::Vtab;
+        self.vtabs.iter().any(|v| {
+            let vn = handle_bytes(arena, v.name);
+            name.len() > vn.len() + 1
+                && name.get(..vn.len()).is_some_and(|p| eq_ci(p, vn))
+                && name.get(vn.len()) == Some(&b'_')
+                // A module hipp lacks may claim any suffix: such a
+                // table is treated as its shadow (never written).
+                && v.tab.as_ref().map_or(true, |t| {
+                    t.module
+                        .shadow_name(name.get(vn.len() + 1..).unwrap_or(&[]))
+                })
+        })
     }
 
     /// All indexes (explicit and implicit) on one table.
@@ -658,6 +724,8 @@ pub async fn build_catalog<S: Storage>(
             checks: AVec::new(),
             strict: false,
             foreign_coll: false,
+            #[cfg(feature = "vtab")]
+            shadow_opaque: false,
             autoinc: false,
             #[cfg(not(feature = "triggers"))]
             triggered: false,
@@ -677,6 +745,35 @@ pub async fn build_catalog<S: Storage>(
         }
         let sql = row.sql.as_ref().expect("checked");
         scratch.reset();
+        // A virtual table (v0.16, `vtab`): listed with its module's
+        // declared columns (none when hipp lacks the module).
+        #[cfg(feature = "vtab")]
+        if let Ok(Ast::CreateVirtual { module, args, .. }) =
+            &parse::<S::Error>(sql.as_slice(), &scratch, lim)
+        {
+            let m = handle_bytes(&scratch, *module);
+            let mut spans: AVec<&[u8]> = AVec::new();
+            let mut stored = AVec::new();
+            for a in args.iter() {
+                let t = handle_bytes(&scratch, *a);
+                spans.push(t);
+                stored.push(intern(catalog_arena, t)?);
+            }
+            let tab = match crate::vtab::Module::lookup(m) {
+                Some(md) if crate::vtab::Vtab::creatable(&md) => {
+                    crate::vtab::Vtab::connect(&md, row.name.as_slice(), spans.as_slice(), false)
+                }
+                _ => Err(crate::error::SchemaKind::NoSuchModule),
+            };
+            catalog.vtabs.push(VtabDef {
+                name: intern(catalog_arena, row.name.as_slice())?,
+                sql: intern(catalog_arena, sql.as_slice())?,
+                module: intern(catalog_arena, m)?,
+                args: stored,
+                tab,
+            });
+            continue;
+        }
         let ast = match parse::<S::Error>(sql.as_slice(), &scratch, lim) {
             Ok(a) => a,
             // v0.16: a collation hipp does not have (one an
@@ -685,9 +782,34 @@ pub async fn build_catalog<S: Storage>(
             // Keep the table listed but unusable; the rest of
             // the file still opens.
             #[cfg(any(feature = "v04", feature = "indexes"))]
-            Err(Error::Schema {
-                kind: crate::error::SchemaKind::UnknownCollation,
-            }) => {
+            Err(e)
+                if matches!(
+                    e,
+                    Error::Schema {
+                        kind: crate::error::SchemaKind::UnknownCollation,
+                    }
+                ) || {
+                    // A shadow table of a module hipp lacks (v0.16,
+                    // `vtab`), whatever its text.
+                    #[cfg(feature = "vtab")]
+                    {
+                        catalog.is_shadow(catalog_arena, row.name.as_slice())
+                    }
+                    #[cfg(not(feature = "vtab"))]
+                    {
+                        false
+                    }
+                } =>
+            {
+                #[cfg(feature = "vtab")]
+                let shadow_opaque = !matches!(
+                    e,
+                    Error::Schema {
+                        kind: crate::error::SchemaKind::UnknownCollation,
+                    }
+                );
+                #[cfg(not(feature = "vtab"))]
+                let _ = e;
                 catalog.tables.push(TableDef {
                     name: intern(catalog_arena, row.name.as_slice())?,
                     root: row.root,
@@ -700,6 +822,8 @@ pub async fn build_catalog<S: Storage>(
                     #[cfg(feature = "v16")]
                     strict: false,
                     foreign_coll: true,
+                    #[cfg(feature = "vtab")]
+                    shadow_opaque,
                     #[cfg(feature = "v16")]
                     autoinc: false,
                     #[cfg(not(feature = "triggers"))]
@@ -869,6 +993,8 @@ pub async fn build_catalog<S: Storage>(
             strict,
             #[cfg(any(feature = "v04", feature = "indexes"))]
             foreign_coll: false,
+            #[cfg(feature = "vtab")]
+            shadow_opaque: false,
             #[cfg(feature = "v16")]
             autoinc: rowid_alias.is_some()
                 && crate::sql::parser::has_autoincrement::<S::Error>(sql.as_slice(), &scratch),

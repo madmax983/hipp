@@ -1089,7 +1089,7 @@ impl<S: Storage> Connection<S> {
             if sp.derived.is_some() || sp.root <= 1 || sp.rec != 0 || sp.temp {
                 continue;
             }
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             if sp.tvf != 0 {
                 continue;
             }

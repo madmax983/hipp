@@ -34,6 +34,8 @@ pub mod pager;
 #[cfg(feature = "v04")]
 pub mod query;
 pub mod record;
+#[cfg(feature = "rtree")]
+pub mod rtree;
 #[cfg(feature = "v04")]
 pub mod rules;
 pub mod schema;
@@ -45,6 +47,8 @@ pub mod storage;
 pub mod systime;
 #[cfg(feature = "utf16")]
 pub mod utf16;
+#[cfg(feature = "vtab")]
+pub mod vtab;
 #[cfg(feature = "wal")]
 pub mod wal;
 #[cfg(feature = "window")]

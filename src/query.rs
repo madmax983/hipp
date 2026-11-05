@@ -204,6 +204,12 @@ pub fn agg_row<E>(p: &AggParts<'_>, ctx: &Ctx<'_>) -> Result<Option<AVec<OwnedVa
 /// scalar forms of min/max.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFn {
+    /// `rtreenode(ndim, blob)` / `rtreedepth(blob)` (v0.16,
+    /// `rtree`): the pin's R*Tree test functions.
+    #[cfg(feature = "rtree")]
+    RtreeNode,
+    #[cfg(feature = "rtree")]
+    RtreeDepth,
     Abs,
     Length,
     Upper,
@@ -582,6 +588,10 @@ pub struct SourceDesc {
     /// object (`json::Op::EachValue`).
     #[cfg(feature = "json")]
     pub json_tvf: u8,
+    /// A virtual table's columns `*` shows (v0.16, `vtab`): the
+    /// rest are HIDDEN. 0: all.
+    #[cfg(feature = "vtab")]
+    pub vt_visible: usize,
 }
 
 /// What an ALTER TABLE learns from planning a view (v0.16, `v16`):
@@ -704,6 +714,8 @@ impl SourceDesc {
             dbname: AVec::new(),
             #[cfg(feature = "json")]
             json_tvf: 0,
+            #[cfg(feature = "vtab")]
+            vt_visible: 0,
         }
     }
 
@@ -935,7 +947,7 @@ pub struct SubSource {
     /// `derived` plan is a placeholder whose one VALUES row holds
     /// the resolved arguments, so every plan walker (correlation,
     /// shifts, aggregates, subqueries) sees them.
-    #[cfg(feature = "json")]
+    #[cfg(any(feature = "json", feature = "vtab"))]
     pub tvf: u8,
     /// A lateral JSON table-valued source's (v0.16, `json`): the
     /// slots of the sources before it that nothing but its
@@ -943,8 +955,13 @@ pub struct SubSource {
     /// (so a plan shifted whole keeps them). The join clears them
     /// once the call has run, so the rows it makes do not each
     /// carry a copy of the document (`FROM t, json_each(t.j)`).
-    #[cfg(feature = "json")]
+    #[cfg(any(feature = "json", feature = "vtab"))]
     pub tvf_dead: AVec<usize>,
+    /// A virtual table (v0.16, `vtab`): its module and plan; `tvf`
+    /// is then `TVF_VTAB` (with `TVF_LATERAL` when a filter argument
+    /// reads a source to its left).
+    #[cfg(feature = "vtab")]
+    pub vt: Option<Box<crate::vtab::VtSrc>>,
     /// The source's index access path (v0.16, `expr_index`): the
     /// rows an index or the rowid B-tree finds, in its order; `None`
     /// scans the table in rowid order.
@@ -980,8 +997,12 @@ pub enum Hint {
 
 /// `SubSource::tvf`: the arguments read a FROM source to the left,
 /// so the rows are computed per row of the sources before it.
-#[cfg(feature = "json")]
+#[cfg(any(feature = "json", feature = "vtab"))]
 pub const TVF_LATERAL: u8 = 0x80;
+
+/// `SubSource::tvf` of a virtual-table source (v0.16, `vtab`).
+#[cfg(feature = "vtab")]
+pub const TVF_VTAB: u8 = 0x40;
 
 /// A recursive common table expression's shape (v0.16, `v16`),
 /// carried by its `SubPlan`: compound tails from index `split - 1`
@@ -1671,6 +1692,10 @@ pub fn expand_star<E>(
             // A table-valued function's hidden columns (v0.16).
             #[cfg(feature = "json")]
             if src.json_tvf != 0 && ci >= crate::json::TVF_VISIBLE {
+                continue;
+            }
+            #[cfg(feature = "vtab")]
+            if src.vt_visible != 0 && ci >= src.vt_visible {
                 continue;
             }
             let joined = qual.is_none()
@@ -2770,6 +2795,15 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
     {
         return Some(ScalarFn::Date(d));
     }
+    #[cfg(feature = "rtree")]
+    if f.is_none() {
+        if eq_ci(name, b"rtreenode") {
+            return Some(ScalarFn::RtreeNode);
+        }
+        if eq_ci(name, b"rtreedepth") {
+            return Some(ScalarFn::RtreeDepth);
+        }
+    }
     #[cfg(feature = "math")]
     if f.is_none() {
         return crate::math::MathFn::lookup(name).map(ScalarFn::Math);
@@ -2786,6 +2820,8 @@ fn arity(f: ScalarFn) -> (usize, usize) {
         // used to run.
         ScalarFn::Coalesce => (2, usize::MAX),
         ScalarFn::Nullif | ScalarFn::Instr => (2, 2),
+        #[cfg(feature = "rtree")]
+        ScalarFn::RtreeNode => (2, 2),
         ScalarFn::Substr => (2, 3),
         ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
         ScalarFn::Replace => (3, 3),
@@ -2949,6 +2985,34 @@ fn resolve_call_body<E>(
     enclosing: &[ScopeGroup],
     planner: SubPlanner<'_, E>,
 ) -> Result<RExpr, E> {
+    // `rtreecheck([schema,] table)` (v0.16, `rtree`) reads the
+    // database: it runs as the scalar subquery `(SELECT * FROM
+    // <check source>(args))` over the internal one-row source that
+    // performs the check (`vtab::Module::Check`).
+    #[cfg(feature = "rtree")]
+    if eq_ci(name, b"rtreecheck") && !star {
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::Schema {
+                kind: SchemaKind::WrongArgumentCount,
+            });
+        }
+        let t = arena.alloc_copy_handle(crate::vtab::CHECK_NAME)?;
+        let mut sel = crate::sql::parser::star_select(t, None, None, AVec::new(), arena);
+        if let Some(f) = sel.from.as_mut_slice().first_mut() {
+            let mut a = AVec::new();
+            for e in args.iter() {
+                a.push(e.clone());
+            }
+            f.args = Some(a);
+        }
+        return resolve_scoped::<E>(
+            &Expr::ScalarSubquery(Box::new(sel)),
+            arena,
+            cur,
+            enclosing,
+            planner,
+        );
+    }
     // CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP without the
     // `datetime` leaf (v0.16): the clock pseudo-columns a DEFAULT
     // expression resolves against (`rules::prepare_default`);
@@ -6428,6 +6492,31 @@ fn scalar_values<E>(
         ScalarFn::OctetLength => crate::func::octet_length(v0),
         #[cfg(feature = "v16")]
         ScalarFn::Unhex => crate::func::unhex(v0, v1),
+        // The pin's `(u8)sqlite3_value_int(ndim)`, and the blob's
+        // bytes (text reads as its bytes).
+        #[cfg(feature = "rtree")]
+        ScalarFn::RtreeNode => {
+            let nd = i64::from(crate::func::int64_value(v0) as i32);
+            let b: &[u8] = match v1 {
+                Some(OwnedValue::Blob(b) | OwnedValue::Text(b)) => b.as_slice(),
+                _ => &[],
+            };
+            match crate::rtree::rtreenode(nd, b) {
+                Some(t) => OwnedValue::Text(t),
+                None => OwnedValue::Null,
+            }
+        }
+        #[cfg(feature = "rtree")]
+        ScalarFn::RtreeDepth => match v0 {
+            OwnedValue::Blob(b) if b.len() >= 2 => {
+                OwnedValue::Integer(i64::from(crate::rtree::depth_of(b.as_slice())))
+            }
+            _ => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::RtreeDepthArgument,
+                });
+            }
+        },
         ScalarFn::Nullif => {
             let b = v1.unwrap_or(&OwnedValue::Null);
             if !matches!(v0, OwnedValue::Null)

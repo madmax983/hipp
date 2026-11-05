@@ -830,6 +830,32 @@ aspirations.
   after the journal is deleted. Ungated: freelist trunks hold the
   pin's `usable/4 - 8` leaves. Without the leaf such files stay
   read only (`AutoVacuumUnsupported`).
+- **Virtual tables, `generate_series`, `dbstat` and the R*Tree**
+  (leaves `vtab` and `rtree`, in `max`). One internal module
+  abstraction modelled on the pin's `sqlite3_module` (Rust traits,
+  no C ABI: xBestIndex with constraint usage / omit / idxNum /
+  idxStr / cost, filter cursors, xUpdate, hidden columns, eponymous
+  modules, shadow-table names). `CREATE VIRTUAL TABLE [IF NOT
+  EXISTS] t USING m(args)` and its DROP store and remove exactly the
+  pin's `sqlite_schema` rows; a file with a virtual table of a
+  module hipp lacks opens, and only statements touching that table
+  are refused ("no such module"). `generate_series(start, stop,
+  step)` as the pin's shell ships it (hidden `start` / `stop` /
+  `step`, its constraint handling on `value`, its 64-bit
+  arithmetic and its "first argument" error); `dbstat` byte for
+  byte on the same file (pages, overflow chains, `aggregate`,
+  `schema`, `name`). `rtree` / `rtree_i32` of 1-5 dimensions with
+  `+aux` columns: the shadow tables `%_node` / `%_parent` /
+  `%_rowid` are written byte-compatibly with the pin (node size,
+  ChooseLeaf, the R*-tree split, delete with node removal and
+  reinsertion, node numbering, float32 rounding outward), so
+  either engine continues the other's files and each one's
+  `rtreecheck()` / integrity_check passes on the other's; queries
+  with `=`, `<`, `<=`, `>`, `>=`, BETWEEN and rowid lookups through
+  xBestIndex; the pin's constraint errors under every conflict
+  clause; `rtreecheck()`, `rtreenode()`, `rtreedepth()`; ALTER
+  TABLE RENAME. Shadow tables are read only, as under the pin
+  shell's defensive mode.
 
 ## What v0.13 does
 
@@ -1155,7 +1181,10 @@ only: writes are refused with `AutoVacuumUnsupported` until `PRAGMA
 auto_vacuum = NONE; VACUUM` converts the file; with it they are
 written, pointer maps kept), no
 ATTACH without the `attach` leaf (refused; with it, one file is
-attached once — hipp has no shared page cache), no multi-process
+attached once — hipp has no shared page cache), no virtual tables
+without the `vtab` leaf (a file holding one is refused at open; with
+it `generate_series` and `dbstat`, R*Trees with `rtree`, any other
+module "no such module"), no multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 

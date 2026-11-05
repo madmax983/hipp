@@ -1045,6 +1045,18 @@ pub enum Ast {
         #[cfg(feature = "v16")]
         indexed: Option<IndexHint>,
     },
+    /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module
+    /// [(args)]` (v0.16, `vtab`): `args` are the module arguments
+    /// as written, `text` what the pin stores after `CREATE VIRTUAL
+    /// TABLE ` (the statement from the name token on).
+    #[cfg(feature = "vtab")]
+    CreateVirtual {
+        name: ABytes,
+        if_not_exists: bool,
+        module: ABytes,
+        args: AVec<ABytes>,
+        text: ABytes,
+    },
     /// `DROP TABLE [IF EXISTS] <name>` (v0.5).
     DropTable {
         name: ABytes,

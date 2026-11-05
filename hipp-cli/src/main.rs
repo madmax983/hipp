@@ -184,17 +184,45 @@ async fn print_schema<S: hipp::Storage>(
         };
         let _ = out.write_all(&shown);
         let _ = out.write_all(b";\n");
-        if ty.as_slice() != b"view" {
+        // A virtual table (v0.16) gets the view comment too: its
+        // declared columns, as the oracle shell lists them.
+        let vtab = ty.as_slice() == b"table"
+            && sql.len() >= 20
+            && sql[..20].eq_ignore_ascii_case(b"CREATE VIRTUAL TABLE");
+        if ty.as_slice() != b"view" && !vtab {
             continue;
         }
-        let cols = if let Some(i) = attached {
-            db.attached_db(i).and_then(|(_, a)| a.view_columns(name))
+        let cols = if vtab {
+            if attached.is_some() || temp {
+                continue;
+            }
+            let q = format!(
+                "PRAGMA table_info(\"{}\")",
+                String::from_utf8_lossy(name).replace('"', "\"\"")
+            );
+            let mut cols = Vec::new();
+            if let Ok(mut st) = db.prepare(&q).await {
+                while let Ok(Step::Row) = st.step().await {
+                    cols.push(st.column_bytes(1).unwrap_or_default().to_vec());
+                }
+            }
+            if cols.is_empty() {
+                continue;
+            }
+            Some(cols)
+        } else if let Some(i) = attached {
+            db.attached_db(i)
+                .and_then(|(_, a)| a.view_columns(name))
+                .map(|v| v.iter().map(|c| c.as_slice().to_vec()).collect())
         } else if temp {
-            db.temp_db().and_then(|t| t.view_columns(name))
+            db.temp_db()
+                .and_then(|t| t.view_columns(name))
+                .map(|v| v.iter().map(|c| c.as_slice().to_vec()).collect())
         } else {
             db.view_columns(name)
+                .map(|v| v.iter().map(|c| c.as_slice().to_vec()).collect())
         };
-        let Some(cols) = cols else {
+        let Some(cols): Option<Vec<Vec<u8>>> = cols else {
             continue;
         };
         let _ = out.write_all(b"/* ");
@@ -852,12 +880,62 @@ where
             // the table itself is re-created by the AUTOINCREMENT
             // table's CREATE (its own CREATE is a reserved name).
             let is_seq = |n: &[u8]| n == b"sqlite_sequence";
+            // A virtual table (v0.16) replays as its schema row, under
+            // `PRAGMA writable_schema=ON`, in schema order among the
+            // tables; its shadow tables then take `IF NOT EXISTS`.
+            let mut vtabs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut order: Vec<Vec<u8>> = Vec::new();
+            if let Ok(mut st) = db
+                .prepare("SELECT name, sql FROM main.sqlite_schema WHERE type = 'table' AND sql NOT NULL")
+                .await
+            {
+                while let Ok(Step::Row) = st.step().await {
+                    if let (Some(n), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
+                        if q.len() >= 20 && q[..20].eq_ignore_ascii_case(b"CREATE VIRTUAL TABLE") {
+                            vtabs.push((n.to_vec(), q.to_vec()));
+                        }
+                        order.push(n.to_vec());
+                    }
+                }
+            }
+            let mut writable = false;
             let ordered = tables
                 .iter()
                 .filter(|t| !is_seq(&t.0))
                 .chain(tables.iter().filter(|t| is_seq(&t.0)));
+            let mut ordered: Vec<&(Vec<u8>, Vec<u8>, String)> = ordered.collect();
+            if !vtabs.is_empty() {
+                ordered.sort_by_key(|t| order.iter().position(|n| *n == t.0).unwrap_or(usize::MAX));
+            }
+            let mut vt_done = 0usize;
             for (name, sql, list) in ordered {
-                if is_seq(name) {
+                // The virtual tables created before this table.
+                let at = order.iter().position(|n| n == name).unwrap_or(usize::MAX);
+                while let Some((vn, vq)) = vtabs.get(vt_done) {
+                    if order.iter().position(|n| n == vn).unwrap_or(usize::MAX) > at {
+                        break;
+                    }
+                    if !writable {
+                        let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
+                        writable = true;
+                    }
+                    let lit = |b: &[u8]| String::from_utf8_lossy(b).replace('\'', "''");
+                    let _ = out.write_all(
+                        format!(
+                            "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
+                            lit(vn),
+                            lit(vn),
+                            lit(vq)
+                        )
+                        .as_bytes(),
+                    );
+                    vt_done += 1;
+                }
+                if writable && sql.starts_with(b"CREATE TABLE \"") {
+                    let _ = out.write_all(b"CREATE TABLE IF NOT EXISTS ");
+                    let _ = out.write_all(&sql[13..]);
+                    let _ = out.write_all(b";\n");
+                } else if is_seq(name) {
                     let _ = out.write_all(b"DELETE FROM sqlite_sequence;\n");
                 } else {
                     let _ = out.write_all(sql);
@@ -898,6 +976,25 @@ where
                         objs.push((t.to_vec(), q.to_vec()));
                     }
                 }
+            }
+            for (vn, vq) in vtabs.iter().skip(vt_done) {
+                if !writable {
+                    let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
+                    writable = true;
+                }
+                let lit = |b: &[u8]| String::from_utf8_lossy(b).replace('\'', "''");
+                let _ = out.write_all(
+                    format!(
+                        "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
+                        lit(vn),
+                        lit(vn),
+                        lit(vq)
+                    )
+                    .as_bytes(),
+                );
+            }
+            if writable {
+                let _ = out.write_all(b"PRAGMA writable_schema=OFF;\n");
             }
             for ty in [&b"view"[..], b"trigger", b"index"] {
                 for (t, sql) in objs.iter() {
