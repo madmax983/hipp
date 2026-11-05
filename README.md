@@ -23,14 +23,15 @@ aspirations.
 
 ## Profiles and features (0.16.0)
 
-Three size-gated `no_std` profiles (thumbv7em, `opt-level = "z"`,
-LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
+Four size-gated `no_std` profiles (thumbv7em, `opt-level = "z"`,
+LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 500,952 B | 512 KiB |
 | `max` | `--no-default-features --features max` | 1,035,516 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,035,516 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.

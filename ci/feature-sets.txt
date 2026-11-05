@@ -39,3 +39,5 @@ full
 std,full
 max
 std,max
+xl
+std,xl
