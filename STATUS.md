@@ -6,6 +6,15 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 
 ## v0.16 — SQLite-parity push
 
+**Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
+(ADR 0003): tiny 76,960 B (budget 128 KiB), full 500,200 B (512
+KiB: every rung + `params`, `math`), max 1,022,404 B (1 MiB: full +
+`window`, `triggers`, `foreign_keys`, `json`, `expr_index`,
+`without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
+`autovacuum`, `vtab`, `rtree`, `fts5`, `explain`). The last unit,
+EXPLAIN QUERY PLAN, closes the push; the honest gaps of each unit
+below are the next milestone's backlog.
+
 Milestone v0.16 closes as much of the gap with the pin as
 possible under ADR 0001 (silent wrong answers fixed ungated;
 new surface behind the `v16` rung or a leaf feature; the tiny
@@ -8021,6 +8030,169 @@ SQLite extension and has no smaller faithful form; 48,884 B of the
   `INSERT INTO t(t) VALUES('integrity-check')`).
 - The hidden table column's value (`SELECT t FROM t`) is a row
   handle, not the pin's cursor pointer value (both meaningless).
+
+### EXPLAIN QUERY PLAN (2026-11-05)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated: leaf `explain` (implies `v16`), in `max` (ADR 0002), not
+`full`; its own `v16,explain` line in `ci/feature-sets.txt`. Without
+the leaf `EXPLAIN` is an unsupported statement, as before.
+
+**Shipped:**
+
+- `EXPLAIN QUERY PLAN <statement>` (`session::eqp`): the statement is
+  parsed and planned as usual (its errors are this statement's, at
+  their offsets) and never run; the result is the pin's four columns
+  `id`, `parent`, `notused`, `detail`. `parent` links the rows into
+  the pin's tree; `id` numbers them in order (the pin's are bytecode
+  addresses) and `notused` is 0. `Statement::is_explain()` is the
+  pin's `sqlite3_stmt_isexplain` (2). Parameters bind and are
+  ignored; re-execution returns the rows again. Plain `EXPLAIN` (a
+  bytecode listing) is refused, `ParseKind::ExplainBytecode`; a
+  nested EXPLAIN is a syntax error, as on the pin.
+- The rows describe the plan hipp executes, in the pin's words: one
+  loop per FROM source (`SCAN t`, `SCAN t USING [COVERING] INDEX i`,
+  `SEARCH t USING [COVERING] INDEX i (a=? AND b>? AND b<?)` with the
+  rowid / PRIMARY KEY suffix columns and `<expr>` keys, `SEARCH t
+  USING INTEGER PRIMARY KEY (rowid=?)`, `SEARCH w USING PRIMARY KEY
+  (k=?)`, ` LEFT-JOIN`, `RIGHT-JOIN t`), `SCAN x VIRTUAL TABLE INDEX
+  n:str` (hex for generate_series / dbstat, fts5's order flags as the
+  pin's 0x20 / 0x40 / 0x80, json_each / json_tree's 1 / 3, pragma
+  functions' 0), `SCAN CONSTANT ROW`, `SCAN n-ROW VALUES CLAUSE` /
+  `SCAN n CONSTANT ROWS`; the sorters (`USE TEMP B-TREE FOR ORDER BY`
+  / `LAST TERM OF` / `LAST n TERMS OF ORDER BY`, `GROUP BY`,
+  `DISTINCT` — including the pin's DISTINCT-as-GROUP-BY rewrite —
+  and `f(DISTINCT)`); `[CORRELATED] SCALAR SUBQUERY n` / `[CORRELATED]
+  LIST SUBQUERY n` where they are evaluated (IN probes with their
+  loop); `CO-ROUTINE` / `MATERIALIZE` of FROM subqueries, views and
+  CTEs by the pin's `fromClauseTermCanBeCoroutine` rule (a shared
+  materialization once), recursive CTEs' `SETUP` / `RECURSIVE STEP`,
+  window co-routines `(subquery-n)` per window class, compound
+  `MERGE (op)` / `LEFT` / `RIGHT` and `COMPOUND QUERY` / `LEFT-MOST
+  SUBQUERY` / `UNION ALL` trees (UNION's LIMIT 1 shortcut as UNION
+  ALL); UPDATE / DELETE target loops (COVERING when the pin collects
+  rowids first), UPDATE ... FROM, INSERT ... SELECT / VALUES with
+  subqueries / RETURNING, CREATE TABLE ... AS, INSTEAD OF writes of
+  views; nothing for statements without a plan (DDL, PRAGMA,
+  transactions, one-row INSERT VALUES). Statements routed to the TEMP
+  or an attached database are explained there.
+- The pin's select numbers: the parser numbers each core when the
+  pin's grammar reduces it (subqueries first, a compound's cores left
+  to right with the ORDER BY / LIMIT in the last one, WITH bodies
+  first, each VALUES row its own select, constant multi-row VALUES
+  two), a view's copy is renumbered after the statement's selects in
+  copy order, window co-routines after those; a compound subquery
+  shows its last core's number.
+- CLI: the pin shell's `eqp_render` tree for an EXPLAIN QUERY PLAN
+  statement (nothing for an empty plan).
+- Planner fixes found by comparing plans, ungated in the
+  `expr_index` / `window` code (they decide row order):
+  a core with window functions reads its rows in its last window
+  class's order (the pin's innermost window subquery's ORDER BY; ties
+  of a window's order were broken by the outer ORDER BY's index);
+  members of a merged compound are planned for the merge key (every
+  column, or an ORDER BY of result numbers); a GROUP BY / DISTINCT
+  takes its terms in any order of the index (`GROUP BY a, b` over an
+  index on (b, a) was sorted, groups in another order than the
+  pin's); a DISTINCT over the rowid is redundant (the planner was
+  given an order the pin drops); a rowid IN list delivers rowid
+  order; no `IS NULL` term on a NOT NULL key column (INTEGER PRIMARY
+  KEY, WITHOUT ROWID key, declared NOT NULL); generate_series reads
+  the ORDER BY (its index number says so). Parser: a statement-level
+  WITH clause and `IN ((SELECT ...), ...)` no longer count their
+  selects twice (numbering only).
+
+**Probing notes (live pin):**
+
+- The shell renders every EQP statement as the tree whatever
+  `.mode` is set; an empty plan prints nothing (not even `QUERY
+  PLAN`). `notused` is the loop's run cost and ids are VDBE
+  addresses (seen through Python's 3.53 module; not reproduced).
+- `SCAN` names the alias, else `[schema.]name` as written;
+  `MATERIALIZE` / `CO-ROUTINE` name a view or CTE by its own name,
+  else the alias, else `(subquery-n)`.
+- Rows are emitted in code-generation order: `f(DISTINCT)` sorters,
+  FROM subqueries, loops (with their IN-probe subqueries and ON
+  subqueries), WHERE subqueries, GROUP BY sorter, HAVING, result
+  subqueries, DISTINCT, ORDER BY subqueries, ORDER BY sorter.
+- 3.54 merges UNION / INTERSECT / EXCEPT even without ORDER BY
+  (`MERGE (op)`, members sorted by every column); UNION ALL members
+  after the last merging operator are `UNION ALL` siblings of the
+  MERGE; a pure UNION ALL chain is `COMPOUND QUERY`.
+- A DISTINCT whose ORDER BY is its result list (any directions) is
+  run as a GROUP BY labelled `DISTINCT`; through a one-row rowid
+  lookup it still sorts for the ORDER BY. An aggregate without GROUP
+  BY drops its ORDER BY sorter; a window query whose ORDER BY
+  repeats the first window class's keys drops its outer sorter.
+- INSERT VALUES rows: one row is no plan; constant rows are one
+  `n-ROW VALUES CLAUSE` co-routine (two select numbers); rows with
+  subqueries are `n CONSTANT ROWS`, one select per row.
+- Triggers' programs are not shown; a table with triggers or FK
+  actions makes UPDATE / DELETE collect rowids first (COVERING loop).
+
+**Differences from the pin (hipp prints what it runs):** no query
+flattening (FROM subqueries, views and CTEs stay CO-ROUTINE /
+MATERIALIZE loops) and no WHERE push-down; no join reordering (FROM
+order, so a rowid lookup into an earlier table is not used); no
+automatic indexes or Bloom filters; EXISTS stays a subquery (no
+`SCAN u EXISTS`); IN subqueries are lists (no `USING INDEX i FOR
+IN-OPERATOR` / `USING ROWID SEARCH ON TABLE`); no MULTI-INDEX OR; no
+min() / max() lookup (`SEARCH t USING COVERING INDEX i`); RIGHT /
+FULL joins and UPDATE ... FROM sources read whole tables;
+`count(DISTINCT x)` sorts even over x's index; DELETE without WHERE
+deletes row by row (`SCAN t`; the pin truncates); an INSTEAD OF
+UPDATE / DELETE shows the view's co-routine. The plain-EXPLAIN
+bytecode listing has no equivalent. All pinned in
+`documented_differences`.
+
+**Tests:** `tests/eqp_v16.rs` (9 tests: 203 curated statements over
+loops, sorters, subqueries, structures and writes, each hipp's tree
+against the pin's shell on the same file; the documented differences
+as hipp goldens that must still differ from the pin; the API — four
+columns, `is_explain`, nothing runs (file state checked with the
+pin), parameters, reset, plain / broken / nested EXPLAIN refused as
+on the pin; a generated corpus — 40 random schemas × 12 queries by
+default, `HIPP_EQP_SEEDS` for more: 2,400 plans at 200 seeds match
+at 99.6%, the rest listed below; regressions for each planner fix,
+comparing rows with data). `hipp-cli/tests/cli_v16_eqp.rs` (two
+scripts, byte-identical stdout: trees, empty plans, plans between
+result rows, comments and case, `.parameter`, errors).
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Release:** the workspace and `hipp-cli` are 0.16.0; `CHANGELOG.md`
+summarises every v0.16 leaf and ungated fix; README's profile table
+and non-goals and ADR 0003 record the final layout and budgets.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**:
+the leaf is in `max` only, and the planner fixes live in
+`expr_index` / `window` code); max **1,022,404 B** (Δ **+19,616 B**,
+ratchet raised to it; under the 32 KiB threshold: the walker and
+its rendering ≈ 14 KiB, numbering and planner fixes ≈ 3 KiB, the
+CTE / view hooks and API ≈ 2 KiB). 26,172 B of the 1 MiB budget
+remain.
+
+**Honest gaps:**
+
+- hipp's cost model (`xplan`) departs from the pin's in some loop
+  choices, which EQP shows and which can order rows differently: an
+  IN on a later column of a multi-column index, a second equality
+  column of a two-column index, ties between equally costed indexes,
+  a WITHOUT ROWID table's secondary index against its primary key
+  (and their key-suffix probes), text literals compared with numeric
+  columns. The generated corpus therefore uses rowid tables and
+  single-column indexes and allows 1 in 100 plans to differ; the
+  curated corpus covers the rest.
+- `id` is a row number, not a bytecode address; `notused` is 0.
+- Select numbers inside view copies and window co-routines follow
+  the pin's observed order on the probed shapes; deeper nests (a
+  view in a view's subquery, multi-row VALUES inside compounds) may
+  number differently.
+- The schema qualifier of a table read through an attached-database
+  route is not printed (`SCAN t` for `aux.t`).
+- FK-action and trigger programs are not shown (as on the pin), but
+  neither are hipp's FK child scans the pin shows for a parent
+  DELETE (`SCAN child`).
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

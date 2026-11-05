@@ -1083,6 +1083,8 @@ impl<S: Storage> Connection<S> {
             _ => return Ok(()),
         };
         let mut plans: AVec<(usize, crate::xplan::IdxAccess)> = AVec::new();
+        #[cfg(feature = "explain")]
+        let mut naturals: AVec<(usize, (usize, bool))> = AVec::new();
         for i in 0..n {
             let Some(sp) = sources.get(i) else { break };
             // (A TEMP table's root is the temp database's page.)
@@ -1148,7 +1150,12 @@ impl<S: Storage> Connection<S> {
                     }
                 } else if !info.has_agg && !info.order_by.is_empty() {
                     order.extend_from_slice(info.order_by);
-                } else if !info.has_agg && info.distinct {
+                } else if !info.has_agg
+                    && info.distinct
+                    // A DISTINCT over the rowid is redundant (the pin's
+                    // `isDistinctRedundant`): no order to deliver.
+                    && !info.items.iter().any(|e| s.is_rowid(e))
+                {
                     group = true;
                     for e in info.items.iter() {
                         order.push((
@@ -1170,6 +1177,21 @@ impl<S: Storage> Connection<S> {
                 Some(RExpr::Literal(OwnedValue::Integer(k))) if *k > 0 => Some(log_est(*k as u64)),
                 _ => None,
             };
+            #[cfg(feature = "explain")]
+            let mut dset: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+            #[cfg(feature = "explain")]
+            if n == 1 && info.distinct && !info.has_agg && !info.order_by.is_empty() {
+                for e in info.items.iter() {
+                    dset.push((
+                        e.clone(),
+                        crate::sql::SortOrder {
+                            desc: false,
+                            nulls_first: true,
+                            coll: crate::query::expr_coll(e).unwrap_or_default(),
+                        },
+                    ));
+                }
+            }
             let q = Query {
                 conj: conj.as_slice(),
                 order: order.as_slice(),
@@ -1180,15 +1202,32 @@ impl<S: Storage> Connection<S> {
                 cover_scan: true,
                 limit,
                 distinct: info.distinct,
+                #[cfg(feature = "explain")]
+                dset: dset.as_slice(),
             };
             let (width, models) = self.table_models(arena, t, &s);
+            let notnull = self.not_null_cols(t);
             let tab = Table {
                 width,
                 indexes: models.as_slice(),
                 wr: !t.has_rowid(),
                 hint: sp.hint,
+                notnull: notnull.as_slice(),
             };
-            if let Some(mut a) = choose(&q, &s, &tab, ts.as_slice()) {
+            let chosen = choose(&q, &s, &tab, ts.as_slice());
+            #[cfg(feature = "explain")]
+            if chosen.is_none() {
+                naturals.push((i, crate::xplan::natural_sat(&q, &s, &tab, ts.as_slice())));
+            }
+            if let Some(mut a) = chosen {
+                // EXPLAIN QUERY PLAN's COVERING (v0.16, `explain`).
+                #[cfg(feature = "explain")]
+                {
+                    a.eqp.1 = models
+                        .iter()
+                        .find(|m| m.root == a.root)
+                        .is_some_and(|m| !m.covers_all && m.covers(needed.as_slice()));
+                }
                 // A covering index of a rowid table: the rows come
                 // from its entries (v0.16 review fix).
                 if t.has_rowid()
@@ -1213,7 +1252,36 @@ impl<S: Storage> Connection<S> {
                 sp.access = Some(Box::new(a.clone()));
             }
         }
+        #[cfg(feature = "explain")]
+        for (i, (n, d)) in naturals.iter() {
+            if let Some(sp) = sources.get_mut(*i) {
+                sp.eqp.natural = *n;
+                sp.eqp.nat_distinct = *d;
+            }
+        }
         Ok(())
+    }
+
+    /// Per column of `t`: never NULL (`xplan::Table::notnull`).
+    fn not_null_cols(&self, t: &crate::schema::TableDef) -> AVec<bool> {
+        #[cfg(feature = "without_rowid")]
+        let ca = &self.catalog_arena;
+        #[cfg(feature = "without_rowid")]
+        let pk = self
+            .catalog
+            .indexes_for(ca, handle_bytes(ca, t.name))
+            .find(|i| i.clustered);
+        #[cfg(not(feature = "without_rowid"))]
+        let pk: Option<&crate::schema::IndexDef> = None;
+        let mut out = AVec::new();
+        for (i, c) in t.columns.iter().enumerate() {
+            out.push(
+                c.not_null
+                    || t.rowid_alias == Some(i)
+                    || pk.is_some_and(|p| p.columns.iter().any(|k| k.col == Some(i))),
+            );
+        }
+        out
     }
 
     /// Whether an `INDEXED BY` index can serve table `t` read as
@@ -1379,13 +1447,17 @@ impl<S: Storage> Connection<S> {
             cover_scan: false,
             limit: None,
             distinct: false,
+            #[cfg(feature = "explain")]
+            dset: &[],
         };
         let (width, models) = self.table_models(arena, t, &s);
+        let notnull = self.not_null_cols(t);
         let tab = Table {
             width,
             indexes: models.as_slice(),
             wr: !t.has_rowid(),
             hint,
+            notnull: notnull.as_slice(),
         };
         let Some(mut acc) = choose(&q, &s, &tab, ts.as_slice()) else {
             return Ok(None);
@@ -1418,6 +1490,14 @@ impl<S: Storage> Connection<S> {
                 })
         });
         acc.one_pass = one_pass && !modified;
+        // EXPLAIN QUERY PLAN's COVERING (v0.16, `explain`): a two-pass
+        // loop reads only the WHERE's columns, as the pin's colUsed.
+        #[cfg(feature = "explain")]
+        {
+            acc.eqp.1 = models.iter().find(|m| m.root == acc.root).is_some_and(|m| {
+                !m.covers_all && !(acc.one_pass && !wr) && m.covers(needed.as_slice())
+            });
+        }
         Ok(Some(Box::new(acc)))
     }
 }

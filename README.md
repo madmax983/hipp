@@ -8,10 +8,11 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.16 — the SQLite-parity push (ADR 0001:
-  silent wrong answers fixed ungated, new dialect behind the
-  `v16` rung / leaf features, the tiny profile never grows),
-  on the v0.15 foundation (SPEC §2).
+- **Phase:** 0.16.0 released — v0.16, the SQLite-parity push (ADR
+  0001: silent wrong answers fixed ungated, new dialect behind the
+  `v16` rung / leaf features, the tiny profile never grows; ADR
+  0002 / 0003: the `max` profile), on the v0.15 foundation (SPEC §2).
+  `CHANGELOG.md` summarises the release.
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
@@ -19,6 +20,36 @@ aspirations.
   with the `wal` leaf, its write-ahead logs).
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## Profiles and features (0.16.0)
+
+Three size-gated `no_std` profiles (thumbv7em, `opt-level = "z"`,
+LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
+
+| profile | build | size | budget |
+|---|---|---|---|
+| `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 500,200 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,022,404 B | 1 MiB |
+
+- **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
+  `WHERE col = literal`, transactions, rollback journal and recovery.
+- **`full`** adds the ladder rungs and two leaves:
+  `indexes` (index B-trees, UNIQUE), `v04` (joins, aggregates,
+  expressions, ALTER ADD COLUMN), `v05` (UPDATE / DELETE / DROP),
+  `v06` (subqueries), `v07` (OR conflict clauses, UPDATE FROM,
+  RETURNING, upsert), `v08` (INSERT ... SELECT), `v09` (compounds,
+  derived tables), `v10` (subqueries in aggregates), `v16` (the
+  parity rung: query shape, collations, operators, the function
+  library, aggregate completion, PRAGMA, views and CTEs, savepoints
+  and maintenance, ALTER / AUTOINCREMENT / TEMP, depth limits),
+  `params` (bound parameters), `math` (math functions).
+- **`max`** adds the heavyweight leaves: `window` (window functions),
+  `triggers`, `foreign_keys`, `json` (JSON / JSONB), `expr_index`
+  (expression and partial indexes, index-aware planning),
+  `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
+  `autovacuum`, `vtab` (virtual tables, generate_series, dbstat),
+  `rtree`, `fts5`, `explain` (EXPLAIN QUERY PLAN).
 
 ## What v0.16 does
 
@@ -897,6 +928,24 @@ aspirations.
   ALTER TABLE RENAME. Transactions, savepoints and crashes recover
   the shadow tables like any other table's pages.
 
+- **EXPLAIN QUERY PLAN** (leaf `explain`, in `max`).
+  `EXPLAIN QUERY PLAN <statement>` returns the pin's four columns
+  (`id`, `parent`, `notused`, `detail`) describing the plan hipp
+  executes, in the pin's words — SCAN / SEARCH loops with INTEGER
+  PRIMARY KEY, PRIMARY KEY, [COVERING] INDEX and the probed keys,
+  LEFT-JOIN / RIGHT-JOIN, the USE TEMP B-TREE sorters, (CORRELATED)
+  SCALAR / LIST SUBQUERY with the pin's select numbers, CO-ROUTINE /
+  MATERIALIZE, recursive CTEs, MERGE / COMPOUND QUERY trees, window
+  co-routines, VIRTUAL TABLE INDEX, VALUES and constant rows, and the
+  UPDATE / DELETE / INSERT plans — and the CLI prints the shell's
+  tree. The statement is planned, never run; plain EXPLAIN (bytecode)
+  is refused. Where hipp's strategy differs (no flattening, join
+  reordering, automatic indexes, MULTI-INDEX OR, min/max lookup) it
+  prints what it runs (STATUS.md). Comparing plans fixed access-path
+  choices that ordered rows unlike the pin (window functions,
+  compound members, GROUP BY / DISTINCT over a permuted index, rowid
+  IN lists, `IS NULL` on NOT NULL keys).
+
 ## What v0.13 does
 
 - Everything v0.12 does (below), plus **uncorrelated-
@@ -1180,9 +1229,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.13) |
+| Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **72,704 B** (Δ **−28 B** vs v0.12's 72,732 B; the hoisting machinery is compiled out of the tiny profile with the rest of the subquery paths, and the delta is dead-code noise) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,200 B of 512 KiB, `max` 1,022,404 B of 1 MiB; ADR 0003) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -1205,29 +1254,24 @@ differential testing. It is a separate crate and contributes
 
 ## Non-goals (SPEC §3)
 
-No WAL without the `wal` leaf (files in WAL mode, or with a
-non-empty `-wal` beside them, are then rejected with
-`WalUnsupported`; with it, single-process WAL only — no shared
-`-shm` wal-index, one connection per WAL database), no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
-them), no AUTOINCREMENT tables
-created (refused below `v16`, foreign ones load read-only there;
-`v16` maintains `sqlite_sequence`), no expression or partial
-indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
-stored but never executed (all of these in the tiny profile: the
-`v04` ... `v16` rungs add them — views execute with `v16`), no
-UTF-16 databases without the `utf16` leaf (refused at open), no
-writes to auto-vacuum files without the `autovacuum` leaf (read
-only: writes are refused with `AutoVacuumUnsupported` until `PRAGMA
-auto_vacuum = NONE; VACUUM` converts the file; with it they are
-written, pointer maps kept), no
-ATTACH without the `attach` leaf (refused; with it, one file is
-attached once — hipp has no shared page cache), no virtual tables
-without the `vtab` leaf (a file holding one is refused at open; with
-it `generate_series` and `dbstat`, R*Trees with `rtree`, FTS5 tables
-and `fts5vocab` with `fts5`, any other module "no such module"), no
-multi-process
-locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
-Rust library, not a drop-in replacement.
+Each leaf left out of a build refuses what it would add, never
+misreads it: without `wal` a WAL file (or a non-empty `-wal`) is
+refused (`WalUnsupported`); without `without_rowid`, `utf16` or `vtab`
+a file holding such tables or text is refused at open; without
+`autovacuum` an auto-vacuum file is read but not written; without
+`attach`, ATTACH is refused; without `explain`, EXPLAIN is. Below the
+rungs (the tiny profile) there are no indexes, joins, subqueries,
+UPDATE / DELETE or views.
+
+Not planned in any profile: multi-process locking or a shared `-shm`
+wal-index (WAL is single-process; one connection per database); a
+shared page cache (a file is attached once); plain EXPLAIN's
+bytecode listing (hipp has no VDBE); query flattening, join
+reordering, automatic indexes, Bloom filters or MULTI-INDEX OR in
+the planner (EXPLAIN QUERY PLAN shows hipp's own plan); loadable
+extensions and application-defined SQL functions; and **no `sqlite3_*`
+C ABI, ever** (D3): hipp is a Rust library, not a drop-in
+replacement.
 
 ## Layout
 

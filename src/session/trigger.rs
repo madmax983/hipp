@@ -151,7 +151,7 @@ pub(super) struct InsteadPlan {
     pub(super) event: TrigEvent,
     /// INSERT: the new rows' supplied values; UPDATE: the view's
     /// rows followed by the SET values; DELETE: the view's rows.
-    source: Box<crate::query::SubPlan>,
+    pub(super) source: Box<crate::query::SubPlan>,
     /// The view's width.
     ncols: usize,
     /// The view column each supplied value (INSERT) or SET value

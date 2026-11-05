@@ -826,6 +826,15 @@ pub struct SelectStmt {
     /// shadows an earlier one, as on the pin.
     #[cfg(feature = "window")]
     pub windows: AVec<(ABytes, WindowDef)>,
+    /// The pin's select number (`Select.selId`; v0.16, `explain`):
+    /// cores are numbered as the pin's parser reduces them (every
+    /// subquery a core holds before the core itself, a compound's
+    /// cores left to right, WITH bodies first); the copy of a view
+    /// read by a statement is renumbered after the statement's own
+    /// selects. EXPLAIN QUERY PLAN prints it (`SCALAR SUBQUERY n`,
+    /// `(subquery-n)`).
+    #[cfg(feature = "explain")]
+    pub sel: u32,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`

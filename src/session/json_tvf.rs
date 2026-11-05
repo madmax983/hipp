@@ -89,8 +89,12 @@ impl<S: Storage> Connection<S> {
             scalar_col: 0,
             rec: None,
             mat: 0,
+            #[cfg(feature = "explain")]
+            sel: 0,
         };
         plans.push(SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: 0,
             kind: s.kind,
             on: None,

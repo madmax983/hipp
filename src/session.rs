@@ -105,6 +105,15 @@ mod alter;
 mod attach;
 #[cfg(feature = "v16")]
 mod cte;
+#[cfg(feature = "explain")]
+mod eqp;
+
+/// A boxed `Connection::prepare` future (v0.16, `explain`: the
+/// EXPLAIN QUERY PLAN prepare recurses).
+#[cfg(feature = "explain")]
+type Prep<'a, 'f, S> = core::pin::Pin<
+    Box<dyn core::future::Future<Output = Result<Statement<'a, S>, <S as Storage>::Error>> + 'f>,
+>;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
 #[cfg(feature = "fts5")]
@@ -938,6 +947,11 @@ enum Plan {
     /// `triggers`).
     #[cfg(feature = "triggers")]
     Instead(Box<trigger::InsteadPlan>),
+    /// `EXPLAIN QUERY PLAN` (v0.16, `explain`; `session::eqp`): the
+    /// rows describing the plan of the statement it names, which was
+    /// planned and is never run.
+    #[cfg(feature = "explain")]
+    Explain(eqp::EqpRows),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -979,6 +993,9 @@ struct QueryPlan {
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
     #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     comp_order: AVec<(usize, crate::sql::SortOrder)>,
+    /// The pin's select number (v0.16, `explain`; `SubPlan::sel`).
+    #[cfg(feature = "explain")]
+    sel: u32,
 }
 
 /// One compound member core's ORDER BY matching data (v0.16;
@@ -1333,6 +1350,12 @@ pub struct Connection<S: Storage> {
     /// (`thumbv6m`) do not have.
     #[cfg(feature = "v06")]
     next_subplan_id: core::cell::Cell<usize>,
+    /// The next SELECT core to plan is a member of a compound the
+    /// executor merges (v0.16, `expr_index`): its access path is
+    /// chosen for the merge key — every result column, ascending —
+    /// as the pin plans a `multiSelectOrderBy` member.
+    #[cfg(all(feature = "expr_index", feature = "v09"))]
+    merge_core: core::cell::Cell<Option<MergeSpec>>,
     /// The recursive CTEs whose recursive SELECTs are being
     /// planned (v0.16, `v16`): each one's id and column shape,
     /// which its recursive reference takes (`plan_rec_ref`). A
@@ -1414,6 +1437,8 @@ impl<S: Storage> Connection<S> {
             sub_execs: 0,
             #[cfg(feature = "v06")]
             next_subplan_id: core::cell::Cell::new(1),
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            merge_core: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
             rec_scope: core::cell::Cell::new(AVec::new()),
             #[cfg(feature = "v04")]
@@ -1495,6 +1520,12 @@ impl<S: Storage> Connection<S> {
     pub async fn prepare(&mut self, sql: &str) -> Result<Statement<'_, S>, S::Error> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
+        }
+        // `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`).
+        #[cfg(feature = "explain")]
+        if let Some(at) = eqp::query_plan_prefix::<S::Error>(sql.as_bytes())? {
+            let eqp: Prep<'_, '_, S> = Box::pin(self.prepare_eqp(sql, at));
+            return eqp.await;
         }
         // A new statement reads the clock afresh (v0.16, `datetime`).
         #[cfg(feature = "datetime")]
@@ -1665,6 +1696,36 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "foreign_keys")]
             fk_skip: [None; 2],
         })
+    }
+
+    /// Prepare `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`):
+    /// the statement from byte `at` of `sql` is prepared, described
+    /// (`session::eqp`) and never run. Its errors are this
+    /// statement's, at their offsets in `sql`.
+    #[cfg(feature = "explain")]
+    async fn prepare_eqp(&mut self, sql: &str, at: usize) -> Result<Statement<'_, S>, S::Error> {
+        let rest = sql.get(at..).unwrap_or("");
+        if eqp::query_plan_prefix::<S::Error>(rest.as_bytes())?.is_some() {
+            return Err(Error::Parse {
+                offset: at,
+                kind: crate::error::ParseKind::UnexpectedToken,
+            });
+        }
+        let prep: Prep<'_, '_, S> = Box::pin(self.prepare(rest));
+        let mut st = prep.await.map_err(|e| match e {
+            Error::Parse { offset, kind } => Error::Parse {
+                offset: offset.saturating_add(at),
+                kind,
+            },
+            e => e,
+        })?;
+        let rows = st.eqp_rows().await?;
+        st.plan = Plan::Explain(rows);
+        #[cfg(feature = "params")]
+        {
+            st.binds.stale = false;
+        }
+        Ok(st)
     }
 
     /// Prepare a statement routed to the TEMP database (v0.16,
@@ -3425,9 +3486,15 @@ impl<S: Storage> Connection<S> {
                 rec: None,
                 #[cfg(feature = "v16")]
                 mat: 0,
+                #[cfg(feature = "explain")]
+                sel: stmt.sel,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
+        }
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        if !stmt.compound.is_empty() {
+            self.merge_core.set(merge_member(stmt, 0));
         }
         let core = self.plan_core(stmt, arena, enclosing)?;
         #[cfg(feature = "v09")]
@@ -3462,6 +3529,8 @@ impl<S: Storage> Connection<S> {
             rec: None,
             #[cfg(feature = "v16")]
             mat: 0,
+            #[cfg(feature = "explain")]
+            sel: stmt.sel,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -3585,7 +3654,12 @@ impl<S: Storage> Connection<S> {
     ) -> Result<SubCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
-        for (op, core) in stmt.compound.iter() {
+        for (i, (op, core)) in stmt.compound.iter().enumerate() {
+            #[cfg(feature = "expr_index")]
+            if core.values.is_empty() {
+                self.merge_core.set(merge_member(stmt, i + 1));
+            }
+            let _ = i;
             let (p, k) = self.plan_subquery_keyed(core, arena, enclosing)?;
             if p.width() != width {
                 return Err(Error::Schema {
@@ -3617,7 +3691,12 @@ impl<S: Storage> Connection<S> {
     ) -> Result<QueryCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
-        for (op, core) in stmt.compound.iter() {
+        for (i, (op, core)) in stmt.compound.iter().enumerate() {
+            #[cfg(feature = "expr_index")]
+            if core.values.is_empty() {
+                self.merge_core.set(merge_member(stmt, i + 1));
+            }
+            let _ = i;
             let (p, k) = self.plan_query_keyed(core, arena)?;
             if p.width != width {
                 return Err(Error::Schema {
@@ -4456,8 +4535,14 @@ impl<S: Storage> Connection<S> {
                 compound,
                 values,
                 comp_order,
+                #[cfg(feature = "explain")]
+                sel: stmt.sel,
             };
             return Ok((qp, keys));
+        }
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        if !stmt.compound.is_empty() {
+            self.merge_core.set(merge_member(stmt, 0));
         }
         let core = self.plan_core(stmt, arena, &[])?;
         let width = core.items.len();
@@ -4485,6 +4570,8 @@ impl<S: Storage> Connection<S> {
             compound,
             values: AVec::new(),
             comp_order,
+            #[cfg(feature = "explain")]
+            sel: stmt.sel,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -4539,6 +4626,8 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
     ) -> Result<CorePlan, S::Error> {
         use crate::query::{ScopeGroup, has_agg, item_result_affinity, resolve_scoped};
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        let merge = self.merge_core.take();
         let (base_width, base_src) = ScopeGroup::stack_end(enclosing);
         let mut descs = AVec::new();
         let mut offsets = AVec::new();
@@ -4842,6 +4931,60 @@ impl<S: Storage> Connection<S> {
         let limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
         // v0.16 (`expr_index`): each table source's index access
         // path, the pin's choice (`xplan`).
+        // A merged compound member's loop delivers the merge key if
+        // it can (`merge_core`).
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = match merge {
+            Some((terms, rest)) if order_by.is_empty() && !has_agg => {
+                let key = |j: usize, desc: bool, nulls_first: bool| {
+                    items.as_slice().get(j).map(|e| {
+                        (
+                            e.clone(),
+                            crate::sql::SortOrder {
+                                desc,
+                                nulls_first,
+                                coll: crate::query::expr_coll(e).unwrap_or_default(),
+                            },
+                        )
+                    })
+                };
+                let mut out: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+                for (j, d, n) in terms.iter() {
+                    if let Some(k) = key(*j, *d, *n) {
+                        out.push(k);
+                    }
+                }
+                for j in 0..items.len() {
+                    if rest
+                        && !terms.iter().any(|t| t.0 == j)
+                        && let Some(k) = key(j, false, true)
+                    {
+                        out.push(k);
+                    }
+                }
+                out
+            }
+            _ => AVec::new(),
+        };
+        #[cfg(all(feature = "expr_index", not(feature = "v09")))]
+        let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+        // A core with window functions reads its rows in the order
+        // of its last window class, which the pin's innermost window
+        // subquery sorts by (v0.16 fix, `window`: ties of a window's
+        // order then keep the pin's order).
+        #[cfg(all(feature = "expr_index", feature = "window"))]
+        let win_key = if !has_agg && group_by.is_empty() {
+            crate::window::class_keys(items.as_slice(), None)
+        } else {
+            None
+        };
+        #[cfg(all(feature = "expr_index", feature = "window"))]
+        let (merge_key, info_limit) = match win_key {
+            Some(k) => (k, None),
+            None => (merge_key, limit.as_ref()),
+        };
+        #[cfg(all(feature = "expr_index", not(feature = "window")))]
+        let info_limit = limit.as_ref();
         #[cfg(feature = "expr_index")]
         self.plan_accesses(
             arena,
@@ -4854,10 +4997,14 @@ impl<S: Storage> Connection<S> {
                 filter: filter.as_ref(),
                 group_by: group_by.as_slice(),
                 having: having.as_ref(),
-                order_by: order_by.as_slice(),
+                order_by: if merge_key.is_empty() {
+                    order_by.as_slice()
+                } else {
+                    merge_key.as_slice()
+                },
                 has_agg,
                 distinct: stmt.distinct,
-                limit: limit.as_ref(),
+                limit: info_limit,
             },
         )?;
         // v0.16 (`json`, `vtab`): what a lateral `json_each` or
@@ -5062,6 +5209,8 @@ impl<S: Storage> Connection<S> {
         }
         descs.push(desc);
         plans.push(SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: 0,
             kind: s.kind,
             on: None,
@@ -5113,6 +5262,10 @@ impl<S: Storage> Connection<S> {
         use crate::query::SourceDesc;
         #[cfg(not(feature = "v09"))]
         let _ = derived_scope;
+        #[cfg(feature = "explain")]
+        let first = plans.len();
+        #[cfg(feature = "explain")]
+        let first_off = offsets.len();
         for s in from.iter() {
             offsets.push(total);
             // v0.16: a recursive CTE's recursive reference reads
@@ -5272,6 +5425,8 @@ impl<S: Storage> Connection<S> {
                 None
             };
             plans.push(SourcePlan {
+                #[cfg(feature = "explain")]
+                eqp: Default::default(),
                 root: t.root,
                 kind: s.kind,
                 on: None,
@@ -5299,6 +5454,30 @@ impl<S: Storage> Connection<S> {
                 ext: 0,
             });
             total += t.columns.len();
+        }
+        #[cfg(feature = "explain")]
+        if let Some(ps) = plans.as_mut_slice().get_mut(first..)
+            && ps.len() == from.len()
+        {
+            for (i, (s, p)) in from.iter().zip(ps.iter_mut()).enumerate() {
+                let (scan, mat) = eqp::source_names(s, arena);
+                let base = offsets.as_slice().get(first_off + i).copied().unwrap_or(0);
+                p.eqp = crate::query::EqpInfo {
+                    scan,
+                    mat,
+                    base,
+                    ..Default::default()
+                };
+                // A table-valued pragma function or the empty temp
+                // schema: rows the planner made, read as a table.
+                #[cfg(any(feature = "json", feature = "vtab"))]
+                let tvf = p.tvf != 0;
+                #[cfg(not(any(feature = "json", feature = "vtab")))]
+                let tvf = false;
+                if s.derived.is_none() && p.derived.is_some() && !tvf && p.rec == 0 {
+                    p.eqp.mat = copy_vec(b"\0");
+                }
+            }
         }
         Ok(())
     }
@@ -6691,6 +6870,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// again, so the plan reflects the values bound, the schema
     /// and the clock at the time.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
+        // An EXPLAIN QUERY PLAN returns its rows and nothing else.
+        #[cfg(feature = "explain")]
+        if matches!(self.plan, Plan::Explain(_)) {
+            return self.step_explain().await;
+        }
         // The `json_each` documents this step holds (v0.16, `json`;
         // `Env::json_docs`) go once the plan has run: its rows are
         // projected by then (a query materialises its result in
@@ -6819,6 +7003,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "foreign_keys")]
         self.fk_stmt_begin();
         let r = match &self.plan {
+            #[cfg(feature = "explain")]
+            Plan::Explain(_) => self.step_explain().await,
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
             #[cfg(feature = "v16")]
@@ -6956,6 +7142,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// repeated executions reuse the same arena space.
     #[cfg(feature = "params")]
     async fn replan(&mut self) -> Result<(), S::Error> {
+        // An EXPLAIN QUERY PLAN never plans again (or runs).
+        #[cfg(feature = "explain")]
+        if matches!(self.plan, Plan::Explain(_)) {
+            self.binds.stale = false;
+        }
         if !self.binds.stale {
             return Ok(());
         }
@@ -13332,8 +13523,21 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Delete { returning, .. } => returning.len(),
             #[cfg(feature = "triggers")]
             Plan::Instead(ip) => ip.returning_width(),
+            #[cfg(feature = "explain")]
+            Plan::Explain(_) => 4,
             _ => 0,
         }
+    }
+
+    /// The pin's `sqlite3_stmt_isexplain`: 2 for an `EXPLAIN QUERY
+    /// PLAN` statement (v0.16, `explain`), whose four result columns
+    /// are `id`, `parent`, `notused` and `detail`; 0 otherwise.
+    pub fn is_explain(&self) -> u8 {
+        #[cfg(feature = "explain")]
+        if matches!(self.plan, Plan::Explain(_)) {
+            return 2;
+        }
+        0
     }
 
     /// The current row's value at `i` (valid until the next `step`).
@@ -13744,6 +13948,48 @@ fn run_compound(
     rows.as_mut_slice()
         .sort_by(|a, b| compound_order_cmp(a, b, order, enc));
     rows
+}
+
+/// The merge key a compound member is read for (v0.16,
+/// `expr_index`; `Connection::merge_core`): `(result column, DESC,
+/// NULLS FIRST)` terms, then (when the flag says so) every other
+/// column ascending.
+#[cfg(all(feature = "expr_index", feature = "v09"))]
+type MergeSpec = (AVec<(usize, bool, bool)>, bool);
+
+/// The merge key core `k` (0: the head) of compound `stmt` is merged
+/// by (see `run_compound`), as the pin's `multiSelectOrderBy` keys
+/// its members: without an ORDER BY, every column of a core at or
+/// left of the last operator other than UNION ALL; under an ORDER BY
+/// of result-column numbers, those columns, then the others unless
+/// the last operator is UNION ALL. `None`: not merged, or an ORDER
+/// BY by name or expression (planned without a key).
+#[cfg(all(feature = "expr_index", feature = "v09"))]
+fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
+    use crate::sql::CompoundOp::UnionAll;
+    if stmt.order_by.is_empty() {
+        return stmt
+            .compound
+            .iter()
+            .rposition(|(op, _)| *op != UnionAll)
+            .filter(|l| k <= l + 1)
+            .map(|_| (AVec::new(), true));
+    }
+    let mut terms = AVec::new();
+    for (e, o) in stmt.order_by.iter() {
+        match e {
+            Expr::Literal(crate::sql::Literal::Integer(n)) if *n >= 1 => {
+                terms.push((usize::try_from(*n - 1).ok()?, o.desc, o.nulls_first));
+            }
+            _ => return None,
+        }
+    }
+    let rest = stmt
+        .compound
+        .as_slice()
+        .last()
+        .is_some_and(|(op, _)| *op != UnionAll);
+    Some((terms, rest))
 }
 
 /// The pin's UNION-with-LIMIT-1 shortcut (3.54.0: "UNION queries

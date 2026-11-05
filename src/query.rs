@@ -996,6 +996,30 @@ pub struct SubSource {
     /// for none.
     #[cfg(feature = "attach")]
     pub ext: u16,
+    /// EXPLAIN QUERY PLAN's names for the source (v0.16, `explain`):
+    /// as a loop (`SCAN x`: the alias, else the `[schema.]` table,
+    /// view or CTE name) and as a subquery the statement computes
+    /// (`MATERIALIZE x`: the view's or CTE's name, else the alias),
+    /// empty for an unnamed FROM subquery (`(subquery-n)`); and what
+    /// its natural order delivers.
+    #[cfg(feature = "explain")]
+    pub eqp: EqpInfo,
+}
+
+/// What EXPLAIN QUERY PLAN says of a FROM source (v0.16, `explain`;
+/// `SubSource::eqp`).
+#[cfg(feature = "explain")]
+#[derive(Debug, Clone, Default)]
+pub struct EqpInfo {
+    pub scan: AVec<u8>,
+    pub mat: AVec<u8>,
+    /// Where its columns start in the query row.
+    pub base: usize,
+    /// A table read in its own order (no access path): how many
+    /// ORDER BY / GROUP BY terms that order delivers, and whether it
+    /// brings a DISTINCT's equal rows together (`xplan::natural_sat`).
+    pub natural: usize,
+    pub nat_distinct: bool,
 }
 
 /// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
@@ -1124,6 +1148,10 @@ pub struct SubPlan {
     /// plan.
     #[cfg(feature = "v16")]
     pub mat: u32,
+    /// The pin's select number of this core (v0.16, `explain`;
+    /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
+    #[cfg(feature = "explain")]
+    pub sel: u32,
 }
 
 impl SubPlan {

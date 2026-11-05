@@ -81,6 +81,10 @@ pub fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 struct Parser<'a> {
     toks: AVec<Token>,
     pos: usize,
+    /// The select numbers handed out so far (v0.16, `explain`;
+    /// `SelectStmt::sel`).
+    #[cfg(feature = "explain")]
+    nsel: core::cell::Cell<u32>,
     limit: usize,
     arena: &'a Arena,
     sql: &'a [u8],
@@ -721,11 +725,21 @@ const IDX_HELD: usize = 10;
 const INS_RETURNING: usize = 10;
 
 impl<'a> Parser<'a> {
+    /// The next select number (v0.16, `explain`; `SelectStmt::sel`).
+    #[cfg(feature = "explain")]
+    fn next_sel(&self) -> u32 {
+        let n = self.nsel.get().saturating_add(1);
+        self.nsel.set(n);
+        n
+    }
+
     fn new(toks: AVec<Token>, arena: &'a Arena, sql: &'a [u8], lim: Limits) -> Parser<'a> {
         Parser {
             limit: toks.len(),
             toks,
             pos: 0,
+            #[cfg(feature = "explain")]
+            nsel: core::cell::Cell::new(0),
             arena,
             sql,
             lim,
@@ -1012,9 +1026,13 @@ impl<'a> Parser<'a> {
     #[cfg(feature = "v16")]
     fn with_statement<E>(&mut self) -> Result<Ast, E> {
         let save = self.pos;
+        #[cfg(feature = "explain")]
+        let save_sel = self.nsel.get();
         let with = self.with_clause::<E>(self.held)?;
         if self.cur_is_kw(b"SELECT") || self.cur_is_kw(b"VALUES") {
             self.pos = save;
+            #[cfg(feature = "explain")]
+            self.nsel.set(save_sel);
             return Ok(Ast::Select(self.select_rich::<E>()?));
         }
         let body = if self.cur_is_kw(b"INSERT") {
@@ -2375,6 +2393,13 @@ impl<'a> Parser<'a> {
         let mut rows = AVec::new();
         #[cfg(feature = "v04")]
         let mut core_h = 1usize;
+        // The pin's select numbers (v0.16, `explain`): each row is a
+        // select of its own, after its subqueries; rows with none
+        // become one VALUES co-routine, two selects in all.
+        #[cfg(feature = "explain")]
+        let sel0 = self.nsel.get();
+        #[cfg(feature = "explain")]
+        let mut subs = false;
         loop {
             self.expect::<E>(Tok::LParen)?;
             // `VALUES LP` / `values COMMA LP`, then `nexprlist
@@ -2397,10 +2422,20 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "v04")]
             self.peak::<E>(base + lp + 2)?;
             rows.push(row);
+            #[cfg(feature = "explain")]
+            {
+                let k = self.nsel.get();
+                subs |= k != sel0.saturating_add(rows.len() as u32 - 1);
+                self.next_sel();
+            }
             if self.eat(Tok::Comma) {
                 continue;
             }
             break;
+        }
+        #[cfg(feature = "explain")]
+        if !subs && rows.len() > 1 {
+            self.nsel.set(sel0.saturating_add(2));
         }
         #[cfg(feature = "v04")]
         {
@@ -3466,6 +3501,8 @@ impl<'a> Parser<'a> {
                 // more symbol: a scalar-subquery list item the pin
                 // turns into this form).
                 let rsub0 = self.rsub;
+                #[cfg(feature = "explain")]
+                let sel0 = self.nsel.get();
                 let stmt = self.subquery::<E>(3 + extra_parens)?;
                 for _ in 0..extra_parens {
                     self.expect::<E>(Tok::RParen)?;
@@ -3484,6 +3521,8 @@ impl<'a> Parser<'a> {
                 }
                 self.pos = save;
                 self.rsub = rsub0;
+                #[cfg(feature = "explain")]
+                self.nsel.set(sel0);
             }
             #[cfg(not(feature = "v06"))]
             {
@@ -4476,6 +4515,12 @@ impl<'a> Parser<'a> {
                     break;
                 };
                 last = base + 2;
+                // The core before the operator is complete.
+                #[cfg(feature = "explain")]
+                match compound.as_mut_slice().last_mut() {
+                    Some((_, c)) => c.sel = self.next_sel(),
+                    None => head.sel = self.next_sel(),
+                }
                 let core = self.select_core::<E>(last)?;
                 if op == CompoundOp::UnionAll {
                     pending = pending.max(self.core_h);
@@ -4503,6 +4548,13 @@ impl<'a> Parser<'a> {
             head.compound = compound;
         }
         self.select_tail::<E>(&mut head, last)?;
+        // The last core is complete with the ORDER BY / LIMIT, which
+        // the pin's grammar gives it (v0.16, `explain`).
+        #[cfg(feature = "explain")]
+        match head.compound.as_mut_slice().last_mut() {
+            Some((_, c)) => c.sel = self.next_sel(),
+            None => head.sel = self.next_sel(),
+        }
         #[cfg(feature = "v09")]
         if !head.compound.is_empty() && !head.order_by.is_empty() {
             self.sorted_members::<E>(pending)?;
@@ -4575,6 +4627,8 @@ impl<'a> Parser<'a> {
             rdepth: 0,
             #[cfg(feature = "window")]
             windows: AVec::new(),
+            #[cfg(feature = "explain")]
+            sel: 0,
         })
     }
 
@@ -4699,6 +4753,8 @@ impl<'a> Parser<'a> {
             rdepth: 0,
             #[cfg(feature = "window")]
             windows,
+            #[cfg(feature = "explain")]
+            sel: 0,
         })
     }
 
@@ -4911,6 +4967,8 @@ impl<'a> Parser<'a> {
             rdepth: 0,
             #[cfg(feature = "window")]
             windows: AVec::new(),
+            #[cfg(feature = "explain")]
+            sel: self.next_sel(),
         }
     }
 

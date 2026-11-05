@@ -518,6 +518,41 @@ fn value_bytes(v: Value<'_>) -> Vec<u8> {
     }
 }
 
+/// The oracle shell's EXPLAIN QUERY PLAN rendering (`eqp_render`):
+/// `QUERY PLAN`, then each row under its parent, `|--` before a row
+/// with a later sibling and `` `-- `` before the last, children
+/// indented by `|  ` or three blanks; nothing for a plan with no
+/// rows. Like the shell's 100-byte prefix buffer, it stops descending
+/// past 31 levels.
+fn eqp_render(out: &mut impl Write, rows: &[(i64, i64, Vec<u8>)]) {
+    fn level(
+        out: &mut impl Write,
+        rows: &[(i64, i64, Vec<u8>)],
+        parent: i64,
+        prefix: &mut Vec<u8>,
+    ) {
+        let kids: Vec<&(i64, i64, Vec<u8>)> = rows.iter().filter(|r| r.1 == parent).collect();
+        for (i, r) in kids.iter().enumerate() {
+            let more = i + 1 < kids.len();
+            let _ = out.write_all(prefix);
+            let _ = out.write_all(if more { b"|--" } else { b"`--" });
+            let _ = out.write_all(&r.2);
+            let _ = out.write_all(b"\n");
+            if prefix.len() < 100 - 7 && r.0 != parent {
+                let n = prefix.len();
+                prefix.extend_from_slice(if more { b"|  " } else { b"   " });
+                level(out, rows, r.0, prefix);
+                prefix.truncate(n);
+            }
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+    let _ = out.write_all(b"QUERY PLAN\n");
+    level(out, rows, 0, &mut Vec::new());
+}
+
 /// Run one SQL statement, printing any result rows. `Err` carries
 /// the user-facing message (hipp's remedy-named Debug form).
 async fn run_statement<S: hipp::Storage>(
@@ -540,6 +575,19 @@ where
             st.bind_value(i, v.as_value())
                 .map_err(|e| format!("{e:?}"))?;
         }
+    }
+    // EXPLAIN QUERY PLAN (v0.16): the oracle shell's tree.
+    if st.is_explain() == 2 {
+        let mut rows: Vec<(i64, i64, Vec<u8>)> = Vec::new();
+        while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
+            rows.push((
+                st.column_i64(0).unwrap_or(0),
+                st.column_i64(1).unwrap_or(0),
+                st.column_bytes(3).unwrap_or(&[]).to_vec(),
+            ));
+        }
+        eqp_render(out, &rows);
+        return Ok(());
     }
     // Step to completion, printing every row (a statement whose
     // planning waited for its bindings knows its columns only

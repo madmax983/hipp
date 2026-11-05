@@ -274,9 +274,13 @@ impl<S: Storage> Connection<S> {
             scalar_col: 0,
             rec: None,
             mat: 0,
+            #[cfg(feature = "explain")]
+            sel: 0,
         };
         let vname = if own { copy_vec(n) } else { AVec::new() };
         plans.push(SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: 0,
             kind: s.kind,
             on: None,
@@ -573,12 +577,14 @@ impl<S: Storage> Connection<S> {
             }
             let module = vt.tab.module;
             let mut aorder = AVec::new();
-            // Only fts5 reads the ORDER BY (its rank and rowid orders);
-            // hipp sorts every result itself.
+            // Only fts5 (its rank and rowid orders) and generate_series
+            // (its value order, v0.16 `explain` parity: the pin's index
+            // number says so) read the ORDER BY; hipp sorts every result
+            // itself.
             #[cfg(feature = "fts5")]
-            let order = order.filter(|_| module == Module::Fts5);
+            let order = order.filter(|_| module == Module::Fts5 || module == Module::Series);
             #[cfg(not(feature = "fts5"))]
-            let order: Option<(&[u8], bool)> = order.filter(|_| false);
+            let order: Option<(&[u8], bool)> = order.filter(|_| module == Module::Series);
             if let Some((name, desc)) = order {
                 if let Some(c) = vt
                     .tab

@@ -842,6 +842,11 @@ pub enum ParseKind {
     InvalidLiteral,
     UnsupportedStatement,
     UnsupportedClause,
+    /// Plain `EXPLAIN <statement>` (v0.16, `explain`): the pin lists
+    /// its bytecode program, and hipp has no bytecode. Use `EXPLAIN
+    /// QUERY PLAN <statement>` for the plan.
+    #[cfg(feature = "explain")]
+    ExplainBytecode,
     /// The statement nests deeper than the parser's stack limit
     /// (the pin's "Recursion limit": 2500 grammar symbols, about
     /// 2490 nested parentheses; `Config::max_parser_depth`), or a

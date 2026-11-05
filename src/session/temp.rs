@@ -1509,6 +1509,8 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         }
         plans.push(super::SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: t.root,
             kind: s.kind,
             on: None,
