@@ -3884,7 +3884,12 @@ impl LazyPage {
             self.page,
             self.interior,
         )?;
-        let p = index_cell_payload(pager, &cell).await?;
+        // `assemble_payload` directly, not `index_cell_payload`: each
+        // nested async call adds its future to the caller's in a debug
+        // build, and this path sits under every index seek and scan
+        // (the `Config::stack_budget` model, tests/depth_v16.rs).
+        let local = copy_bytes(cell.local_bytes());
+        let p = assemble_payload(pager, local.as_slice(), cell.payload_len, cell.overflow).await?;
         let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
         let slot = self
             .slots
@@ -3895,14 +3900,10 @@ impl LazyPage {
         Ok(())
     }
 
-    /// Entry `i`, decoded.
-    async fn entry<S: Storage>(
-        &mut self,
-        pager: &mut Pager<S>,
-        nfields: usize,
-        i: usize,
-    ) -> Result<&IndexEntry, S::Error> {
-        self.fill(pager, nfields, i).await?;
+    /// Entry `i`, once `fill` has decoded it. A plain function, so
+    /// callers await `fill` directly: one async level fewer under
+    /// each seek and scan step.
+    fn get<E>(&self, i: usize) -> Result<&IndexEntry, E> {
         match self.slots.as_slice().get(i) {
             Some(Some(e)) => Ok(e),
             _ => Err(Error::CorruptPage { page: self.page }),
@@ -3939,7 +3940,8 @@ impl LazyPage {
         while lo < hi {
             let mid = lo + (hi - 1 - lo) / 2;
             let enc = pager.text_enc();
-            let e = self.entry(pager, nfields, mid).await?;
+            self.fill(pager, nfields, mid).await?;
+            let e = self.get::<S::Error>(mid)?;
             match cmp_entry_probe(e.values.as_slice(), probe, desc, enc) {
                 core::cmp::Ordering::Less => lo = mid + 1,
                 core::cmp::Ordering::Greater => hi = mid,
@@ -4171,7 +4173,8 @@ impl IndexCursor {
                         if next >= page.ncell {
                             continue;
                         }
-                        let e = page.entry(pager, self.nfields, next).await?.clone();
+                        page.fill(pager, self.nfields, next).await?;
+                        let e = page.get::<S::Error>(next)?.clone();
                         self.stack.push(IdxFrame::Leaf {
                             page,
                             next: next + 1,
@@ -4187,10 +4190,9 @@ impl IndexCursor {
                             continue; // frame exhausted
                         }
                         if seq % 2 == 1 {
-                            let e = page
-                                .entry(pager, self.nfields, (seq - 1) / 2)
-                                .await?
-                                .clone();
+                            let i = (seq - 1) / 2;
+                            page.fill(pager, self.nfields, i).await?;
+                            let e = page.get::<S::Error>(i)?.clone();
                             self.stack.push(IdxFrame::Interior { page, seq: seq + 1 });
                             return self.yield_entry(pager, e);
                         }

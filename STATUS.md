@@ -8412,7 +8412,14 @@ the new field and checks are under `expr_index` / `explain`); max
 MiB budget remain). Merging `main`'s lazy index-cursor decoding
 (`src/btree.rs`, `docs/perf-baselines.md`) then took full to
 **500,952 B** (+752 B) and max to **1,035,516 B** (+744 B; 13,060 B
-remain); both ratchets are set to those measured values.
+remain); both ratchets are set to those measured values. The merge also
+pushed a debug build's IN-subquery path past the 512 KiB thread of
+`budgeted_limits_on_a_small_stack_refuse_cleanly` (about 12 KiB more
+stack under the lazy cursor's nested async calls): `LazyPage` now
+awaits `assemble_payload` from `fill` alone (−3 KiB), and the debug
+`STACK_BASE` of `Config::stack_budget` is re-measured at 336 KiB
+(was 320 KiB), so the derived limits refuse before the stack runs
+out. Release constants are unchanged.
 
 **Honest gaps:**
 
