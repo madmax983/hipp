@@ -8415,11 +8415,11 @@ MiB budget remain). Merging `main`'s lazy index-cursor decoding
 remain); both ratchets are set to those measured values. The merge also
 pushed a debug build's IN-subquery path past the 512 KiB thread of
 `budgeted_limits_on_a_small_stack_refuse_cleanly` (about 12 KiB more
-stack under the lazy cursor's nested async calls): `LazyPage` now
-awaits `assemble_payload` from `fill` alone (−3 KiB), and the debug
-`STACK_BASE` of `Config::stack_budget` is re-measured at 336 KiB
-(was 320 KiB), so the derived limits refuse before the stack runs
-out. Release constants are unchanged.
+stack under the lazy cursor's nested async calls, more under
+`-C instrument-coverage`): the debug `STACK_BASE` of
+`Config::stack_budget` is re-measured at 352 KiB (was 320 KiB), so
+the derived limits refuse before the stack runs out in both the plain
+and the coverage build. Release constants are unchanged.
 
 **Honest gaps:**
 
