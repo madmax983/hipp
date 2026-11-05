@@ -246,7 +246,24 @@ pub struct Config {
     /// count as trigger programs, as on the pin.
     #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub max_trigger_depth: usize,
+    /// The most rows one virtual-table cursor may produce for a
+    /// statement (v0.16 review fix, `vtab`). hipp's executor holds a
+    /// source's rows in memory where the pin streams them, so a
+    /// module whose rows cost nothing to describe —
+    /// `generate_series(1)` is 4294967295 rows — would exhaust the
+    /// heap; past this many rows the statement fails with
+    /// `SchemaKind::VtabTooManyRows` instead. The default
+    /// (`DEFAULT_VTAB_ROWS`, about 4 million) costs a few hundred MiB
+    /// at its peak; lower it on a small heap, raise it where memory
+    /// allows.
+    #[cfg(feature = "vtab")]
+    pub max_vtab_rows: usize,
 }
+
+/// `Config::default()`'s virtual-table row bound (v0.16, `vtab`;
+/// see `Config::max_vtab_rows`).
+#[cfg(feature = "vtab")]
+pub const DEFAULT_VTAB_ROWS: usize = 1 << 22;
 
 /// The `VACUUM INTO` writer's type (v0.16, `v16`; see
 /// `Config::vacuum_into`): file name, image → written.
@@ -286,6 +303,8 @@ impl Default for Config {
             max_parser_depth: DEFAULT_PARSER_DEPTH,
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: DEFAULT_TRIGGER_DEPTH,
+            #[cfg(feature = "vtab")]
+            max_vtab_rows: DEFAULT_VTAB_ROWS,
         }
     }
 }
@@ -366,6 +385,8 @@ impl Config {
             max_parser_depth: 64,
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: 8,
+            #[cfg(feature = "vtab")]
+            max_vtab_rows: 1 << 16,
         }
     }
 
@@ -402,6 +423,12 @@ impl Config {
     #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub fn max_trigger_depth(mut self, levels: usize) -> Config {
         self.max_trigger_depth = levels;
+        self
+    }
+    /// Set `max_vtab_rows` (v0.16, `vtab`).
+    #[cfg(feature = "vtab")]
+    pub fn max_vtab_rows(mut self, rows: usize) -> Config {
+        self.max_vtab_rows = rows;
         self
     }
     /// Set `max_expr_depth` and `max_parser_depth` (v0.16).
@@ -1818,6 +1845,8 @@ impl<S: Storage> Connection<S> {
         };
         if let Some(n) = created {
             reserved_name::<S::Error>(handle_bytes(arena, n))?;
+            #[cfg(feature = "vtab")]
+            self.shadow_name_free(handle_bytes(arena, n))?;
         }
         // The pin's system tables (`sqlite_*`, v0.16 fix, ungated):
         // none may be indexed or altered, and only `sqlite_stat*`
@@ -1868,6 +1897,12 @@ impl<S: Storage> Connection<S> {
             };
             if let Some(h) = target {
                 let n = handle_bytes(arena, h);
+                // A `.dump`'s virtual-table row under `PRAGMA
+                // writable_schema` (v0.16 review fix, `vtab`).
+                #[cfg(feature = "vtab")]
+                if let Some(p) = self.plan_schema_insert(arena, ast)? {
+                    return Ok(p);
+                }
                 if crate::schema::Catalog::is_schema_name(n) {
                     return Err(Error::Schema {
                         kind: SchemaKind::SchemaTableReadOnly,

@@ -1736,10 +1736,10 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        // A string-literal name (v0.16, `fts5`): the pin's `nm` takes
-        // one, and fts5 writes its shadow tables' text that way
-        // (`CREATE TABLE 't_data'(...)`).
-        #[cfg(feature = "fts5")]
+        // A string-literal name (v0.16, `vtab`): the pin's `nm` takes
+        // one, and fts3 / fts4 / fts5 write their shadow tables' text
+        // that way (`CREATE TABLE 't_data'(...)`).
+        #[cfg(feature = "vtab")]
         let name = match self.cur().tok {
             Tok::Text(h) => {
                 self.pos += 1;
@@ -1747,7 +1747,7 @@ impl<'a> Parser<'a> {
             }
             _ => self.name::<E>()?,
         };
-        #[cfg(not(feature = "fts5"))]
+        #[cfg(not(feature = "vtab"))]
         let name = self.name::<E>()?;
         // CREATE TABLE ... AS SELECT (v0.16, `v16`): the columns
         // come from the SELECT at plan time.
@@ -5918,7 +5918,17 @@ UPDATE USING VALUES WHEN WHERE",
             }
             return Ok(true);
         }
-        // Column definition: first token is the name.
+        // Column definition: first token is the name — a string
+        // literal too (v0.16 review fix, `vtab`: the pin's `nm`; an
+        // fts3 / fts4 `%_content` table declares `'c0x'`, and a file
+        // holding one would not VACUUM or read).
+        #[cfg(feature = "vtab")]
+        let col_name = match (self.ident_at(from), tok(from)) {
+            (Some((h, _, _)), _) if self.nm_at(from, to) => h,
+            (_, Some(Tok::Text(h))) => h,
+            _ => return bad(from),
+        };
+        #[cfg(not(feature = "vtab"))]
         let col_name = match self.ident_at(from) {
             Some((h, _, _)) if self.nm_at(from, to) => h,
             _ => return bad(from),

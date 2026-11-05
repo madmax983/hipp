@@ -384,7 +384,10 @@ pub enum SchemaKind {
     ReferencesDefault,
     /// CREATE TABLE / INDEX / VIEW of a name starting with
     /// `sqlite_` (any case; the pin's "object name reserved for
-    /// internal use"). Choose another name.
+    /// internal use"), or (v0.16, `vtab`) of a name a virtual table's
+    /// module claims for its shadow tables (`t_content` beside fts5
+    /// table `t`), also by CREATE TRIGGER / VIRTUAL TABLE and RENAME
+    /// TO. Choose another name.
     ReservedName,
     /// A schema qualifier that names no database (v0.16, `v16`;
     /// the pin's "unknown database"). hipp has `main` only.
@@ -748,6 +751,12 @@ pub enum SchemaKind {
     /// unusable"). Pass a start, or constrain `value`.
     #[cfg(feature = "vtab")]
     SeriesFirstArgument,
+    /// A virtual-table cursor produced more rows than
+    /// `Config::max_vtab_rows` for one statement (v0.16 review fix,
+    /// `vtab`; the pin streams them). hipp holds a source's rows in
+    /// memory: narrow the range, add a LIMIT, or raise the bound.
+    #[cfg(feature = "vtab")]
+    VtabTooManyRows,
     /// `rtree(...)` with fewer than one dimension (v0.16, `rtree`;
     /// "Too few columns for an rtree table").
     #[cfg(feature = "rtree")]

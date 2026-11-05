@@ -30,7 +30,7 @@ justify_over = 16384
 # Every feature without `std` (`--no-default-features --features max`,
 # ADR 0002): `full` plus the leaves too large for `full`'s budget.
 # Same target, profile and binary; ratcheted like the others.
-ratchet = 999692
+ratchet = 1002788
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768

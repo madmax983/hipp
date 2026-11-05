@@ -7669,10 +7669,10 @@ shadow-table writes, queries and checks ≈ 32 KiB; 173,744 B of the
   LIMIT / OFFSET constraints are not passed to modules.
 - A virtual-table source whose arguments read a source to its
   *right* is refused (the pin reorders the join); so is one on the
-  right of a RIGHT / FULL join with lateral arguments.
-- `dbstat` walks the main database only (`temp` / attached schemas
-  give no rows); `dbstat` inside a view or trigger runs (the pin's
-  "unsafe use of virtual table").
+  right of a RIGHT / FULL join whose table-valued arguments read the
+  left side (its ON clause no longer counts: review fix).
+- `dbstat` inside a view or trigger runs (the pin's "unsafe use of
+  virtual table").
 - PRAGMA integrity_check does not run the R*Tree's xIntegrity (use
   `rtreecheck()`); `rtreecheck` reads only `main`.
 - `last_insert_rowid()` after an R*Tree UPDATE / DELETE of a
@@ -7683,11 +7683,123 @@ shadow-table writes, queries and checks ≈ 32 KiB; 173,744 B of the
   on an R*Tree, CREATE INDEX on a shadow table, ALTER TABLE RENAME
   of an R*Tree while the schema has views or triggers, and virtual
   tables in TEMP or attached databases are refused.
-- A file holding a virtual table of an unknown module whose shadow
-  tables hipp cannot parse (fts3 / fts4) opens, but those tables are
-  not readable and a full PRAGMA integrity_check fails there
-  (`integrity_check(t)` of other tables works).
+- A virtual table of a module hipp lacks has no columns for hipp
+  (PRAGMA table_list's `ncol` is 0 where the pin's module declares
+  them); its `<t>_*` tables are read only (hipp cannot ask the
+  module which are shadows).
+- hipp holds a virtual-table cursor's rows in memory (as its
+  executor does every source's): more than `Config::max_vtab_rows`
+  rows from one cursor fail (`VtabTooManyRows`) where the pin
+  streams them — `count(*) from generate_series(1)` is an error,
+  not 4294967295. (The executor-wide form — a huge join or
+  recursive CTE — is the engine's, not this unit's.)
 - hipp-cli's `.tables` does not list virtual tables.
+
+### Virtual tables and the R*Tree — review fixes (2026-11-05)
+
+**Fixed** (each with a regression test against the live pin):
+
+- **generate_series, descending with `value` bounds** (wrong rows):
+  the filter moved the first value down to the upper bound with the
+  pin's test inverted (`base < iMax`), so a consumed `value =` /
+  `<` / `<=` / BETWEEN returned rows above it
+  (`generate_series(100,1,-10) WHERE value < 55` gave 60). A step of
+  `i64::MIN` steps by 2^63 (MAX, then -1), as the pin; hipp used
+  `i64::MAX`. `tests/vtab_v16.rs` `series_descending_constraints`
+  (a corpus and 200 generated descending cases).
+- **generate_series out of memory** (process abort): a cursor's
+  rows are drained into memory, so `count(*) from
+  generate_series(1)` asked for tens of GB. The drain is now bounded
+  by the new `Config::max_vtab_rows` (default 2^22) and fallible
+  allocation, failing with `SchemaKind::VtabTooManyRows`; a LIMIT
+  the module honours stays under it. Streaming the executor is out
+  of this unit's scope (honest gap above). `series_row_bound`.
+- **Shadow-table name clashes** (corrupt schema): CREATE VIRTUAL
+  TABLE now checks every shadow table xCreate makes (an R*Tree's
+  three; fts5's `_data` / `_idx` / `_config` and `_content` /
+  `_docsize` when kept) — hipp wrote a second `r_node` beside the
+  user's, a schema the pin calls malformed. Names a module claims
+  (`xShadowName`) are refused to CREATE TABLE / VIEW / INDEX /
+  TRIGGER / VIRTUAL TABLE, RENAME TO and TEMP objects
+  (`ReservedName`, the pin's "object name reserved for internal
+  use"). `shadow_names_are_reserved`.
+- **R*Tree node cell counts**: a node claiming more cells than fit is
+  `VtabCorrupt` on every read path (search, rowid lookup), as the
+  pin's nodeAcquire; the search clamped it and returned stale cells
+  (118 rows of a 100-row table). `tests/rtree_v16.rs` `review_fixes`.
+- **Duplicate R*Tree column names** (`rtree(id,a,a)`, `+a` beside
+  `a`, any case): `DuplicateColumn`, after the argument-count errors,
+  as `sqlite3_declare_vtab`; hipp created tables the pin cannot read.
+- **RIGHT JOIN of a virtual table**: the ON terms of a RIGHT / FULL
+  join stay join conditions (they were offered to xBestIndex, which
+  made the source lateral and refused). `right_join_of_virtual_tables`.
+- **Unknown-module files**: the CREATE TABLE grammar takes a string
+  literal as a column name under `vtab` (the pin's `nm`; fts3 / fts4
+  declare `'c0x'`), and a string-literal table name under `vtab` (it
+  was `fts5` only). So their shadow tables read, VACUUM and a full
+  integrity_check run, and PRAGMA table_list counts their columns.
+  (With the `fts5` leaf, fts5 files are no longer "unknown"; in a
+  `v16,vtab` build their WITHOUT ROWID `_idx` / `_config` need the
+  `without_rowid` leaf, as any such table.) `unknown_module_file_opens`.
+- **`total_changes()` after R*Tree writes**: the pin counts the rows
+  its internal statements change — the root's INSERT at CREATE, each
+  `%_node` write (repeats included: `nodeRelease` writes a node every
+  time it is released, which during a delete's reinsertion is once
+  per reinserted cell), `%_rowid` / `%_parent` writes and deletes,
+  `rtreeNewRowid`'s placeholder row, the auxiliary UPDATE. The tree
+  code now counts them (`Writes::count`) and models the delete
+  path's releases (`release_but_root`); they join `total_changes()`
+  only. CREATE leaves `last_insert_rowid()` at 1, as the pin's.
+  Checked over 300 generated workloads and the existing generated
+  corpora (now printing the counters every 7 writes); the shadow
+  rows stay byte-identical.
+- **`.dump`** (hipp-cli): the pin shell's script byte for byte for
+  virtual tables — the `/* WARNING: ... DEFENSIVE ... */` and `PRAGMA
+  foreign_keys=OFF;` header (the pin needs both to replay it),
+  `PRAGMA writable_schema=OFF` after the views / triggers / indexes,
+  `x'..'` blobs, `CREATE TABLE IF NOT EXISTS` for any quoted table
+  name — and `.dump PATTERN...` (the pin's LIKE filter; a virtual
+  table brings its `name_*` tables). hipp replays dumps through the
+  new `PRAGMA writable_schema` (leaf `vtab`): while on, the one
+  `INSERT INTO sqlite_schema(...)` row a dump writes for a virtual
+  table (`'table'`, name twice, 0, `CREATE VIRTUAL TABLE ...`,
+  literals) registers it without xCreate, and shadow tables take the
+  dump's rows; anything else written to `sqlite_schema` is refused.
+  `hipp-cli/tests/cli_v16_vtab.rs` `dump_of_virtual_tables` (R*Tree,
+  fts5 and fts4 tables; each engine's dump replayed in both),
+  `tests/vtab_v16.rs` `writable_schema_replays_a_dump`.
+- **`dbstat(schema)`**: an unknown database at CREATE is
+  `UnknownDatabase` (the pin's "no such database"); `temp` and
+  attached databases are walked (they gave no rows).
+  `dbstat_other_databases`.
+- **README** no longer claims integrity_check runs the R*Tree check
+  or that unknown-module files refuse only that table's statements
+  without saying which.
+
+**Not changed:** the pin's shell runs in defensive mode, where
+`PRAGMA writable_schema = ON` is a silent no-op (it reads back 0)
+unless the script carries the `.dump` WARNING header; hipp has no
+defensive switch, honours the pragma and reads back 1.
+`last_insert_rowid()` after an R*Tree UPDATE /
+DELETE of a multi-level tree (the known gap above; the pin's last
+internal INSERT depends on its node-cache releases, which hipp
+models only for the delete path).
+
+**Probing notes (live pin):** the pin's `.dump` of a virtual table
+replays only with its WARNING comment *followed by* `PRAGMA
+foreign_keys=OFF;` (either alone fails with "table sqlite_master may
+not be modified"); `dbstat('temp')` before any temp object lists
+nothing; `CREATE TABLE x_content` *before* a contentless fts5 `x` is
+allowed (only the shadow tables xCreate makes are checked).
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Size:** tiny **76,960 B** (Δ **0**: the parser's string-literal
+column name is `vtab`-only); full **500,200 B** (Δ **0**); max
+**1,002,788 B** (Δ **+3,096 B** over 999,692, ratchet raised: the
+writable_schema replay ≈ 1.3 KiB, shadow-name checks ≈ 0.7 KiB,
+dbstat of other databases ≈ 0.5 KiB, the change counting and
+bounded drain the rest; 45,788 B of the 1 MiB budget remain).
 
 ### FTS5 full-text search (2026-11-05)
 

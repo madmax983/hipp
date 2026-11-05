@@ -135,3 +135,60 @@ SELECT name, path, pagetype FROM s WHERE name = 'big';
     let b = run_stdin(&hipp_bin(), &h, script);
     assert_eq!(b, a);
 }
+
+/// `.dump` of virtual tables (v0.16 review fix): the pin shell's
+/// script byte for byte — its defensive-mode WARNING header, the
+/// `writable_schema` rows, `x'..'` blobs, `CREATE TABLE IF NOT EXISTS`
+/// for quoted names, `PRAGMA writable_schema=OFF` last — and `.dump
+/// PATTERN` (a virtual table bringing its shadow tables). Each
+/// engine's dump replays in both engines (hipp's own through `PRAGMA
+/// writable_schema`).
+#[test]
+fn dump_of_virtual_tables() {
+    let base = temp_db("dump-base");
+    run_stdin(
+        &oracle(),
+        &base,
+        "create table t(a); insert into t values (1), (x'ab01'); \
+         create virtual table r using rtree(id, a, b, +x); \
+         insert into r values (1, 2, 3, 'p'), (2, 0.5, 9.25, x'00ff'); \
+         create table \"u\"(b); insert into u values (2); create view v as select 1; \
+         create index ui on u(b); \
+         create virtual table f using fts5(x, y); insert into f values ('hello world', 'zz'); \
+         create virtual table g using fts4(body); insert into g values ('one two');\n",
+    );
+    for args in [
+        "", " t", " r", " r_node", " u", " 'r%'", " f", " g", " nosuch", " t u",
+    ] {
+        let pin = run_stdin(&oracle(), &base, &format!(".dump{args}\n"));
+        let pin = pin.trim_start_matches("PRAGMA foreign_keys=OFF;\n");
+        let ours = run_stdin(&hipp_bin(), &base, &format!(".dump{args}\n"));
+        assert_eq!(ours, pin, ".dump{args}");
+    }
+    let dump = run_stdin(&hipp_bin(), &base, ".dump\n");
+    let pin_dump = run_stdin(&oracle(), &base, ".dump\n");
+    let check = "select id, a, b, hex(x) from r; select rtreecheck('r'); select * from f; \
+                 select * from g_content; select hex(a) from t; pragma integrity_check;\n";
+    for (i, script) in [&dump, &pin_dump].iter().enumerate() {
+        let o = temp_db(&format!("dump-into-pin{i}"));
+        run_stdin(&oracle(), &o, script);
+        let h = temp_db(&format!("dump-into-hipp{i}"));
+        run_stdin(&hipp_bin(), &h, script);
+        let want = run_stdin(&oracle(), &base, check);
+        assert_eq!(
+            run_stdin(&oracle(), &o, check),
+            want,
+            "pin replays dump {i}"
+        );
+        assert_eq!(
+            run_stdin(&oracle(), &h, check),
+            want,
+            "pin reads hipp's replay {i}"
+        );
+        assert_eq!(
+            run_stdin(&hipp_bin(), &h, ".dump\n"),
+            dump,
+            "hipp's replay {i} dumps the same"
+        );
+    }
+}

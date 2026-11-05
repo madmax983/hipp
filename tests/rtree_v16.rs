@@ -11,10 +11,11 @@
 //!   to 32 bits, the id column's integer reading, "rtree constraint
 //!   failed" and the UNIQUE conflict under every conflict clause,
 //!   REPLACE, UPDATE (scan order) and DELETE (rowid order).
-//! - The tree itself: ChooseLeaf, the R*-tree split, the forced
-//!   reinsertion (once per level per connection, as the pin keeps
-//!   `iReinsertHeight`), node removal and reinsertion on delete,
-//!   node numbering. Generated corpora of 1-5 dimensional inserts,
+//! - The tree itself: ChooseLeaf, the R*-tree split (the pin's 3.54.1
+//!   splits every full node; it forces no reinsertion), node removal
+//!   and reinsertion on delete, node numbering; `changes()` and
+//!   `total_changes()` after each write (the pin counts the shadow
+//!   rows its internal statements change). Generated corpora of 1-5 dimensional inserts,
 //!   deletes and updates compare every shadow-table row byte for
 //!   byte, and each engine's `rtreecheck()` / integrity_check passes
 //!   on the other's file; files move between the engines mid-way.
@@ -502,7 +503,13 @@ fn workload(seed: u64) -> (String, String) {
         }
     };
     let n = 40 + r.below(260);
-    for _ in 0..n {
+    for i in 0..n {
+        // The counters after the writes so far (v0.16 review fix:
+        // the shadow rows' changes were missing from
+        // `total_changes()`).
+        if i % 7 == 6 {
+            w.push("select changes(), total_changes()".to_string());
+        }
         let x = r.below(100);
         if x < 70 || ids.is_empty() {
             let id = if r.below(2) == 0 {
@@ -629,5 +636,104 @@ fn files_move_between_engines() {
         let (ok, hipp_after, e) = hipp_script(&h2, &format!("{second};\n{SHADOW}"));
         assert!(ok, "{e:?}");
         assert_eq!(hipp_after, pin_after, "seed {seed}");
+    }
+}
+
+// ---------------- review fixes (v0.16) ----------------
+
+/// Review-fix regressions: duplicate column names (the pin's
+/// `sqlite3_declare_vtab` refuses them; hipp wrote a table the pin
+/// cannot read), `total_changes()` with the shadow rows' changes,
+/// a node claiming more cells than fit (corrupt, not clamped).
+#[test]
+fn review_fixes() {
+    for (i, cols) in [
+        "id,a,a",
+        "id,a,A",
+        "id,a,b,+a",
+        "id,a,b,+c,+C",
+        "ID,id,b",
+        "id,\"a\",[a]",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(
+            &format!("dupcol{i}"),
+            &format!("create virtual table q using rtree({cols})"),
+            SchemaKind::DuplicateColumn,
+        );
+        refuse(
+            &format!("dupcol-i32-{i}"),
+            &format!("create virtual table q using rtree_i32({cols})"),
+            SchemaKind::DuplicateColumn,
+        );
+    }
+    // The argument-count errors come first, as on the pin.
+    refuse(
+        "dupcol-few",
+        "create virtual table q using rtree(a,a)",
+        SchemaKind::RtreeTooFewColumns,
+    );
+    same_all(
+        "total-changes",
+        "create virtual table r using rtree(id,x0,x1); select total_changes(), last_insert_rowid(); \
+         insert into r values(1,1,2); select changes(), total_changes(); \
+         insert into r values(2,1,2),(3,4,5); select changes(), total_changes(); \
+         update r set x1=10 where id=2; select changes(), total_changes(); \
+         update r set id=20 where id=2; select changes(), total_changes(); \
+         delete from r where id=1; select changes(), total_changes(); \
+         insert or replace into r values(3,7,8); select changes(), total_changes(); \
+         create virtual table q using rtree(id,x0,x1,+a,+b); select total_changes(); \
+         insert into q values(1,1,2,3,4); select changes(), total_changes(); \
+         update q set a=9 where id=1; select changes(), total_changes(); \
+         delete from q; select changes(), total_changes(); \
+         insert into q select value, value, value + 1, 'x', value from generate_series(1, 300); \
+         select changes(), total_changes(); \
+         delete from q where id % 3 = 0; select changes(), total_changes(); \
+         update q set x1 = x1 + 1 where id % 5 = 1; select changes(), total_changes(); \
+         drop table q; select total_changes()",
+    );
+    // A node whose count field claims 0xffff cells.
+    let base = common::temp_db("v16rt-ncell-base");
+    let (ok, _) = oracle_script(
+        &base,
+        "pragma page_size=512; create virtual table r using rtree(id,a,b,+x); \
+         insert into r select value,value,value+1,'v' from generate_series(1,100)",
+    );
+    assert!(ok);
+    let out = std::process::Command::new(common::oracle())
+        .arg(&base)
+        .arg(".dbconfig defensive off")
+        .arg("update r_node set data=cast(x'0000ffff'||substr(data,5) as blob) where nodeno=2")
+        .output()
+        .expect("oracle runs");
+    assert!(out.status.success());
+    for (i, q) in [
+        "select count(*) from r",
+        "select id from r where a > 40",
+        "select id from r where a between 3 and 5",
+        "select * from r where id = 3",
+        "select * from r where id = 50",
+        "select rtreecheck('r')",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let h = common::temp_db(&format!("v16rt-ncell-{i}-h"));
+        let o = common::temp_db(&format!("v16rt-ncell-{i}-o"));
+        std::fs::copy(&base, &h).expect("copy");
+        std::fs::copy(&base, &o).expect("copy");
+        if let Some(e) = same_on(&h, &o, q) {
+            assert!(
+                matches!(
+                    e,
+                    Error::Schema {
+                        kind: SchemaKind::VtabCorrupt
+                    }
+                ),
+                "{q}: {e:?}"
+            );
+        }
     }
 }

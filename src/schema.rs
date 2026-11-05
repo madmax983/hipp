@@ -468,6 +468,21 @@ impl Catalog {
     /// or any suffix when hipp lacks the module).
     #[cfg(feature = "vtab")]
     pub fn is_shadow(&self, arena: &Arena, name: &[u8]) -> bool {
+        self.shadow_of(arena, name, true)
+    }
+
+    /// Whether `name` is reserved for a shadow table of one of the
+    /// file's virtual tables whose module hipp has (v0.16 review fix,
+    /// `vtab`): the pin's "object name reserved for internal use" for
+    /// CREATE TABLE / VIEW / INDEX / TRIGGER and RENAME TO, which an
+    /// unknown module's table does not reserve.
+    #[cfg(feature = "vtab")]
+    pub fn shadow_reserved(&self, arena: &Arena, name: &[u8]) -> bool {
+        self.shadow_of(arena, name, false)
+    }
+
+    #[cfg(feature = "vtab")]
+    fn shadow_of(&self, arena: &Arena, name: &[u8], unknown: bool) -> bool {
         use crate::vtab::Vtab;
         self.vtabs.iter().any(|v| {
             let vn = handle_bytes(arena, v.name);
@@ -476,7 +491,7 @@ impl Catalog {
                 && name.get(vn.len()) == Some(&b'_')
                 // A module hipp lacks may claim any suffix: such a
                 // table is treated as its shadow (never written).
-                && v.tab.as_ref().map_or(true, |t| {
+                && v.tab.as_ref().map_or(unknown, |t| {
                     t.module
                         .shadow_name(name.get(vn.len() + 1..).unwrap_or(&[]))
                 })

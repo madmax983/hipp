@@ -726,7 +726,7 @@ pub struct SeriesCursor {
     oterm: i64,
     ostep: i64,
     term: i64,
-    step: i64,
+    step: u64,
     desc: bool,
     value: i64,
     done: bool,
@@ -845,13 +845,9 @@ impl SeriesCursor {
         }
         let mut base = obase;
         let mut term = oterm;
-        let step: u64 = if ostep > 0 {
-            ostep as u64
-        } else if ostep > i64::MIN {
-            ostep.unsigned_abs()
-        } else {
-            i64::MAX as u64
-        };
+        // The step's magnitude: 2^63 for `i64::MIN`, as the pin's
+        // unsigned iStep (v0.16 review fix: it was i64::MAX).
+        let step: u64 = ostep.unsigned_abs();
         let mut desc = ostep < 0;
         if !desc && base > term {
             return None;
@@ -936,7 +932,10 @@ impl SeriesCursor {
             if base > imax {
                 let span = span64(base, imax);
                 base = sub64(base, (span / step).wrapping_mul(step));
-                if base < imax {
+                // Still above the upper bound: one step further down
+                // (v0.16 review fix: the test was `<`, so the first
+                // value could exceed a consumed `value <` / `=`).
+                if base > imax {
                     if base < add64(i64::MIN, step) {
                         return None;
                     }
@@ -967,7 +966,7 @@ impl SeriesCursor {
             oterm,
             ostep,
             term,
-            step: step as i64,
+            step,
             desc,
             value: base,
             done: false,
@@ -984,9 +983,9 @@ impl VtCursor for SeriesCursor {
         if self.value == self.term {
             self.done = true;
         } else if self.desc {
-            self.value = sub64(self.value, self.step as u64);
+            self.value = sub64(self.value, self.step);
         } else {
-            self.value = add64(self.value, self.step as u64);
+            self.value = add64(self.value, self.step);
         }
     }
 
@@ -1034,15 +1033,25 @@ impl VtCursor for RowsCursor {
     }
 }
 
+/// A cursor's rows: each row's columns and its rowid.
+pub type CursorRows = AVec<(AVec<OwnedValue>, Option<i64>)>;
+
 /// Read a cursor to its end (at most `need` rows): each row's
-/// `ncols` columns and its rowid.
+/// `ncols` columns and its rowid. More than `max` rows (v0.16 review
+/// fix: `Config::max_vtab_rows`), or a refused allocation, is
+/// `VtabTooManyRows` — hipp holds the rows where the pin streams
+/// them, and `generate_series(1)` alone is 2^32 of them.
 pub fn drain(
     cur: &mut dyn VtCursor,
     ncols: usize,
     need: Option<usize>,
-) -> AVec<(AVec<OwnedValue>, Option<i64>)> {
+    max: usize,
+) -> Result<CursorRows, SchemaKind> {
     let mut out = AVec::new();
     while !cur.eof() && need.is_none_or(|n| out.len() < n) {
+        if out.len() >= max || out.try_reserve(1).is_err() {
+            return Err(SchemaKind::VtabTooManyRows);
+        }
         let mut row = AVec::new();
         for i in 0..ncols {
             row.push(cur.column(i));
@@ -1050,7 +1059,7 @@ pub fn drain(
         out.push((row, Some(cur.rowid())));
         cur.next();
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------

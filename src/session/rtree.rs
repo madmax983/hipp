@@ -344,7 +344,13 @@ impl<S: Storage> Statement<'_, S> {
         }
         let mut rec = AVec::new();
         encode_record(&[Value::Null, Value::Blob(blob.as_slice())], &mut rec);
-        btree::btree_insert(&mut self.conn.pager, node_root, 1, rec.as_slice()).await
+        btree::btree_insert(&mut self.conn.pager, node_root, 1, rec.as_slice()).await?;
+        // The pin's xCreate writes the root with an INSERT, which
+        // counts in `total_changes()` and leaves `last_insert_rowid()`
+        // at 1.
+        self.conn.env.add_total(1);
+        self.conn.env.last_rowid.set(1);
+        Ok(())
     }
 
     /// Read the shadow row a write needs into `st`.
@@ -494,6 +500,9 @@ impl<S: Storage> Statement<'_, S> {
             self.rt_put(sh.rowid, *k, vals.as_slice()).await?;
         }
         st.absorb(&writes);
+        // The shadow rows' own changes count in `total_changes()`
+        // only (the pin's internal statements).
+        self.conn.env.add_total(writes.count);
         Ok((rowid, writes.last_insert))
     }
 

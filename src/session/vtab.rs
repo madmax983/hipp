@@ -42,6 +42,10 @@ pub(super) enum VtPlan {
     },
     /// An IF NOT EXISTS / IF EXISTS no-op.
     Noop,
+    /// A virtual table's schema row written under `PRAGMA
+    /// writable_schema` (a `.dump` replayed): name and text; no
+    /// xCreate (the shadow tables follow as ordinary statements).
+    RawRow { name: AVec<u8>, sql: AVec<u8> },
     /// DROP TABLE of a virtual table.
     Drop { name: AVec<u8>, tab: Option<VTab> },
     /// ALTER TABLE ... RENAME TO of an R*Tree or fts5 table (with
@@ -64,6 +68,103 @@ fn vt_err<E>(kind: SchemaKind) -> Error<E> {
 }
 
 impl<S: Storage> Connection<S> {
+    /// `INSERT INTO sqlite_schema(type, name, tbl_name, rootpage,
+    /// sql) VALUES(...)` under `PRAGMA writable_schema = ON` (v0.16
+    /// review fix): the one row a `.dump` writes, the pin shell's and
+    /// hipp-cli's, for a virtual table — `'table'`, the name twice, 0
+    /// and its `CREATE VIRTUAL TABLE` text, all literals. Other rows
+    /// are refused. `None`: not such an INSERT.
+    pub(super) fn plan_schema_insert(
+        &self,
+        arena: &Arena,
+        ast: &Ast,
+    ) -> Result<Option<Plan>, S::Error> {
+        let Ast::Insert {
+            table,
+            columns,
+            rows,
+            select: None,
+            upsert: None,
+            returning,
+            ..
+        } = ast
+        else {
+            return Ok(None);
+        };
+        if !self.prag.writable_schema
+            || !crate::schema::Catalog::is_schema_name(handle_bytes(arena, *table))
+        {
+            return Ok(None);
+        }
+        let ([row], true) = (rows.as_slice(), returning.is_empty()) else {
+            return Err(Error::Unsupported);
+        };
+        // Each value by the schema column it lands in.
+        const COLS: [&[u8]; 5] = [b"type", b"name", b"tbl_name", b"rootpage", b"sql"];
+        let mut vals: [OwnedValue; 5] = core::array::from_fn(|_| OwnedValue::Null);
+        if row.len() != 5 {
+            return Err(Error::Unsupported);
+        }
+        for (k, e) in row.iter().enumerate() {
+            let at = match columns {
+                Some(c) => {
+                    let n = c.as_slice().get(k).map(|h| handle_bytes(arena, *h));
+                    COLS.iter().position(|x| n.is_some_and(|n| eq_ci(n, x)))
+                }
+                None => Some(k),
+            };
+            let (Some(at), Expr::Literal(l)) = (at, e) else {
+                return Err(Error::Unsupported);
+            };
+            if let Some(v) = vals.get_mut(at) {
+                *v = literal_owned(arena, Some(*l));
+            }
+        }
+        let [
+            OwnedValue::Text(ty),
+            OwnedValue::Text(name),
+            OwnedValue::Text(tbl),
+            OwnedValue::Integer(0),
+            OwnedValue::Text(sql),
+        ] = &vals
+        else {
+            return Err(Error::Unsupported);
+        };
+        let ok = ty.as_slice() == b"table"
+            && name.as_slice() == tbl.as_slice()
+            && matches!(
+                crate::sql::parser::parse::<S::Error>(sql.as_slice(), arena, self.cfg.limits()),
+                Ok(Ast::CreateVirtual { name: h, .. }) if eq_ci(handle_bytes(arena, h), name.as_slice())
+            );
+        if !ok {
+            return Err(Error::Unsupported);
+        }
+        if self
+            .catalog
+            .taken(&self.catalog_arena, name.as_slice())
+            .is_some()
+        {
+            return Err(vt_err(SchemaKind::DuplicateTable));
+        }
+        Ok(Some(Plan::Vtab(Box::new(VtPlan::RawRow {
+            name: name.clone(),
+            sql: sql.clone(),
+        }))))
+    }
+
+    /// `name` is not one a virtual table's module claims for a shadow
+    /// table (v0.16 review fix: the pin's "object name reserved for
+    /// internal use"; hipp created `t_content` beside a contentless
+    /// fts5 table `t`).
+    pub(super) fn shadow_name_free(&self, name: &[u8]) -> Result<(), S::Error> {
+        // `writable_schema` lifts it, as the pin shell's `.dump`
+        // replay (defensive mode off) does.
+        if !self.prag.writable_schema && self.catalog.shadow_reserved(&self.catalog_arena, name) {
+            return Err(vt_err(SchemaKind::ReservedName));
+        }
+        Ok(())
+    }
+
     /// The virtual table `name` names (a table of the file, or an
     /// eponymous module no table or view shadows): its declared
     /// table and, for a table of the file, its name.
@@ -271,8 +372,13 @@ impl<S: Storage> Connection<S> {
                 }
             }
             let mut oterms: AVec<RExpr> = AVec::new();
+            // The ON of a RIGHT / FULL join stays a join condition:
+            // the unmatched rows of the module's every row are emitted
+            // after the loop (v0.16 review fix: a RIGHT JOIN's ON
+            // became lateral filter arguments, which were refused).
             if let Some(o) = sp.on.as_ref()
                 && !sp.kind.pads_right()
+                && !sp.kind.pads_left()
             {
                 let mut t = AVec::new();
                 and_terms(o, &mut t);
@@ -643,7 +749,8 @@ impl<S: Storage> Connection<S> {
         // given triggers (the pin shell's defensive mode); nor
         // indexed here (the pin allows it, but hipp's R*Tree writes
         // would not maintain the index).
-        if self.catalog.is_shadow(ca, t) {
+        // `PRAGMA writable_schema` (a `.dump` replayed) writes them.
+        if self.catalog.is_shadow(ca, t) && !(what == 0 && self.prag.writable_schema) {
             return Err(vt_err(if what == 1 {
                 SchemaKind::ShadowNoDrop
             } else {
@@ -712,6 +819,7 @@ impl<S: Storage> Connection<S> {
         }
         let new = handle_bytes(arena, *to);
         reserved_name::<S::Error>(new)?;
+        self.shadow_name_free(new)?;
         let ca = &self.catalog_arena;
         for sfx in core::iter::once(b"" as &[u8]).chain(sfxs.iter().copied()) {
             let mut n = copy_vec(new);
@@ -743,6 +851,7 @@ impl<S: Storage> Connection<S> {
             Some(false) => return Err(vt_err(SchemaKind::DuplicateTable)),
             None => {}
         }
+        self.shadow_name_free(name)?;
         let m = Module::lookup(module)
             .filter(|m| m.creatable())
             .ok_or(vt_err(SchemaKind::NoSuchModule))?;
@@ -751,6 +860,30 @@ impl<S: Storage> Connection<S> {
             spans.push(handle_bytes(arena, *a));
         }
         let tab = m.connect(name, spans.as_slice(), true).map_err(vt_err)?;
+        // dbstat's schema argument must name a database (v0.16 review
+        // fix: the pin's "no such database"; hipp made a table that
+        // read no rows).
+        if m == Module::Dbstat && !tab.schema.is_empty() {
+            let d = tab.schema.as_slice();
+            #[cfg(feature = "attach")]
+            let attached = self.att_index(d).is_some();
+            #[cfg(not(feature = "attach"))]
+            let attached = false;
+            if !(eq_ci(d, b"main") || eq_ci(d, b"temp") || attached) {
+                return Err(vt_err(SchemaKind::UnknownDatabase));
+            }
+        }
+        // The shadow tables xCreate makes must be free (v0.16 review
+        // fix: hipp wrote a second `r_node` beside the user's table,
+        // a schema the pin refuses as malformed).
+        #[cfg(any(feature = "rtree", feature = "fts5"))]
+        for sfx in created_shadows(&tab).iter() {
+            let mut n = copy_vec(name);
+            n.extend_from_slice(sfx);
+            if self.catalog.taken(ca, n.as_slice()).is_some() {
+                return Err(vt_err(SchemaKind::DuplicateTable));
+            }
+        }
         let mut stored = copy_vec(b"CREATE VIRTUAL TABLE ");
         stored.extend_from_slice(handle_bytes(arena, text));
         Ok(Plan::Vtab(Box::new(VtPlan::Create {
@@ -794,6 +927,22 @@ impl<S: Storage> Statement<'_, S> {
         };
         match &**p {
             VtPlan::Noop => Ok(()),
+            VtPlan::RawRow { name, sql } => {
+                let (name, sql) = (name.clone(), sql.clone());
+                self.insert_schema_row(
+                    b"table",
+                    name.as_slice(),
+                    name.as_slice(),
+                    0,
+                    Some(sql.as_slice()),
+                )
+                .await?;
+                self.conn.pager.bump_schema_cookie();
+                if !self.conn.explicit_txn {
+                    auto_commit!(self.conn)?;
+                }
+                Ok(())
+            }
             VtPlan::Create { name, sql, tab } => {
                 let (name, sql, tab) = (name.clone(), sql.clone(), tab.clone());
                 self.insert_schema_row(
@@ -1052,7 +1201,8 @@ impl<S: Storage> Statement<'_, S> {
         match vt.tab.module {
             Module::Series => {
                 let mut c = crate::vtab::SeriesCursor::filter(vt.idx_num, argv.as_slice());
-                Ok(crate::vtab::drain(&mut c, 4, need))
+                crate::vtab::drain(&mut c, 4, need, self.conn.cfg.max_vtab_rows)
+                    .map_err(|kind| Error::Schema { kind })
             }
             Module::Dbstat => self.dbstat_source(vt, argv.as_slice(), need).await,
             #[cfg(feature = "rtree")]
@@ -1068,7 +1218,8 @@ impl<S: Storage> Statement<'_, S> {
 
     /// dbstat's rows: `sqlite_schema` and every b-tree the schema
     /// names, in its rowid order (name order when asked), each
-    /// walked as `statNext` walks it.
+    /// walked as `statNext` walks it — of `main`, `temp` (v0.16
+    /// review fix: no rows came for it) or an attached database.
     async fn dbstat_source(
         &mut self,
         vt: &VtSrc,
@@ -1081,54 +1232,103 @@ impl<S: Storage> Statement<'_, S> {
             None if !vt.tab.schema.is_empty() => vt.tab.schema.clone(),
             None => copy_vec(b"main"),
         };
-        // Only the main database's pages are walked here.
-        if !eq_ci(schema.as_slice(), b"main") {
-            return Ok(AVec::new());
+        // `name = NULL`: no rows.
+        let null_name =
+            a.name.is_none() && argv.len() > usize::from(a.schema.is_some()) && vt.idx_num & 2 != 0;
+        if eq_ci(schema.as_slice(), b"main") {
+            return dbstat_db(&mut self.conn.pager, &a, null_name, b"main", need).await;
         }
-        // A database not yet written has no pages.
-        if self.conn.pager.pristine() {
-            return Ok(AVec::new());
+        if eq_ci(schema.as_slice(), b"temp") {
+            return match self.conn.temp.as_deref_mut() {
+                Some(c) => dbstat_db(&mut c.pager, &a, null_name, b"temp", need)
+                    .await
+                    .map_err(super::temp::mem_err),
+                None => Ok(AVec::new()),
+            };
         }
-        let mut trees: AVec<(AVec<u8>, u32)> = AVec::new();
-        trees.push((copy_vec(b"sqlite_schema"), 1));
-        if self.conn.pager.page_count() > 0 {
-            let mut cursor = ScanCursor::new(1);
-            let mut buf = AVec::new();
-            while cursor
-                .next_row_into(&mut self.conn.pager, &mut buf)
-                .await?
-                .is_some()
-            {
-                let values = crate::record::decode_record::<S::Error>(buf.as_slice(), 5)?;
-                let (Some(Value::Text(n)), Some(Value::Integer(r))) =
-                    (values.as_slice().get(1), values.as_slice().get(3))
-                else {
-                    continue;
-                };
-                if *r != 0 {
-                    trees.push((copy_vec(n), u32::try_from(*r).unwrap_or(0)));
-                }
+        #[cfg(feature = "attach")]
+        if let Some(i) = self.conn.att_index(schema.as_slice())
+            && let Some(at) = self.conn.attached.as_mut_slice().get_mut(i)
+        {
+            if self.conn.explicit_txn {
+                at.used.set(true);
             }
+            let label = at.name.clone();
+            return dbstat_db(&mut at.conn.pager, &a, null_name, label.as_slice(), need).await;
         }
-        if let Some(n) = &a.name {
-            let mut kept = AVec::new();
-            for t in trees.iter() {
-                if t.0.as_slice() == n.as_slice() {
-                    kept.push(t.clone());
-                }
-            }
-            trees = kept;
-        } else if argv.len() > usize::from(a.schema.is_some()) && vt.idx_num & 2 != 0 {
-            // `name = NULL`: no rows.
-            return Ok(AVec::new());
-        }
-        if a.ordered {
-            trees
-                .as_mut_slice()
-                .sort_by(|x, y| x.0.as_slice().cmp(y.0.as_slice()));
-        }
-        crate::vtab::dbstat_rows(&mut self.conn.pager, trees.as_slice(), b"main", a.agg, need).await
+        // A database not attached: no rows (the pin's too).
+        Ok(AVec::new())
     }
+}
+
+/// `dbstat_source` over one database's pager (`label` is its name in
+/// the `schema` column).
+async fn dbstat_db<T: Storage>(
+    pager: &mut Pager<T>,
+    a: &crate::vtab::StatArgs,
+    null_name: bool,
+    label: &[u8],
+    need: Option<usize>,
+) -> Result<VRows, T::Error> {
+    // A database not yet written has no pages.
+    if pager.pristine() || null_name {
+        return Ok(AVec::new());
+    }
+    let mut trees: AVec<(AVec<u8>, u32)> = AVec::new();
+    trees.push((copy_vec(b"sqlite_schema"), 1));
+    if pager.page_count() > 0 {
+        let mut cursor = ScanCursor::new(1);
+        let mut buf = AVec::new();
+        while cursor.next_row_into(pager, &mut buf).await?.is_some() {
+            let values = crate::record::decode_record::<T::Error>(buf.as_slice(), 5)?;
+            let (Some(Value::Text(n)), Some(Value::Integer(r))) =
+                (values.as_slice().get(1), values.as_slice().get(3))
+            else {
+                continue;
+            };
+            if *r != 0 {
+                trees.push((copy_vec(n), u32::try_from(*r).unwrap_or(0)));
+            }
+        }
+    }
+    if let Some(n) = &a.name {
+        let mut kept = AVec::new();
+        for t in trees.iter() {
+            if t.0.as_slice() == n.as_slice() {
+                kept.push(t.clone());
+            }
+        }
+        trees = kept;
+    }
+    if a.ordered {
+        trees
+            .as_mut_slice()
+            .sort_by(|x, y| x.0.as_slice().cmp(y.0.as_slice()));
+    }
+    crate::vtab::dbstat_rows(pager, trees.as_slice(), label, a.agg, need).await
+}
+
+/// The suffixes of the shadow tables xCreate makes for `t` (v0.16
+/// review fix): an R*Tree's three; an fts5 table's `_data`, `_idx`,
+/// `_config`, and `_content` / `_docsize` when its options keep them.
+#[cfg(any(feature = "rtree", feature = "fts5"))]
+fn created_shadows(t: &VTab) -> AVec<&'static [u8]> {
+    let mut out: AVec<&'static [u8]> = AVec::new();
+    #[cfg(feature = "fts5")]
+    if let Some(c) = t.fts.as_deref() {
+        out.extend_from_slice(&[b"_data", b"_idx", b"_config"]);
+        if c.has_content() {
+            out.push(b"_content");
+        }
+        if c.columnsize {
+            out.push(b"_docsize");
+        }
+        return out;
+    }
+    if let Some(s) = shadow_suffixes(t) {
+        out.extend_from_slice(s);
+    }
+    out
 }
 
 /// The shadow tables' suffixes of a module whose tables can be

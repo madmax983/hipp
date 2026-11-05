@@ -454,6 +454,8 @@ impl<S: Storage> Connection<S> {
             return Err(err(SchemaKind::DuplicateTrigger));
         }
         reserved_name::<S::Error>(name)?;
+        #[cfg(feature = "vtab")]
+        self.shadow_name_free(name)?;
         if is_view && t.time != TrigTime::Instead {
             return Err(err(SchemaKind::TriggerOnView));
         }

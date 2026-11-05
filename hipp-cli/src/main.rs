@@ -429,6 +429,22 @@ fn fmt_real(f: f64) -> String {
     String::from_utf8_lossy(t.as_slice()).into_owned()
 }
 
+/// `.dump`'s literal: `fmt_literal`, but a blob as the pin shell's
+/// `x'hex'` (v0.16 review fix: hipp wrote `X'HEX'`).
+fn dump_literal(v: Value<'_>) -> Vec<u8> {
+    match v {
+        Value::Blob(b) => {
+            let mut out = b"x'".to_vec();
+            for &c in b {
+                out.extend_from_slice(format!("{c:02x}").as_bytes());
+            }
+            out.push(b'\'');
+            out
+        }
+        v => fmt_literal(v),
+    }
+}
+
 /// SQL literal rendering for `.dump`: text quoted with `''`
 /// doubling, blobs as `X'HEX'`, reals round-trip exact.
 fn fmt_literal(v: Value<'_>) -> Vec<u8> {
@@ -848,7 +864,41 @@ where
             Ok(Flow::Continue)
         }
         ".dump" => {
-            let _ = out.write_all(b"BEGIN TRANSACTION;\n");
+            // `.dump PATTERN...` (v0.16 review fix: the argument was
+            // ignored): the pin shell's filter — a LIKE on the name,
+            // a virtual table bringing its `name_*` shadow tables.
+            let pats: Vec<String> = shell_args(arg)
+                .into_iter()
+                .filter(|a| !a.starts_with('-'))
+                .collect();
+            let filter = if pats.is_empty() {
+                "1".to_string()
+            } else {
+                pats.iter()
+                    .map(|p| {
+                        let q = format!("'{}'", p.replace('\'', "''"));
+                        format!(
+                            "name LIKE {q} ESCAPE '\\' OR EXISTS (SELECT 1 FROM sqlite_schema \
+                             WHERE name LIKE {q} ESCAPE '\\' AND sql LIKE 'CREATE VIRTUAL TABLE%' \
+                             AND substr(o.name, 1, length(name)+1) == (name||'_'))"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            };
+            let mut keep: Vec<Vec<u8>> = Vec::new();
+            if let Ok(mut st) = db
+                .prepare(&format!(
+                    "SELECT name FROM main.sqlite_schema AS o WHERE ({filter}) AND type = 'table' AND sql NOT NULL"
+                ))
+                .await
+            {
+                while let Ok(Step::Row) = st.step().await {
+                    if let Some(n) = st.column_bytes(0) {
+                        keep.push(n.to_vec());
+                    }
+                }
+            }
             // Snapshot the catalog first (names as bytes) so the
             // per-table SELECTs can borrow the connection freely.
             // A table with generated columns dumps only the
@@ -891,6 +941,9 @@ where
             {
                 while let Ok(Step::Row) = st.step().await {
                     if let (Some(n), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
+                        if !keep.iter().any(|k| k == n) {
+                            continue;
+                        }
                         if q.len() >= 20 && q[..20].eq_ignore_ascii_case(b"CREATE VIRTUAL TABLE") {
                             vtabs.push((n.to_vec(), q.to_vec()));
                         }
@@ -898,11 +951,29 @@ where
                     }
                 }
             }
+            // The pin shell's header for a script that writes
+            // `sqlite_schema`, with the `foreign_keys` line it must
+            // precede: replaying it, the shell turns defensive mode
+            // off (v0.16 review fix: without it the pin refused the
+            // replay).
+            if !vtabs.is_empty() {
+                let _ = out.write_all(
+                    b"/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */\n\
+                      PRAGMA foreign_keys=OFF;\n",
+                );
+            }
+            let _ = out.write_all(b"BEGIN TRANSACTION;\n");
             let mut writable = false;
             let ordered = tables
                 .iter()
+                .filter(|t| keep.contains(&t.0))
                 .filter(|t| !is_seq(&t.0))
-                .chain(tables.iter().filter(|t| is_seq(&t.0)));
+                .chain(
+                    tables
+                        .iter()
+                        .filter(|t| keep.contains(&t.0))
+                        .filter(|t| is_seq(&t.0)),
+                );
             let mut ordered: Vec<&(Vec<u8>, Vec<u8>, String)> = ordered.collect();
             if !vtabs.is_empty() {
                 ordered.sort_by_key(|t| order.iter().position(|n| *n == t.0).unwrap_or(usize::MAX));
@@ -931,7 +1002,7 @@ where
                     );
                     vt_done += 1;
                 }
-                if writable && sql.starts_with(b"CREATE TABLE \"") {
+                if sql.starts_with(b"CREATE TABLE \"") || sql.starts_with(b"CREATE TABLE '") {
                     let _ = out.write_all(b"CREATE TABLE IF NOT EXISTS ");
                     let _ = out.write_all(&sql[13..]);
                     let _ = out.write_all(b";\n");
@@ -952,7 +1023,7 @@ where
                         if i > 0 {
                             line.extend_from_slice(b",");
                         }
-                        line.extend_from_slice(&fmt_literal(
+                        line.extend_from_slice(&dump_literal(
                             st.column_value(i).unwrap_or(Value::Null),
                         ));
                     }
@@ -968,7 +1039,9 @@ where
             // ends with its `;` on a line of its own, as there.
             let mut objs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             if let Ok(mut st) = db
-                .prepare("SELECT type, sql FROM main.sqlite_schema WHERE sql NOT NULL")
+                .prepare(&format!(
+                    "SELECT type, sql FROM main.sqlite_schema AS o WHERE ({filter}) AND sql NOT NULL"
+                ))
                 .await
             {
                 while let Ok(Step::Row) = st.step().await {
@@ -993,9 +1066,6 @@ where
                     .as_bytes(),
                 );
             }
-            if writable {
-                let _ = out.write_all(b"PRAGMA writable_schema=OFF;\n");
-            }
             for ty in [&b"view"[..], b"trigger", b"index"] {
                 for (t, sql) in objs.iter() {
                     if !t.eq_ignore_ascii_case(ty) {
@@ -1005,6 +1075,10 @@ where
                     let comment = sql.windows(2).any(|w| w == b"--");
                     let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
                 }
+            }
+            // Last, as the pin shell writes it.
+            if writable {
+                let _ = out.write_all(b"PRAGMA writable_schema=OFF;\n");
             }
             let _ = out.write_all(b"COMMIT;\n");
             Ok(Flow::Continue)

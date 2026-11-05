@@ -581,6 +581,8 @@ impl<S: Storage> Connection<S> {
             Ast::AlterRename { to, .. } => {
                 let new = handle_bytes(arena, *to);
                 reserved_name::<S::Error>(new)?;
+                #[cfg(feature = "vtab")]
+                self.shadow_name_free(new)?;
                 if self.catalog.taken(ca, new).is_some() {
                     return Err(err(SchemaKind::DuplicateTable));
                 }

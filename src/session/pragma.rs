@@ -56,6 +56,11 @@ pub(super) enum Prag {
     PageSize,
     QuickCheck,
     RecursiveTriggers,
+    /// `writable_schema` (v0.16 review fix, `vtab`): while on, a
+    /// `.dump`'s virtual-table schema rows and shadow-table rows
+    /// replay (see `Connection::plan_schema_insert`).
+    #[cfg(feature = "vtab")]
+    WritableSchema,
     SchemaVersion,
     Synchronous,
     TableInfo,
@@ -102,6 +107,8 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("table_list", Prag::TableList),
     ("table_xinfo", Prag::TableXinfo),
     ("user_version", Prag::UserVersion),
+    #[cfg(feature = "vtab")]
+    ("writable_schema", Prag::WritableSchema),
     #[cfg(feature = "wal")]
     ("wal_autocheckpoint", Prag::WalAutocheckpoint),
     #[cfg(feature = "wal")]
@@ -179,6 +186,10 @@ impl Prag {
         // `PRAGMA temp.encoding = 'UTF-16be'` sets it).
         #[cfg(feature = "utf16")]
         if self == Prag::Encoding {
+            return true;
+        }
+        #[cfg(feature = "vtab")]
+        if self == Prag::WritableSchema {
             return true;
         }
         matches!(
@@ -302,6 +313,9 @@ pub(super) struct PragState {
     pub foreign_keys: bool,
     pub recursive_triggers: bool,
     pub ignore_checks: bool,
+    /// `PRAGMA writable_schema` (v0.16 review fix, `vtab`).
+    #[cfg(feature = "vtab")]
+    pub writable_schema: bool,
     pub busy_timeout: i32,
     /// `case_sensitive_like` has been set (to any value) on this
     /// connection: LIKE is then non-deterministic, as on the pin
@@ -790,6 +804,8 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "foreign_keys")]
             Prag::ForeignKeyCheck => return Err(Error::Unsupported),
             Prag::RecursiveTriggers => row1(int(i64::from(self.prag.recursive_triggers))),
+            #[cfg(feature = "vtab")]
+            Prag::WritableSchema => row1(int(i64::from(self.prag.writable_schema))),
             Prag::IgnoreCheckConstraints => row1(int(i64::from(self.prag.ignore_checks))),
             Prag::CaseSensitiveLike => AVec::new(),
             Prag::CollationList => {
@@ -2156,6 +2172,11 @@ impl<S: Storage> Statement<'_, S> {
             }
             Prag::RecursiveTriggers => {
                 self.conn.prag.recursive_triggers = boolean(arg);
+                Ok(AVec::new())
+            }
+            #[cfg(feature = "vtab")]
+            Prag::WritableSchema => {
+                self.conn.prag.writable_schema = boolean(arg);
                 Ok(AVec::new())
             }
             #[cfg(feature = "foreign_keys")]

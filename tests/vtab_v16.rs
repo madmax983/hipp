@@ -285,16 +285,26 @@ fn unknown_module_file_opens() {
          select name, type from pragma_table_list where name like 'f%' order by name; \
          pragma integrity_check(t)",
     );
+    // Review-fix regressions: its shadow tables (fts4 declares
+    // `'c0x'` columns) read as ordinary tables, VACUUM and a full
+    // integrity_check run, PRAGMA table_list counts their columns.
+    on_pin_file(
+        "fts4-shadow-read",
+        setup,
+        "select * from f_content; select count(*) from f_segdir; select docid, hex(size) from f_docsize; \
+         select name, ncol, wr, type from pragma_table_list where name like 'f\\_%' escape '\\' \
+         order by name; pragma integrity_check; vacuum; pragma integrity_check; \
+         select * from f_content; select type, name from sqlite_schema order by name; \
+         create table 'q'(x, 'y z'); insert into q values (1, 2); select \"y z\" from q; \
+         pragma table_info(q)",
+    );
     let base = common::temp_db("v16vt-fts4-base2");
     let (ok, _) = oracle_script(&base, setup);
     assert!(ok);
-    // (fts4's shadow tables quote their names as strings, which
-    // hipp's grammar does not read: they are listed, not read.)
     for (i, s) in [
         "select * from f",
         "insert into f values ('x')",
         "drop table f",
-        "select count(*) from f_content",
     ]
     .iter()
     .enumerate()
@@ -500,4 +510,322 @@ fn table_list_of_virtual_tables() {
          select * from pragma_table_list where type = 'virtual'; \
          pragma table_xinfo(s)",
     );
+}
+
+// ---------------- review fixes (v0.16) ----------------
+
+/// generate_series with a negative step under `value` constraints:
+/// the first value moved below the upper bound (the filter's test
+/// was `<`, so rows above a consumed `value <` / `=` came back), and
+/// a step of `i64::MIN` (its magnitude is 2^63).
+#[test]
+fn series_descending_constraints() {
+    same(
+        "gs-desc",
+        "select value from generate_series(100,1,-10) where value = 51; \
+         select value from generate_series(100,1,-10) where value < 55; \
+         select value from generate_series(100,1,-10) where value > 12 and value < 29; \
+         select value from generate_series(10,1,-3) where value = 5; \
+         select value from generate_series(10,1,-3) where value <= 8; \
+         select value from generate_series(10,1,-3) where value between 2 and 6; \
+         select value from generate_series(-5,-50,-7) where value < -6.5; \
+         select value from generate_series(9223372036854775807, -9223372036854775808, -9223372036854775808); \
+         select value from generate_series(-9223372036854775808, 9223372036854775807, -9223372036854775808); \
+         select value, step from generate_series(9223372036854775807, 0, -9223372036854775808) where value < 5",
+    );
+    // A generated corpus of descending series under `value` bounds.
+    let mut rng = Rng(0xde5c_e4d5);
+    let mut script = String::new();
+    for _ in 0..200 {
+        let start = rng.range(-60, 60);
+        let stop = rng.range(-60, 60).min(start);
+        let step = -rng.range(1, 13);
+        let mut q = format!("select value from generate_series({start}, {stop}, {step})");
+        let ops = ["<", "<=", ">", ">=", "="];
+        for j in 0..rng.range(1, 2) {
+            let op = ops[rng.below(ops.len() as u64) as usize];
+            let v = rng.range(-65, 65);
+            q.push_str(if j == 0 { " where " } else { " and " });
+            q.push_str(&format!("value {op} {v}"));
+        }
+        script.push_str(&q);
+        script.push_str(";\n");
+    }
+    same("gs-desc-gen", &script);
+}
+
+/// A virtual-table cursor's rows are held in memory: past
+/// `Config::max_vtab_rows` the statement fails cleanly (it aborted
+/// the process out of memory: `count(*) from generate_series(1)` is
+/// 2^32 rows); a LIMIT the module honours stays under it.
+#[test]
+fn series_row_bound() {
+    block_on(async {
+        let cfg = Config::default().max_vtab_rows(1000);
+        let mut db = Connection::open(hipp::storage::MemStorage::new(), cfg)
+            .await
+            .expect("open");
+        let one = |n: &str| format!("select count(*) from generate_series(1, {n})");
+        for (q, want) in [
+            (one("1000"), Some(1000)),
+            (
+                "select value from generate_series(1) limit 3".to_string(),
+                Some(1),
+            ),
+            (one("1001"), None),
+            ("select count(*) from generate_series(1)".to_string(), None),
+        ] {
+            let mut st = db.prepare(&q).await.expect("prepare");
+            match (st.step().await, want) {
+                (Ok(Step::Row), Some(n)) => {
+                    assert_eq!(st.column_value(0), Some(hipp::Value::Integer(n)), "{q}");
+                }
+                (Err(Error::Schema { kind }), None) => {
+                    assert_eq!(kind, SchemaKind::VtabTooManyRows, "{q}")
+                }
+                (r, w) => panic!("{q}: {r:?} (wanted {w:?})"),
+            }
+        }
+    });
+}
+
+/// CREATE VIRTUAL TABLE whose shadow tables' names are taken fails
+/// and creates nothing (hipp wrote a second `r_node`, a schema the pin
+/// refuses as malformed); names a module reserves for its shadow
+/// tables are refused to CREATE TABLE / VIEW / INDEX / TRIGGER /
+/// RENAME TO / TEMP objects.
+#[test]
+fn shadow_names_are_reserved() {
+    for (i, (setup, create)) in [
+        (
+            "create table r_node(a); insert into r_node values ('userdata')",
+            "create virtual table r using rtree(id, x0, x1)",
+        ),
+        (
+            "create table r_parent(a)",
+            "create virtual table r using rtree(id, x0, x1)",
+        ),
+        (
+            "create table r_rowid(a)",
+            "create virtual table r using rtree_i32(id, x0, x1)",
+        ),
+        (
+            "create view f_data as select 1",
+            "create virtual table f using fts5(x)",
+        ),
+        (
+            "create table f_config(a)",
+            "create virtual table f using fts5(x)",
+        ),
+        (
+            "create table f_docsize(a)",
+            "create virtual table f using fts5(x, content='')",
+        ),
+        (
+            "create table f_idx(a)",
+            "create virtual table f using fts5(x, content='', columnsize=0)",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let e = same(
+            &format!("clash{i}"),
+            &format!("{setup}; {create}; select 1"),
+        );
+        assert!(
+            matches!(
+                e,
+                Some(Error::Schema {
+                    kind: SchemaKind::DuplicateTable
+                })
+            ),
+            "{create}: {e:?}"
+        );
+        same(
+            &format!("clash-after{i}"),
+            &format!(
+                "{setup}; select type, name from sqlite_schema order by name; pragma integrity_check"
+            ),
+        );
+    }
+    // A contentless table's unused `_content` / `_docsize` names stay
+    // free beside it only before it exists.
+    same(
+        "clash-free",
+        "create table x_content(a); create virtual table x using fts5(a, content=''); \
+         select type, name from sqlite_schema order by name",
+    );
+    for (i, s) in [
+        "create table h_content(a)",
+        "create table H_CONTENT(a)",
+        "create view h_content as select 1",
+        "create index h_content on t(a)",
+        "alter table t rename to h_content",
+        "create temp table h_content(a)",
+        "create temp view h_docsize as select 1",
+        "create virtual table h_content using fts5(y)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        refuse(
+            &format!("reserved{i}"),
+            &format!("create table t(a); create virtual table h using fts5(x, content=''); {s}"),
+            SchemaKind::ReservedName,
+        );
+    }
+    // CREATE TRIGGER (its body's `;` keeps it out of the scripts).
+    block_on(async {
+        let mut db = Connection::open(hipp::storage::MemStorage::new(), Config::default())
+            .await
+            .expect("open");
+        for s in [
+            "create table t(a)",
+            "create virtual table h using fts5(x, content='')",
+        ] {
+            let mut st = db.prepare(s).await.expect("prepare");
+            assert!(matches!(st.step().await, Ok(Step::Done)));
+        }
+        let r = db
+            .prepare("create trigger h_content after insert on t begin select 1; end")
+            .await;
+        assert!(
+            matches!(
+                r,
+                Err(Error::Schema {
+                    kind: SchemaKind::ReservedName
+                })
+            ),
+            "{:?}",
+            r.err()
+        );
+    });
+    same(
+        "reserved-ok",
+        "create table t(a); create virtual table h using fts5(x, content=''); \
+         create table h_other(a); create table h_docsize2(a); create table hx_content(a); \
+         select name from sqlite_schema order by name",
+    );
+}
+
+/// `dbstat(schema)`: an unknown schema at CREATE is "no such
+/// database" (hipp made a table that read nothing); `temp` and
+/// attached databases list their pages.
+#[test]
+fn dbstat_other_databases() {
+    let aux = common::temp_db("v16vt-dbstat-aux");
+    let (ok, _) = oracle_script(
+        &aux,
+        "create table z(a, b); insert into z select value, randomblob(300) from generate_series(1, 40); \
+         create index zi on z(a)",
+    );
+    assert!(ok);
+    let a = aux.display();
+    same(
+        "dbstat-db",
+        &format!(
+            "create table t(a); select * from dbstat('temp'); \
+             create temp table tt(a); insert into tt values (1); select * from dbstat('temp'); \
+             attach '{a}' as aux; select * from dbstat('aux'); \
+             select name, pageno, schema from dbstat where schema = 'aux'; \
+             select * from dbstat('AUX', 1); select count(*) from dbstat('nosuch'); \
+             create virtual table q2 using dbstat(aux); select name, schema from q2; \
+             create virtual table q3 using dbstat(temp); create virtual table q4 using dbstat('main'); \
+             select count(*) from q4"
+        ),
+    );
+    refuse(
+        "dbstat-nosuch",
+        "create virtual table q using dbstat(nosuch)",
+        SchemaKind::UnknownDatabase,
+    );
+    refuse(
+        "dbstat-nosuch2",
+        "create virtual table q using dbstat(x, y, z)",
+        SchemaKind::UnknownDatabase,
+    );
+}
+
+/// `X RIGHT JOIN <virtual table> ON <its columns>`: the ON stays a
+/// join condition (it was refused as a lateral argument list).
+#[test]
+fn right_join_of_virtual_tables() {
+    same(
+        "rjoin",
+        "create virtual table r using rtree(id, a, b); \
+         insert into r values (1, 0, 10), (2, 5, 6), (3, 20, 30); \
+         create table t(k, v); insert into t values (1, 5), (2, 25), (9, 100); \
+         select k, id from t right join r on r.id = t.k order by 1, 2; \
+         select k, value from t right join generate_series(1, 3) on value = t.k order by 1, 2; \
+         select k, id from t right join r on r.a <= t.v and r.b >= t.v order by 1, 2; \
+         select k, id from t full join r on r.id = t.k order by 1, 2; \
+         select k, value from t right join generate_series(1, 3) on value = t.k where value > 1 order by 1, 2; \
+         select k, id from r left join t on r.id = t.k order by 1, 2",
+    );
+}
+
+/// `PRAGMA writable_schema` and the `.dump` replay of a virtual
+/// table: its schema row, then its shadow tables' rows.
+#[test]
+fn writable_schema_replays_a_dump() {
+    let replay = "PRAGMA writable_schema=ON; \
+        INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','r','r',0,'CREATE VIRTUAL TABLE r using rtree(id,a,b)'); \
+        CREATE TABLE IF NOT EXISTS \"r_rowid\"(rowid INTEGER PRIMARY KEY,nodeno); \
+        INSERT INTO r_rowid VALUES(1,1); \
+        CREATE TABLE IF NOT EXISTS \"r_node\"(nodeno INTEGER PRIMARY KEY,data); \
+        INSERT INTO r_node VALUES(1,x'000000010000000000000001400000004040000000000000000000000000000000000000000000000000000000000000'); \
+        CREATE TABLE IF NOT EXISTS \"r_parent\"(nodeno INTEGER PRIMARY KEY,parentnode); \
+        PRAGMA writable_schema=OFF";
+    // (A node of 48 bytes: the file's page size makes the pin's
+    // node size; the test reads the row back, not the tree.)
+    let h = common::temp_db("v16vt-ws-h");
+    let (ok, _, e) = hipp_script(&h, &format!("pragma page_size=512; {replay}"));
+    assert!(ok, "{e:?}");
+    let (ok, rows, e) = hipp_script(
+        &h,
+        "pragma writable_schema; select type, name, rootpage from sqlite_schema order by name; \
+         select * from r_rowid",
+    );
+    assert!(ok, "{e:?}");
+    assert_eq!(
+        rows,
+        [
+            "0",
+            "table|r|0",
+            "table|r_node|3",
+            "table|r_parent|4",
+            "table|r_rowid|2",
+            "1|1"
+        ]
+    );
+    // Off, the schema table and the shadow tables are read only again.
+    for (i, (s, kind)) in [
+        ("insert into sqlite_schema values ('table','q','q',0,'CREATE VIRTUAL TABLE q using rtree(id,a,b)')", SchemaKind::SchemaTableReadOnly),
+        ("insert into r_rowid values (2, 1)", SchemaKind::ShadowReadOnly),
+        ("pragma writable_schema = 1; insert into sqlite_schema values ('table','r','r',0,'CREATE VIRTUAL TABLE r using rtree(id,a,b)')", SchemaKind::DuplicateTable),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let c = common::temp_db(&format!("v16vt-ws-{i}"));
+        std::fs::copy(&h, &c).expect("copy");
+        let (ok, _, e) = hipp_script(&c, s);
+        assert!(!ok, "{s}");
+        assert!(matches!(e, Some(Error::Schema { kind: k }) if k == *kind), "{s}: {e:?}");
+    }
+    // Only a virtual table's row is written that way.
+    for (i, s) in [
+        "insert into sqlite_schema values ('table','q','q',2,'CREATE TABLE q(a)')",
+        "insert into sqlite_schema values ('view','v','v',0,'CREATE VIEW v AS SELECT 1')",
+        "insert into sqlite_schema values ('table','q','x',0,'CREATE VIRTUAL TABLE q using rtree(id,a,b)')",
+        "insert into sqlite_schema select 'table','q','q',0,'CREATE VIRTUAL TABLE q using rtree(id,a,b)'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let c = common::temp_db(&format!("v16vt-ws-only{i}"));
+        let (ok, _, e) = hipp_script(&c, &format!("pragma writable_schema = on; {s}"));
+        assert!(!ok, "{s}: {e:?}");
+    }
 }

@@ -837,25 +837,37 @@ aspirations.
   idxStr / cost, filter cursors, xUpdate, hidden columns, eponymous
   modules, shadow-table names). `CREATE VIRTUAL TABLE [IF NOT
   EXISTS] t USING m(args)` and its DROP store and remove exactly the
-  pin's `sqlite_schema` rows; a file with a virtual table of a
-  module hipp lacks opens, and only statements touching that table
-  are refused ("no such module"). `generate_series(start, stop,
+  pin's `sqlite_schema` rows, and refuse names the shadow tables
+  need or a module reserves; a file with a virtual table of a
+  module hipp lacks opens, its shadow tables read as ordinary
+  tables (fts3 / fts4's `'quoted'` declarations included), VACUUM
+  and integrity_check run, and only statements reading or writing
+  that table are refused ("no such module"). `generate_series(start, stop,
   step)` as the pin's shell ships it (hidden `start` / `stop` /
   `step`, its constraint handling on `value`, its 64-bit
-  arithmetic and its "first argument" error); `dbstat` byte for
-  byte on the same file (pages, overflow chains, `aggregate`,
-  `schema`, `name`). `rtree` / `rtree_i32` of 1-5 dimensions with
+  arithmetic and its "first argument" error) — hipp holds a
+  cursor's rows in memory, so more than `Config::max_vtab_rows`
+  (about 4 million) fail cleanly (`VtabTooManyRows`) where the pin
+  streams; `dbstat` byte for byte on the same file (pages, overflow
+  chains, `aggregate`, `schema`, `name`; `main`, `temp` and attached
+  databases). `rtree` / `rtree_i32` of 1-5 dimensions with
   `+aux` columns: the shadow tables `%_node` / `%_parent` /
   `%_rowid` are written byte-compatibly with the pin (node size,
   ChooseLeaf, the R*-tree split, delete with node removal and
   reinsertion, node numbering, float32 rounding outward), so
   either engine continues the other's files and each one's
-  `rtreecheck()` / integrity_check passes on the other's; queries
+  `rtreecheck()` passes on the other's (hipp's PRAGMA
+  integrity_check checks the shadow tables as tables, not the
+  tree: use `rtreecheck()`); `changes()` / `total_changes()` count
+  as the pin's (its internal shadow-row statements included); queries
   with `=`, `<`, `<=`, `>`, `>=`, BETWEEN and rowid lookups through
   xBestIndex; the pin's constraint errors under every conflict
   clause; `rtreecheck()`, `rtreenode()`, `rtreedepth()`; ALTER
   TABLE RENAME. Shadow tables are read only, as under the pin
-  shell's defensive mode.
+  shell's defensive mode, except under `PRAGMA writable_schema`,
+  which replays a `.dump` (hipp-cli's is the pin shell's, byte for
+  byte, `.dump PATTERN` included, and either engine reloads either
+  engine's).
 - **FTS5 full-text search** (leaf `fts5`, in `max`; on the `vtab`
   framework). `CREATE VIRTUAL TABLE t USING fts5(...)` with columns,
   `UNINDEXED`, `prefix=`, `content=` / `content_rowid=` (external

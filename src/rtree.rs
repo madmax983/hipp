@@ -98,6 +98,20 @@ pub fn declare(tab: &mut VTab, args: &[&[u8]], int: bool) -> Result<(), SchemaKi
     if !ndim2.is_multiple_of(2) {
         return Err(SchemaKind::RtreeWrongColumns);
     }
+    // The declared table's columns must differ in any case, as
+    // sqlite3_declare_vtab requires (v0.16 review fix: hipp created
+    // `rtree(id, a, a)`, a table the pin cannot read).
+    let cols = tab.cols.as_slice();
+    for (i, c) in cols.iter().enumerate() {
+        if cols
+            .get(..i)
+            .unwrap_or(&[])
+            .iter()
+            .any(|p| crate::sql::parser::eq_ci(p.name.as_slice(), c.name.as_slice()))
+        {
+            return Err(SchemaKind::DuplicateColumn);
+        }
+    }
     tab.ndim2 = ndim2 as u8;
     tab.naux = naux as u8;
     Ok(())
@@ -694,6 +708,10 @@ pub struct Writes {
     /// with INSERT statements, which leave it as the connection's
     /// `last_insert_rowid()` after an UPDATE or DELETE.
     pub last_insert: Option<i64>,
+    /// The shadow rows the pin's internal statements change on the
+    /// way, repeats included (v0.16 review fix: they count in its
+    /// `total_changes()`).
+    pub count: i64,
 }
 
 /// A node in memory (`RtreeNode`): `no` 0 until numbered; `live`
@@ -914,6 +932,7 @@ impl<'s> Tree<'s> {
         let data = self.node(i)?.data.clone();
         put(&mut self.w.nodes, no, Some(data));
         self.w.last_insert = Some(no);
+        self.w.count += 1;
         let n = self.node_mut(i)?;
         n.no = no;
         n.dirty = false;
@@ -945,11 +964,13 @@ impl<'s> Tree<'s> {
     fn rowid_write(&mut self, rowid: i64, node: i64) {
         put(&mut self.w.rowids, rowid, Some(node));
         self.w.last_insert = Some(rowid);
+        self.w.count += 1;
     }
 
     fn parent_write(&mut self, child: i64, parent: i64) {
         put(&mut self.w.parents, child, Some(parent));
         self.w.last_insert = Some(child);
+        self.w.count += 1;
     }
 
     /// `ChooseLeaf`.
@@ -1295,6 +1316,7 @@ impl<'s> Tree<'s> {
         let no = self.no(node);
         put(&mut self.w.nodes, no, None);
         put(&mut self.w.parents, no, None);
+        self.w.count += 2;
         self.node_mut(node)?.live = false;
         self.deleted.push((node, height));
         Ok(())
@@ -1306,6 +1328,20 @@ impl<'s> Tree<'s> {
             let c = self.cell(node, k);
             let ins = self.choose_leaf(&c, height)?;
             self.insert_cell(ins, &c, height)?;
+            // nodeRelease(pInsert) after each cell.
+            self.release_but_root()?;
+        }
+        Ok(())
+    }
+
+    /// Write every dirty node but the root, deepest first: what the
+    /// pin's `nodeRelease` does while a delete holds only the root.
+    fn release_but_root(&mut self) -> R<()> {
+        for i in (0..self.nodes.len()).rev() {
+            let n = self.node(i)?;
+            if n.live && n.dirty && n.no != 1 {
+                self.node_write(i)?;
+            }
         }
         Ok(())
     }
@@ -1317,6 +1353,11 @@ impl<'s> Tree<'s> {
             let leaf = self.acquire(leaf_no, None)?;
             let k = self.rowid_index(leaf, rowid)?;
             self.delete_cell(leaf, k, 0)?;
+            self.w.count += 1;
+            // nodeRelease(pLeaf): every node but the root (which the
+            // delete holds) is written now (v0.16 review fix: the
+            // pin's repeated node writes count in `total_changes()`).
+            self.release_but_root()?;
         }
         put(&mut self.w.rowids, rowid, None);
         if self.depth > 0 && self.ncell(root) == 1 {
@@ -1371,13 +1412,21 @@ impl<'s> Tree<'s> {
         };
         let rowid = match have {
             Some(r) => r,
-            None => self.next_rowid()?,
+            // rtreeNewRowid inserts a (NULL, NULL) `%_rowid` row for
+            // the key, which the mapping then replaces: one more
+            // change.
+            None => {
+                self.w.count += 1;
+                self.next_rowid()?
+            }
         };
         let cell = Cell { rowid, c: nr.c };
         let leaf = self.choose_leaf(&cell, 0)?;
         self.insert_cell(leaf, &cell, 0)?;
         if !nr.aux.is_empty() {
             self.w.aux = Some((rowid, nr.aux.clone()));
+            // The pin's separate UPDATE of the auxiliary columns.
+            self.w.count += 1;
         }
         self.flush()?;
         Ok(Some(rowid))
@@ -1549,10 +1598,16 @@ impl Search {
             } else {
                 level
             };
+            // More cells than fit is corruption, as in the pin's
+            // nodeAcquire (v0.16 review fix: the count was clamped, so
+            // stale cell bytes came back as rows).
+            if ncell(img.as_slice()) > g.max_cells() {
+                return Found::Corrupt;
+            }
             self.stack.push((img, level, 0, no));
         }
         while let Some(top) = self.stack.as_mut_slice().last_mut() {
-            let n = ncell(top.0.as_slice()).min(g.max_cells());
+            let n = ncell(top.0.as_slice());
             if top.2 >= n {
                 self.stack.pop();
                 continue;
@@ -1596,10 +1651,13 @@ pub fn lookup_rowid(v: &OwnedValue) -> Option<i64> {
 }
 
 /// The leaf cell for `rowid` in node image `d`.
+/// None (corrupt) also when the image claims more cells than fit.
 pub fn leaf_cell(g: &Geom, d: &[u8], rowid: i64) -> Option<Cell> {
-    (0..ncell(d).min(g.max_cells()))
-        .map(|k| get_cell(g, d, k))
-        .find(|c| c.rowid == rowid)
+    let n = ncell(d);
+    if n > g.max_cells() {
+        return None;
+    }
+    (0..n).map(|k| get_cell(g, d, k)).find(|c| c.rowid == rowid)
 }
 
 // ---------------------------------------------------------------

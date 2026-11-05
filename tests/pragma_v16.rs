@@ -267,7 +267,12 @@ fn known_but_unimplemented_pragmas_are_refused() {
             "wal_checkpoint"
         },
         "query_only",
-        "writable_schema",
+        // Implemented by the `vtab` leaf (a `.dump` replay).
+        if cfg!(feature = "vtab") {
+            "threads"
+        } else {
+            "writable_schema"
+        },
         "optimize",
     ]
     .iter()

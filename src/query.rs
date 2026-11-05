@@ -5105,6 +5105,15 @@ impl Env {
         self.pending.set(self.pending.get().saturating_add(1));
     }
 
+    /// `n` rows a module's internal statements changed (v0.16,
+    /// `rtree`): they join `total_changes()` at once, never
+    /// `changes()`, as nested statements' changes do on the pin.
+    #[cfg(feature = "rtree")]
+    pub fn add_total(&self, n: i64) {
+        self.total_changes
+            .set(self.total_changes.get().saturating_add(n));
+    }
+
     /// A new statement's claim on the clock cache (v0.16,
     /// `datetime`): the cache empties, so the statement reads the
     /// clock once, on first need, and keeps that instant.
