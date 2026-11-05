@@ -1,6 +1,7 @@
 # ADR 0003 — The profile layout and size budgets of 0.16.0
 
-- **Status:** accepted (2026-11-05), at the 0.16.0 release
+- **Status:** accepted (2026-11-05), at the 0.16.0 release;
+  point 4's alias outside `max` is `xl` (ADR 0004)
 - **Context:** ADR 0001 set the gating policy and ratchets; ADR 0002
   added the `max` alias for leaves too large for `full`. The v0.16
   push ended with seventeen leaves and the `v16` rung. This records

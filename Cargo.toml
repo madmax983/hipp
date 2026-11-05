@@ -10,7 +10,12 @@ license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
 [features]
-default = ["std", "max"]
+default = ["std", "xl"]
+# Past `max` (ADR 0004): `max` plus the leaves that no longer fit
+# `max`'s 1 MiB budget (ADR 0003 closed it to leaves that do not
+# fit). Std builds (the CLI, the differential tests) use it; CI
+# ratchets its size separately (budget 1.25 MiB).
+xl = ["max"]
 # Everything (ADR 0002): `full` plus the heavyweight v0.16 leaves
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the

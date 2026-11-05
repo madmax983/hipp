@@ -75,6 +75,8 @@ jobs:
         run: cargo test --lib --no-default-features --features full
       - name: Library unit tests, max no_std profile (ADR 0002)
         run: cargo test --lib --no-default-features --features max
+      - name: Library unit tests, xl no_std profile (ADR 0004)
+        run: cargo test --lib --no-default-features --features xl
 
   test:
     name: test (vs pinned SQLite 3.54.1 oracle)
@@ -125,6 +127,8 @@ jobs:
         run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features --features full
       - name: Core, max no_std profile (ADR 0002)
         run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features --features max
+      - name: Core, xl no_std profile (ADR 0004)
+        run: cargo build --lib --release --target "${{ matrix.target }}" --no-default-features --features xl
 
   size:
     name: size gate (thumbv7em tiny + full + max)
@@ -149,6 +153,10 @@ jobs:
         run: cargo build --profile tiny --target thumbv7em-none-eabihf --no-default-features --features max --bin hipp_thumb_demo
       - name: Max-profile gate + ratchet
         run: python3 ci/size_gate.py --section max target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
+      - name: Build xl no_std profile demo (ADR 0004)
+        run: cargo build --profile tiny --target thumbv7em-none-eabihf --no-default-features --features xl --bin hipp_thumb_demo
+      - name: Xl-profile gate + ratchet
+        run: python3 ci/size_gate.py --section xl target/thumbv7em-none-eabihf/tiny/hipp_thumb_demo
 
   miri:
     name: miri (arena unsafe + engine end-to-end)
