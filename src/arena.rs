@@ -480,6 +480,22 @@ impl<T: core::fmt::Debug> core::fmt::Debug for AVec<T> {
     }
 }
 
+impl<T> FromIterator<T> for AVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(it: I) -> Self {
+        AVec {
+            vec: it.into_iter().collect(),
+        }
+    }
+}
+
+impl<T> IntoIterator for AVec<T> {
+    type Item = T;
+    type IntoIter = alloc::vec::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.vec.into_iter()
+    }
+}
+
 impl<T> core::ops::Index<usize> for AVec<T> {
     type Output = T;
     fn index(&self, i: usize) -> &T {

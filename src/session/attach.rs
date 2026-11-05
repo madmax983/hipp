@@ -122,10 +122,10 @@ pub(super) enum AttRoute {
 
 /// A planned statement of an attached database (`Plan::Att`).
 pub(super) struct AttPlan {
-    db: usize,
+    pub(super) db: usize,
     pub(super) sql: AVec<u8>,
     pub(super) width: usize,
-    ext: AVec<ExtReq>,
+    pub(super) ext: AVec<ExtReq>,
     /// `OnRoute::lock`.
     lock: bool,
 }
@@ -1075,7 +1075,7 @@ impl<S: Storage> Connection<S> {
 
     /// The external sources' columns, installed in attached database
     /// `db` for its next prepare (rows `None`) or execution.
-    fn ext_tabs(&self, reqs: &[ExtReq]) -> Result<AVec<ExtTab>, S::Error> {
+    pub(super) fn ext_tabs(&self, reqs: &[ExtReq]) -> Result<AVec<ExtTab>, S::Error> {
         let mut out = AVec::new();
         for r in reqs {
             let n = r.name.as_slice();
@@ -1262,6 +1262,8 @@ impl<S: Storage> Connection<S> {
             defaults.push(OwnedValue::Null);
         }
         plans.push(super::SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: 0,
             kind: s.kind,
             on: None,
@@ -1272,10 +1274,12 @@ impl<S: Storage> Connection<S> {
             derived: None,
             gcols: None,
             rec: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf_dead: AVec::new(),
+            #[cfg(feature = "vtab")]
+            vt: None,
             #[cfg(feature = "expr_index")]
             access: None,
             #[cfg(feature = "expr_index")]

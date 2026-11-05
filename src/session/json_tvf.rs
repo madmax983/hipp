@@ -12,13 +12,16 @@
 //! themselves come from `json::tvf_rows`.
 
 use super::*;
-use crate::query::{SourceDesc, SubPlan, TVF_LATERAL, and_terms};
+#[cfg(feature = "json")]
+use crate::query::{SourceDesc, SubPlan};
+use crate::query::{TVF_LATERAL, and_terms};
 
 impl<S: Storage> Connection<S> {
     /// Plan FROM source `s`, a call of the JSON table-valued
     /// function `kind` (`json::tvf_kind`): its description and a
     /// placeholder plan (the arguments are resolved later, by
     /// `plan_tvf_args`). Returns its width.
+    #[cfg(feature = "json")]
     pub(super) fn plan_json_tvf(
         &self,
         s: &crate::sql::FromSource,
@@ -86,8 +89,12 @@ impl<S: Storage> Connection<S> {
             scalar_col: 0,
             rec: None,
             mat: 0,
+            #[cfg(feature = "explain")]
+            sel: 0,
         };
         plans.push(SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: 0,
             kind: s.kind,
             on: None,
@@ -99,8 +106,9 @@ impl<S: Storage> Connection<S> {
             gcols: None,
             rec: 0,
             tvf: kind,
-            #[cfg(feature = "json")]
             tvf_dead: AVec::new(),
+            #[cfg(feature = "vtab")]
+            vt: None,
             #[cfg(feature = "expr_index")]
             access: None,
             #[cfg(feature = "expr_index")]
@@ -285,6 +293,11 @@ impl<S: Storage> Statement<'_, S> {
         row: &RowData,
         need: Option<usize>,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        // A virtual table's rows (v0.16, `vtab`).
+        #[cfg(feature = "vtab")]
+        if let Some(vt) = sp.vt.as_deref() {
+            return self.vtab_rows(sp, vt, row, need).await;
+        }
         let mut args = AVec::new();
         if let Some(d) = sp.derived.as_deref()
             && let Some(r) = d.values.as_slice().first()
@@ -295,10 +308,16 @@ impl<S: Storage> Statement<'_, S> {
         }
         // A UTF-16 database's document or path BLOB decodes from
         // UTF-16 (v0.16, `utf16`).
-        #[cfg(feature = "utf16")]
+        #[cfg(all(feature = "utf16", feature = "json"))]
         for (i, v) in args.as_mut_slice().iter_mut().enumerate() {
             crate::query::json_arg16(v, |i| i < 2, i, self.conn.pager.text_enc());
         }
+        #[cfg(not(feature = "json"))]
+        {
+            let _ = need;
+            Ok(AVec::new())
+        }
+        #[cfg(feature = "json")]
         crate::json::tvf_rows(
             sp.tvf & !TVF_LATERAL,
             args.as_slice(),

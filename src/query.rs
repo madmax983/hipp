@@ -113,6 +113,10 @@ pub struct AggExt {
     /// equal keys surviving, instead of by the first-seen DISTINCT
     /// test.
     pub unique: bool,
+    /// The call was spelled `string_agg` (v0.16, `explain`: EXPLAIN
+    /// QUERY PLAN names the function as the pin does).
+    #[cfg(feature = "explain")]
+    pub string_agg: bool,
 }
 
 /// One aggregate node, taken apart (`agg_parts`): its kind and
@@ -204,6 +208,21 @@ pub fn agg_row<E>(p: &AggParts<'_>, ctx: &Ctx<'_>) -> Result<Option<AVec<OwnedVa
 /// scalar forms of min/max.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFn {
+    /// `x MATCH q` (v0.16, `fts5`): only a full-text table's
+    /// constraint consumes it; evaluated, the pin's "unable to use
+    /// function MATCH in the requested context".
+    #[cfg(feature = "fts5")]
+    Match,
+    /// `bm25()`, `highlight()`, `snippet()` (v0.16, `fts5`): the
+    /// first argument is a full-text table's hidden column.
+    #[cfg(feature = "fts5")]
+    Fts5(crate::fts5::aux::AuxFn),
+    /// `rtreenode(ndim, blob)` / `rtreedepth(blob)` (v0.16,
+    /// `rtree`): the pin's R*Tree test functions.
+    #[cfg(feature = "rtree")]
+    RtreeNode,
+    #[cfg(feature = "rtree")]
+    RtreeDepth,
     Abs,
     Length,
     Upper,
@@ -582,6 +601,14 @@ pub struct SourceDesc {
     /// object (`json::Op::EachValue`).
     #[cfg(feature = "json")]
     pub json_tvf: u8,
+    /// A virtual table's columns `*` shows (v0.16, `vtab`): the
+    /// rest are HIDDEN. 0: all.
+    #[cfg(feature = "vtab")]
+    pub vt_visible: usize,
+    /// A full-text table's hidden table-name column (v0.16, `fts5`):
+    /// the only argument its auxiliary functions take first.
+    #[cfg(feature = "fts5")]
+    pub fts_col: Option<usize>,
 }
 
 /// What an ALTER TABLE learns from planning a view (v0.16, `v16`):
@@ -704,6 +731,10 @@ impl SourceDesc {
             dbname: AVec::new(),
             #[cfg(feature = "json")]
             json_tvf: 0,
+            #[cfg(feature = "vtab")]
+            vt_visible: 0,
+            #[cfg(feature = "fts5")]
+            fts_col: None,
         }
     }
 
@@ -935,7 +966,7 @@ pub struct SubSource {
     /// `derived` plan is a placeholder whose one VALUES row holds
     /// the resolved arguments, so every plan walker (correlation,
     /// shifts, aggregates, subqueries) sees them.
-    #[cfg(feature = "json")]
+    #[cfg(any(feature = "json", feature = "vtab"))]
     pub tvf: u8,
     /// A lateral JSON table-valued source's (v0.16, `json`): the
     /// slots of the sources before it that nothing but its
@@ -943,8 +974,13 @@ pub struct SubSource {
     /// (so a plan shifted whole keeps them). The join clears them
     /// once the call has run, so the rows it makes do not each
     /// carry a copy of the document (`FROM t, json_each(t.j)`).
-    #[cfg(feature = "json")]
+    #[cfg(any(feature = "json", feature = "vtab"))]
     pub tvf_dead: AVec<usize>,
+    /// A virtual table (v0.16, `vtab`): its module and plan; `tvf`
+    /// is then `TVF_VTAB` (with `TVF_LATERAL` when a filter argument
+    /// reads a source to its left).
+    #[cfg(feature = "vtab")]
+    pub vt: Option<Box<crate::vtab::VtSrc>>,
     /// The source's index access path (v0.16, `expr_index`): the
     /// rows an index or the rowid B-tree finds, in its order; `None`
     /// scans the table in rowid order.
@@ -964,6 +1000,30 @@ pub struct SubSource {
     /// for none.
     #[cfg(feature = "attach")]
     pub ext: u16,
+    /// EXPLAIN QUERY PLAN's names for the source (v0.16, `explain`):
+    /// as a loop (`SCAN x`: the alias, else the `[schema.]` table,
+    /// view or CTE name) and as a subquery the statement computes
+    /// (`MATERIALIZE x`: the view's or CTE's name, else the alias),
+    /// empty for an unnamed FROM subquery (`(subquery-n)`); and what
+    /// its natural order delivers.
+    #[cfg(feature = "explain")]
+    pub eqp: EqpInfo,
+}
+
+/// What EXPLAIN QUERY PLAN says of a FROM source (v0.16, `explain`;
+/// `SubSource::eqp`).
+#[cfg(feature = "explain")]
+#[derive(Debug, Clone, Default)]
+pub struct EqpInfo {
+    pub scan: AVec<u8>,
+    pub mat: AVec<u8>,
+    /// Where its columns start in the query row.
+    pub base: usize,
+    /// A table read in its own order (no access path): how many
+    /// ORDER BY / GROUP BY terms that order delivers, and whether it
+    /// brings a DISTINCT's equal rows together (`xplan::natural_sat`).
+    pub natural: usize,
+    pub nat_distinct: bool,
 }
 
 /// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
@@ -980,8 +1040,12 @@ pub enum Hint {
 
 /// `SubSource::tvf`: the arguments read a FROM source to the left,
 /// so the rows are computed per row of the sources before it.
-#[cfg(feature = "json")]
+#[cfg(any(feature = "json", feature = "vtab"))]
 pub const TVF_LATERAL: u8 = 0x80;
+
+/// `SubSource::tvf` of a virtual-table source (v0.16, `vtab`).
+#[cfg(feature = "vtab")]
+pub const TVF_VTAB: u8 = 0x40;
 
 /// A recursive common table expression's shape (v0.16, `v16`),
 /// carried by its `SubPlan`: compound tails from index `split - 1`
@@ -1088,6 +1152,10 @@ pub struct SubPlan {
     /// plan.
     #[cfg(feature = "v16")]
     pub mat: u32,
+    /// The pin's select number of this core (v0.16, `explain`;
+    /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
+    #[cfg(feature = "explain")]
+    pub sel: u32,
 }
 
 impl SubPlan {
@@ -1671,6 +1739,10 @@ pub fn expand_star<E>(
             // A table-valued function's hidden columns (v0.16).
             #[cfg(feature = "json")]
             if src.json_tvf != 0 && ci >= crate::json::TVF_VISIBLE {
+                continue;
+            }
+            #[cfg(feature = "vtab")]
+            if src.vt_visible != 0 && ci >= src.vt_visible {
                 continue;
             }
             let joined = qual.is_none()
@@ -2770,6 +2842,24 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
     {
         return Some(ScalarFn::Date(d));
     }
+    #[cfg(feature = "fts5")]
+    if f.is_none() {
+        if eq_ci(name, b"match") {
+            return Some(ScalarFn::Match);
+        }
+        if let Some(a) = crate::fts5::aux::AuxFn::lookup(name) {
+            return Some(ScalarFn::Fts5(a));
+        }
+    }
+    #[cfg(feature = "rtree")]
+    if f.is_none() {
+        if eq_ci(name, b"rtreenode") {
+            return Some(ScalarFn::RtreeNode);
+        }
+        if eq_ci(name, b"rtreedepth") {
+            return Some(ScalarFn::RtreeDepth);
+        }
+    }
     #[cfg(feature = "math")]
     if f.is_none() {
         return crate::math::MathFn::lookup(name).map(ScalarFn::Math);
@@ -2786,6 +2876,12 @@ fn arity(f: ScalarFn) -> (usize, usize) {
         // used to run.
         ScalarFn::Coalesce => (2, usize::MAX),
         ScalarFn::Nullif | ScalarFn::Instr => (2, 2),
+        #[cfg(feature = "rtree")]
+        ScalarFn::RtreeNode => (2, 2),
+        #[cfg(feature = "fts5")]
+        ScalarFn::Match => (2, 2),
+        #[cfg(feature = "fts5")]
+        ScalarFn::Fts5(_) => (1, usize::MAX),
         ScalarFn::Substr => (2, 3),
         ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
         ScalarFn::Replace => (3, 3),
@@ -2949,6 +3045,34 @@ fn resolve_call_body<E>(
     enclosing: &[ScopeGroup],
     planner: SubPlanner<'_, E>,
 ) -> Result<RExpr, E> {
+    // `rtreecheck([schema,] table)` (v0.16, `rtree`) reads the
+    // database: it runs as the scalar subquery `(SELECT * FROM
+    // <check source>(args))` over the internal one-row source that
+    // performs the check (`vtab::Module::Check`).
+    #[cfg(feature = "rtree")]
+    if eq_ci(name, b"rtreecheck") && !star {
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::Schema {
+                kind: SchemaKind::WrongArgumentCount,
+            });
+        }
+        let t = arena.alloc_copy_handle(crate::vtab::CHECK_NAME)?;
+        let mut sel = crate::sql::parser::star_select(t, None, None, AVec::new(), arena);
+        if let Some(f) = sel.from.as_mut_slice().first_mut() {
+            let mut a = AVec::new();
+            for e in args.iter() {
+                a.push(e.clone());
+            }
+            f.args = Some(a);
+        }
+        return resolve_scoped::<E>(
+            &Expr::ScalarSubquery(Box::new(sel)),
+            arena,
+            cur,
+            enclosing,
+            planner,
+        );
+    }
     // CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP without the
     // `datetime` leaf (v0.16): the clock pseudo-columns a DEFAULT
     // expression resolves against (`rules::prepare_default`);
@@ -2969,6 +3093,29 @@ fn resolve_call_body<E>(
         .map_err(|_| Error::Schema {
             kind: SchemaKind::UnknownFunction,
         });
+    }
+    // The FTS5 auxiliary functions (v0.16, `fts5`): the first
+    // argument must be a full-text table's hidden column, as the
+    // pin's xFindFunction overloading requires.
+    #[cfg(feature = "fts5")]
+    if let Some(a) = crate::fts5::aux::AuxFn::lookup(name)
+        && !star
+    {
+        let r = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
+        let hidden = |slot: usize| {
+            core::iter::once(cur).chain(enclosing.iter()).any(|g| {
+                g.sources
+                    .iter()
+                    .zip(g.offsets.iter())
+                    .any(|(s, off)| s.fts_col.is_some_and(|c| off + c == slot))
+            })
+        };
+        if !matches!(r.as_slice().first(), Some(RExpr::Column(slot, ..)) if hidden(*slot)) {
+            return Err(Error::Schema {
+                kind: SchemaKind::Fts5Context,
+            });
+        }
+        return Ok(RExpr::Scalar(ScalarFn::Fts5(a), r));
     }
     let agg = agg_kind(name);
     // The aggregate clauses on anything but an aggregate (v0.16,
@@ -3091,6 +3238,8 @@ fn resolve_call_body<E>(
                         order,
                         filter,
                         unique,
+                        #[cfg(feature = "explain")]
+                        string_agg: eq_ci(name, b"string_agg"),
                     }))
                 }
             }
@@ -4892,6 +5041,12 @@ pub struct Env {
     /// when it returns.
     #[cfg(feature = "json")]
     pub json_docs: crate::json::TvfDocs,
+    /// The rows the running statement's full-text queries returned
+    /// (v0.16, `fts5`): a full-text table's hidden column holds a
+    /// handle into these, which `bm25()` / `highlight()` /
+    /// `snippet()` read. `Statement::step` drops the ones it added.
+    #[cfg(feature = "fts5")]
+    pub fts_rows: crate::fts5::aux::AuxRows,
     /// The database's text encoding (v0.16, `utf16`): what the
     /// BINARY collation, hex(), CAST(... AS BLOB) and blob-to-text
     /// conversions see (`crate::utf16`).
@@ -4940,6 +5095,8 @@ impl Env {
             raise_msg: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "json")]
             json_docs: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "fts5")]
+            fts_rows: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "utf16")]
             enc: core::cell::Cell::new(crate::record::TextEnc::Utf8),
             #[cfg(feature = "datetime")]
@@ -4980,6 +5137,15 @@ impl Env {
     #[cfg(feature = "v16")]
     pub fn note_change(&self) {
         self.pending.set(self.pending.get().saturating_add(1));
+    }
+
+    /// `n` rows a module's internal statements changed (v0.16,
+    /// `rtree`): they join `total_changes()` at once, never
+    /// `changes()`, as nested statements' changes do on the pin.
+    #[cfg(feature = "rtree")]
+    pub fn add_total(&self, n: i64) {
+        self.total_changes
+            .set(self.total_changes.get().saturating_add(n));
     }
 
     /// A new statement's claim on the clock cache (v0.16,
@@ -6369,6 +6535,34 @@ fn hex_text(bytes: &[u8]) -> OwnedValue {
     OwnedValue::Text(out)
 }
 
+/// An FTS5 auxiliary function over the row its first argument's
+/// handle names (v0.16, `fts5`).
+#[cfg(feature = "fts5")]
+fn fts5_aux<E>(
+    f: crate::fts5::aux::AuxFn,
+    v: &[OwnedValue],
+    ctx: &Ctx<'_>,
+) -> Result<OwnedValue, E> {
+    use crate::fts5::aux::AuxErr;
+    let err = |kind| Error::Schema { kind };
+    let ctxerr = || err(SchemaKind::Fts5Context);
+    let Some(OwnedValue::Integer(h)) = v.first() else {
+        return Err(ctxerr());
+    };
+    let env = ctx.env.ok_or_else(ctxerr)?;
+    let rows = env.fts_rows.try_borrow().map_err(|_| ctxerr())?;
+    let row = usize::try_from(*h)
+        .ok()
+        .and_then(|i| rows.as_slice().get(i))
+        .ok_or_else(ctxerr)?;
+    crate::fts5::aux::call(f, row, v.get(1..).unwrap_or(&[])).map_err(|e| match e {
+        AuxErr::Args => err(SchemaKind::Fts5Arguments),
+        AuxErr::Context => ctxerr(),
+        AuxErr::Range => err(SchemaKind::Fts5Context),
+        AuxErr::Corrupt => err(SchemaKind::VtabCorrupt),
+    })
+}
+
 /// `eval_scalar` over the evaluated argument values (one copy:
 /// inlined into `eval_scalar` unless `utf16` calls it twice).
 #[cfg_attr(not(feature = "utf16"), inline(always))]
@@ -6385,6 +6579,16 @@ fn scalar_values<E>(
     #[cfg(feature = "datetime")]
     if let ScalarFn::Date(d) = f {
         return crate::datetime::eval::<E>(d, v, ctx.time());
+    }
+    #[cfg(feature = "fts5")]
+    match f {
+        ScalarFn::Match => {
+            return Err(Error::Schema {
+                kind: SchemaKind::Fts5Context,
+            });
+        }
+        ScalarFn::Fts5(a) => return fts5_aux::<E>(a, v, ctx),
+        _ => {}
     }
     let Some(v0) = v.first() else {
         // The argument-free calls.
@@ -6428,6 +6632,31 @@ fn scalar_values<E>(
         ScalarFn::OctetLength => crate::func::octet_length(v0),
         #[cfg(feature = "v16")]
         ScalarFn::Unhex => crate::func::unhex(v0, v1),
+        // The pin's `(u8)sqlite3_value_int(ndim)`, and the blob's
+        // bytes (text reads as its bytes).
+        #[cfg(feature = "rtree")]
+        ScalarFn::RtreeNode => {
+            let nd = i64::from(crate::func::int64_value(v0) as i32);
+            let b: &[u8] = match v1 {
+                Some(OwnedValue::Blob(b) | OwnedValue::Text(b)) => b.as_slice(),
+                _ => &[],
+            };
+            match crate::rtree::rtreenode(nd, b) {
+                Some(t) => OwnedValue::Text(t),
+                None => OwnedValue::Null,
+            }
+        }
+        #[cfg(feature = "rtree")]
+        ScalarFn::RtreeDepth => match v0 {
+            OwnedValue::Blob(b) if b.len() >= 2 => {
+                OwnedValue::Integer(i64::from(crate::rtree::depth_of(b.as_slice())))
+            }
+            _ => {
+                return Err(Error::Schema {
+                    kind: SchemaKind::RtreeDepthArgument,
+                });
+            }
+        },
         ScalarFn::Nullif => {
             let b = v1.unwrap_or(&OwnedValue::Null);
             if !matches!(v0, OwnedValue::Null)

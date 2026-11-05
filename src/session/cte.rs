@@ -128,6 +128,10 @@ struct Expander<'c> {
     /// The second walk: every expanded source's materialization
     /// id is settled, nothing is expanded.
     fixing: bool,
+    /// The select numbers given to the cores of view copies so far
+    /// (v0.16, `explain`; `SelectStmt::sel`, `eqp::VIEW_SEL`).
+    #[cfg(feature = "explain")]
+    view_sel: u32,
     /// The SELECT about to be walked is a scalar or EXISTS
     /// subquery, which the pin gives a LIMIT of its own before
     /// flattening.
@@ -167,6 +171,8 @@ impl<S: Storage> Connection<S> {
             copies: 0,
             ctx: 0,
             fixing: false,
+            #[cfg(feature = "explain")]
+            view_sel: 0,
             sub_limit: false,
             returning: false,
             #[cfg(feature = "triggers")]
@@ -531,6 +537,13 @@ impl Expander<'_> {
             self.share_views(s, o);
         } else {
             Self::widths::<E>(s)?;
+            // A view copy's cores are numbered afresh, in the order
+            // the pin copies them (v0.16, `explain`).
+            #[cfg(feature = "explain")]
+            if !self.views.is_empty() {
+                self.view_sel = self.view_sel.saturating_add(1);
+                s.sel = super::eqp::VIEW_SEL.saturating_add(self.view_sel);
+            }
         }
         self.items::<E>(s.items.as_mut_slice())?;
         self.sources::<E>(s.from.as_mut_slice(), o)?;
@@ -1625,6 +1638,8 @@ impl<S: Storage> Connection<S> {
         desc.colls = shape.colls;
         descs.push(desc);
         plans.push(SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: 0,
             kind: s.kind,
             on: None,
@@ -1635,10 +1650,12 @@ impl<S: Storage> Connection<S> {
             derived: None,
             gcols: None,
             rec: id,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf_dead: AVec::new(),
+            #[cfg(feature = "vtab")]
+            vt: None,
             #[cfg(feature = "expr_index")]
             access: None,
             #[cfg(feature = "expr_index")]

@@ -1832,3 +1832,94 @@ fn v16_crash_autovacuum_cut_pages_not_journaled() {
     crash_matrix("av-cut-full-move", Config::default(), &full2, &del);
     pin_recovers_autovacuum("cut-full-move", &full2, &del);
 }
+
+/// R*Tree writes (v0.16, `rtree`): inserts that split nodes, deletes
+/// that remove and reinsert them, updates — every crash point
+/// recovers to the pre- or post-image of the shadow tables.
+#[cfg(feature = "rtree")]
+#[test]
+fn v16_crash_rtree_writes() {
+    let setup = strs(&[
+        "PRAGMA page_size = 1024",
+        "CREATE VIRTUAL TABLE t USING rtree(id, x0, x1, y0, y1, +tag)",
+        "INSERT INTO t SELECT value, value, value + 2, -value, 1 - value, 'r' || value FROM generate_series(1, 60)",
+    ]);
+    let txn = strs(&[
+        "BEGIN",
+        "INSERT INTO t SELECT value + 100, value % 17, value % 17 + 5, value, value + 1, NULL FROM generate_series(1, 90)",
+        "DELETE FROM t WHERE id % 3 = 0",
+        "UPDATE t SET x1 = x1 + 1 WHERE id < 30",
+        "COMMIT",
+    ]);
+    crash_matrix("rtree", Config::default(), &setup, &txn);
+    // One autocommit statement; inside a transaction, a statement
+    // failing half-way (its statement journal undoes the nodes it
+    // split) and a savepoint rolled back.
+    let txn = strs(&["DELETE FROM t WHERE id % 2 = 1"]);
+    crash_matrix("rtree-autocommit", Config::default(), &setup, &txn);
+    let txn = strs(&[
+        "BEGIN",
+        "INSERT INTO t SELECT value + 300, value, value, value, value, 'x' FROM generate_series(1, 40)",
+        "INSERT INTO t SELECT value + 400, value, value, value, value, 'y' FROM generate_series(1, 40) UNION ALL SELECT 999, 9, 2, 3, 4, 'bad'",
+        "SAVEPOINT s",
+        "DELETE FROM t WHERE id < 50",
+        "ROLLBACK TO s",
+        "COMMIT",
+    ]);
+    crash_matrix("rtree-stmt", Config::default(), &setup, &txn);
+}
+
+/// FTS5 writes (v0.16, `fts5`): documents flushed into new segments
+/// at the commit, a 'merge' / 'optimize' rewriting the segments, an
+/// external-content table updated by triggers, statement and
+/// savepoint rollback over the pending terms — every crash point
+/// recovers to the pre- or post-image of the shadow tables.
+#[cfg(feature = "fts5")]
+#[test]
+fn v16_crash_fts5_writes() {
+    let setup = strs(&[
+        "PRAGMA page_size = 1024",
+        "CREATE VIRTUAL TABLE t USING fts5(a, b, prefix='2')",
+        "INSERT INTO t(t, rank) VALUES('pgsz', 64)",
+        "INSERT INTO t SELECT 'alpha beta ' || value, 'gamma w' || (value % 7) FROM generate_series(1, 40)",
+        "INSERT INTO t SELECT 'delta ' || value, 'epsilon' FROM generate_series(41, 60)",
+    ]);
+    let txn = strs(&[
+        "BEGIN",
+        "INSERT INTO t SELECT 'zeta eta ' || value, 'theta ' || (value * 3) FROM generate_series(1, 50)",
+        "DELETE FROM t WHERE rowid % 3 = 0",
+        "UPDATE t SET b = 'iota kappa' WHERE rowid < 20",
+        "COMMIT",
+    ]);
+    crash_matrix("fts5", Config::default(), &setup, &txn);
+    let txn = strs(&["INSERT INTO t(t) VALUES('optimize')"]);
+    crash_matrix("fts5-optimize", Config::default(), &setup, &txn);
+    let txn = strs(&["INSERT INTO t(t, rank) VALUES('merge', -50)"]);
+    crash_matrix("fts5-merge", Config::default(), &setup, &txn);
+    let txn = strs(&[
+        "BEGIN",
+        "INSERT INTO t VALUES('lambda mu', 'nu')",
+        "SAVEPOINT s",
+        "INSERT INTO t SELECT 'xi ' || value, 'pi' FROM generate_series(1, 30)",
+        "ROLLBACK TO s",
+        "INSERT INTO t(rowid, a) VALUES(5, 'dup')",
+        "INSERT INTO t VALUES('rho', 'sigma')",
+        "COMMIT",
+    ]);
+    crash_matrix("fts5-stmt", Config::default(), &setup, &txn);
+    let setup = strs(&[
+        "PRAGMA page_size = 1024",
+        "CREATE TABLE ext(id INTEGER PRIMARY KEY, a)",
+        "CREATE VIRTUAL TABLE t USING fts5(a, content=ext, content_rowid=id)",
+        "CREATE TRIGGER ai AFTER INSERT ON ext BEGIN INSERT INTO t(rowid, a) VALUES(new.id, new.a); END",
+        "CREATE TRIGGER ad AFTER DELETE ON ext BEGIN INSERT INTO t(t, rowid, a) VALUES('delete', old.id, old.a); END",
+        "INSERT INTO ext(a) SELECT 'word' || (value % 13) || ' other' || value FROM generate_series(1, 80)",
+    ]);
+    let txn = strs(&[
+        "BEGIN",
+        "DELETE FROM ext WHERE id % 4 = 1",
+        "INSERT INTO ext(a) SELECT 'fresh' || value FROM generate_series(1, 30)",
+        "COMMIT",
+    ]);
+    crash_matrix("fts5-external", Config::default(), &setup, &txn);
+}

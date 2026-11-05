@@ -375,6 +375,51 @@ fn visit<'x>(e: &'x RExpr, f: &mut dyn FnMut(&'x RExpr)) {
     each_child(e, &mut |c| visit(c, f));
 }
 
+/// The sort keys of window class `class` (`None`: the last class)
+/// among `items` (v0.16): its PARTITION BY terms, ascending, then its
+/// ORDER BY terms — what the pin's window subquery for that class
+/// orders by. `None` when no call has that class.
+pub fn class_keys(items: &[RExpr], class: Option<usize>) -> Option<AVec<(RExpr, SortOrder)>> {
+    let mut best: Option<&RExpr> = None;
+    for e in items.iter() {
+        visit(e, &mut |w| {
+            if let (RExpr::Win(c, _), b) = (w, &mut best)
+                && !c.copy
+            {
+                let better = match (class, b.as_ref()) {
+                    (Some(k), _) => c.class == k && b.is_none(),
+                    (None, None) => true,
+                    (None, Some(RExpr::Win(d, _))) => c.class > d.class,
+                    _ => false,
+                };
+                if better {
+                    *b = Some(w);
+                }
+            }
+        });
+    }
+    let RExpr::Win(c, kids) = best? else {
+        return None;
+    };
+    let mut out = AVec::new();
+    for (i, k) in kids.iter().enumerate().skip(c.part_at()) {
+        let o = match i.checked_sub(c.order_at()) {
+            None => SortOrder {
+                desc: false,
+                nulls_first: true,
+                coll: crate::query::expr_coll(k).unwrap_or_default(),
+            },
+            Some(j) => c.order.as_slice().get(j).copied().unwrap_or(SortOrder {
+                desc: false,
+                nulls_first: true,
+                coll: crate::query::expr_coll(k).unwrap_or_default(),
+            }),
+        };
+        out.push((k.clone(), o));
+    }
+    Some(out)
+}
+
 /// Whether `e` holds a window call outside its subqueries.
 pub fn has_win(e: &RExpr) -> bool {
     let mut any = false;

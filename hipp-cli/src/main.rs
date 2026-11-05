@@ -184,17 +184,45 @@ async fn print_schema<S: hipp::Storage>(
         };
         let _ = out.write_all(&shown);
         let _ = out.write_all(b";\n");
-        if ty.as_slice() != b"view" {
+        // A virtual table (v0.16) gets the view comment too: its
+        // declared columns, as the oracle shell lists them.
+        let vtab = ty.as_slice() == b"table"
+            && sql.len() >= 20
+            && sql[..20].eq_ignore_ascii_case(b"CREATE VIRTUAL TABLE");
+        if ty.as_slice() != b"view" && !vtab {
             continue;
         }
-        let cols = if let Some(i) = attached {
-            db.attached_db(i).and_then(|(_, a)| a.view_columns(name))
+        let cols = if vtab {
+            if attached.is_some() || temp {
+                continue;
+            }
+            let q = format!(
+                "PRAGMA table_info(\"{}\")",
+                String::from_utf8_lossy(name).replace('"', "\"\"")
+            );
+            let mut cols = Vec::new();
+            if let Ok(mut st) = db.prepare(&q).await {
+                while let Ok(Step::Row) = st.step().await {
+                    cols.push(st.column_bytes(1).unwrap_or_default().to_vec());
+                }
+            }
+            if cols.is_empty() {
+                continue;
+            }
+            Some(cols)
+        } else if let Some(i) = attached {
+            db.attached_db(i)
+                .and_then(|(_, a)| a.view_columns(name))
+                .map(|v| v.iter().map(|c| c.as_slice().to_vec()).collect())
         } else if temp {
-            db.temp_db().and_then(|t| t.view_columns(name))
+            db.temp_db()
+                .and_then(|t| t.view_columns(name))
+                .map(|v| v.iter().map(|c| c.as_slice().to_vec()).collect())
         } else {
             db.view_columns(name)
+                .map(|v| v.iter().map(|c| c.as_slice().to_vec()).collect())
         };
-        let Some(cols) = cols else {
+        let Some(cols): Option<Vec<Vec<u8>>> = cols else {
             continue;
         };
         let _ = out.write_all(b"/* ");
@@ -401,6 +429,22 @@ fn fmt_real(f: f64) -> String {
     String::from_utf8_lossy(t.as_slice()).into_owned()
 }
 
+/// `.dump`'s literal: `fmt_literal`, but a blob as the pin shell's
+/// `x'hex'` (v0.16 review fix: hipp wrote `X'HEX'`).
+fn dump_literal(v: Value<'_>) -> Vec<u8> {
+    match v {
+        Value::Blob(b) => {
+            let mut out = b"x'".to_vec();
+            for &c in b {
+                out.extend_from_slice(format!("{c:02x}").as_bytes());
+            }
+            out.push(b'\'');
+            out
+        }
+        v => fmt_literal(v),
+    }
+}
+
 /// SQL literal rendering for `.dump`: text quoted with `''`
 /// doubling, blobs as `X'HEX'`, reals round-trip exact.
 fn fmt_literal(v: Value<'_>) -> Vec<u8> {
@@ -474,6 +518,41 @@ fn value_bytes(v: Value<'_>) -> Vec<u8> {
     }
 }
 
+/// The oracle shell's EXPLAIN QUERY PLAN rendering (`eqp_render`):
+/// `QUERY PLAN`, then each row under its parent, `|--` before a row
+/// with a later sibling and `` `-- `` before the last, children
+/// indented by `|  ` or three blanks; nothing for a plan with no
+/// rows. Like the shell's 100-byte prefix buffer, it stops descending
+/// past 31 levels.
+fn eqp_render(out: &mut impl Write, rows: &[(i64, i64, Vec<u8>)]) {
+    fn level(
+        out: &mut impl Write,
+        rows: &[(i64, i64, Vec<u8>)],
+        parent: i64,
+        prefix: &mut Vec<u8>,
+    ) {
+        let kids: Vec<&(i64, i64, Vec<u8>)> = rows.iter().filter(|r| r.1 == parent).collect();
+        for (i, r) in kids.iter().enumerate() {
+            let more = i + 1 < kids.len();
+            let _ = out.write_all(prefix);
+            let _ = out.write_all(if more { b"|--" } else { b"`--" });
+            let _ = out.write_all(&r.2);
+            let _ = out.write_all(b"\n");
+            if prefix.len() < 100 - 7 && r.0 != parent {
+                let n = prefix.len();
+                prefix.extend_from_slice(if more { b"|  " } else { b"   " });
+                level(out, rows, r.0, prefix);
+                prefix.truncate(n);
+            }
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+    let _ = out.write_all(b"QUERY PLAN\n");
+    level(out, rows, 0, &mut Vec::new());
+}
+
 /// Run one SQL statement, printing any result rows. `Err` carries
 /// the user-facing message (hipp's remedy-named Debug form).
 async fn run_statement<S: hipp::Storage>(
@@ -496,6 +575,19 @@ where
             st.bind_value(i, v.as_value())
                 .map_err(|e| format!("{e:?}"))?;
         }
+    }
+    // EXPLAIN QUERY PLAN (v0.16): the oracle shell's tree.
+    if st.is_explain() == 2 {
+        let mut rows: Vec<(i64, i64, Vec<u8>)> = Vec::new();
+        while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
+            rows.push((
+                st.column_i64(0).unwrap_or(0),
+                st.column_i64(1).unwrap_or(0),
+                st.column_bytes(3).unwrap_or(&[]).to_vec(),
+            ));
+        }
+        eqp_render(out, &rows);
+        return Ok(());
     }
     // Step to completion, printing every row (a statement whose
     // planning waited for its bindings knows its columns only
@@ -820,7 +912,41 @@ where
             Ok(Flow::Continue)
         }
         ".dump" => {
-            let _ = out.write_all(b"BEGIN TRANSACTION;\n");
+            // `.dump PATTERN...` (v0.16 review fix: the argument was
+            // ignored): the pin shell's filter — a LIKE on the name,
+            // a virtual table bringing its `name_*` shadow tables.
+            let pats: Vec<String> = shell_args(arg)
+                .into_iter()
+                .filter(|a| !a.starts_with('-'))
+                .collect();
+            let filter = if pats.is_empty() {
+                "1".to_string()
+            } else {
+                pats.iter()
+                    .map(|p| {
+                        let q = format!("'{}'", p.replace('\'', "''"));
+                        format!(
+                            "name LIKE {q} ESCAPE '\\' OR EXISTS (SELECT 1 FROM sqlite_schema \
+                             WHERE name LIKE {q} ESCAPE '\\' AND sql LIKE 'CREATE VIRTUAL TABLE%' \
+                             AND substr(o.name, 1, length(name)+1) == (name||'_'))"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            };
+            let mut keep: Vec<Vec<u8>> = Vec::new();
+            if let Ok(mut st) = db
+                .prepare(&format!(
+                    "SELECT name FROM main.sqlite_schema AS o WHERE ({filter}) AND type = 'table' AND sql NOT NULL"
+                ))
+                .await
+            {
+                while let Ok(Step::Row) = st.step().await {
+                    if let Some(n) = st.column_bytes(0) {
+                        keep.push(n.to_vec());
+                    }
+                }
+            }
             // Snapshot the catalog first (names as bytes) so the
             // per-table SELECTs can borrow the connection freely.
             // A table with generated columns dumps only the
@@ -852,12 +978,83 @@ where
             // the table itself is re-created by the AUTOINCREMENT
             // table's CREATE (its own CREATE is a reserved name).
             let is_seq = |n: &[u8]| n == b"sqlite_sequence";
+            // A virtual table (v0.16) replays as its schema row, under
+            // `PRAGMA writable_schema=ON`, in schema order among the
+            // tables; its shadow tables then take `IF NOT EXISTS`.
+            let mut vtabs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut order: Vec<Vec<u8>> = Vec::new();
+            if let Ok(mut st) = db
+                .prepare("SELECT name, sql FROM main.sqlite_schema WHERE type = 'table' AND sql NOT NULL")
+                .await
+            {
+                while let Ok(Step::Row) = st.step().await {
+                    if let (Some(n), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
+                        if !keep.iter().any(|k| k == n) {
+                            continue;
+                        }
+                        if q.len() >= 20 && q[..20].eq_ignore_ascii_case(b"CREATE VIRTUAL TABLE") {
+                            vtabs.push((n.to_vec(), q.to_vec()));
+                        }
+                        order.push(n.to_vec());
+                    }
+                }
+            }
+            // The pin shell's header for a script that writes
+            // `sqlite_schema`, with the `foreign_keys` line it must
+            // precede: replaying it, the shell turns defensive mode
+            // off (v0.16 review fix: without it the pin refused the
+            // replay).
+            if !vtabs.is_empty() {
+                let _ = out.write_all(
+                    b"/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */\n\
+                      PRAGMA foreign_keys=OFF;\n",
+                );
+            }
+            let _ = out.write_all(b"BEGIN TRANSACTION;\n");
+            let mut writable = false;
             let ordered = tables
                 .iter()
+                .filter(|t| keep.contains(&t.0))
                 .filter(|t| !is_seq(&t.0))
-                .chain(tables.iter().filter(|t| is_seq(&t.0)));
+                .chain(
+                    tables
+                        .iter()
+                        .filter(|t| keep.contains(&t.0))
+                        .filter(|t| is_seq(&t.0)),
+                );
+            let mut ordered: Vec<&(Vec<u8>, Vec<u8>, String)> = ordered.collect();
+            if !vtabs.is_empty() {
+                ordered.sort_by_key(|t| order.iter().position(|n| *n == t.0).unwrap_or(usize::MAX));
+            }
+            let mut vt_done = 0usize;
             for (name, sql, list) in ordered {
-                if is_seq(name) {
+                // The virtual tables created before this table.
+                let at = order.iter().position(|n| n == name).unwrap_or(usize::MAX);
+                while let Some((vn, vq)) = vtabs.get(vt_done) {
+                    if order.iter().position(|n| n == vn).unwrap_or(usize::MAX) > at {
+                        break;
+                    }
+                    if !writable {
+                        let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
+                        writable = true;
+                    }
+                    let lit = |b: &[u8]| String::from_utf8_lossy(b).replace('\'', "''");
+                    let _ = out.write_all(
+                        format!(
+                            "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
+                            lit(vn),
+                            lit(vn),
+                            lit(vq)
+                        )
+                        .as_bytes(),
+                    );
+                    vt_done += 1;
+                }
+                if sql.starts_with(b"CREATE TABLE \"") || sql.starts_with(b"CREATE TABLE '") {
+                    let _ = out.write_all(b"CREATE TABLE IF NOT EXISTS ");
+                    let _ = out.write_all(&sql[13..]);
+                    let _ = out.write_all(b";\n");
+                } else if is_seq(name) {
                     let _ = out.write_all(b"DELETE FROM sqlite_sequence;\n");
                 } else {
                     let _ = out.write_all(sql);
@@ -874,7 +1071,7 @@ where
                         if i > 0 {
                             line.extend_from_slice(b",");
                         }
-                        line.extend_from_slice(&fmt_literal(
+                        line.extend_from_slice(&dump_literal(
                             st.column_value(i).unwrap_or(Value::Null),
                         ));
                     }
@@ -890,7 +1087,9 @@ where
             // ends with its `;` on a line of its own, as there.
             let mut objs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             if let Ok(mut st) = db
-                .prepare("SELECT type, sql FROM main.sqlite_schema WHERE sql NOT NULL")
+                .prepare(&format!(
+                    "SELECT type, sql FROM main.sqlite_schema AS o WHERE ({filter}) AND sql NOT NULL"
+                ))
                 .await
             {
                 while let Ok(Step::Row) = st.step().await {
@@ -898,6 +1097,22 @@ where
                         objs.push((t.to_vec(), q.to_vec()));
                     }
                 }
+            }
+            for (vn, vq) in vtabs.iter().skip(vt_done) {
+                if !writable {
+                    let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
+                    writable = true;
+                }
+                let lit = |b: &[u8]| String::from_utf8_lossy(b).replace('\'', "''");
+                let _ = out.write_all(
+                    format!(
+                        "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
+                        lit(vn),
+                        lit(vn),
+                        lit(vq)
+                    )
+                    .as_bytes(),
+                );
             }
             for ty in [&b"view"[..], b"trigger", b"index"] {
                 for (t, sql) in objs.iter() {
@@ -908,6 +1123,10 @@ where
                     let comment = sql.windows(2).any(|w| w == b"--");
                     let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
                 }
+            }
+            // Last, as the pin shell writes it.
+            if writable {
+                let _ = out.write_all(b"PRAGMA writable_schema=OFF;\n");
             }
             let _ = out.write_all(b"COMMIT;\n");
             Ok(Flow::Continue)

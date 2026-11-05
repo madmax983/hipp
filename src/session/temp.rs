@@ -536,6 +536,14 @@ impl<S: Storage> Connection<S> {
             Err(_) => return Ok(Route::Main),
         };
         let t = toks.as_slice();
+        // A TEMP object may not take a name a main virtual table's
+        // module reserves (v0.16 review fix, `vtab`).
+        #[cfg(feature = "vtab")]
+        if let (true, Ast::CreateTable { name, .. } | Ast::CreateView { name, .. }) =
+            (temp_kw, &ast)
+        {
+            self.shadow_name_free(handle_bytes(arena, *name))?;
+        }
         // Triggers (v0.16, `triggers`): one on a TEMP table (TEMP or
         // not, as on the pin) lives in the temp database; a TEMP
         // trigger on a main table is refused (hipp runs a statement
@@ -1501,6 +1509,8 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         }
         plans.push(super::SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: t.root,
             kind: s.kind,
             on: None,
@@ -1511,10 +1521,12 @@ impl<S: Storage> Connection<S> {
             derived: None,
             gcols,
             rec: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf_dead: AVec::new(),
+            #[cfg(feature = "vtab")]
+            vt: None,
             #[cfg(feature = "expr_index")]
             access: None,
             #[cfg(feature = "expr_index")]

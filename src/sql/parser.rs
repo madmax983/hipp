@@ -81,6 +81,10 @@ pub fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 struct Parser<'a> {
     toks: AVec<Token>,
     pos: usize,
+    /// The select numbers handed out so far (v0.16, `explain`;
+    /// `SelectStmt::sel`).
+    #[cfg(feature = "explain")]
+    nsel: core::cell::Cell<u32>,
     limit: usize,
     arena: &'a Arena,
     sql: &'a [u8],
@@ -721,11 +725,34 @@ const IDX_HELD: usize = 10;
 const INS_RETURNING: usize = 10;
 
 impl<'a> Parser<'a> {
+    /// The next select number (v0.16, `explain`; `SelectStmt::sel`).
+    #[cfg(feature = "explain")]
+    fn next_sel(&self) -> u32 {
+        let n = self.nsel.get().saturating_add(1);
+        self.nsel.set(n);
+        n
+    }
+
+    /// The select number of a finished core (v0.16, `explain`): a
+    /// SELECT core takes the next one; a VALUES core's rows were
+    /// numbered as they were read (`values_rows`), the last of them
+    /// being the core's (v0.16 review fix: it counted once more).
+    #[cfg(feature = "explain")]
+    fn core_sel(&self, core: &SelectStmt) -> u32 {
+        if core.values.is_empty() {
+            self.next_sel()
+        } else {
+            self.nsel.get()
+        }
+    }
+
     fn new(toks: AVec<Token>, arena: &'a Arena, sql: &'a [u8], lim: Limits) -> Parser<'a> {
         Parser {
             limit: toks.len(),
             toks,
             pos: 0,
+            #[cfg(feature = "explain")]
+            nsel: core::cell::Cell::new(0),
             arena,
             sql,
             lim,
@@ -1012,9 +1039,13 @@ impl<'a> Parser<'a> {
     #[cfg(feature = "v16")]
     fn with_statement<E>(&mut self) -> Result<Ast, E> {
         let save = self.pos;
+        #[cfg(feature = "explain")]
+        let save_sel = self.nsel.get();
         let with = self.with_clause::<E>(self.held)?;
         if self.cur_is_kw(b"SELECT") || self.cur_is_kw(b"VALUES") {
             self.pos = save;
+            #[cfg(feature = "explain")]
+            self.nsel.set(save_sel);
             return Ok(Ast::Select(self.select_rich::<E>()?));
         }
         let body = if self.cur_is_kw(b"INSERT") {
@@ -1068,6 +1099,15 @@ impl<'a> Parser<'a> {
         if self.cur_is_kw(b"CREATE") {
             if self.is_kw(self.pos + 1, b"TABLE") {
                 self.create_table::<E>()
+            } else if cfg!(feature = "vtab") && self.is_kw(self.pos + 1, b"VIRTUAL") {
+                #[cfg(feature = "vtab")]
+                {
+                    self.create_virtual::<E>()
+                }
+                #[cfg(not(feature = "vtab"))]
+                {
+                    Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
+                }
             } else if self.is_kw(self.pos + 1, b"INDEX") {
                 self.create_index_dispatch::<E>(false)
             } else if self.is_kw(self.pos + 1, b"UNIQUE") {
@@ -1652,6 +1692,71 @@ impl<'a> Parser<'a> {
 
     // ---------------- CREATE TABLE ----------------
 
+    /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module
+    /// [(arg, ...)]` (v0.16, `vtab`): each argument is the span of
+    /// its tokens (the pin's `vtabarg`: any tokens, commas only
+    /// inside parentheses; an empty one is dropped), and the stored
+    /// text runs from the name token to the closing parenthesis (or
+    /// the module name), as the pin's `sqlite3VtabFinishParse` keeps
+    /// it.
+    #[cfg(feature = "vtab")]
+    fn create_virtual<E>(&mut self) -> Result<Ast, E> {
+        self.expect_kw::<E>(b"CREATE")?;
+        self.expect_kw::<E>(b"VIRTUAL")?;
+        self.expect_kw::<E>(b"TABLE")?;
+        let if_not_exists = if self.eat_kw(b"IF") {
+            self.expect_kw::<E>(b"NOT")?;
+            self.expect_kw::<E>(b"EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name::<E>()?;
+        let start = self
+            .toks
+            .as_slice()
+            .get(self.pos.wrapping_sub(1))
+            .map_or(0, |t| t.offset);
+        self.expect_kw::<E>(b"USING")?;
+        let mod_off = self.cur().offset;
+        let module = self.name::<E>()?;
+        let mut end = token_end(self.sql, mod_off);
+        let mut args = AVec::new();
+        if matches!(self.cur().tok, Tok::LParen) {
+            self.pos += 1;
+            let items = self.split_items::<E>()?;
+            for (from, to) in items.iter() {
+                if from >= to {
+                    continue;
+                }
+                let first = self.toks.as_slice().get(*from).map_or(0, |t| t.offset);
+                let last = self.toks.as_slice().get(*to - 1).map_or(0, |t| t.offset);
+                let t = self
+                    .sql
+                    .get(first..token_end(self.sql, last))
+                    .unwrap_or(&[]);
+                args.push(self.arena.alloc_copy_handle(t)?);
+            }
+            let close = self
+                .toks
+                .as_slice()
+                .get(self.pos.wrapping_sub(1))
+                .map_or(0, |t| t.offset);
+            end = close + 1;
+        }
+        self.expect_end::<E>()?;
+        let text = self
+            .arena
+            .alloc_copy_handle(self.sql.get(start..end).unwrap_or(&[]))?;
+        Ok(Ast::CreateVirtual {
+            name,
+            if_not_exists,
+            module,
+            args,
+            text,
+        })
+    }
+
     fn create_table<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"CREATE")?;
         self.expect_kw::<E>(b"TABLE")?;
@@ -1662,6 +1767,18 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
+        // A string-literal name (v0.16, `vtab`): the pin's `nm` takes
+        // one, and fts3 / fts4 / fts5 write their shadow tables' text
+        // that way (`CREATE TABLE 't_data'(...)`).
+        #[cfg(feature = "vtab")]
+        let name = match self.cur().tok {
+            Tok::Text(h) => {
+                self.pos += 1;
+                h
+            }
+            _ => self.name::<E>()?,
+        };
+        #[cfg(not(feature = "vtab"))]
         let name = self.name::<E>()?;
         // CREATE TABLE ... AS SELECT (v0.16, `v16`): the columns
         // come from the SELECT at plan time.
@@ -2289,6 +2406,13 @@ impl<'a> Parser<'a> {
         let mut rows = AVec::new();
         #[cfg(feature = "v04")]
         let mut core_h = 1usize;
+        // The pin's select numbers (v0.16, `explain`): each row is a
+        // select of its own, after its subqueries; rows with none
+        // become one VALUES co-routine, two selects in all.
+        #[cfg(feature = "explain")]
+        let sel0 = self.nsel.get();
+        #[cfg(feature = "explain")]
+        let mut subs = false;
         loop {
             self.expect::<E>(Tok::LParen)?;
             // `VALUES LP` / `values COMMA LP`, then `nexprlist
@@ -2311,10 +2435,20 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "v04")]
             self.peak::<E>(base + lp + 2)?;
             rows.push(row);
+            #[cfg(feature = "explain")]
+            {
+                let k = self.nsel.get();
+                subs |= k != sel0.saturating_add(rows.len() as u32 - 1);
+                self.next_sel();
+            }
             if self.eat(Tok::Comma) {
                 continue;
             }
             break;
+        }
+        #[cfg(feature = "explain")]
+        if !subs && rows.len() > 1 {
+            self.nsel.set(sel0.saturating_add(2));
         }
         #[cfg(feature = "v04")]
         {
@@ -3063,6 +3197,7 @@ impl<'a> Parser<'a> {
                         || self.is_kw(n, b"BETWEEN")
                         || (cfg!(feature = "v16")
                             && (self.is_kw(n, b"GLOB") || self.is_kw(n, b"NULL")))
+                        || (cfg!(feature = "fts5") && self.is_kw(n, b"MATCH"))
                     {
                         BP_EQ
                     } else {
@@ -3079,6 +3214,7 @@ impl<'a> Parser<'a> {
                 .iter()
                 .any(|k| eq_ci(b, k))
                     || (cfg!(feature = "v16") && eq_ci(b, b"GLOB"))
+                    || (cfg!(feature = "fts5") && eq_ci(b, b"MATCH"))
                 {
                     BP_EQ
                 } else if cfg!(feature = "v16") && eq_ci(b, b"COLLATE") {
@@ -3288,6 +3424,15 @@ impl<'a> Parser<'a> {
             self.negated::<E>(neg)?;
             return self.pattern_call::<E>(b"glob", r, l, None, neg);
         }
+        // `x [NOT] MATCH q` (v0.16, `fts5`): the pin's `match(q, x)`
+        // call, which only a full-text table's constraint consumes.
+        #[cfg(feature = "fts5")]
+        if self.eat_kw(b"MATCH") {
+            let r = self.operand::<E>(2, BP_REL)?;
+            self.node::<E>(lh, lk)?;
+            self.negated::<E>(neg)?;
+            return self.pattern_call::<E>(b"match", r, l, None, neg);
+        }
         if self.eat_kw(b"BETWEEN") {
             // The lower bound runs to the BETWEEN's own AND; the
             // upper bound takes only operators tighter than `=`
@@ -3369,6 +3514,8 @@ impl<'a> Parser<'a> {
                 // more symbol: a scalar-subquery list item the pin
                 // turns into this form).
                 let rsub0 = self.rsub;
+                #[cfg(feature = "explain")]
+                let sel0 = self.nsel.get();
                 let stmt = self.subquery::<E>(3 + extra_parens)?;
                 for _ in 0..extra_parens {
                     self.expect::<E>(Tok::RParen)?;
@@ -3387,6 +3534,8 @@ impl<'a> Parser<'a> {
                 }
                 self.pos = save;
                 self.rsub = rsub0;
+                #[cfg(feature = "explain")]
+                self.nsel.set(sel0);
             }
             #[cfg(not(feature = "v06"))]
             {
@@ -3751,7 +3900,12 @@ impl<'a> Parser<'a> {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
         }
         // `EXISTS LP select RP`.
-        let stmt = self.subquery::<E>(2 + extra_parens)?;
+        #[allow(unused_mut)]
+        let mut stmt = self.subquery::<E>(2 + extra_parens)?;
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        {
+            stmt.first_row = true;
+        }
         for _ in 0..=extra_parens {
             self.expect::<E>(Tok::RParen)?;
         }
@@ -3787,7 +3941,12 @@ impl<'a> Parser<'a> {
     fn paren_subquery<E>(&mut self) -> Result<Expr, E> {
         #[cfg(feature = "v06")]
         {
-            let stmt = self.subquery::<E>(1)?;
+            #[allow(unused_mut)]
+            let mut stmt = self.subquery::<E>(1)?;
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            {
+                stmt.first_row = true;
+            }
             self.expect::<E>(Tok::RParen)?;
             self.need::<E>(3)?;
             self.set_h::<E>(self.sel_h + 1, 0)?;
@@ -4379,6 +4538,12 @@ impl<'a> Parser<'a> {
                     break;
                 };
                 last = base + 2;
+                // The core before the operator is complete.
+                #[cfg(feature = "explain")]
+                match compound.as_mut_slice().last_mut() {
+                    Some((_, c)) => c.sel = self.core_sel(c),
+                    None => head.sel = self.core_sel(&head),
+                }
                 let core = self.select_core::<E>(last)?;
                 if op == CompoundOp::UnionAll {
                     pending = pending.max(self.core_h);
@@ -4406,6 +4571,13 @@ impl<'a> Parser<'a> {
             head.compound = compound;
         }
         self.select_tail::<E>(&mut head, last)?;
+        // The last core is complete with the ORDER BY / LIMIT, which
+        // the pin's grammar gives it (v0.16, `explain`).
+        #[cfg(feature = "explain")]
+        match head.compound.as_mut_slice().last_mut() {
+            Some((_, c)) => c.sel = self.core_sel(c),
+            None => head.sel = self.core_sel(&head),
+        }
         #[cfg(feature = "v09")]
         if !head.compound.is_empty() && !head.order_by.is_empty() {
             self.sorted_members::<E>(pending)?;
@@ -4478,6 +4650,10 @@ impl<'a> Parser<'a> {
             rdepth: 0,
             #[cfg(feature = "window")]
             windows: AVec::new(),
+            #[cfg(feature = "explain")]
+            sel: 0,
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            first_row: false,
         })
     }
 
@@ -4602,6 +4778,10 @@ impl<'a> Parser<'a> {
             rdepth: 0,
             #[cfg(feature = "window")]
             windows,
+            #[cfg(feature = "explain")]
+            sel: 0,
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            first_row: false,
         })
     }
 
@@ -4814,6 +4994,10 @@ impl<'a> Parser<'a> {
             rdepth: 0,
             #[cfg(feature = "window")]
             windows: AVec::new(),
+            #[cfg(feature = "explain")]
+            sel: self.next_sel(),
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            first_row: false,
         }
     }
 
@@ -5821,7 +6005,17 @@ UPDATE USING VALUES WHEN WHERE",
             }
             return Ok(true);
         }
-        // Column definition: first token is the name.
+        // Column definition: first token is the name — a string
+        // literal too (v0.16 review fix, `vtab`: the pin's `nm`; an
+        // fts3 / fts4 `%_content` table declares `'c0x'`, and a file
+        // holding one would not VACUUM or read).
+        #[cfg(feature = "vtab")]
+        let col_name = match (self.ident_at(from), tok(from)) {
+            (Some((h, _, _)), _) if self.nm_at(from, to) => h,
+            (_, Some(Tok::Text(h))) => h,
+            _ => return bad(from),
+        };
+        #[cfg(not(feature = "vtab"))]
         let col_name = match self.ident_at(from) {
             Some((h, _, _)) if self.nm_at(from, to) => h,
             _ => return bad(from),
@@ -6800,7 +6994,7 @@ impl<'a> Parser<'a> {
 /// One past the last byte of the token starting at `off` of `sql`
 /// (v0.16, `triggers`): an identifier / number / keyword run, a
 /// quoted string or name, or a one- / two-byte operator.
-#[cfg(feature = "triggers")]
+#[cfg(any(feature = "triggers", feature = "vtab"))]
 pub fn token_end(sql: &[u8], off: usize) -> usize {
     let n = sql.len();
     let Some(&c) = sql.get(off) else {
@@ -6893,7 +7087,7 @@ pub fn parse_trigger_step_tokens<E>(
 /// `SELECT *[, extra ...] FROM table [AS alias] [WHERE filter]` as an
 /// AST (v0.16, `triggers`): the rows an UPDATE / DELETE of a view
 /// hands its INSTEAD OF triggers.
-#[cfg(feature = "triggers")]
+#[cfg(any(feature = "triggers", feature = "rtree", feature = "fts5"))]
 pub fn star_select(
     table: ABytes,
     alias: Option<ABytes>,

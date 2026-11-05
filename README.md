@@ -8,10 +8,11 @@ SQLite database files**. It gives SQLite the treatment Horton got:
 — microcontrollers included — with hard size and RAM gates, not
 aspirations.
 
-- **Phase:** v0.16 — the SQLite-parity push (ADR 0001:
-  silent wrong answers fixed ungated, new dialect behind the
-  `v16` rung / leaf features, the tiny profile never grows),
-  on the v0.15 foundation (SPEC §2).
+- **Phase:** 0.16.0 released — v0.16, the SQLite-parity push (ADR
+  0001: silent wrong answers fixed ungated, new dialect behind the
+  `v16` rung / leaf features, the tiny profile never grows; ADR
+  0002 / 0003: the `max` profile), on the v0.15 foundation (SPEC §2).
+  `CHANGELOG.md` summarises the release.
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
@@ -19,6 +20,36 @@ aspirations.
   with the `wal` leaf, its write-ahead logs).
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
+
+## Profiles and features (0.16.0)
+
+Three size-gated `no_std` profiles (thumbv7em, `opt-level = "z"`,
+LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
+
+| profile | build | size | budget |
+|---|---|---|---|
+| `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 500,952 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,035,516 B | 1 MiB |
+
+- **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
+  `WHERE col = literal`, transactions, rollback journal and recovery.
+- **`full`** adds the ladder rungs and two leaves:
+  `indexes` (index B-trees, UNIQUE), `v04` (joins, aggregates,
+  expressions, ALTER ADD COLUMN), `v05` (UPDATE / DELETE / DROP),
+  `v06` (subqueries), `v07` (OR conflict clauses, UPDATE FROM,
+  RETURNING, upsert), `v08` (INSERT ... SELECT), `v09` (compounds,
+  derived tables), `v10` (subqueries in aggregates), `v16` (the
+  parity rung: query shape, collations, operators, the function
+  library, aggregate completion, PRAGMA, views and CTEs, savepoints
+  and maintenance, ALTER / AUTOINCREMENT / TEMP, depth limits),
+  `params` (bound parameters), `math` (math functions).
+- **`max`** adds the heavyweight leaves: `window` (window functions),
+  `triggers`, `foreign_keys`, `json` (JSON / JSONB), `expr_index`
+  (expression and partial indexes, index-aware planning),
+  `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
+  `autovacuum`, `vtab` (virtual tables, generate_series, dbstat),
+  `rtree`, `fts5`, `explain` (EXPLAIN QUERY PLAN).
 
 ## What v0.16 does
 
@@ -830,6 +861,104 @@ aspirations.
   after the journal is deleted. Ungated: freelist trunks hold the
   pin's `usable/4 - 8` leaves. Without the leaf such files stay
   read only (`AutoVacuumUnsupported`).
+- **Virtual tables, `generate_series`, `dbstat` and the R*Tree**
+  (leaves `vtab` and `rtree`, in `max`). One internal module
+  abstraction modelled on the pin's `sqlite3_module` (Rust traits,
+  no C ABI: xBestIndex with constraint usage / omit / idxNum /
+  idxStr / cost, filter cursors, xUpdate, hidden columns, eponymous
+  modules, shadow-table names). `CREATE VIRTUAL TABLE [IF NOT
+  EXISTS] t USING m(args)` and its DROP store and remove exactly the
+  pin's `sqlite_schema` rows, and refuse names the shadow tables
+  need or a module reserves; a file with a virtual table of a
+  module hipp lacks opens, its shadow tables read as ordinary
+  tables (fts3 / fts4's `'quoted'` declarations included), VACUUM
+  and integrity_check run, and only statements reading or writing
+  that table are refused ("no such module"). `generate_series(start, stop,
+  step)` as the pin's shell ships it (hidden `start` / `stop` /
+  `step`, its constraint handling on `value`, its 64-bit
+  arithmetic and its "first argument" error) — hipp holds a
+  cursor's rows in memory, so more than `Config::max_vtab_rows`
+  (about 4 million) fail cleanly (`VtabTooManyRows`) where the pin
+  streams; `dbstat` byte for byte on the same file (pages, overflow
+  chains, `aggregate`, `schema`, `name`; `main`, `temp` and attached
+  databases). `rtree` / `rtree_i32` of 1-5 dimensions with
+  `+aux` columns: the shadow tables `%_node` / `%_parent` /
+  `%_rowid` are written byte-compatibly with the pin (node size,
+  ChooseLeaf, the R*-tree split, delete with node removal and
+  reinsertion, node numbering, float32 rounding outward), so
+  either engine continues the other's files and each one's
+  `rtreecheck()` passes on the other's (hipp's PRAGMA
+  integrity_check checks the shadow tables as tables, not the
+  tree: use `rtreecheck()`); `changes()` / `total_changes()` count
+  as the pin's (its internal shadow-row statements included); queries
+  with `=`, `<`, `<=`, `>`, `>=`, BETWEEN and rowid lookups through
+  xBestIndex; the pin's constraint errors under every conflict
+  clause; `rtreecheck()`, `rtreenode()`, `rtreedepth()`; ALTER
+  TABLE RENAME. Shadow tables are read only, as under the pin
+  shell's defensive mode, except under `PRAGMA writable_schema`,
+  which replays a `.dump` (hipp-cli's is the pin shell's, byte for
+  byte, `.dump PATTERN` included, and either engine reloads either
+  engine's).
+- **FTS5 full-text search** (leaf `fts5`, in `max`; on the `vtab`
+  framework). `CREATE VIRTUAL TABLE t USING fts5(...)` with columns,
+  `UNINDEXED`, `prefix=`, `content=` / `content_rowid=` (external
+  content kept by triggers), `content=''` (contentless),
+  `columnsize=0`, `detail=full|column|none` and the tokenizers
+  `unicode61` (`remove_diacritics 0/1/2`, `tokenchars`,
+  `separators`, `categories`; the Unicode tables generated in-crate),
+  `ascii`, `porter <inner>` and `trigram` (`case_sensitive`,
+  `remove_diacritics`). The index is written byte for byte as the
+  pin writes it — `%_data` (structure record, averages, leaf pages,
+  doclist indexes), `%_idx`, `%_content`, `%_docsize`, `%_config` —
+  with the pin's pending-term flush points (commit, savepoints,
+  statement savepoints, rowid order, `hashsize`) and its segment
+  merging (automerge, crisismerge, usermerge, `merge`, `optimize`),
+  so either engine continues the other's files and the pin's
+  `INSERT INTO t(t) VALUES('integrity-check')` passes on hipp's. A
+  pin-made `contentless_delete=1` table's tombstones hide its deleted
+  rows from hipp's queries and are applied by hipp's merges (the
+  pin's `deletemerge` too); the deletes hipp cannot write as the pin
+  does — tombstones, and deletes under a pin-set `secure-delete=1` —
+  are refused rather than written another way.
+  Queries: the full query syntax (phrases, `prefix*`, `^`,
+  `NEAR(..., N)`, `col:` / `{a b}:` / `-col:` filters, AND / OR /
+  NOT with the pin's precedence and implicit AND, parentheses,
+  quoting), `MATCH`, `t = 'q'` and `t('q')`, LIKE / GLOB patterns on
+  trigram tables, rowid ranges, `ORDER BY rank` with `rank MATCH
+  'bm25(...)'` and the `rank` setting, MATCH under an OR (the pin's
+  multi-index OR) and in a LEFT JOIN's ON, `bm25()` with weights,
+  `highlight()`, `snippet()`, and `fts5vocab` tables (`row`, `col`,
+  `instance`). The special INSERT commands `delete`, `delete-all`,
+  `rebuild`, `optimize`, `merge`, `automerge`, `crisismerge`,
+  `usermerge`, `pgsz`, `hashsize`, `rank`, `secure-delete` (stored;
+  deletes refused while it is on) and `integrity-check`; INSERT ...
+  RETURNING and UPDATE ... FROM; ALTER TABLE RENAME. Transactions,
+  savepoints and crashes recover the shadow tables like any other
+  table's pages.
+
+- **EXPLAIN QUERY PLAN** (leaf `explain`, in `max`).
+  `EXPLAIN QUERY PLAN <statement>` returns the pin's four columns
+  (`id`, `parent`, `notused`, `detail`) describing the plan hipp
+  executes, in the pin's words — SCAN / SEARCH loops with INTEGER
+  PRIMARY KEY, PRIMARY KEY, [COVERING] INDEX and the probed keys,
+  LEFT-JOIN / RIGHT-JOIN, the USE TEMP B-TREE sorters, (CORRELATED)
+  SCALAR / LIST SUBQUERY with the pin's select numbers, CO-ROUTINE /
+  MATERIALIZE, recursive CTEs, MERGE / COMPOUND QUERY trees, window
+  co-routines, VIRTUAL TABLE INDEX, VALUES and constant rows, and the
+  UPDATE / DELETE / INSERT plans — and the CLI prints the shell's
+  tree. The statement is planned, never run; plain EXPLAIN (bytecode)
+  is refused. Where hipp's strategy differs (no flattening, join
+  reordering, automatic indexes, MULTI-INDEX OR, min/max lookup) it
+  prints what it runs (STATUS.md). Comparing plans fixed access-path
+  choices that ordered rows unlike the pin (window functions,
+  compound members, GROUP BY / DISTINCT over a permuted index, rowid
+  IN lists, `IS NULL` on NOT NULL keys); the review of the unit found
+  that two of these introduced wrong answers of their own (a window
+  query's outer ORDER BY on an unselected column was ignored, and a
+  UNION's LIMIT 1 shortcut returned another first row), both fixed
+  before release, along with the `f(ORDER BY)` sorters, upsert
+  subqueries, write-loop COVERING and TEMP / attached qualifiers in
+  the plans.
 
 ## What v0.13 does
 
@@ -1114,9 +1243,9 @@ aspirations.
 
 ## Measured gates (SPEC §4.1, tiny profile)
 
-| Gate | Budget | Measured (v0.13) |
+| Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **72,704 B** (Δ **−28 B** vs v0.12's 72,732 B; the hoisting machinery is compiled out of the tiny profile with the rest of the subquery paths, and the delta is dead-code noise) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,952 B of 512 KiB, `max` 1,035,516 B of 1 MiB; ADR 0003) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -1139,25 +1268,24 @@ differential testing. It is a separate crate and contributes
 
 ## Non-goals (SPEC §3)
 
-No WAL without the `wal` leaf (files in WAL mode, or with a
-non-empty `-wal` beside them, are then rejected with
-`WalUnsupported`; with it, single-process WAL only — no shared
-`-shm` wal-index, one connection per WAL database), no WITHOUT ROWID tables (refused; the `without_rowid` leaf adds
-them), no AUTOINCREMENT tables
-created (refused below `v16`, foreign ones load read-only there;
-`v16` maintains `sqlite_sequence`), no expression or partial
-indexes (`expr_index` adds them), no subqueries, no `UPDATE`/`DELETE`/`DROP TABLE`, views are
-stored but never executed (all of these in the tiny profile: the
-`v04` ... `v16` rungs add them — views execute with `v16`), no
-UTF-16 databases without the `utf16` leaf (refused at open), no
-writes to auto-vacuum files without the `autovacuum` leaf (read
-only: writes are refused with `AutoVacuumUnsupported` until `PRAGMA
-auto_vacuum = NONE; VACUUM` converts the file; with it they are
-written, pointer maps kept), no
-ATTACH without the `attach` leaf (refused; with it, one file is
-attached once — hipp has no shared page cache), no multi-process
-locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
-Rust library, not a drop-in replacement.
+Each leaf left out of a build refuses what it would add, never
+misreads it: without `wal` a WAL file (or a non-empty `-wal`) is
+refused (`WalUnsupported`); without `without_rowid`, `utf16` or `vtab`
+a file holding such tables or text is refused at open; without
+`autovacuum` an auto-vacuum file is read but not written; without
+`attach`, ATTACH is refused; without `explain`, EXPLAIN is. Below the
+rungs (the tiny profile) there are no indexes, joins, subqueries,
+UPDATE / DELETE or views.
+
+Not planned in any profile: multi-process locking or a shared `-shm`
+wal-index (WAL is single-process; one connection per database); a
+shared page cache (a file is attached once); plain EXPLAIN's
+bytecode listing (hipp has no VDBE); query flattening, join
+reordering, automatic indexes, Bloom filters or MULTI-INDEX OR in
+the planner (EXPLAIN QUERY PLAN shows hipp's own plan); loadable
+extensions and application-defined SQL functions; and **no `sqlite3_*`
+C ABI, ever** (D3): hipp is a Rust library, not a drop-in
+replacement.
 
 ## Layout
 

@@ -581,6 +581,8 @@ impl<S: Storage> Connection<S> {
             Ast::AlterRename { to, .. } => {
                 let new = handle_bytes(arena, *to);
                 reserved_name::<S::Error>(new)?;
+                #[cfg(feature = "vtab")]
+                self.shadow_name_free(new)?;
                 if self.catalog.taken(ca, new).is_some() {
                     return Err(err(SchemaKind::DuplicateTable));
                 }
@@ -1423,7 +1425,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.drop_rewrite(troot, layout.as_slice(), *col).await?;
         }
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }

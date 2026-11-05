@@ -826,6 +826,21 @@ pub struct SelectStmt {
     /// shadows an earlier one, as on the pin.
     #[cfg(feature = "window")]
     pub windows: AVec<(ABytes, WindowDef)>,
+    /// The pin's select number (`Select.selId`; v0.16, `explain`):
+    /// cores are numbered as the pin's parser reduces them (every
+    /// subquery a core holds before the core itself, a compound's
+    /// cores left to right, WITH bodies first); the copy of a view
+    /// read by a statement is renumbered after the statement's own
+    /// selects. EXPLAIN QUERY PLAN prints it (`SCALAR SUBQUERY n`,
+    /// `(subquery-n)`).
+    #[cfg(feature = "explain")]
+    pub sel: u32,
+    /// The select is a scalar or EXISTS subquery, which reads its
+    /// first row only (v0.16, `expr_index`): a UNION compound there
+    /// takes the pin's first-row shortcut, so its members are not
+    /// planned for a merge key (`session::merge_member`).
+    #[cfg(all(feature = "expr_index", feature = "v09"))]
+    pub first_row: bool,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
@@ -1044,6 +1059,18 @@ pub enum Ast {
         /// The target's `INDEXED BY` / `NOT INDEXED` (v0.16, `v16`).
         #[cfg(feature = "v16")]
         indexed: Option<IndexHint>,
+    },
+    /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module
+    /// [(args)]` (v0.16, `vtab`): `args` are the module arguments
+    /// as written, `text` what the pin stores after `CREATE VIRTUAL
+    /// TABLE ` (the statement from the name token on).
+    #[cfg(feature = "vtab")]
+    CreateVirtual {
+        name: ABytes,
+        if_not_exists: bool,
+        module: ABytes,
+        args: AVec<ABytes>,
+        text: ABytes,
     },
     /// `DROP TABLE [IF EXISTS] <name>` (v0.5).
     DropTable {

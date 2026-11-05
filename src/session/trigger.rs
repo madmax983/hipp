@@ -151,7 +151,7 @@ pub(super) struct InsteadPlan {
     pub(super) event: TrigEvent,
     /// INSERT: the new rows' supplied values; UPDATE: the view's
     /// rows followed by the SET values; DELETE: the view's rows.
-    source: Box<crate::query::SubPlan>,
+    pub(super) source: Box<crate::query::SubPlan>,
     /// The view's width.
     ncols: usize,
     /// The view column each supplied value (INSERT) or SET value
@@ -454,6 +454,8 @@ impl<S: Storage> Connection<S> {
             return Err(err(SchemaKind::DuplicateTrigger));
         }
         reserved_name::<S::Error>(name)?;
+        #[cfg(feature = "vtab")]
+        self.shadow_name_free(name)?;
         if is_view && t.time != TrigTime::Instead {
             return Err(err(SchemaKind::TriggerOnView));
         }
@@ -1747,7 +1749,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 let committed = if self.conn.explicit_txn {
                     Ok(())
                 } else {
-                    self.conn.pager.drive_commit().await
+                    auto_commit!(self.conn)
                 };
                 if committed.is_ok() {
                     self.conn.env.finish(true);
@@ -1903,7 +1905,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.fk_end_commit().await?;
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         self.conn.env.finish(true);
         Ok(())
@@ -1975,7 +1977,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         .await?;
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -2023,7 +2025,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         btree::btree_delete(&mut self.conn.pager, 1, rowid).await?;
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }

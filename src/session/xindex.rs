@@ -871,6 +871,11 @@ pub(super) struct CoreInfo<'x> {
     pub has_agg: bool,
     pub distinct: bool,
     pub limit: Option<&'x RExpr>,
+    /// The core's own ORDER BY when `order_by` holds another key
+    /// the loop should deliver (a window core's last window class):
+    /// its columns are still read (v0.16 review fix: an index was
+    /// taken as covering without them).
+    pub also_reads: &'x [(RExpr, crate::sql::SortOrder)],
 }
 
 /// Whether any expression of the core reads column slot `slot`.
@@ -885,6 +890,7 @@ fn core_reads(info: &CoreInfo<'_>, sources: &[SourcePlan], slot: usize) -> bool 
         || info.group_by.iter().any(f)
         || info.having.is_some_and(f)
         || info.order_by.iter().any(|(e, _)| f(e))
+        || info.also_reads.iter().any(|(e, _)| f(e))
         || sources.iter().any(|s| {
             s.on.as_ref().is_some_and(f)
                 // A table-valued source's arguments (v0.16 review
@@ -1083,13 +1089,15 @@ impl<S: Storage> Connection<S> {
             _ => return Ok(()),
         };
         let mut plans: AVec<(usize, crate::xplan::IdxAccess)> = AVec::new();
+        #[cfg(feature = "explain")]
+        let mut naturals: AVec<(usize, (usize, bool))> = AVec::new();
         for i in 0..n {
             let Some(sp) = sources.get(i) else { break };
             // (A TEMP table's root is the temp database's page.)
             if sp.derived.is_some() || sp.root <= 1 || sp.rec != 0 || sp.temp {
                 continue;
             }
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             if sp.tvf != 0 {
                 continue;
             }
@@ -1148,7 +1156,12 @@ impl<S: Storage> Connection<S> {
                     }
                 } else if !info.has_agg && !info.order_by.is_empty() {
                     order.extend_from_slice(info.order_by);
-                } else if !info.has_agg && info.distinct {
+                } else if !info.has_agg
+                    && info.distinct
+                    // A DISTINCT over the rowid is redundant (the pin's
+                    // `isDistinctRedundant`): no order to deliver.
+                    && !info.items.iter().any(|e| s.is_rowid(e))
+                {
                     group = true;
                     for e in info.items.iter() {
                         order.push((
@@ -1170,6 +1183,21 @@ impl<S: Storage> Connection<S> {
                 Some(RExpr::Literal(OwnedValue::Integer(k))) if *k > 0 => Some(log_est(*k as u64)),
                 _ => None,
             };
+            #[cfg(feature = "explain")]
+            let mut dset: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+            #[cfg(feature = "explain")]
+            if n == 1 && info.distinct && !info.has_agg && !info.order_by.is_empty() {
+                for e in info.items.iter() {
+                    dset.push((
+                        e.clone(),
+                        crate::sql::SortOrder {
+                            desc: false,
+                            nulls_first: true,
+                            coll: crate::query::expr_coll(e).unwrap_or_default(),
+                        },
+                    ));
+                }
+            }
             let q = Query {
                 conj: conj.as_slice(),
                 order: order.as_slice(),
@@ -1180,15 +1208,32 @@ impl<S: Storage> Connection<S> {
                 cover_scan: true,
                 limit,
                 distinct: info.distinct,
+                #[cfg(feature = "explain")]
+                dset: dset.as_slice(),
             };
             let (width, models) = self.table_models(arena, t, &s);
+            let notnull = self.not_null_cols(t);
             let tab = Table {
                 width,
                 indexes: models.as_slice(),
                 wr: !t.has_rowid(),
                 hint: sp.hint,
+                notnull: notnull.as_slice(),
             };
-            if let Some(mut a) = choose(&q, &s, &tab, ts.as_slice()) {
+            let chosen = choose(&q, &s, &tab, ts.as_slice());
+            #[cfg(feature = "explain")]
+            if chosen.is_none() {
+                naturals.push((i, crate::xplan::natural_sat(&q, &s, &tab, ts.as_slice())));
+            }
+            if let Some(mut a) = chosen {
+                // EXPLAIN QUERY PLAN's COVERING (v0.16, `explain`).
+                #[cfg(feature = "explain")]
+                {
+                    a.eqp.1 = models
+                        .iter()
+                        .find(|m| m.root == a.root)
+                        .is_some_and(|m| !m.covers_all && m.covers(needed.as_slice()));
+                }
                 // A covering index of a rowid table: the rows come
                 // from its entries (v0.16 review fix).
                 if t.has_rowid()
@@ -1213,7 +1258,36 @@ impl<S: Storage> Connection<S> {
                 sp.access = Some(Box::new(a.clone()));
             }
         }
+        #[cfg(feature = "explain")]
+        for (i, (n, d)) in naturals.iter() {
+            if let Some(sp) = sources.get_mut(*i) {
+                sp.eqp.natural = *n;
+                sp.eqp.nat_distinct = *d;
+            }
+        }
         Ok(())
+    }
+
+    /// Per column of `t`: never NULL (`xplan::Table::notnull`).
+    fn not_null_cols(&self, t: &crate::schema::TableDef) -> AVec<bool> {
+        #[cfg(feature = "without_rowid")]
+        let ca = &self.catalog_arena;
+        #[cfg(feature = "without_rowid")]
+        let pk = self
+            .catalog
+            .indexes_for(ca, handle_bytes(ca, t.name))
+            .find(|i| i.clustered);
+        #[cfg(not(feature = "without_rowid"))]
+        let pk: Option<&crate::schema::IndexDef> = None;
+        let mut out = AVec::new();
+        for (i, c) in t.columns.iter().enumerate() {
+            out.push(
+                c.not_null
+                    || t.rowid_alias == Some(i)
+                    || pk.is_some_and(|p| p.columns.iter().any(|k| k.col == Some(i))),
+            );
+        }
+        out
     }
 
     /// Whether an `INDEXED BY` index can serve table `t` read as
@@ -1241,6 +1315,40 @@ impl<S: Storage> Connection<S> {
                 }),
                 _ => Ok(()),
             },
+        }
+    }
+}
+
+impl<S: Storage> Connection<S> {
+    /// Whether a DELETE (`update` None) or UPDATE of `t` checks
+    /// foreign keys, as the pin's `sqlite3FkRequired` decides
+    /// (v0.16, `explain`): `PRAGMA foreign_keys` is on and a key
+    /// refers to or from the table — for an UPDATE, one whose
+    /// columns the SET changes.
+    #[cfg(feature = "explain")]
+    pub(super) fn fk_required(
+        &self,
+        arena: &Arena,
+        t: &crate::schema::TableDef,
+        update: Option<&UpdateInfo<'_>>,
+    ) -> bool {
+        #[cfg(feature = "foreign_keys")]
+        {
+            let name = handle_bytes(&self.catalog_arena, t.name);
+            let assigned = update.map(|u| assigned_columns(u.sets, t.columns.len(), t.rowid_alias));
+            let ev = match &assigned {
+                Some((a, r)) => super::fkey::Event::Update(a.as_slice(), *r),
+                None => super::fkey::Event::Delete,
+            };
+            self.fk_target(name, ev, true, true, arena)
+                .ok()
+                .flatten()
+                .is_some()
+        }
+        #[cfg(not(feature = "foreign_keys"))]
+        {
+            let _ = (arena, t, update);
+            false
         }
     }
 }
@@ -1321,7 +1429,10 @@ impl<S: Storage> Connection<S> {
         if ts.is_empty() && !wr && !forced {
             return Ok(None);
         }
-        let one_pass = update.as_ref().is_some_and(|u| {
+        // The pin's one-pass UPDATE (`WHERE_ONEPASS_MULTIROW`), with
+        // hipp's foreign-key condition (`PRAGMA foreign_keys` on) or
+        // the pin's (`sqlite3FkRequired`: a key the UPDATE changes).
+        let one_pass_with = |u: &UpdateInfo<'_>, fk: bool| {
             #[cfg(feature = "triggers")]
             let trig = self
                 .catalog
@@ -1349,11 +1460,14 @@ impl<S: Storage> Connection<S> {
             !u.returning
                 && !u.from
                 && !trig
-                && !self.prag.foreign_keys
+                && !fk
                 && !replace
                 && !rowid
                 && !crate::query::has_sub(f)
-        });
+        };
+        let one_pass = update
+            .as_ref()
+            .is_some_and(|u| one_pass_with(u, self.prag.foreign_keys));
         let mut needed: AVec<bool> = AVec::new();
         for c in 0..t.columns.len() {
             let r = RefRange {
@@ -1379,13 +1493,17 @@ impl<S: Storage> Connection<S> {
             cover_scan: false,
             limit: None,
             distinct: false,
+            #[cfg(feature = "explain")]
+            dset: &[],
         };
         let (width, models) = self.table_models(arena, t, &s);
+        let notnull = self.not_null_cols(t);
         let tab = Table {
             width,
             indexes: models.as_slice(),
             wr: !t.has_rowid(),
             hint,
+            notnull: notnull.as_slice(),
         };
         let Some(mut acc) = choose(&q, &s, &tab, ts.as_slice()) else {
             return Ok(None);
@@ -1418,6 +1536,34 @@ impl<S: Storage> Connection<S> {
                 })
         });
         acc.one_pass = one_pass && !modified;
+        // EXPLAIN QUERY PLAN's COVERING (v0.16, `explain`): the pin's
+        // loop reads only the WHERE's columns (its colUsed) when it
+        // collects the rowids first — not for a WITHOUT ROWID table,
+        // a one-row lookup (`WHERE_ONEROW`: every key of a UNIQUE
+        // index by `=`, one key or all NOT NULL) or a one-pass UPDATE
+        // (v0.16 review fix: COVERING was printed whenever hipp's
+        // own UPDATE took two passes, e.g. when the SET changed the
+        // loop's index). A DELETE's passes are decided in `eqp`.
+        #[cfg(feature = "explain")]
+        {
+            let m = models.iter().find(|m| m.root == acc.root);
+            let onerow = m.is_some_and(|m| {
+                m.unique
+                    && acc.eq.len() == m.keys.len()
+                    && acc.eq.iter().all(|p| !p.is_in && p.sub.is_none())
+                    && ((m.keys.len() == 1 && acc.eq.iter().all(|p| !p.is))
+                        || m.keys.iter().all(|k| {
+                            matches!(k, IdxKey::Col(c) if notnull.as_slice().get(*c).copied().unwrap_or(false))
+                        }))
+            });
+            let one_pass = update
+                .as_ref()
+                .is_some_and(|u| one_pass_with(u, self.fk_required(arena, t, Some(u))));
+            acc.eqp.1 = !wr
+                && !onerow
+                && !one_pass
+                && m.is_some_and(|m| !m.covers_all && m.covers(needed.as_slice()));
+        }
         Ok(Some(Box::new(acc)))
     }
 }

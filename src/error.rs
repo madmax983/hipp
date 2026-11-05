@@ -384,7 +384,10 @@ pub enum SchemaKind {
     ReferencesDefault,
     /// CREATE TABLE / INDEX / VIEW of a name starting with
     /// `sqlite_` (any case; the pin's "object name reserved for
-    /// internal use"). Choose another name.
+    /// internal use"), or (v0.16, `vtab`) of a name a virtual table's
+    /// module claims for its shadow tables (`t_content` beside fts5
+    /// table `t`), also by CREATE TRIGGER / VIRTUAL TABLE and RENAME
+    /// TO. Choose another name.
     ReservedName,
     /// A schema qualifier that names no database (v0.16, `v16`;
     /// the pin's "unknown database"). hipp has `main` only.
@@ -702,6 +705,142 @@ pub enum SchemaKind {
     /// / trigger, or keep it in one database.
     #[cfg(feature = "attach")]
     CrossDatabaseReference,
+    /// `CREATE VIRTUAL TABLE ... USING m` or a statement reading or
+    /// writing a virtual table whose module hipp does not have
+    /// (v0.16, `vtab`; the pin's "no such module: m"). The rest of
+    /// the file works; use an engine with the module for that table.
+    #[cfg(feature = "vtab")]
+    NoSuchModule,
+    /// A shadow table of a virtual table (`t_node`, ...) as the
+    /// target of INSERT / UPDATE / DELETE / ALTER / CREATE TRIGGER
+    /// (v0.16, `vtab`; the pin shell's defensive "table t_node may
+    /// not be modified"), or of CREATE INDEX (which the pin allows,
+    /// but hipp's module writes would not maintain the index).
+    /// Write the virtual table instead.
+    #[cfg(feature = "vtab")]
+    ShadowReadOnly,
+    /// DROP TABLE of a shadow table (v0.16, `vtab`; "table t_node
+    /// may not be dropped"). DROP the virtual table instead.
+    #[cfg(feature = "vtab")]
+    ShadowNoDrop,
+    /// A write to a virtual table whose module has no xUpdate
+    /// (v0.16, `vtab`: `generate_series`, `dbstat`; the pin's "table
+    /// X may not be modified").
+    #[cfg(feature = "vtab")]
+    VtabReadOnly,
+    /// CREATE INDEX or CREATE TRIGGER on a virtual table (v0.16,
+    /// `vtab`; "virtual tables may not be indexed", "cannot create
+    /// triggers on virtual tables").
+    #[cfg(feature = "vtab")]
+    VtabNotIndexable,
+    /// ALTER TABLE ADD / DROP / RENAME COLUMN of a virtual table
+    /// (v0.16, `vtab`; "virtual tables may not be altered"), or
+    /// RENAME TO of one hipp cannot rename (not an R*Tree, or while
+    /// the schema has views or triggers whose text would change).
+    #[cfg(feature = "vtab")]
+    VtabNotAlterable,
+    /// The virtual table's own storage is inconsistent (v0.16,
+    /// `vtab`; the pin's SQLITE_CORRUPT_VTAB, "database disk image
+    /// is malformed"): an R*Tree node missing, of the wrong size, or
+    /// not linked as its `%_parent` / `%_rowid` rows say. Rebuild the
+    /// table; `rtreecheck()` names what is wrong.
+    #[cfg(feature = "vtab")]
+    VtabCorrupt,
+    /// `generate_series()` with no usable START (v0.16, `vtab`; the
+    /// pin's "first argument to "generate_series()" missing or
+    /// unusable"). Pass a start, or constrain `value`.
+    #[cfg(feature = "vtab")]
+    SeriesFirstArgument,
+    /// A virtual-table cursor produced more rows than
+    /// `Config::max_vtab_rows` for one statement (v0.16 review fix,
+    /// `vtab`; the pin streams them). hipp holds a source's rows in
+    /// memory: narrow the range, add a LIMIT, or raise the bound.
+    #[cfg(feature = "vtab")]
+    VtabTooManyRows,
+    /// `rtree(...)` with fewer than one dimension (v0.16, `rtree`;
+    /// "Too few columns for an rtree table").
+    #[cfg(feature = "rtree")]
+    RtreeTooFewColumns,
+    /// More than five dimensions or 100 auxiliary columns (v0.16,
+    /// `rtree`; "Too many columns for an rtree table").
+    #[cfg(feature = "rtree")]
+    RtreeTooManyColumns,
+    /// An odd number of coordinate columns (v0.16, `rtree`; "Wrong
+    /// number of columns for an rtree table").
+    #[cfg(feature = "rtree")]
+    RtreeWrongColumns,
+    /// A coordinate column after an auxiliary one (v0.16, `rtree`;
+    /// "Auxiliary rtree columns must be last").
+    #[cfg(feature = "rtree")]
+    RtreeAuxNotLast,
+    /// A row whose lower bound exceeds its upper in some dimension
+    /// (v0.16, `rtree`; "rtree constraint failed: t.(x0<=x1)"),
+    /// whatever the conflict clause (OR IGNORE skips the row).
+    /// Order each pair low, high.
+    #[cfg(feature = "rtree")]
+    RtreeConstraint,
+    /// `rtreedepth()` of something not a node blob (v0.16, `rtree`;
+    /// "Invalid argument to rtreedepth()").
+    #[cfg(feature = "rtree")]
+    RtreeDepthArgument,
+    /// A malformed `fts5(...)` argument list (v0.16, `fts5`; the
+    /// pin's "parse error in ...", "unrecognized option", "malformed
+    /// ... directive", "reserved fts5 column name", "prefix length out
+    /// of range", "contentless_delete=1 requires a contentless table",
+    /// ...). Fix the CREATE VIRTUAL TABLE arguments.
+    #[cfg(feature = "fts5")]
+    Fts5Definition,
+    /// An unknown tokenizer or bad tokenizer arguments (v0.16,
+    /// `fts5`; "no such tokenizer", "error in tokenizer constructor").
+    /// Use unicode61, ascii, porter or trigram with their options.
+    #[cfg(feature = "fts5")]
+    Fts5Tokenizer,
+    /// A full-text query that does not parse (v0.16, `fts5`; "fts5:
+    /// syntax error near ...", "unterminated string", "expected
+    /// integer"). Quote special characters inside "...".
+    #[cfg(feature = "fts5")]
+    Fts5Syntax,
+    /// A column filter naming no column of the table (v0.16, `fts5`;
+    /// "no such column: x").
+    #[cfg(feature = "fts5")]
+    Fts5NoColumn,
+    /// A query the table's `detail=` cannot answer, or nested past
+    /// 256 levels (v0.16, `fts5`; "fts5: column / phrase / NEAR
+    /// queries are not supported", "fts5 expression tree is too
+    /// large"). Use detail=full, or simplify the query.
+    #[cfg(feature = "fts5")]
+    Fts5Unsupported,
+    /// MATCH, `bm25()`, `highlight()` or `snippet()` where no
+    /// full-text table answers it (v0.16, `fts5`; "unable to use
+    /// function X in the requested context"). Constrain a full-text
+    /// table's column, and pass its hidden table column first.
+    #[cfg(feature = "fts5")]
+    Fts5Context,
+    /// An auxiliary function called with the wrong arguments (v0.16,
+    /// `fts5`; "wrong number of arguments to function highlight()").
+    #[cfg(feature = "fts5")]
+    Fts5Arguments,
+    /// A special INSERT command the table refuses, or a bad setting
+    /// (v0.16, `fts5`; "'delete-all' may only be used with a
+    /// contentless or external content fts5 table", "'rebuild' may not
+    /// be used with a contentless fts5 table", "SQL logic error" for
+    /// an unknown key or value).
+    #[cfg(feature = "fts5")]
+    Fts5Command,
+    /// A write or scan a contentless table cannot do (v0.16, `fts5`;
+    /// "cannot DELETE from contentless fts5 table", "t: table does not
+    /// support scanning"). Use the 'delete' command, or a MATCH.
+    #[cfg(feature = "fts5")]
+    Fts5Contentless,
+    /// A delete (DELETE, UPDATE, OR REPLACE, the 'delete' command) on
+    /// a table whose `%_config` has `secure-delete=1` (v0.16 review
+    /// fix, `fts5`): the pin removes such entries from the leaves in
+    /// place, which hipp does not do, and an ordinary delete marker
+    /// would leave the deleted terms on disk. Turn it off first
+    /// (`INSERT INTO t(t, rank) VALUES('secure-delete', 0)`), or
+    /// delete with SQLite.
+    #[cfg(feature = "fts5")]
+    Fts5SecureDelete,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.
@@ -712,6 +851,11 @@ pub enum ParseKind {
     InvalidLiteral,
     UnsupportedStatement,
     UnsupportedClause,
+    /// Plain `EXPLAIN <statement>` (v0.16, `explain`): the pin lists
+    /// its bytecode program, and hipp has no bytecode. Use `EXPLAIN
+    /// QUERY PLAN <statement>` for the plan.
+    #[cfg(feature = "explain")]
+    ExplainBytecode,
     /// The statement nests deeper than the parser's stack limit
     /// (the pin's "Recursion limit": 2500 grammar symbols, about
     /// 2490 nested parentheses; `Config::max_parser_depth`), or a

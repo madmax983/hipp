@@ -6,6 +6,19 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 
 ## v0.16 — SQLite-parity push
 
+**Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
+(ADR 0003): tiny 76,960 B (budget 128 KiB), full 500,952 B (512
+KiB: every rung + `params`, `math`), max 1,035,516 B (1,022,404 B at
+the release, + 9,664 B of FTS5 review fixes, + 2,704 B of EXPLAIN
+QUERY PLAN review fixes, + 744 B from merging the lazy index-cursor
+decoding of `docs/perf-baselines.md`, which also took full from
+500,200 B; 1 MiB: full +
+`window`, `triggers`, `foreign_keys`, `json`, `expr_index`,
+`without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
+`autovacuum`, `vtab`, `rtree`, `fts5`, `explain`). The last unit,
+EXPLAIN QUERY PLAN, closes the push; the honest gaps of each unit
+below are the next milestone's backlog.
+
 Milestone v0.16 closes as much of the gap with the pin as
 possible under ADR 0001 (silent wrong answers fixed ungated;
 new surface behind the `v16` rung or a leaf feature; the tiny
@@ -7500,6 +7513,926 @@ less `keep_tail`.
   enough); the pin leaves a 0-byte file. This predates this unit
   and is not specific to it, so the attached tests do not compare
   a main file that the pin left empty.
+
+### Virtual tables, generate_series, dbstat and the R*Tree (2026-11-05)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated: leaf `vtab` (implies `v16`) for the framework,
+`generate_series` and `dbstat`; leaf `rtree` (implies `vtab`); both
+in `max` (ADR 0002), not `full`; their own `v16,vtab` and
+`v16,vtab,rtree` lines in `ci/feature-sets.txt`. Without `vtab` a
+file holding a virtual table is refused at open, as before.
+
+**Shipped:**
+
+- **One module abstraction** (`src/vtab.rs`), Rust traits modelled
+  on `sqlite3_module`, no C ABI: `Vtab::connect` (xCreate /
+  xConnect: declared columns, HIDDEN), `best_index` over an
+  `IndexInfo` (aConstraint column / op / usable, aOrderBy; out
+  argvIndex / omit, idxNum, idxStr, orderByConsumed, cost, rows),
+  `VtCursor` (xFilter / xNext / xEof / xColumn / xRowid),
+  `eponymous`, `creatable`, `writable` (xUpdate), `shadow_name`
+  (xShadowName). The planner (`session::vtab`): a virtual-table
+  FROM source plans like a JSON table-valued function (whose lateral
+  machinery it now shares: `SourcePlan::tvf` / `tvf_dead`, the
+  per-row argument evaluation); once WHERE is resolved each
+  `col op expr` term (`=`, `<`, `<=`, `>`, `>=`, `IS`, either way
+  round, a BETWEEN's halves after the other terms), each inner ON
+  term and each table-valued-function argument (an `=` on the next
+  hidden column) becomes a constraint, usable when it reads only
+  enclosing queries and sources to its left; the module's choice
+  picks the filter's arguments and omitted terms leave the WHERE.
+  Transactions, savepoints and statement rollback: every module
+  keeps its state in the file, so the pager's journals are its
+  xBegin / xSync / xCommit / xRollback / savepoint hooks.
+- **CREATE VIRTUAL TABLE [IF NOT EXISTS] t USING m[(args)]**: the
+  pin's row (`table`, root 0, `CREATE VIRTUAL TABLE ` + the text
+  from the name token to the closing parenthesis; empty arguments
+  dropped), the name rules (taken, `sqlite_` reserved). DROP TABLE
+  deletes it, then (xDestroy) an R*Tree's `%_node`, `%_rowid`,
+  `%_parent` (auto-vacuum files too). A file holding a virtual
+  table of a module hipp lacks opens: the table is listed (PRAGMA
+  table_list `virtual`), statements touching it are "no such
+  module", and its shadow tables (any `<t>_*` table: hipp cannot
+  ask the module) are listed read only — not read when hipp's
+  grammar cannot parse their text (fts3/4 quote names as strings).
+  Shadow tables refuse INSERT / UPDATE / DELETE / DROP / ALTER /
+  CREATE TRIGGER (the shell's defensive mode); virtual tables
+  refuse CREATE INDEX / TRIGGER and ALTER except an R*Tree's
+  RENAME TO (its shadow tables renamed, the pin's quoted text).
+  PRAGMA table_info / table_xinfo (hidden columns) / table_list
+  (`virtual`, `shadow`); `.schema` prints the pin's `/* t(cols) */`
+  line and `.dump` the pin's `writable_schema` rows.
+- **generate_series** (the shell's ext/misc/series.c): eponymous
+  only (CREATE ... USING it is "no such module"), hidden `start` /
+  `stop` / `step`, its `seriesBestIndex` (start / stop / step `=`;
+  `value` / rowid `=` / `IS` / `>` / `>=` / `<` / `<=`, the last of
+  each kind used and omitted; the "first argument ... missing or
+  unusable" error, also when the start reads a source the pin's
+  no-prerequisite plan cannot use), `seriesFilter`'s 64-bit
+  arithmetic (wrap-safe spans, REAL bounds rounded inward, NULL
+  argument → no rows, step 0 → 1, `i64::MIN` steps).
+- **dbstat** (`SQLITE_ENABLE_DBSTAT_VTAB`): every column of
+  `statColumn` for the main database (`sqlite_schema` then each tree
+  in schema order, or name order when ORDER BY name), `statNext`'s
+  walk (page, its cells' overflow pages, children, right child;
+  `/000/` and `/000+000000` paths), `unused` / `payload` /
+  `mx_payload` as `statDecodePage` and `getLocalPayload` compute
+  them, `aggregate = 1` rows, `schema` / `name` constraints,
+  `dbstat(schema, aggregate)`, and `CREATE VIRTUAL TABLE ... USING
+  dbstat`.
+- **R*Tree** (`src/rtree.rs`, `session::rtree`): `rtree` /
+  `rtree_i32`, 1-5 dimensions, up to 100 `+aux` columns, the
+  argument errors; the shadow tables with the pin's text, the root
+  node of `min(page_size - 64, 4 + 51 × cell)` bytes. The tree code
+  is the pin's: ChooseLeaf, AdjustTree, the R*-tree
+  `splitNodeStartree` (margin-then-overlap-then-area, the pin's merge
+  sorts), root splits numbering the right node first, delete with
+  under-full nodes removed and their cells reinserted (latest
+  removed first), the root collapsed, nodes numbered after the
+  largest `%_node` key. Writes are a pure function over a `Store`
+  of the shadow rows read so far (a `Miss` reads one more and the
+  write runs again); its result goes through the pager in the
+  statement's transaction. Coordinates round outward to float32
+  (`rtreeValueDown` / `Up`); `rtree_i32` clamps to 32 bits; the id
+  is `sqlite3_value_int64` of the value; no affinity on any value.
+  "rtree constraint failed" and UNIQUE under OR ABORT / FAIL /
+  IGNORE / REPLACE / ROLLBACK as `rtreeUpdate` resolves them; UPDATE
+  in scan order, DELETE in rowid order (the pin's RowSet). Reads:
+  `rtreeBestIndex` (rowid `=` first; else each `=`, `<`, `<=`, `>`,
+  `>=` on a coordinate, `<=` / `>=` omitted, 20 at most),
+  `rtreeFilter`'s value classes (text → TRUE / FALSE, NULL never,
+  ±2^48 integers widen `<` / `>`), the depth-first walk.
+  `rtreecheck([schema,] t)` (every message of `rtreeCheckTable`;
+  "Schema corrupt or not an rtree" for a narrow table),
+  `rtreenode(n, blob)`, `rtreedepth(blob)`.
+
+**Probing notes (live pin):**
+
+- The pin's 3.54.1 R*Tree never forces a reinsertion: every full
+  node splits. (`Reinsert` and `iReinsertHeight` exist in rtree.c,
+  but its node images match only the split-only model: fitted
+  first as "reset to −1 per insert", which disagreed on the first
+  leaf overflow, then "0 per connection, only rising", which
+  disagreed on the first internal overflow; split-only matches
+  every generated corpus.)
+- An UPDATE / DELETE of an R*Tree leaves `last_insert_rowid()` at
+  the last shadow row the module's internal INSERTs wrote; hipp
+  approximates the pin's node-release order (exact for one-node
+  trees).
+- `dbstat('nosuch')` and `dbstat(NULL)` return no rows, no error;
+  an empty (never written) database has no rows; `dbstat` in a view
+  is "unsafe use of virtual table" on the pin (hipp runs it).
+- `rtreecheck('nosuch')` is "SQL logic error"; `rtreenode(257, b)`
+  is NULL (no `u8` truncation of the dimension count).
+- The pin shell allows CREATE INDEX on a shadow table (hipp
+  refuses: its module writes would not maintain the index; a file
+  with one refuses R*Tree writes).
+- The pin's shell is built with assertions: `generate_series(1, 10)
+  ORDER BY value DESC LIMIT 3` aborts it in `seriesNext`; the tests
+  avoid that shape.
+
+**Tests:** `tests/vtab_v16.rs` (CREATE / DROP storage and errors,
+unknown-module file, generate_series corpus of 46 queries + a
+generated corpus of 120 with random bounds / steps / constraints,
+dbstat byte for byte on a pin-written file, PRAGMAs);
+`tests/rtree_v16.rs` (CREATE across page sizes, a writes corpus,
+rtree_i32, float32 boundaries, 30 query shapes, functions and
+errors, transactions / savepoints / every conflict clause, 14
+generated 1-5-dimension workloads (`HIPP_RTREE_CORPUS` for more)
+compared statement by statement with every shadow row byte for
+byte and each engine's rtreecheck / integrity_check run on the
+other's file, files moving between engines mid-workload);
+`tests/crash.rs` `v16_crash_rtree_writes` (every crash point of
+split-heavy transactions, an autocommit DELETE, a failing statement
+and a savepoint); `hipp-cli/tests/cli_v16_vtab.rs` (byte-identical
+stdout: generate_series, R*Tree reals, `.schema`, dbstat).
+Regression tests for the bugs found: the pin's split-only tree
+(generated corpora), DELETE in rowid order, OR FAIL / OR ROLLBACK on
+"rtree constraint failed", `rtreenode`'s dimension check, the
+fresh-database `dbstat`, DROP of an unknown module's table,
+`rtreecheck` of a narrow table, the legacy planner's virtual-table
+names.
+
+**Gates:** `ci/local-gates.sh` (full) passes: fmt, clippy `-D
+warnings` (default, all features, every feature-set line including
+`v16,vtab` and `v16,vtab,rtree`), workspace tests, the no_std targets,
+the three size gates.
+
+**Size:** tiny **76,960 B** (Δ **0**; the catalog loader keeps
+its tiny-profile code path unchanged); full **500,200 B** (Δ **0**:
+both leaves are in `max` only); max **874,832 B** (Δ **+59,040 B**,
+ratchet raised to it — over the 32 KiB justification threshold:
+the module framework, its planner pass and statements ≈ 18 KiB,
+generate_series ≈ 3 KiB, dbstat ≈ 6 KiB, the R*Tree with its
+shadow-table writes, queries and checks ≈ 32 KiB; 173,744 B of the
+1 MiB budget remain).
+
+**Honest gaps:**
+
+- json_each / json_tree and the pragma table-valued functions are
+  not moved onto the module traits: they share the planner's
+  table-valued machinery (`SourcePlan::tvf`, lateral arguments)
+  with virtual tables, and moving them would grow `full`.
+- IN lists are not offered to xBestIndex (they filter in WHERE), and
+  the pin's OR / IN multi-lookup plans are not made: unordered
+  results of `rowid IN (...)` or `a = 1 OR b < 2` over an R*Tree can
+  come in tree order where the pin's come in lookup order. ORDER BY
+  is always sorted by hipp (orderByConsumed is ignored; same rows);
+  LIMIT / OFFSET constraints are not passed to modules.
+- A virtual-table source whose arguments read a source to its
+  *right* is refused (the pin reorders the join); so is one on the
+  right of a RIGHT / FULL join whose table-valued arguments read the
+  left side (its ON clause no longer counts: review fix).
+- `dbstat` inside a view or trigger runs (the pin's "unsafe use of
+  virtual table").
+- PRAGMA integrity_check does not run the R*Tree's xIntegrity (use
+  `rtreecheck()`); `rtreecheck` reads only `main`.
+- `last_insert_rowid()` after an R*Tree UPDATE / DELETE of a
+  multi-level tree can differ (the pin's internal-INSERT order is
+  approximated); a new rowid past 9223372036854775807 is the
+  smallest unused one (the pin's is random).
+- MATCH (geometry callbacks), UPSERT, RETURNING and UPDATE ... FROM
+  on an R*Tree, CREATE INDEX on a shadow table, ALTER TABLE RENAME
+  of an R*Tree while the schema has views or triggers, and virtual
+  tables in TEMP or attached databases are refused.
+- A virtual table of a module hipp lacks has no columns for hipp
+  (PRAGMA table_list's `ncol` is 0 where the pin's module declares
+  them); its `<t>_*` tables are read only (hipp cannot ask the
+  module which are shadows).
+- hipp holds a virtual-table cursor's rows in memory (as its
+  executor does every source's): more than `Config::max_vtab_rows`
+  rows from one cursor fail (`VtabTooManyRows`) where the pin
+  streams them — `count(*) from generate_series(1)` is an error,
+  not 4294967295. (The executor-wide form — a huge join or
+  recursive CTE — is the engine's, not this unit's.)
+- hipp-cli's `.tables` does not list virtual tables.
+
+### Virtual tables and the R*Tree — review fixes (2026-11-05)
+
+**Fixed** (each with a regression test against the live pin):
+
+- **generate_series, descending with `value` bounds** (wrong rows):
+  the filter moved the first value down to the upper bound with the
+  pin's test inverted (`base < iMax`), so a consumed `value =` /
+  `<` / `<=` / BETWEEN returned rows above it
+  (`generate_series(100,1,-10) WHERE value < 55` gave 60). A step of
+  `i64::MIN` steps by 2^63 (MAX, then -1), as the pin; hipp used
+  `i64::MAX`. `tests/vtab_v16.rs` `series_descending_constraints`
+  (a corpus and 200 generated descending cases).
+- **generate_series out of memory** (process abort): a cursor's
+  rows are drained into memory, so `count(*) from
+  generate_series(1)` asked for tens of GB. The drain is now bounded
+  by the new `Config::max_vtab_rows` (default 2^22) and fallible
+  allocation, failing with `SchemaKind::VtabTooManyRows`; a LIMIT
+  the module honours stays under it. Streaming the executor is out
+  of this unit's scope (honest gap above). `series_row_bound`.
+- **Shadow-table name clashes** (corrupt schema): CREATE VIRTUAL
+  TABLE now checks every shadow table xCreate makes (an R*Tree's
+  three; fts5's `_data` / `_idx` / `_config` and `_content` /
+  `_docsize` when kept) — hipp wrote a second `r_node` beside the
+  user's, a schema the pin calls malformed. Names a module claims
+  (`xShadowName`) are refused to CREATE TABLE / VIEW / INDEX /
+  TRIGGER / VIRTUAL TABLE, RENAME TO and TEMP objects
+  (`ReservedName`, the pin's "object name reserved for internal
+  use"). `shadow_names_are_reserved`.
+- **R*Tree node cell counts**: a node claiming more cells than fit is
+  `VtabCorrupt` on every read path (search, rowid lookup), as the
+  pin's nodeAcquire; the search clamped it and returned stale cells
+  (118 rows of a 100-row table). `tests/rtree_v16.rs` `review_fixes`.
+- **Duplicate R*Tree column names** (`rtree(id,a,a)`, `+a` beside
+  `a`, any case): `DuplicateColumn`, after the argument-count errors,
+  as `sqlite3_declare_vtab`; hipp created tables the pin cannot read.
+- **RIGHT JOIN of a virtual table**: the ON terms of a RIGHT / FULL
+  join stay join conditions (they were offered to xBestIndex, which
+  made the source lateral and refused). `right_join_of_virtual_tables`.
+- **Unknown-module files**: the CREATE TABLE grammar takes a string
+  literal as a column name under `vtab` (the pin's `nm`; fts3 / fts4
+  declare `'c0x'`), and a string-literal table name under `vtab` (it
+  was `fts5` only). So their shadow tables read, VACUUM and a full
+  integrity_check run, and PRAGMA table_list counts their columns.
+  (With the `fts5` leaf, fts5 files are no longer "unknown"; in a
+  `v16,vtab` build their WITHOUT ROWID `_idx` / `_config` need the
+  `without_rowid` leaf, as any such table.) `unknown_module_file_opens`.
+- **`total_changes()` after R*Tree writes**: the pin counts the rows
+  its internal statements change — the root's INSERT at CREATE, each
+  `%_node` write (repeats included: `nodeRelease` writes a node every
+  time it is released, which during a delete's reinsertion is once
+  per reinserted cell), `%_rowid` / `%_parent` writes and deletes,
+  `rtreeNewRowid`'s placeholder row, the auxiliary UPDATE. The tree
+  code now counts them (`Writes::count`) and models the delete
+  path's releases (`release_but_root`); they join `total_changes()`
+  only. CREATE leaves `last_insert_rowid()` at 1, as the pin's.
+  Checked over 300 generated workloads and the existing generated
+  corpora (now printing the counters every 7 writes); the shadow
+  rows stay byte-identical.
+- **`.dump`** (hipp-cli): the pin shell's script byte for byte for
+  virtual tables — the `/* WARNING: ... DEFENSIVE ... */` and `PRAGMA
+  foreign_keys=OFF;` header (the pin needs both to replay it),
+  `PRAGMA writable_schema=OFF` after the views / triggers / indexes,
+  `x'..'` blobs, `CREATE TABLE IF NOT EXISTS` for any quoted table
+  name — and `.dump PATTERN...` (the pin's LIKE filter; a virtual
+  table brings its `name_*` tables). hipp replays dumps through the
+  new `PRAGMA writable_schema` (leaf `vtab`): while on, the one
+  `INSERT INTO sqlite_schema(...)` row a dump writes for a virtual
+  table (`'table'`, name twice, 0, `CREATE VIRTUAL TABLE ...`,
+  literals) registers it without xCreate, and shadow tables take the
+  dump's rows; anything else written to `sqlite_schema` is refused.
+  `hipp-cli/tests/cli_v16_vtab.rs` `dump_of_virtual_tables` (R*Tree,
+  fts5 and fts4 tables; each engine's dump replayed in both),
+  `tests/vtab_v16.rs` `writable_schema_replays_a_dump`.
+- **`dbstat(schema)`**: an unknown database at CREATE is
+  `UnknownDatabase` (the pin's "no such database"); `temp` and
+  attached databases are walked (they gave no rows).
+  `dbstat_other_databases`.
+- **README** no longer claims integrity_check runs the R*Tree check
+  or that unknown-module files refuse only that table's statements
+  without saying which.
+
+**Not changed:** the pin's shell runs in defensive mode, where
+`PRAGMA writable_schema = ON` is a silent no-op (it reads back 0)
+unless the script carries the `.dump` WARNING header; hipp has no
+defensive switch, honours the pragma and reads back 1.
+`last_insert_rowid()` after an R*Tree UPDATE /
+DELETE of a multi-level tree (the known gap above; the pin's last
+internal INSERT depends on its node-cache releases, which hipp
+models only for the delete path).
+
+**Probing notes (live pin):** the pin's `.dump` of a virtual table
+replays only with its WARNING comment *followed by* `PRAGMA
+foreign_keys=OFF;` (either alone fails with "table sqlite_master may
+not be modified"); `dbstat('temp')` before any temp object lists
+nothing; `CREATE TABLE x_content` *before* a contentless fts5 `x` is
+allowed (only the shadow tables xCreate makes are checked).
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Size:** tiny **76,960 B** (Δ **0**: the parser's string-literal
+column name is `vtab`-only); full **500,200 B** (Δ **0**); max
+**1,002,788 B** (Δ **+3,096 B** over 999,692, ratchet raised: the
+writable_schema replay ≈ 1.3 KiB, shadow-name checks ≈ 0.7 KiB,
+dbstat of other databases ≈ 0.5 KiB, the change counting and
+bounded drain the rest; 45,788 B of the 1 MiB budget remain).
+
+### FTS5 full-text search (2026-11-05)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated: leaf `fts5` (implies `vtab`, `without_rowid` for
+the WITHOUT ROWID `%_idx` / `%_config`, and `math` for bm25's `log`),
+in `max` (ADR 0002), not `full`; its own `v16,vtab,without_rowid,
+math,fts5` line in `ci/feature-sets.txt`. It is a module on the
+`vtab` framework (no second virtual-table path). Without the leaf a
+file holding an fts5 table opens and the table is "no such module",
+as before.
+
+**Shipped:**
+
+- **CREATE VIRTUAL TABLE t USING fts5(...)** (`src/fts5/config.rs`):
+  columns (`UNINDEXED`; `rank` / `rowid` / duplicates refused),
+  `prefix=`, `tokenize=`, `content=` / `content_rowid=`,
+  `content=''`, `contentless_delete=` (on contentless tables),
+  `columnsize=`, `detail=full|column|none`, the pin's argument
+  errors; the shadow tables `%_data`, `%_idx`, `%_content`,
+  `%_docsize`, `%_config` created in the pin's order with its text
+  (`CREATE TABLE 't_data'(...)`; the parser now accepts a string
+  literal as a CREATE TABLE name with the leaf), the empty structure
+  record (`V2` marker for contentless_delete) and averages, the
+  `version` row. DROP removes them; ALTER TABLE RENAME renames them
+  with the pin's quoted text (syncing the table first, as
+  `sqlite3Fts5StorageRename` does).
+- **Tokenizers** (`src/fts5/tok.rs`): `unicode61` with
+  `remove_diacritics 0/1/2`, `tokenchars`, `separators`,
+  `categories`; `ascii` with `tokenchars` / `separators`; `porter`
+  over any inner tokenizer (the pin's generated stemmer steps);
+  `trigram` with `case_sensitive` and `remove_diacritics`. The
+  Unicode category, case-folding and diacritic tables
+  (`src/fts5/unicode.rs`, ~10 KiB) are generated in-crate from the
+  pin's own tokenizer output over every code point (clean-room: no
+  SQLite source was read or copied), so the categories, folds and
+  diacritic stripping are the pin's, astral planes included.
+- **The index, byte for byte** (`src/fts5/mod.rs`): the pending-term
+  hash with the pin's byte accounting, the flush into a new level-0
+  segment (leaf pages of `pgsz` with the pin's term / rowid / pgidx
+  encoding and page-splitting of long doclists, doclist indexes,
+  `%_idx` rows), the structure record (levels, segments, write
+  counter, cookie), averages, segment ids (smallest unused);
+  automerge (work units of 64 pages, `automerge` 0-64), crisismerge,
+  usermerge, `merge` with positive / negative page budgets,
+  `optimize` (and its incremental form), promotion of segments,
+  incremental merges with trimmed input segments — the multi-segment
+  iterator is the pin's tournament (older duplicates skipped in its
+  order, which decides where trimmed segments restart). Deletes and
+  updates write the pin's delete markers; `delete-all`, `rebuild`,
+  `integrity-check` (the index compared with the tokenized content,
+  `%_docsize` and the averages), `pgsz` / `hashsize` / `automerge` / `crisismerge` /
+  `usermerge` / `deletemerge` / `rank` settings with the pin's value
+  rules and cookie bump. The whole `%_data` image of a table is read
+  per write (an in-memory store whose writes are applied through the
+  pager in the pin's order).
+- **Flush points** (`session::fts5`): commit (xSync); every
+  savepoint (user SAVEPOINT, and the statement savepoint the pin
+  opens for a statement with a statement journal); RELEASE /
+  ROLLBACK TO's level rules; a rowid below the last pending one (or
+  equal without a delete); `hashsize`; config commands; fts5vocab
+  cursors and RENAME (a full sync). ROLLBACK and ROLLBACK TO discard
+  pending terms; autocommit writes fired by triggers are flushed in
+  the same transaction.
+- **Queries** (`src/fts5/expr.rs`): the full query grammar (phrases,
+  `+`, `prefix*`, `^`, `NEAR(... , N)`, column filters `col:`,
+  `{a b}:`, `-col:` / `-{...}:`, AND / OR / NOT precedence, implicit
+  AND, parentheses, quoting, the pin's syntax errors and the
+  detail=column/none refusals), evaluated with the pin's node
+  semantics (candidate rows of an AND whose phrase tests fail stay
+  "nomatch" and expose no positions; NOT's left side; empty phrases
+  dropped from NEAR groups and implicit ANDs); prefix queries read
+  the prefix indexes exactly as the pin chooses them. `t MATCH q`,
+  `col MATCH q`, `t = q`, `t(q)`, rowid `=` / ranges, several MATCH
+  terms ANDed; `ORDER BY rank` (the pin's sorter: rows by the live
+  rank, the sorted cursor's phrase data on detail != full) with
+  `rank MATCH 'bm25(...)'` and the `rank` setting; `ORDER BY rowid
+  [DESC]`. LIKE / GLOB on a trigram table (no diacritics folding)
+  become the pin's pattern queries (`sqlite3Fts5ExprPattern`:
+  runs of three or more characters, ANDed token by token on
+  detail != full), still checked by the WHERE clause.
+- **Auxiliary functions** (`src/fts5/aux.rs`): `bm25()` with
+  per-column weights (column sizes from `%_docsize`, the tokenized
+  content, or -1 on contentless tables without it), `highlight()`
+  and `snippet()` with the pin's instance iteration, sentence
+  scoring and corruption checks; on detail=column/none the instance
+  lists come from retokenizing the row, as the pin's.
+- **fts5vocab** `row` / `col` / `instance` over a table (NULL for
+  zero counts, the pin's column names), with the sync its cursor
+  does.
+- The entry points the statement engine awaits (sync, savepoint,
+  release, writes, reads) box their futures, so statements re-entered
+  by trigger programs keep their stack frames small (1000-deep
+  recursive triggers still fit the CLI's stack).
+- Transactions, savepoints and crash safety: the shadow tables are
+  ordinary pages under the pager's journals; `tests/crash.rs` covers
+  flush, merge, optimize, statement and savepoint rollback and an
+  external-content table kept by triggers.
+
+**Probing notes (live pin):**
+
+- Shadow tables: created data, idx, content, docsize, config, their
+  names quoted as string literals; after ALTER TABLE RENAME as
+  double-quoted identifiers. An empty table's structure record is
+  `00000000 000000` (cookie, levels, segments, write counter; with
+  `FF000001` after the cookie for contentless_delete) and its
+  averages record is empty.
+- Pending terms are flushed at commit and by **every** xSavepoint:
+  a user SAVEPOINT, and the statement savepoint of statements with
+  a statement journal (an fts5 INSERT of several rows or from a
+  SELECT, UPDATE / DELETE not by `rowid =`, statements on tables
+  with triggers, multi-row writes on tables with constraints).
+  RELEASE of level i flushes only when deeper savepoints were seen;
+  ROLLBACK TO discards. Queries read pending terms without flushing,
+  but a prefix scan of them resets the delete flag, so the next
+  write of the same rowid flushes; fts5vocab cursors and RENAME do a
+  full sync (pending terms and the averages).
+- A write with a rowid below the last pending one flushes first; so
+  does one equal to it unless the previous op was its delete.
+- Merges: which duplicate entry the tournament iterator skips
+  decides where an incrementally merged input segment is trimmed
+  (`%_data` bytes differ otherwise). `merge` N > 0 only merges a
+  level with at least `usermerge` segments; N < 0 merges any level
+  with more than one.
+- `snippet()` reports corruption (an instance past the column size,
+  e.g. contentless `columnsize=0`, where sizes are -1) only for the
+  **last** column it scans: the next column's xColumnText overwrites
+  the error code. bm25 on such tables uses -1 per column.
+- `ORDER BY rank` on detail=column/none: rows come in live-rank
+  order but the auxiliary functions see the sorted cursor's phrase
+  data (all phrases populated, then CheckPoslists), so the
+  displayed rank is recomputed and can differ from the order.
+- `-col : x` leaving no columns is not EOF; a nested filter that
+  intersects to nothing is. NEAR drops phrases a tokenizer makes
+  empty (trigram tokens under three characters).
+- A column filter on detail=none is an error; so is any phrase or
+  NEAR query on detail=column/none. `fts5vocab(db, t, type)` is only
+  accepted in TEMP ("wrong number of vtable arguments" in main).
+- LIKE / GLOB constraints on trigram tables are passed to xBestIndex
+  (`L` / `G` in idxStr, not omitted); case-sensitive trigram takes
+  GLOB only; with remove_diacritics no pattern is used. Patterns
+  with no three-character run give a full scan.
+- An unknown rank function errors only when the rank is used.
+- An automatic rowid after 9223372036854775807 is random on the pin
+  (the tests avoid it); the shell truncates SQL text at a NUL.
+
+**Tests:** `tests/fts5_v16.rs` (18 tests: CREATE text and argument
+errors, RENAME; 14 tokenizer configurations over multi-script text
+compared through fts5vocab and `%_data` bytes; a 4,355-word porter
+corpus built to reach every rule; 54 queries of every operator ×
+5 query shapes (MATCH, `=`, table-valued, column MATCH, ORDER BY
+rank, highlight, snippet, bm25 with weights) on detail=full / column
+/ none, prefix indexes, porter, contentless and external-content
+tables; plans and errors; snippets / highlights; trigram LIKE /
+GLOB; every special command with `%_data` / `%_idx` / `%_config`
+bytes; rowids and conflict clauses; transactions and savepoints;
+external content kept by triggers; fts5vocab; 14 regressions, one
+per bug found; 40 generated workloads (`HIPP_FTS5_CORPUS` for more;
+500 run clean locally, plus ~800 seeds of the scratch generator) of
+random configuration — tokenizer, detail, prefix, columnsize,
+UNINDEXED, normal / external-with-triggers / contentless content,
+fts5vocab, pgsz / automerge / crisismerge / usermerge / hashsize /
+rank settings — with inserts, multi-row inserts, REPLACE, deletes,
+updates, rowid moves, optimize / rebuild / merge, transactions and
+savepoints and random queries, comparing every output line and the
+shadow tables statement by statement, then the pin's
+integrity-check on hipp's file and hipp's on the pin's; files moving
+between the engines mid-workload both ways). `tests/crash.rs`
+`v16_crash_fts5_writes`; `hipp-cli/tests/cli_v16_fts5.rs`
+(byte-identical stdout: queries, ranks and REAL rendering,
+highlight / snippet, fts5vocab and commands, external content and
+trigram LIKE, error lines, `.schema`).
+
+**Gates:** `ci/local-gates.sh` (full) passes: fmt, clippy `-D
+warnings` (default, all features, every feature-set line including
+`v16,vtab,without_rowid,math,fts5`), workspace tests, the no_std
+targets, the three size gates.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**:
+the leaf is in `max` only); max **999,692 B** (Δ **+124,860 B**,
+ratchet raised to it — over the 32 KiB justification threshold: the
+generated Unicode tables ≈ 10 KiB, the four tokenizers and porter
+≈ 9 KiB, the index writer / merger / reader ≈ 35 KiB, the query
+parser and evaluator ≈ 22 KiB, bm25 / highlight / snippet ≈ 9 KiB,
+the session glue (writes, flush points, special commands,
+integrity-check, vocab, planning) ≈ 38 KiB; FTS5 is the largest
+SQLite extension and has no smaller faithful form; 48,884 B of the
+1 MiB budget remain, so it stays in `max` without a new ADR).
+
+**Honest gaps:**
+
+- `contentless_delete=1` tables are created and written byte for
+  byte, and the pin's tombstones are read and merged (review fixes
+  below), but DELETE / UPDATE on them (writing tombstone pages) is
+  refused (`Unsupported`); deletes while `secure-delete=1` is set
+  are refused (`Fts5SecureDelete`: hipp does not remove entries in
+  place); `insttoken`, `locale=1`, `tokendata=1` and
+  `contentless_unindexed=1` are refused.
+- fts5 tables and fts5vocab tables in TEMP or attached databases
+  are refused (so is the three-argument fts5vocab form); custom
+  tokenizers and auxiliary functions cannot be registered.
+- An unknown rank function (`rank MATCH 'nosuch()'`) is an error
+  even when the rank is never read (the pin's is lazy).
+- Query results are materialized before the first row: an error
+  mid-query (e.g. snippet's corruption check on a later row) fails
+  the statement where the pin first returns the earlier rows.
+- The statement-journal flush follows a heuristic of the pin's
+  `usesStmtJournal` (multi-row writes, triggers, constraints); a
+  statement shape it misjudges flushes pending terms at a different
+  point, giving different (valid) segment layouts. Writes fired by
+  triggers inside a multi-row outer statement in an explicit
+  transaction approximate the pin's savepoint nesting likewise (a
+  failing such statement now drops their terms, as the pin's
+  xRollbackTo does: review fixes below).
+- The `hashsize` accounting follows the pin's byte formula for
+  ordinary terms; very long tokens may flush at slightly different
+  points.
+- Every write reads the table's whole `%_data` into memory, and
+  queries read the doclists they need from it: correct at any size,
+  but slow and memory-hungry for very large indexes.
+- PRAGMA integrity_check does not run fts5's xIntegrity (use
+  `INSERT INTO t(t) VALUES('integrity-check')`).
+- The hidden table column's value (`SELECT t FROM t`) is a row
+  handle, not the pin's cursor pointer value (both meaningless).
+
+### FTS5 full-text search — review fixes (2026-11-05)
+
+Eleven review findings on the FTS5 unit, each reproduced against the
+live 3.54.1 pin. Fixes on claimed fts5 paths are in the `fts5` leaf
+(in `max`); two touch the shared `vtab` framework (MATCH under an
+OR, a LEFT JOIN's ON constraints).
+
+**Fixed:**
+
+- **Pin-written tombstones** (corruption): a `contentless_delete=1`
+  table the pin deleted rows of keeps them in its segments, hidden by
+  per-segment tombstone hash pages. hipp did not read those pages, so
+  queries returned deleted rows and hipp's `optimize` / merges copied
+  them back into the index for good (the pin's integrity-check still
+  passed). The reader and the merge iterator now apply the pin's
+  `fts5MultiIterIsDeleted` / `fts5IndexTombstoneQuery` (key size,
+  slot hashing, the rowid-0 flag), merges drop tombstoned entries
+  and recount `nEntry` as the pin, and `fts5IndexFindDeleteMerge`
+  (the `deletemerge` setting) picks merge levels as the pin does.
+  Writing tombstones (DELETE on such tables) stays refused.
+- **Pin-set `secure-delete`** (corruption): hipp ignored it and wrote
+  ordinary delete markers, leaving the deleted terms on disk and a
+  `%_data` unlike the pin's. Deletes (DELETE, UPDATE, OR REPLACE,
+  the 'delete' command) now fail with `Fts5SecureDelete` while it is
+  set; the 'secure-delete' command itself is accepted (so hipp can
+  turn it off, after which deletes match the pin byte for byte).
+  Settings are stored as the pin stores them: numeric text becomes
+  its integer (`'64'` was stored as text — found while probing).
+- **Failing statement in a transaction** (corruption): a multi-row
+  INSERT that failed after its AFTER INSERT trigger had indexed
+  earlier rows into an external-content table left those terms
+  pending, so they were flushed at COMMIT (phantom rowid, both
+  integrity-checks failing). A statement with the pin's statement
+  journal now restores the transaction's fts5 state after its
+  start-of-statement flush when it fails (the pin's xRollbackTo).
+- **NEAR inside an OR** (wrong bm25 / highlight / snippet): a failed
+  NEAR test dropped every phrase's positions; the pin keeps what its
+  test left (phrases before the failing one, the failing one empty,
+  later ones holding the buffers of the last row the node tested),
+  and the OR exposes them. Fixing it found two more: a row missing a
+  term of a phrase after a failing one was still a NEAR candidate,
+  and a column-filtered prefix scan (`fts5SetupPrefixIter`) keeps no
+  row the filter empties.
+- **snippet() with a negative token count**: clamped to 0..INT_MAX
+  like the pin (`-1` and `4294967295` were both used as -1).
+- **External content missing a row**: an error (the pin's "fts5:
+  missing row N from content table", `VtabCorrupt`) when the
+  statement reads a content column or an auxiliary function reads
+  the text; `SELECT rowid` / `count(*)` / bm25 with column sizes
+  still answer, as on the pin (the planner now records the pin's
+  `colUsed` for fts5 sources).
+- **INSERT with an integral REAL rowid** (`7.0`, `CAST(8 AS REAL)`,
+  `'9.0'`): accepted through the pin's `OP_MustBeInt`; an UPDATE's
+  new rowid still refuses them, as on the pin.
+- **MATCH under an OR / in a LEFT JOIN's ON**: `t MATCH 'a' OR t
+  MATCH 'b'`, `... OR rowid = 4`, `... OR rowid > 3`, `... OR (t
+  MATCH 'b' AND rowid < 3)` run as the pin's multi-index OR (each
+  branch's filter in turn, rows unioned in branch order, rowid
+  comparisons rechecked, bm25 0.0 on a rowid-only branch); `m LEFT
+  JOIN t ON t MATCH m.q` passes the ON constraints to the module per
+  left row (generate_series ON constraints under LEFT JOIN work too).
+- **INSERT ... RETURNING and UPDATE ... FROM** on fts5 tables: the
+  RETURNING row is the pin's (evaluated before xUpdate: rowid -1
+  unless given, hidden columns NULL, `*` the visible columns,
+  `last_insert_rowid()` of the previous row); UPDATE ... FROM
+  applies every joined row, the last winning. UPDATE / DELETE
+  RETURNING stay refused, as on the pin.
+- **Auxiliary functions in an aggregate query** (`sum(bm25(t))`,
+  `count(*), bm25(t)`, GROUP BY / HAVING): `Fts5Context`, the pin's
+  "unable to use function ... in the requested context".
+
+**Not fixed (and why):**
+
+- **MATCH whose argument comes from a table listed later in FROM**
+  (`FROM t, m WHERE t MATCH m.q`): the pin reorders the join; hipp
+  runs sources in FROM order (no join reordering anywhere, see
+  `xplan`), so the constraint cannot be evaluated first. Write the
+  argument's table first (`FROM m, t`), which both engines run.
+- **MATCH / aux functions in views and triggers** fail on the pin's
+  shell because it sets `trusted_schema=0` (the library default is
+  1). hipp has no `trusted_schema` (the same holds for `dbstat` and
+  `rtreedepth()` in views): it behaves as the library default.
+
+**Probing notes (live pin):** tombstone pages are
+`FTS5_TOMBSTONE_ROWID(segid, pg)`; the page for a rowid is `rowid %
+nPgTombstone`, its slot `(rowid / nPgTombstone) % nSlot` with linear
+probing; key size 4 or 8 from byte 0, the rowid-0 flag in byte 1.
+`secure-delete` leaves `version` at 4 until the pin's first secure
+delete. `sqlite3_value_numeric_type()` converts a setting's value in
+place, so `%_config` stores the integer. A multi-index OR's rows come
+branch by branch; a branch not usable by fts5 (`a = 'x'`) makes the
+whole OR a full scan, where MATCH errors.
+
+**Tests:** `tests/fts5_v16.rs`: `pin_tombstones_are_honoured` (24
+generated pin-written contentless_delete files with deletes, every
+detail mode, continued by both engines with inserts / optimize /
+merge / automerge; outputs, fts5vocab and shadow tables equal, the
+pin's integrity-check on hipp's copy), `secure_delete_is_not_ignored`,
+`review_regressions` (one case per finding and per bug the fixes'
+own fuzzing found), `generated_near_or_queries_match` (40 seeds of
+random NEAR / OR / AND / NOT / column-filter / prefix queries, every
+row's bm25, highlights and snippet in both rowid orders and rank
+order; ~700 seeds of the scratch version ran clean);
+`hipp-cli/tests/cli_v16_fts5.rs` `review_fixes_output`.
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**);
+max **1,032,068 B** (Δ **+9,664 B**, ratchet raised to it: the
+tombstone reader and deletemerge ≈ 1.5 KiB, the multi-index OR ≈ 3
+KiB, RETURNING / UPDATE FROM ≈ 1.5 KiB, the NEAR buffers, colUsed and
+the rest ≈ 3.5 KiB; 16,508 B of the 1 MiB budget remain).
+
+**Honest gaps:** the two "not fixed" items above; and query results
+are still materialized, so a statement whose later row fails (an
+auxiliary function on a LEFT JOIN's padded row, a missing content
+row) reports the error without the rows the pin printed first.
+
+### EXPLAIN QUERY PLAN (2026-11-05)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated: leaf `explain` (implies `v16`), in `max` (ADR 0002), not
+`full`; its own `v16,explain` line in `ci/feature-sets.txt`. Without
+the leaf `EXPLAIN` is an unsupported statement, as before.
+
+**Shipped:**
+
+- `EXPLAIN QUERY PLAN <statement>` (`session::eqp`): the statement is
+  parsed and planned as usual (its errors are this statement's, at
+  their offsets) and never run; the result is the pin's four columns
+  `id`, `parent`, `notused`, `detail`. `parent` links the rows into
+  the pin's tree; `id` numbers them in order (the pin's are bytecode
+  addresses) and `notused` is 0. `Statement::is_explain()` is the
+  pin's `sqlite3_stmt_isexplain` (2). Parameters bind and are
+  ignored; re-execution returns the rows again. Plain `EXPLAIN` (a
+  bytecode listing) is refused, `ParseKind::ExplainBytecode`; a
+  nested EXPLAIN is a syntax error, as on the pin.
+- The rows describe the plan hipp executes, in the pin's words: one
+  loop per FROM source (`SCAN t`, `SCAN t USING [COVERING] INDEX i`,
+  `SEARCH t USING [COVERING] INDEX i (a=? AND b>? AND b<?)` with the
+  rowid / PRIMARY KEY suffix columns and `<expr>` keys, `SEARCH t
+  USING INTEGER PRIMARY KEY (rowid=?)`, `SEARCH w USING PRIMARY KEY
+  (k=?)`, ` LEFT-JOIN`, `RIGHT-JOIN t`), `SCAN x VIRTUAL TABLE INDEX
+  n:str` (hex for generate_series / dbstat, fts5's order flags as the
+  pin's 0x20 / 0x40 / 0x80, json_each / json_tree's 1 / 3, pragma
+  functions' 0), `SCAN CONSTANT ROW`, `SCAN n-ROW VALUES CLAUSE` /
+  `SCAN n CONSTANT ROWS`; the sorters (`USE TEMP B-TREE FOR ORDER BY`
+  / `LAST TERM OF` / `LAST n TERMS OF ORDER BY`, `GROUP BY`,
+  `DISTINCT` — including the pin's DISTINCT-as-GROUP-BY rewrite —
+  and `f(DISTINCT)` / `f(ORDER BY)`); `[CORRELATED] SCALAR SUBQUERY n` / `[CORRELATED]
+  LIST SUBQUERY n` where they are evaluated (IN probes with their
+  loop); `CO-ROUTINE` / `MATERIALIZE` of FROM subqueries, views and
+  CTEs by the pin's `fromClauseTermCanBeCoroutine` rule (a shared
+  materialization once), recursive CTEs' `SETUP` / `RECURSIVE STEP`,
+  window co-routines `(subquery-n)` per window class, compound
+  `MERGE (op)` / `LEFT` / `RIGHT` and `COMPOUND QUERY` / `LEFT-MOST
+  SUBQUERY` / `UNION ALL` trees (UNION's LIMIT 1 shortcut as UNION
+  ALL); UPDATE / DELETE target loops (COVERING when the pin collects
+  rowids first), UPDATE ... FROM, INSERT ... SELECT / VALUES with
+  subqueries / RETURNING / an upsert's DO UPDATE, CREATE TABLE ... AS, INSTEAD OF writes of
+  views; nothing for statements without a plan (DDL, PRAGMA,
+  transactions, one-row INSERT VALUES). Statements routed to the TEMP
+  or an attached database are explained there.
+- The pin's select numbers: the parser numbers each core when the
+  pin's grammar reduces it (subqueries first, a compound's cores left
+  to right with the ORDER BY / LIMIT in the last one, WITH bodies
+  first, each VALUES row its own select, constant multi-row VALUES
+  two), a view's copy is renumbered after the statement's selects in
+  copy order, window co-routines after those; a compound subquery
+  shows its last core's number.
+- CLI: the pin shell's `eqp_render` tree for an EXPLAIN QUERY PLAN
+  statement (nothing for an empty plan).
+- Planner fixes found by comparing plans, ungated in the
+  `expr_index` / `window` code (they decide row order):
+  a core with window functions reads its rows in its last window
+  class's order (the pin's innermost window subquery's ORDER BY; ties
+  of a window's order were broken by the outer ORDER BY's index);
+  members of a merged compound are planned for the merge key (every
+  column, or an ORDER BY of result numbers); a GROUP BY / DISTINCT
+  takes its terms in any order of the index (`GROUP BY a, b` over an
+  index on (b, a) was sorted, groups in another order than the
+  pin's); a DISTINCT over the rowid is redundant (the planner was
+  given an order the pin drops); a rowid IN list delivers rowid
+  order; no `IS NULL` term on a NOT NULL key column (INTEGER PRIMARY
+  KEY, WITHOUT ROWID key, declared NOT NULL); generate_series reads
+  the ORDER BY (its index number says so). Parser: a statement-level
+  WITH clause and `IN ((SELECT ...), ...)` no longer count their
+  selects twice (numbering only).
+
+**Probing notes (live pin):**
+
+- The shell renders every EQP statement as the tree whatever
+  `.mode` is set; an empty plan prints nothing (not even `QUERY
+  PLAN`). `notused` is the loop's run cost and ids are VDBE
+  addresses (seen through Python's 3.53 module; not reproduced).
+- `SCAN` names the alias, else `[schema.]name` as written;
+  `MATERIALIZE` / `CO-ROUTINE` name a view or CTE by its own name,
+  else the alias, else `(subquery-n)`.
+- Rows are emitted in code-generation order: without GROUP BY the
+  aggregates' `f(DISTINCT)` / `f(ORDER BY)` sorters first, then FROM
+  subqueries, loops (with their IN-probe subqueries and ON
+  subqueries), WHERE subqueries, GROUP BY sorter, HAVING, result
+  subqueries, (with GROUP BY: the aggregates' sorters here), DISTINCT,
+  ORDER BY subqueries, ORDER BY sorter. The aggregates' sorters come
+  in `aFunc` order (result list, ORDER BY, HAVING), one per distinct
+  call, `f(DISTINCT)` before `f(ORDER BY)` for each; a DISTINCT call
+  whose one ORDER BY key is its one argument shows only `f(ORDER BY)`.
+- 3.54 merges UNION / INTERSECT / EXCEPT even without ORDER BY
+  (`MERGE (op)`, members sorted by every column); UNION ALL members
+  after the last merging operator are `UNION ALL` siblings of the
+  MERGE; a pure UNION ALL chain is `COMPOUND QUERY`.
+- A DISTINCT whose ORDER BY is its result list (any directions) is
+  run as a GROUP BY labelled `DISTINCT`; through a one-row rowid
+  lookup it still sorts for the ORDER BY. An aggregate without GROUP
+  BY drops its ORDER BY sorter; a window query whose ORDER BY
+  repeats the first window class's keys drops its outer sorter.
+- INSERT VALUES rows: one row is no plan; constant rows are one
+  `n-ROW VALUES CLAUSE` co-routine (two select numbers); rows with
+  subqueries are `n CONSTANT ROWS`, one select per row.
+- Triggers' programs are not shown. An UPDATE / DELETE loop through
+  an index is COVERING only when the pin collects the rowids first
+  and the loop is not a one-row lookup: RETURNING, a trigger for the
+  event, foreign keys the write must check (`sqlite3FkRequired`: an
+  UPDATE only when it changes a key), OR REPLACE, a rowid change, a
+  WHERE subquery; never for a WITHOUT ROWID table, a UNIQUE `=`
+  lookup, or because the SET changes the loop's index.
+- An upsert's DO UPDATE shows its WHERE's and SET's subqueries after
+  the INSERT's, then the RETURNING's twice (once for the update, once
+  for the insert). `SELECT count(*) FROM t` names the table, never
+  its alias or schema (the pin's `isSimpleCount` loop). `SCAN` keeps
+  a `temp.` / attached schema as written, on every route.
+
+**Differences from the pin (hipp prints what it runs):** no query
+flattening (FROM subqueries, views and CTEs stay CO-ROUTINE /
+MATERIALIZE loops) and no WHERE push-down; no join reordering (FROM
+order, so a rowid lookup into an earlier table is not used); no
+automatic indexes or Bloom filters; EXISTS stays a subquery (no
+`SCAN u EXISTS`); IN subqueries are lists (no `USING INDEX i FOR
+IN-OPERATOR` / `USING ROWID SEARCH ON TABLE`); no MULTI-INDEX OR; no
+min() / max() optimization (`SEARCH t USING COVERING INDEX i`, or a
+bare `SEARCH t` without an index); an UPDATE / DELETE WHERE key
+compared with a scalar subquery does not drive the target loop
+(`SCAN t`; SELECT uses it); RIGHT /
+FULL joins and UPDATE ... FROM sources read whole tables;
+`count(DISTINCT x)` sorts even over x's index; DELETE without WHERE
+deletes row by row (`SCAN t`; the pin truncates); an INSTEAD OF
+UPDATE / DELETE shows the view's co-routine. The plain-EXPLAIN
+bytecode listing has no equivalent. All pinned in
+`documented_differences`.
+
+**Tests:** `tests/eqp_v16.rs` (9 tests: 203 curated statements over
+loops, sorters, subqueries, structures and writes, each hipp's tree
+against the pin's shell on the same file; the documented differences
+as hipp goldens that must still differ from the pin; the API — four
+columns, `is_explain`, nothing runs (file state checked with the
+pin), parameters, reset, plain / broken / nested EXPLAIN refused as
+on the pin; a generated corpus — 40 random schemas × 12 queries by
+default, `HIPP_EQP_SEEDS` for more: 2,400 plans at 200 seeds match
+at 99.6%, the rest listed below; regressions for each planner fix,
+comparing rows with data). `hipp-cli/tests/cli_v16_eqp.rs` (two
+scripts, byte-identical stdout: trees, empty plans, plans between
+result rows, comments and case, `.parameter`, errors).
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Release:** the workspace and `hipp-cli` are 0.16.0; `CHANGELOG.md`
+summarises every v0.16 leaf and ungated fix; README's profile table
+and non-goals and ADR 0003 record the final layout and budgets.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**:
+the leaf is in `max` only, and the planner fixes live in
+`expr_index` / `window` code); max **1,022,404 B** (Δ **+19,616 B**,
+ratchet raised to it; under the 32 KiB threshold: the walker and
+its rendering ≈ 14 KiB, numbering and planner fixes ≈ 3 KiB, the
+CTE / view hooks and API ≈ 2 KiB). 26,172 B of the 1 MiB budget
+remain.
+
+**Honest gaps:**
+
+- hipp's cost model (`xplan`) departs from the pin's in some loop
+  choices, which EQP shows and which can order rows differently: an
+  IN on a later column of a multi-column index, a second equality
+  column of a two-column index, ties between equally costed indexes,
+  a WITHOUT ROWID table's secondary index against its primary key
+  (and their key-suffix probes), text literals compared with numeric
+  columns. The generated corpus therefore uses rowid tables and
+  single-column indexes and allows 1 in 100 plans to differ; the
+  curated corpus covers the rest.
+- `id` is a row number, not a bytecode address; `notused` is 0.
+- Select numbers inside view copies and window co-routines follow
+  the pin's observed order on the probed shapes; deeper nests (a
+  view in a view's subquery, multi-row VALUES inside compounds) may
+  number differently.
+- VALUES labels inside compounds and CTEs follow hipp's shapes, not
+  always the pin's (`SCAN 2-ROW VALUES CLAUSE` where the pin says `SCAN
+  2 CONSTANT ROWS` in a CTE body; a UNION of VALUES members sorts no
+  VALUES member).
+- FK-action and trigger programs are not shown (as on the pin), but
+  neither are hipp's FK child scans the pin shows for a parent
+  DELETE (`SCAN child`).
+
+### EXPLAIN QUERY PLAN — review fixes (2026-11-05)
+
+**Status:** all nine review findings reproduced and fixed, each with
+a regression test against the live pin. The two wrong answers were
+introduced by the unit's own planner changes (ungated `expr_index` /
+`window` code; the release notes no longer present those changes as
+plain fixes). The rest are EXPLAIN QUERY PLAN text (leaf `explain`).
+
+**Fixed:**
+
+- *Wrong answer:* a window query with an outer ORDER BY on a column
+  outside its result list ignored the ORDER BY (`SELECT a, sum(a)
+  OVER (ORDER BY b) FROM t ORDER BY c`): the window key replaced the
+  ORDER BY in the planner's input, so its columns dropped out of the
+  needed set and an index was taken as covering (EQP printed `USING
+  COVERING INDEX`); the sorter then sorted NULLs. `CoreInfo` now
+  carries the core's own ORDER BY as columns read (`also_reads`). The
+  same input change also made `OVER ()` read through the ORDER BY's
+  index; an empty window key now means the natural order, as on the
+  pin.
+- *Wrong answer:* a UNION read through the pin's LIMIT 1 first-row
+  shortcut (a written `LIMIT 1`, or the implicit one of a scalar /
+  EXISTS subquery without a LIMIT) planned its members for the merge
+  key, so the left-most member's first row was the rowid order's, not
+  its own plan's (`SELECT (SELECT a FROM t UNION SELECT 99)`).
+  `merge_member` now returns no key for that shape; the parser marks
+  scalar / EXISTS subqueries (`SelectStmt::first_row`, `expr_index`).
+- Without `expr_index` (e.g. `v16,explain`) the single-table fast
+  path's index lookup printed `SCAN t`; it prints `SEARCH t USING
+  INDEX i (col=?)`, and a lookup a NULL or non-numeric literal
+  short-circuits prints the seek it stands for. (Checked by hand on a
+  `std,full,explain` build: the test suites run under `max`.)
+- UPDATE / DELETE loops printed COVERING whenever hipp's own UPDATE
+  took two passes (a SET changing the loop's index), for a WITHOUT
+  ROWID table, for a one-row UNIQUE lookup, and whenever `PRAGMA
+  foreign_keys` was on; now the pin's rule (probing notes above).
+- `USE TEMP B-TREE FOR f(ORDER BY)` is shown (it never was), with the
+  pin's function names (`string_agg`, `median`, the `json_` /
+  `jsonb_` group functions); grouped queries print the aggregates'
+  sorters after the loop, the GROUP BY sorter and the result
+  subqueries; a call repeated in the ORDER BY counts once.
+- An upsert's DO UPDATE subqueries (WHERE, SET, and the RETURNING it
+  fires) were missing.
+- A VALUES core used as a subquery numbered one select too many
+  (`IN (VALUES (1))` is `LIST SUBQUERY 1`).
+- A statement routed to the TEMP or an attached database dropped its
+  schema qualifiers (`SCAN tt` for `temp.tt`, `sqlite_schema` for
+  `sqlite_temp_master`); they are put back as written. Found on the
+  way: `SELECT count(*) FROM t AS q` named the alias (the pin's
+  count loop names the table) on every route.
+- Docs: CHANGELOG / README describe the two regressions; ADR 0003
+  counts seventeen leaves.
+
+**Tests:** `tests/eqp_v16.rs::review_fixes_match_pin` (rows of the
+window / UNION shapes vs the pin, and 70 plans: write loops,
+aggregate sorters, upserts, VALUES numbers, count loops),
+`routed_qualifiers_match_pin` (19 plans on TEMP / attached routes);
+`hipp-cli/tests/cli_v16_eqp_review.rs` (two byte-identical
+scripts). A scratch differential fuzzer over the regression classes
+(window + outer ORDER BY, UNION / EXISTS / scalar UNION with and
+without LIMIT 1, DISTINCT LIMIT; 300 random schemas × 12 queries,
+rows vs the pin) found no difference after the fixes;
+`HIPP_EQP_SEEDS=200` keeps the generated plans within the corpus
+threshold.
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**:
+the new field and checks are under `expr_index` / `explain`); max
+**1,034,772 B** (Δ **+2,704 B**, ratchet raised; 13,804 B of the 1
+MiB budget remain). Merging `main`'s lazy index-cursor decoding
+(`src/btree.rs`, `docs/perf-baselines.md`) then took full to
+**500,952 B** (+752 B) and max to **1,035,516 B** (+744 B; 13,060 B
+remain); both ratchets are set to those measured values. The merge also
+pushed a debug build's IN-subquery path past the 512 KiB thread of
+`budgeted_limits_on_a_small_stack_refuse_cleanly` (about 12 KiB more
+stack under the lazy cursor's nested async calls, more under
+`-C instrument-coverage`, and more with debug info on, as CI
+builds): the debug `STACK_BASE` of `Config::stack_budget` is
+re-measured at 384 KiB (was 320 KiB; 368 KiB was the smallest that
+held in CI's plain test build), so the derived limits refuse before
+the stack runs out in every build CI runs. Release constants are unchanged.
+
+**Honest gaps:**
+
+- hipp does not parse several ON CONFLICT clauses on one INSERT (the
+  pin's chained upsert: a syntax error in hipp); one clause is
+  explained as above.
+- The foreign-key part of the COVERING rule asks `fk_target` (hipp's
+  `sqlite3FkRequired`), and the pin's FK child scans on a parent
+  write are still not shown.
+- The TEMP / attached qualifiers are put back by name: a statement
+  reading one table both qualified and unqualified (without aliases)
+  prints the qualifier on both loops.
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

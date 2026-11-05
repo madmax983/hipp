@@ -62,6 +62,22 @@ macro_rules! abort_write {
     }};
 }
 
+/// The end of an autocommit write: fts5 tables' pending terms
+/// (written by trigger programs, v0.16 `fts5`) are flushed into the
+/// same transaction first, as the pin's xSync does; then the commit.
+macro_rules! auto_commit {
+    ($c:expr) => {{
+        #[cfg(feature = "fts5")]
+        let r = match $c.fts_sync_all().await {
+            Ok(()) => $c.pager.drive_commit().await,
+            Err(e) => Err(e),
+        };
+        #[cfg(not(feature = "fts5"))]
+        let r = $c.pager.drive_commit().await;
+        r
+    }};
+}
+
 /// A new table's or index's root page: in an auto-vacuum file
 /// (v0.16, `autovacuum`) the pin's slot after the largest root
 /// (`crate::autovac::alloc_root`), elsewhere any page. A macro, so
@@ -89,18 +105,33 @@ mod alter;
 mod attach;
 #[cfg(feature = "v16")]
 mod cte;
+#[cfg(feature = "explain")]
+mod eqp;
+
+/// A boxed `Connection::prepare` future (v0.16, `explain`: the
+/// EXPLAIN QUERY PLAN prepare recurses).
+#[cfg(feature = "explain")]
+type Prep<'a, 'f, S> = core::pin::Pin<
+    Box<dyn core::future::Future<Output = Result<Statement<'a, S>, <S as Storage>::Error>> + 'f>,
+>;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
-#[cfg(feature = "json")]
+#[cfg(feature = "fts5")]
+mod fts5;
+#[cfg(any(feature = "json", feature = "vtab"))]
 mod json_tvf;
 #[cfg(feature = "v16")]
 mod maint;
 #[cfg(feature = "v16")]
 mod pragma;
+#[cfg(feature = "rtree")]
+mod rtree;
 #[cfg(feature = "v16")]
 mod temp;
 #[cfg(feature = "triggers")]
 mod trigger;
+#[cfg(feature = "vtab")]
+mod vtab;
 #[cfg(feature = "expr_index")]
 mod xindex;
 
@@ -224,7 +255,24 @@ pub struct Config {
     /// count as trigger programs, as on the pin.
     #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub max_trigger_depth: usize,
+    /// The most rows one virtual-table cursor may produce for a
+    /// statement (v0.16 review fix, `vtab`). hipp's executor holds a
+    /// source's rows in memory where the pin streams them, so a
+    /// module whose rows cost nothing to describe —
+    /// `generate_series(1)` is 4294967295 rows — would exhaust the
+    /// heap; past this many rows the statement fails with
+    /// `SchemaKind::VtabTooManyRows` instead. The default
+    /// (`DEFAULT_VTAB_ROWS`, about 4 million) costs a few hundred MiB
+    /// at its peak; lower it on a small heap, raise it where memory
+    /// allows.
+    #[cfg(feature = "vtab")]
+    pub max_vtab_rows: usize,
 }
+
+/// `Config::default()`'s virtual-table row bound (v0.16, `vtab`;
+/// see `Config::max_vtab_rows`).
+#[cfg(feature = "vtab")]
+pub const DEFAULT_VTAB_ROWS: usize = 1 << 22;
 
 /// The `VACUUM INTO` writer's type (v0.16, `v16`; see
 /// `Config::vacuum_into`): file name, image → written.
@@ -264,6 +312,8 @@ impl Default for Config {
             max_parser_depth: DEFAULT_PARSER_DEPTH,
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: DEFAULT_TRIGGER_DEPTH,
+            #[cfg(feature = "vtab")]
+            max_vtab_rows: DEFAULT_VTAB_ROWS,
         }
     }
 }
@@ -295,9 +345,14 @@ pub const STACK_PER_TRIGGER: usize = 16 * 1024;
 
 /// The stack hipp needs for any statement, before nesting (v0.16;
 /// measured on x86_64 — the step future and the call path to the
-/// parser and executor).
+/// parser and executor). The debug figure was re-measured at 384 KiB
+/// after the lazily decoded index cursor (`btree::LazyPage`) grew a
+/// debug build's seek path: it covers the worst build CI runs, a
+/// debug build with debug info under `-C instrument-coverage`
+/// (ci/coverage.sh), where tests/depth_v16.rs and
+/// tests/triggers_v16.rs pass on their budgeted threads.
 #[cfg(all(feature = "v04", debug_assertions))]
-pub const STACK_BASE: usize = 320 * 1024;
+pub const STACK_BASE: usize = 384 * 1024;
 #[cfg(all(feature = "v04", not(debug_assertions)))]
 pub const STACK_BASE: usize = 64 * 1024;
 /// The most stack one symbol of `Config::max_parser_depth` costs
@@ -344,6 +399,8 @@ impl Config {
             max_parser_depth: 64,
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: 8,
+            #[cfg(feature = "vtab")]
+            max_vtab_rows: 1 << 16,
         }
     }
 
@@ -380,6 +437,12 @@ impl Config {
     #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub fn max_trigger_depth(mut self, levels: usize) -> Config {
         self.max_trigger_depth = levels;
+        self
+    }
+    /// Set `max_vtab_rows` (v0.16, `vtab`).
+    #[cfg(feature = "vtab")]
+    pub fn max_vtab_rows(mut self, rows: usize) -> Config {
+        self.max_vtab_rows = rows;
         self
     }
     /// Set `max_expr_depth` and `max_parser_depth` (v0.16).
@@ -591,6 +654,9 @@ impl IdxColPlan {
 #[allow(clippy::large_enum_variant)]
 enum Plan {
     CreateTable,
+    /// A virtual-table statement (v0.16, `vtab`; `session::vtab`).
+    #[cfg(feature = "vtab")]
+    Vtab(Box<vtab::VtPlan>),
     /// `CREATE TABLE ... AS SELECT` (v0.16, `v16`): the source
     /// plan, the derived `sqlite_schema` text (the pin's
     /// `createTableStmt` form) and the new columns' affinities.
@@ -886,6 +952,11 @@ enum Plan {
     /// `triggers`).
     #[cfg(feature = "triggers")]
     Instead(Box<trigger::InsteadPlan>),
+    /// `EXPLAIN QUERY PLAN` (v0.16, `explain`; `session::eqp`): the
+    /// rows describing the plan of the statement it names, which was
+    /// planned and is never run.
+    #[cfg(feature = "explain")]
+    Explain(eqp::EqpRows),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -927,6 +998,9 @@ struct QueryPlan {
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
     #[cfg_attr(not(feature = "v09"), allow(dead_code))]
     comp_order: AVec<(usize, crate::sql::SortOrder)>,
+    /// The pin's select number (v0.16, `explain`; `SubPlan::sel`).
+    #[cfg(feature = "explain")]
+    sel: u32,
 }
 
 /// One compound member core's ORDER BY matching data (v0.16;
@@ -1281,6 +1355,12 @@ pub struct Connection<S: Storage> {
     /// (`thumbv6m`) do not have.
     #[cfg(feature = "v06")]
     next_subplan_id: core::cell::Cell<usize>,
+    /// The next SELECT core to plan is a member of a compound the
+    /// executor merges (v0.16, `expr_index`): its access path is
+    /// chosen for the merge key — every result column, ascending —
+    /// as the pin plans a `multiSelectOrderBy` member.
+    #[cfg(all(feature = "expr_index", feature = "v09"))]
+    merge_core: core::cell::Cell<Option<MergeSpec>>,
     /// The recursive CTEs whose recursive SELECTs are being
     /// planned (v0.16, `v16`): each one's id and column shape,
     /// which its recursive reference takes (`plan_rec_ref`). A
@@ -1330,6 +1410,10 @@ pub struct Connection<S: Storage> {
     /// (v0.16, `attach`; `attach::ExtTab`).
     #[cfg(feature = "attach")]
     ext: core::cell::RefCell<AVec<attach::ExtTab>>,
+    /// The fts5 tables written in the open transaction: their
+    /// pending terms and totals (v0.16, `fts5`).
+    #[cfg(feature = "fts5")]
+    fts: AVec<fts5::FtState>,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1358,6 +1442,8 @@ impl<S: Storage> Connection<S> {
             sub_execs: 0,
             #[cfg(feature = "v06")]
             next_subplan_id: core::cell::Cell::new(1),
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            merge_core: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
             rec_scope: core::cell::Cell::new(AVec::new()),
             #[cfg(feature = "v04")]
@@ -1382,6 +1468,8 @@ impl<S: Storage> Connection<S> {
             attach_hook: None,
             #[cfg(feature = "attach")]
             ext: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "fts5")]
+            fts: AVec::new(),
         };
         #[cfg(feature = "utf16")]
         conn.set_text_enc(conn.pager.text_enc());
@@ -1437,6 +1525,12 @@ impl<S: Storage> Connection<S> {
     pub async fn prepare(&mut self, sql: &str) -> Result<Statement<'_, S>, S::Error> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
+        }
+        // `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`).
+        #[cfg(feature = "explain")]
+        if let Some(at) = eqp::query_plan_prefix::<S::Error>(sql.as_bytes())? {
+            let eqp: Prep<'_, '_, S> = Box::pin(self.prepare_eqp(sql, at));
+            return eqp.await;
         }
         // A new statement reads the clock afresh (v0.16, `datetime`).
         #[cfg(feature = "datetime")]
@@ -1609,6 +1703,52 @@ impl<S: Storage> Connection<S> {
         })
     }
 
+    /// Prepare `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`):
+    /// the statement from byte `at` of `sql` is prepared, described
+    /// (`session::eqp`) and never run. Its errors are this
+    /// statement's, at their offsets in `sql`.
+    #[cfg(feature = "explain")]
+    async fn prepare_eqp(&mut self, sql: &str, at: usize) -> Result<Statement<'_, S>, S::Error> {
+        let rest = sql.get(at..).unwrap_or("");
+        if eqp::query_plan_prefix::<S::Error>(rest.as_bytes())?.is_some() {
+            return Err(Error::Parse {
+                offset: at,
+                kind: crate::error::ParseKind::UnexpectedToken,
+            });
+        }
+        let prep: Prep<'_, '_, S> = Box::pin(self.prepare(rest));
+        let mut st = prep.await.map_err(|e| match e {
+            Error::Parse { offset, kind } => Error::Parse {
+                offset: offset.saturating_add(at),
+                kind,
+            },
+            e => e,
+        })?;
+        #[allow(unused_mut)]
+        let mut rows = st.eqp_rows().await?;
+        if let Plan::Temp { .. } = &st.plan {
+            eqp::requalify::<S::Error>(&mut rows, rest.as_bytes(), b"temp", true, &st.arena);
+        }
+        #[cfg(feature = "attach")]
+        if let Plan::Att(p) = &st.plan
+            && let Some(a) = st.conn.attached.as_slice().get(p.db)
+        {
+            eqp::requalify::<S::Error>(
+                &mut rows,
+                rest.as_bytes(),
+                a.name.as_slice(),
+                false,
+                &st.arena,
+            );
+        }
+        st.plan = Plan::Explain(rows);
+        #[cfg(feature = "params")]
+        {
+            st.binds.stale = false;
+        }
+        Ok(st)
+    }
+
     /// Prepare a statement routed to the TEMP database (v0.16,
     /// `v16`): prepared there once now, so its errors are prepare
     /// errors as on the pin, and again when it runs.
@@ -1768,6 +1908,11 @@ impl<S: Storage> Connection<S> {
         let expanded = self.expand_ast(arena, ast)?;
         #[cfg(feature = "v16")]
         let ast = expanded.as_ref().unwrap_or(ast);
+        // v0.16 (`vtab`): statements on virtual and shadow tables.
+        #[cfg(feature = "vtab")]
+        if let Some(p) = self.plan_vtab_stmt(arena, ast)? {
+            return Ok(p);
+        }
         // The pin reserves every `sqlite_*` name (any case) for
         // itself (v0.16 fix, ungated: hipp created such tables,
         // indexes and views). Files that already hold one still
@@ -1782,6 +1927,8 @@ impl<S: Storage> Connection<S> {
         };
         if let Some(n) = created {
             reserved_name::<S::Error>(handle_bytes(arena, n))?;
+            #[cfg(feature = "vtab")]
+            self.shadow_name_free(handle_bytes(arena, n))?;
         }
         // The pin's system tables (`sqlite_*`, v0.16 fix, ungated):
         // none may be indexed or altered, and only `sqlite_stat*`
@@ -1832,6 +1979,12 @@ impl<S: Storage> Connection<S> {
             };
             if let Some(h) = target {
                 let n = handle_bytes(arena, h);
+                // A `.dump`'s virtual-table row under `PRAGMA
+                // writable_schema` (v0.16 review fix, `vtab`).
+                #[cfg(feature = "vtab")]
+                if let Some(p) = self.plan_schema_insert(arena, ast)? {
+                    return Ok(p);
+                }
                 if crate::schema::Catalog::is_schema_name(n) {
                     return Err(Error::Schema {
                         kind: SchemaKind::SchemaTableReadOnly,
@@ -1850,6 +2003,10 @@ impl<S: Storage> Connection<S> {
             // Unwrapped by `expand_ast` above.
             #[cfg(feature = "v16")]
             Ast::With { .. } => Err(Error::Unsupported),
+            // Planned by `plan_vtab_stmt` above (v0.16, `vtab`); a
+            // TEMP database has no virtual tables.
+            #[cfg(feature = "vtab")]
+            Ast::CreateVirtual { .. } => Err(Error::Unsupported),
             #[cfg(feature = "triggers")]
             Ast::CreateTrigger(t) => self.plan_create_trigger(arena, t),
             #[cfg(feature = "triggers")]
@@ -3350,9 +3507,15 @@ impl<S: Storage> Connection<S> {
                 rec: None,
                 #[cfg(feature = "v16")]
                 mat: 0,
+                #[cfg(feature = "explain")]
+                sel: stmt.sel,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
+        }
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        if !stmt.compound.is_empty() {
+            self.merge_core.set(merge_member(stmt, 0));
         }
         let core = self.plan_core(stmt, arena, enclosing)?;
         #[cfg(feature = "v09")]
@@ -3387,6 +3550,8 @@ impl<S: Storage> Connection<S> {
             rec: None,
             #[cfg(feature = "v16")]
             mat: 0,
+            #[cfg(feature = "explain")]
+            sel: stmt.sel,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -3510,7 +3675,12 @@ impl<S: Storage> Connection<S> {
     ) -> Result<SubCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
-        for (op, core) in stmt.compound.iter() {
+        for (i, (op, core)) in stmt.compound.iter().enumerate() {
+            #[cfg(feature = "expr_index")]
+            if core.values.is_empty() {
+                self.merge_core.set(merge_member(stmt, i + 1));
+            }
+            let _ = i;
             let (p, k) = self.plan_subquery_keyed(core, arena, enclosing)?;
             if p.width() != width {
                 return Err(Error::Schema {
@@ -3542,7 +3712,12 @@ impl<S: Storage> Connection<S> {
     ) -> Result<QueryCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
-        for (op, core) in stmt.compound.iter() {
+        for (i, (op, core)) in stmt.compound.iter().enumerate() {
+            #[cfg(feature = "expr_index")]
+            if core.values.is_empty() {
+                self.merge_core.set(merge_member(stmt, i + 1));
+            }
+            let _ = i;
             let (p, k) = self.plan_query_keyed(core, arena)?;
             if p.width != width {
                 return Err(Error::Schema {
@@ -3604,7 +3779,15 @@ impl<S: Storage> Connection<S> {
             match it {
                 SelectItem::Star => {
                     let src = &cur.sources.as_slice()[0];
-                    for ci in 0..src.columns.len() {
+                    // A virtual table's hidden columns are not in `*`.
+                    #[cfg(feature = "vtab")]
+                    let n = match src.vt_visible {
+                        0 => src.columns.len(),
+                        v => v,
+                    };
+                    #[cfg(not(feature = "vtab"))]
+                    let n = src.columns.len();
+                    for ci in 0..n {
                         out.push(src.column_ref(&cur, 0, ci));
                     }
                 }
@@ -4203,6 +4386,12 @@ impl<S: Storage> Connection<S> {
     /// columns, optional `WHERE <col> = <literal>`.
     fn plan_legacy_select(&self, stmt: &SelectStmt, arena: &Arena) -> Result<Plan, S::Error> {
         let tname = handle_bytes(arena, stmt.from.as_slice()[0].table);
+        // v0.16 (`vtab`): a virtual table reads through the general
+        // planner.
+        #[cfg(feature = "vtab")]
+        if self.vtab_named(tname).is_some() {
+            return Err(Error::Unsupported);
+        }
         let t = match self.catalog.find(&self.catalog_arena, tname) {
             Some(t) => t.usable()?,
             // v0.16: `sqlite_schema` and the table-valued pragma
@@ -4375,8 +4564,14 @@ impl<S: Storage> Connection<S> {
                 compound,
                 values,
                 comp_order,
+                #[cfg(feature = "explain")]
+                sel: stmt.sel,
             };
             return Ok((qp, keys));
+        }
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        if !stmt.compound.is_empty() {
+            self.merge_core.set(merge_member(stmt, 0));
         }
         let core = self.plan_core(stmt, arena, &[])?;
         let width = core.items.len();
@@ -4404,6 +4599,8 @@ impl<S: Storage> Connection<S> {
             compound,
             values: AVec::new(),
             comp_order,
+            #[cfg(feature = "explain")]
+            sel: stmt.sel,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -4458,6 +4655,8 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
     ) -> Result<CorePlan, S::Error> {
         use crate::query::{ScopeGroup, has_agg, item_result_affinity, resolve_scoped};
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        let merge = self.merge_core.take();
         let (base_width, base_src) = ScopeGroup::stack_end(enclosing);
         let mut descs = AVec::new();
         let mut offsets = AVec::new();
@@ -4569,7 +4768,10 @@ impl<S: Storage> Connection<S> {
             using,
             &mut planner,
         )?;
-        let filter = match &stmt.filter {
+        #[cfg(feature = "fts5")]
+        let rank_order;
+        #[cfg_attr(not(feature = "vtab"), allow(unused_mut))]
+        let mut filter = match &stmt.filter {
             None => hoisted,
             Some(e) => {
                 let r = resolve_scoped::<S::Error>(e, arena, &cur, enclosing, &mut planner)?;
@@ -4586,6 +4788,28 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
+        // v0.16 (`vtab`): each virtual table's xBestIndex.
+        #[cfg(feature = "vtab")]
+        {
+            // A one-term ORDER BY of a column (`aOrderBy`).
+            let order = match stmt.order_by.as_slice() {
+                [(Expr::Column { name, .. }, o)] if sources.len() == 1 => {
+                    Some((handle_bytes(arena, *name), o.desc))
+                }
+                _ => None,
+            };
+            let consumed = self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, order)?;
+            // An fts5 table's ORDER BY rank (`orderByConsumed`): its
+            // rows come in the pin's sorter order (leaf `fts5`).
+            #[cfg(feature = "fts5")]
+            {
+                rank_order = consumed
+                    && stmt.group_by.is_empty()
+                    && !stmt.distinct
+                    && !items.iter().any(crate::query::has_result_agg);
+            }
+            let _ = consumed;
+        }
         // GROUP BY / HAVING / ORDER BY terms: an output ordinal
         // or alias substitutes the item expression itself
         // (SQLite's rule, per clause — see `resolve_term`), so
@@ -4679,6 +4903,10 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "window")]
             cur.win.ok.set(false);
         }
+        #[cfg(feature = "fts5")]
+        if rank_order {
+            order_by.clear();
+        }
         // The window classes (v0.16, `window`).
         #[cfg(feature = "window")]
         {
@@ -4711,6 +4939,26 @@ impl<S: Storage> Connection<S> {
         // aggregates `SELECT EXISTS(SELECT max(t.a) FROM u) FROM
         // t` to one row.)
         let has_agg = !group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
+        // An auxiliary function in an aggregate query over a
+        // full-text table: the pin's columns there are aggregate
+        // columns, which xFindFunction does not overload ("unable to
+        // use function bm25 in the requested context"; v0.16 review
+        // fix, `fts5`: hipp computed it).
+        #[cfg(feature = "fts5")]
+        if has_agg
+            && cur.sources.iter().any(|s| s.fts_col.is_some())
+            && items
+                .iter()
+                .chain(having.iter())
+                .chain(order_by.iter().map(|(e, _)| e))
+                .any(|e| {
+                    crate::query::any_scalar(e, &|f| matches!(f, crate::query::ScalarFn::Fts5(_)))
+                })
+        {
+            return Err(Error::Schema {
+                kind: SchemaKind::Fts5Context,
+            });
+        }
         if !has_agg && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
             return Err(Error::Schema {
                 kind: SchemaKind::MisusedAggregate,
@@ -4732,6 +4980,63 @@ impl<S: Storage> Connection<S> {
         let limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
         // v0.16 (`expr_index`): each table source's index access
         // path, the pin's choice (`xplan`).
+        // A merged compound member's loop delivers the merge key if
+        // it can (`merge_core`).
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = match merge {
+            Some((terms, rest)) if order_by.is_empty() && !has_agg => {
+                let key = |j: usize, desc: bool, nulls_first: bool| {
+                    items.as_slice().get(j).map(|e| {
+                        (
+                            e.clone(),
+                            crate::sql::SortOrder {
+                                desc,
+                                nulls_first,
+                                coll: crate::query::expr_coll(e).unwrap_or_default(),
+                            },
+                        )
+                    })
+                };
+                let mut out: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+                for (j, d, n) in terms.iter() {
+                    if let Some(k) = key(*j, *d, *n) {
+                        out.push(k);
+                    }
+                }
+                for j in 0..items.len() {
+                    if rest
+                        && !terms.iter().any(|t| t.0 == j)
+                        && let Some(k) = key(j, false, true)
+                    {
+                        out.push(k);
+                    }
+                }
+                out
+            }
+            _ => AVec::new(),
+        };
+        #[cfg(all(feature = "expr_index", not(feature = "v09")))]
+        let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+        // A core with window functions reads its rows in the order
+        // of its last window class, which the pin's innermost window
+        // subquery sorts by (v0.16 fix, `window`: ties of a window's
+        // order then keep the pin's order).
+        #[cfg(all(feature = "expr_index", feature = "window"))]
+        let win_key = if !has_agg && group_by.is_empty() {
+            crate::window::class_keys(items.as_slice(), None)
+        } else {
+            None
+        };
+        // (A window core's key replaces its ORDER BY even when empty,
+        // `OVER ()`: its rows are read in their natural order — v0.16
+        // review fix.)
+        #[cfg(all(feature = "expr_index", feature = "window"))]
+        let (keyed, merge_key, info_limit) = match win_key {
+            Some(k) => (true, k, None),
+            None => (!merge_key.is_empty(), merge_key, limit.as_ref()),
+        };
+        #[cfg(all(feature = "expr_index", not(feature = "window")))]
+        let (keyed, info_limit) = (!merge_key.is_empty(), limit.as_ref());
         #[cfg(feature = "expr_index")]
         self.plan_accesses(
             arena,
@@ -4744,15 +5049,21 @@ impl<S: Storage> Connection<S> {
                 filter: filter.as_ref(),
                 group_by: group_by.as_slice(),
                 having: having.as_ref(),
-                order_by: order_by.as_slice(),
+                order_by: if keyed {
+                    merge_key.as_slice()
+                } else {
+                    order_by.as_slice()
+                },
                 has_agg,
                 distinct: stmt.distinct,
-                limit: limit.as_ref(),
+                limit: info_limit,
+                also_reads: order_by.as_slice(),
             },
         )?;
-        // v0.16 (`json`): what a lateral `json_each` may drop
-        // from the rows it joins onto.
-        #[cfg(feature = "json")]
+        // v0.16 (`json`, `vtab`): what a lateral `json_each` or
+        // virtual table may drop from the rows it joins onto; and
+        // (`vtab`) each virtual table's constraints (its xBestIndex).
+        #[cfg(any(feature = "json", feature = "vtab"))]
         {
             let mut rest: AVec<&RExpr> = AVec::new();
             for e in items
@@ -4765,6 +5076,12 @@ impl<S: Storage> Connection<S> {
                 rest.push(e);
             }
             json_tvf::plan_tvf_dead(
+                sources.as_mut_slice(),
+                cur.offsets.as_slice(),
+                rest.as_slice(),
+            );
+            #[cfg(feature = "fts5")]
+            vtab::plan_content_used(
                 sources.as_mut_slice(),
                 cur.offsets.as_slice(),
                 rest.as_slice(),
@@ -4951,6 +5268,8 @@ impl<S: Storage> Connection<S> {
         }
         descs.push(desc);
         plans.push(SourcePlan {
+            #[cfg(feature = "explain")]
+            eqp: Default::default(),
             root: 0,
             kind: s.kind,
             on: None,
@@ -4962,10 +5281,12 @@ impl<S: Storage> Connection<S> {
             gcols: None,
             #[cfg(feature = "v16")]
             rec: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf: 0,
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             tvf_dead: AVec::new(),
+            #[cfg(feature = "vtab")]
+            vt: None,
             #[cfg(feature = "expr_index")]
             access: None,
             #[cfg(feature = "expr_index")]
@@ -5000,6 +5321,10 @@ impl<S: Storage> Connection<S> {
         use crate::query::SourceDesc;
         #[cfg(not(feature = "v09"))]
         let _ = derived_scope;
+        #[cfg(feature = "explain")]
+        let first = plans.len();
+        #[cfg(feature = "explain")]
+        let first_off = offsets.len();
         for s in from.iter() {
             offsets.push(total);
             // v0.16: a recursive CTE's recursive reference reads
@@ -5023,6 +5348,14 @@ impl<S: Storage> Connection<S> {
                     total += self.plan_json_tvf(s, k, arena, descs, plans)?;
                     continue;
                 }
+            }
+            // v0.16 (`vtab`): a virtual table, or an eponymous module.
+            #[cfg(feature = "vtab")]
+            if s.derived.is_none()
+                && let Some(w) = self.plan_vtab_source(s, arena, descs, plans)?
+            {
+                total += w;
+                continue;
             }
             // v0.16: a table-valued pragma function, or the empty
             // temp schema, as the derived table of its rows.
@@ -5151,6 +5484,8 @@ impl<S: Storage> Connection<S> {
                 None
             };
             plans.push(SourcePlan {
+                #[cfg(feature = "explain")]
+                eqp: Default::default(),
                 root: t.root,
                 kind: s.kind,
                 on: None,
@@ -5162,10 +5497,12 @@ impl<S: Storage> Connection<S> {
                 gcols,
                 #[cfg(feature = "v16")]
                 rec: 0,
-                #[cfg(feature = "json")]
+                #[cfg(any(feature = "json", feature = "vtab"))]
                 tvf: 0,
-                #[cfg(feature = "json")]
+                #[cfg(any(feature = "json", feature = "vtab"))]
                 tvf_dead: AVec::new(),
+                #[cfg(feature = "vtab")]
+                vt: None,
                 #[cfg(feature = "expr_index")]
                 access: None,
                 #[cfg(feature = "expr_index")]
@@ -5176,6 +5513,30 @@ impl<S: Storage> Connection<S> {
                 ext: 0,
             });
             total += t.columns.len();
+        }
+        #[cfg(feature = "explain")]
+        if let Some(ps) = plans.as_mut_slice().get_mut(first..)
+            && ps.len() == from.len()
+        {
+            for (i, (s, p)) in from.iter().zip(ps.iter_mut()).enumerate() {
+                let (scan, mat) = eqp::source_names(s, arena);
+                let base = offsets.as_slice().get(first_off + i).copied().unwrap_or(0);
+                p.eqp = crate::query::EqpInfo {
+                    scan,
+                    mat,
+                    base,
+                    ..Default::default()
+                };
+                // A table-valued pragma function or the empty temp
+                // schema: rows the planner made, read as a table.
+                #[cfg(any(feature = "json", feature = "vtab"))]
+                let tvf = p.tvf != 0;
+                #[cfg(not(any(feature = "json", feature = "vtab")))]
+                let tvf = false;
+                if s.derived.is_none() && p.derived.is_some() && !tvf && p.rec == 0 {
+                    p.eqp.mat = copy_vec(b"\0");
+                }
+            }
         }
         Ok(())
     }
@@ -5210,7 +5571,7 @@ impl<S: Storage> Connection<S> {
         let mut using = using.as_slice().iter();
         for (i, (s, plan)) in from.iter().zip(plans.iter_mut()).enumerate() {
             // A JSON table-valued function's arguments (v0.16).
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             if plan.tvf != 0 {
                 self.plan_tvf_args(s, i, arena, cur, enclosing, plan, &mut *planner)?;
             }
@@ -6568,6 +6929,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// again, so the plan reflects the values bound, the schema
     /// and the clock at the time.
     pub async fn step(&mut self) -> Result<Step, S::Error> {
+        // An EXPLAIN QUERY PLAN returns its rows and nothing else.
+        #[cfg(feature = "explain")]
+        if matches!(self.plan, Plan::Explain(_)) {
+            return self.step_explain().await;
+        }
         // The `json_each` documents this step holds (v0.16, `json`;
         // `Env::json_docs`) go once the plan has run: its rows are
         // projected by then (a query materialises its result in
@@ -6575,6 +6941,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         // only its own.
         #[cfg(feature = "json")]
         let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
+        // Likewise the full-text rows' auxiliary data (v0.16, `fts5`).
+        #[cfg(feature = "fts5")]
+        let fmark = self.conn.env.fts_rows.try_borrow().map_or(0, |d| d.len());
         // The statement's instant (v0.16, `datetime`): kept while
         // this statement owns the clock cache — from its prepare
         // (whose plan may read it for a DEFAULT) through its
@@ -6602,6 +6971,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "v16")]
         let was_txn = self.conn.explicit_txn;
         let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
+            || {
+                #[cfg(feature = "vtab")]
+                {
+                    matches!(self.plan, Plan::Vtab(_))
+                }
+                #[cfg(not(feature = "vtab"))]
+                {
+                    false
+                }
+            }
             || {
                 #[cfg(feature = "v16")]
                 {
@@ -6663,11 +7042,35 @@ impl<'c, S: Storage> Statement<'c, S> {
                     false
                 }
             };
+        // A statement the pin gives a statement journal (several rows,
+        // or a trigger program, with constraints that may abort) calls
+        // xSavepoint on the fts5 tables in the transaction first: their
+        // pending terms are flushed outside the statement's savepoint
+        // (v0.16, `fts5`).
+        // When it fails, its xRollbackTo discards every pending term
+        // written since (v0.16 review fix: terms a trigger program had
+        // added stayed in the index): the state after that flush is
+        // restored.
+        #[cfg(feature = "fts5")]
+        let fts_snap = if self.phase == Phase::Fresh
+            && self.conn.explicit_txn
+            && self.stmt_sp.is_none()
+            && !self.conn.fts_in_program()
+            && self.fts_journal()
+        {
+            let level = self.conn.pager.sp_depth();
+            self.conn.fts_savepoint(level).await?;
+            Some(self.conn.fts.clone())
+        } else {
+            None
+        };
         #[cfg(feature = "v16")]
         self.open_stmt();
         #[cfg(feature = "foreign_keys")]
         self.fk_stmt_begin();
         let r = match &self.plan {
+            #[cfg(feature = "explain")]
+            Plan::Explain(_) => self.step_explain().await,
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
             #[cfg(feature = "v16")]
@@ -6681,6 +7084,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(feature = "attach")]
             Plan::Attach(_) => self.step_attach().await,
             Plan::CreateTable => self.step_create().await,
+            #[cfg(feature = "vtab")]
+            Plan::Vtab(_) => self.step_vtab().await,
             #[cfg(feature = "v16")]
             Plan::CreateTableAs { .. } => self.step_create_as().await,
             #[cfg(feature = "v04")]
@@ -6724,6 +7129,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "json")]
         if let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut() {
             d.truncate(mark);
+        }
+        #[cfg(feature = "fts5")]
+        if let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut() {
+            d.truncate(fmark);
+        }
+        #[cfg(feature = "fts5")]
+        if r.is_err()
+            && let Some(f) = fts_snap
+        {
+            self.conn.fts = f;
         }
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
@@ -6799,6 +7214,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// repeated executions reuse the same arena space.
     #[cfg(feature = "params")]
     async fn replan(&mut self) -> Result<(), S::Error> {
+        // An EXPLAIN QUERY PLAN never plans again (or runs).
+        #[cfg(feature = "explain")]
+        if matches!(self.plan, Plan::Explain(_)) {
+            self.binds.stale = false;
+        }
         if !self.binds.stale {
             return Ok(());
         }
@@ -7026,6 +7446,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         // the transaction staying open (v0.16, `foreign_keys`).
         #[cfg(feature = "foreign_keys")]
         self.conn.fk_commit_check()?;
+        // The fts5 tables' pending terms (v0.16, `fts5`: xSync).
+        #[cfg(feature = "fts5")]
+        self.conn.fts_sync_all().await?;
         // Every database's commit, atomic across their files (v0.16,
         // `attach`).
         #[cfg(feature = "attach")]
@@ -7051,6 +7474,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.rollback().await?;
         self.conn.explicit_txn = false;
+        #[cfg(feature = "fts5")]
+        self.conn.fts.clear();
         self.phase = Phase::Done;
         Ok(Step::Done)
     }
@@ -7224,7 +7649,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -7311,7 +7736,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -7546,7 +7971,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -7619,7 +8044,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             self.conn.pager.bump_schema_cookie();
             if !self.conn.explicit_txn {
-                self.conn.pager.drive_commit().await?;
+                auto_commit!(self.conn)?;
             }
             return Ok(());
         }
@@ -7630,7 +8055,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         btree::btree_delete(&mut self.conn.pager, 1, schema_rowid).await?;
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -7875,6 +8300,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let conflict = match &self.plan {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
+            #[cfg(feature = "rtree")]
+            Plan::Vtab(p) => match &**p {
+                vtab::VtPlan::Write(w) => w.conflict,
+                _ => ConflictAction::Abort,
+            },
             _ => ConflictAction::Abort,
         };
         // v0.16: the failing constraint's own action, when it has one.
@@ -7901,7 +8331,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         e: &Error<S::Error>,
     ) -> core::result::Result<bool, Error<S::Error>> {
         let keep = conflict == ConflictAction::Fail
-            && matches!(
+            && (matches!(
                 e,
                 Error::Schema {
                     kind: SchemaKind::UniqueViolation
@@ -7909,7 +8339,22 @@ impl<'c, S: Storage> Statement<'c, S> {
                         | SchemaKind::NotNullViolation
                         | SchemaKind::CheckViolation
                 }
-            );
+            ) || {
+                // An R*Tree's constraint (v0.16, `rtree`).
+                #[cfg(feature = "rtree")]
+                {
+                    matches!(
+                        e,
+                        Error::Schema {
+                            kind: SchemaKind::RtreeConstraint
+                        }
+                    )
+                }
+                #[cfg(not(feature = "rtree"))]
+                {
+                    false
+                }
+            });
         if keep {
             // v0.16 (`foreign_keys`): an action program's failure
             // aborts the statement whatever its clause says; and the
@@ -7930,7 +8375,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let committed = if self.conn.explicit_txn {
                 Ok(())
             } else {
-                self.conn.pager.drive_commit().await
+                auto_commit!(self.conn)
             };
             return match committed {
                 Ok(()) => {
@@ -8017,7 +8462,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.fk_end_commit().await?;
             #[cfg(not(feature = "foreign_keys"))]
             if !self.conn.explicit_txn {
-                self.conn.pager.drive_commit().await?;
+                auto_commit!(self.conn)?;
             }
             self.conn.env.finish(true);
             return Ok(());
@@ -8053,7 +8498,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.fk_end_commit().await?;
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(true);
@@ -10286,7 +10731,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.fk_end_commit().await?;
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(true);
@@ -10503,7 +10948,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.fk_end_commit().await?;
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(true);
@@ -10682,7 +11127,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -11069,7 +11514,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             // v0.16 (`json`): a JSON table-valued function's rows —
             // computed in the join when its arguments read a source
             // to its left (`join_step`).
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             if sp.tvf != 0 {
                 if sp.tvf & crate::query::TVF_LATERAL != 0 {
                     src_rows.push(AVec::new());
@@ -12225,11 +12670,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             // A JSON table-valued function reading the sources to its
             // left (v0.16, `json`): its rows for this combination.
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             let lateral;
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             let mut acc = acc;
-            #[cfg(feature = "json")]
+            #[cfg(any(feature = "json", feature = "vtab"))]
             let rows = if sp.tvf & crate::query::TVF_LATERAL != 0 {
                 match self.lateral_rows(sources, idx, filter, &acc).await? {
                     Some(r) => {
@@ -12980,7 +13425,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -13054,7 +13499,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         .await?;
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -13121,7 +13566,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -13150,8 +13595,26 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Delete { returning, .. } => returning.len(),
             #[cfg(feature = "triggers")]
             Plan::Instead(ip) => ip.returning_width(),
+            #[cfg(feature = "explain")]
+            Plan::Explain(_) => 4,
+            #[cfg(feature = "fts5")]
+            Plan::Vtab(v) => match &**v {
+                vtab::VtPlan::Fts5Write(w) => w.returning.len(),
+                _ => 0,
+            },
             _ => 0,
         }
+    }
+
+    /// The pin's `sqlite3_stmt_isexplain`: 2 for an `EXPLAIN QUERY
+    /// PLAN` statement (v0.16, `explain`), whose four result columns
+    /// are `id`, `parent`, `notused` and `detail`; 0 otherwise.
+    pub fn is_explain(&self) -> u8 {
+        #[cfg(feature = "explain")]
+        if matches!(self.plan, Plan::Explain(_)) {
+            return 2;
+        }
+        0
     }
 
     /// The current row's value at `i` (valid until the next `step`).
@@ -13562,6 +14025,60 @@ fn run_compound(
     rows.as_mut_slice()
         .sort_by(|a, b| compound_order_cmp(a, b, order, enc));
     rows
+}
+
+/// The merge key a compound member is read for (v0.16,
+/// `expr_index`; `Connection::merge_core`): `(result column, DESC,
+/// NULLS FIRST)` terms, then (when the flag says so) every other
+/// column ascending.
+#[cfg(all(feature = "expr_index", feature = "v09"))]
+type MergeSpec = (AVec<(usize, bool, bool)>, bool);
+
+/// The merge key core `k` (0: the head) of compound `stmt` is merged
+/// by (see `run_compound`), as the pin's `multiSelectOrderBy` keys
+/// its members: without an ORDER BY, every column of a core at or
+/// left of the last operator other than UNION ALL; under an ORDER BY
+/// of result-column numbers, those columns, then the others unless
+/// the last operator is UNION ALL. `None`: not merged, or an ORDER
+/// BY by name or expression (planned without a key).
+#[cfg(all(feature = "expr_index", feature = "v09"))]
+fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
+    use crate::sql::CompoundOp::{Union, UnionAll};
+    if stmt.order_by.is_empty() {
+        // The first-row shortcut reads the members as UNION ALL
+        // ones, each in its own order (`union_first_row`; v0.16
+        // review fix: the left-most member's first row was the
+        // merge key's, not the pin's).
+        let one = match stmt.limit.as_deref() {
+            None => stmt.first_row,
+            Some(Expr::Literal(crate::sql::Literal::Integer(1))) => !stmt.first_row,
+            Some(_) => false,
+        };
+        if one && stmt.offset.is_none() && stmt.compound.iter().all(|(op, _)| *op == Union) {
+            return None;
+        }
+        return stmt
+            .compound
+            .iter()
+            .rposition(|(op, _)| *op != UnionAll)
+            .filter(|l| k <= l + 1)
+            .map(|_| (AVec::new(), true));
+    }
+    let mut terms = AVec::new();
+    for (e, o) in stmt.order_by.iter() {
+        match e {
+            Expr::Literal(crate::sql::Literal::Integer(n)) if *n >= 1 => {
+                terms.push((usize::try_from(*n - 1).ok()?, o.desc, o.nulls_first));
+            }
+            _ => return None,
+        }
+    }
+    let rest = stmt
+        .compound
+        .as_slice()
+        .last()
+        .is_some_and(|(op, _)| *op != UnionAll);
+    Some((terms, rest))
 }
 
 /// The pin's UNION-with-LIMIT-1 shortcut (3.54.0: "UNION queries

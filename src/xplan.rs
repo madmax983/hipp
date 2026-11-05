@@ -807,6 +807,11 @@ pub struct Query<'x> {
     /// A constant LIMIT, as a LogEst.
     pub limit: Option<i32>,
     pub distinct: bool,
+    /// A DISTINCT's result columns when `order` is an ORDER BY
+    /// (v0.16, `explain`): whether the chosen loop also brings equal
+    /// rows together is what EXPLAIN QUERY PLAN reports.
+    #[cfg(feature = "explain")]
+    pub dset: &'x [(RExpr, SortOrder)],
 }
 
 /// The table being planned.
@@ -822,6 +827,11 @@ pub struct Table<'x> {
     /// named index (its full scan always a candidate, as the pin's
     /// `isIndexedBy`), or only the table itself.
     pub hint: crate::query::Hint,
+    /// Per table column: never NULL (NOT NULL, the INTEGER PRIMARY
+    /// KEY, a WITHOUT ROWID table's PRIMARY KEY columns). The pin
+    /// offers no `x IS NULL` term to such a key column
+    /// (`indexColumnNotNull`; v0.16 fix).
+    pub notnull: &'x [bool],
 }
 
 /// How an executor reads one probe set.
@@ -875,6 +885,15 @@ pub struct IdxAccess {
     /// `(key field, nulls_first)` — each probe's rows with a NULL in
     /// that key field move to the front (or back), in scan order.
     pub bignull: Option<(usize, bool)>,
+    /// What EXPLAIN QUERY PLAN says of the loop (v0.16, `explain`):
+    /// how many ORDER BY (or GROUP BY / DISTINCT) terms it delivers,
+    /// whether its index covers the statement's columns, whether its
+    /// lower bound is the pin's virtual `x > NULL` of an `x IS NOT
+    /// NULL` term (printed `x>?`, though it bounds nothing), and
+    /// whether it brings a DISTINCT's equal rows together
+    /// (`Query::dset`).
+    #[cfg(feature = "explain")]
+    pub eqp: (usize, bool, bool, bool),
 }
 
 /// The pin's `whereSortingCost`.
@@ -960,7 +979,10 @@ fn order_sat(
     let mut cols: AVec<(Ord<'_>, bool)> = AVec::new();
     match ix {
         None => {
-            if l.eq.is_empty() {
+            // A rowid IN list is probed in sorted order (v0.16 fix,
+            // as the pin's: `rowid IN (...) ORDER BY rowid` sorts
+            // nothing).
+            if l.eq.iter().all(|t| is_in(ts, *t)) {
                 cols.push((Ord::Rowid, false));
             }
         }
@@ -991,6 +1013,51 @@ fn order_sat(
         ts.iter()
             .any(|t| matches!(t.op, TOp::Eq | TOp::Is) && !t.lateral && same_expr(&t.key, e))
     };
+    // A GROUP BY or DISTINCT takes its terms in any order: each key
+    // column the loop delivers may satisfy any term not yet
+    // satisfied (the pin's `wherePathSatisfiesOrderBy` without
+    // `bOnce`; v0.16 fix: `GROUP BY a, b` over an index on (b, a)
+    // was sorted, the groups in another order than the pin's).
+    if q.group {
+        let mut done: AVec<bool> = AVec::new();
+        for (e, _) in q.order.iter() {
+            done.push(constant(strip(e)));
+        }
+        for (c, k) in cols.iter() {
+            if *k {
+                continue;
+            }
+            let hit = |e: &RExpr, o: &SortOrder| match c {
+                Ord::End => false,
+                Ord::Rowid => s.is_rowid(e),
+                Ord::Key(k, ko) => {
+                    ko.coll == o.coll
+                        && match k {
+                            IdxKey::Col(x) => s.is_col(e, *x),
+                            IdxKey::Rowid => s.is_rowid(e),
+                            IdxKey::Expr(x) => same_expr(e, x),
+                        }
+                }
+            };
+            if matches!(c, Ord::End) {
+                return (n, false, None);
+            }
+            let Some(i) = q.order.iter().enumerate().position(|(i, (e, o))| {
+                !done.as_slice().get(i).copied().unwrap_or(true) && hit(strip(e), o)
+            }) else {
+                break;
+            };
+            if let Some(d) = done.as_mut_slice().get_mut(i) {
+                *d = true;
+            }
+            // Past the rowid every later term is tie-free.
+            if matches!(c, Ord::Rowid) {
+                return (n, false, None);
+            }
+        }
+        let sat = done.iter().take_while(|d| **d).count();
+        return (sat, false, None);
+    }
     let mut next = 0usize;
     let mut rev: Option<bool> = None;
     let mut sat = 0usize;
@@ -1269,12 +1336,67 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
     }
     let mut a = lower(s, tab, ts, &l, reverse);
     a.groups = groups;
+    #[cfg(feature = "explain")]
+    if !q.dset.is_empty() {
+        let d = Query {
+            conj: q.conj,
+            order: q.dset,
+            group: true,
+            group_by: false,
+            ncols_out: q.ncols_out,
+            needed: q.needed,
+            cover_scan: q.cover_scan,
+            limit: q.limit,
+            distinct: q.distinct,
+            dset: &[],
+        };
+        a.eqp.3 = order_sat(&d, s, tab, ts, &l, false).0 >= q.dset.len();
+    }
     // The NULL-keyed rows' column: the first after the equality ones
     // (never the rowid, which is not NULL).
     if l.ix.is_some() && l.eq.len() < a.desc.len() {
         a.bignull = l.bignull.map(|f| (l.eq.len(), f));
     }
     Some(a)
+}
+
+/// What a table read in its own order delivers (v0.16, `explain`):
+/// how many of `q.order` (and whether `q.dset`'s DISTINCT rows come
+/// together) — the rowid B-tree, or a WITHOUT ROWID table's clustered
+/// index, read forward in full, the loop `choose` leaves as no access
+/// path.
+#[cfg(feature = "explain")]
+pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usize, bool) {
+    let l = Loop {
+        ix: if tab.wr {
+            tab.indexes.iter().position(|m| m.covers_all)
+        } else {
+            None
+        },
+        eq: AVec::new(),
+        lo: None,
+        hi: None,
+        run: 0,
+        out: 0,
+        sorted: 0,
+        reverse: false,
+        bignull: None,
+    };
+    let (sat, rev, _) = order_sat(q, s, tab, ts, &l, false);
+    let d = Query {
+        conj: q.conj,
+        order: q.dset,
+        group: true,
+        group_by: false,
+        ncols_out: q.ncols_out,
+        needed: q.needed,
+        cover_scan: q.cover_scan,
+        limit: q.limit,
+        distinct: q.distinct,
+        dset: &[],
+    };
+    let dis = !q.dset.is_empty() && order_sat(&d, s, tab, ts, &l, false).0 >= q.dset.len();
+    (if rev { 0 } else { sat }, dis)
 }
 
 /// The pin's `whereLoopInsert` over a WITHOUT ROWID table's loops,
@@ -1377,11 +1499,21 @@ fn add_index(
         None => 1,
     };
     let matches = |k: usize, t: &Term| -> bool {
+        if t.isnull
+            && let Some(Some(IdxKey::Col(c))) = ix
+                .and_then(|i| tab.indexes.get(i))
+                .map(|m| m.keys.as_slice().get(k))
+            && tab.notnull.get(*c).copied().unwrap_or(false)
+        {
+            return false;
+        }
         match ix.and_then(|i| tab.indexes.get(i)) {
-            None => k == 0 && s.is_rowid(&t.key),
+            // (A rowid is never NULL: the pin offers no `IS NULL`
+            // term to it.)
+            None => k == 0 && !t.isnull && s.is_rowid(&t.key),
             Some(m) => {
                 if k == m.keys.len() {
-                    s.is_rowid(&t.key)
+                    !t.isnull && s.is_rowid(&t.key)
                 } else {
                     m.key_matches(k, s, t)
                 }
@@ -1580,6 +1712,13 @@ fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxA
         groups: false,
         cover: None,
         bignull: None,
+        #[cfg(feature = "explain")]
+        eqp: (
+            l.sorted,
+            false,
+            l.lo.and_then(|i| ts.get(i)).is_some_and(|t| t.vnull),
+            false,
+        ),
     }
 }
 

@@ -56,6 +56,11 @@ pub(super) enum Prag {
     PageSize,
     QuickCheck,
     RecursiveTriggers,
+    /// `writable_schema` (v0.16 review fix, `vtab`): while on, a
+    /// `.dump`'s virtual-table schema rows and shadow-table rows
+    /// replay (see `Connection::plan_schema_insert`).
+    #[cfg(feature = "vtab")]
+    WritableSchema,
     SchemaVersion,
     Synchronous,
     TableInfo,
@@ -102,6 +107,8 @@ const PRAGMAS: &[(&str, Prag)] = &[
     ("table_list", Prag::TableList),
     ("table_xinfo", Prag::TableXinfo),
     ("user_version", Prag::UserVersion),
+    #[cfg(feature = "vtab")]
+    ("writable_schema", Prag::WritableSchema),
     #[cfg(feature = "wal")]
     ("wal_autocheckpoint", Prag::WalAutocheckpoint),
     #[cfg(feature = "wal")]
@@ -179,6 +186,10 @@ impl Prag {
         // `PRAGMA temp.encoding = 'UTF-16be'` sets it).
         #[cfg(feature = "utf16")]
         if self == Prag::Encoding {
+            return true;
+        }
+        #[cfg(feature = "vtab")]
+        if self == Prag::WritableSchema {
             return true;
         }
         matches!(
@@ -302,6 +313,9 @@ pub(super) struct PragState {
     pub foreign_keys: bool,
     pub recursive_triggers: bool,
     pub ignore_checks: bool,
+    /// `PRAGMA writable_schema` (v0.16 review fix, `vtab`).
+    #[cfg(feature = "vtab")]
+    pub writable_schema: bool,
     pub busy_timeout: i32,
     /// `case_sensitive_like` has been set (to any value) on this
     /// connection: LIKE is then non-deterministic, as on the pin
@@ -606,6 +620,9 @@ fn scratch() -> Arena {
 enum Obj<'x> {
     Table(&'x crate::schema::TableDef),
     View(&'x crate::schema::ViewDef),
+    /// A virtual table (v0.16, `vtab`).
+    #[cfg(feature = "vtab")]
+    Vtab(&'x crate::schema::VtabDef),
     Schema,
 }
 
@@ -705,6 +722,11 @@ impl<S: Storage> Connection<S> {
                 out.push(Obj::Table(t));
             } else if let Some(v) = self.catalog.find_view(ca, n) {
                 out.push(Obj::View(v));
+            } else {
+                #[cfg(feature = "vtab")]
+                if let Some(v) = self.catalog.find_vtab(ca, n) {
+                    out.push(Obj::Vtab(v));
+                }
             }
         }
         out.push(Obj::Schema);
@@ -782,6 +804,8 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "foreign_keys")]
             Prag::ForeignKeyCheck => return Err(Error::Unsupported),
             Prag::RecursiveTriggers => row1(int(i64::from(self.prag.recursive_triggers))),
+            #[cfg(feature = "vtab")]
+            Prag::WritableSchema => row1(int(i64::from(self.prag.writable_schema))),
             Prag::IgnoreCheckConstraints => row1(int(i64::from(self.prag.ignore_checks))),
             Prag::CaseSensitiveLike => AVec::new(),
             Prag::CollationList => {
@@ -849,7 +873,23 @@ impl<S: Storage> Connection<S> {
                     ) = match o {
                         Obj::Table(t) => {
                             let n = handle_bytes(ca, t.name);
-                            (n, n, b"table", t.columns.len(), t.strict, !t.has_rowid())
+                            // A virtual table's shadow table (v0.16,
+                            // `vtab`).
+                            #[cfg(feature = "vtab")]
+                            let ty: &[u8] = if self.catalog.is_shadow(ca, n) {
+                                b"shadow"
+                            } else {
+                                b"table"
+                            };
+                            #[cfg(not(feature = "vtab"))]
+                            let ty: &[u8] = b"table";
+                            (n, n, ty, t.columns.len(), t.strict, !t.has_rowid())
+                        }
+                        #[cfg(feature = "vtab")]
+                        Obj::Vtab(v) => {
+                            let n = handle_bytes(ca, v.name);
+                            let ncol = v.tab.as_ref().map_or(0, |t| t.cols.len());
+                            (n, n, b"virtual", ncol, false, false)
                         }
                         Obj::View(v) => {
                             // The planned columns (v0.16 fix: the
@@ -986,6 +1026,32 @@ impl<S: Storage> Connection<S> {
                 }
                 push_row(&mut rows, &r[..if x { 7 } else { 6 }]);
             }
+            return Ok(rows);
+        }
+        // A virtual table's declared columns (v0.16, `vtab`): HIDDEN
+        // ones only in table_xinfo.
+        #[cfg(feature = "vtab")]
+        if let Some(found) = self.vtab_named(name) {
+            let (tab, _) = found?;
+            let mut cid = 0i64;
+            for c in tab.cols.iter() {
+                if c.hidden && !x {
+                    continue;
+                }
+                let mut r = AVec::new();
+                r.push(int(cid));
+                r.push(text(c.name.as_slice()));
+                r.push(text(c.decl));
+                r.push(int(0));
+                r.push(OwnedValue::Null);
+                r.push(int(0));
+                if x {
+                    r.push(int(i64::from(c.hidden)));
+                }
+                push_row(&mut rows, r.as_slice());
+                cid += 1;
+            }
+            let _ = arena;
             return Ok(rows);
         }
         if let Some(t) = self.catalog.find(ca, name) {
@@ -1137,7 +1203,7 @@ impl<S: Storage> Connection<S> {
                     if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
                         // A table-valued function's columns have no
                         // declared type (v0.16, `json`).
-                        #[cfg(feature = "json")]
+                        #[cfg(any(feature = "json", feature = "vtab"))]
                         if sp.tvf != 0 {
                             return None;
                         }
@@ -1770,7 +1836,7 @@ fn item_aff(plan: &crate::query::SubPlan, e: &RExpr) -> Option<Affinity> {
             let mut base = 0usize;
             for sp in plan.sources.iter() {
                 if let Some(k) = slot.checked_sub(base).filter(|k| *k < sp.ncols) {
-                    #[cfg(feature = "json")]
+                    #[cfg(any(feature = "json", feature = "vtab"))]
                     if sp.tvf != 0 {
                         return None;
                     }
@@ -1868,7 +1934,7 @@ impl<S: Storage> Statement<'_, S> {
             return Ok(AVec::new());
         }
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(AVec::new())
     }
@@ -1905,7 +1971,7 @@ impl<S: Storage> Statement<'_, S> {
             };
             let steps = crate::autovac::incremental(&mut self.conn.pager, limit).await?;
             if self.conn.pager.in_txn() && !self.conn.explicit_txn {
-                self.conn.pager.drive_commit().await?;
+                auto_commit!(self.conn)?;
             }
             let mut rows: Rows = AVec::new();
             for _ in 0..steps {
@@ -1928,7 +1994,7 @@ impl<S: Storage> Statement<'_, S> {
                     .set_header_u32(off, atoi(arg) as u32)
                     .await?;
                 if !self.conn.explicit_txn {
-                    self.conn.pager.drive_commit().await?;
+                    auto_commit!(self.conn)?;
                 }
                 Ok(AVec::new())
             }
@@ -2108,6 +2174,11 @@ impl<S: Storage> Statement<'_, S> {
                 self.conn.prag.recursive_triggers = boolean(arg);
                 Ok(AVec::new())
             }
+            #[cfg(feature = "vtab")]
+            Prag::WritableSchema => {
+                self.conn.prag.writable_schema = boolean(arg);
+                Ok(AVec::new())
+            }
             #[cfg(feature = "foreign_keys")]
             Prag::DeferForeignKeys => {
                 self.conn.fk.defer = boolean(arg);
@@ -2203,6 +2274,8 @@ impl<S: Storage> Statement<'_, S> {
                     Obj::Table(t) => (handle_bytes(ca, t.name), t.root),
                     Obj::Schema => (b"sqlite_master", 1),
                     Obj::View(_) => continue,
+                    #[cfg(feature = "vtab")]
+                    Obj::Vtab(_) => continue,
                 };
                 if let Some(o) = &only
                     && !(eq_ci(o.as_slice(), name)
