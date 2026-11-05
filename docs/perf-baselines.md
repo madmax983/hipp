@@ -57,3 +57,34 @@ cell, although the parsed leaf cells are never used afterwards.
 | 2000 | 8,674,819,320 | 8,022,700,508 | -7.5%   |
 
 Full no_std size gate: 256,353 B (ratchet 256,465 B); tiny unchanged at 81,680 B.
+
+## IndexCursor::seek_found decodes every cell on the descent (baseline at da5922d)
+
+`seek_found` copies each page on the root-to-leaf path and decodes
+every cell into an owned `IndexEntry` (several allocations per cell),
+then binary-searches the decoded entries: O(cells per page) work and
+allocations per level for an O(log) search. The join probe
+(`SELECT t.id FROM t JOIN u ON u.t_id = t.id`) and index point lookups
+go through it once per outer row.
+
+| n    | total Ir      | seek_found inclusive Ir |
+|------|---------------|-------------------------|
+| 500  | 948,492,506   | 368,768,027 (38.9%)     |
+| 1000 | 2,365,103,763 | 1,036,197,347 (43.8%)   |
+| 2000 | 5,255,054,649 | 2,125,990,952 (40.5%)   |
+
+### After: lazy per-page entries in IndexCursor (decode only visited cells)
+
+Cursor frames keep the page image and decode a cell on first use
+(binary search visits O(log cells) per page; iteration decodes what it
+yields). Workload output (checksum) is identical before/after.
+
+| n    | total before  | total after   | Δ total | seek_found before | seek_found after |
+|------|---------------|---------------|---------|-------------------|------------------|
+| 500  | 948,492,506   | 551,845,699   | -41.8%  | 368,768,027       | 17,216,698 (3.1%)  |
+| 1000 | 2,365,103,763 | 1,267,512,629 | -46.4%  | 1,036,197,347     | 38,821,008 (3.1%)  |
+| 2000 | 5,255,054,649 | 2,895,279,141 | -44.9%  | 2,125,990,952     | 85,679,128 (3.0%)  |
+
+Size gates: tiny unchanged (`indexes` not in tiny); full 500,200 -> 500,944 B
+(+744), max 815,792 -> 816,576 B (+784); ratchets raised by those amounts
+(each well under `justify_over`).

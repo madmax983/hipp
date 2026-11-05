@@ -16,14 +16,14 @@
    | profile | build | ratchet | budget | headroom |
    |---|---|---|---|---|
    | `tiny` | `--no-default-features` | 76,960 B | 131,072 B | 54,112 B |
-   | `full` | `--features full` | 500,200 B | 524,288 B | 24,088 B |
-   | `max` | `--features max` | 1,034,772 B | 1,048,576 B | 13,804 B |
+   | `full` | `--features full` | 500,952 B | 524,288 B | 23,336 B |
+   | `max` | `--features max` | 1,035,516 B | 1,048,576 B | 13,060 B |
 
    Engine statics stay 0 B in every profile (budget 8 KiB).
 
 2. **`full`** = `indexes`, `v04` … `v10`, `v16`, `params`, `math`: the
    core dialect an embedded target with half a megabyte gets. It is
-   closed to new leaves at this release: 24 KiB of headroom is kept
+   closed to new leaves at this release: about 23 KiB of headroom is kept
    for fixes to claimed paths.
 
 3. **`max`** = `full` + `window`, `triggers`, `foreign_keys`, `json`,
@@ -32,7 +32,7 @@
    `default = ["std", "max"]`. Each leaf compiles alone on its own
    `ci/feature-sets.txt` line with only its declared dependencies.
 
-4. **The next leaf that does not fit `max`'s remaining 13 KiB gets
+4. **The next leaf that does not fit `max`'s remaining 12 KiB gets
    its own alias outside `max`** (an ADR names it and its budget);
    `max` is not raised past 1 MiB without one. A leaf may move from
    `max` into `full` only with a `full` budget decision.

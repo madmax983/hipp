@@ -16,8 +16,8 @@ leaves). Every item is differential-tested against the live pin.
 | profile | features | thumbv7em size | budget |
 |---|---|---|---|
 | tiny | `--no-default-features` | 76,960 B | 128 KiB |
-| full | `full`: every rung + `params`, `math` | 500,200 B | 512 KiB |
-| max | `max` = `full` + the leaves below | 1,034,772 B | 1 MiB |
+| full | `full`: every rung + `params`, `math` | 500,952 B | 512 KiB |
+| max | `max` = `full` + the leaves below | 1,035,516 B | 1 MiB |
 
 `default = ["std", "max"]`, so the CLI and the tests build everything.
 

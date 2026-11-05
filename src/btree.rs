@@ -3832,29 +3832,122 @@ fn cmp_entry_probe(
     Ordering::Equal
 }
 
-/// The pin's per-page binary search (`sqlite3BtreeIndexMoveto`):
-/// probe the middle cell, halve, stop on an equal entry. Returns
-/// the equal entry's index and `true`, or the lower bound the
-/// search ended at (`lwr`: on an ordered page, the first entry
-/// greater than `probe`) and `false`.
+/// One index page held by a cursor: the page image plus entries
+/// decoded on first use, so a seek decodes only the cells its
+/// binary search visits and a scan decodes only what it yields.
 #[cfg(feature = "indexes")]
-fn bin_search(
-    entries: &[IndexEntry],
-    probe: &[KeyPart],
-    desc: &[KeyOrder],
-    enc: crate::record::TextEnc,
-) -> (usize, bool) {
-    let (mut lo, mut hi) = (0usize, entries.len());
-    while lo < hi {
-        let mid = lo + (hi - 1 - lo) / 2;
-        let Some(e) = entries.get(mid) else { break };
-        match cmp_entry_probe(e.values.as_slice(), probe, desc, enc) {
-            core::cmp::Ordering::Less => lo = mid + 1,
-            core::cmp::Ordering::Greater => hi = mid,
-            core::cmp::Ordering::Equal => return (mid, true),
+struct LazyPage {
+    snap: AVec<u8>,
+    page: u32,
+    interior: bool,
+    ncell: usize,
+    rightmost: u32,
+    slots: AVec<Option<IndexEntry>>,
+}
+
+#[cfg(feature = "indexes")]
+impl LazyPage {
+    fn new<E>(snap: AVec<u8>, page: u32, interior: bool) -> Result<LazyPage, E> {
+        let h = head::<E>(snap.as_slice(), page)?;
+        let ncell = usize::from(h.ncell);
+        let mut slots = AVec::with_capacity(ncell);
+        for _ in 0..ncell {
+            slots.push(None);
+        }
+        Ok(LazyPage {
+            snap,
+            page,
+            interior,
+            ncell,
+            rightmost: h.rightmost,
+            slots,
+        })
+    }
+
+    /// Decode entry `i` if it is not yet.
+    async fn fill<S: Storage>(
+        &mut self,
+        pager: &mut Pager<S>,
+        nfields: usize,
+        i: usize,
+    ) -> Result<(), S::Error> {
+        if matches!(self.slots.as_slice().get(i), Some(Some(_))) {
+            return Ok(());
+        }
+        let usable = pager.usable() as usize;
+        let h = head::<S::Error>(self.snap.as_slice(), self.page)?;
+        let ptr = cell_ptr::<S::Error>(self.snap.as_slice(), &h, i, self.page)?;
+        let cell = parse_index_cell::<S::Error>(
+            self.snap.as_slice(),
+            ptr,
+            usable,
+            self.page,
+            self.interior,
+        )?;
+        let p = index_cell_payload(pager, &cell).await?;
+        let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+        let slot = self
+            .slots
+            .as_mut_slice()
+            .get_mut(i)
+            .ok_or(Error::CorruptPage { page: self.page })?;
+        *slot = Some(e);
+        Ok(())
+    }
+
+    /// Entry `i`, decoded.
+    async fn entry<S: Storage>(
+        &mut self,
+        pager: &mut Pager<S>,
+        nfields: usize,
+        i: usize,
+    ) -> Result<&IndexEntry, S::Error> {
+        self.fill(pager, nfields, i).await?;
+        match self.slots.as_slice().get(i) {
+            Some(Some(e)) => Ok(e),
+            _ => Err(Error::CorruptPage { page: self.page }),
         }
     }
-    (lo, false)
+
+    /// Child `i` of an interior page (`ncell` is the rightmost).
+    fn child<E>(&self, i: usize) -> Result<u32, E> {
+        if i == self.ncell {
+            return Ok(self.rightmost);
+        }
+        let h = head::<E>(self.snap.as_slice(), self.page)?;
+        let ptr = cell_ptr::<E>(self.snap.as_slice(), &h, i, self.page)?;
+        if ptr + 4 > self.snap.len() {
+            return Err(Error::CorruptPage { page: self.page });
+        }
+        Ok(be_u32(self.snap.as_slice(), ptr))
+    }
+
+    /// The pin's per-page binary search (`sqlite3BtreeIndexMoveto`):
+    /// probe the middle cell, halve, stop on an equal entry. Returns
+    /// the equal entry's index and `true`, or the lower bound the
+    /// search ended at (`lwr`: on an ordered page, the first entry
+    /// greater than `probe`) and `false`.
+    /// Only the entries the search compares are decoded.
+    async fn search<S: Storage>(
+        &mut self,
+        pager: &mut Pager<S>,
+        nfields: usize,
+        probe: &[KeyPart],
+        desc: &[KeyOrder],
+    ) -> Result<(usize, bool), S::Error> {
+        let (mut lo, mut hi) = (0usize, self.ncell);
+        while lo < hi {
+            let mid = lo + (hi - 1 - lo) / 2;
+            let enc = pager.text_enc();
+            let e = self.entry(pager, nfields, mid).await?;
+            match cmp_entry_probe(e.values.as_slice(), probe, desc, enc) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return Ok((mid, true)),
+            }
+        }
+        Ok((lo, false))
+    }
 }
 
 #[cfg(feature = "indexes")]
@@ -3863,15 +3956,14 @@ enum IdxFrame {
         page: u32,
     },
     Leaf {
-        entries: AVec<IndexEntry>,
+        page: LazyPage,
         next: usize,
     },
     Interior {
-        entries: AVec<IndexEntry>,
-        children: AVec<u32>,
-        /// Next action: even seq = descend children[seq/2] (the
-        /// rightmost child is at seq == 2*entries.len()), odd seq
-        /// = yield entries[(seq-1)/2]; past the end = frame done.
+        page: LazyPage,
+        /// Next action: even seq = descend child seq/2 (the
+        /// rightmost child is at seq == 2*ncell), odd seq
+        /// = yield entry (seq-1)/2; past the end = frame done.
         seq: usize,
     },
 }
@@ -3949,7 +4041,7 @@ impl IndexCursor {
     /// `seek`, plus whether the descent met an entry equal to
     /// `probe` — the pin's `sqlite3BtreeIndexMoveto` result (v0.16:
     /// each page is searched by the pin's binary search,
-    /// `bin_search`, so a page whose keys are out of order, in a
+    /// `LazyPage::search`, so a page whose keys are out of order, in a
     /// damaged file, is searched as the pin searches it). When
     /// found, the cursor yields that entry next.
     pub async fn seek_found<S: Storage>(
@@ -3958,7 +4050,6 @@ impl IndexCursor {
         desc: &[KeyOrder],
         probe: &[KeyPart],
     ) -> Result<(IndexCursor, bool), S::Error> {
-        let usable = pager.usable() as usize;
         let nfields = entry_fields(pager, root, desc);
         let mut cur = IndexCursor::with_fields(root, desc, nfields);
         cur.stack.clear();
@@ -3971,39 +4062,27 @@ impl IndexCursor {
                 if h.kind != KIND_LEAF_INDEX {
                     return Err(Error::Unsupported);
                 }
-                let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
-                let mut entries = AVec::new();
-                for c in cells.iter() {
-                    let p = index_cell_payload(pager, c).await?;
-                    entries.push(decode_index_entry::<S::Error>(p.as_slice(), nfields)?);
-                }
-                let (pos, found) = bin_search(entries.as_slice(), probe, desc, pager.text_enc());
-                cur.stack.push(IdxFrame::Leaf { entries, next: pos });
+                let mut lp = LazyPage::new::<S::Error>(snap, page, false)?;
+                let (pos, found) = lp.search(pager, nfields, probe, desc).await?;
+                cur.stack.push(IdxFrame::Leaf {
+                    page: lp,
+                    next: pos,
+                });
                 return Ok((cur, found));
             }
             if h.kind != KIND_INTERIOR_INDEX {
                 return Err(Error::Unsupported);
             }
-            let (cells, rightmost) =
-                index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
-            let mut entries = AVec::new();
-            let mut children = AVec::new();
-            for c in cells.iter() {
-                children.push(c.child);
-                let p = index_cell_payload(pager, c).await?;
-                entries.push(decode_index_entry::<S::Error>(p.as_slice(), nfields)?);
-            }
-            children.push(rightmost);
+            let mut lp = LazyPage::new::<S::Error>(snap, page, true)?;
             // First divider >= probe (Equal only for a full-key
             // probe: prefix probes pad with Min and can never be
             // Equal to a real entry).
-            let (i, equal) = bin_search(entries.as_slice(), probe, desc, pager.text_enc());
+            let (i, equal) = lp.search(pager, nfields, probe, desc).await?;
             if equal {
                 // The divider itself is the lower bound; yield it
                 // next, then continue with its right subtree.
                 cur.stack.push(IdxFrame::Interior {
-                    entries,
-                    children,
+                    page: lp,
                     seq: 2 * i + 1,
                 });
                 return Ok((cur, true));
@@ -4011,14 +4090,9 @@ impl IndexCursor {
             // Descend into child i; when it is exhausted this
             // frame yields divider i next (or is done, when i is
             // the rightmost child).
-            let next_page = children
-                .as_slice()
-                .get(i)
-                .copied()
-                .ok_or(Error::CorruptPage { page })?;
+            let next_page = lp.child::<S::Error>(i)?;
             cur.stack.push(IdxFrame::Interior {
-                entries,
-                children,
+                page: lp,
                 seq: 2 * i + 1,
             });
             page = next_page;
@@ -4030,7 +4104,6 @@ impl IndexCursor {
         pager: &mut Pager<S>,
         page: u32,
     ) -> Result<IdxFrame, S::Error> {
-        let usable = pager.usable() as usize;
         let idx = pager.load(page).await?;
         let snap = copy_bytes(pager.frame_data(idx));
         let h = head::<S::Error>(snap.as_slice(), page)?;
@@ -4038,29 +4111,16 @@ impl IndexCursor {
             if h.kind != KIND_LEAF_INDEX {
                 return Err(Error::Unsupported);
             }
-            let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
-            let mut entries = AVec::new();
-            for c in cells.iter() {
-                let p = index_cell_payload(pager, c).await?;
-                entries.push(decode_index_entry::<S::Error>(p.as_slice(), self.nfields)?);
-            }
-            return Ok(IdxFrame::Leaf { entries, next: 0 });
+            return Ok(IdxFrame::Leaf {
+                page: LazyPage::new::<S::Error>(snap, page, false)?,
+                next: 0,
+            });
         }
         if h.kind != KIND_INTERIOR_INDEX {
             return Err(Error::Unsupported);
         }
-        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
-        let mut entries = AVec::new();
-        let mut children = AVec::new();
-        for c in cells.iter() {
-            children.push(c.child);
-            let p = index_cell_payload(pager, c).await?;
-            entries.push(decode_index_entry::<S::Error>(p.as_slice(), self.nfields)?);
-        }
-        children.push(rightmost);
         Ok(IdxFrame::Interior {
-            entries,
-            children,
+            page: LazyPage::new::<S::Error>(snap, page, true)?,
             seq: 0,
         })
     }
@@ -4107,13 +4167,13 @@ impl IndexCursor {
                 }
                 Some(IdxFrame::Leaf { .. }) => {
                     let frame = self.stack.pop().expect("leaf frame");
-                    if let IdxFrame::Leaf { entries, next } = frame {
-                        if next >= entries.len() {
+                    if let IdxFrame::Leaf { mut page, next } = frame {
+                        if next >= page.ncell {
                             continue;
                         }
-                        let e = entries.as_slice()[next].clone();
+                        let e = page.entry(pager, self.nfields, next).await?.clone();
                         self.stack.push(IdxFrame::Leaf {
-                            entries,
+                            page,
                             next: next + 1,
                         });
                         return self.yield_entry(pager, e);
@@ -4122,31 +4182,20 @@ impl IndexCursor {
                 }
                 Some(IdxFrame::Interior { .. }) => {
                     let frame = self.stack.pop().expect("interior frame");
-                    if let IdxFrame::Interior {
-                        entries,
-                        children,
-                        seq,
-                    } = frame
-                    {
-                        let n = entries.len();
-                        if seq > 2 * n {
+                    if let IdxFrame::Interior { mut page, seq } = frame {
+                        if seq > 2 * page.ncell {
                             continue; // frame exhausted
                         }
                         if seq % 2 == 1 {
-                            let e = entries.as_slice()[(seq - 1) / 2].clone();
-                            self.stack.push(IdxFrame::Interior {
-                                entries,
-                                children,
-                                seq: seq + 1,
-                            });
+                            let e = page
+                                .entry(pager, self.nfields, (seq - 1) / 2)
+                                .await?
+                                .clone();
+                            self.stack.push(IdxFrame::Interior { page, seq: seq + 1 });
                             return self.yield_entry(pager, e);
                         }
-                        let child = children.as_slice()[seq / 2];
-                        self.stack.push(IdxFrame::Interior {
-                            entries,
-                            children,
-                            seq: seq + 1,
-                        });
+                        let child = page.child::<S::Error>(seq / 2)?;
+                        self.stack.push(IdxFrame::Interior { page, seq: seq + 1 });
                         self.stack.push(IdxFrame::Unresolved { page: child });
                     } else {
                         unreachable!()
@@ -4211,7 +4260,7 @@ pub async fn index_prefix_rowids<S: Storage>(
 /// `PRAGMA integrity_check`'s index probe for one row (v0.16,
 /// `v16`): whether the entry `key` + `rowid` is found by the pin's
 /// seek (`sqlite3BtreeIndexMoveto`: each page binary-searched, see
-/// `bin_search`), and — for a `unique` index — whether the entry
+/// `LazyPage::search`), and — for a `unique` index — whether the entry
 /// after it does not sort above `key` (the pin's `OP_Next` +
 /// `OP_IdxGT`: "non-unique entry"). Only the cells the search
 /// visits are decoded, as on the pin, so damage elsewhere on a

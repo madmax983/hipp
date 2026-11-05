@@ -7,10 +7,12 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
-(ADR 0003): tiny 76,960 B (budget 128 KiB), full 500,200 B (512
-KiB: every rung + `params`, `math`), max 1,034,772 B (1,022,404 B at
+(ADR 0003): tiny 76,960 B (budget 128 KiB), full 500,952 B (512
+KiB: every rung + `params`, `math`), max 1,035,516 B (1,022,404 B at
 the release, + 9,664 B of FTS5 review fixes, + 2,704 B of EXPLAIN
-QUERY PLAN review fixes; 1 MiB: full +
+QUERY PLAN review fixes, + 744 B from merging the lazy index-cursor
+decoding of `docs/perf-baselines.md`, which also took full from
+500,200 B; 1 MiB: full +
 `window`, `triggers`, `foreign_keys`, `json`, `expr_index`,
 `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
 `autovacuum`, `vtab`, `rtree`, `fts5`, `explain`). The last unit,
@@ -8407,7 +8409,10 @@ threshold.
 **Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**:
 the new field and checks are under `expr_index` / `explain`); max
 **1,034,772 B** (Δ **+2,704 B**, ratchet raised; 13,804 B of the 1
-MiB budget remain).
+MiB budget remain). Merging `main`'s lazy index-cursor decoding
+(`src/btree.rs`, `docs/perf-baselines.md`) then took full to
+**500,952 B** (+752 B) and max to **1,035,516 B** (+744 B; 13,060 B
+remain); both ratchets are set to those measured values.
 
 **Honest gaps:**
 
