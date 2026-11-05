@@ -30,6 +30,7 @@ v16,attach
 v16,autovacuum
 v16,vtab
 v16,vtab,rtree
+v16,vtab,without_rowid,math,fts5
 indexes,v04
 indexes,v05
 indexes,v06

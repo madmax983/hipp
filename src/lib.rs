@@ -24,6 +24,8 @@ pub mod btree;
 #[cfg(feature = "datetime")]
 pub mod datetime;
 pub mod error;
+#[cfg(feature = "fts5")]
+pub mod fts5;
 #[cfg(feature = "v16")]
 pub mod func;
 #[cfg(feature = "json")]

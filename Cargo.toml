@@ -15,7 +15,7 @@ default = ["std", "max"]
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
-max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach", "autovacuum", "vtab", "rtree"]
+max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach", "autovacuum", "vtab", "rtree", "fts5"]
 # Every dialect feature, without `std`: the full no_std profile
 # (what a target with room for the whole dialect builds; CI ratchets
 # its size alongside the tiny profile's). New feature rungs join here.
@@ -362,6 +362,22 @@ vtab = ["v16"]
 # (`src/rtree.rs`, `session::rtree`). MATCH (geometry callbacks) is
 # refused. Implies `vtab`. The tiny profile excludes it per Sec. 2.
 rtree = ["vtab"]
+# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): FTS5 full-text
+# search as the pin's fts5 module -- CREATE VIRTUAL TABLE ... USING
+# fts5(cols [UNINDEXED], prefix=, tokenize='unicode61 | ascii | porter
+# | trigram ...', content=, content_rowid=, columnsize=, detail=,
+# contentless_delete=) with the pin's shadow tables (%_data structure,
+# averages and segment b-trees, %_idx, %_content, %_docsize,
+# %_config) byte for byte, its pending-terms flushes, segment writer,
+# automerge / crisismerge / optimize / merge; the full-text query
+# language (phrases, prefix*, ^, NEAR, column filters, AND / OR / NOT)
+# through MATCH and `t = '...'`, rank and ORDER BY rank, bm25(),
+# highlight(), snippet(), fts5vocab tables, the special INSERT
+# commands and integrity-check (`src/fts5/`, `session::fts5`). Its
+# shadow tables %_idx / %_config are WITHOUT ROWID and bm25() needs
+# the in-crate log(), so it implies `vtab`, `without_rowid` and
+# `math`. The tiny profile excludes it per Sec. 2.
+fts5 = ["vtab", "without_rowid", "math"]
 
 [dependencies]
 

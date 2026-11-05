@@ -1736,6 +1736,18 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
+        // A string-literal name (v0.16, `fts5`): the pin's `nm` takes
+        // one, and fts5 writes its shadow tables' text that way
+        // (`CREATE TABLE 't_data'(...)`).
+        #[cfg(feature = "fts5")]
+        let name = match self.cur().tok {
+            Tok::Text(h) => {
+                self.pos += 1;
+                h
+            }
+            _ => self.name::<E>()?,
+        };
+        #[cfg(not(feature = "fts5"))]
         let name = self.name::<E>()?;
         // CREATE TABLE ... AS SELECT (v0.16, `v16`): the columns
         // come from the SELECT at plan time.
@@ -3137,6 +3149,7 @@ impl<'a> Parser<'a> {
                         || self.is_kw(n, b"BETWEEN")
                         || (cfg!(feature = "v16")
                             && (self.is_kw(n, b"GLOB") || self.is_kw(n, b"NULL")))
+                        || (cfg!(feature = "fts5") && self.is_kw(n, b"MATCH"))
                     {
                         BP_EQ
                     } else {
@@ -3153,6 +3166,7 @@ impl<'a> Parser<'a> {
                 .iter()
                 .any(|k| eq_ci(b, k))
                     || (cfg!(feature = "v16") && eq_ci(b, b"GLOB"))
+                    || (cfg!(feature = "fts5") && eq_ci(b, b"MATCH"))
                 {
                     BP_EQ
                 } else if cfg!(feature = "v16") && eq_ci(b, b"COLLATE") {
@@ -3361,6 +3375,15 @@ impl<'a> Parser<'a> {
             self.node::<E>(lh, lk)?;
             self.negated::<E>(neg)?;
             return self.pattern_call::<E>(b"glob", r, l, None, neg);
+        }
+        // `x [NOT] MATCH q` (v0.16, `fts5`): the pin's `match(q, x)`
+        // call, which only a full-text table's constraint consumes.
+        #[cfg(feature = "fts5")]
+        if self.eat_kw(b"MATCH") {
+            let r = self.operand::<E>(2, BP_REL)?;
+            self.node::<E>(lh, lk)?;
+            self.negated::<E>(neg)?;
+            return self.pattern_call::<E>(b"match", r, l, None, neg);
         }
         if self.eat_kw(b"BETWEEN") {
             // The lower bound runs to the BETWEEN's own AND; the
@@ -6967,7 +6990,7 @@ pub fn parse_trigger_step_tokens<E>(
 /// `SELECT *[, extra ...] FROM table [AS alias] [WHERE filter]` as an
 /// AST (v0.16, `triggers`): the rows an UPDATE / DELETE of a view
 /// hands its INSTEAD OF triggers.
-#[cfg(any(feature = "triggers", feature = "rtree"))]
+#[cfg(any(feature = "triggers", feature = "rtree", feature = "fts5"))]
 pub fn star_select(
     table: ABytes,
     alias: Option<ABytes>,

@@ -44,13 +44,16 @@ pub(super) enum VtPlan {
     Noop,
     /// DROP TABLE of a virtual table.
     Drop { name: AVec<u8>, tab: Option<VTab> },
-    /// ALTER TABLE ... RENAME TO of an R*Tree (with its shadow
-    /// tables, the pin's xRename).
-    #[cfg(feature = "rtree")]
+    /// ALTER TABLE ... RENAME TO of an R*Tree or fts5 table (with
+    /// its shadow tables, the pin's xRename).
+    #[cfg(any(feature = "rtree", feature = "fts5"))]
     Rename { old: AVec<u8>, new: AVec<u8> },
     /// INSERT / UPDATE / DELETE of a writable virtual table.
     #[cfg(feature = "rtree")]
     Write(Box<super::rtree::RtWrite>),
+    /// INSERT / UPDATE / DELETE of an fts5 table (leaf `fts5`).
+    #[cfg(feature = "fts5")]
+    Fts5Write(Box<super::fts5::FtWrite>),
 }
 
 /// `(column values, rowid)` rows a module produced.
@@ -133,6 +136,10 @@ impl<S: Storage> Connection<S> {
         desc.kind = s.kind;
         desc.db = 1;
         desc.vt_visible = if tab.visible() < w { tab.visible() } else { 0 };
+        #[cfg(feature = "fts5")]
+        if tab.fts.is_some() {
+            desc.fts_col = Some(tab.visible());
+        }
         descs.push(desc);
         let mut affs = AVec::new();
         let mut defaults = AVec::new();
@@ -209,10 +216,13 @@ impl<S: Storage> Connection<S> {
         sources: &mut [SourcePlan],
         cur: &crate::query::ScopeGroup,
         filter: &mut Option<RExpr>,
-    ) -> Result<(), S::Error> {
+        order: Option<(&[u8], bool)>,
+    ) -> Result<bool, S::Error> {
         let n = sources.len();
+        #[cfg_attr(not(feature = "fts5"), allow(unused_mut))]
+        let mut consumed = false;
         if !sources.iter().any(|s| s.vt.is_some()) {
-            return Ok(());
+            return Ok(consumed);
         }
         let end = cur.offsets.as_slice().last().copied().unwrap_or(0)
             + cur.sources.as_slice().last().map_or(0, |s| s.columns.len());
@@ -236,6 +246,8 @@ impl<S: Storage> Connection<S> {
                 s: (cur.first_src, me),
             };
             let ncols = sp.ncols;
+            #[cfg(feature = "fts5")]
+            let is_fts = matches!(vt.tab.module, crate::vtab::Module::Fts5);
             let col_of = |e: &RExpr| -> Option<i32> {
                 match e {
                     RExpr::Column(slot, ..) if *slot >= here && *slot < here + ncols => {
@@ -321,6 +333,72 @@ impl<S: Storage> Connection<S> {
                                 ));
                             }
                         }
+                        // `x MATCH q` (leaf `fts5`): the pin's
+                        // SQLITE_INDEX_CONSTRAINT_MATCH on column x.
+                        #[cfg(feature = "fts5")]
+                        RExpr::Scalar(crate::query::ScalarFn::Match, a) => {
+                            if let (Some(q), Some(x)) = (a.as_slice().first(), a.as_slice().get(1))
+                                && let Some(c) = col_of(x)
+                                && col_of(q).is_none()
+                            {
+                                cands.push((
+                                    Cons {
+                                        col: c,
+                                        op: Op::Match,
+                                        usable: usable(q),
+                                    },
+                                    q.clone(),
+                                    src,
+                                    k,
+                                ));
+                            }
+                        }
+                        // `x LIKE p` / `x GLOB p` (two arguments): the
+                        // pin's SQLITE_INDEX_CONSTRAINT_LIKE / _GLOB,
+                        // which only fts5 tables use.
+                        #[cfg(feature = "fts5")]
+                        RExpr::Like(x, p, false) if is_fts => {
+                            if let Some(c) = col_of(x)
+                                && col_of(p).is_none()
+                            {
+                                cands.push((
+                                    Cons {
+                                        col: c,
+                                        op: Op::Like,
+                                        usable: usable(p),
+                                    },
+                                    (**p).clone(),
+                                    src,
+                                    k,
+                                ));
+                            }
+                        }
+                        #[cfg(feature = "fts5")]
+                        RExpr::Scalar(
+                            f @ (crate::query::ScalarFn::Like | crate::query::ScalarFn::Glob),
+                            a,
+                        ) if is_fts && a.len() == 2 => {
+                            if let (Some(p), Some(x)) = (a.as_slice().first(), a.as_slice().get(1))
+                                && let Some(c) = col_of(x)
+                                && col_of(p).is_none()
+                            {
+                                let op = if *f == crate::query::ScalarFn::Like {
+                                    Op::Like
+                                } else {
+                                    Op::Glob
+                                };
+                                cands.push((
+                                    Cons {
+                                        col: c,
+                                        op,
+                                        usable: usable(p),
+                                    },
+                                    p.clone(),
+                                    src,
+                                    k,
+                                ));
+                            }
+                        }
                         RExpr::Between(x, lo, hi, false) if src == 0 => {
                             if let Some(c) = col_of(x) {
                                 virt.push((
@@ -388,7 +466,26 @@ impl<S: Storage> Connection<S> {
                 cons.push(c.0);
             }
             let module = vt.tab.module;
-            let mut info = IndexInfo::new(cons.clone(), AVec::new());
+            let mut aorder = AVec::new();
+            // Only fts5 reads the ORDER BY (its rank and rowid orders);
+            // hipp sorts every result itself.
+            #[cfg(feature = "fts5")]
+            let order = order.filter(|_| module == Module::Fts5);
+            #[cfg(not(feature = "fts5"))]
+            let order: Option<(&[u8], bool)> = order.filter(|_| false);
+            if let Some((name, desc)) = order {
+                if let Some(c) = vt
+                    .tab
+                    .cols
+                    .iter()
+                    .position(|c| eq_ci(c.name.as_slice(), name))
+                {
+                    aorder.push((c as i32, desc));
+                } else if eq_ci(name, b"rowid") || eq_ci(name, b"oid") || eq_ci(name, b"_rowid_") {
+                    aorder.push((-1, desc));
+                }
+            }
+            let mut info = IndexInfo::new(cons.clone(), aorder);
             match module.best_index(&vt.tab, &mut info) {
                 Ok(()) => {}
                 Err(BestErr::Err(k)) => return Err(vt_err(k)),
@@ -475,12 +572,18 @@ impl<S: Storage> Connection<S> {
                 d.values.clear();
                 d.values.push(argv);
             }
+            // An fts5 table's rank order is its own (the pin's
+            // orderByConsumed); hipp sorts every other.
+            #[cfg(feature = "fts5")]
+            if module == Module::Fts5 && info.idx_num & 1 != 0 {
+                consumed = true;
+            }
             if let Some(v) = sp.vt.as_deref_mut() {
                 v.idx_num = info.idx_num;
                 v.idx_str = info.idx_str;
             }
         }
-        Ok(())
+        Ok(consumed)
     }
 
     /// The statements that name a virtual table or a shadow table
@@ -557,13 +660,17 @@ impl<S: Storage> Connection<S> {
                 tab: Some(v.tab.clone().map_err(vt_err)?),
             })))),
             2 | 4 => Err(vt_err(SchemaKind::VtabNotIndexable)),
-            #[cfg(feature = "rtree")]
+            #[cfg(any(feature = "rtree", feature = "fts5"))]
             3 if matches!(ast, Ast::AlterRename { .. }) => self.plan_vtab_rename(arena, ast, t, v),
             3 => Err(vt_err(SchemaKind::VtabNotAlterable)),
             _ => {
                 let tab = v.tab.clone().map_err(vt_err)?;
                 if !tab.module.writable() {
                     return Err(vt_err(SchemaKind::VtabReadOnly));
+                }
+                #[cfg(feature = "fts5")]
+                if tab.fts.is_some() {
+                    return self.plan_fts5_write(arena, ast, t, tab).map(Some);
                 }
                 #[cfg(feature = "rtree")]
                 {
@@ -578,11 +685,11 @@ impl<S: Storage> Connection<S> {
         }
     }
 
-    /// Plan `ALTER TABLE vt RENAME TO new` of R*Tree `vt` (another
-    /// module's table cannot be renamed here; neither can one while
-    /// the schema has views or triggers, whose text the pin would
-    /// edit too).
-    #[cfg(feature = "rtree")]
+    /// Plan `ALTER TABLE vt RENAME TO new` of R*Tree or fts5 table
+    /// `vt` (another module's table cannot be renamed here; neither
+    /// can one while the schema has views or triggers, whose text the
+    /// pin would edit too).
+    #[cfg(any(feature = "rtree", feature = "fts5"))]
     fn plan_vtab_rename(
         &self,
         arena: &Arena,
@@ -593,21 +700,20 @@ impl<S: Storage> Connection<S> {
         let Ast::AlterRename { to, .. } = ast else {
             return Err(Error::Unsupported);
         };
-        let rtree = v
-            .tab
-            .as_ref()
-            .is_ok_and(|t| matches!(t.module, Module::Rtree { .. }));
+        let Some(sfxs) = v.tab.as_ref().ok().and_then(shadow_suffixes) else {
+            return Err(vt_err(SchemaKind::VtabNotAlterable));
+        };
         #[cfg(feature = "triggers")]
         let trig = !self.catalog.triggers.is_empty();
         #[cfg(not(feature = "triggers"))]
         let trig = false;
-        if !rtree || trig || !self.catalog.views.is_empty() {
+        if trig || !self.catalog.views.is_empty() {
             return Err(vt_err(SchemaKind::VtabNotAlterable));
         }
         let new = handle_bytes(arena, *to);
         reserved_name::<S::Error>(new)?;
         let ca = &self.catalog_arena;
-        for sfx in [b"" as &[u8], b"_node", b"_parent", b"_rowid"] {
+        for sfx in core::iter::once(b"" as &[u8]).chain(sfxs.iter().copied()) {
             let mut n = copy_vec(new);
             n.extend_from_slice(sfx);
             if self.catalog.taken(ca, n.as_slice()).is_some() {
@@ -671,6 +777,10 @@ impl<S: Storage> Statement<'_, S> {
             Err(e) if matches!(&self.plan, Plan::Vtab(p) if matches!(**p, VtPlan::Write(_))) => {
                 Err(self.write_failed(e).await)
             }
+            #[cfg(feature = "fts5")]
+            Err(e) if matches!(&self.plan, Plan::Vtab(p) if matches!(**p, VtPlan::Fts5Write(_))) => {
+                Err(self.write_failed(e).await)
+            }
             Err(e) => {
                 abort_write!(self, &e);
                 Err(e)
@@ -698,10 +808,14 @@ impl<S: Storage> Statement<'_, S> {
                 if let Module::Rtree { .. } = tab.module {
                     self.rtree_create(name.as_slice(), &tab).await?;
                 }
+                #[cfg(feature = "fts5")]
+                if tab.fts.is_some() {
+                    self.fts5_create(name.as_slice(), &tab).await?;
+                }
                 let _ = tab;
                 self.conn.pager.bump_schema_cookie();
                 if !self.conn.explicit_txn {
-                    self.conn.pager.drive_commit().await?;
+                    auto_commit!(self.conn)?;
                 }
                 Ok(())
             }
@@ -711,7 +825,9 @@ impl<S: Storage> Statement<'_, S> {
             }
             #[cfg(feature = "rtree")]
             VtPlan::Write(_) => self.exec_rtree_write().await,
-            #[cfg(feature = "rtree")]
+            #[cfg(feature = "fts5")]
+            VtPlan::Fts5Write(_) => self.exec_fts5_write().await,
+            #[cfg(any(feature = "rtree", feature = "fts5"))]
             VtPlan::Rename { old, new } => {
                 let (old, new) = (old.clone(), new.clone());
                 self.rename_vtab(old.as_slice(), new.as_slice()).await
@@ -719,12 +835,27 @@ impl<S: Storage> Statement<'_, S> {
         }
     }
 
-    /// Rename R*Tree `old` and its shadow tables: each schema row's
-    /// name and the name token of its text, which takes the pin's
-    /// quoted form (`CREATE VIRTUAL TABLE "new" USING ...`,
-    /// `CREATE TABLE "new_node"(...)`).
-    #[cfg(feature = "rtree")]
+    /// Rename R*Tree or fts5 table `old` and its shadow tables: each
+    /// schema row's name and the name token of its text, which takes
+    /// the pin's quoted form (`CREATE VIRTUAL TABLE "new" USING ...`,
+    /// `CREATE TABLE "new_node"(...)`). An fts5 table's pending terms
+    /// follow it.
+    #[cfg(any(feature = "rtree", feature = "fts5"))]
     async fn rename_vtab(&mut self, old: &[u8], new: &[u8]) -> Result<(), S::Error> {
+        let tab = self
+            .conn
+            .catalog
+            .find_vtab(&self.conn.catalog_arena, old)
+            .and_then(|v| v.tab.as_ref().ok())
+            .cloned()
+            .ok_or(vt_err(SchemaKind::VtabNotAlterable))?;
+        let sfxs = shadow_suffixes(&tab).ok_or(vt_err(SchemaKind::VtabNotAlterable))?;
+        // fts5's xRename syncs the table first.
+        #[cfg(feature = "fts5")]
+        if let Some(cfg) = tab.fts.as_deref() {
+            self.conn.fts5_sync_one(old, cfg).await?;
+            self.conn.fts5_renamed(old, new);
+        }
         // (schema rowid, new name, type, root page, new text).
         type Edit = (i64, AVec<u8>, AVec<u8>, i64, AVec<u8>);
         let mut edits: AVec<Edit> = AVec::new();
@@ -754,13 +885,7 @@ impl<S: Storage> Statement<'_, S> {
                     &[][..]
                 } else if n.len() > old.len() && n.get(..old.len()).is_some_and(|p| eq_ci(p, old)) {
                     match n.get(old.len()..) {
-                        Some(x)
-                            if [b"_node" as &[u8], b"_parent", b"_rowid"]
-                                .iter()
-                                .any(|s| eq_ci(s, x)) =>
-                        {
-                            x
-                        }
+                        Some(x) if sfxs.iter().any(|s| eq_ci(s, x)) => x,
                         _ => continue,
                     }
                 } else {
@@ -805,7 +930,7 @@ impl<S: Storage> Statement<'_, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -837,13 +962,24 @@ impl<S: Storage> Statement<'_, S> {
                 self.drop_plain_table(sname.as_slice()).await?;
             }
         }
+        #[cfg(feature = "fts5")]
+        if let Some(t) = tab
+            && t.fts.is_some()
+        {
+            self.fts5_forget(name);
+            for sfx in Self::fts5_shadows(t).iter() {
+                let mut sname = copy_vec(name);
+                sname.extend_from_slice(sfx);
+                self.drop_plain_table(sname.as_slice()).await?;
+            }
+        }
         let _ = tab;
         self.drop_table_end().await
     }
 
     /// Drop the ordinary table `name` (no indexes, no triggers): its
     /// schema row and its pages, as DROP TABLE does.
-    #[cfg(feature = "rtree")]
+    #[cfg(any(feature = "rtree", feature = "fts5"))]
     async fn drop_plain_table(&mut self, name: &[u8]) -> Result<(), S::Error> {
         let Some(root) = self
             .conn
@@ -923,6 +1059,10 @@ impl<S: Storage> Statement<'_, S> {
             Module::Rtree { .. } => self.rtree_rows(vt, argv.as_slice(), need).await,
             #[cfg(feature = "rtree")]
             Module::Check => self.rtreecheck_rows(argv.as_slice()).await,
+            #[cfg(feature = "fts5")]
+            Module::Fts5 => self.fts5_rows(vt, argv.as_slice(), need).await,
+            #[cfg(feature = "fts5")]
+            Module::Fts5Vocab => self.vocab_rows(vt).await,
         }
     }
 
@@ -989,4 +1129,20 @@ impl<S: Storage> Statement<'_, S> {
         }
         crate::vtab::dbstat_rows(&mut self.conn.pager, trees.as_slice(), b"main", a.agg, need).await
     }
+}
+
+/// The shadow tables' suffixes of a module whose tables can be
+/// renamed (R*Tree, fts5); None for the others.
+#[cfg(any(feature = "rtree", feature = "fts5"))]
+fn shadow_suffixes(t: &VTab) -> Option<&'static [&'static [u8]]> {
+    #[cfg(feature = "rtree")]
+    if matches!(t.module, Module::Rtree { .. }) {
+        return Some(&[b"_node", b"_parent", b"_rowid"]);
+    }
+    #[cfg(feature = "fts5")]
+    if t.fts.is_some() {
+        return Some(&[b"_data", b"_idx", b"_content", b"_docsize", b"_config"]);
+    }
+    let _ = t;
+    None
 }

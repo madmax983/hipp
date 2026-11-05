@@ -173,6 +173,8 @@ pub fn best_index(tab: &VTab, info: &mut IndexInfo) {
                 Op::Le => (b'B', true),
                 Op::Lt => (b'C', false),
                 Op::Ge => (b'D', true),
+                #[cfg(feature = "fts5")]
+                Op::Match | Op::Like | Op::Glob => continue,
                 Op::Is => continue,
             };
             info.idx_str.push(code);

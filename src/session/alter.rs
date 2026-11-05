@@ -1423,7 +1423,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.drop_rewrite(troot, layout.as_slice(), *col).await?;
         }
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }

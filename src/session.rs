@@ -62,6 +62,22 @@ macro_rules! abort_write {
     }};
 }
 
+/// The end of an autocommit write: fts5 tables' pending terms
+/// (written by trigger programs, v0.16 `fts5`) are flushed into the
+/// same transaction first, as the pin's xSync does; then the commit.
+macro_rules! auto_commit {
+    ($c:expr) => {{
+        #[cfg(feature = "fts5")]
+        let r = match $c.fts_sync_all().await {
+            Ok(()) => $c.pager.drive_commit().await,
+            Err(e) => Err(e),
+        };
+        #[cfg(not(feature = "fts5"))]
+        let r = $c.pager.drive_commit().await;
+        r
+    }};
+}
+
 /// A new table's or index's root page: in an auto-vacuum file
 /// (v0.16, `autovacuum`) the pin's slot after the largest root
 /// (`crate::autovac::alloc_root`), elsewhere any page. A macro, so
@@ -91,6 +107,8 @@ mod attach;
 mod cte;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
+#[cfg(feature = "fts5")]
+mod fts5;
 #[cfg(any(feature = "json", feature = "vtab"))]
 mod json_tvf;
 #[cfg(feature = "v16")]
@@ -1337,6 +1355,10 @@ pub struct Connection<S: Storage> {
     /// (v0.16, `attach`; `attach::ExtTab`).
     #[cfg(feature = "attach")]
     ext: core::cell::RefCell<AVec<attach::ExtTab>>,
+    /// The fts5 tables written in the open transaction: their
+    /// pending terms and totals (v0.16, `fts5`).
+    #[cfg(feature = "fts5")]
+    fts: AVec<fts5::FtState>,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1389,6 +1411,8 @@ impl<S: Storage> Connection<S> {
             attach_hook: None,
             #[cfg(feature = "attach")]
             ext: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "fts5")]
+            fts: AVec::new(),
         };
         #[cfg(feature = "utf16")]
         conn.set_text_enc(conn.pager.text_enc());
@@ -4591,6 +4615,8 @@ impl<S: Storage> Connection<S> {
             using,
             &mut planner,
         )?;
+        #[cfg(feature = "fts5")]
+        let rank_order;
         #[cfg_attr(not(feature = "vtab"), allow(unused_mut))]
         let mut filter = match &stmt.filter {
             None => hoisted,
@@ -4611,7 +4637,26 @@ impl<S: Storage> Connection<S> {
         };
         // v0.16 (`vtab`): each virtual table's xBestIndex.
         #[cfg(feature = "vtab")]
-        self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter)?;
+        {
+            // A one-term ORDER BY of a column (`aOrderBy`).
+            let order = match stmt.order_by.as_slice() {
+                [(Expr::Column { name, .. }, o)] if sources.len() == 1 => {
+                    Some((handle_bytes(arena, *name), o.desc))
+                }
+                _ => None,
+            };
+            let consumed = self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, order)?;
+            // An fts5 table's ORDER BY rank (`orderByConsumed`): its
+            // rows come in the pin's sorter order (leaf `fts5`).
+            #[cfg(feature = "fts5")]
+            {
+                rank_order = consumed
+                    && stmt.group_by.is_empty()
+                    && !stmt.distinct
+                    && !items.iter().any(crate::query::has_result_agg);
+            }
+            let _ = consumed;
+        }
         // GROUP BY / HAVING / ORDER BY terms: an output ordinal
         // or alias substitutes the item expression itself
         // (SQLite's rule, per clause — see `resolve_term`), so
@@ -4704,6 +4749,10 @@ impl<S: Storage> Connection<S> {
             }
             #[cfg(feature = "window")]
             cur.win.ok.set(false);
+        }
+        #[cfg(feature = "fts5")]
+        if rank_order {
+            order_by.clear();
         }
         // The window classes (v0.16, `window`).
         #[cfg(feature = "window")]
@@ -6614,6 +6663,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         // only its own.
         #[cfg(feature = "json")]
         let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
+        // Likewise the full-text rows' auxiliary data (v0.16, `fts5`).
+        #[cfg(feature = "fts5")]
+        let fmark = self.conn.env.fts_rows.try_borrow().map_or(0, |d| d.len());
         // The statement's instant (v0.16, `datetime`): kept while
         // this statement owns the clock cache — from its prepare
         // (whose plan may read it for a DEFAULT) through its
@@ -6712,6 +6764,21 @@ impl<'c, S: Storage> Statement<'c, S> {
                     false
                 }
             };
+        // A statement the pin gives a statement journal (several rows,
+        // or a trigger program, with constraints that may abort) calls
+        // xSavepoint on the fts5 tables in the transaction first: their
+        // pending terms are flushed outside the statement's savepoint
+        // (v0.16, `fts5`).
+        #[cfg(feature = "fts5")]
+        if self.phase == Phase::Fresh
+            && self.conn.explicit_txn
+            && self.stmt_sp.is_none()
+            && !self.conn.fts_in_program()
+            && self.fts_journal()
+        {
+            let level = self.conn.pager.sp_depth();
+            self.conn.fts_savepoint(level).await?;
+        }
         #[cfg(feature = "v16")]
         self.open_stmt();
         #[cfg(feature = "foreign_keys")]
@@ -6775,6 +6842,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "json")]
         if let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut() {
             d.truncate(mark);
+        }
+        #[cfg(feature = "fts5")]
+        if let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut() {
+            d.truncate(fmark);
         }
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
@@ -7077,6 +7148,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         // the transaction staying open (v0.16, `foreign_keys`).
         #[cfg(feature = "foreign_keys")]
         self.conn.fk_commit_check()?;
+        // The fts5 tables' pending terms (v0.16, `fts5`: xSync).
+        #[cfg(feature = "fts5")]
+        self.conn.fts_sync_all().await?;
         // Every database's commit, atomic across their files (v0.16,
         // `attach`).
         #[cfg(feature = "attach")]
@@ -7102,6 +7176,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.rollback().await?;
         self.conn.explicit_txn = false;
+        #[cfg(feature = "fts5")]
+        self.conn.fts.clear();
         self.phase = Phase::Done;
         Ok(Step::Done)
     }
@@ -7275,7 +7351,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -7362,7 +7438,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -7597,7 +7673,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -7670,7 +7746,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             self.conn.pager.bump_schema_cookie();
             if !self.conn.explicit_txn {
-                self.conn.pager.drive_commit().await?;
+                auto_commit!(self.conn)?;
             }
             return Ok(());
         }
@@ -7681,7 +7757,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         btree::btree_delete(&mut self.conn.pager, 1, schema_rowid).await?;
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -8001,7 +8077,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let committed = if self.conn.explicit_txn {
                 Ok(())
             } else {
-                self.conn.pager.drive_commit().await
+                auto_commit!(self.conn)
             };
             return match committed {
                 Ok(()) => {
@@ -8088,7 +8164,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.fk_end_commit().await?;
             #[cfg(not(feature = "foreign_keys"))]
             if !self.conn.explicit_txn {
-                self.conn.pager.drive_commit().await?;
+                auto_commit!(self.conn)?;
             }
             self.conn.env.finish(true);
             return Ok(());
@@ -8124,7 +8200,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.fk_end_commit().await?;
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(true);
@@ -10357,7 +10433,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.fk_end_commit().await?;
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(true);
@@ -10574,7 +10650,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.fk_end_commit().await?;
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         #[cfg(feature = "v16")]
         self.conn.env.finish(true);
@@ -10753,7 +10829,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(not(feature = "foreign_keys"))]
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -13051,7 +13127,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -13125,7 +13201,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         .await?;
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }
@@ -13192,7 +13268,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.conn.pager.bump_schema_cookie();
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }

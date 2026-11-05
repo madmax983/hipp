@@ -438,6 +438,13 @@ impl<S: Storage> Statement<'_, S> {
                     self.conn.fk.savepoint(level);
                 }
                 let starts = !self.conn.explicit_txn;
+                // xSavepoint for the fts5 tables in the transaction
+                // (v0.16, `fts5`): their pending terms are flushed.
+                #[cfg(feature = "fts5")]
+                {
+                    let level = self.conn.pager.sp_depth();
+                    self.conn.fts_savepoint(level).await?;
+                }
                 self.conn.pager.sp_open(Some(name.as_slice()), starts);
                 // As at BEGIN (v0.16, `wal`: the checkpoint's
                 // read-since-the-transaction-began rule).
@@ -497,7 +504,7 @@ impl<S: Storage> Statement<'_, S> {
     /// Commit a successful autocommit write, or undo a failed one.
     async fn finish_write(&mut self, r: Result<(), S::Error>) -> Result<(), S::Error> {
         let r = match r {
-            Ok(()) if !self.conn.explicit_txn => self.conn.pager.drive_commit().await,
+            Ok(()) if !self.conn.explicit_txn => auto_commit!(self.conn),
             r => r,
         };
         if let Err(e) = r {
@@ -529,12 +536,16 @@ impl<S: Storage> Statement<'_, S> {
             #[cfg(feature = "foreign_keys")]
             self.conn.fk_commit_check()?;
             // Every database's commit (v0.16, `attach`).
+            #[cfg(feature = "fts5")]
+            self.conn.fts_sync_all().await?;
             #[cfg(feature = "attach")]
             self.conn.commit_all().await?;
             self.conn.pager.drive_commit().await?;
             self.conn.pager.sp_clear();
             self.conn.explicit_txn = false;
         } else {
+            #[cfg(feature = "fts5")]
+            self.conn.fts_release(level).await?;
             self.conn.pager.sp_release(level);
             #[cfg(feature = "foreign_keys")]
             self.conn.fk.release(level);
@@ -559,6 +570,9 @@ impl<S: Storage> Statement<'_, S> {
         // The deferred foreign-key counters return with it.
         #[cfg(feature = "foreign_keys")]
         self.conn.fk.rollback_to(level);
+        // xRollbackTo for the fts5 tables (v0.16, `fts5`).
+        #[cfg(feature = "fts5")]
+        self.fts_rollback_to(level);
         // The schema may have rolled back with it. (Re-reading it is
         // not a read of the transaction's: v0.16, `wal`.)
         #[cfg(feature = "wal")]

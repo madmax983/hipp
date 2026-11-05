@@ -1918,7 +1918,7 @@ impl<S: Storage> Statement<'_, S> {
             return Ok(AVec::new());
         }
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(AVec::new())
     }
@@ -1955,7 +1955,7 @@ impl<S: Storage> Statement<'_, S> {
             };
             let steps = crate::autovac::incremental(&mut self.conn.pager, limit).await?;
             if self.conn.pager.in_txn() && !self.conn.explicit_txn {
-                self.conn.pager.drive_commit().await?;
+                auto_commit!(self.conn)?;
             }
             let mut rows: Rows = AVec::new();
             for _ in 0..steps {
@@ -1978,7 +1978,7 @@ impl<S: Storage> Statement<'_, S> {
                     .set_header_u32(off, atoi(arg) as u32)
                     .await?;
                 if !self.conn.explicit_txn {
-                    self.conn.pager.drive_commit().await?;
+                    auto_commit!(self.conn)?;
                 }
                 Ok(AVec::new())
             }

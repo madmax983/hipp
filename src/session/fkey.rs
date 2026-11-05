@@ -2465,7 +2465,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         self.fk_end()?;
         if !self.conn.explicit_txn {
-            self.conn.pager.drive_commit().await?;
+            auto_commit!(self.conn)?;
         }
         Ok(())
     }

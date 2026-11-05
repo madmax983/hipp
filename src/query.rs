@@ -204,6 +204,15 @@ pub fn agg_row<E>(p: &AggParts<'_>, ctx: &Ctx<'_>) -> Result<Option<AVec<OwnedVa
 /// scalar forms of min/max.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFn {
+    /// `x MATCH q` (v0.16, `fts5`): only a full-text table's
+    /// constraint consumes it; evaluated, the pin's "unable to use
+    /// function MATCH in the requested context".
+    #[cfg(feature = "fts5")]
+    Match,
+    /// `bm25()`, `highlight()`, `snippet()` (v0.16, `fts5`): the
+    /// first argument is a full-text table's hidden column.
+    #[cfg(feature = "fts5")]
+    Fts5(crate::fts5::aux::AuxFn),
     /// `rtreenode(ndim, blob)` / `rtreedepth(blob)` (v0.16,
     /// `rtree`): the pin's R*Tree test functions.
     #[cfg(feature = "rtree")]
@@ -592,6 +601,10 @@ pub struct SourceDesc {
     /// rest are HIDDEN. 0: all.
     #[cfg(feature = "vtab")]
     pub vt_visible: usize,
+    /// A full-text table's hidden table-name column (v0.16, `fts5`):
+    /// the only argument its auxiliary functions take first.
+    #[cfg(feature = "fts5")]
+    pub fts_col: Option<usize>,
 }
 
 /// What an ALTER TABLE learns from planning a view (v0.16, `v16`):
@@ -716,6 +729,8 @@ impl SourceDesc {
             json_tvf: 0,
             #[cfg(feature = "vtab")]
             vt_visible: 0,
+            #[cfg(feature = "fts5")]
+            fts_col: None,
         }
     }
 
@@ -2795,6 +2810,15 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
     {
         return Some(ScalarFn::Date(d));
     }
+    #[cfg(feature = "fts5")]
+    if f.is_none() {
+        if eq_ci(name, b"match") {
+            return Some(ScalarFn::Match);
+        }
+        if let Some(a) = crate::fts5::aux::AuxFn::lookup(name) {
+            return Some(ScalarFn::Fts5(a));
+        }
+    }
     #[cfg(feature = "rtree")]
     if f.is_none() {
         if eq_ci(name, b"rtreenode") {
@@ -2822,6 +2846,10 @@ fn arity(f: ScalarFn) -> (usize, usize) {
         ScalarFn::Nullif | ScalarFn::Instr => (2, 2),
         #[cfg(feature = "rtree")]
         ScalarFn::RtreeNode => (2, 2),
+        #[cfg(feature = "fts5")]
+        ScalarFn::Match => (2, 2),
+        #[cfg(feature = "fts5")]
+        ScalarFn::Fts5(_) => (1, usize::MAX),
         ScalarFn::Substr => (2, 3),
         ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => (1, 2),
         ScalarFn::Replace => (3, 3),
@@ -3033,6 +3061,29 @@ fn resolve_call_body<E>(
         .map_err(|_| Error::Schema {
             kind: SchemaKind::UnknownFunction,
         });
+    }
+    // The FTS5 auxiliary functions (v0.16, `fts5`): the first
+    // argument must be a full-text table's hidden column, as the
+    // pin's xFindFunction overloading requires.
+    #[cfg(feature = "fts5")]
+    if let Some(a) = crate::fts5::aux::AuxFn::lookup(name)
+        && !star
+    {
+        let r = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
+        let hidden = |slot: usize| {
+            core::iter::once(cur).chain(enclosing.iter()).any(|g| {
+                g.sources
+                    .iter()
+                    .zip(g.offsets.iter())
+                    .any(|(s, off)| s.fts_col.is_some_and(|c| off + c == slot))
+            })
+        };
+        if !matches!(r.as_slice().first(), Some(RExpr::Column(slot, ..)) if hidden(*slot)) {
+            return Err(Error::Schema {
+                kind: SchemaKind::Fts5Context,
+            });
+        }
+        return Ok(RExpr::Scalar(ScalarFn::Fts5(a), r));
     }
     let agg = agg_kind(name);
     // The aggregate clauses on anything but an aggregate (v0.16,
@@ -4956,6 +5007,12 @@ pub struct Env {
     /// when it returns.
     #[cfg(feature = "json")]
     pub json_docs: crate::json::TvfDocs,
+    /// The rows the running statement's full-text queries returned
+    /// (v0.16, `fts5`): a full-text table's hidden column holds a
+    /// handle into these, which `bm25()` / `highlight()` /
+    /// `snippet()` read. `Statement::step` drops the ones it added.
+    #[cfg(feature = "fts5")]
+    pub fts_rows: crate::fts5::aux::AuxRows,
     /// The database's text encoding (v0.16, `utf16`): what the
     /// BINARY collation, hex(), CAST(... AS BLOB) and blob-to-text
     /// conversions see (`crate::utf16`).
@@ -5004,6 +5061,8 @@ impl Env {
             raise_msg: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "json")]
             json_docs: core::cell::RefCell::new(AVec::new()),
+            #[cfg(feature = "fts5")]
+            fts_rows: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "utf16")]
             enc: core::cell::Cell::new(crate::record::TextEnc::Utf8),
             #[cfg(feature = "datetime")]
@@ -6433,6 +6492,34 @@ fn hex_text(bytes: &[u8]) -> OwnedValue {
     OwnedValue::Text(out)
 }
 
+/// An FTS5 auxiliary function over the row its first argument's
+/// handle names (v0.16, `fts5`).
+#[cfg(feature = "fts5")]
+fn fts5_aux<E>(
+    f: crate::fts5::aux::AuxFn,
+    v: &[OwnedValue],
+    ctx: &Ctx<'_>,
+) -> Result<OwnedValue, E> {
+    use crate::fts5::aux::AuxErr;
+    let err = |kind| Error::Schema { kind };
+    let ctxerr = || err(SchemaKind::Fts5Context);
+    let Some(OwnedValue::Integer(h)) = v.first() else {
+        return Err(ctxerr());
+    };
+    let env = ctx.env.ok_or_else(ctxerr)?;
+    let rows = env.fts_rows.try_borrow().map_err(|_| ctxerr())?;
+    let row = usize::try_from(*h)
+        .ok()
+        .and_then(|i| rows.as_slice().get(i))
+        .ok_or_else(ctxerr)?;
+    crate::fts5::aux::call(f, row, v.get(1..).unwrap_or(&[])).map_err(|e| match e {
+        AuxErr::Args => err(SchemaKind::Fts5Arguments),
+        AuxErr::Context => ctxerr(),
+        AuxErr::Range => err(SchemaKind::Fts5Context),
+        AuxErr::Corrupt => err(SchemaKind::VtabCorrupt),
+    })
+}
+
 /// `eval_scalar` over the evaluated argument values (one copy:
 /// inlined into `eval_scalar` unless `utf16` calls it twice).
 #[cfg_attr(not(feature = "utf16"), inline(always))]
@@ -6449,6 +6536,16 @@ fn scalar_values<E>(
     #[cfg(feature = "datetime")]
     if let ScalarFn::Date(d) = f {
         return crate::datetime::eval::<E>(d, v, ctx.time());
+    }
+    #[cfg(feature = "fts5")]
+    match f {
+        ScalarFn::Match => {
+            return Err(Error::Schema {
+                kind: SchemaKind::Fts5Context,
+            });
+        }
+        ScalarFn::Fts5(a) => return fts5_aux::<E>(a, v, ctx),
+        _ => {}
     }
     let Some(v0) = v.first() else {
         // The argument-free calls.

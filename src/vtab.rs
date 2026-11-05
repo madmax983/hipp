@@ -71,6 +71,12 @@ pub enum Module {
     /// name cannot be written in SQL), leaf `rtree`.
     #[cfg(feature = "rtree")]
     Check,
+    /// `fts5` (leaf `fts5`).
+    #[cfg(feature = "fts5")]
+    Fts5,
+    /// `fts5vocab` (leaf `fts5`).
+    #[cfg(feature = "fts5")]
+    Fts5Vocab,
 }
 
 /// The internal name `rtreecheck()` calls resolve to (a FROM source
@@ -119,6 +125,13 @@ pub struct VTab {
     pub naux: u8,
     /// dbstat: the schema argument (`dbstat(aux)`), empty for main.
     pub schema: AVec<u8>,
+    /// fts5: the table definition (leaf `fts5`).
+    #[cfg(feature = "fts5")]
+    pub fts: Option<alloc::boxed::Box<crate::fts5::config::Config>>,
+    /// fts5vocab: the fts5 table and the type (0 row, 1 col, 2
+    /// instance).
+    #[cfg(feature = "fts5")]
+    pub vocab: Option<alloc::boxed::Box<(AVec<u8>, u8)>>,
 }
 
 impl VTab {
@@ -166,6 +179,16 @@ pub enum Op {
     Lt,
     Ge,
     Is,
+    /// MATCH (leaf `fts5`).
+    #[cfg(feature = "fts5")]
+    Match,
+    /// `x LIKE p` (two arguments; leaf `fts5`, only offered to fts5
+    /// tables).
+    #[cfg(feature = "fts5")]
+    Like,
+    /// `x GLOB p` (leaf `fts5`, as Like).
+    #[cfg(feature = "fts5")]
+    Glob,
 }
 
 /// One `aConstraint` entry: column (-1 for the rowid), operator,
@@ -292,6 +315,12 @@ impl Module {
             } else if name == CHECK_NAME {
                 return Some(Module::Check);
             }
+            #[cfg(feature = "fts5")]
+            if eq(name, b"fts5") {
+                return Some(Module::Fts5);
+            } else if eq(name, b"fts5vocab") {
+                return Some(Module::Fts5Vocab);
+            }
             None
         }
     }
@@ -306,6 +335,10 @@ impl Vtab for Module {
             ndim2: 0,
             naux: 0,
             schema: AVec::new(),
+            #[cfg(feature = "fts5")]
+            fts: None,
+            #[cfg(feature = "fts5")]
+            vocab: None,
         };
         match self {
             Module::Series => {
@@ -333,6 +366,65 @@ impl Vtab for Module {
             }
             #[cfg(feature = "rtree")]
             Module::Rtree { int } => crate::rtree::declare(&mut tab, args, *int)?,
+            #[cfg(feature = "fts5")]
+            Module::Fts5 => {
+                let cfg = crate::fts5::config::Config::parse(name, args).map_err(|e| {
+                    use crate::fts5::config::CfgErr;
+                    match e {
+                        CfgErr::NoTokenizer | CfgErr::Tokenizer => SchemaKind::Fts5Tokenizer,
+                        _ => SchemaKind::Fts5Definition,
+                    }
+                })?;
+                for c in cfg.cols.iter() {
+                    tab.cols.push(VCol::new(c.as_slice(), b"", false));
+                }
+                tab.cols.push(VCol::new(name, b"", true));
+                tab.cols.push(VCol::new(b"rank", b"", true));
+                tab.fts = Some(alloc::boxed::Box::new(cfg));
+            }
+            #[cfg(feature = "fts5")]
+            Module::Fts5Vocab => {
+                let words: AVec<AVec<u8>> = args
+                    .iter()
+                    .map(|a| {
+                        let a = a.trim_ascii();
+                        if matches!(a.first(), Some(b'\'' | b'"' | b'`' | b'[')) {
+                            crate::fts5::config::dequote(a).0
+                        } else {
+                            let mut v = AVec::new();
+                            v.extend_from_slice(a);
+                            v
+                        }
+                    })
+                    .collect();
+                let (tabname, ty) = match words.as_slice() {
+                    // The three-argument form names another database's
+                    // table, which only a TEMP vocab table may (refused
+                    // with TEMP vocab tables).
+                    [t, ty] => (t, ty),
+                    _ => return Err(SchemaKind::Fts5Definition),
+                };
+                let ci = crate::sql::parser::eq_ci;
+                let ty = ty.as_slice();
+                let kind = if ci(ty, b"row") {
+                    0
+                } else if ci(ty, b"col") {
+                    1
+                } else if ci(ty, b"instance") {
+                    2
+                } else {
+                    return Err(SchemaKind::Fts5Definition);
+                };
+                let names: &[&[u8]] = match kind {
+                    0 => &[b"term", b"doc", b"cnt"],
+                    1 => &[b"term", b"col", b"doc", b"cnt"],
+                    _ => &[b"term", b"doc", b"col", b"offset"],
+                };
+                for n in names {
+                    tab.cols.push(VCol::new(n, b"", false));
+                }
+                tab.vocab = Some(alloc::boxed::Box::new((tabname.clone(), kind)));
+            }
             #[cfg(feature = "rtree")]
             Module::Check => {
                 tab.cols.push(VCol::new(b"rtreecheck", b"", false));
@@ -346,6 +438,10 @@ impl Vtab for Module {
     fn best_index(&self, tab: &VTab, info: &mut IndexInfo) -> Result<(), BestErr> {
         let _ = tab;
         match self {
+            #[cfg(feature = "fts5")]
+            Module::Fts5 => fts5_best_index(tab, info),
+            #[cfg(feature = "fts5")]
+            Module::Fts5Vocab => Ok(()),
             Module::Series => series_best_index(info),
             Module::Dbstat => {
                 dbstat_best_index(info);
@@ -383,12 +479,16 @@ impl Vtab for Module {
             Module::Check => true,
             #[cfg(feature = "rtree")]
             Module::Rtree { .. } => false,
+            #[cfg(feature = "fts5")]
+            Module::Fts5 | Module::Fts5Vocab => false,
         }
     }
 
     fn creatable(&self) -> bool {
         match self {
             Module::Dbstat => true,
+            #[cfg(feature = "fts5")]
+            Module::Fts5 | Module::Fts5Vocab => true,
             #[cfg(feature = "rtree")]
             Module::Rtree { .. } => true,
             _ => false,
@@ -396,6 +496,10 @@ impl Vtab for Module {
     }
 
     fn writable(&self) -> bool {
+        #[cfg(feature = "fts5")]
+        if matches!(self, Module::Fts5) {
+            return true;
+        }
         #[cfg(feature = "rtree")]
         if matches!(self, Module::Rtree { .. }) {
             return true;
@@ -404,6 +508,12 @@ impl Vtab for Module {
     }
 
     fn shadow_name(&self, suffix: &[u8]) -> bool {
+        #[cfg(feature = "fts5")]
+        if matches!(self, Module::Fts5) {
+            return [b"content" as &[u8], b"docsize", b"config", b"data", b"idx"]
+                .iter()
+                .any(|s| crate::sql::parser::eq_ci(s, suffix));
+        }
         #[cfg(feature = "rtree")]
         if matches!(self, Module::Rtree { .. }) {
             return crate::rtree::SHADOWS
@@ -412,6 +522,107 @@ impl Vtab for Module {
         }
         let _ = suffix;
         false
+    }
+}
+
+/// `fts5BestIndexMethod`: MATCH (or `=` on the hidden columns: the
+/// table column is a query, `rank` the rank function), then one
+/// rowid `=`, else a rowid range; idxStr lists them in order (`M`
+/// with the column number, `r`, `=`, `<`, `>`). An unusable MATCH
+/// makes the plan unusable. Only MATCH and the rank are omitted;
+/// a trigram table also takes LIKE / GLOB patterns (`L` / `G`).
+#[cfg(feature = "fts5")]
+fn fts5_best_index(tab: &VTab, info: &mut IndexInfo) -> Result<(), BestErr> {
+    let ncol = tab.visible() as i32;
+    let mut s = AVec::new();
+    let mut n = 0u16;
+    let (mut seen_eq, mut seen_rank) = (false, false);
+    for i in 0..info.cons.len() {
+        let c = info.cons[i];
+        if c.op == Op::Match || (c.op == Op::Eq && c.col >= ncol) {
+            if !c.usable || c.col < 0 {
+                return Err(BestErr::Unusable);
+            }
+            if c.col == ncol + 1 {
+                if seen_rank {
+                    continue;
+                }
+                s.push(b'r');
+                seen_rank = true;
+            } else {
+                s.push(b'M');
+                crate::record::render_int(i64::from(c.col), &mut s);
+            }
+            n += 1;
+            info.set(i, n, true);
+        } else if c.usable
+            && matches!(c.op, Op::Like | Op::Glob)
+            && c.col >= 0
+            && c.col < ncol
+            && fts5_pattern(tab).is_some_and(|glob| c.op == Op::Glob || !glob)
+        {
+            // fts5UsePatternMatch: a trigram table (no diacritics
+            // folding) takes LIKE when case-insensitive, GLOB always;
+            // the constraint is still checked.
+            s.push(if c.op == Op::Like { b'L' } else { b'G' });
+            crate::record::render_int(i64::from(c.col), &mut s);
+            n += 1;
+            info.set(i, n, false);
+        } else if c.usable && !seen_eq && c.op == Op::Eq && c.col < 0 {
+            s.push(b'=');
+            seen_eq = true;
+            n += 1;
+            info.set(i, n, false);
+        }
+    }
+    if !seen_eq {
+        let (mut lt, mut gt) = (false, false);
+        for i in 0..info.cons.len() {
+            let c = info.cons[i];
+            if c.col >= 0 || !c.usable {
+                continue;
+            }
+            match c.op {
+                Op::Lt | Op::Le if !lt => {
+                    s.push(b'<');
+                    lt = true;
+                }
+                Op::Gt | Op::Ge if !gt => {
+                    s.push(b'>');
+                    gt = true;
+                }
+                _ => continue,
+            }
+            n += 1;
+            info.set(i, n, false);
+        }
+    }
+    // FTS5_BI_ORDER_RANK (1) / FTS5_BI_ORDER_ROWID (2), and
+    // FTS5_BI_ORDER_DESC (4).
+    if let [(c, desc)] = info.order.as_slice() {
+        let flag = if *c == ncol + 1 && s.iter().any(|b| matches!(b, b'M' | b'L' | b'G')) {
+            1
+        } else if *c == -1 {
+            2
+        } else {
+            0
+        };
+        if flag != 0 {
+            info.idx_num = flag | if *desc { 4 } else { 0 };
+        }
+    }
+    info.idx_str = s;
+    Ok(())
+}
+
+/// `sqlite3Fts5TokenizerPattern`: a trigram tokenizer without
+/// diacritics folding matches LIKE / GLOB patterns; `Some(true)`
+/// when only GLOB (case-sensitive).
+#[cfg(feature = "fts5")]
+fn fts5_pattern(tab: &VTab) -> Option<bool> {
+    match tab.fts.as_deref()?.tok {
+        crate::fts5::tok::Tokenizer::Trigram { fold, rd: 0 } => Some(!fold),
+        _ => None,
     }
 }
 

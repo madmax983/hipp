@@ -774,6 +774,55 @@ pub enum SchemaKind {
     /// "Invalid argument to rtreedepth()").
     #[cfg(feature = "rtree")]
     RtreeDepthArgument,
+    /// A malformed `fts5(...)` argument list (v0.16, `fts5`; the
+    /// pin's "parse error in ...", "unrecognized option", "malformed
+    /// ... directive", "reserved fts5 column name", "prefix length out
+    /// of range", "contentless_delete=1 requires a contentless table",
+    /// ...). Fix the CREATE VIRTUAL TABLE arguments.
+    #[cfg(feature = "fts5")]
+    Fts5Definition,
+    /// An unknown tokenizer or bad tokenizer arguments (v0.16,
+    /// `fts5`; "no such tokenizer", "error in tokenizer constructor").
+    /// Use unicode61, ascii, porter or trigram with their options.
+    #[cfg(feature = "fts5")]
+    Fts5Tokenizer,
+    /// A full-text query that does not parse (v0.16, `fts5`; "fts5:
+    /// syntax error near ...", "unterminated string", "expected
+    /// integer"). Quote special characters inside "...".
+    #[cfg(feature = "fts5")]
+    Fts5Syntax,
+    /// A column filter naming no column of the table (v0.16, `fts5`;
+    /// "no such column: x").
+    #[cfg(feature = "fts5")]
+    Fts5NoColumn,
+    /// A query the table's `detail=` cannot answer, or nested past
+    /// 256 levels (v0.16, `fts5`; "fts5: column / phrase / NEAR
+    /// queries are not supported", "fts5 expression tree is too
+    /// large"). Use detail=full, or simplify the query.
+    #[cfg(feature = "fts5")]
+    Fts5Unsupported,
+    /// MATCH, `bm25()`, `highlight()` or `snippet()` where no
+    /// full-text table answers it (v0.16, `fts5`; "unable to use
+    /// function X in the requested context"). Constrain a full-text
+    /// table's column, and pass its hidden table column first.
+    #[cfg(feature = "fts5")]
+    Fts5Context,
+    /// An auxiliary function called with the wrong arguments (v0.16,
+    /// `fts5`; "wrong number of arguments to function highlight()").
+    #[cfg(feature = "fts5")]
+    Fts5Arguments,
+    /// A special INSERT command the table refuses, or a bad setting
+    /// (v0.16, `fts5`; "'delete-all' may only be used with a
+    /// contentless or external content fts5 table", "'rebuild' may not
+    /// be used with a contentless fts5 table", "SQL logic error" for
+    /// an unknown key or value).
+    #[cfg(feature = "fts5")]
+    Fts5Command,
+    /// A write or scan a contentless table cannot do (v0.16, `fts5`;
+    /// "cannot DELETE from contentless fts5 table", "t: table does not
+    /// support scanning"). Use the 'delete' command, or a MATCH.
+    #[cfg(feature = "fts5")]
+    Fts5Contentless,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

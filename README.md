@@ -856,6 +856,34 @@ aspirations.
   clause; `rtreecheck()`, `rtreenode()`, `rtreedepth()`; ALTER
   TABLE RENAME. Shadow tables are read only, as under the pin
   shell's defensive mode.
+- **FTS5 full-text search** (leaf `fts5`, in `max`; on the `vtab`
+  framework). `CREATE VIRTUAL TABLE t USING fts5(...)` with columns,
+  `UNINDEXED`, `prefix=`, `content=` / `content_rowid=` (external
+  content kept by triggers), `content=''` (contentless),
+  `columnsize=0`, `detail=full|column|none` and the tokenizers
+  `unicode61` (`remove_diacritics 0/1/2`, `tokenchars`,
+  `separators`, `categories`; the Unicode tables generated in-crate),
+  `ascii`, `porter <inner>` and `trigram` (`case_sensitive`,
+  `remove_diacritics`). The index is written byte for byte as the
+  pin writes it — `%_data` (structure record, averages, leaf pages,
+  doclist indexes), `%_idx`, `%_content`, `%_docsize`, `%_config` —
+  with the pin's pending-term flush points (commit, savepoints,
+  statement savepoints, rowid order, `hashsize`) and its segment
+  merging (automerge, crisismerge, usermerge, `merge`, `optimize`),
+  so either engine continues the other's files and the pin's
+  `INSERT INTO t(t) VALUES('integrity-check')` passes on hipp's.
+  Queries: the full query syntax (phrases, `prefix*`, `^`,
+  `NEAR(..., N)`, `col:` / `{a b}:` / `-col:` filters, AND / OR /
+  NOT with the pin's precedence and implicit AND, parentheses,
+  quoting), `MATCH`, `t = 'q'` and `t('q')`, LIKE / GLOB patterns on
+  trigram tables, rowid ranges, `ORDER BY rank` with `rank MATCH
+  'bm25(...)'` and the `rank` setting, `bm25()` with weights,
+  `highlight()`, `snippet()`, and `fts5vocab` tables (`row`, `col`,
+  `instance`). The special INSERT commands `delete`, `delete-all`,
+  `rebuild`, `optimize`, `merge`, `automerge`, `crisismerge`,
+  `usermerge`, `pgsz`, `hashsize`, `rank` and `integrity-check`;
+  ALTER TABLE RENAME. Transactions, savepoints and crashes recover
+  the shadow tables like any other table's pages.
 
 ## What v0.13 does
 
@@ -1183,8 +1211,9 @@ written, pointer maps kept), no
 ATTACH without the `attach` leaf (refused; with it, one file is
 attached once — hipp has no shared page cache), no virtual tables
 without the `vtab` leaf (a file holding one is refused at open; with
-it `generate_series` and `dbstat`, R*Trees with `rtree`, any other
-module "no such module"), no multi-process
+it `generate_series` and `dbstat`, R*Trees with `rtree`, FTS5 tables
+and `fts5vocab` with `fts5`, any other module "no such module"), no
+multi-process
 locking — and **no `sqlite3_*` C ABI, ever** (D3): hipp is a
 Rust library, not a drop-in replacement.
 

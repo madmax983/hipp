@@ -422,6 +422,10 @@ pub struct Pager<S: Storage> {
     /// handles (v0.16, `without_rowid`; see `crate::wr`).
     #[cfg(feature = "without_rowid")]
     pub wr: crate::wr::WrState,
+    /// Rollbacks so far (v0.16, `fts5`): a full-text table's pending
+    /// terms belong to the transaction they were written in.
+    #[cfg(feature = "fts5")]
+    pub txn_gen: u64,
     /// The write-ahead log, while the database is in WAL mode
     /// (v0.16, `wal`).
     #[cfg(feature = "wal")]
@@ -655,6 +659,8 @@ impl<S: Storage> Pager<S> {
                 sub_off: 0,
                 #[cfg(feature = "without_rowid")]
                 wr: crate::wr::WrState::default(),
+                #[cfg(feature = "fts5")]
+                txn_gen: 0,
                 #[cfg(feature = "wal")]
                 wal,
                 #[cfg(feature = "wal")]
@@ -1689,6 +1695,10 @@ impl<S: Storage> Pager<S> {
     /// begun, the journal is replayed from the sidecar — the same
     /// code path open-recovery uses.
     pub async fn rollback(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "fts5")]
+        {
+            self.txn_gen = self.txn_gen.wrapping_add(1);
+        }
         #[cfg(feature = "v16")]
         self.sp_clear();
         match self.stage {

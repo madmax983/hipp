@@ -7689,6 +7689,227 @@ shadow-table writes, queries and checks ≈ 32 KiB; 173,744 B of the
   (`integrity_check(t)` of other tables works).
 - hipp-cli's `.tables` does not list virtual tables.
 
+### FTS5 full-text search (2026-11-05)
+
+**Status:** implemented, differential-tested against the live
+3.54.1 pin, gated: leaf `fts5` (implies `vtab`, `without_rowid` for
+the WITHOUT ROWID `%_idx` / `%_config`, and `math` for bm25's `log`),
+in `max` (ADR 0002), not `full`; its own `v16,vtab,without_rowid,
+math,fts5` line in `ci/feature-sets.txt`. It is a module on the
+`vtab` framework (no second virtual-table path). Without the leaf a
+file holding an fts5 table opens and the table is "no such module",
+as before.
+
+**Shipped:**
+
+- **CREATE VIRTUAL TABLE t USING fts5(...)** (`src/fts5/config.rs`):
+  columns (`UNINDEXED`; `rank` / `rowid` / duplicates refused),
+  `prefix=`, `tokenize=`, `content=` / `content_rowid=`,
+  `content=''`, `contentless_delete=` (on contentless tables),
+  `columnsize=`, `detail=full|column|none`, the pin's argument
+  errors; the shadow tables `%_data`, `%_idx`, `%_content`,
+  `%_docsize`, `%_config` created in the pin's order with its text
+  (`CREATE TABLE 't_data'(...)`; the parser now accepts a string
+  literal as a CREATE TABLE name with the leaf), the empty structure
+  record (`V2` marker for contentless_delete) and averages, the
+  `version` row. DROP removes them; ALTER TABLE RENAME renames them
+  with the pin's quoted text (syncing the table first, as
+  `sqlite3Fts5StorageRename` does).
+- **Tokenizers** (`src/fts5/tok.rs`): `unicode61` with
+  `remove_diacritics 0/1/2`, `tokenchars`, `separators`,
+  `categories`; `ascii` with `tokenchars` / `separators`; `porter`
+  over any inner tokenizer (the pin's generated stemmer steps);
+  `trigram` with `case_sensitive` and `remove_diacritics`. The
+  Unicode category, case-folding and diacritic tables
+  (`src/fts5/unicode.rs`, ~10 KiB) are generated in-crate from the
+  pin's own tokenizer output over every code point (clean-room: no
+  SQLite source was read or copied), so the categories, folds and
+  diacritic stripping are the pin's, astral planes included.
+- **The index, byte for byte** (`src/fts5/mod.rs`): the pending-term
+  hash with the pin's byte accounting, the flush into a new level-0
+  segment (leaf pages of `pgsz` with the pin's term / rowid / pgidx
+  encoding and page-splitting of long doclists, doclist indexes,
+  `%_idx` rows), the structure record (levels, segments, write
+  counter, cookie), averages, segment ids (smallest unused);
+  automerge (work units of 64 pages, `automerge` 0-64), crisismerge,
+  usermerge, `merge` with positive / negative page budgets,
+  `optimize` (and its incremental form), promotion of segments,
+  incremental merges with trimmed input segments — the multi-segment
+  iterator is the pin's tournament (older duplicates skipped in its
+  order, which decides where trimmed segments restart). Deletes and
+  updates write the pin's delete markers; `delete-all`, `rebuild`,
+  `integrity-check` (the index compared with the tokenized content,
+  `%_docsize` and the averages), `pgsz` / `hashsize` / `automerge` / `crisismerge` /
+  `usermerge` / `deletemerge` / `rank` settings with the pin's value
+  rules and cookie bump. The whole `%_data` image of a table is read
+  per write (an in-memory store whose writes are applied through the
+  pager in the pin's order).
+- **Flush points** (`session::fts5`): commit (xSync); every
+  savepoint (user SAVEPOINT, and the statement savepoint the pin
+  opens for a statement with a statement journal); RELEASE /
+  ROLLBACK TO's level rules; a rowid below the last pending one (or
+  equal without a delete); `hashsize`; config commands; fts5vocab
+  cursors and RENAME (a full sync). ROLLBACK and ROLLBACK TO discard
+  pending terms; autocommit writes fired by triggers are flushed in
+  the same transaction.
+- **Queries** (`src/fts5/expr.rs`): the full query grammar (phrases,
+  `+`, `prefix*`, `^`, `NEAR(... , N)`, column filters `col:`,
+  `{a b}:`, `-col:` / `-{...}:`, AND / OR / NOT precedence, implicit
+  AND, parentheses, quoting, the pin's syntax errors and the
+  detail=column/none refusals), evaluated with the pin's node
+  semantics (candidate rows of an AND whose phrase tests fail stay
+  "nomatch" and expose no positions; NOT's left side; empty phrases
+  dropped from NEAR groups and implicit ANDs); prefix queries read
+  the prefix indexes exactly as the pin chooses them. `t MATCH q`,
+  `col MATCH q`, `t = q`, `t(q)`, rowid `=` / ranges, several MATCH
+  terms ANDed; `ORDER BY rank` (the pin's sorter: rows by the live
+  rank, the sorted cursor's phrase data on detail != full) with
+  `rank MATCH 'bm25(...)'` and the `rank` setting; `ORDER BY rowid
+  [DESC]`. LIKE / GLOB on a trigram table (no diacritics folding)
+  become the pin's pattern queries (`sqlite3Fts5ExprPattern`:
+  runs of three or more characters, ANDed token by token on
+  detail != full), still checked by the WHERE clause.
+- **Auxiliary functions** (`src/fts5/aux.rs`): `bm25()` with
+  per-column weights (column sizes from `%_docsize`, the tokenized
+  content, or -1 on contentless tables without it), `highlight()`
+  and `snippet()` with the pin's instance iteration, sentence
+  scoring and corruption checks; on detail=column/none the instance
+  lists come from retokenizing the row, as the pin's.
+- **fts5vocab** `row` / `col` / `instance` over a table (NULL for
+  zero counts, the pin's column names), with the sync its cursor
+  does.
+- The entry points the statement engine awaits (sync, savepoint,
+  release, writes, reads) box their futures, so statements re-entered
+  by trigger programs keep their stack frames small (1000-deep
+  recursive triggers still fit the CLI's stack).
+- Transactions, savepoints and crash safety: the shadow tables are
+  ordinary pages under the pager's journals; `tests/crash.rs` covers
+  flush, merge, optimize, statement and savepoint rollback and an
+  external-content table kept by triggers.
+
+**Probing notes (live pin):**
+
+- Shadow tables: created data, idx, content, docsize, config, their
+  names quoted as string literals; after ALTER TABLE RENAME as
+  double-quoted identifiers. An empty table's structure record is
+  `00000000 000000` (cookie, levels, segments, write counter; with
+  `FF000001` after the cookie for contentless_delete) and its
+  averages record is empty.
+- Pending terms are flushed at commit and by **every** xSavepoint:
+  a user SAVEPOINT, and the statement savepoint of statements with
+  a statement journal (an fts5 INSERT of several rows or from a
+  SELECT, UPDATE / DELETE not by `rowid =`, statements on tables
+  with triggers, multi-row writes on tables with constraints).
+  RELEASE of level i flushes only when deeper savepoints were seen;
+  ROLLBACK TO discards. Queries read pending terms without flushing,
+  but a prefix scan of them resets the delete flag, so the next
+  write of the same rowid flushes; fts5vocab cursors and RENAME do a
+  full sync (pending terms and the averages).
+- A write with a rowid below the last pending one flushes first; so
+  does one equal to it unless the previous op was its delete.
+- Merges: which duplicate entry the tournament iterator skips
+  decides where an incrementally merged input segment is trimmed
+  (`%_data` bytes differ otherwise). `merge` N > 0 only merges a
+  level with at least `usermerge` segments; N < 0 merges any level
+  with more than one.
+- `snippet()` reports corruption (an instance past the column size,
+  e.g. contentless `columnsize=0`, where sizes are -1) only for the
+  **last** column it scans: the next column's xColumnText overwrites
+  the error code. bm25 on such tables uses -1 per column.
+- `ORDER BY rank` on detail=column/none: rows come in live-rank
+  order but the auxiliary functions see the sorted cursor's phrase
+  data (all phrases populated, then CheckPoslists), so the
+  displayed rank is recomputed and can differ from the order.
+- `-col : x` leaving no columns is not EOF; a nested filter that
+  intersects to nothing is. NEAR drops phrases a tokenizer makes
+  empty (trigram tokens under three characters).
+- A column filter on detail=none is an error; so is any phrase or
+  NEAR query on detail=column/none. `fts5vocab(db, t, type)` is only
+  accepted in TEMP ("wrong number of vtable arguments" in main).
+- LIKE / GLOB constraints on trigram tables are passed to xBestIndex
+  (`L` / `G` in idxStr, not omitted); case-sensitive trigram takes
+  GLOB only; with remove_diacritics no pattern is used. Patterns
+  with no three-character run give a full scan.
+- An unknown rank function errors only when the rank is used.
+- An automatic rowid after 9223372036854775807 is random on the pin
+  (the tests avoid it); the shell truncates SQL text at a NUL.
+
+**Tests:** `tests/fts5_v16.rs` (18 tests: CREATE text and argument
+errors, RENAME; 14 tokenizer configurations over multi-script text
+compared through fts5vocab and `%_data` bytes; a 4,355-word porter
+corpus built to reach every rule; 54 queries of every operator ×
+5 query shapes (MATCH, `=`, table-valued, column MATCH, ORDER BY
+rank, highlight, snippet, bm25 with weights) on detail=full / column
+/ none, prefix indexes, porter, contentless and external-content
+tables; plans and errors; snippets / highlights; trigram LIKE /
+GLOB; every special command with `%_data` / `%_idx` / `%_config`
+bytes; rowids and conflict clauses; transactions and savepoints;
+external content kept by triggers; fts5vocab; 14 regressions, one
+per bug found; 40 generated workloads (`HIPP_FTS5_CORPUS` for more;
+500 run clean locally, plus ~800 seeds of the scratch generator) of
+random configuration — tokenizer, detail, prefix, columnsize,
+UNINDEXED, normal / external-with-triggers / contentless content,
+fts5vocab, pgsz / automerge / crisismerge / usermerge / hashsize /
+rank settings — with inserts, multi-row inserts, REPLACE, deletes,
+updates, rowid moves, optimize / rebuild / merge, transactions and
+savepoints and random queries, comparing every output line and the
+shadow tables statement by statement, then the pin's
+integrity-check on hipp's file and hipp's on the pin's; files moving
+between the engines mid-workload both ways). `tests/crash.rs`
+`v16_crash_fts5_writes`; `hipp-cli/tests/cli_v16_fts5.rs`
+(byte-identical stdout: queries, ranks and REAL rendering,
+highlight / snippet, fts5vocab and commands, external content and
+trigram LIKE, error lines, `.schema`).
+
+**Gates:** `ci/local-gates.sh` (full) passes: fmt, clippy `-D
+warnings` (default, all features, every feature-set line including
+`v16,vtab,without_rowid,math,fts5`), workspace tests, the no_std
+targets, the three size gates.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**:
+the leaf is in `max` only); max **999,692 B** (Δ **+124,860 B**,
+ratchet raised to it — over the 32 KiB justification threshold: the
+generated Unicode tables ≈ 10 KiB, the four tokenizers and porter
+≈ 9 KiB, the index writer / merger / reader ≈ 35 KiB, the query
+parser and evaluator ≈ 22 KiB, bm25 / highlight / snippet ≈ 9 KiB,
+the session glue (writes, flush points, special commands,
+integrity-check, vocab, planning) ≈ 38 KiB; FTS5 is the largest
+SQLite extension and has no smaller faithful form; 48,884 B of the
+1 MiB budget remain, so it stays in `max` without a new ADR).
+
+**Honest gaps:**
+
+- `contentless_delete=1` tables are created and written byte for
+  byte, but DELETE / UPDATE on them (tombstone pages) is refused
+  (`Unsupported`); `secure-delete`, `insttoken`, `locale=1`,
+  `tokendata=1` and `contentless_unindexed=1` are refused.
+- fts5 tables and fts5vocab tables in TEMP or attached databases
+  are refused (so is the three-argument fts5vocab form); custom
+  tokenizers and auxiliary functions cannot be registered.
+- An unknown rank function (`rank MATCH 'nosuch()'`) is an error
+  even when the rank is never read (the pin's is lazy).
+- Query results are materialized before the first row: an error
+  mid-query (e.g. snippet's corruption check on a later row) fails
+  the statement where the pin first returns the earlier rows.
+- The statement-journal flush follows a heuristic of the pin's
+  `usesStmtJournal` (multi-row writes, triggers, constraints); a
+  statement shape it misjudges flushes pending terms at a different
+  point, giving different (valid) segment layouts. Writes fired by
+  triggers inside a multi-row outer statement in an explicit
+  transaction approximate the pin's savepoint nesting likewise. A
+  failing multi-row fts5 statement in a transaction restores the
+  pending terms instead of keeping a segment the pin flushed.
+- The `hashsize` accounting follows the pin's byte formula for
+  ordinary terms; very long tokens may flush at slightly different
+  points.
+- Every write reads the table's whole `%_data` into memory, and
+  queries read the doclists they need from it: correct at any size,
+  but slow and memory-hungry for very large indexes.
+- PRAGMA integrity_check does not run fts5's xIntegrity (use
+  `INSERT INTO t(t) VALUES('integrity-check')`).
+- The hidden table column's value (`SELECT t FROM t`) is a row
+  handle, not the pin's cursor pointer value (both meaningless).
+
 ## v0.15 — insert-side split distribution (2026-11-01)
 
 **Status:** implemented, differential-tested against the
