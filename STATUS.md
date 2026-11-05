@@ -8416,10 +8416,11 @@ remain); both ratchets are set to those measured values. The merge also
 pushed a debug build's IN-subquery path past the 512 KiB thread of
 `budgeted_limits_on_a_small_stack_refuse_cleanly` (about 12 KiB more
 stack under the lazy cursor's nested async calls, more under
-`-C instrument-coverage`): the debug `STACK_BASE` of
-`Config::stack_budget` is re-measured at 352 KiB (was 320 KiB), so
-the derived limits refuse before the stack runs out in both the plain
-and the coverage build. Release constants are unchanged.
+`-C instrument-coverage`, and more with debug info on, as CI
+builds): the debug `STACK_BASE` of `Config::stack_budget` is
+re-measured at 384 KiB (was 320 KiB; 368 KiB was the smallest that
+held in CI's plain test build), so the derived limits refuse before
+the stack runs out in every build CI runs. Release constants are unchanged.
 
 **Honest gaps:**
 

@@ -345,12 +345,14 @@ pub const STACK_PER_TRIGGER: usize = 16 * 1024;
 
 /// The stack hipp needs for any statement, before nesting (v0.16;
 /// measured on x86_64 — the step future and the call path to the
-/// parser and executor). The debug figure was re-measured at 352 KiB
-/// after the lazily decoded index cursor (`btree::LazyPage`) added
-/// about 12 KiB to a debug build's seek path, and more under
-/// `-C instrument-coverage` (ci/coverage.sh runs the same suite).
+/// parser and executor). The debug figure was re-measured at 384 KiB
+/// after the lazily decoded index cursor (`btree::LazyPage`) grew a
+/// debug build's seek path: it covers the worst build CI runs, a
+/// debug build with debug info under `-C instrument-coverage`
+/// (ci/coverage.sh), where tests/depth_v16.rs and
+/// tests/triggers_v16.rs pass on their budgeted threads.
 #[cfg(all(feature = "v04", debug_assertions))]
-pub const STACK_BASE: usize = 352 * 1024;
+pub const STACK_BASE: usize = 384 * 1024;
 #[cfg(all(feature = "v04", not(debug_assertions)))]
 pub const STACK_BASE: usize = 64 * 1024;
 /// The most stack one symbol of `Config::max_parser_depth` costs
