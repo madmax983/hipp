@@ -8,8 +8,9 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
 (ADR 0003): tiny 76,960 B (budget 128 KiB), full 500,200 B (512
-KiB: every rung + `params`, `math`), max 1,032,068 B (1,022,404 B at
-the release, + 9,664 B of FTS5 review fixes; 1 MiB: full +
+KiB: every rung + `params`, `math`), max 1,034,772 B (1,022,404 B at
+the release, + 9,664 B of FTS5 review fixes, + 2,704 B of EXPLAIN
+QUERY PLAN review fixes; 1 MiB: full +
 `window`, `triggers`, `foreign_keys`, `json`, `expr_index`,
 `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
 `autovacuum`, `vtab`, `rtree`, `fts5`, `explain`). The last unit,
@@ -8184,7 +8185,7 @@ the leaf `EXPLAIN` is an unsupported statement, as before.
   `SCAN n CONSTANT ROWS`; the sorters (`USE TEMP B-TREE FOR ORDER BY`
   / `LAST TERM OF` / `LAST n TERMS OF ORDER BY`, `GROUP BY`,
   `DISTINCT` — including the pin's DISTINCT-as-GROUP-BY rewrite —
-  and `f(DISTINCT)`); `[CORRELATED] SCALAR SUBQUERY n` / `[CORRELATED]
+  and `f(DISTINCT)` / `f(ORDER BY)`); `[CORRELATED] SCALAR SUBQUERY n` / `[CORRELATED]
   LIST SUBQUERY n` where they are evaluated (IN probes with their
   loop); `CO-ROUTINE` / `MATERIALIZE` of FROM subqueries, views and
   CTEs by the pin's `fromClauseTermCanBeCoroutine` rule (a shared
@@ -8194,7 +8195,7 @@ the leaf `EXPLAIN` is an unsupported statement, as before.
   SUBQUERY` / `UNION ALL` trees (UNION's LIMIT 1 shortcut as UNION
   ALL); UPDATE / DELETE target loops (COVERING when the pin collects
   rowids first), UPDATE ... FROM, INSERT ... SELECT / VALUES with
-  subqueries / RETURNING, CREATE TABLE ... AS, INSTEAD OF writes of
+  subqueries / RETURNING / an upsert's DO UPDATE, CREATE TABLE ... AS, INSTEAD OF writes of
   views; nothing for statements without a plan (DDL, PRAGMA,
   transactions, one-row INSERT VALUES). Statements routed to the TEMP
   or an attached database are explained there.
@@ -8233,10 +8234,15 @@ the leaf `EXPLAIN` is an unsupported statement, as before.
 - `SCAN` names the alias, else `[schema.]name` as written;
   `MATERIALIZE` / `CO-ROUTINE` name a view or CTE by its own name,
   else the alias, else `(subquery-n)`.
-- Rows are emitted in code-generation order: `f(DISTINCT)` sorters,
-  FROM subqueries, loops (with their IN-probe subqueries and ON
+- Rows are emitted in code-generation order: without GROUP BY the
+  aggregates' `f(DISTINCT)` / `f(ORDER BY)` sorters first, then FROM
+  subqueries, loops (with their IN-probe subqueries and ON
   subqueries), WHERE subqueries, GROUP BY sorter, HAVING, result
-  subqueries, DISTINCT, ORDER BY subqueries, ORDER BY sorter.
+  subqueries, (with GROUP BY: the aggregates' sorters here), DISTINCT,
+  ORDER BY subqueries, ORDER BY sorter. The aggregates' sorters come
+  in `aFunc` order (result list, ORDER BY, HAVING), one per distinct
+  call, `f(DISTINCT)` before `f(ORDER BY)` for each; a DISTINCT call
+  whose one ORDER BY key is its one argument shows only `f(ORDER BY)`.
 - 3.54 merges UNION / INTERSECT / EXCEPT even without ORDER BY
   (`MERGE (op)`, members sorted by every column); UNION ALL members
   after the last merging operator are `UNION ALL` siblings of the
@@ -8249,8 +8255,18 @@ the leaf `EXPLAIN` is an unsupported statement, as before.
 - INSERT VALUES rows: one row is no plan; constant rows are one
   `n-ROW VALUES CLAUSE` co-routine (two select numbers); rows with
   subqueries are `n CONSTANT ROWS`, one select per row.
-- Triggers' programs are not shown; a table with triggers or FK
-  actions makes UPDATE / DELETE collect rowids first (COVERING loop).
+- Triggers' programs are not shown. An UPDATE / DELETE loop through
+  an index is COVERING only when the pin collects the rowids first
+  and the loop is not a one-row lookup: RETURNING, a trigger for the
+  event, foreign keys the write must check (`sqlite3FkRequired`: an
+  UPDATE only when it changes a key), OR REPLACE, a rowid change, a
+  WHERE subquery; never for a WITHOUT ROWID table, a UNIQUE `=`
+  lookup, or because the SET changes the loop's index.
+- An upsert's DO UPDATE shows its WHERE's and SET's subqueries after
+  the INSERT's, then the RETURNING's twice (once for the update, once
+  for the insert). `SELECT count(*) FROM t` names the table, never
+  its alias or schema (the pin's `isSimpleCount` loop). `SCAN` keeps
+  a `temp.` / attached schema as written, on every route.
 
 **Differences from the pin (hipp prints what it runs):** no query
 flattening (FROM subqueries, views and CTEs stay CO-ROUTINE /
@@ -8259,7 +8275,10 @@ order, so a rowid lookup into an earlier table is not used); no
 automatic indexes or Bloom filters; EXISTS stays a subquery (no
 `SCAN u EXISTS`); IN subqueries are lists (no `USING INDEX i FOR
 IN-OPERATOR` / `USING ROWID SEARCH ON TABLE`); no MULTI-INDEX OR; no
-min() / max() lookup (`SEARCH t USING COVERING INDEX i`); RIGHT /
+min() / max() optimization (`SEARCH t USING COVERING INDEX i`, or a
+bare `SEARCH t` without an index); an UPDATE / DELETE WHERE key
+compared with a scalar subquery does not drive the target loop
+(`SCAN t`; SELECT uses it); RIGHT /
 FULL joins and UPDATE ... FROM sources read whole tables;
 `count(DISTINCT x)` sorts even over x's index; DELETE without WHERE
 deletes row by row (`SCAN t`; the pin truncates); an INSTEAD OF
@@ -8310,11 +8329,97 @@ remain.
   the pin's observed order on the probed shapes; deeper nests (a
   view in a view's subquery, multi-row VALUES inside compounds) may
   number differently.
-- The schema qualifier of a table read through an attached-database
-  route is not printed (`SCAN t` for `aux.t`).
+- VALUES labels inside compounds and CTEs follow hipp's shapes, not
+  always the pin's (`SCAN 2-ROW VALUES CLAUSE` where the pin says `SCAN
+  2 CONSTANT ROWS` in a CTE body; a UNION of VALUES members sorts no
+  VALUES member).
 - FK-action and trigger programs are not shown (as on the pin), but
   neither are hipp's FK child scans the pin shows for a parent
   DELETE (`SCAN child`).
+
+### EXPLAIN QUERY PLAN — review fixes (2026-11-05)
+
+**Status:** all nine review findings reproduced and fixed, each with
+a regression test against the live pin. The two wrong answers were
+introduced by the unit's own planner changes (ungated `expr_index` /
+`window` code; the release notes no longer present those changes as
+plain fixes). The rest are EXPLAIN QUERY PLAN text (leaf `explain`).
+
+**Fixed:**
+
+- *Wrong answer:* a window query with an outer ORDER BY on a column
+  outside its result list ignored the ORDER BY (`SELECT a, sum(a)
+  OVER (ORDER BY b) FROM t ORDER BY c`): the window key replaced the
+  ORDER BY in the planner's input, so its columns dropped out of the
+  needed set and an index was taken as covering (EQP printed `USING
+  COVERING INDEX`); the sorter then sorted NULLs. `CoreInfo` now
+  carries the core's own ORDER BY as columns read (`also_reads`). The
+  same input change also made `OVER ()` read through the ORDER BY's
+  index; an empty window key now means the natural order, as on the
+  pin.
+- *Wrong answer:* a UNION read through the pin's LIMIT 1 first-row
+  shortcut (a written `LIMIT 1`, or the implicit one of a scalar /
+  EXISTS subquery without a LIMIT) planned its members for the merge
+  key, so the left-most member's first row was the rowid order's, not
+  its own plan's (`SELECT (SELECT a FROM t UNION SELECT 99)`).
+  `merge_member` now returns no key for that shape; the parser marks
+  scalar / EXISTS subqueries (`SelectStmt::first_row`, `expr_index`).
+- Without `expr_index` (e.g. `v16,explain`) the single-table fast
+  path's index lookup printed `SCAN t`; it prints `SEARCH t USING
+  INDEX i (col=?)`, and a lookup a NULL or non-numeric literal
+  short-circuits prints the seek it stands for. (Checked by hand on a
+  `std,full,explain` build: the test suites run under `max`.)
+- UPDATE / DELETE loops printed COVERING whenever hipp's own UPDATE
+  took two passes (a SET changing the loop's index), for a WITHOUT
+  ROWID table, for a one-row UNIQUE lookup, and whenever `PRAGMA
+  foreign_keys` was on; now the pin's rule (probing notes above).
+- `USE TEMP B-TREE FOR f(ORDER BY)` is shown (it never was), with the
+  pin's function names (`string_agg`, `median`, the `json_` /
+  `jsonb_` group functions); grouped queries print the aggregates'
+  sorters after the loop, the GROUP BY sorter and the result
+  subqueries; a call repeated in the ORDER BY counts once.
+- An upsert's DO UPDATE subqueries (WHERE, SET, and the RETURNING it
+  fires) were missing.
+- A VALUES core used as a subquery numbered one select too many
+  (`IN (VALUES (1))` is `LIST SUBQUERY 1`).
+- A statement routed to the TEMP or an attached database dropped its
+  schema qualifiers (`SCAN tt` for `temp.tt`, `sqlite_schema` for
+  `sqlite_temp_master`); they are put back as written. Found on the
+  way: `SELECT count(*) FROM t AS q` named the alias (the pin's
+  count loop names the table) on every route.
+- Docs: CHANGELOG / README describe the two regressions; ADR 0003
+  counts seventeen leaves.
+
+**Tests:** `tests/eqp_v16.rs::review_fixes_match_pin` (rows of the
+window / UNION shapes vs the pin, and 70 plans: write loops,
+aggregate sorters, upserts, VALUES numbers, count loops),
+`routed_qualifiers_match_pin` (19 plans on TEMP / attached routes);
+`hipp-cli/tests/cli_v16_eqp_review.rs` (two byte-identical
+scripts). A scratch differential fuzzer over the regression classes
+(window + outer ORDER BY, UNION / EXISTS / scalar UNION with and
+without LIMIT 1, DISTINCT LIMIT; 300 random schemas × 12 queries,
+rows vs the pin) found no difference after the fixes;
+`HIPP_EQP_SEEDS=200` keeps the generated plans within the corpus
+threshold.
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**:
+the new field and checks are under `expr_index` / `explain`); max
+**1,034,772 B** (Δ **+2,704 B**, ratchet raised; 13,804 B of the 1
+MiB budget remain).
+
+**Honest gaps:**
+
+- hipp does not parse several ON CONFLICT clauses on one INSERT (the
+  pin's chained upsert: a syntax error in hipp); one clause is
+  explained as above.
+- The foreign-key part of the COVERING rule asks `fk_target` (hipp's
+  `sqlite3FkRequired`), and the pin's FK child scans on a parent
+  write are still not shown.
+- The TEMP / attached qualifiers are put back by name: a statement
+  reading one table both qualified and unqualified (without aliases)
+  prints the qualifier on both loops.
 
 ## v0.15 — insert-side split distribution (2026-11-01)
 

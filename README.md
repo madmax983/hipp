@@ -30,7 +30,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 500,200 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,032,068 B | 1 MiB |
+| `max` | `--no-default-features --features max` | 1,034,772 B | 1 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -952,7 +952,13 @@ LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
   prints what it runs (STATUS.md). Comparing plans fixed access-path
   choices that ordered rows unlike the pin (window functions,
   compound members, GROUP BY / DISTINCT over a permuted index, rowid
-  IN lists, `IS NULL` on NOT NULL keys).
+  IN lists, `IS NULL` on NOT NULL keys); the review of the unit found
+  that two of these introduced wrong answers of their own (a window
+  query's outer ORDER BY on an unselected column was ignored, and a
+  UNION's LIMIT 1 shortcut returned another first row), both fixed
+  before release, along with the `f(ORDER BY)` sorters, upsert
+  subqueries, write-loop COVERING and TEMP / attached qualifiers in
+  the plans.
 
 ## What v0.13 does
 
@@ -1239,7 +1245,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,200 B of 512 KiB, `max` 1,032,068 B of 1 MiB; ADR 0003) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,200 B of 512 KiB, `max` 1,034,772 B of 1 MiB; ADR 0003) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

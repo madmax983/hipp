@@ -113,6 +113,10 @@ pub struct AggExt {
     /// equal keys surviving, instead of by the first-seen DISTINCT
     /// test.
     pub unique: bool,
+    /// The call was spelled `string_agg` (v0.16, `explain`: EXPLAIN
+    /// QUERY PLAN names the function as the pin does).
+    #[cfg(feature = "explain")]
+    pub string_agg: bool,
 }
 
 /// One aggregate node, taken apart (`agg_parts`): its kind and
@@ -3234,6 +3238,8 @@ fn resolve_call_body<E>(
                         order,
                         filter,
                         unique,
+                        #[cfg(feature = "explain")]
+                        string_agg: eq_ci(name, b"string_agg"),
                     }))
                 }
             }

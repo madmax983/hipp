@@ -827,3 +827,196 @@ fn planner_fixes_keep_pin_rows() {
         ],
     );
 }
+
+/// Review fixes (2026-11-05), each against the live pin: the window
+/// core's loop still reads the outer ORDER BY's columns, a UNION with
+/// the first-row shortcut reads its members in their own order, the
+/// write loops' COVERING, the aggregates' `f(ORDER BY)` sorters and
+/// their place under GROUP BY, the upsert's subqueries, VALUES select
+/// numbers, the count(*) loop's name.
+#[test]
+fn review_fixes_match_pin() {
+    let path = db(
+        "eqp-review",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c, d TEXT, e);
+         CREATE INDEX tb ON t(b);
+         CREATE INDEX tcd ON t(c, d);
+         CREATE TABLE u(x, y);
+         CREATE UNIQUE INDEX ux ON u(x);
+         CREATE TABLE e(p, q);
+         CREATE TABLE w(k PRIMARY KEY, v, z) WITHOUT ROWID;
+         CREATE INDEX wv ON w(v);
+         CREATE TABLE par(id INTEGER PRIMARY KEY, g);
+         CREATE INDEX parg ON par(g);
+         CREATE TABLE ch(pid REFERENCES par(id), h);
+         INSERT INTO t VALUES (1,10,3,'x',5),(2,20,1,'y',4),(3,30,2,'z',6),(4,10,2,'w',1);
+         INSERT INTO u VALUES (1,5),(2,6);
+         INSERT INTO e VALUES (1,2),(2,3),(1,4);",
+    );
+    // Rows: the window core with an outer ORDER BY on a column it
+    // does not select; `OVER ()` read in table order; the UNION
+    // LIMIT 1 shortcut (written, and a scalar subquery's own).
+    let rows = [
+        "SELECT a, sum(a) OVER (ORDER BY b) FROM t ORDER BY c",
+        "SELECT a, sum(a) OVER (ORDER BY a DESC) FROM t WHERE c=2 ORDER BY e",
+        "SELECT a, count(*) OVER (PARTITION BY d ORDER BY d) FROM t ORDER BY b",
+        "SELECT c, group_concat(a) OVER () FROM t ORDER BY d, a",
+        "SELECT a FROM t UNION SELECT 99 LIMIT 1",
+        "SELECT (SELECT a FROM t UNION SELECT 99)",
+        "SELECT c FROM t UNION SELECT x FROM u LIMIT 1",
+        "SELECT x FROM u WHERE EXISTS (SELECT b FROM t UNION SELECT y)",
+        "SELECT a FROM t UNION SELECT 99 LIMIT 2",
+    ];
+    block_on(async {
+        let mut c = open(&path).await;
+        for q in rows {
+            let mut st = c.prepare(q).await.expect(q);
+            let mut got = String::new();
+            while let Step::Row = st.step().await.expect(q) {
+                for i in 0..st.column_count() {
+                    if i > 0 {
+                        got.push('|');
+                    }
+                    match st.column_value(i) {
+                        Some(hipp::Value::Integer(v)) => got += &v.to_string(),
+                        Some(hipp::Value::Text(b)) => got += &String::from_utf8_lossy(b),
+                        _ => {}
+                    }
+                }
+                got.push('\n');
+            }
+            drop(st);
+            assert_eq!(got, common::cli(&path, q), "{q}");
+        }
+    });
+    let mut plans: Vec<&str> = rows.to_vec();
+    plans.extend_from_slice(&[
+        // Write loops: COVERING only when the pin collects rowids
+        // first and the lookup is not one row.
+        "UPDATE t SET b=1 WHERE b=2",
+        "UPDATE t SET d='q' WHERE c=2",
+        "UPDATE t SET b=b+1 WHERE b>2",
+        "UPDATE t SET a=5 WHERE b=2",
+        "UPDATE t SET c=d WHERE b=2 RETURNING a",
+        "UPDATE OR REPLACE t SET c=1 WHERE b=2",
+        "UPDATE u SET x=1 WHERE x=2",
+        "UPDATE u SET y=1 WHERE x=2 RETURNING x",
+        "UPDATE u SET x=x+1 WHERE x>2 RETURNING x",
+        "DELETE FROM u WHERE x=2 RETURNING (SELECT count(*) FROM e)",
+        "DELETE FROM u WHERE x=2 RETURNING y",
+        "DELETE FROM t WHERE b=2 RETURNING c",
+        "DELETE FROM t WHERE c=2",
+        "UPDATE w SET z=1 WHERE v=2",
+        "UPDATE w SET k=1 WHERE v=2",
+        "DELETE FROM w WHERE v=2 RETURNING k",
+        "UPDATE ch SET h=1 WHERE h=2",
+        // Aggregate sorters: f(ORDER BY), the pin's names, one per
+        // distinct call, after the loop under GROUP BY.
+        "SELECT group_concat(c ORDER BY d) FROM t",
+        "SELECT b, string_agg(c, ',' ORDER BY d) FROM t GROUP BY b",
+        "SELECT p, count(DISTINCT q) FROM e GROUP BY p",
+        "SELECT count(DISTINCT c) FROM t GROUP BY b",
+        "SELECT b, count(DISTINCT c), sum(DISTINCT d) FROM t GROUP BY b",
+        "SELECT p, count(DISTINCT q) FROM e GROUP BY p ORDER BY 2",
+        "SELECT DISTINCT p, count(DISTINCT q) FROM e GROUP BY p",
+        "SELECT p, group_concat(q ORDER BY p DESC), count(DISTINCT q) FROM e GROUP BY p",
+        "SELECT p, count(DISTINCT q ORDER BY p) FROM e GROUP BY p",
+        "SELECT p FROM e GROUP BY p HAVING count(DISTINCT q) > 1 ORDER BY group_concat(q ORDER BY q)",
+        "SELECT group_concat(DISTINCT q ORDER BY q) FROM e",
+        "SELECT group_concat(DISTINCT q ORDER BY p) FROM e",
+        "SELECT count(q ORDER BY p), count(q ORDER BY p) FROM e",
+        "SELECT count(DISTINCT q) FILTER (WHERE p>1), count(DISTINCT q) FROM e",
+        "SELECT sum(q ORDER BY p) FILTER (WHERE p>1) FROM e",
+        "SELECT median(DISTINCT q), json_group_array(DISTINCT q) FROM e",
+        "SELECT total(DISTINCT q), avg(DISTINCT q ORDER BY q), jsonb_group_object(p, q ORDER BY p) FROM e",
+        "SELECT percentile(q, 50 ORDER BY p), percentile_cont(q, 0.5 ORDER BY q) FROM e",
+        "SELECT json_group_array(q ORDER BY p), string_agg(q, ',' ORDER BY q) FROM e",
+        "SELECT p, (SELECT group_concat(a ORDER BY b) FROM t WHERE c=e.p) FROM e",
+        "SELECT count(*) OVER (), group_concat(q ORDER BY p) FROM e",
+        "SELECT c, group_concat(d ORDER BY d) FROM t GROUP BY c",
+        // Upsert DO UPDATE subqueries: WHERE, SET, then RETURNING for
+        // the update and again for the insert.
+        "INSERT INTO u VALUES(2,3) ON CONFLICT(x) DO UPDATE SET y=(SELECT p FROM e)",
+        "INSERT INTO u VALUES(2,(SELECT p FROM e)) ON CONFLICT(x) DO UPDATE SET y=(SELECT q FROM e) RETURNING (SELECT p+1 FROM e)",
+        "INSERT INTO u SELECT p, q FROM e WHERE true ON CONFLICT(x) DO UPDATE SET y=(SELECT q+1 FROM e) WHERE y > (SELECT q+2 FROM e)",
+        "INSERT INTO u VALUES(2,3) ON CONFLICT(x) DO UPDATE SET y=(SELECT q FROM e WHERE p=excluded.y)",
+        "INSERT INTO u VALUES(2,3),(4,5) ON CONFLICT(x) DO UPDATE SET y=EXISTS(SELECT 1 FROM e)",
+        "INSERT INTO u VALUES(2,3) ON CONFLICT(x) DO NOTHING",
+        // VALUES select numbers.
+        "SELECT * FROM t WHERE b IN (VALUES (1))",
+        "SELECT * FROM t WHERE b IN (VALUES (1),(2),(3))",
+        "SELECT (VALUES (1),(2))",
+        "SELECT * FROM t WHERE b IN (VALUES (1) UNION SELECT p FROM e)",
+        "SELECT * FROM t WHERE b IN (VALUES (3),(4) UNION ALL SELECT p FROM e)",
+        // The count(*) loop names the table.
+        "SELECT count(*) FROM main.t",
+        "SELECT count(*) FROM t AS q",
+        "SELECT count() FROM e",
+        "SELECT count(*) FROM w",
+    ]);
+    same_plans(&path, &plans);
+}
+
+/// A statement routed to the TEMP or an attached database prints the
+/// schema qualifiers as written (review fix), as on the pin.
+#[test]
+fn routed_qualifiers_match_pin() {
+    let path = db("eqp-routed", "CREATE TABLE m(x);");
+    let setup = [
+        "CREATE TEMP TABLE tt(a, b)",
+        "CREATE INDEX temp.tti ON tt(a)",
+        "ATTACH ':memory:' AS aux",
+        "CREATE TABLE aux.at(a, b)",
+        "CREATE INDEX aux.ati ON at(a)",
+    ];
+    let qs = [
+        "SELECT * FROM temp.tt",
+        "SELECT * FROM TEMP.tt",
+        "SELECT * FROM tt",
+        "SELECT * FROM temp.tt AS z",
+        "SELECT * FROM \"temp\".\"tt\" WHERE a=1",
+        "DELETE FROM temp.tt WHERE b=1",
+        "UPDATE temp.tt SET b=1 WHERE a=1",
+        "SELECT * FROM temp.tt WHERE a IN (SELECT b FROM temp.tt)",
+        "SELECT (SELECT count(*) FROM temp.tt) FROM temp.tt t2",
+        "SELECT count(*) FROM temp.tt",
+        "SELECT * FROM temp.sqlite_master",
+        "SELECT * FROM SQLITE_TEMP_MASTER",
+        "SELECT * FROM \"sqlite_temp_schema\"",
+        "SELECT * FROM aux.at",
+        "SELECT * FROM AUX.at WHERE a=1",
+        "SELECT t.a FROM aux.at t",
+        "DELETE FROM aux.at WHERE b=1",
+        "SELECT * FROM aux.sqlite_master",
+        "SELECT * FROM main.m, temp.tt",
+    ];
+    for q in qs {
+        let pin = common::cli(
+            &path,
+            &format!("{};\nEXPLAIN QUERY PLAN {q};", setup.join(";\n")),
+        );
+        let got = block_on(async {
+            let mut c = open(&path).await;
+            for s in setup {
+                let mut st = c.prepare(s).await.expect(s);
+                while let Step::Row = st.step().await.expect(s) {}
+            }
+            let mut st = c
+                .prepare(&format!("EXPLAIN QUERY PLAN {q}"))
+                .await
+                .expect(q);
+            let mut rows = Vec::new();
+            while let Step::Row = st.step().await.expect(q) {
+                let d =
+                    String::from_utf8(st.column_bytes(3).expect("detail").to_vec()).expect("utf8");
+                rows.push((
+                    st.column_i64(0).expect("id"),
+                    st.column_i64(1).expect("parent"),
+                    d,
+                ));
+            }
+            render(&rows)
+        });
+        assert_eq!(got, pin, "{q}");
+    }
+}

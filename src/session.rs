@@ -1719,7 +1719,23 @@ impl<S: Storage> Connection<S> {
             },
             e => e,
         })?;
-        let rows = st.eqp_rows().await?;
+        #[allow(unused_mut)]
+        let mut rows = st.eqp_rows().await?;
+        if let Plan::Temp { .. } = &st.plan {
+            eqp::requalify::<S::Error>(&mut rows, rest.as_bytes(), b"temp", true, &st.arena);
+        }
+        #[cfg(feature = "attach")]
+        if let Plan::Att(p) = &st.plan
+            && let Some(a) = st.conn.attached.as_slice().get(p.db)
+        {
+            eqp::requalify::<S::Error>(
+                &mut rows,
+                rest.as_bytes(),
+                a.name.as_slice(),
+                false,
+                &st.arena,
+            );
+        }
         st.plan = Plan::Explain(rows);
         #[cfg(feature = "params")]
         {
@@ -5006,13 +5022,16 @@ impl<S: Storage> Connection<S> {
         } else {
             None
         };
+        // (A window core's key replaces its ORDER BY even when empty,
+        // `OVER ()`: its rows are read in their natural order — v0.16
+        // review fix.)
         #[cfg(all(feature = "expr_index", feature = "window"))]
-        let (merge_key, info_limit) = match win_key {
-            Some(k) => (k, None),
-            None => (merge_key, limit.as_ref()),
+        let (keyed, merge_key, info_limit) = match win_key {
+            Some(k) => (true, k, None),
+            None => (!merge_key.is_empty(), merge_key, limit.as_ref()),
         };
         #[cfg(all(feature = "expr_index", not(feature = "window")))]
-        let info_limit = limit.as_ref();
+        let (keyed, info_limit) = (!merge_key.is_empty(), limit.as_ref());
         #[cfg(feature = "expr_index")]
         self.plan_accesses(
             arena,
@@ -5025,14 +5044,15 @@ impl<S: Storage> Connection<S> {
                 filter: filter.as_ref(),
                 group_by: group_by.as_slice(),
                 having: having.as_ref(),
-                order_by: if merge_key.is_empty() {
-                    order_by.as_slice()
-                } else {
+                order_by: if keyed {
                     merge_key.as_slice()
+                } else {
+                    order_by.as_slice()
                 },
                 has_agg,
                 distinct: stmt.distinct,
                 limit: info_limit,
+                also_reads: order_by.as_slice(),
             },
         )?;
         // v0.16 (`json`, `vtab`): what a lateral `json_each` or
@@ -14018,8 +14038,20 @@ type MergeSpec = (AVec<(usize, bool, bool)>, bool);
 /// BY by name or expression (planned without a key).
 #[cfg(all(feature = "expr_index", feature = "v09"))]
 fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
-    use crate::sql::CompoundOp::UnionAll;
+    use crate::sql::CompoundOp::{Union, UnionAll};
     if stmt.order_by.is_empty() {
+        // The first-row shortcut reads the members as UNION ALL
+        // ones, each in its own order (`union_first_row`; v0.16
+        // review fix: the left-most member's first row was the
+        // merge key's, not the pin's).
+        let one = match stmt.limit.as_deref() {
+            None => stmt.first_row,
+            Some(Expr::Literal(crate::sql::Literal::Integer(1))) => !stmt.first_row,
+            Some(_) => false,
+        };
+        if one && stmt.offset.is_none() && stmt.compound.iter().all(|(op, _)| *op == Union) {
+            return None;
+        }
         return stmt
             .compound
             .iter()

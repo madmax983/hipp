@@ -45,6 +45,11 @@ use crate::sql::{CompoundOp, JoinKind, SortOrder};
 /// The rows of an EXPLAIN QUERY PLAN: (id, parent, detail).
 pub(super) type EqpRows = AVec<(i64, i64, AVec<u8>)>;
 
+/// The last byte of a count(*) loop's detail until the row is
+/// returned (`step_explain` drops it): `requalify` leaves the line
+/// as it is.
+const COUNT_MARK: u8 = 0;
+
 /// Where the statement after a leading `EXPLAIN QUERY PLAN` starts,
 /// if `sql` has one; plain `EXPLAIN` is refused
 /// (`ParseKind::ExplainBytecode`).
@@ -305,32 +310,54 @@ fn subs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     }
 }
 
-/// The DISTINCT aggregates of `e` (`USE TEMP B-TREE FOR f(DISTINCT)`).
-fn distinct_aggs(e: &RExpr, out: &mut AVec<&'static [u8]>) {
-    use crate::query::AggKind as K;
+/// The aggregate calls of `e` that sort or deduplicate their
+/// arguments in a temp B-tree (`USE TEMP B-TREE FOR f(DISTINCT)` /
+/// `f(ORDER BY)`), each once: the pin's `aFunc` list holds one entry
+/// per distinct call.
+fn agg_sorters<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     if let RExpr::Agg {
-        kind,
-        distinct: true,
+        distinct,
         lvl: 0,
+        ext,
         ..
     } = e
     {
-        out.push(match kind {
-            K::Count => b"count",
-            K::Sum => b"sum",
-            K::Avg => b"avg",
-            K::Total => b"total",
-            K::Min => b"min",
-            K::Max => b"max",
-            K::GroupConcat => b"group_concat",
-            _ => b"",
-        });
+        let order = ext.as_ref().is_some_and(|x| !x.order.is_empty());
+        if (*distinct || order) && !out.iter().any(|o| crate::query::same_expr(o, e)) {
+            out.push(e);
+        }
         return;
     }
     let mut kids: AVec<&RExpr> = AVec::new();
     children(e, &mut kids);
     for k in kids.iter() {
-        distinct_aggs(k, out);
+        agg_sorters(k, out);
+    }
+}
+
+/// An aggregate's name as the pin's function table spells it.
+fn agg_name(kind: crate::query::AggKind, ext: Option<&crate::query::AggExt>) -> &'static [u8] {
+    use crate::query::AggKind as K;
+    match kind {
+        K::Count => b"count",
+        K::Sum => b"sum",
+        K::Avg => b"avg",
+        K::Total => b"total",
+        K::Min => b"min",
+        K::Max => b"max",
+        K::GroupConcat if ext.is_some_and(|x| x.string_agg) => b"string_agg",
+        K::GroupConcat => b"group_concat",
+        K::Median => b"median",
+        K::Percentile => b"percentile",
+        K::PercentileCont => b"percentile_cont",
+        K::PercentileDisc => b"percentile_disc",
+        #[cfg(feature = "json")]
+        K::Json(j) => match (j.object, j.blob) {
+            (false, false) => b"json_group_array",
+            (false, true) => b"jsonb_group_array",
+            (true, false) => b"json_group_object",
+            (true, true) => b"jsonb_group_object",
+        },
     }
 }
 
@@ -717,7 +744,7 @@ impl<'a> Walk<'a> {
                 return self.window(c, parent, classes.as_slice());
             }
         }
-        self.body(c, parent, own_order);
+        self.body(c, parent, own_order, c);
     }
 
     /// The window co-routines (v0.16, `window`): class 0 is computed
@@ -752,7 +779,7 @@ impl<'a> Walk<'a> {
             values: &[],
             sel: c.sel,
         };
-        self.body(&inner, p, false);
+        self.body(&inner, p, false, c);
         // The innermost class's keys, which the loop may deliver.
         let keys = crate::window::class_keys(c.items, None).unwrap_or_default();
         let first = c
@@ -807,17 +834,90 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// A core's loops, subqueries and sorters.
-    fn body(&mut self, c: &Core<'_>, parent: i64, own_order: bool) {
-        let mut aggs: AVec<&'static [u8]> = AVec::new();
-        for e in c.items.iter().chain(c.having) {
-            distinct_aggs(e, &mut aggs);
+    /// The table of a core the pin answers by counting a B-tree's
+    /// entries (its `isSimpleCount`): `SELECT count(*) FROM t`, one
+    /// table, no WHERE, GROUP BY or HAVING, no DISTINCT or FILTER.
+    fn simple_count(&self, c: &Core<'_>) -> Option<&'a TableDef> {
+        let [sp] = c.sources else { return None };
+        let [
+            RExpr::Agg {
+                kind: crate::query::AggKind::Count,
+                star: true,
+                distinct: false,
+                lvl: 0,
+                ext: None,
+                ..
+            },
+        ] = c.items
+        else {
+            return None;
+        };
+        if c.filter.is_some()
+            || !c.group_by.is_empty()
+            || c.having.is_some()
+            || sp.derived.is_some()
+        {
+            return None;
+        }
+        #[cfg(feature = "vtab")]
+        if sp.vt.is_some() {
+            return None;
+        }
+        self.cat
+            .tables
+            .iter()
+            .find(|t| t.root == sp.root && sp.root > 1)
+    }
+
+    /// The aggregates' temp B-trees of core `c` (`agg_sorters`), in
+    /// the pin's `aFunc` order: the result list's calls, then the
+    /// ORDER BY's, then the HAVING's. A DISTINCT call whose one ORDER
+    /// BY key is its argument deduplicates in its ORDER BY sorter.
+    fn agg_lines(&mut self, c: &Core<'_>, parent: i64) {
+        let mut aggs: AVec<&RExpr> = AVec::new();
+        for e in c.items.iter() {
+            agg_sorters(e, &mut aggs);
         }
         for (e, _) in c.order_by.iter() {
-            distinct_aggs(e, &mut aggs);
+            agg_sorters(e, &mut aggs);
         }
-        for a in aggs.iter() {
-            self.add(parent, &[b"USE TEMP B-TREE FOR ", a, b"(DISTINCT)"]);
+        if let Some(h) = c.having {
+            agg_sorters(h, &mut aggs);
+        }
+        for e in aggs.iter() {
+            let RExpr::Agg {
+                kind,
+                distinct,
+                ext,
+                ..
+            } = e
+            else {
+                continue;
+            };
+            let name = agg_name(*kind, ext.as_deref());
+            let (order, unique) = ext
+                .as_ref()
+                .map_or((false, false), |x| (!x.order.is_empty(), x.unique));
+            if *distinct && !unique {
+                self.add(parent, &[b"USE TEMP B-TREE FOR ", name, b"(DISTINCT)"]);
+            }
+            if order {
+                self.add(parent, &[b"USE TEMP B-TREE FOR ", name, b"(ORDER BY)"]);
+            }
+        }
+    }
+
+    /// A core's loops, subqueries and sorters; `aggs`: the core whose
+    /// aggregates these loops feed (`c` itself, or the core a window
+    /// co-routine computes).
+    fn body(&mut self, c: &Core<'_>, parent: i64, own_order: bool, aggs: &Core<'_>) {
+        // The aggregates' sorters open before the loop without a GROUP
+        // BY, and with one where each group's accumulators are reset:
+        // after the loop, the GROUP BY sorter and the result columns
+        // (v0.16 review fix: `f(ORDER BY)` was never shown, and a
+        // grouped `f(DISTINCT)` came first).
+        if c.group_by.is_empty() {
+            self.agg_lines(aggs, parent);
         }
         // The subqueries an access path probes with: shown with its
         // loop, not again with the WHERE.
@@ -884,9 +984,26 @@ impl<'a> Walk<'a> {
                 None => self.select_sub(d, id),
             }
         }
+        let count_of = self.simple_count(c);
         for (i, sp) in c.sources.iter().enumerate() {
             let mut line = AVec::new();
             self.loop_line(sp, &mut line, &mut probes);
+            // The pin's count(*) loop names the table itself, never an
+            // alias or schema (v0.16 review fix); `COUNT_MARK` keeps a
+            // routed statement's qualifier off it (`requalify`).
+            if let Some(t) = count_of {
+                let mut shown = AVec::new();
+                self.scan_name(sp, &mut shown);
+                let tail = line
+                    .as_slice()
+                    .get(shown.len().saturating_add(5)..)
+                    .unwrap_or(&[]);
+                let mut l = copy_vec(b"SCAN ");
+                l.extend_from_slice(handle_bytes(self.ca, t.name));
+                l.extend_from_slice(tail);
+                l.push(COUNT_MARK);
+                line = l;
+            }
             if i > 0 && sp.kind.pads_right() {
                 line.extend_from_slice(b" LEFT-JOIN");
             }
@@ -936,6 +1053,9 @@ impl<'a> Walk<'a> {
             self.exprs(core::slice::from_ref(h), parent, &[]);
         }
         self.exprs(c.items, parent, &[]);
+        if !c.group_by.is_empty() {
+            self.agg_lines(aggs, parent);
+        }
         // The pin turns a DISTINCT whose ORDER BY is its result list
         // (any directions) into a GROUP BY, which then delivers the
         // ORDER BY.
@@ -1356,7 +1476,7 @@ impl<'a> Walk<'a> {
                 values: &[],
                 sel: 0,
             };
-            self.body(&c, 0, false);
+            self.body(&c, 0, false, &c);
         }
         if let Some(f) = filter {
             self.exprs(core::slice::from_ref(f), 0, probes.as_slice());
@@ -1466,17 +1586,35 @@ pub(super) fn describe<S: Storage>(
                     .map_or(AVec::new(), |f| source_names(f, arena).0),
                 _ => AVec::new(),
             };
-            match access {
-                Access::Rowid(_) => w.add(
+            // The lookup a `WHERE col = literal` became (v0.16 review
+            // fix: a secondary-index lookup, and the one a NULL or
+            // non-numeric literal short-circuits, printed as SCAN).
+            let (rowid, ix) = legacy_lookup(conn, ast, arena, access);
+            if rowid {
+                w.add(
                     0,
                     &[
                         b"SEARCH ",
                         name.as_slice(),
                         b" USING INTEGER PRIMARY KEY (rowid=?)",
                     ],
-                ),
-                _ => w.add(0, &[b"SCAN ", name.as_slice()]),
-            };
+                );
+            } else if let Some((ix, col)) = ix {
+                w.add(
+                    0,
+                    &[
+                        b"SEARCH ",
+                        name.as_slice(),
+                        b" USING INDEX ",
+                        ix.as_slice(),
+                        b" (",
+                        col.as_slice(),
+                        b"=?)",
+                    ],
+                );
+            } else {
+                w.add(0, &[b"SCAN ", name.as_slice()]);
+            }
         }
         Plan::Update {
             #[cfg(feature = "expr_index")]
@@ -1530,7 +1668,7 @@ pub(super) fn describe<S: Storage>(
                 let trig = false;
                 let two = trig
                     || !returning.is_empty()
-                    || conn.prag.foreign_keys
+                    || table(*root).is_some_and(|t| conn.fk_required(arena, t, None))
                     || filter.as_ref().is_some_and(crate::query::has_sub);
                 let mut a = a.clone();
                 a.eqp.1 &= two;
@@ -1551,6 +1689,7 @@ pub(super) fn describe<S: Storage>(
             select,
             rows_r,
             rows_v,
+            upsert,
             returning,
             ..
         } => {
@@ -1567,6 +1706,21 @@ pub(super) fn describe<S: Storage>(
                 for r in rows.iter() {
                     w.exprs(r.as_slice(), 0, &[]);
                 }
+            }
+            // The DO UPDATE runs inside the constraint checks: its
+            // WHERE, its SET, and the RETURNING it fires (the pin
+            // codes the RETURNING again for the update) — v0.16
+            // review fix: none of these were shown.
+            if let Some(up) = upsert.as_ref().filter(|u| u.do_update) {
+                if let Some(f) = &up.filter {
+                    w.exprs(core::slice::from_ref(f), 0, &[]);
+                }
+                for (_, e) in up.sets.iter() {
+                    w.exprs(core::slice::from_ref(e), 0, &[]);
+                }
+                let n = w.seen.len();
+                w.exprs(returning.as_slice(), 0, &[]);
+                w.seen.truncate(n);
             }
             w.exprs(returning.as_slice(), 0, &[]);
         }
@@ -1602,14 +1756,12 @@ pub(super) async fn collect<T: Storage>(
         return Err(Error::Unsupported);
     };
     let prep: Prep<'_, '_, T> = Box::pin(c.prepare(t));
-    let mut st = prep.await?;
-    let mut rows = AVec::new();
-    while let Step::Row = st.step().await? {
-        let id = st.column_i64(0).unwrap_or(0);
-        let parent = st.column_i64(1).unwrap_or(0);
-        rows.push((id, parent, copy_vec(st.column_bytes(3).unwrap_or(&[]))));
+    let st = prep.await?;
+    // The rows as made, marks included (`COUNT_MARK`).
+    match &st.plan {
+        Plan::Explain(rows) => Ok(rows.clone()),
+        _ => Err(Error::Unsupported),
     }
-    Ok(rows)
 }
 
 impl<S: Storage> Statement<'_, S> {
@@ -1665,7 +1817,9 @@ impl<S: Storage> Statement<'_, S> {
                 r.push(OwnedValue::Integer(*id));
                 r.push(OwnedValue::Integer(*parent));
                 r.push(OwnedValue::Integer(0));
-                r.push(OwnedValue::Text(d.clone()));
+                let d = d.as_slice();
+                let d = d.strip_suffix(&[COUNT_MARK]).unwrap_or(d);
+                r.push(OwnedValue::Text(copy_vec(d)));
                 out.push(r);
                 self.query_rowids.push(None);
             }
@@ -1674,5 +1828,154 @@ impl<S: Storage> Statement<'_, S> {
             self.query_pos = 0;
         }
         self.step_query().await
+    }
+}
+
+/// An index lookup's (index name, key column name).
+type IndexLine = (AVec<u8>, AVec<u8>);
+
+/// The lookup a single-table scan's `WHERE col = literal` made
+/// (`Connection::plan_legacy_select`): whether it seeks the rowid,
+/// or the index (name, key column) it reads. An `Access::Empty`
+/// lookup (a NULL, or a literal no rowid equals) is the seek the
+/// literal's column took, decided before reading anything.
+fn legacy_lookup<S: Storage>(
+    conn: &Connection<S>,
+    ast: &Ast,
+    arena: &Arena,
+    access: &Access,
+) -> (bool, Option<IndexLine>) {
+    let ca = &conn.catalog_arena;
+    #[cfg_attr(
+        not(all(feature = "indexes", not(feature = "expr_index"))),
+        allow(unused_variables)
+    )]
+    let index_line = |root: u32| {
+        let ix = conn.catalog.indexes.iter().find(|i| i.root == root)?;
+        let t = conn.catalog.find(ca, handle_bytes(ca, ix.table))?;
+        let c = ix.columns.as_slice().first()?.col?;
+        let col = t.columns.as_slice().get(c)?;
+        Some((
+            copy_vec(handle_bytes(ca, ix.name)),
+            copy_vec(handle_bytes(ca, col.name)),
+        ))
+    };
+    match access {
+        Access::FullScan => (false, None),
+        Access::Rowid(_) => (true, None),
+        #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
+        Access::Index { root, .. } => (false, index_line(*root)),
+        Access::Empty => {
+            let Ast::Select(s) = ast else {
+                return (false, None);
+            };
+            let (Some(f), Some(Expr::Binary(BinOp::Eq, l, _))) =
+                (s.from.as_slice().first(), s.filter.as_ref())
+            else {
+                return (false, None);
+            };
+            let (Expr::Column { name, .. }, Some(t)) = (
+                l.as_ref(),
+                conn.catalog.find(ca, handle_bytes(arena, f.table)),
+            ) else {
+                return (false, None);
+            };
+            match conn.resolve_target(t, handle_bytes(arena, *name)) {
+                Ok(Target::Rowid) => (true, None),
+                Ok(Target::Col(i)) if Some(i) == t.rowid_alias => (true, None),
+                #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
+                Ok(Target::Col(i)) => match conn.plan_index_access(
+                    t,
+                    handle_bytes(arena, f.table),
+                    i,
+                    arena,
+                    Literal::Integer(0),
+                ) {
+                    Some(Access::Index { root, .. }) => (false, index_line(root)),
+                    _ => (false, None),
+                },
+                _ => (false, None),
+            }
+        }
+    }
+}
+
+/// Put back the schema qualifiers of a statement routed to the TEMP
+/// or an attached database (v0.16 review fix): that database runs
+/// the statement's text with the qualifiers `schema.` cut (and
+/// `sqlite_temp_schema` / `sqlite_temp_master` read as its
+/// `sqlite_schema`), so its loops name the tables bare; the pin
+/// prints `SCAN temp.t` for `FROM temp.t`, the schema as written.
+/// `sql` is the statement as written; `temp`: the TEMP route.
+pub(super) fn requalify<E>(
+    rows: &mut EqpRows,
+    sql: &[u8],
+    schema: &[u8],
+    temp: bool,
+    arena: &Arena,
+) {
+    use crate::sql::lexer::Tok;
+    let Ok(toks) = crate::sql::parser::tokens::<E>(sql, arena) else {
+        return;
+    };
+    let t = toks.as_slice();
+    let name = |i: usize| match t.get(i).map(|x| x.tok) {
+        Some(Tok::Ident(h, _)) | Some(Tok::Text(h)) => Some(handle_bytes(arena, h)),
+        _ => None,
+    };
+    let is_dot = |i: usize| t.get(i).is_some_and(|x| x.tok == Tok::Dot);
+    // (the name the routed database prints, the pin's).
+    let mut map: AVec<(AVec<u8>, AVec<u8>)> = AVec::new();
+    for i in 0..t.len() {
+        let Some(n) = name(i) else { continue };
+        if is_dot(i + 1) {
+            continue;
+        }
+        let shown: &[u8] = if temp && super::temp::is_temp_schema_name(n) {
+            b"sqlite_schema"
+        } else {
+            n
+        };
+        let q = i
+            .checked_sub(2)
+            .filter(|_| i.checked_sub(1).is_some_and(is_dot))
+            .and_then(|k| name(k).filter(|q| eq_ci(q, schema)).map(|q| (k, q)));
+        let mut pin = AVec::new();
+        match q {
+            Some((k, q)) if k.checked_sub(1).is_none_or(|d| !is_dot(d)) => {
+                pin.extend_from_slice(q);
+                pin.push(b'.');
+            }
+            Some(_) => continue,
+            None if temp && shown != n => {}
+            None => continue,
+        }
+        pin.extend_from_slice(n);
+        if !map.iter().any(|(s, _)| s.as_slice() == shown) {
+            map.push((copy_vec(shown), pin));
+        }
+    }
+    for (_, _, d) in rows.as_mut_slice().iter_mut() {
+        if d.as_slice().last() == Some(&COUNT_MARK) {
+            continue;
+        }
+        let at = if d.as_slice().starts_with(b"SCAN ") {
+            5
+        } else if d.as_slice().starts_with(b"SEARCH ") {
+            7
+        } else {
+            continue;
+        };
+        let rest = d.as_slice().get(at..).unwrap_or(&[]);
+        let Some((shown, pin)) = map.iter().find(|(s, _)| {
+            rest.starts_with(s.as_slice()) && rest.get(s.len()).is_none_or(|c| *c == b' ')
+        }) else {
+            continue;
+        };
+        let mut out = AVec::new();
+        out.extend_from_slice(d.as_slice().get(..at).unwrap_or(&[]));
+        out.extend_from_slice(pin.as_slice());
+        out.extend_from_slice(rest.get(shown.len()..).unwrap_or(&[]));
+        *d = out;
     }
 }

@@ -835,6 +835,12 @@ pub struct SelectStmt {
     /// `(subquery-n)`).
     #[cfg(feature = "explain")]
     pub sel: u32,
+    /// The select is a scalar or EXISTS subquery, which reads its
+    /// first row only (v0.16, `expr_index`): a UNION compound there
+    /// takes the pin's first-row shortcut, so its members are not
+    /// planned for a merge key (`session::merge_member`).
+    #[cfg(all(feature = "expr_index", feature = "v09"))]
+    pub first_row: bool,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`

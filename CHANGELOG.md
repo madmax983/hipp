@@ -17,7 +17,7 @@ leaves). Every item is differential-tested against the live pin.
 |---|---|---|---|
 | tiny | `--no-default-features` | 76,960 B | 128 KiB |
 | full | `full`: every rung + `params`, `math` | 500,200 B | 512 KiB |
-| max | `max` = `full` + the leaves below | 1,022,404 B | 1 MiB |
+| max | `max` = `full` + the leaves below | 1,034,772 B | 1 MiB |
 
 `default = ["std", "max"]`, so the CLI and the tests build everything.
 
@@ -84,7 +84,13 @@ leaves). Every item is differential-tested against the live pin.
   index namespace; constraint-level ON CONFLICT clauses.
 - Access-path choices that ordered rows unlike the pin (window functions,
   compound members, GROUP BY / DISTINCT over a permuted index, DISTINCT
-  over the rowid, rowid IN lists, `IS NULL` on NOT NULL keys).
+  over the rowid, rowid IN lists, `IS NULL` on NOT NULL keys). The window
+  and compound-member changes first introduced two wrong answers, fixed
+  in the same release: a window query's outer ORDER BY on a column it
+  does not select was ignored (the loop's index was taken as covering
+  without that column), and a UNION read through the LIMIT 1 first-row
+  shortcut (written, or a scalar / EXISTS subquery's own) returned
+  another first row than the pin.
 
 ### Not included
 

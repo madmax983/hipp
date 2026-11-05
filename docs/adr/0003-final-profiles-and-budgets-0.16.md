@@ -3,7 +3,7 @@
 - **Status:** accepted (2026-11-05), at the 0.16.0 release
 - **Context:** ADR 0001 set the gating policy and ratchets; ADR 0002
   added the `max` alias for leaves too large for `full`. The v0.16
-  push ended with eighteen leaves and the `v16` rung. This records
+  push ended with seventeen leaves and the `v16` rung. This records
   where each one sits, the measured sizes the ratchets hold, and how
   much budget is left, so the next milestone starts from a written
   baseline rather than from `Cargo.toml` archaeology.
@@ -17,7 +17,7 @@
    |---|---|---|---|---|
    | `tiny` | `--no-default-features` | 76,960 B | 131,072 B | 54,112 B |
    | `full` | `--features full` | 500,200 B | 524,288 B | 24,088 B |
-   | `max` | `--features max` | 1,022,404 B | 1,048,576 B | 26,172 B |
+   | `max` | `--features max` | 1,034,772 B | 1,048,576 B | 13,804 B |
 
    Engine statics stay 0 B in every profile (budget 8 KiB).
 
@@ -32,7 +32,7 @@
    `default = ["std", "max"]`. Each leaf compiles alone on its own
    `ci/feature-sets.txt` line with only its declared dependencies.
 
-4. **The next leaf that does not fit `max`'s remaining 26 KiB gets
+4. **The next leaf that does not fit `max`'s remaining 13 KiB gets
    its own alias outside `max`** (an ADR names it and its budget);
    `max` is not raised past 1 MiB without one. A leaf may move from
    `max` into `full` only with a `full` budget decision.

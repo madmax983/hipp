@@ -733,6 +733,19 @@ impl<'a> Parser<'a> {
         n
     }
 
+    /// The select number of a finished core (v0.16, `explain`): a
+    /// SELECT core takes the next one; a VALUES core's rows were
+    /// numbered as they were read (`values_rows`), the last of them
+    /// being the core's (v0.16 review fix: it counted once more).
+    #[cfg(feature = "explain")]
+    fn core_sel(&self, core: &SelectStmt) -> u32 {
+        if core.values.is_empty() {
+            self.next_sel()
+        } else {
+            self.nsel.get()
+        }
+    }
+
     fn new(toks: AVec<Token>, arena: &'a Arena, sql: &'a [u8], lim: Limits) -> Parser<'a> {
         Parser {
             limit: toks.len(),
@@ -3887,7 +3900,12 @@ impl<'a> Parser<'a> {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
         }
         // `EXISTS LP select RP`.
-        let stmt = self.subquery::<E>(2 + extra_parens)?;
+        #[allow(unused_mut)]
+        let mut stmt = self.subquery::<E>(2 + extra_parens)?;
+        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        {
+            stmt.first_row = true;
+        }
         for _ in 0..=extra_parens {
             self.expect::<E>(Tok::RParen)?;
         }
@@ -3923,7 +3941,12 @@ impl<'a> Parser<'a> {
     fn paren_subquery<E>(&mut self) -> Result<Expr, E> {
         #[cfg(feature = "v06")]
         {
-            let stmt = self.subquery::<E>(1)?;
+            #[allow(unused_mut)]
+            let mut stmt = self.subquery::<E>(1)?;
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            {
+                stmt.first_row = true;
+            }
             self.expect::<E>(Tok::RParen)?;
             self.need::<E>(3)?;
             self.set_h::<E>(self.sel_h + 1, 0)?;
@@ -4518,8 +4541,8 @@ impl<'a> Parser<'a> {
                 // The core before the operator is complete.
                 #[cfg(feature = "explain")]
                 match compound.as_mut_slice().last_mut() {
-                    Some((_, c)) => c.sel = self.next_sel(),
-                    None => head.sel = self.next_sel(),
+                    Some((_, c)) => c.sel = self.core_sel(c),
+                    None => head.sel = self.core_sel(&head),
                 }
                 let core = self.select_core::<E>(last)?;
                 if op == CompoundOp::UnionAll {
@@ -4552,8 +4575,8 @@ impl<'a> Parser<'a> {
         // the pin's grammar gives it (v0.16, `explain`).
         #[cfg(feature = "explain")]
         match head.compound.as_mut_slice().last_mut() {
-            Some((_, c)) => c.sel = self.next_sel(),
-            None => head.sel = self.next_sel(),
+            Some((_, c)) => c.sel = self.core_sel(c),
+            None => head.sel = self.core_sel(&head),
         }
         #[cfg(feature = "v09")]
         if !head.compound.is_empty() && !head.order_by.is_empty() {
@@ -4629,6 +4652,8 @@ impl<'a> Parser<'a> {
             windows: AVec::new(),
             #[cfg(feature = "explain")]
             sel: 0,
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            first_row: false,
         })
     }
 
@@ -4755,6 +4780,8 @@ impl<'a> Parser<'a> {
             windows,
             #[cfg(feature = "explain")]
             sel: 0,
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            first_row: false,
         })
     }
 
@@ -4969,6 +4996,8 @@ impl<'a> Parser<'a> {
             windows: AVec::new(),
             #[cfg(feature = "explain")]
             sel: self.next_sel(),
+            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            first_row: false,
         }
     }
 
