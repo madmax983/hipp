@@ -31,8 +31,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 505,416 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,043,340 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,043,292 B | 1.25 MiB |
+| `max` | `--no-default-features --features max` | 1,044,172 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,053,532 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -52,6 +52,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
   `autovacuum`, `vtab` (virtual tables, generate_series, dbstat),
   `rtree`, `fts5`, `explain` (EXPLAIN QUERY PLAN).
+- **`xl`** adds the leaves past `max`'s budget (ADR 0004):
+  `fts5_delete` (FTS5 tombstones and secure-delete).
 
 ## What v0.17 does
 
@@ -71,6 +73,21 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   it), GROUP BY and DISTINCT buffer as the pin's sorters do;
   `Config::max_vtab_rows` now bounds only what is held. Ungated in
   the `v16` executor (`src/session/stream.rs`).
+- **FTS5 delete writes** (leaf `fts5_delete`, in `xl`). DELETE,
+  UPDATE and INSERT OR REPLACE on `contentless_delete=1` tables
+  write the pin's tombstone hash pages (`fts5IndexTombstoneAdd`:
+  32-slot first page, growth to `pgsz`, then `2n + 1` pages, 4- or
+  8-byte keys, the rowid-0 flag) and the structure's tombstone
+  counters, counted as automerge work and driving `deletemerge`; an
+  UPDATE must set every indexed column (the pin's "cannot UPDATE a
+  subset of columns") and one of UNINDEXED columns only is a no-op.
+  With `secure-delete=1` every delete removes the row's entries
+  from the segments in place (`fts5DoSecureDelete`: entries and
+  terms, emptied and overflow pages, page indexes, `%_idx` rows,
+  `version` 5), byte for byte with the pin in every detail mode;
+  each engine's integrity-check passes on the other's files.
+  Without the leaf those writes are refused as in 0.16
+  (`src/fts5/sdel.rs`).
 
 ## What v0.16 does
 

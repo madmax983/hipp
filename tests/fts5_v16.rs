@@ -1770,9 +1770,11 @@ fn pin_tombstones_are_honoured() {
     }
 }
 
-/// A pin-set `secure-delete`: hipp refuses the deletes it cannot make
-/// in place (the file stays as it was), and deletes once it is off as
-/// the pin does; setting it through hipp stores it as the pin does.
+/// A pin-set `secure-delete`: without the v0.17 `fts5_delete` leaf
+/// hipp refuses the deletes it cannot make in place (the file stays as
+/// it was); with it, it makes them as the pin does. Either way it
+/// deletes once the setting is off as the pin does, and setting it
+/// through hipp stores it as the pin does.
 #[test]
 fn secure_delete_is_not_ignored() {
     let setup = v(&[
@@ -1782,12 +1784,27 @@ fn secure_delete_is_not_ignored() {
     ]);
     let base = common::temp_db("v16fts-sd-base");
     pin_run(&base, &setup);
-    let before = pin_run(&base, &shadow("t")).0;
-    for stmt in [
+    let deletes = [
         "DELETE FROM t WHERE rowid = 10",
         "UPDATE t SET a = 'x' WHERE rowid = 10",
         "INSERT OR REPLACE INTO t(rowid, a) VALUES(10, 'y')",
-    ] {
+    ];
+    // With the v0.17 `fts5_delete` leaf hipp deletes in place as the
+    // pin does (tests/fts5_delete_v17.rs has the corpus).
+    #[cfg(feature = "fts5_delete")]
+    for (i, stmt) in deletes.iter().enumerate() {
+        let h = common::temp_db(&format!("v16fts-sd{i}-h"));
+        let o = common::temp_db(&format!("v16fts-sd{i}-o"));
+        std::fs::copy(&base, &h).expect("copy");
+        std::fs::copy(&base, &o).expect("copy");
+        let mut rest = v(&[stmt]);
+        rest.extend(shadow("t"));
+        same_on(&h, &o, &rest);
+    }
+    #[cfg(not(feature = "fts5_delete"))]
+    let before = pin_run(&base, &shadow("t")).0;
+    #[cfg(not(feature = "fts5_delete"))]
+    for stmt in deletes {
         let (_, f, e) = hipp_run(&base, &v(&[stmt]));
         assert_eq!(f, vec![true], "{stmt}");
         assert!(

@@ -1430,6 +1430,21 @@ pub struct Connection<S: Storage> {
     /// pending terms and totals (v0.16, `fts5`).
     #[cfg(feature = "fts5")]
     fts: AVec<fts5::FtState>,
+    /// Rows counted by fts5 tables' last writes and not yet flushed
+    /// (the pin's `nPendingRow` outlives a commit that flushed
+    /// nothing, and so counts into the next segment's `nEntry`).
+    #[cfg(feature = "fts5")]
+    fts_rows: AVec<(AVec<u8>, u64)>,
+    /// Per fts5 table, the `version` the running statement holds (the
+    /// pin's `Fts5Config::iVersion`, loaded when the statement starts:
+    /// a `delete-all` writes 4 under it; v0.17, `fts5_delete`).
+    #[cfg(feature = "fts5_delete")]
+    fts_ver: AVec<(AVec<u8>, i64)>,
+    /// Per fts5 table, the `secure-delete` setting the connection last
+    /// held (`bSecureDelete` has no default a config reload restores:
+    /// with no `secure-delete` row, a rolled-back setting stays).
+    #[cfg(feature = "fts5_delete")]
+    fts_sd: AVec<(AVec<u8>, bool)>,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1488,6 +1503,12 @@ impl<S: Storage> Connection<S> {
             ext: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "fts5")]
             fts: AVec::new(),
+            #[cfg(feature = "fts5")]
+            fts_rows: AVec::new(),
+            #[cfg(feature = "fts5_delete")]
+            fts_ver: AVec::new(),
+            #[cfg(feature = "fts5_delete")]
+            fts_sd: AVec::new(),
         };
         #[cfg(feature = "utf16")]
         conn.set_text_enc(conn.pager.text_enc());
@@ -7089,6 +7110,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         // written since (v0.16 review fix: terms a trigger program had
         // added stayed in the index): the state after that flush is
         // restored.
+        // A top-level statement loads the fts5 tables' config afresh.
+        #[cfg(feature = "fts5_delete")]
+        if self.phase == Phase::Fresh && !self.conn.fts_in_program() {
+            self.conn.fts_ver.clear();
+        }
         #[cfg(feature = "fts5")]
         let fts_snap = if self.phase == Phase::Fresh
             && self.conn.explicit_txn
@@ -7519,7 +7545,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.conn.pager.rollback().await?;
         self.conn.explicit_txn = false;
         #[cfg(feature = "fts5")]
-        self.conn.fts.clear();
+        {
+            self.conn.fts.clear();
+            self.conn.fts_rows.clear();
+        }
         self.phase = Phase::Done;
         Ok(Step::Done)
     }

@@ -169,6 +169,172 @@ does not contain it, and full stays under its 512 KiB budget.
   the outer source only, which the pin tests at the outer loop, can
   fail there on the pin when the inner source is empty.
 
+### FTS5 delete writes: tombstones and secure-delete (2026-11-05)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated: new leaf `fts5_delete` (requires `fts5`). Placement (ADR
+0004): `max` + the leaf measures 1,053,532 B, past `max`'s 1,048,576 B
+budget (4,404 B were left), so the leaf joins `xl` (`xl = ["max",
+"fts5_delete"]`); its own `v16,vtab,without_rowid,math,fts5,fts5_delete`
+line in `ci/feature-sets.txt`. Without the leaf the 0.16 refusals
+stand (DELETE / UPDATE / REPLACE on contentless_delete tables
+`Unsupported`, deletes under `secure-delete=1` `Fts5SecureDelete`).
+
+**Shipped** (`src/fts5/sdel.rs`; the session glue in `session::fts5`):
+
+- **Tombstones** (`contentless_delete=1`). DELETE, UPDATE and INSERT
+  OR REPLACE look the row up in `%_docsize` (its sizes come off the
+  totals, as the pin's averages show), then add its rowid to the
+  tombstone hash of every segment whose origin range holds the row's
+  origin (`sqlite3Fts5IndexContentlessDelete`: `nEntryTombstone` of
+  the first found, oldest level first, `nContentlessDelete` per page
+  write). The hash is the pin's (`fts5IndexTombstoneAddToPage` /
+  `Rebuild` / `Rehash`): key size 4 until a rowid needs 8, the
+  rowid-0 flag in byte 1, a page refused at half full, the first
+  hash one 32-slot page, a single page regrown to `4 * nElem` slots
+  up to `(pgsz - 8) / szKey`, then `2n + 1` pages, retried with
+  `2n + 1` more until every key fits. The structure's counters change
+  in the cached structure (`FtState::pstruct`, which queries in the
+  same transaction read): written at once when a hash is rebuilt and
+  at the next flush otherwise; the flush counts the tombstones as
+  leaves of automerge work and runs even with no pending terms. An
+  UPDATE must set every indexed column ("cannot UPDATE a subset of
+  columns on fts5 contentless-delete table", `Fts5ContentlessSubset`,
+  rowid changes included); an UPDATE of UNINDEXED columns alone is a
+  no-op on any contentless table (it was refused). `deletemerge`,
+  the merges' tombstone handling and the readers were already the
+  pin's (0.16 review fixes); they now run on hipp-written files.
+- **Secure delete** (`secure-delete=1`, every content mode: DELETE,
+  UPDATE, OR REPLACE, the 'delete' command of contentless and
+  external-content tables). A flush writes no delete markers: each
+  pending delete (`fts5FlushOneHash`'s `bSecureDelete` branch, the
+  term written only once something of it is) removes the row's entry
+  from the newest segment holding it (`fts5FlushSecureDelete`,
+  `fts5DoSecureDelete`), literally as the pin: the entry's bytes and
+  the next entry's rowid delta re-based; the term too when it was its
+  doclist's only entry (the next term on the page takes over its key
+  with the shared prefix re-split), or the term at the end of an
+  earlier page when every page in between is empty; overflowing
+  position lists cut from the pages after (`fts5SecureDeleteOverflow`:
+  emptied pages written as `00000004`, the rest shifted, the page
+  index re-based); the first-rowid header cleared, the page index
+  rebuilt without the removed key; the `%_idx` row of a page left with
+  no term deleted (page 1 keeps its own). The doclist indexes are left
+  stale, as on the pin. The first such delete sets `version` 5 and
+  moves the cookie on; a delete whose pending entry is a delete plus
+  a new position list rewrites the entry without its flag.
+- The connection keeps what the pin's `Fts5Config` keeps: the
+  `version` a statement loaded (a 'rebuild' / 'delete-all' writes 4
+  under it; the commit's flush loads it again) and a `secure-delete`
+  setting a rollback took the row of.
+
+**Fixes on claimed fts5 paths** (ungated, leaf `fts5`, each found by
+the new corpus and kept as a regression):
+
+- A row with no tokens counts into the next segment's `nEntry` (the
+  pin's `nPendingRow` outlives a commit that flushed nothing) —
+  `contentless_delete` structure records differed.
+- `rowid IN (x)` is the pin's `rowid = x` (its parser rewrites a
+  one-value list): no statement-journal flush before it.
+- `integrity-check` compares an external-content table with its
+  content only with rank 1 (the pin's `iArg`): hipp reported
+  corruption where the pin passes.
+- bm25 / `rank` of `0 / 0` (rows of no tokens) is NULL, not 0.0;
+  bm25, snippet and ORDER BY rank on a row with no `%_docsize` entry,
+  or on a table whose totals count no row, are the pin's corruption
+  error (they answered).
+- An UPDATE to a NULL rowid is "datatype mismatch" (the old rowid was
+  kept).
+
+**Oracle-probing notes (live pin):**
+
+- Tombstone pages: `FTS5_TOMBSTONE_ROWID(segid, i)`; byte 0 the key
+  size, byte 1 the rowid-0 flag, bytes 4..8 the element count, slots
+  big-endian. A first delete writes a 136-byte page (32 slots); the
+  totals lose the row's `%_docsize` sizes. The structure record
+  shows `nPgTombstone` / `nEntryTombstone` inside the transaction
+  right after a hash rebuild, otherwise only after the flush; the
+  write counter moves by one per tombstone at the flush.
+- `version` moves to 5 (and the cookie on) at the flush that meets
+  the first pending delete, even when the row's entry is not found;
+  deleting a missing rowid writes nothing. The pin tests the delete
+  flag on the **first byte** of the size varint, so a pending entry
+  whose position list is 64..127 bytes long (first byte odd) also
+  moves it.
+- 'rebuild' / 'delete-all' write `version` 4 without the cookie: a
+  flush later in the same statement still sees 5, the commit's flush
+  (or the next statement) sees 4 and moves it again.
+- A rolled-back `secure-delete` setting stays on in the connection
+  (`sqlite3Fts5ConfigLoad` has no default for it).
+- A secure delete of an entry that the pin's walk mis-parses (a
+  detail=none delete-and-reinsert marker written before the setting
+  was on) grows the page by a byte: reproduced as written; see the
+  gaps.
+- detail=none: a row deleted and written again in one pending batch
+  keeps the rows after it in the doclist.
+
+**Tests:** `tests/fts5_delete_v17.rs` (10 tests: tombstone pages in
+three detail modes and page sizes — growth to multi-page hashes,
+8-byte keys, rowid 0, negative rowids, deletes in a transaction with
+the structure dumped part-way; contentless_delete DELETE / UPDATE /
+REPLACE semantics and errors; deletemerge / automerge / merge /
+optimize over tombstones; secure deletes in six detail / page size /
+prefix configurations — single terms, page heads, runs of pages,
+400-token position lists; secure-delete on contentless 'delete',
+external content kept by triggers, histories with delete markers
+from before the setting, the setting toggled, 'rebuild'; savepoints,
+ROLLBACK TO and ROLLBACK over pending tombstones and secure deletes;
+12 regressions; 40 generated workloads of random configuration and
+write / delete / update / replace / optimize / merge / rebuild /
+delete-all / transaction sequences and 40 page-level workloads of
+long doclists over small pages (`HIPP_FTS5_DELETE_CORPUS` for more:
+1,300 seeds of the scratch generators ran clean), every shadow table
+compared statement by statement, then each engine's integrity-check
+on the other's file; files moving between the engines both ways).
+`tests/crash.rs` `v17_crash_fts5_delete_writes` (tombstones with a
+savepoint rolled back, deletemerge, secure deletes, secure deletes
+then optimize: every crash point recovers to the pre- or post-image).
+`hipp-cli/tests/cli_v17_fts5_delete.rs` (byte-identical stdout,
+error lines included). `tests/fts5_v16.rs` `secure_delete_is_not_ignored`
+now compares the deletes with the pin when the leaf is built.
+
+**Gates:** `ci/local-gates.sh` (full) passes: fmt, clippy `-D
+warnings` (default, all features, every feature-set line), workspace
+tests, the no_std targets, the four size gates; `depth_v16` /
+`triggers_v16` also pass built with debug info (the fts5 write path
+stays boxed; `Config::stack_budget` unchanged). `link.x`'s FLASH
+region grew to 2 MiB so the `xl` sizing demo links (it overflowed
+the 1 MiB region; the measured sections are unchanged).
+
+**Size Δ** (thumbv7em, `--profile tiny`): tiny 76,960 → 76,960 (0);
+full 505,416 → 505,416 (0); max 1,043,340 → 1,044,172 (+832: the
+ungated fts5 fixes above); xl 1,043,292 → 1,053,532 (+10,240: the
+fixes and the leaf, which is xl − max = 9,360 B — the tombstone
+hash, the secure-delete walk and page edits, the flush branch and
+the session glue). Ratchets: `[max]` 1,044,172, `[xl]` 1,053,532.
+
+**Honest gaps:**
+
+- After the pin's own secure delete corrupts a detail=none page (a
+  row whose newest entry is a delete-and-reinsert marker written
+  while `secure-delete` was off), hipp writes the same bytes, but its
+  later reads and merges of that page differ from the pin's; the
+  corpus keeps detail=none tables in secure-delete from the start.
+- The pin seeks with `%_idx` and the (stale) doclist indexes; hipp
+  walks the segment. They find the same entry on any index either
+  engine writes; on one whose doclist index points past a page a
+  secure delete emptied, the pin may read the next term's rowids.
+- Flush points still follow the 0.16 statement-journal heuristic
+  (see the FTS5 section's gap); a rolled-back config command leaves
+  the pin's connection with its new cookie, which hipp does not keep
+  (only the `secure-delete` setting is kept).
+- A matched row whose `%_docsize` entry is gone is an error for
+  bm25 / snippet / ORDER BY rank, but a `rank` column read without
+  ORDER BY rank still answers; ORDER BY rowid DESC over such rows
+  fails before the first row (the pin returns the rows before it).
+- Not done (still refused): `contentless_unindexed=1`, `insttoken`,
+  `tokendata=1`, `locale=1`.
+
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
@@ -8180,7 +8346,9 @@ SQLite extension and has no smaller faithful form; 48,884 B of the
   below), but DELETE / UPDATE on them (writing tombstone pages) is
   refused (`Unsupported`); deletes while `secure-delete=1` is set
   are refused (`Fts5SecureDelete`: hipp does not remove entries in
-  place); `insttoken`, `locale=1`, `tokendata=1` and
+  place) (closed in v0.17: leaf `fts5_delete` writes the tombstones
+  and makes the secure deletes, see "FTS5 delete writes" above);
+  `insttoken`, `locale=1`, `tokendata=1` and
   `contentless_unindexed=1` are refused.
 - fts5 tables and fts5vocab tables in TEMP or attached databases
   are refused (so is the three-argument fts5vocab form); custom
@@ -8228,7 +8396,8 @@ OR, a LEFT JOIN's ON constraints).
   slot hashing, the rowid-0 flag), merges drop tombstoned entries
   and recount `nEntry` as the pin, and `fts5IndexFindDeleteMerge`
   (the `deletemerge` setting) picks merge levels as the pin does.
-  Writing tombstones (DELETE on such tables) stays refused.
+  Writing tombstones (DELETE on such tables) stays refused (closed
+  in v0.17: leaf `fts5_delete`).
 - **Pin-set `secure-delete`** (corruption): hipp ignored it and wrote
   ordinary delete markers, leaving the deleted terms on disk and a
   `%_data` unlike the pin's. Deletes (DELETE, UPDATE, OR REPLACE,

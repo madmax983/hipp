@@ -51,6 +51,11 @@ pub struct AuxRow {
     /// text fails as the pin's "fts5: missing row N from content
     /// table" (v0.16 review fix: NULLs were returned).
     pub missing: bool,
+    /// A row whose `%_docsize` entry is gone (a contentless table told
+    /// to 'delete' other values, a duplicate rowid deleted): reading
+    /// its column sizes is the pin's corruption
+    /// (`sqlite3Fts5StorageDocsize`; v0.17: sizes of 0 were used).
+    pub nosize: bool,
 }
 
 /// The statement's rows (`Env::fts_rows`).
@@ -658,6 +663,16 @@ pub fn snippet(r: &AuxRow, args: &[OwnedValue]) -> Result<OwnedValue, AuxErr> {
     Ok(OwnedValue::Text(h.out))
 }
 
+/// A REAL result as `sqlite3_result_double` stores it: NaN (a bm25
+/// over rows of no tokens, `0 / 0`) is NULL (v0.17: it was 0.0).
+pub fn real_or_null(f: f64) -> OwnedValue {
+    if f.is_nan() {
+        OwnedValue::Null
+    } else {
+        OwnedValue::Real(f)
+    }
+}
+
 /// Call `f` with `args` (the first is the row handle, already
 /// resolved to `row`).
 pub fn call(f: AuxFn, row: &AuxRow, args: &[OwnedValue]) -> Result<OwnedValue, AuxErr> {
@@ -672,9 +687,16 @@ pub fn call(f: AuxFn, row: &AuxRow, args: &[OwnedValue]) -> Result<OwnedValue, A
             if row.missing && (row.sizes.is_none() || row.tab.cfg.detail != Detail::Full) {
                 return Err(AuxErr::Corrupt);
             }
-            Ok(OwnedValue::Real(bm25(row, w.as_slice())))
+            // xRowCount of a table whose totals count no row: corrupt
+            // (`sqlite3Fts5StorageRowCount`; v0.17: bm25 answered). (A
+            // full scan's rows carry no totals: bm25 is 0.0 there.)
+            if (row.tab.nrow <= 0 && !row.tab.first.is_empty()) || row.nosize {
+                return Err(AuxErr::Corrupt);
+            }
+            Ok(real_or_null(bm25(row, w.as_slice())))
         }
         _ if row.missing => Err(AuxErr::Corrupt),
+        AuxFn::Snippet if row.nosize => Err(AuxErr::Corrupt),
         AuxFn::Highlight => highlight(row, args),
         AuxFn::Snippet => snippet(row, args),
     }

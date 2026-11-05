@@ -53,6 +53,62 @@ pub(super) struct FtState {
     /// The pager's rollback count when the state began: a rollback
     /// since makes it stale.
     epoch: u64,
+    /// The cached structure record a tombstone write changed
+    /// (`Fts5Index::pStruct`), written at the next flush; readers see
+    /// it in place of `%_data`'s.
+    #[cfg(feature = "fts5_delete")]
+    pstruct: Option<AVec<u8>>,
+    /// `nContentlessDelete`.
+    #[cfg(feature = "fts5_delete")]
+    ncdel: u64,
+}
+
+impl FtState {
+    fn new(name: AVec<u8>, detail: Detail, sp: usize, epoch: u64) -> FtState {
+        FtState {
+            name,
+            hash: Hash::new(detail),
+            write_rowid: 0,
+            bdelete: false,
+            nrows: 0,
+            totals: None,
+            sp,
+            epoch,
+            #[cfg(feature = "fts5_delete")]
+            pstruct: None,
+            #[cfg(feature = "fts5_delete")]
+            ncdel: 0,
+        }
+    }
+
+    /// `fts5IndexDiscardData` (and the structure cache dropped).
+    fn discard(&mut self) {
+        self.hash = Hash::new(self.hash.detail());
+        self.nrows = 0;
+        #[cfg(feature = "fts5_delete")]
+        {
+            self.pstruct = None;
+            self.ncdel = 0;
+        }
+    }
+
+    /// Whether a flush has anything to write (`nPendingData ||
+    /// nContentlessDelete`).
+    fn dirty(&self) -> bool {
+        #[cfg(feature = "fts5_delete")]
+        if self.ncdel > 0 {
+            return true;
+        }
+        !self.hash.is_empty()
+    }
+
+    /// `st`'s cached structure in place of the stored one.
+    #[cfg(feature = "fts5_delete")]
+    fn overlay(&self, store: &mut Store) {
+        if let Some(b) = &self.pstruct {
+            store.load(crate::fts5::STRUCTURE_ROWID, b.clone());
+        }
+    }
 }
 
 /// The shadow tables of one fts5 table.
@@ -197,7 +253,23 @@ fn rowid_eq(arena: &Arena, e: Option<&Expr>) -> bool {
         }
         _ => false,
     };
-    matches!(e, Some(Expr::Binary(BinOp::Eq, l, r)) if is_rowid(l) || is_rowid(r))
+    // `rowid IN (constant)` is the pin's `rowid = +constant` (its
+    // parser rewrites a one-value IN list; v0.17: it was taken for a
+    // multi-row write, flushing at a different point).
+    let lit = |x: &Expr| match x {
+        Expr::Literal(_) => true,
+        #[cfg(feature = "params")]
+        Expr::Param(..) => true,
+        Expr::Neg(a) | Expr::Pos(a) => matches!(**a, Expr::Literal(_)),
+        _ => false,
+    };
+    match e {
+        Some(Expr::Binary(BinOp::Eq, l, r)) => is_rowid(l) || is_rowid(r),
+        Some(Expr::InList(l, list, false)) => {
+            is_rowid(l) && list.len() == 1 && list.iter().all(lit)
+        }
+        _ => false,
+    }
 }
 
 /// One row of an fts5 write: the old rowid (a delete), and the new
@@ -465,19 +537,28 @@ impl<S: Storage> Connection<S> {
         {
             return s;
         }
-        FtState {
-            name: copy_vec(name),
-            hash: Hash::new(detail),
-            write_rowid: 0,
-            bdelete: false,
-            nrows: 0,
-            totals: None,
-            sp,
-            epoch,
+        let mut s = FtState::new(copy_vec(name), detail, sp, epoch);
+        if let Some(i) = self
+            .fts_rows
+            .iter()
+            .position(|r| eq_ci(r.0.as_slice(), name))
+            && let Some(r) = self.fts_rows.remove_at(i)
+        {
+            s.nrows = r.1;
+        }
+        s
+    }
+
+    /// A synced state leaves the connection: the rows it counted and
+    /// did not flush stay counted (`nPendingRow`).
+    fn ft_leave(&mut self, st: &FtState) {
+        if st.nrows > 0 {
+            self.fts_rows.push((st.name.clone(), st.nrows));
         }
     }
 
-    /// Every `%_data` row.
+    /// Every `%_data` row (the structure as the table's transaction
+    /// state caches it, when it has changed one).
     async fn ft_store(&mut self, t: &Tab) -> Result<Store, S::Error> {
         let mut st = Store::default();
         let mut cur = ScanCursor::new(t.data);
@@ -488,6 +569,10 @@ impl<S: Storage> Connection<S> {
                 _ => AVec::new(),
             };
             st.load(id, b);
+        }
+        #[cfg(feature = "fts5_delete")]
+        if let Some(p) = self.ft_pending(t.name.as_slice()) {
+            p.overlay(&mut st);
         }
         Ok(st)
     }
@@ -540,6 +625,44 @@ impl<S: Storage> Connection<S> {
                     )
                     .await?;
                 }
+                #[cfg(feature = "fts5_delete")]
+                FtOp::IdxDelPg(seg, pg) => {
+                    let mut probe = AVec::new();
+                    probe.push(btree::KeyPart::Val(OwnedValue::Integer(i64::from(*seg))));
+                    probe.push(btree::KeyPart::Min);
+                    let (mut cur, _) = btree::IndexCursor::seek_found(
+                        &mut self.pager,
+                        t.idx,
+                        orders.as_slice(),
+                        probe.as_slice(),
+                    )
+                    .await?;
+                    let mut gone: AVec<AVec<u8>> = AVec::new();
+                    while let Some(e) = cur.next_entry(&mut self.pager).await? {
+                        let v = e.values.as_slice();
+                        if !matches!(v.first(), Some(OwnedValue::Integer(s)) if *s == i64::from(*seg))
+                        {
+                            break;
+                        }
+                        if !matches!(v.get(2), Some(OwnedValue::Integer(p)) if *p >> 1 == i64::from(*pg))
+                        {
+                            continue;
+                        }
+                        let vals: AVec<Value<'_>> = v.iter().map(|x| x.as_value()).collect();
+                        let mut rec = AVec::new();
+                        encode_record(vals.as_slice(), &mut rec);
+                        gone.push(rec);
+                    }
+                    for rec in gone.iter() {
+                        btree::index_delete_core(
+                            &mut self.pager,
+                            t.idx,
+                            rec.as_slice(),
+                            orders.as_slice(),
+                        )
+                        .await?;
+                    }
+                }
                 FtOp::IdxDel(seg) => {
                     let mut probe = AVec::new();
                     probe.push(btree::KeyPart::Val(OwnedValue::Integer(i64::from(*seg))));
@@ -586,6 +709,8 @@ impl<S: Storage> Connection<S> {
         rt.t.cdel = t.cfg.contentless_delete;
         let orders = binary_orders(1);
         let mut cur = btree::IndexCursor::with_fields(t.config, orders.as_slice(), 0);
+        #[cfg(feature = "fts5_delete")]
+        let mut sd_row = false;
         while let Some(e) = cur.next_entry(&mut self.pager).await? {
             let (Some(k), v) = (e.values.as_slice().first(), e.values.as_slice().get(1)) else {
                 continue;
@@ -595,6 +720,10 @@ impl<S: Storage> Connection<S> {
                 _ => continue,
             };
             let v = v.cloned().unwrap_or(OwnedValue::Null);
+            #[cfg(feature = "fts5_delete")]
+            {
+                sd_row |= eq_ci(key.as_slice(), b"secure-delete");
+            }
             if eq_ci(key.as_slice(), b"version") {
                 rt.version = crate::func::int64_value(&v);
             } else {
@@ -604,7 +733,56 @@ impl<S: Storage> Connection<S> {
         if rt.version != 4 && rt.version != 5 {
             return Err(ft_err(SchemaKind::Fts5Definition));
         }
+        #[cfg(feature = "fts5_delete")]
+        {
+            // The pin keeps the `version` it loaded until the structure
+            // cookie moves: a `delete-all` writes 4 without moving it,
+            // and the connection goes on believing 5.
+            let name = t.name.as_slice();
+            match self.fts_ver.iter().find(|v| eq_ci(v.0.as_slice(), name)) {
+                Some(v) => rt.version = v.1,
+                None => self.fts_ver.push((t.name.clone(), rt.version)),
+            }
+            // `bSecureDelete` has no default a reload restores: with no
+            // `secure-delete` row (a rolled-back setting) it keeps the
+            // value the connection had.
+            match self
+                .fts_sd
+                .as_mut_slice()
+                .iter_mut()
+                .find(|v| eq_ci(v.0.as_slice(), name))
+            {
+                Some(v) if !sd_row => rt.secure_delete = v.1,
+                Some(v) => v.1 = rt.secure_delete,
+                None => self.fts_sd.push((t.name.clone(), rt.secure_delete)),
+            }
+        }
         Ok(rt)
+    }
+
+    /// The connection now holds `version` / `secure-delete` (when
+    /// given) for table `t`.
+    #[cfg(feature = "fts5_delete")]
+    fn ft_hold(&mut self, t: &Tab, ver: Option<i64>, sd: Option<bool>) {
+        let name = t.name.as_slice();
+        if let (Some(x), Some(v)) = (
+            ver,
+            self.fts_ver
+                .as_mut_slice()
+                .iter_mut()
+                .find(|v| eq_ci(v.0.as_slice(), name)),
+        ) {
+            v.1 = x;
+        }
+        if let (Some(x), Some(v)) = (
+            sd,
+            self.fts_sd
+                .as_mut_slice()
+                .iter_mut()
+                .find(|v| eq_ci(v.0.as_slice(), name)),
+        ) {
+            v.1 = x;
+        }
     }
 
     /// `REPLACE INTO %_config VALUES(k, v)`.
@@ -659,15 +837,45 @@ impl<S: Storage> Connection<S> {
         rt: &Runtime,
         st: &mut FtState,
     ) -> Result<(), S::Error> {
-        if st.hash.is_empty() {
+        if !st.dirty() {
             return Ok(());
         }
         let mut store = self.ft_store(t).await?;
-        crate::fts5::flush(&mut store, &st.hash, &rt.t, t.cfg.detail, st.nrows)
-            .map_err(|_| corrupt())?;
+        #[cfg(feature = "fts5_delete")]
+        let mut x = {
+            st.overlay(&mut store);
+            let mut x = crate::fts5::sdel::SdFlush {
+                ncdel: st.ncdel,
+                secure: rt.secure_delete,
+                ..Default::default()
+            };
+            if x.secure {
+                // `iVersion` as the connection holds it (an earlier
+                // flush of this statement may have moved it).
+                x.v5 = self.ft_runtime(t).await?.version == 5;
+            }
+            x
+        };
+        crate::fts5::flush(
+            &mut store,
+            &st.hash,
+            &rt.t,
+            t.cfg.detail,
+            st.nrows,
+            #[cfg(feature = "fts5_delete")]
+            &mut x,
+        )
+        .map_err(|_| corrupt())?;
         self.ft_apply(t, store.log.as_slice()).await?;
-        st.hash = Hash::new(t.cfg.detail);
-        st.nrows = 0;
+        #[cfg(feature = "fts5_delete")]
+        if x.bumped {
+            // fts5FlushSecureDelete: `REPLACE INTO %_config
+            // VALUES('version', 5)` (the cookie moved on with it).
+            self.ft_config_put(t, b"version", &OwnedValue::Integer(5))
+                .await?;
+            self.ft_hold(t, Some(5), None);
+        }
+        st.discard();
         Ok(())
     }
 
@@ -711,6 +919,8 @@ impl<S: Storage> Connection<S> {
     }
 
     async fn fts_sync_all_impl(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "fts5_delete")]
+        self.fts_ver.clear();
         let epoch = self.pager.txn_gen;
         let states = core::mem::take(&mut self.fts);
         for mut st in states.into_iter() {
@@ -719,6 +929,7 @@ impl<S: Storage> Connection<S> {
             }
             if let Some((t, rt)) = self.ft_resolve(st.name.clone().as_slice()).await? {
                 self.ft_sync(&t, &rt, &mut st).await?;
+                self.ft_leave(&st);
             }
         }
         Ok(())
@@ -825,6 +1036,17 @@ impl<S: Storage> Connection<S> {
                 st.name = copy_vec(new);
             }
         }
+        for r in self.fts_rows.as_mut_slice().iter_mut() {
+            if eq_ci(r.0.as_slice(), old) {
+                r.0 = copy_vec(new);
+            }
+        }
+        #[cfg(feature = "fts5_delete")]
+        for r in self.fts_sd.as_mut_slice().iter_mut() {
+            if eq_ci(r.0.as_slice(), old) {
+                r.0 = copy_vec(new);
+            }
+        }
     }
 
     /// The pending terms of table `name` in this transaction, if any.
@@ -895,8 +1117,7 @@ impl<S: Storage> Statement<'_, S> {
     pub(super) fn fts_rollback_to(&mut self, level: usize) {
         for st in self.conn.fts.as_mut_slice().iter_mut() {
             if level < st.sp {
-                st.hash = Hash::new(st.hash_detail());
-                st.nrows = 0;
+                st.discard();
                 st.totals = None;
             }
         }
@@ -1038,6 +1259,26 @@ impl<S: Storage> Statement<'_, S> {
             .position(|s| eq_ci(s.name.as_slice(), name))
         {
             self.conn.fts.remove_at(i);
+        }
+        if let Some(i) = self
+            .conn
+            .fts_rows
+            .iter()
+            .position(|s| eq_ci(s.0.as_slice(), name))
+        {
+            self.conn.fts_rows.remove_at(i);
+        }
+        #[cfg(feature = "fts5_delete")]
+        {
+            self.conn.fts_ver.clear();
+            if let Some(i) = self
+                .conn
+                .fts_sd
+                .iter()
+                .position(|s| eq_ci(s.0.as_slice(), name))
+            {
+                self.conn.fts_sd.remove_at(i);
+            }
         }
     }
 
@@ -1293,14 +1534,21 @@ impl<S: Storage> Statement<'_, S> {
         rowid: i64,
         vals: Option<&[OwnedValue]>,
     ) -> Result<(), S::Error> {
-        if t.cfg.contentless_delete {
-            return Err(Error::Unsupported);
-        }
-        if rt.secure_delete {
-            return Err(ft_err(SchemaKind::Fts5SecureDelete));
+        #[cfg(not(feature = "fts5_delete"))]
+        {
+            if t.cfg.contentless_delete {
+                return Err(Error::Unsupported);
+            }
+            if rt.secure_delete {
+                return Err(ft_err(SchemaKind::Fts5SecureDelete));
+            }
         }
         self.conn.ft_totals(t, st).await?;
         self.ft_begin(t, rt, st, true, rowid).await?;
+        #[cfg(feature = "fts5_delete")]
+        if t.cfg.contentless_delete {
+            return self.ft_contentless_delete(t, rt, st, rowid).await;
+        }
         let old = match vals {
             Some(v) => Some(v.iter().cloned().collect::<AVec<_>>()),
             None => self.ft_lookup(t, rowid).await?,
@@ -1326,6 +1574,74 @@ impl<S: Storage> Statement<'_, S> {
         if let Some(c) = t.content {
             btree::btree_delete(&mut self.conn.pager, c, rowid).await?;
         }
+        Ok(())
+    }
+
+    /// `fts5StorageContentlessDelete` (v0.17, `fts5_delete`): the row's
+    /// `%_docsize` entry gives its sizes (taken off the totals) and
+    /// origin; a tombstone for it goes into every segment of that
+    /// origin; the entry goes.
+    #[cfg(feature = "fts5_delete")]
+    async fn ft_contentless_delete(
+        &mut self,
+        t: &Tab,
+        rt: &Runtime,
+        st: &mut FtState,
+        rowid: i64,
+    ) -> Result<(), S::Error> {
+        let ds = t.docsize.ok_or(corrupt())?;
+        let Some(p) = btree::seek_rowid(&mut self.conn.pager, ds, rowid).await? else {
+            return Ok(());
+        };
+        let vals = crate::record::decode_record::<S::Error>(p.as_slice(), 3)?;
+        let sz = vals.as_slice().get(1).copied();
+        let origin = vals
+            .as_slice()
+            .get(2)
+            .map_or(0, |v| crate::func::int64_value(&OwnedValue::from_value(*v)));
+        if let Some(tot) = st.totals.as_mut() {
+            tot.0 = tot.0.wrapping_sub(1);
+            // fts5StorageDecodeSizeArray: the sizes only when the blob
+            // holds exactly one varint per column.
+            let blob: &[u8] = match sz {
+                Some(Value::Blob(b)) | Some(Value::Text(b)) => b,
+                _ => &[],
+            };
+            let mut cols = AVec::new();
+            let mut i = 0usize;
+            let mut ok = true;
+            for _ in 0..tot.1.len() {
+                if i >= blob.len() {
+                    ok = false;
+                    break;
+                }
+                cols.push(crate::fts5::gv(blob, &mut i).map_or(0, |v| v as u32 as i32 as i64));
+            }
+            if ok && i == blob.len() {
+                for (a, c) in tot.1.as_mut_slice().iter_mut().zip(cols.iter()) {
+                    *a = a.wrapping_sub(*c);
+                }
+            }
+        }
+        if origin != 0 {
+            let mut store = self.conn.ft_store(t).await?;
+            st.overlay(&mut store);
+            let mut s = store.structure().map_err(|_| corrupt())?;
+            let n = crate::fts5::sdel::contentless_delete(
+                &mut store,
+                &mut s,
+                origin as u64,
+                rowid,
+                rt.t.pgsz,
+            )
+            .map_err(|_| corrupt())?;
+            if n > 0 {
+                self.conn.ft_apply(t, store.log.as_slice()).await?;
+                st.ncdel = st.ncdel.wrapping_add(n);
+                st.pstruct = Some(s.encode());
+            }
+        }
+        btree::btree_delete(&mut self.conn.pager, ds, rowid).await?;
         Ok(())
     }
 
@@ -1433,6 +1749,26 @@ impl<S: Storage> Statement<'_, S> {
         );
         let cfg = tab.fts.as_deref().ok_or(corrupt())?.clone();
         let ncol = cfg.cols.len();
+        // An UPDATE's indexed columns: how many it sets and leaves.
+        #[cfg(feature = "fts5_delete")]
+        let upd = match &kind {
+            FtKind::Change {
+                sets: Some(sets), ..
+            } => {
+                let mut u = (0usize, 0usize);
+                for (c, un) in cfg.unindexed.iter().enumerate() {
+                    if !*un {
+                        if sets.iter().any(|t| *t == Target::Col(c)) {
+                            u.0 += 1;
+                        } else {
+                            u.1 += 1;
+                        }
+                    }
+                }
+                u
+            }
+            _ => (0, 0),
+        };
         // (old rowid, new row: rowid, columns, command, rank).
         let mut work: AVec<Work> = AVec::new();
         let empty = RowData::empty();
@@ -1542,13 +1878,19 @@ impl<S: Storage> Statement<'_, S> {
                 stmt_level,
                 user_sp,
                 ret.as_slice(),
+                #[cfg(feature = "fts5_delete")]
+                upd,
             )
             .await;
         match r {
             Ok(()) => {
                 if !explicit {
+                    // The commit's xSync loads the config afresh.
+                    #[cfg(feature = "fts5_delete")]
+                    self.conn.fts_ver.clear();
                     let rt = self.conn.ft_runtime(&t).await?;
                     self.conn.ft_sync(&t, &rt, &mut st).await?;
+                    self.conn.ft_leave(&st);
                 } else {
                     self.conn.fts.push(st);
                 }
@@ -1578,6 +1920,7 @@ impl<S: Storage> Statement<'_, S> {
         stmt_level: bool,
         user_sp: usize,
         ret: &[RExpr],
+        #[cfg(feature = "fts5_delete")] upd: (usize, usize),
     ) -> Result<(), S::Error> {
         let mut rt = rt.clone();
         if stmt_level {
@@ -1653,13 +1996,39 @@ impl<S: Storage> Statement<'_, S> {
                     self.conn.note_insert(0, r);
                 }
                 (Some(o), Some((rid, vals, _, _))) => {
+                    #[cfg(not(feature = "fts5_delete"))]
                     if contentless {
                         return Err(ft_err(SchemaKind::Fts5Contentless));
                     }
-                    let rid = Self::ft_rowid_value(&rid)?;
-                    let n = match rid {
+                    #[cfg(feature = "fts5_delete")]
+                    if contentless {
+                        // fts5ContentlessUpdate: an UPDATE of UNINDEXED
+                        // columns alone is a no-op; otherwise every
+                        // indexed column must be set, on a
+                        // contentless_delete table only.
+                        let (seen, unset) = upd;
+                        let moved = match &rid {
+                            OwnedValue::Integer(n) => *n != o,
+                            OwnedValue::Null => o != 0,
+                            _ => true,
+                        };
+                        if seen == 0 && !moved {
+                            self.conn.env.note_change();
+                            continue;
+                        }
+                        if !cfg.contentless_delete {
+                            return Err(ft_err(SchemaKind::Fts5Contentless));
+                        }
+                        if unset > 0 {
+                            return Err(ft_err(SchemaKind::Fts5ContentlessSubset));
+                        }
+                    }
+                    // An UPDATE's new rowid must be an integer (v0.17:
+                    // NULL kept the old one; the pin's "datatype
+                    // mismatch").
+                    let n = match Self::ft_rowid_value(&rid)? {
                         OwnedValue::Integer(n) => n,
-                        _ => o,
+                        _ => return Err(ft_err(SchemaKind::DatatypeMismatch)),
                     };
                     if n != o {
                         if econflict == ConflictAction::Replace {
@@ -1807,7 +2176,10 @@ impl<S: Storage> Statement<'_, S> {
             crate::fts5::user_merge(&mut store, &rt.t, detail, n).map_err(|_| corrupt())?;
             self.conn.ft_apply(t, store.log.as_slice()).await?;
         } else if eq_ci(cmd, b"integrity-check") {
-            self.ft_integrity(t, st).await?;
+            // `rank` 1 also checks an external table's content (the
+            // pin's `iArg`; v0.17: it was always checked).
+            let arg = crate::func::int64_value(val) as i32 != 0;
+            self.ft_integrity(t, st, arg).await?;
         } else if eq_ci(cmd, b"flush") {
             self.conn.ft_sync(t, rt, st).await?;
         } else {
@@ -1836,6 +2208,8 @@ impl<S: Storage> Statement<'_, S> {
                     &[Value::Null, Value::Blob(b.as_slice())],
                 )
                 .await?;
+            #[cfg(feature = "fts5_delete")]
+            self.conn.ft_hold(t, None, Some(probe.secure_delete));
             *rt = probe;
         }
         Ok(())
@@ -1880,8 +2254,7 @@ impl<S: Storage> Statement<'_, S> {
                 }
             }
         }
-        st.hash = Hash::new(t.cfg.detail);
-        st.nrows = 0;
+        st.discard();
         let mut store = Store::default();
         store.reinit(cookie, t.cfg.contentless_delete);
         self.conn.ft_apply(t, store.log.as_slice()).await?;
@@ -1892,26 +2265,19 @@ impl<S: Storage> Statement<'_, S> {
 
     /// `integrity-check`: the index decodes, its doclists match the
     /// content's tokens, and the totals and docsize rows agree.
-    async fn ft_integrity(&mut self, t: &Tab, st: &mut FtState) -> Result<(), S::Error> {
-        let store = self.conn.ft_store(t).await?;
+    async fn ft_integrity(&mut self, t: &Tab, st: &mut FtState, arg: bool) -> Result<(), S::Error> {
+        #[allow(unused_mut)]
+        let mut store = self.conn.ft_store(t).await?;
+        #[cfg(feature = "fts5_delete")]
+        st.overlay(&mut store);
         let detail = t.cfg.detail;
         let reader =
             crate::fts5::Reader::new(&store, Some(&st.hash), detail).map_err(|_| corrupt())?;
-        if t.cfg.content == Content::None {
+        if t.cfg.content == Content::None || (t.cfg.content == Content::External && !arg) {
             return Ok(());
         }
         // The expected index: every row's tokens.
-        let mut h = Hash::new(detail);
-        let mut tmp = FtState {
-            name: AVec::new(),
-            hash: core::mem::replace(&mut h, Hash::new(detail)),
-            write_rowid: 0,
-            bdelete: false,
-            nrows: 0,
-            totals: None,
-            sp: 0,
-            epoch: 0,
-        };
+        let mut tmp = FtState::new(AVec::new(), detail, 0, 0);
         let rows: AVec<(i64, AVec<OwnedValue>)> = match t.cfg.content {
             Content::External => {
                 let q = Self::ext_sql(t, None);
@@ -2222,6 +2588,7 @@ impl<S: Storage> Statement<'_, S> {
                         texts: vals,
                         sizes: None,
                         missing: false,
+                        nosize: false,
                     });
                 }
                 out.push((row, Some(id)));
@@ -2327,6 +2694,11 @@ impl<S: Storage> Statement<'_, S> {
             if !inside(r.rowid) {
                 continue;
             }
+            // The rank sorter's bm25 asks for the row count: none is
+            // corruption (`sqlite3Fts5StorageRowCount`; v0.17).
+            if sorted && tab.nrow <= 0 {
+                return Err(corrupt());
+            }
             let mut missing = false;
             let vals = match self.ft_lookup(&t, r.rowid).await? {
                 Some(v) => v,
@@ -2345,6 +2717,7 @@ impl<S: Storage> Statement<'_, S> {
                     (0..ncol).map(|_| OwnedValue::Null).collect()
                 }
             };
+            let mut nosize = false;
             let sizes = match t.docsize {
                 Some(ds) => match btree::seek_rowid(&mut self.conn.pager, ds, r.rowid).await? {
                     Some(p) => {
@@ -2359,16 +2732,23 @@ impl<S: Storage> Statement<'_, S> {
                         }
                         Some(v)
                     }
-                    None => Some((0..ncol).map(|_| 0).collect()),
+                    None => {
+                        nosize = true;
+                        Some((0..ncol).map(|_| 0).collect())
+                    }
                 },
                 None => None,
             };
+            if sorted && nosize {
+                return Err(corrupt());
+            }
             let mut aux = AuxRow {
                 tab: tab.clone(),
                 phrases: r.phrases.clone(),
                 texts: vals.clone(),
                 sizes,
                 missing,
+                nosize,
             };
             let live = crate::fts5::aux::bm25(&aux, weights.as_slice());
             aux.tab = stab.clone();
@@ -2390,7 +2770,7 @@ impl<S: Storage> Statement<'_, S> {
             };
             let mut row = vals;
             row.push(OwnedValue::Integer(h as i64));
-            row.push(OwnedValue::Real(rank));
+            row.push(crate::fts5::aux::real_or_null(rank));
             if sorted {
                 sorted_out.push((live, row, r.rowid));
                 continue;
@@ -2602,12 +2982,6 @@ impl<S: Storage> Statement<'_, S> {
             }
         }
         Ok(out)
-    }
-}
-
-impl FtState {
-    fn hash_detail(&self) -> Detail {
-        self.hash.detail()
     }
 }
 

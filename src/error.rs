@@ -834,14 +834,22 @@ pub enum SchemaKind {
     #[cfg(feature = "fts5")]
     Fts5Contentless,
     /// A delete (DELETE, UPDATE, OR REPLACE, the 'delete' command) on
-    /// a table whose `%_config` has `secure-delete=1` (v0.16 review
-    /// fix, `fts5`): the pin removes such entries from the leaves in
-    /// place, which hipp does not do, and an ordinary delete marker
-    /// would leave the deleted terms on disk. Turn it off first
-    /// (`INSERT INTO t(t, rank) VALUES('secure-delete', 0)`), or
-    /// delete with SQLite.
+    /// a table whose `%_config` has `secure-delete=1`, in a build
+    /// without the `fts5_delete` leaf (v0.16 review fix, `fts5`): the
+    /// pin removes such entries from the leaves in place, which this
+    /// build does not do, and an ordinary delete marker would leave
+    /// the deleted terms on disk. Build with `fts5_delete`, turn it
+    /// off first (`INSERT INTO t(t, rank) VALUES('secure-delete',
+    /// 0)`), or delete with SQLite.
     #[cfg(feature = "fts5")]
     Fts5SecureDelete,
+    /// An UPDATE of a `contentless_delete=1` table that sets some of
+    /// its indexed columns (or its rowid) but not all of them (v0.17,
+    /// `fts5_delete`; the pin's "cannot UPDATE a subset of columns on
+    /// fts5 contentless-delete table"). Set every indexed column, as
+    /// the table keeps no content to fill the rest from.
+    #[cfg(feature = "fts5_delete")]
+    Fts5ContentlessSubset,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

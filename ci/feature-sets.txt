@@ -31,6 +31,7 @@ v16,autovacuum
 v16,vtab
 v16,vtab,rtree
 v16,vtab,without_rowid,math,fts5
+v16,vtab,without_rowid,math,fts5,fts5_delete
 v16,explain
 indexes,v04
 indexes,v05

@@ -5,6 +5,30 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### FTS5 delete writes (leaf `fts5_delete`, in `xl`)
+
+- `contentless_delete=1` tables: DELETE, UPDATE (every indexed
+  column; UNINDEXED-only is a no-op, a subset is the pin's error)
+  and INSERT OR REPLACE write tombstone hash pages and the
+  structure's `nEntryTombstone` / `nPgTombstone` as the pin does
+  (written at a hash rebuild and at the flush; tombstones count as
+  automerge work and drive `deletemerge`).
+- `secure-delete=1`: DELETE, UPDATE, OR REPLACE and the 'delete'
+  command remove entries from the segments in place, byte for byte
+  with the pin (`version` 5 and the cookie at the first one).
+- Fixes on claimed fts5 paths (ungated, `fts5`): a row with no
+  tokens counts into the next segment's `nEntry` across commits;
+  `rowid IN (x)` is a one-row write (no statement-journal flush);
+  `integrity-check` checks an external table's content only with
+  rank 1; a bm25 of `0 / 0` is NULL; bm25 / snippet / ORDER BY
+  rank on a row without `%_docsize`, or a table whose totals count
+  no row, are the pin's corruption error; an UPDATE to a NULL
+  rowid is "datatype mismatch".
+- `link.x`: the sizing demo's FLASH region is 2 MiB so `xl` links.
+- Sizes: tiny 76,960 B (0), full 505,416 B (0), max 1,044,172 B
+  (+832, the ungated fixes), xl 1,053,532 B (+10,192: the leaf,
+  9,360 B, does not fit `max`'s remaining 4,404 B).
+
 ### Streamed rows (ungated, `v16` executor; cursors with `vtab`)
 
 - A top-level SELECT returns its rows one `step` at a time: a

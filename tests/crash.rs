@@ -1923,3 +1923,68 @@ fn v16_crash_fts5_writes() {
     ]);
     crash_matrix("fts5-external", Config::default(), &setup, &txn);
 }
+
+/// FTS5 delete writes (v0.17, `fts5_delete`): tombstone pages of a
+/// `contentless_delete` table (the hash rebuilt and grown, the
+/// structure written at the rebuild and at the flush) and in-place
+/// secure deletes (leaf pages, emptied pages, `%_idx` rows, `version`
+/// moving to 5), in transactions with savepoints rolled back, and the
+/// merges they drive — every crash point recovers to the pre- or
+/// post-image.
+#[cfg(feature = "fts5_delete")]
+#[test]
+fn v17_crash_fts5_delete_writes() {
+    let setup = strs(&[
+        "PRAGMA page_size = 1024",
+        "CREATE VIRTUAL TABLE t USING fts5(a, b, content='', contentless_delete=1)",
+        "INSERT INTO t(t, rank) VALUES('pgsz', 64)",
+        "INSERT INTO t(rowid, a, b) SELECT value, 'alpha w' || (value % 9), 'beta' FROM generate_series(1, 60)",
+        "INSERT INTO t(rowid, a, b) SELECT value, 'gamma', 'delta ' || value FROM generate_series(61, 90)",
+    ]);
+    let txn = strs(&[
+        "BEGIN",
+        "DELETE FROM t WHERE rowid % 3 = 0",
+        "SAVEPOINT s",
+        "DELETE FROM t WHERE rowid > 80",
+        "ROLLBACK TO s",
+        "UPDATE t SET a = 'eps', b = 'zeta' WHERE rowid = 4",
+        "INSERT OR REPLACE INTO t(rowid, a, b) VALUES(5, 'eta', 'theta'), (5000000000, 'iota', 'kappa')",
+        "DELETE FROM t WHERE rowid = 5000000000",
+        "COMMIT",
+    ]);
+    crash_matrix("fts5-tombstones", Config::default(), &setup, &txn);
+    let txn = strs(&[
+        "BEGIN",
+        "INSERT INTO t(t, rank) VALUES('deletemerge', 5)",
+        "DELETE FROM t WHERE rowid % 2 = 1",
+        "INSERT INTO t(t, rank) VALUES('merge', 50)",
+        "COMMIT",
+    ]);
+    crash_matrix("fts5-deletemerge", Config::default(), &setup, &txn);
+    let setup = strs(&[
+        "PRAGMA page_size = 1024",
+        "CREATE VIRTUAL TABLE t USING fts5(a, prefix='1')",
+        "INSERT INTO t(t, rank) VALUES('pgsz', 40)",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', 1)",
+        "INSERT INTO t SELECT 'common w' || (value % 11) || ' x' || value FROM generate_series(1, 80)",
+        "INSERT INTO t SELECT 'common ' || group_concat('long', ' ') FROM generate_series(1, 90)",
+    ]);
+    let txn = strs(&[
+        "BEGIN",
+        "DELETE FROM t WHERE rowid % 4 = 0",
+        "SAVEPOINT s",
+        "DELETE FROM t WHERE rowid < 30",
+        "ROLLBACK TO s",
+        "UPDATE t SET a = 'replaced' WHERE rowid = 81",
+        "DELETE FROM t WHERE rowid BETWEEN 40 AND 60",
+        "COMMIT",
+    ]);
+    crash_matrix("fts5-secure", Config::default(), &setup, &txn);
+    let txn = strs(&[
+        "BEGIN",
+        "DELETE FROM t WHERE rowid > 10",
+        "INSERT INTO t(t) VALUES('optimize')",
+        "COMMIT",
+    ]);
+    crash_matrix("fts5-secure-optimize", Config::default(), &setup, &txn);
+}
