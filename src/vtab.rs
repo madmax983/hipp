@@ -1056,8 +1056,9 @@ pub type CursorRows = AVec<(AVec<OwnedValue>, Option<i64>)>;
 /// Read a cursor to its end (at most `need` rows): each row's
 /// `ncols` columns and its rowid. More than `max` rows (v0.16 review
 /// fix: `Config::max_vtab_rows`), or a refused allocation, is
-/// `VtabTooManyRows` — hipp holds the rows where the pin streams
-/// them, and `generate_series(1)` alone is 2^32 of them.
+/// `VtabTooManyRows` — the materialising paths hold the rows (a
+/// streamed query reads the cursor row by row instead, v0.17), and
+/// `generate_series(1)` alone is 2^32 of them.
 pub fn drain(
     cur: &mut dyn VtCursor,
     ncols: usize,

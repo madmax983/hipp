@@ -244,9 +244,31 @@ impl<S: Storage> Statement<'_, S> {
         filter: Option<&RExpr>,
         acc: &RowData,
     ) -> Result<Option<AVec<(AVec<OwnedValue>, Option<i64>)>>, S::Error> {
-        use crate::query::{RefRange, expr_refs_range};
         let Some(sp) = sources.get(idx) else {
             return Ok(Some(AVec::new()));
+        };
+        if !self.lateral_ok(sources, idx, filter, acc).await? {
+            return Ok(None);
+        }
+        let mut padded = acc.clone();
+        pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
+        self.json_tvf_rows(sp, &padded, None).await.map(Some)
+    }
+
+    /// Whether the WHERE terms (and this join's ON terms) that read
+    /// only the sources before lateral source `idx` hold for their
+    /// combination `acc` (`lateral_rows`; v0.17: the streamed join
+    /// opens the source's cursor only then).
+    pub(super) async fn lateral_ok(
+        &mut self,
+        sources: &[SourcePlan],
+        idx: usize,
+        filter: Option<&RExpr>,
+        acc: &RowData,
+    ) -> Result<bool, S::Error> {
+        use crate::query::{RefRange, expr_refs_range};
+        let Some(sp) = sources.get(idx) else {
+            return Ok(true);
         };
         let rest = sources.get(idx..).unwrap_or(&[]);
         let w = acc.vals.len();
@@ -263,7 +285,7 @@ impl<S: Storage> Statement<'_, S> {
         }
         for t in terms.iter() {
             if !expr_refs_range(t, &later) && !self.cond_row_sub(t, &padded).await? {
-                return Ok(None);
+                return Ok(false);
             }
         }
         // An inner join's ON is a WHERE term on the pin; a LEFT
@@ -276,10 +298,10 @@ impl<S: Storage> Statement<'_, S> {
         }
         for t in on.iter() {
             if !expr_refs_range(t, &later) && !self.cond_row_sub(t, &padded).await? {
-                return Ok(None);
+                return Ok(false);
             }
         }
-        self.json_tvf_rows(sp, &padded, None).await.map(Some)
+        Ok(true)
     }
 
     /// The rows of JSON table-valued source `sp` for the row `row`

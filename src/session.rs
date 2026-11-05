@@ -127,6 +127,8 @@ mod pragma;
 #[cfg(feature = "rtree")]
 mod rtree;
 #[cfg(feature = "v16")]
+mod stream;
+#[cfg(feature = "v16")]
 mod temp;
 #[cfg(feature = "triggers")]
 mod trigger;
@@ -255,13 +257,21 @@ pub struct Config {
     /// count as trigger programs, as on the pin.
     #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub max_trigger_depth: usize,
-    /// The most rows one virtual-table cursor may produce for a
-    /// statement (v0.16 review fix, `vtab`). hipp's executor holds a
-    /// source's rows in memory where the pin streams them, so a
-    /// module whose rows cost nothing to describe —
-    /// `generate_series(1)` is 4294967295 rows — would exhaust the
-    /// heap; past this many rows the statement fails with
-    /// `SchemaKind::VtabTooManyRows` instead. The default
+    /// The most rows one generate_series cursor may give a statement
+    /// that holds them in memory (v0.16 review fix, `vtab`; v0.17:
+    /// only where it holds them). A module whose rows cost nothing to
+    /// describe — `generate_series(1)` is 4294967295 rows — would
+    /// exhaust the heap; past this many rows the statement fails with
+    /// `SchemaKind::VtabTooManyRows` instead. Since v0.17 a streamed
+    /// top-level query (`session::stream`) holds no source rows, so
+    /// this bounds only (a) its blocking operators that keep every
+    /// row they are given — DISTINCT, GROUP BY, an aggregate that
+    /// does not fold row by row, an ORDER BY without LIMIT — counted
+    /// per cursor opening, and (b) the paths that still materialise a
+    /// cursor's rows: subqueries (scalar, IN, EXISTS), derived tables
+    /// and CTEs, compound members, RIGHT / FULL joins, window
+    /// queries, trigger programs and the sources of INSERT ...
+    /// SELECT, UPDATE ... FROM and CREATE TABLE ... AS. The default
     /// (`DEFAULT_VTAB_ROWS`, about 4 million) costs a few hundred MiB
     /// at its peak; lower it on a small heap, raise it where memory
     /// allows.
@@ -1345,6 +1355,12 @@ pub struct Connection<S: Storage> {
     /// not N.
     #[cfg(feature = "v06")]
     sub_execs: usize,
+    /// The marks of the JSON documents and full-text rows a
+    /// streamed query held when it opened (v0.17, `v16`), while it
+    /// has not finished: a statement dropped part-way leaves them,
+    /// and the next top-level statement drops what they kept.
+    #[cfg(feature = "v16")]
+    stream_left: Option<(usize, usize)>,
     /// SubPlan node identity source (v0.13): every planned
     /// subquery node takes a unique id, which the executor's
     /// hoisting cache keys on. Ids only need uniqueness within
@@ -1440,6 +1456,8 @@ impl<S: Storage> Connection<S> {
             explicit_txn: false,
             #[cfg(feature = "v06")]
             sub_execs: 0,
+            #[cfg(feature = "v16")]
+            stream_left: None,
             #[cfg(feature = "v06")]
             next_subplan_id: core::cell::Cell::new(1),
             #[cfg(all(feature = "expr_index", feature = "v09"))]
@@ -1666,6 +1684,8 @@ impl<S: Storage> Connection<S> {
             query_pos: 0,
             #[cfg(feature = "v04")]
             query_loaded: false,
+            #[cfg(feature = "v16")]
+            stream: None,
             #[cfg(feature = "v06")]
             hoist: AVec::new(),
             #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
@@ -6046,6 +6066,10 @@ pub struct Statement<'c, S: Storage> {
     query_pos: usize,
     #[cfg(feature = "v04")]
     query_loaded: bool,
+    /// The query streaming its rows (v0.17, `v16`; `session::stream`),
+    /// while it has more.
+    #[cfg(feature = "v16")]
+    stream: Option<Box<stream::Stream>>,
     /// Hoisted uncorrelated-subquery results for this
     /// statement's execution (v0.13): `(plan node id, value)`
     /// pairs, populated on first use and cleared when a fresh
@@ -6870,6 +6894,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             query_pos: 0,
             #[cfg(feature = "v04")]
             query_loaded: false,
+            #[cfg(feature = "v16")]
+            stream: None,
             #[cfg(feature = "v06")]
             hoist: AVec::new(),
             #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
@@ -6934,16 +6960,28 @@ impl<'c, S: Storage> Statement<'c, S> {
         if matches!(self.plan, Plan::Explain(_)) {
             return self.step_explain().await;
         }
+        // What a streamed query dropped part-way kept (v0.17).
+        #[cfg(feature = "v16")]
+        if self.phase == Phase::Fresh && self.stream.is_none() {
+            self.reclaim_stream();
+        }
         // The `json_each` documents this step holds (v0.16, `json`;
         // `Env::json_docs`) go once the plan has run: its rows are
         // projected by then (a query materialises its result in
         // its first step), and a nested step (a trigger body) drops
         // only its own.
+        // A streamed query (v0.17) keeps them until its last row.
         #[cfg(feature = "json")]
-        let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
+        let mark = match &self.stream {
+            Some(s) => s.marks.0,
+            None => self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len()),
+        };
         // Likewise the full-text rows' auxiliary data (v0.16, `fts5`).
         #[cfg(feature = "fts5")]
-        let fmark = self.conn.env.fts_rows.try_borrow().map_or(0, |d| d.len());
+        let fmark = match &self.stream {
+            Some(s) => s.marks.1,
+            None => self.conn.env.fts_rows.try_borrow().map_or(0, |d| d.len()),
+        };
         // The statement's instant (v0.16, `datetime`): kept while
         // this statement owns the clock cache — from its prepare
         // (whose plan may read it for a DEFAULT) through its
@@ -7127,11 +7165,15 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Rollback => self.step_rollback().await,
         };
         #[cfg(feature = "json")]
-        if let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut() {
+        if self.stream.is_none()
+            && let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut()
+        {
             d.truncate(mark);
         }
         #[cfg(feature = "fts5")]
-        if let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut() {
+        if self.stream.is_none()
+            && let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut()
+        {
             d.truncate(fmark);
         }
         #[cfg(feature = "fts5")]
@@ -7393,6 +7435,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.query_pos = 0;
             self.query_loaded = false;
         }
+        #[cfg(feature = "v16")]
+        self.end_stream();
         #[cfg(feature = "v06")]
         self.hoist.clear();
         #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
@@ -11314,6 +11358,36 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
+        // A plan that streams (v0.17, `v16`) returns each row as its
+        // join makes it; a blocking one's rows land in `query_rows`.
+        #[cfg(feature = "v16")]
+        if !self.query_loaded {
+            // Boxed: the step future (re-entered once per trigger
+            // level) stays small.
+            if self.stream.is_none() {
+                self.stream = Box::pin(self.stream_open()).await?;
+            }
+            if let Some(mut s) = self.stream.take() {
+                match Box::pin(self.stream_step(&mut s)).await {
+                    Ok(true) => {
+                        self.stream = Some(s);
+                        self.phase = Phase::Running;
+                        return Ok(Step::Row);
+                    }
+                    Ok(false) => {
+                        self.conn.stream_left = None;
+                        self.query_loaded = true;
+                        self.query_pos = 0;
+                    }
+                    Err(e) => {
+                        // Stepped again, the statement starts over.
+                        self.conn.stream_left = None;
+                        self.phase = Phase::Fresh;
+                        return Err(e);
+                    }
+                }
+            }
+        }
         if !self.query_loaded {
             self.run_query().await?;
             self.query_loaded = true;
@@ -11346,33 +11420,43 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !qp.compound.is_empty() || !qp.values.is_empty() {
             return self.run_query_compound(qp).await;
         }
-        #[cfg(feature = "v06")]
-        if query_plan_has_sub(&qp) {
-            return self.run_query_sub(qp).await;
+        // v0.17 (`v16`): one executor, the async one (the streamed
+        // plans and their blocking modes use it too); the synchronous
+        // v0.4 executor below serves the builds without the rung.
+        #[cfg(feature = "v16")]
+        {
+            self.run_query_sub(qp).await
         }
-        // LIMIT / OFFSET first: the pin computes them before
-        // the scan, so a bad one errors even over no rows.
-        let window = self.limit_window(&qp.limit, &qp.offset).await?;
-        let src_rows = self
-            .materialise_query_sources(qp.sources.as_slice())
-            .await?;
-        // Nested-loop join + WHERE, then group / project: the
-        // synchronous v0.4 executor (no subqueries in the plan).
-        let mut rows: AVec<RowData> = AVec::new();
-        join_all::<S::Error>(&self.conn.env, &qp, src_rows.as_slice(), &mut rows)?;
-        let produced = project_rows::<S::Error>(
-            &self.conn.env,
-            &qp,
-            rows.as_slice(),
-            group_cap(
-                qp.group_by.as_slice(),
-                qp.order_by.as_slice(),
-                qp.distinct,
-                window,
-            ),
-        )?;
-        self.finish_produced(&qp, produced, window);
-        Ok(())
+        #[cfg(not(feature = "v16"))]
+        {
+            #[cfg(feature = "v06")]
+            if query_plan_has_sub(&qp) {
+                return self.run_query_sub(qp).await;
+            }
+            // LIMIT / OFFSET first: the pin computes them before
+            // the scan, so a bad one errors even over no rows.
+            let window = self.limit_window(&qp.limit, &qp.offset).await?;
+            let src_rows = self
+                .materialise_query_sources(qp.sources.as_slice())
+                .await?;
+            // Nested-loop join + WHERE, then group / project: the
+            // synchronous v0.4 executor (no subqueries in the plan).
+            let mut rows: AVec<RowData> = AVec::new();
+            join_all::<S::Error>(&self.conn.env, &qp, src_rows.as_slice(), &mut rows)?;
+            let produced = project_rows::<S::Error>(
+                &self.conn.env,
+                &qp,
+                rows.as_slice(),
+                group_cap(
+                    qp.group_by.as_slice(),
+                    qp.order_by.as_slice(),
+                    qp.distinct,
+                    window,
+                ),
+            )?;
+            self.finish_produced(&qp, produced, window);
+            Ok(())
+        }
     }
 
     /// Evaluate a plan's LIMIT / OFFSET (v0.16) into the row
@@ -11415,7 +11499,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Scan one query source's rows into memory (v0.4 executor
     /// step 1, shared by the subquery path): decoded values with
     /// defaults materialised and read-side REAL forcing (§5.5).
-    #[cfg(feature = "v04")]
+    #[cfg(all(feature = "v04", not(feature = "v16")))]
     async fn materialise_query_sources(
         &mut self,
         sources: &[SourcePlan],
@@ -11446,54 +11530,27 @@ impl<'c, S: Storage> Statement<'c, S> {
                 src_rows.push(rows);
                 continue;
             }
-            let mut rows = AVec::new();
-            let mut cursor = ScanCursor::new(sp.root);
-            let mut buf = AVec::new();
-            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-                if let Some(g) = &sp.gcols {
-                    // v0.16: a table with generated columns —
-                    // decode around the VIRTUAL ones, compute
-                    // them, then read the row as any other.
-                    let mut rec = crate::rules::decode_rec::<S::Error>(
-                        buf.as_slice(),
-                        sp.ncols,
-                        sp.defaults.as_slice(),
-                        Some(g.virt.as_slice()),
-                    )?;
-                    g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
-                    let rd = crate::rules::eval_row(
-                        sp.rowid_alias,
-                        sp.affs.as_slice(),
-                        rec.as_slice(),
-                        rowid,
-                    );
-                    rows.push((rd.vals, Some(rowid)));
-                    continue;
-                }
-                let mut dec: AVec<Value<'_>> = AVec::new();
-                crate::record::decode_record_into::<S::Error>(buf.as_slice(), sp.ncols, &mut dec)?;
-                let mut vals = AVec::new();
-                for i in 0..sp.ncols {
-                    let mut v = if Some(i) == sp.rowid_alias {
-                        OwnedValue::Integer(rowid)
-                    } else if i < dec.len() {
-                        OwnedValue::from_value(dec.as_slice()[i])
-                    } else {
-                        sp.defaults.as_slice()[i].clone()
-                    };
-                    // Read-side REAL forcing (§5.5).
-                    if sp.affs.as_slice()[i] == crate::record::Affinity::Real
-                        && let OwnedValue::Integer(x) = v
-                    {
-                        v = OwnedValue::Real(x as f64);
-                    }
-                    vals.push(v);
-                }
-                rows.push((vals, Some(rowid)));
-            }
-            src_rows.push(rows);
+            src_rows.push(self.scan_source(sp).await?);
         }
         Ok(src_rows)
+    }
+
+    /// Every row of the plain table source `sp`, in rowid order
+    /// (`decode_source_row` each).
+    #[cfg(feature = "v04")]
+    async fn scan_source(
+        &mut self,
+        sp: &SourcePlan,
+    ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        let mut rows = AVec::new();
+        let mut cursor = ScanCursor::new(sp.root);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let mut vals = AVec::new();
+            decode_source_row::<S::Error>(sp, buf.as_slice(), rowid, &mut vals)?;
+            rows.push((vals, Some(rowid)));
+        }
+        Ok(rows)
     }
 
     /// Materialise query sources for the async paths (v0.9):
@@ -11584,51 +11641,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 src_rows.push(rows);
                 continue;
             }
-            let mut rows = AVec::new();
-            let mut cursor = ScanCursor::new(sp.root);
-            let mut buf = AVec::new();
-            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-                if let Some(g) = &sp.gcols {
-                    // v0.16: a table with generated columns —
-                    // decode around the VIRTUAL ones, compute
-                    // them, then read the row as any other.
-                    let mut rec = crate::rules::decode_rec::<S::Error>(
-                        buf.as_slice(),
-                        sp.ncols,
-                        sp.defaults.as_slice(),
-                        Some(g.virt.as_slice()),
-                    )?;
-                    g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
-                    let rd = crate::rules::eval_row(
-                        sp.rowid_alias,
-                        sp.affs.as_slice(),
-                        rec.as_slice(),
-                        rowid,
-                    );
-                    rows.push((rd.vals, Some(rowid)));
-                    continue;
-                }
-                let mut dec: AVec<Value<'_>> = AVec::new();
-                crate::record::decode_record_into::<S::Error>(buf.as_slice(), sp.ncols, &mut dec)?;
-                let mut vals = AVec::new();
-                for i in 0..sp.ncols {
-                    let mut v = if Some(i) == sp.rowid_alias {
-                        OwnedValue::Integer(rowid)
-                    } else if i < dec.len() {
-                        OwnedValue::from_value(dec.as_slice()[i])
-                    } else {
-                        sp.defaults.as_slice()[i].clone()
-                    };
-                    if sp.affs.as_slice()[i] == crate::record::Affinity::Real
-                        && let OwnedValue::Integer(x) = v
-                    {
-                        v = OwnedValue::Real(x as f64);
-                    }
-                    vals.push(v);
-                }
-                rows.push((vals, Some(rowid)));
-            }
-            src_rows.push(rows);
+            src_rows.push(self.scan_source(sp).await?);
         }
         Ok(src_rows)
     }
@@ -13245,7 +13258,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// The window path of `project_qp_async` / `sub_project`
-    /// (v0.16, `window`; see `win_project`): the projection
+    /// (v0.16, `window`): the projection
     /// evaluates through `eval_row_sub` / `eval_group_sub`.
     #[cfg(feature = "window")]
     #[allow(clippy::too_many_arguments)]
@@ -14602,6 +14615,58 @@ fn left_padded(
     acc
 }
 
+/// Append the values of plain table source `sp`'s row `rowid`
+/// (record `payload`) to `out`: the rowid alias, defaults for the
+/// fields a short record lacks, read-side REAL forcing (§5.5) and
+/// (v0.16) its generated columns computed.
+#[cfg(feature = "v04")]
+fn decode_source_row<E>(
+    sp: &SourcePlan,
+    payload: &[u8],
+    rowid: i64,
+    out: &mut AVec<OwnedValue>,
+) -> Result<(), E> {
+    if let Some(g) = &sp.gcols {
+        // v0.16: a table with generated columns — decode around
+        // the VIRTUAL ones, compute them, then read the row as any
+        // other.
+        let mut rec = crate::rules::decode_rec::<E>(
+            payload,
+            sp.ncols,
+            sp.defaults.as_slice(),
+            Some(g.virt.as_slice()),
+        )?;
+        g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
+        let rd = crate::rules::eval_row(sp.rowid_alias, sp.affs.as_slice(), rec.as_slice(), rowid);
+        for v in rd.vals {
+            out.push(v);
+        }
+        return Ok(());
+    }
+    let mut dec: AVec<Value<'_>> = AVec::new();
+    crate::record::decode_record_into::<E>(payload, sp.ncols, &mut dec)?;
+    for i in 0..sp.ncols {
+        let mut v = if Some(i) == sp.rowid_alias {
+            OwnedValue::Integer(rowid)
+        } else if let Some(d) = dec.as_slice().get(i) {
+            OwnedValue::from_value(*d)
+        } else {
+            sp.defaults
+                .as_slice()
+                .get(i)
+                .cloned()
+                .unwrap_or(OwnedValue::Null)
+        };
+        if sp.affs.as_slice().get(i) == Some(&crate::record::Affinity::Real)
+            && let OwnedValue::Integer(x) = v
+        {
+            v = OwnedValue::Real(x as f64);
+        }
+        out.push(v);
+    }
+    Ok(())
+}
+
 /// Whether any expression of a query plan contains a
 /// current-scope subquery node (v0.6): such plans execute
 /// through the substitution path instead of the synchronous
@@ -14646,7 +14711,7 @@ struct Produced {
 /// RIGHT / FULL source's unmatched rows NULL-padded on the left
 /// and joined onward — the `join_sources` order, without
 /// subquery execution.
-#[cfg(feature = "v04")]
+#[cfg(all(feature = "v04", not(feature = "v16")))]
 fn join_all<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -14693,7 +14758,7 @@ fn join_all<E>(
 /// extends once with NULLs, and RIGHT / FULL matches are
 /// recorded in `matched` for `join_all`'s tail. The WHERE
 /// filter applies to complete rows.
-#[cfg(feature = "v04")]
+#[cfg(all(feature = "v04", not(feature = "v16")))]
 fn join_rows<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -14749,7 +14814,7 @@ fn join_rows<E>(
 }
 
 /// Group (when the plan aggregates) and project joined rows.
-#[cfg(feature = "v04")]
+#[cfg(all(feature = "v04", not(feature = "v16")))]
 fn project_rows<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -14757,33 +14822,9 @@ fn project_rows<E>(
     cap: Option<usize>,
 ) -> Result<AVec<Produced>, E> {
     let mut out = AVec::new();
-    // Window calls (v0.16, `window`): each input row (or group)
-    // first evaluates the calls' inputs; the projection waits for
-    // the windows (`win_project`). A group LIMIT cannot apply.
-    #[cfg(feature = "window")]
-    let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
-    #[cfg(feature = "window")]
-    let cap = if wins.is_empty() { cap } else { None };
-    #[cfg(feature = "window")]
-    let mut pend: AVec<WinUnit> = AVec::new();
     if !qp.has_agg {
-        #[cfg(feature = "window")]
-        let mut row_at = 0usize;
         for r in rows {
             let ctx = Ctx::of(r).with(env);
-            #[cfg(feature = "window")]
-            if !wins.is_empty() {
-                let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
-                    crate::query::eval::<E>(k, &ctx)
-                })?;
-                pend.push(WinUnit {
-                    at: row_at,
-                    rep: None,
-                    ins,
-                });
-                row_at += 1;
-                continue;
-            }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -14802,10 +14843,6 @@ fn project_rows<E>(
                 keys,
                 rowid,
             });
-        }
-        #[cfg(feature = "window")]
-        if !wins.is_empty() {
-            return win_project::<E>(env, qp, wins.as_slice(), pend, rows, &[]);
         }
         return Ok(out);
     }
@@ -14889,13 +14926,7 @@ fn project_rows<E>(
             });
         }
     }
-    #[cfg(feature = "window")]
-    let mut group_at = usize::MAX;
     for (_, grows) in groups.iter() {
-        #[cfg(feature = "window")]
-        {
-            group_at = group_at.wrapping_add(1);
-        }
         if cap.is_some_and(|c| out.len() >= c) {
             break;
         }
@@ -14922,18 +14953,6 @@ fn project_rows<E>(
                 continue;
             }
         }
-        #[cfg(feature = "window")]
-        if !wins.is_empty() {
-            let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
-                crate::query::eval::<E>(k, &ctx)
-            })?;
-            pend.push(WinUnit {
-                at: group_at,
-                rep: Some(rep),
-                ins,
-            });
-            continue;
-        }
         let mut vals = AVec::new();
         for it in qp.items.iter() {
             vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -14947,10 +14966,6 @@ fn project_rows<E>(
             keys,
             rowid: None,
         });
-    }
-    #[cfg(feature = "window")]
-    if !wins.is_empty() {
-        return win_project::<E>(env, qp, wins.as_slice(), pend, rows, groups.as_slice());
     }
     Ok(out)
 }
@@ -15001,67 +15016,6 @@ fn win_results<E>(
         to.push(crate::window::strip(e));
     }
     Ok((order, vals, ti, to))
-}
-
-/// `project_rows`' window path (v0.16, `window`): compute the
-/// windows, then project each unit in the window order with its
-/// calls' values in place.
-#[cfg(feature = "window")]
-fn win_project<E>(
-    env: &crate::query::Env,
-    qp: &QueryPlan,
-    wins: &[&RExpr],
-    mut units: AVec<WinUnit>,
-    rows: &[RowData],
-    groups: &[(AVec<OwnedValue>, AVec<RowData>)],
-) -> Result<AVec<Produced>, E> {
-    let (order, vals, ti, to) = win_results::<E>(
-        wins,
-        &mut units,
-        qp.items.as_slice(),
-        qp.order_by.as_slice(),
-        env.text_enc(),
-    )?;
-    let empty = RowData::empty();
-    let mut out = AVec::with_capacity(order.len());
-    for &u in order.iter() {
-        let (Some(unit), Some(v)) = (units.as_slice().get(u), vals.as_slice().get(u)) else {
-            continue;
-        };
-        let (ctx, rowid) = match &unit.rep {
-            None => {
-                let r = rows.get(unit.at).unwrap_or(&empty);
-                let rowid = if qp.sources.len() == 1 {
-                    r.rowids.as_slice().first().copied().flatten()
-                } else {
-                    None
-                };
-                (Ctx::of(r).with(env), rowid)
-            }
-            Some(rep) => {
-                let g = groups.get(unit.at).map(|g| g.1.as_slice()).unwrap_or(&[]);
-                (Ctx::group(g, rep).with(env), None)
-            }
-        };
-        let mut vs = AVec::new();
-        for t in ti.iter() {
-            let mut e = t.clone();
-            crate::window::fill(&mut e, v.as_slice());
-            vs.push(crate::query::eval::<E>(&e, &ctx)?);
-        }
-        let mut keys = AVec::new();
-        for t in to.iter() {
-            let mut e = t.clone();
-            crate::window::fill(&mut e, v.as_slice());
-            keys.push(crate::query::eval::<E>(&e, &ctx)?);
-        }
-        out.push(Produced {
-            out: vs,
-            keys,
-            rowid,
-        });
-    }
-    Ok(out)
 }
 
 /// The min/max aggregate whose extremum row supplies a group's

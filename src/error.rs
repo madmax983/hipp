@@ -751,10 +751,11 @@ pub enum SchemaKind {
     /// unusable"). Pass a start, or constrain `value`.
     #[cfg(feature = "vtab")]
     SeriesFirstArgument,
-    /// A virtual-table cursor produced more rows than
-    /// `Config::max_vtab_rows` for one statement (v0.16 review fix,
-    /// `vtab`; the pin streams them). hipp holds a source's rows in
-    /// memory: narrow the range, add a LIMIT, or raise the bound.
+    /// A generate_series cursor gave more rows than
+    /// `Config::max_vtab_rows` to a statement that holds them in
+    /// memory (v0.16 review fix, `vtab`; since v0.17 only a blocking
+    /// operator or a materialising path does — see the field): narrow
+    /// the range, add a LIMIT, or raise the bound.
     #[cfg(feature = "vtab")]
     VtabTooManyRows,
     /// `rtree(...)` with fewer than one dimension (v0.16, `rtree`;

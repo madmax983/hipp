@@ -3,6 +3,32 @@
 All notable changes to hipp. Versions follow the milestones in
 `STATUS.md`; the oracle pin is SQLite 3.54.1 throughout.
 
+## Unreleased (0.17)
+
+### Streamed rows (ungated, `v16` executor; cursors with `vtab`)
+
+- A top-level SELECT returns its rows one `step` at a time: a
+  statement failing on row N returns rows 1..N-1 first (as the pin
+  and its shell do), LIMIT stops reading (`generate_series(1) LIMIT
+  3` answers at once), OFFSET rows are not projected, LIMIT 0 reads
+  nothing.
+- Virtual-table cursors drive the join row by row
+  (generate_series, the R*Tree search); an inner virtual table is
+  filtered again per outer row. dbstat / fts5 / fts5vocab hand out
+  the rows their filter computed.
+- count / sum / total / avg / min / max without GROUP BY fold in
+  constant memory: `count(*) FROM generate_series(1)` is 4294967295.
+- `Config::max_vtab_rows` bounds only rows a statement holds
+  (DISTINCT, GROUP BY, ORDER BY without LIMIT, and the materialising
+  paths: subqueries, derived tables, compounds, RIGHT / FULL joins,
+  window queries, write-statement sources); an ORDER BY with a LIMIT
+  keeps only the rows it may return.
+- Under `v16` the synchronous v0.4 query executor is retired (the
+  async executor serves every top-level query).
+- Sizes: tiny 76,960 B (0), full 505,416 B (+4,464), max 1,043,340 B
+  (+7,824), xl 1,043,292 B (+7,776; its ratchet stays at max's,
+  as `xl` contains `max`).
+
 ## 0.16.0 — the SQLite-parity push (2026-11-05)
 
 Closes as much of the gap with the pinned SQLite 3.54.1 as the size

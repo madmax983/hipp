@@ -4,6 +4,171 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
 
+## v0.17 — parity backlog
+
+Milestone v0.17 closes the honest gaps the v0.16 units recorded,
+still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
+(the `xl` profile for leaves past `max`). Each unit records itself
+below.
+
+### Streamed rows: virtual-table cursors and row-at-a-time statements (2026-11-05)
+
+**Shipped** (`src/session/stream.rs`; the vtab cursors in
+`session::vtab` / `session::rtree`):
+
+- **A streamed top-level SELECT.** `Statement::step` returns each
+  row as the join makes it, instead of materialising the result in
+  the first step: the nested loop of `join_sources` unrolled into a
+  resumable state machine (one level per FROM source, `join_sources`'
+  row order, LEFT JOIN pads, the WHERE clause's constant terms first,
+  the lateral pre-checks of `lateral_ok`). The first source is read
+  through its cursor — a table's b-tree cursor, or a virtual table's
+  xFilter / xNext / xEof / xColumn / xRowid (`vtab_open` /
+  `vtab_next`); each inner source is opened again for every
+  combination of the sources before it, so an inner virtual table is
+  filtered again with the outer row's values, as the pin's xFilter
+  (its arguments, and the usable `value = t.a`-style constraints the
+  planner hands it). A source hipp computes as a whole (a derived
+  table, view or CTE, a TEMP or attached table, an index lookup, a
+  JSON table-valued function, an inner plain table) is computed the
+  first time the join reaches it, not before the statement starts.
+  So a statement failing on row N (a `json()` of malformed text, an
+  `abs()` overflow, a LIKE ESCAPE error, a malformed `json_each`
+  document of the third outer row) returns rows 1..N-1 first, as on
+  the pin — for plain scans, joins, DISTINCT, an ORDER BY that the
+  rowid or an index loop delivers, derived tables / views read by
+  the streaming outer query, and every module (generate_series,
+  dbstat, R*Tree, fts5, fts5vocab). The CLI prints those rows before
+  the error, as the pin's shell does.
+- **LIMIT / OFFSET.** LIMIT stops the join: `SELECT value FROM
+  generate_series(1) LIMIT 3` returns its first row at the first
+  `step` (it was VtabTooManyRows past `Config::max_vtab_rows`), and
+  so does a join or a WHERE over an endless series. OFFSET rows are
+  skipped before their result columns are computed, as on the pin
+  (hipp computed them and could fail on a row it then dropped).
+  LIMIT 0 reads nothing.
+- **Constant-memory aggregates.** An aggregate query without GROUP
+  BY / HAVING / ORDER BY whose aggregates are count / sum / total /
+  avg / min / max (FILTER allowed; no DISTINCT, aggregate ORDER BY or
+  subquery in the result) folds row by row (`agg::SumCtx` and the
+  pin's min / max comparison), the bare columns' row kept by
+  `pick_rep_from`'s rule. `count(*) FROM generate_series(1)` answers
+  4294967295 as the pin does (in a release build; a debug build
+  needs about half an hour for 2^32 rows); the tests run count /
+  sum / min / max / total over generate_series(1, 50000000) under a
+  64 KiB statement arena and `max_vtab_rows(1000)` with the thread's
+  heap peak bounded (a counting allocator), against the pin's answer.
+- **Blocking operators** buffer what they need, as the pin's sorters
+  do: an ORDER BY that no loop delivers (the projected rows and keys;
+  with a LIMIT only the OFFSET + LIMIT rows it may still return —
+  sorted stably, so the earliest of equal rows stay), GROUP BY and
+  the other aggregates (the joined rows, then the materialising
+  executor's grouping projection), DISTINCT (the distinct rows so
+  far). **`Config::max_vtab_rows` now applies only where rows are
+  held**: per generate_series cursor opening under DISTINCT, GROUP BY
+  / a non-folding aggregate, or an ORDER BY without LIMIT; and on the
+  paths that still materialise a cursor (subqueries, derived tables
+  and CTEs, compound members, RIGHT / FULL joins, window queries,
+  trigger programs, INSERT ... SELECT / UPDATE ... FROM / CREATE
+  TABLE ... AS sources) — documented on the field.
+- **One executor under `v16`.** The synchronous v0.4 query executor
+  (`materialise_query_sources`, `join_all`, `project_rows`) now
+  serves only the builds without the rung; with it every top-level
+  query that does not stream runs the async executor
+  (`run_query_sub`), which the streamed modes also finish through.
+  That kept `max` inside its budget.
+- `IdxAccess::sorted` (leaf `expr_index`): how many ORDER BY terms
+  an index loop delivers, outside `explain` too, so a lone source
+  whose loop delivers the ORDER BY streams.
+- A streamed statement's JSON documents and full-text rows (the
+  `Env` side tables its rows point into) are kept until its last
+  row; a statement reset part-way drops them, and one dropped
+  part-way leaves them to the next top-level statement's first step
+  (`Connection::stream_left`).
+
+**Oracle-probing notes** (verified on the 3.54.1 pin):
+
+- The pin's shell prints the rows a statement returned before its
+  error, then the error; one-shot and `-bail` stop there, stdin
+  scripts go on (exit status 1 either way).
+- Streams: plain scans, joins (inner, LEFT, virtual tables and
+  json_each either side), DISTINCT (each new row at once), ORDER BY
+  the rowid or an index delivers (`ORDER BY a DESC` on an INTEGER
+  PRIMARY KEY too), derived tables, views and CTEs (MATERIALIZED
+  too) read by a streaming outer query, UNION ALL members.
+- Buffers (no row before the error): ORDER BY of another column,
+  GROUP BY / HAVING, aggregates.
+- OFFSET rows' result columns are not evaluated (`json(... a = 1
+  ...) LIMIT 1 OFFSET 1` succeeds); their WHERE is. LIMIT 0 runs
+  nothing (`count(json('x')) ... LIMIT 0` succeeds). With DISTINCT or
+  ORDER BY the skipped rows are computed.
+- `json_each('[1,2,')` fails before any row (the document is parsed
+  at xFilter); over `t, json_each(t.j)` the earlier documents' rows
+  come first.
+- The bare column of an aggregate without min / max is the first
+  row's (`SELECT value, count(*) FROM generate_series(1, 5)` is
+  `1|5`); with min / max the extremum row's.
+- The pin reorders an inner join (and a LEFT JOIN whose WHERE
+  rejects the NULL row, which it makes inner) by cost; the tests use
+  CROSS JOIN, which it never reorders (join ordering is another
+  v0.17 unit's).
+
+**Tests:** `tests/stream_v17.rs` (differential, rows before the
+error compared: plain scans, blocking operators, derived tables /
+views, joins, inner virtual tables re-filtered, LIMIT early exit and
+first-row latency, OFFSET, generate_series, dbstat on a pin-written
+file, R*Tree, fts5 and fts5vocab, constant memory, streamed rows not
+accumulating, the bounds of blocking operators and the top-N sort,
+transactions with a statement failing part-way, reset / drop /
+re-step part-way, a generated corpus of 160 joins mixing tables and
+modules with error injection, LEFT JOIN, LIMIT and OFFSET);
+`hipp-cli/tests/cli_v17_stream.rs` (byte-identical stdout over stdin
+and one-shot, errors included). `tests/vtab_v16.rs`'s
+`series_row_bound` now expects the pin's answer for a streamed
+`count(*)` past the bound, and the bound for DISTINCT / ORDER BY.
+
+**Gates:** `ci/local-gates.sh` (full run): fmt, clippy (default,
+all features, every line of `ci/feature-sets.txt`), workspace tests,
+the four no_std targets and the four size gates — "all gates
+passed". `depth_v16` / `triggers_v16` also pass built with debug
+info (the stream's futures are boxed off the step future, so
+`Config::stack_budget`'s constants are unchanged).
+
+**Size Δ** (thumbv7em, `--profile tiny`): tiny 76,960 → 76,960 (0);
+full 500,952 → 505,416 (+4,464: the streamed executor, partly paid
+for by retiring the synchronous executor under `v16`); max 1,035,516
+→ 1,043,340 (+7,824: the above plus the cursor plumbing of `vtab` /
+`rtree`); xl 1,035,516 → 1,043,292 (+7,776; no leaf of its own yet —
+its ratchet is set to max's 1,043,340, as `xl` contains `max`). Part B
+(plain scans and joins) is an ungated fix of the `v16` executor: tiny
+does not contain it, and full stays under its 512 KiB budget.
+
+**Honest gaps:**
+
+- Only a top-level SELECT streams. A scalar / IN / EXISTS subquery,
+  a derived table's own rows, a compound (UNION ALL members stream on
+  the pin), a RIGHT / FULL join, window queries, trigger-program
+  SELECTs and the sources of INSERT ... SELECT / UPDATE ... FROM /
+  CREATE TABLE ... AS still materialise: `SELECT (SELECT count(*)
+  FROM generate_series(1))` is still VtabTooManyRows, and the
+  `last_insert_rowid()`-inside-INSERT-...-SELECT gap of the function
+  unit stays open.
+- dbstat, fts5, fts5vocab and rtreecheck compute their rows at
+  xFilter (bounded by the file) and hand them out row by row; only
+  generate_series and the R*Tree search are incremental. So a
+  module-side error part-way (a corrupt page or node) fails before
+  the first row, and a LIMIT bounds only what a lone first source
+  computes (`derived_need`, as before).
+- An inner plain table is read once, at its first reach, and kept
+  (as before); the pin reads it again per outer row.
+- An ORDER BY delivered by a multi-source join's outer loop, or by
+  a lone table's own order under the `full` profile (no
+  `expr_index`) other than its rowid ascending, still sorts.
+- DISTINCT is still quadratic in the distinct rows.
+- The WHERE clause is tested on complete rows (as before): a term on
+  the outer source only, which the pin tests at the outer loop, can
+  fail there on the pin when the inner source is empty.
+
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
@@ -2025,6 +2190,8 @@ both (the misuse refusal, the HAVING `random()` overflow).
   text.
 - Aggregate folding is still materialise-then-fold (each group's
   rows held in memory) and DISTINCT is quadratic, as before.
+  (Closed in v0.17 for a top-level aggregate without GROUP BY of
+  count / sum / total / avg / min / max: folded row by row.)
 
 ### Math functions (2026-11-02)
 
@@ -4972,7 +5139,8 @@ patch, validity check, the `json_each` cursor) and its wiring.
   RIGHT / FULL join; `json_each()` with empty parentheses has no
   rows, as on the pin.
 - Rows stream on the pin: a statement that fails part-way prints the
-  rows before the failure there, none in hipp (both fail). Columns
+  rows before the failure there, none in hipp (both fail). (Closed
+  in v0.17 for top-level queries: streamed rows.) Columns
   other than key / value / atom are computed for every row, and an
   object whose last label has no value reads NULL where the pin reads
   past the blob's end.
@@ -7706,6 +7874,9 @@ shadow-table writes, queries and checks ≈ 32 KiB; 173,744 B of the
   streams them — `count(*) from generate_series(1)` is an error,
   not 4294967295. (The executor-wide form — a huge join or
   recursive CTE — is the engine's, not this unit's.)
+  (Closed in v0.17 for top-level queries: streamed rows,
+  `session::stream`; subqueries and the other materialising paths
+  keep the bound.)
 - hipp-cli's `.tables` does not list virtual tables.
 
 ### Virtual tables and the R*Tree — review fixes (2026-11-05)

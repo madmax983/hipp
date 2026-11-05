@@ -885,6 +885,9 @@ pub struct IdxAccess {
     /// `(key field, nulls_first)` — each probe's rows with a NULL in
     /// that key field move to the front (or back), in scan order.
     pub bignull: Option<(usize, bool)>,
+    /// How many ORDER BY terms the loop's order delivers (v0.17: a
+    /// lone source delivering them all streams its rows unsorted).
+    pub sorted: usize,
     /// What EXPLAIN QUERY PLAN says of the loop (v0.16, `explain`):
     /// how many ORDER BY (or GROUP BY / DISTINCT) terms it delivers,
     /// whether its index covers the statement's columns, whether its
@@ -1712,6 +1715,7 @@ fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxA
         groups: false,
         cover: None,
         bignull: None,
+        sorted: l.sorted,
         #[cfg(feature = "explain")]
         eqp: (
             l.sorted,

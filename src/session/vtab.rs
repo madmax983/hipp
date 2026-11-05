@@ -5,10 +5,13 @@
 //!   module named in FROM (`generate_series(1, 9)`, `dbstat`), plans
 //!   as a source of the module's declared columns (HIDDEN ones are
 //!   not in `*`) with a rowid (`plan_vtab_source`). Its rows come
-//!   from the module's cursor when the join reaches it
-//!   (`vtab_rows`), once per execution, or once per row of the
-//!   sources to its left when a filter argument reads them (the
-//!   JSON table-valued functions' lateral machinery).
+//!   from the module's cursor when the join reaches it: read row by
+//!   row by a streamed query (v0.17, `vtab_open` / `vtab_next`,
+//!   filtered again for each combination of the sources to its
+//!   left), or read whole (`vtab_rows`) by the materialising paths,
+//!   once per execution, or once per row of the sources to its left
+//!   when a filter argument reads them (the JSON table-valued
+//!   functions' lateral machinery).
 //! - **xBestIndex.** Once the WHERE clause is resolved
 //!   (`plan_vtab_cons`) each `column op expr` term (`=`, `<`, `<=`,
 //!   `>`, `>=`, `IS`, either way round; a BETWEEN's two halves) and
@@ -62,6 +65,17 @@ pub(super) enum VtPlan {
 
 /// `(column values, rowid)` rows a module produced.
 type VRows = AVec<(AVec<OwnedValue>, Option<i64>)>;
+
+/// An open virtual-table cursor (v0.17; `Statement::vtab_open`).
+pub(super) enum VtCur {
+    /// generate_series: each value computed when asked for.
+    Series(crate::vtab::SeriesCursor),
+    /// An R*Tree search, walking the nodes as it reaches them.
+    #[cfg(feature = "rtree")]
+    Rtree(Box<super::rtree::RtCursor>),
+    /// The rows a module computed at its filter, and the next one.
+    Rows(VRows, usize),
+}
 
 fn vt_err<E>(kind: SchemaKind) -> Error<E> {
     Error::Schema { kind }
@@ -1378,6 +1392,17 @@ impl<S: Storage> Statement<'_, S> {
         row: &RowData,
         need: Option<usize>,
     ) -> Result<VRows, S::Error> {
+        let argv = self.vtab_argv(sp, row).await?;
+        self.vtab_rows_of(vt, argv, row, need).await
+    }
+
+    /// Source `sp`'s filter arguments (the pin's xFilter `argv`),
+    /// evaluated for the row `row`.
+    async fn vtab_argv(
+        &mut self,
+        sp: &SourcePlan,
+        row: &RowData,
+    ) -> Result<AVec<OwnedValue>, S::Error> {
         let mut argv = AVec::new();
         if let Some(d) = sp.derived.as_deref()
             && let Some(r) = d.values.as_slice().first()
@@ -1386,6 +1411,90 @@ impl<S: Storage> Statement<'_, S> {
                 argv.push(self.eval_row_sub(a, row).await?);
             }
         }
+        Ok(argv)
+    }
+
+    /// Open a cursor on virtual-table source `sp` for the row `row`
+    /// (v0.17, the pin's xFilter): its arguments evaluated now, its
+    /// rows read one at a time by `vtab_next` — generate_series
+    /// computes each value as it is asked for, an R*Tree walks its
+    /// nodes as its search reaches them; the other modules compute
+    /// their rows here (at most `need`) and hand them out in order.
+    pub(super) async fn vtab_open(
+        &mut self,
+        sp: &SourcePlan,
+        vt: &VtSrc,
+        row: &RowData,
+        need: Option<usize>,
+    ) -> Result<VtCur, S::Error> {
+        let argv = self.vtab_argv(sp, row).await?;
+        Ok(match vt.tab.module {
+            Module::Series => VtCur::Series(crate::vtab::SeriesCursor::filter(
+                vt.idx_num,
+                argv.as_slice(),
+            )),
+            #[cfg(feature = "rtree")]
+            Module::Rtree { .. } => {
+                VtCur::Rtree(Box::new(self.rtree_open(vt, argv.as_slice()).await?))
+            }
+            _ => VtCur::Rows(self.vtab_rows_of(vt, argv, row, need).await?, 0),
+        })
+    }
+
+    /// The cursor's next row appended to `out` (its columns, then its
+    /// rowid; the pin's xColumn / xRowid, then xNext), or false at
+    /// its end (xEof).
+    pub(super) async fn vtab_next(
+        &mut self,
+        c: &mut VtCur,
+        ncols: usize,
+        out: &mut RowData,
+    ) -> Result<bool, S::Error> {
+        use crate::vtab::VtCursor;
+        match c {
+            VtCur::Series(c) => {
+                if c.eof() {
+                    return Ok(false);
+                }
+                for i in 0..ncols {
+                    out.vals.push(c.column(i));
+                }
+                out.rowids.push(Some(c.rowid()));
+                c.next();
+            }
+            #[cfg(feature = "rtree")]
+            VtCur::Rtree(c) => {
+                let Some((vals, rowid)) = self.rtree_next(c).await? else {
+                    return Ok(false);
+                };
+                for v in vals {
+                    out.vals.push(v);
+                }
+                out.rowids.push(rowid);
+            }
+            VtCur::Rows(rows, pos) => {
+                let Some((vals, rowid)) = rows.as_slice().get(*pos) else {
+                    return Ok(false);
+                };
+                *pos += 1;
+                for v in vals.iter() {
+                    out.vals.push(v.clone());
+                }
+                out.rowids.push(*rowid);
+            }
+        }
+        Ok(true)
+    }
+
+    /// `vtab_rows` once the arguments are evaluated.
+    async fn vtab_rows_of(
+        &mut self,
+        vt: &VtSrc,
+        argv: AVec<OwnedValue>,
+        row: &RowData,
+        need: Option<usize>,
+    ) -> Result<VRows, S::Error> {
+        let _ = row;
         match vt.tab.module {
             Module::Series => {
                 let mut c = crate::vtab::SeriesCursor::filter(vt.idx_num, argv.as_slice());

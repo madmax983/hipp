@@ -53,6 +53,16 @@ struct Shadow {
     naux: usize,
 }
 
+/// An open R*Tree cursor (v0.17; `Statement::rtree_open`): the
+/// table's shadow tables and either its search in progress (and the
+/// node image it asked for) or the one cell a rowid lookup found.
+pub(super) struct RtCursor {
+    sh: Shadow,
+    search: Option<Search>,
+    one: Option<crate::rtree::Cell>,
+    img: Option<AVec<u8>>,
+}
+
 fn rt_err<E>(kind: SchemaKind) -> Error<E> {
     Error::Schema { kind }
 }
@@ -668,63 +678,95 @@ impl<S: Storage> Statement<'_, S> {
         argv: &[OwnedValue],
         need: Option<usize>,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
-        let sh = self.rt_shadow(vt.name.as_slice(), &vt.tab).await?;
+        let mut c = self.rtree_open(vt, argv).await?;
         let mut out = AVec::new();
-        let mut cells = AVec::new();
-        if vt.idx_num == 1 {
-            let Some(r) = argv.first().and_then(crate::rtree::lookup_rowid) else {
-                return Ok(out);
-            };
-            let Some(p) = btree::seek_rowid(&mut self.conn.pager, sh.rowid, r).await? else {
-                return Ok(out);
-            };
-            let leaf = crate::func::int64_value(&field::<S::Error>(p.as_slice(), 1)?);
-            let img = self.rt_node(&sh, leaf).await?.ok_or(corrupt())?;
-            let cell = crate::rtree::leaf_cell(&sh.g, img.as_slice(), r).ok_or(corrupt())?;
-            cells.push(cell);
-        } else {
-            let mut s = Search::new(vt.idx_str.as_slice(), argv);
-            let mut img = None;
-            loop {
-                match s.step(&sh.g, img.take()) {
-                    Found::Need(no) => img = self.rt_node(&sh, no).await?,
-                    Found::Row(c) => {
-                        cells.push(c);
-                        if need.is_some_and(|n| cells.len() >= n) {
-                            break;
-                        }
-                    }
-                    Found::Done => break,
-                    Found::Corrupt => return Err(corrupt()),
-                }
+        while need.is_none_or(|n| out.len() < n) {
+            match self.rtree_next(&mut c).await? {
+                Some(r) => out.push(r),
+                None => break,
             }
-        }
-        for c in cells.iter() {
-            let mut row = AVec::new();
-            row.push(OwnedValue::Integer(c.rowid));
-            for k in 0..sh.g.ndim2 {
-                row.push(crate::rtree::coord_value(
-                    &sh.g,
-                    c.c.get(k).copied().unwrap_or(0),
-                ));
-            }
-            if sh.naux > 0 {
-                let p = btree::seek_rowid(&mut self.conn.pager, sh.rowid, c.rowid).await?;
-                let vals = match &p {
-                    Some(p) => crate::record::decode_record::<S::Error>(p.as_slice(), 2 + sh.naux)?,
-                    None => AVec::new(),
-                };
-                for i in 0..sh.naux {
-                    row.push(
-                        vals.as_slice()
-                            .get(2 + i)
-                            .map_or(OwnedValue::Null, |v| OwnedValue::from_value(*v)),
-                    );
-                }
-            }
-            out.push((row, Some(c.rowid)));
         }
         Ok(out)
+    }
+
+    /// Open a cursor on R*Tree `vt` (v0.17; the pin's xFilter): a
+    /// rowid lookup finds its one cell now, a search starts at the
+    /// root and walks the nodes only as `rtree_next` asks for rows.
+    pub(super) async fn rtree_open(
+        &mut self,
+        vt: &VtSrc,
+        argv: &[OwnedValue],
+    ) -> Result<RtCursor, S::Error> {
+        let sh = self.rt_shadow(vt.name.as_slice(), &vt.tab).await?;
+        if vt.idx_num != 1 {
+            return Ok(RtCursor {
+                sh,
+                search: Some(Search::new(vt.idx_str.as_slice(), argv)),
+                one: None,
+                img: None,
+            });
+        }
+        let mut one = None;
+        if let Some(r) = argv.first().and_then(crate::rtree::lookup_rowid)
+            && let Some(p) = btree::seek_rowid(&mut self.conn.pager, sh.rowid, r).await?
+        {
+            let leaf = crate::func::int64_value(&field::<S::Error>(p.as_slice(), 1)?);
+            let img = self.rt_node(&sh, leaf).await?.ok_or(corrupt())?;
+            one = Some(crate::rtree::leaf_cell(&sh.g, img.as_slice(), r).ok_or(corrupt())?);
+        }
+        Ok(RtCursor {
+            sh,
+            search: None,
+            one,
+            img: None,
+        })
+    }
+
+    /// The cursor's next row (rowid, coordinates, auxiliary columns)
+    /// and its rowid; None at the end.
+    #[allow(clippy::type_complexity)]
+    pub(super) async fn rtree_next(
+        &mut self,
+        c: &mut RtCursor,
+    ) -> Result<Option<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        let cell = match c.search.as_mut() {
+            Some(s) => loop {
+                match s.step(&c.sh.g, c.img.take()) {
+                    Found::Need(no) => c.img = self.rt_node(&c.sh, no).await?,
+                    Found::Row(x) => break x,
+                    Found::Done => return Ok(None),
+                    Found::Corrupt => return Err(corrupt()),
+                }
+            },
+            None => match c.one.take() {
+                Some(x) => x,
+                None => return Ok(None),
+            },
+        };
+        let sh = &c.sh;
+        let mut row = AVec::new();
+        row.push(OwnedValue::Integer(cell.rowid));
+        for k in 0..sh.g.ndim2 {
+            row.push(crate::rtree::coord_value(
+                &sh.g,
+                cell.c.get(k).copied().unwrap_or(0),
+            ));
+        }
+        if sh.naux > 0 {
+            let p = btree::seek_rowid(&mut self.conn.pager, sh.rowid, cell.rowid).await?;
+            let vals = match &p {
+                Some(p) => crate::record::decode_record::<S::Error>(p.as_slice(), 2 + sh.naux)?,
+                None => AVec::new(),
+            };
+            for i in 0..sh.naux {
+                row.push(
+                    vals.as_slice()
+                        .get(2 + i)
+                        .map_or(OwnedValue::Null, |v| OwnedValue::from_value(*v)),
+                );
+            }
+        }
+        Ok(Some((row, Some(cell.rowid))))
     }
 
     /// Node `no`'s blob (`None`: no such row).

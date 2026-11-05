@@ -12,7 +12,8 @@ aspirations.
   0001: silent wrong answers fixed ungated, new dialect behind the
   `v16` rung / leaf features, the tiny profile never grows; ADR
   0002 / 0003: the `max` profile), on the v0.15 foundation (SPEC §2).
-  `CHANGELOG.md` summarises the release.
+  `CHANGELOG.md` summarises the release. v0.17 (the parity backlog:
+  the v0.16 units' honest gaps) is in progress on top of it.
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
@@ -29,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 500,952 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,035,516 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,035,516 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 505,416 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,043,340 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,043,292 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -51,6 +52,25 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
   `autovacuum`, `vtab` (virtual tables, generate_series, dbstat),
   `rtree`, `fts5`, `explain` (EXPLAIN QUERY PLAN).
+
+## What v0.17 does
+
+- **Streamed rows.** A top-level SELECT hands its rows to
+  `Statement::step` one at a time, as the pin does: the join is a
+  resumable nested loop whose first source is read through its
+  cursor (a table's b-tree, a virtual table's xFilter / xNext /
+  xColumn — generate_series and the R*Tree search row by row) and
+  whose inner virtual tables are filtered again with each outer
+  row's values. A statement that fails on row N returns rows 1..N-1
+  first (the CLI prints them before the error), LIMIT stops the join
+  (`SELECT value FROM generate_series(1) LIMIT 3` answers at once),
+  OFFSET rows are not projected, and count / sum / total / avg /
+  min / max without GROUP BY fold in constant memory
+  (`count(*) FROM generate_series(1)` is 4294967295, not
+  VtabTooManyRows). ORDER BY (unless the rowid or an index delivers
+  it), GROUP BY and DISTINCT buffer as the pin's sorters do;
+  `Config::max_vtab_rows` now bounds only what is held. Ungated in
+  the `v16` executor (`src/session/stream.rs`).
 
 ## What v0.16 does
 
@@ -1246,7 +1266,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,952 B of 512 KiB, `max` 1,035,516 B of 1 MiB; ADR 0003) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 505,416 B of 512 KiB, `max` 1,043,340 B of 1 MiB, `xl` 1,043,292 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
