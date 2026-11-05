@@ -371,11 +371,13 @@ pub struct Runtime {
     pub version: i64,
     /// `rank` (`name(args)`), empty for the default `bm25()`.
     pub rank: AVec<u8>,
-    pub deletemerge: i64,
+    /// `secure-delete` (`bSecureDelete`): hipp cannot remove index
+    /// entries in place, so deletes are refused while it is set.
+    pub secure_delete: bool,
 }
 
 /// `sqlite3_value_numeric_type(v) == SQLITE_INTEGER` and the value.
-fn int_value(v: &OwnedValue) -> Option<i64> {
+pub(crate) fn int_value(v: &OwnedValue) -> Option<i64> {
     match v {
         OwnedValue::Integer(i) => Some(*i),
         OwnedValue::Text(t) => match crate::record::text_to_number(t.as_slice()) {
@@ -396,7 +398,7 @@ impl Runtime {
             t: Tuning::default(),
             version: 4,
             rank: AVec::new(),
-            deletemerge: 10,
+            secure_delete: false,
         }
     }
 
@@ -447,7 +449,12 @@ impl Runtime {
             if p > 100 {
                 p = 0;
             }
-            self.deletemerge = p;
+            self.t.deletemerge = p;
+        } else if k(b"secure-delete") {
+            match i32v {
+                Some(p) if p >= 0 => self.secure_delete = p != 0,
+                _ => return Err(BadSetting),
+            }
         } else if k(b"rank") {
             let t = match v {
                 OwnedValue::Text(t) | OwnedValue::Blob(t) => t.clone(),

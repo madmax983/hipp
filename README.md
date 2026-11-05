@@ -30,7 +30,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 500,200 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,022,404 B | 1 MiB |
+| `max` | `--no-default-features --features max` | 1,032,068 B | 1 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -914,19 +914,27 @@ LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
   statement savepoints, rowid order, `hashsize`) and its segment
   merging (automerge, crisismerge, usermerge, `merge`, `optimize`),
   so either engine continues the other's files and the pin's
-  `INSERT INTO t(t) VALUES('integrity-check')` passes on hipp's.
+  `INSERT INTO t(t) VALUES('integrity-check')` passes on hipp's. A
+  pin-made `contentless_delete=1` table's tombstones hide its deleted
+  rows from hipp's queries and are applied by hipp's merges (the
+  pin's `deletemerge` too); the deletes hipp cannot write as the pin
+  does — tombstones, and deletes under a pin-set `secure-delete=1` —
+  are refused rather than written another way.
   Queries: the full query syntax (phrases, `prefix*`, `^`,
   `NEAR(..., N)`, `col:` / `{a b}:` / `-col:` filters, AND / OR /
   NOT with the pin's precedence and implicit AND, parentheses,
   quoting), `MATCH`, `t = 'q'` and `t('q')`, LIKE / GLOB patterns on
   trigram tables, rowid ranges, `ORDER BY rank` with `rank MATCH
-  'bm25(...)'` and the `rank` setting, `bm25()` with weights,
+  'bm25(...)'` and the `rank` setting, MATCH under an OR (the pin's
+  multi-index OR) and in a LEFT JOIN's ON, `bm25()` with weights,
   `highlight()`, `snippet()`, and `fts5vocab` tables (`row`, `col`,
   `instance`). The special INSERT commands `delete`, `delete-all`,
   `rebuild`, `optimize`, `merge`, `automerge`, `crisismerge`,
-  `usermerge`, `pgsz`, `hashsize`, `rank` and `integrity-check`;
-  ALTER TABLE RENAME. Transactions, savepoints and crashes recover
-  the shadow tables like any other table's pages.
+  `usermerge`, `pgsz`, `hashsize`, `rank`, `secure-delete` (stored;
+  deletes refused while it is on) and `integrity-check`; INSERT ...
+  RETURNING and UPDATE ... FROM; ALTER TABLE RENAME. Transactions,
+  savepoints and crashes recover the shadow tables like any other
+  table's pages.
 
 - **EXPLAIN QUERY PLAN** (leaf `explain`, in `max`).
   `EXPLAIN QUERY PLAN <statement>` returns the pin's four columns
@@ -1231,7 +1239,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003). `default = ["std", "max"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,200 B of 512 KiB, `max` 1,022,404 B of 1 MiB; ADR 0003) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,200 B of 512 KiB, `max` 1,032,068 B of 1 MiB; ADR 0003) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

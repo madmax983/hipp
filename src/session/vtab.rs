@@ -67,6 +67,136 @@ fn vt_err<E>(kind: SchemaKind) -> Error<E> {
     Error::Schema { kind }
 }
 
+/// The WHERE term (its index) of `wterms` that is an OR whose every
+/// branch is a conjunction of full-text constraints on this fts5
+/// source (MATCH, `t = q`, `rank MATCH`, `rowid =`), each branch's
+/// filter as xBestIndex plans it; `None` when there is none, or when
+/// another term holds a MATCH of its own (the pin plans that one).
+#[cfg(feature = "fts5")]
+#[allow(clippy::type_complexity)]
+fn fts_or(
+    wterms: &AVec<RExpr>,
+    push: &dyn Fn(
+        u8,
+        usize,
+        &RExpr,
+        &mut AVec<(Cons, RExpr, u8, usize)>,
+        &mut AVec<(Cons, RExpr, u8, usize)>,
+    ),
+    tab: &VTab,
+) -> Option<(usize, AVec<crate::vtab::OrBranch>)> {
+    let ncol = tab.visible() as i32;
+    let fts_con = |c: &Cons| {
+        c.op == Op::Match
+            || (c.op == Op::Eq && c.col >= ncol)
+            || (c.col < 0 && matches!(c.op, Op::Eq | Op::Lt | Op::Le | Op::Gt | Op::Ge))
+    };
+    let mut found = None;
+    for (k, t) in wterms.iter().enumerate() {
+        let mut cands = AVec::new();
+        let mut virt = AVec::new();
+        if !matches!(t, RExpr::Binary(BinOp::Or, ..)) {
+            push(0, k, t, &mut cands, &mut virt);
+            if cands
+                .iter()
+                .any(|c| c.0.op == Op::Match || (c.0.op == Op::Eq && c.0.col >= ncol))
+            {
+                return None;
+            }
+            continue;
+        }
+        if found.is_some() {
+            continue;
+        }
+        let mut alts: AVec<&RExpr> = AVec::new();
+        let mut stack: AVec<&RExpr> = AVec::new();
+        stack.push(t);
+        while let Some(e) = stack.pop() {
+            match e {
+                RExpr::Binary(BinOp::Or, l, r) => {
+                    stack.push(r);
+                    stack.push(l);
+                }
+                _ => alts.push(e),
+            }
+        }
+        let mut branches = AVec::new();
+        let mut ok = true;
+        for a in alts.iter() {
+            let mut conj = AVec::new();
+            and_terms(a, &mut conj);
+            let mut bc = AVec::new();
+            for c in conj.iter() {
+                let n = bc.len();
+                push(0, 0, c, &mut bc, &mut virt);
+                ok &= bc.len() == n + 1 && virt.is_empty();
+            }
+            ok &= bc.iter().all(|c| c.0.usable && fts_con(&c.0));
+            if !ok {
+                break;
+            }
+            let mut info = IndexInfo::new(bc.iter().map(|c| c.0).collect(), AVec::new());
+            if Module::Fts5.best_index(tab, &mut info).is_err() {
+                ok = false;
+                break;
+            }
+            let mut argv: AVec<RExpr> = (0..info.nargs())
+                .map(|_| RExpr::Literal(OwnedValue::Null))
+                .collect();
+            let mut eq = AVec::new();
+            for (u, c) in info.usage.iter().zip(bc.iter()) {
+                let Some(slot) = usize::from(u.argv)
+                    .checked_sub(1)
+                    .and_then(|j| argv.as_mut_slice().get_mut(j).map(|s| (j, s)))
+                else {
+                    ok = false;
+                    continue;
+                };
+                *slot.1 = c.1.clone();
+                if c.0.col < 0 {
+                    eq.push((slot.0, c.0.op));
+                }
+            }
+            branches.push((info.idx_num, info.idx_str, argv, eq));
+        }
+        if ok && !branches.is_empty() {
+            found = Some((k, branches));
+        }
+    }
+    found
+}
+
+/// Each fts5 source's `content_used` (the pin's `colUsed`): whether
+/// `rest` (the core's items and clauses), an ON clause or another
+/// source's subplan reads one of its content columns.
+#[cfg(feature = "fts5")]
+pub(super) fn plan_content_used(sources: &mut [SourcePlan], offsets: &[usize], rest: &[&RExpr]) {
+    use crate::query::plan_refs_range;
+    for k in 0..sources.len() {
+        let Some(n) = sources[k]
+            .vt
+            .as_deref()
+            .filter(|v| v.tab.fts.is_some())
+            .map(|v| v.tab.visible())
+        else {
+            continue;
+        };
+        let here = offsets.get(k).copied().unwrap_or(0);
+        let r = RefRange {
+            w: (here, here + n),
+            s: (0, 0),
+        };
+        let used = rest.iter().any(|e| expr_refs_range(e, &r))
+            || sources.iter().enumerate().any(|(j, s)| {
+                s.on.as_ref().is_some_and(|e| expr_refs_range(e, &r))
+                    || (j != k && s.derived.as_deref().is_some_and(|d| plan_refs_range(d, &r)))
+            });
+        if let Some(v) = sources[k].vt.as_deref_mut() {
+            v.content_used = used;
+        }
+    }
+}
+
 impl<S: Storage> Connection<S> {
     /// `INSERT INTO sqlite_schema(type, name, tbl_name, rootpage,
     /// sql) VALUES(...)` under `PRAGMA writable_schema = ON` (v0.16
@@ -299,6 +429,10 @@ impl<S: Storage> Connection<S> {
                 idx_num: 0,
                 idx_str: AVec::new(),
                 nargs,
+                #[cfg(feature = "fts5")]
+                content_used: true,
+                #[cfg(feature = "fts5")]
+                ors: AVec::new(),
             })),
             #[cfg(feature = "expr_index")]
             access: None,
@@ -380,8 +514,10 @@ impl<S: Storage> Connection<S> {
             // the unmatched rows of the module's every row are emitted
             // after the loop (v0.16 review fix: a RIGHT JOIN's ON
             // became lateral filter arguments, which were refused).
+            // A LEFT JOIN's ON constrains the module's rows for each
+            // row on its left, the unmatched padded after (v0.16 review
+            // fix, `fts5`: `m LEFT JOIN t ON t MATCH m.q` was refused).
             if let Some(o) = sp.on.as_ref()
-                && !sp.kind.pads_right()
                 && !sp.kind.pads_left()
             {
                 let mut t = AVec::new();
@@ -537,6 +673,39 @@ impl<S: Storage> Connection<S> {
                     }
                 };
             let pushable = !sp.kind.pads_right() && !any_outer;
+            // An OR of full-text constraints (leaf `fts5`).
+            #[cfg(feature = "fts5")]
+            if is_fts
+                && pushable
+                && let Some((k, ors)) = fts_or(&wterms, &push_term, &vt.tab)
+            {
+                let lateral = ors
+                    .iter()
+                    .any(|b| b.2.iter().any(|a| expr_refs_range(a, &left)));
+                let mut rest = None;
+                for (j, t) in wterms.iter().enumerate() {
+                    if j != k {
+                        rest = Some(and_expr(rest, t.clone()));
+                    }
+                }
+                *filter = rest;
+                let Some(sp) = sources.get_mut(i) else {
+                    continue;
+                };
+                sp.tvf = if lateral {
+                    TVF_VTAB | TVF_LATERAL
+                } else {
+                    TVF_VTAB
+                };
+                if let Some(d) = sp.derived.as_deref_mut() {
+                    d.values.clear();
+                    d.values.push(AVec::new());
+                }
+                if let Some(v) = sp.vt.as_deref_mut() {
+                    v.ors = ors;
+                }
+                continue;
+            }
             if pushable {
                 for (k, t) in wterms.iter().enumerate() {
                     push_term(0, k, t, &mut cands, &mut virt);
@@ -906,6 +1075,19 @@ impl<S: Storage> Statement<'_, S> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
+        // An fts5 INSERT ... RETURNING: its rows, served one per step.
+        #[cfg(feature = "fts5")]
+        if matches!(&self.plan, Plan::Vtab(p) if matches!(&**p, VtPlan::Fts5Write(w) if !w.returning.is_empty()))
+        {
+            if !self.ret_loaded {
+                if let Err(e) = self.exec_vtab().await {
+                    return Err(self.write_failed(e).await);
+                }
+                self.ret_loaded = true;
+                self.ret_pos = 0;
+            }
+            return Ok(self.serve_returning());
+        }
         let r = self.exec_vtab().await;
         match r {
             Ok(()) => {
@@ -1215,6 +1397,9 @@ impl<S: Storage> Statement<'_, S> {
             Module::Rtree { .. } => self.rtree_rows(vt, argv.as_slice(), need).await,
             #[cfg(feature = "rtree")]
             Module::Check => self.rtreecheck_rows(argv.as_slice()).await,
+            #[cfg(feature = "fts5")]
+            #[cfg(feature = "fts5")]
+            Module::Fts5 if !vt.ors.is_empty() => self.fts5_or_rows(vt, row).await,
             #[cfg(feature = "fts5")]
             Module::Fts5 => self.fts5_rows(vt, argv.as_slice(), need).await,
             #[cfg(feature = "fts5")]

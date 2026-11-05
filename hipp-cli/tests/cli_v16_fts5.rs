@@ -153,3 +153,27 @@ SELECT a FROM t WHERE t MATCH 'y';
 fn errors_keep_the_shell_going() {
     same("errors", ERRORS);
 }
+
+const REVIEW_FIXES: &str = "\
+CREATE VIRTUAL TABLE t USING fts5(a, b);
+INSERT INTO t VALUES('alpha beta', 'x') RETURNING rowid, a, b, t, rank;
+INSERT INTO t(rowid, a) VALUES(10.0, 'gamma') RETURNING rowid, *;
+INSERT INTO t(a) VALUES('red pink'), ('red green') RETURNING rowid, upper(a), last_insert_rowid();
+UPDATE t SET b = s.v FROM (SELECT 1 AS k, 'vv' AS v UNION ALL SELECT 10, 'ww') AS s WHERE t.rowid = s.k;
+SELECT rowid, a, b FROM t;
+SELECT rowid, bm25(t), highlight(t, 0, '[', ']') FROM t WHERE t MATCH 'pink' OR t MATCH 'red' OR rowid = 1;
+SELECT rowid, snippet(t, 0, '<', '>', '...', -1) FROM t WHERE t MATCH 'red';
+SELECT sum(bm25(t)) FROM t WHERE t MATCH 'red';
+CREATE TABLE m(q);
+INSERT INTO m VALUES('red'), ('none');
+SELECT m.q, t.rowid FROM m LEFT JOIN t ON t MATCH m.q;
+SELECT 'done';
+";
+
+/// The review fixes' output: INSERT ... RETURNING rows, UPDATE ...
+/// FROM, MATCH under an OR and in a LEFT JOIN, snippet()'s clamped
+/// token count, an aggregate's auxiliary function error line.
+#[test]
+fn review_fixes_output() {
+    same("review", REVIEW_FIXES);
+}

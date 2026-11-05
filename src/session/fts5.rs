@@ -102,6 +102,11 @@ pub(super) struct FtWrite {
     kind: FtKind,
     /// Several rows: the pin opens a statement savepoint for it.
     multi: bool,
+    /// An INSERT's RETURNING list (v0.16 review fix: refused), over
+    /// the new row: its columns, the hidden table and rank columns
+    /// (NULL) and the rowid given (-1 when none, as the pin
+    /// evaluates it before xUpdate assigns one).
+    pub returning: AVec<RExpr>,
 }
 
 fn quote_sq(name: &[u8], out: &mut AVec<u8>) {
@@ -228,6 +233,7 @@ impl<S: Storage> Connection<S> {
             }
             Err(ft_err(SchemaKind::UnknownColumn))
         };
+        let mut ret = AVec::new();
         let (conflict, kind, multi) = match ast {
             Ast::Insert {
                 columns,
@@ -238,7 +244,7 @@ impl<S: Storage> Connection<S> {
                 returning,
                 ..
             } => {
-                if upsert.is_some() || !returning.is_empty() {
+                if upsert.is_some() {
                     return Err(Error::Unsupported);
                 }
                 let mut targets = AVec::new();
@@ -282,6 +288,19 @@ impl<S: Storage> Connection<S> {
                     None => None,
                 };
                 let multi = rr.len() > 1 || sel.is_some();
+                if !returning.is_empty() {
+                    let mut cols = AVec::new();
+                    for c in tab.cols.iter() {
+                        cols.push((c.name.clone(), c.affinity()));
+                    }
+                    let mut src = crate::query::SourceDesc::new(copy_vec(name), cols, None, true);
+                    src.vt_visible = ncol;
+                    let mut srcs = AVec::new();
+                    srcs.push(src);
+                    let mut offs = AVec::new();
+                    offs.push(0);
+                    ret = self.plan_returning_in(arena, srcs, offs, returning)?;
+                }
                 (
                     *conflict,
                     FtKind::Insert {
@@ -301,7 +320,7 @@ impl<S: Storage> Connection<S> {
                 returning,
                 ..
             } => {
-                if !from.is_empty() || !returning.is_empty() {
+                if !returning.is_empty() {
                     return Err(Error::Unsupported);
                 }
                 let mut sets = AVec::new();
@@ -311,7 +330,7 @@ impl<S: Storage> Connection<S> {
                     sets.push(col_of(handle_bytes(arena, *c))?);
                     extra.push(e.clone());
                 }
-                let multi = !rowid_eq(arena, filter.as_ref());
+                let multi = !from.is_empty() || !rowid_eq(arena, filter.as_ref());
                 let sel = self.ft_change_select(arena, ast, *alias, filter.clone(), extra)?;
                 (
                     *conflict,
@@ -331,7 +350,17 @@ impl<S: Storage> Connection<S> {
                 let mut extra = AVec::new();
                 extra.push(rowid_expr(arena)?);
                 let multi = !rowid_eq(arena, filter.as_ref());
-                let sel = self.ft_change_select(arena, ast, None, filter.clone(), extra)?;
+                let mut sel = self.ft_change_select(arena, ast, None, filter.clone(), extra)?;
+                // A DELETE reads only the rowid (the pin's xUpdate gets
+                // no old values).
+                if let Some(v) = sel
+                    .sources
+                    .as_mut_slice()
+                    .first_mut()
+                    .and_then(|s| s.vt.as_deref_mut())
+                {
+                    v.content_used = false;
+                }
                 (
                     ConflictAction::Abort,
                     FtKind::Change {
@@ -354,6 +383,7 @@ impl<S: Storage> Connection<S> {
             tab,
             kind,
             multi,
+            returning: ret,
         })))))
     }
 
@@ -368,7 +398,30 @@ impl<S: Storage> Connection<S> {
         let (Ast::Update { table, .. } | Ast::Delete { table, .. }) = ast else {
             return Err(Error::Unsupported);
         };
-        let sel = crate::sql::parser::star_select(*table, alias, filter, extra, arena);
+        let mut sel = crate::sql::parser::star_select(*table, alias, filter, extra, arena);
+        // UPDATE ... FROM (v0.16 review fix: refused): the table's own
+        // columns (`t.*`) and rowid, the FROM sources joined first (the
+        // pin's plan probes the table per joined row, so rows are
+        // written in the join's order).
+        if let Ast::Update { from, .. } = ast
+            && !from.is_empty()
+        {
+            let q = alias.unwrap_or(*table);
+            if let Some(it) = sel.items.as_mut_slice().first_mut() {
+                *it = SelectItem::TableStar(q);
+            }
+            if let Some(SelectItem::Expr(Expr::Column { table: t, .. }, ..)) =
+                sel.items.as_mut_slice().get_mut(1)
+            {
+                *t = Some(q);
+            }
+            let mut srcs = from.clone();
+            for mut f in core::mem::take(&mut sel.from).into_iter() {
+                f.kind = crate::sql::JoinKind::Inner;
+                srcs.push(f);
+            }
+            sel.from = srcs;
+        }
         self.plan_subquery(&sel, arena, &[])
     }
 
@@ -530,6 +583,7 @@ impl<S: Storage> Connection<S> {
     /// The `%_config` settings (`sqlite3Fts5ConfigLoad`).
     async fn ft_runtime(&mut self, t: &Tab) -> Result<Runtime, S::Error> {
         let mut rt = Runtime::new();
+        rt.t.cdel = t.cfg.contentless_delete;
         let orders = binary_orders(1);
         let mut cur = btree::IndexCursor::with_fields(t.config, orders.as_slice(), 0);
         while let Some(e) = cur.next_entry(&mut self.pager).await? {
@@ -782,6 +836,37 @@ impl<S: Storage> Connection<S> {
     }
 }
 
+/// `rowid op v` as the pin compares it (the rowid's INTEGER affinity
+/// applied to `v`; NULL is never true, text and blobs sort above
+/// numbers).
+fn rowid_cmp(r: i64, v: &OwnedValue, op: crate::vtab::Op) -> bool {
+    use crate::vtab::Op;
+    use core::cmp::Ordering;
+    let n = match v {
+        OwnedValue::Text(t) => crate::record::text_to_number(t.as_slice()).unwrap_or(v.clone()),
+        x => x.clone(),
+    };
+    let o = match n {
+        OwnedValue::Null => return false,
+        OwnedValue::Integer(i) => r.cmp(&i),
+        OwnedValue::Real(f) => {
+            if crate::record::is_integral_real(f) {
+                r.cmp(&(f as i64))
+            } else {
+                (r as f64).partial_cmp(&f).unwrap_or(Ordering::Less)
+            }
+        }
+        _ => Ordering::Less,
+    };
+    match op {
+        Op::Eq => o.is_eq(),
+        Op::Lt => o.is_lt(),
+        Op::Le => o.is_le(),
+        Op::Gt => o.is_gt(),
+        _ => o.is_ge(),
+    }
+}
+
 /// The expression `rowid`.
 fn rowid_expr<E>(arena: &Arena) -> Result<Expr, E> {
     Ok(Expr::Column {
@@ -970,7 +1055,16 @@ impl<S: Storage> Statement<'_, S> {
                 select,
                 ..
             } => (*table, rows.len() > 1 || select.is_some(), 0),
-            Ast::Update { table, filter, .. } => (*table, !rowid_eq(arena, filter.as_ref()), 1),
+            Ast::Update {
+                table,
+                filter,
+                from,
+                ..
+            } => (
+                *table,
+                !from.is_empty() || !rowid_eq(arena, filter.as_ref()),
+                1,
+            ),
             Ast::Delete { table, filter, .. } => (*table, !rowid_eq(arena, filter.as_ref()), 2),
             _ => return false,
         };
@@ -1199,11 +1293,14 @@ impl<S: Storage> Statement<'_, S> {
         rowid: i64,
         vals: Option<&[OwnedValue]>,
     ) -> Result<(), S::Error> {
-        self.conn.ft_totals(t, st).await?;
-        self.ft_begin(t, rt, st, true, rowid).await?;
         if t.cfg.contentless_delete {
             return Err(Error::Unsupported);
         }
+        if rt.secure_delete {
+            return Err(ft_err(SchemaKind::Fts5SecureDelete));
+        }
+        self.conn.ft_totals(t, st).await?;
+        self.ft_begin(t, rt, st, true, rowid).await?;
         let old = match vals {
             Some(v) => Some(v.iter().cloned().collect::<AVec<_>>()),
             None => self.ft_lookup(t, rowid).await?,
@@ -1289,6 +1386,25 @@ impl<S: Storage> Statement<'_, S> {
         }
     }
 
+    /// An INSERT's new rowid: the `OP_MustBeInt` the pin runs before
+    /// xUpdate (an integral REAL or numeric text becomes an integer;
+    /// v0.16 review fix: `7.0` was refused), then
+    /// [`Self::ft_rowid_value`].
+    fn ft_insert_rowid(v: &OwnedValue) -> Result<OwnedValue, S::Error> {
+        let n = match v {
+            OwnedValue::Text(b) => crate::record::text_to_number(b.as_slice()).unwrap_or(v.clone()),
+            _ => v.clone(),
+        };
+        match n {
+            OwnedValue::Real(r)
+                if crate::record::is_integral_real(r) || r == -9.223372036854776e18 =>
+            {
+                Ok(OwnedValue::Integer(r as i64))
+            }
+            _ => Self::ft_rowid_value(&n),
+        }
+    }
+
     // -----------------------------------------------------------
     // The write statement
     // -----------------------------------------------------------
@@ -1307,12 +1423,13 @@ impl<S: Storage> Statement<'_, S> {
         let VtPlan::Fts5Write(w) = &**p else {
             return Err(Error::Unsupported);
         };
-        let (name, tab, conflict, kind, multi) = (
+        let (name, tab, conflict, kind, multi, ret) = (
             w.name.clone(),
             w.tab.clone(),
             w.conflict,
             w.kind.clone(),
             w.multi,
+            w.returning.clone(),
         );
         let cfg = tab.fts.as_deref().ok_or(corrupt())?.clone();
         let ncol = cfg.cols.len();
@@ -1358,6 +1475,8 @@ impl<S: Storage> Statement<'_, S> {
             }
             FtKind::Change { select, sets } => {
                 let rows = self.exec_subplan(&select, &empty).await?;
+                // (UPDATE ... FROM: a row the join repeats is updated
+                // once per match, the last winning, as on the pin.)
                 for r in rows.iter() {
                     let old = r.as_slice().get(ncol).map(crate::func::int64_value);
                     let new = match &sets {
@@ -1414,7 +1533,16 @@ impl<S: Storage> Statement<'_, S> {
         let mut st = self.conn.ft_take(name.as_slice(), cfg.detail, init_sp);
         let snapshot = if explicit { Some(st.clone()) } else { None };
         let r = self
-            .ft_write_rows(&t, &rt, &mut st, work, conflict, stmt_level, user_sp)
+            .ft_write_rows(
+                &t,
+                &rt,
+                &mut st,
+                work,
+                conflict,
+                stmt_level,
+                user_sp,
+                ret.as_slice(),
+            )
             .await;
         match r {
             Ok(()) => {
@@ -1449,6 +1577,7 @@ impl<S: Storage> Statement<'_, S> {
         conflict: ConflictAction,
         stmt_level: bool,
         user_sp: usize,
+        ret: &[RExpr],
     ) -> Result<(), S::Error> {
         let mut rt = rt.clone();
         if stmt_level {
@@ -1465,8 +1594,26 @@ impl<S: Storage> Statement<'_, S> {
             ConflictAction::Abort
         };
         for (old, new) in work.into_iter() {
+            if old.is_none()
+                && !ret.is_empty()
+                && let Some((rid, vals, _, _)) = &new
+            {
+                let mut rd = RowData::empty();
+                rd.vals = vals.clone();
+                rd.vals.push(OwnedValue::Null);
+                rd.vals.push(OwnedValue::Null);
+                let r = match Self::ft_insert_rowid(rid)? {
+                    OwnedValue::Integer(r) => r,
+                    _ => -1,
+                };
+                rd.rowids.push(Some(r));
+                let v = self.eval_returning(ret, &rd).await?;
+                self.ret_rows.push(v);
+                self.ret_rowids.push(Some(r));
+            }
             match (old, new) {
                 (None, Some((rid, vals, cmd, rank))) if !matches!(cmd, OwnedValue::Null) => {
+                    let rid = Self::ft_insert_rowid(&rid)?;
                     let z = crate::fts5::aux::text_of(&cmd).unwrap_or_default();
                     if !normal && eq_ci(z.as_slice(), b"delete") {
                         if cfg.contentless_delete {
@@ -1489,7 +1636,7 @@ impl<S: Storage> Statement<'_, S> {
                     self.conn.env.note_change();
                 }
                 (None, Some((rid, vals, _, _))) => {
-                    let rid = Self::ft_rowid_value(&rid)?;
+                    let rid = Self::ft_insert_rowid(&rid)?;
                     if econflict == ConflictAction::Replace
                         && let OwnedValue::Integer(r) = rid
                     {
@@ -1669,7 +1816,14 @@ impl<S: Storage> Statement<'_, S> {
             probe
                 .set(cmd, val)
                 .map_err(|_| ft_err(SchemaKind::Fts5Command))?;
-            self.conn.ft_config_put(t, cmd, val).await?;
+            // sqlite3_value_numeric_type() converted the value in
+            // place: numeric text is stored as its integer (v0.16 review
+            // fix: `'64'` was stored as text).
+            let stored = match (eq_ci(cmd, b"rank"), crate::fts5::config::int_value(val)) {
+                (false, Some(i)) => OwnedValue::Integer(i),
+                _ => val.clone(),
+            };
+            self.conn.ft_config_put(t, cmd, &stored).await?;
             // The structure record's cookie moves on.
             let store = self.conn.ft_store(t).await?;
             let mut s = store.structure().map_err(|_| corrupt())?;
@@ -1855,6 +2009,46 @@ impl<S: Storage> Statement<'_, S> {
         Box::pin(self.fts5_rows_impl(vt, argv, need)).await
     }
 
+    /// The rows of an OR of full-text constraints ([`VtSrc::ors`]):
+    /// each branch's filter in turn, a rowid already returned
+    /// skipped; a branch's `rowid =` keeps only the row equal to it
+    /// (the pin rechecks it).
+    pub(super) async fn fts5_or_rows(
+        &mut self,
+        vt: &VtSrc,
+        row: &RowData,
+    ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        let mut seen: AVec<i64> = AVec::new();
+        let mut out = AVec::new();
+        for (num, st, args, eq) in vt.ors.iter() {
+            let mut argv = AVec::new();
+            for a in args.iter() {
+                argv.push(self.eval_row_sub(a, row).await?);
+            }
+            let mut one = vt.clone();
+            one.ors.clear();
+            one.idx_num = *num;
+            one.idx_str = st.clone();
+            for (r, id) in self.fts5_rows(&one, argv.as_slice(), None).await? {
+                let Some(i) = id else {
+                    continue;
+                };
+                if eq.iter().any(|(j, op)| {
+                    argv.as_slice()
+                        .get(*j)
+                        .is_none_or(|v| !rowid_cmp(i, v, *op))
+                }) {
+                    continue;
+                }
+                if let Err(p) = seen.as_slice().binary_search(&i) {
+                    seen.insert_at(p, i);
+                    out.push((r, id));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn fts5_rows_impl(
         &mut self,
         vt: &VtSrc,
@@ -2027,6 +2221,7 @@ impl<S: Storage> Statement<'_, S> {
                         phrases: AVec::new(),
                         texts: vals,
                         sizes: None,
+                        missing: false,
                     });
                 }
                 out.push((row, Some(id)));
@@ -2050,11 +2245,12 @@ impl<S: Storage> Statement<'_, S> {
             scanned |= p;
             reader.lookup(k, p, detail)
         };
-        let leaves = crate::fts5::expr::leaf_rows(&e, detail, cfg.prefix.as_slice(), &mut lookup);
         // FTS5_BI_ORDER_RANK (the rank sorter's rows run ascending) /
         // ROWID with DESC.
         let sorted = vt.idx_num & 1 != 0;
         let desc = vt.idx_num & 6 == 6;
+        let leaves =
+            crate::fts5::expr::leaf_rows(&e, detail, cfg.prefix.as_slice(), &mut lookup, desc);
         let rows = crate::fts5::expr::run(&e, leaves.as_slice(), desc);
         // What every row's auxiliary data shares.
         let mut nhit = AVec::new();
@@ -2131,15 +2327,23 @@ impl<S: Storage> Statement<'_, S> {
             if !inside(r.rowid) {
                 continue;
             }
+            let mut missing = false;
             let vals = match self.ft_lookup(&t, r.rowid).await? {
                 Some(v) => v,
                 None if cfg.content == Content::None => {
                     (0..ncol).map(|_| OwnedValue::Null).collect()
                 }
                 // A row the index has but the content lacks: the
-                // pin's lookup fails (corrupt for a normal table).
-                None if cfg.content == Content::Normal => return Err(corrupt()),
-                None => (0..ncol).map(|_| OwnedValue::Null).collect(),
+                // pin's lookup fails (corrupt for a normal table; for
+                // an external one when the statement reads a content
+                // column or an auxiliary function its text).
+                None if cfg.content == Content::Normal || vt.content_used => {
+                    return Err(corrupt());
+                }
+                None => {
+                    missing = true;
+                    (0..ncol).map(|_| OwnedValue::Null).collect()
+                }
             };
             let sizes = match t.docsize {
                 Some(ds) => match btree::seek_rowid(&mut self.conn.pager, ds, r.rowid).await? {
@@ -2164,6 +2368,7 @@ impl<S: Storage> Statement<'_, S> {
                 phrases: r.phrases.clone(),
                 texts: vals.clone(),
                 sizes,
+                missing,
             };
             let live = crate::fts5::aux::bm25(&aux, weights.as_slice());
             aux.tab = stab.clone();

@@ -167,7 +167,24 @@ pub struct VtSrc {
     /// Table-valued-function arguments written (they bind to the
     /// hidden columns, in order).
     pub nargs: usize,
+    /// Whether the statement reads the table's content columns (the
+    /// pin's `colUsed`; leaf `fts5`: a missing external-content row
+    /// is an error only then).
+    #[cfg(feature = "fts5")]
+    pub content_used: bool,
+    /// A WHERE term `a OR b OR ...` whose branches are each full-text
+    /// constraints (MATCH, `t = q`, `rowid =`; leaf `fts5`): one
+    /// filter per branch (idxNum, idxStr, arguments, and the rowid
+    /// comparisons to recheck: argument index and operator), its rows
+    /// unioned in branch order, each
+    /// rowid once (the pin's multi-index OR).
+    #[cfg(feature = "fts5")]
+    pub ors: AVec<OrBranch>,
 }
+
+/// One branch of [`VtSrc::ors`].
+#[cfg(feature = "fts5")]
+pub type OrBranch = (i32, AVec<u8>, AVec<crate::query::RExpr>, AVec<(usize, Op)>);
 
 /// A constraint operator (`SQLITE_INDEX_CONSTRAINT_*`): the ones the
 /// planner hands modules.

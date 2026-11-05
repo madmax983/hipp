@@ -715,10 +715,16 @@ fn shift(n: Node, by: usize) -> Node {
 /// full: `col << 32 | offset`; column: column numbers; none: one 0).
 #[derive(Debug, Clone, Default)]
 pub struct LeafRows {
-    /// Candidate rows (every token present), with each phrase's
-    /// positions when the row matches (`None`: the pin's bNomatch).
-    pub rows: AVec<(i64, Option<AVec<AVec<i64>>>)>,
+    /// Candidate rows (every token present): whether the row matches
+    /// (not the pin's bNomatch) and each phrase's positions as its
+    /// buffer stands there (detail=full: also on a failed NEAR group,
+    /// whose phrases keep what the pin's test left in them; v0.16
+    /// review fix: they were dropped).
+    pub rows: AVec<LeafRow>,
 }
+
+/// One candidate row of a leaf ([`LeafRows::rows`]).
+pub type LeafRow = (i64, bool, Option<AVec<AVec<i64>>>);
 
 /// The positions of a term's doclist at its rows, filtered to
 /// `colset`.
@@ -726,6 +732,7 @@ fn term_rows(
     h: &AVec<Hit>,
     colset: Option<&AVec<usize>>,
     detail: Detail,
+    skip_empty: bool,
 ) -> AVec<(i64, AVec<i64>)> {
     let mut out = AVec::new();
     for x in h.iter() {
@@ -751,6 +758,11 @@ fn term_rows(
                 }
             }
             p = kept;
+        }
+        // A prefix scan the pin merges itself (`fts5SetupPrefixIter`)
+        // drops the rows the column filter empties (v0.16 review fix).
+        if skip_empty && p.is_empty() {
+            continue;
         }
         out.push((x.rowid, p));
     }
@@ -892,13 +904,18 @@ pub fn leaf_rows(
     detail: Detail,
     prefix: &[u16],
     lookup: &mut dyn FnMut(&[u8], bool) -> AVec<Hit>,
+    desc: bool,
 ) -> AVec<LeafRows> {
     let mut out = AVec::new();
     for lf in e.leaves.iter() {
-        out.push(one_leaf(e, lf, detail, prefix, lookup, None));
+        out.push(one_leaf(e, lf, detail, prefix, lookup, None, desc));
     }
     out
 }
+
+/// Each phrase's buffer as a row's NEAR test set it (`None`: not
+/// reached).
+type PhraseBufs = AVec<Option<AVec<i64>>>;
 
 /// One term's rows: rowid and positions.
 type TermRows = AVec<(i64, AVec<i64>)>;
@@ -916,10 +933,10 @@ pub fn phrase_rows(
         return 0;
     };
     let lf = &e.leaves[ph.leaf];
-    one_leaf(e, lf, detail, prefix, lookup, Some(ip))
+    one_leaf(e, lf, detail, prefix, lookup, Some(ip), false)
         .rows
         .iter()
-        .filter(|r| r.1.is_some())
+        .filter(|r| r.1)
         .count()
 }
 
@@ -976,6 +993,7 @@ fn one_leaf(
     prefix: &[u16],
     lookup: &mut dyn FnMut(&[u8], bool) -> AVec<Hit>,
     only: Option<usize>,
+    desc: bool,
 ) -> LeafRows {
     let mut res = LeafRows::default();
     let phrases: AVec<usize> = match only {
@@ -991,7 +1009,11 @@ fn one_leaf(
         let mut ts = AVec::new();
         for t in e.phrases[*p].terms.iter() {
             let h = term_hits(t, prefix, lookup);
-            ts.push(term_rows(&h, lf.colset.as_ref(), detail));
+            let scan = t.prefix
+                && !prefix
+                    .iter()
+                    .any(|p| usize::from(*p) == charlen(t.tok.as_slice()));
+            ts.push(term_rows(&h, lf.colset.as_ref(), detail, scan));
         }
         terms.push(ts);
     }
@@ -1003,11 +1025,18 @@ fn one_leaf(
     for t in terms.iter() {
         ix.push(t.iter().map(|_| 0usize).collect());
     }
+    // Per candidate row: matched, and the phrase buffers the pin's
+    // NEAR test set there (`None`: not reached, the buffer keeps the
+    // previous row's).
+    let mut tested: AVec<(i64, bool, PhraseBufs)> = AVec::new();
     for (rowid, _) in first.iter() {
         let rowid = *rowid;
         let mut all = true;
         let mut cand = true;
-        let mut lists: AVec<AVec<i64>> = AVec::new();
+        let mut lists: AVec<Option<AVec<i64>>> = AVec::new();
+        // A candidate has every term of every phrase (v0.16 review
+        // fix: terms after a failing phrase were not checked).
+        let mut tps: AVec<AVec<&AVec<i64>>> = AVec::new();
         for (pi, ts) in terms.iter().enumerate() {
             let mut tp: AVec<&AVec<i64>> = AVec::new();
             for (ti, t) in ts.iter().enumerate() {
@@ -1017,28 +1046,27 @@ fn one_leaf(
                 }
                 match t.as_slice().get(*k) {
                     Some(x) if x.0 == rowid => tp.push(&x.1),
-                    _ => {
-                        all = false;
-                        cand = false;
-                        break;
-                    }
+                    _ => cand = false,
                 }
             }
-            if !all {
+            tps.push(tp);
+        }
+        for (pi, tp) in tps.iter().enumerate() {
+            if !cand {
                 break;
             }
             let ph = &e.phrases[phrases[pi]];
             let simple = ph.terms.len() == 1 && !ph.first && lf.colset.is_none();
             let l = if simple || detail != Detail::Full {
-                tp[0].clone()
+                (*tp[0]).clone()
             } else {
                 phrase_match(tp.as_slice(), ph.first)
             };
-            if l.is_empty() {
-                all = false;
+            all = !l.is_empty();
+            lists.push(Some(l));
+            if !all {
                 break;
             }
-            lists.push(l);
         }
         if !cand {
             continue;
@@ -1048,9 +1076,30 @@ fn one_leaf(
                 .iter()
                 .map(|p| e.phrases[*p].terms.len() as i64)
                 .collect();
-            all = near_match(&mut lists, ntok.as_slice(), lf.near);
+            let mut l: AVec<AVec<i64>> = lists.into_iter().flatten().collect();
+            all = near_match(&mut l, ntok.as_slice(), lf.near);
+            lists = l.into_iter().map(Some).collect();
         }
-        res.rows.push((rowid, all.then_some(lists)));
+        tested.push((rowid, all, lists));
+    }
+    // The buffers, in the order the pin visits the rows.
+    let mut stale: AVec<AVec<i64>> = phrases.iter().map(|_| AVec::new()).collect();
+    let n = tested.len();
+    for j in 0..n {
+        let k = if desc { n - 1 - j } else { j };
+        let (rowid, all, l) = &tested[k];
+        let mut bufs = AVec::new();
+        for (pi, s) in stale.as_mut_slice().iter_mut().enumerate() {
+            if let Some(Some(x)) = l.as_slice().get(pi) {
+                *s = x.clone();
+            }
+            bufs.push(s.clone());
+        }
+        let shown = (*all || detail == Detail::Full).then_some(bufs);
+        res.rows.push((*rowid, *all, shown));
+    }
+    if desc {
+        res.rows.as_mut_slice().reverse();
     }
     res
 }
@@ -1100,7 +1149,7 @@ impl Eval<'_> {
         }
     }
 
-    fn leaf_row(&self, li: usize, k: usize) -> Option<&(i64, Option<AVec<AVec<i64>>>)> {
+    fn leaf_row(&self, li: usize, k: usize) -> Option<&LeafRow> {
         let rows = self.leaves[li].rows.as_slice();
         let j = if self.desc {
             rows.len().checked_sub(k + 1)?
@@ -1136,7 +1185,7 @@ impl Eval<'_> {
         match self.leaf_row(li, it.k) {
             Some(r) => {
                 it.rowid = r.0;
-                it.nomatch = r.1.is_none();
+                it.nomatch = !r.1;
             }
             None => {
                 it.eof = true;
@@ -1305,7 +1354,7 @@ impl Eval<'_> {
                 if it.eof || it.zero || it.rowid != r {
                     return;
                 }
-                let Some((_, Some(lists))) = self.leaf_row(*li, it.k) else {
+                let Some((_, _, Some(lists))) = self.leaf_row(*li, it.k) else {
                     return;
                 };
                 for (p, l) in self.e.leaves[*li].phrases.iter().zip(lists.iter()) {

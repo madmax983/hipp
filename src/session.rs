@@ -3758,7 +3758,15 @@ impl<S: Storage> Connection<S> {
             match it {
                 SelectItem::Star => {
                     let src = &cur.sources.as_slice()[0];
-                    for ci in 0..src.columns.len() {
+                    // A virtual table's hidden columns are not in `*`.
+                    #[cfg(feature = "vtab")]
+                    let n = match src.vt_visible {
+                        0 => src.columns.len(),
+                        v => v,
+                    };
+                    #[cfg(not(feature = "vtab"))]
+                    let n = src.columns.len();
+                    for ci in 0..n {
                         out.push(src.column_ref(&cur, 0, ci));
                     }
                 }
@@ -4910,6 +4918,26 @@ impl<S: Storage> Connection<S> {
         // aggregates `SELECT EXISTS(SELECT max(t.a) FROM u) FROM
         // t` to one row.)
         let has_agg = !group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
+        // An auxiliary function in an aggregate query over a
+        // full-text table: the pin's columns there are aggregate
+        // columns, which xFindFunction does not overload ("unable to
+        // use function bm25 in the requested context"; v0.16 review
+        // fix, `fts5`: hipp computed it).
+        #[cfg(feature = "fts5")]
+        if has_agg
+            && cur.sources.iter().any(|s| s.fts_col.is_some())
+            && items
+                .iter()
+                .chain(having.iter())
+                .chain(order_by.iter().map(|(e, _)| e))
+                .any(|e| {
+                    crate::query::any_scalar(e, &|f| matches!(f, crate::query::ScalarFn::Fts5(_)))
+                })
+        {
+            return Err(Error::Schema {
+                kind: SchemaKind::Fts5Context,
+            });
+        }
         if !has_agg && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
             return Err(Error::Schema {
                 kind: SchemaKind::MisusedAggregate,
@@ -5023,6 +5051,12 @@ impl<S: Storage> Connection<S> {
                 rest.push(e);
             }
             json_tvf::plan_tvf_dead(
+                sources.as_mut_slice(),
+                cur.offsets.as_slice(),
+                rest.as_slice(),
+            );
+            #[cfg(feature = "fts5")]
+            vtab::plan_content_used(
                 sources.as_mut_slice(),
                 cur.offsets.as_slice(),
                 rest.as_slice(),
@@ -6988,8 +7022,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         // xSavepoint on the fts5 tables in the transaction first: their
         // pending terms are flushed outside the statement's savepoint
         // (v0.16, `fts5`).
+        // When it fails, its xRollbackTo discards every pending term
+        // written since (v0.16 review fix: terms a trigger program had
+        // added stayed in the index): the state after that flush is
+        // restored.
         #[cfg(feature = "fts5")]
-        if self.phase == Phase::Fresh
+        let fts_snap = if self.phase == Phase::Fresh
             && self.conn.explicit_txn
             && self.stmt_sp.is_none()
             && !self.conn.fts_in_program()
@@ -6997,7 +7035,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         {
             let level = self.conn.pager.sp_depth();
             self.conn.fts_savepoint(level).await?;
-        }
+            Some(self.conn.fts.clone())
+        } else {
+            None
+        };
         #[cfg(feature = "v16")]
         self.open_stmt();
         #[cfg(feature = "foreign_keys")]
@@ -7067,6 +7108,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "fts5")]
         if let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut() {
             d.truncate(fmark);
+        }
+        #[cfg(feature = "fts5")]
+        if r.is_err()
+            && let Some(f) = fts_snap
+        {
+            self.conn.fts = f;
         }
         #[cfg(feature = "v16")]
         self.close_stmt(r.is_err()).await;
@@ -13525,6 +13572,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Instead(ip) => ip.returning_width(),
             #[cfg(feature = "explain")]
             Plan::Explain(_) => 4,
+            #[cfg(feature = "fts5")]
+            Plan::Vtab(v) => match &**v {
+                vtab::VtPlan::Fts5Write(w) => w.returning.len(),
+                _ => 0,
+            },
             _ => 0,
         }
     }

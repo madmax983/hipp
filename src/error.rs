@@ -832,6 +832,15 @@ pub enum SchemaKind {
     /// support scanning"). Use the 'delete' command, or a MATCH.
     #[cfg(feature = "fts5")]
     Fts5Contentless,
+    /// A delete (DELETE, UPDATE, OR REPLACE, the 'delete' command) on
+    /// a table whose `%_config` has `secure-delete=1` (v0.16 review
+    /// fix, `fts5`): the pin removes such entries from the leaves in
+    /// place, which hipp does not do, and an ordinary delete marker
+    /// would leave the deleted terms on disk. Turn it off first
+    /// (`INSERT INTO t(t, rank) VALUES('secure-delete', 0)`), or
+    /// delete with SQLite.
+    #[cfg(feature = "fts5")]
+    Fts5SecureDelete,
 }
 
 /// Sub-kind for `Error::Parse` — no strings, just the class of failure.

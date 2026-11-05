@@ -8,7 +8,8 @@ Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
 (ADR 0003): tiny 76,960 B (budget 128 KiB), full 500,200 B (512
-KiB: every rung + `params`, `math`), max 1,022,404 B (1 MiB: full +
+KiB: every rung + `params`, `math`), max 1,032,068 B (1,022,404 B at
+the release, + 9,664 B of FTS5 review fixes; 1 MiB: full +
 `window`, `triggers`, `foreign_keys`, `json`, `expr_index`,
 `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
 `autovacuum`, `vtab`, `rtree`, `fts5`, `explain`). The last unit,
@@ -8001,9 +8002,12 @@ SQLite extension and has no smaller faithful form; 48,884 B of the
 **Honest gaps:**
 
 - `contentless_delete=1` tables are created and written byte for
-  byte, but DELETE / UPDATE on them (tombstone pages) is refused
-  (`Unsupported`); `secure-delete`, `insttoken`, `locale=1`,
-  `tokendata=1` and `contentless_unindexed=1` are refused.
+  byte, and the pin's tombstones are read and merged (review fixes
+  below), but DELETE / UPDATE on them (writing tombstone pages) is
+  refused (`Unsupported`); deletes while `secure-delete=1` is set
+  are refused (`Fts5SecureDelete`: hipp does not remove entries in
+  place); `insttoken`, `locale=1`, `tokendata=1` and
+  `contentless_unindexed=1` are refused.
 - fts5 tables and fts5vocab tables in TEMP or attached databases
   are refused (so is the three-argument fts5vocab form); custom
   tokenizers and auxiliary functions cannot be registered.
@@ -8017,9 +8021,9 @@ SQLite extension and has no smaller faithful form; 48,884 B of the
   statement shape it misjudges flushes pending terms at a different
   point, giving different (valid) segment layouts. Writes fired by
   triggers inside a multi-row outer statement in an explicit
-  transaction approximate the pin's savepoint nesting likewise. A
-  failing multi-row fts5 statement in a transaction restores the
-  pending terms instead of keeping a segment the pin flushed.
+  transaction approximate the pin's savepoint nesting likewise (a
+  failing such statement now drops their terms, as the pin's
+  xRollbackTo does: review fixes below).
 - The `hashsize` accounting follows the pin's byte formula for
   ordinary terms; very long tokens may flush at slightly different
   points.
@@ -8030,6 +8034,124 @@ SQLite extension and has no smaller faithful form; 48,884 B of the
   `INSERT INTO t(t) VALUES('integrity-check')`).
 - The hidden table column's value (`SELECT t FROM t`) is a row
   handle, not the pin's cursor pointer value (both meaningless).
+
+### FTS5 full-text search — review fixes (2026-11-05)
+
+Eleven review findings on the FTS5 unit, each reproduced against the
+live 3.54.1 pin. Fixes on claimed fts5 paths are in the `fts5` leaf
+(in `max`); two touch the shared `vtab` framework (MATCH under an
+OR, a LEFT JOIN's ON constraints).
+
+**Fixed:**
+
+- **Pin-written tombstones** (corruption): a `contentless_delete=1`
+  table the pin deleted rows of keeps them in its segments, hidden by
+  per-segment tombstone hash pages. hipp did not read those pages, so
+  queries returned deleted rows and hipp's `optimize` / merges copied
+  them back into the index for good (the pin's integrity-check still
+  passed). The reader and the merge iterator now apply the pin's
+  `fts5MultiIterIsDeleted` / `fts5IndexTombstoneQuery` (key size,
+  slot hashing, the rowid-0 flag), merges drop tombstoned entries
+  and recount `nEntry` as the pin, and `fts5IndexFindDeleteMerge`
+  (the `deletemerge` setting) picks merge levels as the pin does.
+  Writing tombstones (DELETE on such tables) stays refused.
+- **Pin-set `secure-delete`** (corruption): hipp ignored it and wrote
+  ordinary delete markers, leaving the deleted terms on disk and a
+  `%_data` unlike the pin's. Deletes (DELETE, UPDATE, OR REPLACE,
+  the 'delete' command) now fail with `Fts5SecureDelete` while it is
+  set; the 'secure-delete' command itself is accepted (so hipp can
+  turn it off, after which deletes match the pin byte for byte).
+  Settings are stored as the pin stores them: numeric text becomes
+  its integer (`'64'` was stored as text — found while probing).
+- **Failing statement in a transaction** (corruption): a multi-row
+  INSERT that failed after its AFTER INSERT trigger had indexed
+  earlier rows into an external-content table left those terms
+  pending, so they were flushed at COMMIT (phantom rowid, both
+  integrity-checks failing). A statement with the pin's statement
+  journal now restores the transaction's fts5 state after its
+  start-of-statement flush when it fails (the pin's xRollbackTo).
+- **NEAR inside an OR** (wrong bm25 / highlight / snippet): a failed
+  NEAR test dropped every phrase's positions; the pin keeps what its
+  test left (phrases before the failing one, the failing one empty,
+  later ones holding the buffers of the last row the node tested),
+  and the OR exposes them. Fixing it found two more: a row missing a
+  term of a phrase after a failing one was still a NEAR candidate,
+  and a column-filtered prefix scan (`fts5SetupPrefixIter`) keeps no
+  row the filter empties.
+- **snippet() with a negative token count**: clamped to 0..INT_MAX
+  like the pin (`-1` and `4294967295` were both used as -1).
+- **External content missing a row**: an error (the pin's "fts5:
+  missing row N from content table", `VtabCorrupt`) when the
+  statement reads a content column or an auxiliary function reads
+  the text; `SELECT rowid` / `count(*)` / bm25 with column sizes
+  still answer, as on the pin (the planner now records the pin's
+  `colUsed` for fts5 sources).
+- **INSERT with an integral REAL rowid** (`7.0`, `CAST(8 AS REAL)`,
+  `'9.0'`): accepted through the pin's `OP_MustBeInt`; an UPDATE's
+  new rowid still refuses them, as on the pin.
+- **MATCH under an OR / in a LEFT JOIN's ON**: `t MATCH 'a' OR t
+  MATCH 'b'`, `... OR rowid = 4`, `... OR rowid > 3`, `... OR (t
+  MATCH 'b' AND rowid < 3)` run as the pin's multi-index OR (each
+  branch's filter in turn, rows unioned in branch order, rowid
+  comparisons rechecked, bm25 0.0 on a rowid-only branch); `m LEFT
+  JOIN t ON t MATCH m.q` passes the ON constraints to the module per
+  left row (generate_series ON constraints under LEFT JOIN work too).
+- **INSERT ... RETURNING and UPDATE ... FROM** on fts5 tables: the
+  RETURNING row is the pin's (evaluated before xUpdate: rowid -1
+  unless given, hidden columns NULL, `*` the visible columns,
+  `last_insert_rowid()` of the previous row); UPDATE ... FROM
+  applies every joined row, the last winning. UPDATE / DELETE
+  RETURNING stay refused, as on the pin.
+- **Auxiliary functions in an aggregate query** (`sum(bm25(t))`,
+  `count(*), bm25(t)`, GROUP BY / HAVING): `Fts5Context`, the pin's
+  "unable to use function ... in the requested context".
+
+**Not fixed (and why):**
+
+- **MATCH whose argument comes from a table listed later in FROM**
+  (`FROM t, m WHERE t MATCH m.q`): the pin reorders the join; hipp
+  runs sources in FROM order (no join reordering anywhere, see
+  `xplan`), so the constraint cannot be evaluated first. Write the
+  argument's table first (`FROM m, t`), which both engines run.
+- **MATCH / aux functions in views and triggers** fail on the pin's
+  shell because it sets `trusted_schema=0` (the library default is
+  1). hipp has no `trusted_schema` (the same holds for `dbstat` and
+  `rtreedepth()` in views): it behaves as the library default.
+
+**Probing notes (live pin):** tombstone pages are
+`FTS5_TOMBSTONE_ROWID(segid, pg)`; the page for a rowid is `rowid %
+nPgTombstone`, its slot `(rowid / nPgTombstone) % nSlot` with linear
+probing; key size 4 or 8 from byte 0, the rowid-0 flag in byte 1.
+`secure-delete` leaves `version` at 4 until the pin's first secure
+delete. `sqlite3_value_numeric_type()` converts a setting's value in
+place, so `%_config` stores the integer. A multi-index OR's rows come
+branch by branch; a branch not usable by fts5 (`a = 'x'`) makes the
+whole OR a full scan, where MATCH errors.
+
+**Tests:** `tests/fts5_v16.rs`: `pin_tombstones_are_honoured` (24
+generated pin-written contentless_delete files with deletes, every
+detail mode, continued by both engines with inserts / optimize /
+merge / automerge; outputs, fts5vocab and shadow tables equal, the
+pin's integrity-check on hipp's copy), `secure_delete_is_not_ignored`,
+`review_regressions` (one case per finding and per bug the fixes'
+own fuzzing found), `generated_near_or_queries_match` (40 seeds of
+random NEAR / OR / AND / NOT / column-filter / prefix queries, every
+row's bm25, highlights and snippet in both rowid orders and rank
+order; ~700 seeds of the scratch version ran clean);
+`hipp-cli/tests/cli_v16_fts5.rs` `review_fixes_output`.
+
+**Gates:** `ci/local-gates.sh` (full) passes.
+
+**Size:** tiny **76,960 B** (Δ **0**); full **500,200 B** (Δ **0**);
+max **1,032,068 B** (Δ **+9,664 B**, ratchet raised to it: the
+tombstone reader and deletemerge ≈ 1.5 KiB, the multi-index OR ≈ 3
+KiB, RETURNING / UPDATE FROM ≈ 1.5 KiB, the NEAR buffers, colUsed and
+the rest ≈ 3.5 KiB; 16,508 B of the 1 MiB budget remain).
+
+**Honest gaps:** the two "not fixed" items above; and query results
+are still materialized, so a statement whose later row fails (an
+auxiliary function on a LEFT JOIN's padded row, a missing content
+row) reports the error without the rows the pin printed first.
 
 ### EXPLAIN QUERY PLAN (2026-11-05)
 

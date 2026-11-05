@@ -951,6 +951,10 @@ pub struct Tuning {
     pub crisismerge: i64,
     pub usermerge: i64,
     pub hashsize: i64,
+    /// `deletemerge`, and whether the table is `contentless_delete`
+    /// (`fts5IndexFindDeleteMerge` only runs then).
+    pub deletemerge: i64,
+    pub cdel: bool,
 }
 
 impl Default for Tuning {
@@ -961,6 +965,8 @@ impl Default for Tuning {
             crisismerge: 16,
             usermerge: 4,
             hashsize: 1024 * 1024,
+            deletemerge: 10,
+            cdel: false,
         }
     }
 }
@@ -1114,6 +1120,34 @@ fn crisismerge(
     Ok(())
 }
 
+/// `fts5IndexFindDeleteMerge`: on a contentless_delete table, the
+/// level whose tombstoned share of entries is largest and at least
+/// `deletemerge` percent.
+fn delete_merge_level(s: &Structure, t: &Tuning) -> Option<usize> {
+    if !t.cdel || t.deletemerge <= 0 {
+        return None;
+    }
+    let (mut ret, mut nbest) = (None, 0i64);
+    for (il, l) in s.levels.iter().enumerate() {
+        let (mut ne, mut nt) = (0i64, 0i64);
+        for sg in l.segs.iter() {
+            ne = ne.wrapping_add(sg.nent as i64);
+            nt = nt.wrapping_add(sg.nentt as i64);
+        }
+        if ne > 0 {
+            let pct = i64::from((nt.wrapping_mul(100) / ne) as i32);
+            if pct >= t.deletemerge && pct > nbest {
+                ret = Some(il);
+                nbest = pct;
+            }
+        }
+        if l.merge > 0 {
+            break;
+        }
+    }
+    ret
+}
+
 /// `fts5IndexMerge`: returns whether any merge was made.
 fn merge(
     st: &mut Store,
@@ -1143,7 +1177,10 @@ fn merge(
             }
         }
         if nbest < nmin {
-            break;
+            match delete_merge_level(s, t) {
+                Some(l) => best = l,
+                None => break,
+            }
         }
         merge_level(st, s, best, Some(&mut nrem), t, detail)?;
         ret = true;
@@ -1155,6 +1192,55 @@ fn merge(
         }
     }
     Ok(ret)
+}
+
+/// Segment `sg`'s tombstone hash pages (`FTS5_TOMBSTONE_ROWID`;
+/// none unless the pin deleted rows of a `contentless_delete` table).
+fn tomb_pages(st: &Store, sg: &Seg) -> Result<AVec<AVec<u8>>, Corrupt> {
+    let mut out = AVec::new();
+    for pg in 0..sg.npgt {
+        out.push(copy(
+            st.get(seg_rowid(sg.id + (1 << 16), pg)).ok_or(Corrupt)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// `fts5MultiIterIsDeleted` / `fts5IndexTombstoneQuery`: whether a
+/// segment's tombstone hash (`pages`) holds `rowid` (v0.16 review fix:
+/// a pin-deleted row of a contentless_delete table was returned by
+/// queries and kept by merges).
+fn tomb_hit(pages: &[AVec<u8>], rowid: i64) -> bool {
+    let r = rowid as u64;
+    let n = pages.len() as u64;
+    let Some(p) = r.checked_rem(n).and_then(|i| pages.get(i as usize)) else {
+        return false;
+    };
+    let p = p.as_slice();
+    if r == 0 {
+        return p.get(1).is_some_and(|b| *b != 0);
+    }
+    let sz = if p.first() == Some(&4) { 4 } else { 8 };
+    let nslot = if p.len() > 16 { (p.len() - 8) / sz } else { 1 };
+    let mut i = ((r / n) % nslot as u64) as usize;
+    let mut ncollide = nslot;
+    loop {
+        let Some(k) = p.get(8 + i * sz..8 + i * sz + sz) else {
+            return false;
+        };
+        let v = k.iter().fold(0u64, |a, b| (a << 8) | u64::from(*b));
+        if v == 0 {
+            return false;
+        }
+        if v == r {
+            return true;
+        }
+        if ncollide == 0 {
+            return false;
+        }
+        ncollide -= 1;
+        i = (i + 1) % nslot;
+    }
 }
 
 /// One doclist entry of a segment.
@@ -1580,9 +1666,11 @@ fn merge_level(
     let boldest = s.levels[il + 1].segs.len() == 1 && s.levels.len() == il + 2;
     // The inputs, newest first (the pin's iterator order).
     let mut inputs: AVec<(Seg, AVec<TermRec>)> = AVec::new();
+    let mut tombs: AVec<AVec<AVec<u8>>> = AVec::new();
     for k in (0..ninput).rev() {
         let sg = s.levels[il].segs.as_slice().get(k).ok_or(Corrupt)?.clone();
         let d = decode_seg(st, &sg, detail)?;
+        tombs.push(tomb_pages(st, &sg)?);
         inputs.push((sg, d));
     }
     let mut m = Multi::new(inputs.as_slice());
@@ -1591,6 +1679,11 @@ fn merge_level(
     let mut broke = false;
     while let Some(k) = m.current() {
         let tr = &inputs[k].1[m.pos[k].0];
+        // The pin's iterator steps past a tombstoned entry unseen.
+        if tomb_hit(tombs[k].as_slice(), tr.entries[m.pos[k].1].rowid) {
+            m.next();
+            continue;
+        }
         if term.as_ref().is_none_or(|t| *t != tr.term) {
             if let Some(b) = budget
                 && w.n_leaf > b
@@ -1792,6 +1885,9 @@ pub struct Hit {
 #[derive(Debug, Default)]
 pub struct Reader {
     segs: AVec<AVec<TermRec>>,
+    /// Each segment's tombstone hash pages (none for the pending
+    /// terms).
+    tombs: AVec<AVec<AVec<u8>>>,
 }
 
 impl Reader {
@@ -1804,9 +1900,11 @@ impl Reader {
             && !h.is_empty()
         {
             r.segs.push(hash_terms(h, detail)?);
+            r.tombs.push(AVec::new());
         }
         for sg in s.newest_first().iter() {
             r.segs.push(decode_seg(st, sg, detail)?);
+            r.tombs.push(tomb_pages(st, sg)?);
         }
         Ok(r)
     }
@@ -1871,7 +1969,7 @@ impl Reader {
             }
             last = Some(*rowid);
             let e = &self.segs[*si][*ti].entries[*ei];
-            if e.npos == 0 {
+            if e.npos == 0 || tomb_hit(self.tombs[*si].as_slice(), *rowid) {
                 continue;
             }
             out.push(Hit {

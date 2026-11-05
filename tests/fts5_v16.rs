@@ -1662,3 +1662,477 @@ fn files_move_between_engines() {
         }
     }
 }
+
+// ---------------- Review fixes (v0.16) ----------------
+
+/// The pin's own continuation of a file versus hipp's: `setup` runs on
+/// the pin alone, then `rest` (and the shadow tables) on a copy each.
+fn continue_pin_file(tag: &str, setup: &[String], rest: &[String]) {
+    let base = common::temp_db(&format!("v16fts-{tag}-base"));
+    pin_run(&base, setup);
+    let h = common::temp_db(&format!("v16fts-{tag}-h"));
+    let o = common::temp_db(&format!("v16fts-{tag}-o"));
+    std::fs::copy(&base, &h).expect("copy");
+    std::fs::copy(&base, &o).expect("copy");
+    let mut all = rest.to_vec();
+    all.extend(shadow("t"));
+    let _ = std::fs::write(
+        base.with_extension("sql"),
+        format!("{};\n-- rest\n{};\n", setup.join(";\n"), all.join(";\n")),
+    );
+    same_on(&h, &o, &all);
+    assert_eq!(pin_checks(&h), v(&["ok", "checked"]), "{tag}");
+}
+
+/// A contentless_delete table the pin deleted rows of: its tombstone
+/// pages hide them from queries and fts5vocab, merges drop them, and
+/// hipp's merges keep the structure counters the pin keeps (random
+/// write / delete / merge sequences, every detail mode).
+#[test]
+fn pin_tombstones_are_honoured() {
+    for seed in 0..24u64 {
+        let mut r = Rng(0x7041_0000 + seed * 7919 + 1);
+        let detail = *r.pick(&["full", "column", "none"]);
+        let mut setup = vec![format!(
+            "CREATE VIRTUAL TABLE t USING fts5(a, b, content='', contentless_delete=1, detail={detail})"
+        )];
+        setup.push(format!(
+            "INSERT INTO t(t, rank) VALUES('pgsz', {})",
+            r.pick(&[64, 128, 4050])
+        ));
+        if r.chance(50) {
+            setup.push(format!(
+                "INSERT INTO t(t, rank) VALUES('deletemerge', {})",
+                r.pick(&[0, 5, 10, 30])
+            ));
+        }
+        if r.chance(50) {
+            setup.push(format!(
+                "INSERT INTO t(t, rank) VALUES('automerge', {})",
+                r.pick(&[0, 2, 4, 8])
+            ));
+        }
+        let words: Vec<String> = (0..30).map(|i| format!("w{i}")).collect();
+        let mut rid = 0i64;
+        for _ in 0..r.range(3, 20) {
+            setup.push("BEGIN".into());
+            for _ in 0..r.range(1, 8) {
+                rid += r.range(1, 3);
+                let a: Vec<&str> = (0..r.range(1, 6))
+                    .map(|_| r.pick(&words).as_str())
+                    .collect();
+                setup.push(format!(
+                    "INSERT INTO t(rowid, a, b) VALUES({rid}, '{}', '{}')",
+                    a.join(" "),
+                    r.pick(&words)
+                ));
+            }
+            setup.push("COMMIT".into());
+            if r.chance(45) {
+                let ids: Vec<String> = (0..r.range(1, 6))
+                    .map(|_| r.range(1, rid).to_string())
+                    .collect();
+                setup.push(format!("DELETE FROM t WHERE rowid IN ({})", ids.join(",")));
+            }
+        }
+        let mut rest = Vec::new();
+        for w in words.iter().take(8) {
+            rest.push(format!(
+                "SELECT '{w}', group_concat(rowid) FROM t WHERE t MATCH '{w}'"
+            ));
+        }
+        rest.push("CREATE VIRTUAL TABLE v USING fts5vocab(t, row)".into());
+        rest.push("SELECT * FROM v".into());
+        for _ in 0..r.range(1, 8) {
+            match r.below(10) {
+                0..=5 => {
+                    rid += 1;
+                    rest.push(format!(
+                        "INSERT INTO t(rowid, a, b) VALUES({rid}, '{} {}', 'x')",
+                        r.pick(&words),
+                        r.pick(&words)
+                    ));
+                }
+                6 => rest.push("INSERT INTO t(t) VALUES('optimize')".into()),
+                7 | 8 => rest.push(format!(
+                    "INSERT INTO t(t, rank) VALUES('merge', {})",
+                    r.pick(&[-5, 5, 100, -100, 1])
+                )),
+                _ => rest.push("INSERT INTO t(t, rank) VALUES('automerge', 2)".into()),
+            }
+        }
+        for w in words.iter().take(8) {
+            rest.push(format!(
+                "SELECT '{w}', group_concat(rowid) FROM t WHERE t MATCH '{w}'"
+            ));
+        }
+        continue_pin_file(&format!("tomb{seed}"), &setup, &rest);
+    }
+}
+
+/// A pin-set `secure-delete`: hipp refuses the deletes it cannot make
+/// in place (the file stays as it was), and deletes once it is off as
+/// the pin does; setting it through hipp stores it as the pin does.
+#[test]
+fn secure_delete_is_not_ignored() {
+    let setup = v(&[
+        "CREATE VIRTUAL TABLE t USING fts5(a)",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', 1)",
+        "INSERT INTO t SELECT 'w'||value||' common' FROM generate_series(1, 30)",
+    ]);
+    let base = common::temp_db("v16fts-sd-base");
+    pin_run(&base, &setup);
+    let before = pin_run(&base, &shadow("t")).0;
+    for stmt in [
+        "DELETE FROM t WHERE rowid = 10",
+        "UPDATE t SET a = 'x' WHERE rowid = 10",
+        "INSERT OR REPLACE INTO t(rowid, a) VALUES(10, 'y')",
+    ] {
+        let (_, f, e) = hipp_run(&base, &v(&[stmt]));
+        assert_eq!(f, vec![true], "{stmt}");
+        assert!(
+            matches!(
+                e,
+                Some(Error::Schema {
+                    kind: SchemaKind::Fts5SecureDelete
+                })
+            ),
+            "{stmt}: {e:?}"
+        );
+        assert_eq!(pin_run(&base, &shadow("t")).0, before, "{stmt}");
+    }
+    let h = common::temp_db("v16fts-sd-h");
+    let o = common::temp_db("v16fts-sd-o");
+    std::fs::copy(&base, &h).expect("copy");
+    std::fs::copy(&base, &o).expect("copy");
+    let mut rest = v(&[
+        "INSERT INTO t(t, rank) VALUES('secure-delete', 0)",
+        "DELETE FROM t WHERE rowid = 10",
+        "SELECT rowid FROM t WHERE t MATCH 'w10 OR w11'",
+    ]);
+    rest.extend(shadow("t"));
+    same_on(&h, &o, &rest);
+    // The setting's values as the pin stores them (numeric text as
+    // its integer; bad values refused).
+    let mut cfg = v(&[
+        "CREATE VIRTUAL TABLE t USING fts5(a)",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', 1)",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', -1)",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', 'x')",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', 2.0)",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', '3')",
+        "INSERT INTO t(t, rank) VALUES('pgsz', '64')",
+        "INSERT INTO t(t, rank) VALUES('automerge', ' 3 ')",
+        "INSERT INTO t(t, rank) VALUES('deletemerge', '7')",
+        "INSERT INTO t(t, rank) VALUES('rank', 'bm25(1)')",
+        "SELECT k, quote(v) FROM t_config",
+        "INSERT INTO t VALUES('a b')",
+        "INSERT INTO t(t, rank) VALUES('secure-delete', 0)",
+        "DELETE FROM t",
+    ]);
+    cfg.extend(shadow("t"));
+    same("sd-config", &cfg);
+}
+
+/// One regression case per review finding (and per bug the fixes'
+/// own fuzzing found), compared with the pin.
+#[test]
+fn review_regressions() {
+    let cases: &[(&str, &[&str])] = &[
+        // A failing multi-row statement in a transaction drops the
+        // terms its trigger programs added (they were left in the
+        // index of an external-content table).
+        (
+            "trigger-stmt-rollback",
+            &[
+                "CREATE TABLE src(id INTEGER PRIMARY KEY, x)",
+                "CREATE VIRTUAL TABLE e USING fts5(x, content='src', content_rowid='id')",
+                "CREATE TRIGGER s_ai AFTER INSERT ON src BEGIN INSERT INTO e(rowid, x) VALUES(new.id, new.x); END",
+                "CREATE TRIGGER s_ad AFTER DELETE ON src BEGIN INSERT INTO e(e, rowid, x) VALUES('delete', old.id, old.x); END",
+                "INSERT INTO src VALUES(2, 'two')",
+                "BEGIN",
+                "INSERT INTO src VALUES(3, 'three')",
+                "INSERT INTO src VALUES(6, 'six'), (2, 'bad')",
+                "INSERT INTO src VALUES(7, 'seven'), (8, 'eight')",
+                "SAVEPOINT a",
+                "INSERT INTO src VALUES(9, 'nine'), (3, 'bad')",
+                "DELETE FROM src WHERE id IN (3, 7)",
+                "INSERT INTO src VALUES(10, 'ten'), (10, 'bad')",
+                "RELEASE a",
+                "COMMIT",
+                "SELECT rowid FROM e WHERE e MATCH 'six OR three OR seven OR eight OR nine OR ten OR two'",
+                "INSERT INTO e(e, rank) VALUES('integrity-check', 1)",
+                "SELECT id, hex(block) FROM e_data",
+            ],
+        ),
+        // A NEAR group failing inside an OR keeps the phrase hits the
+        // pin's test left (bm25 / highlight / snippet count them).
+        (
+            "near-in-or",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(x, y)",
+                "INSERT INTO t VALUES('e b', 'ef')",
+                "SELECT rowid, bm25(t), highlight(t, 1, '[', ']') FROM t WHERE t MATCH 'e OR y:NEAR(ef b)'",
+                "CREATE VIRTUAL TABLE u USING fts5(x)",
+                "INSERT INTO u VALUES('cd b ef ab c')",
+                "SELECT bm25(u), highlight(u, 0, '<', '>') FROM u WHERE u MATCH 'NEAR(b \"cd ef\", 3) OR ab'",
+                "SELECT bm25(u), snippet(u, 0, '<', '>', '..', 3) FROM u WHERE u MATCH 'ab OR NEAR(b \"cd ef\", 3)' ORDER BY rowid DESC",
+            ],
+        ),
+        // A row lacking a later phrase's term is no NEAR candidate.
+        (
+            "near-candidate",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(x, y)",
+                "INSERT INTO t VALUES('c ef c cd e cd', 'a cd ef b')",
+                "INSERT INTO t VALUES('a a b f ef a', 'f a')",
+                "INSERT INTO t VALUES('ab', 'b c')",
+                "SELECT rowid, highlight(t, 1, '[', ']') FROM t WHERE t MATCH 'c OR NEAR(a \"ef e\" f, 4)'",
+                "SELECT rowid, bm25(t) FROM t WHERE t MATCH 'NEAR(a \"ef e\" f, 4) OR c'",
+            ],
+        ),
+        // A column-filtered prefix scan drops the rows the filter
+        // empties (they are no NEAR candidates).
+        (
+            "prefix-colset",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(x, y)",
+                "INSERT INTO t VALUES('cd cd f ab f a', 'b ef ab')",
+                "INSERT INTO t VALUES('ef ab f', '')",
+                "INSERT INTO t VALUES('c ab f c ef b c', 'ef c ef')",
+                "SELECT rowid, bm25(t) FROM t WHERE t MATCH '(\"b\" AND NEAR(\"c ef\" \"c*\")) NOT -x:(NEAR(ab* ab, 0))'",
+                "SELECT rowid, bm25(t) FROM t WHERE t MATCH 'b NOT y:(ab* c)'",
+            ],
+        ),
+        // snippet()'s token count is clamped to 0..INT_MAX.
+        (
+            "snippet-ntoken",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(a)",
+                "INSERT INTO t VALUES('Cat. CAT! cAt?'), ('x cat y. z cat w')",
+                "SELECT snippet(t, -1, '<', '>', '...', -1) FROM t WHERE t MATCH 'cat'",
+                "SELECT snippet(t, -1, '<', '>', '...', -4294967297) FROM t WHERE t MATCH 'cat'",
+                "SELECT snippet(t, -1, '<', '>', '...', 4294967295) FROM t WHERE t MATCH 'cat'",
+                "SELECT snippet(t, -1, '<', '>', '...', 4294967296) FROM t WHERE t MATCH 'cat'",
+                "SELECT snippet(t, 0, '<', '>', '...', '-3') FROM t WHERE t MATCH 'cat'",
+            ],
+        ),
+        // External content missing the row: an error when the
+        // statement reads a content column or its text.
+        (
+            "missing-content-row",
+            &[
+                "CREATE TABLE docs(id INTEGER PRIMARY KEY, title, body)",
+                "CREATE VIRTUAL TABLE f USING fts5(title, body, content='docs', content_rowid='id')",
+                "INSERT INTO f(rowid, title, body) VALUES(99, 'ghost', 'ghost')",
+                "SELECT rowid, title FROM f WHERE f MATCH 'ghost'",
+                "SELECT rowid FROM f WHERE f MATCH 'ghost'",
+                "SELECT count(*) FROM f WHERE f MATCH 'ghost'",
+                "SELECT rowid, bm25(f) FROM f WHERE f MATCH 'ghost'",
+                "SELECT rowid, highlight(f, 0, '[', ']') FROM f WHERE f MATCH 'ghost'",
+                "SELECT rowid FROM f WHERE f MATCH 'ghost' ORDER BY rank",
+                "SELECT (SELECT title FROM f WHERE f MATCH 'ghost')",
+                "SELECT rowid FROM f WHERE f MATCH 'ghost' ORDER BY title",
+                "DELETE FROM f WHERE f MATCH 'ghost'",
+                "SELECT rowid FROM f WHERE f MATCH 'ghost'",
+            ],
+        ),
+        // An INSERT's rowid passes OP_MustBeInt; an UPDATE's does not.
+        (
+            "real-rowids",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(a)",
+                "INSERT INTO t(rowid, a) VALUES(7.0, 'x')",
+                "INSERT INTO t(rowid, a) VALUES(CAST(8 AS REAL), 'x')",
+                "INSERT INTO t(rowid, a) VALUES(8.5, 'x')",
+                "INSERT INTO t(rowid, a) VALUES('9.0', 'x')",
+                "INSERT INTO t(rowid, a) VALUES(' 12 ', 'x')",
+                "INSERT INTO t(rowid, a) VALUES(9223372036854775807.0, 'x')",
+                "INSERT INTO t(rowid, a) VALUES(-9223372036854775808.0, 'x')",
+                "INSERT INTO t(rowid, a) VALUES(1e30, 'x')",
+                "INSERT INTO t(rowid, a) VALUES(x'31', 'x')",
+                "UPDATE t SET rowid = 10.0 WHERE rowid = 7",
+                "UPDATE t SET rowid = '20' WHERE rowid = 9",
+                "INSERT OR REPLACE INTO t(rowid, a) VALUES(20.0, 'y')",
+                "SELECT rowid, a FROM t",
+            ],
+        ),
+        // INSERT ... RETURNING and UPDATE ... FROM.
+        (
+            "returning-update-from",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(a, b)",
+                "INSERT INTO t VALUES('alpha beta', 'x') RETURNING rowid, a, b, t, rank",
+                "INSERT INTO t(rowid, a) VALUES(10, 'gamma') RETURNING rowid, a, b, *",
+                "INSERT INTO t(a) VALUES('d'), ('e') RETURNING rowid, upper(a), last_insert_rowid()",
+                "INSERT INTO t(rowid, a) SELECT 20, 'sel' RETURNING rowid",
+                "INSERT INTO t(t) VALUES('optimize') RETURNING rowid, a",
+                "INSERT OR REPLACE INTO t(rowid, a) VALUES(10, 'gamma2') RETURNING rowid, a",
+                "INSERT INTO t VALUES('zz', 'q') RETURNING (SELECT count(*) FROM t)",
+                "INSERT INTO t VALUES('z', 'q') RETURNING bm25(t)",
+                "INSERT INTO t VALUES('z', 'q') RETURNING t.*",
+                "UPDATE t SET a = 'from' FROM (SELECT 2 AS k) WHERE t.rowid = k",
+                "UPDATE t SET b = s.v FROM (SELECT 1 AS k, 'vv' AS v UNION ALL SELECT 10, 'ww') AS s WHERE t.rowid = s.k",
+                "UPDATE t AS z SET a = s.v || z.a FROM (SELECT 1 AS k, 'p' AS v UNION ALL SELECT 1, 'q') AS s WHERE z.rowid = s.k",
+                "UPDATE t SET rowid = s.k + 30 FROM (SELECT 20 AS k) s WHERE t.rowid = s.k",
+                "UPDATE t SET a = 'z' WHERE rowid = 1 RETURNING rowid",
+                "DELETE FROM t WHERE rowid = 1 RETURNING rowid",
+                "SELECT rowid, * FROM t",
+                "SELECT rowid FROM t WHERE t MATCH 'from OR sel OR qalpha'",
+                CHECK,
+            ],
+        ),
+        // UPDATE ... FROM writes in the join's order (the FROM rows
+        // outer, the table probed by rowid), with the pin's flushes.
+        (
+            "update-from-order",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(a)",
+                "INSERT INTO t(rowid, a) VALUES(1, 'one'), (2, 'two'), (3, 'three')",
+                "BEGIN",
+                "INSERT INTO t(rowid, a) VALUES(5, 'five')",
+                "UPDATE t SET a = 'x' FROM (SELECT 2 AS k) WHERE t.rowid = k",
+                "INSERT INTO t(rowid, a) VALUES(6, 'six')",
+                "UPDATE t SET a = 'y' FROM (SELECT 3 AS k UNION ALL SELECT 1) s WHERE t.rowid = s.k",
+                "COMMIT",
+                "SELECT id, hex(block) FROM t_data",
+                CHECK,
+            ],
+        ),
+        // MATCH under an OR (the pin's multi-index OR) and in a LEFT
+        // JOIN's ON.
+        (
+            "match-or-and-left-join",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(a)",
+                "INSERT INTO t(rowid, a) VALUES(1, 'red green'), (2, 'green blue'), (3, 'blue red'), (4, 'pink'), (5, 'red pink')",
+                "SELECT rowid FROM t WHERE t MATCH 'pink' OR t MATCH 'red'",
+                "SELECT rowid FROM t WHERE rowid = 4 OR t MATCH 'red'",
+                "SELECT rowid, bm25(t), highlight(t, 0, '[', ']') FROM t WHERE t MATCH 'pink' OR t MATCH 'red'",
+                "SELECT rowid, rank FROM t WHERE t MATCH 'pink' OR t MATCH 'red' ORDER BY rank",
+                "SELECT rowid FROM t WHERE (t MATCH 'pink' OR t MATCH 'red') AND rowid > 2",
+                "SELECT rowid FROM t WHERE t MATCH 'pink' OR a MATCH 'blue'",
+                "SELECT rowid FROM t WHERE t MATCH 'pink' OR rowid > 3",
+                "SELECT rowid FROM t WHERE t MATCH 'pink' OR a = 'red green'",
+                "SELECT rowid, bm25(t) FROM t WHERE rowid = 4 OR t MATCH 'red'",
+                "SELECT rowid FROM t WHERE t MATCH 'pink' OR (t MATCH 'red' AND rowid < 3)",
+                "SELECT rowid FROM t WHERE rowid = 3.0 OR rowid = '2' OR rowid = 2.5 OR t MATCH 'pink'",
+                "SELECT rowid FROM t WHERE t = 'pink' OR t MATCH 'blue'",
+                "SELECT count(*) FROM t WHERE t MATCH 'pink' OR t MATCH 'red'",
+                "SELECT rowid FROM t WHERE NOT (t MATCH 'pink' OR t MATCH 'red')",
+                "CREATE TABLE m(q)",
+                "INSERT INTO m VALUES('red'), ('nothing'), ('blue')",
+                "SELECT m.q, t.rowid FROM m, t WHERE t MATCH m.q OR t MATCH 'pink'",
+                "SELECT m.q, t.rowid FROM m LEFT JOIN t ON t MATCH m.q || 'x'",
+                "SELECT m.q, t.rowid FROM m LEFT JOIN t ON t MATCH m.q",
+                "SELECT m.q, t.rowid, highlight(t, 0, '[', ']') FROM m LEFT JOIN t ON t MATCH m.q WHERE t.rowid < 3",
+                "SELECT m.q, count(t.rowid) FROM m LEFT JOIN t ON t MATCH m.q GROUP BY m.q",
+                "SELECT m.q, value FROM m LEFT JOIN generate_series ON start = length(m.q) AND stop = 6",
+            ],
+        ),
+        // Auxiliary functions in an aggregate query: the pin's
+        // "unable to use function ... in the requested context".
+        (
+            "aux-in-aggregate",
+            &[
+                "CREATE VIRTUAL TABLE t USING fts5(a)",
+                "INSERT INTO t VALUES('x y'), ('x')",
+                "SELECT sum(bm25(t)) FROM t WHERE t MATCH 'x'",
+                "SELECT group_concat(highlight(t, 0, '[', ']')) FROM t WHERE t MATCH 'x'",
+                "SELECT count(*), bm25(t) FROM t WHERE t MATCH 'x'",
+                "SELECT max(rank) FROM t WHERE t MATCH 'x'",
+                "SELECT bm25(t) FROM t WHERE t MATCH 'x' GROUP BY rowid",
+                "SELECT count(*) FROM t WHERE t MATCH 'x' HAVING max(bm25(t)) < 0",
+                "SELECT (SELECT bm25(t)) FROM t WHERE t MATCH 'x'",
+                "SELECT sum(rowid) OVER (ORDER BY bm25(t)) FROM t WHERE t MATCH 'x'",
+            ],
+        ),
+    ];
+    for (tag, stmts) in cases {
+        same(tag, &v(stmts));
+    }
+}
+
+/// Generated queries mixing NEAR groups, phrases, prefixes, column
+/// filters and AND / OR / NOT over small random documents: every
+/// row's bm25, highlights and snippet as the pin's, in both rowid
+/// orders and in rank order (the NEAR-in-OR finding's own fuzz).
+#[test]
+fn generated_near_or_queries_match() {
+    const W: &[&str] = &["a", "b", "c", "ab", "cd", "ef", "e", "f"];
+    fn phrase(r: &mut Rng) -> String {
+        let n = *r.pick(&[1, 1, 1, 2, 2, 3]);
+        let t: Vec<&str> = (0..n).map(|_| *r.pick(W)).collect();
+        let mut s = t.join(" ");
+        if n == 1 && r.chance(10) {
+            s.push('*');
+        }
+        if n > 1 || r.chance(20) {
+            s = format!("\"{s}\"");
+        }
+        if r.chance(10) {
+            s = format!("^{s}");
+        }
+        s
+    }
+    fn q(r: &mut Rng, d: u32) -> String {
+        let c = r.below(100);
+        let mut p = if d > 2 || c < 30 {
+            phrase(r)
+        } else if c < 50 {
+            let k = r.range(2, 3);
+            let ps: Vec<String> = (0..k)
+                .map(|_| phrase(r).trim_start_matches('^').to_string())
+                .collect();
+            let n = if r.chance(60) {
+                format!(", {}", r.below(5))
+            } else {
+                String::new()
+            };
+            format!("NEAR({}{n})", ps.join(" "))
+        } else if c < 65 {
+            format!("({} OR {})", q(r, d + 1), q(r, d + 1))
+        } else if c < 80 {
+            format!("({} AND {})", q(r, d + 1), q(r, d + 1))
+        } else if c < 90 {
+            format!("({} NOT {})", q(r, d + 1), q(r, d + 1))
+        } else {
+            format!("{} {}", q(r, d + 1), q(r, d + 1))
+        };
+        if r.chance(15) && !p.starts_with('^') {
+            let f = *r.pick(&["x", "y", "{x y}", "-x", "-y"]);
+            p = if p.contains(' ') && !p.starts_with("NEAR") {
+                format!("{f}:({p})")
+            } else {
+                format!("{f}:{p}")
+            };
+        }
+        p
+    }
+    for seed in 0..40u64 {
+        let mut r = Rng(0x4e45_4152 ^ (seed * 104_729 + 7));
+        let mut stmts = v(&["CREATE VIRTUAL TABLE t USING fts5(x, y)"]);
+        for _ in 0..r.range(3, 12) {
+            let a: Vec<&str> = (0..r.range(1, 8)).map(|_| *r.pick(W)).collect();
+            let b: Vec<&str> = (0..r.range(0, 5)).map(|_| *r.pick(W)).collect();
+            stmts.push(format!(
+                "INSERT INTO t VALUES('{}', '{}')",
+                a.join(" "),
+                b.join(" ")
+            ));
+        }
+        for _ in 0..8 {
+            let qq = q(&mut r, 0);
+            stmts.push(format!(
+                "SELECT rowid, bm25(t), highlight(t, 0, '[', ']'), highlight(t, 1, '[', ']'), snippet(t, -1, '<', '>', '..', 3) FROM t WHERE t MATCH '{qq}'"
+            ));
+            stmts.push(format!(
+                "SELECT rowid, highlight(t, 0, '[', ']') FROM t WHERE t MATCH '{qq}' ORDER BY rowid DESC"
+            ));
+            stmts.push(format!(
+                "SELECT rowid, rank FROM t WHERE t MATCH '{qq}' ORDER BY rank"
+            ));
+        }
+        same(&format!("nearor{seed}"), &stmts);
+    }
+}

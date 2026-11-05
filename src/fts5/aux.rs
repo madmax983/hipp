@@ -47,6 +47,10 @@ pub struct AuxRow {
     pub texts: AVec<OwnedValue>,
     /// Column sizes from `%_docsize` (`None`: count by tokenizing).
     pub sizes: Option<AVec<i64>>,
+    /// An external-content row the content table lacks: reading its
+    /// text fails as the pin's "fts5: missing row N from content
+    /// table" (v0.16 review fix: NULLs were returned).
+    pub missing: bool,
 }
 
 /// The statement's rows (`Env::fts_rows`).
@@ -504,7 +508,9 @@ pub fn snippet(r: &AuxRow, args: &[OwnedValue]) -> Result<OwnedValue, AuxErr> {
     let open = arg_text(args.get(1));
     let close = arg_text(args.get(2));
     let ell = arg_text(args.get(3));
-    let ntok = col_index(&args[4]);
+    // The token count is clamped to 0..=INT_MAX (v0.16 review fix: a
+    // negative count was used as is, and a large one truncated).
+    let ntok = crate::func::int64_value(&args[4]).clamp(0, i64::from(i32::MAX));
     let mut best_col = if icol >= 0 { icol } else { 0 };
     let nphrase = r.phrases.len();
     let inst = r.inst();
@@ -661,8 +667,14 @@ pub fn call(f: AuxFn, row: &AuxRow, args: &[OwnedValue]) -> Result<OwnedValue, A
             for a in args.iter() {
                 w.push(crate::func::real_value(a));
             }
+            // bm25 reads the text for column sizes (columnsize=0) and
+            // instances (detail=column / none).
+            if row.missing && (row.sizes.is_none() || row.tab.cfg.detail != Detail::Full) {
+                return Err(AuxErr::Corrupt);
+            }
             Ok(OwnedValue::Real(bm25(row, w.as_slice())))
         }
+        _ if row.missing => Err(AuxErr::Corrupt),
         AuxFn::Highlight => highlight(row, args),
         AuxFn::Snippet => snippet(row, args),
     }
