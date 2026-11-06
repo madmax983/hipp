@@ -5010,8 +5010,11 @@ impl<'a> Parser<'a> {
         let mut from = AVec::new();
         from.push(self.join_source::<E>(JoinKind::Inner, false, true, fb)?);
         loop {
+            // `,` is the pin's plain inner join (`JT_INNER`); only
+            // the CROSS keyword makes `JoinKind::Cross` (v0.17 fix:
+            // the planner never reorders an explicit CROSS JOIN).
             if self.eat(Tok::Comma) {
-                from.push(self.join_source::<E>(JoinKind::Cross, false, false, fb)?);
+                from.push(self.join_source::<E>(JoinKind::Inner, false, false, fb)?);
                 continue;
             }
             let Some((kind, natural)) = self.join_op::<E>()? else {

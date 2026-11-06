@@ -418,6 +418,176 @@ the session glue). Ratchets: `[max]` 1,044,172, `[xl]` 1,053,532.
 - Not done (still refused): `contentless_unindexed=1`, `insttoken`,
   `tokendata=1`, `locale=1`.
 
+### Join ordering, automatic indexes and Bloom filters (2026-11-06)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated: new leaf `join_order` (requires `v16` and `expr_index`:
+it extends `xplan`'s candidate-loop model rather than adding a second
+planner). Placement (ADR 0004): `max` + the leaf measures 1,093,732 B
+of thumbv7em code, past `max`'s 1,048,576 B budget, so the leaf joins
+`xl` (`xl = ["max", "fts5_delete", "join_order"]`); its own
+`v16,indexes,expr_index,join_order` line in `ci/feature-sets.txt`.
+Without the leaf joins run in FROM order, each source with its own
+best loop, exactly as in 0.16.
+
+**Shipped** (`src/xjoin.rs`, `src/session/join.rs`; hooks in `xplan`,
+`session::{xindex, stream, eqp, vtab, json_tvf, maint}`):
+
+- **The pin's join planner** for a SELECT core of two to 63 sources
+  (tables of the main database, virtual tables, JSON table-valued
+  functions; no RIGHT / FULL join): every candidate loop of each
+  source with its prerequisites (`whereLoopAddBtree` /
+  `whereLoopAddBtreeIndex`, nOut lowered only by the terms the
+  prerequisites make computable, `whereLoopOutputAdjust`), inserted
+  through `whereLoopInsert` (`whereLoopAdjustCost`,
+  `whereLoopFindLesser`), the N-best `wherePathSolver` (mxChoice 1 /
+  5 / 12, 18 with the star-query heuristic), the interstage
+  heuristic, sorting costs for ORDER BY / GROUP BY / DISTINCT
+  (`wherePathSatisfiesOrderBy` with its reverse mask), and the
+  ordering constraints: a LEFT JOIN's right side and every source of
+  an explicit CROSS JOIN run after the sources before them; a plain
+  join after them is free again. The core is laid out in the chosen
+  order (sources permuted, every expression renumbered,
+  `query::remap_plan`), so both executors — the materialising one
+  and the v0.17 streamed one — run it unchanged; inner ON terms move
+  to the latest source they read. The planner reads the WHERE clause
+  as the pin does: LEFT JOIN strength reduction over the WHERE with
+  every ON clause appended (`sqlite3ExprImpliesNonNullRow`), the
+  pin's constant propagation (only for two or more AND terms,
+  INTEGER PRIMARY KEY columns included), `x IS [NOT] NULL` on a NOT
+  NULL column as the constant 0 / 1 (`sqlite3ExprCanBeNull`; not for
+  a LEFT JOIN's right side), equivalence classes (`a = b AND b op v`
+  probes `a`), the virtual terms in the pin's term-list order
+  (commuted copies, BETWEEN halves and `x>NULL` after the written
+  terms, analysed last to first), and a non-covering index scan's
+  `nLookup` reduction for the terms the index covers.
+- **Automatic indexes** (`constructAutomaticIndex`): for an `=` / `IS`
+  term on a column no index starts with (`termCanDriveIndex`,
+  `columnIsGoodIndexCandidate`), a loop with the pin's setup cost; the
+  executors build it once per statement (the table's rows sorted on
+  the key columns, under their collations, then the other columns the
+  statement reads, then the rowid — the index's order) and probe it
+  by binary search. PARTIAL when a WHERE (or the LEFT JOIN's own ON)
+  term reads the table alone or no table at all. EXPLAIN QUERY PLAN
+  prints `SEARCH x USING AUTOMATIC [PARTIAL] COVERING INDEX (c=?)`.
+- **Bloom filters**, built and consulted (they change no rows): in
+  front of every automatic index whose key collations are BINARY,
+  and — with `sqlite_stat1` rows for the tables up to it — in front
+  of an index or rowid lookup run more often than its table has rows
+  that is self-culling and keyed on BINARY columns
+  (`whereCheckIfBloomFilterIsUseful`), with the pin's pull-down
+  (a later lookup's filter is built with an earlier one's when its
+  prerequisites allow). The pin's `filterHash` (integers by value,
+  every string alike, every blob alike). A lookup with a filter reads
+  the table's rows, so its index no longer "covers" (as on the pin).
+  EXPLAIN QUERY PLAN prints `BLOOM FILTER ON x (c=?)` where the pin
+  does.
+- **`sqlite_stat1` read back** at schema load and after ANALYZE (in
+  the same connection, either engine's ANALYZE): `nRowLogEst` and each
+  index's `aiRowLogEst` replace the defaults (an index without a row
+  lifting a small table to the pin's 1,000-row floor),
+  `columnIsGoodIndexCandidate`'s statistics rule, the Bloom filters.
+- **Virtual tables in the order** (`whereLoopAddVirtual`): one loop per
+  constraint set the module's xBestIndex accepts (all usable, each
+  distinct set of other sources in increasing order, none), costed
+  from estimatedCost / estimatedRows (fts5's estimates are now the
+  pin's), plus `whereLoopAddOr`'s loop for an OR of MATCH terms; the
+  module's constraints are then planned in the chosen order. So
+  `FROM f, m WHERE f MATCH m.q`, `FROM generate_series(1, t.n), t` and
+  `FROM json_each(t.j), t` now run (they were refused) with the
+  pin's rows and plans.
+- **Ungated fixes:** the commuted copy of a join term `a.k = b.k`
+  kept the collation of its new left operand, so a lookup on `b.k`
+  compared BINARY where the comparison is `a.k`'s NOCASE (rows were
+  lost through an index or automatic index); `,` in FROM parses as
+  the pin's plain inner join (`JoinKind::Inner`), only the CROSS
+  keyword making a CROSS JOIN (`JT_CROSS`), so the FROM-subquery
+  flattening rule that tests for a following CROSS JOIN (the pin's
+  17d) no longer fires for a comma.
+
+**Probing notes (live pin; the 3.54.1 amalgamation's `where.c` read
+alongside):** the pin reorders only past the CROSS / LEFT rules above
+(`b CROSS JOIN c, a WHERE ...` may run `a` before `c`); an explicit
+`WHERE 1`, or `x IS NOT NULL` on a NOT NULL column (folded to 1 by the
+resolver), makes an automatic index PARTIAL; `x IS NOT NULL` adds the
+virtual `x>NULL` range even without STAT4, and it loses to a covering
+full scan through `whereLoopAdjustCost` against the equality loop on
+the same index; the IN iterations of an index's first columns are
+charged to its deeper loops (`rRun += nInMul + nIn`), and it is
+`whereLoopAdjustCost` that still makes `b IN (...) AND c = ?` prefer
+an index on (b, c) to one on c; a top-level `IS NOT NULL` makes a
+LEFT JOIN inner only as the first AND term of the WHERE (or of an ON
+clause appended to it); a Bloom filter needs statistics for every
+table up to its loop, and an automatic index on a NOCASE comparison
+has none.
+
+**Tests:** `tests/join_order_v17.rs` — `generated_joins_match_pin`
+(60 seeds by default, `HIPP_JO_SEEDS` for more: 2- to 6-way joins over
+random rowid / INTEGER PRIMARY KEY / WITHOUT ROWID schemas with and
+without indexes, no statistics / the pin's ANALYZE / hipp's ANALYZE,
+comma, JOIN, LEFT and CROSS joins, every kind of WHERE term, ORDER BY /
+GROUP BY / DISTINCT / LIMIT; rows compared in order, plans as text),
+`curated_plans_and_rows`, `statistics_and_bloom_filters`,
+`virtual_tables_reordered`, `regressions`, `automatic_index_is_faster`
+(2,000 x 2,000: the automatic index ~16 ms against ~1.3 s for the
+nested loop in a debug build; asserted 10x). Measured over 1,600
+generated queries: no row set differs, 12 (0.75%) come in another
+order, 106 (6.6%) print another plan — the test allows 2% and 10%.
+`hipp-cli/tests/cli_v17_join_order.rs`: rows and EXPLAIN QUERY PLAN
+trees byte-for-byte, with either engine's statistics, and the
+virtual-table cases. `tests/eqp_v16.rs`'s two documented differences
+(join order, automatic index) now match the pin and moved to its
+checked corpus. Every v0.16 suite stays green.
+
+**Gates:** `ci/local-gates.sh` (full run) passes. tests/depth_v16.rs
+and tests/triggers_v16.rs pass with debug info. The debug
+`STACK_BASE` was re-measured: an INSERT's step path in the `xl`
+build with debug info needs ~500 KiB before any nesting (the step
+future's poll frame alone ~230 KiB; probed on HEAD too, the same
+path already filled the test's old 512 KiB thread to its last page), so
+`STACK_BASE` is 512 KiB and depth_v16's small debug thread 640 KiB
+(the budgeted limits on it are those of the old pair).
+
+**Size Δ** (thumbv7em, `--profile tiny`): tiny 76,960 → 76,960 (0);
+full 506,432 → 506,480 (+48: the ungated collation fix); max
+1,045,676 → 1,045,804 (+128: the same fix in `xplan` and the
+gated-out hooks' residue); xl 1,055,028 → 1,103,060 (+48,032: the
+planner, automatic indexes, Bloom filters, statistics, virtual-table
+loops — over `justify_over`'s 32 KiB, justified here: the pin's
+planner is its largest single component, and the leaf sits in `xl`,
+1.25 MiB, with 207,660 B left).
+
+**Honest gaps:**
+
+- Plans: 6.6% of the generated corpus (mostly 4- to 6-way joins)
+  still prints another plan; the classes seen: path-cost ties among
+  several automatic indexes and CROSS / LEFT constraints in 5- and
+  6-way joins; the IN early-out / seek-scan rules of
+  `whereLoopAddBtreeIndex` with statistics (`x IN (...)` on an index
+  continued by the rowid); indexes containing the INTEGER PRIMARY
+  KEY column; a WITHOUT ROWID PRIMARY KEY's BETWEEN printing only its
+  lower bound (a v0.16 single-table class); transitive equivalences
+  through a LEFT JOIN the WHERE made inner. Rows differ in order in
+  0.75% of queries (the same plans), never in content.
+- Not modelled: the MULTI-INDEX OR of b-tree tables, skip-scans,
+  `sqlite_stat4`, likelihood() and LIKE-length estimates, the
+  EXISTS-to-join rewrite, the ordered-inner-loop `ORDER BY ... LIMIT`
+  case. A join containing a FROM subquery, view, CTE, TEMP or
+  attached table, or a RIGHT / FULL join, keeps FROM order (the pin
+  may reorder those too; the rows are the same). Automatic indexes
+  on views and subqueries (the pin's cheaper `rSetup - 25`) are not
+  built.
+- The `whereOmitNoopJoin` LEFT JOIN that EXPLAIN QUERY PLAN leaves out
+  (DISTINCT, or a one-row loop whose table nothing else reads) is
+  still run by hipp (same rows).
+- A Bloom filter on a lookup is consulted only for single-value
+  probes (an IN list or subquery probe goes straight to the lookup),
+  and one keyed on an index expression admits every probe; both are
+  still printed, as the pin builds them.
+- Statistics written to `sqlite_stat1` by hand are read at the next
+  schema load or ANALYZE (as on the pin); a rolled-back ANALYZE keeps
+  its statistics in the connection until then (not probed).
+
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles
@@ -5384,7 +5554,8 @@ patch, validity check, the `json_each` cursor) and its wiring.
 - `json_each` / `json_tree` without arguments (`FROM json_each WHERE
   json = ...`, the hidden-column constraint form) is refused
   (`Unsupported`), as are arguments reading a source to the right
-  (the pin reorders the join) and a lateral call on the right of a
+  (the pin reorders the join; closed in v0.17: the `join_order`
+  planner runs that source first) and a lateral call on the right of a
   RIGHT / FULL join; `json_each()` with empty parentheses has no
   rows, as on the pin.
 - Rows stream on the pin: a statement that fails part-way prints the
@@ -5689,7 +5860,9 @@ model and the access-path executor (~25 KB).
   their order), no automatic indexes, no MULTI-INDEX OR, no LIKE prefix
   ranges, no skip-scans, and `sqlite_stat1` / `sqlite_stat4` are never
   read (after ANALYZE the pin may choose another index; hipp keeps the
-  default estimates). Some tie and cost details remain unexplained: a
+  default estimates). (Closed in v0.17 by the `join_order` leaf: join
+  order, automatic indexes, Bloom filters and `sqlite_stat1`; MULTI-
+  INDEX OR, LIKE ranges, skip-scans and `sqlite_stat4` remain.) Some tie and cost details remain unexplained: a
   partial index whose WHERE is `x IS NOT NULL` competing with an index
   led by `x` (the pin's choice there depends on creation order in a way
   the model does not reproduce; 1 in ~1,000 generated cases still
@@ -8098,7 +8271,9 @@ shadow-table writes, queries and checks ≈ 32 KiB; 173,744 B of the
   is always sorted by hipp (orderByConsumed is ignored; same rows);
   LIMIT / OFFSET constraints are not passed to modules.
 - A virtual-table source whose arguments read a source to its
-  *right* is refused (the pin reorders the join); so is one on the
+  *right* is refused (the pin reorders the join; closed in v0.17:
+  the `join_order` planner orders virtual tables by their
+  xBestIndex costs); so is one on the
   right of a RIGHT / FULL join whose table-valued arguments read the
   left side (its ON clause no longer counts: review fix).
 - `dbstat` inside a view or trigger runs (the pin's "unsafe use of
@@ -8539,6 +8714,8 @@ OR, a LEFT JOIN's ON constraints).
   runs sources in FROM order (no join reordering anywhere, see
   `xplan`), so the constraint cannot be evaluated first. Write the
   argument's table first (`FROM m, t`), which both engines run.
+  (Closed in v0.17: the `join_order` planner puts `m` first, as the
+  pin does.)
 - **MATCH / aux functions in views and triggers** fail on the pin's
   shell because it sets `trusted_schema=0` (the library default is
   1). hipp has no `trusted_schema` (the same holds for `dbstat` and
@@ -8697,7 +8874,9 @@ the leaf `EXPLAIN` is an unsupported statement, as before.
 flattening (FROM subqueries, views and CTEs stay CO-ROUTINE /
 MATERIALIZE loops) and no WHERE push-down; no join reordering (FROM
 order, so a rowid lookup into an earlier table is not used); no
-automatic indexes or Bloom filters; EXISTS stays a subquery (no
+automatic indexes or Bloom filters (closed in v0.17 by `join_order`:
+the pin's join order, AUTOMATIC [PARTIAL] COVERING INDEX and BLOOM
+FILTER lines); EXISTS stays a subquery (no
 `SCAN u EXISTS`); IN subqueries are lists (no `USING INDEX i FOR
 IN-OPERATOR` / `USING ROWID SEARCH ON TABLE`); no MULTI-INDEX OR; no
 min() / max() optimization (`SEARCH t USING COVERING INDEX i`, or a

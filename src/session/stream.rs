@@ -62,6 +62,11 @@ enum Src {
     /// A virtual table's cursor.
     #[cfg(feature = "vtab")]
     Vt(super::vtab::VtCur),
+    /// `Level::cache` from the first index given to the second: an
+    /// automatic index's span for this combination (v0.17,
+    /// `join_order`).
+    #[cfg(feature = "join_order")]
+    Span(usize, usize),
 }
 
 /// One FROM source's loop.
@@ -82,6 +87,13 @@ struct Level {
     /// (`SourcePlan::tvf_dead`), put back when its loop ends.
     #[cfg(any(feature = "json", feature = "vtab"))]
     saved: AVec<(usize, OwnedValue)>,
+    /// An automatic index's Bloom filter (v0.17, `join_order`),
+    /// built with `cache`.
+    #[cfg(feature = "join_order")]
+    bloom: AVec<u8>,
+    /// A lookup loop's Bloom filter (`bloom`) is built.
+    #[cfg(feature = "join_order")]
+    bloom_built: bool,
 }
 
 /// What the stream does with each joined row.
@@ -334,6 +346,10 @@ impl<S: Storage> Statement<'_, S> {
                 side: (0, 0),
                 #[cfg(any(feature = "json", feature = "vtab"))]
                 saved: AVec::new(),
+                #[cfg(feature = "join_order")]
+                bloom: AVec::new(),
+                #[cfg(feature = "join_order")]
+                bloom_built: false,
             });
         }
         #[cfg(feature = "json")]
@@ -725,10 +741,55 @@ impl<S: Storage> Statement<'_, S> {
             }
             return Ok(());
         }
+        // An automatic index (v0.17, `join_order`): the table's rows
+        // sorted on its key once, then this combination's span.
+        #[cfg(feature = "join_order")]
+        if let Some(ai) = sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
+            if lv.cache.is_none() {
+                let rows = alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?;
+                if ai.bloom {
+                    lv.bloom = super::join::bloom_build(rows.as_slice(), ai);
+                }
+                lv.cache = Some(rows);
+            }
+            let span = match alloc::boxed::Box::pin(self.auto_probe(ai, &padded)).await? {
+                Some(p) if super::join::bloom_may(lv.bloom.as_slice(), p.as_slice()) => {
+                    match &lv.cache {
+                        Some(r) => super::join::auto_span(
+                            r.as_slice(),
+                            ai,
+                            p.as_slice(),
+                            self.conn.pager.text_enc(),
+                        ),
+                        None => (0, 0),
+                    }
+                }
+                _ => (0, 0),
+            };
+            lv.src = Src::Span(span.0, span.1);
+            return Ok(());
+        }
         #[cfg(feature = "expr_index")]
         if let Some(a) = sp.access.as_deref()
             && a.lateral
         {
+            // v0.17 (`join_order`): the Bloom filter first, built at
+            // the first probe.
+            #[cfg(feature = "join_order")]
+            if let Some(keys) = &a.bloom {
+                if !lv.bloom_built {
+                    lv.bloom = alloc::boxed::Box::pin(self.bloom_rows(sp, keys.as_slice())).await?;
+                    lv.bloom_built = true;
+                }
+                let bits = core::mem::take(&mut lv.bloom);
+                let pass =
+                    alloc::boxed::Box::pin(self.bloom_pass(a, bits.as_slice(), &padded)).await;
+                lv.bloom = bits;
+                if !pass? {
+                    lv.src = Src::Rows(AVec::new(), 0);
+                    return Ok(());
+                }
+            }
             lv.src = Src::Rows(self.access_rows(sp, a, &padded).await?, 0);
             return Ok(());
         }
@@ -817,6 +878,16 @@ impl<S: Storage> Statement<'_, S> {
                 Some(r) => (r, pos),
                 None => return Ok(false),
             },
+            #[cfg(feature = "join_order")]
+            Src::Span(pos, end) => {
+                if *pos >= *end {
+                    return Ok(false);
+                }
+                match &lv.cache {
+                    Some(r) => (r, pos),
+                    None => return Ok(false),
+                }
+            }
             #[cfg(any(feature = "json", feature = "vtab", feature = "expr_index"))]
             Src::Rows(r, pos) => (&*r, pos),
         };

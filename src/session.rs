@@ -118,6 +118,8 @@ type Prep<'a, 'f, S> = core::pin::Pin<
 mod fkey;
 #[cfg(feature = "fts5")]
 mod fts5;
+#[cfg(feature = "join_order")]
+mod join;
 #[cfg(any(feature = "json", feature = "vtab"))]
 mod json_tvf;
 #[cfg(feature = "v16")]
@@ -357,12 +359,15 @@ pub const STACK_PER_TRIGGER: usize = 16 * 1024;
 /// measured on x86_64 — the step future and the call path to the
 /// parser and executor). The debug figure was re-measured at 384 KiB
 /// after the lazily decoded index cursor (`btree::LazyPage`) grew a
-/// debug build's seek path: it covers the worst build CI runs, a
-/// debug build with debug info under `-C instrument-coverage`
-/// (ci/coverage.sh), where tests/depth_v16.rs and
-/// tests/triggers_v16.rs pass on their budgeted threads.
+/// debug build's seek path, and at 512 KiB in v0.17 (an INSERT's
+/// step path in a debug build with debug info of the `xl` profile
+/// reached ~500 KiB, the step future's poll frame alone ~230 KiB): it
+/// covers the worst build CI runs, a debug build with debug info
+/// under `-C instrument-coverage` (ci/coverage.sh), where
+/// tests/depth_v16.rs and tests/triggers_v16.rs pass on their
+/// budgeted threads.
 #[cfg(all(feature = "v04", debug_assertions))]
-pub const STACK_BASE: usize = 384 * 1024;
+pub const STACK_BASE: usize = 512 * 1024;
 #[cfg(all(feature = "v04", not(debug_assertions)))]
 pub const STACK_BASE: usize = 64 * 1024;
 /// The most stack one symbol of `Config::max_parser_depth` costs
@@ -1342,6 +1347,10 @@ pub struct Connection<S: Storage> {
     pager: Pager<S>,
     catalog_arena: Arena,
     catalog: Catalog,
+    /// The `sqlite_stat1` rows the planner reads (v0.17,
+    /// `join_order`): loaded with the schema and after ANALYZE.
+    #[cfg(feature = "join_order")]
+    stat1: AVec<join::Stat1Row>,
     cfg: Config,
     /// An explicit `BEGIN` is open (v0.2). The pager transaction
     /// itself opens lazily at the first write, as in SQLite; while
@@ -1467,6 +1476,8 @@ impl<S: Storage> Connection<S> {
             pager,
             catalog_arena,
             catalog: Catalog::empty(u32::MAX),
+            #[cfg(feature = "join_order")]
+            stat1: AVec::new(),
             cfg,
             explicit_txn: false,
             #[cfg(feature = "v06")]
@@ -1547,6 +1558,10 @@ impl<S: Storage> Connection<S> {
             let (t, i) = crate::wr::layouts(&self.catalog, &self.catalog_arena);
             self.pager.wr.set_layout(t, i);
         }
+        // (Boxed: its cursor stays off the stack of every statement
+        // that reloads the schema.)
+        #[cfg(feature = "join_order")]
+        alloc::boxed::Box::pin(self.load_stat1()).await?;
         Ok(())
     }
 
@@ -4829,6 +4844,12 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
+        // v0.17 (`join_order`): a join the planner orders asks its
+        // virtual tables' xBestIndex once the order is known (below).
+        #[cfg(all(feature = "vtab", feature = "join_order"))]
+        let vt_deferred = join::join_eligible(sources.as_slice());
+        #[cfg(all(feature = "vtab", not(feature = "join_order")))]
+        let vt_deferred = false;
         // v0.16 (`vtab`): each virtual table's xBestIndex.
         #[cfg(feature = "vtab")]
         {
@@ -4839,7 +4860,11 @@ impl<S: Storage> Connection<S> {
                 }
                 _ => None,
             };
-            let consumed = self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, order)?;
+            let consumed = if vt_deferred {
+                false
+            } else {
+                self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, order)?
+            };
             // An fts5 table's ORDER BY rank (`orderByConsumed`): its
             // rows come in the pin's sorter order (leaf `fts5`).
             #[cfg(feature = "fts5")]
@@ -4886,7 +4911,8 @@ impl<S: Storage> Connection<S> {
             }
             group_by.push(r);
         }
-        let having = match &stmt.having {
+        #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+        let mut having = match &stmt.having {
             None => None,
             Some(e) => Some(self.resolve_term(
                 e,
@@ -5099,29 +5125,63 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(all(feature = "expr_index", not(feature = "window")))]
         let (keyed, info_limit) = (!merge_key.is_empty(), limit.as_ref());
-        #[cfg(feature = "expr_index")]
-        self.plan_accesses(
-            arena,
-            sources.as_mut_slice(),
-            cur.offsets.as_slice(),
-            cur.first_src,
-            (base_width, base_src),
-            &xindex::CoreInfo {
-                items: items.as_slice(),
-                filter: filter.as_ref(),
-                group_by: group_by.as_slice(),
-                having: having.as_ref(),
-                order_by: if keyed {
-                    merge_key.as_slice()
-                } else {
-                    order_by.as_slice()
-                },
+        // v0.17 (`join_order`): a join of tables in the pin's order
+        // (`session::join`), the core laid out in it.
+        #[cfg(feature = "join_order")]
+        let joined = !keyed
+            && self.plan_join(
+                arena,
+                &mut sources,
+                &mut cur,
+                (base_width, base_src),
+                &mut items,
+                &mut filter,
+                &mut group_by,
+                &mut having,
+                &mut order_by,
                 has_agg,
-                distinct: stmt.distinct,
-                limit: info_limit,
-                also_reads: order_by.as_slice(),
-            },
-        )?;
+                stmt.distinct,
+                info_limit,
+            )?;
+        #[cfg(not(feature = "join_order"))]
+        let joined = false;
+        // v0.17 (`join_order`): the deferred xBestIndex calls, in the
+        // join's order; then no JSON table-valued function may read a
+        // source after it.
+        #[cfg(all(feature = "vtab", feature = "join_order"))]
+        if vt_deferred {
+            self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, None)?;
+        }
+        #[cfg(all(feature = "json", feature = "join_order"))]
+        json_tvf::check_tvf_order::<S::Error>(sources.as_slice(), &cur)
+            .map_err(|_| Error::Unsupported)?;
+        #[cfg(feature = "expr_index")]
+        if !joined {
+            self.plan_accesses(
+                arena,
+                sources.as_mut_slice(),
+                cur.offsets.as_slice(),
+                cur.first_src,
+                (base_width, base_src),
+                &xindex::CoreInfo {
+                    items: items.as_slice(),
+                    filter: filter.as_ref(),
+                    group_by: group_by.as_slice(),
+                    having: having.as_ref(),
+                    order_by: if keyed {
+                        merge_key.as_slice()
+                    } else {
+                        order_by.as_slice()
+                    },
+                    has_agg,
+                    distinct: stmt.distinct,
+                    limit: info_limit,
+                    also_reads: order_by.as_slice(),
+                },
+            )?;
+        }
+        #[cfg(not(feature = "expr_index"))]
+        let _ = joined;
         // v0.16 (`json`, `vtab`): what a lateral `json_each` or
         // virtual table may drop from the rows it joins onto; and
         // (`vtab`) each virtual table's constraints (its xBestIndex).
@@ -11673,6 +11733,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 src_rows.push(rows);
                 continue;
             }
+            // v0.17 (`join_order`): an automatic index's rows, in its
+            // order (probed per combination in `join_step`).
+            #[cfg(feature = "join_order")]
+            if let Some(ai) = sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
+                src_rows.push(alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?);
+                continue;
+            }
             // v0.16 (`expr_index`): the rows an index finds, for
             // the enclosing row (a lateral path's rows are found per
             // combination, in `join_step`).
@@ -12676,27 +12743,23 @@ impl<'c, S: Storage> Statement<'c, S> {
         )? {
             return Ok(());
         }
-        let mut matched = right_match_flags(sources, src_rows);
-        self.join_step(
-            sources,
-            filter,
-            src_rows,
-            0,
-            outer.clone(),
-            &mut matched,
-            out,
-        )
-        .await?;
+        let mut st = JoinState {
+            matched: right_match_flags(sources, src_rows),
+            #[cfg(feature = "join_order")]
+            bloom: AVec::new(),
+        };
+        self.join_step(sources, filter, src_rows, 0, outer.clone(), &mut st, out)
+            .await?;
         for (i, (sp, rows)) in sources.iter().zip(src_rows.iter()).enumerate() {
             if !sp.kind.pads_left() {
                 continue;
             }
             for (ri, (vals, rowid)) in rows.iter().enumerate() {
-                if row_matched(&matched, i, ri) {
+                if row_matched(&st.matched, i, ri) {
                     continue;
                 }
                 let acc = left_padded(outer, sources, i, vals, *rowid);
-                self.join_step(sources, filter, src_rows, i + 1, acc, &mut matched, out)
+                self.join_step(sources, filter, src_rows, i + 1, acc, &mut st, out)
                     .await?;
             }
         }
@@ -12717,7 +12780,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         src_rows: &'x [AVec<(AVec<OwnedValue>, Option<i64>)>],
         idx: usize,
         acc: RowData,
-        matched: &'x mut AVec<AVec<bool>>,
+        st: &'x mut JoinState,
         out: &'x mut AVec<RowData>,
     ) -> JoinFuture<'x, S::Error> {
         alloc::boxed::Box::pin(async move {
@@ -12760,16 +12823,66 @@ impl<'c, S: Storage> Statement<'c, S> {
             } else {
                 rows
             };
+            // v0.17 (`join_order`): an automatic index — the span of
+            // the source's sorted rows this combination's key finds,
+            // after the Bloom filter.
+            #[cfg(feature = "join_order")]
+            let spanned;
+            #[cfg(feature = "join_order")]
+            let rows = match sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
+                Some(ai) => {
+                    let mut padded = acc.clone();
+                    pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
+                    spanned = self
+                        .auto_lookup(ai, rows, idx, &mut st.bloom, &padded)
+                        .await?;
+                    &spanned
+                }
+                None => rows,
+            };
             // v0.16 (`expr_index`): an index lookup on the sources
             // to the left — this combination's rows.
             #[cfg(feature = "expr_index")]
             let looked;
             #[cfg(feature = "expr_index")]
             let rows = match sp.access.as_deref() {
+                #[cfg(feature = "join_order")]
+                Some(a) if a.auto.is_some() => rows,
                 Some(a) if a.lateral => {
                     let mut padded = acc.clone();
                     pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
-                    looked = self.access_rows(sp, a, &padded).await?;
+                    // v0.17 (`join_order`): the Bloom filter first.
+                    #[cfg(feature = "join_order")]
+                    let pass = match &a.bloom {
+                        None => true,
+                        Some(keys) => {
+                            while st.bloom.len() <= idx {
+                                st.bloom.push(None);
+                            }
+                            if st.bloom.as_slice().get(idx).is_some_and(|b| b.is_none()) {
+                                let bits =
+                                    alloc::boxed::Box::pin(self.bloom_rows(sp, keys.as_slice()))
+                                        .await?;
+                                if let Some(slot) = st.bloom.as_mut_slice().get_mut(idx) {
+                                    *slot = Some(bits);
+                                }
+                            }
+                            let bits = st
+                                .bloom
+                                .as_slice()
+                                .get(idx)
+                                .and_then(|b| b.as_ref())
+                                .map_or(&[][..], |b| b.as_slice());
+                            alloc::boxed::Box::pin(self.bloom_pass(a, bits, &padded)).await?
+                        }
+                    };
+                    #[cfg(not(feature = "join_order"))]
+                    let pass = true;
+                    looked = if pass {
+                        self.access_rows(sp, a, &padded).await?
+                    } else {
+                        AVec::new()
+                    };
                     &looked
                 }
                 _ => rows,
@@ -12801,14 +12914,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 };
                 if on_ok {
                     any = true;
-                    mark_matched(matched, idx, ri);
+                    mark_matched(&mut st.matched, idx, ri);
                     self.join_step(
                         sources,
                         filter,
                         src_rows,
                         idx + 1,
                         acc2,
-                        &mut *matched,
+                        &mut *st,
                         &mut *out,
                     )
                     .await?;
@@ -12823,7 +12936,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     src_rows,
                     idx + 1,
                     acc2,
-                    &mut *matched,
+                    &mut *st,
                     &mut *out,
                 )
                 .await?;
@@ -14618,6 +14731,16 @@ fn dedup_produced(produced: AVec<Produced>, colls: &[crate::record::Coll]) -> AV
         }
     }
     kept
+}
+
+/// The nested-loop join's per-execution state (`join_step`): the
+/// RIGHT / FULL match flags and (v0.17, `join_order`) each automatic
+/// index's Bloom filter, built at its first probe.
+#[cfg(feature = "v06")]
+struct JoinState {
+    matched: AVec<AVec<bool>>,
+    #[cfg(feature = "join_order")]
+    bloom: AVec<Option<AVec<u8>>>,
 }
 
 /// Per-source "matched" flags for a join's RIGHT / FULL

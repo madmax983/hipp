@@ -430,6 +430,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         row: &RowData,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
         let mut out = AVec::new();
+        // An automatic index (v0.17, `join_order`), probed once: the
+        // executors keep its sorted rows instead (`session::join`).
+        #[cfg(feature = "join_order")]
+        if let Some(ai) = acc.auto.as_deref() {
+            let rows = alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?;
+            let mut none = AVec::new();
+            return alloc::boxed::Box::pin(self.auto_lookup(ai, &rows, 0, &mut none, row)).await;
+        }
         // The rowid B-tree walked over a range (v0.16 review fix):
         // its rows as the walk meets them, not re-sought by rowid.
         if acc.root == 0 && acc.eq.is_empty() {
@@ -879,7 +887,7 @@ pub(super) struct CoreInfo<'x> {
 }
 
 /// Whether any expression of the core reads column slot `slot`.
-fn core_reads(info: &CoreInfo<'_>, sources: &[SourcePlan], slot: usize) -> bool {
+pub(super) fn core_reads(info: &CoreInfo<'_>, sources: &[SourcePlan], slot: usize) -> bool {
     let r = crate::query::RefRange {
         w: (slot, slot.saturating_add(1)),
         s: (0, 0),
@@ -1021,6 +1029,8 @@ impl<S: Storage> Connection<S> {
                 suffix,
                 covers_all,
                 suffix_covers: !auto,
+                #[cfg(feature = "join_order")]
+                est: self.index_stat(t, ix),
             });
         }
         (width, out)
@@ -1040,14 +1050,43 @@ impl<S: Storage> Connection<S> {
         outer: (usize, usize),
         info: &CoreInfo<'_>,
     ) -> Result<(), S::Error> {
-        use crate::query::{RefRange, expr_refs_range};
-        use crate::xplan::{Query, Src, Table, choose, conjuncts, log_est, terms};
+        use crate::xplan::conjuncts;
+        self.hint_checks(arena, sources, offsets, first_src, info.filter)?;
         let mut wconj: AVec<&RExpr> = AVec::new();
         if let Some(f) = info.filter {
             conjuncts(f, &mut wconj);
         }
-        // `INDEXED BY` a partial index the WHERE (and the source's
-        // ON) does not imply: the pin's "no query solution".
+        // RIGHT / FULL joins emit each right row's no-match: every
+        // source keeps its whole table.
+        if sources.iter().any(|s| s.kind.pads_left()) {
+            return Ok(());
+        }
+        self.plan_accesses_from(
+            arena,
+            sources,
+            offsets,
+            first_src,
+            outer,
+            info,
+            wconj.as_slice(),
+        )
+    }
+
+    /// `INDEXED BY` a partial index the WHERE (and the source's ON)
+    /// does not imply: the pin's "no query solution" (v0.16).
+    pub(super) fn hint_checks(
+        &self,
+        arena: &Arena,
+        sources: &[SourcePlan],
+        offsets: &[usize],
+        first_src: usize,
+        filter: Option<&RExpr>,
+    ) -> Result<(), S::Error> {
+        use crate::xplan::{Src, conjuncts};
+        let mut wconj: AVec<&RExpr> = AVec::new();
+        if let Some(f) = filter {
+            conjuncts(f, &mut wconj);
+        }
         for (i, sp) in sources.iter().enumerate() {
             if sp.hint == crate::query::Hint::Any || sp.temp {
                 continue;
@@ -1067,7 +1106,7 @@ impl<S: Storage> Connection<S> {
             let mut conj: AVec<&RExpr> = AVec::new();
             if i == 0 || !sp.kind.pads_right() {
                 conj.extend_from_slice(wconj.as_slice());
-            } else if info.filter.is_some_and(|f| s.null_rejects(f)) {
+            } else if filter.is_some_and(|f| s.null_rejects(f)) {
                 // A WHERE term no NULL-extended row passes makes the
                 // LEFT JOIN an inner join, as the pin simplifies it
                 // (v0.16 review fix: "no query solution").
@@ -1078,11 +1117,24 @@ impl<S: Storage> Connection<S> {
             }
             self.hint_solvable(arena, t, sp.hint, &s, conj.as_slice())?;
         }
-        // RIGHT / FULL joins emit each right row's no-match: every
-        // source keeps its whole table.
-        if sources.iter().any(|s| s.kind.pads_left()) {
-            return Ok(());
-        }
+        Ok(())
+    }
+
+    /// `plan_accesses` past its checks: each table source's own best
+    /// loop, in FROM order.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_accesses_from(
+        &self,
+        arena: &Arena,
+        sources: &mut [SourcePlan],
+        offsets: &[usize],
+        first_src: usize,
+        outer: (usize, usize),
+        info: &CoreInfo<'_>,
+        wconj: &[&RExpr],
+    ) -> Result<(), S::Error> {
+        use crate::query::{RefRange, expr_refs_range};
+        use crate::xplan::{Query, Src, Table, choose, conjuncts, log_est, terms};
         let n = sources.len();
         let core_end = match (offsets.last(), sources.last()) {
             (Some(o), Some(s)) => o + s.ncols,
@@ -1113,7 +1165,7 @@ impl<S: Storage> Connection<S> {
             };
             let mut conj: AVec<&RExpr> = AVec::new();
             if i == 0 || !sp.kind.pads_right() {
-                conj.extend_from_slice(wconj.as_slice());
+                conj.extend_from_slice(wconj);
             }
             if let Some(on) = &sp.on {
                 conjuncts(on, &mut conj);
@@ -1210,6 +1262,8 @@ impl<S: Storage> Connection<S> {
                 distinct: info.distinct,
                 #[cfg(feature = "explain")]
                 dset: dset.as_slice(),
+                #[cfg(feature = "join_order")]
+                jm: None,
             };
             let (width, models) = self.table_models(arena, t, &s);
             let notnull = self.not_null_cols(t);
@@ -1219,6 +1273,8 @@ impl<S: Storage> Connection<S> {
                 wr: !t.has_rowid(),
                 hint: sp.hint,
                 notnull: notnull.as_slice(),
+                #[cfg(feature = "join_order")]
+                rows: self.table_rows(t),
             };
             let chosen = choose(&q, &s, &tab, ts.as_slice());
             #[cfg(feature = "explain")]
@@ -1269,7 +1325,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Per column of `t`: never NULL (`xplan::Table::notnull`).
-    fn not_null_cols(&self, t: &crate::schema::TableDef) -> AVec<bool> {
+    pub(super) fn not_null_cols(&self, t: &crate::schema::TableDef) -> AVec<bool> {
         #[cfg(feature = "without_rowid")]
         let ca = &self.catalog_arena;
         #[cfg(feature = "without_rowid")]
@@ -1495,6 +1551,8 @@ impl<S: Storage> Connection<S> {
             distinct: false,
             #[cfg(feature = "explain")]
             dset: &[],
+            #[cfg(feature = "join_order")]
+            jm: None,
         };
         let (width, models) = self.table_models(arena, t, &s);
         let notnull = self.not_null_cols(t);
@@ -1504,6 +1562,8 @@ impl<S: Storage> Connection<S> {
             wr: !t.has_rowid(),
             hint,
             notnull: notnull.as_slice(),
+            #[cfg(feature = "join_order")]
+            rows: self.table_rows(t),
         };
         let Some(mut acc) = choose(&q, &s, &tab, ts.as_slice()) else {
             return Ok(None);

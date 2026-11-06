@@ -15,7 +15,7 @@ default = ["std", "xl"]
 # `max`'s 1 MiB budget (ADR 0003 closed it to leaves that do not
 # fit). Std builds (the CLI, the differential tests) use it; CI
 # ratchets its size separately (budget 1.25 MiB).
-xl = ["max", "fts5_delete"]
+xl = ["max", "fts5_delete", "join_order"]
 # Everything (ADR 0002): `full` plus the heavyweight v0.16 leaves
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
@@ -396,6 +396,26 @@ fts5 = ["vtab", "without_rowid", "math"]
 # pin's no-op (`src/fts5/sdel.rs`, `session::fts5`). Without it those
 # writes are refused as before. Implies `fts5`.
 fts5_delete = ["fts5"]
+
+# v0.17 leaf (ADR 0004: past `max`, in `xl`): the pin's join planner
+# for queries over several tables -- where.c's wherePathSolver (the
+# N-best path search, mxChoice by join size and the star-query
+# heuristic, sorting costs for ORDER BY / GROUP BY / DISTINCT, the
+# interstage heuristic), per-loop costs with prerequisites
+# (whereLoopAddBtree / whereLoopAddBtreeIndex / whereLoopOutputAdjust),
+# the CROSS / LEFT JOIN ordering constraints and LEFT-to-inner
+# simplification, and automatic indexes (constructAutomaticIndex:
+# an ephemeral covering index built once per statement, partial when
+# the WHERE constrains the table alone, with the pin's Bloom filter),
+# plus the sqlite_stat1 row estimates read back at schema load and
+# after ANALYZE (`src/xjoin.rs`, `session::join`). Virtual tables and
+# JSON table-valued functions join the order by their xBestIndex
+# costs, so a MATCH or a table-valued argument may read a table
+# listed later in FROM. The executor runs the sources in the chosen
+# order and EXPLAIN QUERY PLAN prints it. Without it joins run in
+# FROM order, each source with its own best loop. Builds on the
+# `expr_index` access planner, so it implies `v16` and `expr_index`.
+join_order = ["v16", "expr_index"]
 
 # v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): EXPLAIN QUERY
 # PLAN -- `EXPLAIN QUERY PLAN <statement>` returns the pin's four

@@ -474,11 +474,11 @@ fn budgeted_run(stack: usize, cfg: fn() -> Config) {
     }
 }
 
-/// The small thread: 512 KiB in a debug build (hipp's own call path
-/// needs about 384 KiB there before any nesting), 256 KiB in a
-/// release build.
+/// The small thread: 640 KiB in a debug build (hipp's own call path
+/// needs about 512 KiB there before any nesting: `STACK_BASE`,
+/// re-measured in v0.17), 256 KiB in a release build.
 const SMALL_STACK: usize = if cfg!(debug_assertions) {
-    512 * 1024
+    640 * 1024
 } else {
     256 * 1024
 };

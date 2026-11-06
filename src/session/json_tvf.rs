@@ -143,6 +143,7 @@ impl<S: Storage> Connection<S> {
             + cur.sources.as_slice().last().map_or(0, |s| s.columns.len());
         let first = cur.offsets.as_slice().first().copied().unwrap_or(end);
         let here = cur.offsets.as_slice().get(i).copied().unwrap_or(end);
+        #[cfg(not(feature = "join_order"))]
         let later = RefRange {
             w: (here, end),
             s: (cur.first_src + i, cur.first_src + n),
@@ -153,12 +154,36 @@ impl<S: Storage> Connection<S> {
         };
         let mut row = AVec::new();
         let mut lateral = false;
+        // v0.17 (`join_order`): an argument may read a source after
+        // it, which the join planner then runs first (the pin's
+        // reordering; `check_tvf_order` refuses what stays after).
+        #[cfg(feature = "join_order")]
+        let (later, after) = (
+            RefRange {
+                w: (
+                    here,
+                    cur.offsets.as_slice().get(i + 1).copied().unwrap_or(end),
+                ),
+                s: (cur.first_src + i, cur.first_src + i + 1),
+            },
+            RefRange {
+                w: (
+                    cur.offsets.as_slice().get(i + 1).copied().unwrap_or(end),
+                    end,
+                ),
+                s: (cur.first_src + i + 1, cur.first_src + n),
+            },
+        );
         for a in s.args.iter().flat_map(|a| a.iter()) {
             let r = resolve_scoped::<S::Error>(a, arena, cur, enclosing, &mut *planner)?;
             if has_agg(&r) || expr_refs_range(&r, &later) {
                 return Err(Error::Unsupported);
             }
             lateral |= expr_refs_range(&r, &left);
+            #[cfg(feature = "join_order")]
+            {
+                lateral |= expr_refs_range(&r, &after);
+            }
             row.push(r);
         }
         // A lateral call on the right of a RIGHT / FULL join would
@@ -175,6 +200,46 @@ impl<S: Storage> Connection<S> {
         }
         Ok(())
     }
+}
+
+/// Refuse a JSON table-valued source whose arguments read a source
+/// after it (v0.17, `join_order`: the join planner puts the sources
+/// they read first; where it did not — a RIGHT / FULL join, a source
+/// it does not order — the call cannot run).
+#[cfg(all(feature = "join_order", feature = "json"))]
+pub(super) fn check_tvf_order<E>(
+    sources: &[SourcePlan],
+    cur: &crate::query::ScopeGroup,
+) -> Result<(), Error<E>>
+where
+    Error<E>: Sized,
+{
+    use crate::query::{RefRange, expr_refs_range};
+    let n = sources.len();
+    let end =
+        cur.offsets.as_slice().last().copied().unwrap_or(0) + sources.last().map_or(0, |s| s.ncols);
+    for (i, sp) in sources.iter().enumerate() {
+        #[cfg(feature = "vtab")]
+        if sp.tvf & crate::query::TVF_VTAB != 0 || sp.vt.is_some() {
+            continue;
+        }
+        if sp.tvf == 0 {
+            continue;
+        }
+        let here = cur.offsets.as_slice().get(i).copied().unwrap_or(end);
+        let later = RefRange {
+            w: (here, end),
+            s: (cur.first_src + i, cur.first_src + n),
+        };
+        let args = sp
+            .derived
+            .as_deref()
+            .and_then(|d| d.values.as_slice().first());
+        if args.is_some_and(|r| r.iter().any(|a| expr_refs_range(a, &later))) {
+            return Err(Error::Unsupported);
+        }
+    }
+    Ok(())
 }
 
 /// Fill each lateral JSON table-valued source's `tvf_dead`

@@ -1220,6 +1220,10 @@ impl<S: Storage> Statement<'_, S> {
             encode_record(vals.as_slice(), &mut rec);
             btree::btree_insert(&mut self.conn.pager, root, next, rec.as_slice()).await?;
         }
+        // v0.17 (`join_order`): the planner reads the new statistics,
+        // as the pin's `sqlite3AnalysisLoad` after ANALYZE.
+        #[cfg(feature = "join_order")]
+        alloc::boxed::Box::pin(self.conn.load_stat1_from(Some(root))).await?;
         Ok(())
     }
 

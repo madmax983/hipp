@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 506,432 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,045,676 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,055,028 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 506,480 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,045,804 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,103,060 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -53,7 +53,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `autovacuum`, `vtab` (virtual tables, generate_series, dbstat),
   `rtree`, `fts5`, `explain` (EXPLAIN QUERY PLAN).
 - **`xl`** adds the leaves past `max`'s budget (ADR 0004):
-  `fts5_delete` (FTS5 tombstones and secure-delete).
+  `fts5_delete` (FTS5 tombstones and secure-delete), `join_order`
+  (the pin's join order, automatic indexes, Bloom filters,
+  `sqlite_stat1`).
 
 ## What v0.17 does
 
@@ -93,6 +95,21 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   each engine's integrity-check passes on the other's files.
   Without the leaf those writes are refused as in 0.16
   (`src/fts5/sdel.rs`).
+- **Join ordering and automatic indexes** (leaf `join_order`, in
+  `xl`). A join of two or more tables, virtual tables or JSON
+  table-valued functions is planned as the pin's `where.c` plans it:
+  per-loop costs with prerequisites, the N-best path solver with
+  ORDER BY / GROUP BY / DISTINCT sorting costs, the LEFT / CROSS JOIN
+  ordering rules, automatic indexes (built once per statement,
+  PARTIAL where a term reads the table alone) behind a Bloom filter,
+  Bloom filters on lookups when `sqlite_stat1` says they pay, and
+  the statistics ANALYZE writes read back. Rows without ORDER BY come
+  in the pin's order, EXPLAIN QUERY PLAN prints the pin's loops, and
+  `FROM f, m WHERE f MATCH m.q` or `FROM json_each(t.j), t` run
+  instead of being refused; an automatic index turns a 2,000 x 2,000
+  equi-join from 4 million comparisons into 2,000 probes. Without the
+  leaf joins run in FROM order as in 0.16 (`src/xjoin.rs`,
+  `src/session/join.rs`).
 
 ## What v0.16 does
 
@@ -991,7 +1008,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   UPDATE / DELETE / INSERT plans — and the CLI prints the shell's
   tree. The statement is planned, never run; plain EXPLAIN (bytecode)
   is refused. Where hipp's strategy differs (no flattening, join
-  reordering, automatic indexes, MULTI-INDEX OR, min/max lookup) it
+  reordering and automatic indexes before v0.17's `join_order`,
+  MULTI-INDEX OR, min/max lookup) it
   prints what it runs (STATUS.md). Comparing plans fixed access-path
   choices that ordered rows unlike the pin (window functions,
   compound members, GROUP BY / DISTINCT over a permuted index, rowid
@@ -1288,7 +1306,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,432 B of 512 KiB, `max` 1,045,676 B of 1 MiB, `xl` 1,055,028 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,480 B of 512 KiB, `max` 1,045,804 B of 1 MiB, `xl` 1,103,060 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -1323,9 +1341,10 @@ UPDATE / DELETE or views.
 Not planned in any profile: multi-process locking or a shared `-shm`
 wal-index (WAL is single-process; one connection per database); a
 shared page cache (a file is attached once); plain EXPLAIN's
-bytecode listing (hipp has no VDBE); query flattening, join
-reordering, automatic indexes, Bloom filters or MULTI-INDEX OR in
-the planner (EXPLAIN QUERY PLAN shows hipp's own plan); loadable
+bytecode listing (hipp has no VDBE); query flattening or MULTI-INDEX
+OR in the planner (EXPLAIN QUERY PLAN shows hipp's own plan; join
+reordering, automatic indexes and Bloom filters arrived in v0.17 with
+the `join_order` leaf); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.

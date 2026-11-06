@@ -5,6 +5,28 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Join ordering and automatic indexes (leaf `join_order`, in `xl`)
+
+- Joins of tables, virtual tables and JSON table-valued functions are
+  planned as the pin's `where.c` plans them (loop costs with
+  prerequisites, the N-best path solver, sorting costs, LEFT / CROSS
+  JOIN constraints, LEFT JOIN simplification, constant propagation):
+  rows without ORDER BY come in the pin's order and EXPLAIN QUERY
+  PLAN prints the pin's loops.
+- Automatic indexes (PARTIAL when a term reads the table alone),
+  built once per statement, and Bloom filters, built and consulted:
+  before every automatic index and, with `sqlite_stat1`, before
+  lookups that run more often than their table has rows.
+- `sqlite_stat1` is read back at schema load and after ANALYZE.
+- `FROM t, m WHERE t MATCH m.q`, `FROM generate_series(1, t.n), t` and
+  `FROM json_each(t.j), t` run (they were refused).
+- Fixed (ungated): the commuted copy of a join term kept the wrong
+  collation, so a lookup through an index on the other column could
+  lose rows under a NOCASE comparison; `,` in FROM is a plain inner
+  join, not a CROSS JOIN.
+- Tests: `tests/join_order_v17.rs`, `hipp-cli/tests/cli_v17_join_order.rs`.
+  Size: xl +48,032 B (1,103,060 B); max +128 B; full +48 B; tiny 0.
+
 ### FTS5 delete writes (leaf `fts5_delete`, in `xl`)
 
 - `contentless_delete=1` tables: DELETE, UPDATE (every indexed

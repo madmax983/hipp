@@ -57,6 +57,8 @@ pub mod wal;
 pub mod window;
 #[cfg(feature = "without_rowid")]
 pub mod wr;
+#[cfg(feature = "join_order")]
+pub mod xjoin;
 #[cfg(feature = "expr_index")]
 pub mod xplan;
 
