@@ -1202,6 +1202,47 @@ impl<S: Storage> Connection<S> {
                 order.push((e.clone(), unsorted(e)));
             }
         }
+        // The pin's min() / max() optimisation (v0.17, `multi_index`):
+        // the join reads the argument's order.
+        #[cfg(feature = "multi_index")]
+        let mm = has_agg && having.is_none() && {
+            let nullable = |e: &RExpr| match crate::xplan::strip(e) {
+                RExpr::Column(slot, ..) => !(0..n).any(|i| {
+                    let base = offsets.as_slice().get(i).copied().unwrap_or(0);
+                    let sp = sources.as_slice().get(i);
+                    let nc = sp.map_or(0, |s| s.ncols);
+                    *slot >= base
+                        && *slot < base + nc
+                        && !can_null.as_slice().get(i).copied().unwrap_or(true)
+                        && (sp.is_some_and(|s| s.rowid_alias == Some(*slot - base))
+                            || tabs.as_slice().get(i).copied().flatten().is_some_and(|t| {
+                                self.not_null_cols(t)
+                                    .as_slice()
+                                    .get(*slot - base)
+                                    .copied()
+                                    .unwrap_or(false)
+                            }))
+                }),
+                RExpr::Rowid(x) => x
+                    .checked_sub(first_src)
+                    .is_none_or(|i| can_null.as_slice().get(i).copied().unwrap_or(true)),
+                RExpr::Literal(v) => matches!(v, OwnedValue::Null),
+                _ => true,
+            };
+            match crate::xmulti::minmax(
+                items.as_slice(),
+                order_by.as_slice(),
+                !group_by.is_empty(),
+                &nullable,
+            ) {
+                Some((arg, o)) => {
+                    order.clear();
+                    order.push((arg.clone(), o));
+                    true
+                }
+                None => false,
+            }
+        };
         let mut omask: AVec<u64> = AVec::new();
         let mut oconst: AVec<bool> = AVec::new();
         for (e, _) in order.iter() {
@@ -1321,6 +1362,8 @@ impl<S: Storage> Connection<S> {
                     root: 0,
                     stat: false,
                     vt: Some(vl),
+                    #[cfg(feature = "multi_index")]
+                    ors: AVec::new(),
                 });
                 continue;
             };
@@ -1343,6 +1386,15 @@ impl<S: Storage> Connection<S> {
                 } else {
                     owner.is_none()
                 };
+                // (No IN term for an OR the pin does not rewrite: v0.17,
+                // `multi_index`.)
+                #[cfg(feature = "multi_index")]
+                let ok = ok
+                    && (!crate::xmulti::or_in_term(t, conj.as_slice())
+                        || conj
+                            .as_slice()
+                            .get(t.parent)
+                            .is_some_and(|c| crate::xmulti::in_kept(t, c, srcs_s.as_slice())));
                 if ok {
                     ts.push(t.clone());
                 }
@@ -1368,6 +1420,28 @@ impl<S: Storage> Connection<S> {
                 tmask.push(term_mask(t, bands.as_slice()));
             }
             direct.push((ts.clone(), tmask.clone()));
+            // Its OR terms (v0.17, `multi_index`), owned as its terms
+            // are.
+            #[cfg(feature = "multi_index")]
+            let ors = {
+                let ok = |ci: usize| {
+                    let owner = on_of.as_slice().get(ci).copied().flatten();
+                    if left {
+                        owner == Some(i)
+                    } else {
+                        owner.is_none()
+                    }
+                };
+                crate::xmulti::or_infos(
+                    conj.as_slice(),
+                    truth.as_slice(),
+                    &s,
+                    &ok,
+                    &avail,
+                    &|e: &RExpr| src_mask(e, bands.as_slice()),
+                    &|t: &Term| term_mask(t, bands.as_slice()),
+                )
+            };
             let mut used: AVec<bool> = AVec::new();
             let mut affs: AVec<crate::record::Affinity> = AVec::new();
             let mut good: AVec<bool> = AVec::new();
@@ -1407,6 +1481,8 @@ impl<S: Storage> Connection<S> {
                 root: sp.root,
                 stat: self.table_has_stat(t),
                 vt: None,
+                #[cfg(feature = "multi_index")]
+                ors,
             });
         }
         if jsrcs.len() != n {
@@ -1543,7 +1619,68 @@ impl<S: Storage> Connection<S> {
                 continue;
             };
             let reverse = plan.rev & (1u64 << pos) != 0;
-            let mut acc = if jl.auto {
+            // A MULTI-INDEX OR loop (v0.17, `multi_index`): each branch
+            // planned on the table alone, the sources before it given.
+            #[cfg(feature = "multi_index")]
+            let or_acc = jl.l.or.and_then(|k| js.ors.as_slice().get(k)).map(|info| {
+                let me = 1u64 << i;
+                let me_band = bands.as_slice().get(i).copied().unwrap_or(RefRange {
+                    w: (0, 0),
+                    s: (0, 0),
+                });
+                let avail = |e: &RExpr| -> Option<bool> {
+                    if expr_refs_range(e, &me_band) || nondet(e) {
+                        return None;
+                    }
+                    let m = src_mask(e, bands.as_slice());
+                    if m & !ready != 0 {
+                        return None;
+                    }
+                    Some(m != 0)
+                };
+                let w_ok = |ci: usize| {
+                    let owner = on_of.as_slice().get(ci).copied().flatten();
+                    let own = if js.left {
+                        owner == Some(i)
+                    } else {
+                        owner.is_none()
+                    };
+                    own && cmask.as_slice().get(ci).copied().unwrap_or(0) & !(ready | me) == 0
+                };
+                let mut needed: AVec<bool> = AVec::new();
+                for u in js.used.iter() {
+                    needed.push(*u);
+                }
+                let q = crate::xplan::Query {
+                    conj: conj.as_slice(),
+                    truth: truth.as_slice(),
+                    order: &[],
+                    group: false,
+                    group_by: false,
+                    ncols_out: items.len(),
+                    needed: Some(needed.as_slice()),
+                    cover_scan: true,
+                    limit: None,
+                    distinct: false,
+                    #[cfg(feature = "explain")]
+                    dset: &[],
+                    jm: None,
+                };
+                let o = crate::xmulti::or_access(&q, &js.s, &js.tab, info, &avail, &w_ok);
+                let lateral = o.subs.iter().any(|b| {
+                    b.acc.as_ref().is_some_and(|a| a.lateral)
+                        || src_mask(&b.cond, bands.as_slice()) & !me != 0
+                });
+                let mut a = crate::xplan::lower(&js.s, &js.tab, &[], &jl.l, false);
+                a.lateral = lateral;
+                a.or = Some(Box::new(o));
+                a
+            });
+            #[cfg(not(feature = "multi_index"))]
+            let or_acc: Option<crate::xplan::IdxAccess> = None;
+            let mut acc = if let Some(a) = or_acc {
+                Some(a)
+            } else if jl.auto {
                 let ai = crate::xjoin::auto_index(js, &jq, i, ready);
                 let lateral = ai
                     .keys
@@ -1563,6 +1700,10 @@ impl<S: Storage> Connection<S> {
                         sorted: 0,
                         reverse: false,
                         bignull: None,
+                        #[cfg(feature = "multi_index")]
+                        or: None,
+                        #[cfg(feature = "multi_index")]
+                        skip: 0,
                     },
                     false,
                 );
@@ -1837,6 +1978,14 @@ impl<S: Storage> Connection<S> {
             sp.eqp.natural = plan.ob_sat;
             sp.eqp.nat_distinct = plan.distinct_ordered;
             sp.eqp.joined = true;
+        }
+        #[cfg(all(feature = "multi_index", not(feature = "explain")))]
+        let _ = mm;
+        #[cfg(all(feature = "multi_index", feature = "explain"))]
+        if mm {
+            for sp in sources.as_mut_slice() {
+                sp.eqp.minmax = 1 + u8::from(plan.ob_sat >= 1);
+            }
         }
         #[cfg(feature = "explain")]
         for (q, at) in plan.bloom_at.iter().enumerate() {
@@ -2169,7 +2318,7 @@ impl<S: Storage> Connection<S> {
 
     /// Index `ix`'s `aiRowLogEst` when `sqlite_stat1` gave it
     /// (`hasStat1`).
-    fn stat_est(
+    pub(super) fn stat_est(
         &self,
         _t: &crate::schema::TableDef,
         ix: &crate::schema::IndexDef,

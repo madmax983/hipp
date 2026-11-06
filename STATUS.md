@@ -682,12 +682,17 @@ planner is its largest single component, and the leaf sits in `xl`,
   several automatic indexes and CROSS / LEFT constraints in 5- and
   6-way joins; the IN early-out / seek-scan rules of
   `whereLoopAddBtreeIndex` with statistics (`x IN (...)` on an index
-  continued by the rowid); indexes containing the INTEGER PRIMARY
-  KEY column; a WITHOUT ROWID PRIMARY KEY's BETWEEN printing only its
-  lower bound (a v0.16 single-table class); transitive equivalences
+  continued by the rowid; closed in v0.17 by `multi_index`: the
+  statistics rule); indexes containing the INTEGER PRIMARY
+  KEY column (closed in v0.17: probed matching with `multi_index`'s
+  single-table insertion); a WITHOUT ROWID PRIMARY KEY's BETWEEN
+  printing only its lower bound (a v0.16 single-table class; closed
+  in v0.17: both bounds print — a secondary index's PRIMARY KEY
+  suffix range is still not probed); transitive equivalences
   through a LEFT JOIN the WHERE made inner. Rows differ in order in
   0.75% of queries (the same plans), never in content.
-- Not modelled: the MULTI-INDEX OR of b-tree tables, skip-scans,
+- Not modelled: the MULTI-INDEX OR of b-tree tables, skip-scans
+  (both closed in v0.17 by `multi_index`),
   `sqlite_stat4`, LIKE-length estimates (likelihood() estimates:
   closed by the review fixes below), the
   EXISTS-to-join rewrite, the ordered-inner-loop `ORDER BY ... LIMIT`
@@ -840,11 +845,195 @@ Ratchets `[full]` 506,672, `[max]` 1,046,892, `[xl]` 1,114,356.
   as its prefix on the same index is not preferred
   (`whereLoopAdjustCost` is modelled for joins only): `WHERE b = 2
   AND c = 1` over an index on `(b, c)` prints `(b=?)` (v0.16 class,
-  found while probing; the rows are the same).
+  found while probing; the rows are the same). (Closed in v0.17 by
+  `multi_index`: one table's loops pass through `whereLoopInsert`.)
 - An expression-covered index still reads the table row (the pin reads
   the expression's value from the index entry).
 - `sqlite_stat1`'s `sz=N` / `unordered` / `noskipscan` options are
   not read.
+
+### Index strategies: MULTI-INDEX OR, min() / max(), skip-scans, IN with statistics (2026-11-06)
+
+**Status:** implemented, differential-tested against the live 3.54.1
+pin, gated: new leaf `multi_index` (requires `join_order`: it adds
+loops to the join planner's model). Placement (ADR 0004): `max` +
+the leaf needs `join_order` too, far past `max`'s 1,048,576 B, so the
+leaf joins `xl` (`xl = ["max", "fts5_delete", "join_order",
+"multi_index"]`); its own `v16,indexes,expr_index,join_order,multi_index`
+line in `ci/feature-sets.txt`. Without the leaf the plans are 0.16's
+(and `join_order`'s).
+
+**Shipped** (`src/xmulti.rs`; hooks in `xplan`, `xjoin`,
+`session::{xindex, join, eqp}`):
+
+- **MULTI-INDEX OR** (`whereLoopAddOr`, `WHERE_MULTI_OR`). An OR term
+  (not one the pin rewrites to IN as its only plan; see below) whose
+  every branch — a comparison, `IN`, `IS NULL`, or an AND group — has
+  a loop using a term on the source is a loop of its own: per branch
+  the `(prereq, rRun, nOut)` of its loops (`whereOrInsert`, three per
+  prerequisite set; adjusted against the source's loops already
+  listed, `whereLoopAdjustCost`; the branch may use the WHERE clause's
+  own terms, `whereScanNext` reading `pOuter`), summed over the
+  branches, `rRun + 1`; it competes in `whereLoopInsert` and the path
+  solver like any loop (no index order: `wherePathSatisfiesOrderBy`
+  returns 0 at it). When chosen, each branch is planned again on the
+  table alone with the WHERE's pushed terms (`pAndExpr`: indexable,
+  no subquery; in a join, only the sources already joined) and read
+  in turn; a row is returned at the first branch whose condition it
+  satisfies (what the pin's RowSet test leaves), so the rows are the
+  pin's, in its order, each once. Branches are taken in the OR
+  clause's term order: written branches `INDEX 1..n`, then the
+  commuted copies of column-to-column comparisons, last first
+  (`INDEX n+1` is the copy of the last branch). A WITHOUT ROWID
+  table's branches never cover (the pin reads the row by its key).
+  One table, a join loop (prerequisites from the branches' probes,
+  lateral when a branch reads an earlier source), LEFT JOIN (`LEFT-JOIN`
+  on each branch's loop), and UPDATE / DELETE (the rowids collected,
+  sorted, deduplicated; never one-pass). EXPLAIN QUERY PLAN prints
+  `MULTI-INDEX OR`, `INDEX n`, each branch's IN-probe and condition
+  subqueries, then its loop.
+- **OR-to-IN as the pin decides it** (`exprAnalyzeOrTerm` case 1): the
+  first branch's left column, then the first term on another table
+  (the commuted copies), every branch `K = value`, values with no
+  other affinity than K's. As probed, the rewrite no longer hides the
+  OR from the MULTI-INDEX OR: the IN loop and the OR loop compete on
+  cost (`t.a = u.x OR t.a = u.y` with `t.a` unindexed reads `u`
+  through a MULTI-INDEX OR); an IN hipp made that the pin does not is
+  dropped. **whereCombineDisjuncts**: a two-branch OR's comparisons
+  of one column with one value combine (`x < 5 OR x = 5` is also the
+  virtual term `x <= 5`).
+- **min() / max()** (`minMaxQuery`, `WHERE_ORDERBY_MIN` / `_MAX`): a
+  core without GROUP BY / HAVING whose one aggregate call (repeats
+  count once) is `min(x)` / `max(x)` without FILTER (DISTINCT and an
+  aggregate ORDER BY allowed) is planned for `x` (min: NULLs last when
+  `x` can be NULL, the pin's `KEYINFO_ORDER_BIGNULL`; max: `x DESC`),
+  one table or a join. When the loop delivers that order with no IN
+  on it — an index, the rowid, a reverse scan, or the table's own
+  order with `x` held constant (`WHERE x IS NULL`) — the statement
+  reads only the first row of the loop that passes the WHERE
+  (`sqlite3WhereMinMaxOptEarlyOut`): the bare columns are that row's
+  (all-NULL arguments included: min's second pass, max's first row).
+  EXPLAIN QUERY PLAN prints `SEARCH` for every loop (`SEARCH t`,
+  `SEARCH w USING PRIMARY KEY`), and no `f(DISTINCT)` / `f(ORDER BY)`
+  sorter when the order is delivered.
+- **Skip-scans** (end of `whereLoopAddBtreeIndex`): with
+  `sqlite_stat1` rows (`hasStat1`), an index whose leading column(s)
+  have no term and repeat 18 or more times per value (LogEst 42) is
+  probed per distinct value (`nIter + 5` more iterations), `ANY(a) AND
+  b=?`, ranges after it too; read in key order (hipp finds the
+  distinct values with one walk of the index).
+- **The IN operator with statistics**: an IN whose `K` values cost
+  more than scanning the `M` rows the columns before it match
+  (`M + logK + 10 < nIn + logN`) is a filter unless it is the loop's
+  first IN (the pin's seek-scan).
+- **whereLoopInsert / whereLoopAdjustCost for one table**: a single
+  table's loops (a WITHOUT ROWID table's after the 0.16
+  `insert_loops` pass) go through the join planner's insertion, so a
+  loop with more equality columns than its equally costed prefix wins
+  (`WHERE b = 2 AND c = 1` over an index on `(b, c)` prints `(b=? AND
+  c=?)`), and the IN iterations of earlier columns are charged at
+  every deeper level (`rRun += nInMul`) as for a join.
+- EXPLAIN QUERY PLAN fixes (ungated, `explain`): an uncorrelated IN
+  subquery evaluated as a filter (not an index probe) shows `CREATE
+  BLOOM FILTER` after its loops; `SELECT DISTINCT count(*) ...` (an
+  aggregate without GROUP BY) shows `USE TEMP B-TREE FOR DISTINCT`.
+  With `join_order`: a join's WHERE subqueries are shown after the
+  loop that makes their term computable (the pin codes them there).
+- **Fixed** (ungated, `expr_index`): the OR-to-IN rewrite ignored the
+  values' affinity, so `x.c0 = y.c1 OR x.c0 = y.c2` (a TEXT key, a
+  REAL value) probed the key with REAL values and lost rows (55 rows
+  on the pin, 26 in hipp, found by the generated corpus); the pin's
+  `okToChngToIN` affinity check now applies. A row-value comparison
+  `(a, b) > (1, 1)` (hipp's lexicographic OR expansion) is wrapped in
+  a double NOT under the leaf so it is not taken for an OR of branches
+  (a MULTI-INDEX OR there returned the pin's rows in another order).
+
+**Probing notes (live pin):** the MULTI-INDEX OR is costed with the
+WHERE's other terms visible to each branch (`a=1 OR c0>4` beside `c2
+IN (6,8,'x')` runs `(c2=? AND rowid>?)` in branch 2, and beats the IN
+loop with 3 values but not with 2); a WITHOUT ROWID table's branches
+print no COVERING; LEFT JOIN branches end in ` LEFT-JOIN`, the
+`MULTI-INDEX OR` line does not; an OR rewritten to IN still drives a
+MULTI-INDEX OR (`t.b = u.x OR t.b = u.y` with `t.b` indexed reads `t`
+by IN, with `t.b` unindexed reads `u` by OR: `INDEX 3` / `INDEX 4`);
+min() / max() needs no index to print `SEARCH t`; `max(abs(a))` keeps
+`SEARCH t USING COVERING INDEX ta` (a covering scan, no early-out);
+HAVING or FILTER, a second aggregate (`count(*)`), GROUP BY turn the
+optimisation off, DISTINCT and an aggregate ORDER BY do not; min()'s
+all-NULL answer takes the first NULL row's bare columns (BIGNULL's
+second pass), `WHERE x IS NULL` makes even a full scan stop at its
+first row; `CREATE BLOOM FILTER` follows every uncorrelated IN
+subquery used as a filter (NOT IN, a result column, VALUES and
+constant rows included), never an index probe's or a correlated one.
+
+**Tests:** `tests/multi_index_v17.rs` — curated: single-table OR
+(34 queries), OR in joins (13), UPDATE / DELETE through OR (plans,
+RETURNING rows, the tables after, per engine on its own file), min() /
+max() (55, all-NULL and DESC-index cases), skip-scans (no stats, the
+pin's ANALYZE, statistics below the threshold), the IN operator with
+and without statistics, single-table cost ties (5 schemas),
+regressions (the affinity bug, row values, the EXPLAIN fixes);
+`generated_corpus_matches_pin` (40 seeds by default, `HIPP_MI_SEEDS`:
+single-table and two-table queries with OR terms of comparisons, IN
+lists / subqueries, IS NULL, BETWEEN and AND groups, IN subqueries,
+min() / max() with bare columns, on rowid / IPK / WITHOUT ROWID
+tables with 1- to 3-column indexes, a third with ANALYZE): 4,000
+queries at 400 seeds, no row set differs, 1 order and 53 plans (1.3%)
+differ — the test allows 1 in 200 and 2 in 100;
+`multi_index_or_is_faster` (20,000 rows, `a = 5 OR b = 7`: the OR
+reads ~40 rows, net of a one-row baseline, best of 3, asserted 5x
+faster than `NOT INDEXED`; ~11 ms against ~48 ms in a debug CLI).
+`hipp-cli/tests/cli_v17_multi_index.rs`: three byte-identical scripts
+(OR rows and trees, min() / max(), skip-scans after ANALYZE, cost ties,
+UPDATE / DELETE). `tests/eqp_v16.rs`: `documented_differences` loses
+its MULTI-INDEX OR and max() cases (now checked against the pin);
+the generator adds OR terms, IN subqueries and min() / max(); 15 of
+4,800 plans differ at 400 seeds — the limit is now 1 in 200 (was 1
+in 100). `tests/join_order_v17.rs`: the generator adds OR terms (with
+join columns), IN subqueries and min() / max(); 15 orders and 126
+plans of 1,600 at 400 seeds — the limits are now 3 in 200 orders and
+9 in 100 plans (were 2 and 10; the default 60 seeds measure 3 and 20
+of 240). Every other v0.16 / v0.17 suite stays green.
+
+**Gates:** `ci/local-gates.sh` (full run) passes. tests/depth_v16.rs
+and tests/triggers_v16.rs pass with debug info (the stack constants
+are unchanged). `tests/stream_v17.rs`'s random-ORDER BY regression no
+longer compares how many distinct `random() % 5` values each engine
+drew (a coin toss: the gate run met 9 against the pin's 8); it still
+checks they come sorted.
+
+**Size Δ** (thumbv7em, `--profile tiny`): tiny 76,960 → 76,960 (0);
+full 506,672 → 506,672 (0: the ungated fixes are in `expr_index` /
+`explain` code); max 1,046,892 → 1,047,060 (+168: the OR-to-IN
+affinity check, the Bloom filter and DISTINCT lines; 1,516 B of the
+budget left); xl 1,114,356 → 1,135,004 (+20,648: the OR loops and
+their executor, min() / max(), skip-scans, the IN rule, single-table
+insertion, the EXPLAIN trees; 175,716 B left). Ratchets `[max]`
+1,047,060, `[xl]` 1,135,004.
+
+**Honest gaps:**
+
+- Plans: 1.3% of the generated corpus prints another plan. Classes
+  seen: a branch's sub-plan that would itself be a MULTI-INDEX OR
+  (hipp plans branches with b-tree loops only); a WITHOUT ROWID
+  secondary index probed on its PRIMARY KEY suffix (`(c3=? AND c0>?
+  AND c0<?)`: hipp stops at the key columns); `REUSE LIST SUBQUERY n`
+  and the order of two IN subqueries' lines; equivalence-class terms
+  moving a subquery to an earlier loop; the pin's vector range on a
+  key (`(a,b)>(?,?)`; hipp scans, same rows).
+- min() / max() in a join reads every joined row (fold, first-wins:
+  the pin's value and bare columns except when every argument is
+  NULL); a max() over an ascending index reads the index to its end
+  (hipp's index cursor walks forward only; the answer is the pin's).
+  `count(DISTINCT x)` over x's index still sorts (v0.16 class).
+- Skip-scans walk the whole index once to find the leading values
+  (the pin seeks past each); `sqlite_stat1`'s `noskipscan` / `sz=` /
+  `unordered` are not read; `sqlite_stat4` is not modelled.
+- The IN early-out (`WHERE_IN_EARLYOUT`) and seek-scan are run-time
+  shortcuts the plan text does not show; hipp probes every IN value.
+- `CREATE BLOOM FILTER` is not shown under a compound IN subquery
+  (the pin prints one per member); a vector `(a, b) IN (SELECT ...)`
+  plans as in 0.16.
 
 ## v0.16 — SQLite-parity push
 
@@ -9138,7 +9327,9 @@ FILTER lines); EXISTS stays a subquery (no
 `SCAN u EXISTS`); IN subqueries are lists (no `USING INDEX i FOR
 IN-OPERATOR` / `USING ROWID SEARCH ON TABLE`); no MULTI-INDEX OR; no
 min() / max() optimization (`SEARCH t USING COVERING INDEX i`, or a
-bare `SEARCH t` without an index); an UPDATE / DELETE WHERE key
+bare `SEARCH t` without an index) (both closed in v0.17 by
+`multi_index`: the `MULTI-INDEX OR` / `INDEX n` trees and the
+min() / max() `SEARCH` loops); an UPDATE / DELETE WHERE key
 compared with a scalar subquery does not drive the target loop
 (`SCAN t`; SELECT uses it); RIGHT /
 FULL joins and UPDATE ... FROM sources read whole tables (UPDATE
@@ -9182,7 +9373,8 @@ remain.
 - hipp's cost model (`xplan`) departs from the pin's in some loop
   choices, which EQP shows and which can order rows differently: an
   IN on a later column of a multi-column index, a second equality
-  column of a two-column index, ties between equally costed indexes,
+  column of a two-column index (closed in v0.17 by `multi_index`:
+  whereLoopAdjustCost for one table), ties between equally costed indexes,
   a WITHOUT ROWID table's secondary index against its primary key
   (and their key-suffix probes), text literals compared with numeric
   columns. The generated corpus therefore uses rowid tables and

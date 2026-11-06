@@ -485,6 +485,9 @@ pub(super) struct Walk<'a> {
     mats: AVec<u32>,
     /// The statement is an `UPDATE ... FROM` (the pin's co-routine rule).
     update_from: bool,
+    /// The subqueries being shown are an index loop's IN probes (no
+    /// Bloom filter of the IN operator; v0.17).
+    probing: bool,
 }
 
 /// View copies are numbered from here (`cte::Expander`), then shown
@@ -503,6 +506,7 @@ impl<'a> Walk<'a> {
             seen: AVec::new(),
             mats: AVec::new(),
             update_from: false,
+            probing: false,
         }
     }
 
@@ -898,10 +902,17 @@ impl<'a> Walk<'a> {
             let (order, unique) = ext
                 .as_ref()
                 .map_or((false, false), |x| (!x.order.is_empty(), x.unique));
-            if *distinct && !unique {
+            // A min() / max() query (v0.17, `multi_index`): no sorter
+            // for its ORDER BY, nor for its DISTINCT when the loops
+            // deliver the argument's order.
+            #[cfg(feature = "multi_index")]
+            let mm = c.sources.first().map_or(0, |s| s.eqp.minmax);
+            #[cfg(not(feature = "multi_index"))]
+            let mm = 0u8;
+            if *distinct && !unique && mm != 2 {
                 self.add(parent, &[b"USE TEMP B-TREE FOR ", name, b"(DISTINCT)"]);
             }
-            if order {
+            if order && mm == 0 {
                 self.add(parent, &[b"USE TEMP B-TREE FOR ", name, b"(ORDER BY)"]);
             }
         }
@@ -985,6 +996,31 @@ impl<'a> Walk<'a> {
             }
         }
         let count_of = self.simple_count(c);
+        // A join's WHERE terms with subqueries are shown after the loop
+        // that makes them computable, where the pin codes them (v0.17,
+        // `join_order`): per term, that loop's position.
+        #[cfg(feature = "join_order")]
+        let mut wterms: AVec<(&RExpr, usize)> = AVec::new();
+        #[cfg(feature = "join_order")]
+        if n > 1
+            && let Some(f) = c.filter
+        {
+            let mut parts: AVec<&RExpr> = AVec::new();
+            crate::xplan::conjuncts(f, &mut parts);
+            for p in parts.iter() {
+                let mut at = 0usize;
+                for (j, sj) in c.sources.iter().enumerate() {
+                    let band = crate::query::RefRange {
+                        w: (sj.eqp.base, sj.eqp.base + sj.ncols),
+                        s: (0, 0),
+                    };
+                    if crate::query::expr_refs_range(p, &band) {
+                        at = j;
+                    }
+                }
+                wterms.push((p, at));
+            }
+        }
         for (i, sp) in c.sources.iter().enumerate() {
             #[cfg(feature = "join_order")]
             if sp.eqp.omit {
@@ -1008,7 +1044,30 @@ impl<'a> Walk<'a> {
                 l.push(COUNT_MARK);
                 line = l;
             }
-            if i > 0 && sp.kind.pads_right() {
+            // A min() / max() query's loops all print SEARCH (v0.17,
+            // `multi_index`; the pin's `WHERE_ORDERBY_MIN` / `_MAX`).
+            #[cfg(feature = "multi_index")]
+            if sp.eqp.minmax != 0 && line.as_slice().starts_with(b"SCAN ") {
+                let mut l = copy_vec(b"SEARCH ");
+                l.extend_from_slice(line.as_slice().get(5..).unwrap_or(&[]));
+                let wr_pk = sp.derived.is_none()
+                    && self
+                        .cat
+                        .tables
+                        .iter()
+                        .find(|t| t.root == sp.root)
+                        .is_some_and(|t| !t.has_rowid())
+                    && !l.as_slice().windows(7).any(|w| w == b" USING ");
+                if wr_pk {
+                    l.extend_from_slice(b" USING PRIMARY KEY");
+                }
+                line = l;
+            }
+            #[cfg(feature = "multi_index")]
+            let multi = sp.access.as_deref().and_then(|a| a.or.as_deref());
+            #[cfg(not(feature = "multi_index"))]
+            let multi: Option<()> = None;
+            if i > 0 && sp.kind.pads_right() && multi.is_none() {
                 line.extend_from_slice(b" LEFT-JOIN");
             }
             // The Bloom filters built before this loop (v0.17,
@@ -1032,17 +1091,32 @@ impl<'a> Walk<'a> {
                 self.auto_keys(sp, ai, &mut b);
                 self.add(parent, &[b.as_slice()]);
             }
-            self.add(parent, &[line.as_slice()]);
+            let id = self.add(parent, &[line.as_slice()]);
+            // A MULTI-INDEX OR loop's branches (v0.17, `multi_index`).
+            #[cfg(feature = "multi_index")]
+            if let Some(o) = multi {
+                self.or_branches(sp, o, id, i > 0 && sp.kind.pads_right());
+            }
+            #[cfg(not(feature = "multi_index"))]
+            let _ = (id, multi);
             #[cfg(feature = "expr_index")]
             if let Some(a) = sp.access.as_deref() {
+                self.probing = true;
                 for p in a.eq.iter() {
                     if let Some(e) = &p.sub {
                         self.exprs(core::slice::from_ref(e), parent, &[]);
                     }
                 }
+                self.probing = false;
             }
             if let Some(on) = &sp.on {
                 self.exprs(core::slice::from_ref(on), parent, probes.as_slice());
+            }
+            #[cfg(feature = "join_order")]
+            for (p, at) in wterms.iter() {
+                if *at == i {
+                    self.exprs(core::slice::from_ref(*p), parent, probes.as_slice());
+                }
             }
         }
         for (i, sp) in c.sources.iter().enumerate() {
@@ -1053,7 +1127,13 @@ impl<'a> Walk<'a> {
                 self.add(r, &[b"SCAN ", name.as_slice()]);
             }
         }
-        if let Some(f) = c.filter {
+        #[cfg(feature = "join_order")]
+        let shown = !wterms.is_empty();
+        #[cfg(not(feature = "join_order"))]
+        let shown = false;
+        if let Some(f) = c.filter
+            && !shown
+        {
             self.exprs(core::slice::from_ref(f), parent, probes.as_slice());
         }
         // (A join the pin's planner ordered reports what it delivers
@@ -1101,7 +1181,9 @@ impl<'a> Walk<'a> {
         // it (no ORDER BY, no aggregate) or found the loop brings equal
         // rows together, or redundant (a rowid among the result columns
         // of a lone table).
-        if c.distinct && !(c.has_agg && c.group_by.is_empty()) {
+        // (An aggregate without GROUP BY is one row, but the pin
+        // still opens its DISTINCT table: v0.17 fix.)
+        if c.distinct {
             let given = c.order_by.is_empty() && !c.has_agg;
             let unique = n == 1 && c.items.iter().any(|e| self.is_rowid(c.sources, e));
             #[cfg(feature = "expr_index")]
@@ -1109,7 +1191,9 @@ impl<'a> Walk<'a> {
             #[cfg(not(feature = "expr_index"))]
             let adjacent = false;
             let adjacent = adjacent || first.is_some_and(|s| s.eqp.nat_distinct);
-            let done = if as_group {
+            let done = if c.has_agg && c.group_by.is_empty() {
+                false
+            } else if as_group {
                 delivered >= c.items.len()
             } else {
                 unique || adjacent || (given && delivered >= c.items.len())
@@ -1144,6 +1228,42 @@ impl<'a> Walk<'a> {
             } else if !single && !same_group {
                 self.sorter(parent, k, done);
             }
+        }
+    }
+
+    /// A MULTI-INDEX OR loop's branches under its line `id` (v0.17,
+    /// `multi_index`): `INDEX n`, the subqueries its loop evaluates
+    /// (its IN probes first), then its loop (`LEFT-JOIN` as the
+    /// source's).
+    #[cfg(feature = "multi_index")]
+    fn or_branches(&mut self, sp: &SubSource, o: &crate::xmulti::OrAccess, id: i64, left: bool) {
+        for sub in o.subs.iter() {
+            let mut h = copy_vec(b"INDEX ");
+            num(&mut h, u64::from(sub.n), false);
+            let ix = self.add(id, &[h.as_slice()]);
+            let mut skip: AVec<usize> = AVec::new();
+            if let Some(a) = &sub.acc {
+                self.probing = true;
+                for p in a.eq.iter() {
+                    if let Some(e) = &p.sub {
+                        self.exprs(core::slice::from_ref(e), ix, &[]);
+                        if let RExpr::InSub(_, s, _) = e {
+                            skip.push(s.id);
+                        }
+                    }
+                }
+                self.probing = false;
+            }
+            self.exprs(core::slice::from_ref(&sub.cond), ix, skip.as_slice());
+            let mut l = copy_vec(b"SCAN ");
+            self.scan_name(sp, &mut l);
+            if let Some(a) = &sub.acc {
+                self.access(sp, a, &mut l);
+            }
+            if left {
+                l.extend_from_slice(b" LEFT-JOIN");
+            }
+            self.add(ix, &[l.as_slice()]);
         }
     }
 
@@ -1339,6 +1459,12 @@ impl<'a> Walk<'a> {
     /// The index part of a loop's line.
     #[cfg(feature = "expr_index")]
     fn access(&mut self, sp: &SubSource, a: &crate::xplan::IdxAccess, out: &mut AVec<u8>) {
+        #[cfg(feature = "multi_index")]
+        if a.or.is_some() {
+            out.truncate(0);
+            out.extend_from_slice(b"MULTI-INDEX OR");
+            return;
+        }
         #[cfg(feature = "join_order")]
         if let Some(ai) = a.auto.as_deref() {
             out.truncate(0);
@@ -1472,9 +1598,20 @@ impl<'a> Walk<'a> {
             }
             first = false;
         };
-        let k = a.eq.len();
-        for key in keys.iter().take(k) {
+        #[cfg(feature = "multi_index")]
+        let skip = a.skip;
+        #[cfg(not(feature = "multi_index"))]
+        let skip = 0;
+        let k = a.eq.len() + skip;
+        for (i, key) in keys.iter().take(k).enumerate() {
             sep(out);
+            // A skip-scan's columns (v0.17, `multi_index`).
+            if i < skip {
+                out.extend_from_slice(b"ANY(");
+                out.extend_from_slice(key.as_slice());
+                out.push(b')');
+                continue;
+            }
             out.extend_from_slice(key.as_slice());
             out.extend_from_slice(b"=?");
         }
@@ -1527,7 +1664,15 @@ impl<'a> Walk<'a> {
             });
             num(&mut d, u64::from(n), false);
             let id = self.add(parent, &[d.as_slice()]);
+            let probing = core::mem::replace(&mut self.probing, false);
             self.select_sub(p, id);
+            self.probing = probing;
+            // The IN operator's Bloom filter over an uncorrelated
+            // subquery's values, unless an index loop probes with
+            // them (v0.17 fix; a compound's are not shown).
+            if list && p.uncorrelated && !probing && p.compound.is_empty() {
+                self.add(id, &[b"CREATE BLOOM FILTER"]);
+            }
         }
     }
 
@@ -1557,11 +1702,23 @@ impl<'a> Walk<'a> {
         }
         #[cfg(not(feature = "expr_index"))]
         let _ = t;
-        self.add(0, &[line.as_slice()]);
+        let id = self.add(0, &[line.as_slice()]);
+        // A MULTI-INDEX OR loop's branches (v0.17, `multi_index`).
+        #[cfg(feature = "multi_index")]
+        if let Some(o) = access.and_then(|a| a.or.as_deref()) {
+            let sp = SubSource {
+                root: t.root,
+                ..placeholder(name)
+            };
+            self.or_branches(&sp, o, id, false);
+        }
+        #[cfg(not(feature = "multi_index"))]
+        let _ = id;
         #[cfg_attr(not(feature = "expr_index"), allow(unused_mut))]
         let mut probes: AVec<usize> = AVec::new();
         #[cfg(feature = "expr_index")]
         if let Some(a) = access {
+            self.probing = true;
             for p in a.eq.iter() {
                 if let Some(e) = &p.sub {
                     if let RExpr::InSub(_, s, _) = e {
@@ -1570,6 +1727,7 @@ impl<'a> Walk<'a> {
                     self.exprs(core::slice::from_ref(e), 0, &[]);
                 }
             }
+            self.probing = false;
         }
         if !from.is_empty() {
             self.update_from = true;

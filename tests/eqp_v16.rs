@@ -408,13 +408,6 @@ fn writes_match_pin() {
 fn documented_differences() {
     let path = db("eqp-diff", SCHEMA);
     let cases: &[(&str, &str)] = &[
-        // No MULTI-INDEX OR: the table is scanned.
-        ("SELECT * FROM t WHERE b = 1 OR c = 2", "`--SCAN t\n"),
-        // No min() / max() lookup: the index is read through.
-        (
-            "SELECT max(b) FROM t",
-            "`--SCAN t USING COVERING INDEX tb\n",
-        ),
         // FROM subqueries, views and CTEs are not flattened.
         (
             "SELECT * FROM vu",
@@ -444,12 +437,15 @@ fn documented_differences() {
         ),
     ];
     // (v0.17, `join_order`: join reordering and automatic indexes now
-    // print the pin's plans.)
+    // print the pin's plans; `multi_index`: the MULTI-INDEX OR and the
+    // min() / max() lookup too.)
     same_plans(
         &path,
         &[
             "SELECT * FROM t, u WHERE t.a = u.x",
             "SELECT * FROM t LEFT JOIN u ON t.b=u.y",
+            "SELECT * FROM t WHERE b = 1 OR c = 2",
+            "SELECT max(b) FROM t",
         ],
     );
     for (q, want) in cases {
@@ -629,6 +625,20 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
 fn gen_term(r: &mut Rng, t: &Tab) -> String {
     let c = t.cols[r.n(t.cols.len() as u64) as usize].clone();
     let v = r.n(20);
+    // (v0.17, `multi_index`: OR terms, for the MULTI-INDEX OR, and IN
+    // subqueries.)
+    match r.n(12) {
+        8 | 9 => {
+            let d = t.cols[r.n(t.cols.len() as u64) as usize].clone();
+            return format!(
+                "({c} = {v} OR {d} {} {})",
+                r.pick(&["=", ">", "<"]),
+                r.n(20)
+            );
+        }
+        10 => return format!("{c} IN (SELECT c1 FROM t1 WHERE c0 > {v})"),
+        _ => {}
+    }
     match r.n(8) {
         0 => format!("{c} = {v}"),
         1 => format!("{c} > {v}"),
@@ -645,6 +655,21 @@ fn gen_term(r: &mut Rng, t: &Tab) -> String {
 fn gen_single(r: &mut Rng, t: &Tab, one_col: bool) -> String {
     let col = |r: &mut Rng| t.cols[r.n(t.cols.len() as u64) as usize].clone();
     let k = r.n(6);
+    // (v0.17, `multi_index`: min() / max(), with a bare column.)
+    if !one_col && r.n(8) == 0 {
+        let f = r.pick(&["min", "max"]);
+        let a = col(r);
+        let bare = if r.n(2) == 0 {
+            format!(", {}", col(r))
+        } else {
+            String::new()
+        };
+        let mut q = format!("SELECT {f}({a}){bare} FROM {}", t.name);
+        if r.n(2) == 0 {
+            q += &format!(" WHERE {}", gen_term(r, t));
+        }
+        return q;
+    }
     let res = if one_col {
         col(r)
     } else if k == 0 {
@@ -728,7 +753,8 @@ fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
 /// A generated corpus: random schemas (rowid and INTEGER PRIMARY KEY
 /// tables; UNIQUE and DESC indexes) and queries (equality, range, IN, BETWEEN terms; ORDER
 /// BY, GROUP BY, DISTINCT, LIMIT; compounds; correlated and
-/// uncorrelated subqueries). `HIPP_EQP_SEEDS` runs more.
+/// uncorrelated subqueries; v0.17: OR terms, IN subqueries, min() /
+/// max()). `HIPP_EQP_SEEDS` runs more.
 #[test]
 fn generated_plans_match_pin() {
     let seeds: u64 = std::env::var("HIPP_EQP_SEEDS")
@@ -753,9 +779,11 @@ fn generated_plans_match_pin() {
         }
     }
     // hipp's cost model departs from the pin's in a few loop choices
-    // (STATUS.md, "honest gaps"): at most 1 in 100 may differ.
+    // (STATUS.md, "honest gaps"): at most 1 in 200 may differ (v0.17,
+    // `multi_index`: 15 of 4,800 at 400 seeds, OR terms, IN subqueries
+    // and min() / max() in the corpus; it was 1 in 100).
     assert!(
-        bad.len() * 100 <= n,
+        bad.len() * 200 <= n,
         "{} of {n} plans differ:\n{}",
         bad.len(),
         bad.join("\n")

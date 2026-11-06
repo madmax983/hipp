@@ -38,10 +38,14 @@
 //!   pull-down of `sqlite3ConstructBloomFilter`): with `sqlite_stat1`
 //!   rows, a lookup run more often than its table has rows.
 //!
+//! - **MULTI-INDEX OR loops** (v0.17, `multi_index`; `whereLoopAddOr`,
+//!   `crate::xmulti`): after a source's b-tree loops, one per cost
+//!   entry of each OR term every branch of which has a loop.
+//!
 //! What is not modelled (the order or access path may then differ
-//! from the pin's, never the rows): the MULTI-INDEX OR plan of b-tree
-//! tables, skip-scans, the `IN` early-out / seek-scan decisions of
-//! `whereLoopAddBtreeIndex` with statistics, `sqlite_stat4`,
+//! from the pin's, never the rows): without `multi_index`, the
+//! MULTI-INDEX OR plan of b-tree tables, skip-scans and the `IN`
+//! statistics rule of `whereLoopAddBtreeIndex`; `sqlite_stat4`,
 //! likelihood() truth probabilities and the LIKE length adjustment,
 //! the EXISTS-to-join rewrite and the `ORDER BY ... LIMIT`
 //! ordered-inner-loop case; STATUS.md lists the classes the
@@ -88,6 +92,10 @@ pub struct JSrc<'x> {
     /// its loops as `(prerequisites, rRun, nOut)`, one per usable
     /// constraint set its xBestIndex accepted; it has no b-tree loops.
     pub vt: Option<AVec<(u64, i32, i32)>>,
+    /// Its OR terms that may drive a MULTI-INDEX OR loop (v0.17,
+    /// `multi_index`; `xmulti::or_infos`).
+    #[cfg(feature = "multi_index")]
+    pub ors: AVec<crate::xmulti::OrInfo>,
 }
 
 /// The statement around the join.
@@ -200,6 +208,7 @@ fn blooms(srcs: &[JSrc<'_>], jq: &JQuery<'_>, loops: &[JLoop]) -> AVec<Option<us
         let Some(js) = srcs.get(jl.src) else { break };
         live = live && js.stat;
         let bloomable = !jl.auto
+            && crate::xplan::skip_of(&jl.l) == 0
             && match jl.l.ix.and_then(|x| js.tab.indexes.get(x)) {
                 None => !jl.l.eq.is_empty(),
                 Some(m) => (0..jl.l.eq.len()).all(|k| {
@@ -212,7 +221,7 @@ fn blooms(srcs: &[JSrc<'_>], jq: &JQuery<'_>, loops: &[JLoop]) -> AVec<Option<us
         on.push(
             live && pos >= 1
                 && bloomable
-                && column_eq(js, jl)
+                && column_eq(js.ts.as_slice(), jl)
                 && self_cull(js, jq, jl.src, jl)
                 && search > js.tab.nrow(),
         );
@@ -345,6 +354,10 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                         sorted: 0,
                         reverse: false,
                         bignull: None,
+                        #[cfg(feature = "multi_index")]
+                        or: None,
+                        #[cfg(feature = "multi_index")]
+                        skip: 0,
                     },
                     prereq: (mpre | *p) & !me,
                     setup: 0,
@@ -354,7 +367,7 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                     idx_only: false,
                     vt: true,
                 };
-                insert(&mut out, js, jl);
+                insert(&mut out, js.ts.as_slice(), jl);
             }
             continue;
         }
@@ -386,6 +399,10 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                         sorted: 0,
                         reverse: false,
                         bignull: None,
+                        #[cfg(feature = "multi_index")]
+                        or: None,
+                        #[cfg(feature = "multi_index")]
+                        skip: 0,
                     },
                     prereq: mpre | js.tmask.as_slice().get(*ti).copied().unwrap_or(0),
                     setup: (rlog + rsize + 28).max(0),
@@ -395,7 +412,7 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                     idx_only: false,
                     vt: false,
                 };
-                insert(&mut out, js, jl);
+                insert(&mut out, js.ts.as_slice(), jl);
             }
         }
         let jm = JMask {
@@ -460,7 +477,40 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                 idx_only: m.is_some_and(|m| m.covers(needed.as_slice())),
                 vt: false,
             };
-            insert(&mut out, js, jl);
+            insert(&mut out, js.ts.as_slice(), jl);
+        }
+        // Its MULTI-INDEX OR loops (v0.17, `multi_index`;
+        // `whereLoopAddOr`, after the b-tree loops).
+        #[cfg(feature = "multi_index")]
+        for (k, info) in js.ors.iter().enumerate() {
+            let costs =
+                crate::xmulti::or_costs(&q, &js.s, &js.tab, info, out.as_slice(), i, me, mpre);
+            for (p, run, nout) in costs.iter() {
+                let jl = JLoop {
+                    src: i,
+                    l: Loop {
+                        ix: None,
+                        eq: AVec::new(),
+                        lo: None,
+                        hi: None,
+                        run: run + 1,
+                        out: *nout,
+                        sorted: 0,
+                        reverse: false,
+                        bignull: None,
+                        or: Some(k),
+                        skip: 0,
+                    },
+                    prereq: (p | mpre) & !me,
+                    setup: 0,
+                    auto: false,
+                    width: None,
+                    sort_idx: 0,
+                    idx_only: false,
+                    vt: false,
+                };
+                insert(&mut out, js.ts.as_slice(), jl);
+            }
         }
         // (The template's `iSortIdx` is left at the last index's for
         // the next table's automatic-index loops.)
@@ -479,7 +529,10 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
 fn lterms(l: &JLoop) -> AVec<usize> {
     let mut v = AVec::new();
     for t in l.l.eq.iter().chain(l.l.lo.iter()).chain(l.l.hi.iter()) {
-        v.push(*t);
+        // (Not a skip-scan's empty slots.)
+        if *t != usize::MAX {
+            v.push(*t);
+        }
     }
     v
 }
@@ -489,11 +542,12 @@ fn cheaper_subset(x: &JLoop, y: &JLoop) -> bool {
     if x.l.run > y.l.run && x.l.out > y.l.out {
         return false;
     }
-    if x.l.eq.len() < y.l.eq.len() && x.l.ix == y.l.ix {
+    let (sx, sy) = (crate::xplan::skip_of(&x.l), crate::xplan::skip_of(&y.l));
+    if x.l.eq.len() < y.l.eq.len() && x.l.ix == y.l.ix && sx == 0 && sy == 0 {
         return true;
     }
     let (tx, ty) = (lterms(x), lterms(y));
-    if tx.len() >= ty.len() {
+    if tx.len() >= ty.len() || sy > sx {
         return false;
     }
     if !tx.iter().all(|t| ty.iter().any(|u| u == t)) {
@@ -508,23 +562,26 @@ fn indexed(l: &JLoop) -> bool {
 }
 
 /// Whether loop `l` has an `=` / `IS` key term (`WHERE_COLUMN_EQ`).
-fn column_eq(js: &JSrc<'_>, l: &JLoop) -> bool {
+fn column_eq(ts: &[Term], l: &JLoop) -> bool {
     l.l.eq.iter().any(|t| {
-        js.ts
-            .as_slice()
-            .get(*t)
+        ts.get(*t)
             .is_some_and(|t| matches!(t.op, TOp::Eq | TOp::Is) && !t.isnull)
     })
 }
 
 /// The pin's `whereLoopFindLesser` from `from`: `Err(())` to drop the
 /// template, `Ok(Some(k))` to overwrite loop `k`, `Ok(None)` to append.
-fn find_lesser(list: &[JLoop], from: usize, js: &JSrc<'_>, t: &JLoop) -> Result<Option<usize>, ()> {
+fn find_lesser(list: &[JLoop], from: usize, ts: &[Term], t: &JLoop) -> Result<Option<usize>, ()> {
     for (k, p) in list.iter().enumerate().skip(from) {
         if p.src != t.src || p.sort_idx != t.sort_idx {
             continue;
         }
-        if p.auto && indexed(t) && column_eq(js, t) && (p.prereq & t.prereq) == t.prereq {
+        if p.auto
+            && crate::xplan::skip_of(&t.l) == 0
+            && indexed(t)
+            && column_eq(ts, t)
+            && (p.prereq & t.prereq) == t.prereq
+        {
             return Ok(Some(k));
         }
         if (p.prereq & t.prereq) == p.prereq
@@ -545,7 +602,7 @@ fn find_lesser(list: &[JLoop], from: usize, js: &JSrc<'_>, t: &JLoop) -> Result<
 /// the loops it is a proper subset or superset of
 /// (`whereLoopAdjustCost`), then dropped, put in place of the first
 /// loop it beats (removing the later ones it also beats), or added.
-fn insert(list: &mut AVec<JLoop>, js: &JSrc<'_>, mut t: JLoop) {
+pub(crate) fn insert(list: &mut AVec<JLoop>, ts: &[Term], mut t: JLoop) {
     if indexed(&t) {
         for p in list.iter() {
             if p.src != t.src || !indexed(p) {
@@ -560,12 +617,12 @@ fn insert(list: &mut AVec<JLoop>, js: &JSrc<'_>, mut t: JLoop) {
             }
         }
     }
-    match find_lesser(list.as_slice(), 0, js, &t) {
+    match find_lesser(list.as_slice(), 0, ts, &t) {
         Err(()) => {}
         Ok(None) => list.push(t),
         Ok(Some(k)) => {
             let mut from = k + 1;
-            while let Ok(Some(d)) = find_lesser(list.as_slice(), from, js, &t) {
+            while let Ok(Some(d)) = find_lesser(list.as_slice(), from, ts, &t) {
                 list.remove_at(d);
                 from = d;
             }
@@ -581,7 +638,12 @@ fn insert(list: &mut AVec<JLoop>, js: &JSrc<'_>, mut t: JLoop) {
 /// whose key is NOT NULL (or a one-column UNIQUE index probed with
 /// `=`), with no IN before it.
 pub(crate) fn one_row(js: &JSrc<'_>, jl: &JLoop) -> bool {
-    if jl.auto || jl.l.lo.is_some() || jl.l.hi.is_some() || jl.l.eq.is_empty() {
+    if jl.auto
+        || jl.l.lo.is_some()
+        || jl.l.hi.is_some()
+        || jl.l.eq.is_empty()
+        || crate::xplan::skip_of(&jl.l) != 0
+    {
         return false;
     }
     let op = |t: usize| js.ts.as_slice().get(t).map(|t| (&t.op, t.isnull));
@@ -742,6 +804,11 @@ fn path_order(
             if jl.auto {
                 return 0;
             }
+            // A MULTI-INDEX OR loop has no index order (v0.17).
+            #[cfg(feature = "multi_index")]
+            if jl.l.or.is_some() {
+                return 0;
+            }
             // The ordered columns: an index's key (then the rowid or a
             // WITHOUT ROWID table's key suffix), or the rowid alone.
             let mut cols: AVec<(OCol<'_>, KeyOrder)> = AVec::new();
@@ -781,8 +848,9 @@ fn path_order(
             let mut rev_set = false;
             let mut rv = false;
             let mut distinct_cols = false;
+            let skips = crate::xplan::skip_of(&jl.l);
             for (j, (c, ko)) in cols.iter().enumerate() {
-                if j < neq {
+                if j < neq && skips == 0 {
                     let t =
                         jl.l.eq
                             .as_slice()
@@ -963,8 +1031,14 @@ fn mx_choice(srcs: &[JSrc<'_>], loops: &mut [JLoop]) -> usize {
                 if (1u64 << l.src) & seen == 0 {
                     continue;
                 }
-                let nterm =
-                    l.l.eq.len() + usize::from(l.l.lo.is_some()) + usize::from(l.l.hi.is_some());
+                #[cfg(feature = "multi_index")]
+                let or = usize::from(l.l.or.is_some());
+                #[cfg(not(feature = "multi_index"))]
+                let or = 0;
+                let nterm = l.l.eq.len()
+                    + usize::from(l.l.lo.is_some())
+                    + usize::from(l.l.hi.is_some())
+                    + or;
                 if nterm != 0 {
                     continue;
                 }

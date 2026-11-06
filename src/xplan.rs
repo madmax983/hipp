@@ -52,11 +52,17 @@
 //! module builds, and `sqlite_stat1` is read back: its row estimates
 //! replace the defaults (`IdxModel::est`, `Table::rows`).
 //!
+//! With the `multi_index` leaf (v0.17) `crate::xmulti` adds the
+//! MULTI-INDEX OR loop, the min() / max() order, skip-scans (with
+//! `sqlite_stat1`), the IN operator's statistics rule and
+//! `whereLoopInsert` for one table's loops.
+//!
 //! What is not modelled (the order may then differ from the pin's,
 //! never the rows): without `join_order`, join reordering (sources run
 //! in FROM order, each with its own best loop), automatic indexes and
-//! every `sqlite_stat1` estimate; in every build the MULTI-INDEX OR
-//! plan, the LIKE prefix optimisation, skip-scans and `sqlite_stat4`.
+//! every `sqlite_stat1` estimate; without `multi_index`, the
+//! MULTI-INDEX OR plan and skip-scans; in every build the LIKE prefix
+//! optimisation and `sqlite_stat4`.
 
 use crate::arena::AVec;
 use crate::query::{RExpr, RefRange, binary_coll, expr_coll, expr_refs_range, same_expr};
@@ -438,7 +444,7 @@ fn and_terms<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     }
 }
 
-fn strip(e: &RExpr) -> &RExpr {
+pub(crate) fn strip(e: &RExpr) -> &RExpr {
     match e {
         RExpr::Collate(x, _) => strip(x),
         _ => e,
@@ -550,6 +556,18 @@ fn add_terms(
                 && let Some(t) = or_in(ci, c, tp, s, avail)
             {
                 out.push(t);
+            }
+            // The pin's `whereCombineDisjuncts` (v0.17, `multi_index`):
+            // `x < 5 OR x = 5` is also the virtual term `x <= 5`.
+            #[cfg(feature = "multi_index")]
+            if *op == BinOp::Or {
+                for x in crate::xmulti::combined(c).iter() {
+                    let from = out.len();
+                    add_terms(ci, x, 1, s, avail, out);
+                    for t in out.as_mut_slice().get_mut(from..).unwrap_or(&mut []) {
+                        t.virt = true;
+                    }
+                }
             }
         }
         // The pin's two virtual halves, each analysed in turn: `x >=
@@ -679,7 +697,7 @@ fn add_terms(
 
 /// The pin's OR-to-IN rewrite: `x = a OR x = b OR ...` on one key,
 /// every value available, is `x IN (a, b, ...)`.
-fn or_in(
+pub(crate) fn or_in(
     ci: usize,
     c: &RExpr,
     tp: i32,
@@ -710,6 +728,19 @@ fn or_in(
         let (k, v) = if s.reads(strip(a)) { (a, b) } else { (b, a) };
         let kk = strip(k);
         if !s.reads(kk) {
+            return None;
+        }
+        // The pin's `okToChngToIN`: a value with an affinity of its
+        // own must have the key's (v0.17 fix: `x.c0 = y.c1 OR x.c0 =
+        // y.c2` probed a TEXT key with REAL values, losing rows).
+        let aff = |e: &RExpr| match strip(e) {
+            RExpr::Column(_, a, _) | RExpr::Cast(_, a) | RExpr::AffLiteral(_, Some(a), _) => {
+                Some(*a)
+            }
+            RExpr::Rowid(_) => Some(Affinity::Integer),
+            _ => None,
+        };
+        if aff(v).is_some_and(|a| Some(a) != aff(kk)) {
             return None;
         }
         match key {
@@ -783,6 +814,10 @@ pub struct IdxModel {
     /// counts as covering for the plan and EXPLAIN QUERY PLAN, while
     /// hipp still reads the table row for the expressions' values.
     pub xcover: bool,
+    /// The index has `sqlite_stat1` rows (v0.17, `multi_index`; the
+    /// pin's `hasStat1`): `est` may hold defaults otherwise.
+    #[cfg(feature = "multi_index")]
+    pub stat1: bool,
 }
 
 impl IdxModel {
@@ -1030,6 +1065,16 @@ pub(crate) struct Loop {
     /// NULLs where the index does not put them (`Some(nulls_first)`);
     /// the loop moves the NULL-keyed rows to that end.
     pub(crate) bignull: Option<bool>,
+    /// A MULTI-INDEX OR loop (v0.17, `multi_index`; the pin's
+    /// `WHERE_MULTI_OR`): the OR term's place in the source's list of
+    /// OR terms (`xmulti::OrInfo`). Its other fields are empty.
+    #[cfg(feature = "multi_index")]
+    pub(crate) or: Option<usize>,
+    /// The leading index columns a skip-scan steps over (v0.17,
+    /// `multi_index`; the pin's `nSkip`): each is an `eq` slot with
+    /// no term (`usize::MAX`).
+    #[cfg(feature = "multi_index")]
+    pub(crate) skip: usize,
 }
 
 /// What the planner needs about the query around the source.
@@ -1181,6 +1226,22 @@ pub struct IdxAccess {
     /// probe whose key is not in the filter skips the lookup.
     #[cfg(feature = "join_order")]
     pub bloom: Option<AVec<BKey>>,
+    /// A MULTI-INDEX OR loop (v0.17, `multi_index`): the branches'
+    /// own access paths, read in turn, each row once.
+    #[cfg(feature = "multi_index")]
+    pub or: Option<alloc::boxed::Box<crate::xmulti::OrAccess>>,
+    /// A skip-scan (v0.17, `multi_index`): the leading key columns
+    /// whose every value is stepped over (`ANY(a)`) before `eq`.
+    #[cfg(feature = "multi_index")]
+    pub skip: usize,
+    /// The pin's min() / max() early-out (v0.17, `multi_index`): the
+    /// statement needs only the first row of this path, in its order,
+    /// that passes this condition (the WHERE clause; a `TRUE` literal
+    /// when it has none).
+    /// `(condition, base, src)`: where the source's columns and rowid
+    /// sit in the query row the condition reads.
+    #[cfg(feature = "multi_index")]
+    pub first: Option<alloc::boxed::Box<(RExpr, usize, usize)>>,
     /// What EXPLAIN QUERY PLAN says of the loop (v0.16, `explain`):
     /// how many ORDER BY (or GROUP BY / DISTINCT) terms it delivers,
     /// whether its index covers the statement's columns, whether its
@@ -1258,7 +1319,7 @@ pub(crate) fn sort_cost(q: &Query<'_>, n_row: i32, n_ob: usize, n_sorted: usize)
 }
 
 /// Whether term `t` is an IN list.
-fn is_in(ts: &[Term], t: usize) -> bool {
+pub(crate) fn is_in(ts: &[Term], t: usize) -> bool {
     ts.get(t)
         .is_some_and(|t| matches!(t.op, TOp::In(_) | TOp::InSub(_)))
 }
@@ -1286,6 +1347,12 @@ pub(crate) fn order_sat(
 ) -> (usize, bool, Option<bool>) {
     let n = q.order.len();
     if n == 0 {
+        return (0, false, None);
+    }
+    // A MULTI-INDEX OR loop delivers no order (the pin's
+    // `wherePathSatisfiesOrderBy` meets no index; v0.17).
+    #[cfg(feature = "multi_index")]
+    if l.or.is_some() {
         return (0, false, None);
     }
     // A loop that finds at most one row delivers any order.
@@ -1327,8 +1394,11 @@ pub(crate) fn order_sat(
         }
         Some(m) => {
             for (k, key) in m.keys.iter().enumerate() {
-                let constant =
-                    l.eq.as_slice()
+                // (A skip-scan's columns, its equality ones too, are
+                // walked in key order: the pin's `nSkip` rule.)
+                let constant = skip_of(l) == 0
+                    && l.eq
+                        .as_slice()
                         .get(k)
                         .is_some_and(|t| in_eq || !is_in(ts, *t));
                 cols.push((
@@ -1626,6 +1696,10 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
             sorted: 0,
             reverse: false,
             bignull: None,
+            #[cfg(feature = "multi_index")]
+            or: None,
+            #[cfg(feature = "multi_index")]
+            skip: 0,
         });
         let a_rowid = [rows, 0];
         add_index(q, s, tab, ts, None, &a_rowid, tab.width, true, &mut loops);
@@ -1672,6 +1746,10 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
                 sorted: 0,
                 reverse: false,
                 bignull: None,
+                #[cfg(feature = "multi_index")]
+                or: None,
+                #[cfg(feature = "multi_index")]
+                skip: 0,
             });
         }
         // A WITHOUT ROWID table's UPDATE / DELETE (v0.16): the pin
@@ -1700,7 +1778,7 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
 
 /// The cheapest of `loops` (their ORDER BY delivery computed) as an
 /// access path; `None` for the table's own order.
-fn best_access(
+pub(crate) fn best_access(
     q: &Query<'_>,
     s: &Src,
     tab: &Table<'_>,
@@ -1744,6 +1822,14 @@ fn best_access(
         }
     }
     let l = loops.get(best)?.clone();
+    // A MULTI-INDEX OR loop (v0.17, `multi_index`): its branches'
+    // paths are chosen by the caller (`xmulti::choose`).
+    #[cfg(feature = "multi_index")]
+    if let Some(k) = l.or {
+        let mut a = lower(s, tab, ts, &l, false);
+        a.or = Some(alloc::boxed::Box::new(crate::xmulti::OrAccess::pending(k)));
+        return Some(a);
+    }
     let mut reverse = l.reverse && l.sorted > 0;
     // The pin's "ordered inner loop": an ORDER BY the loop does not
     // deliver, but would with its IN columns held constant, still
@@ -1824,6 +1910,10 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
         sorted: 0,
         reverse: false,
         bignull: None,
+        #[cfg(feature = "multi_index")]
+        or: None,
+        #[cfg(feature = "multi_index")]
+        skip: 0,
     };
     let (sat, rev, _) = order_sat(q, s, tab, ts, &l, false);
     let d = Query {
@@ -1940,6 +2030,8 @@ fn add_index(
     let rsize = a.first().copied().unwrap_or(ROWS);
     let rlog = est_log(rsize);
     let ipk = ix.is_none();
+    #[cfg(feature = "multi_index")]
+    let from = loops.len();
     let ncol = match ix.and_then(|i| tab.indexes.get(i)) {
         Some(m) => m.keys.len() + 1,
         None => 1,
@@ -1979,8 +2071,12 @@ fn add_index(
     // the IN iterations of the columns before it (`rRun += nInMul`);
     // alone, the IN is charged at its own level only, which is what
     // `whereLoopAdjustCost` makes of it for one table.
-    #[cfg(feature = "join_order")]
+    // (v0.17, `multi_index`: one table's loops pass through
+    // `whereLoopInsert` too, so they pay it as the pin's do.)
+    #[cfg(all(feature = "join_order", not(feature = "multi_index")))]
     let join_in = |m: i32| if q.jm.is_some() { m } else { 0 };
+    #[cfg(feature = "multi_index")]
+    let join_in = |m: i32| m;
     #[cfg(not(feature = "join_order"))]
     let join_in = |_: i32| 0;
     // An explicit stack instead of recursion: (equality terms,
@@ -2009,6 +2105,22 @@ fn add_index(
                     TOp::InSub(_) => 46,
                     _ => 0,
                 };
+                // With `sqlite_stat1` rows (v0.17, `multi_index`): an IN
+                // whose K values cost more than scanning the M rows the
+                // columns before it match (`M*log(K) < K*log(N)`, with a
+                // margin of 10 for the IN) is not probed, unless it can
+                // still seek-scan (the first IN of the loop).
+                #[cfg(feature = "multi_index")]
+                if matches!(t.op, TOp::In(_) | TOp::InSub(_))
+                    && ix.and_then(|i| tab.indexes.get(i)).is_some_and(|m| m.stat1)
+                    && rlog >= 10
+                {
+                    let m_rows = a.get(k).copied().unwrap_or(rsize);
+                    let x = m_rows + est_log(n_in) + 10 - (n_in + rlog);
+                    if x < 0 && in_mul >= 2 {
+                        continue;
+                    }
+                }
                 let cur = a.get(k).copied().unwrap_or(rsize);
                 let nxt = a.get(k + 1).copied().unwrap_or(0);
                 // A likelihood() probability on a table column's
@@ -2045,6 +2157,10 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
+                    #[cfg(feature = "multi_index")]
+                    or: None,
+                    #[cfg(feature = "multi_index")]
+                    skip: 0,
                 });
                 deeper.push((used, in_mul + n_in, out));
             } else if t.lower() {
@@ -2060,6 +2176,10 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
+                    #[cfg(feature = "multi_index")]
+                    or: None,
+                    #[cfg(feature = "multi_index")]
+                    skip: 0,
                 });
                 // ... and with each upper bound on the same column.
                 for (ui, u) in ts.iter().enumerate() {
@@ -2078,6 +2198,10 @@ fn add_index(
                         sorted: 0,
                         reverse: false,
                         bignull: None,
+                        #[cfg(feature = "multi_index")]
+                        or: None,
+                        #[cfg(feature = "multi_index")]
+                        skip: 0,
                     });
                 }
             } else if t.upper() {
@@ -2093,14 +2217,40 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
+                    #[cfg(feature = "multi_index")]
+                    or: None,
+                    #[cfg(feature = "multi_index")]
+                    skip: 0,
                 });
             }
+        }
+        // A skip-scan (v0.17, `multi_index`; the end of the pin's
+        // `whereLoopAddBtreeIndex`): no term for the leading columns
+        // so far, and `sqlite_stat1` says each value of the next one
+        // repeats at least 18 times (LogEst 42): step over its values,
+        // `nIter` more lookups.
+        #[cfg(feature = "multi_index")]
+        if let Some(m) = ix.and_then(|i| tab.indexes.get(i))
+            && m.stat1
+            && eq.iter().all(|t| *t == usize::MAX)
+            && k + 1 < m.keys.len()
+            && a.get(k + 1).copied().unwrap_or(0) >= 42
+        {
+            let n_iter = a.get(k).copied().unwrap_or(rsize) - a.get(k + 1).copied().unwrap_or(0);
+            let mut e2 = eq.clone();
+            e2.push(usize::MAX);
+            deeper.push((e2, in_mul + n_iter + 5, saved - n_iter));
         }
         // Recurse in term order: the stack pops the last pushed
         // first, so push in reverse.
         while let Some(d) = deeper.pop() {
             work.push(d);
         }
+    }
+    // A skip-scan's loops: how many leading columns they step over.
+    #[cfg(feature = "multi_index")]
+    for l in loops.as_mut_slice().get_mut(from..).unwrap_or(&mut []) {
+        l.skip = l.eq.iter().take_while(|t| **t == usize::MAX).count();
     }
 }
 
@@ -2203,6 +2353,18 @@ fn lookup_cut(q: &Query<'_>, s: &Src, m: &IdxModel, wr: bool) -> i32 {
     cut + virt
 }
 
+/// The leading index columns loop `l` skip-scans (0 below
+/// `multi_index`).
+pub(crate) fn skip_of(l: &Loop) -> usize {
+    #[cfg(feature = "multi_index")]
+    return l.skip;
+    #[cfg(not(feature = "multi_index"))]
+    {
+        let _ = l;
+        0
+    }
+}
+
 /// A chosen loop as the executor's access path.
 pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxAccess {
     let _ = s;
@@ -2252,7 +2414,7 @@ pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bo
     IdxAccess {
         root,
         desc,
-        range_rowid: !tab.wr && root != 0 && eq.len() == nkeys,
+        range_rowid: !tab.wr && root != 0 && eq.len() + skip_of(l) == nkeys,
         eq,
         lo,
         hi,
@@ -2267,6 +2429,12 @@ pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bo
         auto: None,
         #[cfg(feature = "join_order")]
         bloom: None,
+        #[cfg(feature = "multi_index")]
+        or: None,
+        #[cfg(feature = "multi_index")]
+        skip: l.skip,
+        #[cfg(feature = "multi_index")]
+        first: None,
         #[cfg(feature = "explain")]
         eqp: (
             l.sorted,

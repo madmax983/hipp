@@ -17,11 +17,12 @@
 //!   data with NULLs and mixed types, with no statistics, with the
 //!   pin's ANALYZE and with hipp's; comma joins, JOIN ... ON, LEFT
 //!   JOIN and CROSS JOIN; equality, range, IN, BETWEEN and IS NOT NULL
-//!   terms; ORDER BY, GROUP BY, DISTINCT and LIMIT. The rows must be
+//!   terms, OR terms and IN subqueries (v0.17, `multi_index`); ORDER
+//!   BY, GROUP BY, DISTINCT, min() / max() and LIMIT. The rows must be
 //!   the pin's (none may differ as a set, a LIMIT's checked without
-//!   it), in the pin's order (at most 2 in 100 queries may come in
-//!   another, 0.75% measured over 1,600), and the plans the pin's (at
-//!   most 10 in 100 may differ, 6.6% measured, most of them 4- to
+//!   it), in the pin's order (at most 3 in 200 queries may come in
+//!   another, 0.94% measured over 1,600), and the plans the pin's (at
+//!   most 9 in 100 may differ, 7.9% measured, most of them 4- to
 //!   6-way joins: STATUS.md lists the classes);
 //! - a curated corpus of every plan form: reordering, the automatic
 //!   index and its partial form, Bloom filters with and without
@@ -337,12 +338,24 @@ fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
         let (al, t) = &aliases[r.n(aliases.len() as u64) as usize];
         let c = &t.cols[r.n(t.cols.len() as u64) as usize];
         let v = r.n(7);
-        conds.push(match r.n(6) {
+        // (v0.17, `multi_index`: OR terms and IN subqueries too.)
+        conds.push(match r.n(9) {
             0 => format!("{al}.{c}={v}"),
             1 => format!("{al}.{c}>{v}"),
             2 => format!("{al}.{c}<{v}"),
             3 => format!("{al}.{c} IS NOT NULL"),
             4 => format!("{al}.{c} IN (1,2,{v})"),
+            5 => {
+                let d = &t.cols[r.n(t.cols.len() as u64) as usize];
+                format!("({al}.{c}={v} OR {al}.{d}={})", r.n(7))
+            }
+            6 => {
+                let d = &t.cols[r.n(t.cols.len() as u64) as usize];
+                let (pa, pt) = &aliases[r.n(aliases.len() as u64) as usize];
+                let pc = &pt.cols[r.n(pt.cols.len() as u64) as usize];
+                format!("({al}.{c}={pa}.{pc} OR {al}.{d}={})", r.n(7))
+            }
+            7 => format!("{al}.{c} IN (SELECT a FROM t1 WHERE b>{v})"),
             _ => format!("{al}.{c} BETWEEN 1 AND {v}"),
         });
     }
@@ -360,7 +373,12 @@ fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
     let mode = r.n(100);
     let mut tail = String::new();
     let mut dist = "";
-    if mode < 15 && sel[0] != "*" {
+    // (v0.17, `multi_index`: a min() / max() over the join.)
+    if mode >= 92 && sel[0] != "*" {
+        let a = sel[r.n(sel.len() as u64) as usize].clone();
+        let f = if r.chance(50) { "min" } else { "max" };
+        sel = vec![format!("{f}({a})"), sel[0].clone()];
+    } else if mode < 15 && sel[0] != "*" {
         tail = format!(" ORDER BY {}", sel[r.n(sel.len() as u64) as usize]);
     } else if mode < 25 && sel[0] != "*" {
         let g = sel[r.n(sel.len() as u64) as usize].clone();
@@ -454,14 +472,18 @@ fn generated_joins_match_pin() {
         plan_bad.len()
     );
     assert!(hard.is_empty(), "rows differ:\n{}", hard.join("\n"));
+    // (v0.17, `multi_index`: OR terms, IN subqueries and min() / max()
+    // in the corpus; 15 orders and 126 plans of 1,600 at 400 seeds, 3
+    // and 20 of 240 at the default 60 — the limits were 2 and 10 in
+    // 100.)
     assert!(
-        order_bad.len() * 100 <= n * 2,
+        order_bad.len() * 200 <= n * 3,
         "{} of {n} row orders differ:\n{}",
         order_bad.len(),
         order_bad.join("\n")
     );
     assert!(
-        plan_bad.len() * 100 <= n * 10,
+        plan_bad.len() * 100 <= n * 9,
         "{} of {n} plans differ:\n{}",
         plan_bad.len(),
         plan_bad.join("\n")

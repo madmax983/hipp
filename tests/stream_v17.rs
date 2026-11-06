@@ -892,7 +892,13 @@ fn order_by_a_result_column_sorts_on_the_value_returned() {
             .collect();
         assert_eq!(inversions(&pin, desc), 0, "the pin sorts: {q}");
         let rows = mem_rows(Config::default(), setup, q).expect(q);
-        assert_eq!(rows.len(), pin.len(), "{q}");
+        // (How many distinct `random() % 5` values 60 rows give is
+        // itself random: up to 9 on either engine.)
+        if q.contains("DISTINCT") {
+            assert!((1..=9).contains(&rows.len()), "{q}");
+        } else {
+            assert_eq!(rows.len(), pin.len(), "{q}");
+        }
         assert_eq!(inversions(&rows, desc), 0, "hipp must sort: {q}");
     }
     // The rows a CREATE TABLE ... AS stores come in that order too.

@@ -1040,6 +1040,12 @@ pub struct EqpInfo {
     /// pin builds them together, `sqlite3ConstructBloomFilter`).
     #[cfg(feature = "join_order")]
     pub bloom_lines: u64,
+    /// The core is a min() / max() query the pin optimises (v0.17,
+    /// `multi_index`; `WHERE_ORDERBY_MIN` / `_MAX`): 1, every loop
+    /// prints `SEARCH`; 2, and the loops deliver the argument's order
+    /// (a `f(DISTINCT)` sorter is not needed).
+    #[cfg(feature = "multi_index")]
+    pub minmax: u8,
 }
 
 /// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
@@ -1795,6 +1801,23 @@ pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bo
         for k in x.keys.as_mut_slice() {
             remap_expr(&mut k.val, m);
         }
+    }
+    #[cfg(feature = "multi_index")]
+    if let Some(o) = &mut a.or {
+        for sub in o.subs.as_mut_slice() {
+            remap_expr(&mut sub.cond, m);
+            if let Some(x) = &mut sub.acc {
+                remap_access(x, m);
+            }
+        }
+        o.base = m(o.base, false);
+        o.src = m(o.src, true);
+    }
+    #[cfg(feature = "multi_index")]
+    if let Some(f) = &mut a.first {
+        remap_expr(&mut f.0, m);
+        f.1 = m(f.1, false);
+        f.2 = m(f.2, true);
     }
 }
 
@@ -2880,6 +2903,14 @@ fn row_cmp<E>(op: BinOp, l: &[RExpr], r: &[RExpr]) -> Result<RExpr, E> {
                     pair(i, strict)?,
                     bin(BinOp::And, pair(i, BinOp::Eq)?, acc),
                 );
+            }
+            // (v0.17, `multi_index`: under a double NOT, which changes
+            // no value, so the planner does not take the pin's vector
+            // comparison for an OR of branches it could read through
+            // a MULTI-INDEX OR.)
+            #[cfg(feature = "multi_index")]
+            if last > 0 {
+                acc = RExpr::Not(Box::new(RExpr::Not(Box::new(acc))));
             }
             return Ok(acc);
         }

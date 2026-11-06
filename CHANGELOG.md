@@ -5,6 +5,42 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Index strategies (leaf `multi_index`, in `xl`)
+
+- The MULTI-INDEX OR (`whereLoopAddOr`): an OR term whose every branch
+  has an index or rowid loop is a loop of its own, costed as the pin
+  costs it (the branches may use the WHERE clause's other terms); when
+  chosen each branch is planned again with the WHERE's pushed terms,
+  read in turn, a row returned at the first branch it satisfies — the
+  pin's rows, in its order, each once. One table, a join loop (the
+  commuted copies' `INDEX 3`), LEFT JOIN, UPDATE and DELETE. EXPLAIN
+  QUERY PLAN prints `MULTI-INDEX OR` / `INDEX n` trees.
+- min() / max(): a lone `min(x)` / `max(x)` (no GROUP BY, HAVING or
+  FILTER) is planned for x's order (NULLs last for min) and stops at
+  the first row passing the WHERE, so the bare columns are the pin's;
+  every loop prints `SEARCH`, a `f(DISTINCT)` the order delivers sorts
+  nothing.
+- Skip-scans of an index's leading columns when `sqlite_stat1` says
+  each value repeats 18 or more times (`ANY(a) AND b=?`); the IN
+  operator's statistics rule (an IN that costs more than the scan it
+  saves is a filter); whereLoopInsert / whereLoopAdjustCost for one
+  table's loops (`b = 2 AND c = 1` over an index on (b, c) uses both);
+  whereCombineDisjuncts (`x < 5 OR x = 5` is also `x <= 5`); the pin's
+  OR-to-IN rule (the first branch's column, then the commuted copies').
+- EXPLAIN QUERY PLAN (ungated, `explain`): an uncorrelated IN
+  subquery used as a filter shows its `CREATE BLOOM FILTER`; an
+  aggregate query's DISTINCT shows its temp B-tree. With `join_order`:
+  a join's WHERE subqueries are shown after the loop that computes
+  them.
+- Fixed (ungated, `expr_index`): an OR of equalities on one column
+  became an IN probe even when the values' affinity differs from the
+  column's (`x.c0 = y.c1 OR x.c0 = y.c2` with a TEXT `c0` and a REAL
+  `c1` lost rows); the pin's `okToChngToIN` check is applied.
+- Tests: `tests/multi_index_v17.rs`, `hipp-cli/tests/cli_v17_multi_index.rs`;
+  `tests/eqp_v16.rs` and `tests/join_order_v17.rs` generate OR terms,
+  IN subqueries and min() / max() and their limits are tighter.
+  Size: xl +20,648 B (1,135,004 B); max +168 B; full 0; tiny 0.
+
 ### Join ordering and automatic indexes (leaf `join_order`, in `xl`)
 
 - Joins of tables, virtual tables and JSON table-valued functions are
