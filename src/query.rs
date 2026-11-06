@@ -1191,6 +1191,15 @@ pub struct SubPlan {
     /// nothing was merged.
     #[cfg(feature = "flatten")]
     pub view_names: AVec<AVec<u8>>,
+    /// A derived table's `CteUse::is_cte`, `lazy` and `grp` (v0.17
+    /// review fix, `flatten`): what the unused-column omission and
+    /// the pin's reuse of a materialization need to know of it.
+    #[cfg(feature = "flatten")]
+    pub is_cte: bool,
+    #[cfg(feature = "flatten")]
+    pub lazy: bool,
+    #[cfg(feature = "flatten")]
+    pub grp: u32,
 }
 
 impl SubPlan {
@@ -1841,6 +1850,13 @@ pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bo
 #[cfg(feature = "join_order")]
 pub(crate) fn remap_plan(p: &mut SubPlan, m: &dyn Fn(usize, bool) -> usize) {
     for s in p.sources.as_mut_slice() {
+        // (Where EXPLAIN QUERY PLAN finds the source's columns moves
+        // with them: v0.17 review fix, an IN subquery's own index was
+        // not found past a semi-join source.)
+        #[cfg(feature = "explain")]
+        {
+            s.eqp.base = m(s.eqp.base, false);
+        }
         if let Some(on) = &mut s.on {
             remap_expr(on, m);
         }

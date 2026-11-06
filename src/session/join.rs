@@ -613,6 +613,64 @@ fn equiv_key(eq: &[(usize, usize, RExpr, RExpr)], x: usize) -> Option<RExpr> {
     None
 }
 
+/// A LEFT JOIN the WHERE clause rejects the NULL row of is an inner
+/// join (the pin's simplification, in FROM order, over the WHERE
+/// clause with every ON clause appended,
+/// `sqlite3ExprImpliesNonNullRow`): the ON clause of a LEFT JOIN not
+/// (yet) simplified proves nothing. Sources `sources` sit at
+/// `offsets`, the first one's rowid source is `first_src`.
+pub(super) fn simplify_left(
+    sources: &mut [SourcePlan],
+    offsets: &[usize],
+    first_src: usize,
+    filter: Option<&RExpr>,
+) {
+    let n = sources.len();
+    // (A RIGHT / FULL join's sources stay as written: the pin's
+    // `JT_LTORJ` exclusion, and their ON clauses join no row away.)
+    if sources.iter().any(|s| s.kind.pads_left()) {
+        return;
+    }
+    for i in 1..n {
+        let Some(&base) = offsets.get(i) else {
+            break;
+        };
+        let Some(sp) = sources.get(i) else {
+            break;
+        };
+        if sp.kind != crate::sql::JoinKind::Left {
+            continue;
+        }
+        let s = Src {
+            base,
+            ncols: sp.ncols,
+            src: first_src + i,
+            rowid_alias: sp.rowid_alias,
+        };
+        let mut tree: Option<RExpr> = filter.cloned();
+        for x in sources.iter() {
+            let Some(on) = &x.on else { continue };
+            let chunk = if matches!(
+                x.kind,
+                crate::sql::JoinKind::Inner | crate::sql::JoinKind::Cross
+            ) {
+                on.clone()
+            } else {
+                RExpr::Literal(OwnedValue::Null)
+            };
+            tree = Some(match tree {
+                None => chunk,
+                Some(t) => and_expr(Some(t), chunk),
+            });
+        }
+        if tree.as_ref().is_some_and(|t| s.null_rejects(t))
+            && let Some(sp) = sources.get_mut(i)
+        {
+            sp.kind = crate::sql::JoinKind::Inner;
+        }
+    }
+}
+
 /// The sources `e` reads, as a mask over the core's sources.
 fn src_mask(e: &RExpr, bands: &[RefRange]) -> u64 {
     let mut m = 0u64;
@@ -973,6 +1031,7 @@ impl<S: Storage> Connection<S> {
         has_agg: bool,
         distinct: bool,
         limit: Option<&RExpr>,
+        simplified: bool,
     ) -> Result<bool, S::Error> {
         // (The planner's frame is large: a core that is no join, the
         // common case on the deep planning paths, does not pay it.)
@@ -981,7 +1040,7 @@ impl<S: Storage> Connection<S> {
         }
         self.plan_join_body(
             arena, sources, cur, outer, items, filter, group_by, having, order_by, has_agg,
-            distinct, limit,
+            distinct, limit, simplified,
         )
     }
 
@@ -1002,6 +1061,7 @@ impl<S: Storage> Connection<S> {
         has_agg: bool,
         distinct: bool,
         limit: Option<&RExpr>,
+        simplified: bool,
     ) -> Result<bool, S::Error> {
         use crate::xplan::{conjuncts, log_est, terms};
         let n = sources.len();
@@ -1033,45 +1093,15 @@ impl<S: Storage> Connection<S> {
             first_src,
             filter.as_ref(),
         )?;
-        // A LEFT JOIN the WHERE clause rejects the NULL row of is an
-        // inner join (the pin's simplification, in FROM order, over
-        // the WHERE clause with every ON clause appended,
-        // `sqlite3ExprImpliesNonNullRow`): the ON clause of a LEFT
-        // JOIN not (yet) simplified proves nothing.
-        for i in 1..n {
-            let Some(&base) = offsets.as_slice().get(i) else {
-                break;
-            };
-            let Some(sp) = sources.as_slice().get(i) else {
-                break;
-            };
-            if sp.kind != crate::sql::JoinKind::Left {
-                continue;
-            }
-            let s = Src {
-                base,
-                ncols: sp.ncols,
-                src: first_src + i,
-                rowid_alias: sp.rowid_alias,
-            };
-            let mut tree: Option<RExpr> = filter.clone();
-            for x in sources.iter() {
-                let Some(on) = &x.on else { continue };
-                let chunk = if x.kind == crate::sql::JoinKind::Left {
-                    RExpr::Literal(OwnedValue::Null)
-                } else {
-                    on.clone()
-                };
-                tree = Some(match tree {
-                    None => chunk,
-                    Some(t) => and_expr(Some(t), chunk),
-                });
-            }
-            if tree.as_ref().is_some_and(|t| s.null_rejects(t))
-                && let Some(sp) = sources.as_mut_slice().get_mut(i)
-            {
-                sp.kind = crate::sql::JoinKind::Inner;
-            }
+        // (The flattener simplified a SELECT core's LEFT JOINs before
+        // it merged anything: `simplified`.)
+        if !simplified {
+            simplify_left(
+                sources.as_mut_slice(),
+                offsets.as_slice(),
+                first_src,
+                filter.as_ref(),
+            );
         }
         let mut bands: AVec<RefRange> = AVec::new();
         let mut srcs_s: AVec<Src> = AVec::new();
@@ -1891,6 +1921,37 @@ impl<S: Storage> Connection<S> {
                 None => w,
                 Some(f) => and_expr(Some(f), w),
             });
+        }
+        // A WHERE term the last source it reads is a semi-join's is
+        // checked at that loop, where the pin codes it (v0.17 review
+        // fix, `flatten`: an uncorrelated EXISTS's own term ran the
+        // whole join below each of its rows).
+        #[cfg(feature = "flatten")]
+        if sources.iter().any(|s| s.exists)
+            && let Some(f) = filter.take()
+        {
+            let mut parts: AVec<RExpr> = AVec::new();
+            super::flatten::and_terms(f, &mut parts);
+            let mut kept: Option<RExpr> = None;
+            for c in parts {
+                let m = src_mask(&c, bands.as_slice());
+                let mut target: Option<usize> = None;
+                for j in 0..n {
+                    if m & (1u64 << j) != 0
+                        && target.is_none_or(|t| posn.as_slice().get(j) > posn.as_slice().get(t))
+                    {
+                        target = Some(j);
+                    }
+                }
+                let semi = target.filter(|t| sources.as_slice().get(*t).is_some_and(|s| s.exists));
+                match semi.and_then(|t| new_on.as_mut_slice().get_mut(t)) {
+                    Some(slot) if !crate::query::has_sub(&c) => {
+                        *slot = Some(and_expr(slot.take(), c));
+                    }
+                    _ => kept = Some(and_expr(kept, c)),
+                }
+            }
+            *filter = kept;
         }
         // The new layout.
         let mut new_base: AVec<usize> = AVec::new();

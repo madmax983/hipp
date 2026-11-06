@@ -665,14 +665,27 @@ pub fn choose(
     let mut a = pick(q, s, tab, ts, list.as_slice())?;
     if let Some(p) = a.or.as_ref().map(|o| o.pending) {
         let info = ors.get(p)?;
-        a.or = Some(alloc::boxed::Box::new(or_access(
-            q,
-            s,
-            tab,
-            info,
-            avail,
-            &|_| true,
-        )));
+        let o = or_access(q, s, tab, info, avail, &|_| true);
+        // In a FROM-order join the branches' probes and conditions
+        // read the sources before this one, so its rows are found per
+        // combination (v0.17 review fix: under a FROM subquery's
+        // loop they were found once, for the first outer row).
+        if lateral {
+            let below = crate::query::RefRange {
+                w: (0, s.base),
+                s: (0, s.src),
+            };
+            let above = crate::query::RefRange {
+                w: (s.base.saturating_add(s.ncols), usize::MAX),
+                s: (s.src.saturating_add(1), usize::MAX),
+            };
+            a.lateral |= o.subs.iter().any(|b| {
+                b.acc.as_ref().is_some_and(|x| x.lateral)
+                    || crate::query::expr_refs_range(&b.cond, &below)
+                    || crate::query::expr_refs_range(&b.cond, &above)
+            });
+        }
+        a.or = Some(alloc::boxed::Box::new(o));
     }
     Some(a)
 }

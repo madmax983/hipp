@@ -3645,6 +3645,12 @@ impl<S: Storage> Connection<S> {
                 sel: stmt.sel,
                 #[cfg(feature = "flatten")]
                 view_names: AVec::new(),
+                #[cfg(feature = "flatten")]
+                is_cte: false,
+                #[cfg(feature = "flatten")]
+                lazy: false,
+                #[cfg(feature = "flatten")]
+                grp: 0,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
@@ -3690,6 +3696,12 @@ impl<S: Storage> Connection<S> {
             sel: stmt.sel,
             #[cfg(feature = "flatten")]
             view_names: core.view_names,
+            #[cfg(feature = "flatten")]
+            is_cte: false,
+            #[cfg(feature = "flatten")]
+            lazy: false,
+            #[cfg(feature = "flatten")]
+            grp: 0,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -4255,6 +4267,28 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
+        // v0.17 review fix (`flatten`): the FROM subqueries' columns
+        // nothing reads are not computed, as in a SELECT.
+        #[cfg(feature = "flatten")]
+        {
+            let mut reads: AVec<RExpr> = AVec::new();
+            for (_, e) in sets.iter() {
+                reads.push(e.clone());
+            }
+            if let Some(f) = &filter {
+                reads.push(f.clone());
+            }
+            flatten::prune_sources(
+                from_plans.as_mut_slice(),
+                fscope.offsets.as_slice(),
+                false,
+                &mut |mark: &dyn Fn(usize, bool) -> usize| {
+                    for e in reads.as_mut_slice() {
+                        crate::query::remap_expr(e, mark);
+                    }
+                },
+            );
+        }
         #[cfg(feature = "join_order")]
         let from_join = if from_plans.is_empty() || !t.has_rowid() {
             None
@@ -4429,6 +4463,7 @@ impl<S: Storage> Connection<S> {
             false,
             false,
             None,
+            false,
         )?;
         if !joined {
             return Ok(None);
@@ -5308,6 +5343,7 @@ impl<S: Storage> Connection<S> {
                 result_names: result_names.as_slice(),
                 result_named: result_named.as_slice(),
                 has_agg,
+                raw,
             },
         )?;
         // v0.16 (`expr_index`): each table source's index access
@@ -5387,6 +5423,8 @@ impl<S: Storage> Connection<S> {
                 has_agg,
                 stmt.distinct,
                 info_limit,
+                // (The flattener simplified the LEFT JOINs.)
+                cfg!(feature = "flatten"),
             )?;
         #[cfg(not(feature = "join_order"))]
         let joined = false;
@@ -5564,6 +5602,12 @@ impl<S: Storage> Connection<S> {
                 Some(c) if dplan.uncorrelated => c.mat,
                 _ => 0,
             };
+        }
+        #[cfg(feature = "flatten")]
+        if let Some(c) = s.cte.as_ref() {
+            dplan.is_cte = c.is_cte;
+            dplan.lazy = c.lazy && dplan.mat != 0;
+            dplan.grp = if dplan.uncorrelated { c.grp } else { 0 };
         }
         #[cfg(feature = "v16")]
         if s.cte.as_ref().is_some_and(|c| c.view) {
@@ -12931,6 +12975,22 @@ impl<'c, S: Storage> Statement<'c, S> {
         } else {
             None
         };
+        // A plain core (no aggregate, ORDER BY or DISTINCT) computes
+        // only the rows its LIMIT keeps, as the pin's loop stops there
+        // (v0.17 review fix, ungated: a later row's result column that
+        // overflows was raised).
+        let cap = match cap {
+            None if lone
+                && !plan.has_agg
+                && plan.group_by.is_empty()
+                && plan.order_by.is_empty()
+                && !plan.distinct
+                && streamed.1 != usize::MAX =>
+            {
+                Some(streamed.0.saturating_add(streamed.1))
+            }
+            c => c,
+        };
         // A lone core reading one derived table passes the bound
         // on (`derived_need`).
         #[cfg(feature = "v09")]
@@ -13638,6 +13698,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                     });
                     row_at += 1;
                     continue;
+                }
+                // (`cap`: a plain core's LIMIT, rows past it unseen.)
+                if cap.is_some_and(|c| out.len() >= c) {
+                    break;
                 }
                 let mut vals = AVec::new();
                 for it in plan.items.iter() {

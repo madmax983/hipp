@@ -41,6 +41,10 @@ pub(super) struct Parts<'a> {
     pub result_names: &'a [AVec<u8>],
     pub result_named: &'a [bool],
     pub has_agg: bool,
+    /// The core is a body planned raw for its reader's splice
+    /// (`Connection::flat_raw`): its sources may join the reader's,
+    /// so their shared materializations are settled there.
+    pub raw: bool,
 }
 
 /// Where a merged subquery's column `c` waits for its expression
@@ -234,7 +238,7 @@ fn fill_plan(p: &mut SubPlan, xs: &[RExpr]) -> bool {
 }
 
 /// The AND terms of `e`, in order.
-fn and_terms(e: RExpr, out: &mut AVec<RExpr>) {
+pub(super) fn and_terms(e: RExpr, out: &mut AVec<RExpr>) {
     match e {
         RExpr::Binary(crate::sql::BinOp::And, a, b) => {
             and_terms(*a, out);
@@ -475,6 +479,16 @@ impl<S: Storage> Connection<S> {
         mut p: Parts<'_>,
     ) -> Result<AVec<AVec<u8>>, S::Error> {
         let mut names = AVec::new();
+        // The pin's LEFT JOIN simplification comes first (v0.17
+        // review fix): before a body is merged, before a term is
+        // pushed down, before an EXISTS body's WHERE joins the core's.
+        let first_src = p.cur.first_src;
+        super::join::simplify_left(
+            p.sources.as_mut_slice(),
+            p.cur.offsets.as_slice(),
+            first_src,
+            p.filter.as_ref(),
+        );
         self.push_down(arena, stmt, enclosing, &mut p)?;
         if stmt.from.iter().any(|f| f.flat) {
             names = self.col_names_of(
@@ -533,6 +547,14 @@ impl<S: Storage> Connection<S> {
             }
             if !merged {
                 names.clear();
+            }
+            // The pin's `sqlite3WhereBegin` counts the sources after
+            // the flattener merged them (v0.17 review fix: past 64 the
+            // join's source masks overflowed).
+            if p.sources.len() > 64 {
+                return Err(Error::Schema {
+                    kind: SchemaKind::TooManyTables,
+                });
             }
         }
         prune(&mut p);
@@ -623,7 +645,8 @@ impl<S: Storage> Connection<S> {
                     e => out.push(e),
                 }
             }
-            if f.kind != JoinKind::Left
+            // (A LEFT JOIN the WHERE made inner takes its terms too.)
+            if sp.kind != JoinKind::Left
                 && let Some(w) = &stmt.filter
             {
                 conj(w, &mut cand);
@@ -848,14 +871,67 @@ impl<S: Storage> Connection<S> {
 
 /// The columns of the co-routines and materialisations of the core
 /// that nothing reads become NULL (the pin computes only the result
-/// columns its reader uses, unless the subquery is DISTINCT, an
-/// aggregate, windowed, MATERIALIZED or shared, a compound other than
-/// UNION ALL, or its ORDER BY names the column).
+/// columns its reader uses, unless the subquery is a CTE's reference
+/// or correlated, DISTINCT, an aggregate, windowed, MATERIALIZED, a
+/// compound other than UNION ALL, or its ORDER BY names the column).
 fn prune(p: &mut Parts<'_>) {
-    let n = p.sources.len();
+    let offs = p.cur.offsets.clone();
+    let (items, filter, group_by, having, order_by) = (
+        &mut *p.items,
+        &mut *p.filter,
+        &mut *p.group_by,
+        &mut *p.having,
+        &mut *p.order_by,
+    );
+    prune_sources(
+        p.sources.as_mut_slice(),
+        offs.as_slice(),
+        !p.raw,
+        &mut |mark: &dyn Fn(usize, bool) -> usize| {
+            for e in items.as_mut_slice() {
+                remap_expr(e, mark);
+            }
+            for e in filter.iter_mut() {
+                remap_expr(e, mark);
+            }
+            for e in group_by.as_mut_slice() {
+                remap_expr(e, mark);
+            }
+            for e in having.iter_mut() {
+                remap_expr(e, mark);
+            }
+            for (e, _) in order_by.as_mut_slice() {
+                remap_expr(e, mark);
+            }
+        },
+    );
+}
+
+/// A slot marker `prune_sources` hands its reader walk.
+pub(super) type Mark<'m> = &'m dyn Fn(usize, bool) -> usize;
+
+/// `prune` over FROM sources `sources` (their columns at `offs`), of
+/// which `reads` walks every expression outside the sources
+/// themselves — the SELECT core's clauses, or an UPDATE ... FROM's
+/// SET expressions and WHERE clause (v0.17 review fix: there every
+/// column was computed). Then the pin's reuse of one view's
+/// materialization by its copies in one FROM clause
+/// (`isSelfJoinView`) is settled: a copy that lost a column computes
+/// its own rows (the pin marks it changed, `SF_PushDown`), the copies
+/// left share one, and a lone one is materialized when a later copy
+/// stands beside it (`fromClauseTermCanBeCoroutine`'s rule 5), else
+/// planned on its own (`settle`; not for a body its reader merges).
+/// A NOT MATERIALIZED CTE's reference the pin runs as a co-routine is
+/// computed alone.
+pub(super) fn prune_sources(
+    sources: &mut [SourcePlan],
+    offs: &[usize],
+    settle: bool,
+    reads: &mut dyn FnMut(Mark<'_>),
+) {
+    let n = sources.len();
     for i in 0..n {
-        let (Some(sp), Some(&o)) = (p.sources.as_slice().get(i), p.cur.offsets.as_slice().get(i))
-        else {
+        let (Some(sp), Some(&o)) = (sources.get(i), offs.get(i)) else {
             continue;
         };
         let Some(dp) = sp.derived.as_deref() else {
@@ -863,11 +939,12 @@ fn prune(p: &mut Parts<'_>) {
         };
         if tvf_source(sp)
             || sp.rec != 0
+            || dp.is_cte
+            || !dp.uncorrelated
             || dp.distinct
             || dp.has_agg
             || !dp.group_by.is_empty()
             || dp.rec.is_some()
-            || dp.mat != 0
             || !dp.values.is_empty()
             || dp.items.iter().any(has_win)
             || dp.compound.iter().any(|(op, t)| {
@@ -900,22 +977,8 @@ fn prune(p: &mut Parts<'_>) {
                 }
                 v
             };
-            for e in p.items.as_mut_slice() {
-                remap_expr(e, &mark);
-            }
-            for e in p.filter.iter_mut() {
-                remap_expr(e, &mark);
-            }
-            for e in p.group_by.as_mut_slice() {
-                remap_expr(e, &mark);
-            }
-            for e in p.having.iter_mut() {
-                remap_expr(e, &mark);
-            }
-            for (e, _) in p.order_by.as_mut_slice() {
-                remap_expr(e, &mark);
-            }
-            for (j, s) in p.sources.as_mut_slice().iter_mut().enumerate() {
+            reads(&mark);
+            for (j, s) in sources.iter_mut().enumerate() {
                 if let Some(on) = s.on.as_mut() {
                     remap_expr(on, &mark);
                 }
@@ -941,14 +1004,10 @@ fn prune(p: &mut Parts<'_>) {
             }
         }
         let used = used.into_inner();
-        let Some(dp) = p
-            .sources
-            .as_mut_slice()
-            .get_mut(i)
-            .and_then(|s| s.derived.as_deref_mut())
-        else {
+        let Some(dp) = sources.get_mut(i).and_then(|s| s.derived.as_deref_mut()) else {
             continue;
         };
+        let mut changed = false;
         for c in 0..nk {
             if used.as_slice().get(c).copied().unwrap_or(true) {
                 continue;
@@ -964,15 +1023,82 @@ fn prune(p: &mut Parts<'_>) {
                 continue;
             }
             if let Some(it) = dp.items.as_mut_slice().get_mut(c) {
+                changed |= !matches!(it, RExpr::Literal(OwnedValue::Null));
                 *it = RExpr::Literal(OwnedValue::Null);
             }
             for (_, t) in dp.compound.as_mut_slice() {
                 if let Some(it) = t.items.as_mut_slice().get_mut(c) {
+                    changed |= !matches!(it, RExpr::Literal(OwnedValue::Null));
                     *it = RExpr::Literal(OwnedValue::Null);
                 }
             }
         }
+        // A view's copy that lost a column computes its own rows.
+        if changed && dp.grp != 0 {
+            dp.mat = 0;
+        }
     }
+    if !settle {
+        return;
+    }
+    // A NOT MATERIALIZED CTE's reference in a co-routine's place (no
+    // later reference of this FROM clause shares it) is one.
+    for i in 0..n {
+        let lazy = match sources.get(i).and_then(|s| s.derived.as_deref()) {
+            Some(d) if d.lazy && d.mat != 0 => d.mat,
+            _ => continue,
+        };
+        let later = sources
+            .iter()
+            .skip(i + 1)
+            .any(|s| s.derived.as_deref().is_some_and(|d| d.mat == lazy));
+        if !later
+            && coroutine_at(sources, i)
+            && let Some(d) = sources.get_mut(i).and_then(|s| s.derived.as_deref_mut())
+        {
+            d.mat = 0;
+        }
+    }
+    // The copies of each view group left sharing.
+    for i in 0..n {
+        let g = match sources.get(i).and_then(|s| s.derived.as_deref()) {
+            Some(d) if d.grp != 0 && d.mat != 0 => d.grp,
+            _ => continue,
+        };
+        let member = |s: &SourcePlan| s.derived.as_deref().is_some_and(|d| d.grp == g);
+        let sharing = |s: &SourcePlan| {
+            s.derived
+                .as_deref()
+                .is_some_and(|d| d.grp == g && d.mat != 0)
+        };
+        let before = sources.iter().take(i).any(sharing);
+        if before {
+            continue;
+        }
+        let others = sources.iter().skip(i + 1).any(sharing);
+        let later = sources.iter().skip(i + 1).any(member);
+        if !others
+            && !later
+            && let Some(d) = sources.get_mut(i).and_then(|s| s.derived.as_deref_mut())
+        {
+            d.mat = 0;
+        }
+    }
+}
+
+/// Whether source `i` of `sources` stands where the pin's
+/// `fromClauseTermCanBeCoroutine` allows a co-routine: no RIGHT /
+/// FULL join, and the first source, or one after plain tables of
+/// inner joins only.
+fn coroutine_at(sources: &[SourcePlan], i: usize) -> bool {
+    !sources.iter().any(|s| s.kind.pads_left())
+        && (i == 0
+            || sources.iter().take(i + 1).enumerate().all(|(j, s)| {
+                !matches!(
+                    s.kind,
+                    crate::sql::JoinKind::Left | crate::sql::JoinKind::Full
+                ) && (j == i || s.derived.is_none())
+            }))
 }
 
 /// Whether nested plan `q` of an `EXISTS` term is one the pin's
@@ -1046,6 +1172,17 @@ fn exists_join(p: &mut Parts<'_>, base: (usize, usize), stmt: &SelectStmt) {
                         && matches!(q.from.as_slice(), [f] if f.derived.is_none()
                             && f.args.is_none()),
                 ),
+                // A row value's `=` / `IS` resolves to one term per
+                // element (v0.17 review fix: the count lost its place).
+                Expr::Binary(crate::sql::BinOp::Eq | crate::sql::BinOp::Is, l, r) => {
+                    let n = match (&**l, &**r) {
+                        (Expr::Vector(v), _) | (_, Expr::Vector(v)) => v.len().max(1),
+                        _ => 1,
+                    };
+                    for _ in 0..n {
+                        out.push(false);
+                    }
+                }
                 _ => out.push(false),
             }
         }
@@ -1060,10 +1197,15 @@ fn exists_join(p: &mut Parts<'_>, base: (usize, usize), stmt: &SelectStmt) {
     };
     let mut terms = AVec::new();
     and_terms(f, &mut terms);
+    // (Fewer terms than written: the count cannot place them.)
+    if terms.len() < ast_terms {
+        *p.filter = and_all(terms);
+        return;
+    }
     let first_where = terms.len().saturating_sub(ast_terms);
     let mut added: AVec<RExpr> = AVec::new();
     for t in first_where..terms.len() {
-        if p.sources.len() >= 63 {
+        if p.sources.len() >= 64 {
             break;
         }
         let written = ast

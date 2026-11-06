@@ -151,6 +151,10 @@ struct Expander<'c> {
     /// a TEMP table's (the pin's `sqlite3FixSrcList`), so a temp
     /// table neither shadows them nor is read for a missing one.
     fix_main: bool,
+    /// Walking the SELECT of an `x IN (SELECT ...)` (v0.17 review
+    /// fix, `flatten`; see `cte`).
+    #[cfg(feature = "flatten")]
+    in_rhs: bool,
 }
 
 fn schema_err<E>(kind: SchemaKind) -> Error<E> {
@@ -182,6 +186,8 @@ impl<S: Storage> Connection<S> {
             fix_main: self.trig.fix_main.get(),
             #[cfg(not(feature = "triggers"))]
             fix_main: false,
+            #[cfg(feature = "flatten")]
+            in_rhs: false,
         }
     }
 
@@ -753,7 +759,18 @@ impl Expander<'_> {
                     .get((c.mat as usize).wrapping_sub(1))
                     .copied()
                     .unwrap_or((M10d::No, 0));
-                if !(hint == M10d::Yes || (hint == M10d::Any && uses >= 2)) {
+                // A NOT MATERIALIZED one read twice is shared by the
+                // references the pin materializes (v0.17 review fix,
+                // `flatten`; `CteUse::lazy`).
+                #[cfg(feature = "flatten")]
+                if hint == M10d::No && uses >= 2 {
+                    c.lazy = true;
+                }
+                #[cfg(feature = "flatten")]
+                let lazy = c.lazy;
+                #[cfg(not(feature = "flatten"))]
+                let lazy = false;
+                if !(lazy || hint == M10d::Yes || (hint == M10d::Any && uses >= 2)) {
                     c.mat = 0;
                 }
             }
@@ -772,6 +789,12 @@ impl Expander<'_> {
                     rec: RecMark::None,
                     view: false,
                     mat: self.new_mat(M10d::Yes, 1),
+                    #[cfg(feature = "flatten")]
+                    is_cte: false,
+                    #[cfg(feature = "flatten")]
+                    lazy: false,
+                    #[cfg(feature = "flatten")]
+                    grp: 0,
                 }));
             }
             return Ok(());
@@ -879,7 +902,10 @@ impl Expander<'_> {
             let kind = f.kind;
             match f.cte.as_mut() {
                 Some(c) if c.view && c.mat == u32::MAX => {
-                    if pushed {
+                    // (Without the flattener a pushed-down copy takes
+                    // no part; with it, it is a member that computes
+                    // its own rows, `CteUse::grp`.)
+                    if pushed && cfg!(not(feature = "flatten")) {
                         c.mat = 0;
                         continue;
                     }
@@ -899,7 +925,11 @@ impl Expander<'_> {
                             id
                         }
                     };
-                    c.mat = id;
+                    c.mat = if pushed { 0 } else { id };
+                    #[cfg(feature = "flatten")]
+                    {
+                        c.grp = id;
+                    }
                 }
                 Some(c) if c.mat != 0 || !matches!(c.rec, RecMark::None) => {}
                 _ => {
@@ -959,6 +989,12 @@ impl Expander<'_> {
             rec: RecMark::None,
             view: true,
             mat: 0,
+            #[cfg(feature = "flatten")]
+            is_cte: false,
+            #[cfg(feature = "flatten")]
+            lazy: false,
+            #[cfg(feature = "flatten")]
+            grp: 0,
         }));
         Ok(())
     }
@@ -996,7 +1032,15 @@ impl Expander<'_> {
             .as_mut_slice()
             .get_mut((mat as usize).wrapping_sub(1))
         {
-            m.1 = m.1.saturating_add(1);
+            // Inside an `x IN (SELECT ...)` the pin counts each
+            // reference twice (v0.17 review fix, `flatten`: probed, a
+            // CTE read only there is a MATERIALIZE, never a
+            // CO-ROUTINE).
+            #[cfg(feature = "flatten")]
+            let uses = if self.in_rhs { 2 } else { 1 };
+            #[cfg(not(feature = "flatten"))]
+            let uses = 1;
+            m.1 = m.1.saturating_add(uses);
         }
         let name = copy_vec(handle_bytes(self.arena, cte.name));
         let mut body = cte.select;
@@ -1033,6 +1077,12 @@ impl Expander<'_> {
             },
             view: false,
             mat,
+            #[cfg(feature = "flatten")]
+            is_cte: true,
+            #[cfg(feature = "flatten")]
+            lazy: false,
+            #[cfg(feature = "flatten")]
+            grp: 0,
         }));
         Ok(())
     }
@@ -1091,6 +1141,12 @@ impl Expander<'_> {
                             rec: RecMark::Ref { id },
                             view: false,
                             mat: 0,
+                            #[cfg(feature = "flatten")]
+                            is_cte: true,
+                            #[cfg(feature = "flatten")]
+                            lazy: false,
+                            #[cfg(feature = "flatten")]
+                            grp: 0,
                         }));
                     }
                 }
@@ -1179,7 +1235,14 @@ impl Expander<'_> {
             }
             Expr::InSubquery(a, s, _) => {
                 self.expr::<E>(a)?;
-                self.select::<E>(s)?;
+                #[cfg(feature = "flatten")]
+                let was = core::mem::replace(&mut self.in_rhs, true);
+                let r = self.select::<E>(s);
+                #[cfg(feature = "flatten")]
+                {
+                    self.in_rhs = was;
+                }
+                r?;
             }
             Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) => {
                 self.sub_limit = true;

@@ -1236,7 +1236,9 @@ core planner, `xjoin`, `session::join`, `session::stream`, `eqp`,
   ORDER BY names the column — so `SELECT a FROM v` answers where
   `v.b` would overflow, as on the pin (a flattened view never
   evaluates it either). An ungated-path correction: the row set is
-  unchanged; only errors the pin never raises are no longer raised.
+  unchanged; only errors the pin never raises are no longer raised
+  (corrected in the review fixes below: a CTE reference and a
+  correlated FROM subquery keep every column, as on the pin).
 - **EXISTS-to-join** (3.54's `existsToJoin`): an `EXISTS (SELECT ...
   FROM t WHERE w)` AND term of a WHERE clause, over one table of main
   with no aggregate, compound, window function or LIMIT of its own,
@@ -1343,13 +1345,226 @@ marking). `max` + the leaf measures 1,121,684 B (it pulls in
   co-routine after a LIMIT.
 - Push-down: not into the arms of UNION / INTERSECT / EXCEPT, not a
   term holding a subquery, not a WHERE term past a LEFT JOIN the
-  WHERE makes inner.
+  WHERE makes inner (closed in the review fixes: the LEFT JOIN
+  simplification now runs first).
 - EXISTS-to-join is not applied over a virtual table.
 - Co-routines and materialisations still keep FROM order in a join
   (the pin orders them, and builds automatic indexes and Bloom
   filters on them: `SEARCH s USING AUTOMATIC COVERING INDEX`).
 - The LEFT JOIN that EXPLAIN QUERY PLAN omits (`whereOmitNoopJoin`)
   stays as before.
+
+### Query flattening — review fixes (2026-11-06)
+
+**Status:** the review's ten findings on the `flatten` unit, each
+reproduced on the live 3.54.1 pin and fixed at its root, or recorded
+below as a gap. Gating as the unit: fixes to `flatten`'s own surface
+stay in the leaf; the four on paths `max` / `full` already claim are
+ungated (marked).
+
+**Fixed:**
+
+- **A CTE's unused columns are computed** (high; a regression of the
+  unit): the pin never omits the result columns of a CTE reference it
+  does not flatten (its `disableUnusedSubqueryResultColumns` skips
+  `isCte`), nor of a correlated FROM subquery — so `WITH r(n,e) AS
+  (SELECT a, abs(-9223372036854775807-1) FROM t1 LIMIT 3) SELECT r.n
+  FROM r, t1 WHERE r.n=t1.a` is "integer overflow" there (and under a
+  WHERE, a LEFT JOIN, NOT MATERIALIZED twice, UNION ALL, a scalar
+  subquery). hipp answered rows. `SubPlan::is_cte` (from
+  `CteUse::is_cte`) and the plan's correlation now keep every column;
+  views and written FROM subqueries are still pruned.
+- **More than 64 sources after a merge** (high): the 64-table check
+  ran on the FROM list as written, so two views of 33 tables each
+  merged into 66 sources, overflowed the join's `u64` source masks (a
+  debug-build panic in EXPLAIN QUERY PLAN, a hang on execution). The
+  flattener now refuses a core past 64 sources with the pin's "at
+  most 64 tables in a join" (`TooManyTables`); EXISTS-to-join stops at
+  64 sources (it stopped at 63).
+- **MULTI-INDEX OR under a kept subquery** (high, ungated in
+  `multi_index`'s single-table path): `xmulti::choose` never marked an
+  OR loop whose branches read an earlier source as lateral, so under a
+  co-routine or materialisation's loop (the FROM-order executor) its
+  rows were found once, for the first outer row: `... FROM (SELECT a,
+  c FROM m1 LIMIT 9) s, m2 WHERE m2.x=s.a OR m2.y=s.c` lost the second
+  row's matches (LEFT JOIN too).
+- **EXISTS-to-join beside a LEFT JOIN** (medium): the LEFT JOIN
+  simplification ran after the EXISTS body's WHERE had joined the
+  core's, so `w.x = t2.x` made `t1 LEFT JOIN t2` inner and reordered
+  it. The simplification (`join::simplify_left`) now runs first in
+  `flatten_core`, before any merge, push-down or EXISTS-to-join, as
+  the pin's `sqlite3Select` does (never in a core with a RIGHT / FULL
+  join, the pin's `JT_LTORJ`, and with only inner joins' ON clauses
+  counted — `tests/query_shape_v16.rs`'s corpus caught a FULL JOIN's
+  ON clause making the LEFT JOIN before it inner while this was
+  built) — which also closes two gaps: a WHERE
+  term on a flattened LEFT JOIN body's constant column (`s.one = 1`)
+  makes it inner, and a WHERE term is pushed into a LEFT JOIN's right
+  side the WHERE makes inner.
+- **UPDATE ... FROM computed unread columns** (medium): the omission
+  now covers an UPDATE ... FROM's subqueries and views (read by its
+  SET expressions, WHERE and ON clauses): `UPDATE t4 SET b=s.a FROM
+  (SELECT a, abs(...) e FROM t1 LIMIT 3) s ...` updates, as on the
+  pin.
+- **Shared materialisations, as the pin chooses them** (medium): a
+  view's copies in one FROM clause share one MATERIALIZE only while
+  none lost a column (the pin marks a changed copy, as it marks a
+  pushed-down one, so `isSelfJoinView` skips it): `SELECT r.n FROM vv
+  r, vv r2` is `CO-ROUTINE vv` + `MATERIALIZE vv` and computes each,
+  so the unread overflowing column is never raised; a lone copy is
+  materialised when a later one stands beside it (rule 5 of
+  `fromClauseTermCanBeCoroutine`), and a view brought in by a merged
+  body joins its reader's group (`CteUse::grp`, settled per core in
+  `prune_sources`). A NOT MATERIALIZED CTE read twice in one FROM
+  clause is one shared MATERIALIZE (`CteUse::lazy`), while a
+  reference in a co-routine's place is computed alone (so `random()`
+  differs between two scalar subqueries, as on the pin). A CTE read
+  inside an `x IN (SELECT ...)` counts twice (probed: it is then a
+  MATERIALIZE, never a CO-ROUTINE; the pin resolves the IN's SELECT
+  twice).
+- **Uncorrelated EXISTS was quadratic** (medium): a WHERE term whose
+  last source is a semi-join source is now checked at that loop
+  (`join.rs`, moved into its ON clause), where the pin codes it, so
+  `SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x >
+  1000000)` scans `u` once instead of running the whole join below
+  each of its rows (`tests/hoist_v13.rs` keeps its LIMITed EXISTS
+  counts; the new `uncorrelated_exists_join_is_linear` checks the
+  plain one).
+- **Foreign-key child scans** (low): each child loop is now planned as
+  the pin's `fkScanChildren` read — `parent_value = child.key`, the
+  parent value carrying the parent column's affinity and (unless it
+  is the INTEGER PRIMARY KEY) its collation — so an IPK / INT parent
+  never searches a TEXT / BLOB / untyped child index, a NOCASE child
+  index is no use for a BINARY key, a key the index does not hold
+  whole is no covering read, and a full scan reads a narrower covering
+  index (`SCAN c2 USING COVERING INDEX c2k`). INSERT on a parent now
+  prints its scans: one round per REPLACE that can delete (the rowid
+  when supplied, each UNIQUE index whose action is REPLACE), the old
+  and new rows of an upsert DO UPDATE changing a key, then the
+  inserted row's — only for deferred keys unless the INSERT is a
+  multi-row write (SELECT, several VALUES rows, a REPLACE, RETURNING,
+  INSERT triggers, a key-changing DO UPDATE).
+- **EXISTS-to-join beside a row value** (low): `(a,b)=(2,20)` resolves
+  to two AND terms; the written-term count now counts them, so the
+  EXISTS beside it is converted (a count that cannot place the terms
+  converts nothing).
+- **The generators and thresholds** (medium): `tests/eqp_v16.rs` has
+  a second generated test, `generated_subquery_plans_match_pin`
+  (flattened FROM subqueries and CTE bodies, LIMITed ones, EXISTS made
+  joins, a LIMITed compound subquery, IN over a FROM subquery — none of
+  3,200 differ at 400 seeds, so none may); `tests/join_order_v17.rs`
+  adds two joins per schema reading tables through views and FROM
+  subqueries and adding EXISTS terms (limits of their own: 2 orders and
+  13 plans in 100; measured 2 and 15 of 120 at 60 seeds, 11 and 101 of
+  800 at 400 — the misses are the join cost model's, reached through
+  the merged sources), its four original joins unchanged; the flatten
+  corpus gains overflowing result columns in a view, a LIMITed view, a
+  CTE and a FROM subquery, and its limits tighten from 10% / 50% to
+  7% / 45% (measured 5.8% / 39% over 360, 6.0% / 43% over 3,600).
+
+Found while widening the corpora, fixed too:
+
+- **A plain LIMITed FROM subquery projected every row** (ungated,
+  `v06`): under a reader with a WHERE (so not flattened) the body's
+  result columns were computed for all its rows before the LIMIT
+  kept 8; a later row's overflowing column was raised. A core without
+  aggregate, ORDER BY or DISTINCT now projects only the rows its LIMIT
+  keeps (`exec_subplan_inner`'s cap).
+- **A probe's scalar subquery in EXPLAIN QUERY PLAN** (ungated,
+  `expr_index`): a subquery in an index probe's value or range bound
+  is shown with its loop, before the WHERE's other subqueries, as the
+  pin codes it (`... AND a=(SELECT 2 ...)` printed its `SCALAR
+  SUBQUERY` after the IN's `LIST SUBQUERY`).
+- **EXPLAIN QUERY PLAN lost a nested subquery's own source** past a
+  merge or a semi-join source (ungated, `join_order`): `remap_plan`
+  now moves the nested sources' column base with their slots, so the
+  IN operator's own index (`USING INDEX i FOR IN-OPERATOR`) is found
+  again there.
+
+**Oracle-probing notes** (live 3.54.1 pin): a CTE reference
+co-routine / materialisation raises an error in any column (a LIMITed
+CTE under a WHERE, a join, a LEFT JOIN, twice NOT MATERIALIZED, UNION
+ALL of two references, a scalar subquery); a flattened CTE does not;
+a correlated FROM subquery computes every column, the reader's own
+correlation does not count. Views read twice: `SELECT r.n FROM vv r, vv
+r2` (LIMIT view, unread `e`) is CO-ROUTINE + MATERIALIZE; with every
+column read one shared MATERIALIZE; reading `r.n, r2.e` is CO-ROUTINE +
+MATERIALIZE; `t1, vv r, vv r2` with only `r2` pruned is two
+MATERIALIZEs; aggregate or DISTINCT views twice share one. NOT
+MATERIALIZED aggregate CTE twice in one FROM: one MATERIALIZE (and the
+pin builds an automatic index on the second read); in two scalar
+subqueries: two co-routines (`random()` differs). A CTE read inside an
+IN list — in WHERE or the result list, nested in a scalar subquery
+there, in a compound arm — is a MATERIALIZE; in a scalar subquery or
+EXISTS a CO-ROUTINE. Parent INSERT child scans: none for a one-row
+INSERT, OR IGNORE, DO NOTHING or a DO UPDATE of non-key columns; one
+round for several VALUES rows or a SELECT; REPLACE of a supplied rowid
+adds a round per conflict check; a deferred key is scanned for any
+INSERT; `INSERT OR REPLACE INTO p(v) ...` (no rowid, no UNIQUE) scans
+deferred keys only. The pin's materialisation is lazy (`OP_Once` at
+the first row reaching the loop): a later source that is never reached
+is never computed, so its errors never fire — hipp materialises before
+the join (a gap below; the corpus keeps erroring CTEs first).
+
+**Tests:** `tests/flatten_v17.rs` — `review_regressions` (every
+finding's repro, rows in order and plans; rows only for the automatic
+index the pin builds on a second materialisation), `flattened_join_
+past_64_sources_is_refused`, `update_from_omits_unused_columns`,
+`uncorrelated_exists_join_is_linear`, `foreign_key_child_scan_rules_
+match_pin` (plans), and the widened `generated_corpus_matches_pin`;
+`tests/eqp_v16.rs` `generated_subquery_plans_match_pin`;
+`tests/join_order_v17.rs`'s widened corpus;
+`hipp-cli/tests/cli_v17_flatten.rs` `review_regressions`.
+
+**Gates:** `cargo fmt --all` and `ci/local-gates.sh` (full run) end with
+"==> all gates passed"; `tests/depth_v16.rs` and `tests/triggers_v16.rs`
+pass built with debug info (STACK_* unchanged).
+
+**Size Δ** (thumbv7em, `--profile tiny`): tiny 76,960 → 76,960 (0);
+full 506,656 → 506,728 (+72: the LIMITed plain core's projection
+cap, ungated `v06`); max 1,047,868 → 1,048,036 (+168: the cap and the
+probe subqueries shown with their loop; 540 B of the 1 MiB budget
+left); xl 1,156,732 → 1,159,132 (+2,400: the CTE / correlation / view
+group rules of the column omission and its UPDATE ... FROM walk, the
+lazy NOT MATERIALIZED sharing, the IN double count, the LEFT JOIN
+simplification moved first, the semi-join term placement, the 64-source
+check, the planned FK child loops and the INSERT rounds). Each ratchet
+is its measured figure.
+
+**Honest gaps** (left):
+
+- Co-routines and materialisations still keep FROM order in a join,
+  with no automatic index or Bloom filter on them (most of the
+  corpus's plan differences), and UNION ALL bodies are not flattened
+  into a compound reader.
+- A materialisation is computed before the join, where the pin
+  computes it at the first row that reaches its loop: a CTE (or other
+  body computing every column) behind a loop that yields no row raises
+  its error in hipp alone.
+- Nested EXISTS: hipp converts bottom-up (the inner EXISTS becomes a
+  join of the body, which then has two sources and is refused), the
+  pin top-down (the outer becomes `SEARCH t2 EXISTS`, the inner stays
+  a correlated subquery).
+- A row value beside an EXISTS converts it, but the pin then orders
+  the semi-join after the row value's loop (`SEARCH t ... ; SCAN u
+  EXISTS`) where hipp puts it first.
+- Push-down into a windowed subquery on its PARTITION BY columns is
+  not done (the pin does: `SEARCH t1 USING COVERING INDEX t1b (b=?)`
+  inside the co-routine); a subquery with ORDER BY is not flattened
+  under a window-function reader or inside a compound arm (the pin
+  does).
+- A LEFT JOIN's right-side subquery the WHERE makes inner is still
+  refused by the expansion's flattening rules (decided before the
+  plan's simplification), so it stays a co-routine where the pin
+  flattens it.
+- UPDATE ... FROM: no flattening or push-down (rows are the pin's, and
+  unread columns are not computed; the plan keeps its co-routine).
+- Parent-INSERT child scans do not count INSERT triggers that would
+  make the write multi-row in every case, nor the upsert's own
+  conflict target (its REPLACE rounds come from the statement's and
+  constraints' actions).
+- The `min()` bare-column tie: a join's `min(x), y` with ties in `x`
+  may take `y` from another row than the pin (join order), as before.
 
 ## v0.16 — SQLite-parity push
 

@@ -166,6 +166,55 @@ fn same_on(path: &Path, setup: &str, qs: &[&str]) {
     assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
 }
 
+/// `same_on` for the rows (or errors) alone: the plans of these
+/// differ in a documented way (STATUS.md's honest gaps).
+fn same_rows_on(path: &Path, setup: &str, qs: &[&str]) {
+    let owned: Vec<String> = qs.iter().map(|q| q.to_string()).collect();
+    let got = hipp_answers(path, setup, &owned);
+    let mut bad = Vec::new();
+    for (q, (rows, _)) in qs.iter().zip(got) {
+        let p_rows = pin(path, setup, q);
+        match (&rows, &p_rows) {
+            (Ok(h), Ok(p)) if h.as_slice() == p.as_bytes() => {}
+            (Err(_), Err(_)) => {}
+            _ => bad.push(format!(
+                "{q}\n  pin rows : {p_rows:?}\n  hipp rows: {:?}",
+                rows.as_ref()
+                    .map(|r| String::from_utf8_lossy(r).to_string())
+            )),
+        }
+    }
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// `same_on` for the plans alone (the statements are not run: writes).
+fn same_plans_on(path: &Path, setup: &str, qs: &[&str]) {
+    let mut bad = Vec::new();
+    let plans: Vec<Result<String, String>> = block_on(async {
+        let fs = FileStorage::open(path).expect("fs open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
+        if !setup.is_empty() {
+            collect(&mut db, setup).await.expect("setup");
+        }
+        let mut out = Vec::new();
+        for q in qs {
+            out.push(eqp_of(&mut db, q).await);
+        }
+        out
+    });
+    for (q, plan) in qs.iter().zip(plans) {
+        let p_plan = pin(path, setup, &format!("EXPLAIN QUERY PLAN {q}"));
+        match (&plan, &p_plan) {
+            (Ok(h), Ok(p)) if h == p => {}
+            (Err(_), Err(_)) => {}
+            _ => bad.push(format!(
+                "{q}\n  pin plan : {p_plan:?}\n  hipp plan: {plan:?}"
+            )),
+        }
+    }
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
 const SCHEMA: &str = "
 CREATE TABLE t(a INTEGER PRIMARY KEY, b, c);
 CREATE INDEX tb ON t(b);
@@ -470,6 +519,12 @@ fn gen_schema(r: &mut Rng) -> String {
     s.push_str("CREATE VIEW vg AS SELECT y, count(*) n, sum(z) s FROM t2 GROUP BY y;\n");
     s.push_str("CREATE VIEW vj AS SELECT t1.a, t2.y, t2.z FROM t1, t2 WHERE t1.b = t2.y;\n");
     s.push_str("CREATE VIEW vd AS SELECT DISTINCT k FROM t3;\n");
+    // (Review: result columns that overflow, which only a reader that
+    // computes them raises.)
+    s.push_str("CREATE VIEW vbad AS SELECT a, b, abs(a - 9223372036854775807 - 2) bad FROM t1;\n");
+    s.push_str(
+        "CREATE VIEW vbadl AS SELECT x, y, abs(x - 9223372036854775807 - 2) bad FROM t2 LIMIT 7;\n",
+    );
     s
 }
 
@@ -477,7 +532,14 @@ fn gen_schema(r: &mut Rng) -> String {
 fn gen_query(r: &mut Rng) -> String {
     // A FROM source and the columns it offers (qualified by `q`).
     let source = |r: &mut Rng, q: &str| -> (String, Vec<String>) {
-        let (text, cols): (String, Vec<&str>) = match r.n(12) {
+        let (text, cols): (String, Vec<&str>) = match r.n(17) {
+            12 => ("vbad".into(), vec!["a", "b"]),
+            13 => ("vbadl".into(), vec!["x", "y"]),
+            14 => ("c2".into(), vec!["a", "b"]),
+            15 => (
+                "(SELECT k, v, abs(k - 9223372036854775807 - 2) e FROM t3 LIMIT 6)".into(),
+                vec!["k", "v"],
+            ),
             0 => ("t1".into(), vec!["a", "b"]),
             1 => ("t2".into(), vec!["x", "y"]),
             2 => ("va".into(), vec!["a", "b"]),
@@ -500,19 +562,34 @@ fn gen_query(r: &mut Rng) -> String {
         )
     };
     let with = match r.n(4) {
-        0 => "WITH c1(a, b) AS (SELECT a, b FROM t1) ",
-        1 => "WITH c1(a, b) AS MATERIALIZED (SELECT a, b FROM t1) ",
-        2 => "WITH c1(a, b) AS NOT MATERIALIZED (SELECT a, b FROM t1 WHERE b > 1) ",
+        0 => "WITH c1(a, b) AS (SELECT a, b FROM t1)",
+        1 => "WITH c1(a, b) AS MATERIALIZED (SELECT a, b FROM t1)",
+        2 => "WITH c1(a, b) AS NOT MATERIALIZED (SELECT a, b FROM t1 WHERE b > 1)",
         _ => {
-            "WITH RECURSIVE c1(a, b) AS (SELECT 1, 1 UNION ALL SELECT a + 1, b * 2 FROM c1 WHERE a < 5) "
+            "WITH RECURSIVE c1(a, b) AS (SELECT 1, 1 UNION ALL SELECT a + 1, b * 2 FROM c1 WHERE a < 5)"
         }
     };
+    // (A CTE with an overflowing column: the pin computes every column
+    // of a reference it does not flatten.)
+    let with = format!(
+        "{with}, c2(a, b, e) AS {}(SELECT a, b, abs(a - 9223372036854775807 - 2) FROM t1{}) ",
+        r.pick(&["", "", "NOT MATERIALIZED "]),
+        r.pick(&["", " LIMIT 8", " WHERE b > 0"])
+    );
     let n = 1 + r.n(3) as usize;
     let mut from = String::new();
     let mut cols: Vec<String> = Vec::new();
     for i in 0..n {
         let q = format!("s{i}");
-        let (text, cs) = source(r, &q);
+        let (mut text, mut cs) = source(r, &q);
+        // (c2 computes its overflowing column whenever it is computed
+        // at all; hipp materialises a later source before the join,
+        // where the pin does it at the first row that reaches it — so
+        // c2 only leads.)
+        if i > 0 && text.starts_with("c2 ") {
+            text = format!("c1 {q}");
+            cs = vec![format!("{q}.a"), format!("{q}.b")];
+        }
         if i == 0 {
             from.push_str(&text);
         } else {
@@ -569,11 +646,13 @@ fn sorted_lines(b: &[u8]) -> Vec<Vec<u8>> {
 
 /// The generated corpus: no row set differs (rows of a LIMITed query
 /// without a full ORDER BY are not compared as sets) and no error
-/// disagrees; at most 10% come in another order and at most 50% print
-/// another plan (measured 8.9% and 45% over 360 queries: co-routines
-/// and materialisations keep FROM order in a join, and UNION ALL
-/// bodies are not flattened into a compound reader — STATUS.md's
-/// honest gaps).
+/// disagrees — overflowing result columns in a view, a LIMITed view, a
+/// CTE and a FROM subquery included; at most 7% come in another order
+/// and at most 45% print another plan (v0.17 review: measured 5.8% and
+/// 39% over 360 queries, 6.0% and 43% over 3,600 — it was 10% and 50%:
+/// co-routines and materialisations keep FROM order in a join with no
+/// automatic index on them, and UNION ALL bodies are not flattened into
+/// a compound reader — STATUS.md's honest gaps).
 #[test]
 fn generated_corpus_matches_pin() {
     let seeds: u64 = std::env::var("HIPP_FLAT_SEEDS")
@@ -634,11 +713,11 @@ fn generated_corpus_matches_pin() {
         report.join("\n")
     );
     assert!(
-        order_bad * 100 <= total * 10,
+        order_bad * 100 <= total * 7,
         "{order_bad} of {total} in another order"
     );
     assert!(
-        plan_bad * 100 <= total * 50,
+        plan_bad * 100 <= total * 45,
         "{plan_bad} of {total} plans differ"
     );
 }
@@ -667,6 +746,251 @@ fn regressions() {
             "SELECT x FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.b >= u.x) ORDER BY x",
             "SELECT x FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.b >= u.x)",
             "SELECT count(*) FROM u, w WHERE EXISTS (SELECT 1 FROM t WHERE t.b >= u.x)",
+        ],
+    );
+}
+
+/// Review regressions (v0.17 flatten review): each against the pin's
+/// rows (or error) and plan.
+#[test]
+fn review_regressions() {
+    let path = fresh("review", SCHEMA);
+    common::cli(
+        &path,
+        "CREATE TABLE r1(a INTEGER PRIMARY KEY); INSERT INTO r1 VALUES(1),(2),(3);
+         CREATE VIEW rv AS SELECT a n, abs(-9223372036854775807-1) e FROM r1 LIMIT 3;
+         CREATE VIEW rvb AS SELECT a n, b e FROM t LIMIT 3;
+         CREATE TABLE m1(a, c); CREATE TABLE m2(x, y);
+         CREATE INDEX m2x ON m2(x); CREATE INDEX m2y ON m2(y);
+         INSERT INTO m1 VALUES(1,'a'),(2,'b');
+         INSERT INTO m2 VALUES(1,'p'),(2,'q'),(3,'b');",
+    );
+    same_on(
+        &path,
+        "",
+        &[
+            // A CTE's reference the pin does not flatten computes every
+            // column (it never omits a CTE's: the error is raised).
+            "WITH r(n,e) AS (SELECT a, abs(-9223372036854775807-1) FROM r1 LIMIT 3) SELECT r.n FROM r, r1 WHERE r.n=r1.a",
+            "WITH r(n,e) AS (SELECT a, abs(-9223372036854775807-1) FROM r1 LIMIT 3) SELECT n FROM r WHERE n>1",
+            "WITH r(n,e) AS (SELECT a, abs(-9223372036854775807-1) FROM r1 LIMIT 3) SELECT r.n FROM r1 LEFT JOIN r ON r.n=r1.a",
+            "WITH r(n,e) AS (SELECT a, abs(-9223372036854775807-1) FROM r1 LIMIT 3) SELECT n FROM r UNION ALL SELECT n FROM r",
+            "WITH r(n,e) AS (SELECT a, abs(-9223372036854775807-1) FROM r1 LIMIT 3) SELECT (SELECT max(n) FROM r)",
+            // A flattened CTE's unused column is gone with the merge.
+            "WITH r(n,e) AS (SELECT a, abs(-9223372036854775807-1) FROM r1) SELECT n FROM r, r1 WHERE n=a",
+            // A correlated FROM subquery computes every column; the
+            // reader's correlation does not count.
+            "SELECT (SELECT x FROM (SELECT r1.a x, abs(-9223372036854775807-1) e FROM r1 u LIMIT 1)) FROM r1",
+            "SELECT (SELECT x FROM (SELECT u.a x, abs(-9223372036854775807-1) e FROM r1 u LIMIT 2) WHERE x>r1.a) FROM r1",
+            // A view read twice: a copy that lost a column computes its
+            // own rows (CO-ROUTINE + MATERIALIZE); copies that did not
+            // share one MATERIALIZE.
+            "SELECT r.n FROM rv r, rv r2 WHERE r.n=r2.n",
+            "SELECT r.n, r.e, r2.e FROM rvb r, rvb r2 WHERE r.n=r2.n",
+            "SELECT r.n, r2.e FROM rvb r, rvb r2 WHERE r.n=r2.n",
+            "SELECT 1 FROM rvb r, rvb r2 WHERE r.n=r2.n",
+            // A NOT MATERIALIZED CTE read twice in one FROM clause is
+            // materialised once; one read inside an IN counts twice.
+            "WITH g(x) AS (SELECT b FROM t LIMIT 2) SELECT * FROM t WHERE b IN (SELECT x FROM g WHERE x>1)",
+            "WITH g(x) AS (SELECT b FROM t LIMIT 2) SELECT b IN (SELECT x FROM g WHERE x>1) FROM t",
+            "WITH g(x) AS (SELECT b FROM t LIMIT 2) SELECT * FROM t WHERE a = (SELECT x FROM g WHERE x>1)",
+            // A scalar subquery probing an index is shown with its loop.
+            "SELECT * FROM t WHERE c IN (SELECT b FROM t LIMIT 1) AND a=(SELECT 2 FROM t LIMIT 1)",
+            "SELECT * FROM t WHERE c IN (SELECT b FROM t LIMIT 1) AND a>(SELECT 1) AND a<(SELECT 3)",
+            // A MULTI-INDEX OR under a kept subquery's loop: every outer
+            // row's matches.
+            "SELECT s.a, y FROM (SELECT a, c FROM m1 LIMIT 9) s, m2 WHERE m2.x=s.a OR m2.y=s.c",
+            "WITH m AS MATERIALIZED (SELECT a, c FROM m1) SELECT m.a, y FROM m, m2 WHERE m2.x=m.a OR m2.y=m.c",
+            "SELECT s.a, y FROM (SELECT a, c FROM m1 LIMIT 9) s LEFT JOIN m2 ON m2.x=s.a OR m2.y=s.c",
+            // EXISTS-to-join beside a LEFT JOIN: the LEFT JOIN stays
+            // (the pin simplifies it first).
+            "SELECT * FROM t LEFT JOIN u ON x=a WHERE EXISTS (SELECT 1 FROM u w WHERE w.x=u.x)",
+            "SELECT * FROM t LEFT JOIN u ON x=a WHERE EXISTS (SELECT 1 FROM u w WHERE NOT (w.x <> u.x))",
+            // A WHERE term on a flattened LEFT JOIN body's constant
+            // column makes it an inner join.
+            "SELECT * FROM t LEFT JOIN (SELECT x, y, 1 one FROM u) s ON s.x=t.a WHERE s.one=1",
+            // A row value beside an EXISTS.
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x=t.b) AND (a,b)=(2,3)",
+            "SELECT * FROM t WHERE (a,b)=(2,3) AND EXISTS (SELECT 1 FROM u WHERE x=t.b)",
+            // An uncorrelated EXISTS's own term is checked at its loop.
+            "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x > 1000000)",
+        ],
+    );
+    // (The pin builds an automatic index on the second
+    // materialisation; hipp keeps FROM order without one.)
+    same_rows_on(
+        &path,
+        "",
+        &[
+            "WITH r(n,e) AS NOT MATERIALIZED (SELECT a, abs(-9223372036854775807-1) FROM r1 LIMIT 3) SELECT r.n FROM r JOIN r r2 ON r.n=r2.n",
+            "WITH g AS NOT MATERIALIZED (SELECT b, count(*) c FROM t GROUP BY b) SELECT * FROM g x, g y WHERE x.c=y.c",
+            "WITH g AS NOT MATERIALIZED (SELECT b, count(*) c FROM t GROUP BY b) SELECT * FROM g x LEFT JOIN g y ON x.c=y.c",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x=a) AND (a,b)=(2,3)",
+            // The LEFT JOIN simplification ignores a FULL / RIGHT
+            // JOIN's ON clause (it made `t LEFT JOIN u` inner, losing
+            // t's rows; hipp's RIGHT / FULL join reads whole tables).
+            "SELECT * FROM t LEFT JOIN u ON t.a < u.x FULL JOIN w ON w.p = u.x ORDER BY 1, 2, 3, 4, 5, 6, 7",
+            "SELECT * FROM t LEFT JOIN u ON t.a < u.x RIGHT JOIN w ON w.p = u.x ORDER BY 1, 2, 3, 4, 5, 6, 7",
+        ],
+    );
+    // Their materialisations, though, are the pin's: one, shared.
+    same_plans_on(
+        &path,
+        "",
+        &[
+            "WITH g AS NOT MATERIALIZED (SELECT b, count(*) c FROM t GROUP BY b) SELECT b FROM g x WHERE b IN (SELECT b FROM g)",
+            "WITH g AS NOT MATERIALIZED (SELECT b, count(*) c FROM t GROUP BY b) SELECT (SELECT max(c) FROM g), b FROM g",
+        ],
+    );
+}
+
+/// More than 64 sources after the flattener merged the views: the
+/// pin's "at most 64 tables in a join" (32 + 32 still joins).
+#[test]
+fn flattened_join_past_64_sources_is_refused() {
+    for n in [32usize, 33] {
+        let fr: Vec<String> = (0..n).map(|i| format!("t t{i}")).collect();
+        let wh: Vec<String> = (1..n).map(|i| format!("t{i}.a=t{}.a+0", i - 1)).collect();
+        let schema = format!(
+            "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2),(3);
+             CREATE VIEW v AS SELECT t0.a a, t{}.a z FROM {} WHERE {};",
+            n - 1,
+            fr.join(","),
+            wh.join(" AND ")
+        );
+        let path = fresh(&format!("wide{n}"), &schema);
+        same_on(
+            &path,
+            "",
+            &["SELECT count(*), sum(x.a), sum(y.z) FROM v x, v y WHERE x.a=y.z+1"],
+        );
+    }
+}
+
+/// UPDATE ... FROM computes only the FROM subqueries' columns it reads
+/// (the pin flattens the view; the subquery stays), so an error in an
+/// unread one is not raised.
+#[test]
+fn update_from_omits_unused_columns() {
+    let schema = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b); INSERT INTO t1 VALUES(1,10),(2,20);
+         CREATE TABLE t4(a, b); INSERT INTO t4 VALUES(1,2);
+         CREATE TABLE t2(x INT, y, z); INSERT INTO t2 VALUES(1,'p',100),(2,'q',200);
+         CREATE VIEW v AS SELECT a, b, abs(-9223372036854775807-1) bad FROM t1;";
+    for (tag, write, read) in [
+        (
+            "uf1",
+            "UPDATE t4 SET b=s.a FROM (SELECT a, abs(-9223372036854775807-1) e FROM t1 LIMIT 3) s WHERE s.a=t4.a",
+            "SELECT * FROM t4",
+        ),
+        (
+            "uf2",
+            "UPDATE t2 SET z = v.b FROM v WHERE v.a=t2.x",
+            "SELECT * FROM t2",
+        ),
+        (
+            "uf3",
+            "UPDATE t2 SET z = v.bad FROM v WHERE v.a=t2.x",
+            "SELECT * FROM t2",
+        ),
+    ] {
+        let hp = fresh(tag, schema);
+        let pp = fresh(&format!("{tag}p"), schema);
+        let h = hipp_answers(&hp, "", &[write.to_string(), read.to_string()]);
+        let pw = pin(&pp, "", write);
+        assert_eq!(
+            h[0].0.is_ok(),
+            pw.is_ok(),
+            "{write}: {:?} vs {pw:?}",
+            h[0].0
+        );
+        let pr = pin(&pp, "", read).expect("pin read");
+        assert_eq!(
+            h[1].0
+                .as_ref()
+                .map(|r| String::from_utf8_lossy(r).to_string()),
+            Ok(pr),
+            "{write}"
+        );
+    }
+}
+
+/// An uncorrelated EXISTS made a join loop is linear: its own WHERE
+/// term is checked at its loop (it ran the whole join below each of its
+/// rows: minutes at this size in a debug build).
+#[test]
+fn uncorrelated_exists_join_is_linear() {
+    let path = fresh(
+        "exlin",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b); CREATE TABLE u(x, y);
+         WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<10000) INSERT INTO t SELECT n, n%7 FROM r;
+         WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<10000) INSERT INTO u SELECT n, n%5 FROM r;",
+    );
+    let q = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x > 1000000)".to_string();
+    let start = std::time::Instant::now();
+    let got = hipp_answers(&path, "", std::slice::from_ref(&q));
+    let took = start.elapsed();
+    assert_eq!(
+        got[0]
+            .0
+            .as_ref()
+            .map(|r| String::from_utf8_lossy(r).to_string())
+            .ok(),
+        pin(&path, "", &q).ok()
+    );
+    assert!(took.as_secs() < 30, "took {took:?}");
+}
+
+/// The foreign-key child scans of a parent write follow the pin's
+/// rules for the parent value: its affinity (an IPK or INT parent never
+/// searches a TEXT / BLOB / untyped child index) and its collation (a
+/// NOCASE child index is no use for a BINARY key), a covering read only
+/// when the index holds the whole key, and the INSERT side: REPLACE,
+/// upsert DO UPDATE of a key, several rows, a deferred key.
+#[test]
+fn foreign_key_child_scan_rules_match_pin() {
+    let schema = "
+CREATE TABLE p(id INTEGER PRIMARY KEY, v);
+CREATE TABLE c1(k REFERENCES p, j); CREATE INDEX c1k ON c1(k);
+CREATE TABLE c2(k TEXT REFERENCES p); CREATE INDEX c2k ON c2(k);
+CREATE TABLE c3(k INT REFERENCES p); CREATE INDEX c3k ON c3(k);
+CREATE TABLE c4(k BLOB REFERENCES p); CREATE INDEX c4k ON c4(k);
+CREATE TABLE pu(id INTEGER PRIMARY KEY, u TEXT UNIQUE);
+CREATE TABLE d1(k REFERENCES pu(u)); CREATE INDEX d1k ON d1(k);
+CREATE TABLE d2(k TEXT COLLATE NOCASE REFERENCES pu(u)); CREATE INDEX d2k ON d2(k);
+CREATE TABLE d3(k TEXT REFERENCES pu(u)); CREATE INDEX d3k ON d3(k COLLATE NOCASE);
+CREATE TABLE pq(id INTEGER PRIMARY KEY, q TEXT COLLATE NOCASE UNIQUE);
+CREATE TABLE g1(k REFERENCES pq(q)); CREATE INDEX g1k ON g1(k);
+CREATE TABLE g2(k TEXT REFERENCES pq(q)); CREATE INDEX g2k ON g2(k COLLATE NOCASE);
+CREATE TABLE p2(a, b, PRIMARY KEY(a, b));
+CREATE TABLE qc(x, y, FOREIGN KEY(y, x) REFERENCES p2(a, b)); CREATE INDEX qcx ON qc(y);
+CREATE TABLE pd(id INTEGER PRIMARY KEY, v);
+CREATE TABLE dd(k REFERENCES pd DEFERRABLE INITIALLY DEFERRED, j); CREATE INDEX ddk ON dd(k);
+CREATE TABLE di(k REFERENCES pd, j); CREATE INDEX dik ON di(k);
+CREATE TABLE s(x);
+";
+    let path = fresh("fkrules", schema);
+    same_plans_on(
+        &path,
+        "PRAGMA foreign_keys = ON",
+        &[
+            "DELETE FROM p WHERE id = 1",
+            "DELETE FROM pu WHERE id = 1",
+            "DELETE FROM pq WHERE id = 1",
+            "DELETE FROM p2",
+            "UPDATE p SET id = 3 WHERE id = 1",
+            "INSERT INTO p VALUES(1, 2)",
+            "INSERT INTO p VALUES(1, 2), (3, 4)",
+            "INSERT INTO p SELECT x, x FROM s",
+            "INSERT OR IGNORE INTO p VALUES(1, 2)",
+            "INSERT INTO p VALUES(1, 2) ON CONFLICT DO NOTHING",
+            "INSERT INTO p VALUES(1, 2) ON CONFLICT(id) DO UPDATE SET v = 3",
+            "INSERT INTO p VALUES(1, 2) ON CONFLICT(id) DO UPDATE SET id = 2",
+            "REPLACE INTO p VALUES(1, 2)",
+            "REPLACE INTO p SELECT x, x FROM s",
+            "REPLACE INTO pu VALUES(1, 'a')",
+            "INSERT INTO pu VALUES(1, 'a') ON CONFLICT(u) DO UPDATE SET id = 5",
+            "INSERT INTO pd VALUES(1, 2)",
+            "INSERT OR REPLACE INTO pd(v) VALUES(5)",
         ],
     );
 }

@@ -23,7 +23,10 @@
 //!   it), in the pin's order (at most 3 in 200 queries may come in
 //!   another, 0.94% measured over 1,600), and the plans the pin's (at
 //!   most 9 in 100 may differ, 7.9% measured, most of them 4- to
-//!   6-way joins: STATUS.md lists the classes);
+//!   6-way joins: STATUS.md lists the classes); two more joins per
+//!   schema (v0.17 flatten review) read tables through views and FROM
+//!   subqueries the pin flattens and add EXISTS terms it makes
+//!   semi-joins, under limits of their own (2 and 13 in 100);
 //! - a curated corpus of every plan form: reordering, the automatic
 //!   index and its partial form, Bloom filters with and without
 //!   statistics, LEFT / CROSS JOIN ordering constraints, LEFT JOIN
@@ -291,13 +294,32 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
             }
             out += &format!("INSERT OR IGNORE INTO {name} VALUES({});\n", vals.join(","));
         }
+        // (v0.17 flatten review: a view over each table, which the
+        // pin flattens into its reader.)
+        out += &format!("CREATE VIEW v{name} AS SELECT * FROM {name};\n");
         tabs.push(Tab { name, cols });
     }
     (out, tabs)
 }
 
-/// A 2- to 6-way join over `tabs`.
-fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
+/// A FROM source over table `t`: the table, or (v0.17 flatten review)
+/// its view or a FROM subquery over it, which the pin flattens into
+/// the join.
+fn src_text(r: &mut Rng, wide: bool, t: &Tab) -> String {
+    if !wide {
+        return t.name.clone();
+    }
+    match r.n(4) {
+        0 => format!("v{}", t.name),
+        1 => format!("(SELECT * FROM {})", t.name),
+        _ => t.name.clone(),
+    }
+}
+
+/// A 2- to 6-way join over `tabs`; `wide` (v0.17 flatten review) also
+/// draws views, FROM subqueries and EXISTS terms (without it the query
+/// is the one this corpus measured before).
+fn gen_query(r: &mut Rng, wide: bool, tabs: &[Tab]) -> String {
     let k = 2 + r.n(tabs.len() as u64 - 1) as usize;
     let mut order: Vec<usize> = (0..tabs.len()).collect();
     for i in (1..order.len()).rev() {
@@ -315,7 +337,7 @@ fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
             format!("{pa}.{}", pt.cols[r.n(pt.cols.len() as u64) as usize])
         };
         if i == 0 {
-            from = format!("{} {al}", t.name);
+            from = format!("{} {al}", src_text(r, wide, t));
         } else {
             let op = r.pick(&[",", ",", " JOIN ", " LEFT JOIN ", " CROSS JOIN ", " JOIN "]);
             let mut on = String::new();
@@ -330,9 +352,20 @@ fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
                 let c = &t.cols[r.n(t.cols.len() as u64) as usize];
                 conds.push(format!("{al}.{c}={}", pick_prev(r, &aliases)));
             }
-            from += &format!("{op}{} {al}{on}", t.name);
+            from += &format!("{op}{} {al}{on}", src_text(r, wide, t));
         }
         aliases.push((al, t));
+    }
+    // (v0.17 flatten review: an EXISTS the pin makes a semi-join.)
+    if wide && r.chance(30) {
+        let (al, t) = &aliases[r.n(aliases.len() as u64) as usize];
+        let c = &t.cols[r.n(t.cols.len() as u64) as usize];
+        let u = &tabs[r.n(tabs.len() as u64) as usize];
+        let d = &u.cols[r.n(u.cols.len() as u64) as usize];
+        conds.push(format!(
+            "EXISTS (SELECT 1 FROM {} e WHERE e.{d} = {al}.{c})",
+            u.name
+        ));
     }
     for _ in 0..r.n(3) {
         let (al, t) = &aliases[r.n(aliases.len() as u64) as usize];
@@ -414,6 +447,9 @@ fn generated_joins_match_pin() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
     let (mut n, mut order_bad, mut plan_bad) = (0usize, Vec::new(), Vec::new());
+    // (v0.17 flatten review: the queries with a view, a FROM subquery
+    // or an EXISTS, counted apart.)
+    let (mut n_w, mut order_w, mut plan_w) = (0usize, Vec::new(), Vec::new());
     let mut hard = Vec::new();
     for seed in 1..=seeds {
         let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -426,10 +462,21 @@ fn generated_joins_match_pin() {
         if (25..40).contains(&stats) {
             hipp_exec(&path, "ANALYZE");
         }
-        let qs: Vec<String> = (0..4).map(|_| gen_query(&mut r, &tabs)).collect();
+        let mut qs: Vec<String> = (0..4).map(|_| gen_query(&mut r, false, &tabs)).collect();
+        // (v0.17 flatten review: two more, over views, FROM subqueries
+        // and EXISTS, drawn apart so the four stay as measured.)
+        let mut rw = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
+        qs.push(gen_query(&mut rw, true, &tabs));
+        qs.push(gen_query(&mut rw, true, &tabs));
         let got = hipp_answers(&path, &qs);
-        for (q, (rows, plan)) in qs.iter().zip(got) {
-            n += 1;
+        for (qi, (q, (rows, plan))) in qs.iter().zip(got).enumerate() {
+            let wide = qi >= 4;
+            let (n, order_bad, plan_bad) = if wide {
+                (&mut n_w, &mut order_w, &mut plan_w)
+            } else {
+                (&mut n, &mut order_bad, &mut plan_bad)
+            };
+            *n += 1;
             let p_rows = pin(&path, q);
             match (&rows, &p_rows) {
                 (Ok(h), Ok(p)) if h.as_slice() == p.as_bytes() => {}
@@ -473,10 +520,12 @@ fn generated_joins_match_pin() {
         }
     }
     eprintln!(
-        "{n} queries: {} other rows, {} other orders, {} other plans",
+        "{n} queries: {} other rows, {} other orders, {} other plans; with views, FROM subqueries or EXISTS: {n_w} queries, {} other orders, {} other plans",
         hard.len(),
         order_bad.len(),
-        plan_bad.len()
+        plan_bad.len(),
+        order_w.len(),
+        plan_w.len()
     );
     assert!(hard.is_empty(), "rows differ:\n{}", hard.join("\n"));
     // (v0.17, `multi_index`: OR terms, IN subqueries and min() / max()
@@ -496,6 +545,23 @@ fn generated_joins_match_pin() {
         "{} of {n} plans differ:\n{}",
         plan_bad.len(),
         plan_bad.join("\n")
+    );
+    // (v0.17 flatten review: the views, FROM subqueries and EXISTS
+    // terms the pin flattens or makes semi-joins: 2 orders and 15
+    // plans of 120 at the default 60 seeds, 11 and 101 of 800 at 400 —
+    // the misses are the join cost model's, as above, now reached
+    // through the merged sources.)
+    assert!(
+        order_w.len() * 100 <= n_w * 2,
+        "{} of {n_w} row orders differ:\n{}",
+        order_w.len(),
+        order_w.join("\n")
+    );
+    assert!(
+        plan_w.len() * 100 <= n_w * 13,
+        "{} of {n_w} plans differ:\n{}",
+        plan_w.len(),
+        plan_w.join("\n")
     );
     if !order_bad.is_empty() || !plan_bad.is_empty() {
         eprintln!(

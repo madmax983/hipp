@@ -433,6 +433,12 @@ impl<S: Storage> Connection<S> {
             sel: 0,
             #[cfg(feature = "flatten")]
             view_names: AVec::new(),
+            #[cfg(feature = "flatten")]
+            is_cte: false,
+            #[cfg(feature = "flatten")]
+            lazy: false,
+            #[cfg(feature = "flatten")]
+            grp: 0,
         };
         let vname = if own { copy_vec(n) } else { AVec::new() };
         plans.push(SourcePlan {

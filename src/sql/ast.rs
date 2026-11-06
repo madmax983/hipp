@@ -706,6 +706,24 @@ pub struct CteUse {
     /// the pin's reuse of a materialized CTE (and of a view that
     /// a FROM clause names twice); see `session::cte`.
     pub mat: u32,
+    /// The source names a CTE (v0.17 review fix, `flatten`): the pin
+    /// computes every result column of a CTE reference it does not
+    /// flatten (`disableUnusedSubqueryResultColumns` skips `isCte`).
+    #[cfg(feature = "flatten")]
+    pub is_cte: bool,
+    /// A `NOT MATERIALIZED` CTE read more than once (v0.17 review fix,
+    /// `flatten`): `mat` is shared by the references the pin
+    /// materializes, while one it can run as a co-routine
+    /// (`fromClauseTermCanBeCoroutine`) is computed alone.
+    #[cfg(feature = "flatten")]
+    pub lazy: bool,
+    /// The view group this reference belongs to (v0.17 review fix,
+    /// `flatten`; 0: none): every reference of one view in one FROM
+    /// clause, kept when `mat` is cleared, so the planner can settle
+    /// the pin's `isSelfJoinView` reuse once it knows which copies
+    /// lost unused columns.
+    #[cfg(feature = "flatten")]
+    pub grp: u32,
 }
 
 /// A CTE's `MATERIALIZED` / `NOT MATERIALIZED` hint (v0.16, `v16`).

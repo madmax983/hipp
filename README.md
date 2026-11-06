@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 506,656 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,047,868 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,156,732 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 506,728 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,048,036 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,159,132 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -150,11 +150,21 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   co-routine. The subqueries that stay take the reader's WHERE terms
   that read only them (`pushDownWhereTerms`, into HAVING for an
   aggregate's non-GROUP BY terms) and compute only the result columns
-  their reader reads — so an error in a column nobody reads is not
-  raised, as on the pin. A WHERE `EXISTS (SELECT ... FROM t ...)`
-  becomes a semi-join loop (`SEARCH t EXISTS`), and a parent DELETE /
-  UPDATE under `PRAGMA foreign_keys` shows the pin's child-table scans.
-  Without the leaf subqueries plan as in 0.16 (`src/session/flatten.rs`).
+  their reader reads — views and written subqueries, never a CTE's
+  reference or a correlated one, which the pin computes whole — so an
+  error in a column nobody reads is not raised, as on the pin (in an
+  UPDATE ... FROM too); a view's copies share one materialisation only
+  while none lost a column, as the pin's `isSelfJoinView`. A WHERE
+  `EXISTS (SELECT ... FROM t ...)` becomes a semi-join loop (`SEARCH t
+  EXISTS`, its own terms checked at its loop), beside a LEFT JOIN the
+  pin's simplification keeps, and a parent DELETE / UPDATE / INSERT
+  under `PRAGMA foreign_keys` shows the pin's child-table scans,
+  planned with the parent key's affinity and collation. A merge past 64
+  sources is the pin's "at most 64 tables in a join". Review fixes,
+  ungated: a MULTI-INDEX OR under a subquery's loop found the first
+  outer row's matches only; a LIMITed FROM subquery computed its
+  result columns past the LIMIT. Without the leaf subqueries plan as
+  in 0.16 (`src/session/flatten.rs`).
 
 ## What v0.16 does
 

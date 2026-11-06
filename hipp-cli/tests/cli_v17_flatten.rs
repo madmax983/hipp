@@ -144,3 +144,41 @@ SELECT u.x, s.one FROM u LEFT JOIN (SELECT a, 1 AS one, abs(a - 9223372036854775
 ",
     );
 }
+
+/// Review regressions (v0.17 flatten review), both engines answering:
+/// a view read twice (CO-ROUTINE + MATERIALIZE once a copy loses a
+/// column), a CTE read inside an IN (a MATERIALIZE), a MULTI-INDEX OR
+/// under a kept subquery, an EXISTS beside a LEFT JOIN, an UPDATE ...
+/// FROM over an unread overflowing column, and the foreign-key child
+/// scans' affinity, collation and INSERT rules.
+#[test]
+fn review_regressions() {
+    same(
+        "review",
+        "CREATE TABLE t1(a INTEGER PRIMARY KEY, b); INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+CREATE VIEW vv AS SELECT a n, abs(-9223372036854775807-1) e FROM t1 LIMIT 3;
+CREATE TABLE m1(a, c); CREATE TABLE m2(x, y);
+CREATE INDEX m2x ON m2(x); CREATE INDEX m2y ON m2(y);
+INSERT INTO m1 VALUES(1,'a'),(2,'b'); INSERT INTO m2 VALUES(1,'p'),(2,'q'),(3,'b');
+CREATE TABLE t2(x INT, y, z); CREATE INDEX t2x ON t2(x);
+INSERT INTO t2 VALUES(1,'p',100),(2,'q',200),(2,'r',300),(NULL,'s',400),(5,'t',NULL);
+CREATE TABLE t4(a, b); INSERT INTO t4 VALUES(1,2);",
+        "SELECT r.n FROM vv r, vv r2 WHERE r.n=r2.n;
+EXPLAIN QUERY PLAN SELECT r.n FROM vv r, vv r2 WHERE r.n=r2.n;
+WITH g(x) AS (SELECT b FROM t1 LIMIT 2) SELECT * FROM t1 WHERE b IN (SELECT x FROM g WHERE x>10);
+EXPLAIN QUERY PLAN WITH g(x) AS (SELECT b FROM t1 LIMIT 2) SELECT * FROM t1 WHERE b IN (SELECT x FROM g WHERE x>10);
+SELECT s.a, y FROM (SELECT a, c FROM m1 LIMIT 9) s, m2 WHERE m2.x=s.a OR m2.y=s.c;
+SELECT * FROM t1 LEFT JOIN t2 ON x=a WHERE EXISTS (SELECT 1 FROM t2 w WHERE w.x=t2.x);
+EXPLAIN QUERY PLAN SELECT * FROM t1 LEFT JOIN t2 ON x=a WHERE EXISTS (SELECT 1 FROM t2 w WHERE w.x=t2.x);
+UPDATE t4 SET b=s.a FROM (SELECT a, abs(-9223372036854775807-1) e FROM t1 LIMIT 3) s WHERE s.a=t4.a;
+SELECT * FROM t4;
+PRAGMA foreign_keys = ON;
+CREATE TABLE p(id INTEGER PRIMARY KEY, v);
+CREATE TABLE c(k REFERENCES p, j); CREATE INDEX ck ON c(k);
+CREATE TABLE ct(k TEXT REFERENCES p); CREATE INDEX ctk ON ct(k);
+EXPLAIN QUERY PLAN DELETE FROM p WHERE id = 1;
+EXPLAIN QUERY PLAN REPLACE INTO p VALUES(1, 2);
+EXPLAIN QUERY PLAN INSERT INTO p VALUES(1, 2), (3, 4);
+",
+    );
+}

@@ -32,6 +32,29 @@ All notable changes to hipp. Versions follow the milestones in
 - Tests: `tests/flatten_v17.rs`, `hipp-cli/tests/cli_v17_flatten.rs`;
   `tests/eqp_v16.rs`'s flattened-view and EXISTS differences now match
   the pin. Size: tiny 0, full −16 B, max −8 B, xl +15,688 B.
+- Review fixes: a CTE's reference and a correlated FROM subquery
+  compute every column (the omission raised no error where the pin
+  does); a merge past 64 sources is "at most 64 tables in a join" (the
+  source masks overflowed); the LEFT JOIN simplification runs before
+  any merge, push-down or EXISTS-to-join (an EXISTS made a LEFT JOIN
+  inner); UPDATE ... FROM omits unread subquery / view columns; a
+  view's copies share a materialisation only while none lost a column,
+  a NOT MATERIALIZED CTE read twice in one FROM clause is shared, a CTE
+  inside an IN counts twice (the pin's CO-ROUTINE / MATERIALIZE
+  choice); an uncorrelated EXISTS's own term is checked at its loop
+  (it was quadratic); FK child scans follow the parent key's affinity
+  and collation, show the covering read correctly, and INSERT on a
+  parent prints its rounds; a row value beside an EXISTS no longer
+  stops the conversion. Ungated: a MULTI-INDEX OR under a kept
+  subquery's loop found only the first outer row's matches (rows
+  lost); a LIMITed plain FROM subquery computed columns of rows past
+  its LIMIT; a probe's scalar subquery is shown with its loop in
+  EXPLAIN QUERY PLAN; a nested subquery's IN-operator index is found
+  past a merge. Tests: review regressions, a subquery corpus in
+  `tests/eqp_v16.rs` (none may differ), views / FROM subqueries /
+  EXISTS in `tests/join_order_v17.rs` under limits of their own,
+  overflowing columns and tighter limits (7% / 45%) in the flatten
+  corpus. Size: tiny 0, full +72 B, max +168 B, xl +2,400 B.
 
 ### Index strategies (leaf `multi_index`, in `xl`)
 
