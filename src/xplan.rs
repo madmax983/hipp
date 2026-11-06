@@ -46,12 +46,17 @@
 //! WHERE term (the same expression, an OR containing it, or `x IS NOT
 //! NULL` after a comparison of x — `sqlite3ExprImpliesExpr`).
 //!
+//! With the `join_order` leaf (v0.17) a join of two or more sources
+//! is planned as a whole by `crate::xjoin` (the pin's join order,
+//! automatic indexes, Bloom filters), from the candidate loops this
+//! module builds, and `sqlite_stat1` is read back: its row estimates
+//! replace the defaults (`IdxModel::est`, `Table::rows`).
+//!
 //! What is not modelled (the order may then differ from the pin's,
-//! never the rows): join reordering (sources run in FROM order, each
-//! with its own best loop), automatic indexes, the MULTI-INDEX OR
-//! plan, the LIKE prefix optimisation, skip-scans and every
-//! `sqlite_stat1` / `sqlite_stat4` estimate (ANALYZE's statistics are
-//! written but not read back).
+//! never the rows): without `join_order`, join reordering (sources run
+//! in FROM order, each with its own best loop), automatic indexes and
+//! every `sqlite_stat1` estimate; in every build the MULTI-INDEX OR
+//! plan, the LIKE prefix optimisation, skip-scans and `sqlite_stat4`.
 
 use crate::arena::AVec;
 use crate::query::{RExpr, RefRange, binary_coll, expr_coll, expr_refs_range, same_expr};
@@ -103,13 +108,27 @@ pub fn log_est_add(a: i32, b: i32) -> i32 {
     }
 }
 
+/// The pin's `sqlite3LogEstFromDouble` (v0.17, `join_order`: a
+/// virtual table's estimatedCost).
+#[cfg(feature = "join_order")]
+pub fn log_est_from_double(x: f64) -> i32 {
+    if x.is_nan() || x <= 1.0 {
+        return 0;
+    }
+    if x <= 2_000_000_000.0 {
+        return log_est(x as u64);
+    }
+    let e = ((x.to_bits() >> 52) & 0x7ff) as i32 - 1022;
+    e * 10
+}
+
 /// The pin's `estLog`: the LogEst of log(N) for a LogEst N.
-fn est_log(n: i32) -> i32 {
+pub(crate) fn est_log(n: i32) -> i32 {
     if n <= 10 { 0 } else { log_est(n as u64) - 33 }
 }
 
 /// The pin's default table size (`nRowLogEst`, 1,048,576 rows).
-const ROWS: i32 = 200;
+pub(crate) const ROWS: i32 = 200;
 
 /// A column's size estimate (the pin's `Column.szEst`, from
 /// `sqlite3AffinityType`): 1 for numeric types and no type, 5 for
@@ -211,10 +230,22 @@ pub struct Term {
     /// (`TERM_VNULL`): a range for costing; it bounds nothing (the
     /// scan skips NULL keys, the WHERE term still filters).
     pub vnull: bool,
+    /// The pin's commuted copy of a comparison whose left operand is
+    /// a column too (`TERM_VIRTUAL`, v0.17 `join_order`): it sits
+    /// after every original term in the WHERE clause's term list.
+    #[cfg(feature = "join_order")]
+    pub virt: bool,
+    /// The pin's `truthProb` (v0.17 review fix): 1 when none is given,
+    /// else the LogEst of a likely() / unlikely() / likelihood()
+    /// probability (<= 0), which replaces the default estimates.
+    /// Virtual terms (commuted copies, BETWEEN halves, `x > NULL`,
+    /// OR-to-IN) inherit their parent's (`markTermAsChild`).
+    #[cfg(feature = "join_order")]
+    pub truth: i32,
 }
 
 impl Term {
-    fn is_eq(&self) -> bool {
+    pub(crate) fn is_eq(&self) -> bool {
         matches!(self.op, TOp::Eq | TOp::Is | TOp::In(_) | TOp::InSub(_))
     }
     fn lower(&self) -> bool {
@@ -254,10 +285,8 @@ impl Src {
     /// a top-level `IS NOT NULL` counts only where the AND chain's
     /// left operands are tried.
     pub fn null_rejects(&self, e: &RExpr) -> bool {
-        let mut p = e;
-        while let RExpr::Collate(a, _) = p {
-            p = a;
-        }
+        // (`sqlite3ExprSkipCollateAndLikely` first: v0.17 review fix.)
+        let mut p = skip_collate_likely(e);
         if let RExpr::IsNull(a, true) = p {
             return self.non_null_row(a);
         }
@@ -306,8 +335,96 @@ impl Src {
     }
 }
 
-/// Split a condition into its AND terms.
+/// `e` with top-level COLLATE and likely() / unlikely() /
+/// likelihood() wrappers removed (the pin's
+/// `sqlite3ExprSkipCollateAndLikely`): neither changes whether a
+/// WHERE term is true.
+pub fn skip_collate_likely(e: &RExpr) -> &RExpr {
+    let mut p = e;
+    loop {
+        match p {
+            RExpr::Collate(a, _) => p = a,
+            RExpr::Scalar(crate::query::ScalarFn::Likely, a) => match a.as_slice().first() {
+                Some(x) => p = x,
+                None => return p,
+            },
+            _ => return p,
+        }
+    }
+}
+
+/// Split a condition into its AND terms, each with its top-level
+/// COLLATE / likely() wrappers removed, as the pin's
+/// `sqlite3WhereSplit` and `whereClauseInsert` do (v0.17 review fix:
+/// `likely(b.x = a.y)` is still a join constraint).
 pub fn conjuncts<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+    let mut stack: AVec<&'x RExpr> = AVec::new();
+    stack.push(e);
+    while let Some(x) = stack.pop() {
+        #[cfg(feature = "join_order")]
+        let x = skip_collate_likely(x);
+        match x {
+            RExpr::Binary(BinOp::And, a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            x => out.push(x),
+        }
+    }
+}
+
+/// Per AND term of `e`, in `conjuncts` order: its truth probability
+/// (the pin's `truthProb`: `LogEst(P * 2^27) - 270` for a term that
+/// is a likely() / unlikely() / likelihood() call, else 1, "none
+/// given") and whether a COLLATE or likely() wrapper was removed
+/// above it (the pin's constant propagation does not look inside
+/// one). v0.17 review fix.
+#[cfg(feature = "join_order")]
+pub fn conjuncts_meta(e: &RExpr, out: &mut AVec<(i32, bool)>) {
+    let mut stack: AVec<(&RExpr, bool)> = AVec::new();
+    stack.push((e, false));
+    while let Some((x, w)) = stack.pop() {
+        let y = skip_collate_likely(x);
+        let w = w || !core::ptr::eq(x, y);
+        match y {
+            RExpr::Binary(BinOp::And, a, b) => {
+                stack.push((b, w));
+                stack.push((a, w));
+            }
+            _ => out.push((truth_prob(x), w)),
+        }
+    }
+}
+
+/// The truth probability of WHERE term `e` as written (see
+/// `conjuncts_meta`).
+#[cfg(feature = "join_order")]
+fn truth_prob(e: &RExpr) -> i32 {
+    if let RExpr::Scalar(crate::query::ScalarFn::Likely, a) = e
+        && let Some(RExpr::Literal(crate::record::OwnedValue::Real(p))) = a.as_slice().get(1)
+    {
+        // (`exprProbability`: `(int)(P * 134217728.0)`; P is in
+        // 0.0 ..= 1.0, checked at resolution.)
+        let x = *p * 134_217_728.0;
+        let n = if x >= 1.0 { x as u64 } else { 0 };
+        return log_est(n) - 270;
+    }
+    1
+}
+
+/// The truth probabilities of `e`'s AND terms (`conjuncts_meta`).
+#[cfg(feature = "join_order")]
+pub fn conj_truth(e: &RExpr, out: &mut AVec<i32>) {
+    let mut m: AVec<(i32, bool)> = AVec::new();
+    conjuncts_meta(e, &mut m);
+    for (t, _) in m.iter() {
+        out.push(*t);
+    }
+}
+
+/// Split a condition into its AND terms as written.
+#[cfg(feature = "join_order")]
+fn and_terms<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     let mut stack: AVec<&'x RExpr> = AVec::new();
     stack.push(e);
     while let Some(x) = stack.pop() {
@@ -356,10 +473,18 @@ fn same_op(op: BinOp) -> Option<TOp> {
 /// says whether a value expression may probe this source: `None`
 /// when it reads this source or one not yet joined, `Some(lateral)`
 /// otherwise.
-pub fn terms(conj: &[&RExpr], s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) -> AVec<Term> {
-    let mut out = AVec::new();
+/// `truth` holds each conjunct's truth probability (`conj_truth`;
+/// missing entries have none).
+pub fn terms(
+    conj: &[&RExpr],
+    truth: &[i32],
+    s: &Src,
+    avail: &dyn Fn(&RExpr) -> Option<bool>,
+) -> AVec<Term> {
+    let mut out: AVec<Term> = AVec::new();
     for (ci, c) in conj.iter().enumerate() {
-        add_terms(ci, c, s, avail, &mut out);
+        let tp = truth.get(ci).copied().unwrap_or(1);
+        add_terms(ci, c, tp, s, avail, &mut out);
     }
     out
 }
@@ -367,11 +492,18 @@ pub fn terms(conj: &[&RExpr], s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) -
 fn add_terms(
     ci: usize,
     c: &RExpr,
+    tp: i32,
     s: &Src,
     avail: &dyn Fn(&RExpr) -> Option<bool>,
     out: &mut AVec<Term>,
 ) {
-    let cmp = |op: TOp, l: &RExpr, r: &RExpr, out: &mut AVec<Term>| {
+    #[cfg(not(feature = "join_order"))]
+    let _ = tp;
+    // `coll`: the comparison's collation as written (a commuted copy
+    // keeps it: the pin's `EP_Commuted`; v0.17 fix).
+    let cmp = |op: TOp, l: &RExpr, r: &RExpr, coll: Coll, out: &mut AVec<Term>, virt: bool| {
+        #[cfg(not(feature = "join_order"))]
+        let _ = virt;
         let key = strip(l);
         if !s.reads(key) {
             return;
@@ -387,30 +519,47 @@ fn add_terms(
             key: key.clone(),
             op,
             val: r.clone(),
-            coll: binary_coll(l, r),
+            coll,
             aff,
             lateral,
             isnull,
             vnull: false,
+            #[cfg(feature = "join_order")]
+            virt,
+            #[cfg(feature = "join_order")]
+            truth: tp,
         });
     };
     match c {
         RExpr::Binary(op, l, r) => {
+            let coll = binary_coll(l, r);
             if let Some(o) = same_op(*op) {
-                cmp(o, l, r, out);
+                cmp(o, l, r, coll, out, false);
             }
             if let Some(o) = flip(*op) {
-                cmp(o, r, l, out);
+                cmp(
+                    o,
+                    r,
+                    l,
+                    coll,
+                    out,
+                    matches!(strip(l), RExpr::Column(..) | RExpr::Rowid(_)),
+                );
             }
             if *op == BinOp::Or
-                && let Some(t) = or_in(ci, c, s, avail)
+                && let Some(t) = or_in(ci, c, tp, s, avail)
             {
                 out.push(t);
             }
         }
+        // The pin's two virtual halves, each analysed in turn: `x >=
+        // a` and its commuted copy `a <= x`, then `x <= b` and `b >=
+        // x` (v0.17 review fix: a column bound probes its own table).
         RExpr::Between(x, a, b, false) => {
-            cmp(TOp::Ge, x, a, out);
-            cmp(TOp::Le, x, b, out);
+            cmp(TOp::Ge, x, a, binary_coll(x, a), out, true);
+            cmp(TOp::Le, a, x, binary_coll(x, a), out, true);
+            cmp(TOp::Le, x, b, binary_coll(x, b), out, true);
+            cmp(TOp::Ge, b, x, binary_coll(x, b), out, true);
         }
         RExpr::InList(x, items, false, false) => {
             let key = strip(x);
@@ -434,6 +583,10 @@ fn add_terms(
                 lateral,
                 isnull: false,
                 vnull: false,
+                #[cfg(feature = "join_order")]
+                virt: false,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         // `x IN (SELECT ...)` (v0.16 review fix): probed with the
@@ -470,6 +623,10 @@ fn add_terms(
                 lateral,
                 isnull: false,
                 vnull: false,
+                #[cfg(feature = "join_order")]
+                virt: false,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         RExpr::IsNull(x, false) => {
@@ -487,6 +644,10 @@ fn add_terms(
                 lateral: false,
                 isnull: true,
                 vnull: false,
+                #[cfg(feature = "join_order")]
+                virt: false,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         // `x IS NOT NULL` on a column (not the rowid): the pin adds
@@ -506,6 +667,10 @@ fn add_terms(
                 lateral: false,
                 isnull: false,
                 vnull: true,
+                #[cfg(feature = "join_order")]
+                virt: true,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         _ => {}
@@ -514,7 +679,15 @@ fn add_terms(
 
 /// The pin's OR-to-IN rewrite: `x = a OR x = b OR ...` on one key,
 /// every value available, is `x IN (a, b, ...)`.
-fn or_in(ci: usize, c: &RExpr, s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) -> Option<Term> {
+fn or_in(
+    ci: usize,
+    c: &RExpr,
+    tp: i32,
+    s: &Src,
+    avail: &dyn Fn(&RExpr) -> Option<bool>,
+) -> Option<Term> {
+    #[cfg(not(feature = "join_order"))]
+    let _ = tp;
     let mut leaves: AVec<&RExpr> = AVec::new();
     let mut stack: AVec<&RExpr> = AVec::new();
     stack.push(c);
@@ -558,6 +731,10 @@ fn or_in(ci: usize, c: &RExpr, s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) 
         lateral,
         isnull: false,
         vnull: false,
+        #[cfg(feature = "join_order")]
+        virt: true,
+        #[cfg(feature = "join_order")]
+        truth: tp,
     })
 }
 
@@ -595,10 +772,71 @@ pub struct IdxModel {
     /// not-indexed columns the pin computed before the key columns
     /// were appended).
     pub suffix_covers: bool,
+    /// `aiRowLogEst` from `sqlite_stat1` (v0.17, `join_order`): the
+    /// index's rows, then the rows per distinct prefix of 1, 2, ...
+    /// key columns; `None` for the pin's defaults.
+    #[cfg(feature = "join_order")]
+    pub est: Option<AVec<i32>>,
+    /// The SELECT reads the table's columns the index lacks only
+    /// inside expressions the index holds (the pin's
+    /// `whereIsCoveringIndex`, `WHERE_EXPRIDX`; v0.17 review fix): it
+    /// counts as covering for the plan and EXPLAIN QUERY PLAN, while
+    /// hipp still reads the table row for the expressions' values.
+    pub xcover: bool,
 }
 
 impl IdxModel {
-    fn key_matches(&self, k: usize, s: &Src, t: &Term) -> bool {
+    /// Whether `e` (an expression of the statement) reads a column of
+    /// source `s` that this index holds neither as a key column nor
+    /// inside one of its key expressions (`whereIsCoveringIndex`'s
+    /// walk; anything it does not look into counts when it reads the
+    /// source).
+    #[cfg(feature = "join_order")]
+    pub fn reads_uncovered(&self, e: &RExpr, s: &Src) -> bool {
+        if self
+            .keys
+            .iter()
+            .any(|k| matches!(k, IdxKey::Expr(x) if same_expr(e, x)))
+        {
+            return false;
+        }
+        let kids: AVec<&RExpr> = match e {
+            RExpr::Column(slot, ..) => {
+                let Some(c) = slot.checked_sub(s.base).filter(|c| *c < s.ncols) else {
+                    return false;
+                };
+                return s.rowid_alias != Some(c)
+                    && !self
+                        .keys
+                        .iter()
+                        .any(|k| matches!(k, IdxKey::Col(x) if *x == c));
+            }
+            RExpr::Rowid(_) | RExpr::Literal(_) | RExpr::AffLiteral(..) => return false,
+            RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => [&**a, &**b].into_iter().collect(),
+            RExpr::Neg(a)
+            | RExpr::Pos(a)
+            | RExpr::Not(a)
+            | RExpr::IsNull(a, _)
+            | RExpr::Cast(a, _)
+            | RExpr::Collate(a, _) => [&**a].into_iter().collect(),
+            RExpr::InList(x, l, ..) => core::iter::once(&**x).chain(l.iter()).collect(),
+            RExpr::Between(x, a, b, _) => [&**x, &**a, &**b].into_iter().collect(),
+            RExpr::Case {
+                base,
+                whens,
+                otherwise,
+            } => base
+                .iter()
+                .chain(otherwise.iter())
+                .map(|b| &**b)
+                .chain(whens.iter().flat_map(|(w, t)| [w, t]))
+                .collect(),
+            RExpr::Scalar(_, args) => args.iter().collect(),
+            _ => return s.reads(e),
+        };
+        kids.iter().any(|k| self.reads_uncovered(k, s))
+    }
+    pub(crate) fn key_matches(&self, k: usize, s: &Src, t: &Term) -> bool {
         // `x IS NULL` finds NULL keys under any collation (the pin
         // checks no collation for WO_ISNULL).
         let coll_ok = t.isnull
@@ -618,6 +856,12 @@ impl IdxModel {
 
     /// Whether every column the query reads is a key column.
     pub fn covers(&self, needed: &[bool]) -> bool {
+        self.xcover || self.covers_plain(needed)
+    }
+
+    /// `covers` by the entries' own columns: the rows can be built from
+    /// the entries alone.
+    pub fn covers_plain(&self, needed: &[bool]) -> bool {
         self.covers_all
             || needed.iter().enumerate().all(|(c, n)| {
                 !*n || self
@@ -635,7 +879,7 @@ impl IdxModel {
 
     /// Whether an ORDER BY term might be delivered by this index (the
     /// pin's `indexMightHelpWithOrderBy`).
-    fn might_order(&self, s: &Src, order: &[(RExpr, SortOrder)]) -> bool {
+    pub(crate) fn might_order(&self, s: &Src, order: &[(RExpr, SortOrder)]) -> bool {
         order.iter().any(|(e, _)| {
             let e = strip(e);
             if s.is_rowid(e) {
@@ -655,6 +899,9 @@ impl IdxModel {
 /// `sqlite3ExprImpliesExpr`).
 pub fn implies(conj: &[&RExpr], pred: &RExpr) -> bool {
     let mut parts = AVec::new();
+    #[cfg(feature = "join_order")]
+    and_terms(pred, &mut parts);
+    #[cfg(not(feature = "join_order"))]
     conjuncts(pred, &mut parts);
     parts.iter().all(|p| conj.iter().any(|c| implies1(c, p)))
 }
@@ -765,30 +1012,33 @@ fn not_null(c: &RExpr, x: &RExpr) -> bool {
 
 /// One candidate loop.
 #[derive(Debug, Clone)]
-struct Loop {
+pub(crate) struct Loop {
     /// None: the table's rowid B-tree.
-    ix: Option<usize>,
+    pub(crate) ix: Option<usize>,
     /// One term per equality key column (or the rowid).
-    eq: AVec<usize>,
-    lo: Option<usize>,
-    hi: Option<usize>,
-    run: i32,
-    out: i32,
+    pub(crate) eq: AVec<usize>,
+    pub(crate) lo: Option<usize>,
+    pub(crate) hi: Option<usize>,
+    pub(crate) run: i32,
+    pub(crate) out: i32,
     /// The ORDER BY terms the loop delivers in order (all of them
     /// when equal to the term count), and whether it must scan
     /// backwards for them.
-    sorted: usize,
-    reverse: bool,
+    pub(crate) sorted: usize,
+    pub(crate) reverse: bool,
     /// The pin's `WHERE_BIGNULL_SORT`: an ORDER BY term wants its
     /// NULLs where the index does not put them (`Some(nulls_first)`);
     /// the loop moves the NULL-keyed rows to that end.
-    bignull: Option<bool>,
+    pub(crate) bignull: Option<bool>,
 }
 
 /// What the planner needs about the query around the source.
 pub struct Query<'x> {
     /// The source's WHERE / ON terms (usable or not).
     pub conj: &'x [&'x RExpr],
+    /// Per conjunct: its truth probability (`conj_truth`; missing
+    /// entries have none).
+    pub truth: &'x [i32],
     /// The ORDER BY (or GROUP BY) the loop may deliver; empty when
     /// the source is joined with others or the query has none.
     pub order: &'x [(RExpr, SortOrder)],
@@ -812,6 +1062,25 @@ pub struct Query<'x> {
     /// rows together is what EXPLAIN QUERY PLAN reports.
     #[cfg(feature = "explain")]
     pub dset: &'x [(RExpr, SortOrder)],
+    /// The join around the source (v0.17, `join_order`): which
+    /// sources each conjunct and term reads, so a loop's nOut is
+    /// adjusted only by the terms its prerequisites make
+    /// computable (`whereLoopOutputAdjust`'s `notAllowed`).
+    #[cfg(feature = "join_order")]
+    pub jm: Option<&'x JMask<'x>>,
+}
+
+/// `Query::jm` (v0.17, `join_order`).
+#[cfg(feature = "join_order")]
+pub struct JMask<'x> {
+    /// Per `Query::conj` entry: the sources it reads.
+    pub cmask: &'x [u64],
+    /// Per usable term: the sources its value reads.
+    pub tmask: &'x [u64],
+    /// This source's bit.
+    pub me: u64,
+    /// The FROM-order prerequisites (CROSS / LEFT JOIN).
+    pub pre: u64,
 }
 
 /// The table being planned.
@@ -832,6 +1101,20 @@ pub struct Table<'x> {
     /// offers no `x IS NULL` term to such a key column
     /// (`indexColumnNotNull`; v0.16 fix).
     pub notnull: &'x [bool],
+    /// `nRowLogEst` (v0.17, `join_order`): from `sqlite_stat1`, else
+    /// the pin's default 200 (1,048,576 rows).
+    #[cfg(feature = "join_order")]
+    pub rows: i32,
+}
+
+impl Table<'_> {
+    /// The table's row estimate (`nRowLogEst`).
+    pub(crate) fn nrow(&self) -> i32 {
+        #[cfg(feature = "join_order")]
+        return self.rows;
+        #[cfg(not(feature = "join_order"))]
+        ROWS
+    }
 }
 
 /// How an executor reads one probe set.
@@ -885,6 +1168,19 @@ pub struct IdxAccess {
     /// `(key field, nulls_first)` — each probe's rows with a NULL in
     /// that key field move to the front (or back), in scan order.
     pub bignull: Option<(usize, bool)>,
+    /// How many ORDER BY terms the loop's order delivers (v0.17: a
+    /// lone source delivering them all streams its rows unsorted).
+    pub sorted: usize,
+    /// An automatic index (v0.17, `join_order`): the rows are the
+    /// table's, sorted on the index key once per statement and
+    /// probed per combination of the sources before it.
+    #[cfg(feature = "join_order")]
+    pub auto: Option<alloc::boxed::Box<AutoIdx>>,
+    /// The pin's Bloom filter on the lookups (v0.17, `join_order`):
+    /// the key each table row contributes, per equality column; a
+    /// probe whose key is not in the filter skips the lookup.
+    #[cfg(feature = "join_order")]
+    pub bloom: Option<AVec<BKey>>,
     /// What EXPLAIN QUERY PLAN says of the loop (v0.16, `explain`):
     /// how many ORDER BY (or GROUP BY / DISTINCT) terms it delivers,
     /// whether its index covers the statement's columns, whether its
@@ -896,8 +1192,51 @@ pub struct IdxAccess {
     pub eqp: (usize, bool, bool, bool),
 }
 
+/// One key column of a Bloom filter (v0.17, `join_order`): a table
+/// column, the rowid, or an index expression (whose filter, never
+/// built, admits every probe).
+#[cfg(feature = "join_order")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BKey {
+    Col(usize),
+    Rowid,
+    Expr,
+}
+
+/// One key column of an automatic index (v0.17, `join_order`).
+#[derive(Debug, Clone)]
+pub struct AutoKey {
+    /// The table column.
+    pub col: usize,
+    /// The comparison's collation (the index column's).
+    pub coll: Coll,
+    /// The probe: the other side of the `col = value` term.
+    pub val: RExpr,
+    pub aff: Option<Affinity>,
+    /// `IS`: a NULL probe finds NULL keys.
+    pub is: bool,
+}
+
+/// An automatic index (v0.17, `join_order`; the pin's
+/// `constructAutomaticIndex`): the key columns the usable equality
+/// terms constrain (in WHERE-clause order), then the other columns
+/// the statement reads (BINARY, in column order), then the rowid.
+/// Rows with equal keys come in that order.
+#[derive(Debug, Clone)]
+pub struct AutoIdx {
+    pub keys: AVec<AutoKey>,
+    pub extra: AVec<usize>,
+    /// The WHERE clause constrains the table alone (`AUTOMATIC
+    /// PARTIAL COVERING INDEX`): the index holds only the rows those
+    /// terms admit (the executor still evaluates them).
+    pub partial: bool,
+    /// A Bloom filter of the keys is checked before each probe (every
+    /// key collation BINARY, as on the pin).
+    pub bloom: bool,
+}
+
 /// The pin's `whereSortingCost`.
-fn sort_cost(q: &Query<'_>, n_row: i32, n_ob: usize, n_sorted: usize) -> i32 {
+pub(crate) fn sort_cost(q: &Query<'_>, n_row: i32, n_ob: usize, n_sorted: usize) -> i32 {
     let n_col = log_est(((q.ncols_out as u64) + 59) / 30);
     let mut cost = n_row + n_col;
     if n_sorted > 0 && n_ob > 0 {
@@ -937,7 +1276,7 @@ enum Ord<'x> {
 /// backwards (the pin's `wherePathSatisfiesOrderBy`, simplified:
 /// equality-constrained columns and WHERE `col = value` terms are
 /// constants; an IN column ends the delivered order).
-fn order_sat(
+pub(crate) fn order_sat(
     q: &Query<'_>,
     s: &Src,
     tab: &Table<'_>,
@@ -1127,7 +1466,27 @@ fn order_sat(
 fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: i32) -> i32 {
     let mut out = out;
     let mut reduce = 0;
+    // In a join (v0.17, `join_order`): only the terms the loop's
+    // prerequisites and its own table make computable.
+    #[cfg(feature = "join_order")]
+    let allowed = q.jm.map(|j| {
+        let mut p = j.pre | j.me;
+        for t in used.iter() {
+            p |= j.tmask.get(*t).copied().unwrap_or(0);
+        }
+        p
+    });
     for (ci, c) in q.conj.iter().enumerate() {
+        #[cfg(feature = "join_order")]
+        if let (Some(a), Some(j)) = (allowed, q.jm) {
+            let m = j.cmask.get(ci).copied().unwrap_or(0);
+            if m & j.me == 0 || m & !a != 0 {
+                continue;
+            }
+        } else if !s.reads(c) {
+            continue;
+        }
+        #[cfg(not(feature = "join_order"))]
         if !s.reads(c) {
             continue;
         }
@@ -1137,7 +1496,48 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
         {
             continue;
         }
+        // A likelihood() probability replaces the heuristics.
+        #[cfg(feature = "join_order")]
+        if let Some(tp) = q.truth.get(ci).copied().filter(|t| *t <= 0) {
+            out += tp;
+            continue;
+        }
         out -= 1;
+        // In a join (v0.17, `join_order`), heuristic 2 applies to any
+        // `x = expr` term whose `x` might be indexed (a column, or a
+        // constant-propagated one), as the pin's `eOperator` says —
+        // usable by an index here or not.
+        #[cfg(feature = "join_order")]
+        if q.jm.is_some() {
+            if let RExpr::Binary(BinOp::Eq | BinOp::Is, l, r) = c {
+                let ind = |e: &RExpr| {
+                    matches!(
+                        strip(e),
+                        RExpr::Column(..) | RExpr::Rowid(_) | RExpr::AffLiteral(..)
+                    )
+                };
+                let other = if s.reads(l) && s.reads(r) {
+                    None
+                } else if ind(l) {
+                    Some(r)
+                } else if ind(r) {
+                    Some(l)
+                } else {
+                    None
+                };
+                if let Some(v) = other {
+                    reduce = reduce.max(match strip(v) {
+                        RExpr::Literal(crate::record::OwnedValue::Integer(i))
+                            if (-1..=1).contains(i) =>
+                        {
+                            10
+                        }
+                        _ => 20,
+                    });
+                }
+            }
+            continue;
+        }
         if let RExpr::Binary(BinOp::Eq | BinOp::Is, _, r) = c
             && ts
                 .iter()
@@ -1157,6 +1557,52 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
 /// the full table scan in rowid order. `ts` are the source's usable
 /// terms (`terms`).
 pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<IdxAccess> {
+    let mut loops = candidates(q, s, tab, ts);
+    for l in loops.as_mut_slice() {
+        let (sorted, reverse, bignull) = order_sat(q, s, tab, ts, l, false);
+        l.sorted = sorted;
+        l.reverse = reverse;
+        l.bignull = bignull;
+    }
+    best_access(q, s, tab, ts, loops.as_slice())
+}
+
+/// The pin's `aiRowLogEst` of index `m` in a table of `rows`
+/// (LogEst): `sqlite_stat1`'s (v0.17, `join_order`), else
+/// `sqlite3DefaultRowEst` — the table (less half for a partial
+/// index), ten rows per value of the first column, then 9, 8, 7, 6
+/// (LogEst 33 32 30 28 26, then 23), one per key of a UNIQUE index;
+/// and one row per rowid after the key columns.
+pub(crate) fn row_est(m: &IdxModel, rows: i32) -> AVec<i32> {
+    let nk = m.keys.len();
+    let mut a: AVec<i32> = AVec::new();
+    #[cfg(feature = "join_order")]
+    if let Some(e) = &m.est {
+        for k in 0..=nk {
+            a.push(e.as_slice().get(k).copied().unwrap_or(0));
+        }
+        a.push(0);
+        return a;
+    }
+    a.push(if m.pred.is_some() { rows - 10 } else { rows });
+    const VALS: [i32; 5] = [33, 32, 30, 28, 26];
+    for k in 0..nk {
+        a.push(VALS.get(k).copied().unwrap_or(23));
+    }
+    if m.unique
+        && let Some(last) = a.as_mut_slice().last_mut()
+    {
+        *last = 0;
+    }
+    // The rowid after the key columns: one row each.
+    a.push(0);
+    a
+}
+
+/// Every candidate loop of one source, in the pin's order
+/// (`whereLoopAddBtree`): the full table scan and the rowid loops,
+/// then per index its full scan and equality / range loops.
+pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> AVec<Loop> {
     let mut loops: AVec<Loop> = AVec::new();
     let order_rowid = !q.order.is_empty();
     use crate::query::Hint;
@@ -1168,19 +1614,20 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
     // The full table scan, and the rowid "index": one row per key
     // (a WITHOUT ROWID table has neither: its clustered index is
     // among the indexes).
+    let rows = tab.nrow();
     if !tab.wr && forced.is_none() {
         loops.push(Loop {
             ix: None,
             eq: AVec::new(),
             lo: None,
             hi: None,
-            run: ROWS + 16,
-            out: adjust(q, s, ts, &[], ROWS, ROWS),
+            run: rows + 16,
+            out: adjust(q, s, ts, &[], rows, rows),
             sorted: 0,
             reverse: false,
             bignull: None,
         });
-        let a_rowid = [ROWS, 0];
+        let a_rowid = [rows, 0];
         add_index(q, s, tab, ts, None, &a_rowid, tab.width, true, &mut loops);
     }
     let _ = order_rowid;
@@ -1196,20 +1643,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         {
             continue;
         }
-        let nk = m.keys.len();
-        let mut a: AVec<i32> = AVec::new();
-        a.push(if m.pred.is_some() { ROWS - 10 } else { ROWS });
-        const VALS: [i32; 5] = [33, 32, 30, 28, 26];
-        for k in 0..nk {
-            a.push(VALS.get(k).copied().unwrap_or(23));
-        }
-        if m.unique
-            && let Some(last) = a.as_mut_slice().last_mut()
-        {
-            *last = 0;
-        }
-        // The rowid after the key columns: one row each.
-        a.push(0);
+        let a = row_est(m, rows);
         let covering = q.needed.is_some_and(|n| m.covers(n));
         let rsize = a.as_slice()[0];
         // The full index scan.
@@ -1222,7 +1656,11 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         {
             let mut run = rsize + 1 + (15 * m.width) / tab.width.max(1);
             if !covering {
-                run = log_est_add(run, rsize + 16);
+                #[cfg(feature = "join_order")]
+                let lookups = rsize + 16 + lookup_cut(q, s, m, tab.wr);
+                #[cfg(not(feature = "join_order"))]
+                let lookups = rsize + 16;
+                run = log_est_add(run, lookups);
             }
             loops.push(Loop {
                 ix: Some(i),
@@ -1257,12 +1695,18 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
     if tab.wr {
         loops = insert_loops(q, s, tab, ts, loops);
     }
-    for l in loops.as_mut_slice() {
-        let (sorted, reverse, bignull) = order_sat(q, s, tab, ts, l, false);
-        l.sorted = sorted;
-        l.reverse = reverse;
-        l.bignull = bignull;
-    }
+    loops
+}
+
+/// The cheapest of `loops` (their ORDER BY delivery computed) as an
+/// access path; `None` for the table's own order.
+fn best_access(
+    q: &Query<'_>,
+    s: &Src,
+    tab: &Table<'_>,
+    ts: &[Term],
+    loops: &[Loop],
+) -> Option<IdxAccess> {
     // Pass 1: the cheapest loop; its rows estimate the sort.
     let mut best = 0usize;
     let mut bk: Option<(i32, i32)> = None;
@@ -1273,7 +1717,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         }
     }
     if !q.order.is_empty() {
-        let n_row = bk.map_or(ROWS, |b| b.1);
+        let n_row = bk.map_or(tab.nrow(), |b| b.1);
         let n_ob = q.order.len();
         let cost = |l: &Loop| {
             if l.sorted >= n_ob {
@@ -1299,7 +1743,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
             }
         }
     }
-    let l = loops.as_slice().get(best)?.clone();
+    let l = loops.get(best)?.clone();
     let mut reverse = l.reverse && l.sorted > 0;
     // The pin's "ordered inner loop": an ORDER BY the loop does not
     // deliver, but would with its IN columns held constant, still
@@ -1322,16 +1766,12 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
         None => true,
         Some(m) => m.covers_all,
     };
-    // (A WITHOUT ROWID table read in its key order that delivers the
-    // GROUP BY still says so: the groups are emitted as they come.)
+    // (A table read in its own order that delivers the GROUP BY —
+    // in any column order, e.g. `GROUP BY c, id` over the rowid —
+    // still says so: the groups are emitted as they come, as the
+    // pin's; v0.17 review fix.)
     let groups = q.group_by && l.sorted >= q.order.len();
-    if natural
-        && l.eq.is_empty()
-        && l.lo.is_none()
-        && l.hi.is_none()
-        && !reverse
-        && !(tab.wr && groups)
-    {
+    if natural && l.eq.is_empty() && l.lo.is_none() && l.hi.is_none() && !reverse && !groups {
         return None;
     }
     let mut a = lower(s, tab, ts, &l, reverse);
@@ -1340,6 +1780,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
     if !q.dset.is_empty() {
         let d = Query {
             conj: q.conj,
+            truth: q.truth,
             order: q.dset,
             group: true,
             group_by: false,
@@ -1349,6 +1790,8 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
             limit: q.limit,
             distinct: q.distinct,
             dset: &[],
+            #[cfg(feature = "join_order")]
+            jm: None,
         };
         a.eqp.3 = order_sat(&d, s, tab, ts, &l, false).0 >= q.dset.len();
     }
@@ -1385,6 +1828,7 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
     let (sat, rev, _) = order_sat(q, s, tab, ts, &l, false);
     let d = Query {
         conj: q.conj,
+        truth: q.truth,
         order: q.dset,
         group: true,
         group_by: false,
@@ -1394,6 +1838,8 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
         limit: q.limit,
         distinct: q.distinct,
         dset: &[],
+        #[cfg(feature = "join_order")]
+        jm: None,
     };
     let dis = !q.dset.is_empty() && order_sat(&d, s, tab, ts, &l, false).0 >= q.dset.len();
     (if rev { 0 } else { sat }, dis)
@@ -1528,6 +1974,15 @@ fn add_index(
         }
         run
     };
+    // In a join (v0.17, `join_order`), where the loops pass through
+    // the pin's `whereLoopInsert` (`xjoin`), a deeper loop also pays
+    // the IN iterations of the columns before it (`rRun += nInMul`);
+    // alone, the IN is charged at its own level only, which is what
+    // `whereLoopAdjustCost` makes of it for one table.
+    #[cfg(feature = "join_order")]
+    let join_in = |m: i32| if q.jm.is_some() { m } else { 0 };
+    #[cfg(not(feature = "join_order"))]
+    let join_in = |_: i32| 0;
     // An explicit stack instead of recursion: (equality terms,
     // nInMul, nOut so far).
     let mut work: AVec<(AVec<usize>, i32, i32)> = AVec::new();
@@ -1556,14 +2011,28 @@ fn add_index(
                 };
                 let cur = a.get(k).copied().unwrap_or(rsize);
                 let nxt = a.get(k + 1).copied().unwrap_or(0);
-                let mut out = saved + (nxt - cur);
-                if t.isnull {
+                // A likelihood() probability on a table column's
+                // term replaces the index's estimate.
+                let col_key = match ix.and_then(|i| tab.indexes.get(i)) {
+                    Some(m) => matches!(
+                        m.keys.as_slice().get(k),
+                        Some(IdxKey::Col(c)) if s.rowid_alias != Some(*c)
+                    ),
+                    None => false,
+                };
+                let tp = truth_of(t);
+                let mut out = if tp <= 0 && col_key {
+                    saved + tp - n_in
+                } else {
+                    saved + (nxt - cur)
+                };
+                if t.isnull && !(tp <= 0 && col_key) {
                     out += 10;
                 }
                 // The pin charges an IN's iterations at its own level only
                 // (probed: `b IN (16 values) AND c = ?` still prefers an
                 // index on (b, c) to one on c).
-                let run = cost(out) + n_in;
+                let run = cost(out) + n_in + join_in(in_mul);
                 let used = used_with(&[ti]);
                 let o2 = adjust(q, s, ts, used.as_slice(), rsize, out + in_mul + n_in);
                 loops.push(Loop {
@@ -1579,14 +2048,14 @@ fn add_index(
                 });
                 deeper.push((used, in_mul + n_in, out));
             } else if t.lower() {
-                let lo_out = range_est(saved, true, false, t.vnull);
+                let lo_out = range_est(saved, Some(t), None);
                 let used = used_with(&[ti]);
                 loops.push(Loop {
                     ix,
                     eq: eq.clone(),
                     lo: Some(ti),
                     hi: None,
-                    run: cost(lo_out),
+                    run: cost(lo_out) + join_in(in_mul),
                     out: adjust(q, s, ts, used.as_slice(), rsize, lo_out + in_mul),
                     sorted: 0,
                     reverse: false,
@@ -1597,14 +2066,14 @@ fn add_index(
                     if !u.upper() || !matches(k, u) {
                         continue;
                     }
-                    let both = range_est(saved, true, true, t.vnull);
+                    let both = range_est(saved, Some(t), Some(u));
                     let used = used_with(&[ti, ui]);
                     loops.push(Loop {
                         ix,
                         eq: eq.clone(),
                         lo: Some(ti),
                         hi: Some(ui),
-                        run: cost(both),
+                        run: cost(both) + join_in(in_mul),
                         out: adjust(q, s, ts, used.as_slice(), rsize, both + in_mul),
                         sorted: 0,
                         reverse: false,
@@ -1612,14 +2081,14 @@ fn add_index(
                     });
                 }
             } else if t.upper() {
-                let hi_out = range_est(saved, false, true, false);
+                let hi_out = range_est(saved, None, Some(t));
                 let used = used_with(&[ti]);
                 loops.push(Loop {
                     ix,
                     eq: eq.clone(),
                     lo: None,
                     hi: Some(ti),
-                    run: cost(hi_out),
+                    run: cost(hi_out) + join_in(in_mul),
                     out: adjust(q, s, ts, used.as_slice(), rsize, hi_out + in_mul),
                     sorted: 0,
                     reverse: false,
@@ -1637,24 +2106,105 @@ fn add_index(
 
 /// The pin's `whereRangeScanEst` without statistics (`lo` / `hi`:
 /// whether that bound exists; a `TERM_VNULL` bound narrows nothing).
-fn range_est(out: i32, lo: bool, hi: bool, lo_vnull: bool) -> i32 {
-    let mut n = out;
-    if lo && !lo_vnull {
+/// A term's truth probability (`Term::truth`; 1, none, below
+/// `join_order`).
+fn truth_of(t: &Term) -> i32 {
+    #[cfg(feature = "join_order")]
+    return t.truth;
+    #[cfg(not(feature = "join_order"))]
+    {
+        let _ = t;
+        1
+    }
+}
+
+fn range_est(out: i32, lo: Option<&Term>, hi: Option<&Term>) -> i32 {
+    // `whereRangeAdjust`: a likelihood() probability, else 20 per
+    // bound (none for a `TERM_VNULL` one).
+    let adj = |n: i32, t: Option<&Term>| match t {
+        Some(t) if truth_of(t) <= 0 => n + truth_of(t),
+        Some(t) if !t.vnull => n - 20,
+        _ => n,
+    };
+    let mut n = adj(adj(out, lo), hi);
+    if lo.is_some_and(|t| truth_of(t) > 0) && hi.is_some_and(|t| truth_of(t) > 0) {
         n -= 20;
     }
-    if hi {
-        n -= 20;
-    }
-    if lo && hi {
-        n -= 20;
-    }
-    let o = out - i32::from(lo) - i32::from(hi);
+    let o = out - i32::from(lo.is_some()) - i32::from(hi.is_some());
     let n = n.max(10);
     n.min(o)
 }
 
+/// The pin's `nLookup` reduction for a non-covering full index scan
+/// (v0.17, `join_order`; `whereLoopAddBtree`): each WHERE clause term,
+/// in term-list order up to the first the index does not cover
+/// (`sqlite3ExprCoveredByIndex`: every column of this source it reads
+/// is in the index), saves one lookup, twenty for an `=` / `IS`; the
+/// commuted, BETWEEN, `IS NOT NULL` and OR-to-IN virtual terms follow
+/// the originals in the list.
+#[cfg(feature = "join_order")]
+fn lookup_cut(q: &Query<'_>, s: &Src, m: &IdxModel, wr: bool) -> i32 {
+    use crate::query::{RefRange, expr_refs_range};
+    let held = |c: usize| {
+        m.keys
+            .iter()
+            .chain(m.suffix.iter().map(|(k, _)| k))
+            .any(|k| matches!(k, IdxKey::Col(x) if *x == c))
+            || (!wr && s.rowid_alias == Some(c))
+    };
+    let covered = |e: &RExpr| {
+        (0..s.ncols).all(|c| {
+            held(c)
+                || !expr_refs_range(
+                    e,
+                    &RefRange {
+                        w: (s.base + c, s.base + c + 1),
+                        s: (0, 0),
+                    },
+                )
+        })
+    };
+    let col = |e: &RExpr| matches!(strip(e), RExpr::Column(..) | RExpr::Rowid(_));
+    let mut cut = 0;
+    let mut virt = 0;
+    for c in q.conj.iter() {
+        if !covered(c) {
+            return cut;
+        }
+        let c = strip(c);
+        match c {
+            RExpr::Binary(BinOp::Eq | BinOp::Is, l, r) if col(l) || col(r) => {
+                cut -= 20;
+                if col(l) && col(r) {
+                    virt -= 20;
+                }
+            }
+            RExpr::Binary(BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, l, r) => {
+                cut -= 1;
+                if col(l) && col(r) {
+                    virt -= 1;
+                }
+            }
+            RExpr::Between(x, _, _, false) => {
+                cut -= 1;
+                if col(x) {
+                    virt -= 2;
+                }
+            }
+            RExpr::IsNull(x, true) => {
+                cut -= 1;
+                if matches!(strip(x), RExpr::Column(..)) {
+                    virt -= 1;
+                }
+            }
+            _ => cut -= 1,
+        }
+    }
+    cut + virt
+}
+
 /// A chosen loop as the executor's access path.
-fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxAccess {
+pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxAccess {
     let _ = s;
     let (root, desc, nkeys) = match l.ix.and_then(|i| tab.indexes.get(i)) {
         Some(m) => (m.root, m.desc.clone(), m.keys.len()),
@@ -1712,6 +2262,11 @@ fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxA
         groups: false,
         cover: None,
         bignull: None,
+        sorted: l.sorted,
+        #[cfg(feature = "join_order")]
+        auto: None,
+        #[cfg(feature = "join_order")]
+        bloom: None,
         #[cfg(feature = "explain")]
         eqp: (
             l.sorted,

@@ -415,16 +415,6 @@ fn documented_differences() {
             "SELECT max(b) FROM t",
             "`--SCAN t USING COVERING INDEX tb\n",
         ),
-        // No join reordering: FROM order, the rowid lookup unused.
-        (
-            "SELECT * FROM t, u WHERE t.a = u.x",
-            "|--SCAN t\n`--SCAN u\n",
-        ),
-        // No automatic index or Bloom filter.
-        (
-            "SELECT * FROM t LEFT JOIN u ON t.b=u.y",
-            "|--SCAN t\n`--SCAN u LEFT-JOIN\n",
-        ),
         // FROM subqueries, views and CTEs are not flattened.
         (
             "SELECT * FROM vu",
@@ -453,6 +443,15 @@ fn documented_differences() {
             "|--USE TEMP B-TREE FOR count(DISTINCT)\n`--SCAN t USING COVERING INDEX tcde\n",
         ),
     ];
+    // (v0.17, `join_order`: join reordering and automatic indexes now
+    // print the pin's plans.)
+    same_plans(
+        &path,
+        &[
+            "SELECT * FROM t, u WHERE t.a = u.x",
+            "SELECT * FROM t LEFT JOIN u ON t.b=u.y",
+        ],
+    );
     for (q, want) in cases {
         let got = hipp_eqp(&path, q).expect(q);
         assert_eq!(got, format!("QUERY PLAN\n{want}"), "{q}");

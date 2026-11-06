@@ -1253,6 +1253,17 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
     }
     let mut lines = stdin.lock().lines();
     let mut buffer = String::new();
+    // A statement or dot-command failed: the script goes on, and
+    // the shell exits 1 at its end (or at `.exit`), as the pin's
+    // `process_input` returns `errCnt > 0`.
+    let mut failed = false;
+    let status = |failed: bool| {
+        if failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    };
     loop {
         if interactive {
             print!("{}", if buffer.is_empty() { "hipp> " } else { "...> " });
@@ -1272,8 +1283,11 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
         if buffer.is_empty() && line.trim_start().starts_with('.') {
             match block_on(dispatch(db, line.trim(), &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
-                Ok(Flow::Exit) => return ExitCode::SUCCESS,
-                Err(e) => eprintln!("Error: {e}"),
+                Ok(Flow::Exit) => return status(failed),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    failed = true;
+                }
             }
             continue;
         }
@@ -1286,8 +1300,15 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
             for stmt in split_statements(&script) {
                 match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                     Ok(Flow::Continue) => {}
-                    Ok(Flow::Exit) => return ExitCode::SUCCESS,
-                    Err(e) => eprintln!("Error: {e}"),
+                    Ok(Flow::Exit) => return status(failed),
+                    Err(e) => {
+                        // The rest of this input chunk is skipped (the
+                        // pin's shell runs a chunk as one exec, which
+                        // stops at its first error).
+                        eprintln!("Error: {e}");
+                        failed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1297,7 +1318,7 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
         for stmt in split_statements(&buffer) {
             match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
-                Ok(Flow::Exit) => return ExitCode::SUCCESS,
+                Ok(Flow::Exit) => return status(failed),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     return ExitCode::FAILURE;
@@ -1306,5 +1327,5 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
         }
     }
     let _ = out.flush();
-    ExitCode::SUCCESS
+    status(failed)
 }

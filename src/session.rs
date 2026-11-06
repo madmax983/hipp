@@ -118,6 +118,8 @@ type Prep<'a, 'f, S> = core::pin::Pin<
 mod fkey;
 #[cfg(feature = "fts5")]
 mod fts5;
+#[cfg(feature = "join_order")]
+mod join;
 #[cfg(any(feature = "json", feature = "vtab"))]
 mod json_tvf;
 #[cfg(feature = "v16")]
@@ -126,6 +128,8 @@ mod maint;
 mod pragma;
 #[cfg(feature = "rtree")]
 mod rtree;
+#[cfg(feature = "v16")]
+mod stream;
 #[cfg(feature = "v16")]
 mod temp;
 #[cfg(feature = "triggers")]
@@ -255,13 +259,21 @@ pub struct Config {
     /// count as trigger programs, as on the pin.
     #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     pub max_trigger_depth: usize,
-    /// The most rows one virtual-table cursor may produce for a
-    /// statement (v0.16 review fix, `vtab`). hipp's executor holds a
-    /// source's rows in memory where the pin streams them, so a
-    /// module whose rows cost nothing to describe —
-    /// `generate_series(1)` is 4294967295 rows — would exhaust the
-    /// heap; past this many rows the statement fails with
-    /// `SchemaKind::VtabTooManyRows` instead. The default
+    /// The most rows one generate_series cursor may give a statement
+    /// that holds them in memory (v0.16 review fix, `vtab`; v0.17:
+    /// only where it holds them). A module whose rows cost nothing to
+    /// describe — `generate_series(1)` is 4294967295 rows — would
+    /// exhaust the heap; past this many rows the statement fails with
+    /// `SchemaKind::VtabTooManyRows` instead. Since v0.17 a streamed
+    /// top-level query (`session::stream`) holds no source rows, so
+    /// this bounds only (a) its blocking operators that keep every
+    /// row they are given — DISTINCT, GROUP BY, an aggregate that
+    /// does not fold row by row, an ORDER BY without LIMIT — counted
+    /// per cursor opening, and (b) the paths that still materialise a
+    /// cursor's rows: subqueries (scalar, IN, EXISTS), derived tables
+    /// and CTEs, compound members, RIGHT / FULL joins, window
+    /// queries, trigger programs and the sources of INSERT ...
+    /// SELECT, UPDATE ... FROM and CREATE TABLE ... AS. The default
     /// (`DEFAULT_VTAB_ROWS`, about 4 million) costs a few hundred MiB
     /// at its peak; lower it on a small heap, raise it where memory
     /// allows.
@@ -347,12 +359,15 @@ pub const STACK_PER_TRIGGER: usize = 16 * 1024;
 /// measured on x86_64 — the step future and the call path to the
 /// parser and executor). The debug figure was re-measured at 384 KiB
 /// after the lazily decoded index cursor (`btree::LazyPage`) grew a
-/// debug build's seek path: it covers the worst build CI runs, a
-/// debug build with debug info under `-C instrument-coverage`
-/// (ci/coverage.sh), where tests/depth_v16.rs and
-/// tests/triggers_v16.rs pass on their budgeted threads.
+/// debug build's seek path, and at 512 KiB in v0.17 (an INSERT's
+/// step path in a debug build with debug info of the `xl` profile
+/// reached ~500 KiB, the step future's poll frame alone ~230 KiB): it
+/// covers the worst build CI runs, a debug build with debug info
+/// under `-C instrument-coverage` (ci/coverage.sh), where
+/// tests/depth_v16.rs and tests/triggers_v16.rs pass on their
+/// budgeted threads.
 #[cfg(all(feature = "v04", debug_assertions))]
-pub const STACK_BASE: usize = 384 * 1024;
+pub const STACK_BASE: usize = 512 * 1024;
 #[cfg(all(feature = "v04", not(debug_assertions)))]
 pub const STACK_BASE: usize = 64 * 1024;
 /// The most stack one symbol of `Config::max_parser_depth` costs
@@ -648,6 +663,22 @@ impl IdxColPlan {
     }
 }
 
+/// An UPDATE ... FROM planned as a join (v0.17 review fix,
+/// `join_order`; `Plan::Update::from_join`).
+#[cfg(feature = "join_order")]
+#[derive(Debug, Clone)]
+pub(super) struct FromJoin {
+    /// The target table and the FROM sources, in the join's order.
+    sources: AVec<SourcePlan>,
+    /// The WHERE clause (and the inner joins' ON terms), laid out
+    /// for `sources`.
+    filter: Option<RExpr>,
+    /// The SET expressions, laid out for `sources` (in SET order).
+    sets: AVec<RExpr>,
+    /// The target's rowid in that layout.
+    rowid: RExpr,
+}
+
 // Plans are built once per statement and never stored in bulk;
 // the variant-size spread depends on the feature rung (v04 alone
 // has the widest gap), so boxing would only add an indirection.
@@ -818,6 +849,12 @@ enum Plan {
         /// resolved against target ++ these sources.
         #[cfg(feature = "v07")]
         from_sources: AVec<SourcePlan>,
+        /// The target and the FROM sources planned as one join in the
+        /// pin's order (v0.17 review fix, `join_order`): the row each
+        /// target row is updated from is the last combination that
+        /// order gives it, as the pin's UPDATE ... FROM keeps.
+        #[cfg(feature = "join_order")]
+        from_join: Option<Box<FromJoin>>,
         /// `RETURNING` expressions resolved against the target
         /// table only (v0.7); empty when the clause is absent.
         #[cfg(feature = "v07")]
@@ -1332,6 +1369,14 @@ pub struct Connection<S: Storage> {
     pager: Pager<S>,
     catalog_arena: Arena,
     catalog: Catalog,
+    /// The statistics the planner reads (v0.17, `join_order`):
+    /// loaded with the schema and by ANALYZE (`join::StatState`).
+    #[cfg(feature = "join_order")]
+    stat: join::StatState,
+    /// The next schema read follows this connection's own CREATE /
+    /// DROP: the statistics held are kept (`load_stats`).
+    #[cfg(feature = "join_order")]
+    stat_keep: bool,
     cfg: Config,
     /// An explicit `BEGIN` is open (v0.2). The pager transaction
     /// itself opens lazily at the first write, as in SQLite; while
@@ -1345,6 +1390,12 @@ pub struct Connection<S: Storage> {
     /// not N.
     #[cfg(feature = "v06")]
     sub_execs: usize,
+    /// The marks of the JSON documents and full-text rows a
+    /// streamed query held when it opened (v0.17, `v16`), while it
+    /// has not finished: a statement dropped part-way leaves them,
+    /// and the next top-level statement drops what they kept.
+    #[cfg(feature = "v16")]
+    stream_left: Option<(usize, usize)>,
     /// SubPlan node identity source (v0.13): every planned
     /// subquery node takes a unique id, which the executor's
     /// hoisting cache keys on. Ids only need uniqueness within
@@ -1414,6 +1465,21 @@ pub struct Connection<S: Storage> {
     /// pending terms and totals (v0.16, `fts5`).
     #[cfg(feature = "fts5")]
     fts: AVec<fts5::FtState>,
+    /// Rows counted by fts5 tables' last writes and not yet flushed
+    /// (the pin's `nPendingRow` outlives a commit that flushed
+    /// nothing, and so counts into the next segment's `nEntry`).
+    #[cfg(feature = "fts5")]
+    fts_rows: AVec<(AVec<u8>, u64)>,
+    /// Per fts5 table, the `version` the running statement holds (the
+    /// pin's `Fts5Config::iVersion`, loaded when the statement starts:
+    /// a `delete-all` writes 4 under it; v0.17, `fts5_delete`).
+    #[cfg(feature = "fts5_delete")]
+    fts_ver: AVec<(AVec<u8>, i64)>,
+    /// Per fts5 table, the `secure-delete` setting the connection last
+    /// held (`bSecureDelete` has no default a config reload restores:
+    /// with no `secure-delete` row, a rolled-back setting stays).
+    #[cfg(feature = "fts5_delete")]
+    fts_sd: AVec<(AVec<u8>, bool)>,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1436,10 +1502,16 @@ impl<S: Storage> Connection<S> {
             pager,
             catalog_arena,
             catalog: Catalog::empty(u32::MAX),
+            #[cfg(feature = "join_order")]
+            stat: join::StatState::default(),
+            #[cfg(feature = "join_order")]
+            stat_keep: false,
             cfg,
             explicit_txn: false,
             #[cfg(feature = "v06")]
             sub_execs: 0,
+            #[cfg(feature = "v16")]
+            stream_left: None,
             #[cfg(feature = "v06")]
             next_subplan_id: core::cell::Cell::new(1),
             #[cfg(all(feature = "expr_index", feature = "v09"))]
@@ -1470,6 +1542,12 @@ impl<S: Storage> Connection<S> {
             ext: core::cell::RefCell::new(AVec::new()),
             #[cfg(feature = "fts5")]
             fts: AVec::new(),
+            #[cfg(feature = "fts5")]
+            fts_rows: AVec::new(),
+            #[cfg(feature = "fts5_delete")]
+            fts_ver: AVec::new(),
+            #[cfg(feature = "fts5_delete")]
+            fts_sd: AVec::new(),
         };
         #[cfg(feature = "utf16")]
         conn.set_text_enc(conn.pager.text_enc());
@@ -1507,6 +1585,13 @@ impl<S: Storage> Connection<S> {
         {
             let (t, i) = crate::wr::layouts(&self.catalog, &self.catalog_arena);
             self.pager.wr.set_layout(t, i);
+        }
+        // (Boxed: its cursor stays off the stack of every statement
+        // that reloads the schema.)
+        #[cfg(feature = "join_order")]
+        {
+            let keep = core::mem::take(&mut self.stat_keep);
+            alloc::boxed::Box::pin(self.load_stats(keep)).await?;
         }
         Ok(())
     }
@@ -1666,6 +1751,8 @@ impl<S: Storage> Connection<S> {
             query_pos: 0,
             #[cfg(feature = "v04")]
             query_loaded: false,
+            #[cfg(feature = "v16")]
+            stream: None,
             #[cfg(feature = "v06")]
             hoist: AVec::new(),
             #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
@@ -1688,6 +1775,8 @@ impl<S: Storage> Connection<S> {
             stmt_sp: None,
             #[cfg(feature = "v16")]
             upsert_failed: false,
+            #[cfg(feature = "fts5")]
+            fts_kept: false,
             #[cfg(feature = "v07")]
             fail_act: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
@@ -4117,6 +4206,21 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
+        #[cfg(feature = "join_order")]
+        let from_join = if from_plans.is_empty() || !t.has_rowid() {
+            None
+        } else {
+            self.plan_update_join(
+                arena,
+                table,
+                alias,
+                indexed,
+                from_plans.as_slice(),
+                &cur,
+                filter.as_ref(),
+                sets.as_slice(),
+            )?
+        };
         let mut defaults = AVec::new();
         let mut affs = AVec::new();
         let mut not_null = AVec::new();
@@ -4189,12 +4293,104 @@ impl<S: Storage> Connection<S> {
             ipk_act: stmt.over(t.ipk_conflict),
             #[cfg(feature = "v07")]
             from_sources: from_plans,
+            #[cfg(feature = "join_order")]
+            from_join,
             #[cfg(feature = "v07")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
             indexes,
             rules: self.table_rules(arena, t)?,
         })
+    }
+
+    /// UPDATE ... FROM as the pin plans it (v0.17 review fix,
+    /// `join_order`): the target and the FROM sources as one join,
+    /// ordered by the join planner (`plan_join`), with the WHERE
+    /// clause, the SET expressions and the target's rowid laid out
+    /// for that order. `None` when the planner does not take the
+    /// join: the FROM sources are then joined onto each target row in
+    /// FROM order.
+    #[cfg(feature = "join_order")]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_update_join(
+        &self,
+        arena: &Arena,
+        table: &crate::arena::ABytes,
+        alias: &Option<crate::arena::ABytes>,
+        indexed: Option<crate::sql::IndexHint>,
+        from: &[SourcePlan],
+        cur: &crate::query::ScopeGroup,
+        filter: Option<&RExpr>,
+        sets: &[(Target, RExpr)],
+    ) -> Result<Option<Box<FromJoin>>, S::Error> {
+        let target = crate::sql::FromSource {
+            table: *table,
+            alias: *alias,
+            kind: crate::sql::JoinKind::Inner,
+            on: None,
+            derived: None,
+            natural: false,
+            using: AVec::new(),
+            args: None,
+            qualified: false,
+            in_temp: false,
+            #[cfg(feature = "attach")]
+            schema: None,
+            cte: None,
+            indexed,
+        };
+        let mut descs = AVec::new();
+        let mut offs = AVec::new();
+        let mut plans: AVec<SourcePlan> = AVec::new();
+        self.plan_from(
+            core::slice::from_ref(&target),
+            arena,
+            &[],
+            0,
+            &mut descs,
+            &mut offs,
+            &mut plans,
+        )?;
+        if plans.len() != 1 {
+            return Ok(None);
+        }
+        for sp in from.iter() {
+            plans.push(sp.clone());
+        }
+        let mut scope = cur.clone();
+        let mut items: AVec<RExpr> = AVec::new();
+        for (_, e) in sets.iter() {
+            items.push(e.clone());
+        }
+        items.push(RExpr::Rowid(scope.first_src));
+        let mut filt = filter.cloned();
+        let joined = self.plan_join(
+            arena,
+            &mut plans,
+            &mut scope,
+            (0, 0),
+            &mut items,
+            &mut filt,
+            &mut AVec::new(),
+            &mut None,
+            &mut AVec::new(),
+            false,
+            false,
+            None,
+        )?;
+        if !joined {
+            return Ok(None);
+        }
+        let Some(rowid) = items.pop() else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(FromJoin {
+            sources: plans,
+            filter: filt,
+            sets: items,
+            rowid,
+        })))
     }
 
     /// This connection's database for three-part names (v0.16,
@@ -4788,6 +4984,12 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
+        // v0.17 (`join_order`): a join the planner orders asks its
+        // virtual tables' xBestIndex once the order is known (below).
+        #[cfg(all(feature = "vtab", feature = "join_order"))]
+        let vt_deferred = join::join_eligible(sources.as_slice());
+        #[cfg(all(feature = "vtab", not(feature = "join_order")))]
+        let vt_deferred = false;
         // v0.16 (`vtab`): each virtual table's xBestIndex.
         #[cfg(feature = "vtab")]
         {
@@ -4798,7 +5000,11 @@ impl<S: Storage> Connection<S> {
                 }
                 _ => None,
             };
-            let consumed = self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, order)?;
+            let consumed = if vt_deferred {
+                false
+            } else {
+                self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, order)?
+            };
             // An fts5 table's ORDER BY rank (`orderByConsumed`): its
             // rows come in the pin's sorter order (leaf `fts5`).
             #[cfg(feature = "fts5")]
@@ -4845,7 +5051,8 @@ impl<S: Storage> Connection<S> {
             }
             group_by.push(r);
         }
-        let having = match &stmt.having {
+        #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+        let mut having = match &stmt.having {
             None => None,
             Some(e) => Some(self.resolve_term(
                 e,
@@ -4976,6 +5183,27 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::MisusedAggregate,
             });
         }
+        // An aggregate query without GROUP BY makes one row: the pin
+        // drops its ORDER BY (`sSort.pOrderBy = 0`), only the
+        // aggregates in it still accumulating — so the rest of a
+        // term is never evaluated (v0.17 review fix: hipp sorted the
+        // one row, and failed on a term that errors). A window query
+        // keeps it (the pin's rewrite sorts the outer query).
+        #[cfg(feature = "window")]
+        let plain = crate::window::calls(items.as_slice(), order_by.as_slice()).is_empty();
+        #[cfg(not(feature = "window"))]
+        let plain = true;
+        if has_agg && group_by.is_empty() && plain && !order_by.is_empty() {
+            let mut kept: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+            for (e, o) in order_by.iter() {
+                let mut aggs = AVec::new();
+                crate::query::collect_outer_aggs(e, &mut aggs);
+                for a in aggs {
+                    kept.push((a.clone(), *o));
+                }
+            }
+            order_by = kept;
+        }
         cur.aliases.clear();
         let limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
         // v0.16 (`expr_index`): each table source's index access
@@ -5037,29 +5265,63 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(all(feature = "expr_index", not(feature = "window")))]
         let (keyed, info_limit) = (!merge_key.is_empty(), limit.as_ref());
-        #[cfg(feature = "expr_index")]
-        self.plan_accesses(
-            arena,
-            sources.as_mut_slice(),
-            cur.offsets.as_slice(),
-            cur.first_src,
-            (base_width, base_src),
-            &xindex::CoreInfo {
-                items: items.as_slice(),
-                filter: filter.as_ref(),
-                group_by: group_by.as_slice(),
-                having: having.as_ref(),
-                order_by: if keyed {
-                    merge_key.as_slice()
-                } else {
-                    order_by.as_slice()
-                },
+        // v0.17 (`join_order`): a join of tables in the pin's order
+        // (`session::join`), the core laid out in it.
+        #[cfg(feature = "join_order")]
+        let joined = !keyed
+            && self.plan_join(
+                arena,
+                &mut sources,
+                &mut cur,
+                (base_width, base_src),
+                &mut items,
+                &mut filter,
+                &mut group_by,
+                &mut having,
+                &mut order_by,
                 has_agg,
-                distinct: stmt.distinct,
-                limit: info_limit,
-                also_reads: order_by.as_slice(),
-            },
-        )?;
+                stmt.distinct,
+                info_limit,
+            )?;
+        #[cfg(not(feature = "join_order"))]
+        let joined = false;
+        // v0.17 (`join_order`): the deferred xBestIndex calls, in the
+        // join's order; then no JSON table-valued function may read a
+        // source after it.
+        #[cfg(all(feature = "vtab", feature = "join_order"))]
+        if vt_deferred {
+            self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, None)?;
+        }
+        #[cfg(all(feature = "json", feature = "join_order"))]
+        json_tvf::fix_tvf_order::<S::Error>(sources.as_mut_slice(), &cur, &mut filter, joined)
+            .map_err(|_| Error::Unsupported)?;
+        #[cfg(feature = "expr_index")]
+        if !joined {
+            self.plan_accesses(
+                arena,
+                sources.as_mut_slice(),
+                cur.offsets.as_slice(),
+                cur.first_src,
+                (base_width, base_src),
+                &xindex::CoreInfo {
+                    items: items.as_slice(),
+                    filter: filter.as_ref(),
+                    group_by: group_by.as_slice(),
+                    having: having.as_ref(),
+                    order_by: if keyed {
+                        merge_key.as_slice()
+                    } else {
+                        order_by.as_slice()
+                    },
+                    has_agg,
+                    distinct: stmt.distinct,
+                    limit: info_limit,
+                    also_reads: order_by.as_slice(),
+                },
+            )?;
+        }
+        #[cfg(not(feature = "expr_index"))]
+        let _ = joined;
         // v0.16 (`json`, `vtab`): what a lateral `json_each` or
         // virtual table may drop from the rows it joins onto; and
         // (`vtab`) each virtual table's constraints (its xBestIndex).
@@ -5748,7 +6010,13 @@ impl<S: Storage> Connection<S> {
 
     /// Roll back the connection's open transaction, if any.
     pub async fn rollback(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "fts5_delete")]
+        let ck0 = self.pager.schema_cookie();
         self.pager.rollback().await?;
+        #[cfg(feature = "fts5_delete")]
+        if self.pager.schema_cookie() != ck0 {
+            self.fts5_schema_reset();
+        }
         self.explicit_txn = false;
         Ok(())
     }
@@ -6046,6 +6314,10 @@ pub struct Statement<'c, S: Storage> {
     query_pos: usize,
     #[cfg(feature = "v04")]
     query_loaded: bool,
+    /// The query streaming its rows (v0.17, `v16`; `session::stream`),
+    /// while it has more.
+    #[cfg(feature = "v16")]
+    stream: Option<Box<stream::Stream>>,
     /// Hoisted uncorrelated-subquery results for this
     /// statement's execution (v0.13): `(plan node id, value)`
     /// pairs, populated on first use and cleared when a fresh
@@ -6098,6 +6370,10 @@ pub struct Statement<'c, S: Storage> {
     /// on the pin, so OR ROLLBACK does not end the transaction.
     #[cfg(feature = "v16")]
     upsert_failed: bool,
+    /// This failed statement's changes were kept (OR FAIL): the fts5
+    /// tables keep their pending terms too (v0.17 review fix).
+    #[cfg(feature = "fts5")]
+    fts_kept: bool,
     /// The resolved action of the constraint whose violation failed
     /// this write (v0.16, `v07`): a constraint-level `ON CONFLICT
     /// FAIL / ROLLBACK` decides what the failure undoes, so the
@@ -6870,6 +7146,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             query_pos: 0,
             #[cfg(feature = "v04")]
             query_loaded: false,
+            #[cfg(feature = "v16")]
+            stream: None,
             #[cfg(feature = "v06")]
             hoist: AVec::new(),
             #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
@@ -6892,6 +7170,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             stmt_sp: None,
             #[cfg(feature = "v16")]
             upsert_failed: false,
+            #[cfg(feature = "fts5")]
+            fts_kept: false,
             #[cfg(feature = "v07")]
             fail_act: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
@@ -6934,16 +7214,28 @@ impl<'c, S: Storage> Statement<'c, S> {
         if matches!(self.plan, Plan::Explain(_)) {
             return self.step_explain().await;
         }
+        // What a streamed query dropped part-way kept (v0.17).
+        #[cfg(feature = "v16")]
+        if self.phase == Phase::Fresh && self.stream.is_none() {
+            self.reclaim_stream();
+        }
         // The `json_each` documents this step holds (v0.16, `json`;
         // `Env::json_docs`) go once the plan has run: its rows are
         // projected by then (a query materialises its result in
         // its first step), and a nested step (a trigger body) drops
         // only its own.
+        // A streamed query (v0.17) keeps them until its last row.
         #[cfg(feature = "json")]
-        let mark = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
+        let mark = match &self.stream {
+            Some(s) => s.marks.0,
+            None => self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len()),
+        };
         // Likewise the full-text rows' auxiliary data (v0.16, `fts5`).
         #[cfg(feature = "fts5")]
-        let fmark = self.conn.env.fts_rows.try_borrow().map_or(0, |d| d.len());
+        let fmark = match &self.stream {
+            Some(s) => s.marks.1,
+            None => self.conn.env.fts_rows.try_borrow().map_or(0, |d| d.len()),
+        };
         // The statement's instant (v0.16, `datetime`): kept while
         // this statement owns the clock cache — from its prepare
         // (whose plan may read it for a DEFAULT) through its
@@ -6970,6 +7262,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v16")]
         let was_txn = self.conn.explicit_txn;
+        // The schema cookie the statement starts from: a rollback that
+        // moves it back undid a schema change (v0.17, `fts5_delete`).
+        #[cfg(feature = "fts5_delete")]
+        let ck0 = self.conn.pager.schema_cookie();
         let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
             || {
                 #[cfg(feature = "vtab")]
@@ -7051,6 +7347,15 @@ impl<'c, S: Storage> Statement<'c, S> {
         // written since (v0.16 review fix: terms a trigger program had
         // added stayed in the index): the state after that flush is
         // restored.
+        // A top-level statement loads the fts5 tables' config afresh.
+        #[cfg(feature = "fts5_delete")]
+        if self.phase == Phase::Fresh && !self.conn.fts_in_program() {
+            self.conn.fts_ver.clear();
+        }
+        #[cfg(feature = "fts5")]
+        if self.phase == Phase::Fresh {
+            self.fts_kept = false;
+        }
         #[cfg(feature = "fts5")]
         let fts_snap = if self.phase == Phase::Fresh
             && self.conn.explicit_txn
@@ -7127,15 +7432,20 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Rollback => self.step_rollback().await,
         };
         #[cfg(feature = "json")]
-        if let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut() {
+        if self.stream.is_none()
+            && let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut()
+        {
             d.truncate(mark);
         }
         #[cfg(feature = "fts5")]
-        if let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut() {
+        if self.stream.is_none()
+            && let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut()
+        {
             d.truncate(fmark);
         }
         #[cfg(feature = "fts5")]
         if r.is_err()
+            && !self.fts_kept
             && let Some(f) = fts_snap
         {
             self.conn.fts = f;
@@ -7158,6 +7468,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             if !matches!(self.plan, Plan::Att(_)) {
                 self.conn.mirror_att(b"ROLLBACK").await;
             }
+        }
+        // A statement after which the pin reloads its schema forgets
+        // the fts5 tables' connection state (v0.17 review fix).
+        #[cfg(feature = "fts5_delete")]
+        if self.reloads_schema(r.is_ok(), was_txn, ck0) {
+            self.conn.fts5_schema_reset();
         }
         // A transaction statement applies to the TEMP database too.
         #[cfg(feature = "v16")]
@@ -7187,6 +7503,25 @@ impl<'c, S: Storage> Statement<'c, S> {
         // readers (tables(), indexes()) see the new state without
         // waiting for the next prepare (§5.5).
         if ddl_or_txn && r.is_ok() && self.conn.pager.schema_cookie() != self.conn.catalog.cookie {
+            // (After CREATE / DROP / ANALYZE the pin keeps the
+            // statistics it holds; after ALTER, a rollback or VACUUM
+            // it reads the whole schema, statistics included, again.
+            // v0.17 review fix, `join_order`.)
+            #[cfg(feature = "join_order")]
+            {
+                self.conn.stat_keep = !matches!(
+                    self.plan,
+                    Plan::Commit | Plan::Rollback | Plan::Alter16 { .. } | Plan::AlterAdd { .. }
+                ) && !matches!(
+                    self.plan,
+                    Plan::Maint(
+                        maint::Maint::Savepoint(_)
+                            | maint::Maint::Release(_)
+                            | maint::Maint::RollbackTo(_)
+                            | maint::Maint::Vacuum { .. }
+                    )
+                );
+            }
             self.conn.rebuild_catalog().await?;
         }
         // A UTF-16 database's result text is what the pin's
@@ -7393,6 +7728,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.query_pos = 0;
             self.query_loaded = false;
         }
+        #[cfg(feature = "v16")]
+        self.end_stream();
         #[cfg(feature = "v06")]
         self.hoist.clear();
         #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
@@ -7475,7 +7812,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.conn.pager.rollback().await?;
         self.conn.explicit_txn = false;
         #[cfg(feature = "fts5")]
-        self.conn.fts.clear();
+        {
+            self.conn.fts.clear();
+            self.conn.fts_rows.clear();
+        }
         self.phase = Phase::Done;
         Ok(Step::Done)
     }
@@ -8300,9 +8640,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let conflict = match &self.plan {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
-            #[cfg(feature = "rtree")]
+            #[cfg(any(feature = "rtree", feature = "fts5"))]
             Plan::Vtab(p) => match &**p {
+                #[cfg(feature = "rtree")]
                 vtab::VtPlan::Write(w) => w.conflict,
+                // An fts5 write's OR clause (v0.17 review fix: OR FAIL
+                // and OR ROLLBACK acted as ABORT).
+                #[cfg(feature = "fts5")]
+                vtab::VtPlan::Fts5Write(w) => w.conflict,
                 _ => ConflictAction::Abort,
             },
             _ => ConflictAction::Abort,
@@ -9887,6 +10232,45 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     // ---------------- v0.5 write-side execution ----------------
 
+    /// The combinations of an UPDATE ... FROM planned as a join
+    /// (v0.17 review fix, `join_order`): the join run in its order,
+    /// and per target rowid (ascending) the index of the last
+    /// combination that gives it.
+    #[cfg(feature = "join_order")]
+    #[allow(clippy::type_complexity)]
+    async fn update_from_rows(
+        &mut self,
+        j: &FromJoin,
+    ) -> Result<(AVec<RowData>, AVec<(i64, usize)>), S::Error> {
+        let src_rows = self
+            .materialise_sources_sub(j.sources.as_slice(), &RowData::empty(), None)
+            .await?;
+        let mut joined: AVec<RowData> = AVec::new();
+        self.join_sources(
+            j.sources.as_slice(),
+            j.filter.as_ref(),
+            src_rows.as_slice(),
+            &RowData::empty(),
+            &mut joined,
+        )
+        .await?;
+        let mut last: AVec<(i64, usize)> = AVec::new();
+        for (k, c) in joined.iter().enumerate() {
+            if let OwnedValue::Integer(r) = self.eval_row_sub(&j.rowid, c).await? {
+                last.push((r, k));
+            }
+        }
+        last.as_mut_slice().sort_unstable();
+        let mut keep: AVec<(i64, usize)> = AVec::new();
+        for (r, k) in last.iter() {
+            match keep.as_mut_slice().last_mut() {
+                Some(x) if x.0 == *r => x.1 = *k,
+                _ => keep.push((*r, *k)),
+            }
+        }
+        Ok((joined, keep))
+    }
+
     #[cfg(feature = "v05")]
     async fn step_update(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
@@ -10198,8 +10582,40 @@ impl<'c, S: Storage> Statement<'c, S> {
             } => (from_sources.clone(), returning.clone()),
             _ => unreachable!(),
         };
+        // v0.17 (`join_order`): the target and the FROM sources joined
+        // in the pin's order once, before any row changes, each
+        // target rowid keeping the last combination that order gives
+        // it (the pin's UPDATE ... FROM, which collects them keyed by
+        // rowid first).
+        #[cfg(feature = "join_order")]
+        let from_join = match &self.plan {
+            Plan::Update { from_join, .. } => from_join.clone(),
+            _ => None,
+        };
+        #[cfg(feature = "join_order")]
+        let (joined_from, last_from) = match from_join.as_deref() {
+            None => (AVec::new(), AVec::new()),
+            // (Boxed: the join's futures stay off the stack of every
+            // UPDATE, trigger programs' included.)
+            Some(j) => Box::pin(self.update_from_rows(j)).await?,
+        };
+        #[cfg(feature = "join_order")]
+        let eff_sets: AVec<(Target, RExpr)> = match from_join.as_deref() {
+            Some(j) => sets
+                .iter()
+                .zip(j.sets.iter())
+                .map(|((t, _), e)| (*t, e.clone()))
+                .collect(),
+            None => sets.clone(),
+        };
+        #[cfg(not(feature = "join_order"))]
+        let eff_sets = sets.clone();
+        #[cfg(feature = "join_order")]
+        let joined_plan = from_join.is_some();
+        #[cfg(all(feature = "v07", not(feature = "join_order")))]
+        let joined_plan = false;
         #[cfg(feature = "v07")]
-        let from_rows = if from_sources.is_empty() {
+        let from_rows = if from_sources.is_empty() || joined_plan {
             None
         } else {
             Some(
@@ -10208,7 +10624,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
         };
         #[cfg(feature = "v07")]
-        let scan_filter = if from_rows.is_some() { &None } else { &filter };
+        let scan_filter = if !from_sources.is_empty() {
+            &None
+        } else {
+            &filter
+        };
         #[cfg(not(feature = "v07"))]
         let scan_filter = &filter;
         let mut rows = AVec::new();
@@ -10250,7 +10670,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let failed = match scanned {
             Ok(()) => None,
             Err(e)
-                if from_rows.is_none()
+                if from_sources.is_empty()
                     && self.one_pass(
                         crate::sql::ast::TrigEvent::Update,
                         Some((assigned.as_slice(), rowid_set)),
@@ -10320,8 +10740,20 @@ impl<'c, S: Storage> Statement<'c, S> {
             // through (v0.7): exactly one without FROM; with FROM,
             // one per joined combination the filter accepts.
             let mut combos: AVec<RowData> = AVec::new();
+            #[cfg(feature = "join_order")]
+            if joined_plan
+                && let Ok(p) = last_from
+                    .as_slice()
+                    .binary_search_by_key(&wrow.rowid, |x| x.0)
+                && let Some(c) = last_from
+                    .as_slice()
+                    .get(p)
+                    .and_then(|x| joined_from.as_slice().get(x.1))
+            {
+                combos.push(c.clone());
+            }
             #[cfg(feature = "v07")]
-            if let Some(fr) = &from_rows {
+            if let Some(fr) = from_rows.as_ref().filter(|_| !joined_plan) {
                 let mut joined: AVec<RowData> = AVec::new();
                 self.join_sources(
                     from_sources.as_slice(),
@@ -10356,7 +10788,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if let Some(c) = last {
                     combos.push(c);
                 }
-            } else {
+            } else if !joined_plan {
                 combos.push(base_rd);
             }
             #[cfg(not(feature = "v07"))]
@@ -10375,7 +10807,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 // 100 to the old b); applying them in order makes
                 // the last assignment to a column win.
                 let mut evaluated: AVec<(Target, OwnedValue)> = AVec::new();
-                for (target, e) in sets.iter() {
+                for (target, e) in eff_sets.iter() {
                     #[cfg(feature = "v06")]
                     let v = self.eval_row_sub(e, rd).await?;
                     #[cfg(not(feature = "v06"))]
@@ -11314,6 +11746,36 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
+        // A plan that streams (v0.17, `v16`) returns each row as its
+        // join makes it; a blocking one's rows land in `query_rows`.
+        #[cfg(feature = "v16")]
+        if !self.query_loaded {
+            // Boxed: the step future (re-entered once per trigger
+            // level) stays small.
+            if self.stream.is_none() {
+                self.stream = Box::pin(self.stream_open()).await?;
+            }
+            if let Some(mut s) = self.stream.take() {
+                match Box::pin(self.stream_step(&mut s)).await {
+                    Ok(true) => {
+                        self.stream = Some(s);
+                        self.phase = Phase::Running;
+                        return Ok(Step::Row);
+                    }
+                    Ok(false) => {
+                        self.conn.stream_left = None;
+                        self.query_loaded = true;
+                        self.query_pos = 0;
+                    }
+                    Err(e) => {
+                        // Stepped again, the statement starts over.
+                        self.conn.stream_left = None;
+                        self.phase = Phase::Fresh;
+                        return Err(e);
+                    }
+                }
+            }
+        }
         if !self.query_loaded {
             self.run_query().await?;
             self.query_loaded = true;
@@ -11346,33 +11808,43 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !qp.compound.is_empty() || !qp.values.is_empty() {
             return self.run_query_compound(qp).await;
         }
-        #[cfg(feature = "v06")]
-        if query_plan_has_sub(&qp) {
-            return self.run_query_sub(qp).await;
+        // v0.17 (`v16`): one executor, the async one (the streamed
+        // plans and their blocking modes use it too); the synchronous
+        // v0.4 executor below serves the builds without the rung.
+        #[cfg(feature = "v16")]
+        {
+            self.run_query_sub(qp).await
         }
-        // LIMIT / OFFSET first: the pin computes them before
-        // the scan, so a bad one errors even over no rows.
-        let window = self.limit_window(&qp.limit, &qp.offset).await?;
-        let src_rows = self
-            .materialise_query_sources(qp.sources.as_slice())
-            .await?;
-        // Nested-loop join + WHERE, then group / project: the
-        // synchronous v0.4 executor (no subqueries in the plan).
-        let mut rows: AVec<RowData> = AVec::new();
-        join_all::<S::Error>(&self.conn.env, &qp, src_rows.as_slice(), &mut rows)?;
-        let produced = project_rows::<S::Error>(
-            &self.conn.env,
-            &qp,
-            rows.as_slice(),
-            group_cap(
-                qp.group_by.as_slice(),
-                qp.order_by.as_slice(),
-                qp.distinct,
-                window,
-            ),
-        )?;
-        self.finish_produced(&qp, produced, window);
-        Ok(())
+        #[cfg(not(feature = "v16"))]
+        {
+            #[cfg(feature = "v06")]
+            if query_plan_has_sub(&qp) {
+                return self.run_query_sub(qp).await;
+            }
+            // LIMIT / OFFSET first: the pin computes them before
+            // the scan, so a bad one errors even over no rows.
+            let window = self.limit_window(&qp.limit, &qp.offset).await?;
+            let src_rows = self
+                .materialise_query_sources(qp.sources.as_slice())
+                .await?;
+            // Nested-loop join + WHERE, then group / project: the
+            // synchronous v0.4 executor (no subqueries in the plan).
+            let mut rows: AVec<RowData> = AVec::new();
+            join_all::<S::Error>(&self.conn.env, &qp, src_rows.as_slice(), &mut rows)?;
+            let produced = project_rows::<S::Error>(
+                &self.conn.env,
+                &qp,
+                rows.as_slice(),
+                group_cap(
+                    qp.group_by.as_slice(),
+                    qp.order_by.as_slice(),
+                    qp.distinct,
+                    window,
+                ),
+            )?;
+            self.finish_produced(&qp, produced, window);
+            Ok(())
+        }
     }
 
     /// Evaluate a plan's LIMIT / OFFSET (v0.16) into the row
@@ -11415,7 +11887,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Scan one query source's rows into memory (v0.4 executor
     /// step 1, shared by the subquery path): decoded values with
     /// defaults materialised and read-side REAL forcing (§5.5).
-    #[cfg(feature = "v04")]
+    #[cfg(all(feature = "v04", not(feature = "v16")))]
     async fn materialise_query_sources(
         &mut self,
         sources: &[SourcePlan],
@@ -11446,54 +11918,27 @@ impl<'c, S: Storage> Statement<'c, S> {
                 src_rows.push(rows);
                 continue;
             }
-            let mut rows = AVec::new();
-            let mut cursor = ScanCursor::new(sp.root);
-            let mut buf = AVec::new();
-            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-                if let Some(g) = &sp.gcols {
-                    // v0.16: a table with generated columns —
-                    // decode around the VIRTUAL ones, compute
-                    // them, then read the row as any other.
-                    let mut rec = crate::rules::decode_rec::<S::Error>(
-                        buf.as_slice(),
-                        sp.ncols,
-                        sp.defaults.as_slice(),
-                        Some(g.virt.as_slice()),
-                    )?;
-                    g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
-                    let rd = crate::rules::eval_row(
-                        sp.rowid_alias,
-                        sp.affs.as_slice(),
-                        rec.as_slice(),
-                        rowid,
-                    );
-                    rows.push((rd.vals, Some(rowid)));
-                    continue;
-                }
-                let mut dec: AVec<Value<'_>> = AVec::new();
-                crate::record::decode_record_into::<S::Error>(buf.as_slice(), sp.ncols, &mut dec)?;
-                let mut vals = AVec::new();
-                for i in 0..sp.ncols {
-                    let mut v = if Some(i) == sp.rowid_alias {
-                        OwnedValue::Integer(rowid)
-                    } else if i < dec.len() {
-                        OwnedValue::from_value(dec.as_slice()[i])
-                    } else {
-                        sp.defaults.as_slice()[i].clone()
-                    };
-                    // Read-side REAL forcing (§5.5).
-                    if sp.affs.as_slice()[i] == crate::record::Affinity::Real
-                        && let OwnedValue::Integer(x) = v
-                    {
-                        v = OwnedValue::Real(x as f64);
-                    }
-                    vals.push(v);
-                }
-                rows.push((vals, Some(rowid)));
-            }
-            src_rows.push(rows);
+            src_rows.push(self.scan_source(sp).await?);
         }
         Ok(src_rows)
+    }
+
+    /// Every row of the plain table source `sp`, in rowid order
+    /// (`decode_source_row` each).
+    #[cfg(feature = "v04")]
+    async fn scan_source(
+        &mut self,
+        sp: &SourcePlan,
+    ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        let mut rows = AVec::new();
+        let mut cursor = ScanCursor::new(sp.root);
+        let mut buf = AVec::new();
+        while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            let mut vals = AVec::new();
+            decode_source_row::<S::Error>(sp, buf.as_slice(), rowid, &mut vals)?;
+            rows.push((vals, Some(rowid)));
+        }
+        Ok(rows)
     }
 
     /// Materialise query sources for the async paths (v0.9):
@@ -11566,6 +12011,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 src_rows.push(rows);
                 continue;
             }
+            // v0.17 (`join_order`): an automatic index's rows, in its
+            // order (probed per combination in `join_step`).
+            #[cfg(feature = "join_order")]
+            if let Some(ai) = sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
+                src_rows.push(alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?);
+                continue;
+            }
             // v0.16 (`expr_index`): the rows an index finds, for
             // the enclosing row (a lateral path's rows are found per
             // combination, in `join_step`).
@@ -11584,51 +12036,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 src_rows.push(rows);
                 continue;
             }
-            let mut rows = AVec::new();
-            let mut cursor = ScanCursor::new(sp.root);
-            let mut buf = AVec::new();
-            while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
-                if let Some(g) = &sp.gcols {
-                    // v0.16: a table with generated columns —
-                    // decode around the VIRTUAL ones, compute
-                    // them, then read the row as any other.
-                    let mut rec = crate::rules::decode_rec::<S::Error>(
-                        buf.as_slice(),
-                        sp.ncols,
-                        sp.defaults.as_slice(),
-                        Some(g.virt.as_slice()),
-                    )?;
-                    g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
-                    let rd = crate::rules::eval_row(
-                        sp.rowid_alias,
-                        sp.affs.as_slice(),
-                        rec.as_slice(),
-                        rowid,
-                    );
-                    rows.push((rd.vals, Some(rowid)));
-                    continue;
-                }
-                let mut dec: AVec<Value<'_>> = AVec::new();
-                crate::record::decode_record_into::<S::Error>(buf.as_slice(), sp.ncols, &mut dec)?;
-                let mut vals = AVec::new();
-                for i in 0..sp.ncols {
-                    let mut v = if Some(i) == sp.rowid_alias {
-                        OwnedValue::Integer(rowid)
-                    } else if i < dec.len() {
-                        OwnedValue::from_value(dec.as_slice()[i])
-                    } else {
-                        sp.defaults.as_slice()[i].clone()
-                    };
-                    if sp.affs.as_slice()[i] == crate::record::Affinity::Real
-                        && let OwnedValue::Integer(x) = v
-                    {
-                        v = OwnedValue::Real(x as f64);
-                    }
-                    vals.push(v);
-                }
-                rows.push((vals, Some(rowid)));
-            }
-            src_rows.push(rows);
+            src_rows.push(self.scan_source(sp).await?);
         }
         Ok(src_rows)
     }
@@ -12613,27 +13021,23 @@ impl<'c, S: Storage> Statement<'c, S> {
         )? {
             return Ok(());
         }
-        let mut matched = right_match_flags(sources, src_rows);
-        self.join_step(
-            sources,
-            filter,
-            src_rows,
-            0,
-            outer.clone(),
-            &mut matched,
-            out,
-        )
-        .await?;
+        let mut st = JoinState {
+            matched: right_match_flags(sources, src_rows),
+            #[cfg(feature = "join_order")]
+            bloom: AVec::new(),
+        };
+        self.join_step(sources, filter, src_rows, 0, outer.clone(), &mut st, out)
+            .await?;
         for (i, (sp, rows)) in sources.iter().zip(src_rows.iter()).enumerate() {
             if !sp.kind.pads_left() {
                 continue;
             }
             for (ri, (vals, rowid)) in rows.iter().enumerate() {
-                if row_matched(&matched, i, ri) {
+                if row_matched(&st.matched, i, ri) {
                     continue;
                 }
                 let acc = left_padded(outer, sources, i, vals, *rowid);
-                self.join_step(sources, filter, src_rows, i + 1, acc, &mut matched, out)
+                self.join_step(sources, filter, src_rows, i + 1, acc, &mut st, out)
                     .await?;
             }
         }
@@ -12654,7 +13058,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         src_rows: &'x [AVec<(AVec<OwnedValue>, Option<i64>)>],
         idx: usize,
         acc: RowData,
-        matched: &'x mut AVec<AVec<bool>>,
+        st: &'x mut JoinState,
         out: &'x mut AVec<RowData>,
     ) -> JoinFuture<'x, S::Error> {
         alloc::boxed::Box::pin(async move {
@@ -12697,16 +13101,66 @@ impl<'c, S: Storage> Statement<'c, S> {
             } else {
                 rows
             };
+            // v0.17 (`join_order`): an automatic index — the span of
+            // the source's sorted rows this combination's key finds,
+            // after the Bloom filter.
+            #[cfg(feature = "join_order")]
+            let spanned;
+            #[cfg(feature = "join_order")]
+            let rows = match sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
+                Some(ai) => {
+                    let mut padded = acc.clone();
+                    pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
+                    spanned = self
+                        .auto_lookup(ai, rows, idx, &mut st.bloom, &padded)
+                        .await?;
+                    &spanned
+                }
+                None => rows,
+            };
             // v0.16 (`expr_index`): an index lookup on the sources
             // to the left — this combination's rows.
             #[cfg(feature = "expr_index")]
             let looked;
             #[cfg(feature = "expr_index")]
             let rows = match sp.access.as_deref() {
+                #[cfg(feature = "join_order")]
+                Some(a) if a.auto.is_some() => rows,
                 Some(a) if a.lateral => {
                     let mut padded = acc.clone();
                     pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
-                    looked = self.access_rows(sp, a, &padded).await?;
+                    // v0.17 (`join_order`): the Bloom filter first.
+                    #[cfg(feature = "join_order")]
+                    let pass = match &a.bloom {
+                        None => true,
+                        Some(keys) => {
+                            while st.bloom.len() <= idx {
+                                st.bloom.push(None);
+                            }
+                            if st.bloom.as_slice().get(idx).is_some_and(|b| b.is_none()) {
+                                let bits =
+                                    alloc::boxed::Box::pin(self.bloom_rows(sp, keys.as_slice()))
+                                        .await?;
+                                if let Some(slot) = st.bloom.as_mut_slice().get_mut(idx) {
+                                    *slot = Some(bits);
+                                }
+                            }
+                            let bits = st
+                                .bloom
+                                .as_slice()
+                                .get(idx)
+                                .and_then(|b| b.as_ref())
+                                .map_or(&[][..], |b| b.as_slice());
+                            alloc::boxed::Box::pin(self.bloom_pass(a, bits, &padded)).await?
+                        }
+                    };
+                    #[cfg(not(feature = "join_order"))]
+                    let pass = true;
+                    looked = if pass {
+                        self.access_rows(sp, a, &padded).await?
+                    } else {
+                        AVec::new()
+                    };
                     &looked
                 }
                 _ => rows,
@@ -12738,14 +13192,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 };
                 if on_ok {
                     any = true;
-                    mark_matched(matched, idx, ri);
+                    mark_matched(&mut st.matched, idx, ri);
                     self.join_step(
                         sources,
                         filter,
                         src_rows,
                         idx + 1,
                         acc2,
-                        &mut *matched,
+                        &mut *st,
                         &mut *out,
                     )
                     .await?;
@@ -12760,7 +13214,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     src_rows,
                     idx + 1,
                     acc2,
-                    &mut *matched,
+                    &mut *st,
                     &mut *out,
                 )
                 .await?;
@@ -12780,6 +13234,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        let cols = order_cols(qp.order_by.as_slice(), qp.items.as_slice());
         // Window calls (v0.16, `window`; see `project_rows`).
         #[cfg(feature = "window")]
         let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
@@ -12817,6 +13272,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for (e, _) in qp.order_by.iter() {
                     keys.push(self.eval_row_sub(e, r).await?);
                 }
+                shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
                 let rowid = if qp.sources.len() == 1 {
                     r.rowids.as_slice()[0]
                 } else {
@@ -12987,6 +13443,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             for (e, _) in qp.order_by.iter() {
                 keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
             }
+            shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
             out.push(Produced {
                 out: vals,
                 keys,
@@ -13023,6 +13480,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        let cols = order_cols(plan.order_by.as_slice(), plan.items.as_slice());
         // Window calls (v0.16, `window`; see `project_rows`).
         #[cfg(feature = "window")]
         let wins = crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice());
@@ -13060,6 +13518,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for (e, _) in plan.order_by.iter() {
                     keys.push(self.eval_row_sub(e, r).await?);
                 }
+                shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
                 out.push(Produced {
                     out: vals,
                     keys,
@@ -13221,6 +13680,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             for (e, _) in plan.order_by.iter() {
                 keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
             }
+            shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
             out.push(Produced {
                 out: vals,
                 keys,
@@ -13245,7 +13705,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// The window path of `project_qp_async` / `sub_project`
-    /// (v0.16, `window`; see `win_project`): the projection
+    /// (v0.16, `window`): the projection
     /// evaluates through `eval_row_sub` / `eval_group_sub`.
     #[cfg(feature = "window")]
     #[allow(clippy::too_many_arguments)]
@@ -14455,6 +14915,32 @@ fn order_ref(
     }
 }
 
+/// The result column each ORDER BY term is (the pin's
+/// `iOrderByCol`): the term, under any COLLATE, the same expression
+/// as a result column (`same_expr`; an alias or ordinal resolves to
+/// a copy of the column's) — the last such column.
+#[cfg(feature = "v04")]
+fn order_cols(order: &[(RExpr, crate::sql::SortOrder)], items: &[RExpr]) -> AVec<Option<usize>> {
+    let mut out = AVec::new();
+    for (e, _) in order.iter() {
+        let mut e = e;
+        while let RExpr::Collate(x, _) = e {
+            e = x;
+        }
+        out.push(items.iter().rposition(|it| crate::query::same_expr(e, it)));
+    }
+    out
+}
+
+#[cfg(feature = "v04")]
+fn shown_keys(keys: &mut [OwnedValue], cols: &[Option<usize>], vals: &[OwnedValue]) {
+    for (k, c) in keys.iter_mut().zip(cols.iter()) {
+        if let Some(v) = c.and_then(|j| vals.get(j)) {
+            *k = v.clone();
+        }
+    }
+}
+
 /// The direction each GROUP BY term's groups come out in
 /// (v0.16): when the ORDER BY has exactly as many terms as the
 /// GROUP BY, the pin's group sorter takes each ORDER BY term's
@@ -14503,6 +14989,15 @@ fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
     {
         return true;
     }
+    // A join the pin's planner ordered: its first loop delivers the
+    // GROUP BY for the whole join (v0.17 review fix, `join_order`).
+    #[cfg(feature = "join_order")]
+    if let Some(s) = sources.first()
+        && sources.len() > 1
+        && s.access.as_ref().is_some_and(|a| a.groups)
+    {
+        return true;
+    }
     let _ = sources;
     false
 }
@@ -14523,6 +15018,16 @@ fn dedup_produced(produced: AVec<Produced>, colls: &[crate::record::Coll]) -> AV
         }
     }
     kept
+}
+
+/// The nested-loop join's per-execution state (`join_step`): the
+/// RIGHT / FULL match flags and (v0.17, `join_order`) each automatic
+/// index's Bloom filter, built at its first probe.
+#[cfg(feature = "v06")]
+struct JoinState {
+    matched: AVec<AVec<bool>>,
+    #[cfg(feature = "join_order")]
+    bloom: AVec<Option<AVec<u8>>>,
 }
 
 /// Per-source "matched" flags for a join's RIGHT / FULL
@@ -14602,6 +15107,58 @@ fn left_padded(
     acc
 }
 
+/// Append the values of plain table source `sp`'s row `rowid`
+/// (record `payload`) to `out`: the rowid alias, defaults for the
+/// fields a short record lacks, read-side REAL forcing (§5.5) and
+/// (v0.16) its generated columns computed.
+#[cfg(feature = "v04")]
+fn decode_source_row<E>(
+    sp: &SourcePlan,
+    payload: &[u8],
+    rowid: i64,
+    out: &mut AVec<OwnedValue>,
+) -> Result<(), E> {
+    if let Some(g) = &sp.gcols {
+        // v0.16: a table with generated columns — decode around
+        // the VIRTUAL ones, compute them, then read the row as any
+        // other.
+        let mut rec = crate::rules::decode_rec::<E>(
+            payload,
+            sp.ncols,
+            sp.defaults.as_slice(),
+            Some(g.virt.as_slice()),
+        )?;
+        g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
+        let rd = crate::rules::eval_row(sp.rowid_alias, sp.affs.as_slice(), rec.as_slice(), rowid);
+        for v in rd.vals {
+            out.push(v);
+        }
+        return Ok(());
+    }
+    let mut dec: AVec<Value<'_>> = AVec::new();
+    crate::record::decode_record_into::<E>(payload, sp.ncols, &mut dec)?;
+    for i in 0..sp.ncols {
+        let mut v = if Some(i) == sp.rowid_alias {
+            OwnedValue::Integer(rowid)
+        } else if let Some(d) = dec.as_slice().get(i) {
+            OwnedValue::from_value(*d)
+        } else {
+            sp.defaults
+                .as_slice()
+                .get(i)
+                .cloned()
+                .unwrap_or(OwnedValue::Null)
+        };
+        if sp.affs.as_slice().get(i) == Some(&crate::record::Affinity::Real)
+            && let OwnedValue::Integer(x) = v
+        {
+            v = OwnedValue::Real(x as f64);
+        }
+        out.push(v);
+    }
+    Ok(())
+}
+
 /// Whether any expression of a query plan contains a
 /// current-scope subquery node (v0.6): such plans execute
 /// through the substitution path instead of the synchronous
@@ -14646,7 +15203,7 @@ struct Produced {
 /// RIGHT / FULL source's unmatched rows NULL-padded on the left
 /// and joined onward — the `join_sources` order, without
 /// subquery execution.
-#[cfg(feature = "v04")]
+#[cfg(all(feature = "v04", not(feature = "v16")))]
 fn join_all<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -14693,7 +15250,7 @@ fn join_all<E>(
 /// extends once with NULLs, and RIGHT / FULL matches are
 /// recorded in `matched` for `join_all`'s tail. The WHERE
 /// filter applies to complete rows.
-#[cfg(feature = "v04")]
+#[cfg(all(feature = "v04", not(feature = "v16")))]
 fn join_rows<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -14749,7 +15306,7 @@ fn join_rows<E>(
 }
 
 /// Group (when the plan aggregates) and project joined rows.
-#[cfg(feature = "v04")]
+#[cfg(all(feature = "v04", not(feature = "v16")))]
 fn project_rows<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -14757,33 +15314,10 @@ fn project_rows<E>(
     cap: Option<usize>,
 ) -> Result<AVec<Produced>, E> {
     let mut out = AVec::new();
-    // Window calls (v0.16, `window`): each input row (or group)
-    // first evaluates the calls' inputs; the projection waits for
-    // the windows (`win_project`). A group LIMIT cannot apply.
-    #[cfg(feature = "window")]
-    let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
-    #[cfg(feature = "window")]
-    let cap = if wins.is_empty() { cap } else { None };
-    #[cfg(feature = "window")]
-    let mut pend: AVec<WinUnit> = AVec::new();
+    let cols = order_cols(qp.order_by.as_slice(), qp.items.as_slice());
     if !qp.has_agg {
-        #[cfg(feature = "window")]
-        let mut row_at = 0usize;
         for r in rows {
             let ctx = Ctx::of(r).with(env);
-            #[cfg(feature = "window")]
-            if !wins.is_empty() {
-                let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
-                    crate::query::eval::<E>(k, &ctx)
-                })?;
-                pend.push(WinUnit {
-                    at: row_at,
-                    rep: None,
-                    ins,
-                });
-                row_at += 1;
-                continue;
-            }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -14792,6 +15326,7 @@ fn project_rows<E>(
             for (e, _) in qp.order_by.iter() {
                 keys.push(crate::query::eval::<E>(e, &ctx)?);
             }
+            shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
             let rowid = if qp.sources.len() == 1 {
                 r.rowids.as_slice()[0]
             } else {
@@ -14802,10 +15337,6 @@ fn project_rows<E>(
                 keys,
                 rowid,
             });
-        }
-        #[cfg(feature = "window")]
-        if !wins.is_empty() {
-            return win_project::<E>(env, qp, wins.as_slice(), pend, rows, &[]);
         }
         return Ok(out);
     }
@@ -14889,13 +15420,7 @@ fn project_rows<E>(
             });
         }
     }
-    #[cfg(feature = "window")]
-    let mut group_at = usize::MAX;
     for (_, grows) in groups.iter() {
-        #[cfg(feature = "window")]
-        {
-            group_at = group_at.wrapping_add(1);
-        }
         if cap.is_some_and(|c| out.len() >= c) {
             break;
         }
@@ -14922,18 +15447,6 @@ fn project_rows<E>(
                 continue;
             }
         }
-        #[cfg(feature = "window")]
-        if !wins.is_empty() {
-            let ins = crate::window::inputs::<Error<E>>(wins.as_slice(), &mut |k| {
-                crate::query::eval::<E>(k, &ctx)
-            })?;
-            pend.push(WinUnit {
-                at: group_at,
-                rep: Some(rep),
-                ins,
-            });
-            continue;
-        }
         let mut vals = AVec::new();
         for it in qp.items.iter() {
             vals.push(crate::query::eval::<E>(it, &ctx)?);
@@ -14942,15 +15455,12 @@ fn project_rows<E>(
         for (e, _) in qp.order_by.iter() {
             keys.push(crate::query::eval::<E>(e, &ctx)?);
         }
+        shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
         out.push(Produced {
             out: vals,
             keys,
             rowid: None,
         });
-    }
-    #[cfg(feature = "window")]
-    if !wins.is_empty() {
-        return win_project::<E>(env, qp, wins.as_slice(), pend, rows, groups.as_slice());
     }
     Ok(out)
 }
@@ -15001,67 +15511,6 @@ fn win_results<E>(
         to.push(crate::window::strip(e));
     }
     Ok((order, vals, ti, to))
-}
-
-/// `project_rows`' window path (v0.16, `window`): compute the
-/// windows, then project each unit in the window order with its
-/// calls' values in place.
-#[cfg(feature = "window")]
-fn win_project<E>(
-    env: &crate::query::Env,
-    qp: &QueryPlan,
-    wins: &[&RExpr],
-    mut units: AVec<WinUnit>,
-    rows: &[RowData],
-    groups: &[(AVec<OwnedValue>, AVec<RowData>)],
-) -> Result<AVec<Produced>, E> {
-    let (order, vals, ti, to) = win_results::<E>(
-        wins,
-        &mut units,
-        qp.items.as_slice(),
-        qp.order_by.as_slice(),
-        env.text_enc(),
-    )?;
-    let empty = RowData::empty();
-    let mut out = AVec::with_capacity(order.len());
-    for &u in order.iter() {
-        let (Some(unit), Some(v)) = (units.as_slice().get(u), vals.as_slice().get(u)) else {
-            continue;
-        };
-        let (ctx, rowid) = match &unit.rep {
-            None => {
-                let r = rows.get(unit.at).unwrap_or(&empty);
-                let rowid = if qp.sources.len() == 1 {
-                    r.rowids.as_slice().first().copied().flatten()
-                } else {
-                    None
-                };
-                (Ctx::of(r).with(env), rowid)
-            }
-            Some(rep) => {
-                let g = groups.get(unit.at).map(|g| g.1.as_slice()).unwrap_or(&[]);
-                (Ctx::group(g, rep).with(env), None)
-            }
-        };
-        let mut vs = AVec::new();
-        for t in ti.iter() {
-            let mut e = t.clone();
-            crate::window::fill(&mut e, v.as_slice());
-            vs.push(crate::query::eval::<E>(&e, &ctx)?);
-        }
-        let mut keys = AVec::new();
-        for t in to.iter() {
-            let mut e = t.clone();
-            crate::window::fill(&mut e, v.as_slice());
-            keys.push(crate::query::eval::<E>(&e, &ctx)?);
-        }
-        out.push(Produced {
-            out: vs,
-            keys,
-            rowid,
-        });
-    }
-    Ok(out)
 }
 
 /// The min/max aggregate whose extremum row supplies a group's

@@ -33,6 +33,8 @@
 pub mod aux;
 pub mod config;
 pub mod expr;
+#[cfg(feature = "fts5_delete")]
+pub mod sdel;
 pub mod tok;
 mod unicode;
 
@@ -373,6 +375,10 @@ pub enum Op {
     IdxPut(u32, AVec<u8>, i64),
     /// `DELETE FROM %_idx WHERE segid=?`.
     IdxDel(u32),
+    /// `DELETE FROM %_idx WHERE (segid, (pgno/2)) = (?, ?)` (a page a
+    /// secure delete left with no term).
+    #[cfg(feature = "fts5_delete")]
+    IdxDelPg(u32, u32),
 }
 
 /// The `%_data` rows an operation has read (the whole table: the
@@ -979,6 +985,7 @@ pub fn flush(
     t: &Tuning,
     detail: Detail,
     nrows: u64,
+    #[cfg(feature = "fts5_delete")] x: &mut sdel::SdFlush,
 ) -> Result<(), Corrupt> {
     let mut s = st.structure()?;
     let mut last = 0u32;
@@ -988,6 +995,11 @@ pub fn flush(
         let mut w = Writer::new(segid, pgsz);
         for (key, dl) in h.entries().iter() {
             let dl = dl.as_slice();
+            #[cfg(feature = "fts5_delete")]
+            if x.secure {
+                sdel::flush_term(st, &mut w, &s, key.as_slice(), dl, detail, x)?;
+                continue;
+            }
             w.append_term(st, key.as_slice());
             if pgsz > w.room() + dl.len() {
                 w.buf.extend_from_slice(dl);
@@ -1074,7 +1086,17 @@ pub fn flush(
             s.promote(0);
         }
     }
-    automerge(st, &mut s, t, detail, i64::from(last))?;
+    #[cfg(not(feature = "fts5_delete"))]
+    let work = i64::from(last);
+    // fts5IndexAutomerge(pgnoLast + nContentlessDelete).
+    #[cfg(feature = "fts5_delete")]
+    let work = {
+        if x.bumped {
+            s.cookie = s.cookie.wrapping_add(1);
+        }
+        i64::from(last).wrapping_add(x.ncdel as i64)
+    };
+    automerge(st, &mut s, t, detail, work)?;
     crisismerge(st, &mut s, t, detail)?;
     st.write_structure(&s);
     Ok(())

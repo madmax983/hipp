@@ -143,6 +143,7 @@ impl<S: Storage> Connection<S> {
             + cur.sources.as_slice().last().map_or(0, |s| s.columns.len());
         let first = cur.offsets.as_slice().first().copied().unwrap_or(end);
         let here = cur.offsets.as_slice().get(i).copied().unwrap_or(end);
+        #[cfg(not(feature = "join_order"))]
         let later = RefRange {
             w: (here, end),
             s: (cur.first_src + i, cur.first_src + n),
@@ -153,12 +154,36 @@ impl<S: Storage> Connection<S> {
         };
         let mut row = AVec::new();
         let mut lateral = false;
+        // v0.17 (`join_order`): an argument may read a source after
+        // it, which the join planner then runs first (the pin's
+        // reordering; `check_tvf_order` refuses what stays after).
+        #[cfg(feature = "join_order")]
+        let (later, after) = (
+            RefRange {
+                w: (
+                    here,
+                    cur.offsets.as_slice().get(i + 1).copied().unwrap_or(end),
+                ),
+                s: (cur.first_src + i, cur.first_src + i + 1),
+            },
+            RefRange {
+                w: (
+                    cur.offsets.as_slice().get(i + 1).copied().unwrap_or(end),
+                    end,
+                ),
+                s: (cur.first_src + i + 1, cur.first_src + n),
+            },
+        );
         for a in s.args.iter().flat_map(|a| a.iter()) {
             let r = resolve_scoped::<S::Error>(a, arena, cur, enclosing, &mut *planner)?;
             if has_agg(&r) || expr_refs_range(&r, &later) {
                 return Err(Error::Unsupported);
             }
             lateral |= expr_refs_range(&r, &left);
+            #[cfg(feature = "join_order")]
+            {
+                lateral |= expr_refs_range(&r, &after);
+            }
             row.push(r);
         }
         // A lateral call on the right of a RIGHT / FULL join would
@@ -175,6 +200,85 @@ impl<S: Storage> Connection<S> {
         }
         Ok(())
     }
+}
+
+/// A JSON table-valued source whose arguments read a source after it
+/// (v0.17, `join_order`): the join planner puts the sources they read
+/// first where it may; where it may not (a CROSS JOIN keeps the call
+/// before them) the pin offers xBestIndex no constraint for such an
+/// argument, so the call runs without it — no JSON argument, no rows;
+/// no root argument, the root `$` — and the argument's
+/// `hidden column = value` term stays a WHERE term (review fix: it was
+/// refused). `filter` takes those terms. A source the planner does not
+/// order (`ordered` false: a RIGHT / FULL join, ...) is still refused.
+#[cfg(all(feature = "join_order", feature = "json"))]
+pub(super) fn fix_tvf_order<E>(
+    sources: &mut [SourcePlan],
+    cur: &crate::query::ScopeGroup,
+    filter: &mut Option<RExpr>,
+    ordered: bool,
+) -> Result<(), Error<E>>
+where
+    Error<E>: Sized,
+{
+    use crate::query::{RefRange, expr_refs_range};
+    let n = sources.len();
+    let end =
+        cur.offsets.as_slice().last().copied().unwrap_or(0) + sources.last().map_or(0, |s| s.ncols);
+    for (i, sp) in sources.iter_mut().enumerate() {
+        #[cfg(feature = "vtab")]
+        if sp.tvf & crate::query::TVF_VTAB != 0 || sp.vt.is_some() {
+            continue;
+        }
+        if sp.tvf == 0 {
+            continue;
+        }
+        let here = cur.offsets.as_slice().get(i).copied().unwrap_or(end);
+        let later = RefRange {
+            w: (here, end),
+            s: (cur.first_src + i, cur.first_src + n),
+        };
+        let Some(args) = sp
+            .derived
+            .as_deref_mut()
+            .and_then(|d| d.values.as_mut_slice().first_mut())
+        else {
+            continue;
+        };
+        let reads: AVec<bool> = args.iter().map(|a| expr_refs_range(a, &later)).collect();
+        if !reads.iter().any(|r| *r) {
+            continue;
+        }
+        if !ordered {
+            return Err(Error::Unsupported);
+        }
+        // (`json` and `root` are the hidden columns 8 and 9.)
+        let keep = if reads.as_slice().first().copied().unwrap_or(false) {
+            0
+        } else {
+            1
+        };
+        let mut k = args.len();
+        while k > keep {
+            k -= 1;
+            let Some(a) = args.pop() else { break };
+            if !reads.as_slice().get(k).copied().unwrap_or(false) && k > 0 {
+                // (Dropped with the JSON argument: no rows to test.)
+                continue;
+            }
+            let col = RExpr::Column(
+                here + 8 + k,
+                crate::record::Affinity::Blob,
+                Some(crate::record::Coll::default()),
+            );
+            let term = RExpr::Binary(crate::sql::BinOp::Eq, Box::new(col), Box::new(a));
+            *filter = Some(match filter.take() {
+                None => term,
+                Some(f) => and_expr(Some(f), term),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Fill each lateral JSON table-valued source's `tvf_dead`
@@ -244,9 +348,31 @@ impl<S: Storage> Statement<'_, S> {
         filter: Option<&RExpr>,
         acc: &RowData,
     ) -> Result<Option<AVec<(AVec<OwnedValue>, Option<i64>)>>, S::Error> {
-        use crate::query::{RefRange, expr_refs_range};
         let Some(sp) = sources.get(idx) else {
             return Ok(Some(AVec::new()));
+        };
+        if !self.lateral_ok(sources, idx, filter, acc).await? {
+            return Ok(None);
+        }
+        let mut padded = acc.clone();
+        pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
+        self.json_tvf_rows(sp, &padded, None).await.map(Some)
+    }
+
+    /// Whether the WHERE terms (and this join's ON terms) that read
+    /// only the sources before lateral source `idx` hold for their
+    /// combination `acc` (`lateral_rows`; v0.17: the streamed join
+    /// opens the source's cursor only then).
+    pub(super) async fn lateral_ok(
+        &mut self,
+        sources: &[SourcePlan],
+        idx: usize,
+        filter: Option<&RExpr>,
+        acc: &RowData,
+    ) -> Result<bool, S::Error> {
+        use crate::query::{RefRange, expr_refs_range};
+        let Some(sp) = sources.get(idx) else {
+            return Ok(true);
         };
         let rest = sources.get(idx..).unwrap_or(&[]);
         let w = acc.vals.len();
@@ -263,7 +389,7 @@ impl<S: Storage> Statement<'_, S> {
         }
         for t in terms.iter() {
             if !expr_refs_range(t, &later) && !self.cond_row_sub(t, &padded).await? {
-                return Ok(None);
+                return Ok(false);
             }
         }
         // An inner join's ON is a WHERE term on the pin; a LEFT
@@ -276,10 +402,10 @@ impl<S: Storage> Statement<'_, S> {
         }
         for t in on.iter() {
             if !expr_refs_range(t, &later) && !self.cond_row_sub(t, &padded).await? {
-                return Ok(None);
+                return Ok(false);
             }
         }
-        self.json_tvf_rows(sp, &padded, None).await.map(Some)
+        Ok(true)
     }
 
     /// The rows of JSON table-valued source `sp` for the row `row`

@@ -3,6 +3,119 @@
 All notable changes to hipp. Versions follow the milestones in
 `STATUS.md`; the oracle pin is SQLite 3.54.1 throughout.
 
+## Unreleased (0.17)
+
+### Join ordering and automatic indexes (leaf `join_order`, in `xl`)
+
+- Joins of tables, virtual tables and JSON table-valued functions are
+  planned as the pin's `where.c` plans them (loop costs with
+  prerequisites, the N-best path solver, sorting costs, LEFT / CROSS
+  JOIN constraints, LEFT JOIN simplification, constant propagation):
+  rows without ORDER BY come in the pin's order and EXPLAIN QUERY
+  PLAN prints the pin's loops.
+- Automatic indexes (PARTIAL when a term reads the table alone),
+  built once per statement, and Bloom filters, built and consulted:
+  before every automatic index and, with `sqlite_stat1`, before
+  lookups that run more often than their table has rows.
+- `sqlite_stat1` is read back at schema load and after ANALYZE.
+- `FROM t, m WHERE t MATCH m.q`, `FROM generate_series(1, t.n), t` and
+  `FROM json_each(t.j), t` run (they were refused).
+- Fixed (ungated): the commuted copy of a join term kept the wrong
+  collation, so a lookup through an index on the other column could
+  lose rows under a NOCASE comparison; `,` in FROM is a plain inner
+  join, not a CROSS JOIN.
+- Tests: `tests/join_order_v17.rs`, `hipp-cli/tests/cli_v17_join_order.rs`.
+  Size: xl +48,032 B (1,103,060 B); max +128 B; full +48 B; tiny 0.
+- Review fixes: a GROUP BY a join (or a rowid scan) delivers in
+  another column order emits its groups in loop order, as the pin's
+  plan says; likely() / unlikely() / likelihood() and COLLATE around a
+  WHERE term no longer hide it from the planner, and their probability
+  is the pin's `truthProb`; the LEFT JOIN simplification sees through
+  them and takes `x IS DISTINCT FROM NULL` as NOTNULL; the statistics
+  held in a connection follow DDL as the pin's (DROP INDEX keeps the
+  table's estimate, ALTER / VACUUM / a rolled-back schema change
+  reload) and stat rows are decoded as `analysisLoader` does; UPDATE
+  ... FROM is planned as a join (the pin's final table when several
+  FROM rows match, automatic indexes); 64-source joins are planned;
+  expression indexes cover SELECTs that read only their expressions,
+  and BETWEEN with column bounds probes the bounds' table (the latter
+  under `expr_index`);
+  a table-valued argument past a CROSS JOIN is left out of the call as
+  on the pin instead of being refused. Size: xl +11,400 B (1,114,356 B);
+  max +448 B (1,046,892 B); full +192 B (506,672 B); tiny 0.
+
+### FTS5 delete writes (leaf `fts5_delete`, in `xl`)
+
+- `contentless_delete=1` tables: DELETE, UPDATE (every indexed
+  column; UNINDEXED-only is a no-op, a subset is the pin's error)
+  and INSERT OR REPLACE write tombstone hash pages and the
+  structure's `nEntryTombstone` / `nPgTombstone` as the pin does
+  (written at a hash rebuild and at the flush; tombstones count as
+  automerge work and drive `deletemerge`).
+- `secure-delete=1`: DELETE, UPDATE, OR REPLACE and the 'delete'
+  command remove entries from the segments in place, byte for byte
+  with the pin (`version` 5 and the cookie at the first one).
+- Fixes on claimed fts5 paths (ungated, `fts5`): a row with no
+  tokens counts into the next segment's `nEntry` across commits;
+  `rowid IN (x)` is a one-row write (no statement-journal flush);
+  `integrity-check` checks an external table's content only with
+  rank 1; a bm25 of `0 / 0` is NULL; bm25 / snippet / ORDER BY
+  rank on a row without `%_docsize`, or a table whose totals count
+  no row, are the pin's corruption error; an UPDATE to a NULL
+  rowid is "datatype mismatch".
+- Review fixes: under secure-delete an entry a tombstone hides stays
+  in place (the pin's iterator skips tombstoned rowids); a
+  rolled-back `secure-delete` setting is forgotten when the pin would
+  reparse its schema (ALTER TABLE, VACUUM, a rollback undoing a
+  schema change, `writable_schema = RESET`); a contentless UPDATE
+  with `rowid = '1'` on row 1 is not a move (and with
+  `rowid = NULL` on row 0 is the pin's "datatype mismatch"); tombstone and
+  secure-delete writes are linear in the rows a statement deletes
+  (were quadratic); OR FAIL keeps an fts5 write's rows before the
+  conflict and OR ROLLBACK ends the transaction (ungated, `fts5`:
+  both acted as ABORT).
+- `link.x`: the sizing demo's FLASH region is 2 MiB so `xl` links.
+- Sizes: tiny 76,960 B (0), full 505,416 B (0), max 1,044,172 B
+  (+832, the ungated fixes), xl 1,053,532 B (+10,192: the leaf,
+  9,360 B, does not fit `max`'s remaining 4,404 B).
+
+### Streamed rows (ungated, `v16` executor; cursors with `vtab`)
+
+- A top-level SELECT returns its rows one `step` at a time: a
+  statement failing on row N returns rows 1..N-1 first (as the pin
+  and its shell do), LIMIT stops reading (`generate_series(1) LIMIT
+  3` answers at once), OFFSET rows are not projected, LIMIT 0 reads
+  nothing.
+- Virtual-table cursors drive the join row by row
+  (generate_series, the R*Tree search); an inner virtual table is
+  filtered again per outer row. dbstat / fts5 / fts5vocab hand out
+  the rows their filter computed.
+- count / sum / total / avg / min / max without GROUP BY fold in
+  constant memory: `count(*) FROM generate_series(1)` is 4294967295.
+- `Config::max_vtab_rows` bounds only rows a statement holds
+  (DISTINCT, GROUP BY, ORDER BY without LIMIT, and the materialising
+  paths: subqueries, derived tables, compounds, RIGHT / FULL joins,
+  window queries, write-statement sources); an ORDER BY with a LIMIT
+  keeps only the rows it may return.
+- Under `v16` the synchronous v0.4 query executor is retired (the
+  async executor serves every top-level query).
+- Sizes: tiny 76,960 B (0), full 505,416 B (+4,464), max 1,043,340 B
+  (+7,824), xl 1,043,292 B (+7,776).
+- Review fixes: an ORDER BY naming a result column (alias, ordinal,
+  same expression) sorts on the returned value, so a `random()`
+  column comes out sorted (every executor, ungated); an aggregate
+  without GROUP BY drops its ORDER BY as the pin does (only its
+  aggregates still run); recursive CTEs stream (an endless one read
+  through a WHERE or join under a LIMIT with a doubling bound); a
+  streamed join frees the JSON documents and full-text rows of each
+  finished inner loop and row, and computes an inner fts5 / dbstat
+  source that reads nothing to its left once; hipp-cli exits 1 after
+  a stdin script with a failed statement or dot-command and skips
+  the rest of the failing input chunk. Sizes on top of the FTS5
+  delete unit: tiny 0, full 506,432 B (+1,016), max 1,045,676 B
+  (+1,504), xl 1,055,028 B (+1,496); every ratchet at its measured
+  figure.
+
 ## 0.16.0 — the SQLite-parity push (2026-11-05)
 
 Closes as much of the gap with the pinned SQLite 3.54.1 as the size

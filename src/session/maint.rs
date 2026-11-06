@@ -345,6 +345,10 @@ impl<S: Storage> Statement<'_, S> {
         {
             self.conn.fk.kept = true;
         }
+        #[cfg(feature = "fts5")]
+        {
+            self.fts_kept = true;
+        }
         if let Some(level) = self.stmt_sp.take()
             && self.conn.pager.sp_depth() > level
         {
@@ -386,14 +390,26 @@ impl<S: Storage> Statement<'_, S> {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
             // An R*Tree write (v0.16, `rtree`): its UNIQUE and rtree
             // constraints.
-            #[cfg(feature = "rtree")]
+            #[cfg(any(feature = "rtree", feature = "fts5"))]
             Plan::Vtab(p) => match &**p {
+                #[cfg(feature = "rtree")]
                 super::vtab::VtPlan::Write(w) => {
                     return w.conflict == ConflictAction::Rollback
                         && matches!(
                             e,
                             Error::Schema {
                                 kind: SchemaKind::UniqueViolation | SchemaKind::RtreeConstraint,
+                            }
+                        );
+                }
+                // An fts5 table's content conflict (v0.17 review fix).
+                #[cfg(feature = "fts5")]
+                super::vtab::VtPlan::Fts5Write(w) => {
+                    return w.conflict == ConflictAction::Rollback
+                        && matches!(
+                            e,
+                            Error::Schema {
+                                kind: SchemaKind::UniqueViolation,
                             }
                         );
                 }
@@ -1220,6 +1236,10 @@ impl<S: Storage> Statement<'_, S> {
             encode_record(vals.as_slice(), &mut rec);
             btree::btree_insert(&mut self.conn.pager, root, next, rec.as_slice()).await?;
         }
+        // v0.17 (`join_order`): the planner reads the new statistics,
+        // as the pin's `sqlite3AnalysisLoad` after ANALYZE.
+        #[cfg(feature = "join_order")]
+        alloc::boxed::Box::pin(self.conn.analysis_load(Some(root))).await?;
         Ok(())
     }
 

@@ -986,6 +986,10 @@ impl<'a> Walk<'a> {
         }
         let count_of = self.simple_count(c);
         for (i, sp) in c.sources.iter().enumerate() {
+            #[cfg(feature = "join_order")]
+            if sp.eqp.omit {
+                continue;
+            }
             let mut line = AVec::new();
             self.loop_line(sp, &mut line, &mut probes);
             // The pin's count(*) loop names the table itself, never an
@@ -1006,6 +1010,27 @@ impl<'a> Walk<'a> {
             }
             if i > 0 && sp.kind.pads_right() {
                 line.extend_from_slice(b" LEFT-JOIN");
+            }
+            // The Bloom filters built before this loop (v0.17,
+            // `join_order`): its own, and those pulled down to it.
+            #[cfg(feature = "join_order")]
+            for (q, sq) in c.sources.iter().enumerate() {
+                if sp.eqp.bloom_lines & (1u64 << q) != 0 {
+                    let mut b = AVec::new();
+                    self.bloom_line(sq, &mut b);
+                    self.add(parent, &[b.as_slice()]);
+                }
+            }
+            // An automatic index's Bloom filter (v0.17, `join_order`).
+            #[cfg(feature = "join_order")]
+            if let Some(ai) = sp.access.as_deref().and_then(|a| a.auto.as_deref())
+                && ai.bloom
+            {
+                let mut b = copy_vec(b"BLOOM FILTER ON ");
+                self.scan_name(sp, &mut b);
+                b.push(b' ');
+                self.auto_keys(sp, ai, &mut b);
+                self.add(parent, &[b.as_slice()]);
             }
             self.add(parent, &[line.as_slice()]);
             #[cfg(feature = "expr_index")]
@@ -1031,6 +1056,11 @@ impl<'a> Walk<'a> {
         if let Some(f) = c.filter {
             self.exprs(core::slice::from_ref(f), parent, probes.as_slice());
         }
+        // (A join the pin's planner ordered reports what it delivers
+        // on its first loop: v0.17, `join_order`.)
+        #[cfg(feature = "join_order")]
+        let first = c.sources.first().filter(|s| n == 1 || s.eqp.joined);
+        #[cfg(not(feature = "join_order"))]
         let first = c.sources.first().filter(|_| n == 1);
         #[cfg(feature = "expr_index")]
         let acc = first.and_then(|s| s.access.as_deref());
@@ -1205,7 +1235,13 @@ impl<'a> Walk<'a> {
                 .derived
                 .as_deref()
                 .and_then(|d| d.values.as_slice().first())
-                .map_or(1, |r| if r.len() > 1 { 3 } else { 1 });
+                .map_or(1, |r| match r.len() {
+                    // (No JSON argument: a call whose argument reads
+                    // a source past a CROSS JOIN, v0.17.)
+                    0 => 0,
+                    1 => 1,
+                    _ => 3,
+                });
             out.extend_from_slice(b" VIRTUAL TABLE INDEX ");
             num(out, n, false);
             out.push(b':');
@@ -1240,9 +1276,82 @@ impl<'a> Walk<'a> {
         let _ = probes;
     }
 
+    /// `BLOOM FILTER ON x (a=? AND b=?)` for a lookup loop's filter
+    /// (v0.17, `join_order`; `sqlite3WhereExplainBloomFilter`): the
+    /// INTEGER PRIMARY KEY's name (or `rowid`), else the index's
+    /// equality columns.
+    #[cfg(feature = "join_order")]
+    fn bloom_line(&mut self, sp: &SubSource, out: &mut AVec<u8>) {
+        out.extend_from_slice(b"BLOOM FILTER ON ");
+        self.scan_name(sp, out);
+        out.extend_from_slice(b" (");
+        let Some(a) = sp.access.as_deref() else {
+            return;
+        };
+        let n = a.bloom.as_ref().map_or(0, |k| k.len());
+        let t = self.cat.tables.iter().find(|t| t.root == sp.root);
+        let ix = self
+            .cat
+            .indexes
+            .iter()
+            .find(|i| i.root == a.root && a.root != 0);
+        match (t, ix) {
+            (Some(t), Some(i)) => {
+                let mut keys: AVec<AVec<u8>> = AVec::new();
+                self.key_names(t, i, &mut keys);
+                for (k, name) in keys.iter().take(n).enumerate() {
+                    if k > 0 {
+                        out.extend_from_slice(b" AND ");
+                    }
+                    out.extend_from_slice(name.as_slice());
+                    out.extend_from_slice(b"=?");
+                }
+            }
+            (t, _) => {
+                match t.and_then(|t| t.rowid_alias.and_then(|c| t.columns.as_slice().get(c))) {
+                    Some(c) => out.extend_from_slice(handle_bytes(self.ca, c.name)),
+                    None => out.extend_from_slice(b"rowid"),
+                }
+                out.extend_from_slice(b"=?");
+            }
+        }
+        out.push(b')');
+    }
+
+    /// An automatic index's key: `(c=? AND d=?)` (v0.17,
+    /// `join_order`).
+    #[cfg(feature = "join_order")]
+    fn auto_keys(&self, sp: &SubSource, ai: &crate::xplan::AutoIdx, out: &mut AVec<u8>) {
+        let t = self.cat.tables.iter().find(|t| t.root == sp.root);
+        out.push(b'(');
+        for (i, k) in ai.keys.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b" AND ");
+            }
+            if let Some(c) = t.and_then(|t| t.columns.as_slice().get(k.col)) {
+                out.extend_from_slice(handle_bytes(self.ca, c.name));
+            }
+            out.extend_from_slice(b"=?");
+        }
+        out.push(b')');
+    }
+
     /// The index part of a loop's line.
     #[cfg(feature = "expr_index")]
     fn access(&mut self, sp: &SubSource, a: &crate::xplan::IdxAccess, out: &mut AVec<u8>) {
+        #[cfg(feature = "join_order")]
+        if let Some(ai) = a.auto.as_deref() {
+            out.truncate(0);
+            out.extend_from_slice(b"SEARCH ");
+            self.scan_name(sp, out);
+            out.extend_from_slice(if ai.partial {
+                b" USING AUTOMATIC PARTIAL COVERING INDEX "
+            } else {
+                b" USING AUTOMATIC COVERING INDEX "
+            });
+            self.auto_keys(sp, ai, out);
+            return;
+        }
         let Some(t) = self.cat.tables.iter().find(|t| t.root == sp.root) else {
             return;
         };
@@ -1624,8 +1733,35 @@ pub(super) fn describe<S: Storage>(
             filter,
             from_sources,
             returning,
+            #[cfg(feature = "join_order")]
+            from_join,
             ..
         } => {
+            // An UPDATE ... FROM the join planner ordered (v0.17
+            // review fix): its loops as a SELECT's.
+            #[cfg(feature = "join_order")]
+            if let Some(j) = from_join.as_deref() {
+                w.update_from = true;
+                let c = Core {
+                    sources: j.sources.as_slice(),
+                    items: &[],
+                    filter: None,
+                    group_by: &[],
+                    having: None,
+                    order_by: &[],
+                    distinct: false,
+                    has_agg: false,
+                    values: &[],
+                    sel: 0,
+                };
+                w.body(&c, 0, false, &c);
+                if let Some(f) = &j.filter {
+                    w.exprs(core::slice::from_ref(f), 0, &[]);
+                }
+                w.exprs(j.sets.as_slice(), 0, &[]);
+                w.exprs(returning.as_slice(), 0, &[]);
+                return;
+            }
             let alias = match ast {
                 Ast::Update { alias, .. } => *alias,
                 _ => None,

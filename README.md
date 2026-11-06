@@ -12,7 +12,8 @@ aspirations.
   0001: silent wrong answers fixed ungated, new dialect behind the
   `v16` rung / leaf features, the tiny profile never grows; ADR
   0002 / 0003: the `max` profile), on the v0.15 foundation (SPEC §2).
-  `CHANGELOG.md` summarises the release.
+  `CHANGELOG.md` summarises the release. v0.17 (the parity backlog:
+  the v0.16 units' honest gaps) is in progress on top of it.
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
@@ -29,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 500,952 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,035,516 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,035,516 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 506,672 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,046,892 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,114,356 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -51,6 +52,71 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `without_rowid`, `utf16`, `wal`, `datetime`, `attach`,
   `autovacuum`, `vtab` (virtual tables, generate_series, dbstat),
   `rtree`, `fts5`, `explain` (EXPLAIN QUERY PLAN).
+- **`xl`** adds the leaves past `max`'s budget (ADR 0004):
+  `fts5_delete` (FTS5 tombstones and secure-delete), `join_order`
+  (the pin's join order, automatic indexes, Bloom filters,
+  `sqlite_stat1`).
+
+## What v0.17 does
+
+- **Streamed rows.** A top-level SELECT hands its rows to
+  `Statement::step` one at a time, as the pin does: the join is a
+  resumable nested loop whose first source is read through its
+  cursor (a table's b-tree, a virtual table's xFilter / xNext /
+  xColumn — generate_series and the R*Tree search row by row) and
+  whose inner virtual tables are filtered again with each outer
+  row's values. A statement that fails on row N returns rows 1..N-1
+  first (the CLI prints them before the error), LIMIT stops the join
+  (`SELECT value FROM generate_series(1) LIMIT 3` answers at once),
+  OFFSET rows are not projected, and count / sum / total / avg /
+  min / max without GROUP BY fold in constant memory
+  (`count(*) FROM generate_series(1)` is 4294967295, not
+  VtabTooManyRows). ORDER BY (unless the rowid or an index delivers
+  it), GROUP BY and DISTINCT buffer as the pin's sorters do;
+  `Config::max_vtab_rows` now bounds only what is held. Recursive
+  CTEs stream too, a streamed join's memory does not grow with its
+  outer rows, an ORDER BY naming a result column sorts on the value
+  returned (`random() AS r ... ORDER BY r`), a one-row aggregate
+  drops its ORDER BY as the pin does, and the CLI exits 1 after a
+  stdin script whose statement failed. Ungated in the `v16`
+  executor (`src/session/stream.rs`).
+- **FTS5 delete writes** (leaf `fts5_delete`, in `xl`). DELETE,
+  UPDATE and INSERT OR REPLACE on `contentless_delete=1` tables
+  write the pin's tombstone hash pages (`fts5IndexTombstoneAdd`:
+  32-slot first page, growth to `pgsz`, then `2n + 1` pages, 4- or
+  8-byte keys, the rowid-0 flag) and the structure's tombstone
+  counters, counted as automerge work and driving `deletemerge`; an
+  UPDATE must set every indexed column (the pin's "cannot UPDATE a
+  subset of columns") and one of UNINDEXED columns only is a no-op.
+  With `secure-delete=1` every delete removes the row's entries
+  from the segments in place (`fts5DoSecureDelete`: entries and
+  terms, emptied and overflow pages, page indexes, `%_idx` rows,
+  `version` 5), byte for byte with the pin in every detail mode;
+  each engine's integrity-check passes on the other's files. A
+  statement's deletes take time linear in the rows deleted (a
+  tombstone reads one hash page; the secure-delete walk seeks the
+  term's and the rowid's page). Without the leaf those writes are
+  refused as in 0.16 (`src/fts5/sdel.rs`). OR FAIL / OR ROLLBACK on
+  fts5 writes now resolve as on the pin (ungated).
+- **Join ordering and automatic indexes** (leaf `join_order`, in
+  `xl`). A join of two or more tables, virtual tables or JSON
+  table-valued functions is planned as the pin's `where.c` plans it:
+  per-loop costs with prerequisites, the N-best path solver with
+  ORDER BY / GROUP BY / DISTINCT sorting costs, the LEFT / CROSS JOIN
+  ordering rules, automatic indexes (built once per statement,
+  PARTIAL where a term reads the table alone) behind a Bloom filter,
+  Bloom filters on lookups when `sqlite_stat1` says they pay, and
+  the statistics ANALYZE writes read back. Rows without ORDER BY come
+  in the pin's order, EXPLAIN QUERY PLAN prints the pin's loops, and
+  `FROM f, m WHERE f MATCH m.q` or `FROM json_each(t.j), t` run
+  instead of being refused; an automatic index turns a 2,000 x 2,000
+  equi-join from 4 million comparisons into 2,000 probes. UPDATE ...
+  FROM is planned as the same kind of join (the final table is the
+  pin's when several FROM rows match), joins of up to 64 sources are
+  ordered, likely() / unlikely() / likelihood() terms keep their index
+  use and give the pin's estimates, and the statistics a connection
+  holds follow DDL as the pin's do. Without the leaf joins run in
+  FROM order as in 0.16 (`src/xjoin.rs`, `src/session/join.rs`).
 
 ## What v0.16 does
 
@@ -91,7 +157,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   without one); VIRTUAL / STORED generated columns in the pin's
   record layout (files interoperate both ways), indexable,
   recomputed on UPDATE; UPDATE ... FROM applying only the last
-  matching combination (in hipp's join order); MustBeInt rowid
+  matching combination (in hipp's join order; the pin's join order
+  with v0.17's `join_order`); MustBeInt rowid
   conversion. The tiny profile refuses those clauses
   (`RequiresEvaluator`) instead of ignoring them, and still
   shrank. Behind `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE
@@ -949,7 +1016,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   UPDATE / DELETE / INSERT plans — and the CLI prints the shell's
   tree. The statement is planned, never run; plain EXPLAIN (bytecode)
   is refused. Where hipp's strategy differs (no flattening, join
-  reordering, automatic indexes, MULTI-INDEX OR, min/max lookup) it
+  reordering and automatic indexes before v0.17's `join_order`,
+  MULTI-INDEX OR, min/max lookup) it
   prints what it runs (STATUS.md). Comparing plans fixed access-path
   choices that ordered rows unlike the pin (window functions,
   compound members, GROUP BY / DISTINCT over a permuted index, rowid
@@ -1246,7 +1314,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 500,952 B of 512 KiB, `max` 1,035,516 B of 1 MiB; ADR 0003) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,672 B of 512 KiB, `max` 1,046,892 B of 1 MiB, `xl` 1,114,356 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -1281,9 +1349,10 @@ UPDATE / DELETE or views.
 Not planned in any profile: multi-process locking or a shared `-shm`
 wal-index (WAL is single-process; one connection per database); a
 shared page cache (a file is attached once); plain EXPLAIN's
-bytecode listing (hipp has no VDBE); query flattening, join
-reordering, automatic indexes, Bloom filters or MULTI-INDEX OR in
-the planner (EXPLAIN QUERY PLAN shows hipp's own plan); loadable
+bytecode listing (hipp has no VDBE); query flattening or MULTI-INDEX
+OR in the planner (EXPLAIN QUERY PLAN shows hipp's own plan; join
+reordering, automatic indexes and Bloom filters arrived in v0.17 with
+the `join_order` leaf); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.

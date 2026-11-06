@@ -628,6 +628,35 @@ fn fts5_best_index(tab: &VTab, info: &mut IndexInfo) -> Result<(), BestErr> {
             info.idx_num = flag | if *desc { 4 } else { 0 };
         }
     }
+    // The pin's estimates (v0.17, `join_order`: the join planner's
+    // costs): by the full-text and rowid constraints used.
+    #[cfg(feature = "join_order")]
+    {
+        let n_match = s.iter().filter(|b| matches!(b, b'M' | b'L' | b'G')).count();
+        let (lt, gt) = (s.iter().any(|b| *b == b'<'), s.iter().any(|b| *b == b'>'));
+        if seen_eq {
+            info.cost = if n_match > 0 { 25000.0 } else { 25.0 };
+            info.rows = 1;
+        } else {
+            let mut rows: i64;
+            if n_match > 0 {
+                info.cost = if lt != gt { 37500.0 } else { 50000.0 };
+                rows = (info.cost / 40.0) as i64;
+                for _ in 1..n_match {
+                    info.cost *= 2.5;
+                    rows /= 2;
+                }
+            } else {
+                info.cost = match (lt, gt) {
+                    (true, true) => 750000.0,
+                    (true, false) | (false, true) => 2250000.0,
+                    _ => 3000000.0,
+                };
+                rows = (info.cost / 4.0) as i64;
+            }
+            info.rows = rows.max(1);
+        }
+    }
     info.idx_str = s;
     Ok(())
 }
@@ -1056,8 +1085,9 @@ pub type CursorRows = AVec<(AVec<OwnedValue>, Option<i64>)>;
 /// Read a cursor to its end (at most `need` rows): each row's
 /// `ncols` columns and its rowid. More than `max` rows (v0.16 review
 /// fix: `Config::max_vtab_rows`), or a refused allocation, is
-/// `VtabTooManyRows` — hipp holds the rows where the pin streams
-/// them, and `generate_series(1)` alone is 2^32 of them.
+/// `VtabTooManyRows` — the materialising paths hold the rows (a
+/// streamed query reads the cursor row by row instead, v0.17), and
+/// `generate_series(1)` alone is 2^32 of them.
 pub fn drain(
     cur: &mut dyn VtCursor,
     ncols: usize,

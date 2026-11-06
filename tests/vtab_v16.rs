@@ -554,10 +554,10 @@ fn series_descending_constraints() {
     same("gs-desc-gen", &script);
 }
 
-/// A virtual-table cursor's rows are held in memory: past
-/// `Config::max_vtab_rows` the statement fails cleanly (it aborted
-/// the process out of memory: `count(*) from generate_series(1)` is
-/// 2^32 rows); a LIMIT the module honours stays under it.
+/// Where a statement holds a virtual-table cursor's rows in memory,
+/// past `Config::max_vtab_rows` it fails cleanly (it aborted the
+/// process out of memory); a LIMIT stays under it. (v0.17: a streamed
+/// plan holds none, so only blocking operators are bounded.)
 #[test]
 fn series_row_bound() {
     block_on(async {
@@ -572,8 +572,17 @@ fn series_row_bound() {
                 "select value from generate_series(1) limit 3".to_string(),
                 Some(1),
             ),
-            (one("1001"), None),
-            ("select count(*) from generate_series(1)".to_string(), None),
+            // v0.17: a streamed aggregate is not bounded (the pin's
+            // answer); what a blocking operator buffers still is.
+            (one("1001"), Some(1001)),
+            (
+                "select count(distinct value) from generate_series(1, 1001)".to_string(),
+                None,
+            ),
+            (
+                "select value from generate_series(1, 1001) order by value desc".to_string(),
+                None,
+            ),
         ] {
             let mut st = db.prepare(&q).await.expect("prepare");
             match (st.step().await, want) {

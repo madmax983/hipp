@@ -1024,6 +1024,22 @@ pub struct EqpInfo {
     /// brings a DISTINCT's equal rows together (`xplan::natural_sat`).
     pub natural: usize,
     pub nat_distinct: bool,
+    /// The first loop of a join the pin's planner ordered (v0.17,
+    /// `join_order`): `natural` / `nat_distinct` then say what the
+    /// whole join delivers.
+    #[cfg(feature = "join_order")]
+    pub joined: bool,
+    /// A LEFT JOIN that changes no row (the pin's `whereOmitNoopJoin`:
+    /// DISTINCT or a one-row loop, its table read nowhere but its own
+    /// ON clause): EXPLAIN QUERY PLAN leaves it out, as the pin's
+    /// plan does (hipp still runs it; v0.17, `join_order`).
+    #[cfg(feature = "join_order")]
+    pub omit: bool,
+    /// The sources (by position) whose Bloom filter lines EXPLAIN
+    /// QUERY PLAN prints before this loop's (v0.17, `join_order`: the
+    /// pin builds them together, `sqlite3ConstructBloomFilter`).
+    #[cfg(feature = "join_order")]
+    pub bloom_lines: u64,
 }
 
 /// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
@@ -1697,6 +1713,134 @@ fn shift_plan(p: &mut SubPlan, at: (usize, usize), by: (usize, usize)) {
     }
     for (_, t) in p.compound.as_mut_slice() {
         shift_plan(t, at, by);
+    }
+}
+
+/// Renumber every column slot and rowid source through `m` (v0.17,
+/// `join_order`): the join planner runs a core's sources in another
+/// order than FROM's, and lays the joined row out in that order, so
+/// every expression reading the core — through nested subqueries,
+/// their sources' ON clauses, access paths and virtual-table
+/// arguments — reads the new positions. `m` maps a slot (`false`) or
+/// a rowid source (`true`) and leaves anything outside the core as it
+/// is.
+#[cfg(feature = "join_order")]
+pub(crate) fn remap_expr(e: &mut RExpr, m: &dyn Fn(usize, bool) -> usize) {
+    match e {
+        RExpr::Column(slot, ..) => *slot = m(*slot, false),
+        RExpr::Rowid(src) => *src = m(*src, true),
+        RExpr::SubScalar(p) | RExpr::SubExists(p) => remap_plan(p, m),
+        RExpr::InSub(x, p, _) => {
+            remap_expr(x, m);
+            remap_plan(p, m);
+        }
+        RExpr::Literal(_) | RExpr::AffLiteral(..) | RExpr::Raise(_) => {}
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            remap_expr(a, m);
+            remap_expr(b, m);
+        }
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => remap_expr(a, m),
+        RExpr::InList(x, l, ..) => {
+            remap_expr(x, m);
+            for i in l.as_mut_slice() {
+                remap_expr(i, m);
+            }
+        }
+        RExpr::Between(x, a, b, _) => {
+            remap_expr(x, m);
+            remap_expr(a, m);
+            remap_expr(b, m);
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            for b in base.iter_mut().chain(otherwise.iter_mut()) {
+                remap_expr(b, m);
+            }
+            for (w, t) in whens.as_mut_slice() {
+                remap_expr(w, m);
+                remap_expr(t, m);
+            }
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } | RExpr::Win(_, args) => {
+            for a in args.as_mut_slice() {
+                remap_expr(a, m);
+            }
+        }
+    }
+}
+
+/// `remap_expr` over an access path's probes and bounds (v0.17).
+#[cfg(feature = "join_order")]
+pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bool) -> usize) {
+    for p in a.eq.as_mut_slice() {
+        for v in p.vals.as_mut_slice() {
+            remap_expr(v, m);
+        }
+        if let Some(s) = &mut p.sub {
+            remap_expr(s, m);
+        }
+    }
+    for b in a.lo.iter_mut().chain(a.hi.iter_mut()) {
+        remap_expr(&mut b.e, m);
+    }
+    if let Some(x) = &mut a.auto {
+        for k in x.keys.as_mut_slice() {
+            remap_expr(&mut k.val, m);
+        }
+    }
+}
+
+/// `remap_expr` over every part of a plan that indexes the combined
+/// row (v0.17): its sources' ON clauses, derived plans, access paths
+/// and virtual-table OR branches, its expressions, VALUES rows and
+/// compound tails.
+#[cfg(feature = "join_order")]
+pub(crate) fn remap_plan(p: &mut SubPlan, m: &dyn Fn(usize, bool) -> usize) {
+    for s in p.sources.as_mut_slice() {
+        if let Some(on) = &mut s.on {
+            remap_expr(on, m);
+        }
+        if let Some(d) = &mut s.derived {
+            remap_plan(d, m);
+        }
+        if let Some(a) = &mut s.access {
+            remap_access(a, m);
+        }
+        #[cfg(feature = "fts5")]
+        if let Some(vt) = &mut s.vt {
+            for (_, _, args, _) in vt.ors.as_mut_slice() {
+                for a in args.as_mut_slice() {
+                    remap_expr(a, m);
+                }
+            }
+        }
+    }
+    let exprs = p
+        .items
+        .as_mut_slice()
+        .iter_mut()
+        .chain(p.filter.iter_mut())
+        .chain(p.group_by.as_mut_slice().iter_mut())
+        .chain(p.having.iter_mut())
+        .chain(p.order_by.as_mut_slice().iter_mut().map(|(e, _)| e));
+    for e in exprs {
+        remap_expr(e, m);
+    }
+    for row in p.values.as_mut_slice() {
+        for e in row.as_mut_slice() {
+            remap_expr(e, m);
+        }
+    }
+    for (_, t) in p.compound.as_mut_slice() {
+        remap_plan(t, m);
     }
 }
 
@@ -3333,10 +3477,22 @@ fn resolve_call_body<E>(
             kind: SchemaKind::LikelihoodNotConstant,
         });
     }
-    Ok(RExpr::Scalar(
-        f,
-        resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
-    ))
+    #[allow(unused_mut)]
+    let mut rargs = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
+    // likely(X) / unlikely(X) carry their probability as likelihood's
+    // second argument (0.9375 / 0.0625: the pin's tuning), which the
+    // planner reads as the term's truth probability (v0.17 review
+    // fix; `EP_Unlikely`).
+    #[cfg(feature = "join_order")]
+    if f == ScalarFn::Likely && rargs.len() == 1 {
+        let p = if name.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'u')) {
+            0.0625
+        } else {
+            0.9375
+        };
+        rargs.push(RExpr::Literal(OwnedValue::Real(p)));
+    }
+    Ok(RExpr::Scalar(f, rargs))
 }
 
 /// Whether two resolved expressions are the same expression in
