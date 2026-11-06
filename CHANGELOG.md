@@ -68,6 +68,23 @@ All notable changes to hipp. Versions follow the milestones in
   `tests/eqp_v16.rs` and `tests/join_order_v17.rs` generate OR terms,
   IN subqueries and min() / max() and their limits are tighter.
   Size: xl +20,648 B (1,135,004 B); max +168 B; full 0; tiny 0.
+- Review fixes: an OR term holding an explicit COLLATE (outside a
+  subquery) is no MULTI-INDEX OR, IN or combined term, as on the pin
+  (ungated for the IN); `x IN (v)` on a constant is the pin's `x = +v`
+  equality (ungated); OR-to-IN and MULTI-INDEX OR branches take
+  indexed expressions as keys (`a*2=14 OR a*2=4`, `t.a*2 = r.j`); the
+  IN operator's Bloom filter is shown only for BINARY comparisons
+  (ungated) and its own index or rowids read in place of the subquery
+  print `USING INDEX i FOR IN-OPERATOR` / `USING ROWID SEARCH ON TABLE
+  t FOR IN-OPERATOR`; every min() / max() loop prints SEARCH (FROM
+  subqueries, CTEs, virtual tables; max() offers generate_series its
+  DESC order) and `min(a+1)` is covered by an index on `a+1`;
+  `sqlite_stat1`'s `unordered`, `sz=N` and `noskipscan` are read; a
+  min() / max() over an IN probe on its argument folds every row forward (the pin's
+  bare columns). Fixed on the way (ungated): `a = 'y' COLLATE NOCASE
+  ORDER BY a` treated `a` as constant and returned rows out of order.
+  Size: xl +6,040 B (1,156,732 B); max +816 B (1,047,868 B); full 0;
+  tiny 0.
 
 ### Join ordering and automatic indexes (leaf `join_order`, in `xl`)
 

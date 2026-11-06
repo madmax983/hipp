@@ -853,7 +853,7 @@ Ratchets `[full]` 506,672, `[max]` 1,046,892, `[xl]` 1,114,356.
 - An expression-covered index still reads the table row (the pin reads
   the expression's value from the index entry).
 - `sqlite_stat1`'s `sz=N` / `unordered` / `noskipscan` options are
-  not read.
+  not read. (Closed in v0.17 by the `multi_index` review fixes.)
 
 ### Index strategies: MULTI-INDEX OR, min() / max(), skip-scans, IN with statistics (2026-11-06)
 
@@ -1030,13 +1030,142 @@ insertion, the EXPLAIN trees; 175,716 B left). Ratchets `[max]`
   (hipp's index cursor walks forward only; the answer is the pin's).
   `count(DISTINCT x)` over x's index still sorts (v0.16 class).
 - Skip-scans walk the whole index once to find the leading values
-  (the pin seeks past each); `sqlite_stat1`'s `noskipscan` / `sz=` /
-  `unordered` are not read; `sqlite_stat4` is not modelled.
+  (the pin seeks past each); `sqlite_stat4` is not modelled.
+  (`sqlite_stat1`'s `noskipscan` / `sz=` / `unordered`: closed in the
+  review fixes below.)
 - The IN early-out (`WHERE_IN_EARLYOUT`) and seek-scan are run-time
   shortcuts the plan text does not show; hipp probes every IN value.
 - `CREATE BLOOM FILTER` is not shown under a compound IN subquery
   (the pin prints one per member); a vector `(a, b) IN (SELECT ...)`
   plans as in 0.16.
+
+### Index strategies — review fixes (2026-11-06)
+
+**Status:** the review's eight findings on the `multi_index` unit,
+each reproduced on the live 3.54.1 pin and fixed at its root (one
+documented as a gap). Gating as the unit: the fixes on paths `max`
+already claims are ungated, the IN operator's own index (new EXPLAIN
+surface) is in `multi_index`.
+
+**Fixed:**
+
+- **COLLATE inside an OR** (ungated in `xplan`, and in `xmulti`): the
+  pin analyses an OR term that holds an explicit COLLATE anywhere
+  outside a subquery (its `EP_Collate`, propagated through operators,
+  function arguments and CASE; a COLLATE around the whole OR does not
+  count) as no OR at all: neither a MULTI-INDEX OR, nor an OR-to-IN,
+  nor `whereCombineDisjuncts`. hipp built a MULTI-INDEX OR (rows in
+  branch order, the pin's in rowid order) and, ungated, an IN seek.
+  Also: a branch's `likely()` / `unlikely()` wrapper no longer stops
+  the OR-to-IN rewrite (`a='x' OR likely(a='y')` is the pin's IN seek).
+- **The one-value IN** (ungated, `xplan`): `x IN (v)` with a constant
+  `v` is the pin's parser's `x = +v`. It is now an equality term
+  everywhere (compared as the IN compares: the key's affinity and
+  collation), so `d='' OR d IN (-2)` is the pin's `d IN ('', -2)` IN
+  seek and `b IN (3) ORDER BY c` over `(b, c)` sorts nothing.
+- **OR-to-IN on an indexed expression** (`multi_index`): `in_key` now
+  takes the pin's `exprMightBeIndexed` keys (a column, or an
+  expression of one source in one of its expression indexes), so
+  `a*2=14 OR a*2=4` is the pin's IN seek again. The same rule makes
+  `t.a*2 = r.j` a term of `t` for the MULTI-INDEX OR in a join (hipp
+  had no OR loop there), and a branch's sub-plan no longer covers by
+  expressions (the pin plans it with no SELECT: `USING INDEX tex`).
+- **The IN operator's Bloom filter** (ungated, `explain`): shown only
+  when every comparison of the IN is BINARY (a NOCASE left column, or
+  `x COLLATE NOCASE IN (...)`, has none on the pin). **The IN
+  operator's own index** (`multi_index`; the pin's `isCandidateForInOpt`
+  and `sqlite3FindInIndex`): an uncorrelated `SELECT cols FROM table`
+  with no WHERE, GROUP BY, aggregate, LIMIT or compound (ORDER BY and
+  DISTINCT allowed; not a view or FROM subquery, merged or not) reads
+  the table in place of the subquery: `USING ROWID SEARCH ON TABLE u
+  FOR IN-OPERATOR` for the rowid, `USING INDEX i FOR IN-OPERATOR` for
+  the newest non-partial index whose leading columns are the result
+  columns (any order) under the comparisons' collations, the
+  affinities allowing it (a numeric left side needs a numeric column);
+  when an index loop probes with the values, a UNIQUE index of exactly
+  those columns. The probe keeps its left operand for this (nothing
+  evaluates it).
+- **min() / max() SEARCH text** (`multi_index`): every loop of a min()
+  / max() query prints SEARCH, FROM subqueries, CTEs and virtual tables
+  too; a lone `max(col)` offers a virtual table its `ORDER BY col DESC`
+  (generate_series `INDEX 0xb:`; min()'s NULLS LAST order is not
+  offered, as on the pin). STATUS's "every loop prints SEARCH" is now
+  true.
+- **`sqlite_stat1` keywords** (`multi_index`; `decodeIntArray`): after
+  the integers, `unordered` (no range constraint, no ORDER BY and no
+  covering full scan through the index), `sz=N` (its row size, at
+  least 2) and `noskipscan` (no skip-scan) are read; they reset at
+  each load.
+- **min() / max() over an expression index** (`join_order`): an
+  aggregate's arguments count in the expression-covering walk, so
+  `min(a+1)` over an index on `a+1` prints `USING COVERING INDEX te`;
+  an aggregate query's bare key expression (`SELECT a+1, max(a+1)`,
+  `SELECT a+1 ... GROUP BY a+1`) keeps it from covering, as probed.
+- Found on the way: **an equality's collation against the ORDER BY's**
+  (ungated, `xplan`; a silent wrong order): `a = 'y' COLLATE NOCASE
+  ORDER BY a` took `a` for constant and returned `y`, `Y`, `y` in rowid
+  order; the pin's `wherePathSatisfiesOrderBy` holds a column constant
+  only under the ORDER BY / GROUP BY term's collation. **A min() / max()
+  over an IN probe on its argument** (`multi_index`): the pin holds the
+  IN column constant, reads each value's entries forward and folds
+  every row (no reverse scan); hipp scanned in reverse for max(), so
+  the bare columns came from another row (an IN on an earlier key
+  column keeps the loop's direction, as on the pin).
+
+**Not fixed (honest gap):** after ANALYZE, `t.a IN (SELECT ...)` on a
+small WITHOUT ROWID table's PRIMARY KEY still scans where the pin
+seeks (base 0.16 had the same gap; the row set agrees, regression
+`rv9` checks the rows). The pin keeps the IN loop although hipp's
+model of its costs (`rRun` with `nIn` 46, `nOut` clamped to the
+table) has the full scan cheaper; not modelled.
+
+**Probing notes (live pin):** the COLLATE rule holds for `COLLATE
+BINARY` and for a collation that matches the index (`c COLLATE NOCASE
+= 'x'` over a NOCASE index), inside AND branches (`a=2 OR (b=1 AND
+'x'='x' COLLATE NOCASE)`), function arguments and CASE, not inside a
+scalar or IN subquery; `likely(b='x')` as a branch costs the OR out
+(SCAN), `unlikely` keeps it. `'Y' IN ('y' COLLATE NOCASE)` is 0 (the
+IN's collation is the left side's). The IN operator's index: the
+newest qualifying index is taken (`u2(a,e)` over `u1(a)` and the
+autoindex), INDEXED BY / NOT INDEXED in the subquery are ignored, a
+WITHOUT ROWID table's PRIMARY KEY prints `sqlite_autoindex_w_1`, an
+INTEGER PRIMARY KEY DESC is no rowid; for a probing loop a non-UNIQUE
+index is never used and the rowid always is. min()/max(): `max(value)`
+of generate_series passes DESC (0x08), `max(value+1)` and `min(value)`
+pass no order.
+
+**Tests:** `tests/multi_index_v17.rs` `review_regressions` (rv1-rv9:
+every repro above with variants, joins included); the generated
+corpus adds COLLATE inside OR terms, one-value IN lists, an expression
+index and its key, the IN operator's own index, NOCASE columns and
+`sqlite_stat1` keywords: 4,000 queries at 400 seeds, no row set
+differs, 2 orders (one a min() whose bare column came from another row
+of the same minimum under another plan, now counted as an order) and
+47 plans (1.2%) — the limits tighten to 1 in 400 orders and 3 in 200
+plans (were 1 in 200 and 2 in 100; the default 40 seeds measure 1 and
+2 of 400). `tests/eqp_v16.rs`: the generator adds the same forms; 12
+of 4,800 plans differ at 400 seeds (15 before, with fewer forms) — the
+limit tightens to 1 in 400 (was 1 in 200); `documented_differences`
+loses `b IN (SELECT x FROM u)` (the pin's `USING INDEX ux FOR
+IN-OPERATOR` now matches). `tests/join_order_v17.rs`: the generator
+adds COLLATE inside OR terms and one-value IN lists; 10 orders and 133
+plans of 1,600 at 400 seeds (2 and 21 of 240 at the default 60) — the
+order limit tightens to 1 in 100 (was 3 in 200), the plan limit stays
+9 in 100 (the default seeds measure 8.75%).
+`hipp-cli/tests/cli_v17_multi_index.rs` `review_outputs`: one more
+byte-identical script.
+
+**Gates:** `ci/local-gates.sh` (full run) passes; tests/depth_v16.rs
+and tests/triggers_v16.rs pass with debug info.
+
+**Size Δ** (thumbv7em, `--profile tiny`): tiny 76,960 → 76,960 (0);
+full 506,656 → 506,656 (0: the ungated fixes are `expr_index` /
+`explain` code); max 1,047,052 → 1,047,868 (+816: the COLLATE and
+one-value IN rules, the ORDER BY collation check, the Bloom filter's
+collation test; 708 B of the budget left); xl 1,150,692 → 1,156,732
+(+6,040: the IN operator's index, expression keys, `sqlite_stat1`
+keywords, the min() / max() SEARCH text and virtual-table order, the IN-argument rule).
+Ratchets `[max]` 1,047,868, `[xl]` 1,156,732.
 
 ### Query flattening, WHERE push-down, unused columns, EXISTS-to-join (2026-11-06)
 
@@ -9513,7 +9642,8 @@ automatic indexes or Bloom filters (closed in v0.17 by `join_order`:
 the pin's join order, AUTOMATIC [PARTIAL] COVERING INDEX and BLOOM
 FILTER lines); EXISTS stays a subquery (no
 `SCAN u EXISTS`; closed in v0.17 by `flatten`); IN subqueries are lists (no `USING INDEX i FOR
-IN-OPERATOR` / `USING ROWID SEARCH ON TABLE`); no MULTI-INDEX OR; no
+IN-OPERATOR` / `USING ROWID SEARCH ON TABLE`; closed in v0.17 by the
+`multi_index` review fixes); no MULTI-INDEX OR; no
 min() / max() optimization (`SEARCH t USING COVERING INDEX i`, or a
 bare `SEARCH t` without an index) (both closed in v0.17 by
 `multi_index`: the `MULTI-INDEX OR` / `INDEX n` trees and the

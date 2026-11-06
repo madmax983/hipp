@@ -31,8 +31,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 506,656 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,047,052 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,150,692 B | 1.25 MiB |
+| `max` | `--no-default-features --features max` | 1,047,868 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,156,732 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -131,10 +131,15 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   (`ANY(a) AND b=?`), an IN list or subquery the statistics say not
   to probe, and the pin's loop-cost adjustment for one table (`b = 2
   AND c = 1` over an index on (b, c) uses both columns). EXPLAIN
-  QUERY PLAN prints the `MULTI-INDEX OR` / `INDEX n` trees and the IN
-  operator's `CREATE BLOOM FILTER`. Fixed on the way (ungated): an
-  OR of `col = other_col` equalities was probed as an IN list
-  without the pin's affinity check, losing rows. Without the leaf
+  QUERY PLAN prints the `MULTI-INDEX OR` / `INDEX n` trees, the IN
+  operator's `CREATE BLOOM FILTER` (BINARY comparisons only) and its
+  `USING INDEX i FOR IN-OPERATOR` when it reads an index in place of
+  the subquery; `sqlite_stat1`'s `unordered` / `sz=` / `noskipscan`
+  are read. Fixed on the way (ungated): an OR of `col = other_col`
+  equalities was probed as an IN list without the pin's affinity
+  check, losing rows; an OR holding a COLLATE, or a one-value `IN
+  (v)`, is planned as the pin's parser leaves it; `a = 'y' COLLATE
+  NOCASE ORDER BY a` returned rows out of order. Without the leaf
   plans are as in 0.16 (`src/xmulti.rs`).
 - **Query flattening** (leaf `flatten`, in `xl`). Views, CTEs and
   FROM subqueries the pin's `sqlite3FlattenSubquery` merges into
@@ -1347,7 +1352,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,656 B of 512 KiB, `max` 1,047,052 B of 1 MiB, `xl` 1,150,692 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,656 B of 512 KiB, `max` 1,047,868 B of 1 MiB, `xl` 1,156,732 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

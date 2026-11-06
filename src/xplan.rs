@@ -341,6 +341,54 @@ impl Src {
     }
 }
 
+/// Whether `e` holds an explicit COLLATE anywhere outside its
+/// subqueries (the pin's `EP_Collate`, which the parser propagates
+/// up through operators and function arguments; v0.17 review fix).
+/// The pin analyses an OR term holding one neither as an IN nor as
+/// a MULTI-INDEX OR (probed: `a=2 OR b='x' COLLATE BINARY` scans).
+pub(crate) fn has_collate(e: &RExpr) -> bool {
+    let f = has_collate;
+    match e {
+        RExpr::Collate(..) => true,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::Raise(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, ..) => f(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a) | RExpr::Pos(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            f(a)
+        }
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(f)
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_deref().is_some_and(f)
+        }
+        RExpr::Scalar(_, a) | RExpr::Win(_, a) | RExpr::Agg { args: a, .. } => a.iter().any(f),
+    }
+}
+
+/// A one-value IN list on a constant, `x IN (v)`, which the pin's
+/// parser rewrites as `x = +v` (v0.17 review fix): its `(x, v)`.
+pub(crate) fn one_in(e: &RExpr) -> Option<(&RExpr, &RExpr)> {
+    match e {
+        RExpr::InList(x, items, false, false) => match items.as_slice() {
+            [v] if crate::query::is_constant(v) => Some((x, v)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `e` with top-level COLLATE and likely() / unlikely() /
 /// likelihood() wrappers removed (the pin's
 /// `sqlite3ExprSkipCollateAndLikely`): neither changes whether a
@@ -552,15 +600,16 @@ fn add_terms(
                     matches!(strip(l), RExpr::Column(..) | RExpr::Rowid(_)),
                 );
             }
-            if *op == BinOp::Or
-                && let Some(t) = or_in(ci, c, tp, s, avail)
-            {
+            // (An OR term holding an explicit COLLATE is not analysed
+            // as an OR at all: v0.17 review fix.)
+            let or = *op == BinOp::Or && !has_collate(c);
+            if or && let Some(t) = or_in(ci, c, tp, s, avail) {
                 out.push(t);
             }
             // The pin's `whereCombineDisjuncts` (v0.17, `multi_index`):
             // `x < 5 OR x = 5` is also the virtual term `x <= 5`.
             #[cfg(feature = "multi_index")]
-            if *op == BinOp::Or {
+            if or {
                 for x in crate::xmulti::combined(c).iter() {
                     let from = out.len();
                     add_terms(ci, x, 1, s, avail, out);
@@ -582,6 +631,27 @@ fn add_terms(
         RExpr::InList(x, items, false, false) => {
             let key = strip(x);
             if !s.reads(key) || items.is_empty() {
+                return;
+            }
+            // `x IN (v)` on a constant is the pin's `x = +v` (v0.17
+            // review fix): an equality, compared as the IN compares.
+            if let Some((_, v)) = one_in(c) {
+                let Some(lateral) = avail(v) else { return };
+                out.push(Term {
+                    parent: ci,
+                    key: key.clone(),
+                    op: TOp::Eq,
+                    val: v.clone(),
+                    coll: expr_coll(x).unwrap_or_default(),
+                    aff: crate::query::index_in_aff(x),
+                    lateral,
+                    isnull: false,
+                    vnull: false,
+                    #[cfg(feature = "join_order")]
+                    virt: false,
+                    #[cfg(feature = "join_order")]
+                    truth: tp,
+                });
                 return;
             }
             let mut lateral = false;
@@ -630,6 +700,14 @@ fn add_terms(
             );
             let Some(aff) = crate::query::index_probe_aff(x, &rhs) else {
                 return;
+            };
+            // The probe keeps its left operand for EXPLAIN QUERY PLAN
+            // (the IN operator's index; v0.17 review fix); nothing
+            // evaluates it.
+            let probe = if crate::query::has_sub(x) {
+                probe
+            } else {
+                RExpr::InSub(x.clone(), plan.clone(), false)
             };
             out.push(Term {
                 parent: ci,
@@ -722,10 +800,21 @@ pub(crate) fn or_in(
     let mut items = AVec::new();
     let mut lateral = false;
     for l in leaves.iter() {
-        let RExpr::Binary(BinOp::Eq, a, b) = l else {
-            return None;
+        // (A branch's likely() wrapper is the pin's `whereSplit`'s to
+        // skip; a one-value IN is its parser's `x = +v`, whose value
+        // has no affinity: v0.17 review fixes.)
+        let l = skip_collate_likely(l);
+        let (k, v, plus) = match (l, one_in(l)) {
+            (_, Some((x, v))) => (x, v, true),
+            (RExpr::Binary(BinOp::Eq, a, b), None) => {
+                if s.reads(strip(a)) {
+                    (&**a, &**b, false)
+                } else {
+                    (&**b, &**a, false)
+                }
+            }
+            _ => return None,
         };
-        let (k, v) = if s.reads(strip(a)) { (a, b) } else { (b, a) };
         let kk = strip(k);
         if !s.reads(kk) {
             return None;
@@ -740,7 +829,7 @@ pub(crate) fn or_in(
             RExpr::Rowid(_) => Some(Affinity::Integer),
             _ => None,
         };
-        if aff(v).is_some_and(|a| Some(a) != aff(kk)) {
+        if !plus && aff(v).is_some_and(|a| Some(a) != aff(kk)) {
             return None;
         }
         match key {
@@ -749,7 +838,7 @@ pub(crate) fn or_in(
             _ => return None,
         }
         lateral |= avail(v)?;
-        items.push((**v).clone());
+        items.push(v.clone());
     }
     let (kk, k) = key?;
     Some(Term {
@@ -818,9 +907,75 @@ pub struct IdxModel {
     /// pin's `hasStat1`): `est` may hold defaults otherwise.
     #[cfg(feature = "multi_index")]
     pub stat1: bool,
+    /// Its `sqlite_stat1` text says `unordered` (v0.17 review fix,
+    /// `multi_index`; the pin's `bUnordered`): no range constraint,
+    /// no ORDER BY and no covering full scan through it.
+    #[cfg(feature = "multi_index")]
+    pub unordered: bool,
+    /// ... or `noskipscan` (`noSkipScan`): no skip-scan.
+    #[cfg(feature = "multi_index")]
+    pub noskip: bool,
+}
+
+/// `m.unordered` (false without `multi_index`).
+fn unordered(m: &IdxModel) -> bool {
+    #[cfg(feature = "multi_index")]
+    return m.unordered;
+    #[cfg(not(feature = "multi_index"))]
+    {
+        let _ = m;
+        false
+    }
 }
 
 impl IdxModel {
+    /// Whether `e` holds one of this index's key expressions outside
+    /// every aggregate call's arguments (v0.17 review fix): in an
+    /// aggregate query the pin reads such a result column or ORDER BY
+    /// term from the table, so the index does not cover (probed:
+    /// `SELECT a+1, max(a+1) FROM t` over an index on `a+1`).
+    #[cfg(feature = "join_order")]
+    pub fn bare_expr(&self, e: &RExpr) -> bool {
+        if self
+            .keys
+            .iter()
+            .any(|k| matches!(k, IdxKey::Expr(x) if same_expr(e, x)))
+        {
+            return true;
+        }
+        let f = |x: &RExpr| self.bare_expr(x);
+        match e {
+            RExpr::Agg { .. }
+            | RExpr::Column(..)
+            | RExpr::Rowid(_)
+            | RExpr::Literal(_)
+            | RExpr::AffLiteral(..)
+            | RExpr::Raise(_)
+            | RExpr::SubScalar(_)
+            | RExpr::SubExists(_) => false,
+            RExpr::InSub(x, ..) => f(x),
+            RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+            RExpr::Neg(a)
+            | RExpr::Pos(a)
+            | RExpr::Not(a)
+            | RExpr::IsNull(a, _)
+            | RExpr::Cast(a, _)
+            | RExpr::Collate(a, _) => f(a),
+            RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+            RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+            RExpr::Case {
+                base,
+                whens,
+                otherwise,
+            } => {
+                base.as_deref().is_some_and(f)
+                    || whens.iter().any(|(w, t)| f(w) || f(t))
+                    || otherwise.as_deref().is_some_and(f)
+            }
+            RExpr::Scalar(_, a) | RExpr::Win(_, a) => a.iter().any(f),
+        }
+    }
+
     /// Whether `e` (an expression of the statement) reads a column of
     /// source `s` that this index holds neither as a key column nor
     /// inside one of its key expressions (`whereIsCoveringIndex`'s
@@ -866,7 +1021,9 @@ impl IdxModel {
                 .map(|b| &**b)
                 .chain(whens.iter().flat_map(|(w, t)| [w, t]))
                 .collect(),
-            RExpr::Scalar(_, args) => args.iter().collect(),
+            // (An aggregate's arguments too: `min(a+1)` over an index
+            // on `a+1` is covered; v0.17 review fix.)
+            RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().collect(),
             _ => return s.reads(e),
         };
         kids.iter().any(|k| self.reads_uncovered(k, s))
@@ -915,17 +1072,18 @@ impl IdxModel {
     /// Whether an ORDER BY term might be delivered by this index (the
     /// pin's `indexMightHelpWithOrderBy`).
     pub(crate) fn might_order(&self, s: &Src, order: &[(RExpr, SortOrder)]) -> bool {
-        order.iter().any(|(e, _)| {
-            let e = strip(e);
-            if s.is_rowid(e) {
-                return true;
-            }
-            self.keys.iter().any(|k| match k {
-                IdxKey::Col(c) => s.is_col(e, *c),
-                IdxKey::Rowid => false,
-                IdxKey::Expr(x) => same_expr(e, x),
+        !unordered(self)
+            && order.iter().any(|(e, _)| {
+                let e = strip(e);
+                if s.is_rowid(e) {
+                    return true;
+                }
+                self.keys.iter().any(|k| match k {
+                    IdxKey::Col(c) => s.is_col(e, *c),
+                    IdxKey::Rowid => false,
+                    IdxKey::Expr(x) => same_expr(e, x),
+                })
             })
-        })
     }
 }
 
@@ -1379,6 +1537,9 @@ pub(crate) fn order_sat(
     if one(ix) {
         return (n, false, None);
     }
+    if ix.is_some_and(unordered) {
+        return (0, false, None);
+    }
     // The delivered columns: the key columns (a single-value
     // equality column is constant; an IN column is walked in key
     // order), then the rowid.
@@ -1418,9 +1579,17 @@ pub(crate) fn order_sat(
     }
     // Constant keys: the loop's equality columns, and any WHERE
     // `key = value` term with a static value.
-    let constant = |e: &RExpr| {
-        ts.iter()
-            .any(|t| matches!(t.op, TOp::Eq | TOp::Is) && !t.lateral && same_expr(&t.key, e))
+    // (A column's `=` / `IS` term holds it constant only under the
+    // ORDER BY term's collation: the pin's `wherePathSatisfiesOrderBy`
+    // compares them; v0.17 review fix: `a = 'y' COLLATE NOCASE ORDER BY
+    // a` left `Y` and `y` in rowid order.)
+    let constant = |e: &RExpr, o: &SortOrder| {
+        ts.iter().any(|t| {
+            matches!(t.op, TOp::Eq | TOp::Is)
+                && !t.lateral
+                && same_expr(&t.key, e)
+                && (t.isnull || s.is_rowid(e) || t.coll == o.coll)
+        })
     };
     // A GROUP BY or DISTINCT takes its terms in any order: each key
     // column the loop delivers may satisfy any term not yet
@@ -1429,8 +1598,8 @@ pub(crate) fn order_sat(
     // was sorted, the groups in another order than the pin's).
     if q.group {
         let mut done: AVec<bool> = AVec::new();
-        for (e, _) in q.order.iter() {
-            done.push(constant(strip(e)));
+        for (e, o) in q.order.iter() {
+            done.push(constant(strip(e), o));
         }
         for (c, k) in cols.iter() {
             if *k {
@@ -1473,7 +1642,7 @@ pub(crate) fn order_sat(
     let mut bignull = None;
     for (e, o) in q.order.iter() {
         let e0 = strip(e);
-        if constant(e0) {
+        if constant(e0, o) {
             sat += 1;
             continue;
         }
@@ -1726,7 +1895,7 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
             || m.pred.is_some()
             || tab.wr
             || forced.is_some()
-            || (q.cover_scan && covering && m.width < tab.width)
+            || (q.cover_scan && covering && m.width < tab.width && !unordered(m))
         {
             let mut run = rsize + 1 + (15 * m.width) / tab.width.max(1);
             if !covering {
@@ -2093,6 +2262,10 @@ fn add_index(
             if !matches(k, t) {
                 continue;
             }
+            // (An `unordered` index takes no range: v0.17 review fix.)
+            if !t.is_eq() && ix.and_then(|i| tab.indexes.get(i)).is_some_and(unordered) {
+                continue;
+            }
             let used_with = |extra: &[usize]| {
                 let mut u = eq.clone();
                 u.extend_from_slice(extra);
@@ -2232,6 +2405,7 @@ fn add_index(
         #[cfg(feature = "multi_index")]
         if let Some(m) = ix.and_then(|i| tab.indexes.get(i))
             && m.stat1
+            && !m.noskip
             && eq.iter().all(|t| *t == usize::MAX)
             && k + 1 < m.keys.len()
             && a.get(k + 1).copied().unwrap_or(0) >= 42

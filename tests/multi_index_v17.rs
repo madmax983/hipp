@@ -19,15 +19,23 @@
 //!   without the pin's ANALYZE) with OR terms (of comparisons, IN
 //!   lists, IN subqueries, IS NULL, BETWEEN and AND groups), IN
 //!   lists and subqueries, and min() / max() with and without bare
-//!   columns; rows compared in order, plans as text. No row set may
-//!   differ; at most 1 in 200 orders and 2 in 100 plans (1 and 53 of
-//!   4,000 queries measured at 400 seeds; STATUS.md lists the
-//!   classes);
+//!   columns; v0.17 review: COLLATE inside OR terms, one-value IN
+//!   lists, an expression index's key, the IN operator's own index,
+//!   NOCASE columns and `sqlite_stat1`'s `noskipscan` / `unordered` /
+//!   `sz=`); rows compared in order, plans as text. No row set may
+//!   differ; at most 1 in 400 orders and 3 in 200 plans (2 and 47 of
+//!   4,000 queries measured at 400 seeds; a min() / max() whose bare
+//!   columns come from another row of the same minimum counts as an
+//!   order; STATUS.md lists the classes);
 //! - a curated corpus of every form, with data;
 //! - regressions for the bugs found on the way (the OR-to-IN rewrite
 //!   ignoring the values' affinity, a lost row; the row-value
 //!   comparison read as an OR of branches; the DISTINCT table of an
-//!   aggregate query; the IN operator's Bloom filter);
+//!   aggregate query; the IN operator's Bloom filter; and the review's:
+//!   COLLATE in an OR, the one-value IN, the expression OR-to-IN, the
+//!   IN operator's index and Bloom collation, min() / max() SEARCH
+//!   text and coverage, `sqlite_stat1` keywords, an equality's
+//!   collation against the ORDER BY's);
 //! - performance: a two-branch OR over two indexed columns of a
 //!   20,000-row table is far faster than the full scan it replaces.
 
@@ -531,6 +539,227 @@ fn regressions() {
     );
 }
 
+/// Regressions for the review findings (v0.17 review): each a class
+/// the pin plans otherwise.
+#[test]
+fn review_regressions() {
+    // An explicit COLLATE anywhere in an OR term (outside a subquery):
+    // the pin analyses it as no OR at all, neither a MULTI-INDEX OR
+    // nor an IN; rows in rowid order.
+    same(
+        "rv1",
+        "CREATE TABLE t(a, b, c); CREATE INDEX ta ON t(a); CREATE INDEX tb ON t(b); \
+         CREATE INDEX tc ON t(c COLLATE NOCASE); CREATE TABLE r(k, j); \
+         INSERT INTO t VALUES('x','y',1),('X','q',2),(1,'Y',3),('z','x',4),('y','X',5),('X','Y',6); \
+         INSERT INTO r VALUES('x',1),('X',2),('Y',3);",
+        &[
+            "SELECT rowid FROM t WHERE a = 'X' OR b = 'x' COLLATE NOCASE",
+            "SELECT rowid FROM t WHERE a=2 OR b='x' COLLATE BINARY",
+            "SELECT rowid FROM t WHERE a=2 OR b COLLATE BINARY='x'",
+            "SELECT rowid FROM t WHERE a=2 OR (b='x' COLLATE BINARY AND c=1)",
+            "SELECT rowid FROM t WHERE a=2 OR b=lower('X' COLLATE BINARY)",
+            "SELECT rowid FROM t WHERE a=2 OR b=1 OR c COLLATE NOCASE='x'",
+            "SELECT rowid FROM t WHERE (a=2 OR b='x') COLLATE BINARY",
+            "SELECT rowid FROM t WHERE a=2 OR b=(SELECT 'x' COLLATE BINARY)",
+            "SELECT rowid FROM t WHERE (a=1 OR a=2) COLLATE NOCASE OR a=3",
+            "SELECT a FROM t WHERE a='x' OR a='y' COLLATE BINARY",
+            "SELECT a FROM t WHERE a='x' OR (a='y') COLLATE NOCASE",
+            "SELECT a FROM t WHERE a<5 OR a=5 COLLATE BINARY",
+            "SELECT a FROM t WHERE a='x' OR likely(a='y')",
+            "SELECT a FROM t WHERE a='x' OR unlikely(a='y')",
+            "SELECT t.rowid, r.rowid FROM r, t WHERE t.a=r.k OR t.b COLLATE NOCASE = r.k",
+            "SELECT t.rowid, r.rowid FROM r, t WHERE t.a=r.k OR t.b = r.k",
+        ],
+    );
+    // A one-value IN on a constant is the pin's `x = +v`: an equality
+    // in the OR-to-IN rewrite and everywhere else.
+    same(
+        "rv2",
+        "CREATE TABLE t(a TEXT, b INTEGER, c INTEGER, d BLOB); CREATE INDEX ti1 ON t(d, b DESC); \
+         CREATE INDEX tbc ON t(b, c); \
+         INSERT INTO t VALUES('a',1,1,''),('b',2,2,-2),('c',3,3,'-2'),('d',4,4,x''),('e',5,5,NULL), \
+         ('f',6,6,-2.0),('g',3,1,7);",
+        &[
+            "SELECT rowid FROM t WHERE d='' OR d IN (-2)",
+            "SELECT rowid FROM t WHERE d=1 OR d IN (-2)",
+            "SELECT rowid FROM t WHERE d IN (1) OR d IN (-2)",
+            "SELECT rowid FROM t WHERE d IN (1) OR d IN (-2, 7)",
+            "SELECT rowid FROM t WHERE d IN (a) OR d IN (-2)",
+            "SELECT rowid FROM t WHERE d IN (CAST(7 AS TEXT)) OR d=''",
+            "SELECT rowid FROM t WHERE d IN (NULL) OR d=''",
+            "SELECT rowid FROM t WHERE b IN (3) ORDER BY c",
+            "SELECT rowid FROM t WHERE b IN (3) AND c>0 ORDER BY c DESC",
+            "SELECT rowid FROM t WHERE rowid IN (3) OR rowid=5",
+            "SELECT 'Y' IN ('y' COLLATE NOCASE), 1 IN (1.0), '1' IN (1)",
+        ],
+    );
+    // An OR of equalities on an indexed expression: the pin's IN seek
+    // on it; in a join, the MULTI-INDEX OR through the expression
+    // index (its branches never covering by expressions).
+    same(
+        "rv3",
+        "CREATE TABLE t(a, b); CREATE INDEX tex ON t(a*2); CREATE INDEX tb ON t(b); \
+         CREATE TABLE r(k, j); \
+         INSERT INTO t VALUES(7,1),(2,2),(7,3),(2,4),(NULL,5),('2',6); \
+         INSERT INTO r VALUES(14,4),(4,1);",
+        &[
+            "SELECT rowid FROM t WHERE a*2=14 OR a*2=4",
+            "SELECT rowid FROM t WHERE 14=a*2 OR 4=a*2",
+            "SELECT rowid FROM t WHERE a*2=14 OR a*2 IN (4)",
+            "SELECT t.rowid, r.rowid FROM r, t WHERE t.a*2=r.j OR t.a*2=r.k",
+            "SELECT t.rowid, r.rowid FROM r, t WHERE t.a*2=r.j OR t.b=r.k",
+            "SELECT t.rowid, r.rowid FROM r, t WHERE r.j=t.a*2 OR t.b=r.k",
+            "SELECT t.rowid FROM r, t WHERE t.a*2=r.k OR t.a*2=5",
+        ],
+    );
+    // The IN operator's Bloom filter only under BINARY comparisons; an
+    // IN reading the right-hand table's rowids or index in place.
+    same(
+        "rv4",
+        "CREATE TABLE t(a INTEGER, b TEXT COLLATE NOCASE, c, d TEXT); CREATE INDEX ta ON t(a); \
+         CREATE TABLE u(a, e REAL, f TEXT COLLATE NOCASE, g TEXT, h INTEGER PRIMARY KEY, i UNIQUE); \
+         CREATE INDEX ua ON u(a); CREATE INDEX uf ON u(f); CREATE INDEX ug ON u(g, e); \
+         CREATE INDEX up ON u(e) WHERE e > 0; CREATE VIEW vu AS SELECT a FROM u; \
+         CREATE TABLE w(k PRIMARY KEY, v) WITHOUT ROWID; \
+         INSERT INTO t VALUES(1,'x',1,'x'),(2,'X',2,'y'),(3,'y',3,'1'); \
+         INSERT INTO u VALUES(1,1.0,'X','x',5,7),(2,2.0,'y','1',6,8),('x',3,'z','q',7,9); \
+         INSERT INTO w VALUES(1,'a'),('x','b');",
+        &[
+            "SELECT a FROM t WHERE t.b IN (SELECT a FROM u WHERE e>0)",
+            "SELECT a FROM t WHERE t.c IN (SELECT f FROM u WHERE e>0)",
+            "SELECT a FROM t WHERE t.c COLLATE NOCASE IN (SELECT a FROM u WHERE e>0)",
+            "SELECT a FROM t WHERE t.c IN (SELECT a COLLATE NOCASE FROM u WHERE e>0)",
+            "SELECT a FROM t WHERE t.b COLLATE BINARY IN (SELECT a FROM u WHERE e>0)",
+            "SELECT a FROM t WHERE (t.c, t.b) IN (SELECT a, g FROM u WHERE e>0)",
+            "SELECT a FROM t WHERE t.b IN (VALUES(1),(2))",
+            "SELECT a FROM t WHERE t.c IN (SELECT a FROM u)",
+            "SELECT a FROM t WHERE t.c NOT IN (SELECT a FROM u)",
+            "SELECT a FROM t WHERE t.c IN (SELECT a FROM u ORDER BY a)",
+            "SELECT a FROM t WHERE t.c IN (SELECT DISTINCT a FROM u)",
+            "SELECT a FROM t WHERE t.c IN (SELECT a FROM u GROUP BY a)",
+            "SELECT a FROM t WHERE t.c IN (SELECT a FROM vu)",
+            "SELECT a FROM t WHERE t.c IN (SELECT h FROM u)",
+            "SELECT a FROM t WHERE t.a IN (SELECT h FROM u)",
+            "SELECT a FROM t WHERE t.a IN (SELECT i FROM u)",
+            "SELECT a FROM t WHERE t.c IN (SELECT i FROM u)",
+            "SELECT a FROM t WHERE t.d IN (SELECT g FROM u)",
+            "SELECT a FROM t WHERE t.a IN (SELECT g FROM u)",
+            "SELECT a FROM t WHERE t.b IN (SELECT f FROM u)",
+            "SELECT a FROM t WHERE t.c IN (SELECT f FROM u)",
+            "SELECT a FROM t WHERE (t.d, t.c) IN (SELECT g, e FROM u)",
+            "SELECT a FROM t WHERE t.c IN (SELECT k FROM w)",
+            "SELECT a FROM t WHERE t.c IN (SELECT v FROM w)",
+            "SELECT a FROM t WHERE 5 IN (SELECT a FROM u)",
+            "SELECT a, c IN (SELECT a FROM u) FROM t",
+            "SELECT a FROM t WHERE c IN (SELECT a FROM u) AND a IN (SELECT a FROM u)",
+        ],
+    );
+    // min() / max(): every loop prints SEARCH (FROM subqueries, CTEs,
+    // virtual tables: max() offers generate_series its DESC order); an
+    // index on the argument's expression covers; an aggregate query's
+    // bare key expression does not.
+    same(
+        "rv5",
+        "CREATE TABLE t(a); CREATE INDEX ta ON t(a); INSERT INTO t VALUES(1),(2),(NULL); \
+         CREATE TABLE t2(a INTEGER, b); CREATE INDEX te ON t2(a+1); \
+         INSERT INTO t2 VALUES(1,1),(2,2),(NULL,3);",
+        &[
+            "SELECT min(a) FROM (SELECT a FROM t ORDER BY a DESC LIMIT 3)",
+            "WITH q AS MATERIALIZED (SELECT a FROM t) SELECT max(a) FROM q",
+            "SELECT max(a) FROM (SELECT a FROM t UNION SELECT 5)",
+            "SELECT max(value) FROM generate_series(1,5)",
+            "SELECT min(value) FROM generate_series(1,5)",
+            "SELECT max(value) FROM generate_series(1,5) WHERE value>2",
+            "SELECT max(value+1) FROM generate_series(1,5)",
+            "SELECT min(a+1) FROM t2",
+            "SELECT max(a+1) FROM t2",
+            "SELECT min(a+1), b FROM t2",
+            "SELECT count(a+1) FROM t2",
+            "SELECT a+1, max(a+1) FROM t2",
+            "SELECT a+1 FROM t2 GROUP BY a+1",
+            "SELECT a+1, count(*) FROM t2 GROUP BY a+1",
+            "SELECT count(*) FROM t2 GROUP BY a+1",
+            "SELECT count(*) FROM t2 GROUP BY a+1 ORDER BY a+1",
+        ],
+    );
+    // A min() / max() over an IN probe folds every row, each value's
+    // entries forward: the bare columns are the pin's.
+    same(
+        "rv6",
+        "CREATE TABLE t0(c0 REAL, c1 INTEGER, c2 INTEGER); \
+         CREATE INDEX t0i1 ON t0(c1, c2); CREATE INDEX t0i2 ON t0(c1); \
+         INSERT INTO t0 VALUES(5,4,6),(0,'x',8),(7,'z',9),(6,'z',2),('y','z',3),(1,'z',NULL), \
+         (6,'z',NULL),(2,7,4),(1,7,6),(9,7,NULL);",
+        &[
+            "SELECT max(c1), c2 FROM t0 WHERE c1 IN ('z', 7, 'x')",
+            "SELECT min(c1), c2 FROM t0 WHERE c1 IN ('z', 7, 4)",
+            "SELECT max(c1), c2 FROM t0 WHERE c1 IN (SELECT c1 FROM t0)",
+            "SELECT max(c1), c2 FROM t0 WHERE c1 IN (SELECT c1 FROM t0 WHERE c1 < 8)",
+            "SELECT min(c1), c2 FROM t0 WHERE c1 IN (SELECT c1 FROM t0 WHERE c1 < 5)",
+        ],
+    );
+    // `sqlite_stat1`'s keywords: `noskipscan` (no skip-scan),
+    // `unordered` (no range, ORDER BY or covering scan through the
+    // index), `sz=N` (its row size).
+    for kw in [
+        "noskipscan",
+        "unordered",
+        "sz=200",
+        "sz=1 noskipscan",
+        "xnoskipscan",
+    ] {
+        same(
+            &format!("rv7{}", kw.len()),
+            &format!(
+                "CREATE TABLE k(a INT, b INT, c TEXT, d); CREATE INDEX kab ON k(a, b); \
+                 CREATE INDEX kc ON k(c); \
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) \
+                 INSERT INTO k SELECT i%3, i%50, 'c'||(i%17), i FROM n; ANALYZE; \
+                 UPDATE sqlite_stat1 SET stat = stat || ' {kw}' WHERE idx = 'kab'; \
+                 ANALYZE sqlite_schema;"
+            ),
+            &[
+                "SELECT rowid, d FROM k WHERE b=7",
+                "SELECT rowid, d FROM k WHERE a=1 ORDER BY a, b LIMIT 5",
+                "SELECT rowid FROM k WHERE a>1 AND a<3",
+                "SELECT a FROM k LIMIT 3",
+                "SELECT a, b, rowid FROM k WHERE a>1 ORDER BY a LIMIT 4",
+                "SELECT * FROM k WHERE c='c3' AND a=1",
+            ],
+        );
+    }
+    // An `=` term holds its column constant for an ORDER BY / GROUP BY
+    // term of the same collation only (ungated: a NOCASE equality left
+    // `Y` and `y` in rowid order).
+    same(
+        "rv8",
+        "CREATE TABLE p(a TEXT, b); INSERT INTO p VALUES('y',1),('Y',2),('y',0); \
+         CREATE TABLE t(a TEXT, b, c); CREATE INDEX tab ON t(a, b); INSERT INTO t SELECT a, b, 1 FROM p; \
+         CREATE TABLE n(a TEXT COLLATE NOCASE, b); CREATE INDEX nab ON n(a, b); \
+         INSERT INTO n SELECT * FROM p;",
+        &[
+            "SELECT * FROM p WHERE a = 'y' COLLATE NOCASE ORDER BY a",
+            "SELECT * FROM p WHERE a = 'y' COLLATE NOCASE ORDER BY a, b",
+            "SELECT * FROM t WHERE a = 'y' COLLATE NOCASE ORDER BY a",
+            "SELECT * FROM t WHERE a = 'y' ORDER BY a COLLATE NOCASE",
+            "SELECT * FROM n WHERE a = 'y' COLLATE BINARY ORDER BY a",
+            "SELECT * FROM n WHERE a = 'y' ORDER BY a",
+            "SELECT * FROM t WHERE a = 'y' COLLATE NOCASE GROUP BY a",
+            "SELECT a, count(*) FROM p WHERE a = 'y' COLLATE NOCASE GROUP BY a",
+        ],
+    );
+    // (An honest gap: after ANALYZE, an IN subquery on a small WITHOUT
+    // ROWID table's PRIMARY KEY scans where the pin seeks; the rows
+    // agree.)
+    same_rows(
+        "rv9",
+        "CREATE TABLE t(a, b, c, PRIMARY KEY(a, b)) WITHOUT ROWID; CREATE TABLE u(a, e); \
+         INSERT INTO t VALUES(1,1,1),(2,2,2),(3,3,3),(4,4,4),(5,5,5); \
+         INSERT INTO u VALUES(1,5),(2,6),(3,1),(4,0); ANALYZE;",
+        &["SELECT * FROM t WHERE t.a IN (SELECT a FROM u WHERE e>4)"],
+    );
+}
+
 // ------------------------------------------------------------ corpus
 
 /// A small xorshift PRNG (tests/fuzz_smoke.rs style).
@@ -575,7 +804,14 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
             if i == 0 && ipk {
                 defs.push(format!("{c} INTEGER PRIMARY KEY"));
             } else {
-                let t = r.pick(&["INTEGER", "TEXT", "", "REAL", "NUMERIC"]);
+                let t = r.pick(&[
+                    "INTEGER",
+                    "TEXT",
+                    "",
+                    "REAL",
+                    "NUMERIC",
+                    "TEXT COLLATE NOCASE",
+                ]);
                 defs.push(format!("{c} {t}").trim().to_string());
             }
         }
@@ -607,6 +843,11 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
                 ic.join(", ")
             );
         }
+        // An expression index (the OR-to-IN and MULTI-INDEX OR keys
+        // of `c1*2`; v0.17 review).
+        if r.chance(25) {
+            out += &format!("CREATE INDEX {name}e ON {name}(c1*2);\n");
+        }
         for j in 0..r.n(41) {
             let mut vals = Vec::new();
             for i in 0..n {
@@ -629,6 +870,16 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
     }
     if r.chance(30) {
         out += "ANALYZE;\n";
+        // `sqlite_stat1`'s keywords (v0.17 review: `noskipscan`,
+        // `unordered`, `sz=`).
+        if r.chance(30) {
+            let kw = r.pick(&["noskipscan", "unordered", "sz=40", "sz=1 noskipscan"]);
+            out += &format!(
+                "UPDATE sqlite_stat1 SET stat = stat || ' {kw}' WHERE idx IS NOT NULL \
+                 AND rowid % 2 = {}; ANALYZE sqlite_schema;\n",
+                r.n(2)
+            );
+        }
     }
     (out, tabs)
 }
@@ -636,7 +887,7 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
 fn term(r: &mut Rng, al: &str, cols: &[String]) -> String {
     let c = format!("{al}{}", cols[r.n(cols.len() as u64) as usize]);
     let v = r.n(10);
-    match r.n(12) {
+    match r.n(18) {
         0 | 9 | 10 => format!("{c} = {v}"),
         1 => format!("{c} > {v}"),
         2 => format!("{c} < {v}"),
@@ -646,6 +897,14 @@ fn term(r: &mut Rng, al: &str, cols: &[String]) -> String {
         6 => format!("{c} >= {v} AND {c} <= {}", v + 2),
         7 => format!("{c} IN (SELECT c1 FROM t0 WHERE c1 < {v})"),
         8 => format!("{c} = '{}'", r.pick(&["x", "y", "z"])),
+        // (v0.17 review: COLLATE inside an OR, the one-value IN, the
+        // expression key, the IN operator's own index and collation.)
+        12 => format!("{c} = '{}' COLLATE NOCASE", r.pick(&["X", "y"])),
+        13 => format!("{c} COLLATE BINARY = {v}"),
+        14 => format!("{c} IN ({v})"),
+        15 => format!("{al}c1*2 = {}", 2 * v),
+        16 => format!("{c} IN (SELECT c1 FROM t0)"),
+        17 => format!("{c} COLLATE NOCASE IN (SELECT c2 FROM t0 WHERE c1 < {v})"),
         _ => format!("{c} <= {v}"),
     }
 }
@@ -828,7 +1087,17 @@ fn generated_corpus_matches_pin() {
                     let mut b: Vec<&str> = p.lines().collect();
                     a.sort_unstable();
                     b.sort_unstable();
-                    if a == b || q.contains(" LIMIT ") {
+                    // (A min() / max() query's bare columns come from the
+                    // first row of the minimum its loop reaches: another
+                    // plan, another row of the same minimum.)
+                    let agg = |l: &[&str]| -> Vec<String> {
+                        l.iter()
+                            .map(|x| x.split('|').next().unwrap_or("").to_string())
+                            .collect()
+                    };
+                    let bare = (q.starts_with("SELECT min(") || q.starts_with("SELECT max("))
+                        && agg(&a) == agg(&b);
+                    if a == b || q.contains(" LIMIT ") || bare {
                         order_bad.push(format!("seed {seed}: {q}"));
                     } else {
                         hard.push(format!(
@@ -856,14 +1125,17 @@ fn generated_corpus_matches_pin() {
         plan_bad.len()
     );
     assert!(hard.is_empty(), "rows differ:\n{}", hard.join("\n"));
+    // (v0.17 review: 2 orders and 47 plans of 4,000 at 400 seeds, 1 and
+    // 2 of 400 at the default 40, with the review's forms in the
+    // corpus; the limits were 1 in 200 and 2 in 100.)
     assert!(
-        order_bad.len() * 200 <= n,
+        order_bad.len() * 400 <= n,
         "{} of {n} row orders differ:\n{}",
         order_bad.len(),
         order_bad.join("\n")
     );
     assert!(
-        plan_bad.len() * 100 <= n * 2,
+        plan_bad.len() * 200 <= n * 3,
         "{} of {n} plans differ:\n{}",
         plan_bad.len(),
         plan_bad.join("\n")

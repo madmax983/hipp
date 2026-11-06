@@ -338,8 +338,15 @@ fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
         let (al, t) = &aliases[r.n(aliases.len() as u64) as usize];
         let c = &t.cols[r.n(t.cols.len() as u64) as usize];
         let v = r.n(7);
-        // (v0.17, `multi_index`: OR terms and IN subqueries too.)
-        conds.push(match r.n(9) {
+        // (v0.17, `multi_index`: OR terms and IN subqueries too; v0.17
+        // review: a COLLATE inside an OR, the one-value IN.)
+        conds.push(match r.n(11) {
+            9 => {
+                let (pa, pt) = &aliases[r.n(aliases.len() as u64) as usize];
+                let pc = &pt.cols[r.n(pt.cols.len() as u64) as usize];
+                format!("({al}.{c}={pa}.{pc} OR {al}.{c}={} COLLATE NOCASE)", r.n(7))
+            }
+            10 => format!("({al}.{c} IN ({v}) OR {al}.{c}={})", r.n(7)),
             0 => format!("{al}.{c}={v}"),
             1 => format!("{al}.{c}>{v}"),
             2 => format!("{al}.{c}<{v}"),
@@ -475,9 +482,11 @@ fn generated_joins_match_pin() {
     // (v0.17, `multi_index`: OR terms, IN subqueries and min() / max()
     // in the corpus; 15 orders and 126 plans of 1,600 at 400 seeds, 3
     // and 20 of 240 at the default 60 — the limits were 2 and 10 in
-    // 100.)
+    // 100; v0.17 review: COLLATE inside an OR and one-value IN lists
+    // added, 10 orders and 133 plans of 1,600, 2 and 21 of 240 — the
+    // order limit was 3 in 200.)
     assert!(
-        order_bad.len() * 200 <= n * 3,
+        order_bad.len() * 100 <= n,
         "{} of {n} row orders differ:\n{}",
         order_bad.len(),
         order_bad.join("\n")

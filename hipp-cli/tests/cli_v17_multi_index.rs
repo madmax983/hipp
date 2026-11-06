@@ -162,3 +162,46 @@ DELETE FROM p WHERE b=1 OR c=2 RETURNING a;
 SELECT * FROM p;",
     );
 }
+
+/// The review's classes (v0.17 review): a COLLATE inside an OR, the
+/// one-value IN, an OR over an indexed expression, the IN operator's
+/// own index and Bloom filter, min() / max() over a FROM subquery and
+/// a virtual table, `sqlite_stat1`'s `noskipscan`, and an equality's
+/// collation against the ORDER BY's.
+#[test]
+fn review_outputs() {
+    same(
+        "rv",
+        "CREATE TABLE t(a, b); CREATE INDEX ta ON t(a); CREATE INDEX tb ON t(b);
+CREATE INDEX tex ON t(a*2);
+INSERT INTO t VALUES('x','y'),('X','q'),(1,'Y'),('z','x'),('y','X'),('X','Y'),(7,1),(2,2);
+CREATE TABLE u(a TEXT COLLATE NOCASE, e REAL, h INTEGER PRIMARY KEY);
+CREATE INDEX ua ON u(a);
+INSERT INTO u VALUES('x',1,5),('Y',2,6);
+CREATE TABLE k(a INT, b INT, d); CREATE INDEX kab ON k(a, b);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300)
+INSERT INTO k SELECT i%3, i%50, i FROM n;
+ANALYZE;
+UPDATE sqlite_stat1 SET stat = stat || ' noskipscan' WHERE idx = 'kab';
+ANALYZE sqlite_schema;",
+        "SELECT rowid FROM t WHERE a = 'X' OR b = 'x' COLLATE NOCASE;
+EXPLAIN QUERY PLAN SELECT rowid FROM t WHERE a = 2 OR b = 'x' COLLATE BINARY;
+SELECT rowid FROM t WHERE a = 2 OR b = 'x' COLLATE BINARY;
+SELECT rowid FROM t WHERE a = 'z' OR a IN ('X');
+EXPLAIN QUERY PLAN SELECT rowid FROM t WHERE a = 'z' OR a IN ('X');
+SELECT rowid FROM t WHERE a*2 = 14 OR a*2 = 4;
+EXPLAIN QUERY PLAN SELECT rowid FROM t WHERE a*2 = 14 OR a*2 = 4;
+EXPLAIN QUERY PLAN SELECT * FROM t WHERE b IN (SELECT a FROM u WHERE e > 0);
+EXPLAIN QUERY PLAN SELECT * FROM t WHERE a IN (SELECT a FROM u WHERE e > 0);
+EXPLAIN QUERY PLAN SELECT * FROM t WHERE b IN (SELECT h FROM u);
+EXPLAIN QUERY PLAN SELECT * FROM t WHERE b IN (SELECT a FROM u);
+SELECT * FROM t WHERE b IN (SELECT a FROM u);
+EXPLAIN QUERY PLAN SELECT max(a) FROM (SELECT a FROM t ORDER BY a DESC LIMIT 3);
+EXPLAIN QUERY PLAN SELECT max(value) FROM generate_series(1, 5);
+SELECT max(value) FROM generate_series(1, 5);
+SELECT rowid, d FROM k WHERE b = 7;
+EXPLAIN QUERY PLAN SELECT rowid, d FROM k WHERE b = 7;
+SELECT a, rowid FROM t WHERE a = 'x' COLLATE NOCASE ORDER BY a;
+EXPLAIN QUERY PLAN SELECT a, rowid FROM t WHERE a = 'x' COLLATE NOCASE ORDER BY a;",
+    );
+}

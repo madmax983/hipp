@@ -1086,7 +1086,11 @@ pub(super) fn mark_xcover(
             continue;
         }
         let f = |e: &RExpr| m.reads_uncovered(e, s);
-        let uncovered = info.items.iter().any(f)
+        // (An aggregate query's bare key expressions: `bare_expr`.)
+        let agg = info.has_agg || !info.group_by.is_empty();
+        let bare = |e: &RExpr| agg && m.bare_expr(e);
+        let uncovered = info.items.iter().any(|e| f(e) || bare(e))
+            || info.order_by.iter().any(|(e, _)| bare(e))
             || info.filter.is_some_and(f)
             || info.group_by.iter().any(f)
             || info.having.is_some_and(f)
@@ -1229,13 +1233,21 @@ impl<S: Storage> Connection<S> {
                     }
                 }
             }
+            // `sqlite_stat1`'s `unordered` / `sz=` / `noskipscan`
+            // (v0.17 review fix, `multi_index`).
+            #[cfg(feature = "multi_index")]
+            let opts = self.index_opts(ix);
+            #[cfg(feature = "multi_index")]
+            let width = opts.sz.unwrap_or(log_est(u64::from(wi) * 4));
+            #[cfg(not(feature = "multi_index"))]
+            let width = log_est(u64::from(wi) * 4);
             out.push(IdxModel {
                 root: ix.root,
                 unique: ix.unique,
                 keys,
                 desc,
                 pred: ext.as_ref().and_then(|x| x.pred.as_ref()).map(shift),
-                width: log_est(u64::from(wi) * 4),
+                width,
                 suffix,
                 covers_all,
                 suffix_covers: !auto,
@@ -1244,6 +1256,10 @@ impl<S: Storage> Connection<S> {
                 xcover: false,
                 #[cfg(feature = "multi_index")]
                 stat1: self.stat_est(t, ix).is_some(),
+                #[cfg(feature = "multi_index")]
+                unordered: opts.unordered,
+                #[cfg(feature = "multi_index")]
+                noskip: opts.noskip,
             });
         }
         (width, out)
@@ -1556,16 +1572,18 @@ impl<S: Storage> Connection<S> {
                     &avail,
                     &|_| 0,
                     &|t: &crate::xplan::Term| u64::from(t.lateral),
+                    &|e| crate::xmulti::expr_indexed(tab.indexes, e),
                 );
                 // (No IN term for an OR the pin does not rewrite.)
                 let ts: AVec<crate::xplan::Term> = ts
                     .iter()
                     .filter(|t| {
                         !crate::xmulti::or_in_term(t, conj.as_slice())
-                            || conj
-                                .as_slice()
-                                .get(t.parent)
-                                .is_some_and(|c| crate::xmulti::in_kept(t, c, &me))
+                            || conj.as_slice().get(t.parent).is_some_and(|c| {
+                                crate::xmulti::in_kept(t, c, &me, &|_, e| {
+                                    crate::xmulti::expr_indexed(tab.indexes, e)
+                                })
+                            })
                     })
                     .cloned()
                     .collect();
@@ -1582,6 +1600,37 @@ impl<S: Storage> Connection<S> {
                 // argument constant, `x IS NULL`, delivers it too.)
                 if mm.is_some() && a.is_none() {
                     a = crate::xmulti::natural_access(&q, &s, &tab, ts.as_slice());
+                }
+                // (A loop probing an IN list on the argument itself
+                // delivers no min() / max() order: the pin holds the IN
+                // column constant, reads each value's entries forward
+                // and folds every row; v0.17 review fix. An IN on an
+                // earlier key column keeps the loop's direction.)
+                let in_arg = |a: &crate::xplan::IdxAccess| {
+                    let Some((arg, _)) = mm else { return false };
+                    let arg = crate::xplan::strip(arg);
+                    let m = tab.indexes.iter().find(|m| m.root == a.root && a.root != 0);
+                    a.eq.iter().enumerate().any(|(k, p)| {
+                        p.is_in
+                            && match m {
+                                None => s.is_rowid(arg),
+                                Some(m) => match m.keys.as_slice().get(k) {
+                                    Some(crate::xplan::IdxKey::Col(c)) => s.is_col(arg, *c),
+                                    Some(crate::xplan::IdxKey::Expr(x)) => {
+                                        crate::query::same_expr(x, arg)
+                                    }
+                                    Some(crate::xplan::IdxKey::Rowid) => s.is_rowid(arg),
+                                    None => false,
+                                },
+                            }
+                    })
+                };
+                if let Some(a) = a.as_mut()
+                    && in_arg(a)
+                {
+                    a.reverse = false;
+                    a.bignull = None;
+                    a.sorted = 0;
                 }
                 if mm.is_some()
                     && let Some(a) = a.as_mut()
@@ -1827,6 +1876,8 @@ impl<S: Storage> Connection<S> {
         let ts = terms(conj.as_slice(), truth.as_slice(), &s, &avail);
         // The MULTI-INDEX OR loops (v0.17, `multi_index`).
         #[cfg(feature = "multi_index")]
+        let (width, models) = self.table_models(arena, t, &s);
+        #[cfg(feature = "multi_index")]
         let ors = crate::xmulti::or_infos(
             conj.as_slice(),
             truth.as_slice(),
@@ -1835,6 +1886,7 @@ impl<S: Storage> Connection<S> {
             &avail,
             &|_| 0,
             &|_| 0,
+            &|e| crate::xmulti::expr_indexed(models.as_slice(), e),
         );
         #[cfg(feature = "multi_index")]
         let no_or = ors.is_empty();
@@ -1913,6 +1965,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "join_order")]
             jm: None,
         };
+        #[cfg(not(feature = "multi_index"))]
         let (width, models) = self.table_models(arena, t, &s);
         let notnull = self.not_null_cols(t);
         let tab = Table {
@@ -1933,10 +1986,11 @@ impl<S: Storage> Connection<S> {
                 .iter()
                 .filter(|t| {
                     !crate::xmulti::or_in_term(t, conj.as_slice())
-                        || conj
-                            .as_slice()
-                            .get(t.parent)
-                            .is_some_and(|c| crate::xmulti::in_kept(t, c, &me))
+                        || conj.as_slice().get(t.parent).is_some_and(|c| {
+                            crate::xmulti::in_kept(t, c, &me, &|_, e| {
+                                crate::xmulti::expr_indexed(tab.indexes, e)
+                            })
+                        })
                 })
                 .cloned()
                 .collect();

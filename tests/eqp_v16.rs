@@ -408,11 +408,6 @@ fn writes_match_pin() {
 fn documented_differences() {
     let path = db("eqp-diff", SCHEMA);
     let cases: &[(&str, &str)] = &[
-        // An IN subquery is a list, not an index probe.
-        (
-            "SELECT * FROM t WHERE b IN (SELECT x FROM u)",
-            "|--SEARCH t USING INDEX tb (b=?)\n`--LIST SUBQUERY 1\n   `--SCAN u USING COVERING INDEX ux\n",
-        ),
         // RIGHT / FULL joins read whole tables.
         (
             "SELECT * FROM u RIGHT JOIN t ON u.x=t.b",
@@ -439,6 +434,9 @@ fn documented_differences() {
             "SELECT * FROM t LEFT JOIN u ON t.b=u.y",
             "SELECT * FROM t WHERE b = 1 OR c = 2",
             "SELECT max(b) FROM t",
+            // (v0.17 review: the IN operator reads a UNIQUE index in
+            // place of the subquery's list.)
+            "SELECT * FROM t WHERE b IN (SELECT x FROM u)",
         ],
     );
     for (q, want) in cases {
@@ -620,7 +618,9 @@ fn gen_term(r: &mut Rng, t: &Tab) -> String {
     let v = r.n(20);
     // (v0.17, `multi_index`: OR terms, for the MULTI-INDEX OR, and IN
     // subqueries.)
-    match r.n(12) {
+    // (v0.17 review: a COLLATE inside an OR, the one-value IN, the IN
+    // operator's own index and its Bloom filter's collation.)
+    match r.n(16) {
         8 | 9 => {
             let d = t.cols[r.n(t.cols.len() as u64) as usize].clone();
             return format!(
@@ -630,6 +630,13 @@ fn gen_term(r: &mut Rng, t: &Tab) -> String {
             );
         }
         10 => return format!("{c} IN (SELECT c1 FROM t1 WHERE c0 > {v})"),
+        11 => {
+            let d = t.cols[r.n(t.cols.len() as u64) as usize].clone();
+            return format!("({c} = {v} OR {d} = 'x' COLLATE NOCASE)");
+        }
+        12 => return format!("({c} = {v} OR {c} IN ({}))", r.n(20)),
+        13 => return format!("{c} IN (SELECT c1 FROM t1)"),
+        14 => return format!("{c} COLLATE NOCASE IN (SELECT c1 FROM t1 WHERE c0 > {v})"),
         _ => {}
     }
     match r.n(8) {
@@ -772,11 +779,13 @@ fn generated_plans_match_pin() {
         }
     }
     // hipp's cost model departs from the pin's in a few loop choices
-    // (STATUS.md, "honest gaps"): at most 1 in 200 may differ (v0.17,
+    // (STATUS.md, "honest gaps"): at most 1 in 400 may differ (v0.17,
     // `multi_index`: 15 of 4,800 at 400 seeds, OR terms, IN subqueries
-    // and min() / max() in the corpus; it was 1 in 100).
+    // and min() / max() in the corpus; it was 1 in 100; v0.17 review:
+    // 12 of 4,800 with COLLATE inside an OR, one-value IN lists and the
+    // IN operator's own index and Bloom filter added, it was 1 in 200).
     assert!(
-        bad.len() * 200 <= n,
+        bad.len() * 400 <= n,
         "{} of {n} plans differ:\n{}",
         bad.len(),
         bad.join("\n")

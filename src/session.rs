@@ -5060,6 +5060,26 @@ impl<S: Storage> Connection<S> {
                 }
                 _ => None,
             };
+            // A lone max(column)'s `ORDER BY column DESC` (v0.17 review
+            // fix, `multi_index`: the pin's `minMaxQuery`; min()'s
+            // NULLS LAST order is not offered to a virtual table).
+            #[cfg(feature = "multi_index")]
+            let order = order.or_else(|| {
+                if !stmt.order_by.is_empty()
+                    || !stmt.group_by.is_empty()
+                    || stmt.having.is_some()
+                    || sources.len() != 1
+                {
+                    return None;
+                }
+                let (arg, o) = crate::xmulti::minmax(items.as_slice(), &[], false, &|_| true)?;
+                let RExpr::Column(slot, ..) = arg else {
+                    return None;
+                };
+                let c = slot.checked_sub(cur.offsets.as_slice().first().copied()?)?;
+                let col = cur.sources.as_slice().first()?.columns.as_slice().get(c)?;
+                o.desc.then_some((col.0.as_slice(), true))
+            });
             let consumed = if vt_deferred {
                 false
             } else {

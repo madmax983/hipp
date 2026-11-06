@@ -119,28 +119,33 @@ fn is_col(e: &RExpr) -> bool {
 }
 
 /// A branch the pin analyses as one term (`WO_SINGLE`): a comparison
-/// with a column on either side, `col IN (...)`, `col IS NULL`.
-/// Returns the column operand (after the pin's in-place commute) and
-/// whether a commuted copy exists (a column on both sides).
-fn single(d: &RExpr) -> Option<(&RExpr, Option<&RExpr>)> {
+/// with a key on either side, `key IN (...)`, `key IS NULL`, where a
+/// key is a column or an expression `key` says may be indexed (the
+/// pin's `exprMightBeIndexed`; v0.17 review fix: `t.a*2 = r.j` over
+/// an index on `a*2` is t's term too). Returns the key operand (after
+/// the pin's in-place commute) and whether a commuted copy exists (a
+/// key on both sides).
+fn single<'x>(
+    d: &'x RExpr,
+    key: &dyn Fn(&RExpr) -> bool,
+) -> Option<(&'x RExpr, Option<&'x RExpr>)> {
+    let k = |e: &RExpr| is_col(e) || key(strip(e));
     match d {
         RExpr::Binary(
             BinOp::Eq | BinOp::Is | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
             l,
             r,
         ) => {
-            if is_col(l) {
-                Some((strip(l), is_col(r).then(|| strip(r))))
-            } else if is_col(r) {
+            if k(l) {
+                Some((strip(l), k(r).then(|| strip(r))))
+            } else if k(r) {
                 Some((strip(r), None))
             } else {
                 None
             }
         }
-        RExpr::InList(x, _, false, _) | RExpr::InSub(x, _, false) if is_col(x) => {
-            Some((strip(x), None))
-        }
-        RExpr::IsNull(x, false) if is_col(x) => Some((strip(x), None)),
+        RExpr::InList(x, _, false, _) | RExpr::InSub(x, _, false) if k(x) => Some((strip(x), None)),
+        RExpr::IsNull(x, false) if k(x) => Some((strip(x), None)),
         _ => None,
     }
 }
@@ -150,7 +155,8 @@ fn single(d: &RExpr) -> Option<(&RExpr, Option<&RExpr>)> {
 /// has a term on the source; not an OR the pin rewrites to IN).
 /// `ok` filters the terms the source may use (a LEFT JOIN's own ON
 /// terms); `avail` is `xplan::terms`'; `cmask_of` / `tmask_of` give
-/// the sources an expression / a term's value reads.
+/// the sources an expression / a term's value reads; `key` says an
+/// expression may be indexed (`single`).
 #[allow(clippy::too_many_arguments)]
 pub fn or_infos(
     conj: &[&RExpr],
@@ -160,11 +166,16 @@ pub fn or_infos(
     avail: &dyn Fn(&RExpr) -> Option<bool>,
     cmask_of: &dyn Fn(&RExpr) -> u64,
     tmask_of: &dyn Fn(&Term) -> u64,
+    key: &dyn Fn(&RExpr) -> bool,
 ) -> AVec<OrInfo> {
     let mut out = AVec::new();
     'terms: for (ci, c) in conj.iter().enumerate() {
         let c = strip(c);
-        if !matches!(c, RExpr::Binary(BinOp::Or, ..)) || !ok(ci) || !s.reads(c) {
+        if !matches!(c, RExpr::Binary(BinOp::Or, ..))
+            || !ok(ci)
+            || !s.reads(c)
+            || crate::xplan::has_collate(c)
+        {
             continue;
         }
         // (An OR the pin also rewrites as an IN keeps its MULTI-INDEX
@@ -174,13 +185,13 @@ pub fn or_infos(
         let nd = ds.len();
         let copyable: AVec<bool> = ds
             .iter()
-            .map(|(d, _)| single(d).is_some_and(|(_, r)| r.is_some()))
+            .map(|(d, _)| single(d, key).is_some_and(|(_, r)| r.is_some()))
             .collect();
         let mut branches = AVec::new();
         for (k, (d, wrapped)) in ds.iter().enumerate() {
             let mut parts: AVec<&RExpr> = AVec::new();
             let mut truth: AVec<i32> = AVec::new();
-            let n = match single(d) {
+            let n = match single(d, key) {
                 Some((col, copy)) => {
                     parts.push(d);
                     conj_truth(wrapped, &mut truth);
@@ -249,30 +260,59 @@ pub fn or_in_term(t: &Term, conj: &[&RExpr]) -> bool {
             .is_some_and(|c| matches!(strip(c), RExpr::Binary(BinOp::Or, ..)))
 }
 
-/// The column the pin's OR-to-IN rewrite (`exprAnalyzeOrTerm` "case
+/// The key the pin's OR-to-IN rewrite (`exprAnalyzeOrTerm` "case
 /// 1") makes OR term `c` an IN on, if any: every branch `K = value`
-/// (written, or as the commuted copy of a comparison of two columns)
-/// on one column K of one of `srcs`, values with no other affinity
-/// than K's; the first branch's left column is tried first, then the
-/// first term on another table.
-pub fn in_key<'x>(c: &'x RExpr, srcs: &[Src]) -> Option<&'x RExpr> {
+/// (written, as the commuted copy of a comparison of two keys, or as
+/// a one-value IN, the parser's `K = +value`) on one key K of one of
+/// `srcs`, values with no other affinity than K's; the first branch's
+/// left key is tried first, then the first term on another table. A
+/// key is a column, the rowid, or an expression of one source that
+/// `indexed(source, expr)` finds in one of its indexes (the pin's
+/// `exprMightBeIndexed`; v0.17 review fix). An OR holding an explicit
+/// COLLATE has none.
+pub fn in_key<'x>(
+    c: &'x RExpr,
+    srcs: &[Src],
+    indexed: &dyn Fn(usize, &RExpr) -> bool,
+) -> Option<&'x RExpr> {
+    if crate::xplan::has_collate(c) {
+        return None;
+    }
     let mut ds: AVec<(&RExpr, &RExpr)> = AVec::new();
     disjuncts(c, &mut ds);
+    let src_of = |e: &RExpr| {
+        let mut it = srcs.iter().enumerate().filter(|(_, s)| s.reads(e));
+        let (i, _) = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        (is_col(e) || indexed(i, e)).then_some(i)
+    };
+    // (Any column counts, an outer query's too, as on the pin.)
+    let key = |e: &RExpr| is_col(e) || src_of(strip(e)).is_some();
     // The OR clause's terms: each branch (in-place commuted when only
-    // its right side is a column), then the copies, last first.
-    let mut ts: AVec<(&RExpr, &RExpr)> = AVec::new();
-    let mut copies: AVec<(&RExpr, &RExpr)> = AVec::new();
+    // its right side is a key), then the copies, last first; with
+    // whether the value is a one-value IN's (no affinity).
+    let mut ts: AVec<(&RExpr, &RExpr, bool)> = AVec::new();
+    let mut copies: AVec<(&RExpr, &RExpr, bool)> = AVec::new();
     for (d, _) in ds.iter() {
+        if let Some((x, v)) = crate::xplan::one_in(d) {
+            if !key(x) {
+                return None;
+            }
+            ts.push((strip(x), v, true));
+            continue;
+        }
         let RExpr::Binary(BinOp::Eq, l, r) = d else {
             return None;
         };
-        if is_col(l) {
-            ts.push((strip(l), &**r));
-            if is_col(r) {
-                copies.push((strip(r), &**l));
+        if key(l) {
+            ts.push((strip(l), &**r, false));
+            if key(r) {
+                copies.push((strip(r), &**l, false));
             }
-        } else if is_col(r) {
-            ts.push((strip(r), &**l));
+        } else if key(r) {
+            ts.push((strip(r), &**l, false));
         } else {
             return None;
         }
@@ -280,16 +320,16 @@ pub fn in_key<'x>(c: &'x RExpr, srcs: &[Src]) -> Option<&'x RExpr> {
     while let Some(x) = copies.pop() {
         ts.push(x);
     }
-    let src_of = |e: &RExpr| srcs.iter().position(|s| s.reads(e));
     // The tables every branch has a term on.
     let mut chng: AVec<usize> = AVec::new();
     for (i, _) in srcs.iter().enumerate() {
-        let on = ds.iter().all(|(d, _)| match d {
-            RExpr::Binary(_, l, r) => {
-                (is_col(l) && src_of(strip(l)) == Some(i))
-                    || (is_col(r) && src_of(strip(r)) == Some(i))
+        let on = ds.iter().all(|(d, _)| {
+            let on = |e: &RExpr| src_of(strip(e)) == Some(i);
+            match (crate::xplan::one_in(d), d) {
+                (Some((x, _)), _) => on(x),
+                (None, RExpr::Binary(_, l, r)) => on(l) || on(r),
+                _ => false,
             }
-            _ => false,
         });
         if on {
             chng.push(i);
@@ -302,14 +342,17 @@ pub fn in_key<'x>(c: &'x RExpr, srcs: &[Src]) -> Option<&'x RExpr> {
     };
     let mut prev: Option<usize> = None;
     for _ in 0..2 {
-        let cand = ts.iter().find(|(k, _)| {
+        let cand = ts.iter().find(|(k, _, _)| {
             src_of(k).is_some_and(|t| chng.as_slice().contains(&t) && Some(t) != prev)
         });
-        let Some((k, _)) = cand else { break };
+        let Some((k, _, _)) = cand else { break };
         let t = src_of(k);
-        let ok = ts.iter().filter(|(x, _)| src_of(x) == t).all(|(x, v)| {
-            crate::query::same_expr(x, k) && aff(v).is_none_or(|a| Some(a) == aff(x))
-        });
+        let ok = ts
+            .iter()
+            .filter(|(x, _, _)| src_of(x) == t)
+            .all(|(x, v, plus)| {
+                crate::query::same_expr(x, k) && (*plus || aff(v).is_none_or(|a| Some(a) == aff(x)))
+            });
         if ok {
             return Some(k);
         }
@@ -320,8 +363,19 @@ pub fn in_key<'x>(c: &'x RExpr, srcs: &[Src]) -> Option<&'x RExpr> {
 
 /// Whether OR-to-IN term `t` (`or_in_term`) of OR term `c` is the IN
 /// the pin makes (`in_key`).
-pub fn in_kept(t: &Term, c: &RExpr, srcs: &[Src]) -> bool {
-    in_key(c, srcs).is_some_and(|k| crate::query::same_expr(k, &t.key))
+pub fn in_kept(t: &Term, c: &RExpr, srcs: &[Src], indexed: &dyn Fn(usize, &RExpr) -> bool) -> bool {
+    in_key(c, srcs, indexed).is_some_and(|k| crate::query::same_expr(k, &t.key))
+}
+
+/// Whether expression `e` is a key column of one of `ms` (the pin's
+/// `exprMightBeIndexed2`: an expression index's, not constant).
+pub fn expr_indexed(ms: &[IdxModel], e: &RExpr) -> bool {
+    !crate::query::is_constant(e)
+        && ms.iter().any(|m| {
+            m.keys.iter().any(
+                |k| matches!(k, crate::xplan::IdxKey::Expr(x) if crate::query::same_expr(x, e)),
+            )
+        })
 }
 
 /// The pin's `whereOrInsert` (`N_OR_COST` 3): keep the cheapest
@@ -557,9 +611,10 @@ fn pick(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term], list: &[JLoop]) ->
 /// Whether WHERE term `c` is one the pin hands each OR branch's
 /// sub-plan (`pAndExpr`): an indexable comparison, IN, IS NULL or OR
 /// term (`eOperator & WO_ALL`) without a subquery.
-pub(crate) fn pushed(c: &RExpr) -> bool {
+pub(crate) fn pushed(c: &RExpr, key: &dyn Fn(&RExpr) -> bool) -> bool {
     let c = strip(c);
-    !crate::query::has_sub(c) && (matches!(c, RExpr::Binary(BinOp::Or, ..)) || single(c).is_some())
+    !crate::query::has_sub(c)
+        && (matches!(c, RExpr::Binary(BinOp::Or, ..)) || single(c, key).is_some())
 }
 
 /// Choose a single table's access path with the pin's loop list
@@ -646,6 +701,29 @@ fn sub_plan(
     }
     let ts = terms(conj.as_slice(), truth.as_slice(), s, avail);
     let all: AVec<bool> = (0..s.ncols).map(|_| true).collect();
+    // The pin's code generator plans each branch in a WhereInfo of its
+    // own with no SELECT (`WHERE_OR_SUBCLAUSE`), where no index covers
+    // by its expressions (`whereIsCoveringIndex`; v0.17 review fix).
+    let plain: AVec<IdxModel>;
+    let unx;
+    let tab = if tab.indexes.iter().any(|m| m.xcover) {
+        plain = tab
+            .indexes
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                m.xcover = false;
+                m
+            })
+            .collect();
+        unx = Table {
+            indexes: plain.as_slice(),
+            ..*tab
+        };
+        &unx
+    } else {
+        tab
+    };
     let qs = Query {
         conj: conj.as_slice(),
         truth: truth.as_slice(),
@@ -714,7 +792,7 @@ pub fn or_access(
 ) -> OrAccess {
     let mut w: AVec<usize> = AVec::new();
     for (i, c) in q.conj.iter().enumerate() {
-        if i != info.ci && s.reads(c) && pushed(c) && w_ok(i) {
+        if i != info.ci && s.reads(c) && pushed(c, &|e| expr_indexed(tab.indexes, e)) && w_ok(i) {
             w.push(i);
         }
     }
@@ -835,7 +913,7 @@ pub fn combined(c: &RExpr) -> AVec<RExpr> {
     let ([(d1, _), (d2, _)], false) = (
         ds.as_slice(),
         ds.iter()
-            .any(|(d, _)| single(d).is_some_and(|(_, r)| r.is_some())),
+            .any(|(d, _)| single(d, &|_| false).is_some_and(|(_, r)| r.is_some())),
     ) else {
         return out;
     };

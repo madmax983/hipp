@@ -467,6 +467,40 @@ fn last_sel(p: &SubPlan) -> u32 {
     p.compound.as_slice().last().map_or(p.sel, |(_, t)| t.sel)
 }
 
+/// The left operand's elements of `x IN (SELECT ...)` (one, or a
+/// row value's), each with the result column it compares with.
+fn in_pairs<'x>(x: &'x RExpr, p: &'x SubPlan) -> AVec<(&'x RExpr, Option<&'x RExpr>)> {
+    let core = p.compound.as_slice().last().map_or(p, |(_, t)| t);
+    let items: &[RExpr] = match core.values.as_slice().first() {
+        Some(r) if core.items.is_empty() => r.as_slice(),
+        _ => core.items.as_slice(),
+    };
+    let mut out = AVec::new();
+    match x {
+        #[cfg(feature = "v16")]
+        RExpr::Scalar(crate::query::ScalarFn::Vector, xs) => {
+            for (i, e) in xs.iter().enumerate() {
+                out.push((e, items.get(i)));
+            }
+        }
+        _ => out.push((x, items.first())),
+    }
+    out
+}
+
+/// Whether every comparison of `x IN (SELECT ...)` is BINARY: the pin
+/// builds the IN operator's Bloom filter only then (probed: a NOCASE
+/// left column, or `x COLLATE NOCASE IN (...)`, has none).
+fn in_binary(x: &RExpr, p: &SubPlan) -> bool {
+    in_pairs(x, p).iter().all(|(l, r)| {
+        let c = match r {
+            Some(r) => crate::query::binary_coll(l, r),
+            None => crate::query::expr_coll(l).unwrap_or_default(),
+        };
+        c == crate::record::Coll::Binary
+    })
+}
+
 /// The plan walk.
 #[cfg_attr(not(feature = "expr_index"), allow(dead_code))]
 pub(super) struct Walk<'a> {
@@ -1021,6 +1055,15 @@ impl<'a> Walk<'a> {
                 wterms.push((p, at));
             }
         }
+        // A min() / max() query (the pin's `minMaxQuery`): its FROM
+        // subqueries' and virtual tables' loops print SEARCH too
+        // (v0.17 review fix).
+        #[cfg(feature = "multi_index")]
+        let mm_core = c.has_agg
+            && c.having.is_none()
+            && count_of.is_none()
+            && crate::xmulti::minmax(c.items, c.order_by, !c.group_by.is_empty(), &|_| true)
+                .is_some();
         for (i, sp) in c.sources.iter().enumerate() {
             #[cfg(feature = "join_order")]
             if sp.eqp.omit {
@@ -1047,7 +1090,7 @@ impl<'a> Walk<'a> {
             // A min() / max() query's loops all print SEARCH (v0.17,
             // `multi_index`; the pin's `WHERE_ORDERBY_MIN` / `_MAX`).
             #[cfg(feature = "multi_index")]
-            if sp.eqp.minmax != 0 && line.as_slice().starts_with(b"SCAN ") {
+            if (sp.eqp.minmax != 0 || mm_core) && line.as_slice().starts_with(b"SCAN ") {
                 let mut l = copy_vec(b"SEARCH ");
                 l.extend_from_slice(line.as_slice().get(5..).unwrap_or(&[]));
                 let wr_pk = sp.derived.is_none()
@@ -1556,6 +1599,150 @@ impl<'a> Walk<'a> {
         self.terms(a, keys.as_slice(), out);
     }
 
+    /// The line of an IN operator that reads its right-hand table in
+    /// place of the subquery's values (the pin's `isCandidateForInOpt`
+    /// and `sqlite3FindInIndex`; v0.17 review fix): an uncorrelated
+    /// `SELECT cols FROM table` with no WHERE, GROUP BY, aggregate,
+    /// LIMIT or compound, whose columns are the rowid (`USING ROWID
+    /// SEARCH ON TABLE t FOR IN-OPERATOR`) or lead an index of the
+    /// comparisons' collations (`USING INDEX i FOR IN-OPERATOR`; a
+    /// UNIQUE one of exactly those columns when an index loop probes
+    /// with the values), the affinities allowing it.
+    #[cfg(feature = "multi_index")]
+    fn in_index(&self, x: &RExpr, p: &SubPlan) -> Option<AVec<u8>> {
+        use crate::record::Affinity;
+        if !p.uncorrelated
+            || !p.compound.is_empty()
+            || !p.values.is_empty()
+            || p.filter.is_some()
+            || !p.group_by.is_empty()
+            || p.having.is_some()
+            || p.has_agg
+            || p.limit.is_some()
+            || p.sources.len() != 1
+            || (self.probing && matches!(x, RExpr::Literal(_)))
+        {
+            return None;
+        }
+        let sp = p.sources.as_slice().first()?;
+        if sp.derived.is_some() || sp.rec != 0 || sp.temp {
+            return None;
+        }
+        #[cfg(any(feature = "json", feature = "vtab"))]
+        if sp.tvf != 0 {
+            return None;
+        }
+        // (A FROM subquery or view the flattener merged is still one
+        // on the pin.)
+        #[cfg(feature = "flatten")]
+        if !p.view_names.is_empty() {
+            return None;
+        }
+        #[cfg(feature = "attach")]
+        if sp.ext != 0 {
+            return None;
+        }
+        let t = self.cat.tables.iter().find(|t| t.root == sp.root)?;
+        // Each result column's table column (`None`: the rowid).
+        let mut cols: AVec<Option<usize>> = AVec::new();
+        for it in p.items.iter() {
+            cols.push(match it {
+                RExpr::Rowid(_) if t.has_rowid() => None,
+                RExpr::Column(slot, ..) => {
+                    let c = slot.checked_sub(sp.eqp.base)?;
+                    if c >= sp.ncols {
+                        return None;
+                    }
+                    if t.has_rowid() && sp.rowid_alias == Some(c) {
+                        None
+                    } else {
+                        Some(c)
+                    }
+                }
+                _ => return None,
+            });
+        }
+        let pairs = in_pairs(x, p);
+        if pairs.len() != cols.len() {
+            return None;
+        }
+        let name = handle_bytes(self.ca, t.name);
+        let mut line = AVec::new();
+        if let [None] = cols.as_slice() {
+            line.extend_from_slice(b"USING ROWID SEARCH ON TABLE ");
+            line.extend_from_slice(name);
+            line.extend_from_slice(b" FOR IN-OPERATOR");
+            return Some(line);
+        }
+        let numeric =
+            |a: Affinity| matches!(a, Affinity::Numeric | Affinity::Integer | Affinity::Real);
+        for ((l, _), c) in pairs.iter().zip(cols.iter()) {
+            let c = (*c)?;
+            let idx = sp.affs.as_slice().get(c).copied().unwrap_or(Affinity::Blob);
+            if crate::query::item_result_affinity(l).is_some_and(numeric) && !numeric(idx) {
+                return None;
+            }
+        }
+        let pk = self.pk_of(t);
+        let ixs: AVec<&crate::schema::IndexDef> = self.cat.indexes_for(self.ca, name).collect();
+        for ix in ixs.iter().rev() {
+            // (An index loop's probes need a UNIQUE index of exactly
+            // those columns: the pin's `mustBeUnique`.)
+            if ix.partial() || (self.probing && (ix.columns.len() != cols.len() || !ix.unique)) {
+                continue;
+            }
+            // The entry's columns: the key, then (a WITHOUT ROWID
+            // table's secondary index) the PRIMARY KEY columns it lacks.
+            let mut ent: AVec<(Option<usize>, crate::record::Coll)> = AVec::new();
+            for (i, k) in ix.columns.iter().enumerate() {
+                let expr = ix
+                    .ext
+                    .as_ref()
+                    .is_some_and(|e| e.exprs.as_slice().get(i).is_some_and(|e| e.is_some()));
+                ent.push((k.col.filter(|_| !expr), k.coll));
+            }
+            if !clustered(ix)
+                && let Some(pk) = pk
+            {
+                for k in pk.columns.iter() {
+                    if !ix.columns.iter().any(|x| x.col == k.col) {
+                        ent.push((k.col, k.coll));
+                    }
+                }
+            }
+            let Some(lead) = ent.as_slice().get(..cols.len()) else {
+                continue;
+            };
+            let mut used: AVec<bool> = lead.iter().map(|_| false).collect();
+            let ok = pairs.iter().zip(cols.iter()).all(|((l, r), c)| {
+                let coll = match r {
+                    Some(r) => crate::query::binary_coll(l, r),
+                    None => crate::query::expr_coll(l).unwrap_or_default(),
+                };
+                let at = lead.iter().enumerate().position(|(j, (k, kc))| {
+                    *k == *c
+                        && k.is_some()
+                        && *kc == coll
+                        && !used.as_slice().get(j).copied().unwrap_or(true)
+                });
+                match at.and_then(|j| used.as_mut_slice().get_mut(j)) {
+                    Some(u) => {
+                        *u = true;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if ok {
+                line.extend_from_slice(b"USING INDEX ");
+                line.extend_from_slice(handle_bytes(self.ca, ix.name));
+                line.extend_from_slice(b" FOR IN-OPERATOR");
+                return Some(line);
+            }
+        }
+        None
+    }
+
     /// A WITHOUT ROWID table's clustered PRIMARY KEY index.
     #[cfg(feature = "expr_index")]
     fn pk_of(&self, t: &TableDef) -> Option<&'a crate::schema::IndexDef> {
@@ -1672,6 +1859,16 @@ impl<'a> Walk<'a> {
             }
             self.seen.push(p.id);
             let n = self.shown(last_sel(p));
+            // The IN operator reading a table's own rowids or index in
+            // place of the subquery's values (the pin's
+            // `sqlite3FindInIndex`; v0.17 review fix, `multi_index`).
+            #[cfg(feature = "multi_index")]
+            if let RExpr::InSub(x, ..) = e
+                && let Some(line) = self.in_index(x, p)
+            {
+                self.add(parent, &[line.as_slice()]);
+                continue;
+            }
             let mut d = AVec::new();
             if !p.uncorrelated {
                 d.extend_from_slice(b"CORRELATED ");
@@ -1688,8 +1885,15 @@ impl<'a> Walk<'a> {
             self.probing = probing;
             // The IN operator's Bloom filter over an uncorrelated
             // subquery's values, unless an index loop probes with
-            // them (v0.17 fix; a compound's are not shown).
-            if list && p.uncorrelated && !probing && p.compound.is_empty() {
+            // them (v0.17 fix; a compound's are not shown), or the
+            // comparison is not BINARY (v0.17 review fix).
+            if list
+                && p.uncorrelated
+                && !probing
+                && p.compound.is_empty()
+                && let RExpr::InSub(x, ..) = e
+                && in_binary(x, p)
+            {
                 self.add(id, &[b"CREATE BLOOM FILTER"]);
             }
         }

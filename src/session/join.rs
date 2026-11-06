@@ -1395,10 +1395,13 @@ impl<S: Storage> Connection<S> {
                 #[cfg(feature = "multi_index")]
                 let ok = ok
                     && (!crate::xmulti::or_in_term(t, conj.as_slice())
-                        || conj
-                            .as_slice()
-                            .get(t.parent)
-                            .is_some_and(|c| crate::xmulti::in_kept(t, c, srcs_s.as_slice())));
+                        || conj.as_slice().get(t.parent).is_some_and(|c| {
+                            crate::xmulti::in_kept(t, c, srcs_s.as_slice(), &|j, e| {
+                                models.as_slice().get(j).is_some_and(|(_, ms)| {
+                                    crate::xmulti::expr_indexed(ms.as_slice(), e)
+                                })
+                            })
+                        }));
                 if ok {
                     ts.push(t.clone());
                 }
@@ -1444,6 +1447,11 @@ impl<S: Storage> Connection<S> {
                     &avail,
                     &|e: &RExpr| src_mask(e, bands.as_slice()),
                     &|t: &Term| term_mask(t, bands.as_slice()),
+                    &|e: &RExpr| {
+                        models
+                            .iter()
+                            .any(|(_, ms)| crate::xmulti::expr_indexed(ms.as_slice(), e))
+                    },
                 )
             };
             let mut used: AVec<bool> = AVec::new();
@@ -2099,7 +2107,63 @@ fn vt_masks(
 #[derive(Default)]
 pub(super) struct StatState {
     tabs: AVec<(AVec<u8>, i32, bool)>,
-    idxs: AVec<(AVec<u8>, AVec<i32>, bool)>,
+    idxs: AVec<(AVec<u8>, AVec<i32>, bool, IdxOpts)>,
+}
+
+/// The keywords an index's `sqlite_stat1` text may end with (the
+/// pin's `decodeIntArray`; v0.17 review fix): `unordered`, `sz=N`
+/// (`szIdxRow`, LogEst) and `noskipscan`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct IdxOpts {
+    pub(super) unordered: bool,
+    pub(super) noskip: bool,
+    pub(super) sz: Option<i32>,
+}
+
+/// `decodeIntArray`'s keyword loop over the text after the integers
+/// it read into `n` slots: each space-separated token tested as a
+/// glob (`unordered*`, `sz=[0-9]*`, `noskipscan*`).
+fn decode_opts(stat: &[u8], n: usize) -> IdxOpts {
+    let mut z = stat;
+    for _ in 0..n {
+        if z.is_empty() {
+            break;
+        }
+        while z.first().is_some_and(|c| c.is_ascii_digit()) {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+        if z.first() == Some(&b' ') {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+    }
+    let mut o = IdxOpts::default();
+    while !z.is_empty() {
+        if z.starts_with(b"unordered") {
+            o.unordered = true;
+        } else if let Some(d) = z.strip_prefix(b"sz=")
+            && d.first().is_some_and(|c| c.is_ascii_digit())
+        {
+            // (`sqlite3Atoi`: the leading digits, 0 past a 32-bit
+            // int; at least 2.)
+            let mut v: u64 = 0;
+            for c in d.iter().take_while(|c| c.is_ascii_digit()) {
+                v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+            }
+            if v > i32::MAX as u64 {
+                v = 0;
+            }
+            o.sz = Some(crate::xplan::log_est(v.max(2)));
+        } else if z.starts_with(b"noskipscan") {
+            o.noskip = true;
+        }
+        while z.first().is_some_and(|c| *c != b' ') {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+        while z.first() == Some(&b' ') {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+    }
+    o
 }
 
 /// `decodeIntArray` into `out` (LogEst): up to `out.len()` integers
@@ -2192,7 +2256,7 @@ impl<S: Storage> Connection<S> {
                 for _ in 0..=i.columns.len() {
                     a.push(0);
                 }
-                st.idxs.push((copy_vec(n), a, false));
+                st.idxs.push((copy_vec(n), a, false, IdxOpts::default()));
                 default_row_est(st, ca, i);
             }
         }
@@ -2209,6 +2273,7 @@ impl<S: Storage> Connection<S> {
         }
         for i in self.stat.idxs.as_mut_slice() {
             i.2 = false;
+            i.3 = IdxOpts::default();
         }
         if let Some(root) = root {
             // (`sqlite3_exec`'s text of each value.)
@@ -2248,7 +2313,7 @@ impl<S: Storage> Connection<S> {
                 .stat
                 .idxs
                 .iter()
-                .any(|(x, _, has)| !*has && eq_ci(x.as_slice(), n))
+                .any(|(x, _, has, _)| !*has && eq_ci(x.as_slice(), n))
             {
                 default_row_est(&mut self.stat, ca, i);
             }
@@ -2302,6 +2367,7 @@ impl<S: Storage> Connection<S> {
                     return;
                 };
                 decode_ints(stat, e.1.as_mut_slice());
+                e.3 = decode_opts(stat, e.1.len());
                 e.2 = true;
                 let first = e.1.as_slice().first().copied();
                 if !i.partial()
@@ -2348,8 +2414,19 @@ impl<S: Storage> Connection<S> {
         self.stat
             .idxs
             .iter()
-            .find(|(x, _, has)| *has && eq_ci(x.as_slice(), n))
+            .find(|(x, _, has, _)| *has && eq_ci(x.as_slice(), n))
             .map(|e| e.1.clone())
+    }
+
+    /// Index `ix`'s `sqlite_stat1` keywords (`IdxOpts`).
+    #[cfg(feature = "multi_index")]
+    pub(super) fn index_opts(&self, ix: &crate::schema::IndexDef) -> IdxOpts {
+        let n = handle_bytes(&self.catalog_arena, ix.name);
+        self.stat
+            .idxs
+            .iter()
+            .find(|(x, ..)| eq_ci(x.as_slice(), n))
+            .map_or(IdxOpts::default(), |e| e.3)
     }
 
     /// Index `ix`'s `aiRowLogEst` (`IdxModel::est`).
