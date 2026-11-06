@@ -1534,6 +1534,8 @@ impl<S: Storage> Connection<S> {
             temp: true,
             #[cfg(feature = "attach")]
             ext: 0,
+            #[cfg(feature = "flatten")]
+            exists: false,
         });
         Ok(t.columns.len())
     }

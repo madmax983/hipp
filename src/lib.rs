@@ -59,6 +59,8 @@ pub mod window;
 pub mod wr;
 #[cfg(feature = "join_order")]
 pub mod xjoin;
+#[cfg(feature = "multi_index")]
+pub mod xmulti;
 #[cfg(feature = "expr_index")]
 pub mod xplan;
 

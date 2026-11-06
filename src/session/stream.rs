@@ -94,6 +94,10 @@ struct Level {
     /// A lookup loop's Bloom filter (`bloom`) is built.
     #[cfg(feature = "join_order")]
     bloom_built: bool,
+    /// A semi-join source's loop made a joined row (v0.17,
+    /// `flatten`): it ends at its next row.
+    #[cfg(feature = "flatten")]
+    done: bool,
 }
 
 /// What the stream does with each joined row.
@@ -350,6 +354,8 @@ impl<S: Storage> Statement<'_, S> {
                 bloom: AVec::new(),
                 #[cfg(feature = "join_order")]
                 bloom_built: false,
+                #[cfg(feature = "flatten")]
+                done: false,
             });
         }
         #[cfg(feature = "json")]
@@ -526,6 +532,14 @@ impl<S: Storage> Statement<'_, S> {
                     }
                 };
                 if ok {
+                    // Every semi-join loop has its row (v0.17,
+                    // `flatten`).
+                    #[cfg(feature = "flatten")]
+                    for (lv, sp) in s.levels.as_mut_slice().iter_mut().zip(s.qp.sources.iter()) {
+                        if sp.exists {
+                            lv.done = true;
+                        }
+                    }
                     return Ok(true);
                 }
                 self.side_drop(s.row_side, s.pinned);
@@ -578,6 +592,8 @@ impl<S: Storage> Statement<'_, S> {
             let Some(sp) = s.qp.sources.as_slice().get(d) else {
                 return Ok(false);
             };
+            #[cfg(feature = "flatten")]
+            let got = got && !s.levels.as_slice().get(d).is_some_and(|l| l.done);
             if got {
                 let on_ok = match &sp.on {
                     None => true,
@@ -677,6 +693,10 @@ impl<S: Storage> Statement<'_, S> {
         lv.any = false;
         lv.padded = false;
         lv.count = 0;
+        #[cfg(feature = "flatten")]
+        {
+            lv.done = false;
+        }
         lv.side = side;
         let need = if d == 0 { s.need0 } else { None };
         // The row a source's arguments or probes evaluate on: the

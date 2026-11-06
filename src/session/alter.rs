@@ -687,6 +687,8 @@ impl<S: Storage> Connection<S> {
                         schema: None,
                         cte: None,
                         indexed: None,
+                        #[cfg(feature = "flatten")]
+                        flat: false,
                     });
                     probe.filter = None;
                     probe.group_by = AVec::new();

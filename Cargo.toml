@@ -15,7 +15,7 @@ default = ["std", "xl"]
 # `max`'s 1 MiB budget (ADR 0003 closed it to leaves that do not
 # fit). Std builds (the CLI, the differential tests) use it; CI
 # ratchets its size separately (budget 1.25 MiB).
-xl = ["max", "fts5_delete", "join_order"]
+xl = ["max", "fts5_delete", "join_order", "multi_index", "flatten"]
 # Everything (ADR 0002): `full` plus the heavyweight v0.16 leaves
 # (window functions, triggers, foreign keys, JSON, ...) that do not
 # fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
@@ -416,6 +416,38 @@ fts5_delete = ["fts5"]
 # FROM order, each source with its own best loop. Builds on the
 # `expr_index` access planner, so it implies `v16` and `expr_index`.
 join_order = ["v16", "expr_index"]
+# v0.17 leaf (ADR 0001 / 0004: past `max`'s budget, in `xl`): the
+# pin's other index strategies (`src/xplan.rs`, `src/xjoin.rs`) --
+# the MULTI-INDEX OR plan (whereLoopAddOr: each OR branch read
+# through its own index, rows in the pin's branch order, each row
+# once), for one table and as a join loop; the min() / max()
+# optimisation (a lone min(x) / max(x) read in x's order, stopping
+# at the first row, `SEARCH t` in EXPLAIN QUERY PLAN); skip-scans
+# of an index's leading column when sqlite_stat1 justifies them
+# (`ANY(a) AND b=?`); the IN operator's statistics rules
+# (whereLoopAddBtreeIndex: an IN the index should not probe); and
+# whereLoopInsert / whereLoopAdjustCost for single-table loops.
+# Without it a table's OR terms filter a scan and min() / max() read
+# the whole table, as in 0.16. Builds on the join planner, so it
+# implies `join_order`.
+multi_index = ["join_order"]
+# v0.17 leaf (ADR 0001 / 0004: past `max`'s budget, in `xl`): the
+# pin's query flattener and its neighbours (`session::flatten`) --
+# sqlite3FlattenSubquery's merge of a FROM subquery, view or CTE into
+# its reader (its numbered restrictions, the LEFT JOIN's null-row
+# guard, the subquery's LIMIT / ORDER BY moving out), so the merged
+# tables join the join planner's order as ordinary FROM sources;
+# pushDownWhereTerms' copy of a WHERE term into a subquery that is
+# not flattened (into its HAVING when it aggregates, as the pin's
+# havingToWhere moves it on); the omission of a co-routine's or
+# materialisation's result columns its reader never reads (so an
+# error in one is never raised, as on the pin); the EXISTS-to-join
+# rewrite (existsToJoin: `SEARCH t EXISTS`, a semi-join loop); and
+# EXPLAIN QUERY PLAN's foreign-key child scans of a parent DELETE /
+# UPDATE. Without it subqueries, views and CTEs run as co-routines
+# or materialisations in FROM order, as in 0.16. Builds on the join
+# planner, so it implies `join_order`.
+flatten = ["join_order"]
 
 # v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): EXPLAIN QUERY
 # PLAN -- `EXPLAIN QUERY PLAN <statement>` returns the pin's four

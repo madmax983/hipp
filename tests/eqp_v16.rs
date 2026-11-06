@@ -408,28 +408,6 @@ fn writes_match_pin() {
 fn documented_differences() {
     let path = db("eqp-diff", SCHEMA);
     let cases: &[(&str, &str)] = &[
-        // No MULTI-INDEX OR: the table is scanned.
-        ("SELECT * FROM t WHERE b = 1 OR c = 2", "`--SCAN t\n"),
-        // No min() / max() lookup: the index is read through.
-        (
-            "SELECT max(b) FROM t",
-            "`--SCAN t USING COVERING INDEX tb\n",
-        ),
-        // FROM subqueries, views and CTEs are not flattened.
-        (
-            "SELECT * FROM vu",
-            "|--CO-ROUTINE vu\n|  `--SCAN u\n`--SCAN vu\n",
-        ),
-        // EXISTS stays a subquery.
-        (
-            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE y > 3)",
-            "|--SCAN t\n`--SCALAR SUBQUERY 1\n   `--SCAN u\n",
-        ),
-        // An IN subquery is a list, not an index probe.
-        (
-            "SELECT * FROM t WHERE b IN (SELECT x FROM u)",
-            "|--SEARCH t USING INDEX tb (b=?)\n`--LIST SUBQUERY 1\n   `--SCAN u USING COVERING INDEX ux\n",
-        ),
         // RIGHT / FULL joins read whole tables.
         (
             "SELECT * FROM u RIGHT JOIN t ON u.x=t.b",
@@ -444,12 +422,21 @@ fn documented_differences() {
         ),
     ];
     // (v0.17, `join_order`: join reordering and automatic indexes now
-    // print the pin's plans.)
+    // print the pin's plans; `multi_index`: the MULTI-INDEX OR and the
+    // min() / max() lookup too; `flatten`: flattened views and
+    // EXISTS-to-join.)
     same_plans(
         &path,
         &[
+            "SELECT * FROM vu",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE y > 3)",
             "SELECT * FROM t, u WHERE t.a = u.x",
             "SELECT * FROM t LEFT JOIN u ON t.b=u.y",
+            "SELECT * FROM t WHERE b = 1 OR c = 2",
+            "SELECT max(b) FROM t",
+            // (v0.17 review: the IN operator reads a UNIQUE index in
+            // place of the subquery's list.)
+            "SELECT * FROM t WHERE b IN (SELECT x FROM u)",
         ],
     );
     for (q, want) in cases {
@@ -629,6 +616,29 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
 fn gen_term(r: &mut Rng, t: &Tab) -> String {
     let c = t.cols[r.n(t.cols.len() as u64) as usize].clone();
     let v = r.n(20);
+    // (v0.17, `multi_index`: OR terms, for the MULTI-INDEX OR, and IN
+    // subqueries.)
+    // (v0.17 review: a COLLATE inside an OR, the one-value IN, the IN
+    // operator's own index and its Bloom filter's collation.)
+    match r.n(16) {
+        8 | 9 => {
+            let d = t.cols[r.n(t.cols.len() as u64) as usize].clone();
+            return format!(
+                "({c} = {v} OR {d} {} {})",
+                r.pick(&["=", ">", "<"]),
+                r.n(20)
+            );
+        }
+        10 => return format!("{c} IN (SELECT c1 FROM t1 WHERE c0 > {v})"),
+        11 => {
+            let d = t.cols[r.n(t.cols.len() as u64) as usize].clone();
+            return format!("({c} = {v} OR {d} = 'x' COLLATE NOCASE)");
+        }
+        12 => return format!("({c} = {v} OR {c} IN ({}))", r.n(20)),
+        13 => return format!("{c} IN (SELECT c1 FROM t1)"),
+        14 => return format!("{c} COLLATE NOCASE IN (SELECT c1 FROM t1 WHERE c0 > {v})"),
+        _ => {}
+    }
     match r.n(8) {
         0 => format!("{c} = {v}"),
         1 => format!("{c} > {v}"),
@@ -645,6 +655,21 @@ fn gen_term(r: &mut Rng, t: &Tab) -> String {
 fn gen_single(r: &mut Rng, t: &Tab, one_col: bool) -> String {
     let col = |r: &mut Rng| t.cols[r.n(t.cols.len() as u64) as usize].clone();
     let k = r.n(6);
+    // (v0.17, `multi_index`: min() / max(), with a bare column.)
+    if !one_col && r.n(8) == 0 {
+        let f = r.pick(&["min", "max"]);
+        let a = col(r);
+        let bare = if r.n(2) == 0 {
+            format!(", {}", col(r))
+        } else {
+            String::new()
+        };
+        let mut q = format!("SELECT {f}({a}){bare} FROM {}", t.name);
+        if r.n(2) == 0 {
+            q += &format!(" WHERE {}", gen_term(r, t));
+        }
+        return q;
+    }
     let res = if one_col {
         col(r)
     } else if k == 0 {
@@ -725,10 +750,56 @@ fn gen_query(r: &mut Rng, tabs: &[Tab]) -> String {
     }
 }
 
+/// One query of the subquery corpus (v0.17 flatten review): views'
+/// and CTEs' bodies and FROM subqueries — flattened, or kept by a
+/// LIMIT — EXISTS subqueries the pin makes a join, a compound FROM
+/// subquery, an IN over a FROM subquery.
+fn gen_sub_query(r: &mut Rng, tabs: &[Tab]) -> String {
+    let (t0, t1) = (&tabs[0], &tabs[1]);
+    let t = if r.n(2) == 0 { t0 } else { t1 };
+    let c = t.cols[r.n(t.cols.len() as u64) as usize].clone();
+    let w = gen_term(r, t);
+    match r.n(7) {
+        0 => format!("SELECT {c} FROM (SELECT * FROM {} WHERE {w})", t.name),
+        1 => {
+            let w2 = gen_term(r, t);
+            format!(
+                "WITH s AS (SELECT * FROM {}) SELECT * FROM s WHERE {w} AND {w2}",
+                t.name
+            )
+        }
+        2 => {
+            let c0 = &t0.cols[r.n(t0.cols.len() as u64) as usize];
+            let c1 = &t1.cols[r.n(t1.cols.len() as u64) as usize];
+            format!("SELECT * FROM t0 WHERE EXISTS (SELECT 1 FROM t1 WHERE t1.{c1} = t0.{c0})")
+        }
+        3 => format!(
+            "SELECT {c} FROM (SELECT * FROM {} WHERE {w} LIMIT {}) ORDER BY 1",
+            t.name,
+            1 + r.n(5)
+        ),
+        4 => format!(
+            "SELECT * FROM (SELECT c0 FROM t0 UNION ALL SELECT c0 FROM t1 LIMIT {}) WHERE c0 > {}",
+            2 + r.n(5),
+            r.n(10)
+        ),
+        5 => format!(
+            "SELECT {c} FROM {} WHERE {c} IN (SELECT c1 FROM (SELECT * FROM t1 WHERE c0 > {}))",
+            t.name,
+            r.n(20)
+        ),
+        _ => format!(
+            "SELECT {c} FROM (SELECT * FROM {}) x WHERE EXISTS (SELECT 1 FROM t1 WHERE t1.c0 = x.{c}) AND {w}",
+            t.name
+        ),
+    }
+}
+
 /// A generated corpus: random schemas (rowid and INTEGER PRIMARY KEY
 /// tables; UNIQUE and DESC indexes) and queries (equality, range, IN, BETWEEN terms; ORDER
 /// BY, GROUP BY, DISTINCT, LIMIT; compounds; correlated and
-/// uncorrelated subqueries). `HIPP_EQP_SEEDS` runs more.
+/// uncorrelated subqueries; v0.17: OR terms, IN subqueries, min() /
+/// max()). `HIPP_EQP_SEEDS` runs more.
 #[test]
 fn generated_plans_match_pin() {
     let seeds: u64 = std::env::var("HIPP_EQP_SEEDS")
@@ -753,9 +824,51 @@ fn generated_plans_match_pin() {
         }
     }
     // hipp's cost model departs from the pin's in a few loop choices
-    // (STATUS.md, "honest gaps"): at most 1 in 100 may differ.
+    // (STATUS.md, "honest gaps"): at most 1 in 400 may differ (v0.17,
+    // `multi_index`: 15 of 4,800 at 400 seeds, OR terms, IN subqueries
+    // and min() / max() in the corpus; it was 1 in 100; v0.17 review:
+    // 12 of 4,800 with COLLATE inside an OR, one-value IN lists and the
+    // IN operator's own index and Bloom filter added, it was 1 in 200).
     assert!(
-        bad.len() * 100 <= n,
+        bad.len() * 400 <= n,
+        "{} of {n} plans differ:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+    if !bad.is_empty() {
+        eprintln!("{} of {n} plans differ:\n{}", bad.len(), bad.join("\n"));
+    }
+}
+
+/// The subquery corpus (v0.17 flatten review; `gen_sub_query`) over
+/// the same random schemas: hipp's plans against the pin's.
+/// `HIPP_EQP_SEEDS` runs more.
+#[test]
+fn generated_subquery_plans_match_pin() {
+    let seeds: u64 = std::env::var("HIPP_EQP_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let mut bad = Vec::new();
+    let mut n = 0;
+    for seed in 1..=seeds {
+        let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 3);
+        let (schema, tabs) = gen_schema(&mut r);
+        let path = db(&format!("eqp-sub{seed}"), &schema);
+        for _ in 0..8 {
+            let q = gen_sub_query(&mut r, &tabs);
+            n += 1;
+            let (h, p) = (hipp_eqp(&path, &q), pin_eqp(&path, &q));
+            if h != p && !(h.is_err() && p.is_err()) {
+                bad.push(format!(
+                    "seed {seed}: {q}\n{schema}  pin : {p:?}\n  hipp: {h:?}"
+                ));
+            }
+        }
+    }
+    // (Measured: none of 3,200 at 400 seeds.)
+    assert!(
+        bad.is_empty(),
         "{} of {n} plans differ:\n{}",
         bad.len(),
         bad.join("\n")
