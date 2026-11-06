@@ -81,16 +81,67 @@ below.
   an index loop delivers, outside `explain` too, so a lone source
   whose loop delivers the ORDER BY streams.
 - A streamed statement's JSON documents and full-text rows (the
-  `Env` side tables its rows point into) are kept until its last
-  row; a statement reset part-way drops them, and one dropped
-  part-way leaves them to the next top-level statement's first step
+  `Env` side tables its rows point into) go as soon as nothing reads
+  them: what a loop added when it ends (an inner lateral json_each's
+  documents, an inner fts5 filter's rows), what a row's WHERE and
+  result columns added once the row is dealt with; a cached source's
+  rows and a kept row (an aggregate's bare-column row, a buffered
+  GROUP BY row) pin theirs until the statement ends. A statement
+  reset part-way drops them, and one dropped part-way leaves them to
+  the next top-level statement's first step
   (`Connection::stream_left`).
+- **Review fixes** (2026-11-05):
+  - An ORDER BY term that is a result column (an alias or ordinal,
+    or the same expression, under COLLATE too) sorts on the value
+    the column returned, as the pin's `iOrderByCol`: `SELECT
+    random() AS r FROM t ORDER BY r` came out unsorted (the key was
+    a second evaluation), with or without LIMIT, in every executor
+    (ungated, `v04`).
+  - An aggregate query without GROUP BY drops its ORDER BY, as the
+    pin (`sSort.pOrderBy = 0`): only the aggregates in its terms
+    still accumulate, so `SELECT count(*) FROM t ORDER BY json('x')`
+    answers instead of failing (ungated, `v04`); a window query
+    keeps it, as on the pin. Such a query now folds in constant
+    memory.
+  - Recursive CTEs stream: a query reading one (first or inner
+    source, a view over one, MATERIALIZED) returns the rows before a
+    failing one; an endless one read through a WHERE or a join under
+    a LIMIT is computed under a bound that doubles as the join reads
+    it (`Stream::grow`, the materialising executor's growing bound).
+  - A streamed join's memory no longer grows with its outer rows
+    (the side tables above; 1.2M outer rows over a lateral json_each
+    held 143 MB), and an inner fts5 / fts5vocab / dbstat source that
+    reads nothing to its left is computed once per statement, not
+    per outer row (it was ~12x slower than before the unit).
+  - hipp-cli: a stdin script with a failed statement or dot-command
+    exits 1 (at its end, or at `.exit`), and the statements after
+    the failing one in the same input chunk are skipped, as the
+    pin's shell does.
 
 **Oracle-probing notes** (verified on the 3.54.1 pin):
 
 - The pin's shell prints the rows a statement returned before its
   error, then the error; one-shot and `-bail` stop there, stdin
-  scripts go on (exit status 1 either way).
+  scripts go on with the next input chunk (the rest of the failing
+  chunk — its line, or the lines of an unfinished statement — is
+  skipped) and exit 1 at the end or at `.exit`.
+- An ORDER BY term naming a result column (alias — the first match,
+  under COLLATE too —, ordinal, or `sqlite3ExprCompare`-equal
+  expression, the last match) sorts on the returned value: `ORDER BY
+  r` over `random() AS r` is sorted, `ORDER BY +r` and `ORDER BY
+  random() COLLATE nocase` are not. A flattened subquery evaluates
+  its random() column again (`SELECT r FROM (SELECT random() r ...
+  ORDER BY r)` is not sorted on the pin).
+- An aggregate without GROUP BY ignores its ORDER BY (HAVING or
+  not, LIMIT or not); the aggregates in it still run
+  (`ORDER BY sum(abs(...))` overflows), the rest of the term not
+  (`ORDER BY sum(a) + json('x')` answers). With a window function
+  the ORDER BY stays.
+- A view's or subquery's result columns the outer query never reads
+  are not computed (`SELECT a FROM v` answers where `v.b` would
+  overflow) unless the subquery is DISTINCT, aggregate, windowed,
+  MATERIALIZED or a compound other than UNION ALL, or its ORDER BY
+  names the column.
 - Streams: plain scans, joins (inner, LEFT, virtual tables and
   json_each either side), DISTINCT (each new row at once), ORDER BY
   the rowid or an index delivers (`ORDER BY a DESC` on an INTEGER
@@ -123,7 +174,14 @@ transactions with a statement failing part-way, reset / drop /
 re-step part-way, a generated corpus of 160 joins mixing tables and
 modules with error injection, LEFT JOIN, LIMIT and OFFSET);
 `hipp-cli/tests/cli_v17_stream.rs` (byte-identical stdout over stdin
-and one-shot, errors included). `tests/vtab_v16.rs`'s
+and one-shot, errors included; the exit status and the skipped rest
+of a failing input chunk). Review regressions in `stream_v17.rs`:
+ORDER BY a random() result column (alias, ordinal, the same
+expression, LIMIT, DISTINCT, GROUP BY, a subquery's, CREATE TABLE
+... AS), one-row aggregates dropping their ORDER BY, recursive CTEs
+(bounded, endless under LIMIT, inner, through a WHERE / join with
+the growing bound, a view, MATERIALIZED), and the side tables of a
+streamed json_each / fts5 join bounded by the counting allocator. `tests/vtab_v16.rs`'s
 `series_row_bound` now expects the pin's answer for a streamed
 `count(*)` past the bound, and the bound for DISTINCT / ORDER BY.
 
@@ -138,13 +196,27 @@ info (the stream's futures are boxed off the step future, so
 full 500,952 → 505,416 (+4,464: the streamed executor, partly paid
 for by retiring the synchronous executor under `v16`); max 1,035,516
 → 1,043,340 (+7,824: the above plus the cursor plumbing of `vtab` /
-`rtree`); xl 1,035,516 → 1,043,292 (+7,776; no leaf of its own yet —
-its ratchet is set to max's 1,043,340, as `xl` contains `max`). Part B
-(plain scans and joins) is an ungated fix of the `v16` executor: tiny
-does not contain it, and full stays under its 512 KiB budget.
+`rtree`); xl 1,035,516 → 1,043,292 (+7,776; no leaf of its own yet).
+Part B (plain scans and joins) is an ungated fix of the `v16`
+executor: tiny does not contain it, and full stays under its 512 KiB
+budget. Review fixes (measured on top of the FTS5 delete unit): tiny
+76,960 (0: ORDER BY and aggregates are `v04`); full 505,416 → 506,432
+(+1,016); max 1,044,172 → 1,045,676 (+1,504; 2,900 B of headroom
+left); xl 1,053,532 → 1,055,028 (+1,496). Each ratchet is its
+measured figure (the xl ratchet had been left 48 B above its
+measurement).
 
 **Honest gaps:**
 
+- A view's or derived table's result columns that the outer query
+  never reads are still computed (pre-existing; the pin omits them —
+  see the probing notes): `CREATE VIEW v AS SELECT a, abs(a - 2 -
+  9223372036854775807) AS b FROM t; SELECT a FROM v` fails with
+  IntegerOverflow where the pin answers. Doing it safely needs the
+  pin's column-usage rule over every expression a plan holds (index
+  probes, virtual-table constraints and OR branches, lateral
+  arguments as well as the clauses), which is larger than `max`'s
+  remaining 2.9 KB; left for a query-flattening unit.
 - Only a top-level SELECT streams. A scalar / IN / EXISTS subquery,
   a derived table's own rows, a compound (UNION ALL members stream on
   the pin), a RIGHT / FULL join, window queries, trigger-program
@@ -158,7 +230,18 @@ does not contain it, and full stays under its 512 KiB budget.
   generate_series and the R*Tree search are incremental. So a
   module-side error part-way (a corrupt page or node) fails before
   the first row, and a LIMIT bounds only what a lone first source
-  computes (`derived_need`, as before).
+  computes (`derived_need`, as before). On an inner side such a
+  module, when it reads nothing to its left, is computed once per
+  statement (the pin filters it again per outer row: the same rows).
+- An endless recursive CTE read through a WHERE or a join under a
+  LIMIT is computed again under each doubled bound; a
+  non-deterministic CTE (random()) can then differ between the rows
+  already returned and the rest. Without a LIMIT such a query does
+  not end (as before; the pin streams it until interrupted).
+- The ORDER BY / result-column match is structural (`same_expr`):
+  an alias of a CASE or subquery column is evaluated again for its
+  key, and of two equal non-deterministic columns the last is the
+  key (the pin: the alias's own).
 - An inner plain table is read once, at its first reach, and kept
   (as before); the pin reads it again per outer row.
 - An ORDER BY delivered by a multi-source join's outer loop, or by

@@ -12,18 +12,28 @@
 //!   filter re-evaluated with the outer row's values, as the pin's
 //!   xFilter — and a source whose rows hipp computes as a whole (a
 //!   derived table, a TEMP table, an index lookup, a JSON
-//!   table-valued function) is computed the first time the join
-//!   reaches it. Rows come in `join_sources`' order; LEFT JOIN pads,
-//!   the WHERE clause's constant terms first and the lateral
-//!   pre-checks (`lateral_ok`) as there. RIGHT / FULL joins, window
-//!   functions, compounds and plans whose first source is a bounded
-//!   recursive CTE keep the materialising executor.
+//!   table-valued function, a recursive CTE, an inner dbstat / fts5
+//!   source reading nothing to its left) is computed the first time
+//!   the join reaches it — an endless recursive CTE read first
+//!   through a WHERE or a join under a LIMIT under a bound that
+//!   doubles as the join reads it (`Stream::grow`). Rows come in
+//!   `join_sources`' order; LEFT JOIN pads, the WHERE clause's
+//!   constant terms first and the lateral pre-checks (`lateral_ok`)
+//!   as there. RIGHT / FULL joins, window functions and compounds
+//!   keep the materialising executor.
+//! - **Side tables.** The JSON documents and full-text rows a row's
+//!   values point into (`Env::json_docs`, `Env::fts_rows`) go when
+//!   the loop that added them ends, or once the row is dealt with,
+//!   unless a cached source or a kept row reads them
+//!   (`Stream::pinned`): a streamed join's memory does not grow with
+//!   its outer rows.
 //! - **What follows the join.** A plain plan projects each row as
 //!   the join makes it (OFFSET rows are skipped unprojected, LIMIT
 //!   stops the join); DISTINCT keeps the rows seen so far and emits
 //!   each new one; an aggregate without GROUP BY whose aggregates
-//!   are count / sum / total / avg / min / max (no DISTINCT, ORDER BY
-//!   or subquery) folds row by row in constant memory; the blocking
+//!   are count / sum / total / avg / min / max (no DISTINCT or
+//!   subquery; the planner drops such a query's ORDER BY, as the pin)
+//!   folds row by row in constant memory; the blocking
 //!   operators — ORDER BY (except a table's own rowid order), GROUP
 //!   BY, the other aggregates — buffer what they need, as the pin's
 //!   sorters do, and finish through the materialising executor's
@@ -65,6 +75,9 @@ struct Level {
     padded: bool,
     /// Rows its cursor gave since it opened.
     count: usize,
+    /// The side tables' lengths when it opened (`side_len`): what
+    /// its loop added goes when it ends (`side_drop`).
+    side: (usize, usize),
     /// The values a lateral table-valued function's call cleared
     /// (`SourcePlan::tvf_dead`), put back when its loop ends.
     #[cfg(any(feature = "json", feature = "vtab"))]
@@ -116,6 +129,8 @@ pub(super) struct Stream {
     levels: AVec<Level>,
     /// Where each source's values start in the joined row.
     bases: AVec<usize>,
+    /// The result column each ORDER BY term is (`order_cols`).
+    cols: AVec<Option<usize>>,
     /// The source whose loop runs next (`levels.len()`: the row is
     /// complete).
     depth: usize,
@@ -129,6 +144,12 @@ pub(super) struct Stream {
     window: (usize, usize),
     /// The bound on the first source's rows (`derived_need`).
     need0: Option<usize>,
+    /// The first source's growing bound (0: none; `need0` then
+    /// holds it): when the join has read all of the rows computed
+    /// under it and there were that many, they are computed again
+    /// under twice the bound and the join goes on after the rows it
+    /// read.
+    grow: usize,
     /// The plan holds a subquery (the async evaluators run).
     sub: bool,
     /// The mode keeps every row it is given (DISTINCT, GROUP BY, an
@@ -141,6 +162,13 @@ pub(super) struct Stream {
     /// opened (`Statement::step` drops later ones at its end).
     #[cfg_attr(not(any(feature = "json", feature = "fts5")), allow(dead_code))]
     pub(super) marks: (usize, usize),
+    /// The side tables' lengths below which entries stay until the
+    /// stream ends: what a cached source's rows or a kept row (an
+    /// aggregate's bare-column row, a buffered row) may point into.
+    pinned: (usize, usize),
+    /// The side tables' lengths when the current row was complete:
+    /// what its WHERE and result columns added goes after it.
+    row_side: (usize, usize),
 }
 
 /// Whether `p` folds row by row (`Acc`).
@@ -195,14 +223,7 @@ impl<S: Storage> Statement<'_, S> {
         if qp.sources.is_empty()
             || !qp.compound.is_empty()
             || !qp.values.is_empty()
-            || qp.sources.iter().any(|s| {
-                let derived = s.derived.is_some();
-                #[cfg(any(feature = "json", feature = "vtab"))]
-                let derived = derived && s.tvf == 0;
-                s.kind.pads_left()
-                    || s.rec != 0
-                    || (derived && s.derived.as_deref().is_some_and(|d| d.rec.is_some()))
-            })
+            || qp.sources.iter().any(|s| s.kind.pads_left() || s.rec != 0)
         {
             return Ok(None);
         }
@@ -213,21 +234,30 @@ impl<S: Storage> Statement<'_, S> {
         let qp = qp.clone();
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
         // An endless recursive CTE read first through a WHERE or a
-        // join: the materialising executor's growing bound.
-        if streams_first(
+        // join under a LIMIT: its rows are computed under a bound
+        // that doubles whenever the join has read them all
+        // (`Stream::grow`; the materialising executor's growing
+        // bound, the pin's co-routine stopped at the LIMIT).
+        let grow = if streams_first(
             qp.sources.as_slice(),
             qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct,
         ) && (qp.filter.is_some() || qp.sources.len() > 1)
             && window.1 != usize::MAX
         {
-            return Ok(None);
-        }
-        let need0 = derived_need(
-            qp.sources.as_slice(),
-            qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
-            !qp.order_by.is_empty() || qp.distinct,
-            window,
-        );
+            window.0.saturating_add(window.1).max(1)
+        } else {
+            0
+        };
+        let need0 = if grow != 0 {
+            Some(grow)
+        } else {
+            derived_need(
+                qp.sources.as_slice(),
+                qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
+                !qp.order_by.is_empty() || qp.distinct,
+                window,
+            )
+        };
         let sub = query_plan_has_sub(&qp);
         let utf8 = self.conn.pager.text_enc() == crate::record::TextEnc::Utf8;
         let mode = if qp.has_agg || !qp.group_by.is_empty() {
@@ -301,6 +331,7 @@ impl<S: Storage> Statement<'_, S> {
                 any: false,
                 padded: false,
                 count: 0,
+                side: (0, 0),
                 #[cfg(any(feature = "json", feature = "vtab"))]
                 saved: AVec::new(),
             });
@@ -328,6 +359,7 @@ impl<S: Storage> Statement<'_, S> {
         };
         self.conn.stream_left = Some((jm, fm));
         Ok(Some(Box::new(Stream {
+            cols: order_cols(qp.order_by.as_slice(), qp.items.as_slice()),
             qp,
             levels,
             bases,
@@ -339,10 +371,13 @@ impl<S: Storage> Statement<'_, S> {
             take: window.1,
             window,
             need0,
+            grow,
             sub,
             capped,
             ended,
             marks: (jm, fm),
+            pinned: (jm, fm),
+            row_side: (jm, fm),
         })))
     }
 
@@ -367,9 +402,11 @@ impl<S: Storage> Statement<'_, S> {
                 Mode::Plain => {
                     if s.skip > 0 {
                         s.skip -= 1;
+                        self.side_drop(s.row_side, s.pinned);
                         continue;
                     }
                     let vals = self.stream_items(s.qp.items.as_slice(), &s.acc).await?;
+                    self.side_drop(s.row_side, s.pinned);
                     self.current = vals;
                     self.current_rowid = rowid;
                     s.take -= 1;
@@ -377,6 +414,7 @@ impl<S: Storage> Statement<'_, S> {
                 }
                 Mode::Distinct(seen) => {
                     let vals = self.stream_items(s.qp.items.as_slice(), &s.acc).await?;
+                    self.side_drop(s.row_side, s.pinned);
                     let colls = crate::query::exprs_colls(s.qp.items.as_slice());
                     if seen.iter().any(|k| {
                         k.len() == vals.len()
@@ -394,14 +432,25 @@ impl<S: Storage> Statement<'_, S> {
                     s.take -= 1;
                     return Ok(true);
                 }
-                Mode::Agg(run) => self.agg_step(run, &s.acc)?,
-                Mode::Buffer(rows) => rows.push(s.acc.clone()),
+                Mode::Agg(run) => {
+                    if self.agg_step(run, &s.acc)? {
+                        s.pinned = self.side_len();
+                    } else {
+                        self.side_drop(s.row_side, s.pinned);
+                    }
+                }
+                Mode::Buffer(rows) => {
+                    rows.push(s.acc.clone());
+                    s.pinned = self.side_len();
+                }
                 Mode::Sort(out) => {
                     let vals = self.stream_items(s.qp.items.as_slice(), &s.acc).await?;
                     let mut keys = AVec::new();
                     for (e, _) in s.qp.order_by.iter() {
                         keys.push(self.eval_row_sub(e, &s.acc).await?);
                     }
+                    shown_keys(keys.as_mut_slice(), s.cols.as_slice(), vals.as_slice());
+                    self.side_drop(s.row_side, s.pinned);
                     out.push(Produced {
                         out: vals,
                         keys,
@@ -452,6 +501,7 @@ impl<S: Storage> Statement<'_, S> {
             if s.depth >= n {
                 // Back to the innermost loop for its next row.
                 s.depth = n.saturating_sub(1);
+                s.row_side = self.side_len();
                 let ok = match &s.qp.filter {
                     None => true,
                     Some(f) if s.sub => self.where_row_sub(f, &s.acc).await?,
@@ -462,12 +512,49 @@ impl<S: Storage> Statement<'_, S> {
                 if ok {
                     return Ok(true);
                 }
+                self.side_drop(s.row_side, s.pinned);
                 continue;
             }
             let d = s.depth;
             let base = s.bases.as_slice().get(d).copied().unwrap_or(0);
+            // A growing first source (`Stream::grow`) the join has
+            // read to the end of: its rows again under twice the
+            // bound, the join going on after those it read.
+            let mut resume = None;
+            if d == 0
+                && s.grow != 0
+                && let Some(lv) = s.levels.as_mut_slice().first_mut()
+                && let (Src::Cached(p), Some(r)) = (&lv.src, &lv.cache)
+                && *p >= r.len()
+                && r.len() >= s.grow
+            {
+                resume = Some(*p);
+                lv.src = Src::Idle;
+                lv.cache = None;
+                s.grow = s.grow.saturating_mul(2);
+                s.need0 = Some(s.grow);
+            }
             if matches!(s.levels.as_slice().get(d).map(|l| &l.src), Some(Src::Idle)) {
+                let cached = s
+                    .levels
+                    .as_slice()
+                    .get(d)
+                    .is_some_and(|l| l.cache.is_some());
                 self.level_open(s, d).await?;
+                // A source's rows computed once stay for the stream.
+                if !cached
+                    && s.levels
+                        .as_slice()
+                        .get(d)
+                        .is_some_and(|l| l.cache.is_some())
+                {
+                    s.pinned = self.side_len();
+                }
+            }
+            if let Some(p) = resume
+                && let Some(lv) = s.levels.as_mut_slice().first_mut()
+            {
+                lv.src = Src::Cached(p);
             }
             s.acc.vals.truncate(base);
             s.acc.rowids.truncate(d);
@@ -510,6 +597,9 @@ impl<S: Storage> Statement<'_, S> {
                 continue;
             }
             lv.src = Src::Idle;
+            // What its loop added (a lateral call's documents, the
+            // full-text rows of an inner filter) goes with it.
+            self.side_drop(lv.side, s.pinned);
             #[cfg(any(feature = "json", feature = "vtab"))]
             for (slot, v) in core::mem::take(&mut lv.saved) {
                 if let Some(x) = s.acc.vals.as_mut_slice().get_mut(slot) {
@@ -524,8 +614,41 @@ impl<S: Storage> Statement<'_, S> {
         }
     }
 
+    /// The lengths of the side tables a row's values point into
+    /// (`Env::json_docs`, `Env::fts_rows`).
+    #[inline(never)]
+    fn side_len(&self) -> (usize, usize) {
+        #[cfg(feature = "json")]
+        let j = self.conn.env.json_docs.try_borrow().map_or(0, |d| d.len());
+        #[cfg(not(feature = "json"))]
+        let j = 0;
+        #[cfg(feature = "fts5")]
+        let f = self.conn.env.fts_rows.try_borrow().map_or(0, |d| d.len());
+        #[cfg(not(feature = "fts5"))]
+        let f = 0;
+        (j, f)
+    }
+
+    /// Drop the side-table entries past `to` (but none below `pin`):
+    /// what a loop that ended, or a row that was dealt with, added
+    /// and nothing kept reads — so a streamed join's memory does not
+    /// grow with its outer rows.
+    #[inline(never)]
+    fn side_drop(&self, to: (usize, usize), pin: (usize, usize)) {
+        #[cfg(feature = "json")]
+        if let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut() {
+            d.truncate(to.0.max(pin.0));
+        }
+        #[cfg(feature = "fts5")]
+        if let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut() {
+            d.truncate(to.1.max(pin.1));
+        }
+        let _ = (to, pin);
+    }
+
     /// Open source `d`'s loop for the combination in `s.acc`.
     async fn level_open(&mut self, s: &mut Stream, d: usize) -> Result<(), S::Error> {
+        let side = self.side_len();
         let Stream {
             qp, levels, acc, ..
         } = s;
@@ -538,6 +661,7 @@ impl<S: Storage> Statement<'_, S> {
         lv.any = false;
         lv.padded = false;
         lv.count = 0;
+        lv.side = side;
         let need = if d == 0 { s.need0 } else { None };
         // The row a source's arguments or probes evaluate on: the
         // sources before it, then NULLs for it and the rest.
@@ -558,7 +682,17 @@ impl<S: Storage> Statement<'_, S> {
             }
             #[cfg(feature = "vtab")]
             if let Some(vt) = sp.vt.as_deref() {
-                lv.src = Src::Vt(self.vtab_open(sp, vt, &padded, need).await?);
+                // A module whose rows are computed at its filter, not
+                // reading the sources to its left: the same rows for
+                // every outer row, computed once.
+                if !lateral && d > 0 && super::vtab::filters_whole(vt) {
+                    if lv.cache.is_none() {
+                        lv.cache = Some(self.vtab_whole(sp, vt, &padded).await?);
+                    }
+                    lv.src = Src::Cached(0);
+                } else {
+                    lv.src = Src::Vt(self.vtab_open(sp, vt, &padded, need).await?);
+                }
             } else if lateral {
                 lv.src = Src::Rows(self.json_tvf_rows(sp, &padded, None).await?, 0);
             } else {
@@ -698,7 +832,8 @@ impl<S: Storage> Statement<'_, S> {
     }
 
     /// Fold the joined row `row` into the aggregates.
-    fn agg_step(&self, run: &mut AggRun, row: &RowData) -> Result<(), S::Error> {
+    /// True when it kept the row (as the bare columns' row).
+    fn agg_step(&self, run: &mut AggRun, row: &RowData) -> Result<bool, S::Error> {
         let env = &self.conn.env;
         let enc = self.conn.pager.text_enc();
         let ctx = Ctx::of(row).with(env);
@@ -750,8 +885,10 @@ impl<S: Storage> Statement<'_, S> {
         }
         // The bare columns' row: the first, or the lone min / max
         // aggregate's extremum row (`pick_rep_from`).
+        let mut kept = false;
         if run.first.is_none() {
             run.first = Some(row.clone());
+            kept = true;
         }
         if let Some((kind, arg, filter, coll)) = &run.mm {
             let pass = match filter {
@@ -762,10 +899,11 @@ impl<S: Storage> Statement<'_, S> {
                 let v = crate::query::eval::<S::Error>(arg, &ctx)?;
                 if extremum_step(*kind, *coll, &mut run.best, v, enc) {
                     run.rep = Some(row.clone());
+                    kept = true;
                 }
             }
         }
-        Ok(())
+        Ok(kept)
     }
 
     /// The end of the join: a blocking mode's rows into

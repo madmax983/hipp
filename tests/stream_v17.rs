@@ -834,6 +834,321 @@ fn blocking_operators_bound_what_they_buffer() {
     assert_eq!(rows, ["100000"]);
 }
 
+// ---------------- v0.17 review fixes ----------------
+
+/// The number of adjacent pairs out of order in `vals` (its last
+/// `|`-separated field, as integers): `desc` flips the order.
+fn inversions(rows: &[String], desc: bool) -> usize {
+    let v: Vec<i64> = rows
+        .iter()
+        .map(|r| r.rsplit('|').next().unwrap_or("").parse().expect("integer"))
+        .collect();
+    v.windows(2)
+        .filter(|w| if desc { w[0] < w[1] } else { w[0] > w[1] })
+        .count()
+}
+
+#[test]
+fn order_by_a_result_column_sorts_on_the_value_returned() {
+    // Regression (review): an ORDER BY naming a result column (alias,
+    // ordinal, or the same expression) sorted on a second evaluation
+    // of it, so a random() column came out unsorted; the pin sorts on
+    // the value it returns (`iOrderByCol`).
+    let setup = "CREATE TABLE t(a); INSERT INTO t SELECT value FROM generate_series(1, 60);";
+    let pin_db = common::temp_db("v17st-rand-o");
+    common::cli(&pin_db, setup);
+    for (q, desc) in [
+        ("SELECT random() AS r FROM t ORDER BY r", false),
+        ("SELECT random() AS r FROM t ORDER BY r LIMIT 10", false),
+        ("SELECT random() AS r FROM t ORDER BY 1 DESC", true),
+        ("SELECT a, random() AS r FROM t ORDER BY 2 DESC", true),
+        (
+            "SELECT a, random() AS r FROM t ORDER BY r DESC LIMIT 7 OFFSET 3",
+            true,
+        ),
+        ("SELECT random() AS r FROM t ORDER BY random()", false),
+        (
+            "SELECT random() AS r FROM t ORDER BY r COLLATE nocase",
+            false,
+        ),
+        (
+            "SELECT a, random() AS r FROM t WHERE a > 5 ORDER BY r",
+            false,
+        ),
+        ("SELECT DISTINCT random() % 5 AS r FROM t ORDER BY r", false),
+        ("SELECT random() AS r FROM t, (SELECT 1) ORDER BY r", false),
+        (
+            "SELECT random() AS r, count(*) FROM t GROUP BY a ORDER BY r",
+            false,
+        ),
+        (
+            "SELECT x FROM (SELECT random() AS x FROM t ORDER BY x LIMIT 100), (SELECT 1)",
+            false,
+        ),
+    ] {
+        let pin: Vec<String> = common::cli(&pin_db, &format!("{q};"))
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(inversions(&pin, desc), 0, "the pin sorts: {q}");
+        let rows = mem_rows(Config::default(), setup, q).expect(q);
+        assert_eq!(rows.len(), pin.len(), "{q}");
+        assert_eq!(inversions(&rows, desc), 0, "hipp must sort: {q}");
+    }
+    // The rows a CREATE TABLE ... AS stores come in that order too.
+    let (ok, rows, e) = hipp_script(
+        &common::temp_db("v17st-rand-h"),
+        &format!(
+            "{setup} CREATE TABLE s AS SELECT random() AS r FROM t ORDER BY r; \
+             SELECT count(*) FROM s x, s y WHERE y.rowid = x.rowid + 1 AND y.r < x.r;"
+        ),
+    );
+    assert!(ok, "{e:?}");
+    assert_eq!(rows, ["0"]);
+    // A subquery's ORDER BY, and the scalar subquery path.
+    let rows = mem_rows(
+        Config::default(),
+        setup,
+        "SELECT (SELECT group_concat(r) FROM (SELECT random() AS r FROM t ORDER BY r))",
+    )
+    .expect("sub");
+    let vals: Vec<String> = rows[0].split(',').map(str::to_string).collect();
+    assert_eq!(vals.len(), 60);
+    assert_eq!(inversions(&vals, false), 0);
+}
+
+#[test]
+fn an_aggregate_without_group_by_drops_its_order_by() {
+    // Regression (review): the pin's one-row aggregate ignores its
+    // ORDER BY (`sSort.pOrderBy = 0`) — only the aggregates in it
+    // still accumulate; hipp evaluated every term on the one row.
+    for (tag, q) in [
+        ("json", "SELECT count(*) FROM t ORDER BY json('x');"),
+        (
+            "abs",
+            "SELECT count(*) FROM t ORDER BY abs(-9223372036854775808);",
+        ),
+        (
+            "bare",
+            "SELECT a, count(*) FROM t ORDER BY abs(a - 9223372036854775807 - 2);",
+        ),
+        ("sub", "SELECT count(*) FROM t ORDER BY (SELECT json('x'));"),
+        (
+            "having",
+            "SELECT count(*) FROM t HAVING 1 ORDER BY json('x');",
+        ),
+        (
+            "having-no",
+            "SELECT count(*) FROM t HAVING count(*) > 100 ORDER BY json('x');",
+        ),
+        (
+            "minmax",
+            "SELECT max(a), c FROM t ORDER BY json('x') LIMIT 1;",
+        ),
+        (
+            "distinct",
+            "SELECT DISTINCT count(*) FROM t ORDER BY json('x');",
+        ),
+        (
+            "empty",
+            "SELECT count(*) FROM t WHERE a < 0 ORDER BY json('x');",
+        ),
+        (
+            "agg-term",
+            "SELECT count(*) FROM t ORDER BY sum(a) + json('x');",
+        ),
+        ("agg-ok", "SELECT count(*) FROM t ORDER BY max(json(a));"),
+        // The aggregates in the ORDER BY still accumulate.
+        (
+            "agg-fails",
+            "SELECT count(*) FROM t ORDER BY sum(abs(a - 9223372036854775807 - 2));",
+        ),
+        (
+            "nested",
+            "SELECT (SELECT count(*) FROM t ORDER BY json('x'));",
+        ),
+        // A window query keeps its ORDER BY.
+        (
+            "window",
+            "SELECT sum(a), row_number() OVER () FROM t ORDER BY json('x');",
+        ),
+        (
+            "series",
+            "SELECT count(*), sum(value) FROM generate_series(1, 100000) ORDER BY 1;",
+        ),
+        // GROUP BY keeps it.
+        (
+            "group",
+            "SELECT b, count(*) FROM t GROUP BY b ORDER BY json('x');",
+        ),
+    ] {
+        same(&format!("aggord-{tag}"), &format!("{T} {q}"));
+    }
+}
+
+#[test]
+fn recursive_ctes_stream_their_outer_query() {
+    // Regression (review): a query reading a recursive CTE kept the
+    // materialising executor, so a row-N error came with no rows.
+    const OV: &str = "abs(x - 9223372036854775807 - 3)";
+    for (tag, q) in [
+        (
+            "bounded",
+            format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5) SELECT x, {OV} FROM c;"
+            ),
+        ),
+        (
+            "endless-limit",
+            format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x, {OV} FROM c LIMIT 10;"
+            ),
+        ),
+        (
+            "inner",
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2) \
+             SELECT a, x, abs(a - 9223372036854775807 - 3) FROM t CROSS JOIN c;"
+                .to_string(),
+        ),
+        (
+            "where-limit",
+            format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x, {OV} FROM c WHERE x > 0 LIMIT 10;"
+            ),
+        ),
+        (
+            "join-limit",
+            format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x, {OV} FROM c CROSS JOIN u LIMIT 10;"
+            ),
+        ),
+        (
+            "member-limit",
+            format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 6) SELECT x, {} FROM c;",
+                bad("x = 4")
+            ),
+        ),
+        (
+            "view",
+            format!(
+                "CREATE VIEW rv AS WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 4) SELECT x FROM c; \
+                 SELECT x, {} FROM rv;",
+                bad("x = 3")
+            ),
+        ),
+        (
+            "materialized",
+            format!(
+                "WITH RECURSIVE c(x) AS MATERIALIZED (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 4) SELECT x, {} FROM c;",
+                bad("x = 2")
+            ),
+        ),
+    ] {
+        fails_after_rows(&format!("rec-{tag}"), &format!("{T} {q}"));
+    }
+    // A WHERE / join over an endless CTE under a LIMIT: the bound
+    // doubles as the join reads the rows (`Stream::grow`).
+    for (tag, q) in [
+        (
+            "grow-where",
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c WHERE x % 7 = 0 LIMIT 40 OFFSET 3;",
+        ),
+        (
+            "grow-join",
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x, u.v FROM c CROSS JOIN u WHERE u.k = 2 LIMIT 30;",
+        ),
+        (
+            "bounded-plain",
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 300) SELECT x, u.k FROM c, u WHERE x % 50 = u.k;",
+        ),
+    ] {
+        same(&format!("rec-{tag}"), &format!("{T} {q}"));
+    }
+}
+
+#[test]
+fn side_tables_do_not_grow_with_outer_rows() {
+    // Regression (review): a streamed join with a lateral json_each or
+    // an inner fts5 source kept every outer row's JSON documents /
+    // full-text rows until the statement ended.
+    const N: i64 = 200_000;
+    let path = common::temp_db("v17st-side-o");
+    let q = format!(
+        "SELECT count(*), sum(j.value) FROM generate_series(1, {N}) s, json_each('[' || s.value || ',1]') j"
+    );
+    let pin = common::cli(&path, &format!("{q};"));
+    let before = live();
+    reset_peak();
+    let rows = mem_rows(Config::default(), "", &q).expect("json join");
+    let grew = peak() - before;
+    assert_eq!(format!("{}\n", rows.join("\n")), pin);
+    assert!(grew < 4 << 20, "the json_each join held {grew} bytes");
+
+    let setup = "CREATE VIRTUAL TABLE f USING fts5(x); \
+                 INSERT INTO f VALUES ('alpha beta'), ('beta gamma'), ('gamma delta');";
+    common::cli(&path, setup);
+    let q =
+        format!("SELECT count(*) FROM generate_series(1, {N}) s CROSS JOIN f WHERE f MATCH 'beta'");
+    let pin = common::cli(&path, &format!("{q};"));
+    let before = live();
+    reset_peak();
+    let rows = mem_rows(Config::default(), setup, &q).expect("fts join");
+    let grew = peak() - before;
+    assert_eq!(format!("{}\n", rows.join("\n")), pin);
+    assert!(grew < 4 << 20, "the fts5 join held {grew} bytes");
+
+    // Rows streamed one by one: the heap stays flat, with an inner
+    // fts5 source's auxiliary rows and a lateral json_each's
+    // documents read on every row.
+    block_on(async {
+        let mut db = Connection::open(MemStorage::new(), Config::default())
+            .await
+            .expect("open");
+        for s in split(setup) {
+            let mut q = db.prepare(&s).await.expect("prep");
+            while q.step().await.expect("step") == Step::Row {}
+        }
+        let mut q = db
+            .prepare(
+                "SELECT s.value, round(bm25(f), 3), j.value FROM generate_series(1) s \
+                 CROSS JOIN f CROSS JOIN json_each('[' || s.value || ']') j \
+                 WHERE f MATCH 'gamma'",
+            )
+            .await
+            .expect("prep");
+        for _ in 0..1000 {
+            assert_eq!(q.step().await.expect("step"), Step::Row);
+        }
+        let base = live();
+        reset_peak();
+        for _ in 0..100_000 {
+            assert_eq!(q.step().await.expect("step"), Step::Row);
+        }
+        assert_eq!(q.column_i64(2), q.column_i64(0));
+        let grew = peak() - base;
+        assert!(grew < 1 << 20, "streaming grew the heap by {grew} bytes");
+    });
+    // The same rows as the pin (bm25 read through the kept handles).
+    same(
+        "side-rows",
+        &format!(
+            "{setup} SELECT s.value, round(bm25(f), 3), j.value, highlight(f, 0, '[', ']') FROM generate_series(1, 5) s \
+             CROSS JOIN f CROSS JOIN json_each(json_array(s.value, s.value * 2)) j WHERE f MATCH 'gamma';"
+        ),
+    );
+    // Kept rows keep what they point into: a min / max's bare
+    // columns, GROUP BY.
+    same(
+        "side-kept",
+        &format!(
+            "{setup} SELECT max(j.value), j.key, j.type FROM generate_series(1, 300) s, json_each(json_array(s.value, -s.value)) j; \
+             SELECT j.key, count(*), max(j.value) FROM generate_series(1, 300) s, json_each(json_array(s.value, 'x')) j GROUP BY j.key; \
+             SELECT s.value, highlight(f, 0, '<', '>') FROM generate_series(1, 3) s CROSS JOIN f WHERE f MATCH 'beta' ORDER BY s.value DESC;"
+        ),
+    );
+}
+
 // ---------------- transactions, reset, re-execution ----------------
 
 #[test]

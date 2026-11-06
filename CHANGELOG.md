@@ -50,8 +50,21 @@ All notable changes to hipp. Versions follow the milestones in
 - Under `v16` the synchronous v0.4 query executor is retired (the
   async executor serves every top-level query).
 - Sizes: tiny 76,960 B (0), full 505,416 B (+4,464), max 1,043,340 B
-  (+7,824), xl 1,043,292 B (+7,776; its ratchet stays at max's,
-  as `xl` contains `max`).
+  (+7,824), xl 1,043,292 B (+7,776).
+- Review fixes: an ORDER BY naming a result column (alias, ordinal,
+  same expression) sorts on the returned value, so a `random()`
+  column comes out sorted (every executor, ungated); an aggregate
+  without GROUP BY drops its ORDER BY as the pin does (only its
+  aggregates still run); recursive CTEs stream (an endless one read
+  through a WHERE or join under a LIMIT with a doubling bound); a
+  streamed join frees the JSON documents and full-text rows of each
+  finished inner loop and row, and computes an inner fts5 / dbstat
+  source that reads nothing to its left once; hipp-cli exits 1 after
+  a stdin script with a failed statement or dot-command and skips
+  the rest of the failing input chunk. Sizes on top of the FTS5
+  delete unit: tiny 0, full 506,432 B (+1,016), max 1,045,676 B
+  (+1,504), xl 1,055,028 B (+1,496); every ratchet at its measured
+  figure.
 
 ## 0.16.0 — the SQLite-parity push (2026-11-05)
 

@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 505,416 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,044,172 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,053,532 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 506,432 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,045,676 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,055,028 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -71,8 +71,13 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   (`count(*) FROM generate_series(1)` is 4294967295, not
   VtabTooManyRows). ORDER BY (unless the rowid or an index delivers
   it), GROUP BY and DISTINCT buffer as the pin's sorters do;
-  `Config::max_vtab_rows` now bounds only what is held. Ungated in
-  the `v16` executor (`src/session/stream.rs`).
+  `Config::max_vtab_rows` now bounds only what is held. Recursive
+  CTEs stream too, a streamed join's memory does not grow with its
+  outer rows, an ORDER BY naming a result column sorts on the value
+  returned (`random() AS r ... ORDER BY r`), a one-row aggregate
+  drops its ORDER BY as the pin does, and the CLI exits 1 after a
+  stdin script whose statement failed. Ungated in the `v16`
+  executor (`src/session/stream.rs`).
 - **FTS5 delete writes** (leaf `fts5_delete`, in `xl`). DELETE,
   UPDATE and INSERT OR REPLACE on `contentless_delete=1` tables
   write the pin's tombstone hash pages (`fts5IndexTombstoneAdd`:
@@ -1283,7 +1288,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 505,416 B of 512 KiB, `max` 1,043,340 B of 1 MiB, `xl` 1,043,292 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,432 B of 512 KiB, `max` 1,045,676 B of 1 MiB, `xl` 1,055,028 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

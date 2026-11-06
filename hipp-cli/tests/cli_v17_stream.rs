@@ -140,3 +140,61 @@ SELECT count(*), sum(value) FROM generate_series(1, 300000);
     );
     same("limit", &script, false);
 }
+
+/// A script on stdin: stdout and the exit status.
+fn run_stdin_status(bin: &Path, db: &Path, input: &str) -> (String, Option<i32>) {
+    use std::io::Write;
+    let mut child = Command::new(bin)
+        .arg(db)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("cli spawns");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("cli finishes");
+    (
+        String::from_utf8(out.stdout).expect("utf8 stdout"),
+        out.status.code(),
+    )
+}
+
+#[test]
+fn a_failed_statement_sets_the_exit_status() {
+    // Regression (review): a stdin script goes on after a failing
+    // statement (rows before the error printed), and the pin's shell
+    // then exits 1 — at the end of the script, or at `.exit`. hipp-cli
+    // exited 0, and ran the statements after the failing one on its
+    // input line.
+    for (tag, script) in [
+        // The rest of the failing input chunk is skipped, then the
+        // script goes on.
+        ("fail", "SELECT abs(-9223372036854775808); SELECT 1;\n"),
+        (
+            "chunks",
+            "SELECT 1;\nSELECT abs(-9223372036854775808); SELECT 2;\nSELECT 3; SELECT json(1\n); SELECT 4;\nSELECT 5;\n",
+        ),
+        (
+            "part-way",
+            "SELECT value, abs(CASE WHEN value = 3 THEN -9223372036854775807 - 1 ELSE value END) FROM generate_series(1, 5);\nSELECT 'next';\n",
+        ),
+        ("exit", "SELECT abs(-9223372036854775808);\n.exit\n"),
+        ("quit", "SELECT json('x');\n.quit\n"),
+        ("dot", ".nosuchcommand\nSELECT 1;\n"),
+        ("parse", "SELEC 1;\nSELECT 2;\n"),
+        ("trailing", "SELECT 1;\nSELECT abs(-9223372036854775808)"),
+        ("ok", "SELECT 1;\nSELECT 1 / 0;\n"),
+        ("ok-exit", "SELECT 1;\n.exit\n"),
+    ] {
+        let h = temp_db(&format!("status-{tag}-h"));
+        let o = temp_db(&format!("status-{tag}-o"));
+        let pin = run_stdin_status(&oracle(), &o, script);
+        let ours = run_stdin_status(&hipp_bin(), &h, script);
+        assert_eq!(ours, pin, "script:\n{script}");
+    }
+}

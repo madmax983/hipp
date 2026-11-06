@@ -5017,6 +5017,27 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::MisusedAggregate,
             });
         }
+        // An aggregate query without GROUP BY makes one row: the pin
+        // drops its ORDER BY (`sSort.pOrderBy = 0`), only the
+        // aggregates in it still accumulating — so the rest of a
+        // term is never evaluated (v0.17 review fix: hipp sorted the
+        // one row, and failed on a term that errors). A window query
+        // keeps it (the pin's rewrite sorts the outer query).
+        #[cfg(feature = "window")]
+        let plain = crate::window::calls(items.as_slice(), order_by.as_slice()).is_empty();
+        #[cfg(not(feature = "window"))]
+        let plain = true;
+        if has_agg && group_by.is_empty() && plain && !order_by.is_empty() {
+            let mut kept: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+            for (e, o) in order_by.iter() {
+                let mut aggs = AVec::new();
+                crate::query::collect_outer_aggs(e, &mut aggs);
+                for a in aggs {
+                    kept.push((a.clone(), *o));
+                }
+            }
+            order_by = kept;
+        }
         cur.aliases.clear();
         let limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
         // v0.16 (`expr_index`): each table source's index access
@@ -12822,6 +12843,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        let cols = order_cols(qp.order_by.as_slice(), qp.items.as_slice());
         // Window calls (v0.16, `window`; see `project_rows`).
         #[cfg(feature = "window")]
         let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
@@ -12859,6 +12881,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for (e, _) in qp.order_by.iter() {
                     keys.push(self.eval_row_sub(e, r).await?);
                 }
+                shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
                 let rowid = if qp.sources.len() == 1 {
                     r.rowids.as_slice()[0]
                 } else {
@@ -13029,6 +13052,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             for (e, _) in qp.order_by.iter() {
                 keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
             }
+            shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
             out.push(Produced {
                 out: vals,
                 keys,
@@ -13065,6 +13089,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         cap: Option<usize>,
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
+        let cols = order_cols(plan.order_by.as_slice(), plan.items.as_slice());
         // Window calls (v0.16, `window`; see `project_rows`).
         #[cfg(feature = "window")]
         let wins = crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice());
@@ -13102,6 +13127,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 for (e, _) in plan.order_by.iter() {
                     keys.push(self.eval_row_sub(e, r).await?);
                 }
+                shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
                 out.push(Produced {
                     out: vals,
                     keys,
@@ -13263,6 +13289,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             for (e, _) in plan.order_by.iter() {
                 keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
             }
+            shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
             out.push(Produced {
                 out: vals,
                 keys,
@@ -14497,6 +14524,32 @@ fn order_ref(
     }
 }
 
+/// The result column each ORDER BY term is (the pin's
+/// `iOrderByCol`): the term, under any COLLATE, the same expression
+/// as a result column (`same_expr`; an alias or ordinal resolves to
+/// a copy of the column's) — the last such column.
+#[cfg(feature = "v04")]
+fn order_cols(order: &[(RExpr, crate::sql::SortOrder)], items: &[RExpr]) -> AVec<Option<usize>> {
+    let mut out = AVec::new();
+    for (e, _) in order.iter() {
+        let mut e = e;
+        while let RExpr::Collate(x, _) = e {
+            e = x;
+        }
+        out.push(items.iter().rposition(|it| crate::query::same_expr(e, it)));
+    }
+    out
+}
+
+#[cfg(feature = "v04")]
+fn shown_keys(keys: &mut [OwnedValue], cols: &[Option<usize>], vals: &[OwnedValue]) {
+    for (k, c) in keys.iter_mut().zip(cols.iter()) {
+        if let Some(v) = c.and_then(|j| vals.get(j)) {
+            *k = v.clone();
+        }
+    }
+}
+
 /// The direction each GROUP BY term's groups come out in
 /// (v0.16): when the ORDER BY has exactly as many terms as the
 /// GROUP BY, the pin's group sorter takes each ORDER BY term's
@@ -14851,6 +14904,7 @@ fn project_rows<E>(
     cap: Option<usize>,
 ) -> Result<AVec<Produced>, E> {
     let mut out = AVec::new();
+    let cols = order_cols(qp.order_by.as_slice(), qp.items.as_slice());
     if !qp.has_agg {
         for r in rows {
             let ctx = Ctx::of(r).with(env);
@@ -14862,6 +14916,7 @@ fn project_rows<E>(
             for (e, _) in qp.order_by.iter() {
                 keys.push(crate::query::eval::<E>(e, &ctx)?);
             }
+            shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
             let rowid = if qp.sources.len() == 1 {
                 r.rowids.as_slice()[0]
             } else {
@@ -14990,6 +15045,7 @@ fn project_rows<E>(
         for (e, _) in qp.order_by.iter() {
             keys.push(crate::query::eval::<E>(e, &ctx)?);
         }
+        shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
         out.push(Produced {
             out: vals,
             keys,

@@ -77,6 +77,17 @@ pub(super) enum VtCur {
     Rows(VRows, usize),
 }
 
+/// Whether `vt`'s module computes its rows at its filter (dbstat,
+/// fts5, fts5vocab, rtreecheck: `VtCur::Rows`), not row by row.
+pub(super) fn filters_whole(vt: &VtSrc) -> bool {
+    match vt.tab.module {
+        Module::Series => false,
+        #[cfg(feature = "rtree")]
+        Module::Rtree { .. } => false,
+        _ => true,
+    }
+}
+
 fn vt_err<E>(kind: SchemaKind) -> Error<E> {
     Error::Schema { kind }
 }
@@ -1439,6 +1450,18 @@ impl<S: Storage> Statement<'_, S> {
             }
             _ => VtCur::Rows(self.vtab_rows_of(vt, argv, row, need).await?, 0),
         })
+    }
+
+    /// The rows of a module that computes them at its filter
+    /// (`filters_whole`), for `row`.
+    pub(super) async fn vtab_whole(
+        &mut self,
+        sp: &SourcePlan,
+        vt: &VtSrc,
+        row: &RowData,
+    ) -> Result<VRows, S::Error> {
+        let argv = self.vtab_argv(sp, row).await?;
+        self.vtab_rows_of(vt, argv, row, None).await
     }
 
     /// The cursor's next row appended to `out` (its columns, then its
