@@ -577,6 +577,19 @@ impl<S: Storage> Connection<S> {
         Ok(st)
     }
 
+    /// Row `id` of `%_data` into `store`, when there is one.
+    #[cfg(feature = "fts5_delete")]
+    async fn ft_load_row(&mut self, t: &Tab, store: &mut Store, id: i64) -> Result<(), S::Error> {
+        if let Some(p) = btree::seek_rowid(&mut self.pager, t.data, id).await? {
+            let b = match field::<S::Error>(p.as_slice(), 1)? {
+                OwnedValue::Blob(b) | OwnedValue::Text(b) => b,
+                _ => AVec::new(),
+            };
+            store.load(id, b);
+        }
+        Ok(())
+    }
+
     /// Replace (or insert) row `k` of the rowid table at `root`.
     async fn ft_put(&mut self, root: u32, k: i64, vals: &[Value<'_>]) -> Result<(), S::Error> {
         let mut rec = AVec::new();
@@ -1029,6 +1042,17 @@ impl<S: Storage> Connection<S> {
         p
     }
 
+    /// The pin reparsed its schema (`sqlite3ResetAllSchemasOfConnection`
+    /// after ALTER TABLE, VACUUM, a rollback that undid a schema change
+    /// or `PRAGMA writable_schema = RESET`): every fts5 table's
+    /// `Fts5Config` is built afresh, so a rolled-back `secure-delete`
+    /// setting the connection kept is gone (v0.17 review fix: hipp
+    /// kept it and went on doing secure deletes).
+    #[cfg(feature = "fts5_delete")]
+    pub(super) fn fts5_schema_reset(&mut self) {
+        self.fts_sd.clear();
+    }
+
     /// Table `old` was renamed `new`: its pending terms follow it.
     pub(super) fn fts5_renamed(&mut self, old: &[u8], new: &[u8]) {
         for st in self.fts.as_mut_slice().iter_mut() {
@@ -1109,6 +1133,24 @@ fn field<E>(payload: &[u8], i: usize) -> Result<OwnedValue, E> {
 }
 
 impl<S: Storage> Statement<'_, S> {
+    /// Whether the pin reparses its schema after this statement
+    /// (`ok`: it succeeded; `was_txn`: an explicit transaction was
+    /// open when it started; `ck0`: the schema cookie then): a
+    /// successful ALTER TABLE or VACUUM (INTO too), or a rollback —
+    /// ROLLBACK, ROLLBACK TO, a failure that ended the transaction —
+    /// that moved the cookie back.
+    #[cfg(feature = "fts5_delete")]
+    pub(super) fn reloads_schema(&self, ok: bool, was_txn: bool, ck0: u32) -> bool {
+        use super::maint::Maint;
+        let back = self.conn.pager.schema_cookie() != ck0;
+        match &self.plan {
+            Plan::Rollback | Plan::Maint(Maint::RollbackTo(_)) => ok && back,
+            Plan::AlterAdd { .. } | Plan::Alter16 { .. } | Plan::Maint(Maint::Vacuum { .. }) => ok,
+            Plan::Vtab(v) if matches!(**v, VtPlan::Rename { .. }) => ok,
+            _ => !ok && was_txn && !self.conn.explicit_txn && back,
+        }
+    }
+
     // -----------------------------------------------------------
     // Shadow-table access
     // -----------------------------------------------------------
@@ -1624,17 +1666,39 @@ impl<S: Storage> Statement<'_, S> {
             }
         }
         if origin != 0 {
-            let mut store = self.conn.ft_store(t).await?;
-            st.overlay(&mut store);
-            let mut s = store.structure().map_err(|_| corrupt())?;
-            let n = crate::fts5::sdel::contentless_delete(
-                &mut store,
-                &mut s,
-                origin as u64,
-                rowid,
-                rt.t.pgsz,
-            )
-            .map_err(|_| corrupt())?;
+            // Only the structure and the tombstone pages the delete
+            // touches are read (review fix: every `%_data` row was
+            // loaded for each row deleted, quadratic in a statement's
+            // deletes): first the one page each hash maps the rowid
+            // to, and when a hash must be rebuilt, all of its pages.
+            let mut all = false;
+            let (store, s, n) = loop {
+                let mut store = Store::default();
+                self.conn
+                    .ft_load_row(t, &mut store, crate::fts5::STRUCTURE_ROWID)
+                    .await?;
+                if let Some(p) = self.conn.ft_pending(t.name.as_slice()) {
+                    p.overlay(&mut store);
+                }
+                st.overlay(&mut store);
+                let mut s = store.structure().map_err(|_| corrupt())?;
+                let ids = crate::fts5::sdel::tomb_ids(&s, origin as u64, rowid, all);
+                for id in ids.iter() {
+                    self.conn.ft_load_row(t, &mut store, *id).await?;
+                }
+                match crate::fts5::sdel::contentless_delete(
+                    &mut store,
+                    &mut s,
+                    origin as u64,
+                    rowid,
+                    rt.t.pgsz,
+                ) {
+                    Ok(n) => break (store, s, n),
+                    // (A page the first pass did not read.)
+                    Err(_) if !all => all = true,
+                    Err(_) => return Err(corrupt()),
+                }
+            };
             if n > 0 {
                 self.conn.ft_apply(t, store.log.as_slice()).await?;
                 st.ncdel = st.ncdel.wrapping_add(n);
@@ -1901,7 +1965,20 @@ impl<S: Storage> Statement<'_, S> {
                 Ok(())
             }
             Err(e) => {
-                if let Some(s) = snapshot {
+                // OR FAIL keeps the rows written before the conflict
+                // and so their pending terms (the pin's halt releases
+                // the statement savepoint; v0.17 review fix: they were
+                // dropped): the commit or the transaction flushes them.
+                let kept = conflict == ConflictAction::Fail
+                    && matches!(
+                        e,
+                        Error::Schema {
+                            kind: SchemaKind::UniqueViolation,
+                        }
+                    );
+                if kept {
+                    self.conn.fts.push(st);
+                } else if let Some(s) = snapshot {
                     self.conn.fts.push(s);
                 }
                 Err(e)
@@ -2006,13 +2083,19 @@ impl<S: Storage> Statement<'_, S> {
                         // columns alone is a no-op; otherwise every
                         // indexed column must be set, on a
                         // contentless_delete table only.
+                        // The pin compares the rowids as
+                        // `sqlite3_value_int64` reads them (review fix:
+                        // `'1'` counted as a move); a new rowid that is
+                        // not an integer is checked after these rules
+                        // (the no-op's mismatch, or the one below).
                         let (seen, unset) = upd;
-                        let moved = match &rid {
-                            OwnedValue::Integer(n) => *n != o,
-                            OwnedValue::Null => o != 0,
-                            _ => true,
-                        };
+                        let moved = crate::query::int_value(&rid) != o;
                         if seen == 0 && !moved {
+                            // (NULL reads as rowid 0 but is no integer:
+                            // the no-op's "datatype mismatch".)
+                            if !matches!(Self::ft_rowid_value(&rid)?, OwnedValue::Integer(_)) {
+                                return Err(ft_err(SchemaKind::DatatypeMismatch));
+                            }
                             self.conn.env.note_change();
                             continue;
                         }

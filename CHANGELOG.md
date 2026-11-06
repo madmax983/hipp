@@ -46,6 +46,17 @@ All notable changes to hipp. Versions follow the milestones in
   rank on a row without `%_docsize`, or a table whose totals count
   no row, are the pin's corruption error; an UPDATE to a NULL
   rowid is "datatype mismatch".
+- Review fixes: under secure-delete an entry a tombstone hides stays
+  in place (the pin's iterator skips tombstoned rowids); a
+  rolled-back `secure-delete` setting is forgotten when the pin would
+  reparse its schema (ALTER TABLE, VACUUM, a rollback undoing a
+  schema change, `writable_schema = RESET`); a contentless UPDATE
+  with `rowid = '1'` on row 1 is not a move (and with
+  `rowid = NULL` on row 0 is the pin's "datatype mismatch"); tombstone and
+  secure-delete writes are linear in the rows a statement deletes
+  (were quadratic); OR FAIL keeps an fts5 write's rows before the
+  conflict and OR ROLLBACK ends the transaction (ungated, `fts5`:
+  both acted as ABORT).
 - `link.x`: the sizing demo's FLASH region is 2 MiB so `xl` links.
 - Sizes: tiny 76,960 B (0), full 505,416 B (0), max 1,044,172 B
   (+832, the ungated fixes), xl 1,053,532 B (+10,192: the leaf,

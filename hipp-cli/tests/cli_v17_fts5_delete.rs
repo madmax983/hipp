@@ -135,3 +135,43 @@ SELECT rowid FROM d('p');
 ",
     );
 }
+
+/// The review fixes, as the shell shows them: an entry a tombstone
+/// hides kept under secure-delete; `rowid = '1'` not a move; OR FAIL
+/// keeping the rows before the conflict; a rolled-back secure-delete
+/// setting forgotten after ALTER TABLE.
+#[test]
+fn review_fix_outputs() {
+    same(
+        "review",
+        "\
+CREATE VIRTUAL TABLE t USING fts5(a, content='', contentless_delete=1);
+INSERT INTO t(rowid, a) VALUES(1, 'y'), (2, (SELECT group_concat('x', ' ') FROM generate_series(1, 70)));
+INSERT INTO t(t, rank) VALUES('secure-delete', 1);
+INSERT OR REPLACE INTO t(rowid, a) VALUES(2, (SELECT group_concat('x', ' ') FROM generate_series(1, 70)));
+SELECT id, hex(block) FROM t_data;
+SELECT k, v FROM t_config;
+SELECT rowid FROM t('x');
+CREATE VIRTUAL TABLE u USING fts5(a, b UNINDEXED, content='', contentless_delete=1);
+INSERT INTO u(rowid, a, b) VALUES(1, 'x', 'y');
+UPDATE u SET b = 'z', rowid = '1' WHERE rowid = 1;
+SELECT changes();
+UPDATE u SET b = 'z', rowid = 1.0 WHERE rowid = 1;
+SELECT changes();
+CREATE VIRTUAL TABLE f USING fts5(a);
+INSERT INTO f(rowid, a) VALUES(4, 'y');
+INSERT OR FAIL INTO f(rowid, a) VALUES(10, 'p'), (4, 'q'), (11, 'q');
+SELECT rowid, a FROM f('p OR y OR q');
+CREATE VIRTUAL TABLE s USING fts5(a);
+BEGIN;
+INSERT INTO s(s, rank) VALUES('secure-delete', 1);
+ROLLBACK;
+CREATE TABLE z(y);
+ALTER TABLE z ADD COLUMN q;
+INSERT INTO s(rowid, a) SELECT value, 'w' FROM generate_series(1, 20);
+DELETE FROM s WHERE rowid < 5;
+SELECT k, v FROM s_config;
+SELECT id, hex(block) FROM s_data;
+",
+    );
+}

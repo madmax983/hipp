@@ -245,6 +245,25 @@ fn tomb_add(st: &mut Store, sg: &mut Seg, rowid: u64, pgsz: usize) -> Result<boo
     Ok(true)
 }
 
+/// The `%_data` rows [`contentless_delete`] reads for (`origin`,
+/// `rowid`): the tombstone page each segment holding the origin hashes
+/// the rowid to, or (`all`) every page of those hashes, which a rebuild
+/// reads. (A delete then reads a page or so, not the index.)
+pub fn tomb_ids(s: &Structure, origin: u64, rowid: i64, all: bool) -> AVec<i64> {
+    let mut out = AVec::new();
+    for sg in s.newest_first().iter() {
+        if sg.o1 <= origin && sg.o2 >= origin && sg.npgt > 0 {
+            let at = (rowid as u64 % u64::from(sg.npgt)) as u32;
+            for pg in 0..sg.npgt {
+                if all || pg == at {
+                    out.push(tomb_rowid(sg.id, pg));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `sqlite3Fts5IndexContentlessDelete`: rowid `rowid` of origin
 /// `origin` is deleted. Updates `s` (the cached structure) and returns
 /// the tombstones added (`nContentlessDelete`).
@@ -314,7 +333,22 @@ fn locate(
     let mut eod = 0usize;
     let mut pending = 0usize;
     let mut prev = 0i64;
-    for pg in sg.first..=sg.last {
+    // The walk starts at the first term of the page the term's
+    // doclist starts on, and inside the doclist goes on from the page
+    // the rowid is on (review fix: every delete walked the segment
+    // from its first page, quadratic in a flush's deletes).
+    let first_pg = term_page(st, sg, key);
+    let mut pg = first_pg;
+    while pg <= sg.last {
+        let mut from_rowid = false;
+        if pg > first_pg
+            && have_term
+            && term.as_slice() == key
+            && let Some(q) = rowid_page(st, sg, pg, rowid)?
+        {
+            pg = q;
+            from_rowid = true;
+        }
         let a = st.get(seg_rowid(sg.id, pg)).ok_or(Corrupt)?;
         let nn = a.len();
         if nn < 4 {
@@ -338,11 +372,19 @@ fn locate(
             eod = *f;
         }
         let mut off = 4usize;
-        if pending > 0 {
+        if pg == first_pg {
+            // (What comes before the first term is an earlier term's.)
+            off = offs.as_slice().first().copied().unwrap_or(szleaf);
+            pending = 0;
+        } else if from_rowid {
+            off = rowid_ptr;
+            pending = 0;
+        } else if pending > 0 {
             let n = pending.min(szleaf - off);
             pending -= n;
             off += n;
             if pending > 0 {
+                pg = pg.checked_add(1).ok_or(Corrupt)?;
                 continue;
             }
         }
@@ -431,8 +473,102 @@ fn locate(
                 }
             }
         }
+        pg = match pg.checked_add(1) {
+            Some(n) => n,
+            None => break,
+        };
     }
     Ok(None)
+}
+
+/// The first term of leaf page `a` (stored whole); `None` when the
+/// page holds no term.
+fn first_term(a: &[u8]) -> Option<&[u8]> {
+    let szleaf = get_u16(a, 2);
+    if szleaf >= a.len() {
+        return None;
+    }
+    let mut i = szleaf;
+    let mut o = gv(a, &mut i)? as usize;
+    let n = gv(a, &mut o)? as usize;
+    a.get(o..o.checked_add(n)?)
+}
+
+/// The page of segment `sg` where `key`'s doclist starts, if the
+/// segment has it: the last page whose first term is at most `key`
+/// (terms ascend through the segment; pages holding no term are
+/// passed over).
+fn term_page(st: &Store, sg: &Seg, key: &[u8]) -> u32 {
+    let (mut lo, mut hi, mut best) = (sg.first, sg.last, sg.first);
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let mut p = mid;
+        let mut ft = None;
+        while p <= hi {
+            if let Some(t) = st.get(seg_rowid(sg.id, p)).and_then(first_term) {
+                ft = Some(t);
+                break;
+            }
+            p = match p.checked_add(1) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+        match ft {
+            Some(t) if t <= key => {
+                best = p;
+                lo = match p.checked_add(1) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+            _ => {
+                hi = match mid.checked_sub(1) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+        }
+    }
+    best
+}
+
+/// Inside a doclist that goes on at page `pg`: the last page from
+/// `pg` on, up to the doclist's end (the next page holding a term),
+/// whose first rowid (stored whole at the header's offset) is at most
+/// `rowid` — the page the walk may go on from.
+fn rowid_page(st: &Store, sg: &Seg, pg: u32, rowid: i64) -> Result<Option<u32>, Corrupt> {
+    let mut best = None;
+    let mut p = pg;
+    while p <= sg.last {
+        let a = st.get(seg_rowid(sg.id, p)).ok_or(Corrupt)?;
+        if a.len() < 4 {
+            return Err(Corrupt);
+        }
+        let (ptr, szleaf) = (get_u16(a, 0), get_u16(a, 2));
+        let terms = szleaf < a.len();
+        let end = if terms {
+            let mut i = szleaf;
+            gv(a, &mut i).ok_or(Corrupt)? as usize
+        } else {
+            szleaf
+        };
+        if ptr != 0 && ptr < end {
+            let mut i = ptr;
+            if (gv(a, &mut i).ok_or(Corrupt)? as i64) > rowid {
+                break;
+            }
+            best = Some(p);
+        }
+        if terms {
+            break;
+        }
+        p = match p.checked_add(1) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+    Ok(best)
 }
 
 /// How far a write past a page's end may grow it (a leaf page is at
@@ -807,7 +943,8 @@ fn do_secure_delete(
 }
 
 /// `fts5FlushSecureDelete`: remove (`key`, `rowid`) from the newest
-/// segment of `s` holding it.
+/// segment of `s` holding it, unless that segment's tombstone hash
+/// already hides the row (review fix: the entry was cut out).
 fn secure_delete(
     st: &mut Store,
     s: &Structure,
@@ -822,6 +959,12 @@ fn secure_delete(
     }
     for sg in s.newest_first().iter() {
         if let Some(l) = locate(st, sg, key, rowid, detail)? {
+            // The pin finds the entry with a segment iterator, which
+            // skips a rowid in the segment's tombstone hash
+            // (`fts5MultiIterIsDeleted`): a tombstoned entry stays.
+            if sg.npgt > 0 && tomb_hit(tomb_pages(st, sg)?.as_slice(), rowid) {
+                return Ok(());
+            }
             return do_secure_delete(st, sg, &l, key, detail);
         }
     }

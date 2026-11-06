@@ -193,6 +193,14 @@ fn shadow() -> Vec<String> {
 
 const CHECK: &str = "INSERT INTO t(t) VALUES('integrity-check')";
 
+/// A query that reads the structure record: after a rollback or a
+/// schema reparse the generated workloads run one, closing the window
+/// in which the pin's connection holds a cookie other than the file's
+/// (a rolled-back one, or -1 after a reparse; an honest gap: a
+/// 'rebuild' or 'delete-all' there writes the pin's cookie, hipp the
+/// file's).
+const REREAD: &str = "SELECT count(*) FROM t WHERE t MATCH 'alpha'";
+
 /// The pin's `integrity-check` (and PRAGMA integrity_check) on a file.
 fn pin_checks(db: &std::path::Path) -> Vec<String> {
     pin_run(
@@ -746,6 +754,255 @@ fn regressions() {
     );
 }
 
+// ---------------- Review fixes ----------------
+
+/// A position list of 64..127 bytes (its size varint's first byte is
+/// odd, so the pin's flush looks for an entry to remove) for row `r`.
+fn long_row(r: i64, n: usize) -> String {
+    format!(
+        "INSERT OR REPLACE INTO t(rowid, a) SELECT {r}, group_concat('x', ' ') FROM generate_series(1, {n})"
+    )
+}
+
+/// secure-delete on a contentless_delete table: an entry the segment's
+/// tombstone hides stays where it is (the pin's segment iterator skips
+/// tombstoned rowids; hipp cut it out of the leaf).
+#[test]
+fn tombstoned_entries_stay_under_secure_delete() {
+    for detail in ["full", "column", "none"] {
+        let create = format!(
+            "CREATE VIRTUAL TABLE t USING fts5(a, content='', contentless_delete=1, detail={detail})"
+        );
+        let base = [
+            create.as_str(),
+            "INSERT INTO t(rowid, a) VALUES(1, 'y')",
+            "INSERT INTO t(t, rank) VALUES('secure-delete', 1)",
+        ];
+        let replace = long_row(2, 70);
+        let replace3 = long_row(3, 75);
+        let replace4 = long_row(4, 90);
+        let mut w: Vec<&str> = base.to_vec();
+        w.insert(2, &replace);
+        w.extend([
+            replace.as_str(),
+            "SELECT rowid FROM t('x')",
+            replace3.as_str(),
+            replace4.as_str(),
+            "UPDATE t SET a = (SELECT group_concat('x', ' ') FROM generate_series(1, 66)) WHERE rowid = 3",
+            "DELETE FROM t WHERE rowid = 4",
+            replace4.as_str(),
+            "BEGIN",
+            "DELETE FROM t WHERE rowid = 2",
+            replace.as_str(),
+            "COMMIT",
+            "SELECT rowid FROM t('x')",
+            CHECK,
+            "INSERT INTO t(t) VALUES('optimize')",
+            "SELECT rowid FROM t('x')",
+        ]);
+        same_checked(&format!("rf-tomb-sd-{detail}"), &dumped(&w));
+    }
+}
+
+/// The pin forgets a rolled-back `secure-delete` setting whenever it
+/// reparses the schema (ALTER TABLE, VACUUM, a rollback that undid a
+/// schema change, `PRAGMA writable_schema = RESET`); a CREATE or DROP
+/// on its own, or an ALTER that fails, keeps it.
+#[test]
+fn schema_reload_forgets_rolled_back_setting() {
+    let mids: &[&[&str]] = &[
+        &["SELECT 1"],
+        &["CREATE TABLE z2(y)"],
+        &["DROP TABLE z"],
+        &["ALTER TABLE z ADD COLUMN q"],
+        &["ALTER TABLE z RENAME TO zz"],
+        &["ALTER TABLE z RENAME COLUMN y TO yy"],
+        &["ALTER TABLE z DROP COLUMN w"],
+        &["ALTER TABLE z ADD COLUMN q NOT NULL"],
+        &["ALTER TABLE t RENAME TO t2", "ALTER TABLE t2 RENAME TO t"],
+        &["VACUUM"],
+        &["BEGIN", "CREATE TABLE z3(a)", "ROLLBACK"],
+        &["BEGIN", "CREATE TABLE z3(a)", "COMMIT"],
+        &["BEGIN", "DROP TABLE z", "ROLLBACK"],
+        &["BEGIN", "INSERT INTO z VALUES(5, 5)", "ROLLBACK"],
+        &[
+            "SAVEPOINT a",
+            "CREATE TABLE z3(a)",
+            "ROLLBACK TO a",
+            "RELEASE a",
+        ],
+        &[
+            "SAVEPOINT a",
+            "INSERT INTO z VALUES(5, 5)",
+            "ROLLBACK TO a",
+            "RELEASE a",
+        ],
+        &[
+            "CREATE TABLE u(x UNIQUE)",
+            "BEGIN",
+            "CREATE TABLE z3(a)",
+            "INSERT INTO u VALUES(1)",
+            "INSERT OR ROLLBACK INTO u VALUES(1)",
+        ],
+        &[
+            "CREATE TABLE u(x UNIQUE)",
+            "BEGIN",
+            "INSERT INTO u VALUES(1)",
+            "INSERT OR ROLLBACK INTO u VALUES(1)",
+        ],
+        &["PRAGMA writable_schema = RESET"],
+    ];
+    for (i, mid) in mids.iter().enumerate() {
+        let mut w = vec![
+            "CREATE VIRTUAL TABLE t USING fts5(a, b)",
+            "CREATE TABLE z(y, w)",
+            "INSERT INTO z VALUES(1, 1)",
+            "BEGIN",
+            "INSERT INTO t(t, rank) VALUES('secure-delete', 1)",
+            "ROLLBACK",
+        ];
+        w.extend(mid.iter().copied());
+        w.extend([
+            "INSERT INTO t(rowid, a, b) SELECT value, 'w', 'c' FROM generate_series(1, 20)",
+            "DELETE FROM t WHERE rowid < 5",
+            "SELECT rowid FROM t('w')",
+        ]);
+        same(&format!("rf-reload{i}"), &dumped(&w));
+    }
+}
+
+/// A contentless UPDATE compares the rowids as `sqlite3_value_int64`
+/// reads them: `rowid = '1'` on row 1 does not move it (an UPDATE of
+/// UNINDEXED columns alone stays the no-op); a non-integer that reads
+/// as the old rowid is "datatype mismatch" only after the contentless
+/// rules.
+#[test]
+fn contentless_update_rowid_values() {
+    let tables = [
+        "a, b UNINDEXED, c, content='', contentless_delete=1",
+        "a, b UNINDEXED, c, content=''",
+        "a, b UNINDEXED, c",
+    ];
+    let sets = ["b = 'z'", "a = 'q'", "a = 'q', c = 'r'"];
+    let rids = [
+        "'1'", "' 1'", "'+1'", "'1.0'", "1.0", "1.5", "'1e0'", "'x'", "NULL", "x'01'", "'2'",
+        "2.0", "' 0x1'", "1", "2", "1e30", "0", "0.0", "''", "x''", "'-1'", "-1.0",
+    ];
+    // (Row 0 too: NULL, '' and x'' read as rowid 0 there, so they do
+    // not move it, and the no-op is "datatype mismatch" for them;
+    // review regression.)
+    for old in [1, 0, -1] {
+        for (ti, tbl) in tables.iter().enumerate() {
+            for (si, set) in sets.iter().enumerate() {
+                for (ri, rid) in rids.iter().enumerate() {
+                    let create = format!("CREATE VIRTUAL TABLE u USING fts5({tbl})");
+                    let ins = format!("INSERT INTO u(rowid, a, b, c) VALUES({old}, 'x', 'y', 'w')");
+                    let upd = format!("UPDATE u SET {set}, rowid = {rid} WHERE rowid = {old}");
+                    same(
+                        &format!("rf-upd{old}-{ti}-{si}-{ri}"),
+                        &v(&[
+                            &create,
+                            &ins,
+                            &upd,
+                            "SELECT changes()",
+                            "SELECT rowid, a, b, c FROM u",
+                        ]),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// OR FAIL keeps the rows an fts5 write made before the conflict (and
+/// their index entries); OR ROLLBACK ends the transaction (both acted
+/// as ABORT).
+#[test]
+fn fts5_conflict_resolutions() {
+    let body = [
+        "INSERT INTO t(rowid, a) VALUES(3, 'x'), (4, 'y')",
+        "BEGIN",
+        "DELETE FROM t WHERE rowid = 3",
+        "INSERT INTO t(rowid, a) VALUES(5, '')",
+        "INSERT OR ROLLBACK INTO t(rowid, a) VALUES(6, ''), (4, 'dup')",
+        "COMMIT",
+        "SELECT rowid FROM t",
+        "INSERT OR FAIL INTO t(rowid, a) VALUES(8, ''), (9, 'k'), (4, 'q'), (11, 'q')",
+        "SELECT rowid FROM t",
+        "BEGIN",
+        "INSERT OR FAIL INTO t(rowid, a) VALUES(12, 'p'), (4, 'q'), (13, 'q')",
+        "SAVEPOINT s",
+        "INSERT OR FAIL INTO t(rowid, a) VALUES(14, 'm'), (4, 'q')",
+        "ROLLBACK TO s",
+        "RELEASE s",
+        "INSERT INTO t(rowid, a) VALUES(15, 'z')",
+        "COMMIT",
+        "UPDATE OR FAIL t SET rowid = rowid + 1 WHERE rowid IN (3, 10, 11)",
+        "UPDATE OR ROLLBACK t SET rowid = 4 WHERE rowid = 3",
+        "DELETE FROM t WHERE rowid = 9",
+        "INSERT OR ROLLBACK INTO t(rowid, a) VALUES(16, 'a'), (4, 'q')",
+        "SELECT rowid FROM t",
+        "SELECT rowid FROM t('q OR p OR k OR z OR a')",
+        "SELECT id, hex(sz) FROM t_docsize",
+    ];
+    for (i, opts) in [
+        "",
+        ", content='', contentless_delete=1",
+        ", detail=column",
+        ", detail=none",
+        ", prefix='1'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        for sd in [false, true] {
+            let create = format!("CREATE VIRTUAL TABLE t USING fts5(a{opts})");
+            let mut w = vec![create.as_str()];
+            if sd {
+                w.push("INSERT INTO t(t, rank) VALUES('secure-delete', 1)");
+            }
+            w.extend(body);
+            same_checked(&format!("rf-conflict{i}-{sd}"), &dumped(&w));
+        }
+    }
+}
+
+/// Deletes of many rows in one statement (the tombstone pages and the
+/// secure-delete walk read a page or so per row, not the index; the
+/// walk seeks the term's page and, inside a long doclist, the rowid's):
+/// the same bytes as the pin over several page sizes.
+#[test]
+fn bulk_deletes_alike() {
+    for (opts, sd) in [
+        (", content='', contentless_delete=1", false),
+        (", content='', contentless_delete=1", true),
+        ("", true),
+        (", detail=column", true),
+        (", detail=none", true),
+        (", prefix='1 2'", true),
+    ] {
+        for pgsz in [64, 200, 4050] {
+            let create = format!("CREATE VIRTUAL TABLE t USING fts5(a{opts})");
+            let pg = format!("INSERT INTO t(t, rank) VALUES('pgsz', {pgsz})");
+            let mut w = vec![create, pg];
+            if sd {
+                w.push("INSERT INTO t(t, rank) VALUES('secure-delete', 1)".into());
+            }
+            w.extend(v(&[
+                "INSERT INTO t(rowid, a) SELECT value, 'x ' || value || ' y' || (value % 7) FROM generate_series(1, 1500)",
+                "INSERT INTO t(rowid, a) SELECT value, 'x z' || (value % 3) FROM generate_series(1501, 1800)",
+                "DELETE FROM t WHERE rowid % 2 = 0",
+                "SELECT count(*) FROM t('x')",
+                "DELETE FROM t WHERE rowid % 3 = 1",
+                "SELECT count(*), sum(rowid) FROM t('y3 OR z1')",
+                "UPDATE t SET a = 'x w' WHERE rowid % 5 = 0",
+                "SELECT count(*) FROM t('w')",
+            ]));
+            same_checked(&format!("rf-bulk{}-{sd}-{pgsz}", opts.len()), &w);
+        }
+    }
+}
+
 // ---------------- Generated workloads ----------------
 
 const WORDS: &[&str] = &[
@@ -819,7 +1076,9 @@ fn workload(seed: u64, n: usize) -> Vec<String> {
     // (detail=none tables get the setting from the start and keep it:
     // a delete-and-reinsert marker written without it is one the pin's
     // later secure delete mis-parses, corrupting its own page.)
-    if (mode != "cdel" || r.chance(20)) && (r.chance(80) || detail == "none") {
+    // (Tombstones and secure deletes together: review fix, a secure
+    // delete cut out an entry the segment's tombstone hides.)
+    if (mode != "cdel" || r.chance(50)) && (r.chance(80) || detail == "none") {
         out.push("INSERT INTO t(t, rank) VALUES('secure-delete', 1)".into());
     }
     for (k, vals) in [
@@ -841,6 +1100,7 @@ fn workload(seed: u64, n: usize) -> Vec<String> {
     let mut live: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
     let mut snap = live.clone();
     let mut intx = false;
+    let mut nalter = 0;
     let lit = |vs: &[String]| {
         vs.iter()
             .map(|v| format!("'{v}'"))
@@ -985,7 +1245,42 @@ fn workload(seed: u64, n: usize) -> Vec<String> {
                 live.clear();
             }
         } else if k < 71 {
-            if !intx && detail != "none" {
+            if !intx && detail != "none" && r.chance(30) {
+                // A setting rolled back stays on in the connection until
+                // the schema is reparsed (review fix: hipp kept it past
+                // ALTER TABLE and VACUUM).
+                out.push("BEGIN".into());
+                out.push(format!(
+                    "INSERT INTO t(t, rank) VALUES('secure-delete', {})",
+                    r.pick(&[0, 1])
+                ));
+                out.push("ROLLBACK".into());
+                out.push(REREAD.into());
+                nalter += 1;
+                // (hipp refuses to rename a virtual table a trigger
+                // names: the external-content workloads rename none.)
+                let z = if mode == "secext" {
+                    *r.pick(&[0, 1, 3])
+                } else {
+                    *r.pick(&[0, 1, 2, 3])
+                };
+                match z {
+                    0 => out.push("VACUUM".into()),
+                    1 => {
+                        out.push(format!("CREATE TABLE z{nalter}(y)"));
+                        out.push(format!("ALTER TABLE z{nalter} ADD COLUMN q"));
+                    }
+                    2 => {
+                        out.push("ALTER TABLE t RENAME TO tq".into());
+                        out.push("ALTER TABLE tq RENAME TO t".into());
+                    }
+                    _ => out.push(format!("CREATE TABLE z{nalter}(y)")),
+                }
+                // (A reparse leaves the pin's connection holding cookie
+                // -1 until the structure is read: the honest gap of
+                // REREAD.)
+                out.push(REREAD.into());
+            } else if !intx && detail != "none" {
                 out.push(format!(
                     "INSERT INTO t(t, rank) VALUES('secure-delete', {})",
                     r.pick(&[0, 1, 1])
@@ -1001,13 +1296,19 @@ fn workload(seed: u64, n: usize) -> Vec<String> {
             intx = false;
             if c == "ROLLBACK" {
                 live = snap.clone();
+                out.push(REREAD.into());
             }
         } else if k < 81 && intx {
             let mut sps = vec!["SAVEPOINT s1", "RELEASE s1"];
             if mode != "secnone" {
                 sps.push("ROLLBACK TO s1");
             }
-            out.push(r.pick(&sps).to_string());
+            let sp = r.pick(&sps).to_string();
+            let back = sp.starts_with("ROLLBACK");
+            out.push(sp);
+            if back {
+                out.push(REREAD.into());
+            }
         } else {
             let w = *r.pick(&WORDS[..10]);
             let w2 = *r.pick(&WORDS[..10]);
@@ -1053,13 +1354,22 @@ fn workload(seed: u64, n: usize) -> Vec<String> {
     out
 }
 
+/// The first generated seed (`HIPP_FTS5_DELETE_FROM`, default 0), to
+/// run a range of a larger corpus.
+fn first_seed() -> u64 {
+    std::env::var("HIPP_FTS5_DELETE_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 #[test]
 fn generated_delete_workloads_match_byte_for_byte() {
     let n: u64 = std::env::var("HIPP_FTS5_DELETE_CORPUS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
-    for seed in 0..n {
+    for seed in first_seed()..n {
         let w = workload(seed, 60);
         let h = common::temp_db(&format!("v17fd-gen{seed}-h"));
         let o = common::temp_db(&format!("v17fd-gen{seed}-o"));
@@ -1226,7 +1536,7 @@ fn generated_page_level_deletes_match_byte_for_byte() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
-    for seed in 0..n {
+    for seed in first_seed()..n {
         let w = page_workload(seed);
         let h = common::temp_db(&format!("v17fd-pg{seed}-h"));
         let o = common::temp_db(&format!("v17fd-pg{seed}-o"));

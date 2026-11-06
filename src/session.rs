@@ -1744,6 +1744,8 @@ impl<S: Storage> Connection<S> {
             stmt_sp: None,
             #[cfg(feature = "v16")]
             upsert_failed: false,
+            #[cfg(feature = "fts5")]
+            fts_kept: false,
             #[cfg(feature = "v07")]
             fail_act: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
@@ -5870,7 +5872,13 @@ impl<S: Storage> Connection<S> {
 
     /// Roll back the connection's open transaction, if any.
     pub async fn rollback(&mut self) -> Result<(), S::Error> {
+        #[cfg(feature = "fts5_delete")]
+        let ck0 = self.pager.schema_cookie();
         self.pager.rollback().await?;
+        #[cfg(feature = "fts5_delete")]
+        if self.pager.schema_cookie() != ck0 {
+            self.fts5_schema_reset();
+        }
         self.explicit_txn = false;
         Ok(())
     }
@@ -6224,6 +6232,10 @@ pub struct Statement<'c, S: Storage> {
     /// on the pin, so OR ROLLBACK does not end the transaction.
     #[cfg(feature = "v16")]
     upsert_failed: bool,
+    /// This failed statement's changes were kept (OR FAIL): the fts5
+    /// tables keep their pending terms too (v0.17 review fix).
+    #[cfg(feature = "fts5")]
+    fts_kept: bool,
     /// The resolved action of the constraint whose violation failed
     /// this write (v0.16, `v07`): a constraint-level `ON CONFLICT
     /// FAIL / ROLLBACK` decides what the failure undoes, so the
@@ -7020,6 +7032,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             stmt_sp: None,
             #[cfg(feature = "v16")]
             upsert_failed: false,
+            #[cfg(feature = "fts5")]
+            fts_kept: false,
             #[cfg(feature = "v07")]
             fail_act: core::cell::Cell::new(None),
             #[cfg(feature = "v16")]
@@ -7110,6 +7124,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "v16")]
         let was_txn = self.conn.explicit_txn;
+        // The schema cookie the statement starts from: a rollback that
+        // moves it back undid a schema change (v0.17, `fts5_delete`).
+        #[cfg(feature = "fts5_delete")]
+        let ck0 = self.conn.pager.schema_cookie();
         let ddl_or_txn = matches!(self.plan, Plan::CreateTable | Plan::Commit | Plan::Rollback)
             || {
                 #[cfg(feature = "vtab")]
@@ -7195,6 +7213,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "fts5_delete")]
         if self.phase == Phase::Fresh && !self.conn.fts_in_program() {
             self.conn.fts_ver.clear();
+        }
+        #[cfg(feature = "fts5")]
+        if self.phase == Phase::Fresh {
+            self.fts_kept = false;
         }
         #[cfg(feature = "fts5")]
         let fts_snap = if self.phase == Phase::Fresh
@@ -7285,6 +7307,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "fts5")]
         if r.is_err()
+            && !self.fts_kept
             && let Some(f) = fts_snap
         {
             self.conn.fts = f;
@@ -7307,6 +7330,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             if !matches!(self.plan, Plan::Att(_)) {
                 self.conn.mirror_att(b"ROLLBACK").await;
             }
+        }
+        // A statement after which the pin reloads its schema forgets
+        // the fts5 tables' connection state (v0.17 review fix).
+        #[cfg(feature = "fts5_delete")]
+        if self.reloads_schema(r.is_ok(), was_txn, ck0) {
+            self.conn.fts5_schema_reset();
         }
         // A transaction statement applies to the TEMP database too.
         #[cfg(feature = "v16")]
@@ -8454,9 +8483,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let conflict = match &self.plan {
             Plan::Insert { conflict, .. } | Plan::Update { conflict, .. } => *conflict,
-            #[cfg(feature = "rtree")]
+            #[cfg(any(feature = "rtree", feature = "fts5"))]
             Plan::Vtab(p) => match &**p {
+                #[cfg(feature = "rtree")]
                 vtab::VtPlan::Write(w) => w.conflict,
+                // An fts5 write's OR clause (v0.17 review fix: OR FAIL
+                // and OR ROLLBACK acted as ABORT).
+                #[cfg(feature = "fts5")]
+                vtab::VtPlan::Fts5Write(w) => w.conflict,
                 _ => ConflictAction::Abort,
             },
             _ => ConflictAction::Abort,

@@ -309,7 +309,8 @@ stand (DELETE / UPDATE / REPLACE on contentless_delete tables
 - The connection keeps what the pin's `Fts5Config` keeps: the
   `version` a statement loaded (a 'rebuild' / 'delete-all' writes 4
   under it; the commit's flush loads it again) and a `secure-delete`
-  setting a rollback took the row of.
+  setting a rollback took the row of, until the pin would reparse
+  its schema (review fix, below).
 
 **Fixes on claimed fts5 paths** (ungated, leaf `fts5`, each found by
 the new corpus and kept as a regression):
@@ -348,7 +349,8 @@ the new corpus and kept as a regression):
   flush later in the same statement still sees 5, the commit's flush
   (or the next statement) sees 4 and moves it again.
 - A rolled-back `secure-delete` setting stays on in the connection
-  (`sqlite3Fts5ConfigLoad` has no default for it).
+  (`sqlite3Fts5ConfigLoad` has no default for it) until the schema
+  is reparsed (see the review fixes).
 - A secure delete of an entry that the pin's walk mis-parses (a
   detail=none delete-and-reinsert marker written before the setting
   was on) grows the page by a byte: reproduced as written; see the
@@ -404,19 +406,134 @@ the session glue). Ratchets: `[max]` 1,044,172, `[xl]` 1,053,532.
   later reads and merges of that page differ from the pin's; the
   corpus keeps detail=none tables in secure-delete from the start.
 - The pin seeks with `%_idx` and the (stale) doclist indexes; hipp
-  walks the segment. They find the same entry on any index either
-  engine writes; on one whose doclist index points past a page a
-  secure delete emptied, the pin may read the next term's rowids.
+  seeks the term's page by the pages' first terms and, inside a
+  doclist, the rowid's page by the pages' first rowids. Both skip a
+  rowid the segment's tombstone hash holds (review fix: hipp did
+  not), and the corpora find no entry they locate differently; on a
+  doclist index pointing past a page a secure delete emptied, the
+  pin may read the next term's rowids, which hipp does not mimic.
 - Flush points still follow the 0.16 statement-journal heuristic
-  (see the FTS5 section's gap); a rolled-back config command leaves
-  the pin's connection with its new cookie, which hipp does not keep
-  (only the `secure-delete` setting is kept).
+  (see the FTS5 section's gap). A rolled-back transaction that moved
+  the structure cookie (a config command, or the first secure
+  delete's `version` 5) leaves the pin's connection holding the new
+  cookie until it next reads the structure; a 'rebuild' or
+  'delete-all' in that window writes the pin's held cookie where
+  hipp writes the file's (the generated corpora query the table
+  after each rollback; only the `secure-delete` setting is kept).
 - A matched row whose `%_docsize` entry is gone is an error for
   bm25 / snippet / ORDER BY rank, but a `rank` column read without
   ORDER BY rank still answers; ORDER BY rowid DESC over such rows
   fails before the first row (the pin returns the rows before it).
 - Not done (still refused): `contentless_unindexed=1`, `insttoken`,
   `tokendata=1`, `locale=1`.
+
+### FTS5 delete writes — review fixes (2026-11-06)
+
+**Status:** six review findings on the `fts5_delete` unit, each
+reproduced against the live pin and fixed with a regression test
+(`tests/fts5_delete_v17.rs`: `tombstoned_entries_stay_under_secure_delete`,
+`schema_reload_forgets_rolled_back_setting`,
+`contentless_update_rowid_values`, `fts5_conflict_resolutions`,
+`bulk_deletes_alike`; `hipp-cli/tests/cli_v17_fts5_delete.rs`
+`review_fix_outputs`).
+
+- **A tombstoned entry stays under secure-delete** (leaf
+  `fts5_delete`). With `secure-delete=1` on a `contentless_delete`
+  table the pin's `fts5FlushSecureDelete` finds the entry with a
+  segment iterator, which skips a rowid in the segment's tombstone
+  hash (`fts5MultiIterIsDeleted`): a row deleted (tombstoned) and
+  written again — INSERT OR REPLACE, UPDATE, DELETE then INSERT —
+  leaves the old entry in place. hipp cut it out of the leaf
+  (`%_data` differed until an 'optimize'); `sdel::secure_delete` now
+  leaves an entry whose segment's hash holds the rowid.
+- **The schema reparse forgets a rolled-back `secure-delete`**
+  (`fts5_delete`). The pin keeps the setting in its `Fts5Config`,
+  which is rebuilt whenever the schema is reparsed: after a
+  successful ALTER TABLE (ADD / RENAME / RENAME COLUMN / DROP
+  COLUMN, of any table), VACUUM (INTO too), a ROLLBACK / ROLLBACK
+  TO / failure-ended transaction that undid a schema change, and
+  `PRAGMA writable_schema = RESET`. A CREATE or DROP alone, or a
+  failed ALTER, keeps it (probed one by one). hipp kept it through
+  all of them (`Connection::fts5_schema_reset`, called from the
+  statement step, `Connection::rollback` and the pragma).
+- **`rowid = '1'` is not a move** (`fts5_delete`). A contentless
+  UPDATE compares the rowids as `sqlite3_value_int64` reads them
+  (`'1'`, `' 1'`, `'+1'` are row 1; `'x'`, `x'01'`, `2.0`, NULL
+  are moves): an UPDATE of UNINDEXED columns alone with such a rowid
+  is the no-op (changes() 1), not `Fts5ContentlessSubset`; a
+  non-integer that reads as the old rowid (`1.0`, `'1e0'`) is
+  "datatype mismatch" after the contentless rules, as on the pin.
+  On row 0, NULL, `''` and `x''` read as rowid 0 too, so they do not
+  move it either, and the no-op is "datatype mismatch" for them
+  (found while fixing; hipp let the no-op through). 3 old rowids ×
+  3 tables × 3 SETs × 22 new rowids compared.
+- **Linear-time deletes** (`fts5_delete`). A tombstone write read
+  every `%_data` row for each deleted row, and each secure delete
+  walked its segment from the first page, so deleting n rows in one
+  statement cost O(n × index). A tombstone write now reads the
+  structure and the one hash page the rowid maps to (all of that
+  segment's pages only when the hash is rebuilt); the secure-delete
+  walk binary-searches the term's page by the pages' first terms
+  and, inside a doclist, goes on from the last page whose first
+  rowid is at most the target. Debug CLI, `DELETE FROM t WHERE
+  rowid % 2 = 0` after N one-term rows: contentless_delete 0.44 s /
+  0.92 s / 2.4 s / 4.5 s and secure-delete 0.94 s / 2.2 s / 4.5 s /
+  9.3 s for N = 2,000 / 4,000 / 8,000 / 16,000 (were 1.03 s /
+  3.05 s / 10.6 s and 1.63 s / 4.67 s / 13.9 s up to 8,000; a plain
+  fts5 table takes 0.24 s / 0.48 s / 0.95 s / 2.0 s): linear, the
+  rest being the b-tree write of each changed page. With `pgsz`
+  65,536 each tombstone rewrites its (up to 64 KiB) hash page, as
+  the pin does: 8,333 deletes of 10,000 rows take 6.2 s (debug),
+  bytes identical to the pin's.
+- **OR FAIL / OR ROLLBACK on fts5 writes** (ungated, leaf `fts5`;
+  older than the unit). An fts5 write's OR clause was not consulted
+  when it failed, so both acted as ABORT. Now OR ROLLBACK ends the
+  transaction (the pin's `OP_VUpdate` sets `errorAction` from the
+  clause) and OR FAIL keeps the rows written before the conflict
+  together with their pending terms (the kept statement no longer
+  restores the fts5 state taken before it), in every content mode,
+  with and without secure-delete.
+- **Docs**: the claims below that a rolled-back setting "stays on"
+  and that both engines find the same entry are now qualified.
+
+**Oracle-probing notes:** the tombstone skip holds in detail full,
+column and none; the reparse list above is from the pin one
+statement at a time (a CREATE TABLE ... AS SELECT failing in
+autocommit keeps the setting). A rollback that moved the structure
+cookie leaves the pin's connection holding it until the next
+structure read; a 'rebuild' or 'delete-all' first writes that held
+cookie (honest gap, below).
+
+**Tests:** the five tests above (the generated workloads now give
+`contentless_delete` tables secure-delete half the time, and roll
+back a `secure-delete` setting followed by VACUUM, ALTER TABLE ADD
+COLUMN, a rename of the table and back, or a CREATE TABLE);
+seeds 0..400 of the workload generator and 0..700 of the
+page-level generator ran; one page-level seed (291) differs, on
+identical `%_data` bytes, where the pin misreads its own index (a
+phrase / AND query seeking 'b' returns a row with no 'b'; 'b' alone
+and the same query after an 'optimize' do not; hipp answers from the
+entries): the stale-doclist-index honest gap above.
+
+**Gates:** `ci/local-gates.sh` (full) passes; `depth_v16` /
+`triggers_v16` pass with debug info.
+
+**Size Δ** (thumbv7em, `--profile tiny`, against b034139): tiny
+76,960 B (+0); full 506,480 B (+0); max 1,046,444 B (+640: the
+ungated OR FAIL / OR ROLLBACK resolution of fts5 writes); xl
+1,102,956 B (−104: the leaf's seeking walk and page-at-a-time
+tombstone reads came out smaller than the whole-index loads).
+Ratchets `[max]` 1,046,444 and `[xl]` 1,102,956.
+
+**Honest gaps:**
+
+- The cookie a rolled-back transaction leaves in the pin's
+  connection (above) is not kept by hipp: a 'rebuild' or
+  'delete-all' that is a table's first structure access after such a
+  rollback writes the file's cookie, the pin its held one.
+- hipp refuses to rename a virtual table a trigger names
+  (`VtabNotAlterable`, v0.16); the generated external-content
+  workloads rename none.
 
 ### Join ordering, automatic indexes and Bloom filters (2026-11-06)
 

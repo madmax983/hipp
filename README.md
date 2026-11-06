@@ -31,8 +31,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 506,480 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,045,804 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,103,060 B | 1.25 MiB |
+| `max` | `--no-default-features --features max` | 1,046,444 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,102,956 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -92,9 +92,12 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   from the segments in place (`fts5DoSecureDelete`: entries and
   terms, emptied and overflow pages, page indexes, `%_idx` rows,
   `version` 5), byte for byte with the pin in every detail mode;
-  each engine's integrity-check passes on the other's files.
-  Without the leaf those writes are refused as in 0.16
-  (`src/fts5/sdel.rs`).
+  each engine's integrity-check passes on the other's files. A
+  statement's deletes take time linear in the rows deleted (a
+  tombstone reads one hash page; the secure-delete walk seeks the
+  term's and the rowid's page). Without the leaf those writes are
+  refused as in 0.16 (`src/fts5/sdel.rs`). OR FAIL / OR ROLLBACK on
+  fts5 writes now resolve as on the pin (ungated).
 - **Join ordering and automatic indexes** (leaf `join_order`, in
   `xl`). A join of two or more tables, virtual tables or JSON
   table-valued functions is planned as the pin's `where.c` plans it:
@@ -1306,7 +1309,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,480 B of 512 KiB, `max` 1,045,804 B of 1 MiB, `xl` 1,103,060 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,480 B of 512 KiB, `max` 1,046,444 B of 1 MiB, `xl` 1,102,956 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

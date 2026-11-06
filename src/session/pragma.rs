@@ -2177,6 +2177,12 @@ impl<S: Storage> Statement<'_, S> {
             #[cfg(feature = "vtab")]
             Prag::WritableSchema => {
                 self.conn.prag.writable_schema = boolean(arg);
+                // `RESET` reparses the schema (v0.17 review fix,
+                // `fts5_delete`: the fts5 tables' state goes).
+                #[cfg(feature = "fts5_delete")]
+                if eq_ci(arg, b"reset") {
+                    self.conn.fts5_schema_reset();
+                }
                 Ok(AVec::new())
             }
             #[cfg(feature = "foreign_keys")]
