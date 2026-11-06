@@ -41,6 +41,7 @@ mod common;
 use hipp::storage::{FileError, block_on};
 use hipp::{Config, Connection, Error, FileStorage, Step, Value};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 type HErr = Error<FileError>;
 
@@ -991,18 +992,30 @@ fn update_from_is_a_join() {
         (t0.elapsed(), out)
     };
     let fast_q = "UPDATE a SET y = b.v FROM b WHERE b.ax = a.x";
-    let (fast, fo) = time("updfrom-fast", fast_q);
-    let (slow, so) = time(
-        "updfrom-slow",
-        "UPDATE a NOT INDEXED SET y = b.v FROM b NOT INDEXED WHERE b.ax = a.x",
-    );
+    let slow_q = "UPDATE a NOT INDEXED SET y = b.v FROM b NOT INDEXED WHERE b.ax = a.x";
+    // The same 2,000-row write without the join (`base`): opening the
+    // file and writing the rows cost both runs the same, and in an
+    // instrumented (coverage) build that shared cost is most of
+    // `fast`, so the comparison is made net of it. Each figure is the
+    // best of three interleaved samples, so a run slowed by other tests
+    // competing for the CPU does not decide the comparison.
+    let (mut fast, mut slow, mut base) = (Duration::MAX, Duration::MAX, Duration::MAX);
+    let (mut fo, mut so) = (String::new(), String::new());
+    for i in 0..3 {
+        let (t, out) = time(&format!("updfrom-fast{i}"), fast_q);
+        (fast, fo) = (fast.min(t), out);
+        let (t, out) = time(&format!("updfrom-slow{i}"), slow_q);
+        (slow, so) = (slow.min(t), out);
+        base = base.min(time(&format!("updfrom-base{i}"), "UPDATE a SET y = id % 11").0);
+    }
     let o = fresh("updfrom-perf-o", big);
     let want = pin(&o, &format!("{fast_q}; SELECT sum(y), count(*) FROM a")).expect("pin");
     assert_eq!(fo, want);
     assert_eq!(so, want);
+    let (net_fast, net_slow) = (fast.saturating_sub(base), slow.saturating_sub(base));
     assert!(
-        fast * 5 < slow,
-        "automatic index {fast:?} vs nested loop {slow:?}"
+        net_fast * 5 < net_slow,
+        "automatic index {fast:?} vs nested loop {slow:?}, both net of the {base:?} write"
     );
 }
 
@@ -1033,7 +1046,7 @@ fn join_of_64_tables() {
     );
     let t0 = std::time::Instant::now();
     same("j64", &schema, &[q.as_str()]);
-    assert!(t0.elapsed() < std::time::Duration::from_secs(60));
+    assert!(t0.elapsed() < Duration::from_secs(60));
 }
 
 /// An expression index the statement reads only through its
