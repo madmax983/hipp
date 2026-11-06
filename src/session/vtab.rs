@@ -431,6 +431,8 @@ impl<S: Storage> Connection<S> {
             mat: 0,
             #[cfg(feature = "explain")]
             sel: 0,
+            #[cfg(feature = "flatten")]
+            view_names: AVec::new(),
         };
         let vname = if own { copy_vec(n) } else { AVec::new() };
         plans.push(SourcePlan {
@@ -466,6 +468,8 @@ impl<S: Storage> Connection<S> {
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
+            #[cfg(feature = "flatten")]
+            exists: false,
         });
         Ok(Some(w))
     }

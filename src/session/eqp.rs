@@ -1318,6 +1318,25 @@ impl<'a> Walk<'a> {
 
     /// The loop over one FROM source.
     fn loop_line(&mut self, sp: &SubSource, out: &mut AVec<u8>, probes: &mut AVec<usize>) {
+        self.loop_line_of(sp, out, probes);
+        // A semi-join loop (v0.17, `flatten`): `SEARCH t EXISTS ...`.
+        #[cfg(feature = "flatten")]
+        if sp.exists {
+            let mut nm = AVec::new();
+            self.scan_name(sp, &mut nm);
+            for head in [&b"SCAN "[..], &b"SEARCH "[..]] {
+                let at = head.len() + nm.len();
+                if out.as_slice().starts_with(head)
+                    && out.as_slice().get(head.len()..at) == Some(nm.as_slice())
+                {
+                    out.replace_range(at, 0, b" EXISTS");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn loop_line_of(&mut self, sp: &SubSource, out: &mut AVec<u8>, probes: &mut AVec<usize>) {
         out.extend_from_slice(b"SCAN ");
         self.scan_name(sp, out);
         #[cfg(feature = "vtab")]
@@ -1782,6 +1801,8 @@ fn placeholder(name: &[u8]) -> SubSource {
             scan: copy_vec(name),
             ..Default::default()
         },
+        #[cfg(feature = "flatten")]
+        exists: false,
     }
 }
 
@@ -1938,6 +1959,25 @@ pub(super) fn describe<S: Storage>(
                 es.as_slice(),
                 returning.as_slice(),
             );
+            #[cfg(feature = "flatten")]
+            if let Some(t) = table(*root) {
+                let mut assigned: AVec<bool> = AVec::new();
+                for _ in t.columns.iter() {
+                    assigned.push(false);
+                }
+                let mut rowid = false;
+                for (tg, _) in sets.iter() {
+                    match tg {
+                        super::Target::Col(c) => {
+                            if let Some(x) = assigned.as_mut_slice().get_mut(*c) {
+                                *x = true;
+                            }
+                        }
+                        super::Target::Rowid => rowid = true,
+                    }
+                }
+                fk_lines(w, conn, t, Some((assigned.as_slice(), rowid)), arena);
+            }
         }
         Plan::Delete {
             #[cfg(feature = "expr_index")]
@@ -1978,6 +2018,10 @@ pub(super) fn describe<S: Storage>(
                 &[],
                 returning.as_slice(),
             );
+            #[cfg(feature = "flatten")]
+            if let Some(t) = table(*root) {
+                fk_lines(w, conn, t, None, arena);
+            }
         }
         Plan::Insert {
             select,
@@ -2038,6 +2082,83 @@ pub(super) fn describe<S: Storage>(
             }
         }
         _ => {}
+    }
+}
+
+/// EXPLAIN QUERY PLAN's foreign-key child scans after a parent
+/// DELETE / UPDATE's loops (v0.17, `flatten`; the pin's
+/// `fkScanChildren`, once per key for a DELETE, for the old and then
+/// the new row for an UPDATE): `SEARCH c USING INTEGER PRIMARY KEY
+/// (rowid=?)`, `SEARCH c USING [COVERING] INDEX i (k=?)` / `USING
+/// PRIMARY KEY` through the index whose leading columns are most of
+/// the key's, else `SCAN c`.
+#[cfg(feature = "flatten")]
+fn fk_lines<S: Storage>(
+    w: &mut Walk<'_>,
+    conn: &Connection<S>,
+    t: &TableDef,
+    upd: Option<(&[bool], bool)>,
+    arena: &Arena,
+) {
+    let ca = &conn.catalog_arena;
+    let scans = conn.fk_scans(handle_bytes(ca, t.name), upd, arena);
+    let rounds = if upd.is_some() { 2 } else { 1 };
+    for _ in 0..rounds {
+        for (root, ccols) in scans.iter() {
+            let Some(c) = conn.catalog.tables.iter().find(|x| x.root == *root) else {
+                continue;
+            };
+            let name = handle_bytes(ca, c.name);
+            if let [k] = ccols.as_slice()
+                && Some(*k) == c.rowid_alias
+            {
+                w.add(
+                    0,
+                    &[b"SEARCH ", name, b" USING INTEGER PRIMARY KEY (rowid=?)"],
+                );
+                continue;
+            }
+            // The index with the longest run of key columns first.
+            let mut best: Option<(&crate::schema::IndexDef, usize)> = None;
+            for ix in conn.catalog.indexes.iter() {
+                if !eq_ci(handle_bytes(ca, ix.table), name) || !ix.plain() {
+                    continue;
+                }
+                let n = ix
+                    .columns
+                    .iter()
+                    .take_while(|k| k.col.is_some_and(|x| ccols.as_slice().contains(&x)))
+                    .count();
+                if n > 0 && best.is_none_or(|(_, m)| n > m) {
+                    best = Some((ix, n));
+                }
+            }
+            let Some((ix, n)) = best else {
+                w.add(0, &[b"SCAN ", name]);
+                continue;
+            };
+            let mut line: AVec<u8> = AVec::new();
+            line.extend_from_slice(b"SEARCH ");
+            line.extend_from_slice(name);
+            if clustered(ix) {
+                line.extend_from_slice(b" USING PRIMARY KEY (");
+            } else {
+                line.extend_from_slice(b" USING COVERING INDEX ");
+                line.extend_from_slice(handle_bytes(ca, ix.name));
+                line.extend_from_slice(b" (");
+            }
+            for (i, k) in ix.columns.iter().take(n).enumerate() {
+                if i > 0 {
+                    line.extend_from_slice(b" AND ");
+                }
+                if let Some(col) = k.col.and_then(|x| c.columns.as_slice().get(x)) {
+                    line.extend_from_slice(handle_bytes(ca, col.name));
+                }
+                line.extend_from_slice(b"=?");
+            }
+            line.push(b')');
+            w.add(0, &[line.as_slice()]);
+        }
     }
 }
 

@@ -5,6 +5,34 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Query flattening (leaf `flatten`, in `xl`)
+
+- The query flattener (`sqlite3FlattenSubquery`): a view, CTE or
+  FROM subquery the pin merges into its reader is planned without
+  access paths and spliced into the reader's FROM clause (its WHERE
+  into the reader's or the LEFT JOIN's ON clause, its columns
+  substituted through nested subqueries, a LEFT JOIN's merged
+  expressions guarded by the NULL row, its LIMIT and ORDER BY moving
+  out), so the merged tables join the join planner's order. Views keep
+  their pre-flattening column names.
+- WHERE push-down (`pushDownWhereTerms`) into the subqueries that stay
+  co-routines or materialisations (every arm of a UNION ALL; HAVING
+  for an aggregate's non-GROUP BY terms).
+- The result columns a co-routine or materialisation's reader never
+  reads are not computed (DISTINCT, aggregate, windowed, MATERIALIZED,
+  shared and non-UNION ALL compound bodies excepted, and columns their
+  ORDER BY names): `SELECT a FROM v` answers where `v.b` overflows.
+- EXISTS-to-join (`existsToJoin`): `SEARCH t EXISTS` semi-join loops,
+  ordered after the sources they read, in both executors.
+- EXPLAIN QUERY PLAN prints the foreign-key child scans of a parent
+  DELETE / UPDATE.
+- Fixed in the flattener model the shared materialisations follow: a
+  FULL JOIN's right side is never flattened, a LEFT JOIN's right side
+  is refused under DISTINCT (not GROUP BY).
+- Tests: `tests/flatten_v17.rs`, `hipp-cli/tests/cli_v17_flatten.rs`;
+  `tests/eqp_v16.rs`'s flattened-view and EXISTS differences now match
+  the pin. Size: tiny 0, full −16 B, max −8 B, xl +15,688 B.
+
 ### Index strategies (leaf `multi_index`, in `xl`)
 
 - The MULTI-INDEX OR (`whereLoopAddOr`): an OR term whose every branch

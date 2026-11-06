@@ -655,6 +655,34 @@ impl<S: Storage> Connection<S> {
         Ok(Some(Rc::new(out)))
     }
 
+    /// The child tables a parent DELETE (`upd` None) or UPDATE (the
+    /// assigned columns and whether the rowid is) scans for each row
+    /// (v0.17, `flatten`; EXPLAIN QUERY PLAN's `fkScanChildren`
+    /// loops): per foreign key naming the table, in the pin's order
+    /// (the most recently created child first), the child's root page
+    /// and its key columns. Empty while `PRAGMA foreign_keys` is OFF.
+    #[cfg(all(feature = "flatten", feature = "explain"))]
+    pub(super) fn fk_scans(
+        &self,
+        table: &[u8],
+        upd: Option<(&[bool], bool)>,
+        arena: &Arena,
+    ) -> AVec<(u32, AVec<usize>)> {
+        let ev = match upd {
+            Some((a, r)) => Event::Update(a, r),
+            None => Event::Delete,
+        };
+        let mut out = AVec::new();
+        if let Ok(Some(tg)) = self.fk_target(table, ev, true, true, arena) {
+            for f in tg.parent.iter() {
+                if f.parent.is_some() {
+                    out.push((f.child.root, f.ccols.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// COMMIT (or a RELEASE that commits): outstanding deferred
     /// violations fail it, the transaction staying open.
     pub(super) fn fk_commit_check(&self) -> Result<(), S::Error> {

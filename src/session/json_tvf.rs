@@ -91,6 +91,8 @@ impl<S: Storage> Connection<S> {
             mat: 0,
             #[cfg(feature = "explain")]
             sel: 0,
+            #[cfg(feature = "flatten")]
+            view_names: AVec::new(),
         };
         plans.push(SourcePlan {
             #[cfg(feature = "explain")]
@@ -117,6 +119,8 @@ impl<S: Storage> Connection<S> {
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
+            #[cfg(feature = "flatten")]
+            exists: false,
         });
         Ok(w)
     }

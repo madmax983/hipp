@@ -116,6 +116,8 @@ type Prep<'a, 'f, S> = core::pin::Pin<
 >;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
+#[cfg(feature = "flatten")]
+mod flatten;
 #[cfg(feature = "fts5")]
 mod fts5;
 #[cfg(feature = "join_order")]
@@ -1121,6 +1123,11 @@ struct CorePlan {
     result_named: AVec<bool>,
     /// Compound ORDER BY matching data for this core.
     keys: CompKeys,
+    /// The result names `result_col_names` gives, recorded before
+    /// the flattener merged a subquery in (v0.17, `flatten`;
+    /// `SubPlan::view_names`).
+    #[cfg(feature = "flatten")]
+    view_names: AVec<AVec<u8>>,
 }
 
 /// Which clause a GROUP BY / HAVING / ORDER BY term belongs to
@@ -1412,6 +1419,17 @@ pub struct Connection<S: Storage> {
     /// as the pin plans a `multiSelectOrderBy` member.
     #[cfg(all(feature = "expr_index", feature = "v09"))]
     merge_core: core::cell::Cell<Option<MergeSpec>>,
+    /// The next SELECT core to plan is a FROM subquery the query
+    /// flattener merges into its reader (v0.17, `flatten`): it is
+    /// planned without access paths or join order, which its reader
+    /// plans for the merged sources (`session::flatten`).
+    #[cfg(feature = "flatten")]
+    flat_raw: core::cell::Cell<bool>,
+    /// The next `plan_from` call is a SELECT core's own (v0.17,
+    /// `flatten`), whose subqueries marked `FromSource::flat` it
+    /// plans for flattening.
+    #[cfg(feature = "flatten")]
+    flat_from: core::cell::Cell<bool>,
     /// The recursive CTEs whose recursive SELECTs are being
     /// planned (v0.16, `v16`): each one's id and column shape,
     /// which its recursive reference takes (`plan_rec_ref`). A
@@ -1516,6 +1534,10 @@ impl<S: Storage> Connection<S> {
             next_subplan_id: core::cell::Cell::new(1),
             #[cfg(all(feature = "expr_index", feature = "v09"))]
             merge_core: core::cell::Cell::new(None),
+            #[cfg(feature = "flatten")]
+            flat_raw: core::cell::Cell::new(false),
+            #[cfg(feature = "flatten")]
+            flat_from: core::cell::Cell::new(false),
             #[cfg(feature = "v16")]
             rec_scope: core::cell::Cell::new(AVec::new()),
             #[cfg(feature = "v04")]
@@ -3120,15 +3142,40 @@ impl<S: Storage> Connection<S> {
         plan: &crate::query::SubPlan,
         base: (usize, usize),
     ) -> Result<AVec<AVec<u8>>, S::Error> {
+        // A core the flattener merged a subquery into named its
+        // columns before the merge, as the pin does (v0.17,
+        // `flatten`).
+        #[cfg(feature = "flatten")]
+        if !plan.view_names.is_empty() {
+            return Ok(plan.view_names.clone());
+        }
+        self.col_names_of(
+            plan.items.as_slice(),
+            plan.sources.as_slice(),
+            plan.result_names.as_slice(),
+            plan.result_named.as_slice(),
+            plan.width(),
+            base,
+        )
+    }
+
+    /// `result_col_names` over a core's parts (v0.17: also what the
+    /// flattener records before it merges, `SubPlan::view_names`).
+    #[cfg(feature = "v16")]
+    #[allow(clippy::too_many_arguments)]
+    fn col_names_of(
+        &self,
+        items: &[RExpr],
+        sources: &[crate::query::SubSource],
+        result_names: &[AVec<u8>],
+        result_named: &[bool],
+        width: usize,
+        base: (usize, usize),
+    ) -> Result<AVec<AVec<u8>>, S::Error> {
         let mut names: AVec<AVec<u8>> = AVec::new();
-        for i in 0..plan.width() {
-            let mut name = plan
-                .result_names
-                .as_slice()
-                .get(i)
-                .cloned()
-                .unwrap_or_default();
-            let item = plan.items.as_slice().get(i);
+        for i in 0..width {
+            let mut name = result_names.get(i).cloned().unwrap_or_default();
+            let item = items.get(i);
             // The pin's `sqlite3ColumnsFromExprList` over the
             // resolved list: an unaliased column reference (COLLATE
             // skipped; parentheses are no node, unary `+` is) takes
@@ -3139,13 +3186,11 @@ impl<S: Storage> Connection<S> {
             while let Some(RExpr::Collate(x, _)) = bare {
                 bare = Some(&**x);
             }
-            if !plan.result_named.as_slice().get(i).copied().unwrap_or(true) {
+            if !result_named.get(i).copied().unwrap_or(true) {
                 match bare {
                     Some(RExpr::Rowid(src)) => {
                         name = copy_vec(b"rowid");
-                        if let Some(sp) = src
-                            .checked_sub(base.1)
-                            .and_then(|k| plan.sources.as_slice().get(k))
+                        if let Some(sp) = src.checked_sub(base.1).and_then(|k| sources.get(k))
                             && let Some(a) = sp.rowid_alias
                             && let Some(n) = self.source_col_name(sp, a)?
                         {
@@ -3154,7 +3199,7 @@ impl<S: Storage> Connection<S> {
                     }
                     Some(RExpr::Column(slot, ..)) => {
                         let mut at = base.0;
-                        for sp in plan.sources.iter() {
+                        for sp in sources.iter() {
                             if let Some(k) = slot.checked_sub(at).filter(|k| *k < sp.ncols) {
                                 if let Some(n) = self.source_col_name(sp, k)? {
                                     name = n;
@@ -3598,6 +3643,8 @@ impl<S: Storage> Connection<S> {
                 mat: 0,
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
+                #[cfg(feature = "flatten")]
+                view_names: AVec::new(),
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
@@ -3641,6 +3688,8 @@ impl<S: Storage> Connection<S> {
             mat: 0,
             #[cfg(feature = "explain")]
             sel: stmt.sel,
+            #[cfg(feature = "flatten")]
+            view_names: core.view_names,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -4339,6 +4388,8 @@ impl<S: Storage> Connection<S> {
             schema: None,
             cte: None,
             indexed,
+            #[cfg(feature = "flatten")]
+            flat: false,
         };
         let mut descs = AVec::new();
         let mut offs = AVec::new();
@@ -4854,9 +4905,18 @@ impl<S: Storage> Connection<S> {
         #[cfg(all(feature = "expr_index", feature = "v09"))]
         let merge = self.merge_core.take();
         let (base_width, base_src) = ScopeGroup::stack_end(enclosing);
+        // v0.17 (`flatten`): a body its reader merges into itself is
+        // planned without access paths or join order (`flat_raw`).
+        #[cfg(feature = "flatten")]
+        let raw = self.flat_raw.take();
+        #[cfg(not(feature = "flatten"))]
+        let raw = false;
+        let _ = raw;
         let mut descs = AVec::new();
         let mut offsets = AVec::new();
         let mut sources: AVec<SourcePlan> = AVec::new();
+        #[cfg(feature = "flatten")]
+        self.flat_from.set(true);
         self.plan_from(
             stmt.from.as_slice(),
             arena,
@@ -5205,7 +5265,31 @@ impl<S: Storage> Connection<S> {
             order_by = kept;
         }
         cur.aliases.clear();
-        let limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
+        #[cfg_attr(not(feature = "flatten"), allow(unused_mut))]
+        let mut limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
+        // v0.17 (`flatten`): the pin's query flattener, WHERE
+        // push-down, unused subquery columns and EXISTS-to-join
+        // (`session::flatten`), before the join is planned.
+        #[cfg(feature = "flatten")]
+        let view_names = self.flatten_core(
+            arena,
+            stmt,
+            enclosing,
+            (base_width, base_src),
+            flatten::Parts {
+                sources: &mut sources,
+                cur: &mut cur,
+                items: &mut items,
+                filter: &mut filter,
+                group_by: &mut group_by,
+                having: &mut having,
+                order_by: &mut order_by,
+                limit: &mut limit,
+                result_names: result_names.as_slice(),
+                result_named: result_named.as_slice(),
+                has_agg,
+            },
+        )?;
         // v0.16 (`expr_index`): each table source's index access
         // path, the pin's choice (`xplan`).
         // A merged compound member's loop delivers the merge key if
@@ -5269,6 +5353,7 @@ impl<S: Storage> Connection<S> {
         // (`session::join`), the core laid out in it.
         #[cfg(feature = "join_order")]
         let joined = !keyed
+            && !raw
             && self.plan_join(
                 arena,
                 &mut sources,
@@ -5296,7 +5381,7 @@ impl<S: Storage> Connection<S> {
         json_tvf::fix_tvf_order::<S::Error>(sources.as_mut_slice(), &cur, &mut filter, joined)
             .map_err(|_| Error::Unsupported)?;
         #[cfg(feature = "expr_index")]
-        if !joined {
+        if !joined && !raw {
             self.plan_accesses(
                 arena,
                 sources.as_mut_slice(),
@@ -5369,6 +5454,8 @@ impl<S: Storage> Connection<S> {
             result_affs,
             result_named,
             keys,
+            #[cfg(feature = "flatten")]
+            view_names,
         })
     }
 
@@ -5557,6 +5644,8 @@ impl<S: Storage> Connection<S> {
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
+            #[cfg(feature = "flatten")]
+            exists: false,
         });
         Ok(w)
     }
@@ -5587,6 +5676,8 @@ impl<S: Storage> Connection<S> {
         let first = plans.len();
         #[cfg(feature = "explain")]
         let first_off = offsets.len();
+        #[cfg(feature = "flatten")]
+        let flat_from = self.flat_from.take();
         for s in from.iter() {
             offsets.push(total);
             // v0.16: a recursive CTE's recursive reference reads
@@ -5647,7 +5738,15 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::UnknownIndex,
                     });
                 }
-                total += self.plan_derived_source(s, d, arena, derived_scope, descs, plans)?;
+                // v0.17 (`flatten`): a subquery the flattener merges
+                // into this core is planned for it (`flat_raw`).
+                #[cfg(feature = "flatten")]
+                self.flat_raw
+                    .set(flat_from && s.flat && d.compound.is_empty() && d.values.is_empty());
+                let w = self.plan_derived_source(s, d, arena, derived_scope, descs, plans);
+                #[cfg(feature = "flatten")]
+                self.flat_raw.set(false);
+                total += w?;
                 continue;
             }
             let tname = handle_bytes(arena, s.table);
@@ -5773,6 +5872,8 @@ impl<S: Storage> Connection<S> {
                 temp: false,
                 #[cfg(feature = "attach")]
                 ext: 0,
+                #[cfg(feature = "flatten")]
+                exists: false,
             });
             total += t.columns.len();
         }
@@ -13193,6 +13294,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if on_ok {
                     any = true;
                     mark_matched(&mut st.matched, idx, ri);
+                    #[cfg(feature = "flatten")]
+                    let before = out.len();
                     self.join_step(
                         sources,
                         filter,
@@ -13203,6 +13306,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                         &mut *out,
                     )
                     .await?;
+                    // A semi-join source (v0.17, `flatten`): its first
+                    // row that made a joined row ends its loop.
+                    #[cfg(feature = "flatten")]
+                    if sp.exists && out.len() > before {
+                        break;
+                    }
                 }
             }
             if sp.kind.pads_right() && !any {

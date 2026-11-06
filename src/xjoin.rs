@@ -82,6 +82,15 @@ pub struct JSrc<'x> {
     pub left: bool,
     /// An explicit `CROSS JOIN`.
     pub cross: bool,
+    /// The sources a semi-join source must follow (v0.17, `flatten`:
+    /// an `EXISTS` turned into a join loop runs after every source its
+    /// terms read, so its first row is the one the EXISTS finds).
+    #[cfg(feature = "flatten")]
+    pub after: u64,
+    /// A semi-join source: each of its loops yields at most one row
+    /// per combination before it (v0.17, `flatten`).
+    #[cfg(feature = "flatten")]
+    pub semi: bool,
     /// Automatic indexes are allowed (no INDEXED BY / NOT INDEXED).
     pub auto_ok: bool,
     /// The table's root page (the star-query heuristic's self-join).
@@ -325,6 +334,9 @@ pub fn from_prereqs(srcs: &[JSrc<'_>]) -> AVec<u64> {
         } else {
             pre = 0;
         }
+        #[cfg(feature = "flatten")]
+        out.push(pre | js.after);
+        #[cfg(not(feature = "flatten"))]
         out.push(pre);
         prior |= 1u64 << i;
     }
@@ -1239,6 +1251,14 @@ pub(crate) fn plan(srcs: &[JSrc<'_>], jq: &JQuery<'_>) -> Option<JPlan> {
     }
     let pre = from_prereqs(srcs);
     let mut loops = all_loops(srcs, jq, pre.as_slice());
+    // A semi-join loop yields at most one row per combination
+    // before it (v0.17, `flatten`).
+    #[cfg(feature = "flatten")]
+    for l in loops.as_mut_slice() {
+        if !l.auto && srcs.get(l.src).is_some_and(|s| s.semi) {
+            l.l.out = l.l.out.min(0);
+        }
+    }
     let mx = mx_choice(srcs, loops.as_mut_slice());
     let mut disabled: AVec<bool> = AVec::new();
     for _ in loops.iter() {

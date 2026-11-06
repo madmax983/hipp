@@ -408,16 +408,6 @@ fn writes_match_pin() {
 fn documented_differences() {
     let path = db("eqp-diff", SCHEMA);
     let cases: &[(&str, &str)] = &[
-        // FROM subqueries, views and CTEs are not flattened.
-        (
-            "SELECT * FROM vu",
-            "|--CO-ROUTINE vu\n|  `--SCAN u\n`--SCAN vu\n",
-        ),
-        // EXISTS stays a subquery.
-        (
-            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE y > 3)",
-            "|--SCAN t\n`--SCALAR SUBQUERY 1\n   `--SCAN u\n",
-        ),
         // An IN subquery is a list, not an index probe.
         (
             "SELECT * FROM t WHERE b IN (SELECT x FROM u)",
@@ -438,10 +428,13 @@ fn documented_differences() {
     ];
     // (v0.17, `join_order`: join reordering and automatic indexes now
     // print the pin's plans; `multi_index`: the MULTI-INDEX OR and the
-    // min() / max() lookup too.)
+    // min() / max() lookup too; `flatten`: flattened views and
+    // EXISTS-to-join.)
     same_plans(
         &path,
         &[
+            "SELECT * FROM vu",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE y > 3)",
             "SELECT * FROM t, u WHERE t.a = u.x",
             "SELECT * FROM t LEFT JOIN u ON t.b=u.y",
             "SELECT * FROM t WHERE b = 1 OR c = 2",

@@ -316,8 +316,11 @@ fn execution_counts_drop_to_one() {
             count_during!("SELECT a FROM t WHERE a IN (SELECT x FROM u)"),
             1
         );
+        // (A LIMIT of its own keeps the EXISTS a subquery: without one
+        // the pin's EXISTS-to-join makes it a join loop, v0.17
+        // `flatten`.)
         assert_eq!(
-            count_during!("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x > 5)"),
+            count_during!("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x > 5 LIMIT 2)"),
             1
         );
         // Two distinct uncorrelated nodes: exactly 2.
@@ -355,7 +358,7 @@ fn execution_counts_drop_to_one() {
         // Correlated control: still one execution per outer
         // row (200), bit-for-bit the pre-v0.13 cost.
         assert_eq!(
-            count_during!("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a)"),
+            count_during!("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.a LIMIT 2)"),
             200
         );
         // A write statement over 200 rows: 1.

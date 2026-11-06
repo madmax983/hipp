@@ -1008,6 +1008,12 @@ pub struct SubSource {
     /// its natural order delivers.
     #[cfg(feature = "explain")]
     pub eqp: EqpInfo,
+    /// A semi-join source (v0.17, `flatten`; the pin's `existsToJoin`
+    /// of an `EXISTS` term, `SEARCH t EXISTS`): for each combination
+    /// of the sources before it, its loop stops at the first of its
+    /// rows that makes a joined row.
+    #[cfg(feature = "flatten")]
+    pub exists: bool,
 }
 
 /// What EXPLAIN QUERY PLAN says of a FROM source (v0.16, `explain`;
@@ -1178,6 +1184,13 @@ pub struct SubPlan {
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
     #[cfg(feature = "explain")]
     pub sel: u32,
+    /// The names a view or CREATE TABLE ... AS gives the result
+    /// columns (`result_col_names`), recorded before the query
+    /// flattener merged a FROM subquery into the core (v0.17,
+    /// `flatten`: the pin names them before it flattens); empty when
+    /// nothing was merged.
+    #[cfg(feature = "flatten")]
+    pub view_names: AVec<AVec<u8>>,
 }
 
 impl SubPlan {

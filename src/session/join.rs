@@ -1358,6 +1358,10 @@ impl<S: Storage> Connection<S> {
                     good: none,
                     left: sp.kind == crate::sql::JoinKind::Left,
                     cross: sp.kind == crate::sql::JoinKind::Cross,
+                    #[cfg(feature = "flatten")]
+                    after: 0,
+                    #[cfg(feature = "flatten")]
+                    semi: sp.exists,
                     auto_ok: false,
                     root: 0,
                     stat: false,
@@ -1477,6 +1481,10 @@ impl<S: Storage> Connection<S> {
                 good,
                 left,
                 cross: sp.kind == crate::sql::JoinKind::Cross,
+                #[cfg(feature = "flatten")]
+                after: 0,
+                #[cfg(feature = "flatten")]
+                semi: sp.exists,
                 auto_ok: sp.hint == crate::query::Hint::Any,
                 root: sp.root,
                 stat: self.table_has_stat(t),
@@ -1487,6 +1495,19 @@ impl<S: Storage> Connection<S> {
         }
         if jsrcs.len() != n {
             return Ok(false);
+        }
+        // A semi-join source follows every source its terms read
+        // (v0.17, `flatten`).
+        #[cfg(feature = "flatten")]
+        for (i, js) in jsrcs.as_mut_slice().iter_mut().enumerate() {
+            if sources.as_slice().get(i).is_some_and(|sp| sp.exists) {
+                let me = 1u64 << i;
+                for m in cmask.iter() {
+                    if m & me != 0 {
+                        js.after |= m & !me;
+                    }
+                }
+            }
         }
         // Terms on columns a `x = y` term makes equivalent (the pin's
         // `whereScan` equivalence classes): `y op value` probes `x`.

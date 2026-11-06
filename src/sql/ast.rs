@@ -656,6 +656,14 @@ pub struct FromSource {
     /// `v16`).
     #[cfg(feature = "v16")]
     pub indexed: Option<IndexHint>,
+    /// The pin's query flattener merges this FROM subquery (a view's
+    /// or CTE's expansion, or a written one) into its reader (v0.17,
+    /// `flatten`; `sqlite3FlattenSubquery`'s restrictions, settled by
+    /// the view / CTE expansion): the planner plans its body without
+    /// access paths and splices its sources into the reader's FROM
+    /// clause (`session::flatten`). False from the parser.
+    #[cfg(feature = "flatten")]
+    pub flat: bool,
 }
 
 /// A FROM source's (or an UPDATE / DELETE target's) index clause

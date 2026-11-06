@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 506,672 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,047,060 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,135,004 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 506,656 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,047,052 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,150,692 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -56,7 +56,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `fts5_delete` (FTS5 tombstones and secure-delete), `join_order`
   (the pin's join order, automatic indexes, Bloom filters,
   `sqlite_stat1`), `multi_index` (MULTI-INDEX OR, min() / max()
-  lookups, skip-scans, the IN operator's statistics rules).
+  lookups, skip-scans, the IN operator's statistics rules), `flatten`
+  (the query flattener, WHERE push-down, unused subquery columns,
+  EXISTS-to-join, foreign-key child scans in EXPLAIN QUERY PLAN).
 
 ## What v0.17 does
 
@@ -134,6 +136,20 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   OR of `col = other_col` equalities was probed as an IN list
   without the pin's affinity check, losing rows. Without the leaf
   plans are as in 0.16 (`src/xmulti.rs`).
+- **Query flattening** (leaf `flatten`, in `xl`). Views, CTEs and
+  FROM subqueries the pin's `sqlite3FlattenSubquery` merges into
+  their reader are merged by hipp too (its numbered restrictions; a
+  LEFT JOIN's right side with its NULL-row guard; the subquery's LIMIT
+  and ORDER BY moving out), so their tables join the join planner's
+  order and EXPLAIN QUERY PLAN prints their loops instead of a
+  co-routine. The subqueries that stay take the reader's WHERE terms
+  that read only them (`pushDownWhereTerms`, into HAVING for an
+  aggregate's non-GROUP BY terms) and compute only the result columns
+  their reader reads — so an error in a column nobody reads is not
+  raised, as on the pin. A WHERE `EXISTS (SELECT ... FROM t ...)`
+  becomes a semi-join loop (`SEARCH t EXISTS`), and a parent DELETE /
+  UPDATE under `PRAGMA foreign_keys` shows the pin's child-table scans.
+  Without the leaf subqueries plan as in 0.16 (`src/session/flatten.rs`).
 
 ## What v0.16 does
 
@@ -1331,7 +1347,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,672 B of 512 KiB, `max` 1,047,060 B of 1 MiB, `xl` 1,135,004 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,656 B of 512 KiB, `max` 1,047,052 B of 1 MiB, `xl` 1,150,692 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -1366,11 +1382,7 @@ UPDATE / DELETE or views.
 Not planned in any profile: multi-process locking or a shared `-shm`
 wal-index (WAL is single-process; one connection per database); a
 shared page cache (a file is attached once); plain EXPLAIN's
-bytecode listing (hipp has no VDBE); query flattening in the
-planner (EXPLAIN QUERY PLAN shows hipp's own plan; join reordering,
-automatic indexes and Bloom filters arrived in v0.17 with the
-`join_order` leaf, the MULTI-INDEX OR, min() / max() lookups and
-skip-scans with `multi_index`); loadable
+bytecode listing (hipp has no VDBE); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.
