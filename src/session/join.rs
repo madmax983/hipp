@@ -329,15 +329,21 @@ fn const_lit(e: &RExpr) -> Option<OwnedValue> {
 /// constant and no longer ties `a`'s table to `b`'s. Only the
 /// planner reads the copies: the executors evaluate the clauses as
 /// written. A LEFT JOIN's ON terms (`excl`) neither fix nor are
-/// rewritten.
-fn propagate(conj: &[&RExpr], excl: &[bool], srcs: &[Src]) -> AVec<RExpr> {
+/// rewritten; a term under a COLLATE / likely() wrapper (`nofix`)
+/// fixes nothing.
+fn propagate(conj: &[&RExpr], excl: &[bool], nofix: &[bool], srcs: &[Src]) -> AVec<RExpr> {
     let mut fixed: AVec<Fixed> = AVec::new();
     // (Only a WHERE clause of two or more AND terms, ON clauses
     // included: `p->pWhere->op==TK_AND`.)
     let active = conj.len() >= 2;
     // `findConstInWhere` walks the AND tree right to left.
     for (ci, c) in conj.iter().enumerate().rev() {
-        if !active || excl.get(ci).copied().unwrap_or(true) {
+        // (A term under a COLLATE or likely() wrapper fixes nothing:
+        // `findConstInWhere` looks at `=` and AND nodes only.)
+        if !active
+            || excl.get(ci).copied().unwrap_or(true)
+            || nofix.get(ci).copied().unwrap_or(true)
+        {
             continue;
         }
         let RExpr::Binary(crate::sql::BinOp::Eq, l, r) = c else {
@@ -672,7 +678,7 @@ fn virtual_source(sp: &SourcePlan) -> bool {
 /// Whether the join planner takes core `sources` (two or more, each
 /// `join_source_ok`).
 pub(super) fn join_eligible(sources: &[SourcePlan]) -> bool {
-    (2..=63).contains(&sources.len()) && sources.iter().all(join_source_ok)
+    (2..=64).contains(&sources.len()) && sources.iter().all(join_source_ok)
 }
 
 impl<S: Storage> Connection<S> {
@@ -913,16 +919,24 @@ impl<S: Storage> Connection<S> {
         // A JSON table-valued function: `json` and `root` are its
         // inputs (`jsonEachBestIndex`: an unusable one rejects the
         // plan; with the JSON argument the cost is 1).
+        // (An argument reading a source the call may not follow — past
+        // a CROSS JOIN — is not offered at all; without the JSON
+        // argument the call has no input: review fix, it was refused.)
         let deps: AVec<u64> = {
             let mut v = AVec::new();
             for a in args.iter().take(2) {
-                v.push(src_mask(a, bands) & !me);
+                let d = src_mask(a, bands) & !me;
+                if d & unusable != 0 {
+                    if v.is_empty() {
+                        out.push((0, log_est_from_double(5e98), log_est(25)));
+                        return out;
+                    }
+                    break;
+                }
+                v.push(d);
             }
             v
         };
-        if deps.iter().any(|d| d & unusable != 0) {
-            return out;
-        }
         let ask = |mask: u64| -> Option<(u64, i32, i32)> {
             let mut pre = 0u64;
             for d in deps.iter() {
@@ -1077,8 +1091,12 @@ impl<S: Storage> Connection<S> {
         // The WHERE clause's terms: the WHERE, then the ON clauses.
         let mut conj: AVec<&RExpr> = AVec::new();
         let mut on_of: AVec<Option<usize>> = AVec::new();
+        // Per term: its truth probability, and whether a COLLATE /
+        // likely() wrapper was removed above it.
+        let mut meta: AVec<(i32, bool)> = AVec::new();
         if let Some(f) = filter.as_ref() {
             conjuncts(f, &mut conj);
+            crate::xplan::conjuncts_meta(f, &mut meta);
         }
         while on_of.len() < conj.len() {
             on_of.push(None);
@@ -1086,6 +1104,7 @@ impl<S: Storage> Connection<S> {
         for (i, sp) in sources.iter().enumerate() {
             if let Some(on) = &sp.on {
                 conjuncts(on, &mut conj);
+                crate::xplan::conjuncts_meta(on, &mut meta);
                 let left = sp.kind == crate::sql::JoinKind::Left;
                 while on_of.len() < conj.len() {
                     on_of.push(if left { Some(i) } else { None });
@@ -1095,10 +1114,20 @@ impl<S: Storage> Connection<S> {
         // The planner reads the terms after the pin's constant
         // propagation.
         let mut excl: AVec<bool> = AVec::new();
-        for o in on_of.iter() {
+        let mut nofix: AVec<bool> = AVec::new();
+        let mut truth: AVec<i32> = AVec::new();
+        for (ci, o) in on_of.iter().enumerate() {
             excl.push(o.is_some());
+            let (tp, w) = meta.as_slice().get(ci).copied().unwrap_or((1, false));
+            nofix.push(w);
+            truth.push(tp);
         }
-        let prop = propagate(conj.as_slice(), excl.as_slice(), srcs_s.as_slice());
+        let prop = propagate(
+            conj.as_slice(),
+            excl.as_slice(),
+            nofix.as_slice(),
+            srcs_s.as_slice(),
+        );
         // `x IS NULL` / `x IS NOT NULL` on a column that cannot be
         // NULL is the constant 0 / 1 (the pin's resolver,
         // `sqlite3ExprCanBeNull`), unless the column is of a LEFT
@@ -1208,7 +1237,9 @@ impl<S: Storage> Connection<S> {
             };
             match t {
                 Some(t) => {
-                    models.push(self.table_models(arena, t, s));
+                    let (w, mut ms) = self.table_models(arena, t, s);
+                    xindex::mark_xcover(ms.as_mut_slice(), s, &core_info, sources.as_slice());
+                    models.push((w, ms));
                     notnulls.push(self.not_null_cols(t));
                 }
                 None => {
@@ -1305,7 +1336,7 @@ impl<S: Storage> Connection<S> {
             };
             let left = sp.kind == crate::sql::JoinKind::Left;
             let mut ts: AVec<Term> = AVec::new();
-            for t in terms(conj.as_slice(), &s, &avail).iter() {
+            for t in terms(conj.as_slice(), truth.as_slice(), &s, &avail).iter() {
                 let owner = on_of.as_slice().get(t.parent).copied().flatten();
                 let ok = if left {
                     owner == Some(i)
@@ -1446,6 +1477,7 @@ impl<S: Storage> Connection<S> {
         }
         let jq = JQuery {
             conj: conj.as_slice(),
+            truth: truth.as_slice(),
             cmask: cmask.as_slice(),
             pure: pure.as_slice(),
             on_of: on_of.as_slice(),
@@ -1543,11 +1575,17 @@ impl<S: Storage> Connection<S> {
                     None => true,
                     Some(m) => m.covers_all,
                 };
+                // (The first loop of a join that delivers the GROUP
+                // BY keeps an access path to say so, whatever it is:
+                // the groups are emitted as they come; v0.17 review
+                // fix.)
+                let groups = pos == 0 && group_by_o && plan.ob_sat >= order.len();
                 if natural
                     && jl.l.eq.is_empty()
                     && jl.l.lo.is_none()
                     && jl.l.hi.is_none()
                     && !reverse
+                    && !groups
                 {
                     None
                 } else {
@@ -1558,14 +1596,13 @@ impl<S: Storage> Connection<S> {
                         for u in js.used.iter() {
                             needed.push(*u);
                         }
-                        let covers = m.covers(needed.as_slice());
                         #[cfg(feature = "explain")]
                         {
-                            a.eqp.1 = !m.covers_all && covers;
+                            a.eqp.1 = !m.covers_all && m.covers(needed.as_slice());
                         }
                         if js.tab.wr {
                             // (A WITHOUT ROWID table's rows come whole.)
-                        } else if covers {
+                        } else if m.covers_plain(needed.as_slice()) {
                             let mut map: AVec<Option<usize>> = AVec::new();
                             for k in m.keys.iter() {
                                 map.push(match k {
@@ -1880,201 +1917,328 @@ fn vt_masks(
     }
 }
 
-/// One `sqlite_stat1` row as loaded (v0.17): `tbl`, `idx`, `stat`.
-pub(super) type Stat1Row = (AVec<u8>, Option<AVec<u8>>, AVec<u8>);
+/// The statistics the planner reads (v0.17, `join_order`), held as
+/// the pin holds them on its schema objects: per table its
+/// `nRowLogEst` and `TF_HasStat1`, per index its `aiRowLogEst` and
+/// `hasStat1` (ASCII names, matched case-blind). They are set when
+/// the schema is read and by ANALYZE (`sqlite3AnalysisLoad`), and
+/// otherwise only follow the schema: a new table starts at 200, a new
+/// index gets `sqlite3DefaultRowEst` from its table's estimate then,
+/// a dropped object takes its numbers with it (review fix: a DROP
+/// INDEX after ANALYZE leaves the table's estimate in place).
+#[derive(Default)]
+pub(super) struct StatState {
+    tabs: AVec<(AVec<u8>, i32, bool)>,
+    idxs: AVec<(AVec<u8>, AVec<i32>, bool)>,
+}
 
-/// The integers at the start of a `stat` text (`decodeIntArray`),
-/// as LogEst, at most `n` of them.
-fn stat_ints(stat: &[u8], n: usize) -> AVec<i32> {
-    let mut out = AVec::new();
+/// `decodeIntArray` into `out` (LogEst): up to `out.len()` integers
+/// of a `stat` text, each digits then an optional space; the counts
+/// wrap as the pin's `tRowcnt` does; entries past the text's end keep
+/// their values.
+fn decode_ints(stat: &[u8], out: &mut [i32]) {
     let mut z = stat;
-    while out.len() < n && !z.is_empty() {
-        let mut v: u64 = 0;
-        while let Some(c) = z.first().filter(|c| c.is_ascii_digit()) {
-            v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
-            z = z.get(1..).unwrap_or(&[]);
-        }
-        out.push(crate::xplan::log_est(v));
-        if z.first() == Some(&b' ') {
-            z = z.get(1..).unwrap_or(&[]);
-        } else {
+    for slot in out.iter_mut() {
+        if z.is_empty() {
             break;
         }
+        let mut v: u64 = 0;
+        while let Some(c) = z.first().filter(|c| c.is_ascii_digit()) {
+            v = v.wrapping_mul(10).wrapping_add(u64::from(c - b'0'));
+            z = z.get(1..).unwrap_or(&[]);
+        }
+        *slot = crate::xplan::log_est(v);
+        if z.first() == Some(&b' ') {
+            z = z.get(1..).unwrap_or(&[]);
+        }
     }
-    out
 }
 
 impl<S: Storage> Connection<S> {
-    /// Read `sqlite_stat1` back (v0.17, `join_order`): at schema load
-    /// and after ANALYZE, as the pin's `sqlite3AnalysisLoad`; later
-    /// writes to the table are seen at the next of those.
-    pub(super) async fn load_stat1(&mut self) -> Result<(), S::Error> {
+    /// After a schema read: the pin's statistics as at a fresh open
+    /// (`sqlite3InitOne`: every table at 200, every index at its
+    /// defaults, then `sqlite3AnalysisLoad`), or — `keep`, after this
+    /// connection's own CREATE / DROP (the pin parses only the new
+    /// object) — the statistics held so far, brought in step with the
+    /// schema (`stat_follow`).
+    pub(super) async fn load_stats(&mut self, keep: bool) -> Result<(), S::Error> {
+        if keep {
+            self.stat_follow();
+            return Ok(());
+        }
+        self.stat = StatState::default();
+        self.stat_follow();
         let root = self
             .catalog
             .find(&self.catalog_arena, b"sqlite_stat1")
             .filter(|t| t.has_rowid())
             .map(|t| t.root);
-        self.load_stat1_from(root).await
+        self.analysis_load(root).await
     }
 
-    /// `load_stat1` from the table rooted at `root` (ANALYZE knows
-    /// it before the schema is read again).
-    pub(super) async fn load_stat1_from(&mut self, root: Option<u32>) -> Result<(), S::Error> {
-        self.stat1.clear();
-        let Some(root) = root else {
-            return Ok(());
-        };
-        let text = |v: Option<&crate::record::Value<'_>>| -> Option<AVec<u8>> {
-            match v {
-                Some(crate::record::Value::Text(t)) => Some(copy_vec(t)),
-                Some(crate::record::Value::Integer(i)) => {
-                    let mut o = AVec::new();
-                    let mut d: AVec<u8> = AVec::new();
-                    let mut x = i.unsigned_abs();
-                    loop {
-                        d.push(b'0' + (x % 10) as u8);
-                        x /= 10;
-                        if x == 0 {
-                            break;
-                        }
-                    }
-                    if *i < 0 {
-                        o.push(b'-');
-                    }
-                    for c in d.iter().rev() {
-                        o.push(*c);
-                    }
-                    Some(o)
-                }
-                _ => None,
+    /// Drop the statistics of objects the schema no longer has; give
+    /// a new table the default 200 and a new index its defaults.
+    fn stat_follow(&mut self) {
+        let ca = &self.catalog_arena;
+        let tabs = &self.catalog.tables;
+        let idxs = &self.catalog.indexes;
+        let st = &mut self.stat;
+        let mut k = 0;
+        while k < st.tabs.len() {
+            let gone = st.tabs.as_slice().get(k).is_some_and(|(n, ..)| {
+                !tabs
+                    .iter()
+                    .any(|t| eq_ci(handle_bytes(ca, t.name), n.as_slice()))
+            });
+            if gone {
+                st.tabs.remove_at(k);
+            } else {
+                k += 1;
             }
-        };
-        let mut cur = ScanCursor::new(root);
-        while let Some((_, payload)) = cur.next_row(&mut self.pager).await? {
-            let vals = crate::record::decode_record::<S::Error>(payload.as_slice(), 3)?;
-            let v = vals.as_slice();
-            let (Some(t), Some(st)) = (text(v.first()), text(v.get(2))) else {
-                continue;
+        }
+        let mut k = 0;
+        while k < st.idxs.len() {
+            let gone = st.idxs.as_slice().get(k).is_some_and(|(n, ..)| {
+                !idxs
+                    .iter()
+                    .any(|i| eq_ci(handle_bytes(ca, i.name), n.as_slice()))
+            });
+            if gone {
+                st.idxs.remove_at(k);
+            } else {
+                k += 1;
+            }
+        }
+        for t in tabs.iter() {
+            let n = handle_bytes(ca, t.name);
+            if !st.tabs.iter().any(|(x, ..)| eq_ci(x.as_slice(), n)) {
+                st.tabs.push((copy_vec(n), crate::xplan::ROWS, false));
+            }
+        }
+        for i in idxs.iter() {
+            let n = handle_bytes(ca, i.name);
+            if !st.idxs.iter().any(|(x, ..)| eq_ci(x.as_slice(), n)) {
+                let mut a: AVec<i32> = AVec::new();
+                for _ in 0..=i.columns.len() {
+                    a.push(0);
+                }
+                st.idxs.push((copy_vec(n), a, false));
+                default_row_est(st, ca, i);
+            }
+        }
+    }
+
+    /// The pin's `sqlite3AnalysisLoad` over the `sqlite_stat1` table
+    /// rooted at `root` (none: no statistics): every `TF_HasStat1` /
+    /// `hasStat1` cleared, each row applied as `analysisLoader` does,
+    /// then the defaults for every index the rows did not reach. A
+    /// table's `nRowLogEst` is not reset first, as on the pin.
+    pub(super) async fn analysis_load(&mut self, root: Option<u32>) -> Result<(), S::Error> {
+        for t in self.stat.tabs.as_mut_slice() {
+            t.2 = false;
+        }
+        for i in self.stat.idxs.as_mut_slice() {
+            i.2 = false;
+        }
+        if let Some(root) = root {
+            // (`sqlite3_exec`'s text of each value.)
+            let text = |v: Option<&crate::record::Value<'_>>| -> Option<AVec<u8>> {
+                let o = match v? {
+                    crate::record::Value::Null => return None,
+                    crate::record::Value::Text(t) | crate::record::Value::Blob(t) => {
+                        return Some(copy_vec(t));
+                    }
+                    crate::record::Value::Integer(i) => OwnedValue::Integer(*i),
+                    crate::record::Value::Real(r) => OwnedValue::Real(*r),
+                };
+                match crate::query::cast_value(&o, crate::record::Affinity::Text) {
+                    OwnedValue::Text(t) => Some(t),
+                    _ => None,
+                }
             };
-            self.stat1.push((t, text(v.get(1)), st));
+            let mut cur = ScanCursor::new(root);
+            while let Some((_, payload)) = cur.next_row(&mut self.pager).await? {
+                let vals = crate::record::decode_record::<S::Error>(payload.as_slice(), 3)?;
+                let v = vals.as_slice();
+                let (Some(t), Some(st)) = (text(v.first()), text(v.get(2))) else {
+                    continue;
+                };
+                let ix = text(v.get(1));
+                self.stat_row(
+                    t.as_slice(),
+                    ix.as_ref().map(|x| x.as_slice()),
+                    st.as_slice(),
+                );
+            }
+        }
+        let ca = &self.catalog_arena;
+        for i in self.catalog.indexes.iter() {
+            let n = handle_bytes(ca, i.name);
+            if self
+                .stat
+                .idxs
+                .iter()
+                .any(|(x, _, has)| !*has && eq_ci(x.as_slice(), n))
+            {
+                default_row_est(&mut self.stat, ca, i);
+            }
         }
         Ok(())
     }
 
-    /// What `sqlite_stat1` says of table `t` (the pin's loader): its
-    /// row estimate, whether it has statistics (`TF_HasStat1`), and
-    /// each index's `aiRowLogEst` given there (by root page).
-    fn stat_of(&self, t: &crate::schema::TableDef) -> (i32, bool, AVec<(u32, AVec<i32>)>) {
+    /// One `sqlite_stat1` row (`analysisLoader`): `idx` names any
+    /// index of the schema (its table need not be `tbl`), or `tbl`
+    /// itself for a WITHOUT ROWID table's PRIMARY KEY; otherwise the
+    /// row is `tbl`'s own row count.
+    fn stat_row(&mut self, tbl: &[u8], idx: Option<&[u8]>, stat: &[u8]) {
         let ca = &self.catalog_arena;
-        let tn = handle_bytes(ca, t.name);
-        let mut rows = crate::xplan::ROWS;
-        let mut has = false;
-        let mut ests: AVec<(u32, AVec<i32>)> = AVec::new();
-        for (tbl, idx, stat) in self.stat1.iter() {
-            if !eq_ci(tbl.as_slice(), tn) {
-                continue;
+        // (`sqlite3FindTable` finds a view too: its numbers are never
+        // read, but an index the row names still takes them.)
+        let tab = self.catalog.find(ca, tbl);
+        if tab.is_none() && self.catalog.find_view(ca, tbl).is_none() {
+            return;
+        }
+        let ix = idx.and_then(|n| {
+            if eq_ci(n, tbl) {
+                #[cfg(feature = "without_rowid")]
+                return tab.and_then(|t| {
+                    self.catalog
+                        .indexes_for(ca, handle_bytes(ca, t.name))
+                        .find(|i| i.clustered)
+                });
+                #[cfg(not(feature = "without_rowid"))]
+                return None;
             }
-            let ix = idx.as_ref().and_then(|n| {
-                self.catalog.indexes_for(ca, tn).find(|i| {
-                    if eq_ci(n.as_slice(), tn) {
-                        #[cfg(feature = "without_rowid")]
-                        return i.clustered;
-                        #[cfg(not(feature = "without_rowid"))]
-                        return false;
-                    } else {
-                        eq_ci(handle_bytes(ca, i.name), n.as_slice())
-                    }
-                })
-            });
-            match ix {
-                Some(i) => {
-                    let nk = i.columns.len();
-                    // Over the defaults the schema load gave it.
-                    let mut a: AVec<i32> = AVec::new();
-                    a.push(if i.partial() {
-                        crate::xplan::ROWS - 10
-                    } else {
-                        crate::xplan::ROWS
-                    });
-                    const VALS: [i32; 5] = [33, 32, 30, 28, 26];
-                    for k in 0..nk {
-                        a.push(VALS.get(k).copied().unwrap_or(23));
-                    }
-                    if i.unique
-                        && let Some(l) = a.as_mut_slice().last_mut()
-                    {
-                        *l = 0;
-                    }
-                    for (k, v) in stat_ints(stat.as_slice(), nk + 1).iter().enumerate() {
-                        if let Some(x) = a.as_mut_slice().get_mut(k) {
-                            *x = *v;
-                        }
-                    }
-                    if !i.partial() {
-                        rows = a.as_slice().first().copied().unwrap_or(rows);
-                        has = true;
-                    }
-                    if let Some(p) = ests.iter().position(|(r, _)| *r == i.root) {
-                        ests.remove_at(p);
-                    }
-                    ests.push((i.root, a));
+            self.catalog
+                .indexes
+                .iter()
+                .find(|i| eq_ci(handle_bytes(ca, i.name), n))
+        });
+        let st = &mut self.stat;
+        let tp = tab.and_then(|t| {
+            let tn = handle_bytes(ca, t.name);
+            st.tabs.iter().position(|(x, ..)| eq_ci(x.as_slice(), tn))
+        });
+        let tp = tp.unwrap_or(usize::MAX);
+        match ix {
+            Some(i) => {
+                let n = handle_bytes(ca, i.name);
+                let Some(e) = st
+                    .idxs
+                    .as_mut_slice()
+                    .iter_mut()
+                    .find(|(x, ..)| eq_ci(x.as_slice(), n))
+                else {
+                    return;
+                };
+                decode_ints(stat, e.1.as_mut_slice());
+                e.2 = true;
+                let first = e.1.as_slice().first().copied();
+                if !i.partial()
+                    && let (Some(t), Some(r)) = (st.tabs.as_mut_slice().get_mut(tp), first)
+                {
+                    t.1 = r;
+                    t.2 = true;
                 }
-                None => {
-                    if let Some(v) = stat_ints(stat.as_slice(), 1).as_slice().first() {
-                        rows = *v;
-                    }
-                    has = true;
+            }
+            None => {
+                if let Some(t) = st.tabs.as_mut_slice().get_mut(tp) {
+                    let mut r = [t.1];
+                    decode_ints(stat, &mut r);
+                    t.1 = r[0];
+                    t.2 = true;
                 }
             }
         }
-        // An index without statistics takes the defaults, lifting the
-        // table's estimate to at least 1,000 rows (`sqlite3DefaultRowEst`).
-        if rows < 99
-            && self
-                .catalog
-                .indexes_for(ca, tn)
-                .any(|i| !ests.iter().any(|(r, _)| *r == i.root))
-        {
-            rows = 99;
-        }
-        (rows, has, ests)
+    }
+
+    fn stat_tab(&self, t: &crate::schema::TableDef) -> Option<&(AVec<u8>, i32, bool)> {
+        let n = handle_bytes(&self.catalog_arena, t.name);
+        self.stat.tabs.iter().find(|(x, ..)| eq_ci(x.as_slice(), n))
     }
 
     /// Table `t`'s `nRowLogEst` (v0.17, `join_order`).
     pub(super) fn table_rows(&self, t: &crate::schema::TableDef) -> i32 {
-        if self.stat1.is_empty() {
-            return crate::xplan::ROWS;
-        }
-        self.stat_of(t).0
+        self.stat_tab(t).map_or(crate::xplan::ROWS, |e| e.1)
     }
 
     /// Whether table `t` has `sqlite_stat1` rows (`TF_HasStat1`).
     pub(super) fn table_has_stat(&self, t: &crate::schema::TableDef) -> bool {
-        !self.stat1.is_empty() && self.stat_of(t).1
+        self.stat_tab(t).is_some_and(|e| e.2)
     }
 
-    /// Index `ix`'s `aiRowLogEst` from `sqlite_stat1`, if any.
-    pub(super) fn stat_est(
+    /// Index `ix`'s `aiRowLogEst` when `sqlite_stat1` gave it
+    /// (`hasStat1`).
+    fn stat_est(
         &self,
-        t: &crate::schema::TableDef,
+        _t: &crate::schema::TableDef,
         ix: &crate::schema::IndexDef,
     ) -> Option<AVec<i32>> {
-        if self.stat1.is_empty() {
-            return None;
-        }
-        self.stat_of(t)
-            .2
-            .into_iter()
-            .find(|(r, _)| *r == ix.root)
-            .map(|(_, a)| a)
+        let n = handle_bytes(&self.catalog_arena, ix.name);
+        self.stat
+            .idxs
+            .iter()
+            .find(|(x, _, has)| *has && eq_ci(x.as_slice(), n))
+            .map(|e| e.1.clone())
     }
 
-    /// `IdxModel::est` for index `ix` of `t`.
+    /// Index `ix`'s `aiRowLogEst` (`IdxModel::est`).
     pub(super) fn index_stat(
         &self,
-        t: &crate::schema::TableDef,
+        _t: &crate::schema::TableDef,
         ix: &crate::schema::IndexDef,
     ) -> Option<AVec<i32>> {
-        self.stat_est(t, ix)
+        let n = handle_bytes(&self.catalog_arena, ix.name);
+        self.stat
+            .idxs
+            .iter()
+            .find(|(x, ..)| eq_ci(x.as_slice(), n))
+            .map(|e| e.1.clone())
     }
+}
+
+/// The pin's `sqlite3DefaultRowEst` for index `i`: its table's
+/// estimate (lifted to at least 1,000 rows, on the table too; less
+/// half for a partial index), then ten rows per value of the first
+/// column, 9, 8, 7, 6 (LogEst 33 32 30 28 26), then 23; one row per
+/// key of a UNIQUE index.
+fn default_row_est(st: &mut StatState, ca: &crate::arena::Arena, i: &crate::schema::IndexDef) {
+    let tn = handle_bytes(ca, i.table);
+    let mut x = crate::xplan::ROWS;
+    if let Some(t) = st
+        .tabs
+        .as_mut_slice()
+        .iter_mut()
+        .find(|(n, ..)| eq_ci(n.as_slice(), tn))
+    {
+        if t.1 < 99 {
+            t.1 = 99;
+        }
+        x = t.1;
+    }
+    if i.partial() {
+        x -= 10;
+    }
+    let n = handle_bytes(ca, i.name);
+    let Some(e) = st
+        .idxs
+        .as_mut_slice()
+        .iter_mut()
+        .find(|(m, ..)| eq_ci(m.as_slice(), n))
+    else {
+        return;
+    };
+    const VALS: [i32; 5] = [33, 32, 30, 28, 26];
+    let nk = i.columns.len();
+    let mut a: AVec<i32> = AVec::new();
+    a.push(x);
+    for k in 0..nk {
+        a.push(VALS.get(k).copied().unwrap_or(23));
+    }
+    if i.unique
+        && let Some(l) = a.as_mut_slice().last_mut()
+    {
+        *l = 0;
+    }
+    e.1 = a;
 }

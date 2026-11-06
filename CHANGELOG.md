@@ -26,6 +26,23 @@ All notable changes to hipp. Versions follow the milestones in
   join, not a CROSS JOIN.
 - Tests: `tests/join_order_v17.rs`, `hipp-cli/tests/cli_v17_join_order.rs`.
   Size: xl +48,032 B (1,103,060 B); max +128 B; full +48 B; tiny 0.
+- Review fixes: a GROUP BY a join (or a rowid scan) delivers in
+  another column order emits its groups in loop order, as the pin's
+  plan says; likely() / unlikely() / likelihood() and COLLATE around a
+  WHERE term no longer hide it from the planner, and their probability
+  is the pin's `truthProb`; the LEFT JOIN simplification sees through
+  them and takes `x IS DISTINCT FROM NULL` as NOTNULL; the statistics
+  held in a connection follow DDL as the pin's (DROP INDEX keeps the
+  table's estimate, ALTER / VACUUM / a rolled-back schema change
+  reload) and stat rows are decoded as `analysisLoader` does; UPDATE
+  ... FROM is planned as a join (the pin's final table when several
+  FROM rows match, automatic indexes); 64-source joins are planned;
+  expression indexes cover SELECTs that read only their expressions,
+  and BETWEEN with column bounds probes the bounds' table (the latter
+  under `expr_index`);
+  a table-valued argument past a CROSS JOIN is left out of the call as
+  on the pin instead of being refused. Size: xl +11,400 B (1,114,356 B);
+  max +448 B (1,046,892 B); full +192 B (506,672 B); tiny 0.
 
 ### FTS5 delete writes (leaf `fts5_delete`, in `xl`)
 

@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 506,480 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,046,444 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,102,956 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 506,672 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,046,892 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,114,356 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -110,9 +110,13 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   in the pin's order, EXPLAIN QUERY PLAN prints the pin's loops, and
   `FROM f, m WHERE f MATCH m.q` or `FROM json_each(t.j), t` run
   instead of being refused; an automatic index turns a 2,000 x 2,000
-  equi-join from 4 million comparisons into 2,000 probes. Without the
-  leaf joins run in FROM order as in 0.16 (`src/xjoin.rs`,
-  `src/session/join.rs`).
+  equi-join from 4 million comparisons into 2,000 probes. UPDATE ...
+  FROM is planned as the same kind of join (the final table is the
+  pin's when several FROM rows match), joins of up to 64 sources are
+  ordered, likely() / unlikely() / likelihood() terms keep their index
+  use and give the pin's estimates, and the statistics a connection
+  holds follow DDL as the pin's do. Without the leaf joins run in
+  FROM order as in 0.16 (`src/xjoin.rs`, `src/session/join.rs`).
 
 ## What v0.16 does
 
@@ -153,7 +157,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   without one); VIRTUAL / STORED generated columns in the pin's
   record layout (files interoperate both ways), indexable,
   recomputed on UPDATE; UPDATE ... FROM applying only the last
-  matching combination (in hipp's join order); MustBeInt rowid
+  matching combination (in hipp's join order; the pin's join order
+  with v0.17's `join_order`); MustBeInt rowid
   conversion. The tiny profile refuses those clauses
   (`RequiresEvaluator`) instead of ignoring them, and still
   shrank. Behind `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE
@@ -1309,7 +1314,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,480 B of 512 KiB, `max` 1,046,444 B of 1 MiB, `xl` 1,102,956 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,672 B of 512 KiB, `max` 1,046,892 B of 1 MiB, `xl` 1,114,356 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

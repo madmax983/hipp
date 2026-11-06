@@ -1,10 +1,11 @@
 //! hipp-cli v0.17 join ordering (leaf `join_order`): byte-for-byte
 //! the pinned oracle's stdout for joins the pin reorders — the rows of
-//! a query without ORDER BY in the pin's order, `.eqp on` and EXPLAIN
-//! QUERY PLAN trees (SCAN / SEARCH order, AUTOMATIC [PARTIAL] COVERING
-//! INDEX, BLOOM FILTER ON) rendered by the shell, after the pin's
-//! ANALYZE and after hipp's, and MATCH / table-valued arguments reading
-//! a table listed later in FROM.
+//! a query without ORDER BY in the pin's order and EXPLAIN QUERY PLAN
+//! statements' trees (SCAN / SEARCH order, AUTOMATIC [PARTIAL]
+//! COVERING INDEX, BLOOM FILTER ON) as the shell renders them, after
+//! the pin's ANALYZE and after hipp's, and MATCH / table-valued
+//! arguments reading a table listed later in FROM. (hipp's shell has
+//! no `.eqp`, so the plans come from EXPLAIN QUERY PLAN statements.)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -138,5 +139,40 @@ SELECT value, n FROM generate_series(1, t.n), t;
 EXPLAIN QUERY PLAN SELECT value, n FROM generate_series(1, t.n), t;
 SELECT key, value, n FROM json_each(t.j), t;
 EXPLAIN QUERY PLAN SELECT key, value, n FROM json_each(t.j), t;",
+    );
+}
+
+/// The review fixes, as the shell prints them: groups in loop order,
+/// likely()-wrapped join terms, UPDATE ... FROM's final table, the
+/// statistics held after DROP INDEX, a table-valued argument past a
+/// CROSS JOIN.
+#[test]
+fn review_fix_outputs() {
+    same(
+        "review",
+        "CREATE TABLE t1(id INTEGER PRIMARY KEY, a, b); CREATE INDEX t1ba ON t1(b, a);
+INSERT INTO t1 VALUES(1,1,2),(2,2,1),(3,1,1),(4,2,2),(5,3,0);
+CREATE TABLE t0(id INTEGER PRIMARY KEY, v); INSERT INTO t0 VALUES(1,1),(2,2),(3,3);
+CREATE TABLE a(id INTEGER PRIMARY KEY, x, y); CREATE TABLE b(id INTEGER PRIMARY KEY, ax, v);
+CREATE INDEX bax ON b(ax);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300)
+INSERT INTO a SELECT i, i%6, i%40 FROM n;
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300)
+INSERT INTO b SELECT i, i%150, i*7%11 FROM n;
+CREATE TABLE t(n INT, j TEXT); INSERT INTO t VALUES(2,'[1,2]'),(3,'[5]');",
+        "SELECT t1.a, t1.b, count(*) FROM t1, t0 WHERE t0.id = t1.a GROUP BY t1.a, t1.b;
+EXPLAIN QUERY PLAN SELECT t1.a, t1.b, count(*) FROM t1, t0 WHERE t0.id = t1.a GROUP BY t1.a, t1.b;
+EXPLAIN QUERY PLAN SELECT a.id, b.id FROM b, a WHERE likely(a.id = b.ax);
+SELECT a.id, b.id FROM a, b WHERE likely(b.ax = a.y) LIMIT 6;
+EXPLAIN QUERY PLAN SELECT a.id, b.id FROM a LEFT JOIN b ON b.ax = a.x WHERE b.v IS DISTINCT FROM NULL;
+ANALYZE;
+DROP INDEX bax;
+EXPLAIN QUERY PLAN SELECT a.id, b.id FROM a, b WHERE a.y = b.ax;
+SELECT a.id, b.id FROM a, b WHERE a.y = b.ax LIMIT 6;
+EXPLAIN QUERY PLAN UPDATE a SET y = b.v FROM b WHERE b.ax = a.x;
+UPDATE a SET y = b.v FROM b WHERE b.ax = a.x;
+SELECT * FROM a WHERE id < 9;
+SELECT count(*) FROM json_each(t.j) CROSS JOIN t;
+EXPLAIN QUERY PLAN SELECT * FROM json_each(t.j) CROSS JOIN t;",
     );
 }

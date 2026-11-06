@@ -1239,7 +1239,7 @@ impl<S: Storage> Statement<'_, S> {
         // v0.17 (`join_order`): the planner reads the new statistics,
         // as the pin's `sqlite3AnalysisLoad` after ANALYZE.
         #[cfg(feature = "join_order")]
-        alloc::boxed::Box::pin(self.conn.load_stat1_from(Some(root))).await?;
+        alloc::boxed::Box::pin(self.conn.analysis_load(Some(root))).await?;
         Ok(())
     }
 

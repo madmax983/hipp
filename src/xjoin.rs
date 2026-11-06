@@ -95,6 +95,8 @@ pub struct JQuery<'x> {
     /// The WHERE clause's terms: the WHERE's AND terms, then each
     /// source's ON terms in FROM order (the pin's `WhereClause`).
     pub conj: &'x [&'x RExpr],
+    /// Per term: its truth probability (`xplan::conj_truth`).
+    pub truth: &'x [i32],
     /// Per term: the sources it reads; whether it reads nothing else
     /// (no enclosing query, subquery or non-deterministic call: the
     /// pin's table-constant test); and the LEFT JOIN source whose ON
@@ -408,6 +410,7 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
         }
         let q = Query {
             conj: jq.conj,
+            truth: jq.truth,
             order: jq.order,
             group: jq.group,
             group_by: jq.group_by,
@@ -1002,6 +1005,7 @@ fn solve(
     });
     let q = Query {
         conj: jq.conj,
+        truth: jq.truth,
         order: jq.order,
         group: jq.group,
         group_by: jq.group_by,
@@ -1150,13 +1154,13 @@ fn solve(
     from.as_slice().first().cloned()
 }
 
-/// Plan the join (two or more sources, at most 63): the loops in
+/// Plan the join (two or more sources, at most 64, as the pin): the loops in
 /// the order the pin runs them. `None` when no path exists (the pin's
 /// "no query solution" cannot arise here: the full scans need only
 /// the FROM-order prerequisites).
 pub(crate) fn plan(srcs: &[JSrc<'_>], jq: &JQuery<'_>) -> Option<JPlan> {
     let n = srcs.len();
-    if !(2..=63).contains(&n) {
+    if !(2..=64).contains(&n) {
         return None;
     }
     let pre = from_prereqs(srcs);

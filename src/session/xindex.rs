@@ -887,6 +887,47 @@ pub(super) struct CoreInfo<'x> {
 }
 
 /// Whether any expression of the core reads column slot `slot`.
+/// Mark each expression index of `models` (source `s` of a SELECT
+/// core) that the statement reads only through its expressions and
+/// key columns (`IdxModel::xcover`, the pin's `WHERE_EXPRIDX`; v0.17
+/// review fix).
+#[cfg(feature = "join_order")]
+pub(super) fn mark_xcover(
+    models: &mut [crate::xplan::IdxModel],
+    s: &crate::xplan::Src,
+    info: &CoreInfo<'_>,
+    sources: &[SourcePlan],
+) {
+    let band = crate::query::RefRange {
+        w: (s.base, s.base + s.ncols),
+        s: (s.src, s.src + 1),
+    };
+    let sub = sources.iter().any(|sp| {
+        sp.derived
+            .as_ref()
+            .is_some_and(|d| crate::query::plan_refs_range(d, &band))
+    });
+    for m in models.iter_mut() {
+        if sub
+            || !m
+                .keys
+                .iter()
+                .any(|k| matches!(k, crate::xplan::IdxKey::Expr(_)))
+        {
+            continue;
+        }
+        let f = |e: &RExpr| m.reads_uncovered(e, s);
+        let uncovered = info.items.iter().any(f)
+            || info.filter.is_some_and(f)
+            || info.group_by.iter().any(f)
+            || info.having.is_some_and(f)
+            || info.order_by.iter().any(|(e, _)| f(e))
+            || info.also_reads.iter().any(|(e, _)| f(e))
+            || sources.iter().any(|sp| sp.on.as_ref().is_some_and(f));
+        m.xcover = !uncovered;
+    }
+}
+
 pub(super) fn core_reads(info: &CoreInfo<'_>, sources: &[SourcePlan], slot: usize) -> bool {
     let r = crate::query::RefRange {
         w: (slot, slot.saturating_add(1)),
@@ -1031,6 +1072,7 @@ impl<S: Storage> Connection<S> {
                 suffix_covers: !auto,
                 #[cfg(feature = "join_order")]
                 est: self.index_stat(t, ix),
+                xcover: false,
             });
         }
         (width, out)
@@ -1164,11 +1206,27 @@ impl<S: Storage> Connection<S> {
                 rowid_alias: sp.rowid_alias,
             };
             let mut conj: AVec<&RExpr> = AVec::new();
+            #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+            let mut truth: AVec<i32> = AVec::new();
             if i == 0 || !sp.kind.pads_right() {
                 conj.extend_from_slice(wconj);
+                #[cfg(feature = "join_order")]
+                if let Some(f) = info.filter {
+                    crate::xplan::conj_truth(f, &mut truth);
+                }
+            }
+            // (`wconj` is `info.filter`'s terms.)
+            #[cfg(feature = "join_order")]
+            {
+                truth.truncate(conj.len());
+                while truth.len() < conj.len() {
+                    truth.push(1);
+                }
             }
             if let Some(on) = &sp.on {
                 conjuncts(on, &mut conj);
+                #[cfg(feature = "join_order")]
+                crate::xplan::conj_truth(on, &mut truth);
             }
             let later = RefRange {
                 w: (base, core_end),
@@ -1186,7 +1244,7 @@ impl<S: Storage> Connection<S> {
                 }
                 Some(expr_refs_range(e, &earlier))
             };
-            let ts = terms(conj.as_slice(), &s, &avail);
+            let ts = terms(conj.as_slice(), truth.as_slice(), &s, &avail);
             // The ORDER BY (or GROUP BY / DISTINCT) the loop may
             // deliver: a lone source only.
             let mut order: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
@@ -1252,6 +1310,7 @@ impl<S: Storage> Connection<S> {
             }
             let q = Query {
                 conj: conj.as_slice(),
+                truth: truth.as_slice(),
                 order: order.as_slice(),
                 group,
                 group_by,
@@ -1265,7 +1324,10 @@ impl<S: Storage> Connection<S> {
                 #[cfg(feature = "join_order")]
                 jm: None,
             };
-            let (width, models) = self.table_models(arena, t, &s);
+            #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+            let (width, mut models) = self.table_models(arena, t, &s);
+            #[cfg(feature = "join_order")]
+            mark_xcover(models.as_mut_slice(), &s, info, sources);
             let notnull = self.not_null_cols(t);
             let tab = Table {
                 width,
@@ -1295,7 +1357,7 @@ impl<S: Storage> Connection<S> {
                 if t.has_rowid()
                     && a.root != 0
                     && let Some(m) = models.iter().find(|m| m.root == a.root)
-                    && m.covers(needed.as_slice())
+                    && m.covers_plain(needed.as_slice())
                 {
                     let mut map: AVec<Option<usize>> = AVec::new();
                     for k in m.keys.iter() {
@@ -1459,6 +1521,10 @@ impl<S: Storage> Connection<S> {
         };
         let mut conj: AVec<&RExpr> = AVec::new();
         conjuncts(f, &mut conj);
+        #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+        let mut truth: AVec<i32> = AVec::new();
+        #[cfg(feature = "join_order")]
+        crate::xplan::conj_truth(f, &mut truth);
         let all = RefRange {
             w: (0, usize::MAX),
             s: (0, usize::MAX),
@@ -1481,7 +1547,7 @@ impl<S: Storage> Connection<S> {
             Some(false)
         };
         self.hint_solvable(arena, t, hint, &s, conj.as_slice())?;
-        let ts = terms(conj.as_slice(), &s, &avail);
+        let ts = terms(conj.as_slice(), truth.as_slice(), &s, &avail);
         if ts.is_empty() && !wr && !forced {
             return Ok(None);
         }
@@ -1534,6 +1600,7 @@ impl<S: Storage> Connection<S> {
         }
         let q = Query {
             conj: conj.as_slice(),
+            truth: truth.as_slice(),
             order: &[],
             group: false,
             group_by: false,

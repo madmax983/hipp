@@ -1235,7 +1235,13 @@ impl<'a> Walk<'a> {
                 .derived
                 .as_deref()
                 .and_then(|d| d.values.as_slice().first())
-                .map_or(1, |r| if r.len() > 1 { 3 } else { 1 });
+                .map_or(1, |r| match r.len() {
+                    // (No JSON argument: a call whose argument reads
+                    // a source past a CROSS JOIN, v0.17.)
+                    0 => 0,
+                    1 => 1,
+                    _ => 3,
+                });
             out.extend_from_slice(b" VIRTUAL TABLE INDEX ");
             num(out, n, false);
             out.push(b':');
@@ -1727,8 +1733,35 @@ pub(super) fn describe<S: Storage>(
             filter,
             from_sources,
             returning,
+            #[cfg(feature = "join_order")]
+            from_join,
             ..
         } => {
+            // An UPDATE ... FROM the join planner ordered (v0.17
+            // review fix): its loops as a SELECT's.
+            #[cfg(feature = "join_order")]
+            if let Some(j) = from_join.as_deref() {
+                w.update_from = true;
+                let c = Core {
+                    sources: j.sources.as_slice(),
+                    items: &[],
+                    filter: None,
+                    group_by: &[],
+                    having: None,
+                    order_by: &[],
+                    distinct: false,
+                    has_agg: false,
+                    values: &[],
+                    sel: 0,
+                };
+                w.body(&c, 0, false, &c);
+                if let Some(f) = &j.filter {
+                    w.exprs(core::slice::from_ref(f), 0, &[]);
+                }
+                w.exprs(j.sets.as_slice(), 0, &[]);
+                w.exprs(returning.as_slice(), 0, &[]);
+                return;
+            }
             let alias = match ast {
                 Ast::Update { alias, .. } => *alias,
                 _ => None,

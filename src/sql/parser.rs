@@ -3356,9 +3356,10 @@ impl<'a> Parser<'a> {
             let start = self.pos;
             let r = self.operand::<E>(k, BP_REL)?;
             let bare = |p: &Self, w: &[u8]| p.pos == start + 1 && p.is_kw(start, w);
-            // `x IS [NOT] NULL` is the pin's null test (folded
-            // over a literal).
-            if !distinct && bare(self, b"NULL") {
+            // `x IS [NOT] [DISTINCT FROM] NULL` is the pin's null
+            // test (folded over a literal; `binaryToUnaryIfNull`:
+            // `IS DISTINCT FROM NULL` is NOTNULL, v0.17 review fix).
+            if bare(self, b"NULL") {
                 self.eh = lh;
                 self.ek = lk;
                 return self.null_test::<E>(l, neg);

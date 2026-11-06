@@ -3477,10 +3477,22 @@ fn resolve_call_body<E>(
             kind: SchemaKind::LikelihoodNotConstant,
         });
     }
-    Ok(RExpr::Scalar(
-        f,
-        resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?,
-    ))
+    #[allow(unused_mut)]
+    let mut rargs = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
+    // likely(X) / unlikely(X) carry their probability as likelihood's
+    // second argument (0.9375 / 0.0625: the pin's tuning), which the
+    // planner reads as the term's truth probability (v0.17 review
+    // fix; `EP_Unlikely`).
+    #[cfg(feature = "join_order")]
+    if f == ScalarFn::Likely && rargs.len() == 1 {
+        let p = if name.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'u')) {
+            0.0625
+        } else {
+            0.9375
+        };
+        rargs.push(RExpr::Literal(OwnedValue::Real(p)));
+    }
+    Ok(RExpr::Scalar(f, rargs))
 }
 
 /// Whether two resolved expressions are the same expression in

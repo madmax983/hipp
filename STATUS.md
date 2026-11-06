@@ -550,7 +550,8 @@ best loop, exactly as in 0.16.
 **Shipped** (`src/xjoin.rs`, `src/session/join.rs`; hooks in `xplan`,
 `session::{xindex, stream, eqp, vtab, json_tvf, maint}`):
 
-- **The pin's join planner** for a SELECT core of two to 63 sources
+- **The pin's join planner** for a SELECT core of two to 64 sources (63
+  before the review fixes)
   (tables of the main database, virtual tables, JSON table-valued
   functions; no RIGHT / FULL join): every candidate loop of each
   source with its prerequisites (`whereLoopAddBtree` /
@@ -687,7 +688,8 @@ planner is its largest single component, and the leaf sits in `xl`,
   through a LEFT JOIN the WHERE made inner. Rows differ in order in
   0.75% of queries (the same plans), never in content.
 - Not modelled: the MULTI-INDEX OR of b-tree tables, skip-scans,
-  `sqlite_stat4`, likelihood() and LIKE-length estimates, the
+  `sqlite_stat4`, LIKE-length estimates (likelihood() estimates:
+  closed by the review fixes below), the
   EXISTS-to-join rewrite, the ordered-inner-loop `ORDER BY ... LIMIT`
   case. A join containing a FROM subquery, view, CTE, TEMP or
   attached table, or a RIGHT / FULL join, keeps FROM order (the pin
@@ -703,7 +705,146 @@ planner is its largest single component, and the leaf sits in `xl`,
   still printed, as the pin builds them.
 - Statistics written to `sqlite_stat1` by hand are read at the next
   schema load or ANALYZE (as on the pin); a rolled-back ANALYZE keeps
-  its statistics in the connection until then (not probed).
+  its statistics in the connection until then (probed by the review
+  fixes below: as on the pin, unless the ANALYZE created
+  `sqlite_stat1`, a schema change whose rollback reloads).
+
+### Join ordering — review fixes (2026-11-06)
+
+**Status:** ten review findings on the `join_order` unit, each
+reproduced against the live pin; nine fixed with regression tests
+(`tests/join_order_v17.rs`: `group_by_in_loop_order`,
+`likelihood_wrapped_terms`, `left_join_strength_reduction`,
+`statistics_follow_ddl`, `update_from_is_a_join`, `join_of_64_tables`,
+`expression_covering_and_column_bounds`,
+`tvf_arguments_across_cross_join`; `hipp-cli/tests/cli_v17_join_order.rs`
+`review_fix_outputs`), one a doc fix. Gating as the unit (leaf
+`join_order`, in `xl`) except where noted.
+
+- **A GROUP BY a join delivers in another column order** (`GROUP BY
+  t1.a, t1.b` over an index on `(b, a)`, `GROUP BY c, id` over the
+  rowid): the pin emits the groups as its loops give them and prints
+  no group sorter; hipp printed the same plan but sorted the groups.
+  The join's first loop now keeps an access path that says the
+  groups arrive in order, whatever it is, and the executors honour it
+  for joins. The same bug for one table read in rowid order (`SELECT
+  c, id, count(*) FROM t GROUP BY c, id`) is fixed too (`expr_index`,
+  the v0.16 planner).
+- **likely() / unlikely() / likelihood() and COLLATE around a WHERE
+  term** are removed when the WHERE clause is split
+  (`sqlite3WhereSplit` / `whereClauseInsert`), so `likely(b.ax = a.x)`
+  still drives an index, a rowid lookup or an automatic index (it ran
+  as a nested loop: 1.38 s for a 2,000 x 2,000 join). The term's
+  probability is the pin's `truthProb` (`LogEst(P * 2^27) - 270`;
+  likely() and unlikely() now carry their 0.9375 / 0.0625 as
+  likelihood's second argument), inherited by its commuted copy,
+  BETWEEN halves, `x>NULL` and OR-to-IN children (`markTermAsChild`),
+  and it replaces the default estimates where the pin's does: an
+  equality on an index's table column (`nOut += truthProb`), a range
+  bound (`whereRangeAdjust`), an unused term (`whereLoopOutputAdjust`).
+  A wrapped `col = constant` fixes nothing for constant propagation
+  (`findConstInWhere` looks at `=` and AND nodes only). Single-table
+  plans follow the same rules with the leaf (below it, `max`'s budget
+  keeps 0.16's reading of a wrapped term as a plain filter).
+- **LEFT JOIN strength reduction** skips likely() / COLLATE wrappers
+  (`sqlite3ExprSkipCollateAndLikely`), and `x IS DISTINCT FROM NULL`
+  is the pin's NOTNULL (`IS NOT DISTINCT FROM NULL` its ISNULL: the
+  parser's `binaryToUnaryIfNull`, `v16`), so both null-reject.
+- **The statistics a connection holds** follow the pin's model
+  (`StatState`): per table `nRowLogEst` / `TF_HasStat1`, per index
+  `aiRowLogEst` / `hasStat1`, set when the schema is read
+  (`sqlite3InitOne`: tables at 200, indexes at their defaults, then
+  `sqlite3AnalysisLoad`) and by ANALYZE (which clears the flags but
+  not a table's estimate), and otherwise only following this
+  connection's CREATE / DROP (a dropped index's table keeps its
+  estimate; a new index's defaults come from it, lifting it to the
+  1,000-row floor). ALTER TABLE (every form), VACUUM, the rollback
+  of a schema change (ROLLBACK, ROLLBACK TO) and another connection's
+  schema change read schema and statistics again. hipp re-read
+  `sqlite_stat1` after every DDL instead. Rows are read as
+  `analysisLoader` reads them: counts wrap (`tRowcnt`), a row's index
+  is found by name in the whole schema (it may belong to another
+  table: its estimate then also becomes the row's table's), an
+  unknown index makes the row its table's own count, every value is
+  read as text.
+- **UPDATE ... FROM is planned as a join** of the target and the FROM
+  sources (`FromJoin`): the join is run once in the pin's order before
+  any row changes, each target rowid keeping the last combination that
+  order gives it (the pin's ephemeral table keyed by rowid), then the
+  rows are updated in rowid order. With several matching FROM rows the
+  final table is now the pin's (it was the last in FROM rowid order),
+  EXPLAIN QUERY PLAN prints the join's loops, and the automatic index
+  makes a 2,000 x 2,000 UPDATE ... FROM ~0.9 s against 3.3 s before in
+  a debug build (asserted 5x against the same join `NOT INDEXED`).
+  WITHOUT ROWID targets and joins the planner does not take (FROM
+  subqueries, RIGHT joins, ...) keep the per-row join in FROM order.
+- **64-source joins** are planned (the pin's limit; hipp stopped at
+  63 and ran a 64-way chain join as a nested loop, >60 s; now ~0.3 s).
+- **Expression-index covering and column BETWEEN bounds** (v0.16
+  classes; the BETWEEN rule under `expr_index`, the covering rule with
+  the leaf for `max`'s budget): an index whose expressions hold
+  every use of the columns it lacks covers a SELECT (the pin's
+  `whereIsCoveringIndex`, `WHERE_EXPRIDX`): costed and printed as
+  COVERING, while hipp still reads the table row for the expressions'
+  values (same rows). A BETWEEN's halves get their commuted copies
+  (`t1.b BETWEEN t2.y AND t2.x` probes `t2.y <= ?`), in the pin's
+  term order.
+- **A table-valued argument past a CROSS JOIN** (`json_each(t.j)
+  CROSS JOIN t`): the pin offers xBestIndex no constraint for it, so
+  json_each runs without that argument (no JSON input: no rows; no
+  root: `$`) and the argument's `hidden column = value` term stays a
+  WHERE term. hipp refused these; it now gives the pin's rows and
+  `VIRTUAL TABLE INDEX 0:` plan. A RIGHT / FULL join (the planner does
+  not order it) is still refused, as an error on both engines.
+- **Docs:** `cli_v17_join_order.rs`'s header claimed `.eqp on`
+  coverage; hipp's shell has no `.eqp`, the test uses EXPLAIN QUERY
+  PLAN statements.
+
+**Probing notes (live pin):** after ANALYZE, DROP INDEX, CREATE TABLE
+/ VIEW / TRIGGER, DROP TABLE, REINDEX and PRAGMA keep the statistics
+in memory; RENAME COLUMN, RENAME TABLE, ADD COLUMN, DROP COLUMN,
+VACUUM, ROLLBACK and ROLLBACK TO of a schema change reload them;
+`ANALYZE a` after a DROP INDEX clears `b`'s TF_HasStat1 but keeps its
+estimate; a stat row inserted by hand is not read by a following
+CREATE INDEX (defaults); `json_each('[1,2]', t.j) CROSS JOIN t` keeps
+only the rows whose root (`$`) equals `t.j`; with statistics,
+`likely(t.a = u.x)` makes an index lookup on `u.x` cost a full table's
+rows, so the pin scans both tables.
+
+**Tests:** the eight new `tests/join_order_v17.rs` cases above (the
+DDL sequences run in one connection of each engine, plans and rows
+after every step; UPDATE ... FROM's final tables, plans and RETURNING
+rows; the 64-table chain; the CROSS JOIN arguments) and the CLI's
+`review_fix_outputs`. The generated corpus is unchanged at 1,600
+queries (400 seeds): no row set differs, 12 orders and 106 plans
+differ, as before the fixes.
+
+**Gates:** `ci/local-gates.sh` (full run) passes; tests/depth_v16.rs
+and tests/triggers_v16.rs pass with debug info.
+
+**Size Δ** (thumbv7em, `--profile tiny`, against the ratchets after
+the FTS5 review fixes): tiny 76,960 → 76,960 (0); full 506,480 →
+506,672 (+192: the parser's `IS DISTINCT FROM NULL` null test, `v16`,
+and the LEFT JOIN rule's likely() skip); max 1,046,444 → 1,046,892
+(+448: the `expr_index` fixes — groups over a rowid scan, BETWEEN's
+commuted halves, the join-free hooks; truth probabilities, the
+likely() stripping and expression covering are gated with the leaf,
+which keeps max 1,684 B under its budget); xl 1,102,956 → 1,114,356
+(+11,400: truth probabilities, the statistics model, UPDATE ... FROM
+as a join, expression covering, the CROSS JOIN argument rule).
+Ratchets `[full]` 506,672, `[max]` 1,046,892, `[xl]` 1,114,356.
+
+**Honest gaps (beyond the unit's list above):**
+
+- A single-table loop with more equality columns that costs the same
+  as its prefix on the same index is not preferred
+  (`whereLoopAdjustCost` is modelled for joins only): `WHERE b = 2
+  AND c = 1` over an index on `(b, c)` prints `(b=?)` (v0.16 class,
+  found while probing; the rows are the same).
+- An expression-covered index still reads the table row (the pin reads
+  the expression's value from the index entry).
+- `sqlite_stat1`'s `sz=N` / `unordered` / `noskipscan` options are
+  not read.
 
 ## v0.16 — SQLite-parity push
 
@@ -9000,7 +9141,9 @@ min() / max() optimization (`SEARCH t USING COVERING INDEX i`, or a
 bare `SEARCH t` without an index); an UPDATE / DELETE WHERE key
 compared with a scalar subquery does not drive the target loop
 (`SCAN t`; SELECT uses it); RIGHT /
-FULL joins and UPDATE ... FROM sources read whole tables;
+FULL joins and UPDATE ... FROM sources read whole tables (UPDATE
+... FROM: closed in v0.17 by the `join_order` review fixes, planned as
+a join);
 `count(DISTINCT x)` sorts even over x's index; DELETE without WHERE
 deletes row by row (`SCAN t`; the pin truncates); an INSTEAD OF
 UPDATE / DELETE shows the view's co-routine. The plain-EXPLAIN

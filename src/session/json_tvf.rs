@@ -202,14 +202,21 @@ impl<S: Storage> Connection<S> {
     }
 }
 
-/// Refuse a JSON table-valued source whose arguments read a source
-/// after it (v0.17, `join_order`: the join planner puts the sources
-/// they read first; where it did not — a RIGHT / FULL join, a source
-/// it does not order — the call cannot run).
+/// A JSON table-valued source whose arguments read a source after it
+/// (v0.17, `join_order`): the join planner puts the sources they read
+/// first where it may; where it may not (a CROSS JOIN keeps the call
+/// before them) the pin offers xBestIndex no constraint for such an
+/// argument, so the call runs without it — no JSON argument, no rows;
+/// no root argument, the root `$` — and the argument's
+/// `hidden column = value` term stays a WHERE term (review fix: it was
+/// refused). `filter` takes those terms. A source the planner does not
+/// order (`ordered` false: a RIGHT / FULL join, ...) is still refused.
 #[cfg(all(feature = "join_order", feature = "json"))]
-pub(super) fn check_tvf_order<E>(
-    sources: &[SourcePlan],
+pub(super) fn fix_tvf_order<E>(
+    sources: &mut [SourcePlan],
     cur: &crate::query::ScopeGroup,
+    filter: &mut Option<RExpr>,
+    ordered: bool,
 ) -> Result<(), Error<E>>
 where
     Error<E>: Sized,
@@ -218,7 +225,7 @@ where
     let n = sources.len();
     let end =
         cur.offsets.as_slice().last().copied().unwrap_or(0) + sources.last().map_or(0, |s| s.ncols);
-    for (i, sp) in sources.iter().enumerate() {
+    for (i, sp) in sources.iter_mut().enumerate() {
         #[cfg(feature = "vtab")]
         if sp.tvf & crate::query::TVF_VTAB != 0 || sp.vt.is_some() {
             continue;
@@ -231,12 +238,44 @@ where
             w: (here, end),
             s: (cur.first_src + i, cur.first_src + n),
         };
-        let args = sp
+        let Some(args) = sp
             .derived
-            .as_deref()
-            .and_then(|d| d.values.as_slice().first());
-        if args.is_some_and(|r| r.iter().any(|a| expr_refs_range(a, &later))) {
+            .as_deref_mut()
+            .and_then(|d| d.values.as_mut_slice().first_mut())
+        else {
+            continue;
+        };
+        let reads: AVec<bool> = args.iter().map(|a| expr_refs_range(a, &later)).collect();
+        if !reads.iter().any(|r| *r) {
+            continue;
+        }
+        if !ordered {
             return Err(Error::Unsupported);
+        }
+        // (`json` and `root` are the hidden columns 8 and 9.)
+        let keep = if reads.as_slice().first().copied().unwrap_or(false) {
+            0
+        } else {
+            1
+        };
+        let mut k = args.len();
+        while k > keep {
+            k -= 1;
+            let Some(a) = args.pop() else { break };
+            if !reads.as_slice().get(k).copied().unwrap_or(false) && k > 0 {
+                // (Dropped with the JSON argument: no rows to test.)
+                continue;
+            }
+            let col = RExpr::Column(
+                here + 8 + k,
+                crate::record::Affinity::Blob,
+                Some(crate::record::Coll::default()),
+            );
+            let term = RExpr::Binary(crate::sql::BinOp::Eq, Box::new(col), Box::new(a));
+            *filter = Some(match filter.take() {
+                None => term,
+                Some(f) => and_expr(Some(f), term),
+            });
         }
     }
     Ok(())

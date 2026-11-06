@@ -663,6 +663,22 @@ impl IdxColPlan {
     }
 }
 
+/// An UPDATE ... FROM planned as a join (v0.17 review fix,
+/// `join_order`; `Plan::Update::from_join`).
+#[cfg(feature = "join_order")]
+#[derive(Debug, Clone)]
+pub(super) struct FromJoin {
+    /// The target table and the FROM sources, in the join's order.
+    sources: AVec<SourcePlan>,
+    /// The WHERE clause (and the inner joins' ON terms), laid out
+    /// for `sources`.
+    filter: Option<RExpr>,
+    /// The SET expressions, laid out for `sources` (in SET order).
+    sets: AVec<RExpr>,
+    /// The target's rowid in that layout.
+    rowid: RExpr,
+}
+
 // Plans are built once per statement and never stored in bulk;
 // the variant-size spread depends on the feature rung (v04 alone
 // has the widest gap), so boxing would only add an indirection.
@@ -833,6 +849,12 @@ enum Plan {
         /// resolved against target ++ these sources.
         #[cfg(feature = "v07")]
         from_sources: AVec<SourcePlan>,
+        /// The target and the FROM sources planned as one join in the
+        /// pin's order (v0.17 review fix, `join_order`): the row each
+        /// target row is updated from is the last combination that
+        /// order gives it, as the pin's UPDATE ... FROM keeps.
+        #[cfg(feature = "join_order")]
+        from_join: Option<Box<FromJoin>>,
         /// `RETURNING` expressions resolved against the target
         /// table only (v0.7); empty when the clause is absent.
         #[cfg(feature = "v07")]
@@ -1347,10 +1369,14 @@ pub struct Connection<S: Storage> {
     pager: Pager<S>,
     catalog_arena: Arena,
     catalog: Catalog,
-    /// The `sqlite_stat1` rows the planner reads (v0.17,
-    /// `join_order`): loaded with the schema and after ANALYZE.
+    /// The statistics the planner reads (v0.17, `join_order`):
+    /// loaded with the schema and by ANALYZE (`join::StatState`).
     #[cfg(feature = "join_order")]
-    stat1: AVec<join::Stat1Row>,
+    stat: join::StatState,
+    /// The next schema read follows this connection's own CREATE /
+    /// DROP: the statistics held are kept (`load_stats`).
+    #[cfg(feature = "join_order")]
+    stat_keep: bool,
     cfg: Config,
     /// An explicit `BEGIN` is open (v0.2). The pager transaction
     /// itself opens lazily at the first write, as in SQLite; while
@@ -1477,7 +1503,9 @@ impl<S: Storage> Connection<S> {
             catalog_arena,
             catalog: Catalog::empty(u32::MAX),
             #[cfg(feature = "join_order")]
-            stat1: AVec::new(),
+            stat: join::StatState::default(),
+            #[cfg(feature = "join_order")]
+            stat_keep: false,
             cfg,
             explicit_txn: false,
             #[cfg(feature = "v06")]
@@ -1561,7 +1589,10 @@ impl<S: Storage> Connection<S> {
         // (Boxed: its cursor stays off the stack of every statement
         // that reloads the schema.)
         #[cfg(feature = "join_order")]
-        alloc::boxed::Box::pin(self.load_stat1()).await?;
+        {
+            let keep = core::mem::take(&mut self.stat_keep);
+            alloc::boxed::Box::pin(self.load_stats(keep)).await?;
+        }
         Ok(())
     }
 
@@ -4175,6 +4206,21 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
+        #[cfg(feature = "join_order")]
+        let from_join = if from_plans.is_empty() || !t.has_rowid() {
+            None
+        } else {
+            self.plan_update_join(
+                arena,
+                table,
+                alias,
+                indexed,
+                from_plans.as_slice(),
+                &cur,
+                filter.as_ref(),
+                sets.as_slice(),
+            )?
+        };
         let mut defaults = AVec::new();
         let mut affs = AVec::new();
         let mut not_null = AVec::new();
@@ -4247,12 +4293,104 @@ impl<S: Storage> Connection<S> {
             ipk_act: stmt.over(t.ipk_conflict),
             #[cfg(feature = "v07")]
             from_sources: from_plans,
+            #[cfg(feature = "join_order")]
+            from_join,
             #[cfg(feature = "v07")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
             indexes,
             rules: self.table_rules(arena, t)?,
         })
+    }
+
+    /// UPDATE ... FROM as the pin plans it (v0.17 review fix,
+    /// `join_order`): the target and the FROM sources as one join,
+    /// ordered by the join planner (`plan_join`), with the WHERE
+    /// clause, the SET expressions and the target's rowid laid out
+    /// for that order. `None` when the planner does not take the
+    /// join: the FROM sources are then joined onto each target row in
+    /// FROM order.
+    #[cfg(feature = "join_order")]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_update_join(
+        &self,
+        arena: &Arena,
+        table: &crate::arena::ABytes,
+        alias: &Option<crate::arena::ABytes>,
+        indexed: Option<crate::sql::IndexHint>,
+        from: &[SourcePlan],
+        cur: &crate::query::ScopeGroup,
+        filter: Option<&RExpr>,
+        sets: &[(Target, RExpr)],
+    ) -> Result<Option<Box<FromJoin>>, S::Error> {
+        let target = crate::sql::FromSource {
+            table: *table,
+            alias: *alias,
+            kind: crate::sql::JoinKind::Inner,
+            on: None,
+            derived: None,
+            natural: false,
+            using: AVec::new(),
+            args: None,
+            qualified: false,
+            in_temp: false,
+            #[cfg(feature = "attach")]
+            schema: None,
+            cte: None,
+            indexed,
+        };
+        let mut descs = AVec::new();
+        let mut offs = AVec::new();
+        let mut plans: AVec<SourcePlan> = AVec::new();
+        self.plan_from(
+            core::slice::from_ref(&target),
+            arena,
+            &[],
+            0,
+            &mut descs,
+            &mut offs,
+            &mut plans,
+        )?;
+        if plans.len() != 1 {
+            return Ok(None);
+        }
+        for sp in from.iter() {
+            plans.push(sp.clone());
+        }
+        let mut scope = cur.clone();
+        let mut items: AVec<RExpr> = AVec::new();
+        for (_, e) in sets.iter() {
+            items.push(e.clone());
+        }
+        items.push(RExpr::Rowid(scope.first_src));
+        let mut filt = filter.cloned();
+        let joined = self.plan_join(
+            arena,
+            &mut plans,
+            &mut scope,
+            (0, 0),
+            &mut items,
+            &mut filt,
+            &mut AVec::new(),
+            &mut None,
+            &mut AVec::new(),
+            false,
+            false,
+            None,
+        )?;
+        if !joined {
+            return Ok(None);
+        }
+        let Some(rowid) = items.pop() else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(FromJoin {
+            sources: plans,
+            filter: filt,
+            sets: items,
+            rowid,
+        })))
     }
 
     /// This connection's database for three-part names (v0.16,
@@ -5155,7 +5293,7 @@ impl<S: Storage> Connection<S> {
             self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, None)?;
         }
         #[cfg(all(feature = "json", feature = "join_order"))]
-        json_tvf::check_tvf_order::<S::Error>(sources.as_slice(), &cur)
+        json_tvf::fix_tvf_order::<S::Error>(sources.as_mut_slice(), &cur, &mut filter, joined)
             .map_err(|_| Error::Unsupported)?;
         #[cfg(feature = "expr_index")]
         if !joined {
@@ -7365,6 +7503,25 @@ impl<'c, S: Storage> Statement<'c, S> {
         // readers (tables(), indexes()) see the new state without
         // waiting for the next prepare (§5.5).
         if ddl_or_txn && r.is_ok() && self.conn.pager.schema_cookie() != self.conn.catalog.cookie {
+            // (After CREATE / DROP / ANALYZE the pin keeps the
+            // statistics it holds; after ALTER, a rollback or VACUUM
+            // it reads the whole schema, statistics included, again.
+            // v0.17 review fix, `join_order`.)
+            #[cfg(feature = "join_order")]
+            {
+                self.conn.stat_keep = !matches!(
+                    self.plan,
+                    Plan::Commit | Plan::Rollback | Plan::Alter16 { .. } | Plan::AlterAdd { .. }
+                ) && !matches!(
+                    self.plan,
+                    Plan::Maint(
+                        maint::Maint::Savepoint(_)
+                            | maint::Maint::Release(_)
+                            | maint::Maint::RollbackTo(_)
+                            | maint::Maint::Vacuum { .. }
+                    )
+                );
+            }
             self.conn.rebuild_catalog().await?;
         }
         // A UTF-16 database's result text is what the pin's
@@ -10075,6 +10232,45 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     // ---------------- v0.5 write-side execution ----------------
 
+    /// The combinations of an UPDATE ... FROM planned as a join
+    /// (v0.17 review fix, `join_order`): the join run in its order,
+    /// and per target rowid (ascending) the index of the last
+    /// combination that gives it.
+    #[cfg(feature = "join_order")]
+    #[allow(clippy::type_complexity)]
+    async fn update_from_rows(
+        &mut self,
+        j: &FromJoin,
+    ) -> Result<(AVec<RowData>, AVec<(i64, usize)>), S::Error> {
+        let src_rows = self
+            .materialise_sources_sub(j.sources.as_slice(), &RowData::empty(), None)
+            .await?;
+        let mut joined: AVec<RowData> = AVec::new();
+        self.join_sources(
+            j.sources.as_slice(),
+            j.filter.as_ref(),
+            src_rows.as_slice(),
+            &RowData::empty(),
+            &mut joined,
+        )
+        .await?;
+        let mut last: AVec<(i64, usize)> = AVec::new();
+        for (k, c) in joined.iter().enumerate() {
+            if let OwnedValue::Integer(r) = self.eval_row_sub(&j.rowid, c).await? {
+                last.push((r, k));
+            }
+        }
+        last.as_mut_slice().sort_unstable();
+        let mut keep: AVec<(i64, usize)> = AVec::new();
+        for (r, k) in last.iter() {
+            match keep.as_mut_slice().last_mut() {
+                Some(x) if x.0 == *r => x.1 = *k,
+                _ => keep.push((*r, *k)),
+            }
+        }
+        Ok((joined, keep))
+    }
+
     #[cfg(feature = "v05")]
     async fn step_update(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
@@ -10386,8 +10582,40 @@ impl<'c, S: Storage> Statement<'c, S> {
             } => (from_sources.clone(), returning.clone()),
             _ => unreachable!(),
         };
+        // v0.17 (`join_order`): the target and the FROM sources joined
+        // in the pin's order once, before any row changes, each
+        // target rowid keeping the last combination that order gives
+        // it (the pin's UPDATE ... FROM, which collects them keyed by
+        // rowid first).
+        #[cfg(feature = "join_order")]
+        let from_join = match &self.plan {
+            Plan::Update { from_join, .. } => from_join.clone(),
+            _ => None,
+        };
+        #[cfg(feature = "join_order")]
+        let (joined_from, last_from) = match from_join.as_deref() {
+            None => (AVec::new(), AVec::new()),
+            // (Boxed: the join's futures stay off the stack of every
+            // UPDATE, trigger programs' included.)
+            Some(j) => Box::pin(self.update_from_rows(j)).await?,
+        };
+        #[cfg(feature = "join_order")]
+        let eff_sets: AVec<(Target, RExpr)> = match from_join.as_deref() {
+            Some(j) => sets
+                .iter()
+                .zip(j.sets.iter())
+                .map(|((t, _), e)| (*t, e.clone()))
+                .collect(),
+            None => sets.clone(),
+        };
+        #[cfg(not(feature = "join_order"))]
+        let eff_sets = sets.clone();
+        #[cfg(feature = "join_order")]
+        let joined_plan = from_join.is_some();
+        #[cfg(all(feature = "v07", not(feature = "join_order")))]
+        let joined_plan = false;
         #[cfg(feature = "v07")]
-        let from_rows = if from_sources.is_empty() {
+        let from_rows = if from_sources.is_empty() || joined_plan {
             None
         } else {
             Some(
@@ -10396,7 +10624,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
         };
         #[cfg(feature = "v07")]
-        let scan_filter = if from_rows.is_some() { &None } else { &filter };
+        let scan_filter = if !from_sources.is_empty() {
+            &None
+        } else {
+            &filter
+        };
         #[cfg(not(feature = "v07"))]
         let scan_filter = &filter;
         let mut rows = AVec::new();
@@ -10438,7 +10670,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let failed = match scanned {
             Ok(()) => None,
             Err(e)
-                if from_rows.is_none()
+                if from_sources.is_empty()
                     && self.one_pass(
                         crate::sql::ast::TrigEvent::Update,
                         Some((assigned.as_slice(), rowid_set)),
@@ -10508,8 +10740,20 @@ impl<'c, S: Storage> Statement<'c, S> {
             // through (v0.7): exactly one without FROM; with FROM,
             // one per joined combination the filter accepts.
             let mut combos: AVec<RowData> = AVec::new();
+            #[cfg(feature = "join_order")]
+            if joined_plan
+                && let Ok(p) = last_from
+                    .as_slice()
+                    .binary_search_by_key(&wrow.rowid, |x| x.0)
+                && let Some(c) = last_from
+                    .as_slice()
+                    .get(p)
+                    .and_then(|x| joined_from.as_slice().get(x.1))
+            {
+                combos.push(c.clone());
+            }
             #[cfg(feature = "v07")]
-            if let Some(fr) = &from_rows {
+            if let Some(fr) = from_rows.as_ref().filter(|_| !joined_plan) {
                 let mut joined: AVec<RowData> = AVec::new();
                 self.join_sources(
                     from_sources.as_slice(),
@@ -10544,7 +10788,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if let Some(c) = last {
                     combos.push(c);
                 }
-            } else {
+            } else if !joined_plan {
                 combos.push(base_rd);
             }
             #[cfg(not(feature = "v07"))]
@@ -10563,7 +10807,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 // 100 to the old b); applying them in order makes
                 // the last assignment to a column win.
                 let mut evaluated: AVec<(Target, OwnedValue)> = AVec::new();
-                for (target, e) in sets.iter() {
+                for (target, e) in eff_sets.iter() {
                     #[cfg(feature = "v06")]
                     let v = self.eval_row_sub(e, rd).await?;
                     #[cfg(not(feature = "v06"))]
@@ -14741,6 +14985,15 @@ fn group_desc(
 fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
     #[cfg(feature = "expr_index")]
     if let [s] = sources
+        && s.access.as_ref().is_some_and(|a| a.groups)
+    {
+        return true;
+    }
+    // A join the pin's planner ordered: its first loop delivers the
+    // GROUP BY for the whole join (v0.17 review fix, `join_order`).
+    #[cfg(feature = "join_order")]
+    if let Some(s) = sources.first()
+        && sources.len() > 1
         && s.access.as_ref().is_some_and(|a| a.groups)
     {
         return true;

@@ -235,6 +235,13 @@ pub struct Term {
     /// after every original term in the WHERE clause's term list.
     #[cfg(feature = "join_order")]
     pub virt: bool,
+    /// The pin's `truthProb` (v0.17 review fix): 1 when none is given,
+    /// else the LogEst of a likely() / unlikely() / likelihood()
+    /// probability (<= 0), which replaces the default estimates.
+    /// Virtual terms (commuted copies, BETWEEN halves, `x > NULL`,
+    /// OR-to-IN) inherit their parent's (`markTermAsChild`).
+    #[cfg(feature = "join_order")]
+    pub truth: i32,
 }
 
 impl Term {
@@ -278,10 +285,8 @@ impl Src {
     /// a top-level `IS NOT NULL` counts only where the AND chain's
     /// left operands are tried.
     pub fn null_rejects(&self, e: &RExpr) -> bool {
-        let mut p = e;
-        while let RExpr::Collate(a, _) = p {
-            p = a;
-        }
+        // (`sqlite3ExprSkipCollateAndLikely` first: v0.17 review fix.)
+        let mut p = skip_collate_likely(e);
         if let RExpr::IsNull(a, true) = p {
             return self.non_null_row(a);
         }
@@ -330,8 +335,96 @@ impl Src {
     }
 }
 
-/// Split a condition into its AND terms.
+/// `e` with top-level COLLATE and likely() / unlikely() /
+/// likelihood() wrappers removed (the pin's
+/// `sqlite3ExprSkipCollateAndLikely`): neither changes whether a
+/// WHERE term is true.
+pub fn skip_collate_likely(e: &RExpr) -> &RExpr {
+    let mut p = e;
+    loop {
+        match p {
+            RExpr::Collate(a, _) => p = a,
+            RExpr::Scalar(crate::query::ScalarFn::Likely, a) => match a.as_slice().first() {
+                Some(x) => p = x,
+                None => return p,
+            },
+            _ => return p,
+        }
+    }
+}
+
+/// Split a condition into its AND terms, each with its top-level
+/// COLLATE / likely() wrappers removed, as the pin's
+/// `sqlite3WhereSplit` and `whereClauseInsert` do (v0.17 review fix:
+/// `likely(b.x = a.y)` is still a join constraint).
 pub fn conjuncts<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+    let mut stack: AVec<&'x RExpr> = AVec::new();
+    stack.push(e);
+    while let Some(x) = stack.pop() {
+        #[cfg(feature = "join_order")]
+        let x = skip_collate_likely(x);
+        match x {
+            RExpr::Binary(BinOp::And, a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            x => out.push(x),
+        }
+    }
+}
+
+/// Per AND term of `e`, in `conjuncts` order: its truth probability
+/// (the pin's `truthProb`: `LogEst(P * 2^27) - 270` for a term that
+/// is a likely() / unlikely() / likelihood() call, else 1, "none
+/// given") and whether a COLLATE or likely() wrapper was removed
+/// above it (the pin's constant propagation does not look inside
+/// one). v0.17 review fix.
+#[cfg(feature = "join_order")]
+pub fn conjuncts_meta(e: &RExpr, out: &mut AVec<(i32, bool)>) {
+    let mut stack: AVec<(&RExpr, bool)> = AVec::new();
+    stack.push((e, false));
+    while let Some((x, w)) = stack.pop() {
+        let y = skip_collate_likely(x);
+        let w = w || !core::ptr::eq(x, y);
+        match y {
+            RExpr::Binary(BinOp::And, a, b) => {
+                stack.push((b, w));
+                stack.push((a, w));
+            }
+            _ => out.push((truth_prob(x), w)),
+        }
+    }
+}
+
+/// The truth probability of WHERE term `e` as written (see
+/// `conjuncts_meta`).
+#[cfg(feature = "join_order")]
+fn truth_prob(e: &RExpr) -> i32 {
+    if let RExpr::Scalar(crate::query::ScalarFn::Likely, a) = e
+        && let Some(RExpr::Literal(crate::record::OwnedValue::Real(p))) = a.as_slice().get(1)
+    {
+        // (`exprProbability`: `(int)(P * 134217728.0)`; P is in
+        // 0.0 ..= 1.0, checked at resolution.)
+        let x = *p * 134_217_728.0;
+        let n = if x >= 1.0 { x as u64 } else { 0 };
+        return log_est(n) - 270;
+    }
+    1
+}
+
+/// The truth probabilities of `e`'s AND terms (`conjuncts_meta`).
+#[cfg(feature = "join_order")]
+pub fn conj_truth(e: &RExpr, out: &mut AVec<i32>) {
+    let mut m: AVec<(i32, bool)> = AVec::new();
+    conjuncts_meta(e, &mut m);
+    for (t, _) in m.iter() {
+        out.push(*t);
+    }
+}
+
+/// Split a condition into its AND terms as written.
+#[cfg(feature = "join_order")]
+fn and_terms<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     let mut stack: AVec<&'x RExpr> = AVec::new();
     stack.push(e);
     while let Some(x) = stack.pop() {
@@ -380,10 +473,18 @@ fn same_op(op: BinOp) -> Option<TOp> {
 /// says whether a value expression may probe this source: `None`
 /// when it reads this source or one not yet joined, `Some(lateral)`
 /// otherwise.
-pub fn terms(conj: &[&RExpr], s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) -> AVec<Term> {
-    let mut out = AVec::new();
+/// `truth` holds each conjunct's truth probability (`conj_truth`;
+/// missing entries have none).
+pub fn terms(
+    conj: &[&RExpr],
+    truth: &[i32],
+    s: &Src,
+    avail: &dyn Fn(&RExpr) -> Option<bool>,
+) -> AVec<Term> {
+    let mut out: AVec<Term> = AVec::new();
     for (ci, c) in conj.iter().enumerate() {
-        add_terms(ci, c, s, avail, &mut out);
+        let tp = truth.get(ci).copied().unwrap_or(1);
+        add_terms(ci, c, tp, s, avail, &mut out);
     }
     out
 }
@@ -391,10 +492,13 @@ pub fn terms(conj: &[&RExpr], s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) -
 fn add_terms(
     ci: usize,
     c: &RExpr,
+    tp: i32,
     s: &Src,
     avail: &dyn Fn(&RExpr) -> Option<bool>,
     out: &mut AVec<Term>,
 ) {
+    #[cfg(not(feature = "join_order"))]
+    let _ = tp;
     // `coll`: the comparison's collation as written (a commuted copy
     // keeps it: the pin's `EP_Commuted`; v0.17 fix).
     let cmp = |op: TOp, l: &RExpr, r: &RExpr, coll: Coll, out: &mut AVec<Term>, virt: bool| {
@@ -422,6 +526,8 @@ fn add_terms(
             vnull: false,
             #[cfg(feature = "join_order")]
             virt,
+            #[cfg(feature = "join_order")]
+            truth: tp,
         });
     };
     match c {
@@ -441,14 +547,19 @@ fn add_terms(
                 );
             }
             if *op == BinOp::Or
-                && let Some(t) = or_in(ci, c, s, avail)
+                && let Some(t) = or_in(ci, c, tp, s, avail)
             {
                 out.push(t);
             }
         }
+        // The pin's two virtual halves, each analysed in turn: `x >=
+        // a` and its commuted copy `a <= x`, then `x <= b` and `b >=
+        // x` (v0.17 review fix: a column bound probes its own table).
         RExpr::Between(x, a, b, false) => {
             cmp(TOp::Ge, x, a, binary_coll(x, a), out, true);
+            cmp(TOp::Le, a, x, binary_coll(x, a), out, true);
             cmp(TOp::Le, x, b, binary_coll(x, b), out, true);
+            cmp(TOp::Ge, b, x, binary_coll(x, b), out, true);
         }
         RExpr::InList(x, items, false, false) => {
             let key = strip(x);
@@ -474,6 +585,8 @@ fn add_terms(
                 vnull: false,
                 #[cfg(feature = "join_order")]
                 virt: false,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         // `x IN (SELECT ...)` (v0.16 review fix): probed with the
@@ -512,6 +625,8 @@ fn add_terms(
                 vnull: false,
                 #[cfg(feature = "join_order")]
                 virt: false,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         RExpr::IsNull(x, false) => {
@@ -531,6 +646,8 @@ fn add_terms(
                 vnull: false,
                 #[cfg(feature = "join_order")]
                 virt: false,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         // `x IS NOT NULL` on a column (not the rowid): the pin adds
@@ -552,6 +669,8 @@ fn add_terms(
                 vnull: true,
                 #[cfg(feature = "join_order")]
                 virt: true,
+                #[cfg(feature = "join_order")]
+                truth: tp,
             });
         }
         _ => {}
@@ -560,7 +679,15 @@ fn add_terms(
 
 /// The pin's OR-to-IN rewrite: `x = a OR x = b OR ...` on one key,
 /// every value available, is `x IN (a, b, ...)`.
-fn or_in(ci: usize, c: &RExpr, s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) -> Option<Term> {
+fn or_in(
+    ci: usize,
+    c: &RExpr,
+    tp: i32,
+    s: &Src,
+    avail: &dyn Fn(&RExpr) -> Option<bool>,
+) -> Option<Term> {
+    #[cfg(not(feature = "join_order"))]
+    let _ = tp;
     let mut leaves: AVec<&RExpr> = AVec::new();
     let mut stack: AVec<&RExpr> = AVec::new();
     stack.push(c);
@@ -606,6 +733,8 @@ fn or_in(ci: usize, c: &RExpr, s: &Src, avail: &dyn Fn(&RExpr) -> Option<bool>) 
         vnull: false,
         #[cfg(feature = "join_order")]
         virt: true,
+        #[cfg(feature = "join_order")]
+        truth: tp,
     })
 }
 
@@ -648,9 +777,65 @@ pub struct IdxModel {
     /// key columns; `None` for the pin's defaults.
     #[cfg(feature = "join_order")]
     pub est: Option<AVec<i32>>,
+    /// The SELECT reads the table's columns the index lacks only
+    /// inside expressions the index holds (the pin's
+    /// `whereIsCoveringIndex`, `WHERE_EXPRIDX`; v0.17 review fix): it
+    /// counts as covering for the plan and EXPLAIN QUERY PLAN, while
+    /// hipp still reads the table row for the expressions' values.
+    pub xcover: bool,
 }
 
 impl IdxModel {
+    /// Whether `e` (an expression of the statement) reads a column of
+    /// source `s` that this index holds neither as a key column nor
+    /// inside one of its key expressions (`whereIsCoveringIndex`'s
+    /// walk; anything it does not look into counts when it reads the
+    /// source).
+    #[cfg(feature = "join_order")]
+    pub fn reads_uncovered(&self, e: &RExpr, s: &Src) -> bool {
+        if self
+            .keys
+            .iter()
+            .any(|k| matches!(k, IdxKey::Expr(x) if same_expr(e, x)))
+        {
+            return false;
+        }
+        let kids: AVec<&RExpr> = match e {
+            RExpr::Column(slot, ..) => {
+                let Some(c) = slot.checked_sub(s.base).filter(|c| *c < s.ncols) else {
+                    return false;
+                };
+                return s.rowid_alias != Some(c)
+                    && !self
+                        .keys
+                        .iter()
+                        .any(|k| matches!(k, IdxKey::Col(x) if *x == c));
+            }
+            RExpr::Rowid(_) | RExpr::Literal(_) | RExpr::AffLiteral(..) => return false,
+            RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => [&**a, &**b].into_iter().collect(),
+            RExpr::Neg(a)
+            | RExpr::Pos(a)
+            | RExpr::Not(a)
+            | RExpr::IsNull(a, _)
+            | RExpr::Cast(a, _)
+            | RExpr::Collate(a, _) => [&**a].into_iter().collect(),
+            RExpr::InList(x, l, ..) => core::iter::once(&**x).chain(l.iter()).collect(),
+            RExpr::Between(x, a, b, _) => [&**x, &**a, &**b].into_iter().collect(),
+            RExpr::Case {
+                base,
+                whens,
+                otherwise,
+            } => base
+                .iter()
+                .chain(otherwise.iter())
+                .map(|b| &**b)
+                .chain(whens.iter().flat_map(|(w, t)| [w, t]))
+                .collect(),
+            RExpr::Scalar(_, args) => args.iter().collect(),
+            _ => return s.reads(e),
+        };
+        kids.iter().any(|k| self.reads_uncovered(k, s))
+    }
     pub(crate) fn key_matches(&self, k: usize, s: &Src, t: &Term) -> bool {
         // `x IS NULL` finds NULL keys under any collation (the pin
         // checks no collation for WO_ISNULL).
@@ -671,6 +856,12 @@ impl IdxModel {
 
     /// Whether every column the query reads is a key column.
     pub fn covers(&self, needed: &[bool]) -> bool {
+        self.xcover || self.covers_plain(needed)
+    }
+
+    /// `covers` by the entries' own columns: the rows can be built from
+    /// the entries alone.
+    pub fn covers_plain(&self, needed: &[bool]) -> bool {
         self.covers_all
             || needed.iter().enumerate().all(|(c, n)| {
                 !*n || self
@@ -708,6 +899,9 @@ impl IdxModel {
 /// `sqlite3ExprImpliesExpr`).
 pub fn implies(conj: &[&RExpr], pred: &RExpr) -> bool {
     let mut parts = AVec::new();
+    #[cfg(feature = "join_order")]
+    and_terms(pred, &mut parts);
+    #[cfg(not(feature = "join_order"))]
     conjuncts(pred, &mut parts);
     parts.iter().all(|p| conj.iter().any(|c| implies1(c, p)))
 }
@@ -842,6 +1036,9 @@ pub(crate) struct Loop {
 pub struct Query<'x> {
     /// The source's WHERE / ON terms (usable or not).
     pub conj: &'x [&'x RExpr],
+    /// Per conjunct: its truth probability (`conj_truth`; missing
+    /// entries have none).
+    pub truth: &'x [i32],
     /// The ORDER BY (or GROUP BY) the loop may deliver; empty when
     /// the source is joined with others or the query has none.
     pub order: &'x [(RExpr, SortOrder)],
@@ -1299,6 +1496,12 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
         {
             continue;
         }
+        // A likelihood() probability replaces the heuristics.
+        #[cfg(feature = "join_order")]
+        if let Some(tp) = q.truth.get(ci).copied().filter(|t| *t <= 0) {
+            out += tp;
+            continue;
+        }
         out -= 1;
         // In a join (v0.17, `join_order`), heuristic 2 applies to any
         // `x = expr` term whose `x` might be indexed (a column, or a
@@ -1563,16 +1766,12 @@ fn best_access(
         None => true,
         Some(m) => m.covers_all,
     };
-    // (A WITHOUT ROWID table read in its key order that delivers the
-    // GROUP BY still says so: the groups are emitted as they come.)
+    // (A table read in its own order that delivers the GROUP BY —
+    // in any column order, e.g. `GROUP BY c, id` over the rowid —
+    // still says so: the groups are emitted as they come, as the
+    // pin's; v0.17 review fix.)
     let groups = q.group_by && l.sorted >= q.order.len();
-    if natural
-        && l.eq.is_empty()
-        && l.lo.is_none()
-        && l.hi.is_none()
-        && !reverse
-        && !(tab.wr && groups)
-    {
+    if natural && l.eq.is_empty() && l.lo.is_none() && l.hi.is_none() && !reverse && !groups {
         return None;
     }
     let mut a = lower(s, tab, ts, &l, reverse);
@@ -1581,6 +1780,7 @@ fn best_access(
     if !q.dset.is_empty() {
         let d = Query {
             conj: q.conj,
+            truth: q.truth,
             order: q.dset,
             group: true,
             group_by: false,
@@ -1628,6 +1828,7 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
     let (sat, rev, _) = order_sat(q, s, tab, ts, &l, false);
     let d = Query {
         conj: q.conj,
+        truth: q.truth,
         order: q.dset,
         group: true,
         group_by: false,
@@ -1810,8 +2011,22 @@ fn add_index(
                 };
                 let cur = a.get(k).copied().unwrap_or(rsize);
                 let nxt = a.get(k + 1).copied().unwrap_or(0);
-                let mut out = saved + (nxt - cur);
-                if t.isnull {
+                // A likelihood() probability on a table column's
+                // term replaces the index's estimate.
+                let col_key = match ix.and_then(|i| tab.indexes.get(i)) {
+                    Some(m) => matches!(
+                        m.keys.as_slice().get(k),
+                        Some(IdxKey::Col(c)) if s.rowid_alias != Some(*c)
+                    ),
+                    None => false,
+                };
+                let tp = truth_of(t);
+                let mut out = if tp <= 0 && col_key {
+                    saved + tp - n_in
+                } else {
+                    saved + (nxt - cur)
+                };
+                if t.isnull && !(tp <= 0 && col_key) {
                     out += 10;
                 }
                 // The pin charges an IN's iterations at its own level only
@@ -1833,7 +2048,7 @@ fn add_index(
                 });
                 deeper.push((used, in_mul + n_in, out));
             } else if t.lower() {
-                let lo_out = range_est(saved, true, false, t.vnull);
+                let lo_out = range_est(saved, Some(t), None);
                 let used = used_with(&[ti]);
                 loops.push(Loop {
                     ix,
@@ -1851,7 +2066,7 @@ fn add_index(
                     if !u.upper() || !matches(k, u) {
                         continue;
                     }
-                    let both = range_est(saved, true, true, t.vnull);
+                    let both = range_est(saved, Some(t), Some(u));
                     let used = used_with(&[ti, ui]);
                     loops.push(Loop {
                         ix,
@@ -1866,7 +2081,7 @@ fn add_index(
                     });
                 }
             } else if t.upper() {
-                let hi_out = range_est(saved, false, true, false);
+                let hi_out = range_est(saved, None, Some(t));
                 let used = used_with(&[ti]);
                 loops.push(Loop {
                     ix,
@@ -1891,18 +2106,31 @@ fn add_index(
 
 /// The pin's `whereRangeScanEst` without statistics (`lo` / `hi`:
 /// whether that bound exists; a `TERM_VNULL` bound narrows nothing).
-fn range_est(out: i32, lo: bool, hi: bool, lo_vnull: bool) -> i32 {
-    let mut n = out;
-    if lo && !lo_vnull {
+/// A term's truth probability (`Term::truth`; 1, none, below
+/// `join_order`).
+fn truth_of(t: &Term) -> i32 {
+    #[cfg(feature = "join_order")]
+    return t.truth;
+    #[cfg(not(feature = "join_order"))]
+    {
+        let _ = t;
+        1
+    }
+}
+
+fn range_est(out: i32, lo: Option<&Term>, hi: Option<&Term>) -> i32 {
+    // `whereRangeAdjust`: a likelihood() probability, else 20 per
+    // bound (none for a `TERM_VNULL` one).
+    let adj = |n: i32, t: Option<&Term>| match t {
+        Some(t) if truth_of(t) <= 0 => n + truth_of(t),
+        Some(t) if !t.vnull => n - 20,
+        _ => n,
+    };
+    let mut n = adj(adj(out, lo), hi);
+    if lo.is_some_and(|t| truth_of(t) > 0) && hi.is_some_and(|t| truth_of(t) > 0) {
         n -= 20;
     }
-    if hi {
-        n -= 20;
-    }
-    if lo && hi {
-        n -= 20;
-    }
-    let o = out - i32::from(lo) - i32::from(hi);
+    let o = out - i32::from(lo.is_some()) - i32::from(hi.is_some());
     let n = n.max(10);
     n.min(o)
 }

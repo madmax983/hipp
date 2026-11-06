@@ -674,3 +674,428 @@ fn automatic_index_is_faster() {
         "automatic index {fast:?} vs nested loop {slow:?}"
     );
 }
+
+// ------------------------------------------------- review regressions
+
+/// hipp's output of `script`'s statements (`;`-separated, none with a
+/// `;` inside) run in one connection on `path`, rendered as the pin's
+/// shell renders them (rows in list mode, EXPLAIN QUERY PLAN trees).
+fn hipp_script(path: &Path, script: &str) -> String {
+    block_on(async {
+        let fs = FileStorage::open(path).expect("fs open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
+        let mut out = String::new();
+        for stmt in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(q) = stmt.strip_prefix("EXPLAIN QUERY PLAN ") {
+                out.push_str(&eqp_of(&mut db, q).await.expect(stmt));
+            } else {
+                let rows = collect(&mut db, stmt).await.expect(stmt);
+                out.push_str(&String::from_utf8_lossy(&rows));
+            }
+        }
+        out
+    })
+}
+
+/// `script` in one connection of each engine, on twin files with
+/// `schema`: the same output (the statements must not fail).
+fn same_session(tag: &str, schema: &str, script: &str) {
+    let h = fresh(&format!("{tag}-h"), schema);
+    let o = fresh(&format!("{tag}-o"), schema);
+    let want = pin(&o, script).expect("pin runs the script");
+    assert_eq!(hipp_script(&h, script), want, "script:\n{script}");
+}
+
+/// A GROUP BY a join's loops deliver in another column order: the
+/// groups come in loop order, as the pin emits them (no group sorter;
+/// hipp used to sort them by the written key while its plan said it
+/// did not), for a join and for one table read in rowid order.
+#[test]
+fn group_by_in_loop_order() {
+    same(
+        "grp",
+        "CREATE TABLE t1(id INTEGER PRIMARY KEY, a, b); CREATE INDEX t1ba ON t1(b, a); \
+         INSERT INTO t1 VALUES(1,1,2),(2,2,1),(3,1,1),(4,2,2),(5,3,0); \
+         CREATE TABLE t0(id INTEGER PRIMARY KEY, v); INSERT INTO t0 VALUES(1,1),(2,2),(3,3); \
+         CREATE TABLE t2(id INTEGER PRIMARY KEY, c0, c2); \
+         INSERT INTO t2 VALUES(1,5,1),(2,4,2),(3,3,3),(4,5,4); \
+         CREATE TABLE t3(a, b, c, PRIMARY KEY(a, b)) WITHOUT ROWID; \
+         INSERT INTO t3 VALUES(1,2,3),(2,1,3),(1,1,4),(3,0,0);",
+        &[
+            "SELECT t1.a, t1.b, count(*) FROM t1, t0 WHERE t0.id = t1.a GROUP BY t1.a, t1.b",
+            "SELECT t2.c0, t2.id, count(*) FROM t2 JOIN t0 ON t0.id = t2.id GROUP BY t2.c0, t2.id",
+            "SELECT t2.c0, t2.id, count(*) FROM t2 GROUP BY t2.c0, t2.id",
+            "SELECT c0, id, c2, count(*) FROM t2 GROUP BY c2, c0, id",
+            "SELECT b, a, count(*) FROM t3 GROUP BY b, a",
+            "SELECT t3.b, t3.a, count(*) FROM t3, t2 WHERE t2.id = t3.a GROUP BY t3.b, t3.a",
+            "SELECT t1.b, t1.a, sum(t0.v) FROM t1, t0 WHERE t0.id = t1.a GROUP BY t1.a, t1.b \
+             HAVING count(*) > 0",
+            "SELECT t1.a, t1.b, count(*) FROM t1, t0 WHERE t0.id = t1.a GROUP BY t1.a, t1.b \
+             ORDER BY 3, 1",
+        ],
+    );
+}
+
+/// likely() / unlikely() / likelihood() and COLLATE around a WHERE
+/// term are removed before the term is analysed (the pin's
+/// `whereClauseInsert`), so the term still drives an index, a rowid
+/// lookup or an automatic index; their probability replaces the
+/// planner's estimate for the term (`truthProb`), its commuted copy
+/// and BETWEEN halves included.
+#[test]
+fn likelihood_wrapped_terms() {
+    let schema = "CREATE TABLE a(id INTEGER PRIMARY KEY, x, y); \
+         CREATE TABLE b(id INTEGER PRIMARY KEY, ax, v NOT NULL DEFAULT 0, w); \
+         CREATE INDEX bax ON b(ax); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<20) \
+         INSERT INTO a SELECT i, i%6, i%4 FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<15) \
+         INSERT INTO b SELECT i, i%9, i%3, CASE WHEN i%2 THEN NULL ELSE i END FROM n; \
+         CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c); CREATE INDEX ta ON t(a); \
+         CREATE INDEX tb ON t(b); CREATE INDEX tbc ON t(b, c); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<50) \
+         INSERT INTO t SELECT i, i%7, i%5, i%3 FROM n;";
+    let qs = [
+        "SELECT * FROM b WHERE likely(ax = 3)",
+        "SELECT * FROM b WHERE unlikely(ax = 3)",
+        "SELECT * FROM b WHERE (ax = 3) COLLATE NOCASE",
+        "SELECT * FROM b WHERE likelihood(ax = 3, 0.5)",
+        "SELECT a.id, b.id FROM a, b WHERE likely(b.ax = a.x)",
+        "SELECT a.id, b.id FROM b, a WHERE likely(a.id = b.ax)",
+        "SELECT a.id, b.id FROM a, b WHERE (b.ax = a.x) COLLATE NOCASE",
+        "SELECT a.id, b.id FROM a, b WHERE unlikely(b.ax = a.x)",
+        "SELECT a.id, b.id FROM a, b WHERE likelihood(b.ax = a.x, 0.9)",
+        "SELECT a.id, b.id FROM a JOIN b ON likely(b.ax = a.x)",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON likely(b.ax = a.x)",
+        "SELECT * FROM t WHERE unlikely(a = 1) AND b = 2",
+        "SELECT * FROM t WHERE a = 1 AND unlikely(b = 2)",
+        "SELECT * FROM t WHERE likelihood(a = 1, 0.0) AND b = 2",
+        "SELECT * FROM t WHERE likelihood(a = 1, 1.0) AND b = 2",
+        "SELECT * FROM t WHERE a > 1 AND unlikely(b > 2)",
+        "SELECT * FROM t WHERE likelihood(a BETWEEN 1 AND 3, 0.01) AND b > 2",
+        "SELECT * FROM t WHERE unlikely(id = 3) AND a = 1",
+        "SELECT * FROM t WHERE unlikely(a IN (1, 2)) AND b = 1",
+        "SELECT * FROM t WHERE unlikely(a IS NULL) AND b = 1",
+        "SELECT * FROM t WHERE likely(a = 1 AND b = 2)",
+        "SELECT * FROM t WHERE unlikely(a = 1 OR a = 2) AND b = 1",
+        "SELECT count(*) FROM t WHERE unlikely(a = 1) AND b = 2",
+        "SELECT likely(1), unlikely(2), likelihood(3, 0.5), typeof(likely('x'))",
+    ];
+    same("likely", schema, &qs);
+    same(
+        "likely-stat",
+        &format!(
+            "{schema} ANALYZE; CREATE TABLE u(id INTEGER PRIMARY KEY, x, y); \
+             CREATE INDEX ux ON u(x); \
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<30) \
+             INSERT INTO u SELECT i, i%4, i%9 FROM n;"
+        ),
+        &[
+            "SELECT * FROM t WHERE unlikely(a = 1) AND b = 2",
+            "SELECT * FROM t WHERE a = 1 AND likely(b = 2)",
+            "SELECT * FROM t, u WHERE unlikely(u.x = t.a) AND t.b = 1",
+            "SELECT * FROM t, u WHERE likely(u.x = t.a) AND t.b = 1",
+            "SELECT * FROM t, u WHERE u.x = t.a AND unlikely(t.b = 1)",
+            "SELECT * FROM t, u WHERE likelihood(u.y = t.c, 0.5)",
+            "SELECT * FROM u, t WHERE u.y = t.c AND likely(t.a = u.x)",
+            "SELECT * FROM u, t WHERE likely(t.a = u.x)",
+            "SELECT * FROM u, t WHERE u.y = t.c AND likelihood(t.a = u.x, 0.5)",
+        ],
+    );
+}
+
+/// The LEFT JOIN simplification looks through likely() wrappers and
+/// takes `x IS DISTINCT FROM NULL` (the pin's NOTNULL) as
+/// null-rejecting; `IS NOT DISTINCT FROM NULL` is `IS NULL`.
+#[test]
+fn left_join_strength_reduction() {
+    same(
+        "leftlike",
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, x, y); \
+         CREATE TABLE b(id INTEGER PRIMARY KEY, ax, v NOT NULL DEFAULT 0, w); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<20) \
+         INSERT INTO a SELECT i, i%6, i%4 FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<15) \
+         INSERT INTO b SELECT i, i%9, i%3, CASE WHEN i%2 THEN NULL ELSE i END FROM n;",
+        &[
+            "SELECT a.id, b.id, b.w FROM a LEFT JOIN b ON b.ax = a.x WHERE likely(b.w > 0)",
+            "SELECT a.id, b.id, b.w FROM a LEFT JOIN b ON b.ax = a.x WHERE b.w IS DISTINCT FROM NULL",
+            "SELECT a.id, b.id, b.w FROM a LEFT JOIN b ON b.ax = a.x WHERE (b.w > 0) COLLATE NOCASE",
+            "SELECT a.id, b.id, b.w FROM a LEFT JOIN b ON b.ax = a.x \
+             WHERE unlikely(b.w > 0) AND a.y = 1",
+            "SELECT a.id, b.id, b.w FROM a LEFT JOIN b ON b.ax = a.x \
+             WHERE a.y = 1 AND likely(b.w > 0)",
+            "SELECT a.id, b.id, b.w FROM a LEFT JOIN b ON b.ax = a.x \
+             WHERE b.w IS NOT DISTINCT FROM NULL",
+            "SELECT count(*) FROM b WHERE w IS DISTINCT FROM NULL",
+            "SELECT count(*) FROM b WHERE w IS NOT DISTINCT FROM NULL",
+            "SELECT 1 IS DISTINCT FROM NULL, NULL IS DISTINCT FROM NULL, NULL IS NOT DISTINCT FROM NULL",
+            "SELECT * FROM b WHERE w IS DISTINCT FROM NULL",
+        ],
+    );
+}
+
+/// The statistics held in the connection follow the pin's: ANALYZE
+/// reads them all back (a table's estimate is not reset first), a
+/// CREATE / DROP keeps the rest (a dropped index's table keeps its
+/// estimate; a new index takes its defaults from it), and an ALTER,
+/// VACUUM or the rollback of a schema change reads the schema and its
+/// statistics again.
+#[test]
+fn statistics_follow_ddl() {
+    let schema = "CREATE TABLE a(id INTEGER PRIMARY KEY, x, y); \
+         CREATE TABLE b(id INTEGER PRIMARY KEY, ax, v); CREATE INDEX bax ON b(ax); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) \
+         INSERT INTO a SELECT i, i%6, i%40 FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) \
+         INSERT INTO b SELECT i, i%150, i%3 FROM n;";
+    let q = "EXPLAIN QUERY PLAN SELECT a.id, b.id FROM a, b WHERE a.y = b.ax; \
+             SELECT a.id, b.id FROM a, b WHERE a.y = b.ax LIMIT 5;";
+    let steps: &[&[&str]] = &[
+        &["ANALYZE", "DROP INDEX bax"],
+        &["ANALYZE", "ALTER TABLE b RENAME COLUMN v TO w"],
+        &[
+            "ANALYZE",
+            "DROP INDEX bax",
+            "ALTER TABLE b RENAME COLUMN v TO w",
+        ],
+        &["ANALYZE", "DROP INDEX bax", "CREATE INDEX bax2 ON b(ax)"],
+        &["ANALYZE", "DROP INDEX bax", "ALTER TABLE b ADD COLUMN z"],
+        &[
+            "ANALYZE",
+            "DROP INDEX bax",
+            "CREATE TABLE zz(q)",
+            "DROP TABLE zz",
+        ],
+        &["BEGIN", "ANALYZE", "ROLLBACK"],
+        &["ANALYZE", "BEGIN", "DROP INDEX bax", "ROLLBACK"],
+        &["ANALYZE", "DROP INDEX bax", "VACUUM"],
+        &["ANALYZE", "DROP INDEX bax", "CREATE VIEW vv AS SELECT 1"],
+        &["ANALYZE", "DROP INDEX bax", "ALTER TABLE b DROP COLUMN v"],
+        &[
+            "ANALYZE",
+            "DROP INDEX bax",
+            "BEGIN",
+            "CREATE TABLE q1(x)",
+            "ROLLBACK",
+        ],
+        &[
+            "ANALYZE",
+            "DROP INDEX bax",
+            "SAVEPOINT s1",
+            "CREATE TABLE q1(x)",
+            "ROLLBACK TO s1",
+            "RELEASE s1",
+        ],
+        &["ANALYZE", "DROP INDEX bax", "ANALYZE a"],
+        &[
+            "ANALYZE",
+            "UPDATE sqlite_stat1 SET stat = '5 1' WHERE idx = 'bax'",
+            "CREATE INDEX bv ON b(v)",
+            "ALTER TABLE b RENAME COLUMN v TO w",
+        ],
+        &[
+            "CREATE INDEX bv ON b(v)",
+            "ANALYZE b",
+            "DROP INDEX bax",
+            "INSERT INTO sqlite_stat1 VALUES('b','bax','300 10')",
+            "CREATE INDEX bax ON b(ax)",
+        ],
+    ];
+    for (k, st) in steps.iter().enumerate() {
+        let mut script = String::new();
+        for s in st.iter() {
+            script.push_str(s);
+            script.push_str("; ");
+            script.push_str(q);
+            script.push(' ');
+        }
+        same_session(&format!("ddl{k}"), schema, &script);
+    }
+    // The stat rows are read as the pin's `analysisLoader` reads them:
+    // counts that wrap, a row naming another table's index, one naming
+    // no index, a non-digit inside a count, at the next open.
+    same(
+        "stat-odd",
+        &format!(
+            "{} CREATE INDEX ay ON a(y); CREATE INDEX bv ON b(v); ANALYZE; \
+             UPDATE sqlite_stat1 SET stat = '18446744073709551615 99999999999999999999' \
+             WHERE idx = 'bax'; \
+             INSERT INTO sqlite_stat1 VALUES('b','ay','1 1'); \
+             INSERT INTO sqlite_stat1 VALUES('a',NULL,'7x 3'); \
+             INSERT INTO sqlite_stat1 VALUES('b','nosuch','4000'); \
+             INSERT INTO sqlite_stat1 VALUES('nosuch','bv','4000');",
+            schema
+        ),
+        &[
+            "SELECT a.id, b.id FROM b, a WHERE a.id = b.v AND b.ax = 3",
+            "SELECT a.id, b.id FROM b, a WHERE a.y = b.v",
+            "SELECT a.id, b.id FROM a, b WHERE a.y = b.ax",
+            "SELECT * FROM b WHERE ax = 5 AND v = 2",
+            "SELECT * FROM a, b WHERE a.x = b.v AND b.ax = 3",
+        ],
+    );
+}
+
+/// UPDATE ... FROM is planned as the pin plans it: the target and the
+/// FROM sources as one join in cost order (automatic index, Bloom
+/// filter), each target row updated from the last combination that
+/// order gives it — the final table is the pin's when several FROM
+/// rows match.
+#[test]
+fn update_from_is_a_join() {
+    let schema = "CREATE TABLE a(id INTEGER PRIMARY KEY, x, y); \
+         CREATE TABLE b(id INTEGER PRIMARY KEY, ax, v); CREATE TABLE c(k INTEGER PRIMARY KEY, w); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<30) \
+         INSERT INTO a SELECT i, i%6, i%4 FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<40) \
+         INSERT INTO b SELECT i, i%9, i*7%11 FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10) \
+         INSERT INTO c SELECT i, i*3 FROM n;";
+    let script = "EXPLAIN QUERY PLAN UPDATE a SET y = b.v FROM b WHERE b.ax = a.x; \
+         UPDATE a SET y = b.v FROM b WHERE b.ax = a.x; SELECT * FROM a; \
+         EXPLAIN QUERY PLAN UPDATE a SET y = b.v + c.w FROM b, c WHERE b.ax = a.x AND c.k = b.v; \
+         UPDATE a SET y = b.v + c.w FROM b, c WHERE b.ax = a.x AND c.k = b.v; SELECT * FROM a; \
+         EXPLAIN QUERY PLAN UPDATE a SET y = b.v FROM b WHERE b.id = a.id + 1; \
+         UPDATE a SET y = b.v FROM b WHERE b.id = a.id + 1; SELECT * FROM a; \
+         UPDATE a SET x = b.ax FROM b JOIN c ON c.k = b.id WHERE a.y = c.w; SELECT * FROM a; \
+         UPDATE a SET y = b.v FROM b LEFT JOIN c ON c.k = b.v WHERE b.ax = a.x AND c.w IS NULL; \
+         SELECT * FROM a; \
+         CREATE INDEX bax ON b(ax); \
+         EXPLAIN QUERY PLAN UPDATE a SET y = b.id FROM b WHERE b.ax = a.x; \
+         UPDATE a SET y = b.id FROM b WHERE b.ax = a.x AND a.id < 5; SELECT * FROM a; \
+         UPDATE a SET y = (SELECT count(*) FROM c WHERE c.k < b.v) FROM b WHERE b.ax = a.x; \
+         SELECT * FROM a; \
+         UPDATE a SET y = j.value FROM json_each('[1,2,3]') j WHERE j.key = a.x; SELECT * FROM a; \
+         UPDATE a AS t SET y = b.v FROM b WHERE b.ax = t.x AND t.id % 2 = 0; SELECT * FROM a; \
+         UPDATE a SET y = b.v FROM a AS a2, b WHERE a2.id = a.id + 1 AND b.ax = a2.x; \
+         SELECT * FROM a;";
+    same_session("updfrom", schema, script);
+    // RETURNING shows the rows as updated, in the target's order.
+    same_session(
+        "updfrom-ret",
+        schema,
+        "UPDATE a SET y = b.id FROM b WHERE b.ax = a.x RETURNING id, y",
+    );
+    // An automatic index makes a 2,000 x 2,000 UPDATE ... FROM far
+    // faster than the nested loop (`NOT INDEXED` on both rules it out).
+    let big = "CREATE TABLE a(id INTEGER PRIMARY KEY, x, y); CREATE TABLE b(id INTEGER PRIMARY KEY, ax, v); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000) \
+         INSERT INTO a SELECT i, i, 0 FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000) \
+         INSERT INTO b SELECT i, 2001-i, i*7%11 FROM n;";
+    let time = |tag: &str, q: &str| {
+        let path = fresh(tag, big);
+        let t0 = std::time::Instant::now();
+        let out = hipp_script(&path, &format!("{q}; SELECT sum(y), count(*) FROM a"));
+        (t0.elapsed(), out)
+    };
+    let fast_q = "UPDATE a SET y = b.v FROM b WHERE b.ax = a.x";
+    let (fast, fo) = time("updfrom-fast", fast_q);
+    let (slow, so) = time(
+        "updfrom-slow",
+        "UPDATE a NOT INDEXED SET y = b.v FROM b NOT INDEXED WHERE b.ax = a.x",
+    );
+    let o = fresh("updfrom-perf-o", big);
+    let want = pin(&o, &format!("{fast_q}; SELECT sum(y), count(*) FROM a")).expect("pin");
+    assert_eq!(fo, want);
+    assert_eq!(so, want);
+    assert!(
+        fast * 5 < slow,
+        "automatic index {fast:?} vs nested loop {slow:?}"
+    );
+}
+
+/// A join of 64 tables (the pin's limit) is planned like a smaller
+/// one: a chain of equi-joins runs through automatic indexes, not a
+/// 64-deep nested loop.
+#[test]
+fn join_of_64_tables() {
+    let mut schema = String::new();
+    for i in 0..64 {
+        schema.push_str(&format!(
+            "CREATE TABLE t{i}(a INTEGER PRIMARY KEY, b, c); \
+             INSERT INTO t{i} VALUES(1,{},{}),(2,{},{}),(3,{},{}); ",
+            i % 3,
+            (i + 1) % 3,
+            (i + 1) % 3,
+            i % 3,
+            (i + 2) % 3,
+            (i * 7) % 3
+        ));
+    }
+    let from: Vec<String> = (0..64).map(|i| format!("t{i}")).collect();
+    let terms: Vec<String> = (0..63).map(|i| format!("t{i}.b = t{}.c", i + 1)).collect();
+    let q = format!(
+        "SELECT count(*) FROM {} WHERE {}",
+        from.join(", "),
+        terms.join(" AND ")
+    );
+    let t0 = std::time::Instant::now();
+    same("j64", &schema, &[q.as_str()]);
+    assert!(t0.elapsed() < std::time::Duration::from_secs(60));
+}
+
+/// An expression index the statement reads only through its
+/// expressions covers it (the pin's `WHERE_EXPRIDX`), and a BETWEEN
+/// whose bounds are columns also probes the bounds' table (its
+/// halves' commuted copies), with and without statistics.
+#[test]
+fn expression_covering_and_column_bounds() {
+    let schema = "CREATE TABLE w(id INTEGER PRIMARY KEY, v); \
+         CREATE TABLE b(id INTEGER PRIMARY KEY, ax, v); CREATE INDEX bexp ON b(v+1); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<200) \
+         INSERT INTO w SELECT i, i%7 FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<300) \
+         INSERT INTO b SELECT i, i%5, i%3 FROM n; \
+         CREATE TABLE t2(x, y, z); CREATE INDEX t2y ON t2(y); \
+         CREATE TABLE t1(a INTEGER PRIMARY KEY, b); \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<50) \
+         INSERT INTO t2 SELECT i%7, i%5, i FROM n; \
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<40) \
+         INSERT INTO t1 SELECT i, i%6 FROM n;";
+    let qs = [
+        "SELECT w.id, b.id FROM w, b WHERE b.v+1 = w.v",
+        "SELECT b.id FROM b WHERE b.v+1 = 2",
+        "SELECT b.id, b.v+1 FROM b WHERE b.v+1 > 1",
+        "SELECT b.id, b.v FROM b WHERE b.v+1 = 2",
+        "SELECT count(*) FROM b WHERE b.v+1 = 2",
+        "SELECT b.v+1 FROM b",
+        "SELECT b.v+1 FROM b ORDER BY b.v+1",
+        "SELECT * FROM t1, t2 WHERE t1.b BETWEEN t2.y AND t2.x",
+        "SELECT * FROM t2 WHERE 5 BETWEEN x AND y",
+        "SELECT * FROM t2 WHERE 3 BETWEEN y AND x",
+        "SELECT * FROM t1, t2 WHERE t2.y BETWEEN t1.a AND t1.b",
+        "SELECT * FROM t1, t2 WHERE t1.a BETWEEN t2.y AND 30",
+        "SELECT * FROM t1, t2 WHERE t1.b NOT BETWEEN t2.y AND t2.x",
+    ];
+    same("xcov", schema, &qs);
+    same("xcov-stat", &format!("{schema} ANALYZE;"), &qs);
+}
+
+/// A table-valued function's argument that reads a table it may not
+/// follow (past a CROSS JOIN) is not given to the call: without its
+/// JSON argument json_each has no rows, without its root argument the
+/// root is `$`, and the argument's `hidden column = value` term stays
+/// a WHERE term — the pin's answers (hipp refused these).
+#[test]
+fn tvf_arguments_across_cross_join() {
+    same(
+        "tvfcross",
+        "CREATE TABLE t(n INT, j TEXT); INSERT INTO t VALUES(2,'[1,2]'),(3,'[5]'),(9,'$'); \
+         CREATE TABLE u(k); INSERT INTO u VALUES(1),(2);",
+        &[
+            "SELECT count(*) FROM json_each(t.j) CROSS JOIN t",
+            "SELECT count(*) FROM json_each(t.j), u CROSS JOIN t",
+            "SELECT * FROM json_each(t.j) CROSS JOIN t",
+            "SELECT count(*) FROM u CROSS JOIN json_each(t.j) CROSS JOIN t",
+            "SELECT count(*) FROM u LEFT JOIN json_each(t.j) ON 1 CROSS JOIN t",
+            "SELECT count(*) FROM json_tree(t.j) CROSS JOIN t",
+            "SELECT count(*) FROM json_each(t.j, '$') CROSS JOIN t",
+            "SELECT * FROM json_each('[1,2]', t.j) CROSS JOIN t",
+            "SELECT key, value, n FROM json_each('[1,[2,3]]', t.j) CROSS JOIN t",
+            "SELECT count(*) FROM u, json_each(t.j) CROSS JOIN t WHERE u.k = 1",
+            "SELECT count(*) FROM json_each(t.j) JOIN t",
+        ],
+    );
+}
