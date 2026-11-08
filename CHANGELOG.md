@@ -41,7 +41,7 @@ directly must switch to the new one (Cargo refuses the old names).
 - `ci/feature-sets.txt`: `query`, `write`, `sql`, `indexes,query`,
   `indexes,write`, `query,math`, `sql,<leaf>` for each leaf and one
   `sql,indexes,expr_index,planner` line.
-- No behaviour change and no code change: the tree links to the same
+- No behaviour change and no compiled-code change: the tree links to the same
   sections as a purely mechanical rename of the previous tree (`.text`
   and `.rodata` byte-identical for `query`, `write`, `max`, `xl`).
   tiny 76,124 B and full 476,476 B are unchanged; max 962,300 B (+8)

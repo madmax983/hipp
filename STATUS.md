@@ -71,9 +71,40 @@ implications (`sql` ⇒ `write` ⇒ `query`, every leaf ⇒ `sql`, `planner`
 
 **Exact-size check** (thumbv7em-none-eabihf, `--profile tiny`,
 `hipp_thumb_demo`, `.text + .rodata` as ci/size_gate.py sums it, and
-the sum of every symbol's `llvm-nm -S` size; before = `3bc670b`):
+the sum of every symbol's `llvm-nm -S` size; before = `3bc670b`;
+(≠) marks a symbol-size sum that moved):
 
-
+| old line (3bc670b) | new line | before | after | Δ | symbol sizes before | after |
+|---|---|---:|---:|---:|---:|---:|
+| `-` | `-` | 76,124 | 76,124 | 0 | 173,160 | 173,160 |
+| `indexes` | `indexes` | 118,416 | 118,416 | 0 | 215,322 | 215,322 |
+| `v04` | `query` | 173,792 | 173,800 | +8 | 269,274 | 269,274 |
+| `v05` | `write` | 189,760 | 189,752 | -8 | 285,152 | 285,146 (≠) |
+| `v16` | `sql` | 400,184 | 400,184 | 0 | 489,202 | 489,202 |
+| `params` | `params` | 85,604 | 85,604 | 0 | 182,624 | 182,624 |
+| `v04,math` | `query,math` | 191,556 | 191,572 | +16 | 286,356 | 286,356 |
+| `v16,window` | `sql,window` | 429,652 | 429,652 | 0 | 518,000 | 518,000 |
+| `v16,triggers` | `sql,triggers` | 440,980 | 440,980 | 0 | 529,108 | 529,112 (≠) |
+| `v16,foreign_keys` | `sql,foreign_keys` | 482,368 | 482,368 | 0 | 571,062 | 571,062 |
+| `v16,json` | `sql,json` | 434,004 | 434,004 | 0 | 521,554 | 521,554 |
+| `v16,expr_index` | `sql,expr_index` | 486,704 | 486,704 | 0 | 575,250 | 575,250 |
+| `v16,without_rowid` | `sql,without_rowid` | 468,844 | 468,836 | -8 | 557,682 | 557,682 |
+| `v16,utf16` | `sql,utf16` | 407,336 | 407,336 | 0 | 496,294 | 496,294 |
+| `v16,wal` | `sql,wal` | 416,656 | 416,656 | 0 | 505,456 | 505,456 |
+| `v16,datetime` | `sql,datetime` | 420,172 | 420,180 | +8 | 508,562 | 508,562 |
+| `v16,attach` | `sql,attach` | 423,776 | 423,776 | 0 | 512,694 | 512,694 |
+| `v16,autovacuum` | `sql,autovacuum` | 415,440 | 415,440 | 0 | 504,386 | 504,386 |
+| `v16,vtab` | `sql,vtab` | 427,608 | 427,608 | 0 | 516,100 | 516,100 |
+| `v16,vtab,rtree` | `sql,vtab,rtree` | 470,224 | 470,224 | 0 | 558,044 | 558,044 |
+| `v16,vtab,without_rowid,math,fts5` | `sql,vtab,without_rowid,math,fts5` | 639,124 | 639,124 | 0 | 723,613 | 723,613 |
+| `v16,vtab,without_rowid,math,fts5,fts5_delete` | `sql,vtab,without_rowid,math,fts5,fts5_delete` | 649,884 | 649,916 | +32 | 734,369 | 734,369 |
+| `v16,explain` | `sql,explain` | 414,028 | 414,020 | -8 | 502,310 | 502,306 (≠) |
+| `v16,indexes,expr_index,join_order,multi_index,flatten` | `sql,indexes,expr_index,planner` | 559,756 | 559,748 | -8 | 647,492 | 647,492 |
+| `indexes,v04` | `indexes,query` | 203,561 | 203,561 | 0 | 298,968 | 298,968 |
+| `indexes,v05` | `indexes,write` | 232,897 | 232,897 | 0 | 328,260 | 328,250 (≠) |
+| `full` | `full` | 476,476 | 476,476 | 0 | 564,642 | 564,642 |
+| `max` | `max` | 962,292 | 962,300 | +8 | 1,040,831 | 1,040,831 |
+| `xl` | `xl` | 1,058,808 | 1,058,824 | +16 | 1,136,213 | 1,136,213 |
 
 Every pair has the same functions at the same sizes up to layout
 effects. The `.text + .rodata` differences

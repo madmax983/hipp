@@ -421,10 +421,9 @@ fn documented_differences() {
             "|--USE TEMP B-TREE FOR count(DISTINCT)\n`--SCAN t USING COVERING INDEX tcde\n",
         ),
     ];
-    // (v0.17, `planner`: join reordering and automatic indexes now
-    // print the pin's plans; `planner`: the MULTI-INDEX OR and the
-    // min() / max() lookup too; `planner`: flattened views and
-    // EXISTS-to-join.)
+    // (v0.17, `planner`: join reordering, automatic indexes, the
+    // MULTI-INDEX OR, the min() / max() lookup, flattened views and
+    // EXISTS-to-join now print the pin's plans.)
     same_plans(
         &path,
         &[
