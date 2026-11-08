@@ -2380,121 +2380,25 @@ impl<S: Storage> Statement<'_, S> {
 
     /// Check one table's rows: NOT NULL, STRICT types, CHECK
     /// (unless ignored) and, for the full check, each row's index
-    /// entries.
+    /// entries. The future keeps only the reads; what is checked is
+    /// set up by [`Self::row_check_plan`] and each row is checked by
+    /// [`Self::check_row`] (sync, ADR 0005 Stage 1).
     async fn check_rows(
         &mut self,
         tname: &[u8],
         quick: bool,
         out: &mut Out,
     ) -> Result<(), S::Error> {
-        let (root, ncols, alias, defaults, affs, nn, strict, cols, rules) = {
-            let ca = &self.conn.catalog_arena;
-            let Some(t) = self.conn.catalog.find(ca, tname) else {
-                return Ok(());
-            };
-            let Ok(t) = t.usable::<S::Error>() else {
-                return Ok(());
-            };
-            let mut defaults = AVec::new();
-            let mut affs = AVec::new();
-            let mut nn = AVec::new();
-            let mut strict = AVec::new();
-            let mut cols = AVec::new();
-            for c in t.columns.iter() {
-                defaults.push(read_default(ca, c));
-                affs.push(c.affinity);
-                nn.push(c.not_null);
-                strict.push(if t.strict {
-                    crate::rules::StrictType::of(handle_bytes(ca, c.decl).trim_ascii())
-                        .filter(|s| *s != crate::rules::StrictType::Any)
-                        .map(|_| std_type(handle_bytes(ca, c.decl)))
-                } else {
-                    None
-                });
-                cols.push(copy_vec(handle_bytes(ca, c.name)));
-            }
-            let rules = self.conn.table_rules(&self.arena, t)?;
-            (
-                t.root,
-                t.columns.len(),
-                t.rowid_alias,
-                defaults,
-                affs,
-                nn,
-                strict,
-                cols,
-                rules,
-            )
+        let Some(rc) = self.row_check_plan(tname, quick)? else {
+            return Ok(());
         };
-        #[cfg(feature = "indexes")]
-        let indexes = if quick {
-            AVec::new()
-        } else {
-            let mut v = self.conn.write_index_plans(&scratch(), tname)?;
-            // The pin's `pIndex` order: newest first.
-            let mut r = AVec::new();
-            while let Some(x) = v.pop() {
-                r.push(x);
-            }
-            r
-        };
-        #[cfg(feature = "indexes")]
-        let inames: AVec<AVec<u8>> = {
-            let ca = &self.conn.catalog_arena;
-            let mut n = AVec::new();
-            for ix in self.conn.table_indexes(tname).iter() {
-                n.push(copy_vec(handle_bytes(ca, ix.name)));
-            }
-            n
-        };
-        // A WITHOUT ROWID table's key is its own tree (v0.16): no
-        // entry to look for.
-        #[cfg(feature = "without_rowid")]
-        let (indexes, inames) = {
-            let mut a = AVec::new();
-            let mut b = AVec::new();
-            for (ix, n) in indexes.iter().zip(inames.iter()) {
-                if ix.root != root {
-                    a.push(ix.clone());
-                    b.push(n.clone());
-                }
-            }
-            (a, b)
-        };
-        #[cfg(not(feature = "indexes"))]
-        let _ = quick;
-        // Nothing to check row by row: the pin then reads only
-        // each record's header, so hipp reads only the cells' local
-        // bytes (a damaged overflow chain is the page check's
-        // finding alone).
-        #[cfg(feature = "indexes")]
-        let no_index = indexes.is_empty();
-        #[cfg(not(feature = "indexes"))]
-        let no_index = true;
-        let virt = rules.as_ref().and_then(|r| r.virt().map(copy_bools));
-        // The pin reads each row's right-most stored column (not
-        // the rowid alias, not a VIRTUAL one) first, which parses
-        // and checks the record header up to it: `p2` is its index
-        // in the record.
-        let is_virt = |j: usize| {
-            virt.as_ref()
-                .is_some_and(|v| v.as_slice().get(j).copied().unwrap_or(false))
-        };
-        let p2 = (0..ncols)
-            .rev()
-            .find(|j| Some(*j) != alias && !is_virt(*j))
-            .map(|m| (0..m).filter(|j| !is_virt(*j)).count());
-        if no_index
-            && !nn.iter().any(|b| *b)
-            && strict.iter().all(|s| s.is_none())
-            && rules.as_ref().is_none_or(|r| r.checks.is_empty())
-        {
-            if walk_pages(&mut self.conn.pager, root, p2).await? {
+        if rc.trivial() {
+            if walk_pages(&mut self.conn.pager, rc.root, rc.p2).await? {
                 out.malformed();
             }
             return Ok(());
         }
-        let mut cursor = ScanCursor::new(root);
+        let mut cursor = ScanCursor::new(rc.root);
         let mut buf = AVec::new();
         // The pin's messages name a row by its scan ordinal.
         let mut nrow: i64 = 0;
@@ -2503,7 +2407,7 @@ impl<S: Storage> Statement<'_, S> {
         #[cfg(feature = "indexes")]
         let mut in_index: AVec<u64> = AVec::new();
         #[cfg(feature = "indexes")]
-        for _ in indexes.iter() {
+        for _ in rc.indexes.iter() {
             in_index.push(0);
         }
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
@@ -2511,83 +2415,11 @@ impl<S: Storage> Statement<'_, S> {
                 return Ok(());
             }
             nrow += 1;
-            if p2.is_some_and(|p| record_header_corrupt(buf.as_slice(), buf.len() as u64, p)) {
-                out.malformed();
+            let Some(rec) = self.check_row(&rc, tname, buf.as_slice(), rowid, out)? else {
                 return Ok(());
-            }
-            // A record whose header does not decode reads as one
-            // with no fields (the pin's page check reports it).
-            let mut rec = match crate::rules::decode_rec::<S::Error>(
-                buf.as_slice(),
-                ncols,
-                defaults.as_slice(),
-                virt.as_ref().map(|v| v.as_slice()),
-            ) {
-                Ok(r) => r,
-                Err(_) => {
-                    let mut r = AVec::new();
-                    for d in defaults.iter() {
-                        r.push(d.clone());
-                    }
-                    r
-                }
             };
-            if let Some(g) = rules.as_ref().and_then(|r| r.gcols.as_ref()) {
-                g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
-            }
-            let rd = crate::rules::eval_row(alias, affs.as_slice(), rec.as_slice(), rowid);
-            for (i, v) in rd.vals.iter().enumerate() {
-                let msg = if matches!(v, OwnedValue::Null) && nn.as_slice().get(i) == Some(&true) {
-                    Some(b"NULL" as &[u8])
-                } else {
-                    None
-                };
-                if let Some(m) = msg {
-                    let mut s = copy_vec(m);
-                    s.extend_from_slice(b" value in ");
-                    s.extend_from_slice(tname);
-                    s.push(b'.');
-                    s.extend_from_slice(cols.as_slice().get(i).map_or(&[][..], |c| c.as_slice()));
-                    if !out.emit(s) {
-                        return Ok(());
-                    }
-                }
-                if let Some(Some(ty)) = strict.as_slice().get(i)
-                    && Some(i) != alias
-                    && let Some(st) = crate::rules::StrictType::of(ty)
-                    && !st.admits(v)
-                {
-                    let mut s = copy_vec(b"non-");
-                    s.extend_from_slice(ty);
-                    s.extend_from_slice(b" value in ");
-                    s.extend_from_slice(tname);
-                    s.push(b'.');
-                    s.extend_from_slice(cols.as_slice().get(i).map_or(&[][..], |c| c.as_slice()));
-                    if !out.emit(s) {
-                        return Ok(());
-                    }
-                }
-            }
-            if let Some(r) = &rules {
-                let ctx = crate::query::Ctx::of(&rd).with(&self.conn.env);
-                let mut failed = false;
-                for c in r.checks.iter() {
-                    if crate::query::truthy(&crate::query::eval::<S::Error>(c, &ctx)?)
-                        == Some(false)
-                    {
-                        failed = true;
-                    }
-                }
-                if failed {
-                    let mut s = copy_vec(b"CHECK constraint failed in ");
-                    s.extend_from_slice(tname);
-                    if !out.emit(s) {
-                        return Ok(());
-                    }
-                }
-            }
             #[cfg(feature = "indexes")]
-            for (j, (ix, iname)) in indexes.iter().zip(inames.iter()).enumerate() {
+            for (j, (ix, iname)) in rc.indexes.iter().zip(rc.inames.iter()).enumerate() {
                 // v0.16 (`expr_index`): an expression index's key is
                 // computed; a row a partial index's WHERE rejects
                 // has no entry to find.
@@ -2595,7 +2427,7 @@ impl<S: Storage> Statement<'_, S> {
                     ix,
                     rec.as_slice(),
                     rowid,
-                    alias,
+                    rc.alias,
                     #[cfg(feature = "expr_index")]
                     &self.conn.env,
                 )?
@@ -2615,23 +2447,15 @@ impl<S: Storage> Statement<'_, S> {
                     unique,
                 )
                 .await?;
-                if !found {
-                    let mut s = copy_vec(b"row ");
-                    dec(nrow, &mut s);
-                    s.extend_from_slice(b" missing from index ");
-                    s.extend_from_slice(iname.as_slice());
-                    if !out.emit(s) {
-                        return Ok(());
-                    }
-                } else if dup {
-                    let mut s = copy_vec(b"non-unique entry in index ");
-                    s.extend_from_slice(iname.as_slice());
-                    if !out.emit(s) {
-                        return Ok(());
-                    }
+                if !index_finding(found, dup, nrow, iname.as_slice(), out) {
+                    return Ok(());
                 }
             }
+            #[cfg(not(feature = "indexes"))]
+            let _ = rec;
         }
+        #[cfg(feature = "expr_index")]
+        let (indexes, inames) = (&rc.indexes, &rc.inames);
         let _ = nrow;
         // A partial index's entry count against the rows its WHERE
         // admits (v0.16, `expr_index`: the pin's per-index counter,
@@ -2655,6 +2479,252 @@ impl<S: Storage> Statement<'_, S> {
             }
         }
         Ok(())
+    }
+
+    /// The sync preamble of `check_rows`: the table's columns,
+    /// rules and (for the full check) indexes; `None` when there is
+    /// no such usable table.
+    #[inline(never)]
+    fn row_check_plan(&self, tname: &[u8], quick: bool) -> Result<Option<RowCheck>, S::Error> {
+        let ca = &self.conn.catalog_arena;
+        let Some(t) = self.conn.catalog.find(ca, tname) else {
+            return Ok(None);
+        };
+        let Ok(t) = t.usable::<S::Error>() else {
+            return Ok(None);
+        };
+        let root = t.root;
+        let ncols = t.columns.len();
+        let alias = t.rowid_alias;
+        let mut defaults = AVec::new();
+        let mut affs = AVec::new();
+        let mut nn = AVec::new();
+        let mut strict = AVec::new();
+        let mut cols = AVec::new();
+        for c in t.columns.iter() {
+            defaults.push(read_default(ca, c));
+            affs.push(c.affinity);
+            nn.push(c.not_null);
+            strict.push(if t.strict {
+                crate::rules::StrictType::of(handle_bytes(ca, c.decl).trim_ascii())
+                    .filter(|s| *s != crate::rules::StrictType::Any)
+                    .map(|_| std_type(handle_bytes(ca, c.decl)))
+            } else {
+                None
+            });
+            cols.push(copy_vec(handle_bytes(ca, c.name)));
+        }
+        let rules = self.conn.table_rules(&self.arena, t)?;
+        #[cfg(feature = "indexes")]
+        let indexes = if quick {
+            AVec::new()
+        } else {
+            let mut v = self.conn.write_index_plans(&scratch(), tname)?;
+            // The pin's `pIndex` order: newest first.
+            let mut r = AVec::new();
+            while let Some(x) = v.pop() {
+                r.push(x);
+            }
+            r
+        };
+        #[cfg(feature = "indexes")]
+        let inames: AVec<AVec<u8>> = {
+            let mut n = AVec::new();
+            for ix in self.conn.table_indexes(tname).iter() {
+                n.push(copy_vec(handle_bytes(ca, ix.name)));
+            }
+            n
+        };
+        // A WITHOUT ROWID table's key is its own tree (v0.16): no
+        // entry to look for.
+        #[cfg(feature = "without_rowid")]
+        let (indexes, inames) = {
+            let mut a = AVec::new();
+            let mut b = AVec::new();
+            for (ix, n) in indexes.iter().zip(inames.iter()) {
+                if ix.root != root {
+                    a.push(ix.clone());
+                    b.push(n.clone());
+                }
+            }
+            (a, b)
+        };
+        #[cfg(not(feature = "indexes"))]
+        let _ = quick;
+        let virt = rules.as_ref().and_then(|r| r.virt().map(copy_bools));
+        // The pin reads each row's right-most stored column (not
+        // the rowid alias, not a VIRTUAL one) first, which parses
+        // and checks the record header up to it: `p2` is its index
+        // in the record.
+        let is_virt = |j: usize| {
+            virt.as_ref()
+                .is_some_and(|v| v.as_slice().get(j).copied().unwrap_or(false))
+        };
+        let p2 = (0..ncols)
+            .rev()
+            .find(|j| Some(*j) != alias && !is_virt(*j))
+            .map(|m| (0..m).filter(|j| !is_virt(*j)).count());
+        Ok(Some(RowCheck {
+            root,
+            ncols,
+            alias,
+            defaults,
+            affs,
+            nn,
+            strict,
+            cols,
+            rules,
+            #[cfg(feature = "indexes")]
+            indexes,
+            #[cfg(feature = "indexes")]
+            inames,
+            virt,
+            p2,
+        }))
+    }
+
+    /// Check one row (record `buf`) against NOT NULL, STRICT and
+    /// CHECK; the decoded row for the index probes, or `None` once
+    /// the check stops (a malformed header, or the error budget
+    /// spent).
+    #[inline(never)]
+    fn check_row(
+        &self,
+        rc: &RowCheck,
+        tname: &[u8],
+        buf: &[u8],
+        rowid: i64,
+        out: &mut Out,
+    ) -> Result<Option<AVec<OwnedValue>>, S::Error> {
+        if rc
+            .p2
+            .is_some_and(|p| record_header_corrupt(buf, buf.len() as u64, p))
+        {
+            out.malformed();
+            return Ok(None);
+        }
+        // A record whose header does not decode reads as one
+        // with no fields (the pin's page check reports it).
+        let mut rec = match crate::rules::decode_rec::<S::Error>(
+            buf,
+            rc.ncols,
+            rc.defaults.as_slice(),
+            rc.virt.as_ref().map(|v| v.as_slice()),
+        ) {
+            Ok(r) => r,
+            Err(_) => {
+                let mut r = AVec::new();
+                for d in rc.defaults.iter() {
+                    r.push(d.clone());
+                }
+                r
+            }
+        };
+        if let Some(g) = rc.rules.as_ref().and_then(|r| r.gcols.as_ref()) {
+            g.fill::<S::Error>(rec.as_mut_slice(), rowid, true)?;
+        }
+        let rd = crate::rules::eval_row(rc.alias, rc.affs.as_slice(), rec.as_slice(), rowid);
+        for (i, v) in rd.vals.iter().enumerate() {
+            let col = rc.cols.as_slice().get(i).map_or(&[][..], |c| c.as_slice());
+            if matches!(v, OwnedValue::Null) && rc.nn.as_slice().get(i) == Some(&true) {
+                let mut s = copy_vec(b"NULL value in ");
+                s.extend_from_slice(tname);
+                s.push(b'.');
+                s.extend_from_slice(col);
+                if !out.emit(s) {
+                    return Ok(None);
+                }
+            }
+            if let Some(Some(ty)) = rc.strict.as_slice().get(i)
+                && Some(i) != rc.alias
+                && let Some(st) = crate::rules::StrictType::of(ty)
+                && !st.admits(v)
+            {
+                let mut s = copy_vec(b"non-");
+                s.extend_from_slice(ty);
+                s.extend_from_slice(b" value in ");
+                s.extend_from_slice(tname);
+                s.push(b'.');
+                s.extend_from_slice(col);
+                if !out.emit(s) {
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(r) = &rc.rules {
+            let ctx = crate::query::Ctx::of(&rd).with(&self.conn.env);
+            let mut failed = false;
+            for c in r.checks.iter() {
+                if crate::query::truthy(&crate::query::eval::<S::Error>(c, &ctx)?) == Some(false) {
+                    failed = true;
+                }
+            }
+            if failed {
+                let mut s = copy_vec(b"CHECK constraint failed in ");
+                s.extend_from_slice(tname);
+                if !out.emit(s) {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(rec))
+    }
+}
+
+/// What `check_rows` checks in one table, read from the catalog
+/// before any page is (sync, ADR 0005 Stage 1).
+struct RowCheck {
+    root: u32,
+    ncols: usize,
+    alias: Option<usize>,
+    defaults: AVec<OwnedValue>,
+    affs: AVec<Affinity>,
+    nn: AVec<bool>,
+    strict: AVec<Option<&'static [u8]>>,
+    cols: AVec<AVec<u8>>,
+    rules: Option<Box<crate::rules::TableRules>>,
+    #[cfg(feature = "indexes")]
+    indexes: AVec<IndexPlan>,
+    #[cfg(feature = "indexes")]
+    inames: AVec<AVec<u8>>,
+    virt: Option<AVec<bool>>,
+    /// The record index of the right-most stored column.
+    p2: Option<usize>,
+}
+
+impl RowCheck {
+    /// Nothing to check row by row: the pin then reads only each
+    /// record's header, so hipp reads only the cells' local bytes
+    /// (a damaged overflow chain is the page check's finding alone).
+    fn trivial(&self) -> bool {
+        #[cfg(feature = "indexes")]
+        let no_index = self.indexes.is_empty();
+        #[cfg(not(feature = "indexes"))]
+        let no_index = true;
+        no_index
+            && !self.nn.iter().any(|b| *b)
+            && self.strict.iter().all(|s| s.is_none())
+            && self.rules.as_ref().is_none_or(|r| r.checks.is_empty())
+    }
+}
+
+/// Report one index probe's finding; false once the error budget
+/// is spent.
+#[cfg(feature = "indexes")]
+#[inline(never)]
+fn index_finding(found: bool, dup: bool, nrow: i64, iname: &[u8], out: &mut Out) -> bool {
+    if !found {
+        let mut s = copy_vec(b"row ");
+        dec(nrow, &mut s);
+        s.extend_from_slice(b" missing from index ");
+        s.extend_from_slice(iname);
+        out.emit(s)
+    } else if dup {
+        let mut s = copy_vec(b"non-unique entry in index ");
+        s.extend_from_slice(iname);
+        out.emit(s)
+    } else {
+        true
     }
 }
 

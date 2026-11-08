@@ -1904,6 +1904,7 @@ impl<S: Storage> Connection<S> {
     /// table that already exists, storage) is reported here, as
     /// the pin's prepare reports it (`binding_dependent`).
     #[cfg(feature = "params")]
+    #[inline(never)]
     fn prepare_params(&self, sql: &[u8], arena: &Arena) -> Result<(Ast, Plan, Binds), S::Error> {
         let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena, self.cfg.limits())?;
         let plan_ckpt = arena.checkpoint();
@@ -2011,6 +2012,7 @@ impl<S: Storage> Connection<S> {
         Ok(plan)
     }
 
+    #[inline(never)]
     fn plan_inner(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
         // v0.16 (`triggers`): a write of a view with INSTEAD OF
         // triggers for it (its sources are expanded there).
@@ -12323,20 +12325,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 crate::query::exprs_colls(qp.items.as_slice()).as_slice(),
             );
         }
-        let enc = self.conn.pager.text_enc();
-        let perm = order_perm(produced.as_slice(), qp.order_by.as_slice(), enc);
-        let mut kept_rows: AVec<AVec<OwnedValue>> = AVec::new();
         let mut kept_ids: AVec<Option<i64>> = AVec::new();
-        for p in perm
-            .iter()
-            .skip(skip)
-            .take(take)
-            .filter_map(|&i| produced.as_slice().get(i))
-        {
-            kept_rows.push(p.out.clone());
-            kept_ids.push(p.rowid);
-        }
-        self.query_rows = kept_rows;
+        self.query_rows = ordered_window(
+            produced.as_slice(),
+            qp.order_by.as_slice(),
+            self.conn.pager.text_enc(),
+            (skip, take),
+            Some(&mut kept_ids),
+        );
         self.query_rowids = kept_ids;
     }
 
@@ -13079,18 +13075,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             };
             return Ok(apply_window(rows, window));
         }
-        let enc = self.conn.pager.text_enc();
-        let perm = order_perm(produced.as_slice(), plan.order_by.as_slice(), enc);
-        let mut rows: AVec<AVec<OwnedValue>> = AVec::new();
-        for p in perm
-            .iter()
-            .skip(window.0)
-            .take(window.1)
-            .filter_map(|&i| produced.as_slice().get(i))
-        {
-            rows.push(p.out.clone());
-        }
-        Ok(rows)
+        Ok(ordered_window(
+            produced.as_slice(),
+            plan.order_by.as_slice(),
+            self.conn.pager.text_enc(),
+            window,
+            None,
+        ))
     }
 
     /// Execute one subquery CORE (v0.6; v0.9 split): materialise
@@ -15400,6 +15391,34 @@ struct Produced {
     out: AVec<OwnedValue>,
     keys: AVec<OwnedValue>,
     rowid: Option<i64>,
+}
+
+/// The produced rows in ORDER BY order, inside the LIMIT / OFFSET
+/// window, and (into `ids`) their rowids: the tail the materialising
+/// executor and `exec_subplan_inner` share (sync).
+#[cfg(feature = "v04")]
+#[inline(never)]
+fn ordered_window(
+    produced: &[Produced],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
+    (skip, take): (usize, usize),
+    mut ids: Option<&mut AVec<Option<i64>>>,
+) -> AVec<AVec<OwnedValue>> {
+    let perm = order_perm(produced, order_by, enc);
+    let mut rows: AVec<AVec<OwnedValue>> = AVec::new();
+    for p in perm
+        .iter()
+        .skip(skip)
+        .take(take)
+        .filter_map(|&i| produced.get(i))
+    {
+        rows.push(p.out.clone());
+        if let Some(ids) = ids.as_deref_mut() {
+            ids.push(p.rowid);
+        }
+    }
+    rows
 }
 
 /// The ORDER BY permutation of `produced` (stable, under the terms'

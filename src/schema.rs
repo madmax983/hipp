@@ -661,6 +661,11 @@ fn place_clustered_keys(
 }
 
 /// Build the catalog by scanning `sqlite_schema` (root page 1).
+///
+/// The future only reads the schema rows; decoding a row and
+/// building the catalog from the collected rows are sync
+/// ([`collect_schema_row`], [`catalog_from_rows`]), so that code is
+/// not carried inside the state machine (ADR 0005 Stage 1).
 pub async fn build_catalog<S: Storage>(
     pager: &mut Pager<S>,
     catalog_arena: &Arena,
@@ -672,33 +677,51 @@ pub async fn build_catalog<S: Storage>(
     {
         let mut cursor = ScanCursor::new(1);
         while let Some((_rowid, payload)) = cursor.next_row(pager).await? {
-            let values = decode_record::<S::Error>(payload.as_slice(), 5)?;
-            if values.len() < 5 {
-                continue;
-            }
-            let (Value::Text(ty), Value::Text(name), Value::Text(tbl_name), Value::Integer(root)) = (
-                &values.as_slice()[0],
-                &values.as_slice()[1],
-                &values.as_slice()[2],
-                &values.as_slice()[3],
-            ) else {
-                continue;
-            };
-            let sql = match &values.as_slice()[4] {
-                Value::Text(s) => Some(copy_avec(s)),
-                _ => None,
-            };
-            rows.push(SchemaRow {
-                ty: copy_avec(ty),
-                name: copy_avec(name),
-                tbl_name: copy_avec(tbl_name),
-                root: *root as u32,
-                sql,
-            });
+            collect_schema_row::<S::Error>(&mut rows, payload.as_slice())?;
         }
     }
+    catalog_from_rows::<S::Error>(&rows, pager.schema_cookie(), catalog_arena, lim)
+}
 
-    let mut catalog = Catalog::empty(pager.schema_cookie());
+/// Decode one `sqlite_schema` record into `rows`; a record without
+/// the five text/integer columns is skipped.
+#[inline(never)]
+fn collect_schema_row<E>(rows: &mut AVec<SchemaRow>, payload: &[u8]) -> Result<(), E> {
+    let values = decode_record::<E>(payload, 5)?;
+    if values.len() < 5 {
+        return Ok(());
+    }
+    let (Value::Text(ty), Value::Text(name), Value::Text(tbl_name), Value::Integer(root)) = (
+        &values.as_slice()[0],
+        &values.as_slice()[1],
+        &values.as_slice()[2],
+        &values.as_slice()[3],
+    ) else {
+        return Ok(());
+    };
+    let sql = match &values.as_slice()[4] {
+        Value::Text(s) => Some(copy_avec(s)),
+        _ => None,
+    };
+    rows.push(SchemaRow {
+        ty: copy_avec(ty),
+        name: copy_avec(name),
+        tbl_name: copy_avec(tbl_name),
+        root: *root as u32,
+        sql,
+    });
+    Ok(())
+}
+
+/// Build the catalog from the collected schema rows (sync: no I/O).
+#[inline(never)]
+fn catalog_from_rows<E>(
+    rows: &AVec<SchemaRow>,
+    cookie: u32,
+    catalog_arena: &Arena,
+    lim: crate::sql::parser::Limits,
+) -> Result<Catalog, E> {
+    let mut catalog = Catalog::empty(cookie);
     #[cfg(feature = "v16")]
     {
         for row in rows.iter() {
@@ -764,7 +787,7 @@ pub async fn build_catalog<S: Storage>(
         // declared columns (none when hipp lacks the module).
         #[cfg(feature = "vtab")]
         if let Ok(Ast::CreateVirtual { module, args, .. }) =
-            &parse::<S::Error>(sql.as_slice(), &scratch, lim)
+            &parse::<E>(sql.as_slice(), &scratch, lim)
         {
             let m = handle_bytes(&scratch, *module);
             let mut spans: AVec<&[u8]> = AVec::new();
@@ -789,7 +812,7 @@ pub async fn build_catalog<S: Storage>(
             });
             continue;
         }
-        let ast = match parse::<S::Error>(sql.as_slice(), &scratch, lim) {
+        let ast = match parse::<E>(sql.as_slice(), &scratch, lim) {
             Ok(a) => a,
             // v0.16: a collation hipp does not have (one an
             // application registered) — the pin opens such a
@@ -909,7 +932,7 @@ pub async fn build_catalog<S: Storage>(
             #[cfg(feature = "v04")]
             if let Some(h) = c.default_expr {
                 let text = handle_bytes(&scratch, h);
-                match crate::rules::eval_default::<S::Error>(
+                match crate::rules::eval_default::<E>(
                     text,
                     &scratch,
                     lim,
@@ -1012,7 +1035,7 @@ pub async fn build_catalog<S: Storage>(
             shadow_opaque: false,
             #[cfg(feature = "v16")]
             autoinc: rowid_alias.is_some()
-                && crate::sql::parser::has_autoincrement::<S::Error>(sql.as_slice(), &scratch),
+                && crate::sql::parser::has_autoincrement::<E>(sql.as_slice(), &scratch),
             #[cfg(not(feature = "triggers"))]
             triggered: rows.iter().any(|r| {
                 eq_ci(r.ty.as_slice(), b"trigger")
@@ -1072,7 +1095,7 @@ pub async fn build_catalog<S: Storage>(
             Some(sql) => {
                 // Explicit index: re-parse its CREATE INDEX.
                 scratch.reset();
-                let parsed = parse::<S::Error>(sql.as_slice(), &scratch, lim);
+                let parsed = parse::<E>(sql.as_slice(), &scratch, lim);
                 let mut idx = IndexDef {
                     name: intern(catalog_arena, row.name.as_slice())?,
                     table: intern(catalog_arena, row.tbl_name.as_slice())?,
@@ -1213,7 +1236,7 @@ pub async fn build_catalog<S: Storage>(
             columns: explicit,
             select,
             ..
-        }) = parse::<S::Error>(sql.as_slice(), &scratch, lim)
+        }) = parse::<E>(sql.as_slice(), &scratch, lim)
         {
             columns = derive_view_columns(&catalog, catalog_arena, &scratch, &select, &explicit);
         }
@@ -1236,7 +1259,7 @@ pub async fn build_catalog<S: Storage>(
         {
             scratch.reset();
             let sql = row.sql.as_ref().map_or(&[][..], |s| s.as_slice());
-            let parsed = match parse::<S::Error>(sql, &scratch, lim) {
+            let parsed = match parse::<E>(sql, &scratch, lim) {
                 Ok(Ast::CreateTrigger(t)) => Some(t),
                 _ => None,
             };
@@ -1264,7 +1287,7 @@ pub async fn build_catalog<S: Storage>(
         }
     }
 
-    catalog.cookie = pager.schema_cookie();
+    catalog.cookie = cookie;
     Ok(catalog)
 }
 

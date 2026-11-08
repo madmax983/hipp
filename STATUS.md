@@ -1873,6 +1873,143 @@ keeps every group; a negative or text frame offset is an error
 ("frame starting offset must be a non-negative integer"), `1 + 1
 PRECEDING` is accepted.
 
+### Size pass: sync islands out of async bodies (2026-11-08)
+
+Stage 1 unit 3 of the ADR 0005 size pass (`size-islands`). A refactor
+with no feature and no observable change: code between the `.await`s
+of mostly-sync async bodies moves into `#[inline(never)]` sync
+functions, so the future's `poll` keeps the I/O and the calls. Every
+split was measured on all four profiles against the tree before it
+(thumbv7em, `--profile tiny`, `.text + .rodata`) and kept only when no
+profile grew; the B-tree balance futures (`balance_*_window`,
+`cascade_*_up`) are untouched.
+
+**Kept (Δ tiny / full / max / xl, each against the state before it):**
+
+| split | Δ |
+|---|---|
+| `schema::build_catalog` (tiny's `rebuild_catalog` too): the future scans `sqlite_schema`; `collect_schema_row` decodes a row, `catalog_from_rows` builds the catalog | −60 / −256 / −272 / −272 |
+| `pragma` `check_rows`: `row_check_plan` (columns, rules, indexes, `p2`), `check_row` (NOT NULL / STRICT / CHECK per row), `index_finding` | 0 / −208 / −616 / −544 |
+| `stream_open` (in full, `step_query`'s tail): `stream_plan` before the LIMIT / OFFSET await, `stream_build` after it | 0 / −24 / −248 / −160 |
+| `trigger_failed`: one statement-undo site for the FAIL and ABORT arms (the `abort_write!` future was inlined twice) | 0 / 0 / −72 / −32 |
+| `exec_subplan_inner`'s ORDER BY / window tail and `finish_produced` share `ordered_window` | 0 / −56 / −72 / −80 |
+| `prepare_params` out of `prepare` | 0 / −120 / −72 / −40 |
+| `nest_may_abort` out of `trigger_failed`, `json::tvf_rows` out of `json_tvf_rows`, `before_update_loaded` out of `exec_update` (symbol pairs: −130 / −156, −12 / −20, −108 / −106 in max / xl) | 0 / 0 / −256 / −272 |
+| `plan_inner` out of tiny's `prepare` (other profiles already call it) | −76 / 0 / 0 / 0 |
+
+**Measured and reverted (grew a profile):** `integrity`'s preamble and
+count report (+180 / +300 / +172 full / max / xl; the count report
+alone +68 in full); `vacuum`'s page-1 header patch (+120 / +120 /
++104); `compact_image`'s copy order (+200 / +168 / +152: the body
+shrank 440 B, the function is 576 B); `exec_subplan_inner`'s bounds
+(+126 max) and its ORDER BY tail on its own (+70); `stat_decode`'s
+header and cell decode (+176 / +168 max / xl: −816 in the body, 988 B
+of functions); `fk_actions`' per-key gate (+118 max); `dbstat_db`'s
+row decode and tree pick (+52 / +60); `stream_finish`'s aggregate row
+(+88 / +144 max / xl, −16 full); `eval_group_sub`'s owned-aggregate
+fold (+128 in each); `#[inline(never)]` on `route_attach` (+72 max),
+`wr::layouts`, `agg_step`, `cte` `source`, `fk_action_ast`,
+`edit_table` / `edit_index` (+210 full), `fk_check_plan` (+794 xl),
+`open_stmt`, `fts_journal`, `insert_multi` and
+`btree::leaf_cells_meta` (+64 tiny). `rtree_next` and `prepare_eqp`
+hold no sync island worth a call: their bytes are inlined async
+callees (`rt_node`, `seek_rowid`, `prepare`, `eqp_rows`); `requalify`
+was already out of line.
+
+**What the measurements say.** The baseline's density figures (3.01
+vs 2.76 bytes per instruction) do not turn into savings when the code
+moves: a local that never lives across an `.await` is already on the
+stack, so an island pays the async tax only through register
+pressure in the large `poll` function. Out of line it pays a call,
+its arguments and a prologue instead, and loses the constants and
+shared outlined fragments it had inline. Large islands with many
+locals win 3–8% of their bytes (`check_rows`, `stream_open`,
+`nest_may_abort`, `prepare_params`); small ones (a header patch, a
+row decode, a gate) lose. 1,608 B in max is about 2.7% of the
+60,438 B of mostly-sync bodies, below the −3.4…−6.8 K estimate;
+the rest of that code is inlined async callees, which only the
+VM (ADR 0005 Stage 2) removes.
+
+**Cancellation (SPEC §5.1.1).** Nothing a dropped future must leave
+behind moved: the new locals that live across an `.await`
+(`RowCheck`, the stream's plan and window, the `undo` flag) are
+derived from the catalog or the plan, and every write and checkpoint
+still happens where it did. `crash.rs` (dropped futures, injected
+storage failures) passes unchanged.
+
+**Futures' drop glue** (sum of `drop_glue::<…{closure#…}>`) does not
+grow: 1,472 → 1,468 / 13,568 → 13,506 / 29,906 → 29,842 / 30,976 →
+30,916 B. (`prepare`'s own glue grew 4 B in max / xl with
+`prepare_params`; the sum fell.)
+
+**Async stack.** `depth_v16` and `triggers_v16` pass with debug info
+on (and `crash`, `pragma_v16`, `stream_v17`); no limit test moved, so
+`Config::stack_budget`'s `STACK_*` constants are unchanged.
+
+**Oracle probing (3.54.1 pin).** The touched paths were re-probed
+live against the pin and hipp: `PRAGMA integrity_check` / `(N)` /
+`quick_check` / `(table)` over rows that fail CHECK under
+`ignore_check_constraints` (one "CHECK constraint failed in t" per
+failing row, in each form), ORDER BY ... LIMIT / OFFSET inside a
+derived table and a correlated scalar subquery, a compound with
+ORDER BY / LIMIT, a folded `count(*), sum(a)`, and an AFTER INSERT
+trigger's `INSERT OR FAIL` failing in autocommit and inside BEGIN
+(the FAIL keeps the rows written before it; the transaction stays
+open): identical rows and errored-vs-succeeded on every statement.
+`UPDATE sqlite_schema` under `writable_schema` is refused by the pin's
+CLI ("table sqlite_master may not be modified"), so NOT NULL / STRICT
+findings stay covered by `pragma_v16`'s existing corpus.
+
+**Tests.** No behaviour changed, so no test was added or changed: the
+existing suites cover every split (`pragma_v16` integrity corpus,
+`stream_v17`, `triggers_v16` FAIL / ABORT / ROLLBACK and depth
+resolutions, `json_v16` table-valued functions, `foreign_keys_v16`,
+`size_v17`, `crash`, the ALTER / VACUUM / schema-reload suites) and
+pass unchanged.
+
+**Gates:** `ci/local-gates.sh` (full run) passes.
+
+**Size Δ** against the ratchets before the unit: tiny 76,260 → 76,124
+(−136); full 477,180 → 476,516 (−664); max 964,316 → 962,708
+(−1,608); xl 1,060,616 → 1,059,216 (−1,400). Engine statics stay 0 B.
+Every ratchet is lowered to its measured figure; tiny's is lowered
+too (it shrinks; nothing to justify).
+
+**Honest gaps.**
+
+- The unit's estimate (−0.2…−0.5 K / −2.7…−5.4 K / −3.4…−6.8 K /
+  −3.7…−7.4 K) is met for tiny only; full, max and xl reach a quarter
+  to a half of the low end, for the reason above. `vacuum`,
+  `integrity`, `stat_decode`, `dbstat_db`, `fk_actions`,
+  `rtree_next`, `prepare_eqp` and `eval_group_sub` keep their bodies.
+- `step` (34,884 B in max), `exec_vtab`, `vtab_rows_of`,
+  `stream_step`, `exec_alter16` and `step_maint` are large because
+  they inline async callees, not sync code; they are Stage 2 / 3
+  work.
+
+### Size pass Stage 1 (Tier A): summary (2026-11-08)
+
+ADR 0005's Stage 1 is the three units above (`size-sort`,
+`size-mono`, `size-islands`); `docs/adr/0005-code-size-sync-core-and-vm.md`
+records it as accepted. Totals against the ratchets before the stage
+(thumbv7em, `--profile tiny`, `.text + .rodata`):
+
+| profile | before | sort | mono | islands | after | Δ | budget headroom after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `tiny` | 76,960 | 0 | −700 | −136 | **76,124** | −836 (−1.1%) | 54,948 |
+| `full` | 507,592 | −26,352 | −4,060 | −664 | **476,516** | −31,076 (−6.1%) | 47,772 |
+| `max` | 1,031,072 | −62,688 | −4,068 | −1,608 | **962,708** | −68,364 (−6.6%) | 85,868 |
+| `xl` | 1,142,128 | −76,948 | −4,564 | −1,400 | **1,059,216** | −82,912 (−7.3%) | 251,504 |
+
+Against the ADR's estimate for S1 (~75.7 K / ~476.7 K / ~962.9 K /
+~1,018 K from the `8d78815` baseline): full and max land on it, tiny
+is 0.4 K above (the type-erased `AVec` core and most islands did not
+pay), and xl is above because `xl` grew by four leaves between the
+baseline and the stage (1,114,356 B at `8d78815`, 1,142,128 B when the
+stage started). Rows, errors, file bytes and EXPLAIN QUERY PLAN output
+are unchanged against the pin except the deliberate NaN-rank fix of
+`size-sort`. Engine statics stay 0 B in every profile.
+
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles

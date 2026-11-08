@@ -230,26 +230,46 @@ impl<S: Storage> Statement<'_, S> {
     /// executor. Evaluates LIMIT / OFFSET and the WHERE clause's
     /// constant terms, as the materialising executor does first.
     pub(super) async fn stream_open(&mut self) -> Result<Option<Box<Stream>>, S::Error> {
+        let Some(qp) = self.stream_plan() else {
+            return Ok(None);
+        };
+        let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        self.stream_build(qp, window)
+    }
+
+    /// The statement's query plan when it streams (sync part of
+    /// `stream_open`, ADR 0005 Stage 1).
+    #[inline(never)]
+    fn stream_plan(&self) -> Option<alloc::rc::Rc<QueryPlan>> {
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         if self.conn.in_program() {
-            return Ok(None);
+            return None;
         }
         let Plan::Query(qp) = &self.plan else {
-            return Ok(None);
+            return None;
         };
         if qp.sources.is_empty()
             || !qp.compound.is_empty()
             || !qp.values.is_empty()
             || qp.sources.iter().any(|s| s.kind.pads_left() || s.rec != 0)
         {
-            return Ok(None);
+            return None;
         }
         #[cfg(feature = "window")]
         if !crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice()).is_empty() {
-            return Ok(None);
+            return None;
         }
-        let qp = alloc::rc::Rc::clone(qp);
-        let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        Some(alloc::rc::Rc::clone(qp))
+    }
+
+    /// Set up the stream of `qp` over the row window `window` (sync
+    /// part of `stream_open`, ADR 0005 Stage 1).
+    #[inline(never)]
+    fn stream_build(
+        &mut self,
+        qp: alloc::rc::Rc<QueryPlan>,
+        window: (usize, usize),
+    ) -> Result<Option<Box<Stream>>, S::Error> {
         // An endless recursive CTE read first through a WHERE or a
         // join under a LIMIT: its rows are computed under a bound
         // that doubles whenever the join has read them all

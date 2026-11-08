@@ -5,6 +5,27 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Size: sync islands out of async bodies
+
+- Mostly-sync async bodies keep only their I/O; the code between the
+  awaits runs in `#[inline(never)]` sync functions: the schema load
+  (`collect_schema_row` / `catalog_from_rows`, tiny's catalog rebuild
+  too), the integrity check's per-table setup and per-row checks,
+  `stream_open`'s plan and setup, one statement-undo site in
+  `trigger_failed`, the ORDER BY window shared by `exec_subplan_inner`
+  and `finish_produced`, and `prepare_params`, `plan_inner`,
+  `nest_may_abort`, `json::tvf_rows` and `before_update_loaded` out of
+  their futures. tiny −136 B (76,124), full −664 B (476,516), max
+  −1,608 B (962,708), xl −1,400 B (1,059,216); ratchets lowered;
+  futures' drop glue smaller in every profile. Splits that measured
+  larger in any profile (vacuum, integrity's preamble, stat_decode,
+  dbstat, fk_actions, eval_group_sub, and others) were reverted. No
+  observable change.
+- ADR 0005 (`docs/adr/0005-code-size-sync-core-and-vm.md`) is accepted
+  for Stage 1 with its measured results: tiny −836 B, full −31,076 B,
+  max −68,364 B, xl −82,912 B over the three size units; Stages 2–4
+  (the VM) stay proposed.
+
 ### Size: monomorphic glue
 
 - The evaluator's remaining duplicate instantiations are gone:

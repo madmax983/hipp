@@ -29,10 +29,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,260 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 477,180 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 964,316 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,060,616 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,124 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 476,516 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 962,708 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,059,216 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -186,6 +186,17 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   no longer copies its plan per outer row): tiny −700 B, full
   −4,060 B, max −4,068 B, xl −4,564 B. Rows, errors and file bytes
   are unchanged against the pin.
+- **Size pass: sync islands** (no feature). The sync code inside
+  mostly-sync async bodies — the schema load, the integrity check's
+  row checks, the streamed query's setup, subquery ORDER BY windows,
+  statement preparation, trigger-failure resolution — runs in
+  out-of-line sync functions, and the futures keep only their I/O:
+  tiny −136 B, full −664 B, max −1,608 B, xl −1,400 B; every split
+  that measured larger was reverted (STATUS.md lists both). With the
+  two units above this closes Stage 1 of ADR 0005: tiny −836 B, full
+  −31,076 B, max −68,364 B (85,868 B of headroom under 1 MiB), xl
+  −82,912 B. Rows, errors and file bytes are unchanged against the
+  pin.
 
 ## What v0.16 does
 
