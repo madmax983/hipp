@@ -972,7 +972,7 @@ fn eval_offset(e: Option<&RExpr>) -> Result<Option<OwnedValue>, SchemaKind> {
         return Ok(None);
     };
     let empty = crate::query::RowData::empty();
-    match crate::query::eval::<()>(e, &crate::query::Ctx::of(&empty)) {
+    match crate::query::eval_body::<()>(e, &crate::query::Ctx::of(&empty)) {
         Ok(v) => Ok(Some(v)),
         Err(crate::error::Error::Schema { kind }) => Err(kind),
         Err(_) => Err(SchemaKind::FrameStartOffset),

@@ -1068,8 +1068,11 @@ struct CompKeys {
 #[cfg(feature = "v09")]
 impl CompKeys {
     /// The item term `table.name` (or bare `name`) matches in
-    /// this core, if any.
-    fn hit(&self, table: Option<&[u8]>, name: &[u8]) -> Option<usize> {
+    /// this core, if any. Generic over the caller's error type only
+    /// so that it shares the resolver's instantiation (v0.17 size
+    /// pass: an `Error<()>` copy of `group_column` was compiled for
+    /// this one caller).
+    fn hit<E>(&self, table: Option<&[u8]>, name: &[u8]) -> Option<usize> {
         if table.is_none()
             && let Some(i) = self
                 .names
@@ -1078,7 +1081,7 @@ impl CompKeys {
         {
             return Some(i);
         }
-        let r = crate::query::resolve_column_in_group::<()>(&self.scope, table, name)?.ok()?;
+        let r = crate::query::resolve_column_in_group::<E>(&self.scope, table, name)?.ok()?;
         self.items.iter().position(|it| same_ref(it, &r))
     }
 }
@@ -14378,7 +14381,7 @@ fn resolve_compound_order<E>(
                 let qb = table.map(|h| handle_bytes(arena, h));
                 core::iter::once(head)
                     .chain(tails.iter())
-                    .find_map(|k| k.hit(qb, nb))
+                    .find_map(|k| k.hit::<E>(qb, nb))
             }
             _ => None,
         };

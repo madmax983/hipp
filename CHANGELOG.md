@@ -5,6 +5,17 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Size: monomorphic glue
+
+- The evaluator's remaining duplicate instantiations are gone:
+  `walk_aggs_mut` / `walk_plan_aggs_mut` are monomorphic, the compound
+  ORDER BY matcher shares the resolver's instantiation, and under
+  `window` `cond_is` re-types one `Error<()>` body as `eval` does, with
+  the evaluator's own helpers calling the bodies directly. full
+  −1,844 B (479,396), max −2,036 B (966,348), xl −2,044 B (1,063,136),
+  tiny unchanged; ratchets lowered. No observable change
+  (`tests/size_v17.rs`).
+
 ### Size: one shared stable sort
 
 - Every `sort` / `sort_by` / `sort_by_key` / `sort_unstable*` in `src/`

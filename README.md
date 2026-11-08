@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 481,240 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 968,384 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,065,180 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 479,396 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 966,348 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,063,136 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -176,6 +176,12 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   (an infinite rank weight) sorts those rows as the pin's NULL —
   first ascending, last descending — instead of leaving them in rowid
   order.
+- **Size pass: monomorphic glue** (no feature). Machinery Rust
+  compiled once per type is compiled once: the expression evaluator's
+  helpers, conditions and aggregate walks no longer have both an
+  `Error<()>` and a storage-error copy (full −1,844 B, max −2,036 B,
+  xl −2,044 B, tiny unchanged). Rows, errors and file bytes are
+  unchanged against the pin.
 
 ## What v0.16 does
 

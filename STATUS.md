@@ -1697,6 +1697,63 @@ statics stay 0 B. Each ratchet is lowered to its measured figure.
   Within noise to +9%; `docs/perf-baselines.md` workloads are gated
   from unit 4 on.
 
+### Size pass: monomorphic glue (2026-11-08)
+
+Stage 1 unit 2 of the ADR 0005 size pass (`size-mono`): shared
+machinery that Rust compiled once per type is compiled once. A
+refactor with no feature and no observable change; each sub-edit is
+its own commit, measured on all four profiles and kept only because no
+profile grew. Size Δ is against the ratchets before the sub-edit
+(thumbv7em, `--profile tiny`).
+
+**(a) The rest of the evaluator's duplicates.** After `e091bae`
+(`query::eval` compiled once under `window`) the symbol table still
+held both an `Error<()>` and a storage-error copy of
+`walk_aggs_mut` / `walk_plan_aggs_mut` (full, max, xl),
+`resolve_column_in_group` with `group_column` inlined (full, max,
+xl), `cond_is` / `cond` (max, xl), and a 128 B `eval::<()>` re-typing
+wrapper the evaluator's own recursion went through. Now:
+
+- `walk_aggs_mut` / `walk_plan_aggs_mut` are monomorphic: the visitor
+  returns `Err(())` to stop, and `subst_owned_aggs` keeps the fold's
+  real error beside the closure (an overflowing `sum` in a correlated
+  subquery still fails the statement, `tests/size_v17.rs`);
+  `alias_from_outer` maps the signal to its `Unsupported`.
+- The compound ORDER BY matcher (`CompKeys::hit`) resolves on its
+  caller's error type, so it shares the resolver's instantiation.
+- Under `window`, `cond_is` re-types a once-compiled `cond_body`, as
+  `eval` does; the evaluator's helpers (`eval_other`, `scalar_values`,
+  `eval_case`, `eval_in_list`, `eval_json_arg`, `eval_lazy`, `arith`,
+  `cmp_op`, `in_rows`, `eval_raise`) and the window frame offsets call
+  `eval_body` / `cond_body` directly, so the re-typing wrappers are
+  paid only at the executors' entry points. Without `window` the
+  wrappers are the bodies (no growth in `full`).
+- `llvm-nm --demangle | rg '<\(\)>'` in max / xl now lists only the
+  evaluator family, the json and printf helpers and the frame code,
+  each once: no function has both an `Error<()>` and a `MemError`
+  copy. In full one 28 B `serial_body_len::<()>` (the record
+  encoder's) remains; splitting it out grew tiny by 8 B, so it stays.
+- agg::fold and func::printf were already single (`fold::<MemError>`
+  is a 92 B wrapper of the non-generic `fold_rows`; printf has only
+  the `()` copy).
+
+Size Δ: tiny 76,960 → 76,960 (0); full 481,240 → 479,396 (−1,844);
+max 968,384 → 966,348 (−2,036); xl 1,065,180 → 1,063,136 (−2,044).
+Gates: `ci/local-gates.sh` (full run) passes; `depth_v16` and
+`triggers_v16` pass with debug info on (the evaluator's recursion now
+calls `eval_body` directly, one frame fewer per level).
+
+**Oracle probing (3.54.1 pin)**, recorded as corpora in
+`tests/size_v17.rs`: a compound's ORDER BY resolves `t.a` and an
+alias against the first core and errors on an unknown name; an outer
+aggregate in a scalar subquery is per group (`(SELECT sum(a) + c FROM
+u WHERE c = 1)` is 5 / 3 / NULL); a group whose `sum` overflows fails
+the whole statement with no row printed first, a filtered group that
+does not overflow answers; `HAVING EXISTS (SELECT max(t.a) FROM u)`
+keeps every group; a negative or text frame offset is an error
+("frame starting offset must be a non-negative integer"), `1 + 1
+PRECEDING` is accepted.
+
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles

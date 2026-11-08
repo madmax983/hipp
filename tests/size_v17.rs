@@ -20,6 +20,12 @@
 //!   where the sort put them. The pin reads the rank as an SQL value,
 //!   where NaN is NULL: those rows sort first ascending, last
 //!   descending, ties in rowid order. Regression tests below.
+//!
+//! Stage 1 unit 2 (`size-mono`) adds corpora at the end of the file
+//! for the machinery it compiles once instead of per type: the
+//! evaluator's helpers and conditions, the aggregate walks, the
+//! compound ORDER BY resolver, B-tree page splits, `AVec` growth and
+//! the per-execution plans.
 
 mod common;
 
@@ -393,6 +399,89 @@ fn rtree_and_fts5_rowid_ordered_writes_match_the_pin() {
             "DELETE FROM rt WHERE x0 < 20; SELECT id FROM rt",
             "DELETE FROM ft WHERE ft MATCH 'w1'; SELECT rowid FROM ft",
             "SELECT rowid FROM ft WHERE ft MATCH 'w2' ORDER BY rank",
+        ],
+    );
+}
+
+// ---------- Stage 1 unit 2 (`size-mono`): monomorphic glue ----------
+//
+// Each sub-edit compiles a piece of shared machinery once instead of
+// per type; the claim is again "nothing observable changed". The
+// corpora below drive exactly the paths whose instantiations were
+// merged, against the pin.
+
+/// A small table pair with ties, NULLs and an overflowing column.
+const MONO_SETUP: &str = "CREATE TABLE t(a, b);\
+     INSERT INTO t VALUES(1, 'x'), (2, 'y'), (3, 'x'), (NULL, 'z');\
+     CREATE TABLE u(c);\
+     INSERT INTO u VALUES(1), (2);\
+     CREATE TABLE big(a, b);\
+     INSERT INTO big VALUES(9223372036854775807, 'x'), (9223372036854775807, 'x'), (1, 'y');";
+
+/// (a) A compound's ORDER BY names a result column through the
+/// resolver (`CompKeys::hit`, now on the resolver's own instantiation).
+#[test]
+fn compound_order_by_names_match_the_pin() {
+    same(
+        "mono-comp",
+        MONO_SETUP,
+        &[
+            "SELECT a, b FROM t UNION SELECT c, 'q' FROM u ORDER BY b, a",
+            "SELECT a AS k FROM t UNION ALL SELECT c FROM u ORDER BY k DESC",
+            "SELECT t.a FROM t UNION SELECT c FROM u ORDER BY t.a",
+            "SELECT t.a, t.b FROM t UNION SELECT c, c FROM u ORDER BY t.b DESC, 1",
+            "SELECT a FROM t UNION SELECT c FROM u ORDER BY nosuch",
+            "SELECT t.a FROM t, u UNION SELECT c FROM u ORDER BY t.a",
+        ],
+    );
+}
+
+/// (a) Aggregates of an outer query inside subqueries: substituted
+/// per group (`subst_owned_aggs`, whose walk now stops on a unit
+/// signal and keeps the fold's error beside it — an overflowing
+/// `sum` must still fail the statement), re-levelled through an
+/// alias (`alias_from_outer`), and marked inert in an EXISTS.
+#[test]
+fn outer_aggregates_in_subqueries_match_the_pin() {
+    same(
+        "mono-agg",
+        MONO_SETUP,
+        &[
+            "SELECT b, (SELECT count(*) FROM u WHERE c <= max(t.a)) FROM t GROUP BY b ORDER BY b",
+            "SELECT b, sum(a) s FROM t GROUP BY b HAVING (SELECT s) > 1",
+            "SELECT b FROM t GROUP BY b HAVING EXISTS (SELECT max(t.a) FROM u)",
+            "SELECT b, (SELECT sum(a) + c FROM u WHERE c = 1) FROM t GROUP BY b",
+            "SELECT (SELECT count(*) FROM t AS t2 WHERE t2.a = max(t.a)) FROM t",
+            "SELECT b AS k, count(*) FROM t GROUP BY k ORDER BY (SELECT k)",
+            "SELECT b, (SELECT sum(a) FROM (SELECT 1)) FROM big GROUP BY b",
+            "SELECT b, (SELECT sum(a) FROM (SELECT 1)) FROM big WHERE b = 'y' GROUP BY b",
+            "SELECT b FROM big GROUP BY b HAVING (SELECT sum(a)) > 0",
+            "SELECT b, (SELECT max(a) + 1 FROM (SELECT 1)) FROM big GROUP BY b",
+        ],
+    );
+}
+
+/// (a) The evaluator's own conditions (CASE, `iif`, json arguments,
+/// FILTER, AND / OR / NOT short cuts) and the window functions' frame
+/// offsets, which now run the one `Error<()>` body directly.
+#[test]
+fn evaluator_conditions_and_frame_offsets_match_the_pin() {
+    same(
+        "mono-cond",
+        MONO_SETUP,
+        &[
+            "SELECT iif(a > 1, 'big', 'small'), CASE WHEN a THEN b END, \
+             json_object('k', CASE WHEN a > 1 THEN 1 ELSE 0 END) FROM t",
+            "SELECT a FROM t WHERE (a > 1 AND b = 'x') OR NOT (a < 3) ORDER BY a",
+            "SELECT count(*) FILTER (WHERE a > 1 AND b <> 'z') FROM t",
+            "SELECT b, max(a) FROM t GROUP BY b HAVING max(a) > 1 AND count(*) > 1",
+            "SELECT CASE WHEN a + 1 > 2 AND NOT b = 'x' THEN 'p' WHEN a IS NULL THEN 'n' END FROM t",
+            "SELECT a FROM big WHERE a + a > 0",
+            "SELECT CASE WHEN a + a > 0 THEN 1 END FROM big",
+            "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
+            "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN 1 + 1 PRECEDING AND CURRENT ROW) FROM t",
+            "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t",
+            "SELECT a, sum(a) OVER (ORDER BY a ROWS BETWEEN 'x' PRECEDING AND CURRENT ROW) FROM t",
         ],
     );
 }

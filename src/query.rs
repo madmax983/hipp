@@ -1634,15 +1634,16 @@ fn alias_from_outer<E>(
     let mut out = e.clone();
     shift_expr(&mut out, home, by);
     let up = u8::try_from(depth).map_err(|_| Error::Unsupported)?;
-    walk_aggs_mut::<E>(&mut out, 0, &mut |a, dd| {
+    walk_aggs_mut(&mut out, 0, &mut |a, dd| {
         if let RExpr::Agg { lvl, alias, .. } = a
             && *lvl >= dd
         {
-            *lvl = lvl.checked_add(up).ok_or(Error::Unsupported)?;
+            *lvl = lvl.checked_add(up).ok_or(())?;
             *alias = true;
         }
         Ok(false)
-    })?;
+    })
+    .map_err(|()| Error::Unsupported)?;
     Ok(out)
 }
 
@@ -3849,7 +3850,7 @@ pub fn mark_exists_inert(p: &mut SubPlan) {
         return;
     }
     fn mark(e: &mut RExpr, d: u8) {
-        let _ = walk_aggs_mut::<()>(e, d, &mut |a, dd| {
+        let _ = walk_aggs_mut(e, d, &mut |a, dd| {
             if let RExpr::Agg { lvl, inert, .. } = a
                 && *lvl > dd
             {
@@ -3967,30 +3968,45 @@ pub fn subst_owned_aggs<E>(
     d: u8,
     fold: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
 ) -> Result<(), E> {
-    walk_aggs_mut::<E>(e, d, &mut |a, dd| {
+    // The walk is monomorphic (v0.17 size pass): `fold`'s error
+    // waits here while the walk stops on the unit signal.
+    let mut err = None;
+    let _ = walk_aggs_mut(e, d, &mut |a, dd| {
         if let RExpr::Agg {
             lvl, inert: false, ..
         } = a
             && *lvl == dd
             && dd > 0
         {
-            let v = fold(a)?;
-            *a = RExpr::Literal(v);
+            match fold(a) {
+                Ok(v) => *a = RExpr::Literal(v),
+                Err(x) => {
+                    err = Some(x);
+                    return Err(());
+                }
+            }
             return Ok(true);
         }
         Ok(false)
-    })
+    });
+    match err {
+        Some(x) => Err(x),
+        None => Ok(()),
+    }
 }
 
 /// Walk every node of `e` (at subquery depth `d`, + 1 per
 /// nested plan as in `visit_aggs`), calling `f` on each
 /// aggregate node first; `f` returning true means it replaced
-/// the node, which is then not descended into (v0.16).
-fn walk_aggs_mut<E>(
+/// the node, which is then not descended into (v0.16). `f`
+/// returning `Err(())` stops the walk; a caller with an error to
+/// report keeps it beside the closure, so the walk is compiled once
+/// (v0.17 size pass).
+fn walk_aggs_mut(
     e: &mut RExpr,
     d: u8,
-    f: &mut dyn FnMut(&mut RExpr, u8) -> Result<bool, E>,
-) -> Result<(), E> {
+    f: &mut dyn FnMut(&mut RExpr, u8) -> core::result::Result<bool, ()>,
+) -> core::result::Result<(), ()> {
     let fold = f;
     if matches!(e, RExpr::Agg { .. }) && fold(e, d)? {
         return Ok(());
@@ -4057,11 +4073,11 @@ fn walk_aggs_mut<E>(
 }
 
 /// `walk_aggs_mut` over every expression of a plan (v0.16).
-fn walk_plan_aggs_mut<E>(
+fn walk_plan_aggs_mut(
     p: &mut SubPlan,
     d: u8,
-    fold: &mut dyn FnMut(&mut RExpr, u8) -> Result<bool, E>,
-) -> Result<(), E> {
+    fold: &mut dyn FnMut(&mut RExpr, u8) -> core::result::Result<bool, ()>,
+) -> core::result::Result<(), ()> {
     for s in p.sources.as_mut_slice() {
         if let Some(on) = &mut s.on {
             walk_aggs_mut(on, d, fold)?;
@@ -5969,8 +5985,8 @@ fn in_list_coll(x: &RExpr) -> Coll {
 }
 
 fn cmp_op<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
-    let lv = eval::<E>(l, ctx)?;
-    let rv = eval::<E>(r, ctx)?;
+    let lv = eval_body::<E>(l, ctx)?;
+    let rv = eval_body::<E>(r, ctx)?;
     cmp_values::<E>(op, l, r, lv, rv, ctx.enc())
 }
 
@@ -6011,8 +6027,8 @@ fn cmp_values<E>(
 }
 
 fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
-    let lv = eval::<E>(l, ctx)?;
-    let rv = eval::<E>(r, ctx)?;
+    let lv = eval_body::<E>(l, ctx)?;
+    let rv = eval_body::<E>(r, ctx)?;
     #[cfg(feature = "utf16")]
     if ctx.enc() != crate::record::TextEnc::Utf8 {
         let r = arith_values::<E>(op, blob_text(lv, ctx), blob_text(rv, ctx))?;
@@ -6592,7 +6608,7 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
         ScalarFn::Raise(k) => Some(eval_raise::<E>(k, args, ctx)),
         ScalarFn::Coalesce => {
             for a in args {
-                match eval::<E>(a, ctx) {
+                match eval_body::<E>(a, ctx) {
                     Ok(OwnedValue::Null) => {}
                     other => return Some(other),
                 }
@@ -6602,20 +6618,20 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
         ScalarFn::Iif => {
             let mut i = 0usize;
             while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
-                match cond::<E>(c, ctx) {
+                match cond_body::<E>(c, ctx, true) {
                     Err(e) => return Some(Err(e)),
-                    Ok(true) => return Some(eval::<E>(t, ctx)),
+                    Ok(true) => return Some(eval_body::<E>(t, ctx)),
                     Ok(false) => {}
                 }
                 i += 2;
             }
             Some(match args.get(i) {
-                Some(o) => eval::<E>(o, ctx),
+                Some(o) => eval_body::<E>(o, ctx),
                 None => Ok(OwnedValue::Null),
             })
         }
         #[cfg(feature = "v16")]
-        ScalarFn::Likely => args.first().map(|a| eval::<E>(a, ctx)),
+        ScalarFn::Likely => args.first().map(|a| eval_body::<E>(a, ctx)),
         #[cfg(feature = "v16")]
         ScalarFn::Random
         | ScalarFn::Randomblob
@@ -6627,7 +6643,7 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
             };
             Some(match f {
                 ScalarFn::Random => Ok(OwnedValue::Integer(env.prng.random())),
-                ScalarFn::Randomblob => match args.first().map(|a| eval::<E>(a, ctx)) {
+                ScalarFn::Randomblob => match args.first().map(|a| eval_body::<E>(a, ctx)) {
                     Some(Ok(n)) => env.prng.blob::<E>(&num_arg(n, ctx)),
                     Some(Err(e)) => Err(e),
                     None => Ok(OwnedValue::Null),
@@ -6651,7 +6667,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
     }
     let mut vs: AVec<OwnedValue> = AVec::new();
     for a in args {
-        vs.push(eval::<E>(a, ctx)?);
+        vs.push(eval_body::<E>(a, ctx)?);
     }
     #[cfg(feature = "utf16")]
     if let Some(be) = crate::utf16::byte_order(ctx.enc()) {
@@ -7221,7 +7237,8 @@ pub(crate) fn json_arg16(
 /// other function, a value read back from a table — does not.
 #[cfg(feature = "json")]
 pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, bool), E> {
-    let plain = |x: &RExpr| -> Result<(OwnedValue, bool), E> { Ok((eval::<E>(x, ctx)?, false)) };
+    let plain =
+        |x: &RExpr| -> Result<(OwnedValue, bool), E> { Ok((eval_body::<E>(x, ctx)?, false)) };
     match e {
         RExpr::Scalar(ScalarFn::Json(f), args) => eval_json_call::<E>(*f, args.as_slice(), ctx),
         RExpr::Pos(x) | RExpr::Collate(x, _) => eval_json_arg::<E>(x, ctx),
@@ -7253,7 +7270,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             let args = args.as_slice();
             let mut i = 0usize;
             while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
-                if cond::<E>(c, ctx)? {
+                if cond_body::<E>(c, ctx, true)? {
                     return eval_json_arg::<E>(t, ctx);
                 }
                 i += 2;
@@ -7269,7 +7286,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
                 return plain(e);
             };
             let (va, sa) = eval_json_arg::<E>(a, ctx)?;
-            let vb = eval::<E>(b, ctx)?;
+            let vb = eval_body::<E>(b, ctx)?;
             if !matches!(va, OwnedValue::Null)
                 && !matches!(vb, OwnedValue::Null)
                 && values_equal_coll(&va, &vb, args_coll(args))
@@ -7321,9 +7338,9 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
         } => {
             match base {
                 Some(b) => {
-                    let bv = eval::<E>(b, ctx)?;
+                    let bv = eval_body::<E>(b, ctx)?;
                     for (w, t) in whens.iter() {
-                        let wv = eval::<E>(w, ctx)?;
+                        let wv = eval_body::<E>(w, ctx)?;
                         let (bv2, wv2) = adjust_cmp(b, w, bv.clone(), wv);
                         if !matches!(bv2, OwnedValue::Null)
                             && !matches!(wv2, OwnedValue::Null)
@@ -7335,7 +7352,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
                 }
                 None => {
                     for (w, t) in whens.iter() {
-                        if cond::<E>(w, ctx)? {
+                        if cond_body::<E>(w, ctx, true)? {
                             return eval_json_arg::<E>(t, ctx);
                         }
                     }
@@ -7350,7 +7367,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             kind: AggKind::Json(a),
             ..
         } if !a.blob => {
-            let v = eval::<E>(e, ctx)?;
+            let v = eval_body::<E>(e, ctx)?;
             let sub = matches!(v, OwnedValue::Text(_));
             Ok((v, sub))
         }
@@ -7362,7 +7379,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             ..
         } if matches!(args.as_slice().first(), Some(RExpr::Scalar(ScalarFn::Json(f), _)) if f.always_json()) =>
         {
-            let v = eval::<E>(e, ctx)?;
+            let v = eval_body::<E>(e, ctx)?;
             let sub = matches!(v, OwnedValue::Text(_));
             Ok((v, sub))
         }
@@ -7443,7 +7460,7 @@ fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<Own
     let last = list.last().map(parts).unwrap_or(&[]);
     let mut xv = AVec::new();
     for e in xs {
-        xv.push(eval::<E>(e, ctx)?);
+        xv.push(eval_body::<E>(e, ctx)?);
     }
     let mut any_null = false;
     for item in list {
@@ -7454,7 +7471,7 @@ fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<Own
             else {
                 return Err(row_misused());
             };
-            let iv = eval::<E>(ie, ctx)?;
+            let iv = eval_body::<E>(ie, ctx)?;
             let (a, b) = adjust_set(xe, src, v.clone(), iv);
             if matches!(a, OwnedValue::Null) || matches!(b, OwnedValue::Null) {
                 row_null = true;
@@ -7491,7 +7508,7 @@ fn eval_raise<E>(
     use crate::sql::ast::RaiseKind;
     let mut msg = AVec::new();
     if let Some(a) = args.first() {
-        match eval::<E>(a, ctx)? {
+        match eval_body::<E>(a, ctx)? {
             OwnedValue::Null => {}
             v => {
                 if let OwnedValue::Text(t) = cast_value(&v, Affinity::Text) {
@@ -7532,10 +7549,14 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     eval_body(e, ctx)
 }
 
-/// The evaluator's body (see `eval`); recursive calls go back through
-/// `eval`.
+/// The evaluator's body (see `eval`). Recursive calls, and the
+/// evaluator's own helpers (`eval_other`, `scalar_values`, `eval_case`,
+/// ...), call the body directly, so under `window` only the
+/// executors' entry points pay for `eval`'s re-typing (v0.17 size
+/// pass); a caller that wants `Error<()>` (the window functions'
+/// frame offsets) calls it directly too.
 #[inline(never)]
-fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+pub(crate) fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
         RExpr::AffLiteral(v, ..) => v.clone(),
@@ -7552,8 +7573,8 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         },
         RExpr::Win(..) => return Err(Error::Unsupported),
         RExpr::Raise(kind) => return Err(Error::Schema { kind: *kind }),
-        RExpr::Pos(x) => eval::<E>(x, ctx)?,
-        RExpr::Neg(x) => match to_number(&num_arg(eval::<E>(x, ctx)?, ctx)) {
+        RExpr::Pos(x) => eval_body::<E>(x, ctx)?,
+        RExpr::Neg(x) => match to_number(&num_arg(eval_body::<E>(x, ctx)?, ctx)) {
             None => OwnedValue::Null,
             Some(Num::Int(i)) => match i.checked_neg() {
                 Some(n) => OwnedValue::Integer(n),
@@ -7561,12 +7582,12 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             },
             Some(Num::Real(r)) => OwnedValue::Real(-r),
         },
-        RExpr::Not(x) => match truthy(&eval::<E>(x, ctx)?) {
+        RExpr::Not(x) => match truthy(&eval_body::<E>(x, ctx)?) {
             None => OwnedValue::Null,
             Some(b) => bool_val(!b),
         },
         RExpr::IsNull(x, neg) => {
-            let is = matches!(eval::<E>(x, ctx)?, OwnedValue::Null);
+            let is = matches!(eval_body::<E>(x, ctx)?, OwnedValue::Null);
             bool_val(is != *neg)
         }
         RExpr::Binary(op, l, r) => match op {
@@ -7577,11 +7598,11 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             BinOp::And if int_lit(l) == Some(false) || int_lit(r) == Some(false) => bool_val(false),
             BinOp::Or if int_lit(l) == Some(true) || int_lit(r) == Some(true) => bool_val(true),
             BinOp::And => {
-                let a = truthy(&eval::<E>(l, ctx)?);
+                let a = truthy(&eval_body::<E>(l, ctx)?);
                 if a == Some(false) && has_raise(r) {
                     return Ok(bool_val(false));
                 }
-                let b = truthy(&eval::<E>(r, ctx)?);
+                let b = truthy(&eval_body::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(false), _) | (_, Some(false)) => bool_val(false),
                     (Some(true), Some(true)) => bool_val(true),
@@ -7589,11 +7610,11 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                 }
             }
             BinOp::Or => {
-                let a = truthy(&eval::<E>(l, ctx)?);
+                let a = truthy(&eval_body::<E>(l, ctx)?);
                 if a == Some(true) && has_raise(r) {
                     return Ok(bool_val(true));
                 }
-                let b = truthy(&eval::<E>(r, ctx)?);
+                let b = truthy(&eval_body::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(true), _) | (_, Some(true)) => bool_val(true),
                     (Some(false), Some(false)) => bool_val(false),
@@ -7615,10 +7636,10 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => eval_other::<E>(e, ctx)?,
         },
         #[cfg(feature = "utf16")]
-        RExpr::Cast(x, aff) => cast_in(eval::<E>(x, ctx)?, *aff, ctx),
+        RExpr::Cast(x, aff) => cast_in(eval_body::<E>(x, ctx)?, *aff, ctx),
         #[cfg(not(feature = "utf16"))]
-        RExpr::Cast(x, aff) => cast_value(&eval::<E>(x, ctx)?, *aff),
-        RExpr::Collate(x, _) => eval::<E>(x, ctx)?,
+        RExpr::Cast(x, aff) => cast_value(&eval_body::<E>(x, ctx)?, *aff),
+        RExpr::Collate(x, _) => eval_body::<E>(x, ctx)?,
         // Everything else out of line: this function is on the
         // stack once per level of the expression tree, so its own
         // frame is kept to the common nodes (v0.16: see
@@ -7637,12 +7658,12 @@ fn eval_in_list<E>(
     ctx: &Ctx<'_>,
 ) -> Result<OwnedValue, E> {
     Ok({
-        let xv = eval::<E>(x, ctx)?;
+        let xv = eval_body::<E>(x, ctx)?;
         let mut any_null = matches!(xv, OwnedValue::Null);
         let mut hit = false;
         let coll = in_list_coll(x);
         for item in list.iter() {
-            let iv = eval::<E>(item, ctx)?;
+            let iv = eval_body::<E>(item, ctx)?;
             // An IN (SELECT ...) substitution converts both
             // sides by the set's affinity (the item carries
             // the subquery column's; `adjust_set`). A written list converts both sides
@@ -7692,9 +7713,9 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         let mut done = false;
         match base {
             Some(b) => {
-                let bv = eval::<E>(b, ctx)?;
+                let bv = eval_body::<E>(b, ctx)?;
                 for (w, t) in whens.iter() {
-                    let wv = eval::<E>(w, ctx)?;
+                    let wv = eval_body::<E>(w, ctx)?;
                     // The base form compares like `=`:
                     // comparison affinity applies between
                     // the base and each WHEN operand (v0.8;
@@ -7707,7 +7728,7 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                         && !matches!(wv2, OwnedValue::Null)
                         && values_equal_coll(&bv2, &wv2, binary_coll(b, w))
                     {
-                        out = eval::<E>(t, ctx)?;
+                        out = eval_body::<E>(t, ctx)?;
                         done = true;
                         break;
                     }
@@ -7715,8 +7736,8 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
             None => {
                 for (w, t) in whens.iter() {
-                    if cond::<E>(w, ctx)? {
-                        out = eval::<E>(t, ctx)?;
+                    if cond_body::<E>(w, ctx, true)? {
+                        out = eval_body::<E>(t, ctx)?;
                         done = true;
                         break;
                     }
@@ -7724,7 +7745,7 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
         }
         if !done && let Some(o) = otherwise {
-            out = eval::<E>(o, ctx)?;
+            out = eval_body::<E>(o, ctx)?;
         }
         out
     })
@@ -7755,24 +7776,40 @@ pub fn cond_false<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
 }
 
 /// Whether `e` is `want` (true or false; NULL is neither).
+///
+/// Like `eval`, compiled once under `window` (v0.17 size pass): the
+/// evaluator's own conditions (CASE, json, `iif`) run the body for
+/// `Error<()>`, and the executors' calls re-type its errors here.
+#[cfg(feature = "window")]
 pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
+    cond_body::<()>(e, ctx, want).map_err(|x| x.map_storage(|()| Error::Unsupported))
+}
+
+/// Whether `e` is `want` (see the `window` variant above).
+#[cfg(not(feature = "window"))]
+pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
+    cond_body(e, ctx, want)
+}
+
+/// `cond_is`'s body (see `eval`): recursive calls stay in the body.
+fn cond_body<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
     match e {
         RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r)
             if int_lit(l).is_none() && int_lit(r).is_none() =>
         {
             // AND is false, OR true, as soon as one operand is.
             let decisive = (*op == BinOp::Or) == want;
-            let a = cond_is::<E>(l, ctx, want)?;
+            let a = cond_body::<E>(l, ctx, want)?;
             if a == decisive {
                 return Ok(a);
             }
-            cond_is::<E>(r, ctx, want)
+            cond_body::<E>(r, ctx, want)
         }
-        RExpr::Not(x) => cond_is::<E>(x, ctx, !want),
+        RExpr::Not(x) => cond_body::<E>(x, ctx, !want),
         #[cfg(feature = "utf16")]
-        _ => Ok(truthy(&blob_text(eval::<E>(e, ctx)?, ctx)) == Some(want)),
+        _ => Ok(truthy(&blob_text(eval_body::<E>(e, ctx)?, ctx)) == Some(want)),
         #[cfg(not(feature = "utf16"))]
-        _ => Ok(truthy(&eval::<E>(e, ctx)?) == Some(want)),
+        _ => Ok(truthy(&eval_body::<E>(e, ctx)?) == Some(want)),
     }
 }
 
@@ -7933,8 +7970,8 @@ fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         #[cfg(feature = "v16")]
         RExpr::Binary(op @ (BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr), l, r) => {
-            let lv = eval::<E>(l, ctx)?;
-            let rv = eval::<E>(r, ctx)?;
+            let lv = eval_body::<E>(l, ctx)?;
+            let rv = eval_body::<E>(r, ctx)?;
             if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
@@ -7973,8 +8010,8 @@ fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
         }
         RExpr::Like(x, p, neg) => {
-            let xv = eval::<E>(x, ctx)?;
-            let pv = eval::<E>(p, ctx)?;
+            let xv = eval_body::<E>(x, ctx)?;
+            let pv = eval_body::<E>(p, ctx)?;
             #[cfg(feature = "utf16")]
             let (xv, pv) = (text_view(xv, ctx), text_view(pv, ctx));
             match like_glob::<E>(&pv, &xv, None, false, case_like(ctx))? {
