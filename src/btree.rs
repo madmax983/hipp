@@ -1240,6 +1240,8 @@ pub async fn btree_insert<S: Storage>(
 /// is a suffix of the combined sequence costing closest to half
 /// the content capacity `cap` (ties take the smaller suffix), and
 /// the remaining items are distributed over the `win` old pages.
+/// The group sizes come from the monomorphic `insert_counts`; only
+/// the copy into groups is per item type (v0.17 size pass).
 fn distribute_insert<T: Clone>(
     items: &[T],
     weights: &[usize],
@@ -1247,9 +1249,16 @@ fn distribute_insert<T: Clone>(
     cap: usize,
     win: usize,
 ) -> AVec<AVec<T>> {
-    if n == win + 1 && win >= 2 && items.len() > n {
+    group_items(items, insert_counts(weights, n, cap, win).as_slice())
+}
+
+/// The group sizes of `distribute_insert` for items of `weights`
+/// (one weight per item).
+fn insert_counts(weights: &[usize], n: usize, cap: usize, win: usize) -> AVec<usize> {
+    let len = weights.len();
+    if n == win + 1 && win >= 2 && len > n {
         let target = cap / 2;
-        let max_cnt = items.len() - win;
+        let max_cnt = len - win;
         let mut best_cnt = 1usize;
         let mut best_key = (usize::MAX, usize::MAX);
         let mut s = 0usize;
@@ -1264,16 +1273,29 @@ fn distribute_insert<T: Clone>(
                 best_cnt = i + 1;
             }
         }
-        let cut = items.len() - best_cnt;
-        let mut groups = distribute(&items[..cut], &weights[..cut], win, cap);
-        let mut suffix = AVec::new();
-        for it in &items[cut..] {
-            suffix.push(it.clone());
-        }
-        groups.push(suffix);
-        return groups;
+        let cut = len - best_cnt;
+        let mut counts = split_counts(weights.get(..cut).unwrap_or(&[]), win, cap);
+        counts.push(best_cnt);
+        return counts;
     }
-    distribute(items, weights, n, cap)
+    split_counts(weights, n, cap)
+}
+
+/// Copy `items` in order into consecutive groups of `counts[k]`
+/// items (the only per-item-type step of a balance's split).
+fn group_items<T: Clone>(items: &[T], counts: &[usize]) -> AVec<AVec<T>> {
+    let mut groups: AVec<AVec<T>> = AVec::new();
+    let mut rest = items;
+    for &c in counts {
+        let (head, tail) = rest.split_at(c.min(rest.len()));
+        let mut group = AVec::new();
+        for it in head {
+            group.push(it.clone());
+        }
+        groups.push(group);
+        rest = tail;
+    }
+    groups
 }
 
 /// Greedy in-order packing of leaf cells at full capacity (the
@@ -1942,66 +1964,62 @@ fn window_range(nchildren: usize, trigger: usize) -> (usize, usize) {
 /// `n` non-empty groups, evenly by weight: each group is filled
 /// to at least the ceiling of its fair share of the remaining
 /// weight before the next group starts. Requires
-/// `items.len() >= n >= 1`.
+/// `items.len() >= n >= 1`. The split points come from the
+/// monomorphic `split_counts` (v0.17 size pass).
 fn distribute<T: Clone>(items: &[T], weights: &[usize], n: usize, usable: usize) -> AVec<AVec<T>> {
-    debug_assert!(n >= 1 && items.len() >= n);
+    debug_assert!(n >= 1 && items.len() >= n && weights.len() == items.len());
+    group_items(items, split_counts(weights, n, usable).as_slice())
+}
+
+/// The group sizes of `distribute` for items of `weights` (one weight
+/// per item): `n` counts summing to `weights.len()`.
+fn split_counts(weights: &[usize], n: usize, usable: usize) -> AVec<usize> {
+    let len = weights.len();
     let total: usize = weights.iter().sum();
-    let mut groups: AVec<AVec<T>> = AVec::new();
+    let mut counts: AVec<usize> = AVec::new();
     let mut idx = 0usize;
     let mut cum = 0usize;
     for g in 0..n {
-        let mut group = AVec::new();
         if g + 1 == n {
-            while idx < items.len() {
-                group.push(items[idx].clone());
-                idx += 1;
-            }
-            groups.push(group);
+            counts.push(len - idx);
             break;
         }
         // Items that must remain so every later group is
         // non-empty.
         let reserve = n - 1 - g;
-        if n == 2 {
-            // Two-page result: split evenly by weight — fill
-            // while the running total is below half (probed:
-            // exact on every observed merge).
-            while items.len() - idx > reserve && (group.is_empty() || cum * 2 < total) {
-                cum += weights[idx];
-                group.push(items[idx].clone());
-                idx += 1;
+        let start = idx;
+        while len - idx > reserve {
+            let w = weights.get(idx).copied().unwrap_or(0);
+            let more = idx == start
+                || if n == 2 {
+                    // Two-page result: split evenly by weight — fill
+                    // while the running total is below half (probed:
+                    // exact on every observed merge).
+                    cum * 2 < total
+                } else if g == 0 {
+                    // First boundary of a three-page result:
+                    // cumulative quota (total + usable) / (n + 1),
+                    // check-then-add — the group overshoots its quota
+                    // by less than one item (probed from the 3.54.1
+                    // oracle; see the section comment).
+                    cum * (n + 1) < total + usable
+                } else {
+                    // Second boundary: place it at the item closest
+                    // to the cumulative quota 2 * (total + usable) /
+                    // (n + 1) — stop before an item that would carry
+                    // the total strictly further past the quota than
+                    // it currently falls short.
+                    (2 * cum + w) * (n + 1) <= 2 * (total + usable) * (g + 1)
+                };
+            if !more {
+                break;
             }
-        } else if g == 0 {
-            // First boundary of a three-page result: cumulative
-            // quota (total + usable) / (n + 1), check-then-add —
-            // the group overshoots its quota by less than one
-            // item (probed from the 3.54.1 oracle; see the
-            // section comment).
-            while items.len() - idx > reserve
-                && (group.is_empty() || cum * (n + 1) < total + usable)
-            {
-                cum += weights[idx];
-                group.push(items[idx].clone());
-                idx += 1;
-            }
-        } else {
-            // Second boundary: place it at the item closest to
-            // the cumulative quota 2 * (total + usable) / (n + 1)
-            // — stop before an item that would carry the total
-            // strictly further past the quota than it currently
-            // falls short.
-            while items.len() - idx > reserve
-                && (group.is_empty()
-                    || (2 * cum + weights[idx]) * (n + 1) <= 2 * (total + usable) * (g + 1))
-            {
-                cum += weights[idx];
-                group.push(items[idx].clone());
-                idx += 1;
-            }
+            cum += w;
+            idx += 1;
         }
-        groups.push(group);
+        counts.push(idx - start);
     }
-    groups
+    counts
 }
 
 /// Outcome of one window balance.
@@ -6003,4 +6021,172 @@ async fn index_rebuild_without_extra<S: Storage>(
         index_insert_core(pager, root, p.as_slice(), desc).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod split_tests {
+    //! The monomorphic split-point computation (v0.17 size pass)
+    //! against the generic `distribute` / `distribute_insert` it
+    //! replaced, kept here verbatim as the reference.
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn ref_distribute<T: Clone>(
+        items: &[T],
+        weights: &[usize],
+        n: usize,
+        usable: usize,
+    ) -> Vec<Vec<T>> {
+        let total: usize = weights.iter().sum();
+        let mut groups: Vec<Vec<T>> = Vec::new();
+        let mut idx = 0usize;
+        let mut cum = 0usize;
+        for g in 0..n {
+            let mut group = Vec::new();
+            if g + 1 == n {
+                while idx < items.len() {
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+                groups.push(group);
+                break;
+            }
+            let reserve = n - 1 - g;
+            if n == 2 {
+                while items.len() - idx > reserve && (group.is_empty() || cum * 2 < total) {
+                    cum += weights[idx];
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+            } else if g == 0 {
+                while items.len() - idx > reserve
+                    && (group.is_empty() || cum * (n + 1) < total + usable)
+                {
+                    cum += weights[idx];
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+            } else {
+                while items.len() - idx > reserve
+                    && (group.is_empty()
+                        || (2 * cum + weights[idx]) * (n + 1) <= 2 * (total + usable) * (g + 1))
+                {
+                    cum += weights[idx];
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+            }
+            groups.push(group);
+        }
+        groups
+    }
+
+    fn ref_insert<T: Clone>(
+        items: &[T],
+        weights: &[usize],
+        n: usize,
+        cap: usize,
+        win: usize,
+    ) -> Vec<Vec<T>> {
+        if n == win + 1 && win >= 2 && items.len() > n {
+            let target = cap / 2;
+            let max_cnt = items.len() - win;
+            let mut best_cnt = 1usize;
+            let mut best_key = (usize::MAX, usize::MAX);
+            let mut s = 0usize;
+            for (i, w) in weights.iter().rev().enumerate() {
+                if i >= max_cnt {
+                    break;
+                }
+                s += w;
+                let key = (s.abs_diff(target), s);
+                if key < best_key {
+                    best_key = key;
+                    best_cnt = i + 1;
+                }
+            }
+            let cut = items.len() - best_cnt;
+            let mut groups = ref_distribute(&items[..cut], &weights[..cut], win, cap);
+            groups.push(items[cut..].to_vec());
+            return groups;
+        }
+        ref_distribute(items, weights, n, cap)
+    }
+
+    fn as_vecs(g: AVec<AVec<u32>>) -> Vec<Vec<u32>> {
+        g.iter().map(|x| x.as_slice().to_vec()).collect()
+    }
+
+    /// xorshift64, deterministic.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    #[test]
+    fn split_counts_match_the_generic_reference() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..4000 {
+            let len = 1 + (r.next() % 60) as usize;
+            let heavy = round % 7 == 0;
+            let weights: Vec<usize> = (0..len)
+                .map(|_| {
+                    if heavy {
+                        200 + (r.next() % 1800) as usize
+                    } else {
+                        4 + (r.next() % 120) as usize
+                    }
+                })
+                .collect();
+            let items: Vec<u32> = (0..len as u32).collect();
+            let usable = 488 + (r.next() % 3600) as usize;
+            for n in 1..=len.min(5) {
+                let got = as_vecs(distribute(&items, &weights, n, usable));
+                assert_eq!(
+                    got,
+                    ref_distribute(&items, &weights, n, usable),
+                    "{weights:?} n={n}"
+                );
+                let c = split_counts(&weights, n, usable);
+                assert_eq!(c.len(), n);
+                assert_eq!(c.iter().sum::<usize>(), len);
+                assert!(c.iter().all(|&k| k >= 1));
+                for win in 1..=3 {
+                    let got = as_vecs(distribute_insert(&items, &weights, n, usable, win));
+                    assert_eq!(
+                        got,
+                        ref_insert(&items, &weights, n, usable, win),
+                        "{weights:?} n={n} win={win}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_items_follows_the_counts() {
+        let items = [1u32, 2, 3, 4, 5, 6];
+        let g = as_vecs(group_items(&items, &[1, 3, 2]));
+        assert_eq!(
+            g,
+            alloc::vec![alloc::vec![1], alloc::vec![2, 3, 4], alloc::vec![5, 6]]
+        );
+        // Counts past the end never panic: the groups just run short.
+        let g = as_vecs(group_items(&items, &[4, 4, 4]));
+        assert_eq!(
+            g,
+            alloc::vec![alloc::vec![1, 2, 3, 4], alloc::vec![5, 6], alloc::vec![]]
+        );
+        assert!(group_items::<u32>(&[], &[]).is_empty());
+        // An empty weight list with one group is one empty count.
+        assert_eq!(split_counts(&[], 1, 100).as_slice(), &[0]);
+        assert!(insert_counts(&[], 1, 100, 1).as_slice() == [0]);
+    }
 }

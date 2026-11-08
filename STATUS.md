@@ -1743,6 +1743,28 @@ Gates: `ci/local-gates.sh` (full run) passes; `depth_v16` and
 `triggers_v16` pass with debug info on (the evaluator's recursion now
 calls `eval_body` directly, one frame fewer per level).
 
+**(b) B-tree split points, computed once.** `btree::distribute` /
+`distribute_insert` were compiled per cell type (`LeafCell`,
+`IndexCell`, `(u32, key)` interior pairs: 1,360 B in tiny). The group
+sizes now come from the monomorphic `split_counts` / `insert_counts`
+over the weights (the same rules, branch for branch: the two-page
+half split, the three-page quota boundaries, the insert balance's
+half-capacity suffix); only `group_items::<T>`, the copy into groups,
+is per type. Unit tests (`btree::split_tests`) run the old generic
+code, kept verbatim as the reference, against the new one on 4,000
+generated weight lists × every group count 1..5 × windows 1..3; the
+page images are unchanged: `insert_balance_v15` and
+`delete_balance_v14` compare every step with the pin and pass, and
+their five `#[ignore]`d index / churn tests fail at the same steps
+the v0.15 notes record (step 133 of `idxasc`, ...), as before. A
+`extend_from_slice` copy instead of the push loop measured +48 B in
+tiny and +120 B in full, so the loop stays.
+
+Size Δ: tiny 76,960 → 76,260 (−700); full 479,396 → 478,436 (−960);
+max 966,348 → 965,388 (−960); xl 1,063,136 → 1,062,144 (−992).
+Tiny shrinks, so its ratchet is lowered too (no tiny growth to
+justify). Gates: `ci/local-gates.sh` (full run) passes.
+
 **Oracle probing (3.54.1 pin)**, recorded as corpora in
 `tests/size_v17.rs`: a compound's ORDER BY resolves `t.a` and an
 alias against the first core and errors on an unknown name; an outer

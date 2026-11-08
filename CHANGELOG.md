@@ -15,6 +15,11 @@ All notable changes to hipp. Versions follow the milestones in
   −1,844 B (479,396), max −2,036 B (966,348), xl −2,044 B (1,063,136),
   tiny unchanged; ratchets lowered. No observable change
   (`tests/size_v17.rs`).
+- `btree::distribute` / `distribute_insert` compute their group sizes
+  in the monomorphic `split_counts` / `insert_counts`; only the copy
+  into groups stays per cell type. tiny −700 B (76,260), full −960 B
+  (478,436), max −960 B (965,388), xl −992 B (1,062,144); page images
+  unchanged (`insert_balance_v15`, `delete_balance_v14` vs the pin).
 
 ### Size: one shared stable sort
 
