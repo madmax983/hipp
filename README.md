@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 506,728 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,048,036 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,159,132 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 507,592 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,031,072 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,142,128 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -1362,7 +1362,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 506,656 B of 512 KiB, `max` 1,047,868 B of 1 MiB, `xl` 1,156,732 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 507,592 B of 512 KiB, `max` 1,031,072 B of 1 MiB, `xl` 1,142,128 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

@@ -1095,7 +1095,9 @@ impl<E> Error<E> {
     /// Re-wrap this error for another storage error type, mapping
     /// a `Storage` error through `f` (v0.16, `v16`: VACUUM builds
     /// its image on an in-memory pager, whose errors surface under
-    /// the connection's storage type).
+    /// the connection's storage type). With `window`, also how the
+    /// expression evaluator, compiled once for `Error<()>`, hands its
+    /// errors to callers of any storage type (`query::eval`).
     #[cfg(feature = "v16")]
     pub fn map_storage<F>(self, f: impl FnOnce(E) -> Error<F>) -> Error<F> {
         match self {

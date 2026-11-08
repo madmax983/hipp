@@ -5,6 +5,13 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Size: one copy of the expression evaluator
+
+- With `window`, `query::eval` is compiled once (for `Error<()>`) instead
+  of once per error type: max −17,924 B, xl −17,900 B, tiny and full
+  unchanged (first item of the ADR 0005 size pass; it makes room for
+  `main`'s index-insert speed-up, which had taken `max` past 1 MiB).
+
 ### Query flattening (leaf `flatten`, in `xl`)
 
 - The query flattener (`sqlite3FlattenSubquery`): a view, CTE or

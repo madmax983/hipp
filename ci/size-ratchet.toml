@@ -21,7 +21,7 @@ justify_over = 4096
 # The full no_std profile (`--no-default-features --features full`),
 # same target, profile and binary. Tracked so dialect growth is a
 # visible, reviewed number; the tiny profile is the one SPEC §4.1 binds.
-ratchet = 506728
+ratchet = 507592
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -30,7 +30,7 @@ justify_over = 16384
 # Every feature without `std` (`--no-default-features --features max`,
 # ADR 0002): `full` plus the leaves too large for `full`'s budget.
 # Same target, profile and binary; ratcheted like the others.
-ratchet = 1048036
+ratchet = 1031072
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -39,7 +39,7 @@ justify_over = 32768
 # `max` plus the leaves past its 1 MiB budget (ADR 0004:
 # `--no-default-features --features xl`). Same target, profile and
 # binary; ratcheted like the others.
-ratchet = 1159132
+ratchet = 1142128
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

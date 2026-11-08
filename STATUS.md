@@ -1566,6 +1566,14 @@ is its measured figure.
 - The `min()` bare-column tie: a join's `min(x), y` with ties in `x`
   may take `y` from another row than the pin (join order), as before.
 
+### Merging `main` (bolt index-insert speed-up) and one copy of the evaluator (2026-11-08)
+
+Merging `main` ([madmax983/hipp#18](https://github.com/madmax983/hipp/pull/18): the index leaf rebuilt from page bytes, `src/btree.rs`) on top of this wave conflicted in `ci/size-ratchet.toml` and took the merged `max` to 1,048,996 B, 420 B over its 1 MiB hard budget (full 507,592, xl 1,160,028).
+
+The first size-pass item (ADR 0005 draft, Tier A "monomorphic evaluator") makes the room: `query::eval` was compiled twice in `max` / `xl`, once for the executors' storage error type and once for `Error<()>`, which the window functions use to evaluate frame offsets. Under `window` the evaluator's body (`eval_body`) is now compiled once, for `Error<()>`, and `eval` re-types its errors through `Error::map_storage` (the evaluator never touches storage, so the `Storage` arm cannot occur). Without `window` there was only one instantiation, so `eval` calls the body directly and `full` does not pay for the wrapper. Rows and errors are unchanged: every differential suite and the CLI suites pass against the pin.
+
+**Size Δ** against the merged tree (thumbv7em, `--profile tiny`): tiny 76,960 (0); full 507,592 (0); max 1,048,996 → 1,031,072 (−17,924); xl 1,160,028 → 1,142,128 (−17,900). Against this wave before the merge: full 506,728 → 507,592 (+864, `main`'s index-insert change); max 1,048,036 → 1,031,072 (−16,964), now 17,504 B under its budget; xl 1,159,132 → 1,142,128 (−17,004). Each ratchet is its measured figure.
+
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles

@@ -7513,7 +7513,29 @@ fn eval_raise<E>(
     })
 }
 
+/// Evaluate `e` against `ctx` for a caller of any storage type.
+///
+/// With `window`, the window functions evaluate frame offsets for
+/// `Error<()>` while the executors evaluate for their storage's error
+/// type, which compiled the whole evaluator twice. The evaluator never
+/// touches storage, so under `window` its body is compiled once, for
+/// `Error<()>`, and its errors are re-typed here (`Storage` cannot
+/// occur). Without `window` there is only one instantiation anyway.
+#[cfg(feature = "window")]
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    eval_body::<()>(e, ctx).map_err(|x| x.map_storage(|()| Error::Unsupported))
+}
+
+/// Evaluate `e` against `ctx` (see the `window` variant above).
+#[cfg(not(feature = "window"))]
+pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    eval_body(e, ctx)
+}
+
+/// The evaluator's body (see `eval`); recursive calls go back through
+/// `eval`.
+#[inline(never)]
+fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
         RExpr::AffLiteral(v, ..) => v.clone(),
