@@ -467,6 +467,40 @@ fn last_sel(p: &SubPlan) -> u32 {
     p.compound.as_slice().last().map_or(p.sel, |(_, t)| t.sel)
 }
 
+/// The left operand's elements of `x IN (SELECT ...)` (one, or a
+/// row value's), each with the result column it compares with.
+fn in_pairs<'x>(x: &'x RExpr, p: &'x SubPlan) -> AVec<(&'x RExpr, Option<&'x RExpr>)> {
+    let core = p.compound.as_slice().last().map_or(p, |(_, t)| t);
+    let items: &[RExpr] = match core.values.as_slice().first() {
+        Some(r) if core.items.is_empty() => r.as_slice(),
+        _ => core.items.as_slice(),
+    };
+    let mut out = AVec::new();
+    match x {
+        #[cfg(feature = "v16")]
+        RExpr::Scalar(crate::query::ScalarFn::Vector, xs) => {
+            for (i, e) in xs.iter().enumerate() {
+                out.push((e, items.get(i)));
+            }
+        }
+        _ => out.push((x, items.first())),
+    }
+    out
+}
+
+/// Whether every comparison of `x IN (SELECT ...)` is BINARY: the pin
+/// builds the IN operator's Bloom filter only then (probed: a NOCASE
+/// left column, or `x COLLATE NOCASE IN (...)`, has none).
+fn in_binary(x: &RExpr, p: &SubPlan) -> bool {
+    in_pairs(x, p).iter().all(|(l, r)| {
+        let c = match r {
+            Some(r) => crate::query::binary_coll(l, r),
+            None => crate::query::expr_coll(l).unwrap_or_default(),
+        };
+        c == crate::record::Coll::Binary
+    })
+}
+
 /// The plan walk.
 #[cfg_attr(not(feature = "expr_index"), allow(dead_code))]
 pub(super) struct Walk<'a> {
@@ -485,6 +519,9 @@ pub(super) struct Walk<'a> {
     mats: AVec<u32>,
     /// The statement is an `UPDATE ... FROM` (the pin's co-routine rule).
     update_from: bool,
+    /// The subqueries being shown are an index loop's IN probes (no
+    /// Bloom filter of the IN operator; v0.17).
+    probing: bool,
 }
 
 /// View copies are numbered from here (`cte::Expander`), then shown
@@ -503,6 +540,7 @@ impl<'a> Walk<'a> {
             seen: AVec::new(),
             mats: AVec::new(),
             update_from: false,
+            probing: false,
         }
     }
 
@@ -898,10 +936,17 @@ impl<'a> Walk<'a> {
             let (order, unique) = ext
                 .as_ref()
                 .map_or((false, false), |x| (!x.order.is_empty(), x.unique));
-            if *distinct && !unique {
+            // A min() / max() query (v0.17, `multi_index`): no sorter
+            // for its ORDER BY, nor for its DISTINCT when the loops
+            // deliver the argument's order.
+            #[cfg(feature = "multi_index")]
+            let mm = c.sources.first().map_or(0, |s| s.eqp.minmax);
+            #[cfg(not(feature = "multi_index"))]
+            let mm = 0u8;
+            if *distinct && !unique && mm != 2 {
                 self.add(parent, &[b"USE TEMP B-TREE FOR ", name, b"(DISTINCT)"]);
             }
-            if order {
+            if order && mm == 0 {
                 self.add(parent, &[b"USE TEMP B-TREE FOR ", name, b"(ORDER BY)"]);
             }
         }
@@ -936,15 +981,9 @@ impl<'a> Walk<'a> {
             if sp.eqp.mat.as_slice() == b"\0" {
                 continue;
             }
-            if d.mat != 0 {
-                if self.mats.iter().any(|m| *m == d.mat) {
-                    continue;
-                }
-                self.mats.push(d.mat);
-            }
-            // The pin's `fromClauseTermCanBeCoroutine`.
-            let co = d.mat == 0
-                && !ltorj
+            // The pin's `fromClauseTermCanBeCoroutine`, as far as the
+            // position goes.
+            let at = !ltorj
                 && if i == 0 {
                     n == 1 || !self.update_from
                 } else {
@@ -956,6 +995,13 @@ impl<'a> Walk<'a> {
                                 && (j == i || s.derived.is_none())
                         })
                 };
+            if d.mat != 0 {
+                if self.mats.iter().any(|m| *m == d.mat) {
+                    continue;
+                }
+                self.mats.push(d.mat);
+            }
+            let co = d.mat == 0 && at;
             let mut h = AVec::new();
             h.extend_from_slice(if co { b"CO-ROUTINE " } else { b"MATERIALIZE " });
             self.sub_name(&mut h, sp.eqp.mat.as_slice(), last_sel(d));
@@ -985,6 +1031,40 @@ impl<'a> Walk<'a> {
             }
         }
         let count_of = self.simple_count(c);
+        // A join's WHERE terms with subqueries are shown after the loop
+        // that makes them computable, where the pin codes them (v0.17,
+        // `join_order`): per term, that loop's position.
+        #[cfg(feature = "join_order")]
+        let mut wterms: AVec<(&RExpr, usize)> = AVec::new();
+        #[cfg(feature = "join_order")]
+        if n > 1
+            && let Some(f) = c.filter
+        {
+            let mut parts: AVec<&RExpr> = AVec::new();
+            crate::xplan::conjuncts(f, &mut parts);
+            for p in parts.iter() {
+                let mut at = 0usize;
+                for (j, sj) in c.sources.iter().enumerate() {
+                    let band = crate::query::RefRange {
+                        w: (sj.eqp.base, sj.eqp.base + sj.ncols),
+                        s: (0, 0),
+                    };
+                    if crate::query::expr_refs_range(p, &band) {
+                        at = j;
+                    }
+                }
+                wterms.push((p, at));
+            }
+        }
+        // A min() / max() query (the pin's `minMaxQuery`): its FROM
+        // subqueries' and virtual tables' loops print SEARCH too
+        // (v0.17 review fix).
+        #[cfg(feature = "multi_index")]
+        let mm_core = c.has_agg
+            && c.having.is_none()
+            && count_of.is_none()
+            && crate::xmulti::minmax(c.items, c.order_by, !c.group_by.is_empty(), &|_| true)
+                .is_some();
         for (i, sp) in c.sources.iter().enumerate() {
             #[cfg(feature = "join_order")]
             if sp.eqp.omit {
@@ -1008,7 +1088,30 @@ impl<'a> Walk<'a> {
                 l.push(COUNT_MARK);
                 line = l;
             }
-            if i > 0 && sp.kind.pads_right() {
+            // A min() / max() query's loops all print SEARCH (v0.17,
+            // `multi_index`; the pin's `WHERE_ORDERBY_MIN` / `_MAX`).
+            #[cfg(feature = "multi_index")]
+            if (sp.eqp.minmax != 0 || mm_core) && line.as_slice().starts_with(b"SCAN ") {
+                let mut l = copy_vec(b"SEARCH ");
+                l.extend_from_slice(line.as_slice().get(5..).unwrap_or(&[]));
+                let wr_pk = sp.derived.is_none()
+                    && self
+                        .cat
+                        .tables
+                        .iter()
+                        .find(|t| t.root == sp.root)
+                        .is_some_and(|t| !t.has_rowid())
+                    && !l.as_slice().windows(7).any(|w| w == b" USING ");
+                if wr_pk {
+                    l.extend_from_slice(b" USING PRIMARY KEY");
+                }
+                line = l;
+            }
+            #[cfg(feature = "multi_index")]
+            let multi = sp.access.as_deref().and_then(|a| a.or.as_deref());
+            #[cfg(not(feature = "multi_index"))]
+            let multi: Option<()> = None;
+            if i > 0 && sp.kind.pads_right() && multi.is_none() {
                 line.extend_from_slice(b" LEFT-JOIN");
             }
             // The Bloom filters built before this loop (v0.17,
@@ -1032,17 +1135,38 @@ impl<'a> Walk<'a> {
                 self.auto_keys(sp, ai, &mut b);
                 self.add(parent, &[b.as_slice()]);
             }
-            self.add(parent, &[line.as_slice()]);
+            let id = self.add(parent, &[line.as_slice()]);
+            // A MULTI-INDEX OR loop's branches (v0.17, `multi_index`).
+            #[cfg(feature = "multi_index")]
+            if let Some(o) = multi {
+                self.or_branches(sp, o, id, i > 0 && sp.kind.pads_right());
+            }
+            #[cfg(not(feature = "multi_index"))]
+            let _ = (id, multi);
             #[cfg(feature = "expr_index")]
             if let Some(a) = sp.access.as_deref() {
                 for p in a.eq.iter() {
+                    // A scalar subquery a probe's value or bound holds
+                    // is coded with the loop too (v0.17 review fix).
+                    self.exprs(p.vals.as_slice(), parent, &[]);
                     if let Some(e) = &p.sub {
+                        self.probing = true;
                         self.exprs(core::slice::from_ref(e), parent, &[]);
+                        self.probing = false;
                     }
+                }
+                for b in a.lo.iter().chain(a.hi.iter()) {
+                    self.exprs(core::slice::from_ref(&b.e), parent, &[]);
                 }
             }
             if let Some(on) = &sp.on {
                 self.exprs(core::slice::from_ref(on), parent, probes.as_slice());
+            }
+            #[cfg(feature = "join_order")]
+            for (p, at) in wterms.iter() {
+                if *at == i {
+                    self.exprs(core::slice::from_ref(*p), parent, probes.as_slice());
+                }
             }
         }
         for (i, sp) in c.sources.iter().enumerate() {
@@ -1053,7 +1177,13 @@ impl<'a> Walk<'a> {
                 self.add(r, &[b"SCAN ", name.as_slice()]);
             }
         }
-        if let Some(f) = c.filter {
+        #[cfg(feature = "join_order")]
+        let shown = !wterms.is_empty();
+        #[cfg(not(feature = "join_order"))]
+        let shown = false;
+        if let Some(f) = c.filter
+            && !shown
+        {
             self.exprs(core::slice::from_ref(f), parent, probes.as_slice());
         }
         // (A join the pin's planner ordered reports what it delivers
@@ -1101,7 +1231,9 @@ impl<'a> Walk<'a> {
         // it (no ORDER BY, no aggregate) or found the loop brings equal
         // rows together, or redundant (a rowid among the result columns
         // of a lone table).
-        if c.distinct && !(c.has_agg && c.group_by.is_empty()) {
+        // (An aggregate without GROUP BY is one row, but the pin
+        // still opens its DISTINCT table: v0.17 fix.)
+        if c.distinct {
             let given = c.order_by.is_empty() && !c.has_agg;
             let unique = n == 1 && c.items.iter().any(|e| self.is_rowid(c.sources, e));
             #[cfg(feature = "expr_index")]
@@ -1109,7 +1241,9 @@ impl<'a> Walk<'a> {
             #[cfg(not(feature = "expr_index"))]
             let adjacent = false;
             let adjacent = adjacent || first.is_some_and(|s| s.eqp.nat_distinct);
-            let done = if as_group {
+            let done = if c.has_agg && c.group_by.is_empty() {
+                false
+            } else if as_group {
                 delivered >= c.items.len()
             } else {
                 unique || adjacent || (given && delivered >= c.items.len())
@@ -1144,6 +1278,42 @@ impl<'a> Walk<'a> {
             } else if !single && !same_group {
                 self.sorter(parent, k, done);
             }
+        }
+    }
+
+    /// A MULTI-INDEX OR loop's branches under its line `id` (v0.17,
+    /// `multi_index`): `INDEX n`, the subqueries its loop evaluates
+    /// (its IN probes first), then its loop (`LEFT-JOIN` as the
+    /// source's).
+    #[cfg(feature = "multi_index")]
+    fn or_branches(&mut self, sp: &SubSource, o: &crate::xmulti::OrAccess, id: i64, left: bool) {
+        for sub in o.subs.iter() {
+            let mut h = copy_vec(b"INDEX ");
+            num(&mut h, u64::from(sub.n), false);
+            let ix = self.add(id, &[h.as_slice()]);
+            let mut skip: AVec<usize> = AVec::new();
+            if let Some(a) = &sub.acc {
+                self.probing = true;
+                for p in a.eq.iter() {
+                    if let Some(e) = &p.sub {
+                        self.exprs(core::slice::from_ref(e), ix, &[]);
+                        if let RExpr::InSub(_, s, _) = e {
+                            skip.push(s.id);
+                        }
+                    }
+                }
+                self.probing = false;
+            }
+            self.exprs(core::slice::from_ref(&sub.cond), ix, skip.as_slice());
+            let mut l = copy_vec(b"SCAN ");
+            self.scan_name(sp, &mut l);
+            if let Some(a) = &sub.acc {
+                self.access(sp, a, &mut l);
+            }
+            if left {
+                l.extend_from_slice(b" LEFT-JOIN");
+            }
+            self.add(ix, &[l.as_slice()]);
         }
     }
 
@@ -1198,6 +1368,25 @@ impl<'a> Walk<'a> {
 
     /// The loop over one FROM source.
     fn loop_line(&mut self, sp: &SubSource, out: &mut AVec<u8>, probes: &mut AVec<usize>) {
+        self.loop_line_of(sp, out, probes);
+        // A semi-join loop (v0.17, `flatten`): `SEARCH t EXISTS ...`.
+        #[cfg(feature = "flatten")]
+        if sp.exists {
+            let mut nm = AVec::new();
+            self.scan_name(sp, &mut nm);
+            for head in [&b"SCAN "[..], &b"SEARCH "[..]] {
+                let at = head.len() + nm.len();
+                if out.as_slice().starts_with(head)
+                    && out.as_slice().get(head.len()..at) == Some(nm.as_slice())
+                {
+                    out.replace_range(at, 0, b" EXISTS");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn loop_line_of(&mut self, sp: &SubSource, out: &mut AVec<u8>, probes: &mut AVec<usize>) {
         out.extend_from_slice(b"SCAN ");
         self.scan_name(sp, out);
         #[cfg(feature = "vtab")]
@@ -1339,6 +1528,12 @@ impl<'a> Walk<'a> {
     /// The index part of a loop's line.
     #[cfg(feature = "expr_index")]
     fn access(&mut self, sp: &SubSource, a: &crate::xplan::IdxAccess, out: &mut AVec<u8>) {
+        #[cfg(feature = "multi_index")]
+        if a.or.is_some() {
+            out.truncate(0);
+            out.extend_from_slice(b"MULTI-INDEX OR");
+            return;
+        }
         #[cfg(feature = "join_order")]
         if let Some(ai) = a.auto.as_deref() {
             out.truncate(0);
@@ -1411,6 +1606,150 @@ impl<'a> Walk<'a> {
         self.terms(a, keys.as_slice(), out);
     }
 
+    /// The line of an IN operator that reads its right-hand table in
+    /// place of the subquery's values (the pin's `isCandidateForInOpt`
+    /// and `sqlite3FindInIndex`; v0.17 review fix): an uncorrelated
+    /// `SELECT cols FROM table` with no WHERE, GROUP BY, aggregate,
+    /// LIMIT or compound, whose columns are the rowid (`USING ROWID
+    /// SEARCH ON TABLE t FOR IN-OPERATOR`) or lead an index of the
+    /// comparisons' collations (`USING INDEX i FOR IN-OPERATOR`; a
+    /// UNIQUE one of exactly those columns when an index loop probes
+    /// with the values), the affinities allowing it.
+    #[cfg(feature = "multi_index")]
+    fn in_index(&self, x: &RExpr, p: &SubPlan) -> Option<AVec<u8>> {
+        use crate::record::Affinity;
+        if !p.uncorrelated
+            || !p.compound.is_empty()
+            || !p.values.is_empty()
+            || p.filter.is_some()
+            || !p.group_by.is_empty()
+            || p.having.is_some()
+            || p.has_agg
+            || p.limit.is_some()
+            || p.sources.len() != 1
+            || (self.probing && matches!(x, RExpr::Literal(_)))
+        {
+            return None;
+        }
+        let sp = p.sources.as_slice().first()?;
+        if sp.derived.is_some() || sp.rec != 0 || sp.temp {
+            return None;
+        }
+        #[cfg(any(feature = "json", feature = "vtab"))]
+        if sp.tvf != 0 {
+            return None;
+        }
+        // (A FROM subquery or view the flattener merged is still one
+        // on the pin.)
+        #[cfg(feature = "flatten")]
+        if !p.view_names.is_empty() {
+            return None;
+        }
+        #[cfg(feature = "attach")]
+        if sp.ext != 0 {
+            return None;
+        }
+        let t = self.cat.tables.iter().find(|t| t.root == sp.root)?;
+        // Each result column's table column (`None`: the rowid).
+        let mut cols: AVec<Option<usize>> = AVec::new();
+        for it in p.items.iter() {
+            cols.push(match it {
+                RExpr::Rowid(_) if t.has_rowid() => None,
+                RExpr::Column(slot, ..) => {
+                    let c = slot.checked_sub(sp.eqp.base)?;
+                    if c >= sp.ncols {
+                        return None;
+                    }
+                    if t.has_rowid() && sp.rowid_alias == Some(c) {
+                        None
+                    } else {
+                        Some(c)
+                    }
+                }
+                _ => return None,
+            });
+        }
+        let pairs = in_pairs(x, p);
+        if pairs.len() != cols.len() {
+            return None;
+        }
+        let name = handle_bytes(self.ca, t.name);
+        let mut line = AVec::new();
+        if let [None] = cols.as_slice() {
+            line.extend_from_slice(b"USING ROWID SEARCH ON TABLE ");
+            line.extend_from_slice(name);
+            line.extend_from_slice(b" FOR IN-OPERATOR");
+            return Some(line);
+        }
+        let numeric =
+            |a: Affinity| matches!(a, Affinity::Numeric | Affinity::Integer | Affinity::Real);
+        for ((l, _), c) in pairs.iter().zip(cols.iter()) {
+            let c = (*c)?;
+            let idx = sp.affs.as_slice().get(c).copied().unwrap_or(Affinity::Blob);
+            if crate::query::item_result_affinity(l).is_some_and(numeric) && !numeric(idx) {
+                return None;
+            }
+        }
+        let pk = self.pk_of(t);
+        let ixs: AVec<&crate::schema::IndexDef> = self.cat.indexes_for(self.ca, name).collect();
+        for ix in ixs.iter().rev() {
+            // (An index loop's probes need a UNIQUE index of exactly
+            // those columns: the pin's `mustBeUnique`.)
+            if ix.partial() || (self.probing && (ix.columns.len() != cols.len() || !ix.unique)) {
+                continue;
+            }
+            // The entry's columns: the key, then (a WITHOUT ROWID
+            // table's secondary index) the PRIMARY KEY columns it lacks.
+            let mut ent: AVec<(Option<usize>, crate::record::Coll)> = AVec::new();
+            for (i, k) in ix.columns.iter().enumerate() {
+                let expr = ix
+                    .ext
+                    .as_ref()
+                    .is_some_and(|e| e.exprs.as_slice().get(i).is_some_and(|e| e.is_some()));
+                ent.push((k.col.filter(|_| !expr), k.coll));
+            }
+            if !clustered(ix)
+                && let Some(pk) = pk
+            {
+                for k in pk.columns.iter() {
+                    if !ix.columns.iter().any(|x| x.col == k.col) {
+                        ent.push((k.col, k.coll));
+                    }
+                }
+            }
+            let Some(lead) = ent.as_slice().get(..cols.len()) else {
+                continue;
+            };
+            let mut used: AVec<bool> = lead.iter().map(|_| false).collect();
+            let ok = pairs.iter().zip(cols.iter()).all(|((l, r), c)| {
+                let coll = match r {
+                    Some(r) => crate::query::binary_coll(l, r),
+                    None => crate::query::expr_coll(l).unwrap_or_default(),
+                };
+                let at = lead.iter().enumerate().position(|(j, (k, kc))| {
+                    *k == *c
+                        && k.is_some()
+                        && *kc == coll
+                        && !used.as_slice().get(j).copied().unwrap_or(true)
+                });
+                match at.and_then(|j| used.as_mut_slice().get_mut(j)) {
+                    Some(u) => {
+                        *u = true;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if ok {
+                line.extend_from_slice(b"USING INDEX ");
+                line.extend_from_slice(handle_bytes(self.ca, ix.name));
+                line.extend_from_slice(b" FOR IN-OPERATOR");
+                return Some(line);
+            }
+        }
+        None
+    }
+
     /// A WITHOUT ROWID table's clustered PRIMARY KEY index.
     #[cfg(feature = "expr_index")]
     fn pk_of(&self, t: &TableDef) -> Option<&'a crate::schema::IndexDef> {
@@ -1472,9 +1811,20 @@ impl<'a> Walk<'a> {
             }
             first = false;
         };
-        let k = a.eq.len();
-        for key in keys.iter().take(k) {
+        #[cfg(feature = "multi_index")]
+        let skip = a.skip;
+        #[cfg(not(feature = "multi_index"))]
+        let skip = 0;
+        let k = a.eq.len() + skip;
+        for (i, key) in keys.iter().take(k).enumerate() {
             sep(out);
+            // A skip-scan's columns (v0.17, `multi_index`).
+            if i < skip {
+                out.extend_from_slice(b"ANY(");
+                out.extend_from_slice(key.as_slice());
+                out.push(b')');
+                continue;
+            }
             out.extend_from_slice(key.as_slice());
             out.extend_from_slice(b"=?");
         }
@@ -1516,6 +1866,16 @@ impl<'a> Walk<'a> {
             }
             self.seen.push(p.id);
             let n = self.shown(last_sel(p));
+            // The IN operator reading a table's own rowids or index in
+            // place of the subquery's values (the pin's
+            // `sqlite3FindInIndex`; v0.17 review fix, `multi_index`).
+            #[cfg(feature = "multi_index")]
+            if let RExpr::InSub(x, ..) = e
+                && let Some(line) = self.in_index(x, p)
+            {
+                self.add(parent, &[line.as_slice()]);
+                continue;
+            }
             let mut d = AVec::new();
             if !p.uncorrelated {
                 d.extend_from_slice(b"CORRELATED ");
@@ -1527,7 +1887,22 @@ impl<'a> Walk<'a> {
             });
             num(&mut d, u64::from(n), false);
             let id = self.add(parent, &[d.as_slice()]);
+            let probing = core::mem::replace(&mut self.probing, false);
             self.select_sub(p, id);
+            self.probing = probing;
+            // The IN operator's Bloom filter over an uncorrelated
+            // subquery's values, unless an index loop probes with
+            // them (v0.17 fix; a compound's are not shown), or the
+            // comparison is not BINARY (v0.17 review fix).
+            if list
+                && p.uncorrelated
+                && !probing
+                && p.compound.is_empty()
+                && let RExpr::InSub(x, ..) = e
+                && in_binary(x, p)
+            {
+                self.add(id, &[b"CREATE BLOOM FILTER"]);
+            }
         }
     }
 
@@ -1557,11 +1932,23 @@ impl<'a> Walk<'a> {
         }
         #[cfg(not(feature = "expr_index"))]
         let _ = t;
-        self.add(0, &[line.as_slice()]);
+        let id = self.add(0, &[line.as_slice()]);
+        // A MULTI-INDEX OR loop's branches (v0.17, `multi_index`).
+        #[cfg(feature = "multi_index")]
+        if let Some(o) = access.and_then(|a| a.or.as_deref()) {
+            let sp = SubSource {
+                root: t.root,
+                ..placeholder(name)
+            };
+            self.or_branches(&sp, o, id, false);
+        }
+        #[cfg(not(feature = "multi_index"))]
+        let _ = id;
         #[cfg_attr(not(feature = "expr_index"), allow(unused_mut))]
         let mut probes: AVec<usize> = AVec::new();
         #[cfg(feature = "expr_index")]
         if let Some(a) = access {
+            self.probing = true;
             for p in a.eq.iter() {
                 if let Some(e) = &p.sub {
                     if let RExpr::InSub(_, s, _) = e {
@@ -1570,6 +1957,7 @@ impl<'a> Walk<'a> {
                     self.exprs(core::slice::from_ref(e), 0, &[]);
                 }
             }
+            self.probing = false;
         }
         if !from.is_empty() {
             self.update_from = true;
@@ -1624,6 +2012,8 @@ fn placeholder(name: &[u8]) -> SubSource {
             scan: copy_vec(name),
             ..Default::default()
         },
+        #[cfg(feature = "flatten")]
+        exists: false,
     }
 }
 
@@ -1780,6 +2170,25 @@ pub(super) fn describe<S: Storage>(
                 es.as_slice(),
                 returning.as_slice(),
             );
+            #[cfg(feature = "flatten")]
+            if let Some(t) = table(*root) {
+                let mut assigned: AVec<bool> = AVec::new();
+                for _ in t.columns.iter() {
+                    assigned.push(false);
+                }
+                let mut rowid = false;
+                for (tg, _) in sets.iter() {
+                    match tg {
+                        super::Target::Col(c) => {
+                            if let Some(x) = assigned.as_mut_slice().get_mut(*c) {
+                                *x = true;
+                            }
+                        }
+                        super::Target::Rowid => rowid = true,
+                    }
+                }
+                fk_lines(w, conn, t, Some((assigned.as_slice(), rowid)), arena);
+            }
         }
         Plan::Delete {
             #[cfg(feature = "expr_index")]
@@ -1820,6 +2229,10 @@ pub(super) fn describe<S: Storage>(
                 &[],
                 returning.as_slice(),
             );
+            #[cfg(feature = "flatten")]
+            if let Some(t) = table(*root) {
+                fk_lines(w, conn, t, None, arena);
+            }
         }
         Plan::Insert {
             select,
@@ -1827,6 +2240,8 @@ pub(super) fn describe<S: Storage>(
             rows_v,
             upsert,
             returning,
+            #[cfg(feature = "flatten")]
+            root,
             ..
         } => {
             if let Some(p) = select {
@@ -1859,6 +2274,10 @@ pub(super) fn describe<S: Storage>(
                 w.seen.truncate(n);
             }
             w.exprs(returning.as_slice(), 0, &[]);
+            #[cfg(feature = "flatten")]
+            if let Some(t) = table(*root) {
+                fk_insert_lines(w, conn, t, plan, arena);
+            }
         }
         Plan::CreateTableAs {
             select: Some(p), ..
@@ -1881,6 +2300,208 @@ pub(super) fn describe<S: Storage>(
         }
         _ => {}
     }
+}
+
+/// EXPLAIN QUERY PLAN's foreign-key child scans after a parent
+/// DELETE / UPDATE's loops (v0.17, `flatten`; the pin's
+/// `fkScanChildren`, once per key for a DELETE, for the old and then
+/// the new row for an UPDATE).
+#[cfg(feature = "flatten")]
+fn fk_lines<S: Storage>(
+    w: &mut Walk<'_>,
+    conn: &Connection<S>,
+    t: &TableDef,
+    upd: Option<(&[bool], bool)>,
+    arena: &Arena,
+) {
+    let ca = &conn.catalog_arena;
+    let ev = match upd {
+        Some((a, r)) => super::fkey::Event::Update(a, r),
+        None => super::fkey::Event::Delete,
+    };
+    let scans = conn.fk_scans(handle_bytes(ca, t.name), ev, true, arena);
+    let lines = fk_child_lines(conn, w, scans.as_slice(), arena);
+    let rounds = if upd.is_some() { 2 } else { 1 };
+    for _ in 0..rounds {
+        for l in lines.iter() {
+            w.add(0, &[l.as_slice()]);
+        }
+    }
+}
+
+/// An INSERT's foreign-key child scans on its parent side (v0.17
+/// review fix, `flatten`; in the pin's code order): one round for
+/// each REPLACE that can delete a row (the rowid when the INSERT
+/// supplies it, each UNIQUE index whose action is REPLACE), the old
+/// and the new row of an upsert DO UPDATE that changes a key, then
+/// the inserted row's — only for a deferred key, unless the INSERT
+/// writes more than one row (`isMultiWrite`: a SELECT or several
+/// VALUES rows, a REPLACE, RETURNING, INSERT triggers, or a DO
+/// UPDATE that changes a key).
+#[cfg(feature = "flatten")]
+fn fk_insert_lines<S: Storage>(
+    w: &mut Walk<'_>,
+    conn: &Connection<S>,
+    t: &TableDef,
+    plan: &super::Plan,
+    arena: &Arena,
+) {
+    use super::fkey::Event;
+    let super::Plan::Insert {
+        targets,
+        rows_v,
+        rows_r,
+        select,
+        ipk_act,
+        indexes,
+        returning,
+        upsert,
+        cols,
+        rowid_alias,
+        ..
+    } = plan
+    else {
+        return;
+    };
+    let ca = &conn.catalog_arena;
+    let name = handle_bytes(ca, t.name);
+    let rowid_given = targets.iter().any(|x| {
+        matches!(x, super::Target::Rowid)
+            || matches!(x, super::Target::Col(c) if Some(*c) == *rowid_alias)
+    });
+    let deletes = usize::from(*ipk_act == super::ConflictAction::Replace && rowid_given)
+        + indexes
+            .iter()
+            .filter(|ix| ix.unique && ix.act == super::ConflictAction::Replace)
+            .count();
+    let mut upd: AVec<super::fkey::FkScan> = AVec::new();
+    if let Some(up) = upsert.as_ref().filter(|u| u.do_update) {
+        let (a, r) = super::assigned_columns(up.sets.as_slice(), cols.len(), *rowid_alias);
+        upd = conn.fk_scans(name, Event::Update(a.as_slice(), r), true, arena);
+    }
+    #[cfg(feature = "triggers")]
+    let trig = conn.catalog.triggers_on(ca, name).any(|x| {
+        x.event == crate::sql::ast::TrigEvent::Insert
+            && x.time != crate::sql::ast::TrigTime::Instead
+    });
+    #[cfg(not(feature = "triggers"))]
+    let trig = false;
+    let multi = select.is_some()
+        || rows_v.len() > 1
+        || rows_r.as_ref().is_some_and(|r| r.len() > 1)
+        || deletes > 0
+        || !returning.is_empty()
+        || !upd.is_empty()
+        || trig;
+    if deletes > 0 {
+        let all = conn.fk_scans(name, Event::Delete, true, arena);
+        let lines = fk_child_lines(conn, w, all.as_slice(), arena);
+        for _ in 0..deletes {
+            for l in lines.iter() {
+                w.add(0, &[l.as_slice()]);
+            }
+        }
+    }
+    let lines = fk_child_lines(conn, w, upd.as_slice(), arena);
+    for _ in 0..2 {
+        for l in lines.iter() {
+            w.add(0, &[l.as_slice()]);
+        }
+    }
+    let ins = conn.fk_scans(name, Event::Insert, multi, arena);
+    for l in fk_child_lines(conn, w, ins.as_slice(), arena).iter() {
+        w.add(0, &[l.as_slice()]);
+    }
+}
+
+/// Each child scan's loop line: the child's loop for `parent_value =
+/// child.key`, planned as a read of the key columns (v0.17 review
+/// fix: the parent value carries the parent column's affinity and,
+/// unless it is the INTEGER PRIMARY KEY, its collation, so an index
+/// of another affinity class or collation is not searched; a key the
+/// index does not hold whole is no covering read; a full scan reads
+/// a narrower covering index).
+#[cfg(feature = "flatten")]
+fn fk_child_lines<S: Storage>(
+    conn: &Connection<S>,
+    w: &mut Walk<'_>,
+    scans: &[super::fkey::FkScan],
+    arena: &Arena,
+) -> AVec<AVec<u8>> {
+    let ca = &conn.catalog_arena;
+    let mut lines: AVec<AVec<u8>> = AVec::new();
+    for (root, ccols, keys) in scans.iter() {
+        let Some(c) = conn.catalog.tables.iter().find(|x| x.root == *root) else {
+            continue;
+        };
+        let name = handle_bytes(ca, c.name);
+        let mut sp = SubSource {
+            root: c.root,
+            ncols: c.columns.len(),
+            rowid_alias: c.rowid_alias,
+            ..placeholder(name)
+        };
+        for col in c.columns.iter() {
+            sp.affs.push(col.affinity);
+            sp.defaults.push(crate::record::OwnedValue::Null);
+        }
+        let mut filter: Option<RExpr> = None;
+        for (k, (paff, pcoll, ipk)) in ccols.iter().zip(keys.iter()) {
+            let Some(col) = c.columns.as_slice().get(*k) else {
+                continue;
+            };
+            let key = if Some(*k) == c.rowid_alias {
+                RExpr::Rowid(0)
+            } else {
+                RExpr::Column(*k, col.affinity, Some(col.coll))
+            };
+            let reg = RExpr::AffLiteral(
+                crate::record::OwnedValue::Null,
+                Some(if *ipk {
+                    crate::record::Affinity::Integer
+                } else {
+                    *paff
+                }),
+                None,
+            );
+            let val = if *ipk {
+                reg
+            } else {
+                RExpr::Collate(Box::new(reg), *pcoll)
+            };
+            filter = Some(super::and_expr(
+                filter,
+                RExpr::Binary(crate::sql::BinOp::Eq, Box::new(val), Box::new(key)),
+            ));
+        }
+        let info = super::xindex::CoreInfo {
+            items: &[],
+            filter: filter.as_ref(),
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            has_agg: false,
+            distinct: false,
+            limit: None,
+            also_reads: &[],
+        };
+        let mut one = [sp];
+        if conn
+            .plan_accesses(arena, &mut one, &[0], 0, (0, 0), &info)
+            .is_err()
+        {
+            continue;
+        }
+        let [sp] = one;
+        let mut line = AVec::new();
+        line.extend_from_slice(b"SCAN ");
+        line.extend_from_slice(name);
+        if let Some(a) = sp.access.as_deref() {
+            w.access(&sp, a, &mut line);
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 /// Run `text` (an EXPLAIN QUERY PLAN) on `c` and collect its rows.

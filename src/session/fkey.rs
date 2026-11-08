@@ -246,6 +246,13 @@ struct Fk {
     child: Shape,
 }
 
+/// One child scan of a parent write's EXPLAIN QUERY PLAN (v0.17,
+/// `flatten`; `fk_scans`): the child's root page, its key columns,
+/// and per key position the parent column's affinity and collation
+/// and whether it is the INTEGER PRIMARY KEY.
+#[cfg(all(feature = "flatten", feature = "explain"))]
+pub(super) type FkScan = (u32, AVec<usize>, AVec<(Affinity, Coll, bool)>);
+
 /// The foreign keys of one write's table.
 #[derive(Debug)]
 pub(super) struct FkTarget {
@@ -653,6 +660,41 @@ impl<S: Storage> Connection<S> {
             return Ok(None);
         }
         Ok(Some(Rc::new(out)))
+    }
+
+    /// The child tables a parent write `ev` scans for each row (v0.17,
+    /// `flatten`; EXPLAIN QUERY PLAN's `fkScanChildren` loops; an
+    /// INSERT only when `multi` — the pin's `isMultiWrite` — or its
+    /// key is deferred): per foreign key naming the table, in the
+    /// pin's order (the most recently created child first), the
+    /// child's root page, its key columns and the parent key's
+    /// affinities and collations (`FkScan`). Empty while `PRAGMA
+    /// foreign_keys` is OFF.
+    #[cfg(all(feature = "flatten", feature = "explain"))]
+    pub(super) fn fk_scans(
+        &self,
+        table: &[u8],
+        ev: Event<'_>,
+        multi: bool,
+        arena: &Arena,
+    ) -> AVec<FkScan> {
+        let mut out = AVec::new();
+        if let Ok(Some(tg)) = self.fk_target(table, ev, multi, true, arena) {
+            for f in tg.parent.iter() {
+                if let Some(p) = &f.parent {
+                    let mut keys = AVec::new();
+                    for (k, a) in p.affs.iter().enumerate() {
+                        keys.push((
+                            *a,
+                            p.colls.as_slice().get(k).copied().unwrap_or_default(),
+                            p.ipk.as_slice().get(k).copied().unwrap_or(false),
+                        ));
+                    }
+                    out.push((f.child.root, f.ccols.clone(), keys));
+                }
+            }
+        }
+        out
     }
 
     /// COMMIT (or a RELEASE that commits): outstanding deferred

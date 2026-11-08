@@ -613,6 +613,64 @@ fn equiv_key(eq: &[(usize, usize, RExpr, RExpr)], x: usize) -> Option<RExpr> {
     None
 }
 
+/// A LEFT JOIN the WHERE clause rejects the NULL row of is an inner
+/// join (the pin's simplification, in FROM order, over the WHERE
+/// clause with every ON clause appended,
+/// `sqlite3ExprImpliesNonNullRow`): the ON clause of a LEFT JOIN not
+/// (yet) simplified proves nothing. Sources `sources` sit at
+/// `offsets`, the first one's rowid source is `first_src`.
+pub(super) fn simplify_left(
+    sources: &mut [SourcePlan],
+    offsets: &[usize],
+    first_src: usize,
+    filter: Option<&RExpr>,
+) {
+    let n = sources.len();
+    // (A RIGHT / FULL join's sources stay as written: the pin's
+    // `JT_LTORJ` exclusion, and their ON clauses join no row away.)
+    if sources.iter().any(|s| s.kind.pads_left()) {
+        return;
+    }
+    for i in 1..n {
+        let Some(&base) = offsets.get(i) else {
+            break;
+        };
+        let Some(sp) = sources.get(i) else {
+            break;
+        };
+        if sp.kind != crate::sql::JoinKind::Left {
+            continue;
+        }
+        let s = Src {
+            base,
+            ncols: sp.ncols,
+            src: first_src + i,
+            rowid_alias: sp.rowid_alias,
+        };
+        let mut tree: Option<RExpr> = filter.cloned();
+        for x in sources.iter() {
+            let Some(on) = &x.on else { continue };
+            let chunk = if matches!(
+                x.kind,
+                crate::sql::JoinKind::Inner | crate::sql::JoinKind::Cross
+            ) {
+                on.clone()
+            } else {
+                RExpr::Literal(OwnedValue::Null)
+            };
+            tree = Some(match tree {
+                None => chunk,
+                Some(t) => and_expr(Some(t), chunk),
+            });
+        }
+        if tree.as_ref().is_some_and(|t| s.null_rejects(t))
+            && let Some(sp) = sources.get_mut(i)
+        {
+            sp.kind = crate::sql::JoinKind::Inner;
+        }
+    }
+}
+
 /// The sources `e` reads, as a mask over the core's sources.
 fn src_mask(e: &RExpr, bands: &[RefRange]) -> u64 {
     let mut m = 0u64;
@@ -973,6 +1031,7 @@ impl<S: Storage> Connection<S> {
         has_agg: bool,
         distinct: bool,
         limit: Option<&RExpr>,
+        simplified: bool,
     ) -> Result<bool, S::Error> {
         // (The planner's frame is large: a core that is no join, the
         // common case on the deep planning paths, does not pay it.)
@@ -981,7 +1040,7 @@ impl<S: Storage> Connection<S> {
         }
         self.plan_join_body(
             arena, sources, cur, outer, items, filter, group_by, having, order_by, has_agg,
-            distinct, limit,
+            distinct, limit, simplified,
         )
     }
 
@@ -1002,6 +1061,7 @@ impl<S: Storage> Connection<S> {
         has_agg: bool,
         distinct: bool,
         limit: Option<&RExpr>,
+        simplified: bool,
     ) -> Result<bool, S::Error> {
         use crate::xplan::{conjuncts, log_est, terms};
         let n = sources.len();
@@ -1033,45 +1093,15 @@ impl<S: Storage> Connection<S> {
             first_src,
             filter.as_ref(),
         )?;
-        // A LEFT JOIN the WHERE clause rejects the NULL row of is an
-        // inner join (the pin's simplification, in FROM order, over
-        // the WHERE clause with every ON clause appended,
-        // `sqlite3ExprImpliesNonNullRow`): the ON clause of a LEFT
-        // JOIN not (yet) simplified proves nothing.
-        for i in 1..n {
-            let Some(&base) = offsets.as_slice().get(i) else {
-                break;
-            };
-            let Some(sp) = sources.as_slice().get(i) else {
-                break;
-            };
-            if sp.kind != crate::sql::JoinKind::Left {
-                continue;
-            }
-            let s = Src {
-                base,
-                ncols: sp.ncols,
-                src: first_src + i,
-                rowid_alias: sp.rowid_alias,
-            };
-            let mut tree: Option<RExpr> = filter.clone();
-            for x in sources.iter() {
-                let Some(on) = &x.on else { continue };
-                let chunk = if x.kind == crate::sql::JoinKind::Left {
-                    RExpr::Literal(OwnedValue::Null)
-                } else {
-                    on.clone()
-                };
-                tree = Some(match tree {
-                    None => chunk,
-                    Some(t) => and_expr(Some(t), chunk),
-                });
-            }
-            if tree.as_ref().is_some_and(|t| s.null_rejects(t))
-                && let Some(sp) = sources.as_mut_slice().get_mut(i)
-            {
-                sp.kind = crate::sql::JoinKind::Inner;
-            }
+        // (The flattener simplified a SELECT core's LEFT JOINs before
+        // it merged anything: `simplified`.)
+        if !simplified {
+            simplify_left(
+                sources.as_mut_slice(),
+                offsets.as_slice(),
+                first_src,
+                filter.as_ref(),
+            );
         }
         let mut bands: AVec<RefRange> = AVec::new();
         let mut srcs_s: AVec<Src> = AVec::new();
@@ -1202,6 +1232,47 @@ impl<S: Storage> Connection<S> {
                 order.push((e.clone(), unsorted(e)));
             }
         }
+        // The pin's min() / max() optimisation (v0.17, `multi_index`):
+        // the join reads the argument's order.
+        #[cfg(feature = "multi_index")]
+        let mm = has_agg && having.is_none() && {
+            let nullable = |e: &RExpr| match crate::xplan::strip(e) {
+                RExpr::Column(slot, ..) => !(0..n).any(|i| {
+                    let base = offsets.as_slice().get(i).copied().unwrap_or(0);
+                    let sp = sources.as_slice().get(i);
+                    let nc = sp.map_or(0, |s| s.ncols);
+                    *slot >= base
+                        && *slot < base + nc
+                        && !can_null.as_slice().get(i).copied().unwrap_or(true)
+                        && (sp.is_some_and(|s| s.rowid_alias == Some(*slot - base))
+                            || tabs.as_slice().get(i).copied().flatten().is_some_and(|t| {
+                                self.not_null_cols(t)
+                                    .as_slice()
+                                    .get(*slot - base)
+                                    .copied()
+                                    .unwrap_or(false)
+                            }))
+                }),
+                RExpr::Rowid(x) => x
+                    .checked_sub(first_src)
+                    .is_none_or(|i| can_null.as_slice().get(i).copied().unwrap_or(true)),
+                RExpr::Literal(v) => matches!(v, OwnedValue::Null),
+                _ => true,
+            };
+            match crate::xmulti::minmax(
+                items.as_slice(),
+                order_by.as_slice(),
+                !group_by.is_empty(),
+                &nullable,
+            ) {
+                Some((arg, o)) => {
+                    order.clear();
+                    order.push((arg.clone(), o));
+                    true
+                }
+                None => false,
+            }
+        };
         let mut omask: AVec<u64> = AVec::new();
         let mut oconst: AVec<bool> = AVec::new();
         for (e, _) in order.iter() {
@@ -1317,10 +1388,16 @@ impl<S: Storage> Connection<S> {
                     good: none,
                     left: sp.kind == crate::sql::JoinKind::Left,
                     cross: sp.kind == crate::sql::JoinKind::Cross,
+                    #[cfg(feature = "flatten")]
+                    after: 0,
+                    #[cfg(feature = "flatten")]
+                    semi: sp.exists,
                     auto_ok: false,
                     root: 0,
                     stat: false,
                     vt: Some(vl),
+                    #[cfg(feature = "multi_index")]
+                    ors: AVec::new(),
                 });
                 continue;
             };
@@ -1343,6 +1420,18 @@ impl<S: Storage> Connection<S> {
                 } else {
                     owner.is_none()
                 };
+                // (No IN term for an OR the pin does not rewrite: v0.17,
+                // `multi_index`.)
+                #[cfg(feature = "multi_index")]
+                let ok = ok
+                    && (!crate::xmulti::or_in_term(t, conj.as_slice())
+                        || conj.as_slice().get(t.parent).is_some_and(|c| {
+                            crate::xmulti::in_kept(t, c, srcs_s.as_slice(), &|j, e| {
+                                models.as_slice().get(j).is_some_and(|(_, ms)| {
+                                    crate::xmulti::expr_indexed(ms.as_slice(), e)
+                                })
+                            })
+                        }));
                 if ok {
                     ts.push(t.clone());
                 }
@@ -1368,6 +1457,33 @@ impl<S: Storage> Connection<S> {
                 tmask.push(term_mask(t, bands.as_slice()));
             }
             direct.push((ts.clone(), tmask.clone()));
+            // Its OR terms (v0.17, `multi_index`), owned as its terms
+            // are.
+            #[cfg(feature = "multi_index")]
+            let ors = {
+                let ok = |ci: usize| {
+                    let owner = on_of.as_slice().get(ci).copied().flatten();
+                    if left {
+                        owner == Some(i)
+                    } else {
+                        owner.is_none()
+                    }
+                };
+                crate::xmulti::or_infos(
+                    conj.as_slice(),
+                    truth.as_slice(),
+                    &s,
+                    &ok,
+                    &avail,
+                    &|e: &RExpr| src_mask(e, bands.as_slice()),
+                    &|t: &Term| term_mask(t, bands.as_slice()),
+                    &|e: &RExpr| {
+                        models
+                            .iter()
+                            .any(|(_, ms)| crate::xmulti::expr_indexed(ms.as_slice(), e))
+                    },
+                )
+            };
             let mut used: AVec<bool> = AVec::new();
             let mut affs: AVec<crate::record::Affinity> = AVec::new();
             let mut good: AVec<bool> = AVec::new();
@@ -1403,14 +1519,33 @@ impl<S: Storage> Connection<S> {
                 good,
                 left,
                 cross: sp.kind == crate::sql::JoinKind::Cross,
+                #[cfg(feature = "flatten")]
+                after: 0,
+                #[cfg(feature = "flatten")]
+                semi: sp.exists,
                 auto_ok: sp.hint == crate::query::Hint::Any,
                 root: sp.root,
                 stat: self.table_has_stat(t),
                 vt: None,
+                #[cfg(feature = "multi_index")]
+                ors,
             });
         }
         if jsrcs.len() != n {
             return Ok(false);
+        }
+        // A semi-join source follows every source its terms read
+        // (v0.17, `flatten`).
+        #[cfg(feature = "flatten")]
+        for (i, js) in jsrcs.as_mut_slice().iter_mut().enumerate() {
+            if sources.as_slice().get(i).is_some_and(|sp| sp.exists) {
+                let me = 1u64 << i;
+                for m in cmask.iter() {
+                    if m & me != 0 {
+                        js.after |= m & !me;
+                    }
+                }
+            }
         }
         // Terms on columns a `x = y` term makes equivalent (the pin's
         // `whereScan` equivalence classes): `y op value` probes `x`.
@@ -1543,7 +1678,68 @@ impl<S: Storage> Connection<S> {
                 continue;
             };
             let reverse = plan.rev & (1u64 << pos) != 0;
-            let mut acc = if jl.auto {
+            // A MULTI-INDEX OR loop (v0.17, `multi_index`): each branch
+            // planned on the table alone, the sources before it given.
+            #[cfg(feature = "multi_index")]
+            let or_acc = jl.l.or.and_then(|k| js.ors.as_slice().get(k)).map(|info| {
+                let me = 1u64 << i;
+                let me_band = bands.as_slice().get(i).copied().unwrap_or(RefRange {
+                    w: (0, 0),
+                    s: (0, 0),
+                });
+                let avail = |e: &RExpr| -> Option<bool> {
+                    if expr_refs_range(e, &me_band) || nondet(e) {
+                        return None;
+                    }
+                    let m = src_mask(e, bands.as_slice());
+                    if m & !ready != 0 {
+                        return None;
+                    }
+                    Some(m != 0)
+                };
+                let w_ok = |ci: usize| {
+                    let owner = on_of.as_slice().get(ci).copied().flatten();
+                    let own = if js.left {
+                        owner == Some(i)
+                    } else {
+                        owner.is_none()
+                    };
+                    own && cmask.as_slice().get(ci).copied().unwrap_or(0) & !(ready | me) == 0
+                };
+                let mut needed: AVec<bool> = AVec::new();
+                for u in js.used.iter() {
+                    needed.push(*u);
+                }
+                let q = crate::xplan::Query {
+                    conj: conj.as_slice(),
+                    truth: truth.as_slice(),
+                    order: &[],
+                    group: false,
+                    group_by: false,
+                    ncols_out: items.len(),
+                    needed: Some(needed.as_slice()),
+                    cover_scan: true,
+                    limit: None,
+                    distinct: false,
+                    #[cfg(feature = "explain")]
+                    dset: &[],
+                    jm: None,
+                };
+                let o = crate::xmulti::or_access(&q, &js.s, &js.tab, info, &avail, &w_ok);
+                let lateral = o.subs.iter().any(|b| {
+                    b.acc.as_ref().is_some_and(|a| a.lateral)
+                        || src_mask(&b.cond, bands.as_slice()) & !me != 0
+                });
+                let mut a = crate::xplan::lower(&js.s, &js.tab, &[], &jl.l, false);
+                a.lateral = lateral;
+                a.or = Some(Box::new(o));
+                a
+            });
+            #[cfg(not(feature = "multi_index"))]
+            let or_acc: Option<crate::xplan::IdxAccess> = None;
+            let mut acc = if let Some(a) = or_acc {
+                Some(a)
+            } else if jl.auto {
                 let ai = crate::xjoin::auto_index(js, &jq, i, ready);
                 let lateral = ai
                     .keys
@@ -1563,6 +1759,10 @@ impl<S: Storage> Connection<S> {
                         sorted: 0,
                         reverse: false,
                         bignull: None,
+                        #[cfg(feature = "multi_index")]
+                        or: None,
+                        #[cfg(feature = "multi_index")]
+                        skip: 0,
                     },
                     false,
                 );
@@ -1722,6 +1922,37 @@ impl<S: Storage> Connection<S> {
                 Some(f) => and_expr(Some(f), w),
             });
         }
+        // A WHERE term the last source it reads is a semi-join's is
+        // checked at that loop, where the pin codes it (v0.17 review
+        // fix, `flatten`: an uncorrelated EXISTS's own term ran the
+        // whole join below each of its rows).
+        #[cfg(feature = "flatten")]
+        if sources.iter().any(|s| s.exists)
+            && let Some(f) = filter.take()
+        {
+            let mut parts: AVec<RExpr> = AVec::new();
+            super::flatten::and_terms(f, &mut parts);
+            let mut kept: Option<RExpr> = None;
+            for c in parts {
+                let m = src_mask(&c, bands.as_slice());
+                let mut target: Option<usize> = None;
+                for j in 0..n {
+                    if m & (1u64 << j) != 0
+                        && target.is_none_or(|t| posn.as_slice().get(j) > posn.as_slice().get(t))
+                    {
+                        target = Some(j);
+                    }
+                }
+                let semi = target.filter(|t| sources.as_slice().get(*t).is_some_and(|s| s.exists));
+                match semi.and_then(|t| new_on.as_mut_slice().get_mut(t)) {
+                    Some(slot) if !crate::query::has_sub(&c) => {
+                        *slot = Some(and_expr(slot.take(), c));
+                    }
+                    _ => kept = Some(and_expr(kept, c)),
+                }
+            }
+            *filter = kept;
+        }
         // The new layout.
         let mut new_base: AVec<usize> = AVec::new();
         for _ in 0..n {
@@ -1838,6 +2069,14 @@ impl<S: Storage> Connection<S> {
             sp.eqp.nat_distinct = plan.distinct_ordered;
             sp.eqp.joined = true;
         }
+        #[cfg(all(feature = "multi_index", not(feature = "explain")))]
+        let _ = mm;
+        #[cfg(all(feature = "multi_index", feature = "explain"))]
+        if mm {
+            for sp in sources.as_mut_slice() {
+                sp.eqp.minmax = 1 + u8::from(plan.ob_sat >= 1);
+            }
+        }
         #[cfg(feature = "explain")]
         for (q, at) in plan.bloom_at.iter().enumerate() {
             if let Some(p) = at
@@ -1929,7 +2168,63 @@ fn vt_masks(
 #[derive(Default)]
 pub(super) struct StatState {
     tabs: AVec<(AVec<u8>, i32, bool)>,
-    idxs: AVec<(AVec<u8>, AVec<i32>, bool)>,
+    idxs: AVec<(AVec<u8>, AVec<i32>, bool, IdxOpts)>,
+}
+
+/// The keywords an index's `sqlite_stat1` text may end with (the
+/// pin's `decodeIntArray`; v0.17 review fix): `unordered`, `sz=N`
+/// (`szIdxRow`, LogEst) and `noskipscan`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct IdxOpts {
+    pub(super) unordered: bool,
+    pub(super) noskip: bool,
+    pub(super) sz: Option<i32>,
+}
+
+/// `decodeIntArray`'s keyword loop over the text after the integers
+/// it read into `n` slots: each space-separated token tested as a
+/// glob (`unordered*`, `sz=[0-9]*`, `noskipscan*`).
+fn decode_opts(stat: &[u8], n: usize) -> IdxOpts {
+    let mut z = stat;
+    for _ in 0..n {
+        if z.is_empty() {
+            break;
+        }
+        while z.first().is_some_and(|c| c.is_ascii_digit()) {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+        if z.first() == Some(&b' ') {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+    }
+    let mut o = IdxOpts::default();
+    while !z.is_empty() {
+        if z.starts_with(b"unordered") {
+            o.unordered = true;
+        } else if let Some(d) = z.strip_prefix(b"sz=")
+            && d.first().is_some_and(|c| c.is_ascii_digit())
+        {
+            // (`sqlite3Atoi`: the leading digits, 0 past a 32-bit
+            // int; at least 2.)
+            let mut v: u64 = 0;
+            for c in d.iter().take_while(|c| c.is_ascii_digit()) {
+                v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+            }
+            if v > i32::MAX as u64 {
+                v = 0;
+            }
+            o.sz = Some(crate::xplan::log_est(v.max(2)));
+        } else if z.starts_with(b"noskipscan") {
+            o.noskip = true;
+        }
+        while z.first().is_some_and(|c| *c != b' ') {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+        while z.first() == Some(&b' ') {
+            z = z.get(1..).unwrap_or(&[]);
+        }
+    }
+    o
 }
 
 /// `decodeIntArray` into `out` (LogEst): up to `out.len()` integers
@@ -2022,7 +2317,7 @@ impl<S: Storage> Connection<S> {
                 for _ in 0..=i.columns.len() {
                     a.push(0);
                 }
-                st.idxs.push((copy_vec(n), a, false));
+                st.idxs.push((copy_vec(n), a, false, IdxOpts::default()));
                 default_row_est(st, ca, i);
             }
         }
@@ -2039,6 +2334,7 @@ impl<S: Storage> Connection<S> {
         }
         for i in self.stat.idxs.as_mut_slice() {
             i.2 = false;
+            i.3 = IdxOpts::default();
         }
         if let Some(root) = root {
             // (`sqlite3_exec`'s text of each value.)
@@ -2078,7 +2374,7 @@ impl<S: Storage> Connection<S> {
                 .stat
                 .idxs
                 .iter()
-                .any(|(x, _, has)| !*has && eq_ci(x.as_slice(), n))
+                .any(|(x, _, has, _)| !*has && eq_ci(x.as_slice(), n))
             {
                 default_row_est(&mut self.stat, ca, i);
             }
@@ -2132,6 +2428,7 @@ impl<S: Storage> Connection<S> {
                     return;
                 };
                 decode_ints(stat, e.1.as_mut_slice());
+                e.3 = decode_opts(stat, e.1.len());
                 e.2 = true;
                 let first = e.1.as_slice().first().copied();
                 if !i.partial()
@@ -2169,7 +2466,7 @@ impl<S: Storage> Connection<S> {
 
     /// Index `ix`'s `aiRowLogEst` when `sqlite_stat1` gave it
     /// (`hasStat1`).
-    fn stat_est(
+    pub(super) fn stat_est(
         &self,
         _t: &crate::schema::TableDef,
         ix: &crate::schema::IndexDef,
@@ -2178,8 +2475,19 @@ impl<S: Storage> Connection<S> {
         self.stat
             .idxs
             .iter()
-            .find(|(x, _, has)| *has && eq_ci(x.as_slice(), n))
+            .find(|(x, _, has, _)| *has && eq_ci(x.as_slice(), n))
             .map(|e| e.1.clone())
+    }
+
+    /// Index `ix`'s `sqlite_stat1` keywords (`IdxOpts`).
+    #[cfg(feature = "multi_index")]
+    pub(super) fn index_opts(&self, ix: &crate::schema::IndexDef) -> IdxOpts {
+        let n = handle_bytes(&self.catalog_arena, ix.name);
+        self.stat
+            .idxs
+            .iter()
+            .find(|(x, ..)| eq_ci(x.as_slice(), n))
+            .map_or(IdxOpts::default(), |e| e.3)
     }
 
     /// Index `ix`'s `aiRowLogEst` (`IdxModel::est`).

@@ -1008,6 +1008,12 @@ pub struct SubSource {
     /// its natural order delivers.
     #[cfg(feature = "explain")]
     pub eqp: EqpInfo,
+    /// A semi-join source (v0.17, `flatten`; the pin's `existsToJoin`
+    /// of an `EXISTS` term, `SEARCH t EXISTS`): for each combination
+    /// of the sources before it, its loop stops at the first of its
+    /// rows that makes a joined row.
+    #[cfg(feature = "flatten")]
+    pub exists: bool,
 }
 
 /// What EXPLAIN QUERY PLAN says of a FROM source (v0.16, `explain`;
@@ -1040,6 +1046,12 @@ pub struct EqpInfo {
     /// pin builds them together, `sqlite3ConstructBloomFilter`).
     #[cfg(feature = "join_order")]
     pub bloom_lines: u64,
+    /// The core is a min() / max() query the pin optimises (v0.17,
+    /// `multi_index`; `WHERE_ORDERBY_MIN` / `_MAX`): 1, every loop
+    /// prints `SEARCH`; 2, and the loops deliver the argument's order
+    /// (a `f(DISTINCT)` sorter is not needed).
+    #[cfg(feature = "multi_index")]
+    pub minmax: u8,
 }
 
 /// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
@@ -1172,6 +1184,22 @@ pub struct SubPlan {
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
     #[cfg(feature = "explain")]
     pub sel: u32,
+    /// The names a view or CREATE TABLE ... AS gives the result
+    /// columns (`result_col_names`), recorded before the query
+    /// flattener merged a FROM subquery into the core (v0.17,
+    /// `flatten`: the pin names them before it flattens); empty when
+    /// nothing was merged.
+    #[cfg(feature = "flatten")]
+    pub view_names: AVec<AVec<u8>>,
+    /// A derived table's `CteUse::is_cte`, `lazy` and `grp` (v0.17
+    /// review fix, `flatten`): what the unused-column omission and
+    /// the pin's reuse of a materialization need to know of it.
+    #[cfg(feature = "flatten")]
+    pub is_cte: bool,
+    #[cfg(feature = "flatten")]
+    pub lazy: bool,
+    #[cfg(feature = "flatten")]
+    pub grp: u32,
 }
 
 impl SubPlan {
@@ -1796,6 +1824,23 @@ pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bo
             remap_expr(&mut k.val, m);
         }
     }
+    #[cfg(feature = "multi_index")]
+    if let Some(o) = &mut a.or {
+        for sub in o.subs.as_mut_slice() {
+            remap_expr(&mut sub.cond, m);
+            if let Some(x) = &mut sub.acc {
+                remap_access(x, m);
+            }
+        }
+        o.base = m(o.base, false);
+        o.src = m(o.src, true);
+    }
+    #[cfg(feature = "multi_index")]
+    if let Some(f) = &mut a.first {
+        remap_expr(&mut f.0, m);
+        f.1 = m(f.1, false);
+        f.2 = m(f.2, true);
+    }
 }
 
 /// `remap_expr` over every part of a plan that indexes the combined
@@ -1805,6 +1850,13 @@ pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bo
 #[cfg(feature = "join_order")]
 pub(crate) fn remap_plan(p: &mut SubPlan, m: &dyn Fn(usize, bool) -> usize) {
     for s in p.sources.as_mut_slice() {
+        // (Where EXPLAIN QUERY PLAN finds the source's columns moves
+        // with them: v0.17 review fix, an IN subquery's own index was
+        // not found past a semi-join source.)
+        #[cfg(feature = "explain")]
+        {
+            s.eqp.base = m(s.eqp.base, false);
+        }
         if let Some(on) = &mut s.on {
             remap_expr(on, m);
         }
@@ -2880,6 +2932,14 @@ fn row_cmp<E>(op: BinOp, l: &[RExpr], r: &[RExpr]) -> Result<RExpr, E> {
                     pair(i, strict)?,
                     bin(BinOp::And, pair(i, BinOp::Eq)?, acc),
                 );
+            }
+            // (v0.17, `multi_index`: under a double NOT, which changes
+            // no value, so the planner does not take the pin's vector
+            // comparison for an OR of branches it could read through
+            // a MULTI-INDEX OR.)
+            #[cfg(feature = "multi_index")]
+            if last > 0 {
+                acc = RExpr::Not(Box::new(RExpr::Not(Box::new(acc))));
             }
             return Ok(acc);
         }
@@ -7453,7 +7513,29 @@ fn eval_raise<E>(
     })
 }
 
+/// Evaluate `e` against `ctx` for a caller of any storage type.
+///
+/// With `window`, the window functions evaluate frame offsets for
+/// `Error<()>` while the executors evaluate for their storage's error
+/// type, which compiled the whole evaluator twice. The evaluator never
+/// touches storage, so under `window` its body is compiled once, for
+/// `Error<()>`, and its errors are re-typed here (`Storage` cannot
+/// occur). Without `window` there is only one instantiation anyway.
+#[cfg(feature = "window")]
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    eval_body::<()>(e, ctx).map_err(|x| x.map_storage(|()| Error::Unsupported))
+}
+
+/// Evaluate `e` against `ctx` (see the `window` variant above).
+#[cfg(not(feature = "window"))]
+pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+    eval_body(e, ctx)
+}
+
+/// The evaluator's body (see `eval`); recursive calls go back through
+/// `eval`.
+#[inline(never)]
+fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
         RExpr::AffLiteral(v, ..) => v.clone(),

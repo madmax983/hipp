@@ -4977,6 +4977,8 @@ impl<'a> Parser<'a> {
             schema: self.last_schema,
             cte: None,
             indexed: None,
+            #[cfg(feature = "flatten")]
+            flat: false,
         });
         SelectStmt {
             distinct: false,
@@ -5220,6 +5222,8 @@ impl<'a> Parser<'a> {
                     cte: None,
                     #[cfg(feature = "v16")]
                     indexed: None,
+                    #[cfg(feature = "flatten")]
+                    flat: false,
                 }));
             }
         }
@@ -5296,6 +5300,8 @@ impl<'a> Parser<'a> {
             cte: None,
             #[cfg(feature = "v16")]
             indexed,
+            #[cfg(feature = "flatten")]
+            flat: false,
         })
     }
 

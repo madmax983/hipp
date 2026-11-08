@@ -52,11 +52,17 @@
 //! module builds, and `sqlite_stat1` is read back: its row estimates
 //! replace the defaults (`IdxModel::est`, `Table::rows`).
 //!
+//! With the `multi_index` leaf (v0.17) `crate::xmulti` adds the
+//! MULTI-INDEX OR loop, the min() / max() order, skip-scans (with
+//! `sqlite_stat1`), the IN operator's statistics rule and
+//! `whereLoopInsert` for one table's loops.
+//!
 //! What is not modelled (the order may then differ from the pin's,
 //! never the rows): without `join_order`, join reordering (sources run
 //! in FROM order, each with its own best loop), automatic indexes and
-//! every `sqlite_stat1` estimate; in every build the MULTI-INDEX OR
-//! plan, the LIKE prefix optimisation, skip-scans and `sqlite_stat4`.
+//! every `sqlite_stat1` estimate; without `multi_index`, the
+//! MULTI-INDEX OR plan and skip-scans; in every build the LIKE prefix
+//! optimisation and `sqlite_stat4`.
 
 use crate::arena::AVec;
 use crate::query::{RExpr, RefRange, binary_coll, expr_coll, expr_refs_range, same_expr};
@@ -335,6 +341,54 @@ impl Src {
     }
 }
 
+/// Whether `e` holds an explicit COLLATE anywhere outside its
+/// subqueries (the pin's `EP_Collate`, which the parser propagates
+/// up through operators and function arguments; v0.17 review fix).
+/// The pin analyses an OR term holding one neither as an IN nor as
+/// a MULTI-INDEX OR (probed: `a=2 OR b='x' COLLATE BINARY` scans).
+pub(crate) fn has_collate(e: &RExpr) -> bool {
+    let f = has_collate;
+    match e {
+        RExpr::Collate(..) => true,
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::Raise(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_) => false,
+        RExpr::InSub(x, ..) => f(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a) | RExpr::Pos(a) | RExpr::Not(a) | RExpr::IsNull(a, _) | RExpr::Cast(a, _) => {
+            f(a)
+        }
+        RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            base.as_deref().is_some_and(f)
+                || whens.iter().any(|(w, t)| f(w) || f(t))
+                || otherwise.as_deref().is_some_and(f)
+        }
+        RExpr::Scalar(_, a) | RExpr::Win(_, a) | RExpr::Agg { args: a, .. } => a.iter().any(f),
+    }
+}
+
+/// A one-value IN list on a constant, `x IN (v)`, which the pin's
+/// parser rewrites as `x = +v` (v0.17 review fix): its `(x, v)`.
+pub(crate) fn one_in(e: &RExpr) -> Option<(&RExpr, &RExpr)> {
+    match e {
+        RExpr::InList(x, items, false, false) => match items.as_slice() {
+            [v] if crate::query::is_constant(v) => Some((x, v)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `e` with top-level COLLATE and likely() / unlikely() /
 /// likelihood() wrappers removed (the pin's
 /// `sqlite3ExprSkipCollateAndLikely`): neither changes whether a
@@ -438,7 +492,7 @@ fn and_terms<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     }
 }
 
-fn strip(e: &RExpr) -> &RExpr {
+pub(crate) fn strip(e: &RExpr) -> &RExpr {
     match e {
         RExpr::Collate(x, _) => strip(x),
         _ => e,
@@ -546,10 +600,23 @@ fn add_terms(
                     matches!(strip(l), RExpr::Column(..) | RExpr::Rowid(_)),
                 );
             }
-            if *op == BinOp::Or
-                && let Some(t) = or_in(ci, c, tp, s, avail)
-            {
+            // (An OR term holding an explicit COLLATE is not analysed
+            // as an OR at all: v0.17 review fix.)
+            let or = *op == BinOp::Or && !has_collate(c);
+            if or && let Some(t) = or_in(ci, c, tp, s, avail) {
                 out.push(t);
+            }
+            // The pin's `whereCombineDisjuncts` (v0.17, `multi_index`):
+            // `x < 5 OR x = 5` is also the virtual term `x <= 5`.
+            #[cfg(feature = "multi_index")]
+            if or {
+                for x in crate::xmulti::combined(c).iter() {
+                    let from = out.len();
+                    add_terms(ci, x, 1, s, avail, out);
+                    for t in out.as_mut_slice().get_mut(from..).unwrap_or(&mut []) {
+                        t.virt = true;
+                    }
+                }
             }
         }
         // The pin's two virtual halves, each analysed in turn: `x >=
@@ -564,6 +631,27 @@ fn add_terms(
         RExpr::InList(x, items, false, false) => {
             let key = strip(x);
             if !s.reads(key) || items.is_empty() {
+                return;
+            }
+            // `x IN (v)` on a constant is the pin's `x = +v` (v0.17
+            // review fix): an equality, compared as the IN compares.
+            if let Some((_, v)) = one_in(c) {
+                let Some(lateral) = avail(v) else { return };
+                out.push(Term {
+                    parent: ci,
+                    key: key.clone(),
+                    op: TOp::Eq,
+                    val: v.clone(),
+                    coll: expr_coll(x).unwrap_or_default(),
+                    aff: crate::query::index_in_aff(x),
+                    lateral,
+                    isnull: false,
+                    vnull: false,
+                    #[cfg(feature = "join_order")]
+                    virt: false,
+                    #[cfg(feature = "join_order")]
+                    truth: tp,
+                });
                 return;
             }
             let mut lateral = false;
@@ -612,6 +700,14 @@ fn add_terms(
             );
             let Some(aff) = crate::query::index_probe_aff(x, &rhs) else {
                 return;
+            };
+            // The probe keeps its left operand for EXPLAIN QUERY PLAN
+            // (the IN operator's index; v0.17 review fix); nothing
+            // evaluates it.
+            let probe = if crate::query::has_sub(x) {
+                probe
+            } else {
+                RExpr::InSub(x.clone(), plan.clone(), false)
             };
             out.push(Term {
                 parent: ci,
@@ -679,7 +775,7 @@ fn add_terms(
 
 /// The pin's OR-to-IN rewrite: `x = a OR x = b OR ...` on one key,
 /// every value available, is `x IN (a, b, ...)`.
-fn or_in(
+pub(crate) fn or_in(
     ci: usize,
     c: &RExpr,
     tp: i32,
@@ -704,12 +800,36 @@ fn or_in(
     let mut items = AVec::new();
     let mut lateral = false;
     for l in leaves.iter() {
-        let RExpr::Binary(BinOp::Eq, a, b) = l else {
-            return None;
+        // (A branch's likely() wrapper is the pin's `whereSplit`'s to
+        // skip; a one-value IN is its parser's `x = +v`, whose value
+        // has no affinity: v0.17 review fixes.)
+        let l = skip_collate_likely(l);
+        let (k, v, plus) = match (l, one_in(l)) {
+            (_, Some((x, v))) => (x, v, true),
+            (RExpr::Binary(BinOp::Eq, a, b), None) => {
+                if s.reads(strip(a)) {
+                    (&**a, &**b, false)
+                } else {
+                    (&**b, &**a, false)
+                }
+            }
+            _ => return None,
         };
-        let (k, v) = if s.reads(strip(a)) { (a, b) } else { (b, a) };
         let kk = strip(k);
         if !s.reads(kk) {
+            return None;
+        }
+        // The pin's `okToChngToIN`: a value with an affinity of its
+        // own must have the key's (v0.17 fix: `x.c0 = y.c1 OR x.c0 =
+        // y.c2` probed a TEXT key with REAL values, losing rows).
+        let aff = |e: &RExpr| match strip(e) {
+            RExpr::Column(_, a, _) | RExpr::Cast(_, a) | RExpr::AffLiteral(_, Some(a), _) => {
+                Some(*a)
+            }
+            RExpr::Rowid(_) => Some(Affinity::Integer),
+            _ => None,
+        };
+        if !plus && aff(v).is_some_and(|a| Some(a) != aff(kk)) {
             return None;
         }
         match key {
@@ -718,7 +838,7 @@ fn or_in(
             _ => return None,
         }
         lateral |= avail(v)?;
-        items.push((**v).clone());
+        items.push(v.clone());
     }
     let (kk, k) = key?;
     Some(Term {
@@ -783,9 +903,79 @@ pub struct IdxModel {
     /// counts as covering for the plan and EXPLAIN QUERY PLAN, while
     /// hipp still reads the table row for the expressions' values.
     pub xcover: bool,
+    /// The index has `sqlite_stat1` rows (v0.17, `multi_index`; the
+    /// pin's `hasStat1`): `est` may hold defaults otherwise.
+    #[cfg(feature = "multi_index")]
+    pub stat1: bool,
+    /// Its `sqlite_stat1` text says `unordered` (v0.17 review fix,
+    /// `multi_index`; the pin's `bUnordered`): no range constraint,
+    /// no ORDER BY and no covering full scan through it.
+    #[cfg(feature = "multi_index")]
+    pub unordered: bool,
+    /// ... or `noskipscan` (`noSkipScan`): no skip-scan.
+    #[cfg(feature = "multi_index")]
+    pub noskip: bool,
+}
+
+/// `m.unordered` (false without `multi_index`).
+fn unordered(m: &IdxModel) -> bool {
+    #[cfg(feature = "multi_index")]
+    return m.unordered;
+    #[cfg(not(feature = "multi_index"))]
+    {
+        let _ = m;
+        false
+    }
 }
 
 impl IdxModel {
+    /// Whether `e` holds one of this index's key expressions outside
+    /// every aggregate call's arguments (v0.17 review fix): in an
+    /// aggregate query the pin reads such a result column or ORDER BY
+    /// term from the table, so the index does not cover (probed:
+    /// `SELECT a+1, max(a+1) FROM t` over an index on `a+1`).
+    #[cfg(feature = "join_order")]
+    pub fn bare_expr(&self, e: &RExpr) -> bool {
+        if self
+            .keys
+            .iter()
+            .any(|k| matches!(k, IdxKey::Expr(x) if same_expr(e, x)))
+        {
+            return true;
+        }
+        let f = |x: &RExpr| self.bare_expr(x);
+        match e {
+            RExpr::Agg { .. }
+            | RExpr::Column(..)
+            | RExpr::Rowid(_)
+            | RExpr::Literal(_)
+            | RExpr::AffLiteral(..)
+            | RExpr::Raise(_)
+            | RExpr::SubScalar(_)
+            | RExpr::SubExists(_) => false,
+            RExpr::InSub(x, ..) => f(x),
+            RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+            RExpr::Neg(a)
+            | RExpr::Pos(a)
+            | RExpr::Not(a)
+            | RExpr::IsNull(a, _)
+            | RExpr::Cast(a, _)
+            | RExpr::Collate(a, _) => f(a),
+            RExpr::InList(x, l, ..) => f(x) || l.iter().any(f),
+            RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+            RExpr::Case {
+                base,
+                whens,
+                otherwise,
+            } => {
+                base.as_deref().is_some_and(f)
+                    || whens.iter().any(|(w, t)| f(w) || f(t))
+                    || otherwise.as_deref().is_some_and(f)
+            }
+            RExpr::Scalar(_, a) | RExpr::Win(_, a) => a.iter().any(f),
+        }
+    }
+
     /// Whether `e` (an expression of the statement) reads a column of
     /// source `s` that this index holds neither as a key column nor
     /// inside one of its key expressions (`whereIsCoveringIndex`'s
@@ -831,7 +1021,9 @@ impl IdxModel {
                 .map(|b| &**b)
                 .chain(whens.iter().flat_map(|(w, t)| [w, t]))
                 .collect(),
-            RExpr::Scalar(_, args) => args.iter().collect(),
+            // (An aggregate's arguments too: `min(a+1)` over an index
+            // on `a+1` is covered; v0.17 review fix.)
+            RExpr::Scalar(_, args) | RExpr::Agg { args, .. } => args.iter().collect(),
             _ => return s.reads(e),
         };
         kids.iter().any(|k| self.reads_uncovered(k, s))
@@ -880,17 +1072,18 @@ impl IdxModel {
     /// Whether an ORDER BY term might be delivered by this index (the
     /// pin's `indexMightHelpWithOrderBy`).
     pub(crate) fn might_order(&self, s: &Src, order: &[(RExpr, SortOrder)]) -> bool {
-        order.iter().any(|(e, _)| {
-            let e = strip(e);
-            if s.is_rowid(e) {
-                return true;
-            }
-            self.keys.iter().any(|k| match k {
-                IdxKey::Col(c) => s.is_col(e, *c),
-                IdxKey::Rowid => false,
-                IdxKey::Expr(x) => same_expr(e, x),
+        !unordered(self)
+            && order.iter().any(|(e, _)| {
+                let e = strip(e);
+                if s.is_rowid(e) {
+                    return true;
+                }
+                self.keys.iter().any(|k| match k {
+                    IdxKey::Col(c) => s.is_col(e, *c),
+                    IdxKey::Rowid => false,
+                    IdxKey::Expr(x) => same_expr(e, x),
+                })
             })
-        })
     }
 }
 
@@ -1030,6 +1223,16 @@ pub(crate) struct Loop {
     /// NULLs where the index does not put them (`Some(nulls_first)`);
     /// the loop moves the NULL-keyed rows to that end.
     pub(crate) bignull: Option<bool>,
+    /// A MULTI-INDEX OR loop (v0.17, `multi_index`; the pin's
+    /// `WHERE_MULTI_OR`): the OR term's place in the source's list of
+    /// OR terms (`xmulti::OrInfo`). Its other fields are empty.
+    #[cfg(feature = "multi_index")]
+    pub(crate) or: Option<usize>,
+    /// The leading index columns a skip-scan steps over (v0.17,
+    /// `multi_index`; the pin's `nSkip`): each is an `eq` slot with
+    /// no term (`usize::MAX`).
+    #[cfg(feature = "multi_index")]
+    pub(crate) skip: usize,
 }
 
 /// What the planner needs about the query around the source.
@@ -1181,6 +1384,22 @@ pub struct IdxAccess {
     /// probe whose key is not in the filter skips the lookup.
     #[cfg(feature = "join_order")]
     pub bloom: Option<AVec<BKey>>,
+    /// A MULTI-INDEX OR loop (v0.17, `multi_index`): the branches'
+    /// own access paths, read in turn, each row once.
+    #[cfg(feature = "multi_index")]
+    pub or: Option<alloc::boxed::Box<crate::xmulti::OrAccess>>,
+    /// A skip-scan (v0.17, `multi_index`): the leading key columns
+    /// whose every value is stepped over (`ANY(a)`) before `eq`.
+    #[cfg(feature = "multi_index")]
+    pub skip: usize,
+    /// The pin's min() / max() early-out (v0.17, `multi_index`): the
+    /// statement needs only the first row of this path, in its order,
+    /// that passes this condition (the WHERE clause; a `TRUE` literal
+    /// when it has none).
+    /// `(condition, base, src)`: where the source's columns and rowid
+    /// sit in the query row the condition reads.
+    #[cfg(feature = "multi_index")]
+    pub first: Option<alloc::boxed::Box<(RExpr, usize, usize)>>,
     /// What EXPLAIN QUERY PLAN says of the loop (v0.16, `explain`):
     /// how many ORDER BY (or GROUP BY / DISTINCT) terms it delivers,
     /// whether its index covers the statement's columns, whether its
@@ -1258,7 +1477,7 @@ pub(crate) fn sort_cost(q: &Query<'_>, n_row: i32, n_ob: usize, n_sorted: usize)
 }
 
 /// Whether term `t` is an IN list.
-fn is_in(ts: &[Term], t: usize) -> bool {
+pub(crate) fn is_in(ts: &[Term], t: usize) -> bool {
     ts.get(t)
         .is_some_and(|t| matches!(t.op, TOp::In(_) | TOp::InSub(_)))
 }
@@ -1288,6 +1507,12 @@ pub(crate) fn order_sat(
     if n == 0 {
         return (0, false, None);
     }
+    // A MULTI-INDEX OR loop delivers no order (the pin's
+    // `wherePathSatisfiesOrderBy` meets no index; v0.17).
+    #[cfg(feature = "multi_index")]
+    if l.or.is_some() {
+        return (0, false, None);
+    }
     // A loop that finds at most one row delivers any order.
     let one = |ix: Option<&IdxModel>| {
         l.lo.is_none()
@@ -1312,6 +1537,9 @@ pub(crate) fn order_sat(
     if one(ix) {
         return (n, false, None);
     }
+    if ix.is_some_and(unordered) {
+        return (0, false, None);
+    }
     // The delivered columns: the key columns (a single-value
     // equality column is constant; an IN column is walked in key
     // order), then the rowid.
@@ -1327,8 +1555,11 @@ pub(crate) fn order_sat(
         }
         Some(m) => {
             for (k, key) in m.keys.iter().enumerate() {
-                let constant =
-                    l.eq.as_slice()
+                // (A skip-scan's columns, its equality ones too, are
+                // walked in key order: the pin's `nSkip` rule.)
+                let constant = skip_of(l) == 0
+                    && l.eq
+                        .as_slice()
                         .get(k)
                         .is_some_and(|t| in_eq || !is_in(ts, *t));
                 cols.push((
@@ -1348,9 +1579,17 @@ pub(crate) fn order_sat(
     }
     // Constant keys: the loop's equality columns, and any WHERE
     // `key = value` term with a static value.
-    let constant = |e: &RExpr| {
-        ts.iter()
-            .any(|t| matches!(t.op, TOp::Eq | TOp::Is) && !t.lateral && same_expr(&t.key, e))
+    // (A column's `=` / `IS` term holds it constant only under the
+    // ORDER BY term's collation: the pin's `wherePathSatisfiesOrderBy`
+    // compares them; v0.17 review fix: `a = 'y' COLLATE NOCASE ORDER BY
+    // a` left `Y` and `y` in rowid order.)
+    let constant = |e: &RExpr, o: &SortOrder| {
+        ts.iter().any(|t| {
+            matches!(t.op, TOp::Eq | TOp::Is)
+                && !t.lateral
+                && same_expr(&t.key, e)
+                && (t.isnull || s.is_rowid(e) || t.coll == o.coll)
+        })
     };
     // A GROUP BY or DISTINCT takes its terms in any order: each key
     // column the loop delivers may satisfy any term not yet
@@ -1359,8 +1598,8 @@ pub(crate) fn order_sat(
     // was sorted, the groups in another order than the pin's).
     if q.group {
         let mut done: AVec<bool> = AVec::new();
-        for (e, _) in q.order.iter() {
-            done.push(constant(strip(e)));
+        for (e, o) in q.order.iter() {
+            done.push(constant(strip(e), o));
         }
         for (c, k) in cols.iter() {
             if *k {
@@ -1403,7 +1642,7 @@ pub(crate) fn order_sat(
     let mut bignull = None;
     for (e, o) in q.order.iter() {
         let e0 = strip(e);
-        if constant(e0) {
+        if constant(e0, o) {
             sat += 1;
             continue;
         }
@@ -1626,6 +1865,10 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
             sorted: 0,
             reverse: false,
             bignull: None,
+            #[cfg(feature = "multi_index")]
+            or: None,
+            #[cfg(feature = "multi_index")]
+            skip: 0,
         });
         let a_rowid = [rows, 0];
         add_index(q, s, tab, ts, None, &a_rowid, tab.width, true, &mut loops);
@@ -1652,7 +1895,7 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
             || m.pred.is_some()
             || tab.wr
             || forced.is_some()
-            || (q.cover_scan && covering && m.width < tab.width)
+            || (q.cover_scan && covering && m.width < tab.width && !unordered(m))
         {
             let mut run = rsize + 1 + (15 * m.width) / tab.width.max(1);
             if !covering {
@@ -1672,6 +1915,10 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
                 sorted: 0,
                 reverse: false,
                 bignull: None,
+                #[cfg(feature = "multi_index")]
+                or: None,
+                #[cfg(feature = "multi_index")]
+                skip: 0,
             });
         }
         // A WITHOUT ROWID table's UPDATE / DELETE (v0.16): the pin
@@ -1700,7 +1947,7 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
 
 /// The cheapest of `loops` (their ORDER BY delivery computed) as an
 /// access path; `None` for the table's own order.
-fn best_access(
+pub(crate) fn best_access(
     q: &Query<'_>,
     s: &Src,
     tab: &Table<'_>,
@@ -1744,6 +1991,14 @@ fn best_access(
         }
     }
     let l = loops.get(best)?.clone();
+    // A MULTI-INDEX OR loop (v0.17, `multi_index`): its branches'
+    // paths are chosen by the caller (`xmulti::choose`).
+    #[cfg(feature = "multi_index")]
+    if let Some(k) = l.or {
+        let mut a = lower(s, tab, ts, &l, false);
+        a.or = Some(alloc::boxed::Box::new(crate::xmulti::OrAccess::pending(k)));
+        return Some(a);
+    }
     let mut reverse = l.reverse && l.sorted > 0;
     // The pin's "ordered inner loop": an ORDER BY the loop does not
     // deliver, but would with its IN columns held constant, still
@@ -1824,6 +2079,10 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
         sorted: 0,
         reverse: false,
         bignull: None,
+        #[cfg(feature = "multi_index")]
+        or: None,
+        #[cfg(feature = "multi_index")]
+        skip: 0,
     };
     let (sat, rev, _) = order_sat(q, s, tab, ts, &l, false);
     let d = Query {
@@ -1940,6 +2199,8 @@ fn add_index(
     let rsize = a.first().copied().unwrap_or(ROWS);
     let rlog = est_log(rsize);
     let ipk = ix.is_none();
+    #[cfg(feature = "multi_index")]
+    let from = loops.len();
     let ncol = match ix.and_then(|i| tab.indexes.get(i)) {
         Some(m) => m.keys.len() + 1,
         None => 1,
@@ -1979,8 +2240,12 @@ fn add_index(
     // the IN iterations of the columns before it (`rRun += nInMul`);
     // alone, the IN is charged at its own level only, which is what
     // `whereLoopAdjustCost` makes of it for one table.
-    #[cfg(feature = "join_order")]
+    // (v0.17, `multi_index`: one table's loops pass through
+    // `whereLoopInsert` too, so they pay it as the pin's do.)
+    #[cfg(all(feature = "join_order", not(feature = "multi_index")))]
     let join_in = |m: i32| if q.jm.is_some() { m } else { 0 };
+    #[cfg(feature = "multi_index")]
+    let join_in = |m: i32| m;
     #[cfg(not(feature = "join_order"))]
     let join_in = |_: i32| 0;
     // An explicit stack instead of recursion: (equality terms,
@@ -1997,6 +2262,10 @@ fn add_index(
             if !matches(k, t) {
                 continue;
             }
+            // (An `unordered` index takes no range: v0.17 review fix.)
+            if !t.is_eq() && ix.and_then(|i| tab.indexes.get(i)).is_some_and(unordered) {
+                continue;
+            }
             let used_with = |extra: &[usize]| {
                 let mut u = eq.clone();
                 u.extend_from_slice(extra);
@@ -2009,6 +2278,22 @@ fn add_index(
                     TOp::InSub(_) => 46,
                     _ => 0,
                 };
+                // With `sqlite_stat1` rows (v0.17, `multi_index`): an IN
+                // whose K values cost more than scanning the M rows the
+                // columns before it match (`M*log(K) < K*log(N)`, with a
+                // margin of 10 for the IN) is not probed, unless it can
+                // still seek-scan (the first IN of the loop).
+                #[cfg(feature = "multi_index")]
+                if matches!(t.op, TOp::In(_) | TOp::InSub(_))
+                    && ix.and_then(|i| tab.indexes.get(i)).is_some_and(|m| m.stat1)
+                    && rlog >= 10
+                {
+                    let m_rows = a.get(k).copied().unwrap_or(rsize);
+                    let x = m_rows + est_log(n_in) + 10 - (n_in + rlog);
+                    if x < 0 && in_mul >= 2 {
+                        continue;
+                    }
+                }
                 let cur = a.get(k).copied().unwrap_or(rsize);
                 let nxt = a.get(k + 1).copied().unwrap_or(0);
                 // A likelihood() probability on a table column's
@@ -2045,6 +2330,10 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
+                    #[cfg(feature = "multi_index")]
+                    or: None,
+                    #[cfg(feature = "multi_index")]
+                    skip: 0,
                 });
                 deeper.push((used, in_mul + n_in, out));
             } else if t.lower() {
@@ -2060,6 +2349,10 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
+                    #[cfg(feature = "multi_index")]
+                    or: None,
+                    #[cfg(feature = "multi_index")]
+                    skip: 0,
                 });
                 // ... and with each upper bound on the same column.
                 for (ui, u) in ts.iter().enumerate() {
@@ -2078,6 +2371,10 @@ fn add_index(
                         sorted: 0,
                         reverse: false,
                         bignull: None,
+                        #[cfg(feature = "multi_index")]
+                        or: None,
+                        #[cfg(feature = "multi_index")]
+                        skip: 0,
                     });
                 }
             } else if t.upper() {
@@ -2093,14 +2390,41 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
+                    #[cfg(feature = "multi_index")]
+                    or: None,
+                    #[cfg(feature = "multi_index")]
+                    skip: 0,
                 });
             }
+        }
+        // A skip-scan (v0.17, `multi_index`; the end of the pin's
+        // `whereLoopAddBtreeIndex`): no term for the leading columns
+        // so far, and `sqlite_stat1` says each value of the next one
+        // repeats at least 18 times (LogEst 42): step over its values,
+        // `nIter` more lookups.
+        #[cfg(feature = "multi_index")]
+        if let Some(m) = ix.and_then(|i| tab.indexes.get(i))
+            && m.stat1
+            && !m.noskip
+            && eq.iter().all(|t| *t == usize::MAX)
+            && k + 1 < m.keys.len()
+            && a.get(k + 1).copied().unwrap_or(0) >= 42
+        {
+            let n_iter = a.get(k).copied().unwrap_or(rsize) - a.get(k + 1).copied().unwrap_or(0);
+            let mut e2 = eq.clone();
+            e2.push(usize::MAX);
+            deeper.push((e2, in_mul + n_iter + 5, saved - n_iter));
         }
         // Recurse in term order: the stack pops the last pushed
         // first, so push in reverse.
         while let Some(d) = deeper.pop() {
             work.push(d);
         }
+    }
+    // A skip-scan's loops: how many leading columns they step over.
+    #[cfg(feature = "multi_index")]
+    for l in loops.as_mut_slice().get_mut(from..).unwrap_or(&mut []) {
+        l.skip = l.eq.iter().take_while(|t| **t == usize::MAX).count();
     }
 }
 
@@ -2203,6 +2527,18 @@ fn lookup_cut(q: &Query<'_>, s: &Src, m: &IdxModel, wr: bool) -> i32 {
     cut + virt
 }
 
+/// The leading index columns loop `l` skip-scans (0 below
+/// `multi_index`).
+pub(crate) fn skip_of(l: &Loop) -> usize {
+    #[cfg(feature = "multi_index")]
+    return l.skip;
+    #[cfg(not(feature = "multi_index"))]
+    {
+        let _ = l;
+        0
+    }
+}
+
 /// A chosen loop as the executor's access path.
 pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bool) -> IdxAccess {
     let _ = s;
@@ -2252,7 +2588,7 @@ pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bo
     IdxAccess {
         root,
         desc,
-        range_rowid: !tab.wr && root != 0 && eq.len() == nkeys,
+        range_rowid: !tab.wr && root != 0 && eq.len() + skip_of(l) == nkeys,
         eq,
         lo,
         hi,
@@ -2267,6 +2603,12 @@ pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bo
         auto: None,
         #[cfg(feature = "join_order")]
         bloom: None,
+        #[cfg(feature = "multi_index")]
+        or: None,
+        #[cfg(feature = "multi_index")]
+        skip: l.skip,
+        #[cfg(feature = "multi_index")]
+        first: None,
         #[cfg(feature = "explain")]
         eqp: (
             l.sorted,

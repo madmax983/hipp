@@ -82,13 +82,16 @@ struct Outer {
     order: bool,
     /// Aggregate (an aggregate call, GROUP BY or HAVING).
     agg: bool,
-    group: bool,
     distinct: bool,
     /// A member of a compound SELECT.
     compound: bool,
     /// Its result list calls a function or holds a subquery (the
     /// pin's `SF_ComplexResult`).
     complex: bool,
+    /// Its result list or ORDER BY calls a window function (the
+    /// flattener's restriction 25; v0.17, `flatten`).
+    #[cfg(feature = "flatten")]
+    win: bool,
 }
 
 /// The expansion walk (see the module docs).
@@ -148,6 +151,10 @@ struct Expander<'c> {
     /// a TEMP table's (the pin's `sqlite3FixSrcList`), so a temp
     /// table neither shadows them nor is read for a missing one.
     fix_main: bool,
+    /// Walking the SELECT of an `x IN (SELECT ...)` (v0.17 review
+    /// fix, `flatten`; see `cte`).
+    #[cfg(feature = "flatten")]
+    in_rhs: bool,
 }
 
 fn schema_err<E>(kind: SchemaKind) -> Error<E> {
@@ -179,6 +186,8 @@ impl<S: Storage> Connection<S> {
             fix_main: self.trig.fix_main.get(),
             #[cfg(not(feature = "triggers"))]
             fix_main: false,
+            #[cfg(feature = "flatten")]
+            in_rhs: false,
         }
     }
 
@@ -232,6 +241,8 @@ impl<S: Storage> Connection<S> {
             schema: None,
             cte: None,
             indexed: None,
+            #[cfg(feature = "flatten")]
+            flat: false,
         };
         x.view::<S::Error>(&mut f, v)?;
         let cols = f.cte.map(|c| c.columns).unwrap_or_default();
@@ -594,6 +605,20 @@ impl Expander<'_> {
 
     fn sources<E>(&mut self, from: &mut [FromSource], o: &Outer) -> Result<(), E> {
         let n = from.len();
+        // v0.17 (`flatten`): which sources hipp's flattener may
+        // splice next to (a table of main or a FROM subquery; no
+        // virtual table, table-valued function or RIGHT / FULL join).
+        #[cfg(feature = "flatten")]
+        let plain: AVec<bool> = {
+            let rf = from
+                .iter()
+                .any(|f| matches!(f.kind, JoinKind::Right | JoinKind::Full));
+            let mut v = AVec::new();
+            for f in from.iter() {
+                v.push(!rf && self.plain_src(f));
+            }
+            v
+        };
         for i in 0..n {
             // The next source's join (the pin's co-routine test).
             let next = from.get(i + 1).map(|f| f.kind);
@@ -604,7 +629,98 @@ impl Expander<'_> {
                 }
             }
         }
+        // The flattener's choice, once every source's
+        // materialization is settled (v0.17, `flatten`).
+        #[cfg(feature = "flatten")]
+        if self.fixing {
+            let ok = plain.iter().all(|p| *p);
+            for i in 0..n {
+                let next = from.get(i + 1).map(|f| f.kind);
+                let flat = ok && from.get(i).is_some_and(|f| self.flat_ok(f, o, i, next));
+                if let Some(f) = from.get_mut(i) {
+                    f.flat = flat;
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// A FROM source hipp's flattener may splice into, or out of, its
+    /// reader (v0.17, `flatten`): a FROM subquery (an expanded view or
+    /// CTE included, not a recursive reference), or a table of main
+    /// that is no virtual table.
+    #[cfg(feature = "flatten")]
+    fn plain_src(&self, f: &FromSource) -> bool {
+        if f.cte
+            .as_ref()
+            .is_some_and(|c| matches!(c.rec, RecMark::Ref { .. }))
+        {
+            return false;
+        }
+        if f.derived.is_some() {
+            return true;
+        }
+        #[cfg(feature = "attach")]
+        if f.schema.is_some() {
+            return false;
+        }
+        let n = handle_bytes(self.arena, f.table);
+        #[cfg(feature = "vtab")]
+        if self.catalog.find_vtab(self.ca, n).is_some() {
+            return false;
+        }
+        f.args.is_none() && !f.in_temp && self.catalog.find(self.ca, n).is_some()
+    }
+
+    /// Whether the pin's flattener merges FROM subquery `f` (source
+    /// `idx` of a reader shaped `o`, the next source's join `next`)
+    /// into its reader, as far as hipp's flattener follows it (v0.17,
+    /// `flatten`): `flattens` and the restrictions it leaves to the
+    /// planner — no shared materialization, MATERIALIZED or recursive
+    /// CTE (28, 22), no window function on either side (25), no
+    /// compound reader. hipp's own limits: no compound body, no
+    /// top-level COLLATE result column (the pin's substituted column
+    /// keeps an implicit collation hipp's expressions cannot carry),
+    /// only tables of main and FROM subqueries in the body, and a
+    /// LEFT JOIN's right side only as one table with a rowid (whose
+    /// NULL row guards the substituted expressions).
+    #[cfg(feature = "flatten")]
+    fn flat_ok(&self, f: &FromSource, o: &Outer, idx: usize, next: Option<JoinKind>) -> bool {
+        if self.returning || o.win || o.compound {
+            return false;
+        }
+        let Some(d) = f.derived.as_deref() else {
+            return false;
+        };
+        if let Some(c) = &f.cte
+            && (c.mat != 0 || !matches!(c.rec, RecMark::None))
+        {
+            return false;
+        }
+        if !d.compound.is_empty() || !d.values.is_empty() || core_win(d) {
+            return false;
+        }
+        if d.items
+            .iter()
+            .any(|it| matches!(it, SelectItem::Expr(Expr::Collate(..), ..)))
+            || d.from
+                .iter()
+                .any(|g| matches!(g.kind, JoinKind::Right | JoinKind::Full) || !self.plain_src(g))
+        {
+            return false;
+        }
+        if f.kind == JoinKind::Left {
+            let Some(g) = d.from.as_slice().first() else {
+                return false;
+            };
+            let t = self
+                .catalog
+                .find(self.ca, handle_bytes(self.arena, g.table));
+            if g.derived.is_some() || !t.is_some_and(|t| t.has_rowid()) {
+                return false;
+            }
+        }
+        flattens(d, o, f.kind, idx, next, self.arena)
     }
 
     /// The CTE a source names, as (frame, index), searching the
@@ -643,7 +759,18 @@ impl Expander<'_> {
                     .get((c.mat as usize).wrapping_sub(1))
                     .copied()
                     .unwrap_or((M10d::No, 0));
-                if !(hint == M10d::Yes || (hint == M10d::Any && uses >= 2)) {
+                // A NOT MATERIALIZED one read twice is shared by the
+                // references the pin materializes (v0.17 review fix,
+                // `flatten`; `CteUse::lazy`).
+                #[cfg(feature = "flatten")]
+                if hint == M10d::No && uses >= 2 {
+                    c.lazy = true;
+                }
+                #[cfg(feature = "flatten")]
+                let lazy = c.lazy;
+                #[cfg(not(feature = "flatten"))]
+                let lazy = false;
+                if !(lazy || hint == M10d::Yes || (hint == M10d::Any && uses >= 2)) {
                     c.mat = 0;
                 }
             }
@@ -662,6 +789,12 @@ impl Expander<'_> {
                     rec: RecMark::None,
                     view: false,
                     mat: self.new_mat(M10d::Yes, 1),
+                    #[cfg(feature = "flatten")]
+                    is_cte: false,
+                    #[cfg(feature = "flatten")]
+                    lazy: false,
+                    #[cfg(feature = "flatten")]
+                    grp: 0,
                 }));
             }
             return Ok(());
@@ -769,7 +902,10 @@ impl Expander<'_> {
             let kind = f.kind;
             match f.cte.as_mut() {
                 Some(c) if c.view && c.mat == u32::MAX => {
-                    if pushed {
+                    // (Without the flattener a pushed-down copy takes
+                    // no part; with it, it is a member that computes
+                    // its own rows, `CteUse::grp`.)
+                    if pushed && cfg!(not(feature = "flatten")) {
                         c.mat = 0;
                         continue;
                     }
@@ -789,7 +925,11 @@ impl Expander<'_> {
                             id
                         }
                     };
-                    c.mat = id;
+                    c.mat = if pushed { 0 } else { id };
+                    #[cfg(feature = "flatten")]
+                    {
+                        c.grp = id;
+                    }
                 }
                 Some(c) if c.mat != 0 || !matches!(c.rec, RecMark::None) => {}
                 _ => {
@@ -849,6 +989,12 @@ impl Expander<'_> {
             rec: RecMark::None,
             view: true,
             mat: 0,
+            #[cfg(feature = "flatten")]
+            is_cte: false,
+            #[cfg(feature = "flatten")]
+            lazy: false,
+            #[cfg(feature = "flatten")]
+            grp: 0,
         }));
         Ok(())
     }
@@ -886,7 +1032,15 @@ impl Expander<'_> {
             .as_mut_slice()
             .get_mut((mat as usize).wrapping_sub(1))
         {
-            m.1 = m.1.saturating_add(1);
+            // Inside an `x IN (SELECT ...)` the pin counts each
+            // reference twice (v0.17 review fix, `flatten`: probed, a
+            // CTE read only there is a MATERIALIZE, never a
+            // CO-ROUTINE).
+            #[cfg(feature = "flatten")]
+            let uses = if self.in_rhs { 2 } else { 1 };
+            #[cfg(not(feature = "flatten"))]
+            let uses = 1;
+            m.1 = m.1.saturating_add(uses);
         }
         let name = copy_vec(handle_bytes(self.arena, cte.name));
         let mut body = cte.select;
@@ -923,6 +1077,12 @@ impl Expander<'_> {
             },
             view: false,
             mat,
+            #[cfg(feature = "flatten")]
+            is_cte: true,
+            #[cfg(feature = "flatten")]
+            lazy: false,
+            #[cfg(feature = "flatten")]
+            grp: 0,
         }));
         Ok(())
     }
@@ -981,6 +1141,12 @@ impl Expander<'_> {
                             rec: RecMark::Ref { id },
                             view: false,
                             mat: 0,
+                            #[cfg(feature = "flatten")]
+                            is_cte: true,
+                            #[cfg(feature = "flatten")]
+                            lazy: false,
+                            #[cfg(feature = "flatten")]
+                            grp: 0,
                         }));
                     }
                 }
@@ -1069,7 +1235,14 @@ impl Expander<'_> {
             }
             Expr::InSubquery(a, s, _) => {
                 self.expr::<E>(a)?;
-                self.select::<E>(s)?;
+                #[cfg(feature = "flatten")]
+                let was = core::mem::replace(&mut self.in_rhs, true);
+                let r = self.select::<E>(s);
+                #[cfg(feature = "flatten")]
+                {
+                    self.in_rhs = was;
+                }
+                r?;
             }
             Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) => {
                 self.sub_limit = true;
@@ -1149,7 +1322,6 @@ fn outer_of(s: &SelectStmt, tail: bool, compound: bool, arena: &Arena) -> Outer 
         limit: tail && s.limit.is_some(),
         order: tail && !s.order_by.is_empty(),
         agg: core_is_agg(s, arena),
-        group: !s.group_by.is_empty(),
         distinct: s.distinct,
         compound,
         complex: s.items.iter().any(|it| match it {
@@ -1164,6 +1336,32 @@ fn outer_of(s: &SelectStmt, tail: bool, compound: bool, arena: &Arena) -> Outer 
             }),
             _ => false,
         }),
+        #[cfg(feature = "flatten")]
+        win: core_win(s),
+    }
+}
+
+/// Whether core `s`'s result list or ORDER BY calls a window
+/// function (v0.16, `window`).
+#[cfg(feature = "flatten")]
+fn core_win(s: &SelectStmt) -> bool {
+    #[cfg(feature = "window")]
+    {
+        let w = |e: &Expr| {
+            crate::rules::expr_any(
+                e,
+                &mut |x| matches!(x, Expr::Func { clause: Some(c), .. } if c.over.is_some()),
+            )
+        };
+        s.items.iter().any(|it| match it {
+            SelectItem::Expr(e, ..) => w(e),
+            _ => false,
+        }) || s.order_by.iter().any(|(e, _)| w(e))
+    }
+    #[cfg(not(feature = "window"))]
+    {
+        let _ = s;
+        false
     }
 }
 
@@ -1231,8 +1429,11 @@ fn flattens(
     next: Option<JoinKind>,
     arena: &Arena,
 ) -> bool {
-    let outer_rhs = matches!(kind, JoinKind::Left | JoinKind::Full);
-    if matches!(kind, JoinKind::Right) {
+    // The right operand of a RIGHT or FULL JOIN never is (26); a
+    // LEFT JOIN's only as one source, under a reader that is not
+    // DISTINCT (3a, 3c — probed: a GROUP BY reader flattens it).
+    let outer_rhs = matches!(kind, JoinKind::Left);
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
         return false;
     }
     let lim = d.limit.is_some();
@@ -1277,7 +1478,7 @@ fn flattens(
     if !plain(d) {
         return false;
     }
-    if outer_rhs && (d.from.len() > 1 || o.group) {
+    if outer_rhs && (d.from.len() > 1 || o.distinct) {
         return false;
     }
     if idx > 0
@@ -1664,6 +1865,8 @@ impl<S: Storage> Connection<S> {
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
+            #[cfg(feature = "flatten")]
+            exists: false,
         });
         Ok(w)
     }
