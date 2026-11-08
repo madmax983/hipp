@@ -109,3 +109,26 @@ instructions. `valgrind --tool=dhat` (n=1000): 1,885,182 blocks,
 321,242,993 bytes total.
 
 Reproduce dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: search only the visited cells, rebuild the leaf from page bytes
+
+`index_search_raw` parses just the cells the binary search visits (every
+cell's layout is still validated, allocation-free); a leaf that still fits
+is rewritten by `write_index_leaf_inserted`, copying cell bytes straight
+from the page image. A leaf that overflows falls back to the old
+parse-everything path. Workload checksums identical; a 5 MB index-heavy
+database (512 B pages, overflow keys, DESC/UNIQUE/NOCASE indexes,
+deletes/updates) is byte-identical (sha256) before/after.
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 531,491,467   | 412,739,173   | -22.3%  |
+| 1000 | 1,221,031,532 | 935,461,204   | -23.4%  |
+| 2000 | 2,791,295,949 | 2,136,959,519 | -23.4%  |
+
+n=1000: index_insert inclusive 552,561,282 -> 266,949,278 (-51.7%);
+dhat 1,885,182 -> 1,289,425 blocks (-31.6%), 321,242,993 -> 201,527,480
+bytes (-37.3%).
+
+Size gates: tiny unchanged (76,960); full +872 B, max +984 B, xl +976 B;
+ratchets raised by those amounts (each well under `justify_over`).
