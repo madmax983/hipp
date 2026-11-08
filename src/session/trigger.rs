@@ -647,7 +647,7 @@ impl<S: Storage> Connection<S> {
             }
             _ => AVec::new(),
         };
-        Ok(Some(Plan::Instead(Box::new(InsteadPlan {
+        Ok(Some(Plan::Instead(alloc::rc::Rc::new(InsteadPlan {
             event,
             source: Box::new(source),
             ncols,
@@ -1829,7 +1829,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         let Plan::Instead(ip) = &self.plan else {
             return Err(Error::Unsupported);
         };
-        let ip = ip.clone();
+        // Shared, not deep-copied, per execution (v0.17 size pass).
+        let ip = Rc::clone(ip);
         let rows = self.exec_subplan(&ip.source, &RowData::empty()).await?;
         for row in rows.iter() {
             let r = row.as_slice();

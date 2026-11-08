@@ -485,3 +485,73 @@ fn evaluator_conditions_and_frame_offsets_match_the_pin() {
         ],
     );
 }
+
+/// (d) Plans are shared, not deep-copied, per execution: a query,
+/// PRAGMA or INSTEAD OF statement run, reset (part-way or at its end)
+/// and run again gives the same rows each time — the pin's rows.
+#[test]
+fn re_executed_statements_keep_their_plans() {
+    let setup = format!(
+        "{MONO_SETUP}\
+         CREATE VIEW v AS SELECT a, b FROM t;\
+         CREATE TABLE log(x);"
+    );
+    // (The script splitter would cut the trigger body at its `;`.)
+    let trigger =
+        "CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO log VALUES(new.a); END";
+    let queries = [
+        "SELECT a, b FROM t ORDER BY b, a",
+        "SELECT b, count(*) FROM t GROUP BY b",
+        "SELECT a FROM t UNION SELECT c FROM u ORDER BY 1",
+        "SELECT a, (SELECT count(*) FROM u WHERE c <= t.a) FROM t",
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE c = t.a)",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r",
+        "SELECT value FROM generate_series(1, 5) WHERE value % 2 = 1",
+        "PRAGMA table_info(t)",
+        "INSERT INTO v VALUES(7, 'w')",
+        "SELECT x FROM log",
+    ];
+    let h = common::temp_db("v17sz-reexec-h");
+    let o = common::temp_db("v17sz-reexec-o");
+    let (hok, _, he) = hipp_script(&h, &setup);
+    assert!(hok, "setup: {he:?}");
+    assert!(oracle_script(&o, &setup).0);
+    assert!(oracle_script(&o, trigger).0);
+    block_on(async {
+        let mut db = Connection::open(FileStorage::open(&h).expect("fs open"), Config::default())
+            .await
+            .expect("open");
+        let mut t = db.prepare(trigger).await.expect("prepare trigger");
+        assert_eq!(t.step().await.expect("trigger"), Step::Done);
+        drop(t);
+        for sql in queries {
+            let mut q = db.prepare(sql).await.expect("prepare");
+            let mut runs: Vec<Vec<String>> = Vec::new();
+            for round in 0..3 {
+                let mut rows = Vec::new();
+                while q.step().await.expect("step") == Step::Row {
+                    let mut l = String::new();
+                    render(&q, &mut l);
+                    rows.push(l);
+                    // The second round stops after one row: a reset
+                    // part-way must not lose the plan.
+                    if round == 1 {
+                        break;
+                    }
+                }
+                q.reset();
+                runs.push(rows);
+            }
+            let mut ol = oracle_script(&o, sql).1;
+            if sql.starts_with("INSERT") {
+                // Three executions insert three times on hipp.
+                for _ in 0..2 {
+                    ol = oracle_script(&o, sql).1;
+                }
+            }
+            assert_eq!(runs[0], ol, "first run: {sql}");
+            assert_eq!(runs[2], runs[0], "third run: {sql}");
+            assert_eq!(runs[1].first(), runs[0].first(), "part-way run: {sql}");
+        }
+    });
+}

@@ -6133,7 +6133,9 @@ mod split_tests {
     #[test]
     fn split_counts_match_the_generic_reference() {
         let mut r = Rng(0x9e37_79b9_7f4a_7c15);
-        for round in 0..4000 {
+        // Fewer rounds under miri (CI runs the lib tests there).
+        let rounds = if cfg!(miri) { 40 } else { 4000 };
+        for round in 0..rounds {
             let len = 1 + (r.next() % 60) as usize;
             let heavy = round % 7 == 0;
             let weights: Vec<usize> = (0..len)

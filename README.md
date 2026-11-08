@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,260 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 478,436 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 965,388 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,062,144 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 477,180 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 964,316 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,060,616 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -179,9 +179,11 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 - **Size pass: monomorphic glue** (no feature). Machinery Rust
   compiled once per type is compiled once: the expression evaluator's
   helpers, conditions and aggregate walks no longer have both an
-  `Error<()>` and a storage-error copy, and the B-tree balance computes
-  its split points once for every cell type (tiny −700 B, full
-  −2,804 B, max −2,996 B, xl −3,036 B). Rows, errors and file bytes
+  `Error<()>` and a storage-error copy, the B-tree balance computes
+  its split points once for every cell type, and a statement's plan is
+  shared, not deep-copied, each time it runs (a correlated subquery
+  no longer copies its plan per outer row): tiny −700 B, full
+  −4,060 B, max −4,068 B, xl −4,564 B. Rows, errors and file bytes
   are unchanged against the pin.
 
 ## What v0.16 does

@@ -811,9 +811,11 @@ enum Plan {
     Rollback,
     /// A v0.4 query (joins / aggregates / general expressions /
     /// ORDER BY / LIMIT): planned resolved expressions, executed
-    /// by materialisation on first step.
+    /// by materialisation on first step. Shared, not copied, by each
+    /// execution (v0.17 size pass): the executors borrow it, and a
+    /// streamed execution holds a reference beside its own state.
     #[cfg(feature = "v04")]
-    Query(QueryPlan),
+    Query(alloc::rc::Rc<QueryPlan>),
     /// `UPDATE` (v0.5): SET expressions and the filter are
     /// resolved at plan time against the single source; rows are
     /// materialised at step time and each assignment evaluates
@@ -966,7 +968,7 @@ enum Plan {
     },
     /// `PRAGMA` (v0.16, `v16`).
     #[cfg(feature = "v16")]
-    Pragma(Box<pragma::PragmaPlan>),
+    Pragma(alloc::rc::Rc<pragma::PragmaPlan>),
     /// The savepoint and maintenance statements (v0.16, `v16`).
     #[cfg(feature = "v16")]
     Maint(maint::Maint),
@@ -990,7 +992,7 @@ enum Plan {
     /// A write of a view through its INSTEAD OF triggers (v0.16,
     /// `triggers`).
     #[cfg(feature = "triggers")]
-    Instead(Box<trigger::InsteadPlan>),
+    Instead(alloc::rc::Rc<trigger::InsteadPlan>),
     /// `EXPLAIN QUERY PLAN` (v0.16, `explain`; `session::eqp`): the
     /// rows describing the plan of the statement it names, which was
     /// planned and is never run.
@@ -4659,7 +4661,9 @@ impl<S: Storage> Connection<S> {
         }
         #[cfg(feature = "v04")]
         {
-            Ok(Plan::Query(self.plan_query(stmt, arena)?))
+            Ok(Plan::Query(alloc::rc::Rc::new(
+                self.plan_query(stmt, arena)?,
+            )))
         }
         #[cfg(not(feature = "v04"))]
         {
@@ -11971,23 +11975,24 @@ impl<'c, S: Storage> Statement<'c, S> {
         let Plan::Query(qp) = &self.plan else {
             unreachable!()
         };
-        let qp = qp.clone();
+        // The plan is shared, not deep-copied, per execution.
+        let qp = alloc::rc::Rc::clone(qp);
         #[cfg(feature = "v09")]
         if !qp.compound.is_empty() || !qp.values.is_empty() {
-            return self.run_query_compound(qp).await;
+            return self.run_query_compound(&qp).await;
         }
         // v0.17 (`v16`): one executor, the async one (the streamed
         // plans and their blocking modes use it too); the synchronous
         // v0.4 executor below serves the builds without the rung.
         #[cfg(feature = "v16")]
         {
-            self.run_query_sub(qp).await
+            self.run_query_sub(&qp).await
         }
         #[cfg(not(feature = "v16"))]
         {
             #[cfg(feature = "v06")]
             if query_plan_has_sub(&qp) {
-                return self.run_query_sub(qp).await;
+                return self.run_query_sub(&qp).await;
             }
             // LIMIT / OFFSET first: the pin computes them before
             // the scan, so a bad one errors even over no rows.
@@ -12213,9 +12218,9 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// each core's rows through the async core path, combined
     /// left to right, then the compound ORDER BY / LIMIT.
     #[cfg(feature = "v09")]
-    async fn run_query_compound(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
+    async fn run_query_compound(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
-        let head = self.exec_qp_core_values(&qp).await?;
+        let head = self.exec_qp_core_values(qp).await?;
         let mut tails = AVec::new();
         let mut cores = AVec::new();
         cores.push(core_colls(qp.items.as_slice(), qp.values.as_slice()));
@@ -12343,7 +12348,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// row at hand and substitutes its value before the
     /// synchronous evaluator runs.
     #[cfg(feature = "v06")]
-    async fn run_query_sub(&mut self, qp: QueryPlan) -> Result<(), S::Error> {
+    async fn run_query_sub(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
         // Window calls (v0.16, `window`) read every input row: no
         // bound passes into the sources.
@@ -12402,7 +12407,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let produced = self
             .project_qp_async(
-                &qp,
+                qp,
                 rows.as_slice(),
                 group_cap(
                     qp.group_by.as_slice(),
@@ -12412,7 +12417,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 ),
             )
             .await?;
-        self.finish_produced(&qp, produced, window);
+        self.finish_produced(qp, produced, window);
         Ok(())
     }
 
@@ -12951,7 +12956,6 @@ impl<'c, S: Storage> Statement<'c, S> {
         if let Some(rec) = plan.rec {
             return self.exec_recursive(plan, rec, outer, need).await;
         }
-        let plan = plan.clone();
         let window = self.limit_window(&plan.limit, &plan.offset).await?;
         // The rows its reader takes bound the rows it must make.
         let (skip, take) = window;
@@ -13028,7 +13032,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut n = if grow { target.max(1) } else { 0 };
         let produced = loop {
             let (p, first) = self
-                .exec_subplan_core_n(&plan, outer, cap, if grow { Some(n) } else { src_need })
+                .exec_subplan_core_n(plan, outer, cap, if grow { Some(n) } else { src_need })
                 .await?;
             if !grow || p.len() >= target || first < n {
                 break p;

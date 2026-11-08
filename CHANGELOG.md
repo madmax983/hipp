@@ -20,6 +20,16 @@ All notable changes to hipp. Versions follow the milestones in
   into groups stays per cell type. tiny −700 B (76,260), full −960 B
   (478,436), max −960 B (965,388), xl −992 B (1,062,144); page images
   unchanged (`insert_balance_v15`, `delete_balance_v14` vs the pin).
+- Plans are no longer deep-copied per execution: `Plan::Query`,
+  `Plan::Pragma` and `Plan::Instead` hold an `Rc`, the executors and
+  the streamed cursor borrow or share it, and `exec_subplan_inner` (a
+  subquery's every run — per outer row when correlated) no longer
+  clones its plan. full −1,256 B (477,180), max −1,072 B (964,316), xl
+  −1,528 B (1,060,616), tiny unchanged.
+- Measured and not kept: a hand-written type-erased `AVec` growth core
+  (+460 to +2,024 B; `alloc`'s `RawVecInner` already shares the growth
+  path) and an out-of-line `AVec::push` (−88 to −1,968 B, +17.7%
+  instructions on the bolt workload).
 
 ### Size: one shared stable sort
 

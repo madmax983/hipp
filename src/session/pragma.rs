@@ -699,7 +699,7 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::UnknownTable,
             });
         }
-        Ok(Plan::Pragma(Box::new(PragmaPlan {
+        Ok(Plan::Pragma(alloc::rc::Rc::new(PragmaPlan {
             prag,
             arg,
             numeric,
@@ -1943,7 +1943,8 @@ impl<S: Storage> Statement<'_, S> {
         let Plan::Pragma(p) = &self.plan else {
             return Err(Error::Unsupported);
         };
-        let p = (**p).clone();
+        // Shared, not deep-copied, per execution (v0.17 size pass).
+        let p = alloc::rc::Rc::clone(p);
         let Some(prag) = p.prag else {
             return Ok(AVec::new());
         };

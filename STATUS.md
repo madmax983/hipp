@@ -1765,6 +1765,79 @@ max 966,348 → 965,388 (−960); xl 1,063,136 → 1,062,144 (−992).
 Tiny shrinks, so its ratchet is lowered too (no tiny growth to
 justify). Gates: `ci/local-gates.sh` (full run) passes.
 
+**(c) A type-erased `AVec` growth core: measured, not kept.** The
+standard library already compiles `Vec`'s growth once:
+`RawVecInner::grow_amortized` / `finish_grow` are non-generic (one
+copy each in every profile), and each element type adds only a 22 B
+`grow_one` stub that passes its layout (18 / 34 / 47 / 51 stubs, 438
+/ 790 / 1,070 / 1,158 B in tiny / full / max / xl). Two experiments:
+
+- A hand-written non-generic `grow_core(ptr, cap, Layout)` in
+  `src/arena.rs` (alloc / realloc, `Vec::from_raw_parts` back) behind
+  an out-of-line typed `push`: +460 / +1,696 / +2,024 / +1,912 B —
+  the per-type take-and-rebuild glue costs more than the stubs it
+  replaces, and passing the layout from each of max's 264 inline push
+  sites would cost about as much again.
+- `#[inline(never)]` on `AVec::push` (one copy per element type, every
+  site a call): −88 / −304 / −1,872 / −1,968 B, but +17.7% instructions
+  on `examples/bolt_workload 500` (callgrind, release: 415.3 M → 488.9
+  M Ir; the record encoder pushes byte by byte). Not worth 0.2% of
+  max; `AVec` is unchanged.
+
+So this unit ships no (c) commit; the growth glue is left to unit 4,
+whose VM deletes most push sites (registers are preallocated).
+
+**(d) No per-execution plan copies.** A statement's plan was deep-
+copied every time it ran, because the executors take `&mut self`
+while the plan lives in `self.plan`:
+
+- `Plan::Query` holds an `Rc<QueryPlan>`: `run_query` and the streamed
+  `stream_open` take a reference count, not a copy, and the executors
+  (`run_query_sub`, `run_query_compound`) borrow it; the stream keeps
+  its `Rc` beside its own per-execution state (levels, buffers,
+  windows). `QueryPlan`'s `Clone` code (436 B in max) is gone.
+- `exec_subplan_inner` cloned its `SubPlan` (sources, expressions,
+  nested plans) on every run — for a correlated subquery, once per
+  outer row — although it already held a shared reference; the copy
+  is simply gone.
+- `Plan::Pragma` and `Plan::Instead` (INSTEAD OF trigger statements)
+  hold an `Rc` too, so `run_pragma` and `exec_instead` stop copying.
+- A dropped or reset statement keeps its plan (the `Rc` in `self.plan`
+  is never taken out), so the cancellation rule of SPEC §5.1.1 holds;
+  `crash.rs` passes unchanged. `tests/size_v17.rs` runs queries
+  (ORDER BY, GROUP BY, compound, correlated scalar and EXISTS
+  subqueries, a recursive CTE, generate_series), a PRAGMA and an
+  INSTEAD OF insert three times on one prepared statement — the second
+  run reset after one row — against the pin's rows.
+- Kept: `exec_recursive` (`cte.rs`) still copies the recursive CTE's
+  plan once per execution to strip its recursive members (not per
+  row), and the planner's own copies (`query.rs` row-valued scalar
+  subqueries, `xplan.rs` IN probes) are plan-time, not per execution.
+
+Size Δ: tiny 76,260 → 76,260 (0; `Plan::Query` is a `v04` variant);
+full 478,436 → 477,180 (−1,256); max 965,388 → 964,316 (−1,072); xl
+1,062,144 → 1,060,616 (−1,528).
+
+**Unit total** against the ratchets before the unit: tiny 76,960 →
+76,260 (−700); full 481,240 → 477,180 (−4,060); max 968,384 → 964,316
+(−4,068); xl 1,065,180 → 1,060,616 (−4,564). Engine statics stay 0 B.
+
+**Honest gaps.**
+
+- (c) ships nothing (above); the estimate's −0.2…−5.5 K assumed a
+  per-type growth path that `alloc` already shares.
+- `serial_body_len::<()>` (28 B, full only) stays duplicated: the
+  split that removes it grows tiny by 8 B.
+- `exec_recursive`'s once-per-execution plan copy stays (see (d)).
+
+**Gates** (each sub-edit's commit): `ci/local-gates.sh` (full run)
+passes; `depth_v16` and `triggers_v16` pass with debug info on (after
+(a) and after (d)); the CI miri job's three commands (`cargo +nightly
+miri test --lib --no-default-features --features full`, and `smoke` /
+`arenas a9_statement_arena_exhaustion` with `std,full`) pass —
+`src/arena.rs` is unchanged by the unit, so there is no new `unsafe`;
+`btree::split_tests` runs 40 instead of 4,000 rounds under miri.
+
 **Oracle probing (3.54.1 pin)**, recorded as corpora in
 `tests/size_v17.rs`: a compound's ORDER BY resolves `t.a` and an
 alias against the first core and errors on an unknown name; an outer

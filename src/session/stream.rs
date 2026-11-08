@@ -141,7 +141,8 @@ enum Acc {
 
 /// A streamed top-level query in progress (`Statement::stream`).
 pub(super) struct Stream {
-    qp: QueryPlan,
+    /// The statement's plan, shared (not copied) for this execution.
+    qp: alloc::rc::Rc<QueryPlan>,
     levels: AVec<Level>,
     /// Where each source's values start in the joined row.
     bases: AVec<usize>,
@@ -247,7 +248,7 @@ impl<S: Storage> Statement<'_, S> {
         if !crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice()).is_empty() {
             return Ok(None);
         }
-        let qp = qp.clone();
+        let qp = alloc::rc::Rc::clone(qp);
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
         // An endless recursive CTE read first through a WHERE or a
         // join under a LIMIT: its rows are computed under a bound
