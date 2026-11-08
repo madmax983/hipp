@@ -1963,9 +1963,11 @@ ORDER BY / LIMIT, a folded `count(*), sum(a)`, and an AFTER INSERT
 trigger's `INSERT OR FAIL` failing in autocommit and inside BEGIN
 (the FAIL keeps the rows written before it; the transaction stays
 open): identical rows and errored-vs-succeeded on every statement.
-`UPDATE sqlite_schema` under `writable_schema` is refused by the pin's
-CLI ("table sqlite_master may not be modified"), so NOT NULL / STRICT
-findings stay covered by `pragma_v16`'s existing corpus.
+NOT NULL / STRICT findings were not re-probed then (`UPDATE
+sqlite_schema` under `writable_schema` is refused by the pin's CLI);
+that was avoidable: editing the stored CREATE text in place, at the
+same length, drives both engines through them live, and the review
+fixes below do so (`tests/integrity_v17.rs`).
 
 **Tests.** No behaviour changed, so no test was added or changed: the
 existing suites cover every split (`pragma_v16` integrity corpus,
@@ -1994,6 +1996,115 @@ too (it shrinks; nothing to justify).
   they inline async callees, not sync code; they are Stage 2 / 3
   work.
 
+### Size pass: sync islands — review fixes (2026-11-08)
+
+Three findings in the integrity check this unit restructured
+(`check_rows` / `row_check_plan` / `check_row`, `src/session/
+pragma.rs`); all three predate the unit (they are the same at
+`d20c2b6`). Reached by editing an oracle-written file's stored
+schema text in place, at the same length.
+
+- **The wrong index named** (ungated fix). `write_index_plans`
+  already returns the plans newest first (the pin's `pIndex` order)
+  and `row_check_plan` reversed them a second time, while the names
+  (`table_indexes`) were newest first: with two or more indexes,
+  "row N missing from index X" named another index of the table, and
+  a WITHOUT ROWID table's broken index came out as its
+  `sqlite_autoindex`. The second reverse is gone. No other caller
+  zips `write_index_plans` with names (searched: the write paths
+  index plans by position only).
+- **No entry count for a partial index** (ungated fix). The
+  `expr_index` tail that counted a partial index's entries against
+  the rows its WHERE admits and printed "wrong # of entries in index
+  X" has no counterpart on the pin: probed with fewer, more and
+  equal admitted rows, swapped predicates, and a stale entry left by
+  a DELETE under another predicate, the pin reports only each
+  admitted row's missing entry (and `ok` when nothing is missing).
+  The tail and its counters are removed.
+- **A stored type against its affinity** (ungated fix: hipp said
+  `ok`). The pin's checks 4 and 5 on a non-STRICT table: "NUMERIC
+  value in t.c" for an INTEGER or REAL in a TEXT-affinity column,
+  "TEXT value in t.c" for text that NUMERIC conversion takes (what
+  `record::text_to_number` takes; `'abc'`, `'0x10'`, `''`, `'inf'`,
+  `'1e'`, `'1 2'` and Unicode spaces stay text) in an INTEGER /
+  REAL / NUMERIC column; BLOB columns, NULLs, the rowid alias and a
+  STRICT table's ANY column are not checked; a STRICT table's
+  columns get only their STRICT finding. A column added by ALTER
+  TABLE reads its converted default, as on the pin; generated
+  columns read their computed values. A table with a typed column is
+  now checked row by row (it was walked page by page when it had no
+  index, NOT NULL, STRICT or CHECK), so `quick_check` reports these
+  too. The pin's findings, order and error budget matched on every
+  probe.
+
+**Oracle probing (3.54.1 pin, live).** Each repro of the review,
+then: one, two and three indexes with one or two broken (the per-row
+order newest first), an autoindex beside a named index, WITHOUT ROWID
+with one and two secondary indexes; partial indexes as above; every
+affinity against INT / REAL / TEXT / BLOB / NULL values and 30
+numeric-looking strings; NOT NULL, STRICT (a table made STRICT by
+editing `)` to `) STRICT--`, and one made non-STRICT), CHECK,
+generated (VIRTUAL and STORED) columns, ALTER-added defaults, WITHOUT
+ROWID columns; `integrity_check`, `quick_check`, `(N)` and `(t)`.
+
+**Found while probing: the pin's header re-parse.** The pin's column
+checks read the record header's types (`OP_IsType`) and load a value
+only to look closer (a NOT NULL column's NULL or REAL, a numeric
+column's TEXT). Once a finding has been emitted the cursor's header
+cache is stale, and the next load re-parses the header only up to its
+own column; a later column of that row then reads as its default's
+type (NULL), so its type finding is skipped. Example: `t(c0 NUM, c1
+INT NOT NULL, c2 NUM)` holding `(' 7 ', 1e3, '-0')` gets only "TEXT
+value in t.c0" from the pin; hipp adds "TEXT value in t.c2". hipp
+does not model this (honest gap below): a model for rowid tables
+measured +256 B in full, past the ratchet.
+
+**Tests.** `tests/integrity_v17.rs` (new, 5 tests, live against the
+pin): the index-name cases, the partial-index cases, the affinity
+cases (with and without an index, quick_check, the error budget,
+generated columns, STRICT edited both ways, WITHOUT ROWID, ALTER
+defaults), NOT NULL / STRICT / CHECK reached by editing the stored
+CREATE text, and a generated corpus of 120 tables (xorshift; up to
+four columns, one edited to a random declared type, random values,
+one to three indexes, some edited to another column). Existing suites
+(`pragma_v16`, `expr_index_v16`, `without_rowid_v16`,
+`table_defs_v16`, `alter_v16`, `crash`) pass unchanged.
+
+**Gates:** `ci/local-gates.sh` (full run) passes, run with
+`CARGO_TARGET_DIR` set to the build directory's real path (`target`
+is a symlink here, and `attach_v16` compares the pin's resolved
+database paths with `CARGO_TARGET_TMPDIR`'s). `depth_v16`,
+`triggers_v16`, `crash`, `pragma_v16` and `integrity_v17` pass with
+debug info on; `check_rows`' future only lost locals and an await,
+so the `STACK_*` constants stay as they are.
+
+**Size Δ** against the unit's figures: tiny 76,124 → 76,124 (0); full
+476,516 → 476,476 (−40); max 962,708 → 962,292 (−416); xl 1,059,216
+→ 1,058,808 (−408). The removed partial-count tail and double reverse
+pay for the affinity checks (+76 B in full, measured alone); each
+finding's ` value in <table>.<column>` tail is built once per table
+in `row_check_plan`, and the three column findings share
+`col_finding`. Ratchets lowered to these figures. Futures' drop glue
+falls again: 1,468 / 13,498 / 29,830 / 30,904 B (from 1,468 / 13,506
+/ 29,842 / 30,916). Against the ratchets before the unit, the unit
+with its review fixes: tiny −136, full −704, max −2,024, xl −1,808.
+
+**Honest gaps.**
+
+- The pin's header re-parse after a finding (above) is not
+  modelled: in a row that already has a column finding, hipp can
+  report a later column's type finding that the pin skips. The same
+  holds, before this fix, for STRICT findings. `tests/integrity_v17.rs`'s
+  generated corpus edits one column per table so that a row holds at
+  most one column finding.
+- A table with a typed column is checked row by row now, and hipp's
+  row read follows every overflow chain where the pin reads only the
+  header (bar a TEXT value in a numeric column): a damaged chain in
+  such a table makes hipp's check fail after the page check's
+  findings, where the pin finishes. This is the v0.16 gap ("a row
+  whose overflow chain is broken stops hipp") reaching tables that
+  were walked page by page before (an untyped table still is).
+
 ### Size pass Stage 1 (Tier A): summary (2026-11-08)
 
 ADR 0005's Stage 1 is the three units above (`size-sort`,
@@ -2004,9 +2115,9 @@ records it as accepted. Totals against the ratchets before the stage
 | profile | before | sort | mono | islands | after | Δ | budget headroom after |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `tiny` | 76,960 | 0 | −700 | −136 | **76,124** | −836 (−1.1%) | 54,948 |
-| `full` | 507,592 | −26,352 | −4,060 | −664 | **476,516** | −31,076 (−6.1%) | 47,772 |
-| `max` | 1,031,072 | −62,688 | −4,068 | −1,608 | **962,708** | −68,364 (−6.6%) | 85,868 |
-| `xl` | 1,142,128 | −76,948 | −4,564 | −1,400 | **1,059,216** | −82,912 (−7.3%) | 251,504 |
+| `full` | 507,592 | −26,352 | −4,060 | −704 | **476,476** | −31,116 (−6.1%) | 47,812 |
+| `max` | 1,031,072 | −62,688 | −4,068 | −2,024 | **962,292** | −68,780 (−6.7%) | 86,284 |
+| `xl` | 1,142,128 | −76,948 | −4,564 | −1,808 | **1,058,808** | −83,320 (−7.3%) | 251,912 |
 
 Against the ADR's estimate for S1 (~75.7 K / ~476.7 K / ~962.9 K /
 ~1,018 K from the `8d78815` baseline): full and max land on it, tiny
@@ -2015,7 +2126,9 @@ pay), and xl is above because `xl` grew by four leaves between the
 baseline and the stage (1,114,356 B at `8d78815`, 1,142,128 B when the
 stage started). Rows, errors, file bytes and EXPLAIN QUERY PLAN output
 are unchanged against the pin except the deliberate NaN-rank fix of
-`size-sort`. Engine statics stay 0 B in every profile.
+`size-sort` and the three integrity-check fixes of `size-islands`'
+review (in its column above). Engine statics stay 0 B in every
+profile.
 
 ## v0.16 — SQLite-parity push
 
@@ -7176,7 +7289,9 @@ ADR 0002 draws, so it is a leaf, as the unit's brief directs. Census
   expression column cid -2 and no name (an INTEGER PRIMARY KEY column
   keeps its cid, as on the pin); `index_list`'s `partial`;
   integrity_check computes each row's entry and, for a partial index,
-  compares its entry count with the admitted rows (the pin's counter);
+  compares its entry count with the admitted rows (the pin's counter)
+  (corrected in v0.17: the pin keeps no such count; the tail is
+  removed, `tests/integrity_v17.rs`);
   VACUUM copies the indexes byte for byte; ANALYZE writes their stats.
 - **Files the pin made** with such indexes are read and written; the
   pin's integrity_check passes on every file hipp wrote in the suites.

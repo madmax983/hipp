@@ -2402,14 +2402,6 @@ impl<S: Storage> Statement<'_, S> {
         let mut buf = AVec::new();
         // The pin's messages name a row by its scan ordinal.
         let mut nrow: i64 = 0;
-        // Rows each index should hold (a partial index's count is
-        // checked against these, after the rows).
-        #[cfg(feature = "indexes")]
-        let mut in_index: AVec<u64> = AVec::new();
-        #[cfg(feature = "indexes")]
-        for _ in rc.indexes.iter() {
-            in_index.push(0);
-        }
         while let Some(rowid) = cursor.next_row_into(&mut self.conn.pager, &mut buf).await? {
             if out.stop {
                 return Ok(());
@@ -2419,7 +2411,7 @@ impl<S: Storage> Statement<'_, S> {
                 return Ok(());
             };
             #[cfg(feature = "indexes")]
-            for (j, (ix, iname)) in rc.indexes.iter().zip(rc.inames.iter()).enumerate() {
+            for (ix, iname) in rc.indexes.iter().zip(rc.inames.iter()) {
                 // v0.16 (`expr_index`): an expression index's key is
                 // computed; a row a partial index's WHERE rejects
                 // has no entry to find.
@@ -2434,9 +2426,6 @@ impl<S: Storage> Statement<'_, S> {
                 else {
                     continue;
                 };
-                if let Some(n) = in_index.as_mut_slice().get_mut(j) {
-                    *n += 1;
-                }
                 let unique = ix.unique && key_has_no_null(key.as_slice());
                 let (found, dup) = btree::index_check_entry(
                     &mut self.conn.pager,
@@ -2454,30 +2443,11 @@ impl<S: Storage> Statement<'_, S> {
             #[cfg(not(feature = "indexes"))]
             let _ = rec;
         }
-        #[cfg(feature = "expr_index")]
-        let (indexes, inames) = (&rc.indexes, &rc.inames);
+        // A partial index is not counted: the pin reports neither
+        // an extra nor a missing total for one, only each admitted
+        // row's missing entry (v0.17 review fix: a "wrong # of
+        // entries" tail here had no counterpart on the pin).
         let _ = nrow;
-        // A partial index's entry count against the rows its WHERE
-        // admits (v0.16, `expr_index`: the pin's per-index counter,
-        // compared after the row loop).
-        #[cfg(feature = "expr_index")]
-        for ((ix, iname), want) in indexes.iter().zip(inames.iter()).zip(in_index.iter()) {
-            if ix.ext.as_ref().is_none_or(|x| x.pred.is_none()) {
-                continue;
-            }
-            let mut cur = btree::IndexCursor::new(ix.root, ix.desc.as_slice());
-            let mut have = 0u64;
-            while cur.next_entry(&mut self.conn.pager).await?.is_some() {
-                have += 1;
-            }
-            if have != *want {
-                let mut m = copy_vec(b"wrong # of entries in index ");
-                m.extend_from_slice(iname.as_slice());
-                if !out.emit(m) {
-                    return Ok(());
-                }
-            }
-        }
         Ok(())
     }
 
@@ -2512,20 +2482,24 @@ impl<S: Storage> Statement<'_, S> {
             } else {
                 None
             });
-            cols.push(copy_vec(handle_bytes(ca, c.name)));
+            // Each finding's tail, ` value in <table>.<column>`.
+            let mut m = copy_vec(b" value in ");
+            m.extend_from_slice(tname);
+            m.push(b'.');
+            m.extend_from_slice(handle_bytes(ca, c.name));
+            cols.push(m);
         }
         let rules = self.conn.table_rules(&self.arena, t)?;
+        // Plans and names both in the pin's `pIndex` order (newest
+        // first: `write_index_plans` and `table_indexes` each reverse
+        // the catalog's), zipped position by position below (v0.17
+        // review fix: a second reverse here paired each plan with
+        // another index's name).
         #[cfg(feature = "indexes")]
         let indexes = if quick {
             AVec::new()
         } else {
-            let mut v = self.conn.write_index_plans(&scratch(), tname)?;
-            // The pin's `pIndex` order: newest first.
-            let mut r = AVec::new();
-            while let Some(x) = v.pop() {
-                r.push(x);
-            }
-            r
+            self.conn.write_index_plans(&scratch(), tname)?
         };
         #[cfg(feature = "indexes")]
         let inames: AVec<AVec<u8>> = {
@@ -2626,29 +2600,33 @@ impl<S: Storage> Statement<'_, S> {
         let rd = crate::rules::eval_row(rc.alias, rc.affs.as_slice(), rec.as_slice(), rowid);
         for (i, v) in rd.vals.iter().enumerate() {
             let col = rc.cols.as_slice().get(i).map_or(&[][..], |c| c.as_slice());
-            if matches!(v, OwnedValue::Null) && rc.nn.as_slice().get(i) == Some(&true) {
-                let mut s = copy_vec(b"NULL value in ");
-                s.extend_from_slice(tname);
-                s.push(b'.');
-                s.extend_from_slice(col);
-                if !out.emit(s) {
-                    return Ok(None);
-                }
-            }
-            if let Some(Some(ty)) = rc.strict.as_slice().get(i)
-                && Some(i) != rc.alias
-                && let Some(st) = crate::rules::StrictType::of(ty)
-                && !st.admits(v)
+            if matches!(v, OwnedValue::Null)
+                && rc.nn.as_slice().get(i) == Some(&true)
+                && !out.emit(col_finding(b"", b"NULL", col))
             {
-                let mut s = copy_vec(b"non-");
-                s.extend_from_slice(ty);
-                s.extend_from_slice(b" value in ");
-                s.extend_from_slice(tname);
-                s.push(b'.');
-                s.extend_from_slice(col);
-                if !out.emit(s) {
-                    return Ok(None);
+                return Ok(None);
+            }
+            if Some(i) == rc.alias {
+                continue;
+            }
+            // A STRICT column's type; any other column's stored type
+            // against its affinity (the pin's checks 4 and 5: no
+            // number in a TEXT column, no text a NUMERIC conversion
+            // takes in a numeric one; v0.17 review fix, hipp said
+            // "ok"). A STRICT table's ANY column has no affinity.
+            let bad = if let Some(Some(ty)) = rc.strict.as_slice().get(i) {
+                match crate::rules::StrictType::of(ty) {
+                    Some(st) if !st.admits(v) => Some((&b"non-"[..], *ty)),
+                    _ => None,
                 }
+            } else {
+                let aff = rc.affs.as_slice().get(i).copied();
+                aff_mismatch(aff.unwrap_or(Affinity::Blob), v).map(|k| (&b""[..], k))
+            };
+            if let Some((pre, kind)) = bad
+                && !out.emit(col_finding(pre, kind, col))
+            {
+                return Ok(None);
             }
         }
         if let Some(r) = &rc.rules {
@@ -2681,6 +2659,7 @@ struct RowCheck {
     affs: AVec<Affinity>,
     nn: AVec<bool>,
     strict: AVec<Option<&'static [u8]>>,
+    /// Each column's finding tail, ` value in <table>.<column>`.
     cols: AVec<AVec<u8>>,
     rules: Option<Box<crate::rules::TableRules>>,
     #[cfg(feature = "indexes")]
@@ -2696,16 +2675,46 @@ impl RowCheck {
     /// Nothing to check row by row: the pin then reads only each
     /// record's header, so hipp reads only the cells' local bytes
     /// (a damaged overflow chain is the page check's finding alone).
+    /// Otherwise hipp reads whole rows, overflow chains included,
+    /// where the pin's NOT NULL, STRICT and affinity checks read
+    /// only the header (a known gap: a damaged chain there fails
+    /// hipp's check after the page check's findings).
     fn trivial(&self) -> bool {
         #[cfg(feature = "indexes")]
         let no_index = self.indexes.is_empty();
         #[cfg(not(feature = "indexes"))]
         let no_index = true;
+        // A typed column is checked against its affinity (v0.17).
         no_index
             && !self.nn.iter().any(|b| *b)
+            && self.affs.iter().all(|a| *a == Affinity::Blob)
             && self.strict.iter().all(|s| s.is_none())
             && self.rules.as_ref().is_none_or(|r| r.checks.is_empty())
     }
+}
+
+/// A non-STRICT column's stored value against its affinity: the
+/// pin's `NUMERIC` (a number in a TEXT column) or `TEXT` (text a
+/// NUMERIC conversion takes, in a numeric column) finding.
+#[inline(never)]
+fn aff_mismatch(aff: Affinity, v: &OwnedValue) -> Option<&'static [u8]> {
+    match (aff, v) {
+        (Affinity::Text, OwnedValue::Integer(_) | OwnedValue::Real(_)) => Some(b"NUMERIC"),
+        (Affinity::Text | Affinity::Blob, _) => None,
+        (_, OwnedValue::Text(t)) => {
+            crate::record::text_to_number(t.as_slice()).map(|_| &b"TEXT"[..])
+        }
+        _ => None,
+    }
+}
+
+/// A column finding: `<pre><kind>` and the column's `tail`
+/// (` value in <table>.<column>`).
+fn col_finding(pre: &[u8], kind: &[u8], tail: &[u8]) -> AVec<u8> {
+    let mut s = copy_vec(pre);
+    s.extend_from_slice(kind);
+    s.extend_from_slice(tail);
+    s
 }
 
 /// Report one index probe's finding; false once the error budget

@@ -21,9 +21,20 @@ All notable changes to hipp. Versions follow the milestones in
   larger in any profile (vacuum, integrity's preamble, stat_decode,
   dbstat, fk_actions, eval_group_sub, and others) were reverted. No
   observable change.
+- Review fixes in the integrity check (ungated, `tests/integrity_v17.rs`
+  live against the pin): "row N missing from index X" names the broken
+  index (the plans were reversed twice, so a table with two or more
+  indexes named another one, and a WITHOUT ROWID table's broken index
+  came out as its `sqlite_autoindex`); a partial index gets no "wrong #
+  of entries" line (the pin keeps no such count); a non-STRICT column's
+  stored type is checked against its affinity, as the pin does ("NUMERIC
+  value in t.c" for a number in a TEXT column, "TEXT value in t.c" for
+  convertible text in a numeric one; hipp said `ok`). With them the unit
+  ends at full 476,476 B, max 962,292 B, xl 1,058,808 B (tiny 76,124 B);
+  ratchets lowered again.
 - ADR 0005 (`docs/adr/0005-code-size-sync-core-and-vm.md`) is accepted
-  for Stage 1 with its measured results: tiny −836 B, full −31,076 B,
-  max −68,364 B, xl −82,912 B over the three size units; Stages 2–4
+  for Stage 1 with its measured results: tiny −836 B, full −31,116 B,
+  max −68,780 B, xl −83,320 B over the three size units; Stages 2–4
   (the VM) stay proposed.
 
 ### Size: monomorphic glue

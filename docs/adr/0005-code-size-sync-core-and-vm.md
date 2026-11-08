@@ -125,16 +125,18 @@ the `8d78815` baseline above):
 | profile | stage start | 1.1 shared sort | 1.2 + 1.4 mono / glue | 1.3 sync islands | after | Δ |
 |---|---:|---:|---:|---:|---:|---:|
 | `tiny` | 76,960 | 0 | −700 | −136 | **76,124** | −836 |
-| `full` | 507,592 | −26,352 | −4,060 | −664 | **476,516** | −31,076 |
-| `max` | 1,031,072 | −62,688 | −4,068 | −1,608 | **962,708** | −68,364 |
-| `xl` | 1,142,128 | −76,948 | −4,564 | −1,400 | **1,059,216** | −82,912 |
+| `full` | 507,592 | −26,352 | −4,060 | −704 | **476,476** | −31,116 |
+| `max` | 1,031,072 | −62,688 | −4,068 | −2,024 | **962,292** | −68,780 |
+| `xl` | 1,142,128 | −76,948 | −4,564 | −1,808 | **1,058,808** | −83,320 |
 
-Headroom after Stage 1: tiny 54,948 B, full 47,772 B, max 85,868 B,
-xl 251,504 B. Engine statics stay 0 B. Futures' drop glue fell in
-every profile (max 29,906 → 29,842 B). Rows, errors, file bytes and
+Headroom after Stage 1: tiny 54,948 B, full 47,812 B, max 86,284 B,
+xl 251,912 B. Engine statics stay 0 B. Futures' drop glue fell in
+every profile (max 29,906 → 29,830 B). Rows, errors, file bytes and
 EXPLAIN QUERY PLAN output are unchanged against the pin, except one
 deliberate parity fix found by the comparator audit (an fts5 NaN rank
-now sorts as the pin's NULL).
+now sorts as the pin's NULL) and three integrity-check parity fixes
+found in the sync-islands review (column 1.3 includes them: they
+removed more code than they added).
 
 What the measurements taught, for Stages 2-4:
 
@@ -364,7 +366,7 @@ derived from the plan).
 |---|---:|---:|---:|---:|
 | baseline (measured) | 76,960 | 506,672 | 1,046,892 | 1,114,356 |
 | S1 Tier A | −0.8…−1.9 K → **~75.7 K** | −26…−34 K → **~476.7 K** | −78…−90 K → **~962.9 K** | −90…−103 K → **~1,018 K** |
-| S1 Tier A (**measured**, from the stage start) | −0.8 K → **76,124** | −31.1 K → **476,516** | −68.4 K → **962,708** | −82.9 K → **1,059,216** |
+| S1 Tier A (**measured**, from the stage start) | −0.8 K → **76,124** | −31.1 K → **476,476** | −68.8 K → **962,292** | −83.3 K → **1,058,808** |
 | S2 VM + read path | 0…−3 K → **~74.2 K** | −12…−30 K → **~454.7 K** | −30…−55 K → **~920.9 K** | −32…−58 K → **~973.4 K** |
 | S3 writes / triggers / FK | 0 → **~74.2 K** | −8…−18 K → **~441.7 K** | −20…−40 K → **~890.9 K** | −20…−40 K → **~943.4 K** |
 | S4 (optional) sync writes + DDL / PRAGMA | −1…−2.5 K → **~72.5 K** | −10…−20 K → **~426.7 K** | −20…−35 K → **~863.9 K** | −20…−35 K → **~916.4 K** |
