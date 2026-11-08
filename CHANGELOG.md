@@ -43,7 +43,10 @@ All notable changes to hipp. Versions follow the milestones in
   order (`tests/size_v17.rs`).
 - Fix (ungated): the fts5 rank sorter treated a NaN bm25 score as equal
   to every score; it now sorts as the pin's NULL (first ascending, last
-  descending, ties in rowid order).
+  descending, ties in rowid order). The old comparator was not an
+  order: with finite ranks among NaN ones it also returned the finite
+  ranks out of order, so no total order could keep 0.16's output; this
+  is a deliberate, pin-matching change in an otherwise pure refactor.
 
 ### Size: one copy of the expression evaluator
 

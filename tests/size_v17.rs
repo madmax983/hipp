@@ -214,6 +214,44 @@ fn fts5_nan_rank_sorts_as_null_like_the_pin() {
     );
 }
 
+/// Finite ranks interleaved with NaN ranks (column 0 weighted 10^308,
+/// column 1 weighted 1): rows 1, 3, 5, 7 have finite, distinct ranks;
+/// rows 2, 4, 6 have NaN ones.
+fn nan_mixed_setup() -> String {
+    let mut s = String::from("CREATE VIRTUAL TABLE ft USING fts5(x, y);");
+    s.push_str(&format!(
+        "INSERT INTO ft(ft, rank) VALUES('rank', 'bm25({}, 1.0)');",
+        big_weight()
+    ));
+    s.push_str(
+        "INSERT INTO ft VALUES('b', 'a a a b'), ('a a', 'b'), ('c', 'a'), \
+         ('a a b', 'c'), ('d', 'a b'), ('a a', 'x'), ('e', 'a a');",
+    );
+    s
+}
+
+#[test]
+fn fts5_nan_rank_keeps_finite_ranks_sorted() {
+    // Regression (v0.17 size pass): with NaN "equal to everything" the
+    // old comparator was not an order at all, and ORDER BY rank left
+    // even the FINITE ranks out of order: 0.16 / e091bae returned
+    // rowids 1,2,3,4,5,6,7 (rank of row 7 < rank of row 5, yet 7 came
+    // last). No placement of NaN reproduces that output with a total
+    // order; the pin gives 2,4,6,1,7,3,5 (NaN as NULL first, then the
+    // finite ranks ascending), and so does hipp now.
+    same(
+        "nanmixed",
+        &nan_mixed_setup(),
+        &[
+            "SELECT rowid, rank FROM ft WHERE ft MATCH 'a' ORDER BY rank",
+            "SELECT rowid, rank FROM ft WHERE ft MATCH 'a' ORDER BY rank DESC",
+            "SELECT rowid FROM ft WHERE ft MATCH 'a' ORDER BY rank LIMIT 4",
+            "SELECT group_concat(rowid) FROM (SELECT rowid FROM ft WHERE ft MATCH 'a' ORDER BY rank)",
+            "SELECT rowid, rank IS NULL FROM ft WHERE ft MATCH 'b OR a' ORDER BY rank",
+        ],
+    );
+}
+
 #[test]
 fn fts5_finite_rank_order_unchanged() {
     let mut r = Rng(0xF75);

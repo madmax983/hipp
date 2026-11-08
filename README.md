@@ -174,8 +174,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   tiny unchanged, rows and tie order unchanged against the pin. Fixed
   on the way, ungated: an fts5 `ORDER BY rank` whose bm25 score is NaN
   (an infinite rank weight) sorts those rows as the pin's NULL —
-  first ascending, last descending — instead of leaving them in rowid
-  order.
+  first ascending, last descending — instead of leaving them (and, in
+  a mixed corpus, the finite ranks around them) where the sort happened
+  to put them.
 - **Size pass: monomorphic glue** (no feature). Machinery Rust
   compiled once per type is compiled once: the expression evaluator's
   helpers, conditions and aggregate walks no longer have both an

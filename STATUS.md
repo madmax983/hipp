@@ -1627,6 +1627,28 @@ one: the fts5 rank sorter compared live bm25 scores with
 everything" and its rows stayed wherever the sort algorithm left them.
 That is a silent wrong answer on a claimed path, fixed ungated.
 
+*Scope deviation, for explicit acceptance.* The unit text asked that a
+comparator that does not map NaN be made total "in the same way the
+current output behaves", keeping today's order. That cannot be done
+here: the old comparator was not an order, and its output contradicts
+every total order. With finite ranks interleaved with NaN ones (column
+0 weighted 10^308, column 1 weighted 1; `tests/size_v17.rs`
+`fts5_nan_rank_keeps_finite_ranks_sorted`), 0.16 / e091bae returned
+rowids 1,2,3,4,5,6,7 for `ORDER BY rank`: the insertion pass stopped at
+each NaN, so row 7 (rank −1.409e−6) came after row 5 (−1.037e−6) —
+the FINITE ranks were out of order, and NaN would have to rank both
+above row 5 and below row 7. Any total order therefore changes some
+observable output; the unit took the one the pin uses (2,4,6,1,7,3,5:
+NaN as NULL first ascending, last descending), so the change is a
+parity fix, not a new divergence. In the single-column corpus the old
+output happened to be rowid order (the review's repro: 1,2,3,4,5 on
+e091bae, 2,4,1,3,5 now and on the pin). No other comparator changes
+observable order: the percentile sort's `<=` became
+`partial_cmp(..).unwrap_or(Equal)`, which differs only on NaN, and a
+NaN never reaches it from SQL (NaN-producing expressions, the math
+functions and JSON NaN are NULL, as on the pin); only the NaN-bits
+file gap below can feed one.
+
 **Oracle probing (3.54.1 pin).**
 
 - A NaN bm25 is reachable: the rank option takes no exponent, but
@@ -1649,8 +1671,10 @@ equal, reverse and sorted inputs at and around the cutoff and its
 multiples, descending comparators, owned non-`Copy` elements, index
 lists that are not `0..n`, a malformed permutation, an inconsistent
 comparator, and 400 rounds against a stable reference sort with a
-hand-rolled PRNG). `tests/size_v17.rs` (7 tests, differential vs the
-pin): the NaN rank regression, finite rank orders, ORDER BY / GROUP
+hand-rolled PRNG). `tests/size_v17.rs` (8 tests from this unit,
+differential vs the pin): the two NaN rank regressions (NaN rows
+placed as NULL; finite ranks among NaN ones in order), finite rank
+orders, ORDER BY / GROUP
 BY / compound / window / aggregate ORDER BY / percentile corpora, and
 sorted UPDATE / DELETE (rowid, WITHOUT ROWID, R*Tree, fts5) writes.
 `stream_v17`, `fts5_v16`, `fts5_delete_v17`, `json_v16`, `pragma_v16`,
