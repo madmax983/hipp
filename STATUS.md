@@ -1853,6 +1853,13 @@ full 478,436 → 477,180 (−1,256); max 965,388 → 964,316 (−1,072); xl
 - `serial_body_len::<()>` (28 B, full only) stays duplicated: the
   split that removes it grows tiny by 8 B.
 - `exec_recursive`'s once-per-execution plan copy stays (see (d)).
+- Found by the unit's review, not caused by it (base `fa2ae78` gives
+  the same bytes) and left open because a fix adds code to a
+  size-reduction unit: a window function beside an outer aggregate in
+  a scalar subquery, `SELECT g, sum(a) OVER (PARTITION BY g), (SELECT
+  max(t.a)) FROM t GROUP BY g`, returns rows (`1|3|3`, `2|4|4`) where
+  the pin fails at prepare time ("misuse of aggregate: max()").
+  Tracked for a v0.17 parity unit.
 
 **Gates** (each sub-edit's commit): `ci/local-gates.sh` (full run)
 passes; `depth_v16` and `triggers_v16` pass with debug info on (after

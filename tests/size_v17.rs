@@ -24,8 +24,10 @@
 //! Stage 1 unit 2 (`size-mono`) adds corpora at the end of the file
 //! for the machinery it compiles once instead of per type: the
 //! evaluator's helpers and conditions, the aggregate walks, the
-//! compound ORDER BY resolver, B-tree page splits, `AVec` growth and
-//! the per-execution plans.
+//! compound ORDER BY resolver and the shared per-execution plans. Its
+//! B-tree split-point checks are lib unit tests (`btree::split_tests`,
+//! next to the code they test), and its `AVec` growth sub-edit shipped
+//! nothing (measured and rejected, see STATUS.md), so it has no corpus.
 
 mod common;
 
