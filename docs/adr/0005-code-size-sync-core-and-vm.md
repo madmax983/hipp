@@ -289,24 +289,24 @@ that needs it, so `tiny` compiles about 25 opcodes and `full` about 95.
 | group | opcodes | gate |
 |---|---|---|
 | control | Init, Goto, Halt (p4: error), Eq / Ne (jump), IsNull / NotNull | always |
-| control+ | Lt / Le / Gt / Ge (p5 affinity + NULL rule, p4 collation), If / IfNot, Gosub / Return, IfPos / DecrJumpZero / OffsetLimit, Once, Compare / Jump | `v04` |
-| coroutines | InitCoroutine / Yield / EndCoroutine (FROM subqueries, views, CTEs), BeginSubrtn (scalar subqueries) | `v06` |
-| values | Integer, Int64, Real, String8, Blob, Null, Copy / SCopy / Move, Affinity, MustBeInt | always (Copy… `v04`) |
+| control+ | Lt / Le / Gt / Ge (p5 affinity + NULL rule, p4 collation), If / IfNot, Gosub / Return, IfPos / DecrJumpZero / OffsetLimit, Once, Compare / Jump | `query` |
+| coroutines | InitCoroutine / Yield / EndCoroutine (FROM subqueries, views, CTEs), BeginSubrtn (scalar subqueries) | `sql` |
+| values | Integer, Int64, Real, String8, Blob, Null, Copy / SCopy / Move, Affinity, MustBeInt | always (Copy… `query`) |
 | | Variable | `params` |
-| expressions | Add … Remainder, Concat, And / Or / Not, Cast, Function (p4: id into the existing function library) | `v04` (`math`, `datetime`, `json`, fts5 aux functions are ids, not opcodes) |
-| | BitAnd / BitOr / ShiftLeft / ShiftRight / BitNot, row-value Compare | `v16` |
+| expressions | Add … Remainder, Concat, And / Or / Not, Cast, Function (p4: id into the existing function library) | `query` (`math`, `datetime`, `json`, fts5 aux functions are ids, not opcodes) |
+| | BitAnd / BitOr / ShiftLeft / ShiftRight / BitNot, row-value Compare | `sql` |
 | tables | OpenRead, OpenWrite, Rewind, Next, Column, Rowid, SeekRowid / NotExists, MakeRecord, NewRowid, Insert†, CreateBtree†, Close | always |
-| | Last, Prev, NullRow (LEFT / RIGHT / FULL) | `v04` |
-| | Delete†, Destroy†, Clear† | `v05` |
+| | Last, Prev, NullRow (LEFT / RIGHT / FULL) | `query` |
+| | Delete†, Destroy†, Clear† | `write` |
 | indexes | SeekGE / GT / LE / LT, IdxGE / GT / LE / LT, IdxRowid, Found / NotFound / NoConflict, IdxInsert†, IdxDelete† | `indexes` |
-| sorting / temp | OpenEphemeral, SorterOpen / Insert / Sort / Data / Next, RowSetAdd / Test | `v04` (sets: `v06`; compounds `v09`; recursive CTE queue `v16`) |
-| aggregates | AggStep / AggFinal (p4: `AggKind`, driving `agg.rs`) | `v04` |
+| sorting / temp | OpenEphemeral, SorterOpen / Insert / Sort / Data / Next, RowSetAdd / Test | `query` (sets, compounds and the recursive CTE queue: `sql`) |
+| aggregates | AggStep / AggFinal (p4: `AggKind`, driving `agg.rs`) | `query` |
 | | AggInverse / AggValue + frame ops over `window.rs` | `window` |
 | subprograms | Program (trigger body, with OLD / NEW parameter registers and RAISE(IGNORE) target), Param, ResetCount | `triggers` |
 | | FkCounter / FkIfZero / FkCheck | `foreign_keys` |
 | virtual tables | VOpen, VFilter, VColumn, VNext, VRowid, VUpdate (generate_series, dbstat, rtree, fts5, fts5vocab) | `vtab` (+ `json` for the json_each / json_tree cursor kind) |
 | txn / schema | Transaction, AutoCommit (BEGIN / COMMIT / ROLLBACK), SetCookie, ParseSchema, Host (p4: legacy kind) | always |
-| | Savepoint | `v16` |
+| | Savepoint | `sql` |
 | | WITHOUT ROWID / UTF-16 / expression / partial index behaviour | flags on Open* and codegen; no new opcodes |
 
 † driver-awaited in Stages 2–3; sync under op-undo in Stage 4.

@@ -12,7 +12,7 @@
 //! neighbours, integers near 2^53 / 2^63, powers of ten,
 //! subnormals and halfway cases. `HIPP_REAL_CORPUS=<n>` scales the
 //! generated part (default 4000) for local soak runs.
-#![cfg(feature = "v04")]
+#![cfg(feature = "query")]
 // Values are spelled as the pin prints them (17 digits), on purpose.
 #![allow(clippy::excessive_precision)]
 

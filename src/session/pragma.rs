@@ -1,5 +1,5 @@
 //! PRAGMA statements and the pragma table-valued functions
-//! (v0.16, `v16`).
+//! (v0.16, `sql`).
 //!
 //! Grammar: `PRAGMA [main .] name [= value | (value)]`. The pin
 //! ignores a name it does not know; hipp does too. A name the pin

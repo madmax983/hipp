@@ -46,21 +46,21 @@
 //! WHERE term (the same expression, an OR containing it, or `x IS NOT
 //! NULL` after a comparison of x — `sqlite3ExprImpliesExpr`).
 //!
-//! With the `join_order` leaf (v0.17) a join of two or more sources
+//! With the `planner` leaf (v0.17) a join of two or more sources
 //! is planned as a whole by `crate::xjoin` (the pin's join order,
 //! automatic indexes, Bloom filters), from the candidate loops this
 //! module builds, and `sqlite_stat1` is read back: its row estimates
 //! replace the defaults (`IdxModel::est`, `Table::rows`).
 //!
-//! With the `multi_index` leaf (v0.17) `crate::xmulti` adds the
+//! With the `planner` leaf (v0.17) `crate::xmulti` adds the
 //! MULTI-INDEX OR loop, the min() / max() order, skip-scans (with
 //! `sqlite_stat1`), the IN operator's statistics rule and
 //! `whereLoopInsert` for one table's loops.
 //!
 //! What is not modelled (the order may then differ from the pin's,
-//! never the rows): without `join_order`, join reordering (sources run
+//! never the rows): without `planner`, join reordering (sources run
 //! in FROM order, each with its own best loop), automatic indexes and
-//! every `sqlite_stat1` estimate; without `multi_index`, the
+//! every `sqlite_stat1` estimate; without `planner`, the
 //! MULTI-INDEX OR plan and skip-scans; in every build the LIKE prefix
 //! optimisation and `sqlite_stat4`.
 
@@ -114,9 +114,9 @@ pub fn log_est_add(a: i32, b: i32) -> i32 {
     }
 }
 
-/// The pin's `sqlite3LogEstFromDouble` (v0.17, `join_order`: a
+/// The pin's `sqlite3LogEstFromDouble` (v0.17, `planner`: a
 /// virtual table's estimatedCost).
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub fn log_est_from_double(x: f64) -> i32 {
     if x.is_nan() || x <= 1.0 {
         return 0;
@@ -237,16 +237,16 @@ pub struct Term {
     /// scan skips NULL keys, the WHERE term still filters).
     pub vnull: bool,
     /// The pin's commuted copy of a comparison whose left operand is
-    /// a column too (`TERM_VIRTUAL`, v0.17 `join_order`): it sits
+    /// a column too (`TERM_VIRTUAL`, v0.17 `planner`): it sits
     /// after every original term in the WHERE clause's term list.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub virt: bool,
     /// The pin's `truthProb` (v0.17 review fix): 1 when none is given,
     /// else the LogEst of a likely() / unlikely() / likelihood()
     /// probability (<= 0), which replaces the default estimates.
     /// Virtual terms (commuted copies, BETWEEN halves, `x > NULL`,
     /// OR-to-IN) inherit their parent's (`markTermAsChild`).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub truth: i32,
 }
 
@@ -415,7 +415,7 @@ pub fn conjuncts<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     let mut stack: AVec<&'x RExpr> = AVec::new();
     stack.push(e);
     while let Some(x) = stack.pop() {
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let x = skip_collate_likely(x);
         match x {
             RExpr::Binary(BinOp::And, a, b) => {
@@ -433,7 +433,7 @@ pub fn conjuncts<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
 /// given") and whether a COLLATE or likely() wrapper was removed
 /// above it (the pin's constant propagation does not look inside
 /// one). v0.17 review fix.
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub fn conjuncts_meta(e: &RExpr, out: &mut AVec<(i32, bool)>) {
     let mut stack: AVec<(&RExpr, bool)> = AVec::new();
     stack.push((e, false));
@@ -452,7 +452,7 @@ pub fn conjuncts_meta(e: &RExpr, out: &mut AVec<(i32, bool)>) {
 
 /// The truth probability of WHERE term `e` as written (see
 /// `conjuncts_meta`).
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 fn truth_prob(e: &RExpr) -> i32 {
     if let RExpr::Scalar(crate::query::ScalarFn::Likely, a) = e
         && let Some(RExpr::Literal(crate::record::OwnedValue::Real(p))) = a.as_slice().get(1)
@@ -467,7 +467,7 @@ fn truth_prob(e: &RExpr) -> i32 {
 }
 
 /// The truth probabilities of `e`'s AND terms (`conjuncts_meta`).
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub fn conj_truth(e: &RExpr, out: &mut AVec<i32>) {
     let mut m: AVec<(i32, bool)> = AVec::new();
     conjuncts_meta(e, &mut m);
@@ -477,7 +477,7 @@ pub fn conj_truth(e: &RExpr, out: &mut AVec<i32>) {
 }
 
 /// Split a condition into its AND terms as written.
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 fn and_terms<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
     let mut stack: AVec<&'x RExpr> = AVec::new();
     stack.push(e);
@@ -551,12 +551,12 @@ fn add_terms(
     avail: &dyn Fn(&RExpr) -> Option<bool>,
     out: &mut AVec<Term>,
 ) {
-    #[cfg(not(feature = "join_order"))]
+    #[cfg(not(feature = "planner"))]
     let _ = tp;
     // `coll`: the comparison's collation as written (a commuted copy
     // keeps it: the pin's `EP_Commuted`; v0.17 fix).
     let cmp = |op: TOp, l: &RExpr, r: &RExpr, coll: Coll, out: &mut AVec<Term>, virt: bool| {
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         let _ = virt;
         let key = strip(l);
         if !s.reads(key) {
@@ -578,9 +578,9 @@ fn add_terms(
             lateral,
             isnull,
             vnull: false,
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             virt,
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             truth: tp,
         });
     };
@@ -606,9 +606,9 @@ fn add_terms(
             if or && let Some(t) = or_in(ci, c, tp, s, avail) {
                 out.push(t);
             }
-            // The pin's `whereCombineDisjuncts` (v0.17, `multi_index`):
+            // The pin's `whereCombineDisjuncts` (v0.17, `planner`):
             // `x < 5 OR x = 5` is also the virtual term `x <= 5`.
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             if or {
                 for x in crate::xmulti::combined(c).iter() {
                     let from = out.len();
@@ -647,9 +647,9 @@ fn add_terms(
                     lateral,
                     isnull: false,
                     vnull: false,
-                    #[cfg(feature = "join_order")]
+                    #[cfg(feature = "planner")]
                     virt: false,
-                    #[cfg(feature = "join_order")]
+                    #[cfg(feature = "planner")]
                     truth: tp,
                 });
                 return;
@@ -671,9 +671,9 @@ fn add_terms(
                 lateral,
                 isnull: false,
                 vnull: false,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 virt: false,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 truth: tp,
             });
         }
@@ -719,9 +719,9 @@ fn add_terms(
                 lateral,
                 isnull: false,
                 vnull: false,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 virt: false,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 truth: tp,
             });
         }
@@ -740,9 +740,9 @@ fn add_terms(
                 lateral: false,
                 isnull: true,
                 vnull: false,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 virt: false,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 truth: tp,
             });
         }
@@ -763,9 +763,9 @@ fn add_terms(
                 lateral: false,
                 isnull: false,
                 vnull: true,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 virt: true,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 truth: tp,
             });
         }
@@ -782,7 +782,7 @@ pub(crate) fn or_in(
     s: &Src,
     avail: &dyn Fn(&RExpr) -> Option<bool>,
 ) -> Option<Term> {
-    #[cfg(not(feature = "join_order"))]
+    #[cfg(not(feature = "planner"))]
     let _ = tp;
     let mut leaves: AVec<&RExpr> = AVec::new();
     let mut stack: AVec<&RExpr> = AVec::new();
@@ -851,9 +851,9 @@ pub(crate) fn or_in(
         lateral,
         isnull: false,
         vnull: false,
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         virt: true,
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         truth: tp,
     })
 }
@@ -892,10 +892,10 @@ pub struct IdxModel {
     /// not-indexed columns the pin computed before the key columns
     /// were appended).
     pub suffix_covers: bool,
-    /// `aiRowLogEst` from `sqlite_stat1` (v0.17, `join_order`): the
+    /// `aiRowLogEst` from `sqlite_stat1` (v0.17, `planner`): the
     /// index's rows, then the rows per distinct prefix of 1, 2, ...
     /// key columns; `None` for the pin's defaults.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub est: Option<AVec<i32>>,
     /// The SELECT reads the table's columns the index lacks only
     /// inside expressions the index holds (the pin's
@@ -903,25 +903,25 @@ pub struct IdxModel {
     /// counts as covering for the plan and EXPLAIN QUERY PLAN, while
     /// hipp still reads the table row for the expressions' values.
     pub xcover: bool,
-    /// The index has `sqlite_stat1` rows (v0.17, `multi_index`; the
+    /// The index has `sqlite_stat1` rows (v0.17, `planner`; the
     /// pin's `hasStat1`): `est` may hold defaults otherwise.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub stat1: bool,
     /// Its `sqlite_stat1` text says `unordered` (v0.17 review fix,
-    /// `multi_index`; the pin's `bUnordered`): no range constraint,
+    /// `planner`; the pin's `bUnordered`): no range constraint,
     /// no ORDER BY and no covering full scan through it.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub unordered: bool,
     /// ... or `noskipscan` (`noSkipScan`): no skip-scan.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub noskip: bool,
 }
 
-/// `m.unordered` (false without `multi_index`).
+/// `m.unordered` (false without `planner`).
 fn unordered(m: &IdxModel) -> bool {
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     return m.unordered;
-    #[cfg(not(feature = "multi_index"))]
+    #[cfg(not(feature = "planner"))]
     {
         let _ = m;
         false
@@ -934,7 +934,7 @@ impl IdxModel {
     /// aggregate query the pin reads such a result column or ORDER BY
     /// term from the table, so the index does not cover (probed:
     /// `SELECT a+1, max(a+1) FROM t` over an index on `a+1`).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub fn bare_expr(&self, e: &RExpr) -> bool {
         if self
             .keys
@@ -981,7 +981,7 @@ impl IdxModel {
     /// inside one of its key expressions (`whereIsCoveringIndex`'s
     /// walk; anything it does not look into counts when it reads the
     /// source).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub fn reads_uncovered(&self, e: &RExpr, s: &Src) -> bool {
         if self
             .keys
@@ -1092,9 +1092,9 @@ impl IdxModel {
 /// `sqlite3ExprImpliesExpr`).
 pub fn implies(conj: &[&RExpr], pred: &RExpr) -> bool {
     let mut parts = AVec::new();
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     and_terms(pred, &mut parts);
-    #[cfg(not(feature = "join_order"))]
+    #[cfg(not(feature = "planner"))]
     conjuncts(pred, &mut parts);
     parts.iter().all(|p| conj.iter().any(|c| implies1(c, p)))
 }
@@ -1223,15 +1223,15 @@ pub(crate) struct Loop {
     /// NULLs where the index does not put them (`Some(nulls_first)`);
     /// the loop moves the NULL-keyed rows to that end.
     pub(crate) bignull: Option<bool>,
-    /// A MULTI-INDEX OR loop (v0.17, `multi_index`; the pin's
+    /// A MULTI-INDEX OR loop (v0.17, `planner`; the pin's
     /// `WHERE_MULTI_OR`): the OR term's place in the source's list of
     /// OR terms (`xmulti::OrInfo`). Its other fields are empty.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub(crate) or: Option<usize>,
     /// The leading index columns a skip-scan steps over (v0.17,
-    /// `multi_index`; the pin's `nSkip`): each is an `eq` slot with
+    /// `planner`; the pin's `nSkip`): each is an `eq` slot with
     /// no term (`usize::MAX`).
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub(crate) skip: usize,
 }
 
@@ -1265,16 +1265,16 @@ pub struct Query<'x> {
     /// rows together is what EXPLAIN QUERY PLAN reports.
     #[cfg(feature = "explain")]
     pub dset: &'x [(RExpr, SortOrder)],
-    /// The join around the source (v0.17, `join_order`): which
+    /// The join around the source (v0.17, `planner`): which
     /// sources each conjunct and term reads, so a loop's nOut is
     /// adjusted only by the terms its prerequisites make
     /// computable (`whereLoopOutputAdjust`'s `notAllowed`).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub jm: Option<&'x JMask<'x>>,
 }
 
-/// `Query::jm` (v0.17, `join_order`).
-#[cfg(feature = "join_order")]
+/// `Query::jm` (v0.17, `planner`).
+#[cfg(feature = "planner")]
 pub struct JMask<'x> {
     /// Per `Query::conj` entry: the sources it reads.
     pub cmask: &'x [u64],
@@ -1304,18 +1304,18 @@ pub struct Table<'x> {
     /// offers no `x IS NULL` term to such a key column
     /// (`indexColumnNotNull`; v0.16 fix).
     pub notnull: &'x [bool],
-    /// `nRowLogEst` (v0.17, `join_order`): from `sqlite_stat1`, else
+    /// `nRowLogEst` (v0.17, `planner`): from `sqlite_stat1`, else
     /// the pin's default 200 (1,048,576 rows).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub rows: i32,
 }
 
 impl Table<'_> {
     /// The table's row estimate (`nRowLogEst`).
     pub(crate) fn nrow(&self) -> i32 {
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         return self.rows;
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         ROWS
     }
 }
@@ -1374,31 +1374,31 @@ pub struct IdxAccess {
     /// How many ORDER BY terms the loop's order delivers (v0.17: a
     /// lone source delivering them all streams its rows unsorted).
     pub sorted: usize,
-    /// An automatic index (v0.17, `join_order`): the rows are the
+    /// An automatic index (v0.17, `planner`): the rows are the
     /// table's, sorted on the index key once per statement and
     /// probed per combination of the sources before it.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub auto: Option<alloc::boxed::Box<AutoIdx>>,
-    /// The pin's Bloom filter on the lookups (v0.17, `join_order`):
+    /// The pin's Bloom filter on the lookups (v0.17, `planner`):
     /// the key each table row contributes, per equality column; a
     /// probe whose key is not in the filter skips the lookup.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub bloom: Option<AVec<BKey>>,
-    /// A MULTI-INDEX OR loop (v0.17, `multi_index`): the branches'
+    /// A MULTI-INDEX OR loop (v0.17, `planner`): the branches'
     /// own access paths, read in turn, each row once.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub or: Option<alloc::boxed::Box<crate::xmulti::OrAccess>>,
-    /// A skip-scan (v0.17, `multi_index`): the leading key columns
+    /// A skip-scan (v0.17, `planner`): the leading key columns
     /// whose every value is stepped over (`ANY(a)`) before `eq`.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub skip: usize,
-    /// The pin's min() / max() early-out (v0.17, `multi_index`): the
+    /// The pin's min() / max() early-out (v0.17, `planner`): the
     /// statement needs only the first row of this path, in its order,
     /// that passes this condition (the WHERE clause; a `TRUE` literal
     /// when it has none).
     /// `(condition, base, src)`: where the source's columns and rowid
     /// sit in the query row the condition reads.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub first: Option<alloc::boxed::Box<(RExpr, usize, usize)>>,
     /// What EXPLAIN QUERY PLAN says of the loop (v0.16, `explain`):
     /// how many ORDER BY (or GROUP BY / DISTINCT) terms it delivers,
@@ -1411,10 +1411,10 @@ pub struct IdxAccess {
     pub eqp: (usize, bool, bool, bool),
 }
 
-/// One key column of a Bloom filter (v0.17, `join_order`): a table
+/// One key column of a Bloom filter (v0.17, `planner`): a table
 /// column, the rowid, or an index expression (whose filter, never
 /// built, admits every probe).
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BKey {
     Col(usize),
@@ -1422,7 +1422,7 @@ pub enum BKey {
     Expr,
 }
 
-/// One key column of an automatic index (v0.17, `join_order`).
+/// One key column of an automatic index (v0.17, `planner`).
 #[derive(Debug, Clone)]
 pub struct AutoKey {
     /// The table column.
@@ -1436,7 +1436,7 @@ pub struct AutoKey {
     pub is: bool,
 }
 
-/// An automatic index (v0.17, `join_order`; the pin's
+/// An automatic index (v0.17, `planner`; the pin's
 /// `constructAutomaticIndex`): the key columns the usable equality
 /// terms constrain (in WHERE-clause order), then the other columns
 /// the statement reads (BINARY, in column order), then the rowid.
@@ -1509,7 +1509,7 @@ pub(crate) fn order_sat(
     }
     // A MULTI-INDEX OR loop delivers no order (the pin's
     // `wherePathSatisfiesOrderBy` meets no index; v0.17).
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     if l.or.is_some() {
         return (0, false, None);
     }
@@ -1705,9 +1705,9 @@ pub(crate) fn order_sat(
 fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: i32) -> i32 {
     let mut out = out;
     let mut reduce = 0;
-    // In a join (v0.17, `join_order`): only the terms the loop's
+    // In a join (v0.17, `planner`): only the terms the loop's
     // prerequisites and its own table make computable.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     let allowed = q.jm.map(|j| {
         let mut p = j.pre | j.me;
         for t in used.iter() {
@@ -1716,7 +1716,7 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
         p
     });
     for (ci, c) in q.conj.iter().enumerate() {
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         if let (Some(a), Some(j)) = (allowed, q.jm) {
             let m = j.cmask.get(ci).copied().unwrap_or(0);
             if m & j.me == 0 || m & !a != 0 {
@@ -1725,7 +1725,7 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
         } else if !s.reads(c) {
             continue;
         }
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         if !s.reads(c) {
             continue;
         }
@@ -1736,17 +1736,17 @@ fn adjust(q: &Query<'_>, s: &Src, ts: &[Term], used: &[usize], n_row: i32, out: 
             continue;
         }
         // A likelihood() probability replaces the heuristics.
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         if let Some(tp) = q.truth.get(ci).copied().filter(|t| *t <= 0) {
             out += tp;
             continue;
         }
         out -= 1;
-        // In a join (v0.17, `join_order`), heuristic 2 applies to any
+        // In a join (v0.17, `planner`), heuristic 2 applies to any
         // `x = expr` term whose `x` might be indexed (a column, or a
         // constant-propagated one), as the pin's `eOperator` says —
         // usable by an index here or not.
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         if q.jm.is_some() {
             if let RExpr::Binary(BinOp::Eq | BinOp::Is, l, r) = c {
                 let ind = |e: &RExpr| {
@@ -1807,7 +1807,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
 }
 
 /// The pin's `aiRowLogEst` of index `m` in a table of `rows`
-/// (LogEst): `sqlite_stat1`'s (v0.17, `join_order`), else
+/// (LogEst): `sqlite_stat1`'s (v0.17, `planner`), else
 /// `sqlite3DefaultRowEst` — the table (less half for a partial
 /// index), ten rows per value of the first column, then 9, 8, 7, 6
 /// (LogEst 33 32 30 28 26, then 23), one per key of a UNIQUE index;
@@ -1815,7 +1815,7 @@ pub fn choose(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> Option<Id
 pub(crate) fn row_est(m: &IdxModel, rows: i32) -> AVec<i32> {
     let nk = m.keys.len();
     let mut a: AVec<i32> = AVec::new();
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     if let Some(e) = &m.est {
         for k in 0..=nk {
             a.push(e.as_slice().get(k).copied().unwrap_or(0));
@@ -1865,9 +1865,9 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
             sorted: 0,
             reverse: false,
             bignull: None,
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             or: None,
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             skip: 0,
         });
         let a_rowid = [rows, 0];
@@ -1899,9 +1899,9 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
         {
             let mut run = rsize + 1 + (15 * m.width) / tab.width.max(1);
             if !covering {
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 let lookups = rsize + 16 + lookup_cut(q, s, m, tab.wr);
-                #[cfg(not(feature = "join_order"))]
+                #[cfg(not(feature = "planner"))]
                 let lookups = rsize + 16;
                 run = log_est_add(run, lookups);
             }
@@ -1915,9 +1915,9 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
                 sorted: 0,
                 reverse: false,
                 bignull: None,
-                #[cfg(feature = "multi_index")]
+                #[cfg(feature = "planner")]
                 or: None,
-                #[cfg(feature = "multi_index")]
+                #[cfg(feature = "planner")]
                 skip: 0,
             });
         }
@@ -1991,9 +1991,9 @@ pub(crate) fn best_access(
         }
     }
     let l = loops.get(best)?.clone();
-    // A MULTI-INDEX OR loop (v0.17, `multi_index`): its branches'
+    // A MULTI-INDEX OR loop (v0.17, `planner`): its branches'
     // paths are chosen by the caller (`xmulti::choose`).
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     if let Some(k) = l.or {
         let mut a = lower(s, tab, ts, &l, false);
         a.or = Some(alloc::boxed::Box::new(crate::xmulti::OrAccess::pending(k)));
@@ -2045,7 +2045,7 @@ pub(crate) fn best_access(
             limit: q.limit,
             distinct: q.distinct,
             dset: &[],
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             jm: None,
         };
         a.eqp.3 = order_sat(&d, s, tab, ts, &l, false).0 >= q.dset.len();
@@ -2079,9 +2079,9 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
         sorted: 0,
         reverse: false,
         bignull: None,
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         or: None,
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         skip: 0,
     };
     let (sat, rev, _) = order_sat(q, s, tab, ts, &l, false);
@@ -2097,7 +2097,7 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
         limit: q.limit,
         distinct: q.distinct,
         dset: &[],
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         jm: None,
     };
     let dis = !q.dset.is_empty() && order_sat(&d, s, tab, ts, &l, false).0 >= q.dset.len();
@@ -2199,7 +2199,7 @@ fn add_index(
     let rsize = a.first().copied().unwrap_or(ROWS);
     let rlog = est_log(rsize);
     let ipk = ix.is_none();
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     let from = loops.len();
     let ncol = match ix.and_then(|i| tab.indexes.get(i)) {
         Some(m) => m.keys.len() + 1,
@@ -2235,18 +2235,15 @@ fn add_index(
         }
         run
     };
-    // In a join (v0.17, `join_order`), where the loops pass through
-    // the pin's `whereLoopInsert` (`xjoin`), a deeper loop also pays
-    // the IN iterations of the columns before it (`rRun += nInMul`);
-    // alone, the IN is charged at its own level only, which is what
-    // `whereLoopAdjustCost` makes of it for one table.
-    // (v0.17, `multi_index`: one table's loops pass through
-    // `whereLoopInsert` too, so they pay it as the pin's do.)
-    #[cfg(all(feature = "join_order", not(feature = "multi_index")))]
-    let join_in = |m: i32| if q.jm.is_some() { m } else { 0 };
-    #[cfg(feature = "multi_index")]
+    // With the `planner` leaf every loop, a join's or one table's,
+    // passes through the pin's `whereLoopInsert` (`xjoin`), so a
+    // deeper loop also pays the IN iterations of the columns before
+    // it (`rRun += nInMul`); without it the IN is charged at its own
+    // level only, which is what `whereLoopAdjustCost` makes of it for
+    // one table.
+    #[cfg(feature = "planner")]
     let join_in = |m: i32| m;
-    #[cfg(not(feature = "join_order"))]
+    #[cfg(not(feature = "planner"))]
     let join_in = |_: i32| 0;
     // An explicit stack instead of recursion: (equality terms,
     // nInMul, nOut so far).
@@ -2278,12 +2275,12 @@ fn add_index(
                     TOp::InSub(_) => 46,
                     _ => 0,
                 };
-                // With `sqlite_stat1` rows (v0.17, `multi_index`): an IN
+                // With `sqlite_stat1` rows (v0.17, `planner`): an IN
                 // whose K values cost more than scanning the M rows the
                 // columns before it match (`M*log(K) < K*log(N)`, with a
                 // margin of 10 for the IN) is not probed, unless it can
                 // still seek-scan (the first IN of the loop).
-                #[cfg(feature = "multi_index")]
+                #[cfg(feature = "planner")]
                 if matches!(t.op, TOp::In(_) | TOp::InSub(_))
                     && ix.and_then(|i| tab.indexes.get(i)).is_some_and(|m| m.stat1)
                     && rlog >= 10
@@ -2330,9 +2327,9 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
-                    #[cfg(feature = "multi_index")]
+                    #[cfg(feature = "planner")]
                     or: None,
-                    #[cfg(feature = "multi_index")]
+                    #[cfg(feature = "planner")]
                     skip: 0,
                 });
                 deeper.push((used, in_mul + n_in, out));
@@ -2349,9 +2346,9 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
-                    #[cfg(feature = "multi_index")]
+                    #[cfg(feature = "planner")]
                     or: None,
-                    #[cfg(feature = "multi_index")]
+                    #[cfg(feature = "planner")]
                     skip: 0,
                 });
                 // ... and with each upper bound on the same column.
@@ -2371,9 +2368,9 @@ fn add_index(
                         sorted: 0,
                         reverse: false,
                         bignull: None,
-                        #[cfg(feature = "multi_index")]
+                        #[cfg(feature = "planner")]
                         or: None,
-                        #[cfg(feature = "multi_index")]
+                        #[cfg(feature = "planner")]
                         skip: 0,
                     });
                 }
@@ -2390,19 +2387,19 @@ fn add_index(
                     sorted: 0,
                     reverse: false,
                     bignull: None,
-                    #[cfg(feature = "multi_index")]
+                    #[cfg(feature = "planner")]
                     or: None,
-                    #[cfg(feature = "multi_index")]
+                    #[cfg(feature = "planner")]
                     skip: 0,
                 });
             }
         }
-        // A skip-scan (v0.17, `multi_index`; the end of the pin's
+        // A skip-scan (v0.17, `planner`; the end of the pin's
         // `whereLoopAddBtreeIndex`): no term for the leading columns
         // so far, and `sqlite_stat1` says each value of the next one
         // repeats at least 18 times (LogEst 42): step over its values,
         // `nIter` more lookups.
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         if let Some(m) = ix.and_then(|i| tab.indexes.get(i))
             && m.stat1
             && !m.noskip
@@ -2422,7 +2419,7 @@ fn add_index(
         }
     }
     // A skip-scan's loops: how many leading columns they step over.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     for l in loops.as_mut_slice().get_mut(from..).unwrap_or(&mut []) {
         l.skip = l.eq.iter().take_while(|t| **t == usize::MAX).count();
     }
@@ -2431,11 +2428,11 @@ fn add_index(
 /// The pin's `whereRangeScanEst` without statistics (`lo` / `hi`:
 /// whether that bound exists; a `TERM_VNULL` bound narrows nothing).
 /// A term's truth probability (`Term::truth`; 1, none, below
-/// `join_order`).
+/// `planner`).
 fn truth_of(t: &Term) -> i32 {
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     return t.truth;
-    #[cfg(not(feature = "join_order"))]
+    #[cfg(not(feature = "planner"))]
     {
         let _ = t;
         1
@@ -2460,13 +2457,13 @@ fn range_est(out: i32, lo: Option<&Term>, hi: Option<&Term>) -> i32 {
 }
 
 /// The pin's `nLookup` reduction for a non-covering full index scan
-/// (v0.17, `join_order`; `whereLoopAddBtree`): each WHERE clause term,
+/// (v0.17, `planner`; `whereLoopAddBtree`): each WHERE clause term,
 /// in term-list order up to the first the index does not cover
 /// (`sqlite3ExprCoveredByIndex`: every column of this source it reads
 /// is in the index), saves one lookup, twenty for an `=` / `IS`; the
 /// commuted, BETWEEN, `IS NOT NULL` and OR-to-IN virtual terms follow
 /// the originals in the list.
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 fn lookup_cut(q: &Query<'_>, s: &Src, m: &IdxModel, wr: bool) -> i32 {
     use crate::query::{RefRange, expr_refs_range};
     let held = |c: usize| {
@@ -2528,11 +2525,11 @@ fn lookup_cut(q: &Query<'_>, s: &Src, m: &IdxModel, wr: bool) -> i32 {
 }
 
 /// The leading index columns loop `l` skip-scans (0 below
-/// `multi_index`).
+/// `planner`).
 pub(crate) fn skip_of(l: &Loop) -> usize {
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     return l.skip;
-    #[cfg(not(feature = "multi_index"))]
+    #[cfg(not(feature = "planner"))]
     {
         let _ = l;
         0
@@ -2599,15 +2596,15 @@ pub(crate) fn lower(s: &Src, tab: &Table<'_>, ts: &[Term], l: &Loop, reverse: bo
         cover: None,
         bignull: None,
         sorted: l.sorted,
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         auto: None,
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         bloom: None,
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         or: None,
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         skip: l.skip,
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         first: None,
         #[cfg(feature = "explain")]
         eqp: (

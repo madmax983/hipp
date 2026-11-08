@@ -1,4 +1,4 @@
-//! The pin's other index strategies (v0.17, `multi_index`).
+//! The pin's other index strategies (v0.17, `planner`).
 //!
 //! `xplan` chooses one loop per source from its index and rowid
 //! loops; `xjoin` orders a join's sources. This module adds the loop
@@ -621,7 +621,7 @@ pub(crate) fn pushed(c: &RExpr, key: &dyn Fn(&RExpr) -> bool) -> bool {
 }
 
 /// Choose a single table's access path with the pin's loop list
-/// (v0.17, `multi_index`; `xplan::choose` with `whereLoopInsert` and
+/// (v0.17, `planner`; `xplan::choose` with `whereLoopInsert` and
 /// MULTI-INDEX OR loops). `ors` are the source's OR terms
 /// (`or_infos`); `lateral` says loops reading an earlier source have
 /// prerequisites (a FROM-order join), `avail` is `xplan::terms`'.

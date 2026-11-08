@@ -5,6 +5,52 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Breaking: feature renames
+
+Cargo features are named for what they enable, not for the milestone
+that added them (ADR 0006, `docs/adr/0006-features-name-capabilities.md`).
+The profiles keep their names and contents: builds that use `default`,
+`full`, `max` or `xl` are unaffected; builds that enable an old name
+directly must switch to the new one (Cargo refuses the old names).
+
+| old feature | new feature | enables |
+|---|---|---|
+| `v04` | `query` | joins, aggregates + GROUP BY, the expression evaluator, CHECK / DEFAULT / generated columns / STRICT, ALTER TABLE ADD COLUMN, inert views |
+| `v05` | `write` | UPDATE, DELETE, DROP TABLE (implies `query`) |
+| `v06`, `v07`, `v08`, `v09`, `v10`, `v16` | `sql` | subqueries; conflict clauses, UPDATE FROM, RETURNING, upsert; INSERT ... SELECT; compounds and derived tables; subqueries in aggregate arguments; the v0.16 core-dialect completion (implies `write`) |
+| `join_order`, `multi_index`, `flatten` | `planner` | the pin's join planner, index strategies and query flattener (in `xl`; implies `sql`, `expr_index`) |
+
+- `indexes`, `params`, `math`, `std` and every other leaf keep their
+  names; every leaf that required `v16` requires `sql`.
+- `cfg` predicates were rewritten under the new names and simplified
+  (`any(feature = "v05", feature = "indexes")` -> `any(feature =
+  "write", feature = "indexes")`, `all(feature = "v07", feature =
+  "foreign_keys")` -> `feature = "foreign_keys"`, ...). Code no
+  surviving feature combination compiles was deleted: the IN-cost
+  rule for `join_order` without `multi_index` (`xplan`), the empty
+  compound merge key for `expr_index` without `v09` and the
+  derived-source fallback for `v09` without `v16` (`session`), a
+  `v06` subquery check inside the `not(v16)` executor, a `not(v16)`
+  derived-table read inside a `v09` block, the pre-`flatten` /
+  pre-`multi_index` fallbacks inside the planner modules (`xjoin`,
+  `session::join`), a `not(v07)` RETURNING fallback inside the `v16`
+  INSERT ... DEFAULT VALUES, a NOT NULL argument
+  and two assertions of the tiny profile's code that a `v07` gate kept
+  out of every build; attributes that repeat the gate of the block
+  they sit in were dropped.
+- `ci/feature-sets.txt`: `query`, `write`, `sql`, `indexes,query`,
+  `indexes,write`, `query,math`, `sql,<leaf>` for each leaf and one
+  `sql,indexes,expr_index,planner` line.
+- No behaviour change and no code change: the tree links to the same
+  sections as a purely mechanical rename of the previous tree (`.text`
+  and `.rodata` byte-identical for `query`, `write`, `max`, `xl`).
+  tiny 76,124 B and full 476,476 B are unchanged; max 962,300 B (+8)
+  and xl 1,058,824 B (+16) differ by inter-function alignment padding
+  only (every symbol's size is unchanged), because a feature's name
+  enters the crate's metadata hash, hence every mangled symbol and
+  rustc's item order; the `[max]` / `[xl]` ratchets take those
+  values. Sizes per feature set in STATUS.md.
+
 ### Size: sync islands out of async bodies
 
 - Mostly-sync async bodies keep only their I/O; the code between the

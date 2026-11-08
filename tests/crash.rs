@@ -385,7 +385,7 @@ async fn run_all<S: Storage>(db: &mut Connection<S>, sqls: &[String]) {
 
 /// A recursive-CTE row source of `n` rows numbered from `from`
 /// with `width`-byte texts.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn rows_sql(table: &str, from: i64, n: i64, width: usize) -> String {
     format!(
         "INSERT INTO {table} WITH RECURSIVE c(i) AS (SELECT {from} UNION ALL \
@@ -481,7 +481,7 @@ fn strs(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|s| s.to_string()).collect()
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn v16_crash_savepoint_transaction() {
     let setup = strs(&[
@@ -519,7 +519,7 @@ fn v16_crash_savepoint_transaction() {
 /// Spills under a small cache, with pages the transaction
 /// allocated changed again after their spill, inside savepoints
 /// rolled back to across the spills.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn v16_crash_spill_rechange_and_savepoints() {
     let cfg = Config::default().cache_pages(4);
@@ -541,7 +541,7 @@ fn v16_crash_spill_rechange_and_savepoints() {
 }
 
 /// Pages freed and reused in one transaction.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn v16_crash_freelist_reuse() {
     let setup = vec![
@@ -557,7 +557,7 @@ fn v16_crash_freelist_reuse() {
     crash_matrix("freelist", Config::default(), &setup, &txn);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn v16_crash_vacuum() {
     let setup = vec![
@@ -578,7 +578,7 @@ fn v16_crash_vacuum() {
 /// of pages the transaction had already changed live past the
 /// largest rollback journal it can write, behind a zero record, so
 /// real SQLite's recovery stops before them at every kill point.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn v16_cross_tool_real_sqlite_recovers_savepoint_journal() {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hipp-crash-sp");

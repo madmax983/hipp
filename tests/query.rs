@@ -404,8 +404,8 @@ fn views_inert_both_directions() {
             )
             .await
             .unwrap();
-            if cfg!(feature = "v16") {
-                // v0.16 (`v16`): views execute, and CREATE VIEW
+            if cfg!(feature = "sql") {
+                // v0.16 (`sql`): views execute, and CREATE VIEW
                 // resolves nothing (as on the pin; tests/
                 // views_cte_v16.rs covers both).
                 assert_eq!(
@@ -481,7 +481,7 @@ fn views_inert_both_directions() {
         let views = db.views();
         assert_eq!(views.len(), 1);
         assert_eq!(views.as_slice()[0].columns.as_slice()[0], b"c");
-        if cfg!(feature = "v16") {
+        if cfg!(feature = "sql") {
             assert_eq!(collect(&mut db, "SELECT * FROM ov").await, vec!["2|x"]);
         } else {
             let r = db.prepare("SELECT * FROM ov").await;

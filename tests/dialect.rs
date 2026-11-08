@@ -470,7 +470,7 @@ fn txn_statement_error_aborts_statement_or_bracket() {
             exec(&mut db, "INSERT INTO t VALUES (2, 'two')")
                 .await
                 .unwrap();
-            // Duplicate rowid. Without `v16` the error aborts the
+            // Duplicate rowid. Without `sql` the error aborts the
             // whole bracket (v0.2's documented, stricter-than-SQLite
             // rule); with it (v0.16 statement savepoints) only the
             // statement is undone and the bracket stays open, as on
@@ -485,7 +485,7 @@ fn txn_statement_error_aborts_statement_or_bracket() {
                 ),
                 "dup: {e:?}"
             );
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             {
                 assert!(db.in_explicit_transaction(), "bracket kept");
                 let rows = collect(&mut db, "SELECT id FROM t").await;

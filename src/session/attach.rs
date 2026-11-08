@@ -1286,7 +1286,7 @@ impl<S: Storage> Connection<S> {
             hint: crate::query::Hint::Any,
             temp: true,
             ext: u16::try_from(k + 1).unwrap_or(u16::MAX),
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             exists: false,
         });
         Ok(e.cols.len())

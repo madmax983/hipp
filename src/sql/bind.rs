@@ -101,19 +101,19 @@ impl Binder<'_> {
                 }
                 b.items::<E>(returning.as_mut_slice())?;
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::CreateTable {
                 as_select: Some(s), ..
             } => b.select::<E>(s)?,
             // `WITH ... INSERT / UPDATE / DELETE` (v0.16): the CTE
             // bodies, then the statement.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::With { with, body } => {
                 b.with::<E>(with)?;
                 b.ast::<E>(body)?;
             }
             // `VACUUM INTO ?` (v0.16).
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::Vacuum { into: Some(e), .. } => b.expr::<E>(e)?,
             // `ATTACH ? AS ? [KEY ?]` / `DETACH ?` (v0.16, `attach`).
             #[cfg(feature = "attach")]
@@ -134,8 +134,8 @@ impl Binder<'_> {
         Ok(())
     }
 
-    /// A WITH clause's CTE bodies (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// A WITH clause's CTE bodies (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     fn with<E>(&self, w: &mut super::ast::With) -> Result<(), E> {
         for c in w.ctes.as_mut_slice() {
             self.select::<E>(&mut c.select)?;
@@ -170,7 +170,7 @@ impl Binder<'_> {
                 *e = Expr::Literal(self.literal::<E>(*idx)?);
             }
             Expr::Literal(_) | Expr::Column { .. } => {}
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Expr::HexTooBig(_) => {}
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             Expr::TrigValue(..) => {}
@@ -185,9 +185,9 @@ impl Binder<'_> {
             Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
                 self.expr::<E>(a)?
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => self.expr::<E>(a)?,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Expr::Vector(l) => {
                 for x in l.as_mut_slice() {
                     self.expr::<E>(x)?;
@@ -227,14 +227,14 @@ impl Binder<'_> {
             }
             Expr::Func {
                 args,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 clause,
                 ..
             } => {
                 for x in args.as_mut_slice() {
                     self.expr::<E>(x)?;
                 }
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if let Some(c) = clause {
                     for (x, _) in c.order_by.as_mut_slice() {
                         self.expr::<E>(x)?;
@@ -277,9 +277,9 @@ impl Binder<'_> {
     /// COLLATE) becomes `ordinal` when given, else `+value` — a
     /// constant the term rules never read as an ordinal.
     fn term<E>(&self, e: &mut Expr, ordinal: Option<i64>) -> Result<(), E> {
-        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
         let mut core = &mut *e;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         while let Expr::Collate(inner, _) = core {
             core = inner;
         }
@@ -294,7 +294,7 @@ impl Binder<'_> {
     }
 
     fn select<E>(&self, s: &mut SelectStmt) -> Result<(), E> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Some(w) = &mut s.with {
             self.with::<E>(w)?;
         }
@@ -360,9 +360,9 @@ impl Binder<'_> {
 
 /// The parameter a term is (under any COLLATE), if it is one.
 fn bare_param(e: &Expr) -> Option<(u16, ABytes)> {
-    #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
     let mut core = e;
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     while let Expr::Collate(inner, _) = core {
         core = inner;
     }
@@ -443,7 +443,7 @@ fn constant(e: &Expr) -> bool {
     match e {
         Expr::ScalarSubquery(_) | Expr::ExistsSubquery(_) | Expr::InSubquery(..) => false,
         Expr::Literal(_) | Expr::Column { .. } | Expr::Param(..) => true,
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         Expr::HexTooBig(_) => true,
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         Expr::TrigValue(..) => true,
@@ -455,9 +455,9 @@ fn constant(e: &Expr) -> bool {
         Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             constant(a)
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => constant(a),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Vector(l) => l.iter().all(constant),
         Expr::InList(a, l, _) => constant(a) && l.iter().all(constant),
         Expr::Between(a, b, c, _) => constant(a) && constant(b) && constant(c),
@@ -472,7 +472,7 @@ fn constant(e: &Expr) -> bool {
         }
         // An aggregate clause makes no call constant (it only
         // goes with aggregates, which are not).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Func {
             clause: Some(_), ..
         } => false,
@@ -488,9 +488,9 @@ fn constant(e: &Expr) -> bool {
 fn starts_coroutine(row: &[Expr]) -> bool {
     constant_row(row)
         && row.iter().all(|e| {
-            #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+            #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
             let mut core = e;
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             while let Expr::Collate(inner, _) = core {
                 core = inner;
             }

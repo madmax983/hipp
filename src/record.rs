@@ -159,10 +159,10 @@ pub fn encode_record(values: &[Value<'_>], out: &mut AVec<u8>) {
 }
 
 /// Encode a record the way the pin's ALTER TABLE ... DROP COLUMN
-/// rewrites one (v0.16, `v16`): as `encode_record`, except that
+/// rewrites one (v0.16, `sql`): as `encode_record`, except that
 /// the integers 0 and 1 take the one-byte serial type 1 rather than
 /// the constant types 8 / 9 (observed on the pin's rewritten rows).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub fn encode_record_plain(values: &[Value<'_>], out: &mut AVec<u8>) {
     encode_with(values, out, |v| match v {
         0 | 1 => 1,
@@ -738,7 +738,7 @@ pub fn render_real(r: f64, out: &mut AVec<u8>) {
     }
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 /// A decoded REAL: `n` significant digits `z[s..s + n]` with the
 /// decimal point after digit `idp` (`0.d1d2... * 10^idp`).
 pub struct Fp {
@@ -751,7 +751,7 @@ pub struct Fp {
     pub idp: i32,
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 impl Fp {
     pub fn digit(&self, j: usize) -> u8 {
         if j < self.n {
@@ -762,7 +762,7 @@ impl Fp {
     }
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 /// Decode `r` into the pin's digits, rounded half up to `iround`
 /// significant digits (or, for `iround <= 0`, to `-iround` digits
 /// after the point) and to at most `mx` digits (16, or 26 with the
@@ -916,7 +916,7 @@ pub fn fp_decode(r: f64, mut iround: i32, mx: i32) -> Fp {
 /// zero — and reads the text back. (v0.15 rounded the exact
 /// binary expansion instead, which differs where the pin's
 /// approximate digits do.)
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub fn round_digits(r: f64, n: i64) -> f64 {
     let n = n.clamp(0, 30) as i32;
     let f = fp_decode(r, -n, 26);

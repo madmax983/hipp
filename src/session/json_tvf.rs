@@ -91,13 +91,13 @@ impl<S: Storage> Connection<S> {
             mat: 0,
             #[cfg(feature = "explain")]
             sel: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             view_names: AVec::new(),
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             is_cte: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             lazy: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             grp: 0,
         };
         plans.push(SourcePlan {
@@ -121,11 +121,10 @@ impl<S: Storage> Connection<S> {
             access: None,
             #[cfg(feature = "expr_index")]
             hint: crate::query::Hint::Any,
-            #[cfg(feature = "v16")]
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             exists: false,
         });
         Ok(w)
@@ -153,7 +152,7 @@ impl<S: Storage> Connection<S> {
             + cur.sources.as_slice().last().map_or(0, |s| s.columns.len());
         let first = cur.offsets.as_slice().first().copied().unwrap_or(end);
         let here = cur.offsets.as_slice().get(i).copied().unwrap_or(end);
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         let later = RefRange {
             w: (here, end),
             s: (cur.first_src + i, cur.first_src + n),
@@ -164,10 +163,10 @@ impl<S: Storage> Connection<S> {
         };
         let mut row = AVec::new();
         let mut lateral = false;
-        // v0.17 (`join_order`): an argument may read a source after
+        // v0.17 (`planner`): an argument may read a source after
         // it, which the join planner then runs first (the pin's
         // reordering; `check_tvf_order` refuses what stays after).
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let (later, after) = (
             RefRange {
                 w: (
@@ -190,7 +189,7 @@ impl<S: Storage> Connection<S> {
                 return Err(Error::Unsupported);
             }
             lateral |= expr_refs_range(&r, &left);
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             {
                 lateral |= expr_refs_range(&r, &after);
             }
@@ -213,7 +212,7 @@ impl<S: Storage> Connection<S> {
 }
 
 /// A JSON table-valued source whose arguments read a source after it
-/// (v0.17, `join_order`): the join planner puts the sources they read
+/// (v0.17, `planner`): the join planner puts the sources they read
 /// first where it may; where it may not (a CROSS JOIN keeps the call
 /// before them) the pin offers xBestIndex no constraint for such an
 /// argument, so the call runs without it — no JSON argument, no rows;
@@ -221,7 +220,7 @@ impl<S: Storage> Connection<S> {
 /// `hidden column = value` term stays a WHERE term (review fix: it was
 /// refused). `filter` takes those terms. A source the planner does not
 /// order (`ordered` false: a RIGHT / FULL join, ...) is still refused.
-#[cfg(all(feature = "join_order", feature = "json"))]
+#[cfg(all(feature = "planner", feature = "json"))]
 pub(super) fn fix_tvf_order<E>(
     sources: &mut [SourcePlan],
     cur: &crate::query::ScopeGroup,

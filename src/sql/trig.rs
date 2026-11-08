@@ -401,7 +401,6 @@ impl Walker<'_> {
     /// before it in scope, as they resolve.
     fn scope_from<E>(&mut self, from: &mut [super::ast::FromSource]) -> Result<(), E> {
         for f in from {
-            #[cfg(feature = "v16")]
             for a in f.args.iter_mut().flat_map(|a| a.as_mut_slice().iter_mut()) {
                 self.expr::<E>(a)?;
             }

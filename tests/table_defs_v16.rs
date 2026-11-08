@@ -34,7 +34,7 @@
 //!   on the earlier combinations too).
 //! - INTEGER PRIMARY KEY / rowid values convert like the pin's
 //!   MustBeInt: `'8'`, `9.0` are rowids (ungated fix).
-//! - Under `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE ... AS
+//! - Under `sql`: INSERT ... DEFAULT VALUES, CREATE TABLE ... AS
 //!   SELECT (names and declared types byte-identical in
 //!   `sqlite_schema.sql`), and STRICT tables.
 
@@ -1020,7 +1020,7 @@ fn prng_constraint_corpus() {
 
 // ---------------- v16: DEFAULT VALUES, CTAS, STRICT ----------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn insert_default_values() {
     let tw = twins(
@@ -1052,7 +1052,7 @@ fn insert_default_values() {
 /// CREATE TABLE ... AS SELECT: run on both twins, then compare
 /// `sqlite_schema` (read by the oracle from both files) byte for
 /// byte, plus the contents.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn ctas(tag: &str, setup: &str, stmts: &[&str], dump: &str) {
     let tw = twins(tag, setup);
     tw.all(stmts);
@@ -1065,7 +1065,7 @@ fn ctas(tag: &str, setup: &str, stmts: &[&str], dump: &str) {
     tw.same(dump);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn create_table_as_select_names_and_types() {
     ctas(
@@ -1094,7 +1094,7 @@ fn create_table_as_select_names_and_types() {
     );
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn create_table_as_select_shapes() {
     ctas(
@@ -1125,7 +1125,7 @@ fn create_table_as_select_shapes() {
     tw.refuse_any("CREATE TABLE v AS SELECT 1");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn strict_tables_enforce_types() {
     let tw = twins(
@@ -1167,7 +1167,7 @@ fn strict_tables_enforce_types() {
     tw.finish("SELECT rowid, * FROM s ORDER BY rowid");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn strict_table_definitions_and_precedence() {
     let tw = twins(
@@ -1261,7 +1261,7 @@ fn strict_table_definitions_and_precedence() {
     assert_eq!(oracle_raw(&tw.hipp, q), oracle_raw(&tw.oracle, q));
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn strict_oracle_written_file() {
     let path = common::temp_db("v16td-strict-foreign");
@@ -1582,7 +1582,7 @@ fn unary_plus_drops_affinity() {
     ]);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn create_table_as_select_names_follow_resolution() {
     // The pin names CTAS columns over the resolved list: `+a` is
@@ -1739,10 +1739,10 @@ fn clock_is_read_once_per_statement() {
 
 #[test]
 fn autoincrement_is_kept_or_refused() {
-    // Without `v16` hipp keeps no `sqlite_sequence`: CREATE refuses
+    // Without `sql` hipp keeps no `sqlite_sequence`: CREATE refuses
     // the clause and an AUTOINCREMENT table the pin made is
     // read-only (an INSERT that left the sequence behind let the
-    // pin hand out a rowid twice). With `v16` both work and the
+    // pin hand out a rowid twice). With `sql` both work and the
     // sequence is the pin's (tests/autoinc_v16.rs covers it).
     let h = common::temp_db("v16td-autoinc-h");
     for sql in [
@@ -1753,7 +1753,7 @@ fn autoincrement_is_kept_or_refused() {
             let mut db = open(&h).await;
             try_collect(&mut db, sql).await
         });
-        if cfg!(feature = "v16") {
+        if cfg!(feature = "sql") {
             assert!(r.is_ok(), "{sql}: {r:?}");
         } else {
             assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
@@ -1772,7 +1772,7 @@ fn autoincrement_is_kept_or_refused() {
             try_collect(&mut db, "SELECT a, b FROM t").await.unwrap(),
         )
     });
-    if cfg!(feature = "v16") {
+    if cfg!(feature = "sql") {
         assert!(ins.is_ok(), "{ins:?}");
         assert_eq!(rows, ["1|x", "2|y"]);
         assert_eq!(oracle_raw(&o, "SELECT * FROM sqlite_sequence;").1, ["t|2"]);

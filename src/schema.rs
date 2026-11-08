@@ -46,21 +46,21 @@ pub struct Column {
     /// the INSERT that needs it. A foldable expression default
     /// (`(1+2)`, `-'3'`) is folded into `default` instead, so
     /// every reader sees the pin's value.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub default_expr: Option<ABytes>,
     /// A generated column's expression text (v0.16).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub gen_expr: Option<ABytes>,
     /// A STORED generated column (v0.16); VIRTUAL otherwise.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub stored: bool,
     /// The column's collating sequence (v0.16; BINARY when no
     /// `COLLATE` clause was written).
-    #[cfg(any(feature = "v04", feature = "indexes"))]
+    #[cfg(any(feature = "query", feature = "indexes"))]
     pub coll: Coll,
     /// The NOT NULL constraint's own `ON CONFLICT` clause (v0.16,
-    /// `v07`; `None`: none).
-    #[cfg(feature = "v07")]
+    /// `sql`; `None`: none).
+    #[cfg(feature = "sql")]
     pub nn_conflict: Option<crate::sql::ConflictAction>,
 }
 
@@ -82,8 +82,8 @@ pub struct IndexColumn {
 pub struct AutoSet {
     pub primary_key: bool,
     pub columns: AVec<IndexColumn>,
-    /// The constraint's own `ON CONFLICT` clause (v0.16, `v07`).
-    #[cfg(feature = "v07")]
+    /// The constraint's own `ON CONFLICT` clause (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     pub conflict: Option<crate::sql::ConflictAction>,
 }
 
@@ -99,10 +99,10 @@ pub struct TableDef {
     /// UNIQUE / PK constraint sets in statement order (v0.3).
     pub auto_sets: AVec<AutoSet>,
     /// CHECK constraint texts, statement order (v0.16).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub checks: AVec<ABytes>,
-    /// A STRICT table (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// A STRICT table (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     pub strict: bool,
     /// The stored SQL names a collating sequence hipp does not
     /// have (an application-registered one, v0.16). The table
@@ -110,7 +110,7 @@ pub struct TableDef {
     /// has no columns here, and every statement that reads or
     /// writes it is refused with `SchemaKind::UnknownCollation`
     /// (see `TableDef::usable`); the rest of the file works.
-    #[cfg(any(feature = "v04", feature = "indexes"))]
+    #[cfg(any(feature = "query", feature = "indexes"))]
     pub foreign_coll: bool,
     /// A shadow table of a virtual table whose module hipp lacks,
     /// with stored SQL hipp cannot parse (v0.16, `vtab`: fts3/4
@@ -119,8 +119,8 @@ pub struct TableDef {
     #[cfg(feature = "vtab")]
     pub shadow_opaque: bool,
     /// The table's INTEGER PRIMARY KEY is AUTOINCREMENT (v0.16,
-    /// `v16`): every INSERT keeps its `sqlite_sequence` row.
-    #[cfg(feature = "v16")]
+    /// `sql`): every INSERT keeps its `sqlite_sequence` row.
+    #[cfg(feature = "sql")]
     pub autoinc: bool,
     /// The file has a trigger on this table, which a build without
     /// `triggers` cannot run (v0.16): writes are refused
@@ -134,9 +134,9 @@ pub struct TableDef {
     #[cfg(feature = "without_rowid")]
     pub without_rowid: bool,
     /// The INTEGER PRIMARY KEY's own `ON CONFLICT` clause (v0.16,
-    /// `v07`): how a rowid conflict resolves (the pin's
+    /// `sql`): how a rowid conflict resolves (the pin's
     /// `keyConf`); `None` when it has none.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     pub ipk_conflict: Option<crate::sql::ConflictAction>,
 }
 
@@ -157,7 +157,7 @@ impl TableDef {
     /// `SchemaKind::UnknownCollation` — remedy: register no
     /// custom collation, or use an engine that has it.
     pub fn usable<E>(&self) -> Result<&TableDef, E> {
-        #[cfg(any(feature = "v04", feature = "indexes"))]
+        #[cfg(any(feature = "query", feature = "indexes"))]
         if self.foreign_coll {
             #[cfg(feature = "vtab")]
             if self.shadow_opaque {
@@ -173,16 +173,16 @@ impl TableDef {
     }
 
     /// Whether any column is generated (v0.16).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub fn has_generated(&self) -> bool {
         self.columns.iter().any(|c| c.gen_expr.is_some())
     }
 
     /// Whether writes must go through table rules (v0.16): a
     /// generated column, a CHECK constraint, or STRICT typing.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub fn has_rules(&self) -> bool {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.strict {
             return true;
         }
@@ -229,9 +229,9 @@ pub struct IndexDef {
     #[cfg(feature = "without_rowid")]
     pub clustered: bool,
     /// A UNIQUE / PRIMARY KEY constraint's own `ON CONFLICT`
-    /// clause (v0.16, `v07`): the automatic index's; `None` for
+    /// clause (v0.16, `sql`): the automatic index's; `None` for
     /// an explicit index and a constraint without one.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     pub conflict: Option<crate::sql::ConflictAction>,
 }
 
@@ -334,13 +334,13 @@ pub struct Catalog {
     /// Schema cookie this catalog was built from.
     pub cookie: u32,
     /// Table and view names in `sqlite_schema` rowid (creation)
-    /// order (v0.16, `v16`): the order PRAGMA table_list and
+    /// order (v0.16, `sql`): the order PRAGMA table_list and
     /// integrity_check walk.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub objects: AVec<ABytes>,
-    /// `sqlite_schema` itself as a readable table (v0.16, `v16`):
+    /// `sqlite_schema` itself as a readable table (v0.16, `sql`):
     /// root page 1, columns `type name tbl_name rootpage sql`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub schema_table: Option<TableDef>,
 }
 
@@ -356,23 +356,23 @@ impl Catalog {
             triggers: AVec::new(),
 
             cookie,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             objects: AVec::new(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             schema_table: None,
         }
     }
 
-    /// The name names `sqlite_schema` (v0.16, `v16`): any case
+    /// The name names `sqlite_schema` (v0.16, `sql`): any case
     /// of `sqlite_schema` / `sqlite_master`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn is_schema_name(name: &[u8]) -> bool {
         eq_ci(name, b"sqlite_schema") || eq_ci(name, b"sqlite_master")
     }
 
-    /// A table to read (v0.16, `v16`): a catalog table, or
+    /// A table to read (v0.16, `sql`): a catalog table, or
     /// `sqlite_schema` under either of its names.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn find_readable<'x>(&'x self, arena: &Arena, name: &[u8]) -> Option<&'x TableDef> {
         self.find(arena, name).or_else(|| {
             if Catalog::is_schema_name(name) {
@@ -528,7 +528,7 @@ fn intern_literal(
 }
 
 /// A folded DEFAULT value as a catalog literal (v0.16).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn owned_literal(
     arena: &Arena,
     v: &crate::record::OwnedValue,
@@ -631,7 +631,7 @@ fn place_clustered_keys(
             continue;
         };
         let columns = set.columns.clone();
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let conflict = set.conflict;
         adds.push((
             at,
@@ -647,7 +647,7 @@ fn place_clustered_keys(
                 #[cfg(feature = "expr_index")]
                 ext: None,
                 clustered: true,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 conflict,
             },
         ));
@@ -722,7 +722,7 @@ fn catalog_from_rows<E>(
     lim: crate::sql::parser::Limits,
 ) -> Result<Catalog, E> {
     let mut catalog = Catalog::empty(cookie);
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     {
         for row in rows.iter() {
             if eq_ci(row.ty.as_slice(), b"table") || eq_ci(row.ty.as_slice(), b"view") {
@@ -819,7 +819,7 @@ fn catalog_from_rows<E>(
             // file and errors only where the collation is used.
             // Keep the table listed but unusable; the rest of
             // the file still opens.
-            #[cfg(any(feature = "v04", feature = "indexes"))]
+            #[cfg(any(feature = "query", feature = "indexes"))]
             Err(e)
                 if matches!(
                     e,
@@ -855,20 +855,20 @@ fn catalog_from_rows<E>(
                     columns: AVec::new(),
                     rowid_alias: None,
                     auto_sets: AVec::new(),
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     checks: AVec::new(),
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     strict: false,
                     foreign_coll: true,
                     #[cfg(feature = "vtab")]
                     shadow_opaque,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     autoinc: false,
                     #[cfg(not(feature = "triggers"))]
                     triggered: false,
                     #[cfg(feature = "without_rowid")]
                     without_rowid: false,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     ipk_conflict: None,
                 });
                 continue;
@@ -879,9 +879,9 @@ fn catalog_from_rows<E>(
             columns,
             pk_columns,
             constraint_sets,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             checks,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             strict,
             #[cfg(feature = "without_rowid")]
             without_rowid,
@@ -914,7 +914,7 @@ fn catalog_from_rows<E>(
             // STRICT (v0.16): an ANY column has no affinity —
             // values are stored as given (in an ordinary table
             // `ANY` is NUMERIC by the name rules).
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if strict && eq_ci(crate::record::decl_token(decl_bytes), b"ANY") {
                 affinity = Affinity::Blob;
             }
@@ -927,9 +927,9 @@ fn catalog_from_rows<E>(
             // it is constant; keep its text when it reads the
             // clock or fails to evaluate (the INSERT that needs
             // it evaluates it then — and errors, as the pin does).
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             let mut default_expr = None;
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             if let Some(h) = c.default_expr {
                 let text = handle_bytes(&scratch, h);
                 match crate::rules::eval_default::<E>(
@@ -956,24 +956,24 @@ fn catalog_from_rows<E>(
                 affinity,
                 default,
                 not_null: c.not_null || in_pk,
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 default_expr,
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 gen_expr: match c.gen_expr {
                     Some(h) => Some(intern(catalog_arena, handle_bytes(&scratch, h))?),
                     None => None,
                 },
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 stored: c.stored,
-                #[cfg(any(feature = "v04", feature = "indexes"))]
+                #[cfg(any(feature = "query", feature = "indexes"))]
                 coll: c.coll.unwrap_or_default(),
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 nn_conflict: if c.not_null { c.nn_conflict } else { None },
             });
         }
         let rowid_alias = alias;
-        // The rowid alias's PRIMARY KEY clause (v0.16, `v07`).
-        #[cfg(feature = "v07")]
+        // The rowid alias's PRIMARY KEY clause (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         let ipk_conflict = match rowid_alias {
             Some(_) => constraint_sets
                 .iter()
@@ -1012,9 +1012,9 @@ fn catalog_from_rows<E>(
         let auto_sets: AVec<AutoSet> = AVec::new();
         #[cfg(not(feature = "indexes"))]
         let _ = (constraint_sets, pk_columns);
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut check_texts = AVec::new();
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         for h in checks.iter() {
             check_texts.push(intern(catalog_arena, handle_bytes(&scratch, *h))?);
         }
@@ -1025,15 +1025,15 @@ fn catalog_from_rows<E>(
             columns: cols,
             rowid_alias,
             auto_sets,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             checks: check_texts,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             strict,
-            #[cfg(any(feature = "v04", feature = "indexes"))]
+            #[cfg(any(feature = "query", feature = "indexes"))]
             foreign_coll: false,
             #[cfg(feature = "vtab")]
             shadow_opaque: false,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             autoinc: rowid_alias.is_some()
                 && crate::sql::parser::has_autoincrement::<E>(sql.as_slice(), &scratch),
             #[cfg(not(feature = "triggers"))]
@@ -1043,7 +1043,7 @@ fn catalog_from_rows<E>(
             }),
             #[cfg(feature = "without_rowid")]
             without_rowid,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ipk_conflict,
         });
     }
@@ -1085,7 +1085,7 @@ fn catalog_from_rows<E>(
                 opaque: true,
                 #[cfg(feature = "without_rowid")]
                 clustered: false,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 conflict: None,
             });
             continue;
@@ -1109,7 +1109,7 @@ fn catalog_from_rows<E>(
                     ext: None,
                     #[cfg(feature = "without_rowid")]
                     clustered: false,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     conflict: None,
                 };
                 match parsed {
@@ -1210,7 +1210,7 @@ fn catalog_from_rows<E>(
                     ext: None,
                     #[cfg(feature = "without_rowid")]
                     clustered: false,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     conflict: set.as_ref().and_then(|s| s.conflict),
                 });
             }
@@ -1316,7 +1316,7 @@ fn derive_view_columns(
     }
     // A VALUES view (v0.16): `column1`, `column2`, ... as on the
     // pin.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     if let Some(row) = select.values.as_slice().first() {
         for i in 0..row.len() {
             let mut n = copy_avec(b"column");
@@ -1342,7 +1342,7 @@ fn derive_view_columns(
     // (the pin's `selectExpander`; review regression: they were
     // listed per source).
     let mut sources: AVec<(AVec<u8>, AVec<AVec<u8>>)> = AVec::new();
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     let mut joined: AVec<AVec<AVec<u8>>> = AVec::new();
     for src in select.from.iter() {
         let tname = handle_bytes(scratch, src.table);
@@ -1365,7 +1365,7 @@ fn derive_view_columns(
         } else {
             return AVec::new();
         }
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             let mut j: AVec<AVec<u8>> = AVec::new();
             if src.natural {
@@ -1389,13 +1389,13 @@ fn derive_view_columns(
     for item in select.items.iter() {
         match item {
             crate::sql::SelectItem::Star => {
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 let mut joined_it = joined.iter();
                 for (_, cols) in sources.iter() {
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     let j = joined_it.next();
                     for c in cols.iter() {
-                        #[cfg(feature = "v04")]
+                        #[cfg(feature = "query")]
                         if j.is_some_and(|j| j.iter().any(|x| eq_ci(x.as_slice(), c.as_slice()))) {
                             continue;
                         }
@@ -1441,7 +1441,7 @@ fn derive_view_columns(
                         Some(c) => c.as_slice(),
                         // v0.16: a rowid reference is named by the
                         // rowid-alias column, as on the pin.
-                        #[cfg(feature = "v04")]
+                        #[cfg(feature = "query")]
                         None if eq_ci(nb, b"rowid")
                             || eq_ci(nb, b"oid")
                             || eq_ci(nb, b"_rowid_") =>
@@ -1475,7 +1475,7 @@ fn derive_view_columns(
         }
     }
     // Duplicate names become `id:1`, ... as on the pin (v0.16).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     {
         let mut names: AVec<AVec<u8>> = AVec::new();
         for h in out.iter() {
@@ -1547,7 +1547,7 @@ fn resolve_auto_sets(
             auto_sets.push(AutoSet {
                 primary_key: s.primary_key,
                 columns: set_cols,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 conflict: s.conflict,
             });
         }

@@ -1,4 +1,4 @@
-//! The pin's join planner (v0.17, `join_order`).
+//! The pin's join planner (v0.17, `planner`).
 //!
 //! `xplan` decides one source's loop; this module orders the
 //! sources of a join and picks each one's loop together, as the
@@ -38,12 +38,12 @@
 //!   pull-down of `sqlite3ConstructBloomFilter`): with `sqlite_stat1`
 //!   rows, a lookup run more often than its table has rows.
 //!
-//! - **MULTI-INDEX OR loops** (v0.17, `multi_index`; `whereLoopAddOr`,
+//! - **MULTI-INDEX OR loops** (v0.17, `planner`; `whereLoopAddOr`,
 //!   `crate::xmulti`): after a source's b-tree loops, one per cost
 //!   entry of each OR term every branch of which has a loop.
 //!
 //! What is not modelled (the order or access path may then differ
-//! from the pin's, never the rows): without `multi_index`, the
+//! from the pin's, never the rows): without `planner`, the
 //! MULTI-INDEX OR plan of b-tree tables, skip-scans and the `IN`
 //! statistics rule of `whereLoopAddBtreeIndex`; `sqlite_stat4`,
 //! likelihood() truth probabilities and the LIKE length adjustment,
@@ -82,14 +82,12 @@ pub struct JSrc<'x> {
     pub left: bool,
     /// An explicit `CROSS JOIN`.
     pub cross: bool,
-    /// The sources a semi-join source must follow (v0.17, `flatten`:
+    /// The sources a semi-join source must follow (v0.17, `planner`:
     /// an `EXISTS` turned into a join loop runs after every source its
     /// terms read, so its first row is the one the EXISTS finds).
-    #[cfg(feature = "flatten")]
     pub after: u64,
     /// A semi-join source: each of its loops yields at most one row
-    /// per combination before it (v0.17, `flatten`).
-    #[cfg(feature = "flatten")]
+    /// per combination before it (v0.17, `planner`).
     pub semi: bool,
     /// Automatic indexes are allowed (no INDEXED BY / NOT INDEXED).
     pub auto_ok: bool,
@@ -102,8 +100,7 @@ pub struct JSrc<'x> {
     /// constraint set its xBestIndex accepted; it has no b-tree loops.
     pub vt: Option<AVec<(u64, i32, i32)>>,
     /// Its OR terms that may drive a MULTI-INDEX OR loop (v0.17,
-    /// `multi_index`; `xmulti::or_infos`).
-    #[cfg(feature = "multi_index")]
+    /// `planner`; `xmulti::or_infos`).
     pub ors: AVec<crate::xmulti::OrInfo>,
 }
 
@@ -334,10 +331,7 @@ pub fn from_prereqs(srcs: &[JSrc<'_>]) -> AVec<u64> {
         } else {
             pre = 0;
         }
-        #[cfg(feature = "flatten")]
         out.push(pre | js.after);
-        #[cfg(not(feature = "flatten"))]
-        out.push(pre);
         prior |= 1u64 << i;
     }
     out
@@ -366,9 +360,7 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                         sorted: 0,
                         reverse: false,
                         bignull: None,
-                        #[cfg(feature = "multi_index")]
                         or: None,
-                        #[cfg(feature = "multi_index")]
                         skip: 0,
                     },
                     prereq: (mpre | *p) & !me,
@@ -411,9 +403,7 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                         sorted: 0,
                         reverse: false,
                         bignull: None,
-                        #[cfg(feature = "multi_index")]
                         or: None,
-                        #[cfg(feature = "multi_index")]
                         skip: 0,
                     },
                     prereq: mpre | js.tmask.as_slice().get(*ti).copied().unwrap_or(0),
@@ -491,9 +481,8 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
             };
             insert(&mut out, js.ts.as_slice(), jl);
         }
-        // Its MULTI-INDEX OR loops (v0.17, `multi_index`;
+        // Its MULTI-INDEX OR loops (v0.17, `planner`;
         // `whereLoopAddOr`, after the b-tree loops).
-        #[cfg(feature = "multi_index")]
         for (k, info) in js.ors.iter().enumerate() {
             let costs =
                 crate::xmulti::or_costs(&q, &js.s, &js.tab, info, out.as_slice(), i, me, mpre);
@@ -817,7 +806,6 @@ fn path_order(
                 return 0;
             }
             // A MULTI-INDEX OR loop has no index order (v0.17).
-            #[cfg(feature = "multi_index")]
             if jl.l.or.is_some() {
                 return 0;
             }
@@ -1043,10 +1031,7 @@ fn mx_choice(srcs: &[JSrc<'_>], loops: &mut [JLoop]) -> usize {
                 if (1u64 << l.src) & seen == 0 {
                     continue;
                 }
-                #[cfg(feature = "multi_index")]
                 let or = usize::from(l.l.or.is_some());
-                #[cfg(not(feature = "multi_index"))]
-                let or = 0;
                 let nterm = l.l.eq.len()
                     + usize::from(l.l.lo.is_some())
                     + usize::from(l.l.hi.is_some())
@@ -1252,8 +1237,7 @@ pub(crate) fn plan(srcs: &[JSrc<'_>], jq: &JQuery<'_>) -> Option<JPlan> {
     let pre = from_prereqs(srcs);
     let mut loops = all_loops(srcs, jq, pre.as_slice());
     // A semi-join loop yields at most one row per combination
-    // before it (v0.17, `flatten`).
-    #[cfg(feature = "flatten")]
+    // before it (v0.17, `planner`).
     for l in loops.as_mut_slice() {
         if !l.auto && srcs.get(l.src).is_some_and(|s| s.semi) {
             l.l.out = l.l.out.min(0);

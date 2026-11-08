@@ -431,13 +431,13 @@ impl<S: Storage> Connection<S> {
             mat: 0,
             #[cfg(feature = "explain")]
             sel: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             view_names: AVec::new(),
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             is_cte: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             lazy: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             grp: 0,
         };
         let vname = if own { copy_vec(n) } else { AVec::new() };
@@ -474,7 +474,7 @@ impl<S: Storage> Connection<S> {
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             exists: false,
         });
         Ok(Some(w))

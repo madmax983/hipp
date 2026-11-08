@@ -15,295 +15,240 @@ default = ["std", "xl"]
 # `max`'s 1 MiB budget (ADR 0003 closed it to leaves that do not
 # fit). Std builds (the CLI, the differential tests) use it; CI
 # ratchets its size separately (budget 1.25 MiB).
-xl = ["max", "fts5_delete", "join_order", "multi_index", "flatten"]
-# Everything (ADR 0002): `full` plus the heavyweight v0.16 leaves
-# (window functions, triggers, foreign keys, JSON, ...) that do not
-# fit `full`'s 512 KiB embedded budget. Std builds (the CLI, the
+xl = ["max", "fts5_delete", "planner"]
+# Everything (ADR 0002): `full` plus the heavyweight leaves (window
+# functions, triggers, foreign keys, JSON, ...) that do not fit
+# `full`'s 512 KiB embedded budget. Std builds (the CLI, the
 # differential tests) use it; CI ratchets its size separately.
 max = ["full", "window", "triggers", "foreign_keys", "json", "expr_index", "without_rowid", "utf16", "wal", "datetime", "attach", "autovacuum", "vtab", "rtree", "fts5", "explain"]
 # Every dialect feature, without `std`: the full no_std profile
-# (what a target with room for the whole dialect builds; CI ratchets
-# its size alongside the tiny profile's). New feature rungs join here.
-full = ["indexes", "v04", "v05", "v06", "v07", "v08", "v09", "v10", "v16", "params", "math"]
+# (what a target with room for the whole core dialect builds; CI
+# ratchets its size alongside the tiny profile's). Small dialect
+# surface joins `sql`, which this profile carries (ADR 0006).
+full = ["indexes", "query", "write", "sql", "params", "math"]
 # Host file storage (std::fs). The core engine is no_std with or without it.
 std = []
-# Index B-trees (SPEC §2 v0.3): CREATE [UNIQUE] INDEX, secondary-index
+# Index B-trees (SPEC §2): CREATE [UNIQUE] INDEX, secondary-index
 # lookups, UNIQUE enforcement, DROP INDEX. The tiny profile
 # (--no-default-features) excludes it and pays nothing for it (SPEC §2).
 indexes = []
-# v0.4 dialect (SPEC §2 v0.4): joins, aggregates + GROUP BY, the
-# expression evaluator, ALTER TABLE ADD COLUMN, inert views. The
+# The query engine (SPEC §2): joins, aggregates + GROUP BY, the
+# expression evaluator (operators, the core scalar and aggregate
+# functions, CAST, CASE, affinity and collation rules), CHECK
+# constraints, DEFAULT expressions, generated columns and STRICT
+# tables, ALTER TABLE ADD COLUMN and inert views (CREATE VIEW
+# stored, not executed).
+# Without it SELECT is a scan with literal / column filters and
+# table clauses the tiny profile cannot enforce are refused. The
 # tiny profile (--no-default-features) excludes it per §2.
-v04 = []
-# v0.5 write-side dialect: UPDATE, DELETE, DROP TABLE with full
-# index maintenance. Builds on the v0.4 expression evaluator for
-# SET/WHERE expressions, so it implies `v04`. The tiny profile
-# excludes it per §2.
-v05 = ["v04"]
-# v0.6 dialect: subqueries in expressions — scalar subqueries,
-# IN (SELECT ...), EXISTS across SELECT / UPDATE / DELETE. Builds
-# on the v0.5 write side (UPDATE/DELETE filters and SET
-# expressions are subquery sites), so it implies `v05`. The tiny
-# profile excludes it per §2.
-v06 = ["v05"]
-# v0.7 dialect: the write-side completion — OR REPLACE conflict
-# clauses on INSERT/UPDATE, UPDATE ... FROM, RETURNING on
-# INSERT/UPDATE/DELETE, and UPSERT (INSERT ... ON CONFLICT).
-# Builds on the v0.6 subquery machinery (RETURNING and upsert
-# expressions resolve subqueries against the affected row), so
-# it implies `v06`. The tiny profile excludes it per §2.
-v07 = ["v06"]
-# v0.8 dialect: INSERT completion — INSERT INTO ... SELECT and
-# subqueries in INSERT VALUES. Builds on the v0.7 write side
-# (an INSERT ... SELECT ... ON CONFLICT / RETURNING composes
-# the v0.7 plans), so it implies `v07`. The tiny profile
-# excludes it per §2. (The v0.8 cross-affinity comparison fix
-# is *not* gated: it lives in the v0.4 evaluator, which the
-# tiny profile already excludes wholesale.)
-v08 = ["v07"]
-# v0.9 dialect: compound SELECTs (UNION / UNION ALL / INTERSECT /
-# EXCEPT between SELECT and VALUES cores) and FROM-clause derived
-# tables `(SELECT ...) [[AS] alias]`, in the general query
-# planner, the subquery planner, and write-side FROM sources.
-# Builds on the v0.8 INSERT completion (compounds compose as
-# INSERT ... SELECT sources through the subquery planner), so it
-# implies `v08`. The tiny profile excludes it per §2.
-v09 = ["v08"]
-# v0.11 dialect: subqueries inside aggregate arguments
-# (sum((SELECT ...)) and friends, evaluated per group row).
-# The feature ladder's next rung is v10 -- the v0.10 milestone
-# itself was an ungated correctness fix and took no rung.
-# Builds on the v0.9 compound/derived machinery (an aggregate
-# argument's subquery may itself be a compound or contain
-# aggregates over derived tables), so it implies `v09`. The
-# tiny profile excludes it per §2.
-v10 = ["v09"]
-# v0.16 dialect (ADR 0001): the SQLite-parity rung for core-SQL
-# completion. This unit adds the query-shape surface: LIMIT /
-# OFFSET as general (constant / uncorrelated subquery)
-# expressions, result-column aliases referenced from WHERE / ON
-# / GROUP BY / HAVING / ORDER BY expressions, and `x IN table`.
-# (The RIGHT / FULL / NATURAL / USING joins and NULLS FIRST /
-# LAST fixes are *not* gated: they correct claimed v0.4 paths.)
-# The collations unit adds the `expr COLLATE name` operator,
-# GLOB / NOT GLOB, LIKE ... ESCAPE and the like() / glob()
-# functions (column COLLATE clauses, collated indexes and the
-# collation rules themselves are *not* gated: they correct
-# claimed v0.4 / index paths).
-# The expressions unit adds the bitwise operators `& | << >> ~`,
-# IS [NOT] DISTINCT FROM, postfix NOT NULL and row values
-# (comparisons, BETWEEN, IN, CASE, multi-column scalar
-# subqueries, UPDATE ... SET (a, b) = ...). (The precedence,
-# IS TRUE / FALSE, hex / digit-separator literal and aggregate
-# scoping fixes are *not* gated: they correct claimed v0.4 /
-# v0.6 paths.)
-# The function-library unit adds printf() / format(), quote(),
-# char(), unicode(), zeroblob(), randomblob(), random(),
-# last_insert_rowid() / changes() / total_changes() (and the
-# Connection methods), likely() / unlikely() / likelihood(),
-# concat(), concat_ws(), octet_length(), unhex(), if() and the
-# n-ary iif(), sqlite_version(). (round()'s fitted digits, lazy
-# coalesce / iif and the text-function fixes are *not* gated:
-# they correct claimed v0.4 paths.)
-# The aggregate unit adds string_agg(), the aggregate ORDER BY
-# (`f(args ORDER BY ...)`, DISTINCT interplay as on the pin),
-# FILTER (WHERE ...) on every aggregate, count() and the
-# percentile family -- median(), percentile(), percentile_cont(),
-# percentile_disc(). (The sum() overflow error, compensated REAL
-# sums, group_concat()'s NULL separator, the DISTINCT argument
-# count and the group-finalization rules are *not* gated: they
-# correct claimed v0.4 paths.)
-# The PRAGMA unit adds the PRAGMA statement (header values,
-# flags, schema introspection, integrity_check / quick_check),
-# `sqlite_schema` / `sqlite_master` as a readable table and the
-# table-valued `pragma_*` functions. (Refusing `sqlite_*` names
-# in CREATE is *not* gated: it corrects claimed paths.)
-# The views / CTE unit executes views (CREATE VIEW then resolves
-# nothing, as on the pin) and adds WITH [RECURSIVE] before SELECT,
-# VALUES, INSERT, REPLACE, UPDATE and DELETE and inside
-# subqueries, with the pin's recursive queue. (The shared
-# table / view / index namespace, ambiguous `q.col` over two
-# sources named `q`, and compound column-affinity demotion in
-# derived tables are *not* gated: they correct claimed paths.)
-# Builds on the v0.11 subquery machinery (a LIMIT may be a
-# scalar subquery, `x IN t` plans as `x IN (SELECT * FROM t)`),
-# so it implies `v10`. The tiny profile excludes it per §2.
-# The honest-gap sweep adds INDEXED BY / NOT INDEXED, three-part
-# column names and statements across the TEMP and main databases.
-# (Constraint-level ON CONFLICT clauses are *not* gated here: they
-# correct claimed `v07` write paths.)
-v16 = ["v10"]
-# v0.16 leaf (ADR 0001): bound parameters -- `?`, `?NNN`, `:name`,
-# `@name`, `$name` with the pin's numbering, the Statement bind_*
-# / parameter_* / clear_bindings / reset API, and re-execution of
-# a prepared statement. Depends on nothing: on top of the tiny
-# profile a parameter stands wherever its grammar takes a literal
-# (INSERT VALUES, WHERE rowid = ?); with the evaluator it is any
-# expression. The tiny profile excludes it per §2.
+query = []
+# The write side: UPDATE, DELETE and DROP TABLE with full index
+# maintenance. Its SET / WHERE expressions run on the evaluator, so
+# it implies `query`. The tiny profile excludes it per §2.
+write = ["query"]
+# The rest of the SQL dialect on top of `write` (implies it):
+# - subqueries in expressions -- scalar subqueries, IN (SELECT ...),
+#   EXISTS -- in SELECT / UPDATE / DELETE, and inside aggregate
+#   arguments (evaluated per group row);
+# - the write-side completion -- OR REPLACE / IGNORE / FAIL / ABORT /
+#   ROLLBACK conflict clauses on INSERT / UPDATE (and on column and
+#   table constraints), UPDATE ... FROM, RETURNING on INSERT / UPDATE
+#   / DELETE, UPSERT (INSERT ... ON CONFLICT), INSERT ... SELECT,
+#   INSERT ... DEFAULT VALUES and subqueries in INSERT VALUES;
+# - compound SELECTs (UNION / UNION ALL / INTERSECT / EXCEPT between
+#   SELECT and VALUES cores) and FROM-clause derived tables;
+# - the query shape: LIMIT / OFFSET as general expressions,
+#   result-column aliases in WHERE / ON / GROUP BY / HAVING / ORDER
+#   BY, `x IN table`, INDEXED BY / NOT INDEXED, three-part column
+#   names;
+# - the `expr COLLATE name` operator, GLOB / NOT GLOB, LIKE ...
+#   ESCAPE, like() / glob(); the bitwise operators `& | << >> ~`, IS
+#   [NOT] DISTINCT FROM, postfix NOT NULL and row values;
+# - the function library -- printf() / format(), quote(), char(),
+#   unicode(), zeroblob(), randomblob(), random(),
+#   last_insert_rowid() / changes() / total_changes(), likely() /
+#   unlikely() / likelihood(), concat(), concat_ws(), octet_length(),
+#   unhex(), if() / n-ary iif(), sqlite_version(); string_agg(), the
+#   aggregate ORDER BY, FILTER (WHERE ...), median() and the
+#   percentile family;
+# - the PRAGMA statement (header values, flags, schema
+#   introspection, integrity_check / quick_check), `sqlite_schema` as
+#   a readable table and the table-valued `pragma_*` functions;
+# - executed views and WITH [RECURSIVE] common table expressions;
+# - SAVEPOINT / RELEASE / ROLLBACK TO, VACUUM [INTO] / REINDEX /
+#   ANALYZE, ALTER TABLE RENAME / RENAME COLUMN / DROP COLUMN,
+#   AUTOINCREMENT, TEMP tables / views / indexes and statements
+#   across the TEMP and main databases.
+# (Fixes to paths `query` already claims -- joins, NULLS FIRST /
+# LAST, collations, precedence, round(), the sum() rules, ... -- are
+# not gated: they live in `query` or below.) The heavyweight leaves
+# below build on it. The tiny profile excludes it per §2.
+sql = ["write"]
+# Bound parameters (ADR 0001) -- `?`, `?NNN`, `:name`, `@name`,
+# `$name` with the pin's numbering, the Statement bind_* /
+# parameter_* / clear_bindings / reset API, and re-execution of a
+# prepared statement. Depends on nothing: on top of the tiny profile
+# a parameter stands wherever its grammar takes a literal (INSERT
+# VALUES, WHERE rowid = ?); with the evaluator it is any expression.
+# The tiny profile excludes it per §2.
 params = []
-# v0.16 leaf (ADR 0001): the SQL math functions SQLite builds with
-# SQLITE_ENABLE_MATH_FUNCTIONS -- acos ... trunc, log(B, X), mod,
-# pi, pow -- over an in-crate floating-point library (no libm in
-# no_std: argument reduction plus double-double series, correctly
-# rounded). Needs only the v0.4 expression evaluator. The tiny
-# profile excludes it per §2.
-math = ["v04"]
-# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
-# `full`): window functions -- `f(...) OVER (PARTITION BY ...
-# ORDER BY ... frame)`, named windows (`WINDOW w AS (...)`, `OVER
-# w`, `OVER (w ...)`), ROWS / RANGE / GROUPS frames with EXCLUDE,
-# the built-in window functions (row_number, rank, dense_rank,
-# percent_rank, cume_dist, ntile, lag, lead, first_value,
-# last_value, nth_value) and every aggregate as a window function,
-# with the pin's frame engine (its step / inverse order, so REAL
-# sums round as they do there). Builds on the v0.16 aggregate
-# completion (FILTER, string_agg, the percentile family), so it
-# implies `v16`. The tiny profile excludes it per §2.
-window = ["v16"]
-# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
-# `full`): triggers -- CREATE [TEMP] TRIGGER [IF NOT EXISTS] ...
-# BEFORE | AFTER | INSTEAD OF INSERT | DELETE | UPDATE [OF cols]
-# ON table [FOR EACH ROW] [WHEN expr] BEGIN ...; END and DROP
-# TRIGGER, stored with the pin's text; bodies of INSERT / UPDATE /
-# DELETE / SELECT with NEW. / OLD. references and RAISE(), fired
-# in the pin's order with its recursion rules (PRAGMA
-# recursive_triggers, the depth limit), conflict-clause override,
-# changes() / last_insert_rowid() frames, REPLACE deletes and
-# INSTEAD OF triggers that make views writable; ALTER TABLE
-# rewrites trigger texts as the pin does. Builds on the v0.16
-# statement machinery (statement rollback, TEMP, ALTER), so it
-# implies `v16`. Without it a file's triggers are never skipped
+# The SQL math functions SQLite builds with
+# SQLITE_ENABLE_MATH_FUNCTIONS (ADR 0001) -- acos ... trunc,
+# log(B, X), mod, pi, pow -- over an in-crate floating-point library
+# (no libm in no_std: argument reduction plus double-double series,
+# correctly rounded). Needs only the expression evaluator, so it
+# implies `query`. The tiny profile excludes it per §2.
+math = ["query"]
+# Window functions (ADR 0001 / 0002: a heavyweight leaf, in `max`,
+# not `full`) -- `f(...) OVER (PARTITION BY ... ORDER BY ... frame)`,
+# named windows (`WINDOW w AS (...)`, `OVER w`, `OVER (w ...)`),
+# ROWS / RANGE / GROUPS frames with EXCLUDE, the built-in window
+# functions (row_number, rank, dense_rank, percent_rank, cume_dist,
+# ntile, lag, lead, first_value, last_value, nth_value) and every
+# aggregate as a window function, with the pin's frame engine (its
+# step / inverse order, so REAL sums round as they do there). Builds
+# on the aggregate completion of `sql` (FILTER, string_agg, the
+# percentile family), so it implies `sql`. The tiny profile excludes
+# it per §2.
+window = ["sql"]
+# Triggers (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
+# `full`) -- CREATE [TEMP] TRIGGER [IF NOT EXISTS] ... BEFORE | AFTER
+# | INSTEAD OF INSERT | DELETE | UPDATE [OF cols] ON table [FOR EACH
+# ROW] [WHEN expr] BEGIN ...; END and DROP TRIGGER, stored with the
+# pin's text; bodies of INSERT / UPDATE / DELETE / SELECT with NEW. /
+# OLD. references and RAISE(), fired in the pin's order with its
+# recursion rules (PRAGMA recursive_triggers, the depth limit),
+# conflict-clause override, changes() / last_insert_rowid() frames,
+# REPLACE deletes and INSTEAD OF triggers that make views writable;
+# ALTER TABLE rewrites trigger texts as the pin does. Builds on the
+# statement machinery of `sql` (statement rollback, TEMP, ALTER), so
+# it implies `sql`. Without it a file's triggers are never skipped
 # silently: writes to a table that has one are refused. The tiny
 # profile excludes it per §2.
-triggers = ["v16"]
-# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
-# `full`): foreign-key enforcement while `PRAGMA foreign_keys` is
-# ON -- the pin's per-statement and deferred violation counters
-# (DEFERRABLE INITIALLY DEFERRED keys checked at COMMIT / RELEASE,
-# PRAGMA defer_foreign_keys), ON DELETE / ON UPDATE CASCADE, SET
-# NULL, SET DEFAULT, RESTRICT and NO ACTION run as the pin's action
-# programs (firing the child's triggers when `triggers` is built
-# too), composite and self-referencing keys, "foreign key mismatch",
-# DROP TABLE's implicit DELETE, and PRAGMA foreign_key_check.
-# Parent keys are found through their PRIMARY KEY / UNIQUE index,
-# so it implies `indexes`; it builds on the v0.16 statement
-# machinery (statement rollback, savepoints), so it implies `v16`.
-# Without it a write to a table in a foreign key is refused while
-# the pragma is ON (never skipped silently). The tiny profile
-# excludes it per §2.
-foreign_keys = ["v16", "indexes"]
+triggers = ["sql"]
+# Foreign-key enforcement (ADR 0001 / 0002: a heavyweight leaf, in
+# `max`, not `full`) while `PRAGMA foreign_keys` is ON -- the pin's
+# per-statement and deferred violation counters (DEFERRABLE
+# INITIALLY DEFERRED keys checked at COMMIT / RELEASE, PRAGMA
+# defer_foreign_keys), ON DELETE / ON UPDATE CASCADE, SET NULL, SET
+# DEFAULT, RESTRICT and NO ACTION run as the pin's action programs
+# (firing the child's triggers when `triggers` is built too),
+# composite and self-referencing keys, "foreign key mismatch", DROP
+# TABLE's implicit DELETE, and PRAGMA foreign_key_check. Parent keys
+# are found through their PRIMARY KEY / UNIQUE index, so it implies
+# `indexes`; it builds on the statement machinery of `sql`
+# (statement rollback, savepoints), so it implies `sql`. Without it a
+# write to a table in a foreign key is refused while the pragma is
+# ON (never skipped silently). The tiny profile excludes it per §2.
+foreign_keys = ["sql", "indexes"]
 
-# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
-# `full`): the JSON functions -- json(), jsonb() and the pin's JSONB
-# binary format (byte-identical blobs), json_array / json_object,
-# json_extract and the -> / ->> operators, json_insert / replace /
-# set / remove / array_insert (and their jsonb_ forms), json_patch,
-# json_type, json_valid, json_quote, json_array_length,
-# json_error_position, json_pretty, the json_group_array /
-# json_group_object aggregates (window functions too when `window`
-# is built) and the json_each / json_tree table-valued functions,
-# with JSON5 input, the JSON subtype rules and the 1000-level
-# nesting limit. Builds on the v0.16 function library (printf's
-# value conversions, table-valued sources in FROM), so it implies
-# `v16`. The tiny profile excludes it per §2.
-json = ["v16"]
-# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
-# `full`): expression indexes, partial indexes and index-aware
-# planning -- CREATE [UNIQUE] INDEX ... ON t(expr [COLLATE c]
-# [DESC], ...) [WHERE expr] with the pin's restrictions
-# (deterministic functions only, no subqueries, parameters,
-# aggregates or qualified / rowid references in key expressions),
-# maintained on every write path (INSERT / UPDATE / DELETE /
-# REPLACE / upsert, UNIQUE enforced over the rows the WHERE admits,
-# upsert targets naming an expression or a partial index's WHERE),
-# PRAGMA index_info / index_xinfo (cid -2), integrity_check, REINDEX
-# and ALTER TABLE over them; and the planner that answers equality,
-# IN and range terms (and ORDER BY) through the rowid, PRIMARY KEY,
-# UNIQUE, ordinary, partial and expression indexes in SELECT,
-# subqueries, joins, UPDATE and DELETE, in the pin's row order.
-# Without it such indexes in a file are listed but refused for
-# writes (never left stale), and scans read the table in rowid
-# order. Builds on the v0.16 rule machinery (generated columns,
-# CHECK) and index collations, so it implies `v16` and `indexes`.
-# The tiny profile excludes it per §2.
-expr_index = ["v16", "indexes"]
-# v0.16 leaf (ADR 0001 / 0002: a heavyweight leaf, in `max`, not
-# `full`): WITHOUT ROWID tables -- CREATE TABLE ... WITHOUT ROWID
-# with the pin's rules and errors (PRIMARY KEY required, no
-# AUTOINCREMENT, no rowid / oid / _rowid_, NOT NULL PRIMARY KEY
-# columns, INTEGER PRIMARY KEY no rowid alias, repeated key
-# columns dropped, key collations and DESC ordering the tree),
-# stored as the pin stores them: a clustered index B-tree keyed by
-# the PRIMARY KEY with the other columns after it, secondary
-# indexes holding the key columns instead of a rowid, byte for
-# byte (files interoperate both ways). Every read and write path
-# works on them -- INSERT / UPDATE (moving a row whose key
-# changes) / DELETE / REPLACE / upsert / RETURNING, lookups and
-# scans in the pin's order, joins, views, triggers, foreign keys,
-# ALTER TABLE, DROP TABLE, VACUUM, the PRAGMAs and integrity_check
-# -- through a translation layer at the B-tree boundary
-# (`src/wr.rs`). Without it a file holding such a table is refused
-# at open, as before. Builds on the v0.16 statement machinery and
-# index B-trees, so it implies `v16` and `indexes`. The tiny
+# The JSON functions (ADR 0001 / 0002: a heavyweight leaf, in `max`,
+# not `full`) -- json(), jsonb() and the pin's JSONB binary format
+# (byte-identical blobs), json_array / json_object, json_extract and
+# the -> / ->> operators, json_insert / replace / set / remove /
+# array_insert (and their jsonb_ forms), json_patch, json_type,
+# json_valid, json_quote, json_array_length, json_error_position,
+# json_pretty, the json_group_array / json_group_object aggregates
+# (window functions too when `window` is built) and the json_each /
+# json_tree table-valued functions, with JSON5 input, the JSON
+# subtype rules and the 1000-level nesting limit. Builds on the
+# function library of `sql` (printf's value conversions,
+# table-valued sources in FROM), so it implies `sql`. The tiny
 # profile excludes it per §2.
-without_rowid = ["v16", "indexes"]
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): UTF-16
-# databases -- files whose header text encoding is 2 (UTF-16le) or 3
-# (UTF-16be) open and write as on the pin, and PRAGMA encoding =
-# 'UTF-16' / 'UTF-16le' / 'UTF-16be' picks one for a new database
-# (ignored once it has content). Records are translated at the
-# B-tree boundary (text is UTF-8 inside the engine); the BINARY
-# collation compares the UTF-16 bytes as the pin's memcmp does
-# (tables, indexes, ORDER BY, min / max, compounds, windows), and
-# hex(), CAST(... AS BLOB), octet_length() and every blob read as
-# text see UTF-16 (`src/utf16.rs`). Without it such a file is
-# refused at open (`Error::UnsupportedEncoding`), never misread.
-# Builds on the v0.16 PRAGMA machinery, so it implies `v16`. The
-# tiny profile excludes it per §2.
-utf16 = ["v16"]
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): write-ahead
-# logging -- files whose header says WAL (bytes 18 / 19 = 2) open
-# with the committed frames of their `-wal` file replayed (salts and
-# both checksum byte orders validated as the pin does, stopping at
-# the first invalid frame, frames after the last commit ignored);
-# PRAGMA journal_mode = WAL / DELETE switch in both directions;
-# commits append frames in the pin's layout (WAL header, salts,
-# cumulative checksums, commit markers) so the pin reads and
-# recovers hipp's log; PRAGMA wal_checkpoint (PASSIVE / FULL /
-# RESTART / TRUNCATE), the automatic checkpoint (PRAGMA
-# wal_autocheckpoint, 1000 pages by default), checkpoint and `-wal`
-# removal at `Connection::close`, PRAGMA synchronous levels and
-# journal_size_limit. Single-process, as the pin's
-# locking_mode=EXCLUSIVE: the wal-index lives in heap memory and no
-# `-shm` is written (a `-shm` another process holds is refused).
-# Without it a WAL file is refused at open (`Error::WalUnsupported`),
-# never read stale. Builds on the v0.16 PRAGMA and savepoint
-# machinery, so it implies `v16`. The tiny profile excludes it per §2.
-wal = ["v16"]
-# v0.16 leaf (ADR 0001 / 0002: in `max`; see STATUS.md for why not
-# `full`): the date and time functions -- date(), time(),
-# datetime(), julianday(), unixepoch(), strftime() (every
-# conversion the pin knows), timediff() and CURRENT_DATE /
-# CURRENT_TIME / CURRENT_TIMESTAMP in any expression -- as a model
-# of the pin's date.c: its integer-millisecond Julian day, every
-# time-value form and modifier (NNN units, +/-YYYY-MM-DD HH:MM,
-# start of / end of, weekday [-]N, unixepoch, julianday, auto,
-# localtime, utc, subsec, ceiling / floor) in its order and with
-# its rounding. 'now' reads `Config::clock` once per statement;
-# 'localtime' / 'utc' read `Config::tz_offset` (UTC without one;
-# the system clock and zone under `std`). Builds on the v0.16
-# function library (printf's REAL conversions), so it implies
-# `v16`. Without it the functions are unknown (the pin's "no such
-# function"), never wrong; DEFAULT CURRENT_* still works. The
-# tiny profile excludes it per §2.
-datetime = ["v16"]
+json = ["sql"]
+# Expression indexes, partial indexes and index-aware planning (ADR
+# 0001 / 0002: a heavyweight leaf, in `max`, not `full`) -- CREATE
+# [UNIQUE] INDEX ... ON t(expr [COLLATE c] [DESC], ...) [WHERE expr]
+# with the pin's restrictions (deterministic functions only, no
+# subqueries, parameters, aggregates or qualified / rowid references
+# in key expressions), maintained on every write path (INSERT /
+# UPDATE / DELETE / REPLACE / upsert, UNIQUE enforced over the rows
+# the WHERE admits, upsert targets naming an expression or a partial
+# index's WHERE), PRAGMA index_info / index_xinfo (cid -2),
+# integrity_check, REINDEX and ALTER TABLE over them; and the access
+# planner that answers equality, IN and range terms (and ORDER BY)
+# through the rowid, PRIMARY KEY, UNIQUE, ordinary, partial and
+# expression indexes in SELECT, subqueries, joins, UPDATE and DELETE,
+# in the pin's row order. Without it such indexes in a file are
+# listed but refused for writes (never left stale), and scans read
+# the table in rowid order. Builds on the rule machinery of `sql`
+# (generated columns, CHECK) and index collations, so it implies
+# `sql` and `indexes`. The tiny profile excludes it per §2.
+expr_index = ["sql", "indexes"]
+# WITHOUT ROWID tables (ADR 0001 / 0002: a heavyweight leaf, in
+# `max`, not `full`) -- CREATE TABLE ... WITHOUT ROWID with the pin's
+# rules and errors (PRIMARY KEY required, no AUTOINCREMENT, no rowid /
+# oid / _rowid_, NOT NULL PRIMARY KEY columns, INTEGER PRIMARY KEY no
+# rowid alias, repeated key columns dropped, key collations and DESC
+# ordering the tree), stored as the pin stores them: a clustered
+# index B-tree keyed by the PRIMARY KEY with the other columns after
+# it, secondary indexes holding the key columns instead of a rowid,
+# byte for byte (files interoperate both ways). Every read and write
+# path works on them -- INSERT / UPDATE (moving a row whose key
+# changes) / DELETE / REPLACE / upsert / RETURNING, lookups and scans
+# in the pin's order, joins, views, triggers, foreign keys, ALTER
+# TABLE, DROP TABLE, VACUUM, the PRAGMAs and integrity_check --
+# through a translation layer at the B-tree boundary (`src/wr.rs`).
+# Without it a file holding such a table is refused at open. Builds
+# on the statement machinery of `sql` and index B-trees, so it
+# implies `sql` and `indexes`. The tiny profile excludes it per §2.
+without_rowid = ["sql", "indexes"]
+# UTF-16 databases (ADR 0001 / 0002: in `max`, not `full`) -- files
+# whose header text encoding is 2 (UTF-16le) or 3 (UTF-16be) open and
+# write as on the pin, and PRAGMA encoding = 'UTF-16' / 'UTF-16le' /
+# 'UTF-16be' picks one for a new database (ignored once it has
+# content). Records are translated at the B-tree boundary (text is
+# UTF-8 inside the engine); the BINARY collation compares the UTF-16
+# bytes as the pin's memcmp does (tables, indexes, ORDER BY, min /
+# max, compounds, windows), and hex(), CAST(... AS BLOB),
+# octet_length() and every blob read as text see UTF-16
+# (`src/utf16.rs`). Without it such a file is refused at open
+# (`Error::UnsupportedEncoding`), never misread. Builds on the PRAGMA
+# machinery of `sql`, so it implies `sql`. The tiny profile excludes
+# it per §2.
+utf16 = ["sql"]
+# Write-ahead logging (ADR 0001 / 0002: in `max`, not `full`) --
+# files whose header says WAL (bytes 18 / 19 = 2) open with the
+# committed frames of their `-wal` file replayed (salts and both
+# checksum byte orders validated as the pin does, stopping at the
+# first invalid frame, frames after the last commit ignored); PRAGMA
+# journal_mode = WAL / DELETE switch in both directions; commits
+# append frames in the pin's layout (WAL header, salts, cumulative
+# checksums, commit markers) so the pin reads and recovers hipp's
+# log; PRAGMA wal_checkpoint (PASSIVE / FULL / RESTART / TRUNCATE),
+# the automatic checkpoint (PRAGMA wal_autocheckpoint, 1000 pages by
+# default), checkpoint and `-wal` removal at `Connection::close`,
+# PRAGMA synchronous levels and journal_size_limit. Single-process,
+# as the pin's locking_mode=EXCLUSIVE: the wal-index lives in heap
+# memory and no `-shm` is written (a `-shm` another process holds is
+# refused). Without it a WAL file is refused at open
+# (`Error::WalUnsupported`), never read stale. Builds on the PRAGMA
+# and savepoint machinery of `sql`, so it implies `sql`. The tiny
+# profile excludes it per §2.
+wal = ["sql"]
+# The date and time functions (ADR 0001 / 0002: in `max`; see
+# STATUS.md for why not `full`) -- date(), time(), datetime(),
+# julianday(), unixepoch(), strftime() (every conversion the pin
+# knows), timediff() and CURRENT_DATE / CURRENT_TIME /
+# CURRENT_TIMESTAMP in any expression -- as a model of the pin's
+# date.c: its integer-millisecond Julian day, every time-value form
+# and modifier (NNN units, +/-YYYY-MM-DD HH:MM, start of / end of,
+# weekday [-]N, unixepoch, julianday, auto, localtime, utc, subsec,
+# ceiling / floor) in its order and with its rounding. 'now' reads
+# `Config::clock` once per statement; 'localtime' / 'utc' read
+# `Config::tz_offset` (UTC without one; the system clock and zone
+# under `std`). Builds on the function library of `sql` (printf's
+# REAL conversions), so it implies `sql`. Without it the functions
+# are unknown (the pin's "no such function"), never wrong; DEFAULT
+# CURRENT_* still works. The tiny profile excludes it per §2.
+datetime = ["sql"]
 
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): ATTACH /
-# DETACH and statements across several databases -- `ATTACH
-# [DATABASE] expr AS expr` (a file, ':memory:', '' for a private
-# temporary database) and `DETACH [DATABASE] expr` with the pin's
-# limit of 10 attached databases and its errors; schema-qualified
-# names (`aux.t`, `aux.t.col`, `aux.sqlite_schema`, `PRAGMA aux.x`,
+# ATTACH / DETACH and statements across several databases (ADR 0001
+# / 0002: in `max`, not `full`) -- `ATTACH [DATABASE] expr AS expr`
+# (a file, ':memory:', '' for a private temporary database) and
+# `DETACH [DATABASE] expr` with the pin's limit of 10 attached
+# databases and its errors; schema-qualified names (`aux.t`,
+# `aux.t.col`, `aux.sqlite_schema`, `PRAGMA aux.x`,
 # `aux.pragma_table_info(...)`) everywhere the pin takes them, the
 # pin's unqualified-name order (temp, main, then attached in attach
 # order), DDL / ALTER / VACUUM / REINDEX / ANALYZE in an attached
@@ -314,32 +259,32 @@ datetime = ["v16"]
 # honours. Each attached database is a `Connection` of the main
 # one's storage type, opened through `Connection::set_attach_hook`
 # (no_std) or `Storage::open_attached` (`FileStorage` under `std`).
-# Builds on the v0.16 TEMP-database routing, so it implies `v16`.
+# Builds on the TEMP-database routing of `sql`, so it implies `sql`.
 # Without it ATTACH / DETACH are refused (`UnsupportedStatement`)
-# and a qualifier other than main / temp is refused as before. The
-# tiny profile excludes it per §2.
-attach = ["v16"]
+# and a qualifier other than main / temp is refused. The tiny
+# profile excludes it per §2.
+attach = ["sql"]
 
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): auto-vacuum
-# files -- the pin's pointer-map pages (btree.c's ptrmap logic) kept
-# correct by every write (ROOTPAGE, FREEPAGE, OVERFLOW1, OVERFLOW2
-# and BTREE entries, re-derived from the trees and the freelist at
-# commit), CREATE TABLE / INDEX placing the new root at the pin's
-# page (moving the page there), DROP TABLE / INDEX moving the last
-# root into the freed slot and rewriting sqlite_schema.rootpage,
-# auto_vacuum = FULL's truncation at every commit (the pin's
-# autoVacuumCommit), auto_vacuum = INCREMENTAL with PRAGMA
-# incremental_vacuum[(N)], PRAGMA auto_vacuum on an empty database
-# (and between FULL and INCREMENTAL) and VACUUM / VACUUM INTO of an
-# auto-vacuum file keeping its mode (`src/autovac.rs`). Without it an
-# auto-vacuum file is read but every write is refused
-# (`Error::AutoVacuumUnsupported`), never left with stale maps.
-# Builds on the v0.16 PRAGMA and VACUUM machinery, so it implies
-# `v16`. The tiny profile excludes it per §2.
-autovacuum = ["v16"]
+# Auto-vacuum files (ADR 0001 / 0002: in `max`, not `full`) -- the
+# pin's pointer-map pages (btree.c's ptrmap logic) kept correct by
+# every write (ROOTPAGE, FREEPAGE, OVERFLOW1, OVERFLOW2 and BTREE
+# entries, re-derived from the trees and the freelist at commit),
+# CREATE TABLE / INDEX placing the new root at the pin's page (moving
+# the page there), DROP TABLE / INDEX moving the last root into the
+# freed slot and rewriting sqlite_schema.rootpage, auto_vacuum =
+# FULL's truncation at every commit (the pin's autoVacuumCommit),
+# auto_vacuum = INCREMENTAL with PRAGMA incremental_vacuum[(N)],
+# PRAGMA auto_vacuum on an empty database (and between FULL and
+# INCREMENTAL) and VACUUM / VACUUM INTO of an auto-vacuum file
+# keeping its mode (`src/autovac.rs`). Without it an auto-vacuum file
+# is read but every write is refused (`Error::AutoVacuumUnsupported`),
+# never left with stale maps. Builds on the PRAGMA and VACUUM
+# machinery of `sql`, so it implies `sql`. The tiny profile excludes
+# it per §2.
+autovacuum = ["sql"]
 
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): virtual tables --
-# one internal module abstraction modelled on the pin's sqlite3_module
+# Virtual tables (ADR 0001 / 0002: in `max`, not `full`) -- one
+# internal module abstraction modelled on the pin's sqlite3_module
 # (xBestIndex with constraint / ORDER BY usage, cost, rows, idxNum,
 # idxStr, orderByConsumed; xFilter / xNext / xEof / xColumn / xRowid;
 # xUpdate; hidden columns; eponymous modules), Rust traits with no C
@@ -351,120 +296,110 @@ autovacuum = ["v16"]
 # `generate_series` (as the pin's shell ships it) and `dbstat`
 # (eponymous, or CREATE VIRTUAL TABLE ... USING dbstat(schema)).
 # Shadow tables are read only, as under the pin shell's defensive
-# mode. Builds on the v0.16 table-valued sources and PRAGMA machinery,
-# so it implies `v16`. Without it a file holding a virtual table is
-# refused at open, as before. The tiny profile excludes it per Sec. 2.
-vtab = ["v16"]
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): the R*Tree
-# module of the pin's rtree.c -- rtree / rtree_i32 tables of 1 to 5
-# dimensions with auxiliary `+columns`, shadow tables %_node /
-# %_parent / %_rowid byte-compatible with the pin's (node size from
-# the page size, its ChooseLeaf / R*-tree split / delete-and-reinsert
-# algorithm and node numbering, float32 coordinates rounded outward
-# as rtreeValueDown / rtreeValueUp), its xBestIndex (rowid lookups,
-# coordinate =, <, <=, >, >=, BETWEEN), its constraint errors and
-# REPLACE handling, rtreecheck(), rtreenode(), rtreedepth()
-# (`src/rtree.rs`, `session::rtree`). MATCH (geometry callbacks) is
-# refused. Implies `vtab`. The tiny profile excludes it per Sec. 2.
+# mode. Builds on the table-valued sources and PRAGMA machinery of
+# `sql`, so it implies `sql`. Without it a file holding a virtual
+# table is refused at open. The tiny profile excludes it per Sec. 2.
+vtab = ["sql"]
+# The R*Tree module of the pin's rtree.c (ADR 0001 / 0002: in `max`,
+# not `full`) -- rtree / rtree_i32 tables of 1 to 5 dimensions with
+# auxiliary `+columns`, shadow tables %_node / %_parent / %_rowid
+# byte-compatible with the pin's (node size from the page size, its
+# ChooseLeaf / R*-tree split / delete-and-reinsert algorithm and node
+# numbering, float32 coordinates rounded outward as rtreeValueDown /
+# rtreeValueUp), its xBestIndex (rowid lookups, coordinate =, <, <=,
+# >, >=, BETWEEN), its constraint errors and REPLACE handling,
+# rtreecheck(), rtreenode(), rtreedepth() (`src/rtree.rs`,
+# `session::rtree`). MATCH (geometry callbacks) is refused. Implies
+# `vtab`. The tiny profile excludes it per Sec. 2.
 rtree = ["vtab"]
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): FTS5 full-text
-# search as the pin's fts5 module -- CREATE VIRTUAL TABLE ... USING
-# fts5(cols [UNINDEXED], prefix=, tokenize='unicode61 | ascii | porter
-# | trigram ...', content=, content_rowid=, columnsize=, detail=,
-# contentless_delete=) with the pin's shadow tables (%_data structure,
-# averages and segment b-trees, %_idx, %_content, %_docsize,
-# %_config) byte for byte, its pending-terms flushes, segment writer,
-# automerge / crisismerge / optimize / merge; the full-text query
-# language (phrases, prefix*, ^, NEAR, column filters, AND / OR / NOT)
-# through MATCH and `t = '...'`, rank and ORDER BY rank, bm25(),
-# highlight(), snippet(), fts5vocab tables, the special INSERT
-# commands and integrity-check (`src/fts5/`, `session::fts5`). Its
-# shadow tables %_idx / %_config are WITHOUT ROWID and bm25() needs
-# the in-crate log(), so it implies `vtab`, `without_rowid` and
-# `math`. The tiny profile excludes it per Sec. 2.
+# FTS5 full-text search as the pin's fts5 module (ADR 0001 / 0002:
+# in `max`, not `full`) -- CREATE VIRTUAL TABLE ... USING fts5(cols
+# [UNINDEXED], prefix=, tokenize='unicode61 | ascii | porter |
+# trigram ...', content=, content_rowid=, columnsize=, detail=,
+# contentless_delete=) with the pin's shadow tables (%_data
+# structure, averages and segment b-trees, %_idx, %_content,
+# %_docsize, %_config) byte for byte, its pending-terms flushes,
+# segment writer, automerge / crisismerge / optimize / merge; the
+# full-text query language (phrases, prefix*, ^, NEAR, column
+# filters, AND / OR / NOT) through MATCH and `t = '...'`, rank and
+# ORDER BY rank, bm25(), highlight(), snippet(), fts5vocab tables,
+# the special INSERT commands and integrity-check (`src/fts5/`,
+# `session::fts5`). Its shadow tables %_idx / %_config are WITHOUT
+# ROWID and bm25() needs the in-crate log(), so it implies `vtab`,
+# `without_rowid` and `math`. The tiny profile excludes it per Sec. 2.
 fts5 = ["vtab", "without_rowid", "math"]
-# v0.17 leaf (ADR 0004: past `max`, in `xl`): FTS5 delete writes as
-# the pin's fts5_index.c makes them -- DELETE / UPDATE / INSERT OR
-# REPLACE on `contentless_delete=1` tables write tombstone hash pages
+# FTS5 delete writes as the pin's fts5_index.c makes them (ADR 0004:
+# past `max`, in `xl`) -- DELETE / UPDATE / INSERT OR REPLACE on
+# `contentless_delete=1` tables write tombstone hash pages
 # (fts5IndexTombstoneAdd / Rebuild: 4- or 8-byte keys, page growth,
 # nEntryTombstone / nPgTombstone in the structure record, the
 # tombstones counted as automerge work), and with `secure-delete=1`
 # every delete removes the row's entries from the segments in place
 # (fts5FlushSecureDelete / fts5DoSecureDelete: leaf entries, terms,
-# overflow pages, page indexes, `%_idx` rows, `version` 5);
-# UPDATE of only UNINDEXED columns of a contentless table is the
-# pin's no-op (`src/fts5/sdel.rs`, `session::fts5`). Without it those
-# writes are refused as before. Implies `fts5`.
+# overflow pages, page indexes, `%_idx` rows, `version` 5); UPDATE
+# of only UNINDEXED columns of a contentless table is the pin's
+# no-op (`src/fts5/sdel.rs`, `session::fts5`). Without it those
+# writes are refused. Implies `fts5`.
 fts5_delete = ["fts5"]
 
-# v0.17 leaf (ADR 0004: past `max`, in `xl`): the pin's join planner
-# for queries over several tables -- where.c's wherePathSolver (the
-# N-best path search, mxChoice by join size and the star-query
-# heuristic, sorting costs for ORDER BY / GROUP BY / DISTINCT, the
-# interstage heuristic), per-loop costs with prerequisites
-# (whereLoopAddBtree / whereLoopAddBtreeIndex / whereLoopOutputAdjust),
-# the CROSS / LEFT JOIN ordering constraints and LEFT-to-inner
-# simplification, and automatic indexes (constructAutomaticIndex:
-# an ephemeral covering index built once per statement, partial when
-# the WHERE constrains the table alone, with the pin's Bloom filter),
-# plus the sqlite_stat1 row estimates read back at schema load and
-# after ANALYZE (`src/xjoin.rs`, `session::join`). Virtual tables and
-# JSON table-valued functions join the order by their xBestIndex
-# costs, so a MATCH or a table-valued argument may read a table
-# listed later in FROM. The executor runs the sources in the chosen
-# order and EXPLAIN QUERY PLAN prints it. Without it joins run in
-# FROM order, each source with its own best loop. Builds on the
-# `expr_index` access planner, so it implies `v16` and `expr_index`.
-join_order = ["v16", "expr_index"]
-# v0.17 leaf (ADR 0001 / 0004: past `max`'s budget, in `xl`): the
-# pin's other index strategies (`src/xplan.rs`, `src/xjoin.rs`) --
-# the MULTI-INDEX OR plan (whereLoopAddOr: each OR branch read
-# through its own index, rows in the pin's branch order, each row
-# once), for one table and as a join loop; the min() / max()
-# optimisation (a lone min(x) / max(x) read in x's order, stopping
-# at the first row, `SEARCH t` in EXPLAIN QUERY PLAN); skip-scans
-# of an index's leading column when sqlite_stat1 justifies them
-# (`ANY(a) AND b=?`); the IN operator's statistics rules
-# (whereLoopAddBtreeIndex: an IN the index should not probe); and
-# whereLoopInsert / whereLoopAdjustCost for single-table loops.
-# Without it a table's OR terms filter a scan and min() / max() read
-# the whole table, as in 0.16. Builds on the join planner, so it
-# implies `join_order`.
-multi_index = ["join_order"]
-# v0.17 leaf (ADR 0001 / 0004: past `max`'s budget, in `xl`): the
-# pin's query flattener and its neighbours (`session::flatten`) --
-# sqlite3FlattenSubquery's merge of a FROM subquery, view or CTE into
-# its reader (its numbered restrictions, the LEFT JOIN's null-row
-# guard, the subquery's LIMIT / ORDER BY moving out), so the merged
-# tables join the join planner's order as ordinary FROM sources;
-# pushDownWhereTerms' copy of a WHERE term into a subquery that is
-# not flattened (into its HAVING when it aggregates, as the pin's
-# havingToWhere moves it on); the omission of a co-routine's or
-# materialisation's result columns its reader never reads (so an
-# error in one is never raised, as on the pin); the EXISTS-to-join
-# rewrite (existsToJoin: `SEARCH t EXISTS`, a semi-join loop); and
-# EXPLAIN QUERY PLAN's foreign-key child scans of a parent DELETE /
-# UPDATE. Without it subqueries, views and CTEs run as co-routines
-# or materialisations in FROM order, as in 0.16. Builds on the join
-# planner, so it implies `join_order`.
-flatten = ["join_order"]
+# The pin's query planner past the single-table access paths (ADR
+# 0004 / 0006: past `max`'s budget, in `xl`):
+# - the join planner (`src/xjoin.rs`, `session::join`) -- where.c's
+#   wherePathSolver (the N-best path search, mxChoice by join size
+#   and the star-query heuristic, sorting costs for ORDER BY / GROUP
+#   BY / DISTINCT, the interstage heuristic), per-loop costs with
+#   prerequisites (whereLoopAddBtree / whereLoopAddBtreeIndex /
+#   whereLoopOutputAdjust), the CROSS / LEFT JOIN ordering
+#   constraints and LEFT-to-inner simplification, automatic indexes
+#   (constructAutomaticIndex: an ephemeral covering index built once
+#   per statement, partial when the WHERE constrains the table
+#   alone, with the pin's Bloom filter) and the sqlite_stat1 row
+#   estimates read back at schema load and after ANALYZE; virtual
+#   tables and JSON table-valued functions join the order by their
+#   xBestIndex costs, the executor runs the sources in the chosen
+#   order and EXPLAIN QUERY PLAN prints it;
+# - the other index strategies (`src/xplan.rs`, `src/xmulti.rs`) --
+#   the MULTI-INDEX OR plan (whereLoopAddOr: each OR branch read
+#   through its own index, rows in the pin's branch order, each row
+#   once), for one table and as a join loop; the min() / max()
+#   optimisation (a lone min(x) / max(x) read in x's order, stopping
+#   at the first row); skip-scans of an index's leading column when
+#   sqlite_stat1 justifies them (`ANY(a) AND b=?`); the IN operator's
+#   statistics rules; whereLoopInsert / whereLoopAdjustCost for
+#   single-table loops;
+# - the query flattener and its neighbours (the session's flattener) --
+#   sqlite3FlattenSubquery's merge of a FROM subquery, view or CTE
+#   into its reader (its numbered restrictions, the LEFT JOIN's
+#   null-row guard, the subquery's LIMIT / ORDER BY moving out);
+#   pushDownWhereTerms' copy of a WHERE term into a subquery that is
+#   not flattened (into its HAVING when it aggregates); the omission
+#   of a co-routine's or materialisation's result columns its reader
+#   never reads; the EXISTS-to-join rewrite (existsToJoin: a
+#   semi-join loop); and EXPLAIN QUERY PLAN's foreign-key child
+#   scans of a parent DELETE / UPDATE.
+# Without it joins run in FROM order, each source with its own best
+# loop; a table's OR terms filter a scan, min() / max() read the
+# whole table, and subqueries, views and CTEs run as co-routines or
+# materialisations. Builds on the `expr_index` access planner, so it
+# implies `sql` and `expr_index`.
+planner = ["sql", "expr_index"]
 
-# v0.16 leaf (ADR 0001 / 0002: in `max`, not `full`): EXPLAIN QUERY
-# PLAN -- `EXPLAIN QUERY PLAN <statement>` returns the pin's four
-# columns (id, parent, notused, detail) describing the plan hipp
-# executes, in the pin's words: SCAN / SEARCH loops with the index,
-# INTEGER PRIMARY KEY, PRIMARY KEY or COVERING INDEX and the probed
-# key columns, LEFT-JOIN, RIGHT-JOIN, the USE TEMP B-TREE sorters,
+# EXPLAIN QUERY PLAN (ADR 0001 / 0002: in `max`, not `full`) --
+# `EXPLAIN QUERY PLAN <statement>` returns the pin's four columns
+# (id, parent, notused, detail) describing the plan hipp executes, in
+# the pin's words: SCAN / SEARCH loops with the index, INTEGER
+# PRIMARY KEY, PRIMARY KEY or COVERING INDEX and the probed key
+# columns, LEFT-JOIN, RIGHT-JOIN, the USE TEMP B-TREE sorters,
 # (CORRELATED) SCALAR / LIST SUBQUERY n with the pin's subquery
 # numbers, CO-ROUTINE / MATERIALIZE of FROM subqueries, views and
-# CTEs, recursive CTEs, compound MERGE / COMPOUND QUERY trees,
-# window co-routines, VIRTUAL TABLE INDEX n:str and SCAN CONSTANT
-# ROW (`session::eqp`). The CLI prints the pin shell's tree. Plain
+# CTEs, recursive CTEs, compound MERGE / COMPOUND QUERY trees, window
+# co-routines, VIRTUAL TABLE INDEX n:str and SCAN CONSTANT ROW
+# (`session::eqp`). The CLI prints the pin shell's tree. Plain
 # EXPLAIN (a bytecode listing) is refused: hipp has no bytecode.
-# Builds on the v0.16 planner, so it implies `v16`. Without it
+# Builds on the planning of `sql`, so it implies `sql`. Without it
 # EXPLAIN is an unsupported statement. The tiny profile excludes it
 # per Sec. 2.
-explain = ["v16"]
+explain = ["sql"]
 
 [dependencies]
 

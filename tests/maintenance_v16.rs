@@ -23,7 +23,7 @@
 //! continuing past errors; rows and failing statements must agree
 //! and the oracle must read hipp's final file as it reads its own.
 
-#![cfg(feature = "v16")]
+#![cfg(feature = "sql")]
 
 mod common;
 

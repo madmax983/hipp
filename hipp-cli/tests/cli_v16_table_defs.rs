@@ -4,7 +4,7 @@
 //! expression and signed DEFAULTs (REAL and text conversions
 //! included), VIRTUAL / STORED generated columns with REAL and
 //! TEXT affinities, indexes on generated columns, and under
-//! `v16` STRICT tables, INSERT ... DEFAULT VALUES and CREATE
+//! `sql` STRICT tables, INSERT ... DEFAULT VALUES and CREATE
 //! TABLE ... AS SELECT. Each batch runs one-shot and over stdin,
 //! and the hipp-written file must pass the oracle's integrity
 //! check.

@@ -7,7 +7,7 @@
 //! finalize functions do:
 //!
 //! - DISTINCT keeps the first of equal values (under the argument's
-//!   collation) in input order; with an aggregate ORDER BY (`v16`)
+//!   collation) in input order; with an aggregate ORDER BY (`sql`)
 //!   the kept rows are then stably sorted by the keys (ties keep
 //!   input order — the pin's sorter carries a sequence number).
 //!   When the ORDER BY is the DISTINCT argument itself the pin
@@ -24,7 +24,7 @@
 //!   before it (none before the first value, nothing for a NULL
 //!   separator).
 //! - `median` / `percentile` / `percentile_cont` /
-//!   `percentile_disc` (`v16`) are the pin's percentile extension
+//!   `percentile_disc` (`sql`) are the pin's percentile extension
 //!   (built in with `SQLITE_ENABLE_PERCENTILE`): P is validated on
 //!   every stepped row (NULL Y included) and must stay within
 //!   0.001 of the first row's fraction; Y must be an INTEGER or a
@@ -160,7 +160,7 @@ fn fold_rows(
         }
         idx = kept;
     }
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if !p.order.is_empty() {
         let n = p.args.len();
         let keys = |i: usize| {
@@ -266,7 +266,7 @@ fn fold_rows(
                 OwnedValue::Null
             })
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         AggKind::Median
         | AggKind::Percentile
         | AggKind::PercentileCont
@@ -465,9 +465,9 @@ impl SumCtx {
     }
 }
 
-/// The percentile family over the stepped rows (`v16`): see the
+/// The percentile family over the stepped rows (`sql`): see the
 /// module notes.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn percentile(
     kind: AggKind,
     sel: &[&[OwnedValue]],

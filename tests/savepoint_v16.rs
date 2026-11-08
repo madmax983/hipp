@@ -28,7 +28,7 @@
 //! must read hipp's final file as it reads its own (integrity
 //! check and `.dump`).
 
-#![cfg(feature = "v16")]
+#![cfg(feature = "sql")]
 
 mod common;
 

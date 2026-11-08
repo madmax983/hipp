@@ -4,7 +4,7 @@
 //! GROUP BY, DISTINCT, aggregates and compounds (REAL, NULL and
 //! blob rendering mixed in), NOCASE / RTRIM indexes and UNIQUE
 //! constraints under OR IGNORE / OR REPLACE / upsert, and under
-//! `v16` the COLLATE operator, GLOB, LIKE ... ESCAPE and the
+//! `sql` the COLLATE operator, GLOB, LIKE ... ESCAPE and the
 //! like() / glob() functions. Each batch runs one-shot and over
 //! stdin, and the hipp-written file must pass the oracle's
 //! integrity check.

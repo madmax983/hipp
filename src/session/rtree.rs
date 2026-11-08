@@ -253,7 +253,6 @@ fn rowid_expr<E>(arena: &Arena) -> Result<Expr, E> {
     Ok(Expr::Column {
         table: None,
         name: arena.alloc_copy_handle(b"rowid")?,
-        #[cfg(feature = "v16")]
         schema: None,
     })
 }

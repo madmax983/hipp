@@ -1,4 +1,4 @@
-//! hipp-cli v0.17 join ordering (leaf `join_order`): byte-for-byte
+//! hipp-cli v0.17 join ordering (leaf `planner`): byte-for-byte
 //! the pinned oracle's stdout for joins the pin reorders — the rows of
 //! a query without ORDER BY in the pin's order and EXPLAIN QUERY PLAN
 //! statements' trees (SCAN / SEARCH order, AUTOMATIC [PARTIAL]

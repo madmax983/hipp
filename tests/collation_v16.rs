@@ -39,7 +39,7 @@
 //!   the other's integrity check, and tables with such indexes
 //!   are writable (they used to be refused as foreign).
 //! - Unknown collation names are refused (`UnknownCollation`).
-//! - Under `v16`: the `expr COLLATE name` operator, GLOB / NOT
+//! - Under `sql`: the `expr COLLATE name` operator, GLOB / NOT
 //!   GLOB, `LIKE ... ESCAPE`, `like()` / `glob()`; LIKE folds
 //!   ASCII only, both read operands up to their first NUL.
 
@@ -677,7 +677,7 @@ fn upsert_excluded_compares_binary_without_affinity() {
          (excluded.a < 'Y') || max(excluded.a, a) || (excluded.a IN (a))",
         "SELECT * FROM q",
     ]);
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     tw.all(&[
         "INSERT INTO q VALUES (1, 'X', 1, 'z', 1) ON CONFLICT (a) DO UPDATE SET s = \
          (excluded.a COLLATE NOCASE = 'x') || ('x' = excluded.a COLLATE NOCASE)",
@@ -858,7 +858,7 @@ fn files_naming_unknown_collations_still_open() {
 
 // ---------------- the COLLATE operator (v16) ----------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn collate_operator_wins_comparisons() {
     let tw = twins("op", TABLE);
@@ -937,7 +937,7 @@ fn like_folds_ascii_only_and_reads_to_nul() {
          x'41' LIKE 'a', 'a' LIKE x'41', 12 LIKE '1%', 2.5 LIKE '2._'",
         "SELECT x, x LIKE 'a%', x LIKE '%B', x NOT LIKE '_' FROM s ORDER BY rowid",
     ]);
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     tw.same("SELECT 'a' COLLATE NOCASE LIKE 'A'");
     // The pattern-length limit (50,000 bytes, checked before
     // matching). A larger statement arena holds the literal.
@@ -970,7 +970,7 @@ fn like_folds_ascii_only_and_reads_to_nul() {
     }
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn glob_escape_and_the_pattern_functions() {
     let tw = twins("glob", "CREATE TABLE t(a)");
@@ -1020,7 +1020,7 @@ fn glob_escape_and_the_pattern_functions() {
 /// A deterministic corpus of random patterns and subjects over
 /// the wildcard / class / escape / case alphabet: LIKE, LIKE
 /// ESCAPE and GLOB answers must match the oracle's exactly.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn generated_pattern_corpus_matches_oracle() {
     let tw = twins("pcorpus", "CREATE TABLE t(a)");

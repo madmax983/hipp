@@ -28,7 +28,7 @@
 //!   sources named `q` are ambiguous; a derived compound's column
 //!   affinity is demoted across its cores.
 
-#![cfg(feature = "v16")]
+#![cfg(feature = "sql")]
 
 mod common;
 

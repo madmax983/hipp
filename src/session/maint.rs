@@ -1,4 +1,4 @@
-//! Savepoints and the maintenance statements (v0.16, `v16`).
+//! Savepoints and the maintenance statements (v0.16, `sql`).
 //!
 //! - `SAVEPOINT name` / `RELEASE [SAVEPOINT] name` / `ROLLBACK
 //!   [TRANSACTION] TO [SAVEPOINT] name`, with the pin's nesting:
@@ -1236,9 +1236,9 @@ impl<S: Storage> Statement<'_, S> {
             encode_record(vals.as_slice(), &mut rec);
             btree::btree_insert(&mut self.conn.pager, root, next, rec.as_slice()).await?;
         }
-        // v0.17 (`join_order`): the planner reads the new statistics,
+        // v0.17 (`planner`): the planner reads the new statistics,
         // as the pin's `sqlite3AnalysisLoad` after ANALYZE.
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         alloc::boxed::Box::pin(self.conn.analysis_load(Some(root))).await?;
         Ok(())
     }

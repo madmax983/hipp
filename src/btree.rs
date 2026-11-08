@@ -658,13 +658,13 @@ impl ScanCursor {
 }
 
 /// The rowid a new row without an explicit one takes in the table
-/// rooted at `root` (v0.16, `v16`): one past the largest, 1 for an
+/// rooted at `root` (v0.16, `sql`): one past the largest, 1 for an
 /// empty table, and when the largest is 9223372036854775807 the
 /// smallest unused positive rowid — the pin picks a random unused
 /// one, and any unused rowid serves (v0.16 review fix: ANALYZE and
 /// INSERT failed there). `DatabaseFull` when every positive rowid
-/// is taken. Without `v16` such an insert fails.
-#[cfg(feature = "v16")]
+/// is taken. Without `sql` such an insert fails.
+#[cfg(feature = "sql")]
 pub async fn new_rowid<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<i64, S::Error> {
     // A WITHOUT ROWID table's new row (v0.16): a fresh handle.
     #[cfg(feature = "without_rowid")]
@@ -2825,7 +2825,7 @@ pub async fn btree_delete<S: Storage>(
 /// Local-payload byte count for an index cell (SQFMT §1.6):
 /// X = ((U-12)*64/255)-23; if P > X, M = ((U-12)*32/255)-23 and
 /// K = M + ((P-M) mod (U-4)); keep K if K <= X else M.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub fn index_local(usable: usize, payload_len: usize) -> usize {
     let x = (usable - 12) * 64 / 255 - 23;
     if payload_len <= x {
@@ -2840,7 +2840,7 @@ pub fn index_local(usable: usize, payload_len: usize) -> usize {
 /// `fillInCell` pads a shorter one with zeros; v0.16: only a WITHOUT
 /// ROWID table's records, with no rowid, are that short). `after` is
 /// what follows the cell on its page, read for the padding bytes.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 #[inline(always)]
 fn pad_cell(img: &mut AVec<u8>, after: &[u8]) {
     #[cfg(feature = "without_rowid")]
@@ -2855,7 +2855,7 @@ fn pad_cell(img: &mut AVec<u8>, after: &[u8]) {
 }
 
 /// One parsed index cell (leaf or interior).
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 #[derive(Clone)]
 pub struct IndexCell {
     /// Left child page (interior cells only; 0 in leaf cells).
@@ -2870,7 +2870,7 @@ pub struct IndexCell {
     pub payload_off: usize,
 }
 
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 impl IndexCell {
     pub fn local_bytes(&self) -> &[u8] {
         &self.bytes.as_slice()[self.payload_off..self.payload_off + self.local_len]
@@ -2879,7 +2879,7 @@ impl IndexCell {
 
 /// Where an index cell's parts sit on its page (everything
 /// `parse_index_cell` reads from the cell, before copying it out).
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 struct IndexCellLayout {
     child: u32,
     payload_len: usize,
@@ -2891,7 +2891,7 @@ struct IndexCellLayout {
     total: usize,
 }
 
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 fn index_cell_layout<E>(
     bytes: &[u8],
     at: usize,
@@ -2938,7 +2938,7 @@ fn index_cell_layout<E>(
     })
 }
 
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 fn parse_index_cell<E>(
     bytes: &[u8],
     at: usize,
@@ -2961,7 +2961,7 @@ fn parse_index_cell<E>(
 }
 
 /// Parse all cells of an index leaf page.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub fn index_leaf_cells<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec<IndexCell>, E> {
     let h = head::<E>(bytes, page)?;
     if h.kind != KIND_LEAF_INDEX {
@@ -2977,7 +2977,7 @@ pub fn index_leaf_cells<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVe
 
 /// Parse an index interior page: cells (each with its left child)
 /// plus the rightmost child.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub fn index_interior_cells<E>(
     bytes: &[u8],
     page: u32,
@@ -3155,8 +3155,8 @@ pub fn decode_index_entry<E>(payload: &[u8], nfields: usize) -> Result<IndexEntr
 }
 
 /// Every key payload of the index rooted at `root`, raw, in key
-/// order (v0.16, `v16`: VACUUM copies indexes byte for byte).
-#[cfg(all(feature = "v16", feature = "indexes"))]
+/// order (v0.16, `sql`: VACUUM copies indexes byte for byte).
+#[cfg(all(feature = "sql", feature = "indexes"))]
 pub async fn index_payloads<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -4387,14 +4387,14 @@ pub async fn index_prefix_rowids<S: Storage>(
 }
 
 /// `PRAGMA integrity_check`'s index probe for one row (v0.16,
-/// `v16`): whether the entry `key` + `rowid` is found by the pin's
+/// `sql`): whether the entry `key` + `rowid` is found by the pin's
 /// seek (`sqlite3BtreeIndexMoveto`: each page binary-searched, see
 /// `LazyPage::search`), and — for a `unique` index — whether the entry
 /// after it does not sort above `key` (the pin's `OP_Next` +
 /// `OP_IdxGT`: "non-unique entry"). Only the cells the search
 /// visits are decoded, as on the pin, so damage elsewhere on a
 /// page does not stop the check.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 pub async fn index_check_entry<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -4516,14 +4516,14 @@ pub async fn index_check_entry<S: Storage>(
 }
 
 /// The pin's index-record comparison (`xRecordCompare`, v0.16,
-/// `v16`): index cell payload `rec` against the full key `probe`
+/// `sql`): index cell payload `rec` against the full key `probe`
 /// (key values + rowid) under `desc`, field by field from the raw
 /// record — a field's body is read only when its type needs it, so
 /// a damaged record compares as the pin's does (its fast paths for
 /// an integer or BINARY text first field included). `None` is the
 /// pin's corruption verdict (`errCode`), which it reports only if
 /// the comparison then reads as equal.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn pin_rec_cmp(
     rec: &[u8],
     probe: &[OwnedValue],
@@ -4590,7 +4590,7 @@ fn pin_rec_cmp(
 
 /// `sqlite3VdbeRecordCompareWithSkip` (see `pin_rec_cmp`); `skip`
 /// starts at the second field, the first known equal.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn pin_rec_cmp_from(
     rec: &[u8],
     probe: &[OwnedValue],
@@ -4693,7 +4693,7 @@ fn pin_rec_cmp_from(
 /// A big-endian integer of serial type `st` (1..=6, 8, 9) at `at`;
 /// bytes past the record read as 0 (the pin reads into its page
 /// buffer's slack).
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_int(rec: &[u8], at: usize, st: u32) -> i64 {
     let n = match st {
         1..=4 => st as usize,
@@ -4715,7 +4715,7 @@ fn rec_int(rec: &[u8], at: usize, st: u32) -> i64 {
 }
 
 /// `getVarint32` at `at` (missing bytes read as 0).
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_varint32(rec: &[u8], at: usize) -> (u32, usize) {
     match rec.get(at..).map(decode_varint::<()>) {
         Some(Ok((v, n))) => (u32::try_from(v).unwrap_or(u32::MAX), n),
@@ -4723,7 +4723,7 @@ fn rec_varint32(rec: &[u8], at: usize) -> (u32, usize) {
     }
 }
 
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_serial_len(t: u32) -> u32 {
     match t {
         0..=4 => t,
@@ -4734,7 +4734,7 @@ fn rec_serial_len(t: u32) -> u32 {
     }
 }
 
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_varint_len(v: u32) -> usize {
     match v {
         0..=0x7f => 1,
@@ -4746,14 +4746,14 @@ fn rec_varint_len(v: u32) -> usize {
 }
 
 /// A copy of page `page`'s image.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 async fn page_snap<S: Storage>(pager: &mut Pager<S>, page: u32) -> Result<AVec<u8>, S::Error> {
     let idx = pager.load(page).await?;
     Ok(copy_bytes(pager.frame_data(idx)))
 }
 
 /// Index page cell `i`'s full payload.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 async fn index_payload_at<S: Storage>(
     pager: &mut Pager<S>,
     snap: &[u8],
@@ -4768,7 +4768,7 @@ async fn index_payload_at<S: Storage>(
 }
 
 /// Interior index page child `i` (`ncell` is the rightmost).
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 async fn child_at<S: Storage>(
     pager: &mut Pager<S>,
     snap: &[u8],
@@ -4801,7 +4801,7 @@ pub async fn index_first_with_prefix<S: Storage>(
 
 /// Every page of the index rooted at `root`: B-tree pages plus
 /// all overflow chains (DROP INDEX frees exactly this set).
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub async fn collect_index_pages<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -4855,7 +4855,7 @@ pub async fn collect_index_pages<S: Storage>(
 
 /// Every page of the table rooted at `root`: B-tree pages plus
 /// all overflow chains. Ungated like `btree_delete`: DROP TABLE
-/// (v05) is the headline caller, but the delete-rebuild path
+/// (`write`) is the headline caller, but the delete-rebuild path
 /// needs it in every configuration that can delete rows.
 pub async fn collect_table_pages<S: Storage>(
     pager: &mut Pager<S>,

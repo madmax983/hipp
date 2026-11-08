@@ -339,8 +339,8 @@ pub(super) fn source_row<E>(
 }
 
 /// `row` with one source's row put at its place (v0.17,
-/// `multi_index`): its columns from slot `base`, its rowid at `src`.
-#[cfg(feature = "multi_index")]
+/// `planner`): its columns from slot `base`, its rowid at `src`.
+#[cfg(feature = "planner")]
 fn placed(
     row: &RowData,
     base: usize,
@@ -458,15 +458,15 @@ impl<'c, S: Storage> Statement<'c, S> {
         row: &RowData,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
         let mut out = AVec::new();
-        // A MULTI-INDEX OR loop (v0.17, `multi_index`): each branch's
+        // A MULTI-INDEX OR loop (v0.17, `planner`): each branch's
         // rows in turn, a row at the first branch it satisfies.
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         if let Some(o) = acc.or.as_deref() {
             return alloc::boxed::Box::pin(self.or_rows(sp, o, row)).await;
         }
-        // The min() / max() early-out (v0.17, `multi_index`): the
+        // The min() / max() early-out (v0.17, `planner`): the
         // first row in the path's order that passes the WHERE clause.
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         if let Some(f) = acc.first.as_deref() {
             let mut a = acc.clone();
             a.first = None;
@@ -481,9 +481,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             return Ok(out);
         }
-        // An automatic index (v0.17, `join_order`), probed once: the
+        // An automatic index (v0.17, `planner`), probed once: the
         // executors keep its sorted rows instead (`session::join`).
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         if let Some(ai) = acc.auto.as_deref() {
             let rows = alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?;
             let mut none = AVec::new();
@@ -557,12 +557,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(out)
     }
 
-    /// The rows of a MULTI-INDEX OR loop (v0.17, `multi_index`): per
+    /// The rows of a MULTI-INDEX OR loop (v0.17, `planner`): per
     /// branch, the rows its path finds that satisfy its condition and
     /// no earlier branch's — each row once, at the first branch it
     /// satisfies, as the pin's RowSet test leaves them (the WHERE
     /// clause is still checked on every row).
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     async fn or_rows(
         &mut self,
         sp: &SourcePlan,
@@ -709,9 +709,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         let nk = acc.desc.len();
         // A MULTI-INDEX OR loop of an UPDATE / DELETE (v0.17,
-        // `multi_index`): every branch's rowids (the write sorts them
+        // `planner`): every branch's rowids (the write sorts them
         // and drops repeats, and checks the WHERE on each row).
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         if let Some(o) = acc.or.as_deref() {
             for sub in o.subs.iter() {
                 match &sub.acc {
@@ -734,11 +734,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             return Ok(out);
         }
-        // A skip-scan (v0.17, `multi_index`): each distinct value of
+        // A skip-scan (v0.17, `planner`): each distinct value of
         // the skipped leading columns, in key order, probed with the
         // rest (the pin steps over them by seeks; hipp reads the
         // index's entries once to find them).
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         if acc.skip > 0 && acc.root != 0 {
             let mut cur = btree::IndexCursor::new(acc.root, acc.desc.as_slice());
             let mut prefixes: AVec<AVec<OwnedValue>> = AVec::new();
@@ -1060,7 +1060,7 @@ pub(super) struct CoreInfo<'x> {
 /// core) that the statement reads only through its expressions and
 /// key columns (`IdxModel::xcover`, the pin's `WHERE_EXPRIDX`; v0.17
 /// review fix).
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub(super) fn mark_xcover(
     models: &mut [crate::xplan::IdxModel],
     s: &crate::xplan::Src,
@@ -1234,12 +1234,12 @@ impl<S: Storage> Connection<S> {
                 }
             }
             // `sqlite_stat1`'s `unordered` / `sz=` / `noskipscan`
-            // (v0.17 review fix, `multi_index`).
-            #[cfg(feature = "multi_index")]
+            // (v0.17 review fix, `planner`).
+            #[cfg(feature = "planner")]
             let opts = self.index_opts(ix);
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             let width = opts.sz.unwrap_or(log_est(u64::from(wi) * 4));
-            #[cfg(not(feature = "multi_index"))]
+            #[cfg(not(feature = "planner"))]
             let width = log_est(u64::from(wi) * 4);
             out.push(IdxModel {
                 root: ix.root,
@@ -1251,14 +1251,14 @@ impl<S: Storage> Connection<S> {
                 suffix,
                 covers_all,
                 suffix_covers: !auto,
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 est: self.index_stat(t, ix),
                 xcover: false,
-                #[cfg(feature = "multi_index")]
+                #[cfg(feature = "planner")]
                 stat1: self.stat_est(t, ix).is_some(),
-                #[cfg(feature = "multi_index")]
+                #[cfg(feature = "planner")]
                 unordered: opts.unordered,
-                #[cfg(feature = "multi_index")]
+                #[cfg(feature = "planner")]
                 noskip: opts.noskip,
             });
         }
@@ -1372,7 +1372,7 @@ impl<S: Storage> Connection<S> {
         let mut plans: AVec<(usize, crate::xplan::IdxAccess)> = AVec::new();
         #[cfg(feature = "explain")]
         let mut naturals: AVec<(usize, (usize, bool))> = AVec::new();
-        #[cfg(all(feature = "multi_index", feature = "explain"))]
+        #[cfg(all(feature = "planner", feature = "explain"))]
         let mut marks: AVec<(usize, u8)> = AVec::new();
         for i in 0..n {
             let Some(sp) = sources.get(i) else { break };
@@ -1395,17 +1395,17 @@ impl<S: Storage> Connection<S> {
                 rowid_alias: sp.rowid_alias,
             };
             let mut conj: AVec<&RExpr> = AVec::new();
-            #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+            #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
             let mut truth: AVec<i32> = AVec::new();
             if i == 0 || !sp.kind.pads_right() {
                 conj.extend_from_slice(wconj);
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 if let Some(f) = info.filter {
                     crate::xplan::conj_truth(f, &mut truth);
                 }
             }
             // (`wconj` is `info.filter`'s terms.)
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             {
                 truth.truncate(conj.len());
                 while truth.len() < conj.len() {
@@ -1414,7 +1414,7 @@ impl<S: Storage> Connection<S> {
             }
             if let Some(on) = &sp.on {
                 conjuncts(on, &mut conj);
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 crate::xplan::conj_truth(on, &mut truth);
             }
             let later = RefRange {
@@ -1475,8 +1475,8 @@ impl<S: Storage> Connection<S> {
                 }
             }
             // The pin's min() / max() optimisation (v0.17,
-            // `multi_index`): the loop reads the argument's order.
-            #[cfg(feature = "multi_index")]
+            // `planner`): the loop reads the argument's order.
+            #[cfg(feature = "planner")]
             let mm = if n == 1 && info.has_agg && info.having.is_none() {
                 let nn = self.not_null_cols(t);
                 let nullable = |e: &RExpr| match crate::xplan::strip(e) {
@@ -1498,7 +1498,7 @@ impl<S: Storage> Connection<S> {
             } else {
                 None
             };
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             if let Some((arg, o)) = mm {
                 order.clear();
                 order.push((arg.clone(), o));
@@ -1539,12 +1539,12 @@ impl<S: Storage> Connection<S> {
                 distinct: info.distinct,
                 #[cfg(feature = "explain")]
                 dset: dset.as_slice(),
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 jm: None,
             };
-            #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+            #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
             let (width, mut models) = self.table_models(arena, t, &s);
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             mark_xcover(models.as_mut_slice(), &s, info, sources);
             let notnull = self.not_null_cols(t);
             let tab = Table {
@@ -1553,15 +1553,15 @@ impl<S: Storage> Connection<S> {
                 wr: !t.has_rowid(),
                 hint: sp.hint,
                 notnull: notnull.as_slice(),
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 rows: self.table_rows(t),
             };
-            #[cfg(not(feature = "multi_index"))]
+            #[cfg(not(feature = "planner"))]
             let chosen = crate::xplan::choose(&q, &s, &tab, ts.as_slice());
-            // v0.17 (`multi_index`): the pin's loop list, with its
+            // v0.17 (`planner`): the pin's loop list, with its
             // MULTI-INDEX OR loops; a min() / max() loop that delivers
             // the argument's order stops at the first row.
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             let chosen = {
                 let me = [s];
                 let ors = crate::xmulti::or_infos(
@@ -1652,7 +1652,7 @@ impl<S: Storage> Connection<S> {
             if chosen.is_none() {
                 naturals.push((i, crate::xplan::natural_sat(&q, &s, &tab, ts.as_slice())));
             }
-            #[cfg(all(feature = "multi_index", feature = "explain"))]
+            #[cfg(all(feature = "planner", feature = "explain"))]
             if mm.is_some() {
                 let ordered = match &chosen {
                     Some(a) => a.sorted >= 1,
@@ -1703,7 +1703,7 @@ impl<S: Storage> Connection<S> {
                 sp.eqp.nat_distinct = *d;
             }
         }
-        #[cfg(all(feature = "multi_index", feature = "explain"))]
+        #[cfg(all(feature = "planner", feature = "explain"))]
         for (i, m) in marks.iter() {
             if let Some(sp) = sources.get_mut(*i) {
                 sp.eqp.minmax = *m;
@@ -1847,9 +1847,9 @@ impl<S: Storage> Connection<S> {
         };
         let mut conj: AVec<&RExpr> = AVec::new();
         conjuncts(f, &mut conj);
-        #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut truth: AVec<i32> = AVec::new();
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         crate::xplan::conj_truth(f, &mut truth);
         let all = RefRange {
             w: (0, usize::MAX),
@@ -1874,10 +1874,10 @@ impl<S: Storage> Connection<S> {
         };
         self.hint_solvable(arena, t, hint, &s, conj.as_slice())?;
         let ts = terms(conj.as_slice(), truth.as_slice(), &s, &avail);
-        // The MULTI-INDEX OR loops (v0.17, `multi_index`).
-        #[cfg(feature = "multi_index")]
+        // The MULTI-INDEX OR loops (v0.17, `planner`).
+        #[cfg(feature = "planner")]
         let (width, models) = self.table_models(arena, t, &s);
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         let ors = crate::xmulti::or_infos(
             conj.as_slice(),
             truth.as_slice(),
@@ -1888,9 +1888,9 @@ impl<S: Storage> Connection<S> {
             &|_| 0,
             &|e| crate::xmulti::expr_indexed(models.as_slice(), e),
         );
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         let no_or = ors.is_empty();
-        #[cfg(not(feature = "multi_index"))]
+        #[cfg(not(feature = "planner"))]
         let no_or = true;
         if ts.is_empty() && no_or && !wr && !forced {
             return Ok(None);
@@ -1962,10 +1962,10 @@ impl<S: Storage> Connection<S> {
             distinct: false,
             #[cfg(feature = "explain")]
             dset: &[],
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             jm: None,
         };
-        #[cfg(not(feature = "multi_index"))]
+        #[cfg(not(feature = "planner"))]
         let (width, models) = self.table_models(arena, t, &s);
         let notnull = self.not_null_cols(t);
         let tab = Table {
@@ -1974,12 +1974,12 @@ impl<S: Storage> Connection<S> {
             wr: !t.has_rowid(),
             hint,
             notnull: notnull.as_slice(),
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             rows: self.table_rows(t),
         };
-        #[cfg(not(feature = "multi_index"))]
+        #[cfg(not(feature = "planner"))]
         let chosen = crate::xplan::choose(&q, &s, &tab, ts.as_slice());
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         let chosen = {
             let me = [s];
             let ts: AVec<crate::xplan::Term> = ts
@@ -2028,7 +2028,7 @@ impl<S: Storage> Connection<S> {
         });
         acc.one_pass = one_pass && !modified;
         // (A MULTI-INDEX OR loop's rows are collected first.)
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         if acc.or.is_some() {
             acc.one_pass = false;
         }

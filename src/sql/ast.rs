@@ -6,7 +6,7 @@
 //! borrows.
 
 use crate::arena::{ABytes, AVec};
-#[cfg(any(feature = "v04", feature = "indexes"))]
+#[cfg(any(feature = "query", feature = "indexes"))]
 use crate::record::Coll;
 use alloc::boxed::Box;
 
@@ -57,42 +57,42 @@ pub struct ColumnDef {
     /// `CURRENT_TIMESTAMP`, ... — re-parsed and evaluated by
     /// the planner when a row needs the default. `None` for a
     /// literal default (then `default` holds it) or no DEFAULT.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub default_expr: Option<ABytes>,
     /// The generation expression's text (the inside of `AS
     /// (...)`) of a generated column (v0.16).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub gen_expr: Option<ABytes>,
     /// A generated column written `STORED` (v0.16): computed on
     /// write and kept in the record. Otherwise (`VIRTUAL`, the
     /// default) it is computed on read and absent from the
     /// record, exactly as in the pin's file format.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub stored: bool,
     /// The column's `COLLATE name` (v0.16): its collating
     /// sequence for comparisons, ORDER BY / GROUP BY / DISTINCT
     /// and the indexes on it; `None` (no clause) is BINARY. An
     /// unknown name is refused at parse, as on the pin.
-    #[cfg(any(feature = "v04", feature = "indexes"))]
+    #[cfg(any(feature = "query", feature = "indexes"))]
     pub coll: Option<Coll>,
     /// The DEFAULT clause's text as `PRAGMA table_info` shows it
-    /// (v0.16, `v16`): the expression as written, the outer
+    /// (v0.16, `sql`): the expression as written, the outer
     /// parentheses of `DEFAULT (expr)` removed.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub dflt_text: Option<ABytes>,
     /// The NOT NULL constraint's own `ON CONFLICT` clause (v0.16,
-    /// `v07`): the last NOT NULL's, as on the pin; `None` when it
+    /// `sql`): the last NOT NULL's, as on the pin; `None` when it
     /// has none (ABORT unless the statement's `OR` clause decides).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     pub nn_conflict: Option<ConflictAction>,
 }
 
 /// One FOREIGN KEY / REFERENCES clause of a `CREATE TABLE`
-/// (v0.16, `v16`): `PRAGMA foreign_key_list` reports it, and the
+/// (v0.16, `sql`): `PRAGMA foreign_key_list` reports it, and the
 /// `foreign_keys` leaf enforces it while `PRAGMA foreign_keys` is
 /// ON. Actions are the pin's codes:
 /// 0 NO ACTION, 1 RESTRICT, 2 SET NULL, 3 SET DEFAULT, 4 CASCADE.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone)]
 pub struct ForeignKey {
     /// The child columns (one for a column-level REFERENCES).
@@ -119,9 +119,9 @@ pub struct ForeignKey {
 pub struct ConstraintSet {
     pub primary_key: bool,
     pub columns: AVec<IndexColumnDef>,
-    /// The constraint's own `ON CONFLICT` clause (v0.16, `v07`);
+    /// The constraint's own `ON CONFLICT` clause (v0.16, `sql`);
     /// `None` when it has none.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     pub conflict: Option<ConflictAction>,
 }
 
@@ -133,7 +133,7 @@ pub struct IndexColumnDef {
     pub desc: bool,
     /// An explicit `COLLATE name` on this key column (v0.16);
     /// `None` takes the table column's collation.
-    #[cfg(any(feature = "v04", feature = "indexes"))]
+    #[cfg(any(feature = "query", feature = "indexes"))]
     pub coll: Option<Coll>,
     /// An expression key column (v0.16, `expr_index`): the item's
     /// text, `COLLATE` included (`name` is then empty). A bare
@@ -169,17 +169,17 @@ pub enum BinOp {
     Div,
     Mod,
     Concat,
-    /// `&`, `|`, `<<`, `>>` (v0.16, `v16`): both operands taken
+    /// `&`, `|`, `<<`, `>>` (v0.16, `sql`): both operands taken
     /// as 64-bit integers (the pin's `sqlite3VdbeIntValue`), NULL
     /// if either is NULL; a negative shift count shifts the other
     /// way and a count of 64 or more shifts every bit out.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BitAnd,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BitOr,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Shl,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Shr,
 }
 
@@ -193,9 +193,9 @@ pub enum Expr {
         table: Option<ABytes>,
         name: ABytes,
         /// The schema of a three-part name `schema.table.column`
-        /// (v0.16, `v16`): the column of table `table` in that
+        /// (v0.16, `sql`): the column of table `table` in that
         /// database (`main`, `temp`). `None` for one or two parts.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         schema: Option<ABytes>,
     },
     Binary(BinOp, Box<Expr>, Box<Expr>),
@@ -236,9 +236,9 @@ pub enum Expr {
         star: bool,
         args: AVec<Expr>,
         /// The aggregate clauses written with the call (v0.16,
-        /// `v16`): `f(args ORDER BY ...)` and `f(...) FILTER
+        /// `sql`): `f(args ORDER BY ...)` and `f(...) FILTER
         /// (WHERE ...)`. `None` when neither was written.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         clause: Option<Box<FuncClause>>,
     },
     Cast(Box<Expr>, ABytes),
@@ -250,12 +250,12 @@ pub enum Expr {
     /// comes from code generation, so a CREATE TABLE holding one
     /// in a DEFAULT / CHECK / generated column is accepted and
     /// only the statement that evaluates it fails.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     HexTooBig(usize),
-    /// `expr COLLATE name` (v0.16, `v16`): the operand with an
+    /// `expr COLLATE name` (v0.16, `sql`): the operand with an
     /// explicit collating sequence, which wins every comparison
     /// it takes part in (the pin's `EP_Collate` rules).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Collate(Box<Expr>, Coll),
     /// A bound parameter (v0.16, feature `params`): its 1-based
     /// index and its token text (`?`, `?2`, `:name`, ...). It
@@ -266,24 +266,24 @@ pub enum Expr {
     /// pin silently reads one as NULL) it resolves to NULL.
     #[cfg(feature = "params")]
     Param(u16, ABytes),
-    /// `~x`, bitwise NOT (v0.16, `v16`): the operand as a 64-bit
+    /// `~x`, bitwise NOT (v0.16, `sql`): the operand as a 64-bit
     /// integer, complemented; NULL stays NULL.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BitNot(Box<Expr>),
     /// A row value `(a, b, ...)` of two or more expressions
-    /// (v0.16, `v16`). Legal only as an operand of a comparison
+    /// (v0.16, `sql`). Legal only as an operand of a comparison
     /// (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT]`), `BETWEEN`,
     /// `IN`, or a CASE base / WHEN operand, against a row value
     /// of the same size; anywhere else the planner refuses it
     /// (`SchemaKind::RowValueMisused`), as the pin does.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Vector(AVec<Expr>),
     /// Element `i` (0-based) of a row value of `n` elements
-    /// (v0.16, `v16`): the parser's split of `UPDATE ... SET
+    /// (v0.16, `sql`): the parser's split of `UPDATE ... SET
     /// (c1, ..., cn) = <row>` into one assignment per column. The
     /// row is a scalar subquery (column `i` of its first row) or
     /// any expression when `n` is 1; the planner checks the size.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     RowItem(Box<Expr>, u16, u16),
     /// `RAISE(IGNORE)` / `RAISE(ROLLBACK | ABORT | FAIL, msg)`
     /// (v0.16, `triggers`), and whether it was parsed inside a
@@ -416,11 +416,11 @@ impl JoinKind {
     }
 }
 
-/// The aggregate clauses of a function call (v0.16, `v16`): the
+/// The aggregate clauses of a function call (v0.16, `sql`): the
 /// ORDER BY written inside its parentheses (empty when none) and
 /// its `FILTER (WHERE ...)` expression. The planner refuses both
 /// on a function that is not an aggregate, as the pin does.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone)]
 pub struct FuncClause {
     pub order_by: AVec<(Expr, SortOrder)>,
@@ -615,31 +615,31 @@ pub struct FromSource {
     pub alias: Option<ABytes>,
     pub kind: JoinKind,
     pub on: Option<Expr>,
-    /// A FROM-clause subquery (v0.9, feature `v09`).
+    /// A FROM-clause subquery (v0.9, feature `sql`).
     pub derived: Option<Box<SelectStmt>>,
     /// `NATURAL` was written on this join (v0.16): the join
     /// columns are this source's columns that any source to its
     /// left also has, in this source's column order. Never
     /// combined with `on` / `using` (the parser refuses that).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub natural: bool,
     /// `USING (col, ...)` column names as written (v0.16);
     /// empty when the clause is absent.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub using: AVec<ABytes>,
-    /// A table-valued function's arguments (v0.16, `v16`):
+    /// A table-valued function's arguments (v0.16, `sql`):
     /// `pragma_table_info('t')` and friends. `None` for an
     /// ordinary table name.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub args: Option<AVec<Expr>>,
     /// The name was written with its schema qualifier (`main.t`;
-    /// v0.16, `v16`): such a name never denotes a common table
+    /// v0.16, `sql`): such a name never denotes a common table
     /// expression, as on the pin.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub qualified: bool,
-    /// The qualifier was `temp` (v0.16, `v16`): the TEMP database's
+    /// The qualifier was `temp` (v0.16, `sql`): the TEMP database's
     /// table, which a main statement reads there.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub in_temp: bool,
     /// The schema qualifier as written (v0.16, `attach`): `aux` of
     /// `aux.t` — `main` and `temp` included — or `None`. The planner
@@ -648,30 +648,30 @@ pub struct FromSource {
     #[cfg(feature = "attach")]
     pub schema: Option<ABytes>,
     /// What the planner's view / CTE expansion made of this
-    /// source (v0.16, `v16`; `None` from the parser): see
+    /// source (v0.16, `sql`; `None` from the parser): see
     /// `CteUse`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub cte: Option<Box<CteUse>>,
     /// `INDEXED BY name` / `NOT INDEXED` after the source (v0.16,
-    /// `v16`).
-    #[cfg(feature = "v16")]
+    /// `sql`).
+    #[cfg(feature = "sql")]
     pub indexed: Option<IndexHint>,
     /// The pin's query flattener merges this FROM subquery (a view's
     /// or CTE's expansion, or a written one) into its reader (v0.17,
-    /// `flatten`; `sqlite3FlattenSubquery`'s restrictions, settled by
+    /// `planner`; `sqlite3FlattenSubquery`'s restrictions, settled by
     /// the view / CTE expansion): the planner plans its body without
     /// access paths and splices its sources into the reader's FROM
     /// clause (`session::flatten`). False from the parser.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub flat: bool,
 }
 
 /// A FROM source's (or an UPDATE / DELETE target's) index clause
-/// (v0.16, `v16`): `INDEXED BY name` makes the planner use that
+/// (v0.16, `sql`): `INDEXED BY name` makes the planner use that
 /// index of the table (the pin's "no such index" when the table has
 /// none of the name, "no query solution" when it is a partial index
 /// the WHERE does not imply); `NOT INDEXED` makes it use none.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy)]
 pub enum IndexHint {
     By(ABytes),
@@ -679,11 +679,11 @@ pub enum IndexHint {
 }
 
 /// A FROM source that the view / common-table-expression
-/// expansion rewrote (v0.16, `v16`; `session::cte`). The parser
+/// expansion rewrote (v0.16, `sql`; `session::cte`). The parser
 /// never builds one: the expansion turns a source naming a view
 /// or a CTE into a derived table holding a copy of its SELECT and
 /// records here what the derived table alone cannot say.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone)]
 pub struct CteUse {
     /// The view's or CTE's column-name list, empty when none was
@@ -706,28 +706,28 @@ pub struct CteUse {
     /// the pin's reuse of a materialized CTE (and of a view that
     /// a FROM clause names twice); see `session::cte`.
     pub mat: u32,
-    /// The source names a CTE (v0.17 review fix, `flatten`): the pin
+    /// The source names a CTE (v0.17 review fix, `planner`): the pin
     /// computes every result column of a CTE reference it does not
     /// flatten (`disableUnusedSubqueryResultColumns` skips `isCte`).
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub is_cte: bool,
     /// A `NOT MATERIALIZED` CTE read more than once (v0.17 review fix,
-    /// `flatten`): `mat` is shared by the references the pin
+    /// `planner`): `mat` is shared by the references the pin
     /// materializes, while one it can run as a co-routine
     /// (`fromClauseTermCanBeCoroutine`) is computed alone.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub lazy: bool,
     /// The view group this reference belongs to (v0.17 review fix,
-    /// `flatten`; 0: none): every reference of one view in one FROM
+    /// `planner`; 0: none): every reference of one view in one FROM
     /// clause, kept when `mat` is cleared, so the planner can settle
     /// the pin's `isSelfJoinView` reuse once it knows which copies
     /// lost unused columns.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub grp: u32,
 }
 
-/// A CTE's `MATERIALIZED` / `NOT MATERIALIZED` hint (v0.16, `v16`).
-#[cfg(feature = "v16")]
+/// A CTE's `MATERIALIZED` / `NOT MATERIALIZED` hint (v0.16, `sql`).
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum M10d {
     /// No hint.
@@ -738,8 +738,8 @@ pub enum M10d {
     No,
 }
 
-/// A source's part in a recursive CTE (v0.16, `v16`).
-#[cfg(feature = "v16")]
+/// A source's part in a recursive CTE (v0.16, `sql`).
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecMark {
     /// An ordinary view / CTE use.
@@ -755,20 +755,20 @@ pub enum RecMark {
     Ref { id: u32 },
 }
 
-/// A `WITH [RECURSIVE] cte, ...` clause (v0.16, `v16`). The
+/// A `WITH [RECURSIVE] cte, ...` clause (v0.16, `sql`). The
 /// planner expands every reference before planning (the parser
 /// keeps the clause where it was written).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone)]
 pub struct With {
     pub ctes: AVec<Cte>,
 }
 
 /// One common table expression, `name [(col, ...)] AS [[NOT]
-/// MATERIALIZED] (select)` (v0.16, `v16`). The hint decides, with
+/// MATERIALIZED] (select)` (v0.16, `sql`). The hint decides, with
 /// the number of references, whether the references share one
 /// materialization (see `session::cte`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone)]
 pub struct Cte {
     pub name: ABytes,
@@ -807,12 +807,12 @@ pub struct SelectStmt {
     /// carries the NULLS FIRST / LAST placement).
     pub order_by: AVec<(Expr, SortOrder)>,
     /// `LIMIT` expression (v0.16: a general expression under
-    /// the `v16` feature; an integer literal before it).
+    /// the `sql` feature; an integer literal before it).
     pub limit: Option<Box<Expr>>,
     /// `OFFSET` expression (also the first term of the
     /// `LIMIT offset, count` form); None when absent.
     pub offset: Option<Box<Expr>>,
-    /// Compound tail (v0.9, feature `v09`): `(op, core)` pairs
+    /// Compound tail (v0.9, feature `sql`): `(op, core)` pairs
     /// in source order, applied left to right (all compound
     /// operators share one precedence on the pin — see
     /// `CompoundOp`). Each tail core is a plain SELECT or VALUES
@@ -821,7 +821,7 @@ pub struct SelectStmt {
     /// `order_by` / `limit` / `offset` then apply to the whole
     /// compound. Empty for an ordinary single-core SELECT.
     pub compound: AVec<(CompoundOp, SelectStmt)>,
-    /// A VALUES core (v0.9, feature `v09`): when non-empty this
+    /// A VALUES core (v0.9, feature `sql`): when non-empty this
     /// "core" is `VALUES (row), (row), ...` and `items` / `from`
     /// are empty. All rows have the same width (validated at
     /// plan time). A VALUES core may head a compound or stand
@@ -829,23 +829,23 @@ pub struct SelectStmt {
     /// the pin rejects a trailing ORDER BY / LIMIT as a syntax
     /// error, and so does the parser.
     pub values: AVec<AVec<Expr>>,
-    /// The statement's `WITH` clause (v0.16, `v16`): its CTEs are
+    /// The statement's `WITH` clause (v0.16, `sql`): its CTEs are
     /// visible to every core, every nested subquery and each
     /// other.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub with: Option<Box<With>>,
     /// The pin's name-resolution depth around this select (v0.16
-    /// depth limits, `v16`): the height of the expression of the
+    /// depth limits, `sql`): the height of the expression of the
     /// enclosing select it is resolved inside (`Parse.nHeight`
     /// grows by that much on the way in); 0 for a statement, a FROM
     /// subquery, a CTE or a view body. Set by the parser.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub rctx: u32,
     /// The deepest sum of nested expression heights that resolving
     /// this select on its own reaches (the parser's `sel_r`; v0.16,
-    /// `v16`). A view or CTE body is resolved where it is read, so
+    /// `sql`). A view or CTE body is resolved where it is read, so
     /// the expansion checks the reference's depth plus this.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub rdepth: u32,
     /// The core's `WINDOW name AS (...)` definitions (v0.16,
     /// `window`), in source order; a later definition of a name
@@ -865,17 +865,17 @@ pub struct SelectStmt {
     /// first row only (v0.16, `expr_index`): a UNION compound there
     /// takes the pin's first-row shortcut, so its members are not
     /// planned for a merge key (`session::merge_member`).
-    #[cfg(all(feature = "expr_index", feature = "v09"))]
+    #[cfg(feature = "expr_index")]
     pub first_row: bool,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`
 /// of `INSERT OR ...` / `UPDATE OR ...`, and the standalone
 /// `REPLACE` verb (which is `INSERT` with `Replace`). Without
-/// `v16`, `Abort` also covers the ROLLBACK spelling: hipp's
+/// `sql`, `Abort` also covers the ROLLBACK spelling: hipp's
 /// write-error rule there rolls back the whole transaction on any
 /// error, which is ROLLBACK's behaviour and ABORT's in autocommit.
-/// With `v16` a failed statement inside a transaction undoes only
+/// With `sql` a failed statement inside a transaction undoes only
 /// itself (ABORT), and ROLLBACK has its own variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
@@ -886,32 +886,32 @@ pub enum ConflictAction {
     /// stay changed (committed in autocommit; an explicit
     /// transaction stays open). Other errors still roll back.
     /// Parsed only with UPDATE (v0.5) / INSERT OR (v0.7).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     Fail,
     Ignore,
     Replace,
-    /// `OR ROLLBACK` (v0.16, `v16`): a constraint violation
+    /// `OR ROLLBACK` (v0.16, `sql`): a constraint violation
     /// (UNIQUE / PRIMARY KEY, NOT NULL, CHECK) errors like `Abort`
     /// and also rolls back the whole transaction, ending it (in
-    /// autocommit it is `Abort`). Without `v16` OR ROLLBACK parses
+    /// autocommit it is `Abort`). Without `sql` OR ROLLBACK parses
     /// as `Abort`: a failed statement then ends the transaction
     /// anyway.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Rollback,
-    /// No `OR` clause at all (v0.16, `v07`): each constraint's own
+    /// No `OR` clause at all (v0.16, `sql`): each constraint's own
     /// `ON CONFLICT` clause decides, ABORT when it has none (the
     /// pin's `OE_Default`). Only the parser produces it; the
     /// planner resolves it per constraint and hands the executors
     /// `Abort` as the statement action.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     Unset,
 }
 
 impl ConflictAction {
     /// The action a constraint whose own clause is `own` resolves
-    /// by under this statement action (v0.16, `v07`): an explicit
+    /// by under this statement action (v0.16, `sql`): an explicit
     /// `OR` clause wins, then the constraint's clause, then ABORT.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     pub fn over(self, own: Option<ConflictAction>) -> ConflictAction {
         match self {
             ConflictAction::Unset => match own {
@@ -928,9 +928,9 @@ impl ConflictAction {
     pub fn aborts(self) -> bool {
         match self {
             ConflictAction::Abort => true,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             ConflictAction::Rollback => true,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ConflictAction::Unset => true,
             _ => false,
         }
@@ -987,23 +987,23 @@ pub enum Ast {
         /// CHECK constraint expression texts, column-level and
         /// table-level, in statement order (v0.16; the inside
         /// of each `CHECK (...)`).
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         checks: AVec<ABytes>,
-        /// The `STRICT` table option (v0.16, feature `v16`).
-        #[cfg(feature = "v16")]
+        /// The `STRICT` table option (v0.16, feature `sql`).
+        #[cfg(feature = "sql")]
         strict: bool,
         /// The `WITHOUT ROWID` table option (v0.16, feature
         /// `without_rowid`).
         #[cfg(feature = "without_rowid")]
         without_rowid: bool,
         /// `CREATE TABLE ... AS SELECT ...` (v0.16, feature
-        /// `v16`): the columns are derived from the SELECT and
+        /// `sql`): the columns are derived from the SELECT and
         /// `columns` is empty.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         as_select: Option<Box<SelectStmt>>,
         /// FOREIGN KEY / REFERENCES clauses in statement order
-        /// (v0.16, `v16`).
-        #[cfg(feature = "v16")]
+        /// (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         fkeys: AVec<ForeignKey>,
     },
     /// `CREATE [UNIQUE] INDEX` (v0.3).
@@ -1032,7 +1032,7 @@ pub enum Ast {
         /// Empty when the source is a SELECT (v0.8).
         rows: AVec<AVec<Expr>>,
         /// `INSERT INTO ... SELECT ...` source (v0.8, feature
-        /// `v08`): the rows to insert are the SELECT's result
+        /// `sql`): the rows to insert are the SELECT's result
         /// rows, in result order. `None` for a VALUES source.
         select: Option<Box<SelectStmt>>,
         /// The `OR ...` conflict clause (v0.7; `REPLACE INTO`
@@ -1072,8 +1072,8 @@ pub enum Ast {
         /// only — SQLite refuses FROM columns there ("no such
         /// column", oracle-verified).
         returning: AVec<SelectItem>,
-        /// The target's `INDEXED BY` / `NOT INDEXED` (v0.16, `v16`).
-        #[cfg(feature = "v16")]
+        /// The target's `INDEXED BY` / `NOT INDEXED` (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         indexed: Option<IndexHint>,
     },
     /// `DELETE FROM <t> [WHERE <expr>] [RETURNING ...]` (v0.5;
@@ -1082,8 +1082,8 @@ pub enum Ast {
         table: ABytes,
         filter: Option<Expr>,
         returning: AVec<SelectItem>,
-        /// The target's `INDEXED BY` / `NOT INDEXED` (v0.16, `v16`).
-        #[cfg(feature = "v16")]
+        /// The target's `INDEXED BY` / `NOT INDEXED` (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         indexed: Option<IndexHint>,
     },
     /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module
@@ -1114,28 +1114,28 @@ pub enum Ast {
         text: ABytes,
         /// The new column's CHECK constraint texts (v0.16): the
         /// pin verifies existing rows against them.
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         checks: AVec<ABytes>,
     },
-    /// `ALTER TABLE <t> RENAME TO <new>` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `ALTER TABLE <t> RENAME TO <new>` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     AlterRename {
         table: ABytes,
         to: ABytes,
     },
     /// `ALTER TABLE <t> RENAME [COLUMN] <old> TO <new>` (v0.16,
-    /// `v16`). `quoted`: the new name was written quoted (or as a
+    /// `sql`). `quoted`: the new name was written quoted (or as a
     /// string), so every edited token takes the quoted form, as on
     /// the pin.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     AlterRenameColumn {
         table: ABytes,
         from: ABytes,
         to: ABytes,
         quoted: bool,
     },
-    /// `ALTER TABLE <t> DROP [COLUMN] <c>` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `ALTER TABLE <t> DROP [COLUMN] <c>` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     AlterDropColumn {
         table: ABytes,
         column: ABytes,
@@ -1157,66 +1157,66 @@ pub enum Ast {
     },
     /// `BEGIN [TRANSACTION]` (v0.2).
     Begin,
-    /// `BEGIN IMMEDIATE | EXCLUSIVE [TRANSACTION]` (v0.16, `v16`):
+    /// `BEGIN IMMEDIATE | EXCLUSIVE [TRANSACTION]` (v0.16, `sql`):
     /// a BEGIN that, like the pin's write lock taken at once, fixes
     /// an empty database's page size (`Pager::fix_layout`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BeginImmediate,
     /// `COMMIT [TRANSACTION]` / `END [TRANSACTION]` (v0.2).
     Commit,
     /// `ROLLBACK [TRANSACTION]` (v0.2).
     Rollback,
-    /// `SAVEPOINT name` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `SAVEPOINT name` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Savepoint {
         name: ABytes,
     },
-    /// `RELEASE [SAVEPOINT] name` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `RELEASE [SAVEPOINT] name` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Release {
         name: ABytes,
     },
-    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     RollbackTo {
         name: ABytes,
     },
-    /// `VACUUM [schema] [INTO expr]` (v0.16, `v16`): `into` is the
+    /// `VACUUM [schema] [INTO expr]` (v0.16, `sql`): `into` is the
     /// expression naming the target file (any expression with a
     /// text value: a literal, `?`, `'a' || 'b'`, a subquery).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Vacuum {
         schema: Option<ABytes>,
         into: Option<Expr>,
     },
-    /// `REINDEX [[schema .] name]` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `REINDEX [[schema .] name]` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Reindex {
         schema: Option<ABytes>,
         name: Option<ABytes>,
     },
-    /// `ANALYZE [[schema .] name]` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `ANALYZE [[schema .] name]` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Analyze {
         schema: Option<ABytes>,
         name: Option<ABytes>,
     },
     /// `WITH ... INSERT / REPLACE / UPDATE / DELETE` (v0.16,
-    /// `v16`): the clause's CTEs are visible throughout the
+    /// `sql`): the clause's CTEs are visible throughout the
     /// statement (its SELECT, FROM, expressions and subqueries,
     /// never as its target table). A `WITH ... SELECT` keeps its
     /// clause in `SelectStmt::with` instead.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     With {
         with: Box<With>,
         body: Box<Ast>,
     },
     /// `PRAGMA [schema .] name [= value | (value)]` (v0.16,
-    /// `v16`). `value` is the argument's text as the pin hands it
+    /// `sql`). `value` is the argument's text as the pin hands it
     /// to its pragma code: a name or string dequoted, a number as
     /// written (with a leading `-` for a negative one, `+`
     /// dropped).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Pragma {
         schema: Option<ABytes>,
         name: ABytes,

@@ -511,7 +511,7 @@ impl<T> core::ops::IndexMut<usize> for AVec<T> {
 // ---------- the shared stable sort (v0.17 size pass) ----------
 
 /// Runs this short are insertion-sorted before the merge passes.
-#[cfg_attr(not(feature = "v04"), allow(dead_code))] // the tiny profile sorts nothing
+#[cfg_attr(not(feature = "query"), allow(dead_code))] // the tiny profile sorts nothing
 const SORT_RUN: usize = 12;
 
 /// Stably sort the index list `v` under `cmp`: afterwards no index
@@ -528,7 +528,7 @@ const SORT_RUN: usize = 12;
 /// when `cmp(later, earlier)` is `Less` — `slice::sort_by`'s rule —
 /// so for a total order the output is exactly `sort_by`'s. Never
 /// panics, whatever `cmp` returns.
-#[cfg_attr(not(feature = "v04"), allow(dead_code))] // the tiny profile sorts nothing
+#[cfg_attr(not(feature = "query"), allow(dead_code))] // the tiny profile sorts nothing
 pub(crate) fn sort_idx(v: &mut [usize], cmp: &mut dyn FnMut(usize, usize) -> core::cmp::Ordering) {
     use core::cmp::Ordering::Less;
     let n = v.len();
@@ -626,7 +626,7 @@ pub(crate) fn sort_idx(v: &mut [usize], cmp: &mut dyn FnMut(usize, usize) -> cor
 /// The stable sort permutation of `0..n` under `cmp` (see
 /// `sort_idx`): position `k` of the result holds the index of the
 /// element that sorts `k`-th.
-#[cfg_attr(not(feature = "v04"), allow(dead_code))] // the tiny profile sorts nothing
+#[cfg_attr(not(feature = "query"), allow(dead_code))] // the tiny profile sorts nothing
 pub(crate) fn sort_perm(
     n: usize,
     cmp: &mut dyn FnMut(usize, usize) -> core::cmp::Ordering,
@@ -642,7 +642,7 @@ pub(crate) fn sort_perm(
 /// `perm.len()`. One pass over the permutation's cycles, so each
 /// element moves at most once per cycle step; entries out of range
 /// (never produced by `sort_perm`) are skipped, not followed.
-#[cfg_attr(not(feature = "v04"), allow(dead_code))] // the tiny profile sorts nothing
+#[cfg_attr(not(feature = "query"), allow(dead_code))] // the tiny profile sorts nothing
 pub(crate) fn apply_perm(mut perm: AVec<usize>, swap: &mut dyn FnMut(usize, usize)) {
     let p = perm.as_mut_slice();
     let n = p.len();
@@ -663,7 +663,7 @@ pub(crate) fn apply_perm(mut perm: AVec<usize>, swap: &mut dyn FnMut(usize, usiz
 /// Stably sort `v` by `cmp`, exactly as `slice::sort_by` would for a
 /// total order, through the shared `sort_perm` (v0.17 size pass:
 /// only this thin adapter is instantiated per element type).
-#[cfg_attr(not(feature = "v04"), allow(dead_code))] // the tiny profile sorts nothing
+#[cfg_attr(not(feature = "query"), allow(dead_code))] // the tiny profile sorts nothing
 pub(crate) fn sort_by<T>(v: &mut [T], cmp: &mut dyn FnMut(&T, &T) -> core::cmp::Ordering) {
     let perm = {
         let s: &[T] = v;

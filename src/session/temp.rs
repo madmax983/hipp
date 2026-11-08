@@ -1,4 +1,4 @@
-//! The TEMP database (v0.16, `v16`).
+//! The TEMP database (v0.16, `sql`).
 //!
 //! A connection's temp schema lives in a second, private
 //! connection over a `MemStorage` (`Connection::temp`), created the
@@ -1534,7 +1534,7 @@ impl<S: Storage> Connection<S> {
             temp: true,
             #[cfg(feature = "attach")]
             ext: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             exists: false,
         });
         Ok(t.columns.len())

@@ -371,7 +371,7 @@ fn a7() {
 
 /// v0.16 review regression: a row without an explicit rowid when
 /// the largest rowid is 9223372036854775807. The pin picks an
-/// unused rowid (at random). With `v16` hipp takes the smallest
+/// unused rowid (at random). With `sql` hipp takes the smallest
 /// unused positive rowid and the oracle reads the file; without it
 /// (the tiny profile) the insert fails cleanly and the file is
 /// unchanged.
@@ -393,7 +393,7 @@ fn insert_after_the_largest_rowid() {
     });
     assert_eq!(common::cli(&path, "PRAGMA integrity_check;"), "ok\n");
     let rows = common::cli(&path, "SELECT rowid, a FROM t ORDER BY rowid;");
-    if cfg!(feature = "v16") {
+    if cfg!(feature = "sql") {
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(rows, "1|1\n2|10\n3|3\n4|20\n9223372036854775807|0\n");
     } else {

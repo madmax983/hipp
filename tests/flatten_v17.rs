@@ -1,5 +1,5 @@
 //! v0.17 query flattening, WHERE push-down, unused subquery columns,
-//! EXISTS-to-join and foreign-key child scans (leaf `flatten`),
+//! EXISTS-to-join and foreign-key child scans (leaf `planner`),
 //! differentially vs the pinned oracle (SQLite 3.54.1).
 //!
 //! - curated plans: views, CTEs and FROM subqueries flattened into

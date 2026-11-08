@@ -31,7 +31,7 @@ pub enum SchemaKind {
     /// unconditionally for an upsert DO UPDATE result row.
     NotNullViolation,
     /// `DROP INDEX` named an index that does not exist (v0.3);
-    /// v0.16 (`v16`): an `INDEXED BY` naming no index of its table
+    /// v0.16 (`sql`): an `INDEXED BY` naming no index of its table
     /// (or naming one on a view or CTE) — the pin's "no such
     /// index". Name one of the table's indexes, or drop the clause.
     UnknownIndex,
@@ -172,13 +172,13 @@ pub enum SchemaKind {
     ParameterNotAllowed,
     /// A row value `(a, b, ...)` (or a multi-column scalar
     /// subquery) where only a single value is allowed, or two
-    /// row values of different sizes compared (v0.16, `v16`;
+    /// row values of different sizes compared (v0.16, `sql`;
     /// the pin's "row value misused" and "IN(...) element has N
     /// terms - expected M"). Compare row values of equal size
     /// with `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT]`,
     /// `BETWEEN`, `IN`, or assign them with `UPDATE ... SET
     /// (a, b) = ...`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     RowValueMisused,
     /// A function name the pin does not define, or one this build
     /// leaves out (v0.16; the pin's "no such function"). Raised
@@ -189,14 +189,14 @@ pub enum SchemaKind {
     /// function"). Raised at prepare.
     WrongArgumentCount,
     /// `likelihood(X, P)` whose P is not a REAL literal between
-    /// 0.0 and 1.0 (v0.16, `v16`; the pin's "second argument to
+    /// 0.0 and 1.0 (v0.16, `sql`; the pin's "second argument to
     /// likelihood() must be a constant between 0.0 and 1.0").
     /// Write P as a literal such as `0.5`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     LikelihoodNotConstant,
     /// A non-deterministic function — `random()`, `randomblob()`,
     /// `changes()`, `total_changes()`, `last_insert_rowid()`,
-    /// `sqlite_version()` — in a generated column (v0.16, `v16`;
+    /// `sqlite_version()` — in a generated column (v0.16, `sql`;
     /// the pin's "non-deterministic functions prohibited in
     /// generated columns"; also in an index expression or a partial
     /// index's WHERE, v0.16 `expr_index`). Compute the value on
@@ -208,7 +208,7 @@ pub enum SchemaKind {
     /// expression or a generated column (the pin's
     /// "non-deterministic use of date() in a CHECK constraint").
     /// Pass the instant as a value instead.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     NonDeterministic,
     /// `'localtime'` / `'utc'` asked the time-zone hook
     /// (`Config::tz_offset`) for an instant it could not convert
@@ -228,10 +228,10 @@ pub enum SchemaKind {
     #[cfg(feature = "expr_index")]
     QualifiedIndexColumn,
     /// A string or blob result of 1,000,000,000 bytes or more
-    /// (v0.16, `v16`; the pin's default `SQLITE_LIMIT_LENGTH`,
+    /// (v0.16, `sql`; the pin's default `SQLITE_LIMIT_LENGTH`,
     /// "string or blob too big"): `zeroblob` / `randomblob` past
     /// the limit, or a `printf` result reaching it.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     TooBig,
     /// A DISTINCT aggregate called with other than exactly one
     /// argument (v0.16, ungated; the pin's "DISTINCT aggregates
@@ -239,40 +239,40 @@ pub enum SchemaKind {
     /// x, ',')` used to run). Drop DISTINCT, or the separator.
     DistinctAggregateArgs,
     /// `ORDER BY` inside the parentheses of a function that is
-    /// not an aggregate (v0.16, `v16`; the pin's "ORDER BY may
+    /// not an aggregate (v0.16, `sql`; the pin's "ORDER BY may
     /// not be used with non-aggregate"). Order the query instead.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     OrderByNonAggregate,
     /// `FILTER (WHERE ...)` after a function that is not an
-    /// aggregate (v0.16, `v16`; the pin's "FILTER may not be used
+    /// aggregate (v0.16, `sql`; the pin's "FILTER may not be used
     /// with non-aggregate"). Use a CASE expression instead.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     FilterNonAggregate,
     /// The P argument of `percentile(Y, P)` (0 ..= 100) or
     /// `percentile_cont` / `percentile_disc` (0 ..= 1) is not a
     /// number in range — NULL, non-numeric text, a blob, or out
-    /// of bounds (v0.16, `v16`; the pin's "the fraction argument
+    /// of bounds (v0.16, `sql`; the pin's "the fraction argument
     /// to ...() is not between 0.0 and ..."). Raised for each row
     /// the aggregate steps, NULL Y included. Pass a constant in
     /// range.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     PercentileFraction,
     /// The P argument of a percentile aggregate differs (by more
     /// than 0.001 of the fraction) between rows of one group
-    /// (v0.16, `v16`; the pin's "the fraction argument to ...() is
+    /// (v0.16, `sql`; the pin's "the fraction argument to ...() is
     /// not the same for all input rows"). Pass a constant P.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     PercentileFractionVaries,
     /// A non-NULL Y of `median()` / `percentile*()` that is not an
     /// INTEGER or REAL — TEXT (even numeric text) or a BLOB
-    /// (v0.16, `v16`; the pin's "input to ...() is not numeric").
+    /// (v0.16, `sql`; the pin's "input to ...() is not numeric").
     /// CAST the column to REAL.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     PercentileNotNumeric,
     /// An infinite Y of `median()` / `percentile*()` (v0.16,
-    /// `v16`; the pin's "Inf input to ...()"). Filter infinities
+    /// `sql`; the pin's "Inf input to ...()"). Filter infinities
     /// out first.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     PercentileInfinite,
     /// A window function where the pin forbids one (v0.16,
     /// `window`; its "misuse of window function f()" / "misuse
@@ -380,7 +380,7 @@ pub enum SchemaKind {
     /// foreign_keys` is ON (v0.16 fix; the pin's "Cannot add a
     /// REFERENCES column with non-NULL default value"). Add it with
     /// no default, before the table has rows, or with the pragma off.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     ReferencesDefault,
     /// CREATE TABLE / INDEX / VIEW of a name starting with
     /// `sqlite_` (any case; the pin's "object name reserved for
@@ -389,80 +389,80 @@ pub enum SchemaKind {
     /// table `t`), also by CREATE TRIGGER / VIRTUAL TABLE and RENAME
     /// TO. Choose another name.
     ReservedName,
-    /// A schema qualifier that names no database (v0.16, `v16`;
+    /// A schema qualifier that names no database (v0.16, `sql`;
     /// the pin's "unknown database"). hipp has `main` only.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     UnknownDatabase,
     /// `PRAGMA encoding` named no encoding the pin knows (v0.16,
-    /// `v16`; "unsupported encoding"). Use `UTF-8`.
-    #[cfg(feature = "v16")]
+    /// `sql`; "unsupported encoding"). Use `UTF-8`.
+    #[cfg(feature = "sql")]
     UnknownEncoding,
     /// INSERT / UPDATE / DELETE / DROP / ALTER / CREATE INDEX
-    /// against `sqlite_schema` (v0.16, `v16`; the pin's "table
+    /// against `sqlite_schema` (v0.16, `sql`; the pin's "table
     /// sqlite_master may not be modified"). Change the schema
     /// with CREATE / DROP statements instead.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     SchemaTableReadOnly,
     /// A view whose definition reads itself, directly or through
-    /// other views (v0.16, `v16`; the pin's "view v is circularly
+    /// other views (v0.16, `sql`; the pin's "view v is circularly
     /// defined", raised when the view is used). Redefine one of
     /// the views without the cycle.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     CircularView,
     /// A common table expression that reads itself where it may
-    /// not (v0.16, `v16`; the pin's "circular reference"): a CTE
+    /// not (v0.16, `sql`; the pin's "circular reference"): a CTE
     /// that is not a UNION / UNION ALL compound whose last SELECTs
     /// name it in their FROM clause, a reference from its setup
     /// SELECTs, or a cycle between CTEs. Make the CTE recursive
     /// in that shape, or break the cycle.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     CircularReference,
     /// A recursive SELECT that reads its recursive table more than
     /// once — twice in its FROM clause, or again inside a
-    /// subquery (v0.16, `v16`; the pin's "multiple references to
+    /// subquery (v0.16, `sql`; the pin's "multiple references to
     /// recursive table" / "multiple recursive references"). Read
     /// the recursive table once per recursive SELECT.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     RecursiveReferences,
     /// A recursive SELECT with an aggregate or GROUP BY (v0.16,
-    /// `v16`; the pin's "recursive aggregate queries not
+    /// `sql`; the pin's "recursive aggregate queries not
     /// supported"). Aggregate over the CTE's result instead.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     RecursiveAggregate,
-    /// One WITH clause names two CTEs alike (v0.16, `v16`; the
+    /// One WITH clause names two CTEs alike (v0.16, `sql`; the
     /// pin's "duplicate WITH table name"). Rename one.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     DuplicateCteName,
     /// Views and common table expressions nested deeper than
     /// `Config::max_nesting` allows, or a statement whose CTE
-    /// references copy 1000 SELECTs or more (v0.16, `v16`; the
+    /// references copy 1000 SELECTs or more (v0.16, `sql`; the
     /// pin's "VIEWs and/or subqueries nested too deep"). Define
     /// the views or CTEs less deeply, or raise the limit (with
     /// stack to match).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     NestedTooDeep,
     /// `RELEASE` / `ROLLBACK TO` a name no open savepoint has
-    /// (v0.16, `v16`; the pin's "no such savepoint"). Open it with
+    /// (v0.16, `sql`; the pin's "no such savepoint"). Open it with
     /// `SAVEPOINT name` first; savepoints end with the transaction.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     NoSuchSavepoint,
-    /// `VACUUM` inside a transaction (v0.16, `v16`; the pin's
+    /// `VACUUM` inside a transaction (v0.16, `sql`; the pin's
     /// "cannot VACUUM from within a transaction"). COMMIT or
     /// ROLLBACK first.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     VacuumInTransaction,
     /// `VACUUM INTO` a file that already holds a database, or that
     /// the connection's `Config::vacuum_into` hook could not write
-    /// (v0.16, `v16`; the pin's "output file already exists"), or a
+    /// (v0.16, `sql`; the pin's "output file already exists"), or a
     /// name expression whose value is not text (the pin's
     /// "non-text filename"). Name a new or empty file, as text.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     VacuumTarget,
     /// `PRAGMA synchronous = ...` inside an explicit transaction
-    /// (v0.16, `v16`; the pin's "Safety level may not be changed
+    /// (v0.16, `sql`; the pin's "Safety level may not be changed
     /// inside a transaction", raised when the statement is
     /// prepared). COMMIT or ROLLBACK first.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     SafetyLevelInTransaction,
     /// `PRAGMA journal_mode = WAL` (or from WAL to another mode)
     /// inside an explicit transaction that has not written yet
@@ -478,21 +478,21 @@ pub enum SchemaKind {
     #[cfg(feature = "wal")]
     CheckpointLocked,
     /// `REINDEX x` where `x` names no collation, table or index
-    /// (v0.16, `v16`; the pin's "unable to identify the object to
+    /// (v0.16, `sql`; the pin's "unable to identify the object to
     /// be reindexed"). Name an existing one.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     ReindexTarget,
     /// A schema change the pin refuses on one of its own tables
     /// (v0.16): `sqlite_*` tables may not be indexed or altered,
     /// and only `sqlite_stat*` may be dropped ("table sqlite_sequence
     /// may not be dropped"). Leave the system tables to the engine.
-    #[cfg(any(feature = "indexes", feature = "v04"))]
+    #[cfg(any(feature = "indexes", feature = "query"))]
     SystemTable,
     /// `AUTOINCREMENT` on a column that is not the table's INTEGER
-    /// PRIMARY KEY (v0.16, `v16`; "AUTOINCREMENT is only allowed on
+    /// PRIMARY KEY (v0.16, `sql`; "AUTOINCREMENT is only allowed on
     /// an INTEGER PRIMARY KEY"). Declare the column `INTEGER
     /// PRIMARY KEY` (not DESC), or drop the keyword.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     AutoincrementNotIntegerPk,
     /// `AUTOINCREMENT` on a WITHOUT ROWID table (v0.16,
     /// `without_rowid`; the pin's "AUTOINCREMENT not allowed on
@@ -501,25 +501,25 @@ pub enum SchemaKind {
     #[cfg(feature = "without_rowid")]
     AutoincrementWithoutRowid,
     /// `ALTER TABLE ... RENAME COLUMN` to `rowid`, `oid` or
-    /// `_rowid_` (v0.16, `v16`; the pin's "cannot rename to rowid
+    /// `_rowid_` (v0.16, `sql`; the pin's "cannot rename to rowid
     /// alias"). Pick another name.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     RowidAliasName,
     /// `ALTER TABLE ... DROP COLUMN` of a PRIMARY KEY or UNIQUE
-    /// column, or of a table's only column (v0.16, `v16`; the
+    /// column, or of a table's only column (v0.16, `sql`; the
     /// pin's "cannot drop PRIMARY KEY column", "cannot drop UNIQUE
     /// column", "no other columns exist"). Rebuild the table
     /// instead (CREATE TABLE ... AS / INSERT ... SELECT).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     CannotDropColumn,
     /// An AUTOINCREMENT table has handed out rowid
     /// 9223372036854775807, or its largest rowid is that value
-    /// (v0.16, `v16`; the pin's "database or disk is full"): no
+    /// (v0.16, `sql`; the pin's "database or disk is full"): no
     /// larger rowid exists and AUTOINCREMENT never reuses one.
     /// Insert with an explicit smaller rowid, or reset the table's
     /// `sqlite_sequence` row. Also a table holding every positive
     /// rowid, with no rowid left for a new row.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     DatabaseFull,
     /// A write to a table (or view) that has triggers, in a build
     /// without the `triggers` feature (v0.16, every profile): the
@@ -562,7 +562,7 @@ pub enum SchemaKind {
     /// A `table.*` item in a RETURNING list (v0.16 review fix,
     /// ungated; the pin's "RETURNING may not use \"TABLE.*\"
     /// wildcards"). Write `*` or name the columns.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     ReturningTableStar,
     /// RETURNING inside a trigger body (v0.16, `triggers`;
     /// "cannot use RETURNING in a trigger"). Drop the clause.
@@ -912,22 +912,22 @@ pub enum ParseKind {
     /// DEFAULT in a build without the v0.4 expression evaluator
     /// (the tiny profile, v0.16): hipp cannot enforce or
     /// compute it, so it refuses the table instead of silently
-    /// ignoring the clause. Build with feature `v04` (or
+    /// ignoring the clause. Build with feature `query` (or
     /// `full`), or drop the clause.
     RequiresEvaluator,
     /// A constraint-level `ON CONFLICT FAIL | IGNORE | REPLACE`
     /// in a build without the conflict-resolving write path
-    /// (v0.16; below `v07`): hipp cannot resolve the violation as
+    /// (v0.16; below `sql`): hipp cannot resolve the violation as
     /// the pin would, so it refuses the table instead of ignoring
-    /// the clause. Build with feature `v07` (or `full`), or drop
+    /// the clause. Build with feature `sql` (or `full`), or drop
     /// the clause (ABORT and ROLLBACK need no feature).
-    #[cfg(not(feature = "v07"))]
+    #[cfg(not(feature = "sql"))]
     RequiresConflictResolution,
     /// Two PRIMARY KEY / UNIQUE constraints on the same columns
-    /// with different `ON CONFLICT` clauses (v0.16, `v07`; the
+    /// with different `ON CONFLICT` clauses (v0.16, `sql`; the
     /// pin's "conflicting ON CONFLICT clauses specified"). Give
     /// them one clause, or drop the repeat.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     ConflictingOnConflict,
     /// `?0`, or `?NNN` past 32766 (v0.16, `params`; the pin's
     /// "variable number must be between ?1 and ?32766"). Number
@@ -1093,12 +1093,12 @@ impl<E> Error<E> {
 
 impl<E> Error<E> {
     /// Re-wrap this error for another storage error type, mapping
-    /// a `Storage` error through `f` (v0.16, `v16`: VACUUM builds
+    /// a `Storage` error through `f` (v0.16, `sql`: VACUUM builds
     /// its image on an in-memory pager, whose errors surface under
     /// the connection's storage type). With `window`, also how the
     /// expression evaluator, compiled once for `Error<()>`, hands its
     /// errors to callers of any storage type (`query::eval`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn map_storage<F>(self, f: impl FnOnce(E) -> Error<F>) -> Error<F> {
         match self {
             Error::Storage(e) => f(e),

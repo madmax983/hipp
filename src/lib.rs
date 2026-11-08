@@ -14,7 +14,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub mod agg;
 #[allow(unsafe_code)] // the bounded arena exception (SPEC §6)
 pub mod arena;
@@ -26,19 +26,19 @@ pub mod datetime;
 pub mod error;
 #[cfg(feature = "fts5")]
 pub mod fts5;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub mod func;
 #[cfg(feature = "json")]
 pub mod json;
 #[cfg(feature = "math")]
 pub mod math;
 pub mod pager;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub mod query;
 pub mod record;
 #[cfg(feature = "rtree")]
 pub mod rtree;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub mod rules;
 pub mod schema;
 pub mod session;
@@ -57,9 +57,9 @@ pub mod wal;
 pub mod window;
 #[cfg(feature = "without_rowid")]
 pub mod wr;
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub mod xjoin;
-#[cfg(feature = "multi_index")]
+#[cfg(feature = "planner")]
 pub mod xmulti;
 #[cfg(feature = "expr_index")]
 pub mod xplan;

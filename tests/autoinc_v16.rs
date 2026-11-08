@@ -23,10 +23,10 @@
 //!   tables may not be dropped (but `sqlite_stat*`), indexed or
 //!   altered; the sequence follows ALTER TABLE RENAME.
 //!
-//! Without `v16` an AUTOINCREMENT table is refused at CREATE and
+//! Without `sql` an AUTOINCREMENT table is refused at CREATE and
 //! read-only (tests/table_defs_v16.rs).
 
-#![cfg(feature = "v16")]
+#![cfg(feature = "sql")]
 
 mod common;
 

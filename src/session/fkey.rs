@@ -247,10 +247,10 @@ struct Fk {
 }
 
 /// One child scan of a parent write's EXPLAIN QUERY PLAN (v0.17,
-/// `flatten`; `fk_scans`): the child's root page, its key columns,
+/// `planner`; `fk_scans`): the child's root page, its key columns,
 /// and per key position the parent column's affinity and collation
 /// and whether it is the INTEGER PRIMARY KEY.
-#[cfg(all(feature = "flatten", feature = "explain"))]
+#[cfg(all(feature = "planner", feature = "explain"))]
 pub(super) type FkScan = (u32, AVec<usize>, AVec<(Affinity, Coll, bool)>);
 
 /// The foreign keys of one write's table.
@@ -663,14 +663,14 @@ impl<S: Storage> Connection<S> {
     }
 
     /// The child tables a parent write `ev` scans for each row (v0.17,
-    /// `flatten`; EXPLAIN QUERY PLAN's `fkScanChildren` loops; an
+    /// `planner`; EXPLAIN QUERY PLAN's `fkScanChildren` loops; an
     /// INSERT only when `multi` — the pin's `isMultiWrite` — or its
     /// key is deferred): per foreign key naming the table, in the
     /// pin's order (the most recently created child first), the
     /// child's root page, its key columns and the parent key's
     /// affinities and collations (`FkScan`). Empty while `PRAGMA
     /// foreign_keys` is OFF.
-    #[cfg(all(feature = "flatten", feature = "explain"))]
+    #[cfg(all(feature = "planner", feature = "explain"))]
     pub(super) fn fk_scans(
         &self,
         table: &[u8],

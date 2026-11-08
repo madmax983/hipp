@@ -7,7 +7,7 @@
 //! per connection (§5.1.2) and a catalog rebuild can only happen
 //! when no statement is live (§7.5.5) — both by construction.
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 use alloc::boxed::Box;
 
 use crate::arena::{AVec, Arena};
@@ -24,17 +24,17 @@ use crate::storage::Storage;
 #[cfg(feature = "indexes")]
 use crate::schema::IndexOrigin;
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 use crate::query::{Ctx, RExpr, RowData};
 
 /// Undo a write statement that failed with error `$e` (§7.5.4: a
-/// failed write leaves no trace). Inside a transaction with `v16`,
+/// failed write leaves no trace). Inside a transaction with `sql`,
 /// only the statement's own savepoint is rolled back and the
 /// transaction stays open, as on the pin — unless the error is a
 /// storage, memory or cache failure, after which (as the pin's
 /// I/O and out-of-memory errors do) the whole transaction rolls
 /// back (`Statement::stmt_rollback`). Otherwise (autocommit, or a
-/// build without `v16`, where a failed statement still ends the
+/// build without `sql`, where a failed statement still ends the
 /// whole bracket) the transaction is rolled back. A macro, so the
 /// tiny profile's abort stays the inline two statements it was.
 macro_rules! abort_write {
@@ -46,11 +46,11 @@ macro_rules! abort_write {
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         let undone = $s.conn.in_program() || $s.stmt_rollback($e).await;
         #[cfg(all(
-            feature = "v16",
+            feature = "sql",
             not(any(feature = "triggers", feature = "foreign_keys"))
         ))]
         let undone = $s.stmt_rollback($e).await;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let undone = {
             let _ = $e;
             false
@@ -99,11 +99,11 @@ macro_rules! alloc_root {
     }};
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 mod alter;
 #[cfg(feature = "attach")]
 mod attach;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 mod cte;
 #[cfg(feature = "explain")]
 mod eqp;
@@ -116,23 +116,23 @@ type Prep<'a, 'f, S> = core::pin::Pin<
 >;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
-#[cfg(feature = "flatten")]
+#[cfg(feature = "planner")]
 mod flatten;
 #[cfg(feature = "fts5")]
 mod fts5;
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 mod join;
 #[cfg(any(feature = "json", feature = "vtab"))]
 mod json_tvf;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 mod maint;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 mod pragma;
 #[cfg(feature = "rtree")]
 mod rtree;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 mod stream;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 mod temp;
 #[cfg(feature = "triggers")]
 mod trigger;
@@ -172,7 +172,7 @@ pub struct Config {
     /// no clock of its own; with `None` a statement that needs one
     /// fails with `Error::NoClock`. Under `std`, `Config::default()`
     /// supplies the system clock (`systime::now_ms`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub clock: Option<fn() -> i64>,
     /// The time zone (v0.16, `datetime`): the offset east of UTC,
     /// in seconds, at an instant given in Unix seconds — what the
@@ -185,7 +185,7 @@ pub struct Config {
     /// `SchemaKind::LocalTimeUnavailable`.
     #[cfg(feature = "datetime")]
     pub tz_offset: Option<crate::datetime::TzOffset>,
-    /// The `VACUUM INTO 'file'` writer (v0.16, `v16`): called with
+    /// The `VACUUM INTO 'file'` writer (v0.16, `sql`): called with
     /// the file name as written and the finished database image,
     /// it creates the file and returns `true`, or returns `false`
     /// (the statement then fails with `SchemaKind::VacuumTarget`)
@@ -193,10 +193,10 @@ pub struct Config {
     /// core opens no files itself; with `None`, VACUUM INTO is
     /// `Error::Unsupported`. With feature `std` the default is
     /// `storage::write_new_file`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub vacuum_into: Option<VacuumWriter>,
     /// How deep view and CTE bodies may nest inside one another
-    /// (v0.16, `v16`): a statement reaching this many levels fails
+    /// (v0.16, `sql`): a statement reaching this many levels fails
     /// with `SchemaKind::NestedTooDeep`. The pin allows 999 nested
     /// views (1000 is its "nested too deep"). Each level costs
     /// hipp's planner and executor stack — measured on x86_64 up to
@@ -207,7 +207,7 @@ pub struct Config {
     /// in debug); `Config::stack_budget` does not lower it. Raise it
     /// to 1000 for the pin's limit on a thread with the stack for it
     /// (the CLI does).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub max_nesting: usize,
     /// The deepest expression a statement may hold (v0.16), counted
     /// as the pin counts `SQLITE_LIMIT_EXPR_DEPTH` (whose default,
@@ -229,7 +229,7 @@ pub struct Config {
     /// stack you have with `stack_budget`. The views and CTEs a
     /// statement reads cost their nesting levels on top (see
     /// `max_nesting`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub max_expr_depth: usize,
     /// The deepest nesting the parser takes (v0.16), counted in the
     /// pin's LALR parser-stack symbols (the pin: 2500,
@@ -237,7 +237,7 @@ pub struct Config {
     /// parentheses, 830 nested function calls, 410 nested FROM
     /// subqueries); deeper is `ParseKind::RecursionLimit` ("Recursion
     /// limit").
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub max_parser_depth: usize,
     /// How deep trigger programs may nest (v0.16, `triggers`): a
     /// trigger that would run as program number
@@ -288,9 +288,9 @@ pub struct Config {
 #[cfg(feature = "vtab")]
 pub const DEFAULT_VTAB_ROWS: usize = 1 << 22;
 
-/// The `VACUUM INTO` writer's type (v0.16, `v16`; see
+/// The `VACUUM INTO` writer's type (v0.16, `sql`; see
 /// `Config::vacuum_into`): file name, image → written.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub type VacuumWriter = fn(&[u8], &[u8]) -> bool;
 
 impl Default for Config {
@@ -306,23 +306,23 @@ impl Default for Config {
             catalog_init: 16 * 1024,
             catalog_max: 256 * 1024,
             nonce_seed: 0x6869_7070_5eed_0001,
-            #[cfg(all(feature = "v04", feature = "std"))]
+            #[cfg(all(feature = "query", feature = "std"))]
             clock: Some(crate::systime::now_ms),
-            #[cfg(all(feature = "v04", not(feature = "std")))]
+            #[cfg(all(feature = "query", not(feature = "std")))]
             clock: None,
             #[cfg(all(feature = "datetime", feature = "std"))]
             tz_offset: Some(crate::systime::local_offset),
             #[cfg(all(feature = "datetime", not(feature = "std")))]
             tz_offset: None,
-            #[cfg(all(feature = "v16", feature = "std"))]
+            #[cfg(all(feature = "sql", feature = "std"))]
             vacuum_into: Some(crate::storage::write_new_file),
-            #[cfg(all(feature = "v16", not(feature = "std")))]
+            #[cfg(all(feature = "sql", not(feature = "std")))]
             vacuum_into: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             max_nesting: 250,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             max_expr_depth: DEFAULT_EXPR_DEPTH,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             max_parser_depth: DEFAULT_PARSER_DEPTH,
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: DEFAULT_TRIGGER_DEPTH,
@@ -333,13 +333,13 @@ impl Default for Config {
 }
 
 /// `Config::default()`'s expression depth limit (v0.16): the pin's.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub const DEFAULT_EXPR_DEPTH: usize = crate::sql::parser::PIN_EXPR_DEPTH;
 /// `Config::default()`'s parser depth limit (v0.16): a fifth of the
 /// pin's 2500, so that the default limits fit a 2 MiB thread in a
 /// release build (about 490 nested parentheses, 160 nested calls, 80
 /// nested FROM subqueries).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub const DEFAULT_PARSER_DEPTH: usize = 500;
 
 /// `Config::default()`'s trigger nesting limit (v0.16, `triggers` /
@@ -368,23 +368,23 @@ pub const STACK_PER_TRIGGER: usize = 16 * 1024;
 /// under `-C instrument-coverage` (ci/coverage.sh), where
 /// tests/depth_v16.rs and tests/triggers_v16.rs pass on their
 /// budgeted threads.
-#[cfg(all(feature = "v04", debug_assertions))]
+#[cfg(all(feature = "query", debug_assertions))]
 pub const STACK_BASE: usize = 512 * 1024;
-#[cfg(all(feature = "v04", not(debug_assertions)))]
+#[cfg(all(feature = "query", not(debug_assertions)))]
 pub const STACK_BASE: usize = 64 * 1024;
 /// The most stack one symbol of `Config::max_parser_depth` costs
 /// (v0.16; measured on x86_64, the worst construct being a nested
 /// FROM subquery: its parse, plan and execution).
-#[cfg(all(feature = "v04", debug_assertions))]
+#[cfg(all(feature = "query", debug_assertions))]
 pub const STACK_PER_SYMBOL: usize = 4096;
-#[cfg(all(feature = "v04", not(debug_assertions)))]
+#[cfg(all(feature = "query", not(debug_assertions)))]
 pub const STACK_PER_SYMBOL: usize = 1536;
 /// The most stack one level of `Config::max_expr_depth` costs
 /// (v0.16; measured on x86_64: the resolver, the evaluator and the
 /// tree's Clone / Drop, each recursing once per level).
-#[cfg(all(feature = "v04", debug_assertions))]
+#[cfg(all(feature = "query", debug_assertions))]
 pub const STACK_PER_HEIGHT: usize = 3456;
-#[cfg(all(feature = "v04", not(debug_assertions)))]
+#[cfg(all(feature = "query", not(debug_assertions)))]
 pub const STACK_PER_HEIGHT: usize = 704;
 
 impl Config {
@@ -402,17 +402,17 @@ impl Config {
             catalog_init: 4 * 1024,
             catalog_max: 16 * 1024,
             nonce_seed: 0x6869_7070_5eed_0001,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             clock: None,
             #[cfg(feature = "datetime")]
             tz_offset: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             vacuum_into: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             max_nesting: 16,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             max_expr_depth: 64,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             max_parser_depth: 64,
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             max_trigger_depth: 8,
@@ -444,8 +444,8 @@ impl Config {
         self.nonce_seed = seed;
         self
     }
-    /// Set `max_nesting` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// Set `max_nesting` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     pub fn max_nesting(mut self, levels: usize) -> Config {
         self.max_nesting = levels;
         self
@@ -463,7 +463,7 @@ impl Config {
         self
     }
     /// Set `max_expr_depth` and `max_parser_depth` (v0.16).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub fn depth_limits(mut self, expr: usize, parser: usize) -> Config {
         self.max_expr_depth = expr;
         self.max_parser_depth = parser;
@@ -482,7 +482,7 @@ impl Config {
     /// triggers or foreign keys it also lowers `max_trigger_depth`
     /// to the trigger levels a quarter of the room holds
     /// (`STACK_PER_TRIGGER` each; v0.16 review fix), never raising it.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub fn stack_budget(self, bytes: usize) -> Config {
         let room = bytes.saturating_sub(STACK_BASE);
         let expr = (room / 2 / STACK_PER_HEIGHT).min(crate::sql::parser::PIN_EXPR_DEPTH);
@@ -503,9 +503,9 @@ impl Config {
     /// does not nest).
     pub fn limits(&self) -> crate::sql::parser::Limits {
         crate::sql::parser::Limits {
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             expr_depth: self.max_expr_depth,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             parser_depth: self.max_parser_depth,
         }
     }
@@ -515,14 +515,14 @@ impl Config {
     }
     /// Supply the wall clock (v0.16): `now` returns the current
     /// Unix time in milliseconds (see the `clock` field).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub fn clock(mut self, now: fn() -> i64) -> Config {
         self.clock = Some(now);
         self
     }
     /// Remove the wall clock (v0.16): statements that need it fail
     /// with `Error::NoClock` (the `no_std` default).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub fn no_clock(mut self) -> Config {
         self.clock = None;
         self
@@ -534,9 +534,9 @@ impl Config {
         self.tz_offset = zone;
         self
     }
-    /// Supply the `VACUUM INTO` writer (v0.16, `v16`; see the
+    /// Supply the `VACUUM INTO` writer (v0.16, `sql`; see the
     /// `vacuum_into` field).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn vacuum_into(mut self, write: VacuumWriter) -> Config {
         self.vacuum_into = Some(write);
         self
@@ -594,14 +594,14 @@ struct IndexPlan {
     /// (v0.16, `expr_index`): keys are computed by `ix_key`.
     #[cfg(feature = "expr_index")]
     ext: Option<alloc::rc::Rc<xindex::IdxExt>>,
-    /// The index's own `ON CONFLICT` clause (v0.16, `v07`; an
+    /// The index's own `ON CONFLICT` clause (v0.16, `sql`; an
     /// automatic index's constraint's).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     own: Option<ConflictAction>,
     /// How a conflict on this index resolves under the statement
-    /// (v0.16, `v07`; `ConflictAction::over`), set by
+    /// (v0.16, `sql`; `ConflictAction::over`), set by
     /// `resolve_index_conflicts`.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     act: ConflictAction,
 }
 
@@ -627,11 +627,11 @@ fn update_replaces_any(stmt: ConflictAction, sets: &[(Target, RExpr)], ixs: &[In
 }
 
 /// Resolve each index's conflict action under the statement's
-/// (v0.16, `v07`) and order the indexes as the pin checks them:
+/// (v0.16, `sql`) and order the indexes as the pin checks them:
 /// its index list keeps every index whose own clause is REPLACE
 /// after the others (`sqlite3CreateIndex`), so a REPLACE deletion
 /// happens only once no other constraint can fail or skip the row.
-#[cfg(all(feature = "indexes", feature = "v07"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn resolve_index_conflicts(ixs: &mut AVec<IndexPlan>, stmt: ConflictAction) {
     let mut out: AVec<IndexPlan> = AVec::new();
     for last in [false, true] {
@@ -666,8 +666,8 @@ impl IdxColPlan {
 }
 
 /// An UPDATE ... FROM planned as a join (v0.17 review fix,
-/// `join_order`; `Plan::Update::from_join`).
-#[cfg(feature = "join_order")]
+/// `planner`; `Plan::Update::from_join`).
+#[cfg(feature = "planner")]
 #[derive(Debug, Clone)]
 pub(super) struct FromJoin {
     /// The target table and the FROM sources, in the join's order.
@@ -682,7 +682,7 @@ pub(super) struct FromJoin {
 }
 
 // Plans are built once per statement and never stored in bulk;
-// the variant-size spread depends on the feature rung (v04 alone
+// the variant-size spread depends on the features (`query` alone
 // has the widest gap), so boxing would only add an indirection.
 #[allow(clippy::large_enum_variant)]
 enum Plan {
@@ -690,13 +690,13 @@ enum Plan {
     /// A virtual-table statement (v0.16, `vtab`; `session::vtab`).
     #[cfg(feature = "vtab")]
     Vtab(Box<vtab::VtPlan>),
-    /// `CREATE TABLE ... AS SELECT` (v0.16, `v16`): the source
+    /// `CREATE TABLE ... AS SELECT` (v0.16, `sql`): the source
     /// plan, the derived `sqlite_schema` text (the pin's
     /// `createTableStmt` form) and the new columns' affinities.
     /// `select: None` is the IF NOT EXISTS no-op: the name was
     /// taken when the statement was planned, so (as the pin's
     /// `sqlite3StartTable`) the SELECT was never resolved.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     CreateTableAs {
         select: Option<Box<crate::query::SubPlan>>,
         sql: AVec<u8>,
@@ -714,7 +714,7 @@ enum Plan {
         unique: bool,
         /// The table's generated columns (v0.16): an index may
         /// key on a VIRTUAL column, computed per row here.
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         gcols: Option<Box<crate::rules::GenCols>>,
         /// An expression or partial index's definition (v0.16,
         /// `expr_index`).
@@ -746,7 +746,7 @@ enum Plan {
         /// t)), ((SELECT count(*) FROM t))` on an empty `t`
         /// inserts 0, 0 — probed on the pin). `rows_v` is empty
         /// when this is `Some`.
-        #[cfg(feature = "v08")]
+        #[cfg(feature = "sql")]
         rows_r: Option<AVec<AVec<RExpr>>>,
         /// `INSERT INTO ... SELECT` source (v0.8): a subquery
         /// plan against the empty enclosing scope; executed and
@@ -756,7 +756,7 @@ enum Plan {
         /// pre-statement rows, as in the oracle. Boxed: the
         /// plan is large and the enum's other variants are not
         /// (clippy::large_enum_variant).
-        #[cfg(feature = "v08")]
+        #[cfg(feature = "sql")]
         select: Option<Box<crate::query::SubPlan>>,
         /// The `OR ...` conflict clause (v0.7; the parser only
         /// produces a non-default value under the feature, and
@@ -764,27 +764,27 @@ enum Plan {
         /// planned as `Abort`; the constraints' own clauses are in
         /// `ipk_act`, `InsCol::nn_act` and `IndexPlan::act`.
         conflict: ConflictAction,
-        /// How a rowid conflict resolves (v0.16, `v07`): the
+        /// How a rowid conflict resolves (v0.16, `sql`): the
         /// statement's action over the INTEGER PRIMARY KEY's clause.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         ipk_act: ConflictAction,
         /// The planned upsert clause (v0.7).
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         upsert: Option<UpsertPlan>,
         /// `RETURNING` expressions resolved against the target
         /// table (v0.7); empty when the clause is absent.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         returning: AVec<RExpr>,
         /// Indexes to maintain, in catalog order (v0.3).
         #[cfg(feature = "indexes")]
         indexes: AVec<IndexPlan>,
         /// The table's CHECK / generated / STRICT rules (v0.16);
         /// `None` when it has none.
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         rules: Option<Box<crate::rules::TableRules>>,
         /// The table's name when it is AUTOINCREMENT (v0.16,
-        /// `v16`): the `sqlite_sequence` row to keep.
-        #[cfg(feature = "v16")]
+        /// `sql`): the `sqlite_sequence` row to keep.
+        #[cfg(feature = "sql")]
         autoinc: Option<AVec<u8>>,
     },
     Scan {
@@ -801,9 +801,9 @@ enum Plan {
     },
     /// `BEGIN` (v0.2): state is validated again at step time.
     Begin,
-    /// `BEGIN IMMEDIATE | EXCLUSIVE` (v0.16, `v16`): a `Begin`
+    /// `BEGIN IMMEDIATE | EXCLUSIVE` (v0.16, `sql`): a `Begin`
     /// that also fixes an empty database's layout.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BeginImmediate,
     /// `COMMIT` (v0.2).
     Commit,
@@ -814,13 +814,13 @@ enum Plan {
     /// by materialisation on first step. Shared, not copied, by each
     /// execution (v0.17 size pass): the executors borrow it, and a
     /// streamed execution holds a reference beside its own state.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     Query(alloc::rc::Rc<QueryPlan>),
     /// `UPDATE` (v0.5): SET expressions and the filter are
     /// resolved at plan time against the single source; rows are
     /// materialised at step time and each assignment evaluates
     /// against the row's original values.
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     Update {
         /// The target rows' access path (v0.16, `expr_index`).
         #[cfg(feature = "expr_index")]
@@ -841,27 +841,27 @@ enum Plan {
         /// `Unset` is planned as `Abort` (see `Plan::Insert`).
         conflict: ConflictAction,
         /// Per column, how a NULL in a NOT NULL column resolves
-        /// (v0.16, `v07`), parallel to `not_null`.
-        #[cfg(feature = "v07")]
+        /// (v0.16, `sql`), parallel to `not_null`.
+        #[cfg(feature = "sql")]
         nn_acts: AVec<ConflictAction>,
-        /// How a rowid conflict resolves (v0.16, `v07`).
-        #[cfg(feature = "v07")]
+        /// How a rowid conflict resolves (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         ipk_act: ConflictAction,
         /// `FROM` sources (v0.7), materialised at step time and
         /// nested-loop joined onto each target row; empty when
         /// the clause is absent. The SET/filter expressions were
         /// resolved against target ++ these sources.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         from_sources: AVec<SourcePlan>,
         /// The target and the FROM sources planned as one join in the
-        /// pin's order (v0.17 review fix, `join_order`): the row each
+        /// pin's order (v0.17 review fix, `planner`): the row each
         /// target row is updated from is the last combination that
         /// order gives it, as the pin's UPDATE ... FROM keeps.
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         from_join: Option<Box<FromJoin>>,
         /// `RETURNING` expressions resolved against the target
         /// table only (v0.7); empty when the clause is absent.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         returning: AVec<RExpr>,
         /// Indexes to maintain, in catalog order.
         #[cfg(feature = "indexes")]
@@ -870,7 +870,7 @@ enum Plan {
         rules: Option<Box<crate::rules::TableRules>>,
     },
     /// `DELETE` (v0.5).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     Delete {
         /// The target rows' access path (v0.16, `expr_index`).
         #[cfg(feature = "expr_index")]
@@ -883,7 +883,7 @@ enum Plan {
         filter: Option<RExpr>,
         /// `RETURNING` expressions resolved against the target
         /// table (v0.7); they read each row's pre-delete values.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         returning: AVec<RExpr>,
         /// Indexes to maintain, in catalog order.
         #[cfg(feature = "indexes")]
@@ -894,7 +894,7 @@ enum Plan {
         rules: Option<Box<crate::rules::TableRules>>,
     },
     /// `DROP TABLE` (v0.5); `root: None` is the IF EXISTS no-op.
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     DropTable {
         root: Option<u32>,
         /// Roots of the table's indexes (explicit + implicit),
@@ -906,9 +906,9 @@ enum Plan {
         /// name = ...`).
         seq: Option<(u32, AVec<u8>)>,
     },
-    /// A statement routed to the TEMP database (v0.16, `v16`;
+    /// A statement routed to the TEMP database (v0.16, `sql`;
     /// `session::temp`): its text there and its result width.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Temp {
         sql: AVec<u8>,
         width: usize,
@@ -927,15 +927,15 @@ enum Plan {
     #[cfg(feature = "attach")]
     Attach(Box<attach::AttachPlan>),
     /// `ALTER TABLE ... RENAME TO / RENAME COLUMN / DROP COLUMN`
-    /// (v0.16, `v16`; `session::alter`).
-    #[cfg(feature = "v16")]
+    /// (v0.16, `sql`; `session::alter`).
+    #[cfg(feature = "sql")]
     Alter16 {
         table: AVec<u8>,
         op: alter::AlterOp,
     },
     /// `ALTER TABLE ... ADD COLUMN` (v0.4): the rewritten stored
     /// CREATE TABLE text is computed at plan time.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     AlterAdd {
         root: u32,
         table: AVec<u8>,
@@ -953,7 +953,7 @@ enum Plan {
         empty_only: Option<SchemaKind>,
     },
     /// `CREATE VIEW` (v0.4).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     CreateView,
     /// A statement with parameters whose plan for its current
     /// bindings is not made yet (v0.16, `params`): its plan for
@@ -962,15 +962,15 @@ enum Plan {
     #[cfg(feature = "params")]
     Deferred,
     /// `DROP VIEW` (v0.4); `exists: false` is the IF EXISTS no-op.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     DropView {
         exists: bool,
     },
-    /// `PRAGMA` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `PRAGMA` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Pragma(alloc::rc::Rc<pragma::PragmaPlan>),
-    /// The savepoint and maintenance statements (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// The savepoint and maintenance statements (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Maint(maint::Maint),
     /// `CREATE TRIGGER` (v0.16, `triggers`): the span of the
     /// statement text the stored text keeps (from the bare name to
@@ -1006,11 +1006,11 @@ enum Plan {
 /// derived source (v0.9) carries its subplan in `derived`,
 /// executed once against the empty outer row at
 /// materialisation time (`root` unused).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 type SourcePlan = crate::query::SubSource;
 
 /// A v0.4 query plan: everything resolved at prepare time.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[derive(Debug, Clone)]
 struct QueryPlan {
     sources: AVec<SourcePlan>,
@@ -1029,15 +1029,15 @@ struct QueryPlan {
     /// Compound tail (v0.9; see `SubPlan::compound`). When
     /// non-empty, `order_by` is empty, `comp_order` carries
     /// the compound ORDER BY, and `limit` / `offset` apply to
-    /// the combined result. Only filled under `v09`.
-    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
+    /// the combined result. Only filled under `sql`.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     compound: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
     /// A VALUES core's resolved rows (v0.9; see
     /// `SubPlan::values`).
-    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     values: AVec<AVec<RExpr>>,
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
-    #[cfg_attr(not(feature = "v09"), allow(dead_code))]
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     comp_order: AVec<(usize, crate::sql::SortOrder)>,
     /// The pin's select number (v0.16, `explain`; `SubPlan::sel`).
     #[cfg(feature = "explain")]
@@ -1055,8 +1055,8 @@ struct QueryPlan {
 /// the first item that is the same reference — so after
 /// `a RIGHT JOIN b USING (id)` the term `id` is `b.id`, after a
 /// FULL join `coalesce(a.id, b.id)`.
-#[cfg(feature = "v04")]
-#[cfg_attr(not(feature = "v09"), allow(dead_code))]
+#[cfg(feature = "query")]
+#[cfg_attr(not(feature = "sql"), allow(dead_code))]
 struct CompKeys {
     names: AVec<Option<AVec<u8>>>,
     items: AVec<RExpr>,
@@ -1067,7 +1067,7 @@ struct CompKeys {
     colls: AVec<Option<crate::record::Coll>>,
 }
 
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 impl CompKeys {
     /// The item term `table.name` (or bare `name`) matches in
     /// this core, if any. Generic over the caller's error type only
@@ -1092,7 +1092,7 @@ impl CompKeys {
 /// (v0.16, compound ORDER BY): the same slot, the same rowid
 /// source, or the same function over such references (a FULL
 /// join's USING `coalesce`).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn same_ref(a: &RExpr, b: &RExpr) -> bool {
     match (a, b) {
         (RExpr::Column(x, ..), RExpr::Column(y, ..)) => x == y,
@@ -1107,7 +1107,7 @@ fn same_ref(a: &RExpr, b: &RExpr) -> bool {
 /// The common planned body of one SELECT core (v0.16; see
 /// `Connection::plan_core`): what `QueryPlan` and `SubPlan`
 /// both carry.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 struct CorePlan {
     sources: AVec<SourcePlan>,
     items: AVec<RExpr>,
@@ -1120,25 +1120,25 @@ struct CorePlan {
     has_agg: bool,
     /// Result names / affinities: what a subquery plan records
     /// (top-level queries do not keep them).
-    #[cfg_attr(not(feature = "v06"), allow(dead_code))]
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     result_names: AVec<AVec<u8>>,
-    #[cfg_attr(not(feature = "v06"), allow(dead_code))]
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     result_affs: AVec<Option<crate::record::Affinity>>,
-    #[cfg_attr(not(feature = "v06"), allow(dead_code))]
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     result_named: AVec<bool>,
     /// Compound ORDER BY matching data for this core.
     keys: CompKeys,
     /// The result names `result_col_names` gives, recorded before
-    /// the flattener merged a subquery in (v0.17, `flatten`;
+    /// the flattener merged a subquery in (v0.17, `planner`;
     /// `SubPlan::view_names`).
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     view_names: AVec<AVec<u8>>,
 }
 
 /// Which clause a GROUP BY / HAVING / ORDER BY term belongs to
 /// (v0.16): the pin's ordinal and alias rules differ per
 /// clause (see `Connection::resolve_term`).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TermClause {
     Order,
@@ -1148,7 +1148,7 @@ enum TermClause {
 
 /// `a AND b`, or `b` alone when there is no `a` (v0.16: join
 /// constraint and hoisted ON-term conjunctions).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn and_expr(a: Option<RExpr>, b: RExpr) -> RExpr {
     match a {
         None => b,
@@ -1171,7 +1171,7 @@ fn and_expr(a: Option<RExpr>, b: RExpr) -> RExpr {
 /// in USING()" otherwise). Records the columns in the scope
 /// (`SourceDesc::using`) for star expansion and unqualified
 /// name resolution, and returns the per-source conditions.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn plan_using<E>(
     from: &[crate::sql::FromSource],
     arena: &Arena,
@@ -1248,7 +1248,7 @@ fn plan_using<E>(
 
 /// ALTER TABLE ADD COLUMN's existing-row verification (v0.16):
 /// the new definition's rules and its row layout.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[derive(Debug, Clone)]
 struct AlterVerify {
     rules: crate::rules::TableRules,
@@ -1264,17 +1264,17 @@ struct InsCol {
     /// `NOT NULL` constraint on the column (v0.10).
     not_null: bool,
     /// A DEFAULT that reads connection state (`random()`,
-    /// `last_insert_rowid()`, ...; v0.16 review fix, `v16`): its
+    /// `last_insert_rowid()`, ...; v0.16 review fix, `sql`): its
     /// resolved expression and clock row, evaluated again for
     /// every row inserted — on the pin each row's DEFAULT sees the
     /// rowid the row before it inserted, and draws its own random
     /// value. `default` keeps the prepare-time value (which is
     /// where such a default's errors surface).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     per_row: Option<(RExpr, RowData)>,
-    /// How a NULL in this NOT NULL column resolves (v0.16, `v07`):
+    /// How a NULL in this NOT NULL column resolves (v0.16, `sql`):
     /// the statement's action over the column's own clause.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     nn_act: ConflictAction,
 }
 
@@ -1286,7 +1286,7 @@ enum Target {
 
 /// A planned subquery compound tail plus its resolved
 /// compound ORDER BY (v0.9).
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 type SubCompoundParts = (
     AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)>,
     AVec<(usize, crate::sql::SortOrder)>,
@@ -1294,7 +1294,7 @@ type SubCompoundParts = (
 
 /// A planned top-level compound tail plus its resolved
 /// compound ORDER BY (v0.9).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 type QueryCompoundParts = (
     AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
     AVec<(usize, crate::sql::SortOrder)>,
@@ -1306,7 +1306,7 @@ type QueryCompoundParts = (
 /// group holding the proposed row's values under the qualifier
 /// `excluded`), so bare column names bind the original row —
 /// SQLite's rule — and `excluded.<col>` reaches the proposal.
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone)]
 struct UpsertPlan {
     /// Arbitration target as resolved column targets: `None`
@@ -1352,7 +1352,7 @@ fn select_is_simple(stmt: &SelectStmt) -> bool {
     }
     // v0.16: `name(args)` is a table-valued function (or the
     // pin's "not a function"), for the general planner.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if stmt.from.as_slice()[0].args.is_some() {
         return false;
     }
@@ -1381,13 +1381,13 @@ pub struct Connection<S: Storage> {
     pager: Pager<S>,
     catalog_arena: Arena,
     catalog: Catalog,
-    /// The statistics the planner reads (v0.17, `join_order`):
+    /// The statistics the planner reads (v0.17, `planner`):
     /// loaded with the schema and by ANALYZE (`join::StatState`).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     stat: join::StatState,
     /// The next schema read follows this connection's own CREATE /
     /// DROP: the statistics held are kept (`load_stats`).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     stat_keep: bool,
     cfg: Config,
     /// An explicit `BEGIN` is open (v0.2). The pager transaction
@@ -1400,13 +1400,13 @@ pub struct Connection<S: Storage> {
     /// test observable for the hoisting win — an uncorrelated
     /// expression subquery over N outer rows contributes 1,
     /// not N.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     sub_execs: usize,
     /// The marks of the JSON documents and full-text rows a
-    /// streamed query held when it opened (v0.17, `v16`), while it
+    /// streamed query held when it opened (v0.17, `sql`), while it
     /// has not finished: a statement dropped part-way leaves them,
     /// and the next top-level statement drops what they kept.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     stream_left: Option<(usize, usize)>,
     /// SubPlan node identity source (v0.13): every planned
     /// subquery node takes a unique id, which the executor's
@@ -1416,50 +1416,50 @@ pub struct Connection<S: Storage> {
     /// than a global atomic: no engine statics, and no atomic
     /// read-modify-write, which targets such as Cortex-M0
     /// (`thumbv6m`) do not have.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     next_subplan_id: core::cell::Cell<usize>,
     /// The next SELECT core to plan is a member of a compound the
     /// executor merges (v0.16, `expr_index`): its access path is
     /// chosen for the merge key — every result column, ascending —
     /// as the pin plans a `multiSelectOrderBy` member.
-    #[cfg(all(feature = "expr_index", feature = "v09"))]
+    #[cfg(feature = "expr_index")]
     merge_core: core::cell::Cell<Option<MergeSpec>>,
     /// The next SELECT core to plan is a FROM subquery the query
-    /// flattener merges into its reader (v0.17, `flatten`): it is
+    /// flattener merges into its reader (v0.17, `planner`): it is
     /// planned without access paths or join order, which its reader
     /// plans for the merged sources (`session::flatten`).
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     flat_raw: core::cell::Cell<bool>,
     /// The next `plan_from` call is a SELECT core's own (v0.17,
-    /// `flatten`), whose subqueries marked `FromSource::flat` it
+    /// `planner`), whose subqueries marked `FromSource::flat` it
     /// plans for flattening.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     flat_from: core::cell::Cell<bool>,
     /// The recursive CTEs whose recursive SELECTs are being
-    /// planned (v0.16, `v16`): each one's id and column shape,
+    /// planned (v0.16, `sql`): each one's id and column shape,
     /// which its recursive reference takes (`plan_rec_ref`). A
     /// `Cell` taken and put back around each use, for `&self`
     /// planning.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     rec_scope: core::cell::Cell<AVec<cte::RecShape>>,
     /// The connection state the evaluator reads (v0.16): the
     /// pin's last-insert rowid, change counters and random
-    /// stream (`query::Env`; empty without `v16`).
-    #[cfg(feature = "v04")]
+    /// stream (`query::Env`; empty without `sql`).
+    #[cfg(feature = "query")]
     env: crate::query::Env,
-    /// The PRAGMA flags (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// The PRAGMA flags (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     prag: pragma::PragState,
-    /// The reference trace of a running ALTER TABLE (v0.16, `v16`;
+    /// The reference trace of a running ALTER TABLE (v0.16, `sql`;
     /// `query::AlterTrace`): set while it plans the schema's views.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     alter_trace: Option<alloc::rc::Rc<core::cell::RefCell<crate::query::AlterTrace>>>,
-    /// The connection's TEMP database (v0.16, `v16`; `session::temp`),
+    /// The connection's TEMP database (v0.16, `sql`; `session::temp`),
     /// created on first use, never written to the file.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     temp: Option<Box<Connection<crate::storage::MemStorage>>>,
-    /// This connection is another's TEMP database (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// This connection is another's TEMP database (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     is_temp: bool,
     /// The running trigger programs (v0.16, `triggers`).
     #[cfg(feature = "triggers")]
@@ -1519,41 +1519,41 @@ impl<S: Storage> Connection<S> {
         )
         .await?;
         let catalog_arena = Arena::new(Scope::Catalog, cfg.catalog_init, cfg.catalog_max);
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let seed = cfg.nonce_seed;
         let mut conn = Connection {
             pager,
             catalog_arena,
             catalog: Catalog::empty(u32::MAX),
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             stat: join::StatState::default(),
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             stat_keep: false,
             cfg,
             explicit_txn: false,
-            #[cfg(feature = "v06")]
+            #[cfg(feature = "sql")]
             sub_execs: 0,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             stream_left: None,
-            #[cfg(feature = "v06")]
+            #[cfg(feature = "sql")]
             next_subplan_id: core::cell::Cell::new(1),
-            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            #[cfg(feature = "expr_index")]
             merge_core: core::cell::Cell::new(None),
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             flat_raw: core::cell::Cell::new(false),
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             flat_from: core::cell::Cell::new(false),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rec_scope: core::cell::Cell::new(AVec::new()),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             env: crate::query::Env::new(seed),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             prag: pragma::PragState::default(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             alter_trace: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             temp: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             is_temp: false,
             #[cfg(feature = "triggers")]
             trig: trigger::TrigState::default(),
@@ -1597,12 +1597,12 @@ impl<S: Storage> Connection<S> {
 
     async fn rebuild_catalog(&mut self) -> Result<(), S::Error> {
         self.catalog_arena.reset();
-        // With `v16` a statement may rebuild mid-way and then roll
+        // With `sql` a statement may rebuild mid-way and then roll
         // the file back to the cookie the old catalog was built
         // from: a failed build must not leave that catalog (its
         // arena is gone) looking current, so it is replaced by an
         // empty one the next prepare rebuilds.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             self.catalog = Catalog::empty(self.pager.schema_cookie().wrapping_add(1));
         }
@@ -1615,7 +1615,7 @@ impl<S: Storage> Connection<S> {
         }
         // (Boxed: its cursor stays off the stack of every statement
         // that reloads the schema.)
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         {
             let keep = core::mem::take(&mut self.stat_keep);
             alloc::boxed::Box::pin(self.load_stats(keep)).await?;
@@ -1663,10 +1663,9 @@ impl<S: Storage> Connection<S> {
         // it is what lands in `sqlite_schema.sql` (§5.5).
         let sql_text = arena.alloc_copy_handle(sql.as_bytes())?;
         // v0.16: a statement on the TEMP database runs there.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         // (A statement reading TEMP views over main tables runs on
         // main as the text `MainAs` gives.)
-        #[cfg(feature = "v16")]
         let mut main_as = None;
         // v0.16 (`attach`): a statement naming an attached database
         // is routed first (`session::attach`); the tables of other
@@ -1687,9 +1686,9 @@ impl<S: Storage> Connection<S> {
                 (Some(Plan::Maint(maint::Maint::Nothing)), temp::Route::Main)
             }
         };
-        #[cfg(all(feature = "v16", not(feature = "attach")))]
+        #[cfg(all(feature = "sql", not(feature = "attach")))]
         let temp_route = self.route(sql.as_bytes(), &arena)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let routed = match temp_route {
             #[cfg(feature = "attach")]
             temp::Route::Main if att_plan.is_some() => att_plan,
@@ -1701,15 +1700,15 @@ impl<S: Storage> Connection<S> {
             temp::Route::Temp(text) => Some(self.prepare_temp(text, &arena).await?),
             temp::Route::TempFed(f) => Some(self.prepare_temp_fed(*f, &arena).await?),
         };
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let main_text = main_as.as_ref().map_or(sql.as_bytes(), |t| t.as_slice());
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let main_text = sql.as_bytes();
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let routed: Option<()> = None;
         #[cfg(not(feature = "params"))]
         let (ast, plan) = match routed {
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Some(p) => (Ast::Begin, p),
             _ => {
                 let ast = crate::sql::parse::<S::Error>(main_text, &arena, self.cfg.limits())?;
@@ -1719,7 +1718,7 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(feature = "params")]
         let (ast, plan, binds) = match routed {
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Some(p) => {
                 let t = match &p {
                     Plan::Temp { sql: t, .. } => t.as_slice(),
@@ -1770,43 +1769,43 @@ impl<S: Storage> Connection<S> {
             index_pos: 0,
             #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_loaded: false,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_rows: AVec::new(),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_rowids: AVec::new(),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_pos: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_loaded: false,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             stream: None,
-            #[cfg(feature = "v06")]
+            #[cfg(feature = "sql")]
             hoist: AVec::new(),
-            #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             ret_hoist: AVec::new(),
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_rows: AVec::new(),
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_rowids: AVec::new(),
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_pos: 0,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_loaded: false,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             deferred: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rec_rows: AVec::new(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             mats: AVec::new(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             stmt_sp: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             upsert_failed: false,
             #[cfg(feature = "fts5")]
             fts_kept: false,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             fail_act: core::cell::Cell::new(None),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             autoinc: None,
             #[cfg(feature = "triggers")]
             trig: None,
@@ -1866,9 +1865,9 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Prepare a statement routed to the TEMP database (v0.16,
-    /// `v16`): prepared there once now, so its errors are prepare
+    /// `sql`): prepared there once now, so its errors are prepare
     /// errors as on the pin, and again when it runs.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     async fn prepare_temp(&mut self, text: AVec<u8>, _arena: &Arena) -> Result<Plan, S::Error> {
         let Ok(t) = core::str::from_utf8(text.as_slice()) else {
             return Err(Error::Unsupported);
@@ -2022,9 +2021,9 @@ impl<S: Storage> Connection<S> {
         }
         // v0.16: views and CTEs are read as derived tables — every
         // reference is expanded before anything else is planned.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let expanded = self.expand_ast(arena, ast)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let ast = expanded.as_ref().unwrap_or(ast);
         // v0.16 (`vtab`): statements on virtual and shadow tables.
         #[cfg(feature = "vtab")]
@@ -2039,7 +2038,7 @@ impl<S: Storage> Connection<S> {
             Ast::CreateTable { name, .. } => Some(*name),
             #[cfg(feature = "indexes")]
             Ast::CreateIndex { name, .. } => Some(*name),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Ast::CreateView { name, .. } => Some(*name),
             _ => None,
         };
@@ -2053,7 +2052,7 @@ impl<S: Storage> Connection<S> {
         // (and `sqlite_parameters`) may be dropped — hipp indexed,
         // altered and dropped `sqlite_sequence`, breaking
         // AUTOINCREMENT for the pin.
-        #[cfg(any(feature = "indexes", feature = "v04"))]
+        #[cfg(any(feature = "indexes", feature = "query"))]
         {
             let sys = |h: crate::arena::ABytes| {
                 let n = handle_bytes(arena, h);
@@ -2063,9 +2062,9 @@ impl<S: Storage> Connection<S> {
             let refused = match ast {
                 #[cfg(feature = "indexes")]
                 Ast::CreateIndex { table, .. } => sys(*table),
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 Ast::AlterAddColumn { table, .. } => sys(*table),
-                #[cfg(feature = "v05")]
+                #[cfg(feature = "write")]
                 Ast::DropTable { name, .. } => {
                     let n = handle_bytes(arena, *name);
                     sys(*name)
@@ -2084,14 +2083,12 @@ impl<S: Storage> Connection<S> {
         // with `PRAGMA foreign_keys = ON` a table in a foreign key
         // is not writable either unless `foreign_keys` enforces
         // them.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             let target = match ast {
                 Ast::Insert { table, .. } | Ast::CreateIndex { table, .. } => Some(*table),
                 Ast::AlterAddColumn { table, .. } => Some(*table),
-                #[cfg(feature = "v05")]
                 Ast::Update { table, .. } | Ast::Delete { table, .. } => Some(*table),
-                #[cfg(feature = "v05")]
                 Ast::DropTable { name, .. } => Some(*name),
                 _ => None,
             };
@@ -2119,7 +2116,7 @@ impl<S: Storage> Connection<S> {
         }
         match ast {
             // Unwrapped by `expand_ast` above.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::With { .. } => Err(Error::Unsupported),
             // Planned by `plan_vtab_stmt` above (v0.16, `vtab`); a
             // TEMP database has no virtual tables.
@@ -2131,7 +2128,7 @@ impl<S: Storage> Connection<S> {
             Ast::DropTrigger { name, if_exists } => {
                 self.plan_drop_trigger(arena, *name, *if_exists)
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::Pragma {
                 schema,
                 name,
@@ -2146,34 +2143,34 @@ impl<S: Storage> Connection<S> {
             }
             #[cfg(feature = "attach")]
             Ast::Attach { .. } | Ast::Detach { .. } => self.plan_attach(arena, ast),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::AlterRename { .. }
             | Ast::AlterRenameColumn { .. }
             | Ast::AlterDropColumn { .. } => self.plan_alter16(arena, ast),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::Savepoint { .. }
             | Ast::Release { .. }
             | Ast::RollbackTo { .. }
             | Ast::Vacuum { .. }
             | Ast::Reindex { .. }
             | Ast::Analyze { .. } => self.plan_maint(arena, ast),
-            #[cfg(not(feature = "v04"))]
+            #[cfg(not(feature = "query"))]
             Ast::CreateTable { .. } => Ok(Plan::CreateTable),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Ast::CreateTable {
                 name,
                 columns,
                 pk_columns,
                 checks,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 strict,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 as_select,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if_not_exists,
                 ..
             } => {
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if let Some(sel) = as_select {
                     // The pin's `sqlite3StartTable` refuses a taken
                     // name (or makes IF NOT EXISTS a no-op) before
@@ -2197,9 +2194,9 @@ impl<S: Storage> Connection<S> {
                     }
                     return self.plan_create_as(arena, tname, sel);
                 }
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 let strict = *strict;
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 let strict = false;
                 #[cfg(feature = "without_rowid")]
                 let wr_def = create_without_rowid(ast);
@@ -2235,7 +2232,7 @@ impl<S: Storage> Connection<S> {
                     strict,
                     !wr_def,
                 )?;
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if self.prag.like_redefined
                     && crate::rules::gen_uses_like::<S::Error>(
                         arena,
@@ -2342,7 +2339,7 @@ impl<S: Storage> Connection<S> {
                     defaults,
                     cols,
                     unique: *unique,
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     gcols: if t.has_generated() {
                         self.table_rules(arena, t)?
                             .and_then(|r| r.gcols)
@@ -2409,25 +2406,25 @@ impl<S: Storage> Connection<S> {
                     });
                 }
                 // An AUTOINCREMENT table (in a file the pin made) is
-                // read-only without `v16`: those builds keep no
+                // read-only without `sql`: those builds keep no
                 // `sqlite_sequence` (v0.16 fix: hipp inserted rows
                 // and left the sequence behind, so the pin's next
                 // INSERT reused a rowid AUTOINCREMENT had handed out).
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 crate::sql::parser::schema_text_start::<S::Error>(
                     handle_bytes(&self.catalog_arena, t.sql),
                     arena,
                 )?;
-                #[cfg(not(feature = "v08"))]
+                #[cfg(not(feature = "sql"))]
                 let _ = select;
-                #[cfg(not(feature = "v07"))]
+                #[cfg(not(feature = "sql"))]
                 let _ = (upsert, returning);
                 // v0.16: a generated column takes no value — an
                 // INSERT without a column list supplies the other
                 // columns, in order, and naming one is an error.
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 let is_gen = |i: usize| t.columns.as_slice()[i].gen_expr.is_some();
-                #[cfg(not(feature = "v04"))]
+                #[cfg(not(feature = "query"))]
                 let is_gen = |_: usize| false;
                 let mut targets = AVec::new();
                 match columns {
@@ -2463,20 +2460,20 @@ impl<S: Storage> Connection<S> {
                     }
                 }
                 let mut cols = AVec::new();
-                // v0.16 (`v07`): each constraint's action under the
+                // v0.16 (`sql`): each constraint's action under the
                 // statement's; the statement action itself is ABORT
                 // when it has no OR clause.
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 let stmt = *conflict;
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 let conflict = &stmt.over(None);
                 // One clock read for the whole statement.
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 let mut clock = crate::rules::Clock::new(self.cfg.clock);
                 for (i, c) in t.columns.iter().enumerate() {
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     let nn_act = stmt.over(c.nn_conflict);
-                    #[cfg(all(feature = "v04", not(feature = "v07")))]
+                    #[cfg(all(feature = "query", not(feature = "sql")))]
                     let nn_act = *conflict;
                     // v0.16: an expression DEFAULT the catalog
                     // could not fold is evaluated only when a row
@@ -2485,25 +2482,25 @@ impl<S: Storage> Connection<S> {
                     // in a NOT NULL column — so its clock read or
                     // unknown function errors exactly when the
                     // pin's would.
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     let mut per_row = None;
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     let default = if c.default_expr.is_some()
                         && (!targets.iter().any(|tg| *tg == Target::Col(i))
                             || (c.not_null && nn_act == ConflictAction::Replace))
                     {
-                        #[cfg(feature = "v16")]
+                        #[cfg(feature = "sql")]
                         {
                             let (v, pr) = self.column_default_per_row(arena, c, &mut clock)?;
                             per_row = pr;
                             v
                         }
-                        #[cfg(not(feature = "v16"))]
+                        #[cfg(not(feature = "sql"))]
                         self.column_default(arena, c, &mut clock)?
                     } else {
                         literal_owned(&self.catalog_arena, c.default)
                     };
-                    #[cfg(not(feature = "v04"))]
+                    #[cfg(not(feature = "query"))]
                     let default = {
                         let _ = i;
                         literal_owned(&self.catalog_arena, c.default)
@@ -2512,16 +2509,16 @@ impl<S: Storage> Connection<S> {
                         affinity: c.affinity,
                         default,
                         not_null: c.not_null,
-                        #[cfg(feature = "v16")]
+                        #[cfg(feature = "sql")]
                         per_row,
-                        #[cfg(feature = "v07")]
+                        #[cfg(feature = "sql")]
                         nn_act,
                     });
                 }
                 #[cfg(feature = "indexes")]
                 #[allow(unused_mut)]
                 let mut indexes = self.write_index_plans(arena, tname)?;
-                #[cfg(all(feature = "indexes", feature = "v07"))]
+                #[cfg(all(feature = "indexes", feature = "sql"))]
                 resolve_index_conflicts(&mut indexes, stmt);
                 // v0.8: an INSERT ... SELECT source is planned
                 // as a subquery against the empty enclosing
@@ -2535,7 +2532,7 @@ impl<S: Storage> Connection<S> {
                 // syntax error there, the terminated and
                 // FROM-less forms parse), so hipp refuses the
                 // same shape rather than accepting a superset.
-                #[cfg(feature = "v08")]
+                #[cfg(feature = "sql")]
                 let select_plan = match select {
                     Some(sel) => {
                         // A compound source (v0.9) terminates
@@ -2573,7 +2570,7 @@ impl<S: Storage> Connection<S> {
                     }
                     None => None,
                 };
-                #[cfg(feature = "v08")]
+                #[cfg(feature = "sql")]
                 let (rows_v, rows_r) = if select_plan.is_some() {
                     (AVec::new(), None)
                 } else {
@@ -2608,7 +2605,6 @@ impl<S: Storage> Connection<S> {
                             // v0.16: a row reading last_insert_rowid()
                             // evaluates at step time, just before its
                             // own insert (see `exec_insert`).
-                            #[cfg(feature = "v16")]
                             if reads_last_rowid(&re) {
                                 any_sub = true;
                             }
@@ -2647,13 +2643,12 @@ impl<S: Storage> Connection<S> {
                             // inserted first, as on the pin, so a
                             // failed statement leaves
                             // last_insert_rowid() at the last of them.
-                            #[cfg(feature = "v16")]
                             Some(Error::Schema { .. }) => (AVec::new(), Some(resolved)),
                             Some(e) => return Err(e),
                         }
                     }
                 };
-                #[cfg(not(feature = "v08"))]
+                #[cfg(not(feature = "sql"))]
                 let rows_v = {
                     let mut rows_v = AVec::new();
                     for r in rows.iter() {
@@ -2665,12 +2660,12 @@ impl<S: Storage> Connection<S> {
                     }
                     rows_v
                 };
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 let upsert_plan = match upsert {
                     Some(u) => Some(self.plan_upsert(arena, t, tname, u)?),
                     None => None,
                 };
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 let returning_r = self.plan_returning(arena, t, tname, returning)?;
                 Ok(Plan::Insert {
                     root: t.root,
@@ -2678,22 +2673,22 @@ impl<S: Storage> Connection<S> {
                     cols,
                     targets,
                     rows_v,
-                    #[cfg(feature = "v08")]
+                    #[cfg(feature = "sql")]
                     rows_r,
-                    #[cfg(feature = "v08")]
+                    #[cfg(feature = "sql")]
                     select: select_plan,
                     conflict: *conflict,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     ipk_act: stmt.over(t.ipk_conflict),
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     upsert: upsert_plan,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     returning: returning_r,
                     #[cfg(feature = "indexes")]
                     indexes,
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     rules: self.table_rules(arena, t)?,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     autoinc: if t.autoinc {
                         Some(copy_vec(handle_bytes(&self.catalog_arena, t.name)))
                     } else {
@@ -2707,7 +2702,7 @@ impl<S: Storage> Connection<S> {
                 }
                 Ok(Plan::Begin)
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::BeginImmediate => {
                 if self.explicit_txn {
                     return Err(Error::TransactionState { nested: true });
@@ -2717,7 +2712,7 @@ impl<S: Storage> Connection<S> {
             Ast::Commit => Ok(Plan::Commit),
             Ast::Rollback => Ok(Plan::Rollback),
             Ast::Select(stmt) => self.plan_select(stmt, arena),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Ast::AlterAddColumn {
                 table,
                 column,
@@ -2769,7 +2764,7 @@ impl<S: Storage> Connection<S> {
                 // through `sqlite3ErrorIfNotEmpty` and emitted before
                 // its other such refusals; v0.16 review fix: an empty
                 // table takes the column).
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if self.prag.foreign_keys
                     && (column.default_expr.is_some()
                         || !matches!(literal_owned(arena, column.default), OwnedValue::Null))
@@ -2835,16 +2830,16 @@ impl<S: Storage> Connection<S> {
                     columns: ncols_def,
                     pk_columns,
                     checks,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     strict,
                     ..
                 } = crate::sql::parse::<S::Error>(new_sql.as_slice(), arena, self.cfg.limits())?
                 else {
                     return Err(Error::Unsupported);
                 };
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 let strict_def = strict;
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 let strict_def = false;
                 #[allow(unused_mut)]
                 let mut rules = crate::rules::validate_def::<S::Error>(
@@ -2858,7 +2853,7 @@ impl<S: Storage> Connection<S> {
                     t.has_rowid(),
                 )?;
                 // The pin re-checks the whole rewritten definition.
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if self.prag.like_redefined
                     && crate::rules::gen_uses_like::<S::Error>(
                         arena,
@@ -2871,7 +2866,7 @@ impl<S: Storage> Connection<S> {
                     });
                 }
                 // `PRAGMA ignore_check_constraints` (v0.16).
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if self.prag.ignore_checks {
                     rules.checks = AVec::new();
                 }
@@ -2924,9 +2919,9 @@ impl<S: Storage> Connection<S> {
             // v0.16: the pin stores a view without resolving it; a
             // missing table, a column-count mismatch or a cycle is
             // reported when the view is read.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Ast::CreateView { .. } => Ok(Plan::CreateView),
-            #[cfg(all(feature = "v04", not(feature = "v16")))]
+            #[cfg(all(feature = "query", not(feature = "sql")))]
             Ast::CreateView {
                 columns, select, ..
             } => {
@@ -2940,7 +2935,7 @@ impl<S: Storage> Connection<S> {
                 }
                 Ok(Plan::CreateView)
             }
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Ast::DropView { name, if_exists } => {
                 let nb = handle_bytes(arena, *name);
                 match self.catalog.find_view(&self.catalog_arena, nb) {
@@ -2963,11 +2958,11 @@ impl<S: Storage> Connection<S> {
                     Some(_) => Ok(Plan::DropView { exists: true }),
                 }
             }
-            #[cfg(not(feature = "v04"))]
+            #[cfg(not(feature = "query"))]
             Ast::AlterAddColumn { .. } | Ast::CreateView { .. } | Ast::DropView { .. } => {
                 Err(Error::Unsupported)
             }
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Ast::Update {
                 table,
                 alias,
@@ -2976,7 +2971,7 @@ impl<S: Storage> Connection<S> {
                 from,
                 filter,
                 returning,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 indexed,
             } => self.plan_update(
                 arena,
@@ -2987,25 +2982,25 @@ impl<S: Storage> Connection<S> {
                 from,
                 filter,
                 returning,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 *indexed,
             ),
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Ast::Delete {
                 table,
                 filter,
                 returning,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 indexed,
             } => self.plan_delete(
                 arena,
                 table,
                 filter,
                 returning,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 *indexed,
             ),
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Ast::DropTable { name, if_exists } => {
                 let nb = handle_bytes(arena, *name);
                 match self.catalog.find(&self.catalog_arena, nb) {
@@ -3050,7 +3045,7 @@ impl<S: Storage> Connection<S> {
                     }
                 }
             }
-            #[cfg(not(feature = "v05"))]
+            #[cfg(not(feature = "write"))]
             Ast::Update { .. } | Ast::Delete { .. } | Ast::DropTable { .. } => {
                 Err(Error::Unsupported)
             }
@@ -3060,7 +3055,7 @@ impl<S: Storage> Connection<S> {
     /// The table an UPDATE/DELETE writes to: a view is refused
     /// with `IsView` (the oracle: "cannot modify ... because it
     /// is a view"), a missing name with `UnknownTable`.
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     fn write_table(
         &self,
         arena: &Arena,
@@ -3088,7 +3083,7 @@ impl<S: Storage> Connection<S> {
         }
     }
 
-    /// Plan `CREATE TABLE name AS SELECT ...` (v0.16, `v16`):
+    /// Plan `CREATE TABLE name AS SELECT ...` (v0.16, `sql`):
     /// the SELECT plans as a subquery against the empty scope;
     /// the new table's columns take the pin's names (alias, else
     /// the column's own name — `rowid` for a rowid reference, or
@@ -3097,7 +3092,7 @@ impl<S: Storage> Connection<S> {
     /// each result item (`sqlite3ExprAffinity`, with the pin's
     /// demotion across compound cores), which also gives the
     /// declared type in the derived schema text.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn plan_create_as(
         &self,
         arena: &Arena,
@@ -3143,7 +3138,7 @@ impl<S: Storage> Connection<S> {
     /// derived tables, views and CTEs name their columns by it.
     /// Not made unique. `base` is the plan's enclosing scopes'
     /// `(width, source count)`, where its own slots begin.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn result_col_names(
         &self,
         plan: &crate::query::SubPlan,
@@ -3151,8 +3146,8 @@ impl<S: Storage> Connection<S> {
     ) -> Result<AVec<AVec<u8>>, S::Error> {
         // A core the flattener merged a subquery into named its
         // columns before the merge, as the pin does (v0.17,
-        // `flatten`).
-        #[cfg(feature = "flatten")]
+        // `planner`).
+        #[cfg(feature = "planner")]
         if !plan.view_names.is_empty() {
             return Ok(plan.view_names.clone());
         }
@@ -3168,7 +3163,7 @@ impl<S: Storage> Connection<S> {
 
     /// `result_col_names` over a core's parts (v0.17: also what the
     /// flattener records before it merges, `SubPlan::view_names`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     #[allow(clippy::too_many_arguments)]
     fn col_names_of(
         &self,
@@ -3227,7 +3222,7 @@ impl<S: Storage> Connection<S> {
     /// The name of column `k` of one planned FROM source (v0.16,
     /// CREATE TABLE ... AS SELECT naming): the table's column, or
     /// a derived table's (deduplicated) result column.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn source_col_name(
         &self,
         sp: &crate::query::SubSource,
@@ -3242,7 +3237,7 @@ impl<S: Storage> Connection<S> {
         if sp.ext != 0 {
             return Ok(self.ext_col(sp.ext, k).map(|c| c.0));
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if sp.temp
             && let Some(tc) = self.temp.as_deref()
         {
@@ -3265,7 +3260,7 @@ impl<S: Storage> Connection<S> {
 
     /// A table's CHECK / generated / STRICT rules resolved for
     /// one statement (v0.16); `None` for a table with none.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn table_rules(
         &self,
         arena: &Arena,
@@ -3291,13 +3286,13 @@ impl<S: Storage> Connection<S> {
             checks.push(handle_bytes(ca, *h));
         }
         // `PRAGMA ignore_check_constraints` (v0.16).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.prag.ignore_checks {
             checks.clear();
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let strict = t.strict;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let strict = false;
         #[allow(unused_mut)]
         let mut rules = crate::rules::plan_rules::<S::Error>(
@@ -3310,7 +3305,7 @@ impl<S: Storage> Connection<S> {
             strict,
             t.has_rowid(),
         )?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Some(g) = rules.gcols.as_mut() {
             g.case_like = self.env.case_like.get();
         }
@@ -3322,7 +3317,7 @@ impl<S: Storage> Connection<S> {
     /// not fold — its evaluation now (reading the clock if it
     /// names one; an unknown function errors here, as on the
     /// pin, only because the default is needed).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn column_default(
         &self,
         arena: &Arena,
@@ -3341,10 +3336,10 @@ impl<S: Storage> Connection<S> {
         }
     }
 
-    /// `column_default` for an INSERT (v0.16 review fix, `v16`):
+    /// `column_default` for an INSERT (v0.16 review fix, `sql`):
     /// also the prepared expression when the default reads
     /// connection state, for `InsCol::per_row`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     #[allow(clippy::type_complexity)]
     fn column_default_per_row(
         &self,
@@ -3370,7 +3365,7 @@ impl<S: Storage> Connection<S> {
     /// One FROM source description for resolving an UPDATE/DELETE
     /// statement's expressions (qualifier = alias if given, else
     /// the table name — SQLite's rule, as in plan_query).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     fn single_source(
         &self,
         t: &crate::schema::TableDef,
@@ -3387,7 +3382,7 @@ impl<S: Storage> Connection<S> {
         let mut src =
             crate::query::SourceDesc::new(copy_vec(qualifier), cols, t.rowid_alias, t.has_rowid());
         src.colls = table_colls(t);
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             src.db = self.db_no();
         }
@@ -3440,9 +3435,9 @@ impl<S: Storage> Connection<S> {
                 desc,
                 #[cfg(feature = "expr_index")]
                 ext,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 own: ix.conflict,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 act: ConflictAction::Abort,
             });
         }
@@ -3453,10 +3448,10 @@ impl<S: Storage> Connection<S> {
     /// The subquery planner handed to `resolve_scoped` (v0.6):
     /// stacks the containing query's scope group onto the
     /// enclosing groups and plans the subquery against the
-    /// combined scope. Without the `v06` feature the planner
+    /// combined scope. Without the `sql` feature the planner
     /// always fails — the parser never produces subquery nodes
     /// there, so it is never actually called.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn sub_planner<'a>(
         &'a self,
         arena: &'a Arena,
@@ -3466,7 +3461,7 @@ impl<S: Storage> Connection<S> {
         &[crate::query::ScopeGroup],
     ) -> Result<crate::query::SubPlan, S::Error>
     + 'a {
-        #[cfg(feature = "v06")]
+        #[cfg(feature = "sql")]
         {
             move |stmt: &SelectStmt,
                   cur: &crate::query::ScopeGroup,
@@ -3479,7 +3474,7 @@ impl<S: Storage> Connection<S> {
                 self.plan_subquery(stmt, arena, full.as_slice())
             }
         }
-        #[cfg(not(feature = "v06"))]
+        #[cfg(not(feature = "sql"))]
         {
             let _ = arena;
             move |_: &SelectStmt, _: &crate::query::ScopeGroup, _: &[crate::query::ScopeGroup]| {
@@ -3503,8 +3498,8 @@ impl<S: Storage> Connection<S> {
     ///   column shadows the alias there — the pin groups
     ///   `SELECT a+1 AS b ... GROUP BY b` by the column `b`).
     /// - Anything else resolves as an ordinary expression
-    ///   (under `v16` the scope's aliases are visible inside it).
-    #[cfg(feature = "v04")]
+    ///   (under `sql` the scope's aliases are visible inside it).
+    #[cfg(feature = "query")]
     #[allow(clippy::too_many_arguments)]
     fn resolve_term(
         &self,
@@ -3517,12 +3512,12 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
         planner: crate::query::SubPlanner<'_, S::Error>,
     ) -> Result<RExpr, S::Error> {
-        // `<term> COLLATE name` (v0.16, `v16`): the term's own
+        // `<term> COLLATE name` (v0.16, `sql`): the term's own
         // ordinal / alias rules apply to the operand and the
         // collation stays on top (the pin's `resolveAlias`
         // keeps it), so `ORDER BY 1 COLLATE NOCASE` sorts item 1
         // by NOCASE.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Expr::Collate(inner, c) = e {
             let r = self.resolve_term(
                 inner, clause, arena, items, aliases, cur, enclosing, planner,
@@ -3565,7 +3560,7 @@ impl<S: Storage> Connection<S> {
     /// `base_src` are the enclosing scopes' combined width and
     /// source count — the absolute threshold below which a
     /// reference is bound to an enclosing scope.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     fn stamp_subplan(&self, plan: &mut crate::query::SubPlan, base_width: usize, base_src: usize) {
         let id = self.next_subplan_id.get();
         // Wrapping past usize::MAX would take 2^64 plans; skip 0,
@@ -3582,7 +3577,7 @@ impl<S: Storage> Connection<S> {
     /// subquery's own sources are numbered after all enclosing
     /// sources. Mirrors `plan_query`, including term resolution
     /// and the aggregate-argument subquery rule.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     fn plan_subquery(
         &self,
         stmt: &SelectStmt,
@@ -3596,7 +3591,7 @@ impl<S: Storage> Connection<S> {
     /// `plan_subquery`, also returning the head core's compound
     /// ORDER BY matching data (v0.16; a compound tail core is
     /// planned through this to supply its own).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     fn plan_subquery_keyed(
         &self,
         stmt: &SelectStmt,
@@ -3607,7 +3602,7 @@ impl<S: Storage> Connection<S> {
         let (base_width, base_src) = crate::query::ScopeGroup::stack_end(enclosing);
         // A VALUES core (v0.9): no sources of its own; the rows
         // resolve against the enclosing scopes alone.
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if !stmt.values.is_empty() {
             let (values, keys) = self.plan_values(stmt, arena, base_src, enclosing)?;
             let width = keys.names.len();
@@ -3644,36 +3639,34 @@ impl<S: Storage> Connection<S> {
                 id: 0,
                 uncorrelated: false,
                 scalar_col: 0,
-                #[cfg(feature = "v16")]
                 rec: None,
-                #[cfg(feature = "v16")]
                 mat: 0,
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 view_names: AVec::new(),
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 is_cte: false,
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 lazy: false,
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 grp: 0,
             };
             self.stamp_subplan(&mut plan, base_width, base_src);
             return Ok((plan, keys));
         }
-        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        #[cfg(feature = "expr_index")]
         if !stmt.compound.is_empty() {
             self.merge_core.set(merge_member(stmt, 0));
         }
         let core = self.plan_core(stmt, arena, enclosing)?;
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
             self.plan_sub_compound(stmt, arena, enclosing, &core.keys, core.items.len())?
         };
-        #[cfg(not(feature = "v09"))]
+        #[cfg(not(feature = "sql"))]
         let (compound, comp_order): SubCompoundParts = (AVec::new(), AVec::new());
         let mut plan = SubPlan {
             sources: core.sources,
@@ -3695,19 +3688,19 @@ impl<S: Storage> Connection<S> {
             id: 0,
             uncorrelated: false,
             scalar_col: 0,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rec: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             mat: 0,
             #[cfg(feature = "explain")]
             sel: stmt.sel,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             view_names: core.view_names,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             is_cte: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             lazy: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             grp: 0,
         };
         // A compound's cores sort by its ORDER BY (and, under
@@ -3752,7 +3745,7 @@ impl<S: Storage> Connection<S> {
     /// and subquery planning since v0.16) against `enclosing`,
     /// with its compound ORDER BY keys: the `column1`, ...
     /// names, no FROM scope.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     fn plan_values(
         &self,
         stmt: &SelectStmt,
@@ -3821,7 +3814,7 @@ impl<S: Storage> Connection<S> {
     /// number of result columns"). The statement's ORDER BY
     /// resolves to output-column indices over every core's
     /// `CompKeys`, head first.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     fn plan_sub_compound(
         &self,
         stmt: &SelectStmt,
@@ -3859,7 +3852,7 @@ impl<S: Storage> Connection<S> {
 
     /// Plan one top-level statement's compound tail (v0.9):
     /// the `plan_sub_compound` mirror for `QueryPlan`.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     fn plan_query_compound(
         &self,
         stmt: &SelectStmt,
@@ -3899,7 +3892,7 @@ impl<S: Storage> Connection<S> {
     /// in the table's single-source scope (subqueries plan
     /// against it as their enclosing scope), and aggregates are
     /// refused — the oracle calls them a misuse in RETURNING.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn plan_returning(
         &self,
         arena: &Arena,
@@ -3913,7 +3906,7 @@ impl<S: Storage> Connection<S> {
 
     /// `plan_returning` over the given source (v0.16: also a view's
     /// columns, for a write through INSTEAD OF triggers).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     pub(super) fn plan_returning_in(
         &self,
         arena: &Arena,
@@ -3926,7 +3919,7 @@ impl<S: Storage> Connection<S> {
         cur.agg_owner = false;
         // The pin's RETURNING row is no schema object: `main.t.col`
         // is "no such column" there (v0.16).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         for s in cur.sources.as_mut_slice() {
             s.db = 0;
         }
@@ -3978,7 +3971,7 @@ impl<S: Storage> Connection<S> {
     /// Plan an upsert clause (v0.7): resolve and validate the
     /// conflict target, then resolve the DO UPDATE assignments
     /// and filter against (original row, excluded row) scopes.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn plan_upsert(
         &self,
         arena: &Arena,
@@ -4166,7 +4159,7 @@ impl<S: Storage> Connection<S> {
     /// prepare time, against target ++ FROM sources; aggregates
     /// are not legal in either (SQLite agrees). RETURNING
     /// resolves against the target table only.
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     #[allow(clippy::too_many_arguments)]
     fn plan_update(
         &self,
@@ -4178,21 +4171,21 @@ impl<S: Storage> Connection<S> {
         from: &AVec<crate::sql::FromSource>,
         filter: &Option<Expr>,
         returning: &AVec<SelectItem>,
-        #[cfg(feature = "v16")] indexed: Option<crate::sql::IndexHint>,
+        #[cfg(feature = "sql")] indexed: Option<crate::sql::IndexHint>,
     ) -> Result<Plan, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let _ = returning;
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let hint = self.index_hint(arena, t, indexed)?;
         let qualifier: &[u8] = match alias {
             Some(a) => handle_bytes(arena, *a),
             None => tname,
         };
         // Combined scope: target first, then the FROM sources
-        // (empty without the v07 parser, which never fills
+        // (empty without the `sql` parser, which never fills
         // `from`); SourcePlans are kept for the executor. The
         // FROM clause is its own join (v0.16, as on the pin,
         // which plans it like a subquery): its USING / NATURAL
@@ -4274,9 +4267,9 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
-        // v0.17 review fix (`flatten`): the FROM subqueries' columns
+        // v0.17 review fix (`planner`): the FROM subqueries' columns
         // nothing reads are not computed, as in a SELECT.
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         {
             let mut reads: AVec<RExpr> = AVec::new();
             for (_, e) in sets.iter() {
@@ -4296,7 +4289,7 @@ impl<S: Storage> Connection<S> {
                 },
             );
         }
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let from_join = if from_plans.is_empty() || !t.has_rowid() {
             None
         } else {
@@ -4314,20 +4307,20 @@ impl<S: Storage> Connection<S> {
         let mut defaults = AVec::new();
         let mut affs = AVec::new();
         let mut not_null = AVec::new();
-        // v0.16 (`v07`): each constraint's action under the
+        // v0.16 (`sql`): each constraint's action under the
         // statement's (`ConflictAction::over`); the statement action
         // itself is ABORT when it has no OR clause.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let stmt = conflict;
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let conflict = stmt.over(None);
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let mut nn_acts = AVec::new();
         let mut clock = crate::rules::Clock::new(self.cfg.clock);
         for c in t.columns.iter() {
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             let nn_act = stmt.over(c.nn_conflict);
-            #[cfg(not(feature = "v07"))]
+            #[cfg(not(feature = "sql"))]
             let nn_act = conflict;
             // v0.16: an unfolded expression DEFAULT matters to an
             // UPDATE only as a REPLACE's NOT NULL substitute.
@@ -4340,15 +4333,15 @@ impl<S: Storage> Connection<S> {
             );
             affs.push(c.affinity);
             not_null.push(c.not_null);
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             nn_acts.push(nn_act);
         }
         #[cfg(feature = "indexes")]
         #[allow(unused_mut)]
         let mut indexes = self.write_index_plans(arena, tname)?;
-        #[cfg(all(feature = "indexes", feature = "v07"))]
+        #[cfg(all(feature = "indexes", feature = "sql"))]
         resolve_index_conflicts(&mut indexes, stmt);
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let returning_r = self.plan_returning(arena, t, qualifier, returning)?;
         #[cfg(feature = "expr_index")]
         let access = self.plan_write_access(
@@ -4363,7 +4356,7 @@ impl<S: Storage> Connection<S> {
             }),
             hint,
         )?;
-        #[cfg(all(feature = "v16", not(feature = "expr_index")))]
+        #[cfg(all(feature = "sql", not(feature = "expr_index")))]
         let _ = hint;
         Ok(Plan::Update {
             #[cfg(feature = "expr_index")]
@@ -4377,15 +4370,15 @@ impl<S: Storage> Connection<S> {
             sets,
             filter,
             conflict,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             nn_acts,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ipk_act: stmt.over(t.ipk_conflict),
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             from_sources: from_plans,
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             from_join,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
             indexes,
@@ -4394,13 +4387,13 @@ impl<S: Storage> Connection<S> {
     }
 
     /// UPDATE ... FROM as the pin plans it (v0.17 review fix,
-    /// `join_order`): the target and the FROM sources as one join,
+    /// `planner`): the target and the FROM sources as one join,
     /// ordered by the join planner (`plan_join`), with the WHERE
     /// clause, the SET expressions and the target's rowid laid out
     /// for that order. `None` when the planner does not take the
     /// join: the FROM sources are then joined onto each target row in
     /// FROM order.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn plan_update_join(
@@ -4429,7 +4422,7 @@ impl<S: Storage> Connection<S> {
             schema: None,
             cte: None,
             indexed,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             flat: false,
         };
         let mut descs = AVec::new();
@@ -4487,8 +4480,8 @@ impl<S: Storage> Connection<S> {
     }
 
     /// This connection's database for three-part names (v0.16,
-    /// `v16`; `SourceDesc::db`): 1 main, 2 temp.
-    #[cfg(feature = "v16")]
+    /// `sql`; `SourceDesc::db`): 1 main, 2 temp.
+    #[cfg(feature = "sql")]
     pub(super) fn db_no(&self) -> u8 {
         if self.is_temp { 2 } else { 1 }
     }
@@ -4503,12 +4496,12 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Resolve an `INDEXED BY` / `NOT INDEXED` on table `t` (v0.16,
-    /// `v16`): the pin's "no such index" (`UnknownIndex`) when `t`
+    /// `sql`): the pin's "no such index" (`UnknownIndex`) when `t`
     /// has no index of the name. An index hipp cannot read (an
     /// expression or partial one below `expr_index`) is refused
     /// (`Unsupported`). Builds without the `expr_index` planner only
     /// check the clause: their scans keep rowid order.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn index_hint(
         &self,
         arena: &Arena,
@@ -4540,7 +4533,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Whether a write of `t` under the statement action `stmt` may
-    /// delete rows to resolve a conflict (v0.16, `v07`): OR REPLACE,
+    /// delete rows to resolve a conflict (v0.16, `sql`): OR REPLACE,
     /// or, without an OR clause, a rowid or UNIQUE / PRIMARY KEY
     /// constraint declared `ON CONFLICT REPLACE` (a NOT NULL one
     /// substitutes its default and deletes nothing).
@@ -4561,21 +4554,21 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Plan a DELETE (v0.5; RETURNING is v0.7).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     fn plan_delete(
         &self,
         arena: &Arena,
         table: &crate::arena::ABytes,
         filter: &Option<Expr>,
         returning: &AVec<SelectItem>,
-        #[cfg(feature = "v16")] indexed: Option<crate::sql::IndexHint>,
+        #[cfg(feature = "sql")] indexed: Option<crate::sql::IndexHint>,
     ) -> Result<Plan, S::Error> {
         use crate::query::{has_agg, resolve_scoped};
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let _ = returning;
         let tname = handle_bytes(arena, *table);
         let t = self.write_table(arena, table)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         #[allow(unused_variables)]
         let hint = self.index_hint(arena, t, indexed)?;
         let (sources, offsets) = self.single_source(t, tname);
@@ -4597,7 +4590,7 @@ impl<S: Storage> Connection<S> {
             defaults.push(read_default(&self.catalog_arena, c));
             affs.push(c.affinity);
         }
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let returning_r = self.plan_returning(arena, t, tname, returning)?;
         Ok(Plan::Delete {
             #[cfg(feature = "expr_index")]
@@ -4608,7 +4601,7 @@ impl<S: Storage> Connection<S> {
             defaults,
             affs,
             filter,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             returning: returning_r,
             #[cfg(feature = "indexes")]
             indexes: self.write_index_plans(arena, tname)?,
@@ -4622,16 +4615,16 @@ impl<S: Storage> Connection<S> {
 
     /// Evaluate one INSERT VALUES expression at plan time
     /// (v0.4: constant expressions; pre-v0.4: plain literals).
-    /// Superseded under `v08` by the resolved-expression fold in
+    /// Superseded under `sql` by the resolved-expression fold in
     /// the INSERT planner (which needs the resolved form to
     /// detect subqueries), so it only compiles there.
-    #[cfg(not(feature = "v08"))]
+    #[cfg(not(feature = "sql"))]
     fn eval_value_expr(&self, arena: &Arena, e: &Expr) -> Result<OwnedValue, S::Error> {
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             crate::query::eval_const::<S::Error>(e, arena)
         }
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         {
             match e {
                 Expr::Literal(l) => Ok(literal_owned(arena, Some(*l))),
@@ -4643,7 +4636,7 @@ impl<S: Storage> Connection<S> {
     /// SELECT planning (v0.4): the legacy fast paths (full scan /
     /// rowid seek / index lookup, zero materialisation) serve the
     /// simple single-table shape; anything richer goes to the
-    /// general query planner when the `v04` feature is on. A
+    /// general query planner when the `query` feature is on. A
     /// simple shape whose only legacy failure is `Unsupported`
     /// (a general WHERE predicate) also falls through to it.
     fn plan_select(&self, stmt: &SelectStmt, arena: &Arena) -> Result<Plan, S::Error> {
@@ -4654,20 +4647,20 @@ impl<S: Storage> Connection<S> {
                     if !matches!(e, Error::Unsupported) {
                         return Err(e);
                     }
-                    #[cfg(not(feature = "v04"))]
+                    #[cfg(not(feature = "query"))]
                     {
                         return Err(e);
                     }
                 }
             }
         }
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             Ok(Plan::Query(alloc::rc::Rc::new(
                 self.plan_query(stmt, arena)?,
             )))
         }
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         {
             Err(Error::Unsupported)
         }
@@ -4687,7 +4680,7 @@ impl<S: Storage> Connection<S> {
             Some(t) => t.usable()?,
             // v0.16: `sqlite_schema` and the table-valued pragma
             // functions read through the general planner.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             None if crate::schema::Catalog::is_schema_name(tname)
                 || tname.get(..7).is_some_and(|p| eq_ci(p, b"pragma_"))
                 || tname.get(..11).is_some_and(|p| eq_ci(p, b"sqlite_temp")) =>
@@ -4706,7 +4699,7 @@ impl<S: Storage> Connection<S> {
         };
         // v0.16: a table with generated columns reads through
         // the general planner, which computes VIRTUAL columns.
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         if t.has_generated() {
             return Err(Error::Unsupported);
         }
@@ -4805,7 +4798,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Width of a SELECT's result (for CREATE VIEW validation).
-    #[cfg(all(feature = "v04", not(feature = "v16")))]
+    #[cfg(all(feature = "query", not(feature = "sql")))]
     fn view_select_width(&self, stmt: &SelectStmt, arena: &Arena) -> Result<usize, S::Error> {
         match self.plan_select(stmt, arena)? {
             Plan::Scan { out, .. } => Ok(out.len()),
@@ -4816,14 +4809,14 @@ impl<S: Storage> Connection<S> {
 
     /// The v0.4 general query planner: resolve every expression
     /// against the FROM sources once, at prepare time.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn plan_query(&self, stmt: &SelectStmt, arena: &Arena) -> Result<QueryPlan, S::Error> {
         self.plan_query_keyed(stmt, arena).map(|(p, _)| p)
     }
 
     /// `plan_query`, also returning the head core's compound
     /// ORDER BY matching data (v0.16; see `plan_subquery_keyed`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn plan_query_keyed(
         &self,
         stmt: &SelectStmt,
@@ -4831,7 +4824,7 @@ impl<S: Storage> Connection<S> {
     ) -> Result<(QueryPlan, CompKeys), S::Error> {
         // A VALUES core (v0.9): no sources; rows resolve
         // against the empty scope.
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if !stmt.values.is_empty() {
             let (values, keys) = self.plan_values(stmt, arena, 0, &[])?;
             let width = keys.names.len();
@@ -4860,19 +4853,19 @@ impl<S: Storage> Connection<S> {
             };
             return Ok((qp, keys));
         }
-        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        #[cfg(feature = "expr_index")]
         if !stmt.compound.is_empty() {
             self.merge_core.set(merge_member(stmt, 0));
         }
         let core = self.plan_core(stmt, arena, &[])?;
         let width = core.items.len();
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
             self.plan_query_compound(stmt, arena, &core.keys, width)?
         };
-        #[cfg(not(feature = "v09"))]
+        #[cfg(not(feature = "sql"))]
         let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
         #[cfg_attr(not(feature = "window"), allow(unused_mut))]
         let mut plan = QueryPlan {
@@ -4938,7 +4931,7 @@ impl<S: Storage> Connection<S> {
     /// every slot / source of `enclosing` (nearest first);
     /// derived tables plan against `enclosing` only — SQLite has
     /// no LATERAL, so a FROM subquery never sees its siblings.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn plan_core(
         &self,
         stmt: &SelectStmt,
@@ -4946,20 +4939,20 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
     ) -> Result<CorePlan, S::Error> {
         use crate::query::{ScopeGroup, has_agg, item_result_affinity, resolve_scoped};
-        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        #[cfg(feature = "expr_index")]
         let merge = self.merge_core.take();
         let (base_width, base_src) = ScopeGroup::stack_end(enclosing);
-        // v0.17 (`flatten`): a body its reader merges into itself is
+        // v0.17 (`planner`): a body its reader merges into itself is
         // planned without access paths or join order (`flat_raw`).
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         let raw = self.flat_raw.take();
-        #[cfg(not(feature = "flatten"))]
+        #[cfg(not(feature = "planner"))]
         let raw = false;
         let _ = raw;
         let mut descs = AVec::new();
         let mut offsets = AVec::new();
         let mut sources: AVec<SourcePlan> = AVec::new();
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         self.flat_from.set(true);
         self.plan_from(
             stmt.from.as_slice(),
@@ -5008,7 +5001,7 @@ impl<S: Storage> Connection<S> {
                     kind: SchemaKind::NoTablesSpecified,
                 });
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if let SelectItem::TableStar(q) = it {
                 crate::query::trace_star(&cur, *q, arena);
             }
@@ -5048,12 +5041,12 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::HavingWithoutAggregate,
             });
         }
-        // v16: result-column aliases become visible to every
+        // `sql`: result-column aliases become visible to every
         // clause resolved below (and to subqueries inside them),
         // after the current scope's own columns (the pin's
         // `lookupName` order). The result list above never sees
         // them — there an alias is "no such column" on the pin.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         for (a, r) in item_aliases.iter().zip(items.iter()) {
             if let Some(a) = a {
                 cur.aliases.push((a.clone(), r.clone()));
@@ -5088,11 +5081,11 @@ impl<S: Storage> Connection<S> {
                 Some(and_expr(hoisted, r))
             }
         };
-        // v0.17 (`join_order`): a join the planner orders asks its
+        // v0.17 (`planner`): a join the planner orders asks its
         // virtual tables' xBestIndex once the order is known (below).
-        #[cfg(all(feature = "vtab", feature = "join_order"))]
+        #[cfg(all(feature = "vtab", feature = "planner"))]
         let vt_deferred = join::join_eligible(sources.as_slice());
-        #[cfg(all(feature = "vtab", not(feature = "join_order")))]
+        #[cfg(all(feature = "vtab", not(feature = "planner")))]
         let vt_deferred = false;
         // v0.16 (`vtab`): each virtual table's xBestIndex.
         #[cfg(feature = "vtab")]
@@ -5105,9 +5098,9 @@ impl<S: Storage> Connection<S> {
                 _ => None,
             };
             // A lone max(column)'s `ORDER BY column DESC` (v0.17 review
-            // fix, `multi_index`: the pin's `minMaxQuery`; min()'s
+            // fix, `planner`: the pin's `minMaxQuery`; min()'s
             // NULLS LAST order is not offered to a virtual table).
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             let order = order.or_else(|| {
                 if !stmt.order_by.is_empty()
                     || !stmt.group_by.is_empty()
@@ -5175,7 +5168,7 @@ impl<S: Storage> Connection<S> {
             }
             group_by.push(r);
         }
-        #[cfg_attr(not(feature = "join_order"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut having = match &stmt.having {
             None => None,
             Some(e) => Some(self.resolve_term(
@@ -5250,9 +5243,9 @@ impl<S: Storage> Connection<S> {
             crate::window::classify(items.as_mut_slice(), order_by.as_mut_slice());
         }
         // A subquery inside an aggregate's arguments needs
-        // per-group-row execution (v0.11, the `v10` feature);
+        // per-group-row execution (v0.11, the `sql` feature);
         // without it the plan is refused, as in v0.6.
-        if cfg!(not(feature = "v10"))
+        if cfg!(not(feature = "sql"))
             && (items.iter().any(crate::query::sub_in_agg_args)
                 || having.as_ref().is_some_and(crate::query::sub_in_agg_args)
                 || order_by
@@ -5329,12 +5322,12 @@ impl<S: Storage> Connection<S> {
             order_by = kept;
         }
         cur.aliases.clear();
-        #[cfg_attr(not(feature = "flatten"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
-        // v0.17 (`flatten`): the pin's query flattener, WHERE
+        // v0.17 (`planner`): the pin's query flattener, WHERE
         // push-down, unused subquery columns and EXISTS-to-join
         // (`session::flatten`), before the join is planned.
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         let view_names = self.flatten_core(
             arena,
             stmt,
@@ -5359,7 +5352,7 @@ impl<S: Storage> Connection<S> {
         // path, the pin's choice (`xplan`).
         // A merged compound member's loop delivers the merge key if
         // it can (`merge_core`).
-        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        #[cfg(feature = "expr_index")]
         let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = match merge {
             Some((terms, rest)) if order_by.is_empty() && !has_agg => {
                 let key = |j: usize, desc: bool, nulls_first: bool| {
@@ -5392,8 +5385,6 @@ impl<S: Storage> Connection<S> {
             }
             _ => AVec::new(),
         };
-        #[cfg(all(feature = "expr_index", not(feature = "v09")))]
-        let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
         // A core with window functions reads its rows in the order
         // of its last window class, which the pin's innermost window
         // subquery sorts by (v0.16 fix, `window`: ties of a window's
@@ -5414,9 +5405,9 @@ impl<S: Storage> Connection<S> {
         };
         #[cfg(all(feature = "expr_index", not(feature = "window")))]
         let (keyed, info_limit) = (!merge_key.is_empty(), limit.as_ref());
-        // v0.17 (`join_order`): a join of tables in the pin's order
+        // v0.17 (`planner`): a join of tables in the pin's order
         // (`session::join`), the core laid out in it.
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let joined = !keyed
             && !raw
             && self.plan_join(
@@ -5433,18 +5424,18 @@ impl<S: Storage> Connection<S> {
                 stmt.distinct,
                 info_limit,
                 // (The flattener simplified the LEFT JOINs.)
-                cfg!(feature = "flatten"),
+                true,
             )?;
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         let joined = false;
-        // v0.17 (`join_order`): the deferred xBestIndex calls, in the
+        // v0.17 (`planner`): the deferred xBestIndex calls, in the
         // join's order; then no JSON table-valued function may read a
         // source after it.
-        #[cfg(all(feature = "vtab", feature = "join_order"))]
+        #[cfg(all(feature = "vtab", feature = "planner"))]
         if vt_deferred {
             self.plan_vtab_cons(sources.as_mut_slice(), &cur, &mut filter, None)?;
         }
-        #[cfg(all(feature = "json", feature = "join_order"))]
+        #[cfg(all(feature = "json", feature = "planner"))]
         json_tvf::fix_tvf_order::<S::Error>(sources.as_mut_slice(), &cur, &mut filter, joined)
             .map_err(|_| Error::Unsupported)?;
         #[cfg(feature = "expr_index")]
@@ -5521,16 +5512,16 @@ impl<S: Storage> Connection<S> {
             result_affs,
             result_named,
             keys,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             view_names,
         })
     }
 
     /// A FROM source that names no table or view: a table-valued
     /// pragma function or the empty temp schema, as the derived
-    /// table of its rows (v0.16, `v16`). Out of line: `plan_from` is
+    /// table of its rows (v0.16, `sql`). Out of line: `plan_from` is
     /// on the stack once per level of nested FROM subqueries.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     #[inline(never)]
     fn synth_source(
         &self,
@@ -5568,11 +5559,11 @@ impl<S: Storage> Connection<S> {
     }
 
     /// One derived table of a FROM clause (v0.9; a view's or CTE's
-    /// expansion under `v16`): planned as a subquery against
+    /// expansion under `sql`): planned as a subquery against
     /// `derived_scope` only (no LATERAL), its description and plan
     /// pushed; returns its width. Out of line: `plan_from` is on
     /// the stack once per level of nested FROM subqueries.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     #[inline(never)]
     fn plan_derived_source(
         &self,
@@ -5585,14 +5576,14 @@ impl<S: Storage> Connection<S> {
     ) -> Result<usize, S::Error> {
         use crate::query::SourceDesc;
         // v0.16: an expanded view or CTE, possibly recursive.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut dplan = match s.cte.as_ref().map(|c| c.rec) {
             Some(crate::sql::RecMark::Body { split, id }) => {
                 self.plan_recursive(d, split, id, s.cte.as_deref(), arena, derived_scope)?
             }
             _ => self.plan_subquery(d, arena, derived_scope)?,
         };
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let dplan = self.plan_subquery(d, arena, derived_scope)?;
         let w = dplan.width();
         let mut cols = AVec::new();
@@ -5605,33 +5596,33 @@ impl<S: Storage> Connection<S> {
         // `SELECT *` over a USING join dropped them all).
         // A shared materialization (`CteUse::mat`) is read
         // only by a plan that needs nothing of its reader.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             dplan.mat = match s.cte.as_ref() {
                 Some(c) if dplan.uncorrelated => c.mat,
                 _ => 0,
             };
         }
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         if let Some(c) = s.cte.as_ref() {
             dplan.is_cte = c.is_cte;
             dplan.lazy = c.lazy && dplan.mat != 0;
             dplan.grp = if dplan.uncorrelated { c.grp } else { 0 };
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if s.cte.as_ref().is_some_and(|c| c.view) {
             dplan.result_names =
                 self.result_col_names(&dplan, crate::query::ScopeGroup::stack_end(derived_scope))?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut names = Self::cte_names(arena, s.cte.as_deref(), &dplan)?;
         // A column list renames the result for every reader
         // (CREATE TABLE ... AS names its columns by it).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             dplan.result_names = names.clone();
         }
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let mut names = dplan.result_names.clone();
         crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
         for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
@@ -5656,7 +5647,7 @@ impl<S: Storage> Connection<S> {
         // A view is a schema object (v0.16): `main.v.col` reaches it;
         // a table-valued pragma function is main's, the empty temp
         // schema temp's (v0.16 review fix: both were unreachable).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if s.cte.as_ref().is_some_and(|c| c.view) {
             desc.db = self.db_no();
             #[cfg(feature = "attach")]
@@ -5701,7 +5692,7 @@ impl<S: Storage> Connection<S> {
             defaults,
             derived: Some(Box::new(dplan)),
             gcols: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rec: 0,
             #[cfg(any(feature = "json", feature = "vtab"))]
             tvf: 0,
@@ -5713,11 +5704,11 @@ impl<S: Storage> Connection<S> {
             access: None,
             #[cfg(feature = "expr_index")]
             hint: crate::query::Hint::Any,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             exists: false,
         });
         Ok(w)
@@ -5730,7 +5721,7 @@ impl<S: Storage> Connection<S> {
     /// first slot (counting from `total`), and its executor
     /// plan. Join constraints are resolved later
     /// (`plan_using`, `plan_on`) once the whole scope exists.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     #[allow(clippy::too_many_arguments)]
     fn plan_from(
         &self,
@@ -5743,19 +5734,19 @@ impl<S: Storage> Connection<S> {
         plans: &mut AVec<SourcePlan>,
     ) -> Result<(), S::Error> {
         use crate::query::SourceDesc;
-        #[cfg(not(feature = "v09"))]
+        #[cfg(not(feature = "sql"))]
         let _ = derived_scope;
         #[cfg(feature = "explain")]
         let first = plans.len();
         #[cfg(feature = "explain")]
         let first_off = offsets.len();
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         let flat_from = self.flat_from.take();
         for s in from.iter() {
             offsets.push(total);
             // v0.16: a recursive CTE's recursive reference reads
             // the row its queue gave up.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if let Some(crate::sql::RecMark::Ref { id }) = s.cte.as_ref().map(|c| c.rec) {
                 total += self.plan_rec_ref(s, id, arena, descs, plans)?;
                 continue;
@@ -5788,36 +5779,33 @@ impl<S: Storage> Connection<S> {
             // A table or view of the name shadows the function; given
             // arguments it is the pin's "'t' is not a function" (v0.16
             // fix: the arguments were ignored).
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let synth = if s.derived.is_none() {
                 self.synth_source(s, arena)?
             } else {
                 None
             };
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let derived = synth.as_ref().or(s.derived.as_ref());
-            #[cfg(all(feature = "v09", not(feature = "v16")))]
-            let derived = s.derived.as_ref();
             // A derived table (v0.9): planned as a subquery
             // against `derived_scope` only (no LATERAL).
-            #[cfg(feature = "v09")]
+            #[cfg(feature = "sql")]
             if let Some(d) = derived {
                 // A view or CTE has no index (the pin's "no such
                 // index", v0.16); NOT INDEXED asks for none and is
                 // accepted (v0.16 review fix).
-                #[cfg(feature = "v16")]
                 if matches!(s.indexed, Some(crate::sql::IndexHint::By(_))) {
                     return Err(Error::Schema {
                         kind: SchemaKind::UnknownIndex,
                     });
                 }
-                // v0.17 (`flatten`): a subquery the flattener merges
+                // v0.17 (`planner`): a subquery the flattener merges
                 // into this core is planned for it (`flat_raw`).
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 self.flat_raw
                     .set(flat_from && s.flat && d.compound.is_empty() && d.values.is_empty());
                 let w = self.plan_derived_source(s, d, arena, derived_scope, descs, plans);
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 self.flat_raw.set(false);
                 total += w?;
                 continue;
@@ -5832,7 +5820,7 @@ impl<S: Storage> Connection<S> {
             // A TEMP table read by a main statement (v0.16): an
             // unqualified name is the temp database's first, as on
             // the pin (the router cut a `temp.` and left `main.` in).
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if !self.is_temp && (s.in_temp || !s.qualified) {
                 match self.temp.as_deref() {
                     Some(tc) if let Some(tt) = tc.catalog.find(&tc.catalog_arena, tname) => {
@@ -5847,9 +5835,9 @@ impl<S: Storage> Connection<S> {
                     _ => {}
                 }
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let found = self.catalog.find_readable(&self.catalog_arena, tname);
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             let found = self.catalog.find(&self.catalog_arena, tname);
             let t = match found {
                 Some(t) => t.usable()?,
@@ -5864,7 +5852,7 @@ impl<S: Storage> Connection<S> {
                     });
                 }
             };
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             #[allow(unused_variables)]
             let hint = self.index_hint(arena, t, s.indexed)?;
             let mut cols = AVec::new();
@@ -5885,7 +5873,7 @@ impl<S: Storage> Connection<S> {
             let mut desc = SourceDesc::new(qual, cols, t.rowid_alias, t.has_rowid());
             desc.kind = s.kind;
             desc.colls = table_colls(t);
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             {
                 desc.db = self.db_no();
             }
@@ -5897,12 +5885,12 @@ impl<S: Storage> Connection<S> {
             // The temp database's schema table answers to its own
             // names only, whatever the FROM clause wrote (v0.16
             // review fix: `sqlite_schema.name FROM temp.sqlite_schema`).
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if self.is_temp && desc.schema_table {
                 desc.qualifier = copy_vec(b"sqlite_temp_master");
             }
             // An ALTER TABLE tracing references to its table (v0.16).
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if let Some(tr) = &self.alter_trace
                 && eq_ci(tr.borrow().table.as_slice(), tname)
             {
@@ -5929,7 +5917,7 @@ impl<S: Storage> Connection<S> {
                 defaults,
                 derived: None,
                 gcols,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 rec: 0,
                 #[cfg(any(feature = "json", feature = "vtab"))]
                 tvf: 0,
@@ -5941,11 +5929,11 @@ impl<S: Storage> Connection<S> {
                 access: None,
                 #[cfg(feature = "expr_index")]
                 hint,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 temp: false,
                 #[cfg(feature = "attach")]
                 ext: 0,
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 exists: false,
             });
             total += t.columns.len();
@@ -5986,7 +5974,7 @@ impl<S: Storage> Connection<S> {
     /// otherwise (an inner join's ON) it is hoisted into WHERE —
     /// the returned conjunction — exactly as SQLite moves it,
     /// which for an inner join changes no result.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     #[allow(clippy::too_many_arguments)]
     fn plan_on(
         &self,
@@ -6046,7 +6034,7 @@ impl<S: Storage> Connection<S> {
     /// column reference (even an outer one) is "no such
     /// column" and any subquery in it is uncorrelated — and
     /// aggregate-free ("misuse of aggregate").
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn plan_limit(&self, e: Option<&Expr>, arena: &Arena) -> Result<Option<RExpr>, S::Error> {
         let Some(e) = e else {
             return Ok(None);
@@ -6139,7 +6127,7 @@ impl<S: Storage> Connection<S> {
     /// One row inserted into the table rooted at `root` (v0.16):
     /// it counts as a change, and sets `last_insert_rowid()` unless
     /// the table is WITHOUT ROWID (the pin leaves it alone then).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn note_insert(&self, root: u32, rowid: i64) {
         #[cfg(feature = "without_rowid")]
         if self.pager.wr.table_of(root).is_some() {
@@ -6197,33 +6185,33 @@ impl<S: Storage> Connection<S> {
 
     /// The rowid of the most recent row an INSERT (or REPLACE, or
     /// an upsert's insert branch) put into a table on this
-    /// connection, 0 before any (v0.16, `v16`; the pin's
+    /// connection, 0 before any (v0.16, `sql`; the pin's
     /// `sqlite3_last_insert_rowid`, also read by the SQL function
     /// `last_insert_rowid()`). An upsert's DO UPDATE, UPDATE and
     /// CREATE TABLE ... AS SELECT leave it alone; a failed
     /// statement keeps the rowids it inserted before failing.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn last_insert_rowid(&self) -> i64 {
         self.env.last_rowid.get()
     }
 
     /// The rows the most recent successful INSERT, UPDATE or DELETE
-    /// changed (v0.16, `v16`; the pin's `sqlite3_changes64`, also
+    /// changed (v0.16, `sql`; the pin's `sqlite3_changes64`, also
     /// `changes()`): inserted rows (REPLACE's deletions not
     /// counted), rows updated (once per row, also by an upsert's
     /// DO UPDATE) and rows deleted. A failed write sets it to 0;
     /// other statements (SELECT, DDL, CREATE TABLE ... AS SELECT,
     /// transaction control) leave it alone.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn changes(&self) -> i64 {
         self.env.changes.get()
     }
 
     /// The sum of `changes()` over every successful INSERT, UPDATE
-    /// and DELETE since the connection opened (v0.16, `v16`; the
+    /// and DELETE since the connection opened (v0.16, `sql`; the
     /// pin's `sqlite3_total_changes64`, also `total_changes()`) —
     /// a write later rolled back still counts.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn total_changes(&self) -> i64 {
         self.env.total_changes.get()
     }
@@ -6251,9 +6239,9 @@ impl<S: Storage> Connection<S> {
             let mut generated = AVec::new();
             for c in t.columns.iter() {
                 columns.push(handle_bytes(&self.catalog_arena, c.name));
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 generated.push(c.gen_expr.is_some());
-                #[cfg(not(feature = "v04"))]
+                #[cfg(not(feature = "query"))]
                 generated.push(false);
             }
             out.push(TableMeta {
@@ -6300,11 +6288,11 @@ impl<S: Storage> Connection<S> {
         out
     }
 
-    /// The connection's TEMP database (v0.16, `v16`), once a
+    /// The connection's TEMP database (v0.16, `sql`), once a
     /// statement has used it: a private in-memory connection whose
     /// `tables()` / `indexes()` / `views()` are the temp schema's
     /// (tools print them as `temp.name`). `None` before first use.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn temp_db(&self) -> Option<&Connection<crate::storage::MemStorage>> {
         self.temp.as_deref()
     }
@@ -6324,7 +6312,7 @@ impl<S: Storage> Connection<S> {
     /// (v0.13; see the `sub_execs` field). Tests assert the
     /// hoisting win with it: an uncorrelated subquery node's
     /// executions per statement drop from O(outer rows) to 1.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     pub fn subquery_executions(&self) -> usize {
         self.sub_execs
     }
@@ -6423,8 +6411,8 @@ struct Binds {
 #[cfg(feature = "params")]
 fn binding_dependent<E>(e: &Error<E>) -> bool {
     // The percentile family's runtime checks read the bound
-    // values too (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    // values too (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     if matches!(
         e,
         Error::Schema {
@@ -6480,17 +6468,17 @@ pub struct Statement<'c, S: Storage> {
     #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
     index_loaded: bool,
     /// v0.4 query results, materialised on first step.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     query_rows: AVec<AVec<OwnedValue>>,
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     query_rowids: AVec<Option<i64>>,
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     query_pos: usize,
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     query_loaded: bool,
-    /// The query streaming its rows (v0.17, `v16`; `session::stream`),
+    /// The query streaming its rows (v0.17, `sql`; `session::stream`),
     /// while it has more.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     stream: Option<Box<stream::Stream>>,
     /// Hoisted uncorrelated-subquery results for this
     /// statement's execution (v0.13): `(plan node id, value)`
@@ -6501,62 +6489,62 @@ pub struct Statement<'c, S: Storage> {
     /// including a statement that writes the subquery's own
     /// table, whose pre-statement snapshot the first use
     /// captures.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     hoist: AVec<((usize, usize), crate::query::SubValue)>,
     /// The uncorrelated subqueries of a RETURNING list that do not
     /// read the written table, cached for the statement (v0.16
     /// review fix; see `eval_returning`).
-    #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+    #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
     ret_hoist: AVec<((usize, usize), crate::query::SubValue)>,
     /// v0.7 RETURNING results of a write statement, materialised
     /// by the write's execution on first step and then served
     /// one row per step, like a query's.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     ret_rows: AVec<AVec<OwnedValue>>,
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     ret_rowids: AVec<Option<i64>>,
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     ret_pos: usize,
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     ret_loaded: bool,
     /// An error to report after the rows already produced (v0.16,
-    /// `v16`: an integrity check that met a corrupt page).
-    #[cfg(feature = "v16")]
+    /// `sql`: an integrity check that met a corrupt page).
+    #[cfg(feature = "sql")]
     deferred: Option<Error<S::Error>>,
     /// The rows recursive CTEs' queues gave up, innermost last
-    /// (v0.16, `v16`): a recursive reference (`SubSource::rec`)
+    /// (v0.16, `sql`): a recursive reference (`SubSource::rec`)
     /// reads the last entry with its id.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     rec_rows: AVec<(u32, AVec<OwnedValue>)>,
     /// Shared materializations of this execution (v0.16 review
-    /// fix, `v16`; `SubPlan::mat`): (id, rows, complete). A
+    /// fix, `sql`; `SubPlan::mat`): (id, rows, complete). A
     /// recursive CTE's entry may hold only the prefix a bounded
     /// reader took (`complete` false).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     mats: AVec<(u32, AVec<AVec<OwnedValue>>, bool)>,
     /// The savepoint level of the statement savepoint this write
-    /// runs under inside a transaction (v0.16, `v16`; see
+    /// runs under inside a transaction (v0.16, `sql`; see
     /// `abort_write`), while it is open.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     stmt_sp: Option<usize>,
-    /// An upsert's DO UPDATE failed (v0.16, `v16`): its conflicts
+    /// An upsert's DO UPDATE failed (v0.16, `sql`): its conflicts
     /// resolve by ABORT whatever the statement's OR clause says, as
     /// on the pin, so OR ROLLBACK does not end the transaction.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     upsert_failed: bool,
     /// This failed statement's changes were kept (OR FAIL): the fts5
     /// tables keep their pending terms too (v0.17 review fix).
     #[cfg(feature = "fts5")]
     fts_kept: bool,
     /// The resolved action of the constraint whose violation failed
-    /// this write (v0.16, `v07`): a constraint-level `ON CONFLICT
+    /// this write (v0.16, `sql`): a constraint-level `ON CONFLICT
     /// FAIL / ROLLBACK` decides what the failure undoes, so the
     /// statement's own action is not enough. `None`: the statement
     /// action applies (a CHECK, or no constraint failed).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fail_act: core::cell::Cell<Option<ConflictAction>>,
-    /// The running INSERT's AUTOINCREMENT state (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// The running INSERT's AUTOINCREMENT state (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     autoinc: Option<Autoinc>,
     /// The triggers this write may fire (v0.16, `triggers`), loaded
     /// when its execution starts; `None` when it fires none.
@@ -6579,14 +6567,14 @@ pub struct Statement<'c, S: Storage> {
 }
 
 /// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
-/// row (v0.16, `v16`), as the pin keeps it: read when the statement
+/// row (v0.16, `sql`), as the pin keeps it: read when the statement
 /// starts (the first row whose `name` is the table's name, byte for
 /// byte; `seq` converted as CAST AS INTEGER, NULL or no row reading
 /// 0), raised by every rowid the statement inserts or generates,
 /// and written back when it completes — only when there was no row
 /// or the counter grew past what was read. A statement that fails
 /// part way (OR FAIL keeps its earlier rows) writes nothing.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 struct Autoinc {
     name: AVec<u8>,
     seq_root: u32,
@@ -6617,7 +6605,7 @@ fn read_default(arena: &Arena, c: &crate::schema::Column) -> OwnedValue {
 
 /// Whether a column definition's text declares a REFERENCES
 /// clause (v0.16).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn def_references<E>(text: &[u8], arena: &Arena) -> bool {
     use crate::sql::lexer::Tok;
     let Ok(toks) = crate::sql::lexer::lex::<E>(text, arena) else {
@@ -6662,7 +6650,7 @@ fn ins_affs(cols: &[InsCol]) -> AVec<crate::record::Affinity> {
 
 /// Whether `e` calls `last_insert_rowid()` (v0.16), whose value
 /// moves with every row an INSERT inserts.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn reads_last_rowid(e: &RExpr) -> bool {
     crate::query::any_scalar(e, &|f| f == crate::query::ScalarFn::LastInsertRowid)
 }
@@ -6679,7 +6667,7 @@ fn literal_owned(arena: &Arena, lit: Option<Literal>) -> OwnedValue {
 
 /// A table's per-column collating sequences (v0.16), for its
 /// resolution `SourceDesc`.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn table_colls(t: &crate::schema::TableDef) -> AVec<crate::record::Coll> {
     let mut out = AVec::new();
     for c in t.columns.iter() {
@@ -6713,7 +6701,7 @@ fn trimmed_sql_text<E>(raw: &[u8], arena: &Arena) -> Result<AVec<u8>, E> {
     while end > 0 && (raw[end - 1] == b';' || (raw[end - 1] as char).is_whitespace()) {
         end -= 1;
     }
-    #[cfg(any(feature = "v16", feature = "indexes"))]
+    #[cfg(any(feature = "sql", feature = "indexes"))]
     let end = crate::sql::parser::schema_text_end::<E>(raw, arena).unwrap_or(end);
     let raw = &raw[..end.min(raw.len())];
     Ok(
@@ -6734,7 +6722,7 @@ fn trimmed_sql_text<E>(raw: &[u8], arena: &Arena) -> Result<AVec<u8>, E> {
 /// the pin's `addColOffset` (v0.16 fix, ungated: hipp appended the
 /// column after the table constraints, a text that no longer parses,
 /// so ADD COLUMN failed on any table with one).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn add_column_offset<E>(sql: &[u8], arena: &Arena) -> Result<usize, E> {
     use crate::sql::lexer::Tok;
     let toks = crate::sql::lexer::lex::<E>(sql, arena)?;
@@ -6772,16 +6760,16 @@ fn add_column_offset<E>(sql: &[u8], arena: &Arena) -> Result<usize, E> {
 }
 
 /// Whether a table is AUTOINCREMENT (v0.16): the catalog's flag
-/// with `v16`; without it, whether its stored text carries the
+/// with `sql`; without it, whether its stored text carries the
 /// clause (`schema_text_start` refuses that text there).
-#[cfg(feature = "v05")]
-#[cfg_attr(feature = "v16", allow(clippy::extra_unused_type_parameters))]
+#[cfg(feature = "write")]
+#[cfg_attr(feature = "sql", allow(clippy::extra_unused_type_parameters))]
 fn table_autoinc<E>(t: &crate::schema::TableDef, cat: &Arena, arena: &Arena) -> bool {
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     let _ = (cat, arena);
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     return t.autoinc;
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     crate::sql::parser::schema_text_start::<E>(handle_bytes(cat, t.sql), arena).is_err()
 }
 
@@ -6797,11 +6785,11 @@ fn create_without_rowid(ast: &Ast) -> bool {
     )
 }
 
-/// Whether a parsed CREATE TABLE has a rowid alias (v0.16, `v16`):
+/// Whether a parsed CREATE TABLE has a rowid alias (v0.16, `sql`):
 /// exactly one PRIMARY KEY column, declared exactly INTEGER and not
 /// written `INTEGER PRIMARY KEY DESC` — the rule `schema.rs` applies
 /// when it loads the table. AUTOINCREMENT needs one.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn create_has_rowid_alias(ast: &Ast, arena: &Arena) -> bool {
     let Ast::CreateTable {
         columns,
@@ -6840,7 +6828,7 @@ fn index_key_for_row<E>(
     payload: &[u8],
     ncols: usize,
     rowid: i64,
-    #[cfg(feature = "v04")] gcols: Option<&crate::rules::GenCols>,
+    #[cfg(feature = "query")] gcols: Option<&crate::rules::GenCols>,
     #[cfg(feature = "expr_index")] env: Option<&crate::query::Env>,
 ) -> Result<Option<AVec<OwnedValue>>, E> {
     // v0.16: with generated columns (or an index computing from
@@ -6859,7 +6847,7 @@ fn index_key_for_row<E>(
         }
         return xindex::ext_key::<E>(cols, x, rec.as_slice(), rowid, env);
     }
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     if let Some(g) = gcols {
         let mut rec =
             crate::rules::decode_rec::<E>(payload, ncols, defaults, Some(g.virt.as_slice()))?;
@@ -6936,7 +6924,7 @@ fn key_has_no_null(key: &[OwnedValue]) -> bool {
 /// record form (affinities applied, defaults materialised);
 /// the rowid-alias column is exempt — its record field is
 /// NULL by construction and its value lives in the rowid.
-/// Per conflict action — the statement's, or (v0.16, `v07`) each
+/// Per conflict action — the statement's, or (v0.16, `sql`) each
 /// column's own from `nn`:
 /// - `Abort` (ABORT / FAIL / ROLLBACK / the default): any
 ///   NULL in a NOT NULL column is `NotNullViolation`.
@@ -6961,32 +6949,32 @@ pub(crate) fn resolve_not_null<E>(
     affs: &[crate::record::Affinity],
     rowid_alias: Option<usize>,
     action: ConflictAction,
-    #[cfg(feature = "v07")] nn: NnActs<'_>,
+    #[cfg(feature = "sql")] nn: NnActs<'_>,
 ) -> Result<bool, E> {
     // A REPLACE whose default is NULL fails as ABORT, but only after
     // every column had its turn (the pin's second pass): a later
     // column's IGNORE still skips the row, its FAIL still fails it.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     let mut deferred = false;
     for i in 0..row.len() {
         if !not_null[i] || Some(i) == rowid_alias || !matches!(row[i], OwnedValue::Null) {
             continue;
         }
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let act = nn.acts.get(i).copied().unwrap_or(action);
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let act = action;
         match act {
             ConflictAction::Ignore => return Ok(false),
             ConflictAction::Replace => {
                 if matches!(defaults[i], OwnedValue::Null) {
-                    // One action for every column below v07: no
+                    // One action for every column without `sql`: no
                     // later column can decide otherwise.
-                    #[cfg(not(feature = "v07"))]
+                    #[cfg(not(feature = "sql"))]
                     return Err(Error::Schema {
                         kind: SchemaKind::NotNullViolation,
                     });
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     {
                         deferred = true;
                     }
@@ -6997,7 +6985,7 @@ pub(crate) fn resolve_not_null<E>(
             // ABORT, FAIL, ROLLBACK: the statement fails (FAIL and
             // ROLLBACK differ only in what the failure undoes).
             _ => {
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 nn.failed.set(Some(act));
                 return Err(Error::Schema {
                     kind: SchemaKind::NotNullViolation,
@@ -7005,7 +6993,7 @@ pub(crate) fn resolve_not_null<E>(
             }
         }
     }
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     if deferred {
         nn.failed.set(Some(ConflictAction::Abort));
         return Err(Error::Schema {
@@ -7015,11 +7003,11 @@ pub(crate) fn resolve_not_null<E>(
     Ok(true)
 }
 
-/// Per-column NOT NULL resolution (v0.16, `v07`): each column's
+/// Per-column NOT NULL resolution (v0.16, `sql`): each column's
 /// action (`acts`, parallel to the row; empty: the statement's
 /// action for every column) and where the action of a failing
 /// column is recorded (`Statement::fail_act`).
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 #[derive(Clone, Copy)]
 pub struct NnActs<'a> {
     /// Per column, its NOT NULL action; empty: the statement's.
@@ -7032,7 +7020,7 @@ pub struct NnActs<'a> {
 /// decoded values with defaults materialised; the rowid-alias
 /// column's slot holds its stored NULL — the rowid itself is in
 /// `rowid`.
-#[cfg(feature = "v05")]
+#[cfg(feature = "write")]
 struct WriteRow {
     rowid: i64,
     rec: AVec<OwnedValue>,
@@ -7041,7 +7029,7 @@ struct WriteRow {
 /// Build the evaluation row for one write-side row (v0.5): the
 /// alias column reads as the rowid and REAL columns force reals,
 /// exactly as the query executor builds its rows (§5.5).
-#[cfg(feature = "v05")]
+#[cfg(feature = "write")]
 fn row_data_for(
     rowid_alias: Option<usize>,
     affs: &[crate::record::Affinity],
@@ -7089,7 +7077,7 @@ fn key_from_rec(
 /// An UPDATE's (or upsert DO UPDATE's) change set (v0.16): per
 /// column, whether a SET names it, and whether the rowid (or its
 /// alias) is assigned.
-#[cfg(feature = "v05")]
+#[cfg(feature = "write")]
 fn assigned_columns(
     sets: &[(Target, RExpr)],
     ncols: usize,
@@ -7111,7 +7099,7 @@ fn assigned_columns(
 /// affinity, then a lossless integer (`'5'` and `7.0` assign 5
 /// and 7). Unlike INSERT, NULL does not auto-assign: it is a
 /// datatype mismatch, like any non-integer (oracle-probed).
-#[cfg(feature = "v05")]
+#[cfg(feature = "write")]
 fn update_rowid<E>(v: &OwnedValue) -> Result<i64, E> {
     match apply_affinity(v.clone(), crate::record::Affinity::Integer) {
         OwnedValue::Integer(x) => Ok(x),
@@ -7123,7 +7111,7 @@ fn update_rowid<E>(v: &OwnedValue) -> Result<i64, E> {
 
 /// A unique index's canonical key columns with their
 /// collations (v0.16), for upsert-target matching.
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 type KeySet = AVec<(Target, crate::record::Coll)>;
 
 /// Whether an upsert clause arbitrates one found conflict
@@ -7131,7 +7119,7 @@ type KeySet = AVec<(Target, crate::record::Coll)>;
 /// a rowid conflict only when it is exactly `[Rowid]`, and an
 /// index conflict only when the index's canonical key set is
 /// exactly the target set.
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 fn upsert_arbitrates(up: &UpsertPlan, by_rowid: bool, keyset: &Option<KeySet>) -> bool {
     let Some(target) = &up.target else {
         return true;
@@ -7149,7 +7137,7 @@ fn upsert_arbitrates(up: &UpsertPlan, by_rowid: bool, keyset: &Option<KeySet>) -
 /// columns (v0.7), each target column written with a `COLLATE`
 /// matching that key column's collation (v0.16; the pin's
 /// `sqlite3UpsertAnalyzeTarget` — a bare column matches any).
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 fn keyset_matches(
     target: &[Target],
     colls: &[Option<crate::record::Coll>],
@@ -7312,43 +7300,43 @@ impl<'c, S: Storage> Statement<'c, S> {
             index_pos: 0,
             #[cfg(all(feature = "indexes", not(feature = "expr_index")))]
             index_loaded: false,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_rows: AVec::new(),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_rowids: AVec::new(),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_pos: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             query_loaded: false,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             stream: None,
-            #[cfg(feature = "v06")]
+            #[cfg(feature = "sql")]
             hoist: AVec::new(),
-            #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             ret_hoist: AVec::new(),
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_rows: AVec::new(),
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_rowids: AVec::new(),
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_pos: 0,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             ret_loaded: false,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             deferred: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rec_rows: AVec::new(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             mats: AVec::new(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             stmt_sp: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             upsert_failed: false,
             #[cfg(feature = "fts5")]
             fts_kept: false,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             fail_act: core::cell::Cell::new(None),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             autoinc: None,
             #[cfg(feature = "triggers")]
             trig: None,
@@ -7365,12 +7353,12 @@ impl<'c, S: Storage> Statement<'c, S> {
 impl<'c, S: Storage> Statement<'c, S> {
     /// The write plan's table rules (v0.16), cloned out of the
     /// plan; `None` for a table with none (or a plan without).
-    #[cfg(feature = "v04")]
-    #[cfg_attr(not(feature = "v05"), allow(dead_code))]
+    #[cfg(feature = "query")]
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
     fn plan_rules(&self) -> Option<Box<crate::rules::TableRules>> {
         match &self.plan {
             Plan::Insert { rules, .. } => rules.clone(),
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Plan::Update { rules, .. } | Plan::Delete { rules, .. } => rules.clone(),
             _ => None,
         }
@@ -7389,7 +7377,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             return self.step_explain().await;
         }
         // What a streamed query dropped part-way kept (v0.17).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.phase == Phase::Fresh && self.stream.is_none() {
             self.reclaim_stream();
         }
@@ -7426,15 +7414,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         // (v0.13): cached uncorrelated-subquery values belong
         // to one statement execution, never across statements
         // or across a re-execution after an error.
-        #[cfg(feature = "v06")]
+        #[cfg(feature = "sql")]
         if self.phase == Phase::Fresh {
             self.hoist.clear();
-            #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+            #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             self.ret_hoist.clear();
-            #[cfg(feature = "v16")]
             self.mats.clear();
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let was_txn = self.conn.explicit_txn;
         // The schema cookie the statement starts from: a rollback that
         // moves it back undid a schema change (v0.17, `fts5_delete`).
@@ -7452,7 +7439,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             || {
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 {
                     matches!(
                         self.plan,
@@ -7471,7 +7458,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         }
                     }
                 }
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 {
                     false
                 }
@@ -7487,27 +7474,27 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             || {
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 {
                     matches!(
                         self.plan,
                         Plan::AlterAdd { .. } | Plan::CreateView | Plan::DropView { .. }
                     )
                 }
-                #[cfg(not(feature = "v04"))]
+                #[cfg(not(feature = "query"))]
                 {
                     false
                 }
             }
             || {
-                #[cfg(feature = "v05")]
+                #[cfg(feature = "write")]
                 {
                     matches!(
                         self.plan,
                         Plan::Update { .. } | Plan::Delete { .. } | Plan::DropTable { .. }
                     )
                 }
-                #[cfg(not(feature = "v05"))]
+                #[cfg(not(feature = "write"))]
                 {
                     false
                 }
@@ -7543,7 +7530,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         } else {
             None
         };
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.open_stmt();
         #[cfg(feature = "foreign_keys")]
         self.fk_stmt_begin();
@@ -7552,11 +7539,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Explain(_) => self.step_explain().await,
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::Maint(_) => self.step_maint().await,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::Alter16 { .. } => self.step_alter16().await,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::Temp { .. } => self.step_temp().await,
             #[cfg(feature = "attach")]
             Plan::Att(_) => self.step_att().await,
@@ -7565,32 +7552,32 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::CreateTable => self.step_create().await,
             #[cfg(feature = "vtab")]
             Plan::Vtab(_) => self.step_vtab().await,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::CreateTableAs { .. } => self.step_create_as().await,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Plan::Query(_) => self.step_query().await,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Plan::AlterAdd { .. } => self.step_alter().await,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Plan::CreateView => self.step_create_view().await,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Plan::DropView { .. } => self.step_drop_view().await,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::Pragma(_) => self.step_pragma().await,
             #[cfg(feature = "indexes")]
             Plan::CreateIndex { .. } => self.step_create_index().await,
             #[cfg(feature = "indexes")]
             Plan::DropIndex { .. } => self.step_drop_index().await,
             Plan::Insert { .. } => self.step_insert().await,
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Plan::Update { .. } => self.step_update().await,
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Plan::Delete { .. } => self.step_delete().await,
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Plan::DropTable { .. } => self.step_drop_table().await,
             Plan::Scan { .. } => self.step_scan().await,
             Plan::Begin => self.step_begin().await,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::BeginImmediate => {
                 let s = self.step_begin().await?;
                 self.conn.pager.fix_layout();
@@ -7624,13 +7611,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         {
             self.conn.fts = f;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.close_stmt(r.is_err()).await;
         #[cfg(feature = "foreign_keys")]
         self.fk_stmt_end(r.is_err(), was_txn);
         // A failure that ended the transaction (OR ROLLBACK, an
         // I/O-class error) ends the TEMP database's too.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if r.is_err()
             && was_txn
             && !self.conn.explicit_txn
@@ -7650,7 +7637,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.conn.fts5_schema_reset();
         }
         // A transaction statement applies to the TEMP database too.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if r.is_ok()
             && matches!(
                 self.plan,
@@ -7680,8 +7667,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             // (After CREATE / DROP / ANALYZE the pin keeps the
             // statistics it holds; after ALTER, a rollback or VACUUM
             // it reads the whole schema, statistics included, again.
-            // v0.17 review fix, `join_order`.)
-            #[cfg(feature = "join_order")]
+            // v0.17 review fix, `planner`.)
+            #[cfg(feature = "planner")]
             {
                 self.conn.stat_keep = !matches!(
                     self.plan,
@@ -7732,7 +7719,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Ok(());
         }
         // The TEMP database plans its own statements.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if matches!(self.plan, Plan::Temp { .. }) {
             self.binds.stale = false;
             return Ok(());
@@ -7895,25 +7882,25 @@ impl<'c, S: Storage> Statement<'c, S> {
             self.index_pos = 0;
             self.index_loaded = false;
         }
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             self.query_rows.clear();
             self.query_rowids.clear();
             self.query_pos = 0;
             self.query_loaded = false;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.end_stream();
-        #[cfg(feature = "v06")]
+        #[cfg(feature = "sql")]
         self.hoist.clear();
-        #[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+        #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         self.ret_hoist.clear();
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             self.deferred = None;
             self.mats.clear();
         }
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         {
             self.ret_rows.clear();
             self.ret_rowids.clear();
@@ -7965,8 +7952,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "attach")]
         self.conn.commit_all().await?;
         self.conn.pager.drive_commit().await?;
-        // Every savepoint ends with the transaction (v0.16, `v16`).
-        #[cfg(feature = "v16")]
+        // Every savepoint ends with the transaction (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         self.conn.pager.sp_clear();
         self.conn.explicit_txn = false;
         self.phase = Phase::Done;
@@ -8036,8 +8023,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         // AUTOINCREMENT is refused there (v0.16).
         let raw = handle_bytes(&self.arena, self.sql_text);
         let sql_text = trimmed_sql_text::<S::Error>(raw, &self.arena)?;
-        // AUTOINCREMENT (v0.16, `v16`): only on the rowid alias.
-        #[cfg(feature = "v16")]
+        // AUTOINCREMENT (v0.16, `sql`): only on the rowid alias.
+        #[cfg(feature = "sql")]
         let autoinc =
             crate::sql::parser::has_autoincrement::<S::Error>(sql_text.as_slice(), &self.arena);
         // ... and never on a WITHOUT ROWID table (the pin's
@@ -8048,17 +8035,17 @@ impl<'c, S: Storage> Statement<'c, S> {
                 kind: SchemaKind::AutoincrementWithoutRowid,
             });
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if autoinc && !create_has_rowid_alias(&self.ast, &self.arena) {
             return Err(Error::Schema {
                 kind: SchemaKind::AutoincrementNotIntegerPk,
             });
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let r = self
             .exec_create(name_b.as_slice(), sql_text.as_slice(), autoinc)
             .await;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let r = self
             .exec_create(name_b.as_slice(), sql_text.as_slice())
             .await;
@@ -8076,14 +8063,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
     }
 
-    /// `CREATE TABLE ... AS SELECT` (v0.16, `v16`): an existing
+    /// `CREATE TABLE ... AS SELECT` (v0.16, `sql`): an existing
     /// name is an error (a no-op under IF NOT EXISTS, the SELECT
     /// not run); otherwise the SELECT's rows are materialised,
     /// the table is created with the derived schema text, and
     /// the rows are stored in result order under rowids 1, 2,
     /// ... with each new column's affinity applied — one atomic
     /// statement.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     async fn step_create_as(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
@@ -8128,7 +8115,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
     }
 
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     async fn exec_create_as(&mut self, name: &[u8]) -> Result<(), S::Error> {
         if matches!(&self.plan, Plan::CreateTableAs { select: None, .. }) {
             // The name was taken at plan time and is free now
@@ -8179,12 +8166,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         sql: Option<&[u8]>,
     ) -> Result<(), S::Error> {
         let pager = &mut self.conn.pager;
-        // At the largest rowid: v16 takes an unused one, as the pin
+        // At the largest rowid: `sql` takes an unused one, as the pin
         // does; without it the insert fails as a duplicate (v0.16
         // review fix: the next rowid was computed unchecked).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let rowid = btree::new_rowid(pager, 1).await?;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let rowid = match btree::seek_max_rowid(pager, 1).await? {
             Some(m) => m.saturating_add(1),
             None => 1,
@@ -8207,7 +8194,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         &mut self,
         name: &[u8],
         sql_text: &[u8],
-        #[cfg(feature = "v16")] autoinc: bool,
+        #[cfg(feature = "sql")] autoinc: bool,
     ) -> Result<(), S::Error> {
         let root = alloc_root!(&mut self.conn.pager);
         // A WITHOUT ROWID table's B-tree is an index B-tree (v0.16).
@@ -8227,9 +8214,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "indexes")]
         self.create_auto_indexes(name).await?;
         // The first AUTOINCREMENT table brings `sqlite_sequence`
-        // (v0.16, `v16`): its schema row follows the table's
+        // (v0.16, `sql`): its schema row follows the table's
         // automatic indexes, with the pin's text, as on the pin.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if autoinc
             && self
                 .conn
@@ -8411,7 +8398,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let (table_root, rowid_alias, ncols, unique) = (*table_root, *rowid_alias, *ncols, *unique);
         let defaults = defaults.clone();
         let cols = cols.clone();
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let gcols = match &self.plan {
             Plan::CreateIndex { gcols, .. } => gcols.clone(),
             _ => None,
@@ -8450,7 +8437,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 buf.as_slice(),
                 ncols,
                 rowid,
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 gcols.as_deref(),
                 #[cfg(feature = "expr_index")]
                 Some(&self.conn.env),
@@ -8576,7 +8563,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// Whether this statement carries a v0.7 `RETURNING` clause
     /// with at least one result expression.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn has_returning(&self) -> bool {
         match &self.plan {
             Plan::Insert { returning, .. } => !returning.is_empty(),
@@ -8592,7 +8579,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// write's deferred foreign-key violations (v0.16,
     /// `foreign_keys`): the pin checks them when the statement
     /// halts, after its RETURNING rows (its immediate ones before).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     async fn serve_returning_fk(&mut self) -> Result<Step, S::Error> {
         let step = self.serve_returning();
         #[cfg(feature = "foreign_keys")]
@@ -8608,7 +8595,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// Serve one buffered RETURNING row (v0.7), query-style.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn serve_returning(&mut self) -> Step {
         if self.ret_pos >= self.ret_rows.len() {
             self.phase = Phase::Done;
@@ -8637,7 +8624,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// `foreign_keys`: the pin computes it once, when a row first
     /// reaches it, so the later writes of triggers or foreign-key
     /// actions to its tables do not show — `ret_hoist`).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     async fn eval_returning(
         &mut self,
         exprs: &[RExpr],
@@ -8691,7 +8678,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Delete one row and every index entry it owns (v0.7):
     /// the shared tail of OR REPLACE and upsert conflict
     /// handling. A rowid that is already gone is a no-op.
-    #[cfg(all(feature = "v07", feature = "foreign_keys"))]
+    #[cfg(feature = "foreign_keys")]
     async fn delete_row_completely(
         &mut self,
         root: u32,
@@ -8746,11 +8733,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     // The row deletion itself: `delete_row_completely` without
     // `foreign_keys` (as it always was), its `delete_row_raw` with.
     row_delete_fn!(
-        #[cfg(all(feature = "v07", feature = "foreign_keys"))]
+        #[cfg(feature = "foreign_keys")]
         delete_row_raw
     );
     row_delete_fn!(
-        #[cfg(all(feature = "v07", not(feature = "foreign_keys")))]
+        #[cfg(all(feature = "sql", not(feature = "foreign_keys")))]
         delete_row_completely
     );
 
@@ -8758,7 +8745,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         if self.has_returning() && !self.ret_loaded {
             match self.exec_insert().await {
                 Ok(()) => {
@@ -8768,7 +8755,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 Err(e) => return Err(self.write_failed(e).await),
             }
         }
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         if self.has_returning() {
             return self.serve_returning_fk().await;
         }
@@ -8780,11 +8767,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             // Same abort rule as CREATE (see step_create), but for
             // OR FAIL (`write_failed`).
-            #[cfg(feature = "v05")]
+            #[cfg(feature = "write")]
             Err(e) => Err(self.write_failed(e).await),
             // No OR FAIL without v0.5 / v0.7: the abort rule alone
             // (inline, as the tiny profile has always built it).
-            #[cfg(not(feature = "v05"))]
+            #[cfg(not(feature = "write"))]
             Err(e) => {
                 abort_write!(self, &e);
                 Err(e)
@@ -8803,7 +8790,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// kept rows are committed; an explicit transaction stays open.
     /// `changes()` counts the kept rows.
     /// (OR FAIL parses only with UPDATE (v0.5) / INSERT OR (v0.7).)
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn write_failed(
         &mut self,
         #[allow(unused_mut)] mut e: Error<S::Error>,
@@ -8827,14 +8814,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             _ => ConflictAction::Abort,
         };
         // v0.16: the failing constraint's own action, when it has one.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let conflict = self.fail_act.get().unwrap_or(conflict);
         match self.fail_in_place(conflict, &e).await {
             Ok(true) => return e,
             Ok(false) => {}
             Err(ce) => return ce,
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.finish(false);
         abort_write!(self, &e);
         e
@@ -8843,7 +8830,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// The OR FAIL half of `write_failed` (v0.5+): whether the
     /// statement's changes were kept (committed in autocommit), or
     /// the commit's own error (the transaction then rolled back).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn fail_in_place(
         &mut self,
         conflict: ConflictAction,
@@ -8905,15 +8892,15 @@ impl<'c, S: Storage> Statement<'c, S> {
                     let kept = !self.conn.in_program();
                     #[cfg(not(any(feature = "triggers", feature = "foreign_keys")))]
                     let kept = true;
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     self.conn.env.finish(kept);
                     let _ = kept;
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     self.keep_stmt();
                     Ok(true)
                 }
                 Err(ce) => {
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     self.conn.env.finish(false);
                     abort_write!(self, &ce);
                     Err(ce)
@@ -8924,7 +8911,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     async fn exec_insert(&mut self) -> Result<(), S::Error> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.pending.set(0);
         #[cfg(feature = "triggers")]
         self.load_triggers()?;
@@ -8933,7 +8920,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let multi = self.insert_multi();
             self.fk_load(fkey::Event::Insert, multi)?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.autoinc_begin().await?;
         // v0.16: VALUES rows that read last_insert_rowid() evaluate
         // one at a time, each just before its own insert — on the
@@ -8950,9 +8937,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             crate::sql::ast::TrigTime::After,
             crate::sql::ast::TrigEvent::Insert,
         );
-        #[cfg(all(feature = "v16", not(feature = "triggers")))]
+        #[cfg(all(feature = "sql", not(feature = "triggers")))]
         let staged = false;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let lazy = match &self.plan {
             Plan::Insert {
                 rows_r: Some(rows_r),
@@ -8966,7 +8953,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             _ => None,
         };
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Some(rows_r) = lazy {
             let empty = RowData::empty();
             for rr in rows_r.iter() {
@@ -9005,7 +8992,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         for values in rows.iter() {
             self.exec_insert_row(values.clone()).await?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.autoinc_end().await?;
         // The rows a trigger program's INSERT ... SELECT streamed
         // before its SELECT failed stay (`insert_prefix`).
@@ -9019,14 +9006,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !self.conn.explicit_txn {
             auto_commit!(self.conn)?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.finish(true);
         Ok(())
     }
 
     /// Read the target's `sqlite_sequence` row when the INSERT's
-    /// table is AUTOINCREMENT (v0.16, `v16`; see `Autoinc`).
-    #[cfg(feature = "v16")]
+    /// table is AUTOINCREMENT (v0.16, `sql`; see `Autoinc`).
+    #[cfg(feature = "sql")]
     async fn autoinc_begin(&mut self) -> Result<(), S::Error> {
         self.autoinc = None;
         let name = match &self.plan {
@@ -9076,10 +9063,10 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// Write the AUTOINCREMENT counter back to `sqlite_sequence`
-    /// at the end of a successful INSERT (v0.16, `v16`): a new row
+    /// at the end of a successful INSERT (v0.16, `sql`): a new row
     /// (next rowid) when the table had none, else its row rewritten
     /// in place when the counter grew.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     async fn autoinc_end(&mut self) -> Result<(), S::Error> {
         let Some(ai) = self.autoinc.take() else {
             return Ok(());
@@ -9110,7 +9097,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// an INSERT ... SELECT source executes its subquery plan
     /// against the empty outer row.
     async fn insert_source_rows(&mut self) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
-        #[cfg(feature = "v08")]
+        #[cfg(feature = "sql")]
         {
             let select = match &self.plan {
                 Plan::Insert { select, .. } => select.clone(),
@@ -9160,8 +9147,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         let ncols = cols.len();
         // This row's defaults: a connection-state DEFAULT is
-        // evaluated now, for this row (v0.16 review fix, `v16`).
-        #[cfg(feature = "v16")]
+        // evaluated now, for this row (v0.16 review fix, `sql`).
+        #[cfg(feature = "sql")]
         let row_defaults: AVec<OwnedValue> = {
             let mut out = AVec::new();
             for c in cols.iter() {
@@ -9180,11 +9167,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         // An omitted column's default is a stored value like any
         // other: the column's affinity applies (v0.10; the pin
         // stores DEFAULT '7' in an INT column as the integer 7).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         for (c, d) in cols.iter().zip(row_defaults.iter()) {
             row.push(apply_affinity(d.clone(), c.affinity));
         }
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         for c in cols.iter() {
             row.push(apply_affinity(c.default.clone(), c.affinity));
         }
@@ -9253,7 +9240,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             let pager = &mut self.conn.pager;
             match explicit_rowid {
                 Some(r) => r,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 None if self.autoinc.is_some() => {
                     // AUTOINCREMENT: one past both the largest rowid
                     // and the largest ever handed out; nothing past
@@ -9271,9 +9258,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                         kind: SchemaKind::DatabaseFull,
                     })?)
                 }
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 None => btree::new_rowid(pager, *root).await?,
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 None => match btree::seek_max_rowid(pager, *root).await? {
                     Some(m) => m.checked_add(1).ok_or(Error::Schema {
                         kind: SchemaKind::DatatypeMismatch,
@@ -9282,7 +9269,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 },
             }
         };
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Some(ai) = self.autoinc.as_mut() {
             ai.counter = ai.counter.max(rowid);
         }
@@ -9304,30 +9291,30 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut nn_flags = AVec::new();
             let mut nn_defaults = AVec::new();
             let mut nn_affs = AVec::new();
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             let mut acts = AVec::new();
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             for c in cols.iter() {
                 acts.push(c.nn_act);
             }
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             let nn = NnActs {
                 acts: acts.as_slice(),
                 failed: &self.fail_act,
             };
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             for (c, d) in cols.iter().zip(row_defaults.iter()) {
                 nn_flags.push(c.not_null);
                 nn_defaults.push(d.clone());
                 nn_affs.push(c.affinity);
             }
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             for c in cols.iter() {
                 nn_flags.push(c.not_null);
                 nn_defaults.push(c.default.clone());
                 nn_affs.push(c.affinity);
             }
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             let proceed = match &self.plan {
                 Plan::Insert { rules: Some(r), .. } => r.resolve::<S::Error>(
                     row.as_mut_slice(),
@@ -9337,7 +9324,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     nn_affs.as_slice(),
                     *rowid_alias,
                     action,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     nn,
                     None,
                     Some(&self.conn.env),
@@ -9349,11 +9336,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                     nn_affs.as_slice(),
                     *rowid_alias,
                     action,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     nn,
                 )?,
             };
-            #[cfg(not(feature = "v04"))]
+            #[cfg(not(feature = "query"))]
             let proceed = resolve_not_null::<S::Error>(
                 row.as_mut_slice(),
                 nn_flags.as_slice(),
@@ -9361,8 +9348,6 @@ impl<'c, S: Storage> Statement<'c, S> {
                 nn_affs.as_slice(),
                 *rowid_alias,
                 action,
-                #[cfg(feature = "v07")]
-                nn,
             )?;
             if !proceed {
                 return Ok(()); // OR IGNORE: skip this row.
@@ -9372,7 +9357,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // routes the row through the conflict-aware path, which
         // finds the conflicting rows first and then replaces,
         // skips, or updates instead of failing.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         {
             // v0.16: so does a constraint whose own clause resolves
             // it other than ABORT.
@@ -9399,7 +9384,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 return self.exec_insert_row_v07(row, rowid).await;
             }
         }
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let virt: Option<AVec<bool>> = match &self.plan {
             Plan::Insert { rules: Some(r), .. } => r.virt().map(|m| {
                 let mut v = AVec::new();
@@ -9414,7 +9399,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut vals: AVec<Value<'_>> = AVec::new();
         for (i, v) in row.iter().enumerate() {
             // A VIRTUAL generated column is not stored (v0.16).
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             if virt
                 .as_ref()
                 .is_some_and(|m| m.as_slice().get(i).copied().unwrap_or(false))
@@ -9500,11 +9485,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             let payload = encode_index_payload(key.as_slice(), rowid);
             btree::index_insert(pager, *ix_root, payload.as_slice(), desc.as_slice()).await?;
         }
-        #[cfg(all(feature = "v16", feature = "foreign_keys"))]
+        #[cfg(feature = "foreign_keys")]
         self.conn.note_insert(root, rowid);
-        #[cfg(all(feature = "v16", not(feature = "foreign_keys")))]
+        #[cfg(all(feature = "sql", not(feature = "foreign_keys")))]
         self.conn.note_insert(*root, rowid);
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         self.push_insert_returning(row.as_slice(), rowid).await?;
         #[cfg(feature = "triggers")]
         self.after_insert(row.as_slice(), rowid).await?;
@@ -9539,7 +9524,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Buffer one inserted (or upsert-updated) row's RETURNING
     /// values (v0.7): the expressions read the row as stored,
     /// through the same row shape a scan would produce.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     async fn push_insert_returning(
         &mut self,
         rec: &[OwnedValue],
@@ -9573,7 +9558,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Insert one fully-built row with no conflict handling
     /// (v0.7): record encode, B-tree insert, index maintenance.
     /// Callers have already resolved every conflict.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     async fn insert_row_raw(&mut self, row: &[OwnedValue], rowid: i64) -> Result<(), S::Error> {
         let (root, rowid_alias) = match &self.plan {
             Plan::Insert {
@@ -9611,7 +9596,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             .await?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.note_insert(root, rowid);
         Ok(())
     }
@@ -9619,7 +9604,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Rewrite one stored row in place: old index entries out,
     /// old row out, new row in, new index entries in — the apply
     /// tail shared by UPDATE (v0.5) and upsert DO UPDATE (v0.7).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     #[allow(clippy::too_many_arguments)]
     async fn rewrite_stored_row(
         &mut self,
@@ -9811,7 +9796,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// upsert clause (v0.7). `row` is the proposed record
     /// (defaults applied, column affinities applied, the alias
     /// slot holding its default) and `rowid` its proposed rowid.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     async fn exec_insert_row_v07(
         &mut self,
         row: AVec<OwnedValue>,
@@ -9969,7 +9954,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         not_nulls.as_slice(),
                     )
                     .await;
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if r.is_err() {
                     self.upsert_failed = true;
                 }
@@ -10134,7 +10119,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// insert into an update of the conflicting row `crowid`.
     /// SET expressions evaluate against (original ++ excluded);
     /// a false WHERE skips the row entirely.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     #[allow(clippy::too_many_arguments)]
     async fn exec_upsert_update(
         &mut self,
@@ -10382,7 +10367,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             .await?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.note_change();
         self.push_insert_returning(new_rec.as_slice(), new_rowid)
             .await?;
@@ -10407,10 +10392,10 @@ impl<'c, S: Storage> Statement<'c, S> {
     // ---------------- v0.5 write-side execution ----------------
 
     /// The combinations of an UPDATE ... FROM planned as a join
-    /// (v0.17 review fix, `join_order`): the join run in its order,
+    /// (v0.17 review fix, `planner`): the join run in its order,
     /// and per target rowid (ascending) the index of the last
     /// combination that gives it.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     #[allow(clippy::type_complexity)]
     async fn update_from_rows(
         &mut self,
@@ -10445,12 +10430,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok((joined, keep))
     }
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn step_update(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         if self.has_returning() {
             if !self.ret_loaded {
                 match self.exec_update().await {
@@ -10474,12 +10459,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
     }
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn step_delete(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         if self.has_returning() {
             if !self.ret_loaded {
                 match self.exec_delete().await {
@@ -10493,7 +10478,6 @@ impl<'c, S: Storage> Statement<'c, S> {
                         if self.trigger_failed(&mut e).await {
                             return Err(e);
                         }
-                        #[cfg(feature = "v16")]
                         self.conn.env.finish(false);
                         abort_write!(self, &e);
                         return Err(e);
@@ -10514,7 +10498,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if self.trigger_failed(&mut e).await {
                     return Err(e);
                 }
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 self.conn.env.finish(false);
                 abort_write!(self, &e);
                 Err(e)
@@ -10522,7 +10506,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
     }
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn step_drop_table(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
@@ -10553,7 +10537,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// failure, the rows the scan passed before it are in `out`
     /// (v0.16 review fix, `triggers`: a trigger program's one-pass
     /// write keeps them — `one_pass`).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     #[allow(clippy::too_many_arguments)]
     async fn scan_write_rows_into(
         &mut self,
@@ -10654,9 +10638,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             if let Some(f) = filter {
                 let rd = row_data_for(rowid_alias, affs, rec.as_slice(), rowid);
-                #[cfg(feature = "v06")]
+                #[cfg(feature = "sql")]
                 let keep = self.where_row_sub(f, &rd).await?;
-                #[cfg(not(feature = "v06"))]
+                #[cfg(not(feature = "sql"))]
                 let keep = crate::query::cond::<S::Error>(f, &Ctx::of(&rd).with(&self.conn.env))?;
                 if !keep {
                     continue;
@@ -10671,7 +10655,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// decoded as `scan_write_rows_into` decodes it; `None` when the
     /// row is gone (an OR REPLACE earlier in the statement
     /// deleted it).
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn reload_write_row(
         &mut self,
         root: u32,
@@ -10696,9 +10680,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(Some(WriteRow { rowid, rec }))
     }
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn exec_update(&mut self) -> Result<(), S::Error> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.pending.set(0);
         #[cfg(feature = "triggers")]
         self.load_triggers()?;
@@ -10728,15 +10712,15 @@ impl<'c, S: Storage> Statement<'c, S> {
                 ),
                 _ => unreachable!(),
             };
-        // Per-constraint actions (v0.16, `v07`).
-        #[cfg(feature = "v07")]
+        // Per-constraint actions (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         let (nn_acts, ipk_act) = match &self.plan {
             Plan::Update {
                 nn_acts, ipk_act, ..
             } => (nn_acts.clone(), *ipk_act),
             _ => unreachable!(),
         };
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let ipk_act = conflict_action;
         #[cfg(feature = "indexes")]
         let indexes: AVec<IndexPlan> = match &self.plan {
@@ -10747,7 +10731,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // filter then applies per (target row, FROM combination)
         // pair instead of per target row, so the scan runs
         // unfiltered.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let (from_sources, returning) = match &self.plan {
             Plan::Update {
                 from_sources,
@@ -10756,24 +10740,24 @@ impl<'c, S: Storage> Statement<'c, S> {
             } => (from_sources.clone(), returning.clone()),
             _ => unreachable!(),
         };
-        // v0.17 (`join_order`): the target and the FROM sources joined
+        // v0.17 (`planner`): the target and the FROM sources joined
         // in the pin's order once, before any row changes, each
         // target rowid keeping the last combination that order gives
         // it (the pin's UPDATE ... FROM, which collects them keyed by
         // rowid first).
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let from_join = match &self.plan {
             Plan::Update { from_join, .. } => from_join.clone(),
             _ => None,
         };
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let (joined_from, last_from) = match from_join.as_deref() {
             None => (AVec::new(), AVec::new()),
             // (Boxed: the join's futures stay off the stack of every
             // UPDATE, trigger programs' included.)
             Some(j) => Box::pin(self.update_from_rows(j)).await?,
         };
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let eff_sets: AVec<(Target, RExpr)> = match from_join.as_deref() {
             Some(j) => sets
                 .iter()
@@ -10782,13 +10766,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .collect(),
             None => sets.clone(),
         };
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         let eff_sets = sets.clone();
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let joined_plan = from_join.is_some();
-        #[cfg(all(feature = "v07", not(feature = "join_order")))]
+        #[cfg(all(feature = "sql", not(feature = "planner")))]
         let joined_plan = false;
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let from_rows = if from_sources.is_empty() || joined_plan {
             None
         } else {
@@ -10797,13 +10781,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                     .await?,
             )
         };
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let scan_filter = if !from_sources.is_empty() {
             &None
         } else {
             &filter
         };
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let scan_filter = &filter;
         let mut rows = AVec::new();
         let scanned = self
@@ -10827,9 +10811,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         // REPLACE, or a constraint's own clause).
         #[cfg(feature = "indexes")]
         let any_replace = ipk_act == ConflictAction::Replace || {
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             let r = indexes.iter().any(|ix| ix.act == ConflictAction::Replace);
-            #[cfg(not(feature = "v07"))]
+            #[cfg(not(feature = "sql"))]
             let r = conflict_action == ConflictAction::Replace;
             r
         };
@@ -10914,7 +10898,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             // through (v0.7): exactly one without FROM; with FROM,
             // one per joined combination the filter accepts.
             let mut combos: AVec<RowData> = AVec::new();
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             if joined_plan
                 && let Ok(p) = last_from
                     .as_slice()
@@ -10926,7 +10910,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             {
                 combos.push(c.clone());
             }
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             if let Some(fr) = from_rows.as_ref().filter(|_| !joined_plan) {
                 let mut joined: AVec<RowData> = AVec::new();
                 self.join_sources(
@@ -10965,7 +10949,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             } else if !joined_plan {
                 combos.push(base_rd);
             }
-            #[cfg(not(feature = "v07"))]
+            #[cfg(not(feature = "sql"))]
             combos.push(base_rd);
             // The row as currently stored. `combos` holds at most
             // one combination (v0.16: the last matching one —
@@ -10982,9 +10966,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 // the last assignment to a column win.
                 let mut evaluated: AVec<(Target, OwnedValue)> = AVec::new();
                 for (target, e) in eff_sets.iter() {
-                    #[cfg(feature = "v06")]
+                    #[cfg(feature = "sql")]
                     let v = self.eval_row_sub(e, rd).await?;
-                    #[cfg(not(feature = "v06"))]
+                    #[cfg(not(feature = "sql"))]
                     let v = crate::query::eval::<S::Error>(e, &Ctx::of(rd).with(&self.conn.env))?;
                     evaluated.push((*target, v));
                 }
@@ -11085,7 +11069,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         affs.as_slice(),
                         rowid_alias,
                         conflict_action,
-                        #[cfg(feature = "v07")]
+                        #[cfg(feature = "sql")]
                         NnActs {
                             acts: nn_acts.as_slice(),
                             failed: &self.fail_act,
@@ -11100,7 +11084,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         affs.as_slice(),
                         rowid_alias,
                         conflict_action,
-                        #[cfg(feature = "v07")]
+                        #[cfg(feature = "sql")]
                         NnActs {
                             acts: nn_acts.as_slice(),
                             failed: &self.fail_act,
@@ -11163,9 +11147,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                         .await?
                         && other != cur_rowid
                     {
-                        #[cfg(feature = "v07")]
+                        #[cfg(feature = "sql")]
                         violated.push((false, ix.act));
-                        #[cfg(not(feature = "v07"))]
+                        #[cfg(not(feature = "sql"))]
                         violated.push((false, conflict_action));
                         if !conflict_rows.iter().any(|r| *r == other) {
                             conflict_rows.push(other);
@@ -11195,7 +11179,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     match decides.map(|d| d.1) {
                         Some(ConflictAction::Ignore) => continue,
                         None => {
-                            #[cfg(feature = "v07")]
+                            #[cfg(feature = "sql")]
                             {
                                 stale = true;
                                 #[cfg(feature = "triggers")]
@@ -11237,7 +11221,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                                     return Err(Error::Schema { kind });
                                 }
                             }
-                            #[cfg(not(feature = "v07"))]
+                            #[cfg(not(feature = "sql"))]
                             {
                                 return Err(Error::Schema {
                                     kind: first_err.unwrap_or(SchemaKind::UniqueViolation),
@@ -11246,7 +11230,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         }
                         // ABORT, FAIL, ROLLBACK: the statement fails.
                         Some(a) => {
-                            #[cfg(feature = "v07")]
+                            #[cfg(feature = "sql")]
                             self.fail_act.set(Some(a));
                             let _ = a;
                             let kind = match decides {
@@ -11297,7 +11281,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 // RETURNING reads the row before its AFTER triggers
                 // run (v0.16 review fix: the pin's RETURNING program
                 // is the first of them, as for INSERT and DELETE).
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 if !returning.is_empty() {
                     let rd =
                         row_data_for(rowid_alias, affs.as_slice(), new_rec.as_slice(), new_rowid);
@@ -11323,7 +11307,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 cur_rowid = new_rowid;
                 applied = true;
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if applied {
                 self.conn.env.note_change();
             }
@@ -11339,14 +11323,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !self.conn.explicit_txn {
             auto_commit!(self.conn)?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.finish(true);
         Ok(())
     }
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn exec_delete(&mut self) -> Result<(), S::Error> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.pending.set(0);
         #[cfg(feature = "triggers")]
         self.load_triggers()?;
@@ -11388,7 +11372,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             .await;
         #[cfg(not(feature = "triggers"))]
         scanned?;
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let returning = match &self.plan {
             Plan::Delete { returning, .. } => returning.clone(),
             _ => unreachable!(),
@@ -11507,7 +11491,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 .await?;
             }
             btree::btree_delete(&mut self.conn.pager, root, wrow.rowid).await?;
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             self.conn.env.note_change();
             #[cfg(feature = "foreign_keys")]
             if let Some(lrow) = &fk_old {
@@ -11517,7 +11501,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             // subqueries the table with this row (and every
             // earlier one) gone — the pin evaluates it after the
             // row's delete (v0.16 review fix: it ran before).
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             if !returning.is_empty() {
                 let rd = row_data_for(
                     rowid_alias,
@@ -11556,7 +11540,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         if !self.conn.explicit_txn {
             auto_commit!(self.conn)?;
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         self.conn.env.finish(true);
         Ok(())
     }
@@ -11568,7 +11552,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// ungated: hipp left them, so a later table of the same name
     /// inherited made-up statistics). `name` is the name as stored
     /// in the schema, compared exactly, as the pin's `tbl = name`.
-    #[cfg(any(feature = "v05", feature = "indexes"))]
+    #[cfg(any(feature = "write", feature = "indexes"))]
     async fn clear_stat_rows(&mut self, col: usize, name: &[u8]) -> Result<(), S::Error> {
         for stat in [
             b"sqlite_stat1",
@@ -11601,7 +11585,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// chains) to the freelist, then remove the schema rows.
     /// Collection happens before any freeing, so the traversals
     /// see intact trees.
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn exec_drop_table(&mut self) -> Result<(), S::Error> {
         let (root, index_roots, seq) = match &self.plan {
             Plan::DropTable {
@@ -11703,7 +11687,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// Remove a dropped AUTOINCREMENT table's `sqlite_sequence` row.
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn drop_seq_row(&mut self, sroot: u32, tname: &[u8]) -> Result<(), S::Error> {
         let mut gone = AVec::new();
         let mut cursor = ScanCursor::new(sroot);
@@ -11721,7 +11705,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// DROP TABLE's end: the schema cookie, then the commit.
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     async fn drop_table_end(&mut self) -> Result<(), S::Error> {
         self.conn.pager.bump_schema_cookie();
         #[cfg(feature = "foreign_keys")]
@@ -11915,14 +11899,14 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     // ---------------- v0.4 query execution ----------------
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn step_query(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
-        // A plan that streams (v0.17, `v16`) returns each row as its
+        // A plan that streams (v0.17, `sql`) returns each row as its
         // join makes it; a blocking one's rows land in `query_rows`.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if !self.query_loaded {
             // Boxed: the step future (re-entered once per trigger
             // level) stays small.
@@ -11972,30 +11956,26 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// source, nested-loop join, filter, group/project, distinct,
     /// sort, limit. The plan's fast paths keep the common
     /// single-table scans off this code entirely.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn run_query(&mut self) -> Result<(), S::Error> {
         let Plan::Query(qp) = &self.plan else {
             unreachable!()
         };
         // The plan is shared, not deep-copied, per execution.
         let qp = alloc::rc::Rc::clone(qp);
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if !qp.compound.is_empty() || !qp.values.is_empty() {
             return self.run_query_compound(&qp).await;
         }
-        // v0.17 (`v16`): one executor, the async one (the streamed
+        // v0.17 (`sql`): one executor, the async one (the streamed
         // plans and their blocking modes use it too); the synchronous
-        // v0.4 executor below serves the builds without the rung.
-        #[cfg(feature = "v16")]
+        // v0.4 executor below serves the builds without `sql`.
+        #[cfg(feature = "sql")]
         {
             self.run_query_sub(&qp).await
         }
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         {
-            #[cfg(feature = "v06")]
-            if query_plan_has_sub(&qp) {
-                return self.run_query_sub(&qp).await;
-            }
             // LIMIT / OFFSET first: the pin computes them before
             // the scan, so a bad one errors even over no rows.
             let window = self.limit_window(&qp.limit, &qp.offset).await?;
@@ -12029,7 +12009,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// (`query::limit_int`). A negative LIMIT means no limit and
     /// a negative OFFSET means none; counts beyond the address
     /// space saturate rather than wrap on 32-bit targets.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn limit_window(
         &mut self,
         limit: &Option<RExpr>,
@@ -12038,9 +12018,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         let mut vals = [None, None];
         for (slot, e) in vals.iter_mut().zip([limit, offset]) {
             let Some(e) = e else { continue };
-            #[cfg(feature = "v06")]
+            #[cfg(feature = "sql")]
             let v = self.eval_row_sub(e, &RowData::empty()).await?;
-            #[cfg(not(feature = "v06"))]
+            #[cfg(not(feature = "sql"))]
             let v = crate::query::eval::<S::Error>(
                 e,
                 &Ctx::of(&RowData::empty()).with(&self.conn.env),
@@ -12062,7 +12042,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Scan one query source's rows into memory (v0.4 executor
     /// step 1, shared by the subquery path): decoded values with
     /// defaults materialised and read-side REAL forcing (§5.5).
-    #[cfg(all(feature = "v04", not(feature = "v16")))]
+    #[cfg(all(feature = "query", not(feature = "sql")))]
     async fn materialise_query_sources(
         &mut self,
         sources: &[SourcePlan],
@@ -12075,12 +12055,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             if sp.derived.is_some() {
                 return Err(Error::Unsupported);
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if sp.rec != 0 {
                 return Err(Error::Unsupported);
             }
             // v0.16: a TEMP table read by a main statement.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if sp.temp {
                 let rows = self.scan_temp(sp).await?;
                 src_rows.push(rows);
@@ -12100,7 +12080,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// Every row of the plain table source `sp`, in rowid order
     /// (`decode_source_row` each).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn scan_source(
         &mut self,
         sp: &SourcePlan,
@@ -12120,14 +12100,14 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// like `materialise_query_sources`, but a derived source
     /// executes its subplan against `outer` (the empty row at
     /// statement level) and contributes rowid-less rows.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn materialise_sources_sub(
         &mut self,
         sources: &[SourcePlan],
         outer: &RowData,
         need: Option<usize>,
     ) -> Result<AVec<AVec<(AVec<OwnedValue>, Option<i64>)>>, S::Error> {
-        #[cfg(not(feature = "v09"))]
+        #[cfg(not(feature = "sql"))]
         let _ = (outer, need);
         let mut src_rows: AVec<AVec<(AVec<OwnedValue>, Option<i64>)>> = AVec::new();
         for sp in sources.iter() {
@@ -12148,7 +12128,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 continue;
             }
             // v0.16: a recursive reference's one row.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if sp.rec != 0 {
                 let mut rows = AVec::new();
                 if let Some((_, r)) = self.rec_rows.iter().rev().find(|(id, _)| *id == sp.rec) {
@@ -12157,20 +12137,17 @@ impl<'c, S: Storage> Statement<'c, S> {
                 src_rows.push(rows);
                 continue;
             }
-            #[cfg(feature = "v09")]
+            #[cfg(feature = "sql")]
             {
                 if let Some(d) = &sp.derived {
                     // `need` bounds the first source only (the outer
                     // loop the reader stops early).
                     let need = if src_rows.is_empty() { need } else { None };
-                    #[cfg(feature = "v16")]
                     let inner = if d.mat != 0 {
                         self.shared_rows(d, outer, need).await?
                     } else {
                         self.exec_subplan_need(d, outer, need).await?
                     };
-                    #[cfg(not(feature = "v16"))]
-                    let inner = self.exec_subplan_need(d, outer, need).await?;
                     let mut rows = AVec::new();
                     for r in inner.iter() {
                         rows.push((r.clone(), None));
@@ -12180,15 +12157,15 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             // v0.16: a TEMP table read by a main statement.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if sp.temp {
                 let rows = self.scan_temp(sp).await?;
                 src_rows.push(rows);
                 continue;
             }
-            // v0.17 (`join_order`): an automatic index's rows, in its
+            // v0.17 (`planner`): an automatic index's rows, in its
             // order (probed per combination in `join_step`).
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             if let Some(ai) = sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
                 src_rows.push(alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?);
                 continue;
@@ -12219,7 +12196,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Execute a compound / VALUES-core top-level query (v0.9):
     /// each core's rows through the async core path, combined
     /// left to right, then the compound ORDER BY / LIMIT.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     async fn run_query_compound(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
         let head = self.exec_qp_core_values(qp).await?;
@@ -12261,7 +12238,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// empty row; a SELECT core runs the async join/project
     /// path. The core's own DISTINCT applies; ORDER BY / LIMIT
     /// belong to the compound and are the caller's job.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     async fn exec_qp_core_values(
         &mut self,
         qp: &QueryPlan,
@@ -12312,7 +12289,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// (v0.4 executor steps 4-6, shared by the subquery path;
     /// v0.16: NULLS FIRST / LAST honoured, and the row window
     /// comes evaluated from `limit_window`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn finish_produced(
         &mut self,
         qp: &QueryPlan,
@@ -12343,7 +12320,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// executes each subquery node against the pager for the
     /// row at hand and substitutes its value before the
     /// synchronous evaluator runs.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn run_query_sub(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
         // Window calls (v0.16, `window`) read every input row: no
@@ -12351,21 +12328,21 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "window")]
         let wins = !crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice()).is_empty();
         #[cfg(not(feature = "window"))]
-        #[cfg_attr(not(feature = "v09"), allow(unused_variables))]
+        #[cfg_attr(not(feature = "sql"), allow(unused_variables))]
         let wins = false;
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         let need = derived_need(
             qp.sources.as_slice(),
             wins || qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg,
             !qp.order_by.is_empty() || qp.distinct,
             window,
         );
-        #[cfg(not(feature = "v09"))]
+        #[cfg(not(feature = "sql"))]
         let need = None;
         // v0.16 review fix: an endless recursive CTE read as the
         // outer loop through a WHERE or a join stops at the
         // reader's LIMIT, as the pin's co-routine does.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let grow = !wins
             && streams_first(
                 qp.sources.as_slice(),
@@ -12373,7 +12350,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             && (qp.filter.is_some() || qp.sources.len() > 1)
             && window.1 != usize::MAX;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let grow = false;
         let target = window.0.saturating_add(window.1);
         let mut n = if grow { target.max(1) } else { 0 };
@@ -12469,13 +12446,13 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// A subquery runs only when its operand is reached, and an AND
     /// / OR whose left operand holds a subquery and right one does
     /// not tests the right one first (the pin's `exprEvalRhsFirst`).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn cond_row_sub(&mut self, e: &RExpr, row: &RowData) -> Result<bool, S::Error> {
         self.cond_is_sub(e, row, true).await
     }
 
     /// `cond_row_sub` asking whether `e` is `want` (`query::cond_is`).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     fn cond_is_sub<'a>(
         &'a mut self,
         e: &'a RExpr,
@@ -12518,7 +12495,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// codes them (`TERM_VARSELECT`): `WHERE EXISTS (SELECT .. FROM
     /// json_each(t.j)) AND json_valid(t.j)` never runs the subquery
     /// for a row the second term rejects.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn where_row_sub(&mut self, f: &RExpr, row: &RowData) -> Result<bool, S::Error> {
         if !crate::query::has_sub(f) {
             return self.cond_row_sub(f, row).await;
@@ -12545,7 +12522,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Whether HAVING condition `e` holds for a group (v0.16 review
     /// fix, ungated): AND / OR stop early (`query::cond`) when it
     /// holds no subquery.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn cond_group_sub(
         &mut self,
         e: &RExpr,
@@ -12561,7 +12538,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Evaluate one expression for one row, executing any
     /// subquery nodes it contains first (v0.6). Expressions
     /// without subqueries take the plain synchronous path.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn eval_row_sub(&mut self, e: &RExpr, row: &RowData) -> Result<OwnedValue, S::Error> {
         if !crate::query::has_sub(e) {
             return crate::query::eval::<S::Error>(e, &Ctx::of(row).with(&self.conn.env));
@@ -12583,7 +12560,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// over those values, and the folded literal replaces the
     /// aggregate node before the rest of the expression
     /// evaluates against the representative row.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn eval_group_sub(
         &mut self,
         e: &RExpr,
@@ -12657,7 +12634,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// subquery in an argument is executed against that row
     /// (v0.11). The fold itself is `query::eval_agg_values`,
     /// shared with the synchronous evaluator.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn eval_agg_async(
         &mut self,
         agg: &RExpr,
@@ -12689,7 +12666,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// aggregate's argument contains a subquery, the extremum
     /// search must execute that subquery per row, which the
     /// synchronous `pick_rep` cannot do.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn pick_rep_qp_async(
         &mut self,
         qp: &QueryPlan,
@@ -12711,7 +12688,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     /// The `pick_rep_qp_async` mirror for a subquery's group.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn pick_rep_sub_async(
         &mut self,
         plan: &crate::query::SubPlan,
@@ -12737,7 +12714,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// through `eval_row_sub` (v0.11): the synchronous
     /// `pick_rep_from` rule (`extremum_step`), with per-row
     /// subquery execution.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn extremum_rep(
         &mut self,
         m: MinMaxRep<'_>,
@@ -12766,7 +12743,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// Execute every current-scope subquery node of `e` for the
     /// outer row `outer`, in `collect_subs` traversal order.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn compute_sub_values(
         &mut self,
         e: &RExpr,
@@ -12785,7 +12762,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Execute the subquery nodes of `e` that lie OUTSIDE any
     /// aggregate's arguments, for the outer row `outer`, in
     /// `collect_subs_outside_agg` traversal order (v0.11).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn compute_sub_values_outside_agg(
         &mut self,
         e: &RExpr,
@@ -12810,7 +12787,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// that writes the subquery's own table is its pre-write
     /// snapshot, matching the pin's per-statement behaviour.
     /// Correlated plans always take the per-row path.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn sub_value_for(
         &mut self,
         kind: &crate::query::SubKind<'_>,
@@ -12844,7 +12821,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// on the pin, which runs a subquery only when it is read
     /// (`coalesce(1, (SELECT abs(-9223372036854775808)))` is 1).
     /// I/O, corruption and resource errors still fail at once.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn exec_sub_kind_deferred(
         &mut self,
         kind: &crate::query::SubKind<'_>,
@@ -12858,7 +12835,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// Execute one subquery node for one outer row and shape
     /// its `SubValue` (v0.6; factored out in v0.13).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn exec_sub_kind(
         &mut self,
         kind: &crate::query::SubKind<'_>,
@@ -12913,7 +12890,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// boxed: subquery execution is recursive (a subquery's
     /// expressions can contain further subqueries), and boxing
     /// this link keeps the async layout finite.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     fn exec_subplan<'x>(
         &'x mut self,
         plan: &'x crate::query::SubPlan,
@@ -12930,7 +12907,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// cannot error: `SELECT x FROM (SELECT k x, sum(v) FROM g
     /// GROUP BY k) LIMIT 1` answers although a later group's sum
     /// overflows.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     fn exec_subplan_need<'x>(
         &'x mut self,
         plan: &'x crate::query::SubPlan,
@@ -12941,14 +12918,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer, need))
     }
 
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn exec_subplan_inner(
         &mut self,
         plan: &crate::query::SubPlan,
         outer: &RowData,
         need: Option<usize>,
     ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Some(rec) = plan.rec {
             return self.exec_recursive(plan, rec, outer, need).await;
         }
@@ -12959,9 +12936,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Only a lone core streams its groups up to the LIMIT —
         // and not over window calls (v0.16, `window`), which read
         // every input row.
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         let lone = plan.compound.is_empty();
-        #[cfg(not(feature = "v09"))]
+        #[cfg(not(feature = "sql"))]
         let lone = true;
         #[cfg(feature = "window")]
         let lone = lone
@@ -12994,7 +12971,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         };
         // A lone core reading one derived table passes the bound
         // on (`derived_need`).
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         let src_need = if lone {
             derived_need(
                 plan.sources.as_slice(),
@@ -13005,12 +12982,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         } else {
             None
         };
-        #[cfg(not(feature = "v09"))]
+        #[cfg(not(feature = "sql"))]
         let src_need = None;
         // v0.16 review fix: an endless recursive CTE read through
         // a WHERE or a join stops at the reader's bound (see
         // `run_query_sub`).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let grow = lone
             && plan.values.is_empty()
             && streams_first(
@@ -13022,7 +12999,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             )
             && (plan.filter.is_some() || plan.sources.len() > 1)
             && streamed.1 != usize::MAX;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let grow = false;
         let target = streamed.0.saturating_add(streamed.1);
         let mut n = if grow { target.max(1) } else { 0 };
@@ -13038,7 +13015,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         // Compound finish (v0.9): combine the core rows with
         // each tail core's rows, left to right, then the
         // compound ORDER BY / LIMIT.
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if !plan.compound.is_empty() {
             let mut head: AVec<AVec<OwnedValue>> = AVec::new();
             for p in produced.iter() {
@@ -13090,7 +13067,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// apply the core's own DISTINCT. ORDER BY / LIMIT are the
     /// caller's job (they belong to the whole statement, or to
     /// the compound).
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     async fn exec_subplan_core(
         &mut self,
         plan: &crate::query::SubPlan,
@@ -13104,7 +13081,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// `exec_subplan_core`, also returning how many rows its first
     /// source gave (v0.16 review fix: whether a bounded first
     /// derived table ran out).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn exec_subplan_core_n(
         &mut self,
         plan: &crate::query::SubPlan,
@@ -13114,7 +13091,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     ) -> Result<(AVec<Produced>, usize), S::Error> {
         // A VALUES core (v0.9): the rows evaluate against the
         // outer row directly.
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if !plan.values.is_empty() {
             let mut out = AVec::new();
             for r in plan.values.iter() {
@@ -13178,7 +13155,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// sources first, each in its own row order, exactly the
     /// pin's output order (its right-join loop runs once the
     /// left operand is exhausted).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn join_sources(
         &mut self,
         sources: &[SourcePlan],
@@ -13198,7 +13175,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         let mut st = JoinState {
             matched: right_match_flags(sources, src_rows),
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             bloom: AVec::new(),
         };
         self.join_step(sources, filter, src_rows, 0, outer.clone(), &mut st, out)
@@ -13224,7 +13201,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// RIGHT / FULL matches in `matched`, and recurse; a
     /// complete row passes `filter` into `out`. Recursive, so
     /// the future is boxed.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     #[allow(clippy::too_many_arguments)]
     fn join_step<'x>(
         &'x mut self,
@@ -13276,12 +13253,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             } else {
                 rows
             };
-            // v0.17 (`join_order`): an automatic index — the span of
+            // v0.17 (`planner`): an automatic index — the span of
             // the source's sorted rows this combination's key finds,
             // after the Bloom filter.
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             let spanned;
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             let rows = match sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
                 Some(ai) => {
                     let mut padded = acc.clone();
@@ -13299,13 +13276,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             let looked;
             #[cfg(feature = "expr_index")]
             let rows = match sp.access.as_deref() {
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 Some(a) if a.auto.is_some() => rows,
                 Some(a) if a.lateral => {
                     let mut padded = acc.clone();
                     pad_sources(&mut padded, sources.get(idx..).unwrap_or(&[]));
-                    // v0.17 (`join_order`): the Bloom filter first.
-                    #[cfg(feature = "join_order")]
+                    // v0.17 (`planner`): the Bloom filter first.
+                    #[cfg(feature = "planner")]
                     let pass = match &a.bloom {
                         None => true,
                         Some(keys) => {
@@ -13329,7 +13306,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                             alloc::boxed::Box::pin(self.bloom_pass(a, bits, &padded)).await?
                         }
                     };
-                    #[cfg(not(feature = "join_order"))]
+                    #[cfg(not(feature = "planner"))]
                     let pass = true;
                     looked = if pass {
                         self.access_rows(sp, a, &padded).await?
@@ -13368,7 +13345,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if on_ok {
                     any = true;
                     mark_matched(&mut st.matched, idx, ri);
-                    #[cfg(feature = "flatten")]
+                    #[cfg(feature = "planner")]
                     let before = out.len();
                     self.join_step(
                         sources,
@@ -13380,9 +13357,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                         &mut *out,
                     )
                     .await?;
-                    // A semi-join source (v0.17, `flatten`): its first
+                    // A semi-join source (v0.17, `planner`): its first
                     // row that made a joined row ends its loop.
-                    #[cfg(feature = "flatten")]
+                    #[cfg(feature = "planner")]
                     if sp.exists && out.len() > before {
                         break;
                     }
@@ -13409,7 +13386,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Group / project for a top-level query whose expressions
     /// contain subqueries (v0.6): `project_rows` with per-row /
     /// per-group subquery execution.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn project_qp_async(
         &mut self,
         qp: &QueryPlan,
@@ -13644,7 +13621,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// over combined (outer ++ inner) rows; the empty-group
     /// representative keeps the outer row's values and pads the
     /// subquery's own columns with NULLs.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     async fn sub_project(
         &mut self,
         plan: &crate::query::SubPlan,
@@ -13935,7 +13912,7 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     // ---------------- v0.4 DDL ----------------
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn step_alter(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
@@ -13958,7 +13935,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// the schema rowid (creation order is schema order). The
     /// table's records are untouched — short records already
     /// materialise the new column's default on read (§5.5).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn exec_alter(&mut self) -> Result<(), S::Error> {
         let Plan::AlterAdd {
             root,
@@ -14040,7 +14017,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     v.affs.as_slice(),
                     v.rowid_alias,
                     ConflictAction::Abort,
-                    #[cfg(feature = "v07")]
+                    #[cfg(feature = "sql")]
                     NnActs {
                         acts: &[],
                         failed: &core::cell::Cell::new(None),
@@ -14057,7 +14034,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(())
     }
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn step_create_view(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
@@ -14078,7 +14055,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// `CREATE VIEW` (v0.4): a schema row with type `view`, root
     /// page 0, and the statement text as issued. Inert — nothing
     /// else happens, ever (SPEC §2).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn exec_create_view(&mut self) -> Result<(), S::Error> {
         let Ast::CreateView {
             name,
@@ -14131,7 +14108,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(())
     }
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn step_drop_view(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
@@ -14149,7 +14126,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
     }
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     async fn exec_drop_view(&mut self) -> Result<(), S::Error> {
         let Plan::DropView { exists } = &self.plan else {
             unreachable!()
@@ -14206,19 +14183,19 @@ impl<'c, S: Storage> Statement<'c, S> {
     pub fn column_count(&self) -> usize {
         match &self.plan {
             Plan::Scan { out, .. } => out.len(),
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             Plan::Query(q) => q.width,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::Pragma(p) => p.width(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Plan::Temp { width, .. } => *width,
             #[cfg(feature = "attach")]
             Plan::Att(a) => a.width,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             Plan::Insert { returning, .. } => returning.len(),
-            #[cfg(all(feature = "v05", feature = "v07"))]
+            #[cfg(feature = "sql")]
             Plan::Update { returning, .. } => returning.len(),
-            #[cfg(all(feature = "v05", feature = "v07"))]
+            #[cfg(feature = "sql")]
             Plan::Delete { returning, .. } => returning.len(),
             #[cfg(feature = "triggers")]
             Plan::Instead(ip) => ip.returning_width(),
@@ -14291,18 +14268,18 @@ impl<'c, S: Storage> Statement<'c, S> {
 }
 
 /// A boxed subquery-execution future (v0.6).
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 type SubplanFuture<'x, E> = core::pin::Pin<
     alloc::boxed::Box<dyn core::future::Future<Output = Result<AVec<AVec<OwnedValue>>, E>> + 'x>,
 >;
 
 /// A boxed recursive condition future (v0.16, `cond_is_sub`).
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 type CondFuture<'x, E> =
     core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<bool, E>> + 'x>>;
 
 /// A boxed recursive-join future (v0.6).
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 type JoinFuture<'x, E> =
     core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Result<(), E>> + 'x>>;
 
@@ -14310,7 +14287,7 @@ type JoinFuture<'x, E> =
 /// alias when written, else the column name for a direct
 /// column reference, else the expression's source text (the
 /// pin's naming rules, header-verified).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn item_name(
     arena: &Arena,
     e: &Expr,
@@ -14327,8 +14304,8 @@ fn item_name(
 
 /// A VALUES core's result column name (v0.9): `column1`,
 /// `column2`, ... (pin-verified via the CLI header).
-#[cfg(feature = "v04")]
-#[cfg_attr(not(feature = "v09"), allow(dead_code))]
+#[cfg(feature = "query")]
+#[cfg_attr(not(feature = "sql"), allow(dead_code))]
 fn values_col_name(i: usize) -> AVec<u8> {
     let mut v = AVec::new();
     v.extend_from_slice(b"column");
@@ -14345,7 +14322,7 @@ fn values_col_name(i: usize) -> AVec<u8> {
 /// constant, a name no core matches) fails prepare with
 /// "ORDER BY term does not match any column in the result
 /// set", mirrored here as `SchemaKind::UnknownColumn`.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn resolve_compound_order<E>(
     order_by: &[(Expr, crate::sql::SortOrder)],
     arena: &Arena,
@@ -14360,7 +14337,7 @@ fn resolve_compound_order<E>(
         // column's own (the leftmost core's that has one).
         #[allow(unused_mut)]
         let (mut e, mut explicit) = (e, None);
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         while let Expr::Collate(inner, c) = e {
             if explicit.is_none() {
                 explicit = Some(*c);
@@ -14410,7 +14387,7 @@ fn resolve_compound_order<E>(
 /// SELECT nocase_col` deduplicates by BINARY); otherwise the
 /// rows are a UNION ALL chain of one-row cores, and the first
 /// row with a collation lends it.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn core_colls(items: &[RExpr], values: &[AVec<RExpr>]) -> AVec<Option<crate::record::Coll>> {
     use crate::query::{expr_coll, is_constant, item_result_affinity};
     let mut out = AVec::new();
@@ -14438,7 +14415,7 @@ fn core_colls(items: &[RExpr], values: &[AVec<RExpr>]) -> AVec<Option<crate::rec
 /// A compound result column's collation (v0.16, the pin's
 /// `multiSelectCollSeq`): the leftmost core whose item `i` has
 /// one decides; BINARY when none does.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn compound_col_coll<'x>(
     cores: impl Iterator<Item = &'x AVec<Option<crate::record::Coll>>>,
     i: usize,
@@ -14455,7 +14432,7 @@ fn compound_col_coll<'x>(
 /// (v0.16; v0.9 compared raw): the pin applies NO affinity in
 /// compound operations or DISTINCT (`SELECT 1 UNION SELECT
 /// '1'` keeps both rows).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn compound_rows_equal(a: &[OwnedValue], b: &[OwnedValue], colls: &[crate::record::Coll]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).enumerate().all(|(i, (x, y))| {
@@ -14465,7 +14442,7 @@ fn compound_rows_equal(a: &[OwnedValue], b: &[OwnedValue], colls: &[crate::recor
 
 /// Remove duplicate rows, keeping first occurrences (v0.9;
 /// under the columns' collations since v0.16).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn dedup_compound_rows(
     rows: AVec<AVec<OwnedValue>>,
     colls: &[crate::record::Coll],
@@ -14484,7 +14461,7 @@ fn dedup_compound_rows(
 
 /// Compare two compound rows ascending by every column under
 /// the merge key's collations (v0.16).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn compound_key_cmp(
     a: &[OwnedValue],
     b: &[OwnedValue],
@@ -14516,7 +14493,7 @@ fn compound_key_cmp(
 /// the previous emitted row under `dup` (the operator's own
 /// column collations, which can differ from a key pushed down
 /// from an enclosing operator).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn merge_compound(
     op: crate::sql::CompoundOp,
     mut left: AVec<AVec<OwnedValue>>,
@@ -14603,7 +14580,7 @@ fn merge_compound(
 /// other than its column's makes the pin evaluate the compound
 /// without it and sort the result afterwards; the final stable
 /// sort by `order` below covers both shapes.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn run_compound(
     head: AVec<AVec<OwnedValue>>,
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
@@ -14659,7 +14636,7 @@ fn run_compound(
 /// `expr_index`; `Connection::merge_core`): `(result column, DESC,
 /// NULLS FIRST)` terms, then (when the flag says so) every other
 /// column ascending.
-#[cfg(all(feature = "expr_index", feature = "v09"))]
+#[cfg(feature = "expr_index")]
 type MergeSpec = (AVec<(usize, bool, bool)>, bool);
 
 /// The merge key core `k` (0: the head) of compound `stmt` is merged
@@ -14669,7 +14646,7 @@ type MergeSpec = (AVec<(usize, bool, bool)>, bool);
 /// of result-column numbers, those columns, then the others unless
 /// the last operator is UNION ALL. `None`: not merged, or an ORDER
 /// BY by name or expression (planned without a key).
-#[cfg(all(feature = "expr_index", feature = "v09"))]
+#[cfg(feature = "expr_index")]
 fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
     use crate::sql::CompoundOp::{Union, UnionAll};
     if stmt.order_by.is_empty() {
@@ -14722,7 +14699,7 @@ fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
 /// `LIMIT 1` case, and that mixed operator chains, `LIMIT +1`,
 /// bound limits and a subquery's own `LIMIT X` (rewritten to
 /// `X <> 0`) keep the sorted answer.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn union_first_row(
     limit: &Option<RExpr>,
     offset: &Option<RExpr>,
@@ -14739,7 +14716,7 @@ fn union_first_row(
 
 /// The first row of the first core that has one (see
 /// `union_first_row`).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn first_core_row(
     head: AVec<AVec<OwnedValue>>,
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
@@ -14758,7 +14735,7 @@ fn first_core_row(
 /// A row window `(skip, take)` from `limit_window` over
 /// finished rows (v0.9 extraction of the subquery finisher's
 /// tail; v0.16 takes the evaluated window).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn apply_window(
     rows: AVec<AVec<OwnedValue>>,
     (skip, take): (usize, usize),
@@ -14772,7 +14749,7 @@ fn apply_window(
 
 /// Compare two compound result rows under the compound ORDER
 /// BY (v0.9; NULLS FIRST / LAST since v0.16).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn compound_order_cmp(
     a: &AVec<OwnedValue>,
     b: &AVec<OwnedValue>,
@@ -14802,7 +14779,7 @@ fn compound_order_cmp(
 /// so `HAVING random() = 5`, `HAVING 0`, a bare column, a NOCASE
 /// group column and a query without GROUP BY skipped errors the
 /// pin raises.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn having_early<'x>(h: &'x RExpr, group_by: &[RExpr], out: &mut AVec<&'x RExpr>) {
     if group_by.is_empty() || always_false(h) {
         return;
@@ -14825,7 +14802,7 @@ fn having_early<'x>(h: &'x RExpr, group_by: &[RExpr], out: &mut AVec<&'x RExpr>)
 /// `abs(k) = 1`. hipp's parser folds FALSE, `-0` and `+0` into
 /// the literal 0, where the pin folds no AND over FALSE and
 /// keeps a (movable) unary operator (STATUS.md gap).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn always_false(e: &RExpr) -> bool {
     match e {
         RExpr::Literal(OwnedValue::Integer(0)) => true,
@@ -14838,7 +14815,7 @@ fn always_false(e: &RExpr) -> bool {
 
 /// Whether `e` holds a function call outside its subqueries
 /// (v0.16): the pin's `EP_HasFunc`, which LIKE / GLOB carry too.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn has_call(e: &RExpr) -> bool {
     match e {
         RExpr::Scalar(..) | RExpr::Agg { .. } | RExpr::Like(..) | RExpr::Win(..) => true,
@@ -14877,7 +14854,7 @@ fn has_call(e: &RExpr) -> bool {
 /// collation (`group_match`). Columns elsewhere, subqueries,
 /// aggregates and the non-constant functions (`random()`,
 /// `changes()`, ...) fail.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn const_or_group(e: &RExpr, group_by: &[RExpr]) -> bool {
     if group_by.iter().any(|g| {
         group_match(e, g)
@@ -14916,9 +14893,9 @@ fn const_or_group(e: &RExpr, group_by: &[RExpr]) -> bool {
         }
         RExpr::Scalar(g, args) => {
             // sqlite_version() is a constant function there.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let varies = g.nondeterministic() && *g != crate::query::ScalarFn::SqliteVersion;
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             let varies = {
                 let _ = g;
                 false
@@ -14930,7 +14907,7 @@ fn const_or_group(e: &RExpr, group_by: &[RExpr]) -> bool {
 
 /// `sqlite3ExprCompare(a, b) < 2` (v0.16): the same expression,
 /// or one that differs only by a COLLATE on top of either side.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn group_match(a: &RExpr, b: &RExpr) -> bool {
     if crate::query::same_expr(a, b) {
         return true;
@@ -14948,7 +14925,7 @@ fn group_match(a: &RExpr, b: &RExpr) -> bool {
 /// ORDER BY. The pin computes them all before testing HAVING, so
 /// one that errors (`sum()` overflow, the percentile checks) fails
 /// the statement even for a group HAVING drops.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn group_aggs<'x>(
     items: &'x [RExpr],
     order_by: &'x [(RExpr, crate::sql::SortOrder)],
@@ -14969,7 +14946,7 @@ fn group_aggs<'x>(
 /// DISTINCT, the pin emits groups as it finalizes them and stops
 /// at OFFSET + LIMIT — later groups are never finalized, so their
 /// aggregates cannot error. None: every group is needed.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn group_cap(
     group_by: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
@@ -14996,10 +14973,10 @@ fn group_cap(
 /// needed (an outer WHERE may be pushed into the subquery on the
 /// pin, which hipp does not model; see STATUS.md).
 /// Whether a reader's `need` bounds what derived plan `p`
-/// computes (v0.16 review fix, `v16`): a recursive CTE stops its
+/// computes (v0.16 review fix, `sql`): a recursive CTE stops its
 /// queue there, and a plain core passes the bound on to a first
 /// source that honours it (`streams_first`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn need_bounds(p: &crate::query::SubPlan) -> bool {
     if p.rec.is_some() {
         return true;
@@ -15019,8 +14996,8 @@ fn need_bounds(p: &crate::query::SubPlan) -> bool {
 /// FULL join emits rows after the main loop. The pin runs such a
 /// first source as a co-routine and stops it at the reader's
 /// LIMIT, so an endless recursive CTE read through a WHERE or a
-/// join answers (v0.16 review fix, `v16`).
-#[cfg(feature = "v16")]
+/// join answers (v0.16 review fix, `sql`).
+#[cfg(feature = "sql")]
 fn streams_first(sources: &[SourcePlan], plain: bool) -> bool {
     plain
         && !sources.iter().any(|s| {
@@ -15035,7 +15012,7 @@ fn streams_first(sources: &[SourcePlan], plain: bool) -> bool {
             .is_some_and(|d| d.mat == 0 && need_bounds(d))
 }
 
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn derived_need(
     sources: &[SourcePlan],
     reduced: bool,
@@ -15087,7 +15064,7 @@ fn order_ref(
 /// `iOrderByCol`): the term, under any COLLATE, the same expression
 /// as a result column (`same_expr`; an alias or ordinal resolves to
 /// a copy of the column's) — the last such column.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn order_cols(order: &[(RExpr, crate::sql::SortOrder)], items: &[RExpr]) -> AVec<Option<usize>> {
     let mut out = AVec::new();
     for (e, _) in order.iter() {
@@ -15100,7 +15077,7 @@ fn order_cols(order: &[(RExpr, crate::sql::SortOrder)], items: &[RExpr]) -> AVec
     out
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn shown_keys(keys: &mut [OwnedValue], cols: &[Option<usize>], vals: &[OwnedValue]) {
     for (k, c) in keys.iter_mut().zip(cols.iter()) {
         if let Some(v) = c.and_then(|j| vals.get(j)) {
@@ -15124,7 +15101,7 @@ fn shown_keys(keys: &mut [OwnedValue], cols: &[Option<usize>], vals: &[OwnedValu
 /// keys (`window::inner_sort_desc`), so those directions apply —
 /// when there are as many keys as GROUP BY terms — whatever the
 /// outer ORDER BY says.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn group_desc(
     group_by: &[RExpr],
     items: &[RExpr],
@@ -15149,7 +15126,7 @@ fn group_desc(
 /// Sort GROUP BY groups into key order: each term under its
 /// collation, descending where `gdesc` says (v0.17 size pass: the
 /// one comparator every grouping path shares).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn sort_groups(
     groups: &mut [(AVec<OwnedValue>, AVec<RowData>)],
     gcolls: &[crate::record::Coll],
@@ -15176,7 +15153,7 @@ fn sort_groups(
 /// Whether a query's rows arrive in its GROUP BY order (v0.16,
 /// `expr_index`): its one source's index delivers it, and the pin
 /// then emits the groups as they arrive, skipping its group sorter.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
     #[cfg(feature = "expr_index")]
     if let [s] = sources
@@ -15185,8 +15162,8 @@ fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
         return true;
     }
     // A join the pin's planner ordered: its first loop delivers the
-    // GROUP BY for the whole join (v0.17 review fix, `join_order`).
-    #[cfg(feature = "join_order")]
+    // GROUP BY for the whole join (v0.17 review fix, `planner`).
+    #[cfg(feature = "planner")]
     if let Some(s) = sources.first()
         && sources.len() > 1
         && s.access.as_ref().is_some_and(|a| a.groups)
@@ -15200,7 +15177,7 @@ fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
 /// DISTINCT over produced rows (v0.4): first occurrences
 /// kept, values compared NULL-safely under each result
 /// column's collation (v0.16).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn dedup_produced(produced: AVec<Produced>, colls: &[crate::record::Coll]) -> AVec<Produced> {
     let mut kept: AVec<Produced> = AVec::new();
     for p in produced.iter() {
@@ -15216,19 +15193,19 @@ fn dedup_produced(produced: AVec<Produced>, colls: &[crate::record::Coll]) -> AV
 }
 
 /// The nested-loop join's per-execution state (`join_step`): the
-/// RIGHT / FULL match flags and (v0.17, `join_order`) each automatic
+/// RIGHT / FULL match flags and (v0.17, `planner`) each automatic
 /// index's Bloom filter, built at its first probe.
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 struct JoinState {
     matched: AVec<AVec<bool>>,
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     bloom: AVec<Option<AVec<u8>>>,
 }
 
 /// Per-source "matched" flags for a join's RIGHT / FULL
 /// sources (v0.16): one flag per materialised row of each such
 /// source, empty for every other source.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn right_match_flags(
     sources: &[SourcePlan],
     src_rows: &[AVec<(AVec<OwnedValue>, Option<i64>)>],
@@ -15248,7 +15225,7 @@ fn right_match_flags(
 
 /// Record that row `ri` of source `idx` was matched (v0.16; a
 /// no-op for sources that keep no flags).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn mark_matched(matched: &mut AVec<AVec<bool>>, idx: usize, ri: usize) {
     if let Some(f) = matched
         .as_mut_slice()
@@ -15260,7 +15237,7 @@ fn mark_matched(matched: &mut AVec<AVec<bool>>, idx: usize, ri: usize) {
 }
 
 /// Whether row `ri` of source `idx` was matched (v0.16).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn row_matched(matched: &AVec<AVec<bool>>, idx: usize, ri: usize) -> bool {
     matched
         .as_slice()
@@ -15272,7 +15249,7 @@ fn row_matched(matched: &AVec<AVec<bool>>, idx: usize, ri: usize) -> bool {
 
 /// Append a NULL row (all columns, no rowid) for each of
 /// `sources` to `acc` (v0.16).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn pad_sources(acc: &mut RowData, sources: &[SourcePlan]) {
     for sp in sources.iter() {
         for _ in 0..sp.ncols {
@@ -15285,7 +15262,7 @@ fn pad_sources(acc: &mut RowData, sources: &[SourcePlan]) {
 /// The accumulator for an unmatched row of RIGHT / FULL source
 /// `i` (v0.16): the outer row, NULLs for every source before
 /// `i`, then the row itself.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn left_padded(
     outer: &RowData,
     sources: &[SourcePlan],
@@ -15306,7 +15283,7 @@ fn left_padded(
 /// (record `payload`) to `out`: the rowid alias, defaults for the
 /// fields a short record lacks, read-side REAL forcing (§5.5) and
 /// (v0.16) its generated columns computed.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn decode_source_row<E>(
     sp: &SourcePlan,
     payload: &[u8],
@@ -15358,7 +15335,7 @@ fn decode_source_row<E>(
 /// current-scope subquery node (v0.6): such plans execute
 /// through the substitution path instead of the synchronous
 /// v0.4 executor.
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 fn query_plan_has_sub(qp: &QueryPlan) -> bool {
     use crate::query::has_sub;
     // A lateral index lookup (v0.16, `expr_index`) runs in the
@@ -15385,7 +15362,7 @@ fn query_plan_has_sub(qp: &QueryPlan) -> bool {
 
 /// One produced result row of a v0.4 query (output values, sort
 /// keys, representative rowid for single-source queries).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[derive(Debug, Clone)]
 struct Produced {
     out: AVec<OwnedValue>,
@@ -15396,7 +15373,7 @@ struct Produced {
 /// The produced rows in ORDER BY order, inside the LIMIT / OFFSET
 /// window, and (into `ids`) their rowids: the tail the materialising
 /// executor and `exec_subplan_inner` share (sync).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[inline(never)]
 fn ordered_window(
     produced: &[Produced],
@@ -15424,7 +15401,7 @@ fn ordered_window(
 /// The ORDER BY permutation of `produced` (stable, under the terms'
 /// directions and NULLS placement): its callers read the rows they
 /// keep through it instead of moving every row (v0.17 size pass).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn order_perm(
     produced: &[Produced],
     order_by: &[(RExpr, crate::sql::SortOrder)],
@@ -15449,7 +15426,7 @@ fn order_perm(
 /// RIGHT / FULL source's unmatched rows NULL-padded on the left
 /// and joined onward — the `join_sources` order, without
 /// subquery execution.
-#[cfg(all(feature = "v04", not(feature = "v16")))]
+#[cfg(all(feature = "query", not(feature = "sql")))]
 fn join_all<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -15496,7 +15473,7 @@ fn join_all<E>(
 /// extends once with NULLs, and RIGHT / FULL matches are
 /// recorded in `matched` for `join_all`'s tail. The WHERE
 /// filter applies to complete rows.
-#[cfg(all(feature = "v04", not(feature = "v16")))]
+#[cfg(all(feature = "query", not(feature = "sql")))]
 fn join_rows<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -15552,7 +15529,7 @@ fn join_rows<E>(
 }
 
 /// Group (when the plan aggregates) and project joined rows.
-#[cfg(all(feature = "v04", not(feature = "v16")))]
+#[cfg(all(feature = "query", not(feature = "sql")))]
 fn project_rows<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -15758,7 +15735,7 @@ fn win_results<E>(
 /// other aggregates the query has. None: bare columns read the
 /// group's first row. (v0.4 – v0.15 honoured only a lone
 /// min/max aggregate.)
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn rep_minmax<'x>(
     items: &'x [RExpr],
     having: Option<&'x RExpr>,
@@ -15789,10 +15766,10 @@ fn rep_minmax<'x>(
 }
 
 /// The min / max aggregate that decides a group's bare columns
-/// (`rep_minmax`): its kind, its argument and (v0.16, `v16`) its
+/// (`rep_minmax`): its kind, its argument and (v0.16, `sql`) its
 /// FILTER — a row the filter rejects is not stepped, so it never
 /// loads the bare columns (none passing: the group's first row).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[derive(Clone, Copy)]
 struct MinMaxRep<'x> {
     kind: crate::query::AggKind,
@@ -15800,7 +15777,7 @@ struct MinMaxRep<'x> {
     filter: Option<&'x RExpr>,
 }
 
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 impl MinMaxRep<'_> {
     fn has_sub(&self) -> bool {
         crate::query::has_sub(self.arg) || self.filter.is_some_and(crate::query::has_sub)
@@ -15813,7 +15790,7 @@ impl MinMaxRep<'_> {
 /// group of NULLs reads its LAST row); a value loads them when
 /// it is the first or strictly beyond the best so far under the
 /// argument's collation (ties keep the earlier row).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn extremum_step(
     kind: crate::query::AggKind,
     coll: crate::record::Coll,
@@ -15844,7 +15821,7 @@ fn extremum_step(
 /// The representative row of a group (SQLite's bare-column
 /// rule): the first row, or the extremum row of the min/max
 /// aggregate `rep_minmax` picks (see `extremum_step`).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn pick_rep_from<E>(
     env: &crate::query::Env,
     items: &[RExpr],
@@ -15877,7 +15854,7 @@ fn pick_rep_from<E>(
     Ok(rep.clone())
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn pick_rep<E>(
     env: &crate::query::Env,
     qp: &QueryPlan,
@@ -15895,7 +15872,7 @@ fn pick_rep<E>(
 }
 
 /// The `pick_rep` rule for a subquery's group.
-#[cfg(feature = "v06")]
+#[cfg(feature = "sql")]
 fn pick_rep_sub<E>(
     env: &crate::query::Env,
     plan: &crate::query::SubPlan,
@@ -15916,7 +15893,7 @@ fn pick_rep_sub<E>(
 /// compound demotion since v0.16): the result item's, demoted
 /// across a compound's cores (`rules::compound_affinity`); BLOB for
 /// none.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 fn derived_col_affinity(
     plan: &crate::query::SubPlan,
     i: usize,

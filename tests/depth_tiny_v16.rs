@@ -76,7 +76,7 @@ fn hipp(sql: &str) -> Out {
             let cfg = Config::default().statement_arena(16 * 1024, 64 * 1024 * 1024);
             // With the v0.4 grammar, the pin's limits (a sign run
             // is walked without recursion there too).
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             let cfg = cfg.depth_limits(
                 hipp::sql::parser::PIN_EXPR_DEPTH,
                 hipp::sql::parser::PIN_PARSER_DEPTH,
@@ -281,7 +281,7 @@ fn default_sign_runs_match_the_oracle() {
                 block_on(async move {
                     let fs = FileStorage::open(&path).expect("file");
                     let cfg = Config::default().statement_arena(16 * 1024, 1 << 22);
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     let cfg = cfg.depth_limits(
                         hipp::sql::parser::PIN_EXPR_DEPTH,
                         hipp::sql::parser::PIN_PARSER_DEPTH,
@@ -364,7 +364,7 @@ fn schema_rows_past_page_one_match_the_oracle() {
 /// The default test run builds this file without the v0.4 grammar
 /// (`--no-default-features --features std`, its own target
 /// directory) and requires every test above to pass there.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[test]
 fn tiny_build_runs_these() {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());

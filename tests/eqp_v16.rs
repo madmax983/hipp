@@ -421,9 +421,9 @@ fn documented_differences() {
             "|--USE TEMP B-TREE FOR count(DISTINCT)\n`--SCAN t USING COVERING INDEX tcde\n",
         ),
     ];
-    // (v0.17, `join_order`: join reordering and automatic indexes now
-    // print the pin's plans; `multi_index`: the MULTI-INDEX OR and the
-    // min() / max() lookup too; `flatten`: flattened views and
+    // (v0.17, `planner`: join reordering and automatic indexes now
+    // print the pin's plans; `planner`: the MULTI-INDEX OR and the
+    // min() / max() lookup too; `planner`: flattened views and
     // EXISTS-to-join.)
     same_plans(
         &path,
@@ -616,7 +616,7 @@ fn gen_schema(r: &mut Rng) -> (String, Vec<Tab>) {
 fn gen_term(r: &mut Rng, t: &Tab) -> String {
     let c = t.cols[r.n(t.cols.len() as u64) as usize].clone();
     let v = r.n(20);
-    // (v0.17, `multi_index`: OR terms, for the MULTI-INDEX OR, and IN
+    // (v0.17, `planner`: OR terms, for the MULTI-INDEX OR, and IN
     // subqueries.)
     // (v0.17 review: a COLLATE inside an OR, the one-value IN, the IN
     // operator's own index and its Bloom filter's collation.)
@@ -655,7 +655,7 @@ fn gen_term(r: &mut Rng, t: &Tab) -> String {
 fn gen_single(r: &mut Rng, t: &Tab, one_col: bool) -> String {
     let col = |r: &mut Rng| t.cols[r.n(t.cols.len() as u64) as usize].clone();
     let k = r.n(6);
-    // (v0.17, `multi_index`: min() / max(), with a bare column.)
+    // (v0.17, `planner`: min() / max(), with a bare column.)
     if !one_col && r.n(8) == 0 {
         let f = r.pick(&["min", "max"]);
         let a = col(r);
@@ -825,7 +825,7 @@ fn generated_plans_match_pin() {
     }
     // hipp's cost model departs from the pin's in a few loop choices
     // (STATUS.md, "honest gaps"): at most 1 in 400 may differ (v0.17,
-    // `multi_index`: 15 of 4,800 at 400 seeds, OR terms, IN subqueries
+    // `planner`: 15 of 4,800 at 400 seeds, OR terms, IN subqueries
     // and min() / max() in the corpus; it was 1 in 100; v0.17 review:
     // 12 of 4,800 with COLLATE inside an OR, one-value IN lists and the
     // IN operator's own index and Bloom filter added, it was 1 in 200).

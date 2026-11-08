@@ -11,6 +11,120 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Features named for capabilities (2026-11-08)
+
+A rename and dead-code unit (ADR 0006,
+`docs/adr/0006-features-name-capabilities.md`; the user's decision of
+2026-11-08: "features should be what they actually are, not a version
+number"). Nothing observable changes.
+
+**Shipped (breaking for direct feature users).** `query` replaces
+`v04`, `write` replaces `v05` (implies `query`), one `sql` replaces
+`v06` `v07` `v08` `v09` `v10` `v16` (implies `write`), one leaf
+`planner` (in `xl`, requiring `sql` and `expr_index`) replaces
+`join_order` `multi_index` `flatten`. Every other name stays; every
+leaf that required `v16` requires `sql` (`math` keeps `query`). `full`
+/ `max` / `xl` keep their names and contents. Cargo.toml's comments
+say what each feature enables, with no version numbers.
+`ci/feature-sets.txt`: `query`, `write`, `sql`, `indexes,query`,
+`indexes,write`, `query,math`, `sql,<leaf>` per leaf, one
+`sql,indexes,expr_index,planner` (the three planner lines become one);
+all compile warning-free under clippy -D warnings.
+
+**How.** The 2,022 `feature = "..."` sites in src/, tests/, hipp-cli/
+and examples/ were rewritten by a script that parses each `cfg` /
+`cfg!` / `cfg_attr` predicate, renames it and simplifies it under the
+new implications (sql ⇒ write ⇒ query, planner ⇒ sql + expr_index, each
+leaf ⇒ its requirements), checking equivalence by truth table over
+every feature-closed assignment. A second pass tracked each predicate's
+enclosing gated items (modules through their `mod` declaration,
+functions, blocks, statements, arms) and flagged the ones that are
+unsatisfiable or always true where they stand; each was then checked
+by hand. Comments that named a rung now name its feature.
+
+**Deleted (code no surviving combination compiles):**
+- `xplan`: the IN-cost closure for `all(join_order,
+  not(multi_index))` (`join_in` paid the IN only inside joins).
+- `session`: the empty merge key of `all(expr_index, not(v09))`; the
+  plain `derived` of `all(v09, not(v16))`; a `v06` subquery check
+  inside the `not(v16)` executor branch; a `not(v16)` derived-table
+  read inside a `v09` block; a `v07` NOT NULL argument inside a
+  `not(v04)` block (dead before the rename too).
+- `xjoin` / `session::join`: three `not(flatten)` / `not(multi_index)`
+  fallbacks inside the `join_order` modules (prerequisites without
+  semi-join ones, an OR-less term count, a missing OR access).
+- `sql::parser`: a `not(v07)` RETURNING fallback inside the `v16`
+  INSERT ... DEFAULT VALUES; two assertions in a tiny-only parser
+  test gated on `v07` / `v04` (never compiled).
+- About 50 attributes that repeated the gate of the item they sit in (e.g.
+  `#[cfg(feature = "planner")]` inside `xjoin`), and one
+  `cfg!(feature = "flatten")` inside the planner, now `true`.
+Nothing a tiny, `query`, `write`, `indexes,query`, `indexes,write`
+or leaf build reaches was removed (the `all(query, not(sql))`
+fallbacks stay: the `query` and `write` builds use them).
+
+**Oracle probing.** None needed beyond the suites: no SQL behaviour
+changes; the existing differential and CLI suites run unchanged except
+their `cfg` attributes. New `tests/features_v17.rs` checks the
+implications (`sql` ⇒ `write` ⇒ `query`, every leaf ⇒ `sql`, `planner`
+⇒ `expr_index`) and the profiles' contents in whatever build runs it.
+
+**Exact-size check** (thumbv7em-none-eabihf, `--profile tiny`,
+`hipp_thumb_demo`, `.text + .rodata` as ci/size_gate.py sums it, and
+the sum of every symbol's `llvm-nm -S` size; before = `3bc670b`):
+
+
+
+Every pair has the same functions at the same sizes up to layout
+effects. The `.text + .rodata` differences
+(−8 … +32 B) and the few symbol-size differences (±2 … 10 B, always
+balanced by the machine outliner or a merged twin) are layout, not
+code: a feature's name enters cargo's `-C metadata` hash, the hash
+enters every mangled symbol, rustc orders a codegen unit's
+monomorphised items by symbol name, and the order moves inter-function
+alignment padding (max: 314 two-byte gaps instead of 312, 30 four-byte
+gaps instead of 29), literal-pool padding and the outliner's choices.
+Three checks pin that down:
+1. **A purely mechanical rename of `3bc670b`** (the rewrite script and
+   the new `[features]` table only, no deletion, no comment edit)
+   measures max 962,300, xl 1,058,824, query 173,800, write 189,752,
+   and its `.text` and `.rodata` are **byte-identical** to this unit's
+   for those four lines: the deletions and attribute removals changed
+   no compiled byte, the names alone moved the layout.
+2. **`3bc670b` with one unused feature `zzz` enabled** (a hash change
+   with no code change) measures `v04,zzz` 173,784 (−8), tiny + `zzz`
+   76,120 (−4; the outliner's functions −4 B), `v05,zzz` / full / max /
+   xl + `zzz` unchanged: the same jitter, at the base.
+3. For `query` and `write` (the lines no profile covers) the
+   `llvm-nm --size-sort --demangle` lists of base and head match
+   symbol for symbol up to which name the linker keeps for merged
+   identical functions (`drop_glue::<AVec<RExpr>>` vs
+   `drop_glue::<Vec<RExpr>>`) and, for `write`, three ±4 B
+   function-size moves against the outliner's functions (−6 B
+   total), all reproduced by the mechanical rename of check 1.
+No line went down from the deleted code: none of it was compiled in
+any measured line.
+
+**Gates.** `ci/local-gates.sh` (full) passes; depth_v16 / triggers_v16
+pass with debug info on (no stack constant touched).
+
+**Size Δ.** tiny 0 (76,124), full 0 (476,476), max **+8** (962,300),
+xl **+16** (1,058,824). The `[max]` / `[xl]` ratchets were set to the
+measured values. This is the unit's one deviation from its brief
+("never raise a ratchet"): the growth is the alignment padding above,
+which no edit within the unit can remove (it follows from the
+mandated names; check 1), and the size gates cannot pass without it.
+
+**Honest gaps.**
+- The max / xl ratchet raise above (+8 / +16 B of padding).
+- Feature-graph implications are tested only in the builds that run
+  the test suite (`std,xl` and the CI matrix's clippy builds compile
+  but do not run `tests/features_v17.rs`).
+- Test file names (`*_v16.rs`, `cli_v07.rs`, ...), oracle temp-file
+  tags (`"v07-upsert"`) and milestone headings keep their version
+  numbers (history, per the brief); old-milestone README sections say
+  "what is now the `sql` feature".
+
 ### Streamed rows: virtual-table cursors and row-at-a-time statements (2026-11-05)
 
 **Shipped** (`src/session/stream.rs`; the vtab cursors in
