@@ -2859,14 +2859,28 @@ impl IndexCell {
     }
 }
 
+/// Where an index cell's parts sit on its page (everything
+/// `parse_index_cell` reads from the cell, before copying it out).
 #[cfg(any(feature = "indexes", feature = "v05"))]
-fn parse_index_cell<E>(
+struct IndexCellLayout {
+    child: u32,
+    payload_len: usize,
+    local_len: usize,
+    overflow: u32,
+    /// Offset of the local payload from the cell start.
+    payload_off: usize,
+    /// Cell length on the page, before the 4-byte minimum padding.
+    total: usize,
+}
+
+#[cfg(any(feature = "indexes", feature = "v05"))]
+fn index_cell_layout<E>(
     bytes: &[u8],
     at: usize,
     usable: usize,
     page: u32,
     interior: bool,
-) -> Result<IndexCell, E> {
+) -> Result<IndexCellLayout, E> {
     let mut off = at;
     let mut child = 0u32;
     if interior {
@@ -2896,16 +2910,35 @@ fn parse_index_cell<E>(
         overflow = be_u32(bytes, end);
         total += 4;
     }
-    let mut img = AVec::with_capacity(total);
-    img.extend_from_slice(&bytes[at..at + total]);
-    pad_cell(&mut img, bytes.get(at + total..).unwrap_or(&[]));
-    Ok(IndexCell {
+    Ok(IndexCellLayout {
         child,
-        bytes: img,
         payload_len: plen,
         local_len: local,
         overflow,
         payload_off: (off - at) + n1,
+        total,
+    })
+}
+
+#[cfg(any(feature = "indexes", feature = "v05"))]
+fn parse_index_cell<E>(
+    bytes: &[u8],
+    at: usize,
+    usable: usize,
+    page: u32,
+    interior: bool,
+) -> Result<IndexCell, E> {
+    let l = index_cell_layout::<E>(bytes, at, usable, page, interior)?;
+    let mut img = AVec::with_capacity(l.total);
+    img.extend_from_slice(&bytes[at..at + l.total]);
+    pad_cell(&mut img, bytes.get(at + l.total..).unwrap_or(&[]));
+    Ok(IndexCell {
+        child: l.child,
+        bytes: img,
+        payload_len: l.payload_len,
+        local_len: l.local_len,
+        overflow: l.overflow,
+        payload_off: l.payload_off,
     })
 }
 
@@ -3619,23 +3652,47 @@ async fn cascade_index_up<S: Storage>(
     }
 }
 
-/// Binary-search a sorted cell list for the first cell above
-/// `probe`; returns `cells.len()` when none is. An equal cell is a
-/// `DuplicateRowid` error: it is never excluded from the search
-/// range, so it is always probed before the range empties.
+/// Length a cell of `total` bytes takes on its page (`pad_cell`'s
+/// 4-byte minimum).
 #[cfg(feature = "indexes")]
-async fn index_search_pos<S: Storage>(
+fn padded_cell_len(total: usize) -> usize {
+    #[cfg(feature = "without_rowid")]
+    return total.max(4);
+    #[cfg(not(feature = "without_rowid"))]
+    total
+}
+
+/// `index_search_pos` over a page image: parses only the cells the
+/// binary search visits (not all of them into owned copies). Every
+/// cell is still validated (layout only, no allocation), so a corrupt
+/// page errors as when the whole page was parsed. Returns the
+/// position and the summed on-page length of the cells.
+#[cfg(feature = "indexes")]
+async fn index_search_raw<S: Storage>(
     pager: &mut Pager<S>,
-    cells: &[IndexCell],
+    bytes: &[u8],
+    h: &PageHead,
+    page: u32,
     probe: &IndexEntry,
     nfields: usize,
     desc: &[KeyOrder],
-) -> Result<usize, S::Error> {
+) -> Result<(usize, usize), S::Error> {
     use core::cmp::Ordering;
-    let (mut lo, mut hi) = (0usize, cells.len());
+    let usable = pager.usable() as usize;
+    let interior = h.kind == KIND_INTERIOR_INDEX;
+    let n = usize::from(h.ncell);
+    let mut sum = 0usize;
+    for i in 0..n {
+        let ptr = cell_ptr::<S::Error>(bytes, h, i, page)?;
+        let l = index_cell_layout::<S::Error>(bytes, ptr, usable, page, interior)?;
+        sum += padded_cell_len(l.total);
+    }
+    let (mut lo, mut hi) = (0usize, n);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let p = index_cell_payload(pager, &cells[mid]).await?;
+        let ptr = cell_ptr::<S::Error>(bytes, h, mid, page)?;
+        let cell = parse_index_cell::<S::Error>(bytes, ptr, usable, page, interior)?;
+        let p = index_cell_payload(pager, &cell).await?;
         let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
         match compare_entries(
             probe.values.as_slice(),
@@ -3652,7 +3709,52 @@ async fn index_search_pos<S: Storage>(
             Ordering::Greater => lo = mid + 1,
         }
     }
-    Ok(lo)
+    Ok((lo, sum))
+}
+
+/// Write index leaf `page` as its image `old` with `new` inserted at
+/// `pos`: the bytes `write_index_page` would build from the parsed
+/// cells, copying each cell straight from `old`.
+#[cfg(feature = "indexes")]
+async fn write_index_leaf_inserted<S: Storage>(
+    pager: &mut Pager<S>,
+    page: u32,
+    old: &[u8],
+    pos: usize,
+    new: &IndexCell,
+    usable: usize,
+) -> Result<(), S::Error> {
+    let h = head::<S::Error>(old, page)?;
+    let n = usize::from(h.ncell);
+    let idx = pager.dirty_page(page).await?;
+    let out = pager.frame_data_mut(idx);
+    out.fill(0);
+    let mut content = out.len();
+    for j in 0..=n {
+        let ptr = if j == pos {
+            content -= new.bytes.len();
+            out[content..content + new.bytes.len()].copy_from_slice(new.bytes.as_slice());
+            content
+        } else {
+            let src = if j < pos { j } else { j - 1 };
+            let at = cell_ptr::<S::Error>(old, &h, src, page)?;
+            let l = index_cell_layout::<S::Error>(old, at, usable, page, false)?;
+            let len = padded_cell_len(l.total);
+            content -= len;
+            out[content..content + l.total].copy_from_slice(&old[at..at + l.total]);
+            for k in l.total..len {
+                out[content + k] = old.get(at + k).copied().unwrap_or(0);
+            }
+            content
+        };
+        put_be_u16(out, 8 + 2 * j, ptr as u16);
+    }
+    out[0] = KIND_LEAF_INDEX;
+    put_be_u16(out, 1, 0);
+    put_be_u16(out, 3, (n + 1) as u16);
+    put_be_u16(out, 5, content_code(content));
+    out[7] = 0;
+    Ok(())
 }
 
 /// Insert the key `payload` (a full index record) into the index
@@ -3703,7 +3805,7 @@ pub async fn index_insert_core<S: Storage>(
     // (cells' children in order, then the rightmost pointer).
     let mut path: AVec<(u32, usize)> = AVec::new();
     let mut page = root;
-    let (leaf_page, leaf_cells, leaf_pos) = loop {
+    let (leaf_page, leaf_snap, leaf_pos, leaf_sum) = loop {
         let idx = pager.load(page).await?;
         let snap = copy_bytes(pager.frame_data(idx));
         let h = head::<S::Error>(snap.as_slice(), page)?;
@@ -3711,22 +3813,23 @@ pub async fn index_insert_core<S: Storage>(
             if h.kind != KIND_LEAF_INDEX {
                 return Err(Error::Unsupported);
             }
-            let cells = index_leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
             // The leaf is sorted: the probe goes before the first cell
             // above it, and a duplicate can only be a cell the binary
             // search lands on (an equal cell is never excluded).
-            let pos = index_search_pos(pager, cells.as_slice(), &probe, nfields, desc).await?;
-            break (page, cells, pos);
+            let (pos, sum) =
+                index_search_raw(pager, snap.as_slice(), &h, page, &probe, nfields, desc).await?;
+            break (page, snap, pos, sum);
         }
         if h.kind != KIND_INTERIOR_INDEX {
             return Err(Error::Unsupported);
         }
-        let (cells, rightmost) = index_interior_cells::<S::Error>(snap.as_slice(), page, usable)?;
-        let child_idx = index_search_pos(pager, cells.as_slice(), &probe, nfields, desc).await?;
-        let child = if child_idx < cells.len() {
-            cells.as_slice()[child_idx].child
+        let (child_idx, _) =
+            index_search_raw(pager, snap.as_slice(), &h, page, &probe, nfields, desc).await?;
+        let child = if child_idx < usize::from(h.ncell) {
+            let ptr = cell_ptr::<S::Error>(snap.as_slice(), &h, child_idx, page)?;
+            be_u32(snap.as_slice(), ptr)
         } else {
-            rightmost
+            h.rightmost
         };
         path.push((page, child_idx));
         page = child;
@@ -3761,15 +3864,23 @@ pub async fn index_insert_core<S: Storage>(
     };
 
     // ---- merge into the leaf in key order ----
-    // The parsed leaf cells are not needed afterwards: reuse them.
-    let mut all = leaf_cells;
-    all.insert(leaf_pos, new_cell);
-
+    // The common case, the new cell fits: rebuild the leaf image
+    // straight from the page bytes, without parsing every cell.
+    let ncell = usize::from(head::<S::Error>(leaf_snap.as_slice(), leaf_page)?.ncell);
     let hdr_off = 0usize; // index roots are never page 1
-    if index_page_need(all.as_slice(), hdr_off, false) <= usable {
-        write_index_page(pager, leaf_page, all.as_slice(), 0, false, false).await?;
-        return Ok(());
+    if hdr_off + 8 + 2 * (ncell + 1) + leaf_sum + new_cell.bytes.len() <= usable {
+        return write_index_leaf_inserted(
+            pager,
+            leaf_page,
+            leaf_snap.as_slice(),
+            leaf_pos,
+            &new_cell,
+            usable,
+        )
+        .await;
     }
+    let mut all = index_leaf_cells::<S::Error>(leaf_snap.as_slice(), leaf_page, usable)?;
+    all.insert(leaf_pos, new_cell);
 
     // ---- the leaf overflows: balance (v0.15; no quick split
     // for index B-trees — probed: appends balance like any other
