@@ -88,3 +88,24 @@ yields). Workload output (checksum) is identical before/after.
 Size gates: tiny unchanged (`indexes` not in tiny); full 500,200 -> 500,944 B
 (+744), max 815,792 -> 816,576 B (+784); ratchets raised by those amounts
 (each well under `justify_over`).
+
+## index_insert_core parses every cell of every page on the descent (baseline at 8d78815)
+
+`index_insert_core` (every index entry written: INSERT index maintenance
+and CREATE INDEX) turns each interior page on the descent and the leaf
+into owned `IndexCell`s (`index_leaf_cells` / `index_interior_cells`: one
+heap copy per cell) although the binary search visits O(log cells) of
+them, then rebuilds the whole leaf image from those copies.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 531,491,467   |
+| 1000 | 1,221,031,532 |
+| 2000 | 2,791,295,949 |
+
+n=1000 profile: `index_insert` inclusive 552,561,282 (45.25%) of which
+`index_leaf_cells` 250,165,910 (20.49%). malloc/free (self) ~45% of all
+instructions. `valgrind --tool=dhat` (n=1000): 1,885,182 blocks,
+321,242,993 bytes total.
+
+Reproduce dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
