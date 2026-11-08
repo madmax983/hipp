@@ -160,7 +160,7 @@ fn edit_for(sql: &[u8], at: usize, new: &[u8], force_quote: bool) -> Ed {
 
 /// Apply edits (deduplicated by position) to `sql`.
 fn apply(sql: &[u8], mut eds: AVec<Ed>) -> AVec<u8> {
-    eds.as_mut_slice().sort_by_key(|e| e.at);
+    crate::arena::sort_by(eds.as_mut_slice(), &mut |a, b| a.at.cmp(&b.at));
     let mut out = AVec::new();
     let mut pos = 0usize;
     for e in eds.iter() {

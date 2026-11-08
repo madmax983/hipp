@@ -246,7 +246,10 @@ pub fn or_infos(
         }
         // The pin's code generator reads the OR clause's term list in
         // order: written branches, then the commuted copies.
-        branches.as_mut_slice().sort_by_key(|b: &OrBranch| b.n);
+        crate::arena::sort_by(
+            branches.as_mut_slice(),
+            &mut |a: &OrBranch, b: &OrBranch| a.n.cmp(&b.n),
+        );
         out.push(OrInfo { ci, branches });
     }
     out

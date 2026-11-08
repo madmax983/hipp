@@ -30,9 +30,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 507,592 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,031,072 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,142,128 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 481,240 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 968,384 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,065,180 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -165,6 +165,17 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   outer row's matches only; a LIMITed FROM subquery computed its
   result columns past the LIMIT. Without the leaf subqueries plan as
   in 0.16 (`src/session/flatten.rs`).
+- **Size pass: one shared sort** (no feature). Every sort in the engine
+  — ORDER BY, GROUP BY, compounds, windows, aggregate ORDER BY, IN
+  lists, the planner's orders, sorted writes — goes through one
+  non-generic stable merge sort over an index permutation
+  (`arena::sort_perm`) instead of a `slice::sort` copy per element
+  type and comparator: full −26,352 B, max −62,688 B, xl −76,948 B,
+  tiny unchanged, rows and tie order unchanged against the pin. Fixed
+  on the way, ungated: an fts5 `ORDER BY rank` whose bm25 score is NaN
+  (an infinite rank weight) sorts those rows as the pin's NULL —
+  first ascending, last descending — instead of leaving them in rowid
+  order.
 
 ## What v0.16 does
 
@@ -1362,7 +1373,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 507,592 B of 512 KiB, `max` 1,031,072 B of 1 MiB, `xl` 1,142,128 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 481,240 B of 512 KiB, `max` 968,384 B of 1 MiB, `xl` 1,065,180 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |

@@ -1907,7 +1907,7 @@ impl<S: Storage> Statement<'_, S> {
                     work.push((old, new));
                 }
                 if sets.is_none() {
-                    work.as_mut_slice().sort_by_key(|w| w.0);
+                    crate::arena::sort_by(work.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
                     let mut kept: AVec<Work> = AVec::new();
                     for w in work.iter() {
                         if kept.as_slice().last().is_none_or(|k| k.0 != w.0) {
@@ -2394,7 +2394,7 @@ impl<S: Storage> Statement<'_, S> {
             }
         };
         let mut sorted = rows;
-        sorted.as_mut_slice().sort_by_key(|r| r.0);
+        crate::arena::sort_by(sorted.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
         let mut ntot: AVec<i64> = t.cfg.cols.iter().map(|_| 0).collect();
         for (id, vals) in sorted.iter() {
             let sizes = Self::ft_tokens(&t.cfg, &mut tmp, *id, vals.as_slice(), false);
@@ -2628,7 +2628,7 @@ impl<S: Storage> Statement<'_, S> {
                             (id, r.iter().skip(1).cloned().collect())
                         })
                         .collect();
-                    all.as_mut_slice().sort_by_key(|r| r.0);
+                    crate::arena::sort_by(all.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
                     for r in all.into_iter() {
                         if inside(r.0) {
                             rows.push(r);
@@ -2866,8 +2866,18 @@ impl<S: Storage> Statement<'_, S> {
         if sorted {
             // The rank sorter: by the live rank, ties in rowid order.
             let desc = vt.idx_num & 4 != 0;
-            sorted_out.as_mut_slice().sort_by(|a, b| {
-                let o = a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal);
+            // A NaN rank is NULL on the pin (its sorter reads the
+            // rank as an SQL value): it sorts below every number and
+            // ties with another NaN, so the order is total (v0.17
+            // size pass: it was "equal to everything", which left
+            // the NaN rows wherever the sort algorithm put them).
+            crate::arena::sort_by(sorted_out.as_mut_slice(), &mut |a, b| {
+                let o = match (a.0.is_nan(), b.0.is_nan()) {
+                    (true, true) => core::cmp::Ordering::Equal,
+                    (true, false) => core::cmp::Ordering::Less,
+                    (false, true) => core::cmp::Ordering::Greater,
+                    (false, false) => a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal),
+                };
                 if desc { o.reverse() } else { o }
             });
             for (_, row, id) in sorted_out.into_iter() {

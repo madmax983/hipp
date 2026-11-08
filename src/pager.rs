@@ -1436,7 +1436,7 @@ impl<S: Storage> Pager<S> {
                     if self.dirty.is_empty() && w.tx_frames() {
                         self.dirty.push(1);
                     }
-                    self.dirty.sort_unstable();
+                    crate::arena::sort_by(self.dirty.as_mut_slice(), &mut |a, b| a.cmp(b));
                     self.stage = CommitStage::WalFrames { next: 0 };
                 }
             }

@@ -394,7 +394,7 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                     drive.push((wc_pos(js, ti, jq.conj.len()), ti));
                 }
             }
-            drive.as_mut_slice().sort_by_key(|d| d.0);
+            crate::arena::sort_by(drive.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
             let rlog = est_log(rsize);
             for (_, ti) in drive.iter() {
                 let mut eq = AVec::new();
@@ -1329,7 +1329,7 @@ pub fn auto_index(js: &JSrc<'_>, jq: &JQuery<'_>, i: usize, ready: u64) -> crate
             drive.push((wc_pos(js, ti, jq.conj.len()), ti));
         }
     }
-    drive.as_mut_slice().sort_by_key(|d| d.0);
+    crate::arena::sort_by(drive.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
     let mut keys: AVec<crate::xplan::AutoKey> = AVec::new();
     let mut taken: AVec<usize> = AVec::new();
     let mut bloom = true;

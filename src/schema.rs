@@ -653,7 +653,7 @@ fn place_clustered_keys(
         ));
     }
     // Later positions first, so earlier ones stay valid.
-    adds.as_mut_slice().sort_by_key(|a| a.0);
+    crate::arena::sort_by(adds.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
     while let Some((at, ix)) = adds.pop() {
         catalog.indexes.insert_at(at.min(catalog.indexes.len()), ix);
     }

@@ -127,7 +127,7 @@ pub(super) fn auto_sort(
     ai: &crate::xplan::AutoIdx,
     enc: crate::record::TextEnc,
 ) {
-    rows.sort_by(|a, b| auto_cmp(a, b, ai, enc));
+    crate::arena::sort_by(rows, &mut |a, b| auto_cmp(a, b, ai, enc));
 }
 
 /// The span of `rows` (in automatic-index order) whose key equals
@@ -1450,7 +1450,7 @@ impl<S: Storage> Connection<S> {
                         t.parent
                     }
                 };
-                ts.as_mut_slice().sort_by_key(key);
+                crate::arena::sort_by(ts.as_mut_slice(), &mut |a, b| key(a).cmp(&key(b)));
             }
             let mut tmask: AVec<u64> = AVec::new();
             for t in ts.iter() {

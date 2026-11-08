@@ -172,7 +172,7 @@ fn fold_rows(
         let cmp = |a: usize, b: usize| {
             crate::query::order_keys_cmp(keys(a), keys(b), p.order.iter().copied(), enc)
         };
-        sort_stable(&mut idx, &|a, b| cmp(a, b) != core::cmp::Ordering::Greater);
+        crate::arena::sort_idx(idx.as_mut_slice(), &mut |a, b| cmp(a, b));
         if p.unique {
             // Equal keys (under the key's collation) collapse to
             // the last one inserted.
@@ -531,7 +531,10 @@ fn percentile(
         order.push(i);
     }
     let y = |i: usize| ys.as_slice().get(i).copied().unwrap_or(0.0);
-    sort_stable(&mut order, &|a, b| y(a) <= y(b));
+    crate::arena::sort_idx(order.as_mut_slice(), &mut |a, b| {
+        y(a).partial_cmp(&y(b))
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
     let mut sorted: AVec<f64> = AVec::with_capacity(ys.len());
     for &i in order.iter() {
         sorted.push(y(i));
@@ -551,46 +554,4 @@ fn percentile(
     };
     let v2 = ys.get(i2).copied().unwrap_or(v1);
     Ok(real_value(v1 + (v2 - v1) * (ix - i1 as f64)))
-}
-
-/// A stable bottom-up merge sort of `v` under `le` ("a sorts no
-/// later than b"): one small, non-generic routine for every
-/// aggregate sort (the aggregate ORDER BY, the percentile values),
-/// instead of a `slice::sort_by` instantiation per call site.
-#[cfg(feature = "v16")]
-pub(crate) fn sort_stable(v: &mut AVec<usize>, le: &dyn Fn(usize, usize) -> bool) {
-    let n = v.len();
-    let mut src: AVec<usize> = v.clone();
-    let mut dst: AVec<usize> = v.clone();
-    let mut width = 1usize;
-    while width < n {
-        let mut lo = 0usize;
-        while lo < n {
-            let mid = lo.saturating_add(width).min(n);
-            let hi = mid.saturating_add(width).min(n);
-            let (mut i, mut j) = (lo, mid);
-            for k in lo..hi {
-                let a = src.as_slice().get(i).copied();
-                let b = src.as_slice().get(j).copied();
-                let take_left = match (a, b) {
-                    (Some(x), Some(y)) => i < mid && (j >= hi || le(x, y)),
-                    _ => i < mid,
-                };
-                let pick = if take_left {
-                    i += 1;
-                    a
-                } else {
-                    j += 1;
-                    b
-                };
-                if let (Some(slot), Some(x)) = (dst.as_mut_slice().get_mut(k), pick) {
-                    *slot = x;
-                }
-            }
-            lo = hi;
-        }
-        core::mem::swap(&mut src, &mut dst);
-        width = width.saturating_mul(2);
-    }
-    *v = src;
 }

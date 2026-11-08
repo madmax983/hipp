@@ -1634,9 +1634,9 @@ async fn dbstat_db<T: Storage>(
         trees = kept;
     }
     if a.ordered {
-        trees
-            .as_mut_slice()
-            .sort_by(|x, y| x.0.as_slice().cmp(y.0.as_slice()));
+        crate::arena::sort_by(trees.as_mut_slice(), &mut |x, y| {
+            x.0.as_slice().cmp(y.0.as_slice())
+        });
     }
     crate::vtab::dbstat_rows(pager, trees.as_slice(), label, a.agg, need).await
 }

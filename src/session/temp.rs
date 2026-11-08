@@ -413,7 +413,7 @@ pub(super) fn qual_cut(toks: &[Token], i: usize) -> Option<(usize, usize)> {
 /// `sqlite_temp_schema` / `sqlite_temp_master` token at `a`, bare
 /// or quoted, to `sqlite_schema`.
 pub(super) fn apply_cuts(src: &[u8], cuts: &mut AVec<(usize, usize)>) -> AVec<u8> {
-    cuts.as_mut_slice().sort_by_key(|c| c.0);
+    crate::arena::sort_by(cuts.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
     let mut out = AVec::new();
     let mut pos = 0usize;
     for &(a, b) in cuts.iter() {

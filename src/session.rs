@@ -10425,7 +10425,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 last.push((r, k));
             }
         }
-        last.as_mut_slice().sort_unstable();
+        crate::arena::sort_by(last.as_mut_slice(), &mut |a, b| a.cmp(b));
         let mut keep: AVec<(i64, usize)> = AVec::new();
         for (r, k) in last.iter() {
             match keep.as_mut_slice().last_mut() {
@@ -10593,7 +10593,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 padded.rowids.push(None);
                 let mut ids = self.access_rowids(root, &acc, &padded).await?;
                 if !acc.one_pass {
-                    ids.as_mut_slice().sort_unstable();
+                    crate::arena::sort_by(ids.as_mut_slice(), &mut |a, b| a.cmp(b));
                     // A WITHOUT ROWID table's two-pass write visits
                     // its rows in key order (v0.16).
                     #[cfg(feature = "without_rowid")]
@@ -11661,7 +11661,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     roots.push(*ir);
                 }
             }
-            roots.as_mut_slice().sort_unstable_by(|a, b| b.cmp(a));
+            crate::arena::sort_by(roots.as_mut_slice(), &mut |a, b| b.cmp(a));
             for r in roots.iter() {
                 let moved = crate::autovac::drop_tree(&mut self.conn.pager, *r).await?;
                 if moved != 0 {
@@ -12316,17 +12316,15 @@ impl<'c, S: Storage> Statement<'c, S> {
             );
         }
         let enc = self.conn.pager.text_enc();
-        produced.as_mut_slice().sort_by(|x, y| {
-            crate::query::order_keys_cmp(
-                x.keys.as_slice(),
-                y.keys.as_slice(),
-                qp.order_by.iter().map(|(_, o)| *o),
-                enc,
-            )
-        });
+        let perm = order_perm(produced.as_slice(), qp.order_by.as_slice(), enc);
         let mut kept_rows: AVec<AVec<OwnedValue>> = AVec::new();
         let mut kept_ids: AVec<Option<i64>> = AVec::new();
-        for p in produced.iter().skip(skip).take(take) {
+        for p in perm
+            .iter()
+            .skip(skip)
+            .take(take)
+            .filter_map(|&i| produced.as_slice().get(i))
+        {
             kept_rows.push(p.out.clone());
             kept_ids.push(p.rowid);
         }
@@ -13025,7 +13023,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         let grow = false;
         let target = streamed.0.saturating_add(streamed.1);
         let mut n = if grow { target.max(1) } else { 0 };
-        let mut produced = loop {
+        let produced = loop {
             let (p, first) = self
                 .exec_subplan_core_n(&plan, outer, cap, if grow { Some(n) } else { src_need })
                 .await?;
@@ -13075,16 +13073,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             return Ok(apply_window(rows, window));
         }
         let enc = self.conn.pager.text_enc();
-        produced.as_mut_slice().sort_by(|x, y| {
-            crate::query::order_keys_cmp(
-                x.keys.as_slice(),
-                y.keys.as_slice(),
-                plan.order_by.iter().map(|(_, o)| *o),
-                enc,
-            )
-        });
+        let perm = order_perm(produced.as_slice(), plan.order_by.as_slice(), enc);
         let mut rows: AVec<AVec<OwnedValue>> = AVec::new();
-        for p in produced.iter().skip(window.0).take(window.1) {
+        for p in perm
+            .iter()
+            .skip(window.0)
+            .take(window.1)
+            .filter_map(|&i| produced.as_slice().get(i))
+        {
             rows.push(p.out.clone());
         }
         Ok(rows)
@@ -13552,22 +13548,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             if !groups_arrive_ordered(qp.sources.as_slice()) {
                 let enc = self.conn.pager.text_enc();
-                groups.as_mut_slice().sort_by(|a, b| {
-                    for (((av, bv), c), d) in
-                        a.0.iter()
-                            .zip(b.0.iter())
-                            .zip(gcolls.iter())
-                            .zip(gdesc.iter())
-                    {
-                        let o =
-                            crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
-                        let o = if *d { o.reverse() } else { o };
-                        if o != core::cmp::Ordering::Equal {
-                            return o;
-                        }
-                    }
-                    core::cmp::Ordering::Equal
-                });
+                sort_groups(
+                    groups.as_mut_slice(),
+                    gcolls.as_slice(),
+                    gdesc.as_slice(),
+                    enc,
+                );
             }
         }
         #[cfg(feature = "window")]
@@ -13796,22 +13782,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             if !groups_arrive_ordered(plan.sources.as_slice()) {
                 let enc = self.conn.pager.text_enc();
-                groups.as_mut_slice().sort_by(|a, b| {
-                    for (((av, bv), c), d) in
-                        a.0.iter()
-                            .zip(b.0.iter())
-                            .zip(gcolls.iter())
-                            .zip(gdesc.iter())
-                    {
-                        let o =
-                            crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
-                        let o = if *d { o.reverse() } else { o };
-                        if o != core::cmp::Ordering::Equal {
-                            return o;
-                        }
-                    }
-                    core::cmp::Ordering::Equal
-                });
+                sort_groups(
+                    groups.as_mut_slice(),
+                    gcolls.as_slice(),
+                    gdesc.as_slice(),
+                    enc,
+                );
             }
         }
         #[cfg(feature = "window")]
@@ -14553,11 +14529,11 @@ fn merge_compound(
 ) -> AVec<AVec<OwnedValue>> {
     use crate::sql::CompoundOp::{Except, Intersect, Union, UnionAll};
     use core::cmp::Ordering::{Equal, Greater, Less};
-    left.as_mut_slice()
-        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key, enc));
-    right
-        .as_mut_slice()
-        .sort_by(|a, b| compound_key_cmp(a.as_slice(), b.as_slice(), key, enc));
+    let mut by_key = |a: &AVec<OwnedValue>, b: &AVec<OwnedValue>| {
+        compound_key_cmp(a.as_slice(), b.as_slice(), key, enc)
+    };
+    crate::arena::sort_by(left.as_mut_slice(), &mut by_key);
+    crate::arena::sort_by(right.as_mut_slice(), &mut by_key);
     let (l, r) = (left.as_slice(), right.as_slice());
     let mut out: AVec<AVec<OwnedValue>> = AVec::new();
     let emit = |out: &mut AVec<AVec<OwnedValue>>, row: &AVec<OwnedValue>| {
@@ -14675,8 +14651,9 @@ fn run_compound(
             }
         }
     }
-    rows.as_mut_slice()
-        .sort_by(|a, b| compound_order_cmp(a, b, order, enc));
+    crate::arena::sort_by(rows.as_mut_slice(), &mut |a, b| {
+        compound_order_cmp(a, b, order, enc)
+    });
     rows
 }
 
@@ -15171,6 +15148,33 @@ fn group_desc(
     out
 }
 
+/// Sort GROUP BY groups into key order: each term under its
+/// collation, descending where `gdesc` says (v0.17 size pass: the
+/// one comparator every grouping path shares).
+#[cfg(feature = "v04")]
+fn sort_groups(
+    groups: &mut [(AVec<OwnedValue>, AVec<RowData>)],
+    gcolls: &[crate::record::Coll],
+    gdesc: &[bool],
+    enc: crate::record::TextEnc,
+) {
+    crate::arena::sort_by(groups, &mut |a, b| {
+        for (((av, bv), c), d) in
+            a.0.iter()
+                .zip(b.0.iter())
+                .zip(gcolls.iter())
+                .zip(gdesc.iter())
+        {
+            let o = crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
+            let o = if *d { o.reverse() } else { o };
+            if o != core::cmp::Ordering::Equal {
+                return o;
+            }
+        }
+        core::cmp::Ordering::Equal
+    });
+}
+
 /// Whether a query's rows arrive in its GROUP BY order (v0.16,
 /// `expr_index`): its one source's index delivers it, and the pin
 /// then emits the groups as they arrive, skipping its group sorter.
@@ -15391,6 +15395,29 @@ struct Produced {
     rowid: Option<i64>,
 }
 
+/// The ORDER BY permutation of `produced` (stable, under the terms'
+/// directions and NULLS placement): its callers read the rows they
+/// keep through it instead of moving every row (v0.17 size pass).
+#[cfg(feature = "v04")]
+fn order_perm(
+    produced: &[Produced],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    enc: crate::record::TextEnc,
+) -> AVec<usize> {
+    crate::arena::sort_perm(
+        produced.len(),
+        &mut |a, b| match (produced.get(a), produced.get(b)) {
+            (Some(x), Some(y)) => crate::query::order_keys_cmp(
+                x.keys.as_slice(),
+                y.keys.as_slice(),
+                order_by.iter().map(|(_, o)| *o),
+                enc,
+            ),
+            _ => core::cmp::Ordering::Equal,
+        },
+    )
+}
+
 /// The synchronous nested-loop join of a query plan's sources
 /// (v0.4; RIGHT / FULL since v0.16): the main loop, then each
 /// RIGHT / FULL source's unmatched rows NULL-padded on the left
@@ -15596,21 +15623,12 @@ fn project_rows<E>(
         // SQLite's GROUP BY emits groups in key order (its sorter).
         if !groups_arrive_ordered(qp.sources.as_slice()) {
             let enc = env.text_enc();
-            groups.as_mut_slice().sort_by(|a, b| {
-                for (((av, bv), c), d) in
-                    a.0.iter()
-                        .zip(b.0.iter())
-                        .zip(gcolls.iter())
-                        .zip(gdesc.iter())
-                {
-                    let o = crate::record::compare_coll_in(&av.as_value(), &bv.as_value(), *c, enc);
-                    let o = if *d { o.reverse() } else { o };
-                    if o != core::cmp::Ordering::Equal {
-                        return o;
-                    }
-                }
-                core::cmp::Ordering::Equal
-            });
+            sort_groups(
+                groups.as_mut_slice(),
+                gcolls.as_slice(),
+                gdesc.as_slice(),
+                enc,
+            );
         }
     }
     for (_, grows) in groups.iter() {

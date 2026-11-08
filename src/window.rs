@@ -840,7 +840,7 @@ pub fn compute(
         let cmp = |a: usize, b: usize| {
             crate::query::order_keys_cmp(keys(a), keys(b), dirs.iter().copied(), enc)
         };
-        crate::agg::sort_stable(&mut perm, &|a, b| cmp(a, b) != core::cmp::Ordering::Greater);
+        crate::arena::sort_idx(perm.as_mut_slice(), &mut |a, b| cmp(a, b));
         // Partitions: runs of rows with equal partition keys.
         let mut lo = 0usize;
         while lo < n {

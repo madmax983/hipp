@@ -3417,7 +3417,7 @@ fn check_tree<'a, S: Storage>(
                 }
                 fb = j;
             }
-            heap.as_mut_slice().sort_unstable_by_key(|(a, b)| (*a, *b));
+            crate::arena::sort_by(heap.as_mut_slice(), &mut |x, y| x.cmp(y));
             let mut nfrag: i64 = 0;
             let mut prev_end = content as i64 - 1;
             // The pin pulls the heap in order and stops at an

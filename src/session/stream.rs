@@ -484,7 +484,7 @@ impl<S: Storage> Statement<'_, S> {
                     let k = s.window.0.saturating_add(s.window.1);
                     if !s.capped && out.len() >= k.saturating_mul(2).saturating_add(64) {
                         let enc = self.conn.pager.text_enc();
-                        out.as_mut_slice().sort_by(|x, y| {
+                        crate::arena::sort_by(out.as_mut_slice(), &mut |x, y| {
                             crate::query::order_keys_cmp(
                                 x.keys.as_slice(),
                                 y.keys.as_slice(),

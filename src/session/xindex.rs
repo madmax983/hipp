@@ -638,7 +638,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         if p.is_in {
             let enc = self.conn.pager.text_enc();
-            vals.as_mut_slice().sort_by(|a, b| {
+            crate::arena::sort_by(vals.as_mut_slice(), &mut |a, b| {
                 crate::record::compare_coll_in(&a.as_value(), &b.as_value(), coll, enc)
             });
             let mut d: AVec<OwnedValue> = AVec::new();

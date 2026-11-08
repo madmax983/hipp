@@ -1574,6 +1574,129 @@ The first size-pass item (ADR 0005 draft, Tier A "monomorphic evaluator") makes 
 
 **Size Δ** against the merged tree (thumbv7em, `--profile tiny`): tiny 76,960 (0); full 507,592 (0); max 1,048,996 → 1,031,072 (−17,924); xl 1,160,028 → 1,142,128 (−17,900). Against this wave before the merge: full 506,728 → 507,592 (+864, `main`'s index-insert change); max 1,048,036 → 1,031,072 (−16,964), now 17,504 B under its budget; xl 1,159,132 → 1,142,128 (−17,004). Each ratchet is its measured figure.
 
+### Size pass: one shared stable sort (2026-11-08)
+
+Stage 1 unit 1 of the ADR 0005 size pass (`size-sort`). Every sort in
+`src/` went through `slice::sort*`, which Rust instantiates in full
+(driftsort / ipnsort, 2.2–3 KB each) once per element type and
+comparator: 0 / 22,570 / 60,410 / 72,616 B in tiny / full / max / xl
+(`baseline.md`). They now share one routine.
+
+**Shipped (no feature; every profile that sorts):**
+
+- `arena::sort_idx` / `sort_perm`: one non-generic stable bottom-up
+  merge sort over an index list, driven by `&mut dyn FnMut(usize,
+  usize) -> Ordering`. Runs of 12 are insertion-sorted in place, then
+  merged pairwise between the list and one scratch `AVec` of the same
+  length. An element moves ahead of an earlier one only when
+  `cmp(later, earlier)` is `Less` — `slice::sort_by`'s rule — so for a
+  total order the output is exactly `sort_by`'s. No panics and no
+  unchecked indexing or arithmetic, whatever the comparator returns.
+- `arena::apply_perm`: the permutation applied in place by following
+  its cycles (non-generic; the caller passes a swap closure), and
+  `arena::sort_by<T>`, the thin per-type adapter (two small closures
+  per element type) the call sites use.
+- All 31 call sites (`rg '\.sort(_by|_unstable|_by_key|_unstable_by|_unstable_by_key)?\('`
+  is now empty in `src/`): ORDER BY (materialised, subquery, streamed
+  with LIMIT), GROUP BY (its three copies of the key comparator are
+  now one `session::sort_groups`), compound members and ORDER BY,
+  automatic-index rows, IN-list values, WITHOUT ROWID two-pass write
+  order, the fts5 rank sorter and rowid-ordered fts5 / R*Tree writes,
+  dbstat, ALTER / TEMP text edits, the planner's term / OR-branch /
+  auto-index key orders, the WAL commit's page list, the
+  integrity check's free-block heap, `DROP TABLE`'s auto-vacuum roots;
+  and the v16 aggregate ORDER BY / percentile and window partition
+  sorts, whose `agg::sort_stable` (a second hand-written merge sort)
+  is gone. The five unstable sorts were on fully keyed integers or
+  tuples, so the stable sort's output is the same.
+- ORDER BY over materialised rows (`finish_produced`, subquery and
+  compound-free subplans) no longer moves its rows: it sorts a
+  permutation (`session::order_perm`) and clones the LIMIT / OFFSET
+  window through it. `sort_idx` returns at once on input already in
+  order, and reverses input strictly against it.
+- `llvm-nm --demangle <elf> | rg 'core::slice::sort'` is empty for
+  full, max and xl (212 symbols in xl before).
+
+**Comparator audit.** Every comparator is a total order on the values
+the engine produces (integers, tuples, byte strings, `compare_coll_in`
+/ `order_keys_cmp` / `compound_*_cmp` / `auto_cmp` /
+`compare_entries` over values whose REALs are never NaN: the
+evaluator, `bind_f64` and the math library turn NaN into NULL) except
+one: the fts5 rank sorter compared live bm25 scores with
+`partial_cmp(..).unwrap_or(Equal)`, so a NaN score was "equal to
+everything" and its rows stayed wherever the sort algorithm left them.
+That is a silent wrong answer on a claimed path, fixed ungated.
+
+**Oracle probing (3.54.1 pin).**
+
+- A NaN bm25 is reachable: the rank option takes no exponent, but
+  `INSERT INTO ft(ft, rank) VALUES('rank', 'bm25(1000…0.0)')` with
+  10^308 written out makes a row's frequency sum +Inf when the term
+  occurs twice, and Inf/Inf is NaN (`bm25(ft, 1e308)` in a query does
+  the same). The pin's sorter reads the rank as an SQL value, where
+  NaN is NULL: `ORDER BY rank` returns those rows first (rowid order
+  among them), `ORDER BY rank DESC` last, and `rank` shows NULL.
+  hipp returned plain rowid order (1,2,3,… for the pin's 2,4,6,…). The
+  comparator now ranks NaN below every number and equal to another
+  NaN, which is total and the pin's order.
+- Ties: ORDER BY / GROUP BY / compound / window / aggregate ORDER BY
+  over 9 to 300 generated rows with few distinct keys, NULLs, the
+  three collations and mixed storage classes give the pin's rows and
+  tie order (`tests/size_v17.rs`), as before.
+
+**Tests.** Unit tests in `src/arena.rs` (empty, one element, all
+equal, reverse and sorted inputs at and around the cutoff and its
+multiples, descending comparators, owned non-`Copy` elements, index
+lists that are not `0..n`, a malformed permutation, an inconsistent
+comparator, and 400 rounds against a stable reference sort with a
+hand-rolled PRNG). `tests/size_v17.rs` (7 tests, differential vs the
+pin): the NaN rank regression, finite rank orders, ORDER BY / GROUP
+BY / compound / window / aggregate ORDER BY / percentile corpora, and
+sorted UPDATE / DELETE (rowid, WITHOUT ROWID, R*Tree, fts5) writes.
+`stream_v17`, `fts5_v16`, `fts5_delete_v17`, `json_v16`, `pragma_v16`,
+`join_order_v17`, `multi_index_v17`, `flatten_v17` and `window_v16`
+pass unchanged; `depth_v16` and `triggers_v16` pass with debug info
+on.
+
+**Gates:** `ci/local-gates.sh` (full run) passes.
+
+**Size Δ** against the ratchets before the unit (thumbv7em,
+`--profile tiny`): tiny 76,960 → 76,960 (0; the tiny profile sorts
+nothing); full 507,592 → 481,240 (−26,352); max 1,031,072 → 968,384
+(−62,688); xl 1,142,128 → 1,065,180 (−76,948). The shared sort costs
+`sort_idx` 520 B + `sort_perm` 86 B + `apply_perm` 82 B (in xl), and
+each element type's adapter about 100–150 B; the rest of the saving
+is the driftsort / ipnsort copies (and `agg::sort_stable`). The
+already-sorted / reversed pass and the ORDER BY permutation read in
+place (below) cost about 250 B of the saving, for speed. Engine
+statics stay 0 B. Each ratchet is lowered to its measured figure.
+
+**Honest gaps.**
+
+- A REAL whose stored bits are a NaN (only a hand-made or corrupt file
+  holds one; SQLite never writes it) is read as a REAL, not as NULL as
+  on the pin (`sqlite3VdbeSerialGet`), and `compare_values` calls it
+  equal to every other REAL, so it is not a total order there: such a
+  file's rows print `0.0` and sort where the algorithm leaves them, as
+  in 0.16 (where the order also depended on the sort's internals; the
+  new sort may place them differently). Fixing it sits on the tiny
+  profile's read path and is left to a unit that can pay for it.
+- Speed, measured against the tree before the unit (release CLI, a
+  200,000-row table, best of 5): a first cut was 6–20% slower in wall
+  time on the materialised ORDER BY at the same instruction count
+  (callgrind: 222.2 M vs 220.8 M Ir at 20,000 rows) — applying the
+  permutation by swapping large rows at random positions misses the
+  cache. The shipped version reads the kept rows through the ORDER BY
+  permutation (`session::order_perm`, so an ORDER BY ... LIMIT clones
+  only its window) and settles already-ordered or strictly reversed
+  input in one pass: ORDER BY a LIMIT 199990 in a subquery 0.335 →
+  0.358 s / 0.322 → 0.351 s (two runs; the worst, +7–9%), ORDER BY
+  b DESC (reversed) 0.239 → 0.240 s, ORDER BY CAST(a AS TEXT) 0.434 →
+  0.417 s / 0.398 → 0.431 s, top-level ORDER BY a 0.375 → 0.366 s,
+  ORDER BY ... LIMIT 5 0.090 → 0.094 s, GROUP BY 0.724 → 0.737 s.
+  Within noise to +9%; `docs/perf-baselines.md` workloads are gated
+  from unit 4 on.
+
 ## v0.16 — SQLite-parity push
 
 **Released as 0.16.0 (2026-11-05; `CHANGELOG.md`).** Profiles

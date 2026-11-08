@@ -5,6 +5,20 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Size: one shared stable sort
+
+- Every `sort` / `sort_by` / `sort_by_key` / `sort_unstable*` in `src/`
+  (31 call sites, plus `agg::sort_stable`) now goes through
+  `arena::sort_perm`, one non-generic stable bottom-up merge sort over
+  an index permutation, with a per-type `arena::sort_by` adapter: no
+  `core::slice::sort` code is left in any profile. full −26,352 B
+  (481,240), max −62,688 B (968,384), xl −76,948 B (1,065,180), tiny
+  unchanged; ratchets lowered. Output is unchanged for every total
+  order (`tests/size_v17.rs`).
+- Fix (ungated): the fts5 rank sorter treated a NaN bm25 score as equal
+  to every score; it now sorts as the pin's NULL (first ascending, last
+  descending, ties in rowid order).
+
 ### Size: one copy of the expression evaluator
 
 - With `window`, `query::eval` is compiled once (for `Error<()>`) instead
