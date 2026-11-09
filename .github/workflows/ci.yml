@@ -102,6 +102,32 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --no-fail-fast
 
+  test_vm:
+    # ADR 0005 Stage 2 migration: the hidden `vm` feature (in no profile)
+    # runs SELECTs on the register VM, falling back whole to today's
+    # executor for shapes it does not cover. Removed by unit vm_flip,
+    # when the VM becomes the only read path.
+    name: test --features vm (vs pinned SQLite 3.54.1 oracle)
+    needs: fmt
+    runs-on: ubuntu-24.04
+    env:
+      HIPP_ORACLE: ${{ github.workspace }}/../hipp-design/oracle/sqlite3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache the pinned oracle
+        id: oracle-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../hipp-design/oracle
+          key: sqlite-oracle-3540100-${{ runner.os }}-${{ hashFiles('ci/build-oracle.sh') }}
+      - name: Build the pinned oracle (SQLite 3.54.1, SHA3-verified)
+        run: ci/build-oracle.sh "${{ github.workspace }}/../hipp-design/oracle"
+      - name: cargo test --workspace --features vm
+        run: cargo test --workspace --no-fail-fast --features vm
+
   no_std:
     name: no_std build (${{ matrix.target }})
     needs: fmt
