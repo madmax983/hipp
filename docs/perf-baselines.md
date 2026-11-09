@@ -132,3 +132,22 @@ bytes (-37.3%).
 
 Size gates: tiny unchanged (76,960); full +872 B, max +984 B, xl +976 B;
 ratchets raised by those amounts (each well under `justify_over`).
+
+## parse_real big-integer conversion (baseline at 7cfaf1e)
+
+`bolt_workload 1000` (callgrind, release + debuginfo). The workload's
+2n INSERT statements carry `{i}.5` REAL literals; each one goes through
+`int_pow10_to_f64`'s big-integer division although the value is exactly
+representable (mantissa < 2^53, |exp10| <= 22).
+
+| n    | total Ir    | parse_real inclusive Ir |
+|------|-------------|-------------------------|
+| 1000 | 937,058,403 | 70,732,757 (7.55%)      |
+
+### After: Clinger exact fast path in `int_pow10_to_f64`
+
+| n    | total Ir    | parse_real inclusive Ir | Δ total |
+|------|-------------|-------------------------|---------|
+| 500  | 378,111,682 | n/a                     | n/a     |
+| 1000 | 866,107,908 | 1,333,026 (0.15%)       | -7.57%  |
+| 2000 | 1,993,289,422 | n/a                   | n/a     |
