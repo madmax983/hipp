@@ -179,9 +179,11 @@ impl Eph {
     }
 }
 
-/// The empty group's bare-column row: NULLs for every source.
-fn empty_rep(qp: &QueryPlan) -> RowData {
-    let mut r = RowData::empty();
+/// The empty group's bare-column row: the outer row a subquery's
+/// groups are formed under (`prefix`; none at the top level), then
+/// NULLs for every source.
+fn empty_rep(qp: &QueryPlan, prefix: &RowData) -> RowData {
+    let mut r = prefix.clone();
     for sp in qp.sources.iter() {
         for _ in 0..sp.ncols {
             r.vals.push(OwnedValue::Null);
@@ -206,10 +208,15 @@ pub(crate) struct Groups {
     cur: usize,
     /// The current group's bare-column row (`session::pick_rep_from`).
     pub(crate) rep: RowData,
+    /// The outer row of a subquery's groups (`empty_rep`).
+    prefix: RowData,
+    /// The current group's row `GroupRows` / `GroupRowNext` read.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    ri: usize,
 }
 
 impl Groups {
-    pub(crate) fn new(info: u32, qp: &QueryPlan) -> Groups {
+    pub(crate) fn new(info: u32, qp: &QueryPlan, prefix: RowData) -> Groups {
         let mut groups = AVec::new();
         if qp.group_by.is_empty() {
             groups.push((AVec::new(), AVec::new()));
@@ -226,7 +233,17 @@ impl Groups {
             at: 0,
             cur: usize::MAX,
             rep: RowData::empty(),
+            prefix,
+            ri: 0,
         }
+    }
+
+    /// The current group's row `ri` (`first`: its first row; else
+    /// the next one), or none past its last.
+    #[cfg(feature = "sql")]
+    pub(crate) fn row(&mut self, first: bool) -> Option<&RowData> {
+        self.ri = if first { 0 } else { self.ri.saturating_add(1) };
+        self.rows().get(self.ri)
     }
 
     /// Add `row` to the group its GROUP BY values `key` name.
@@ -283,7 +300,7 @@ impl Groups {
             qp.having.as_ref(),
             qp.order_by.as_slice(),
             rows.as_slice(),
-            &empty_rep(qp),
+            &empty_rep(qp, &self.prefix),
         )?;
         self.cur = self.at;
         self.at = self.at.saturating_add(1);
@@ -318,6 +335,8 @@ pub(crate) struct AggRun {
     first: Option<RowData>,
     rep: Option<RowData>,
     best: Option<OwnedValue>,
+    /// The outer row of a subquery's aggregate (`empty_rep`).
+    prefix: RowData,
 }
 
 /// Whether a query's aggregates fold row by row (`stream_build`'s
@@ -330,6 +349,7 @@ pub(crate) fn folds(qp: &QueryPlan, utf8: bool) -> bool {
         crate::query::collect_outer_aggs(it, &mut aggs);
     }
     utf8 && !qp.sources.is_empty()
+        && !qp.items.iter().any(crate::query::has_sub)
         && qp.group_by.is_empty()
         && qp.having.is_none()
         && qp.order_by.is_empty()
@@ -352,7 +372,7 @@ pub(crate) fn folds(qp: &QueryPlan, utf8: bool) -> bool {
 }
 
 impl AggRun {
-    pub(crate) fn new(qp: &QueryPlan) -> AggRun {
+    pub(crate) fn new(qp: &QueryPlan, prefix: RowData) -> AggRun {
         let mut aggs: AVec<&RExpr> = AVec::new();
         for it in qp.items.iter() {
             crate::query::collect_outer_aggs(it, &mut aggs);
@@ -372,6 +392,7 @@ impl AggRun {
             first: None,
             rep: None,
             best: None,
+            prefix,
         };
         for a in aggs.iter() {
             run.aggs.push((*a).clone());
@@ -460,7 +481,7 @@ impl AggRun {
         env: &Env,
         out: &mut [OwnedValue],
     ) -> Result<(), Error<()>> {
-        let empty = empty_rep(qp);
+        let empty = empty_rep(qp, &self.prefix);
         let rep = self.rep.as_ref().or(self.first.as_ref()).unwrap_or(&empty);
         let mut vals = AVec::new();
         for (a, st) in self.aggs.iter().zip(self.accs.iter()) {
@@ -481,5 +502,82 @@ impl AggRun {
             *slot = crate::query::eval::<()>(&e, &Ctx::group(&[], rep).with(env))?;
         }
         Ok(())
+    }
+}
+
+/// A recursive CTE's queue (`session::exec_recursive`): the pin's
+/// FIFO, or with an ORDER BY a priority queue with ties in arrival
+/// order (`session::RecQueue`, whose state this holds between
+/// opcodes), and under UNION every row that entered it, sorted, so
+/// an equal row is dropped.
+#[cfg(feature = "sql")]
+#[derive(Default)]
+pub(crate) struct Queue {
+    /// The `P4::Queue` entry it was opened with.
+    pub(crate) info: u32,
+    rows: AVec<(u64, AVec<OwnedValue>)>,
+    head: usize,
+    seq: u64,
+    seen: AVec<AVec<OwnedValue>>,
+}
+
+#[cfg(feature = "sql")]
+impl Queue {
+    pub(crate) fn new(info: u32) -> Queue {
+        Queue {
+            info,
+            ..Default::default()
+        }
+    }
+
+    /// `f` over the queue as `session::RecQueue`.
+    fn with<R>(
+        &mut self,
+        info: &super::op::QueueInfo,
+        enc: TextEnc,
+        f: impl FnOnce(&mut crate::session::RecQueue<'_>) -> R,
+    ) -> R {
+        let mut q = crate::session::RecQueue {
+            order: info.order.as_slice(),
+            enc,
+            rows: core::mem::take(&mut self.rows),
+            head: self.head,
+            seq: self.seq,
+        };
+        let r = f(&mut q);
+        self.rows = q.rows;
+        self.head = q.head;
+        self.seq = q.seq;
+        r
+    }
+
+    /// Add `row` unless UNION saw an equal one (the compound's column
+    /// collations, `exec_recursive`'s `admit`).
+    pub(crate) fn add(&mut self, info: &super::op::QueueInfo, row: &[OwnedValue], enc: TextEnc) {
+        if let Some(colls) = &info.union {
+            let at = self.seen.as_slice().binary_search_by(|r| {
+                crate::session::compound_key_cmp(r.as_slice(), row, colls.as_slice(), enc)
+            });
+            match at {
+                Ok(_) => return,
+                Err(at) => {
+                    let mut v = AVec::with_capacity(row.len());
+                    v.extend_from_slice(row);
+                    self.seen.insert_at(at, v);
+                }
+            }
+        }
+        let mut v = AVec::with_capacity(row.len());
+        v.extend_from_slice(row);
+        self.with(info, enc, |q| q.push(v));
+    }
+
+    /// The next row out.
+    pub(crate) fn pop(
+        &mut self,
+        info: &super::op::QueueInfo,
+        enc: TextEnc,
+    ) -> Option<AVec<OwnedValue>> {
+        self.with(info, enc, |q| q.pop())
     }
 }

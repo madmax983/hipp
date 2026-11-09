@@ -5,6 +5,8 @@
 
 use super::cursor::{Cursor, Sorter, TableCursor};
 use super::op::{ACC_ROWID, Code, EVAL_ACC, EVAL_COND, EVAL_CONSTS, EVAL_GROUP, P4, p4_at};
+#[cfg(feature = "sql")]
+use super::op::{EVAL_FALSE, EVAL_SUB};
 use super::rows::{AggRun, Eph, Groups};
 use super::{Exec, Program};
 use crate::arena::AVec;
@@ -30,6 +32,31 @@ pub(crate) struct Vm {
     /// The joined row so far: each source's values from its slot
     /// base, its rowid at its index (`Load` / `NullRow`).
     acc: RowData,
+    /// Each subquery node's result (`SubStart` / `SubRow`).
+    #[cfg(feature = "sql")]
+    subs: AVec<crate::query::SubValue>,
+    /// The subqueries running, innermost last: where a statement
+    /// error inside one goes (`SubStart`).
+    #[cfg(feature = "sql")]
+    traps: AVec<Trap>,
+    /// Joined rows `AccPush` saved.
+    #[cfg(feature = "sql")]
+    saved: AVec<RowData>,
+    /// Subquery-plan executions since the driver last took them
+    /// (`Connection::subquery_executions`).
+    #[cfg(feature = "sql")]
+    pub(crate) execs: usize,
+}
+
+/// A running subquery's error trap: its slot, the instruction its
+/// error continues at, and how many joined rows were saved when it
+/// started (an error between an `AccPush` and its `AccPop` restores
+/// the row).
+#[cfg(feature = "sql")]
+struct Trap {
+    slot: u32,
+    handler: u32,
+    depth: usize,
 }
 
 /// The outcome of one opcode: go on at `pc + 1`, jump, or leave the
@@ -85,6 +112,14 @@ impl Vm {
             out_rowid: None,
             empty: RowData::empty(),
             acc: RowData::empty(),
+            #[cfg(feature = "sql")]
+            subs: AVec::new(),
+            #[cfg(feature = "sql")]
+            traps: AVec::new(),
+            #[cfg(feature = "sql")]
+            saved: AVec::new(),
+            #[cfg(feature = "sql")]
+            execs: 0,
         };
         vm.reset();
         vm
@@ -106,6 +141,16 @@ impl Vm {
         self.out.clear();
         self.out_rowid = None;
         self.acc = RowData::empty();
+        #[cfg(feature = "sql")]
+        {
+            self.subs.clear();
+            for _ in 0..self.prog.nsub {
+                self.subs
+                    .push(crate::query::SubValue::One(OwnedValue::Null, None));
+            }
+            self.traps.clear();
+            self.saved.clear();
+        }
     }
 
     /// Whether the program runs on the VM (holds no `Host`).
@@ -126,7 +171,16 @@ impl Vm {
             let Some(op) = self.prog.ops.as_slice().get(self.pc).copied() else {
                 return Err(Error::Unsupported);
             };
-            match self.op(op, core, env)? {
+            let flow = match self.op(op, core, env) {
+                Ok(f) => f,
+                #[cfg(feature = "sql")]
+                Err(Error::Schema { kind }) if !self.traps.is_empty() => {
+                    self.trap(kind);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match flow {
                 Flow::Next => self.pc = self.pc.saturating_add(1),
                 Flow::Jump(to) => self.pc = to as usize,
                 Flow::Stay(e) => {
@@ -145,6 +199,27 @@ impl Vm {
             }
             self.pins.clear();
         }
+    }
+
+    /// A statement error inside the innermost running subquery: its
+    /// slot becomes the error (raised where an expression reads it,
+    /// today's `exec_sub_kind_deferred`) and the program goes on after
+    /// it, with the joined row it started with.
+    #[cfg(feature = "sql")]
+    fn trap(&mut self, kind: crate::error::SchemaKind) {
+        let Some(t) = self.traps.pop() else {
+            return;
+        };
+        while self.saved.len() > t.depth {
+            if let Some(r) = self.saved.pop() {
+                self.acc = r;
+            }
+        }
+        if let Some(s) = self.subs.as_mut_slice().get_mut(t.slot as usize) {
+            *s = crate::query::SubValue::Fail(kind);
+        }
+        self.pins.clear();
+        self.pc = t.handler as usize;
     }
 
     /// Execute one instruction. A pending I/O returns `Stay(Pending)`
@@ -272,6 +347,50 @@ impl Vm {
                 }
             }
             Code::Eval => {
+                // An expression with subquery nodes reads their slots'
+                // values first (`query::substitute`, or with its
+                // aggregates' folds `substitute_group`).
+                #[cfg(feature = "sql")]
+                let owned: Option<crate::query::RExpr> = match p4_at(&self.prog.p4, op.p4) {
+                    Some(P4::SubExpr(x)) if op.p5 & EVAL_SUB != 0 => {
+                        let mut vals = AVec::with_capacity(x.slots.len());
+                        for s in x.slots.iter() {
+                            vals.push(
+                                self.subs
+                                    .as_slice()
+                                    .get(*s as usize)
+                                    .cloned()
+                                    .ok_or(Error::Unsupported)?,
+                            );
+                        }
+                        let mut pos = 0;
+                        Some(match &x.aggs {
+                            None => crate::query::substitute(&x.e, vals.as_slice(), &mut pos),
+                            Some(regs) => {
+                                let mut av = AVec::with_capacity(regs.len());
+                                for r in regs.iter() {
+                                    av.push(reg(&self.regs, *r)?.clone());
+                                }
+                                let mut apos = 0;
+                                crate::query::substitute_group(
+                                    &x.e,
+                                    vals.as_slice(),
+                                    &mut pos,
+                                    av.as_slice(),
+                                    &mut apos,
+                                )
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+                #[cfg(feature = "sql")]
+                let e: &crate::query::RExpr = match (&owned, p4_at(&self.prog.p4, op.p4)) {
+                    (Some(e), _) => e,
+                    (None, Some(P4::Expr(e))) => e,
+                    _ => return Err(Error::Unsupported),
+                };
+                #[cfg(not(feature = "sql"))]
                 let Some(P4::Expr(e)) = p4_at(&self.prog.p4, op.p4) else {
                     return Err(Error::Unsupported);
                 };
@@ -303,8 +422,22 @@ impl Vm {
                     };
                     Ctx::of(row).with(env)
                 };
+                #[cfg(feature = "sql")]
+                if op.p5 & EVAL_SUB != 0 && op.p5 & 3 != 0 {
+                    // A condition over subquery values: the value's
+                    // truth (`cond_is_sub`'s leaf).
+                    let v = crate::query::eval::<()>(e, &ctx)?;
+                    let want = op.p5 & 3 == EVAL_COND;
+                    let t = crate::query::truthy(&v) == Some(want);
+                    *reg_mut(&mut self.regs, op.p2)? = OwnedValue::Integer(i64::from(t));
+                    return Ok(Flow::Next);
+                }
                 let v = match op.p5 & 3 {
                     EVAL_COND => OwnedValue::Integer(i64::from(crate::query::cond::<()>(e, &ctx)?)),
+                    #[cfg(feature = "sql")]
+                    EVAL_FALSE => {
+                        OwnedValue::Integer(i64::from(crate::query::cond_is::<()>(e, &ctx, false)?))
+                    }
                     EVAL_CONSTS => OwnedValue::Integer(i64::from(
                         crate::query::join_constants_hold::<()>(Some(e), &[], &ctx)?,
                     )),
@@ -598,6 +731,23 @@ fn cut(acc: &mut RowData, base: u32, src: u32) {
     }
 }
 
+/// The joined row's first `w` values and `n` rowids: the outer row a
+/// subquery's aggregates and groups are opened under.
+fn prefix_of(acc: &RowData, w: u32, n: u32) -> RowData {
+    let mut r = RowData::empty();
+    r.vals
+        .extend_from_slice(acc.vals.as_slice().get(..w as usize).unwrap_or(&[]));
+    r.rowids
+        .extend_from_slice(acc.rowids.as_slice().get(..n as usize).unwrap_or(&[]));
+    while r.vals.len() < w as usize {
+        r.vals.push(OwnedValue::Null);
+    }
+    while r.rowids.len() < n as usize {
+        r.rowids.push(None);
+    }
+    r
+}
+
 /// A flag register's truth (`p3`: 1 + the register; 0: false).
 fn flag_of(regs: &AVec<OwnedValue>, p3: u32) -> bool {
     p3.checked_sub(1)
@@ -740,12 +890,13 @@ impl Vm {
             }
             Code::AggOpen => {
                 let qp = plan(&self.prog, op.p4)?;
+                let prefix = prefix_of(&self.acc, op.p2, op.p3);
                 let slot = self
                     .curs
                     .as_mut_slice()
                     .get_mut(usize::from(op.p1))
                     .ok_or(Error::Unsupported)?;
-                *slot = Cursor::Agg(alloc::boxed::Box::new(AggRun::new(&qp)));
+                *slot = Cursor::Agg(alloc::boxed::Box::new(AggRun::new(&qp, prefix)));
                 Flow::Next
             }
             Code::AggStep => {
@@ -770,12 +921,13 @@ impl Vm {
             }
             Code::GroupOpen => {
                 let qp = plan(&self.prog, op.p4)?;
+                let prefix = prefix_of(&self.acc, op.p2, op.p3);
                 let slot = self
                     .curs
                     .as_mut_slice()
                     .get_mut(usize::from(op.p1))
                     .ok_or(Error::Unsupported)?;
-                *slot = Cursor::Groups(alloc::boxed::Box::new(Groups::new(op.p4, &qp)));
+                *slot = Cursor::Groups(alloc::boxed::Box::new(Groups::new(op.p4, &qp, prefix)));
                 Flow::Next
             }
             Code::GroupAdd => {
@@ -1051,7 +1203,319 @@ impl Vm {
                 };
                 jump_if(!skip && !crate::session::bloom_may(e.bloom.as_slice(), probe))
             }
+            #[cfg(feature = "sql")]
+            _ => return self.op_sub(op, core),
+            #[cfg(not(feature = "sql"))]
             _ => return Err(Error::Unsupported),
         })
+    }
+}
+
+/// An integer register's value (−1 for anything else: no bound).
+#[cfg(feature = "sql")]
+fn bound_of(regs: &AVec<OwnedValue>, r: u32) -> i64 {
+    match regs.as_slice().get(r as usize) {
+        Some(OwnedValue::Integer(i)) => *i,
+        _ => -1,
+    }
+}
+
+/// Register `p` (1 + the register; 0: none) as a row count bound:
+/// `None` for no bound (absent or negative).
+#[cfg(feature = "sql")]
+fn opt_bound(regs: &AVec<OwnedValue>, p: u32) -> Option<i64> {
+    let r = p.checked_sub(1)?;
+    let v = bound_of(regs, r);
+    (v >= 0).then_some(v)
+}
+
+#[cfg(feature = "sql")]
+impl Vm {
+    /// The opcodes of unit `vm_subqueries`: subquery slots and traps,
+    /// the saved joined rows, aggregates over a group's rows, shared
+    /// and growing row lists, compounds and the recursive queue.
+    fn op_sub(&mut self, op: super::op::Op, core: &mut PagerCore<'_>) -> Result<Flow, Error<()>> {
+        use super::op::SubKind;
+        use crate::query::SubValue;
+        let jump_if = |b: bool| if b { Flow::Jump(op.p2) } else { Flow::Next };
+        let enc = core.text_enc();
+        Ok(match op.code {
+            Code::AccGroup => {
+                self.acc = groups(&mut self.curs, op.p1)?.rep.clone();
+                Flow::Next
+            }
+            Code::AccPush => {
+                self.saved.push(self.acc.clone());
+                Flow::Next
+            }
+            Code::AccPop => {
+                self.acc = self.saved.pop().ok_or(Error::Unsupported)?;
+                Flow::Next
+            }
+            Code::GroupRows | Code::GroupRowNext => {
+                let first = op.code == Code::GroupRows;
+                let row = groups(&mut self.curs, op.p1)?.row(first).cloned();
+                let got = row.is_some();
+                if let Some(r) = row {
+                    self.acc = r;
+                }
+                jump_if(got != first)
+            }
+            Code::SubStart => {
+                let Some(P4::Sub(info)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let v = match info.kind {
+                    SubKind::Scalar => SubValue::One(OwnedValue::Null, info.aff),
+                    SubKind::Exists => SubValue::One(OwnedValue::Integer(0), None),
+                    SubKind::In => SubValue::Many(AVec::new(), info.aff),
+                };
+                *self
+                    .subs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)? = v;
+                self.traps.push(Trap {
+                    slot: u32::from(op.p1),
+                    handler: op.p2,
+                    depth: self.saved.len(),
+                });
+                Flow::Next
+            }
+            Code::SubRow => {
+                let Some(P4::Sub(info)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let vals = regs_at(&self.regs, op.p2, op.p3 as usize)?;
+                let slot = self
+                    .subs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)?;
+                match info.kind {
+                    SubKind::Scalar => {
+                        let v = vals.get(info.col).cloned().unwrap_or(OwnedValue::Null);
+                        *slot = SubValue::One(v, info.aff);
+                    }
+                    SubKind::Exists => *slot = SubValue::One(OwnedValue::Integer(1), None),
+                    SubKind::In => {
+                        if let SubValue::Many(vs, _) = slot {
+                            vs.extend_from_slice(vals);
+                        }
+                    }
+                }
+                Flow::Next
+            }
+            Code::SubEnd => {
+                self.traps.pop();
+                Flow::Next
+            }
+            Code::Count => {
+                self.execs = self.execs.saturating_add(1);
+                Flow::Next
+            }
+            Code::EphPut => {
+                let mut row = AVec::with_capacity(op.p3 as usize);
+                row.extend_from_slice(regs_at(&self.regs, op.p2, op.p3 as usize)?);
+                eph(&mut self.curs, op.p1)?.push(row, None, false);
+                Flow::Next
+            }
+            Code::EphRow => {
+                let mut vals = AVec::new();
+                if let Some(r) = eph(&mut self.curs, op.p1)?.cur() {
+                    vals.extend_from_slice(r.0.as_slice());
+                }
+                for j in 0..op.p3 {
+                    let v = vals
+                        .as_slice()
+                        .get(j as usize)
+                        .cloned()
+                        .unwrap_or(OwnedValue::Null);
+                    *reg_mut(&mut self.regs, op.p2.saturating_add(j))? = v;
+                }
+                Flow::Next
+            }
+            Code::EphCopy => {
+                let mut rows = AVec::new();
+                for (v, r) in eph(&mut self.curs, op.p2 as u16)?.rows.iter() {
+                    rows.push((v.clone(), *r));
+                }
+                let e = eph(&mut self.curs, op.p1)?;
+                e.clear();
+                for (v, r) in rows {
+                    e.push(v, r, false);
+                }
+                Flow::Next
+            }
+            Code::EphSeek => {
+                let at = usize::try_from(bound_of(&self.regs, op.p3)).unwrap_or(0);
+                let e = eph(&mut self.curs, op.p1)?;
+                e.end = e.rows.len();
+                e.at = at;
+                jump_if(e.at >= e.end)
+            }
+            Code::Grow => {
+                let n = bound_of(&self.regs, op.p3);
+                let len = eph(&mut self.curs, op.p1)?.rows.len();
+                let len = i64::try_from(len).unwrap_or(i64::MAX);
+                if n >= 0 && len >= n {
+                    *reg_mut(&mut self.regs, op.p4)? = OwnedValue::Integer(len);
+                    *reg_mut(&mut self.regs, op.p3)? = OwnedValue::Integer(n.saturating_mul(2));
+                    Flow::Next
+                } else {
+                    Flow::Jump(op.p2)
+                }
+            }
+            Code::MatTest => {
+                let need = bound_of(&self.regs, op.p3);
+                let built = crate::query::truthy(reg(&self.regs, op.p4)?) == Some(true);
+                let complete =
+                    crate::query::truthy(reg(&self.regs, op.p4.saturating_add(1))?) == Some(true);
+                let len = match self.curs.as_slice().get(usize::from(op.p1)) {
+                    Some(Cursor::Eph(e)) => e.rows.len(),
+                    _ => 0,
+                };
+                let len = i64::try_from(len).unwrap_or(i64::MAX);
+                jump_if(built && (complete || (need >= 0 && len >= need)))
+            }
+            Code::MatDone => {
+                let ask = bound_of(&self.regs, op.p3);
+                let len = eph(&mut self.curs, op.p1)?.rows.len();
+                let len = i64::try_from(len).unwrap_or(i64::MAX);
+                *reg_mut(&mut self.regs, op.p4)? = OwnedValue::Integer(1);
+                *reg_mut(&mut self.regs, op.p4.saturating_add(1))? =
+                    OwnedValue::Integer(i64::from(ask < 0 || len < ask));
+                Flow::Next
+            }
+            Code::Need => {
+                let take = opt_bound(&self.regs, op.p2);
+                let off = opt_bound(&self.regs, op.p3).unwrap_or(0);
+                let take = match (take, opt_bound(&self.regs, op.p4)) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                let v = take.map_or(-1, |t| off.saturating_add(t));
+                *reg_mut(&mut self.regs, u32::from(op.p1))? = OwnedValue::Integer(v);
+                Flow::Next
+            }
+            Code::AggFold => {
+                let Some(P4::Expr(a)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let p = crate::query::agg_parts(a).ok_or(Error::Unsupported)?;
+                let mut rows = AVec::new();
+                for (v, _) in eph(&mut self.curs, op.p1)?.rows.iter() {
+                    rows.push(v.clone());
+                }
+                let v = crate::agg::fold::<()>(&p, rows, enc)?;
+                *reg_mut(&mut self.regs, op.p2)? = v;
+                Flow::Next
+            }
+            Code::Compound => {
+                let Some(P4::Comp(c)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let rows_of = |curs: &mut AVec<Cursor>, k: u32| -> Result<_, Error<()>> {
+                    let mut out: AVec<AVec<OwnedValue>> = AVec::new();
+                    let c =
+                        u16::try_from(op.p2.saturating_add(k)).map_err(|_| Error::Unsupported)?;
+                    for (v, _) in eph(curs, c)?.rows.iter() {
+                        out.push(v.clone());
+                    }
+                    Ok(out)
+                };
+                let head = rows_of(&mut self.curs, 0)?;
+                let mut tails = AVec::new();
+                for (k, o) in c.ops.iter().enumerate() {
+                    tails.push((*o, rows_of(&mut self.curs, (k as u32).saturating_add(1))?));
+                }
+                let rows = if c.first_row {
+                    crate::session::first_core_row(head, tails.as_slice())
+                } else {
+                    crate::session::run_compound(
+                        head,
+                        tails.as_slice(),
+                        c.cores.as_slice(),
+                        c.order.as_slice(),
+                        enc,
+                    )
+                };
+                let e = eph(&mut self.curs, op.p1)?;
+                e.clear();
+                for r in rows {
+                    e.push(r, None, false);
+                }
+                Flow::Next
+            }
+            Code::QueueOpen => {
+                let slot = self
+                    .curs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)?;
+                *slot = Cursor::Queue(alloc::boxed::Box::new(super::rows::Queue::new(op.p4)));
+                Flow::Next
+            }
+            Code::QueueAdd | Code::QueuePop => {
+                let q = match self.curs.as_mut_slice().get_mut(usize::from(op.p1)) {
+                    Some(Cursor::Queue(q)) => q,
+                    _ => return Err(Error::Unsupported),
+                };
+                let Some(P4::Queue(info)) = p4_at(&self.prog.p4, q.info) else {
+                    return Err(Error::Unsupported);
+                };
+                if op.code == Code::QueueAdd {
+                    let vals = regs_at(&self.regs, op.p2, op.p3 as usize)?;
+                    q.add(info, vals, enc);
+                    Flow::Next
+                } else {
+                    match q.pop(info, enc) {
+                        None => Flow::Jump(op.p2),
+                        Some(row) => {
+                            let e = eph(&mut self.curs, op.p3 as u16)?;
+                            e.clear();
+                            e.push(row, None, false);
+                            e.rewind(false);
+                            Flow::Next
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "expr_index")]
+            Code::ProbeSub => {
+                let Some(P4::Probe(p)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let mut vals: AVec<OwnedValue> = AVec::new();
+                let raw: &[OwnedValue] = match self.subs.as_slice().get(op.p3 as usize) {
+                    Some(SubValue::Many(vs, _)) => vs.as_slice(),
+                    Some(SubValue::One(v, _)) => core::slice::from_ref(v),
+                    Some(SubValue::Fail(kind)) => return Err(Error::Schema { kind: *kind }),
+                    None => return Err(Error::Unsupported),
+                };
+                for v in raw.iter() {
+                    let v = crate::query::probe_value(v.clone(), p.aff);
+                    if !matches!(v, OwnedValue::Null) {
+                        vals.push(v);
+                    }
+                }
+                let list = super::index::probe_list(p, vals.as_slice(), enc);
+                let e = eph(&mut self.curs, op.p1)?;
+                e.clear();
+                for v in list {
+                    let mut row = AVec::with_capacity(1);
+                    row.push(v);
+                    e.push(row, None, false);
+                }
+                e.rewind(false);
+                jump_if(e.rows.is_empty())
+            }
+            _ => return Err(Error::Unsupported),
+        })
+    }
+
+    /// Subquery-plan executions counted since the last call.
+    pub(crate) fn take_execs(&mut self) -> usize {
+        core::mem::take(&mut self.execs)
     }
 }

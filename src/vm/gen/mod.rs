@@ -7,3 +7,5 @@
 pub(crate) mod expr;
 pub(crate) mod join;
 pub(crate) mod select;
+#[cfg(feature = "sql")]
+pub(crate) mod sub;

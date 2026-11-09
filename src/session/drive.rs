@@ -106,6 +106,12 @@ impl<S: Storage> Statement<'_, S> {
                 let mut core = self.conn.pager.vm_core();
                 vm.run(&mut core, &self.conn.env)
             };
+            // Subquery-plan executions, counted as today's executor
+            // counts them (`subquery_executions`).
+            #[cfg(feature = "sql")]
+            {
+                self.conn.sub_execs = self.conn.sub_execs.saturating_add(vm.take_execs());
+            }
             match r {
                 Ok(Exec::Row) => {
                     self.current_rowid = vm.take_row(&mut self.current);

@@ -67,6 +67,9 @@ pub(crate) struct Program {
     pub(crate) p4: crate::arena::AVec<op::P4>,
     pub(crate) nreg: usize,
     pub(crate) ncur: usize,
+    /// Subquery result slots (`Code::SubStart`).
+    #[cfg(feature = "sql")]
+    pub(crate) nsub: usize,
 }
 
 impl Program {
@@ -80,6 +83,8 @@ impl Program {
             p4: crate::arena::AVec::new(),
             nreg: 0,
             ncur: 0,
+            #[cfg(feature = "sql")]
+            nsub: 0,
         }
     }
 

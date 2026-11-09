@@ -575,14 +575,11 @@ fn parameters_compile_per_execution() {
 /// (`VmFallback`), and without it they run on today's executor with
 /// the pin's rows. (Joins, aggregates, DISTINCT, index access and
 /// rowid IN lists moved to `tests/vm_joins_v17.rs` with unit
-/// `vm_joins`, as did an EXISTS term the planner makes a semi-join.)
+/// `vm_joins`, as did an EXISTS term the planner makes a semi-join;
+/// subqueries, compounds, VALUES, FROM subqueries and recursive CTEs to
+/// `tests/vm_subqueries_v17.rs` with unit `vm_subqueries`.)
 const UNCLAIMED: &[&str] = &[
-    "SELECT a FROM t WHERE a IN (SELECT k FROM u);",
-    "SELECT (SELECT max(k) FROM u), a FROM t;",
-    "SELECT a FROM t UNION SELECT k FROM u;",
-    "VALUES (1), (2);",
-    "SELECT * FROM (SELECT a FROM t ORDER BY b LIMIT 3) WHERE a > 2;",
-    "WITH RECURSIVE w(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM w WHERE n < 3) SELECT * FROM w;",
+    "SELECT a, (SELECT sum(t.a) FROM u) FROM t GROUP BY a;",
     "SELECT a, row_number() OVER (ORDER BY a) FROM t;",
     "SELECT name FROM sqlite_schema;",
     "SELECT * FROM wr;",

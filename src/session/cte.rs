@@ -1873,13 +1873,13 @@ impl<S: Storage> Connection<S> {
 
 /// The recursive CTE queue (see the module docs): FIFO, or — with
 /// an ORDER BY — a binary heap on (ORDER BY key, arrival).
-struct RecQueue<'o> {
-    order: &'o [(usize, crate::sql::SortOrder)],
+pub(crate) struct RecQueue<'o> {
+    pub(crate) order: &'o [(usize, crate::sql::SortOrder)],
     /// The database's text encoding (its BINARY order).
-    enc: crate::record::TextEnc,
-    rows: AVec<(u64, AVec<OwnedValue>)>,
-    head: usize,
-    seq: u64,
+    pub(crate) enc: crate::record::TextEnc,
+    pub(crate) rows: AVec<(u64, AVec<OwnedValue>)>,
+    pub(crate) head: usize,
+    pub(crate) seq: u64,
 }
 
 impl RecQueue<'_> {
@@ -1893,7 +1893,7 @@ impl RecQueue<'_> {
         }
     }
 
-    fn push(&mut self, row: AVec<OwnedValue>) {
+    pub(crate) fn push(&mut self, row: AVec<OwnedValue>) {
         self.seq = self.seq.wrapping_add(1);
         self.rows.push((self.seq, row));
         if self.order.is_empty() {
@@ -1910,7 +1910,7 @@ impl RecQueue<'_> {
         }
     }
 
-    fn pop(&mut self) -> Option<AVec<OwnedValue>> {
+    pub(crate) fn pop(&mut self) -> Option<AVec<OwnedValue>> {
         if self.order.is_empty() {
             let r = self.rows.as_mut_slice().get_mut(self.head)?;
             let row = core::mem::take(&mut r.1);

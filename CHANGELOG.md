@@ -5,6 +5,23 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: subqueries, compounds, CTEs (ADR 0005 Stage 2, unit `vm_subqueries`)
+
+- Under the hidden feature `vm`, the VM now runs scalar, IN and
+  EXISTS subqueries (correlated and uncorrelated; in result columns,
+  WHERE, ON, ORDER BY, HAVING, LIMIT / OFFSET, index probes and
+  aggregate arguments), FROM subqueries, views and CTEs the flattener
+  leaves, UNION / UNION ALL / INTERSECT / EXCEPT and VALUES, and
+  recursive CTEs, as inline code in one program: today's evaluation
+  order and laziness, an uncorrelated subquery once per statement, a
+  failing subquery's error raised only where its value is read, and
+  `Connection::subquery_executions` counting as today.
+- On the VM a UNION ALL chain streams its rows (those before a failing
+  row are returned, a LIMIT stops it, OFFSET rows are not computed),
+  as the pin does; today's executor materialises compounds. Still no
+  profile
+  enables `vm`: every profile's size is unchanged.
+
 ### The bytecode VM: joins, index access, aggregates (ADR 0005 Stage 2, unit `vm_joins`)
 
 - Under the hidden feature `vm`, the VM now runs SELECTs over any

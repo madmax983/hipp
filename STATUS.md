@@ -11,6 +11,194 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_subqueries (2026-11-09)
+
+The third of Stage 2's five units, built on `vm_core` / `vm_joins`
+(their `src/vm/` design unchanged: the restart rule, the `Eval`
+opcode, the driver). Still behind the hidden feature `vm`, which no
+profile enables; under `vm` a SELECT the code generator does not
+cover runs whole on today's executor.
+
+**Shipped** (`src/vm/gen/sub.rs`, and `gen/join.rs` generalized: one
+core generator for the statement and for every subquery core, over a
+shared builder, with the joined row's slots and sources before the
+core's own, a sink and the reader's bound):
+- **Subquery nodes** (scalar, IN, EXISTS; correlated or not; in
+  result columns, WHERE, ON, ORDER BY, GROUP BY, HAVING, LIMIT /
+  OFFSET, index probes including `x IN (SELECT ...)` probe sets, and
+  MULTI-INDEX OR branch conditions): inline code where today's
+  executor computes them — every node of a value in `collect_subs`
+  order (`eval_row_sub`); a condition's AND / OR / NOT one operand at
+  a time, a subquery-free operand first (`cond_is_sub`); a WHERE
+  clause's correlated terms after the others (`where_row_sub`). The
+  node's own sources are loops appended to the joined row after every
+  slot of the query around it; its rows go to its result slot
+  (`SubRow`: a scalar's first row, EXISTS's first row, an IN set), and
+  the `Eval` that follows substitutes the slots (`query::substitute`).
+  An uncorrelated node runs once per execution (`Once`, keyed by plan
+  id and result column as today's `hoist` cache; every copy reads one
+  slot). A statement error inside a node becomes its value
+  (`SubStart`'s trap, today's `SubValue::Fail`), raised only where an
+  expression reads it.
+- **Groups**: a subquery in a group's expression runs over the group's
+  bare-column row (`AccGroup`, `eval_group_sub`); one inside an
+  aggregate's arguments runs for each row of the group, the FILTER
+  and inputs per row, the fold substituted (`GroupRows` / `AggFold`,
+  `query::substitute_group`); a subquery's own groups and its empty
+  group carry the outer row (`GroupOpen` / `AggOpen` take the joined
+  row's prefix).
+- **FROM subqueries, views, CTEs** the flattener leaves: a row list
+  the subquery's code fills the first time the loop opens, the joined
+  row saved around the fill (`AccPush` / `AccPop`: a FROM subquery's
+  slots start where its reader's do); RIGHT / FULL ones too; a shared
+  materialization (`SubPlan::mat`) computed by its first reader and
+  copied by the others (`MatTest` / `MatDone` / `EphCopy`, a bounded
+  recursive one again when a reader needs more); a first one the
+  reader reads in order under `derived_need`'s bound (`Need`), and an
+  endless recursive one read through a WHERE or a join under a
+  growing bound that doubles when the loop has read every row
+  (`Grow` / `EphSeek`, the streamed executor's `Stream::grow`).
+- **Compounds and VALUES**: a UNION ALL chain without ORDER BY streams
+  its cores in order under the compound's LIMIT / OFFSET; every other
+  compound computes each core into a row list and combines them with
+  today's `run_compound` / `first_core_row` (`Compound`). VALUES
+  cores are their rows.
+- **Recursive CTEs** (`exec_recursive`): LIMIT / OFFSET first, the
+  setup's rows into the queue (`QueueOpen` / `QueueAdd`: today's
+  `RecQueue`, FIFO or by the ORDER BY with ties in arrival order;
+  UNION drops rows seen before under the compound's collations), then
+  each row out (`QueuePop`) output unless the OFFSET skips it, the
+  LIMIT or the reader's bound ending everything, and fed to every
+  recursive step as the recursive reference's one row.
+- **Opcodes (23 more: 22 under `sql`, `ProbeSub` with `expr_index`):** AccGroup, AccPush, AccPop,
+  GroupRows, GroupRowNext, SubStart, SubRow, SubEnd, Count, EphPut,
+  EphRow, EphCopy, EphSeek, Grow, MatTest, MatDone, Need, AggFold,
+  Compound, QueueOpen, QueueAdd, QueuePop, ProbeSub; the `Eval` modes `EVAL_SUB` (substitute the slots
+  first) and `EVAL_FALSE` (a NOT's operand). The ADR's InitCoroutine /
+  Yield / EndCoroutine and BeginSubrtn / Gosub / Return are not
+  built: a node's code is inline at each use, and a FROM subquery is
+  materialized (a coroutine would need a second joined row); see the
+  ADR 0005 amendment.
+- **Eval decision** unchanged (rule 5): substitution and evaluation
+  stay `query::substitute` / `query::eval`, so evaluation order,
+  laziness, affinity (a subquery result's comparison affinity) and
+  collation are today's.
+- `Connection::subquery_executions` counts on the VM as today
+  (`Count`, drained by the driver).
+
+**Falls back** (whole statements): subquery plans nested more than
+32 deep (code generation recurses with them; today's executor and its
+depth limits take those, e.g. the CLI's 1,000-view chain); a query's
+own aggregate inside a
+subquery of its group (`has_owned_sub_agg`, today's
+`subst_owned_aggs`: the subquery's plan would need the fold
+substituted at run time); a grouped query whose bare-column row a
+min() / max() with a subquery in its argument picks
+(`extremum_rep`); windows, virtual and table-valued sources
+(`json_each`, `generate_series`, ...), WITHOUT ROWID, TEMP and
+attached tables, `sqlite_schema`, trigger and FK action programs.
+
+**Oracle probing** (the pin, live, before implementing):
+- An uncorrelated subquery's value is fixed for the statement
+  (`count(DISTINCT x) FROM (SELECT (SELECT random()) x FROM t)` is 1),
+  each node its own (`(SELECT random()) = (SELECT random())` is 0); a
+  correlated one runs per row.
+- NULL IN semantics: `NULL IN (empty)` is 0 and `NULL NOT IN (empty)`
+  1; `a NOT IN (SELECT k ...)` with a NULL k is NULL for every a not
+  found.
+- A scalar subquery with several rows gives its first (after its
+  ORDER BY); `(SELECT 2 UNION SELECT 1)` is 2 (the UNION-with-LIMIT-1
+  shortcut), `(SELECT 2 UNION ALL SELECT 1)` 2.
+- A failing subquery fails the row that reads it, after the rows
+  before (`SELECT a, (SELECT abs(-9223372036854775808) WHERE a = 3)
+  FROM t`: two rows, then the error); one not read never fails
+  (`coalesce(a, (SELECT ...))` fails only on the NULL row).
+- A UNION ALL chain streams: `SELECT a FROM t UNION ALL SELECT
+  abs(-9223372036854775808)` returns t's rows before the error; under a
+  reader's LIMIT a FROM compound stops (`SELECT x FROM (... UNION ALL
+  SELECT abs(...)) LIMIT 2` answers); OFFSET rows of a compound are
+  not computed (`SELECT 1 UNION ALL SELECT abs(...) UNION ALL SELECT 3
+  LIMIT 1 OFFSET 2` is 3). Today's executor materialises compounds
+  (no row, then the error, in all three); the VM gives the pin's.
+- Recursive CTEs: FIFO queue order, an ORDER BY's priority queue,
+  UNION dropping rows seen before, LIMIT stopping an endless one, also
+  through a WHERE (`... WHERE x % 3 = 0 LIMIT 3`).
+- Where the pin and today's executor differ and the VM keeps today's:
+  EXISTS ignores its result columns on the pin (`EXISTS (SELECT
+  abs(-9223372036854775808) FROM u ...)` does not fail), today's
+  executor and the VM compute the first row's; `t LEFT JOIN (compound)
+  ON 0` never computes the compound on the pin, today and the VM do at
+  the loop's first open; `FROM e, (compound that fails)` with e empty
+  fails on the pin, today and the VM never reach the compound.
+
+**Tests.** `tests/vm_subqueries_v17.rs` (built only with `--features
+vm`; strict, asserting `runs_on_vm`, rows in order vs the pin): 42
+subquery queries (scalar / IN / NOT IN / EXISTS, correlated, nested,
+NULL IN, row values, ORDER BY / HAVING / GROUP BY / ON / LIMIT
+subqueries, aggregate arguments, index probes), 15 FROM-subquery /
+view / CTE queries (shared materializations, MATERIALIZED, RIGHT JOIN
+of one, LIMIT under the reader), 16 compounds (every operator,
+collations, VALUES, the LIMIT-1 shortcut), 8 recursive CTEs (LIMIT /
+OFFSET, UNION, ORDER BY queue, correlated, in a scalar subquery), 12
+failing statements (rows before the error, deferred subquery errors,
+compound OFFSET), a 2,000-row file at 512-byte pages; the whole corpus
+again with a one-frame and a two-frame cache (restart rule inside
+subquery code, FROM-subquery fills and recursive steps);
+subquery-execution counts equal to today's executor's for 19 queries;
+480 generated queries (xorshift: nested / correlated scalar, EXISTS,
+IN / NOT IN over subqueries, compounds and VALUES, FROM subqueries,
+CTEs, grouped queries with subqueries in aggregate arguments,
+compounds, recursive CTEs with LIMIT) that all run on the VM and give
+today's executor's rows, order and success exactly, or the pin's
+where today's does not (1,800 at `HIPP_VMS_SEEDS=150`: all equal to
+today's). `tests/vm_v17.rs`' fallback list loses the shapes this unit
+claims (and gains the owned-aggregate one). `cargo test --workspace
+--no-fail-fast --features vm` passes, as do `depth_v16` /
+`triggers_v16` with debug info with and without `vm`.
+
+**Gates.** `ci/local-gates.sh` (full) ends with "all gates passed";
+clippy `-D warnings` on the `query,vm`, `sql,vm`, `sql,indexes,vm`,
+`sql,indexes,expr_index,vm` and `sql,indexes,expr_index,planner,vm`
+lines and `--all-features`.
+
+**Size Δ** (thumbv7em, `--profile tiny`, `.text + .rodata`): tiny 0
+(76,124), full 0 (476,476), max 0 (962,300), xl 0 (1,058,824) — the
+shared-code changes are visibility (`pub(crate)` on `RecQueue` and its
+fields and methods, `core_colls`, `compound_col_coll`,
+`compound_key_cmp`, `run_compound`, `first_core_row`,
+`union_first_row`, `streams_first`) and `cfg(vm)` code
+(`QueryPlan::of_sub`). For information: `query,vm` 209,974 B (+664
+over `vm_joins`' review fixes), `sql,vm` 454,808 B (+13,416),
+`sql,indexes,vm` 507,172 B (+13,648),
+`sql,indexes,expr_index,planner,vm` 634,544 B (+15,672).
+
+**Honest gaps.**
+- The two fallbacks above (a query's own aggregate inside a subquery
+  of its group; a min() / max() bare-column row picked over a
+  subquery argument).
+- Inside a subquery, a growing first FROM subquery (an endless
+  recursive CTE read through a WHERE under a LIMIT) is grown in place
+  as the streamed top level does; today's subquery executor re-runs
+  the whole core with each doubled bound, so a subquery nested in that
+  core can run fewer times on the VM than today (rows are the same).
+- Inside a subquery, a FROM subquery is computed when its loop first
+  opens (as at the top level), and HAVING terms the pin moves into the
+  WHERE clause are tested per row (as `vm_joins` does at the top
+  level); today's subquery executor computes every source before
+  joining and tests those terms per group, so an error that a WHERE 0
+  or an empty first source keeps the pin from reaching surfaces today
+  and not on the VM (`SELECT (SELECT 1 FROM (SELECT
+  abs(-9223372036854775808) UNION SELECT 1) WHERE 0)` is NULL on the pin
+  and the VM, an error today). Strict-mode differences are toward the
+  pin only.
+- The three pin divergences above are today's and stay until
+  `vm_flip` (EXISTS result columns, a never-matching LEFT JOIN's FROM
+  compound, an empty first source).
+- A subquery node's code is repeated at each use (an ORDER BY alias
+  of a result column holding one, a multi-column scalar subquery's
+  parts): program size, not behaviour (an uncorrelated one still runs
+  once, sharing its slot).
+
 ### VM (ADR 0005 Stage 2): vm_joins (2026-11-09)
 
 The second of Stage 2's five units, built on `vm_core`'s `src/vm/`

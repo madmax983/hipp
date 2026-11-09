@@ -28,6 +28,28 @@ pub(crate) struct Builder {
     /// The constant loads of the `Init` prologue.
     consts: AVec<Op>,
     bad: bool,
+    /// Subquery result slots (`Code::SubStart`).
+    #[cfg(feature = "sql")]
+    nsub: u32,
+    /// The program's uncorrelated subquery nodes, by (plan id, result
+    /// column): their slot and "computed" register, so every copy of
+    /// a node reads one result per execution (today's `hoist` cache).
+    #[cfg(feature = "sql")]
+    pub(crate) hoisted: AVec<((usize, usize), u32, u32)>,
+    /// The shared materializations (`SubPlan::mat`): their row list
+    /// and flag registers (built, complete).
+    #[cfg(feature = "sql")]
+    pub(crate) mats: AVec<(u32, u32, u32)>,
+    /// The recursive CTEs being generated: each one's id and the row
+    /// list holding the row its queue last gave up.
+    #[cfg(feature = "sql")]
+    pub(crate) recs: AVec<(u32, u32)>,
+    /// How deeply the subquery plans being generated nest (`sub::
+    /// subplan`): code generation recurses with them, so a deeper
+    /// statement runs on today's executor, whose depth limits bound
+    /// its stack.
+    #[cfg(feature = "sql")]
+    pub(crate) depth: u32,
 }
 
 impl Builder {
@@ -45,7 +67,40 @@ impl Builder {
             fixups3: AVec::new(),
             consts: AVec::new(),
             bad: false,
+            #[cfg(feature = "sql")]
+            nsub: 0,
+            #[cfg(feature = "sql")]
+            hoisted: AVec::new(),
+            #[cfg(feature = "sql")]
+            mats: AVec::new(),
+            #[cfg(feature = "sql")]
+            recs: AVec::new(),
+            #[cfg(feature = "sql")]
+            depth: 0,
         }
+    }
+
+    /// Mark the program as one the generator does not cover: `finish`
+    /// declines it, and the statement runs on today's executor whole.
+    #[cfg(feature = "sql")]
+    pub(crate) fn fail(&mut self) {
+        self.bad = true;
+    }
+
+    /// Whether the program was marked as not covered.
+    pub(crate) fn failed(&self) -> bool {
+        self.bad
+    }
+
+    /// A fresh subquery result slot.
+    #[cfg(feature = "sql")]
+    pub(crate) fn slot(&mut self) -> u32 {
+        let s = self.nsub;
+        match self.nsub.checked_add(1) {
+            Some(x) => self.nsub = x,
+            None => self.bad = true,
+        }
+        s
     }
 
     /// A fresh register.
@@ -179,6 +234,8 @@ impl Builder {
             p4: self.p4,
             nreg: self.nreg as usize,
             ncur: usize::from(self.ncur),
+            #[cfg(feature = "sql")]
+            nsub: self.nsub as usize,
         })
     }
 }

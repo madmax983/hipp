@@ -79,6 +79,9 @@ pub(crate) enum Cursor {
     Agg(alloc::boxed::Box<super::rows::AggRun>),
     #[cfg(feature = "expr_index")]
     Index(alloc::boxed::Box<super::index::IdxCursor>),
+    /// A recursive CTE's queue (unit `vm_subqueries`).
+    #[cfg(feature = "sql")]
+    Queue(alloc::boxed::Box<super::rows::Queue>),
 }
 
 /// One interior page on a table cursor's path: its children (the

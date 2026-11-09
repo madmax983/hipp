@@ -290,6 +290,108 @@ pub(crate) enum Code {
     /// `p4`) is not in row list `p1`'s Bloom filter.
     #[cfg(feature = "planner")]
     BloomTest,
+    // ---- subqueries, compounds, CTEs (unit `vm_subqueries`; ADR:
+    // `sql`'s coroutines / subroutines, sets and the recursive
+    // queue) ----
+    /// The joined row = group set `p1`'s current bare-column row:
+    /// the outer row a subquery in a group's expression reads.
+    #[cfg(feature = "sql")]
+    AccGroup,
+    /// Save the joined row (`AccPop` restores it): around a LIMIT /
+    /// OFFSET subquery, planned against the empty row.
+    #[cfg(feature = "sql")]
+    AccPush,
+    /// Restore the joined row `AccPush` saved.
+    #[cfg(feature = "sql")]
+    AccPop,
+    /// The joined row = group set `p1`'s current group's first row;
+    /// jump to `p2` when it has none (an aggregate's arguments per
+    /// group row).
+    #[cfg(feature = "sql")]
+    GroupRows,
+    /// The joined row = the current group's next row; jump to `p2`
+    /// when there is one.
+    #[cfg(feature = "sql")]
+    GroupRowNext,
+    /// Subquery slot `p1` = the empty result of `P4::Sub` `p4` (NULL,
+    /// 0 or the empty set), and an error trap: a statement error
+    /// (`Error::Schema`) before the matching `SubEnd` makes the slot
+    /// that error and jumps to `p2` (the value is raised only where
+    /// an expression reads it, as today's `SubValue::Fail`).
+    #[cfg(feature = "sql")]
+    SubStart,
+    /// One result row of the subquery of slot `p1` in registers `p2
+    /// ..` (`p3` values, `P4::Sub` `p4`): a scalar subquery's value,
+    /// EXISTS true, or the row added to an IN set.
+    #[cfg(feature = "sql")]
+    SubRow,
+    /// Drop the innermost subquery error trap.
+    #[cfg(feature = "sql")]
+    SubEnd,
+    /// Count one subquery-plan execution (`subquery_executions`).
+    #[cfg(feature = "sql")]
+    Count,
+    /// Append registers `p2 ..` (`p3` values) to row list `p1`, no
+    /// rowid.
+    #[cfg(feature = "sql")]
+    EphPut,
+    /// Registers `p2 ..` = row list `p1`'s current row's first `p3`
+    /// values.
+    #[cfg(feature = "sql")]
+    EphRow,
+    /// Row list `p1` = a copy of row list `p2`'s rows (a reader of a
+    /// shared materialization).
+    #[cfg(feature = "sql")]
+    EphCopy,
+    /// Row list `p1` to row `p3` (a register); jump to `p2` past its
+    /// end (a growing first source read on from where it was).
+    #[cfg(feature = "sql")]
+    EphSeek,
+    /// A growing first source (`session::streams_first`): when the
+    /// bound in register `p3` (−1: none) was reached by row list
+    /// `p1`, register `p4` = its length and the bound doubles; else
+    /// jump to `p2`.
+    #[cfg(feature = "sql")]
+    Grow,
+    /// Shared materialization row list `p1` already holds what this
+    /// reader needs: jump to `p2` (register `p3`: the reader's bound,
+    /// −1 for none; `p4`: the built / complete flags' first register).
+    #[cfg(feature = "sql")]
+    MatTest,
+    /// Row list `p1` was just computed under bound register `p3`
+    /// (−1: none): set the flags at register `p4` (built, and
+    /// complete when it ran out first).
+    #[cfg(feature = "sql")]
+    MatDone,
+    /// Register `p1` = the rows a reader needs: OFFSET register `p3 -
+    /// 1` + the least of LIMIT register `p2 - 1` and the bound in
+    /// register `p4 - 1` (0: none of each), −1 when nothing bounds
+    /// it (`session::derived_need`'s count).
+    #[cfg(feature = "sql")]
+    Need,
+    /// Register `p2` = the aggregate `P4::Expr` `p4` folded over row
+    /// list `p1`'s rows (its argument values per group row).
+    #[cfg(feature = "sql")]
+    AggFold,
+    /// Row list `p1` = the compound `P4::Comp` `p4` of row lists `p2
+    /// ..` (`p3` cores, head first: `session::run_compound`).
+    #[cfg(feature = "sql")]
+    Compound,
+    /// Open recursive-CTE queue `p1` (`P4::Queue` `p4`).
+    #[cfg(feature = "sql")]
+    QueueOpen,
+    /// Add registers `p2 ..` (`p3` values) to queue `p1` unless UNION
+    /// saw an equal row before.
+    #[cfg(feature = "sql")]
+    QueueAdd,
+    /// Row list `p3` = the one row taken from queue `p1`; jump to
+    /// `p2` when it is empty.
+    #[cfg(feature = "sql")]
+    QueuePop,
+    /// Row list `p1` = the probe set of subquery slot `p3` (`P4::Probe`
+    /// `p4`, as `ProbeList`); jump to `p2` when it is empty.
+    #[cfg(all(feature = "sql", feature = "expr_index"))]
+    ProbeSub,
 }
 
 /// `ResultRow` / `SorterInsert` `p3`: the rowid is the joined row's
@@ -311,6 +413,14 @@ pub(crate) const EVAL_VALUE: u8 = 0;
 pub(crate) const EVAL_COND: u8 = 1;
 /// `Code::Eval` `p5`: whether the WHERE clause's constant terms hold.
 pub(crate) const EVAL_CONSTS: u8 = 2;
+/// `Code::Eval` `p5`: whether the condition is false (`query::cond_is`
+/// asking for false: a NOT over a subquery condition).
+#[cfg(feature = "sql")]
+pub(crate) const EVAL_FALSE: u8 = 3;
+/// `Code::Eval` `p5` flag: `p4` is a `P4::SubExpr`, whose subquery
+/// nodes take their slots' values first (`query::substitute`).
+#[cfg(feature = "sql")]
+pub(crate) const EVAL_SUB: u8 = 16;
 
 /// One entry of a program's side table (`Op::p4`).
 pub(crate) enum P4 {
@@ -337,6 +447,68 @@ pub(crate) enum P4 {
     Auto(alloc::boxed::Box<crate::xplan::AutoIdx>),
     #[cfg(feature = "planner")]
     BKeys(AVec<crate::xplan::BKey>),
+    /// An expression with subquery nodes and their slots.
+    #[cfg(feature = "sql")]
+    SubExpr(alloc::boxed::Box<SubExpr>),
+    /// A subquery node's kind and result shape.
+    #[cfg(feature = "sql")]
+    Sub(alloc::boxed::Box<SubInfo>),
+    /// A compound's operators, column collations and ORDER BY.
+    #[cfg(feature = "sql")]
+    Comp(alloc::boxed::Box<CompInfo>),
+    /// A recursive CTE's queue order and UNION collations.
+    #[cfg(feature = "sql")]
+    Queue(alloc::boxed::Box<QueueInfo>),
+}
+
+/// An expression whose subquery nodes read slots (`P4::SubExpr`): the
+/// slots in `query::collect_subs` order (`collect_subs_outside_agg`
+/// with `aggs`), and the registers holding its outermost aggregates'
+/// folds (`query::substitute_group`), none for a row expression.
+#[cfg(feature = "sql")]
+pub(crate) struct SubExpr {
+    pub(crate) e: RExpr,
+    pub(crate) slots: AVec<u32>,
+    pub(crate) aggs: Option<AVec<u32>>,
+}
+
+/// A subquery node (`P4::Sub`): what its rows make.
+#[cfg(feature = "sql")]
+pub(crate) struct SubInfo {
+    pub(crate) kind: SubKind,
+    /// The result's comparison affinity (`query::result_affinity`).
+    pub(crate) aff: Option<crate::record::Affinity>,
+    /// A scalar subquery's result column (`SubPlan::scalar_col`).
+    pub(crate) col: usize,
+}
+
+/// A subquery node's kind (`query::SubKind`).
+#[cfg(feature = "sql")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubKind {
+    Scalar,
+    Exists,
+    In,
+}
+
+/// A compound's combination (`P4::Comp`): `session::run_compound`'s
+/// operators (one per tail core), the cores' column collations (head
+/// first), the compound ORDER BY, and the UNION-with-LIMIT-1
+/// shortcut (`union_first_row`).
+#[cfg(feature = "sql")]
+pub(crate) struct CompInfo {
+    pub(crate) ops: AVec<crate::sql::CompoundOp>,
+    pub(crate) cores: AVec<AVec<Option<crate::record::Coll>>>,
+    pub(crate) order: AVec<(usize, crate::sql::SortOrder)>,
+    pub(crate) first_row: bool,
+}
+
+/// A recursive CTE's queue (`P4::Queue`): its ORDER BY (none: first
+/// in, first out), UNION's column collations (`None`: UNION ALL).
+#[cfg(feature = "sql")]
+pub(crate) struct QueueInfo {
+    pub(crate) order: AVec<(usize, crate::sql::SortOrder)>,
+    pub(crate) union: Option<AVec<crate::record::Coll>>,
 }
 
 /// The side table entries as a slice-indexed lookup that never

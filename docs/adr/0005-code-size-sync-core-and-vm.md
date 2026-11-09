@@ -377,6 +377,34 @@ aggregates fold through `agg.rs` when each group is finalized (an
 aggregates and collations stay today's. The reasoning is rule 5's:
 one place for each rule, no second copy to drift.
 
+**Amendment (Stage 2, unit `vm_subqueries`, 2026-11-09): subqueries
+as inline code writing result slots; FROM subqueries materialized.**
+A subquery node is code emitted where today's executor computes it
+(the table's BeginSubrtn / Gosub become inline blocks: every use site
+has its own copy, so no return address is needed), running in the
+same program and the same joined row: its sources are further loops
+appended after the slots of the query around it (the planner's
+absolute slots), its rows go to a per-node result slot (`SubStart` /
+`SubRow`, the program's `nsub` slots of `query::SubValue`), and the
+`Eval` that follows substitutes the slots' values
+(`query::substitute`), keeping evaluation order, laziness and
+affinity today's. An uncorrelated node is guarded by `Once`, keyed by
+plan id and result column like today's per-statement cache. A
+statement error inside a node's code is caught by the trap
+`SubStart` pushes and becomes the slot's value (today's
+`SubValue::Fail`), raised only where an expression reads it. FROM
+subqueries, views and CTEs the flattener leaves are filled into a row
+list (MATERIALIZE into an Ephemeral) the first time their loop opens,
+with the joined row saved around the fill (`AccPush` / `AccPop`)
+since a FROM subquery's slots start where its reader's do; the
+coroutine opcodes are not built, because a coroutine would need a
+second joined row. Compounds stream a UNION ALL chain without ORDER
+BY and otherwise combine row lists with today's `run_compound`
+(`Compound`); a recursive CTE is a queue cursor (`QueueOpen` /
+`QueueAdd` / `QueuePop`) over today's `RecQueue`. Everything stays in
+one flat program, so the restart rule needs nothing new: none of the
+added opcodes reads a page.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,

@@ -37,11 +37,18 @@
 //!   groups of `project_qp_async`, each group emitted as it is
 //!   finalized (HAVING first) in GROUP BY order.
 //!
-//! Every other shape (subqueries anywhere, compounds, VALUES, derived
-//! tables, views and CTEs that are not flattened, windows, virtual and
-//! table-valued sources, WITHOUT ROWID, TEMP and attached tables,
-//! `sqlite_schema`, an IN-subquery probe) returns `None`: the whole
-//! statement runs on today's executor.
+//! - **Subqueries, compounds, CTEs** (unit `vm_subqueries`, `sql`;
+//!   `gen/sub.rs`): an expression's subquery nodes are code run where
+//!   today's executor computes them, writing a result slot the `Eval`
+//!   reads; a FROM subquery, view or CTE that is not flattened is a row
+//!   list its code fills the first time its loop opens; a subquery's
+//!   own sources are further loops appended to the joined row after
+//!   every slot of the query around it (the planner's absolute slots).
+//!
+//! Every other shape (windows, virtual and table-valued sources,
+//! WITHOUT ROWID, TEMP and attached tables, `sqlite_schema`, the
+//! shapes `gen/sub.rs` lists) returns `None`: the whole statement runs
+//! on today's executor.
 
 use super::super::Program;
 use super::super::build::{Builder, Label};
@@ -55,26 +62,55 @@ use alloc::rc::Rc;
 /// Where an expression reads its row: the joined row, or the group
 /// of group set `.0` (aggregates fold its rows).
 #[derive(Clone, Copy)]
-enum Cx {
+pub(super) enum Cx {
     Acc,
     Group(u32),
 }
 
+/// What the generators know of the database: whether a root page is
+/// a WITHOUT ROWID table's, and whether its text is UTF-8 (the
+/// streamed aggregate fold's condition).
+#[derive(Clone, Copy)]
+pub(super) struct Gx<'w> {
+    pub(super) wr: &'w dyn Fn(u32) -> bool,
+    pub(super) utf8: bool,
+}
+
+/// Where a query's result rows go.
+#[derive(Clone, Copy)]
+pub(super) enum Sink {
+    /// The statement's result (`ResultRow`).
+    Result,
+    /// A row list: a FROM subquery's rows, a compound core's.
+    #[cfg(feature = "sql")]
+    List(u32),
+    /// A subquery node's slot (`SubRow`, `P4::Sub` entry `.1`).
+    #[cfg(feature = "sql")]
+    Sub(u32, u32),
+    /// A recursive CTE's queue (`QueueAdd`).
+    #[cfg(feature = "sql")]
+    Queue(u32),
+}
+
 /// Whether `Eval` can evaluate `e` over a joined row of `width`
-/// slots and `nsrc` sources: no subquery, window call or deferred
-/// error, and (`agg`) aggregates of this query only, whose arguments
-/// read the row.
-fn evaluable(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool {
+/// slots and `nsrc` sources: no window call or deferred error, and
+/// (`agg`) aggregates of this query only, whose arguments read the
+/// row. Subquery nodes are code of their own (`sql`): their plans are
+/// checked as they are generated, and an expression of the query's
+/// own aggregates inside one falls back.
+pub(super) fn evaluable(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool {
     let f = |x: &RExpr| evaluable(x, width, nsrc, agg);
     match e {
         RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
         RExpr::Column(slot, ..) => *slot < width,
         RExpr::Rowid(s) => *s < nsrc,
-        RExpr::SubScalar(_)
-        | RExpr::SubExists(_)
-        | RExpr::InSub(..)
-        | RExpr::Raise(_)
-        | RExpr::Win(..) => false,
+        #[cfg(feature = "sql")]
+        RExpr::SubScalar(_) | RExpr::SubExists(_) => true,
+        #[cfg(feature = "sql")]
+        RExpr::InSub(x, ..) => f(x),
+        #[cfg(not(feature = "sql"))]
+        RExpr::SubScalar(_) | RExpr::SubExists(_) | RExpr::InSub(..) => false,
+        RExpr::Raise(_) | RExpr::Win(..) => false,
         RExpr::Agg { args, lvl, .. } => {
             agg && *lvl == 0 && args.iter().all(|a| evaluable(a, width, nsrc, false))
         }
@@ -100,6 +136,16 @@ fn evaluable(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool {
     }
 }
 
+/// `evaluable` with no subquery node anywhere (what an opcode that
+/// evaluates its side-table expressions itself can take).
+fn plain(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool {
+    #[cfg(feature = "sql")]
+    if crate::query::has_sub(e) {
+        return false;
+    }
+    evaluable(e, width, nsrc, agg)
+}
+
 /// Whether source `sp` is a table the VM reads: a rowid table of the
 /// main database (no derived table, TEMP, attached, WITHOUT ROWID,
 /// virtual or table-valued source, recursive reference, nor the
@@ -115,6 +161,24 @@ fn table_source(sp: &SubSource, wr: &dyn Fn(u32) -> bool) -> bool {
     #[cfg(feature = "attach")]
     let ok = ok && sp.ext == 0;
     ok
+}
+
+/// A FROM subquery, view or CTE the VM computes (`sql`): a derived
+/// source that is no table-valued function or virtual table.
+#[cfg(feature = "sql")]
+fn derived_source(sp: &SubSource) -> Option<&crate::query::SubPlan> {
+    #[cfg(any(feature = "json", feature = "vtab"))]
+    if sp.tvf != 0 {
+        return None;
+    }
+    #[cfg(feature = "vtab")]
+    if sp.vt.is_some() {
+        return None;
+    }
+    if sp.rec != 0 || sp.temp {
+        return None;
+    }
+    sp.derived.as_deref()
 }
 
 #[cfg(feature = "expr_index")]
@@ -141,6 +205,14 @@ enum Kind<'p> {
     /// combination.
     #[cfg(feature = "planner")]
     Auto(&'p crate::xplan::AutoIdx),
+    /// A FROM subquery's rows: a row list its code fills the first
+    /// time the loop opens (once per execution of this query).
+    #[cfg(feature = "sql")]
+    Derived(&'p crate::query::SubPlan),
+    /// A recursive CTE's recursive reference: the one row its queue
+    /// last gave up, in row list `.0`.
+    #[cfg(feature = "sql")]
+    Rec,
     #[cfg(not(feature = "expr_index"))]
     #[allow(dead_code)]
     Never(core::marker::PhantomData<&'p ()>),
@@ -151,9 +223,9 @@ struct Lv<'p> {
     kind: Kind<'p>,
     /// The table cursor.
     t: u32,
-    /// The row list (`Mat`, `Lateral`, `Auto`).
+    /// The row list (`Mat`, `Lateral`, `Auto`, `Derived`, `Rec`).
     e: u32,
-    /// Set once the row list is built (`Mat`, `Auto`).
+    /// Set once the row list is built (`Mat`, `Auto`, `Derived`).
     built: u32,
     /// A row of this combination passed the ON clause.
     any: u32,
@@ -188,31 +260,108 @@ enum Fold {
     Groups(u32),
 }
 
-struct G<'p> {
-    b: Builder,
+/// The generator of one query core (a SELECT without compound): the
+/// statement's own, or a subquery's, whose slots and sources follow
+/// those of the query around it (`w0`, `n0`).
+pub(super) struct G<'p, 'b> {
+    pub(super) b: &'b mut Builder,
     qp: &'p QueryPlan,
+    pub(super) gx: Gx<'p>,
     plan: u32,
     bases: AVec<usize>,
     lv: AVec<Lv<'p>>,
-    end: Label,
-    lim: Option<u32>,
-    off: Option<u32>,
-    tmp: u32,
+    pub(super) end: Label,
+    pub(super) lim: Option<u32>,
+    pub(super) off: Option<u32>,
+    pub(super) tmp: u32,
     /// The output row's rowid source (`ACC_ROWID` for one source).
     rowid: u32,
     fold: Fold,
+    /// The joined row's slots and sources before this core's own.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    w0: usize,
+    n0: usize,
+    /// Every slot and source of the joined row this core makes.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    pub(super) width: usize,
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    pub(super) nsrc: usize,
+    pub(super) sink: Sink,
+    /// The rows the reader takes: a register (−1: all; its copy
+    /// `cnt` counts them down).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    pub(super) need: Option<u32>,
+    pub(super) cnt: Option<u32>,
+    /// A growing first FROM subquery (`session::streams_first`): its
+    /// bound and the read position registers.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    grow: Option<(u32, u32)>,
+    /// The bound of a first FROM subquery the reader reads in order
+    /// (`session::derived_need`; −1: none).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    dneed: Option<u32>,
 }
 
 /// The program of a general query plan, or `None` when it holds a
-/// shape this unit does not cover. `wr`: whether a root page is a
+/// shape the generators do not cover. `wr`: whether a root page is a
 /// WITHOUT ROWID table's; `utf8`: the database's text encoding is
 /// UTF-8 (the streamed aggregate fold's condition).
 pub(crate) fn query(qp: &Rc<QueryPlan>, wr: &dyn Fn(u32) -> bool, utf8: bool) -> Option<Program> {
+    let mut b = Builder::new();
+    let gx = Gx { wr, utf8 };
+    select(&mut b, qp, gx, (0, 0), None, Sink::Result)?;
+    b.emit(Code::Halt, 0, 0, 0, 0, 0);
+    b.finish()
+}
+
+/// Code for one execution of `qp` (a core, or a compound / VALUES
+/// one under `sql`) over the joined row's first `at` slots and
+/// sources, its rows into `sink`, at most `need` of them.
+pub(super) fn select(
+    b: &mut Builder,
+    qp: &Rc<QueryPlan>,
+    gx: Gx<'_>,
+    at: (usize, usize),
+    need: Option<u32>,
+    sink: Sink,
+) -> Option<()> {
+    #[cfg(feature = "sql")]
     if !qp.compound.is_empty() || !qp.values.is_empty() {
-        return None;
+        return super::sub::compound(b, qp, gx, at, need, sink);
     }
-    let nsrc = qp.sources.len();
-    let width: usize = qp.sources.iter().map(|s| s.ncols).sum();
+    let end = b.label();
+    let cnt = need.map(|n| {
+        let c = b.reg();
+        b.emit(Code::Copy, n, c, 0, 0, 0);
+        c
+    });
+    core(b, qp, gx, at, None, need, cnt, sink, end)?;
+    b.here(end);
+    Some(())
+}
+
+/// One core's code: `qp`'s sources joined (its compound tails, if any,
+/// are not this core's), its rows into `sink`; `end` follows. `win`:
+/// the LIMIT / OFFSET registers of a compound around it (else the
+/// core's own LIMIT / OFFSET apply). `need`: the register holding the
+/// rows the reader takes (−1: all), which bounds a first FROM
+/// subquery; `cnt`: the counter of rows still to give, which ends the
+/// core at 0.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn core(
+    b: &mut Builder,
+    qp: &Rc<QueryPlan>,
+    gx: Gx<'_>,
+    at: (usize, usize),
+    win: Option<(Option<u32>, Option<u32>)>,
+    need: Option<u32>,
+    cnt: Option<u32>,
+    sink: Sink,
+    end: Label,
+) -> Option<()> {
+    let (w0, n0) = at;
+    let nsrc = n0.saturating_add(qp.sources.len());
+    let width: usize = w0.saturating_add(qp.sources.iter().map(|s| s.ncols).sum::<usize>());
     let grouped = qp.has_agg || !qp.group_by.is_empty();
     let row_ok = |e: &RExpr| evaluable(e, width, nsrc, false);
     let out_ok = |e: &RExpr| evaluable(e, width, nsrc, grouped);
@@ -221,27 +370,62 @@ pub(crate) fn query(qp: &Rc<QueryPlan>, wr: &dyn Fn(u32) -> bool, utf8: bool) ->
         || !qp.having.as_ref().is_none_or(out_ok)
         || !qp.group_by.iter().all(row_ok)
         || !qp.filter.as_ref().is_none_or(row_ok)
-        || ![&qp.limit, &qp.offset]
-            .iter()
-            .all(|l| l.as_ref().is_none_or(|e| evaluable(e, 0, 0, false)))
+        || (win.is_none()
+            && ![&qp.limit, &qp.offset]
+                .iter()
+                .all(|l| l.as_ref().is_none_or(|e| evaluable(e, 0, 0, false))))
     {
         return None;
     }
-    let mut b = Builder::new();
+    // A grouped query's bare-column row picked by a min() / max()
+    // whose argument holds a subquery (`extremum_rep`) is not built.
+    if grouped
+        && crate::session::rep_minmax(
+            qp.items.as_slice(),
+            qp.having.as_ref(),
+            qp.order_by.as_slice(),
+        )
+        .is_some_and(|m| {
+            !plain(m.arg, width, nsrc, false)
+                || !m.filter.is_none_or(|f| plain(f, width, nsrc, false))
+        })
+    {
+        return None;
+    }
     let plan = b.p4(P4::Plan(Rc::clone(qp)));
     let mut bases = AVec::new();
     let mut lv = AVec::new();
-    let mut w = 0usize;
+    let mut w = w0;
     for (d, sp) in qp.sources.iter().enumerate() {
-        if !table_source(sp, wr) || !sp.on.as_ref().is_none_or(row_ok) {
+        if !sp.on.as_ref().is_none_or(row_ok) {
             return None;
         }
         bases.push(w);
         w = w.saturating_add(sp.ncols);
-        let kind = kind_of(sp, d, width, nsrc)?;
+        let kind = kind_of(b, sp, d, width, nsrc, gx)?;
+        let is_table = matches!(kind, Kind::Scan) || direct(&kind) || table_backed(&kind);
+        if is_table && !table_source(sp, gx.wr) {
+            return None;
+        }
         let t = b.cursor();
         let needs_list = !matches!(kind, Kind::Scan) && !direct(&kind);
-        let e = if needs_list { b.cursor() } else { u32::MAX };
+        #[cfg(feature = "sql")]
+        let rec_list = match kind {
+            Kind::Rec => b
+                .recs
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == sp.rec)
+                .map(|r| r.1),
+            _ => None,
+        };
+        #[cfg(not(feature = "sql"))]
+        let rec_list: Option<u32> = None;
+        let e = match rec_list {
+            Some(l) => l,
+            None if needs_list => b.cursor(),
+            None => u32::MAX,
+        };
         #[cfg(feature = "planner")]
         let bloom = match sp.access.as_deref() {
             Some(a) if a.lateral && a.auto.is_none() && a.bloom.is_some() => {
@@ -261,11 +445,11 @@ pub(crate) fn query(qp: &Rc<QueryPlan>, wr: &dyn Fn(u32) -> bool, utf8: bool) ->
             bloom,
         });
     }
-    let end = b.label();
     let tmp = b.reg();
     let mut g = G {
         b,
         qp,
+        gx,
         plan,
         bases,
         lv,
@@ -275,31 +459,56 @@ pub(crate) fn query(qp: &Rc<QueryPlan>, wr: &dyn Fn(u32) -> bool, utf8: bool) ->
         tmp,
         rowid: if nsrc == 1 { ACC_ROWID } else { 0 },
         fold: Fold::Rows,
+        w0,
+        n0,
+        width,
+        nsrc,
+        sink,
+        need,
+        cnt,
+        grow: None,
+        dneed: None,
     };
-    g.limits();
+    match win {
+        Some((l, o)) => {
+            g.lim = l;
+            g.off = o;
+        }
+        None => g.limits()?,
+    }
     // The output, the sorter, the accumulators.
     let out = g.out_mode(grouped);
     g.fold = if grouped {
         let c = g.b.cursor();
-        if super::super::rows::folds(qp, utf8) {
-            g.b.emit(Code::AggOpen, c, 0, 0, plan, 0);
+        let (pw, pn) = (w0 as u32, n0 as u32);
+        if super::super::rows::folds(qp, gx.utf8) {
+            g.b.emit(Code::AggOpen, c, pw, pn, plan, 0);
             Fold::Agg(c)
         } else {
-            g.b.emit(Code::GroupOpen, c, 0, 0, plan, 0);
+            g.b.emit(Code::GroupOpen, c, pw, pn, plan, 0);
             Fold::Groups(c)
         }
     } else {
         Fold::Rows
     };
-    // Table cursors.
+    // Table cursors, and every row list built anew in this execution.
     for i in 0..g.lv.len() {
-        let (t, root) = match (g.lv.as_slice().get(i), qp.sources.as_slice().get(i)) {
-            (Some(l), Some(sp)) => (l.t, sp),
+        let (t, built, root) = match (g.lv.as_slice().get(i), qp.sources.as_slice().get(i)) {
+            (Some(l), Some(sp)) => (l.t, l.built, sp),
             _ => return None,
         };
-        let info = g.b.p4(P4::Table(alloc::boxed::Box::new(table_info(root))));
-        g.b.emit(Code::OpenRead, t, 0, 0, info, 0);
+        g.b.emit(Code::Integer, 0, built, 0, 0, 0);
+        #[cfg(feature = "planner")]
+        if let Some((_, bb)) = g.lvl(i).and_then(|l| l.bloom) {
+            g.b.emit(Code::Integer, 0, bb, 0, 0, 0);
+        }
+        if table_source(root, gx.wr) {
+            let info = g.b.p4(P4::Table(alloc::boxed::Box::new(table_info(root))));
+            g.b.emit(Code::OpenRead, t, 0, 0, info, 0);
+        }
     }
+    #[cfg(feature = "sql")]
+    g.grow_setup();
     let after = g.b.label();
     // The WHERE clause's constant terms, once, first: false, and no
     // row joins (an aggregate still has its empty group).
@@ -311,7 +520,7 @@ pub(crate) fn query(qp: &Rc<QueryPlan>, wr: &dyn Fn(u32) -> bool, utf8: bool) ->
     g.from(0, main_done, out)?;
     g.b.here(main_done);
     // Each RIGHT / FULL source's unmatched rows, NULLs on the left.
-    for i in 0..nsrc {
+    for i in 0..qp.sources.len() {
         if qp
             .sources
             .as_slice()
@@ -324,9 +533,10 @@ pub(crate) fn query(qp: &Rc<QueryPlan>, wr: &dyn Fn(u32) -> bool, utf8: bool) ->
     g.b.here(after);
     g.finish_agg(out);
     g.sorted_out(out);
-    g.b.here(end);
-    g.b.emit(Code::Halt, 0, 0, 0, 0, 0);
-    g.b.finish()
+    if g.b.failed() {
+        return None;
+    }
+    Some(())
 }
 
 /// Whether a loop reads the table directly (no row list).
@@ -336,6 +546,16 @@ fn direct(k: &Kind<'_>) -> bool {
         #[cfg(feature = "expr_index")]
         Kind::Eq(..) | Kind::Range(..) => true,
         _ => false,
+    }
+}
+
+/// Whether a row-list loop's rows come from the source's table (an
+/// access path, an automatic index, a RIGHT / FULL table source).
+fn table_backed(k: &Kind<'_>) -> bool {
+    match k {
+        #[cfg(feature = "sql")]
+        Kind::Derived(_) | Kind::Rec => false,
+        _ => true,
     }
 }
 
@@ -353,10 +573,35 @@ fn table_info(sp: &SubSource) -> TableInfo {
 
 /// How source `d`'s loop reads it, when the VM covers its access
 /// path: every probe evaluable over the sources before it (a
-/// non-lateral one over none), no IN-subquery probe (unit
-/// `vm_subqueries`).
-fn kind_of(sp: &SubSource, d: usize, width: usize, nsrc: usize) -> Option<Kind<'_>> {
-    let _ = (d, width, nsrc);
+/// non-lateral one over none); a FROM subquery's rows; a recursive
+/// reference's row.
+fn kind_of<'p>(
+    b: &Builder,
+    sp: &'p SubSource,
+    d: usize,
+    width: usize,
+    nsrc: usize,
+    gx: Gx<'_>,
+) -> Option<Kind<'p>> {
+    let _ = (d, width, nsrc, b, gx);
+    #[cfg(feature = "sql")]
+    if sp.rec != 0 {
+        return b
+            .recs
+            .iter()
+            .any(|(id, _)| *id == sp.rec)
+            .then_some(Kind::Rec);
+    }
+    #[cfg(feature = "sql")]
+    if sp.derived.is_some() {
+        // (No planner gives a FROM subquery an access path; one would
+        // be today's executor's.)
+        #[cfg(feature = "expr_index")]
+        if sp.access.is_some() {
+            return None;
+        }
+        return derived_source(sp).map(Kind::Derived);
+    }
     #[cfg(feature = "expr_index")]
     if let Some(a) = sp.access.as_deref() {
         if sp.kind.pads_left() || !access_ok(a, width, nsrc) {
@@ -373,7 +618,7 @@ fn kind_of(sp: &SubSource, d: usize, width: usize, nsrc: usize) -> Option<Kind<'
             let bounds = [a.lo.as_ref(), a.hi.as_ref()];
             match a.eq.as_slice().first() {
                 Some(p) => {
-                    if let ([e], false) = (p.vals.as_slice(), p.is_in) {
+                    if let ([e], false, None) = (p.vals.as_slice(), p.is_in, &p.sub) {
                         return Some(Kind::Eq(e, p.aff, bounds));
                     }
                 }
@@ -388,14 +633,18 @@ fn kind_of(sp: &SubSource, d: usize, width: usize, nsrc: usize) -> Option<Kind<'
     Some(Kind::Scan)
 }
 
-/// Whether every expression of access path `a` is evaluable and it
-/// has no IN-subquery probe.
+/// Whether every expression of access path `a` is evaluable (an
+/// IN-subquery probe set under `sql`; the MULTI-INDEX OR branches'
+/// conditions, which the earlier branches test as plain conditions,
+/// hold no subquery).
 #[cfg(feature = "expr_index")]
 fn access_ok(a: &crate::xplan::IdxAccess, width: usize, nsrc: usize) -> bool {
     let ok = |e: &RExpr| evaluable(e, width, nsrc, false);
-    let probes =
-        a.eq.iter()
-            .all(|p| p.sub.is_none() && p.vals.iter().all(ok));
+    #[cfg(feature = "sql")]
+    let sub_ok = |p: &crate::xplan::Probe| p.sub.as_ref().is_none_or(ok);
+    #[cfg(not(feature = "sql"))]
+    let sub_ok = |p: &crate::xplan::Probe| p.sub.is_none();
+    let probes = a.eq.iter().all(|p| sub_ok(p) && p.vals.iter().all(ok));
     let bounds = [&a.lo, &a.hi]
         .iter()
         .all(|b| b.as_ref().is_none_or(|b| ok(&b.e)));
@@ -422,9 +671,14 @@ fn access_ok(a: &crate::xplan::IdxAccess, width: usize, nsrc: usize) -> bool {
     }
 }
 
-impl<'p> G<'p> {
+impl<'p> G<'p, '_> {
     fn lvl(&self, d: usize) -> Option<&Lv<'p>> {
         self.lv.as_slice().get(d)
+    }
+
+    /// Source `d`'s index in the joined row.
+    fn src(&self, d: usize) -> u32 {
+        self.n0.saturating_add(d) as u32
     }
 
     fn base(&self, d: usize) -> u32 {
@@ -433,10 +687,15 @@ impl<'p> G<'p> {
 
     /// Code `e`'s value into `dest`, reading `cx`'s row; a literal is a
     /// prologue constant.
-    fn val(&mut self, e: &RExpr, cx: Cx, dest: u32) {
+    pub(super) fn val(&mut self, e: &RExpr, cx: Cx, dest: u32) {
         if let RExpr::Literal(v) = e {
             let k = self.b.p4(P4::Value(v.clone()));
             self.b.hoist(Code::Value, dest, k);
+            return;
+        }
+        #[cfg(feature = "sql")]
+        if crate::query::has_sub(e) {
+            self.val_sub(e, cx, dest, EVAL_VALUE);
             return;
         }
         let k = self.b.p4(P4::Expr(e.clone()));
@@ -463,7 +722,21 @@ impl<'p> G<'p> {
 
     /// Code condition `e` (NULL is not true) and jump to `skip` unless
     /// it holds.
-    fn test(&mut self, e: &RExpr, cx: Cx, skip: Label) {
+    pub(super) fn test(&mut self, e: &RExpr, cx: Cx, skip: Label) {
+        // A condition holding a subquery (`cond_row_sub` /
+        // `cond_group_sub`).
+        #[cfg(feature = "sql")]
+        if crate::query::has_sub(e) {
+            match cx {
+                Cx::Acc => self.cond_sub(e, true, skip),
+                Cx::Group(_) => {
+                    let t = self.tmp;
+                    self.val_sub(e, cx, t, EVAL_COND);
+                    self.b.jump(Code::IfNot, t, skip, 0, 0, 0);
+                }
+            }
+            return;
+        }
         let k = self.b.p4(P4::Expr(e.clone()));
         let (p1, flag) = match cx {
             Cx::Acc => (0, EVAL_ACC),
@@ -476,22 +749,25 @@ impl<'p> G<'p> {
 
     /// LIMIT, then OFFSET, before the loop (`computeLimitRegisters`:
     /// a LIMIT of 0 reads nothing, not even the OFFSET).
-    fn limits(&mut self) {
-        let qp = self.qp;
-        let end = self.end;
-        if let Some(l) = &qp.limit {
-            let r = self.b.regs(2);
-            super::expr::value(&mut self.b, l, None, r);
-            self.b.emit(Code::MustBeInt, r, 0, 0, 0, 0);
-            self.b.jump(Code::IfNot, r, end, 0, 0, 0);
-            if let Some(o) = &qp.offset {
-                let ro = r.saturating_add(1);
-                super::expr::value(&mut self.b, o, None, ro);
-                self.b.emit(Code::MustBeInt, ro, 0, 0, 0, 0);
-                self.off = Some(ro);
-            }
-            self.lim = Some(r);
-        }
+    fn limits(&mut self) -> Option<()> {
+        let (l, o) = limits(
+            self.b,
+            self.qp.limit.as_ref(),
+            self.qp.offset.as_ref(),
+            self.gx,
+            self.end,
+        )?;
+        self.lim = l;
+        self.off = o;
+        Some(())
+    }
+
+    /// One result row in registers `regs ..` (`n` values) into the
+    /// sink, then the LIMIT and the reader's bound.
+    pub(super) fn sink_row(&mut self, regs: u32, n: usize, rowid: u32) {
+        emit_row(
+            self.b, self.sink, regs, n, rowid, self.lim, self.cnt, self.end,
+        );
     }
 
     /// The output mode (`stream_build`'s): sorted unless the one
@@ -541,7 +817,6 @@ impl<'p> G<'p> {
     fn emit(&mut self, out: Out, cx: Cx, vals: Option<u32>, cont: Label) {
         let qp = self.qp;
         let n = qp.items.len();
-        let end = self.end;
         let rowid = if matches!(cx, Cx::Group(_)) || vals.is_some() {
             0
         } else {
@@ -551,7 +826,7 @@ impl<'p> G<'p> {
             Some(r) => r,
             None => self.b.regs(n.saturating_add(qp.order_by.len())),
         };
-        let compute = |g: &mut G<'p>| {
+        let compute = |g: &mut G<'p, '_>| {
             if vals.is_none() {
                 for (i, it) in qp.items.iter().enumerate() {
                     g.val(it, cx, items.saturating_add(i as u32));
@@ -564,10 +839,7 @@ impl<'p> G<'p> {
                     self.b.jump(Code::IfPos, o, cont, 1, 0, 0);
                 }
                 compute(self);
-                self.b.emit(Code::ResultRow, items, n as u32, rowid, 0, 0);
-                if let Some(l) = self.lim {
-                    self.b.jump(Code::DecrJumpZero, l, end, 0, 0, 0);
-                }
+                self.sink_row(items, n, rowid);
             }
             Out::Distinct(e) => {
                 compute(self);
@@ -578,10 +850,7 @@ impl<'p> G<'p> {
                 if let Some(o) = self.off {
                     self.b.jump(Code::IfPos, o, cont, 1, 0, 0);
                 }
-                self.b.emit(Code::ResultRow, items, n as u32, rowid, 0, 0);
-                if let Some(l) = self.lim {
-                    self.b.jump(Code::DecrJumpZero, l, end, 0, 0, 0);
-                }
+                self.sink_row(items, n, rowid);
             }
             Out::Sort(s, distinct) => {
                 compute(self);
@@ -618,6 +887,9 @@ impl<'p> G<'p> {
     fn body(&mut self, out: Out, cont: Label) {
         let qp = self.qp;
         if let Some(f) = &qp.filter {
+            #[cfg(feature = "sql")]
+            self.where_sub(f, cont);
+            #[cfg(not(feature = "sql"))]
             self.test(f, Cx::Acc, cont);
         }
         #[cfg(feature = "planner")]
@@ -684,7 +956,7 @@ impl<'p> G<'p> {
             self.b.jump(code, tmp, pad_chk, r, 0, 0);
         }
         let src = if adv.list { e } else { t };
-        self.b.emit(Code::Load, src, base, d as u32, 0, 0);
+        self.b.emit(Code::Load, src, base, self.src(d), 0, 0);
         if let Some(on) = &sp.on {
             self.test(on, Cx::Acc, next);
         }
@@ -703,10 +975,25 @@ impl<'p> G<'p> {
         if let Some((code, c)) = adv.next {
             self.b.jump(code, c, top, 0, 0, 0);
         }
+        // A growing first FROM subquery read to the end of its rows:
+        // computed again under twice the bound, the loop going on
+        // after the rows it read (`Stream::grow`).
+        #[cfg(feature = "sql")]
+        if d == 0
+            && let (Some((n, pos)), Kind::Derived(p)) = (self.grow, &self.lvl(0)?.kind)
+        {
+            let p = *p;
+            let nogrow = self.b.label();
+            self.b.jump(Code::Grow, e, nogrow, n, pos, 0);
+            self.derived_build(p, e, Some(n))?;
+            self.b.jump(Code::EphSeek, e, pad_chk, pos, 0, 0);
+            self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+            self.b.here(nogrow);
+        }
         self.b.here(pad_chk);
         if sp.kind.pads_right() {
             self.b.jump(Code::If, any, fin, 0, 0, 0);
-            self.b.emit(Code::NullRow, ncols, base, d as u32, 0, 0);
+            self.b.emit(Code::NullRow, ncols, base, self.src(d), 0, 0);
             self.b.emit(Code::Integer, 0, pad, 1, 0, 0);
             self.b.jump(Code::Goto, 0, inner, 0, 0, 0);
         }
@@ -729,11 +1016,17 @@ impl<'p> G<'p> {
         self.b.here(top);
         for (j, sp) in qp.sources.iter().enumerate().take(i) {
             let base = self.base(j);
-            self.b
-                .emit(Code::NullRow, sp.ncols as u32, base, j as u32, 0, 0);
+            self.b.emit(
+                Code::NullRow,
+                sp.ncols as u32,
+                base,
+                self.n0.saturating_add(j) as u32,
+                0,
+                0,
+            );
         }
         let base = self.base(i);
-        self.b.emit(Code::Load, e, base, i as u32, 0, 0);
+        self.b.emit(Code::Load, e, base, self.src(i), 0, 0);
         self.from(i.saturating_add(1), next, out)?;
         self.b.here(next);
         self.b.jump(Code::EphNext, e, top, 0, 0, 1);
@@ -798,12 +1091,92 @@ impl<'p> G<'p> {
         }
         self.b.emit(Code::SorterData, s, regs, 0, 0, 0);
         let rowid = s.saturating_add(1);
-        self.b.emit(Code::ResultRow, regs, n as u32, rowid, 0, 0);
-        if let Some(l) = self.lim {
-            self.b.jump(Code::DecrJumpZero, l, end, 0, 0, 0);
-        }
+        self.sink_row(regs, n, rowid);
         self.b.here(skip);
         self.b.jump(Code::SorterNext, s, more, 0, 0, 0);
+    }
+}
+
+#[cfg(feature = "sql")]
+impl G<'_, '_> {
+    /// The bound a first FROM subquery is computed under
+    /// (`session::derived_need`), or its growing bound
+    /// (`session::streams_first`: an endless recursive CTE read
+    /// through a WHERE or a join under a LIMIT): the rows the reader
+    /// takes, OFFSET + the least of LIMIT and its own reader's bound.
+    fn grow_setup(&mut self) {
+        let qp = self.qp;
+        if !matches!(self.lvl(0).map(|l| &l.kind), Some(Kind::Derived(_))) {
+            return;
+        }
+        let plain = qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct;
+        let grow = crate::session::streams_first(qp.sources.as_slice(), plain)
+            && (qp.filter.is_some() || qp.sources.len() > 1);
+        let reduced = qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg;
+        let reordered = !qp.order_by.is_empty() || qp.distinct;
+        let bounded = qp.sources.len() == 1 && !reduced && !reordered;
+        if !grow && !bounded {
+            return;
+        }
+        let r = self.b.reg();
+        let refp = |x: Option<u32>| x.map_or(0, |v| v.saturating_add(1));
+        let (l, o, n) = (refp(self.lim), refp(self.off), refp(self.need));
+        self.b.emit(Code::Need, r, l, o, n, 0);
+        if grow {
+            let pos = self.b.reg();
+            self.b.emit(Code::Integer, 0, pos, 0, 0, 0);
+            self.grow = Some((r, pos));
+        } else {
+            self.dneed = Some(r);
+        }
+    }
+
+    /// Code that fills row list `e` with FROM subquery `p`'s rows for
+    /// this execution (`materialise_sources_sub`), under the bound in
+    /// register `need` (−1: none): its own code, over the joined row's
+    /// slots before this core's (the joined row so far is saved
+    /// around it); a shared materialization (`SubPlan::mat`) computed
+    /// by its first reader and copied by every other.
+    fn derived_build(
+        &mut self,
+        p: &crate::query::SubPlan,
+        e: u32,
+        need: Option<u32>,
+    ) -> Option<()> {
+        let at = (self.w0, self.n0);
+        let gx = self.gx;
+        self.b.emit(Code::AccPush, 0, 0, 0, 0, 0);
+        if p.mat == 0 {
+            self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+            self.b.emit(Code::Count, 0, 0, 0, 0, 0);
+            super::sub::subplan(self.b, p, gx, at, need, Sink::List(e))?;
+        } else {
+            let (se, flags) = match self.b.mats.iter().find(|m| m.0 == p.mat) {
+                Some(m) => (m.1, m.2),
+                None => {
+                    let se = self.b.cursor();
+                    let flags = self.b.regs(2);
+                    self.b.mats.push((p.mat, se, flags));
+                    (se, flags)
+                }
+            };
+            let none = self.b.reg();
+            self.b.emit(Code::Integer, 0, none, -1i32 as u32, 0, 0);
+            let needr = need.unwrap_or(none);
+            let ask = if p.rec.is_some() { need } else { None };
+            let skip = self.b.label();
+            self.b.jump(Code::MatTest, se, skip, needr, flags, 0);
+            self.b.emit(Code::EphOpen, se, 0, 0, 0, 0);
+            self.b.emit(Code::Count, 0, 0, 0, 0, 0);
+            super::sub::subplan(self.b, p, gx, at, ask, Sink::List(se))?;
+            self.b
+                .emit(Code::MatDone, se, 0, ask.unwrap_or(none), flags, 0);
+            self.b.here(skip);
+            self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+            self.b.emit(Code::EphCopy, e, se, 0, 0, 0);
+        }
+        self.b.emit(Code::AccPop, 0, 0, 0, 0, 0);
+        Some(())
     }
 }
 
@@ -816,6 +1189,142 @@ struct Adv {
     stop: Option<(Code, u32)>,
     /// The loop reads the row list.
     list: bool,
+}
+
+/// One result row in registers `regs ..` (`n` values, the rowid of
+/// `rowid`'s source) into `sink`; then the LIMIT `lim` and the
+/// reader's counter `cnt`, each ending the code at `end` once 0.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_row(
+    b: &mut Builder,
+    sink: Sink,
+    regs: u32,
+    n: usize,
+    rowid: u32,
+    lim: Option<u32>,
+    cnt: Option<u32>,
+    end: Label,
+) {
+    match sink {
+        Sink::Result => b.emit(Code::ResultRow, regs, n as u32, rowid, 0, 0),
+        #[cfg(feature = "sql")]
+        Sink::List(e) => b.emit(Code::EphPut, e, regs, n as u32, 0, 0),
+        #[cfg(feature = "sql")]
+        Sink::Sub(slot, info) => b.emit(Code::SubRow, slot, regs, n as u32, info, 0),
+        #[cfg(feature = "sql")]
+        Sink::Queue(q) => b.emit(Code::QueueAdd, q, regs, n as u32, 0, 0),
+    }
+    let _ = rowid;
+    if let Some(l) = lim {
+        b.jump(Code::DecrJumpZero, l, end, 0, 0, 0);
+    }
+    if let Some(c) = cnt {
+        b.jump(Code::DecrJumpZero, c, end, 0, 0, 0);
+    }
+}
+
+/// A VALUES core's rows (`sql`): each row's values over the joined
+/// row's first `at` slots and sources, into `sink`, after the OFFSET
+/// `off` and up to the LIMIT `lim` and the counter `cnt`.
+#[cfg(feature = "sql")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn values_core(
+    b: &mut Builder,
+    qp: &QueryPlan,
+    gx: Gx<'_>,
+    at: (usize, usize),
+    lim: Option<u32>,
+    off: Option<u32>,
+    cnt: Option<u32>,
+    sink: Sink,
+    end: Label,
+) -> Option<()> {
+    let tmp = b.reg();
+    let mut g = G {
+        b,
+        qp,
+        gx,
+        plan: 0,
+        bases: AVec::new(),
+        lv: AVec::new(),
+        end,
+        lim,
+        off,
+        tmp,
+        rowid: 0,
+        fold: Fold::Rows,
+        w0: at.0,
+        n0: at.1,
+        width: at.0,
+        nsrc: at.1,
+        sink,
+        need: None,
+        cnt,
+        grow: None,
+        dneed: None,
+    };
+    for r in qp.values.iter() {
+        if !r.iter().all(|e| evaluable(e, at.0, at.1, false)) {
+            return None;
+        }
+        let next = g.b.label();
+        let regs = g.b.regs(r.len());
+        for (i, e) in r.iter().enumerate() {
+            g.val(e, Cx::Acc, regs.saturating_add(i as u32));
+        }
+        if let Some(o) = off {
+            g.b.jump(Code::IfPos, o, next, 1, 0, 0);
+        }
+        g.sink_row(regs, r.len(), 0);
+        g.b.here(next);
+    }
+    (!g.b.failed()).then_some(())
+}
+
+/// LIMIT, then OFFSET, into registers (`computeLimitRegisters`: a
+/// LIMIT of 0 jumps to `end` and reads nothing, not even the OFFSET).
+/// They were planned against the empty row: a subquery in one runs
+/// over an empty joined row (`sql`).
+pub(super) fn limits(
+    b: &mut Builder,
+    limit: Option<&RExpr>,
+    offset: Option<&RExpr>,
+    gx: Gx<'_>,
+    end: Label,
+) -> Option<(Option<u32>, Option<u32>)> {
+    let Some(l) = limit else {
+        return Some((None, None));
+    };
+    let r = b.regs(2);
+    scope_val(b, l, gx, r)?;
+    b.emit(Code::MustBeInt, r, 0, 0, 0, 0);
+    b.jump(Code::IfNot, r, end, 0, 0, 0);
+    let mut off = None;
+    if let Some(o) = offset {
+        let ro = r.saturating_add(1);
+        scope_val(b, o, gx, ro)?;
+        b.emit(Code::MustBeInt, ro, 0, 0, 0, 0);
+        off = Some(ro);
+    }
+    Some((Some(r), off))
+}
+
+/// `e`'s value over the empty row into `dest` (a LIMIT or OFFSET).
+fn scope_val(b: &mut Builder, e: &RExpr, gx: Gx<'_>, dest: u32) -> Option<()> {
+    #[cfg(feature = "sql")]
+    if crate::query::has_sub(e) {
+        return super::sub::empty_scope_val(b, e, gx, dest);
+    }
+    let _ = gx;
+    // A literal is loaded here, not in the prologue: the LIMIT / OFFSET
+    // registers count down, and a subquery's run again.
+    if let RExpr::Literal(v) = e {
+        let k = b.p4(P4::Value(v.clone()));
+        b.emit(Code::Value, 0, dest, 0, k, 0);
+        return Some(());
+    }
+    super::expr::value(b, e, None, dest);
+    Some(())
 }
 
 /// Whether ORDER BY is the one source's own row order (the streamed
@@ -880,7 +1389,7 @@ impl PSrc {
     }
 }
 
-impl<'p> G<'p> {
+impl<'p> G<'p, '_> {
     /// Open source `d`'s loop on its first row for the joined row so
     /// far (jumping to `none` when there is no row); how it advances.
     fn open(&mut self, d: usize, top: Label, none: Label) -> Option<Adv> {
@@ -902,6 +1411,10 @@ impl<'p> G<'p> {
             Kind::Lateral => 4,
             #[cfg(feature = "planner")]
             Kind::Auto(_) => 5,
+            #[cfg(feature = "sql")]
+            Kind::Derived(_) => 3,
+            #[cfg(feature = "sql")]
+            Kind::Rec => 6,
             #[cfg(not(feature = "expr_index"))]
             Kind::Never(_) => return None,
         };
@@ -975,6 +1488,11 @@ impl<'p> G<'p> {
                 self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
                 list
             }
+            #[cfg(feature = "sql")]
+            6 => {
+                self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
+                list
+            }
             #[cfg(feature = "expr_index")]
             4 => {
                 self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
@@ -1027,6 +1545,19 @@ impl<'p> G<'p> {
     fn build(&mut self, d: usize, e: u32) -> Option<()> {
         let qp = self.qp;
         let sp = qp.sources.as_slice().get(d)?;
+        #[cfg(feature = "sql")]
+        match self.lvl(d)?.kind {
+            Kind::Derived(p) => {
+                let need = if d == 0 {
+                    self.grow.map(|g| g.0).or(self.dneed)
+                } else {
+                    None
+                };
+                return self.derived_build(p, e, need);
+            }
+            Kind::Rec => return Some(()),
+            _ => {}
+        }
         #[cfg(feature = "planner")]
         if let Kind::Auto(ai) = self.lvl(d)?.kind {
             self.scan_into(d, e);
@@ -1227,6 +1758,24 @@ impl<'p> G<'p> {
         reverse: bool,
         none: Label,
     ) -> u32 {
+        // An IN subquery's set (`probe_vals`): its node's values.
+        #[cfg(feature = "sql")]
+        if let Some(e) = &p.sub {
+            let l = self.b.cursor();
+            self.b.emit(Code::EphOpen, l, 0, 0, 0, 0);
+            let k = self.b.p4(P4::Probe(alloc::boxed::Box::new(
+                super::super::index::ProbeInfo {
+                    n: 0,
+                    aff: p.aff,
+                    is: p.is,
+                    is_in: p.is_in,
+                    key,
+                    reverse,
+                },
+            )));
+            self.probe_sub(e, k, l, none);
+            return l;
+        }
         let regs = self.b.regs(p.vals.len());
         for (i, v) in p.vals.iter().enumerate() {
             self.val(v, Cx::Acc, regs.saturating_add(i as u32));
@@ -1521,10 +2070,27 @@ impl<'p> G<'p> {
             self.b.here(top);
             self.b
                 .emit(Code::Load, tk, o.base as u32, o.src as u32, 0, 0);
+            // (Holding a subquery, a branch's condition is its value's
+            // truth, `eval_row_sub`, as today.)
+            #[cfg(feature = "sql")]
+            if crate::query::has_sub(&sub.cond) {
+                let tmp = self.tmp;
+                self.val_sub(&sub.cond, Cx::Acc, tmp, EVAL_COND);
+                self.b.jump(Code::IfNot, tmp, next, 0, 0, 0);
+            } else {
+                self.test(&sub.cond, Cx::Acc, next);
+            }
+            #[cfg(not(feature = "sql"))]
             self.test(&sub.cond, Cx::Acc, next);
             for prev in o.subs.as_slice().get(..k).unwrap_or(&[]).iter() {
-                let kk = self.b.p4(P4::Expr(prev.cond.clone()));
                 let tmp = self.tmp;
+                #[cfg(feature = "sql")]
+                if crate::query::has_sub(&prev.cond) {
+                    self.val_sub(&prev.cond, Cx::Acc, tmp, EVAL_COND);
+                    self.b.jump(Code::If, tmp, next, 0, 0, 0);
+                    continue;
+                }
+                let kk = self.b.p4(P4::Expr(prev.cond.clone()));
                 self.b.emit(Code::Eval, 0, tmp, 0, kk, EVAL_COND | EVAL_ACC);
                 self.b.jump(Code::If, tmp, next, 0, 0, 0);
             }

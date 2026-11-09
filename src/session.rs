@@ -142,6 +142,8 @@ mod trigger;
 mod vtab;
 #[cfg(feature = "expr_index")]
 mod xindex;
+#[cfg(all(feature = "vm", feature = "sql"))]
+pub(crate) use cte::RecQueue;
 #[cfg(all(feature = "vm", feature = "planner"))]
 pub(crate) use join::{BLOOM_BYTES, auto_sort, auto_span, bloom_build, bloom_hash, bloom_may};
 #[cfg(all(feature = "vm", feature = "expr_index"))]
@@ -1084,6 +1086,44 @@ pub(crate) struct QueryPlan {
     /// The pin's select number (v0.16, `explain`; `SubPlan::sel`).
     #[cfg(feature = "explain")]
     sel: u32,
+}
+
+#[cfg(all(feature = "vm", feature = "sql"))]
+impl QueryPlan {
+    /// A subquery's plan as a query plan, for the bytecode VM's code
+    /// generator (ADR 0005 Stage 2, unit `vm_subqueries`): the same
+    /// sources, expressions and compound tails. What only a subquery
+    /// has (its id, correlation, result column, recursion, shared
+    /// materialization) stays with the `SubPlan`.
+    pub(crate) fn of_sub(p: &crate::query::SubPlan) -> QueryPlan {
+        let mut compound = AVec::new();
+        for (op, t) in p.compound.iter() {
+            compound.push((*op, Box::new(QueryPlan::of_sub(t))));
+        }
+        QueryPlan {
+            sources: p.sources.clone(),
+            items: p.items.clone(),
+            filter: p.filter.clone(),
+            group_by: p.group_by.clone(),
+            having: p.having.clone(),
+            order_by: p.order_by.clone(),
+            distinct: p.distinct,
+            limit: p.limit.clone(),
+            offset: p.offset.clone(),
+            has_agg: p.has_agg,
+            width: p.width(),
+            compound,
+            values: p.values.clone(),
+            comp_order: p.comp_order.clone(),
+            #[cfg(feature = "explain")]
+            sel: p.sel,
+        }
+    }
+
+    /// The compound ORDER BY (`SubPlan::comp_order`).
+    pub(crate) fn comp_order(&self) -> &[(usize, crate::sql::SortOrder)] {
+        self.comp_order.as_slice()
+    }
 }
 
 /// One compound member core's ORDER BY matching data (v0.16;
@@ -14460,7 +14500,10 @@ fn resolve_compound_order<E>(
 /// rows are a UNION ALL chain of one-row cores, and the first
 /// row with a collation lends it.
 #[cfg(feature = "query")]
-fn core_colls(items: &[RExpr], values: &[AVec<RExpr>]) -> AVec<Option<crate::record::Coll>> {
+pub(crate) fn core_colls(
+    items: &[RExpr],
+    values: &[AVec<RExpr>],
+) -> AVec<Option<crate::record::Coll>> {
     use crate::query::{expr_coll, is_constant, item_result_affinity};
     let mut out = AVec::new();
     let Some(first) = values.first() else {
@@ -14488,7 +14531,7 @@ fn core_colls(items: &[RExpr], values: &[AVec<RExpr>]) -> AVec<Option<crate::rec
 /// `multiSelectCollSeq`): the leftmost core whose item `i` has
 /// one decides; BINARY when none does.
 #[cfg(feature = "sql")]
-fn compound_col_coll<'x>(
+pub(crate) fn compound_col_coll<'x>(
     cores: impl Iterator<Item = &'x AVec<Option<crate::record::Coll>>>,
     i: usize,
 ) -> crate::record::Coll {
@@ -14534,7 +14577,7 @@ fn dedup_compound_rows(
 /// Compare two compound rows ascending by every column under
 /// the merge key's collations (v0.16).
 #[cfg(feature = "sql")]
-fn compound_key_cmp(
+pub(crate) fn compound_key_cmp(
     a: &[OwnedValue],
     b: &[OwnedValue],
     colls: &[crate::record::Coll],
@@ -14653,7 +14696,7 @@ fn merge_compound(
 /// without it and sort the result afterwards; the final stable
 /// sort by `order` below covers both shapes.
 #[cfg(feature = "sql")]
-fn run_compound(
+pub(crate) fn run_compound(
     head: AVec<AVec<OwnedValue>>,
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
     cores: &[AVec<Option<crate::record::Coll>>],
@@ -14772,7 +14815,7 @@ fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
 /// bound limits and a subquery's own `LIMIT X` (rewritten to
 /// `X <> 0`) keep the sorted answer.
 #[cfg(feature = "sql")]
-fn union_first_row(
+pub(crate) fn union_first_row(
     limit: &Option<RExpr>,
     offset: &Option<RExpr>,
     order: &[(usize, crate::sql::SortOrder)],
@@ -14789,7 +14832,7 @@ fn union_first_row(
 /// The first row of the first core that has one (see
 /// `union_first_row`).
 #[cfg(feature = "sql")]
-fn first_core_row(
+pub(crate) fn first_core_row(
     head: AVec<AVec<OwnedValue>>,
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
 ) -> AVec<AVec<OwnedValue>> {
@@ -15070,7 +15113,7 @@ fn need_bounds(p: &crate::query::SubPlan) -> bool {
 /// LIMIT, so an endless recursive CTE read through a WHERE or a
 /// join answers (v0.16 review fix, `sql`).
 #[cfg(feature = "sql")]
-fn streams_first(sources: &[SourcePlan], plain: bool) -> bool {
+pub(crate) fn streams_first(sources: &[SourcePlan], plain: bool) -> bool {
     plain
         && !sources.iter().any(|s| {
             matches!(

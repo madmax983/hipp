@@ -232,6 +232,12 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   restartable index cursors), aggregates, GROUP BY / HAVING and
   DISTINCT now run on the VM too; subqueries, compounds, CTEs / views,
   windows and virtual sources still hand off to today's executor.
+- **The bytecode VM, third unit** (hidden feature `vm`). Scalar, IN
+  and EXISTS subqueries (correlated or not, anywhere in a SELECT, in
+  aggregate arguments too), FROM subqueries, views and CTEs, compounds
+  and VALUES, and recursive CTEs run on the VM, with today's laziness,
+  once-per-statement caching and subquery-execution counts; windows,
+  virtual and table-valued sources and `sqlite_schema` still hand off.
 
 ## What v0.16 does
 
