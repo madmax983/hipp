@@ -209,6 +209,17 @@ below the VM — by making **the instruction the restart unit**:
   An opcode therefore needs at most "pages per op" frames: about the tree
   depth plus siblings, the same bound SQLite has. Running out is today's
   `Error::CacheExhausted`.
+  *Amendment (Stage 2, `vm_core` review fixes, 2026-11-09):* pinning
+  frames made the VM need as many frames as the tree is high, where
+  today's executor reads one page at a time and runs in a one-frame
+  cache (`Config::cache_pages` has no lower bound; `Config::tiny()`
+  has 4 frames). The pages an attempt read are instead recorded in a
+  VM-side set (`pager::Held`), and the miss that ends the attempt
+  copies those frames into it; the next attempt reads the copies, so
+  the driver may evict any frame and an opcode completes with one
+  free frame. Hit-only attempts copy nothing. The copies are dropped
+  when the opcode completes, so they never outlive it (the statement
+  holds the connection mutably, so no write can come between).
 - **In Stages 2–3, B-tree writes are not made sync.** Insert, IdxInsert,
   Delete, IdxDelete, CreateBtree and Destroy run as **driver-awaited
   ops**:
@@ -515,4 +526,6 @@ Reasoning:
   5. **The migration is long.** The `Host` seam keeps every intermediate
      state shippable.
   6. **The memory bound on pinned pages per opcode.** It is the same as
-     SQLite's and errors as today.
+     SQLite's and errors as today. (Amended: the held pages are copies
+     outside the cache, taken only on a miss, about one page per tree
+     level; the cache itself needs one frame.)

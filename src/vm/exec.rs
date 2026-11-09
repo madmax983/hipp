@@ -9,7 +9,7 @@ use super::rows::{AggRun, Eph, Groups};
 use super::{Exec, Program};
 use crate::arena::AVec;
 use crate::error::Error;
-use crate::pager::PagerCore;
+use crate::pager::{Held, PagerCore};
 use crate::query::{Ctx, Env, RowData};
 use crate::record::OwnedValue;
 
@@ -19,10 +19,10 @@ pub(crate) struct Vm {
     pc: usize,
     regs: AVec<OwnedValue>,
     curs: AVec<Cursor>,
-    /// The pages the opcode at `pc` has read so far (the driver keeps
-    /// them in the cache while it services a miss). Cleared when an
-    /// opcode completes.
-    pins: AVec<u32>,
+    /// The pages the opcode at `pc` has read so far (copied when it
+    /// misses, so its next run reads them whatever the driver
+    /// evicts). Cleared when an opcode completes.
+    pins: Held,
     /// The last result row and its rowid (`take_row`).
     out: AVec<OwnedValue>,
     out_rowid: Option<i64>,
@@ -80,7 +80,7 @@ impl Vm {
             pc: 0,
             regs: AVec::new(),
             curs: AVec::new(),
-            pins: AVec::new(),
+            pins: Held::default(),
             out: AVec::new(),
             out_rowid: None,
             empty: RowData::empty(),
@@ -111,11 +111,6 @@ impl Vm {
     /// Whether the program runs on the VM (holds no `Host`).
     pub(crate) fn on_vm(&self) -> bool {
         self.prog.on_vm()
-    }
-
-    /// The pages the pending opcode keeps (`Pager::vm_service`).
-    pub(crate) fn pins(&self) -> &[u32] {
-        self.pins.as_slice()
     }
 
     /// The row `Exec::Row` announced, swapped into `into`, and its
@@ -526,7 +521,7 @@ fn row_at<'a>(
     curs: &'a mut AVec<Cursor>,
     prog: &Program,
     core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+    pins: &mut Held,
     c: u16,
 ) -> Result<core::result::Result<RowRef<'a>, crate::pager::Io>, Error<()>> {
     match curs.as_mut_slice().get_mut(usize::from(c)) {

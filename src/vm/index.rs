@@ -9,9 +9,9 @@
 //! step inside a leaf touches nothing until the entry is decoded; a
 //! step across pages works on a copy of the page stack) and commits
 //! only when no page was missing. Every page a move reads, overflow
-//! pages included, stays pinned until the opcode completes, so a key
-//! whose overflow chain is longer than the page cache is
-//! `CacheExhausted` (a key of several pages; the corpus has none).
+//! pages included, is held until the opcode completes (`pager::Held`:
+//! copied when the opcode misses), so a move completes in a one-frame
+//! cache whatever the tree's height or a key's overflow chain.
 //!
 //! The walk's per-entry test (`walk_test`), the probe sets
 //! (`probe_list`) and the covering-index row (`cover_row`) port
@@ -23,7 +23,7 @@ use super::cursor::{Sync, fetch};
 use crate::arena::AVec;
 use crate::btree::{self, KeyPart};
 use crate::error::Error;
-use crate::pager::{PagerCore, be_u32};
+use crate::pager::{Held, PagerCore, be_u32};
 use crate::record::{Affinity, KeyOrder, OwnedValue, compare_coll, compare_coll_in};
 use core::cmp::Ordering;
 
@@ -74,9 +74,8 @@ pub(crate) struct IdxCursor {
 }
 
 /// A snapshot of `page` as a cursor frame.
-fn frame(core: &mut PagerCore<'_>, pins: &mut AVec<u32>, page: u32) -> Sync<Frame> {
-    let idx = ready!(fetch(core, pins, page, true));
-    let bytes = core.data(idx);
+fn frame(core: &mut PagerCore<'_>, pins: &mut Held, page: u32) -> Sync<Frame> {
+    let bytes = ready!(fetch(core, pins, page, true));
     let h = btree::head::<()>(bytes, page)?;
     let interior = match h.kind {
         btree::KIND_LEAF_INDEX => false,
@@ -109,10 +108,10 @@ fn child(f: &Frame, i: usize) -> Result<u32, Error<()>> {
 }
 
 /// Entry `i` of frame `f`, decoded (its overflow pages read and
-/// pinned; a UTF-16 database's text read as UTF-8).
+/// held; a UTF-16 database's text read as UTF-8).
 fn entry_of(
     core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+    pins: &mut Held,
     f: &Frame,
     i: usize,
     nfields: usize,
@@ -140,8 +139,7 @@ fn entry_of(
         if hops > core.page_count().saturating_add(1) {
             return Err(Error::OverflowChainCycle);
         }
-        let idx = ready!(fetch(core, pins, next, true));
-        let d = core.data(idx);
+        let d = ready!(fetch(core, pins, next, true));
         if d.len() < 4 {
             return Err(Error::CorruptPage { page: next });
         }
@@ -166,7 +164,7 @@ fn entry_of(
 /// entry and `true`, or the lower bound the search ended at.
 fn search(
     core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+    pins: &mut Held,
     f: &Frame,
     nfields: usize,
     probe: &[KeyPart],
@@ -190,7 +188,7 @@ fn search(
 /// it), or `None` at the end of the tree.
 fn advance(
     core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+    pins: &mut Held,
     stack: &mut AVec<Frame>,
     nfields: usize,
 ) -> Sync<Option<AVec<OwnedValue>>> {
@@ -258,7 +256,7 @@ impl IdxCursor {
     }
 
     /// The first entry; false for an empty index.
-    pub(crate) fn rewind(&mut self, core: &mut PagerCore<'_>, pins: &mut AVec<u32>) -> Sync<bool> {
+    pub(crate) fn rewind(&mut self, core: &mut PagerCore<'_>, pins: &mut Held) -> Sync<bool> {
         let mut st = AVec::new();
         st.push(ready!(frame(core, pins, self.root)));
         let e = ready!(advance(core, pins, &mut st, self.nfields));
@@ -270,7 +268,7 @@ impl IdxCursor {
     pub(crate) fn seek(
         &mut self,
         core: &mut PagerCore<'_>,
-        pins: &mut AVec<u32>,
+        pins: &mut Held,
         probe: &[KeyPart],
         desc: &[KeyOrder],
     ) -> Sync<bool> {
@@ -306,7 +304,7 @@ impl IdxCursor {
     }
 
     /// The next entry; false past the last one.
-    pub(crate) fn next(&mut self, core: &mut PagerCore<'_>, pins: &mut AVec<u32>) -> Sync<bool> {
+    pub(crate) fn next(&mut self, core: &mut PagerCore<'_>, pins: &mut Held) -> Sync<bool> {
         if !self.valid {
             return Ok(Ok(false));
         }

@@ -13,10 +13,13 @@
 //! `PagerCore`, which never touches storage. An opcode that needs a
 //! page not in the cache returns `Exec::Pending(io)` having changed
 //! no register, no cursor position and not `pc`; the driver does the
-//! I/O (`Pager::vm_service`) and runs the same opcode again. The pages
-//! an opcode has read stay pinned until it completes, so it needs at
-//! most "pages per opcode" frames (a cursor's descent from the root to
-//! a leaf); fewer is `CacheExhausted`, as today. The VM state (pc,
+//! I/O (`Pager::vm_service`) and runs the same opcode again. The miss
+//! copies the pages the opcode had read (`pager::Held`), and its next
+//! run reads those copies, so the driver may evict any frame and an
+//! opcode completes with a single free frame, whatever the tree's
+//! height: the VM runs at every cache size today's executor runs at,
+//! one frame included (none is `CacheExhausted`, as today). The copies
+//! are dropped when the opcode completes. The VM state (pc,
 //! registers, cursors) lives in the `Statement`, so dropping the step
 //! future at its one `.await` is safe (SPEC §5.1.1).
 //!

@@ -1680,9 +1680,6 @@ impl<S: Storage> Connection<S> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
         }
-        // A VM statement dropped while its I/O ran left its pins.
-        #[cfg(feature = "vm")]
-        self.pager.vm_unpin();
         // `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`).
         #[cfg(feature = "explain")]
         if let Some(at) = eqp::query_plan_prefix::<S::Error>(sql.as_bytes())? {

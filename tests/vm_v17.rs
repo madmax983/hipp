@@ -21,11 +21,12 @@
 //! - **Fallback.** Every shape no unit claims yet fails under
 //!   `vm_strict` with `Error::VmFallback`, and without it runs on
 //!   today's executor (`runs_on_vm` false) with the pin's rows.
-//! - **Restart.** The corpus again with the smallest page cache that
-//!   holds one opcode's pages (three frames: the big table's height),
-//!   so nearly every opcode misses, is re-run after the read, and
-//!   must give the same rows; a smaller cache is `CacheExhausted`,
-//!   never a wrong row or a livelock.
+//! - **Restart.** The corpus again with the smallest page cache the
+//!   engine allows (one frame) and with two, so nearly every opcode
+//!   misses, is re-run after the read, and must give the same rows:
+//!   a miss copies the pages the opcode read, so a descent of any
+//!   height completes in one frame, as today's executor does (no
+//!   frame at all fails on both alike).
 //! - **Cancellation.** A storage whose reads return `Pending` first:
 //!   step futures dropped after one poll, again and again, then the
 //!   next step (and a reset part-way) give exactly the
@@ -614,6 +615,23 @@ fn unclaimed_shapes_fall_back_whole() {
         });
         assert!(!ok && rows.is_empty(), "strict must refuse: {q}");
         assert!(matches!(e, Some(Error::VmFallback)), "{q}: {e:?}");
+        // Regression: asking the coverage hook before the first step
+        // compiles the program, and used to turn strict mode off for
+        // the statement (the first step then ran on today's
+        // executor).
+        let h = copy_of(&base, &format!("vm17-uc{i}-k"));
+        let (on_vm, first) = block_on(async {
+            let fs = FileStorage::open(&h).expect("fs open");
+            let mut db = Connection::open(fs, strict()).await.expect("open");
+            let mut q2 = db.prepare(q).await.expect("prepare");
+            let on_vm = q2.runs_on_vm();
+            (on_vm, q2.step().await.err())
+        });
+        assert!(!on_vm, "unclaimed but on the VM: {q}");
+        assert!(
+            matches!(first, Some(Error::VmFallback)),
+            "{q}: hook first: {first:?}"
+        );
         // Default: today's executor, the pin's rows.
         let h = copy_of(&base, &format!("vm17-uc{i}-h"));
         let o = copy_of(&base, &format!("vm17-uc{i}-o"));
@@ -680,56 +698,150 @@ fn statements_other_than_select_never_compile() {
 /// runs again.
 fn restart_corpus(pages: usize) {
     let cfg = strict().cache_pages(pages);
-    let base = pin_t("t-rs");
+    let base = pin_t(&format!("t-rs{pages}"));
     corpus(&base, &format!("rs{pages}-"), &cfg, OK);
     for (i, q) in ERRORS.iter().enumerate() {
         same_on(&base, &format!("rs{pages}e{i}"), cfg.clone(), q);
     }
-    let big = pin_file("rsbig", &big_setup(3000));
+    let big = pin_file(&format!("rsbig{pages}"), &big_setup(3000));
     corpus(&big, &format!("rs{pages}b"), &cfg, BIG);
 }
 
 #[test]
 fn restart_with_the_smallest_cache() {
-    // The big table is three levels high: a descent from its root to
-    // a leaf, the most pages one opcode holds at once, needs three
-    // frames.
-    restart_corpus(3);
+    // One frame, the smallest cache the engine allows: the big table
+    // is three levels high, so every descent misses at each level.
+    restart_corpus(1);
 }
 
 #[test]
-fn restart_with_a_cache_too_small_for_one_opcode() {
-    // Two frames cannot hold a descent of the three-level big table:
-    // the cursor stops with CacheExhausted rather than looping (each
-    // run evicting the page the last one read) or misreading.
-    let base = pin_file("tiny", &big_setup(3000));
-    let h = copy_of(&base, "vm17-tiny-h");
-    let r = block_on(async {
+fn restart_with_two_frames() {
+    restart_corpus(2);
+}
+
+/// `sql`'s rows (or its failure) on a copy of `base`, under `cfg`.
+fn rows_of(
+    base: &std::path::Path,
+    tag: &str,
+    cfg: Config,
+    sql: &str,
+) -> Result<Vec<String>, String> {
+    let h = copy_of(base, tag);
+    block_on(async {
         let fs = FileStorage::open(&h).expect("fs open");
-        let mut db = Connection::open(fs, strict().cache_pages(2))
+        let mut db = Connection::open(fs, cfg)
             .await
-            .expect("open");
-        let mut q = db.prepare("SELECT id FROM big").await?;
-        let mut n = 0usize;
-        while q.step().await? == Step::Row {
-            n += 1;
+            .map_err(|e| format!("{e:?}"))?;
+        let mut q = db.prepare(sql).await.map_err(|e| format!("{e:?}"))?;
+        let mut rows = Vec::new();
+        loop {
+            match q.step().await {
+                Ok(Step::Row) => rows.push(render(&q)),
+                Ok(Step::Done) => return Ok(rows),
+                Err(e) => return Err(format!("{e:?}")),
+            }
         }
-        Ok::<usize, Error<FsError>>(n)
-    });
-    assert!(matches!(r, Err(Error::CacheExhausted)), "{r:?}");
+    })
+}
+
+#[test]
+fn deep_trees_read_in_a_cache_smaller_than_their_height() {
+    // Regression: an opcode used to pin every page of its descent, so
+    // a tree taller than the cache was `CacheExhausted` on the VM
+    // (1 frame for a 2-level table, 2 for a 3-level one) where
+    // today's executor returns the pin's rows.
+    let two = pin_file(
+        "deep2",
+        "PRAGMA page_size = 512; CREATE TABLE t(a INTEGER PRIMARY KEY, b); \
+         WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 200) \
+         INSERT INTO t SELECT i, 'row' || i FROM r;",
+    );
+    let three = pin_file(
+        "deep3",
+        "PRAGMA page_size = 512; CREATE TABLE t(a INTEGER PRIMARY KEY, b); \
+         WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 20000) \
+         INSERT INTO t SELECT i, 'row' || i FROM r;",
+    );
+    let qs = [
+        "SELECT a, b FROM t WHERE a % 50 = 0;",
+        "SELECT b FROM t WHERE a = 150;",
+        "SELECT a FROM t WHERE a > 120 AND a < 140 ORDER BY a DESC;",
+        "SELECT a, b FROM t ORDER BY b DESC LIMIT 3;",
+        "SELECT count(*) FROM t;",
+    ];
+    for (base, tag) in [(&two, "d2"), (&three, "d3")] {
+        for pages in [1, 2, 3] {
+            for (i, q) in qs.iter().enumerate() {
+                same_on(
+                    base,
+                    &format!("{tag}-{pages}-{i}"),
+                    strict().cache_pages(pages),
+                    q,
+                );
+            }
+        }
+    }
+    // No frame at all: the VM and today's executor fail alike.
+    let vm = rows_of(
+        &three,
+        "vm17-d0-vm",
+        Config::default().cache_pages(0),
+        qs[1],
+    );
+    let legacy = rows_of(
+        &three,
+        "vm17-d0-legacy",
+        Config::default().cache_pages(0).vm_off(true),
+        qs[1],
+    );
+    assert!(vm.is_err(), "{vm:?}");
+    assert_eq!(vm, legacy);
+}
+
+/// Index keys of several overflow pages, seeks and scans through a
+/// one- and two-frame cache (the index cursors of unit `vm_joins`
+/// hold their pages the same way).
+#[cfg(feature = "expr_index")]
+#[test]
+fn index_keys_longer_than_the_cache_read_in_one_frame() {
+    let base = pin_file(
+        "ixov",
+        "PRAGMA page_size = 512; CREATE TABLE w(a INTEGER PRIMARY KEY, s TEXT, n INT); \
+         CREATE INDEX ws ON w(s); CREATE INDEX wn ON w(n); \
+         WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 300) \
+         INSERT INTO w SELECT i, printf('%.1800c', char(97 + i % 26)) || i, i % 17 FROM r;",
+    );
+    let qs = [
+        "SELECT a, length(s) FROM w WHERE s > printf('%.1800c', 'q') ORDER BY s LIMIT 5;",
+        "SELECT a FROM w WHERE s = printf('%.1800c', 'c') || '106';",
+        "SELECT a, n FROM w WHERE n = 3 ORDER BY a;",
+        "SELECT count(*), min(s) = max(s) FROM w WHERE s < 'b';",
+    ];
+    for pages in [1, 2] {
+        for (i, q) in qs.iter().enumerate() {
+            same_on(
+                &base,
+                &format!("ixov{pages}-{i}"),
+                strict().cache_pages(pages),
+                q,
+            );
+        }
+    }
 }
 
 #[test]
 fn a_small_cache_reads_overflow_chains_longer_than_itself() {
     // 18,000-byte values over 512-byte pages: chains of 35 pages
-    // through a cache of 3 frames.
+    // through a cache of 1 to 3 frames.
     let base = pin_file("chain", &big_setup(10));
-    same_on(
-        &base,
-        "chain",
-        strict().cache_pages(3),
-        "SELECT id, length(txt), substr(txt, -5), hex(substr(blob, -2)) FROM ov ORDER BY id DESC;",
-    );
+    for pages in [1, 2, 3] {
+        same_on(
+            &base,
+            &format!("chain{pages}"),
+            strict().cache_pages(pages),
+            "SELECT id, length(txt), substr(txt, -5), hex(substr(blob, -2)) FROM ov ORDER BY id DESC;",
+        );
+    }
 }
 
 // ---------------- cancellation: dropped step futures ----------------
@@ -862,7 +974,7 @@ fn dropped_step_futures_resume_exactly() {
         "SELECT id, s FROM big WHERE id = 291;",
     ] {
         let (_, want) = oracle_script(&o, sql);
-        for (pages, drops) in [(16, 1), (3, 1), (3, 3), (5, 2)] {
+        for (pages, drops) in [(16, 1), (3, 1), (3, 3), (5, 2), (1, 1), (1, 3), (2, 2)] {
             let (got, dropped) = rows_with_drops(&mem, strict().cache_pages(pages), sql, drops);
             assert_eq!(got, want, "{sql} (cache {pages}, drops {drops})");
             // Every query reads pages it misses: futures were dropped
@@ -880,7 +992,7 @@ fn reset_part_way_starts_over() {
     let sql = "SELECT id, k FROM big WHERE k < 50 ORDER BY k, id;";
     let (_, want) = oracle_script(&o, sql);
     let st = SlowReads(mem.clone());
-    let mut db = block_on(Connection::open(st, strict().cache_pages(3))).expect("open");
+    let mut db = block_on(Connection::open(st, strict().cache_pages(1))).expect("open");
     let mut q = block_on(db.prepare(sql)).expect("prepare");
     // Three rows, then a step future dropped mid-read, then reset.
     for _ in 0..3 {
@@ -1040,5 +1152,5 @@ fn generated_single_table_selects_match_the_pin() {
     }
     let qs: Vec<&str> = qs.iter().map(String::as_str).collect();
     corpus(&base, "gen", &strict(), &qs);
-    corpus(&base, "genrs", &strict().cache_pages(3), &qs);
+    corpus(&base, "genrs", &strict().cache_pages(1), &qs);
 }

@@ -42,6 +42,14 @@ All notable changes to hipp. Versions follow the milestones in
   ORDER BY term (the pin never computes it), and LIMIT 0 (nothing,
   not even the WHERE or OFFSET, is computed); so does `LIMIT 0 OFFSET
   <error>` over a table.
+- Review fixes: the VM no longer needs a page-cache frame per B-tree
+  level. A miss copies the pages the opcode had read, so a SELECT on
+  the VM runs at every cache size today's executor runs at (one
+  frame included) instead of failing with `CacheExhausted` on trees
+  taller than the cache, and index keys with overflow chains longer
+  than the cache read too. Asking `Statement::runs_on_vm` before the
+  first step no longer turns `Config::vm_strict` off for that
+  statement.
 
 ### Breaking: feature renames
 

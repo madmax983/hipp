@@ -30,7 +30,8 @@
 //!   aggregate queries (xorshift) give exactly the rows, order and
 //!   errors of the executor the VM replaces (`Config::vm_off`), and
 //!   the pin's rows wherever today's executor gives them.
-//! - **Restart**: the corpus again with the smallest page cache, so
+//! - **Restart**: the corpus again with the smallest page cache (one
+//!   frame), so
 //!   nearly every index seek and step misses and runs again.
 #![cfg(feature = "vm")]
 
@@ -452,12 +453,13 @@ fn big_tables_match_the_pin() {
     corpus(&base, "b", &strict(), BIG);
 }
 
-/// Every corpus again with a page cache of three frames (the big
-/// file's height): nearly every seek, step and row read misses, the
-/// page is read and the opcode runs again — same rows.
+/// Every corpus again with a page cache of one frame, the smallest
+/// the engine allows (the big file is three levels high): nearly
+/// every seek, step and row read misses, the page is read and the
+/// opcode runs again — same rows.
 #[test]
 fn restart_with_the_smallest_cache() {
-    let cfg = strict().cache_pages(3);
+    let cfg = strict().cache_pages(1);
     let base = pin_file("rs", &format!("{S} {G2}"));
     corpus(&base, "rsj", &cfg, JOINS);
     corpus(&base, "rsg", &cfg, AGGS);
@@ -706,7 +708,7 @@ fn planner_suites_run_strict_on_the_vm() {
     let stat = format!("{JO} CREATE INDEX cs ON c(s); ANALYZE;");
     corpus(&pin_file("jos", &stat), "jos", &cfg, JO_STAT_Q);
     // The restart rule under the minimum cache, for every one of them.
-    let small = strict().cache_pages(3);
+    let small = strict().cache_pages(1);
     corpus(&pin_file("mi-r", MI), "mi-r", &small, MI_OR);
     corpus(&pin_file("mij-r", MI_JOIN), "mij-r", &small, MI_JOIN_Q);
     corpus(&pin_file("mm-r", MM), "mm-r", &small, MM_Q);

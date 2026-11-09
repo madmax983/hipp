@@ -10,14 +10,16 @@
 //! (a copy of the descent stack, a snapshot of the new leaf) and
 //! commits it only when every page it needed was in the cache; a
 //! miss returns the I/O to do (`Err(io)` inside `Ok`) with the cursor
-//! as it was. The pages a descent reads are recorded in `pins`, so
-//! the driver keeps them while it loads the next one.
+//! as it was. The pages a descent reads are recorded in `pins`
+//! (`pager::Held`): a miss copies them, so the next run of the opcode
+//! reads them again whatever the driver evicted to load the missing
+//! one, and a descent of any height completes in a one-frame cache.
 
 use super::Io;
 use crate::arena::AVec;
 use crate::btree::{self, CellMeta};
 use crate::error::Error;
-use crate::pager::{Got, PagerCore, be_u32};
+use crate::pager::{Held, PagerCore, be_u32};
 use crate::query::RowData;
 use crate::record::{Affinity, OwnedValue, Value};
 use crate::sql::SortOrder;
@@ -133,16 +135,15 @@ enum Aim {
     Key(i64),
 }
 
-pub(crate) fn fetch(
-    core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+/// The bytes of `page` (`PagerCore::get`; `keep`: the opcode reads
+/// it again when it runs again).
+pub(crate) fn fetch<'s>(
+    core: &'s mut PagerCore<'_>,
+    pins: &'s mut Held,
     page: u32,
     keep: bool,
-) -> Sync<usize> {
-    Ok(match core.get(page, pins, keep)? {
-        Got::Hit(i) => Ok(i),
-        Got::Miss(io) => Err(io),
-    })
+) -> Sync<&'s [u8]> {
+    core.get(page, pins, keep)
 }
 
 /// Descend from `page` to a leaf, pushing the interior pages passed
@@ -151,7 +152,7 @@ pub(crate) fn fetch(
 /// the cell count).
 fn descend(
     core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+    pins: &mut Held,
     mut page: u32,
     aim: Aim,
     levels: &mut AVec<Level>,
@@ -160,9 +161,8 @@ fn descend(
         if levels.len() > MAX_DEPTH {
             return Err(Error::CorruptPage { page });
         }
-        let idx = ready!(fetch(core, pins, page, true));
         let usable = core.usable() as usize;
-        let bytes = core.data(idx);
+        let bytes = ready!(fetch(core, pins, page, true));
         let h = btree::head::<()>(bytes, page)?;
         if h.is_leaf() {
             if h.kind != btree::KIND_LEAF_TABLE {
@@ -205,7 +205,7 @@ fn descend(
 /// first cell; `None` at the end of the tree.
 fn next_leaf(
     core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+    pins: &mut Held,
     levels: &mut AVec<Level>,
 ) -> Sync<Option<(Leaf, usize)>> {
     loop {
@@ -230,7 +230,7 @@ fn next_leaf(
 #[cfg(feature = "expr_index")]
 fn prev_leaf(
     core: &mut PagerCore<'_>,
-    pins: &mut AVec<u32>,
+    pins: &mut Held,
     levels: &mut AVec<Level>,
 ) -> Sync<Option<(Leaf, usize)>> {
     loop {
@@ -300,7 +300,7 @@ impl TableCursor {
     }
 
     /// The first row; false for an empty table.
-    pub(crate) fn rewind(&mut self, core: &mut PagerCore<'_>, pins: &mut AVec<u32>) -> Sync<bool> {
+    pub(crate) fn rewind(&mut self, core: &mut PagerCore<'_>, pins: &mut Held) -> Sync<bool> {
         let mut lv = AVec::new();
         let (leaf, _) = ready!(descend(core, pins, self.root, Aim::First, &mut lv));
         let at = if leaf.cells.is_empty() {
@@ -313,7 +313,7 @@ impl TableCursor {
 
     /// The last row; false for an empty table.
     #[cfg(feature = "expr_index")]
-    pub(crate) fn last(&mut self, core: &mut PagerCore<'_>, pins: &mut AVec<u32>) -> Sync<bool> {
+    pub(crate) fn last(&mut self, core: &mut PagerCore<'_>, pins: &mut Held) -> Sync<bool> {
         let mut lv = AVec::new();
         let (leaf, n) = ready!(descend(core, pins, self.root, Aim::Last, &mut lv));
         let at = match n.checked_sub(1) {
@@ -324,7 +324,7 @@ impl TableCursor {
     }
 
     /// The next row; false past the last one.
-    pub(crate) fn next(&mut self, core: &mut PagerCore<'_>, pins: &mut AVec<u32>) -> Sync<bool> {
+    pub(crate) fn next(&mut self, core: &mut PagerCore<'_>, pins: &mut Held) -> Sync<bool> {
         if !self.valid {
             return Ok(Ok(false));
         }
@@ -339,7 +339,7 @@ impl TableCursor {
 
     /// The previous row; false before the first one.
     #[cfg(feature = "expr_index")]
-    pub(crate) fn prev(&mut self, core: &mut PagerCore<'_>, pins: &mut AVec<u32>) -> Sync<bool> {
+    pub(crate) fn prev(&mut self, core: &mut PagerCore<'_>, pins: &mut Held) -> Sync<bool> {
         if !self.valid {
             return Ok(Ok(false));
         }
@@ -356,7 +356,7 @@ impl TableCursor {
     pub(crate) fn seek_rowid(
         &mut self,
         core: &mut PagerCore<'_>,
-        pins: &mut AVec<u32>,
+        pins: &mut Held,
         k: i64,
     ) -> Sync<bool> {
         let mut lv = AVec::new();
@@ -370,7 +370,7 @@ impl TableCursor {
     pub(crate) fn seek_ge(
         &mut self,
         core: &mut PagerCore<'_>,
-        pins: &mut AVec<u32>,
+        pins: &mut Held,
         k: i64,
     ) -> Sync<bool> {
         let mut lv = AVec::new();
@@ -388,7 +388,7 @@ impl TableCursor {
     pub(crate) fn seek_le(
         &mut self,
         core: &mut PagerCore<'_>,
-        pins: &mut AVec<u32>,
+        pins: &mut Held,
         k: i64,
     ) -> Sync<bool> {
         let mut lv = AVec::new();
@@ -417,7 +417,7 @@ impl TableCursor {
     pub(crate) fn load(
         &mut self,
         core: &mut PagerCore<'_>,
-        pins: &mut AVec<u32>,
+        pins: &mut Held,
         info: &TableInfo,
     ) -> Sync<()> {
         if self.decoded {
@@ -449,8 +449,7 @@ impl TableCursor {
             if hops > core.page_count().saturating_add(1) {
                 return Err(Error::OverflowChainCycle);
             }
-            let idx = ready!(fetch(core, pins, page, false));
-            let d = core.data(idx);
+            let d = ready!(fetch(core, pins, page, false));
             let following = match d.get(..4) {
                 Some(_) => be_u32(d, 0),
                 None => return Err(Error::CorruptPage { page }),

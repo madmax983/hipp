@@ -41,7 +41,9 @@ executor.
   entries between their subtrees), the seek with the pin's per-page
   binary search (`btree::IndexCursor::seek_found`'s); a move works on
   copies and commits only when no page was missing, every page it
-  read pinned until the opcode completes.
+  read held until the opcode completes (`pager::Held`, since the
+  `vm_core` review fixes: copied on a miss, so a move completes in a
+  one-frame cache).
 - **Every access path the planners produce**, ported from
   `xindex::access_rows` / `access_walk` rule for rule: rowid lookups
   and ranges read the table directly (per outer row for a lateral
@@ -154,8 +156,8 @@ file at 512-byte pages with two indexes, `multi_index_v17`'s OR,
 min() / max() and skip-scan corpora and `join_order_v17`'s curated
 and statistics corpora (automatic indexes, Bloom filters), all
 against the pin, rows in order; the whole corpus again with a
-3-frame cache (the restart rule for index seeks and the RIGHT / FULL
-second pass); 480 generated queries (xorshift: 1-3 of 4 random
+one-frame cache (3 frames before the `vm_core` review fixes; the
+restart rule for index seeks and the RIGHT / FULL second pass); 480 generated queries (xorshift: 1-3 of 4 random
 tables with random indexes and statistics, every join kind, IN /
 range / OR / expression / partial-index terms, GROUP BY / HAVING,
 aggregates, DISTINCT, ORDER BY, LIMIT / OFFSET) that must all run on
@@ -181,7 +183,7 @@ the VM calls: `group_desc`, `sort_groups`, `groups_arrive_ordered`,
 `group_aggs`, `order_cols`, the automatic-index and Bloom helpers,
 `btree::cmp_entry_probe` / `cell_ptr` / `index_cell_layout`) and
 `cfg(vm)` code. For information: `query,vm` 209,334 B (`query`
-173,800: +35,534; +12,880 over `vm_core`), `sql,vm` 441,472 B (`sql`
+173,800: +35,534; +12,968 over `vm_core`), `sql,vm` 441,472 B (`sql`
 400,184: +41,288), `sql,indexes,vm` 493,964 B (`sql,indexes`
 452,432: +41,532), `sql,indexes,expr_index,planner,vm` 619,136 B
 (559,748: +59,388) — the VM beside the executors it will replace.
@@ -196,8 +198,9 @@ the VM calls: `group_desc`, `sort_groups`, `groups_arrive_ordered`,
   per outer row where today's executor reads it once, so a row whose
   decode fails (a generated column's error) surfaces at that row, as
   on the pin, not before the first one.
-- An index key whose overflow chain is longer than the page cache is
-  `CacheExhausted` on the VM (its pages stay pinned during the seek).
+- (Closed by the `vm_core` review fixes: an index key whose overflow
+  chain is longer than the page cache was `CacheExhausted` on the VM;
+  its pages are now copied on a miss, `pager::Held`.)
 - `IdxSeek`'s `p4` holds a count, not a side-table index (the
   EXPLAIN formatter of `vm_rest` must know it).
 - The two divergences of today's executor above (rows before an error
@@ -215,13 +218,15 @@ executor unchanged.
 
 **Shipped.**
 - **Sync page access** (`pager::PagerCore`, `Pager::vm_core` /
-  `vm_service` / `vm_unpin`): a storage-free view of the page cache.
-  `get(page)` returns the frame on a hit; a miss returns
-  `Io::Read(page)` (an empty or clean frame outside the opcode's pins
-  can take it) or `Io::Spill` (only dirty ones can) and changes
-  nothing; every frame pinned is `CacheExhausted`. The driver's
-  `vm_service` loads or spills with `load` / `spill_one`, which under
-  `vm` take no victim among the pins.
+  `vm_service`): a storage-free view of the page cache. `get(page)`
+  returns the page's bytes on a hit; a miss returns `Io::Read(page)`
+  (an empty or clean frame can take it) or `Io::Spill` (only dirty
+  ones can) and changes no VM state; no frame at all is
+  `CacheExhausted`, as `load` reports it. The pages an opcode read
+  are recorded in its `pager::Held` set, and the miss that ends its
+  run copies those frames there, so the driver's `vm_service` (plain
+  `load` / `spill_one`) may evict any frame and the re-run reads the
+  copies (review fix; first shipped as frame pins, below).
 - **Sync, restartable rowid-table reads** (`vm::cursor::TableCursor`):
   rewind / next / last / prev, rowid seek (exact, GE, LE), payload
   assembly across overflow pages (UTF-16 records transcoded as
@@ -229,7 +234,7 @@ executor unchanged.
   (`decode_source_row`'s rules: rowid alias, defaults past the
   record's end, REAL forcing, generated columns). A move computes the
   new path and leaf snapshot in temporaries and commits only when no
-  page was missing; the pages a descent read are pinned until the
+  page was missing; the pages a descent read are held until the
   opcode completes. The one deliberate exception: an overflow chain
   is copied into a cursor-owned scratch buffer page by page, and that
   copy survives a miss (it is not a position, is cleared by any move,
@@ -344,16 +349,19 @@ table; the legacy scan plan; parameters (one statement executed
 three times with new bindings, a rowid lookup and a range bound by
 parameters); flattened FROM subqueries, views and CTEs (single-table
 plans under `planner`); 20 unclaimed shapes, refused under strict
-before any row and run on today's executor otherwise; the restart
-corpus (everything again with a 3-frame cache, the big table's
-height; overflow chains of 35 pages through 3 frames; a 2-frame
-cache failing with `CacheExhausted`); dropped step futures on a
-storage whose reads are pending first (each step polled once and
-dropped up to three times, caches of 3 to 16 frames, asserting
-futures were dropped while pending) and a reset after a dropped
-future, the connection writing and reading normally afterwards; an
-error then a step (the statement starts over); 120 generated queries
-(xorshift) at the default and the 3-frame cache. The unit test
+before any row (also when `runs_on_vm` is asked first) and run on
+today's executor otherwise; the restart corpus (everything again
+with a 1-frame cache, the smallest the engine allows, and with 2;
+2- and 3-level tables at 1 to 3 frames; index keys of four overflow
+pages and row overflow chains of 35 pages through 1 to 3 frames; no
+frame at all failing on the VM as on today's executor); dropped
+step futures on a storage whose reads are pending first (each step
+polled once and dropped up to three times, caches of 1 to 16
+frames, asserting futures were dropped while pending) and a reset
+after a dropped future at a 1-frame cache, the connection writing
+and reading normally afterwards; an error then a step (the
+statement starts over); 120 generated queries (xorshift) at the
+default and the 1-frame cache. The unit test
 `an_instruction_is_sixteen_bytes` asserts `size_of::<Op>() == 16`.
 `cargo test --workspace --no-fail-fast --features vm` passes (every
 suite, `tests/vm_v17.rs`'s 16 tests and the unit test included), as
@@ -370,9 +378,10 @@ suite, the four no_std targets and the four size gates at Δ 0.
 (76,124), full 0 (476,476), max 0 (962,300), xl 0 (1,058,824) — the
 shared-code changes are visibility (`QueryPlan` and its fields
 `pub(crate)`) and `cfg` predicates widened to `vm`. For information:
-`query,vm` 196,454 B (`query` 173,800: +22,654), `sql,vm` 429,736 B
-(`sql` 400,184: +29,552) — the VM, its codegen and the duplicate sync
-read path, before any executor is deleted.
+`query,vm` 196,366 B (`query` 173,800: +22,566), `sql,vm` 429,728 B
+(`sql` 400,184: +29,544) at 36616a8 (first recorded as 196,454 /
+429,736, measured on an earlier revision) — the VM, its codegen and
+the duplicate sync read path, before any executor is deleted.
 
 **Honest gaps.**
 - Index access, joins, aggregates, DISTINCT, subqueries, compounds,
@@ -392,6 +401,50 @@ read path, before any executor is deleted.
   (`vm_rest`; the orchestrator's CI).
 - No CLI suite: the CLI does not enable `vm`, and the VM's rows render
   through the same `column_*` API.
+- The pages an opcode read are copied outside the page cache when it
+  misses (`pager::Held`: about one page per tree level, or per page
+  of an index key's overflow chain, dropped when the opcode
+  completes); this memory is not charged to the cache budget. A miss
+  in the middle of an index key's overflow chain re-reads the chain's
+  earlier pages from those copies on every re-run (quadratic in the
+  chain length, which only multi-page keys reach).
+
+**Review fixes (2026-11-09, on top of `vm_joins`).**
+- **Small caches** (regression vs today's executor): an opcode pinned
+  every page of its descent, so the VM needed one frame per B-tree
+  level and a plain SELECT was `CacheExhausted` where today's
+  executor returns the pin's rows (1 frame for a 2-level table, 2 for
+  a 3-level one; `Config::tiny()`'s 4 frames for a 5-level one), and
+  `vm_joins`' index keys with overflow chains longer than the cache
+  failed the same way. Now the miss that ends a run copies the frames
+  the opcode read into its `pager::Held` set and the re-run reads the
+  copies, so the driver may evict any frame: the VM runs at every
+  cache size today's executor does, one frame included (none is
+  `CacheExhausted` on both). Hit-only runs copy nothing. The pager's
+  `vm_pins`, `vm_unpin` and the `cfg(vm)` victim filters in `load` /
+  `spill_one` are gone (the shared pager code is back to its pre-VM
+  form). Tests: the restart corpora of `tests/vm_v17.rs` and
+  `tests/vm_joins_v17.rs` now run at 1 frame (and 2), the reviewer's
+  repro (2- and 3-level tables at 1 to 3 frames), index keys of four
+  overflow pages at 1 and 2 frames, cancellation at 1 and 2 frames;
+  the test that asserted `CacheExhausted` at 2 frames is replaced.
+- **`runs_on_vm` before the first step** compiled the program and so
+  skipped the strict check, which ran only when the program was
+  compiled by `vm_step`: an unclaimed shape then ran on today's
+  executor under `vm_strict`. The check now runs on every step
+  (regression test in `unclaimed_shapes_fall_back_whole`).
+- `open_wal`'s doc comment, split from its function by the `Io` block,
+  is back on `open_wal`.
+- The `query,vm` / `sql,vm` figures above are corrected to the
+  committed `vm_core` tree. After these fixes (on `vm_joins`):
+  `query,vm` 209,310 B (−24), `sql,vm` 441,392 B (−80),
+  `sql,indexes,vm` 493,524 B (−440),
+  `sql,indexes,expr_index,planner,vm` 618,872 B (−264). The four
+  profiles are unchanged: tiny 76,124 / full 476,476 / max 962,300 /
+  xl 1,058,824 (Δ 0).
+- Gates: `ci/local-gates.sh` (full), `cargo test --workspace
+  --no-fail-fast --features vm`, and `depth_v16` / `triggers_v16`
+  with debug info with and without `vm` (14 + 33 each way) pass.
 
 ### Features named for capabilities (2026-11-08)
 

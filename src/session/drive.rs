@@ -64,7 +64,9 @@ impl<S: Storage> Statement<'_, S> {
     /// 0005 Stage 2, hidden `vm` feature; a test hook): its program,
     /// compiled now if the statement has not stepped yet, holds no
     /// `Host` hand-off. A statement with parameters compiles again
-    /// for each execution's plan, so ask after its first step.
+    /// for each execution's plan, so ask after its first step. Asking
+    /// changes nothing the statement does: under `Config::vm_strict`
+    /// a statement that falls back still fails with `VmFallback`.
     #[doc(hidden)]
     pub fn runs_on_vm(&mut self) -> bool {
         if !matches!(self.plan, Plan::Query(_) | Plan::Scan { .. }) {
@@ -90,11 +92,13 @@ impl<S: Storage> Statement<'_, S> {
             return None;
         }
         if self.vm.is_none() {
-            let prog = self.vm_program();
-            if !prog.on_vm() && self.conn.cfg.vm_strict {
-                return Some(Err(Error::VmFallback));
-            }
-            self.vm = Some(Box::new(Vm::new(prog)));
+            self.vm = Some(Box::new(Vm::new(self.vm_program())));
+        }
+        // Checked on every step, not only when the program is
+        // compiled, so that `runs_on_vm` (which may compile it first)
+        // never turns strict mode off.
+        if self.conn.cfg.vm_strict && !self.vm.as_deref().is_some_and(Vm::on_vm) {
+            return Some(Err(Error::VmFallback));
         }
         loop {
             let vm = self.vm.as_deref_mut()?;
@@ -114,9 +118,7 @@ impl<S: Storage> Statement<'_, S> {
                     return Some(Ok(Step::Done));
                 }
                 Ok(Exec::Pending(io)) => {
-                    let mut pins = AVec::new();
-                    pins.extend_from_slice(vm.pins());
-                    if let Err(e) = self.conn.pager.vm_service(io, pins.as_slice()).await {
+                    if let Err(e) = self.conn.pager.vm_service(io).await {
                         self.vm_fail();
                         return Some(Err(e));
                     }
