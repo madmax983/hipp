@@ -834,10 +834,9 @@ const EQP_S: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c, d TEXT, e); \
 #[test]
 fn reused_suites_run_strict_on_the_vm() {
     let none = |_: &str| false;
-    // (A min() / max() bare-column row picked over a subquery in its
-    // FILTER: vm_subqueries' `extremum_rep` fallback.)
-    let extremum = |q: &str| q.starts_with("SELECT max(a) FILTER (WHERE") && q.contains("(SELECT");
-    corpus_with_fallbacks(&pin_file("rt", AGG_T), "rt", AGG_T_Q, &extremum);
+    // (The min() / max() bare-column rows picked over a subquery in a
+    // FILTER run on the VM since the vm_subqueries review fixes.)
+    corpus_with_fallbacks(&pin_file("rt", AGG_T), "rt", AGG_T_Q, &none);
     corpus_with_fallbacks(&pin_file("rm", AGG_MIX), "rm", AGG_MIX_Q, &none);
     corpus_with_fallbacks(&pin_file("rf", AGG_FIN), "rf", AGG_FIN_Q, &none);
     corpus_with_fallbacks(&pin_file("rs", "SELECT 1;"), "rsep", AGG_SEP_Q, &none);

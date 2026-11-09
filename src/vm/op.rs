@@ -392,6 +392,23 @@ pub(crate) enum Code {
     /// `p4`, as `ProbeList`); jump to `p2` when it is empty.
     #[cfg(all(feature = "sql", feature = "expr_index"))]
     ProbeSub,
+    /// Register `p3` = the next instruction's address, then jump to
+    /// `p2`: an uncorrelated subquery node's code, shared by every use
+    /// of it over the same joined row (`Return` comes back).
+    #[cfg(feature = "sql")]
+    Gosub,
+    /// Jump to the address in register `p3` (`Gosub`).
+    #[cfg(feature = "sql")]
+    Return,
+    /// One row of a group's bare-column search under a min() / max()
+    /// whose argument holds a subquery (`session::extremum_rep`):
+    /// register `p2` is the argument's value for group set `p1`'s
+    /// current row, and when it is the group's new extremum
+    /// (`extremum_step`: max when `p3` is 1, else min, under the
+    /// argument's collation, `P4::Colls` `p4`) that row is the group's
+    /// bare-column row.
+    #[cfg(feature = "sql")]
+    RepStep,
 }
 
 /// `ResultRow` / `SorterInsert` `p3`: the rowid is the joined row's
@@ -470,6 +487,12 @@ pub(crate) struct SubExpr {
     pub(crate) e: RExpr,
     pub(crate) slots: AVec<u32>,
     pub(crate) aggs: Option<AVec<u32>>,
+    /// Every node is an enclosing query's aggregate folded into a slot
+    /// (`G::owned_aggs`, today's `subst_owned_aggs` literal): once
+    /// substituted the expression has no subquery and evaluates as
+    /// one without (`EVAL_COND` is `query::cond`, not the value's
+    /// truth).
+    pub(crate) plain: bool,
 }
 
 /// A subquery node (`P4::Sub`): what its rows make.

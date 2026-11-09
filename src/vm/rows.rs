@@ -193,6 +193,19 @@ fn empty_rep(qp: &QueryPlan, prefix: &RowData) -> RowData {
     r
 }
 
+/// Whether `qp`'s groups pick their bare-column row by a min() / max()
+/// with a subquery in its argument or FILTER (`session::rep_minmax`,
+/// `extremum_rep`): code searches it, `RepStep` by `RepStep`.
+#[cfg(feature = "sql")]
+pub(crate) fn sub_rep(qp: &QueryPlan) -> bool {
+    crate::session::rep_minmax(
+        qp.items.as_slice(),
+        qp.having.as_ref(),
+        qp.order_by.as_slice(),
+    )
+    .is_some_and(|m| crate::query::has_sub(m.arg) || m.filter.is_some_and(crate::query::has_sub))
+}
+
 /// A GROUP BY's groups (`project_qp_async`'s grouping): each group's
 /// key (its first row's values) and rows, in arrival order; one group
 /// of every row without a GROUP BY.
@@ -213,6 +226,14 @@ pub(crate) struct Groups {
     /// The current group's row `GroupRows` / `GroupRowNext` read.
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     ri: usize,
+    /// The bare-column row is searched by code (`RepStep`): the min()
+    /// / max() that picks it has a subquery in its argument or FILTER
+    /// (`session::extremum_rep`). `next` then starts the search at
+    /// the group's first row, `best` its extremum so far.
+    #[cfg(feature = "sql")]
+    sub_rep: bool,
+    #[cfg(feature = "sql")]
+    best: Option<OwnedValue>,
 }
 
 impl Groups {
@@ -235,6 +256,23 @@ impl Groups {
             rep: RowData::empty(),
             prefix,
             ri: 0,
+            #[cfg(feature = "sql")]
+            sub_rep: sub_rep(qp),
+            #[cfg(feature = "sql")]
+            best: None,
+        }
+    }
+
+    /// One row of the code's bare-column search (`RepStep`,
+    /// `session::extremum_rep`): `v` is the argument's value for the
+    /// current group row; the new extremum makes that row the group's
+    /// bare-column row.
+    #[cfg(feature = "sql")]
+    pub(crate) fn rep_step(&mut self, kind: AggKind, coll: Coll, v: OwnedValue, enc: TextEnc) {
+        if crate::session::extremum_step(kind, coll, &mut self.best, v, enc)
+            && let Some(r) = self.rows().get(self.ri)
+        {
+            self.rep = r.clone();
         }
     }
 
@@ -294,6 +332,17 @@ impl Groups {
             self.cur = usize::MAX;
             return Ok(false);
         };
+        #[cfg(feature = "sql")]
+        if self.sub_rep {
+            self.best = None;
+            self.rep = match rows.as_slice().first() {
+                Some(r) => r.clone(),
+                None => empty_rep(qp, &self.prefix),
+            };
+            self.cur = self.at;
+            self.at = self.at.saturating_add(1);
+            return Ok(true);
+        }
         self.rep = crate::session::pick_rep_from::<()>(
             env,
             qp.items.as_slice(),

@@ -40,11 +40,20 @@
 //!   as the one row of the recursive reference, until the LIMIT or the
 //!   reader's bound.
 //!
-//! Falls back (the whole statement): a query's own aggregate inside a
-//! subquery of its group (`has_owned_sub_agg`), a min() / max() whose
-//! argument holds a subquery picking a group's bare-column row, a
-//! MULTI-INDEX OR branch condition holding one, and every shape the
-//! other generators do not cover.
+//! - **Shared code.** An uncorrelated node's code is a subroutine
+//!   (`Gosub` / `Return`) every use over the same joined row calls; a
+//!   correlated node's is repeated at each use, under the builder's
+//!   instruction budget (`Builder::over`).
+//! - **Outer aggregates.** The query's own aggregates inside its
+//!   subqueries are folded over the group into slots that placeholder
+//!   nodes read (`G::owned_aggs`, today's `subst_owned_aggs`); a min()
+//!   / max() over a subquery picks the group's bare-column row by code
+//!   (`G::rep_search`, today's `extremum_rep`).
+//!
+//! Falls back (the whole statement): a query's own aggregate whose
+//! arguments hold a subquery or that a nested query uses as an access
+//! path's bound, a program past the instruction budget, and every
+//! shape the other generators do not cover.
 
 use super::super::build::Builder;
 use super::super::op::{
@@ -74,9 +83,10 @@ impl G<'_, '_> {
             Cx::Acc => (0, EVAL_ACC, self.subs_of(e, at, false)?, None),
             Cx::Group(gc) => {
                 // The query's own aggregates inside its subqueries
-                // (`subst_owned_aggs`) are not generated.
+                // (`subst_owned_aggs`): folded first, then the
+                // expression with each one's placeholder.
                 if crate::query::has_owned_sub_agg(e) {
-                    return None;
+                    return self.owned_aggs(e, gc, dest, mode);
                 }
                 let aggs = if crate::query::sub_in_agg_args(e) {
                     let mut list: AVec<&RExpr> = AVec::new();
@@ -98,10 +108,94 @@ impl G<'_, '_> {
             e: e.clone(),
             slots,
             aggs,
+            plain: false,
         })));
         self.b
             .emit(Code::Eval, p1, dest, 0, k, mode | flag | EVAL_SUB);
         Some(())
+    }
+
+    /// A group expression holding this query's own aggregates inside
+    /// its subqueries (`eval_group_sub`'s `subst_owned_aggs`): each
+    /// one folded over the group, before anything else, into the slot
+    /// of a placeholder that takes its place in the subquery plans;
+    /// then the expression, whose subqueries read the placeholders'
+    /// slots where today's executor read the folds as literals. An
+    /// aggregate whose arguments or FILTER hold a subquery is
+    /// refused today (`Unsupported`), so it falls back.
+    fn owned_aggs(&mut self, e: &RExpr, gc: u32, dest: u32, mode: u8) -> Option<()> {
+        let mut e2 = e.clone();
+        let mut found: AVec<RExpr> = AVec::new();
+        let base = self.b.preset.len();
+        let _ = crate::query::walk_aggs_mut(&mut e2, 0, &mut |a, d| {
+            if let RExpr::Agg {
+                lvl, inert: false, ..
+            } = a
+                && *lvl == d
+                && d > 0
+            {
+                let id = usize::MAX.saturating_sub(base.saturating_add(found.len()));
+                found.push(core::mem::replace(
+                    a,
+                    RExpr::SubScalar(Box::new(placeholder(id))),
+                ));
+                return Ok(true);
+            }
+            Ok(false)
+        });
+        let mut slots = AVec::new();
+        for a in found.iter() {
+            let p = crate::query::agg_parts(a)?;
+            if p.args.iter().any(crate::query::has_sub)
+                || p.filter.is_some_and(crate::query::has_sub)
+            {
+                return None;
+            }
+            let r = self.agg_rows(a, gc)?;
+            let s = self.b.slot();
+            let info = self.b.p4(P4::Sub(Box::new(SubInfo {
+                kind: SubKind::Scalar,
+                aff: None,
+                col: 0,
+            })));
+            let after = self.b.label();
+            self.b.jump(Code::SubStart, s, after, 0, info, 0);
+            self.b.emit(Code::SubRow, s, r, 1, info, 0);
+            self.b.emit(Code::SubEnd, 0, 0, 0, 0, 0);
+            self.b.here(after);
+            slots.push(s);
+        }
+        for (i, s) in slots.iter().enumerate() {
+            let id = usize::MAX.saturating_sub(base.saturating_add(i));
+            self.b.preset.push((id, *s));
+        }
+        let r = self.val_sub_in(&e2, Cx::Group(gc), dest, mode);
+        self.b.preset.truncate(base);
+        r
+    }
+
+    /// `e` over `cx`'s row when its only subquery nodes are folded
+    /// aggregates' placeholders (`owned_aggs`): their slots
+    /// substituted, it evaluates as an expression without subqueries,
+    /// as today's literal did (`mode` as for one).
+    pub(super) fn val_preset(&mut self, e: &RExpr, cx: Cx, dest: u32, mode: u8) {
+        let at = (self.width, self.nsrc);
+        let Some(slots) = self.subs_of(e, at, false) else {
+            self.b.fail();
+            return;
+        };
+        let (p1, flag) = match cx {
+            Cx::Acc => (0, EVAL_ACC),
+            Cx::Group(c) => (c.saturating_add(1), EVAL_GROUP),
+        };
+        let k = self.b.p4(P4::SubExpr(Box::new(SubExpr {
+            e: e.clone(),
+            slots,
+            aggs: None,
+            plain: true,
+        })));
+        self.b
+            .emit(Code::Eval, p1, dest, 0, k, mode | flag | EVAL_SUB);
     }
 
     /// One aggregate of a group whose arguments hold a subquery
@@ -135,6 +229,44 @@ impl G<'_, '_> {
         Some(dest)
     }
 
+    /// A group's bare-column row picked by a min() / max() whose
+    /// argument or FILTER holds a subquery (`extremum_rep`, before
+    /// anything of the group is evaluated): for every row of the
+    /// group, its FILTER and then its argument over that row, each a
+    /// `RepStep`. (`Groups::next` started the search at the first
+    /// row.)
+    pub(super) fn rep_search(&mut self, gc: u32) {
+        let qp = self.qp;
+        if !super::super::rows::sub_rep(qp) {
+            return;
+        }
+        let Some(m) = crate::session::rep_minmax(
+            qp.items.as_slice(),
+            qp.having.as_ref(),
+            qp.order_by.as_slice(),
+        ) else {
+            return;
+        };
+        let mut c = AVec::new();
+        c.push(crate::query::expr_coll(m.arg).unwrap_or_default());
+        let colls = self.b.p4(P4::Colls(c));
+        let max = u32::from(m.kind == crate::query::AggKind::Max);
+        let v = self.b.reg();
+        let top = self.b.label();
+        let next = self.b.label();
+        let done = self.b.label();
+        self.b.jump(Code::GroupRows, gc, done, 0, 0, 0);
+        self.b.here(top);
+        if let Some(f) = m.filter {
+            self.test(f, Cx::Acc, next);
+        }
+        self.val(m.arg, Cx::Acc, v);
+        self.b.emit(Code::RepStep, gc, v, max, colls, 0);
+        self.b.here(next);
+        self.b.jump(Code::GroupRowNext, gc, top, 0, 0, 0);
+        self.b.here(done);
+    }
+
     /// Condition `e` over the joined row (`cond_is_sub`: is it `want`?),
     /// jumping to `fail` unless so: AND / OR stop at a decisive
     /// operand, a subquery-free operand tested first, NOT flips the
@@ -142,15 +274,19 @@ impl G<'_, '_> {
     /// reached.
     pub(super) fn cond_sub(&mut self, e: &RExpr, want: bool, fail: super::super::build::Label) {
         use crate::sql::BinOp;
-        if !crate::query::has_sub(e) {
-            let k = self.b.p4(P4::Expr(e.clone()));
+        if !real_sub(self.b, e) {
             let t = self.tmp;
             let mode = if want {
                 super::super::op::EVAL_COND
             } else {
                 EVAL_FALSE
             };
-            self.b.emit(Code::Eval, 0, t, 0, k, mode | EVAL_ACC);
+            if crate::query::has_sub(e) {
+                self.val_preset(e, Cx::Acc, t, mode);
+            } else {
+                let k = self.b.p4(P4::Expr(e.clone()));
+                self.b.emit(Code::Eval, 0, t, 0, k, mode | EVAL_ACC);
+            }
             self.b.jump(Code::IfNot, t, fail, 0, 0, 0);
             return;
         }
@@ -158,7 +294,7 @@ impl G<'_, '_> {
             RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r)
                 if crate::query::int_lit(l).is_none() && crate::query::int_lit(r).is_none() =>
             {
-                let (first, second) = if crate::query::has_sub(l) && !crate::query::has_sub(r) {
+                let (first, second) = if real_sub(self.b, l) && !real_sub(self.b, r) {
                     (&**r, &**l)
                 } else {
                     (&**l, &**r)
@@ -195,7 +331,7 @@ impl G<'_, '_> {
     /// terms in order, those holding a correlated subquery (other than
     /// an `x IN (SELECT ...)` constraint) after the rest.
     pub(super) fn where_sub(&mut self, f: &RExpr, skip: super::super::build::Label) {
-        if !crate::query::has_sub(f) {
+        if !real_sub(self.b, f) {
             self.test(f, Cx::Acc, skip);
             return;
         }
@@ -282,6 +418,7 @@ pub(super) fn empty_scope_val(b: &mut Builder, e: &RExpr, gx: Gx<'_>, dest: u32)
         e: e.clone(),
         slots,
         aggs: None,
+        plain: false,
     })));
     b.emit(Code::Eval, 0, dest, 0, k, EVAL_VALUE | EVAL_ACC | EVAL_SUB);
     b.emit(Code::AccPop, 0, 0, 0, 0, 0);
@@ -291,7 +428,13 @@ pub(super) fn empty_scope_val(b: &mut Builder, e: &RExpr, gx: Gx<'_>, dest: u32)
 /// One subquery node's code (`sub_value_for`), its plan over the
 /// joined row's first `at` slots and sources: its slot. An
 /// uncorrelated node runs once per execution, and every copy of it
-/// (the same plan id and result column) reads its one slot.
+/// (the same plan id and result column) reads its one slot; its code
+/// is a subroutine that a later copy over the same joined row calls
+/// (an alias of a result column holding one, in ORDER BY, GROUP BY
+/// or HAVING, is such a copy: repeated, nested aliases would
+/// otherwise make the program grow exponentially). A placeholder of
+/// an enclosing query's folded aggregate (`G::owned_aggs`) is its
+/// slot, no code.
 fn sub_node(
     b: &mut Builder,
     gx: Gx<'_>,
@@ -304,30 +447,72 @@ fn sub_node(
         K::Exists(p) => (*p, SubKind::Exists),
         K::In(p) => (*p, SubKind::In),
     };
+    if let Some(s) = preset_slot(b, plan) {
+        return Some(s);
+    }
+    if b.over() {
+        return None;
+    }
     let key = (plan.uncorrelated && plan.id != 0).then_some((plan.id, plan.scalar_col));
-    let hoisted = key.and_then(|k| b.hoisted.iter().find(|h| h.0 == k).map(|h| (h.1, h.2)));
-    let (slot, once) = match hoisted {
-        Some((s, o)) => (s, Some(o)),
+    let found = key.and_then(|k| b.hoisted.iter().find(|h| h.key == k));
+    if let Some(h) = found
+        && let Some((entry, ret, hat)) = h.code
+        && hat == at
+    {
+        // The node's code again over the same row: call it.
+        let (slot, once) = (h.slot, h.once);
+        let done = b.label();
+        b.jump(Code::Once, once, done, 0, 0, 0);
+        b.jump(Code::Gosub, 0, entry, ret, 0, 0);
+        b.here(done);
+        return Some(slot);
+    }
+    let (slot, once, shared) = match found {
+        Some(h) => (h.slot, Some(h.once), None),
         None => {
             let s = b.slot();
-            let o = key.map(|k| {
-                let r = b.reg();
-                b.hoisted.push((k, s, r));
-                r
-            });
-            (s, o)
+            match key {
+                Some(k) => {
+                    let o = b.reg();
+                    let entry = b.label();
+                    let ret = b.reg();
+                    b.hoisted.push(crate::vm::build::Hoisted {
+                        key: k,
+                        slot: s,
+                        once: o,
+                        code: Some((entry, ret, at)),
+                    });
+                    (s, Some(o), Some((entry, ret)))
+                }
+                None => (s, None, None),
+            }
         }
     };
     let done = b.label();
     if let Some(o) = once {
         b.jump(Code::Once, o, done, 0, 0, 0);
     }
+    // Shared code: called here, placed after the call and jumped over.
+    let ret_to = match shared {
+        Some((entry, ret)) => {
+            b.jump(Code::Gosub, 0, entry, ret, 0, 0);
+            b.jump(Code::Goto, 0, done, 0, 0, 0);
+            b.here(entry);
+            let back = b.label();
+            Some((back, ret))
+        }
+        None => None,
+    };
+    let after = match ret_to {
+        Some((back, _)) => back,
+        None => done,
+    };
     let info = b.p4(P4::Sub(Box::new(SubInfo {
         kind,
         aff: crate::query::result_affinity(plan),
         col: plan.scalar_col,
     })));
-    b.jump(Code::SubStart, slot, done, 0, info, 0);
+    b.jump(Code::SubStart, slot, after, 0, info, 0);
     b.emit(Code::Count, 0, 0, 0, 0, 0);
     // A scalar subquery and EXISTS read one row (the pin's implicit
     // LIMIT 1); an IN set all of them.
@@ -341,8 +526,78 @@ fn sub_node(
     };
     subplan(b, plan, gx, at, need, Sink::Sub(slot, info))?;
     b.emit(Code::SubEnd, 0, 0, 0, 0, 0);
+    if let Some((back, ret)) = ret_to {
+        b.here(back);
+        b.emit(Code::Return, 0, 0, ret, 0, 0);
+    }
     b.here(done);
     Some(slot)
+}
+
+/// The placeholder standing for an enclosing query's folded aggregate
+/// (`G::owned_aggs`): a scalar subquery node of an empty plan, id `id`,
+/// whose slot the fold fills.
+fn placeholder(id: usize) -> SubPlan {
+    SubPlan {
+        sources: AVec::new(),
+        items: AVec::new(),
+        filter: None,
+        group_by: AVec::new(),
+        having: None,
+        order_by: AVec::new(),
+        distinct: false,
+        limit: None,
+        offset: None,
+        has_agg: false,
+        compound: AVec::new(),
+        values: AVec::new(),
+        comp_order: AVec::new(),
+        result_names: AVec::new(),
+        result_affs: AVec::new(),
+        result_named: AVec::new(),
+        id,
+        uncorrelated: true,
+        scalar_col: 0,
+        rec: None,
+        mat: 0,
+        #[cfg(feature = "explain")]
+        sel: 0,
+        #[cfg(feature = "planner")]
+        view_names: AVec::new(),
+        #[cfg(feature = "planner")]
+        is_cte: false,
+        #[cfg(feature = "planner")]
+        lazy: false,
+        #[cfg(feature = "planner")]
+        grp: 0,
+    }
+}
+
+/// The slot of placeholder plan `p` (`G::owned_aggs`), if it is one.
+fn preset_slot(b: &Builder, p: &SubPlan) -> Option<u32> {
+    b.preset.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s)
+}
+
+/// Whether `e` holds a subquery node of its own that is not a folded
+/// aggregate's placeholder (`G::owned_aggs`): what today's executor,
+/// which substituted those as literals, would see as a subquery.
+pub(super) fn real_sub(b: &Builder, e: &RExpr) -> bool {
+    if !crate::query::has_sub(e) {
+        return false;
+    }
+    if b.preset.is_empty() {
+        return true;
+    }
+    let mut kinds: AVec<crate::query::SubKind<'_>> = AVec::new();
+    crate::query::collect_subs(e, &mut kinds);
+    kinds.iter().any(|k| {
+        let p = match k {
+            crate::query::SubKind::Scalar(p)
+            | crate::query::SubKind::Exists(p)
+            | crate::query::SubKind::In(p) => *p,
+        };
+        preset_slot(b, p).is_none()
+    })
 }
 
 /// Code for one execution of subquery plan `p` over the joined row's
@@ -356,7 +611,8 @@ pub(super) fn subplan(
     need: Option<u32>,
     sink: Sink,
 ) -> Option<()> {
-    if b.depth >= MAX_NEST {
+    if b.depth >= MAX_NEST || b.over() {
+        b.fail();
         return None;
     }
     b.depth = b.depth.saturating_add(1);

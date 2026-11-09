@@ -405,6 +405,20 @@ BY and otherwise combine row lists with today's `run_compound`
 one flat program, so the restart rule needs nothing new: none of the
 added opcodes reads a page.
 
+*Review fixes (2026-11-09):* inline copies made a short statement's
+program grow exponentially when ORDER BY / GROUP BY / HAVING aliases
+nested a result column's subquery (the planner copies it at each
+alias), and code generation ran out of memory before it fell back.
+An uncorrelated node's code is now the table's subroutine after all:
+placed at its first use and called (`Gosub` / `Return`, the return
+address in a register) by every later use over the same joined row;
+a correlated node stays inline, and the generator stops at an
+instruction budget (`MAX_OPS`, 65,536) and falls back. A min() /
+max() whose argument holds a subquery picks the group's bare-column
+row by code (`RepStep` per row), and an enclosing query's aggregate
+inside a subquery is folded into a slot that a placeholder subquery
+node reads (today's `subst_owned_aggs` literal).
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,

@@ -377,7 +377,10 @@ fn restart_with_the_smallest_cache() {
 /// the VM equal today's executor's for each query: an uncorrelated
 /// node once per statement, a correlated one per row that reaches it,
 /// a FROM subquery per execution of its query, a recursive CTE's
-/// setup and the CTE itself once each.
+/// setup and the CTE itself once each. (None of these has a scalar or
+/// EXISTS subquery with several candidate rows: those stop at their
+/// first row on the VM, as on the pin, and run fewer nested plans than
+/// today's executor — `scalar_and_exists_subqueries_stop_at_their_first_row`.)
 #[test]
 fn subqueries_run_as_often_as_today() {
     let base = pin_file("count", S);
@@ -401,6 +404,14 @@ fn subqueries_run_as_often_as_today() {
         "SELECT a, (SELECT 1 UNION SELECT 2) FROM t;",
         "SELECT a FROM t UNION SELECT (SELECT max(v) FROM u);",
         "SELECT a, (SELECT (SELECT max(v) FROM u WHERE u.k = t2.a) FROM t AS t2 WHERE t2.a = t.a) FROM t;",
+        // (Review fixes: min() / max() over a subquery, its bare
+        // columns' row searched as well; the query's own aggregates
+        // in its subqueries; a shared uncorrelated node.)
+        "SELECT max((SELECT v FROM u WHERE k = t.a)), a, b FROM t;",
+        "SELECT b, max(a) FILTER (WHERE (SELECT count(*) FROM u WHERE k = t.a) > 0), a FROM t GROUP BY b ORDER BY 1;",
+        "SELECT b, (SELECT sum(t.a) FROM u) FROM t GROUP BY b ORDER BY 1;",
+        "SELECT b, count(*) AS s FROM t GROUP BY b HAVING (SELECT s) > 1 ORDER BY 1;",
+        "SELECT (SELECT count(*) FROM u) AS c FROM t GROUP BY c HAVING c > 0 ORDER BY c;",
     ];
     let mut bad = Vec::new();
     for (i, q) in qs.iter().enumerate() {
@@ -555,7 +566,7 @@ fn gen_set(r: &mut Rng, o: &str, depth: u32) -> String {
 /// FROM subqueries, views and CTEs; compounds; recursive CTEs.
 fn gen_query(r: &mut Rng) -> String {
     let t = r.pick(&["p", "q", "z"]);
-    match r.n(10) {
+    match r.n(12) {
         0 => {
             let lim = 1 + r.n(6);
             // (An outer WHERE over an endless CTE could match nothing
@@ -620,6 +631,53 @@ fn gen_query(r: &mut Rng) -> String {
                 ""
             }
         ),
+        // A min() / max() over a subquery argument: the group's
+        // bare columns from its extremum row (`extremum_rep`).
+        5 => {
+            let grouped = r.chance(50);
+            format!(
+                "SELECT {}({}){}, x.a, x.c, count(*) FROM {t} x{};",
+                r.pick(&["max", "min"]),
+                gen_sub(r, "x", 0),
+                if r.chance(30) {
+                    format!(" FILTER (WHERE {})", gen_sub(r, "x", 0))
+                } else {
+                    String::new()
+                },
+                if grouped {
+                    " GROUP BY x.b ORDER BY x.b"
+                } else {
+                    ""
+                }
+            )
+        }
+        // The query's own aggregates inside its subqueries
+        // (`subst_owned_aggs`), in result columns, a subquery's WHERE
+        // and HAVING.
+        6 => {
+            let agg = format!(
+                "{}(x.{})",
+                r.pick(&["max", "min", "sum", "count"]),
+                r.pick(&["a", "b"])
+            );
+            let inner = r.pick(&["p", "q", "z"]);
+            let sub = match r.n(4) {
+                0 => format!("(SELECT {agg} FROM {inner})"),
+                // (`+ 0`: an index or rowid bound holding the
+                // aggregate still falls back.)
+                1 => format!("(SELECT count(*) FROM {inner} y WHERE y.a + 0 <= {agg})"),
+                2 => format!("(SELECT y.b FROM {inner} y WHERE +y.a = {agg} ORDER BY 1)"),
+                _ => format!("(SELECT (SELECT {agg} + y.a) FROM {inner} y ORDER BY 1 LIMIT 1)"),
+            };
+            format!(
+                "SELECT x.b, {sub} FROM {t} x GROUP BY x.b{} ORDER BY x.b;",
+                if r.chance(30) {
+                    format!(" HAVING (SELECT count(x.a)) > {}", r.n(2))
+                } else {
+                    String::new()
+                }
+            )
+        }
         _ => {
             let mut conds = Vec::new();
             for _ in 0..r.n(3) {
@@ -700,4 +758,211 @@ fn generated_queries_match_the_executor_and_the_pin() {
         "{total} generated queries on the VM; {fixed} where it gives the pin's rows and today's executor does not"
     );
     assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+// ---------------- review fixes ----------------
+
+/// A min() / max() whose argument or FILTER holds a subquery: the
+/// group's bare-column row is searched row by row (`RepStep`, today's
+/// `extremum_rep`) on the VM; it used to fall back whole.
+const MINMAX_SUBQ: &[&str] = &[
+    "SELECT min((SELECT 1)) FROM t;",
+    "SELECT max((SELECT v FROM u WHERE k = t.a)) FROM t;",
+    "SELECT max((SELECT v FROM u WHERE k = t.a)), count(*) FROM t;",
+    "SELECT b, max((SELECT v FROM u WHERE k = t.a)) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT max((SELECT v FROM u WHERE k = t.a)), a, b FROM t;",
+    "SELECT min((SELECT v FROM u WHERE k = t.a)), a, b FROM t;",
+    "SELECT min((SELECT v FROM u WHERE k = t.a)), a FROM t WHERE a > 1;",
+    "SELECT max((SELECT v FROM u WHERE k = t.a)) FROM t WHERE 0;",
+    "SELECT max((SELECT v FROM u WHERE k = t.a)), b FROM t WHERE a IS NULL;",
+    "SELECT max((SELECT b FROM t AS t2 WHERE t2.a = t.a)), a FROM t;",
+    "SELECT max((SELECT q FROM w WHERE w.p = t.a)), a, b FROM t;",
+    "SELECT b, max(a) FILTER (WHERE a > (SELECT min(k) FROM u)), a FROM t GROUP BY b ORDER BY 1;",
+    "SELECT max(a) FILTER (WHERE (SELECT count(*) FROM u WHERE k = t.a) > 1), b FROM t;",
+    "SELECT k, (SELECT max((SELECT v FROM u AS u2 WHERE u2.k = t.a)) FROM t WHERE t.a <= u.k) FROM u;",
+    "SELECT max((SELECT v FROM u WHERE k = t.a)) AS m, a FROM t GROUP BY b HAVING m > 10 ORDER BY 2;",
+    "SELECT max((SELECT abs(-9223372036854775808) WHERE t.a = 3)), a FROM t;",
+];
+
+#[test]
+fn minmax_over_subqueries_runs_on_the_vm() {
+    let base = pin_file("mm", S);
+    corpus(&base, "mm", &strict(), MINMAX_SUBQ);
+    corpus(&base, "mmr", &strict().cache_pages(1), MINMAX_SUBQ);
+}
+
+/// The query's own aggregates inside its subqueries (outer-aggregate
+/// scoping, today's `subst_owned_aggs`): folded over the group first,
+/// each into the slot of a placeholder the subquery code reads, where
+/// today's executor substituted a literal; it used to fall back whole.
+const OWNED_AGGS: &[&str] = &[
+    "SELECT (SELECT sum(a) FROM u) FROM t;",
+    "SELECT count(*), (SELECT max(t.a) FROM u WHERE u.k = 1) FROM t;",
+    "SELECT b, (SELECT sum(t.a) FROM u) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT a, (SELECT sum(t.a) FROM u) FROM t GROUP BY a ORDER BY 1;",
+    "SELECT b, count(*) AS s FROM t GROUP BY b HAVING (SELECT s) > 1 ORDER BY 1;",
+    "SELECT a, count(*) AS s FROM t GROUP BY a HAVING (SELECT s) > 1 ORDER BY 1;",
+    "SELECT (SELECT max(t.a) + u.v FROM u WHERE u.k = 1 ORDER BY u.v DESC) FROM t;",
+    "SELECT b, (SELECT (SELECT min(t.a))) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT (SELECT sum(u.v) + count(t.a) FROM u) FROM t;",
+    "SELECT count(*) FROM t WHERE 1 HAVING (SELECT max(t.a)) > 1;",
+    "SELECT (SELECT abs(sum(t.a) - 9223372036854775807 - 10)) FROM t;",
+    "SELECT b, (SELECT k FROM u WHERE u.k = max(t.a) ORDER BY v DESC) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT (SELECT count(*) FROM u WHERE u.k + 0 <= max(t.a)) FROM t;",
+    "SELECT (SELECT count(*) FROM u WHERE u.k + 0 <= count(t.a)) FROM t;",
+    "SELECT b, (SELECT group_concat(u.v) FROM u WHERE +u.k = max(t.a)) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT b FROM t GROUP BY b ORDER BY (SELECT count(*) FROM u WHERE u.k + 0 < max(t.a)), b;",
+    // (The sub-free term first, as today after its substitution: the
+    // failing subquery is never reached.)
+    "SELECT b, (SELECT k FROM u WHERE (SELECT abs(-9223372036854775808) FROM w WHERE w.p = u.k) AND u.k = max(t.a) + 10) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT a, (SELECT k FROM u WHERE u.k = max(t.a) OR (SELECT 1 FROM w WHERE w.p = u.k)) FROM t GROUP BY a ORDER BY 1;",
+    "SELECT (SELECT sum(t.a) FROM u WHERE u.k = (SELECT max(k) FROM u)) FROM t;",
+    "SELECT b, EXISTS (SELECT 1 FROM u WHERE u.k = max(t.a)) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT b, max(t.a) IN (SELECT k FROM u), (SELECT max(t.a) IN (SELECT k FROM u WHERE v > 15)) FROM t GROUP BY b ORDER BY 1;",
+];
+
+#[test]
+fn outer_aggregates_in_subqueries_run_on_the_vm() {
+    let base = pin_file("own", S);
+    corpus(&base, "own", &strict(), OWNED_AGGS);
+    corpus(&base, "ownr", &strict().cache_pages(1), OWNED_AGGS);
+}
+
+/// Two outer-aggregate shapes still fall back whole (strict:
+/// `VmFallback`), each to today's executor's answer: the query's own
+/// aggregate whose arguments hold a subquery (refused today,
+/// `Unsupported`), and one a nested query uses as an index or rowid
+/// bound (the access path is not substituted today, so it fails with
+/// `MisusedAggregate`, or a lone min() / max() reads as the scalar
+/// function of the bare-column row).
+#[test]
+fn outer_aggregate_shapes_that_still_fall_back() {
+    let base = pin_file("ownf", S);
+    let q = "SELECT a, (SELECT group_concat((SELECT 1 WHERE t.a > 0)) FROM t AS t2) FROM t;";
+    let (_, on_vm, e) = hipp_run(&copy_of(&base, "vms17-ownf-s"), strict(), q);
+    assert!(!on_vm && matches!(e, Some(Error::VmFallback)), "{e:?}");
+    let (_, _, e) = hipp_run(&copy_of(&base, "vms17-ownf-d"), Config::default(), q);
+    assert!(matches!(e, Some(Error::Unsupported)), "{e:?}");
+    for (i, q) in [
+        "SELECT (SELECT count(*) FROM u WHERE u.k <= max(t.a)) FROM t;",
+        "SELECT (SELECT count(*) FROM u WHERE u.k <= count(t.a)) FROM t;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (_, on_vm, e) = hipp_run(&copy_of(&base, &format!("vms17-ownf{i}-s")), strict(), q);
+        assert!(!on_vm && matches!(e, Some(Error::VmFallback)), "{q}: {e:?}");
+        let (d, _, _) = hipp_run(
+            &copy_of(&base, &format!("vms17-ownf{i}-d")),
+            Config::default(),
+            q,
+        );
+        let (o, _, _) = hipp_run(
+            &copy_of(&base, &format!("vms17-ownf{i}-o")),
+            Config::default().vm_off(true),
+            q,
+        );
+        assert_eq!(d, o, "{q}");
+    }
+}
+
+/// A scalar subquery and EXISTS stop at their first row on the VM, as
+/// on the pin (its implicit LIMIT 1), where today's subquery executor
+/// still evaluates the WHERE clause over every candidate row: an error
+/// in a later row's WHERE is never reached, a `random()` there is drawn
+/// once, and fewer subquery plans run. Intentional (the divergence is
+/// toward the pin; `vm_flip` retires today's executor).
+#[test]
+fn scalar_and_exists_subqueries_stop_at_their_first_row() {
+    let s = "CREATE TABLE t(a, b TEXT); \
+        INSERT INTO t VALUES (1,'x'),(2,'y'),(3,NULL),(NULL,'z'),(2,'Y'),('2','2'),(2.0,'r'); \
+        CREATE TABLE u(k INTEGER, v); \
+        INSERT INTO u VALUES (1,10),(1,11),(2,20),(NULL,30),(5,50),('2',21); \
+        CREATE TABLE w(id INTEGER PRIMARY KEY, p, q TEXT COLLATE NOCASE); \
+        INSERT INTO w VALUES (1,1,'a'),(2,2,'A'),(3,2,'b'),(4,NULL,'B');";
+    let base = pin_file("first", s);
+    let qs: &[&str] = &[
+        // Today: IntegerOverflow (row 3's WHERE); the pin and the VM: x.
+        "SELECT (SELECT b FROM t WHERE CASE WHEN a = 3 THEN abs(-9223372036854775808) ELSE 1 END);",
+        "SELECT EXISTS (SELECT 1 FROM t WHERE CASE WHEN a = 3 THEN abs(-9223372036854775808) ELSE 1 END);",
+        "SELECT k, (SELECT b FROM t WHERE a >= u.k AND (SELECT count(*) FROM w WHERE w.p = t.a)) FROM u;",
+        "SELECT a, (SELECT b FROM t AS t2 WHERE t2.a = (SELECT max(k) FROM u WHERE u.k < t.a)) FROM t;",
+    ];
+    corpus(&base, "first", &strict(), qs);
+    // Fewer subquery plans run than on today's executor, same rows.
+    for (i, q) in qs.iter().enumerate().skip(2) {
+        let count = |cfg: Config, tag: &str| {
+            block_on(async {
+                let fs = FileStorage::open(copy_of(&base, tag)).expect("fs open");
+                let mut db = Connection::open(fs, cfg).await.expect("open");
+                let before = db.subquery_executions();
+                let mut st = db.prepare(q).await.expect("prepare");
+                let mut rows = Vec::new();
+                while st.step().await.expect("step") == Step::Row {
+                    rows.push(render(&st));
+                }
+                drop(st);
+                (db.subquery_executions() - before, rows)
+            })
+        };
+        let (n_vm, r_vm) = count(strict(), &format!("vms17-first{i}-v"));
+        let (n_old, r_old) = count(Config::default().vm_off(true), &format!("vms17-first{i}-o"));
+        assert_eq!(r_vm, r_old, "{q}");
+        assert!(n_vm < n_old, "{q}: vm {n_vm}, today {n_old}");
+    }
+    // A random() in the subquery's WHERE is drawn once (its first row
+    // passes), so the statement's next draw is the connection's second.
+    let draws = |q: &str, tag: &str| {
+        block_on(async {
+            let fs = FileStorage::open(copy_of(&base, tag)).expect("fs open");
+            let mut db = Connection::open(fs, strict()).await.expect("open");
+            let mut st = db.prepare(q).await.expect("prepare");
+            assert_eq!(st.step().await.expect("step"), Step::Row);
+            assert!(st.runs_on_vm(), "{q}");
+            render(&st)
+        })
+    };
+    let one = draws(
+        "SELECT (SELECT b FROM t WHERE random() <> 0), random();",
+        "vms17-first-r1",
+    );
+    let two = draws("SELECT random(), random();", "vms17-first-r2");
+    assert_eq!(
+        one.split('|').nth(1),
+        two.split('|').nth(1),
+        "{one} vs {two}"
+    );
+}
+
+/// Nested ORDER BY / GROUP BY / HAVING aliases of a result column
+/// holding a subquery: the planner copies the subquery at each alias,
+/// so the plan grows about four times per level. An uncorrelated
+/// node's code is a subroutine every copy calls (`Gosub`), so the
+/// program stays small and the statement runs on the VM (at seven
+/// levels it used to overflow the program's operands after seconds
+/// of code generation, and at ten exhaust memory); a correlated chain,
+/// copied at each use, stops generating at the instruction budget and
+/// falls back whole.
+#[test]
+fn nested_alias_chains_stay_bounded() {
+    let base = pin_file("chain", S);
+    let mut e = String::from("1");
+    for i in 0..7 {
+        e = format!(
+            "(SELECT ({e}) AS s{i} FROM u x{i} GROUP BY s{i} HAVING s{i} > 0 ORDER BY s{i} LIMIT 1)"
+        );
+    }
+    let q = format!("SELECT a, {e} FROM t;");
+    corpus(&base, "chain", &strict(), &[q.as_str()]);
+    let mut e = String::from("t.a");
+    for i in 0..7 {
+        e = format!(
+            "(SELECT ({e}) + x{i}.k AS s{i} FROM u x{i} WHERE x{i}.k <= t.a GROUP BY s{i} HAVING s{i} > 0 ORDER BY s{i} LIMIT 1)"
+        );
+    }
+    let q = format!("SELECT a, {e} FROM t;");
+    let t0 = std::time::Instant::now();
+    let (_, on_vm, err) = hipp_run(&copy_of(&base, "vms17-chain-c"), strict(), &q);
+    assert!(!on_vm && matches!(err, Some(Error::VmFallback)), "{err:?}");
+    assert!(t0.elapsed().as_secs() < 60, "{:?}", t0.elapsed());
 }

@@ -579,7 +579,6 @@ fn parameters_compile_per_execution() {
 /// subqueries, compounds, VALUES, FROM subqueries and recursive CTEs to
 /// `tests/vm_subqueries_v17.rs` with unit `vm_subqueries`.)
 const UNCLAIMED: &[&str] = &[
-    "SELECT a, (SELECT sum(t.a) FROM u) FROM t GROUP BY a;",
     "SELECT a, row_number() OVER (ORDER BY a) FROM t;",
     "SELECT name FROM sqlite_schema;",
     "SELECT * FROM wr;",

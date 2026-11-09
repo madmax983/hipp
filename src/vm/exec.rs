@@ -423,7 +423,9 @@ impl Vm {
                     Ctx::of(row).with(env)
                 };
                 #[cfg(feature = "sql")]
-                if op.p5 & EVAL_SUB != 0 && op.p5 & 3 != 0 {
+                let plain = matches!(p4_at(&self.prog.p4, op.p4), Some(P4::SubExpr(x)) if x.plain);
+                #[cfg(feature = "sql")]
+                if op.p5 & EVAL_SUB != 0 && op.p5 & 3 != 0 && !plain {
                     // A condition over subquery values: the value's
                     // truth (`cond_is_sub`'s leaf).
                     let v = crate::query::eval::<()>(e, &ctx)?;
@@ -1509,6 +1511,29 @@ impl Vm {
                 }
                 e.rewind(false);
                 jump_if(e.rows.is_empty())
+            }
+            Code::Gosub => {
+                let back = i64::try_from(self.pc.saturating_add(1)).unwrap_or(i64::MAX);
+                *reg_mut(&mut self.regs, op.p3)? = OwnedValue::Integer(back);
+                Flow::Jump(op.p2)
+            }
+            Code::Return => {
+                let to = int_of(reg(&self.regs, op.p3)?).ok_or(Error::Unsupported)?;
+                Flow::Jump(u32::try_from(to).map_err(|_| Error::Unsupported)?)
+            }
+            Code::RepStep => {
+                let Some(P4::Colls(c)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let coll = c.as_slice().first().copied().unwrap_or_default();
+                let kind = if op.p3 == 1 {
+                    crate::query::AggKind::Max
+                } else {
+                    crate::query::AggKind::Min
+                };
+                let v = reg(&self.regs, op.p2)?.clone();
+                groups(&mut self.curs, op.p1)?.rep_step(kind, coll, v, enc);
+                Flow::Next
             }
             _ => return Err(Error::Unsupported),
         })

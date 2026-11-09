@@ -11,6 +11,131 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_subqueries — review fixes (2026-11-09)
+
+Four findings on `vm_subqueries` (2291f5e), fixed on top of the
+`vm_joins` review fixes (0e80182). Still behind the hidden feature
+`vm`; no profile changes.
+
+**Fixed.**
+- **Code generation blew up on nested aliases** (medium, crash). A
+  subquery node's code was copied at every use, and the planner copies
+  a result column's subquery into each ORDER BY / GROUP BY / HAVING
+  alias of it, so `SELECT a, (SELECT (...) AS s9 FROM u GROUP BY s9
+  HAVING s9 > 0 ORDER BY s9 LIMIT 1) FROM t` nested ten deep (749
+  bytes) grew the program about four times per level: seven levels
+  overflowed an operand after the work, ten exhausted a 6 GB address
+  space and aborted, in the default (non-strict) config too. Now an
+  uncorrelated node's code is a subroutine placed at its first use
+  (`Gosub` / `Return`, the return address in a register; the trap
+  handler is its `Return`) that every later use over the same joined
+  row calls, its `Once` guard as before; a use over a different row
+  (the same plan inside a CTE read twice) still gets its own copy. A
+  correlated node is still inline, but the generator now stops at
+  65,536 instructions or side-table entries (`Builder::over`, checked
+  before each subquery plan and node) and falls back. Measured
+  (debug build): the uncorrelated chain at ten levels runs on the VM
+  (10 s, 2.4 GB peak, where today's executor takes 5.6 s and 1 GB:
+  planning that statement is itself exponential, 5.7 s, and each plan
+  node is still cloned a few times into the side table); a correlated
+  chain at eight levels falls back after 0.75 s, at ten after 9 s of
+  which 5.7 s are planning.
+- **min() / max() over a subquery fell back whole** (medium). Not
+  only the bare-column pick STATUS named: every aggregate min() /
+  max() whose argument or FILTER holds a subquery was refused. Now
+  the group's bare-column row is searched by code as today's
+  `extremum_rep` does it, before anything else of the group: for
+  every row, the FILTER and then the argument (subqueries run per
+  row), each a `RepStep` (`extremum_step` under the argument's
+  collation); `Groups::next` starts the search at the group's first
+  row (the empty group's row for none).
+- **The query's own aggregates inside its subqueries fell back**
+  (medium; outer-aggregate scoping, in the unit's scope).
+  `SELECT (SELECT sum(t.a) FROM u) FROM t`, `HAVING (SELECT s) > 1`
+  over `count(*) AS s` and the rest now run on the VM: as today's
+  `subst_owned_aggs`, each such aggregate (walked with
+  `query::walk_aggs_mut`, now `pub(crate)`) is folded over the group
+  first (`GroupRows` / `AggFold`) into a slot, and a placeholder
+  scalar subquery node of an empty plan takes its place in the
+  subquery plans; the subquery code reads the slot where today's
+  executor read a literal. So that evaluation order stays today's,
+  an expression whose only subquery nodes are placeholders evaluates
+  as one without subqueries (`SubExpr::plain`: `query::cond`, not the
+  value's truth), and AND / OR operand order, WHERE term order and
+  MULTI-INDEX OR branch tests count only real subqueries
+  (`sub::real_sub`). Two shapes still fall back, each to today's
+  answer: an own aggregate whose arguments hold a subquery (today
+  refuses it, `Unsupported`; the pin answers), and one a nested query
+  uses as an index or rowid bound (`u.k <= max(t.a)` with an index
+  on `u.k`): today's executor does not substitute access paths, so it
+  fails with `MisusedAggregate` (`count(t.a)`) or reads a lone
+  min() / max() as the scalar function of the bare-column row — a
+  pre-existing bug of today's executor, left for `vm_flip` (fixing it
+  there would grow the max and xl profiles, which this unit may not).
+
+**Recorded as intended (not ported).**
+- **Scalar and EXISTS subqueries stop at their first row** (medium).
+  The VM gives them a need of one row and stops at the first that
+  passes the WHERE, as the pin's implicit LIMIT 1 does; today's
+  subquery executor tests every candidate row's WHERE and caps the
+  rows after. So an error in a later row's WHERE is not raised (today
+  fails with IntegerOverflow, the pin and the VM answer), a `random()`
+  there is drawn once (the statement's next `random()` is then the
+  connection's second draw, not its eighth), and fewer nested plans
+  run (`subquery_executions` 10 against 28, 27 against 56 in the
+  review's repros; the same for IN (... LIMIT 0) and VALUES cores
+  read as a scalar). Every difference goes toward the pin, and
+  `vm_flip` retires today's executor, so the VM keeps the pin's
+  behaviour; the `vm_subqueries` subsection, README and CHANGELOG
+  claimed today's counts and laziness without this exception and are
+  corrected.
+
+**Out of scope.** `SELECT a, (SELECT group_concat((SELECT ... WHERE
+t.a > 0)) FROM t AS t2) FROM t` (an outer aggregate over a subquery
+argument): today's executor refuses it (`Unsupported`) and the VM,
+porting it, falls back to that; the pin answers.
+
+**Tests** (`tests/vm_subqueries_v17.rs`, strict vs the pin, each
+also at a one-frame cache where marked):
+`minmax_over_subqueries_runs_on_the_vm` (16 queries: plain, with
+count(*), grouped, bare columns picked by min / max, FILTER holding a
+subquery, empty input, NULL group, nested, HAVING, a failing
+argument; one-frame cache), `outer_aggregates_in_subqueries_run_on_the_vm`
+(21: result columns, HAVING through an alias, a subquery's WHERE /
+ORDER BY / nested subquery, EXISTS and IN, operand order with a
+failing real subquery, an overflowing fold; one-frame cache),
+`outer_aggregate_shapes_that_still_fall_back` (the two shapes,
+strict `VmFallback`, default config equal to today's),
+`scalar_and_exists_subqueries_stop_at_their_first_row` (the review's
+repros: the pin's rows and success, fewer executions than today, one
+`random()` draw), `nested_alias_chains_stay_bounded` (seven-level
+uncorrelated chain strict on the VM, failed before; a seven-level
+correlated chain falls back quickly); the counts test gains five
+queries (min / max, outer aggregates, a shared uncorrelated node);
+the generator gains min() / max() over subqueries and outer
+aggregates (4,800 generated queries at `HIPP_VMS_SEEDS=400`, all on
+the VM, all equal to today's executor). `tests/vm_joins_v17.rs`' two
+FILTER bare-column queries now run strict; `tests/vm_v17.rs`'
+fallback list loses the outer-aggregate shape.
+
+**Gates.** `ci/local-gates.sh` (full; run with `CARGO_PROFILE_DEV_DEBUG=0
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`, as a debug-info
+workspace build filled the disk) ends with "all gates passed";
+`cargo test --workspace --no-fail-fast --features vm` passes (one
+`wal_v16` test, `close_removes_the_log_and_a_stale_shm`, failed once
+with `DatabaseBusy` on open under the parallel run and passes on its
+own; WAL open, untouched here); `depth_v16` / `triggers_v16` pass
+with debug info with and without `vm` (14 + 33 each); clippy `-D
+warnings` clean on the five `vm` feature-set lines and
+`--all-features`.
+
+**Size Δ** (thumbv7em, `--profile tiny`, `.text + .rodata`): tiny 0
+(76,124), full 0 (476,492), max 0 (962,628), xl 0 (1,059,584) — the
+only shared-code change is visibility (`query::walk_aggs_mut` made
+`pub(crate)`); everything else is `cfg(vm)`. For information:
+`query,vm` 210,094 B, `sql,vm` 457,520 B, `sql,indexes,vm` 509,732
+B, `sql,indexes,expr_index,planner,vm` 637,368 B.
+
 ### VM (ADR 0005 Stage 2): vm_joins — review fixes (2026-11-09)
 
 Six findings on `vm_joins` (ad90fb1), resumed on top of
@@ -203,17 +328,20 @@ core's own, a sink and the reader's bound):
   laziness, affinity (a subquery result's comparison affinity) and
   collation are today's.
 - `Connection::subquery_executions` counts on the VM as today
-  (`Count`, drained by the driver).
+  (`Count`, drained by the driver), except that a scalar or EXISTS
+  subquery stops at its first row (see the review fixes above).
+  (Corrected by the review fixes: this said "as today" without the
+  exception.)
 
 **Falls back** (whole statements): subquery plans nested more than
 32 deep (code generation recurses with them; today's executor and its
-depth limits take those, e.g. the CLI's 1,000-view chain); a query's
-own aggregate inside a
-subquery of its group (`has_owned_sub_agg`, today's
-`subst_owned_aggs`: the subquery's plan would need the fold
-substituted at run time); a grouped query whose bare-column row a
-min() / max() with a subquery in its argument picks
-(`extremum_rep`); windows, virtual and table-valued sources
+depth limits take those, e.g. the CLI's 1,000-view chain); a program
+past 65,536 instructions (review fixes); a query's own aggregate whose
+arguments hold a subquery, or that a nested query uses as an index or
+rowid bound (review fixes; until then every query's own aggregate
+inside a subquery of its group fell back, and so did every min() /
+max() over a subquery argument, not only a bare-column pick as this
+said); windows, virtual and table-valued sources
 (`json_each`, `generate_series`, ...), WITHOUT ROWID, TEMP and
 attached tables, `sqlite_schema`, trigger and FK action programs.
 
@@ -292,9 +420,8 @@ over `vm_joins`' review fixes), `sql,vm` 454,808 B (+13,416),
 `sql,indexes,expr_index,planner,vm` 634,544 B (+15,672).
 
 **Honest gaps.**
-- The two fallbacks above (a query's own aggregate inside a subquery
-  of its group; a min() / max() bare-column row picked over a
-  subquery argument).
+- The fallbacks above (closed by the review fixes except the two
+  outer-aggregate shapes they name).
 - Inside a subquery, a growing first FROM subquery (an endless
   recursive CTE read through a WHERE under a LIMIT) is grown in place
   as the streamed top level does; today's subquery executor re-runs
@@ -316,7 +443,9 @@ over `vm_joins`' review fixes), `sql,vm` 454,808 B (+13,416),
 - A subquery node's code is repeated at each use (an ORDER BY alias
   of a result column holding one, a multi-column scalar subquery's
   parts): program size, not behaviour (an uncorrelated one still runs
-  once, sharing its slot).
+  once, sharing its slot). (Review fixes: this made nested aliases'
+  programs grow exponentially; an uncorrelated node's code is now
+  shared, a correlated one's still repeated under the budget.)
 
 ### VM (ADR 0005 Stage 2): vm_joins (2026-11-09)
 

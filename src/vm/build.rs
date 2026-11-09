@@ -34,8 +34,19 @@ pub(crate) struct Builder {
     /// The program's uncorrelated subquery nodes, by (plan id, result
     /// column): their slot and "computed" register, so every copy of
     /// a node reads one result per execution (today's `hoist` cache).
+    ///
+    /// The node's code is a subroutine (`Gosub` / `Return`) its first
+    /// use places: its entry, return-address register and the joined
+    /// row's slots and sources it was generated over, which a later
+    /// use over the same row calls instead of repeating the code.
     #[cfg(feature = "sql")]
-    pub(crate) hoisted: AVec<((usize, usize), u32, u32)>,
+    pub(crate) hoisted: AVec<Hoisted>,
+    /// The enclosing queries' aggregates folded into slots while a
+    /// group expression's subqueries are generated (`G::owned_aggs`,
+    /// today's `subst_owned_aggs`): the id of the placeholder plan
+    /// that stands for each, and its slot.
+    #[cfg(feature = "sql")]
+    pub(crate) preset: AVec<(usize, u32)>,
     /// The shared materializations (`SubPlan::mat`): their row list
     /// and flag registers (built, complete).
     #[cfg(feature = "sql")]
@@ -52,7 +63,38 @@ pub(crate) struct Builder {
     pub(crate) depth: u32,
 }
 
+/// One uncorrelated subquery node of a program (`Builder::hoisted`):
+/// its key (plan id, result column), slot, "computed" register, and
+/// its shared code's entry, return-address register and joined-row
+/// position.
+#[cfg(feature = "sql")]
+pub(crate) struct Hoisted {
+    pub(crate) key: (usize, usize),
+    pub(crate) slot: u32,
+    pub(crate) once: u32,
+    pub(crate) code: Option<(Label, u32, (usize, usize))>,
+}
+
+/// The most instructions (and side-table entries) code generation
+/// makes before it gives up: a statement whose program would be
+/// bigger runs on today's executor, and the generator stops as soon
+/// as it is past this, so its time and memory stay bounded (the
+/// planner's alias copies can make a short statement's plan grow
+/// exponentially with its nesting).
+#[cfg(feature = "sql")]
+const MAX_OPS: usize = 1 << 16;
+
 impl Builder {
+    /// Whether the program is already declined or past `MAX_OPS`:
+    /// generating more of it is wasted work.
+    #[cfg(feature = "sql")]
+    pub(crate) fn over(&mut self) -> bool {
+        if self.ops.len() > MAX_OPS || self.p4.len() > MAX_OPS {
+            self.bad = true;
+        }
+        self.bad
+    }
+
     /// An empty program: instruction 0 is `Init`.
     pub(crate) fn new() -> Builder {
         let mut ops = AVec::new();
@@ -71,6 +113,8 @@ impl Builder {
             nsub: 0,
             #[cfg(feature = "sql")]
             hoisted: AVec::new(),
+            #[cfg(feature = "sql")]
+            preset: AVec::new(),
             #[cfg(feature = "sql")]
             mats: AVec::new(),
             #[cfg(feature = "sql")]

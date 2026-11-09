@@ -241,9 +241,13 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 - **The bytecode VM, third unit** (hidden feature `vm`). Scalar, IN
   and EXISTS subqueries (correlated or not, anywhere in a SELECT, in
   aggregate arguments too), FROM subqueries, views and CTEs, compounds
-  and VALUES, and recursive CTEs run on the VM, with today's laziness,
-  once-per-statement caching and subquery-execution counts; windows,
-  virtual and table-valued sources and `sqlite_schema` still hand off.
+  and VALUES, and recursive CTEs run on the VM, with today's laziness
+  and once-per-statement caching (a scalar or EXISTS subquery stops at
+  its first row, as on the pin); windows, virtual and table-valued
+  sources and `sqlite_schema` still hand off. Its review fixes add
+  min() / max() over a subquery and an enclosing query's aggregates
+  inside subqueries, and share an uncorrelated subquery's code so
+  nested aliases no longer blow up code generation.
 
 ## What v0.16 does
 

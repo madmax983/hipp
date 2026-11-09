@@ -136,16 +136,6 @@ pub(super) fn evaluable(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool
     }
 }
 
-/// `evaluable` with no subquery node anywhere (what an opcode that
-/// evaluates its side-table expressions itself can take).
-fn plain(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool {
-    #[cfg(feature = "sql")]
-    if crate::query::has_sub(e) {
-        return false;
-    }
-    evaluable(e, width, nsrc, agg)
-}
-
 /// Whether source `sp` is a table the VM reads: a rowid table of the
 /// main database (no derived table, TEMP, attached, WITHOUT ROWID,
 /// virtual or table-valued source, recursive reference, nor the
@@ -265,7 +255,7 @@ enum Fold {
 /// those of the query around it (`w0`, `n0`).
 pub(super) struct G<'p, 'b> {
     pub(super) b: &'b mut Builder,
-    qp: &'p QueryPlan,
+    pub(super) qp: &'p QueryPlan,
     pub(super) gx: Gx<'p>,
     plan: u32,
     bases: AVec<usize>,
@@ -374,21 +364,6 @@ pub(super) fn core(
             && ![&qp.limit, &qp.offset]
                 .iter()
                 .all(|l| l.as_ref().is_none_or(|e| evaluable(e, 0, 0, false))))
-    {
-        return None;
-    }
-    // A grouped query's bare-column row picked by a min() / max()
-    // whose argument holds a subquery (`extremum_rep`) is not built.
-    if grouped
-        && crate::session::rep_minmax(
-            qp.items.as_slice(),
-            qp.having.as_ref(),
-            qp.order_by.as_slice(),
-        )
-        .is_some_and(|m| {
-            !plain(m.arg, width, nsrc, false)
-                || !m.filter.is_none_or(|f| plain(f, width, nsrc, false))
-        })
     {
         return None;
     }
@@ -695,7 +670,11 @@ impl<'p> G<'p, '_> {
         }
         #[cfg(feature = "sql")]
         if crate::query::has_sub(e) {
-            self.val_sub(e, cx, dest, EVAL_VALUE);
+            if super::sub::real_sub(self.b, e) {
+                self.val_sub(e, cx, dest, EVAL_VALUE);
+            } else {
+                self.val_preset(e, cx, dest, EVAL_VALUE);
+            }
             return;
         }
         let k = self.b.p4(P4::Expr(e.clone()));
@@ -728,6 +707,11 @@ impl<'p> G<'p, '_> {
         #[cfg(feature = "sql")]
         if crate::query::has_sub(e) {
             match cx {
+                _ if !super::sub::real_sub(self.b, e) => {
+                    let t = self.tmp;
+                    self.val_preset(e, cx, t, super::super::op::EVAL_COND);
+                    self.b.jump(Code::IfNot, t, skip, 0, 0, 0);
+                }
                 Cx::Acc => self.cond_sub(e, true, skip),
                 Cx::Group(_) => {
                     let t = self.tmp;
@@ -1058,6 +1042,8 @@ impl<'p> G<'p, '_> {
                 self.b.emit(Code::GroupSort, gc, 0, 0, 0, 0);
                 self.b.here(top);
                 self.b.jump(Code::GroupNext, gc, done, 0, 0, 0);
+                #[cfg(feature = "sql")]
+                self.rep_search(gc);
                 let cx = Cx::Group(gc);
                 if let Some(h) = &qp.having {
                     // (Its moved terms were tested on the rows.) Every
@@ -2057,7 +2043,7 @@ impl<'p> G<'p, '_> {
             // (Holding a subquery, a branch's condition is its value's
             // truth, `eval_row_sub`, as today.)
             #[cfg(feature = "sql")]
-            if crate::query::has_sub(&sub.cond) {
+            if super::sub::real_sub(self.b, &sub.cond) {
                 let tmp = self.tmp;
                 self.val_sub(&sub.cond, Cx::Acc, tmp, EVAL_COND);
                 self.b.jump(Code::IfNot, tmp, next, 0, 0, 0);
@@ -2070,7 +2056,11 @@ impl<'p> G<'p, '_> {
                 let tmp = self.tmp;
                 #[cfg(feature = "sql")]
                 if crate::query::has_sub(&prev.cond) {
-                    self.val_sub(&prev.cond, Cx::Acc, tmp, EVAL_COND);
+                    if super::sub::real_sub(self.b, &prev.cond) {
+                        self.val_sub(&prev.cond, Cx::Acc, tmp, EVAL_COND);
+                    } else {
+                        self.val_preset(&prev.cond, Cx::Acc, tmp, EVAL_COND);
+                    }
                     self.b.jump(Code::If, tmp, next, 0, 0, 0);
                     continue;
                 }

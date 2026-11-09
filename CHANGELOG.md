@@ -5,6 +5,22 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: review fixes of unit `vm_subqueries` (hidden feature `vm`)
+
+- min() / max() over a subquery argument or FILTER (the group's
+  bare columns from its extremum row) and the query's own aggregates
+  inside its subqueries (`SELECT (SELECT sum(t.a) FROM u) FROM t`,
+  `HAVING (SELECT s) > 1`) now run on the VM; they fell back whole.
+- An uncorrelated subquery's code is shared by every use of it
+  (`Gosub` / `Return`) and code generation stops at an instruction
+  budget: nested ORDER BY / GROUP BY / HAVING aliases of a subquery
+  made the program grow exponentially, and a 749-byte statement ran
+  the process out of memory before it fell back.
+- Recorded as intended: on the VM a scalar or EXISTS subquery stops at
+  its first row, as on the pin, where today's executor still tests
+  every candidate row's WHERE (an error there, `random()` draws and
+  `subquery_executions` differ). Every profile's size is unchanged.
+
 ### GROUP BY with ORDER BY and LIMIT: the right groups (review fix of unit `vm_joins`, every profile with `query`)
 
 - A grouped query with a LIMIT stopped after the LIMIT's groups in
@@ -33,7 +49,9 @@ All notable changes to hipp. Versions follow the milestones in
   recursive CTEs, as inline code in one program: today's evaluation
   order and laziness, an uncorrelated subquery once per statement, a
   failing subquery's error raised only where its value is read, and
-  `Connection::subquery_executions` counting as today.
+  `Connection::subquery_executions` counting as today (except that a
+  scalar or EXISTS subquery stops at its first row, as on the pin; see
+  the review fixes above).
 - On the VM a UNION ALL chain streams its rows (those before a failing
   row are returned, a LIMIT stops it, OFFSET rows are not computed),
   as the pin does; today's executor materialises compounds. Still no

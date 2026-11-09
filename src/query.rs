@@ -4000,7 +4000,7 @@ pub fn subst_owned_aggs<E>(
 /// returning `Err(())` stops the walk; a caller with an error to
 /// report keeps it beside the closure, so the walk is compiled once
 /// (v0.17 size pass).
-fn walk_aggs_mut(
+pub(crate) fn walk_aggs_mut(
     e: &mut RExpr,
     d: u8,
     f: &mut dyn FnMut(&mut RExpr, u8) -> core::result::Result<bool, ()>,
