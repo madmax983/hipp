@@ -143,3 +143,11 @@ representable (mantissa < 2^53, |exp10| <= 22).
 | n    | total Ir    | parse_real inclusive Ir |
 |------|-------------|-------------------------|
 | 1000 | 937,058,403 | 70,732,757 (7.55%)      |
+
+### After: Clinger exact fast path in `int_pow10_to_f64`
+
+| n    | total Ir    | parse_real inclusive Ir | Δ total |
+|------|-------------|-------------------------|---------|
+| 500  | 378,111,682 | n/a                     | n/a     |
+| 1000 | 866,062,551 | 1,333,026 (0.15%)       | -7.58%  |
+| 2000 | 1,993,289,422 | n/a                   | n/a     |

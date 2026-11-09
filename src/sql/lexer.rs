@@ -364,6 +364,22 @@ pub fn parse_real(text: &[u8]) -> Option<f64> {
 /// conversion `parse_real` ends in (`acc` holds the kept digits),
 /// shared with `record::render_real`'s read-back test (v0.16).
 pub fn int_pow10_to_f64(c: u64, x: i64) -> f64 {
+    // Exact fast path (Clinger): with `c < 2^53` and `|x| <= 22` both
+    // `c` and `10^|x|` are exact f64s, so one IEEE multiply or divide
+    // is the correctly rounded (ties-to-even) result -- the same
+    // value the big-integer conversion below produces.
+    const POW10: [f64; 23] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+    if c < (1u64 << 53) && (-22..=22).contains(&x) {
+        let m = c as f64;
+        return if x < 0 {
+            m / POW10[(-x) as usize]
+        } else {
+            m * POW10[x as usize]
+        };
+    }
     // Decimal magnitude: the value lies in [10^(mag-1), 10^mag).
     // Far outside the f64 range the answer needs no arithmetic:
     // >= 10^310 is past the overflow midpoint, and < 10^-324 is
@@ -1226,5 +1242,29 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    extern crate std;
+    use super::{int_pow10_to_f64, parse_real};
+    use std::format;
+
+    /// The Clinger fast path must equal the correctly rounded value
+    /// (Rust's `str::parse` is correctly rounded) over its whole domain.
+    #[test]
+    fn fast_path_matches_correct_rounding() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let c = (s >> (s % 12)) % (1u64 << 53) + 1;
+            let x = ((s >> 40) % 47) as i64 - 24; // spans the 22 boundary
+            let want: f64 = format!("{c}e{x}").parse().unwrap();
+            assert_eq!(int_pow10_to_f64(c, x).to_bits(), want.to_bits(), "{c}e{x}");
+        }
+        assert_eq!(parse_real(b"123.5"), Some(123.5));
     }
 }
