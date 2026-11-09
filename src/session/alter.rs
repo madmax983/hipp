@@ -1,5 +1,5 @@
 //! ALTER TABLE ... RENAME TO, RENAME [COLUMN] and DROP [COLUMN]
-//! (v0.16, `v16`).
+//! (v0.16, `sql`).
 //!
 //! The pin edits the stored `CREATE` texts token by token: every
 //! token that names the altered table (or column) is replaced, the
@@ -160,7 +160,7 @@ fn edit_for(sql: &[u8], at: usize, new: &[u8], force_quote: bool) -> Ed {
 
 /// Apply edits (deduplicated by position) to `sql`.
 fn apply(sql: &[u8], mut eds: AVec<Ed>) -> AVec<u8> {
-    eds.as_mut_slice().sort_by_key(|e| e.at);
+    crate::arena::sort_by(eds.as_mut_slice(), &mut |a, b| a.at.cmp(&b.at));
     let mut out = AVec::new();
     let mut pos = 0usize;
     for e in eds.iter() {
@@ -548,7 +548,7 @@ fn names_col(r: &ColRef, table: &[u8], col: &[u8]) -> bool {
 
 impl<S: Storage> Connection<S> {
     /// Plan ALTER TABLE RENAME TO / RENAME COLUMN / DROP COLUMN
-    /// (v0.16, `v16`): the checks the pin makes when it prepares
+    /// (v0.16, `sql`): the checks the pin makes when it prepares
     /// the statement.
     pub(super) fn plan_alter16(&self, arena: &Arena, ast: &Ast) -> Result<Plan, S::Error> {
         let table = match ast {
@@ -687,7 +687,7 @@ impl<S: Storage> Connection<S> {
                         schema: None,
                         cte: None,
                         indexed: None,
-                        #[cfg(feature = "flatten")]
+                        #[cfg(feature = "planner")]
                         flat: false,
                     });
                     probe.filter = None;

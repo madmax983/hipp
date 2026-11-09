@@ -318,7 +318,7 @@ fn execution_counts_drop_to_one() {
         );
         // (A LIMIT of its own keeps the EXISTS a subquery: without one
         // the pin's EXISTS-to-join makes it a join loop, v0.17
-        // `flatten`.)
+        // `planner`.)
         assert_eq!(
             count_during!("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE x > 5 LIMIT 2)"),
             1

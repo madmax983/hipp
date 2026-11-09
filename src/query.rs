@@ -69,21 +69,21 @@ pub enum AggKind {
     Total,
     Min,
     Max,
-    /// `group_concat(X[, SEP])`, and (v0.16, `v16`)
+    /// `group_concat(X[, SEP])`, and (v0.16, `sql`)
     /// `string_agg(X, SEP)`.
     GroupConcat,
-    /// `median(Y)` (v0.16, `v16`): `percentile(Y, 50)`.
-    #[cfg(feature = "v16")]
+    /// `median(Y)` (v0.16, `sql`): `percentile(Y, 50)`.
+    #[cfg(feature = "sql")]
     Median,
-    /// `percentile(Y, P)`, P in 0 ..= 100 (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `percentile(Y, P)`, P in 0 ..= 100 (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Percentile,
-    /// `percentile_cont(Y, P)`, P in 0 ..= 1 (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `percentile_cont(Y, P)`, P in 0 ..= 1 (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     PercentileCont,
-    /// `percentile_disc(Y, P)`, P in 0 ..= 1 (v0.16, `v16`): the
+    /// `percentile_disc(Y, P)`, P in 0 ..= 1 (v0.16, `sql`): the
     /// value at or below the interpolation point, no blending.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     PercentileDisc,
     /// `json_group_array` / `json_group_object` and their `jsonb_`
     /// forms (v0.16, `json`): the arguments are wrapped in the
@@ -94,14 +94,14 @@ pub enum AggKind {
 }
 
 /// How an aggregate's `args` divide when it was written with an
-/// aggregate ORDER BY and / or FILTER clause (v0.16, `v16`): the
+/// aggregate ORDER BY and / or FILTER clause (v0.16, `sql`): the
 /// first `nargs` are its arguments, the next `order.len()` its
 /// ORDER BY keys (`order` holds their directions and
 /// collations), and with `filter` the last one is its FILTER
 /// expression. Keeping them in `args` lets every walker (column
 /// shifts, subquery collection and substitution, aggregate
 /// ownership, nested-aggregate misuse) see them unchanged.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone)]
 pub struct AggExt {
     pub nargs: usize,
@@ -120,7 +120,7 @@ pub struct AggExt {
 }
 
 /// One aggregate node, taken apart (`agg_parts`): its kind and
-/// flags, its own arguments, and (v0.16, `v16`) its ORDER BY
+/// flags, its own arguments, and (v0.16, `sql`) its ORDER BY
 /// keys with their directions and its FILTER expression. Each
 /// group row contributes the values of `inputs()` (arguments,
 /// then keys) when the filter passes.
@@ -151,7 +151,7 @@ pub fn agg_parts(e: &RExpr) -> Option<AggParts<'_>> {
         distinct,
         star,
         args,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ext,
         ..
     } = e
@@ -159,7 +159,7 @@ pub fn agg_parts(e: &RExpr) -> Option<AggParts<'_>> {
         return None;
     };
     let all = args.as_slice();
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if let Some(x) = ext {
         let n = x.nargs.min(all.len());
         let k = n.saturating_add(x.order.len()).min(all.len());
@@ -242,73 +242,73 @@ pub enum ScalarFn {
     Iif,
     MinN,
     MaxN,
-    /// `like(pattern, subject[, escape])` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `like(pattern, subject[, escape])` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Like,
-    /// `glob(pattern, subject)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `glob(pattern, subject)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Glob,
-    /// `~x` (v0.16, `v16`): bitwise NOT of the operand's
+    /// `~x` (v0.16, `sql`): bitwise NOT of the operand's
     /// integer value.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BitNot,
-    /// A row value's elements (v0.16, `v16`): only ever the left
+    /// A row value's elements (v0.16, `sql`): only ever the left
     /// operand or an item of an `InList` (a row-value IN test),
     /// which evaluates it element by element; on its own it is
     /// `SchemaKind::RowValueMisused`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Vector,
-    /// `printf()` / `format()` (v0.16, `v16`): `func::printf`.
-    #[cfg(feature = "v16")]
+    /// `printf()` / `format()` (v0.16, `sql`): `func::printf`.
+    #[cfg(feature = "sql")]
     Printf,
-    /// `quote(X)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `quote(X)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Quote,
-    /// `char(X, ...)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `char(X, ...)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Char,
-    /// `unicode(X)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `unicode(X)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Unicode,
-    /// `zeroblob(N)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `zeroblob(N)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Zeroblob,
-    /// `randomblob(N)` (v0.16, `v16`): reads the connection's
+    /// `randomblob(N)` (v0.16, `sql`): reads the connection's
     /// random stream (`Env::prng`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Randomblob,
-    /// `random()` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `random()` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Random,
-    /// `last_insert_rowid()` (v0.16, `v16`): `Env::last_rowid`.
-    #[cfg(feature = "v16")]
+    /// `last_insert_rowid()` (v0.16, `sql`): `Env::last_rowid`.
+    #[cfg(feature = "sql")]
     LastInsertRowid,
-    /// `changes()` (v0.16, `v16`): `Env::changes`.
-    #[cfg(feature = "v16")]
+    /// `changes()` (v0.16, `sql`): `Env::changes`.
+    #[cfg(feature = "sql")]
     Changes,
-    /// `total_changes()` (v0.16, `v16`): `Env::total_changes`.
-    #[cfg(feature = "v16")]
+    /// `total_changes()` (v0.16, `sql`): `Env::total_changes`.
+    #[cfg(feature = "sql")]
     TotalChanges,
     /// `likely(X)` / `unlikely(X)` / `likelihood(X, P)` (v0.16,
-    /// `v16`): X itself (P is a planner hint, checked at
+    /// `sql`): X itself (P is a planner hint, checked at
     /// resolution).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Likely,
-    /// `concat(X, ...)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `concat(X, ...)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Concat,
-    /// `concat_ws(SEP, X, ...)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `concat_ws(SEP, X, ...)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     ConcatWs,
-    /// `octet_length(X)` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `octet_length(X)` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     OctetLength,
-    /// `unhex(X[, Y])` (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// `unhex(X[, Y])` (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     Unhex,
-    /// `sqlite_version()` (v0.16, `v16`): the claim version,
+    /// `sqlite_version()` (v0.16, `sql`): the claim version,
     /// `'3.54.1'`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     SqliteVersion,
     /// The math functions (v0.16, leaf feature `math`):
     /// `crate::math::eval`.
@@ -334,7 +334,7 @@ pub enum ScalarFn {
 impl ScalarFn {
     /// Whether the pin counts the function non-deterministic
     /// (v0.16): refused in generated columns.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn nondeterministic(self) -> bool {
         matches!(
             self,
@@ -357,7 +357,7 @@ impl ScalarFn {
 
 /// Whether any function call in `e` (outside subquery plans)
 /// satisfies `f` (v0.16).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub fn any_scalar(e: &RExpr, f: &dyn Fn(ScalarFn) -> bool) -> bool {
     let any = |x: &RExpr| any_scalar(x, f);
     match e {
@@ -508,9 +508,9 @@ pub enum RExpr {
         /// (`HAVING EXISTS (SELECT 1 FROM t x WHERE x.b = s)`
         /// over `sum(b) AS s`), where a written one is.
         alias: bool,
-        /// The ORDER BY / FILTER layout of `args` (v0.16, `v16`);
+        /// The ORDER BY / FILTER layout of `args` (v0.16, `sql`);
         /// None when the call had neither clause.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ext: Option<Box<AggExt>>,
     },
     /// A subquery whose execution failed with an evaluation error
@@ -538,10 +538,10 @@ pub enum RExpr {
 }
 
 /// `SourceDesc::db` of a CHECK constraint's or partial index's
-/// table (v0.16 review fix, `v16`): the pin ignores the schema part
+/// table (v0.16 review fix, `sql`): the pin ignores the schema part
 /// of a three-part name there (`main.t.a`, `temp.t.a`, even
 /// `bogus.t.a` reach table `t`, whichever database holds it).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub const DB_ANY: u8 = 0xff;
 
 /// One FROM source for resolution: qualifier (alias if given, else
@@ -578,18 +578,18 @@ pub struct SourceDesc {
     /// (v0.16): `sqlite_master` and `sqlite_schema` both qualify
     /// its columns, as on the pin.
     pub schema_table: bool,
-    /// The table an ALTER TABLE is renaming (v0.16, `v16`): every
+    /// The table an ALTER TABLE is renaming (v0.16, `sql`): every
     /// reference resolved to this source is recorded in the shared
     /// trace, with whether the source was read under an alias.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub trace: Option<(alloc::rc::Rc<core::cell::RefCell<AlterTrace>>, bool)>,
-    /// The database a table or view source lives in (v0.16, `v16`):
+    /// The database a table or view source lives in (v0.16, `sql`):
     /// 1 main, 2 temp; 0 for anything else (a derived table, a CTE,
     /// `excluded`), which no three-part name `schema.table.column`
     /// reaches. A table-valued function is main's (1), as on the
     /// pin; a CHECK constraint's or partial index's table is
     /// `DB_ANY`, which every schema part reaches.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub db: u8,
     /// The attached database's name a three-part name reaches this
     /// source by (v0.16, `attach`; empty for main / temp sources).
@@ -611,12 +611,12 @@ pub struct SourceDesc {
     pub fts_col: Option<usize>,
 }
 
-/// What an ALTER TABLE learns from planning a view (v0.16, `v16`):
+/// What an ALTER TABLE learns from planning a view (v0.16, `sql`):
 /// the name tokens that resolved to the table being altered. Each
 /// position is an `ABytes::pos` of the view's parsed text — a token
 /// handle — so the rename can edit exactly those tokens, as the
 /// pin's `renameColumnFunc` / `renameTableFunc` edit theirs.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Default)]
 pub struct AlterTrace {
     /// The altered table's name.
@@ -627,8 +627,8 @@ pub struct AlterTrace {
     pub hits: AVec<TraceHit>,
 }
 
-/// One reference to the altered table's column (v0.16, `v16`).
-#[cfg(feature = "v16")]
+/// One reference to the altered table's column (v0.16, `sql`).
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy)]
 pub struct TraceHit {
     /// The column-name token (`None` for `t.rowid` and `t.*`).
@@ -641,10 +641,10 @@ pub struct TraceHit {
 }
 
 /// Record a resolved column reference in the trace of the source it
-/// resolved to (v0.16, `v16`; see `AlterTrace`): the first scope, in
+/// resolved to (v0.16, `sql`; see `AlterTrace`): the first scope, in
 /// resolution order, holding a source that matches is the one the
 /// reference read; a scope whose result alias answered is not.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn trace_column(
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
@@ -687,8 +687,8 @@ fn trace_column(
     }
 }
 
-/// Record `q.*` over the altered table (v0.16, `v16`).
-#[cfg(feature = "v16")]
+/// Record `q.*` over the altered table (v0.16, `sql`).
+#[cfg(feature = "sql")]
 pub fn trace_star(cur: &ScopeGroup, q: crate::arena::ABytes, arena: &Arena) {
     let qn = handle_bytes(arena, q);
     for src in cur.sources.iter() {
@@ -723,9 +723,9 @@ impl SourceDesc {
             colls: AVec::new(),
             registers: false,
             schema_table: false,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             trace: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             db: 0,
             #[cfg(feature = "attach")]
             dbname: AVec::new(),
@@ -739,8 +739,8 @@ impl SourceDesc {
     }
 
     /// Whether a three-part name of database `db` (0: none
-    /// written) may reach this source (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// written) may reach this source (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     pub fn in_db(&self, db: u8) -> bool {
         db == 0 || self.db == db || self.db == DB_ANY
     }
@@ -751,13 +751,13 @@ impl SourceDesc {
         // `sqlite_temp_schema` / `sqlite_temp_master` only (v0.16
         // review fix: the router renames the FROM name alone, so its
         // own name was "no such column" and main's was taken).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let (m, s) = if self.db == 2 {
             (&b"sqlite_temp_master"[..], &b"sqlite_temp_schema"[..])
         } else {
             (&b"sqlite_master"[..], &b"sqlite_schema"[..])
         };
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let (m, s) = (b"sqlite_master", b"sqlite_schema");
         eq_ci(self.qualifier.as_slice(), q) || (self.schema_table && (eq_ci(q, m) || eq_ci(q, s)))
     }
@@ -851,7 +851,7 @@ pub struct ScopeGroup {
     pub offsets: AVec<usize>,
     pub first_src: usize,
     /// Result-column aliases visible in this scope (v0.16,
-    /// `v16`): `(alias, resolved item)`. Filled after the
+    /// `sql`): `(alias, resolved item)`. Filled after the
     /// result list is resolved, so WHERE / ON / GROUP BY /
     /// HAVING / ORDER BY expressions — and subqueries inside
     /// them — may name an alias; an unqualified name that no
@@ -955,10 +955,10 @@ pub struct SubSource {
     /// The table's generated columns (v0.16): VIRTUAL ones are
     /// absent from the record and computed as each row is read.
     pub gcols: Option<Box<crate::rules::GenCols>>,
-    /// A recursive CTE's recursive reference (v0.16, `v16`): when
+    /// A recursive CTE's recursive reference (v0.16, `sql`): when
     /// non-zero, the source's one row is the row the CTE's queue
     /// last gave up (`RecInfo::id`); `root` is unused.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub rec: u32,
     /// A `json_each` / `json_tree` source (v0.16, `json`): its kind
     /// (`json::tvf_kind`, with `TVF_LATERAL` when its arguments
@@ -990,9 +990,9 @@ pub struct SubSource {
     /// `expr_index`), which the access planner obeys.
     #[cfg(feature = "expr_index")]
     pub hint: Hint,
-    /// The table is the TEMP database's (v0.16, `v16`): a main
+    /// The table is the TEMP database's (v0.16, `sql`): a main
     /// statement reads it there (`root` is a temp page).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub temp: bool,
     /// The table is another database's (v0.16, `attach`): 1 + its
     /// index in the connection's external sources (with `temp` set,
@@ -1008,11 +1008,11 @@ pub struct SubSource {
     /// its natural order delivers.
     #[cfg(feature = "explain")]
     pub eqp: EqpInfo,
-    /// A semi-join source (v0.17, `flatten`; the pin's `existsToJoin`
+    /// A semi-join source (v0.17, `planner`; the pin's `existsToJoin`
     /// of an `EXISTS` term, `SEARCH t EXISTS`): for each combination
     /// of the sources before it, its loop stops at the first of its
     /// rows that makes a joined row.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub exists: bool,
 }
 
@@ -1031,33 +1031,33 @@ pub struct EqpInfo {
     pub natural: usize,
     pub nat_distinct: bool,
     /// The first loop of a join the pin's planner ordered (v0.17,
-    /// `join_order`): `natural` / `nat_distinct` then say what the
+    /// `planner`): `natural` / `nat_distinct` then say what the
     /// whole join delivers.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub joined: bool,
     /// A LEFT JOIN that changes no row (the pin's `whereOmitNoopJoin`:
     /// DISTINCT or a one-row loop, its table read nowhere but its own
     /// ON clause): EXPLAIN QUERY PLAN leaves it out, as the pin's
-    /// plan does (hipp still runs it; v0.17, `join_order`).
-    #[cfg(feature = "join_order")]
+    /// plan does (hipp still runs it; v0.17, `planner`).
+    #[cfg(feature = "planner")]
     pub omit: bool,
     /// The sources (by position) whose Bloom filter lines EXPLAIN
-    /// QUERY PLAN prints before this loop's (v0.17, `join_order`: the
+    /// QUERY PLAN prints before this loop's (v0.17, `planner`: the
     /// pin builds them together, `sqlite3ConstructBloomFilter`).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     pub bloom_lines: u64,
     /// The core is a min() / max() query the pin optimises (v0.17,
-    /// `multi_index`; `WHERE_ORDERBY_MIN` / `_MAX`): 1, every loop
+    /// `planner`; `WHERE_ORDERBY_MIN` / `_MAX`): 1, every loop
     /// prints `SEARCH`; 2, and the loops deliver the argument's order
     /// (a `f(DISTINCT)` sorter is not needed).
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     pub minmax: u8,
 }
 
-/// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `v16`):
+/// A resolved `INDEXED BY` / `NOT INDEXED` clause (v0.16, `sql`):
 /// any access path, only the index rooted at the page given, or no
 /// index at all (rowid lookups stay).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Hint {
     #[default]
@@ -1075,12 +1075,12 @@ pub const TVF_LATERAL: u8 = 0x80;
 #[cfg(feature = "vtab")]
 pub const TVF_VTAB: u8 = 0x40;
 
-/// A recursive common table expression's shape (v0.16, `v16`),
+/// A recursive common table expression's shape (v0.16, `sql`),
 /// carried by its `SubPlan`: compound tails from index `split - 1`
 /// on are the recursive SELECTs, the plan's head and the tails
 /// before them the setup. `comp_order` / `limit` / `offset` are
 /// the CTE's own ORDER BY (the queue order) and row window.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy)]
 pub struct RecInfo {
     pub split: usize,
@@ -1170,15 +1170,15 @@ pub struct SubPlan {
     /// b) = (SELECT ...)`), where part `i` is a copy of the plan
     /// yielding column `i` of the first row.
     pub scalar_col: usize,
-    /// A recursive CTE (v0.16, `v16`; see `RecInfo`).
-    #[cfg(feature = "v16")]
+    /// A recursive CTE (v0.16, `sql`; see `RecInfo`).
+    #[cfg(feature = "sql")]
     pub rec: Option<RecInfo>,
     /// The shared materialization this derived table's rows come
-    /// from (v0.16 review fix, `v16`; `CteUse::mat`): non-zero when
+    /// from (v0.16 review fix, `sql`; `CteUse::mat`): non-zero when
     /// every derived table with this id reads one result, computed
     /// once per statement execution. Set only on an uncorrelated
     /// plan.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub mat: u32,
     /// The pin's select number of this core (v0.16, `explain`;
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
@@ -1187,18 +1187,18 @@ pub struct SubPlan {
     /// The names a view or CREATE TABLE ... AS gives the result
     /// columns (`result_col_names`), recorded before the query
     /// flattener merged a FROM subquery into the core (v0.17,
-    /// `flatten`: the pin names them before it flattens); empty when
+    /// `planner`: the pin names them before it flattens); empty when
     /// nothing was merged.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub view_names: AVec<AVec<u8>>,
     /// A derived table's `CteUse::is_cte`, `lazy` and `grp` (v0.17
-    /// review fix, `flatten`): what the unused-column omission and
+    /// review fix, `planner`): what the unused-column omission and
     /// the pin's reuse of a materialization need to know of it.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub is_cte: bool,
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub lazy: bool,
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     pub grp: u32,
 }
 
@@ -1428,25 +1428,25 @@ pub(crate) fn resolve_column_in_group<E>(
     table: Option<&[u8]>,
     name: &[u8],
 ) -> Option<Result<RExpr, E>> {
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     let r = group_column::<E>(group, table, name, 0);
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     let r = group_column::<E>(group, table, name);
     r
 }
 
-/// `resolve_column_in_group`, counting (v0.16, `v16`) only the
+/// `resolve_column_in_group`, counting (v0.16, `sql`) only the
 /// sources of database `db` when it is not 0 — a three-part name
 /// `main.t.col` / `temp.t.col` (`SourceDesc::in_db`).
 fn group_column<E>(
     group: &ScopeGroup,
     table: Option<&[u8]>,
     name: &[u8],
-    #[cfg(feature = "v16")] db: u8,
+    #[cfg(feature = "sql")] db: u8,
 ) -> Option<Result<RExpr, E>> {
     // With a schema written, the temp schema table also answers to
     // main's names (the pin's `isValidSchemaTableName`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     let named = |src: &SourceDesc, q: &[u8]| {
         (src.named(q)
             || (db != 0
@@ -1455,7 +1455,7 @@ fn group_column<E>(
                 && (eq_ci(q, b"sqlite_master") || eq_ci(q, b"sqlite_schema"))))
             && src.in_db(db)
     };
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     let named = |src: &SourceDesc, q: &[u8]| src.named(q);
     // A qualified reference counts only the sources of that name
     // (v0.16 fix, ungated: `SELECT t.a FROM t, t` read the first t
@@ -1554,21 +1554,21 @@ fn group_column<E>(
 /// shadowing). With no enclosing scopes this is exactly the
 /// pre-v0.6 rule. v0.16: within each scope an unqualified name
 /// no source has falls back to that scope's result-column
-/// aliases (only filled under `v16`) before the next scope out.
+/// aliases (only filled under `sql`) before the next scope out.
 fn resolve_column<E>(
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
     table: Option<&[u8]>,
     name: &[u8],
-    #[cfg(feature = "v16")] db: u8,
+    #[cfg(feature = "sql")] db: u8,
 ) -> Result<RExpr, E> {
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     for g in core::iter::once(cur).chain(enclosing.iter()) {
         if let Some(r) = resolve_column_in_group::<E>(g, table, name) {
             return r;
         }
     }
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     for (depth, g) in core::iter::once(cur).chain(enclosing.iter()).enumerate() {
         if let Some(r) = group_column::<E>(g, table, name, db) {
             return r;
@@ -1597,7 +1597,7 @@ fn resolve_column<E>(
 }
 
 /// An alias of an enclosing query, referenced from a subquery
-/// `depth` scopes in (v0.16, `v16`). The alias's resolved item
+/// `depth` scopes in (v0.16, `sql`). The alias's resolved item
 /// is reused, rebased onto the current evaluation row: its
 /// column refs into its own scope (and further out) keep their
 /// slots, but any subquery inside it was planned with its own
@@ -1617,7 +1617,7 @@ fn resolve_column<E>(
 /// that the subquery re-aggregated its own rows). Where the
 /// owner cannot aggregate (WHERE, GROUP BY) the planner then
 /// reports the pin's misuse.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn alias_from_outer<E>(
     e: &RExpr,
     cur: &ScopeGroup,
@@ -1634,22 +1634,23 @@ fn alias_from_outer<E>(
     let mut out = e.clone();
     shift_expr(&mut out, home, by);
     let up = u8::try_from(depth).map_err(|_| Error::Unsupported)?;
-    walk_aggs_mut::<E>(&mut out, 0, &mut |a, dd| {
+    walk_aggs_mut(&mut out, 0, &mut |a, dd| {
         if let RExpr::Agg { lvl, alias, .. } = a
             && *lvl >= dd
         {
-            *lvl = lvl.checked_add(up).ok_or(Error::Unsupported)?;
+            *lvl = lvl.checked_add(up).ok_or(())?;
             *alias = true;
         }
         Ok(false)
-    })?;
+    })
+    .map_err(|()| Error::Unsupported)?;
     Ok(out)
 }
 
 /// Move every column slot at or past `at.0` by `by.0` and every
 /// rowid source at or past `at.1` by `by.1`, through nested
 /// subquery plans (v0.16, `alias_from_outer`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub(crate) fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) {
     match e {
         RExpr::Column(slot, ..) => {
@@ -1713,7 +1714,7 @@ pub(crate) fn shift_expr(e: &mut RExpr, at: (usize, usize), by: (usize, usize)) 
 /// `shift_expr` over every part of a plan that indexes the
 /// combined row (LIMIT / OFFSET run against an empty row of
 /// their own and are left alone).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn shift_plan(p: &mut SubPlan, at: (usize, usize), by: (usize, usize)) {
     for s in p.sources.as_mut_slice() {
         if let Some(on) = &mut s.on {
@@ -1745,14 +1746,14 @@ fn shift_plan(p: &mut SubPlan, at: (usize, usize), by: (usize, usize)) {
 }
 
 /// Renumber every column slot and rowid source through `m` (v0.17,
-/// `join_order`): the join planner runs a core's sources in another
+/// `planner`): the join planner runs a core's sources in another
 /// order than FROM's, and lays the joined row out in that order, so
 /// every expression reading the core — through nested subqueries,
 /// their sources' ON clauses, access paths and virtual-table
 /// arguments — reads the new positions. `m` maps a slot (`false`) or
 /// a rowid source (`true`) and leaves anything outside the core as it
 /// is.
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub(crate) fn remap_expr(e: &mut RExpr, m: &dyn Fn(usize, bool) -> usize) {
     match e {
         RExpr::Column(slot, ..) => *slot = m(*slot, false),
@@ -1806,7 +1807,7 @@ pub(crate) fn remap_expr(e: &mut RExpr, m: &dyn Fn(usize, bool) -> usize) {
 }
 
 /// `remap_expr` over an access path's probes and bounds (v0.17).
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bool) -> usize) {
     for p in a.eq.as_mut_slice() {
         for v in p.vals.as_mut_slice() {
@@ -1824,7 +1825,6 @@ pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bo
             remap_expr(&mut k.val, m);
         }
     }
-    #[cfg(feature = "multi_index")]
     if let Some(o) = &mut a.or {
         for sub in o.subs.as_mut_slice() {
             remap_expr(&mut sub.cond, m);
@@ -1835,7 +1835,6 @@ pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bo
         o.base = m(o.base, false);
         o.src = m(o.src, true);
     }
-    #[cfg(feature = "multi_index")]
     if let Some(f) = &mut a.first {
         remap_expr(&mut f.0, m);
         f.1 = m(f.1, false);
@@ -1847,7 +1846,7 @@ pub(crate) fn remap_access(a: &mut crate::xplan::IdxAccess, m: &dyn Fn(usize, bo
 /// row (v0.17): its sources' ON clauses, derived plans, access paths
 /// and virtual-table OR branches, its expressions, VALUES rows and
 /// compound tails.
-#[cfg(feature = "join_order")]
+#[cfg(feature = "planner")]
 pub(crate) fn remap_plan(p: &mut SubPlan, m: &dyn Fn(usize, bool) -> usize) {
     for s in p.sources.as_mut_slice() {
         // (Where EXPLAIN QUERY PLAN finds the source's columns moves
@@ -1963,9 +1962,9 @@ pub fn expand_star<E>(
                     && !src.qualifier.is_empty()
                     && let Some(Err(e)) = {
                         let q = Some(src.qualifier.as_slice());
-                        #[cfg(feature = "v16")]
+                        #[cfg(feature = "sql")]
                         let dup = group_column::<E>(cur, q, n, src.db);
-                        #[cfg(not(feature = "v16"))]
+                        #[cfg(not(feature = "sql"))]
                         let dup = resolve_column_in_group::<E>(cur, q, n);
                         dup
                     }
@@ -2010,7 +2009,7 @@ pub type SubPlanner<'p, E> =
 /// A scalar / EXISTS subquery reads at most its first row, and
 /// the pin (`sqlite3CodeSubselect`) rewrites its `LIMIT X` to
 /// `LIMIT (X <> 0)`, the `0` carrying NUMERIC affinity (v0.16,
-/// `v16`): `LIMIT 2.5`, `LIMIT 'x'` or `LIMIT x'00'` become
+/// `sql`): `LIMIT 2.5`, `LIMIT 'x'` or `LIMIT x'00'` become
 /// `LIMIT 1` there instead of a datatype mismatch, `LIMIT '0'`
 /// stays `LIMIT 0`, and a NULL limit still errors. OFFSET is
 /// left alone, as are IN subqueries and derived tables.
@@ -2019,7 +2018,7 @@ pub type SubPlanner<'p, E> =
 /// implicit integer `LIMIT 1`, which is what lets a UNION
 /// compound take the pin's first-row shortcut
 /// (`session::union_first_row`; v0.16, CI against the pin).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn first_row_limit(mut plan: SubPlan) -> SubPlan {
     plan.limit = Some(match plan.limit.take() {
         Some(x) => RExpr::Binary(
@@ -2036,10 +2035,10 @@ fn first_row_limit(mut plan: SubPlan) -> SubPlan {
     plan
 }
 
-/// `first_row_limit` without `v16`: a LIMIT is an integer
+/// `first_row_limit` without `sql`: a LIMIT is an integer
 /// literal there, for which the `X <> 0` rewrite changes
 /// nothing; the implicit `LIMIT 1` still applies.
-#[cfg(not(feature = "v16"))]
+#[cfg(not(feature = "sql"))]
 fn first_row_limit(mut plan: SubPlan) -> SubPlan {
     if plan.limit.is_none() {
         plan.limit = Some(RExpr::Literal(OwnedValue::Integer(1)));
@@ -2098,7 +2097,7 @@ pub fn resolve_scoped<E>(
         // `session::bind_ast`); the pin reads one there as NULL.
         #[cfg(feature = "params")]
         Expr::Param(..) => RExpr::Literal(OwnedValue::Null),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Column {
             table,
             name,
@@ -2124,14 +2123,14 @@ pub fn resolve_scoped<E>(
             };
             resolve_col_ref::<E>(*table, *name, arena, cur, enclosing, db)?
         }
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         Expr::Column { table, name } => resolve_col_ref::<E>(*table, *name, arena, cur, enclosing)?,
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         Expr::TrigValue(lit, aff, coll) => {
             RExpr::AffLiteral(literal_value(arena, *lit), *aff, *coll)
         }
         // Row-value comparisons (resolved out of line).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Binary(op, l, r) if is_cmp_op(*op) && (is_row(l) || is_row(r)) => {
             resolve_other::<E>(expr, arena, cur, enclosing, planner)?
         }
@@ -2193,7 +2192,7 @@ pub fn resolve_scoped<E>(
             )?),
             crate::record::cast_affinity(handle_bytes(arena, *ty)),
         ),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Collate(e, c) => RExpr::Collate(
             Box::new(resolve_scoped::<E>(
                 e,
@@ -2215,13 +2214,13 @@ pub fn resolve_scoped<E>(
 }
 
 /// The database a three-part column name's schema part names
-/// (v0.16, `v16`; `SourceDesc::db`): 1 for `main`, 2 for `temp`
+/// (v0.16, `sql`; `SourceDesc::db`): 1 for `main`, 2 for `temp`
 /// (case-insensitive; the pin takes no other spelling, `temporary`
 /// included), else 3, which only a CHECK constraint's or partial
 /// index's table (`DB_ANY`) matches — as on the pin, which ignores
 /// the schema part there. A name matching no source of its
 /// database is "no such column" (`UnknownColumn`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn schema_db(sc: &[u8]) -> u8 {
     if eq_ci(sc, b"main") {
         1
@@ -2240,17 +2239,17 @@ fn resolve_col_ref<E>(
     arena: &Arena,
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
-    #[cfg(feature = "v16")] db: u8,
+    #[cfg(feature = "sql")] db: u8,
 ) -> Result<RExpr, E> {
     let r = resolve_column::<E>(
         cur,
         enclosing,
         table.map(|h| handle_bytes(arena, h)),
         handle_bytes(arena, name),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         db,
     )?;
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if core::iter::once(cur)
         .chain(enclosing.iter())
         .any(|g| g.sources.iter().any(|s| s.trace.is_some()))
@@ -2271,32 +2270,32 @@ fn resolve_other<E>(
 ) -> Result<RExpr, E> {
     let p = planner;
     Ok(match expr {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::InSubquery(x, ..) if is_row(x) => {
             res_in_sub_row::<E>(expr, arena, cur, enclosing, p)?
         }
         Expr::InSubquery(..) => res_in_sub::<E>(expr, arena, cur, enclosing, p)?,
         Expr::ScalarSubquery(_) => res_scalar_sub::<E>(expr, arena, cur, enclosing, p)?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::BitNot(_) => res_bit_not::<E>(expr, arena, cur, enclosing, p)?,
         // A row value anywhere but a comparison operand.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Vector(_) => return Err(row_misused()),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::RowItem(..) => res_row_item::<E>(expr, arena, cur, enclosing, p)?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Binary(op, l, r) if is_cmp_op(*op) && (is_row(l) || is_row(r)) => {
             res_row_cmp::<E>(expr, arena, cur, enclosing, p)?
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Between(x, lo, hi, _) if is_row(x) || is_row(lo) || is_row(hi) => {
             res_row_between::<E>(expr, arena, cur, enclosing, p)?
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::InList(x, ..) if matches!(**x, Expr::Vector(_)) => {
             res_row_in_list::<E>(expr, arena, cur, enclosing, p)?
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Case {
             base: Some(b),
             whens,
@@ -2314,14 +2313,14 @@ fn resolve_other<E>(
             distinct,
             star,
             args,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             clause,
         } => resolve_func::<E>(
             handle_bytes(arena, *name),
             *distinct,
             *star,
             args.as_slice(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             clause.as_deref(),
             arena,
             cur,
@@ -2350,7 +2349,7 @@ fn resolve_other<E>(
 
 /// `resolve_other`'s `in_sub_row` node (out of line, v0.16: see
 /// `resolve_scoped`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[inline(never)]
 fn res_in_sub_row<E>(
     expr: &Expr,
@@ -2432,7 +2431,7 @@ fn res_scalar_sub<E>(
 
 /// `resolve_other`'s `bit_not` node (out of line, v0.16: see
 /// `resolve_scoped`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[inline(never)]
 fn res_bit_not<E>(
     expr: &Expr,
@@ -2460,7 +2459,7 @@ fn res_bit_not<E>(
 
 /// `resolve_other`'s `row_item` node (out of line, v0.16: see
 /// `resolve_scoped`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[inline(never)]
 fn res_row_item<E>(
     expr: &Expr,
@@ -2492,7 +2491,7 @@ fn res_row_item<E>(
 
 /// `resolve_other`'s `row_cmp` node (out of line, v0.16: see
 /// `resolve_scoped`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[inline(never)]
 fn res_row_cmp<E>(
     expr: &Expr,
@@ -2514,7 +2513,7 @@ fn res_row_cmp<E>(
 
 /// `resolve_other`'s `row_between` node (out of line, v0.16: see
 /// `resolve_scoped`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[inline(never)]
 fn res_row_between<E>(
     expr: &Expr,
@@ -2542,7 +2541,7 @@ fn res_row_between<E>(
 
 /// `resolve_other`'s `row_in_list` node (out of line, v0.16: see
 /// `resolve_scoped`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[inline(never)]
 fn res_row_in_list<E>(
     expr: &Expr,
@@ -2582,7 +2581,7 @@ fn res_row_in_list<E>(
 
 /// `resolve_other`'s `row_case` node (out of line, v0.16: see
 /// `resolve_scoped`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[inline(never)]
 fn res_row_case<E>(
     expr: &Expr,
@@ -2815,7 +2814,7 @@ fn res_case<E>(
 }
 
 /// The pin's "row value misused" (v0.16).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn row_misused<E>() -> Error<E> {
     Error::Schema {
         kind: SchemaKind::RowValueMisused,
@@ -2824,7 +2823,7 @@ fn row_misused<E>() -> Error<E> {
 
 /// `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`: the operators
 /// that compare row values (v0.16).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn is_cmp_op(op: BinOp) -> bool {
     matches!(
         op,
@@ -2842,7 +2841,7 @@ fn is_cmp_op(op: BinOp) -> bool {
 /// Whether `e` may be a row value (v0.16): a written `(a, b,
 /// ...)` or a scalar subquery (whose width only planning
 /// tells).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn is_row(e: &Expr) -> bool {
     matches!(e, Expr::Vector(_) | Expr::ScalarSubquery(_))
 }
@@ -2852,7 +2851,7 @@ fn is_row(e: &Expr) -> bool {
 /// must be scalars; a scalar subquery of n > 1 columns gives n
 /// copies of its plan, part `i` yielding column `i` of the
 /// first row.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn resolve_row<E>(
     e: &Expr,
     arena: &Arena,
@@ -2901,7 +2900,7 @@ fn resolve_row<E>(
 /// itself. Three-valued logic gives the pin's NULL answers. Two
 /// scalars compare directly; operands of different sizes are
 /// "row value misused".
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn row_cmp<E>(op: BinOp, l: &[RExpr], r: &[RExpr]) -> Result<RExpr, E> {
     if l.len() != r.len() {
         return Err(row_misused());
@@ -2933,11 +2932,11 @@ fn row_cmp<E>(op: BinOp, l: &[RExpr], r: &[RExpr]) -> Result<RExpr, E> {
                     bin(BinOp::And, pair(i, BinOp::Eq)?, acc),
                 );
             }
-            // (v0.17, `multi_index`: under a double NOT, which changes
+            // (v0.17, `planner`: under a double NOT, which changes
             // no value, so the planner does not take the pin's vector
             // comparison for an OR of branches it could read through
             // a MULTI-INDEX OR.)
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             if last > 0 {
                 acc = RExpr::Not(Box::new(RExpr::Not(Box::new(acc))));
             }
@@ -3002,7 +3001,7 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
         (b"sign", ScalarFn::Sign),
         (b"iif", ScalarFn::Iif),
     ];
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     const V16: &[(&[u8], ScalarFn)] = &[
         (b"if", ScalarFn::Iif),
         (b"like", ScalarFn::Like),
@@ -3027,7 +3026,7 @@ fn scalar_fn(name: &[u8]) -> Option<ScalarFn> {
         (b"unhex", ScalarFn::Unhex),
         (b"sqlite_version", ScalarFn::SqliteVersion),
     ];
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     const V16: &[(&[u8], ScalarFn)] = &[];
     let f = BASE
         .iter()
@@ -3091,28 +3090,28 @@ fn arity(f: ScalarFn) -> (usize, usize) {
         ScalarFn::Replace => (3, 3),
         // The pin's iif() is a CASE of (condition, value) pairs
         // with an optional ELSE (3.48+): two or more arguments.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Iif => (2, usize::MAX),
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         ScalarFn::Iif => (3, 3),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Like => (2, 3),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Glob => (2, 2),
         ScalarFn::MinN | ScalarFn::MaxN => (2, usize::MAX),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Printf | ScalarFn::Char => (0, usize::MAX),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Random
         | ScalarFn::LastInsertRowid
         | ScalarFn::Changes
         | ScalarFn::TotalChanges
         | ScalarFn::SqliteVersion => (0, 0),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Likely | ScalarFn::Unhex => (1, 2),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Concat => (1, usize::MAX),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::ConcatWs => (2, usize::MAX),
         #[cfg(feature = "math")]
         ScalarFn::Math(m) => m.arity(),
@@ -3139,7 +3138,7 @@ fn resolve_func<E>(
     distinct: bool,
     star: bool,
     args: &[Expr],
-    #[cfg(feature = "v16")] clause: Option<&crate::sql::ast::FuncClause>,
+    clause: Option<&crate::sql::ast::FuncClause>,
     arena: &Arena,
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
@@ -3185,15 +3184,15 @@ pub(crate) fn agg_kind(name: &[u8]) -> Option<AggKind> {
         (b"min", AggKind::Min),
         (b"max", AggKind::Max),
         (b"group_concat", AggKind::GroupConcat),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         (b"string_agg", AggKind::GroupConcat),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         (b"median", AggKind::Median),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         (b"percentile", AggKind::Percentile),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         (b"percentile_cont", AggKind::PercentileCont),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         (b"percentile_disc", AggKind::PercentileDisc),
     ];
     let k = AGGS.iter().find(|(n, _)| eq_ci(name, n)).map(|(_, k)| *k);
@@ -3243,7 +3242,7 @@ fn resolve_call_body<E>(
     distinct: bool,
     star: bool,
     args: &[Expr],
-    #[cfg(feature = "v16")] clause: Option<&crate::sql::ast::FuncClause>,
+    #[cfg(feature = "sql")] clause: Option<&crate::sql::ast::FuncClause>,
     arena: &Arena,
     cur: &ScopeGroup,
     enclosing: &[ScopeGroup],
@@ -3291,7 +3290,7 @@ fn resolve_call_body<E>(
             enclosing,
             None,
             col,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             0,
         )
         .map_err(|_| Error::Schema {
@@ -3323,9 +3322,9 @@ fn resolve_call_body<E>(
     }
     let agg = agg_kind(name);
     // The aggregate clauses on anything but an aggregate (v0.16,
-    // `v16`): the pin refuses them at prepare. min / max with
+    // `sql`): the pin refuses them at prepare. min / max with
     // several arguments are the scalar forms.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if let Some(c) = clause
         && (agg.is_none() || (matches!(agg, Some(AggKind::Min | AggKind::Max)) && args.len() > 1))
     {
@@ -3352,19 +3351,19 @@ fn resolve_call_body<E>(
         }
         let want = match kind {
             AggKind::GroupConcat => {
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if eq_ci(name, b"string_agg") {
                     (2, 2)
                 } else {
                     (1, 2)
                 }
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 (1, 2)
             }
-            // `count()` is `count(*)` on the pin (v0.16, `v16`).
-            #[cfg(feature = "v16")]
+            // `count()` is `count(*)` on the pin (v0.16, `sql`).
+            #[cfg(feature = "sql")]
             AggKind::Count => (0, 1),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             AggKind::Percentile | AggKind::PercentileCont | AggKind::PercentileDisc => (2, 2),
             #[cfg(feature = "json")]
             AggKind::Json(j) => (j.nargs(), j.nargs()),
@@ -3388,7 +3387,7 @@ fn resolve_call_body<E>(
         }
         let star = star || args.is_empty();
         let all = resolve_args::<E>(args, arena, cur, enclosing, &mut *planner)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut all = all;
         // min / max take no ORDER BY on the pin, but only its code
         // generator ignores it: the keys are resolved (so their
@@ -3397,9 +3396,9 @@ fn resolve_call_body<E>(
         // (review fix: `(SELECT max(o.x ORDER BY i.y) FROM i)`
         // became the outer query's aggregate, and `max(x ORDER BY
         // count(*))` ran). They are held here, outside the node.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut ignored: AVec<RExpr> = AVec::new();
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let ext = match clause {
             None => None,
             Some(c) => {
@@ -3455,9 +3454,9 @@ fn resolve_call_body<E>(
         // aggregate's arguments): `sum(max(a))`, and `(SELECT
         // sum(c + max(t.a)) FROM u)`, where sum belongs to u and
         // max to t (review fix: the latter returned a value).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let ignored = ignored.as_slice();
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let ignored: &[RExpr] = &[];
         if all.iter().chain(ignored.iter()).any(has_direct_agg) {
             return Err(Error::Schema {
@@ -3486,7 +3485,7 @@ fn resolve_call_body<E>(
             lvl,
             inert: false,
             alias: false,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             ext,
         });
     }
@@ -3495,14 +3494,14 @@ fn resolve_call_body<E>(
             kind: SchemaKind::UnknownFunction,
         });
     };
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     let want = if f == ScalarFn::Likely {
         let n = if eq_ci(name, b"likelihood") { 2 } else { 1 };
         (n, n)
     } else {
         arity(f)
     };
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     let want = arity(f);
     // `ifnull` is coalesce with exactly two arguments on the pin
     // (v0.16 review fix: `ifnull(1)` / `ifnull(NULL, NULL, 5)`
@@ -3513,10 +3512,10 @@ fn resolve_call_body<E>(
         want
     };
     // `f(*)` is `f()` for a scalar function and DISTINCT is
-    // ignored, as on the pin (v0.16, `v16`): `random(*)`,
+    // ignored, as on the pin (v0.16, `sql`): `random(*)`,
     // `printf(*)` (NULL), `abs(DISTINCT -1)` (1). The argument
     // count is checked as for the plain call (`abs(*)` errors).
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     if star || distinct {
         return Err(Error::Unsupported);
     }
@@ -3527,7 +3526,7 @@ fn resolve_call_body<E>(
     }
     // likelihood(X, P): P must be a REAL literal in 0.0 ..= 1.0
     // (the pin's `TK_FLOAT` test; `-0.0` and integers fail).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if f == ScalarFn::Likely
         && args.len() == 2
         && !matches!(args.get(1), Some(Expr::Literal(Literal::Real(r)))
@@ -3543,7 +3542,7 @@ fn resolve_call_body<E>(
     // second argument (0.9375 / 0.0625: the pin's tuning), which the
     // planner reads as the term's truth probability (v0.17 review
     // fix; `EP_Unlikely`).
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     if f == ScalarFn::Likely && rargs.len() == 1 {
         let p = if name.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'u')) {
             0.0625
@@ -3556,7 +3555,7 @@ fn resolve_call_body<E>(
 }
 
 /// Whether two resolved expressions are the same expression in
-/// the pin's `sqlite3ExprCompare` sense (v0.16, `v16`; used for
+/// the pin's `sqlite3ExprCompare` sense (v0.16, `sql`; used for
 /// the DISTINCT aggregate whose ORDER BY is its argument): the
 /// same column (whatever qualifier named it), literal, operator,
 /// function or COLLATE, recursively. Anything else — CASE,
@@ -3849,7 +3848,7 @@ pub fn mark_exists_inert(p: &mut SubPlan) {
         return;
     }
     fn mark(e: &mut RExpr, d: u8) {
-        let _ = walk_aggs_mut::<()>(e, d, &mut |a, dd| {
+        let _ = walk_aggs_mut(e, d, &mut |a, dd| {
             if let RExpr::Agg { lvl, inert, .. } = a
                 && *lvl > dd
             {
@@ -3967,30 +3966,45 @@ pub fn subst_owned_aggs<E>(
     d: u8,
     fold: &mut dyn FnMut(&RExpr) -> Result<OwnedValue, E>,
 ) -> Result<(), E> {
-    walk_aggs_mut::<E>(e, d, &mut |a, dd| {
+    // The walk is monomorphic (v0.17 size pass): `fold`'s error
+    // waits here while the walk stops on the unit signal.
+    let mut err = None;
+    let _ = walk_aggs_mut(e, d, &mut |a, dd| {
         if let RExpr::Agg {
             lvl, inert: false, ..
         } = a
             && *lvl == dd
             && dd > 0
         {
-            let v = fold(a)?;
-            *a = RExpr::Literal(v);
+            match fold(a) {
+                Ok(v) => *a = RExpr::Literal(v),
+                Err(x) => {
+                    err = Some(x);
+                    return Err(());
+                }
+            }
             return Ok(true);
         }
         Ok(false)
-    })
+    });
+    match err {
+        Some(x) => Err(x),
+        None => Ok(()),
+    }
 }
 
 /// Walk every node of `e` (at subquery depth `d`, + 1 per
 /// nested plan as in `visit_aggs`), calling `f` on each
 /// aggregate node first; `f` returning true means it replaced
-/// the node, which is then not descended into (v0.16).
-fn walk_aggs_mut<E>(
+/// the node, which is then not descended into (v0.16). `f`
+/// returning `Err(())` stops the walk; a caller with an error to
+/// report keeps it beside the closure, so the walk is compiled once
+/// (v0.17 size pass).
+fn walk_aggs_mut(
     e: &mut RExpr,
     d: u8,
-    f: &mut dyn FnMut(&mut RExpr, u8) -> Result<bool, E>,
-) -> Result<(), E> {
+    f: &mut dyn FnMut(&mut RExpr, u8) -> core::result::Result<bool, ()>,
+) -> core::result::Result<(), ()> {
     let fold = f;
     if matches!(e, RExpr::Agg { .. }) && fold(e, d)? {
         return Ok(());
@@ -4057,11 +4071,11 @@ fn walk_aggs_mut<E>(
 }
 
 /// `walk_aggs_mut` over every expression of a plan (v0.16).
-fn walk_plan_aggs_mut<E>(
+fn walk_plan_aggs_mut(
     p: &mut SubPlan,
     d: u8,
-    fold: &mut dyn FnMut(&mut RExpr, u8) -> Result<bool, E>,
-) -> Result<(), E> {
+    fold: &mut dyn FnMut(&mut RExpr, u8) -> core::result::Result<bool, ()>,
+) -> core::result::Result<(), ()> {
     for s in p.sources.as_mut_slice() {
         if let Some(on) = &mut s.on {
             walk_aggs_mut(on, d, fold)?;
@@ -4181,7 +4195,7 @@ pub fn has_corr_sub(e: &RExpr) -> bool {
 /// any other uncorrelated one once — even one that reads the table
 /// through a nested subquery, a derived table, a view or a CTE
 /// (probed). See `Statement::eval_returning`.
-#[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+#[cfg(any(feature = "triggers", feature = "foreign_keys"))]
 pub fn subs_reading(e: &RExpr, root: u32, out: &mut AVec<usize>) {
     let mut subs = AVec::new();
     collect_subs(e, &mut subs);
@@ -4194,7 +4208,7 @@ pub fn subs_reading(e: &RExpr, root: u32, out: &mut AVec<usize>) {
 }
 
 /// `subs_reading` over one plan and the plans inside it.
-#[cfg(all(feature = "v07", any(feature = "triggers", feature = "foreign_keys")))]
+#[cfg(any(feature = "triggers", feature = "foreign_keys"))]
 fn plan_subs_reading(p: &SubPlan, root: u32, out: &mut AVec<usize>) {
     let mut direct = false;
     let mut cores: AVec<&SubPlan> = AVec::new();
@@ -4206,7 +4220,6 @@ fn plan_subs_reading(p: &SubPlan, root: u32, out: &mut AVec<usize>) {
         for s in c.sources.iter() {
             match &s.derived {
                 Some(d) => plan_subs_reading(d, root, out),
-                #[cfg(feature = "v16")]
                 None if s.rec != 0 => {}
                 None => direct |= s.root == root,
             }
@@ -4351,7 +4364,7 @@ pub(crate) fn in_sub_coll(x: &RExpr, plan: &SubPlan) -> Coll {
 /// as substituted) of the subquery's values, with the left
 /// operand `sx` (the substituted `x`) carrying the membership
 /// collation (`in_sub_lhs`). A row-value left operand (v0.16,
-/// `v16`) gets one collation per element and the row-major
+/// `sql`) gets one collation per element and the row-major
 /// values regrouped into rows of its size, each element
 /// carrying its result column's affinity.
 fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool) -> RExpr {
@@ -4362,7 +4375,7 @@ fn in_sub_list(x: &RExpr, plan: &SubPlan, sx: RExpr, value: &SubValue, neg: bool
         Some(a) => RExpr::AffLiteral(v.clone(), Some(a), None),
         None => RExpr::Literal(v.clone()),
     };
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if let (RExpr::Scalar(ScalarFn::Vector, xs), RExpr::Scalar(ScalarFn::Vector, sxs)) = (x, &sx) {
         let core = plan.compound.as_slice().last().map_or(plan, |(_, t)| t);
         let n = xs.len().max(1);
@@ -4602,7 +4615,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
             lvl,
             inert,
             alias,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             ext,
         } => {
             let mut out = AVec::new();
@@ -4617,7 +4630,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
                 lvl: *lvl,
                 inert: *inert,
                 alias: *alias,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 ext: ext.clone(),
             }
         }
@@ -4626,7 +4639,7 @@ pub fn substitute(e: &RExpr, values: &[SubValue], pos: &mut usize) -> RExpr {
 
 /// Whether a subquery node occurs inside an aggregate's
 /// arguments: such subqueries need per-group-row execution
-/// (v0.11, behind the `v10` feature). Without that feature the
+/// (v0.11, behind the `sql` feature). Without that feature the
 /// planners refuse them at plan time with
 /// `Error::Unsupported` rather than mis-evaluating.
 pub fn sub_in_agg_args(e: &RExpr) -> bool {
@@ -5221,29 +5234,29 @@ pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {
 
 // ---------------- evaluation ----------------
 
-/// Connection state the evaluator reads (v0.16, `v16`): the
+/// Connection state the evaluator reads (v0.16, `sql`): the
 /// pin's `last_insert_rowid()`, `changes()`, `total_changes()`
 /// and the random stream behind `random()` / `randomblob()`. One
 /// per connection; the cells are updated from `&self` paths (a
 /// statement's writes, the random draws), never through global
-/// state. Without `v16` it is empty.
+/// state. Without `sql` it is empty.
 #[derive(Debug)]
 pub struct Env {
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub last_rowid: core::cell::Cell<i64>,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub changes: core::cell::Cell<i64>,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub total_changes: core::cell::Cell<i64>,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub prng: crate::func::Prng,
     /// Rows the running INSERT / UPDATE / DELETE has changed so
     /// far (moved to `changes` when it succeeds).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub pending: core::cell::Cell<i64>,
     /// `PRAGMA case_sensitive_like` (v0.16): LIKE and `like()`
     /// compare ASCII letters case-sensitively while set.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub case_like: core::cell::Cell<bool>,
     /// The message of the last `RAISE(...)` evaluated (v0.16,
     /// `triggers`; `Connection::raise_message`).
@@ -5295,17 +5308,17 @@ impl Env {
     pub fn new(seed: u64) -> Env {
         let _ = seed;
         Env {
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             last_rowid: core::cell::Cell::new(0),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             changes: core::cell::Cell::new(0),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             total_changes: core::cell::Cell::new(0),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             prng: crate::func::Prng::new(seed),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             pending: core::cell::Cell::new(0),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             case_like: core::cell::Cell::new(false),
             #[cfg(feature = "triggers")]
             raise_msg: core::cell::RefCell::new(AVec::new()),
@@ -5341,7 +5354,7 @@ impl Env {
     /// One row inserted with `rowid` (an INSERT, the REPLACE
     /// verb, an upsert's insert): counted, and the new
     /// `last_insert_rowid()`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn note_insert(&self, rowid: i64) {
         self.last_rowid.set(rowid);
         self.note_change();
@@ -5350,7 +5363,7 @@ impl Env {
     /// One row updated (UPDATE, upsert DO UPDATE) or deleted
     /// (DELETE). A REPLACE conflict's deletions are not counted,
     /// as on the pin.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn note_change(&self) {
         self.pending.set(self.pending.get().saturating_add(1));
     }
@@ -5396,7 +5409,7 @@ impl Env {
     /// The end of an INSERT / UPDATE / DELETE: on success its
     /// count becomes `changes()` and joins `total_changes()`; a
     /// failed statement leaves `changes()` 0.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn finish(&self, ok: bool) {
         let n = if ok { self.pending.get() } else { 0 };
         self.changes.set(n);
@@ -5419,7 +5432,7 @@ pub struct Ctx<'x> {
     env: Option<&'x Env>,
     /// LIKE compares case-sensitively without the connection
     /// state at hand (v0.16: a generated column's computation).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     like_cs: bool,
     /// The pin's "pure" evaluation (v0.16, `datetime`): a CHECK
     /// constraint or an index expression, where a date and time
@@ -5435,7 +5448,7 @@ impl<'x> Ctx<'x> {
             rows: None,
             rep: r,
             env: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             like_cs: false,
             #[cfg(feature = "datetime")]
             pure: false,
@@ -5458,7 +5471,7 @@ impl<'x> Ctx<'x> {
     }
     /// The same context with `PRAGMA case_sensitive_like` set to
     /// `on` (v0.16).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn case_like(mut self, on: bool) -> Ctx<'x> {
         self.like_cs = on;
         self
@@ -5470,7 +5483,7 @@ impl<'x> Ctx<'x> {
             rows: Some(rows),
             rep,
             env: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             like_cs: false,
             #[cfg(feature = "datetime")]
             pure: false,
@@ -5501,7 +5514,7 @@ impl<'x> Ctx<'x> {
             rows: None,
             rep: r,
             env: self.env,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             like_cs: self.like_cs,
             #[cfg(feature = "datetime")]
             pure: self.pure,
@@ -5969,8 +5982,8 @@ fn in_list_coll(x: &RExpr) -> Coll {
 }
 
 fn cmp_op<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
-    let lv = eval::<E>(l, ctx)?;
-    let rv = eval::<E>(r, ctx)?;
+    let lv = eval_body::<E>(l, ctx)?;
+    let rv = eval_body::<E>(r, ctx)?;
     cmp_values::<E>(op, l, r, lv, rv, ctx.enc())
 }
 
@@ -6011,8 +6024,8 @@ fn cmp_values<E>(
 }
 
 fn arith<E>(op: BinOp, l: &RExpr, r: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
-    let lv = eval::<E>(l, ctx)?;
-    let rv = eval::<E>(r, ctx)?;
+    let lv = eval_body::<E>(l, ctx)?;
+    let rv = eval_body::<E>(r, ctx)?;
     #[cfg(feature = "utf16")]
     if ctx.enc() != crate::record::TextEnc::Utf8 {
         let r = arith_values::<E>(op, blob_text(lv, ctx), blob_text(rv, ctx))?;
@@ -6362,11 +6375,11 @@ fn pattern_match(pat: &[u32], s: &[u8], info: PatInfo) -> bool {
 /// Whether `PRAGMA case_sensitive_like` is on for this
 /// evaluation (v0.16; off without the connection state).
 fn case_like(ctx: &Ctx<'_>) -> bool {
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     {
         ctx.like_cs || ctx.env.is_some_and(|e| e.case_like.get())
     }
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     {
         let _ = ctx;
         false
@@ -6592,7 +6605,7 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
         ScalarFn::Raise(k) => Some(eval_raise::<E>(k, args, ctx)),
         ScalarFn::Coalesce => {
             for a in args {
-                match eval::<E>(a, ctx) {
+                match eval_body::<E>(a, ctx) {
                     Ok(OwnedValue::Null) => {}
                     other => return Some(other),
                 }
@@ -6602,21 +6615,21 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
         ScalarFn::Iif => {
             let mut i = 0usize;
             while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
-                match cond::<E>(c, ctx) {
+                match cond_body::<E>(c, ctx, true) {
                     Err(e) => return Some(Err(e)),
-                    Ok(true) => return Some(eval::<E>(t, ctx)),
+                    Ok(true) => return Some(eval_body::<E>(t, ctx)),
                     Ok(false) => {}
                 }
                 i += 2;
             }
             Some(match args.get(i) {
-                Some(o) => eval::<E>(o, ctx),
+                Some(o) => eval_body::<E>(o, ctx),
                 None => Ok(OwnedValue::Null),
             })
         }
-        #[cfg(feature = "v16")]
-        ScalarFn::Likely => args.first().map(|a| eval::<E>(a, ctx)),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
+        ScalarFn::Likely => args.first().map(|a| eval_body::<E>(a, ctx)),
+        #[cfg(feature = "sql")]
         ScalarFn::Random
         | ScalarFn::Randomblob
         | ScalarFn::LastInsertRowid
@@ -6627,7 +6640,7 @@ fn eval_lazy<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Option<Result<Own
             };
             Some(match f {
                 ScalarFn::Random => Ok(OwnedValue::Integer(env.prng.random())),
-                ScalarFn::Randomblob => match args.first().map(|a| eval::<E>(a, ctx)) {
+                ScalarFn::Randomblob => match args.first().map(|a| eval_body::<E>(a, ctx)) {
                     Some(Ok(n)) => env.prng.blob::<E>(&num_arg(n, ctx)),
                     Some(Err(e)) => Err(e),
                     None => Ok(OwnedValue::Null),
@@ -6651,7 +6664,7 @@ fn eval_scalar<E>(f: ScalarFn, args: &[RExpr], ctx: &Ctx<'_>) -> Result<OwnedVal
     }
     let mut vs: AVec<OwnedValue> = AVec::new();
     for a in args {
-        vs.push(eval::<E>(a, ctx)?);
+        vs.push(eval_body::<E>(a, ctx)?);
     }
     #[cfg(feature = "utf16")]
     if let Some(be) = crate::utf16::byte_order(ctx.enc()) {
@@ -6808,7 +6821,7 @@ fn scalar_values<E>(
     }
     let Some(v0) = v.first() else {
         // The argument-free calls.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         match f {
             ScalarFn::Printf => return Ok(OwnedValue::Null),
             ScalarFn::Char => return Ok(OwnedValue::Text(AVec::new())),
@@ -6823,30 +6836,30 @@ fn scalar_values<E>(
     };
     let v1 = v.get(1);
     Ok(match f {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::BitNot => match v0 {
             OwnedValue::Null => OwnedValue::Null,
             x => OwnedValue::Integer(!int_value(x)),
         },
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Vector => return Err(row_misused()),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Printf => crate::func::printf::<E>(v)?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Quote => crate::func::quote::<E>(v0)?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Char => crate::func::char_fn::<E>(v)?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Unicode => crate::func::unicode(v0),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Zeroblob => crate::func::zeroblob::<E>(v0)?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Concat => crate::func::concat::<E>(None, v)?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::ConcatWs => crate::func::concat::<E>(Some(v0), v.get(1..).unwrap_or(&[]))?,
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::OctetLength => crate::func::octet_length(v0),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Unhex => crate::func::unhex(v0, v1),
         // The pin's `(u8)sqlite3_value_int(ndim)`, and the blob's
         // bytes (text reads as its bytes).
@@ -7102,7 +7115,7 @@ fn scalar_values<E>(
             OwnedValue::Text(out)
         }
         ScalarFn::Instr => instr_value(v0, v1.unwrap_or(&OwnedValue::Null)),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         ScalarFn::Like | ScalarFn::Glob => like_glob::<E>(
             v0,
             v1.unwrap_or(&OwnedValue::Null),
@@ -7221,7 +7234,8 @@ pub(crate) fn json_arg16(
 /// other function, a value read back from a table — does not.
 #[cfg(feature = "json")]
 pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, bool), E> {
-    let plain = |x: &RExpr| -> Result<(OwnedValue, bool), E> { Ok((eval::<E>(x, ctx)?, false)) };
+    let plain =
+        |x: &RExpr| -> Result<(OwnedValue, bool), E> { Ok((eval_body::<E>(x, ctx)?, false)) };
     match e {
         RExpr::Scalar(ScalarFn::Json(f), args) => eval_json_call::<E>(*f, args.as_slice(), ctx),
         RExpr::Pos(x) | RExpr::Collate(x, _) => eval_json_arg::<E>(x, ctx),
@@ -7253,7 +7267,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             let args = args.as_slice();
             let mut i = 0usize;
             while let (Some(c), Some(t)) = (args.get(i), args.get(i + 1)) {
-                if cond::<E>(c, ctx)? {
+                if cond_body::<E>(c, ctx, true)? {
                     return eval_json_arg::<E>(t, ctx);
                 }
                 i += 2;
@@ -7269,7 +7283,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
                 return plain(e);
             };
             let (va, sa) = eval_json_arg::<E>(a, ctx)?;
-            let vb = eval::<E>(b, ctx)?;
+            let vb = eval_body::<E>(b, ctx)?;
             if !matches!(va, OwnedValue::Null)
                 && !matches!(vb, OwnedValue::Null)
                 && values_equal_coll(&va, &vb, args_coll(args))
@@ -7321,9 +7335,9 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
         } => {
             match base {
                 Some(b) => {
-                    let bv = eval::<E>(b, ctx)?;
+                    let bv = eval_body::<E>(b, ctx)?;
                     for (w, t) in whens.iter() {
-                        let wv = eval::<E>(w, ctx)?;
+                        let wv = eval_body::<E>(w, ctx)?;
                         let (bv2, wv2) = adjust_cmp(b, w, bv.clone(), wv);
                         if !matches!(bv2, OwnedValue::Null)
                             && !matches!(wv2, OwnedValue::Null)
@@ -7335,7 +7349,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
                 }
                 None => {
                     for (w, t) in whens.iter() {
-                        if cond::<E>(w, ctx)? {
+                        if cond_body::<E>(w, ctx, true)? {
                             return eval_json_arg::<E>(t, ctx);
                         }
                     }
@@ -7350,7 +7364,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             kind: AggKind::Json(a),
             ..
         } if !a.blob => {
-            let v = eval::<E>(e, ctx)?;
+            let v = eval_body::<E>(e, ctx)?;
             let sub = matches!(v, OwnedValue::Text(_));
             Ok((v, sub))
         }
@@ -7362,7 +7376,7 @@ pub(crate) fn eval_json_arg<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<(OwnedValue, 
             ..
         } if matches!(args.as_slice().first(), Some(RExpr::Scalar(ScalarFn::Json(f), _)) if f.always_json()) =>
         {
-            let v = eval::<E>(e, ctx)?;
+            let v = eval_body::<E>(e, ctx)?;
             let sub = matches!(v, OwnedValue::Text(_));
             Ok((v, sub))
         }
@@ -7392,7 +7406,7 @@ fn eval_agg<E>(e: &RExpr, rows: &[RowData], ctx: &Ctx<'_>) -> Result<OwnedValue,
 /// `OP_BitAnd` / `OP_BitOr` / `OP_ShiftLeft` / `OP_ShiftRight`.
 /// A negative count shifts the other way; a count of 64 or more
 /// leaves 0, or -1 for a negative value shifted right.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn bit_op(op: BinOp, a: i64, b: i64) -> i64 {
     let mut left = match op {
         BinOp::BitAnd => return a & b,
@@ -7431,7 +7445,7 @@ fn bit_op(op: BinOp, a: i64, b: i64) -> i64 {
 /// `x`'s element against that same element. The result is 1 on
 /// a match, else NULL if some item had a NULL element test and
 /// no unequal one, else 0 (negated for NOT IN).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     fn parts(e: &RExpr) -> &[RExpr] {
         match e {
@@ -7443,7 +7457,7 @@ fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<Own
     let last = list.last().map(parts).unwrap_or(&[]);
     let mut xv = AVec::new();
     for e in xs {
-        xv.push(eval::<E>(e, ctx)?);
+        xv.push(eval_body::<E>(e, ctx)?);
     }
     let mut any_null = false;
     for item in list {
@@ -7454,7 +7468,7 @@ fn in_rows<E>(x: &RExpr, list: &[RExpr], neg: bool, ctx: &Ctx<'_>) -> Result<Own
             else {
                 return Err(row_misused());
             };
-            let iv = eval::<E>(ie, ctx)?;
+            let iv = eval_body::<E>(ie, ctx)?;
             let (a, b) = adjust_set(xe, src, v.clone(), iv);
             if matches!(a, OwnedValue::Null) || matches!(b, OwnedValue::Null) {
                 row_null = true;
@@ -7491,7 +7505,7 @@ fn eval_raise<E>(
     use crate::sql::ast::RaiseKind;
     let mut msg = AVec::new();
     if let Some(a) = args.first() {
-        match eval::<E>(a, ctx)? {
+        match eval_body::<E>(a, ctx)? {
             OwnedValue::Null => {}
             v => {
                 if let OwnedValue::Text(t) = cast_value(&v, Affinity::Text) {
@@ -7532,10 +7546,14 @@ pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     eval_body(e, ctx)
 }
 
-/// The evaluator's body (see `eval`); recursive calls go back through
-/// `eval`.
+/// The evaluator's body (see `eval`). Recursive calls, and the
+/// evaluator's own helpers (`eval_other`, `scalar_values`, `eval_case`,
+/// ...), call the body directly, so under `window` only the
+/// executors' entry points pay for `eval`'s re-typing (v0.17 size
+/// pass); a caller that wants `Error<()>` (the window functions'
+/// frame offsets) calls it directly too.
 #[inline(never)]
-fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
+pub(crate) fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
         RExpr::Literal(v) => v.clone(),
         RExpr::AffLiteral(v, ..) => v.clone(),
@@ -7552,8 +7570,8 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         },
         RExpr::Win(..) => return Err(Error::Unsupported),
         RExpr::Raise(kind) => return Err(Error::Schema { kind: *kind }),
-        RExpr::Pos(x) => eval::<E>(x, ctx)?,
-        RExpr::Neg(x) => match to_number(&num_arg(eval::<E>(x, ctx)?, ctx)) {
+        RExpr::Pos(x) => eval_body::<E>(x, ctx)?,
+        RExpr::Neg(x) => match to_number(&num_arg(eval_body::<E>(x, ctx)?, ctx)) {
             None => OwnedValue::Null,
             Some(Num::Int(i)) => match i.checked_neg() {
                 Some(n) => OwnedValue::Integer(n),
@@ -7561,12 +7579,12 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             },
             Some(Num::Real(r)) => OwnedValue::Real(-r),
         },
-        RExpr::Not(x) => match truthy(&eval::<E>(x, ctx)?) {
+        RExpr::Not(x) => match truthy(&eval_body::<E>(x, ctx)?) {
             None => OwnedValue::Null,
             Some(b) => bool_val(!b),
         },
         RExpr::IsNull(x, neg) => {
-            let is = matches!(eval::<E>(x, ctx)?, OwnedValue::Null);
+            let is = matches!(eval_body::<E>(x, ctx)?, OwnedValue::Null);
             bool_val(is != *neg)
         }
         RExpr::Binary(op, l, r) => match op {
@@ -7577,11 +7595,11 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             BinOp::And if int_lit(l) == Some(false) || int_lit(r) == Some(false) => bool_val(false),
             BinOp::Or if int_lit(l) == Some(true) || int_lit(r) == Some(true) => bool_val(true),
             BinOp::And => {
-                let a = truthy(&eval::<E>(l, ctx)?);
+                let a = truthy(&eval_body::<E>(l, ctx)?);
                 if a == Some(false) && has_raise(r) {
                     return Ok(bool_val(false));
                 }
-                let b = truthy(&eval::<E>(r, ctx)?);
+                let b = truthy(&eval_body::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(false), _) | (_, Some(false)) => bool_val(false),
                     (Some(true), Some(true)) => bool_val(true),
@@ -7589,11 +7607,11 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                 }
             }
             BinOp::Or => {
-                let a = truthy(&eval::<E>(l, ctx)?);
+                let a = truthy(&eval_body::<E>(l, ctx)?);
                 if a == Some(true) && has_raise(r) {
                     return Ok(bool_val(true));
                 }
-                let b = truthy(&eval::<E>(r, ctx)?);
+                let b = truthy(&eval_body::<E>(r, ctx)?);
                 match (a, b) {
                     (Some(true), _) | (_, Some(true)) => bool_val(true),
                     (Some(false), Some(false)) => bool_val(false),
@@ -7611,14 +7629,14 @@ fn eval_body<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
                 arith::<E>(*op, l, r, ctx)?
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => eval_other::<E>(e, ctx)?,
         },
         #[cfg(feature = "utf16")]
-        RExpr::Cast(x, aff) => cast_in(eval::<E>(x, ctx)?, *aff, ctx),
+        RExpr::Cast(x, aff) => cast_in(eval_body::<E>(x, ctx)?, *aff, ctx),
         #[cfg(not(feature = "utf16"))]
-        RExpr::Cast(x, aff) => cast_value(&eval::<E>(x, ctx)?, *aff),
-        RExpr::Collate(x, _) => eval::<E>(x, ctx)?,
+        RExpr::Cast(x, aff) => cast_value(&eval_body::<E>(x, ctx)?, *aff),
+        RExpr::Collate(x, _) => eval_body::<E>(x, ctx)?,
         // Everything else out of line: this function is on the
         // stack once per level of the expression tree, so its own
         // frame is kept to the common nodes (v0.16: see
@@ -7637,12 +7655,12 @@ fn eval_in_list<E>(
     ctx: &Ctx<'_>,
 ) -> Result<OwnedValue, E> {
     Ok({
-        let xv = eval::<E>(x, ctx)?;
+        let xv = eval_body::<E>(x, ctx)?;
         let mut any_null = matches!(xv, OwnedValue::Null);
         let mut hit = false;
         let coll = in_list_coll(x);
         for item in list.iter() {
-            let iv = eval::<E>(item, ctx)?;
+            let iv = eval_body::<E>(item, ctx)?;
             // An IN (SELECT ...) substitution converts both
             // sides by the set's affinity (the item carries
             // the subquery column's; `adjust_set`). A written list converts both sides
@@ -7692,9 +7710,9 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         let mut done = false;
         match base {
             Some(b) => {
-                let bv = eval::<E>(b, ctx)?;
+                let bv = eval_body::<E>(b, ctx)?;
                 for (w, t) in whens.iter() {
-                    let wv = eval::<E>(w, ctx)?;
+                    let wv = eval_body::<E>(w, ctx)?;
                     // The base form compares like `=`:
                     // comparison affinity applies between
                     // the base and each WHEN operand (v0.8;
@@ -7707,7 +7725,7 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
                         && !matches!(wv2, OwnedValue::Null)
                         && values_equal_coll(&bv2, &wv2, binary_coll(b, w))
                     {
-                        out = eval::<E>(t, ctx)?;
+                        out = eval_body::<E>(t, ctx)?;
                         done = true;
                         break;
                     }
@@ -7715,8 +7733,8 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
             None => {
                 for (w, t) in whens.iter() {
-                    if cond::<E>(w, ctx)? {
-                        out = eval::<E>(t, ctx)?;
+                    if cond_body::<E>(w, ctx, true)? {
+                        out = eval_body::<E>(t, ctx)?;
                         done = true;
                         break;
                     }
@@ -7724,7 +7742,7 @@ fn eval_case<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
         }
         if !done && let Some(o) = otherwise {
-            out = eval::<E>(o, ctx)?;
+            out = eval_body::<E>(o, ctx)?;
         }
         out
     })
@@ -7755,24 +7773,40 @@ pub fn cond_false<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
 }
 
 /// Whether `e` is `want` (true or false; NULL is neither).
+///
+/// Like `eval`, compiled once under `window` (v0.17 size pass): the
+/// evaluator's own conditions (CASE, json, `iif`) run the body for
+/// `Error<()>`, and the executors' calls re-type its errors here.
+#[cfg(feature = "window")]
 pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
+    cond_body::<()>(e, ctx, want).map_err(|x| x.map_storage(|()| Error::Unsupported))
+}
+
+/// Whether `e` is `want` (see the `window` variant above).
+#[cfg(not(feature = "window"))]
+pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
+    cond_body(e, ctx, want)
+}
+
+/// `cond_is`'s body (see `eval`): recursive calls stay in the body.
+fn cond_body<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
     match e {
         RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r)
             if int_lit(l).is_none() && int_lit(r).is_none() =>
         {
             // AND is false, OR true, as soon as one operand is.
             let decisive = (*op == BinOp::Or) == want;
-            let a = cond_is::<E>(l, ctx, want)?;
+            let a = cond_body::<E>(l, ctx, want)?;
             if a == decisive {
                 return Ok(a);
             }
-            cond_is::<E>(r, ctx, want)
+            cond_body::<E>(r, ctx, want)
         }
-        RExpr::Not(x) => cond_is::<E>(x, ctx, !want),
+        RExpr::Not(x) => cond_body::<E>(x, ctx, !want),
         #[cfg(feature = "utf16")]
-        _ => Ok(truthy(&blob_text(eval::<E>(e, ctx)?, ctx)) == Some(want)),
+        _ => Ok(truthy(&blob_text(eval_body::<E>(e, ctx)?, ctx)) == Some(want)),
         #[cfg(not(feature = "utf16"))]
-        _ => Ok(truthy(&eval::<E>(e, ctx)?) == Some(want)),
+        _ => Ok(truthy(&eval_body::<E>(e, ctx)?) == Some(want)),
     }
 }
 
@@ -7920,7 +7954,7 @@ pub fn and_terms<'e>(e: &'e RExpr, out: &mut AVec<&'e RExpr>) {
 /// A constant the pin computes once per statement: no column, no
 /// subquery, nothing non-deterministic.
 fn factorable(e: &RExpr) -> bool {
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if any_scalar(e, &|f| f.nondeterministic()) {
         return false;
     }
@@ -7931,10 +7965,10 @@ fn factorable(e: &RExpr) -> bool {
 #[inline(never)]
 fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     Ok(match e {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         RExpr::Binary(op @ (BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr), l, r) => {
-            let lv = eval::<E>(l, ctx)?;
-            let rv = eval::<E>(r, ctx)?;
+            let lv = eval_body::<E>(l, ctx)?;
+            let rv = eval_body::<E>(r, ctx)?;
             if matches!(lv, OwnedValue::Null) || matches!(rv, OwnedValue::Null) {
                 OwnedValue::Null
             } else {
@@ -7946,7 +7980,7 @@ fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
         // `NULL IN (SELECT a FROM empty)` is 0, not NULL — the
         // shape `x IN emptytable` exposed it).
         RExpr::InList(_, list, neg, _) if list.is_empty() => bool_val(*neg),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         RExpr::InList(x, list, neg, _) if matches!(**x, RExpr::Scalar(ScalarFn::Vector, _)) => {
             in_rows::<E>(x, list.as_slice(), *neg, ctx)?
         }
@@ -7973,8 +8007,8 @@ fn eval_other<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
             }
         }
         RExpr::Like(x, p, neg) => {
-            let xv = eval::<E>(x, ctx)?;
-            let pv = eval::<E>(p, ctx)?;
+            let xv = eval_body::<E>(x, ctx)?;
+            let pv = eval_body::<E>(p, ctx)?;
             #[cfg(feature = "utf16")]
             let (xv, pv) = (text_view(xv, ctx), text_view(pv, ctx));
             match like_glob::<E>(&pv, &xv, None, false, case_like(ctx))? {

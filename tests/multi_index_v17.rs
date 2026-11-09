@@ -1,4 +1,4 @@
-//! v0.17 index strategies (leaf `multi_index`), differentially vs the
+//! v0.17 index strategies (leaf `planner`), differentially vs the
 //! pinned oracle (SQLite 3.54.1).
 //!
 //! The pin's `where.c` has loop kinds hipp's planner lacked in 0.16:

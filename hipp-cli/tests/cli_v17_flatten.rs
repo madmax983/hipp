@@ -1,4 +1,4 @@
-//! hipp-cli v0.17 query flattening (leaf `flatten`): byte-for-byte
+//! hipp-cli v0.17 query flattening (leaf `planner`): byte-for-byte
 //! the pinned oracle's stdout for views, CTEs and FROM subqueries the
 //! pin flattens into their readers (their rows in the pin's join
 //! order, EXPLAIN QUERY PLAN trees without the co-routine), WHERE

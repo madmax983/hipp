@@ -7,7 +7,7 @@
 //! finalize functions do:
 //!
 //! - DISTINCT keeps the first of equal values (under the argument's
-//!   collation) in input order; with an aggregate ORDER BY (`v16`)
+//!   collation) in input order; with an aggregate ORDER BY (`sql`)
 //!   the kept rows are then stably sorted by the keys (ties keep
 //!   input order — the pin's sorter carries a sequence number).
 //!   When the ORDER BY is the DISTINCT argument itself the pin
@@ -24,7 +24,7 @@
 //!   before it (none before the first value, nothing for a NULL
 //!   separator).
 //! - `median` / `percentile` / `percentile_cont` /
-//!   `percentile_disc` (`v16`) are the pin's percentile extension
+//!   `percentile_disc` (`sql`) are the pin's percentile extension
 //!   (built in with `SQLITE_ENABLE_PERCENTILE`): P is validated on
 //!   every stepped row (NULL Y included) and must stay within
 //!   0.001 of the first row's fraction; Y must be an INTEGER or a
@@ -160,7 +160,7 @@ fn fold_rows(
         }
         idx = kept;
     }
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     if !p.order.is_empty() {
         let n = p.args.len();
         let keys = |i: usize| {
@@ -172,7 +172,7 @@ fn fold_rows(
         let cmp = |a: usize, b: usize| {
             crate::query::order_keys_cmp(keys(a), keys(b), p.order.iter().copied(), enc)
         };
-        sort_stable(&mut idx, &|a, b| cmp(a, b) != core::cmp::Ordering::Greater);
+        crate::arena::sort_idx(idx.as_mut_slice(), &mut |a, b| cmp(a, b));
         if p.unique {
             // Equal keys (under the key's collation) collapse to
             // the last one inserted.
@@ -266,7 +266,7 @@ fn fold_rows(
                 OwnedValue::Null
             })
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         AggKind::Median
         | AggKind::Percentile
         | AggKind::PercentileCont
@@ -465,9 +465,9 @@ impl SumCtx {
     }
 }
 
-/// The percentile family over the stepped rows (`v16`): see the
+/// The percentile family over the stepped rows (`sql`): see the
 /// module notes.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn percentile(
     kind: AggKind,
     sel: &[&[OwnedValue]],
@@ -531,7 +531,10 @@ fn percentile(
         order.push(i);
     }
     let y = |i: usize| ys.as_slice().get(i).copied().unwrap_or(0.0);
-    sort_stable(&mut order, &|a, b| y(a) <= y(b));
+    crate::arena::sort_idx(order.as_mut_slice(), &mut |a, b| {
+        y(a).partial_cmp(&y(b))
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
     let mut sorted: AVec<f64> = AVec::with_capacity(ys.len());
     for &i in order.iter() {
         sorted.push(y(i));
@@ -551,46 +554,4 @@ fn percentile(
     };
     let v2 = ys.get(i2).copied().unwrap_or(v1);
     Ok(real_value(v1 + (v2 - v1) * (ix - i1 as f64)))
-}
-
-/// A stable bottom-up merge sort of `v` under `le` ("a sorts no
-/// later than b"): one small, non-generic routine for every
-/// aggregate sort (the aggregate ORDER BY, the percentile values),
-/// instead of a `slice::sort_by` instantiation per call site.
-#[cfg(feature = "v16")]
-pub(crate) fn sort_stable(v: &mut AVec<usize>, le: &dyn Fn(usize, usize) -> bool) {
-    let n = v.len();
-    let mut src: AVec<usize> = v.clone();
-    let mut dst: AVec<usize> = v.clone();
-    let mut width = 1usize;
-    while width < n {
-        let mut lo = 0usize;
-        while lo < n {
-            let mid = lo.saturating_add(width).min(n);
-            let hi = mid.saturating_add(width).min(n);
-            let (mut i, mut j) = (lo, mid);
-            for k in lo..hi {
-                let a = src.as_slice().get(i).copied();
-                let b = src.as_slice().get(j).copied();
-                let take_left = match (a, b) {
-                    (Some(x), Some(y)) => i < mid && (j >= hi || le(x, y)),
-                    _ => i < mid,
-                };
-                let pick = if take_left {
-                    i += 1;
-                    a
-                } else {
-                    j += 1;
-                    b
-                };
-                if let (Some(slot), Some(x)) = (dst.as_mut_slice().get_mut(k), pick) {
-                    *slot = x;
-                }
-            }
-            lo = hi;
-        }
-        core::mem::swap(&mut src, &mut dst);
-        width = width.saturating_mul(2);
-    }
-    *v = src;
 }

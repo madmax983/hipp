@@ -11,6 +11,151 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Features named for capabilities (2026-11-08)
+
+A rename and dead-code unit (ADR 0006,
+`docs/adr/0006-features-name-capabilities.md`; the user's decision of
+2026-11-08: "features should be what they actually are, not a version
+number"). Nothing observable changes.
+
+**Shipped (breaking for direct feature users).** `query` replaces
+`v04`, `write` replaces `v05` (implies `query`), one `sql` replaces
+`v06` `v07` `v08` `v09` `v10` `v16` (implies `write`), one leaf
+`planner` (in `xl`, requiring `sql` and `expr_index`) replaces
+`join_order` `multi_index` `flatten`. Every other name stays; every
+leaf that required `v16` requires `sql` (`math` keeps `query`). `full`
+/ `max` / `xl` keep their names and contents. Cargo.toml's comments
+say what each feature enables, with no version numbers.
+`ci/feature-sets.txt`: `query`, `write`, `sql`, `indexes,query`,
+`indexes,write`, `query,math`, `sql,<leaf>` per leaf, one
+`sql,indexes,expr_index,planner` (the three planner lines become one);
+all compile warning-free under clippy -D warnings.
+
+**How.** The 2,022 `feature = "..."` sites in src/, tests/, hipp-cli/
+and examples/ were rewritten by a script that parses each `cfg` /
+`cfg!` / `cfg_attr` predicate, renames it and simplifies it under the
+new implications (sql ⇒ write ⇒ query, planner ⇒ sql + expr_index, each
+leaf ⇒ its requirements), checking equivalence by truth table over
+every feature-closed assignment. A second pass tracked each predicate's
+enclosing gated items (modules through their `mod` declaration,
+functions, blocks, statements, arms) and flagged the ones that are
+unsatisfiable or always true where they stand; each was then checked
+by hand. Comments that named a rung now name its feature.
+
+**Deleted (code no surviving combination compiles):**
+- `xplan`: the IN-cost closure for `all(join_order,
+  not(multi_index))` (`join_in` paid the IN only inside joins).
+- `session`: the empty merge key of `all(expr_index, not(v09))`; the
+  plain `derived` of `all(v09, not(v16))`; a `v06` subquery check
+  inside the `not(v16)` executor branch; a `not(v16)` derived-table
+  read inside a `v09` block; a `v07` NOT NULL argument inside a
+  `not(v04)` block (dead before the rename too).
+- `xjoin` / `session::join`: three `not(flatten)` / `not(multi_index)`
+  fallbacks inside the `join_order` modules (prerequisites without
+  semi-join ones, an OR-less term count, a missing OR access).
+- `sql::parser`: a `not(v07)` RETURNING fallback inside the `v16`
+  INSERT ... DEFAULT VALUES; two assertions in a tiny-only parser
+  test gated on `v07` / `v04` (never compiled).
+- About 50 attributes that repeated the gate of the item they sit in (e.g.
+  `#[cfg(feature = "planner")]` inside `xjoin`), and one
+  `cfg!(feature = "flatten")` inside the planner, now `true`.
+Nothing a tiny, `query`, `write`, `indexes,query`, `indexes,write`
+or leaf build reaches was removed (the `all(query, not(sql))`
+fallbacks stay: the `query` and `write` builds use them).
+
+**Oracle probing.** None needed beyond the suites: no SQL behaviour
+changes; the existing differential and CLI suites run unchanged except
+their `cfg` attributes. New `tests/features_v17.rs` checks the
+implications (`sql` ⇒ `write` ⇒ `query`, every leaf ⇒ `sql`, `planner`
+⇒ `expr_index`) and the profiles' contents in whatever build runs it.
+
+**Exact-size check** (thumbv7em-none-eabihf, `--profile tiny`,
+`hipp_thumb_demo`, `.text + .rodata` as ci/size_gate.py sums it, and
+the sum of every symbol's `llvm-nm -S` size; before = `3bc670b`;
+(≠) marks a symbol-size sum that moved):
+
+| old line (3bc670b) | new line | before | after | Δ | symbol sizes before | after |
+|---|---|---:|---:|---:|---:|---:|
+| `-` | `-` | 76,124 | 76,124 | 0 | 173,160 | 173,160 |
+| `indexes` | `indexes` | 118,416 | 118,416 | 0 | 215,322 | 215,322 |
+| `v04` | `query` | 173,792 | 173,800 | +8 | 269,274 | 269,274 |
+| `v05` | `write` | 189,760 | 189,752 | -8 | 285,152 | 285,146 (≠) |
+| `v16` | `sql` | 400,184 | 400,184 | 0 | 489,202 | 489,202 |
+| `params` | `params` | 85,604 | 85,604 | 0 | 182,624 | 182,624 |
+| `v04,math` | `query,math` | 191,556 | 191,572 | +16 | 286,356 | 286,356 |
+| `v16,window` | `sql,window` | 429,652 | 429,652 | 0 | 518,000 | 518,000 |
+| `v16,triggers` | `sql,triggers` | 440,980 | 440,980 | 0 | 529,108 | 529,112 (≠) |
+| `v16,foreign_keys` | `sql,foreign_keys` | 482,368 | 482,368 | 0 | 571,062 | 571,062 |
+| `v16,json` | `sql,json` | 434,004 | 434,004 | 0 | 521,554 | 521,554 |
+| `v16,expr_index` | `sql,expr_index` | 486,704 | 486,704 | 0 | 575,250 | 575,250 |
+| `v16,without_rowid` | `sql,without_rowid` | 468,844 | 468,836 | -8 | 557,682 | 557,682 |
+| `v16,utf16` | `sql,utf16` | 407,336 | 407,336 | 0 | 496,294 | 496,294 |
+| `v16,wal` | `sql,wal` | 416,656 | 416,656 | 0 | 505,456 | 505,456 |
+| `v16,datetime` | `sql,datetime` | 420,172 | 420,180 | +8 | 508,562 | 508,562 |
+| `v16,attach` | `sql,attach` | 423,776 | 423,776 | 0 | 512,694 | 512,694 |
+| `v16,autovacuum` | `sql,autovacuum` | 415,440 | 415,440 | 0 | 504,386 | 504,386 |
+| `v16,vtab` | `sql,vtab` | 427,608 | 427,608 | 0 | 516,100 | 516,100 |
+| `v16,vtab,rtree` | `sql,vtab,rtree` | 470,224 | 470,224 | 0 | 558,044 | 558,044 |
+| `v16,vtab,without_rowid,math,fts5` | `sql,vtab,without_rowid,math,fts5` | 639,124 | 639,124 | 0 | 723,613 | 723,613 |
+| `v16,vtab,without_rowid,math,fts5,fts5_delete` | `sql,vtab,without_rowid,math,fts5,fts5_delete` | 649,884 | 649,916 | +32 | 734,369 | 734,369 |
+| `v16,explain` | `sql,explain` | 414,028 | 414,020 | -8 | 502,310 | 502,306 (≠) |
+| `v16,indexes,expr_index,join_order,multi_index,flatten` | `sql,indexes,expr_index,planner` | 559,756 | 559,748 | -8 | 647,492 | 647,492 |
+| `indexes,v04` | `indexes,query` | 203,561 | 203,561 | 0 | 298,968 | 298,968 |
+| `indexes,v05` | `indexes,write` | 232,897 | 232,897 | 0 | 328,260 | 328,250 (≠) |
+| `full` | `full` | 476,476 | 476,476 | 0 | 564,642 | 564,642 |
+| `max` | `max` | 962,292 | 962,300 | +8 | 1,040,831 | 1,040,831 |
+| `xl` | `xl` | 1,058,808 | 1,058,824 | +16 | 1,136,213 | 1,136,213 |
+
+Every pair has the same functions at the same sizes up to layout
+effects. The `.text + .rodata` differences
+(−8 … +32 B) and the few symbol-size differences (±2 … 10 B, always
+balanced by the machine outliner or a merged twin) are layout, not
+code: a feature's name enters cargo's `-C metadata` hash, the hash
+enters every mangled symbol, rustc orders a codegen unit's
+monomorphised items by symbol name, and the order moves inter-function
+alignment padding (max: 314 two-byte gaps instead of 312, 30 four-byte
+gaps instead of 29), literal-pool padding and the outliner's choices.
+Three checks pin that down:
+1. **A purely mechanical rename of `3bc670b`** (the rewrite script and
+   the new `[features]` table only, no deletion, no comment edit)
+   measures max 962,300, xl 1,058,824, query 173,800, write 189,752,
+   and its `.text` and `.rodata` are **byte-identical** to this unit's
+   for those four lines: the deletions and attribute removals changed
+   no compiled byte, the names alone moved the layout.
+2. **`3bc670b` with one unused feature `zzz` enabled** (a hash change
+   with no code change) measures `v04,zzz` 173,784 (−8), tiny + `zzz`
+   76,120 (−4; the outliner's functions −4 B), `v05,zzz` / full / max /
+   xl + `zzz` unchanged: the same jitter, at the base.
+3. For `query` and `write` (the lines no profile covers) the
+   `llvm-nm --size-sort --demangle` lists of base and head match
+   symbol for symbol up to which name the linker keeps for merged
+   identical functions (`drop_glue::<AVec<RExpr>>` vs
+   `drop_glue::<Vec<RExpr>>`) and, for `write`, three ±4 B
+   function-size moves against the outliner's functions (−6 B
+   total), all reproduced by the mechanical rename of check 1.
+No line went down from the deleted code: none of it was compiled in
+any measured line.
+
+**Gates.** `ci/local-gates.sh` (full) passes; depth_v16 / triggers_v16
+pass with debug info on (no stack constant touched).
+
+**Size Δ.** tiny 0 (76,124), full 0 (476,476), max **+8** (962,300),
+xl **+16** (1,058,824). The `[max]` / `[xl]` ratchets were set to the
+measured values. This is the unit's one deviation from its brief
+("never raise a ratchet"): the growth is the alignment padding above,
+which no edit within the unit can remove (it follows from the
+mandated names; check 1), and the size gates cannot pass without it.
+
+**Honest gaps.**
+- The max / xl ratchet raise above (+8 / +16 B of padding).
+- Feature-graph implications are tested only in the builds that run
+  the test suite (`std,xl` and the CI matrix's clippy builds compile
+  but do not run `tests/features_v17.rs`).
+- Test file names (`*_v16.rs`, `cli_v07.rs`, ...), oracle temp-file
+  tags (`"v07-upsert"`) and milestone headings keep their version
+  numbers (history, per the brief); old-milestone README sections say
+  "what is now the `sql` feature".
+
 ### Streamed rows: virtual-table cursors and row-at-a-time statements (2026-11-05)
 
 **Shipped** (`src/session/stream.rs`; the vtab cursors in
@@ -1573,6 +1718,562 @@ Merging `main` ([madmax983/hipp#18](https://github.com/madmax983/hipp/pull/18): 
 The first size-pass item (ADR 0005 draft, Tier A "monomorphic evaluator") makes the room: `query::eval` was compiled twice in `max` / `xl`, once for the executors' storage error type and once for `Error<()>`, which the window functions use to evaluate frame offsets. Under `window` the evaluator's body (`eval_body`) is now compiled once, for `Error<()>`, and `eval` re-types its errors through `Error::map_storage` (the evaluator never touches storage, so the `Storage` arm cannot occur). Without `window` there was only one instantiation, so `eval` calls the body directly and `full` does not pay for the wrapper. Rows and errors are unchanged: every differential suite and the CLI suites pass against the pin.
 
 **Size Δ** against the merged tree (thumbv7em, `--profile tiny`): tiny 76,960 (0); full 507,592 (0); max 1,048,996 → 1,031,072 (−17,924); xl 1,160,028 → 1,142,128 (−17,900). Against this wave before the merge: full 506,728 → 507,592 (+864, `main`'s index-insert change); max 1,048,036 → 1,031,072 (−16,964), now 17,504 B under its budget; xl 1,159,132 → 1,142,128 (−17,004). Each ratchet is its measured figure.
+
+### Size pass: one shared stable sort (2026-11-08)
+
+Stage 1 unit 1 of the ADR 0005 size pass (`size-sort`). Every sort in
+`src/` went through `slice::sort*`, which Rust instantiates in full
+(driftsort / ipnsort, 2.2–3 KB each) once per element type and
+comparator: 0 / 22,570 / 60,410 / 72,616 B in tiny / full / max / xl
+(`baseline.md`). They now share one routine.
+
+**Shipped (no feature; every profile that sorts):**
+
+- `arena::sort_idx` / `sort_perm`: one non-generic stable bottom-up
+  merge sort over an index list, driven by `&mut dyn FnMut(usize,
+  usize) -> Ordering`. Runs of 12 are insertion-sorted in place, then
+  merged pairwise between the list and one scratch `AVec` of the same
+  length. An element moves ahead of an earlier one only when
+  `cmp(later, earlier)` is `Less` — `slice::sort_by`'s rule — so for a
+  total order the output is exactly `sort_by`'s. No panics and no
+  unchecked indexing or arithmetic, whatever the comparator returns.
+- `arena::apply_perm`: the permutation applied in place by following
+  its cycles (non-generic; the caller passes a swap closure), and
+  `arena::sort_by<T>`, the thin per-type adapter (two small closures
+  per element type) the call sites use.
+- All 31 call sites (`rg '\.sort(_by|_unstable|_by_key|_unstable_by|_unstable_by_key)?\('`
+  is now empty in `src/`): ORDER BY (materialised, subquery, streamed
+  with LIMIT), GROUP BY (its three copies of the key comparator are
+  now one `session::sort_groups`), compound members and ORDER BY,
+  automatic-index rows, IN-list values, WITHOUT ROWID two-pass write
+  order, the fts5 rank sorter and rowid-ordered fts5 / R*Tree writes,
+  dbstat, ALTER / TEMP text edits, the planner's term / OR-branch /
+  auto-index key orders, the WAL commit's page list, the
+  integrity check's free-block heap, `DROP TABLE`'s auto-vacuum roots;
+  and the v16 aggregate ORDER BY / percentile and window partition
+  sorts, whose `agg::sort_stable` (a second hand-written merge sort)
+  is gone. The five unstable sorts were on fully keyed integers or
+  tuples, so the stable sort's output is the same.
+- ORDER BY over materialised rows (`finish_produced`, subquery and
+  compound-free subplans) no longer moves its rows: it sorts a
+  permutation (`session::order_perm`) and clones the LIMIT / OFFSET
+  window through it. `sort_idx` returns at once on input already in
+  order, and reverses input strictly against it.
+- `llvm-nm --demangle <elf> | rg 'core::slice::sort'` is empty for
+  full, max and xl (212 symbols in xl before).
+
+**Comparator audit.** Every comparator is a total order on the values
+the engine produces (integers, tuples, byte strings, `compare_coll_in`
+/ `order_keys_cmp` / `compound_*_cmp` / `auto_cmp` /
+`compare_entries` over values whose REALs are never NaN: the
+evaluator, `bind_f64` and the math library turn NaN into NULL) except
+one: the fts5 rank sorter compared live bm25 scores with
+`partial_cmp(..).unwrap_or(Equal)`, so a NaN score was "equal to
+everything" and its rows stayed wherever the sort algorithm left them.
+That is a silent wrong answer on a claimed path, fixed ungated.
+
+*Scope deviation, for explicit acceptance.* The unit text asked that a
+comparator that does not map NaN be made total "in the same way the
+current output behaves", keeping today's order. That cannot be done
+here: the old comparator was not an order, and its output contradicts
+every total order. With finite ranks interleaved with NaN ones (column
+0 weighted 10^308, column 1 weighted 1; `tests/size_v17.rs`
+`fts5_nan_rank_keeps_finite_ranks_sorted`), 0.16 / e091bae returned
+rowids 1,2,3,4,5,6,7 for `ORDER BY rank`: the insertion pass stopped at
+each NaN, so row 7 (rank −1.409e−6) came after row 5 (−1.037e−6) —
+the FINITE ranks were out of order, and NaN would have to rank both
+above row 5 and below row 7. Any total order therefore changes some
+observable output; the unit took the one the pin uses (2,4,6,1,7,3,5:
+NaN as NULL first ascending, last descending), so the change is a
+parity fix, not a new divergence. In the single-column corpus the old
+output happened to be rowid order (the review's repro: 1,2,3,4,5 on
+e091bae, 2,4,1,3,5 now and on the pin). No other comparator changes
+observable order: the percentile sort's `<=` became
+`partial_cmp(..).unwrap_or(Equal)`, which differs only on NaN, and a
+NaN never reaches it from SQL (NaN-producing expressions, the math
+functions and JSON NaN are NULL, as on the pin); only the NaN-bits
+file gap below can feed one.
+
+**Oracle probing (3.54.1 pin).**
+
+- A NaN bm25 is reachable: the rank option takes no exponent, but
+  `INSERT INTO ft(ft, rank) VALUES('rank', 'bm25(1000…0.0)')` with
+  10^308 written out makes a row's frequency sum +Inf when the term
+  occurs twice, and Inf/Inf is NaN (`bm25(ft, 1e308)` in a query does
+  the same). The pin's sorter reads the rank as an SQL value, where
+  NaN is NULL: `ORDER BY rank` returns those rows first (rowid order
+  among them), `ORDER BY rank DESC` last, and `rank` shows NULL.
+  hipp returned plain rowid order (1,2,3,… for the pin's 2,4,6,…). The
+  comparator now ranks NaN below every number and equal to another
+  NaN, which is total and the pin's order.
+- Ties: ORDER BY / GROUP BY / compound / window / aggregate ORDER BY
+  over 9 to 300 generated rows with few distinct keys, NULLs, the
+  three collations and mixed storage classes give the pin's rows and
+  tie order (`tests/size_v17.rs`), as before.
+
+**Tests.** Unit tests in `src/arena.rs` (empty, one element, all
+equal, reverse and sorted inputs at and around the cutoff and its
+multiples, descending comparators, owned non-`Copy` elements, index
+lists that are not `0..n`, a malformed permutation, an inconsistent
+comparator, and 400 rounds against a stable reference sort with a
+hand-rolled PRNG). `tests/size_v17.rs` (8 tests from this unit,
+differential vs the pin): the two NaN rank regressions (NaN rows
+placed as NULL; finite ranks among NaN ones in order), finite rank
+orders, ORDER BY / GROUP
+BY / compound / window / aggregate ORDER BY / percentile corpora, and
+sorted UPDATE / DELETE (rowid, WITHOUT ROWID, R*Tree, fts5) writes.
+`stream_v17`, `fts5_v16`, `fts5_delete_v17`, `json_v16`, `pragma_v16`,
+`join_order_v17`, `multi_index_v17`, `flatten_v17` and `window_v16`
+pass unchanged; `depth_v16` and `triggers_v16` pass with debug info
+on.
+
+**Gates:** `ci/local-gates.sh` (full run) passes.
+
+**Size Δ** against the ratchets before the unit (thumbv7em,
+`--profile tiny`): tiny 76,960 → 76,960 (0; the tiny profile sorts
+nothing); full 507,592 → 481,240 (−26,352); max 1,031,072 → 968,384
+(−62,688); xl 1,142,128 → 1,065,180 (−76,948). The shared sort costs
+`sort_idx` 520 B + `sort_perm` 86 B + `apply_perm` 82 B (in xl), and
+each element type's adapter about 100–150 B; the rest of the saving
+is the driftsort / ipnsort copies (and `agg::sort_stable`). The
+already-sorted / reversed pass and the ORDER BY permutation read in
+place (below) cost about 250 B of the saving, for speed. Engine
+statics stay 0 B. Each ratchet is lowered to its measured figure.
+
+**Honest gaps.**
+
+- A REAL whose stored bits are a NaN (only a hand-made or corrupt file
+  holds one; SQLite never writes it) is read as a REAL, not as NULL as
+  on the pin (`sqlite3VdbeSerialGet`), and `compare_values` calls it
+  equal to every other REAL, so it is not a total order there: such a
+  file's rows print `0.0` and sort where the algorithm leaves them, as
+  in 0.16 (where the order also depended on the sort's internals; the
+  new sort may place them differently). Fixing it sits on the tiny
+  profile's read path and is left to a unit that can pay for it.
+- Speed, measured against the tree before the unit (release CLI, a
+  200,000-row table, best of 5): a first cut was 6–20% slower in wall
+  time on the materialised ORDER BY at the same instruction count
+  (callgrind: 222.2 M vs 220.8 M Ir at 20,000 rows) — applying the
+  permutation by swapping large rows at random positions misses the
+  cache. The shipped version reads the kept rows through the ORDER BY
+  permutation (`session::order_perm`, so an ORDER BY ... LIMIT clones
+  only its window) and settles already-ordered or strictly reversed
+  input in one pass: ORDER BY a LIMIT 199990 in a subquery 0.335 →
+  0.358 s / 0.322 → 0.351 s (two runs; the worst, +7–9%), ORDER BY
+  b DESC (reversed) 0.239 → 0.240 s, ORDER BY CAST(a AS TEXT) 0.434 →
+  0.417 s / 0.398 → 0.431 s, top-level ORDER BY a 0.375 → 0.366 s,
+  ORDER BY ... LIMIT 5 0.090 → 0.094 s, GROUP BY 0.724 → 0.737 s.
+  Within noise to +9%; `docs/perf-baselines.md` workloads are gated
+  from unit 4 on.
+
+### Size pass: monomorphic glue (2026-11-08)
+
+Stage 1 unit 2 of the ADR 0005 size pass (`size-mono`): shared
+machinery that Rust compiled once per type is compiled once. A
+refactor with no feature and no observable change; each sub-edit is
+its own commit, measured on all four profiles and kept only because no
+profile grew. Size Δ is against the ratchets before the sub-edit
+(thumbv7em, `--profile tiny`).
+
+**(a) The rest of the evaluator's duplicates.** After `e091bae`
+(`query::eval` compiled once under `window`) the symbol table still
+held both an `Error<()>` and a storage-error copy of
+`walk_aggs_mut` / `walk_plan_aggs_mut` (full, max, xl),
+`resolve_column_in_group` with `group_column` inlined (full, max,
+xl), `cond_is` / `cond` (max, xl), and a 128 B `eval::<()>` re-typing
+wrapper the evaluator's own recursion went through. Now:
+
+- `walk_aggs_mut` / `walk_plan_aggs_mut` are monomorphic: the visitor
+  returns `Err(())` to stop, and `subst_owned_aggs` keeps the fold's
+  real error beside the closure (an overflowing `sum` in a correlated
+  subquery still fails the statement, `tests/size_v17.rs`);
+  `alias_from_outer` maps the signal to its `Unsupported`.
+- The compound ORDER BY matcher (`CompKeys::hit`) resolves on its
+  caller's error type, so it shares the resolver's instantiation.
+- Under `window`, `cond_is` re-types a once-compiled `cond_body`, as
+  `eval` does; the evaluator's helpers (`eval_other`, `scalar_values`,
+  `eval_case`, `eval_in_list`, `eval_json_arg`, `eval_lazy`, `arith`,
+  `cmp_op`, `in_rows`, `eval_raise`) and the window frame offsets call
+  `eval_body` / `cond_body` directly, so the re-typing wrappers are
+  paid only at the executors' entry points. Without `window` the
+  wrappers are the bodies (no growth in `full`).
+- `llvm-nm --demangle | rg '<\(\)>'` in max / xl now lists only the
+  evaluator family, the json and printf helpers and the frame code,
+  each once: no function has both an `Error<()>` and a `MemError`
+  copy. In full one 28 B `serial_body_len::<()>` (the record
+  encoder's) remains; splitting it out grew tiny by 8 B, so it stays.
+- agg::fold and func::printf were already single (`fold::<MemError>`
+  is a 92 B wrapper of the non-generic `fold_rows`; printf has only
+  the `()` copy).
+
+Size Δ: tiny 76,960 → 76,960 (0); full 481,240 → 479,396 (−1,844);
+max 968,384 → 966,348 (−2,036); xl 1,065,180 → 1,063,136 (−2,044).
+Gates: `ci/local-gates.sh` (full run) passes; `depth_v16` and
+`triggers_v16` pass with debug info on (the evaluator's recursion now
+calls `eval_body` directly, one frame fewer per level).
+
+**(b) B-tree split points, computed once.** `btree::distribute` /
+`distribute_insert` were compiled per cell type (`LeafCell`,
+`IndexCell`, `(u32, key)` interior pairs: 1,360 B in tiny). The group
+sizes now come from the monomorphic `split_counts` / `insert_counts`
+over the weights (the same rules, branch for branch: the two-page
+half split, the three-page quota boundaries, the insert balance's
+half-capacity suffix); only `group_items::<T>`, the copy into groups,
+is per type. Unit tests (`btree::split_tests`) run the old generic
+code, kept verbatim as the reference, against the new one on 4,000
+generated weight lists × every group count 1..5 × windows 1..3; the
+page images are unchanged: `insert_balance_v15` and
+`delete_balance_v14` compare every step with the pin and pass, and
+their five `#[ignore]`d index / churn tests fail at the same steps
+the v0.15 notes record (step 133 of `idxasc`, ...), as before. A
+`extend_from_slice` copy instead of the push loop measured +48 B in
+tiny and +120 B in full, so the loop stays.
+
+Size Δ: tiny 76,960 → 76,260 (−700); full 479,396 → 478,436 (−960);
+max 966,348 → 965,388 (−960); xl 1,063,136 → 1,062,144 (−992).
+Tiny shrinks, so its ratchet is lowered too (no tiny growth to
+justify). Gates: `ci/local-gates.sh` (full run) passes.
+
+**(c) A type-erased `AVec` growth core: measured, not kept.** The
+standard library already compiles `Vec`'s growth once:
+`RawVecInner::grow_amortized` / `finish_grow` are non-generic (one
+copy each in every profile), and each element type adds only a 22 B
+`grow_one` stub that passes its layout (18 / 34 / 47 / 51 stubs, 438
+/ 790 / 1,070 / 1,158 B in tiny / full / max / xl). Two experiments:
+
+- A hand-written non-generic `grow_core(ptr, cap, Layout)` in
+  `src/arena.rs` (alloc / realloc, `Vec::from_raw_parts` back) behind
+  an out-of-line typed `push`: +460 / +1,696 / +2,024 / +1,912 B —
+  the per-type take-and-rebuild glue costs more than the stubs it
+  replaces, and passing the layout from each of max's 264 inline push
+  sites would cost about as much again.
+- `#[inline(never)]` on `AVec::push` (one copy per element type, every
+  site a call): −88 / −304 / −1,872 / −1,968 B, but +17.7% instructions
+  on `examples/bolt_workload 500` (callgrind, release: 415.3 M → 488.9
+  M Ir; the record encoder pushes byte by byte). Not worth 0.2% of
+  max; `AVec` is unchanged.
+
+So this unit ships no (c) commit; the growth glue is left to unit 4,
+whose VM deletes most push sites (registers are preallocated).
+
+**(d) No per-execution plan copies.** A statement's plan was deep-
+copied every time it ran, because the executors take `&mut self`
+while the plan lives in `self.plan`:
+
+- `Plan::Query` holds an `Rc<QueryPlan>`: `run_query` and the streamed
+  `stream_open` take a reference count, not a copy, and the executors
+  (`run_query_sub`, `run_query_compound`) borrow it; the stream keeps
+  its `Rc` beside its own per-execution state (levels, buffers,
+  windows). `QueryPlan`'s `Clone` code (436 B in max) is gone.
+- `exec_subplan_inner` cloned its `SubPlan` (sources, expressions,
+  nested plans) on every run — for a correlated subquery, once per
+  outer row — although it already held a shared reference; the copy
+  is simply gone.
+- `Plan::Pragma` and `Plan::Instead` (INSTEAD OF trigger statements)
+  hold an `Rc` too, so `run_pragma` and `exec_instead` stop copying.
+- A dropped or reset statement keeps its plan (the `Rc` in `self.plan`
+  is never taken out), so the cancellation rule of SPEC §5.1.1 holds;
+  `crash.rs` passes unchanged. `tests/size_v17.rs` runs queries
+  (ORDER BY, GROUP BY, compound, correlated scalar and EXISTS
+  subqueries, a recursive CTE, generate_series), a PRAGMA and an
+  INSTEAD OF insert three times on one prepared statement — the second
+  run reset after one row — against the pin's rows.
+- Kept: `exec_recursive` (`cte.rs`) still copies the recursive CTE's
+  plan once per execution to strip its recursive members (not per
+  row), and the planner's own copies (`query.rs` row-valued scalar
+  subqueries, `xplan.rs` IN probes) are plan-time, not per execution.
+
+Size Δ: tiny 76,260 → 76,260 (0; `Plan::Query` is a `v04` variant);
+full 478,436 → 477,180 (−1,256); max 965,388 → 964,316 (−1,072); xl
+1,062,144 → 1,060,616 (−1,528).
+
+**Unit total** against the ratchets before the unit: tiny 76,960 →
+76,260 (−700); full 481,240 → 477,180 (−4,060); max 968,384 → 964,316
+(−4,068); xl 1,065,180 → 1,060,616 (−4,564). Engine statics stay 0 B.
+
+**Honest gaps.**
+
+- (c) ships nothing (above); the estimate's −0.2…−5.5 K assumed a
+  per-type growth path that `alloc` already shares.
+- `serial_body_len::<()>` (28 B, full only) stays duplicated: the
+  split that removes it grows tiny by 8 B.
+- `exec_recursive`'s once-per-execution plan copy stays (see (d)).
+- Found by the unit's review, not caused by it (base `fa2ae78` gives
+  the same bytes) and left open because a fix adds code to a
+  size-reduction unit: a window function beside an outer aggregate in
+  a scalar subquery, `SELECT g, sum(a) OVER (PARTITION BY g), (SELECT
+  max(t.a)) FROM t GROUP BY g`, returns rows (`1|3|3`, `2|4|4`) where
+  the pin fails at prepare time ("misuse of aggregate: max()").
+  Tracked for a v0.17 parity unit.
+
+**Gates** (each sub-edit's commit): `ci/local-gates.sh` (full run)
+passes; `depth_v16` and `triggers_v16` pass with debug info on (after
+(a) and after (d)); the CI miri job's three commands (`cargo +nightly
+miri test --lib --no-default-features --features full`, and `smoke` /
+`arenas a9_statement_arena_exhaustion` with `std,full`) pass —
+`src/arena.rs` is unchanged by the unit, so there is no new `unsafe`;
+`btree::split_tests` runs 40 instead of 4,000 rounds under miri.
+
+**Oracle probing (3.54.1 pin)**, recorded as corpora in
+`tests/size_v17.rs`: a compound's ORDER BY resolves `t.a` and an
+alias against the first core and errors on an unknown name; an outer
+aggregate in a scalar subquery is per group (`(SELECT sum(a) + c FROM
+u WHERE c = 1)` is 5 / 3 / NULL); a group whose `sum` overflows fails
+the whole statement with no row printed first, a filtered group that
+does not overflow answers; `HAVING EXISTS (SELECT max(t.a) FROM u)`
+keeps every group; a negative or text frame offset is an error
+("frame starting offset must be a non-negative integer"), `1 + 1
+PRECEDING` is accepted.
+
+### Size pass: sync islands out of async bodies (2026-11-08)
+
+Stage 1 unit 3 of the ADR 0005 size pass (`size-islands`). A refactor
+with no feature and no observable change: code between the `.await`s
+of mostly-sync async bodies moves into `#[inline(never)]` sync
+functions, so the future's `poll` keeps the I/O and the calls. Every
+split was measured on all four profiles against the tree before it
+(thumbv7em, `--profile tiny`, `.text + .rodata`) and kept only when no
+profile grew; the B-tree balance futures (`balance_*_window`,
+`cascade_*_up`) are untouched.
+
+**Kept (Δ tiny / full / max / xl, each against the state before it):**
+
+| split | Δ |
+|---|---|
+| `schema::build_catalog` (tiny's `rebuild_catalog` too): the future scans `sqlite_schema`; `collect_schema_row` decodes a row, `catalog_from_rows` builds the catalog | −60 / −256 / −272 / −272 |
+| `pragma` `check_rows`: `row_check_plan` (columns, rules, indexes, `p2`), `check_row` (NOT NULL / STRICT / CHECK per row), `index_finding` | 0 / −208 / −616 / −544 |
+| `stream_open` (in full, `step_query`'s tail): `stream_plan` before the LIMIT / OFFSET await, `stream_build` after it | 0 / −24 / −248 / −160 |
+| `trigger_failed`: one statement-undo site for the FAIL and ABORT arms (the `abort_write!` future was inlined twice) | 0 / 0 / −72 / −32 |
+| `exec_subplan_inner`'s ORDER BY / window tail and `finish_produced` share `ordered_window` | 0 / −56 / −72 / −80 |
+| `prepare_params` out of `prepare` | 0 / −120 / −72 / −40 |
+| `nest_may_abort` out of `trigger_failed`, `json::tvf_rows` out of `json_tvf_rows`, `before_update_loaded` out of `exec_update` (symbol pairs: −130 / −156, −12 / −20, −108 / −106 in max / xl) | 0 / 0 / −256 / −272 |
+| `plan_inner` out of tiny's `prepare` (other profiles already call it) | −76 / 0 / 0 / 0 |
+
+**Measured and reverted (grew a profile):** `integrity`'s preamble and
+count report (+180 / +300 / +172 full / max / xl; the count report
+alone +68 in full); `vacuum`'s page-1 header patch (+120 / +120 /
++104); `compact_image`'s copy order (+200 / +168 / +152: the body
+shrank 440 B, the function is 576 B); `exec_subplan_inner`'s bounds
+(+126 max) and its ORDER BY tail on its own (+70); `stat_decode`'s
+header and cell decode (+176 / +168 max / xl: −816 in the body, 988 B
+of functions); `fk_actions`' per-key gate (+118 max); `dbstat_db`'s
+row decode and tree pick (+52 / +60); `stream_finish`'s aggregate row
+(+88 / +144 max / xl, −16 full); `eval_group_sub`'s owned-aggregate
+fold (+128 in each); `#[inline(never)]` on `route_attach` (+72 max),
+`wr::layouts`, `agg_step`, `cte` `source`, `fk_action_ast`,
+`edit_table` / `edit_index` (+210 full), `fk_check_plan` (+794 xl),
+`open_stmt`, `fts_journal`, `insert_multi` and
+`btree::leaf_cells_meta` (+64 tiny). `rtree_next` and `prepare_eqp`
+hold no sync island worth a call: their bytes are inlined async
+callees (`rt_node`, `seek_rowid`, `prepare`, `eqp_rows`); `requalify`
+was already out of line.
+
+**What the measurements say.** The baseline's density figures (3.01
+vs 2.76 bytes per instruction) do not turn into savings when the code
+moves: a local that never lives across an `.await` is already on the
+stack, so an island pays the async tax only through register
+pressure in the large `poll` function. Out of line it pays a call,
+its arguments and a prologue instead, and loses the constants and
+shared outlined fragments it had inline. Large islands with many
+locals win 3–8% of their bytes (`check_rows`, `stream_open`,
+`nest_may_abort`, `prepare_params`); small ones (a header patch, a
+row decode, a gate) lose. 1,608 B in max is about 2.7% of the
+60,438 B of mostly-sync bodies, below the −3.4…−6.8 K estimate;
+the rest of that code is inlined async callees, which only the
+VM (ADR 0005 Stage 2) removes.
+
+**Cancellation (SPEC §5.1.1).** Nothing a dropped future must leave
+behind moved: the new locals that live across an `.await`
+(`RowCheck`, the stream's plan and window, the `undo` flag) are
+derived from the catalog or the plan, and every write and checkpoint
+still happens where it did. `crash.rs` (dropped futures, injected
+storage failures) passes unchanged.
+
+**Futures' drop glue** (sum of `drop_glue::<…{closure#…}>`) does not
+grow: 1,472 → 1,468 / 13,568 → 13,506 / 29,906 → 29,842 / 30,976 →
+30,916 B. (`prepare`'s own glue grew 4 B in max / xl with
+`prepare_params`; the sum fell.)
+
+**Async stack.** `depth_v16` and `triggers_v16` pass with debug info
+on (and `crash`, `pragma_v16`, `stream_v17`); no limit test moved, so
+`Config::stack_budget`'s `STACK_*` constants are unchanged.
+
+**Oracle probing (3.54.1 pin).** The touched paths were re-probed
+live against the pin and hipp: `PRAGMA integrity_check` / `(N)` /
+`quick_check` / `(table)` over rows that fail CHECK under
+`ignore_check_constraints` (one "CHECK constraint failed in t" per
+failing row, in each form), ORDER BY ... LIMIT / OFFSET inside a
+derived table and a correlated scalar subquery, a compound with
+ORDER BY / LIMIT, a folded `count(*), sum(a)`, and an AFTER INSERT
+trigger's `INSERT OR FAIL` failing in autocommit and inside BEGIN
+(the FAIL keeps the rows written before it; the transaction stays
+open): identical rows and errored-vs-succeeded on every statement.
+NOT NULL / STRICT findings were not re-probed then (`UPDATE
+sqlite_schema` under `writable_schema` is refused by the pin's CLI);
+that was avoidable: editing the stored CREATE text in place, at the
+same length, drives both engines through them live, and the review
+fixes below do so (`tests/integrity_v17.rs`).
+
+**Tests.** No behaviour changed, so no test was added or changed: the
+existing suites cover every split (`pragma_v16` integrity corpus,
+`stream_v17`, `triggers_v16` FAIL / ABORT / ROLLBACK and depth
+resolutions, `json_v16` table-valued functions, `foreign_keys_v16`,
+`size_v17`, `crash`, the ALTER / VACUUM / schema-reload suites) and
+pass unchanged.
+
+**Gates:** `ci/local-gates.sh` (full run) passes.
+
+**Size Δ** against the ratchets before the unit: tiny 76,260 → 76,124
+(−136); full 477,180 → 476,516 (−664); max 964,316 → 962,708
+(−1,608); xl 1,060,616 → 1,059,216 (−1,400). Engine statics stay 0 B.
+Every ratchet is lowered to its measured figure; tiny's is lowered
+too (it shrinks; nothing to justify).
+
+**Honest gaps.**
+
+- The unit's estimate (−0.2…−0.5 K / −2.7…−5.4 K / −3.4…−6.8 K /
+  −3.7…−7.4 K) is met for tiny only; full, max and xl reach a quarter
+  to a half of the low end, for the reason above. `vacuum`,
+  `integrity`, `stat_decode`, `dbstat_db`, `fk_actions`,
+  `rtree_next`, `prepare_eqp` and `eval_group_sub` keep their bodies.
+- `step` (34,884 B in max), `exec_vtab`, `vtab_rows_of`,
+  `stream_step`, `exec_alter16` and `step_maint` are large because
+  they inline async callees, not sync code; they are Stage 2 / 3
+  work.
+
+### Size pass: sync islands — review fixes (2026-11-08)
+
+Three findings in the integrity check this unit restructured
+(`check_rows` / `row_check_plan` / `check_row`, `src/session/
+pragma.rs`); all three predate the unit (they are the same at
+`d20c2b6`). Reached by editing an oracle-written file's stored
+schema text in place, at the same length.
+
+- **The wrong index named** (ungated fix). `write_index_plans`
+  already returns the plans newest first (the pin's `pIndex` order)
+  and `row_check_plan` reversed them a second time, while the names
+  (`table_indexes`) were newest first: with two or more indexes,
+  "row N missing from index X" named another index of the table, and
+  a WITHOUT ROWID table's broken index came out as its
+  `sqlite_autoindex`. The second reverse is gone. No other caller
+  zips `write_index_plans` with names (searched: the write paths
+  index plans by position only).
+- **No entry count for a partial index** (ungated fix). The
+  `expr_index` tail that counted a partial index's entries against
+  the rows its WHERE admits and printed "wrong # of entries in index
+  X" has no counterpart on the pin: probed with fewer, more and
+  equal admitted rows, swapped predicates, and a stale entry left by
+  a DELETE under another predicate, the pin reports only each
+  admitted row's missing entry (and `ok` when nothing is missing).
+  The tail and its counters are removed.
+- **A stored type against its affinity** (ungated fix: hipp said
+  `ok`). The pin's checks 4 and 5 on a non-STRICT table: "NUMERIC
+  value in t.c" for an INTEGER or REAL in a TEXT-affinity column,
+  "TEXT value in t.c" for text that NUMERIC conversion takes (what
+  `record::text_to_number` takes; `'abc'`, `'0x10'`, `''`, `'inf'`,
+  `'1e'`, `'1 2'` and Unicode spaces stay text) in an INTEGER /
+  REAL / NUMERIC column; BLOB columns, NULLs, the rowid alias and a
+  STRICT table's ANY column are not checked; a STRICT table's
+  columns get only their STRICT finding. A column added by ALTER
+  TABLE reads its converted default, as on the pin; generated
+  columns read their computed values. A table with a typed column is
+  now checked row by row (it was walked page by page when it had no
+  index, NOT NULL, STRICT or CHECK), so `quick_check` reports these
+  too. The pin's findings, order and error budget matched on every
+  probe.
+
+**Oracle probing (3.54.1 pin, live).** Each repro of the review,
+then: one, two and three indexes with one or two broken (the per-row
+order newest first), an autoindex beside a named index, WITHOUT ROWID
+with one and two secondary indexes; partial indexes as above; every
+affinity against INT / REAL / TEXT / BLOB / NULL values and 30
+numeric-looking strings; NOT NULL, STRICT (a table made STRICT by
+editing `)` to `) STRICT--`, and one made non-STRICT), CHECK,
+generated (VIRTUAL and STORED) columns, ALTER-added defaults, WITHOUT
+ROWID columns; `integrity_check`, `quick_check`, `(N)` and `(t)`.
+
+**Found while probing: the pin's header re-parse.** The pin's column
+checks read the record header's types (`OP_IsType`) and load a value
+only to look closer (a NOT NULL column's NULL or REAL, a numeric
+column's TEXT). Once a finding has been emitted the cursor's header
+cache is stale, and the next load re-parses the header only up to its
+own column; a later column of that row then reads as its default's
+type (NULL), so its type finding is skipped. Example: `t(c0 NUM, c1
+INT NOT NULL, c2 NUM)` holding `(' 7 ', 1e3, '-0')` gets only "TEXT
+value in t.c0" from the pin; hipp adds "TEXT value in t.c2". hipp
+does not model this (honest gap below): a model for rowid tables
+measured +256 B in full, past the ratchet.
+
+**Tests.** `tests/integrity_v17.rs` (new, 5 tests, live against the
+pin): the index-name cases, the partial-index cases, the affinity
+cases (with and without an index, quick_check, the error budget,
+generated columns, STRICT edited both ways, WITHOUT ROWID, ALTER
+defaults), NOT NULL / STRICT / CHECK reached by editing the stored
+CREATE text, and a generated corpus of 120 tables (xorshift; up to
+four columns, one edited to a random declared type, random values,
+one to three indexes, some edited to another column). Existing suites
+(`pragma_v16`, `expr_index_v16`, `without_rowid_v16`,
+`table_defs_v16`, `alter_v16`, `crash`) pass unchanged.
+
+**Gates:** `ci/local-gates.sh` (full run) passes, run with
+`CARGO_TARGET_DIR` set to the build directory's real path (`target`
+is a symlink here, and `attach_v16` compares the pin's resolved
+database paths with `CARGO_TARGET_TMPDIR`'s). `depth_v16`,
+`triggers_v16`, `crash`, `pragma_v16` and `integrity_v17` pass with
+debug info on; `check_rows`' future only lost locals and an await,
+so the `STACK_*` constants stay as they are.
+
+**Size Δ** against the unit's figures: tiny 76,124 → 76,124 (0); full
+476,516 → 476,476 (−40); max 962,708 → 962,292 (−416); xl 1,059,216
+→ 1,058,808 (−408). The removed partial-count tail and double reverse
+pay for the affinity checks (+76 B in full, measured alone); each
+finding's ` value in <table>.<column>` tail is built once per table
+in `row_check_plan`, and the three column findings share
+`col_finding`. Ratchets lowered to these figures. Futures' drop glue
+falls again: 1,468 / 13,498 / 29,830 / 30,904 B (from 1,468 / 13,506
+/ 29,842 / 30,916). Against the ratchets before the unit, the unit
+with its review fixes: tiny −136, full −704, max −2,024, xl −1,808.
+
+**Honest gaps.**
+
+- The pin's header re-parse after a finding (above) is not
+  modelled: in a row that already has a column finding, hipp can
+  report a later column's type finding that the pin skips. The same
+  holds, before this fix, for STRICT findings. `tests/integrity_v17.rs`'s
+  generated corpus edits one column per table so that a row holds at
+  most one column finding.
+- A table with a typed column is checked row by row now, and hipp's
+  row read follows every overflow chain where the pin reads only the
+  header (bar a TEXT value in a numeric column): a damaged chain in
+  such a table makes hipp's check fail after the page check's
+  findings, where the pin finishes. This is the v0.16 gap ("a row
+  whose overflow chain is broken stops hipp") reaching tables that
+  were walked page by page before (an untyped table still is).
+
+### Size pass Stage 1 (Tier A): summary (2026-11-08)
+
+ADR 0005's Stage 1 is the three units above (`size-sort`,
+`size-mono`, `size-islands`); `docs/adr/0005-code-size-sync-core-and-vm.md`
+records it as accepted. Totals against the ratchets before the stage
+(thumbv7em, `--profile tiny`, `.text + .rodata`):
+
+| profile | before | sort | mono | islands | after | Δ | budget headroom after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `tiny` | 76,960 | 0 | −700 | −136 | **76,124** | −836 (−1.1%) | 54,948 |
+| `full` | 507,592 | −26,352 | −4,060 | −704 | **476,476** | −31,116 (−6.1%) | 47,812 |
+| `max` | 1,031,072 | −62,688 | −4,068 | −2,024 | **962,292** | −68,780 (−6.7%) | 86,284 |
+| `xl` | 1,142,128 | −76,948 | −4,564 | −1,808 | **1,058,808** | −83,320 (−7.3%) | 251,912 |
+
+Against the ADR's estimate for S1 (~75.7 K / ~476.7 K / ~962.9 K /
+~1,018 K from the `8d78815` baseline): full and max land on it, tiny
+is 0.4 K above (the type-erased `AVec` core and most islands did not
+pay), and xl is above because `xl` grew by four leaves between the
+baseline and the stage (1,114,356 B at `8d78815`, 1,142,128 B when the
+stage started). Rows, errors, file bytes and EXPLAIN QUERY PLAN output
+are unchanged against the pin except the deliberate NaN-rank fix of
+`size-sort` and the three integrity-check fixes of `size-islands`'
+review (in its column above). Engine statics stay 0 B in every
+profile.
 
 ## v0.16 — SQLite-parity push
 
@@ -6733,7 +7434,9 @@ ADR 0002 draws, so it is a leaf, as the unit's brief directs. Census
   expression column cid -2 and no name (an INTEGER PRIMARY KEY column
   keeps its cid, as on the pin); `index_list`'s `partial`;
   integrity_check computes each row's entry and, for a partial index,
-  compares its entry count with the admitted rows (the pin's counter);
+  compares its entry count with the admitted rows (the pin's counter)
+  (corrected in v0.17: the pin keeps no such count; the tail is
+  removed, `tests/integrity_v17.rs`);
   VACUUM copies the indexes byte for byte; ANALYZE writes their stats.
 - **Files the pin made** with such indexes are read and written; the
   pin's integrity_check passes on every file hipp wrote in the suites.

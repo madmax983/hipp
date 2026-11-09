@@ -72,7 +72,7 @@ fn insert_into_a_triggered_table() {
     assert_eq!(common::cli(&p, "PRAGMA integrity_check;"), "ok\n");
 }
 
-#[cfg(feature = "v05")]
+#[cfg(feature = "write")]
 #[test]
 fn update_delete_and_drop() {
     let p = pin_file("write");

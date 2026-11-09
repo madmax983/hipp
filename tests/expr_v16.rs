@@ -11,7 +11,7 @@
 //!   operator's result can be extended by tighter operators: `x
 //!   ISNULL + 1` is `(x ISNULL) + 1`. hipp had `<` and `=` on one
 //!   level (`3 = 2 < 3` was 1).
-//! - Bitwise operators and `~` (`v16`): operands as 64-bit
+//! - Bitwise operators and `~` (`sql`): operands as 64-bit
 //!   integers (a text's integer prefix, a real truncated and
 //!   saturated), NULL in -> NULL out, negative shift counts shift
 //!   the other way, counts >= 64 shift everything out (-1 for a
@@ -26,8 +26,8 @@
 //!   the evaluator.
 //! - `x IS [NOT] TRUE / FALSE` is the pin's truth test (ungated:
 //!   `2 IS TRUE` was 0); `IS [NOT] DISTINCT FROM` and postfix
-//!   `NOT NULL` (`v16`).
-//! - Row values (`v16`): `(a, b) op (c, d)` for `= <> < <= > >=
+//!   `NOT NULL` (`sql`).
+//! - Row values (`sql`): `(a, b) op (c, d)` for `= <> < <= > >=
 //!   IS [NOT]`, BETWEEN, `IN ((..), (..))` (the pin's VALUES
 //!   rewrite: per-column affinity of the rightmost row), `IN
 //!   (SELECT a, b ...)`, CASE, multi-column scalar subqueries,
@@ -263,7 +263,7 @@ fn generated_precedence_corpus() {
         " = ", " == ", " <> ", " != ", " < ", " <= ", " > ", " >= ", " IS ", " IS NOT ", " + ",
         " - ", " * ", " AND ", " OR ",
     ];
-    if cfg!(feature = "v16") {
+    if cfg!(feature = "sql") {
         ops.extend([
             " & ",
             " | ",
@@ -287,9 +287,9 @@ fn generated_precedence_corpus() {
                     rng.pick(&atoms)
                 )),
                 4 => e = format!("NOT {e}"),
-                5 if cfg!(feature = "v16") => e = format!("~{e}"),
+                5 if cfg!(feature = "sql") => e = format!("~{e}"),
                 5 => e = format!("-{e}"),
-                6 if cfg!(feature = "v16") => e.push_str(" NOT NULL"),
+                6 if cfg!(feature = "sql") => e.push_str(" NOT NULL"),
                 _ => {
                     let op = rng.pick(&ops);
                     let rhs = rng.pick(&atoms);
@@ -320,7 +320,7 @@ fn truth_tests() {
     ]);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn is_distinct_from_and_not_null() {
     let tw = twins(
@@ -343,7 +343,7 @@ fn is_distinct_from_and_not_null() {
 
 // ---------------- bitwise operators (v16) ----------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn bitwise_operators() {
     let tw = twins("bits", "");
@@ -369,7 +369,7 @@ fn bitwise_operators() {
 
 /// Bitwise operators over a pool of operands of every storage
 /// class, plus the shift counts around 0 and 64.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn generated_bitwise_corpus() {
     let tw = twins("bitgen", "");
@@ -417,7 +417,7 @@ fn generated_bitwise_corpus() {
     exprs_same(&tw, &out);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn bitwise_over_columns_and_affinity() {
     let tw = twins(
@@ -536,7 +536,7 @@ fn smallest_integer_literal() {
 
 // ---------------- row values (v16) ----------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn row_value_comparisons() {
     let tw = twins("rows", "");
@@ -560,7 +560,7 @@ fn row_value_comparisons() {
 
 /// Random row values of two or three elements (integers, text,
 /// NULL) under every comparison operator, BETWEEN and IN.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn generated_row_value_corpus() {
     let tw = twins("rowgen", "");
@@ -597,7 +597,7 @@ fn generated_row_value_corpus() {
     exprs_same(&tw, &out);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn row_value_in_lists_and_subqueries() {
     let tw = twins(
@@ -636,7 +636,7 @@ fn row_value_in_lists_and_subqueries() {
     ]);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn scalar_subquery_row_values() {
     let tw = twins(
@@ -653,7 +653,7 @@ fn scalar_subquery_row_values() {
     ]);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn row_value_errors() {
     let tw = twins(
@@ -714,7 +714,7 @@ fn row_value_errors() {
     tw.finish("SELECT * FROM t;");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn update_set_row_values() {
     let tw = twins(
@@ -744,7 +744,7 @@ fn update_set_row_values() {
     tw.finish("SELECT rowid, * FROM t; SELECT * FROM s; SELECT a, typeof(a), b, typeof(b) FROM r;");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn row_values_in_check_and_delete() {
     let tw = twins(
@@ -856,7 +856,7 @@ fn outer_aggregate_misuse_is_refused() {
     tw.finish("SELECT * FROM t;");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn outer_aggregate_through_an_alias() {
     let tw = twins("aggalias", AGG);
@@ -941,7 +941,7 @@ fn generated_aggregate_scope_corpus() {
 /// them (regression: only the left operand was converted, so
 /// `(1, 1) IN ((x, y), (a, b))` with INTEGER x, y and TEXT a, b
 /// was 0 on hipp, 1 on the pin).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn row_value_in_list_affinity_applies_to_both_sides() {
     let tw = twins(
@@ -959,7 +959,7 @@ fn row_value_in_list_affinity_applies_to_both_sides() {
 
 /// Generated tables with every affinity, written row-value IN
 /// lists of mixed column and literal rows.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn generated_row_value_in_list_affinity_corpus() {
     let mut rng = Rng(0x0016_1a1f_5e75_0b07);
@@ -1082,7 +1082,7 @@ fn exists_result_list_aggregates_are_inert() {
 /// upsert's `excluded` row, belong to the subquery: the pin's
 /// owner search never stops at those rows (regression: hipp
 /// refused them; the base commit ran them).
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 #[test]
 fn returning_and_excluded_never_own_an_aggregate() {
     let setup = "CREATE TABLE t(a, b); INSERT INTO t VALUES (1,10);
@@ -1117,7 +1117,7 @@ fn returning_and_excluded_never_own_an_aggregate() {
 /// HAVING / ORDER BY subquery, is the alias's own query's
 /// aggregate, folded per group (regression: refused; earlier
 /// still, re-aggregated over the subquery's rows).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn aggregate_alias_in_having_and_order_by_subqueries() {
     let tw = twins(
@@ -1334,7 +1334,7 @@ fn reserved_words_are_no_bare_alias() {
 /// leftmost core and gave scalar subqueries and VALUES rows no
 /// affinity, so `'1' IN (SELECT 1 UNION SELECT i FROM c)` over
 /// INTEGER i was 0, the pin 1).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 #[test]
 fn subquery_affinity_comes_from_the_rightmost_core() {
     let tw = twins(
@@ -1384,7 +1384,7 @@ fn subquery_affinity_comes_from_the_rightmost_core() {
 }
 
 /// The row-value forms of the rightmost-core rule.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn row_value_subquery_affinity_comes_from_the_rightmost_core() {
     let tw = twins(
@@ -1400,7 +1400,7 @@ fn row_value_subquery_affinity_comes_from_the_rightmost_core() {
 
 /// `x IN ((SELECT ...), ...)` is a list whose first item is a
 /// scalar subquery (regression: a syntax error on hipp).
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 #[test]
 fn in_list_led_by_a_scalar_subquery() {
     let tw = twins("inlistsub", "");

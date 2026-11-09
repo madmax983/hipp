@@ -1,4 +1,4 @@
-//! The TEMP database (v0.16, `v16`).
+//! The TEMP database (v0.16, `sql`).
 //!
 //! A connection's temp schema lives in a second, private
 //! connection over a `MemStorage` (`Connection::temp`), created the
@@ -413,7 +413,7 @@ pub(super) fn qual_cut(toks: &[Token], i: usize) -> Option<(usize, usize)> {
 /// `sqlite_temp_schema` / `sqlite_temp_master` token at `a`, bare
 /// or quoted, to `sqlite_schema`.
 pub(super) fn apply_cuts(src: &[u8], cuts: &mut AVec<(usize, usize)>) -> AVec<u8> {
-    cuts.as_mut_slice().sort_by_key(|c| c.0);
+    crate::arena::sort_by(cuts.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
     let mut out = AVec::new();
     let mut pos = 0usize;
     for &(a, b) in cuts.iter() {
@@ -1534,7 +1534,7 @@ impl<S: Storage> Connection<S> {
             temp: true,
             #[cfg(feature = "attach")]
             ext: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             exists: false,
         });
         Ok(t.columns.len())

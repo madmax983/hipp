@@ -5,6 +5,127 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Breaking: feature renames
+
+Cargo features are named for what they enable, not for the milestone
+that added them (ADR 0006, `docs/adr/0006-features-name-capabilities.md`).
+The profiles keep their names and contents: builds that use `default`,
+`full`, `max` or `xl` are unaffected; builds that enable an old name
+directly must switch to the new one (Cargo refuses the old names).
+
+| old feature | new feature | enables |
+|---|---|---|
+| `v04` | `query` | joins, aggregates + GROUP BY, the expression evaluator, CHECK / DEFAULT / generated columns / STRICT, ALTER TABLE ADD COLUMN, inert views |
+| `v05` | `write` | UPDATE, DELETE, DROP TABLE (implies `query`) |
+| `v06`, `v07`, `v08`, `v09`, `v10`, `v16` | `sql` | subqueries; conflict clauses, UPDATE FROM, RETURNING, upsert; INSERT ... SELECT; compounds and derived tables; subqueries in aggregate arguments; the v0.16 core-dialect completion (implies `write`) |
+| `join_order`, `multi_index`, `flatten` | `planner` | the pin's join planner, index strategies and query flattener (in `xl`; implies `sql`, `expr_index`) |
+
+- `indexes`, `params`, `math`, `std` and every other leaf keep their
+  names; every leaf that required `v16` requires `sql`.
+- `cfg` predicates were rewritten under the new names and simplified
+  (`any(feature = "v05", feature = "indexes")` -> `any(feature =
+  "write", feature = "indexes")`, `all(feature = "v07", feature =
+  "foreign_keys")` -> `feature = "foreign_keys"`, ...). Code no
+  surviving feature combination compiles was deleted: the IN-cost
+  rule for `join_order` without `multi_index` (`xplan`), the empty
+  compound merge key for `expr_index` without `v09` and the
+  derived-source fallback for `v09` without `v16` (`session`), a
+  `v06` subquery check inside the `not(v16)` executor, a `not(v16)`
+  derived-table read inside a `v09` block, the pre-`flatten` /
+  pre-`multi_index` fallbacks inside the planner modules (`xjoin`,
+  `session::join`), a `not(v07)` RETURNING fallback inside the `v16`
+  INSERT ... DEFAULT VALUES, a NOT NULL argument
+  and two assertions of the tiny profile's code that a `v07` gate kept
+  out of every build; attributes that repeat the gate of the block
+  they sit in were dropped.
+- `ci/feature-sets.txt`: `query`, `write`, `sql`, `indexes,query`,
+  `indexes,write`, `query,math`, `sql,<leaf>` for each leaf and one
+  `sql,indexes,expr_index,planner` line.
+- No behaviour change and no compiled-code change: the tree links to the same
+  sections as a purely mechanical rename of the previous tree (`.text`
+  and `.rodata` byte-identical for `query`, `write`, `max`, `xl`).
+  tiny 76,124 B and full 476,476 B are unchanged; max 962,300 B (+8)
+  and xl 1,058,824 B (+16) differ by inter-function alignment padding
+  only (every symbol's size is unchanged), because a feature's name
+  enters the crate's metadata hash, hence every mangled symbol and
+  rustc's item order; the `[max]` / `[xl]` ratchets take those
+  values. Sizes per feature set in STATUS.md.
+
+### Size: sync islands out of async bodies
+
+- Mostly-sync async bodies keep only their I/O; the code between the
+  awaits runs in `#[inline(never)]` sync functions: the schema load
+  (`collect_schema_row` / `catalog_from_rows`, tiny's catalog rebuild
+  too), the integrity check's per-table setup and per-row checks,
+  `stream_open`'s plan and setup, one statement-undo site in
+  `trigger_failed`, the ORDER BY window shared by `exec_subplan_inner`
+  and `finish_produced`, and `prepare_params`, `plan_inner`,
+  `nest_may_abort`, `json::tvf_rows` and `before_update_loaded` out of
+  their futures. tiny −136 B (76,124), full −664 B (476,516), max
+  −1,608 B (962,708), xl −1,400 B (1,059,216); ratchets lowered;
+  futures' drop glue smaller in every profile. Splits that measured
+  larger in any profile (vacuum, integrity's preamble, stat_decode,
+  dbstat, fk_actions, eval_group_sub, and others) were reverted. No
+  observable change.
+- Review fixes in the integrity check (ungated, `tests/integrity_v17.rs`
+  live against the pin): "row N missing from index X" names the broken
+  index (the plans were reversed twice, so a table with two or more
+  indexes named another one, and a WITHOUT ROWID table's broken index
+  came out as its `sqlite_autoindex`); a partial index gets no "wrong #
+  of entries" line (the pin keeps no such count); a non-STRICT column's
+  stored type is checked against its affinity, as the pin does ("NUMERIC
+  value in t.c" for a number in a TEXT column, "TEXT value in t.c" for
+  convertible text in a numeric one; hipp said `ok`). With them the unit
+  ends at full 476,476 B, max 962,292 B, xl 1,058,808 B (tiny 76,124 B);
+  ratchets lowered again.
+- ADR 0005 (`docs/adr/0005-code-size-sync-core-and-vm.md`) is accepted
+  for Stage 1 with its measured results: tiny −836 B, full −31,116 B,
+  max −68,780 B, xl −83,320 B over the three size units; Stages 2–4
+  (the VM) stay proposed.
+
+### Size: monomorphic glue
+
+- The evaluator's remaining duplicate instantiations are gone:
+  `walk_aggs_mut` / `walk_plan_aggs_mut` are monomorphic, the compound
+  ORDER BY matcher shares the resolver's instantiation, and under
+  `window` `cond_is` re-types one `Error<()>` body as `eval` does, with
+  the evaluator's own helpers calling the bodies directly. full
+  −1,844 B (479,396), max −2,036 B (966,348), xl −2,044 B (1,063,136),
+  tiny unchanged; ratchets lowered. No observable change
+  (`tests/size_v17.rs`).
+- `btree::distribute` / `distribute_insert` compute their group sizes
+  in the monomorphic `split_counts` / `insert_counts`; only the copy
+  into groups stays per cell type. tiny −700 B (76,260), full −960 B
+  (478,436), max −960 B (965,388), xl −992 B (1,062,144); page images
+  unchanged (`insert_balance_v15`, `delete_balance_v14` vs the pin).
+- Plans are no longer deep-copied per execution: `Plan::Query`,
+  `Plan::Pragma` and `Plan::Instead` hold an `Rc`, the executors and
+  the streamed cursor borrow or share it, and `exec_subplan_inner` (a
+  subquery's every run — per outer row when correlated) no longer
+  clones its plan. full −1,256 B (477,180), max −1,072 B (964,316), xl
+  −1,528 B (1,060,616), tiny unchanged.
+- Measured and not kept: a hand-written type-erased `AVec` growth core
+  (+460 to +2,024 B; `alloc`'s `RawVecInner` already shares the growth
+  path) and an out-of-line `AVec::push` (−88 to −1,968 B, +17.7%
+  instructions on the bolt workload).
+
+### Size: one shared stable sort
+
+- Every `sort` / `sort_by` / `sort_by_key` / `sort_unstable*` in `src/`
+  (31 call sites, plus `agg::sort_stable`) now goes through
+  `arena::sort_perm`, one non-generic stable bottom-up merge sort over
+  an index permutation, with a per-type `arena::sort_by` adapter: no
+  `core::slice::sort` code is left in any profile. full −26,352 B
+  (481,240), max −62,688 B (968,384), xl −76,948 B (1,065,180), tiny
+  unchanged; ratchets lowered. Output is unchanged for every total
+  order (`tests/size_v17.rs`).
+- Fix (ungated): the fts5 rank sorter treated a NaN bm25 score as equal
+  to every score; it now sorts as the pin's NULL (first ascending, last
+  descending, ties in rowid order). The old comparator was not an
+  order: with finite ranks among NaN ones it also returned the finite
+  ranks out of order, so no total order could keep 0.16's output; this
+  is a deliberate, pin-matching change in an otherwise pure refactor.
+
 ### Size: one copy of the expression evaluator
 
 - With `window`, `query::eval` is compiled once (for `Error<()>`) instead

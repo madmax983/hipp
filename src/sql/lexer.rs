@@ -48,16 +48,16 @@ pub enum Tok {
     #[cfg(feature = "params")]
     Param(u16, ABytes),
     /// The bitwise operators `&`, `|`, `<<`, `>>` and `~`
-    /// (v0.16, `v16`).
-    #[cfg(feature = "v16")]
+    /// (v0.16, `sql`).
+    #[cfg(feature = "sql")]
     BitAnd,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BitOr,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Shl,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     Shr,
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     BitNot,
     /// A hexadecimal literal of more than 16 significant digits
     /// (v0.16 review fix, evaluator builds). The pin reports
@@ -66,7 +66,7 @@ pub enum Tok {
     /// CHECK / generated expression holds one is accepted (and a
     /// file with one stays readable); the parser keeps it as
     /// `Expr::HexTooBig` and resolution refuses it.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     HexTooBig,
     /// `->` (false) and `->>` (true), the JSON extraction
     /// operators (v0.16, `json`): the pin's `TK_PTR`, at the
@@ -687,7 +687,7 @@ fn big_rational_to_f64(p: &BigUint, q: &BigUint) -> f64 {
 /// - Otherwise digits, an optional `.` fraction and an
 ///   optional exponent (`e` / `E`, optional sign, at least one
 ///   digit) — `1e` is not an exponent.
-/// - With the evaluator (v0.16 fix; `v04`): a `_` digit
+/// - With the evaluator (v0.16 fix; `query`): a `_` digit
 ///   separator is allowed between two digits (hex digits in a
 ///   hex literal), as in SQLite 3.46+, and a literal followed
 ///   directly by an identifier character is the pin's
@@ -695,10 +695,10 @@ fn big_rational_to_f64(p: &BigUint, q: &BigUint) -> f64 {
 ///   `_000`; `1a` as `1` aliased `a`). The tiny profile has
 ///   no position where either reading is accepted, so it keeps
 ///   the shorter scan.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn number_at<E>(z: &[u8], off: usize) -> core::result::Result<(Tok, usize), Error<E>> {
     let at = |k: usize| z.get(k).copied().unwrap_or(0);
-    let sep = |c: u8| cfg!(feature = "v04") && c == b'_';
+    let sep = |c: u8| cfg!(feature = "query") && c == b'_';
     let mut i;
     let hex = at(0) == b'0' && matches!(at(1), b'x' | b'X') && hex_val(at(2)).is_some();
     if hex {
@@ -728,7 +728,7 @@ fn number_at<E>(z: &[u8], off: usize) -> core::result::Result<(Tok, usize), Erro
         }
     }
     let text = z.get(..i).unwrap_or(&[]);
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     {
         if is_ident_char(at(i)) {
             return Err(perr(off, ParseKind::InvalidLiteral));
@@ -774,7 +774,7 @@ fn number_at<E>(z: &[u8], off: usize) -> core::result::Result<(Tok, usize), Erro
 /// The value of a hexadecimal literal `0x<digits>` (v0.16): the
 /// pin's `sqlite3DecOrHexToI64` — leading zeros skipped, at most
 /// 16 significant digits, read as two's complement.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn hex_token(text: &[u8]) -> Tok {
     let mut v: u64 = 0;
     for &c in text.get(2..).unwrap_or(&[]) {
@@ -896,7 +896,7 @@ fn lex_inner<E>(
                 });
                 i += 1;
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             b'<' | b'>' if sql.get(i + 1) == Some(&b) => {
                 toks.push(Token {
                     tok: if b == b'<' { Tok::Shl } else { Tok::Shr },
@@ -904,7 +904,7 @@ fn lex_inner<E>(
                 });
                 i += 2;
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             b'&' | b'~' | b'|' if !(b == b'|' && sql.get(i + 1) == Some(&b'|')) => {
                 toks.push(Token {
                     tok: match b {
@@ -1124,7 +1124,7 @@ fn lex_inner<E>(
             // 0x7fffffffffffffff, refused beyond (the evaluator's
             // `number_at` reads all 16 digits, digit separators
             // and the pin's trailing-character rule).
-            #[cfg(not(feature = "v04"))]
+            #[cfg(not(feature = "query"))]
             b'0'..=b'9' | b'.' => {
                 // Number (b'.' only reaches here before a digit).
                 if b == b'0' && i + 1 < n && (sql[i + 1] == b'x' || sql[i + 1] == b'X') {
@@ -1174,7 +1174,7 @@ fn lex_inner<E>(
                 let tok = number_token::<E>(&sql[start..i], off)?;
                 toks.push(Token { tok, offset: off });
             }
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             b'0'..=b'9' | b'.' => {
                 // Number (b'.' only reaches here before a digit).
                 let (tok, len) = number_at::<E>(sql.get(i..).unwrap_or(&[]), off)?;

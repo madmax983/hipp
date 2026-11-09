@@ -121,7 +121,7 @@ pub trait Storage {
     /// `MemStorage::new` models a file too (the test and
     /// crash-injection workhorse), `MemStorage::memory_db` makes an
     /// in-memory database.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn is_memory(&self) -> bool {
         false
     }
@@ -219,7 +219,7 @@ pub struct MemStorage {
     inner: Rc<RefCell<MemInner>>,
     /// An in-memory database rather than a model of a file (v0.16,
     /// `Storage::is_memory`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     memory: bool,
 }
 
@@ -234,7 +234,7 @@ impl MemStorage {
                 #[cfg(feature = "wal")]
                 shm: None,
             })),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             memory: false,
         }
     }
@@ -250,14 +250,14 @@ impl MemStorage {
                 #[cfg(feature = "wal")]
                 shm: None,
             })),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             memory: false,
         }
     }
 
     /// An in-memory database (v0.16): the pin's `:memory:`, whose
     /// journal mode is `memory` (`Storage::is_memory`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn memory_db() -> MemStorage {
         MemStorage {
             memory: true,
@@ -443,7 +443,7 @@ impl Storage for MemStorage {
     async fn sync(&mut self) -> Result<(), MemError> {
         Ok(())
     }
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn is_memory(&self) -> bool {
         self.memory
     }
@@ -615,13 +615,13 @@ mod file_storage {
         }
     }
 
-    /// The hosted `VACUUM INTO` writer (v0.16, `v16`; the default
+    /// The hosted `VACUUM INTO` writer (v0.16, `sql`; the default
     /// `Config::vacuum_into` with `std`): writes `image` to the
     /// file named `name` (UTF-8, relative to the working
     /// directory) and syncs it. An existing non-empty file is
     /// left alone and reported as `false`, as the pin refuses
     /// one; so is a name that is not UTF-8 or a failed write.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub fn write_new_file(name: &[u8], image: &[u8]) -> bool {
         let Ok(path) = core::str::from_utf8(name) else {
             return false;
@@ -820,7 +820,7 @@ mod file_storage {
         fn file_name(&self) -> &[u8] {
             &self.full
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         fn is_memory(&self) -> bool {
             self.anon == Some(true)
         }
@@ -930,7 +930,7 @@ mod file_storage {
     }
 }
 
-#[cfg(all(feature = "std", feature = "v16"))]
+#[cfg(all(feature = "std", feature = "sql"))]
 pub use file_storage::write_new_file;
 #[cfg(feature = "std")]
 pub use file_storage::{FileError, FileSidecar, FileStorage};

@@ -1,4 +1,4 @@
-//! The v0.16 scalar function library (`v16`): `printf()` /
+//! The v0.16 scalar function library (`sql`): `printf()` /
 //! `format()` and the value functions SQLite 3.54.1 ships beside
 //! it — `quote()`, `char()`, `unicode()`, `zeroblob()`,
 //! `randomblob()` / `random()`, `concat()`, `concat_ws()`,

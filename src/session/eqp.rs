@@ -477,7 +477,6 @@ fn in_pairs<'x>(x: &'x RExpr, p: &'x SubPlan) -> AVec<(&'x RExpr, Option<&'x REx
     };
     let mut out = AVec::new();
     match x {
-        #[cfg(feature = "v16")]
         RExpr::Scalar(crate::query::ScalarFn::Vector, xs) => {
             for (i, e) in xs.iter().enumerate() {
                 out.push((e, items.get(i)));
@@ -936,12 +935,12 @@ impl<'a> Walk<'a> {
             let (order, unique) = ext
                 .as_ref()
                 .map_or((false, false), |x| (!x.order.is_empty(), x.unique));
-            // A min() / max() query (v0.17, `multi_index`): no sorter
+            // A min() / max() query (v0.17, `planner`): no sorter
             // for its ORDER BY, nor for its DISTINCT when the loops
             // deliver the argument's order.
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             let mm = c.sources.first().map_or(0, |s| s.eqp.minmax);
-            #[cfg(not(feature = "multi_index"))]
+            #[cfg(not(feature = "planner"))]
             let mm = 0u8;
             if *distinct && !unique && mm != 2 {
                 self.add(parent, &[b"USE TEMP B-TREE FOR ", name, b"(DISTINCT)"]);
@@ -1033,10 +1032,10 @@ impl<'a> Walk<'a> {
         let count_of = self.simple_count(c);
         // A join's WHERE terms with subqueries are shown after the loop
         // that makes them computable, where the pin codes them (v0.17,
-        // `join_order`): per term, that loop's position.
-        #[cfg(feature = "join_order")]
+        // `planner`): per term, that loop's position.
+        #[cfg(feature = "planner")]
         let mut wterms: AVec<(&RExpr, usize)> = AVec::new();
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         if n > 1
             && let Some(f) = c.filter
         {
@@ -1059,14 +1058,14 @@ impl<'a> Walk<'a> {
         // A min() / max() query (the pin's `minMaxQuery`): its FROM
         // subqueries' and virtual tables' loops print SEARCH too
         // (v0.17 review fix).
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         let mm_core = c.has_agg
             && c.having.is_none()
             && count_of.is_none()
             && crate::xmulti::minmax(c.items, c.order_by, !c.group_by.is_empty(), &|_| true)
                 .is_some();
         for (i, sp) in c.sources.iter().enumerate() {
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             if sp.eqp.omit {
                 continue;
             }
@@ -1089,8 +1088,8 @@ impl<'a> Walk<'a> {
                 line = l;
             }
             // A min() / max() query's loops all print SEARCH (v0.17,
-            // `multi_index`; the pin's `WHERE_ORDERBY_MIN` / `_MAX`).
-            #[cfg(feature = "multi_index")]
+            // `planner`; the pin's `WHERE_ORDERBY_MIN` / `_MAX`).
+            #[cfg(feature = "planner")]
             if (sp.eqp.minmax != 0 || mm_core) && line.as_slice().starts_with(b"SCAN ") {
                 let mut l = copy_vec(b"SEARCH ");
                 l.extend_from_slice(line.as_slice().get(5..).unwrap_or(&[]));
@@ -1107,16 +1106,16 @@ impl<'a> Walk<'a> {
                 }
                 line = l;
             }
-            #[cfg(feature = "multi_index")]
+            #[cfg(feature = "planner")]
             let multi = sp.access.as_deref().and_then(|a| a.or.as_deref());
-            #[cfg(not(feature = "multi_index"))]
+            #[cfg(not(feature = "planner"))]
             let multi: Option<()> = None;
             if i > 0 && sp.kind.pads_right() && multi.is_none() {
                 line.extend_from_slice(b" LEFT-JOIN");
             }
             // The Bloom filters built before this loop (v0.17,
-            // `join_order`): its own, and those pulled down to it.
-            #[cfg(feature = "join_order")]
+            // `planner`): its own, and those pulled down to it.
+            #[cfg(feature = "planner")]
             for (q, sq) in c.sources.iter().enumerate() {
                 if sp.eqp.bloom_lines & (1u64 << q) != 0 {
                     let mut b = AVec::new();
@@ -1124,8 +1123,8 @@ impl<'a> Walk<'a> {
                     self.add(parent, &[b.as_slice()]);
                 }
             }
-            // An automatic index's Bloom filter (v0.17, `join_order`).
-            #[cfg(feature = "join_order")]
+            // An automatic index's Bloom filter (v0.17, `planner`).
+            #[cfg(feature = "planner")]
             if let Some(ai) = sp.access.as_deref().and_then(|a| a.auto.as_deref())
                 && ai.bloom
             {
@@ -1136,12 +1135,12 @@ impl<'a> Walk<'a> {
                 self.add(parent, &[b.as_slice()]);
             }
             let id = self.add(parent, &[line.as_slice()]);
-            // A MULTI-INDEX OR loop's branches (v0.17, `multi_index`).
-            #[cfg(feature = "multi_index")]
+            // A MULTI-INDEX OR loop's branches (v0.17, `planner`).
+            #[cfg(feature = "planner")]
             if let Some(o) = multi {
                 self.or_branches(sp, o, id, i > 0 && sp.kind.pads_right());
             }
-            #[cfg(not(feature = "multi_index"))]
+            #[cfg(not(feature = "planner"))]
             let _ = (id, multi);
             #[cfg(feature = "expr_index")]
             if let Some(a) = sp.access.as_deref() {
@@ -1162,7 +1161,7 @@ impl<'a> Walk<'a> {
             if let Some(on) = &sp.on {
                 self.exprs(core::slice::from_ref(on), parent, probes.as_slice());
             }
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             for (p, at) in wterms.iter() {
                 if *at == i {
                     self.exprs(core::slice::from_ref(*p), parent, probes.as_slice());
@@ -1177,9 +1176,9 @@ impl<'a> Walk<'a> {
                 self.add(r, &[b"SCAN ", name.as_slice()]);
             }
         }
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         let shown = !wterms.is_empty();
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         let shown = false;
         if let Some(f) = c.filter
             && !shown
@@ -1187,10 +1186,10 @@ impl<'a> Walk<'a> {
             self.exprs(core::slice::from_ref(f), parent, probes.as_slice());
         }
         // (A join the pin's planner ordered reports what it delivers
-        // on its first loop: v0.17, `join_order`.)
-        #[cfg(feature = "join_order")]
+        // on its first loop: v0.17, `planner`.)
+        #[cfg(feature = "planner")]
         let first = c.sources.first().filter(|s| n == 1 || s.eqp.joined);
-        #[cfg(not(feature = "join_order"))]
+        #[cfg(not(feature = "planner"))]
         let first = c.sources.first().filter(|_| n == 1);
         #[cfg(feature = "expr_index")]
         let acc = first.and_then(|s| s.access.as_deref());
@@ -1282,10 +1281,10 @@ impl<'a> Walk<'a> {
     }
 
     /// A MULTI-INDEX OR loop's branches under its line `id` (v0.17,
-    /// `multi_index`): `INDEX n`, the subqueries its loop evaluates
+    /// `planner`): `INDEX n`, the subqueries its loop evaluates
     /// (its IN probes first), then its loop (`LEFT-JOIN` as the
     /// source's).
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     fn or_branches(&mut self, sp: &SubSource, o: &crate::xmulti::OrAccess, id: i64, left: bool) {
         for sub in o.subs.iter() {
             let mut h = copy_vec(b"INDEX ");
@@ -1369,8 +1368,8 @@ impl<'a> Walk<'a> {
     /// The loop over one FROM source.
     fn loop_line(&mut self, sp: &SubSource, out: &mut AVec<u8>, probes: &mut AVec<usize>) {
         self.loop_line_of(sp, out, probes);
-        // A semi-join loop (v0.17, `flatten`): `SEARCH t EXISTS ...`.
-        #[cfg(feature = "flatten")]
+        // A semi-join loop (v0.17, `planner`): `SEARCH t EXISTS ...`.
+        #[cfg(feature = "planner")]
         if sp.exists {
             let mut nm = AVec::new();
             self.scan_name(sp, &mut nm);
@@ -1466,10 +1465,10 @@ impl<'a> Walk<'a> {
     }
 
     /// `BLOOM FILTER ON x (a=? AND b=?)` for a lookup loop's filter
-    /// (v0.17, `join_order`; `sqlite3WhereExplainBloomFilter`): the
+    /// (v0.17, `planner`; `sqlite3WhereExplainBloomFilter`): the
     /// INTEGER PRIMARY KEY's name (or `rowid`), else the index's
     /// equality columns.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     fn bloom_line(&mut self, sp: &SubSource, out: &mut AVec<u8>) {
         out.extend_from_slice(b"BLOOM FILTER ON ");
         self.scan_name(sp, out);
@@ -1508,8 +1507,8 @@ impl<'a> Walk<'a> {
     }
 
     /// An automatic index's key: `(c=? AND d=?)` (v0.17,
-    /// `join_order`).
-    #[cfg(feature = "join_order")]
+    /// `planner`).
+    #[cfg(feature = "planner")]
     fn auto_keys(&self, sp: &SubSource, ai: &crate::xplan::AutoIdx, out: &mut AVec<u8>) {
         let t = self.cat.tables.iter().find(|t| t.root == sp.root);
         out.push(b'(');
@@ -1528,13 +1527,13 @@ impl<'a> Walk<'a> {
     /// The index part of a loop's line.
     #[cfg(feature = "expr_index")]
     fn access(&mut self, sp: &SubSource, a: &crate::xplan::IdxAccess, out: &mut AVec<u8>) {
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         if a.or.is_some() {
             out.truncate(0);
             out.extend_from_slice(b"MULTI-INDEX OR");
             return;
         }
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         if let Some(ai) = a.auto.as_deref() {
             out.truncate(0);
             out.extend_from_slice(b"SEARCH ");
@@ -1615,7 +1614,7 @@ impl<'a> Walk<'a> {
     /// comparisons' collations (`USING INDEX i FOR IN-OPERATOR`; a
     /// UNIQUE one of exactly those columns when an index loop probes
     /// with the values), the affinities allowing it.
-    #[cfg(feature = "multi_index")]
+    #[cfg(feature = "planner")]
     fn in_index(&self, x: &RExpr, p: &SubPlan) -> Option<AVec<u8>> {
         use crate::record::Affinity;
         if !p.uncorrelated
@@ -1641,7 +1640,6 @@ impl<'a> Walk<'a> {
         }
         // (A FROM subquery or view the flattener merged is still one
         // on the pin.)
-        #[cfg(feature = "flatten")]
         if !p.view_names.is_empty() {
             return None;
         }
@@ -1811,14 +1809,14 @@ impl<'a> Walk<'a> {
             }
             first = false;
         };
-        #[cfg(feature = "multi_index")]
+        #[cfg(feature = "planner")]
         let skip = a.skip;
-        #[cfg(not(feature = "multi_index"))]
+        #[cfg(not(feature = "planner"))]
         let skip = 0;
         let k = a.eq.len() + skip;
         for (i, key) in keys.iter().take(k).enumerate() {
             sep(out);
-            // A skip-scan's columns (v0.17, `multi_index`).
+            // A skip-scan's columns (v0.17, `planner`).
             if i < skip {
                 out.extend_from_slice(b"ANY(");
                 out.extend_from_slice(key.as_slice());
@@ -1868,8 +1866,8 @@ impl<'a> Walk<'a> {
             let n = self.shown(last_sel(p));
             // The IN operator reading a table's own rowids or index in
             // place of the subquery's values (the pin's
-            // `sqlite3FindInIndex`; v0.17 review fix, `multi_index`).
-            #[cfg(feature = "multi_index")]
+            // `sqlite3FindInIndex`; v0.17 review fix, `planner`).
+            #[cfg(feature = "planner")]
             if let RExpr::InSub(x, ..) = e
                 && let Some(line) = self.in_index(x, p)
             {
@@ -1933,8 +1931,8 @@ impl<'a> Walk<'a> {
         #[cfg(not(feature = "expr_index"))]
         let _ = t;
         let id = self.add(0, &[line.as_slice()]);
-        // A MULTI-INDEX OR loop's branches (v0.17, `multi_index`).
-        #[cfg(feature = "multi_index")]
+        // A MULTI-INDEX OR loop's branches (v0.17, `planner`).
+        #[cfg(feature = "planner")]
         if let Some(o) = access.and_then(|a| a.or.as_deref()) {
             let sp = SubSource {
                 root: t.root,
@@ -1942,7 +1940,7 @@ impl<'a> Walk<'a> {
             };
             self.or_branches(&sp, o, id, false);
         }
-        #[cfg(not(feature = "multi_index"))]
+        #[cfg(not(feature = "planner"))]
         let _ = id;
         #[cfg_attr(not(feature = "expr_index"), allow(unused_mut))]
         let mut probes: AVec<usize> = AVec::new();
@@ -2012,7 +2010,7 @@ fn placeholder(name: &[u8]) -> SubSource {
             scan: copy_vec(name),
             ..Default::default()
         },
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         exists: false,
     }
 }
@@ -2123,13 +2121,13 @@ pub(super) fn describe<S: Storage>(
             filter,
             from_sources,
             returning,
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             from_join,
             ..
         } => {
             // An UPDATE ... FROM the join planner ordered (v0.17
             // review fix): its loops as a SELECT's.
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             if let Some(j) = from_join.as_deref() {
                 w.update_from = true;
                 let c = Core {
@@ -2170,7 +2168,7 @@ pub(super) fn describe<S: Storage>(
                 es.as_slice(),
                 returning.as_slice(),
             );
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             if let Some(t) = table(*root) {
                 let mut assigned: AVec<bool> = AVec::new();
                 for _ in t.columns.iter() {
@@ -2229,7 +2227,7 @@ pub(super) fn describe<S: Storage>(
                 &[],
                 returning.as_slice(),
             );
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             if let Some(t) = table(*root) {
                 fk_lines(w, conn, t, None, arena);
             }
@@ -2240,7 +2238,7 @@ pub(super) fn describe<S: Storage>(
             rows_v,
             upsert,
             returning,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             root,
             ..
         } => {
@@ -2274,7 +2272,7 @@ pub(super) fn describe<S: Storage>(
                 w.seen.truncate(n);
             }
             w.exprs(returning.as_slice(), 0, &[]);
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             if let Some(t) = table(*root) {
                 fk_insert_lines(w, conn, t, plan, arena);
             }
@@ -2303,10 +2301,10 @@ pub(super) fn describe<S: Storage>(
 }
 
 /// EXPLAIN QUERY PLAN's foreign-key child scans after a parent
-/// DELETE / UPDATE's loops (v0.17, `flatten`; the pin's
+/// DELETE / UPDATE's loops (v0.17, `planner`; the pin's
 /// `fkScanChildren`, once per key for a DELETE, for the old and then
 /// the new row for an UPDATE).
-#[cfg(feature = "flatten")]
+#[cfg(feature = "planner")]
 fn fk_lines<S: Storage>(
     w: &mut Walk<'_>,
     conn: &Connection<S>,
@@ -2330,7 +2328,7 @@ fn fk_lines<S: Storage>(
 }
 
 /// An INSERT's foreign-key child scans on its parent side (v0.17
-/// review fix, `flatten`; in the pin's code order): one round for
+/// review fix, `planner`; in the pin's code order): one round for
 /// each REPLACE that can delete a row (the rowid when the INSERT
 /// supplies it, each UNIQUE index whose action is REPLACE), the old
 /// and the new row of an upsert DO UPDATE that changes a key, then
@@ -2338,7 +2336,7 @@ fn fk_lines<S: Storage>(
 /// writes more than one row (`isMultiWrite`: a SELECT or several
 /// VALUES rows, a REPLACE, RETURNING, INSERT triggers, or a DO
 /// UPDATE that changes a key).
-#[cfg(feature = "flatten")]
+#[cfg(feature = "planner")]
 fn fk_insert_lines<S: Storage>(
     w: &mut Walk<'_>,
     conn: &Connection<S>,
@@ -2421,7 +2419,7 @@ fn fk_insert_lines<S: Storage>(
 /// of another affinity class or collation is not searched; a key the
 /// index does not hold whole is no covering read; a full scan reads
 /// a narrower covering index).
-#[cfg(feature = "flatten")]
+#[cfg(feature = "planner")]
 fn fk_child_lines<S: Storage>(
     conn: &Connection<S>,
     w: &mut Walk<'_>,

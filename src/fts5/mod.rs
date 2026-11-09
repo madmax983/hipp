@@ -1982,7 +1982,7 @@ impl Reader {
                 }
             }
         }
-        rows.as_mut_slice().sort_by_key(|r| (r.0, r.1));
+        crate::arena::sort_by(rows.as_mut_slice(), &mut |a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         let mut out = AVec::new();
         let mut last: Option<i64> = None;
         for (rowid, si, ti, ei) in rows.iter() {

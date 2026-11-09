@@ -840,7 +840,7 @@ pub fn compute(
         let cmp = |a: usize, b: usize| {
             crate::query::order_keys_cmp(keys(a), keys(b), dirs.iter().copied(), enc)
         };
-        crate::agg::sort_stable(&mut perm, &|a, b| cmp(a, b) != core::cmp::Ordering::Greater);
+        crate::arena::sort_idx(perm.as_mut_slice(), &mut |a, b| cmp(a, b));
         // Partitions: runs of rows with equal partition keys.
         let mut lo = 0usize;
         while lo < n {
@@ -972,7 +972,7 @@ fn eval_offset(e: Option<&RExpr>) -> Result<Option<OwnedValue>, SchemaKind> {
         return Ok(None);
     };
     let empty = crate::query::RowData::empty();
-    match crate::query::eval::<()>(e, &crate::query::Ctx::of(&empty)) {
+    match crate::query::eval_body::<()>(e, &crate::query::Ctx::of(&empty)) {
         Ok(v) => Ok(Some(v)),
         Err(crate::error::Error::Schema { kind }) => Err(kind),
         Err(_) => Err(SchemaKind::FrameStartOffset),

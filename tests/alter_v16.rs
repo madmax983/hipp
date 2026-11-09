@@ -33,7 +33,7 @@
 //! included), failing statements, the oracle's integrity check and
 //! `.dump` of both files must agree.
 
-#![cfg(feature = "v16")]
+#![cfg(feature = "sql")]
 
 mod common;
 

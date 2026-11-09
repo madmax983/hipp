@@ -46,7 +46,7 @@ use crate::record::{Affinity, OwnedValue, Value, apply_affinity, encode_record};
 use crate::sql::parser::Limits;
 use crate::sql::{ConflictAction, Expr, SelectStmt, eq_ci, parse_expr_text};
 
-/// A STRICT table column's declared type (v0.16, `v16`).
+/// A STRICT table column's declared type (v0.16, `sql`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrictType {
     /// `INT` or `INTEGER`: integers only (INTEGER affinity first
@@ -118,7 +118,7 @@ pub struct GenCols {
     pub rowid_alias: Option<usize>,
     /// `PRAGMA case_sensitive_like` for this statement (v0.16 fix:
     /// a generated column's LIKE ignored it). Set by the planner.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     pub case_like: bool,
 }
 
@@ -139,7 +139,7 @@ impl GenCols {
             }
             let rd = eval_row(self.rowid_alias, self.affs.as_slice(), rec, rowid);
             let ctx = Ctx::of(&rd);
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let ctx = ctx.case_like(self.case_like);
             let v = eval::<E>(e, &ctx)?;
             let aff = self
@@ -222,7 +222,7 @@ impl TableRules {
         affs: &[Affinity],
         rowid_alias: Option<usize>,
         action: ConflictAction,
-        #[cfg(feature = "v07")] nn_acts: crate::session::NnActs<'_>,
+        #[cfg(feature = "sql")] nn_acts: crate::session::NnActs<'_>,
         changed: Option<(&[bool], bool)>,
         env: Option<&crate::query::Env>,
     ) -> Result<bool, E> {
@@ -239,7 +239,7 @@ impl TableRules {
             affs,
             rowid_alias,
             action,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             nn_acts,
         )? {
             return Ok(false);
@@ -257,7 +257,7 @@ impl TableRules {
                 affs,
                 rowid_alias,
                 action,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 nn_acts,
             )? {
                 return Ok(false);
@@ -521,7 +521,7 @@ pub fn plan_rules<E>(
                     kind: SchemaKind::MisusedAggregate,
                 });
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if crate::query::any_scalar(&r, &crate::query::ScalarFn::nondeterministic) {
                 return Err(Error::Schema {
                     kind: SchemaKind::NonDeterministic,
@@ -574,7 +574,7 @@ pub fn plan_rules<E>(
             order,
             affs: affs.clone(),
             rowid_alias,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             case_like: false,
         });
     }
@@ -587,7 +587,7 @@ pub fn plan_rules<E>(
         // A three-part name's schema part is ignored in a CHECK, as
         // on the pin (v0.16 review fix: `temp.t.a` on a main table,
         // or `bogus.t.a`, was refused).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             src.db = crate::query::DB_ANY;
         }
@@ -693,7 +693,7 @@ pub fn validate_def<E>(
 /// non-deterministic, so CREATE TABLE / ALTER TABLE ADD COLUMN
 /// refuse such a column ("non-deterministic functions prohibited
 /// in generated columns").
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub fn gen_uses_like<E>(
     arena: &Arena,
     lim: Limits,
@@ -740,9 +740,9 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             expr_any(a, f)
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Collate(a, _) | Expr::BitNot(a) | Expr::RowItem(a, ..) => expr_any(a, f),
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Expr::Vector(l) => l.iter().any(|x| expr_any(x, f)),
         Expr::InSubquery(a, _, _) => expr_any(a, f),
         Expr::InList(a, l, _) => expr_any(a, f) || l.iter().any(|x| expr_any(x, f)),
@@ -758,11 +758,11 @@ pub fn expr_any(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
         }
         Expr::Func {
             args,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             clause,
             ..
         } => {
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if let Some(c) = clause
                 && (c.order_by.iter().any(|(x, _)| expr_any(x, f))
                     || c.filter.as_ref().is_some_and(|x| expr_any(x, f)))
@@ -1020,13 +1020,13 @@ pub fn boxed_gen(r: &TableRules) -> Option<Box<GenCols>> {
     r.gcols.clone().map(Box::new)
 }
 
-// ---------------- CREATE TABLE ... AS SELECT (v16) ----------------
+// ---------------- CREATE TABLE ... AS SELECT (`sql`) ----------------
 
 /// The pin's keywords (147, as `sqlite3_keyword_name` lists them;
 /// verified against the oracle): a CREATE TABLE ... AS SELECT
 /// column or table name that is one of them is double-quoted in
 /// the derived schema text.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 const KEYWORDS: &str = "ABORT ACTION ADD AFTER ALL ALTER ALWAYS ANALYZE AND AS ASC ATTACH \
 AUTOINCREMENT BEFORE BEGIN BETWEEN BY CASCADE CASE CAST CHECK COLLATE COLUMN COMMIT CONFLICT \
 CONSTRAINT CREATE CROSS CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFAULT \
@@ -1040,14 +1040,14 @@ RETURNING RIGHT ROLLBACK ROW ROWS SAVEPOINT SELECT SET TABLE TEMP TEMPORARY THEN
 TRANSACTION TRIGGER UNBOUNDED UNION UNIQUE UPDATE USING VACUUM VALUES VIEW VIRTUAL WHEN WHERE \
 WINDOW WITH WITHOUT";
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn is_keyword(w: &[u8]) -> bool {
     KEYWORDS.split(' ').any(|k| eq_ci(k.as_bytes(), w))
 }
 
 /// The pin's `identLength`: the name's length with each `"`
 /// doubled, plus two quotes.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn ident_len(z: &[u8]) -> usize {
     z.len()
         .saturating_add(z.iter().filter(|b| **b == b'"').count())
@@ -1057,7 +1057,7 @@ fn ident_len(z: &[u8]) -> usize {
 /// The pin's `identPut`: the name, double-quoted (inner `"`
 /// doubled) when it is empty, starts with a digit, holds any byte
 /// but an ASCII letter, digit or `_`, or is a keyword.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn ident_put(out: &mut AVec<u8>, z: &[u8]) {
     let j = z
         .iter()
@@ -1081,7 +1081,7 @@ fn ident_put(out: &mut AVec<u8>, z: &[u8]) {
 /// The declared type CREATE TABLE ... AS SELECT gives a column of
 /// affinity `aff` (the pin's `azType`): none for BLOB, else
 /// ` TEXT`, ` NUM`, ` INT`, ` REAL`.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn aff_type(aff: Affinity) -> &'static [u8] {
     match aff {
         Affinity::Blob => b"",
@@ -1095,7 +1095,7 @@ fn aff_type(aff: Affinity) -> &'static [u8] {
 /// The `sqlite_schema.sql` text of a CREATE TABLE ... AS SELECT
 /// table (the pin's `createTableStmt`, byte for byte): one line
 /// when the names are short, else one column per line.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub fn ctas_sql(tname: &[u8], cols: &[(AVec<u8>, Affinity)]) -> AVec<u8> {
     let mut n = ident_len(tname);
     for (c, _) in cols.iter() {
@@ -1126,7 +1126,6 @@ pub fn ctas_sql(tname: &[u8], cols: &[(AVec<u8>, Affinity)]) -> AVec<u8> {
 /// `:1`, `:2`, ... until unique. Past three attempts the pin
 /// switches to a random suffix, which hipp cannot reproduce:
 /// `Error::Unsupported` then.
-#[cfg(feature = "v04")]
 pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
     for i in 0..names.len() {
         let mut cnt = 0u32;
@@ -1164,7 +1163,7 @@ pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
 /// The pin's `sqlite3ExprAffinity` of one resolved result item:
 /// a column's affinity, a CAST's, INTEGER for a rowid, a scalar
 /// subquery's first result item's; none (BLOB) for anything else.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 pub fn item_affinity(e: &RExpr) -> Affinity {
     match e {
         RExpr::Column(_, a, _) | RExpr::Cast(_, a) => *a,
@@ -1182,7 +1181,7 @@ pub fn item_affinity(e: &RExpr) -> Affinity {
 /// The pin's `sqlite3ExprDataType` bits of one later compound
 /// core's result item (0x01 numeric-ish, 0x02 text, 0x04 blob),
 /// which can demote the leftmost core's affinity.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 pub fn item_datatype(e: &RExpr) -> u8 {
     match e {
         RExpr::Literal(OwnedValue::Null) => 0x00,
@@ -1218,7 +1217,7 @@ pub fn item_datatype(e: &RExpr) -> u8 {
 /// text item — and a numeric CAST becoming NUMERIC (the pin's
 /// FLEXNUM). `head` is the leftmost core's item, `tails` the later
 /// cores.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 pub fn compound_affinity<'p>(
     aff: Affinity,
     head: Option<&RExpr>,
@@ -1252,7 +1251,7 @@ pub fn compound_affinity<'p>(
 /// The clock keywords with and without the `datetime` leaf (v0.16;
 /// run by `cargo test --lib` for `full`, which lacks the leaf, and
 /// for `max`, which has it).
-#[cfg(all(test, feature = "v16"))]
+#[cfg(all(test, feature = "sql"))]
 mod clock_tests {
     use crate::session::{Config, Connection, Step};
     use crate::storage::{MemStorage, block_on};

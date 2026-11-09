@@ -628,9 +628,9 @@ fn fts5_best_index(tab: &VTab, info: &mut IndexInfo) -> Result<(), BestErr> {
             info.idx_num = flag | if *desc { 4 } else { 0 };
         }
     }
-    // The pin's estimates (v0.17, `join_order`: the join planner's
+    // The pin's estimates (v0.17, `planner`: the join planner's
     // costs): by the full-text and rowid constraints used.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     {
         let n_match = s.iter().filter(|b| matches!(b, b'M' | b'L' | b'G')).count();
         let (lt, gt) = (s.iter().any(|b| *b == b'<'), s.iter().any(|b| *b == b'>'));

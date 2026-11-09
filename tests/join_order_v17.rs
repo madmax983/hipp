@@ -1,4 +1,4 @@
-//! v0.17 join ordering and automatic indexes (leaf `join_order`),
+//! v0.17 join ordering and automatic indexes (leaf `planner`),
 //! differentially vs the pinned oracle (SQLite 3.54.1).
 //!
 //! The pin's `where.c` planner orders a join's FROM sources by cost
@@ -17,7 +17,7 @@
 //!   data with NULLs and mixed types, with no statistics, with the
 //!   pin's ANALYZE and with hipp's; comma joins, JOIN ... ON, LEFT
 //!   JOIN and CROSS JOIN; equality, range, IN, BETWEEN and IS NOT NULL
-//!   terms, OR terms and IN subqueries (v0.17, `multi_index`); ORDER
+//!   terms, OR terms and IN subqueries (v0.17, `planner`); ORDER
 //!   BY, GROUP BY, DISTINCT, min() / max() and LIMIT. The rows must be
 //!   the pin's (none may differ as a set, a LIMIT's checked without
 //!   it), in the pin's order (at most 3 in 200 queries may come in
@@ -371,7 +371,7 @@ fn gen_query(r: &mut Rng, wide: bool, tabs: &[Tab]) -> String {
         let (al, t) = &aliases[r.n(aliases.len() as u64) as usize];
         let c = &t.cols[r.n(t.cols.len() as u64) as usize];
         let v = r.n(7);
-        // (v0.17, `multi_index`: OR terms and IN subqueries too; v0.17
+        // (v0.17, `planner`: OR terms and IN subqueries too; v0.17
         // review: a COLLATE inside an OR, the one-value IN.)
         conds.push(match r.n(11) {
             9 => {
@@ -413,7 +413,7 @@ fn gen_query(r: &mut Rng, wide: bool, tabs: &[Tab]) -> String {
     let mode = r.n(100);
     let mut tail = String::new();
     let mut dist = "";
-    // (v0.17, `multi_index`: a min() / max() over the join.)
+    // (v0.17, `planner`: a min() / max() over the join.)
     if mode >= 92 && sel[0] != "*" {
         let a = sel[r.n(sel.len() as u64) as usize].clone();
         let f = if r.chance(50) { "min" } else { "max" };
@@ -528,7 +528,7 @@ fn generated_joins_match_pin() {
         plan_w.len()
     );
     assert!(hard.is_empty(), "rows differ:\n{}", hard.join("\n"));
-    // (v0.17, `multi_index`: OR terms, IN subqueries and min() / max()
+    // (v0.17, `planner`: OR terms, IN subqueries and min() / max()
     // in the corpus; 15 orders and 126 plans of 1,600 at 400 seeds, 3
     // and 20 of 240 at the default 60 — the limits were 2 and 10 in
     // 100; v0.17 review: COLLATE inside an OR and one-value IN lists

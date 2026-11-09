@@ -13,9 +13,9 @@ pub use ast::{
     IndexColumnDef, JoinKind, Literal, SelectItem, SelectList, SelectStmt, SortOrder, Upsert,
     UpsertAction,
 };
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub use ast::{Cte, CteUse, IndexHint, M10d, RecMark, With};
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub use parser::parse_expr_text;
 #[cfg(feature = "params")]
 pub use parser::parse_params;

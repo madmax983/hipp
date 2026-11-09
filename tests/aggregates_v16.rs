@@ -4,18 +4,18 @@
 //! (STATUS.md, "Aggregate completion"); the matrix the tests
 //! encode:
 //!
-//! - `string_agg(X, SEP)` and the aggregate ORDER BY (`v16`):
+//! - `string_agg(X, SEP)` and the aggregate ORDER BY (`sql`):
 //!   `f(args ORDER BY ...)` sorts the stepped rows stably (ties in
 //!   input order) for every aggregate but min / max (which drop
 //!   it); DISTINCT keeps the first value seen, then sorts, except
 //!   when the single ORDER BY term is the argument itself, where
 //!   the sorter deduplicates and the last of equal keys survives.
-//! - `FILTER (WHERE ...)` on every aggregate (`v16`): a row the
+//! - `FILTER (WHERE ...)` on every aggregate (`sql`): a row the
 //!   filter rejects is not stepped (and loads no min / max bare
 //!   column); FILTER / ORDER BY ownership in subqueries follows
 //!   every column they name; on a non-aggregate they are refused.
 //! - `median` / `percentile` / `percentile_cont` /
-//!   `percentile_disc` (`v16`): the pin's P validation, constant-P
+//!   `percentile_disc` (`sql`): the pin's P validation, constant-P
 //!   check, NULL handling and REAL results.
 //! - Ungated fixes: `sum()` integer overflow is an error (total /
 //!   avg go REAL), REAL sums use Kahan–Babuška–Neumaier

@@ -647,7 +647,7 @@ impl<S: Storage> Connection<S> {
             }
             _ => AVec::new(),
         };
-        Ok(Some(Plan::Instead(Box::new(InsteadPlan {
+        Ok(Some(Plan::Instead(alloc::rc::Rc::new(InsteadPlan {
             event,
             source: Box::new(source),
             ncols,
@@ -1110,6 +1110,7 @@ impl<S: Storage> Connection<S> {
     /// (the trigger depth limit) inside an explicit transaction
     /// leaves the statement's changes in place. Conservative: what
     /// it cannot tell counts as an abort point (hipp's undo).
+    #[inline(never)]
     pub(super) fn nest_may_abort(&self, sql: &[u8], arena: &Arena) -> bool {
         // Without the `foreign_keys` leaf such writes are refused.
         #[cfg(not(feature = "foreign_keys"))]
@@ -1345,6 +1346,7 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// is past the 32nd column), and computes the generated columns
     /// from that row — the other columns read as NULL. Per column:
     /// whether it is loaded.
+    #[inline(never)]
     pub(super) fn before_update_loaded(&self, cols: &[bool], rowid_set: bool) -> AVec<bool> {
         let mut loaded = AVec::new();
         let Some(tg) = self.trig.as_ref() else {
@@ -1744,7 +1746,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             r
         };
         let e = &*e;
-        match r {
+        // One undo for the FAIL and ABORT arms below (its rollback
+        // future is inlined once).
+        let undo = match r {
             Resolve::Fail => {
                 let committed = if self.conn.explicit_txn {
                     Ok(())
@@ -1757,12 +1761,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                     return true;
                 }
                 self.conn.env.finish(false);
-                abort_write!(self, e);
+                true
             }
             Resolve::Rollback => {
                 self.conn.env.finish(false);
                 let _ = self.conn.pager.rollback().await;
                 self.conn.explicit_txn = false;
+                false
             }
             // A depth failure in an explicit transaction, where no
             // program of the statement holds an abort point, keeps
@@ -1783,11 +1788,15 @@ impl<'c, S: Storage> Statement<'c, S> {
             {
                 self.conn.env.finish(true);
                 self.keep_stmt();
+                false
             }
             Resolve::Abort => {
                 self.conn.env.finish(false);
-                abort_write!(self, e);
+                true
             }
+        };
+        if undo {
+            abort_write!(self, e);
         }
         true
     }
@@ -1829,7 +1838,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         let Plan::Instead(ip) = &self.plan else {
             return Err(Error::Unsupported);
         };
-        let ip = ip.clone();
+        // Shared, not deep-copied, per execution (v0.17 size pass).
+        let ip = Rc::clone(ip);
         let rows = self.exec_subplan(&ip.source, &RowData::empty()).await?;
         for row in rows.iter() {
             let r = row.as_slice();

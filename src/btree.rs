@@ -658,13 +658,13 @@ impl ScanCursor {
 }
 
 /// The rowid a new row without an explicit one takes in the table
-/// rooted at `root` (v0.16, `v16`): one past the largest, 1 for an
+/// rooted at `root` (v0.16, `sql`): one past the largest, 1 for an
 /// empty table, and when the largest is 9223372036854775807 the
 /// smallest unused positive rowid — the pin picks a random unused
 /// one, and any unused rowid serves (v0.16 review fix: ANALYZE and
 /// INSERT failed there). `DatabaseFull` when every positive rowid
-/// is taken. Without `v16` such an insert fails.
-#[cfg(feature = "v16")]
+/// is taken. Without `sql` such an insert fails.
+#[cfg(feature = "sql")]
 pub async fn new_rowid<S: Storage>(pager: &mut Pager<S>, root: u32) -> Result<i64, S::Error> {
     // A WITHOUT ROWID table's new row (v0.16): a fresh handle.
     #[cfg(feature = "without_rowid")]
@@ -1240,6 +1240,8 @@ pub async fn btree_insert<S: Storage>(
 /// is a suffix of the combined sequence costing closest to half
 /// the content capacity `cap` (ties take the smaller suffix), and
 /// the remaining items are distributed over the `win` old pages.
+/// The group sizes come from the monomorphic `insert_counts`; only
+/// the copy into groups is per item type (v0.17 size pass).
 fn distribute_insert<T: Clone>(
     items: &[T],
     weights: &[usize],
@@ -1247,9 +1249,16 @@ fn distribute_insert<T: Clone>(
     cap: usize,
     win: usize,
 ) -> AVec<AVec<T>> {
-    if n == win + 1 && win >= 2 && items.len() > n {
+    group_items(items, insert_counts(weights, n, cap, win).as_slice())
+}
+
+/// The group sizes of `distribute_insert` for items of `weights`
+/// (one weight per item).
+fn insert_counts(weights: &[usize], n: usize, cap: usize, win: usize) -> AVec<usize> {
+    let len = weights.len();
+    if n == win + 1 && win >= 2 && len > n {
         let target = cap / 2;
-        let max_cnt = items.len() - win;
+        let max_cnt = len - win;
         let mut best_cnt = 1usize;
         let mut best_key = (usize::MAX, usize::MAX);
         let mut s = 0usize;
@@ -1264,16 +1273,29 @@ fn distribute_insert<T: Clone>(
                 best_cnt = i + 1;
             }
         }
-        let cut = items.len() - best_cnt;
-        let mut groups = distribute(&items[..cut], &weights[..cut], win, cap);
-        let mut suffix = AVec::new();
-        for it in &items[cut..] {
-            suffix.push(it.clone());
-        }
-        groups.push(suffix);
-        return groups;
+        let cut = len - best_cnt;
+        let mut counts = split_counts(weights.get(..cut).unwrap_or(&[]), win, cap);
+        counts.push(best_cnt);
+        return counts;
     }
-    distribute(items, weights, n, cap)
+    split_counts(weights, n, cap)
+}
+
+/// Copy `items` in order into consecutive groups of `counts[k]`
+/// items (the only per-item-type step of a balance's split).
+fn group_items<T: Clone>(items: &[T], counts: &[usize]) -> AVec<AVec<T>> {
+    let mut groups: AVec<AVec<T>> = AVec::new();
+    let mut rest = items;
+    for &c in counts {
+        let (head, tail) = rest.split_at(c.min(rest.len()));
+        let mut group = AVec::new();
+        for it in head {
+            group.push(it.clone());
+        }
+        groups.push(group);
+        rest = tail;
+    }
+    groups
 }
 
 /// Greedy in-order packing of leaf cells at full capacity (the
@@ -1942,66 +1964,62 @@ fn window_range(nchildren: usize, trigger: usize) -> (usize, usize) {
 /// `n` non-empty groups, evenly by weight: each group is filled
 /// to at least the ceiling of its fair share of the remaining
 /// weight before the next group starts. Requires
-/// `items.len() >= n >= 1`.
+/// `items.len() >= n >= 1`. The split points come from the
+/// monomorphic `split_counts` (v0.17 size pass).
 fn distribute<T: Clone>(items: &[T], weights: &[usize], n: usize, usable: usize) -> AVec<AVec<T>> {
-    debug_assert!(n >= 1 && items.len() >= n);
+    debug_assert!(n >= 1 && items.len() >= n && weights.len() == items.len());
+    group_items(items, split_counts(weights, n, usable).as_slice())
+}
+
+/// The group sizes of `distribute` for items of `weights` (one weight
+/// per item): `n` counts summing to `weights.len()`.
+fn split_counts(weights: &[usize], n: usize, usable: usize) -> AVec<usize> {
+    let len = weights.len();
     let total: usize = weights.iter().sum();
-    let mut groups: AVec<AVec<T>> = AVec::new();
+    let mut counts: AVec<usize> = AVec::new();
     let mut idx = 0usize;
     let mut cum = 0usize;
     for g in 0..n {
-        let mut group = AVec::new();
         if g + 1 == n {
-            while idx < items.len() {
-                group.push(items[idx].clone());
-                idx += 1;
-            }
-            groups.push(group);
+            counts.push(len - idx);
             break;
         }
         // Items that must remain so every later group is
         // non-empty.
         let reserve = n - 1 - g;
-        if n == 2 {
-            // Two-page result: split evenly by weight — fill
-            // while the running total is below half (probed:
-            // exact on every observed merge).
-            while items.len() - idx > reserve && (group.is_empty() || cum * 2 < total) {
-                cum += weights[idx];
-                group.push(items[idx].clone());
-                idx += 1;
+        let start = idx;
+        while len - idx > reserve {
+            let w = weights.get(idx).copied().unwrap_or(0);
+            let more = idx == start
+                || if n == 2 {
+                    // Two-page result: split evenly by weight — fill
+                    // while the running total is below half (probed:
+                    // exact on every observed merge).
+                    cum * 2 < total
+                } else if g == 0 {
+                    // First boundary of a three-page result:
+                    // cumulative quota (total + usable) / (n + 1),
+                    // check-then-add — the group overshoots its quota
+                    // by less than one item (probed from the 3.54.1
+                    // oracle; see the section comment).
+                    cum * (n + 1) < total + usable
+                } else {
+                    // Second boundary: place it at the item closest
+                    // to the cumulative quota 2 * (total + usable) /
+                    // (n + 1) — stop before an item that would carry
+                    // the total strictly further past the quota than
+                    // it currently falls short.
+                    (2 * cum + w) * (n + 1) <= 2 * (total + usable) * (g + 1)
+                };
+            if !more {
+                break;
             }
-        } else if g == 0 {
-            // First boundary of a three-page result: cumulative
-            // quota (total + usable) / (n + 1), check-then-add —
-            // the group overshoots its quota by less than one
-            // item (probed from the 3.54.1 oracle; see the
-            // section comment).
-            while items.len() - idx > reserve
-                && (group.is_empty() || cum * (n + 1) < total + usable)
-            {
-                cum += weights[idx];
-                group.push(items[idx].clone());
-                idx += 1;
-            }
-        } else {
-            // Second boundary: place it at the item closest to
-            // the cumulative quota 2 * (total + usable) / (n + 1)
-            // — stop before an item that would carry the total
-            // strictly further past the quota than it currently
-            // falls short.
-            while items.len() - idx > reserve
-                && (group.is_empty()
-                    || (2 * cum + weights[idx]) * (n + 1) <= 2 * (total + usable) * (g + 1))
-            {
-                cum += weights[idx];
-                group.push(items[idx].clone());
-                idx += 1;
-            }
+            cum += w;
+            idx += 1;
         }
-        groups.push(group);
+        counts.push(idx - start);
     }
-    groups
+    counts
 }
 
 /// Outcome of one window balance.
@@ -2807,7 +2825,7 @@ pub async fn btree_delete<S: Storage>(
 /// Local-payload byte count for an index cell (SQFMT §1.6):
 /// X = ((U-12)*64/255)-23; if P > X, M = ((U-12)*32/255)-23 and
 /// K = M + ((P-M) mod (U-4)); keep K if K <= X else M.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub fn index_local(usable: usize, payload_len: usize) -> usize {
     let x = (usable - 12) * 64 / 255 - 23;
     if payload_len <= x {
@@ -2822,7 +2840,7 @@ pub fn index_local(usable: usize, payload_len: usize) -> usize {
 /// `fillInCell` pads a shorter one with zeros; v0.16: only a WITHOUT
 /// ROWID table's records, with no rowid, are that short). `after` is
 /// what follows the cell on its page, read for the padding bytes.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 #[inline(always)]
 fn pad_cell(img: &mut AVec<u8>, after: &[u8]) {
     #[cfg(feature = "without_rowid")]
@@ -2837,7 +2855,7 @@ fn pad_cell(img: &mut AVec<u8>, after: &[u8]) {
 }
 
 /// One parsed index cell (leaf or interior).
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 #[derive(Clone)]
 pub struct IndexCell {
     /// Left child page (interior cells only; 0 in leaf cells).
@@ -2852,7 +2870,7 @@ pub struct IndexCell {
     pub payload_off: usize,
 }
 
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 impl IndexCell {
     pub fn local_bytes(&self) -> &[u8] {
         &self.bytes.as_slice()[self.payload_off..self.payload_off + self.local_len]
@@ -2861,7 +2879,7 @@ impl IndexCell {
 
 /// Where an index cell's parts sit on its page (everything
 /// `parse_index_cell` reads from the cell, before copying it out).
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 struct IndexCellLayout {
     child: u32,
     payload_len: usize,
@@ -2873,7 +2891,7 @@ struct IndexCellLayout {
     total: usize,
 }
 
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 fn index_cell_layout<E>(
     bytes: &[u8],
     at: usize,
@@ -2920,7 +2938,7 @@ fn index_cell_layout<E>(
     })
 }
 
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 fn parse_index_cell<E>(
     bytes: &[u8],
     at: usize,
@@ -2943,7 +2961,7 @@ fn parse_index_cell<E>(
 }
 
 /// Parse all cells of an index leaf page.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub fn index_leaf_cells<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec<IndexCell>, E> {
     let h = head::<E>(bytes, page)?;
     if h.kind != KIND_LEAF_INDEX {
@@ -2959,7 +2977,7 @@ pub fn index_leaf_cells<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVe
 
 /// Parse an index interior page: cells (each with its left child)
 /// plus the rightmost child.
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub fn index_interior_cells<E>(
     bytes: &[u8],
     page: u32,
@@ -3137,8 +3155,8 @@ pub fn decode_index_entry<E>(payload: &[u8], nfields: usize) -> Result<IndexEntr
 }
 
 /// Every key payload of the index rooted at `root`, raw, in key
-/// order (v0.16, `v16`: VACUUM copies indexes byte for byte).
-#[cfg(all(feature = "v16", feature = "indexes"))]
+/// order (v0.16, `sql`: VACUUM copies indexes byte for byte).
+#[cfg(all(feature = "sql", feature = "indexes"))]
 pub async fn index_payloads<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -4369,14 +4387,14 @@ pub async fn index_prefix_rowids<S: Storage>(
 }
 
 /// `PRAGMA integrity_check`'s index probe for one row (v0.16,
-/// `v16`): whether the entry `key` + `rowid` is found by the pin's
+/// `sql`): whether the entry `key` + `rowid` is found by the pin's
 /// seek (`sqlite3BtreeIndexMoveto`: each page binary-searched, see
 /// `LazyPage::search`), and — for a `unique` index — whether the entry
 /// after it does not sort above `key` (the pin's `OP_Next` +
 /// `OP_IdxGT`: "non-unique entry"). Only the cells the search
 /// visits are decoded, as on the pin, so damage elsewhere on a
 /// page does not stop the check.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 pub async fn index_check_entry<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -4498,14 +4516,14 @@ pub async fn index_check_entry<S: Storage>(
 }
 
 /// The pin's index-record comparison (`xRecordCompare`, v0.16,
-/// `v16`): index cell payload `rec` against the full key `probe`
+/// `sql`): index cell payload `rec` against the full key `probe`
 /// (key values + rowid) under `desc`, field by field from the raw
 /// record — a field's body is read only when its type needs it, so
 /// a damaged record compares as the pin's does (its fast paths for
 /// an integer or BINARY text first field included). `None` is the
 /// pin's corruption verdict (`errCode`), which it reports only if
 /// the comparison then reads as equal.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn pin_rec_cmp(
     rec: &[u8],
     probe: &[OwnedValue],
@@ -4572,7 +4590,7 @@ fn pin_rec_cmp(
 
 /// `sqlite3VdbeRecordCompareWithSkip` (see `pin_rec_cmp`); `skip`
 /// starts at the second field, the first known equal.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn pin_rec_cmp_from(
     rec: &[u8],
     probe: &[OwnedValue],
@@ -4675,7 +4693,7 @@ fn pin_rec_cmp_from(
 /// A big-endian integer of serial type `st` (1..=6, 8, 9) at `at`;
 /// bytes past the record read as 0 (the pin reads into its page
 /// buffer's slack).
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_int(rec: &[u8], at: usize, st: u32) -> i64 {
     let n = match st {
         1..=4 => st as usize,
@@ -4697,7 +4715,7 @@ fn rec_int(rec: &[u8], at: usize, st: u32) -> i64 {
 }
 
 /// `getVarint32` at `at` (missing bytes read as 0).
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_varint32(rec: &[u8], at: usize) -> (u32, usize) {
     match rec.get(at..).map(decode_varint::<()>) {
         Some(Ok((v, n))) => (u32::try_from(v).unwrap_or(u32::MAX), n),
@@ -4705,7 +4723,7 @@ fn rec_varint32(rec: &[u8], at: usize) -> (u32, usize) {
     }
 }
 
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_serial_len(t: u32) -> u32 {
     match t {
         0..=4 => t,
@@ -4716,7 +4734,7 @@ fn rec_serial_len(t: u32) -> u32 {
     }
 }
 
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 fn rec_varint_len(v: u32) -> usize {
     match v {
         0..=0x7f => 1,
@@ -4728,14 +4746,14 @@ fn rec_varint_len(v: u32) -> usize {
 }
 
 /// A copy of page `page`'s image.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 async fn page_snap<S: Storage>(pager: &mut Pager<S>, page: u32) -> Result<AVec<u8>, S::Error> {
     let idx = pager.load(page).await?;
     Ok(copy_bytes(pager.frame_data(idx)))
 }
 
 /// Index page cell `i`'s full payload.
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 async fn index_payload_at<S: Storage>(
     pager: &mut Pager<S>,
     snap: &[u8],
@@ -4750,7 +4768,7 @@ async fn index_payload_at<S: Storage>(
 }
 
 /// Interior index page child `i` (`ncell` is the rightmost).
-#[cfg(all(feature = "indexes", feature = "v16"))]
+#[cfg(all(feature = "indexes", feature = "sql"))]
 async fn child_at<S: Storage>(
     pager: &mut Pager<S>,
     snap: &[u8],
@@ -4783,7 +4801,7 @@ pub async fn index_first_with_prefix<S: Storage>(
 
 /// Every page of the index rooted at `root`: B-tree pages plus
 /// all overflow chains (DROP INDEX frees exactly this set).
-#[cfg(any(feature = "indexes", feature = "v05"))]
+#[cfg(any(feature = "indexes", feature = "write"))]
 pub async fn collect_index_pages<S: Storage>(
     pager: &mut Pager<S>,
     root: u32,
@@ -4837,7 +4855,7 @@ pub async fn collect_index_pages<S: Storage>(
 
 /// Every page of the table rooted at `root`: B-tree pages plus
 /// all overflow chains. Ungated like `btree_delete`: DROP TABLE
-/// (v05) is the headline caller, but the delete-rebuild path
+/// (`write`) is the headline caller, but the delete-rebuild path
 /// needs it in every configuration that can delete rows.
 pub async fn collect_table_pages<S: Storage>(
     pager: &mut Pager<S>,
@@ -6003,4 +6021,174 @@ async fn index_rebuild_without_extra<S: Storage>(
         index_insert_core(pager, root, p.as_slice(), desc).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod split_tests {
+    //! The monomorphic split-point computation (v0.17 size pass)
+    //! against the generic `distribute` / `distribute_insert` it
+    //! replaced, kept here verbatim as the reference.
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn ref_distribute<T: Clone>(
+        items: &[T],
+        weights: &[usize],
+        n: usize,
+        usable: usize,
+    ) -> Vec<Vec<T>> {
+        let total: usize = weights.iter().sum();
+        let mut groups: Vec<Vec<T>> = Vec::new();
+        let mut idx = 0usize;
+        let mut cum = 0usize;
+        for g in 0..n {
+            let mut group = Vec::new();
+            if g + 1 == n {
+                while idx < items.len() {
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+                groups.push(group);
+                break;
+            }
+            let reserve = n - 1 - g;
+            if n == 2 {
+                while items.len() - idx > reserve && (group.is_empty() || cum * 2 < total) {
+                    cum += weights[idx];
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+            } else if g == 0 {
+                while items.len() - idx > reserve
+                    && (group.is_empty() || cum * (n + 1) < total + usable)
+                {
+                    cum += weights[idx];
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+            } else {
+                while items.len() - idx > reserve
+                    && (group.is_empty()
+                        || (2 * cum + weights[idx]) * (n + 1) <= 2 * (total + usable) * (g + 1))
+                {
+                    cum += weights[idx];
+                    group.push(items[idx].clone());
+                    idx += 1;
+                }
+            }
+            groups.push(group);
+        }
+        groups
+    }
+
+    fn ref_insert<T: Clone>(
+        items: &[T],
+        weights: &[usize],
+        n: usize,
+        cap: usize,
+        win: usize,
+    ) -> Vec<Vec<T>> {
+        if n == win + 1 && win >= 2 && items.len() > n {
+            let target = cap / 2;
+            let max_cnt = items.len() - win;
+            let mut best_cnt = 1usize;
+            let mut best_key = (usize::MAX, usize::MAX);
+            let mut s = 0usize;
+            for (i, w) in weights.iter().rev().enumerate() {
+                if i >= max_cnt {
+                    break;
+                }
+                s += w;
+                let key = (s.abs_diff(target), s);
+                if key < best_key {
+                    best_key = key;
+                    best_cnt = i + 1;
+                }
+            }
+            let cut = items.len() - best_cnt;
+            let mut groups = ref_distribute(&items[..cut], &weights[..cut], win, cap);
+            groups.push(items[cut..].to_vec());
+            return groups;
+        }
+        ref_distribute(items, weights, n, cap)
+    }
+
+    fn as_vecs(g: AVec<AVec<u32>>) -> Vec<Vec<u32>> {
+        g.iter().map(|x| x.as_slice().to_vec()).collect()
+    }
+
+    /// xorshift64, deterministic.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    #[test]
+    fn split_counts_match_the_generic_reference() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        // Fewer rounds under miri (CI runs the lib tests there).
+        let rounds = if cfg!(miri) { 40 } else { 4000 };
+        for round in 0..rounds {
+            let len = 1 + (r.next() % 60) as usize;
+            let heavy = round % 7 == 0;
+            let weights: Vec<usize> = (0..len)
+                .map(|_| {
+                    if heavy {
+                        200 + (r.next() % 1800) as usize
+                    } else {
+                        4 + (r.next() % 120) as usize
+                    }
+                })
+                .collect();
+            let items: Vec<u32> = (0..len as u32).collect();
+            let usable = 488 + (r.next() % 3600) as usize;
+            for n in 1..=len.min(5) {
+                let got = as_vecs(distribute(&items, &weights, n, usable));
+                assert_eq!(
+                    got,
+                    ref_distribute(&items, &weights, n, usable),
+                    "{weights:?} n={n}"
+                );
+                let c = split_counts(&weights, n, usable);
+                assert_eq!(c.len(), n);
+                assert_eq!(c.iter().sum::<usize>(), len);
+                assert!(c.iter().all(|&k| k >= 1));
+                for win in 1..=3 {
+                    let got = as_vecs(distribute_insert(&items, &weights, n, usable, win));
+                    assert_eq!(
+                        got,
+                        ref_insert(&items, &weights, n, usable, win),
+                        "{weights:?} n={n} win={win}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_items_follows_the_counts() {
+        let items = [1u32, 2, 3, 4, 5, 6];
+        let g = as_vecs(group_items(&items, &[1, 3, 2]));
+        assert_eq!(
+            g,
+            alloc::vec![alloc::vec![1], alloc::vec![2, 3, 4], alloc::vec![5, 6]]
+        );
+        // Counts past the end never panic: the groups just run short.
+        let g = as_vecs(group_items(&items, &[4, 4, 4]));
+        assert_eq!(
+            g,
+            alloc::vec![alloc::vec![1, 2, 3, 4], alloc::vec![5, 6], alloc::vec![]]
+        );
+        assert!(group_items::<u32>(&[], &[]).is_empty());
+        // An empty weight list with one group is one empty count.
+        assert_eq!(split_counts(&[], 1, 100).as_slice(), &[0]);
+        assert!(insert_counts(&[], 1, 100, 1).as_slice() == [0]);
+    }
 }

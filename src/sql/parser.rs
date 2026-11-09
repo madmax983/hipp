@@ -7,23 +7,23 @@
 //! accepted is stored verbatim and must load on the pin. Foreign
 //! keys (without the `foreign_keys` leaf) and DEFERRABLE are parsed
 //! and not enforced; CHECK, DEFAULT, generated columns, COLLATE,
-//! NOT NULL, PRIMARY KEY, UNIQUE and (v0.16, `v07`) their
+//! NOT NULL, PRIMARY KEY, UNIQUE and (v0.16, `sql`) their
 //! constraint-level ON CONFLICT clauses are (CHECK and generated
 //! columns only with the v0.4 evaluator, a FAIL / IGNORE / REPLACE
-//! clause only with `v07` — smaller builds refuse them).
+//! clause only with `sql` — smaller builds refuse them).
 
 use crate::arena::{ABytes, AVec, Arena};
 use crate::error::{Error, ParseKind, Result};
-#[cfg(any(feature = "v04", feature = "indexes"))]
+#[cfg(any(feature = "query", feature = "indexes"))]
 use crate::record::Coll;
 
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 use super::ast::CompoundOp;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 use super::ast::IndexHint;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 use super::ast::SortOrder;
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 use super::ast::UpsertAction;
 use super::ast::{
     Ast, BinOp, ColumnDef, ConflictAction, ConstraintSet, Expr, FromSource, IndexColumnDef,
@@ -41,25 +41,25 @@ const MAX_DEPTH: usize = PIN_PARSER_DEPTH;
 
 // Expression binding powers (v0.16: the pin's precedence levels,
 // loosest first; see `Parser::expr_bp`).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_OR: u8 = 1;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_AND: u8 = 2;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_NOT: u8 = 3;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_EQ: u8 = 4;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_REL: u8 = 5;
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 const BP_BIT: u8 = 7;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_ADD: u8 = 8;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_MUL: u8 = 9;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_CONCAT: u8 = 10;
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const BP_COLLATE: u8 = 11;
 
 fn perr<E>(offset: usize, kind: ParseKind) -> Error<E> {
@@ -94,43 +94,43 @@ struct Parser<'a> {
     /// The pin's LALR parser stack while the current construct is
     /// parsed: how many grammar symbols sit below it (v0.16; see
     /// `Parser::need`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     held: usize,
     /// The pin's tree height (`Expr.nHeight`) of the expression
     /// just parsed, and what kind of node it is (`EK_*`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     eh: usize,
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     ek: u8,
     /// The largest resolution depth (`Parser::sel_r`) of the
     /// subqueries met so far in the current resolved expression.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     rsub: usize,
     /// The select just parsed: its height as a subquery operand
     /// (`heightOfSelect`) and its resolution depth — the deepest
     /// sum of nested expression heights the pin's name resolution
     /// reaches inside it (`Parse.nHeight`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     sel_h: usize,
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     sel_r: usize,
     /// The select being parsed: its height and resolution depth so
     /// far (`sel_h` / `sel_r` once it is complete).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     acc_h: usize,
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     acc_r: usize,
     /// The current core's ON / USING terms, which the pin ANDs
     /// into its WHERE before resolving it (`sqlite3ProcessJoin`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     on: OnChain,
     /// Resolution depths are computed but not checked: a CREATE
     /// VIEW's body, which the pin resolves only when the view is
     /// read (`parse_view` reads one that way).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     defer: bool,
     /// Parsing a view's text to read it (`parse_view`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     view_use: bool,
     /// Parsing a CREATE VIEW body (v0.16 review fix): the pin keeps
     /// a view's tree in its reduced form, whose leaves lose their
@@ -138,10 +138,10 @@ struct Parser<'a> {
     /// `(SELECT 1)`'s `1`) adds 0 to the resolution depth there, 1
     /// elsewhere (probed: `SELECT <998 signs>(SELECT 1)` reads as a
     /// view, as a CTE only up to 997).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     reduced: bool,
     /// The tallest result column of the select core just parsed.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     core_h: usize,
     /// Parsing a trigger program (v0.16, `triggers`): `RAISE()` is
     /// legal only here.
@@ -160,7 +160,7 @@ struct Parser<'a> {
 /// terms' count, the first one's height, the best `height + 1 -
 /// position` of the others, and their deepest subquery
 /// resolution.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[derive(Debug, Clone, Copy, Default)]
 struct OnChain {
     n: usize,
@@ -169,7 +169,7 @@ struct OnChain {
     rsub: usize,
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 impl OnChain {
     fn push(&mut self, h: usize, rsub: usize) {
         self.n += 1;
@@ -210,11 +210,11 @@ impl OnChain {
 pub struct Limits {
     /// The deepest expression tree, counted as the pin counts
     /// `Expr.nHeight` (the pin: 1000; `Config::max_expr_depth`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub expr_depth: usize,
     /// The deepest parser stack, counted in the pin's LALR
     /// grammar symbols (the pin: 2500; `Config::max_parser_depth`).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     pub parser_depth: usize,
 }
 
@@ -222,20 +222,20 @@ impl Limits {
     /// The pin's limits: an expression tree 1000 deep, a parser
     /// stack of 2500 symbols.
     pub const PIN: Limits = Limits {
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         expr_depth: PIN_EXPR_DEPTH,
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         parser_depth: PIN_PARSER_DEPTH,
     };
 
     /// The expression-height limit (the pin's without the v0.4
     /// grammar).
     fn expr(&self) -> usize {
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             self.expr_depth
         }
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         {
             PIN_EXPR_DEPTH
         }
@@ -243,11 +243,11 @@ impl Limits {
 
     /// The parser-stack limit (likewise).
     fn stack(&self) -> usize {
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             self.parser_depth
         }
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         {
             PIN_PARSER_DEPTH
         }
@@ -265,14 +265,14 @@ pub const PIN_PARSER_DEPTH: usize = 2500;
 /// a result set, terms of an ORDER BY / GROUP BY, items of a SET.
 pub const MAX_COLUMN: usize = 2000;
 /// The pin's `SQLITE_MAX_FUNCTION_ARG` (this build: 1000).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub const MAX_FUNCTION_ARG: usize = 1000;
 /// The pin's `SQLITE_MAX_COMPOUND_SELECT`.
-#[cfg(feature = "v09")]
+#[cfg(feature = "sql")]
 pub const MAX_COMPOUND_SELECT: usize = 500;
 /// The pin's join limit ("at most 64 tables in a join", the
 /// planner's bitmask width).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub const MAX_JOIN_TABLES: usize = 64;
 /// The pin's `SQLITE_MAX_SQL_LENGTH` ("statement too long").
 pub const MAX_SQL_LENGTH: usize = 1_000_000_000;
@@ -281,28 +281,28 @@ pub const MAX_SQL_LENGTH: usize = 1_000_000_000;
 // them.
 /// No column reference and no subquery: the pin's
 /// `sqlite3ExprIsConstant` at parse time.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const EK_CONST: u8 = 1;
 /// A numeric, string or blob literal, possibly under unary `+` /
 /// `-`: `x ISNULL` over it folds to a literal.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const EK_LIT: u8 = 2;
 /// A unary `+` node (the pin re-uses it for a `+` / `-` above).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const EK_UPLUS: u8 = 4;
 /// A COLLATE node (an IN list item the pin does not rewrite).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const EK_COLLATE: u8 = 8;
 
 /// Record `h`, the height of a whole expression the pin resolves on
 /// its own (a result column, a WHERE tree, ...), on every subquery
 /// directly inside `e` (`SelectStmt::rctx`; v0.16 depth limits,
-/// `v16`): resolving that subquery's expressions starts that much
+/// `sql`): resolving that subquery's expressions starts that much
 /// deeper. Subqueries' own expressions were marked when they were
 /// parsed; the walk does not enter them, so each node is visited
 /// once per statement. Iterative: `e` may be as deep as the parser
 /// stack allows.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 fn mark_ctx(e: &mut Expr, h: usize) {
     let h32 = u32::try_from(h).unwrap_or(u32::MAX);
     let mut todo: AVec<&mut Expr> = AVec::new();
@@ -396,11 +396,11 @@ fn mark_ctx(e: &mut Expr, h: usize) {
 /// `word`: the term spells TRUE or FALSE, whose literal the pin
 /// never reads as an integer; a bare one is wrapped in a unary `+`
 /// so that it stays a constant.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 fn ordinal_term(e: &mut Expr, word: bool) {
-    #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
     let mut t = e;
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     while let Expr::Collate(inner, _) = t {
         t = inner;
     }
@@ -457,7 +457,7 @@ pub fn parse<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Ast, E> {
 /// checks it when it resolves the view; `parse` of a CREATE VIEW
 /// does not (the pin creates such a view and refuses only its
 /// readers).
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub fn parse_view<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Ast, E> {
     let toks = lex_checked::<E>(sql, arena)?;
     let mut p = Parser::new(toks, arena, sql, lim);
@@ -485,9 +485,9 @@ pub fn parse_params<E>(
     let ast = p.statement::<E>()?;
     p.expect_end::<E>()?;
     let stored = match &ast {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         Ast::CreateTable { as_select, .. } => as_select.is_none(),
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         Ast::CreateTable { .. } => true,
         Ast::AlterAddColumn { .. } | Ast::CreateView { .. } => true,
         // "parameters prohibited in index expressions / partial
@@ -507,11 +507,11 @@ pub fn parse_params<E>(
     Ok((ast, params))
 }
 
-/// `parse`, also returning the statement's tokens (v0.16, `v16`):
+/// `parse`, also returning the statement's tokens (v0.16, `sql`):
 /// every name in the tree is the handle of the token it was read
 /// from, so ALTER TABLE can map a resolved name back to its bytes
 /// in `sql` (`Token::offset`).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub fn parse_with_tokens<E>(
     sql: &[u8],
     arena: &Arena,
@@ -525,8 +525,8 @@ pub fn parse_with_tokens<E>(
 }
 
 /// `parse_expr_text`, also returning the expression's tokens
-/// (v0.16, `v16`; see `parse_with_tokens`).
-#[cfg(feature = "v16")]
+/// (v0.16, `sql`; see `parse_with_tokens`).
+#[cfg(feature = "sql")]
 pub fn parse_expr_with_tokens<E>(
     sql: &[u8],
     arena: &Arena,
@@ -543,10 +543,10 @@ pub fn parse_expr_with_tokens<E>(
     Ok((e, p.toks))
 }
 
-/// The tokens of `sql` (v0.16, `v16`): ALTER TABLE walks a stored
+/// The tokens of `sql` (v0.16, `sql`): ALTER TABLE walks a stored
 /// CREATE INDEX text by tokens (an expression or partial index is
 /// outside hipp's CREATE INDEX grammar).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub fn tokens<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
     lexer::lex::<E>(sql, arena)
 }
@@ -555,7 +555,7 @@ pub fn tokens<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
 /// a CHECK constraint, generated column or DEFAULT, re-parsed by
 /// the planner into `arena`. The whole input must be the one
 /// expression.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Expr, E> {
     let toks = lex_checked::<E>(sql, arena)?;
     let mut p = Parser::new(toks, arena, sql, lim);
@@ -576,13 +576,13 @@ pub fn parse_expr_text<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Expr
 /// are not kept. Returns that prefix and the name's byte offset;
 /// `None` for text that does not lex.
 ///
-/// Without `v16` it also refuses AUTOINCREMENT
+/// Without `sql` it also refuses AUTOINCREMENT
 /// (`Error::Unsupported`): those builds do not maintain the
 /// companion `sqlite_sequence` table, and a file holding an
 /// AUTOINCREMENT table without it is "malformed" to the pin on its
 /// next INSERT. The INSERT planner calls it on the target table's
 /// stored text for the same reason (an existing AUTOINCREMENT
-/// table is read-only there). With `v16` AUTOINCREMENT is
+/// table is read-only there). With `sql` AUTOINCREMENT is
 /// maintained (`has_autoincrement`). The word is reserved, so an
 /// unquoted occurrence is the clause.
 pub fn schema_text_start<E>(
@@ -593,7 +593,7 @@ pub fn schema_text_start<E>(
         return Ok(None);
     };
     let p = Parser::new(toks, arena, sql, Limits::PIN);
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     if (0..p.limit).any(|i| p.is_kw(i, b"AUTOINCREMENT")) {
         return Err(Error::Unsupported);
     }
@@ -632,7 +632,7 @@ pub fn schema_text_start<E>(
 /// Not built for the tiny profile (no table options, no indexes),
 /// whose stored text stays the statement minus its trailing `;` and
 /// whitespace.
-#[cfg(any(feature = "v16", feature = "indexes"))]
+#[cfg(any(feature = "sql", feature = "indexes"))]
 pub fn schema_text_end<E>(sql: &[u8], arena: &Arena) -> Option<usize> {
     let toks = lexer::lex::<E>(sql, arena).ok()?;
     let p = Parser::new(toks, arena, sql, Limits::PIN);
@@ -651,10 +651,10 @@ pub fn schema_text_end<E>(sql: &[u8], arena: &Arena) -> Option<usize> {
 }
 
 /// Whether a stored CREATE TABLE text declares AUTOINCREMENT
-/// (v0.16, `v16`): the word is reserved, so an unquoted
+/// (v0.16, `sql`): the word is reserved, so an unquoted
 /// occurrence can only be the PRIMARY KEY's clause. Text that
 /// does not lex has none.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 pub fn has_autoincrement<E>(sql: &[u8], arena: &Arena) -> bool {
     let Ok(toks) = lexer::lex::<E>(sql, arena) else {
         return false;
@@ -664,10 +664,10 @@ pub fn has_autoincrement<E>(sql: &[u8], arena: &Arena) -> bool {
 }
 
 /// Two `ON CONFLICT` clauses of one PRIMARY KEY / UNIQUE
-/// constraint (v0.16, `v07`): a repeated constraint takes the
+/// constraint (v0.16, `sql`): a repeated constraint takes the
 /// clause either one gives; two different clauses are the pin's
 /// "conflicting ON CONFLICT clauses specified".
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 fn merge_conflict<E>(
     a: Option<ConflictAction>,
     b: Option<ConflictAction>,
@@ -685,11 +685,11 @@ fn merge_conflict<E>(
 /// with the v0.4 grammar: the tiny profile's targets cannot hold
 /// such a statement (and its size ratchet pays for none).
 fn too_long<E>(len: usize) -> Result<(), E> {
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     if len > MAX_SQL_LENGTH {
         return Err(perr(0, ParseKind::StatementTooLong));
     }
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     let _ = len;
     Ok(())
 }
@@ -707,7 +707,7 @@ fn lex_checked<E>(sql: &[u8], arena: &Arena) -> Result<AVec<Token>, E> {
 /// parentheses parse there. A later column's sits two symbols
 /// higher on the pin (`columnlist ,`); hipp re-parses the stored
 /// text alone and counts the first column's.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 const RULE_HELD: usize = 7;
 
 /// The pin's parser stack below an INSERT's row source: the
@@ -721,7 +721,7 @@ const INS_BASE: usize = 6;
 const IDX_HELD: usize = 10;
 /// ... and below a RETURNING item of an INSERT without an upsert
 /// clause (`select RETURNING sclp scanpt`).
-#[cfg(feature = "v07")]
+#[cfg(feature = "sql")]
 const INS_RETURNING: usize = 10;
 
 impl<'a> Parser<'a> {
@@ -757,36 +757,36 @@ impl<'a> Parser<'a> {
             sql,
             lim,
             // The pin's bottom stack entry (state 0).
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             held: 1,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             eh: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             ek: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             rsub: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             sel_h: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             sel_r: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             acc_h: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             acc_r: 0,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             on: OnChain {
                 n: 0,
                 first: 0,
                 rest: 0,
                 rsub: 0,
             },
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             defer: false,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             view_use: false,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             reduced: false,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             core_h: 0,
             #[cfg(feature = "triggers")]
             in_trig: false,
@@ -822,7 +822,7 @@ impl<'a> Parser<'a> {
     /// `name.*` at the cursor (a result column): the qualifier. A
     /// bare wall-clock keyword never qualifies (the pin's CTIME_KW:
     /// `current_date.*` is a syntax error at the dot).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn table_star_at(&self) -> Option<ABytes> {
         let (h, quoted, _) = self.ident_at(self.pos)?;
         let t = self.toks.as_slice();
@@ -887,7 +887,7 @@ impl<'a> Parser<'a> {
     /// sequence". Not built for the tiny profile, which has no
     /// comparisons a collation could change (it skips the
     /// clause, as before v0.16).
-    #[cfg(any(feature = "v04", feature = "indexes"))]
+    #[cfg(any(feature = "query", feature = "indexes"))]
     fn coll_at<E>(&self, i: usize) -> Result<Coll, E> {
         let t = self
             .toks
@@ -914,7 +914,7 @@ impl<'a> Parser<'a> {
                 // hipp used to drop it and use `main.t`, where the
                 // pin finds no such table (or, for CREATE TABLE
                 // temp.t, makes a temporary one outside the file).
-                // v0.16 (`v16`): `temp.` too — the connection routes a
+                // v0.16 (`sql`): `temp.` too — the connection routes a
                 // statement naming the temp schema to its temp
                 // database (`session::temp`) before it plans it, so
                 // the planner never reads `temp.t` as `main.t`.
@@ -926,7 +926,7 @@ impl<'a> Parser<'a> {
                     let s = handle_bytes(self.arena, h);
                     if !cfg!(feature = "attach")
                         && !eq_ci(s, b"main")
-                        && !(cfg!(feature = "v16") && eq_ci(s, b"temp"))
+                        && !(cfg!(feature = "sql") && eq_ci(s, b"temp"))
                     {
                         return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                     }
@@ -950,17 +950,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Whether token `i` starts a `WITH` clause (v0.16, `v16`;
+    /// Whether token `i` starts a `WITH` clause (v0.16, `sql`;
     /// always false without it, so the clause stays a syntax
     /// error there).
     fn with_at(&self, i: usize) -> bool {
-        cfg!(feature = "v16") && self.is_kw(i, b"WITH")
+        cfg!(feature = "sql") && self.is_kw(i, b"WITH")
     }
 
-    /// `WITH [RECURSIVE] cte [, cte ...]` (v0.16, `v16`; the pin's
+    /// `WITH [RECURSIVE] cte [, cte ...]` (v0.16, `sql`; the pin's
     /// grammar): each CTE is `name [(col, ...)] AS [[NOT]
     /// MATERIALIZED] (select-stmt)`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     ///
     /// `hs` symbols sit below the WITH on the pin's stack; a body's
     /// resolution depth is checked where the body is read (see
@@ -1033,10 +1033,10 @@ impl<'a> Parser<'a> {
         Ok(crate::sql::ast::With { ctes })
     }
 
-    /// A statement led by a WITH clause (v0.16, `v16`): a select
+    /// A statement led by a WITH clause (v0.16, `sql`): a select
     /// statement keeps the clause itself; INSERT / REPLACE /
     /// UPDATE / DELETE are wrapped in `Ast::With`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn with_statement<E>(&mut self) -> Result<Ast, E> {
         let save = self.pos;
         #[cfg(feature = "explain")]
@@ -1066,9 +1066,9 @@ impl<'a> Parser<'a> {
     }
 
     /// `name`, also saying whether the `main.` qualifier was
-    /// written (v0.16, `v16`: a qualified name never denotes a
+    /// written (v0.16, `sql`: a qualified name never denotes a
     /// CTE).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn name_q<E>(&mut self) -> Result<(ABytes, bool, bool), E> {
         let qualified = matches!(
             self.toks.as_slice().get(self.pos + 1).map(|t| t.tok),
@@ -1080,7 +1080,7 @@ impl<'a> Parser<'a> {
 
     /// Whether `INDEXED BY` / `NOT INDEXED` starts here (v0.16):
     /// then `INDEXED` is no alias.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn at_index_hint(&self) -> bool {
         (self.cur_is_kw(b"INDEXED") && self.is_kw(self.pos + 1, b"BY"))
             || (self.cur_is_kw(b"NOT") && self.is_kw(self.pos + 1, b"INDEXED"))
@@ -1141,22 +1141,22 @@ impl<'a> Parser<'a> {
         } else if self.cur_is_kw(b"SELECT") {
             self.select::<E>()
         } else if self.with_at(self.pos) {
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             {
                 self.with_statement::<E>()
             }
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
         } else if self.cur_is_kw(b"VALUES") {
             // A standalone VALUES statement (v0.9): a select
             // statement whose first core is a VALUES core.
-            #[cfg(feature = "v09")]
+            #[cfg(feature = "sql")]
             {
                 Ok(Ast::Select(self.select_rich::<E>()?))
             }
-            #[cfg(not(feature = "v09"))]
+            #[cfg(not(feature = "sql"))]
             {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
@@ -1164,14 +1164,14 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             // BEGIN [TRANSACTION]; deferred/immediate/exclusive all
             // parse — the engine has one lock level in v0.2.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let immediate = !self.eat_kw(b"DEFERRED")
                 && (self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE"));
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             let _ =
                 self.eat_kw(b"DEFERRED") || self.eat_kw(b"IMMEDIATE") || self.eat_kw(b"EXCLUSIVE");
             let _ = self.eat_kw(b"TRANSACTION");
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if immediate {
                 return Ok(Ast::BeginImmediate);
             }
@@ -1183,31 +1183,31 @@ impl<'a> Parser<'a> {
         } else if self.cur_is_kw(b"ROLLBACK") {
             self.pos += 1;
             let _ = self.eat_kw(b"TRANSACTION");
-            // ROLLBACK TO [SAVEPOINT] <name> (v0.16, `v16`).
+            // ROLLBACK TO [SAVEPOINT] <name> (v0.16, `sql`).
             if self.cur_is_kw(b"TO") {
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 {
                     self.pos += 1;
                     let _ = self.eat_kw(b"SAVEPOINT");
                     let name = self.pragma_nm::<E>()?;
                     return Ok(Ast::RollbackTo { name });
                 }
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
             Ok(Ast::Rollback)
-        } else if cfg!(feature = "v16")
+        } else if cfg!(feature = "sql")
             && (self.cur_is_kw(b"SAVEPOINT")
                 || self.cur_is_kw(b"RELEASE")
                 || self.cur_is_kw(b"VACUUM")
                 || self.cur_is_kw(b"REINDEX")
                 || self.cur_is_kw(b"ANALYZE"))
         {
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             {
                 self.maint_stmt::<E>()
             }
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
@@ -1222,12 +1222,12 @@ impl<'a> Parser<'a> {
             {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
-        } else if cfg!(feature = "v16") && self.cur_is_kw(b"PRAGMA") {
-            #[cfg(feature = "v16")]
+        } else if cfg!(feature = "sql") && self.cur_is_kw(b"PRAGMA") {
+            #[cfg(feature = "sql")]
             {
                 self.pragma_stmt::<E>()
             }
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             {
                 Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
             }
@@ -1238,11 +1238,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The savepoint and maintenance statements (v0.16, `v16`):
+    /// The savepoint and maintenance statements (v0.16, `sql`):
     /// `SAVEPOINT nm`, `RELEASE [SAVEPOINT] nm`, `VACUUM [nm]
     /// [INTO expr]`, `REINDEX [nm [. nm]]`, `ANALYZE [nm [.
     /// nm]]`, with the current token on the keyword.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn maint_stmt<E>(&mut self) -> Result<Ast, E> {
         if self.eat_kw(b"SAVEPOINT") {
             let name = self.pragma_nm::<E>()?;
@@ -1325,11 +1325,11 @@ impl<'a> Parser<'a> {
         Ok(Ast::Attach { file, name, key })
     }
 
-    /// `PRAGMA [nm .] nm [= nmnum | ( nmnum )]` (v0.16, `v16`;
+    /// `PRAGMA [nm .] nm [= nmnum | ( nmnum )]` (v0.16, `sql`;
     /// the pin's grammar): `nmnum` is a signed number, a name
     /// (an identifier that is not a reserved word, or a string),
     /// or one of `ON`, `DELETE`, `DEFAULT`.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn pragma_stmt<E>(&mut self) -> Result<Ast, E> {
         self.pos += 1;
         let first = self.pragma_nm::<E>()?;
@@ -1364,7 +1364,7 @@ impl<'a> Parser<'a> {
 
     /// One PRAGMA name (`nm`): a non-reserved or quoted
     /// identifier, or a string.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn pragma_nm<E>(&mut self) -> Result<ABytes, E> {
         match self.cur().tok {
             Tok::Ident(h, q) if q || !self.reserved(self.pos, true) => {
@@ -1381,7 +1381,7 @@ impl<'a> Parser<'a> {
     }
 
     /// One PRAGMA argument (`nmnum` / `minus_num`) as text.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn pragma_value<E>(&mut self) -> Result<ABytes, E> {
         let minus = matches!(self.cur().tok, Tok::Minus);
         if minus || matches!(self.cur().tok, Tok::Plus) {
@@ -1467,73 +1467,73 @@ impl<'a> Parser<'a> {
     }
 
     // ---------------- v0.5 statement shims ----------------
-    // UPDATE, DELETE and DROP TABLE exist only under the `v05`
+    // UPDATE, DELETE and DROP TABLE exist only under the `write`
     // feature (the tiny profile's documented exclusion, SPEC §2);
     // the parsers live at the bottom of this file behind the
     // same cfg.
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     fn update_dispatch<E>(&mut self) -> Result<Ast, E> {
         self.update_stmt::<E>()
     }
 
-    #[cfg(not(feature = "v05"))]
+    #[cfg(not(feature = "write"))]
     fn update_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     fn delete_dispatch<E>(&mut self) -> Result<Ast, E> {
         self.delete_stmt::<E>()
     }
 
-    #[cfg(not(feature = "v05"))]
+    #[cfg(not(feature = "write"))]
     fn delete_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
-    #[cfg(feature = "v05")]
+    #[cfg(feature = "write")]
     fn drop_table_dispatch<E>(&mut self) -> Result<Ast, E> {
         self.drop_table::<E>()
     }
 
-    #[cfg(not(feature = "v05"))]
+    #[cfg(not(feature = "write"))]
     fn drop_table_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
     // ---------------- v0.4 statement shims ----------------
     // ALTER TABLE ADD COLUMN, CREATE VIEW and DROP VIEW exist
-    // only under the `v04` feature (the tiny profile's documented
+    // only under the `query` feature (the tiny profile's documented
     // exclusion, SPEC §2); the parsers live at the bottom of this
     // file behind the same cfg.
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn create_view_dispatch<E>(&mut self) -> Result<Ast, E> {
         self.create_view::<E>()
     }
 
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     fn create_view_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn drop_view_dispatch<E>(&mut self) -> Result<Ast, E> {
         self.drop_view::<E>()
     }
 
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     fn drop_view_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
 
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn alter_dispatch<E>(&mut self) -> Result<Ast, E> {
         self.alter_table::<E>()
     }
 
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     fn alter_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
@@ -1780,9 +1780,9 @@ impl<'a> Parser<'a> {
         };
         #[cfg(not(feature = "vtab"))]
         let name = self.name::<E>()?;
-        // CREATE TABLE ... AS SELECT (v0.16, `v16`): the columns
+        // CREATE TABLE ... AS SELECT (v0.16, `sql`): the columns
         // come from the SELECT at plan time.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.eat_kw(b"AS") {
             // `create_table AS select`.
             let select = self.select_at::<E>(3)?;
@@ -1807,9 +1807,9 @@ impl<'a> Parser<'a> {
         let mut pk_names: AVec<ABytes> = AVec::new();
         let mut pk_desc_names: AVec<ABytes> = AVec::new();
         let mut sets: AVec<ConstraintSet> = AVec::new();
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut checks: AVec<ABytes> = AVec::new();
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut fkeys: AVec<crate::sql::ast::ForeignKey> = AVec::new();
         // Column definitions first, then table constraints (the
         // pin's `columnlist conslist_opt`): a column after a table
@@ -1824,9 +1824,9 @@ impl<'a> Parser<'a> {
                 &mut pk_names,
                 &mut pk_desc_names,
                 &mut sets,
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 &mut checks,
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 &mut fkeys,
             )?;
             if in_cons && columns.len() != ncols {
@@ -1887,15 +1887,15 @@ impl<'a> Parser<'a> {
             // SQLite: "table has more than one primary key".
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
-        // Table options (v0.16, `v16`): a comma-separated list of
+        // Table options (v0.16, `sql`): a comma-separated list of
         // STRICT and WITHOUT ROWID, as on the pin (`STRICT,STRICT`
         // parses; `STRICT STRICT` does not). WITHOUT ROWID stays
         // outside every hipp phase and is refused.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut strict = false;
         #[cfg(feature = "without_rowid")]
         let mut without_rowid = false;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.cur_is_kw(b"STRICT") || self.cur_is_kw(b"WITHOUT") {
             loop {
                 if self.cur_is_kw(b"WITHOUT") {
@@ -1935,7 +1935,7 @@ impl<'a> Parser<'a> {
         #[cfg(not(feature = "indexes"))]
         let _ = without_rowid;
         // Trailing clauses: WITHOUT ROWID is outside v0.1.
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         if self.cur_is_kw(b"WITHOUT") {
             return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
         }
@@ -1945,15 +1945,15 @@ impl<'a> Parser<'a> {
             columns,
             pk_columns,
             constraint_sets: sets,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             checks,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             strict,
             #[cfg(feature = "without_rowid")]
             without_rowid,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             as_select: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             fkeys,
         })
     }
@@ -2007,7 +2007,7 @@ impl<'a> Parser<'a> {
                     .find(|k| indexed(k) && same(k))
             {
                 k.primary_key |= s.primary_key;
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 {
                     k.conflict = merge_conflict::<E>(k.conflict, s.conflict, self.cur().offset)?;
                 }
@@ -2042,7 +2042,7 @@ impl<'a> Parser<'a> {
     /// The SQL text inside the parenthesised group opening at
     /// token `k` (v0.16: CHECK and generated-column bodies),
     /// plus the index of its closing `)`.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn paren_text<E>(&self, k: usize, to: usize) -> Result<(usize, ABytes), E> {
         if k >= to || !matches!(self.toks.as_slice()[k].tok, Tok::LParen) {
             return Err(perr(self.item_end_offset(k), ParseKind::UnexpectedToken));
@@ -2114,7 +2114,7 @@ impl<'a> Parser<'a> {
         }
         let z = self.sql.get(t.offset..).unwrap_or(&[]);
         // Without the evaluator there are no `_` separators.
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         {
             let mut z = z;
             while let [b'0', rest @ ..] = z {
@@ -2129,7 +2129,7 @@ impl<'a> Parser<'a> {
         // The token's digits, without leading zeros and `_`
         // separators (v0.16: `-9_223_372_036_854_775_808` is
         // the INTEGER too).
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             let end = z
                 .iter()
@@ -2154,7 +2154,7 @@ impl<'a> Parser<'a> {
     /// Token `i` is a hexadecimal literal whose value is i64::MIN
     /// (`0x8000000000000000`, leading zeros allowed) — the one
     /// hex literal a minus sign cannot negate (v0.16).
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn hex_min(&self, i: usize) -> bool {
         match self.toks.as_slice().get(i) {
             Some(t) if matches!(t.tok, Tok::Integer(i64::MIN)) => {
@@ -2169,7 +2169,7 @@ impl<'a> Parser<'a> {
 
     /// A parameter token at the cursor, consumed (v0.16,
     /// `params`): the literal positions of the tiny grammar.
-    #[cfg(all(feature = "params", not(feature = "v04")))]
+    #[cfg(all(feature = "params", not(feature = "query")))]
     fn param_here(&mut self) -> Option<Expr> {
         match self.cur().tok {
             Tok::Param(i, h) => {
@@ -2231,7 +2231,7 @@ impl<'a> Parser<'a> {
             if innermost && self.min_magnitude(j) {
                 lit = Literal::Integer(i64::MIN);
             } else {
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 if innermost && self.hex_min(j) {
                     return None;
                 }
@@ -2252,7 +2252,7 @@ impl<'a> Parser<'a> {
     /// token `i`, spanning `used` tokens (`literal_at`), when the
     /// grammar folds it without parsing it as an expression (v0.16:
     /// the tiny grammar's literals, a parenthesised DEFAULT, a
-    /// LIMIT without `v16`): one parser-stack symbol per token over
+    /// LIMIT without `sql`): one parser-stack symbol per token over
     /// `held` ("Recursion limit"), and the tree height of its `+` /
     /// `-` nodes, `nodes` more sitting above them — a `+` over a `+`
     /// node re-uses it, a `-` over one turns it into a `-` node
@@ -2282,14 +2282,14 @@ impl<'a> Parser<'a> {
 
     // ---------------- v0.7 statement shim ----------------
     // The standalone `REPLACE` verb (== INSERT OR REPLACE) exists
-    // only under the `v07` feature.
+    // only under the `sql` feature.
 
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn replace_dispatch<E>(&mut self) -> Result<Ast, E> {
         self.insert::<E>(true)
     }
 
-    #[cfg(not(feature = "v07"))]
+    #[cfg(not(feature = "sql"))]
     fn replace_dispatch<E>(&mut self) -> Result<Ast, E> {
         Err(perr(self.cur().offset, ParseKind::UnsupportedStatement))
     }
@@ -2302,9 +2302,9 @@ impl<'a> Parser<'a> {
             ConflictAction::Replace
         } else {
             self.expect_kw::<E>(b"INSERT")?;
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             let c = self.conflict_clause::<E>()?;
-            #[cfg(not(feature = "v07"))]
+            #[cfg(not(feature = "sql"))]
             let c = ConflictAction::Abort;
             c
         };
@@ -2323,11 +2323,11 @@ impl<'a> Parser<'a> {
             }
             columns = Some(cols);
         }
-        // `INSERT INTO t DEFAULT VALUES` (v0.16, `v16`): one row
+        // `INSERT INTO t DEFAULT VALUES` (v0.16, `sql`): one row
         // of defaults — an empty target list with one empty VALUES
         // row. The pin allows no column list before it and no
         // ON CONFLICT after it (RETURNING is fine).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.cur_is_kw(b"DEFAULT") {
             self.pos += 1;
             if columns.is_some() {
@@ -2336,10 +2336,7 @@ impl<'a> Parser<'a> {
             self.expect_kw::<E>(b"VALUES")?;
             let mut rows = AVec::new();
             rows.push(AVec::new());
-            #[cfg(feature = "v07")]
             let returning = self.returning_clause::<E>(INS_RETURNING)?;
-            #[cfg(not(feature = "v07"))]
-            let returning = AVec::new();
             return Ok(Ast::Insert {
                 table,
                 columns: Some(AVec::new()),
@@ -2364,11 +2361,11 @@ impl<'a> Parser<'a> {
     }
 
     /// An INSERT's row source (v0.8): `VALUES (...)` rows, or —
-    /// under `v08` — a SELECT whose result rows are inserted.
+    /// under `sql` — a SELECT whose result rows are inserted.
     /// Without the feature a SELECT source is not consumed here
     /// and the statement fails at `expect_kw(VALUES)` exactly as
     /// before.
-    #[cfg(feature = "v08")]
+    #[cfg(feature = "sql")]
     fn insert_source<E>(&mut self) -> Result<InsertSource, E> {
         if self.cur_is_kw(b"SELECT") || self.with_at(self.pos) {
             return Ok(InsertSource {
@@ -2382,7 +2379,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    #[cfg(not(feature = "v08"))]
+    #[cfg(not(feature = "sql"))]
     fn insert_source<E>(&mut self) -> Result<InsertSource, E> {
         Ok(InsertSource {
             rows: self.values_rows::<E>(INS_BASE, true)?,
@@ -2404,7 +2401,7 @@ impl<'a> Parser<'a> {
     fn values_rows<E>(&mut self, base: usize, insert: bool) -> Result<AVec<AVec<Expr>>, E> {
         self.expect_kw::<E>(b"VALUES")?;
         let mut rows = AVec::new();
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut core_h = 1usize;
         // The pin's select numbers (v0.16, `explain`): each row is a
         // select of its own, after its subqueries; rows with none
@@ -2422,7 +2419,7 @@ impl<'a> Parser<'a> {
             loop {
                 let at = base + lp + if row.is_empty() { 0 } else { 2 };
                 row.push(self.value_expr::<E>(at)?);
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 {
                     core_h = core_h.max(self.eh);
                 }
@@ -2432,7 +2429,7 @@ impl<'a> Parser<'a> {
                 self.expect::<E>(Tok::RParen)?;
                 break;
             }
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             self.peak::<E>(base + lp + 2)?;
             rows.push(row);
             #[cfg(feature = "explain")]
@@ -2450,7 +2447,7 @@ impl<'a> Parser<'a> {
         if !subs && rows.len() > 1 {
             self.nsel.set(sel0.saturating_add(2));
         }
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             self.core_h = core_h;
             let wide = rows.iter().any(|r| r.len() > MAX_COLUMN);
@@ -2458,14 +2455,14 @@ impl<'a> Parser<'a> {
                 return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
             }
         }
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         let _ = insert;
         Ok(rows)
     }
 
     /// The optional `OR <action>` after INSERT / UPDATE (v0.7):
     /// absent is `Unset` (v0.16: the constraints' own clauses decide).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn conflict_clause<E>(&mut self) -> Result<ConflictAction, E> {
         if !self.eat_kw(b"OR") {
             return Ok(ConflictAction::Unset);
@@ -2477,9 +2474,9 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw(b"FAIL") {
             Ok(ConflictAction::Fail)
         } else if self.eat_kw(b"ROLLBACK") {
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             return Ok(ConflictAction::Rollback);
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             return Ok(ConflictAction::Abort);
         } else if self.eat_kw(b"ABORT") {
             Ok(ConflictAction::Abort)
@@ -2490,9 +2487,9 @@ impl<'a> Parser<'a> {
 
     /// What may follow an INSERT's VALUES rows (v0.7): an
     /// optional `ON CONFLICT` upsert clause, then an optional
-    /// `RETURNING` clause. Without the `v07` feature nothing may
+    /// `RETURNING` clause. Without the `sql` feature nothing may
     /// follow (the caller's `expect_end` rejects trailing input).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn insert_tail<E>(&mut self) -> Result<(Option<Box<Upsert>>, AVec<SelectItem>), E> {
         let upsert = if self.eat_kw(b"ON") {
             Some(Box::new(self.upsert_clause::<E>()?))
@@ -2515,7 +2512,7 @@ impl<'a> Parser<'a> {
         Ok((upsert, returning))
     }
 
-    #[cfg(not(feature = "v07"))]
+    #[cfg(not(feature = "sql"))]
     fn insert_tail<E>(&mut self) -> Result<(Option<Box<Upsert>>, AVec<SelectItem>), E> {
         Ok((None, AVec::new()))
     }
@@ -2523,7 +2520,7 @@ impl<'a> Parser<'a> {
     /// `CONFLICT [(col, ...)] [WHERE expr] DO NOTHING | DO
     /// UPDATE SET ... [WHERE expr]` — the leading `ON` is eaten
     /// by the caller (v0.7).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn upsert_clause<E>(&mut self) -> Result<Upsert, E> {
         self.expect_kw::<E>(b"CONFLICT")?;
         let mut target = AVec::new();
@@ -2627,7 +2624,7 @@ impl<'a> Parser<'a> {
     ///
     /// `held` symbols sit below an item on the pin's parser stack
     /// (`RETURNING sclp scanpt`).
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn returning_clause<E>(&mut self, held: usize) -> Result<AVec<SelectItem>, E> {
         let mut items = AVec::new();
         if !self.eat_kw(b"RETURNING") {
@@ -2655,15 +2652,15 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
-    /// One INSERT value: a full expression under `v04`, a plain
+    /// One INSERT value: a full expression under `query`, a plain
     /// literal otherwise.
     /// `held` symbols sit below it on the pin's parser stack.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     fn value_expr<E>(&mut self, held: usize) -> Result<Expr, E> {
         self.item::<E>(held)
     }
 
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     fn value_expr<E>(&mut self, held: usize) -> Result<Expr, E> {
         #[cfg(feature = "params")]
         if let Some(e) = self.param_here() {
@@ -2683,7 +2680,7 @@ impl<'a> Parser<'a> {
     /// re-uses it, a `-` over one turns it into a `-` node
     /// ("Expression tree is too large"). `None` (nothing consumed)
     /// when no literal starts here.
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     ///
     /// `nodes` more nodes sit above the run in the pin's tree (the
     /// `=` of `WHERE col = literal`).
@@ -2699,11 +2696,11 @@ impl<'a> Parser<'a> {
     // ---------------- SELECT ----------------
 
     fn select<E>(&mut self) -> Result<Ast, E> {
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         {
             Ok(Ast::Select(self.select_rich::<E>()?))
         }
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         {
             self.select_simple::<E>()
         }
@@ -2712,7 +2709,7 @@ impl<'a> Parser<'a> {
     /// The pre-v0.4 SELECT grammar (kept for the tiny profile):
     /// `SELECT * | col, ... FROM t [WHERE col = literal]`, in the
     /// v0.4 AST shape.
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     fn select_simple<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"SELECT")?;
         let mut items = AVec::new();
@@ -2748,11 +2745,11 @@ impl<'a> Parser<'a> {
             kind: JoinKind::Inner,
             on: None,
             derived: None,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             natural: false,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             using: AVec::new(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             args: None,
             #[cfg(feature = "attach")]
             schema: None,
@@ -2805,9 +2802,9 @@ impl<'a> Parser<'a> {
     }
 }
 
-// ================= v0.4 grammar (feature = "v04") =================
+// ================= v0.4 grammar (feature = "query") =================
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 impl<'a> Parser<'a> {
     /// True when the current token is an unquoted identifier whose
     /// text is a clause keyword that must not be eaten as a bare
@@ -2841,11 +2838,11 @@ impl<'a> Parser<'a> {
         match self.ident_at(self.pos) {
             Some((h, false, _)) => {
                 let b = handle_bytes(self.arena, h);
-                // RETURNING (v0.16 fix, v07 grammar) ends an
+                // RETURNING (v0.16 fix, `sql` grammar) ends an
                 // UPDATE ... FROM source list: `FROM s RETURNING v`
                 // used to alias `s` as RETURNING.
                 KWS.iter().any(|k| eq_ci(b, k))
-                    || (cfg!(feature = "v07") && eq_ci(b, b"RETURNING"))
+                    || (cfg!(feature = "sql") && eq_ci(b, b"RETURNING"))
                     || (cfg!(feature = "window") && self.window_clause_at(self.pos))
             }
             _ => false,
@@ -2868,12 +2865,12 @@ impl<'a> Parser<'a> {
     }
 
     /// An optional `[AS] name` alias: a quoted identifier, or a
-    /// bare identifier that is not a clause keyword. Under `v16`
+    /// bare identifier that is not a clause keyword. Under `sql`
     /// a string literal works too, with or without AS (the pin's
     /// `as ::= AS nm | ids`, where both admit a STRING token):
     /// `SELECT a AS 'q'`, `FROM t 'x'`.
     fn opt_alias(&mut self) -> Option<ABytes> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             let at = if self.cur_is_kw(b"AS") { 1 } else { 0 };
             if let Some(Tok::Text(h)) = self.toks.as_slice().get(self.pos + at).map(|t| t.tok) {
@@ -3023,10 +3020,10 @@ impl<'a> Parser<'a> {
     /// `acc_r`). Returns the expression; `eh` / `rsub` stay set
     /// for the caller.
     fn item<E>(&mut self, held: usize) -> Result<Expr, E> {
-        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
         let mut e = self.raw::<E>(held)?;
         self.fold_item::<E>(true)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         mark_ctx(&mut e, self.eh);
         Ok(e)
     }
@@ -3073,7 +3070,7 @@ impl<'a> Parser<'a> {
             });
         ordinal_term(&mut e, word);
         self.fold_item::<E>(!matches!(e, Expr::Literal(Literal::Integer(_))))?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         mark_ctx(&mut e, self.eh);
         Ok(e)
     }
@@ -3094,7 +3091,7 @@ impl<'a> Parser<'a> {
     /// A subquery's select statement with `k` more symbols below
     /// it; afterwards `sel_h` / `sel_r` describe it and `rsub`
     /// includes its resolution depth.
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     fn subquery<E>(&mut self, k: usize) -> Result<SelectStmt, E> {
         let h0 = self.held;
         self.held = h0.saturating_add(k);
@@ -3175,7 +3172,7 @@ impl<'a> Parser<'a> {
         Some(match self.cur().tok {
             Tok::Eq | Tok::Ne => BP_EQ,
             Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge => BP_REL,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Tok::BitAnd | Tok::BitOr | Tok::Shl | Tok::Shr => BP_BIT,
             Tok::Plus | Tok::Minus => BP_ADD,
             Tok::Star | Tok::Slash | Tok::Percent => BP_MUL,
@@ -3195,7 +3192,7 @@ impl<'a> Parser<'a> {
                     if self.is_kw(n, b"IN")
                         || self.is_kw(n, b"LIKE")
                         || self.is_kw(n, b"BETWEEN")
-                        || (cfg!(feature = "v16")
+                        || (cfg!(feature = "sql")
                             && (self.is_kw(n, b"GLOB") || self.is_kw(n, b"NULL")))
                         || (cfg!(feature = "fts5") && self.is_kw(n, b"MATCH"))
                     {
@@ -3213,11 +3210,11 @@ impl<'a> Parser<'a> {
                 ]
                 .iter()
                 .any(|k| eq_ci(b, k))
-                    || (cfg!(feature = "v16") && eq_ci(b, b"GLOB"))
+                    || (cfg!(feature = "sql") && eq_ci(b, b"GLOB"))
                     || (cfg!(feature = "fts5") && eq_ci(b, b"MATCH"))
                 {
                     BP_EQ
-                } else if cfg!(feature = "v16") && eq_ci(b, b"COLLATE") {
+                } else if cfg!(feature = "sql") && eq_ci(b, b"COLLATE") {
                     BP_COLLATE
                 } else {
                     return None;
@@ -3244,7 +3241,7 @@ impl<'a> Parser<'a> {
         if bp == BP_EQ && matches!(self.cur().tok, Tok::Ident(..)) {
             return self.expr_eq_kw::<E>(l);
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if bp == BP_COLLATE {
             self.pos += 1;
             let c = self.coll_at::<E>(self.pos)?;
@@ -3281,13 +3278,13 @@ impl<'a> Parser<'a> {
             Tok::Le => BinOp::Le,
             Tok::Gt => BinOp::Gt,
             Tok::Ge => BinOp::Ge,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Tok::BitAnd => BinOp::BitAnd,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Tok::BitOr => BinOp::BitOr,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Tok::Shl => BinOp::Shl,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Tok::Shr => BinOp::Shr,
             Tok::Plus => BinOp::Add,
             Tok::Minus => BinOp::Sub,
@@ -3340,16 +3337,16 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw(b"IS") {
             let neg = self.eat_kw(b"NOT");
-            // `IS [NOT] DISTINCT FROM` (v0.16, `v16`): `IS NOT
+            // `IS [NOT] DISTINCT FROM` (v0.16, `sql`): `IS NOT
             // DISTINCT FROM` is IS, `IS DISTINCT FROM` is IS NOT.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let (neg, distinct) = if self.eat_kw(b"DISTINCT") {
                 self.expect_kw::<E>(b"FROM")?;
                 (!neg, true)
             } else {
                 (neg, false)
             };
-            #[cfg(not(feature = "v16"))]
+            #[cfg(not(feature = "sql"))]
             let distinct = false;
             // `expr IS [NOT] [DISTINCT FROM] expr`.
             let k = 2 + usize::from(neg != distinct) + 2 * usize::from(distinct);
@@ -3387,8 +3384,8 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Binary(op, Box::new(l), Box::new(r)));
         }
         let neg = self.eat_kw(b"NOT");
-        // Postfix `NOT NULL` (v0.16, `v16`): NOTNULL.
-        #[cfg(feature = "v16")]
+        // Postfix `NOT NULL` (v0.16, `sql`): NOTNULL.
+        #[cfg(feature = "sql")]
         if neg && self.cur_is_kw(b"NULL") {
             self.pos += 1;
             // `expr NOT NULL`.
@@ -3402,9 +3399,9 @@ impl<'a> Parser<'a> {
             // `expr likeop expr [ESCAPE expr]`: the pin's
             // `like(pattern, x[, escape])` function node.
             let r = self.operand::<E>(2, BP_REL)?;
-            // `x LIKE p ESCAPE e` (v0.16, `v16`) is the pin's
+            // `x LIKE p ESCAPE e` (v0.16, `sql`) is the pin's
             // `like(p, x, e)` call, negated for NOT LIKE.
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if self.eat_kw(b"ESCAPE") {
                 let (rh, rk) = (self.eh, self.ek);
                 let esc = self.operand::<E>(4, BP_REL)?;
@@ -3416,9 +3413,9 @@ impl<'a> Parser<'a> {
             self.negated::<E>(neg)?;
             return Ok(Expr::Like(Box::new(l), Box::new(r), neg));
         }
-        // `x [NOT] GLOB p` (v0.16, `v16`): the pin's
+        // `x [NOT] GLOB p` (v0.16, `sql`): the pin's
         // `glob(p, x)` call (no ESCAPE form).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.eat_kw(b"GLOB") {
             let r = self.operand::<E>(2, BP_REL)?;
             self.node::<E>(lh, lk)?;
@@ -3458,14 +3455,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// The right side of `x [NOT] IN`: a table name (`v16`), a
+    /// The right side of `x [NOT] IN`: a table name (`sql`), a
     /// parenthesised subquery, or an expression list.
     fn expr_in<E>(&mut self, l: Expr, neg: bool) -> Result<Expr, E> {
         let (lh, lk) = (self.eh, self.ek);
-        // `x IN tablename` (v0.16, `v16`): the pin reads it as
+        // `x IN tablename` (v0.16, `sql`): the pin reads it as
         // `x IN (SELECT * FROM tablename)` — a one-column table
         // is required at plan time.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Tok::Ident(..) = self.cur().tok {
             let (table, qualified, in_temp) = self.name_q::<E>()?;
             // `expr in_op nm dbnm paren_exprlist`; the subquery's
@@ -3497,7 +3494,7 @@ impl<'a> Parser<'a> {
             extra_parens += 1;
         }
         let is_subquery = self.cur_is_kw(b"SELECT")
-            || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            || (cfg!(feature = "sql") && self.cur_is_kw(b"VALUES"))
             || self.with_at(self.pos);
         if !is_subquery {
             // An expression list whose first item is
@@ -3506,10 +3503,10 @@ impl<'a> Parser<'a> {
             self.pos = save;
             extra_parens = 0;
         }
-        #[cfg(not(feature = "v06"))]
+        #[cfg(not(feature = "sql"))]
         let _ = extra_parens;
         if is_subquery {
-            #[cfg(feature = "v06")]
+            #[cfg(feature = "sql")]
             {
                 // `expr in_op LP select RP` (each further `(` one
                 // more symbol: a scalar-subquery list item the pin
@@ -3538,7 +3535,7 @@ impl<'a> Parser<'a> {
                 #[cfg(feature = "explain")]
                 self.nsel.set(sel0);
             }
-            #[cfg(not(feature = "v06"))]
+            #[cfg(not(feature = "sql"))]
             {
                 return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
             }
@@ -3596,9 +3593,9 @@ impl<'a> Parser<'a> {
     }
 
     /// A LIKE ... ESCAPE / GLOB operator as the pin's function
-    /// call (v0.16, `v16`): `name(pattern, subject[, escape])`,
+    /// call (v0.16, `sql`): `name(pattern, subject[, escape])`,
     /// wrapped in NOT for the negated form.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn pattern_call<E>(
         &mut self,
         name: &[u8],
@@ -3655,7 +3652,7 @@ impl<'a> Parser<'a> {
                 self.sign_node::<E>(true)?;
                 Ok(Expr::Pos(Box::new(e)))
             }
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             Tok::BitNot => {
                 self.pos += 1;
                 let e = self.unary_operand::<E>()?;
@@ -3753,7 +3750,6 @@ impl<'a> Parser<'a> {
     /// stays small.
     fn expr_primary<E>(&mut self) -> Result<Expr, E> {
         match self.cur().tok {
-            #[cfg(feature = "v04")]
             Tok::HexTooBig => {
                 let off = self.cur().offset;
                 self.pos += 1;
@@ -3770,7 +3766,7 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Param(i, h))
             }
             Tok::Ident(h, quoted) => {
-                #[cfg(feature = "v06")]
+                #[cfg(feature = "sql")]
                 if self.cur_is_kw(b"EXISTS") {
                     return self.expr_exists::<E>();
                 }
@@ -3798,7 +3794,7 @@ impl<'a> Parser<'a> {
                         distinct: false,
                         star: false,
                         args: AVec::new(),
-                        #[cfg(feature = "v16")]
+                        #[cfg(feature = "sql")]
                         clause: None,
                     });
                 }
@@ -3842,10 +3838,10 @@ impl<'a> Parser<'a> {
             match self.cur().tok {
                 Tok::Ident(h2, _) => {
                     self.pos += 1;
-                    // `nm DOT nm DOT nm` (v0.16, `v16`): a column of
+                    // `nm DOT nm DOT nm` (v0.16, `sql`): a column of
                     // table `h2` in database `h` — the pin's DOT node
                     // over a leaf and another DOT.
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     if matches!(self.cur().tok, Tok::Dot)
                         && let Some(Tok::Ident(h3, _)) =
                             self.toks.as_slice().get(self.pos + 1).map(|t| t.tok)
@@ -3866,7 +3862,7 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Column {
                         table: Some(h),
                         name: h2,
-                        #[cfg(feature = "v16")]
+                        #[cfg(feature = "sql")]
                         schema: None,
                     });
                 }
@@ -3878,13 +3874,13 @@ impl<'a> Parser<'a> {
         Ok(Expr::Column {
             table: None,
             name: h,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             schema: None,
         })
     }
 
     /// `EXISTS (select)` (v0.6).
-    #[cfg(feature = "v06")]
+    #[cfg(feature = "sql")]
     #[inline(never)]
     fn expr_exists<E>(&mut self) -> Result<Expr, E> {
         self.pos += 1;
@@ -3895,7 +3891,7 @@ impl<'a> Parser<'a> {
             extra_parens += 1;
         }
         if !self.cur_is_kw(b"SELECT")
-            && !(cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            && !(cfg!(feature = "sql") && self.cur_is_kw(b"VALUES"))
             && !self.with_at(self.pos)
         {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
@@ -3903,7 +3899,7 @@ impl<'a> Parser<'a> {
         // `EXISTS LP select RP`.
         #[allow(unused_mut)]
         let mut stmt = self.subquery::<E>(2 + extra_parens)?;
-        #[cfg(all(feature = "expr_index", feature = "v09"))]
+        #[cfg(feature = "expr_index")]
         {
             stmt.first_row = true;
         }
@@ -3916,19 +3912,19 @@ impl<'a> Parser<'a> {
     }
 
     /// `( ... )`: a scalar subquery, a parenthesised expression or
-    /// (`v16`) a row value.
+    /// (`sql`) a row value.
     #[inline(never)]
     fn expr_paren<E>(&mut self) -> Result<Expr, E> {
         self.pos += 1;
         if self.cur_is_kw(b"SELECT")
-            || (cfg!(feature = "v09") && self.cur_is_kw(b"VALUES"))
+            || (cfg!(feature = "sql") && self.cur_is_kw(b"VALUES"))
             || self.with_at(self.pos)
         {
             return self.paren_subquery::<E>();
         }
         // `LP expr RP` (no node of its own).
         let e = self.operand_expr::<E>(1)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if matches!(self.cur().tok, Tok::Comma) {
             return self.paren_vector::<E>(e);
         }
@@ -3940,11 +3936,11 @@ impl<'a> Parser<'a> {
     /// `LP select RP`: a scalar subquery.
     #[inline(never)]
     fn paren_subquery<E>(&mut self) -> Result<Expr, E> {
-        #[cfg(feature = "v06")]
+        #[cfg(feature = "sql")]
         {
             #[allow(unused_mut)]
             let mut stmt = self.subquery::<E>(1)?;
-            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            #[cfg(feature = "expr_index")]
             {
                 stmt.first_row = true;
             }
@@ -3953,16 +3949,16 @@ impl<'a> Parser<'a> {
             self.set_h::<E>(self.sel_h + 1, 0)?;
             Ok(Expr::ScalarSubquery(Box::new(stmt)))
         }
-        #[cfg(not(feature = "v06"))]
+        #[cfg(not(feature = "sql"))]
         {
             Err(perr(self.cur().offset, ParseKind::UnsupportedClause))
         }
     }
 
     /// The rest of a row value `(a, b, ...)` after its first
-    /// element (v0.16, `v16`): `LP nexprlist COMMA expr RP`, a node
+    /// element (v0.16, `sql`): `LP nexprlist COMMA expr RP`, a node
     /// of height 1 on the pin whatever its elements.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     #[inline(never)]
     fn paren_vector<E>(&mut self, first: Expr) -> Result<Expr, E> {
         let mut k = self.ek;
@@ -4066,16 +4062,16 @@ impl<'a> Parser<'a> {
     }
 
     /// A function call `name(...)`: `*`, `DISTINCT`, the
-    /// arguments, the aggregate ORDER BY and FILTER (`v16`).
+    /// arguments, the aggregate ORDER BY and FILTER (`sql`).
     #[inline(never)]
     fn expr_call<E>(&mut self, fname: ABytes) -> Result<Expr, E> {
         self.pos += 2; // name + '('
         let star = self.eat(Tok::Star);
         let distinct = !star && self.eat_kw(b"DISTINCT");
         let mut args = AVec::new();
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let no_args = self.cur_is_kw(b"ORDER");
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let no_args = false;
         // `idj LP distinct [nexprlist COMMA] expr`: the first
         // argument three symbols up, later ones five.
@@ -4094,7 +4090,7 @@ impl<'a> Parser<'a> {
         if args.len() > MAX_FUNCTION_ARG {
             return Err(perr(self.cur().offset, ParseKind::TooManyArguments));
         }
-        // `f(args ORDER BY ...)` (v0.16, `v16`): the pin's
+        // `f(args ORDER BY ...)` (v0.16, `sql`): the pin's
         // grammar takes it after a (possibly empty) argument
         // list, not after `*` (`count(* ORDER BY x)` is a
         // syntax error there). With no arguments the pin's
@@ -4103,9 +4099,9 @@ impl<'a> Parser<'a> {
         // (review fix: it was refused). Its terms (`idj LP
         // distinct exprlist ORDER BY sortlist`) add nothing to
         // the call's height.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let clause = self.call_clauses::<E>(star, args.is_empty())?;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         {
             self.expect::<E>(Tok::RParen)?;
             self.need::<E>(if star { 4 } else { 5 })?;
@@ -4116,15 +4112,15 @@ impl<'a> Parser<'a> {
             distinct,
             star,
             args,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             clause,
         })
     }
 
-    /// A call's tail after its arguments (v0.16, `v16`): the
+    /// A call's tail after its arguments (v0.16, `sql`): the
     /// aggregate ORDER BY, the `)` and FILTER. Neither clause adds
     /// to the call's height.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     #[inline(never)]
     fn call_clauses<E>(
         &mut self,
@@ -4469,7 +4465,7 @@ impl<'a> Parser<'a> {
     /// A full select statement (v0.9 shape): one core, an
     /// optional compound tail, and the trailing ORDER BY /
     /// LIMIT that belong to the whole statement. Without the
-    /// `v09` feature this is exactly the pre-v0.9 single core
+    /// `sql` feature this is exactly the pre-v0.9 single core
     /// plus its tail.
     ///
     /// `held` is the pin's parser stack below it; afterwards
@@ -4479,11 +4475,11 @@ impl<'a> Parser<'a> {
         let saved = (self.acc_h, self.acc_r, self.rsub, self.on);
         self.acc_h = 0;
         self.acc_r = 0;
-        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
         let mut r = self.select_body::<E>();
         (self.sel_h, self.sel_r) = (self.acc_h, self.acc_r);
         (self.acc_h, self.acc_r, self.rsub, self.on) = saved;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if let Ok(s) = &mut r {
             s.rdepth = u32::try_from(self.sel_r).unwrap_or(u32::MAX);
         }
@@ -4494,7 +4490,7 @@ impl<'a> Parser<'a> {
         let hs = self.held;
         // `select ::= WITH [RECURSIVE] wqlist selectnowith`: the
         // cores sit two symbols up (three after RECURSIVE).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let (with, base) = if self.with_at(self.pos) {
             let recursive = self.is_kw(self.pos + 1, b"RECURSIVE");
             let w = self.with_clause::<E>(hs)?;
@@ -4502,10 +4498,10 @@ impl<'a> Parser<'a> {
         } else {
             (None, hs)
         };
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let base = hs;
         let mut head = self.select_core::<E>(base)?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             head.with = with;
         }
@@ -4515,13 +4511,13 @@ impl<'a> Parser<'a> {
         // compound has an ORDER BY (UNION ALL alone adds none):
         // `pending` is the tallest result column of the members not
         // known yet to be such operands.
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         let mut pending = self.core_h;
         // The base of the last core: `selectnowith
         // multiselect_op oneselect` puts a later one two up.
-        #[cfg_attr(not(feature = "v09"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
         let mut last = base;
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         {
             let mut compound: AVec<(CompoundOp, SelectStmt)> = AVec::new();
             loop {
@@ -4579,7 +4575,7 @@ impl<'a> Parser<'a> {
             Some((_, c)) => c.sel = self.core_sel(c),
             None => head.sel = self.core_sel(&head),
         }
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if !head.compound.is_empty() && !head.order_by.is_empty() {
             self.sorted_members::<E>(pending)?;
         }
@@ -4589,7 +4585,7 @@ impl<'a> Parser<'a> {
         // `SF_Values` exemption; v0.16 review fix — probed: 600
         // SELECTs then `VALUES(1)` read, then `VALUES(1),(2)` do
         // not).
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if head.compound.len() >= MAX_COMPOUND_SELECT
             && head
                 .compound
@@ -4604,7 +4600,7 @@ impl<'a> Parser<'a> {
 
     /// Compound members whose result columns reach height `h` go
     /// through the pin's sorter, which puts a node over each.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     fn sorted_members<E>(&self, h: usize) -> Result<(), E> {
         if h.saturating_add(1) > self.lim.expr_depth && h > 0 {
             return Err(perr(self.cur().offset, ParseKind::ExprTooDeep));
@@ -4612,14 +4608,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// One compound operand: a SELECT core or — under `v09` —
+    /// One compound operand: a SELECT core or — under `sql` —
     /// a VALUES core, with no ORDER BY / LIMIT / compound of
     /// its own (the pin gives cores none: `SELECT ... ORDER BY
     /// ... UNION ...` fails there with "ORDER BY clause should
     /// come after UNION"). `base` symbols sit below it on the
     /// pin's stack.
     fn select_core<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if self.cur_is_kw(b"VALUES") {
             return self.values_core::<E>(base);
         }
@@ -4628,7 +4624,7 @@ impl<'a> Parser<'a> {
 
     /// A `VALUES (row), (row), ...` core (v0.9): values are
     /// full expressions, as in the INSERT grammar.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     fn values_core<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
         let values = self.values_rows::<E>(base, false)?;
         Ok(SelectStmt {
@@ -4643,17 +4639,17 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             with: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rctx: 0,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rdepth: 0,
             #[cfg(feature = "window")]
             windows: AVec::new(),
             #[cfg(feature = "explain")]
             sel: 0,
-            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            #[cfg(feature = "expr_index")]
             first_row: false,
         })
     }
@@ -4697,7 +4693,7 @@ impl<'a> Parser<'a> {
             return Err(perr(self.cur().offset, ParseKind::TooManyColumns));
         }
         // `SELECT distinct selcollist FROM`.
-        #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
         let mut from = if self.eat_kw(b"FROM") {
             self.source_list::<E>(base + 4)?
         } else {
@@ -4711,24 +4707,24 @@ impl<'a> Parser<'a> {
         // `SELECT distinct selcollist from WHERE expr`: the pin
         // resolves the WHERE with the ON / USING terms ANDed in.
         let (filter, wh) = if self.eat_kw(b"WHERE") {
-            #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+            #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
             let mut w = self.raw::<E>(base + 5)?;
             self.fold_item::<E>(false)?;
             let wh = self.where_depth::<E>(Some(self.eh))?;
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             mark_ctx(&mut w, wh);
             (Some(w), wh)
         } else {
             (None, self.where_depth::<E>(None)?)
         };
         // The ON / USING terms are resolved inside that WHERE tree.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         for f in from.as_mut_slice() {
             if let Some(on) = &mut f.on {
                 mark_ctx(on, wh);
             }
         }
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let _ = wh;
         let mut group_by = AVec::new();
         if self.eat_kw(b"GROUP") {
@@ -4771,17 +4767,17 @@ impl<'a> Parser<'a> {
             offset: None,
             compound: AVec::new(),
             values: AVec::new(),
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             with: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rctx: 0,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             rdepth: 0,
             #[cfg(feature = "window")]
             windows,
             #[cfg(feature = "explain")]
             sel: 0,
-            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            #[cfg(feature = "expr_index")]
             first_row: false,
         })
     }
@@ -4807,7 +4803,7 @@ impl<'a> Parser<'a> {
     }
 
     /// A comma-separated ORDER BY term list after `ORDER BY`:
-    /// the statement's (v0.4) and, under `v16`, an aggregate's
+    /// the statement's (v0.4) and, under `sql`, an aggregate's
     /// own `f(args ORDER BY ...)` (the same grammar on the pin).
     /// `held` symbols sit below the first term on the pin's stack
     /// (`sortlist COMMA` two more below the others); a statement's
@@ -4825,11 +4821,11 @@ impl<'a> Parser<'a> {
                 self.peak::<E>(self.held)?;
                 let r = self.parse_expr::<E>();
                 self.held = h0;
-                #[cfg_attr(not(feature = "v16"), allow(unused_mut))]
+                #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
                 let mut e = r?;
                 // An aggregate's or window's term: inside a call, the
                 // whole item's height is marked over this later.
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 mark_ctx(&mut e, self.eh);
                 e
             };
@@ -4903,9 +4899,9 @@ impl<'a> Parser<'a> {
             self.set_h::<E>(h + 1, 0)?;
             self.rsub = rsub;
             self.fold_item::<E>(true)?;
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             let (mut first, mut second) = (first, second);
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             {
                 mark_ctx(&mut first, h + 1);
                 if let Some(x) = &mut second {
@@ -4932,16 +4928,16 @@ impl<'a> Parser<'a> {
     }
 
     /// One LIMIT / OFFSET term: an integer literal (v0.4), or —
-    /// under `v16` — any expression; the planner resolves it
+    /// under `sql` — any expression; the planner resolves it
     /// against an empty scope (the pin: a LIMIT may not name a
     /// column) and the executor converts its value with the
     /// pin's `MustBeInt` rule. `held` symbols sit below it.
     fn limit_term<E>(&mut self, held: usize) -> Result<Box<Expr>, E> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             Ok(Box::new(self.raw::<E>(held)?))
         }
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         match self.literal_at(self.pos) {
             Some((lit @ Literal::Integer(_), used)) => {
                 // The LIMIT node sits above the run.
@@ -4957,7 +4953,7 @@ impl<'a> Parser<'a> {
 
     /// `SELECT * FROM <table>` as an AST (v0.16: the subquery an
     /// `x IN table` operand stands for).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn table_select(&self, table: ABytes, qualified: bool, in_temp: bool) -> SelectStmt {
         let mut items = AVec::new();
         items.push(SelectItem::Star);
@@ -4977,7 +4973,7 @@ impl<'a> Parser<'a> {
             schema: self.last_schema,
             cte: None,
             indexed: None,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             flat: false,
         });
         SelectStmt {
@@ -4999,7 +4995,7 @@ impl<'a> Parser<'a> {
             windows: AVec::new(),
             #[cfg(feature = "explain")]
             sel: self.next_sel(),
-            #[cfg(all(feature = "expr_index", feature = "v09"))]
+            #[cfg(feature = "expr_index")]
             first_row: false,
         }
     }
@@ -5152,7 +5148,7 @@ impl<'a> Parser<'a> {
         first: bool,
         fb: usize,
     ) -> Result<FromSource, E> {
-        #[cfg(feature = "v09")]
+        #[cfg(feature = "sql")]
         if let Some(src) = self.derived_source::<E>(kind, natural, first, fb)? {
             return Ok(src);
         }
@@ -5161,7 +5157,7 @@ impl<'a> Parser<'a> {
 
     /// A derived table source, or `None` (nothing consumed) when no
     /// subquery starts here.
-    #[cfg(feature = "v09")]
+    #[cfg(feature = "sql")]
     #[inline(never)]
     fn derived_source<E>(
         &mut self,
@@ -5210,19 +5206,19 @@ impl<'a> Parser<'a> {
                     derived: Some(Box::new(inner)),
                     natural,
                     using,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     args: None,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     qualified: false,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     in_temp: false,
                     #[cfg(feature = "attach")]
                     schema: None,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     cte: None,
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     indexed: None,
-                    #[cfg(feature = "flatten")]
+                    #[cfg(feature = "planner")]
                     flat: false,
                 }));
             }
@@ -5230,7 +5226,7 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    /// A named FROM source: a table, view or CTE name, or (`v16`) a
+    /// A named FROM source: a table, view or CTE name, or (`sql`) a
     /// table-valued function call.
     #[inline(never)]
     fn table_source<E>(
@@ -5240,14 +5236,14 @@ impl<'a> Parser<'a> {
         first: bool,
         fb: usize,
     ) -> Result<FromSource, E> {
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let (table, qualified, in_temp) = self.name_q::<E>()?;
         #[cfg(feature = "attach")]
         let schema = self.last_schema;
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         let table = self.name::<E>()?;
         // A table-valued function (v0.16): `name(arg, ...)`.
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let args = if self.eat(Tok::LParen) {
             let mut v = AVec::new();
             if !self.eat(Tok::RParen) {
@@ -5272,7 +5268,7 @@ impl<'a> Parser<'a> {
         };
         // `stl_prefix nm dbnm as indexed_opt on_using` (a function
         // call takes none).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let indexed = if args.is_none() {
             self.index_hint::<E>()?
         } else {
@@ -5288,19 +5284,19 @@ impl<'a> Parser<'a> {
             derived: None,
             natural,
             using,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             args,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             qualified,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             in_temp,
             #[cfg(feature = "attach")]
             schema,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             cte: None,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             indexed,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             flat: false,
         })
     }
@@ -5312,9 +5308,9 @@ impl<'a> Parser<'a> {
         self.expect_kw::<E>(b"TABLE")?;
         let table = self.name::<E>()?;
         // RENAME TO / RENAME [COLUMN] / DROP [COLUMN] (v0.16,
-        // `v16`): every name is the pin's `nm` (an identifier, a
+        // `sql`): every name is the pin's `nm` (an identifier, a
         // keyword that is not reserved, or a string).
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.eat_kw(b"RENAME") {
             if self.eat_kw(b"TO") {
                 let (to, _) = self.nm_tok::<E>()?;
@@ -5333,7 +5329,7 @@ impl<'a> Parser<'a> {
                 quoted,
             });
         }
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         if self.eat_kw(b"DROP") {
             let _ = self.eat_kw(b"COLUMN");
             let (column, _) = self.nm_tok::<E>()?;
@@ -5360,7 +5356,7 @@ impl<'a> Parser<'a> {
         let mut pk_desc: AVec<ABytes> = AVec::new();
         let mut sets: AVec<ConstraintSet> = AVec::new();
         let mut checks: AVec<ABytes> = AVec::new();
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut fkeys = AVec::new();
         self.create_item::<E>(
             from,
@@ -5370,7 +5366,7 @@ impl<'a> Parser<'a> {
             &mut pk_desc,
             &mut sets,
             &mut checks,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             &mut fkeys,
         )?;
         if columns.len() != 1 {
@@ -5495,7 +5491,7 @@ impl<'a> Parser<'a> {
             j < to
                 && match toks[j].tok {
                     Tok::Integer(_) | Tok::Real(_) | Tok::Text(_) | Tok::Blob(_) => true,
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     Tok::HexTooBig => true,
                     Tok::Ident(h, false) => {
                         let b = handle_bytes(self.arena, h);
@@ -5572,9 +5568,9 @@ UPDATE USING VALUES WHEN WHERE",
         }
     }
 
-    /// Consume one `nm` (v0.16, `v16`): its handle and whether it
+    /// Consume one `nm` (v0.16, `sql`): its handle and whether it
     /// was quoted (a quoted identifier or a string).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn nm_tok<E>(&mut self) -> Result<(ABytes, bool), E> {
         if !self.nm_at(self.pos, self.limit) {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
@@ -5601,7 +5597,7 @@ UPDATE USING VALUES WHEN WHERE",
 
     /// An optional constraint-level `ON CONFLICT <action>` at token
     /// `i`: the next index and the action (`None` when absent).
-    /// v0.16: the action is kept (`v07`) and honoured by the write
+    /// v0.16: the action is kept (`sql`) and honoured by the write
     /// paths; a build without the conflict-resolving write path
     /// refuses FAIL / IGNORE / REPLACE rather than ignore them.
     /// `acts`: whether the clause takes effect (a CHECK's is parsed
@@ -5618,9 +5614,9 @@ UPDATE USING VALUES WHEN WHERE",
         if i + 2 < to && self.is_kw(i + 1, b"CONFLICT") {
             let w = i + 2;
             let act = if self.is_kw(w, b"ROLLBACK") {
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 let a = ConflictAction::Rollback;
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 let a = ConflictAction::Abort;
                 Some(a)
             } else if self.is_kw(w, b"ABORT") {
@@ -5629,7 +5625,7 @@ UPDATE USING VALUES WHEN WHERE",
                 || self.is_kw(w, b"IGNORE")
                 || self.is_kw(w, b"REPLACE")
             {
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 let a = if self.is_kw(w, b"FAIL") {
                     ConflictAction::Fail
                 } else if self.is_kw(w, b"IGNORE") {
@@ -5637,14 +5633,14 @@ UPDATE USING VALUES WHEN WHERE",
                 } else {
                     ConflictAction::Replace
                 };
-                #[cfg(not(feature = "v07"))]
+                #[cfg(not(feature = "sql"))]
                 if acts {
                     return Err(perr(
                         self.toks.as_slice()[w].offset,
                         ParseKind::RequiresConflictResolution,
                     ));
                 }
-                #[cfg(not(feature = "v07"))]
+                #[cfg(not(feature = "sql"))]
                 let a = ConflictAction::Abort;
                 let _ = acts;
                 Some(a)
@@ -5709,10 +5705,10 @@ UPDATE USING VALUES WHEN WHERE",
     }
 
     /// The foreign key a `REFERENCES` clause at token `i` declares
-    /// (v0.16, `v16`; the clause was validated by `references`).
+    /// (v0.16, `sql`; the clause was validated by `references`).
     /// `ON INSERT` actions parse and are dropped, as on the pin;
     /// `MATCH` is not recorded (the pin reports `NONE` always).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn fk_clause<E>(
         &self,
         from: AVec<ABytes>,
@@ -5795,7 +5791,7 @@ UPDATE USING VALUES WHEN WHERE",
     /// grammar) makes its foreign key deferred: `DEFERRABLE
     /// INITIALLY DEFERRED` only (`NOT DEFERRABLE INITIALLY
     /// DEFERRED` is immediate, as on the pin).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn defers(&self, i: usize) -> bool {
         self.is_kw(i, b"DEFERRABLE")
             && self.is_kw(i + 1, b"INITIALLY")
@@ -5855,10 +5851,10 @@ UPDATE USING VALUES WHEN WHERE",
             // order (v0.16: the collation is the autoindex key's;
             // it used to be skipped, and only after ASC / DESC,
             // so `(a COLLATE x DESC, b)` lost `b`).
-            #[cfg(any(feature = "v04", feature = "indexes"))]
+            #[cfg(any(feature = "query", feature = "indexes"))]
             let mut coll = None;
             if self.is_kw(i, b"COLLATE") {
-                #[cfg(any(feature = "v04", feature = "indexes"))]
+                #[cfg(any(feature = "query", feature = "indexes"))]
                 {
                     coll = Some(self.coll_at::<E>(i + 1)?);
                 }
@@ -5874,7 +5870,7 @@ UPDATE USING VALUES WHEN WHERE",
             out.push(IndexColumnDef {
                 name: h,
                 desc,
-                #[cfg(any(feature = "v04", feature = "indexes"))]
+                #[cfg(any(feature = "query", feature = "indexes"))]
                 coll,
                 #[cfg(feature = "expr_index")]
                 expr: None,
@@ -5912,8 +5908,8 @@ UPDATE USING VALUES WHEN WHERE",
         pk_names: &mut AVec<ABytes>,
         pk_desc_names: &mut AVec<ABytes>,
         sets: &mut AVec<ConstraintSet>,
-        #[cfg(feature = "v04")] checks: &mut AVec<ABytes>,
-        #[cfg(feature = "v16")] fkeys: &mut AVec<crate::sql::ast::ForeignKey>,
+        #[cfg(feature = "query")] checks: &mut AVec<ABytes>,
+        #[cfg(feature = "sql")] fkeys: &mut AVec<crate::sql::ast::ForeignKey>,
     ) -> Result<bool, E> {
         let bad = |j: usize| -> Result<bool, E> {
             Err(perr(self.item_end_offset(j), ParseKind::UnexpectedToken))
@@ -5962,12 +5958,12 @@ UPDATE USING VALUES WHEN WHERE",
                     }
                     let (n, conf) = self.onconf::<E>(next, to, true)?;
                     i = n;
-                    #[cfg(not(feature = "v07"))]
+                    #[cfg(not(feature = "sql"))]
                     let _ = conf;
                     sets.push(ConstraintSet {
                         primary_key: pk,
                         columns: cols,
-                        #[cfg(feature = "v07")]
+                        #[cfg(feature = "sql")]
                         conflict: conf,
                     });
                 } else if self.is_kw(i, b"CHECK") {
@@ -5975,13 +5971,13 @@ UPDATE USING VALUES WHEN WHERE",
                     // write path through the v0.4 evaluator; a
                     // build without it refuses the table rather
                     // than ignore the check.
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     {
                         let (close, text) = self.paren_text::<E>(i + 1, to)?;
                         checks.push(text);
                         i = self.onconf::<E>(close + 1, to, false)?.0;
                     }
-                    #[cfg(not(feature = "v04"))]
+                    #[cfg(not(feature = "query"))]
                     return Err(perr(
                         self.toks.as_slice()[i].offset,
                         ParseKind::RequiresEvaluator,
@@ -5997,7 +5993,7 @@ UPDATE USING VALUES WHEN WHERE",
                     // (v0.16 fix; all columns precede the table
                     // constraints).
                     self.known_columns::<E>(columns.as_slice(), cols.as_slice())?;
-                    #[cfg(feature = "v16")]
+                    #[cfg(feature = "sql")]
                     {
                         let mut from = AVec::new();
                         for c in cols.iter() {
@@ -6079,28 +6075,28 @@ UPDATE USING VALUES WHEN WHERE",
         let mut unique = false;
         let mut default: Option<Literal> = None;
         let mut not_null = false;
-        // The constraints' own ON CONFLICT clauses (v0.16, `v07`).
-        #[cfg(feature = "v07")]
+        // The constraints' own ON CONFLICT clauses (v0.16, `sql`).
+        #[cfg(feature = "sql")]
         let (mut nn_conf, mut pk_conf, mut uq_conf) = (None, None, None);
-        #[cfg(any(feature = "v04", feature = "indexes"))]
+        #[cfg(any(feature = "query", feature = "indexes"))]
         let mut coll = None;
         // Without the evaluator (tiny) neither can become true:
         // the clauses that set them are refused.
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut default_nonconst = false;
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         let default_nonconst = false;
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut generated = false;
-        #[cfg(not(feature = "v04"))]
+        #[cfg(not(feature = "query"))]
         let generated = false;
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut default_expr: Option<ABytes> = None;
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut gen_expr: Option<ABytes> = None;
-        #[cfg(feature = "v04")]
+        #[cfg(feature = "query")]
         let mut stored = false;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let mut dflt_text: Option<ABytes> = None;
         // Column constraints (`carglist`), in any order.
         while i < to {
@@ -6115,19 +6111,19 @@ UPDATE USING VALUES WHEN WHERE",
                 // (` for the first column (7, probed), two more
                 // (`columnlist ,`) for a later one and for ALTER
                 // TABLE ADD COLUMN's.
-                // (ALTER TABLE exists with `v16`: its item follows
+                // (ALTER TABLE exists with `sql`: its item follows
                 // ADD [COLUMN], not `(`.)
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 let first = columns.is_empty()
                     && from
                         .checked_sub(1)
                         .and_then(|j| self.toks.as_slice().get(j))
                         .is_some_and(|t| matches!(t.tok, Tok::LParen));
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 let first = columns.is_empty();
                 let held = if first { 7 } else { 9 };
                 let (d, next) = self.default_clause::<E>(i + 1, to, held)?;
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 {
                     let paren = matches!(tok(i + 1), Some(Tok::LParen));
                     let (a, b) = if paren {
@@ -6143,7 +6139,7 @@ UPDATE USING VALUES WHEN WHERE",
                 match d {
                     Ok(lit) => {
                         default = Some(lit);
-                        #[cfg(feature = "v04")]
+                        #[cfg(feature = "query")]
                         {
                             default_nonconst = false;
                             default_expr = None;
@@ -6154,14 +6150,14 @@ UPDATE USING VALUES WHEN WHERE",
                     // one refuses the table (it used to keep the
                     // first literal of `DEFAULT (1+2)` and NULL for
                     // the rest).
-                    #[cfg(feature = "v04")]
+                    #[cfg(feature = "query")]
                     Err((start, end)) => {
                         default = None;
                         default_nonconst = true;
                         let text = trim(self.span(start.min(end), end));
                         default_expr = Some(self.arena.alloc_copy_handle(text)?);
                     }
-                    #[cfg(not(feature = "v04"))]
+                    #[cfg(not(feature = "query"))]
                     Err(_) => {
                         return Err(perr(
                             self.toks.as_slice()[i + 1].offset,
@@ -6178,11 +6174,11 @@ UPDATE USING VALUES WHEN WHERE",
                 i = n;
                 // The last NOT NULL's clause, as the pin's
                 // `sqlite3AddNotNull` (no clause: the default).
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 {
                     nn_conf = c;
                 }
-                #[cfg(not(feature = "v07"))]
+                #[cfg(not(feature = "sql"))]
                 let _ = c;
             } else if self.is_kw(i, b"NOT") || self.is_kw(i, b"DEFERRABLE") {
                 let next = self.deferrable(i);
@@ -6191,7 +6187,7 @@ UPDATE USING VALUES WHEN WHERE",
                 }
                 // The pin's `sqlite3DeferForeignKey`: the table's most
                 // recent foreign key, whichever column declared it.
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 if let Some(f) = fkeys.as_mut_slice().last_mut() {
                     f.deferred = self.defers(i);
                 }
@@ -6210,11 +6206,11 @@ UPDATE USING VALUES WHEN WHERE",
                 }
                 let (n, c) = self.onconf::<E>(i, to, true)?;
                 i = n;
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 {
                     pk_conf = c;
                 }
-                #[cfg(not(feature = "v07"))]
+                #[cfg(not(feature = "sql"))]
                 let _ = c;
                 if self.is_kw(i, b"AUTOINCREMENT") {
                     i += 1;
@@ -6224,29 +6220,29 @@ UPDATE USING VALUES WHEN WHERE",
                 let (n, c) = self.onconf::<E>(i + 1, to, true)?;
                 // A repeated UNIQUE is the same constraint: its
                 // clauses merge as the pin's duplicate-index rule.
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 {
                     uq_conf = merge_conflict::<E>(uq_conf, c, self.toks.as_slice()[i].offset)?;
                 }
-                #[cfg(not(feature = "v07"))]
+                #[cfg(not(feature = "sql"))]
                 let _ = c;
                 i = n;
             } else if self.is_kw(i, b"CHECK") {
                 // Column-level CHECK (v0.16): a table check like
                 // any other.
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 {
                     let (close, text) = self.paren_text::<E>(i + 1, to)?;
                     checks.push(text);
                     i = close + 1;
                 }
-                #[cfg(not(feature = "v04"))]
+                #[cfg(not(feature = "query"))]
                 return Err(perr(
                     self.toks.as_slice()[i].offset,
                     ParseKind::RequiresEvaluator,
                 ));
             } else if self.is_kw(i, b"REFERENCES") {
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 {
                     let mut from = AVec::new();
                     from.push(col_name);
@@ -6257,7 +6253,7 @@ UPDATE USING VALUES WHEN WHERE",
                 // v0.16: the column's collating sequence (it used
                 // to be parsed and ignored — comparisons and
                 // ORDER BY ran BINARY).
-                #[cfg(any(feature = "v04", feature = "indexes"))]
+                #[cfg(any(feature = "query", feature = "indexes"))]
                 {
                     coll = Some(self.coll_at::<E>(i + 1)?);
                 }
@@ -6277,7 +6273,7 @@ UPDATE USING VALUES WHEN WHERE",
                 };
                 // Every generated column has `AS (...)`; without
                 // the evaluator it cannot be computed.
-                #[cfg(not(feature = "v04"))]
+                #[cfg(not(feature = "query"))]
                 return Err(perr(
                     self.toks.as_slice()[at].offset,
                     ParseKind::RequiresEvaluator,
@@ -6286,7 +6282,7 @@ UPDATE USING VALUES WHEN WHERE",
                 // AS (expr) [VIRTUAL | STORED]`. It used to be
                 // parsed as part of the declared type and read as
                 // NULL.
-                #[cfg(feature = "v04")]
+                #[cfg(feature = "query")]
                 {
                     if generated {
                         return bad(i);
@@ -6324,17 +6320,17 @@ UPDATE USING VALUES WHEN WHERE",
             not_null,
             default_nonconst,
             generated,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             default_expr,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             gen_expr,
-            #[cfg(feature = "v04")]
+            #[cfg(feature = "query")]
             stored,
-            #[cfg(any(feature = "v04", feature = "indexes"))]
+            #[cfg(any(feature = "query", feature = "indexes"))]
             coll,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             dflt_text,
-            #[cfg(feature = "v07")]
+            #[cfg(feature = "sql")]
             nn_conflict: nn_conf,
         });
         // Constraint sets in statement order (v0.3): an inline
@@ -6349,7 +6345,7 @@ UPDATE USING VALUES WHEN WHERE",
             cols.push(IndexColumnDef {
                 name: col_name,
                 desc: pk_desc,
-                #[cfg(any(feature = "v04", feature = "indexes"))]
+                #[cfg(any(feature = "query", feature = "indexes"))]
                 coll: None,
                 #[cfg(feature = "expr_index")]
                 expr: None,
@@ -6357,7 +6353,7 @@ UPDATE USING VALUES WHEN WHERE",
             sets.push(ConstraintSet {
                 primary_key: true,
                 columns: cols,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 conflict: pk_conf,
             });
         }
@@ -6366,7 +6362,7 @@ UPDATE USING VALUES WHEN WHERE",
             cols.push(IndexColumnDef {
                 name: col_name,
                 desc: false,
-                #[cfg(any(feature = "v04", feature = "indexes"))]
+                #[cfg(any(feature = "query", feature = "indexes"))]
                 coll: None,
                 #[cfg(feature = "expr_index")]
                 expr: None,
@@ -6374,7 +6370,7 @@ UPDATE USING VALUES WHEN WHERE",
             sets.push(ConstraintSet {
                 primary_key: false,
                 columns: cols,
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 conflict: uq_conf,
             });
         }
@@ -6385,14 +6381,14 @@ UPDATE USING VALUES WHEN WHERE",
 /// CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP (v0.16): the
 /// pin's wall-clock keywords, an expression wherever a DEFAULT
 /// term may be.
-/// A row value (v0.16, `v16`; there are none without it).
-#[cfg(feature = "v04")]
+/// A row value (v0.16, `sql`; there are none without it).
+#[cfg(feature = "query")]
 fn is_vector(e: &Expr) -> bool {
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     {
         matches!(e, Expr::Vector(_))
     }
-    #[cfg(not(feature = "v16"))]
+    #[cfg(not(feature = "sql"))]
     {
         let _ = e;
         false
@@ -6415,9 +6411,9 @@ fn trim(b: &[u8]) -> &[u8] {
     &b[s..e]
 }
 
-// ================= v0.5 grammar (feature = "v05") =================
+// ================= v0.5 grammar (feature = "write") =================
 
-#[cfg(feature = "v05")]
+#[cfg(feature = "write")]
 impl<'a> Parser<'a> {
     /// A bare column name with no qualifier: SQLite rejects
     /// `SET t.col = ...` as a syntax error (oracle-verified), so
@@ -6437,7 +6433,7 @@ impl<'a> Parser<'a> {
     }
 
     /// An UPDATE / upsert `SET` list: `col = expr, ...`. Under
-    /// `v16` an item may be `(c1, ..., cn) = <row>` (v0.16),
+    /// `sql` an item may be `(c1, ..., cn) = <row>` (v0.16),
     /// split here into one assignment per column: a row value of
     /// size n gives each column its element, any other
     /// right-hand side gives column i `RowItem(rhs, i, n)` (the
@@ -6451,7 +6447,7 @@ impl<'a> Parser<'a> {
         let mut assignments: AVec<(ABytes, Expr)> = AVec::new();
         loop {
             let at = held + if assignments.is_empty() { 0 } else { 2 };
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             if self.eat(Tok::LParen) {
                 let mut cols: AVec<ABytes> = AVec::new();
                 loop {
@@ -6509,38 +6505,38 @@ impl<'a> Parser<'a> {
 
     fn update_stmt<E>(&mut self) -> Result<Ast, E> {
         self.expect_kw::<E>(b"UPDATE")?;
-        // OR clause: under v05 alone only IGNORE widens behaviour
+        // OR clause: under `write` alone only IGNORE widens behaviour
         // (ABORT/FAIL/ROLLBACK are the default); OR REPLACE is a
         // v0.7 addition, rejected by name without the feature.
         // No OR clause: each constraint's own clause decides (v0.16,
-        // `v07`; below it there are none).
-        #[cfg(feature = "v07")]
+        // `sql`; below it there are none).
+        #[cfg(feature = "sql")]
         let mut conflict = ConflictAction::Unset;
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let mut conflict = ConflictAction::Abort;
         if self.eat_kw(b"OR") {
             if self.eat_kw(b"IGNORE") {
                 conflict = ConflictAction::Ignore;
             } else if self.cur_is_kw(b"REPLACE") {
-                #[cfg(feature = "v07")]
+                #[cfg(feature = "sql")]
                 {
                     self.pos += 1;
                     conflict = ConflictAction::Replace;
                 }
-                #[cfg(not(feature = "v07"))]
+                #[cfg(not(feature = "sql"))]
                 {
                     return Err(perr(self.cur().offset, ParseKind::UnsupportedClause));
                 }
             } else if self.eat_kw(b"FAIL") {
                 conflict = ConflictAction::Fail;
             } else if self.eat_kw(b"ROLLBACK") {
-                // v16: the whole transaction rolls back too; before
+                // `sql`: the whole transaction rolls back too; without
                 // it a failed statement ended the bracket anyway.
-                #[cfg(feature = "v16")]
+                #[cfg(feature = "sql")]
                 {
                     conflict = ConflictAction::Rollback;
                 }
-                #[cfg(not(feature = "v16"))]
+                #[cfg(not(feature = "sql"))]
                 {
                     conflict = ConflictAction::Abort;
                 }
@@ -6561,7 +6557,7 @@ impl<'a> Parser<'a> {
         } else {
             self.opt_alias()
         };
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let indexed = self.index_hint::<E>()?;
         self.expect_kw::<E>(b"SET")?;
         // `with UPDATE orconf xfullname indexed_opt SET nm EQ expr`.
@@ -6575,9 +6571,9 @@ impl<'a> Parser<'a> {
         // before WHERE, exactly as SQLite orders the clauses
         // (`... SET setlist FROM`). The target is a table of the
         // join too.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let from = self.update_from::<E>()?;
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let from: AVec<FromSource> = AVec::new();
         if from.len() >= MAX_JOIN_TABLES {
             return Err(Error::Schema {
@@ -6593,9 +6589,9 @@ impl<'a> Parser<'a> {
         // ORDER BY/LIMIT on UPDATE stay rejected (the pinned
         // oracle's build rejects them too); expect_end in parse()
         // catches any trailing input.
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let returning = self.returning_clause::<E>(if filter.is_some() { 14 } else { 12 })?;
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let returning: AVec<SelectItem> = AVec::new();
         Ok(Ast::Update {
             table,
@@ -6605,14 +6601,14 @@ impl<'a> Parser<'a> {
             from,
             filter,
             returning,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             indexed,
         })
     }
 
-    /// An optional `INDEXED BY name` / `NOT INDEXED` (v0.16, `v16`;
+    /// An optional `INDEXED BY name` / `NOT INDEXED` (v0.16, `sql`;
     /// the pin's `indexed_opt`: the name is a plain `nm`).
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     fn index_hint<E>(&mut self) -> Result<Option<IndexHint>, E> {
         if !self.at_index_hint() {
             return Ok(None);
@@ -6629,7 +6625,7 @@ impl<'a> Parser<'a> {
     /// The optional `FROM <source> [, <source> | JOIN ...]` of
     /// an UPDATE (v0.7): the same source grammar as a SELECT's
     /// FROM clause body.
-    #[cfg(feature = "v07")]
+    #[cfg(feature = "sql")]
     fn update_from<E>(&mut self) -> Result<AVec<FromSource>, E> {
         if !self.eat_kw(b"FROM") {
             return Ok(AVec::new());
@@ -6641,7 +6637,7 @@ impl<'a> Parser<'a> {
         self.expect_kw::<E>(b"DELETE")?;
         self.expect_kw::<E>(b"FROM")?;
         let table = self.name::<E>()?;
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         let indexed = self.index_hint::<E>()?;
         // `with DELETE FROM xfullname indexed_opt WHERE expr`.
         let filter = if self.eat_kw(b"WHERE") {
@@ -6649,15 +6645,15 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        #[cfg(feature = "v07")]
+        #[cfg(feature = "sql")]
         let returning = self.returning_clause::<E>(if filter.is_some() { 11 } else { 9 })?;
-        #[cfg(not(feature = "v07"))]
+        #[cfg(not(feature = "sql"))]
         let returning: AVec<SelectItem> = AVec::new();
         Ok(Ast::Delete {
             table,
             filter,
             returning,
-            #[cfg(feature = "v16")]
+            #[cfg(feature = "sql")]
             indexed,
         })
     }
@@ -7125,7 +7121,7 @@ mod tests {
     /// The pin's statement length limit (v0.16): a length is all
     /// the check reads, so the boundary is testable without a
     /// gigabyte of SQL.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     #[test]
     fn statement_length_limit() {
         assert!(too_long::<()>(MAX_SQL_LENGTH).is_ok());
@@ -7140,7 +7136,7 @@ mod tests {
 
     /// The ON / USING fold equals the left-deep AND tree the pin
     /// builds (v0.16), with and without a written WHERE.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     #[test]
     fn on_chain_heights() {
         // A reference: heights of ((w AND t1) AND t2) ... built
@@ -7183,7 +7179,7 @@ mod tests {
     /// ignoring it (they used to be silent wrong answers: CHECK
     /// never enforced, `DEFAULT (1+2)` stored 1, generated columns
     /// read NULL) — and still accepts the literal forms it handles.
-    #[cfg(not(feature = "v04"))]
+    #[cfg(not(feature = "query"))]
     #[test]
     fn tiny_refuses_unenforceable_table_clauses() {
         let refused = [
@@ -7210,27 +7206,18 @@ mod tests {
             assert_eq!(kind(sql), None, "{sql}");
         }
         // Constraint-level FAIL / IGNORE / REPLACE (v0.16): kept with
-        // the conflict-resolving write path, refused below it.
+        // the conflict-resolving write path (`sql`), refused here.
         for sql in [
             "CREATE TABLE t(a INT PRIMARY KEY ASC ON CONFLICT IGNORE, b UNIQUE ON CONFLICT FAIL)",
             "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL ON CONFLICT REPLACE)",
             "CREATE TABLE t(a, b, UNIQUE (b) ON CONFLICT REPLACE)",
         ] {
-            #[cfg(feature = "v07")]
-            assert_eq!(kind(sql), None, "{sql}");
-            #[cfg(not(feature = "v07"))]
             assert_eq!(
                 kind(sql),
                 Some(ParseKind::RequiresConflictResolution),
                 "{sql}"
             );
         }
-        // A CHECK's clause is ignored (as on the pin), never refused.
-        #[cfg(feature = "v04")]
-        assert_eq!(
-            kind("CREATE TABLE t(a, CHECK (a > 0) ON CONFLICT IGNORE)"),
-            None
-        );
     }
 
     /// v0.16, every build: CREATE TABLE items follow the pin's
@@ -7360,12 +7347,12 @@ mod tests {
             );
         }
         let auto = b"CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)";
-        #[cfg(not(feature = "v16"))]
+        #[cfg(not(feature = "sql"))]
         assert!(matches!(
             schema_text_start::<()>(auto, &arena),
             Err(Error::Unsupported)
         ));
-        #[cfg(feature = "v16")]
+        #[cfg(feature = "sql")]
         {
             assert!(schema_text_start::<()>(auto, &arena).is_ok());
             assert!(has_autoincrement::<()>(auto, &arena));
@@ -7378,7 +7365,7 @@ mod tests {
 
     /// v0.16 (evaluator builds): the clauses are kept for the
     /// planner, and the pin's syntax errors around them hold.
-    #[cfg(feature = "v04")]
+    #[cfg(feature = "query")]
     #[test]
     fn table_clauses_parse_with_the_pins_grammar() {
         for sql in [
@@ -7448,10 +7435,10 @@ mod tests {
         }
     }
 
-    /// v0.16 (`v16`): the COLLATE operator binds tighter than
+    /// v0.16 (`sql`): the COLLATE operator binds tighter than
     /// `||` and looser than unary minus; GLOB and LIKE ... ESCAPE
     /// are the pin's `glob()` / `like()` calls.
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     #[test]
     fn collate_operator_and_pattern_calls() {
         let arena = Arena::new(Scope::Statement, 0, 1 << 16);

@@ -459,7 +459,7 @@ fn rand_value(rng: &mut Rng) -> B {
 
 /// (sql, count, names of 1..=count, (name, index) lookups) — the
 /// pin's `sqlite3_bind_parameter_count / _name / _index` answers.
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[allow(clippy::type_complexity)]
 const NUMBERING: &[(&str, usize, &[Option<&str>], &[(&str, Option<usize>)])] = &[
     ("SELECT ?5", 5, &[None, None, None, None, Some("?5")], &[]),
@@ -560,7 +560,7 @@ const NUMBERING: &[(&str, usize, &[Option<&str>], &[(&str, Option<usize>)])] = &
     ),
 ];
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[test]
 fn numbering_matches_the_pin() {
     block_on(async {
@@ -593,7 +593,7 @@ fn numbering_matches_the_pin() {
     });
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[test]
 fn numbering_errors_match_the_pin() {
     block_on(async {
@@ -647,7 +647,7 @@ fn numbering_errors_match_the_pin() {
     });
 }
 
-#[cfg(feature = "v04")]
+#[cfg(feature = "query")]
 #[test]
 fn the_bind_api_contract() {
     block_on(async {
@@ -912,7 +912,7 @@ fn a_prepared_insert_is_re_executed_with_new_bindings() {
 // The full dialect: every expression position (v16 / full).
 // ---------------------------------------------------------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 const SETUP: &str = "CREATE TABLE t(i INTEGER, tx TEXT, n NUMERIC, r REAL, b BLOB, x);
     INSERT INTO t VALUES (1, '1', 1, 1.0, '1', 1);
     INSERT INTO t VALUES (5, '5', 5, 5.0, '5', '5');
@@ -922,7 +922,7 @@ const SETUP: &str = "CREATE TABLE t(i INTEGER, tx TEXT, n NUMERIC, r REAL, b BLO
     CREATE TABLE k(id INTEGER PRIMARY KEY, a TEXT UNIQUE, v);
     INSERT INTO k VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', NULL)";
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn affinity_of_bound_values_matches_literals() {
     let tw = twins("aff", SETUP);
@@ -993,7 +993,7 @@ fn affinity_of_bound_values_matches_literals() {
     tw.same_files("SELECT rowid, typeof(i), quote(i), typeof(tx), quote(tx), typeof(n), quote(n), typeof(r), quote(r), typeof(b), quote(b), typeof(x), quote(x) FROM t;");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn parameters_in_every_expression_position() {
     let tw = twins("pos", SETUP);
@@ -1166,7 +1166,7 @@ fn parameters_in_every_expression_position() {
     assert_eq!(show(&sql), "CREATE TABLE c(p,\"?\",\"? + 1\",\":n\")");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn order_and_group_by_parameters_are_constants() {
     let tw = twins("ord", SETUP);
@@ -1404,7 +1404,7 @@ fn order_and_group_by_parameters_are_constants() {
     }
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn errors_and_deferred_value_errors() {
     let tw = twins(
@@ -1527,7 +1527,7 @@ fn errors_and_deferred_value_errors() {
     });
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn re_execution_follows_schema_changes() {
     let tw = twins("schema", "CREATE TABLE a(x); CREATE TABLE b(x)");
@@ -1579,7 +1579,7 @@ fn re_execution_follows_schema_changes() {
     tw.same_files("SELECT * FROM b; SELECT * FROM c;");
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn generated_expressions_with_random_bindings() {
     let tw = twins("prng", SETUP);
@@ -1613,7 +1613,7 @@ fn generated_expressions_with_random_bindings() {
 /// AS INTEGER) reads only the integer prefix, and CAST(text AS
 /// NUMERIC) is an INTEGER only for an integer that fits or an
 /// integral value below 2^51.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn cast_and_remainder_follow_the_pin() {
     let tw = twins("cast", "CREATE TABLE z(a)");
@@ -1692,7 +1692,7 @@ fn cast_and_remainder_follow_the_pin() {
 /// decimal expansion as the pin's `%!.*f` does (hipp scaled by a
 /// power of ten, which overflowed past 18 digits and misrounded
 /// values such as 2.675 at 2 places).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn round_follows_the_pin() {
     let tw = twins("round", "CREATE TABLE z(a)");

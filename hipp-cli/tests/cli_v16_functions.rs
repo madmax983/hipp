@@ -100,7 +100,7 @@ SELECT instr(x'68c3a96c6c6f', x'6c'), upper(x'61'), typeof(lower(x'41')), length
 SELECT hex(substr(x'c3a9', 1, 1)), hex(trim(x'c3a9c3', 'é')), trim('xxaxx', 'x'), replace('abc', '', 'z');
 ";
 
-/// `v16`: printf and the value functions.
+/// `sql`: printf and the value functions.
 const PRINTF: &str = "\
 SELECT printf('%d %s %5.2f %x %%', 42, 'hi', 3.14159, 255), format('%05d', 42), printf('[%-8s|%8.3s]', 'abc', 'abcdef');
 SELECT printf('%,d|%+d|% d|%#x|%#o|%r|%r|%r|%p', 1234567, 5, 5, 255, 8, 1, 22, 113, 255);
@@ -115,7 +115,7 @@ SELECT concat('a', NULL, 2, 1.5), concat_ws('-', 'a', NULL, 'b'), octet_length('
 SELECT likely(3), unlikely('u'), likelihood(4.5, 0.25), iif(0, 'a'), if(0, 1, 0, 2, 3), sqlite_version();
 ";
 
-/// `v16`: the change counters across a script.
+/// `sql`: the change counters across a script.
 const COUNTERS: &str = "\
 CREATE TABLE t(a PRIMARY KEY, b);
 INSERT INTO t VALUES(1, 1.5), (2, 2.5), (3, 3.5);

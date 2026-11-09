@@ -100,7 +100,7 @@ CREATE TABLE t(a, b, c TEXT COLLATE NOCASE, r REAL, g);
 INSERT INTO t VALUES (1,'x','A',1.5,1),(2,'y','a',2,1),(3,'z','B',NULL,2),(NULL,'w',NULL,0.1,2),(2,'v','b',0.2,3),(7,'u','c',-3,3),(x'0102','t','C',0.3,3);
 ";
 
-/// `v16`: string_agg() and the aggregate ORDER BY.
+/// `sql`: string_agg() and the aggregate ORDER BY.
 const ORDER: &str = "\
 SELECT string_agg(b, ', ' ORDER BY a DESC, b), group_concat(b ORDER BY c, r DESC NULLS FIRST) FROM t;
 SELECT g, group_concat(b, '' ORDER BY b), string_agg(c, '/' ORDER BY c COLLATE BINARY) FROM t GROUP BY g ORDER BY g;
@@ -109,7 +109,7 @@ SELECT hex(group_concat(a ORDER BY r)), group_concat(a, '|' ORDER BY r) FROM t;
 SELECT sum(r ORDER BY r DESC), total(r ORDER BY b), avg(r ORDER BY g, b) FROM t;
 ";
 
-/// `v16`: FILTER, and its effect on the bare columns.
+/// `sql`: FILTER, and its effect on the bare columns.
 const FILTER: &str = "\
 SELECT count(*) FILTER (WHERE a > 1), sum(a) FILTER (WHERE g = 3), avg(r) FILTER (WHERE r > 0), group_concat(b) FILTER (WHERE c = 'a') FROM t;
 SELECT g, count() FILTER (WHERE r IS NOT NULL), max(r) FILTER (WHERE b < 'x'), b FROM t GROUP BY g ORDER BY g;
@@ -118,7 +118,7 @@ SELECT g FROM t GROUP BY g HAVING count(*) FILTER (WHERE r > 0.15) > 1 ORDER BY 
 SELECT (SELECT count(*) FILTER (WHERE t.g > 1) FROM t u), (SELECT string_agg(u.b, '' ORDER BY u.b) FILTER (WHERE u.g = t.g) FROM t u) FROM t ORDER BY 2;
 ";
 
-/// `v16`: the percentile family.
+/// `sql`: the percentile family.
 const PERCENTILE: &str = "\
 SELECT median(r), percentile(r, 25), percentile(r, 99.9), percentile_cont(r, 0.4), percentile_disc(r, 0.4) FROM t;
 SELECT g, median(r), percentile(r, '50'), percentile_disc(r, 1) FROM t GROUP BY g ORDER BY g;
@@ -137,7 +137,7 @@ SELECT group_concat(x, s) FROM (SELECT 'a' x, '1' s UNION ALL SELECT 'b', NULL U
 SELECT group_concat(x, char(1)) FROM (SELECT 'a' x UNION ALL SELECT 'b');
 ";
 
-/// `v16`: CREATE TABLE ... AS SELECT over the new clauses.
+/// `sql`: CREATE TABLE ... AS SELECT over the new clauses.
 const CTAS: &str = "\
 CREATE TABLE c AS SELECT group_concat(b ORDER BY a DESC), count(*) FILTER (WHERE a > 1), median(r) AS m FROM t;
 SELECT * FROM c;

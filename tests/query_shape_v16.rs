@@ -31,7 +31,7 @@
 //!   shadows an alias in GROUP BY / HAVING (not in ORDER BY),
 //!   aggregates are refused in GROUP BY, HAVING needs an
 //!   aggregate query, `NULL IN (<empty>)` is 0.
-//! - Under `v16`: LIMIT / OFFSET as expressions (constant or
+//! - Under `sql`: LIMIT / OFFSET as expressions (constant or
 //!   uncorrelated subquery, the pin's `MustBeInt` conversion,
 //!   negative LIMIT = no limit), result-column aliases inside
 //!   WHERE / ON / GROUP BY / HAVING / ORDER BY expressions and
@@ -812,7 +812,7 @@ fn generated_join_corpus() {
 
 // ---------------- v16: LIMIT / OFFSET expressions ----------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn limit_offset_expressions() {
     let tw = twins(
@@ -938,7 +938,7 @@ fn limit_offset_expressions() {
     ]);
 }
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn limit_expression_into_insert_select() {
     let setup = "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2),(3),(4),(5); CREATE TABLE u(x)";
@@ -954,7 +954,7 @@ fn limit_expression_into_insert_select() {
 
 // ---------------- v16: result-column aliases ----------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn aliases_in_where_on_group_having_order() {
     let tw = twins(
@@ -1034,7 +1034,7 @@ fn aliases_in_where_on_group_having_order() {
 
 // ---------------- v16: x IN tablename ----------------
 
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn in_table_operand() {
     let tw = twins(
@@ -1095,7 +1095,7 @@ fn hipp_only(
 /// subquery reads the right columns (review regression: its
 /// slots were not rebased onto the deeper row — no rows, or
 /// the nested source's columns).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn alias_with_subquery_used_in_a_nested_scope() {
     let tw = twins(
@@ -1139,7 +1139,7 @@ fn alias_with_subquery_used_in_a_nested_scope() {
 /// The same, generated: alias definitions with correlated and
 /// uncorrelated subqueries, referenced from nested subqueries
 /// of various shapes, vs the oracle.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn generated_alias_nesting_corpus() {
     let tw = twins(
@@ -1177,7 +1177,7 @@ fn generated_alias_nesting_corpus() {
 /// subquery's rows (silent wrong answers), then refused. Since
 /// the v0.16 aggregate-scoping review fix the owner folds it per
 /// group and substitutes the value, as on the pin.
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn aggregate_alias_inside_a_subquery_matches_the_pin() {
     let tw = twins(
@@ -1273,7 +1273,7 @@ fn derived_table_duplicate_names_are_renamed() {
 /// Scalar and EXISTS subqueries take the pin's `LIMIT (X<>0)`
 /// rewrite (review regression: hipp raised a datatype
 /// mismatch for a non-integer X there).
-#[cfg(feature = "v16")]
+#[cfg(feature = "sql")]
 #[test]
 fn scalar_and_exists_subquery_limit_rewrite() {
     let tw = twins(
@@ -1392,7 +1392,7 @@ fn schema_qualifier_other_than_main_is_refused() {
     } else {
         tw.refuse_parse("SELECT * FROM foo.s");
     }
-    // `temp.` names the TEMP database: hipp has one with `v16`
+    // `temp.` names the TEMP database: hipp has one with `sql`
     // (empty here, so these fail as on the pin), and refuses the
     // qualifier without it.
     for sql in [
@@ -1400,21 +1400,21 @@ fn schema_qualifier_other_than_main_is_refused() {
         "INSERT INTO temp.s VALUES(2)",
         "DELETE FROM temp.s",
     ] {
-        if cfg!(feature = "v16") {
+        if cfg!(feature = "sql") {
             assert!(tw.same(sql).is_some(), "{sql}");
         } else {
             tw.refuse_parse(sql);
         }
     }
-    #[cfg(feature = "v16")]
+    #[cfg(feature = "sql")]
     {
         tw.same("SELECT 1 IN main.s");
         assert!(tw.same("SELECT 1 IN temp.s").is_some());
     }
-    // Without `v16` the pin would make a temporary table outside
+    // Without `sql` the pin would make a temporary table outside
     // the file; with it, hipp does too (never in the file).
     let r = hipp_only(&tw, "CREATE TABLE temp.q(a)");
-    if cfg!(feature = "v16") {
+    if cfg!(feature = "sql") {
         assert!(r.is_ok(), "{r:?}");
     } else {
         assert!(matches!(r, Err(Error::Parse { .. })), "{r:?}");

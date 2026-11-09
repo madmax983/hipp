@@ -1,4 +1,4 @@
-//! hipp-cli v0.17 index strategies (leaf `multi_index`): byte-for-byte
+//! hipp-cli v0.17 index strategies (leaf `planner`): byte-for-byte
 //! the pinned oracle's stdout for the MULTI-INDEX OR (rows in the
 //! pin's branch order, each once; the `MULTI-INDEX OR` / `INDEX n`
 //! trees with their IN subqueries and LEFT-JOIN loops), the min() /

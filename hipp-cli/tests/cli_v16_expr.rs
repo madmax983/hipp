@@ -3,7 +3,7 @@
 //! oracle — precedence and the truth tests (ungated), hex and
 //! digit-separated literals with REAL results, the aggregate
 //! scoping fix (an enclosing query's aggregate inside a
-//! subquery), and under `v16` the bitwise operators, IS
+//! subquery), and under `sql` the bitwise operators, IS
 //! DISTINCT FROM, postfix NOT NULL, row-value comparisons / IN /
 //! BETWEEN and UPDATE ... SET (a, b) = .... Each batch runs
 //! one-shot and over stdin, and the hipp-written file must pass
@@ -113,7 +113,7 @@ SELECT a, total(z) AS s FROM t GROUP BY a HAVING (SELECT s) > 1.6 ORDER BY (SELE
 INSERT INTO t VALUES (7, 0.5) RETURNING (SELECT max(t.z) + count(*) FROM u);
 ";
 
-/// `v16`: bitwise operators, DISTINCT FROM, NOT NULL, row values.
+/// `sql`: bitwise operators, DISTINCT FROM, NOT NULL, row values.
 const V16: &str = "\
 SELECT 1|2, 5&3, 1<<2, 8>>1, ~5, 1<<63, 1<<64, -1>>64, 8>>-1, 1<<-1, -8>>1, ~-1;
 SELECT 3.9|4, -3.9|0, '12abc'|1, 1e19|0, -1e19|0, ~5.7, ~'abc', NULL|1, 1 + 1 << 1 + 1, 1|2&3;

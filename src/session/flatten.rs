@@ -1,4 +1,4 @@
-//! The pin's query flattener and its neighbours (v0.17, `flatten`).
+//! The pin's query flattener and its neighbours (v0.17, `planner`).
 //!
 //! The view / CTE expansion (`session::cte`) marks each FROM
 //! subquery the pin's `sqlite3FlattenSubquery` merges into its reader
@@ -183,7 +183,6 @@ fn fill_access(a: &mut crate::xplan::IdxAccess, xs: &[RExpr]) -> bool {
     {
         return false;
     }
-    #[cfg(feature = "multi_index")]
     if let Some(o) = &mut a.or {
         for sub in o.subs.as_mut_slice() {
             if !f(&mut sub.cond) || !sub.acc.iter_mut().all(|x| fill_access(x, xs)) {
@@ -191,7 +190,6 @@ fn fill_access(a: &mut crate::xplan::IdxAccess, xs: &[RExpr]) -> bool {
             }
         }
     }
-    #[cfg(feature = "multi_index")]
     if let Some(x) = &mut a.first
         && !f(&mut x.0)
     {

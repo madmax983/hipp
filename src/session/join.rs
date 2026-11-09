@@ -1,4 +1,4 @@
-//! The join planner's session side (v0.17, `join_order`; the
+//! The join planner's session side (v0.17, `planner`; the
 //! planning itself is `crate::xjoin`).
 //!
 //! A SELECT core whose FROM clause holds two or more plain tables
@@ -127,7 +127,7 @@ pub(super) fn auto_sort(
     ai: &crate::xplan::AutoIdx,
     enc: crate::record::TextEnc,
 ) {
-    rows.sort_by(|a, b| auto_cmp(a, b, ai, enc));
+    crate::arena::sort_by(rows, &mut |a, b| auto_cmp(a, b, ai, enc));
 }
 
 /// The span of `rows` (in automatic-index order) whose key equals
@@ -1013,7 +1013,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Plan a SELECT core's join in the pin's order (v0.17,
-    /// `join_order`; see the module comment). False when the core is
+    /// `planner`; see the module comment). False when the core is
     /// not such a join: the caller plans its sources one by one in
     /// FROM order (`plan_accesses`).
     #[allow(clippy::too_many_arguments)]
@@ -1232,9 +1232,8 @@ impl<S: Storage> Connection<S> {
                 order.push((e.clone(), unsorted(e)));
             }
         }
-        // The pin's min() / max() optimisation (v0.17, `multi_index`):
+        // The pin's min() / max() optimisation (v0.17, `planner`):
         // the join reads the argument's order.
-        #[cfg(feature = "multi_index")]
         let mm = has_agg && having.is_none() && {
             let nullable = |e: &RExpr| match crate::xplan::strip(e) {
                 RExpr::Column(slot, ..) => !(0..n).any(|i| {
@@ -1388,15 +1387,12 @@ impl<S: Storage> Connection<S> {
                     good: none,
                     left: sp.kind == crate::sql::JoinKind::Left,
                     cross: sp.kind == crate::sql::JoinKind::Cross,
-                    #[cfg(feature = "flatten")]
                     after: 0,
-                    #[cfg(feature = "flatten")]
                     semi: sp.exists,
                     auto_ok: false,
                     root: 0,
                     stat: false,
                     vt: Some(vl),
-                    #[cfg(feature = "multi_index")]
                     ors: AVec::new(),
                 });
                 continue;
@@ -1421,8 +1417,7 @@ impl<S: Storage> Connection<S> {
                     owner.is_none()
                 };
                 // (No IN term for an OR the pin does not rewrite: v0.17,
-                // `multi_index`.)
-                #[cfg(feature = "multi_index")]
+                // `planner`.)
                 let ok = ok
                     && (!crate::xmulti::or_in_term(t, conj.as_slice())
                         || conj.as_slice().get(t.parent).is_some_and(|c| {
@@ -1450,16 +1445,15 @@ impl<S: Storage> Connection<S> {
                         t.parent
                     }
                 };
-                ts.as_mut_slice().sort_by_key(key);
+                crate::arena::sort_by(ts.as_mut_slice(), &mut |a, b| key(a).cmp(&key(b)));
             }
             let mut tmask: AVec<u64> = AVec::new();
             for t in ts.iter() {
                 tmask.push(term_mask(t, bands.as_slice()));
             }
             direct.push((ts.clone(), tmask.clone()));
-            // Its OR terms (v0.17, `multi_index`), owned as its terms
+            // Its OR terms (v0.17, `planner`), owned as its terms
             // are.
-            #[cfg(feature = "multi_index")]
             let ors = {
                 let ok = |ci: usize| {
                     let owner = on_of.as_slice().get(ci).copied().flatten();
@@ -1519,15 +1513,12 @@ impl<S: Storage> Connection<S> {
                 good,
                 left,
                 cross: sp.kind == crate::sql::JoinKind::Cross,
-                #[cfg(feature = "flatten")]
                 after: 0,
-                #[cfg(feature = "flatten")]
                 semi: sp.exists,
                 auto_ok: sp.hint == crate::query::Hint::Any,
                 root: sp.root,
                 stat: self.table_has_stat(t),
                 vt: None,
-                #[cfg(feature = "multi_index")]
                 ors,
             });
         }
@@ -1535,8 +1526,7 @@ impl<S: Storage> Connection<S> {
             return Ok(false);
         }
         // A semi-join source follows every source its terms read
-        // (v0.17, `flatten`).
-        #[cfg(feature = "flatten")]
+        // (v0.17, `planner`).
         for (i, js) in jsrcs.as_mut_slice().iter_mut().enumerate() {
             if sources.as_slice().get(i).is_some_and(|sp| sp.exists) {
                 let me = 1u64 << i;
@@ -1678,9 +1668,8 @@ impl<S: Storage> Connection<S> {
                 continue;
             };
             let reverse = plan.rev & (1u64 << pos) != 0;
-            // A MULTI-INDEX OR loop (v0.17, `multi_index`): each branch
+            // A MULTI-INDEX OR loop (v0.17, `planner`): each branch
             // planned on the table alone, the sources before it given.
-            #[cfg(feature = "multi_index")]
             let or_acc = jl.l.or.and_then(|k| js.ors.as_slice().get(k)).map(|info| {
                 let me = 1u64 << i;
                 let me_band = bands.as_slice().get(i).copied().unwrap_or(RefRange {
@@ -1735,8 +1724,6 @@ impl<S: Storage> Connection<S> {
                 a.or = Some(Box::new(o));
                 a
             });
-            #[cfg(not(feature = "multi_index"))]
-            let or_acc: Option<crate::xplan::IdxAccess> = None;
             let mut acc = if let Some(a) = or_acc {
                 Some(a)
             } else if jl.auto {
@@ -1759,9 +1746,7 @@ impl<S: Storage> Connection<S> {
                         sorted: 0,
                         reverse: false,
                         bignull: None,
-                        #[cfg(feature = "multi_index")]
                         or: None,
-                        #[cfg(feature = "multi_index")]
                         skip: 0,
                     },
                     false,
@@ -1924,9 +1909,8 @@ impl<S: Storage> Connection<S> {
         }
         // A WHERE term the last source it reads is a semi-join's is
         // checked at that loop, where the pin codes it (v0.17 review
-        // fix, `flatten`: an uncorrelated EXISTS's own term ran the
+        // fix, `planner`: an uncorrelated EXISTS's own term ran the
         // whole join below each of its rows).
-        #[cfg(feature = "flatten")]
         if sources.iter().any(|s| s.exists)
             && let Some(f) = filter.take()
         {
@@ -2069,9 +2053,9 @@ impl<S: Storage> Connection<S> {
             sp.eqp.nat_distinct = plan.distinct_ordered;
             sp.eqp.joined = true;
         }
-        #[cfg(all(feature = "multi_index", not(feature = "explain")))]
+        #[cfg(all(feature = "planner", not(feature = "explain")))]
         let _ = mm;
-        #[cfg(all(feature = "multi_index", feature = "explain"))]
+        #[cfg(all(feature = "planner", feature = "explain"))]
         if mm {
             for sp in sources.as_mut_slice() {
                 sp.eqp.minmax = 1 + u8::from(plan.ob_sat >= 1);
@@ -2156,7 +2140,7 @@ fn vt_masks(
     }
 }
 
-/// The statistics the planner reads (v0.17, `join_order`), held as
+/// The statistics the planner reads (v0.17, `planner`), held as
 /// the pin holds them on its schema objects: per table its
 /// `nRowLogEst` and `TF_HasStat1`, per index its `aiRowLogEst` and
 /// `hasStat1` (ASCII names, matched case-blind). They are set when
@@ -2454,7 +2438,7 @@ impl<S: Storage> Connection<S> {
         self.stat.tabs.iter().find(|(x, ..)| eq_ci(x.as_slice(), n))
     }
 
-    /// Table `t`'s `nRowLogEst` (v0.17, `join_order`).
+    /// Table `t`'s `nRowLogEst` (v0.17, `planner`).
     pub(super) fn table_rows(&self, t: &crate::schema::TableDef) -> i32 {
         self.stat_tab(t).map_or(crate::xplan::ROWS, |e| e.1)
     }
@@ -2480,7 +2464,6 @@ impl<S: Storage> Connection<S> {
     }
 
     /// Index `ix`'s `sqlite_stat1` keywords (`IdxOpts`).
-    #[cfg(feature = "multi_index")]
     pub(super) fn index_opts(&self, ix: &crate::schema::IndexDef) -> IdxOpts {
         let n = handle_bytes(&self.catalog_arena, ix.name);
         self.stat

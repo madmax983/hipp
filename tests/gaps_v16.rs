@@ -31,7 +31,7 @@
 //!   temp INSERT / CREATE TABLE ... AS fed by a SELECT over main,
 //!   temp views over both, pragma functions on temp objects.
 
-#![cfg(feature = "v16")]
+#![cfg(feature = "sql")]
 
 mod common;
 

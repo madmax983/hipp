@@ -10,10 +10,12 @@ aspirations.
 
 - **Phase:** 0.16.0 released — v0.16, the SQLite-parity push (ADR
   0001: silent wrong answers fixed ungated, new dialect behind the
-  `v16` rung / leaf features, the tiny profile never grows; ADR
+  `sql` feature / leaf features, the tiny profile never grows; ADR
   0002 / 0003: the `max` profile), on the v0.15 foundation (SPEC §2).
   `CHANGELOG.md` summarises the release. v0.17 (the parity backlog:
-  the v0.16 units' honest gaps) is in progress on top of it.
+  the v0.16 units' honest gaps) is in progress on top of it; its
+  features are named for what they enable (ADR 0006: `query`,
+  `write`, `sql`, `planner` replace the version-numbered features).
 - **Pinned claim version:** SQLite **3.54.1** (decision D1). The
   differential suite in `tests/` runs against a locally built
   3.54.1 oracle; `PRAGMA integrity_check` passes on hipp-written
@@ -22,30 +24,31 @@ aspirations.
 - **Profile measured:** `tiny` profile (`opt-level = "z"`, LTO) on
   `thumbv7em-none-eabihf`.
 
-## Profiles and features (0.16.0)
+## Profiles and features
 
 Four size-gated `no_std` profiles (thumbv7em, `opt-level = "z"`,
 LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,960 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 507,592 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,031,072 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,142,128 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,124 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 476,476 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 962,300 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,058,824 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
-- **`full`** adds the ladder rungs and two leaves:
-  `indexes` (index B-trees, UNIQUE), `v04` (joins, aggregates,
-  expressions, ALTER ADD COLUMN), `v05` (UPDATE / DELETE / DROP),
-  `v06` (subqueries), `v07` (OR conflict clauses, UPDATE FROM,
-  RETURNING, upsert), `v08` (INSERT ... SELECT), `v09` (compounds,
-  derived tables), `v10` (subqueries in aggregates), `v16` (the
-  parity rung: query shape, collations, operators, the function
-  library, aggregate completion, PRAGMA, views and CTEs, savepoints
-  and maintenance, ALTER / AUTOINCREMENT / TEMP, depth limits),
-  `params` (bound parameters), `math` (math functions).
+- **`full`** adds the core dialect and two leaves: `indexes` (index
+  B-trees, UNIQUE), `query` (joins, aggregates, the expression
+  evaluator, CHECK / DEFAULT / generated columns / STRICT, ALTER ADD
+  COLUMN), `write` (UPDATE / DELETE / DROP TABLE; implies `query`),
+  `sql` (the rest of the dialect; implies `write`: subqueries, OR
+  conflict clauses, UPDATE FROM, RETURNING, upsert, INSERT ...
+  SELECT, compounds, derived tables, query shape, collations,
+  operators, the function library, aggregate completion, PRAGMA,
+  views and CTEs, savepoints and maintenance, ALTER / AUTOINCREMENT
+  / TEMP, depth limits), `params` (bound parameters), `math` (math
+  functions).
 - **`max`** adds the heavyweight leaves: `window` (window functions),
   `triggers`, `foreign_keys`, `json` (JSON / JSONB), `expr_index`
   (expression and partial indexes, index-aware planning),
@@ -53,12 +56,16 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `autovacuum`, `vtab` (virtual tables, generate_series, dbstat),
   `rtree`, `fts5`, `explain` (EXPLAIN QUERY PLAN).
 - **`xl`** adds the leaves past `max`'s budget (ADR 0004):
-  `fts5_delete` (FTS5 tombstones and secure-delete), `join_order`
+  `fts5_delete` (FTS5 tombstones and secure-delete) and `planner`
   (the pin's join order, automatic indexes, Bloom filters,
-  `sqlite_stat1`), `multi_index` (MULTI-INDEX OR, min() / max()
-  lookups, skip-scans, the IN operator's statistics rules), `flatten`
-  (the query flattener, WHERE push-down, unused subquery columns,
-  EXISTS-to-join, foreign-key child scans in EXPLAIN QUERY PLAN).
+  `sqlite_stat1`; MULTI-INDEX OR, min() / max() lookups, skip-scans,
+  the IN operator's statistics rules; the query flattener, WHERE
+  push-down, unused subquery columns, EXISTS-to-join, foreign-key
+  child scans in EXPLAIN QUERY PLAN).
+- Every leaf of `max` / `xl` that builds on the dialect implies
+  `sql`; `math` implies only `query`. The features before 0.17 were
+  named by milestone (`v04` ... `v16`, and `join_order` /
+  `multi_index` / `flatten`); `CHANGELOG.md` has the old → new table.
 
 ## What v0.17 does
 
@@ -81,7 +88,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   outer rows, an ORDER BY naming a result column sorts on the value
   returned (`random() AS r ... ORDER BY r`), a one-row aggregate
   drops its ORDER BY as the pin does, and the CLI exits 1 after a
-  stdin script whose statement failed. Ungated in the `v16`
+  stdin script whose statement failed. Ungated in the `sql`
   executor (`src/session/stream.rs`).
 - **FTS5 delete writes** (leaf `fts5_delete`, in `xl`). DELETE,
   UPDATE and INSERT OR REPLACE on `contentless_delete=1` tables
@@ -101,7 +108,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   term's and the rowid's page). Without the leaf those writes are
   refused as in 0.16 (`src/fts5/sdel.rs`). OR FAIL / OR ROLLBACK on
   fts5 writes now resolve as on the pin (ungated).
-- **Join ordering and automatic indexes** (leaf `join_order`, in
+- **Join ordering and automatic indexes** (leaf `planner`, in
   `xl`). A join of two or more tables, virtual tables or JSON
   table-valued functions is planned as the pin's `where.c` plans it:
   per-loop costs with prerequisites, the N-best path solver with
@@ -120,7 +127,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   use and give the pin's estimates, and the statistics a connection
   holds follow DDL as the pin's do. Without the leaf joins run in
   FROM order as in 0.16 (`src/xjoin.rs`, `src/session/join.rs`).
-- **Index strategies** (leaf `multi_index`, in `xl`). The pin's
+- **Index strategies** (leaf `planner`, in `xl`). The pin's
   other loop kinds: the MULTI-INDEX OR (`WHERE a = 1 OR b = 2` reads
   each branch through its own index or the rowid, each row once, in
   the pin's branch order — for one table, as a join loop, and for
@@ -141,7 +148,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   (v)`, is planned as the pin's parser leaves it; `a = 'y' COLLATE
   NOCASE ORDER BY a` returned rows out of order. Without the leaf
   plans are as in 0.16 (`src/xmulti.rs`).
-- **Query flattening** (leaf `flatten`, in `xl`). Views, CTEs and
+- **Query flattening** (leaf `planner`, in `xl`). Views, CTEs and
   FROM subqueries the pin's `sqlite3FlattenSubquery` merges into
   their reader are merged by hipp too (its numbered restrictions; a
   LEFT JOIN's right side with its NULL-row guard; the subquery's LIMIT
@@ -165,6 +172,53 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   outer row's matches only; a LIMITed FROM subquery computed its
   result columns past the LIMIT. Without the leaf subqueries plan as
   in 0.16 (`src/session/flatten.rs`).
+- **Size pass: one shared sort** (no feature). Every sort in the engine
+  — ORDER BY, GROUP BY, compounds, windows, aggregate ORDER BY, IN
+  lists, the planner's orders, sorted writes — goes through one
+  non-generic stable merge sort over an index permutation
+  (`arena::sort_perm`) instead of a `slice::sort` copy per element
+  type and comparator: full −26,352 B, max −62,688 B, xl −76,948 B,
+  tiny unchanged, rows and tie order unchanged against the pin. Fixed
+  on the way, ungated: an fts5 `ORDER BY rank` whose bm25 score is NaN
+  (an infinite rank weight) sorts those rows as the pin's NULL —
+  first ascending, last descending — instead of leaving them (and, in
+  a mixed corpus, the finite ranks around them) where the sort happened
+  to put them.
+- **Size pass: monomorphic glue** (no feature). Machinery Rust
+  compiled once per type is compiled once: the expression evaluator's
+  helpers, conditions and aggregate walks no longer have both an
+  `Error<()>` and a storage-error copy, the B-tree balance computes
+  its split points once for every cell type, and a statement's plan is
+  shared, not deep-copied, each time it runs (a correlated subquery
+  no longer copies its plan per outer row): tiny −700 B, full
+  −4,060 B, max −4,068 B, xl −4,564 B. Rows, errors and file bytes
+  are unchanged against the pin.
+- **Size pass: sync islands** (no feature). The sync code inside
+  mostly-sync async bodies — the schema load, the integrity check's
+  row checks, the streamed query's setup, subquery ORDER BY windows,
+  statement preparation, trigger-failure resolution — runs in
+  out-of-line sync functions, and the futures keep only their I/O:
+  tiny −136 B, full −704 B, max −2,024 B, xl −1,808 B with its
+  review fixes; every split that measured larger was reverted
+  (STATUS.md lists both). With the two units above this closes Stage 1
+  of ADR 0005: tiny −836 B, full −31,116 B, max −68,780 B (86,284 B
+  of headroom under 1 MiB), xl −83,320 B. Rows, errors and file bytes
+  are unchanged against the pin, except three integrity-check fixes
+  found in review: "row N missing from index X" names the broken
+  index (it named another index of the table), a partial index gets
+  no "wrong # of entries" line (the pin keeps no such count), and a
+  non-STRICT column's stored type is checked against its affinity
+  ("NUMERIC value in t.c" / "TEXT value in t.c", as on the pin).
+- **Features named for capabilities** (breaking rename, ADR 0006).
+  `query` (was `v04`), `write` (was `v05`) and `sql` (was `v06` ...
+  `v10` and `v16`) replace the milestone-numbered features, and one
+  leaf `planner` (in `xl`) replaces `join_order`, `multi_index` and
+  `flatten`. The profiles keep their names and contents; code only an
+  intermediate feature could reach is gone. No behaviour change, and
+  the code is the same: a mechanical rename of the old tree links to
+  byte-identical sections. The new names alone (they enter the
+  crate's metadata hash and so rustc's item order) move max by +8 B
+  and xl by +16 B of alignment padding (STATUS.md has the table).
 
 ## What v0.16 does
 
@@ -178,7 +232,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   a later source (hoisted on inner joins, refused on outer
   ones); `ORDER BY ... NULLS FIRST / LAST` honoured
   everywhere; the pin's ordinal / alias / HAVING term rules;
-  `NULL IN (<empty>)` = 0. Behind the new `v16` rung:
+  `NULL IN (<empty>)` = 0. Behind `sql` (then the new `v16` feature):
   LIMIT / OFFSET as expressions (constant or uncorrelated
   subquery, the pin's integer conversion), result-column
   aliases inside WHERE / ON / GROUP BY / HAVING / ORDER BY,
@@ -206,10 +260,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   record layout (files interoperate both ways), indexable,
   recomputed on UPDATE; UPDATE ... FROM applying only the last
   matching combination (in hipp's join order; the pin's join order
-  with v0.17's `join_order`); MustBeInt rowid
+  with v0.17's `planner`); MustBeInt rowid
   conversion. The tiny profile refuses those clauses
   (`RequiresEvaluator`) instead of ignoring them, and still
-  shrank. Behind `v16`: INSERT ... DEFAULT VALUES, CREATE TABLE
+  shrank. Behind `sql`: INSERT ... DEFAULT VALUES, CREATE TABLE
   ... AS SELECT (the pin's column names, declared types and
   schema text, byte for byte) and STRICT tables. (WITHOUT ROWID
   came later, in its own leaf: see below.) Review fixes (every profile): CREATE TABLE
@@ -227,9 +281,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   tiny profile dropped 5.5 KB); ALTER TABLE ADD COLUMN takes
   non-constant defaults, NOT NULL and STORED columns on an empty
   table; one clock read per statement; hipp-cli supplies the
-  system clock; below `v16` CREATE TABLE refuses AUTOINCREMENT
+  system clock; below `sql` CREATE TABLE refuses AUTOINCREMENT
   (those builds keep no `sqlite_sequence`, and such a table read
-  as malformed on the pin; `v16` maintains it, see below).
+  as malformed on the pin; `sql` maintains it, see below).
 - **Collations and pattern matching.** Ungated (column
   `COLLATE` was parsed and ignored): BINARY / NOCASE / RTRIM
   column collations with the pin's selection rule in every
@@ -254,7 +308,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `IN (list)` converts by its left operand's affinity only, and
   UPDATE OR REPLACE no longer revives rows its own REPLACE
   deleted. Behind
-  `v16`: the `expr COLLATE name` operator, GLOB / NOT GLOB,
+  `sql`: the `expr COLLATE name` operator, GLOB / NOT GLOB,
   `LIKE ... ESCAPE`, and `like()` / `glob()`.
 - **Bound parameters** (leaf feature `params`, in `full`;
   not in the tiny profile, but it builds on it alone): `?`,
@@ -308,7 +362,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   in that query's WHERE it is "misuse of aggregate"); an
   aggregate in ORDER BY alone no longer aggregates the query;
   a qualifier naming an inner source that lacks the column
-  falls through to the outer scopes. Behind `v16`: `&` `|`
+  falls through to the outer scopes. Behind `sql`: `&` `|`
   `<<` `>>` `~` with the pin's integer coercion and shift
   rules, `IS [NOT] DISTINCT FROM`, postfix `NOT NULL`, and row
   values — `(a, b) = / <> / < / <= / > / >= / IS (c, d)`,
@@ -333,7 +387,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   ((SELECT ...), 2)` parses; a bare reserved word is no alias
   (`SELECT 1 NOT`, `SELECT 1 AS` are syntax errors). The tiny
   profile did not grow.
-- **Scalar function library.** Behind `v16`: `printf()` /
+- **Scalar function library.** Behind `sql`: `printf()` /
   `format()` with the pin's whole conversion set (`%d %i %u %x
   %X %o %p %r %c %s %z %q %Q %w %j %J %f %e %E %g %G %% %n`, the
   flags `- + space 0 # , !`, width / precision / `*`, the `#`
@@ -367,13 +421,13 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   LIKE walk text in place (no per-character list, so the pin's
   largest legal text no longer runs out of memory); `INSERT` /
   `UPDATE OR FAIL` keep the rows changed before the violation
-  (it was treated as ABORT); behind `v16`, a DEFAULT reading
+  (it was treated as ABORT); behind `sql`, a DEFAULT reading
   `last_insert_rowid()` / `random()` is evaluated per row,
   `f(*)` is `f()` and DISTINCT is ignored on scalar functions.
   `sqlite_source_id()` stays undefined (hipp is not the pin's
   source check-in). The tiny profile grew by 8 bytes (the
   overflow-chain fix on its INSERT path).
-- **Aggregate completion.** Behind `v16`: `string_agg(X, SEP)`;
+- **Aggregate completion.** Behind `sql`: `string_agg(X, SEP)`;
   the aggregate ORDER BY (`group_concat(b, ',' ORDER BY a DESC,
   b)`) on every aggregate that takes it — a stable sort of the
   stepped rows, dropped by min / max as on the pin; DISTINCT
@@ -403,7 +457,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `+inf` and `-inf`, `inf - inf`) is NULL, as the pin stores it
   (it was a REAL 0.0). The tiny profile did not grow.
 - **Math functions** (leaf feature `math`, in `full`; needs only
-  `v04`): every function the pin builds with
+  `query`): every function the pin builds with
   SQLITE_ENABLE_MATH_FUNCTIONS — `acos` `acosh` `asin` `asinh`
   `atan` `atan2` `atanh` `ceil` / `ceiling` `cos` `cosh`
   `degrees` `exp` `floor` `ln` `log(X)` `log(B, X)` `log10`
@@ -437,7 +491,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   arithmetic and CAST reads bytes, so a non-UTF-8 tail no longer
   zeroes it (`x'38ff' + 0` is 8).
 
-- **PRAGMA statements and `sqlite_schema`** (behind `v16`):
+- **PRAGMA statements and `sqlite_schema`** (behind `sql`):
   `PRAGMA [main.]name [= value | (value)]` with the pin's value
   grammar and conversions; header values (`user_version`,
   `application_id` read and write inside transactions;
@@ -483,7 +537,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   in a damaged file (STATUS.md).
 
 - **Executed views and common table expressions** (behind
-  `v16`): views are read wherever a table is — FROM, joins
+  `sql`): views are read wherever a table is — FROM, joins
   (NATURAL / USING / RIGHT / FULL), subqueries, `x IN view`,
   compound members, view-on-view, UPDATE ... FROM, INSERT ...
   SELECT, CREATE TABLE ... AS — with `CREATE VIEW v(a, b)`
@@ -524,7 +578,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   demoted affinity where the pin pushes some WHERE terms into
   each core (STATUS.md).
 
-- **Savepoints and maintenance statements** (behind `v16`):
+- **Savepoints and maintenance statements** (behind `sql`):
   `SAVEPOINT` / `RELEASE [SAVEPOINT]` / `ROLLBACK [TRANSACTION]
   TO [SAVEPOINT]` with the pin's nesting (a SAVEPOINT outside a
   transaction starts one and releasing it commits; ROLLBACK TO
@@ -563,7 +617,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   without the `autovacuum` leaf (refused: no pointer-map upkeep; the
   honest-gap sweep refuses every other write to such a file too, and
   the leaf lifts both) (STATUS.md).
-- **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `v16`):
+- **ALTER TABLE, AUTOINCREMENT and TEMP tables** (behind `sql`):
   `ALTER TABLE t RENAME TO u`, `RENAME [COLUMN] a TO b` and `DROP
   [COLUMN] a` edit the stored schema texts token by token exactly
   as the pin does — byte-identical `sqlite_schema` rows for the
@@ -586,7 +640,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   catalog as the file is, and "database or disk is full" rolls the
   transaction back as the pin does. hipp-cli's `.schema` /
   `.tables` / `.dump` follow. Ungated
-  fixes: a pin-made AUTOINCREMENT table is read-only below `v16`
+  fixes: a pin-made AUTOINCREMENT table is read-only below `sql`
   (an INSERT left the counter behind), DROP TABLE removes its
   `sqlite_sequence` row, `sqlite_*` tables can no longer be
   indexed, altered or dropped, and ADD COLUMN on a table with
@@ -857,19 +911,19 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   whose header says WAL, or with a non-empty `-wal` beside it
   (which the pin opens in WAL mode whatever the header says), is
   refused at open (`WalUnsupported`), never read stale. Fixed on
-  the way (ungated, `v16`): `PRAGMA journal_mode = w` (a prefix)
+  the way (ungated, `sql`): `PRAGMA journal_mode = w` (a prefix)
   is the pin's WAL, no longer a silent query; `PRAGMA synchronous
   = ...` inside a transaction is the pin's error. Gaps and sizes
   in STATUS.md.
 - **Honest-gap sweep.** Constraint-level `ON CONFLICT` clauses
   (`NOT NULL` / `UNIQUE` / `PRIMARY KEY ... ON CONFLICT ROLLBACK |
   ABORT | FAIL | IGNORE | REPLACE`) are honoured instead of
-  ignored (ungated from `v07`; below it FAIL / IGNORE / REPLACE are
+  ignored (ungated from `sql`; below it FAIL / IGNORE / REPLACE are
   refused at parse) with the pin's precedence — an explicit `OR`
   clause, then the constraint's, then ABORT — its index order
   (REPLACE indexes and the rowid REPLACE last), NOT NULL ...
   REPLACE defaults, CHECK ignoring its clause, and the upsert /
-  trigger / foreign-key interplay. Behind `v16`: `INDEXED BY name`
+  trigger / foreign-key interplay. Behind `sql`: `INDEXED BY name`
   / `NOT INDEXED` in FROM, UPDATE and DELETE (the pin's "no such
   index" and "no query solution"; with `expr_index` the planner uses
   exactly that index, or none); three-part column names
@@ -1064,7 +1118,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   UPDATE / DELETE / INSERT plans — and the CLI prints the shell's
   tree. The statement is planned, never run; plain EXPLAIN (bytecode)
   is refused. Where hipp's strategy differs (no flattening, join
-  reordering and automatic indexes before v0.17's `join_order`,
+  reordering and automatic indexes before v0.17's `planner`,
   MULTI-INDEX OR, min/max lookup) it
   prints what it runs (STATUS.md). Comparing plans fixed access-path
   choices that ordered rows unlike the pin (window functions,
@@ -1129,10 +1183,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 ## What v0.11 does
 
 - Everything v0.10 does (below), plus **subqueries inside
-  aggregate arguments** behind the `v10` feature (default
-  on, implies `v09`; the tiny profile excludes it — the
-  feature ladder's next rung is `v10` because v0.10 itself
-  was an ungated correctness fix and took no rung). The
+  aggregate arguments** behind what is now the `sql` feature
+  (default on; the tiny profile excludes it). The
   v0.6 plan-time refusal is lifted in every aggregate-
   argument position: SELECT list, HAVING, and ORDER BY, in
   top-level queries, subquery bodies, derived tables,
@@ -1178,8 +1230,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 ## What v0.9 does
 
 - Everything v0.8 does (below), plus the last grammar holes
-  of the claimed profiles behind the `v09` feature (default
-  on, implies `v08`; the tiny profile excludes it):
+  of the claimed profiles behind what is now the `sql` feature
+  (default on; the tiny profile excludes it):
   **compound SELECTs** — `UNION`, `UNION ALL`, `INTERSECT`
   and `EXCEPT` between SELECT cores and `VALUES` cores,
   anywhere a select statement appears (statements, subquery
@@ -1210,8 +1262,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 ## What v0.8 does
 
 - Everything v0.7 does (below), plus the
-  correctness-and-completion pass behind the `v08` feature
-  (default on, implies `v07`; the tiny profile excludes it):
+  correctness-and-completion pass behind what is now the `sql`
+  feature (default on; the tiny profile excludes it):
   `INSERT INTO ... SELECT` — the full SELECT grammar as a row
   source (joins, aggregates, GROUP BY, DISTINCT, ORDER BY /
   LIMIT, no-FROM selects, column lists), composing with the
@@ -1244,8 +1296,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 ## What v0.7 does
 
 - Everything v0.6 does (below), plus the write-side
-  completion behind the `v07` feature (default on, implies
-  `v06`; the tiny profile excludes it): `OR REPLACE` /
+  completion behind what is now the `sql` feature (default on;
+  the tiny profile excludes it): `OR REPLACE` /
   `OR IGNORE` / `OR ABORT` conflict clauses on INSERT and
   UPDATE (plus the `REPLACE` verb), where REPLACE deletes
   every row the proposal or update collides with — through
@@ -1267,8 +1319,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 ## What v0.6 does
 
 - Everything v0.5 does (below), plus subqueries in
-  expressions behind the `v06` feature (default on, implies
-  `v05`; the tiny profile excludes it): scalar subqueries,
+  expressions behind what is now the `sql` feature (default on,
+  implies `write`; the tiny profile excludes it): scalar subqueries,
   `x [NOT] IN (SELECT ...)`, and `EXISTS (SELECT ...)` in
   SELECT lists, WHERE, ON, GROUP BY, HAVING, ORDER BY,
   UPDATE SET/WHERE, and DELETE WHERE. Uncorrelated and
@@ -1286,7 +1338,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 ## What v0.5 does
 
 - Everything v0.4 does (below), plus the write side behind the
-  `v05` feature (default on; the tiny profile excludes it):
+  `write` feature (default on, implies `query`; the tiny profile
+  excludes it):
   `UPDATE` (with `OR IGNORE`, table aliases, and general
   expressions that read the original row), `DELETE`, and
   `DROP TABLE`, all with full index maintenance — updated and
@@ -1303,7 +1356,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 ## What v0.4 does
 
 - Everything v0.3 does (below), plus the v0.4 dialect behind the
-  `v04` feature (default on; the tiny profile excludes it):
+  `query` feature (default on; the tiny profile excludes it):
   nested-loop joins (`JOIN` / `LEFT JOIN` / `CROSS JOIN` /
   comma joins, `ON` expressions, aliases, self-joins),
   aggregates (`count`/`sum`/`avg`/`total`/`min`/`max`/
@@ -1362,7 +1415,7 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | Gate | Budget | Measured (0.16.0) |
 |---|---|---|
-| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 507,592 B of 512 KiB, `max` 1,031,072 B of 1 MiB, `xl` 1,142,128 B of 1.25 MiB; ADR 0003 / 0004) |
+| Linked `.text` + `.rodata` (thumbv7em) | ≤ 128 KiB | **76,960 B** (`full` 481,240 B of 512 KiB, `max` 968,384 B of 1 MiB, `xl` 1,065,180 B of 1.25 MiB; ADR 0003 / 0004) |
 | Engine statics (`.data` + `.bss`, excl. caller heap) | ≤ 8 KiB | **0 B** |
 | Engine RAM, tiny config (pool + arenas) | ≤ 64 KiB | within (see `tests/gates.rs`) |
 | Steady-state scan allocations after warm-up | 0 | **0** (`tests/gates.rs`) |
@@ -1390,9 +1443,9 @@ misreads it: without `wal` a WAL file (or a non-empty `-wal`) is
 refused (`WalUnsupported`); without `without_rowid`, `utf16` or `vtab`
 a file holding such tables or text is refused at open; without
 `autovacuum` an auto-vacuum file is read but not written; without
-`attach`, ATTACH is refused; without `explain`, EXPLAIN is. Below the
-rungs (the tiny profile) there are no indexes, joins, subqueries,
-UPDATE / DELETE or views.
+`attach`, ATTACH is refused; without `explain`, EXPLAIN is. Without
+`indexes`, `query`, `write` and `sql` (the tiny profile) there are no
+indexes, joins, subqueries, UPDATE / DELETE or views.
 
 Not planned in any profile: multi-process locking or a shared `-shm`
 wal-index (WAL is single-process; one connection per database); a

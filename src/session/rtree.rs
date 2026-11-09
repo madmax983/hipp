@@ -253,7 +253,6 @@ fn rowid_expr<E>(arena: &Arena) -> Result<Expr, E> {
     Ok(Expr::Column {
         table: None,
         name: arena.alloc_copy_handle(b"rowid")?,
-        #[cfg(feature = "v16")]
         schema: None,
     })
 }
@@ -593,7 +592,7 @@ impl<S: Storage> Statement<'_, S> {
                 // A DELETE collects its rowids in a RowSet on the pin:
                 // the rows go in rowid order, each once.
                 if sets.is_none() {
-                    work.as_mut_slice().sort_by_key(|w| w.0);
+                    crate::arena::sort_by(work.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
                     let mut kept: AVec<(Option<i64>, Option<AVec<OwnedValue>>)> = AVec::new();
                     for w in work.iter() {
                         if kept.as_slice().last().is_none_or(|k| k.0 != w.0) {

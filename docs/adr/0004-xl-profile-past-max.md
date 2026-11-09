@@ -1,5 +1,12 @@
 # ADR 0004 — An `xl` profile for the leaves past `max`
 
+> **Naming superseded by ADR 0006 (2026-11-08).** The feature names
+> below are those of their time. `v04` is now `query`, `v05` is
+> `write`, `v06` ... `v10` and `v16` are one feature `sql`, and
+> `join_order` / `multi_index` / `flatten` are one leaf `planner` (in
+> `xl`). The decisions recorded here stand; where this ADR says "the
+> `v16` rung", read `sql`. The rest of the text is kept as written.
+
 - **Status:** accepted (2026-11-05), at the start of v0.17
 - **Context:** ADR 0003 closed the 0.16.0 release with `max` at
   1,035,516 B of its 1,048,576 B budget (13,060 B of headroom) and

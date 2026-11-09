@@ -3,7 +3,7 @@
 //! before implementation (STATUS.md, "Scalar function library");
 //! the matrix the tests encode:
 //!
-//! - `printf()` / `format()` (`v16`): the pin's conversion grammar
+//! - `printf()` / `format()` (`sql`): the pin's conversion grammar
 //!   — flags `- + space 0 # , !` in any order, width and precision
 //!   (digits accumulate in 32 bits; `*` reads an argument as a C
 //!   int, a negative width left-justifies), `l` / `ll` ignored —
@@ -20,7 +20,7 @@
 //! - `round()` (ungated fit): `%!.*f` of those digits read back.
 //! - `quote char unicode zeroblob randomblob random concat
 //!   concat_ws octet_length unhex likely unlikely likelihood if
-//!   iif(2+ args) sqlite_version` (`v16`), `last_insert_rowid
+//!   iif(2+ args) sqlite_version` (`sql`), `last_insert_rowid
 //!   changes total_changes` with the pin's counting rules and the
 //!   matching `Connection` methods.
 //! - Ungated fixes: `coalesce` / `ifnull` / `iif` evaluate lazily;

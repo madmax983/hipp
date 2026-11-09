@@ -24,7 +24,7 @@
 //! a statement that names objects of both databases is refused
 //! (`Unsupported`, `refused_when_both_databases_meet`).
 
-#![cfg(feature = "v16")]
+#![cfg(feature = "sql")]
 
 mod common;
 

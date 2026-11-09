@@ -1,4 +1,4 @@
-//! Streamed query execution (v0.17, `v16`; virtual-table cursors
+//! Streamed query execution (v0.17, `sql`; virtual-table cursors
 //! with leaf `vtab`): a top-level SELECT hands its rows to
 //! `Statement::step` one at a time, as the pin's VDBE does, instead
 //! of materialising its result in its first step.
@@ -64,8 +64,8 @@ enum Src {
     Vt(super::vtab::VtCur),
     /// `Level::cache` from the first index given to the second: an
     /// automatic index's span for this combination (v0.17,
-    /// `join_order`).
-    #[cfg(feature = "join_order")]
+    /// `planner`).
+    #[cfg(feature = "planner")]
     Span(usize, usize),
 }
 
@@ -87,16 +87,16 @@ struct Level {
     /// (`SourcePlan::tvf_dead`), put back when its loop ends.
     #[cfg(any(feature = "json", feature = "vtab"))]
     saved: AVec<(usize, OwnedValue)>,
-    /// An automatic index's Bloom filter (v0.17, `join_order`),
+    /// An automatic index's Bloom filter (v0.17, `planner`),
     /// built with `cache`.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     bloom: AVec<u8>,
     /// A lookup loop's Bloom filter (`bloom`) is built.
-    #[cfg(feature = "join_order")]
+    #[cfg(feature = "planner")]
     bloom_built: bool,
     /// A semi-join source's loop made a joined row (v0.17,
-    /// `flatten`): it ends at its next row.
-    #[cfg(feature = "flatten")]
+    /// `planner`): it ends at its next row.
+    #[cfg(feature = "planner")]
     done: bool,
 }
 
@@ -141,7 +141,8 @@ enum Acc {
 
 /// A streamed top-level query in progress (`Statement::stream`).
 pub(super) struct Stream {
-    qp: QueryPlan,
+    /// The statement's plan, shared (not copied) for this execution.
+    qp: alloc::rc::Rc<QueryPlan>,
     levels: AVec<Level>,
     /// Where each source's values start in the joined row.
     bases: AVec<usize>,
@@ -229,26 +230,46 @@ impl<S: Storage> Statement<'_, S> {
     /// executor. Evaluates LIMIT / OFFSET and the WHERE clause's
     /// constant terms, as the materialising executor does first.
     pub(super) async fn stream_open(&mut self) -> Result<Option<Box<Stream>>, S::Error> {
+        let Some(qp) = self.stream_plan() else {
+            return Ok(None);
+        };
+        let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        self.stream_build(qp, window)
+    }
+
+    /// The statement's query plan when it streams (sync part of
+    /// `stream_open`, ADR 0005 Stage 1).
+    #[inline(never)]
+    fn stream_plan(&self) -> Option<alloc::rc::Rc<QueryPlan>> {
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
         if self.conn.in_program() {
-            return Ok(None);
+            return None;
         }
         let Plan::Query(qp) = &self.plan else {
-            return Ok(None);
+            return None;
         };
         if qp.sources.is_empty()
             || !qp.compound.is_empty()
             || !qp.values.is_empty()
             || qp.sources.iter().any(|s| s.kind.pads_left() || s.rec != 0)
         {
-            return Ok(None);
+            return None;
         }
         #[cfg(feature = "window")]
         if !crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice()).is_empty() {
-            return Ok(None);
+            return None;
         }
-        let qp = qp.clone();
-        let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        Some(alloc::rc::Rc::clone(qp))
+    }
+
+    /// Set up the stream of `qp` over the row window `window` (sync
+    /// part of `stream_open`, ADR 0005 Stage 1).
+    #[inline(never)]
+    fn stream_build(
+        &mut self,
+        qp: alloc::rc::Rc<QueryPlan>,
+        window: (usize, usize),
+    ) -> Result<Option<Box<Stream>>, S::Error> {
         // An endless recursive CTE read first through a WHERE or a
         // join under a LIMIT: its rows are computed under a bound
         // that doubles whenever the join has read them all
@@ -350,11 +371,11 @@ impl<S: Storage> Statement<'_, S> {
                 side: (0, 0),
                 #[cfg(any(feature = "json", feature = "vtab"))]
                 saved: AVec::new(),
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 bloom: AVec::new(),
-                #[cfg(feature = "join_order")]
+                #[cfg(feature = "planner")]
                 bloom_built: false,
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 done: false,
             });
         }
@@ -484,7 +505,7 @@ impl<S: Storage> Statement<'_, S> {
                     let k = s.window.0.saturating_add(s.window.1);
                     if !s.capped && out.len() >= k.saturating_mul(2).saturating_add(64) {
                         let enc = self.conn.pager.text_enc();
-                        out.as_mut_slice().sort_by(|x, y| {
+                        crate::arena::sort_by(out.as_mut_slice(), &mut |x, y| {
                             crate::query::order_keys_cmp(
                                 x.keys.as_slice(),
                                 y.keys.as_slice(),
@@ -533,8 +554,8 @@ impl<S: Storage> Statement<'_, S> {
                 };
                 if ok {
                     // Every semi-join loop has its row (v0.17,
-                    // `flatten`).
-                    #[cfg(feature = "flatten")]
+                    // `planner`).
+                    #[cfg(feature = "planner")]
                     for (lv, sp) in s.levels.as_mut_slice().iter_mut().zip(s.qp.sources.iter()) {
                         if sp.exists {
                             lv.done = true;
@@ -592,7 +613,7 @@ impl<S: Storage> Statement<'_, S> {
             let Some(sp) = s.qp.sources.as_slice().get(d) else {
                 return Ok(false);
             };
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             let got = got && !s.levels.as_slice().get(d).is_some_and(|l| l.done);
             if got {
                 let on_ok = match &sp.on {
@@ -693,7 +714,7 @@ impl<S: Storage> Statement<'_, S> {
         lv.any = false;
         lv.padded = false;
         lv.count = 0;
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         {
             lv.done = false;
         }
@@ -761,9 +782,9 @@ impl<S: Storage> Statement<'_, S> {
             }
             return Ok(());
         }
-        // An automatic index (v0.17, `join_order`): the table's rows
+        // An automatic index (v0.17, `planner`): the table's rows
         // sorted on its key once, then this combination's span.
-        #[cfg(feature = "join_order")]
+        #[cfg(feature = "planner")]
         if let Some(ai) = sp.access.as_deref().and_then(|a| a.auto.as_deref()) {
             if lv.cache.is_none() {
                 let rows = alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?;
@@ -793,9 +814,9 @@ impl<S: Storage> Statement<'_, S> {
         if let Some(a) = sp.access.as_deref()
             && a.lateral
         {
-            // v0.17 (`join_order`): the Bloom filter first, built at
+            // v0.17 (`planner`): the Bloom filter first, built at
             // the first probe.
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             if let Some(keys) = &a.bloom {
                 if !lv.bloom_built {
                     lv.bloom = alloc::boxed::Box::pin(self.bloom_rows(sp, keys.as_slice())).await?;
@@ -898,7 +919,7 @@ impl<S: Storage> Statement<'_, S> {
                 Some(r) => (r, pos),
                 None => return Ok(false),
             },
-            #[cfg(feature = "join_order")]
+            #[cfg(feature = "planner")]
             Src::Span(pos, end) => {
                 if *pos >= *end {
                     return Ok(false);

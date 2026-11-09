@@ -3889,6 +3889,7 @@ impl Cursor<'_> {
 /// `limit` of them. The document joins `docs`, where the rows'
 /// key, value, atom and json columns point (`each_column`).
 #[allow(clippy::type_complexity)]
+#[inline(never)]
 pub fn tvf_rows(
     kind: u8,
     args: &[OwnedValue],

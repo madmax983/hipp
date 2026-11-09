@@ -1,44 +1,36 @@
 # One feature set per line, each checked with
 #   cargo clippy --lib --no-default-features --features "<set>" -- -D warnings
 # by CI (features job) and ci/local-gates.sh. An empty line-set is
-# written as `-` (the tiny profile). New feature rungs / leaves add
-# a line for themselves alone and stay covered by `full` (or, for
-# the heavyweight leaves of ADR 0002, by `max`).
+# written as `-` (the tiny profile). New leaves add a line for
+# themselves with only their required features, and stay covered by
+# `full` / `max` / `xl` (ADR 0002 / 0004 / 0006).
 -
 std
 indexes
-v04
-v05
-v06
-v07
-v08
-v09
-v10
-v16
+query
+write
+sql
 params
-v04,math
-v16,window
-v16,triggers
-v16,foreign_keys
-v16,json
-v16,expr_index
-v16,without_rowid
-v16,utf16
-v16,wal
-v16,datetime
-v16,attach
-v16,autovacuum
-v16,vtab
-v16,vtab,rtree
-v16,vtab,without_rowid,math,fts5
-v16,vtab,without_rowid,math,fts5,fts5_delete
-v16,explain
-v16,indexes,expr_index,join_order
-v16,indexes,expr_index,join_order,multi_index
-v16,indexes,expr_index,join_order,flatten
-indexes,v04
-indexes,v05
-indexes,v06
+query,math
+sql,window
+sql,triggers
+sql,foreign_keys
+sql,json
+sql,expr_index
+sql,without_rowid
+sql,utf16
+sql,wal
+sql,datetime
+sql,attach
+sql,autovacuum
+sql,vtab
+sql,vtab,rtree
+sql,vtab,without_rowid,math,fts5
+sql,vtab,without_rowid,math,fts5,fts5_delete
+sql,explain
+sql,indexes,expr_index,planner
+indexes,query
+indexes,write
 full
 std,full
 max

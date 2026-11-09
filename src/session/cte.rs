@@ -1,4 +1,4 @@
-//! Executed views and common table expressions (v0.16, `v16`).
+//! Executed views and common table expressions (v0.16, `sql`).
 //!
 //! Before a statement is planned, every FROM source that names a
 //! view or a common table expression in scope is rewritten into a
@@ -89,8 +89,8 @@ struct Outer {
     /// pin's `SF_ComplexResult`).
     complex: bool,
     /// Its result list or ORDER BY calls a window function (the
-    /// flattener's restriction 25; v0.17, `flatten`).
-    #[cfg(feature = "flatten")]
+    /// flattener's restriction 25; v0.17, `planner`).
+    #[cfg(feature = "planner")]
     win: bool,
 }
 
@@ -152,8 +152,8 @@ struct Expander<'c> {
     /// table neither shadows them nor is read for a missing one.
     fix_main: bool,
     /// Walking the SELECT of an `x IN (SELECT ...)` (v0.17 review
-    /// fix, `flatten`; see `cte`).
-    #[cfg(feature = "flatten")]
+    /// fix, `planner`; see `cte`).
+    #[cfg(feature = "planner")]
     in_rhs: bool,
 }
 
@@ -186,13 +186,13 @@ impl<S: Storage> Connection<S> {
             fix_main: self.trig.fix_main.get(),
             #[cfg(not(feature = "triggers"))]
             fix_main: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             in_rhs: false,
         }
     }
 
     /// Expand every view and CTE reference in `ast` into a derived
-    /// table (v0.16, `v16`; see the module docs). `None` when the
+    /// table (v0.16, `sql`; see the module docs). `None` when the
     /// statement holds nothing to expand (it plans as written).
     /// INSERT into a view is refused here (`IsView`).
     pub(super) fn expand_ast(&self, arena: &Arena, ast: &Ast) -> Result<Option<Ast>, S::Error> {
@@ -217,7 +217,7 @@ impl<S: Storage> Connection<S> {
     }
 
     /// A view's SELECT with every view and CTE it reads expanded
-    /// (v0.16, `v16`), and its column-name list (empty when none
+    /// (v0.16, `sql`), and its column-name list (empty when none
     /// was written), parsed into `arena`. The shape PRAGMA
     /// table_info and the CLI's `.schema` comment are derived from.
     pub(super) fn expand_view(
@@ -241,7 +241,7 @@ impl<S: Storage> Connection<S> {
             schema: None,
             cte: None,
             indexed: None,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             flat: false,
         };
         x.view::<S::Error>(&mut f, v)?;
@@ -277,7 +277,7 @@ impl<S: Storage> Connection<S> {
 
     /// The column names of view `name` as the pin's shell lists
     /// them in a `.schema` comment and PRAGMA table_info (v0.16,
-    /// `v16`): the view's SELECT is expanded and planned; its
+    /// `sql`): the view's SELECT is expanded and planned; its
     /// column list (of any length), else its result names, made
     /// unique the pin's way (`id`, `id:1`, ...). `None` when the
     /// view does not exist or cannot be planned (a missing table,
@@ -605,10 +605,10 @@ impl Expander<'_> {
 
     fn sources<E>(&mut self, from: &mut [FromSource], o: &Outer) -> Result<(), E> {
         let n = from.len();
-        // v0.17 (`flatten`): which sources hipp's flattener may
+        // v0.17 (`planner`): which sources hipp's flattener may
         // splice next to (a table of main or a FROM subquery; no
         // virtual table, table-valued function or RIGHT / FULL join).
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         let plain: AVec<bool> = {
             let rf = from
                 .iter()
@@ -630,8 +630,8 @@ impl Expander<'_> {
             }
         }
         // The flattener's choice, once every source's
-        // materialization is settled (v0.17, `flatten`).
-        #[cfg(feature = "flatten")]
+        // materialization is settled (v0.17, `planner`).
+        #[cfg(feature = "planner")]
         if self.fixing {
             let ok = plain.iter().all(|p| *p);
             for i in 0..n {
@@ -646,10 +646,10 @@ impl Expander<'_> {
     }
 
     /// A FROM source hipp's flattener may splice into, or out of, its
-    /// reader (v0.17, `flatten`): a FROM subquery (an expanded view or
+    /// reader (v0.17, `planner`): a FROM subquery (an expanded view or
     /// CTE included, not a recursive reference), or a table of main
     /// that is no virtual table.
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     fn plain_src(&self, f: &FromSource) -> bool {
         if f.cte
             .as_ref()
@@ -675,7 +675,7 @@ impl Expander<'_> {
     /// Whether the pin's flattener merges FROM subquery `f` (source
     /// `idx` of a reader shaped `o`, the next source's join `next`)
     /// into its reader, as far as hipp's flattener follows it (v0.17,
-    /// `flatten`): `flattens` and the restrictions it leaves to the
+    /// `planner`): `flattens` and the restrictions it leaves to the
     /// planner — no shared materialization, MATERIALIZED or recursive
     /// CTE (28, 22), no window function on either side (25), no
     /// compound reader. hipp's own limits: no compound body, no
@@ -684,7 +684,7 @@ impl Expander<'_> {
     /// only tables of main and FROM subqueries in the body, and a
     /// LEFT JOIN's right side only as one table with a rowid (whose
     /// NULL row guards the substituted expressions).
-    #[cfg(feature = "flatten")]
+    #[cfg(feature = "planner")]
     fn flat_ok(&self, f: &FromSource, o: &Outer, idx: usize, next: Option<JoinKind>) -> bool {
         if self.returning || o.win || o.compound {
             return false;
@@ -761,14 +761,14 @@ impl Expander<'_> {
                     .unwrap_or((M10d::No, 0));
                 // A NOT MATERIALIZED one read twice is shared by the
                 // references the pin materializes (v0.17 review fix,
-                // `flatten`; `CteUse::lazy`).
-                #[cfg(feature = "flatten")]
+                // `planner`; `CteUse::lazy`).
+                #[cfg(feature = "planner")]
                 if hint == M10d::No && uses >= 2 {
                     c.lazy = true;
                 }
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 let lazy = c.lazy;
-                #[cfg(not(feature = "flatten"))]
+                #[cfg(not(feature = "planner"))]
                 let lazy = false;
                 if !(lazy || hint == M10d::Yes || (hint == M10d::Any && uses >= 2)) {
                     c.mat = 0;
@@ -789,11 +789,11 @@ impl Expander<'_> {
                     rec: RecMark::None,
                     view: false,
                     mat: self.new_mat(M10d::Yes, 1),
-                    #[cfg(feature = "flatten")]
+                    #[cfg(feature = "planner")]
                     is_cte: false,
-                    #[cfg(feature = "flatten")]
+                    #[cfg(feature = "planner")]
                     lazy: false,
-                    #[cfg(feature = "flatten")]
+                    #[cfg(feature = "planner")]
                     grp: 0,
                 }));
             }
@@ -905,7 +905,7 @@ impl Expander<'_> {
                     // (Without the flattener a pushed-down copy takes
                     // no part; with it, it is a member that computes
                     // its own rows, `CteUse::grp`.)
-                    if pushed && cfg!(not(feature = "flatten")) {
+                    if pushed && cfg!(not(feature = "planner")) {
                         c.mat = 0;
                         continue;
                     }
@@ -926,7 +926,7 @@ impl Expander<'_> {
                         }
                     };
                     c.mat = if pushed { 0 } else { id };
-                    #[cfg(feature = "flatten")]
+                    #[cfg(feature = "planner")]
                     {
                         c.grp = id;
                     }
@@ -989,11 +989,11 @@ impl Expander<'_> {
             rec: RecMark::None,
             view: true,
             mat: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             is_cte: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             lazy: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             grp: 0,
         }));
         Ok(())
@@ -1033,12 +1033,12 @@ impl Expander<'_> {
             .get_mut((mat as usize).wrapping_sub(1))
         {
             // Inside an `x IN (SELECT ...)` the pin counts each
-            // reference twice (v0.17 review fix, `flatten`: probed, a
+            // reference twice (v0.17 review fix, `planner`: probed, a
             // CTE read only there is a MATERIALIZE, never a
             // CO-ROUTINE).
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             let uses = if self.in_rhs { 2 } else { 1 };
-            #[cfg(not(feature = "flatten"))]
+            #[cfg(not(feature = "planner"))]
             let uses = 1;
             m.1 = m.1.saturating_add(uses);
         }
@@ -1077,11 +1077,11 @@ impl Expander<'_> {
             },
             view: false,
             mat,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             is_cte: true,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             lazy: false,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             grp: 0,
         }));
         Ok(())
@@ -1141,11 +1141,11 @@ impl Expander<'_> {
                             rec: RecMark::Ref { id },
                             view: false,
                             mat: 0,
-                            #[cfg(feature = "flatten")]
+                            #[cfg(feature = "planner")]
                             is_cte: true,
-                            #[cfg(feature = "flatten")]
+                            #[cfg(feature = "planner")]
                             lazy: false,
-                            #[cfg(feature = "flatten")]
+                            #[cfg(feature = "planner")]
                             grp: 0,
                         }));
                     }
@@ -1235,10 +1235,10 @@ impl Expander<'_> {
             }
             Expr::InSubquery(a, s, _) => {
                 self.expr::<E>(a)?;
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 let was = core::mem::replace(&mut self.in_rhs, true);
                 let r = self.select::<E>(s);
-                #[cfg(feature = "flatten")]
+                #[cfg(feature = "planner")]
                 {
                     self.in_rhs = was;
                 }
@@ -1336,14 +1336,14 @@ fn outer_of(s: &SelectStmt, tail: bool, compound: bool, arena: &Arena) -> Outer 
             }),
             _ => false,
         }),
-        #[cfg(feature = "flatten")]
+        #[cfg(feature = "planner")]
         win: core_win(s),
     }
 }
 
 /// Whether core `s`'s result list or ORDER BY calls a window
 /// function (v0.16, `window`).
-#[cfg(feature = "flatten")]
+#[cfg(feature = "planner")]
 fn core_win(s: &SelectStmt) -> bool {
     #[cfg(feature = "window")]
     {
@@ -1632,7 +1632,7 @@ pub(super) struct RecShape {
 }
 
 impl<S: Storage> Connection<S> {
-    /// A derived view / CTE table's column names (v0.16, `v16`):
+    /// A derived view / CTE table's column names (v0.16, `sql`):
     /// its column list when one was written — which must have the
     /// SELECT's width (the pin's "expected N columns for 'v' but
     /// got M" / "table x has M values for N columns") — else the
@@ -1657,7 +1657,7 @@ impl<S: Storage> Connection<S> {
         }
     }
 
-    /// Plan a recursive CTE's body (v0.16, `v16`): the setup
+    /// Plan a recursive CTE's body (v0.16, `sql`): the setup
     /// cores (`0 .. split`) as a compound, then each recursive
     /// SELECT with its recursive reference shaped like the setup's
     /// result (names from the CTE's column list or the leftmost
@@ -1808,7 +1808,7 @@ impl<S: Storage> Connection<S> {
         Ok((tails, keys))
     }
 
-    /// Plan a recursive reference (v0.16, `v16`): a one-row
+    /// Plan a recursive reference (v0.16, `sql`): a one-row
     /// source shaped like its CTE (`plan_recursive`). Returns its
     /// width.
     pub(super) fn plan_rec_ref(
@@ -1861,11 +1861,10 @@ impl<S: Storage> Connection<S> {
             access: None,
             #[cfg(feature = "expr_index")]
             hint: crate::query::Hint::Any,
-            #[cfg(feature = "v16")]
             temp: false,
             #[cfg(feature = "attach")]
             ext: 0,
-            #[cfg(feature = "flatten")]
+            #[cfg(feature = "planner")]
             exists: false,
         });
         Ok(w)
@@ -1952,7 +1951,7 @@ impl RecQueue<'_> {
 
 impl<S: Storage> Statement<'_, S> {
     /// The rows of a derived table that shares a materialization
-    /// (v0.16 review fix, `v16`; `SubPlan::mat`): computed by the
+    /// (v0.16 review fix, `sql`; `SubPlan::mat`): computed by the
     /// first reader of this execution, then served to every other.
     /// A recursive CTE is computed only as far as a bounded reader
     /// needs (`need`), and again when a later reader needs more.
@@ -1982,7 +1981,7 @@ impl<S: Storage> Statement<'_, S> {
         Ok(rows)
     }
 
-    /// Run a recursive CTE (v0.16, `v16`; the pin's
+    /// Run a recursive CTE (v0.16, `sql`; the pin's
     /// `generateWithRecursiveQuery`): LIMIT / OFFSET evaluate
     /// first (a LIMIT of 0 runs nothing), the setup's rows enter
     /// the queue, then each row taken from the queue is output

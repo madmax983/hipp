@@ -938,7 +938,7 @@ impl WrState {
             let k = self.key_values::<()>(root, *h, false).ok().flatten();
             keyed.push((k, *h));
         }
-        keyed.as_mut_slice().sort_by(|a, b| match (&a.0, &b.0) {
+        crate::arena::sort_by(keyed.as_mut_slice(), &mut |a, b| match (&a.0, &b.0) {
             (Some(x), Some(y)) => {
                 crate::btree::compare_entries(x.as_slice(), y.as_slice(), t.orders.as_slice(), enc)
             }

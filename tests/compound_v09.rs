@@ -1,5 +1,5 @@
 //! v0.9 differentials vs the pinned oracle (SPEC §2 phases,
-//! feature `v09`): compound SELECTs (UNION / UNION ALL /
+//! feature `sql`): compound SELECTs (UNION / UNION ALL /
 //! INTERSECT / EXCEPT between SELECT and VALUES cores) and
 //! FROM-clause derived tables. Every compound rule below was
 //! probed against the pin before implementation:
