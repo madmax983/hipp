@@ -453,6 +453,45 @@ fn big_tables_match_the_pin() {
     corpus(&base, "b", &strict(), BIG);
 }
 
+/// Index keys that spill to overflow pages (v0.17 review fix): at
+/// 512-byte pages a 100-byte key, at the default size an 1100-byte
+/// one, each with one overflow page. A seek decodes every binary-search
+/// midpoint on every level and a walk every entry, overflow pages
+/// included — at the default cache and at one frame, as on the pin.
+fn ovf_setup(page: u32, rows: u32, width: u32) -> String {
+    format!(
+        "PRAGMA page_size = {page}; CREATE TABLE t(a INTEGER PRIMARY KEY, b); CREATE INDEX tb ON t(b); \
+         WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < {rows}) \
+         INSERT INTO t SELECT i, printf('%0{width}d', (i * 7919) % {m}) FROM r;",
+        m = rows + 1
+    )
+}
+
+#[test]
+fn overflowing_index_keys_match_the_pin() {
+    let small = ovf_setup(512, 3000, 100);
+    let qs: &[&str] = &[
+        "SELECT a FROM t WHERE b >= printf('%0100d', 2998) ORDER BY b DESC;",
+        "SELECT a FROM t WHERE b = printf('%0100d', 123);",
+        "SELECT a FROM t WHERE b IN (printf('%0100d', 7), printf('%0100d', 2999)) ORDER BY b;",
+        "SELECT count(*), min(b) = printf('%0100d', 0), max(b) = printf('%0100d', 3000) FROM t;",
+        "SELECT substr(b, 95), count(*) FROM t WHERE b < printf('%0100d', 5) GROUP BY b ORDER BY b DESC;",
+        "SELECT x.a FROM t x JOIN t y ON y.b = x.b WHERE x.a < 4;",
+    ];
+    let base = pin_file("ovf", &small);
+    corpus(&base, "ovf", &strict(), qs);
+    corpus(&base, "ovf1", &strict().cache_pages(1), qs);
+    let big = ovf_setup(4096, 6000, 1100);
+    let qs: &[&str] = &[
+        "SELECT a FROM t WHERE b = printf('%01100d', 123);",
+        "SELECT a FROM t WHERE b > printf('%01100d', 5995) ORDER BY b DESC;",
+        "SELECT a FROM t WHERE b BETWEEN printf('%01100d', 10) AND printf('%01100d', 12);",
+    ];
+    let base = pin_file("ovfbig", &big);
+    corpus(&base, "ovfb", &strict(), qs);
+    corpus(&base, "ovfb1", &strict().cache_pages(1), qs);
+}
+
 /// Every corpus again with a page cache of one frame, the smallest
 /// the engine allows (the big file is three levels high): nearly
 /// every seek, step and row read misses, the page is read and the
@@ -726,6 +765,353 @@ fn planner_suites_run_strict_on_the_vm() {
     );
     corpus(&pin_file("jos-r", &stat), "jos-r", &small, JO_STAT_Q);
 }
+
+// ---------------- the eqp_v16 and aggregates_v16 corpora ----------------
+
+/// `corpus`, except that the queries `falls_back` names must still
+/// fall back (a later unit's shape: WITHOUT ROWID sources,
+/// `sqlite_schema`, ...): those run on today's executor and give the
+/// pin's rows; every other one runs strict on the VM.
+fn corpus_with_fallbacks(base: &Path, tag: &str, qs: &[&str], falls_back: &dyn Fn(&str) -> bool) {
+    let mut on: Vec<&str> = Vec::new();
+    let mut off: Vec<&str> = Vec::new();
+    for q in qs {
+        if falls_back(q) {
+            off.push(q);
+        } else {
+            on.push(q);
+        }
+    }
+    corpus(base, tag, &strict(), &on);
+    let mut bad = Vec::new();
+    for (i, q) in off.iter().enumerate() {
+        let h = copy_of(base, &format!("vmj17-{tag}f{i}-h"));
+        let o = copy_of(base, &format!("vmj17-{tag}f{i}-o"));
+        let (hr, on_vm, he) = hipp_run(&h, Config::default(), q);
+        let or = pin_run(&o, q);
+        if on_vm && he.is_none() {
+            bad.push(format!("now on the VM (claim it): {q}"));
+        } else if hr != or {
+            bad.push(format!("{q}\n  pin : {or:?}\n  hipp: {hr:?} {he:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+const AGG_T: &str = "CREATE TABLE t(a, b, c TEXT COLLATE NOCASE, r REAL); \
+    INSERT INTO t VALUES (1,'x','A',1.5),(2,'y','a',2),(3,'z','B',NULL),(NULL,'w',NULL,0.1),(2,'v','b',0.2),('7','u','c','x'); \
+    CREATE TABLE u(k); INSERT INTO u VALUES (1),(2); \
+    CREATE TABLE v(k, x, c TEXT COLLATE NOCASE); \
+    INSERT INTO v VALUES (1, 1e308, 'a'), (2, 1e308, 'A'), (3, -1e308, 'b');";
+
+/// (tests/aggregates_v16.rs's MIX, its `x'01'` blob printable here:
+/// the pin's shell prints control bytes as `^A`.)
+const AGG_MIX: &str = "CREATE TABLE t(a, b, c TEXT COLLATE NOCASE, r REAL, d TEXT COLLATE RTRIM); \
+    INSERT INTO t VALUES (1,'x','A',1.5,'p '),(2,'y','a',2,'p'),(3,'z','B',NULL,'q'),(NULL,'w',NULL,0.1,NULL),(2,'v','b',0.2,'q  '),('7','u','c',-3,x'70'),(x'7a7a','t','C',5,'P'),(2.0,'s','é',2.0,'é');";
+
+const AGG_FIN: &str = "CREATE TABLE g(k, v); INSERT INTO g VALUES (1, 5), (2, 9223372036854775807), (2, 1), (3, 'x');";
+
+/// tests/eqp_v16.rs's schema, with rows.
+const EQP_S: &str = "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c, d TEXT, e); \
+    CREATE INDEX tb ON t(b); CREATE INDEX tcde ON t(c, d, e); \
+    CREATE INDEX tpart ON t(e) WHERE e > 10; CREATE INDEX texp ON t(lower(d)); \
+    CREATE TABLE u(x, y); CREATE UNIQUE INDEX ux ON u(x); \
+    CREATE TABLE w(k PRIMARY KEY, v) WITHOUT ROWID; \
+    CREATE TABLE w3(p, q, r, s, PRIMARY KEY(p, q)) WITHOUT ROWID; CREATE INDEX w3r ON w3(r); \
+    CREATE VIEW v AS SELECT b, count(*) n FROM t GROUP BY b; \
+    INSERT INTO t VALUES (1, 1, 1, 'x', 5), (2, 2, 1, 'y', 20), (3, NULL, 2, 'X', 11), (4, 3, 1, 'a', NULL), \
+      (5, 2, NULL, 'b', 30), (6, 1, 1, 'z', 2), (7, 'q', 3, NULL, 12), (8, 3, 1, 'x', 5), (9, 2, 2, 'ab', 7); \
+    INSERT INTO u VALUES (1, 10), (2, 20), (3, -1), (NULL, 4), ('q', 5); \
+    INSERT INTO w VALUES (1, 'a'), (6, 'b'), (9, 'c'); \
+    INSERT INTO w3 VALUES (1, 2, 2, 'p'), (1, 5, 3, 'q'), (2, 3, 2, 'r'), (1, 9, 7, 's');";
+
+/// The review's ask: the aggregate corpora of tests/aggregates_v16.rs
+/// (aggregate ORDER BY / string_agg, DISTINCT, FILTER, bare columns,
+/// mixed classes and collations, empty input, which groups finalize,
+/// group_concat separators) and the SELECTs of tests/eqp_v16.rs's loop
+/// and sorter corpora, strict on the VM against the pin, over files
+/// with rows.
+#[test]
+fn reused_suites_run_strict_on_the_vm() {
+    let none = |_: &str| false;
+    // (A min() / max() bare-column row picked over a subquery in its
+    // FILTER: vm_subqueries' `extremum_rep` fallback.)
+    let extremum = |q: &str| q.starts_with("SELECT max(a) FILTER (WHERE") && q.contains("(SELECT");
+    corpus_with_fallbacks(&pin_file("rt", AGG_T), "rt", AGG_T_Q, &extremum);
+    corpus_with_fallbacks(&pin_file("rm", AGG_MIX), "rm", AGG_MIX_Q, &none);
+    corpus_with_fallbacks(&pin_file("rf", AGG_FIN), "rf", AGG_FIN_Q, &none);
+    corpus_with_fallbacks(&pin_file("rs", "SELECT 1;"), "rsep", AGG_SEP_Q, &none);
+    // (WITHOUT ROWID sources and `sqlite_schema` fall back until unit
+    // vm_rest.)
+    let later =
+        |q: &str| q.contains("FROM w") || q.contains("JOIN w ") || q.contains("sqlite_schema");
+    corpus_with_fallbacks(&pin_file("re", EQP_S), "re", EQP_Q, &later);
+}
+
+const AGG_T_Q: &[&str] = &[
+    "SELECT string_agg(b, ',') FROM t",
+    "SELECT group_concat(b ORDER BY a DESC) FROM t",
+    "SELECT group_concat(b, '-' ORDER BY a DESC, b) FROM t",
+    "SELECT string_agg(b, '-' ORDER BY a DESC, b) FROM t",
+    "SELECT string_agg(b, ',' ORDER BY b) FROM t",
+    "SELECT string_agg(b, NULL), group_concat(b, NULL) FROM t",
+    "SELECT group_concat(b, a), group_concat(a, b), group_concat(b, a ORDER BY a) FROM t",
+    "SELECT group_concat(b ORDER BY a NULLS LAST), group_concat(b ORDER BY a DESC NULLS FIRST) FROM t",
+    "SELECT group_concat(b ORDER BY 1), group_concat(b ORDER BY 2), group_concat(b ORDER BY (SELECT 1)) FROM t",
+    "SELECT group_concat(b ORDER BY a, c, r), group_concat(b ORDER BY c, r DESC) FROM t",
+    "SELECT group_concat(b ORDER BY c COLLATE BINARY), group_concat(b ORDER BY b COLLATE NOCASE DESC) FROM t",
+    "SELECT group_concat(r ORDER BY r), group_concat(x'41' ORDER BY a), typeof(group_concat(x'41')) FROM t",
+    "SELECT group_concat(b ORDER BY a) FROM t GROUP BY c ORDER BY 1",
+    "SELECT a, group_concat(b ORDER BY b DESC) FROM t GROUP BY a ORDER BY 1",
+    "SELECT group_concat(b ORDER BY a) AS x FROM t ORDER BY x",
+    "SELECT a FROM t UNION SELECT group_concat(b ORDER BY b DESC) FROM t ORDER BY 1",
+    "SELECT x FROM (SELECT string_agg(b, '+' ORDER BY a DESC) x FROM t)",
+    "SELECT sum(x ORDER BY k DESC), sum(x ORDER BY k), sum(x ORDER BY x), total(x ORDER BY k DESC), avg(x ORDER BY k DESC) FROM v",
+    "SELECT max(c ORDER BY k DESC), min(c ORDER BY k DESC), max(c), min(c) FROM v",
+    "SELECT max(c ORDER BY k DESC), k FROM v",
+    "SELECT min(b ORDER BY a), count(c ORDER BY k DESC), count(DISTINCT c ORDER BY k) FROM v, t",
+    "SELECT string_agg(b) FROM t",
+    "SELECT string_agg(b, ',', 1) FROM t",
+    "SELECT abs(a ORDER BY a) FROM t",
+    "SELECT coalesce(a, b ORDER BY a) FROM t",
+    "SELECT min(a, b ORDER BY a) FROM t",
+    "SELECT group_concat(b ORDER BY count(*)) FROM t",
+    "SELECT group_concat(b ORDER BY nope) FROM t",
+    "SELECT count(* ORDER BY b) FROM t",
+    "SELECT group_concat(ORDER BY b) FROM t",
+    "SELECT group_concat(DISTINCT c ORDER BY c) FROM t",
+    "SELECT group_concat(DISTINCT c ORDER BY c DESC) FROM t",
+    "SELECT group_concat(DISTINCT a ORDER BY a DESC) FROM t",
+    "SELECT group_concat(DISTINCT (c) ORDER BY c) FROM t",
+    "SELECT group_concat(DISTINCT a ORDER BY b) FROM t",
+    "SELECT group_concat(DISTINCT c ORDER BY c COLLATE BINARY) FROM t",
+    "SELECT group_concat(DISTINCT c ORDER BY c || '') FROM t",
+    "SELECT group_concat(DISTINCT c ORDER BY b DESC), count(DISTINCT c ORDER BY b) FROM t",
+    "SELECT group_concat(DISTINCT x COLLATE NOCASE ORDER BY x COLLATE NOCASE) FROM (SELECT 'a' x UNION ALL SELECT 'A')",
+    "SELECT group_concat(DISTINCT x COLLATE NOCASE ORDER BY x) FROM (SELECT 'a' x UNION ALL SELECT 'A' UNION ALL SELECT 'B' UNION ALL SELECT 'b')",
+    "SELECT group_concat(DISTINCT x ORDER BY x COLLATE NOCASE) FROM (SELECT 'a' x UNION ALL SELECT 'A' UNION ALL SELECT 'B' UNION ALL SELECT 'b')",
+    "SELECT group_concat(DISTINCT x ORDER BY x DESC NULLS FIRST) FROM (SELECT 'a' x UNION ALL SELECT NULL UNION ALL SELECT 'b')",
+    "SELECT count(DISTINCT x ORDER BY x), sum(DISTINCT x ORDER BY x) FROM (SELECT 1 x UNION ALL SELECT 1.0 UNION ALL SELECT '1')",
+    "SELECT typeof(sum(DISTINCT x ORDER BY x)), typeof(sum(DISTINCT x)) FROM (SELECT 1.0 x UNION ALL SELECT 1)",
+    "SELECT median(DISTINCT x ORDER BY x DESC) FROM (SELECT 1 x UNION ALL SELECT 1 UNION ALL SELECT 4)",
+    "SELECT group_concat(DISTINCT c, ',' ORDER BY c) FROM t",
+    "SELECT string_agg(DISTINCT b, ',') FROM t",
+    "SELECT count(*) FILTER (WHERE a > 1), count(a) FILTER (WHERE 0), sum(a) FILTER (WHERE NULL), total(a) FILTER (WHERE 0), avg(a) FILTER (WHERE 0), min(a) FILTER (WHERE a > 1), max(a) FILTER (WHERE a < 7), group_concat(b) FILTER (WHERE 0) FROM t",
+    "SELECT count(DISTINCT a) FILTER (WHERE b > 'v'), sum(DISTINCT a) FILTER (WHERE b < 'z') FROM t",
+    "SELECT count(*) FILTER (WHERE (SELECT count(*) FROM t) > 1), count(*) FILTER (WHERE a IN (SELECT a FROM t WHERE a > 2)) FROM t",
+    "SELECT count(*) FILTER (WHERE '1'), count(*) FILTER (WHERE 'abc'), count(*) FILTER (WHERE 0.5), count(*) FILTER (WHERE x'01') FROM t",
+    "SELECT count(*) FILTER ( WHERE a > 1 ) AS n FROM t",
+    "SELECT count(*) FILTER (WHERE a > 1) FROM t GROUP BY b > 'w' ORDER BY 1",
+    "SELECT b > 'w', count(*) FILTER (WHERE a > 1) FROM t GROUP BY 1 HAVING count(*) FILTER (WHERE a > 2) > 0",
+    "SELECT a FROM t GROUP BY a ORDER BY count(*) FILTER (WHERE b > 'v') DESC, a",
+    "SELECT count(*) FROM t HAVING count(*) FILTER (WHERE a > 100) = 0",
+    "SELECT group_concat(b, ';' ORDER BY b DESC) FILTER (WHERE a % 2 = 0) FROM t",
+    "SELECT group_concat(b ORDER BY a) FILTER (WHERE a > 1) FROM t",
+    "SELECT sum(a) FILTER (WHERE a > 1) + count(*) FILTER (WHERE a < 3) FROM t",
+    "SELECT a, sum(a) FILTER (WHERE b <> 'y') FROM t GROUP BY a HAVING sum(a) FILTER (WHERE a > 1) IS NOT NULL ORDER BY sum(a) FILTER (WHERE a > 0) DESC",
+    "SELECT sum(a) FILTER (WHERE c = 'a'), count(DISTINCT c) FILTER (WHERE c <> 'c') FROM t",
+    "SELECT count(*) FILTER (WHERE b = (SELECT max(b) FROM t)) FROM t",
+    "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM u WHERE k = t.a)) FROM t",
+    "SELECT sum((SELECT k FROM u WHERE k = t.a)) FILTER (WHERE a < 3) FROM t",
+    "SELECT count(), count() FILTER (WHERE a > 1) FROM t",
+    "SELECT filter FROM (SELECT 1 filter)",
+    "SELECT count(*) filter FROM t",
+    "SELECT abs(a) FILTER (WHERE 1) FROM t",
+    "SELECT min(a, b) FILTER (WHERE 1) FROM t",
+    "SELECT count(*) FILTER (WHERE count(*) > 1) FROM t",
+    "SELECT count(*) FILTER (WHERE max(a) > 1) FROM t",
+    "SELECT count(DISTINCT) FILTER (WHERE 1) FROM t",
+    "SELECT count(*) FILTER (a > 1) FROM t",
+    "SELECT count(*) x FILTER (WHERE 1) FROM t",
+    "SELECT max(a) FILTER (WHERE a < 3), b FROM t",
+    "SELECT min(a) FILTER (WHERE a > 1), b FROM t",
+    "SELECT min(a) FILTER (WHERE a > 99), b FROM t",
+    "SELECT max(a) FILTER (WHERE a > 99), b FROM t",
+    "SELECT min(a) FILTER (WHERE a IS NULL), b FROM t",
+    "SELECT max(c) FILTER (WHERE b < 'z'), b FROM t",
+    "SELECT b, min(a) FILTER (WHERE a > 99) FROM t GROUP BY a > 1",
+    "SELECT b, max(a) FILTER (WHERE a > 1) FROM t GROUP BY c",
+    "SELECT max(a) FILTER (WHERE a > 99), b FROM t WHERE 0",
+    "SELECT count(*) FILTER (WHERE a > 2), b FROM t",
+    "SELECT sum(a) FILTER (WHERE a > 2), b FROM t GROUP BY c",
+    "SELECT max(a) FILTER (WHERE a < (SELECT 3)), b FROM t",
+    "SELECT max(a) FILTER (WHERE EXISTS (SELECT 1 FROM u WHERE k = t.a)), b FROM t",
+];
+
+const AGG_MIX_Q: &[&str] = &[
+    "SELECT min(a), max(a), min(b), max(b), min(c), max(c), min(d), max(d), min(r), max(r) FROM t",
+    "SELECT count(DISTINCT a), count(DISTINCT c), count(DISTINCT d), count(DISTINCT r) FROM t",
+    "SELECT group_concat(DISTINCT d), group_concat(DISTINCT c) FROM t",
+    "SELECT c, count(*), min(b), max(b) FROM t GROUP BY c ORDER BY c",
+    "SELECT d, count(*), group_concat(b) FROM t GROUP BY d ORDER BY d",
+    "SELECT max(a), min(a), b FROM t",
+    "SELECT min(c), b FROM t",
+    "SELECT max(c), b FROM t",
+    "SELECT max(d), b, min(d) FROM t",
+    "SELECT max(r), count(*), b FROM t",
+    "SELECT sum(a), total(a), avg(a), typeof(avg(a)), typeof(sum(r)) FROM t",
+    "SELECT min(x), max(x), typeof(min(x)), typeof(max(x)) FROM (SELECT 1 x UNION ALL SELECT 1.0)",
+    "SELECT min(x), max(x), typeof(min(x)), typeof(max(x)) FROM (SELECT 1.0 x UNION ALL SELECT 1)",
+    "SELECT max(x COLLATE NOCASE), min(x COLLATE NOCASE) FROM (SELECT 'a' x UNION ALL SELECT 'A' UNION ALL SELECT 'b' UNION ALL SELECT 'B')",
+    "SELECT count(DISTINCT x), count(DISTINCT x COLLATE NOCASE), group_concat(DISTINCT x COLLATE NOCASE) FROM (SELECT 'a' x UNION ALL SELECT 'A')",
+    "SELECT count(DISTINCT x), sum(DISTINCT x), avg(DISTINCT x) FROM (SELECT 1 x UNION ALL SELECT 1.0 UNION ALL SELECT '1')",
+    "SELECT count(DISTINCT c COLLATE BINARY), max(c COLLATE BINARY), min(b COLLATE NOCASE) FROM t",
+    "SELECT count(*), count(a), sum(a), total(a), avg(a), min(a), max(a), group_concat(a), string_agg(a, ';'), median(r), percentile(r, 5) FROM t WHERE 0",
+    "SELECT count(*), sum(a) FROM t WHERE 0 GROUP BY a",
+    "SELECT max(b), b FROM t WHERE 0",
+    "SELECT count(*), b FROM t WHERE 0",
+    "SELECT count(*) FILTER (WHERE 1), group_concat(b ORDER BY a) FROM t WHERE 0",
+    "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1 ORDER BY sum(r)",
+    "SELECT x FROM (SELECT a x FROM t UNION SELECT 5) GROUP BY x HAVING sum(x) > 2 ORDER BY count(*), x",
+    "SELECT max(a) FROM t UNION SELECT min(a) FROM t ORDER BY 1",
+    "SELECT count(*) FROM (SELECT 1 UNION ALL SELECT 2) HAVING count(*) > 1",
+    "SELECT a FROM t UNION ALL SELECT count(*) FROM t ORDER BY 1",
+    "SELECT x, count(*) FROM (SELECT a x FROM t UNION ALL SELECT b FROM t) GROUP BY x HAVING count(*) > 1 ORDER BY 2 DESC, 1",
+    "SELECT (SELECT count(*) FROM t u WHERE u.a < t.a) c, a FROM t ORDER BY c, b",
+    "SELECT a, (SELECT max(b) FROM t u WHERE u.a = t.a HAVING count(*) > 1) FROM t ORDER BY b",
+    "SELECT count(*) FROM t GROUP BY a ORDER BY count(*) DESC, min(b) LIMIT 2",
+    "SELECT group_concat(b) FROM t GROUP BY c HAVING c IS NULL",
+    "SELECT (SELECT group_concat(b, '' ORDER BY b) FROM t WHERE c = 'a') || (SELECT count(*) FILTER (WHERE r > 1) FROM t)",
+    "SELECT b FROM t WHERE r > (SELECT median(r) FROM t) ORDER BY b",
+    "SELECT count(*) FROM t WHERE a IN (SELECT max(a) FILTER (WHERE typeof(a) = 'integer') FROM t)",
+];
+
+const AGG_FIN_Q: &[&str] = &[
+    "SELECT k, sum(v) FROM g GROUP BY k HAVING k = 1",
+    "SELECT k FROM g GROUP BY k HAVING k = 1 AND sum(v) > 0",
+    "SELECT k, sum(v) FROM g GROUP BY k LIMIT 1",
+    "SELECT k, sum(v) FROM g GROUP BY k ORDER BY k LIMIT 1",
+    "SELECT k, sum(v) FROM g GROUP BY k ORDER BY k DESC LIMIT 1",
+    "SELECT k, count(*) FROM g GROUP BY k HAVING count(*) < 2 ORDER BY k LIMIT 1",
+    "SELECT k, count(*) FROM g GROUP BY k ORDER BY count(*) LIMIT 1",
+    "SELECT k, sum(v) FROM g GROUP BY k LIMIT 0",
+    "SELECT (SELECT sum(v) FROM g GROUP BY k)",
+    "SELECT (SELECT sum(v) FROM g GROUP BY k ORDER BY k DESC)",
+    "SELECT EXISTS (SELECT sum(v) FROM g GROUP BY k)",
+    "SELECT * FROM (SELECT k, sum(v) s FROM g GROUP BY k LIMIT 1)",
+    "SELECT (SELECT sum(v) FROM g)",
+    "SELECT sum(v) FROM g UNION ALL SELECT 1",
+    "SELECT count(*) FROM (SELECT sum(v) s FROM g)",
+    "SELECT k FROM g GROUP BY k HAVING count(*) > 5 AND sum(v) > 0",
+    "SELECT k, sum(v) FROM g GROUP BY k HAVING count(*) < 2",
+    "SELECT k FROM g GROUP BY k HAVING count(*) < 2 ORDER BY sum(v)",
+    "SELECT k, max(v) FROM g GROUP BY k HAVING sum(v) IS NOT NULL",
+    "SELECT k, sum(v) FROM g GROUP BY k LIMIT 1 OFFSET 1",
+    "SELECT k, sum(v) FROM g GROUP BY k ORDER BY sum(v) LIMIT 1",
+    "SELECT 1 IN (SELECT sum(v) FROM g GROUP BY k)",
+    "SELECT k, (SELECT sum(v) FROM g WHERE k = 2) FROM g LIMIT 1",
+    "SELECT k, median(v) FROM g GROUP BY k HAVING k < 3",
+    "SELECT k FROM g GROUP BY k HAVING k < 3 OR median(v) > 0",
+    "SELECT k FROM g GROUP BY k ORDER BY median(v) LIMIT 1",
+];
+
+const AGG_SEP_Q: &[&str] = &[
+    "SELECT group_concat(x, s) FROM (SELECT 'a' x, '1' s UNION ALL SELECT 'b', NULL UNION ALL SELECT 'c', '3')",
+    "SELECT group_concat(x, s) FROM (SELECT 'a' x, NULL s UNION ALL SELECT 'b', '2' UNION ALL SELECT 'c', '3')",
+    "SELECT group_concat(x, s) FROM (SELECT NULL x, 'Q' s UNION ALL SELECT 'b', '2' UNION ALL SELECT 'c', '3')",
+    "SELECT group_concat(x, s ORDER BY x DESC) FROM (SELECT 'a' x, '1' s UNION ALL SELECT 'b', '2' UNION ALL SELECT 'c', '3')",
+    "SELECT group_concat(x, '') FROM (SELECT 3 x UNION ALL SELECT 1)",
+    "SELECT group_concat(x) FROM (SELECT '' x UNION ALL SELECT '' UNION ALL SELECT 'a')",
+    "SELECT group_concat(x, ',') FROM (SELECT NULL x UNION ALL SELECT '' UNION ALL SELECT 'a')",
+    "SELECT typeof(group_concat('')), quote(group_concat('')), quote(group_concat(x'')), quote(group_concat(x'00ff'))",
+    "SELECT group_concat(1.5), group_concat(1e300), group_concat(-0.0)",
+    "SELECT hex(group_concat(x)) FROM (SELECT CAST(x'610062' AS TEXT) x UNION ALL SELECT 'q')",
+    "SELECT hex(group_concat(x, CAST(x'2c002c' AS TEXT))) FROM (SELECT 'a' x UNION ALL SELECT 'q')",
+    "SELECT group_concat(DISTINCT b, ',') FROM t",
+    "SELECT count(DISTINCT a, b) FROM t",
+    "SELECT min(DISTINCT a, b), max(DISTINCT a) FROM t",
+];
+
+const EQP_Q: &[&str] = &[
+    "SELECT 1",
+    "SELECT * FROM t",
+    "SELECT * FROM t WHERE a=1",
+    "SELECT * FROM t WHERE a>1",
+    "SELECT * FROM t WHERE a<5",
+    "SELECT * FROM t WHERE a BETWEEN 1 AND 5",
+    "SELECT * FROM t WHERE a IN (1,2,3)",
+    "SELECT * FROM t WHERE rowid = 5",
+    "SELECT * FROM t WHERE oid > 5 AND oid < 9",
+    "SELECT * FROM t WHERE a IS NULL",
+    "SELECT * FROM t WHERE b=1",
+    "SELECT b FROM t WHERE b=1",
+    "SELECT * FROM t WHERE b IS NULL",
+    "SELECT * FROM t WHERE b IS 3",
+    "SELECT b FROM t WHERE b IS NOT NULL",
+    "SELECT * FROM t WHERE b IS NOT NULL",
+    "SELECT * FROM t WHERE b=1 AND a>5",
+    "SELECT * FROM t WHERE b=1 AND a>5 AND a<9",
+    "SELECT * FROM t WHERE b>1 AND b<10",
+    "SELECT * FROM t WHERE b IN (1,2,3)",
+    "SELECT * FROM t WHERE c=1 AND d>'x'",
+    "SELECT * FROM t WHERE c=1 AND d>'x' AND d<'z'",
+    "SELECT * FROM t WHERE c>1",
+    "SELECT * FROM t WHERE c IN (1,2) AND d=3",
+    "SELECT * FROM t WHERE c = 1 AND d IN ('a', 'b') AND e > 5",
+    "SELECT * FROM t WHERE (c, d) = (1, 'x')",
+    "SELECT * FROM t WHERE lower(d) = 'x'",
+    "SELECT * FROM t WHERE e > 20",
+    "SELECT e FROM t WHERE e > 20",
+    "SELECT * FROM t WHERE d LIKE 'a%'",
+    "SELECT * FROM t INDEXED BY tb WHERE c=1",
+    "SELECT * FROM t NOT INDEXED WHERE b=1",
+    "SELECT * FROM t x WHERE x.a=1",
+    "SELECT * FROM main.t",
+    "SELECT count(*) FROM t",
+    "SELECT count(*) FROM t WHERE c = 1 AND d = 'x'",
+    "SELECT * FROM t WHERE 0",
+    "SELECT * FROM t LIMIT 0",
+    "SELECT * FROM w WHERE k=1",
+    "SELECT * FROM w WHERE k>5",
+    "SELECT * FROM w",
+    "SELECT * FROM w ORDER BY k DESC",
+    "SELECT * FROM w3 WHERE p = 1",
+    "SELECT * FROM w3 WHERE p = 1 AND q > 2 AND q < 9",
+    "SELECT * FROM w3 WHERE r = 2",
+    "SELECT p, q FROM w3 WHERE r = 2 ORDER BY p",
+    "SELECT * FROM w3 ORDER BY p, q",
+    "SELECT count(*) FROM w3",
+    "SELECT * FROM t, u WHERE t.b=u.x",
+    "SELECT * FROM t x, u y WHERE x.b=y.x",
+    "SELECT * FROM t LEFT JOIN u ON u.x=t.b",
+    "SELECT * FROM t LEFT JOIN u ON u.x=t.b LEFT JOIN w ON w.k=u.y",
+    "SELECT * FROM t CROSS JOIN u",
+    "SELECT * FROM sqlite_schema",
+    "SELECT * FROM t ORDER BY d",
+    "SELECT * FROM t ORDER BY b",
+    "SELECT * FROM t ORDER BY b DESC",
+    "SELECT * FROM t ORDER BY a",
+    "SELECT * FROM t ORDER BY a DESC",
+    "SELECT * FROM t ORDER BY c, b",
+    "SELECT * FROM t ORDER BY c, b, a",
+    "SELECT * FROM t ORDER BY c, d, b, a",
+    "SELECT * FROM t WHERE b=1 ORDER BY a",
+    "SELECT * FROM t WHERE c=1 ORDER BY d",
+    "SELECT * FROM t WHERE c=1 ORDER BY d, e",
+    "SELECT * FROM t WHERE c=1 AND d=2 ORDER BY e DESC",
+    "SELECT * FROM t WHERE c=1 ORDER BY e",
+    "SELECT * FROM t WHERE b > 1 ORDER BY b DESC",
+    "SELECT * FROM t ORDER BY b NULLS LAST",
+    "SELECT * FROM t ORDER BY 1 LIMIT 5",
+    "SELECT * FROM t ORDER BY c LIMIT 5",
+    "SELECT a FROM t WHERE c = 1 ORDER BY d DESC",
+    "SELECT b, count(*) FROM t GROUP BY b",
+    "SELECT d, count(*) FROM t GROUP BY d",
+    "SELECT b, count(*) FROM t GROUP BY b ORDER BY b DESC",
+    "SELECT b, count(*) FROM t GROUP BY b ORDER BY 2",
+    "SELECT c, count(*) FROM t GROUP BY c ORDER BY 2",
+    "SELECT count(*) FROM t ORDER BY 1",
+    "SELECT DISTINCT d FROM t",
+    "SELECT DISTINCT b FROM t",
+    "SELECT DISTINCT a, b FROM t",
+    "SELECT DISTINCT c FROM t WHERE c > 1",
+    "SELECT DISTINCT b FROM t ORDER BY b",
+    "SELECT DISTINCT b FROM t ORDER BY b DESC",
+    "SELECT DISTINCT c, d FROM t ORDER BY c",
+    "SELECT DISTINCT c, d FROM t ORDER BY d",
+    "SELECT DISTINCT e FROM t ORDER BY e",
+    "SELECT sum(DISTINCT c), count(DISTINCT d) FROM t",
+];
 
 // ---------------- generated queries ----------------
 

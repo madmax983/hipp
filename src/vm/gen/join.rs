@@ -783,7 +783,11 @@ impl<'p> G<'p, '_> {
             None
         };
         let sorted = if grouped {
-            qp.order_by.is_empty() || group_order(qp)
+            crate::session::groups_sorted(
+                qp.group_by.as_slice(),
+                qp.order_by.as_slice(),
+                qp.sources.as_slice(),
+            )
         } else {
             qp.order_by.is_empty()
                 || (!qp.distinct && matches!(qp.sources.as_slice(), [sp] if rowid_order(sp, qp)))
@@ -1344,26 +1348,6 @@ fn rowid_order(sp: &SubSource, qp: &QueryPlan) -> bool {
             RExpr::Column(slot, ..) => sp.rowid_alias == Some(*slot),
             _ => false,
         }
-}
-
-/// Whether a grouped query's ORDER BY is its GROUP BY order (each
-/// term the GROUP BY term in its position, with its collation and the
-/// default NULLs placement; the groups sorted, not arriving in an
-/// index's order): the groups are emitted as they are finalized, as
-/// the pin's group sorter does.
-fn group_order(qp: &QueryPlan) -> bool {
-    !qp.group_by.is_empty()
-        && qp.order_by.len() == qp.group_by.len()
-        && !crate::session::groups_arrive_ordered(qp.sources.as_slice())
-        && qp
-            .order_by
-            .iter()
-            .zip(qp.group_by.iter())
-            .all(|((o, so), g)| {
-                crate::query::same_expr(o, g)
-                    && so.nulls_first != so.desc
-                    && so.coll == crate::query::expr_coll(g).unwrap_or_default()
-            })
 }
 
 /// Where a walk's equality value for one key column comes from.

@@ -12105,6 +12105,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 group_cap(
                     qp.group_by.as_slice(),
                     qp.order_by.as_slice(),
+                    qp.sources.as_slice(),
                     qp.distinct,
                     window,
                 ),
@@ -12497,6 +12498,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 group_cap(
                     qp.group_by.as_slice(),
                     qp.order_by.as_slice(),
+                    qp.sources.as_slice(),
                     qp.distinct,
                     window,
                 ),
@@ -13059,6 +13061,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             group_cap(
                 plan.group_by.as_slice(),
                 plan.order_by.as_slice(),
+                plan.sources.as_slice(),
                 plan.distinct,
                 streamed,
             )
@@ -15055,9 +15058,49 @@ pub(crate) fn group_aggs<'x>(
     aggs
 }
 
+/// Whether a grouped query's ORDER BY is its GROUP BY (the pin's
+/// `orderByGrp`, v0.17 review fix): each term the GROUP BY term in
+/// its position, compared as `sqlite3ExprListCompare` does
+/// (COLLATE included), with the default NULLs placement (the pin's
+/// BIGNULL flag makes the lists differ). Either direction: the
+/// pin copies the ORDER BY's into the GROUP BY.
+#[cfg(feature = "query")]
+pub(crate) fn ob_grp(group_by: &[RExpr], order_by: &[(RExpr, crate::sql::SortOrder)]) -> bool {
+    !order_by.is_empty()
+        && order_by.len() == group_by.len()
+        && order_by
+            .iter()
+            .zip(group_by.iter())
+            .all(|((o, so), g)| so.nulls_first != so.desc && crate::query::same_expr(o, g))
+}
+
+/// Whether a grouped query emits its groups in its ORDER BY order
+/// (v0.17 review fix, ungated): no ORDER BY, or the GROUP BY's
+/// (`ob_grp`) when the groups are sorted (in the ORDER BY's
+/// directions) or come from an index walked in that order
+/// (`IdxAccess::sorted`, the pin's `sqlite3WhereIsSorted`). The pin
+/// then skips its ORDER BY sorter.
+#[cfg(feature = "query")]
+pub(crate) fn groups_sorted(
+    group_by: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    sources: &[SourcePlan],
+) -> bool {
+    #[cfg(feature = "expr_index")]
+    let delivered = group_access(sources).is_none_or(|a| a.sorted >= order_by.len());
+    #[cfg(not(feature = "expr_index"))]
+    let delivered = {
+        let _ = sources;
+        true
+    };
+    order_by.is_empty() || (ob_grp(group_by, order_by) && delivered)
+}
+
 /// How many groups a grouped query needs before it can stop
-/// (v0.16, ungated): with a LIMIT and output in group order (no
-/// ORDER BY, or one naming exactly the GROUP BY terms), and no
+/// (v0.16, ungated): with a LIMIT, the groups emitted in ORDER BY
+/// order (`groups_sorted`; v0.17 review fix: an ORDER BY in another
+/// NULLs placement, or one an index walk does not deliver, sorts
+/// the groups again, so capping them kept the wrong ones), and no
 /// DISTINCT, the pin emits groups as it finalizes them and stops
 /// at OFFSET + LIMIT — later groups are never finalized, so their
 /// aggregates cannot error. None: every group is needed.
@@ -15065,19 +15108,14 @@ pub(crate) fn group_aggs<'x>(
 fn group_cap(
     group_by: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
+    sources: &[SourcePlan],
     distinct: bool,
     (skip, take): (usize, usize),
 ) -> Option<usize> {
     if group_by.is_empty() || distinct || take == usize::MAX {
         return None;
     }
-    let in_group_order = order_by.is_empty()
-        || (order_by.len() == group_by.len()
-            && order_by
-                .iter()
-                .zip(group_by.iter())
-                .all(|((o, _), g)| crate::query::same_expr(o, g)));
-    in_group_order.then(|| skip.saturating_add(take))
+    groups_sorted(group_by, order_by, sources).then(|| skip.saturating_add(take))
 }
 
 /// How many rows a query needs from its FROM clause when that
@@ -15268,28 +15306,31 @@ pub(crate) fn sort_groups(
     });
 }
 
-/// Whether a query's rows arrive in its GROUP BY order (v0.16,
-/// `expr_index`): its one source's index delivers it, and the pin
-/// then emits the groups as they arrive, skipping its group sorter.
+/// The access path of a query whose rows arrive in its GROUP BY
+/// order (v0.16, `expr_index`): its one source's index delivers it
+/// (or, `planner`, a join's first loop does: v0.17 review fix), and
+/// the pin then emits the groups as they arrive, skipping its group
+/// sorter.
+#[cfg(feature = "expr_index")]
+pub(crate) fn group_access(sources: &[SourcePlan]) -> Option<&crate::xplan::IdxAccess> {
+    #[cfg(not(feature = "planner"))]
+    let [s] = sources else { return None };
+    #[cfg(feature = "planner")]
+    let s = sources.first()?;
+    s.access.as_deref().filter(|a| a.groups)
+}
+
+/// Whether a query's rows arrive in its GROUP BY order
+/// (`group_access`).
 #[cfg(feature = "query")]
 pub(crate) fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
     #[cfg(feature = "expr_index")]
-    if let [s] = sources
-        && s.access.as_ref().is_some_and(|a| a.groups)
+    return group_access(sources).is_some();
+    #[cfg(not(feature = "expr_index"))]
     {
-        return true;
+        let _ = sources;
+        false
     }
-    // A join the pin's planner ordered: its first loop delivers the
-    // GROUP BY for the whole join (v0.17 review fix, `planner`).
-    #[cfg(feature = "planner")]
-    if let Some(s) = sources.first()
-        && sources.len() > 1
-        && s.access.as_ref().is_some_and(|a| a.groups)
-    {
-        return true;
-    }
-    let _ = sources;
-    false
 }
 
 /// DISTINCT over produced rows (v0.4): first occurrences

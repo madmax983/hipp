@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,124 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 476,476 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 962,300 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,058,824 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 476,492 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 962,628 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,059,584 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -232,6 +232,12 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   restartable index cursors), aggregates, GROUP BY / HAVING and
   DISTINCT now run on the VM too; subqueries, compounds, CTEs / views,
   windows and virtual sources still hand off to today's executor.
+- **GROUP BY with ORDER BY and LIMIT** (fix, every profile with
+  `query`). A grouped query stops after its LIMIT's groups only when
+  they come in the ORDER BY's order, as the pin does; an index (or the
+  rowid) delivering the groups is read backwards for `ORDER BY ...
+  DESC`. hipp used to return the wrong groups for `ORDER BY b NULLS
+  LAST LIMIT n` and for `ORDER BY b DESC LIMIT n` over an index.
 - **The bytecode VM, third unit** (hidden feature `vm`). Scalar, IN
   and EXISTS subqueries (correlated or not, anywhere in a SELECT, in
   aggregate arguments too), FROM subqueries, views and CTEs, compounds

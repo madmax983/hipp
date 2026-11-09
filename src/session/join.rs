@@ -1217,7 +1217,14 @@ impl<S: Storage> Connection<S> {
             nulls_first: true,
             coll: crate::query::expr_coll(e).unwrap_or_default(),
         };
-        if !group_by.is_empty() {
+        // (The pin's `orderByGrp`: `xplan::Query::obgrp`; v0.17
+        // review fix.)
+        let obgrp = crate::session::ob_grp(group_by.as_slice(), order_by.as_slice());
+        if obgrp {
+            group = true;
+            group_by_o = true;
+            order.extend_from_slice(order_by.as_slice());
+        } else if !group_by.is_empty() {
             group = true;
             group_by_o = true;
             for e in group_by.iter() {
@@ -1609,6 +1616,7 @@ impl<S: Storage> Connection<S> {
             order: order.as_slice(),
             group,
             group_by: group_by_o,
+            obgrp,
             distinct_by,
             distinct,
             ncols_out: items.len(),
@@ -1705,6 +1713,7 @@ impl<S: Storage> Connection<S> {
                     order: &[],
                     group: false,
                     group_by: false,
+                    obgrp: false,
                     ncols_out: items.len(),
                     needed: Some(needed.as_slice()),
                     cover_scan: true,
@@ -1842,6 +1851,11 @@ impl<S: Storage> Connection<S> {
                 && let Some(a) = acc.as_mut()
             {
                 a.groups = group_by_o && plan.ob_sat >= order.len();
+                // (`IdxAccess::sorted` 0: the ORDER BY a GROUP BY
+                // repeats is not delivered; v0.17 review fix.)
+                if a.groups && obgrp {
+                    a.sorted = if plan.ob_grp { order.len() } else { 0 };
+                }
                 #[cfg(feature = "explain")]
                 {
                     a.eqp.0 = plan.ob_sat;

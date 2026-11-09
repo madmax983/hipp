@@ -1451,8 +1451,16 @@ impl<S: Storage> Connection<S> {
             let mut order: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
             let mut group = false;
             let mut group_by = false;
+            // (The pin's `orderByGrp`: the GROUP BY takes the ORDER
+            // BY's directions, and a loop delivering it is checked for
+            // the ORDER BY too; v0.17 review fix.)
+            let obgrp = n == 1 && crate::session::ob_grp(info.group_by, info.order_by);
             if n == 1 {
-                if !info.group_by.is_empty() {
+                if obgrp {
+                    group = true;
+                    group_by = true;
+                    order.extend_from_slice(info.order_by);
+                } else if !info.group_by.is_empty() {
                     group = true;
                     group_by = true;
                     for e in info.group_by.iter() {
@@ -1544,6 +1552,7 @@ impl<S: Storage> Connection<S> {
                 order: order.as_slice(),
                 group,
                 group_by,
+                obgrp,
                 ncols_out: info.items.len(),
                 needed: Some(needed.as_slice()),
                 cover_scan: true,
@@ -1960,6 +1969,7 @@ impl<S: Storage> Connection<S> {
             order: &[],
             group: false,
             group_by: false,
+            obgrp: false,
             ncols_out: 0,
             // The pin's `colUsed`: a WITHOUT ROWID table's loop
             // covers the WHERE's columns (the SET and RETURNING

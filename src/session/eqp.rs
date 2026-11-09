@@ -1254,14 +1254,12 @@ impl<'a> Walk<'a> {
         if own_order && !c.order_by.is_empty() && (!as_group || one_row_distinct(c)) {
             self.order_exprs(c, parent);
             // An aggregate without GROUP BY is one row; a GROUP BY
-            // the ORDER BY repeats sorts once.
+            // the ORDER BY repeats sorts once — not in the other NULLs
+            // placement, nor when the index delivering the groups
+            // does not deliver it (v0.17 review fix).
             let single = c.has_agg && c.group_by.is_empty();
             let same_group = !c.group_by.is_empty()
-                && c.group_by.len() == c.order_by.len()
-                && c.group_by
-                    .iter()
-                    .zip(c.order_by.iter())
-                    .all(|(g, (o, _))| crate::query::same_expr(g, o));
+                && crate::session::groups_sorted(c.group_by, c.order_by, c.sources);
             let k = c.order_by.len();
             let done = if c.group_by.is_empty() && (!c.distinct || !c.has_agg) {
                 delivered.min(k)

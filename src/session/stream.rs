@@ -1065,6 +1065,7 @@ impl<S: Storage> Statement<'_, S> {
                 let cap = group_cap(
                     s.qp.group_by.as_slice(),
                     s.qp.order_by.as_slice(),
+                    s.qp.sources.as_slice(),
                     s.qp.distinct,
                     s.window,
                 );

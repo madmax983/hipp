@@ -5,6 +5,24 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### GROUP BY with ORDER BY and LIMIT: the right groups (review fix of unit `vm_joins`, every profile with `query`)
+
+- A grouped query with a LIMIT stopped after the LIMIT's groups in
+  GROUP BY order even when its ORDER BY sorted them again, so it
+  returned the wrong groups: `GROUP BY b ORDER BY b NULLS LAST LIMIT
+  2` kept the NULL group, and `GROUP BY b ORDER BY b DESC LIMIT 2`
+  over an index on `b` kept the two smallest. hipp now stops early
+  only where the pin does: the ORDER BY is the GROUP BY (either
+  direction, the default NULLs placement) and the groups come in its
+  order — sorted, or from an index read the way that delivers it.
+- As on the pin, such an index (or the rowid) is now read backwards
+  for `ORDER BY ... DESC`, so each group's rows come in that order
+  too (`group_concat`), later groups' aggregates are not finalized
+  (no error from them), and EXPLAIN QUERY PLAN shows a `USE TEMP
+  B-TREE FOR ORDER BY` where the index does not deliver the ORDER BY
+  (mixed directions). The VM (hidden feature `vm`) follows the same
+  rule. Sizes: tiny unchanged, full +16 B, max +328 B, xl +760 B.
+
 ### The bytecode VM: subqueries, compounds, CTEs (ADR 0005 Stage 2, unit `vm_subqueries`)
 
 - Under the hidden feature `vm`, the VM now runs scalar, IN and

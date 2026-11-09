@@ -1250,6 +1250,11 @@ pub struct Query<'x> {
     /// ... a GROUP BY one: a loop delivering it emits the groups in
     /// its own order (the pin then skips its group sorter).
     pub group_by: bool,
+    /// ... the ORDER BY too (the pin's `orderByGrp`, v0.17 review
+    /// fix; `order` then holds its terms and directions): a loop
+    /// delivering the GROUP BY walks the index the way that also
+    /// delivers the ORDER BY, when one does (`WHERE_SORTBYGROUP`).
+    pub obgrp: bool,
     /// Result columns (the sorting cost's width term).
     pub ncols_out: usize,
     /// Per table column: read by the query. `None`: all of them.
@@ -2026,11 +2031,29 @@ pub(crate) fn best_access(
     // still says so: the groups are emitted as they come, as the
     // pin's; v0.17 review fix.)
     let groups = q.group_by && l.sorted >= q.order.len();
+    // The pin's `WHERE_SORTBYGROUP` check (v0.17 review fix): the
+    // GROUP BY loop delivers the ORDER BY it repeats when read in
+    // the ORDER BY's directions; `sorted` 0 says it does not.
+    let mut sorted = l.sorted;
+    if groups && q.obgrp {
+        let o = Query {
+            group: false,
+            group_by: false,
+            ..*q
+        };
+        let (k, rev, _) = order_sat(&o, s, tab, ts, &l, false);
+        if k >= q.order.len() {
+            reverse = rev;
+        } else {
+            sorted = 0;
+        }
+    }
     if natural && l.eq.is_empty() && l.lo.is_none() && l.hi.is_none() && !reverse && !groups {
         return None;
     }
     let mut a = lower(s, tab, ts, &l, reverse);
     a.groups = groups;
+    a.sorted = sorted;
     #[cfg(feature = "explain")]
     if !q.dset.is_empty() {
         let d = Query {
@@ -2039,6 +2062,7 @@ pub(crate) fn best_access(
             order: q.dset,
             group: true,
             group_by: false,
+            obgrp: false,
             ncols_out: q.ncols_out,
             needed: q.needed,
             cover_scan: q.cover_scan,
@@ -2091,6 +2115,7 @@ pub fn natural_sat(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> (usi
         order: q.dset,
         group: true,
         group_by: false,
+        obgrp: false,
         ncols_out: q.ncols_out,
         needed: q.needed,
         cover_scan: q.cover_scan,

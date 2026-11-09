@@ -11,6 +11,125 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_joins — review fixes (2026-11-09)
+
+Six findings on `vm_joins` (ad90fb1), resumed on top of
+`vm_subqueries` (2291f5e) after an earlier fix attempt was stopped
+part-way (its draft, which capped groups from the reader's window and
+dropped the cap for any index-ordered group under an ORDER BY, was
+redone: it made `ORDER BY k LIMIT 1` over an index on `k` finalize a
+later, overflowing group the pin never reaches).
+
+**Fixed (ungated: a silent wrong answer in every profile with
+`query`).**
+- **GROUP BY + ORDER BY + LIMIT kept the wrong groups** (high,
+  pre-existing in today's executor; the `vm_joins` subsection called
+  it a rare join case). `group_cap` stopped after OFFSET + LIMIT
+  groups whenever the ORDER BY named the GROUP BY terms, but the
+  groups are sorted in the ORDER BY's directions with NULLs first, or
+  arrive in an index's order: `GROUP BY b ORDER BY b NULLS LAST LIMIT
+  2` with a NULL group gave `1|2, |1` (pin `1|2, 2|1`), and `GROUP BY
+  b ORDER BY b DESC LIMIT 2` over an index on `b` gave `2|1, 1|2`
+  (pin `3|1, 2|1`). Probed on the pin: it stops early only under
+  `orderByGrp` (the ORDER BY is the GROUP BY, compared with COLLATE,
+  either direction — copied into the GROUP BY — and the default NULLs
+  placement: the BIGNULL flag makes them differ) when the groups are
+  sorted in that order: by its group sorter, or by a loop the
+  `WHERE_SORTBYGROUP` re-check finds delivers the ORDER BY too, read
+  backwards where the directions ask (`ORDER BY b DESC` over an
+  ascending index; each group's rows then come backwards too, the
+  low finding below). Anywhere else it sorts every group (each
+  finalized: `ORDER BY k LIMIT 1` over an index on `k` never reaches
+  an overflowing later group; `ORDER BY k NULLS LAST LIMIT 1`
+  does).
+  hipp now does the same: `session::ob_grp` (the pin's
+  `orderByGrp`), the access planners (`xplan::best_access` for one
+  table, `xjoin::plan` for a join's first loop) give such a query the
+  ORDER BY's terms as the group order and re-check the chosen loop as
+  an ORDER BY (`Query::obgrp` / `JQuery::obgrp`): delivered, it is
+  read in the ORDER BY's direction; not, `IdxAccess::sorted` is 0.
+  `session::groups_sorted` (no ORDER BY, or `ob_grp` and either no
+  index or one whose `sorted` covers the ORDER BY) now decides
+  `group_cap`, EXPLAIN QUERY PLAN's ORDER BY sorter (`USE TEMP B-TREE
+  FOR ORDER BY` for `GROUP BY b, c ORDER BY b DESC, c` over an index
+  on `(b, c)`, as on the pin) and the VM's (`gen::join::out_mode`,
+  whose `group_order` it replaces).
+- **Each group's rows in reverse for a reverse walk** (low): `GROUP
+  BY c1 ORDER BY 1 DESC` over an index on `c1` now gives
+  `1.0|3|1,b,0` as the pin does (the index read backwards), on the VM
+  and today's executor.
+
+**Already fixed / not reproduced.**
+- **CacheExhausted on index keys with overflow pages** (medium): fixed
+  by the `vm_core` review fixes (9cd8201, after this review's base):
+  an opcode's pages are copied on a miss (`pager::Held`). The review's
+  two repros (100-byte keys at 512-byte pages, 1,100-byte keys at
+  4,096) now run strict at the default cache and at one frame
+  (`overflowing_index_keys_match_the_pin`).
+
+**Tests added.**
+- `tests/group_order_v17.rs` (ungated; with `--features vm` each
+  query also runs strict on the VM and on today's executor via
+  `vm_off`): the review's repros and 34 GROUP BY / ORDER BY / LIMIT
+  shapes over six index layouts (none, ASC, DESC, two columns, two
+  columns with DESC, NOCASE) — NULLs placements, directions, OFFSET,
+  COLLATE, aliases and ordinals, `group_concat` row order, rowid
+  groups, EXPLAIN QUERY PLAN; which groups finalize (an overflowing
+  later group, three layouts); joins whose first loop delivers the
+  groups; 240 generated grouped queries (xorshift, 24 files with
+  random indexes) whose ORDER BY orders the groups fully. All four
+  tests fail on 2291f5e and pass now. A scratch fuzz of 3,600 such
+  queries (with EXPLAIN, joins, LIMIT without ORDER BY) found 150
+  fixed, none newly wrong.
+- `tests/vm_joins_v17.rs`: `overflowing_index_keys_match_the_pin`
+  (above) and `reused_suites_run_strict_on_the_vm` (medium finding:
+  the spec's eqp_v16 and aggregate corpora were not reused): the
+  aggregate corpora of `aggregates_v16.rs` (aggregate ORDER BY /
+  `string_agg`, DISTINCT, FILTER, bare columns, mixed classes and
+  collations, empty input and query shapes, group finalization,
+  separators: 162 queries) and the SELECTs of `eqp_v16.rs`'s loop and
+  sorter corpora (88, over its schema with rows), strict against the
+  pin; the shapes that still fall back are named and must still fall
+  back and give the pin's rows: 2 min() / max() bare-column rows over
+  a subquery FILTER (`vm_subqueries`' `extremum_rep`), 12 WITHOUT
+  ROWID / `sqlite_schema` queries.
+
+**Not fixed (out of scope, recorded).**
+- **WITHOUT ROWID primary-key access** (low): listed in the unit's
+  spec, still a fallback (the rows go through `crate::wr`'s
+  per-statement handles, which the sync read path does not reach); it
+  moves to unit `vm_rest`, now said in the `vm_joins` honest gaps.
+- **`X OR 1` ON terms reorder the join** (low, pre-existing, the
+  planner, not the VM port): the pin keeps the FROM order for `ON
+  b.a > 0 OR 1`; hipp costs it as a term on `b` and puts `b`
+  outermost (rows in another order, EQP `SCAN b` first). A planner
+  fix (the pin's always-true OR simplification), not this unit's.
+- Seen while fuzzing, pre-existing and unchanged: with a LIMIT the
+  pin's cost model sometimes prefers a loop that delivers part of a
+  GROUP BY (`SCAN t USING INDEX tb` for `GROUP BY b, c LIMIT 3`), or
+  a join order with an automatic index, where hipp keeps a full scan;
+  the rows agree whenever the ORDER BY orders the groups fully (a
+  `GROUP BY ... LIMIT` without ORDER BY, or a NOCASE group's bare
+  value, can differ).
+
+**Gates.** `ci/local-gates.sh` (full) ends with "all gates passed";
+`cargo test --workspace --no-fail-fast` passes with and without
+`--features vm` (the VM-vs-executor generated corpus of
+`vm_joins_v17` included); `depth_v16` / `triggers_v16` pass with
+debug info.
+
+**Size Δ** (thumbv7em, `--profile tiny`, `.text + .rodata`): tiny 0
+(76,124: no GROUP BY there), full +16 (476,492), max +328 (962,628),
+xl +760 (1,059,584). Justification: an ungated correctness fix on a
+claimed path (ADR 0001), the minimum found — `group_cap` asks one
+shared predicate (`groups_sorted`, also EXPLAIN's and the VM's), the
+single-table planner re-checks its chosen loop with the existing
+`order_sat` (max), the join planner its path with the existing
+`path_order` (xl); ratchets set to the measured values. For
+information: `query,vm` 210,182 B, `sql,vm` 454,776 B,
+`sql,indexes,vm` 507,132 B (−40),
+`sql,indexes,expr_index,planner,vm` 635,104 B (+560).
+
 ### VM (ADR 0005 Stage 2): vm_subqueries (2026-11-09)
 
 The third of Stage 2's five units, built on `vm_core` / `vm_joins`
@@ -330,9 +449,11 @@ planner makes none), trigger and FK action programs.
   GROUP BY terms in another NULLs placement can stop at the wrong
   groups (`group_cap` counts groups in GROUP BY order, NULLs first):
   a generated three-way join, `... GROUP BY x1.b ORDER BY x1.b NULLS
-  LAST LIMIT 4`, lost its `5` group for the NULL one (the one-table
-  forms of it, with and without an index, are right); the VM sorts
+  LAST LIMIT 4`, lost its `5` group for the NULL one; the VM sorts
   every group and gives the pin's rows (`generated_queries_...`).
+  (Closed by the review fixes below, ungated, in both executors: the
+  one-table forms were wrong too, `ORDER BY b NULLS LAST LIMIT` with
+  a NULL group and `ORDER BY b DESC LIMIT` over an index on `b`.)
 
 **Tests.** `tests/vm_joins_v17.rs` (built only with `--features
 vm`; every claimed SELECT strict, asserting `runs_on_vm`): 50 joins
@@ -379,7 +500,9 @@ the VM calls: `group_desc`, `sort_groups`, `groups_arrive_ordered`,
 **Honest gaps.**
 - WITHOUT ROWID sources and the IN-subquery probe fall back (see
   above); subqueries, compounds, CTEs / views, windows and virtual
-  sources are the later units'.
+  sources are the later units'. WITHOUT ROWID primary-key access,
+  which this unit's spec lists among the access paths, is not
+  delivered: it moves to unit `vm_rest` (review note).
 - A source whose rows are computed as a whole (an index path, an
   automatic index, a RIGHT / FULL source) is materialised as today
   (the pin streams most index walks); a plain inner table is re-read
@@ -391,9 +514,9 @@ the VM calls: `group_desc`, `sort_groups`, `groups_arrive_ordered`,
   its pages are now copied on a miss, `pager::Held`.)
 - `IdxSeek`'s `p4` holds a count, not a side-table index (the
   EXPLAIN formatter of `vm_rest` must know it).
-- The two divergences of today's executor above (rows before an error
-  in RIGHT / FULL joins and GROUP BY, the `group_cap` NULLs case) stay
-  until `vm_flip` deletes it.
+- The first divergence of today's executor above (rows before an
+  error in RIGHT / FULL joins and GROUP BY) stays until `vm_flip`
+  deletes it; the `group_cap` one is closed (review fixes below).
 
 ### VM (ADR 0005 Stage 2): vm_core (2026-11-09)
 
@@ -4782,7 +4905,12 @@ paths):**
   one naming exactly the GROUP BY terms) stops finalizing at
   OFFSET + LIMIT — so `(SELECT sum(v) FROM g GROUP BY k)` reads
   only the first group (`session::having_early`, `group_aggs`,
-  `group_cap`; top-level queries and subqueries).
+  `group_cap`; top-level queries and subqueries). (Corrected in
+  v0.17, `vm_joins` review fixes: "naming exactly the GROUP BY
+  terms" also took an ORDER BY in the other NULLs placement, or one
+  an index delivering the groups does not deliver, and so kept the
+  wrong groups; the rule is now the pin's `orderByGrp` +
+  `WHERE_SORTBYGROUP`, `session::groups_sorted`.)
 
 **Review fixes** (2026-11-02, all reproduced on the pin first):
 
