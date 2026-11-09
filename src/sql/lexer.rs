@@ -364,21 +364,24 @@ pub fn parse_real(text: &[u8]) -> Option<f64> {
 /// conversion `parse_real` ends in (`acc` holds the kept digits),
 /// shared with `record::render_real`'s read-back test (v0.16).
 pub fn int_pow10_to_f64(c: u64, x: i64) -> f64 {
-    // Exact fast path (Clinger): with `c < 2^53` and `|x| <= 22` both
-    // `c` and `10^|x|` are exact f64s, so one IEEE multiply or divide
-    // is the correctly rounded (ties-to-even) result -- the same
-    // value the big-integer conversion below produces.
-    const POW10: [f64; 23] = [
-        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
-        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
-    ];
-    if c < (1u64 << 53) && (-22..=22).contains(&x) {
-        let m = c as f64;
-        return if x < 0 {
-            m / POW10[(-x) as usize]
-        } else {
-            m * POW10[x as usize]
-        };
+    // Gated on `query`: the tiny profile has no f64 arithmetic, and the
+    // hardware-less soft-float mul/div this pulls in cost ~2 KB there.
+    #[cfg(feature = "query")]
+    {
+        // Exact fast path (Clinger): with `c < 2^53` and `|x| <= 22` both
+        // `c` and `10^|x|` are exact f64s, so one IEEE multiply or divide
+        // is the correctly rounded (ties-to-even) result -- the same
+        // value the big-integer conversion below produces.
+        if c < (1u64 << 53) && (-22..=22).contains(&x) {
+            // 10^k is exact for k <= 22 (5^22 < 2^53): every partial
+            // product below is exactly representable.
+            let mut p = 1.0f64;
+            for _ in 0..x.unsigned_abs() {
+                p *= 10.0;
+            }
+            let m = c as f64;
+            return if x < 0 { m / p } else { m * p };
+        }
     }
     // Decimal magnitude: the value lies in [10^(mag-1), 10^mag).
     // Far outside the f64 range the answer needs no arithmetic:
@@ -1245,7 +1248,7 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "query"))]
 mod fast_path_tests {
     extern crate std;
     use super::{int_pow10_to_f64, parse_real};
