@@ -219,6 +219,14 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   byte-identical sections. The new names alone (they enter the
   crate's metadata hash and so rustc's item order) move max by +8 B
   and xl by +16 B of alignment padding (STATUS.md has the table).
+- **The bytecode VM, first unit** (hidden feature `vm`, ADR 0005
+  Stage 2). A register VM (`src/vm/`) with synchronous, restartable
+  page reads runs SELECTs over one rowid table or none — WHERE, any
+  subquery-free expression, ORDER BY, LIMIT / OFFSET, full scans and
+  rowid lookups and ranges — and hands every other statement to
+  today's executor. No profile enables `vm` yet, so no profile's size
+  changes; the stage's later units cover the rest of SELECT, and its
+  last one turns the VM on and deletes the executors it replaces.
 
 ## What v0.16 does
 

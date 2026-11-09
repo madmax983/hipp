@@ -5,6 +5,27 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM, behind a hidden feature (ADR 0005 Stage 2, unit `vm_core`)
+
+- A register VM in `src/vm/` (16-byte `p1`-`p5` instructions with a
+  side table, a builder with labels and an `Init` prologue, table and
+  sorter cursors, the dispatch loop) runs SELECTs over one rowid
+  table or none: WHERE, any subquery-free expression (one `Eval`
+  opcode over `query::eval`), ORDER BY, LIMIT / OFFSET, full scans
+  and rowid equality / range access. Its page reads are synchronous
+  and restartable (`PagerCore`: a miss changes nothing; the driver in
+  `Statement::step` reads the page and runs the opcode again), so a
+  dropped step future is safe.
+- Behind the hidden feature `vm`, which no profile enables: every
+  profile's size is unchanged. Under `vm`, every other statement
+  runs on today's executor; `Config::vm_strict` makes a SELECT the
+  VM does not cover an error (`Error::VmFallback`) for tests.
+- On the VM, three no-FROM SELECTs match the pin where today's
+  executor errors: an OFFSET skipping an erroring row, an erroring
+  ORDER BY term (the pin never computes it), and LIMIT 0 (nothing,
+  not even the WHERE or OFFSET, is computed); so does `LIMIT 0 OFFSET
+  <error>` over a table.
+
 ### Breaking: feature renames
 
 Cargo features are named for what they enable, not for the milestone

@@ -11,6 +11,195 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_core (2026-11-09)
+
+The first of Stage 2's five units (the plan approved 2026-11-09; ADR
+0005, accepted for Stages 2-3 with its migration rule). Everything
+is behind the hidden feature `vm` (`vm = ["query"]`), which no
+profile enables, so every profile measures exactly its ratchet; under
+`vm` a SELECT the code generator does not cover runs on today's
+executor unchanged.
+
+**Shipped.**
+- **Sync page access** (`pager::PagerCore`, `Pager::vm_core` /
+  `vm_service` / `vm_unpin`): a storage-free view of the page cache.
+  `get(page)` returns the frame on a hit; a miss returns
+  `Io::Read(page)` (an empty or clean frame outside the opcode's pins
+  can take it) or `Io::Spill` (only dirty ones can) and changes
+  nothing; every frame pinned is `CacheExhausted`. The driver's
+  `vm_service` loads or spills with `load` / `spill_one`, which under
+  `vm` take no victim among the pins.
+- **Sync, restartable rowid-table reads** (`vm::cursor::TableCursor`):
+  rewind / next / last / prev, rowid seek (exact, GE, LE), payload
+  assembly across overflow pages (UTF-16 records transcoded as
+  `assemble_payload_into` does) and the query-row decode
+  (`decode_source_row`'s rules: rowid alias, defaults past the
+  record's end, REAL forcing, generated columns). A move computes the
+  new path and leaf snapshot in temporaries and commits only when no
+  page was missing; the pages a descent read are pinned until the
+  opcode completes. The one deliberate exception: an overflow chain
+  is copied into a cursor-owned scratch buffer page by page, and that
+  copy survives a miss (it is not a position, is cleared by any move,
+  and a re-run yields the same bytes) — otherwise a chain longer than
+  the cache could never complete. Kept as a `cfg(vm)` copy of the
+  async B-tree read (rule 2): the async `ScanCursor` stays for the
+  legacy executors and `vm_flip` deletes the duplicate.
+- **`src/vm/`**: `op.rs` (`Op { code, p5: u8, p1: u16, p2, p3, p4:
+  u32 }`, 16 bytes, asserted by a unit test; the `P4` side table:
+  values, expressions, table layouts, sort keys, affinities),
+  `build.rs` (registers, cursors, labels fixed up at `finish`,
+  literal constants hoisted into the `Init` prologue), `exec.rs` (the
+  dispatch loop; `Exec = Row | Done | Pending(Io) | Host(kind)`),
+  `cursor.rs` (`Cursor = Closed | Table | Sorter`; the other kinds
+  arrive with the units that need them), `gen/{select,expr}.rs`. The
+  driver is `session/drive.rs` (`Statement::vm_step`, reached from
+  `step_query` / `step_scan`): it runs the program, services a
+  `Pending` and re-runs the opcode, and hands a `Host` program back to
+  today's executor. The VM state lives in the `Statement`. `rg
+  'Storage' src/vm` finds nothing: the driver is the only generic
+  code.
+- **Opcodes (33; 24 without `expr_index`):** Init, Goto, Halt,
+  Host; If, IfNot, IfPos, DecrJumpZero; Value (the ADR's Integer /
+  Int64 / Real / String8 / Blob: the side table carries the type),
+  Copy, MustBeInt; Eval;
+  OpenRead, Rewind, Next, SeekRowid, Column, Rowid; SorterOpen /
+  Insert / Sort / Data / Next; ResultRow; and, gated `expr_index`
+  (only its access planner produces the plans that need them), Last,
+  Prev, SeekGE, SeekLE, RowidBound, Affinity, IsNull, Gt, Lt. The ADR
+  puts all of them in its "always" or `query` rows, which `vm`
+  implies. Not built because nothing generates them yet: Null,
+  Variable (below), the per-operator expression opcodes (below), the
+  write opcodes (`Exec::Write` arrives with them, Stage 3).
+- **Claimed shapes** (codegen from today's plans; the planners are
+  unchanged): `Plan::Query` with one rowid table or no FROM, no
+  join, aggregate, GROUP BY / HAVING, DISTINCT, compound, VALUES,
+  window or subquery anywhere — WHERE (its constant terms first,
+  through `join_constants_hold`, then the whole condition per row
+  with `query::cond`'s jump semantics), result columns of any
+  expression `query::eval` evaluates, ORDER BY through the sorter
+  (items, then keys, a key that is a result column taking its value,
+  `query::order_keys_cmp` under the shared stable sort, the
+  streamed executor's 2k+64 truncation under a LIMIT) unless the
+  table's rowid order delivers it, LIMIT / OFFSET as expressions
+  (`MustBeInt`), full scans and the `expr_index` planner's rowid
+  equality and range access (`RowidBound` is `xindex::rowid_bound`,
+  now `rowid_end` for the VM, shared); and the legacy `Plan::Scan`
+  (full scan, `rowid = literal`, the empty access).
+- **Parameters:** no `Variable` opcode is needed in Stage 2. The
+  binder substitutes the bound values into the statement before it
+  is planned (rule 6), so every execution re-plans and compiles its
+  own program (`replan` / `reset` drop the old one).
+- **Falls back** (whole statements; a `Host` program, no half-VM
+  execution): index access (and rowid IN lists, MULTI-INDEX OR,
+  automatic indexes, covering / BIGNULL loops), joins, aggregates,
+  DISTINCT, subqueries, compounds, VALUES, CTEs / views / derived
+  tables, windows, virtual and table-valued sources, WITHOUT ROWID,
+  TEMP and attached tables, `sqlite_schema` (root page 1), and every
+  statement of a trigger or foreign-key action program (they keep
+  the materialising executor's order).
+- **Test hooks:** `Statement::runs_on_vm()` (doc-hidden) and
+  `Config::vm_strict` / `Error::VmFallback`.
+
+**The Eval decision (rule 5; ADR 0005 §"Instruction set"
+amendment).** Expressions run through one `Eval` opcode whose `p4`
+is a resolved expression in the side table, evaluated by the sync
+`query::eval` against the row a cursor holds; `p5` selects the value,
+a WHERE condition (`query::cond`) or the constant-terms test. The
+per-operator opcodes (Add … Remainder, Concat, And / Or / Not,
+Cast, Function) are not built: `query::eval` must stay until Stage 3
+for the write paths, so a second evaluator as opcodes would only add
+bytes and a second place for evaluation order, laziness (CASE,
+coalesce, iif, AND / OR), affinity and collation to drift. With one
+`Eval` they are exactly today's. Loop control is real opcodes.
+
+**Oracle probing** (the pin, live, before implementing):
+- No FROM: the pin's loop over no table satisfies any ORDER BY, so
+  its terms are never computed (`SELECT 1 ORDER BY
+  abs(-9223372036854775808)` is `1`); OFFSET skips the row before
+  its result columns (`SELECT abs(-9223372036854775808) LIMIT 1
+  OFFSET 1` is no row, no error); LIMIT 0 computes nothing, WHERE
+  included. Today's materialising no-FROM path errors in all three;
+  the VM matches the pin (the legacy path keeps them until
+  `vm_flip`).
+- LIMIT is computed, converted and tested for 0 before OFFSET is
+  computed (`computeLimitRegisters`): `LIMIT 0 OFFSET
+  abs(-9223372036854775808)` is no row on the pin, an error on
+  today's executor, no row on the VM.
+- With a FROM, an erroring constant ORDER BY term fails the
+  statement before any row when the table has rows, and is never
+  computed over an empty table (`SELECT x FROM e ORDER BY
+  abs(-9223372036854775808)` is no row, no error): the VM's sort
+  computes keys per row, as today's executor does, which gives both.
+- A constant WHERE term errors before any row (`WHERE a > 0 AND
+  abs(...)`), over an empty table too; rows before a failing row are
+  returned first (result columns, WHERE, ORDER BY rowid ascending and
+  descending); LIMIT / OFFSET conversions ('3', ' 2 ', 2.0 accepted;
+  2.5, NULL, x'01', '0x10', 1e30 a datatype mismatch).
+- `random()` sequences differ from run to run on the pin (OS-seeded),
+  so the corpus has none.
+
+**Tests.** `tests/vm_v17.rs` (built only with `--features vm`;
+every claimed SELECT runs strict and asserts `runs_on_vm`): a
+117-query corpus over NULLs, every affinity, NOCASE / BINARY
+collations, ORDER BY ties and NULLS FIRST / LAST, ordinals and
+aliases, the LIMIT / OFFSET forms, rowid equality and ranges (reals,
+text, NULL, the i64 ends, descending), generated columns,
+ALTER-added defaults and no FROM; 24 failing statements (the rows
+before the error, conversion errors); a 3,000-row table at 512-byte
+pages (three levels) and overflow rows up to 18,000 bytes; an empty
+table; the legacy scan plan; parameters (one statement executed
+three times with new bindings, a rowid lookup and a range bound by
+parameters); flattened FROM subqueries, views and CTEs (single-table
+plans under `planner`); 20 unclaimed shapes, refused under strict
+before any row and run on today's executor otherwise; the restart
+corpus (everything again with a 3-frame cache, the big table's
+height; overflow chains of 35 pages through 3 frames; a 2-frame
+cache failing with `CacheExhausted`); dropped step futures on a
+storage whose reads are pending first (each step polled once and
+dropped up to three times, caches of 3 to 16 frames, asserting
+futures were dropped while pending) and a reset after a dropped
+future, the connection writing and reading normally afterwards; an
+error then a step (the statement starts over); 120 generated queries
+(xorshift) at the default and the 3-frame cache. The unit test
+`an_instruction_is_sixteen_bytes` asserts `size_of::<Op>() == 16`.
+`cargo test --workspace --no-fail-fast --features vm` passes (every
+suite, `tests/vm_v17.rs`'s 16 tests and the unit test included), as
+do `depth_v16` / `triggers_v16` with debug info with and without `vm`
+(14 + 33 tests each way).
+
+**Gates.** `ci/local-gates.sh` (full) ends with "all gates passed":
+fmt, clippy `-D warnings` on default, `--all-features` (which
+includes `vm`) and every feature-set line (the new `query,vm`,
+`sql,vm` and `sql,indexes,expr_index,vm` among them), the workspace
+suite, the four no_std targets and the four size gates at Δ 0.
+
+**Size Δ** (thumbv7em, `--profile tiny`, `.text + .rodata`): tiny 0
+(76,124), full 0 (476,476), max 0 (962,300), xl 0 (1,058,824) — the
+shared-code changes are visibility (`QueryPlan` and its fields
+`pub(crate)`) and `cfg` predicates widened to `vm`. For information:
+`query,vm` 196,454 B (`query` 173,800: +22,654), `sql,vm` 429,736 B
+(`sql` 400,184: +29,552) — the VM, its codegen and the duplicate sync
+read path, before any executor is deleted.
+
+**Honest gaps.**
+- Index access, joins, aggregates, DISTINCT, subqueries, compounds,
+  CTEs / views, windows, virtual and table-valued sources, WITHOUT
+  ROWID, TEMP / attached tables and `sqlite_schema` fall back (units
+  `vm_joins`, `vm_subqueries`, `vm_rest`). Rowid IN lists fall back
+  too (with `vm_joins`' list probes).
+- Trigger and FK action programs' SELECTs stay on today's executor
+  even when their shape is claimed: their materialising order is not
+  ported yet.
+- The legacy no-FROM path keeps the three pin divergences above and
+  the LIMIT 0 OFFSET one until `vm_flip` deletes it (fixing them there
+  would grow every profile).
+- The sync B-tree read is a `cfg(vm)` copy beside the async one
+  (`btree::ScanCursor`); `vm_flip` deletes the legacy copy.
+- `EXPLAIN` listings and the `vm_shadow` diff job are later units'
+  (`vm_rest`; the orchestrator's CI).
+- No CLI suite: the CLI does not enable `vm`, and the VM's rows render
+  through the same `column_*` API.
+
 ### Features named for capabilities (2026-11-08)
 
 A rename and dead-code unit (ADR 0006,

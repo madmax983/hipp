@@ -321,6 +321,31 @@ that needs it, so `tiny` compiles about 25 opcodes and `full` about 95.
 
 † driver-awaited in Stages 2–3; sync under op-undo in Stage 4.
 
+**Amendment (Stage 2, unit `vm_core`, 2026-11-09): expressions run
+through one `Eval` opcode in Stage 2.** Its `p4` indexes a resolved
+expression (`RExpr`) in the program's side table, evaluated by the
+existing sync `query::eval` against the row a cursor holds (or the
+empty row); a `p5` mode evaluates it as a WHERE condition
+(`query::cond`'s jump semantics) or as the WHERE clause's constant
+terms (`query::join_constants_hold`). The table's per-operator
+opcodes (Add … Remainder, Concat, And / Or / Not, Cast, Function)
+are not built in Stage 2. Reasoning: `query::eval` must stay until
+Stage 3 anyway (every write path evaluates through it), so a second
+evaluator spelled as opcodes would only add bytes (and a second
+place for evaluation order, laziness, affinity and collation rules
+to drift), while one `Eval` keeps those rules exactly today's. The
+comparisons and jumps that drive loops are real opcodes (`If`,
+`IfNot`, `IfPos`, `DecrJumpZero`, `IsNull`, `Gt`, `Lt`). Stage 3,
+which deletes the tree-walker once nothing else calls it, revisits
+the per-operator opcodes. Two smaller deviations from the text
+above: `Op` is `{code: u8, p5: u8, p1: u16, p2, p3, p4: u32}`, since
+four `u32` operands and two bytes do not fit 16 bytes (`p1` holds a
+cursor or register number; a program that needs more than 65,535
+falls back); and the `params` bind path needs no `Variable` opcode
+in Stage 2, because the binder substitutes the bound values into the
+statement before it is planned (rule 6: the binder is unchanged), so
+each execution compiles its own plan.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,

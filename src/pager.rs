@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-#[cfg(feature = "sql")]
+#[cfg(any(feature = "sql", feature = "vm"))]
 use crate::arena::AVec;
 use crate::arena::Arena;
 use crate::error::{Error, Result};
@@ -457,6 +457,12 @@ pub struct Pager<S: Storage> {
     /// `attach`: phase one of a multi-database commit).
     #[cfg(feature = "attach")]
     hold: bool,
+    /// The pages the VM opcode being serviced has read (ADR 0005
+    /// Stage 2, `vm`; `vm_service`): `load` and `spill_one` take no
+    /// victim among them, so the opcode finds them all when it runs
+    /// again. Empty outside `vm_service`.
+    #[cfg(feature = "vm")]
+    vm_pins: AVec<u32>,
 }
 
 impl<S: Storage> Pager<S> {
@@ -675,6 +681,8 @@ impl<S: Storage> Pager<S> {
                 super_name: None,
                 #[cfg(feature = "attach")]
                 hold: false,
+                #[cfg(feature = "vm")]
+                vm_pins: AVec::new(),
             },
             is_new,
         ))
@@ -712,10 +720,18 @@ impl<S: Storage> Pager<S> {
                 chosen = Some(i);
             } else {
                 for _ in 0..2 * self.frames.len() {
+                    #[cfg(not(feature = "vm"))]
                     let i = self
                         .frames
                         .iter()
                         .position(|f| !f.dirty)
+                        .unwrap_or(usize::MAX);
+                    // A page a VM opcode is reading stays (`vm_pins`).
+                    #[cfg(feature = "vm")]
+                    let i = self
+                        .frames
+                        .iter()
+                        .position(|f| !f.dirty && !self.vm_pins.as_slice().contains(&f.page))
                         .unwrap_or(usize::MAX);
                     if i == usize::MAX {
                         break;
@@ -778,7 +794,17 @@ impl<S: Storage> Pager<S> {
     /// Returns the freed frame index, or None when no frame is
     /// dirty (the cache is genuinely exhausted).
     async fn spill_one(&mut self) -> Result<Option<usize>, S::Error> {
+        #[cfg(not(feature = "vm"))]
         let Some(i) = self.frames.iter().position(|f| f.dirty) else {
+            return Ok(None);
+        };
+        // A page a VM opcode is reading stays (`vm_pins`).
+        #[cfg(feature = "vm")]
+        let Some(i) = self
+            .frames
+            .iter()
+            .position(|f| f.dirty && !self.vm_pins.as_slice().contains(&f.page))
+        else {
             return Ok(None);
         };
         let page = self.frames[i].page;
@@ -822,6 +848,52 @@ impl<S: Storage> Pager<S> {
     }
     pub fn frame_page(&self, idx: usize) -> u32 {
         self.frames[idx].page
+    }
+
+    /// The sync, storage-free view of the page cache the VM reads
+    /// through (ADR 0005 Stage 2, `vm`; `PagerCore`).
+    #[cfg(feature = "vm")]
+    pub(crate) fn vm_core(&mut self) -> PagerCore<'_> {
+        PagerCore {
+            page_count: self.header.page_count,
+            usable: self.usable(),
+            enc: self.text_enc(),
+            frames: self.frames.as_mut_slice(),
+            #[cfg(feature = "wal")]
+            touched: &mut self.touched,
+            #[cfg(feature = "wal")]
+            wal_fresh: &mut self.wal_fresh,
+        }
+    }
+
+    /// Do the I/O a VM opcode is waiting for (ADR 0005 Stage 2,
+    /// `vm`): load the page it missed, or spill a dirty frame to
+    /// make room, never evicting a page in `pins` (the pages the
+    /// opcode has read so far). Dropping the future part-way leaves
+    /// nothing the VM depends on: the opcode runs again from the
+    /// start and asks again.
+    #[cfg(feature = "vm")]
+    pub(crate) async fn vm_service(&mut self, io: Io, pins: &[u32]) -> Result<(), S::Error> {
+        self.vm_pins.clear();
+        self.vm_pins.extend_from_slice(pins);
+        let r = match io {
+            Io::Read(page) => self.load(page).await.map(|_| ()),
+            Io::Spill => match self.spill_one().await {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(Error::CacheExhausted),
+                Err(e) => Err(e),
+            },
+        };
+        self.vm_pins.clear();
+        r
+    }
+
+    /// Forget the pins of a VM opcode whose step future was dropped
+    /// while `vm_service` ran (ADR 0005 Stage 2, `vm`): a new
+    /// statement starts with every frame evictable.
+    #[cfg(feature = "vm")]
+    pub(crate) fn vm_unpin(&mut self) {
+        self.vm_pins.clear();
     }
 
     /// Begin the (single, autocommit) write transaction if none is
@@ -2557,6 +2629,100 @@ impl<S: Storage> Pager<S> {
 /// says). The committed frames' page 1 replaces `probe` and `header`,
 /// whose page count becomes the last commit's size. A database
 /// another process holds is `DatabaseBusy`.
+/// The I/O a sync page access waits for (ADR 0005 Stage 2, `vm`):
+/// the page to read, or a dirty frame to spill to make room for it.
+#[cfg(feature = "vm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Io {
+    Read(u32),
+    Spill,
+}
+
+/// What a sync page access found (`PagerCore::get`): the page's
+/// frame, or the I/O that must happen first.
+#[cfg(feature = "vm")]
+pub(crate) enum Got {
+    Hit(usize),
+    Miss(Io),
+}
+
+/// The pager as the VM sees it (ADR 0005 Stage 2, `vm`): the page
+/// cache and the header fields reads need, with no storage type, so
+/// everything above it is monomorphic. A hit returns the frame; a
+/// miss names the I/O the driver must do (`Pager::vm_service`) and
+/// changes nothing, so the opcode that asked simply runs again.
+#[cfg(feature = "vm")]
+pub(crate) struct PagerCore<'a> {
+    frames: &'a mut [Frame],
+    page_count: u32,
+    usable: u32,
+    enc: crate::record::TextEnc,
+    #[cfg(feature = "wal")]
+    touched: &'a mut bool,
+    #[cfg(feature = "wal")]
+    wal_fresh: &'a mut bool,
+}
+
+#[cfg(feature = "vm")]
+impl PagerCore<'_> {
+    /// Usable bytes per page.
+    pub(crate) fn usable(&self) -> u32 {
+        self.usable
+    }
+    /// Pages in the database.
+    pub(crate) fn page_count(&self) -> u32 {
+        self.page_count
+    }
+    /// The database's text encoding.
+    pub(crate) fn text_enc(&self) -> crate::record::TextEnc {
+        self.enc
+    }
+
+    /// The frame holding `page`, recording it in `pins` when `keep`
+    /// (a page the running opcode needs again if it must restart:
+    /// `vm_service` evicts none of them). A miss returns the I/O to
+    /// do: `Read` when an empty or clean frame outside `pins` can
+    /// take the page, `Spill` when only dirty ones can; with every
+    /// frame pinned the cache is too small for the opcode
+    /// (`CacheExhausted`, as `load` reports it).
+    pub(crate) fn get(&mut self, page: u32, pins: &mut AVec<u32>, keep: bool) -> Result<Got, ()> {
+        if page == 0 || page > self.page_count {
+            return Err(Error::PageOutOfRange { page });
+        }
+        if let Some(i) = self.frames.iter().position(|f| f.page == page) {
+            if let Some(f) = self.frames.get_mut(i) {
+                f.clock_ref = true;
+            }
+            #[cfg(feature = "wal")]
+            {
+                *self.touched = true;
+                *self.wal_fresh = false;
+            }
+            if keep && !pins.as_slice().contains(&page) {
+                pins.push(page);
+            }
+            return Ok(Got::Hit(i));
+        }
+        let free = |f: &Frame| !pins.as_slice().contains(&f.page);
+        if self
+            .frames
+            .iter()
+            .any(|f| f.page == 0 || (!f.dirty && free(f)))
+        {
+            return Ok(Got::Miss(Io::Read(page)));
+        }
+        if self.frames.iter().any(|f| f.dirty && free(f)) {
+            return Ok(Got::Miss(Io::Spill));
+        }
+        Err(Error::CacheExhausted)
+    }
+
+    /// The bytes of frame `idx` (from `get`).
+    pub(crate) fn data(&self, idx: usize) -> &[u8] {
+        self.frames.get(idx).map_or(&[], |f| f.data.as_slice())
+    }
+}
+
 #[cfg(feature = "wal")]
 async fn open_wal<S: Storage>(
     storage: &mut S,

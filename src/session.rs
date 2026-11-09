@@ -114,6 +114,8 @@ mod eqp;
 type Prep<'a, 'f, S> = core::pin::Pin<
     Box<dyn core::future::Future<Output = Result<Statement<'a, S>, <S as Storage>::Error>> + 'f>,
 >;
+#[cfg(feature = "vm")]
+mod drive;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
 #[cfg(feature = "planner")]
@@ -140,6 +142,8 @@ mod trigger;
 mod vtab;
 #[cfg(feature = "expr_index")]
 mod xindex;
+#[cfg(all(feature = "vm", feature = "expr_index"))]
+pub(crate) use xindex::rowid_end;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -281,6 +285,12 @@ pub struct Config {
     /// allows.
     #[cfg(feature = "vtab")]
     pub max_vtab_rows: usize,
+    /// Refuse a SELECT the bytecode VM does not cover yet with
+    /// `Error::VmFallback` instead of running it on today's executor
+    /// (ADR 0005 Stage 2, hidden `vm` feature; a test switch, off by
+    /// default).
+    #[cfg(feature = "vm")]
+    pub vm_strict: bool,
 }
 
 /// `Config::default()`'s virtual-table row bound (v0.16, `vtab`;
@@ -328,6 +338,8 @@ impl Default for Config {
             max_trigger_depth: DEFAULT_TRIGGER_DEPTH,
             #[cfg(feature = "vtab")]
             max_vtab_rows: DEFAULT_VTAB_ROWS,
+            #[cfg(feature = "vm")]
+            vm_strict: false,
         }
     }
 }
@@ -418,6 +430,8 @@ impl Config {
             max_trigger_depth: 8,
             #[cfg(feature = "vtab")]
             max_vtab_rows: 1 << 16,
+            #[cfg(feature = "vm")]
+            vm_strict: false,
         }
     }
 
@@ -539,6 +553,13 @@ impl Config {
     #[cfg(feature = "sql")]
     pub fn vacuum_into(mut self, write: VacuumWriter) -> Config {
         self.vacuum_into = Some(write);
+        self
+    }
+    /// Make a SELECT the VM does not cover an error (ADR 0005
+    /// Stage 2, hidden `vm` feature; see the `vm_strict` field).
+    #[cfg(feature = "vm")]
+    pub fn vm_strict(mut self, on: bool) -> Config {
+        self.vm_strict = on;
         self
     }
 }
@@ -1012,30 +1033,30 @@ type SourcePlan = crate::query::SubSource;
 /// A v0.4 query plan: everything resolved at prepare time.
 #[cfg(feature = "query")]
 #[derive(Debug, Clone)]
-struct QueryPlan {
-    sources: AVec<SourcePlan>,
-    items: AVec<RExpr>,
-    filter: Option<RExpr>,
-    group_by: AVec<RExpr>,
-    having: Option<RExpr>,
-    order_by: AVec<(RExpr, crate::sql::SortOrder)>,
-    distinct: bool,
+pub(crate) struct QueryPlan {
+    pub(crate) sources: AVec<SourcePlan>,
+    pub(crate) items: AVec<RExpr>,
+    pub(crate) filter: Option<RExpr>,
+    pub(crate) group_by: AVec<RExpr>,
+    pub(crate) having: Option<RExpr>,
+    pub(crate) order_by: AVec<(RExpr, crate::sql::SortOrder)>,
+    pub(crate) distinct: bool,
     /// LIMIT / OFFSET (v0.16: resolved expressions; see
     /// `SubPlan::limit`).
-    limit: Option<RExpr>,
-    offset: Option<RExpr>,
-    has_agg: bool,
+    pub(crate) limit: Option<RExpr>,
+    pub(crate) offset: Option<RExpr>,
+    pub(crate) has_agg: bool,
     width: usize,
     /// Compound tail (v0.9; see `SubPlan::compound`). When
     /// non-empty, `order_by` is empty, `comp_order` carries
     /// the compound ORDER BY, and `limit` / `offset` apply to
     /// the combined result. Only filled under `sql`.
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
-    compound: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
+    pub(crate) compound: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
     /// A VALUES core's resolved rows (v0.9; see
     /// `SubPlan::values`).
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
-    values: AVec<AVec<RExpr>>,
+    pub(crate) values: AVec<AVec<RExpr>>,
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     comp_order: AVec<(usize, crate::sql::SortOrder)>,
@@ -1638,6 +1659,9 @@ impl<S: Storage> Connection<S> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
         }
+        // A VM statement dropped while its I/O ran left its pins.
+        #[cfg(feature = "vm")]
+        self.pager.vm_unpin();
         // `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`).
         #[cfg(feature = "explain")]
         if let Some(at) = eqp::query_plan_prefix::<S::Error>(sql.as_bytes())? {
@@ -1815,6 +1839,8 @@ impl<S: Storage> Connection<S> {
             fk_del: None,
             #[cfg(feature = "foreign_keys")]
             fk_skip: [None; 2],
+            #[cfg(feature = "vm")]
+            vm: None,
         })
     }
 
@@ -6564,6 +6590,12 @@ pub struct Statement<'c, S: Storage> {
     /// pin's `isSetNullAction`; see `fkey::Sim`), loaded with `fk`.
     #[cfg(feature = "foreign_keys")]
     fk_skip: fkey::Skip,
+    /// The SELECT's program and its execution state (ADR 0005
+    /// Stage 2, hidden `vm` feature): compiled at the first step of
+    /// an execution (`vm_step`); `None` until then and for every
+    /// other statement.
+    #[cfg(feature = "vm")]
+    vm: Option<Box<crate::vm::exec::Vm>>,
 }
 
 /// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
@@ -7346,6 +7378,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             fk_del: None,
             #[cfg(feature = "foreign_keys")]
             fk_skip: [None; 2],
+            #[cfg(feature = "vm")]
+            vm: None,
         }
     }
 }
@@ -7748,6 +7782,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.plan = self.conn.plan(&self.arena, &self.ast)?;
         self.binds.stale = false;
         self.row_ckpt = self.arena.checkpoint();
+        // The new plan gets its own program.
+        #[cfg(feature = "vm")]
+        {
+            self.vm = None;
+        }
         Ok(())
     }
 
@@ -7891,6 +7930,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "sql")]
         self.end_stream();
+        #[cfg(feature = "vm")]
+        {
+            self.vm = None;
+        }
         #[cfg(feature = "sql")]
         self.hoist.clear();
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
@@ -11772,6 +11815,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     async fn step_scan(&mut self) -> Result<Step, S::Error> {
+        // The bytecode VM (ADR 0005 Stage 2).
+        #[cfg(feature = "vm")]
+        if let Some(r) = Box::pin(self.vm_step()).await {
+            return r;
+        }
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
@@ -11901,6 +11949,12 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "query")]
     async fn step_query(&mut self) -> Result<Step, S::Error> {
+        // The bytecode VM (ADR 0005 Stage 2): a program's `Host`
+        // hands the step back here.
+        #[cfg(feature = "vm")]
+        if let Some(r) = Box::pin(self.vm_step()).await {
+            return r;
+        }
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }

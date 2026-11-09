@@ -420,6 +420,18 @@ fn rowid_bound(v: &OwnedValue, lower: bool, incl: bool) -> Rb {
     }
 }
 
+/// `rowid_bound` as the VM's `RowidBound` opcode takes it (ADR 0005
+/// Stage 2, `vm`): `None` when no rowid satisfies the bound,
+/// `Some(None)` for an open end, else the rowid.
+#[cfg(feature = "vm")]
+pub(crate) fn rowid_end(v: &OwnedValue, lower: bool, incl: bool) -> Option<Option<i64>> {
+    match rowid_bound(v, lower, incl) {
+        Rb::Empty => None,
+        Rb::All => Some(None),
+        Rb::At(x) => Some(Some(x)),
+    }
+}
+
 /// Range bounds on the rowid as `(from, to)` rowids (`None`: open);
 /// `None` when no rowid satisfies them.
 fn rowid_span(

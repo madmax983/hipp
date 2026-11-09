@@ -1043,6 +1043,13 @@ pub enum Error<E> {
     /// (`Storage::claim_wal` reports it).
     #[cfg(feature = "wal")]
     DatabaseBusy,
+    /// A SELECT the bytecode VM does not cover yet, prepared under
+    /// `Config::vm_strict` (ADR 0005 Stage 2, hidden `vm` feature: a
+    /// test switch that makes the fallback to today's executor an
+    /// error). Clear `vm_strict` to run the statement on today's
+    /// executor.
+    #[cfg(feature = "vm")]
+    VmFallback,
     /// The caller's storage device error.
     Storage(E),
 }
@@ -1086,6 +1093,8 @@ impl<E> Error<E> {
             Error::ResetRequired => Error::ResetRequired,
             #[cfg(feature = "wal")]
             Error::DatabaseBusy => Error::DatabaseBusy,
+            #[cfg(feature = "vm")]
+            Error::VmFallback => Error::VmFallback,
             Error::Storage(e) => Error::Storage(e.into()),
         }
     }
@@ -1097,8 +1106,10 @@ impl<E> Error<E> {
     /// its image on an in-memory pager, whose errors surface under
     /// the connection's storage type). With `window`, also how the
     /// expression evaluator, compiled once for `Error<()>`, hands its
-    /// errors to callers of any storage type (`query::eval`).
-    #[cfg(feature = "sql")]
+    /// errors to callers of any storage type (`query::eval`), and how
+    /// the bytecode VM's storage-free core hands its errors to the
+    /// driver (ADR 0005 Stage 2, `vm`).
+    #[cfg(any(feature = "sql", feature = "vm"))]
     pub fn map_storage<F>(self, f: impl FnOnce(E) -> Error<F>) -> Error<F> {
         match self {
             Error::Storage(e) => f(e),
@@ -1130,6 +1141,8 @@ impl<E> Error<E> {
             Error::ResetRequired => Error::ResetRequired,
             #[cfg(feature = "wal")]
             Error::DatabaseBusy => Error::DatabaseBusy,
+            #[cfg(feature = "vm")]
+            Error::VmFallback => Error::VmFallback,
         }
     }
 }

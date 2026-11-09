@@ -384,6 +384,19 @@ fts5_delete = ["fts5"]
 # implies `sql` and `expr_index`.
 planner = ["sql", "expr_index"]
 
+# The bytecode VM (ADR 0005 Stage 2), the migration feature of that
+# stage: a register VM in `src/vm/` with sync, restartable page access
+# and B-tree reads, its driver in `Statement::step`, and code
+# generation for the SELECT shapes it covers so far (a single rowid
+# table or none: WHERE, any subquery-free expression, ORDER BY,
+# LIMIT / OFFSET, rowid equality and range access). Every other
+# statement runs on today's executor. Hidden: no profile (`full`,
+# `max`, `xl`, `default`) enables it, so the size ratchets never see
+# it; `Config::vm_strict` makes a SELECT the VM does not cover an
+# error (tests). The stage's last unit (`vm_flip`) turns the VM on,
+# deletes the executors it replaces and removes this feature.
+vm = ["query"]
+
 # EXPLAIN QUERY PLAN (ADR 0001 / 0002: in `max`, not `full`) --
 # `EXPLAIN QUERY PLAN <statement>` returns the pin's four columns
 # (id, parent, notused, detail) describing the plan hipp executes, in
