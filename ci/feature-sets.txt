@@ -31,7 +31,9 @@ sql,explain
 sql,indexes,expr_index,planner
 query,vm
 sql,vm
+sql,indexes,vm
 sql,indexes,expr_index,vm
+sql,indexes,expr_index,planner,vm
 indexes,query
 indexes,write
 full

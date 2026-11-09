@@ -78,7 +78,7 @@ pub fn head<E>(bytes: &[u8], page: u32) -> Result<PageHead, E> {
     })
 }
 
-fn cell_ptr<E>(bytes: &[u8], head: &PageHead, i: usize, page: u32) -> Result<usize, E> {
+pub(crate) fn cell_ptr<E>(bytes: &[u8], head: &PageHead, i: usize, page: u32) -> Result<usize, E> {
     let off = head.cell_ptrs_off() + 2 * i;
     if off + 2 > bytes.len() {
         return Err(Error::CorruptPage { page });
@@ -2880,19 +2880,19 @@ impl IndexCell {
 /// Where an index cell's parts sit on its page (everything
 /// `parse_index_cell` reads from the cell, before copying it out).
 #[cfg(any(feature = "indexes", feature = "write"))]
-struct IndexCellLayout {
+pub(crate) struct IndexCellLayout {
     child: u32,
-    payload_len: usize,
-    local_len: usize,
-    overflow: u32,
+    pub(crate) payload_len: usize,
+    pub(crate) local_len: usize,
+    pub(crate) overflow: u32,
     /// Offset of the local payload from the cell start.
-    payload_off: usize,
+    pub(crate) payload_off: usize,
     /// Cell length on the page, before the 4-byte minimum padding.
     total: usize,
 }
 
 #[cfg(any(feature = "indexes", feature = "write"))]
-fn index_cell_layout<E>(
+pub(crate) fn index_cell_layout<E>(
     bytes: &[u8],
     at: usize,
     usable: usize,
@@ -3938,7 +3938,7 @@ pub enum KeyPart {
 }
 
 #[cfg(feature = "indexes")]
-fn cmp_entry_probe(
+pub(crate) fn cmp_entry_probe(
     entry: &[OwnedValue],
     probe: &[KeyPart],
     desc: &[KeyOrder],

@@ -4,7 +4,8 @@
 //! and every page it does not have.
 
 use super::cursor::{Cursor, Sorter, TableCursor};
-use super::op::{Code, EVAL_COND, EVAL_CONSTS, P4, p4_at};
+use super::op::{ACC_ROWID, Code, EVAL_ACC, EVAL_COND, EVAL_CONSTS, EVAL_GROUP, P4, p4_at};
+use super::rows::{AggRun, Eph, Groups};
 use super::{Exec, Program};
 use crate::arena::AVec;
 use crate::error::Error;
@@ -26,6 +27,9 @@ pub(crate) struct Vm {
     out: AVec<OwnedValue>,
     out_rowid: Option<i64>,
     empty: RowData,
+    /// The joined row so far: each source's values from its slot
+    /// base, its rowid at its index (`Load` / `NullRow`).
+    acc: RowData,
 }
 
 /// The outcome of one opcode: go on at `pc + 1`, jump, or leave the
@@ -80,6 +84,7 @@ impl Vm {
             out: AVec::new(),
             out_rowid: None,
             empty: RowData::empty(),
+            acc: RowData::empty(),
         };
         vm.reset();
         vm
@@ -100,6 +105,7 @@ impl Vm {
         self.pins.clear();
         self.out.clear();
         self.out_rowid = None;
+        self.acc = RowData::empty();
     }
 
     /// Whether the program runs on the VM (holds no `Host`).
@@ -274,22 +280,35 @@ impl Vm {
                 let Some(P4::Expr(e)) = p4_at(&self.prog.p4, op.p4) else {
                     return Err(Error::Unsupported);
                 };
-                let row: &RowData = match usize::from(op.p1).checked_sub(1) {
-                    None => &self.empty,
-                    Some(c) => {
-                        let t = match self.curs.as_mut_slice().get_mut(c) {
-                            Some(Cursor::Table(t)) => t,
-                            _ => return Err(Error::Unsupported),
-                        };
-                        let info = table_info(&self.prog, t.info)?;
-                        if let Err(io) = t.load(core, &mut self.pins, info)? {
-                            return Ok(Flow::Stay(Exec::Pending(io)));
+                let ctx = if op.p5 & EVAL_GROUP != 0 {
+                    let g = match usize::from(op.p1)
+                        .checked_sub(1)
+                        .and_then(|c| self.curs.as_slice().get(c))
+                    {
+                        Some(Cursor::Groups(g)) => g,
+                        _ => return Err(Error::Unsupported),
+                    };
+                    Ctx::group(g.rows(), &g.rep).with(env)
+                } else if op.p5 & EVAL_ACC != 0 {
+                    Ctx::of(&self.acc).with(env)
+                } else {
+                    let row: &RowData = match usize::from(op.p1).checked_sub(1) {
+                        None => &self.empty,
+                        Some(c) => {
+                            let t = match self.curs.as_mut_slice().get_mut(c) {
+                                Some(Cursor::Table(t)) => t,
+                                _ => return Err(Error::Unsupported),
+                            };
+                            let info = table_info(&self.prog, t.info)?;
+                            if let Err(io) = t.load(core, &mut self.pins, info)? {
+                                return Ok(Flow::Stay(Exec::Pending(io)));
+                            }
+                            &t.row
                         }
-                        &t.row
-                    }
+                    };
+                    Ctx::of(row).with(env)
                 };
-                let ctx = Ctx::of(row).with(env);
-                let v = match op.p5 {
+                let v = match op.p5 & 3 {
                     EVAL_COND => OwnedValue::Integer(i64::from(crate::query::cond::<()>(e, &ctx)?)),
                     EVAL_CONSTS => OwnedValue::Integer(i64::from(
                         crate::query::join_constants_hold::<()>(Some(e), &[], &ctx)?,
@@ -411,7 +430,7 @@ impl Vm {
                     .checked_add(n)
                     .and_then(|end| self.regs.as_slice().get(from..end))
                     .ok_or(Error::Unsupported)?;
-                let rowid = rowid_of(&self.curs, op.p3);
+                let rowid = self.rowid_of(op.p3);
                 let enc = core.text_enc();
                 sorter(&mut self.curs, op.p1)?.insert(info, vals, rowid, window, enc);
                 Flow::Next
@@ -452,10 +471,20 @@ impl Vm {
                     .ok_or(Error::Unsupported)?;
                 self.out.clear();
                 self.out.extend_from_slice(vals);
-                self.out_rowid = rowid_of(&self.curs, op.p3);
+                self.out_rowid = self.rowid_of(op.p3);
                 Flow::Yield(Exec::Row)
             }
+            _ => return self.op_join(op, core, env),
         })
+    }
+
+    /// The rowid source `p` (cursor `p - 1`; 0: none; `ACC_ROWID`:
+    /// the joined row's first source).
+    fn rowid_of(&self, p: u32) -> Option<i64> {
+        if p == ACC_ROWID {
+            return self.acc.rowids.as_slice().first().copied().flatten();
+        }
+        rowid_of(&self.curs, p)
     }
 }
 
@@ -482,6 +511,552 @@ fn rowid_of(curs: &AVec<Cursor>, p: u32) -> Option<i64> {
     match curs.as_slice().get(c)? {
         Cursor::Table(t) => t.rowid(),
         Cursor::Sorter(s) => s.rowid,
-        Cursor::Closed => None,
+        Cursor::Eph(e) => e.cur().and_then(|r| r.1),
+        _ => None,
+    }
+}
+
+/// A row's values and rowid, borrowed from its cursor.
+type RowRef<'a> = (&'a [OwnedValue], Option<i64>);
+
+/// The current row of cursor `c` (a table's, decoded, or a row
+/// list's) and its rowid; a pending page leaves everything as it
+/// was.
+fn row_at<'a>(
+    curs: &'a mut AVec<Cursor>,
+    prog: &Program,
+    core: &mut PagerCore<'_>,
+    pins: &mut AVec<u32>,
+    c: u16,
+) -> Result<core::result::Result<RowRef<'a>, crate::pager::Io>, Error<()>> {
+    match curs.as_mut_slice().get_mut(usize::from(c)) {
+        Some(Cursor::Table(t)) => {
+            let info = table_info(prog, t.info)?;
+            if let Err(io) = t.load(core, pins, info)? {
+                return Ok(Err(io));
+            }
+            let rowid = t.rowid();
+            Ok(Ok((t.row.vals.as_slice(), rowid)))
+        }
+        Some(Cursor::Eph(e)) => match e.cur() {
+            Some((v, r)) => Ok(Ok((v.as_slice(), *r))),
+            None => Err(Error::Unsupported),
+        },
+        _ => Err(Error::Unsupported),
+    }
+}
+
+fn eph(curs: &mut AVec<Cursor>, c: u16) -> Result<&mut Eph, Error<()>> {
+    match curs.as_mut_slice().get_mut(usize::from(c)) {
+        Some(Cursor::Eph(e)) => Ok(e),
+        _ => Err(Error::Unsupported),
+    }
+}
+
+fn groups(curs: &mut AVec<Cursor>, c: u16) -> Result<&mut Groups, Error<()>> {
+    match curs.as_mut_slice().get_mut(usize::from(c)) {
+        Some(Cursor::Groups(g)) => Ok(g),
+        _ => Err(Error::Unsupported),
+    }
+}
+
+fn agg(curs: &mut AVec<Cursor>, c: u16) -> Result<&mut AggRun, Error<()>> {
+    match curs.as_mut_slice().get_mut(usize::from(c)) {
+        Some(Cursor::Agg(a)) => Ok(a),
+        _ => Err(Error::Unsupported),
+    }
+}
+
+#[cfg(feature = "expr_index")]
+fn index(curs: &mut AVec<Cursor>, c: u16) -> Result<&mut super::index::IdxCursor, Error<()>> {
+    match curs.as_mut_slice().get_mut(usize::from(c)) {
+        Some(Cursor::Index(i)) => Ok(i),
+        _ => Err(Error::Unsupported),
+    }
+}
+
+/// The query plan a `P4::Plan` entry shares.
+fn plan(prog: &Program, at: u32) -> Result<alloc::rc::Rc<crate::session::QueryPlan>, Error<()>> {
+    match p4_at(&prog.p4, at) {
+        Some(P4::Plan(p)) => Ok(alloc::rc::Rc::clone(p)),
+        _ => Err(Error::Unsupported),
+    }
+}
+
+/// `n` registers from `from`.
+fn regs_at(regs: &AVec<OwnedValue>, from: u32, n: usize) -> Result<&[OwnedValue], Error<()>> {
+    let from = from as usize;
+    from.checked_add(n)
+        .and_then(|end| regs.as_slice().get(from..end))
+        .ok_or(Error::Unsupported)
+}
+
+/// The joined row cut back to source `src` (slot `base`).
+fn cut(acc: &mut RowData, base: u32, src: u32) {
+    acc.vals.truncate(base as usize);
+    acc.rowids.truncate(src as usize);
+    while acc.vals.len() < base as usize {
+        acc.vals.push(OwnedValue::Null);
+    }
+    while acc.rowids.len() < src as usize {
+        acc.rowids.push(None);
+    }
+}
+
+/// A flag register's truth (`p3`: 1 + the register; 0: false).
+fn flag_of(regs: &AVec<OwnedValue>, p3: u32) -> bool {
+    p3.checked_sub(1)
+        .and_then(|r| regs.as_slice().get(r as usize))
+        .is_some_and(|v| crate::query::truthy(v) == Some(true))
+}
+
+impl Vm {
+    /// The opcodes of unit `vm_joins`: joins, row lists, aggregates,
+    /// index cursors and the access walk.
+    fn op_join(
+        &mut self,
+        op: super::op::Op,
+        core: &mut PagerCore<'_>,
+        env: &Env,
+    ) -> Result<Flow, Error<()>> {
+        #[cfg(feature = "expr_index")]
+        macro_rules! step {
+            ($e:expr, $jump_if:expr) => {
+                match $e? {
+                    Err(io) => Flow::Stay(Exec::Pending(io)),
+                    Ok(b) if b == $jump_if => Flow::Jump(op.p2),
+                    Ok(_) => Flow::Next,
+                }
+            };
+        }
+        let jump_if = |b: bool| if b { Flow::Jump(op.p2) } else { Flow::Next };
+        Ok(match op.code {
+            Code::Integer => {
+                *reg_mut(&mut self.regs, op.p2)? = OwnedValue::Integer(i64::from(op.p3 as i32));
+                Flow::Next
+            }
+            Code::Once => {
+                let r = reg_mut(&mut self.regs, u32::from(op.p1))?;
+                if matches!(r, OwnedValue::Integer(1)) {
+                    Flow::Jump(op.p2)
+                } else {
+                    *r = OwnedValue::Integer(1);
+                    Flow::Next
+                }
+            }
+            Code::Load => {
+                let (vals, rowid) =
+                    match row_at(&mut self.curs, &self.prog, core, &mut self.pins, op.p1)? {
+                        Err(io) => return Ok(Flow::Stay(Exec::Pending(io))),
+                        Ok(r) => r,
+                    };
+                cut(&mut self.acc, op.p2, op.p3);
+                self.acc.vals.extend_from_slice(vals);
+                self.acc.rowids.push(rowid);
+                Flow::Next
+            }
+            Code::NullRow => {
+                cut(&mut self.acc, op.p2, op.p3);
+                for _ in 0..op.p1 {
+                    self.acc.vals.push(OwnedValue::Null);
+                }
+                self.acc.rowids.push(None);
+                Flow::Next
+            }
+            Code::Consts => {
+                let qp = plan(&self.prog, op.p4)?;
+                let ctx = Ctx::of(&self.empty).with(env);
+                let ok = crate::query::join_constants_hold::<()>(
+                    qp.filter.as_ref(),
+                    qp.sources.as_slice(),
+                    &ctx,
+                )?;
+                *reg_mut(&mut self.regs, op.p2)? = OwnedValue::Integer(i64::from(ok));
+                Flow::Next
+            }
+            Code::EphOpen => {
+                let slot = self
+                    .curs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)?;
+                match slot {
+                    Cursor::Eph(e) => e.clear(),
+                    _ => *slot = Cursor::Eph(alloc::boxed::Box::default()),
+                }
+                Flow::Next
+            }
+            Code::EphRewind => jump_if(!eph(&mut self.curs, op.p1)?.rewind(op.p5 == 1)),
+            Code::EphNext => jump_if(eph(&mut self.curs, op.p1)?.next(op.p5 == 1)),
+            Code::EphAdd => {
+                let flag = flag_of(&self.regs, op.p3);
+                let (vals, rowid) = match row_at(
+                    &mut self.curs,
+                    &self.prog,
+                    core,
+                    &mut self.pins,
+                    op.p2 as u16,
+                )? {
+                    Err(io) => return Ok(Flow::Stay(Exec::Pending(io))),
+                    Ok((v, r)) => {
+                        let mut c = AVec::with_capacity(v.len());
+                        c.extend_from_slice(v);
+                        (c, r)
+                    }
+                };
+                eph(&mut self.curs, op.p1)?.push(vals, rowid, flag);
+                Flow::Next
+            }
+            Code::EphMatch => {
+                eph(&mut self.curs, op.p1)?.flag_current();
+                Flow::Next
+            }
+            #[cfg(feature = "expr_index")]
+            Code::EphMark => {
+                let e = eph(&mut self.curs, op.p1)?;
+                e.mark = e.rows.len();
+                Flow::Next
+            }
+            #[cfg(feature = "expr_index")]
+            Code::EphReverse => {
+                eph(&mut self.curs, op.p1)?.reverse_tail();
+                Flow::Next
+            }
+            #[cfg(feature = "expr_index")]
+            Code::EphNulls => {
+                eph(&mut self.curs, op.p1)?.flagged_tail(op.p5 == 1);
+                Flow::Next
+            }
+            #[cfg(feature = "planner")]
+            Code::EphKeep => {
+                eph(&mut self.curs, op.p1)?.keep_current();
+                Flow::Next
+            }
+            Code::Distinct => {
+                let Some(P4::Colls(colls)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let vals = regs_at(&self.regs, op.p3, colls.len())?;
+                let e = match self.curs.as_mut_slice().get_mut(usize::from(op.p1)) {
+                    Some(Cursor::Eph(e)) => e,
+                    _ => return Err(Error::Unsupported),
+                };
+                jump_if(e.seen(vals, colls.as_slice()))
+            }
+            Code::AggOpen => {
+                let qp = plan(&self.prog, op.p4)?;
+                let slot = self
+                    .curs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)?;
+                *slot = Cursor::Agg(alloc::boxed::Box::new(AggRun::new(&qp)));
+                Flow::Next
+            }
+            Code::AggStep => {
+                let a = match self.curs.as_mut_slice().get_mut(usize::from(op.p1)) {
+                    Some(Cursor::Agg(a)) => a,
+                    _ => return Err(Error::Unsupported),
+                };
+                a.step(&self.acc, env)?;
+                Flow::Next
+            }
+            Code::AggFinal => {
+                let qp = plan(&self.prog, op.p4)?;
+                let n = qp.items.len();
+                let from = op.p2 as usize;
+                let a = agg(&mut self.curs, op.p1)?;
+                let dest = from
+                    .checked_add(n)
+                    .and_then(|end| self.regs.as_mut_slice().get_mut(from..end))
+                    .ok_or(Error::Unsupported)?;
+                a.finish(&qp, env, dest)?;
+                Flow::Next
+            }
+            Code::GroupOpen => {
+                let qp = plan(&self.prog, op.p4)?;
+                let slot = self
+                    .curs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)?;
+                *slot = Cursor::Groups(alloc::boxed::Box::new(Groups::new(op.p4, &qp)));
+                Flow::Next
+            }
+            Code::GroupAdd => {
+                let g = groups(&mut self.curs, op.p1)?;
+                let qp = plan(&self.prog, g.info)?;
+                let key = regs_at(&self.regs, op.p3, qp.group_by.len())?;
+                let g = match self.curs.as_mut_slice().get_mut(usize::from(op.p1)) {
+                    Some(Cursor::Groups(g)) => g,
+                    _ => return Err(Error::Unsupported),
+                };
+                g.add(&qp, &self.acc, key);
+                Flow::Next
+            }
+            Code::GroupSort => {
+                let g = groups(&mut self.curs, op.p1)?;
+                let qp = plan(&self.prog, g.info)?;
+                g.sort(&qp, core.text_enc());
+                Flow::Next
+            }
+            Code::GroupNext => {
+                let g = groups(&mut self.curs, op.p1)?;
+                let qp = plan(&self.prog, g.info)?;
+                jump_if(!g.next(&qp, env)?)
+            }
+            #[cfg(feature = "expr_index")]
+            Code::IdxOpen => {
+                let Some(P4::Index(ii)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let c = super::index::IdxCursor::new(op.p4, ii);
+                let slot = self
+                    .curs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)?;
+                *slot = Cursor::Index(alloc::boxed::Box::new(c));
+                Flow::Next
+            }
+            #[cfg(feature = "expr_index")]
+            Code::IdxRewind => step!(
+                index(&mut self.curs, op.p1)?.rewind(core, &mut self.pins),
+                false
+            ),
+            #[cfg(feature = "expr_index")]
+            Code::IdxSeek => {
+                let i = index(&mut self.curs, op.p1)?;
+                let Some(P4::Index(ii)) = p4_at(&self.prog.p4, i.info) else {
+                    return Err(Error::Unsupported);
+                };
+                let vals = regs_at(&self.regs, op.p3, op.p4 as usize)?;
+                let probe = super::index::probe_key(vals, ii.desc.len());
+                let i = index(&mut self.curs, op.p1)?;
+                step!(
+                    i.seek(core, &mut self.pins, probe.as_slice(), ii.desc.as_slice()),
+                    false
+                )
+            }
+            #[cfg(feature = "expr_index")]
+            Code::IdxNext => step!(
+                index(&mut self.curs, op.p1)?.next(core, &mut self.pins),
+                true
+            ),
+            #[cfg(feature = "expr_index")]
+            Code::IdxTest => {
+                let Some(P4::Walk(w)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let enc = core.text_enc();
+                let curs = self.curs.as_slice();
+                let ent = match curs.get(usize::from(op.p1)) {
+                    Some(Cursor::Index(i)) if i.valid => i.entry.as_slice(),
+                    _ => return Err(Error::Unsupported),
+                };
+                let rowids = match w.rowids {
+                    None => None,
+                    Some(c) => match curs.get(c as usize) {
+                        Some(Cursor::Eph(e)) => Some(e),
+                        _ => return Err(Error::Unsupported),
+                    },
+                };
+                let mut rv: AVec<OwnedValue> = AVec::new();
+                if let Some(e) = rowids {
+                    for (v, _) in e.rows.iter() {
+                        if let Some(x) = v.as_slice().first() {
+                            rv.push(x.clone());
+                        }
+                    }
+                }
+                let got = super::index::walk_test(
+                    w,
+                    ent,
+                    self.regs.as_slice(),
+                    rowids.map(|_| rv.as_slice()),
+                    enc,
+                )?;
+                match got {
+                    super::index::WalkStep::Stop => Flow::Jump(op.p2),
+                    super::index::WalkStep::Skip => Flow::Jump(op.p3),
+                    super::index::WalkStep::Found(null) => {
+                        let fr = w.flag;
+                        *reg_mut(&mut self.regs, fr)? = OwnedValue::Integer(i64::from(null));
+                        Flow::Next
+                    }
+                }
+            }
+            #[cfg(feature = "expr_index")]
+            Code::IdxRowid => {
+                let r = index(&mut self.curs, op.p1)?.rowid()?;
+                *reg_mut(&mut self.regs, op.p2)? = OwnedValue::Integer(r);
+                Flow::Next
+            }
+            #[cfg(feature = "expr_index")]
+            Code::IdxCover => {
+                let Some(P4::Cover(c)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let flag = flag_of(&self.regs, op.p3);
+                let i = index(&mut self.curs, op.p2 as u16)?;
+                let rowid = i.rowid()?;
+                let row = super::index::cover_row(c, i.entry.as_slice(), rowid);
+                eph(&mut self.curs, op.p1)?.push(row, Some(rowid), flag);
+                Flow::Next
+            }
+            #[cfg(feature = "expr_index")]
+            Code::ProbeList => {
+                let Some(P4::Probe(p)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let vals = regs_at(&self.regs, op.p3, p.n)?;
+                let list = super::index::probe_list(p, vals, core.text_enc());
+                let e = eph(&mut self.curs, op.p1)?;
+                e.clear();
+                for v in list {
+                    let mut row = AVec::with_capacity(1);
+                    row.push(v);
+                    e.push(row, None, false);
+                }
+                e.rewind(false);
+                jump_if(e.rows.is_empty())
+            }
+            #[cfg(feature = "expr_index")]
+            Code::ListValue => {
+                let v = eph(&mut self.curs, op.p1)?
+                    .cur()
+                    .and_then(|r| r.0.as_slice().first().cloned())
+                    .unwrap_or(OwnedValue::Null);
+                *reg_mut(&mut self.regs, op.p2)? = v;
+                Flow::Next
+            }
+            #[cfg(feature = "planner")]
+            Code::ListValues => {
+                let mut vals = AVec::new();
+                if let Some(r) = eph(&mut self.curs, op.p1)?.cur() {
+                    vals.extend_from_slice(r.0.as_slice());
+                }
+                for j in 0..op.p3 {
+                    let v = vals
+                        .as_slice()
+                        .get(j as usize)
+                        .cloned()
+                        .unwrap_or(OwnedValue::Null);
+                    *reg_mut(&mut self.regs, op.p2.saturating_add(j))? = v;
+                }
+                Flow::Next
+            }
+            #[cfg(feature = "planner")]
+            Code::SkipAdd => {
+                let Some(P4::Index(ii)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let n = op.p3 as usize;
+                let mut vals: AVec<OwnedValue> = AVec::new();
+                match self.curs.as_slice().get(op.p2 as usize) {
+                    Some(Cursor::Index(i)) if i.valid => {
+                        vals.extend_from_slice(i.entry.as_slice().get(..n).unwrap_or(&[]));
+                    }
+                    _ => return Err(Error::Unsupported),
+                }
+                let e = eph(&mut self.curs, op.p1)?;
+                let last = e.rows.as_slice().last().map(|r| r.0.as_slice());
+                if super::index::new_prefix(last, vals.as_slice(), n, ii.desc.as_slice()) {
+                    e.push(vals, None, false);
+                }
+                Flow::Next
+            }
+            #[cfg(feature = "planner")]
+            Code::AutoSort => {
+                let Some(P4::Auto(ai)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let enc = core.text_enc();
+                let e = eph(&mut self.curs, op.p1)?;
+                crate::session::auto_sort(e.rows.as_mut_slice(), ai, enc);
+                if ai.bloom {
+                    e.bloom = crate::session::bloom_build(e.rows.as_slice(), ai);
+                }
+                e.end = e.rows.len();
+                Flow::Next
+            }
+            #[cfg(feature = "planner")]
+            Code::AutoSpan => {
+                let Some(P4::Auto(ai)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let probe = regs_at(&self.regs, op.p3, ai.keys.len())?;
+                let enc = core.text_enc();
+                let e = match self.curs.as_mut_slice().get_mut(usize::from(op.p1)) {
+                    Some(Cursor::Eph(e)) => e,
+                    _ => return Err(Error::Unsupported),
+                };
+                let (lo, hi) = if crate::session::bloom_may(e.bloom.as_slice(), probe) {
+                    crate::session::auto_span(e.rows.as_slice(), ai, probe, enc)
+                } else {
+                    (0, 0)
+                };
+                e.at = lo;
+                e.end = hi;
+                jump_if(lo >= hi)
+            }
+            #[cfg(feature = "planner")]
+            Code::BloomAdd => {
+                let Some(P4::BKeys(keys)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                if op.p5 == 1 {
+                    let e = eph(&mut self.curs, op.p1)?;
+                    e.bloom.clear();
+                    for _ in 0..crate::session::BLOOM_BYTES {
+                        e.bloom.push(0);
+                    }
+                    return Ok(Flow::Next);
+                }
+                let (vals, rowid) = match row_at(
+                    &mut self.curs,
+                    &self.prog,
+                    core,
+                    &mut self.pins,
+                    op.p2 as u16,
+                )? {
+                    Err(io) => return Ok(Flow::Stay(Exec::Pending(io))),
+                    Ok(r) => r,
+                };
+                let mut key: AVec<OwnedValue> = AVec::new();
+                for k in keys.iter() {
+                    key.push(match k {
+                        crate::xplan::BKey::Col(c) => {
+                            vals.get(*c).cloned().unwrap_or(OwnedValue::Null)
+                        }
+                        _ => rowid.map_or(OwnedValue::Null, OwnedValue::Integer),
+                    });
+                }
+                let bits = crate::session::BLOOM_BYTES as u64 * 8;
+                let h = crate::session::bloom_hash(key.as_slice()) % bits;
+                let e = eph(&mut self.curs, op.p1)?;
+                if let Some(b) = e.bloom.as_mut_slice().get_mut((h / 8) as usize) {
+                    *b |= 1 << (h % 8);
+                }
+                Flow::Next
+            }
+            #[cfg(feature = "planner")]
+            Code::BloomTest => {
+                let Some(P4::BKeys(keys)) = p4_at(&self.prog.p4, op.p4) else {
+                    return Err(Error::Unsupported);
+                };
+                let probe = regs_at(&self.regs, op.p3, keys.len())?;
+                let skip = keys.iter().zip(probe.iter()).any(|(k, v)| {
+                    *k == crate::xplan::BKey::Rowid
+                        && !matches!(v, OwnedValue::Integer(_) | OwnedValue::Real(_))
+                });
+                let e = match self.curs.as_slice().get(usize::from(op.p1)) {
+                    Some(Cursor::Eph(e)) => e,
+                    _ => return Err(Error::Unsupported),
+                };
+                jump_if(!skip && !crate::session::bloom_may(e.bloom.as_slice(), probe))
+            }
+            _ => return Err(Error::Unsupported),
+        })
     }
 }

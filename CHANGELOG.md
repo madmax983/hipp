@@ -5,6 +5,23 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: joins, index access, aggregates (ADR 0005 Stage 2, unit `vm_joins`)
+
+- Under the hidden feature `vm`, the VM now runs SELECTs over any
+  number of rowid tables joined in the planner's order (inner, LEFT,
+  RIGHT, FULL, CROSS, NATURAL / USING, semi-joins), reading each
+  through its access path — sync, restartable index cursors for
+  equality, range and IN lookups, covering, expression and partial
+  indexes, MULTI-INDEX OR, skip-scans, the min() / max() early-out,
+  automatic indexes and Bloom filters — then aggregates (the streamed
+  fold or GROUP BY groups, HAVING), DISTINCT, ORDER BY and LIMIT /
+  OFFSET, with today's executor's rows, order and bare columns.
+- On the VM, a RIGHT / FULL JOIN and a GROUP BY return the rows before
+  a failing one, as the pin does (today's executor returns none), and
+  HAVING terms the pin moves into the WHERE clause are tested per
+  row. Still no profile enables `vm`: every profile's size is
+  unchanged.
+
 ### The bytecode VM, behind a hidden feature (ADR 0005 Stage 2, unit `vm_core`)
 
 - A register VM in `src/vm/` (16-byte `p1`-`p5` instructions with a

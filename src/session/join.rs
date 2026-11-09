@@ -27,11 +27,11 @@ use crate::xjoin::{JQuery, JSrc};
 use crate::xplan::{Src, TOp, Table, Term};
 
 /// The Bloom filter's size in bytes (the pin's `OP_Blob 10000`).
-const BLOOM_BYTES: usize = 10_000;
+pub(crate) const BLOOM_BYTES: usize = 10_000;
 
 /// The pin's `filterHash` of one key: integers (and integral reals)
 /// by value, every string alike, every blob alike, NULL as 0.
-fn bloom_hash(vals: &[OwnedValue]) -> u64 {
+pub(crate) fn bloom_hash(vals: &[OwnedValue]) -> u64 {
     let mut h: u64 = 0;
     for v in vals.iter() {
         let x: u64 = match v {
@@ -47,7 +47,7 @@ fn bloom_hash(vals: &[OwnedValue]) -> u64 {
 }
 
 /// A Bloom filter over the key columns of `rows` (v0.17).
-pub(super) fn bloom_build(
+pub(crate) fn bloom_build(
     rows: &[(AVec<OwnedValue>, Option<i64>)],
     ai: &crate::xplan::AutoIdx,
 ) -> AVec<u8> {
@@ -75,7 +75,7 @@ pub(super) fn bloom_build(
 }
 
 /// Whether probe `key` may find a row (`OP_Filter`).
-pub(super) fn bloom_may(bits: &[u8], key: &[OwnedValue]) -> bool {
+pub(crate) fn bloom_may(bits: &[u8], key: &[OwnedValue]) -> bool {
     if bits.is_empty() {
         return true;
     }
@@ -122,7 +122,7 @@ fn auto_cmp(
 }
 
 /// Sort a table's rows into automatic-index order (v0.17).
-pub(super) fn auto_sort(
+pub(crate) fn auto_sort(
     rows: &mut [(AVec<OwnedValue>, Option<i64>)],
     ai: &crate::xplan::AutoIdx,
     enc: crate::record::TextEnc,
@@ -132,7 +132,7 @@ pub(super) fn auto_sort(
 
 /// The span of `rows` (in automatic-index order) whose key equals
 /// `probe` (converted values, one per key column): binary searched.
-pub(super) fn auto_span(
+pub(crate) fn auto_span(
     rows: &[(AVec<OwnedValue>, Option<i64>)],
     ai: &crate::xplan::AutoIdx,
     probe: &[OwnedValue],

@@ -227,6 +227,11 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   today's executor. No profile enables `vm` yet, so no profile's size
   changes; the stage's later units cover the rest of SELECT, and its
   last one turns the VM on and deletes the executors it replaces.
+- **The bytecode VM, second unit** (hidden feature `vm`). Joins of
+  any kind in the planner's order, every index access path (sync,
+  restartable index cursors), aggregates, GROUP BY / HAVING and
+  DISTINCT now run on the VM too; subqueries, compounds, CTEs / views,
+  windows and virtual sources still hand off to today's executor.
 
 ## What v0.16 does
 

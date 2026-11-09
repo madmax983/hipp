@@ -142,6 +142,8 @@ mod trigger;
 mod vtab;
 #[cfg(feature = "expr_index")]
 mod xindex;
+#[cfg(all(feature = "vm", feature = "planner"))]
+pub(crate) use join::{BLOOM_BYTES, auto_sort, auto_span, bloom_build, bloom_hash, bloom_may};
 #[cfg(all(feature = "vm", feature = "expr_index"))]
 pub(crate) use xindex::rowid_end;
 
@@ -291,6 +293,13 @@ pub struct Config {
     /// default).
     #[cfg(feature = "vm")]
     pub vm_strict: bool,
+    /// Run every SELECT on today's executor, as a build without the
+    /// VM does (ADR 0005 Stage 2, hidden `vm` feature; a test switch
+    /// for comparing the VM with the executor it replaces, off by
+    /// default).
+    #[cfg(feature = "vm")]
+    #[doc(hidden)]
+    pub vm_off: bool,
 }
 
 /// `Config::default()`'s virtual-table row bound (v0.16, `vtab`;
@@ -340,6 +349,8 @@ impl Default for Config {
             max_vtab_rows: DEFAULT_VTAB_ROWS,
             #[cfg(feature = "vm")]
             vm_strict: false,
+            #[cfg(feature = "vm")]
+            vm_off: false,
         }
     }
 }
@@ -432,6 +443,8 @@ impl Config {
             max_vtab_rows: 1 << 16,
             #[cfg(feature = "vm")]
             vm_strict: false,
+            #[cfg(feature = "vm")]
+            vm_off: false,
         }
     }
 
@@ -560,6 +573,14 @@ impl Config {
     #[cfg(feature = "vm")]
     pub fn vm_strict(mut self, on: bool) -> Config {
         self.vm_strict = on;
+        self
+    }
+    /// Run every SELECT on today's executor (ADR 0005 Stage 2, hidden
+    /// `vm` feature; see the `vm_off` field).
+    #[cfg(feature = "vm")]
+    #[doc(hidden)]
+    pub fn vm_off(mut self, on: bool) -> Config {
+        self.vm_off = on;
         self
     }
 }
@@ -14834,7 +14855,7 @@ fn compound_order_cmp(
 /// group column and a query without GROUP BY skipped errors the
 /// pin raises.
 #[cfg(feature = "query")]
-fn having_early<'x>(h: &'x RExpr, group_by: &[RExpr], out: &mut AVec<&'x RExpr>) {
+pub(crate) fn having_early<'x>(h: &'x RExpr, group_by: &[RExpr], out: &mut AVec<&'x RExpr>) {
     if group_by.is_empty() || always_false(h) {
         return;
     }
@@ -14980,7 +15001,7 @@ fn group_match(a: &RExpr, b: &RExpr) -> bool {
 /// one that errors (`sum()` overflow, the percentile checks) fails
 /// the statement even for a group HAVING drops.
 #[cfg(feature = "query")]
-fn group_aggs<'x>(
+pub(crate) fn group_aggs<'x>(
     items: &'x [RExpr],
     order_by: &'x [(RExpr, crate::sql::SortOrder)],
 ) -> AVec<&'x RExpr> {
@@ -15119,7 +15140,10 @@ fn order_ref(
 /// as a result column (`same_expr`; an alias or ordinal resolves to
 /// a copy of the column's) — the last such column.
 #[cfg(feature = "query")]
-fn order_cols(order: &[(RExpr, crate::sql::SortOrder)], items: &[RExpr]) -> AVec<Option<usize>> {
+pub(crate) fn order_cols(
+    order: &[(RExpr, crate::sql::SortOrder)],
+    items: &[RExpr],
+) -> AVec<Option<usize>> {
     let mut out = AVec::new();
     for (e, _) in order.iter() {
         let mut e = e;
@@ -15156,7 +15180,7 @@ fn shown_keys(keys: &mut [OwnedValue], cols: &[Option<usize>], vals: &[OwnedValu
 /// when there are as many keys as GROUP BY terms — whatever the
 /// outer ORDER BY says.
 #[cfg(feature = "query")]
-fn group_desc(
+pub(crate) fn group_desc(
     group_by: &[RExpr],
     items: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
@@ -15181,7 +15205,7 @@ fn group_desc(
 /// collation, descending where `gdesc` says (v0.17 size pass: the
 /// one comparator every grouping path shares).
 #[cfg(feature = "query")]
-fn sort_groups(
+pub(crate) fn sort_groups(
     groups: &mut [(AVec<OwnedValue>, AVec<RowData>)],
     gcolls: &[crate::record::Coll],
     gdesc: &[bool],
@@ -15208,7 +15232,7 @@ fn sort_groups(
 /// `expr_index`): its one source's index delivers it, and the pin
 /// then emits the groups as they arrive, skipping its group sorter.
 #[cfg(feature = "query")]
-fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
+pub(crate) fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
     #[cfg(feature = "expr_index")]
     if let [s] = sources
         && s.access.as_ref().is_some_and(|a| a.groups)
@@ -15790,7 +15814,7 @@ fn win_results<E>(
 /// group's first row. (v0.4 – v0.15 honoured only a lone
 /// min/max aggregate.)
 #[cfg(feature = "query")]
-fn rep_minmax<'x>(
+pub(crate) fn rep_minmax<'x>(
     items: &'x [RExpr],
     having: Option<&'x RExpr>,
     order_by: &'x [(RExpr, crate::sql::SortOrder)],
@@ -15825,10 +15849,10 @@ fn rep_minmax<'x>(
 /// loads the bare columns (none passing: the group's first row).
 #[cfg(feature = "query")]
 #[derive(Clone, Copy)]
-struct MinMaxRep<'x> {
-    kind: crate::query::AggKind,
-    arg: &'x RExpr,
-    filter: Option<&'x RExpr>,
+pub(crate) struct MinMaxRep<'x> {
+    pub(crate) kind: crate::query::AggKind,
+    pub(crate) arg: &'x RExpr,
+    pub(crate) filter: Option<&'x RExpr>,
 }
 
 #[cfg(feature = "sql")]
@@ -15845,7 +15869,7 @@ impl MinMaxRep<'_> {
 /// it is the first or strictly beyond the best so far under the
 /// argument's collation (ties keep the earlier row).
 #[cfg(feature = "query")]
-fn extremum_step(
+pub(crate) fn extremum_step(
     kind: crate::query::AggKind,
     coll: crate::record::Coll,
     best: &mut Option<OwnedValue>,
@@ -15876,7 +15900,7 @@ fn extremum_step(
 /// rule): the first row, or the extremum row of the min/max
 /// aggregate `rep_minmax` picks (see `extremum_step`).
 #[cfg(feature = "query")]
-fn pick_rep_from<E>(
+pub(crate) fn pick_rep_from<E>(
     env: &crate::query::Env,
     items: &[RExpr],
     having: Option<&RExpr>,

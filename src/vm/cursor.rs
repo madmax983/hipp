@@ -69,6 +69,14 @@ pub(crate) enum Cursor {
     Closed,
     Table(alloc::boxed::Box<TableCursor>),
     Sorter(alloc::boxed::Box<Sorter>),
+    /// An in-memory row list (unit `vm_joins`).
+    Eph(alloc::boxed::Box<super::rows::Eph>),
+    /// A GROUP BY's groups.
+    Groups(alloc::boxed::Box<super::rows::Groups>),
+    /// A streamed aggregate's accumulators.
+    Agg(alloc::boxed::Box<super::rows::AggRun>),
+    #[cfg(feature = "expr_index")]
+    Index(alloc::boxed::Box<super::index::IdxCursor>),
 }
 
 /// One interior page on a table cursor's path: its children (the
@@ -125,7 +133,12 @@ enum Aim {
     Key(i64),
 }
 
-fn fetch(core: &mut PagerCore<'_>, pins: &mut AVec<u32>, page: u32, keep: bool) -> Sync<usize> {
+pub(crate) fn fetch(
+    core: &mut PagerCore<'_>,
+    pins: &mut AVec<u32>,
+    page: u32,
+    keep: bool,
+) -> Sync<usize> {
     Ok(match core.get(page, pins, keep)? {
         Got::Hit(i) => Ok(i),
         Got::Miss(io) => Err(io),

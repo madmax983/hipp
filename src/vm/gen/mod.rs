@@ -5,4 +5,5 @@
 //! (`Program::host`).
 
 pub(crate) mod expr;
+pub(crate) mod join;
 pub(crate) mod select;

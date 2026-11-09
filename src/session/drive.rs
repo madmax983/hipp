@@ -18,7 +18,10 @@ impl<S: Storage> Statement<'_, S> {
         #[cfg(not(feature = "without_rowid"))]
         let wr = |_: u32| false;
         let prog = match &self.plan {
-            Plan::Query(qp) => codegen::select::query(qp, &wr),
+            Plan::Query(qp) => codegen::select::query(qp, &wr).or_else(|| {
+                let utf8 = self.conn.pager.text_enc() == crate::record::TextEnc::Utf8;
+                codegen::join::query(qp, &wr, utf8)
+            }),
             Plan::Scan {
                 root,
                 rowid_alias,
@@ -79,7 +82,7 @@ impl<S: Storage> Statement<'_, S> {
     pub(super) async fn vm_step(&mut self) -> Option<Result<Step, S::Error>> {
         // PRAGMA and EXPLAIN QUERY PLAN serve their rows through
         // `step_query` too.
-        if !matches!(self.plan, Plan::Query(_) | Plan::Scan { .. }) {
+        if !matches!(self.plan, Plan::Query(_) | Plan::Scan { .. }) || self.conn.cfg.vm_off {
             return None;
         }
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]

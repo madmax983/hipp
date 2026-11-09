@@ -37,7 +37,10 @@ pub(crate) mod build;
 pub(crate) mod codegen;
 pub(crate) mod cursor;
 pub(crate) mod exec;
+#[cfg(feature = "expr_index")]
+pub(crate) mod index;
 pub(crate) mod op;
+pub(crate) mod rows;
 
 pub(crate) use crate::pager::Io;
 

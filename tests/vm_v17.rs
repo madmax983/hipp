@@ -18,7 +18,7 @@
 //!   pin; three no-FROM cases where today's executor errors and the
 //!   pin does not (OFFSET skipping an erroring row, an erroring
 //!   ORDER BY term, LIMIT 0) match the pin on the VM.
-//! - **Fallback.** Every shape the unit does not claim fails under
+//! - **Fallback.** Every shape no unit claims yet fails under
 //!   `vm_strict` with `Error::VmFallback`, and without it runs on
 //!   today's executor (`runs_on_vm` false) with the pin's rows.
 //! - **Restart.** The corpus again with the smallest page cache that
@@ -570,18 +570,14 @@ fn parameters_compile_per_execution() {
 
 // ---------------- fallback ----------------
 
-/// Shapes this unit does not claim: strict mode refuses them
+/// Shapes no unit claims yet: strict mode refuses them
 /// (`VmFallback`), and without it they run on today's executor with
-/// the pin's rows.
+/// the pin's rows. (Joins, aggregates, DISTINCT, index access and
+/// rowid IN lists moved to `tests/vm_joins_v17.rs` with unit
+/// `vm_joins`, as did an EXISTS term the planner makes a semi-join.)
 const UNCLAIMED: &[&str] = &[
-    "SELECT t.a, u.k FROM t, u WHERE t.a = u.k;",
-    "SELECT a FROM t LEFT JOIN u ON a = k;",
-    "SELECT count(*) FROM t;",
-    "SELECT f, count(*) FROM t GROUP BY f;",
-    "SELECT DISTINCT f FROM t;",
     "SELECT a FROM t WHERE a IN (SELECT k FROM u);",
     "SELECT (SELECT max(k) FROM u), a FROM t;",
-    "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = a);",
     "SELECT a FROM t UNION SELECT k FROM u;",
     "VALUES (1), (2);",
     "SELECT * FROM (SELECT a FROM t ORDER BY b LIMIT 3) WHERE a > 2;",
@@ -591,8 +587,6 @@ const UNCLAIMED: &[&str] = &[
     "SELECT * FROM wr;",
     "SELECT key FROM json_each('[1,2]');",
     "SELECT value FROM generate_series(1, 3);",
-    "SELECT k FROM u WHERE k = 2;",
-    "SELECT a FROM t WHERE a IN (1, 3);",
 ];
 
 const U: &str = "CREATE TABLE u(k, v); INSERT INTO u VALUES (1, 'p'), (2, 'q'), (3, 'r'); \

@@ -23,6 +23,8 @@ pub(crate) struct Builder {
     labels: AVec<Option<u32>>,
     /// (instruction, label) pairs whose `p2` is the label's address.
     fixups: AVec<(usize, usize)>,
+    /// (instruction, label) pairs whose `p3` is the label's address.
+    fixups3: AVec<(usize, usize)>,
     /// The constant loads of the `Init` prologue.
     consts: AVec<Op>,
     bad: bool,
@@ -40,6 +42,7 @@ impl Builder {
             ncur: 0,
             labels: AVec::new(),
             fixups: AVec::new(),
+            fixups3: AVec::new(),
             consts: AVec::new(),
             bad: false,
         }
@@ -130,6 +133,16 @@ impl Builder {
         self.fixups.push((at, to.0));
     }
 
+    /// Append an instruction whose `p2` jumps to `to` and whose `p3`
+    /// jumps to `to3`.
+    #[cfg(feature = "expr_index")]
+    pub(crate) fn jump2(&mut self, code: Code, p1: u32, to: Label, to3: Label, p4: u32) {
+        let at = self.ops.len();
+        self.emit(code, p1, 0, 0, p4, 0);
+        self.fixups.push((at, to.0));
+        self.fixups3.push((at, to3.0));
+    }
+
     /// Append a constant load to the `Init` prologue: it runs once,
     /// before instruction 1.
     pub(crate) fn hoist(&mut self, code: Code, p2: u32, p4: u32) {
@@ -156,6 +169,10 @@ impl Builder {
         for (at, l) in self.fixups.iter() {
             let to = (*self.labels.as_slice().get(*l)?)?;
             self.ops.as_mut_slice().get_mut(*at)?.p2 = to;
+        }
+        for (at, l) in self.fixups3.iter() {
+            let to = (*self.labels.as_slice().get(*l)?)?;
+            self.ops.as_mut_slice().get_mut(*at)?.p3 = to;
         }
         Some(Program {
             ops: self.ops,

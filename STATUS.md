@@ -11,6 +11,199 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_joins (2026-11-09)
+
+The second of Stage 2's five units, built on `vm_core`'s `src/vm/`
+design (unchanged: the restart rule, the `Eval` opcode, the driver).
+Still behind the hidden feature `vm`, which no profile enables; under
+`vm` a SELECT the code generator does not cover runs whole on today's
+executor.
+
+**Shipped.**
+- **The general SELECT generator** (`vm::codegen::join`, tried after
+  `vm_core`'s single-table one): any number of FROM sources in the
+  planner's order, each a loop that appends its row to the joined
+  row (the VM's accumulator: `Load`, `NullRow`) — the streamed
+  executor's (`session::stream`) nested loop laid out as code. Inner,
+  comma and CROSS joins; LEFT JOIN NULL-extension (one pad row after
+  a loop no row of which passed the ON clause); RIGHT and FULL joins
+  (the source's rows in a row list whose match flags the ON clause
+  sets, then after the main loop each unmatched row with NULLs for
+  the sources before it, joined onward — `join_sources`' second
+  pass, for every RIGHT / FULL source in turn); NATURAL / USING (the
+  plan's ON clauses and coalesced columns); semi-joins from
+  flattened EXISTS terms (the loop ends once a joined row passed the
+  WHERE clause); the WHERE clause's constant terms first (`Consts`,
+  `join_constants_hold` with the sources' ON terms), the rest per
+  complete row; ON terms where the planner placed them.
+- **Index cursors** (`vm::index::IdxCursor`): sync, restartable
+  rewind / seek / next over index B-trees in key order (interior
+  entries between their subtrees), the seek with the pin's per-page
+  binary search (`btree::IndexCursor::seek_found`'s); a move works on
+  copies and commits only when no page was missing, every page it
+  read pinned until the opcode completes.
+- **Every access path the planners produce**, ported from
+  `xindex::access_rows` / `access_walk` rule for rule: rowid lookups
+  and ranges read the table directly (per outer row for a lateral
+  probe); every other path computes the source's rows into a row
+  list — once per execution (`Once`) when its probes read no earlier
+  source, per combination otherwise — in the path's order: equality
+  and IN probe sets (`ProbeList`: converted, NULLs dropped unless
+  `IS`, an IN list sorted and deduplicated under the key's
+  collation, walked in the key column's order), each combination of
+  them seeked and walked (`IdxSeek` / `IdxTest`: the prefix, the
+  range under the key's collation and direction, NULL keys, the rowid
+  range and rowid equality values after the key), reversed for a
+  reverse walk, WHERE_BIGNULL_SORT's NULL rows moved (`EphNulls`);
+  covering indexes (rows from the entries, `IdxCover`); expression
+  and partial indexes; rowid IN lists; MULTI-INDEX OR (each branch's
+  rows that satisfy its condition and no earlier branch's, in branch
+  order); skip-scans (the distinct leading prefixes from one index
+  pass, then the walk per prefix, its bounds and probes evaluated
+  again as today); the min() / max() early-out (the first row passing
+  the WHERE clause); automatic indexes (the table's rows sorted once
+  on the key with `join::auto_sort`, probed by `auto_span` after
+  their Bloom filter) and the Bloom filters of lateral lookups (built
+  from every table row at the first probe, `bloom_hash`).
+- **Aggregates**: the streamed fold (`AggOpen` / `AggStep` /
+  `AggFinal`: count / sum / total / avg / min / max with the
+  min / max bare-column row, `stream::AggRun` ported) where today's
+  executor folds; otherwise GROUP BY groups (`GroupOpen` /
+  `GroupAdd` / `GroupSort` / `GroupNext`: formed in arrival order
+  under each term's collation, sorted with `sort_groups` unless an
+  index delivers them, the bare-column row by `pick_rep_from`) whose
+  aggregates fold through `agg.rs` (an `Eval` in group context) —
+  DISTINCT aggregates, ORDER BY / FILTER aggregates, the empty
+  group; HAVING with every aggregate finalized first; DISTINCT
+  (`Distinct` over a row list, `compound_rows_equal`'s rule) with
+  OFFSET after it; ORDER BY (the sorter) unless the one source's
+  order delivers it.
+- **Opcodes (37 more: 42 in all with `query` alone, 63 with
+  `expr_index`, 70 with `planner`):** Integer, Once, Load,
+  NullRow, Consts; EphOpen / Rewind / Next / Add / Match / Mark /
+  Reverse / Nulls / Keep, Distinct (the ADR's OpenEphemeral and
+  RowSet); AggOpen / Step / Final, GroupOpen / Add / Sort / Next (the
+  ADR's AggStep / AggFinal over `agg.rs`); IdxOpen / Rewind / Seek /
+  Next / Test / Rowid / Cover, ProbeList, ListValue (gated
+  `expr_index`: only its planner makes index plans); ListValues,
+  SkipAdd, AutoSort, AutoSpan, BloomAdd, BloomTest (gated `planner`).
+  The ADR's per-predicate IdxGE / GT / LE / LT are one `IdxTest`
+  (`p2` ends the walk, `p3` skips the entry: the builder fixes up a
+  second jump), whose side-table entry is the walk's rule — the same
+  choice as `Eval` (rule 5): one opcode keeps today's comparison
+  rules in one place. `Found` / `NotFound` are not needed (an index
+  walk finds rows by `IdxRowid` + `SeekRowid`).
+- **Test hook:** `Config::vm_off` (doc-hidden, `vm` only) runs every
+  SELECT on today's executor, so a test can compare the VM with the
+  executor it replaces row for row.
+
+**Falls back** (whole statements): subqueries anywhere (IN-subquery
+probes included: `vm_subqueries`), compounds, VALUES, derived tables,
+views and CTEs the flattener leaves, windows, virtual and
+table-valued sources, WITHOUT ROWID tables (their rows are named by
+the connection's per-statement handles, `crate::wr`, which the sync
+read path does not reach yet), TEMP and attached tables,
+`sqlite_schema`, a RIGHT / FULL source with an access path (the
+planner makes none), trigger and FK action programs.
+
+**Oracle probing** (the pin, live, before implementing):
+- A RIGHT / FULL JOIN streams: the main loop's rows, then the
+  unmatched ones in the source's scan order; a row error after them
+  returns the rows before it (`a RIGHT JOIN b ON b.p = a.x` with an
+  erroring result column: three rows, then the error). Today's
+  executor materialises these joins and returns no row before the
+  error; the VM returns the pin's.
+- GROUP BY emits each group as it is finalized: an aggregate error in
+  the third group (`sum()` overflow) comes after the first two
+  groups' rows; with `ORDER BY` the GROUP BY terms (default NULLs
+  placement, the terms' collations) the groups come in that order
+  with no sorter (`GROUP BY k ORDER BY k DESC`: `4|1`, then the
+  error). Any other ORDER BY sorts every group first (no row before
+  the error). The VM does the same; today's executor returns no row.
+- HAVING terms the pin moves into the WHERE clause (`having_early`:
+  constant or GROUP BY terms) are tested per row before grouping: an
+  error there comes before any row (`GROUP BY b HAVING json(...)`).
+  The VM tests them per row, in turn, as WHERE terms.
+- A RIGHT / FULL source gets no index path from hipp's planner
+  (EQP `SCAN b` where the pin searches an index): its rows are the
+  pin's, from a scan.
+
+**Bugs found on the way (VM only; today's executor keeps them until
+`vm_flip`, since fixing them there would grow every profile):**
+- a literal range bound loaded once in the prologue was converted in
+  place by `RowidBound` on every pass, so a rowid range re-walked per
+  outer row (a lateral loop, a MULTI-INDEX OR branch) drifted by one
+  each time — values a later opcode converts are now loaded where
+  they are used (`G::val_mut`); found by `multi_index_v17` and
+  `flatten_v17` under `--features vm`;
+- today's executor's GROUP BY with a LIMIT and an ORDER BY of the
+  GROUP BY terms in another NULLs placement can stop at the wrong
+  groups (`group_cap` counts groups in GROUP BY order, NULLs first):
+  a generated three-way join, `... GROUP BY x1.b ORDER BY x1.b NULLS
+  LAST LIMIT 4`, lost its `5` group for the NULL one (the one-table
+  forms of it, with and without an index, are right); the VM sorts
+  every group and gives the pin's rows (`generated_queries_...`).
+
+**Tests.** `tests/vm_joins_v17.rs` (built only with `--features
+vm`; every claimed SELECT strict, asserting `runs_on_vm`): 50 joins
+(every join kind, RIGHT / FULL mixed with LEFT and with each other,
+empty tables on either side, NATURAL / USING, semi-joins, views,
+LIMIT / OFFSET), 48 aggregate and DISTINCT queries, 44 index-access
+queries, 13 failing statements (rows before the error), a 3,000-row
+file at 512-byte pages with two indexes, `multi_index_v17`'s OR,
+min() / max() and skip-scan corpora and `join_order_v17`'s curated
+and statistics corpora (automatic indexes, Bloom filters), all
+against the pin, rows in order; the whole corpus again with a
+3-frame cache (the restart rule for index seeks and the RIGHT / FULL
+second pass); 480 generated queries (xorshift: 1-3 of 4 random
+tables with random indexes and statistics, every join kind, IN /
+range / OR / expression / partial-index terms, GROUP BY / HAVING,
+aggregates, DISTINCT, ORDER BY, LIMIT / OFFSET) that must all run on
+the VM and give today's executor's rows, order and success exactly
+(`vm_off`), or the pin's rows where today's executor does not (6,000
+queries at `HIPP_VMJ_SEEDS=500`: 4 such, 14 where both give today's
+non-pin rows). `tests/vm_v17.rs`' fallback list loses the shapes this
+unit claims. `cargo test --workspace --no-fail-fast --features vm`
+passes (the planner suites' generated corpora run on the VM; also at
+200 seeds each), as do `depth_v16` / `triggers_v16` with debug info
+with and without `vm`.
+
+**Gates.** `ci/local-gates.sh` (full) ends with "all gates passed";
+clippy `-D warnings` on the new `sql,indexes,vm` and
+`sql,indexes,expr_index,planner,vm` feature-set lines and the
+existing `vm` ones, and `--all-features`.
+
+**Size Δ** (thumbv7em, `--profile tiny`, `.text + .rodata`): tiny 0
+(76,124), full 0 (476,476), max 0 (962,300), xl 0 (1,058,824) — the
+shared-code changes are visibility (`pub(crate)` on session helpers
+the VM calls: `group_desc`, `sort_groups`, `groups_arrive_ordered`,
+`rep_minmax`, `extremum_step`, `pick_rep_from`, `having_early`,
+`group_aggs`, `order_cols`, the automatic-index and Bloom helpers,
+`btree::cmp_entry_probe` / `cell_ptr` / `index_cell_layout`) and
+`cfg(vm)` code. For information: `query,vm` 209,334 B (`query`
+173,800: +35,534; +12,880 over `vm_core`), `sql,vm` 441,472 B (`sql`
+400,184: +41,288), `sql,indexes,vm` 493,964 B (`sql,indexes`
+452,432: +41,532), `sql,indexes,expr_index,planner,vm` 619,136 B
+(559,748: +59,388) — the VM beside the executors it will replace.
+
+**Honest gaps.**
+- WITHOUT ROWID sources and the IN-subquery probe fall back (see
+  above); subqueries, compounds, CTEs / views, windows and virtual
+  sources are the later units'.
+- A source whose rows are computed as a whole (an index path, an
+  automatic index, a RIGHT / FULL source) is materialised as today
+  (the pin streams most index walks); a plain inner table is re-read
+  per outer row where today's executor reads it once, so a row whose
+  decode fails (a generated column's error) surfaces at that row, as
+  on the pin, not before the first one.
+- An index key whose overflow chain is longer than the page cache is
+  `CacheExhausted` on the VM (its pages stay pinned during the seek).
+- `IdxSeek`'s `p4` holds a count, not a side-table index (the
+  EXPLAIN formatter of `vm_rest` must know it).
+- The two divergences of today's executor above (rows before an error
+  in RIGHT / FULL joins and GROUP BY, the `group_cap` NULLs case) stay
+  until `vm_flip` deletes it.
+
 ### VM (ADR 0005 Stage 2): vm_core (2026-11-09)
 
 The first of Stage 2's five units (the plan approved 2026-11-09; ADR

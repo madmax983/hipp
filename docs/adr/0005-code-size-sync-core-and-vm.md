@@ -346,6 +346,26 @@ in Stage 2, because the binder substitutes the bound values into the
 statement before it is planned (rule 6: the binder is unchanged), so
 each execution compiles its own plan.
 
+**Amendment (Stage 2, unit `vm_joins`, 2026-11-09): index walks
+and groups as opcodes over today's rules.** The table's IdxGE / GT /
+LE / LT are one `IdxTest` whose side-table entry is the access walk's
+per-entry rule (`xindex::access_walk`: the equality prefix, the range
+under the key column's collation and direction, NULL keys, the rowid
+range and rowid values after the key); it falls through for a found
+entry and jumps to `p2` (the walk is over) or `p3` (skip the entry),
+`p3` being a second label the builder fixes up. Found / NotFound are
+not built: an index walk finds rows by `IdxRowid` and `SeekRowid`. A
+source whose rows today's executor computes as a whole (an index or
+OR path, an automatic index, a RIGHT / FULL source) fills an
+in-memory row list (the `Ephemeral` cursor; `Once` for one built per
+execution) in today's order, and the loops read that. Aggregates are
+AggStep / AggFinal where today's executor folds row by row (count,
+sum, total, avg, min, max) and otherwise GROUP BY groups whose
+aggregates fold through `agg.rs` when each group is finalized (an
+`Eval` in group context), so bare columns, DISTINCT and ORDER BY
+aggregates and collations stay today's. The reasoning is rule 5's:
+one place for each rule, no second copy to drift.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,
