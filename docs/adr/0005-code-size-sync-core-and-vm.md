@@ -1,10 +1,20 @@
 # ADR 0005 — Code size: a sync core and a bytecode VM
 
 - **Status:** accepted for Stage 1 (Tier A), 2026-11-08, with the
-  measured results below; Stages 2-4 proposed (2026-11-06). Stages 2-4
-  would supersede SPEC §5.7's "tree-walk now" decision and finally
-  implement SPEC §5.1.1's "the state machines are inside" design; Stage
-  1 changes no architecture.
+  measured results below. **Stages 2 and 3 accepted, 2026-11-09.**
+  Stage 4 stays optional and needs its own amendment, as the Decision
+  says. Stages 2-3 supersede SPEC §5.7's "tree-walk now" decision and
+  implement SPEC §5.1.1's "the state machines are inside" design;
+  Stage 1 changed no architecture.
+- **Migration rule (added with the acceptance):** the VM is built
+  behind a hidden `vm` feature that no profile enables, so every
+  intermediate commit leaves the four size ratchets untouched. Under
+  `vm`, a statement whose plan the code generator does not cover yet
+  runs on today's executor, so the whole suite stays green at every
+  step, and a CI job runs it with `vm` on. One final unit per stage
+  turns the VM on in the profiles and deletes the executors it
+  replaces in the same change. That unit must lower every ratchet it
+  touches.
 - **Context:** All four profiles are gated, and `max` is out of room.
   Measured at `8d78815` (thumbv7em, `--profile tiny`, the pinned
   toolchain; full tables in the size-pass working note `baseline.md`,
