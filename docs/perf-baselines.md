@@ -151,3 +151,47 @@ representable (mantissa < 2^53, |exp10| <= 22).
 | 500  | 378,111,682 | n/a                     | n/a     |
 | 1000 | 866,107,908 | 1,333,026 (0.15%)       | -7.57%  |
 | 2000 | 1,993,289,422 | n/a                   | n/a     |
+
+## btree_insert (table leaf) parse-all-and-clone (baseline at 10b5549)
+
+`bolt_workload` (callgrind, release + debuginfo). Every table INSERT
+parses all cells of the target leaf into owned `LeafCell`s (`leaf_cells`),
+clones them all into a merged list, and rebuilds the page from that list
+(`build_leaf_image`), although only one cell is added and the leaf nearly
+always still fits.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 378,136,050   |
+| 1000 | 866,107,919   |
+| 2000 | 1,993,376,790 |
+
+n=1000 profile: `btree_insert` inclusive 203,601,500 (23.51%) of which
+`leaf_cells` 97,076,273 (11.21%) and `build_leaf_image` 90,835,172 (10.49%).
+malloc+free (self) ~35% of all instructions. dhat (n=1000): 1,041,475
+blocks, 198,910,292 bytes total.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: insert into the leaf image without parsing/cloning every cell
+
+`btree_insert` validates the leaf with `leaf_cells_meta` (no per-cell
+allocation) and, when the leaf still fits, builds the new page image
+straight from the page bytes (`build_leaf_image_inserted`). Only a leaf
+that overflows re-parses with `leaf_cells` and takes the old split path.
+Workload checksum identical (657610); the test suite's pass/fail set is
+identical before/after (950 tests; the 823 failures are the absent
+`sqlite3` oracle, same on the baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 378,136,050   | 268,236,272   | -29.1%  |
+| 1000 | 866,107,919   | 626,660,907   | -27.6%  |
+| 2000 | 1,993,376,790 | 1,526,832,320 | -23.4%  |
+
+dhat (n=1000): 1,041,475 -> 535,229 blocks (-48.6%); 198,910,292 ->
+143,513,712 bytes (-27.8%).
+
+Size gates: tiny +828 B, full +776 B, max +752 B, xl +744 B; ratchets
+raised by those amounts (each well under `justify_over`).

@@ -10,7 +10,8 @@
 
 [tiny]
 # .text + .rodata, bytes.
-ratchet = 76124
+# +828 B (Bolt): table-leaf insert fast path in btree_insert.
+ratchet = 76952
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
@@ -24,7 +25,8 @@ justify_over = 4096
 # 476,476 -> 476,692 (Bolt): +216 B for the exact f64 fast path in
 # int_pow10_to_f64 (-7.6% instructions on bolt_workload); gated on
 # `query`, so the tiny profile is unchanged.
-ratchet = 476692
+# +776 B (Bolt): table-leaf insert fast path in btree_insert.
+ratchet = 477468
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -39,7 +41,8 @@ justify_over = 16384
 # the crate's metadata hash, hence the mangled names and rustc's item
 # order. A pure mechanical rename of 3bc670b measures the same.
 # 962,300 -> 962,484 (Bolt): +184 B, the int_pow10_to_f64 fast path.
-ratchet = 962484
+# +752 B (Bolt): table-leaf insert fast path in btree_insert.
+ratchet = 963236
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -51,7 +54,8 @@ justify_over = 32768
 # 1,058,808 -> 1,058,824 (v0.17 feature rename, ADR 0006): +16 B of
 # alignment padding only, as for `max` above.
 # 1,058,824 -> 1,059,016 (Bolt): +192 B, the int_pow10_to_f64 fast path.
-ratchet = 1059016
+# +744 B (Bolt): table-leaf insert fast path in btree_insert.
+ratchet = 1059760
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
