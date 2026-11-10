@@ -11,6 +11,145 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_flip — not delivered; review fixes (2026-11-10)
+
+Stage 2's fifth unit was to make the VM the only SELECT path in
+every profile, delete the legacy read executors and the `vm`
+feature, and lower every ratchet. **It was not delivered**: its rule
+"if any profile does not shrink, stop and report instead of
+committing" fired at the feasibility measurement, before any
+deletion. The `vm` feature, `Config::vm_strict` / `vm_off`,
+`Error::VmFallback`, `Statement::runs_on_vm` and the legacy
+executors all stay as `vm_rest` left them; no CI line changed (the
+restart-heavy smallest-cache line was not added); the perf baselines
+were not re-run (no executor changed).
+
+**Measured (thumbv7em, `--profile tiny`, `hipp_thumb_demo`, `.text +
+.rodata`).** VM on, nothing deleted → VM on with the legacy
+executors cut off by `cfg(vm)` stubs so LTO drops them (a best case:
+the VM-backed replacements writes would still need — UPDATE ... FROM,
+INSERT ... SELECT, RETURNING / upsert / trigger / fts5 / rtree /
+TEMP / ATTACH subqueries — are not counted and only add bytes):
+
+| profile | ratchet | VM on | VM on, executors dropped | Δ vs ratchet |
+|---|---:|---:|---:|---:|
+| full | 477,484 | 537,796 | 496,736 | +19,252 |
+| max | 963,572 | 1,040,392 | 1,015,072 | +51,500 |
+| xl | 1,060,496 | 1,145,708 | 1,119,036 | +58,540 |
+| `sql` | 401,352 | — | 420,592 | +19,240 |
+| `query` | 174,936 | — | 196,326 | +21,390 |
+
+The review rebuilt `full,vm` at 52008ef: 537,796 B, the same figure.
+The legacy read executor that can be deleted is about 27 KB in full
+and 35.6 KB in xl (ADR 0005 estimated 44 KB and 90–110 KB); the VM
+that replaces it is about 45 KB in full (`vm::` 34.2 KB, driver 10.9
+KB) and 74 KB in xl (`vm::` 56.7 KB, driver 17.2 KB) — the largest
+symbols `Vm::op_join` (10.2 / 19 KB), `vm_step`'s future (10.6 /
+12.6 KB) and `codegen::join::core` (4–5.7 KB) — and in xl the VM
+still needs the async source readers (`access_rows`,
+`json_tvf_rows`, `vtab_open`, `scan_temp`, `auto_rows`, `lateral_ok`)
+behind `Exec::Call`. Tiny: the VM's `Eval` opcode calls
+`query::eval`, so tiny cannot run its scan SELECT on the VM without
+the evaluator; it keeps its direct path. One saving is ready on its
+own: compiling the evaluator once for `Error<()>` in every build with
+the VM measured about −14 KB in full (511,164 → 496,736 in the
+stubbed build). The orchestrator has to re-scope the unit: re-baseline
+the ratchets with a written justification, or shrink the VM (opcode
+dispatch, the driver future, sync source readers) before the flip.
+
+**Review fixes shipped** (ungated correctness, every profile that has
+the path):
+- **An enclosing query's aggregate used as a nested query's index or
+  rowid bound** (item (d) of the unit; profiles with `expr_index`:
+  max, xl). `SELECT (SELECT count(*) FROM u WHERE u.k <= max(t.a))
+  FROM t` with an index on `u.k` (or `w.id <= max(t.a)` on an INTEGER
+  PRIMARY KEY, `u.rowid = max(t.a)`) failed with `MisusedAggregate`
+  in result columns, GROUP BY queries, HAVING and ORDER BY; the pin
+  answers. `subst_owned_aggs` substituted the folded value into the
+  nested plan's expressions but not into its access path, where the
+  planner had copied the term. `walk_aggs_mut` now walks access paths
+  (`walk_access_aggs_mut`: equality probes, IN lists and IN-subquery
+  probes, range bounds, the automatic index's keys, MULTI-INDEX OR
+  branches and their paths, the min() / max() early-out's condition)
+  and fts5 OR branches' arguments. The VM's placeholders come from the
+  same walk, so these shapes now run on the VM too (strict, in
+  `tests/vm_subqueries_v17.rs`' `outer_aggregate_bounds_run_on_the_vm`,
+  the smallest page cache included). The variant "a lone min() / max()
+  read as the scalar function of the bare-column row" (recorded by
+  `vm_subqueries`) did not reproduce on the CLI or in the corpus.
+- **A repeated min() / max() deciding the bare columns** (found by the
+  generated corpus; every profile with `query`). The pin's aggregate
+  list holds each aggregate once (`analyzeAggregate` reuses an equal
+  earlier one, whatever query level it is written at), so the last
+  *distinct* min() / max() decides: `SELECT max(a), min(a), max(a), a
+  FROM t` reads the min() row on the pin; hipp counted the repeat and
+  read the max() row (a silent wrong answer), also when the repeat sat
+  in a subquery (`max(a), (SELECT min(t.a) + max(t.a)), a`).
+  `rep_minmax` now skips an aggregate equal to an earlier one
+  (`same_agg`: function, flags, arguments, ORDER BY keys, FILTER).
+- **VM only (hidden `vm`):** a placeholder in the arguments of a
+  source the driver reads with today's readers — a table-valued or
+  virtual source (`generate_series(1, max(t.a))`, an R*Tree or
+  fts5 constraint), a WITHOUT ROWID table's access path — read as
+  NULL there (those readers do not see the placeholder's slot): a
+  silent wrong answer on the VM (table-valued and virtual sources
+  before the walk fix, WITHOUT ROWID access paths after it). Such a
+  source now falls back whole (`vm::gen::sub::host_reads_preset`).
+
+**Oracle probing** (the pin, live): an aggregate whose arguments read
+only an enclosing query belongs to that query inside a nested
+*aggregate* query's WHERE clause (the review's five repros: 3 / 3 / 21
+/ 5 / `|0, Y|1, x|2, y|1, z|0`), with or without an index; in a nested
+query that is not an aggregate (`SELECT (SELECT q FROM w WHERE w.id =
+min(t.a)) FROM t`, an EXISTS, a FROM subquery, an IN subquery) and for
+an argument-less `count(*)` it is "misuse of aggregate" — hipp
+refuses those too (`MisusedAggregate`, error-vs-error). Bare columns
+with several min() / max(): the last distinct one decides (`min(a),
+max(a), a` → the max() row; `max(a), min(a), max(a), a` → the min()
+row; `max(a), max(b), a` → the max(b) row).
+
+**Tests.** `tests/outer_agg_bound_v17.rs` (cfg `sql`; with `vm` also
+on the VM, strict, and on today's executor): 47 shapes, the
+review's repros among them, over five index setups (none, `u(k)`, `u(k
+DESC)`, `u(k, v)`, indexes on every bounded column); virtual and
+table-valued sources (rtree, fts5, generate_series, json_each);
+WITHOUT ROWID keys, secondary indexes and joins; the repeated min() /
+max() rule (16 queries × 5 setups); 120 generated queries (an
+aggregate of `t` against an indexed column, the rowid or the INTEGER
+PRIMARY KEY under a plain, grouped, HAVING or bare-column query; an
+xorshift PRNG) × 5 setups. `hipp-cli/tests/cli_v17_outer_agg_bound.rs`:
+the CLI byte-identical with the pin. `tests/vm_subqueries_v17.rs`:
+the bound shapes moved from the fallback list to a strict corpus; the
+fallback test now asserts the host-read sources fall back and answer
+like the pin; `tests/vm_v17.rs`' unclaimed list drops the shape.
+Full profile (`--no-default-features --features std,full`): the
+suite passes too.
+
+**Gates.** `cargo fmt --all`; `ci/local-gates.sh` (full run, the
+`--features vm` workspace suite included): all gates passed.
+`tests/depth_v16.rs` and `tests/triggers_v16.rs` with debug info, with
+and without `vm`: pass (no `STACK_*` change).
+
+**Size Δ** (vs the ratchets at 52008ef): tiny 76,952 → 76,952 (0),
+full 477,484 → 477,788 (+304: the min() / max() rule), max 963,572 →
+964,076 (+504: both fixes), xl 1,060,496 → 1,061,144 (+648). Ratchets
+raised to the measured figures (ungated correctness fixes); none went
+down, because the unit that was to lower them was not delivered.
+
+**Honest gaps.**
+- `vm_flip` itself: items (a)–(c) and (e) are not done — the `vm`
+  feature and the legacy executors remain, every ratchet stayed up,
+  the tiny comparison is only the note above, the codegen refusals
+  were not re-recorded, no restart-heavy CI line, no perf re-run, no
+  README profile change beyond the new sizes.
+- On the VM an enclosing query's aggregate in a host-read source's
+  arguments falls back whole (above) rather than running there; the
+  fallback answers like the pin.
+- Of `vm_rest`'s "Still falls back" list, the index-bound entry is
+  closed; the aggregate over a subquery argument (`Unsupported`), the
+  aggregate inside an inner aggregate (the pin's misuse) and the
+  instruction budget remain.
+
 ### VM (ADR 0005 Stage 2): vm_rest (2026-11-10)
 
 The fourth of Stage 2's five units, built on `vm_core` / `vm_joins` /
@@ -135,6 +274,8 @@ executor.
   wrong answer (the scalar function of the bare-column row; the pin
   answers), the one fallback that is not a refusal: `vm_subqueries`
   recorded it for `vm_flip`, which retires today's executor.
+  (Closed in the `vm_flip` review fixes: today's executor answers like
+  the pin and the shape runs on the VM.)
 - A program past the generator's budget (65,536 instructions or
   side-table entries, `Builder::over`): a correlated subquery chain
   through nested ORDER BY / GROUP BY / HAVING aliases, whose inline
@@ -340,7 +481,8 @@ Four findings on `vm_subqueries` (2291f5e), fixed on top of the
   fails with `MisusedAggregate` (`count(t.a)`) or reads a lone
   min() / max() as the scalar function of the bare-column row — a
   pre-existing bug of today's executor, left for `vm_flip` (fixing it
-  there would grow the max and xl profiles, which this unit may not).
+  there would grow the max and xl profiles, which this unit may not). (Closed in the
+  `vm_flip` review fixes, ungated.)
 
 **Recorded as intended (not ported).**
 - **Scalar and EXISTS subqueries stop at their first row** (medium).

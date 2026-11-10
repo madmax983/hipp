@@ -692,6 +692,11 @@ fn kind_of<'p>(
     let _ = (d, width, nsrc, b, gx);
     #[cfg(feature = "sql")]
     if let Some(k) = host_kind(sp, d, gx, width, nsrc) {
+        // (A folded aggregate's placeholder the driver's readers would
+        // evaluate falls back: v0.17 review fix.)
+        if super::sub::host_reads_preset(b, sp) {
+            return None;
+        }
         return k;
     }
     #[cfg(feature = "sql")]

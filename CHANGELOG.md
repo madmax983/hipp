@@ -5,6 +5,30 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM flip (ADR 0005 Stage 2, unit `vm_flip`): measured, not taken; review fixes
+
+- The flip was not made: with the VM as the only SELECT path and the
+  legacy read executors deleted, every profile measured larger than
+  its ratchet (best case: full +19,252 B, max +51,500 B, xl +58,540
+  B), and the unit's rule is to stop rather than let a profile grow.
+  The hidden `vm` feature and today's executors stay; STATUS.md has
+  the measurements.
+- Fix (max, xl): an enclosing query's aggregate that a nested
+  aggregate query uses as an index or rowid bound (`SELECT (SELECT
+  count(*) FROM u WHERE u.k <= max(t.a)) FROM t` with an index on
+  `u.k`, `w.id <= max(t.a)` on an INTEGER PRIMARY KEY) is answered
+  like the pin; it failed with `MisusedAggregate`. The folded value
+  now reaches the nested plan's access path too.
+- Fix (every profile with `query`): a repeated min() / max() no
+  longer decides the bare columns (`SELECT max(a), min(a), max(a), a
+  FROM t` read the max() row; the pin reads the min() row, its
+  aggregate list holding each aggregate once).
+- Under the hidden `vm`: such a bound now runs on the VM; one in the
+  arguments of a table-valued, virtual or WITHOUT ROWID source falls
+  back to today's executor (it read as NULL on the VM).
+- Sizes: tiny 76,952 B (unchanged), full 477,788 B (+304), max
+  964,076 B (+504), xl 1,061,144 B (+648).
+
 ### The bytecode VM: windows, virtual sources, the rest of SELECT and EXPLAIN (ADR 0005 Stage 2, unit `vm_rest`)
 
 - Under the hidden feature `vm`, every SELECT now runs on the VM:

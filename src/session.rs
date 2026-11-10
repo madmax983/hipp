@@ -15965,9 +15965,16 @@ pub(crate) fn rep_minmax<'x>(
     if let Some(h) = having {
         collect_aggs(h, &mut aggs);
     }
-    aggs.iter().rev().find_map(|a| {
+    // (v0.17 review fix: the pin's aggregate list holds each
+    // aggregate once — `analyzeAggregate` reuses an equal earlier one,
+    // whatever query level it was written at — so a repeat does not
+    // move it later: `max(a), min(a), max(a)` decides by min().)
+    let s = aggs.as_slice();
+    s.iter().enumerate().rev().find_map(|(i, a)| {
         let p = crate::query::agg_parts(a)?;
-        if !matches!(p.kind, AggKind::Min | AggKind::Max) {
+        if !matches!(p.kind, AggKind::Min | AggKind::Max)
+            || s.get(..i)?.iter().any(|b| same_agg(&p, b))
+        {
             return None;
         }
         Some(MinMaxRep {
@@ -15976,6 +15983,32 @@ pub(crate) fn rep_minmax<'x>(
             filter: p.filter,
         })
     })
+}
+
+/// Whether aggregate node `b` is the aggregate `p` in the pin's
+/// `sqlite3ExprCompare` sense (`rep_minmax`): the same function,
+/// flags, arguments, ORDER BY keys and FILTER.
+#[cfg(feature = "query")]
+fn same_agg(p: &crate::query::AggParts<'_>, b: &RExpr) -> bool {
+    use crate::query::same_expr;
+    let Some(q) = crate::query::agg_parts(b) else {
+        return false;
+    };
+    let all = |x: &[RExpr], y: &[RExpr]| {
+        x.len() == y.len() && x.iter().zip(y.iter()).all(|(l, r)| same_expr(l, r))
+    };
+    p.kind == q.kind
+        && p.distinct == q.distinct
+        && p.star == q.star
+        && p.unique == q.unique
+        && p.args.len() == q.args.len()
+        && all(p.inputs(), q.inputs())
+        && p.order == q.order
+        && match (p.filter, q.filter) {
+            (None, None) => true,
+            (Some(x), Some(y)) => same_expr(x, y),
+            _ => false,
+        }
 }
 
 /// The min / max aggregate that decides a group's bare columns

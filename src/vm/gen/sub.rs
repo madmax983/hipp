@@ -590,6 +590,70 @@ fn preset_slot(b: &Builder, p: &SubPlan) -> Option<u32> {
     b.preset.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s)
 }
 
+/// Whether the parts of source `sp` that the driver evaluates with
+/// today's readers (a table-valued or virtual source's arguments and
+/// OR branches, a WITHOUT ROWID table's access path) hold a folded
+/// aggregate's placeholder (`G::owned_aggs`) at any depth: those
+/// readers do not see the placeholders' slots (they would read the
+/// empty placeholder plan as NULL), so such a source falls back
+/// (v0.17 review fix).
+#[cfg(feature = "sql")]
+pub(super) fn host_reads_preset(b: &Builder, sp: &crate::query::SubSource) -> bool {
+    if b.preset.is_empty() {
+        return false;
+    }
+    #[cfg(feature = "expr_index")]
+    if sp
+        .access
+        .as_deref()
+        .is_some_and(|a| crate::query::any_access_expr(a, &mut |e: &RExpr| expr_has_preset(b, e)))
+    {
+        return true;
+    }
+    #[cfg(feature = "fts5")]
+    if let Some(vt) = sp.vt.as_deref()
+        && vt
+            .ors
+            .iter()
+            .any(|(_, _, args, _)| args.iter().any(|e| expr_has_preset(b, e)))
+    {
+        return true;
+    }
+    sp.derived.as_deref().is_some_and(|d| plan_has_preset(b, d))
+}
+
+/// Whether `e` holds a folded aggregate's placeholder, in its own
+/// subquery nodes or nested deeper (`host_reads_preset`).
+#[cfg(feature = "sql")]
+fn expr_has_preset(b: &Builder, e: &RExpr) -> bool {
+    let mut kinds: AVec<crate::query::SubKind<'_>> = AVec::new();
+    crate::query::collect_subs(e, &mut kinds);
+    kinds.iter().any(|k| {
+        let p = match k {
+            crate::query::SubKind::Scalar(p)
+            | crate::query::SubKind::Exists(p)
+            | crate::query::SubKind::In(p) => *p,
+        };
+        preset_slot(b, p).is_some() || plan_has_preset(b, p)
+    })
+}
+
+/// `expr_has_preset` over every expression of plan `p`.
+#[cfg(feature = "sql")]
+fn plan_has_preset(b: &Builder, p: &SubPlan) -> bool {
+    let f = |e: &RExpr| expr_has_preset(b, e);
+    p.sources
+        .iter()
+        .any(|s| s.on.as_ref().is_some_and(f) || host_reads_preset(b, s))
+        || p.items.iter().any(f)
+        || p.filter.as_ref().is_some_and(f)
+        || p.group_by.iter().any(f)
+        || p.having.as_ref().is_some_and(f)
+        || p.order_by.iter().any(|(e, _)| f(e))
+        || p.values.iter().any(|r| r.iter().any(f))
+        || p.compound.iter().any(|(_, t)| plan_has_preset(b, t))
+}
+
 /// Whether `e` holds a subquery node of its own that is not a folded
 /// aggregate's placeholder (`G::owned_aggs`): what today's executor,
 /// which substituted those as literals, would see as a subquery.

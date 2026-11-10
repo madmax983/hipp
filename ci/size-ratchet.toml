@@ -31,7 +31,13 @@ justify_over = 4096
 # asks `groups_sorted`, the pin's `orderByGrp` rule). STATUS.md.
 # Merged with main (Bolt, PRs #21/#22): measured 477,484, the sum
 # of both raises.
-ratchet = 477484
+# 477,484 -> 477,788 (v0.17 vm_flip review fixes, ungated correctness;
+# STATUS.md): +304 B. A repeated min() / max() no longer moves the
+# bare-column rule's choice (`rep_minmax` skips an aggregate equal to
+# an earlier one, the pin's one AggInfo entry each: a silent wrong
+# answer). (`vm_flip` itself delivered nothing: with the VM as the
+# only SELECT path no profile shrinks, so every ratchet stays up.)
+ratchet = 477788
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -52,7 +58,12 @@ justify_over = 16384
 # groups in the ORDER BY's direction). STATUS.md.
 # Merged with main (Bolt, PRs #21/#22): measured 963,572, the sum of
 # both raises +8 B of alignment padding.
-ratchet = 963572
+# 963,572 -> 964,076 (v0.17 vm_flip review fixes, ungated
+# correctness; STATUS.md): +504 B — the repeated min() / max() fix
+# above, and an enclosing query's aggregate a nested query uses as an
+# index or rowid bound is substituted into the nested plan's access
+# path too (`walk_access_aggs_mut`; it failed with MisusedAggregate).
+ratchet = 964076
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -69,7 +80,9 @@ justify_over = 32768
 # the join planner's re-check of the first loop). STATUS.md.
 # Merged with main (Bolt, PRs #21/#22): measured 1,060,496, the sum
 # of both raises -24 B of alignment padding.
-ratchet = 1060496
+# 1,060,496 -> 1,061,144 (v0.17 vm_flip review fixes, ungated
+# correctness, as for `max` above; STATUS.md): +648 B.
+ratchet = 1061144
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

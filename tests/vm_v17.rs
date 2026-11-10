@@ -584,9 +584,11 @@ const UNCLAIMED: &[&str] = &[
     // An enclosing query's aggregate inside an inner aggregate: the
     // pin's misuse error, refused by today's executor.
     "SELECT (SELECT sum((SELECT max(t.a))) FROM u) FROM t;",
-    // A nested query's index bound reading an enclosing query's
-    // aggregate (an index on u.k): today's `MisusedAggregate`.
-    "SELECT (SELECT count(*) FROM u WHERE u.k <= count(t.a)) FROM t;",
+    // (A nested query's index bound reading an enclosing query's
+    // aggregate, `u.k <= count(t.a)` over an index on u.k, was today's
+    // `MisusedAggregate`; since the `vm_flip` review fixes both engines
+    // answer it like the pin: tests/vm_subqueries_v17.rs,
+    // tests/outer_agg_bound_v17.rs.)
 ];
 
 const U: &str = "CREATE TABLE u(k, v); INSERT INTO u VALUES (1, 'p'), (2, 'q'), (3, 'r'); \

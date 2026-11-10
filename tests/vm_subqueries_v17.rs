@@ -828,13 +828,38 @@ fn outer_aggregates_in_subqueries_run_on_the_vm() {
     corpus(&base, "ownr", &strict().cache_pages(1), OWNED_AGGS);
 }
 
-/// Two outer-aggregate shapes still fall back whole (strict:
+/// The query's own aggregate that a nested query uses as an index or
+/// rowid bound runs on the VM (v0.17 review fix, unit `vm_flip`'s item
+/// (d)): `walk_aggs_mut` now reaches the nested plan's access path, so
+/// the bound reads the fold's placeholder as the plan's expressions
+/// do; today's executor substitutes it there too (it failed with
+/// `MisusedAggregate`). tests/outer_agg_bound_v17.rs holds the full
+/// corpus.
+const OWNED_BOUNDS: &[&str] = &[
+    "SELECT (SELECT count(*) FROM u WHERE u.k <= max(t.a)) FROM t;",
+    "SELECT (SELECT count(*) FROM u WHERE u.k <= count(t.a)) FROM t;",
+    "SELECT (SELECT count(*) FROM w WHERE w.id <= max(t.a)) FROM t;",
+    "SELECT (SELECT sum(v) FROM u WHERE u.k = min(t.a)) FROM t;",
+    "SELECT count(*) FROM t HAVING (SELECT count(*) FROM u WHERE u.k <= max(t.a)) > 1;",
+    "SELECT b, (SELECT count(*) FROM u WHERE u.k = max(t.a)) FROM t GROUP BY b ORDER BY 1;",
+    "SELECT max(t.a), (SELECT count(*) FROM u WHERE u.k = max(t.a)), a FROM t;",
+];
+
+#[test]
+fn outer_aggregate_bounds_run_on_the_vm() {
+    let base = pin_file("ownb", S);
+    corpus(&base, "ownb", &strict(), OWNED_BOUNDS);
+    corpus(&base, "ownbr", &strict().cache_pages(1), OWNED_BOUNDS);
+}
+
+/// Outer-aggregate shapes that still fall back whole (strict:
 /// `VmFallback`), each to today's executor's answer: the query's own
 /// aggregate whose arguments hold a subquery (refused today,
-/// `Unsupported`), and one a nested query uses as an index or rowid
-/// bound (the access path is not substituted today, so it fails with
-/// `MisusedAggregate`, or a lone min() / max() reads as the scalar
-/// function of the bare-column row).
+/// `Unsupported`), and (v0.17 review fix) one in the arguments of a
+/// source the driver reads with today's readers — a table-valued or
+/// virtual source, a WITHOUT ROWID table's access path — which do not
+/// see the fold's placeholder slot (`host_reads_preset`; they read it
+/// as NULL, a silent wrong answer before the fix).
 #[test]
 fn outer_aggregate_shapes_that_still_fall_back() {
     let base = pin_file("ownf", S);
@@ -847,26 +872,30 @@ fn outer_aggregate_shapes_that_still_fall_back() {
         q,
     );
     assert!(matches!(e, Some(Error::Unsupported)), "{e:?}");
-    for (i, q) in [
-        "SELECT (SELECT count(*) FROM u WHERE u.k <= max(t.a)) FROM t;",
-        "SELECT (SELECT count(*) FROM u WHERE u.k <= count(t.a)) FROM t;",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let (_, on_vm, e) = hipp_run(&copy_of(&base, &format!("vms17-ownf{i}-s")), strict(), q);
+    #[allow(unused_mut)]
+    let mut host: Vec<&str> = Vec::new();
+    #[cfg(feature = "vtab")]
+    host.push("SELECT (SELECT count(*) FROM generate_series(1, max(t.a))) FROM t;");
+    #[cfg(feature = "json")]
+    host.push(
+        "SELECT (SELECT group_concat(value) FROM json_each(json_array(1, max(t.a)))) FROM t;",
+    );
+    let wr = "CREATE TABLE x(k PRIMARY KEY, v) WITHOUT ROWID; \
+        INSERT INTO x VALUES (1, 'p'), (2, 'q'), (3, 'r'), (5, 's');";
+    #[cfg(feature = "without_rowid")]
+    host.push("SELECT (SELECT count(*) FROM x WHERE x.k <= max(t.a)) FROM t;");
+    let base = pin_file("ownh", &format!("{S} {wr}"));
+    for (i, q) in host.iter().enumerate() {
+        let (_, on_vm, e) = hipp_run(&copy_of(&base, &format!("vms17-ownh{i}-s")), strict(), q);
         assert!(!on_vm && matches!(e, Some(Error::VmFallback)), "{q}: {e:?}");
+        let o = copy_of(&base, &format!("vms17-ownh{i}-o"));
+        let want = pin_run(&o, q);
         let (d, _, _) = hipp_run(
-            &copy_of(&base, &format!("vms17-ownf{i}-d")),
+            &copy_of(&base, &format!("vms17-ownh{i}-d")),
             Config::default().vm_strict(false),
             q,
         );
-        let (o, _, _) = hipp_run(
-            &copy_of(&base, &format!("vms17-ownf{i}-o")),
-            Config::default().vm_off(true),
-            q,
-        );
-        assert_eq!(d, o, "{q}");
+        assert_eq!(d, want, "{q}");
     }
 }
 

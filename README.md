@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 477,484 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 963,572 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,060,496 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 477,788 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 964,076 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,061,144 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -258,6 +258,19 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   executor refuses. Plain `EXPLAIN` lists hipp's own program in the
   pin's columns under `vm` (still refused without it). No profile
   enables `vm`; the stage's last unit turns it on.
+- **The VM flip, measured and not taken.** Making the VM the only
+  SELECT path and deleting the legacy read executors would grow every
+  profile (full by about 19 KB, max by 51 KB and xl by 59 KB even in a
+  best case), so the stage's last unit stopped; `vm` stays hidden and
+  every profile keeps today's executor (STATUS.md has the figures).
+- **Outer aggregates as index bounds; repeated min() / max()** (fixes).
+  An enclosing query's aggregate that a nested aggregate query uses as
+  an index or rowid bound (`SELECT (SELECT count(*) FROM u WHERE u.k
+  <= max(t.a)) FROM t` over an index on `u.k`) is answered like the
+  pin; it failed with `MisusedAggregate` (max, xl). A repeated min()
+  / max() no longer changes which one picks the bare columns
+  (`SELECT max(a), min(a), max(a), a FROM t` read the max() row; the
+  pin reads the min() row; every profile with aggregates).
 
 ## What v0.16 does
 

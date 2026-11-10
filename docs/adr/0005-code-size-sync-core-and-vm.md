@@ -453,6 +453,27 @@ the result columns' templates filled from its values (`Eval`'s
 (`vm::op::listing`); a statement that does not compile (any non-SELECT
 until Stage 3) lists its one `Host` instruction.
 
+**Stage 2 flip: measured, not taken (unit `vm_flip`, 2026-11-10).**
+The flip's rule — every ratchet lower, or stop — fired at the
+feasibility measurement (thumbv7em, `--profile tiny`, `.text +
+.rodata`): with `vm` on and nothing deleted, full 537,796 / max
+1,040,392 / xl 1,145,708 B; with the legacy read executors cut off by
+`cfg(vm)` stubs so LTO drops them (a best case that leaves out the
+VM-backed replacements writes would need), full 496,736 (+19,252 over
+its ratchet), max 1,015,072 (+51,500), xl 1,119,036 (+58,540), `sql`
+420,592 (+19,240), `query` 196,326 (+21,390). The deletable read
+executor is about 27 KB in full and 35.6 KB in xl, not the 44 KB and
+90–110 KB estimated below; the VM replacing it is about 45 KB in full
+and 74 KB in xl (`Vm::op_join`, `vm_step`'s future and
+`codegen::join::core` the largest symbols), and in xl the VM still
+links the async source readers through `Exec::Call`. Tiny cannot move
+its scan SELECT onto the VM without the evaluator (`Eval` calls
+`query::eval`). The S2 row of the estimate table below did not hold;
+the stage needs re-scoping (a justified re-baseline, or a smaller VM:
+opcode dispatch, the driver future, sync source readers) before the
+flip. Compiling the evaluator once for `Error<()>` in every VM build
+measured about −14 KB in full on its own.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,
