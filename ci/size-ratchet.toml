@@ -10,7 +10,8 @@
 
 [tiny]
 # .text + .rodata, bytes.
-ratchet = 76124
+# +828 B (Bolt): table-leaf insert fast path in btree_insert.
+ratchet = 76952
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
@@ -21,10 +22,16 @@ justify_over = 4096
 # The full no_std profile (`--no-default-features --features full`),
 # same target, profile and binary. Tracked so dialect growth is a
 # visible, reviewed number; the tiny profile is the one SPEC §4.1 binds.
+# 476,476 -> 476,692 (Bolt): +216 B for the exact f64 fast path in
+# int_pow10_to_f64 (-7.6% instructions on bolt_workload); gated on
+# `query`, so the tiny profile is unchanged.
+# +776 B (Bolt): table-leaf insert fast path in btree_insert.
 # 476,476 -> 476,492 (v0.17 vm_joins review fix, ungated correctness:
 # GROUP BY + ORDER BY + LIMIT kept the wrong groups; `group_cap` now
 # asks `groups_sorted`, the pin's `orderByGrp` rule). STATUS.md.
-ratchet = 476492
+# Merged with main (Bolt, PRs #21/#22): measured 477,484, the sum
+# of both raises.
+ratchet = 477484
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -38,10 +45,14 @@ justify_over = 16384
 # (sum of `llvm-nm -S` sizes unchanged); the new feature names change
 # the crate's metadata hash, hence the mangled names and rustc's item
 # order. A pure mechanical rename of 3bc670b measures the same.
+# 962,300 -> 962,484 (Bolt): +184 B, the int_pow10_to_f64 fast path.
+# +752 B (Bolt): table-leaf insert fast path in btree_insert.
 # 962,300 -> 962,628 (v0.17 vm_joins review fix, same fix: the access
 # planner's `WHERE_SORTBYGROUP` re-check reads an index delivering the
 # groups in the ORDER BY's direction). STATUS.md.
-ratchet = 962628
+# Merged with main (Bolt, PRs #21/#22): measured 963,572, the sum of
+# both raises +8 B of alignment padding.
+ratchet = 963572
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -52,9 +63,13 @@ justify_over = 32768
 # binary; ratcheted like the others.
 # 1,058,808 -> 1,058,824 (v0.17 feature rename, ADR 0006): +16 B of
 # alignment padding only, as for `max` above.
+# 1,058,824 -> 1,059,016 (Bolt): +192 B, the int_pow10_to_f64 fast path.
+# +744 B (Bolt): table-leaf insert fast path in btree_insert.
 # 1,058,824 -> 1,059,584 (v0.17 vm_joins review fix, same fix: also
 # the join planner's re-check of the first loop). STATUS.md.
-ratchet = 1059584
+# Merged with main (Bolt, PRs #21/#22): measured 1,060,496, the sum
+# of both raises -24 B of alignment padding.
+ratchet = 1060496
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

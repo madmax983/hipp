@@ -163,6 +163,9 @@ fn parse_leaf_cell<E>(bytes: &[u8], at: usize, usable: usize, page: u32) -> Resu
 /// allocations instead of one image copy per cell (SPEC §4.1).
 #[derive(Clone, Copy)]
 pub struct CellMeta {
+    /// Offset and length of the whole on-page cell image.
+    pub cell_off: usize,
+    pub cell_len: usize,
     pub rowid: i64,
     pub payload_len: usize,
     pub local_off: usize,
@@ -196,13 +199,17 @@ pub fn leaf_cells_meta<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec
             return Err(Error::CorruptPage { page });
         }
         let mut overflow = 0u32;
+        let mut cell_len = n1 + n2 + local;
         if plen > local {
             if end + 4 > bytes.len() {
                 return Err(Error::CorruptPage { page });
             }
             overflow = be_u32(bytes, end);
+            cell_len += 4;
         }
         out.push(CellMeta {
+            cell_off: at,
+            cell_len,
             rowid: rowid as i64,
             payload_len: plen,
             local_off: start,
@@ -276,6 +283,46 @@ fn build_leaf_image(page: u32, page_size: usize, cells: &[LeafCell], base: &[u8]
     for (i, p) in ptrs.iter().enumerate() {
         put_be_u16(out, hdr_off + 8 + 2 * i, *p);
     }
+    img
+}
+
+/// `build_leaf_image` of `metas` with `new_cell` inserted at `pos`,
+/// copying cell bytes straight from the page image `snap`.
+fn build_leaf_image_inserted(
+    page: u32,
+    page_size: usize,
+    snap: &[u8],
+    metas: &[CellMeta],
+    pos: usize,
+    new_cell: &[u8],
+    base: &[u8],
+) -> AVec<u8> {
+    let mut img = vec_zeroed(page_size);
+    if page == 1 {
+        img.as_mut_slice()[0..100].copy_from_slice(&base[0..100]);
+    }
+    let hdr_off = if page == 1 { 100 } else { 0 };
+    let out = img.as_mut_slice();
+    let mut content = page_size;
+    let total = metas.len() + 1;
+    let mut k = 0usize;
+    for i in 0..total {
+        let src: &[u8] = if i == pos {
+            new_cell
+        } else {
+            let m = &metas[k];
+            k += 1;
+            &snap[m.cell_off..m.cell_off + m.cell_len]
+        };
+        content -= src.len();
+        out[content..content + src.len()].copy_from_slice(src);
+        put_be_u16(out, hdr_off + 8 + 2 * i, content as u16);
+    }
+    out[hdr_off] = KIND_LEAF_TABLE;
+    put_be_u16(out, hdr_off + 1, 0);
+    put_be_u16(out, hdr_off + 3, total as u16);
+    put_be_u16(out, hdr_off + 5, content_code(content));
+    out[hdr_off + 7] = 0;
     img
 }
 
@@ -1025,7 +1072,7 @@ pub async fn btree_insert<S: Storage>(
     let mut path: AVec<(u32, usize)> = AVec::new();
     let mut is_rightmost = true;
     let mut page = root;
-    let (mut leaf_page, leaf_cells, insert_pos) = loop {
+    let (mut leaf_page, leaf_snap, metas, insert_pos) = loop {
         let idx = pager.load(page).await?;
         let snap = copy_bytes(pager.frame_data(idx));
         let h = head::<S::Error>(snap.as_slice(), page)?;
@@ -1033,7 +1080,7 @@ pub async fn btree_insert<S: Storage>(
             if h.kind != KIND_LEAF_TABLE {
                 return Err(Error::Unsupported);
             }
-            let cells = leaf_cells::<S::Error>(snap.as_slice(), page, usable)?;
+            let cells = leaf_cells_meta::<S::Error>(snap.as_slice(), page, usable)?;
             let mut pos = cells.len();
             for (i, c) in cells.iter().enumerate() {
                 if c.rowid == rowid {
@@ -1046,7 +1093,7 @@ pub async fn btree_insert<S: Storage>(
                     break;
                 }
             }
-            break (page, cells, pos);
+            break (page, snap, cells, pos);
         }
         let (pairs, rightmost) = interior_cells::<S::Error>(snap.as_slice(), page)?;
         let mut child = rightmost;
@@ -1087,6 +1134,32 @@ pub async fn btree_insert<S: Storage>(
         local_len,
         overflow: overflow_head,
     };
+
+    // ---- fast path: the leaf still fits with the new cell ----
+    {
+        let hdr = if leaf_page == 1 { 100 } else { 0 };
+        let content: usize = metas.iter().map(|m| m.cell_len).sum::<usize>() + new_cell.bytes.len();
+        if hdr + 8 + 2 * (metas.len() + 1) + content <= usable {
+            let idx = pager.dirty_page(leaf_page).await?;
+            let base = if leaf_page == 1 {
+                copy_bytes(pager.frame_data(idx))
+            } else {
+                AVec::new()
+            };
+            let img = build_leaf_image_inserted(
+                leaf_page,
+                page_size,
+                leaf_snap.as_slice(),
+                metas.as_slice(),
+                insert_pos,
+                new_cell.bytes.as_slice(),
+                base.as_slice(),
+            );
+            set_page_image(pager, leaf_page, img.as_slice()).await?;
+            return Ok(());
+        }
+    }
+    let leaf_cells = leaf_cells::<S::Error>(leaf_snap.as_slice(), leaf_page, usable)?;
 
     // ---- merged cell list ----
     let mut all: AVec<LeafCell> = AVec::new();

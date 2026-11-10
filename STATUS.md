@@ -255,6 +255,13 @@ information: `query,vm` 210,182 B, `sql,vm` 454,776 B,
 `sql,indexes,vm` 507,132 B (−40),
 `sql,indexes,expr_index,planner,vm` 635,104 B (+560).
 
+**Merged with main (2026-11-10).** Main gained the Bolt perf changes
+(PRs #21 / #22: the f64 literal fast path and the table-leaf insert
+fast path), which raised every ratchet. Measured after the merge: tiny
+76,952 (main's figure), full 477,484 (both raises summed exactly), max
+963,572 (summed +8 B alignment padding), xl 1,060,496 (summed −24 B
+padding); `ci/size-ratchet.toml` keeps both histories.
+
 ### VM (ADR 0005 Stage 2): vm_subqueries (2026-11-09)
 
 The third of Stage 2's five units, built on `vm_core` / `vm_joins`

@@ -31,10 +31,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,124 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 476,492 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 962,628 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,059,584 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 477,484 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 963,572 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,060,496 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
