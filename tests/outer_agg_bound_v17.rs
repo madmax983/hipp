@@ -138,8 +138,20 @@ fn copy_of(base: &Path, tag: &str) -> PathBuf {
 /// today's readers, `vm::gen::sub::host_reads_preset`).
 fn engines(claimed: bool) -> Vec<(&'static str, Config, bool)> {
     let _ = claimed;
+    // (A corpus the VM does not claim falls back by design; under
+    // `--cfg hipp_vm_strict`, the whole-suite strict run, the default
+    // `Config` is strict, so it is made non-strict here, as the `vm`
+    // engine is.)
+    #[cfg(feature = "vm")]
+    let dflt = if claimed {
+        Config::default()
+    } else {
+        Config::default().vm_strict(false)
+    };
+    #[cfg(not(feature = "vm"))]
+    let dflt = Config::default();
     #[allow(unused_mut)]
-    let mut v = vec![("default", Config::default(), false)];
+    let mut v = vec![("default", dflt, false)];
     #[cfg(feature = "vm")]
     {
         let vm = Config::default().vm_strict(claimed);

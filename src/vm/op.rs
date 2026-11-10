@@ -600,6 +600,12 @@ pub(crate) struct SrcInfo {
     pub(crate) d: usize,
     pub(crate) base: usize,
     pub(crate) src: usize,
+    /// A generate_series cursor is read to its end when it opens
+    /// (`vtab::drain`, under `Config::max_vtab_rows` and the reader's
+    /// bound), as today's materialising executor reads it: every
+    /// core except a top-level query today's executor streams
+    /// (`G::streamed`; a trigger program's too, checked when it runs).
+    pub(crate) drain: bool,
 }
 
 /// An expression whose subquery nodes read slots (`P4::SubExpr`): the

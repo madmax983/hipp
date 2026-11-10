@@ -11,6 +11,109 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_rest — review fixes (2026-11-10)
+
+Fixes to unit `vm_rest` (below), all under the hidden `vm` feature;
+no profile changes.
+
+**Fixed.**
+- **A window query's LIMIT bounded its source** (wrong answer, with
+  or without strict mode): `G::grow_setup` gave a lone first view,
+  CTE, FROM subquery or table-valued / fts5 source the reader's bound
+  (`derived_need`), whose test left out window calls; today's
+  executor skips the bound for them (`run_query_sub`'s `wins`,
+  `exec_subplan`'s `lone`). `SELECT value, count(*) OVER () FROM
+  json_each('[1,2,3,4]') LIMIT 2` gave `1|2, 2|2` (pin: `1|4, 2|4`),
+  and a scalar subquery's window saw one row (`SELECT (SELECT count(*)
+  OVER () FROM json_each('[1,2,3]'))` gave 1). A window query now
+  gives no bound to its first source (neither the fixed nor the
+  growing one).
+- **`Config::max_vtab_rows` where rows are kept around the cursor**
+  (memory unbounded where today's executor fails): the VM read every
+  generate_series cursor row by row and counted it only by the
+  reading core's own rule (`vtab_cap`), so a materialised CTE, a
+  UNION's or a sorted compound's cores, an IN list, a FROM subquery
+  under an outer ORDER BY or WHERE, a scalar subquery's sorter, a fold
+  in a subquery, a RIGHT JOIN, a recursive CTE's step and a trigger
+  program's SELECTs held up to the whole series (`WITH c AS
+  MATERIALIZED (SELECT value FROM generate_series(1, 6000000)) SELECT
+  count(*) FROM c`: 2 GB at its peak, where today's executor fails
+  with `VtabTooManyRows`). Today streams a cursor only in the
+  statement's own core when `stream_plan` takes it (no compound, RIGHT
+  / FULL join, recursive reference, window call or trigger program);
+  every other core reads it whole (`vtab::drain`, under the reader's
+  bound). The VM now does the same: `G::streamed` is that test at
+  code generation, `SrcInfo::drain` carries it to the driver, which
+  drains the cursor at `HostOpen` (also when a trigger or action
+  program runs, checked then), and a compound's cores give their first
+  source no fixed bound (`exec_qp_core_values`). The bound, the reader
+  bounds and the errors are today's, and the memory a cursor costs is
+  at most `max_vtab_rows` rows per opening.
+
+**Tests** (`tests/vm_rest_v17.rs`, strict): `windows_match_the_pin`
++20 queries (window queries over json_each / json_tree /
+generate_series / views / CTEs (materialised too) / ordered,
+compound and nested FROM subqueries under LIMIT / OFFSET, and as
+scalar subqueries); `generated_windows_over_derived_sources_match_the_pin`
+(new: 120 generated window queries by default, `HIPP_VMR_SEEDS`,
+over ten derived and table-valued source shapes under a LIMIT /
+OFFSET or as scalar subqueries — 63 of 120 differed before the fix,
+1,500 run clean after); `max_vtab_rows_where_rows_are_kept` (new: 55
+shapes at a bound of 40 — materialised and plain CTEs, UNION /
+INTERSECT / EXCEPT / sorted UNION ALL, IN lists, FROM subqueries
+under ORDER BY / WHERE / joins, scalar and EXISTS subqueries with
+folds, sorters and correlated arguments, RIGHT and LEFT joins,
+windows, VALUES joins, a recursive step, under-the-bound controls —
+the VM's rows and success are today's executor's, and the reviewer's
+shapes at the default bound fail as today's do);
+`max_vtab_rows_in_trigger_programs` (new: a trigger body's and a WHEN
+clause's generate_series, at and past the bound: success and the
+tables are today's); `max_vtab_rows_as_today`'s subquery fold now
+expects today's error.
+
+**Divergence kept (recorded).** A UNION ALL chain without ORDER BY
+streams its cores on the VM (as on the pin): `SELECT 1 UNION ALL
+SELECT value FROM generate_series(1, 100) LIMIT 3` at a bound of 40
+returns its first row before the second core's `VtabTooManyRows`;
+today's executor computes every core first and returns none. Both
+fail.
+
+**Gates.** Full `ci/local-gates.sh` ends with "all gates passed";
+the strict whole-suite run (`RUSTFLAGS="--cfg hipp_vm_strict" cargo
+test --workspace --no-fail-fast --features vm`, 124 test binaries,
+the CLI suites included): 1,192 passed, 2 failed, 5 ignored — the two
+failures were `tests/outer_agg_bound_v17.rs`' corpora the VM does not
+claim (an enclosing aggregate in a host-read source's arguments,
+which the `vm_flip` review fixes made fall back), whose `default`
+engine meant a non-strict `Config::default()`; that engine is now
+non-strict for unclaimed corpora (as its `vm` engine is) and the
+binary passes strict (5 / 5), so the run stands at 1,194 passed, 0
+failed;
+`depth_v16` / `triggers_v16` / `depth_tiny_v16` with debug info, with
+and without `vm`.
+
+**Size Δ** (thumbv7em, `--profile tiny`): tiny 0 (76,952), full 0
+(477,788), max 0 (964,076), xl 0 (1,061,144) — the changes are `vm`
+code and `Connection::in_program_any`'s cfg (now also `vtab`, used
+only under `vm`). For information: `query,vm` 211,566 B, `sql,vm`
+462,736 B, `sql,indexes,expr_index,vm` 565,024 B (vs `vm_rest`'s
+211,366 / 461,856 / 563,736, the `vm_flip` review fixes in between).
+
+**Still falls back under strict** (the strict run's list): `vm_rest`'s
+three (below: two refusals of today's executor and the instruction
+budget) and, since the `vm_flip` review fixes, an enclosing query's
+aggregate in the arguments of a host-read source (a table-valued or
+virtual source, a WITHOUT ROWID access path) — not a refusal: the
+driver's readers do not see the folded value's slot, so the statement
+runs on today's executor, which answers like the pin.
+
+**Honest gaps.** As `vm_rest`'s below, less the withdrawn
+"toward the pin" subquery fold; the divergence and the fallback
+above. A generate_series cursor drained at `HostOpen` costs its rows
+up front (today's executor's memory, at most `max_vtab_rows` per
+opening) where the VM's cursor read them one at a time; only the cores
+today's executor streams keep the row-at-a-time read.
+
 ### VM (ADR 0005 Stage 2): vm_flip — not delivered; review fixes (2026-11-10)
 
 Stage 2's fifth unit was to make the VM the only SELECT path in
@@ -195,7 +298,10 @@ executor.
   `Config::max_vtab_rows` counts a generate_series cursor's rows where
   the streamed executor counts them (a core that keeps every row:
   DISTINCT, groups, windows, an ORDER BY without a LIMIT in effect —
-  the LIMIT register read at run time, so `LIMIT -1` counts). The
+  the LIMIT register read at run time, so `LIMIT -1` counts).
+  (Review fix, below: that rule held only in the cores today's
+  executor streams; every other core now reads the cursor whole
+  under the bound, as today's materialising executor does.) The
   side tables a row's values point into (`Env::json_docs`,
   `Env::fts_rows`) are kept as the streamed executor keeps them
   (`SideMark` / `SideDrop` / `SidePin`): what a table-valued loop
@@ -326,11 +432,13 @@ future was dropped (it now moves a copy).
 JOIN come in scan order (the pin's automatic index orders them by
 key); a main table joined to a TEMP WITHOUT ROWID table is refused; a
 join of a table with a FROM subquery over an fts5 MATCH runs in FROM
-order (the pin puts the subquery outermost). Toward the pin, recorded
-as intended: inside a subquery, generate_series is read row by row as
-at the top level, so a fold there is not bounded by
-`Config::max_vtab_rows` (today's subquery executor drains it against
-the bound first and fails).
+order (the pin puts the subquery outermost). ~~Toward the pin,
+recorded as intended: inside a subquery, generate_series is read row
+by row as at the top level, so a fold there is not bounded by
+`Config::max_vtab_rows`.~~ (Withdrawn in the review fixes: rows kept
+around the cursor — a materialised CTE, a compound, an IN list, a
+derived table — were not bounded either; the VM now reads it whole
+under the bound wherever today's executor does.)
 
 **Tests.** `tests/vm_rest_v17.rs` (built with `--features vm`;
 strict, `runs_on_vm` asserted, rows in order vs the pin):
@@ -358,7 +466,8 @@ bodies with RAISE, generate_series, json_each and windows, a cascade's
 and a SET NULL's triggers; strict, at the default and one-frame cache:
 each write's success and the tables after it are the pin's),
 `max_vtab_rows_as_today` (12 queries: the VM's bound is today's
-streamed executor's, row for row; the subquery case above),
+streamed executor's, row for row; the subquery case above, today's
+error since the review fixes),
 `cancel::dropped_step_futures_resume_exactly` (step futures polled
 once and dropped up to three times over WITHOUT ROWID scans and
 lookups, an R*Tree search, generate_series, json_each, fts5, a window

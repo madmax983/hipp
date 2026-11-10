@@ -352,6 +352,16 @@ pub(super) struct G<'p, 'b> {
     /// A window query's set (unit `vm_rest`).
     #[cfg_attr(not(feature = "window"), allow(dead_code))]
     win: Option<u32>,
+    /// Whether today's executor streams this core (`stream_plan`):
+    /// the statement's own core, not a compound's, with no RIGHT /
+    /// FULL join, recursive CTE reference or window call. Every other
+    /// core is today's materialising executor's, which reads a
+    /// generate_series cursor whole (`SrcInfo::drain`).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    streamed: bool,
+    /// One core of a compound (its LIMIT / OFFSET the compound's).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    arm: bool,
     /// `Eval` flags every expression the output computes takes
     /// (`EVAL_WIN` while a window query's units are output).
     pub(super) wflag: u8,
@@ -512,6 +522,14 @@ pub(super) fn core(
         });
     }
     let tmp = b.reg();
+    let streamed = matches!(sink, Sink::Result)
+        && w0 == 0
+        && n0 == 0
+        && win.is_none()
+        && !windowed
+        && !qp.sources.iter().any(|s| s.kind.pads_left());
+    #[cfg(feature = "sql")]
+    let streamed = streamed && !qp.sources.iter().any(|s| s.rec != 0);
     let mut g = G {
         b,
         qp,
@@ -537,6 +555,8 @@ pub(super) fn core(
         items: qp.items.as_slice(),
         order: qp.order_by.as_slice(),
         win: None,
+        streamed,
+        arm: win.is_some(),
         wflag: 0,
     };
     match win {
@@ -1385,7 +1405,11 @@ impl G<'_, '_> {
         let first = self.lvl(0).map(|l| l.kind);
         let derived = matches!(first, Some(Kind::Derived(_)));
         let tvf = first.is_some_and(|k| tvf_kind(&k) && !matches!(k, Kind::Host(_, true)));
-        if !derived && !tvf {
+        // Window calls read every input row: no bound passes into the
+        // first source (today's `run_query_sub` / `exec_subplan`'s
+        // `wins`; review fix: a LIMIT, or a scalar subquery's one row,
+        // bounded a derived or table-valued source's rows).
+        if (!derived && !tvf) || self.win.is_some() {
             return;
         }
         let plain = qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct;
@@ -1393,7 +1417,10 @@ impl G<'_, '_> {
             && (qp.filter.is_some() || qp.sources.len() > 1);
         let reduced = qp.filter.is_some() || !qp.group_by.is_empty() || qp.has_agg;
         let reordered = !qp.order_by.is_empty() || qp.distinct;
-        let bounded = qp.sources.len() == 1 && !reduced && !reordered;
+        // (A compound's cores read their first source whole, as today's
+        // `exec_qp_core_values` and compound finish do: its LIMIT is
+        // the compound's.)
+        let bounded = qp.sources.len() == 1 && !reduced && !reordered && !self.arm;
         if !grow && !bounded {
             return;
         }
@@ -1547,6 +1574,8 @@ pub(super) fn values_core(
         items: qp.items.as_slice(),
         order: qp.order_by.as_slice(),
         win: None,
+        streamed: false,
+        arm: false,
         wflag: 0,
     };
     for r in qp.values.iter() {
@@ -2539,6 +2568,7 @@ impl G<'_, '_> {
             d,
             base: self.base(d) as usize,
             src: self.src(d) as usize,
+            drain: !self.streamed,
         };
         self.b.p4(P4::Src(alloc::boxed::Box::new(info)))
     }

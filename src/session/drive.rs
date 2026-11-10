@@ -9,7 +9,7 @@ use super::*;
 use crate::vm::exec::Vm;
 use crate::vm::{Exec, Program, codegen, op};
 
-#[cfg(any(feature = "json", feature = "fts5"))]
+#[cfg(any(feature = "json", feature = "fts5", feature = "vtab"))]
 impl<S: Storage> Connection<S> {
     /// Whether a trigger or foreign-key action program is running.
     fn in_program_any(&self) -> bool {
@@ -217,13 +217,14 @@ impl<S: Storage> Statement<'_, S> {
     /// move a copy of their cursor, `vm_host_next`).
     async fn vm_call(&mut self) -> Result<(), S::Error> {
         use crate::vm::op::{self as vop, Code};
-        let (op, qp, d, base, src) = {
+        let (op, qp, d, base, src, drain) = {
             let vm = self.vm.as_deref().ok_or(Error::Unsupported)?;
             let op = vm.call_op().ok_or(Error::Unsupported)?;
             let info = vm.src_info(op.p4).ok_or(Error::Unsupported)?;
             let qp = vm.plan_at(info.plan).ok_or(Error::Unsupported)?;
-            (op, qp, info.d, info.base, info.src)
+            (op, qp, info.d, info.base, info.src, info.drain)
         };
+        let _ = drain;
         let sp = qp.sources.as_slice().get(d).ok_or(Error::Unsupported)?;
         if op.code == Code::HostNext {
             return Box::pin(self.vm_host_next(op, sp)).await;
@@ -283,7 +284,22 @@ impl<S: Storage> Statement<'_, S> {
                 #[cfg(feature = "vtab")]
                 vop::HOST_VT => {
                     let vt = sp.vt.as_deref().ok_or(Error::Unsupported)?;
-                    Box::new(self.vtab_open(sp, vt, &padded, need).await?)
+                    let mut cur = self.vtab_open(sp, vt, &padded, need).await?;
+                    // A core today's executor does not stream reads a
+                    // generate_series cursor whole, under the reader's
+                    // bound and `Config::max_vtab_rows` (`vtab_rows_of`;
+                    // review fix: rows kept by a materialised CTE, a
+                    // compound, an IN list or a derived table were not
+                    // bounded).
+                    if (drain || self.conn.in_program_any())
+                        && let super::vtab::VtCur::Series(c) = &mut cur
+                    {
+                        let rows =
+                            crate::vtab::drain(c, sp.ncols, need, self.conn.cfg.max_vtab_rows)
+                                .map_err(|kind| Error::Schema { kind })?;
+                        cur = super::vtab::VtCur::Rows(rows, 0);
+                    }
+                    Box::new(cur)
                 }
                 vop::HOST_SCAN => Box::new(ScanCursor::new(sp.root)),
                 _ => return Err(Error::Unsupported),

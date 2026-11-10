@@ -249,7 +249,8 @@ const W: &str = "CREATE TABLE t(a, b, c, n TEXT COLLATE NOCASE); \
     INSERT INTO t VALUES (1,'x',5,'A'),(2,'y',3,'a'),(1,'z',4,'B'),(2,'w',1,NULL),(1,'q',2,'b'),(0,'p',6,'c'); \
     CREATE TABLE d(k, v); \
     INSERT INTO d VALUES (1,1),(2,2),(NULL,3),(2.5,4),('a',5),('b',6),(x'41',7),(NULL,8),(4,9),(6,10); \
-    CREATE TABLE e(x);";
+    CREATE TABLE e(x); \
+    CREATE VIEW tv AS SELECT * FROM t;";
 
 const WINDOWS: &[&str] = &[
     "SELECT b, a, row_number() OVER (ORDER BY a) FROM t;",
@@ -301,6 +302,30 @@ const WINDOWS: &[&str] = &[
     "SELECT c, lag(c, -9223372036854775808) OVER (ORDER BY c) FROM t;",
     "SELECT a, sum(c) OVER (ORDER BY a RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t;",
     "SELECT a, sum(abs(-9223372036854775808)) OVER () FROM t;",
+    // Review fix: a window query reads every input row, so its LIMIT
+    // (or a scalar subquery's one row) bounds no first source — a
+    // view, a CTE, a FROM subquery or a table-valued source read only
+    // the LIMIT + OFFSET rows.
+    "SELECT value, count(*) OVER () FROM json_each('[1,2,3,4]') LIMIT 2;",
+    "SELECT key, sum(value) OVER (ORDER BY key DESC) FROM json_each('[5,6,7,8]') LIMIT 3 OFFSET 1;",
+    "SELECT id, count(*) OVER () FROM json_tree('[1,[2,3],4]') LIMIT 2;",
+    "SELECT x, count(*) OVER () FROM (SELECT value x FROM generate_series(1, 9)) LIMIT 3;",
+    "SELECT value, count(*) OVER (), last_value(value) OVER () FROM generate_series(1, 9) LIMIT 2;",
+    "SELECT a, count(*) OVER () FROM tv LIMIT 2;",
+    "WITH c AS (SELECT a FROM t) SELECT a, count(*) OVER () FROM c LIMIT 2;",
+    "WITH c AS MATERIALIZED (SELECT a FROM t) SELECT a, sum(a) OVER () FROM c LIMIT 2 OFFSET 1;",
+    "SELECT (SELECT count(*) OVER () FROM (SELECT a FROM t));",
+    "SELECT (SELECT count(*) OVER () FROM json_each('[1,2,3]'));",
+    "SELECT (SELECT sum(value) OVER () FROM generate_series(1, 5));",
+    "SELECT (SELECT last_value(a) OVER () FROM tv);",
+    "SELECT a, row_number() OVER (ORDER BY a), count(*) OVER () FROM (SELECT a FROM t ORDER BY a DESC) LIMIT 2;",
+    "SELECT x, count(*) OVER () FROM (SELECT a x FROM t UNION ALL SELECT 9) LIMIT 2;",
+    "SELECT x, count(*) OVER () FROM (SELECT 1 x UNION ALL SELECT 2) LIMIT 1;",
+    "SELECT * FROM (SELECT a, count(*) OVER () n FROM (SELECT a FROM t)) LIMIT 2;",
+    "SELECT a, (SELECT count(*) OVER () FROM (SELECT a FROM t u WHERE u.a >= t.a)) FROM t;",
+    "SELECT x FROM (SELECT a x, count(*) OVER () n FROM tv) WHERE n = 6 LIMIT 1;",
+    "SELECT a, count(*) OVER () FROM (SELECT a FROM t) WHERE a > 0 LIMIT 2;",
+    "SELECT a, count(*) OVER () FROM (SELECT a FROM t) LIMIT 0;",
 ];
 
 #[test]
@@ -740,23 +765,178 @@ fn max_vtab_rows_as_today() {
         assert!(on_vm, "{q}");
         assert_eq!(vm, today, "{q}");
     }
-    // Recorded as intended: inside a subquery the VM applies the
-    // streamed executor's rule too (a fold keeps no row), where today's
-    // subquery executor drains the cursor against the bound first; the
-    // VM gives the pin's answer.
+    // Inside a subquery today's materialising executor reads the
+    // cursor whole against the bound (a fold included); so does the VM
+    // (review fix: it read it row by row, unbounded where a row-keeping
+    // construct around it held the rows).
     let q = "SELECT (SELECT count(*) FROM generate_series(1, 100));";
     let h = copy_of(&base, "vmr17-cap-s");
     let mut c = strict();
     c.max_vtab_rows = 40;
-    let (vm, on_vm, _) = hipp_run(&h, c, q);
+    let (vm, on_vm, e) = hipp_run(&h, c, q);
     assert!(on_vm);
-    assert_eq!(vm, pin_run(&base, q));
-    let mut c = Config::default().vm_off(true);
-    c.max_vtab_rows = 40;
     assert!(
-        !hipp_run(&h, c, q).0.ok,
-        "today's subquery executor is bounded"
+        !vm.ok && matches!(e, Some(Error::Schema { .. })),
+        "bounded as today: {vm:?} {e:?}"
     );
+}
+
+/// Review fix: `Config::max_vtab_rows` where a construct around the
+/// cursor keeps its rows — a materialised CTE, a compound's cores, an
+/// IN list, a derived table, a scalar or EXISTS subquery, a RIGHT
+/// JOIN, a window query, a recursive CTE's step. Today's materialising
+/// executor reads such a cursor whole (under the reader's bound) and
+/// fails past the bound; the VM did not count those rows (memory grew
+/// with the series). Now the VM and today's executor agree, row for
+/// row and error for error, at a bound of 40 rows.
+#[test]
+fn max_vtab_rows_where_rows_are_kept() {
+    let base = pin_file("capk", S);
+    let mut bad = Vec::new();
+    let cap = |c: Config| {
+        let mut c = c;
+        c.max_vtab_rows = 40;
+        c
+    };
+    for q in [
+        "WITH c AS MATERIALIZED (SELECT value FROM generate_series(1,100)) SELECT count(*) FROM c;",
+        "WITH c AS (SELECT value FROM generate_series(1,100)) SELECT count(*) FROM c;",
+        "WITH c AS MATERIALIZED (SELECT value FROM generate_series(1,100)) SELECT * FROM c LIMIT 2;",
+        "SELECT value FROM generate_series(1,100) UNION SELECT 1 LIMIT 1;",
+        "SELECT value FROM generate_series(1,100) UNION ALL SELECT 1 ORDER BY 1 LIMIT 1;",
+        "SELECT value FROM generate_series(1,100) UNION ALL SELECT 1 LIMIT 1;",
+        "SELECT value FROM generate_series(1,100) UNION ALL SELECT 1;",
+        "SELECT value FROM generate_series(1,100) INTERSECT SELECT 3;",
+        "SELECT * FROM generate_series(1,3) WHERE value IN (SELECT value FROM generate_series(1,100));",
+        "SELECT a FROM t WHERE a IN (SELECT value FROM generate_series(1,100) WHERE value < 3);",
+        "SELECT x FROM (SELECT value x FROM generate_series(1,100)) ORDER BY x DESC LIMIT 1;",
+        "SELECT x FROM (SELECT value x FROM generate_series(1,100)) ORDER BY x LIMIT 1;",
+        "SELECT x FROM (SELECT value x FROM generate_series(1,100)) LIMIT 1;",
+        "SELECT x FROM (SELECT value x FROM generate_series(1,100) WHERE value > 2) LIMIT 1;",
+        "SELECT x FROM (SELECT value x FROM generate_series(1,100)) WHERE x > 2 LIMIT 1;",
+        "SELECT count(*) FROM (SELECT value FROM generate_series(1,100));",
+        "SELECT * FROM (SELECT value FROM generate_series(1,100) LIMIT 5);",
+        "SELECT * FROM (SELECT value FROM generate_series(1,100) UNION ALL SELECT 0) LIMIT 2;",
+        "SELECT * FROM t, (SELECT value FROM generate_series(1,100)) g WHERE g.value = t.a;",
+        "SELECT (SELECT value FROM generate_series(1,100) ORDER BY value+0 DESC LIMIT 1);",
+        "SELECT (SELECT value FROM generate_series(1,100));",
+        "SELECT (SELECT value FROM generate_series(1,100) WHERE value > 50);",
+        "SELECT (SELECT count(*) FROM generate_series(1,100));",
+        "SELECT (SELECT max(value) FROM generate_series(1,100));",
+        "SELECT EXISTS (SELECT 1 FROM generate_series(1,100));",
+        "SELECT EXISTS (SELECT 1 FROM generate_series(1,100) WHERE value > 50);",
+        "SELECT a, (SELECT value FROM generate_series(1,100) WHERE value = t.a) FROM t;",
+        "SELECT a, (SELECT count(*) FROM generate_series(1,t.a)) FROM t;",
+        "SELECT value FROM generate_series(1,100) RIGHT JOIN t ON value = a;",
+        "SELECT a, value FROM t LEFT JOIN generate_series(1,100) ON value = a;",
+        "SELECT a, value FROM generate_series(1,100), t WHERE value = a;",
+        "SELECT a, value FROM t, generate_series(1,100) WHERE value = a ORDER BY 1;",
+        "SELECT value, sum(value) OVER () FROM generate_series(1,100) LIMIT 1;",
+        "SELECT * FROM (SELECT value, row_number() OVER () FROM generate_series(1,100)) LIMIT 1;",
+        "SELECT * FROM (SELECT DISTINCT value FROM generate_series(1,100)) LIMIT 1;",
+        "SELECT * FROM (SELECT value FROM generate_series(1,100) ORDER BY value % 7 LIMIT 3);",
+        "SELECT * FROM (SELECT value FROM generate_series(1,100) ORDER BY value % 7);",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n, (SELECT count(*) FROM generate_series(1, 100)) FROM r;",
+        "SELECT value FROM generate_series(1,30) UNION SELECT 1;",
+        "SELECT (SELECT group_concat(value) FROM generate_series(1,30));",
+        "SELECT x FROM (SELECT value x FROM generate_series(1,100)) UNION ALL SELECT 1 LIMIT 1;",
+        "SELECT a, (SELECT count(*) FROM generate_series(1, t.a * 20)) FROM t;",
+        "SELECT a, (SELECT max(value) FROM generate_series(1, t.a * 20)) FROM t WHERE a < 2;",
+        "SELECT (SELECT value FROM generate_series(1,100) WHERE value % 2 = 0 LIMIT 1);",
+        "SELECT EXISTS (SELECT 1 FROM generate_series(1,100) WHERE value % 10 = 0);",
+        "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM generate_series(1,100) WHERE value = t.a);",
+        "SELECT (SELECT count(*) FROM t, generate_series(1,100));",
+        "SELECT (SELECT count(*) FROM t, generate_series(1,30));",
+        "SELECT * FROM t WHERE a IN (SELECT value FROM generate_series(1,100) LIMIT 2);",
+        "SELECT * FROM (SELECT value, sum(value) OVER () FROM generate_series(1,30)) LIMIT 2;",
+        "SELECT * FROM (VALUES (1), (2)) v, generate_series(1, 100) g WHERE g.value = v.column1;",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r, generate_series(1, 50) g WHERE g.value = 1 AND n < 3) SELECT * FROM r;",
+        "SELECT j.id, (SELECT count(*) FROM json_each(j.doc), generate_series(1, 100)) FROM j;",
+        "SELECT a FROM t UNION SELECT value FROM generate_series(1, 30) ORDER BY 1 LIMIT 3;",
+        "SELECT value FROM generate_series(1, 100) EXCEPT SELECT a FROM t LIMIT 1;",
+    ] {
+        let h = copy_of(&base, "vmr17-capk-h");
+        let (vm, on_vm, e1) = hipp_run(&h, cap(strict()), q);
+        let (today, _, e2) = hipp_run(&h, cap(Config::default().vm_off(true)), q);
+        if !on_vm || vm != today {
+            bad.push(format!(
+                "{q}\n  vm   : {vm:?} {e1:?}\n  today: {today:?} {e2:?}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+    // A UNION ALL chain streams its cores on the VM, as on the pin: the
+    // first core's row comes before the second core's error, where
+    // today's executor computes every core first. Both fail.
+    let q = "SELECT 1 UNION ALL SELECT value FROM generate_series(1, 100) LIMIT 3;";
+    let h = copy_of(&base, "vmr17-capk-u");
+    let (vm, on_vm, _) = hipp_run(&h, cap(strict()), q);
+    let (today, _, _) = hipp_run(&h, cap(Config::default().vm_off(true)), q);
+    assert!(on_vm && !vm.ok && !today.ok, "{vm:?} {today:?}");
+    assert_eq!(vm.rows, ["1"]);
+    // The reviewer's shapes at the default bound (4,194,304 rows):
+    // each fails as today's executor fails, and none holds the rows
+    // past the bound.
+    for q in [
+        "WITH c AS MATERIALIZED (SELECT value FROM generate_series(1, 4194305)) SELECT count(*) FROM c;",
+        "SELECT value FROM generate_series(1, 4194305) UNION SELECT 1 LIMIT 1;",
+        "SELECT * FROM generate_series(1, 3) WHERE value IN (SELECT value FROM generate_series(1, 4194305));",
+        "SELECT (SELECT value FROM generate_series(1, 4194305) ORDER BY value + 0 DESC LIMIT 1);",
+    ] {
+        let h = copy_of(&base, "vmr17-capk-d");
+        let (vm, on_vm, e) = hipp_run(&h, strict(), q);
+        assert!(on_vm, "{q}");
+        assert!(
+            !vm.ok && matches!(e, Some(Error::Schema { .. })),
+            "{q}: {vm:?} {e:?}"
+        );
+    }
+}
+
+/// A trigger program's SELECTs are today's materialising executor's:
+/// a generate_series cursor there is read whole under
+/// `Config::max_vtab_rows`, on the VM too.
+#[test]
+fn max_vtab_rows_in_trigger_programs() {
+    let setup = "CREATE TABLE p(n); CREATE TABLE log(m); \
+        CREATE TRIGGER pi AFTER INSERT ON p BEGIN \
+          SELECT value FROM generate_series(1, new.n) LIMIT 1; \
+          SELECT count(*) FROM generate_series(1, new.n); \
+          INSERT INTO log VALUES (new.n); \
+        END; \
+        CREATE TABLE q(n); \
+        CREATE TRIGGER qi AFTER INSERT ON q \
+          WHEN (SELECT count(*) FROM generate_series(1, new.n)) > 0 BEGIN \
+          INSERT INTO log VALUES (-new.n); \
+        END;";
+    let base = pin_file("capt", setup);
+    for (t, n) in [10, 40, 41, 100]
+        .iter()
+        .flat_map(|n| [("p", *n), ("q", *n)])
+    {
+        let w = format!("INSERT INTO {t} VALUES ({n})");
+        let mut res = Vec::new();
+        for cfg in [strict(), Config::default().vm_off(true)] {
+            let h = copy_of(&base, "vmr17-capt-h");
+            let mut c = cfg;
+            c.max_vtab_rows = 40;
+            let r = block_on(async {
+                let fs = FileStorage::open(&h).expect("fs open");
+                let mut db = Connection::open(fs, c).await.expect("open");
+                let r = async {
+                    let mut q = db.prepare(&w).await?;
+                    while q.step().await? == Step::Row {}
+                    Ok::<(), Error<FsError>>(())
+                }
+                .await;
+                assert!(!matches!(r, Err(Error::VmFallback)), "{w}");
+                r.is_ok()
+            });
+            res.push((r, common::cli(&h, "SELECT * FROM log;")));
+        }
+        assert_eq!(res[0], res[1], "{w}");
+        assert_eq!(res[0].0, n <= 40, "{w}");
+    }
 }
 
 // ---------------- cancellation ----------------
@@ -1029,6 +1209,80 @@ fn generated_windows_match_the_pin() {
     }
     let refs: Vec<&str> = qs.iter().map(String::as_str).collect();
     corpus(&base, "gw", &strict(), &refs);
+}
+
+/// Generated window queries whose only source is a view, a CTE, a FROM
+/// subquery (plain, ordered, compound, joined) or a table-valued
+/// source, under a LIMIT / OFFSET or as a scalar subquery: the windows
+/// see every input row (review fix: the reader's bound reached the
+/// source), strict on the VM, against the pin.
+#[test]
+fn generated_windows_over_derived_sources_match_the_pin() {
+    let base = pin_file("gen-wd", W);
+    let funcs = [
+        "count(*)",
+        "row_number()",
+        "rank()",
+        "ntile(2)",
+        "sum(c)",
+        "last_value(c)",
+        "first_value(c)",
+        "lead(c)",
+        "lag(c, 2)",
+        "max(c)",
+        "cume_dist()",
+        "group_concat(c, '.')",
+    ];
+    let overs = [
+        "",
+        "ORDER BY c",
+        "PARTITION BY a",
+        "ORDER BY c ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        "PARTITION BY a ORDER BY c DESC",
+        "ORDER BY a GROUPS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+    ];
+    let srcs = [
+        "tv",
+        "(SELECT a, c FROM t)",
+        "(SELECT a, c FROM t ORDER BY c DESC)",
+        "(SELECT a, c FROM t UNION ALL SELECT 7, 9)",
+        "(SELECT 1 a, 2 c UNION ALL SELECT 3, 4 UNION ALL SELECT 1, 6)",
+        "(SELECT t.a, t.c FROM t JOIN e ON 1 UNION ALL SELECT a, c FROM t)",
+        "(SELECT value % 3 a, value c FROM generate_series(1, 7))",
+        "(SELECT key a, value c FROM json_each('[4,1,3,1,5]'))",
+        "cte",
+        "mcte",
+    ];
+    let tails = [
+        " LIMIT 1",
+        " LIMIT 2",
+        " LIMIT 4 OFFSET 1",
+        " LIMIT 3 OFFSET 2",
+        " LIMIT 2 OFFSET 9",
+    ];
+    let mut rng = Rng(0x5eed_d0e5_0002_0003);
+    let mut qs = Vec::new();
+    for _ in 0..seeds(120) {
+        let f = rng.pick(&funcs);
+        let o = rng.pick(&overs);
+        let src = rng.pick(&srcs);
+        let (with, from) = match src {
+            "cte" => ("WITH x AS (SELECT a, c FROM t) ", "x"),
+            "mcte" => ("WITH x AS MATERIALIZED (SELECT a, c FROM t) ", "x"),
+            s => ("", s),
+        };
+        let tail = rng.pick(&tails);
+        let q = if rng.next().is_multiple_of(4) {
+            format!(
+                "{with}SELECT (SELECT {f} OVER ({o}) FROM {from}), (SELECT count(*) OVER () FROM {from}{tail});"
+            )
+        } else {
+            format!("{with}SELECT a, c, {f} OVER ({o}) FROM {from}{tail};")
+        };
+        qs.push(q);
+    }
+    let refs: Vec<&str> = qs.iter().map(String::as_str).collect();
+    corpus(&base, "gwd", &strict(), &refs);
 }
 
 /// Generated queries over virtual and table-valued sources joined to

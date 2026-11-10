@@ -432,8 +432,11 @@ xNext). The driver runs today's async readers for them —
 tables), `scan_source` / `access_rows` / `auto_rows` (WITHOUT ROWID
 tables through `crate::wr`, whose handles stand for rowids) — with
 their argument evaluation, lateral pre-checks (`lateral_ok`),
-`Config::max_vtab_rows` and cleared arguments (`tvf_dead`, put back by
-`Restore`), on copies of the VM's inputs, storing the result when the
+`Config::max_vtab_rows` (counted where the streamed executor counts
+it in the cores that executor streams, and the cursor read whole under
+the bound in every other core, as today's materialising executor
+reads it — `vm_rest` review fix) and cleared arguments (`tvf_dead`,
+put back by `Restore`), on copies of the VM's inputs, storing the result when the
 reader completes: a step future dropped while the reader waits leaves
 the VM as it was and the next step runs the instruction again (an
 R*Tree search and a WITHOUT ROWID scan move a copy of their cursor).

@@ -257,7 +257,13 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   instructions over today's async code — except one shape today's
   executor refuses. Plain `EXPLAIN` lists hipp's own program in the
   pin's columns under `vm` (still refused without it). No profile
-  enables `vm`; the stage's last unit turns it on.
+  enables `vm`; the stage's last unit turns it on. Review fixes: a
+  window query's LIMIT no longer bounds its view / CTE / FROM
+  subquery / table-valued source (its windows saw only the LIMIT's
+  rows), and `Config::max_vtab_rows` bounds a generate_series cursor
+  wherever today's executor holds its rows (a materialised CTE, a
+  compound, an IN list, a derived table, a subquery, a trigger
+  program), as it did before the VM.
 - **The VM flip, measured and not taken.** Making the VM the only
   SELECT path and deleting the legacy read executors would grow every
   profile (full by about 19 KB, max by 51 KB and xl by 59 KB even in a

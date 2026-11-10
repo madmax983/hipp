@@ -5,6 +5,24 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: review fixes of unit `vm_rest` (hidden feature `vm`)
+
+- A window query whose only source is a view, a CTE, a FROM subquery
+  or a table-valued source (json_each, generate_series, fts5 ...)
+  computed its windows over only the rows its LIMIT + OFFSET kept
+  (`SELECT value, count(*) OVER () FROM json_each('[1,2,3,4]') LIMIT
+  2` gave 2 for 4), and inside a scalar subquery over one row: the
+  reader's bound no longer reaches the source of a window query, as
+  in today's executor.
+- `Config::max_vtab_rows` again bounds a generate_series cursor
+  wherever today's executor holds its rows: a materialised CTE, a
+  compound's cores, an IN list, a FROM subquery, a scalar or EXISTS
+  subquery, a RIGHT / FULL join, a window query, a trigger program.
+  The VM read such a cursor row by row, uncounted, and its memory grew
+  with the series; it now reads it whole under the bound, as today's
+  executor does, and fails with `VtabTooManyRows` where it fails.
+- Sizes: every profile unchanged (no profile enables `vm`).
+
 ### The bytecode VM flip (ADR 0005 Stage 2, unit `vm_flip`): measured, not taken; review fixes
 
 - The flip was not made: with the VM as the only SELECT path and the
