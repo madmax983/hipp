@@ -173,3 +173,25 @@ blocks, 198,910,292 bytes total.
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: insert into the leaf image without parsing/cloning every cell
+
+`btree_insert` validates the leaf with `leaf_cells_meta` (no per-cell
+allocation) and, when the leaf still fits, builds the new page image
+straight from the page bytes (`build_leaf_image_inserted`). Only a leaf
+that overflows re-parses with `leaf_cells` and takes the old split path.
+Workload checksum identical (657610); the test suite's pass/fail set is
+identical before/after (950 tests; the 823 failures are the absent
+`sqlite3` oracle, same on the baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 378,136,050   | 268,236,272   | -29.1%  |
+| 1000 | 866,107,919   | 626,660,907   | -27.6%  |
+| 2000 | 1,993,376,790 | 1,526,832,320 | -23.4%  |
+
+dhat (n=1000): 1,041,475 -> 535,229 blocks (-48.6%); 198,910,292 ->
+143,513,712 bytes (-27.8%).
+
+Size gates: tiny +828 B, full +776 B, max +752 B, xl +744 B; ratchets
+raised by those amounts (each well under `justify_over`).
