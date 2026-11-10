@@ -151,3 +151,25 @@ representable (mantissa < 2^53, |exp10| <= 22).
 | 500  | 378,111,682 | n/a                     | n/a     |
 | 1000 | 866,107,908 | 1,333,026 (0.15%)       | -7.57%  |
 | 2000 | 1,993,289,422 | n/a                   | n/a     |
+
+## btree_insert (table leaf) parse-all-and-clone (baseline at 10b5549)
+
+`bolt_workload` (callgrind, release + debuginfo). Every table INSERT
+parses all cells of the target leaf into owned `LeafCell`s (`leaf_cells`),
+clones them all into a merged list, and rebuilds the page from that list
+(`build_leaf_image`), although only one cell is added and the leaf nearly
+always still fits.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 378,136,050   |
+| 1000 | 866,107,919   |
+| 2000 | 1,993,376,790 |
+
+n=1000 profile: `btree_insert` inclusive 203,601,500 (23.51%) of which
+`leaf_cells` 97,076,273 (11.21%) and `build_leaf_image` 90,835,172 (10.49%).
+malloc+free (self) ~35% of all instructions. dhat (n=1000): 1,041,475
+blocks, 198,910,292 bytes total.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
