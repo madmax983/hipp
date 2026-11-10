@@ -29,6 +29,11 @@ sql,vtab,without_rowid,math,fts5
 sql,vtab,without_rowid,math,fts5,fts5_delete
 sql,explain
 sql,indexes,expr_index,planner
+query,vm
+sql,vm
+sql,indexes,vm
+sql,indexes,expr_index,vm
+sql,indexes,expr_index,planner,vm
 indexes,query
 indexes,write
 full

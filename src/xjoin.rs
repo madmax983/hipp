@@ -122,6 +122,9 @@ pub struct JQuery<'x> {
     pub order: &'x [(RExpr, SortOrder)],
     pub group: bool,
     pub group_by: bool,
+    /// ... and the ORDER BY too (`xplan::Query::obgrp`, v0.17 review
+    /// fix): `order` holds its terms and directions.
+    pub obgrp: bool,
     /// `order` is the DISTINCT result set (`WHERE_DISTINCTBY`).
     pub distinct_by: bool,
     pub distinct: bool,
@@ -163,6 +166,9 @@ pub(crate) struct JPlan {
     pub loops: AVec<JLoop>,
     pub rev: u64,
     pub ob_sat: usize,
+    /// The path delivers a GROUP BY and the ORDER BY that repeats it
+    /// (`JQuery::obgrp`; v0.17 review fix).
+    pub ob_grp: bool,
     #[cfg_attr(not(feature = "explain"), allow(dead_code))]
     pub distinct_ordered: bool,
     /// Per position: the loop's index or rowid lookups go through a
@@ -433,6 +439,7 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
             order: jq.order,
             group: jq.group,
             group_by: jq.group_by,
+            obgrp: false,
             ncols_out: jq.ncols_out,
             needed: Some(needed.as_slice()),
             cover_scan: true,
@@ -1080,6 +1087,7 @@ fn solve(
         order: jq.order,
         group: jq.group,
         group_by: jq.group_by,
+        obgrp: false,
         ncols_out: jq.ncols_out,
         needed: None,
         cover_scan: true,
@@ -1286,12 +1294,34 @@ pub(crate) fn plan(srcs: &[JSrc<'_>], jq: &JQuery<'_>) -> Option<JPlan> {
             distinct_ordered = true;
         }
     }
+    let mut rev = if jq.group { 0 } else { best.rev };
+    // The pin's `WHERE_SORTBYGROUP` check (v0.17 review fix): a path
+    // delivering a GROUP BY the ORDER BY repeats is checked for the
+    // ORDER BY, read in its directions.
+    let mut ob_grp = false;
+    if jq.obgrp
+        && ob_sat >= jq.order.len()
+        && let Some((last, path)) = best.loops.as_slice().split_last()
+    {
+        let o = JQuery {
+            group: false,
+            group_by: false,
+            ..*jq
+        };
+        let mut r = 0u64;
+        let k = path_order(srcs, &o, loops.as_slice(), path, *last, false, &mut r);
+        if usize::try_from(k).is_ok_and(|k| k >= jq.order.len()) {
+            rev = r;
+            ob_grp = true;
+        }
+    }
     let bloom_at = blooms(srcs, jq, out.as_slice());
     Some(JPlan {
         bloom_at,
         loops: out,
-        rev: if jq.group { 0 } else { best.rev },
+        rev,
         ob_sat,
+        ob_grp,
         distinct_ordered,
     })
 }

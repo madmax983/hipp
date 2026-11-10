@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-#[cfg(feature = "sql")]
+#[cfg(any(feature = "sql", feature = "vm"))]
 use crate::arena::AVec;
 use crate::arena::Arena;
 use crate::error::{Error, Result};
@@ -822,6 +822,41 @@ impl<S: Storage> Pager<S> {
     }
     pub fn frame_page(&self, idx: usize) -> u32 {
         self.frames[idx].page
+    }
+
+    /// The sync, storage-free view of the page cache the VM reads
+    /// through (ADR 0005 Stage 2, `vm`; `PagerCore`).
+    #[cfg(feature = "vm")]
+    pub(crate) fn vm_core(&mut self) -> PagerCore<'_> {
+        PagerCore {
+            page_count: self.header.page_count,
+            usable: self.usable(),
+            enc: self.text_enc(),
+            frames: self.frames.as_mut_slice(),
+            #[cfg(feature = "wal")]
+            touched: &mut self.touched,
+            #[cfg(feature = "wal")]
+            wal_fresh: &mut self.wal_fresh,
+        }
+    }
+
+    /// Do the I/O a VM opcode is waiting for (ADR 0005 Stage 2,
+    /// `vm`): load the page it missed, or spill a dirty frame to
+    /// make room. Any frame may be the victim: the pages the opcode
+    /// read before its miss are copied into its `Held` set
+    /// (`PagerCore::get`). Dropping the future part-way leaves
+    /// nothing the VM depends on: the opcode runs again and asks
+    /// again.
+    #[cfg(feature = "vm")]
+    pub(crate) async fn vm_service(&mut self, io: Io) -> Result<(), S::Error> {
+        match io {
+            Io::Read(page) => self.load(page).await.map(|_| ()),
+            Io::Spill => match self.spill_one().await {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(Error::CacheExhausted),
+                Err(e) => Err(e),
+            },
+        }
     }
 
     /// Begin the (single, autocommit) write transaction if none is
@@ -2548,6 +2583,134 @@ impl<S: Storage> Pager<S> {
     /// Page pool bytes (for §4.1 accounting by the session layer).
     pub fn pool_bytes(&self) -> usize {
         self.cache_cap * self.header.page_size as usize
+    }
+}
+
+/// The I/O a sync page access waits for (ADR 0005 Stage 2, `vm`):
+/// the page to read, or a dirty frame to spill to make room for it.
+#[cfg(feature = "vm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Io {
+    Read(u32),
+    Spill,
+}
+
+/// The pages a VM opcode has read so far (ADR 0005 Stage 2, `vm`;
+/// `PagerCore::get`), so that it reads the same bytes when it runs
+/// again after a miss. While the opcode only hits, they are the
+/// frames' page numbers; the miss that ends the run copies those
+/// frames here, so the driver may then evict any frame and the next
+/// run still finds every page it read before the miss. The opcode
+/// therefore needs one free frame, not one per page of its descent,
+/// and a cache of a single frame completes it. Cleared when the
+/// opcode completes (or the program resets), so a copy never
+/// outlives the opcode that took it.
+#[cfg(feature = "vm")]
+#[derive(Default)]
+pub(crate) struct Held {
+    pages: AVec<u32>,
+    imgs: AVec<(u32, AVec<u8>)>,
+}
+
+#[cfg(feature = "vm")]
+impl Held {
+    /// Forget every page (the opcode completed).
+    pub(crate) fn clear(&mut self) {
+        self.pages.clear();
+        self.imgs.clear();
+    }
+}
+
+/// The pager as the VM sees it (ADR 0005 Stage 2, `vm`): the page
+/// cache and the header fields reads need, with no storage type, so
+/// everything above it is monomorphic. A hit returns the page's
+/// bytes; a miss names the I/O the driver must do
+/// (`Pager::vm_service`) and changes no VM state, so the opcode that
+/// asked simply runs again.
+#[cfg(feature = "vm")]
+pub(crate) struct PagerCore<'a> {
+    frames: &'a mut [Frame],
+    page_count: u32,
+    usable: u32,
+    enc: crate::record::TextEnc,
+    #[cfg(feature = "wal")]
+    touched: &'a mut bool,
+    #[cfg(feature = "wal")]
+    wal_fresh: &'a mut bool,
+}
+
+#[cfg(feature = "vm")]
+impl PagerCore<'_> {
+    /// Usable bytes per page.
+    pub(crate) fn usable(&self) -> u32 {
+        self.usable
+    }
+    /// Pages in the database.
+    pub(crate) fn page_count(&self) -> u32 {
+        self.page_count
+    }
+    /// The database's text encoding.
+    pub(crate) fn text_enc(&self) -> crate::record::TextEnc {
+        self.enc
+    }
+
+    /// The bytes of `page`: from the opcode's copies in `held` when
+    /// it read the page before a miss, else from its cache frame,
+    /// which `keep` records in `held` (a page the opcode reads again
+    /// when it runs again; a payload's overflow pages are copied by
+    /// the cursor instead). A miss copies the frames `held` records,
+    /// then returns the I/O to do: `Read` when an empty or clean
+    /// frame can take the page, `Spill` when only dirty ones can;
+    /// with no frame at all the cache is `CacheExhausted`, as `load`
+    /// reports it.
+    pub(crate) fn get<'s>(
+        &'s mut self,
+        page: u32,
+        held: &'s mut Held,
+        keep: bool,
+    ) -> Result<core::result::Result<&'s [u8], Io>, ()> {
+        if page == 0 || page > self.page_count {
+            return Err(Error::PageOutOfRange { page });
+        }
+        if let Some(i) = held.imgs.iter().position(|(p, _)| *p == page) {
+            return Ok(Ok(held
+                .imgs
+                .as_slice()
+                .get(i)
+                .map_or(&[], |(_, b)| b.as_slice())));
+        }
+        if let Some(i) = self.frames.iter().position(|f| f.page == page) {
+            #[cfg(feature = "wal")]
+            {
+                *self.touched = true;
+                *self.wal_fresh = false;
+            }
+            if keep && !held.pages.as_slice().contains(&page) {
+                held.pages.push(page);
+            }
+            return Ok(Ok(match self.frames.get_mut(i) {
+                Some(f) => {
+                    f.clock_ref = true;
+                    f.data.as_slice()
+                }
+                None => &[],
+            }));
+        }
+        for &p in held.pages.as_slice() {
+            if let Some(f) = self.frames.iter().find(|f| f.page == p) {
+                let mut img = AVec::with_capacity(f.data.len());
+                img.extend_from_slice(f.data.as_slice());
+                held.imgs.push((p, img));
+            }
+        }
+        held.pages.clear();
+        if self.frames.iter().any(|f| f.page == 0 || !f.dirty) {
+            return Ok(Err(Io::Read(page)));
+        }
+        if self.frames.iter().any(|f| f.dirty) {
+            return Ok(Err(Io::Spill));
+        }
+        Err(Error::CacheExhausted)
     }
 }
 

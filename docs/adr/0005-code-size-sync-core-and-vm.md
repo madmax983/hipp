@@ -1,10 +1,20 @@
 # ADR 0005 — Code size: a sync core and a bytecode VM
 
 - **Status:** accepted for Stage 1 (Tier A), 2026-11-08, with the
-  measured results below; Stages 2-4 proposed (2026-11-06). Stages 2-4
-  would supersede SPEC §5.7's "tree-walk now" decision and finally
-  implement SPEC §5.1.1's "the state machines are inside" design; Stage
-  1 changes no architecture.
+  measured results below. **Stages 2 and 3 accepted, 2026-11-09.**
+  Stage 4 stays optional and needs its own amendment, as the Decision
+  says. Stages 2-3 supersede SPEC §5.7's "tree-walk now" decision and
+  implement SPEC §5.1.1's "the state machines are inside" design;
+  Stage 1 changed no architecture.
+- **Migration rule (added with the acceptance):** the VM is built
+  behind a hidden `vm` feature that no profile enables, so every
+  intermediate commit leaves the four size ratchets untouched. Under
+  `vm`, a statement whose plan the code generator does not cover yet
+  runs on today's executor, so the whole suite stays green at every
+  step, and a CI job runs it with `vm` on. One final unit per stage
+  turns the VM on in the profiles and deletes the executors it
+  replaces in the same change. That unit must lower every ratchet it
+  touches.
 - **Context:** All four profiles are gated, and `max` is out of room.
   Measured at `8d78815` (thumbv7em, `--profile tiny`, the pinned
   toolchain; full tables in the size-pass working note `baseline.md`,
@@ -199,6 +209,17 @@ below the VM — by making **the instruction the restart unit**:
   An opcode therefore needs at most "pages per op" frames: about the tree
   depth plus siblings, the same bound SQLite has. Running out is today's
   `Error::CacheExhausted`.
+  *Amendment (Stage 2, `vm_core` review fixes, 2026-11-09):* pinning
+  frames made the VM need as many frames as the tree is high, where
+  today's executor reads one page at a time and runs in a one-frame
+  cache (`Config::cache_pages` has no lower bound; `Config::tiny()`
+  has 4 frames). The pages an attempt read are instead recorded in a
+  VM-side set (`pager::Held`), and the miss that ends the attempt
+  copies those frames into it; the next attempt reads the copies, so
+  the driver may evict any frame and an opcode completes with one
+  free frame. Hit-only attempts copy nothing. The copies are dropped
+  when the opcode completes, so they never outlive it (the statement
+  holds the connection mutably, so no write can come between).
 - **In Stages 2–3, B-tree writes are not made sync.** Insert, IdxInsert,
   Delete, IdxDelete, CreateBtree and Destroy run as **driver-awaited
   ops**:
@@ -310,6 +331,93 @@ that needs it, so `tiny` compiles about 25 opcodes and `full` about 95.
 | | WITHOUT ROWID / UTF-16 / expression / partial index behaviour | flags on Open* and codegen; no new opcodes |
 
 † driver-awaited in Stages 2–3; sync under op-undo in Stage 4.
+
+**Amendment (Stage 2, unit `vm_core`, 2026-11-09): expressions run
+through one `Eval` opcode in Stage 2.** Its `p4` indexes a resolved
+expression (`RExpr`) in the program's side table, evaluated by the
+existing sync `query::eval` against the row a cursor holds (or the
+empty row); a `p5` mode evaluates it as a WHERE condition
+(`query::cond`'s jump semantics) or as the WHERE clause's constant
+terms (`query::join_constants_hold`). The table's per-operator
+opcodes (Add … Remainder, Concat, And / Or / Not, Cast, Function)
+are not built in Stage 2. Reasoning: `query::eval` must stay until
+Stage 3 anyway (every write path evaluates through it), so a second
+evaluator spelled as opcodes would only add bytes (and a second
+place for evaluation order, laziness, affinity and collation rules
+to drift), while one `Eval` keeps those rules exactly today's. The
+comparisons and jumps that drive loops are real opcodes (`If`,
+`IfNot`, `IfPos`, `DecrJumpZero`, `IsNull`, `Gt`, `Lt`). Stage 3,
+which deletes the tree-walker once nothing else calls it, revisits
+the per-operator opcodes. Two smaller deviations from the text
+above: `Op` is `{code: u8, p5: u8, p1: u16, p2, p3, p4: u32}`, since
+four `u32` operands and two bytes do not fit 16 bytes (`p1` holds a
+cursor or register number; a program that needs more than 65,535
+falls back); and the `params` bind path needs no `Variable` opcode
+in Stage 2, because the binder substitutes the bound values into the
+statement before it is planned (rule 6: the binder is unchanged), so
+each execution compiles its own plan.
+
+**Amendment (Stage 2, unit `vm_joins`, 2026-11-09): index walks
+and groups as opcodes over today's rules.** The table's IdxGE / GT /
+LE / LT are one `IdxTest` whose side-table entry is the access walk's
+per-entry rule (`xindex::access_walk`: the equality prefix, the range
+under the key column's collation and direction, NULL keys, the rowid
+range and rowid values after the key); it falls through for a found
+entry and jumps to `p2` (the walk is over) or `p3` (skip the entry),
+`p3` being a second label the builder fixes up. Found / NotFound are
+not built: an index walk finds rows by `IdxRowid` and `SeekRowid`. A
+source whose rows today's executor computes as a whole (an index or
+OR path, an automatic index, a RIGHT / FULL source) fills an
+in-memory row list (the `Ephemeral` cursor; `Once` for one built per
+execution) in today's order, and the loops read that. Aggregates are
+AggStep / AggFinal where today's executor folds row by row (count,
+sum, total, avg, min, max) and otherwise GROUP BY groups whose
+aggregates fold through `agg.rs` when each group is finalized (an
+`Eval` in group context), so bare columns, DISTINCT and ORDER BY
+aggregates and collations stay today's. The reasoning is rule 5's:
+one place for each rule, no second copy to drift.
+
+**Amendment (Stage 2, unit `vm_subqueries`, 2026-11-09): subqueries
+as inline code writing result slots; FROM subqueries materialized.**
+A subquery node is code emitted where today's executor computes it
+(the table's BeginSubrtn / Gosub become inline blocks: every use site
+has its own copy, so no return address is needed), running in the
+same program and the same joined row: its sources are further loops
+appended after the slots of the query around it (the planner's
+absolute slots), its rows go to a per-node result slot (`SubStart` /
+`SubRow`, the program's `nsub` slots of `query::SubValue`), and the
+`Eval` that follows substitutes the slots' values
+(`query::substitute`), keeping evaluation order, laziness and
+affinity today's. An uncorrelated node is guarded by `Once`, keyed by
+plan id and result column like today's per-statement cache. A
+statement error inside a node's code is caught by the trap
+`SubStart` pushes and becomes the slot's value (today's
+`SubValue::Fail`), raised only where an expression reads it. FROM
+subqueries, views and CTEs the flattener leaves are filled into a row
+list (MATERIALIZE into an Ephemeral) the first time their loop opens,
+with the joined row saved around the fill (`AccPush` / `AccPop`)
+since a FROM subquery's slots start where its reader's do; the
+coroutine opcodes are not built, because a coroutine would need a
+second joined row. Compounds stream a UNION ALL chain without ORDER
+BY and otherwise combine row lists with today's `run_compound`
+(`Compound`); a recursive CTE is a queue cursor (`QueueOpen` /
+`QueueAdd` / `QueuePop`) over today's `RecQueue`. Everything stays in
+one flat program, so the restart rule needs nothing new: none of the
+added opcodes reads a page.
+
+*Review fixes (2026-11-09):* inline copies made a short statement's
+program grow exponentially when ORDER BY / GROUP BY / HAVING aliases
+nested a result column's subquery (the planner copies it at each
+alias), and code generation ran out of memory before it fell back.
+An uncorrelated node's code is now the table's subroutine after all:
+placed at its first use and called (`Gosub` / `Return`, the return
+address in a register) by every later use over the same joined row;
+a correlated node stays inline, and the generator stops at an
+instruction budget (`MAX_OPS`, 65,536) and falls back. A min() /
+max() whose argument holds a subquery picks the group's bare-column
+row by code (`RepStep` per row), and an enclosing query's aggregate
+inside a subquery is folded into a slot that a placeholder subquery
+node reads (today's `subst_owned_aggs` literal).
 
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
@@ -460,4 +568,6 @@ Reasoning:
   5. **The migration is long.** The `Host` seam keeps every intermediate
      state shippable.
   6. **The memory bound on pinned pages per opcode.** It is the same as
-     SQLite's and errors as today.
+     SQLite's and errors as today. (Amended: the held pages are copies
+     outside the cache, taken only on a miss, about one page per tree
+     level; the cache itself needs one frame.)

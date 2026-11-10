@@ -45,6 +45,9 @@ if [[ "${quick}" == 0 ]]; then
     skip=(-- --skip literal_bits_match_oracle_on_corpus)
   fi
   cargo test --workspace --no-fail-fast "${skip[@]}"
+  # ADR 0005 Stage 2: the hidden `vm` feature (removed by vm_flip).
+  step "tests (workspace, --features vm)"
+  cargo test --workspace --no-fail-fast --features vm "${skip[@]}"
 fi
 
 step "no_std targets"

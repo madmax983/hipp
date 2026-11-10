@@ -5,6 +5,105 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: review fixes of unit `vm_subqueries` (hidden feature `vm`)
+
+- min() / max() over a subquery argument or FILTER (the group's
+  bare columns from its extremum row) and the query's own aggregates
+  inside its subqueries (`SELECT (SELECT sum(t.a) FROM u) FROM t`,
+  `HAVING (SELECT s) > 1`) now run on the VM; they fell back whole.
+- An uncorrelated subquery's code is shared by every use of it
+  (`Gosub` / `Return`) and code generation stops at an instruction
+  budget: nested ORDER BY / GROUP BY / HAVING aliases of a subquery
+  made the program grow exponentially, and a 749-byte statement ran
+  the process out of memory before it fell back.
+- Recorded as intended: on the VM a scalar or EXISTS subquery stops at
+  its first row, as on the pin, where today's executor still tests
+  every candidate row's WHERE (an error there, `random()` draws and
+  `subquery_executions` differ). Every profile's size is unchanged.
+
+### GROUP BY with ORDER BY and LIMIT: the right groups (review fix of unit `vm_joins`, every profile with `query`)
+
+- A grouped query with a LIMIT stopped after the LIMIT's groups in
+  GROUP BY order even when its ORDER BY sorted them again, so it
+  returned the wrong groups: `GROUP BY b ORDER BY b NULLS LAST LIMIT
+  2` kept the NULL group, and `GROUP BY b ORDER BY b DESC LIMIT 2`
+  over an index on `b` kept the two smallest. hipp now stops early
+  only where the pin does: the ORDER BY is the GROUP BY (either
+  direction, the default NULLs placement) and the groups come in its
+  order — sorted, or from an index read the way that delivers it.
+- As on the pin, such an index (or the rowid) is now read backwards
+  for `ORDER BY ... DESC`, so each group's rows come in that order
+  too (`group_concat`), later groups' aggregates are not finalized
+  (no error from them), and EXPLAIN QUERY PLAN shows a `USE TEMP
+  B-TREE FOR ORDER BY` where the index does not deliver the ORDER BY
+  (mixed directions). The VM (hidden feature `vm`) follows the same
+  rule. Sizes: tiny unchanged, full +16 B, max +328 B, xl +760 B.
+
+### The bytecode VM: subqueries, compounds, CTEs (ADR 0005 Stage 2, unit `vm_subqueries`)
+
+- Under the hidden feature `vm`, the VM now runs scalar, IN and
+  EXISTS subqueries (correlated and uncorrelated; in result columns,
+  WHERE, ON, ORDER BY, HAVING, LIMIT / OFFSET, index probes and
+  aggregate arguments), FROM subqueries, views and CTEs the flattener
+  leaves, UNION / UNION ALL / INTERSECT / EXCEPT and VALUES, and
+  recursive CTEs, as inline code in one program: today's evaluation
+  order and laziness, an uncorrelated subquery once per statement, a
+  failing subquery's error raised only where its value is read, and
+  `Connection::subquery_executions` counting as today (except that a
+  scalar or EXISTS subquery stops at its first row, as on the pin; see
+  the review fixes above).
+- On the VM a UNION ALL chain streams its rows (those before a failing
+  row are returned, a LIMIT stops it, OFFSET rows are not computed),
+  as the pin does; today's executor materialises compounds. Still no
+  profile
+  enables `vm`: every profile's size is unchanged.
+
+### The bytecode VM: joins, index access, aggregates (ADR 0005 Stage 2, unit `vm_joins`)
+
+- Under the hidden feature `vm`, the VM now runs SELECTs over any
+  number of rowid tables joined in the planner's order (inner, LEFT,
+  RIGHT, FULL, CROSS, NATURAL / USING, semi-joins), reading each
+  through its access path — sync, restartable index cursors for
+  equality, range and IN lookups, covering, expression and partial
+  indexes, MULTI-INDEX OR, skip-scans, the min() / max() early-out,
+  automatic indexes and Bloom filters — then aggregates (the streamed
+  fold or GROUP BY groups, HAVING), DISTINCT, ORDER BY and LIMIT /
+  OFFSET, with today's executor's rows, order and bare columns.
+- On the VM, a RIGHT / FULL JOIN and a GROUP BY return the rows before
+  a failing one, as the pin does (today's executor returns none), and
+  HAVING terms the pin moves into the WHERE clause are tested per
+  row. Still no profile enables `vm`: every profile's size is
+  unchanged.
+
+### The bytecode VM, behind a hidden feature (ADR 0005 Stage 2, unit `vm_core`)
+
+- A register VM in `src/vm/` (16-byte `p1`-`p5` instructions with a
+  side table, a builder with labels and an `Init` prologue, table and
+  sorter cursors, the dispatch loop) runs SELECTs over one rowid
+  table or none: WHERE, any subquery-free expression (one `Eval`
+  opcode over `query::eval`), ORDER BY, LIMIT / OFFSET, full scans
+  and rowid equality / range access. Its page reads are synchronous
+  and restartable (`PagerCore`: a miss changes nothing; the driver in
+  `Statement::step` reads the page and runs the opcode again), so a
+  dropped step future is safe.
+- Behind the hidden feature `vm`, which no profile enables: every
+  profile's size is unchanged. Under `vm`, every other statement
+  runs on today's executor; `Config::vm_strict` makes a SELECT the
+  VM does not cover an error (`Error::VmFallback`) for tests.
+- On the VM, three no-FROM SELECTs match the pin where today's
+  executor errors: an OFFSET skipping an erroring row, an erroring
+  ORDER BY term (the pin never computes it), and LIMIT 0 (nothing,
+  not even the WHERE or OFFSET, is computed); so does `LIMIT 0 OFFSET
+  <error>` over a table.
+- Review fixes: the VM no longer needs a page-cache frame per B-tree
+  level. A miss copies the pages the opcode had read, so a SELECT on
+  the VM runs at every cache size today's executor runs at (one
+  frame included) instead of failing with `CacheExhausted` on trees
+  taller than the cache, and index keys with overflow chains longer
+  than the cache read too. Asking `Statement::runs_on_vm` before the
+  first step no longer turns `Config::vm_strict` off for that
+  statement.
+
 ### Breaking: feature renames
 
 Cargo features are named for what they enable, not for the milestone

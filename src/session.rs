@@ -114,6 +114,8 @@ mod eqp;
 type Prep<'a, 'f, S> = core::pin::Pin<
     Box<dyn core::future::Future<Output = Result<Statement<'a, S>, <S as Storage>::Error>> + 'f>,
 >;
+#[cfg(feature = "vm")]
+mod drive;
 #[cfg(feature = "foreign_keys")]
 mod fkey;
 #[cfg(feature = "planner")]
@@ -140,6 +142,12 @@ mod trigger;
 mod vtab;
 #[cfg(feature = "expr_index")]
 mod xindex;
+#[cfg(all(feature = "vm", feature = "sql"))]
+pub(crate) use cte::RecQueue;
+#[cfg(all(feature = "vm", feature = "planner"))]
+pub(crate) use join::{BLOOM_BYTES, auto_sort, auto_span, bloom_build, bloom_hash, bloom_may};
+#[cfg(all(feature = "vm", feature = "expr_index"))]
+pub(crate) use xindex::rowid_end;
 
 /// Output-column sentinel for the `rowid` pseudo-column in a scan
 /// plan (also `oid` / `_rowid_` when no real column bears the name).
@@ -281,6 +289,19 @@ pub struct Config {
     /// allows.
     #[cfg(feature = "vtab")]
     pub max_vtab_rows: usize,
+    /// Refuse a SELECT the bytecode VM does not cover yet with
+    /// `Error::VmFallback` instead of running it on today's executor
+    /// (ADR 0005 Stage 2, hidden `vm` feature; a test switch, off by
+    /// default).
+    #[cfg(feature = "vm")]
+    pub vm_strict: bool,
+    /// Run every SELECT on today's executor, as a build without the
+    /// VM does (ADR 0005 Stage 2, hidden `vm` feature; a test switch
+    /// for comparing the VM with the executor it replaces, off by
+    /// default).
+    #[cfg(feature = "vm")]
+    #[doc(hidden)]
+    pub vm_off: bool,
 }
 
 /// `Config::default()`'s virtual-table row bound (v0.16, `vtab`;
@@ -328,6 +349,10 @@ impl Default for Config {
             max_trigger_depth: DEFAULT_TRIGGER_DEPTH,
             #[cfg(feature = "vtab")]
             max_vtab_rows: DEFAULT_VTAB_ROWS,
+            #[cfg(feature = "vm")]
+            vm_strict: false,
+            #[cfg(feature = "vm")]
+            vm_off: false,
         }
     }
 }
@@ -418,6 +443,10 @@ impl Config {
             max_trigger_depth: 8,
             #[cfg(feature = "vtab")]
             max_vtab_rows: 1 << 16,
+            #[cfg(feature = "vm")]
+            vm_strict: false,
+            #[cfg(feature = "vm")]
+            vm_off: false,
         }
     }
 
@@ -539,6 +568,21 @@ impl Config {
     #[cfg(feature = "sql")]
     pub fn vacuum_into(mut self, write: VacuumWriter) -> Config {
         self.vacuum_into = Some(write);
+        self
+    }
+    /// Make a SELECT the VM does not cover an error (ADR 0005
+    /// Stage 2, hidden `vm` feature; see the `vm_strict` field).
+    #[cfg(feature = "vm")]
+    pub fn vm_strict(mut self, on: bool) -> Config {
+        self.vm_strict = on;
+        self
+    }
+    /// Run every SELECT on today's executor (ADR 0005 Stage 2, hidden
+    /// `vm` feature; see the `vm_off` field).
+    #[cfg(feature = "vm")]
+    #[doc(hidden)]
+    pub fn vm_off(mut self, on: bool) -> Config {
+        self.vm_off = on;
         self
     }
 }
@@ -1012,36 +1056,74 @@ type SourcePlan = crate::query::SubSource;
 /// A v0.4 query plan: everything resolved at prepare time.
 #[cfg(feature = "query")]
 #[derive(Debug, Clone)]
-struct QueryPlan {
-    sources: AVec<SourcePlan>,
-    items: AVec<RExpr>,
-    filter: Option<RExpr>,
-    group_by: AVec<RExpr>,
-    having: Option<RExpr>,
-    order_by: AVec<(RExpr, crate::sql::SortOrder)>,
-    distinct: bool,
+pub(crate) struct QueryPlan {
+    pub(crate) sources: AVec<SourcePlan>,
+    pub(crate) items: AVec<RExpr>,
+    pub(crate) filter: Option<RExpr>,
+    pub(crate) group_by: AVec<RExpr>,
+    pub(crate) having: Option<RExpr>,
+    pub(crate) order_by: AVec<(RExpr, crate::sql::SortOrder)>,
+    pub(crate) distinct: bool,
     /// LIMIT / OFFSET (v0.16: resolved expressions; see
     /// `SubPlan::limit`).
-    limit: Option<RExpr>,
-    offset: Option<RExpr>,
-    has_agg: bool,
+    pub(crate) limit: Option<RExpr>,
+    pub(crate) offset: Option<RExpr>,
+    pub(crate) has_agg: bool,
     width: usize,
     /// Compound tail (v0.9; see `SubPlan::compound`). When
     /// non-empty, `order_by` is empty, `comp_order` carries
     /// the compound ORDER BY, and `limit` / `offset` apply to
     /// the combined result. Only filled under `sql`.
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
-    compound: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
+    pub(crate) compound: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)>,
     /// A VALUES core's resolved rows (v0.9; see
     /// `SubPlan::values`).
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
-    values: AVec<AVec<RExpr>>,
+    pub(crate) values: AVec<AVec<RExpr>>,
     /// Compound ORDER BY (v0.9; see `SubPlan::comp_order`).
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     comp_order: AVec<(usize, crate::sql::SortOrder)>,
     /// The pin's select number (v0.16, `explain`; `SubPlan::sel`).
     #[cfg(feature = "explain")]
     sel: u32,
+}
+
+#[cfg(all(feature = "vm", feature = "sql"))]
+impl QueryPlan {
+    /// A subquery's plan as a query plan, for the bytecode VM's code
+    /// generator (ADR 0005 Stage 2, unit `vm_subqueries`): the same
+    /// sources, expressions and compound tails. What only a subquery
+    /// has (its id, correlation, result column, recursion, shared
+    /// materialization) stays with the `SubPlan`.
+    pub(crate) fn of_sub(p: &crate::query::SubPlan) -> QueryPlan {
+        let mut compound = AVec::new();
+        for (op, t) in p.compound.iter() {
+            compound.push((*op, Box::new(QueryPlan::of_sub(t))));
+        }
+        QueryPlan {
+            sources: p.sources.clone(),
+            items: p.items.clone(),
+            filter: p.filter.clone(),
+            group_by: p.group_by.clone(),
+            having: p.having.clone(),
+            order_by: p.order_by.clone(),
+            distinct: p.distinct,
+            limit: p.limit.clone(),
+            offset: p.offset.clone(),
+            has_agg: p.has_agg,
+            width: p.width(),
+            compound,
+            values: p.values.clone(),
+            comp_order: p.comp_order.clone(),
+            #[cfg(feature = "explain")]
+            sel: p.sel,
+        }
+    }
+
+    /// The compound ORDER BY (`SubPlan::comp_order`).
+    pub(crate) fn comp_order(&self) -> &[(usize, crate::sql::SortOrder)] {
+        self.comp_order.as_slice()
+    }
 }
 
 /// One compound member core's ORDER BY matching data (v0.16;
@@ -1815,6 +1897,8 @@ impl<S: Storage> Connection<S> {
             fk_del: None,
             #[cfg(feature = "foreign_keys")]
             fk_skip: [None; 2],
+            #[cfg(feature = "vm")]
+            vm: None,
         })
     }
 
@@ -6564,6 +6648,12 @@ pub struct Statement<'c, S: Storage> {
     /// pin's `isSetNullAction`; see `fkey::Sim`), loaded with `fk`.
     #[cfg(feature = "foreign_keys")]
     fk_skip: fkey::Skip,
+    /// The SELECT's program and its execution state (ADR 0005
+    /// Stage 2, hidden `vm` feature): compiled at the first step of
+    /// an execution (`vm_step`); `None` until then and for every
+    /// other statement.
+    #[cfg(feature = "vm")]
+    vm: Option<Box<crate::vm::exec::Vm>>,
 }
 
 /// One INSERT's view of an AUTOINCREMENT table's `sqlite_sequence`
@@ -7346,6 +7436,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             fk_del: None,
             #[cfg(feature = "foreign_keys")]
             fk_skip: [None; 2],
+            #[cfg(feature = "vm")]
+            vm: None,
         }
     }
 }
@@ -7748,6 +7840,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.plan = self.conn.plan(&self.arena, &self.ast)?;
         self.binds.stale = false;
         self.row_ckpt = self.arena.checkpoint();
+        // The new plan gets its own program.
+        #[cfg(feature = "vm")]
+        {
+            self.vm = None;
+        }
         Ok(())
     }
 
@@ -7891,6 +7988,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         }
         #[cfg(feature = "sql")]
         self.end_stream();
+        #[cfg(feature = "vm")]
+        {
+            self.vm = None;
+        }
         #[cfg(feature = "sql")]
         self.hoist.clear();
         #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
@@ -11772,6 +11873,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 
     async fn step_scan(&mut self) -> Result<Step, S::Error> {
+        // The bytecode VM (ADR 0005 Stage 2).
+        #[cfg(feature = "vm")]
+        if let Some(r) = Box::pin(self.vm_step()).await {
+            return r;
+        }
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
@@ -11901,6 +12007,12 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "query")]
     async fn step_query(&mut self) -> Result<Step, S::Error> {
+        // The bytecode VM (ADR 0005 Stage 2): a program's `Host`
+        // hands the step back here.
+        #[cfg(feature = "vm")]
+        if let Some(r) = Box::pin(self.vm_step()).await {
+            return r;
+        }
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
@@ -11993,6 +12105,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 group_cap(
                     qp.group_by.as_slice(),
                     qp.order_by.as_slice(),
+                    qp.sources.as_slice(),
                     qp.distinct,
                     window,
                 ),
@@ -12385,6 +12498,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 group_cap(
                     qp.group_by.as_slice(),
                     qp.order_by.as_slice(),
+                    qp.sources.as_slice(),
                     qp.distinct,
                     window,
                 ),
@@ -12947,6 +13061,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             group_cap(
                 plan.group_by.as_slice(),
                 plan.order_by.as_slice(),
+                plan.sources.as_slice(),
                 plan.distinct,
                 streamed,
             )
@@ -14388,7 +14503,10 @@ fn resolve_compound_order<E>(
 /// rows are a UNION ALL chain of one-row cores, and the first
 /// row with a collation lends it.
 #[cfg(feature = "query")]
-fn core_colls(items: &[RExpr], values: &[AVec<RExpr>]) -> AVec<Option<crate::record::Coll>> {
+pub(crate) fn core_colls(
+    items: &[RExpr],
+    values: &[AVec<RExpr>],
+) -> AVec<Option<crate::record::Coll>> {
     use crate::query::{expr_coll, is_constant, item_result_affinity};
     let mut out = AVec::new();
     let Some(first) = values.first() else {
@@ -14416,7 +14534,7 @@ fn core_colls(items: &[RExpr], values: &[AVec<RExpr>]) -> AVec<Option<crate::rec
 /// `multiSelectCollSeq`): the leftmost core whose item `i` has
 /// one decides; BINARY when none does.
 #[cfg(feature = "sql")]
-fn compound_col_coll<'x>(
+pub(crate) fn compound_col_coll<'x>(
     cores: impl Iterator<Item = &'x AVec<Option<crate::record::Coll>>>,
     i: usize,
 ) -> crate::record::Coll {
@@ -14462,7 +14580,7 @@ fn dedup_compound_rows(
 /// Compare two compound rows ascending by every column under
 /// the merge key's collations (v0.16).
 #[cfg(feature = "sql")]
-fn compound_key_cmp(
+pub(crate) fn compound_key_cmp(
     a: &[OwnedValue],
     b: &[OwnedValue],
     colls: &[crate::record::Coll],
@@ -14581,7 +14699,7 @@ fn merge_compound(
 /// without it and sort the result afterwards; the final stable
 /// sort by `order` below covers both shapes.
 #[cfg(feature = "sql")]
-fn run_compound(
+pub(crate) fn run_compound(
     head: AVec<AVec<OwnedValue>>,
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
     cores: &[AVec<Option<crate::record::Coll>>],
@@ -14700,7 +14818,7 @@ fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
 /// bound limits and a subquery's own `LIMIT X` (rewritten to
 /// `X <> 0`) keep the sorted answer.
 #[cfg(feature = "sql")]
-fn union_first_row(
+pub(crate) fn union_first_row(
     limit: &Option<RExpr>,
     offset: &Option<RExpr>,
     order: &[(usize, crate::sql::SortOrder)],
@@ -14717,7 +14835,7 @@ fn union_first_row(
 /// The first row of the first core that has one (see
 /// `union_first_row`).
 #[cfg(feature = "sql")]
-fn first_core_row(
+pub(crate) fn first_core_row(
     head: AVec<AVec<OwnedValue>>,
     tails: &[(crate::sql::CompoundOp, AVec<AVec<OwnedValue>>)],
 ) -> AVec<AVec<OwnedValue>> {
@@ -14780,7 +14898,7 @@ fn compound_order_cmp(
 /// group column and a query without GROUP BY skipped errors the
 /// pin raises.
 #[cfg(feature = "query")]
-fn having_early<'x>(h: &'x RExpr, group_by: &[RExpr], out: &mut AVec<&'x RExpr>) {
+pub(crate) fn having_early<'x>(h: &'x RExpr, group_by: &[RExpr], out: &mut AVec<&'x RExpr>) {
     if group_by.is_empty() || always_false(h) {
         return;
     }
@@ -14926,7 +15044,7 @@ fn group_match(a: &RExpr, b: &RExpr) -> bool {
 /// one that errors (`sum()` overflow, the percentile checks) fails
 /// the statement even for a group HAVING drops.
 #[cfg(feature = "query")]
-fn group_aggs<'x>(
+pub(crate) fn group_aggs<'x>(
     items: &'x [RExpr],
     order_by: &'x [(RExpr, crate::sql::SortOrder)],
 ) -> AVec<&'x RExpr> {
@@ -14940,9 +15058,49 @@ fn group_aggs<'x>(
     aggs
 }
 
+/// Whether a grouped query's ORDER BY is its GROUP BY (the pin's
+/// `orderByGrp`, v0.17 review fix): each term the GROUP BY term in
+/// its position, compared as `sqlite3ExprListCompare` does
+/// (COLLATE included), with the default NULLs placement (the pin's
+/// BIGNULL flag makes the lists differ). Either direction: the
+/// pin copies the ORDER BY's into the GROUP BY.
+#[cfg(feature = "query")]
+pub(crate) fn ob_grp(group_by: &[RExpr], order_by: &[(RExpr, crate::sql::SortOrder)]) -> bool {
+    !order_by.is_empty()
+        && order_by.len() == group_by.len()
+        && order_by
+            .iter()
+            .zip(group_by.iter())
+            .all(|((o, so), g)| so.nulls_first != so.desc && crate::query::same_expr(o, g))
+}
+
+/// Whether a grouped query emits its groups in its ORDER BY order
+/// (v0.17 review fix, ungated): no ORDER BY, or the GROUP BY's
+/// (`ob_grp`) when the groups are sorted (in the ORDER BY's
+/// directions) or come from an index walked in that order
+/// (`IdxAccess::sorted`, the pin's `sqlite3WhereIsSorted`). The pin
+/// then skips its ORDER BY sorter.
+#[cfg(feature = "query")]
+pub(crate) fn groups_sorted(
+    group_by: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    sources: &[SourcePlan],
+) -> bool {
+    #[cfg(feature = "expr_index")]
+    let delivered = group_access(sources).is_none_or(|a| a.sorted >= order_by.len());
+    #[cfg(not(feature = "expr_index"))]
+    let delivered = {
+        let _ = sources;
+        true
+    };
+    order_by.is_empty() || (ob_grp(group_by, order_by) && delivered)
+}
+
 /// How many groups a grouped query needs before it can stop
-/// (v0.16, ungated): with a LIMIT and output in group order (no
-/// ORDER BY, or one naming exactly the GROUP BY terms), and no
+/// (v0.16, ungated): with a LIMIT, the groups emitted in ORDER BY
+/// order (`groups_sorted`; v0.17 review fix: an ORDER BY in another
+/// NULLs placement, or one an index walk does not deliver, sorts
+/// the groups again, so capping them kept the wrong ones), and no
 /// DISTINCT, the pin emits groups as it finalizes them and stops
 /// at OFFSET + LIMIT — later groups are never finalized, so their
 /// aggregates cannot error. None: every group is needed.
@@ -14950,19 +15108,14 @@ fn group_aggs<'x>(
 fn group_cap(
     group_by: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
+    sources: &[SourcePlan],
     distinct: bool,
     (skip, take): (usize, usize),
 ) -> Option<usize> {
     if group_by.is_empty() || distinct || take == usize::MAX {
         return None;
     }
-    let in_group_order = order_by.is_empty()
-        || (order_by.len() == group_by.len()
-            && order_by
-                .iter()
-                .zip(group_by.iter())
-                .all(|((o, _), g)| crate::query::same_expr(o, g)));
-    in_group_order.then(|| skip.saturating_add(take))
+    groups_sorted(group_by, order_by, sources).then(|| skip.saturating_add(take))
 }
 
 /// How many rows a query needs from its FROM clause when that
@@ -14998,7 +15151,7 @@ fn need_bounds(p: &crate::query::SubPlan) -> bool {
 /// LIMIT, so an endless recursive CTE read through a WHERE or a
 /// join answers (v0.16 review fix, `sql`).
 #[cfg(feature = "sql")]
-fn streams_first(sources: &[SourcePlan], plain: bool) -> bool {
+pub(crate) fn streams_first(sources: &[SourcePlan], plain: bool) -> bool {
     plain
         && !sources.iter().any(|s| {
             matches!(
@@ -15065,7 +15218,10 @@ fn order_ref(
 /// as a result column (`same_expr`; an alias or ordinal resolves to
 /// a copy of the column's) — the last such column.
 #[cfg(feature = "query")]
-fn order_cols(order: &[(RExpr, crate::sql::SortOrder)], items: &[RExpr]) -> AVec<Option<usize>> {
+pub(crate) fn order_cols(
+    order: &[(RExpr, crate::sql::SortOrder)],
+    items: &[RExpr],
+) -> AVec<Option<usize>> {
     let mut out = AVec::new();
     for (e, _) in order.iter() {
         let mut e = e;
@@ -15102,7 +15258,7 @@ fn shown_keys(keys: &mut [OwnedValue], cols: &[Option<usize>], vals: &[OwnedValu
 /// when there are as many keys as GROUP BY terms — whatever the
 /// outer ORDER BY says.
 #[cfg(feature = "query")]
-fn group_desc(
+pub(crate) fn group_desc(
     group_by: &[RExpr],
     items: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
@@ -15127,7 +15283,7 @@ fn group_desc(
 /// collation, descending where `gdesc` says (v0.17 size pass: the
 /// one comparator every grouping path shares).
 #[cfg(feature = "query")]
-fn sort_groups(
+pub(crate) fn sort_groups(
     groups: &mut [(AVec<OwnedValue>, AVec<RowData>)],
     gcolls: &[crate::record::Coll],
     gdesc: &[bool],
@@ -15150,28 +15306,31 @@ fn sort_groups(
     });
 }
 
-/// Whether a query's rows arrive in its GROUP BY order (v0.16,
-/// `expr_index`): its one source's index delivers it, and the pin
-/// then emits the groups as they arrive, skipping its group sorter.
-#[cfg(feature = "query")]
-fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
-    #[cfg(feature = "expr_index")]
-    if let [s] = sources
-        && s.access.as_ref().is_some_and(|a| a.groups)
-    {
-        return true;
-    }
-    // A join the pin's planner ordered: its first loop delivers the
-    // GROUP BY for the whole join (v0.17 review fix, `planner`).
+/// The access path of a query whose rows arrive in its GROUP BY
+/// order (v0.16, `expr_index`): its one source's index delivers it
+/// (or, `planner`, a join's first loop does: v0.17 review fix), and
+/// the pin then emits the groups as they arrive, skipping its group
+/// sorter.
+#[cfg(feature = "expr_index")]
+pub(crate) fn group_access(sources: &[SourcePlan]) -> Option<&crate::xplan::IdxAccess> {
+    #[cfg(not(feature = "planner"))]
+    let [s] = sources else { return None };
     #[cfg(feature = "planner")]
-    if let Some(s) = sources.first()
-        && sources.len() > 1
-        && s.access.as_ref().is_some_and(|a| a.groups)
+    let s = sources.first()?;
+    s.access.as_deref().filter(|a| a.groups)
+}
+
+/// Whether a query's rows arrive in its GROUP BY order
+/// (`group_access`).
+#[cfg(feature = "query")]
+pub(crate) fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
+    #[cfg(feature = "expr_index")]
+    return group_access(sources).is_some();
+    #[cfg(not(feature = "expr_index"))]
     {
-        return true;
+        let _ = sources;
+        false
     }
-    let _ = sources;
-    false
 }
 
 /// DISTINCT over produced rows (v0.4): first occurrences
@@ -15736,7 +15895,7 @@ fn win_results<E>(
 /// group's first row. (v0.4 – v0.15 honoured only a lone
 /// min/max aggregate.)
 #[cfg(feature = "query")]
-fn rep_minmax<'x>(
+pub(crate) fn rep_minmax<'x>(
     items: &'x [RExpr],
     having: Option<&'x RExpr>,
     order_by: &'x [(RExpr, crate::sql::SortOrder)],
@@ -15771,10 +15930,10 @@ fn rep_minmax<'x>(
 /// loads the bare columns (none passing: the group's first row).
 #[cfg(feature = "query")]
 #[derive(Clone, Copy)]
-struct MinMaxRep<'x> {
-    kind: crate::query::AggKind,
-    arg: &'x RExpr,
-    filter: Option<&'x RExpr>,
+pub(crate) struct MinMaxRep<'x> {
+    pub(crate) kind: crate::query::AggKind,
+    pub(crate) arg: &'x RExpr,
+    pub(crate) filter: Option<&'x RExpr>,
 }
 
 #[cfg(feature = "sql")]
@@ -15791,7 +15950,7 @@ impl MinMaxRep<'_> {
 /// it is the first or strictly beyond the best so far under the
 /// argument's collation (ties keep the earlier row).
 #[cfg(feature = "query")]
-fn extremum_step(
+pub(crate) fn extremum_step(
     kind: crate::query::AggKind,
     coll: crate::record::Coll,
     best: &mut Option<OwnedValue>,
@@ -15822,7 +15981,7 @@ fn extremum_step(
 /// rule): the first row, or the extremum row of the min/max
 /// aggregate `rep_minmax` picks (see `extremum_step`).
 #[cfg(feature = "query")]
-fn pick_rep_from<E>(
+pub(crate) fn pick_rep_from<E>(
     env: &crate::query::Env,
     items: &[RExpr],
     having: Option<&RExpr>,

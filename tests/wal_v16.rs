@@ -103,9 +103,23 @@ fn parity() -> Config {
 
 fn hipp_run_cfg(path: &Path, script: &str, close: bool, cfg: Config) -> (Run, Vec<Error<FsError>>) {
     block_on(async {
-        let mut db = Connection::open(FileStorage::open(path).expect("fs"), cfg)
-            .await
-            .expect("open");
+        // hipp's WAL claim is an `flock` on the file's open file
+        // description. While another test in this process spawns the
+        // pin, the child holds a copy of every descriptor until its
+        // `exec` (`O_CLOEXEC` only closes them there), so a database
+        // this test just closed can still look held for a moment and
+        // the reopen sees `DatabaseBusy`. Retry briefly; the tests
+        // that expect `DatabaseBusy` open the database directly.
+        let mut tries = 0;
+        let mut db = loop {
+            match Connection::open(FileStorage::open(path).expect("fs"), cfg.clone()).await {
+                Err(Error::DatabaseBusy) if tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                r => break r.expect("open"),
+            }
+        };
         let mut lines = Vec::new();
         let mut errs = Vec::new();
         for s in steps(script) {

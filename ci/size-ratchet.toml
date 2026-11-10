@@ -26,7 +26,12 @@ justify_over = 4096
 # int_pow10_to_f64 (-7.6% instructions on bolt_workload); gated on
 # `query`, so the tiny profile is unchanged.
 # +776 B (Bolt): table-leaf insert fast path in btree_insert.
-ratchet = 477468
+# 476,476 -> 476,492 (v0.17 vm_joins review fix, ungated correctness:
+# GROUP BY + ORDER BY + LIMIT kept the wrong groups; `group_cap` now
+# asks `groups_sorted`, the pin's `orderByGrp` rule). STATUS.md.
+# Merged with main (Bolt, PRs #21/#22): measured 477,484, the sum
+# of both raises.
+ratchet = 477484
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -42,7 +47,12 @@ justify_over = 16384
 # order. A pure mechanical rename of 3bc670b measures the same.
 # 962,300 -> 962,484 (Bolt): +184 B, the int_pow10_to_f64 fast path.
 # +752 B (Bolt): table-leaf insert fast path in btree_insert.
-ratchet = 963236
+# 962,300 -> 962,628 (v0.17 vm_joins review fix, same fix: the access
+# planner's `WHERE_SORTBYGROUP` re-check reads an index delivering the
+# groups in the ORDER BY's direction). STATUS.md.
+# Merged with main (Bolt, PRs #21/#22): measured 963,572, the sum of
+# both raises +8 B of alignment padding.
+ratchet = 963572
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -55,7 +65,11 @@ justify_over = 32768
 # alignment padding only, as for `max` above.
 # 1,058,824 -> 1,059,016 (Bolt): +192 B, the int_pow10_to_f64 fast path.
 # +744 B (Bolt): table-leaf insert fast path in btree_insert.
-ratchet = 1059760
+# 1,058,824 -> 1,059,584 (v0.17 vm_joins review fix, same fix: also
+# the join planner's re-check of the first loop). STATUS.md.
+# Merged with main (Bolt, PRs #21/#22): measured 1,060,496, the sum
+# of both raises -24 B of alignment padding.
+ratchet = 1060496
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

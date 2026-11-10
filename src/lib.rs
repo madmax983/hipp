@@ -49,6 +49,8 @@ pub mod storage;
 pub mod systime;
 #[cfg(feature = "utf16")]
 pub mod utf16;
+#[cfg(feature = "vm")]
+pub(crate) mod vm;
 #[cfg(feature = "vtab")]
 pub mod vtab;
 #[cfg(feature = "wal")]

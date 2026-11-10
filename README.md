@@ -31,10 +31,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,124 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 476,476 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 962,300 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,058,824 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 477,484 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 963,572 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,060,496 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -219,6 +219,35 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   byte-identical sections. The new names alone (they enter the
   crate's metadata hash and so rustc's item order) move max by +8 B
   and xl by +16 B of alignment padding (STATUS.md has the table).
+- **The bytecode VM, first unit** (hidden feature `vm`, ADR 0005
+  Stage 2). A register VM (`src/vm/`) with synchronous, restartable
+  page reads runs SELECTs over one rowid table or none — WHERE, any
+  subquery-free expression, ORDER BY, LIMIT / OFFSET, full scans and
+  rowid lookups and ranges — and hands every other statement to
+  today's executor. No profile enables `vm` yet, so no profile's size
+  changes; the stage's later units cover the rest of SELECT, and its
+  last one turns the VM on and deletes the executors it replaces.
+- **The bytecode VM, second unit** (hidden feature `vm`). Joins of
+  any kind in the planner's order, every index access path (sync,
+  restartable index cursors), aggregates, GROUP BY / HAVING and
+  DISTINCT now run on the VM too; subqueries, compounds, CTEs / views,
+  windows and virtual sources still hand off to today's executor.
+- **GROUP BY with ORDER BY and LIMIT** (fix, every profile with
+  `query`). A grouped query stops after its LIMIT's groups only when
+  they come in the ORDER BY's order, as the pin does; an index (or the
+  rowid) delivering the groups is read backwards for `ORDER BY ...
+  DESC`. hipp used to return the wrong groups for `ORDER BY b NULLS
+  LAST LIMIT n` and for `ORDER BY b DESC LIMIT n` over an index.
+- **The bytecode VM, third unit** (hidden feature `vm`). Scalar, IN
+  and EXISTS subqueries (correlated or not, anywhere in a SELECT, in
+  aggregate arguments too), FROM subqueries, views and CTEs, compounds
+  and VALUES, and recursive CTEs run on the VM, with today's laziness
+  and once-per-statement caching (a scalar or EXISTS subquery stops at
+  its first row, as on the pin); windows, virtual and table-valued
+  sources and `sqlite_schema` still hand off. Its review fixes add
+  min() / max() over a subquery and an enclosing query's aggregates
+  inside subqueries, and share an uncorrelated subquery's code so
+  nested aliases no longer blow up code generation.
 
 ## What v0.16 does
 
