@@ -571,19 +571,22 @@ fn parameters_compile_per_execution() {
 
 // ---------------- fallback ----------------
 
-/// Shapes no unit claims yet: strict mode refuses them
-/// (`VmFallback`), and without it they run on today's executor with
-/// the pin's rows. (Joins, aggregates, DISTINCT, index access and
-/// rowid IN lists moved to `tests/vm_joins_v17.rs` with unit
-/// `vm_joins`, as did an EXISTS term the planner makes a semi-join;
-/// subqueries, compounds, VALUES, FROM subqueries and recursive CTEs to
-/// `tests/vm_subqueries_v17.rs` with unit `vm_subqueries`.)
+/// The shapes that still fall back after unit `vm_rest`: each only to
+/// reproduce today's executor's refusal of it. Strict mode refuses
+/// them (`VmFallback`); without it they run on today's executor and
+/// fail as it does. (Every other shape moved to the suites of the
+/// units that claimed it: `tests/vm_joins_v17.rs`,
+/// `tests/vm_subqueries_v17.rs`, `tests/vm_rest_v17.rs`.)
 const UNCLAIMED: &[&str] = &[
-    "SELECT a, row_number() OVER (ORDER BY a) FROM t;",
-    "SELECT name FROM sqlite_schema;",
-    "SELECT * FROM wr;",
-    "SELECT key FROM json_each('[1,2]');",
-    "SELECT value FROM generate_series(1, 3);",
+    // An enclosing query's aggregate over a subquery argument: today's
+    // `Unsupported` (the pin answers).
+    "SELECT a, (SELECT group_concat((SELECT k FROM u WHERE t.a > 0 LIMIT 1)) FROM t AS t2) FROM t;",
+    // An enclosing query's aggregate inside an inner aggregate: the
+    // pin's misuse error, refused by today's executor.
+    "SELECT (SELECT sum((SELECT max(t.a))) FROM u) FROM t;",
+    // A nested query's index bound reading an enclosing query's
+    // aggregate (an index on u.k): today's `MisusedAggregate`.
+    "SELECT (SELECT count(*) FROM u WHERE u.k <= count(t.a)) FROM t;",
 ];
 
 const U: &str = "CREATE TABLE u(k, v); INSERT INTO u VALUES (1, 'p'), (2, 'q'), (3, 'r'); \
@@ -628,23 +631,29 @@ fn unclaimed_shapes_fall_back_whole() {
             matches!(first, Some(Error::VmFallback)),
             "{q}: hook first: {first:?}"
         );
-        // Default: today's executor, the pin's rows.
-        let h = copy_of(&base, &format!("vm17-uc{i}-h"));
-        let o = copy_of(&base, &format!("vm17-uc{i}-o"));
-        let (hl, on_vm) = block_on(async {
-            let fs = FileStorage::open(&h).expect("fs open");
-            let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            let mut q2 = db.prepare(q).await.expect("prepare");
-            let mut rows = Vec::new();
-            while q2.step().await.expect("step") == Step::Row {
-                rows.push(render(&q2));
-            }
-            (rows, q2.runs_on_vm())
-        });
-        assert!(!on_vm, "unclaimed but on the VM: {q}");
-        let (ook, ol) = oracle_script(&o, q);
-        assert!(ook, "pin failed: {q}");
-        assert_eq!(hl, ol, "{q}");
+        // Default: today's executor and its refusal, whatever the
+        // VM's build (`vm_off` is today's executor alone).
+        let run = |cfg: Config, tag: &str| {
+            let h = copy_of(&base, &format!("vm17-uc{i}-{tag}"));
+            block_on(async {
+                let fs = FileStorage::open(&h).expect("fs open");
+                let mut db = Connection::open(fs, cfg).await.expect("open");
+                let mut q2 = db.prepare(q).await.expect("prepare");
+                let mut rows = Vec::new();
+                loop {
+                    match q2.step().await {
+                        Ok(Step::Row) => rows.push(render(&q2)),
+                        Ok(Step::Done) => return (rows, None, q2.runs_on_vm()),
+                        Err(e) => return (rows, Some(format!("{e:?}")), q2.runs_on_vm()),
+                    }
+                }
+            })
+        };
+        let (hl, he, on_vm) = run(Config::default().vm_strict(false), "h");
+        assert!(!on_vm, "on the VM: {q}");
+        let (tl, te, _) = run(Config::default().vm_off(true), "t");
+        assert_eq!((hl, he.clone()), (tl, te), "{q}");
+        assert!(he.is_some(), "today's executor answers: {q}");
     }
 }
 

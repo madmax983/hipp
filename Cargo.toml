@@ -9,6 +9,12 @@ edition = "2024"
 license = "Apache-2.0"
 description = "A little no_std database that reads and writes SQLite database files (pinned claim version: SQLite 3.54.1 file format)"
 
+[lints.rust]
+# `--cfg hipp_vm_strict` (RUSTFLAGS): `Config::vm_strict` on by
+# default, so a whole test suite runs every SELECT strict on the VM
+# (ADR 0005 Stage 2, hidden `vm` feature).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hipp_vm_strict)'] }
+
 [features]
 default = ["std", "xl"]
 # Past `max` (ADR 0004): `max` plus the leaves that no longer fit

@@ -261,7 +261,7 @@ impl WinCall {
 
 /// Call `f` on every direct child of `e` that evaluates against the
 /// same row (subquery plans are other cores and are not entered).
-fn each_child<'x>(e: &'x RExpr, f: &mut dyn FnMut(&'x RExpr)) {
+pub(crate) fn each_child<'x>(e: &'x RExpr, f: &mut dyn FnMut(&'x RExpr)) {
     match e {
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)

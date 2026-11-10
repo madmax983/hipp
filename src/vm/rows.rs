@@ -356,6 +356,20 @@ impl Groups {
         Ok(true)
     }
 
+    /// Make group `i` current again with its bare-column row `rep` (a
+    /// window unit's group, `WinNext`).
+    #[cfg(feature = "window")]
+    pub(crate) fn seek(&mut self, i: usize, rep: RowData) {
+        self.cur = i;
+        self.rep = rep;
+    }
+
+    /// The current group's index.
+    #[cfg(feature = "window")]
+    pub(crate) fn current(&self) -> usize {
+        self.cur
+    }
+
     /// The current group's rows.
     pub(crate) fn rows(&self) -> &[RowData] {
         self.groups
@@ -455,8 +469,9 @@ impl AggRun {
         run
     }
 
-    /// Fold the joined row `row` (`stream::agg_step`).
-    pub(crate) fn step(&mut self, row: &RowData, env: &Env) -> Result<(), Error<()>> {
+    /// Fold the joined row `row` (`stream::agg_step`); whether it kept
+    /// the row (as the bare columns' row).
+    pub(crate) fn step(&mut self, row: &RowData, env: &Env) -> Result<bool, Error<()>> {
         let enc = env.text_enc();
         let ctx = Ctx::of(row).with(env);
         for (a, st) in self.aggs.iter().zip(self.accs.as_mut_slice().iter_mut()) {
@@ -505,8 +520,10 @@ impl AggRun {
                 }
             }
         }
+        let mut kept = false;
         if self.first.is_none() {
             self.first = Some(row.clone());
+            kept = true;
         }
         if let Some((kind, arg, filter, coll)) = &self.mm {
             let pass = match filter {
@@ -517,10 +534,11 @@ impl AggRun {
                 let v = crate::query::eval::<()>(arg, &ctx)?;
                 if crate::session::extremum_step(*kind, *coll, &mut self.best, v, enc) {
                     self.rep = Some(row.clone());
+                    kept = true;
                 }
             }
         }
-        Ok(())
+        Ok(kept)
     }
 
     /// The result columns (`stream::stream_finish`'s fold).

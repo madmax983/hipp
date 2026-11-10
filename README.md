@@ -248,6 +248,16 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   min() / max() over a subquery and an enclosing query's aggregates
   inside subqueries, and share an uncorrelated subquery's code so
   nested aliases no longer blow up code generation.
+- **The bytecode VM, fourth unit** (hidden feature `vm`). Every SELECT
+  now runs on the VM: window functions, virtual and table-valued
+  sources (generate_series, dbstat, rtree, fts5, fts5vocab,
+  json_each / json_tree, `pragma_*`), `sqlite_schema`, WITHOUT ROWID,
+  TEMP and attached tables, and the SELECTs of trigger and
+  foreign-key action programs — the source readers as driver-awaited
+  instructions over today's async code — except one shape today's
+  executor refuses. Plain `EXPLAIN` lists hipp's own program in the
+  pin's columns under `vm` (still refused without it). No profile
+  enables `vm`; the stage's last unit turns it on.
 
 ## What v0.16 does
 
@@ -1146,7 +1156,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   co-routines, VIRTUAL TABLE INDEX, VALUES and constant rows, and the
   UPDATE / DELETE / INSERT plans — and the CLI prints the shell's
   tree. The statement is planned, never run; plain EXPLAIN (bytecode)
-  is refused. Where hipp's strategy differs (no flattening, join
+  is refused (v0.17: under the hidden `vm` feature it lists hipp's own
+  program in the pin's columns). Where hipp's strategy differs (no flattening, join
   reordering and automatic indexes before v0.17's `planner`,
   MULTI-INDEX OR, min/max lookup) it
   prints what it runs (STATUS.md). Comparing plans fixed access-path
@@ -1478,8 +1489,10 @@ indexes, joins, subqueries, UPDATE / DELETE or views.
 
 Not planned in any profile: multi-process locking or a shared `-shm`
 wal-index (WAL is single-process; one connection per database); a
-shared page cache (a file is attached once); plain EXPLAIN's
-bytecode listing (hipp has no VDBE); loadable
+shared page cache (a file is attached once); the pin's own bytecode
+listing (plain EXPLAIN lists hipp's program, in the pin's columns, under
+the hidden `vm` feature until ADR 0005's last Stage 2 unit turns the VM
+on; its content is hipp's, not the pin's); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.

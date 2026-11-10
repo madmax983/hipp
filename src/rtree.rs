@@ -1543,6 +1543,7 @@ fn passes(g: &Geom, cons: &[Constraint], d: &[u8], off: usize, leaf: bool) -> bo
 /// A search in progress (`rtreeStepToLeaf` with no MATCH: every
 /// score is 0, so the pin's priority queue walks depth first, in
 /// cell order).
+#[cfg_attr(feature = "vm", derive(Clone))]
 pub struct Search {
     cons: AVec<Constraint>,
     /// (node image, level: 1 for a leaf, next cell, node number).

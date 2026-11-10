@@ -82,6 +82,13 @@ pub(crate) enum Cursor {
     /// A recursive CTE's queue (unit `vm_subqueries`).
     #[cfg(feature = "sql")]
     Queue(alloc::boxed::Box<super::rows::Queue>),
+    /// A source the driver reads (unit `vm_rest`: a virtual table's
+    /// cursor, a WITHOUT ROWID table's scan).
+    #[cfg(feature = "sql")]
+    Host(alloc::boxed::Box<super::rest::HostCur>),
+    /// A query's window units (unit `vm_rest`).
+    #[cfg(feature = "window")]
+    Win(alloc::boxed::Box<super::rest::WinSet>),
 }
 
 /// One interior page on a table cursor's path: its children (the

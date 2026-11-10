@@ -483,6 +483,7 @@ fn stored_record<E>(enc: crate::record::TextEnc, rec: &[u8]) -> Result<Option<AV
     }
 }
 
+#[cfg_attr(feature = "vm", derive(Clone))]
 enum ScanFrame {
     Unresolved { page: u32 },
     Interior { page: u32, next_child: usize },
@@ -492,6 +493,7 @@ enum ScanFrame {
 /// A full-scan cursor over a table B-tree (SPEC §5.4). State lives
 /// in the cursor (hence in its owning `Statement`), never in a
 /// future, so it spans suspensions intact (§5.1.2).
+#[cfg_attr(feature = "vm", derive(Clone))]
 pub struct ScanCursor {
     stack: AVec<ScanFrame>,
     done: bool,
@@ -4038,6 +4040,7 @@ pub(crate) fn cmp_entry_probe(
 /// decoded on first use, so a seek decodes only the cells its
 /// binary search visits and a scan decodes only what it yields.
 #[cfg(feature = "indexes")]
+#[cfg_attr(feature = "vm", derive(Clone))]
 struct LazyPage {
     snap: AVec<u8>,
     page: u32,
@@ -4153,6 +4156,7 @@ impl LazyPage {
 }
 
 #[cfg(feature = "indexes")]
+#[cfg_attr(feature = "vm", derive(Clone))]
 enum IdxFrame {
     Unresolved {
         page: u32,
@@ -4174,6 +4178,7 @@ enum IdxFrame {
 /// real entries and are yielded between their subtrees). State
 /// lives in the cursor, never in a future (§5.1.2).
 #[cfg(feature = "indexes")]
+#[cfg_attr(feature = "vm", derive(Clone))]
 pub struct IndexCursor {
     stack: AVec<IdxFrame>,
     nfields: usize,

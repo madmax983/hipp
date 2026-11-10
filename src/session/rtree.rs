@@ -45,6 +45,7 @@ pub(super) struct RtWrite {
 }
 
 /// The roots of an R*Tree's shadow tables and its geometry.
+#[cfg_attr(feature = "vm", derive(Clone))]
 struct Shadow {
     node: u32,
     parent: u32,
@@ -56,6 +57,7 @@ struct Shadow {
 /// An open R*Tree cursor (v0.17; `Statement::rtree_open`): the
 /// table's shadow tables and either its search in progress (and the
 /// node image it asked for) or the one cell a rowid lookup found.
+#[cfg_attr(feature = "vm", derive(Clone))]
 pub(super) struct RtCursor {
     sh: Shadow,
     search: Option<Search>,

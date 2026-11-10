@@ -55,12 +55,6 @@ pub(crate) struct Builder {
     /// list holding the row its queue last gave up.
     #[cfg(feature = "sql")]
     pub(crate) recs: AVec<(u32, u32)>,
-    /// How deeply the subquery plans being generated nest (`sub::
-    /// subplan`): code generation recurses with them, so a deeper
-    /// statement runs on today's executor, whose depth limits bound
-    /// its stack.
-    #[cfg(feature = "sql")]
-    pub(crate) depth: u32,
 }
 
 /// One uncorrelated subquery node of a program (`Builder::hoisted`):
@@ -119,8 +113,6 @@ impl Builder {
             mats: AVec::new(),
             #[cfg(feature = "sql")]
             recs: AVec::new(),
-            #[cfg(feature = "sql")]
-            depth: 0,
         }
     }
 

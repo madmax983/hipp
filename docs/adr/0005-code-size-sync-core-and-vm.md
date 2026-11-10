@@ -419,6 +419,40 @@ row by code (`RepStep` per row), and an enclosing query's aggregate
 inside a subquery is folded into a slot that a placeholder subquery
 node reads (today's `subst_owned_aggs` literal).
 
+**Amendment (Stage 2, unit `vm_rest`, 2026-11-10): virtual, table-
+valued and host-read sources as driver-awaited opcodes; windows over
+`window.rs`.** The table's VOpen / VFilter / VColumn / VNext / VRowid
+are three driver-awaited instructions (`Exec::Call`, the same seam as
+`Exec::Write`): `HostRows` fills a row list with a source's rows,
+`HostOpen` opens a host cursor (a virtual table's xFilter, a WITHOUT
+ROWID table's scan) and `HostNext` moves it (xColumn / xRowid, then
+xNext). The driver runs today's async readers for them —
+`session::vtab` (generate_series, dbstat, rtree, fts5, fts5vocab),
+`json_tvf` (json_each / json_tree), `scan_temp` (TEMP and attached
+tables), `scan_source` / `access_rows` / `auto_rows` (WITHOUT ROWID
+tables through `crate::wr`, whose handles stand for rowids) — with
+their argument evaluation, lateral pre-checks (`lateral_ok`),
+`Config::max_vtab_rows` and cleared arguments (`tvf_dead`, put back by
+`Restore`), on copies of the VM's inputs, storing the result when the
+reader completes: a step future dropped while the reader waits leaves
+the VM as it was and the next step runs the instruction again (an
+R*Tree search and a WITHOUT ROWID scan move a copy of their cursor).
+These readers are async because they read pages through `Pager<S>`;
+making them sync is Stage 3's work with the rest of `session`, and
+this keeps one copy of each module's rules. The side tables a row's
+values point into (`Env::json_docs`, `Env::fts_rows`) are kept as the
+streamed executor keeps them (`SideMark` / `SideDrop` / `SidePin`).
+Window functions are the table's AggInverse / AggValue + frame ops as
+`window.rs`'s one computation (`window::compute`, the pin's frame
+engine and step / inverse order): the joined rows (or each group after
+HAVING) are kept, every call's children evaluated per unit in today's
+order (`WinRow` / `WinLoad` / `WinAdd`), the windows computed
+(`WinCompute`), and each unit output in window order (`WinNext`) with
+the result columns' templates filled from its values (`Eval`'s
+`EVAL_WIN`, `window::fill`). Plain `EXPLAIN` lists a program as below
+(`vm::op::listing`); a statement that does not compile (any non-SELECT
+until Stage 3) lists its one `Host` instruction.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,

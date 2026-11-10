@@ -841,7 +841,11 @@ fn outer_aggregate_shapes_that_still_fall_back() {
     let q = "SELECT a, (SELECT group_concat((SELECT 1 WHERE t.a > 0)) FROM t AS t2) FROM t;";
     let (_, on_vm, e) = hipp_run(&copy_of(&base, "vms17-ownf-s"), strict(), q);
     assert!(!on_vm && matches!(e, Some(Error::VmFallback)), "{e:?}");
-    let (_, _, e) = hipp_run(&copy_of(&base, "vms17-ownf-d"), Config::default(), q);
+    let (_, _, e) = hipp_run(
+        &copy_of(&base, "vms17-ownf-d"),
+        Config::default().vm_strict(false),
+        q,
+    );
     assert!(matches!(e, Some(Error::Unsupported)), "{e:?}");
     for (i, q) in [
         "SELECT (SELECT count(*) FROM u WHERE u.k <= max(t.a)) FROM t;",
@@ -854,7 +858,7 @@ fn outer_aggregate_shapes_that_still_fall_back() {
         assert!(!on_vm && matches!(e, Some(Error::VmFallback)), "{q}: {e:?}");
         let (d, _, _) = hipp_run(
             &copy_of(&base, &format!("vms17-ownf{i}-d")),
-            Config::default(),
+            Config::default().vm_strict(false),
             q,
         );
         let (o, _, _) = hipp_run(

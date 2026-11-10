@@ -292,7 +292,8 @@ pub struct Config {
     /// Refuse a SELECT the bytecode VM does not cover yet with
     /// `Error::VmFallback` instead of running it on today's executor
     /// (ADR 0005 Stage 2, hidden `vm` feature; a test switch, off by
-    /// default).
+    /// default — on by default in a build with `--cfg hipp_vm_strict`
+    /// in `RUSTFLAGS`, which runs a whole test suite strict).
     #[cfg(feature = "vm")]
     pub vm_strict: bool,
     /// Run every SELECT on today's executor, as a build without the
@@ -350,7 +351,7 @@ impl Default for Config {
             #[cfg(feature = "vtab")]
             max_vtab_rows: DEFAULT_VTAB_ROWS,
             #[cfg(feature = "vm")]
-            vm_strict: false,
+            vm_strict: cfg!(hipp_vm_strict),
             #[cfg(feature = "vm")]
             vm_off: false,
         }
@@ -444,7 +445,7 @@ impl Config {
             #[cfg(feature = "vtab")]
             max_vtab_rows: 1 << 16,
             #[cfg(feature = "vm")]
-            vm_strict: false,
+            vm_strict: cfg!(hipp_vm_strict),
             #[cfg(feature = "vm")]
             vm_off: false,
         }
@@ -1042,6 +1043,12 @@ enum Plan {
     /// planned and is never run.
     #[cfg(feature = "explain")]
     Explain(eqp::EqpRows),
+    /// Plain `EXPLAIN` (unit `vm_rest`, `explain` with the hidden
+    /// `vm`; `session::drive`): the listing of the program the
+    /// statement it names compiles to, which was planned and is
+    /// never run.
+    #[cfg(all(feature = "explain", feature = "vm"))]
+    Bytecode(AVec<AVec<OwnedValue>>),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -1719,6 +1726,17 @@ impl<S: Storage> Connection<S> {
     pub async fn prepare(&mut self, sql: &str) -> Result<Statement<'_, S>, S::Error> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
+        }
+        // Plain `EXPLAIN <statement>` (unit `vm_rest`): the program's
+        // listing.
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if let Err(Error::Parse {
+            offset,
+            kind: crate::error::ParseKind::ExplainBytecode,
+        }) = eqp::query_plan_prefix::<S::Error>(sql.as_bytes())
+        {
+            let p: Prep<'_, '_, S> = Box::pin(self.prepare_bytecode(sql, offset.saturating_add(7)));
+            return p.await;
         }
         // `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`).
         #[cfg(feature = "explain")]
@@ -7468,6 +7486,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         if matches!(self.plan, Plan::Explain(_)) {
             return self.step_explain().await;
         }
+        // (Boxed: the step future, which every statement's step
+        // polls, stays as it was.)
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if matches!(self.plan, Plan::Bytecode(_)) {
+            return Box::pin(self.step_bytecode()).await;
+        }
         // What a streamed query dropped part-way kept (v0.17).
         #[cfg(feature = "sql")]
         if self.phase == Phase::Fresh && self.stream.is_none() {
@@ -7629,6 +7653,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         let r = match &self.plan {
             #[cfg(feature = "explain")]
             Plan::Explain(_) => self.step_explain().await,
+            #[cfg(all(feature = "explain", feature = "vm"))]
+            Plan::Bytecode(_) => Box::pin(self.step_bytecode()).await,
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
             #[cfg(feature = "sql")]
@@ -7684,14 +7710,30 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Instead(_) => self.step_instead().await,
             Plan::Rollback => self.step_rollback().await,
         };
-        #[cfg(feature = "json")]
+        #[cfg(all(feature = "json", not(feature = "vm")))]
         if self.stream.is_none()
             && let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut()
         {
             d.truncate(mark);
         }
-        #[cfg(feature = "fts5")]
+        #[cfg(all(feature = "fts5", not(feature = "vm")))]
         if self.stream.is_none()
+            && let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut()
+        {
+            d.truncate(fmark);
+        }
+        // A query running on the VM (ADR 0005 Stage 2, hidden `vm`)
+        // keeps them until its last row, as a stream does.
+        #[cfg(all(feature = "json", feature = "vm"))]
+        if self.stream.is_none()
+            && !self.vm_running()
+            && let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut()
+        {
+            d.truncate(mark);
+        }
+        #[cfg(all(feature = "fts5", feature = "vm"))]
+        if self.stream.is_none()
+            && !self.vm_running()
             && let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut()
         {
             d.truncate(fmark);
@@ -7805,6 +7847,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         // An EXPLAIN QUERY PLAN never plans again (or runs).
         #[cfg(feature = "explain")]
         if matches!(self.plan, Plan::Explain(_)) {
+            self.binds.stale = false;
+        }
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if matches!(self.plan, Plan::Bytecode(_)) {
             self.binds.stale = false;
         }
         if !self.binds.stale {
@@ -14316,6 +14362,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Instead(ip) => ip.returning_width(),
             #[cfg(feature = "explain")]
             Plan::Explain(_) => 4,
+            #[cfg(all(feature = "explain", feature = "vm"))]
+            Plan::Bytecode(_) => 8,
             #[cfg(feature = "fts5")]
             Plan::Vtab(v) => match &**v {
                 vtab::VtPlan::Fts5Write(w) => w.returning.len(),
@@ -14327,11 +14375,17 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// The pin's `sqlite3_stmt_isexplain`: 2 for an `EXPLAIN QUERY
     /// PLAN` statement (v0.16, `explain`), whose four result columns
-    /// are `id`, `parent`, `notused` and `detail`; 0 otherwise.
+    /// are `id`, `parent`, `notused` and `detail`; 1 for a plain
+    /// `EXPLAIN` (with the hidden `vm` feature: `addr`, `opcode`,
+    /// `p1` ... `p5`, `comment`); 0 otherwise.
     pub fn is_explain(&self) -> u8 {
         #[cfg(feature = "explain")]
         if matches!(self.plan, Plan::Explain(_)) {
             return 2;
+        }
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if matches!(self.plan, Plan::Bytecode(_)) {
+            return 1;
         }
         0
     }

@@ -110,8 +110,14 @@ impl G<'_, '_> {
             aggs,
             plain: false,
         })));
-        self.b
-            .emit(Code::Eval, p1, dest, 0, k, mode | flag | EVAL_SUB);
+        self.b.emit(
+            Code::Eval,
+            p1,
+            dest,
+            0,
+            k,
+            mode | flag | EVAL_SUB | self.wflag,
+        );
         Some(())
     }
 
@@ -194,8 +200,14 @@ impl G<'_, '_> {
             aggs: None,
             plain: true,
         })));
-        self.b
-            .emit(Code::Eval, p1, dest, 0, k, mode | flag | EVAL_SUB);
+        self.b.emit(
+            Code::Eval,
+            p1,
+            dest,
+            0,
+            k,
+            mode | flag | EVAL_SUB | self.wflag,
+        );
     }
 
     /// One aggregate of a group whose arguments hold a subquery
@@ -611,26 +623,22 @@ pub(super) fn subplan(
     need: Option<u32>,
     sink: Sink,
 ) -> Option<()> {
-    if b.depth >= MAX_NEST || b.over() {
+    // (No nesting cap: plans nest no deeper than the parser's limits
+    // let a statement's text, and the generator's stack per level fits
+    // the budget `Config::stack_budget` gives those limits, measured
+    // by tests/depth_v16.rs in a debug build with debug info.)
+    if b.over() {
         b.fail();
         return None;
     }
-    b.depth = b.depth.saturating_add(1);
-    let r = match p.rec {
+    match p.rec {
         Some(rec) => recursive(b, p, rec, gx, at, need, sink),
         None => {
             let qp = Rc::new(QueryPlan::of_sub(p));
             super::join::select(b, &qp, gx, at, need, sink)
         }
-    };
-    b.depth = b.depth.saturating_sub(1);
-    r
+    }
 }
-
-/// The deepest nesting of subquery plans the generator follows (its
-/// recursion's native stack); a deeper statement runs on today's
-/// executor.
-const MAX_NEST: u32 = 32;
 
 /// A compound or VALUES query (`run_query_compound` /
 /// `exec_subplan_inner`'s compound finish): a UNION ALL chain without

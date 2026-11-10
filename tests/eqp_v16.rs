@@ -500,13 +500,23 @@ fn explain_runs_nothing() {
         st.reset();
         assert_eq!(st.step().await.expect("again"), Step::Row);
         drop(st);
-        // Plain EXPLAIN: the pin lists bytecode, which hipp has none of.
+        // Plain EXPLAIN: the pin lists bytecode. Without the VM hipp
+        // has none (refused); with the hidden `vm` feature it lists
+        // its own program in the pin's eight columns
+        // (tests/vm_rest_v17.rs compares the shape with the pin).
+        #[cfg(not(feature = "vm"))]
         match c.prepare("EXPLAIN SELECT 1").await {
             Err(Error::Parse {
                 kind: hipp::error::ParseKind::ExplainBytecode,
                 offset: 0,
             }) => {}
             other => panic!("EXPLAIN: {:?}", other.err()),
+        }
+        #[cfg(feature = "vm")]
+        {
+            let r: Result<_, Error<_>> = c.prepare("EXPLAIN SELECT 1").await;
+            let st = r.expect("EXPLAIN");
+            assert_eq!((st.is_explain(), st.column_count()), (1, 8));
         }
         // A broken EXPLAIN QUERY PLAN and a nested one fail, as on the pin.
         for sql in [

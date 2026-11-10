@@ -5,6 +5,27 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: windows, virtual sources, the rest of SELECT and EXPLAIN (ADR 0005 Stage 2, unit `vm_rest`)
+
+- Under the hidden feature `vm`, every SELECT now runs on the VM:
+  window functions (today's frame engine, `window::compute`, over the
+  kept rows or groups, units output in window order), virtual and
+  table-valued sources (generate_series, dbstat, rtree, fts5,
+  fts5vocab, json_each / json_tree, the `pragma_*` functions) as
+  driver-awaited opcodes over today's readers with the streamed
+  semantics (`Config::max_vtab_rows`, side-table release, an inner
+  virtual table filtered again per outer row), `sqlite_schema`,
+  WITHOUT ROWID tables, TEMP and attached tables, and the SELECTs of
+  trigger programs and foreign-key actions. The one shape still
+  handed to today's executor is one it refuses itself (an enclosing
+  query's aggregate over a subquery argument); a strict run of the
+  whole workspace suite (`RUSTFLAGS="--cfg hipp_vm_strict"`) passes.
+- Plain `EXPLAIN <statement>` (with `explain` and `vm`) lists hipp's
+  own program in the pin's eight columns (`addr`, `opcode`, `p1` ..
+  `p5`, `comment`); without `vm` it is still refused. EXPLAIN QUERY
+  PLAN is unchanged. No profile enables `vm`: every profile's size is
+  unchanged.
+
 ### The bytecode VM: review fixes of unit `vm_subqueries` (hidden feature `vm`)
 
 - min() / max() over a subquery argument or FILTER (the group's

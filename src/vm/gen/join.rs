@@ -99,7 +99,27 @@ pub(super) enum Sink {
 /// checked as they are generated, and an expression of the query's
 /// own aggregates inside one falls back.
 pub(super) fn evaluable(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool {
-    let f = |x: &RExpr| evaluable(x, width, nsrc, agg);
+    evaluable_w(e, width, nsrc, agg, false)
+}
+
+/// `evaluable`, also allowing (`win`) window calls whose children are
+/// evaluable (a window query's result columns and ORDER BY terms,
+/// unit `vm_rest`).
+pub(super) fn evaluable_w(e: &RExpr, width: usize, nsrc: usize, agg: bool, win: bool) -> bool {
+    // A chain of unary operators (a run of signs, NOTs, CASTs) is
+    // walked in a loop: the expression may be as deep as the
+    // parser's limits allow, and the step path's stack is budgeted.
+    let mut e = e;
+    while let RExpr::Neg(a)
+    | RExpr::Pos(a)
+    | RExpr::Not(a)
+    | RExpr::IsNull(a, _)
+    | RExpr::Cast(a, _)
+    | RExpr::Collate(a, _) = e
+    {
+        e = a;
+    }
+    let f = |x: &RExpr| evaluable_w(x, width, nsrc, agg, win);
     match e {
         RExpr::Literal(_) | RExpr::AffLiteral(..) => true,
         RExpr::Column(slot, ..) => *slot < width,
@@ -110,7 +130,11 @@ pub(super) fn evaluable(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool
         RExpr::InSub(x, ..) => f(x),
         #[cfg(not(feature = "sql"))]
         RExpr::SubScalar(_) | RExpr::SubExists(_) | RExpr::InSub(..) => false,
-        RExpr::Raise(_) | RExpr::Win(..) => false,
+        RExpr::Raise(_) => false,
+        RExpr::Win(_, k) => win && k.iter().all(|x| evaluable_w(x, width, nsrc, agg, false)),
+        // An enclosing query's aggregate in an EXISTS subquery's
+        // result list is never evaluated there: NULL (`inert`).
+        RExpr::Agg { inert: true, .. } => true,
         RExpr::Agg { args, lvl, .. } => {
             agg && *lvl == 0 && args.iter().all(|a| evaluable(a, width, nsrc, false))
         }
@@ -136,12 +160,28 @@ pub(super) fn evaluable(e: &RExpr, width: usize, nsrc: usize, agg: bool) -> bool
     }
 }
 
+/// Whether any of `es` holds a window call (outside its subqueries),
+/// walked with a heap stack, not recursion: an expression may be as
+/// deep as the parser's limits allow and the step path's native stack
+/// is budgeted (`window::calls` recurses).
+#[cfg(feature = "window")]
+fn any_win<'x>(es: impl Iterator<Item = &'x RExpr>) -> bool {
+    let mut stack: AVec<&'x RExpr> = es.collect();
+    while let Some(e) = stack.pop() {
+        if matches!(e, RExpr::Win(..)) {
+            return true;
+        }
+        crate::window::each_child(e, &mut |c| stack.push(c));
+    }
+    false
+}
+
 /// Whether source `sp` is a table the VM reads: a rowid table of the
-/// main database (no derived table, TEMP, attached, WITHOUT ROWID,
-/// virtual or table-valued source, recursive reference, nor the
-/// schema table).
+/// main database, `sqlite_schema` included (no derived table, TEMP,
+/// attached, WITHOUT ROWID, virtual or table-valued source, nor
+/// recursive reference: those the driver reads, `host_kind`).
 fn table_source(sp: &SubSource, wr: &dyn Fn(u32) -> bool) -> bool {
-    let ok = sp.derived.is_none() && sp.root > 1 && sp.affs.len() == sp.ncols && !wr(sp.root);
+    let ok = sp.derived.is_none() && sp.root >= 1 && sp.affs.len() == sp.ncols && !wr(sp.root);
     #[cfg(feature = "sql")]
     let ok = ok && sp.rec == 0 && !sp.temp;
     #[cfg(any(feature = "json", feature = "vtab"))]
@@ -175,6 +215,7 @@ fn derived_source(sp: &SubSource) -> Option<&crate::query::SubPlan> {
 type Bounds<'p> = [Option<&'p crate::xplan::Bound>; 2];
 
 /// How a source's loop reads its rows.
+#[derive(Clone, Copy)]
 enum Kind<'p> {
     /// The table in rowid order.
     Scan,
@@ -194,7 +235,7 @@ enum Kind<'p> {
     /// An automatic index: the table's rows sorted once, probed per
     /// combination.
     #[cfg(feature = "planner")]
-    Auto(&'p crate::xplan::AutoIdx),
+    Auto(&'p crate::xplan::AutoIdx, bool),
     /// A FROM subquery's rows: a row list its code fills the first
     /// time the loop opens (once per execution of this query).
     #[cfg(feature = "sql")]
@@ -203,6 +244,20 @@ enum Kind<'p> {
     /// last gave up, in row list `.0`.
     #[cfg(feature = "sql")]
     Rec,
+    /// A row list the driver fills (`HostRows`, mode `.0`): once per
+    /// execution, or (`.1`, a lateral source) per combination of the
+    /// sources before it.
+    #[cfg(feature = "sql")]
+    Host(u8, bool),
+    /// A host cursor the driver opens and moves row by row
+    /// (`HostOpen` mode `.0` / `HostNext`): a virtual table's xFilter
+    /// for each combination, a WITHOUT ROWID table's scan.
+    #[cfg(feature = "sql")]
+    #[cfg_attr(
+        not(any(feature = "vtab", feature = "without_rowid")),
+        allow(dead_code)
+    )]
+    HostCur(u8),
     #[cfg(not(feature = "expr_index"))]
     #[allow(dead_code)]
     Never(core::marker::PhantomData<&'p ()>),
@@ -290,6 +345,16 @@ pub(super) struct G<'p, 'b> {
     /// (`session::derived_need`; −1: none).
     #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     dneed: Option<u32>,
+    /// The result columns and ORDER BY terms the output computes:
+    /// the plan's, or a window query's templates (`window::strip`).
+    items: &'p [RExpr],
+    order: &'p [(RExpr, crate::sql::SortOrder)],
+    /// A window query's set (unit `vm_rest`).
+    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    win: Option<u32>,
+    /// `Eval` flags every expression the output computes takes
+    /// (`EVAL_WIN` while a window query's units are output).
+    pub(super) wflag: u8,
 }
 
 /// The program of a general query plan, or `None` when it holds a
@@ -353,8 +418,35 @@ pub(super) fn core(
     let nsrc = n0.saturating_add(qp.sources.len());
     let width: usize = w0.saturating_add(qp.sources.iter().map(|s| s.ncols).sum::<usize>());
     let grouped = qp.has_agg || !qp.group_by.is_empty();
+    // A window query (unit `vm_rest`): its calls, and the templates
+    // its output computes with their values (`window::strip`).
+    #[cfg(feature = "window")]
+    let windowed = any_win(qp.items.iter().chain(qp.order_by.iter().map(|(e, _)| e)));
+    #[cfg(feature = "window")]
+    let wins = if windowed {
+        crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice())
+    } else {
+        AVec::new()
+    };
+    #[cfg(not(feature = "window"))]
+    let windowed = false;
+    #[cfg(feature = "window")]
+    let tpl_items: AVec<RExpr> = if windowed {
+        qp.items.iter().map(crate::window::strip).collect()
+    } else {
+        AVec::new()
+    };
+    #[cfg(feature = "window")]
+    let tpl_order: AVec<(RExpr, crate::sql::SortOrder)> = if windowed {
+        qp.order_by
+            .iter()
+            .map(|(e, o)| (crate::window::strip(e), *o))
+            .collect()
+    } else {
+        AVec::new()
+    };
     let row_ok = |e: &RExpr| evaluable(e, width, nsrc, false);
-    let out_ok = |e: &RExpr| evaluable(e, width, nsrc, grouped);
+    let out_ok = |e: &RExpr| evaluable_w(e, width, nsrc, grouped, windowed);
     if !qp.items.iter().all(out_ok)
         || !qp.order_by.iter().all(|(e, _)| out_ok(e))
         || !qp.having.as_ref().is_none_or(out_ok)
@@ -378,8 +470,7 @@ pub(super) fn core(
         bases.push(w);
         w = w.saturating_add(sp.ncols);
         let kind = kind_of(b, sp, d, width, nsrc, gx)?;
-        let is_table = matches!(kind, Kind::Scan) || direct(&kind) || table_backed(&kind);
-        if is_table && !table_source(sp, gx.wr) {
+        if table_backed(&kind) && !table_source(sp, gx.wr) {
             return None;
         }
         let t = b.cursor();
@@ -443,6 +534,10 @@ pub(super) fn core(
         cnt,
         grow: None,
         dneed: None,
+        items: qp.items.as_slice(),
+        order: qp.order_by.as_slice(),
+        win: None,
+        wflag: 0,
     };
     match win {
         Some((l, o)) => {
@@ -451,12 +546,25 @@ pub(super) fn core(
         }
         None => g.limits()?,
     }
+    #[cfg(feature = "window")]
+    if windowed {
+        g.items = tpl_items.as_slice();
+        g.order = tpl_order.as_slice();
+        let mut calls = AVec::with_capacity(wins.len());
+        for w in wins.iter() {
+            calls.push((*w).clone());
+        }
+        let k = g.b.p4(P4::Win(calls));
+        let c = g.b.cursor();
+        g.b.emit(Code::WinOpen, c, 0, 0, k, 0);
+        g.win = Some(c);
+    }
     // The output, the sorter, the accumulators.
     let out = g.out_mode(grouped);
     g.fold = if grouped {
         let c = g.b.cursor();
         let (pw, pn) = (w0 as u32, n0 as u32);
-        if super::super::rows::folds(qp, gx.utf8) {
+        if !windowed && super::super::rows::folds(qp, gx.utf8) {
             g.b.emit(Code::AggOpen, c, pw, pn, plan, 0);
             Fold::Agg(c)
         } else {
@@ -507,6 +615,10 @@ pub(super) fn core(
     }
     g.b.here(after);
     g.finish_agg(out);
+    #[cfg(feature = "window")]
+    if windowed {
+        g.window_out(out);
+    }
     g.sorted_out(out);
     if g.b.failed() {
         return None;
@@ -514,22 +626,41 @@ pub(super) fn core(
     Some(())
 }
 
-/// Whether a loop reads the table directly (no row list).
+/// Whether a loop reads a table-valued or virtual source the driver
+/// reads.
+#[cfg(feature = "sql")]
+fn tvf_kind(k: &Kind<'_>) -> bool {
+    match k {
+        #[cfg(any(feature = "json", feature = "vtab"))]
+        Kind::Host(super::super::op::HOST_TVF, _) => true,
+        #[cfg(feature = "vtab")]
+        Kind::HostCur(super::super::op::HOST_VT) => true,
+        _ => false,
+    }
+}
+
+/// Whether a loop reads a cursor directly (no row list): the table,
+/// or a host cursor.
 fn direct(k: &Kind<'_>) -> bool {
     match k {
         Kind::Scan => true,
         #[cfg(feature = "expr_index")]
         Kind::Eq(..) | Kind::Range(..) => true,
+        #[cfg(feature = "sql")]
+        Kind::HostCur(_) => true,
         _ => false,
     }
 }
 
-/// Whether a row-list loop's rows come from the source's table (an
-/// access path, an automatic index, a RIGHT / FULL table source).
+/// Whether a loop's rows come from the source's table through the
+/// VM's own table cursor (a scan, a rowid lookup or range, an access
+/// path, an automatic index, a RIGHT / FULL table source).
 fn table_backed(k: &Kind<'_>) -> bool {
     match k {
         #[cfg(feature = "sql")]
-        Kind::Derived(_) | Kind::Rec => false,
+        Kind::Derived(_) | Kind::Rec | Kind::Host(..) | Kind::HostCur(_) => false,
+        #[cfg(feature = "planner")]
+        Kind::Auto(_, host) => !host,
         _ => true,
     }
 }
@@ -560,6 +691,10 @@ fn kind_of<'p>(
 ) -> Option<Kind<'p>> {
     let _ = (d, width, nsrc, b, gx);
     #[cfg(feature = "sql")]
+    if let Some(k) = host_kind(sp, d, gx, width, nsrc) {
+        return k;
+    }
+    #[cfg(feature = "sql")]
     if sp.rec != 0 {
         return b
             .recs
@@ -584,7 +719,7 @@ fn kind_of<'p>(
         }
         #[cfg(feature = "planner")]
         if let Some(ai) = a.auto.as_deref() {
-            return Some(Kind::Auto(ai));
+            return Some(Kind::Auto(ai, false));
         }
         let plain = a.root == 0 && a.cover.is_none() && a.bignull.is_none() && a.eq.len() <= 1;
         #[cfg(feature = "planner")]
@@ -606,6 +741,82 @@ fn kind_of<'p>(
         return Some(Kind::Mat);
     }
     Some(Kind::Scan)
+}
+
+/// How the driver reads source `sp` when the VM's own cursors do not
+/// (unit `vm_rest`), as the streamed executor reads it
+/// (`level_open`): a table-valued function's rows (once, or per
+/// combination when its arguments read a source to its left); a
+/// virtual table's cursor (xFilter per combination, except a module
+/// computing its rows at its filter that reads nothing to its left,
+/// computed once for an inner source); a TEMP or attached table's rows
+/// once; a WITHOUT ROWID table's scan (row by row for the first
+/// source, else its rows once) or the rows its access path finds.
+/// `None`: a source the VM reads itself; `Some(None)`: a shape no
+/// generator covers.
+#[cfg(feature = "sql")]
+fn host_kind<'p>(
+    sp: &'p SubSource,
+    d: usize,
+    gx: Gx<'_>,
+    width: usize,
+    nsrc: usize,
+) -> Option<Option<Kind<'p>>> {
+    use super::super::op::HOST_SCAN;
+    let _ = (d, gx, width, nsrc);
+    // The arguments evaluate on the row before the source.
+    #[cfg(any(feature = "json", feature = "vtab"))]
+    if sp.tvf != 0 {
+        let lateral = sp.tvf & crate::query::TVF_LATERAL != 0;
+        #[cfg(feature = "vtab")]
+        if let Some(vt) = sp.vt.as_deref() {
+            use crate::vtab::Module;
+            #[cfg(feature = "rtree")]
+            let streamed = matches!(vt.tab.module, Module::Series | Module::Rtree { .. });
+            #[cfg(not(feature = "rtree"))]
+            let streamed = matches!(vt.tab.module, Module::Series);
+            return Some(Some(
+                if sp.kind.pads_left() || (!lateral && d > 0 && !streamed) {
+                    Kind::Host(super::super::op::HOST_TVF, false)
+                } else {
+                    Kind::HostCur(super::super::op::HOST_VT)
+                },
+            ));
+        }
+        return Some(Some(Kind::Host(
+            super::super::op::HOST_TVF,
+            lateral && !sp.kind.pads_left(),
+        )));
+    }
+    if sp.derived.is_some() || sp.rec != 0 {
+        return None;
+    }
+    if sp.temp {
+        return Some(Some(Kind::Host(HOST_SCAN, false)));
+    }
+    #[cfg(feature = "without_rowid")]
+    if (gx.wr)(sp.root) {
+        #[cfg(feature = "expr_index")]
+        if let Some(a) = sp.access.as_deref() {
+            if !access_ok(a, width, nsrc) {
+                return Some(None);
+            }
+            #[cfg(feature = "planner")]
+            if let Some(ai) = a.auto.as_deref() {
+                return Some(Some(Kind::Auto(ai, true)));
+            }
+            return Some(Some(Kind::Host(
+                super::super::op::HOST_ACCESS,
+                a.lateral && !sp.kind.pads_left(),
+            )));
+        }
+        return Some(Some(if d == 0 && !sp.kind.pads_left() {
+            Kind::HostCur(HOST_SCAN)
+        } else {
+            Kind::Host(HOST_SCAN, false)
+        }));
+    }
+    None
 }
 
 /// Whether every expression of access path `a` is evaluable (an
@@ -682,7 +893,8 @@ impl<'p> G<'p, '_> {
             Cx::Acc => (0, EVAL_ACC),
             Cx::Group(c) => (c.saturating_add(1), EVAL_GROUP),
         };
-        self.b.emit(Code::Eval, p1, dest, 0, k, EVAL_VALUE | flag);
+        self.b
+            .emit(Code::Eval, p1, dest, 0, k, EVAL_VALUE | flag | self.wflag);
     }
 
     /// `val` for a register an opcode then converts in place
@@ -727,7 +939,8 @@ impl<'p> G<'p, '_> {
             Cx::Group(c) => (c.saturating_add(1), EVAL_GROUP),
         };
         let t = self.tmp;
-        self.b.emit(Code::Eval, p1, t, 0, k, EVAL_COND | flag);
+        self.b
+            .emit(Code::Eval, p1, t, 0, k, EVAL_COND | flag | self.wflag);
         self.b.jump(Code::IfNot, t, skip, 0, 0, 0);
     }
 
@@ -766,7 +979,10 @@ impl<'p> G<'p, '_> {
         } else {
             None
         };
-        let sorted = if grouped {
+        let sorted = if self.win.is_some() {
+            // (The units come in window order.)
+            qp.order_by.is_empty()
+        } else if grouped {
             crate::session::groups_sorted(
                 qp.group_by.as_slice(),
                 qp.order_by.as_slice(),
@@ -803,8 +1019,8 @@ impl<'p> G<'p, '_> {
     /// One output row from the values `cx` computes (`vals`: already
     /// in registers, the streamed fold's), `cont` the next row's code.
     fn emit(&mut self, out: Out, cx: Cx, vals: Option<u32>, cont: Label) {
-        let qp = self.qp;
-        let n = qp.items.len();
+        let (items_e, order_e) = (self.items, self.order);
+        let n = items_e.len();
         let rowid = if matches!(cx, Cx::Group(_)) || vals.is_some() {
             0
         } else {
@@ -812,11 +1028,11 @@ impl<'p> G<'p, '_> {
         };
         let items = match vals {
             Some(r) => r,
-            None => self.b.regs(n.saturating_add(qp.order_by.len())),
+            None => self.b.regs(n.saturating_add(order_e.len())),
         };
         let compute = |g: &mut G<'p, '_>| {
             if vals.is_none() {
-                for (i, it) in qp.items.iter().enumerate() {
+                for (i, it) in items_e.iter().enumerate() {
                     g.val(it, cx, items.saturating_add(i as u32));
                 }
             }
@@ -831,9 +1047,9 @@ impl<'p> G<'p, '_> {
             }
             Out::Distinct(e) => {
                 compute(self);
-                let colls = self
-                    .b
-                    .p4(P4::Colls(crate::query::exprs_colls(qp.items.as_slice())));
+                let colls = self.b.p4(P4::Colls(crate::query::exprs_colls(
+                    self.qp.items.as_slice(),
+                )));
                 self.b.jump(Code::Distinct, e, cont, items, colls, 0);
                 if let Some(o) = self.off {
                     self.b.jump(Code::IfPos, o, cont, 1, 0, 0);
@@ -842,10 +1058,19 @@ impl<'p> G<'p, '_> {
             }
             Out::Sort(s, distinct) => {
                 compute(self);
-                for (j, (e, _)) in qp.order_by.iter().enumerate() {
+                for (j, (e, _)) in order_e.iter().enumerate() {
                     self.val(e, cx, items.saturating_add(n.saturating_add(j) as u32));
                 }
-                let cols = crate::session::order_cols(qp.order_by.as_slice(), qp.items.as_slice());
+                // (A window query's keys are its terms' values, as
+                // today's `win_project_async` computes them.)
+                let cols = if self.win.is_some() {
+                    AVec::new()
+                } else {
+                    crate::session::order_cols(
+                        self.qp.order_by.as_slice(),
+                        self.qp.items.as_slice(),
+                    )
+                };
                 for (j, col) in cols.iter().enumerate() {
                     if let Some(i) = col {
                         self.b.emit(
@@ -859,9 +1084,9 @@ impl<'p> G<'p, '_> {
                     }
                 }
                 if let Some(e) = distinct {
-                    let colls = self
-                        .b
-                        .p4(P4::Colls(crate::query::exprs_colls(qp.items.as_slice())));
+                    let colls = self.b.p4(P4::Colls(crate::query::exprs_colls(
+                        self.qp.items.as_slice(),
+                    )));
                     self.b.jump(Code::Distinct, e, cont, items, colls, 0);
                 }
                 self.b.emit(Code::SorterInsert, s, items, rowid, 0, 0);
@@ -872,8 +1097,20 @@ impl<'p> G<'p, '_> {
     /// A complete joined row: the WHERE clause, the semi-join loops'
     /// end, then the output or the aggregates; `cont` is the next
     /// row's code.
-    fn body(&mut self, out: Out, cont: Label) {
+    fn body(&mut self, out: Out, next: Label) {
         let qp = self.qp;
+        // The side-table entries this row adds go once it is dealt
+        // with (`Stream::row_side`), unless something keeps it.
+        #[cfg(any(feature = "json", feature = "fts5"))]
+        let side = self.track_side().then(|| {
+            let r = self.b.regs(2);
+            self.b.emit(Code::SideMark, r, 0, 0, 0, 0);
+            (r, self.b.label())
+        });
+        #[cfg(any(feature = "json", feature = "fts5"))]
+        let cont = side.map_or(next, |s| s.1);
+        #[cfg(not(any(feature = "json", feature = "fts5")))]
+        let cont = next;
         if let Some(f) = &qp.filter {
             #[cfg(feature = "sql")]
             self.where_sub(f, cont);
@@ -890,6 +1127,11 @@ impl<'p> G<'p, '_> {
             }
         }
         match self.fold {
+            #[cfg(feature = "window")]
+            Fold::Rows if self.win.is_some() => {
+                let w = self.win.unwrap_or(0);
+                self.b.emit(Code::WinRow, w, 0, 0, 0, 0);
+            }
             Fold::Rows => self.emit(out, Cx::Acc, None, cont),
             Fold::Agg(a) => self.b.emit(Code::AggStep, a, 0, 0, 0, 0),
             Fold::Groups(gc) => {
@@ -910,7 +1152,18 @@ impl<'p> G<'p, '_> {
                 self.b.emit(Code::GroupAdd, gc, 0, k, 0, 0);
             }
         }
-        self.b.jump(Code::Goto, 0, cont, 0, 0, 0);
+        #[cfg(any(feature = "json", feature = "fts5"))]
+        if let Some((r, l)) = side {
+            // A kept row (an aggregate's, a group's) pins what it
+            // points into.
+            // (The streamed fold pins a row it keeps itself, `AggStep`.)
+            if matches!(self.fold, Fold::Groups(_)) || self.win.is_some() {
+                self.b.emit(Code::SidePin, 0, 0, 0, 0, 0);
+            }
+            self.b.here(l);
+            self.b.emit(Code::SideDrop, r, 0, 0, 0, 0);
+        }
+        self.b.jump(Code::Goto, 0, next, 0, 0, 0);
     }
 
     /// The loops of sources `d ..` (then the body), for the joined row
@@ -936,7 +1189,17 @@ impl<'p> G<'p, '_> {
         self.b.emit(Code::Integer, 0, pad, 0, 0, 0);
         self.b.emit(Code::Integer, 0, done, 0, 0, 0);
         // Open: the first row, or `pad_chk` when there is none.
-        let adv = self.open(d, top, pad_chk)?;
+        // A driver-read table-valued or virtual source: the side-table
+        // entries its loop adds go when it ends (`Stream::side_drop`).
+        #[cfg(any(feature = "json", feature = "fts5"))]
+        let side = if self.track_side() && tvf_kind(&self.lvl(d)?.kind) {
+            let r = self.b.regs(2);
+            self.b.emit(Code::SideMark, r, 0, 0, 0, 0);
+            Some(r)
+        } else {
+            None
+        };
+        let adv = self.open(d, top, pad_chk, fin)?;
         self.b.here(top);
         if let Some((code, r)) = adv.stop {
             let tmp = self.tmp;
@@ -961,7 +1224,7 @@ impl<'p> G<'p, '_> {
             self.b.jump(Code::If, done, fin, 0, 0, 0);
         }
         if let Some((code, c)) = adv.next {
-            self.b.jump(code, c, top, 0, 0, 0);
+            self.b.jump(code, c, top, adv.p3, adv.p4, 0);
         }
         // A growing first FROM subquery read to the end of its rows:
         // computed again under twice the bound, the loop going on
@@ -986,6 +1249,16 @@ impl<'p> G<'p, '_> {
             self.b.jump(Code::Goto, 0, inner, 0, 0, 0);
         }
         self.b.here(fin);
+        // The values a lateral table-valued call cleared, back.
+        #[cfg(any(feature = "json", feature = "vtab"))]
+        if sp.tvf & crate::query::TVF_LATERAL != 0 && !sp.tvf_dead.is_empty() {
+            let c = if direct(&self.lvl(d)?.kind) { t } else { e };
+            self.b.emit(Code::Restore, c, 0, 0, 0, 0);
+        }
+        #[cfg(any(feature = "json", feature = "fts5"))]
+        if let Some(r) = side {
+            self.b.emit(Code::SideDrop, r, 0, 0, 0, 0);
+        }
         self.b.jump(Code::Goto, 0, exit, 0, 0, 0);
         Some(())
     }
@@ -1057,6 +1330,13 @@ impl<'p> G<'p, '_> {
                     }
                     self.test(h, cx, top);
                 }
+                #[cfg(feature = "window")]
+                if let Some(w) = self.win {
+                    self.win_unit(w, cx, gc.saturating_add(1));
+                    self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+                    self.b.here(done);
+                    return;
+                }
                 self.emit(out, cx, None, top);
                 self.b.jump(Code::Goto, 0, top, 0, 0, 0);
                 self.b.here(done);
@@ -1096,7 +1376,11 @@ impl G<'_, '_> {
     /// takes, OFFSET + the least of LIMIT and its own reader's bound.
     fn grow_setup(&mut self) {
         let qp = self.qp;
-        if !matches!(self.lvl(0).map(|l| &l.kind), Some(Kind::Derived(_))) {
+        // A FROM subquery, or a table-valued source the driver reads.
+        let first = self.lvl(0).map(|l| l.kind);
+        let derived = matches!(first, Some(Kind::Derived(_)));
+        let tvf = first.is_some_and(|k| tvf_kind(&k) && !matches!(k, Kind::Host(_, true)));
+        if !derived && !tvf {
             return;
         }
         let plain = qp.group_by.is_empty() && !qp.has_agg && qp.order_by.is_empty() && !qp.distinct;
@@ -1172,8 +1456,11 @@ impl G<'_, '_> {
 
 /// How a loop opened by `G::open` advances.
 struct Adv {
-    /// The advance instruction and its cursor (`None`: one row).
+    /// The advance instruction and its cursor (`None`: one row), and
+    /// its `p3`.
     next: Option<(Code, u32)>,
+    p3: u32,
+    p4: u32,
     /// The end test at the top of each row: the rowid past the
     /// bound register ends the loop.
     stop: Option<(Code, u32)>,
@@ -1252,15 +1539,67 @@ pub(super) fn values_core(
         cnt,
         grow: None,
         dneed: None,
+        items: qp.items.as_slice(),
+        order: qp.order_by.as_slice(),
+        win: None,
+        wflag: 0,
     };
     for r in qp.values.iter() {
-        if !r.iter().all(|e| evaluable(e, at.0, at.1, false)) {
+        // A row's window calls run over that row alone, as the pin's
+        // one-row SELECT core it is (`eval_values_row`, unit
+        // `vm_rest`).
+        #[cfg(feature = "window")]
+        let windowed = any_win(r.iter());
+        #[cfg(feature = "window")]
+        let wins = if windowed {
+            crate::window::calls(r.as_slice(), &[])
+        } else {
+            AVec::new()
+        };
+        #[cfg(not(feature = "window"))]
+        let windowed = false;
+        if !r
+            .iter()
+            .all(|e| evaluable_w(e, at.0, at.1, false, windowed))
+        {
             return None;
         }
         let next = g.b.label();
         let regs = g.b.regs(r.len());
-        for (i, e) in r.iter().enumerate() {
-            g.val(e, Cx::Acc, regs.saturating_add(i as u32));
+        #[cfg(feature = "window")]
+        if windowed {
+            let mut calls = AVec::with_capacity(wins.len());
+            for w in wins.iter() {
+                calls.push((*w).clone());
+            }
+            let n: usize = wins.iter().map(|c| crate::window::children(c).len()).sum();
+            let k = g.b.p4(P4::Win(calls));
+            let w = g.b.cursor();
+            g.b.emit(Code::WinOpen, w, 0, 0, k, 0);
+            g.b.emit(Code::WinRow, w, 0, 0, 0, 0);
+            g.b.jump(Code::WinLoad, w, next, 0, 0, 1);
+            let kids = g.b.regs(n);
+            let mut j = 0u32;
+            for c in wins.iter() {
+                for x in crate::window::children(c) {
+                    g.val(x, Cx::Acc, kids.saturating_add(j));
+                    j = j.saturating_add(1);
+                }
+            }
+            g.b.emit(Code::WinAdd, w, kids, 0, 0, 0);
+            g.b.emit(Code::WinCompute, w, 0, 0, 0, 0);
+            g.b.jump(Code::WinNext, w, next, 0, 0, 1);
+            g.wflag = super::super::op::EVAL_WIN;
+            for (i, e) in r.iter().enumerate() {
+                let t = crate::window::strip(e);
+                g.val(&t, Cx::Acc, regs.saturating_add(i as u32));
+            }
+            g.wflag = 0;
+        }
+        if !windowed {
+            for (i, e) in r.iter().enumerate() {
+                g.val(e, Cx::Acc, regs.saturating_add(i as u32));
+            }
         }
         if let Some(o) = off {
             g.b.jump(Code::IfPos, o, next, 1, 0, 0);
@@ -1328,7 +1667,11 @@ fn rowid_order(sp: &SubSource, qp: &QueryPlan) -> bool {
     let [(e, o)] = order else {
         return false;
     };
-    !o.desc
+    let plain = sp.derived.is_none();
+    #[cfg(feature = "sql")]
+    let plain = plain && !sp.temp;
+    plain
+        && !o.desc
         && match e {
             RExpr::Rowid(0) => true,
             RExpr::Column(slot, ..) => sp.rowid_alias == Some(*slot),
@@ -1362,15 +1705,16 @@ impl PSrc {
 impl<'p> G<'p, '_> {
     /// Open source `d`'s loop on its first row for the joined row so
     /// far (jumping to `none` when there is no row); how it advances.
-    fn open(&mut self, d: usize, top: Label, none: Label) -> Option<Adv> {
-        let _ = top;
+    fn open(&mut self, d: usize, top: Label, none: Label, nopad: Label) -> Option<Adv> {
+        let _ = (top, nopad);
         let (t, e) = {
             let l = self.lvl(d)?;
             (l.t, l.e)
         };
         #[cfg(feature = "planner")]
         self.bloom_check(d, none)?;
-        let kind = match &self.lvl(d)?.kind {
+        let kk = self.lvl(d)?.kind;
+        let kind = match kk {
             Kind::Scan => 0,
             #[cfg(feature = "expr_index")]
             Kind::Eq(..) => 1,
@@ -1380,16 +1724,48 @@ impl<'p> G<'p, '_> {
             #[cfg(feature = "expr_index")]
             Kind::Lateral => 4,
             #[cfg(feature = "planner")]
-            Kind::Auto(_) => 5,
+            Kind::Auto(..) => 5,
             #[cfg(feature = "sql")]
             Kind::Derived(_) => 3,
             #[cfg(feature = "sql")]
             Kind::Rec => 6,
+            #[cfg(feature = "sql")]
+            Kind::Host(_, false) => 3,
+            #[cfg(feature = "sql")]
+            Kind::Host(mode, true) => {
+                self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+                self.host_rows(d, e, mode, Some(nopad));
+                self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
+                return Some(Adv {
+                    next: Some((Code::EphNext, e)),
+                    p3: 0,
+                    p4: 0,
+                    stop: None,
+                    list: true,
+                });
+            }
+            #[cfg(feature = "sql")]
+            Kind::HostCur(mode) => {
+                let src = self.src_entry(d);
+                let need = self.first_need(d);
+                self.b.jump(Code::HostOpen, t, nopad, need, src, mode);
+                let cap = self.vtab_cap();
+                self.b.jump(Code::HostNext, t, none, cap, src, 1);
+                return Some(Adv {
+                    next: Some((Code::HostNext, t)),
+                    p3: cap,
+                    p4: src,
+                    stop: None,
+                    list: false,
+                });
+            }
             #[cfg(not(feature = "expr_index"))]
             Kind::Never(_) => return None,
         };
         let list = Adv {
             next: Some((Code::EphNext, e)),
+            p3: 0,
+            p4: 0,
             stop: None,
             list: true,
         };
@@ -1398,6 +1774,8 @@ impl<'p> G<'p, '_> {
                 self.b.jump(Code::Rewind, t, none, 0, 0, 0);
                 Adv {
                     next: Some((Code::Next, t)),
+                    p3: 0,
+                    p4: 0,
                     stop: None,
                     list: false,
                 }
@@ -1420,6 +1798,8 @@ impl<'p> G<'p, '_> {
                 self.b.jump(Code::SeekRowid, t, none, r, 0, 0);
                 Adv {
                     next: None,
+                    p3: 0,
+                    p4: 0,
                     stop: None,
                     list: false,
                 }
@@ -1449,6 +1829,8 @@ impl<'p> G<'p, '_> {
                 }
                 Adv {
                     next: Some((if reverse { Code::Prev } else { Code::Next }, t)),
+                    p3: 0,
+                    p4: 0,
                     stop: to.map(|r| (if reverse { Code::Lt } else { Code::Gt }, r)),
                     list: false,
                 }
@@ -1472,7 +1854,7 @@ impl<'p> G<'p, '_> {
             }
             #[cfg(feature = "planner")]
             5 => {
-                let Kind::Auto(ai) = self.lvl(d)?.kind else {
+                let Kind::Auto(ai, _) = self.lvl(d)?.kind else {
                     return None;
                 };
                 self.build_once(d)?;
@@ -1506,6 +1888,12 @@ impl<'p> G<'p, '_> {
         self.b.jump(Code::Once, built, skip, 0, 0, 0);
         self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
         self.build(d, e)?;
+        // Its rows stay for the execution: so does what they point
+        // into.
+        #[cfg(any(feature = "json", feature = "fts5"))]
+        if self.track_side() {
+            self.b.emit(Code::SidePin, 0, 0, 0, 0, 0);
+        }
         self.b.here(skip);
         Some(())
     }
@@ -1526,10 +1914,19 @@ impl<'p> G<'p, '_> {
                 return self.derived_build(p, e, need);
             }
             Kind::Rec => return Some(()),
+            Kind::Host(mode, _) => {
+                self.host_rows(d, e, mode, None);
+                return Some(());
+            }
             _ => {}
         }
         #[cfg(feature = "planner")]
-        if let Kind::Auto(ai) = self.lvl(d)?.kind {
+        if let Kind::Auto(ai, host) = self.lvl(d)?.kind {
+            // A WITHOUT ROWID table's rows, sorted by the driver.
+            if host {
+                self.host_rows(d, e, super::super::op::HOST_AUTO, None);
+                return Some(());
+            }
             self.scan_into(d, e);
             let a = self.b.p4(P4::Auto(alloc::boxed::Box::new(ai.clone())));
             self.b.emit(Code::AutoSort, e, 0, 0, a, 0);
@@ -1581,12 +1978,40 @@ impl<'p> G<'p, '_> {
         self.b.emit(Code::BloomAdd, bl, 0, 0, kp, 1);
         let top = self.b.label();
         let done = self.b.label();
+        // A WITHOUT ROWID table's rows come from the driver
+        // (`join::bloom_rows` reads them with `scan_source`).
+        #[cfg(feature = "sql")]
+        if matches!(self.lvl(d)?.kind, Kind::Host(..)) {
+            let l = self.b.cursor();
+            self.b.emit(Code::EphOpen, l, 0, 0, 0, 0);
+            self.host_rows(d, l, super::super::op::HOST_SCAN, None);
+            self.b.jump(Code::EphRewind, l, done, 0, 0, 0);
+            self.b.here(top);
+            self.b.emit(Code::BloomAdd, bl, l, 0, kp, 0);
+            self.b.jump(Code::EphNext, l, top, 0, 0, 0);
+            self.b.here(done);
+            self.b.here(skip);
+            return self.bloom_probe(a, keys, bl, none);
+        }
         self.b.jump(Code::Rewind, t, done, 0, 0, 0);
         self.b.here(top);
         self.b.emit(Code::BloomAdd, bl, t, 0, kp, 0);
         self.b.jump(Code::Next, t, top, 0, 0, 0);
         self.b.here(done);
         self.b.here(skip);
+        self.bloom_probe(a, keys, bl, none)
+    }
+
+    /// A lateral lookup's probe of its Bloom filter `bl` (`none` when
+    /// the key is not in it).
+    #[cfg(feature = "planner")]
+    fn bloom_probe(
+        &mut self,
+        a: &crate::xplan::IdxAccess,
+        keys: &AVec<crate::xplan::BKey>,
+        bl: u32,
+        none: Label,
+    ) -> Option<()> {
         // The probes, in order (`join::bloom_pass`); an IN or
         // multi-value probe stops the test (every earlier probe still
         // evaluated).
@@ -2096,5 +2521,136 @@ impl<'p> G<'p, '_> {
         self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
         self.b.here(done);
         Some(())
+    }
+}
+
+/// Driver-read sources (unit `vm_rest`).
+#[cfg(feature = "sql")]
+impl G<'_, '_> {
+    /// The `P4::Src` entry of source `d`.
+    fn src_entry(&mut self, d: usize) -> u32 {
+        let info = super::super::op::SrcInfo {
+            plan: self.plan,
+            d,
+            base: self.base(d) as usize,
+            src: self.src(d) as usize,
+        };
+        self.b.p4(P4::Src(alloc::boxed::Box::new(info)))
+    }
+
+    /// `p3` of a first source's driver-awaited read: 1 + the register
+    /// holding the rows the reader needs (`session::derived_need`), 0
+    /// for none.
+    fn first_need(&self, d: usize) -> u32 {
+        match self.dneed {
+            Some(r) if d == 0 => r.saturating_add(1),
+            _ => 0,
+        }
+    }
+
+    /// Code that fills row list `e` with source `d`'s rows read by the
+    /// driver (`mode`); a lateral source whose pre-check fails jumps
+    /// to `nopad`.
+    fn host_rows(&mut self, d: usize, e: u32, mode: u8, nopad: Option<Label>) {
+        let src = self.src_entry(d);
+        let need = self.first_need(d);
+        match nopad {
+            Some(l) => self.b.jump(Code::HostRows, e, l, need, src, mode),
+            None => self.b.emit(Code::HostRows, e, 0, need, src, mode),
+        }
+    }
+
+    /// `HostNext`'s `p3`: whether a generate_series cursor counts its
+    /// rows against `Config::max_vtab_rows` — when this core keeps
+    /// every row it is given (DISTINCT, groups, an ORDER BY without a
+    /// LIMIT in effect: `Stream::capped`).
+    fn vtab_cap(&self) -> u32 {
+        let qp = self.qp;
+        // (The streamed fold keeps none: `Stream::capped` is false
+        // for it.)
+        if qp.distinct || matches!(self.fold, Fold::Groups(_)) || self.win.is_some() {
+            return 1;
+        }
+        let sorted =
+            qp.order_by.is_empty() || matches!(qp.sources.as_slice(), [sp] if rowid_order(sp, qp));
+        if sorted {
+            return 0;
+        }
+        match self.lim {
+            Some(r) => r.saturating_add(2),
+            None => 1,
+        }
+    }
+
+    /// Whether this core tracks the side tables' entries (the
+    /// statement's own rows: `Stream`'s bookkeeping).
+    #[cfg(any(feature = "json", feature = "fts5"))]
+    fn track_side(&self) -> bool {
+        matches!(self.sink, Sink::Result) && self.n0 == 0 && self.w0 == 0
+    }
+}
+
+/// Window queries (unit `vm_rest`): today's `project_qp_async` window
+/// path laid out as code.
+#[cfg(feature = "window")]
+impl G<'_, '_> {
+    /// One window unit of set `w`: every call's children's values
+    /// over `cx`'s row (in `window::calls` order), with its row or
+    /// (`gp` > 0) group set `gp - 1`'s current group.
+    fn win_unit(&mut self, w: u32, cx: Cx, gp: u32) {
+        let calls = crate::window::calls(self.qp.items.as_slice(), self.qp.order_by.as_slice());
+        let n: usize = calls.iter().map(|c| crate::window::children(c).len()).sum();
+        let regs = self.b.regs(n);
+        let mut i = 0u32;
+        for c in calls.iter() {
+            for k in crate::window::children(c) {
+                self.val(k, cx, regs.saturating_add(i));
+                i = i.saturating_add(1);
+            }
+        }
+        self.b.emit(Code::WinAdd, w, regs, gp, 0, 0);
+    }
+
+    /// The output of a window query, after its rows or groups: the
+    /// units of a query without aggregates first (every kept row's
+    /// children, in row order: the rows were all joined first, as
+    /// today's executor joins them before it projects), then the
+    /// windows computed, then each unit in window order through the
+    /// output with the templates (`EVAL_WIN`).
+    fn window_out(&mut self, out: Out) {
+        let Some(w) = self.win else {
+            return;
+        };
+        let gp = match self.fold {
+            Fold::Groups(gc) => gc.saturating_add(1),
+            _ => {
+                let done = self.b.label();
+                let top = self.b.label();
+                self.b.jump(Code::WinLoad, w, done, 0, 0, 1);
+                self.b.here(top);
+                self.win_unit(w, Cx::Acc, 0);
+                self.b.jump(Code::WinLoad, w, done, 0, 0, 0);
+                self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+                self.b.here(done);
+                0
+            }
+        };
+        self.b.emit(Code::WinCompute, w, 0, 0, 0, 0);
+        let done = self.b.label();
+        let top = self.b.label();
+        let next = self.b.label();
+        self.b.jump(Code::WinNext, w, done, gp, 0, 1);
+        self.b.here(top);
+        let cx = match gp.checked_sub(1) {
+            Some(gc) => Cx::Group(gc),
+            None => Cx::Acc,
+        };
+        self.wflag = super::super::op::EVAL_WIN;
+        self.emit(out, cx, None, next);
+        self.wflag = 0;
+        self.b.here(next);
+        self.b.jump(Code::WinNext, w, done, gp, 0, 0);
+        self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+        self.b.here(done);
     }
 }

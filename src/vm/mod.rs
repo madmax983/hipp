@@ -43,6 +43,8 @@ pub(crate) mod exec;
 #[cfg(feature = "expr_index")]
 pub(crate) mod index;
 pub(crate) mod op;
+#[cfg(feature = "sql")]
+pub(crate) mod rest;
 pub(crate) mod rows;
 
 pub(crate) use crate::pager::Io;
@@ -58,6 +60,11 @@ pub(crate) enum Exec {
     Pending(Io),
     /// The statement runs on today's executor (`op::HOST_QUERY`).
     Host(u16),
+    /// The opcode at `pc` is driver-awaited (`HostRows`, `HostOpen`,
+    /// `HostNext`): the driver runs today's async source reader it
+    /// names, stores the result (`exec::Vm::call_done`) and runs on.
+    #[cfg(feature = "sql")]
+    Call,
 }
 
 /// A compiled statement: its instructions, their side table and the
