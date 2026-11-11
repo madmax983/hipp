@@ -219,3 +219,31 @@ n=1000 profile: `index_insert_core` inclusive 265,845,678 (42.42%);
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: reuse the leaf's validated cell spans
+
+`index_search_raw` keeps each cell's `(offset, on-page length)` (as
+`u16`s, reserved once per page) while it validates the page, and
+`write_index_leaf_inserted` copies the cells from those spans instead
+of laying every cell out again. Workload checksums identical; an
+index-heavy file (DESC / UNIQUE NOCASE / multi-column indexes, keys
+with overflow, deletes, updates, a late CREATE INDEX, INSERT ...
+SELECT, a WITHOUT ROWID table with a secondary index) at 512 B and
+4096 B pages is byte-identical (cmp) before/after. Test pass/fail set
+identical (1002 tests; failures are the absent `sqlite3` oracle).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 268,235,071   | 250,102,694   | -6.76%  |
+| 1000 | 626,649,402   | 582,822,372   | -6.99%  |
+| 2000 | 1,526,801,879 | 1,425,425,432 | -6.64%  |
+
+n=1000: `index_insert_core` inclusive 265,845,678 -> 221,704,757
+(-16.6%); `index_cell_layout` inclusive 99,904,355 -> 51,809,543
+(-48.1%). dhat (n=1000): 535,229 -> 538,328 blocks (+0.58%, one
+span buffer per index insert), 143,513,712 -> 145,792,820 bytes
+(+1.59%); peak (t-gmax) unchanged at 852,156 B. Storing the spans as
+`usize` pairs measured -7.69% Ir but +6.35% bytes; `u16` was kept.
+
+Size gates: tiny unchanged; full +184 B, max +24 B, xl +40 B;
+ratchets raised by those amounts (each well under `justify_over`).
