@@ -501,6 +501,34 @@ justified re-baseline or Stage 3's deletions (the async readers and
 the write executors' row loops) in the same step. STATUS.md
 ("vm_shrink") has the per-symbol inventory and each step's delta.
 
+*Amendment (unit `s3_probe`, wave 15, 2026-11-11): Stage 3 measured
+first — stop.* After the owner chose Stage 3 before one combined
+flip, the probe was extended (`ci/flip_probe.sh --s3`: `--cfg
+hipp_s3_probe`, build-only) to also cut the write executors
+(`step_insert` / `step_update` / `step_delete`), the trigger and FK
+runners and the VM's async source readers (`Exec::Call`), keeping the
+B-tree write primitives the VM's write opcodes would call, and
+everything DDL, PRAGMA, VACUUM, ALTER and integrity_check reach.
+Measured best case: full 461,824 / max 868,732 / xl 962,336 B (the
+Stage 2 flip probe: 495,088 / 1,011,428 / 1,115,132). Of the 33.3 /
+142.7 / 152.8 KB deleted, 29.4 / 76.8 / 81.6 KB is the write side
+(row loops, triggers, FK) and 3.9 / 65.9 / 71.2 KB what only the
+source readers reach. The deletions are as estimated below (about
+30 KB of write executor in full); the replacement is not. Replacing
+the write side at Stage 2's measured VM-to-executor ratio (1.5-1.9x;
+1.9x taken) and the readers at their own size projects the combined
+flip to 521,505 / 1,080,562 / 1,188,565 B: +43.3 / +115.9 / +127.1 KB
+over the ratchets (max 32 KB over its 1 MiB budget). Since the
+projection is the Stage 2 flip probe plus (ratio − 1) × the write
+side, no ratio of 1 or more can lower a ratchet; going needs 0.29x /
+0.34x / 0.29x. **Stages 2-3
+cannot pay for themselves in code size on the measured evidence**;
+the S2 / S3 rows of the estimate table below did not hold. Taking
+the VM now needs an owner re-baseline (+47.4 / +120.0 / +131.2 KB
+with headroom, max only after moving leaves to `xl`) or a decision to
+continue it for reasons other than size. STATUS.md ("ADR 0005 Stage
+3: s3_probe") has the per-category inventory and the estimate.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,

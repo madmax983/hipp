@@ -1426,6 +1426,10 @@ impl<'c, S: Storage> Statement<'c, S> {
     pub(super) async fn insert_prefix(
         &mut self,
     ) -> Result<Option<(AVec<AVec<OwnedValue>>, bool)>, S::Error> {
+        // The Stage 3 probe (`ci/flip_probe.sh --s3`; build-only): the
+        // trigger runner, cut (Stage 3 runs triggers as VM subprograms).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "triggers")))]
+        return Ok(None);
         if !self.conn.in_trigger()
             || self.fires(TrigTime::Before, TrigEvent::Insert)
             || self.fires(TrigTime::After, TrigEvent::Insert)
@@ -1607,6 +1611,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         new: Row<'_>,
         orconf: Option<ConflictAction>,
     ) -> Result<bool, S::Error> {
+        // The Stage 3 probe (`ci/flip_probe.sh --s3`; build-only): the
+        // trigger runner, cut (Stage 3 runs triggers as VM subprograms).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "triggers")))]
+        return Ok(true);
         let Some(tg) = self.trig.clone() else {
             return Ok(true);
         };
@@ -1661,6 +1669,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         rowid: i64,
         kind: SchemaKind,
     ) -> Result<bool, S::Error> {
+        // The Stage 3 probe (`ci/flip_probe.sh --s3`; build-only): the
+        // trigger runner, cut (Stage 3 runs triggers as VM subprograms).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "triggers")))]
+        return Ok(false);
         let before = self.fires(TrigTime::Before, TrigEvent::Delete);
         let after = self.fires(TrigTime::After, TrigEvent::Delete);
         if !self.conn.prag.recursive_triggers || !(before || after) {
@@ -1727,6 +1739,11 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Whether it was such a failure. A FAIL halt with foreign-key
     /// violations outstanding becomes their failure (`e` replaced).
     pub(super) async fn trigger_failed(&mut self, e: &mut Error<S::Error>) -> bool {
+        // The Stage 3 probe (`ci/flip_probe.sh --s3`; build-only): the
+        // trigger runner, cut (Stage 3 runs triggers as VM subprograms;
+        // no write left on today's path runs in a trigger program).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "triggers")))]
+        return false;
         if self.conn.in_trigger() {
             return false;
         }
@@ -1805,6 +1822,13 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// triggers: they fire for each row; the view changes nothing
     /// (`changes()` is 0).
     pub(super) async fn step_instead(&mut self) -> Result<Step, S::Error> {
+        // The Stage 3 probe (ADR 0005, unit `s3_probe`; build-only,
+        // never run: `ci/flip_probe.sh --s3`): with writes compiled to
+        // VM programs, today's INSTEAD OF trigger runner for writes to a
+        // view is cut off here,
+        // so LTO drops what only it reaches (DDL keeps what it calls).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "triggers")))]
+        return Err(Error::VmFallback);
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }

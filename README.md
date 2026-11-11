@@ -293,6 +293,14 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   `1`, now `1.0`); the compound's affinity comes from the first core
   that has one, and a scalar subquery's from its rightmost core (CREATE
   TABLE ... AS and PRAGMA table_info types; every profile with `sql`).
+- **Stage 3 measured before building it: stop** (hidden feature
+  `vm`). The flip probe now also cuts the write executors, the trigger
+  and foreign-key runners and the VM's async source readers
+  (`ci/flip_probe.sh --s3`): 33 / 143 / 153 KB go in full / max / xl,
+  but replacing them at the Stage 2 VM's measured size ratio puts the
+  combined flip 43 / 116 / 127 KB over the ratchets: the verdict is
+  stop, and the next step is an owner decision. No shipped profile
+  changes (STATUS.md has the figures).
 
 ## What v0.16 does
 
@@ -1526,8 +1534,9 @@ Not planned in any profile: multi-process locking or a shared `-shm`
 wal-index (WAL is single-process; one connection per database); a
 shared page cache (a file is attached once); the pin's own bytecode
 listing (plain EXPLAIN lists hipp's program, in the pin's columns, under
-the hidden `vm` feature until ADR 0005's last Stage 2 unit turns the VM
-on; its content is hipp's, not the pin's); loadable
+the hidden `vm` feature, which no profile enables: turning the VM on
+measured larger in every profile, Stage 2 alone and with Stage 3,
+ADR 0005; its content is hipp's, not the pin's); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.

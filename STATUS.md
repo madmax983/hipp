@@ -11,6 +11,253 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### ADR 0005 Stage 3: s3_probe (2026-11-11)
+
+Wave 15's first unit (owner decision 2026-11-11: do Stage 3 first,
+then one combined flip): measure what Stage 3 can delete before
+building it, estimate what replaces it, and decide. An architecture /
+size unit: no behaviour change, no shipped size change (the probe is
+a build-only `cfg`; every shipped profile measures exactly its
+ratchet).
+
+**Verdict: STOP, in every profile.** With Stage 2's measured
+replacement ratio at its pessimistic end (1.9x), the combined flip
+projects to full 521,505 / max 1,080,562 / xl 1,188,565 B: +43,285 /
++115,854 / +127,133 B over the ratchets, 47.4 / 120.0 / 131.2 KB
+short of the "4 KB under every ratchet" go rule (max also 32 KB over
+its 1 MiB budget). Even a replacement exactly as large as the code it
+deletes (ratio 1.0) projects to the Stage 2 flip probe itself (+16.9 /
++46.7 / +53.7 KB over): the deletions are large, but at any ratio of
+1 or more they cannot pay for the Stage 2 VM. The go rule needs the
+VM write path at 0.29x / 0.34x / 0.29x of the code it replaces (full
+/ max / xl). `sync_readers`, `vm_writes`, `vm_triggers_fk` and
+`flip3` should therefore commit nothing (their shared rule).
+
+**Step 1 — the probe, extended.** `--cfg hipp_s3_probe` (with `vm`;
+build-only, never run; `ci/flip_probe.sh --s3`, own target directory
+`target/flip-probe-s3`; its `check-cfg` entry in Cargo.toml; not wired
+into CI or `ci/local-gates.sh`) implies `hipp_flip_probe`'s cuts and
+also cuts, at their entry points (each a `cfg`'d early return, so LTO
+drops what only it reaches):
+
+| category | cut at | what goes |
+|---|---|---|
+| readers | `Statement::vm_step`'s `Exec::Call` arm (`vm_call`, `vm_host_next`) | the async source readers the VM reaches: TEMP / attached / WITHOUT ROWID scans, access paths, automatic indexes, generate_series, dbstat, R*Tree, `rtreecheck`, fts5 / fts5vocab, json_each / json_tree, `sqlite_schema` and pragma TVFs, lateral pre-checks |
+| triggers | `fire_as`, `replace_victim`, `insert_prefix`, `trigger_failed`, `step_instead` | the trigger runner (programs, nested statements, RAISE / OR resolution, `nest_may_abort`), INSTEAD OF writes on views |
+| fk | `fk_new_row`, `fk_old_row`, `fk_actions`, `fk_sim` | FK enforcement (lookups, child scans, counters' updates), action programs, the pin-compile replay (`sim_*`) |
+| writes | `step_insert`, `step_update`, `step_delete` | INSERT VALUES / SELECT, UPDATE incl. FROM, DELETE, upsert, RETURNING, the OR-conflict paths, AUTOINCREMENT upkeep, write-side subquery and join helpers |
+
+`--s3=<cat>[,<cat>...]` (`--cfg hipp_flip_probe --cfg
+hipp_s3_probe="<cat>"`) cuts only those categories, for the
+inventory.
+
+*What stays, and why (checked against callers and in the ELFs).*
+- **B-tree write primitives.** Stage 3 keeps B-tree writes async
+  (Stage 4 is out of scope), so the VM's Insert / Delete / NewRowid /
+  IdxInsert / IdxDelete would call today's `btree::btree_insert`,
+  `btree_overwrite` (`wal`), `btree_delete`, `new_rowid`,
+  `index_insert` and `index_delete` (with its WITHOUT ROWID
+  translation). The cut `step_insert` therefore calls them once from
+  `Statement::s3_write_primitives` (operands read from the statement,
+  so LTO cannot fold them): only the executors' own row loops count
+  as deletable. In full this keeps 14.8 KB of index-delete code alive
+  that only DML reaches (the probe measured 447,064 without it); the
+  call glue (a few hundred bytes) stays in the probe, a pessimistic
+  error. Read primitives the write loops use (`seek_rowid`,
+  `IndexCursor::seek`, `index_first_with_prefix`,
+  `index_prefix_rowids`) are not kept: the VM has its own sync table
+  and index cursors (Stage 2), which `NotExists` / `NoConflict` /
+  `Found` would use.
+- **DDL, PRAGMA, VACUUM, ALTER, integrity_check.** None of them
+  reaches a cut entry point except through a nested DML statement:
+  DROP TABLE's implicit `DELETE FROM` under `foreign_keys` (`fk_drop`
+  prepares and steps a DELETE, which Stage 3 compiles to a program;
+  `fk_drop`, `fk_end_commit`, `fk_target` / `fk_clauses` themselves
+  stay). Symbol sizes before / after in full and xl:
+  `exec_drop_table`, `step_maint` / `vacuum`, `exec_alter` /
+  `alter16`, `run_pragma`, `integrity`, `exec_create_index`,
+  `exec_create_as`, `step_create`, `exec_drop_index`,
+  `exec_create_view`, CREATE / DROP TRIGGER, `step_commit`,
+  `build_catalog` / `rebuild_catalog` and every B-tree write
+  primitive are all still linked (equal or within LTO's inlining
+  noise, ±1 KB). CREATE TABLE ... AS inserts through its own loop
+  (`exec_create_as`, kept). Prepare-time checks stay
+  (`validate_triggers`, `trigger_columns`, `plan_instead`,
+  `fk_validate`, `fk_target`, `fk_check_plan` for `foreign_key_check`,
+  `fk_commit_check` for COMMIT). The tiny profile is never built with
+  `vm`, so no cut reaches it.
+- **Virtual-table writes are not cut** (`Plan::Vtab`: R*Tree and
+  fts5 INSERT / UPDATE / DELETE, fts5 commands): their row loops would
+  move to the VM too (`VUpdate`), but they share the modules' own
+  write code, which stays; leaving them in makes the probe larger,
+  the safe direction for a go / stop decision. They keep `write_failed`
+  / `fail_in_place` (the OR FAIL path) alive.
+- **`query::eval` is not cut**: the VM's `Eval` opcode
+  (`vm/exec.rs`, `vm/rows.rs`), integrity_check's CHECK evaluation
+  (`pragma.rs`) and expression / partial index keys (`xindex.rs`:
+  CREATE INDEX, REINDEX, VACUUM) still call it; it is in the probe at
+  full size (full 20.3 KB, xl 9.2 KB of `query::eval*` symbols).
+
+**Probe figures** (thumbv7em, `--profile tiny`, `hipp_thumb_demo`,
+`.text + .rodata`; reproduced byte for byte in a second target
+directory, `FLIP_PROBE_TARGET_DIR=target/flip-probe-s3-repro
+ci/flip_probe.sh --s3`):
+
+| profile | ratchet | flip probe (Stage 2) | s3 probe | s3 − ratchet |
+|---|---:|---:|---:|---:|
+| full | 478,220 | 495,088 | 461,824 | −16,396 |
+| max | 964,708 | 1,011,428 | 868,732 | −95,976 |
+| xl | 1,061,432 | 1,115,132 | 962,336 | −99,096 |
+
+(The flip probe is 495,088 / 1,011,428 / 1,115,132 at this head:
+wave 14's figures plus the review fixes and PR #24 merged since.)
+These are best cases: nothing that replaces the cut code is counted.
+
+**Step 2 — inventory per category** (each figure a difference of two
+probe builds; LTO moves code between symbols, so the per-symbol lists
+name where the bytes went, not exact category boundaries):
+
+| deleted bytes vs. the flip probe | full | max | xl |
+|---|---:|---:|---:|
+| readers alone (`--s3=readers`) | 2,480 | 5,832 | 6,376 |
+| triggers alone | 0 | 21,248 | 21,712 |
+| FK alone | 0 | 11,376 | 11,344 |
+| writes alone | 29,352 | 59,040 | 64,112 |
+| cumulative: readers | 2,480 | 5,832 | 6,376 |
+| cumulative: + triggers | 0 | 21,216 | 21,112 |
+| cumulative: + FK | 0 | 11,728 | 11,912 |
+| cumulative: + writes | 30,784 | 103,920 | 113,396 |
+| **all (s3 probe)** | **33,264** | **142,696** | **152,796** |
+| write side W (`--s3=triggers,fk,writes`; readers alive) | 29,352 | 76,816 | 81,592 |
+| readers' own Rd (s3 − write side: what only readers reach) | 3,912 | 65,880 | 71,204 |
+
+full has no triggers or foreign keys (`full` excludes both leaves).
+The readers alone free little in max / xl because the write paths
+share them (UPDATE / DELETE WHERE access paths, INSERT ... SELECT over
+a TVF): with the write side cut they free 65.9 / 71.2 KB. Largest
+symbols:
+- full, write side: `exec_insert_row` 7,320, `exec_update` 6,672,
+  `exec_insert` 2,296, `exec_delete` 1,062, `join_step` 1,012,
+  `eval_row_sub` 906, `rewrite_stored_row` 868, `scan_write_rows_into`
+  854, `TableRules::resolve` 762, `delete_row_completely` 708.
+- full, readers' own: `vm_step`'s future 1,648 (`vm_call` inlined),
+  `decode_source_row` 560, `scan_temp` 468, `scan_source` 302,
+  `Vm::trap` 188.
+- max / xl, write side: `exec_update` 7,446 / 7,458,
+  `exec_insert_row_v07` 6,460 / 6,456, `insert_prefix` 5,980 / 5,980,
+  `exec_insert_row` 3,480 / 3,488, `window::compute` 3,180 / 3,176
+  (inlined into `Vm::op_sub` once the legacy window projection goes),
+  `rewrite_stored_row` 3,152 / 3,152, `exec_insert` 2,816 / 2,824,
+  `nest_may_abort` 2,526 / 2,528, `exec_delete` 2,438 / 2,438,
+  `fk_actions` 2,032 / 2,026, `sim_triggers` 1,272, `sim_write` 1,024,
+  `fk_lookup` 918, `fk_children` 904.
+- max / xl, readers' own: `fts5_rows_impl` 8,172 / 8,156,
+  `vtab_rows_of` 6,932 / 6,880, `vm_step`'s future 6,008 / 5,644,
+  `access_walk` 4,520 / 5,512, `access_rows` 1,686 / 3,784,
+  `fts5::expr::one_leaf` 3,494 / 3,482, `dbstat_db` 2,192,
+  `json::tvf_rows` 1,856, `rtree_next` 1,640, `stat_decode` 1,628.
+
+**Step 3 — the replacement estimate.** Per profile, replacement = r
+× W (VM write opcodes + write codegen + trigger / FK subprograms,
+replacing the write side) + 1.0 × Rd (sync source readers: the async
+readers' own size, as they are rewritten, not designed anew); so the
+projection = s3 probe + replacement = flip probe + (r − 1) × W.
+r is Stage 2's measured ratio of VM to the read executor it replaces,
+about 1.5x / 1.8x / 1.9x (full / max / xl; vm_shrink: VM 41 / 65 /
+69 KB against 27 / 36 KB of executor), taken at its pessimistic end,
+1.9x, in every profile. No prototype was built to argue a lower
+ratio. Cross-check at this head: the VM + driver symbols are 41,992
+/ 66,516 / 70,680 B and `--features <profile>,vm` without the probe
+measures 521,176 / 1,035,676 / 1,140,732, so the read executor the
+flip deletes is 26,088 / 24,248 / 25,600 B and the ratio 1.61x /
+2.74x / 2.76x — worse than the figure used; it does not change the
+verdict.
+
+| | full | max | xl |
+|---|---:|---:|---:|
+| s3 probe | 461,824 | 868,732 | 962,336 |
+| replacement, readers (1.0 × Rd) | 3,912 | 65,880 | 71,204 |
+| replacement, write side (1.9 × W) | 55,769 | 145,950 | 155,025 |
+| **projected flip (r = 1.9)** | **521,505** | **1,080,562** | **1,188,565** |
+| ratchet | 478,220 | 964,708 | 1,061,432 |
+| **projected − ratchet** | **+43,285** | **+115,854** | **+127,133** |
+| go target (ratchet − 4,096) | 474,124 | 960,612 | 1,057,336 |
+| **gap to go** | **47,381** | **119,950** | **131,229** |
+| budget (512 KiB / 1 MiB / 1.25 MiB) | 524,288 | 1,048,576 | 1,310,720 |
+| projected − budget | −2,783 | **+31,986** | −122,155 |
+| per-profile ratio (1.5 / 1.8 / 1.9): projected − ratchet | +31,544 | +108,173 | +127,133 |
+| ADR 0005's original 0.6x: projected − ratchet | +5,127 | +15,994 | +21,063 |
+| ADR 0005's original 0.8x: projected − ratchet | +10,998 | +31,357 | +37,382 |
+| break-even ratio for go | 0.286 | 0.338 | 0.292 |
+
+**Step 4 — verdict per profile.**
+- **full: stop.** Projected 521,505 B, +43,285 over the ratchet
+  (47,381 short of go).
+- **max: stop.** Projected 1,080,562 B, +115,854 over the ratchet
+  (119,950 short of go) and 31,986 over max's 1 MiB budget: max cannot
+  even be re-baselined to take the flip without moving leaves to
+  `xl`.
+- **xl: stop.** Projected 1,188,565 B, +127,133 over the ratchet
+  (131,229 short of go).
+
+*What would close it.* (a) An owner-approved re-baseline of +47.4 /
++120.0 / +131.2 KB (full / max / xl, with the 4 KB headroom), max's
+needing leaves moved out of `max` first (it would exceed 1 MiB); or
+(b) a VM write path at most 0.29x / 0.34x / 0.29x the size of the code
+it replaces, which nothing measured so far supports (Stage 2 came out
+at 1.5-1.9x, today's cross-check 1.6-2.8x; even the ADR's original
+0.6-0.8x estimate is 5-37 KB over); or (c) shrinking the Stage 2 VM
+itself below the read executor first (it is 16.9 / 46.7 / 53.7 KB
+larger: at any ratio of 1 or more, Stage 3 only adds to that gap).
+Stage 3 is not a size lever on these numbers; whether to continue
+the VM for other reasons (EXPLAIN parity, the restart design) is an
+owner decision.
+
+**Oracle probing** (the pin, live, 3.54.1): `EXPLAIN` of six writes
+over a schema with an INTEGER PRIMARY KEY parent, a UNIQUE column, a
+child with an FK (ON DELETE CASCADE), a CHECK and an index, and an
+AFTER INSERT trigger (`INSERT VALUES`, an upsert with RETURNING,
+`UPDATE ... WHERE`, a parent `DELETE`, `UPDATE ... FROM`, `INSERT OR
+REPLACE ... SELECT`) gives 28-114 instructions each, the trigger as a
+separate `Program` frame (`Init` ... `Halt`, `Param` for NEW). They
+use about 25 write-only opcodes the Stage 2 VM does not have
+(OpenWrite, NewRowid, MakeRecord, Insert, Delete, IdxInsert,
+IdxDelete, NotExists / NoConflict, MustBeInt, SoftNull, Affinity,
+constraint `Halt`s, FkCounter / FkIfZero / FkCheck, Program / Param,
+ResetCount, RowSetAdd / RowSetRead, OpenEphemeral, IntCopy, AddImm,
+Trace, DeferredSeek): each `Insert` / `IdxDelete` maps onto one
+B-tree write call, which is why the probe keeps the B-tree write
+primitives. No behaviour is claimed, so no differential test changes.
+
+**Tests.** None added: the unit changes no behaviour (the cuts exist
+only under `--cfg hipp_s3_probe`, a build that is measured, never
+run). `ci/flip_probe.sh --s3` and every `--s3=<cat>` combination
+above build warning-free (the probe's dead code is allowed under the
+probe `cfg`s only).
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed; `cargo test --workspace --no-fail-fast --features vm`: green
+(rule 8; no recursive path touched).
+
+**Size Δ** (shipped profiles): tiny 0 (76,952), full 0 (478,220),
+max 0 (964,708), xl 0 (1,061,432). No ratchet moved.
+
+**Honest gaps.**
+- The estimate is a ratio applied to measured deletions, not a
+  prototype; Stage 2's ratio (VM vs the read executor) may not carry
+  over to writes, in either direction. The verdict holds for any
+  ratio above 0.34.
+- Virtual-table writes' row loops are not cut (above): the probe
+  under-counts what Stage 3 deletes in max / xl by at most their
+  loops (`exec_vtab` 18 KB in xl, mostly the modules' own write code).
+- The readers are replaced at 1.0x as the spec says; Rd also holds
+  legacy helpers that only the readers still reach (argument
+  evaluation, `access_walk`), which sync readers might not need, so
+  1.0x may overstate them. Even with Rd replaced by nothing, full /
+  max / xl project +39,373 / +49,974 / +55,929 over the ratchets.
+- Per-symbol attributions move with LTO inlining (`window::compute`,
+  `exec_insert_row_v07`); the category figures are build differences.
+
 ### VM (ADR 0005 Stage 2): vm_shrink — review fixes (2026-11-11)
 
 Fixes to unit `vm_shrink` (below); test and documentation only, no

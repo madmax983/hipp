@@ -5,6 +5,21 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: Stage 3 measured first, verdict stop (wave 15, unit `s3_probe`)
+
+- `ci/flip_probe.sh --s3` (`--cfg hipp_s3_probe` with the hidden `vm`
+  feature; build-only, not in CI) measures the combined Stage 2 + 3
+  flip's best case: the write executors, trigger and FK runners and
+  the VM's async source readers cut, the B-tree write primitives kept:
+  full 461,824 / max 868,732 / xl 962,336 B; `--s3=<category>` for
+  the per-category inventory.
+- Verdict: stop. With the replacement at Stage 2's measured ratio
+  (1.9x) the flip projects +43.3 / +115.9 / +127.1 KB over the full /
+  max / xl ratchets; going needs a VM write path at about 0.3x the
+  code it replaces (STATUS.md, ADR 0005 amendment).
+- No behaviour or shipped size change: tiny 76,952, full 478,220, max
+  964,708, xl 1,061,432.
+
 ### The bytecode VM: the flip retry, not taken; REAL affinity through subqueries (wave 14, unit `vm_flip` retry)
 
 - The flip (the VM as the only SELECT path) was not taken: the flip
