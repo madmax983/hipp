@@ -5,6 +5,18 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: shrinking it before the flip (unit `vm_shrink`, hidden feature `vm`)
+
+- A reproducible flip probe: `ci/flip_probe.sh` builds full / max /
+  xl with `vm` and `--cfg hipp_flip_probe`, which cuts today's read
+  executor off where wave 13's measurement did, and prints each size
+  next to its ratchet (build-only; not part of CI). STATUS.md records
+  the starting figures and the largest VM, driver and legacy symbols.
+- The expression evaluator is compiled once (for `Error<()>`) in
+  every build with `vm`, as it already was with `window`: the full
+  probe −14,476 B.
+- Sizes: every shipped profile unchanged.
+
 ### The bytecode VM: review fixes of unit `vm_rest` (hidden feature `vm`)
 
 - A window query whose only source is a view, a CTE, a FROM subquery

@@ -13,7 +13,10 @@ description = "A little no_std database that reads and writes SQLite database fi
 # `--cfg hipp_vm_strict` (RUSTFLAGS): `Config::vm_strict` on by
 # default, so a whole test suite runs every SELECT strict on the VM
 # (ADR 0005 Stage 2, hidden `vm` feature).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hipp_vm_strict)'] }
+# `--cfg hipp_flip_probe` (with `vm`; build-only, never run): the flip
+# probe of ADR 0005 Stage 2 (`ci/flip_probe.sh`) cuts today's read
+# executor off so LTO drops it, measuring the flip's best case.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hipp_vm_strict)', 'cfg(hipp_flip_probe)'] }
 
 [features]
 default = ["std", "xl"]

@@ -12062,9 +12062,18 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
+        // The flip probe (ADR 0005 Stage 2, unit `vm_shrink`;
+        // build-only, never run: `ci/flip_probe.sh`): with the VM the
+        // only SELECT path, today's read executor is cut off here, so
+        // LTO drops it. Rows a statement loaded itself (PRAGMA,
+        // EXPLAIN QUERY PLAN, plain EXPLAIN) are still served below.
+        #[cfg(all(feature = "vm", hipp_flip_probe))]
+        if !self.query_loaded {
+            return Err(Error::VmFallback);
+        }
         // A plan that streams (v0.17, `sql`) returns each row as its
         // join makes it; a blocking one's rows land in `query_rows`.
-        #[cfg(feature = "sql")]
+        #[cfg(all(feature = "sql", not(all(feature = "vm", hipp_flip_probe))))]
         if !self.query_loaded {
             // Boxed: the step future (re-entered once per trigger
             // level) stays small.
@@ -12092,6 +12101,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
         }
+        #[cfg(not(all(feature = "vm", hipp_flip_probe)))]
         if !self.query_loaded {
             self.run_query().await?;
             self.query_loaded = true;
@@ -13074,8 +13084,19 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &'x RowData,
         need: Option<usize>,
     ) -> SubplanFuture<'x, S::Error> {
-        self.conn.sub_execs += 1;
-        alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer, need))
+        // The flip probe (see `step_query`): the subquery executor the
+        // write paths reach today is cut off too; their VM-backed
+        // replacements are not counted (a best case).
+        #[cfg(all(feature = "vm", hipp_flip_probe))]
+        {
+            let _ = (plan, outer, need);
+            alloc::boxed::Box::pin(async { Err(Error::VmFallback) })
+        }
+        #[cfg(not(all(feature = "vm", hipp_flip_probe)))]
+        {
+            self.conn.sub_execs += 1;
+            alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer, need))
+        }
     }
 
     #[cfg(feature = "sql")]

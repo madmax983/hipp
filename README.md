@@ -277,6 +277,11 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   / max() no longer changes which one picks the bare columns
   (`SELECT max(a), min(a), max(a), a FROM t` read the max() row; the
   pin reads the min() row; every profile with aggregates).
+- **Shrinking the VM before the flip** (hidden feature `vm`). A
+  reproducible flip probe (`ci/flip_probe.sh`) measures what full /
+  max / xl would weigh with the VM as the only SELECT path; the VM's
+  evaluator is compiled once. No shipped profile changes (STATUS.md
+  has the figures and the remaining gap).
 
 ## What v0.16 does
 

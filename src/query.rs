@@ -7634,14 +7634,16 @@ fn eval_raise<E>(
 /// type, which compiled the whole evaluator twice. The evaluator never
 /// touches storage, so under `window` its body is compiled once, for
 /// `Error<()>`, and its errors are re-typed here (`Storage` cannot
-/// occur). Without `window` there is only one instantiation anyway.
-#[cfg(feature = "window")]
+/// occur). The bytecode VM (hidden `vm`, ADR 0005 Stage 2) evaluates
+/// for `Error<()>` too, so it takes the same shape (v0.17 `vm_shrink`).
+/// Without either there is only one instantiation anyway.
+#[cfg(any(feature = "window", feature = "vm"))]
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     eval_body::<()>(e, ctx).map_err(|x| x.map_storage(|()| Error::Unsupported))
 }
 
 /// Evaluate `e` against `ctx` (see the `window` variant above).
-#[cfg(not(feature = "window"))]
+#[cfg(not(any(feature = "window", feature = "vm")))]
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     eval_body(e, ctx)
 }
@@ -7874,16 +7876,16 @@ pub fn cond_false<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
 
 /// Whether `e` is `want` (true or false; NULL is neither).
 ///
-/// Like `eval`, compiled once under `window` (v0.17 size pass): the
+/// Like `eval`, compiled once under `window` or `vm` (v0.17 size pass): the
 /// evaluator's own conditions (CASE, json, `iif`) run the body for
 /// `Error<()>`, and the executors' calls re-type its errors here.
-#[cfg(feature = "window")]
+#[cfg(any(feature = "window", feature = "vm"))]
 pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
     cond_body::<()>(e, ctx, want).map_err(|x| x.map_storage(|()| Error::Unsupported))
 }
 
 /// Whether `e` is `want` (see the `window` variant above).
-#[cfg(not(feature = "window"))]
+#[cfg(not(any(feature = "window", feature = "vm")))]
 pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
     cond_body(e, ctx, want)
 }

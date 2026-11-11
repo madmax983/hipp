@@ -11,6 +11,181 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_shrink (2026-11-11)
+
+Wave 14's first unit (owner decision 2026-11-10: shrink the VM
+first, then retry the flip). An architecture / size unit: no
+behaviour changes, all VM code stays behind the hidden `vm`
+feature, and the four shipped profiles measure exactly their
+ratchets.
+
+**Step 1 — a reproducible flip probe** (`ci/flip_probe.sh`,
+`--cfg hipp_flip_probe` with `vm`; build-only, never run, not wired
+into CI or `ci/local-gates.sh`; its `check-cfg` entry is in
+Cargo.toml's `[lints.rust]`). The probe cuts today's read executor
+off at the entry points wave 13's stubs cut — `Statement::step_query`'s
+streamed (`stream_open` / `stream_step`) and materialising
+(`run_query`) executors, and `Statement::exec_subplan_need` (the
+subquery executor the write paths reach) — so LTO drops everything
+only they reach. Kept, because the flip keeps them: the rows a
+statement loads itself (PRAGMA, EXPLAIN QUERY PLAN, plain EXPLAIN,
+served by `step_query`'s tail), `step_scan`'s VM entry and every
+write path. A best case: the VM-backed replacements writes still
+need (UPDATE ... FROM, INSERT ... SELECT, RETURNING subqueries,
+upsert, trigger and FK programs) are not counted. Reproduction: the
+symbol diff against wave 13's stubbed build (`xlvm_stub.syms`,
+52008ef) shows the same set of executor symbols gone; the remaining
+differences are the review fixes since (`join_sources` +760 B,
+`rep_minmax` +266 B, `vm_step` +180 B) — wave 13's figures plus
+those fixes. Builds in two separate target directories gave the
+same bytes.
+
+Starting figures (thumbv7em, `--profile tiny`, `hipp_thumb_demo`,
+`.text + .rodata`; ratchets at 5b67982):
+
+| profile | ratchet | `<profile>,vm` | flip probe | probe − ratchet |
+|---|---:|---:|---:|---:|
+| full | 477,788 | 538,676 | 512,764 | +34,976 |
+| max | 964,076 | — | 1,017,176 | +53,100 |
+| xl | 1,061,144 | 1,147,396 | 1,121,556 | +60,412 |
+| `sql` | — | — | 436,848 | — |
+| `query` | — | — | 203,750 | — |
+
+(Wave 13 measured 511,164 / 1,015,072 / 1,119,036 for the same
+stubbed build before its review fixes and with full's evaluator
+still compiled twice: full 511,164 is the comparable figure.)
+
+**Inventory** (the starting probe, `llvm-nm --size-sort -S -C` on
+the thumbv7em ELF): the 30 largest VM (`hipp::vm::`), driver
+(`session/drive.rs`, `Pager::vm_service`) and still-linked legacy
+read symbols per profile. "legacy" = today's async readers the VM
+reaches through `Exec::Call` (and the write paths' subquery
+helpers). The driver's `vm_step` future inlines `Vm::run` / `Vm::op`
+and, in full, `codegen::select`; `Vm::op_join` inlines `op_sub` /
+`op_rest`. Totals: full VM 33,748 / driver 10,758 / legacy 3,410;
+max 51,592 / 19,042 / 31,440; xl 56,394 / 19,132 / 34,820.
+
+full:
+
+| # | kind | symbol | bytes |
+|---:|---|---|---:|
+| 1 | driver | `Statement::vm_step (future) (poll)` | 10,608 |
+| 2 | VM | `<vm::exec::Vm>::op_join` | 10,156 |
+| 3 | VM | `vm::codegen::join::core` | 4,156 |
+| 4 | VM | `<vm::cursor::TableCursor>::load` | 1,490 |
+| 5 | VM | `<vm::codegen::join::G>::from` | 1,448 |
+| 6 | VM | `vm::codegen::join::select` | 1,404 |
+| 7 | VM | `vm::cursor::descend` | 1,344 |
+| 8 | VM | `vm::codegen::sub::subplan` | 1,256 |
+| 9 | VM | `<vm::codegen::join::G>::val_sub_in` | 940 |
+| 10 | legacy | `Statement::eval_row_sub (future)` | 906 |
+| 11 | VM | `vm::codegen::sub::subs_of` | 882 |
+| 12 | legacy | `Statement::exec_sub_kind_deferred (future)` | 816 |
+| 13 | VM | `<vm::codegen::join::G>::emit` | 666 |
+| 14 | legacy | `session::decode_source_row::<S>` | 560 |
+| 15 | VM | `<vm::codegen::join::G>::derived_build` | 536 |
+| 16 | legacy | `Statement::scan_temp (future)` | 470 |
+| 17 | VM | `vm::codegen::join::values_core` | 452 |
+| 18 | VM | `<vm::codegen::join::G>::cond_sub` | 426 |
+| 19 | VM | `<vm::build::Builder>::finish` | 408 |
+| 20 | VM | `vm::cursor::fetch` | 402 |
+| 21 | VM | `<vm::codegen::join::G>::agg_rows` | 396 |
+| 22 | legacy | `session::temp::run_temp (future)` | 356 |
+| 23 | VM | `vm::codegen::join::evaluable_w` | 336 |
+| 24 | legacy | `Statement::scan_source (future)` | 302 |
+| 25 | VM | `<vm::exec::Vm>::reset` | 292 |
+| 26 | VM | `<vm::codegen::join::G>::build_once` | 282 |
+| 27 | VM | `vm::codegen::join::scope_val` | 258 |
+| 28 | VM | `vm::codegen::expr::evaluable` | 256 |
+| 29 | VM | `vm::codegen::sub::plan_has_preset` | 244 |
+| 30 | VM | `<vm::codegen::join::G>::test` | 242 |
+
+max:
+
+| # | kind | symbol | bytes |
+|---:|---|---|---:|
+| 1 | VM | `<vm::exec::Vm>::op_join` | 17,468 |
+| 2 | driver | `Statement::vm_step (future) (poll)` | 12,844 |
+| 3 | legacy | `Statement::fts5_rows_impl (future)` | 8,160 |
+| 4 | legacy | `Statement::vtab_rows_of (future)` | 6,936 |
+| 5 | VM | `vm::codegen::join::core` | 5,608 |
+| 6 | legacy | `Statement::access_walk (future)` | 4,528 |
+| 7 | driver | `Statement::vm_program` | 4,020 |
+| 8 | VM | `<vm::codegen::join::G>::build` | 3,184 |
+| 9 | VM | `<vm::codegen::join::G>::from` | 2,596 |
+| 10 | legacy | `session::vtab::dbstat_db::<S> (future)` | 2,196 |
+| 11 | driver | `Connection::prepare_bytecode (future)` | 1,856 |
+| 12 | legacy | `Statement::rtree_next (future)` | 1,640 |
+| 13 | VM | `<vm::cursor::TableCursor>::load` | 1,636 |
+| 14 | legacy | `Statement::access_rows (future)` | 1,562 |
+| 15 | VM | `vm::codegen::join::select` | 1,376 |
+| 16 | VM | `vm::cursor::descend` | 1,348 |
+| 17 | legacy | `Statement::win_project_async (future)` | 1,238 |
+| 18 | VM | `vm::codegen::sub::subplan` | 1,220 |
+| 19 | VM | `vm::index::entry_of` | 988 |
+| 20 | VM | `vm::codegen::join::values_core` | 968 |
+| 21 | legacy | `Statement::scan_temp (future)` | 930 |
+| 22 | VM | `<vm::codegen::join::G>::val_sub_in` | 924 |
+| 23 | legacy | `Statement::exec_sub_kind_deferred (future)` | 812 |
+| 24 | VM | `vm::codegen::sub::sub_node` | 794 |
+| 25 | legacy | `Statement::json_tvf_rows (future)` | 680 |
+| 26 | VM | `<vm::codegen::join::G>::emit` | 564 |
+| 27 | legacy | `session::decode_source_row::<S>` | 562 |
+| 28 | VM | `<vm::codegen::join::G>::derived_build` | 544 |
+| 29 | legacy | `Statement::lateral_ok (future)` | 492 |
+| 30 | legacy | `Statement::fts5_rows_impl (future)::{closure#14}` | 468 |
+
+xl:
+
+| # | kind | symbol | bytes |
+|---:|---|---|---:|
+| 1 | VM | `<vm::exec::Vm>::op_join` | 18,964 |
+| 2 | driver | `Statement::vm_step (future) (poll)` | 12,804 |
+| 3 | legacy | `Statement::fts5_rows_impl (future)` | 8,140 |
+| 4 | legacy | `Statement::vtab_rows_of (future)` | 6,880 |
+| 5 | VM | `vm::codegen::join::core` | 5,952 |
+| 6 | legacy | `Statement::access_walk (future)` | 5,512 |
+| 7 | driver | `Statement::vm_program` | 4,108 |
+| 8 | VM | `<vm::codegen::join::G>::from` | 3,688 |
+| 9 | legacy | `Statement::access_rows (future)` | 3,246 |
+| 10 | VM | `<vm::codegen::join::G>::access_rows` | 2,712 |
+| 11 | legacy | `session::vtab::dbstat_db::<S> (future)` | 2,196 |
+| 12 | driver | `Connection::prepare_bytecode (future)` | 1,896 |
+| 13 | legacy | `Statement::rtree_next (future)` | 1,638 |
+| 14 | VM | `<vm::cursor::TableCursor>::load` | 1,630 |
+| 15 | VM | `<vm::codegen::join::G>::combos` | 1,528 |
+| 16 | VM | `vm::codegen::join::select` | 1,374 |
+| 17 | VM | `vm::cursor::descend` | 1,344 |
+| 18 | legacy | `Statement::win_project_async (future)` | 1,240 |
+| 19 | VM | `vm::codegen::sub::subplan` | 1,220 |
+| 20 | VM | `vm::index::entry_of` | 986 |
+| 21 | VM | `vm::codegen::join::values_core` | 968 |
+| 22 | legacy | `Statement::scan_temp (future)` | 936 |
+| 23 | VM | `<vm::codegen::join::G>::val_sub_in` | 912 |
+| 24 | legacy | `Statement::exec_sub_kind_deferred (future)` | 812 |
+| 25 | VM | `vm::codegen::sub::sub_node` | 780 |
+| 26 | legacy | `Statement::json_tvf_rows (future)` | 682 |
+| 27 | legacy | `Statement::auto_lookup (future)` | 622 |
+| 28 | legacy | `session::decode_source_row::<S>` | 568 |
+| 29 | VM | `<vm::codegen::join::G>::emit` | 562 |
+| 30 | VM | `<vm::codegen::join::G>::derived_build` | 532 |
+
+**Step 2 — the evaluator compiled once in VM builds.** `query::eval`
+/ `cond_is` take their `window` shape under `vm` too (the body
+compiled for `Error<()>`, the executors' errors re-typed at the
+entry): probe full 512,764 → 498,288 (−14,476); max and xl
+unchanged (−0: `window` already compiles it once); shipped profiles
+unchanged (no shipped profile has `vm`).
+
+**Gates** (this commit). `cargo fmt --all`; full `ci/local-gates.sh`
+(the `--features vm` workspace suite included): all gates passed;
+`tests/depth_v16.rs` and `tests/triggers_v16.rs` with debug info,
+with and without `vm`: pass.
+
+**Size Δ** (shipped profiles): tiny 0 (76,952), full 0 (477,788),
+max 0 (964,076), xl 0 (1,061,144) — the probe's cuts and the
+evaluator's shape are `vm`-only.
+
 ### VM (ADR 0005 Stage 2): vm_rest — review fixes (2026-11-10)
 
 Fixes to unit `vm_rest` (below), all under the hidden `vm` feature;
